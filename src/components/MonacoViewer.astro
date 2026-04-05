@@ -131,6 +131,10 @@ async function initMonaco() {
   skeleton.style.display = 'none';
   container.style.display = 'block';
 
+  // Ensure editor starts at line 1
+  editor.setScrollTop(0);
+  editor.setPosition({ lineNumber: 1, column: 1 });
+
   // --- Toolbar wiring ---
 
   // COPY button
