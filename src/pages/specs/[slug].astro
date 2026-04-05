@@ -1,7 +1,7 @@
 ---
 import Base from '../../layouts/Base.astro';
+import MonacoViewer from '../../components/MonacoViewer.astro';
 
-import { marked } from 'marked';
 import { parseFrontmatter, categoryLabels, RAW_BASE, type SpecMeta } from '../../lib/specs';
 
 const specFiles = import.meta.glob('/specs/*.spec.md', { query: '?raw', import: 'default', eager: true });
@@ -32,7 +32,6 @@ if (!entry) {
 
 const { meta, content } = parseFrontmatter(entry[1] as string);
 const rawMarkdown = content.trim();
-const htmlContent = await marked(rawMarkdown);
 
 const rawUrl = `${RAW_BASE}/${meta.slug}.spec.md`;
 const githubUrl = `https://github.com/ethanolivertroy/grclanker/blob/main/specs/${meta.slug}.spec.md`;
@@ -40,7 +39,7 @@ const editUrl = `https://github.com/ethanolivertroy/grclanker/edit/main/specs/${
 ---
 
 <Base title={`${meta.name} — grclanker`} description={`Compliance automation spec for ${meta.vendor}. ${meta.name}.`}>
-  <div class="max-w-content mx-auto px-6 py-8">
+  <div class="max-w-content mx-auto px-4 py-6 sm:px-6 sm:py-8">
 
     <!-- Spec page data for keyboard shortcuts + markdown copy -->
     <div id="spec-page-data" data-raw-url={rawUrl} data-slug={meta.slug} class="hidden"></div>
@@ -135,15 +134,17 @@ const editUrl = `https://github.com/ethanolivertroy/grclanker/edit/main/specs/${
       </aside>
 
       <!-- Main viewscreen: spec content -->
-      <div class="viewscreen rounded-lg p-6 md:p-8 scanlines relative min-w-0">
+      <div class="viewscreen rounded-lg scanlines relative min-w-0 overflow-hidden">
         <!-- Mobile metadata -->
-        <div class="lg:hidden mb-6 pb-4 border-b border-surface0 flex flex-wrap gap-4 text-xs font-mono">
+        <div class="lg:hidden px-4 pt-4 pb-3 sm:px-6 sm:pt-6 sm:pb-4 border-b border-surface0 flex flex-wrap gap-3 sm:gap-4 text-xs font-mono">
           <span class="text-subtext0">VENDOR: <span class="text-subtext1">{meta.vendor}</span></span>
           <span class="text-subtext0">LANG: <span class="text-subtext1 uppercase">{meta.language}</span></span>
           <span class="text-subtext0">UPDATED: <span class="text-subtext1">{meta.last_updated}</span></span>
         </div>
 
-        <div class="relative z-10 spec-content" set:html={htmlContent} />
+        <div class="relative z-10">
+          <MonacoViewer />
+        </div>
       </div>
     </div>
 

@@ -1,0 +1,171 @@
+<!-- Editor toolbar + Monaco container -->
+<div class="editor-toolbar">
+  <div class="toolbar-left">
+    <span class="toolbar-label">SPEC</span>
+    <span class="toolbar-sep">·</span>
+    <span class="toolbar-lang">MARKDOWN</span>
+  </div>
+  <div class="toolbar-actions">
+    <button id="tb-copy" class="toolbar-btn" title="Copy markdown">COPY</button>
+    <button id="tb-wrap" class="toolbar-btn active" title="Toggle word wrap">WRAP</button>
+    <button id="tb-map" class="toolbar-btn" title="Toggle minimap">MAP</button>
+  </div>
+</div>
+
+<!-- Loading skeleton -->
+<div id="monaco-skeleton" class="monaco-skeleton">
+  <div class="skeleton-line w-3/4"></div>
+  <div class="skeleton-line w-1/2"></div>
+  <div class="skeleton-line w-5/6"></div>
+  <div class="skeleton-line w-2/3"></div>
+  <div class="skeleton-line w-4/5"></div>
+  <div class="skeleton-line w-1/3"></div>
+  <div class="skeleton-line w-3/4"></div>
+  <div class="skeleton-line w-1/2"></div>
+</div>
+
+<!-- Editor container -->
+<div id="monaco-container" style="display:none;"></div>
+
+<!-- Fallback for CDN failure -->
+<div id="monaco-fallback" style="display:none;">
+  <div class="fallback-notice">Editor unavailable — showing raw markdown</div>
+  <pre id="monaco-fallback-pre" class="fallback-pre"></pre>
+</div>
+
+<script>
+import loader from '@monaco-editor/loader';
+import { catppuccinFrappe } from '../lib/monaco-theme';
+
+async function initMonaco() {
+  const dataEl = document.getElementById('spec-markdown-data');
+  if (!dataEl) return;
+
+  const rawMarkdown = JSON.parse(dataEl.textContent || '""');
+  const container = document.getElementById('monaco-container')!;
+  const skeleton = document.getElementById('monaco-skeleton')!;
+  const fallback = document.getElementById('monaco-fallback')!;
+  const fallbackPre = document.getElementById('monaco-fallback-pre')!;
+
+  // Race Monaco load against a timeout
+  const timeout = new Promise<null>((_, reject) =>
+    setTimeout(() => reject(new Error('timeout')), 8000)
+  );
+
+  let monaco;
+  try {
+    monaco = await Promise.race([loader.init(), timeout]);
+  } catch {
+    // CDN failed — show fallback
+    skeleton.style.display = 'none';
+    fallbackPre.textContent = rawMarkdown;
+    fallback.style.display = 'block';
+    return;
+  }
+
+  // Register theme
+  monaco.editor.defineTheme('catppuccin-frappe', catppuccinFrappe);
+
+  // Responsive defaults
+  const isMobile = window.innerWidth < 768;
+
+  // Create editor
+  const editor = monaco.editor.create(container, {
+    value: rawMarkdown,
+    language: 'markdown',
+    theme: 'catppuccin-frappe',
+    readOnly: true,
+    automaticLayout: true,
+    wordWrap: 'on',
+    lineNumbers: isMobile ? 'off' : 'on',
+    folding: !isMobile,
+    smoothScrolling: true,
+    fontSize: isMobile ? 12 : 13,
+    lineHeight: isMobile ? 20 : 22,
+    fontFamily: "'Google Sans Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+    padding: { top: isMobile ? 12 : 16, bottom: isMobile ? 12 : 16 },
+    minimap: { enabled: !isMobile },
+    scrollBeyondLastLine: false,
+    renderLineHighlight: isMobile ? 'none' : 'line',
+    matchBrackets: 'always',
+    guides: { indentation: !isMobile },
+    overviewRulerLanes: 0,
+    glyphMargin: false,
+    lineDecorationsWidth: isMobile ? 4 : 10,
+    lineNumbersMinChars: isMobile ? 0 : 3,
+    scrollbar: {
+      verticalScrollbarSize: isMobile ? 6 : 10,
+      horizontalScrollbarSize: isMobile ? 6 : 10,
+    },
+
+    // Disabled features (read-only viewer)
+    contextmenu: false,
+    quickSuggestions: false,
+    parameterHints: { enabled: false },
+    hover: { enabled: false },
+    codeLens: false,
+    dragAndDrop: false,
+    links: false,
+    lightbulb: { enabled: false },
+    suggest: { showWords: false },
+    find: { addExtraSpaceOnTop: false },
+  });
+
+  // Size container to content (clamped)
+  function sizeContainer() {
+    const mobile = window.innerWidth < 768;
+    const lineCount = editor.getModel()!.getLineCount();
+    const lineHeight = editor.getOption(monaco.editor.EditorOption.lineHeight);
+    const contentHeight = lineCount * lineHeight + (mobile ? 24 : 32);
+    const maxHeight = window.innerHeight * (mobile ? 0.7 : 0.85);
+    const minHeight = mobile ? 300 : 400;
+    const height = Math.max(minHeight, Math.min(contentHeight, maxHeight));
+    container.style.height = height + 'px';
+    editor.layout();
+  }
+
+  sizeContainer();
+  window.addEventListener('resize', sizeContainer);
+
+  // Show editor, hide skeleton
+  skeleton.style.display = 'none';
+  container.style.display = 'block';
+
+  // --- Toolbar wiring ---
+
+  // COPY button
+  const copyBtn = document.getElementById('tb-copy')!;
+  copyBtn.addEventListener('click', () => {
+    navigator.clipboard.writeText(rawMarkdown);
+    copyBtn.textContent = 'COPIED';
+    copyBtn.classList.add('copied');
+    setTimeout(() => {
+      copyBtn.textContent = 'COPY';
+      copyBtn.classList.remove('copied');
+    }, 1500);
+  });
+
+  // WRAP toggle
+  let wrapOn = true;
+  const wrapBtn = document.getElementById('tb-wrap')!;
+  wrapBtn.addEventListener('click', () => {
+    wrapOn = !wrapOn;
+    editor.updateOptions({ wordWrap: wrapOn ? 'on' : 'off' });
+    wrapBtn.classList.toggle('active', wrapOn);
+    // Re-size since wrapping changes visible line count
+    setTimeout(sizeContainer, 50);
+  });
+
+  // MAP toggle
+  let mapOn = !isMobile;
+  const mapBtn = document.getElementById('tb-map')!;
+  mapBtn.classList.toggle('active', mapOn);
+  mapBtn.addEventListener('click', () => {
+    mapOn = !mapOn;
+    editor.updateOptions({ minimap: { enabled: mapOn } });
+    mapBtn.classList.toggle('active', mapOn);
+  });
+}
+
+initMonaco();
+</script>

@@ -8,6 +8,7 @@
     "preview": "astro preview"
   },
   "dependencies": {
+    "@monaco-editor/loader": "^1.7.0",
     "@tailwindcss/vite": "^4.2.2",
     "astro": "^6.1.1",
     "marked": "^17.0.5"
