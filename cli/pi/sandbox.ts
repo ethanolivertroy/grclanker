@@ -1,4 +1,4 @@
-import { constants, existsSync, readFileSync } from "node:fs";
+import { constants, existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   access,
   mkdir,
@@ -8,7 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, relative, resolve, sep } from "node:path";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 import { minimatch } from "minimatch";
 import {
   SandboxManager,
@@ -99,26 +99,48 @@ function isWithin(basePath: string, absolutePath: string): boolean {
   return absolutePath === basePath || absolutePath.startsWith(`${basePath}${sep}`);
 }
 
+function canonicalizePath(targetPath: string): string {
+  const absolutePath = resolve(targetPath);
+
+  if (existsSync(absolutePath)) {
+    return realpathSync(absolutePath);
+  }
+
+  let existingParent = dirname(absolutePath);
+  while (!existsSync(existingParent)) {
+    const nextParent = dirname(existingParent);
+    if (nextParent === existingParent) {
+      return absolutePath;
+    }
+    existingParent = nextParent;
+  }
+
+  const canonicalParent = realpathSync(existingParent);
+  const suffix = relative(existingParent, absolutePath);
+  return suffix.length > 0 ? resolve(canonicalParent, suffix) : canonicalParent;
+}
+
 function matchesRule(absolutePath: string, rule: string, cwd: string): boolean {
-  const normalizedPath = resolve(absolutePath);
+  const normalizedPath = canonicalizePath(absolutePath);
+  const normalizedCwd = canonicalizePath(cwd);
   const expandedRule = expandHome(rule);
 
   if (expandedRule === ".") {
-    return isWithin(resolve(cwd), normalizedPath);
+    return isWithin(normalizedCwd, normalizedPath);
   }
 
   if (expandedRule.startsWith("/")) {
-    const absoluteRule = resolve(expandedRule);
+    const absoluteRule = canonicalizePath(expandedRule);
     return hasGlob(expandedRule)
       ? minimatch(normalizedPath, absoluteRule, { dot: true, matchBase: true })
       : isWithin(absoluteRule, normalizedPath);
   }
 
   if (!hasGlob(expandedRule)) {
-    return isWithin(resolve(cwd, expandedRule), normalizedPath);
+    return isWithin(canonicalizePath(resolve(normalizedCwd, expandedRule)), normalizedPath);
   }
 
-  const relativePath = relative(resolve(cwd), normalizedPath).split(sep).join("/");
+  const relativePath = relative(normalizedCwd, normalizedPath).split(sep).join("/");
   return minimatch(relativePath, expandedRule, { dot: true, matchBase: true });
 }
 
