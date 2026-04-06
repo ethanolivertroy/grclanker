@@ -161,7 +161,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
 
   if ($AssetUrlOverride) {
     Write-Warn "Skipping checksum verification — custom GRCLANKER_ASSET_URL in use"
-    return
+    return $false
   }
 
   if ($AssetSourcePath) {
@@ -171,7 +171,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
       Copy-Item -LiteralPath $LocalChecksums -Destination $ChecksumsPath -Force
     } else {
       Write-Warn "No SHA256SUMS.txt found alongside local artifact — skipping verification"
-      return
+      return $false
     }
   } elseif ($ReleaseBaseUrl) {
     $ChecksumsUrl = ($ReleaseBaseUrl.TrimEnd("/")) + "/SHA256SUMS.txt"
@@ -184,7 +184,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
       Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath | Out-Null
     } catch {
       Write-Warn "Could not fetch SHA256SUMS.txt — skipping checksum verification"
-      return
+      return $false
     }
   }
 
@@ -194,7 +194,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
 
   if (-not $Entry) {
     Write-Warn "No checksum entry for $AssetName in SHA256SUMS.txt — skipping verification"
-    return
+    return $false
   }
 
   $ExpectedHash = ($Entry -split "\s+")[0].ToLowerInvariant()
@@ -202,6 +202,8 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
   if ($ActualHash -ne $ExpectedHash) {
     throw "Checksum mismatch for $AssetName — expected $ExpectedHash, got $ActualHash. The download may be corrupted or tampered with."
   }
+
+  return $true
 }
 
 Write-Host ""
@@ -253,6 +255,9 @@ if ($AssetUrlOverride) {
     $AssetName = Split-Path $AssetUrlOverride -Leaf
   }
 } elseif ($ReleaseBaseUrl) {
+  if (-not $Version) {
+    throw "GRCLANKER_RELEASE_BASE_URL requires an explicit version. Set GRCLANKER_VERSION or pass -Version <version>."
+  }
   if (-not $AssetName) {
     $AssetName = "grclanker-$Version-$Target.zip"
   }
@@ -281,8 +286,10 @@ try {
   }
   Write-Ok "Downloaded"
 
-  Verify-Checksum -ArchivePath $ArchivePath -AssetName $AssetName -Tag $Tag -AssetSourcePath $AssetSourcePath -AssetUrl $AssetUrl
-  Write-Ok "Integrity verified"
+  $verified = Verify-Checksum -ArchivePath $ArchivePath -AssetName $AssetName -Tag $Tag -AssetSourcePath $AssetSourcePath -AssetUrl $AssetUrl
+  if ($verified) {
+    Write-Ok "Integrity verified"
+  }
 
   if (Test-Path $InstallDir) {
     Remove-Item -Recurse -Force $InstallDir
