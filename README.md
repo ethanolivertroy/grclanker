@@ -1,140 +1,188 @@
 # grclanker
 
-Open-source `spec.md` files for building GRC compliance automations. Grab one. Feed it to your agent.
+`grclanker` is an experimental open source AI GRC CLI built on top of Pi.
 
-Each spec describes a Go CLI tool that authenticates to a vendor's API, pulls security configuration data, and maps findings to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, and STIG controls.
+The current public release starts with CMVP, KEV, EPSS, control mapping, posture triage, and spec-driven build workflows. That is the opening surface, not the full intended scope of the project.
 
----
+This first public CLI release is `0.0.1`. It is intentionally experimental.
 
-## Why?
+macOS and Linux are the recommended platforms for `0.0.1`. Windows support exists, but it is best-effort and not a priority for this first experimental release.
 
-Compliance automation is treated like a black box — as if it's spectacularly complicated rocket science. It's not. It's API connectors pulling information that's always been there. The industry overcomplicates it for no reason.
+## Install
 
-These specs take the ideas out of my head and give them away because that's the right thing to do. Every spec is a complete blueprint: the APIs, the auth flow, the security controls, the framework mappings, the architecture, the build sequence. Hand it to any coding agent and you get a working compliance tool.
-
-The spec-driven approach is inspired in part by projects like OpenAI's [Symphony SPEC.md](https://github.com/openai/symphony/blob/main/SPEC.md) — the idea that a well-structured spec file is all an agent needs to build something real. No proprietary platform required. No vendor lock-in. Just a markdown file and whatever agent you already use.
-
----
-
-## Quick Start
-
-**Clone everything:**
+Recommended bundle install:
 
 ```bash
-git clone https://github.com/ethanolivertroy/grclanker.git
+curl -fsSL https://grclanker.com/install | bash
 ```
 
-**Grab a single spec:**
+Windows PowerShell (best effort):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
+```
+
+Package-manager fallback:
+
+```bash
+npm install -g @grclanker/cli
+bun install -g @grclanker/cli
+```
+
+Installation docs:
+
+- `https://grclanker.com/docs/getting-started/installation`
+- `https://grclanker.com/docs/getting-started/setup`
+
+## Setup
+
+After install, run:
+
+```bash
+grclanker setup
+```
+
+The recommended path is local-first:
+
+```bash
+ollama serve
+ollama pull gemma4
+grclanker setup
+```
+
+That configures grclanker to use a local Ollama-compatible endpoint with Gemma 4 instead of silently defaulting to a hosted model.
+
+If you do not want the local-first path, the setup wizard can also save an explicit hosted provider/model choice.
+
+Inspect local backend readiness:
+
+```bash
+grclanker env doctor
+grclanker env smoke-test
+grclanker env exec -- pwd
+```
+
+If you choose `docker` or `parallels-vm` during setup, the wizard now also captures the container image or Parallels sandbox source settings needed for backend execution.
+
+If you choose `sandbox-runtime`, grclanker reads sandbox policy from:
+
+- `~/.grclanker/sandbox.json`
+- `<repo>/.grclanker/sandbox.json`
+
+## Compute Backends
+
+`0.0.1` is still a local-shell CLI release. Planned execution backends are tracked in [specs/grclanker-compute-backends.spec.md](./specs/grclanker-compute-backends.spec.md).
+
+The current recommendation is:
+
+- Phase 1: `sandbox-runtime`, Docker, and Parallels
+- Phase 2: Modal and RunPod
+- Phase 3: Vercel Sandbox or Cloudflare Sandbox for hosted CPU-only isolation
+
+Current MVP behavior:
+
+- Docker and Parallels now route Pi's `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` tools, plus user `!` commands, through the selected backend.
+- `sandbox-runtime` now routes `bash`, `grep`, and `find` through the sandbox and enforces the same filesystem policy for `read`, `write`, `edit`, and `ls`.
+- `env smoke-test` now validates both file-tool behavior and backend-native search behavior.
+- The Parallels path is intentionally safer than directly reusing one of your existing VMs: grclanker prefers deploying disposable sandboxes from a dedicated Parallels template, with stopped-base cloning as a fallback, and attaches only the repo share to the sandbox it creates.
+- This is intentionally more explicit than Feynman's current Docker badge logic: grclanker validates runtime readiness and only claims a backend when it can actually be used.
+
+## What You Can Do With It
+
+```bash
+grclanker "what is the CMVP certificate for BoringCrypto?"
+grclanker investigate "CVE-2024-3094"
+grclanker audit "map our vuln evidence to FedRAMP RA-5"
+grclanker "read specs/aws-sec-inspector.spec.md and build the tool"
+```
+
+Built-in workflow rails:
+
+- `/investigate`
+- `/audit`
+- `/assess`
+- `/validate`
+
+What ships in `0.0.1`:
+
+- 8 domain tools across CMVP, KEV, EPSS, recent exploited-vulnerability review, and ransomware-linked KEV checks
+- 2 bundled agent personas: `auditor` and `verifier`
+- 4 workflow commands
+- Dedicated runtime identity and state under `~/.grclanker/agent`
+- A real setup command for local-first or hosted model configuration
+
+## Skills Only
+
+User-scoped Codex skill:
+
+```bash
+curl -fsSL https://grclanker.com/install-skills | bash
+```
+
+Repo-local skill:
+
+```bash
+curl -fsSL https://grclanker.com/install-skills | bash -s -- --repo
+```
+
+Windows PowerShell (best effort):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install-skills.ps1 | iex"
+```
+
+The skills-only installers download just the `skills/` tree. They do not install the bundled runtime.
+
+## Specs
+
+The specs are still here, but they are not the whole story anymore. They are the build surface the CLI can work on directly.
+
+Browse the catalog:
+
+- Website: `https://grclanker.com/specs`
+- Raw base: `https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs`
+
+Grab one directly:
 
 ```bash
 curl -O https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md
 ```
 
-**Feed it to your agent:**
+Or tell the CLI to use one:
 
 ```bash
-# Claude Code
-claude "Read https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md and build the tool"
-
-# OpenAI Codex CLI
-codex "Read https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md and build the tool"
-
-# Gemini CLI
-gemini "Read https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md and implement this spec"
-
-# Any agent — just pass the raw URL
-your-agent "Read https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md and build the tool"
+grclanker "read specs/aws-sec-inspector.spec.md and build the tool"
 ```
 
----
+The intended flow is not “pick between the specs and the CLI.” The intended flow is install the CLI, configure it, and then point it at a spec when you want the repo’s build plans executed.
 
-## Spec Catalog
+The catalog currently covers cloud infrastructure, IAM, security tooling, vulnerability platforms, observability, SaaS apps, and developer platforms.
 
-### Cloud Infrastructure
+## Experimental Release Bundles
 
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [aws-sec-inspector](specs/aws-sec-inspector.spec.md) | Amazon Web Services | Security Hub, Config, IAM, Access Analyzer. Unified multi-framework compliance reports. |
-| [azure-sec-inspector](specs/azure-sec-inspector.spec.md) | Microsoft | Azure subscriptions and M365 tenants via Graph API, ARM, Defender for Cloud. |
-| [gcp-sec-inspector](specs/gcp-sec-inspector.spec.md) | Google Cloud | GCP infrastructure, IAM policies, encryption, org constraints via Security Command Center. |
-| [oci-sec-inspector](specs/oci-sec-inspector.spec.md) | Oracle | OCI IAM, networking, Cloud Guard posture, vault key management, audit logging. |
-| [snowflake-sec-inspector](specs/snowflake-sec-inspector.spec.md) | Snowflake | IAM, network security, data protection policies, encryption, audit logging. |
+The release installers look for GitHub Release assets named like:
 
-### Identity & Access Management
+- `grclanker-<version>-darwin-arm64.tar.gz`
+- `grclanker-<version>-darwin-x64.tar.gz`
+- `grclanker-<version>-linux-arm64.tar.gz`
+- `grclanker-<version>-linux-x64.tar.gz`
+- `grclanker-<version>-win32-arm64.zip`
+- `grclanker-<version>-win32-x64.zip`
 
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [duo-sec-inspector](specs/duo-sec-inspector.spec.md) | Cisco | MFA configurations, policies, user enrollment, trust monitor alerts via Admin API. |
-| [gws-inspector-go](specs/gws-inspector-go.spec.md) | Google | Multi-framework compliance audit for Google Workspace. |
+Build them locally:
 
-### Security & Network Infrastructure
+```bash
+cd cli
+npm install
+npm run build:bundle -- --all
+```
 
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [crowdstrike-sec-inspector](specs/crowdstrike-sec-inspector.spec.md) | CrowdStrike | Falcon EDR: prevention policies, sensor deployment, device control settings. |
-| [paloalto-sec-inspector](specs/paloalto-sec-inspector.spec.md) | Palo Alto Networks | Prisma Cloud CSPM/CWPP and PAN-OS firewalls. Policy enforcement, compliance configs. |
-| [zscaler-sec-inspector](specs/zscaler-sec-inspector.spec.md) | Zscaler | ZIA and ZPA: URL filtering, DLP policies, SSL inspection, app segmentation. |
-| [cloudflare-sec-inspector](specs/cloudflare-sec-inspector.spec.md) | Cloudflare | WAF configs, Zero Trust policies, SSL/TLS, DNS security, API token permissions. |
+Artifacts land in `cli/release/`.
 
-### Vulnerability & Application Security
+## Experimental Means Experimental
 
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [qualys-sec-inspector](specs/qualys-sec-inspector.spec.md) | Qualys | Vuln management configs, compliance profiles, scan coverage, asset group hygiene. |
-| [tenable-sec-inspector](specs/tenable-sec-inspector.spec.md) | Tenable | Scan policies, asset coverage, credential audits, agent deployment, user permissions. |
-| [veracode-sec-inspector](specs/veracode-sec-inspector.spec.md) | Veracode | Scan coverage, policy compliance, flaw aging, SCA library health, access controls. |
-| [knowbe4-sec-inspector](specs/knowbe4-sec-inspector.spec.md) | KnowBe4 | Security awareness training coverage, completion rates, user risk scores. |
-
-### Monitoring, Logging & Observability
-
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [splunk-sec-inspector](specs/splunk-sec-inspector.spec.md) | Splunk | Authentication, authorization, server settings, data pipelines, index clustering. |
-| [datadog-sec-inspector](specs/datadog-sec-inspector.spec.md) | Datadog | RBAC, API key management, log pipelines, security monitoring. |
-| [newrelic-sec-inspector](specs/newrelic-sec-inspector.spec.md) | New Relic | Authentication, user access controls, API key management, data governance. |
-| [sumologic-sec-inspector](specs/sumologic-sec-inspector.spec.md) | Sumo Logic | Authentication policies, access controls, data governance, operational security. |
-| [elastic-sec-inspector](specs/elastic-sec-inspector.spec.md) | Elastic | Authentication realms, TLS configs, RBAC, field/document-level security. |
-
-### SaaS & Collaboration
-
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [salesforce-sec-inspector](specs/salesforce-sec-inspector.spec.md) | Salesforce | Security settings, user permissions, auth policies, data protection. |
-| [servicenow-sec-inspector](specs/servicenow-sec-inspector.spec.md) | ServiceNow | Platform security configs, ACL rules, user/role management, authentication. |
-| [slack-sec-inspector](specs/slack-sec-inspector.spec.md) | Slack | Enterprise Grid: SSO enforcement, MFA policies, DLP settings, external sharing. |
-| [zoom-sec-inspector](specs/zoom-sec-inspector.spec.md) | Zoom | Zoom for Government: meeting policies, recording controls, auth enforcement. |
-| [webex-sec-inspector](specs/webex-sec-inspector.spec.md) | Cisco | IAM, messaging policies, meeting security, recording governance, device management. |
-| [zendesk-sec-inspector](specs/zendesk-sec-inspector.spec.md) | Zendesk | Authentication settings, agent access controls, data protection, audit logging. |
-| [box-sec-inspector](specs/box-sec-inspector.spec.md) | Box | Authentication policies, sharing controls, data governance, device trust. |
-
-### DevOps & Developer Platforms
-
-| Spec | Vendor | What It Audits |
-|------|--------|----------------|
-| [github-sec-inspector](specs/github-sec-inspector.spec.md) | GitHub | Enterprise Cloud: SSO enforcement, branch protection, code security, Actions workflows. |
-| [pagerduty-sec-inspector](specs/pagerduty-sec-inspector.spec.md) | PagerDuty | Authentication settings, user roles, access controls, escalation policy coverage. |
-| [launchdarkly-sec-inspector](specs/launchdarkly-sec-inspector.spec.md) | LaunchDarkly | IAM, feature flag hygiene, API token lifecycle, integration security. |
-| [mulesoft-sec-inspector](specs/mulesoft-sec-inspector.spec.md) | MuleSoft | Anypoint Platform: IAM, API gateway policies, runtime security, environment isolation. |
-
----
-
-## Spec Format
-
-Every spec follows the same 10-section structure:
-
-1. **Overview** -- What the tool does and why it matters
-2. **APIs & SDKs** -- Vendor API endpoints and SDK references
-3. **Authentication** -- Credential models and auth flows
-4. **Security Controls** -- What security configurations are audited
-5. **Compliance Framework Mappings** -- How controls map to FedRAMP, CMMC, SOC 2, etc.
-6. **Existing Tools** -- What's already out there (and what's missing)
-7. **Architecture** -- Tool design and data flow
-8. **CLI Interface** -- Commands, flags, output formats
-9. **Build Sequence** -- Step-by-step implementation order
-10. **Status** -- Current implementation state
-
-All specs include YAML frontmatter with metadata: `slug`, `name`, `vendor`, `category`, `language`, `status`, `version`, `source_repo`.
-
----
+- Expect rough edges.
+- Expect fast iteration.
+- Expect breaking changes before `0.1.x`.
 
 Built by [Ethan Troy](https://ethantroy.dev)

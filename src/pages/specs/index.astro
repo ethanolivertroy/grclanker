@@ -1,6 +1,5 @@
 ---
 import Base from '../../layouts/Base.astro';
-import AgentCommandsSection from '../../components/AgentCommandsSection.astro';
 import SpecCatalogSection from '../../components/SpecCatalogSection.astro';
 import { RAW_BASE, loadSpecs } from '../../lib/specs';
 
@@ -16,25 +15,13 @@ const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
     <div class="absolute inset-0 bg-gradient-to-b from-base/55 via-base/78 to-base pointer-events-none"></div>
 
     <div class="relative z-10 max-w-content mx-auto px-6 pt-14 pb-14 md:pt-18 md:pb-18">
-      <div class="inline-flex items-center gap-2 bg-surface0/80 border border-surface1/60 rounded-full px-4 py-1.5 mb-5">
-        <span class="w-2 h-2 rounded-full bg-blue"></span>
-        <span class="text-subtext1 text-xs">{specs.length} raw specs online</span>
-      </div>
-
-      <div class="max-w-3xl">
-        <p class="hud-label mb-3">/specs</p>
+      <div class="max-w-3xl mx-auto text-center">
         <h1 class="font-bold text-3xl sm:text-4xl md:text-5xl text-text leading-tight hero-text-shadow">
-          The spec is the build plan.
+          Bring your own clanker. Build your own compliance.
         </h1>
-        <p class="mt-4 max-w-2xl text-subtext1 text-base md:text-lg leading-relaxed">
-          Pull the raw Markdown, hand it to Claude, Codex, Gemini, Cursor, or whatever else you trust, and let the file do the work.
-        </p>
-        <p class="mt-2 text-sm text-subtext0">
-          Keyboard-first: use <kbd>/</kbd> or <kbd>Cmd+K</kbd> anywhere on the site to jump to a spec.
-        </p>
       </div>
 
-      <div class="mt-8 max-w-3xl">
+      <div class="mt-8 max-w-3xl mx-auto">
         <div class="cmd-hero">
           <code id="spec-hero-command">{heroCommand}</code>
           <button class="cmd-hero-copy" id="spec-hero-copy" data-cmd={heroCommand} aria-label="Copy raw spec command">
@@ -50,7 +37,32 @@ const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
 
   <div class="max-w-content mx-auto px-6 py-8 md:py-10">
     <SpecCatalogSection />
-    <AgentCommandsSection />
+
+    <section class="page-image-break mb-8" aria-label="Specs ambient frame">
+      <img
+        src="/footer/closeup.webp"
+        alt=""
+        class="page-image-break-image"
+        loading="lazy"
+      />
+      <div class="page-image-break-overlay">
+        <span class="page-image-break-pill">Raw markdown in // agent output out</span>
+      </div>
+    </section>
+
+    <section class="viewscreen rounded-xl scanlines relative overflow-hidden">
+      <div class="relative z-10 p-5 md:p-6 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+        <div class="max-w-2xl">
+          <h2 class="font-semibold text-sm tracking-widest uppercase text-blue mb-2">Use With Any Agent</h2>
+          <p class="text-subtext1 text-sm leading-relaxed italic">
+            The long-form command examples live in the docs now so the catalog can stay focused on raw spec discovery and copy flow.
+          </p>
+        </div>
+        <a href="/docs/specs/using-specs-as-inputs" class="spec-action-btn spec-action-btn-primary self-start md:self-auto">
+          Open docs
+        </a>
+      </div>
+    </section>
   </div>
 </Base>
 

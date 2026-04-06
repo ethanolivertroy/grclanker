@@ -1,0 +1,35 @@
+---
+import { getCollection, render } from 'astro:content';
+import AgentCommandsSection from '../../components/AgentCommandsSection.astro';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+
+export async function getStaticPaths() {
+  const docs = await getCollection('docs');
+  return docs
+    .filter((entry) => entry.id !== 'index')
+    .map((entry) => ({
+      params: { slug: entry.id },
+      props: { entry },
+    }));
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+const showAgentCommands = entry.id === 'specs/using-specs-as-inputs';
+---
+
+<DocsLayout
+  title={`${entry.data.title} — grclanker docs`}
+  description={entry.data.description}
+  currentSlug={entry.id}
+>
+  <h1 class="docs-article-title">{entry.data.title}</h1>
+  <div class="docs-prose">
+    <Content />
+  </div>
+  {showAgentCommands && (
+    <div class="mt-8">
+      <AgentCommandsSection />
+    </div>
+  )}
+</DocsLayout>

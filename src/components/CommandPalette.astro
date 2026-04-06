@@ -2,21 +2,24 @@
 
 <!-- Search overlay -->
 <div id="search-backdrop" class="overlay-backdrop" aria-hidden="true"></div>
-<div id="search-modal" class="overlay-modal" role="dialog" aria-modal="true" aria-label="Search specs">
+<div id="search-modal" class="overlay-modal" role="dialog" aria-modal="true" aria-label="Search site">
   <div class="viewscreen rounded-lg overflow-hidden hud-corners">
-    <div class="p-3 border-b border-surface0">
+    <div class="p-3 border-b border-surface0 flex items-center gap-3">
       <input
         id="search-input"
         type="text"
         class="search-input"
-        placeholder="Search specs..."
+        placeholder="Search the site..."
         autocomplete="off"
         spellcheck="false"
-        aria-label="Search specs"
+        aria-label="Search the site"
       />
+      <button id="search-close" type="button" class="overlay-close" aria-label="Close search">
+        Close
+      </button>
     </div>
     <ul id="search-results" class="max-h-72 overflow-y-auto py-1" aria-live="polite" aria-label="Search results"></ul>
-    <div class="px-3 py-2 border-t border-surface0 flex items-center gap-4 text-xs text-overlay0">
+    <div class="px-3 py-2 border-t border-surface0 flex items-center gap-4 text-xs text-subtext0">
       <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
       <span><kbd>Enter</kbd> open</span>
       <span><kbd>Esc</kbd> close</span>

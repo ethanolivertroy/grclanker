@@ -1,0 +1,15 @@
+{
+  "theme": "grclanker",
+  "quietStartup": true,
+  "collapseChangelog": true,
+  "agentScope": "both",
+  "skillDiscoveryMode": "bundled-only",
+  "computeBackend": "host",
+  "dockerImage": "ubuntu:24.04",
+  "dockerWorkspacePath": "/workspace",
+  "parallelsAutoStart": true,
+  "defaults": {
+    "framework": "NIST 800-53",
+    "riskModel": "EPSS"
+  }
+}

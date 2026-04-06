@@ -1,26 +1,106 @@
 ---
 import '../styles/global.css';
+import { getCollection } from 'astro:content';
 import CommandPalette from '../components/CommandPalette.astro';
 import ShortcutsHelp from '../components/ShortcutsHelp.astro';
+import { getDocHref } from '../lib/docs';
 import { categoryLabels, loadSpecs } from '../lib/specs';
 
 interface Props {
   title: string;
   description?: string;
+  searchEnabled?: boolean;
+  footerVariant?: 'default' | 'simple';
 }
 
-const { title, description = 'Bring your own clanker. Build your own compliance. Open-source spec files for GRC compliance automation.' } = Astro.props;
+const {
+  title,
+  description = 'CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Nothing leaves your machine.',
+  searchEnabled = true,
+  footerVariant = 'default',
+} = Astro.props;
 
-// Build search data for the command palette
-const searchData = loadSpecs().map((meta) => {
-  return {
-    slug: meta.slug,
-    name: meta.name,
-    vendor: meta.vendor,
-    category: meta.category,
-    categoryLabel: categoryLabels[meta.category] || meta.category,
-  };
-}).sort((a, b) => a.name.localeCompare(b.name));
+const primaryLinks = [
+  { href: '/', label: 'CLI' },
+  { href: '/docs', label: 'Docs' },
+  { href: '/specs', label: 'Specs' },
+  { href: '/about', label: 'About' },
+];
+
+const footerImages = [
+  '/footer/closeup.webp',
+  '/footer/skyline.webp',
+  '/footer/standby.webp',
+  '/footer/walkaway.webp',
+];
+
+const footerImage =
+  footerImages[
+    Array.from(Astro.url.pathname).reduce((sum, char) => sum + char.charCodeAt(0), 0) %
+      footerImages.length
+  ];
+
+const siteEntries = [
+  {
+    href: '/',
+    title: 'CLI',
+    meta: 'Homepage · Install, setup, workflows, and specs as inputs',
+    kind: 'Page',
+    priority: 0,
+    searchText: 'cli homepage install setup workflows specs inputs local first ollama gemma',
+  },
+  {
+    href: '/docs',
+    title: 'Docs',
+    meta: 'Documentation overview · Installation, setup, workflows, and spec inputs',
+    kind: 'Page',
+    priority: 0,
+    searchText: 'docs documentation installation quick start setup configuration workflows specs inputs',
+  },
+  {
+    href: '/specs',
+    title: 'Specs',
+    meta: 'Spec catalog · Browse and copy raw build plans',
+    kind: 'Page',
+    priority: 0,
+    searchText: 'specs spec catalog raw urls build plans compliance automation',
+  },
+  {
+    href: '/about',
+    title: 'About',
+    meta: 'Project overview · What grclanker is and where it is going',
+    kind: 'Page',
+    priority: 0,
+    searchText: 'about project overview terminal-first compliance tool grc cli',
+  },
+];
+
+const docs = await getCollection('docs');
+const docsEntries = docs.filter((entry) => entry.id !== 'index').map((entry) => ({
+  href: entry.id === 'index' ? '/docs' : getDocHref(entry.id),
+  title: entry.data.title,
+  meta: `Docs · ${entry.data.description}`,
+  kind: 'Docs',
+  priority: 1,
+  searchText: `${entry.data.title} ${entry.data.description} ${entry.id.replaceAll('/', ' ')}`,
+}));
+
+const specEntries = loadSpecs().map((meta) => ({
+  href: `/specs/${meta.slug}`,
+  title: meta.name,
+  meta: `${meta.vendor} · ${categoryLabels[meta.category] || meta.category}`,
+  kind: 'Spec',
+  priority: 2,
+  searchText: `${meta.name} ${meta.vendor} ${meta.slug} ${meta.category} ${categoryLabels[meta.category] || meta.category}`,
+}));
+
+const searchData = searchEnabled
+  ? [...siteEntries, ...docsEntries, ...specEntries].sort((a, b) =>
+      a.priority === b.priority
+        ? a.title.localeCompare(b.title)
+        : a.priority - b.priority,
+    )
+  : [];
 ---
 
 <!doctype html>
@@ -48,10 +128,12 @@ const searchData = loadSpecs().map((meta) => {
       Skip to content
     </a>
 
+    <div id="app-shell" class="flex min-h-screen flex-col">
     <!-- Nav -->
-    <nav class="border-b border-surface0/60 bg-mantle/80 backdrop-blur-sm sticky top-0 z-50" aria-label="Main navigation">
-      <div class="max-w-content mx-auto px-6 py-3 flex items-center justify-between">
-        <div class="flex items-center gap-2.5">
+    <nav class="border-b border-surface0/60 bg-mantle/95 sticky top-0 z-50" aria-label="Main navigation">
+      <div class="max-w-content mx-auto px-4 sm:px-6">
+        <div class="flex min-h-[4.25rem] items-center justify-between gap-4 py-2">
+        <div class="flex items-center gap-2.5 min-w-0">
           <a href="/" class="flex items-center gap-2 text-text hover:text-blue transition-colors group">
             <svg width="28" height="28" viewBox="0 0 28 28" fill="none" class="shrink-0">
               <!-- Antenna stalk -->
@@ -83,21 +165,30 @@ const searchData = loadSpecs().map((meta) => {
               <!-- Glow filter -->
               <defs><filter id="glow"><feGaussianBlur stdDeviation="1.5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
             </svg>
-            <span class="font-bold text-lg tracking-wider">GRCLANKER</span>
+            <span class="led led-live"></span>
+            <span class="font-bold text-lg tracking-[0.12em] nav-wordmark">GRCLANKER</span>
           </a>
           <a href="https://hackidle.com" class="text-overlay1 hover:text-blue text-[0.8125rem] transition-colors hidden sm:inline">by hackIDLE</a>
         </div>
-        <div class="flex items-center gap-4 md:gap-6 text-sm">
-          <button
-            onclick="window.__openSearch && window.__openSearch()"
-            class="flex items-center gap-2 text-subtext0 hover:text-blue border border-surface0/60 rounded-md px-2.5 py-1 transition-colors cursor-pointer text-xs"
-            aria-label="Search specs (press / or Cmd+K)"
-          >
-            Search <kbd class="hidden sm:inline">/</kbd>
-          </button>
-          <a href="/" class="hidden sm:inline text-subtext0 hover:text-blue transition-colors">Companion</a>
-          <a href="/specs" class="hidden sm:inline text-subtext0 hover:text-blue transition-colors">Specs</a>
-          <a href="/about" class="hidden sm:inline text-subtext0 hover:text-blue transition-colors">About</a>
+        <div class="hidden sm:flex items-center gap-4 md:gap-6 text-sm">
+          {searchEnabled && (
+            <button
+              onclick="window.__openSearch && window.__openSearch()"
+              class="nav-action-btn nav-search-btn"
+              aria-label="Search site (press / or Cmd+K)"
+            >
+              Search <kbd class="hidden sm:inline">/</kbd>
+            </button>
+          )}
+          {primaryLinks.map((link) => (
+            <a
+              href={link.href}
+              class:list={[
+                'nav-link',
+                (link.href === '/' ? Astro.url.pathname === '/' : Astro.url.pathname.startsWith(link.href)) ? 'is-active' : '',
+              ]}
+            >{link.label}</a>
+          ))}
           <a
             href="https://github.com/ethanolivertroy/grclanker"
             target="_blank"
@@ -108,6 +199,47 @@ const searchData = loadSpecs().map((meta) => {
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
           </a>
         </div>
+        <div class="flex sm:hidden items-center gap-2">
+          {searchEnabled && (
+            <button
+              type="button"
+              onclick="window.__openSearch && window.__openSearch()"
+              class="nav-icon-btn"
+              aria-label="Search site"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="7"></circle>
+                <path d="m20 20-3.5-3.5"></path>
+              </svg>
+            </button>
+          )}
+          <a
+            href="https://github.com/ethanolivertroy/grclanker"
+            target="_blank"
+            rel="noopener"
+            class="nav-icon-btn"
+            aria-label="GitHub repository"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          </a>
+          <button
+            id="mobile-nav-toggle"
+            type="button"
+            class="nav-action-btn"
+            aria-expanded="false"
+            aria-controls="mobile-nav-panel"
+          >
+            Menu
+          </button>
+        </div>
+        </div>
+        <div id="mobile-nav-panel" class="site-mobile-nav-panel sm:hidden hidden" aria-label="Mobile navigation">
+          <div class="site-mobile-nav-links">
+            {primaryLinks.map((link) => (
+              <a href={link.href} class="site-mobile-nav-link">{link.label}</a>
+            ))}
+          </div>
+        </div>
       </div>
     </nav>
 
@@ -117,61 +249,126 @@ const searchData = loadSpecs().map((meta) => {
     </main>
 
     <!-- Footer -->
-    <footer class="border-t border-surface0/60 bg-mantle/80 relative overflow-hidden">
-      <!-- Random footer image -->
-      <div class="absolute inset-0 w-full h-full">
-        <img id="footer-img" src="/footer/closeup.webp" alt="" class="w-full h-full object-cover object-center opacity-20" loading="lazy" />
-      </div>
-      <div class="max-w-content mx-auto px-6 py-3 flex items-center justify-between text-xs relative z-10">
-        <div class="flex items-center gap-4 text-subtext0">
-          <span>Built by <a href="https://ethantroy.dev" class="hover:text-blue">Ethan Troy</a></span>
-          <a href="/" class="hover:text-blue">Companion</a>
-          <a href="/specs" class="hover:text-blue">Specs</a>
-          <a href="/about" class="hover:text-blue">About</a>
-          <a href="https://github.com/ethanolivertroy/grclanker" target="_blank" rel="noopener" class="hover:text-blue">GitHub</a>
+    {footerVariant === 'default' ? (
+      <footer class="border-t border-surface0/60 bg-mantle/80">
+        <div class="footer-image-strip" aria-hidden="true">
+          <img src={footerImage} alt="" class="footer-image-strip-media" loading="lazy" />
+          <div class="footer-image-strip-overlay"></div>
         </div>
-        <span class="flex items-center gap-1.5 text-subtext0">
-          <span class="led led-live"></span>
-          <span class="hidden sm:inline">SYS NOMINAL</span>
-        </span>
-      </div>
-    </footer>
+        <div class="max-w-content mx-auto px-6 py-4 flex flex-col gap-3 text-xs text-subtext0 sm:flex-row sm:items-center sm:justify-between">
+          <div class="flex items-center gap-4 text-subtext0">
+            <span>Built by <a href="https://ethantroy.dev" class="hover:text-blue">Ethan Troy</a></span>
+            <a href="/" class="hover:text-blue">CLI</a>
+            <a href="/docs" class="hover:text-blue">Docs</a>
+            <a href="/specs" class="hover:text-blue">Specs</a>
+            <a href="/about" class="hover:text-blue">About</a>
+            <a href="https://github.com/ethanolivertroy/grclanker" target="_blank" rel="noopener" class="hover:text-blue">GitHub</a>
+          </div>
+          <span class="flex items-center gap-1.5 text-subtext0">
+            <span class="led led-live"></span>
+            <span class="hidden sm:inline italic">SYS NOMINAL</span>
+          </span>
+        </div>
+      </footer>
+    ) : (
+      <footer class="border-t border-surface0/60 bg-mantle/65">
+        <div class="footer-image-strip" aria-hidden="true">
+          <img src={footerImage} alt="" class="footer-image-strip-media" loading="lazy" />
+          <div class="footer-image-strip-overlay"></div>
+        </div>
+        <div class="max-w-6xl mx-auto px-6 py-6 flex flex-col gap-3 text-sm text-subtext0 sm:flex-row sm:items-center sm:justify-between">
+          <p>Reference docs for grclanker: install, workflows, specs, and build inputs.</p>
+          <div class="flex flex-wrap items-center gap-4">
+            <a href="/" class="hover:text-blue">CLI</a>
+            <a href="/specs" class="hover:text-blue">Specs</a>
+            <a href="https://github.com/ethanolivertroy/grclanker" target="_blank" rel="noopener" class="hover:text-blue">GitHub</a>
+          </div>
+        </div>
+      </footer>
+    )}
+    </div>
 
     <!-- Search data for command palette -->
-    <script type="application/json" id="spec-search-data" set:html={JSON.stringify(searchData)} />
+    {searchEnabled && (
+      <script type="application/json" id="site-search-data" set:html={JSON.stringify(searchData)} />
+    )}
 
     <!-- Overlays -->
-    <CommandPalette />
-    <ShortcutsHelp />
+    {searchEnabled && <CommandPalette />}
+    {searchEnabled && <ShortcutsHelp />}
 
     <!-- Keyboard shortcuts + search JS (must be in layout, not component, for dev mode) -->
+    {searchEnabled && (
     <script is:inline>
     (function() {
       var searchOpen = false;
       var helpOpen = false;
       var selectedIndex = 0;
       var results = [];
-      var specs = null;
+      var entries = null;
       var prevFocus = null;
+      var appShell = document.getElementById('app-shell');
 
       var searchBackdrop = document.getElementById('search-backdrop');
       var searchModal = document.getElementById('search-modal');
       var searchInput = document.getElementById('search-input');
       var searchResults = document.getElementById('search-results');
+      var searchClose = document.getElementById('search-close');
       var helpBackdrop = document.getElementById('help-backdrop');
       var helpModal = document.getElementById('help-modal');
+      var helpClose = document.getElementById('help-close');
       var copyToast = document.getElementById('copy-toast');
+      var mobileNavToggle = document.getElementById('mobile-nav-toggle');
+      var mobileNavPanel = document.getElementById('mobile-nav-panel');
 
-      function getSpecs() {
-        if (specs) return specs;
-        var el = document.getElementById('spec-search-data');
-        if (!el) return [];
-        specs = JSON.parse(el.textContent);
-        return specs;
+      function getActiveModal() {
+        if (searchOpen) return searchModal;
+        if (helpOpen) return helpModal;
+        return null;
       }
 
-      function scoreSpec(spec, q) {
-        var fields = [spec.name, spec.vendor, spec.categoryLabel, spec.slug];
+      function setShellInert(value) {
+        if (appShell) appShell.inert = value;
+      }
+
+      function getFocusable(container) {
+        if (!container) return [];
+        return Array.prototype.slice.call(
+          container.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])')
+        ).filter(function(el) {
+          return !el.hasAttribute('hidden') && el.offsetParent !== null;
+        });
+      }
+
+      function trapFocus(event, container) {
+        var focusables = getFocusable(container);
+        if (!focusables.length) return;
+        var first = focusables[0];
+        var last = focusables[focusables.length - 1];
+        if (!container.contains(document.activeElement)) {
+          event.preventDefault();
+          first.focus();
+          return;
+        }
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+
+      function getEntries() {
+        if (entries) return entries;
+        var el = document.getElementById('site-search-data');
+        if (!el) return [];
+        entries = JSON.parse(el.textContent);
+        return entries;
+      }
+
+      function scoreEntry(entry, q) {
+        var fields = [entry.title, entry.meta, entry.kind, entry.href, entry.searchText];
         var best = 0;
         for (var i = 0; i < fields.length; i++) {
           var f = (fields[i] || '').toLowerCase();
@@ -188,18 +385,18 @@ const searchData = loadSpecs().map((meta) => {
         return best;
       }
 
-      function searchSpecs(query) {
-        var all = getSpecs();
+      function searchSite(query) {
+        var all = getEntries();
         if (!query) return all.slice(0, 10);
         var q = query.toLowerCase().trim();
         if (!q) return all.slice(0, 10);
         var scored = [];
         for (var i = 0; i < all.length; i++) {
-          var s = scoreSpec(all[i], q);
-          if (s > 0) scored.push({ spec: all[i], score: s });
+          var s = scoreEntry(all[i], q);
+          if (s > 0) scored.push({ entry: all[i], score: s });
         }
         scored.sort(function(a, b) { return b.score - a.score; });
-        return scored.slice(0, 10).map(function(x) { return x.spec; });
+        return scored.slice(0, 10).map(function(x) { return x.entry; });
       }
 
       function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -209,13 +406,13 @@ const searchData = loadSpecs().map((meta) => {
         selectedIndex = 0;
         var html = '';
         for (var i = 0; i < items.length; i++) {
-          var sp = items[i];
-          html += '<li><a href="/specs/' + sp.slug + '" class="search-result' + (i===0?' active':'') + '" data-index="' + i + '">'
-            + '<div class="result-name">' + esc(sp.name) + '</div>'
-            + '<div class="result-meta">' + esc(sp.vendor) + ' &middot; ' + esc(sp.categoryLabel) + '</div>'
+          var item = items[i];
+          html += '<li><a href="' + item.href + '" class="search-result' + (i===0?' active':'') + '" data-index="' + i + '">'
+            + '<div class="result-name">' + esc(item.title) + '</div>'
+            + '<div class="result-meta">' + esc(item.kind) + ' &middot; ' + esc(item.meta) + '</div>'
             + '</a></li>';
         }
-        if (!items.length) html = '<li class="px-4 py-6 text-center"><img src="/empty-state.webp" alt="" class="w-24 h-24 mx-auto mb-3 rounded-lg object-cover"><span class="text-subtext0 text-sm block">No specs found</span></li>';
+        if (!items.length) html = '<li class="px-4 py-6 text-center"><img src="/empty-state.webp" alt="" class="w-24 h-24 mx-auto mb-3 rounded-lg object-cover"><span class="text-subtext0 text-sm block">No pages found</span></li>';
         searchResults.innerHTML = html;
       }
 
@@ -231,9 +428,10 @@ const searchData = loadSpecs().map((meta) => {
         searchOpen = true;
         searchBackdrop.classList.add('open');
         searchModal.classList.add('open');
+        setShellInert(true);
         document.body.style.overflow = 'hidden';
         searchInput.value = '';
-        renderResults(searchSpecs(''));
+        renderResults(searchSite(''));
         setTimeout(function() { searchInput.focus(); }, 50);
       }
 
@@ -241,6 +439,7 @@ const searchData = loadSpecs().map((meta) => {
         searchOpen = false;
         searchBackdrop.classList.remove('open');
         searchModal.classList.remove('open');
+        setShellInert(false);
         document.body.style.overflow = '';
         if (prevFocus && prevFocus.focus) prevFocus.focus();
         prevFocus = null;
@@ -252,13 +451,19 @@ const searchData = loadSpecs().map((meta) => {
         helpOpen = true;
         helpBackdrop.classList.add('open');
         helpModal.classList.add('open');
+        setShellInert(true);
         document.body.style.overflow = 'hidden';
+        setTimeout(function() {
+          var focusables = getFocusable(helpModal);
+          if (focusables[0]) focusables[0].focus();
+        }, 50);
       }
 
       function closeHelp() {
         helpOpen = false;
         helpBackdrop.classList.remove('open');
         helpModal.classList.remove('open');
+        setShellInert(false);
         document.body.style.overflow = '';
         if (prevFocus && prevFocus.focus) prevFocus.focus();
         prevFocus = null;
@@ -274,17 +479,51 @@ const searchData = loadSpecs().map((meta) => {
         setTimeout(function() { copyToast.classList.remove('show'); }, 1500);
       }
 
-      searchInput.addEventListener('input', function() { renderResults(searchSpecs(this.value)); });
+      searchInput.addEventListener('input', function() { renderResults(searchSite(this.value)); });
       searchBackdrop.addEventListener('click', closeSearch);
       helpBackdrop.addEventListener('click', closeHelp);
+      if (searchClose) searchClose.addEventListener('click', closeSearch);
+      if (helpClose) helpClose.addEventListener('click', closeHelp);
       searchResults.addEventListener('click', function(e) { if (e.target.closest('.search-result')) closeSearch(); });
       searchResults.addEventListener('mousemove', function(e) {
         var link = e.target.closest('.search-result');
         if (link) { var idx = parseInt(link.getAttribute('data-index'),10); if (!isNaN(idx) && idx !== selectedIndex) { selectedIndex = idx; updateActive(); } }
       });
+      if (mobileNavToggle && mobileNavPanel) {
+        mobileNavToggle.addEventListener('click', function() {
+          var expanded = mobileNavToggle.getAttribute('aria-expanded') === 'true';
+          mobileNavToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+          mobileNavPanel.classList.toggle('hidden', expanded);
+          if (!expanded) {
+            var firstLink = mobileNavPanel.querySelector('a');
+            if (firstLink) firstLink.focus();
+          }
+        });
+        mobileNavPanel.querySelectorAll('a').forEach(function(link) {
+          link.addEventListener('click', function() {
+            mobileNavPanel.classList.add('hidden');
+            mobileNavToggle.setAttribute('aria-expanded', 'false');
+          });
+        });
+        mobileNavPanel.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape') {
+            mobileNavPanel.classList.add('hidden');
+            mobileNavToggle.setAttribute('aria-expanded', 'false');
+            mobileNavToggle.focus();
+          }
+          if (e.key === 'Tab') {
+            trapFocus(e, mobileNavPanel);
+          }
+        });
+      }
 
       document.addEventListener('keydown', function(e) {
         var inInput = /^(input|textarea|select)$/i.test(e.target.tagName);
+        var activeModal = getActiveModal();
+        if (activeModal && e.key === 'Tab') {
+          trapFocus(e, activeModal);
+          return;
+        }
         if ((e.metaKey||e.ctrlKey) && e.key==='k') { e.preventDefault(); searchOpen ? closeSearch() : openSearch(); return; }
         if (e.key==='Escape') { if (searchOpen) { closeSearch(); e.preventDefault(); } else if (helpOpen) { closeHelp(); e.preventDefault(); } return; }
         if (searchOpen) {
@@ -302,14 +541,19 @@ const searchData = loadSpecs().map((meta) => {
       });
 
       window.__openSearch = openSearch;
-    })();
-    // Randomize footer image
-    (function(){
-      var footers = ['/footer/walkaway.webp','/footer/skyline.webp','/footer/standby.webp','/footer/closeup.webp'];
-      var img = document.getElementById('footer-img');
-      if (img) img.src = footers[Math.floor(Math.random() * footers.length)];
+
+      console.log(
+        '%c  ┌─────────────────────────┐\n' +
+        '  │  (@>@)  GRCLANKER       │\n' +
+        '  │  /(   )\\  v0.0.1        │\n' +
+        '  │   `---´                 │\n' +
+        '  │  Put a clanker on it.   │\n' +
+        '  │  github.com/ethanolivertroy/grclanker  │\n' +
+        '  └─────────────────────────┘',
+        'color: #8caaee; font-family: monospace;'
+      );
     })();
     </script>
-
+    )}
   </body>
 </html>

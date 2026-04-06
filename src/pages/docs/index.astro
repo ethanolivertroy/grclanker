@@ -1,0 +1,35 @@
+---
+import { getEntry, render } from 'astro:content';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+
+const entry = await getEntry('docs', 'index');
+
+if (!entry) {
+  throw new Error('Missing docs index entry');
+}
+
+const { Content } = await render(entry);
+---
+
+<DocsLayout
+  title={`${entry.data.title} — grclanker docs`}
+  description={entry.data.description}
+  currentSlug=""
+>
+  <section class="page-image-break docs-index-break" aria-label="Docs ambient frame">
+    <img
+      src="/footer/skyline.webp"
+      alt=""
+      class="page-image-break-image"
+      loading="eager"
+    />
+    <div class="page-image-break-overlay">
+      <span class="page-image-break-pill">Install // setup // local-first // build from specs</span>
+    </div>
+  </section>
+
+  <h1 class="docs-article-title">{entry.data.title}</h1>
+  <div class="docs-prose">
+    <Content />
+  </div>
+</DocsLayout>

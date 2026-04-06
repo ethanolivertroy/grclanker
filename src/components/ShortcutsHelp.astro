@@ -4,11 +4,16 @@
   <div class="viewscreen rounded-lg p-6 hud-corners">
     <div class="flex items-center justify-between mb-4">
       <span class="hud-label">Keyboard Shortcuts</span>
-      <span class="text-xs text-subtext0">Press <kbd>?</kbd> or <kbd>Esc</kbd> to close</span>
+      <div class="flex items-center gap-3">
+        <span class="text-xs text-subtext0">Press <kbd>?</kbd> or <kbd>Esc</kbd> to close</span>
+        <button id="help-close" type="button" class="overlay-close" aria-label="Close keyboard shortcuts">
+          Close
+        </button>
+      </div>
     </div>
     <dl class="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
       <div class="flex items-center justify-between gap-3">
-        <dt class="text-subtext1">Search specs</dt>
+        <dt class="text-subtext1">Search site</dt>
         <dd><kbd>/</kbd> or <kbd>Cmd+K</kbd></dd>
       </div>
       <div class="flex items-center justify-between gap-3">

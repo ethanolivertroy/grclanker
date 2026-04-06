@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+cli/.cache/
+cli/release/
 
 # Astro
 dist/
@@ -24,6 +26,7 @@ Thumbs.db
 .claude/
 .factory/
 skills-lock.json
+grclanker-local/
 
 # Internal docs (mascots, design refs, marketing)
-docs/
+/docs/

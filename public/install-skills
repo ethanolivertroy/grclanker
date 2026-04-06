@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_OWNER="${GRCLANKER_REPO_OWNER:-ethanolivertroy}"
+REPO_NAME="${GRCLANKER_REPO_NAME:-grclanker}"
+DEFAULT_RELEASE_VERSION="${GRCLANKER_RELEASE_VERSION:-0.0.1}"
+REF="${GRCLANKER_REF:-v${DEFAULT_RELEASE_VERSION}}"
+VERSION="${GRCLANKER_VERSION:-}"
+SKILL_URL_OVERRIDE="${GRCLANKER_SKILL_URL:-}"
+TARGET_SCOPE="user"
+POSITIONAL_VERSION=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --repo) TARGET_SCOPE="repo" ;;
+    --user) TARGET_SCOPE="user" ;;
+    *)
+      if [ -z "$POSITIONAL_VERSION" ]; then
+        POSITIONAL_VERSION="$arg"
+      else
+        printf "Usage: install-skills [latest|<version>] [--user|--repo]\n" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [ -n "$POSITIONAL_VERSION" ]; then
+  VERSION="$POSITIONAL_VERSION"
+fi
+
+if [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
+  REF="v${VERSION#v}"
+fi
+
+if [ "$TARGET_SCOPE" = "repo" ]; then
+  TARGET_DIR=".agents/skills/grclanker"
+else
+  TARGET_DIR="${HOME}/.codex/skills/grclanker"
+fi
+
+if [ -n "$SKILL_URL_OVERRIDE" ]; then
+  RAW_URL="$SKILL_URL_OVERRIDE"
+else
+  RAW_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REF}/skills/grclanker/SKILL.md"
+fi
+
+mkdir -p "$TARGET_DIR"
+curl -fsSL "$RAW_URL" -o "${TARGET_DIR}/SKILL.md"
+
+printf "\nInstalled grclanker skill into %s\n" "$TARGET_DIR"
+printf "Use it when you need CMVP, KEV, EPSS, or framework-mapped GRC analysis.\n\n"

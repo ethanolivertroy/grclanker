@@ -11,7 +11,6 @@ import Base from '../layouts/Base.astro';
     </div>
     <div class="absolute inset-0 bg-gradient-to-b from-base/30 via-base/60 to-base pointer-events-none"></div>
     <div class="relative z-10 max-w-content mx-auto px-6 pt-24 pb-16 text-center">
-      <p class="hud-label mb-4">About</p>
       <h1 class="font-bold text-3xl md:text-4xl text-text hero-text-shadow">
         What is grclanker
       </h1>
@@ -19,44 +18,70 @@ import Base from '../layouts/Base.astro';
   </section>
 
   <div class="max-w-content mx-auto px-6 pb-12">
-    <div class="max-w-2xl">
-      <div class="viewscreen rounded-lg p-6 md:p-8 scanlines relative -mt-8">
-        <div class="relative z-10 space-y-5 text-subtext1 leading-relaxed">
-          <p>
-            <strong class="text-text">grclanker</strong> is a collection of open-source spec files for building GRC compliance automation tools.
-            Each spec describes a Go CLI tool that connects to a vendor's API, pulls security configuration data, and maps findings to compliance frameworks
-            &mdash; FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, and STIG.
-          </p>
+    <div class="about-intro-grid">
+      <div class="about-copy-stack">
+        <div class="viewscreen rounded-lg p-6 md:p-8 scanlines relative -mt-8">
+          <div class="relative z-10 space-y-5 text-subtext1 leading-relaxed">
+            <div class="flex flex-wrap gap-4 justify-center md:justify-start">
+              <img src="/badges/audited-by-clanker.webp" alt="Audited by Clanker badge" class="h-24 w-24 rounded-full" loading="lazy" />
+              <img src="/badges/spec-driven.webp" alt="Spec Driven badge" class="h-24 w-24 rounded-full" loading="lazy" />
+            </div>
 
-          <p>
-            The idea: take a spec, feed it to your AI coding agent, get a working compliance automation tool.
-            No agents to install. No SaaS platform to buy. Just a file that tells the machine what to build.
-          </p>
+            <div class="text-sm text-subtext0 space-y-1.5 font-mono">
+              <p>Built by <a href="https://ethantroy.dev">Ethan Troy</a></p>
+              <p><a href="https://ethantroy.dev">ethantroy.dev</a></p>
+              <p><a href="https://github.com/ethanolivertroy/grclanker">GitHub</a></p>
+            </div>
 
-          <p>
-            Every spec follows the same 10-section structure: overview, APIs, authentication, security controls,
-            framework mappings, existing tools, architecture, CLI interface, build sequence, and status.
-            This consistency means agents can reliably parse and implement them.
-          </p>
+            <div class="hud-divider !my-7"></div>
 
-          <p>
-            Specs cover 31 FedRAMP Marketplace services across cloud infrastructure, identity management,
-            security tooling, vulnerability management, monitoring, SaaS, and DevOps platforms.
-          </p>
+            <p>
+              <strong class="text-text">grclanker</strong> is a terminal-first compliance tool built on Pi, plus a raw spec library for building GRC automation. CMVP certificate lookups, KEV and EPSS triage, and framework-mapped posture work ship in the first release.
+            </p>
+
+            <p>
+              The project exists because compliance evidence is scattered across vendor dashboards, government feeds, and spreadsheets that nobody wants to maintain. grclanker pulls that evidence into one terminal session, maps it to controls, and keeps everything on your machine.
+            </p>
+
+            <p>
+              The spec library is the second half. Each spec is a structured build plan for a vendor-specific GRC tool — APIs, auth model, controls, mappings, architecture, CLI, and build sequence. Feed a spec to any agent and it has enough context to start building.
+            </p>
+
+            <p>
+              Specs cover FedRAMP Marketplace services across cloud infrastructure, identity, security tooling, vulnerability management, and monitoring. The raw files are agent-agnostic and URL-first — grab them from <a href="/specs" class="text-blue hover:underline">/specs</a>.
+            </p>
+          </div>
         </div>
       </div>
 
-      <!-- Badges -->
-      <div class="flex flex-wrap gap-4 mt-8 justify-center">
-        <img src="/badges/audited-by-clanker.webp" alt="Audited by Clanker badge" class="h-24 w-24 rounded-full" loading="lazy" />
-        <img src="/badges/spec-driven.webp" alt="Spec Driven badge" class="h-24 w-24 rounded-full" loading="lazy" />
-      </div>
-
-      <div class="mt-8 text-sm text-subtext0 space-y-1.5 font-mono">
-        <p>Built by <a href="https://ethantroy.dev">Ethan Troy</a></p>
-        <p><a href="https://ethantroy.dev">ethantroy.dev</a></p>
-        <p><a href="https://github.com/ethanolivertroy/grclanker">GitHub</a></p>
-      </div>
+      <aside class="about-robot-column" aria-label="grclanker field unit">
+        <div class="about-robot-card">
+          <div class="about-robot-meta">
+            <span class="hud-label">Field Unit</span>
+            <span class="about-robot-status"><span class="led led-live"></span> Local-first CLI</span>
+          </div>
+          <div class="about-robot-figure">
+            <img
+              src="/about/grclanker-robot-v1-transparent.png"
+              alt="Full-body illustration of the grclanker robot"
+              class="about-robot-image"
+              loading="lazy"
+            />
+          </div>
+        </div>
+      </aside>
     </div>
+
+    <section class="page-image-break mt-8" aria-label="About ambient frame">
+      <img
+        src="/footer/standby.webp"
+        alt=""
+        class="page-image-break-image"
+        loading="lazy"
+      />
+      <div class="page-image-break-overlay">
+        <span class="page-image-break-pill">Open source // local-first // experimental by design</span>
+      </div>
+    </section>
   </div>
 </Base>

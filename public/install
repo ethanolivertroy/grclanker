@@ -3,25 +3,62 @@ set -euo pipefail
 
 REPO_OWNER="${GRCLANKER_REPO_OWNER:-ethanolivertroy}"
 REPO_NAME="${GRCLANKER_REPO_NAME:-grclanker}"
-REF="${GRCLANKER_REF:-main}"
-ARCHIVE_URL="${GRCLANKER_ARCHIVE_URL:-https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REF}}"
-PACKAGE_SUBDIR="companion"
+VERSION="${GRCLANKER_VERSION:-latest}"
+INSTALL_DIR="${GRCLANKER_INSTALL_DIR:-$HOME/.local/share/grclanker}"
+BIN_DIR="${GRCLANKER_BIN_DIR:-$HOME/.local/bin}"
+BIN_PATH="${BIN_DIR}/grclanker"
+ASSET_URL_OVERRIDE="${GRCLANKER_ASSET_URL:-}"
+RELEASE_BASE_URL="${GRCLANKER_RELEASE_BASE_URL:-}"
+TARGET_OVERRIDE="${GRCLANKER_INSTALL_TARGET:-}"
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 
-# ── Colors ──────────────────────────────────────────────────────────
-if [ -t 1 ]; then
-  B="\033[1m" D="\033[2m"
-  BLUE="\033[38;2;140;170;238m"
-  GREEN="\033[38;2;166;209;137m"
-  RED="\033[38;2;231;130;132m"
-  R="\033[0m"
-else
-  B="" D="" BLUE="" GREEN="" RED="" R=""
+if [ "$#" -gt 1 ]; then
+  printf "Usage: install [latest|<version>]\n" >&2
+  exit 1
 fi
 
-log()  { printf "  ${BLUE}▸${R} %s\n" "$*"; }
-ok()   { printf "  ${GREEN}✓${R} %s\n" "$*"; }
-warn() { printf "  ${RED}!${R} %s\n" "$*" >&2; }
+if [ "$#" -eq 1 ]; then
+  VERSION="$1"
+fi
+
+if [ -t 1 ]; then
+  B="\033[1m"
+  BLUE="\033[38;2;140;170;238m"
+  MAUVE="\033[38;2;202;158;230m"
+  LAVENDER="\033[38;2;186;187;241m"
+  GREEN="\033[38;2;166;209;137m"
+  YELLOW="\033[38;2;229;200;144m"
+  RED="\033[38;2;231;130;132m"
+  DIM="\033[38;2;140;143;161m"
+  INK="\033[38;2;198;208;245m"
+  R="\033[0m"
+else
+  B="" BLUE="" MAUVE="" LAVENDER="" GREEN="" YELLOW="" RED="" DIM="" INK="" R=""
+fi
+
+STEP=0
+STEPS=6
+step() {
+  STEP=$((STEP + 1))
+  printf "  ${DIM}[%d/%d]${R} ${GREEN}✓${R} %s\n" "$STEP" "$STEPS" "$*"
+}
+log()  { printf "  ${DIM}[%d/%d]${R} ${BLUE}▸${R} %s\n" "$((STEP + 1))" "$STEPS" "$*"; }
+ok()   { step "$@"; }
+warn() { printf "  ${YELLOW}!${R} %s\n" "$*" >&2; }
 fail() { printf "  ${RED}✗${R} %s\n" "$*" >&2; exit 1; }
+
+spin() {
+  local pid=$1 msg=$2
+  local frames=("⣾" "⣽" "⣻" "⢿" "⡿" "⣟" "⣯" "⣷")
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${DIM}[%d/%d]${R} ${BLUE}${frames[$i]}${R} %s" "$((STEP + 1))" "$STEPS" "$msg"
+    i=$(( (i + 1) % ${#frames[@]} ))
+    sleep 0.08
+  done
+  wait "$pid"
+  return $?
+}
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
@@ -31,26 +68,319 @@ banner() {
   printf "\n"
   printf "${BLUE}    ____ ____   ____ _        _    _   _ _  _______ ____  ${R}\n"
   printf "${BLUE}   / ___|  _ \\\\ / ___| |      / \\\\  | \\\\ | | |/ / ____|  _ \\\\ ${R}\n"
-  printf "${BLUE}  | |  _| |_) | |   | |     / _ \\\\ |  \\\\| | ' /|  _| | |_) |${R}\n"
-  printf "${BLUE}  | |_| |  _ <| |___| |___ / ___ \\\\| |\\\\  | . \\\\| |___|  _ < ${R}\n"
-  printf "${BLUE}   \\\\____|_| \\\\_\\\\\\\\____|_____/_/   \\\\_\\\\_| \\\\_|_|\\\\_\\\\_____|_| \\\\_\\\\${R}\n"
+  printf "${MAUVE}  | |  _| |_) | |   | |     / _ \\\\ |  \\\\| | ' /|  _| | |_) |${R}\n"
+  printf "${MAUVE}  | |_| |  _ <| |___| |___ / ___ \\\\| |\\\\  | . \\\\| |___|  _ < ${R}\n"
+  printf "${LAVENDER}   \\\\____|_| \\\\_\\\\\\\\____|_____/_/   \\\\_\\\\_| \\\\_|_|\\\\_\\\\_____|_| \\\\_\\\\${R}\n"
   printf "\n"
-  printf "  ${D}Local GRC companion on Pi${R}\n\n"
+  printf "  ${DIM}https://ethantroy.dev // https://hackidle.com${R}\n\n"
+}
+
+normalize_version() {
+  printf "%s" "${1#v}"
+}
+
+resolve_script_dir() {
+  if [ -z "$SCRIPT_PATH" ]; then
+    return 1
+  fi
+
+  if [ ! -f "$SCRIPT_PATH" ]; then
+    return 1
+  fi
+
+  cd "$(dirname "$SCRIPT_PATH")" && pwd
+}
+
+read_local_cli_version() {
+  local package_json
+  local candidates=()
+
+  if script_dir="$(resolve_script_dir 2>/dev/null)"; then
+    candidates+=("$(cd "${script_dir}/.." && pwd)/cli/package.json")
+  fi
+  candidates+=("$(pwd)/cli/package.json")
+
+  for package_json in "${candidates[@]}"; do
+    [ -f "$package_json" ] || continue
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$package_json" | head -n 1
+    return 0
+  done
+
+  return 1
+}
+
+find_local_asset() {
+  local target="$1"
+  local archive_ext="$2"
+  local version_filter="${3:-}"
+  local pattern
+  local search_dirs=()
+  local candidate=""
+  local preferred_version=""
+
+  if script_dir="$(resolve_script_dir 2>/dev/null)"; then
+    search_dirs+=("$(cd "${script_dir}/.." && pwd)/cli/release")
+  fi
+  search_dirs+=("$(pwd)/cli/release")
+
+  for dir in "${search_dirs[@]}"; do
+    [ -d "$dir" ] || continue
+
+    if [ -n "$version_filter" ] && [ "$version_filter" != "latest" ]; then
+      pattern="grclanker-${version_filter}-${target}.${archive_ext}"
+      if [ -f "${dir}/${pattern}" ]; then
+        printf "%s\n" "${dir}/${pattern}"
+        return 0
+      fi
+      continue
+    fi
+
+    if preferred_version="$(read_local_cli_version 2>/dev/null)" && [ -n "$preferred_version" ]; then
+      pattern="grclanker-${preferred_version}-${target}.${archive_ext}"
+      if [ -f "${dir}/${pattern}" ]; then
+        printf "%s\n" "${dir}/${pattern}"
+        return 0
+      fi
+    fi
+
+    candidate="$(find "$dir" -maxdepth 1 -type f -name "grclanker-*-${target}.${archive_ext}" | sort -V | tail -n 1)"
+    if [ -n "$candidate" ]; then
+      printf "%s\n" "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_latest_release_asset() {
+  local target="$1"
+  local archive_ext="$2"
+  local api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=30"
+  local response current_tag="" current_asset_name="" asset_url="" line=""
+
+  response="$(curl -fsSL -H "Accept: application/vnd.github+json" "$api_url" 2>/dev/null)" || return 1
+
+  while IFS= read -r line; do
+    case "$line" in
+      *'"tag_name":'*)
+        current_tag="$(printf "%s" "$line" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+        ;;
+      *'"name":'*)
+        current_asset_name="$(printf "%s" "$line" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+        case "$current_asset_name" in
+          grclanker-*-"${target}.${archive_ext}") ;;
+          *) current_asset_name="" ;;
+        esac
+        ;;
+      *'"browser_download_url":'*)
+        if [ -z "$current_asset_name" ] || [ -z "$current_tag" ]; then
+          continue
+        fi
+
+        asset_url="$(printf "%s" "$line" | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+        if [ -n "$asset_url" ]; then
+          printf "%s\n%s\n%s\n" "$(normalize_version "$current_tag")" "$current_asset_name" "$asset_url"
+          return 0
+        fi
+        ;;
+    esac
+  done <<EOF
+$response
+EOF
+
+  return 1
+}
+
+detect_target() {
+  if [ -n "$TARGET_OVERRIDE" ]; then
+    printf "%s" "$TARGET_OVERRIDE"
+    return 0
+  fi
+
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$os" in
+    Darwin) os="darwin" ;;
+    Linux)
+      os="linux"
+      if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        :
+      elif ldd --version 2>&1 | grep -qi 'musl'; then
+        fail "Linux musl hosts are not supported by release bundles yet. Use npm install -g @grclanker/cli or bun install -g @grclanker/cli instead."
+      fi
+      ;;
+    *) fail "unsupported operating system: $os" ;;
+  esac
+
+  case "$arch" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64) arch="x64" ;;
+    *) fail "unsupported architecture: $arch" ;;
+  esac
+
+  printf "%s-%s" "$os" "$arch"
+}
+
+asset_extension_for_target() {
+  case "$1" in
+    win32-*) printf "zip" ;;
+    *) printf "tar.gz" ;;
+  esac
+}
+
+fallback_instructions() {
+  printf "\n"
+  warn "Release bundle unavailable for ${1}."
+  printf "  ${DIM}Fallbacks:${R}\n"
+  printf "    npm install -g @grclanker/cli\n"
+  printf "    bun install -g @grclanker/cli\n"
+  printf "\n"
+  fail "Install aborted."
+}
+
+extract_archive() {
+  local archive_path="$1"
+  local install_dir="$2"
+  local entry=""
+
+  if [ -z "$install_dir" ]; then
+    fail "Refusing to extract — install directory is empty"
+  fi
+
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+      /*) fail "Refusing to extract unsafe archive entry: $entry" ;;
+    esac
+    if printf "%s" "$entry" | grep -Eq '(^|/)\.\.(/|$)'; then
+      fail "Refusing to extract unsafe archive entry: $entry"
+    fi
+  done <<EOF
+$(tar -tzf "$archive_path")
+EOF
+
+  rm -rf "$install_dir"
+  mkdir -p "$install_dir"
+  tar -xzf "$archive_path" -C "$install_dir"
+}
+
+verify_checksum() {
+  local archive_path="$1"
+  local archive_name="$2"
+  local checksums_path="${tmp_dir}/SHA256SUMS.txt"
+  local checksums_url=""
+
+  # Determine where to fetch checksums from
+  if [ -n "$ASSET_URL_OVERRIDE" ]; then
+    warn "Skipping checksum verification — custom GRCLANKER_ASSET_URL in use"
+    return 0
+  elif printf "%s" "$ASSET_URL" | grep -q '^file://'; then
+    local local_dir
+    local_dir="$(dirname "${ASSET_URL#file://}")"
+    if [ -f "${local_dir}/SHA256SUMS.txt" ]; then
+      cp "${local_dir}/SHA256SUMS.txt" "$checksums_path"
+    else
+      warn "No SHA256SUMS.txt found alongside local artifact — skipping verification"
+      return 0
+    fi
+  elif [ -n "$RELEASE_BASE_URL" ]; then
+    checksums_url="${RELEASE_BASE_URL%/}/SHA256SUMS.txt"
+  else
+    checksums_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/SHA256SUMS.txt"
+  fi
+
+  if [ -n "$checksums_url" ]; then
+    if ! curl -fsSL "$checksums_url" -o "$checksums_path" 2>/dev/null; then
+      warn "Could not fetch SHA256SUMS.txt — skipping checksum verification"
+      return 0
+    fi
+  fi
+
+  # Verify the archive against the checksum file
+  local expected
+  expected="$(grep "  ${archive_name}\$" "$checksums_path" 2>/dev/null || grep " ${archive_name}\$" "$checksums_path" 2>/dev/null || true)"
+
+  if [ -z "$expected" ]; then
+    warn "No checksum entry for ${archive_name} in SHA256SUMS.txt — skipping verification"
+    return 0
+  fi
+
+  local expected_hash
+  expected_hash="$(printf "%s" "$expected" | awk '{print $1}')"
+
+  local actual_hash
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_hash="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+  else
+    warn "Neither sha256sum nor shasum found — skipping checksum verification"
+    return 0
+  fi
+
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    fail "Checksum mismatch for ${archive_name} — expected ${expected_hash}, got ${actual_hash}. The download may be corrupted or tampered with."
+  fi
 }
 
 banner
 
 need_cmd curl
 need_cmd tar
-need_cmd node
-need_cmd npm
-ok "Prerequisites found"
+ok "Prerequisites verified"
 
-node_major="$(node -p "Number(process.versions.node.split('.')[0])")"
-if [ "$node_major" -lt 20 ]; then
-  fail "Node.js 20+ is required (found $(node -v))"
+TARGET="$(detect_target)"
+ARCHIVE_EXT="$(asset_extension_for_target "$TARGET")"
+LOCAL_ASSET_PATH=""
+
+if [ "$VERSION" != "latest" ]; then
+  VERSION="$(normalize_version "$VERSION")"
+  if LOCAL_ASSET_PATH="$(find_local_asset "$TARGET" "$ARCHIVE_EXT" "$VERSION")" && [ -n "$LOCAL_ASSET_PATH" ]; then
+    ASSET_URL="file://${LOCAL_ASSET_PATH}"
+    ASSET_NAME="$(basename "$LOCAL_ASSET_PATH")"
+    TAG="v${VERSION}"
+  fi
 fi
-ok "Node.js $(node -v)"
+
+if [ "${ASSET_URL:-}" = "" ] && [ "$VERSION" = "latest" ]; then
+  if LOCAL_ASSET_PATH="$(find_local_asset "$TARGET" "$ARCHIVE_EXT" latest)" && [ -n "$LOCAL_ASSET_PATH" ]; then
+    VERSION="$(basename "$LOCAL_ASSET_PATH" | sed -E "s/^grclanker-([^-]+)-${TARGET//\//\\/}\.${ARCHIVE_EXT//./\\.}$/\\1/")"
+    ASSET_URL="file://${LOCAL_ASSET_PATH}"
+    ASSET_NAME="$(basename "$LOCAL_ASSET_PATH")"
+    TAG="v${VERSION}"
+    printf "  ${DIM}       Using local artifact ${ASSET_NAME}${R}\n"
+  else
+    log "Resolving latest release"
+    if RELEASE_INFO="$(resolve_latest_release_asset "$TARGET" "$ARCHIVE_EXT")"; then
+      VERSION="$(printf "%s" "$RELEASE_INFO" | sed -n '1p')"
+      ASSET_NAME="$(printf "%s" "$RELEASE_INFO" | sed -n '2p')"
+      ASSET_URL="$(printf "%s" "$RELEASE_INFO" | sed -n '3p')"
+      TAG="v${VERSION}"
+    else
+      fallback_instructions "$TARGET"
+    fi
+  fi
+fi
+
+if [ -n "$ASSET_URL_OVERRIDE" ]; then
+  warn "GRCLANKER_ASSET_URL is set — downloading from a non-default source"
+  ASSET_URL="$ASSET_URL_OVERRIDE"
+  ASSET_NAME="${ASSET_NAME:-$(basename "$ASSET_URL_OVERRIDE")}"
+elif [ -n "$RELEASE_BASE_URL" ]; then
+  warn "GRCLANKER_RELEASE_BASE_URL is set — downloading from a non-default source"
+  VERSION="$(normalize_version "$VERSION")"
+  TAG="v${VERSION}"
+  ASSET_NAME="${ASSET_NAME:-grclanker-${VERSION}-${TARGET}.${ARCHIVE_EXT}}"
+  ASSET_URL="${RELEASE_BASE_URL%/}/${ASSET_NAME}"
+elif [ -z "${ASSET_URL:-}" ]; then
+  VERSION="$(normalize_version "$VERSION")"
+  TAG="v${VERSION}"
+  ASSET_NAME="${ASSET_NAME:-grclanker-${VERSION}-${TARGET}.${ARCHIVE_EXT}}"
+  ASSET_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/${ASSET_NAME}"
+fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/grclanker-install.XXXXXX")"
 cleanup() {
@@ -58,67 +388,98 @@ cleanup() {
 }
 trap cleanup EXIT
 
-archive_path="$tmp_dir/grclanker.tar.gz"
+archive_path="${tmp_dir}/${ASSET_NAME}"
 
-log "Fetching ${REPO_OWNER}/${REPO_NAME} @ ${REF}"
-curl -fsSL "$ARCHIVE_URL" -o "$archive_path"
-ok "Downloaded"
+ok "Detected ${LAVENDER}${TARGET}${R}"
 
-log "Unpacking"
-tar -xzf "$archive_path" -C "$tmp_dir"
-
-source_root="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n 1)"
-[ -n "$source_root" ] || fail "unable to locate unpacked source tree"
-
-package_dir="${source_root}/${PACKAGE_SUBDIR}"
-[ -d "$package_dir" ] || fail "missing package directory: ${PACKAGE_SUBDIR}"
-
-cd "$package_dir"
-
-log "Installing dependencies"
-npm install --no-fund --no-audit >/dev/null 2>&1
-ok "Dependencies installed"
-
-log "Building"
-npm run build >/dev/null 2>&1
-ok "Built"
-
-log "Installing global command"
-if ! npm install -g . --no-fund --no-audit >/dev/null 2>&1; then
-  fail "Global install failed. Ensure npm global prefix is writable."
-fi
-
-global_bin="$(npm prefix -g)/bin"
-
-if [ -x "${global_bin}/grclanker" ]; then
-  ok "Installed → ${global_bin}/grclanker"
+if [ -t 1 ]; then
+  curl -fsSL "$ASSET_URL" -o "$archive_path" &
+  if ! spin $! "Downloading ${ASSET_NAME}"; then
+    printf "\r\033[K"
+    fallback_instructions "$TARGET"
+  fi
+  printf "\r\033[K"
+  ok "Downloaded ${DIM}${ASSET_NAME}${R}"
 else
-  warn "Install completed but ${global_bin}/grclanker not found"
+  log "Downloading ${ASSET_NAME}"
+  if ! curl -fsSL "$ASSET_URL" -o "$archive_path"; then
+    fallback_instructions "$TARGET"
+  fi
+  ok "Downloaded"
 fi
 
-if [[ ":$PATH:" != *":${global_bin}:"* ]]; then
-  warn "your PATH does not include ${global_bin}"
+verify_checksum "$archive_path" "$ASSET_NAME"
+ok "Integrity verified"
+
+mkdir -p "$BIN_DIR"
+extract_archive "$archive_path" "$INSTALL_DIR"
+ok "Installed to ${LAVENDER}${INSTALL_DIR}${R}"
+
+if [ -n "$(command -v grclanker 2>/dev/null)" ] && [ "$(command -v grclanker)" != "$BIN_PATH" ]; then
+  warn "Another grclanker command is already on PATH: $(command -v grclanker)"
+fi
+
+rm -f "$BIN_PATH"
+ln -s "${INSTALL_DIR}/grclanker" "$BIN_PATH"
+ok "Linked ${LAVENDER}${BIN_PATH}${R}"
+
+if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
+  warn "your PATH does not include ${BIN_DIR}"
   shell_name="$(basename "${SHELL:-}")"
   case "$shell_name" in
     zsh)
-      warn "add this to ~/.zshrc: export PATH=\"${global_bin}:\$PATH\""
+      warn "add this to ~/.zshrc: export PATH=\"${BIN_DIR}:\$PATH\""
       ;;
     bash)
-      warn "add this to ~/.bashrc: export PATH=\"${global_bin}:\$PATH\""
+      warn "add this to ~/.bashrc: export PATH=\"${BIN_DIR}:\$PATH\""
       ;;
     *)
-      warn "export PATH=\"${global_bin}:\$PATH\" before running grclanker"
+      warn "export PATH=\"${BIN_DIR}:\$PATH\" before running grclanker"
       ;;
   esac
 fi
 
+ELAPSED="${SECONDS:-0}"
+
+BOX_W=46
+border_h() { printf "%0.s─" $(seq 1 $((BOX_W + 2))); }
+row() {
+  local raw stripped pad_len
+  raw="$1"
+  stripped="$(printf "%b" "$raw" | sed 's/\x1b\[[0-9;]*m//g')"
+  pad_len=$(( BOX_W - ${#stripped} ))
+  [ "$pad_len" -lt 0 ] && pad_len=0
+  printf "  ${DIM}│${R} %b%*s ${DIM}│${R}\n" "$raw" "$pad_len" ""
+}
+row_lr() {
+  local left="$1" right="$2"
+  local ls rs gap
+  ls="$(printf "%b" "$left" | sed 's/\x1b\[[0-9;]*m//g')"
+  rs="$(printf "%b" "$right" | sed 's/\x1b\[[0-9;]*m//g')"
+  gap=$(( BOX_W - ${#ls} - ${#rs} ))
+  [ "$gap" -lt 1 ] && gap=1
+  printf "  ${DIM}│${R} %b%*s%b ${DIM}│${R}\n" "$left" "$gap" "" "$right"
+}
+
 printf "\n"
-printf "  ${GREEN}${B}Ready.${R} Run ${B}grclanker${R} to start.\n"
-printf "\n"
-printf "  ${D}Commands:${R}\n"
-printf "    grclanker               interactive agent\n"
-printf "    grclanker investigate    crypto + vulnerability check\n"
-printf "    grclanker audit          compliance audit\n"
-printf "    grclanker assess         posture assessment\n"
-printf "    grclanker validate       FIPS validation check\n"
-printf "\n"
+printf "  ${DIM}╭$(border_h)╮${R}\n"
+row_lr "${MAUVE}${B}GRCLANKER${R} ${DIM}v${VERSION}${R}" "${LAVENDER}${TARGET}${R}"
+printf "  ${DIM}├$(border_h)┤${R}\n"
+row "${GREEN}${B}Ready.${R} Run ${INK}${B}grclanker${R} to start."
+row "${DIM}Installed in ${ELAPSED}s${R}"
+row ""
+row "${DIM}Workflows:${R}"
+row "  ${INK}grclanker${R}"
+row "  ${INK}grclanker investigate${R}"
+row "  ${INK}grclanker audit${R}"
+row "  ${INK}grclanker assess${R}"
+row "  ${INK}grclanker validate${R}"
+printf "  ${DIM}╰$(border_h)╯${R}\n"
+
+tips=(
+  "pipe a spec URL straight into your agent's context"
+  "grclanker investigate <vendor> to start a deep-dive"
+  "specs are markdown — read them, fork them, extend them"
+  "CMVP + KEV + EPSS data stays local, always"
+)
+printf "\n  ${DIM}Tip: ${tips[$((RANDOM % ${#tips[@]}))]}${R}\n\n"

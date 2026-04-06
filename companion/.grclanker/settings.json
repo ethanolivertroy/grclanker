@@ -1,8 +1,0 @@
-{
-  "quietStartup": true,
-  "collapseChangelog": true,
-  "defaults": {
-    "framework": "NIST 800-53",
-    "riskModel": "EPSS"
-  }
-}

@@ -20,7 +20,7 @@ const categories = groupSpecsByCategory(specs);
     <div class="flex flex-col gap-2 mb-6 md:flex-row md:items-end md:justify-between">
       <div>
         <h2 class="font-semibold text-sm tracking-widest uppercase text-blue">{title}</h2>
-        <p class="text-subtext0 text-sm mt-1">{subtitle}</p>
+        <p class="text-subtext0 text-sm mt-1 italic">{subtitle}</p>
       </div>
       <div class="text-[0.6875rem] font-mono uppercase tracking-[0.16em] text-subtext0">
         {specs.length} specs loaded
@@ -30,41 +30,40 @@ const categories = groupSpecsByCategory(specs);
     {Object.entries(categories).map(([key, { label, specs: catSpecs }]) => (
       catSpecs.length > 0 && (
         <div class="mb-8 last:mb-0">
-          <div class="relative h-12 md:h-14 rounded-t-lg overflow-hidden mb-2.5">
-            <img src={`/categories/${key}.webp`} alt="" class="w-full h-full object-cover" loading="lazy" />
-            <div class="absolute inset-0 bg-gradient-to-r from-base/80 via-base/40 to-base/80"></div>
-            <h3 class="absolute inset-0 flex items-center px-4 font-semibold text-[0.6875rem] text-text uppercase tracking-[0.18em] z-10">
-              <span class="w-1.5 h-1.5 bg-blue/60 rounded-full mr-2"></span>
-              {label}
-            </h3>
+          <div class="spec-category-head">
+            <img src={`/categories/${key}.webp`} alt="" class="spec-category-image" loading="lazy" />
+            <div class="spec-category-overlay">
+              <h3 class="spec-category-title">{label}</h3>
+              <span class="spec-category-count">{catSpecs.length} specs</span>
+            </div>
           </div>
           <div class="overflow-x-auto">
             <table class="w-full text-sm">
               <thead>
                 <tr>
-                  <th scope="col" class="text-left pb-2 pr-4 hud-label !text-blue/50 !font-semibold">Spec</th>
-                  <th scope="col" class="text-left pb-2 pr-4 hud-label !text-blue/50 !font-semibold hidden sm:table-cell">Vendor</th>
-                  <th scope="col" class="text-left pb-2 pr-4 hud-label !text-blue/50 !font-semibold hidden md:table-cell">Updated</th>
-                  <th scope="col" class="text-right pb-2 hud-label !text-blue/50 !font-semibold">Raw URL</th>
+                  <th scope="col" class="text-left pb-2 pr-4 hud-label !text-subtext1 !font-semibold">Spec</th>
+                  <th scope="col" class="text-left pb-2 pr-4 hud-label !text-subtext1 !font-semibold hidden sm:table-cell">Vendor</th>
+                  <th scope="col" class="text-left pb-2 pr-4 hud-label !text-subtext1 !font-semibold hidden md:table-cell">Updated</th>
+                  <th scope="col" class="text-right pb-2 hud-label !text-subtext1 !font-semibold">Raw URL</th>
                 </tr>
               </thead>
               <tbody>
                 {catSpecs.map((spec) => (
                   <tr class="border-t border-surface0/40 transition-colors hover:bg-blue/[0.03]">
-                    <td class="py-3 pr-4 align-top">
+                    <td class="py-2.5 pr-4 align-top">
                       <a href={`/specs/${spec.slug}`} class="block font-semibold text-text hover:text-blue transition-colors leading-snug">
                         {spec.name}
                       </a>
                       <span class="mt-1 block text-xs text-subtext0 sm:hidden">{spec.vendor}</span>
                     </td>
-                    <td class="py-3 pr-4 align-top text-subtext1 hidden sm:table-cell">{spec.vendor}</td>
-                    <td class="py-3 pr-4 align-top text-subtext0 text-[0.6875rem] font-mono uppercase tracking-[0.08em] hidden md:table-cell">{spec.last_updated}</td>
-                    <td class="py-3 text-right align-top">
+                    <td class="py-2.5 pr-4 align-top text-subtext1 hidden sm:table-cell">{spec.vendor}</td>
+                    <td class="py-2.5 pr-4 align-top text-subtext0 text-[0.6875rem] font-mono uppercase tracking-[0.08em] hidden md:table-cell">{spec.last_updated}</td>
+                    <td class="py-2.5 text-right align-top">
                       <button
-                        class="copy-btn inline-flex items-center rounded-full border border-surface0 px-3 py-1 text-[0.65rem] font-semibold tracking-[0.14em] text-blue/70 hover:text-blue hover:border-blue/30 hover:bg-blue/10 font-mono cursor-pointer transition-colors"
+                        type="button"
+                        class="copy-btn spec-copy-btn"
                         data-url={`${RAW_BASE}/${spec.slug}.spec.md`}
                         aria-label={`Copy raw URL for ${spec.name}`}
-                        onclick="let b=this;navigator.clipboard.writeText(b.dataset.url);b.textContent='COPIED';b.classList.add('copied');setTimeout(()=>{b.textContent='COPY';b.classList.remove('copied')},1500)"
                       >
                         COPY
                       </button>
@@ -79,3 +78,28 @@ const categories = groupSpecsByCategory(specs);
     ))}
   </div>
 </section>
+
+<script is:inline>
+  (() => {
+    if (window.__grclankerSpecCatalogCopyBound) return;
+    window.__grclankerSpecCatalogCopyBound = true;
+
+    document.addEventListener('click', async function(e) {
+      var btn = e.target.closest('.spec-copy-btn');
+      if (!btn || !btn.dataset.url) return;
+
+      try {
+        await navigator.clipboard.writeText(btn.dataset.url);
+      } catch {
+        return;
+      }
+
+      btn.textContent = 'COPIED';
+      btn.classList.add('copied');
+      setTimeout(function() {
+        btn.textContent = 'COPY';
+        btn.classList.remove('copied');
+      }, 1500);
+    });
+  })();
+</script>

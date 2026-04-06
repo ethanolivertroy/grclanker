@@ -1,0 +1,98 @@
+name: release-bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.20.0"
+
+      - name: Verify tag matches CLI version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="$(node -p "require('./cli/package.json').version")"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "Tag v$TAG does not match CLI version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install CLI dependencies
+        working-directory: cli
+        run: npm ci
+
+      - name: Build release bundles
+        working-directory: cli
+        run: npm run build:bundle -- --all
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          name: GRC Clanker ${{ github.ref_name }} (Experimental)
+          prerelease: true
+          body: |
+            First public experimental CLI release for grclanker.
+
+            grclanker is an open source AI GRC CLI built on top of Pi. `0.0.1` is the first public bundle line and should be treated like an experimental prerelease: usable, but still moving quickly.
+
+            ## Highlights
+
+            - Bundled runtime installers for macOS, Linux, and Windows release targets
+            - Real setup flow with `grclanker setup`
+            - Local-first path for Ollama-compatible models, with Gemma 4 as the documented default example
+            - Explicit hosted-model path instead of silent fallback behavior
+            - Current workflow rails:
+              - `/investigate`
+              - `/audit`
+              - `/assess`
+              - `/validate`
+            - Repo specs can be used as build inputs by the CLI
+            - Dedicated runtime state under `~/.grclanker/agent`
+
+            ## Install
+
+            macOS / Linux:
+
+            ```bash
+            curl -fsSL https://grclanker.com/install | bash
+            grclanker setup
+            ```
+
+            Windows PowerShell:
+
+            ```powershell
+            powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
+            grclanker setup
+            ```
+
+            Full docs:
+            - https://grclanker.com/docs/getting-started/installation
+            - https://grclanker.com/docs/getting-started/setup
+
+            ## Validation notes
+
+            - macOS bundle build, install flow, and launcher smoke-tested locally
+            - Windows ARM bundle build, installer, and launcher smoke-tested in a disposable Parallels Windows 11 ARM clone
+            - Windows remains best-effort for `0.0.1`, even though the installer path was validated
+
+            ## Known release posture
+
+            - macOS and Linux are the recommended platforms for this release
+            - Windows support is present but not a priority yet
+            - Breaking changes are still likely while the runtime, setup flow, and workflows settle
+          files: |
+            cli/release/*.tar.gz
+            cli/release/*.zip
+            cli/release/SHA256SUMS.txt
