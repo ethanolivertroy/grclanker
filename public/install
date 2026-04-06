@@ -37,7 +37,7 @@ else
 fi
 
 STEP=0
-STEPS=5
+STEPS=6
 step() {
   STEP=$((STEP + 1))
   printf "  ${DIM}[%d/%d]${R} ${GREEN}✓${R} %s\n" "$STEP" "$STEPS" "$*"
@@ -204,7 +204,14 @@ detect_target() {
 
   case "$os" in
     Darwin) os="darwin" ;;
-    Linux) os="linux" ;;
+    Linux)
+      os="linux"
+      if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        :
+      elif ldd --version 2>&1 | grep -qi 'musl'; then
+        fail "Linux musl hosts are not supported by release bundles yet. Use npm install -g @grclanker/cli or bun install -g @grclanker/cli instead."
+      fi
+      ;;
     *) fail "unsupported operating system: $os" ;;
   esac
 
@@ -237,10 +244,86 @@ fallback_instructions() {
 extract_archive() {
   local archive_path="$1"
   local install_dir="$2"
+  local entry=""
+
+  if [ -z "$install_dir" ]; then
+    fail "Refusing to extract — install directory is empty"
+  fi
+
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+      /*) fail "Refusing to extract unsafe archive entry: $entry" ;;
+    esac
+    if printf "%s" "$entry" | grep -Eq '(^|/)\.\.(/|$)'; then
+      fail "Refusing to extract unsafe archive entry: $entry"
+    fi
+  done <<EOF
+$(tar -tzf "$archive_path")
+EOF
 
   rm -rf "$install_dir"
   mkdir -p "$install_dir"
   tar -xzf "$archive_path" -C "$install_dir"
+}
+
+verify_checksum() {
+  local archive_path="$1"
+  local archive_name="$2"
+  local checksums_path="${tmp_dir}/SHA256SUMS.txt"
+  local checksums_url=""
+
+  # Determine where to fetch checksums from
+  if [ -n "$ASSET_URL_OVERRIDE" ]; then
+    warn "Skipping checksum verification — custom GRCLANKER_ASSET_URL in use"
+    return 0
+  elif printf "%s" "$ASSET_URL" | grep -q '^file://'; then
+    local local_dir
+    local_dir="$(dirname "${ASSET_URL#file://}")"
+    if [ -f "${local_dir}/SHA256SUMS.txt" ]; then
+      cp "${local_dir}/SHA256SUMS.txt" "$checksums_path"
+    else
+      warn "No SHA256SUMS.txt found alongside local artifact — skipping verification"
+      return 0
+    fi
+  elif [ -n "$RELEASE_BASE_URL" ]; then
+    checksums_url="${RELEASE_BASE_URL%/}/SHA256SUMS.txt"
+  else
+    checksums_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/SHA256SUMS.txt"
+  fi
+
+  if [ -n "$checksums_url" ]; then
+    if ! curl -fsSL "$checksums_url" -o "$checksums_path" 2>/dev/null; then
+      warn "Could not fetch SHA256SUMS.txt — skipping checksum verification"
+      return 0
+    fi
+  fi
+
+  # Verify the archive against the checksum file
+  local expected
+  expected="$(grep "  ${archive_name}\$" "$checksums_path" 2>/dev/null || grep " ${archive_name}\$" "$checksums_path" 2>/dev/null || true)"
+
+  if [ -z "$expected" ]; then
+    warn "No checksum entry for ${archive_name} in SHA256SUMS.txt — skipping verification"
+    return 0
+  fi
+
+  local expected_hash
+  expected_hash="$(printf "%s" "$expected" | awk '{print $1}')"
+
+  local actual_hash
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_hash="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+  else
+    warn "Neither sha256sum nor shasum found — skipping checksum verification"
+    return 0
+  fi
+
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    fail "Checksum mismatch for ${archive_name} — expected ${expected_hash}, got ${actual_hash}. The download may be corrupted or tampered with."
+  fi
 }
 
 banner
@@ -283,9 +366,11 @@ if [ "${ASSET_URL:-}" = "" ] && [ "$VERSION" = "latest" ]; then
 fi
 
 if [ -n "$ASSET_URL_OVERRIDE" ]; then
+  warn "GRCLANKER_ASSET_URL is set — downloading from a non-default source"
   ASSET_URL="$ASSET_URL_OVERRIDE"
   ASSET_NAME="${ASSET_NAME:-$(basename "$ASSET_URL_OVERRIDE")}"
 elif [ -n "$RELEASE_BASE_URL" ]; then
+  warn "GRCLANKER_RELEASE_BASE_URL is set — downloading from a non-default source"
   VERSION="$(normalize_version "$VERSION")"
   TAG="v${VERSION}"
   ASSET_NAME="${ASSET_NAME:-grclanker-${VERSION}-${TARGET}.${ARCHIVE_EXT}}"
@@ -322,6 +407,9 @@ else
   fi
   ok "Downloaded"
 fi
+
+verify_checksum "$archive_path" "$ASSET_NAME"
+ok "Integrity verified"
 
 mkdir -p "$BIN_DIR"
 extract_archive "$archive_path" "$INSTALL_DIR"

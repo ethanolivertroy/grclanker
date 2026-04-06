@@ -33,6 +33,7 @@ import {
   loadSandboxConfig,
   wrapCommandWithSandbox,
 } from "./sandbox.js";
+import { joinBashArgs, quoteForBash } from "./shell.js";
 import type { GrclankerSettings } from "./settings.js";
 
 type StreamExecOptions = {
@@ -216,9 +217,9 @@ function buildWriteFileCommand(remotePath: string, content: string): string {
   const encoded = Buffer.from(content, "utf8").toString("base64");
   return [
     `if printf '' | base64 --decode >/dev/null 2>&1; then`,
-    `  printf '%s' ${JSON.stringify(encoded)} | base64 --decode > ${JSON.stringify(remotePath)}`,
+    `  printf '%s' ${quoteForBash(encoded)} | base64 --decode > ${quoteForBash(remotePath)}`,
     "else",
-    `  printf '%s' ${JSON.stringify(encoded)} | base64 -D > ${JSON.stringify(remotePath)}`,
+    `  printf '%s' ${quoteForBash(encoded)} | base64 -D > ${quoteForBash(remotePath)}`,
     "fi",
   ].join("\n");
 }
@@ -243,7 +244,7 @@ function isIgnoredPath(relativePath: string, ignorePatterns: string[]): boolean 
 function buildBackendFindCommand(pattern: string): string {
   return [
     "if command -v rg >/dev/null 2>&1; then",
-    `  rg --files --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g ${JSON.stringify(pattern)} .`,
+    `  rg --files --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g ${quoteForBash(pattern)} .`,
     "  status=$?",
     "else",
     "  find . \\( -name .git -o -name node_modules \\) -prune -o -type f -print",
@@ -274,7 +275,7 @@ function buildRipgrepJsonCommand({
   args.push(pattern, target);
 
   return [
-    `rg ${args.map((value) => JSON.stringify(value)).join(" ")}`,
+    `rg ${joinBashArgs(args)}`,
     "status=$?",
     "if [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]; then exit 0; fi",
     "exit \"$status\"",
@@ -307,7 +308,7 @@ function buildPosixGrepCommand({
   args.push("--", pattern, target);
 
   return [
-    `grep ${args.map((value) => JSON.stringify(value)).join(" ")}`,
+    `grep ${joinBashArgs(args)}`,
     "status=$?",
     "if [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]; then exit 0; fi",
     "exit \"$status\"",
@@ -416,15 +417,15 @@ function createBackendReadOperations(
 ): ReadOperations {
   return {
     readFile: async (absolutePath) =>
-      adapter.capture(`cat ${JSON.stringify(await adapter.mapPath(absolutePath))}`, localCwd),
+      adapter.capture(`cat -- ${quoteForBash(await adapter.mapPath(absolutePath))}`, localCwd),
     access: async (absolutePath) => {
-      await adapter.capture(`test -r ${JSON.stringify(await adapter.mapPath(absolutePath))}`, localCwd);
+      await adapter.capture(`test -r ${quoteForBash(await adapter.mapPath(absolutePath))}`, localCwd);
     },
     detectImageMimeType: async (absolutePath) => {
       try {
         const remotePath = await adapter.mapPath(absolutePath);
         const result = await adapter.capture(
-          `file --mime-type -b ${JSON.stringify(remotePath)}`,
+          `file --mime-type -b -- ${quoteForBash(remotePath)}`,
           localCwd,
         );
         const mimeType = result.toString("utf8").trim();
@@ -450,7 +451,7 @@ function createBackendWriteOperations(
       );
     },
     mkdir: async (absolutePath) => {
-      await adapter.capture(`mkdir -p ${JSON.stringify(await adapter.mapPath(absolutePath))}`, localCwd);
+      await adapter.capture(`mkdir -p -- ${quoteForBash(await adapter.mapPath(absolutePath))}`, localCwd);
     },
   };
 }
@@ -468,7 +469,7 @@ function createBackendEditOperations(
     access: async (absolutePath) => {
       const remotePath = await adapter.mapPath(absolutePath);
       await adapter.capture(
-        `test -r ${JSON.stringify(remotePath)} && test -w ${JSON.stringify(remotePath)}`,
+        `test -r ${quoteForBash(remotePath)} && test -w ${quoteForBash(remotePath)}`,
         localCwd,
       );
     },
@@ -482,7 +483,7 @@ function createBackendLsOperations(
   return {
     exists: async (absolutePath) => {
       try {
-        await adapter.capture(`test -e ${JSON.stringify(await adapter.mapPath(absolutePath))}`, localCwd);
+        await adapter.capture(`test -e ${quoteForBash(await adapter.mapPath(absolutePath))}`, localCwd);
         return true;
       } catch {
         return false;
@@ -491,7 +492,7 @@ function createBackendLsOperations(
     stat: async (absolutePath) => {
       const remotePath = await adapter.mapPath(absolutePath);
       const output = await adapter.capture(
-        `if test -d ${JSON.stringify(remotePath)}; then printf dir; else printf file; fi`,
+        `if test -d ${quoteForBash(remotePath)}; then printf dir; else printf file; fi`,
         localCwd,
       );
       const kind = output.toString("utf8").trim();
@@ -501,7 +502,7 @@ function createBackendLsOperations(
     },
     readdir: async (absolutePath) => {
       const output = await adapter.capture(
-        `ls -1A ${JSON.stringify(await adapter.mapPath(absolutePath))}`,
+        `ls -1A -- ${quoteForBash(await adapter.mapPath(absolutePath))}`,
         localCwd,
       );
       const text = output.toString("utf8").trim();
@@ -517,14 +518,14 @@ function createBackendFindOperations(
   return {
     exists: async (absolutePath) => {
       try {
-        await adapter.capture(`test -e ${JSON.stringify(await adapter.mapPath(absolutePath))}`, localCwd);
+        await adapter.capture(`test -e ${quoteForBash(await adapter.mapPath(absolutePath))}`, localCwd);
         return true;
       } catch {
         return false;
       }
     },
     glob: async (pattern, searchPath, options) => {
-      await adapter.capture(`test -d ${JSON.stringify(await adapter.mapPath(searchPath))}`, localCwd);
+      await adapter.capture(`test -d ${quoteForBash(await adapter.mapPath(searchPath))}`, localCwd);
       const output = await adapter.capture(buildBackendFindCommand(pattern), searchPath);
       const lines = output
         .toString("utf8")
@@ -569,7 +570,7 @@ function createBackendGrepOperations(
     }: ComputeBackendGrepSearch): Promise<ComputeBackendGrepSearchResult> {
       const remoteSearchPath = await adapter.mapPath(searchPath);
       const kind = await adapter.capture(
-        `if test -d ${JSON.stringify(remoteSearchPath)}; then printf dir; elif test -e ${JSON.stringify(remoteSearchPath)}; then printf file; else printf missing; fi`,
+        `if test -d ${quoteForBash(remoteSearchPath)}; then printf dir; elif test -e ${quoteForBash(remoteSearchPath)}; then printf file; else printf missing; fi`,
         localCwd,
       );
       const resolvedKind = kind.toString("utf8").trim();
@@ -713,7 +714,7 @@ function createParallelsCommandAdapter(
 
       const session = await ensureParallelsSandbox(localCwd, settings);
       const mappedCwd = ensureWorkspaceMapping(localCwd, cwd, session.workspacePath);
-      const wrappedCommand = `cd ${JSON.stringify(mappedCwd)} && ${command}`;
+      const wrappedCommand = `cd -- ${quoteForBash(mappedCwd)} && ${command}`;
 
       return execStreamingCommand(
         "prlctl",
@@ -743,7 +744,7 @@ function createParallelsCommandAdapter(
         "--current-user",
         "bash",
         "-lc",
-        `cd ${JSON.stringify(mappedCwd)} && ${command}`,
+        `cd -- ${quoteForBash(mappedCwd)} && ${command}`,
       ]);
     },
   };

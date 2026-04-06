@@ -29,10 +29,13 @@ async function importEntry(entryPath) {
   await import(pathToFileURL(entryPath).href);
 }
 
-async function applyBrandingPatch(entryPath) {
+async function assertBrandedRuntime(entryPath) {
   if (!existsSync(entryPath)) return;
   const mod = await import(pathToFileURL(entryPath).href);
-  await mod.ensureEmbeddedPiBranding?.(resolve(binDir, ".."));
+  if (typeof mod.assertEmbeddedPiBranding !== "function") {
+    throw new Error("Embedded branding verifier is unavailable in this grclanker build.");
+  }
+  await mod.assertEmbeddedPiBranding(resolve(binDir, ".."));
 }
 
 async function run() {
@@ -45,7 +48,7 @@ async function run() {
   }
 
   if (existsSync(distEntry)) {
-    await applyBrandingPatch(distBranding);
+    await assertBrandedRuntime(distBranding);
     await importEntry(distEntry);
     return;
   }
@@ -54,7 +57,7 @@ async function run() {
     try {
       const { register } = await import("tsx/esm/api");
       register();
-      await applyBrandingPatch(srcBranding);
+      await assertBrandedRuntime(srcBranding);
       await importEntry(srcEntry);
       return;
     } catch (error) {

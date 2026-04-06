@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { cpus, totalmem } from "node:os";
+import { quoteForBash } from "./shell.js";
 import type { GrclankerSettings } from "./settings.js";
 
 const require = createRequire(import.meta.url);
@@ -325,7 +326,7 @@ export function validateParallelsWorkspacePath(
     "--current-user",
     "bash",
     "-lc",
-    `if test -d ${JSON.stringify(workspacePath)}; then printf ok; else printf missing; fi`,
+    `if test -d ${quoteForBash(workspacePath)}; then printf ok; else printf missing; fi`,
   ]);
 
   if (checkResult.status !== 0) {
@@ -372,11 +373,7 @@ export function getComputeBackendConfigurationIssues(
   }
 
   if (kind === "docker") {
-    const issues: string[] = [];
-    if (!resolveDockerImage(settings)) {
-      issues.push("Set `dockerImage` to choose the container image for bash execution.");
-    }
-    return issues;
+    return [];
   }
 
   if (kind === "parallels-vm") {

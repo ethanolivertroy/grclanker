@@ -50,7 +50,12 @@ function resolveCliVersion(currentDir: string): string {
 export default function grcTools(pi: ExtensionAPI): void {
   const cliVersion = resolveCliVersion(import.meta.dirname);
   const localCwd = process.cwd();
+  const settingsPath = getGrclankerSettingsPath();
   const cache: { agentsPromise?: Promise<string[]> } = {};
+  const runtime: {
+    settings?: ReturnType<typeof readGrclankerSettings>;
+    execution?: ReturnType<typeof resolveComputeBackendExecution>;
+  } = {};
   const localBash = createBashTool(localCwd);
   const localRead = createReadTool(localCwd);
   const localWrite = createWriteTool(localCwd);
@@ -59,12 +64,25 @@ export default function grcTools(pi: ExtensionAPI): void {
   const localFind = createFindTool(localCwd);
   const localGrep = createGrepTool(localCwd);
 
+  function getSettings() {
+    if (!runtime.settings) {
+      runtime.settings = readGrclankerSettings(settingsPath);
+    }
+    return runtime.settings;
+  }
+
+  function getExecution() {
+    if (!runtime.execution) {
+      runtime.execution = resolveComputeBackendExecution(localCwd, getSettings());
+    }
+    return runtime.execution;
+  }
+
   pi.registerTool({
     ...localBash,
     label: "bash (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       const tool = createBashTool(localCwd, { operations: execution.bashOperations });
       return tool.execute(id, params, signal, onUpdate);
     },
@@ -74,8 +92,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     ...localRead,
     label: "read (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       if (!execution.readOperations) {
         return localRead.execute(id, params, signal, onUpdate);
       }
@@ -88,8 +105,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     ...localWrite,
     label: "write (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       if (!execution.writeOperations) {
         return localWrite.execute(id, params, signal, onUpdate);
       }
@@ -102,8 +118,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     ...localEdit,
     label: "edit (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       if (!execution.editOperations) {
         return localEdit.execute(id, params, signal, onUpdate);
       }
@@ -116,8 +131,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     ...localLs,
     label: "ls (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       if (!execution.lsOperations) {
         return localLs.execute(id, params, signal, onUpdate);
       }
@@ -130,8 +144,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     ...localFind,
     label: "find (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       if (!execution.findOperations) {
         return localFind.execute(id, params, signal, onUpdate);
       }
@@ -144,8 +157,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     ...localGrep,
     label: "grep (compute backend)",
     async execute(id, params, signal, onUpdate, _ctx) {
-      const settings = readGrclankerSettings(getGrclankerSettingsPath());
-      const execution = resolveComputeBackendExecution(localCwd, settings);
+      const execution = getExecution();
       if (!execution.grepOperations) {
         return localGrep.execute(id, params, signal, onUpdate);
       }
@@ -154,14 +166,13 @@ export default function grcTools(pi: ExtensionAPI): void {
   });
 
   pi.on("user_bash", () => {
-    const settings = readGrclankerSettings(getGrclankerSettingsPath());
-    const execution = resolveComputeBackendExecution(localCwd, settings);
+    const execution = getExecution();
     if (execution.kind === "host") return;
     return { operations: execution.bashOperations };
   });
 
   pi.on("before_agent_start", async (event) => {
-    const settings = readGrclankerSettings(getGrclankerSettingsPath());
+    const settings = getSettings();
     const note = buildComputeBackendSystemPromptNote(localCwd, settings);
     return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${note}` };
   });
@@ -175,8 +186,8 @@ export default function grcTools(pi: ExtensionAPI): void {
     ctx.ui.setStatus?.("grclanker", `${DOMAIN_TOOL_COUNT} domain tools ready`);
     ctx.ui.setWorkingMessage?.("Correlating evidence...");
     ctx.ui.setHiddenThinkingLabel?.("GRC analysis");
-    const settings = readGrclankerSettings(getGrclankerSettingsPath());
-    const execution = resolveComputeBackendExecution(localCwd, settings);
+    const settings = getSettings();
+    const execution = getExecution();
     ctx.ui.setStatus?.("compute", `compute: ${execution.summary}`);
     for (const issue of getComputeBackendConfigurationIssues(settings, execution.kind)) {
       ctx.ui.notify(`Compute backend warning: ${issue}`, "warning");
@@ -190,7 +201,7 @@ export default function grcTools(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    const settings = readGrclankerSettings(getGrclankerSettingsPath());
+    const settings = getSettings();
     if (resolveComputeBackend(settings) === "sandbox-runtime") {
       await resetSandboxRuntime();
     }

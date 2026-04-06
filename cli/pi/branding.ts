@@ -27,7 +27,7 @@ export function assertEmbeddedPiBranding(appRoot: string): void {
     throw new Error(
       [
         "Embedded Pi package is not branded for grclanker isolation.",
-        "Run `npm run build` or `npm run brand:embedded-pi` before launching grclanker.",
+        "Reinstall grclanker or use an official release bundle so the embedded Pi dependency is patched correctly.",
       ].join(" "),
     );
   }

@@ -115,16 +115,27 @@ const editUrl = `https://github.com/ethanolivertroy/grclanker/edit/main/specs/${
 </Base>
 
 <script is:inline>
-  document.addEventListener('click', function(e) {
-    var btn = e.target.closest('.spec-action-btn-primary.copy-btn');
-    if (!btn || !btn.dataset.url) return;
-    var label = btn.dataset.label || 'COPY URL';
-    navigator.clipboard.writeText(btn.dataset.url);
-    btn.textContent = 'COPIED';
-    btn.classList.add('copied');
-    setTimeout(function() {
-      btn.textContent = label;
-      btn.classList.remove('copied');
-    }, 1500);
-  });
+  (() => {
+    if (window.__grclankerSpecPageCopyBound) return;
+    window.__grclankerSpecPageCopyBound = true;
+
+    document.addEventListener('click', async function(e) {
+      var btn = e.target.closest('.spec-action-btn-primary.copy-btn');
+      if (!btn || !btn.dataset.url) return;
+      var label = btn.dataset.label || 'COPY URL';
+
+      try {
+        await navigator.clipboard.writeText(btn.dataset.url);
+      } catch {
+        return;
+      }
+
+      btn.textContent = 'COPIED';
+      btn.classList.add('copied');
+      setTimeout(function() {
+        btn.textContent = label;
+        btn.classList.remove('copied');
+      }, 1500);
+    });
+  })();
 </script>

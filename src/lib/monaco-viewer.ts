@@ -12,6 +12,7 @@ interface MountMonacoViewerOptions {
 interface MonacoViewerController {
   setWrap: (enabled: boolean) => void;
   setMap: (enabled: boolean) => void;
+  dispose: () => void;
 }
 
 export async function mountMonacoViewer({
@@ -97,6 +98,10 @@ export async function mountMonacoViewer({
     },
     setMap(enabled: boolean) {
       editor.updateOptions({ minimap: { enabled } });
+    },
+    dispose() {
+      window.removeEventListener('resize', sizeContainer);
+      editor.dispose();
     },
   };
 }

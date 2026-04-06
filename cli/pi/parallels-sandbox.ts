@@ -11,6 +11,7 @@ import {
   resolveParallelsTemplateName,
   resolveParallelsWorkspacePath,
 } from "./compute.js";
+import { quoteForBash } from "./shell.js";
 import type { GrclankerSettings } from "./settings.js";
 
 export type ParallelsSandboxSession = {
@@ -240,7 +241,7 @@ function waitForWorkspaceMount(
     for (const candidate of candidates) {
       const check = execInClone(
         cloneName,
-        `if test -d ${JSON.stringify(candidate)}; then printf ok; else printf missing; fi`,
+        `if test -d ${quoteForBash(candidate)}; then printf ok; else printf missing; fi`,
       );
 
       if (check.status === 0 && check.stdout.trim() === "ok") {

@@ -57,6 +57,7 @@ const { content } = Astro.props;
   let mapOn = false;
   let loading = false;
   let controller = null;
+  let disposed = false;
 
   function syncFallbackWrap() {
     fallbackPre.classList.toggle('fallback-pre-wrap', wrapOn);
@@ -65,8 +66,12 @@ const { content } = Astro.props;
 
   syncFallbackWrap();
 
-  copyBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(rawMarkdown);
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(rawMarkdown);
+    } catch {
+      return;
+    }
     copyBtn.textContent = 'COPIED';
     copyBtn.classList.add('copied');
     setTimeout(() => {
@@ -90,7 +95,7 @@ const { content } = Astro.props;
   });
 
   async function loadEditor() {
-    if (controller || loading) return;
+    if (disposed || controller || loading) return;
     loading = true;
     loadBtn.textContent = 'LOADING';
     loadBtn.disabled = true;
@@ -120,9 +125,21 @@ const { content } = Astro.props;
     }
   }
 
+  function teardown() {
+    if (disposed) return;
+    disposed = true;
+    if (controller && typeof controller.dispose === 'function') {
+      controller.dispose();
+      controller = null;
+    }
+  }
+
   loadBtn.addEventListener('click', () => {
     loadEditor();
   });
+
+  document.addEventListener('astro:before-swap', teardown, { once: true });
+  window.addEventListener('pagehide', teardown, { once: true });
 
   if (desktopDefaultEditor) {
     mobileNote.hidden = true;

@@ -19,8 +19,8 @@ export type BootstrapSyncResult = {
   skipped: string[];
 };
 
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
+function sha256(data: string | Buffer): string {
+  return createHash("sha256").update(data).digest("hex");
 }
 
 function readBootstrapState(path: string): BootstrapState {
@@ -93,8 +93,8 @@ function syncManagedFiles(
     const previous = state.files[scopedKey] ?? state.files[key];
     if (!previous) continue;
 
-    const currentTargetText = readFileSync(targetPath, "utf8");
-    if (sha256(currentTargetText) !== previous.lastAppliedTargetHash) {
+    const currentTargetData = readFileSync(targetPath);
+    if (sha256(currentTargetData) !== previous.lastAppliedTargetHash) {
       result.skipped.push(key);
       continue;
     }
@@ -108,15 +108,15 @@ function syncManagedFiles(
   for (const sourcePath of listFiles(sourceRoot)) {
     const key = relative(sourceRoot, sourcePath);
     const targetPath = resolve(targetRoot, key);
-    const sourceText = readFileSync(sourcePath, "utf8");
-    const sourceHash = sha256(sourceText);
+    const sourceData = readFileSync(sourcePath);
+    const sourceHash = sha256(sourceData);
     const scopedKey = `${scope}:${key}`;
     const previous = state.files[scopedKey] ?? state.files[key];
 
     mkdirSync(dirname(targetPath), { recursive: true });
 
     if (!existsSync(targetPath)) {
-      writeFileSync(targetPath, sourceText, "utf8");
+      writeFileSync(targetPath, sourceData);
       state.files[scopedKey] = {
         lastAppliedSourceHash: sourceHash,
         lastAppliedTargetHash: sourceHash,
@@ -126,8 +126,8 @@ function syncManagedFiles(
       continue;
     }
 
-    const currentTargetText = readFileSync(targetPath, "utf8");
-    const currentTargetHash = sha256(currentTargetText);
+    const currentTargetData = readFileSync(targetPath);
+    const currentTargetHash = sha256(currentTargetData);
 
     if (currentTargetHash === sourceHash) {
       state.files[scopedKey] = {
@@ -143,7 +143,7 @@ function syncManagedFiles(
       continue;
     }
 
-    writeFileSync(targetPath, sourceText, "utf8");
+    writeFileSync(targetPath, sourceData);
     state.files[scopedKey] = {
       lastAppliedSourceHash: sourceHash,
       lastAppliedTargetHash: sourceHash,

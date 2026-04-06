@@ -14,10 +14,11 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc && npm run brand:embedded-pi",
     "dev": "tsx index.ts",
     "start": "node dist/index.js",
+    "postinstall": "node scripts/patch-embedded-pi.mjs --root .",
     "brand:embedded-pi": "node scripts/patch-embedded-pi.mjs",
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
-    "test:cli": "npm run build && node --test tests/isolation.test.mjs tests/skill-discovery.test.mjs",
+    "test:cli": "npm run build && node --test tests/isolation.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/bootstrap-sync.test.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },
   "files": [
@@ -25,6 +26,7 @@
     "dist",
     "extensions",
     "prompts",
+    "scripts",
     "skills",
     ".grclanker"
   ],

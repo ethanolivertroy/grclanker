@@ -12,6 +12,7 @@ import {
   resolveComputeBackend,
   type ComputeBackendKind,
 } from "./compute.js";
+import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
   readGrclankerSettings,
@@ -193,7 +194,7 @@ async function removeProbeFile(
 ): Promise<void> {
   if (execution.writeOperations) {
     try {
-      await execution.bashOperations.exec(`rm -f ${JSON.stringify(probePath)}`, dirname(probePath), {
+      await execution.bashOperations.exec(`rm -f -- ${quoteForBash(probePath)}`, dirname(probePath), {
         onData: () => {},
         timeout: timeoutSeconds,
       });
@@ -395,7 +396,7 @@ export async function runComputeExec(rawArgs: string[]): Promise<void> {
   const options = parsed.options;
   const settings = getEffectiveSettings(options);
   const backend = options.backend ?? resolveComputeBackend(settings);
-  const command = parsed.commandArgs.join(" ");
+  const command = joinBashArgs(parsed.commandArgs);
 
   console.log(`\nbackend: ${getComputeBackendLabel(backend)} (${backend})`);
   console.log(`cwd: ${options.cwd}`);

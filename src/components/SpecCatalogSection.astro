@@ -80,15 +80,26 @@ const categories = groupSpecsByCategory(specs);
 </section>
 
 <script is:inline>
-  document.addEventListener('click', function(e) {
-    var btn = e.target.closest('.spec-copy-btn');
-    if (!btn || !btn.dataset.url) return;
-    navigator.clipboard.writeText(btn.dataset.url);
-    btn.textContent = 'COPIED';
-    btn.classList.add('copied');
-    setTimeout(function() {
-      btn.textContent = 'COPY';
-      btn.classList.remove('copied');
-    }, 1500);
-  });
+  (() => {
+    if (window.__grclankerSpecCatalogCopyBound) return;
+    window.__grclankerSpecCatalogCopyBound = true;
+
+    document.addEventListener('click', async function(e) {
+      var btn = e.target.closest('.spec-copy-btn');
+      if (!btn || !btn.dataset.url) return;
+
+      try {
+        await navigator.clipboard.writeText(btn.dataset.url);
+      } catch {
+        return;
+      }
+
+      btn.textContent = 'COPIED';
+      btn.classList.add('copied');
+      setTimeout(function() {
+        btn.textContent = 'COPY';
+        btn.classList.remove('copied');
+      }, 1500);
+    });
+  })();
 </script>

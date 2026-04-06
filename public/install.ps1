@@ -12,6 +12,7 @@ $BinDir = if ($env:GRCLANKER_BIN_DIR) { $env:GRCLANKER_BIN_DIR } else { Join-Pat
 $AssetUrlOverride = $env:GRCLANKER_ASSET_URL
 $ReleaseBaseUrl = $env:GRCLANKER_RELEASE_BASE_URL
 $TargetOverride = $env:GRCLANKER_INSTALL_TARGET
+$AssetSourcePath = $null
 
 if ($args.Count -gt 1) {
   throw "Usage: install.ps1 [-Version <version>] or install.ps1 [latest|<version>]"
@@ -154,6 +155,55 @@ function Fallback-And-Fail([string]$Target) {
   throw "Install aborted."
 }
 
+function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag, [string]$AssetSourcePath, [string]$AssetUrl) {
+  $ChecksumsPath = Join-Path $TempRoot "SHA256SUMS.txt"
+  $ChecksumsUrl = $null
+
+  if ($AssetUrlOverride) {
+    Write-Warn "Skipping checksum verification — custom GRCLANKER_ASSET_URL in use"
+    return
+  }
+
+  if ($AssetSourcePath) {
+    $LocalDir = Split-Path $AssetSourcePath -Parent
+    $LocalChecksums = Join-Path $LocalDir "SHA256SUMS.txt"
+    if (Test-Path $LocalChecksums) {
+      Copy-Item -LiteralPath $LocalChecksums -Destination $ChecksumsPath -Force
+    } else {
+      Write-Warn "No SHA256SUMS.txt found alongside local artifact — skipping verification"
+      return
+    }
+  } elseif ($ReleaseBaseUrl) {
+    $ChecksumsUrl = ($ReleaseBaseUrl.TrimEnd("/")) + "/SHA256SUMS.txt"
+  } else {
+    $ChecksumsUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$Tag/SHA256SUMS.txt"
+  }
+
+  if ($ChecksumsUrl) {
+    try {
+      Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath | Out-Null
+    } catch {
+      Write-Warn "Could not fetch SHA256SUMS.txt — skipping checksum verification"
+      return
+    }
+  }
+
+  $Entry = Get-Content -Path $ChecksumsPath | Where-Object {
+    $_ -match "\s+$([regex]::Escape($AssetName))$"
+  } | Select-Object -First 1
+
+  if (-not $Entry) {
+    Write-Warn "No checksum entry for $AssetName in SHA256SUMS.txt — skipping verification"
+    return
+  }
+
+  $ExpectedHash = ($Entry -split "\s+")[0].ToLowerInvariant()
+  $ActualHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($ActualHash -ne $ExpectedHash) {
+    throw "Checksum mismatch for $AssetName — expected $ExpectedHash, got $ActualHash. The download may be corrupted or tampered with."
+  }
+}
+
 Write-Host ""
 Write-Host "  https://ethantroy.dev // https://hackidle.com" -ForegroundColor Cyan
 Write-Host ""
@@ -168,7 +218,7 @@ if ($Version -ne "latest") {
   if ($LocalAssetPath) {
     $Tag = "v$Version"
     $AssetName = Split-Path $LocalAssetPath -Leaf
-    $AssetUrl = "file://$LocalAssetPath"
+    $AssetSourcePath = $LocalAssetPath
   }
 }
 
@@ -178,7 +228,7 @@ if (-not $AssetUrlOverride -and -not $ReleaseBaseUrl -and -not $AssetUrl -and $V
     $AssetName = Split-Path $LocalAssetPath -Leaf
     $Version = ($AssetName -replace "^grclanker-", "") -replace "-$Target\.$ArchiveExt$", ""
     $Tag = "v$Version"
-    $AssetUrl = "file://$LocalAssetPath"
+    $AssetSourcePath = $LocalAssetPath
     Write-Ok "Using local release artifact $AssetName"
   } else {
     Write-Info "Resolving latest release"
@@ -207,7 +257,7 @@ if ($AssetUrlOverride) {
     $AssetName = "grclanker-$Version-$Target.zip"
   }
   $AssetUrl = ($ReleaseBaseUrl.TrimEnd("/")) + "/$AssetName"
-} elseif (-not $AssetUrl) {
+} elseif (-not $AssetUrl -and -not $AssetSourcePath) {
   $AssetName = "grclanker-$Version-$Target.zip"
   $AssetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$Tag/$AssetName"
 }
@@ -218,13 +268,21 @@ $BinPath = Join-Path $BinDir "grclanker.cmd"
 
 New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
 try {
-  Write-Info "Downloading $AssetName"
-  try {
-    Invoke-WebRequest -Uri $AssetUrl -OutFile $ArchivePath
-  } catch {
-    Fallback-And-Fail $Target
+  if ($AssetSourcePath) {
+    Write-Info "Copying local release artifact $AssetName"
+    Copy-Item -LiteralPath $AssetSourcePath -Destination $ArchivePath -Force
+  } else {
+    Write-Info "Downloading $AssetName"
+    try {
+      Invoke-WebRequest -Uri $AssetUrl -OutFile $ArchivePath
+    } catch {
+      Fallback-And-Fail $Target
+    }
   }
   Write-Ok "Downloaded"
+
+  Verify-Checksum -ArchivePath $ArchivePath -AssetName $AssetName -Tag $Tag -AssetSourcePath $AssetSourcePath -AssetUrl $AssetUrl
+  Write-Ok "Integrity verified"
 
   if (Test-Path $InstallDir) {
     Remove-Item -Recurse -Force $InstallDir

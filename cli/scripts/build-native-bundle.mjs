@@ -159,6 +159,7 @@ function detectHostTarget(definitions) {
 function ensureNodeArchive(target, pythonCommand) {
   const archivePath = join(cacheDir, target.nodeArchive);
   const extractedRoot = join(cacheDir, target.nodeRootDir);
+  const checksumsPath = join(cacheDir, `SHASUMS256-v${nodeVersion}.txt`);
 
   mkdirSync(cacheDir, { recursive: true });
 
@@ -166,6 +167,24 @@ function ensureNodeArchive(target, pythonCommand) {
     const url = `https://nodejs.org/dist/v${nodeVersion}/${target.nodeArchive}`;
     console.log(`Downloading ${target.nodeArchive}`);
     run("curl", ["-fsSL", url, "-o", archivePath]);
+  }
+
+  if (!existsSync(checksumsPath)) {
+    const url = `https://nodejs.org/dist/v${nodeVersion}/SHASUMS256.txt`;
+    run("curl", ["-fsSL", url, "-o", checksumsPath]);
+  }
+
+  const checksumLines = readFileSync(checksumsPath, "utf8").split("\n");
+  const expectedLine = checksumLines.find((line) => line.endsWith(`  ${target.nodeArchive}`));
+  if (!expectedLine) {
+    throw new Error(`Missing checksum entry for ${target.nodeArchive} in SHASUMS256.txt`);
+  }
+
+  const expectedHash = expectedLine.split(/\s+/)[0];
+  const actualHash = sha256(archivePath);
+  if (actualHash !== expectedHash) {
+    rmSync(archivePath, { force: true });
+    throw new Error(`Checksum mismatch for ${target.nodeArchive}`);
   }
 
   if (!existsSync(extractedRoot)) {
@@ -189,6 +208,7 @@ function copyApp(stageAppDir, target) {
     "dist",
     "extensions",
     "prompts",
+    "scripts",
     "skills",
     "package.json",
     "package-lock.json",
