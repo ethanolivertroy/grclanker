@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/splunk-sec-inspector"
+source_repo: "https://github.com/hackIDLE/splunk-sec-inspector"
 ---
 
 # splunk-sec-inspector — Architecture Specification

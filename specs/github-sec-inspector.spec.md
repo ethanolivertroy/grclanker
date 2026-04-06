@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/github-sec-inspector"
+source_repo: "https://github.com/hackIDLE/github-sec-inspector"
 ---
 
 # github-sec-inspector — Architecture Specification

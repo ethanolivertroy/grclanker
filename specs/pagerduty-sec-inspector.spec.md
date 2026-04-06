@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/pagerduty-sec-inspector"
+source_repo: "https://github.com/hackIDLE/pagerduty-sec-inspector"
 ---
 
 # PagerDuty Security Inspector
@@ -270,7 +270,7 @@ pagerduty-sec-inspector --format sarif --output results.sarif
 
 ```bash
 # 1. Initialize module
-go mod init github.com/ethanolivertroy/pagerduty-sec-inspector
+go mod init github.com/hackIDLE/pagerduty-sec-inspector
 
 # 2. Add dependencies
 go get github.com/PagerDuty/go-pagerduty

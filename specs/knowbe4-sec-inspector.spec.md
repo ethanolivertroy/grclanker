@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/knowbe4-sec-inspector"
+source_repo: "https://github.com/hackIDLE/knowbe4-sec-inspector"
 ---
 
 # KnowBe4 Security Inspector - Architecture Specification
@@ -303,7 +303,7 @@ knowbe4-sec-inspector report --input findings.json --output compliance \
 
 ```bash
 # 1. Initialize Go module
-go mod init github.com/ethanolivertroy/knowbe4-sec-inspector
+go mod init github.com/hackIDLE/knowbe4-sec-inspector
 
 # 2. Add dependencies
 go get github.com/spf13/cobra@latest

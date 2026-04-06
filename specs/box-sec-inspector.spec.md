@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/box-sec-inspector"
+source_repo: "https://github.com/hackIDLE/box-sec-inspector"
 ---
 
 # Box Enterprise Security Inspector — Architecture Specification
@@ -349,7 +349,7 @@ box-sec-inspector list
 go 1.22+
 
 # Clone and build
-git clone https://github.com/ethanolivertroy/box-sec-inspector.git
+git clone https://github.com/hackIDLE/box-sec-inspector.git
 cd box-sec-inspector
 go mod download
 go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \

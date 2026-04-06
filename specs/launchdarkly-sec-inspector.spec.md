@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/launchdarkly-sec-inspector"
+source_repo: "https://github.com/hackIDLE/launchdarkly-sec-inspector"
 ---
 
 # LaunchDarkly Security Inspector — Architecture Specification
@@ -254,7 +254,7 @@ Examples:
 
 ```bash
 # 1. Initialize module
-go mod init github.com/ethanolivertroy/launchdarkly-sec-inspector
+go mod init github.com/hackIDLE/launchdarkly-sec-inspector
 
 # 2. Install dependencies
 go get github.com/spf13/cobra@latest

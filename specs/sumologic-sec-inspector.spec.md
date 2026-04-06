@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/sumologic-sec-inspector"
+source_repo: "https://github.com/hackIDLE/sumologic-sec-inspector"
 ---
 
 # Sumo Logic Security Inspector — Architecture Specification
@@ -269,7 +269,7 @@ sumologic-sec-inspector list
 go 1.22+
 
 # Clone and build
-git clone https://github.com/ethanolivertroy/sumologic-sec-inspector.git
+git clone https://github.com/hackIDLE/sumologic-sec-inspector.git
 cd sumologic-sec-inspector
 go mod download
 go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \

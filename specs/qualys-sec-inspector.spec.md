@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/qualys-sec-inspector"
+source_repo: "https://github.com/hackIDLE/qualys-sec-inspector"
 ---
 
 # qualys-sec-inspector
@@ -330,7 +330,7 @@ Examples:
 
 ```bash
 # 1. Initialize module
-go mod init github.com/ethanolivertroy/qualys-sec-inspector
+go mod init github.com/hackIDLE/qualys-sec-inspector
 
 # 2. Add dependencies
 go get github.com/spf13/cobra

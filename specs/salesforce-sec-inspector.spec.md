@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/salesforce-sec-inspector"
+source_repo: "https://github.com/hackIDLE/salesforce-sec-inspector"
 ---
 
 # salesforce-sec-inspector

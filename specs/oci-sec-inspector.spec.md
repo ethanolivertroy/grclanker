@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/oci-sec-inspector"
+source_repo: "https://github.com/hackIDLE/oci-sec-inspector"
 ---
 
 # OCI Security Inspector - Architecture Specification
@@ -291,7 +291,7 @@ oci-sec-inspector report --input findings.json --output compliance \
 
 ```bash
 # 1. Initialize Go module
-go mod init github.com/ethanolivertroy/oci-sec-inspector
+go mod init github.com/hackIDLE/oci-sec-inspector
 
 # 2. Add dependencies
 go get github.com/oracle/oci-go-sdk/v65@latest

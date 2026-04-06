@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/cloudflare-sec-inspector"
+source_repo: "https://github.com/hackIDLE/cloudflare-sec-inspector"
 ---
 
 # Cloudflare Security Inspector — Architecture Specification
@@ -305,7 +305,7 @@ cloudflare-sec-inspector scan --tui
 go 1.22+
 
 # Clone and build
-git clone https://github.com/ethanolivertroy/cloudflare-sec-inspector.git
+git clone https://github.com/hackIDLE/cloudflare-sec-inspector.git
 cd cloudflare-sec-inspector
 go mod download
 go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \

@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SPECS_DIR="$(cd "$(dirname "$0")/.." && pwd)/specs"
-OWNER="ethanolivertroy"
+OWNER="hackIDLE"
 SUCCESS=0
 FAIL=0
 

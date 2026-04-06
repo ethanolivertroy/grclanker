@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/newrelic-sec-inspector"
+source_repo: "https://github.com/hackIDLE/newrelic-sec-inspector"
 ---
 
 # New Relic Security Inspector — Architecture Specification
@@ -292,7 +292,7 @@ newrelic-sec-inspector scan --tui
 go 1.22+
 
 # Clone and build
-git clone https://github.com/ethanolivertroy/newrelic-sec-inspector.git
+git clone https://github.com/hackIDLE/newrelic-sec-inspector.git
 cd newrelic-sec-inspector
 go mod download
 go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \

@@ -7,7 +7,7 @@ language: "go"
 status: "spec-only"
 version: "1.0"
 last_updated: "2026-03-29"
-source_repo: "https://github.com/ethanolivertroy/snowflake-sec-inspector"
+source_repo: "https://github.com/hackIDLE/snowflake-sec-inspector"
 ---
 
 # Snowflake Security Inspector
@@ -284,7 +284,7 @@ snowflake-sec-inspector --controls 3,7,8,11,14 --stale-user-days 60 \
 
 ```bash
 # 1. Initialize module
-go mod init github.com/ethanolivertroy/snowflake-sec-inspector
+go mod init github.com/hackIDLE/snowflake-sec-inspector
 
 # 2. Add Snowflake driver dependency
 go get github.com/snowflakedb/gosnowflake
