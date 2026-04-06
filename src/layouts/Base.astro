@@ -166,18 +166,18 @@ const searchData = searchEnabled
               <defs><filter id="glow"><feGaussianBlur stdDeviation="1.5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
             </svg>
             <span class="led led-live"></span>
-            <span class="font-bold text-lg tracking-[0.12em] nav-wordmark">GRCLANKER</span>
+            <span class="font-bold text-base md:text-lg tracking-[0.06em] md:tracking-[0.12em] nav-wordmark">GRCLANKER</span>
           </a>
-          <a href="https://hackidle.com" class="text-overlay1 hover:text-blue text-[0.8125rem] transition-colors hidden sm:inline">by hackIDLE</a>
+          <a href="https://hackidle.com" class="text-overlay1 hover:text-blue text-[0.8125rem] transition-colors hidden md:inline">by hackIDLE</a>
         </div>
-        <div class="hidden sm:flex items-center gap-4 md:gap-6 text-sm">
+        <div class="hidden md:flex items-center gap-4 md:gap-6 text-sm">
           {searchEnabled && (
             <button
               onclick="window.__openSearch && window.__openSearch()"
               class="nav-action-btn nav-search-btn"
               aria-label="Search site (press / or Cmd+K)"
             >
-              Search <kbd class="hidden sm:inline">/</kbd>
+              Search <kbd class="hidden md:inline">/</kbd>
             </button>
           )}
           {primaryLinks.map((link) => (
@@ -199,7 +199,7 @@ const searchData = searchEnabled
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
           </a>
         </div>
-        <div class="flex sm:hidden items-center gap-2">
+        <div class="flex md:hidden items-center gap-2">
           {searchEnabled && (
             <button
               type="button"
@@ -233,7 +233,7 @@ const searchData = searchEnabled
           </button>
         </div>
         </div>
-        <div id="mobile-nav-panel" class="site-mobile-nav-panel sm:hidden hidden" aria-label="Mobile navigation">
+        <div id="mobile-nav-panel" class="site-mobile-nav-panel md:hidden hidden" aria-label="Mobile navigation">
           <div class="site-mobile-nav-links">
             {primaryLinks.map((link) => (
               <a href={link.href} class="site-mobile-nav-link">{link.label}</a>
@@ -256,7 +256,7 @@ const searchData = searchEnabled
           <div class="footer-image-strip-overlay"></div>
         </div>
         <div class="max-w-content mx-auto px-6 py-4 flex flex-col gap-3 text-xs text-subtext0 sm:flex-row sm:items-center sm:justify-between">
-          <div class="flex items-center gap-4 text-subtext0">
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-subtext0">
             <span>Built by <a href="https://ethantroy.dev" class="hover:text-blue">Ethan Troy</a></span>
             <a href="/" class="hover:text-blue">CLI</a>
             <a href="/docs" class="hover:text-blue">Docs</a>
