@@ -17,6 +17,7 @@ Use the GRC tools to gather high-signal evidence:
 3. KEV exposure
 4. EPSS likelihood for any matched CVEs
 5. Ransomware linkage where applicable
+6. SCF control language, crosswalks, and evidence-request guidance when framework interpretation matters
 
 ## Phase 3: Posture Classification
 

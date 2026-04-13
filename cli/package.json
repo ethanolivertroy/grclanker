@@ -18,7 +18,7 @@
     "brand:embedded-pi": "node scripts/patch-embedded-pi.mjs",
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
-    "test:cli": "npm run build && node --test tests/isolation.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/bootstrap-sync.test.mjs tests/sandbox.test.mjs tests/vanta.test.mjs",
+    "test:cli": "npm run build && node --test tests/isolation.test.mjs tests/scf.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/bootstrap-sync.test.mjs tests/sandbox.test.mjs tests/vanta.test.mjs",
     "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },

@@ -37,6 +37,11 @@ export async function cachedFetch<T>(
  */
 const lastRequestTime = new Map<string, number>();
 
+export function clearGrcSharedCachesForTests(): void {
+  cache.clear();
+  lastRequestTime.clear();
+}
+
 export async function throttledFetch<T>(
   url: string,
   minDelayMs: number = 100,
