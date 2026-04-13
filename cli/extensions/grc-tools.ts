@@ -23,8 +23,9 @@ import { readGrclankerSettings } from "../pi/settings.js";
 import { registerCmvpTools } from "./grc-tools/cmvp.js";
 import { installGrclankerHeader } from "./grc-tools/header.js";
 import { registerKevsTools } from "./grc-tools/kevs.js";
+import { registerVantaTools } from "./grc-tools/vanta.js";
 
-const DOMAIN_TOOL_COUNT = 8;
+const DOMAIN_TOOL_COUNT = 11;
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [
@@ -179,6 +180,7 @@ export default function grcTools(pi: ExtensionAPI): void {
 
   registerCmvpTools(pi);
   registerKevsTools(pi);
+  registerVantaTools(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;

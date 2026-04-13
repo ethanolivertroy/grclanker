@@ -24,6 +24,7 @@ Thumbs.db
 # Claude Code
 .agents/
 .claude/
+.firecrawl/
 .factory/
 skills-lock.json
 grclanker-local/

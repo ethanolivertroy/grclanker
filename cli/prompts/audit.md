@@ -15,7 +15,8 @@ Confirm:
 Use the available GRC tools first:
 1. Search CMVP validation status where cryptography is in scope
 2. Search KEV and EPSS data for active exploit pressure
-3. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
+3. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
+4. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
 
 If evidence is missing, say exactly what is missing and what artifact would close the gap.
 

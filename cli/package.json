@@ -18,7 +18,8 @@
     "brand:embedded-pi": "node scripts/patch-embedded-pi.mjs",
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
-    "test:cli": "npm run build && node --test tests/isolation.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/bootstrap-sync.test.mjs tests/sandbox.test.mjs",
+    "test:cli": "npm run build && node --test tests/isolation.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/bootstrap-sync.test.mjs tests/sandbox.test.mjs tests/vanta.test.mjs",
+    "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },
   "files": [
@@ -46,9 +47,11 @@
     "@clack/prompts": "^1.2.0",
     "@mariozechner/pi-ai": "^0.65.2",
     "@mariozechner/pi-coding-agent": "^0.65.2",
-    "@sinclair/typebox": "^0.34.48"
+    "@sinclair/typebox": "^0.34.48",
+    "archiver": "^7.0.1"
   },
   "devDependencies": {
+    "@types/archiver": "^7.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },
