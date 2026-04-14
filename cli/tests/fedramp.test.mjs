@@ -17,6 +17,8 @@ import {
 } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { buildFedrampDocsSnapshot } from "../dist/extensions/grc-tools/fedramp-docs.js";
 import {
+  buildFedrampAdsPackagePlan,
+  buildFedrampArtifactPlan,
   buildFedrampReadinessBrief,
   inferFedrampArtifactSuggestions,
   inferFedrampWorkstreams,
@@ -428,4 +430,90 @@ test("artifact and workstream inference stays grounded in official requirement l
   assert.ok(artifacts.some((item) => item.toLowerCase().includes("trust-center")));
   assert.ok(workstreams.some((item) => item.toLowerCase().includes("authorization data publishing")));
   assert.ok(workstreams.some((item) => item.toLowerCase().includes("trust-center operations")));
+});
+
+test("artifact planner turns ADS into public and controlled package items", () => {
+  const catalog = normalizeFedrampFrmr(frmrFixture);
+  const loaded = {
+    catalog,
+    provenance: {
+      repo: "docs",
+      path: "FRMR.documentation.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "0.9.43-beta",
+      upstreamLastUpdated: "2026-04-08",
+    },
+    cacheStatus: "live",
+  };
+
+  const plan = buildFedrampArtifactPlan(loaded, {
+    query: "ADS",
+    audience: "trust-center",
+    applies_to: "20x",
+  });
+
+  assert.equal(plan.kind, "process");
+  assert.ok(plan.items.some((item) => item.name.includes("Human-readable authorization summary")));
+  assert.ok(plan.items.some((item) => item.name.includes("Machine-readable authorization data feed")));
+  assert.ok(plan.items.some((item) => item.name.includes("Controlled authorization-data API")));
+  assert.ok(plan.rollout.some((phase) => phase.phase === "foundation"));
+  assert.ok(plan.rollout.some((phase) => phase.phase === "access"));
+  assert.match(plan.text, /Public artifacts/i);
+  assert.match(plan.text, /Controlled-access artifacts/i);
+});
+
+test("artifact planner resolves KSI queries back to linked process artifacts", () => {
+  const catalog = normalizeFedrampFrmr(frmrFixture);
+  const loaded = {
+    catalog,
+    provenance: {
+      repo: "docs",
+      path: "FRMR.documentation.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "0.9.43-beta",
+      upstreamLastUpdated: "2026-04-08",
+    },
+    cacheStatus: "live",
+  };
+
+  const plan = buildFedrampArtifactPlan(loaded, {
+    query: "KSI-AFR-ADS",
+    audience: "provider",
+    applies_to: "20x",
+  });
+
+  assert.equal(plan.kind, "ksi-indicator");
+  assert.equal(plan.linkedProcesses[0]?.id, "ADS");
+  assert.ok(plan.items.some((item) => item.groundedBy.includes("ADS-CSO-PUB")));
+  assert.match(plan.text, /Linked process:\s+Authorization Data Sharing \[ADS\]/);
+});
+
+test("ADS package planner groups artifacts into package layers", () => {
+  const catalog = normalizeFedrampFrmr(frmrFixture);
+  const loaded = {
+    catalog,
+    provenance: {
+      repo: "docs",
+      path: "FRMR.documentation.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "0.9.43-beta",
+      upstreamLastUpdated: "2026-04-08",
+    },
+    cacheStatus: "live",
+  };
+
+  const plan = buildFedrampAdsPackagePlan(loaded, {
+    audience: "trust-center",
+    applies_to: "20x",
+  });
+
+  assert.equal(plan.process.id, "ADS");
+  assert.ok(plan.publicItems.length >= 2);
+  assert.ok(plan.controlledItems.length >= 1);
+  assert.match(plan.text, /Public trust-center layer:/);
+  assert.match(plan.text, /Controlled authorization-data layer:/);
+  assert.match(plan.text, /Recommended rollout:/);
 });

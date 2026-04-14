@@ -28,7 +28,7 @@ import { registerOscalTools } from "./grc-tools/oscal.js";
 import { registerScfTools } from "./grc-tools/scf.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 
-const DOMAIN_TOOL_COUNT = 28;
+const DOMAIN_TOOL_COUNT = 30;
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [

@@ -34,6 +34,18 @@ type ReadinessArgs = {
   audience?: "provider" | "trust-center" | "any";
   limit?: number;
 };
+type PlanningArgs = {
+  query: string;
+  applies_to?: FedrampApplicability | "any";
+  audience?: "provider" | "trust-center" | "any";
+};
+type AdsPackageArgs = {
+  applies_to?: FedrampApplicability | "any";
+  audience?: "provider" | "trust-center" | "any";
+};
+
+type ArtifactVisibility = "public" | "controlled" | "private";
+type ArtifactPhase = "foundation" | "access" | "operations";
 
 type ReadinessChecklistItem = {
   id: string;
@@ -74,6 +86,86 @@ type ReadinessBrief =
       artifactSuggestions: string[];
       workstreams: string[];
       text: string;
+    };
+
+type ArtifactPlanItem = {
+  name: string;
+  visibility: ArtifactVisibility;
+  phase: ArtifactPhase;
+  format: string;
+  rationale: string;
+  groundedBy: string[];
+};
+
+type RolloutPhase = {
+  phase: ArtifactPhase;
+  title: string;
+  objective: string;
+  items: string[];
+};
+
+type ArtifactPlan =
+  | {
+      kind: "process";
+      subject: FedrampProcessRecord;
+      linkedProcesses: FedrampProcessRecord[];
+      linkedIndicators: FedrampKsiIndicatorRecord[];
+      items: ArtifactPlanItem[];
+      rollout: RolloutPhase[];
+      text: string;
+    }
+  | {
+      kind: "ksi-indicator";
+      subject: FedrampKsiIndicatorRecord;
+      linkedProcesses: FedrampProcessRecord[];
+      linkedIndicators: FedrampKsiIndicatorRecord[];
+      items: ArtifactPlanItem[];
+      rollout: RolloutPhase[];
+      text: string;
+    }
+  | {
+      kind: "ksi-domain";
+      subject: FedrampKsiDomainRecord;
+      linkedProcesses: FedrampProcessRecord[];
+      linkedIndicators: FedrampKsiIndicatorRecord[];
+      items: ArtifactPlanItem[];
+      rollout: RolloutPhase[];
+      text: string;
+    };
+
+type AdsPackagePlan = {
+  process: FedrampProcessRecord;
+  linkedIndicators: FedrampKsiIndicatorRecord[];
+  audience: "provider" | "trust-center" | "any";
+  appliesTo: FedrampApplicability | "any";
+  publicItems: ArtifactPlanItem[];
+  controlledItems: ArtifactPlanItem[];
+  privateItems: ArtifactPlanItem[];
+  rollout: RolloutPhase[];
+  text: string;
+};
+
+type ArtifactPlanContext =
+  | {
+      kind: "process";
+      subject: FedrampProcessRecord;
+      linkedProcesses: FedrampProcessRecord[];
+      linkedIndicators: FedrampKsiIndicatorRecord[];
+      requirements: FedrampRequirementRecord[];
+    }
+  | {
+      kind: "ksi-indicator";
+      subject: FedrampKsiIndicatorRecord;
+      linkedProcesses: FedrampProcessRecord[];
+      linkedIndicators: FedrampKsiIndicatorRecord[];
+      requirements: FedrampRequirementRecord[];
+    }
+  | {
+      kind: "ksi-domain";
+      subject: FedrampKsiDomainRecord;
+      linkedProcesses: FedrampProcessRecord[];
+      linkedIndicators: FedrampKsiIndicatorRecord[];
+      requirements: FedrampRequirementRecord[];
     };
 
 function asString(value: unknown): string | undefined {
@@ -185,6 +277,54 @@ function normalizeReadinessArgs(args: unknown): ReadinessArgs {
   }
 
   return { query: "", applies_to: "any", audience: "provider", limit: 8 };
+}
+
+function normalizePlanningArgs(args: unknown): PlanningArgs {
+  if (typeof args === "string" || typeof args === "number") {
+    return { query: String(args), applies_to: "any", audience: "provider" };
+  }
+
+  if (args && typeof args === "object") {
+    const value = args as Record<string, unknown>;
+    const audienceRaw = asString(value.audience)?.toLowerCase();
+    return {
+      query:
+        asString(value.query) ??
+        asString(value.id) ??
+        asString(value.process) ??
+        asString(value.process_id) ??
+        asString(value.ksi) ??
+        asString(value.indicator) ??
+        "",
+      applies_to: normalizeFedrampApplicability(
+        asString(value.applies_to) ?? asString(value.framework),
+      ),
+      audience:
+        audienceRaw === "trust-center" || audienceRaw === "any" || audienceRaw === "provider"
+          ? audienceRaw
+          : "provider",
+    };
+  }
+
+  return { query: "", applies_to: "any", audience: "provider" };
+}
+
+function normalizeAdsPackageArgs(args: unknown): AdsPackageArgs {
+  if (args && typeof args === "object") {
+    const value = args as Record<string, unknown>;
+    const audienceRaw = asString(value.audience)?.toLowerCase();
+    return {
+      applies_to: normalizeFedrampApplicability(
+        asString(value.applies_to) ?? asString(value.framework) ?? "20x",
+      ),
+      audience:
+        audienceRaw === "trust-center" || audienceRaw === "any" || audienceRaw === "provider"
+          ? audienceRaw
+          : "trust-center",
+    };
+  }
+
+  return { applies_to: "20x", audience: "trust-center" };
 }
 
 function missingQueryResult(toolName: string, example: string) {
@@ -445,6 +585,274 @@ function toChecklistItems(requirements: FedrampRequirementRecord[]): ReadinessCh
 
 function dedupeStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter((value) => value.trim().length > 0)));
+}
+
+function formatVisibility(value: ArtifactVisibility): string {
+  return value === "controlled" ? "controlled-access" : value;
+}
+
+function formatPhase(value: ArtifactPhase): string {
+  if (value === "foundation") return "foundation";
+  if (value === "access") return "access";
+  return "operations";
+}
+
+function requirementText(requirement: FedrampRequirementRecord): string {
+  return [
+    requirement.name ?? "",
+    requirement.statement,
+    ...requirement.followingInformation,
+    ...requirement.terms,
+  ]
+    .filter(Boolean)
+    .join(" \n ")
+    .toLowerCase();
+}
+
+function indicatorText(indicator: FedrampKsiIndicatorRecord): string {
+  return [
+    indicator.name,
+    indicator.statement,
+    indicator.reference ?? "",
+    ...indicator.terms,
+  ]
+    .filter(Boolean)
+    .join(" \n ")
+    .toLowerCase();
+}
+
+type ArtifactRule = {
+  name: string;
+  visibility: ArtifactVisibility;
+  phase: ArtifactPhase;
+  format: string;
+  rationale: string;
+  patterns: RegExp[];
+};
+
+const ARTIFACT_RULES: ArtifactRule[] = [
+  {
+    name: "Human-readable authorization summary page",
+    visibility: "public",
+    phase: "foundation",
+    format: "Web page",
+    rationale: "Official requirements call for publicly shared human-readable information.",
+    patterns: [/human-readable|publicly share|public information|publicly available/i],
+  },
+  {
+    name: "Machine-readable authorization data feed",
+    visibility: "public",
+    phase: "foundation",
+    format: "JSON feed or API payload",
+    rationale: "Official requirements call for machine-readable authorization data that can be reused programmatically.",
+    patterns: [/machine-readable|structured data|programmatically access/i],
+  },
+  {
+    name: "Service inventory and assessment-scope page",
+    visibility: "public",
+    phase: "foundation",
+    format: "Catalog page",
+    rationale: "Official requirements emphasize clear service scope, boundary, and included-service information.",
+    patterns: [/service list|service model|specific services|scope|boundary|minimum assessment scope|service inventory/i],
+  },
+  {
+    name: "Controlled authorization-data API and access guide",
+    visibility: "controlled",
+    phase: "access",
+    format: "API docs and access instructions",
+    rationale: "Official requirements call for documented programmatic access to deeper authorization data.",
+    patterns: [/programmatic access|api|retrieve authorization data|download|all authorization data/i],
+  },
+  {
+    name: "Version history and change-log archive",
+    visibility: "controlled",
+    phase: "access",
+    format: "Version archive",
+    rationale: "Official requirements call for historical versions or change deltas to remain available to necessary parties.",
+    patterns: [/historical versions|history|delta|change log|versions available/i],
+  },
+  {
+    name: "Secure configuration guide and shared-responsibility guidance",
+    visibility: "public",
+    phase: "foundation",
+    format: "Guide page or PDF",
+    rationale: "Official requirements and related indicators expect customers to understand secure configuration and responsibility boundaries.",
+    patterns: [/secure configuration|configuration guide|shared responsibility/i],
+  },
+  {
+    name: "Access inventory and authorization-data audit logs",
+    visibility: "private",
+    phase: "operations",
+    format: "Operational records",
+    rationale: "Official requirements imply auditable control over who can retrieve authorization data and how that access is tracked.",
+    patterns: [/access log|log access|access inventory|inventory of access|who can view/i],
+  },
+  {
+    name: "Notification routing and escalation runbook",
+    visibility: "private",
+    phase: "operations",
+    format: "Runbook",
+    rationale: "Official requirements around notifications and inbox operations need an internal execution path even when the public surface is simple.",
+    patterns: [/notify|notification|inbox|escalation|communicat/i],
+  },
+  {
+    name: "Continuous validation cadence records",
+    visibility: "private",
+    phase: "operations",
+    format: "Automation evidence",
+    rationale: "Official requirements around persistent validation and recurring review need internal cadence evidence.",
+    patterns: [/persistently|validation|quarterly review|ongoing authorization report|cadence/i],
+  },
+  {
+    name: "Vulnerability response evidence bundle",
+    visibility: "controlled",
+    phase: "operations",
+    format: "Evidence bundle",
+    rationale: "Official requirements around vulnerabilities and remediation usually need a controlled evidence surface plus private workflow records.",
+    patterns: [/vulnerability|accepted vulnerability|remediation/i],
+  },
+  {
+    name: "Cryptographic module inventory and references",
+    visibility: "controlled",
+    phase: "foundation",
+    format: "Inventory appendix",
+    rationale: "Official requirements around cryptographic modules and CMVP references benefit from a maintained source-of-truth appendix.",
+    patterns: [/cryptographic module|fips|cmvp/i],
+  },
+];
+
+function groupArtifactItemsByVisibility(items: ArtifactPlanItem[]) {
+  return {
+    publicItems: items.filter((item) => item.visibility === "public"),
+    controlledItems: items.filter((item) => item.visibility === "controlled"),
+    privateItems: items.filter((item) => item.visibility === "private"),
+  };
+}
+
+function buildRolloutPhases(items: ArtifactPlanItem[]): RolloutPhase[] {
+  const phases: Array<{ phase: ArtifactPhase; title: string; objective: string }> = [
+    {
+      phase: "foundation",
+      title: "Phase 1: Publish the public baseline",
+      objective:
+        "Make the offering legible without a private request loop by publishing the public trust-center and scope baseline first.",
+    },
+    {
+      phase: "access",
+      title: "Phase 2: Enable controlled retrieval",
+      objective:
+        "Add the controlled-access surfaces that let agencies and necessary parties pull deeper authorization data when needed.",
+    },
+    {
+      phase: "operations",
+      title: "Phase 3: Back it with auditable operations",
+      objective:
+        "Support the published surface with internal runbooks, logs, and recurring evidence so the package stays trustworthy over time.",
+    },
+  ];
+
+  return phases
+    .map((phase) => ({
+      ...phase,
+      items: items
+        .filter((item) => item.phase === phase.phase)
+        .map((item) => item.name),
+    }))
+    .filter((phase) => phase.items.length > 0);
+}
+
+function inferFedrampArtifactPlanItems(
+  requirements: FedrampRequirementRecord[],
+  indicators: FedrampKsiIndicatorRecord[],
+): ArtifactPlanItem[] {
+  const items: ArtifactPlanItem[] = [];
+
+  for (const rule of ARTIFACT_RULES) {
+    const requirementMatches = requirements.filter((requirement) =>
+      rule.patterns.some((pattern) => pattern.test(requirementText(requirement))),
+    );
+    const indicatorMatches = indicators.filter((indicator) =>
+      rule.patterns.some((pattern) => pattern.test(indicatorText(indicator))),
+    );
+
+    if (requirementMatches.length === 0 && indicatorMatches.length === 0) continue;
+
+    items.push({
+      name: rule.name,
+      visibility: rule.visibility,
+      phase: rule.phase,
+      format: rule.format,
+      rationale: rule.rationale,
+      groundedBy: dedupeStrings(requirementMatches.map((requirement) => requirement.id)).slice(0, 4),
+    });
+  }
+
+  return items;
+}
+
+function formatArtifactPlanItem(item: ArtifactPlanItem): string {
+  const groundedBy = item.groundedBy.length > 0 ? item.groundedBy.join(", ") : "linked KSI or process text";
+  return `- ${item.name} [${formatVisibility(item.visibility)} · ${formatPhase(item.phase)} · ${item.format}] — ${item.rationale} Grounded by: ${groundedBy}.`;
+}
+
+function buildArtifactPlanContext(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  args: PlanningArgs,
+): ArtifactPlanContext {
+  const appliesTo = args.applies_to ?? "any";
+
+  try {
+    const process = resolveFedrampProcess(loaded.catalog, args.query);
+    const requirements = filterRequirementsByApplicability(
+      processRequirements(loaded.catalog, process.id),
+      appliesTo,
+    );
+    const linkedIndicators = loaded.catalog.ksiIndicators.filter(
+      (indicator) => resolveLinkedProcess(loaded, indicator.reference)?.id === process.id,
+    );
+    return {
+      kind: "process",
+      subject: process,
+      linkedProcesses: [process],
+      linkedIndicators,
+      requirements,
+    };
+  } catch {
+    const match = resolveFedrampKsi(loaded.catalog, args.query);
+    if (match.kind === "indicator") {
+      const linkedProcess = resolveLinkedProcess(loaded, match.indicator.reference);
+      const linkedProcesses = linkedProcess ? [linkedProcess] : [];
+      const requirements = linkedProcess
+        ? filterRequirementsByApplicability(processRequirements(loaded.catalog, linkedProcess.id), appliesTo)
+        : [];
+      return {
+        kind: "ksi-indicator",
+        subject: match.indicator,
+        linkedProcesses,
+        linkedIndicators: [match.indicator],
+        requirements,
+      };
+    }
+
+    const linkedIndicators = domainIndicators(loaded.catalog, match.domain.id);
+    const linkedProcesses = dedupeStrings(
+      linkedIndicators
+        .map((indicator) => resolveLinkedProcess(loaded, indicator.reference)?.id ?? "")
+        .filter(Boolean),
+    )
+      .map((processId) => loaded.catalog.processes.find((process) => process.id === processId))
+      .filter((process): process is FedrampProcessRecord => Boolean(process));
+    const requirements = linkedProcesses.flatMap((process) =>
+      filterRequirementsByApplicability(processRequirements(loaded.catalog, process.id), appliesTo),
+    );
+    return {
+      kind: "ksi-domain",
+      subject: match.domain,
+      linkedProcesses,
+      linkedIndicators,
+      requirements,
+    };
+  }
 }
 
 export function inferFedrampArtifactSuggestions(
@@ -817,6 +1225,220 @@ export function buildFedrampReadinessBrief(
       text: lines.join("\n"),
     };
   }
+}
+
+export function buildFedrampArtifactPlan(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  args: PlanningArgs,
+): ArtifactPlan {
+  const audience = args.audience ?? "provider";
+  const appliesTo = args.applies_to ?? "any";
+  const context = buildArtifactPlanContext(loaded, args);
+  const items = inferFedrampArtifactPlanItems(context.requirements, context.linkedIndicators);
+  const rollout = buildRolloutPhases(items);
+
+  const subjectName =
+    context.kind === "process"
+      ? context.subject.name
+      : context.kind === "ksi-domain"
+        ? context.subject.name
+        : context.subject.name;
+  const subjectLine =
+    context.kind === "process"
+      ? `Official page:   ${context.subject.sourceUrl ?? "Unavailable"}`
+      : `Linked process:  ${context.linkedProcesses[0] ? `${context.linkedProcesses[0].name} [${context.linkedProcesses[0].shortName}]` : "No direct process match found"}`;
+  const lines = [
+    `${subjectName} artifact plan`,
+    `Audience:        ${audience}`,
+    `Applies to:      ${appliesTo}`,
+    `Subject kind:    ${context.kind}`,
+    subjectLine,
+    "",
+  ];
+
+  const grouped = groupArtifactItemsByVisibility(items);
+
+  const sections: Array<{ title: string; items: ArtifactPlanItem[] }> = [
+    { title: "Public artifacts (inferred from official sources):", items: grouped.publicItems },
+    { title: "Controlled-access artifacts (inferred from official sources):", items: grouped.controlledItems },
+    { title: "Private operating artifacts (inferred from official sources):", items: grouped.privateItems },
+  ];
+
+  for (const section of sections) {
+    if (section.items.length === 0) continue;
+    lines.push(section.title);
+    for (const item of section.items) lines.push(formatArtifactPlanItem(item));
+    lines.push("");
+  }
+
+  if (rollout.length > 0) {
+    lines.push("Recommended rollout order:");
+    for (const phase of rollout) {
+      lines.push(`- ${phase.title} — ${phase.objective}`);
+      for (const item of phase.items) {
+        lines.push(`  - ${item}`);
+      }
+    }
+    lines.push("");
+  }
+
+  if (context.linkedIndicators.length > 0) {
+    lines.push("Linked KSI indicators:");
+    for (const indicator of context.linkedIndicators.slice(0, 6)) {
+      lines.push(`- ${indicator.id} — ${indicator.name}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(
+    formatProvenanceNote({
+      repo: loaded.provenance.repo,
+      path: loaded.provenance.path,
+      branch: loaded.provenance.branch,
+      blobSha: loaded.provenance.blobSha,
+      version: loaded.provenance.version,
+      upstreamLastUpdated: loaded.provenance.upstreamLastUpdated,
+      cacheStatus: loaded.cacheStatus,
+    }),
+  );
+
+  const text = lines.join("\n");
+
+  if (context.kind === "process") {
+    return {
+      kind: "process",
+      subject: context.subject,
+      linkedProcesses: context.linkedProcesses,
+      linkedIndicators: context.linkedIndicators,
+      items,
+      rollout,
+      text,
+    };
+  }
+
+  if (context.kind === "ksi-indicator") {
+    return {
+      kind: "ksi-indicator",
+      subject: context.subject,
+      linkedProcesses: context.linkedProcesses,
+      linkedIndicators: context.linkedIndicators,
+      items,
+      rollout,
+      text,
+    };
+  }
+
+  return {
+    kind: "ksi-domain",
+    subject: context.subject,
+    linkedProcesses: context.linkedProcesses,
+    linkedIndicators: context.linkedIndicators,
+    items,
+    rollout,
+    text,
+  };
+}
+
+export function buildFedrampAdsPackagePlan(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  args: AdsPackageArgs,
+): AdsPackagePlan {
+  const audience = args.audience ?? "trust-center";
+  const appliesTo = args.applies_to ?? "20x";
+  const artifactPlan = buildFedrampArtifactPlan(loaded, {
+    query: "ADS",
+    audience,
+    applies_to: appliesTo,
+  });
+
+  if (artifactPlan.kind !== "process") {
+    throw new Error("ADS package planning requires the ADS process context.");
+  }
+
+  const grouped = groupArtifactItemsByVisibility(artifactPlan.items);
+  const lines = [
+    "Authorization Data Sharing package plan",
+    `Audience:        ${audience}`,
+    `Applies to:      ${appliesTo}`,
+    `Official page:   ${artifactPlan.subject.sourceUrl ?? "Unavailable"}`,
+    "",
+  ];
+
+  if (artifactPlan.subject.expectedOutcomes.length > 0) {
+    lines.push("Expected outcomes:");
+    for (const outcome of artifactPlan.subject.expectedOutcomes.slice(0, 5)) {
+      lines.push(`- ${outcome}`);
+    }
+    lines.push("");
+  }
+
+  const sections: Array<{ title: string; items: ArtifactPlanItem[]; empty: string }> = [
+    {
+      title: "Public trust-center layer:",
+      items: grouped.publicItems,
+      empty: "- No public package items were inferred from the current official source filter.",
+    },
+    {
+      title: "Controlled authorization-data layer:",
+      items: grouped.controlledItems,
+      empty: "- No controlled-access items were inferred from the current official source filter.",
+    },
+    {
+      title: "Private operating layer:",
+      items: grouped.privateItems,
+      empty: "- No private operating items were inferred from the current official source filter.",
+    },
+  ];
+
+  for (const section of sections) {
+    lines.push(section.title);
+    if (section.items.length === 0) lines.push(section.empty);
+    else for (const item of section.items) lines.push(formatArtifactPlanItem(item));
+    lines.push("");
+  }
+
+  if (artifactPlan.rollout.length > 0) {
+    lines.push("Recommended rollout:");
+    for (const phase of artifactPlan.rollout) {
+      lines.push(`- ${phase.title} — ${phase.objective}`);
+      for (const item of phase.items) {
+        lines.push(`  - ${item}`);
+      }
+    }
+    lines.push("");
+  }
+
+  if (artifactPlan.linkedIndicators.length > 0) {
+    lines.push("Linked KSI indicators:");
+    for (const indicator of artifactPlan.linkedIndicators.slice(0, 6)) {
+      lines.push(`- ${indicator.id} — ${indicator.name}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(
+    formatProvenanceNote({
+      repo: loaded.provenance.repo,
+      path: loaded.provenance.path,
+      branch: loaded.provenance.branch,
+      blobSha: loaded.provenance.blobSha,
+      version: loaded.provenance.version,
+      upstreamLastUpdated: loaded.provenance.upstreamLastUpdated,
+      cacheStatus: loaded.cacheStatus,
+    }),
+  );
+
+  return {
+    process: artifactPlan.subject,
+    linkedIndicators: artifactPlan.linkedIndicators,
+    audience,
+    appliesTo,
+    publicItems: grouped.publicItems,
+    controlledItems: grouped.controlledItems,
+    privateItems: grouped.privateItems,
+    rollout: artifactPlan.rollout,
+    text: lines.join("\n"),
+  };
 }
 
 function formatKsiText(
@@ -1224,6 +1846,130 @@ export function registerFedrampTools(pi: any): void {
         return errorResult(
           `FedRAMP readiness assessment failed: ${error instanceof Error ? error.message : String(error)}`,
           { tool: "fedramp_assess_readiness", query: args.query },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "fedramp_plan_process_artifacts",
+    label: "Plan FedRAMP process artifacts",
+    description:
+      "Turn an official FedRAMP process or KSI into a practical artifact plan with public, controlled-access, and private operating surfaces plus a rollout order.",
+    parameters: Type.Object({
+      query: Type.String({
+        description: "Process or KSI query such as ADS, SCG, KSI-AFR, or KSI-AFR-ADS.",
+      }),
+      applies_to: Type.Optional(
+        Type.Union([
+          Type.Literal("20x"),
+          Type.Literal("rev5"),
+          Type.Literal("both"),
+          Type.Literal("any"),
+        ]),
+      ),
+      audience: Type.Optional(
+        Type.Union([
+          Type.Literal("provider"),
+          Type.Literal("trust-center"),
+          Type.Literal("any"),
+        ]),
+      ),
+    }),
+    prepareArguments: normalizePlanningArgs,
+    async execute(_toolCallId: string, args: PlanningArgs) {
+      if (!args.query.trim()) {
+        return missingQueryResult("fedramp_plan_process_artifacts", '{"query":"ADS"}');
+      }
+
+      try {
+        const loaded = await loadFedrampCatalog();
+        const plan = buildFedrampArtifactPlan(loaded, args);
+        return textResult(plan.text, {
+          tool: "fedramp_plan_process_artifacts",
+          query: args.query,
+          audience: args.audience ?? "provider",
+          applies_to: args.applies_to ?? "any",
+          kind: plan.kind,
+          item_count: plan.items.length,
+          items: plan.items,
+          rollout: plan.rollout,
+          linked_processes: plan.linkedProcesses.map((process) => ({
+            id: process.id,
+            name: process.name,
+            short_name: process.shortName,
+          })),
+          linked_indicators: plan.linkedIndicators.map((indicator) => ({
+            id: indicator.id,
+            name: indicator.name,
+            reference: indicator.reference,
+          })),
+          provenance: loaded.provenance,
+          cache_status: loaded.cacheStatus,
+          notes: loaded.notes,
+        });
+      } catch (error) {
+        return errorResult(
+          `FedRAMP artifact planning failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "fedramp_plan_process_artifacts", query: args.query },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "fedramp_plan_ads_package",
+    label: "Plan ADS trust-center package",
+    description:
+      "Build an Authorization Data Sharing package plan grounded in official FedRAMP sources, grouped into public, controlled-access, and private operating layers.",
+    parameters: Type.Object({
+      applies_to: Type.Optional(
+        Type.Union([
+          Type.Literal("20x"),
+          Type.Literal("rev5"),
+          Type.Literal("both"),
+          Type.Literal("any"),
+        ]),
+      ),
+      audience: Type.Optional(
+        Type.Union([
+          Type.Literal("provider"),
+          Type.Literal("trust-center"),
+          Type.Literal("any"),
+        ]),
+      ),
+    }),
+    prepareArguments: normalizeAdsPackageArgs,
+    async execute(_toolCallId: string, args: AdsPackageArgs) {
+      try {
+        const loaded = await loadFedrampCatalog();
+        const plan = buildFedrampAdsPackagePlan(loaded, args);
+        return textResult(plan.text, {
+          tool: "fedramp_plan_ads_package",
+          audience: args.audience ?? "trust-center",
+          applies_to: args.applies_to ?? "20x",
+          process: {
+            id: plan.process.id,
+            name: plan.process.name,
+            short_name: plan.process.shortName,
+          },
+          public_items: plan.publicItems,
+          controlled_items: plan.controlledItems,
+          private_items: plan.privateItems,
+          rollout: plan.rollout,
+          linked_indicators: plan.linkedIndicators.map((indicator) => ({
+            id: indicator.id,
+            name: indicator.name,
+            reference: indicator.reference,
+          })),
+          provenance: loaded.provenance,
+          cache_status: loaded.cacheStatus,
+          notes: loaded.notes,
+        });
+      } catch (error) {
+        return errorResult(
+          `FedRAMP ADS package planning failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "fedramp_plan_ads_package" },
         );
       }
     },

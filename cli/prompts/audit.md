@@ -17,10 +17,12 @@ Use the available GRC tools first:
 2. Search KEV and EPSS data for active exploit pressure
 3. If FedRAMP or FedRAMP 20x is in scope, start with `fedramp_check_sources`, then use `fedramp_search_frmr`, `fedramp_get_process`, `fedramp_get_requirement`, and `fedramp_get_ksi` to ground your interpretation in the official FedRAMP GitHub sources
 4. When you need a practical operator brief instead of raw source data, use `fedramp_assess_readiness` on the relevant process or KSI
-5. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
-6. If you need control language, crosswalk mappings, or artifact guidance, use `scf_search_controls`, `scf_get_control`, `scf_get_crosswalk`, and `scf_get_evidence_request`
-7. If the deliverable needs to become a portable OSCAL artifact, start with `oscal_check_trestle`, then use `oscal_init_workspace`, `oscal_import_model` or `oscal_create_model`, and the SSP helpers as needed
-8. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
+5. When you need to turn a FedRAMP process into a concrete publishing and evidence plan, use `fedramp_plan_process_artifacts`
+6. If the scope centers on Authorization Data Sharing or trust-center rollout, use `fedramp_plan_ads_package`
+7. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
+8. If you need control language, crosswalk mappings, or artifact guidance, use `scf_search_controls`, `scf_get_control`, `scf_get_crosswalk`, and `scf_get_evidence_request`
+9. If the deliverable needs to become a portable OSCAL artifact, start with `oscal_check_trestle`, then use `oscal_init_workspace`, `oscal_import_model` or `oscal_create_model`, and the SSP helpers as needed
+10. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
 
 If evidence is missing, say exactly what is missing and what artifact would close the gap.
 
