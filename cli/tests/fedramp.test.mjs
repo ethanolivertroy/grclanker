@@ -619,7 +619,9 @@ test("ADS site builder includes public pages, JSON artifacts, and cloud deploy n
 
   assert.equal(site.bundleName, "ads-public-site");
   assert.equal(site.metadata.baseUrl, "https://trust.example.com");
+  assert.equal(site.metadata.approvalStatus, "draft-unapproved");
   assert.ok(site.files.some((file) => file.path === "index.html"));
+  assert.ok(site.files.some((file) => file.path === "APPROVAL_REQUIRED.md"));
   assert.ok(site.files.some((file) => file.path === "services/index.html"));
   assert.ok(site.files.some((file) => file.path === "access/index.html"));
   assert.ok(site.files.some((file) => file.path === "history/index.html"));
@@ -636,6 +638,8 @@ test("ADS site builder includes public pages, JSON artifacts, and cloud deploy n
   assert.match(readme, /AWS: upload the generated files to S3/i);
   assert.match(readme, /Azure: upload the generated files to Azure Storage Static Website/i);
   assert.match(readme, /GCP: upload the generated files to Cloud Storage/i);
+  assert.match(readme, /Approval status: draft-unapproved/i);
+  assert.match(readme, /Review and approve every public statement/i);
 
   const index = site.files.find((file) => file.path === "index.html")?.content ?? "";
   assert.match(index, /Example Cloud Trust Center/);
@@ -643,6 +647,8 @@ test("ADS site builder includes public pages, JSON artifacts, and cloud deploy n
   assert.match(index, /query-index\.json/);
   assert.match(index, /llms\.txt/);
   assert.match(index, /documentation\/api\/api\.yaml/);
+  assert.match(index, /Draft scaffold\. Review before publication\./);
+  assert.match(index, /noindex,nofollow,noarchive/);
   assert.match(index, /public trust center/i);
 
   const llms = site.files.find((file) => file.path === "llms.txt")?.content ?? "";
@@ -653,11 +659,20 @@ test("ADS site builder includes public pages, JSON artifacts, and cloud deploy n
   assert.match(queryIndex, /"resources": \[/);
   assert.match(queryIndex, /"llms-txt"/);
   assert.match(queryIndex, /"openapi-yaml"/);
+  assert.match(queryIndex, /"draft-unapproved"/);
 
   const openapi = site.files.find((file) => file.path === "documentation/api/api.yaml")?.content ?? "";
   assert.match(openapi, /openapi: 3\.0\.3/);
   assert.match(openapi, /\/authorization-data\.json:/);
   assert.match(openapi, /\/llms\.txt:/);
+  assert.match(openapi, /requires human approval before publication/i);
+
+  const robots = site.files.find((file) => file.path === "robots.txt")?.content ?? "";
+  assert.match(robots, /Disallow: \//);
+
+  const approval = site.files.find((file) => file.path === "APPROVAL_REQUIRED.md")?.content ?? "";
+  assert.match(approval, /Approval Required Before Publication/);
+  assert.match(approval, /Reviewer: TODO/);
 });
 
 test("ADS site generator writes a portable static trust-center bundle under the requested root", async () => {
@@ -690,6 +705,7 @@ test("ADS site generator writes a portable static trust-center bundle under the 
     assert.ok(result.outputDir.startsWith(realpathSync(outputRoot)));
     assert.equal(result.metadata.siteTitle, "Example Cloud Trust Center");
     assert.ok(existsSync(join(result.outputDir, "index.html")));
+    assert.ok(existsSync(join(result.outputDir, "APPROVAL_REQUIRED.md")));
     assert.ok(existsSync(join(result.outputDir, "services", "index.html")));
     assert.ok(existsSync(join(result.outputDir, "access", "index.html")));
     assert.ok(existsSync(join(result.outputDir, "history", "index.html")));
@@ -705,11 +721,15 @@ test("ADS site generator writes a portable static trust-center bundle under the 
     const source = readFileSync(join(result.outputDir, "_source.json"), "utf8");
     assert.match(source, /"bundle": "ads-public-site"/);
     assert.match(source, /"primary_domain": "trust\.example\.com"/);
+    assert.match(source, /"approval_status": "draft-unapproved"/);
 
     const llms = readFileSync(join(result.outputDir, "llms.txt"), "utf8");
     assert.match(llms, /trust-center\.md/);
     assert.match(llms, /llms-full\.txt/);
     assert.match(llms, /documentation\/api\/api\.yaml/);
+
+    const robots = readFileSync(join(result.outputDir, "robots.txt"), "utf8");
+    assert.match(robots, /Disallow: \//);
   } finally {
     rmSync(outputRoot, { recursive: true, force: true });
   }

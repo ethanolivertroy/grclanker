@@ -192,6 +192,8 @@ type AdsSiteMetadata = {
   supportEmail: string;
   baseUrl: string;
   siteTitle: string;
+  approvalStatus: "draft-unapproved";
+  requiresHumanApproval: true;
 };
 
 type AdsPublicSite = {
@@ -1246,6 +1248,8 @@ function buildAdsSiteMetadata(args: AdsSiteArgs): AdsSiteMetadata {
     supportEmail: args.support_email ?? "security@example.com",
     baseUrl,
     siteTitle: `${offeringName} Trust Center`,
+    approvalStatus: "draft-unapproved",
+    requiresHumanApproval: true,
   };
 }
 
@@ -1316,6 +1320,8 @@ function buildAdsSiteSourceMetadataFile(
         primary_domain: metadata.primaryDomain,
         base_url: metadata.baseUrl,
         support_email: metadata.supportEmail,
+        approval_status: metadata.approvalStatus,
+        requires_human_approval: metadata.requiresHumanApproval,
       },
       process: {
         id: plan.process.id,
@@ -1333,6 +1339,12 @@ function buildAdsSiteSourceMetadataFile(
       public_items: plan.publicItems,
       controlled_items: plan.controlledItems,
       rollout: plan.rollout,
+      publication: {
+        status: metadata.approvalStatus,
+        requires_human_approval: metadata.requiresHumanApproval,
+        note:
+          "Generated trust-center output is a draft scaffold. Review and approve the content before public hosting or indexing.",
+      },
       provenance: {
         ...loaded.provenance,
         cache_status: loaded.cacheStatus,
@@ -1356,6 +1368,8 @@ function buildAdsSiteAuthorizationDataJson(plan: AdsPackagePlan, metadata: AdsSi
         offering_name: metadata.offeringName,
         base_url: metadata.baseUrl,
         support_email: metadata.supportEmail,
+        approval_status: metadata.approvalStatus,
+        requires_human_approval: metadata.requiresHumanApproval,
       },
       fedramp: {
         process: plan.process.shortName,
@@ -1379,6 +1393,12 @@ function buildAdsSiteAuthorizationDataJson(plan: AdsPackagePlan, metadata: AdsSi
           },
         ],
         customer_responsibilities: ["TODO"],
+      },
+      publication: {
+        status: metadata.approvalStatus,
+        requires_human_approval: metadata.requiresHumanApproval,
+        note:
+          "Draft scaffold only. A human owner must review and approve the shared information before public publication.",
       },
       grounding: {
         artifact: machineReadable?.name ?? "Machine-readable authorization data feed",
@@ -1409,6 +1429,12 @@ function buildAdsSiteServiceInventoryJson(plan: AdsPackagePlan, metadata: AdsSit
       ],
       shared_responsibility_summary: "TODO",
       boundary_notes: "TODO",
+      publication: {
+        status: metadata.approvalStatus,
+        requires_human_approval: metadata.requiresHumanApproval,
+        note:
+          "Draft scaffold only. A human owner must review and approve the shared information before public publication.",
+      },
       grounding: {
         artifact: inventory?.name ?? "Service inventory and assessment-scope page",
         requirement_ids: groundedIds(inventory),
@@ -1432,6 +1458,12 @@ function buildAdsQueryIndexJson(
         "Machine-readable index of the public trust-center resources intentionally exposed for broad retrieval.",
       base_url: metadata.baseUrl,
       support_email: metadata.supportEmail,
+      publication: {
+        status: metadata.approvalStatus,
+        requires_human_approval: metadata.requiresHumanApproval,
+        note:
+          "This index describes a draft public trust-center scaffold. Human approval is required before the represented content should be treated as final public disclosure.",
+      },
       process: {
         id: plan.process.id,
         short_name: plan.process.shortName,
@@ -1548,9 +1580,14 @@ function buildAdsTrustCenterMarkdown(
   const controlledItems = plan.controlledItems.map((item) => `- **${item.name}**: ${item.rationale}`).join("\n");
   return `# ${metadata.siteTitle}
 
-> Public trust-center surface for ${metadata.offeringName}. This markdown file is intended for agents, scripts, and organizations that want the shareable facts without parsing the HTML site.
+> Draft public trust-center surface for ${metadata.offeringName}. This markdown file is intended for agents, scripts, and organizations that want the shareable facts without parsing the HTML site.
 
 This trust center exposes only the public layer of the provider's Authorization Data Sharing posture. Controlled-access and private operational materials are intentionally excluded from this file and from the public host.
+
+## Approval status
+
+- Status: draft-unapproved
+- Human approval required before publication: yes
 
 ## Public resources
 
@@ -1594,9 +1631,10 @@ ${controlledItems || "- TODO: document controlled-access artifact classes outsid
 function buildAdsLlmsTxt(metadata: AdsSiteMetadata): string {
   return `# ${metadata.siteTitle}
 
-> Public trust-center resources for ${metadata.offeringName}, including human-readable pages and machine-readable JSON endpoints that organizations can query safely.
+> Draft public trust-center resources for ${metadata.offeringName}, including human-readable pages and machine-readable JSON endpoints that organizations can query safely after human approval.
 
 This site exposes only the information the provider is willing to share publicly. Controlled-access and private authorization materials are intentionally excluded from the public host.
+Human approval is required before these draft resources should be treated as final public disclosures.
 
 ## Public trust center
 
@@ -1632,7 +1670,7 @@ function buildAdsLlmsFullTxt(
     .join("\n");
   return `# ${metadata.siteTitle}
 
-> Public trust-center surface for ${metadata.offeringName}. This file bundles the public documentation and machine-readable resource map into one text response for agents and automation.
+> Draft public trust-center surface for ${metadata.offeringName}. This file bundles the public documentation and machine-readable resource map into one text response for agents and automation.
 
 ## Public trust center summary
 
@@ -1642,6 +1680,8 @@ function buildAdsLlmsFullTxt(
 - Support email: ${metadata.supportEmail}
 - Official process: ${plan.process.name} [${plan.process.shortName}]
 - Applies to: ${plan.appliesTo}
+- Approval status: ${metadata.approvalStatus}
+- Human approval required before publication: yes
 
 ## Public resources
 
@@ -1690,8 +1730,8 @@ info:
   title: ${metadata.siteTitle} API
   version: 0.1.0
   description: >
-    Public, read-only trust-center contract for the information the provider is willing to share broadly.
-    This API description covers only static GET resources exposed by the public host.
+    Draft, public, read-only trust-center contract for the information the provider is willing to share broadly.
+    This API description covers only static GET resources exposed by the public host and requires human approval before publication.
 servers:
   - url: ${metadata.baseUrl}
 paths:
@@ -1764,6 +1804,39 @@ paths:
 `;
 }
 
+function buildAdsApprovalChecklist(metadata: AdsSiteMetadata): string {
+  return `# Approval Required Before Publication
+
+This generated trust-center bundle is a draft scaffold. Do not publish it to a public domain until a human owner reviews and approves the content.
+
+## Required review checks
+
+- Confirm the provider name, offering name, domain, and support contact are correct.
+- Review every TODO field in the HTML, markdown, JSON, and YAML files.
+- Confirm that no controlled-access or private operational information leaked into the public files.
+- Confirm the organization is actually willing to publish each JSON field and page section.
+- Confirm the public query surface is limited to the files intentionally exposed:
+  - \`authorization-data.json\`
+  - \`service-inventory.json\`
+  - \`query-index.json\`
+  - \`trust-center.md\`
+  - \`llms.txt\`
+  - \`llms-full.txt\`
+  - \`documentation/api/api.yaml\`
+- Confirm the trust-center summary, access guidance, and version history match the latest approved public posture.
+- Only after approval: remove draft/noindex warnings, update \`robots.txt\`, and publish to the customer-owned host.
+
+## Approval record
+
+- Reviewer: TODO
+- Approval date: TODO
+- Approval scope: TODO
+- Notes: TODO
+
+If approval is still pending, keep this bundle private and unhosted.
+`;
+}
+
 function buildAdsSiteReadme(
   loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
   plan: AdsPackagePlan,
@@ -1773,6 +1846,11 @@ function buildAdsSiteReadme(
     `# ${metadata.siteTitle}`,
     "",
     "This directory is a portable, public-only ADS trust-center scaffold generated by grclanker.",
+    "",
+    "Draft status:",
+    "- Approval status: draft-unapproved",
+    "- Human approval required before publication: yes",
+    "- Default indexing posture: blocked until a human explicitly reviews and flips it",
     "",
     "What is included:",
     "- Static HTML pages for the trust-center summary, services, access guidance, and version history.",
@@ -1804,6 +1882,8 @@ function buildAdsSiteReadme(
     "- This output is static by design. No application server is required.",
     "- Keep the generated file paths intact so the relative links and `sitemap.xml` remain valid.",
     "- Replace all TODO fields before publishing to a public domain.",
+    "- Review and approve every public statement, endpoint, and JSON field before hosting the site publicly.",
+    "- Remove the draft banner, noindex meta tag, and `Disallow: /` robots posture only after that approval step is complete.",
     "- Review `_source.json` and keep it if you want provenance for internal traceability.",
     "",
     "Public files:",
@@ -2251,6 +2331,7 @@ function buildAdsSiteDocument(
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${escapeHtml(options.title)} · ${escapeHtml(metadata.siteTitle)}</title>
     <meta name="description" content="${escapeHtml(options.description)}" />
+    <meta name="robots" content="noindex,nofollow,noarchive" />
     <link rel="stylesheet" href="${escapeHtml(pageHref(options.prefix, "assets/site.css"))}" />
   </head>
   <body>
@@ -2263,6 +2344,7 @@ function buildAdsSiteDocument(
             <p class="brand-copy">A portable public trust-center scaffold grounded in the official FedRAMP GitHub FRMR source. Replace the TODO fields with your customer-facing service posture, scope, and access narrative.</p>
           </div>
           <div class="meta-strip">
+            <span class="meta-pill">Draft · Human approval required</span>
             <span class="meta-pill">Provider · ${escapeHtml(metadata.providerName)}</span>
             <span class="meta-pill">Offering · ${escapeHtml(metadata.offeringName)}</span>
             <span class="meta-pill">Applies to · ${escapeHtml(plan.appliesTo.toUpperCase())}</span>
@@ -2270,9 +2352,14 @@ function buildAdsSiteDocument(
         </div>
         <nav class="site-nav" aria-label="Trust center navigation">${nav}</nav>
       </header>
+      <section class="panel">
+        <span class="section-kicker">Approval gate</span>
+        <h2 class="section-title">Draft scaffold. Review before publication.</h2>
+        <p class="section-copy">This generated trust-center site is intentionally marked draft-unapproved. A human owner should verify every public statement, endpoint, and file before hosting it on a public domain or removing the noindex posture.</p>
+      </section>
       ${options.main}
       <footer class="footer-panel">
-        <p class="footer-copy">This site only covers the public layer. Controlled-access and private operational materials should stay outside the public host and can be scaffolded separately with grclanker's ADS bundle generator.</p>
+        <p class="footer-copy">This site only covers the public layer. Controlled-access and private operational materials should stay outside the public host and can be scaffolded separately with grclanker's ADS bundle generator. The generated output is draft-only until a human approves it for publication.</p>
         <div class="footer-links">
           <a href="${escapeHtml(pageHref(options.prefix, "authorization-data.json"))}">authorization-data.json</a>
           <a href="${escapeHtml(pageHref(options.prefix, "service-inventory.json"))}">service-inventory.json</a>
@@ -2526,7 +2613,7 @@ function buildAds404Page(metadata: AdsSiteMetadata): string {
 }
 
 function buildAdsRobotsTxt(metadata: AdsSiteMetadata): string {
-  return `User-agent: *\nAllow: /\nSitemap: ${metadata.baseUrl}/sitemap.xml\n`;
+  return `# Draft scaffold: block indexing until a human approves publication\nUser-agent: *\nDisallow: /\nSitemap: ${metadata.baseUrl}/sitemap.xml\n`;
 }
 
 function buildAdsSitemapXml(metadata: AdsSiteMetadata): string {
@@ -2552,6 +2639,7 @@ export function buildFedrampAdsSite(
 
   const files: BundleTemplateFile[] = [
     { path: "README.md", content: buildAdsSiteReadme(loaded, plan, metadata) },
+    { path: "APPROVAL_REQUIRED.md", content: buildAdsApprovalChecklist(metadata) },
     { path: "_source.json", content: buildAdsSiteSourceMetadataFile(loaded, plan, metadata) },
     { path: "assets/site.css", content: buildAdsSiteCss() },
     { path: "index.html", content: buildAdsOverviewPage(metadata, loaded, plan) },
@@ -3965,7 +4053,9 @@ export function registerFedrampTools(pi: any): void {
           "Files:",
           ...relativeFiles.map((filePath) => `- ${filePath}`),
           "",
-          "This output is public-only and static by design. Host it in a customer-owned AWS, Azure, or GCP environment, then keep controlled-access and private operational artifacts outside the public site.",
+          "This output is public-only and static by design, but it is generated as a draft scaffold.",
+          "A human owner should approve the content before public hosting or removing the default noindex posture.",
+          "Host it in a customer-owned AWS, Azure, or GCP environment only after that review, and keep controlled-access and private operational artifacts outside the public site.",
         ];
 
         return textResult(lines.join("\n"), {
