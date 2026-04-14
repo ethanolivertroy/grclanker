@@ -5,7 +5,7 @@ description: Start with the bundle installer, run setup, pick local-first or hos
 
 `grclanker` is an experimental open source AI GRC companion built on top of Pi.
 
-The current release starts with CMVP, KEV, EPSS, official FedRAMP GitHub-grounded 20x and Rev5 lookups, FedRAMP readiness, ADS package planning and starter-bundle generation, posture mapping, Vanta audit export, SCF lookups, trestle-backed OSCAL helpers, and spec-driven build inputs, but that is the opening surface, not the ceiling. The real flow is short:
+The current release starts with CMVP, KEV, EPSS, official FedRAMP GitHub-grounded 20x and Rev5 lookups, FedRAMP readiness, ADS package planning, starter-bundle generation, portable public trust-center site generation, posture mapping, Vanta audit export, SCF lookups, trestle-backed OSCAL helpers, and spec-driven build inputs, but that is the opening surface, not the ceiling. The real flow is short:
 
 1. Install the companion.
 2. Run `grclanker setup`.
@@ -40,6 +40,7 @@ If you want the path that best matches the current product direction:
 - `fedramp_assess_readiness` when you want an operator-facing brief for a FedRAMP process or KSI instead of raw lookup data.
 - `fedramp_plan_process_artifacts` and `fedramp_plan_ads_package` when you need a concrete trust-center and evidence rollout plan instead of another lookup.
 - `fedramp_generate_ads_bundle` when you want grclanker to scaffold an ADS starter package you can actually start filling in.
+- `fedramp_generate_ads_site` when you want a portable public trust-center site bundle customers can deploy in their own AWS, Azure, or GCP environment.
 - Repo specs as build inputs under [`/specs`](/specs) and [`/docs/specs/using-specs-as-inputs/`](/docs/specs/using-specs-as-inputs/).
 
 ## Important Release Note

@@ -57,6 +57,15 @@ type AdsBundleArgs = {
   applies_to?: FedrampApplicability | "any";
   audience?: "provider" | "trust-center" | "any";
 };
+type AdsSiteArgs = {
+  output_dir?: string;
+  applies_to?: FedrampApplicability | "any";
+  audience?: "provider" | "trust-center" | "any";
+  provider_name?: string;
+  offering_name?: string;
+  primary_domain?: string;
+  support_email?: string;
+};
 
 type ArtifactVisibility = "public" | "controlled" | "private";
 type ArtifactPhase = "foundation" | "access" | "operations";
@@ -176,8 +185,32 @@ type AdsStarterBundleResult = {
   plan: AdsPackagePlan;
 };
 
+type AdsSiteMetadata = {
+  providerName: string;
+  offeringName: string;
+  primaryDomain: string;
+  supportEmail: string;
+  baseUrl: string;
+  siteTitle: string;
+};
+
+type AdsPublicSite = {
+  bundleName: string;
+  files: BundleTemplateFile[];
+  plan: AdsPackagePlan;
+  metadata: AdsSiteMetadata;
+};
+
+type AdsPublicSiteResult = {
+  outputDir: string;
+  files: string[];
+  plan: AdsPackagePlan;
+  metadata: AdsSiteMetadata;
+};
+
 const DEFAULT_FEDRAMP_OUTPUT_DIR = "./export/fedramp";
 const ADS_BUNDLE_DIRNAME = "ads-starter-bundle";
+const ADS_SITE_DIRNAME = "ads-public-site";
 
 type ArtifactPlanContext =
   | {
@@ -378,6 +411,49 @@ function normalizeAdsBundleArgs(args: unknown): AdsBundleArgs {
   }
 
   return { output_dir: undefined, applies_to: "20x", audience: "trust-center" };
+}
+
+function normalizeAdsSiteArgs(args: unknown): AdsSiteArgs {
+  if (args && typeof args === "object") {
+    const value = args as Record<string, unknown>;
+    const audienceRaw = asString(value.audience)?.toLowerCase();
+    return {
+      output_dir: asString(value.output_dir) ?? asString(value.output) ?? asString(value.dir),
+      applies_to: normalizeFedrampApplicability(
+        asString(value.applies_to) ?? asString(value.framework) ?? "20x",
+      ),
+      audience:
+        audienceRaw === "trust-center" || audienceRaw === "any" || audienceRaw === "provider"
+          ? audienceRaw
+          : "trust-center",
+      provider_name:
+        asString(value.provider_name) ??
+        asString(value.provider) ??
+        asString(value.organization) ??
+        asString(value.company),
+      offering_name:
+        asString(value.offering_name) ??
+        asString(value.offering) ??
+        asString(value.product) ??
+        asString(value.service),
+      primary_domain:
+        asString(value.primary_domain) ?? asString(value.domain) ?? asString(value.base_url),
+      support_email:
+        asString(value.support_email) ??
+        asString(value.email) ??
+        asString(value.contact_email),
+    };
+  }
+
+  return {
+    output_dir: undefined,
+    applies_to: "20x",
+    audience: "trust-center",
+    provider_name: undefined,
+    offering_name: undefined,
+    primary_domain: undefined,
+    support_email: undefined,
+  };
 }
 
 function missingQueryResult(toolName: string, example: string) {
@@ -1144,6 +1220,1026 @@ export async function generateFedrampAdsStarterBundle(
     outputDir,
     files: writtenFiles,
     plan: bundle.plan,
+  };
+}
+
+function normalizePrimaryDomain(value: string | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return "trust.example.com";
+  return trimmed.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+}
+
+function toBaseUrl(domain: string): string {
+  return `https://${domain.replace(/^https?:\/\//i, "").replace(/\/+$/, "")}`;
+}
+
+function buildAdsSiteMetadata(args: AdsSiteArgs): AdsSiteMetadata {
+  const providerName = args.provider_name ?? "Example Provider";
+  const offeringName = args.offering_name ?? "Example Cloud Service";
+  const primaryDomain = normalizePrimaryDomain(args.primary_domain);
+  const baseUrl = toBaseUrl(primaryDomain);
+
+  return {
+    providerName,
+    offeringName,
+    primaryDomain,
+    supportEmail: args.support_email ?? "security@example.com",
+    baseUrl,
+    siteTitle: `${offeringName} Trust Center`,
+  };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function pageHref(prefix: string, path: string): string {
+  return `${prefix}${path}`;
+}
+
+function navLink(prefix: string, href: string, label: string, active: boolean): string {
+  return `<a href="${escapeHtml(pageHref(prefix, href))}" class="site-nav-link${active ? " is-active" : ""}">${escapeHtml(label)}</a>`;
+}
+
+function renderArtifactList(items: ArtifactPlanItem[]): string {
+  if (items.length === 0) {
+    return "<p class=\"empty-copy\">No public-facing items were inferred from the current official source text for this scope.</p>";
+  }
+
+  return `<ul class="artifact-list">${items
+    .map(
+      (item) =>
+        `<li><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.rationale)}</p><p class="artifact-meta">${escapeHtml(item.format)} · Grounded by ${escapeHtml(item.groundedBy.join(", ") || "linked official text")}</p></li>`,
+    )
+    .join("")}</ul>`;
+}
+
+function renderRolloutSummary(plan: AdsPackagePlan): string {
+  const relevantPhases = plan.rollout.filter((phase) =>
+    phase.items.some((name) =>
+      plan.publicItems.some((item) => item.name === name) ||
+      plan.controlledItems.some((item) => item.name === name),
+    ),
+  );
+
+  return `<ol class="rollout-list">${relevantPhases
+    .map((phase) => {
+      const visibleItems = phase.items.filter((name) =>
+        plan.publicItems.some((item) => item.name === name) ||
+        plan.controlledItems.some((item) => item.name === name),
+      );
+      return `<li><h3>${escapeHtml(phase.title)}</h3><p>${escapeHtml(phase.objective)}</p><ul>${visibleItems
+        .map((item) => `<li>${escapeHtml(item)}</li>`)
+        .join("")}</ul></li>`;
+    })
+    .join("")}</ol>`;
+}
+
+function buildAdsSiteSourceMetadataFile(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+  metadata: AdsSiteMetadata,
+): string {
+  return `${JSON.stringify(
+    {
+      generated_by: "grclanker",
+      bundle: ADS_SITE_DIRNAME,
+      site: {
+        title: metadata.siteTitle,
+        provider_name: metadata.providerName,
+        offering_name: metadata.offeringName,
+        primary_domain: metadata.primaryDomain,
+        base_url: metadata.baseUrl,
+        support_email: metadata.supportEmail,
+      },
+      process: {
+        id: plan.process.id,
+        name: plan.process.name,
+        short_name: plan.process.shortName,
+        source_url: plan.process.sourceUrl,
+      },
+      applies_to: plan.appliesTo,
+      audience: plan.audience,
+      linked_indicators: plan.linkedIndicators.map((indicator) => ({
+        id: indicator.id,
+        name: indicator.name,
+        reference: indicator.reference,
+      })),
+      public_items: plan.publicItems,
+      controlled_items: plan.controlledItems,
+      rollout: plan.rollout,
+      provenance: {
+        ...loaded.provenance,
+        cache_status: loaded.cacheStatus,
+        notes: loaded.notes,
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function buildAdsSiteAuthorizationDataJson(plan: AdsPackagePlan, metadata: AdsSiteMetadata): string {
+  const machineReadable = findArtifactItem(plan, "Machine-readable authorization data feed");
+  return `${JSON.stringify(
+    {
+      version: "0.1.0-draft",
+      generated_by: "grclanker",
+      trust_center: {
+        title: metadata.siteTitle,
+        provider_name: metadata.providerName,
+        offering_name: metadata.offeringName,
+        base_url: metadata.baseUrl,
+        support_email: metadata.supportEmail,
+      },
+      fedramp: {
+        process: plan.process.shortName,
+        process_name: plan.process.name,
+        applies_to: plan.appliesTo,
+        marketplace_url: "TODO",
+        public_summary_url: `${metadata.baseUrl}/`,
+        machine_readable_url: `${metadata.baseUrl}/authorization-data.json`,
+        service_inventory_url: `${metadata.baseUrl}/service-inventory.json`,
+      },
+      offering: {
+        name: metadata.offeringName,
+        status_summary: "TODO",
+        last_updated: "TODO",
+        included_services: [
+          {
+            name: "TODO",
+            service_model: "TODO",
+            included_in_scope: true,
+            notes: "TODO",
+          },
+        ],
+        customer_responsibilities: ["TODO"],
+      },
+      grounding: {
+        artifact: machineReadable?.name ?? "Machine-readable authorization data feed",
+        requirement_ids: groundedIds(machineReadable),
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function buildAdsSiteServiceInventoryJson(plan: AdsPackagePlan, metadata: AdsSiteMetadata): string {
+  const inventory = findArtifactItem(plan, "Service inventory and assessment-scope page");
+  return `${JSON.stringify(
+    {
+      generated_by: "grclanker",
+      trust_center: metadata.siteTitle,
+      process: plan.process.shortName,
+      offering_name: metadata.offeringName,
+      services: [
+        {
+          name: "TODO",
+          marketing_name: "TODO",
+          service_model: "TODO",
+          included_in_scope: true,
+          notes: "TODO",
+        },
+      ],
+      shared_responsibility_summary: "TODO",
+      boundary_notes: "TODO",
+      grounding: {
+        artifact: inventory?.name ?? "Service inventory and assessment-scope page",
+        requirement_ids: groundedIds(inventory),
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function buildAdsSiteReadme(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+  metadata: AdsSiteMetadata,
+): string {
+  const lines = [
+    `# ${metadata.siteTitle}`,
+    "",
+    "This directory is a portable, public-only ADS trust-center scaffold generated by grclanker.",
+    "",
+    "What is included:",
+    "- Static HTML pages for the trust-center summary, services, access guidance, and version history.",
+    "- Public machine-readable files: `authorization-data.json` and `service-inventory.json`.",
+    "- Shared CSS, `robots.txt`, `sitemap.xml`, and provenance metadata in `_source.json`.",
+    "",
+    "What is intentionally excluded:",
+    "- Controlled-access authorization data.",
+    "- Private operating runbooks, logging, routing, or validation records.",
+    "- Any backend or cloud-specific runtime.",
+    "",
+    "Use `fedramp_generate_ads_bundle` if you also need the internal controlled/private scaffolding.",
+    "",
+    `Provider name: ${metadata.providerName}`,
+    `Offering name: ${metadata.offeringName}`,
+    `Primary domain: ${metadata.primaryDomain}`,
+    `Support email: ${metadata.supportEmail}`,
+    `Official process: ${plan.process.name} [${plan.process.shortName}]`,
+    `FRMR version: ${loaded.provenance.version}`,
+    "",
+    "Suggested deployment targets:",
+    "- AWS: upload the generated files to S3, front them with CloudFront, and attach your customer-owned ACM certificate.",
+    "- Azure: upload the generated files to Azure Storage Static Website, then front them with Front Door or Azure CDN.",
+    "- GCP: upload the generated files to Cloud Storage and front them with an HTTPS load balancer or CDN.",
+    "",
+    "Deployment notes:",
+    "- This output is static by design. No application server is required.",
+    "- Keep the generated file paths intact so the relative links and `sitemap.xml` remain valid.",
+    "- Replace all TODO fields before publishing to a public domain.",
+    "- Review `_source.json` and keep it if you want provenance for internal traceability.",
+    "",
+    "Public files:",
+    "- `index.html`",
+    "- `services/index.html`",
+    "- `access/index.html`",
+    "- `history/index.html`",
+    "- `authorization-data.json`",
+    "- `service-inventory.json`",
+    "- `assets/site.css`",
+    "",
+    "Grounding:",
+    `- Source repo: ${loaded.provenance.repo}`,
+    `- Source path: ${loaded.provenance.path}`,
+    `- Source branch: ${loaded.provenance.branch}`,
+    `- Source blob SHA: ${loaded.provenance.blobSha ?? "Unavailable"}`,
+    `- Upstream last updated: ${loaded.provenance.upstreamLastUpdated}`,
+    `- Cache status during generation: ${loaded.cacheStatus}`,
+  ];
+
+  return `${lines.join("\n")}\n`;
+}
+
+function buildAdsSiteCss(): string {
+  return `:root {
+  color-scheme: dark;
+  --bg: oklch(0.2 0.022 255);
+  --bg-elevated: oklch(0.25 0.026 255);
+  --bg-panel: color-mix(in oklch, var(--bg-elevated) 86%, oklch(0.58 0.06 140) 14%);
+  --ink: oklch(0.92 0.018 250);
+  --muted: oklch(0.78 0.018 250);
+  --line: oklch(0.42 0.03 246 / 0.48);
+  --accent: oklch(0.8 0.12 145);
+  --accent-soft: oklch(0.68 0.07 150);
+  --warning: oklch(0.82 0.1 80);
+  --shadow: 0 24px 80px oklch(0.06 0.02 250 / 0.42);
+  --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --sans: "Aptos", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top, oklch(0.36 0.05 150 / 0.18), transparent 0 38rem),
+    linear-gradient(180deg, color-mix(in oklch, var(--bg) 84%, oklch(0.28 0.03 150) 16%), var(--bg));
+  color: var(--ink);
+  font-family: var(--sans);
+  line-height: 1.6;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 2.75rem 2.75rem;
+  mask-image: linear-gradient(180deg, oklch(0 0 0 / 0.3), transparent 85%);
+  opacity: 0.28;
+}
+
+a { color: inherit; }
+
+.site-shell {
+  width: min(76rem, calc(100vw - 2rem));
+  margin: 0 auto;
+  padding: 1.25rem 0 3rem;
+}
+
+.topbar,
+.panel,
+.footer-panel {
+  border: 1px solid var(--line);
+  background: color-mix(in oklch, var(--bg-panel) 88%, black 12%);
+  box-shadow: var(--shadow);
+}
+
+.topbar {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem 1.1rem;
+  border-radius: 1.4rem;
+  backdrop-filter: blur(12px);
+}
+
+.brand-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+}
+
+.brand-meta {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.72rem;
+  color: var(--accent);
+}
+
+.brand-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: clamp(2rem, 5vw, 3.6rem);
+  line-height: 0.94;
+}
+
+.brand-copy {
+  max-width: 40rem;
+  margin: 0;
+  color: var(--muted);
+}
+
+.meta-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.meta-pill,
+.site-nav-link,
+.action-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.6rem;
+  padding: 0.55rem 0.95rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  text-decoration: none;
+}
+
+.meta-pill {
+  color: var(--muted);
+  background: color-mix(in oklch, var(--bg-elevated) 72%, black 28%);
+}
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+
+.site-nav-link {
+  color: var(--muted);
+  background: transparent;
+}
+
+.site-nav-link.is-active,
+.action-link.primary {
+  color: oklch(0.16 0.015 250);
+  background: linear-gradient(135deg, var(--accent), color-mix(in oklch, var(--accent) 66%, white 34%));
+  border-color: transparent;
+}
+
+.action-link.secondary {
+  color: var(--ink);
+  background: color-mix(in oklch, var(--bg-elevated) 72%, black 28%);
+}
+
+.hero-grid,
+.content-grid {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.hero-grid {
+  grid-template-columns: minmax(0, 1.7fr) minmax(18rem, 1fr);
+}
+
+.panel {
+  border-radius: 1.5rem;
+  padding: 1.25rem;
+}
+
+.lede {
+  margin: 0;
+  color: var(--muted);
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.2rem;
+}
+
+.stats-grid {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.stat {
+  padding-bottom: 0.8rem;
+  border-bottom: 1px solid color-mix(in oklch, var(--line) 78%, transparent 22%);
+}
+
+.stat:last-child { border-bottom: 0; padding-bottom: 0; }
+
+.stat-label {
+  display: block;
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-soft);
+}
+
+.stat-value {
+  margin-top: 0.2rem;
+  font-size: 1rem;
+}
+
+.section-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  margin-top: 1rem;
+}
+
+.section-grid > section,
+.section-grid > aside {
+  grid-column: span 6;
+}
+
+.section-kicker {
+  display: inline-block;
+  color: var(--accent-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.78rem;
+}
+
+.section-title {
+  margin: 0.3rem 0 0.7rem;
+  font-family: var(--serif);
+  font-size: clamp(1.5rem, 3vw, 2.15rem);
+  line-height: 1;
+}
+
+.section-copy,
+.footer-copy,
+.artifact-list p,
+.rollout-list p,
+.empty-copy,
+.provenance,
+.history-table td,
+.history-table th {
+  color: var(--muted);
+}
+
+.artifact-list,
+.rollout-list,
+.endpoint-list,
+.checklist,
+.footer-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.artifact-list,
+.endpoint-list,
+.checklist {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.artifact-list li,
+.endpoint-list li,
+.rollout-list li,
+.checklist li {
+  padding: 0.9rem 1rem;
+  border-radius: 1.1rem;
+  border: 1px solid color-mix(in oklch, var(--line) 76%, transparent 24%);
+  background: color-mix(in oklch, var(--bg-elevated) 78%, black 22%);
+}
+
+.artifact-list h3,
+.rollout-list h3,
+.endpoint-list h3 {
+  margin: 0 0 0.3rem;
+  font-size: 1rem;
+}
+
+.artifact-meta,
+.tiny-note {
+  font-size: 0.9rem;
+}
+
+.rollout-list { display: grid; gap: 0.75rem; }
+.rollout-list ul { margin: 0.7rem 0 0; padding-left: 1.15rem; color: var(--muted); }
+
+.provenance {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid color-mix(in oklch, var(--line) 78%, transparent 22%);
+  font-size: 0.93rem;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+  border-radius: 1rem;
+}
+
+.history-table th,
+.history-table td {
+  padding: 0.9rem 0.8rem;
+  border-bottom: 1px solid color-mix(in oklch, var(--line) 78%, transparent 22%);
+  text-align: left;
+}
+
+.history-table thead th {
+  color: var(--ink);
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+}
+
+.footer-panel {
+  margin-top: 1rem;
+  border-radius: 1.4rem;
+  padding: 1rem 1.1rem 1.2rem;
+}
+
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-top: 0.9rem;
+}
+
+.footer-links a { color: var(--muted); text-decoration: none; }
+
+.mono-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2rem;
+  padding: 0.4rem 0.7rem;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--bg-elevated) 76%, black 24%);
+  border: 1px solid color-mix(in oklch, var(--line) 76%, transparent 24%);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.mono-chip strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+@media (max-width: 860px) {
+  .hero-grid,
+  .section-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .section-grid > section,
+  .section-grid > aside {
+    grid-column: auto;
+  }
+
+  .brand-row {
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 640px) {
+  .site-shell {
+    width: min(100vw - 1rem, 76rem);
+    padding-top: 0.75rem;
+    padding-bottom: 2rem;
+  }
+
+  .panel,
+  .topbar,
+  .footer-panel {
+    border-radius: 1.1rem;
+    padding: 1rem;
+  }
+
+  .action-link,
+  .site-nav-link,
+  .meta-pill {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .footer-links {
+    display: grid;
+  }
+}
+`;
+}
+
+function buildAdsSiteDocument(
+  metadata: AdsSiteMetadata,
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+  options: {
+    title: string;
+    description: string;
+    prefix: string;
+    current: "home" | "services" | "access" | "history";
+    main: string;
+  },
+): string {
+  const nav = [
+    navLink(options.prefix, "", "Overview", options.current === "home"),
+    navLink(options.prefix, "services/", "Services", options.current === "services"),
+    navLink(options.prefix, "access/", "Access", options.current === "access"),
+    navLink(options.prefix, "history/", "History", options.current === "history"),
+  ].join("");
+  const sourceNote = formatProvenanceNote({
+    repo: loaded.provenance.repo,
+    path: loaded.provenance.path,
+    branch: loaded.provenance.branch,
+    blobSha: loaded.provenance.blobSha,
+    version: loaded.provenance.version,
+    upstreamLastUpdated: loaded.provenance.upstreamLastUpdated,
+    cacheStatus: loaded.cacheStatus,
+  });
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(options.title)} · ${escapeHtml(metadata.siteTitle)}</title>
+    <meta name="description" content="${escapeHtml(options.description)}" />
+    <link rel="stylesheet" href="${escapeHtml(pageHref(options.prefix, "assets/site.css"))}" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="topbar">
+        <div class="brand-row">
+          <div class="brand-meta">
+            <span class="eyebrow">Authorization Data Sharing // Public Trust Center</span>
+            <h1 class="brand-title">${escapeHtml(metadata.siteTitle)}</h1>
+            <p class="brand-copy">A portable public trust-center scaffold grounded in the official FedRAMP GitHub FRMR source. Replace the TODO fields with your customer-facing service posture, scope, and access narrative.</p>
+          </div>
+          <div class="meta-strip">
+            <span class="meta-pill">Provider · ${escapeHtml(metadata.providerName)}</span>
+            <span class="meta-pill">Offering · ${escapeHtml(metadata.offeringName)}</span>
+            <span class="meta-pill">Applies to · ${escapeHtml(plan.appliesTo.toUpperCase())}</span>
+          </div>
+        </div>
+        <nav class="site-nav" aria-label="Trust center navigation">${nav}</nav>
+      </header>
+      ${options.main}
+      <footer class="footer-panel">
+        <p class="footer-copy">This site only covers the public layer. Controlled-access and private operational materials should stay outside the public host and can be scaffolded separately with grclanker's ADS bundle generator.</p>
+        <div class="footer-links">
+          <a href="${escapeHtml(pageHref(options.prefix, "authorization-data.json"))}">authorization-data.json</a>
+          <a href="${escapeHtml(pageHref(options.prefix, "service-inventory.json"))}">service-inventory.json</a>
+          <a href="${escapeHtml(pageHref(options.prefix, "_source.json"))}">_source.json</a>
+          <a href="mailto:${escapeHtml(metadata.supportEmail)}">${escapeHtml(metadata.supportEmail)}</a>
+        </div>
+        <p class="provenance">${escapeHtml(sourceNote)}</p>
+      </footer>
+    </div>
+  </body>
+</html>
+`;
+}
+
+function buildAdsOverviewPage(
+  metadata: AdsSiteMetadata,
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+): string {
+  const main = `<main>
+    <section class="hero-grid">
+      <article class="panel">
+        <span class="section-kicker">Public summary</span>
+        <h2 class="section-title">Publish the minimum agency-facing truth without waiting on a portal rebuild.</h2>
+        <p class="lede">Replace this page with your actual offering summary, boundary statement, FedRAMP status, and links to customer-facing authorization materials. The structure is already aligned to the official ADS process, but the facts still need to come from your team.</p>
+        <div class="action-row">
+          <a class="action-link primary" href="authorization-data.json">Machine-readable data</a>
+          <a class="action-link secondary" href="services/">Scope and services</a>
+          <a class="action-link secondary" href="access/">Access guidance</a>
+        </div>
+      </article>
+      <aside class="panel stats-grid" aria-label="Trust center facts">
+        <div class="stat"><span class="stat-label">Primary domain</span><div class="stat-value">${escapeHtml(metadata.primaryDomain)}</div></div>
+        <div class="stat"><span class="stat-label">Support contact</span><div class="stat-value"><a href="mailto:${escapeHtml(metadata.supportEmail)}">${escapeHtml(metadata.supportEmail)}</a></div></div>
+        <div class="stat"><span class="stat-label">Official process</span><div class="stat-value">${escapeHtml(plan.process.name)} [${escapeHtml(plan.process.shortName)}]</div></div>
+        <div class="stat"><span class="stat-label">Marketplace URL</span><div class="stat-value">TODO</div></div>
+      </aside>
+    </section>
+
+    <div class="section-grid">
+      <section class="panel">
+        <span class="section-kicker">Public artifacts</span>
+        <h2 class="section-title">What this public site should expose</h2>
+        <p class="section-copy">These public-facing surfaces were inferred from the official FedRAMP process text. Keep them customer-readable, current, and stable enough for agencies to cite.</p>
+        ${renderArtifactList(plan.publicItems)}
+      </section>
+      <aside class="panel">
+        <span class="section-kicker">Rollout order</span>
+        <h2 class="section-title">Suggested publication sequence</h2>
+        <p class="section-copy">Start with the public baseline, then add controlled retrieval. The private runbooks stay out of this site.</p>
+        ${renderRolloutSummary(plan)}
+      </aside>
+      <section class="panel">
+        <span class="section-kicker">Narrative</span>
+        <h2 class="section-title">Replace this with your offering summary</h2>
+        <p class="section-copy">TODO: describe the offering in plain language, explain the current authorization posture, and clarify which services and customer responsibilities are included in the public summary.</p>
+        <p class="section-copy">TODO: add a short statement about how agencies or customers can retrieve deeper authorization materials without exposing controlled or private content on this host.</p>
+      </section>
+      <aside class="panel">
+        <span class="section-kicker">Public endpoints</span>
+        <h2 class="section-title">Machine-readable companion files</h2>
+        <ul class="endpoint-list">
+          <li><h3><a href="authorization-data.json">authorization-data.json</a></h3><p>Public authorization-data skeleton for machine-readable retrieval.</p></li>
+          <li><h3><a href="service-inventory.json">service-inventory.json</a></h3><p>Service inventory and scope skeleton that should stay synchronized with the human-readable services page.</p></li>
+          <li><h3><a href="_source.json">_source.json</a></h3><p>Generation provenance tying this scaffold back to the official FRMR source snapshot.</p></li>
+        </ul>
+      </aside>
+    </div>
+  </main>`;
+
+  return buildAdsSiteDocument(metadata, loaded, plan, {
+    title: "Overview",
+    description: `${metadata.siteTitle} public summary and machine-readable ADS endpoints.`,
+    prefix: "",
+    current: "home",
+    main,
+  });
+}
+
+function buildAdsServicesPage(
+  metadata: AdsSiteMetadata,
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+): string {
+  const main = `<main class="content-grid">
+    <section class="panel">
+      <span class="section-kicker">Scope</span>
+      <h2 class="section-title">Services and minimum assessment scope</h2>
+      <p class="section-copy">This page is where you publish the public service inventory, included components, and customer-responsibility framing. Keep the language synchronized with <a href="../service-inventory.json">service-inventory.json</a>.</p>
+      <table class="history-table">
+        <thead>
+          <tr><th>Service</th><th>Model</th><th>In scope</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>TODO</td><td>TODO</td><td>Yes</td><td>TODO</td></tr>
+          <tr><td>TODO</td><td>TODO</td><td>No</td><td>TODO</td></tr>
+        </tbody>
+      </table>
+    </section>
+    <div class="section-grid">
+      <section class="panel">
+        <span class="section-kicker">Shared responsibility</span>
+        <h2 class="section-title">Clarify who operates what</h2>
+        <p class="section-copy">TODO: explain the provider-managed security boundary, the customer-managed responsibilities, and any assumptions that would affect agency reviewers or customer deployment teams.</p>
+        <ul class="checklist">
+          <li>TODO: boundary statement</li>
+          <li>TODO: customer-managed configurations</li>
+          <li>TODO: service dependencies and exclusions</li>
+        </ul>
+      </section>
+      <aside class="panel">
+        <span class="section-kicker">Grounding</span>
+        <h2 class="section-title">Why this page exists</h2>
+        <p class="section-copy">This page is scaffolded from the official ADS process artifacts inferred for public publication. Update it whenever the service inventory, scope, or customer-responsibility model changes.</p>
+        ${renderArtifactList(plan.publicItems.filter((item) => item.name.toLowerCase().includes("service inventory")))}
+      </aside>
+    </div>
+  </main>`;
+
+  return buildAdsSiteDocument(metadata, loaded, plan, {
+    title: "Services",
+    description: `${metadata.siteTitle} service inventory and scope summary.`,
+    prefix: "../",
+    current: "services",
+    main,
+  });
+}
+
+function buildAdsAccessPage(
+  metadata: AdsSiteMetadata,
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+): string {
+  const main = `<main class="content-grid">
+    <section class="panel">
+      <span class="section-kicker">Access</span>
+      <h2 class="section-title">Public endpoints and controlled retrieval</h2>
+      <p class="section-copy">Use this page to explain what is openly published, what requires controlled retrieval, and how agencies or necessary parties should request deeper authorization data.</p>
+      <ul class="endpoint-list">
+        <li><h3><a href="../authorization-data.json">authorization-data.json</a></h3><p>Public machine-readable summary intended for broad retrieval.</p></li>
+        <li><h3><a href="../service-inventory.json">service-inventory.json</a></h3><p>Public service and scope summary intended to stay aligned with the public site narrative.</p></li>
+        <li><h3>Controlled retrieval path</h3><p>TODO: document the request channel, reviewer expectations, and response model for deeper authorization materials.</p></li>
+      </ul>
+    </section>
+    <div class="section-grid">
+      <section class="panel">
+        <span class="section-kicker">Request flow</span>
+        <h2 class="section-title">Replace this with your real access procedure</h2>
+        <ol class="rollout-list">
+          <li><h3>Step 1</h3><p>TODO: identify the request intake path and required requester information.</p></li>
+          <li><h3>Step 2</h3><p>TODO: describe validation, approval, and delivery expectations.</p></li>
+          <li><h3>Step 3</h3><p>TODO: explain expiration, renewal, or follow-up rules.</p></li>
+        </ol>
+      </section>
+      <aside class="panel">
+        <span class="section-kicker">Controlled artifacts</span>
+        <h2 class="section-title">Not public, but planned</h2>
+        <p class="section-copy">These artifact categories belong in the controlled-access lane, not on the public host itself.</p>
+        ${renderArtifactList(plan.controlledItems)}
+      </aside>
+    </div>
+  </main>`;
+
+  return buildAdsSiteDocument(metadata, loaded, plan, {
+    title: "Access",
+    description: `${metadata.siteTitle} public and controlled access guidance.`,
+    prefix: "../",
+    current: "access",
+    main,
+  });
+}
+
+function buildAdsHistoryPage(
+  metadata: AdsSiteMetadata,
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+): string {
+  const main = `<main class="content-grid">
+    <section class="panel">
+      <span class="section-kicker">History</span>
+      <h2 class="section-title">Version history and update notes</h2>
+      <p class="section-copy">Use this page to document what changed, when it changed, and where a reviewer should go to compare current and prior public authorization summaries.</p>
+      <table class="history-table">
+        <thead>
+          <tr><th>Version</th><th>Effective date</th><th>Summary</th><th>Delta link</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>TODO</td><td>TODO</td><td>TODO</td><td>TODO</td></tr>
+        </tbody>
+      </table>
+    </section>
+    <div class="section-grid">
+      <section class="panel">
+        <span class="section-kicker">Update policy</span>
+        <h2 class="section-title">State the public refresh cadence</h2>
+        <ul class="checklist">
+          <li>TODO: expected refresh cadence for human-readable summary</li>
+          <li>TODO: expected refresh cadence for machine-readable files</li>
+          <li>TODO: retention period for prior versions</li>
+        </ul>
+      </section>
+      <aside class="panel">
+        <span class="section-kicker">Grounding</span>
+        <h2 class="section-title">Why the history surface matters</h2>
+        ${renderArtifactList(plan.publicItems.filter((item) => item.name.toLowerCase().includes("version history")))}
+      </aside>
+    </div>
+  </main>`;
+
+  return buildAdsSiteDocument(metadata, loaded, plan, {
+    title: "History",
+    description: `${metadata.siteTitle} change history and publication retention notes.`,
+    prefix: "../",
+    current: "history",
+    main,
+  });
+}
+
+function buildAds404Page(metadata: AdsSiteMetadata): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Not found · ${escapeHtml(metadata.siteTitle)}</title>
+    <link rel="stylesheet" href="assets/site.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <main class="panel">
+        <span class="section-kicker">404</span>
+        <h1 class="section-title">This trust-center path is not published.</h1>
+        <p class="section-copy">Return to the overview, then use the public navigation to find the current summary, access guidance, or history pages.</p>
+        <div class="action-row">
+          <a class="action-link primary" href="./">Back to overview</a>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>
+`;
+}
+
+function buildAdsRobotsTxt(metadata: AdsSiteMetadata): string {
+  return `User-agent: *\nAllow: /\nSitemap: ${metadata.baseUrl}/sitemap.xml\n`;
+}
+
+function buildAdsSitemapXml(metadata: AdsSiteMetadata): string {
+  const pages = ["", "/services/", "/access/", "/history/"];
+  const urls = pages
+    .map(
+      (path) =>
+        `  <url>\n    <loc>${escapeHtml(`${metadata.baseUrl}${path}`)}</loc>\n  </url>`,
+    )
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
+}
+
+export function buildFedrampAdsSite(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  args: AdsSiteArgs,
+): AdsPublicSite {
+  const metadata = buildAdsSiteMetadata(args);
+  const plan = buildFedrampAdsPackagePlan(loaded, {
+    applies_to: args.applies_to,
+    audience: args.audience,
+  });
+
+  const files: BundleTemplateFile[] = [
+    { path: "README.md", content: buildAdsSiteReadme(loaded, plan, metadata) },
+    { path: "_source.json", content: buildAdsSiteSourceMetadataFile(loaded, plan, metadata) },
+    { path: "assets/site.css", content: buildAdsSiteCss() },
+    { path: "index.html", content: buildAdsOverviewPage(metadata, loaded, plan) },
+    { path: "services/index.html", content: buildAdsServicesPage(metadata, loaded, plan) },
+    { path: "access/index.html", content: buildAdsAccessPage(metadata, loaded, plan) },
+    { path: "history/index.html", content: buildAdsHistoryPage(metadata, loaded, plan) },
+    { path: "404.html", content: buildAds404Page(metadata) },
+    { path: "robots.txt", content: buildAdsRobotsTxt(metadata) },
+    { path: "sitemap.xml", content: buildAdsSitemapXml(metadata) },
+    {
+      path: "authorization-data.json",
+      content: buildAdsSiteAuthorizationDataJson(plan, metadata),
+    },
+    {
+      path: "service-inventory.json",
+      content: buildAdsSiteServiceInventoryJson(plan, metadata),
+    },
+  ];
+
+  return {
+    bundleName: ADS_SITE_DIRNAME,
+    files,
+    plan,
+    metadata,
+  };
+}
+
+export async function generateFedrampAdsSite(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  outputRoot: string,
+  args: AdsSiteArgs,
+): Promise<AdsPublicSiteResult> {
+  ensurePrivateDir(outputRoot);
+  const canonicalOutputRoot = realpathSync(outputRoot);
+  const site = buildFedrampAdsSite(loaded, args);
+  const outputDir = nextAvailableBundleDir(canonicalOutputRoot, site.bundleName);
+  ensurePrivateDir(outputDir);
+
+  const writtenFiles: string[] = [];
+  for (const file of site.files) {
+    const absolutePath = await writeSecureTextFile(outputDir, resolve(outputDir, file.path), file.content);
+    writtenFiles.push(absolutePath);
+  }
+
+  return {
+    outputDir,
+    files: writtenFiles,
+    plan: site.plan,
+    metadata: site.metadata,
   };
 }
 
@@ -2421,6 +3517,99 @@ export function registerFedrampTools(pi: any): void {
         return errorResult(
           `FedRAMP ADS starter bundle generation failed: ${error instanceof Error ? error.message : String(error)}`,
           { tool: "fedramp_generate_ads_bundle" },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "fedramp_generate_ads_site",
+    label: "Generate ADS public trust-center site",
+    description:
+      "Generate a portable static ADS trust-center site with public HTML pages, machine-readable JSON files, and deploy notes suitable for customer-owned AWS, Azure, or GCP hosting.",
+    parameters: Type.Object({
+      output_dir: Type.Optional(
+        Type.String({
+          description: `Optional output root (default: ${DEFAULT_FEDRAMP_OUTPUT_DIR}).`,
+        }),
+      ),
+      applies_to: Type.Optional(
+        Type.Union([
+          Type.Literal("20x"),
+          Type.Literal("rev5"),
+          Type.Literal("both"),
+          Type.Literal("any"),
+        ]),
+      ),
+      audience: Type.Optional(
+        Type.Union([
+          Type.Literal("provider"),
+          Type.Literal("trust-center"),
+          Type.Literal("any"),
+        ]),
+      ),
+      provider_name: Type.Optional(
+        Type.String({
+          description: "Public provider name to prefill into the generated trust-center site.",
+        }),
+      ),
+      offering_name: Type.Optional(
+        Type.String({
+          description: "Public offering name to prefill into the generated trust-center site.",
+        }),
+      ),
+      primary_domain: Type.Optional(
+        Type.String({
+          description: "Primary public trust-center domain, such as trust.example.com.",
+        }),
+      ),
+      support_email: Type.Optional(
+        Type.String({
+          description: "Public support or security contact email to include in the generated site.",
+        }),
+      ),
+    }),
+    prepareArguments: normalizeAdsSiteArgs,
+    async execute(_toolCallId: string, args: AdsSiteArgs) {
+      try {
+        const loaded = await loadFedrampCatalog();
+        const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_FEDRAMP_OUTPUT_DIR);
+        const site = await generateFedrampAdsSite(loaded, outputRoot, args);
+        const relativeFiles = site.files.map((filePath) => relative(site.outputDir, filePath));
+        const lines = [
+          "Authorization Data Sharing public trust-center site generated.",
+          `Output dir: ${site.outputDir}`,
+          `Primary domain: ${site.metadata.primaryDomain}`,
+          "",
+          "Files:",
+          ...relativeFiles.map((filePath) => `- ${filePath}`),
+          "",
+          "This output is public-only and static by design. Host it in a customer-owned AWS, Azure, or GCP environment, then keep controlled-access and private operational artifacts outside the public site.",
+        ];
+
+        return textResult(lines.join("\n"), {
+          tool: "fedramp_generate_ads_site",
+          output_dir: site.outputDir,
+          files: relativeFiles,
+          metadata: {
+            provider_name: site.metadata.providerName,
+            offering_name: site.metadata.offeringName,
+            primary_domain: site.metadata.primaryDomain,
+            support_email: site.metadata.supportEmail,
+            base_url: site.metadata.baseUrl,
+            site_title: site.metadata.siteTitle,
+          },
+          public_items: site.plan.publicItems,
+          controlled_items: site.plan.controlledItems,
+          rollout: site.plan.rollout,
+          provenance: loaded.provenance,
+          cache_status: loaded.cacheStatus,
+          notes: loaded.notes,
+        });
+      } catch (error) {
+        return errorResult(
+          `FedRAMP ADS public site generation failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "fedramp_generate_ads_site" },
         );
       }
     },

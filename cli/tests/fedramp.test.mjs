@@ -17,10 +17,12 @@ import {
 } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { buildFedrampDocsSnapshot } from "../dist/extensions/grc-tools/fedramp-docs.js";
 import {
+  buildFedrampAdsSite,
   buildFedrampAdsStarterBundle,
   buildFedrampAdsPackagePlan,
   buildFedrampArtifactPlan,
   buildFedrampReadinessBrief,
+  generateFedrampAdsSite,
   generateFedrampAdsStarterBundle,
   inferFedrampArtifactSuggestions,
   inferFedrampWorkstreams,
@@ -585,6 +587,97 @@ test("ADS starter bundle generator writes scaffold files under the requested roo
     const metadata = readFileSync(join(result.outputDir, "_source.json"), "utf8");
     assert.match(metadata, /"process":/);
     assert.match(metadata, /"ADS"/);
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test("ADS site builder includes public pages, JSON artifacts, and cloud deploy notes", () => {
+  const catalog = normalizeFedrampFrmr(frmrFixture);
+  const loaded = {
+    catalog,
+    provenance: {
+      repo: "docs",
+      path: "FRMR.documentation.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "0.9.43-beta",
+      upstreamLastUpdated: "2026-04-08",
+    },
+    cacheStatus: "live",
+    notes: [],
+  };
+
+  const site = buildFedrampAdsSite(loaded, {
+    audience: "trust-center",
+    applies_to: "20x",
+    provider_name: "Example Security",
+    offering_name: "Example Cloud",
+    primary_domain: "trust.example.com",
+    support_email: "trust@example.com",
+  });
+
+  assert.equal(site.bundleName, "ads-public-site");
+  assert.equal(site.metadata.baseUrl, "https://trust.example.com");
+  assert.ok(site.files.some((file) => file.path === "index.html"));
+  assert.ok(site.files.some((file) => file.path === "services/index.html"));
+  assert.ok(site.files.some((file) => file.path === "access/index.html"));
+  assert.ok(site.files.some((file) => file.path === "history/index.html"));
+  assert.ok(site.files.some((file) => file.path === "authorization-data.json"));
+  assert.ok(site.files.some((file) => file.path === "service-inventory.json"));
+  assert.ok(site.files.some((file) => file.path === "assets/site.css"));
+
+  const readme = site.files.find((file) => file.path === "README.md")?.content ?? "";
+  assert.match(readme, /AWS: upload the generated files to S3/i);
+  assert.match(readme, /Azure: upload the generated files to Azure Storage Static Website/i);
+  assert.match(readme, /GCP: upload the generated files to Cloud Storage/i);
+
+  const index = site.files.find((file) => file.path === "index.html")?.content ?? "";
+  assert.match(index, /Example Cloud Trust Center/);
+  assert.match(index, /authorization-data\.json/);
+  assert.match(index, /public trust center/i);
+});
+
+test("ADS site generator writes a portable static trust-center bundle under the requested root", async () => {
+  const catalog = normalizeFedrampFrmr(frmrFixture);
+  const loaded = {
+    catalog,
+    provenance: {
+      repo: "docs",
+      path: "FRMR.documentation.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "0.9.43-beta",
+      upstreamLastUpdated: "2026-04-08",
+    },
+    cacheStatus: "live",
+    notes: [],
+  };
+  const outputRoot = mkdtempSync(join(tmpdir(), "grclanker-fedramp-site-"));
+
+  try {
+    const result = await generateFedrampAdsSite(loaded, outputRoot, {
+      audience: "trust-center",
+      applies_to: "20x",
+      provider_name: "Example Security",
+      offering_name: "Example Cloud",
+      primary_domain: "trust.example.com",
+      support_email: "trust@example.com",
+    });
+
+    assert.ok(result.outputDir.startsWith(realpathSync(outputRoot)));
+    assert.equal(result.metadata.siteTitle, "Example Cloud Trust Center");
+    assert.ok(existsSync(join(result.outputDir, "index.html")));
+    assert.ok(existsSync(join(result.outputDir, "services", "index.html")));
+    assert.ok(existsSync(join(result.outputDir, "access", "index.html")));
+    assert.ok(existsSync(join(result.outputDir, "history", "index.html")));
+    assert.ok(existsSync(join(result.outputDir, "authorization-data.json")));
+    assert.ok(existsSync(join(result.outputDir, "service-inventory.json")));
+    assert.ok(existsSync(join(result.outputDir, "assets", "site.css")));
+
+    const source = readFileSync(join(result.outputDir, "_source.json"), "utf8");
+    assert.match(source, /"bundle": "ads-public-site"/);
+    assert.match(source, /"primary_domain": "trust\.example\.com"/);
   } finally {
     rmSync(outputRoot, { recursive: true, force: true });
   }
