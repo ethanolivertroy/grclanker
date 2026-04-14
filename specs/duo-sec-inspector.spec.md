@@ -3,18 +3,29 @@ slug: "duo-sec-inspector"
 name: "Duo Security Inspector"
 vendor: "Cisco"
 category: "identity-access-management"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/duo-sec-inspector"
+last_updated: "2026-04-14"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+legacy_repo: "https://github.com/hackIDLE/duo-sec-inspector"
+reference_docs: "https://duo.com/docs/adminapi"
 ---
 
 # duo-sec-inspector
 
 ## 1. Overview
 
-A security compliance inspection tool for **Cisco Duo** that audits multi-factor authentication configurations, user enrollment status, integration policies, trust monitor alerts, and administrative settings. The tool connects to Duo's Admin API, Auth API, and Accounts API to evaluate global MFA policy, device health requirements, trusted endpoint configurations, bypass code usage, and authentication patterns. Results are output as structured compliance reports mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP controls.
+A read-only Duo compliance inspection surface for **grclanker** that audits MFA configuration, policy posture, privileged administration, integration hygiene, Trust Monitor coverage, and audit telemetry through the Duo Admin API. The implementation intentionally stays Admin API–first so GRC engineers can assess a tenant with one read-only audit principal instead of juggling multiple application types on day one.
+
+The current tool family is:
+
+- `duo_check_access`
+- `duo_assess_authentication`
+- `duo_assess_admin_access`
+- `duo_assess_integrations`
+- `duo_assess_monitoring`
+- `duo_export_audit_bundle`
 
 ## 2. APIs & SDKs
 
@@ -80,15 +91,20 @@ A security compliance inspection tool for **Cisco Duo** that audits multi-factor
 
 ## 3. Authentication
 
-### HMAC-SHA1 Signed Requests
+### Signed Requests
 
-All Duo API requests are authenticated using HMAC-SHA1 signatures. Each request includes:
+The current grclanker implementation follows the official Duo Admin API and Duo Node client signing model:
+
+- Standard Admin API endpoints use HMAC-SHA512 request signing over the canonical v2 string.
+- Newer Admin API v3 integration endpoints use the current v5 canonical form and signature path.
+
+Each request includes:
 
 - **Integration Key (ikey)** — Identifies the application/API client
 - **Secret Key (skey)** — Used to sign requests (never transmitted)
 - **API Hostname** — Account-specific hostname (`api-XXXXXXXX.duosecurity.com`)
 
-The signature is computed over: `{date}\n{method}\n{host}\n{path}\n{params}` and sent as HTTP Basic Auth where username = ikey and password = HMAC-SHA1 signature.
+The standard canonical string is computed over: `{date}\n{method}\n{host}\n{path}\n{params}` and sent as HTTP Basic Auth where username = `ikey` and password = the derived HMAC-SHA512 signature. For newer v3 integration endpoints, grclanker uses the current v5 canonical form from the official Duo client behavior.
 
 ### Required Permissions
 
@@ -166,9 +182,13 @@ DUO_API_HOST=api-XXXXXXXX.duosecurity.com
 | **CISA MFA Guidance** | Federal MFA implementation guidance | Reference only, no tooling |
 | **CrowdStrike Falcon Identity** | Identity threat detection and response | Commercial; detection-focused, not Duo-specific config audit |
 
-**Gap:** No open-source tool performs comprehensive Duo security configuration auditing with multi-framework compliance mapping. Existing tools focus on authentication monitoring and anomaly detection rather than systematic policy configuration validation against compliance requirements.
+**Current state:** grclanker now ships a native TypeScript Duo assessment surface with read-only access checks, focused posture assessments, and audit-bundle export. The remaining gap is real-tenant smoke validation and future deeper vendor-specific expansion, not the absence of an open-source Duo posture tool.
 
 ## 7. Architecture
+
+The current implementation lives in grclanker as native TypeScript under `cli/extensions/grc-tools/duo.ts`, with tests in `cli/tests/duo.test.mjs` and an optional smoke path in `cli/scripts/duo-live-smoke.mjs`.
+
+The legacy tree below is preserved as historical design context from the original standalone concept:
 
 ```
 duo-sec-inspector/
@@ -246,7 +266,7 @@ duo-sec-inspector/
 
 | Package | Purpose |
 |---------|---------|
-| `github.com/duosecurity/duo_client_golang` | Official Duo API client (HMAC-SHA1 auth) |
+| `github.com/duosecurity/duo_client_golang` | Official Duo API client and signing reference |
 | `github.com/spf13/cobra` | CLI framework |
 | `github.com/charmbracelet/bubbletea` | Terminal UI framework |
 | `github.com/charmbracelet/lipgloss` | TUI styling |
