@@ -1419,6 +1419,351 @@ function buildAdsSiteServiceInventoryJson(plan: AdsPackagePlan, metadata: AdsSit
   )}\n`;
 }
 
+function buildAdsQueryIndexJson(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+  metadata: AdsSiteMetadata,
+): string {
+  return `${JSON.stringify(
+    {
+      generated_by: "grclanker",
+      title: `${metadata.siteTitle} public resource index`,
+      summary:
+        "Machine-readable index of the public trust-center resources intentionally exposed for broad retrieval.",
+      base_url: metadata.baseUrl,
+      support_email: metadata.supportEmail,
+      process: {
+        id: plan.process.id,
+        short_name: plan.process.shortName,
+        name: plan.process.name,
+        applies_to: plan.appliesTo,
+      },
+      resources: [
+        {
+          id: "overview-html",
+          path: "/",
+          url: `${metadata.baseUrl}/`,
+          content_type: "text/html",
+          query_intent: "Human-readable public trust-center summary.",
+        },
+        {
+          id: "services-html",
+          path: "/services/",
+          url: `${metadata.baseUrl}/services/`,
+          content_type: "text/html",
+          query_intent: "Human-readable service inventory and scope summary.",
+        },
+        {
+          id: "access-html",
+          path: "/access/",
+          url: `${metadata.baseUrl}/access/`,
+          content_type: "text/html",
+          query_intent: "Public access guidance and controlled retrieval explanation.",
+        },
+        {
+          id: "history-html",
+          path: "/history/",
+          url: `${metadata.baseUrl}/history/`,
+          content_type: "text/html",
+          query_intent: "Public version history and update policy.",
+        },
+        {
+          id: "authorization-data-json",
+          path: "/authorization-data.json",
+          url: `${metadata.baseUrl}/authorization-data.json`,
+          content_type: "application/json",
+          query_intent: "Machine-readable public authorization summary and trust-center metadata.",
+        },
+        {
+          id: "service-inventory-json",
+          path: "/service-inventory.json",
+          url: `${metadata.baseUrl}/service-inventory.json`,
+          content_type: "application/json",
+          query_intent: "Machine-readable public service inventory and scope data.",
+        },
+        {
+          id: "query-index-json",
+          path: "/query-index.json",
+          url: `${metadata.baseUrl}/query-index.json`,
+          content_type: "application/json",
+          query_intent: "Index of all public, shareable resources exposed by this trust center.",
+        },
+        {
+          id: "openapi-yaml",
+          path: "/documentation/api/api.yaml",
+          url: `${metadata.baseUrl}/documentation/api/api.yaml`,
+          content_type: "application/yaml",
+          query_intent: "OpenAPI contract for the public trust-center GET surface.",
+        },
+        {
+          id: "trust-center-markdown",
+          path: "/trust-center.md",
+          url: `${metadata.baseUrl}/trust-center.md`,
+          content_type: "text/markdown",
+          query_intent: "Markdown trust-center documentation for agent or script consumption.",
+        },
+        {
+          id: "llms-txt",
+          path: "/llms.txt",
+          url: `${metadata.baseUrl}/llms.txt`,
+          content_type: "text/plain",
+          query_intent: "Agent-friendly discovery index for public trust-center resources.",
+        },
+        {
+          id: "llms-full-txt",
+          path: "/llms-full.txt",
+          url: `${metadata.baseUrl}/llms-full.txt`,
+          content_type: "text/plain",
+          query_intent: "Full text bundle of public trust-center documentation and endpoints.",
+        },
+      ],
+      share_boundary: {
+        public_only: true,
+        controlled_access_included: false,
+        private_operational_material_included: false,
+        note:
+          "Only broadly shareable trust-center information is represented here. Controlled and private authorization materials should be exposed through separate, non-public workflows.",
+      },
+      provenance: {
+        version: loaded.provenance.version,
+        source_repo: loaded.provenance.repo,
+        source_path: loaded.provenance.path,
+        source_branch: loaded.provenance.branch,
+        source_blob_sha: loaded.provenance.blobSha,
+        upstream_last_updated: loaded.provenance.upstreamLastUpdated,
+        cache_status: loaded.cacheStatus,
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function buildAdsTrustCenterMarkdown(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+  metadata: AdsSiteMetadata,
+): string {
+  const publicItems = plan.publicItems.map((item) => `- **${item.name}**: ${item.rationale}`).join("\n");
+  const controlledItems = plan.controlledItems.map((item) => `- **${item.name}**: ${item.rationale}`).join("\n");
+  return `# ${metadata.siteTitle}
+
+> Public trust-center surface for ${metadata.offeringName}. This markdown file is intended for agents, scripts, and organizations that want the shareable facts without parsing the HTML site.
+
+This trust center exposes only the public layer of the provider's Authorization Data Sharing posture. Controlled-access and private operational materials are intentionally excluded from this file and from the public host.
+
+## Public resources
+
+- [Overview](${metadata.baseUrl}/): Human-readable public trust-center summary.
+- [Services](${metadata.baseUrl}/services/): Human-readable service inventory and scope summary.
+- [Access](${metadata.baseUrl}/access/): Public explanation of what is openly published versus controlled retrieval.
+- [History](${metadata.baseUrl}/history/): Public version history and update policy.
+- [authorization-data.json](${metadata.baseUrl}/authorization-data.json): Machine-readable public authorization summary.
+- [service-inventory.json](${metadata.baseUrl}/service-inventory.json): Machine-readable public service inventory and scope data.
+- [query-index.json](${metadata.baseUrl}/query-index.json): Machine-readable index of all public resources.
+- [documentation/api/api.yaml](${metadata.baseUrl}/documentation/api/api.yaml): OpenAPI contract for the public trust-center GET surface.
+
+## Publicly shareable artifact categories
+
+${publicItems || "- TODO: replace with actual public artifact descriptions."}
+
+## Controlled-access categories not published here
+
+${controlledItems || "- TODO: document controlled-access artifact classes outside the public host."}
+
+## Query guidance
+
+- Treat \`query-index.json\` as the public index of the trust center's shareable machine-readable resources.
+- Use \`documentation/api/api.yaml\` when an organization or tool wants a formal API contract for the public GET surface.
+- Use \`authorization-data.json\` for public posture metadata and \`service-inventory.json\` for service/scope data.
+- Use \`llms.txt\` for quick discovery and \`llms-full.txt\` for a full text bundle.
+- Do not assume controlled or private authorization data exists on this public host.
+
+## Provenance
+
+- Source repo: ${loaded.provenance.repo}
+- Source path: ${loaded.provenance.path}
+- Source branch: ${loaded.provenance.branch}
+- Source blob SHA: ${loaded.provenance.blobSha ?? "Unavailable"}
+- FRMR version: ${loaded.provenance.version}
+- Upstream last updated: ${loaded.provenance.upstreamLastUpdated}
+- Cache status during generation: ${loaded.cacheStatus}
+`;
+}
+
+function buildAdsLlmsTxt(metadata: AdsSiteMetadata): string {
+  return `# ${metadata.siteTitle}
+
+> Public trust-center resources for ${metadata.offeringName}, including human-readable pages and machine-readable JSON endpoints that organizations can query safely.
+
+This site exposes only the information the provider is willing to share publicly. Controlled-access and private authorization materials are intentionally excluded from the public host.
+
+## Public trust center
+
+- [Overview](${metadata.baseUrl}/): Human-readable trust-center summary and public artifact overview.
+- [Services](${metadata.baseUrl}/services/): Human-readable service inventory and scope summary.
+- [Access](${metadata.baseUrl}/access/): Public access guidance and controlled retrieval explanation.
+- [History](${metadata.baseUrl}/history/): Public version history and update policy.
+
+## Machine-readable resources
+
+- [authorization-data.json](${metadata.baseUrl}/authorization-data.json): Public authorization summary in JSON form.
+- [service-inventory.json](${metadata.baseUrl}/service-inventory.json): Public service inventory and scope data in JSON form.
+- [query-index.json](${metadata.baseUrl}/query-index.json): Index of all public, queryable resources.
+- [documentation/api/api.yaml](${metadata.baseUrl}/documentation/api/api.yaml): OpenAPI description of the public GET endpoints.
+
+## Agent-friendly documentation
+
+- [trust-center.md](${metadata.baseUrl}/trust-center.md): Markdown trust-center documentation for agent or script consumption.
+- [llms-full.txt](${metadata.baseUrl}/llms-full.txt): Full text bundle of the public trust-center documentation and resources.
+`;
+}
+
+function buildAdsLlmsFullTxt(
+  loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
+  plan: AdsPackagePlan,
+  metadata: AdsSiteMetadata,
+): string {
+  const publicItemText = plan.publicItems
+    .map((item) => `- ${item.name} [${item.format}] — ${item.rationale} Grounded by: ${item.groundedBy.join(", ") || "linked official text"}.`)
+    .join("\n");
+  const controlledItemText = plan.controlledItems
+    .map((item) => `- ${item.name} [${item.format}] — ${item.rationale} Grounded by: ${item.groundedBy.join(", ") || "linked official text"}.`)
+    .join("\n");
+  return `# ${metadata.siteTitle}
+
+> Public trust-center surface for ${metadata.offeringName}. This file bundles the public documentation and machine-readable resource map into one text response for agents and automation.
+
+## Public trust center summary
+
+- Provider: ${metadata.providerName}
+- Offering: ${metadata.offeringName}
+- Base URL: ${metadata.baseUrl}
+- Support email: ${metadata.supportEmail}
+- Official process: ${plan.process.name} [${plan.process.shortName}]
+- Applies to: ${plan.appliesTo}
+
+## Public resources
+
+- \`GET ${metadata.baseUrl}/\` — Overview HTML page
+- \`GET ${metadata.baseUrl}/services/\` — Services and scope HTML page
+- \`GET ${metadata.baseUrl}/access/\` — Access guidance HTML page
+- \`GET ${metadata.baseUrl}/history/\` — History HTML page
+- \`GET ${metadata.baseUrl}/authorization-data.json\` — Machine-readable public authorization data
+- \`GET ${metadata.baseUrl}/service-inventory.json\` — Machine-readable public service inventory
+- \`GET ${metadata.baseUrl}/query-index.json\` — Machine-readable public resource index
+- \`GET ${metadata.baseUrl}/documentation/api/api.yaml\` — OpenAPI contract for the public trust-center surface
+- \`GET ${metadata.baseUrl}/trust-center.md\` — Markdown trust-center documentation
+- \`GET ${metadata.baseUrl}/llms.txt\` — Discovery index
+- \`GET ${metadata.baseUrl}/llms-full.txt\` — Full text bundle
+
+## Public artifact categories
+
+${publicItemText || "- TODO: replace with actual public artifact descriptions."}
+
+## Controlled-access categories not exposed on the public host
+
+${controlledItemText || "- TODO: document controlled-access categories elsewhere."}
+
+## Query policy
+
+- Only the resources listed above should be assumed public and broadly retrievable.
+- \`query-index.json\` is the canonical machine-readable index of publicly shareable resources.
+- \`authorization-data.json\` and \`service-inventory.json\` are the preferred structured endpoints for scripts and organizations that need machine-readable data.
+- Controlled-access and private operational materials should be requested through non-public workflows and must not be inferred to exist on this public host.
+
+## Provenance
+
+- Source repo: ${loaded.provenance.repo}
+- Source path: ${loaded.provenance.path}
+- Source branch: ${loaded.provenance.branch}
+- Source blob SHA: ${loaded.provenance.blobSha ?? "Unavailable"}
+- FRMR version: ${loaded.provenance.version}
+- Upstream last updated: ${loaded.provenance.upstreamLastUpdated}
+- Cache status during generation: ${loaded.cacheStatus}
+`;
+}
+
+function buildAdsOpenApiYaml(metadata: AdsSiteMetadata): string {
+  return `openapi: 3.0.3
+info:
+  title: ${metadata.siteTitle} API
+  version: 0.1.0
+  description: >
+    Public, read-only trust-center contract for the information the provider is willing to share broadly.
+    This API description covers only static GET resources exposed by the public host.
+servers:
+  - url: ${metadata.baseUrl}
+paths:
+  /authorization-data.json:
+    get:
+      summary: Get public authorization data summary
+      operationId: getAuthorizationData
+      responses:
+        '200':
+          description: Public authorization summary
+          content:
+            application/json:
+              schema:
+                type: object
+  /service-inventory.json:
+    get:
+      summary: Get public service inventory and scope data
+      operationId: getServiceInventory
+      responses:
+        '200':
+          description: Public service inventory and scope data
+          content:
+            application/json:
+              schema:
+                type: object
+  /query-index.json:
+    get:
+      summary: Get public resource index
+      operationId: getQueryIndex
+      responses:
+        '200':
+          description: Machine-readable index of public trust-center resources
+          content:
+            application/json:
+              schema:
+                type: object
+  /trust-center.md:
+    get:
+      summary: Get markdown trust-center documentation
+      operationId: getTrustCenterMarkdown
+      responses:
+        '200':
+          description: Markdown trust-center documentation
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /llms.txt:
+    get:
+      summary: Get agent-friendly discovery index
+      operationId: getLlmsIndex
+      responses:
+        '200':
+          description: Agent-friendly discovery index for public resources
+          content:
+            text/plain:
+              schema:
+                type: string
+  /llms-full.txt:
+    get:
+      summary: Get full text trust-center bundle
+      operationId: getLlmsFull
+      responses:
+        '200':
+          description: Full text bundle of public trust-center documentation and endpoints
+          content:
+            text/plain:
+              schema:
+                type: string
+`;
+}
+
 function buildAdsSiteReadme(
   loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
   plan: AdsPackagePlan,
@@ -1432,6 +1777,8 @@ function buildAdsSiteReadme(
     "What is included:",
     "- Static HTML pages for the trust-center summary, services, access guidance, and version history.",
     "- Public machine-readable files: `authorization-data.json` and `service-inventory.json`.",
+    "- Agent-friendly discovery and docs files: `llms.txt`, `llms-full.txt`, `trust-center.md`, and `query-index.json`.",
+    "- An OpenAPI description for the public GET surface at `documentation/api/api.yaml`.",
     "- Shared CSS, `robots.txt`, `sitemap.xml`, and provenance metadata in `_source.json`.",
     "",
     "What is intentionally excluded:",
@@ -1466,6 +1813,11 @@ function buildAdsSiteReadme(
     "- `history/index.html`",
     "- `authorization-data.json`",
     "- `service-inventory.json`",
+    "- `query-index.json`",
+    "- `documentation/api/api.yaml`",
+    "- `trust-center.md`",
+    "- `llms.txt`",
+    "- `llms-full.txt`",
     "- `assets/site.css`",
     "",
     "Grounding:",
@@ -1924,6 +2276,9 @@ function buildAdsSiteDocument(
         <div class="footer-links">
           <a href="${escapeHtml(pageHref(options.prefix, "authorization-data.json"))}">authorization-data.json</a>
           <a href="${escapeHtml(pageHref(options.prefix, "service-inventory.json"))}">service-inventory.json</a>
+          <a href="${escapeHtml(pageHref(options.prefix, "query-index.json"))}">query-index.json</a>
+          <a href="${escapeHtml(pageHref(options.prefix, "documentation/api/api.yaml"))}">api.yaml</a>
+          <a href="${escapeHtml(pageHref(options.prefix, "llms.txt"))}">llms.txt</a>
           <a href="${escapeHtml(pageHref(options.prefix, "_source.json"))}">_source.json</a>
           <a href="mailto:${escapeHtml(metadata.supportEmail)}">${escapeHtml(metadata.supportEmail)}</a>
         </div>
@@ -1981,10 +2336,14 @@ function buildAdsOverviewPage(
       </section>
       <aside class="panel">
         <span class="section-kicker">Public endpoints</span>
-        <h2 class="section-title">Machine-readable companion files</h2>
+        <h2 class="section-title">Machine-readable and agent-friendly files</h2>
         <ul class="endpoint-list">
           <li><h3><a href="authorization-data.json">authorization-data.json</a></h3><p>Public authorization-data skeleton for machine-readable retrieval.</p></li>
           <li><h3><a href="service-inventory.json">service-inventory.json</a></h3><p>Service inventory and scope skeleton that should stay synchronized with the human-readable services page.</p></li>
+          <li><h3><a href="query-index.json">query-index.json</a></h3><p>Canonical machine-readable index of the public resources this trust center is willing to expose broadly.</p></li>
+          <li><h3><a href="documentation/api/api.yaml">documentation/api/api.yaml</a></h3><p>OpenAPI contract for the public GET surface so orgs and tools can target the published data intentionally.</p></li>
+          <li><h3><a href="llms.txt">llms.txt</a></h3><p>Agent-friendly discovery index that points organizations and agents to the public files without guesswork.</p></li>
+          <li><h3><a href="llms-full.txt">llms-full.txt</a></h3><p>Full text bundle of the public trust-center docs and endpoints for “load it all at once” agent workflows.</p></li>
           <li><h3><a href="_source.json">_source.json</a></h3><p>Generation provenance tying this scaffold back to the official FRMR source snapshot.</p></li>
         </ul>
       </aside>
@@ -2058,10 +2417,12 @@ function buildAdsAccessPage(
     <section class="panel">
       <span class="section-kicker">Access</span>
       <h2 class="section-title">Public endpoints and controlled retrieval</h2>
-      <p class="section-copy">Use this page to explain what is openly published, what requires controlled retrieval, and how agencies or necessary parties should request deeper authorization data.</p>
+      <p class="section-copy">Use this page to explain what is openly published, what requires controlled retrieval, and how agencies or necessary parties should request deeper authorization data. The public query surface should stop at the files explicitly linked here.</p>
       <ul class="endpoint-list">
         <li><h3><a href="../authorization-data.json">authorization-data.json</a></h3><p>Public machine-readable summary intended for broad retrieval.</p></li>
         <li><h3><a href="../service-inventory.json">service-inventory.json</a></h3><p>Public service and scope summary intended to stay aligned with the public site narrative.</p></li>
+        <li><h3><a href="../query-index.json">query-index.json</a></h3><p>Machine-readable map of the public resources orgs and agents can query safely.</p></li>
+        <li><h3><a href="../documentation/api/api.yaml">documentation/api/api.yaml</a></h3><p>OpenAPI contract describing the public read-only endpoints exposed by this trust center.</p></li>
         <li><h3>Controlled retrieval path</h3><p>TODO: document the request channel, reviewer expectations, and response model for deeper authorization materials.</p></li>
       </ul>
     </section>
@@ -2207,6 +2568,26 @@ export function buildFedrampAdsSite(
     {
       path: "service-inventory.json",
       content: buildAdsSiteServiceInventoryJson(plan, metadata),
+    },
+    {
+      path: "query-index.json",
+      content: buildAdsQueryIndexJson(loaded, plan, metadata),
+    },
+    {
+      path: "trust-center.md",
+      content: buildAdsTrustCenterMarkdown(loaded, plan, metadata),
+    },
+    {
+      path: "llms.txt",
+      content: buildAdsLlmsTxt(metadata),
+    },
+    {
+      path: "llms-full.txt",
+      content: buildAdsLlmsFullTxt(loaded, plan, metadata),
+    },
+    {
+      path: "documentation/api/api.yaml",
+      content: buildAdsOpenApiYaml(metadata),
     },
   ];
 

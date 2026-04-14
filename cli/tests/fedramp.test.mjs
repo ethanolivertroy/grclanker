@@ -625,6 +625,11 @@ test("ADS site builder includes public pages, JSON artifacts, and cloud deploy n
   assert.ok(site.files.some((file) => file.path === "history/index.html"));
   assert.ok(site.files.some((file) => file.path === "authorization-data.json"));
   assert.ok(site.files.some((file) => file.path === "service-inventory.json"));
+  assert.ok(site.files.some((file) => file.path === "query-index.json"));
+  assert.ok(site.files.some((file) => file.path === "trust-center.md"));
+  assert.ok(site.files.some((file) => file.path === "llms.txt"));
+  assert.ok(site.files.some((file) => file.path === "llms-full.txt"));
+  assert.ok(site.files.some((file) => file.path === "documentation/api/api.yaml"));
   assert.ok(site.files.some((file) => file.path === "assets/site.css"));
 
   const readme = site.files.find((file) => file.path === "README.md")?.content ?? "";
@@ -635,7 +640,24 @@ test("ADS site builder includes public pages, JSON artifacts, and cloud deploy n
   const index = site.files.find((file) => file.path === "index.html")?.content ?? "";
   assert.match(index, /Example Cloud Trust Center/);
   assert.match(index, /authorization-data\.json/);
+  assert.match(index, /query-index\.json/);
+  assert.match(index, /llms\.txt/);
+  assert.match(index, /documentation\/api\/api\.yaml/);
   assert.match(index, /public trust center/i);
+
+  const llms = site.files.find((file) => file.path === "llms.txt")?.content ?? "";
+  assert.match(llms, /Machine-readable resources/i);
+  assert.match(llms, /query-index\.json/);
+
+  const queryIndex = site.files.find((file) => file.path === "query-index.json")?.content ?? "";
+  assert.match(queryIndex, /"resources": \[/);
+  assert.match(queryIndex, /"llms-txt"/);
+  assert.match(queryIndex, /"openapi-yaml"/);
+
+  const openapi = site.files.find((file) => file.path === "documentation/api/api.yaml")?.content ?? "";
+  assert.match(openapi, /openapi: 3\.0\.3/);
+  assert.match(openapi, /\/authorization-data\.json:/);
+  assert.match(openapi, /\/llms\.txt:/);
 });
 
 test("ADS site generator writes a portable static trust-center bundle under the requested root", async () => {
@@ -673,11 +695,21 @@ test("ADS site generator writes a portable static trust-center bundle under the 
     assert.ok(existsSync(join(result.outputDir, "history", "index.html")));
     assert.ok(existsSync(join(result.outputDir, "authorization-data.json")));
     assert.ok(existsSync(join(result.outputDir, "service-inventory.json")));
+    assert.ok(existsSync(join(result.outputDir, "query-index.json")));
+    assert.ok(existsSync(join(result.outputDir, "trust-center.md")));
+    assert.ok(existsSync(join(result.outputDir, "llms.txt")));
+    assert.ok(existsSync(join(result.outputDir, "llms-full.txt")));
+    assert.ok(existsSync(join(result.outputDir, "documentation", "api", "api.yaml")));
     assert.ok(existsSync(join(result.outputDir, "assets", "site.css")));
 
     const source = readFileSync(join(result.outputDir, "_source.json"), "utf8");
     assert.match(source, /"bundle": "ads-public-site"/);
     assert.match(source, /"primary_domain": "trust\.example\.com"/);
+
+    const llms = readFileSync(join(result.outputDir, "llms.txt"), "utf8");
+    assert.match(llms, /trust-center\.md/);
+    assert.match(llms, /llms-full\.txt/);
+    assert.match(llms, /documentation\/api\/api\.yaml/);
   } finally {
     rmSync(outputRoot, { recursive: true, force: true });
   }
