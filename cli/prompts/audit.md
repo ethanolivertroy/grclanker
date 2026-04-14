@@ -21,10 +21,11 @@ Use the available GRC tools first:
 6. If the scope centers on Authorization Data Sharing or trust-center rollout, use `fedramp_plan_ads_package`
 7. If you want a working ADS starter scaffold instead of only a plan, use `fedramp_generate_ads_bundle`
 8. If the team needs a public, customer-owned trust-center site they can deploy to AWS, Azure, or GCP, use `fedramp_generate_ads_site`
-9. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
-10. If you need control language, crosswalk mappings, or artifact guidance, use `scf_search_controls`, `scf_get_control`, `scf_get_crosswalk`, and `scf_get_evidence_request`
-11. If the deliverable needs to become a portable OSCAL artifact, start with `oscal_check_trestle`, then use `oscal_init_workspace`, `oscal_import_model` or `oscal_create_model`, and the SSP helpers as needed
-12. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
+9. If the scope is an Okta tenant, start with `okta_check_access`, then run the focused assessment that matches the question before falling back to `okta_export_audit_bundle`
+10. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
+11. If you need control language, crosswalk mappings, or artifact guidance, use `scf_search_controls`, `scf_get_control`, `scf_get_crosswalk`, and `scf_get_evidence_request`
+12. If the deliverable needs to become a portable OSCAL artifact, start with `oscal_check_trestle`, then use `oscal_init_workspace`, `oscal_import_model` or `oscal_create_model`, and the SSP helpers as needed
+13. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
 
 If evidence is missing, say exactly what is missing and what artifact would close the gap.
 

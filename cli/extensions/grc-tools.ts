@@ -24,11 +24,12 @@ import { registerCmvpTools } from "./grc-tools/cmvp.js";
 import { registerFedrampTools } from "./grc-tools/fedramp.js";
 import { installGrclankerHeader } from "./grc-tools/header.js";
 import { registerKevsTools } from "./grc-tools/kevs.js";
+import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
 import { registerScfTools } from "./grc-tools/scf.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 
-const DOMAIN_TOOL_COUNT = 32;
+const DOMAIN_TOOL_COUNT = 38;
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [
@@ -184,6 +185,7 @@ export default function grcTools(pi: ExtensionAPI): void {
   registerCmvpTools(pi);
   registerFedrampTools(pi);
   registerKevsTools(pi);
+  registerOktaTools(pi);
   registerOscalTools(pi);
   registerScfTools(pi);
   registerVantaTools(pi);

@@ -23,8 +23,9 @@ Use the GRC tools to gather high-signal evidence:
 9. If the posture work is really about ADS or trust-center rollout, use `fedramp_plan_ads_package`
 10. If the team is ready for a scaffold instead of another plan, use `fedramp_generate_ads_bundle`
 11. If the team needs a public ADS trust-center site they can host in AWS, Azure, or GCP, use `fedramp_generate_ads_site`
-12. SCF control language, crosswalks, and evidence-request guidance when framework interpretation matters
-13. If the assessment needs to roll into OSCAL artifacts, use the OSCAL trestle tools to scaffold or validate the SSP, SAR, or POA&M workspace content
+12. If the subject is an Okta tenant, start with `okta_check_access`, then use the focused Okta assessment tools or `okta_export_audit_bundle` to ground posture claims in collected tenant evidence
+13. SCF control language, crosswalks, and evidence-request guidance when framework interpretation matters
+14. If the assessment needs to roll into OSCAL artifacts, use the OSCAL trestle tools to scaffold or validate the SSP, SAR, or POA&M workspace content
 
 ## Phase 3: Posture Classification
 
