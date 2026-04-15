@@ -255,7 +255,7 @@ fw = Firewall('10.0.0.1', 'admin', 'password')
 
 ## 7. Architecture
 
-The project mirrors the structure of [okta-inspector](https://github.com/ethanolivertroy/okta-inspector):
+The project mirrors the structure of [okta-inspector-py](https://github.com/hackIDLE/okta-inspector-py):
 
 ```
 paloalto-sec-inspector/

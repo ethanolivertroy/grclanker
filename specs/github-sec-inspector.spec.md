@@ -426,7 +426,7 @@ In organizations with SAML SSO enabled, tokens must be explicitly authorized for
 
 ## 7. Architecture
 
-The project is written in Go and mirrors the modular architecture of [okta-inspector](https://github.com/ethanolivertroy/okta-inspector).
+The project is written in Go and mirrors the modular architecture of [okta-inspector-py](https://github.com/hackIDLE/okta-inspector-py).
 
 ```
 github-sec-inspector/

@@ -36,7 +36,7 @@ Go implementation of gws-inspector — a multi-framework compliance audit tool f
 
 ## Reference Implementation
 
-The Python implementation is the source of truth: [github.com/ethanolivertroy/gws-inspector](https://github.com/ethanolivertroy/gws-inspector)
+The Python implementation is the source of truth: [github.com/hackIDLE/gws-inspector-py](https://github.com/hackIDLE/gws-inspector-py)
 
 ## Architecture
 

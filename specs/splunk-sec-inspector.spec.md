@@ -284,7 +284,7 @@ When SAML is configured, API access typically still uses tokens or service accou
 
 ## 7. Architecture
 
-The project is written in Go and mirrors the modular architecture of [okta-inspector](https://github.com/ethanolivertroy/okta-inspector).
+The project is written in Go and mirrors the modular architecture of [okta-inspector-py](https://github.com/hackIDLE/okta-inspector-py).
 
 ```
 splunk-sec-inspector/

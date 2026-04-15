@@ -8,7 +8,7 @@ status: "implemented"
 version: "1.0"
 last_updated: "2026-04-14"
 source_repo: "https://github.com/hackIDLE/grclanker"
-legacy_repo: "https://github.com/ethanolivertroy/okta-inspector-py"
+legacy_repo: "https://github.com/hackIDLE/okta-inspector-py"
 reference_repo: "https://github.com/okta/okta-cli-client"
 ---
 
@@ -64,7 +64,7 @@ The current tool family is designed for GRC engineers who need evidence-backed p
 
 ### Reference Implementations
 
-- Legacy assessment logic: `ethanolivertroy/okta-inspector-py`
+- Legacy assessment logic: `hackIDLE/okta-inspector-py`
 - Config and endpoint coverage reference: `okta/okta-cli-client`
 
 ## 3. Authentication

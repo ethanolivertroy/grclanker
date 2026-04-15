@@ -220,7 +220,7 @@ No existing tool audits CrowdStrike Falcon's **own security configuration** (pre
 
 ## 7. Architecture
 
-The project follows the same package layout as [okta-inspector](https://github.com/ethanolivertroy/okta-inspector), adapted for CrowdStrike Falcon.
+The project follows the same package layout as [okta-inspector-py](https://github.com/hackIDLE/okta-inspector-py), adapted for CrowdStrike Falcon.
 
 ```
 crowdstrike-sec-inspector/
