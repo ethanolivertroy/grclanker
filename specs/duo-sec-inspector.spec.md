@@ -7,7 +7,7 @@ language: "typescript"
 status: "implemented"
 version: "1.0"
 last_updated: "2026-04-14"
-source_repo: "https://github.com/ethanolivertroy/grclanker"
+source_repo: "https://github.com/hackIDLE/grclanker"
 legacy_repo: "https://github.com/hackIDLE/duo-sec-inspector"
 reference_docs: "https://duo.com/docs/adminapi"
 ---

@@ -7,7 +7,7 @@ language: "typescript"
 status: "spec-only"
 version: "0.1"
 last_updated: "2026-04-05"
-source_repo: "https://github.com/ethanolivertroy/grclanker"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # grclanker Compute Backends — Architecture Specification

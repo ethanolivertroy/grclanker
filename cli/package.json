@@ -4,6 +4,10 @@
   "type": "module",
   "description": "Experimental local-first GRC CLI for CMVP, KEV, EPSS, and framework-mapped posture work",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hackIDLE/grclanker.git"
+  },
   "engines": {
     "node": ">=20.19.0"
   },

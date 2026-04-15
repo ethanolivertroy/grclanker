@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "ethanolivertroy" }
+$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "hackIDLE" }
 $RepoName = if ($env:GRCLANKER_REPO_NAME) { $env:GRCLANKER_REPO_NAME } else { "grclanker" }
 $Version = if ($Version) { $Version } elseif ($env:GRCLANKER_VERSION) { $env:GRCLANKER_VERSION } else { "latest" }
 $InstallDir = if ($env:GRCLANKER_INSTALL_DIR) { $env:GRCLANKER_INSTALL_DIR } else { Join-Path $HOME ".local\share\grclanker" }
