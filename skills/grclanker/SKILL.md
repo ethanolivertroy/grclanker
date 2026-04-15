@@ -40,6 +40,6 @@ Use this skill when the task is about cryptographic validation, exploited-vulner
 - Skills-only install:
   `curl -fsSL https://grclanker.com/install-skills | bash`
 - Raw spec library:
-  `https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/<slug>.spec.md`
+  `https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/<slug>.spec.md`
 
 When a task is implementation-oriented, pull the relevant `spec.md` file and treat it as the source of truth for build sequence, APIs, auth flow, control mappings, and CLI design.

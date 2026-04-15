@@ -268,7 +268,7 @@ Zscaler is migrating to a unified OAuth2 framework called OneAPI. The `zscaler-s
 
 ## 7. Architecture
 
-The project mirrors the structure of [okta-inspector](https://github.com/ethanolivertroy/okta-inspector):
+The project mirrors the structure of [okta-inspector-py](https://github.com/hackIDLE/okta-inspector-py):
 
 ```
 zscaler-sec-inspector/

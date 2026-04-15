@@ -140,12 +140,12 @@ The specs are still here, but they are not the whole story anymore. They are the
 Browse the catalog:
 
 - Website: `https://grclanker.com/specs`
-- Raw base: `https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs`
+- Raw base: `https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs`
 
 Grab one directly:
 
 ```bash
-curl -O https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md
+curl -O https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/aws-sec-inspector.spec.md
 ```
 
 Or tell the CLI to use one:

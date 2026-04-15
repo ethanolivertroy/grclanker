@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_OWNER="${GRCLANKER_REPO_OWNER:-ethanolivertroy}"
+REPO_OWNER="${GRCLANKER_REPO_OWNER:-hackIDLE}"
 REPO_NAME="${GRCLANKER_REPO_NAME:-grclanker}"
 VERSION="${GRCLANKER_VERSION:-latest}"
 INSTALL_DIR="${GRCLANKER_INSTALL_DIR:-$HOME/.local/share/grclanker}"

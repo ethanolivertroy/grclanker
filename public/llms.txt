@@ -6,37 +6,37 @@
 
 All specs are available as raw markdown. Point your agent at any URL below.
 
-- [AWS Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md): Multi-framework security compliance audit tool for AWS environments
-- [Azure Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/azure-sec-inspector.spec.md): Azure subscriptions and M365 tenants via Graph API, ARM, Defender for Cloud
-- [Box Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/box-sec-inspector.spec.md): Authentication policies, sharing controls, data governance, device trust
-- [Cloudflare Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/cloudflare-sec-inspector.spec.md): WAF configs, Zero Trust policies, SSL/TLS, DNS security
-- [CrowdStrike Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/crowdstrike-sec-inspector.spec.md): Falcon EDR prevention policies, sensor deployment, device control
-- [Datadog Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/datadog-sec-inspector.spec.md): RBAC, API key management, log pipelines, security monitoring
-- [Duo Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/duo-sec-inspector.spec.md): MFA configurations, policies, user enrollment, trust monitor alerts
-- [Elastic Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/elastic-sec-inspector.spec.md): Authentication realms, TLS configs, RBAC, field/document-level security
-- [GCP Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/gcp-sec-inspector.spec.md): GCP infrastructure, IAM policies, encryption, org constraints
-- [GitHub Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/github-sec-inspector.spec.md): Enterprise Cloud SSO, branch protection, code security, Actions workflows
-- [Google Workspace Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/gws-inspector-go.spec.md): Multi-framework compliance audit for Google Workspace
-- [KnowBe4 Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/knowbe4-sec-inspector.spec.md): Security awareness training coverage, completion rates, user risk scores
-- [LaunchDarkly Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/launchdarkly-sec-inspector.spec.md): IAM, feature flag hygiene, API token lifecycle
-- [MuleSoft Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/mulesoft-sec-inspector.spec.md): Anypoint Platform IAM, API gateway policies, runtime security
-- [New Relic Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/newrelic-sec-inspector.spec.md): Authentication, user access controls, API key management
-- [OCI Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/oci-sec-inspector.spec.md): OCI IAM, networking, Cloud Guard posture, vault key management
-- [PagerDuty Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/pagerduty-sec-inspector.spec.md): Authentication settings, user roles, access controls
-- [Palo Alto Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/paloalto-sec-inspector.spec.md): Prisma Cloud CSPM/CWPP and PAN-OS firewalls
-- [Qualys Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/qualys-sec-inspector.spec.md): Vuln management configs, compliance profiles, scan coverage
-- [Salesforce Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/salesforce-sec-inspector.spec.md): Security settings, user permissions, auth policies
-- [ServiceNow Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/servicenow-sec-inspector.spec.md): Platform security configs, ACL rules, user/role management
-- [Slack Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/slack-sec-inspector.spec.md): Enterprise Grid SSO, MFA policies, DLP settings
-- [Snowflake Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/snowflake-sec-inspector.spec.md): IAM, network security, data protection policies, encryption
-- [Splunk Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/splunk-sec-inspector.spec.md): Authentication, authorization, server settings, data pipelines
-- [Sumo Logic Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/sumologic-sec-inspector.spec.md): Authentication policies, access controls, data governance
-- [Tenable Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/tenable-sec-inspector.spec.md): Scan policies, asset coverage, credential audits
-- [Veracode Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/veracode-sec-inspector.spec.md): Scan coverage, policy compliance, flaw aging, SCA library health
-- [Webex Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/webex-sec-inspector.spec.md): IAM, messaging policies, meeting security, recording governance
-- [Zendesk Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zendesk-sec-inspector.spec.md): Authentication settings, agent access controls, audit logging
-- [Zoom Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zoom-sec-inspector.spec.md): Meeting policies, recording controls, auth enforcement
-- [Zscaler Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zscaler-sec-inspector.spec.md): ZIA and ZPA URL filtering, DLP policies, SSL inspection
+- [AWS Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/aws-sec-inspector.spec.md): Multi-framework security compliance audit tool for AWS environments
+- [Azure Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/azure-sec-inspector.spec.md): Azure subscriptions and M365 tenants via Graph API, ARM, Defender for Cloud
+- [Box Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/box-sec-inspector.spec.md): Authentication policies, sharing controls, data governance, device trust
+- [Cloudflare Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/cloudflare-sec-inspector.spec.md): WAF configs, Zero Trust policies, SSL/TLS, DNS security
+- [CrowdStrike Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/crowdstrike-sec-inspector.spec.md): Falcon EDR prevention policies, sensor deployment, device control
+- [Datadog Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/datadog-sec-inspector.spec.md): RBAC, API key management, log pipelines, security monitoring
+- [Duo Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/duo-sec-inspector.spec.md): MFA configurations, policies, user enrollment, trust monitor alerts
+- [Elastic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/elastic-sec-inspector.spec.md): Authentication realms, TLS configs, RBAC, field/document-level security
+- [GCP Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/gcp-sec-inspector.spec.md): GCP infrastructure, IAM policies, encryption, org constraints
+- [GitHub Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/github-sec-inspector.spec.md): Enterprise Cloud SSO, branch protection, code security, Actions workflows
+- [Google Workspace Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/gws-inspector-go.spec.md): Multi-framework compliance audit for Google Workspace
+- [KnowBe4 Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/knowbe4-sec-inspector.spec.md): Security awareness training coverage, completion rates, user risk scores
+- [LaunchDarkly Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/launchdarkly-sec-inspector.spec.md): IAM, feature flag hygiene, API token lifecycle
+- [MuleSoft Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/mulesoft-sec-inspector.spec.md): Anypoint Platform IAM, API gateway policies, runtime security
+- [New Relic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/newrelic-sec-inspector.spec.md): Authentication, user access controls, API key management
+- [OCI Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/oci-sec-inspector.spec.md): OCI IAM, networking, Cloud Guard posture, vault key management
+- [PagerDuty Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/pagerduty-sec-inspector.spec.md): Authentication settings, user roles, access controls
+- [Palo Alto Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/paloalto-sec-inspector.spec.md): Prisma Cloud CSPM/CWPP and PAN-OS firewalls
+- [Qualys Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/qualys-sec-inspector.spec.md): Vuln management configs, compliance profiles, scan coverage
+- [Salesforce Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/salesforce-sec-inspector.spec.md): Security settings, user permissions, auth policies
+- [ServiceNow Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/servicenow-sec-inspector.spec.md): Platform security configs, ACL rules, user/role management
+- [Slack Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/slack-sec-inspector.spec.md): Enterprise Grid SSO, MFA policies, DLP settings
+- [Snowflake Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/snowflake-sec-inspector.spec.md): IAM, network security, data protection policies, encryption
+- [Splunk Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/splunk-sec-inspector.spec.md): Authentication, authorization, server settings, data pipelines
+- [Sumo Logic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/sumologic-sec-inspector.spec.md): Authentication policies, access controls, data governance
+- [Tenable Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/tenable-sec-inspector.spec.md): Scan policies, asset coverage, credential audits
+- [Veracode Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/veracode-sec-inspector.spec.md): Scan coverage, policy compliance, flaw aging, SCA library health
+- [Webex Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/webex-sec-inspector.spec.md): IAM, messaging policies, meeting security, recording governance
+- [Zendesk Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/zendesk-sec-inspector.spec.md): Authentication settings, agent access controls, audit logging
+- [Zoom Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/zoom-sec-inspector.spec.md): Meeting policies, recording controls, auth enforcement
+- [Zscaler Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/zscaler-sec-inspector.spec.md): ZIA and ZPA URL filtering, DLP policies, SSL inspection
 
 ## How to use
 
@@ -45,5 +45,5 @@ Point any AI coding agent at a raw spec URL above. The spec contains everything 
 ## Source
 
 - Website: https://grclanker.com
-- Repository: https://github.com/ethanolivertroy/grclanker
-- Clone all specs: git clone https://github.com/ethanolivertroy/grclanker.git
+- Repository: https://github.com/hackIDLE/grclanker
+- Clone all specs: git clone https://github.com/hackIDLE/grclanker.git

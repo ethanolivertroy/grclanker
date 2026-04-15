@@ -30,7 +30,7 @@ If you are not using grclanker directly, the examples below show the same spec h
 ## Browse the raw catalog
 
 - Site catalog: [`/specs`](/specs)
-- Raw base: `https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs`
+- Raw base: `https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs`
 
 ## Why this matters
 
