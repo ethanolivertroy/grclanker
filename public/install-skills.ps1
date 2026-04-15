@@ -8,8 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "hackIDLE" }
 $RepoName = if ($env:GRCLANKER_REPO_NAME) { $env:GRCLANKER_REPO_NAME } else { "grclanker" }
-$DefaultReleaseVersion = if ($env:GRCLANKER_RELEASE_VERSION) { $env:GRCLANKER_RELEASE_VERSION } else { "0.0.1" }
-$Ref = if ($env:GRCLANKER_REF) { $env:GRCLANKER_REF } else { "v$DefaultReleaseVersion" }
+$Ref = if ($env:GRCLANKER_REF) { $env:GRCLANKER_REF } else { "main" }
 $Version = if ($env:GRCLANKER_VERSION) { $env:GRCLANKER_VERSION } else { $null }
 $SkillUrlOverride = $env:GRCLANKER_SKILL_URL
 $Scope = "user"
