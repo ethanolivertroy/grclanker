@@ -32,11 +32,12 @@ Use the available GRC tools first:
 17. If the scope is a Google Workspace tenant, start with `gws_check_access`, then run the focused GWS assessment that matches the question before falling back to `gws_export_audit_bundle`
 18. If the Google Workspace task is really operator-side investigation or raw evidence collection and `gws` is installed, use `gws_ops_check_cli`, then the focused `gws_ops_*` tools for alerts, admin activity, token activity, or the separate operator evidence bundle
 19. If the scope is a Slack Enterprise Grid tenant, start with `slack_check_access`, then use `slack_assess_identity`, `slack_assess_admin_access`, `slack_assess_integrations`, and `slack_assess_monitoring`, or `slack_export_audit_bundle` when the deliverable needs a zipped evidence package
-20. If the scope is an Ansible Automation Platform tenant, start with `ansible_check_access`, then use `ansible_assess_job_health`, `ansible_assess_host_coverage`, and `ansible_assess_platform_security`, or `ansible_export_audit_bundle` when the deliverable needs a zipped evidence package
-21. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
-22. If you need control language, crosswalk mappings, or artifact guidance, use `scf_search_controls`, `scf_get_control`, `scf_get_crosswalk`, and `scf_get_evidence_request`
-23. If the deliverable needs to become a portable OSCAL artifact, start with `oscal_check_trestle`, then use `oscal_init_workspace`, `oscal_import_model` or `oscal_create_model`, and the SSP helpers as needed
-24. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
+20. If the scope is a Webex organization, start with `webex_check_access`, then use `webex_assess_identity`, `webex_assess_collaboration_governance`, and `webex_assess_meeting_hybrid_security`, or `webex_export_audit_bundle` when the deliverable needs a zipped evidence package
+21. If the scope is an Ansible Automation Platform tenant, start with `ansible_check_access`, then use `ansible_assess_job_health`, `ansible_assess_host_coverage`, and `ansible_assess_platform_security`, or `ansible_export_audit_bundle` when the deliverable needs a zipped evidence package
+22. If the scope is a Vanta audit, start with `vanta_check_access`, then use `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package before classifying controls
+23. If you need control language, crosswalk mappings, or artifact guidance, use `scf_search_controls`, `scf_get_control`, `scf_get_crosswalk`, and `scf_get_evidence_request`
+24. If the deliverable needs to become a portable OSCAL artifact, start with `oscal_check_trestle`, then use `oscal_init_workspace`, `oscal_import_model` or `oscal_create_model`, and the SSP helpers as needed
+25. Collect certificate numbers, CVE IDs, due dates, and source URLs inline
 
 If evidence is missing, say exactly what is missing and what artifact would close the gap.
 

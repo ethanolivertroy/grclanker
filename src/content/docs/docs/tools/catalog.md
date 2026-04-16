@@ -7,7 +7,7 @@ description: Bundled grclanker GRC and compute tools grouped by domain.
 
 Current bundled surface:
 
-- 97 domain tools
+- 102 domain tools
 - 7 compute backend tools
 
 ## Compute Backend
@@ -208,3 +208,13 @@ Current bundled surface:
 | `vanta_check_access` | Check Vanta auditor access |
 | `vanta_export_audit` | Export Vanta audit evidence |
 | `vanta_list_audits` | List Vanta audits |
+
+## Webex
+
+| Tool | Purpose |
+|---|---|
+| `webex_assess_collaboration_governance` | Assess Webex collaboration governance |
+| `webex_assess_identity` | Assess Webex identity posture |
+| `webex_assess_meeting_hybrid_security` | Assess Webex meeting and hybrid security |
+| `webex_check_access` | Check Webex audit access |
+| `webex_export_audit_bundle` | Export Webex audit bundle |

@@ -34,9 +34,10 @@ Use the GRC tools to gather high-signal evidence:
 20. If the subject is a Google Workspace tenant, start with `gws_check_access`, then use the focused GWS assessment tools or `gws_export_audit_bundle` to ground posture claims in collected tenant evidence
 21. If the Google Workspace task is really operator-side investigation or raw evidence collection and `gws` is installed, use `gws_ops_check_cli` and the focused `gws_ops_*` workflows instead of stretching the native posture tools past their purpose
 22. If the subject is a Slack Enterprise Grid tenant, start with `slack_check_access`, then use `slack_assess_identity`, `slack_assess_admin_access`, `slack_assess_integrations`, and `slack_assess_monitoring`, or `slack_export_audit_bundle` when you need a zipped evidence package
-23. If the subject is an Ansible Automation Platform tenant or automation program, start with `ansible_check_access`, then use `ansible_assess_job_health`, `ansible_assess_host_coverage`, and `ansible_assess_platform_security`, or `ansible_export_audit_bundle` when you need a zipped evidence package
-24. SCF control language, crosswalks, and evidence-request guidance when framework interpretation matters
-25. If the assessment needs to roll into OSCAL artifacts, use the OSCAL trestle tools to scaffold or validate the SSP, SAR, or POA&M workspace content
+23. If the subject is a Webex organization, start with `webex_check_access`, then use `webex_assess_identity`, `webex_assess_collaboration_governance`, and `webex_assess_meeting_hybrid_security`, or `webex_export_audit_bundle` when you need a zipped evidence package
+24. If the subject is an Ansible Automation Platform tenant or automation program, start with `ansible_check_access`, then use `ansible_assess_job_health`, `ansible_assess_host_coverage`, and `ansible_assess_platform_security`, or `ansible_export_audit_bundle` when you need a zipped evidence package
+25. SCF control language, crosswalks, and evidence-request guidance when framework interpretation matters
+26. If the assessment needs to roll into OSCAL artifacts, use the OSCAL trestle tools to scaffold or validate the SSP, SAR, or POA&M workspace content
 
 ## Phase 3: Posture Classification
 

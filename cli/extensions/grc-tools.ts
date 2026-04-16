@@ -39,8 +39,9 @@ import { registerOscalTools } from "./grc-tools/oscal.js";
 import { registerScfTools } from "./grc-tools/scf.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
+import { registerWebexTools } from "./grc-tools/webex.js";
 
-const DOMAIN_TOOL_COUNT = 97;
+const DOMAIN_TOOL_COUNT = 102;
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [
@@ -211,6 +212,7 @@ export default function grcTools(pi: ExtensionAPI): void {
   registerScfTools(pi);
   registerSlackTools(pi);
   registerVantaTools(pi);
+  registerWebexTools(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
