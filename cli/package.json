@@ -24,7 +24,7 @@
     "brand:embedded-pi": "node scripts/patch-embedded-pi.mjs",
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
-    "test:cli": "npm run build && node --test tests/ansible.test.mjs tests/duo.test.mjs tests/fedramp.test.mjs tests/github.test.mjs tests/gws-ops.test.mjs tests/gws.test.mjs tests/isolation.test.mjs tests/okta.test.mjs tests/oscal.test.mjs tests/scf.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/bootstrap-sync.test.mjs tests/sandbox.test.mjs tests/tool-catalog.test.mjs tests/vanta.test.mjs",
+    "test:cli": "npm run build && node --test tests/ansible.test.mjs tests/duo.test.mjs tests/fedramp.test.mjs tests/github.test.mjs tests/gws-ops.test.mjs tests/gws.test.mjs tests/isolation.test.mjs tests/okta.test.mjs tests/oscal.test.mjs tests/scf.test.mjs tests/skill-discovery.test.mjs tests/shell.test.mjs tests/slack.test.mjs tests/bootstrap-sync.test.mjs tests/sandbox.test.mjs tests/tool-catalog.test.mjs tests/vanta.test.mjs",
     "test:duo:live": "npm run build && node scripts/duo-live-smoke.mjs",
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
     "test:gws-ops:live": "npm run build && node scripts/gws-ops-live-smoke.mjs",

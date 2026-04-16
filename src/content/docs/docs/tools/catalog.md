@@ -7,7 +7,7 @@ description: Bundled grclanker GRC and compute tools grouped by domain.
 
 Current bundled surface:
 
-- 66 domain tools
+- 72 domain tools
 - 7 compute backend tools
 
 ## Compute Backend
@@ -139,6 +139,17 @@ Current bundled surface:
 | `scf_get_crosswalk` | Get SCF framework crosswalk |
 | `scf_get_evidence_request` | Get SCF evidence request |
 | `scf_search_controls` | Search SCF controls |
+
+## Slack
+
+| Tool | Purpose |
+|---|---|
+| `slack_assess_admin_access` | Assess Slack admin access |
+| `slack_assess_identity` | Assess Slack identity posture |
+| `slack_assess_integrations` | Assess Slack integrations |
+| `slack_assess_monitoring` | Assess Slack monitoring |
+| `slack_check_access` | Check Slack audit access |
+| `slack_export_audit_bundle` | Export Slack audit bundle |
 
 ## Vanta
 

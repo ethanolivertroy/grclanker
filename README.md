@@ -117,7 +117,7 @@ Built-in workflow rails:
 
 What ships in `0.0.1`:
 
-- 66 domain tools across Ansible AAP, CMVP, KEV/EPSS, FedRAMP, SCF, OSCAL, GitHub, Google Workspace, Okta, Duo, Vanta, and operator evidence workflows
+- 72 domain tools across Ansible AAP, CMVP, KEV/EPSS, FedRAMP, SCF, OSCAL, GitHub, Google Workspace, Slack, Okta, Duo, Vanta, and operator evidence workflows
 - `grclanker tools` to list the bundled tool inventory from the same extension registration path the agent uses
 - 2 bundled agent personas: `auditor` and `verifier`
 - 4 workflow commands

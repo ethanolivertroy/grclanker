@@ -34,6 +34,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["github_", "GitHub"],
   ["okta_", "Okta"],
   ["duo_", "Duo"],
+  ["slack_", "Slack"],
   ["vanta_", "Vanta"],
 ];
 

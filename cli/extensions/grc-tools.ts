@@ -32,9 +32,10 @@ import { registerKevsTools } from "./grc-tools/kevs.js";
 import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
 import { registerScfTools } from "./grc-tools/scf.js";
+import { registerSlackTools } from "./grc-tools/slack.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 
-const DOMAIN_TOOL_COUNT = 66;
+const DOMAIN_TOOL_COUNT = 72;
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [
@@ -198,6 +199,7 @@ export default function grcTools(pi: ExtensionAPI): void {
   registerOktaTools(pi);
   registerOscalTools(pi);
   registerScfTools(pi);
+  registerSlackTools(pi);
   registerVantaTools(pi);
 
   pi.on("session_start", async (_event, ctx) => {

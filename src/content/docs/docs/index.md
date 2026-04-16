@@ -46,6 +46,8 @@ If you want the path that best matches the current product direction:
 - `github_check_access`, `github_assess_org_access`, `github_assess_repo_protection`, `github_assess_actions_security`, `github_assess_code_security`, and `github_export_audit_bundle` for read-only, multi-framework GitHub organization posture work.
 - `gws_check_access`, `gws_assess_identity`, `gws_assess_admin_access`, `gws_assess_integrations`, `gws_assess_monitoring`, and `gws_export_audit_bundle` for read-only, multi-framework Google Workspace tenant posture work.
 - `gws_ops_check_cli`, `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, `gws_ops_review_tokens`, and `gws_ops_collect_evidence_bundle` for optional, read-only Google Workspace CLI operator evidence collection.
+- `slack_check_access`, `slack_assess_identity`, `slack_assess_admin_access`, `slack_assess_integrations`, `slack_assess_monitoring`, and `slack_export_audit_bundle` for read-only, multi-framework Slack Enterprise Grid posture work.
+- `ansible_check_access`, `ansible_assess_job_health`, `ansible_assess_host_coverage`, `ansible_assess_platform_security`, and `ansible_export_audit_bundle` for read-only Ansible Automation Platform evidence collection.
 - Repo specs as build inputs under [`/specs`](/specs) and [`/docs/specs/using-specs-as-inputs/`](/docs/specs/using-specs-as-inputs/).
 
 ## Important Release Note
