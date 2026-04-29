@@ -50,3 +50,9 @@ service-account-*.json
 
 # Internal docs (mascots, design refs, marketing)
 /docs/
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+!.env.example

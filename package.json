@@ -5,11 +5,14 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "preview": "astro preview",
+    "preview": "npm run build && wrangler dev",
     "sync:fedramp": "npm --prefix cli run sync:fedramp",
-    "sync:tool-catalog": "npm --prefix cli run sync:tool-catalog"
+    "sync:tool-catalog": "npm --prefix cli run sync:tool-catalog",
+    "generate-types": "wrangler types",
+    "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
+    "@astrojs/cloudflare": "^13.2.2",
     "@monaco-editor/loader": "^1.7.0",
     "@tailwindcss/vite": "^4.2.2",
     "astro": "^6.1.5",
@@ -18,5 +21,8 @@
   "overrides": {
     "defu": "^6.1.6",
     "vite": "7.3.2"
+  },
+  "devDependencies": {
+    "wrangler": "^4.86.0"
   }
 }
