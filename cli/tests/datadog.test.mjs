@@ -23,11 +23,22 @@ import {
   checkDatadogAccess,
   datadogBaseUrlForSite,
   exportDatadogAuditBundle,
+  isCredentialKey,
   normalizeDatadogSite,
+  projectAuditEvent,
+  projectCloudIntegration,
+  projectDashboard,
+  projectKeyRecord,
+  projectMonitor,
+  projectPostureFinding,
+  projectSecuritySignal,
+  redactCredentialValues,
+  reduceUrl,
   resolveDatadogConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/datadog.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -625,9 +636,12 @@ test("DatadogApiClient sends both key headers and paginates users with page[size
   };
 
   const client = new DatadogApiClient(sampleConfig(), { fetchImpl });
-  const users = await client.listUsers(150);
+  const listing = await client.listUsers(150);
+  const users = listing.items;
 
   assert.equal(users.length, 150);
+  assert.equal(listing.truncated, false);
+  assert.equal(listing.total, 150);
   assert.equal(seen.length, 2);
   assert.equal(seen[0].pathname, "/api/v2/users");
   assert.equal(seen[0].method, "GET");
@@ -637,6 +651,13 @@ test("DatadogApiClient sends both key headers and paginates users with page[size
   assert.equal(seen[0].size, "100");
   assert.equal(users[0].id, "u1");
   assert.equal(users[149].id, "u150");
+
+  // A cap below the server total is reported as truncated with the total the server disclosed.
+  const capped = await client.listUsers(120);
+  assert.equal(capped.items.length, 120);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.total, 150);
+  assert.match(capped.truncationReason, /item cap of 120 was reached/);
 });
 
 test("DatadogApiClient follows meta.page.after cursors and page/page_size monitor paging", async () => {
@@ -662,7 +683,8 @@ test("DatadogApiClient follows meta.page.after cursors and page/page_size monito
 
   const client = new DatadogApiClient(sampleConfig(), { fetchImpl });
   const events = await client.listAuditEvents({ from: "now-1d", to: "now", query: "@action:login", limit: 10 });
-  assert.deepEqual(events.map((event) => event.id), ["e1", "e2"]);
+  assert.deepEqual(events.items.map((event) => event.id), ["e1", "e2"]);
+  assert.equal(events.truncated, false);
   const auditCalls = seen.filter((url) => url.pathname === "/api/v2/audit/events");
   assert.equal(auditCalls[0].searchParams.get("filter[query]"), "@action:login");
   assert.equal(auditCalls[0].searchParams.get("filter[from]"), "now-1d");
@@ -670,13 +692,16 @@ test("DatadogApiClient follows meta.page.after cursors and page/page_size monito
   assert.equal(auditCalls[1].searchParams.get("page[cursor]"), "cursor-2");
 
   const monitors = await client.listMonitors(2);
-  assert.equal(monitors.length, 2);
+  assert.equal(monitors.items.length, 2);
+  // The cap stopped the loop while the page was still full, so the client cannot claim the list is complete.
+  assert.equal(monitors.truncated, true);
   const monitorCalls = seen.filter((url) => url.pathname === "/api/v1/monitor");
   assert.equal(monitorCalls.length, 1);
   assert.equal(monitorCalls[0].searchParams.get("page_size"), "2");
 
   const connections = await client.listOrgConnections(25);
-  assert.equal(connections.length, 1);
+  assert.equal(connections.items.length, 1);
+  assert.equal(connections.truncated, false);
   const connectionCalls = seen.filter((url) => url.pathname === "/api/v2/org_connections");
   assert.equal(connectionCalls[0].searchParams.get("limit"), "25");
   assert.equal(connectionCalls[0].searchParams.get("offset"), "0");
@@ -768,15 +793,20 @@ test("DatadogApiClient pages org connections with limit and offset until the tot
     });
   };
   const client = new DatadogApiClient(sampleConfig(), { fetchImpl });
-  const connections = await client.listOrgConnections();
+  const listing = await client.listOrgConnections();
+  const connections = listing.items;
   assert.equal(connections.length, total);
+  assert.equal(listing.truncated, false);
+  assert.equal(listing.total, total);
   assert.equal(connections[total - 1].id, `c${total - 1}`);
   assert.deepEqual(seen.map((url) => url.searchParams.get("offset")), ["0", "1000", "2000"]);
   assert.ok(seen.every((url) => url.searchParams.get("limit") === "1000"));
   assert.ok(seen.every((url) => !url.searchParams.has("page[limit]")));
 
   const capped = await new DatadogApiClient(sampleConfig(), { fetchImpl }).listOrgConnections(1500);
-  assert.equal(capped.length, 1500);
+  assert.equal(capped.items.length, 1500);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.total, total);
 });
 
 test("DatadogApiClient pages dashboards with count and start instead of relying on the default count of 100", async () => {
@@ -791,14 +821,18 @@ test("DatadogApiClient pages dashboards with count and start instead of relying 
   };
   const client = new DatadogApiClient(sampleConfig(), { fetchImpl });
   const dashboards = await client.listDashboards({ shared: true });
-  assert.equal(dashboards.length, total);
+  assert.equal(dashboards.items.length, total);
+  assert.equal(dashboards.truncated, false);
   assert.deepEqual(seen.map((url) => url.searchParams.get("start")), ["0", "100", "200"]);
   assert.ok(seen.every((url) => url.searchParams.get("count") === "100"));
   assert.ok(seen.every((url) => url.searchParams.get("filter[shared]") === "true"));
 
   seen.length = 0;
   const probe = await client.listDashboards({ shared: true, limit: 1 });
-  assert.equal(probe.length, 1);
+  assert.equal(probe.items.length, 1);
+  // The dashboard endpoint has no total, so a full single page under the cap is reported as truncated, not complete.
+  assert.equal(probe.truncated, true);
+  assert.equal(probe.total, undefined);
   assert.equal(seen.length, 1);
   assert.equal(seen[0].searchParams.get("count"), "1");
 });
@@ -1124,7 +1158,7 @@ test("identity findings flag truncated user and role inventories instead of pass
   for (const id of ["DD-02", "DD-03", "DD-04"]) {
     const item = findingById(result, id);
     assert.equal(item.status, "warn", `${id} should warn on a truncated inventory`);
-    assert.match(item.summary, /inventory is truncated at (50|10) items \(raise (user_limit|role_limit)\)/);
+    assert.match(item.summary, /inventory is truncated at (50|10) items \((50|10) of an unknown total loaded; raise (user_limit|role_limit)\)/);
   }
   assert.equal(findingById(result, "DD-02").evidence.users_inventory_truncated, true);
   assert.equal(findingById(result, "DD-02").evidence.active_human_users, 50);
@@ -1201,10 +1235,11 @@ test("DD-14 is manual, never pass, when org settings are unreadable or omit priv
   }), { now: NOW });
   const sharing = findingById(orgForbidden, "DD-14");
   assert.equal(sharing.status, "manual");
-  assert.match(sharing.summary, /organization settings \(org_management\).*403/);
-  assert.match(sharing.summary, /private_widget_share setting was therefore never read/);
+  assert.match(sharing.summary, /Unreadable inventory: organization settings \(GET \/api\/v1\/org, org_management: .*403 Forbidden/);
+  assert.match(sharing.summary, /whether widget sharing outside the organization \(private_widget_share\) is disabled was not checked/);
   assert.equal(sharing.evidence.private_widget_share, null);
   assert.equal(sharing.evidence.organization_settings_readable, false);
+  assert.equal(sharing.evidence.unreadable_inventories[0].inventory, "organization settings");
   assert.ok(sharing.evidence.manual_evidence.some((step) => /private_widget_share/.test(step)));
 
   const settingMissing = await assessDatadogAccessControls(healthyClient({
@@ -1221,7 +1256,8 @@ test("DD-14 is manual, never pass, when org settings are unreadable or omit priv
     },
   }), { now: NOW });
   assert.equal(findingStatus(dashboardsForbidden, "DD-14"), "manual");
-  assert.match(findingById(dashboardsForbidden, "DD-14").summary, /dashboards \(dashboards_read\)/);
+  assert.match(findingById(dashboardsForbidden, "DD-14").summary, /Unreadable inventory: shared_dashboards \(GET \/api\/v1\/dashboard\?filter\[shared\]=true, dashboards_read: .*403 Forbidden/);
+  assert.match(findingById(dashboardsForbidden, "DD-14").summary, /Collect manually: Dashboards > Shared Dashboards/);
 });
 
 test("access control findings never pass on empty key inventories or an allowlist without its enabled flag", async () => {
@@ -1310,7 +1346,7 @@ test("access control findings flag truncated key and shared dashboard inventorie
   for (const id of ["DD-05", "DD-06"]) {
     const item = findingById(result, id);
     assert.equal(item.status, "warn", `${id} should warn on a truncated inventory`);
-    assert.match(item.summary, /inventory is truncated at 20 items \(raise key_limit\)/);
+    assert.match(item.summary, /inventory is truncated at 20 items \(20 of an unknown total loaded; raise key_limit\)/);
   }
   assert.equal(findingById(result, "DD-05").evidence.api_keys_inventory_truncated, true);
   assert.equal(findingById(result, "DD-06").evidence.application_keys_inventory_truncated, true);
@@ -1318,7 +1354,7 @@ test("access control findings flag truncated key and shared dashboard inventorie
   assert.equal(sharing.status, "warn");
   assert.equal(sharing.evidence.shared_dashboards_inventory_truncated, true);
   assert.equal(sharing.evidence.shared_dashboards, 2000);
-  assert.deepEqual(sharing.evidence.verdict_caveats, ["shared_dashboards inventory is truncated at 2000 items (raise the dashboard limit), so the verdict covers a partial view."]);
+  assert.deepEqual(sharing.evidence.verdict_caveats, ["shared_dashboards inventory is truncated at 2000 items (2000 of an unknown total loaded; raise the dashboard limit), so the verdict covers a partial view."]);
   assert.ok(result.errors.some((error) => /shared_dashboards: inventory truncated at 2000 items/.test(error)));
 });
 
@@ -1395,7 +1431,7 @@ test("DD-12 is manual when either the rules or the posture findings source is un
   }), { now: NOW });
   const cspm = findingById(rulesForbidden, "DD-12");
   assert.equal(cspm.status, "manual");
-  assert.match(cspm.summary, /security_rules \(security_monitoring_rules_read\) \(403 forbidden\)/);
+  assert.match(cspm.summary, /Unreadable inventory: security_rules \(GET \/api\/v2\/security_monitoring\/rules, security_monitoring_rules_read: .*403 Forbidden/);
   assert.doesNotMatch(cspm.summary, /is not active/);
   assert.equal(cspm.evidence.rules_readable, false);
   assert.equal(cspm.evidence.posture_findings_readable, true);
@@ -1415,7 +1451,7 @@ test("DD-12 is manual when either the rules or the posture findings source is un
     },
   }), { now: NOW });
   assert.equal(findingStatus(integrationsForbidden, "DD-12"), "manual");
-  assert.match(findingById(integrationsForbidden, "DD-12").summary, /gcp_integrations \(gcp_configuration_read\)/);
+  assert.match(findingById(integrationsForbidden, "DD-12").summary, /Unreadable inventory: gcp_integrations \(GET \/api\/v1\/integration\/gcp, gcp_configuration_read: .*403 Forbidden/);
 });
 
 test("DD-12 downgrades to warn when posture counts are truncated instead of reporting a fixed rate", async () => {
@@ -1515,7 +1551,7 @@ test("security monitoring findings flag truncated rule, signal, and monitor inve
   for (const [id, limit, argument] of [["DD-08", 40, "rule_limit"], ["DD-13", 40, "rule_limit"], ["DD-17", 30, "monitor_limit"]]) {
     const item = findingById(result, id);
     assert.equal(item.status, "warn", `${id} should warn on a truncated inventory`);
-    assert.match(item.summary, new RegExp(`inventory is truncated at ${limit} items \\(raise ${argument}\\)`));
+    assert.match(item.summary, new RegExp(`inventory is truncated at ${limit} items \\(${limit} of an unknown total loaded; raise ${argument}\\)`));
   }
   assert.equal(findingById(result, "DD-08").evidence.rules_inventory_truncated, true);
   assert.equal(findingById(result, "DD-12").evidence.rules_inventory_truncated, true);
@@ -1602,7 +1638,7 @@ test("DD-20 is manual, never pass, when org connections or org settings are unre
   }), { now: NOW });
   const orgSettings = findingById(connectionsForbidden, "DD-20");
   assert.equal(orgSettings.status, "manual");
-  assert.match(orgSettings.summary, /org_connections \(org_connections_read\) \(403 forbidden\)/);
+  assert.match(orgSettings.summary, /Unreadable inventory: org_connections \(GET \/api\/v2\/org_connections, org_connections_read: .*403 Forbidden.*\), so whether any cross-org connection shares data with another organization was not checked\. Collect manually: Organization Settings > Org Connections/);
   assert.equal(orgSettings.evidence.org_connections, null);
   assert.equal(orgSettings.evidence.org_connections_readable, false);
   assert.ok(orgSettings.evidence.manual_evidence.some((step) => /Org Connections/.test(step)));
@@ -1613,7 +1649,7 @@ test("DD-20 is manual, never pass, when org connections or org settings are unre
     },
   }), { now: NOW });
   assert.equal(findingStatus(orgForbidden, "DD-20"), "manual");
-  assert.match(findingById(orgForbidden, "DD-20").summary, /organization settings \(org_management\) \(403 forbidden\)/);
+  assert.match(findingById(orgForbidden, "DD-20").summary, /Unreadable inventory: organization settings \(GET \/api\/v1\/org, org_management: .*403 Forbidden/);
 
   const settingMissing = await assessDatadogDataProtection(healthyClient({
     async getOrganization() {
@@ -1670,12 +1706,12 @@ test("DD-07 and DD-10 are manual when one of their surfaces is unreadable and wa
   }), { now: NOW });
   const audit = findingById(recentForbidden, "DD-07");
   assert.equal(audit.status, "manual");
-  assert.match(audit.summary, /audit_events_recent \(audit_logs_read\) \(403 forbidden\)/);
+  assert.match(audit.summary, /Unreadable inventory: audit_events_recent \(GET \/api\/v2\/audit\/events \(last 7 days\), audit_logs_read: .*403 Forbidden.*\), so whether Audit Trail recorded any event in the last 7 days was not checked/);
   assert.equal(audit.evidence.oldest_events_readable, true);
   assert.equal(audit.evidence.recent_events_readable, false);
   const logs = findingById(recentForbidden, "DD-10");
   assert.equal(logs.status, "manual");
-  assert.match(logs.summary, /log_archives \(logs_read_archives\) \(403 forbidden\)/);
+  assert.match(logs.summary, /Unreadable inventory: log_archives \(GET \/api\/v2\/logs\/config\/archives, logs_read_archives: .*403 Forbidden.*\), so whether a healthy archive destination exists for long-term retention was not checked/);
   assert.equal(logs.evidence.surfaces_readable.archives, false);
 
   const undatedOldest = await assessDatadogDataProtection(healthyClient({
@@ -1884,7 +1920,171 @@ test("false-pass self-check (c): a partial inventory never passes on any of the 
   assert.equal(findings.get("DD-14").evidence.shared_dashboards_inventory_truncated, true);
   assert.match(findings.get("DD-15").summary, /returned no CIDR entries/);
   assert.match(findings.get("DD-17").summary, /monitors inventory is truncated/);
-  assert.match(findings.get("DD-20").summary, /org_connections \(org_connections_read\)/);
+  assert.match(findings.get("DD-20").summary, /Unreadable inventory: org_connections \(GET \/api\/v2\/org_connections, org_connections_read: /);
+});
+
+// Every Datadog finding whose verdict reads two or more collected inventories, with each secondary inventory forbidden
+// in turn while the primary stays healthy. `label` is the inventory name the summary and the evidence gap must carry,
+// `errorPrefix` the prefix of the single collection error the failure must produce, and `status` the verdict required.
+// Single-inventory controls (DD-01, DD-04, DD-05, DD-06, DD-08, DD-11, DD-13, DD-15, DD-17) and the always-manual
+// DD-16 are covered by the false-pass self-checks above.
+const DATADOG_MULTI_INVENTORY_CASES = [
+  // DD-02 reads users (primary) plus the organization's SAML strict-mode setting; native MFA still judges the users.
+  { control: "DD-02", area: "identity", label: "organization settings", errorPrefix: "organization:", failure: { method: "getOrganization", path: "/api/v1/org" }, status: "warn", names: /All 2 active human users have Datadog MFA enabled.*Unreadable inventory: organization settings \(GET \/api\/v1\/org, org_management: .*403 Forbidden.*\), so whether SAML strict mode disables password login for the users below was not checked\. Collect manually: Organization Settings > Login Methods/ },
+  // DD-03 reads roles (primary) plus each custom role's permission list.
+  { control: "DD-03", area: "identity", label: "role_permissions", errorPrefix: "role_permissions(Auditor):", failure: { method: "listRolePermissions", path: "/api/v2/roles/role-auditor/permissions" }, status: "manual", names: /1\/1 custom roles could not have their permissions read.*Unreadable inventory: role_permissions \(GET \/api\/v2\/roles\/\{id\}\/permissions, user_access_read: Auditor: .*403 Forbidden.*\), so admin-equivalent grants in 1 custom roles could not be ruled out\. Collect manually: the permission list of each custom role/ },
+  // DD-19 reads users (primary) plus application keys for rotation; naming and interactive logins still judge the users.
+  { control: "DD-19", area: "identity", label: "application_keys", errorPrefix: "application_keys:", failure: { method: "listApplicationKeys", path: "/api/v2/application_keys" }, status: "warn", names: /1 service accounts follow the naming convention and have no interactive logins\. Unreadable inventory: application_keys \(GET \/api\/v2\/application_keys, org_app_keys_read: .*403 Forbidden.*\), so whether the application keys owned by these service accounts were rotated within 90 days was not checked\. Collect manually: Organization Settings > Application Keys/ },
+  // DD-14 reads organization settings plus shared dashboards; both are essential.
+  { control: "DD-14", area: "access", label: "organization settings", errorPrefix: "organization:", failure: { method: "getOrganization", path: "/api/v1/org" }, status: "manual", names: /^Unreadable inventory: organization settings \(GET \/api\/v1\/org, org_management: .*403 Forbidden.*\), so whether widget sharing outside the organization \(private_widget_share\) is disabled was not checked/ },
+  { control: "DD-14", area: "access", label: "shared_dashboards", errorPrefix: "shared_dashboards:", failure: { method: "listDashboards", path: "/api/v1/dashboard" }, status: "manual", names: /^Unreadable inventory: shared_dashboards \(GET \/api\/v1\/dashboard\?filter\[shared\]=true, dashboards_read: .*403 Forbidden.*\), so whether any dashboard is shared through a public link was not checked/ },
+  // DD-18 reads the AWS, GCP, and Azure integration lists; it is always manual but must still name what it could not inventory.
+  { control: "DD-18", area: "access", label: "aws_integrations", errorPrefix: "aws_integrations:", failure: { method: "listAwsIntegrations", path: "/api/v1/integration/aws" }, status: "manual", names: /0 GCP, 0 Azure integrations were inventoried.*Unreadable inventory: aws_integrations \(GET \/api\/v1\/integration\/aws, aws_configuration_read: .*403 Forbidden.*\), so AWS accounts and their authentication method were not inventoried/ },
+  { control: "DD-18", area: "access", label: "gcp_integrations", errorPrefix: "gcp_integrations:", failure: { method: "listGcpIntegrations", path: "/api/v1/integration/gcp" }, status: "manual", names: /1 AWS, 0 Azure integrations were inventoried.*Unreadable inventory: gcp_integrations \(GET \/api\/v1\/integration\/gcp, gcp_configuration_read: .*403 Forbidden.*\), so GCP projects were not inventoried/ },
+  { control: "DD-18", area: "access", label: "azure_integrations", errorPrefix: "azure_integrations:", failure: { method: "listAzureIntegrations", path: "/api/v1/integration/azure" }, status: "manual", names: /1 AWS, 0 GCP integrations were inventoried.*Unreadable inventory: azure_integrations \(GET \/api\/v1\/integration\/azure, azure_configuration_read: .*403 Forbidden.*\), so Azure tenants were not inventoried/ },
+  // DD-09 reads signals (primary) plus the rule inventory that makes an empty signal list meaningful.
+  { control: "DD-09", area: "monitoring", label: "security_rules", errorPrefix: "security_rules:", failure: { method: "listSecurityRules", path: "/api/v2/security_monitoring/rules" }, status: "manual", names: /detection rule inventory was not readable.*Unreadable inventory: security_rules \(GET \/api\/v2\/security_monitoring\/rules, security_monitoring_rules_read: .*403 Forbidden.*\), so whether any detection rule is enabled to generate signals was not checked\. Collect manually: Security > Cloud SIEM > Detection Rules/ },
+  // DD-12 reads rules (primary) plus the three cloud integration lists and the failing and passing posture counts.
+  { control: "DD-12", area: "monitoring", label: "aws_integrations", errorPrefix: "aws_integrations:", failure: { method: "listAwsIntegrations", path: "/api/v1/integration/aws" }, status: "manual", names: /^Unreadable inventory: aws_integrations \(GET \/api\/v1\/integration\/aws, aws_configuration_read: .*403 Forbidden.*\), so whether AWS accounts have CSPM resource collection enabled was not checked/ },
+  { control: "DD-12", area: "monitoring", label: "gcp_integrations", errorPrefix: "gcp_integrations:", failure: { method: "listGcpIntegrations", path: "/api/v1/integration/gcp" }, status: "manual", names: /^Unreadable inventory: gcp_integrations .*so whether GCP projects have CSPM resource collection enabled was not checked/ },
+  { control: "DD-12", area: "monitoring", label: "azure_integrations", errorPrefix: "azure_integrations:", failure: { method: "listAzureIntegrations", path: "/api/v1/integration/azure" }, status: "manual", names: /^Unreadable inventory: azure_integrations .*so whether Azure tenants have CSPM resource collection enabled was not checked/ },
+  { control: "DD-12", area: "monitoring", label: "posture_findings_fail", errorPrefix: "posture_findings_fail:", failure: { method: "listPostureFindings", path: "/api/v2/posture_management/findings", when: (options = {}) => options.evaluation === "fail" }, status: "manual", names: /CSPM appears active.*passing rate could not be measured\. Unreadable inventory: posture_findings_fail \(GET \/api\/v2\/posture_management\/findings\?filter\[evaluation\]=fail, security_monitoring_findings_read: .*403 Forbidden.*\), so the failing posture finding count behind the passing rate was not read/ },
+  { control: "DD-12", area: "monitoring", label: "posture_findings_pass", errorPrefix: "posture_findings_pass:", failure: { method: "listPostureFindings", path: "/api/v2/posture_management/findings", when: (options = {}) => options.evaluation === "pass" }, status: "manual", names: /CSPM appears active.*Unreadable inventory: posture_findings_pass \(GET \/api\/v2\/posture_management\/findings\?filter\[evaluation\]=pass, security_monitoring_findings_read: .*403 Forbidden.*\), so the passing posture finding count behind the passing rate was not read/ },
+  // DD-07 reads the oldest retained audit event and the last seven days of events; both are essential.
+  { control: "DD-07", area: "data", label: "audit_events_oldest", errorPrefix: "audit_events_oldest:", failure: { method: "listAuditEvents", path: "/api/v2/audit/events", when: (options = {}) => options.sort === "timestamp" }, status: "manual", names: /^Unreadable inventory: audit_events_oldest \(GET \/api\/v2\/audit\/events \(oldest event in the retention window\), audit_logs_read: .*403 Forbidden.*\), so whether events at least 83 days old are still retained was not checked\. Collect manually: Organization Settings > Audit Trail showing the retention setting/ },
+  { control: "DD-07", area: "data", label: "audit_events_recent", errorPrefix: "audit_events_recent:", failure: { method: "listAuditEvents", path: "/api/v2/audit/events", when: (options = {}) => options.sort === "-timestamp" }, status: "manual", names: /^Unreadable inventory: audit_events_recent \(GET \/api\/v2\/audit\/events \(last 7 days\), audit_logs_read: .*403 Forbidden.*\), so whether Audit Trail recorded any event in the last 7 days was not checked/ },
+  // DD-10 reads indexes (primary) plus pipelines and archives.
+  { control: "DD-10", area: "data", label: "log_pipelines", errorPrefix: "log_pipelines:", failure: { method: "listLogPipelines", path: "/api/v1/logs/config/pipelines" }, status: "manual", names: /^Unreadable inventory: log_pipelines \(GET \/api\/v1\/logs\/config\/pipelines, logs_read_config: .*403 Forbidden.*\), so whether processing pipelines are configured for security sources was not checked\. Collect manually: Logs > Configuration > Pipelines/ },
+  { control: "DD-10", area: "data", label: "log_archives", errorPrefix: "log_archives:", failure: { method: "listLogArchives", path: "/api/v2/logs/config/archives" }, status: "manual", names: /^Unreadable inventory: log_archives \(GET \/api\/v2\/logs\/config\/archives, logs_read_archives: .*403 Forbidden.*\), so whether a healthy archive destination exists for long-term retention was not checked/ },
+  // DD-20 reads organization settings (primary) plus log indexes and org connections.
+  { control: "DD-20", area: "data", label: "log_indexes", errorPrefix: "log_indexes:", failure: { method: "listLogIndexes", path: "/api/v1/logs/config/indexes" }, status: "manual", names: /^Unreadable inventory: log_indexes \(GET \/api\/v1\/logs\/config\/indexes, logs_read_config: .*403 Forbidden.*\), so whether every log index retains data for at least 30 days was not checked\. Collect manually: Logs > Configuration > Indexes/ },
+  { control: "DD-20", area: "data", label: "org_connections", errorPrefix: "org_connections:", failure: { method: "listOrgConnections", path: "/api/v2/org_connections" }, status: "manual", names: /^Unreadable inventory: org_connections \(GET \/api\/v2\/org_connections, org_connections_read: .*403 Forbidden.*\), so whether any cross-org connection shares data with another organization was not checked\. Collect manually: Organization Settings > Org Connections/ },
+];
+
+const DATADOG_ASSESS_BY_AREA = {
+  identity: assessDatadogIdentity,
+  access: assessDatadogAccessControls,
+  monitoring: assessDatadogSecurityMonitoring,
+  data: assessDatadogDataProtection,
+};
+
+function clientWithForbiddenSecondary(failure) {
+  const base = healthyClient();
+  return healthyClient({
+    async [failure.method](...args) {
+      if (failure.when && !failure.when(...args)) return base[failure.method](...args);
+      throw forbidden(failure.path);
+    },
+  });
+}
+
+test("verdict rule 1 corollary: Datadog findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
+  const baselines = new Map();
+  for (const item of DATADOG_MULTI_INVENTORY_CASES) {
+    const assess = DATADOG_ASSESS_BY_AREA[item.area];
+    if (!baselines.has(item.area)) baselines.set(item.area, await assess(healthyClient(), { now: NOW }));
+    const baseline = findingById(baselines.get(item.area), item.control);
+    assert.equal(baseline.status, item.control === "DD-18" ? "manual" : "pass", `${item.control} baseline on the healthy fixture`);
+    assert.equal(baseline.evidence.unreadable_inventories, undefined, `${item.control} baseline records no inventory gap`);
+
+    const label = `${item.control} with ${item.label} forbidden`;
+    const result = await assess(clientWithForbiddenSecondary(item.failure), { now: NOW });
+    assert.equal(result.errors.length, 1, `${label}: only the secondary inventory failed (${result.errors.join(" | ")})`);
+    assert.ok(result.errors[0].startsWith(item.errorPrefix), `${label}: the collection error names the inventory (${result.errors[0]})`);
+
+    const found = findingById(result, item.control);
+    assert.notEqual(found.status, "pass", `${label} must not pass`);
+    assert.equal(found.status, item.status, `${label} status`);
+    assert.match(found.summary, item.names, `${label} must name the unreadable inventory`);
+    assert.match(found.summary, /403 Forbidden/, `${label} must carry the HTTP error`);
+    assert.match(found.summary, /Collect manually: /, `${label} must tell the human what to collect`);
+    const gaps = found.evidence.unreadable_inventories;
+    assert.ok(Array.isArray(gaps) && gaps.some((gap) => gap.inventory === item.label), `${label} evidence lists the gap`);
+    assert.ok(gaps.every((gap) => gap.endpoint && gap.permission && gap.error && gap.not_checked && gap.collect_manually), `${label} gap entries are complete`);
+    assert.equal(gaps.filter((gap) => gap.inventory === item.label).length, 1, `${label} records the gap once`);
+    if (item.status === "manual") {
+      assert.ok(Array.isArray(found.evidence.manual_evidence) && found.evidence.manual_evidence.length > 0, `${label} lists manual evidence`);
+      assert.match(found.summary, /Manual evidence required: /, `${label} states the manual evidence`);
+    }
+  }
+});
+
+test("verdict rule 1 corollary: Datadog findings keep judging the readable inventories and still fail on them", async () => {
+  // DD-02: users without native MFA and no organization settings cannot be called fail (strict SAML may block passwords) or pass.
+  const mfaUnknown = await assessDatadogIdentity(healthyClient({
+    async getOrganization() {
+      throw forbidden("/api/v1/org");
+    },
+    async listUsers() {
+      return [user("alice", { mfa_enabled: false }), user("bob")];
+    },
+  }), { now: NOW });
+  const mfa = findingById(mfaUnknown, "DD-02");
+  assert.equal(mfa.status, "manual");
+  assert.match(mfa.summary, /1\/2 active human users lack Datadog-native MFA, and whether SAML strict mode blocks their password login is unknown/);
+  assert.match(mfa.summary, /Unreadable inventory: organization settings/);
+  assert.equal(mfa.evidence.saml_strict_mode, null);
+  assert.deepEqual(mfa.evidence.manual_evidence.length, 2);
+
+  // DD-19: an interactive service account still fails even though its application keys could not be read.
+  const interactive = await assessDatadogIdentity(healthyClient({
+    async listApplicationKeys() {
+      throw forbidden("/api/v2/application_keys");
+    },
+    async listUsers() {
+      return [user("alice"), user("svc-terraform", { service_account: true, last_login_time: daysAgo(1) })];
+    },
+  }), { now: NOW });
+  const serviceAccounts = findingById(interactive, "DD-19");
+  assert.equal(serviceAccounts.status, "fail");
+  assert.match(serviceAccounts.summary, /1 service accounts show interactive login history.*Unreadable inventory: application_keys/);
+
+  // DD-09: overdue signals fail regardless of the unreadable rule inventory, and the summary still names the gap.
+  const overdue = await assessDatadogSecurityMonitoring(healthyClient({
+    async listSecurityRules() {
+      throw forbidden("/api/v2/security_monitoring/rules");
+    },
+    async listSecuritySignals() {
+      return [{ id: "sig-1", type: "signal", attributes: { timestamp: hoursAgo(80), message: "Brute force", attributes: { status: "critical", workflow: { triage: { state: "open" } } } } }];
+    },
+  }), { now: NOW });
+  const signals = findingById(overdue, "DD-09");
+  assert.equal(signals.status, "fail");
+  assert.match(signals.summary, /1\/1 unresolved high or critical signals are older than the 72-hour SLA\. Unreadable inventory: security_rules/);
+
+  // DD-14 and DD-20: an enabled private_widget_share fails even when the dashboard list or org connections are unreadable.
+  const openSharing = await assessDatadogAccessControls(healthyClient({
+    async getOrganization() {
+      return { settings: { private_widget_share: true } };
+    },
+    async listDashboards() {
+      throw forbidden("/api/v1/dashboard");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(openSharing, "DD-14"), "fail");
+  assert.match(findingById(openSharing, "DD-14").summary, /private_widget_share enabled.*Unreadable inventory: shared_dashboards/);
+  const openOrg = await assessDatadogDataProtection(healthyClient({
+    async getOrganization() {
+      return { settings: { private_widget_share: true } };
+    },
+    async listOrgConnections() {
+      throw forbidden("/api/v2/org_connections");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(openOrg, "DD-20"), "fail");
+  assert.match(findingById(openOrg, "DD-20").summary, /Widget sharing outside the organization is enabled.*Unreadable inventory: org_connections/);
+
+  // DD-10: an exclusion filter dropping security sources fails even when archives are unreadable.
+  const dropping = await assessDatadogDataProtection(healthyClient({
+    async listLogIndexes() {
+      return [{ name: "main", num_retention_days: 30, exclusion_filters: [{ name: "drop cloudtrail", is_enabled: true, filter: { query: "source:cloudtrail", sample_rate: 1 } }] }];
+    },
+    async listLogArchives() {
+      throw forbidden("/api/v2/logs/config/archives");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(dropping, "DD-10"), "fail");
+  assert.match(findingById(dropping, "DD-10").summary, /drop security-relevant log sources\. Unreadable inventory: log_archives/);
 });
 
 test("exportDatadogAuditBundle writes core data, analysis, compliance reports, quick reference, and archive", async () => {
@@ -1996,6 +2196,472 @@ test("exportDatadogAuditBundle reruns allocate a new directory and zip without o
   assert.notEqual(third.zipPath, second.zipPath, "a leftover zip must block reuse of its directory name");
   assert.match(basename(third.outputDir), /-audit-bundle-3$/);
   assert.ok(existsSync(second.zipPath));
+});
+
+test("isCredentialKey, reduceUrl, and redactCredentialValues cover nested, plural, camelCase, key-id, pair, and URL-shaped credential fields", () => {
+  for (const name of ["apiKey", "api_keys", "appKey", "secrets", "clientSecret", "client_secret", "access_key_id", "private_key_id", "privateKey", "authorization", "password", "passphrase", "signing_secret", "sessionToken", "bearer"]) {
+    assert.equal(isCredentialKey(name), true, `${name} is credential-shaped`);
+  }
+  for (const name of ["handle", "public_id", "monitor_id", "key_id", "keys_without_created_at", "stale_service_account_keys", "cspm_resource_collection_enabled", "authentication", "credential_fields_dropped", "last4"]) {
+    assert.equal(isCredentialKey(name), false, `${name} is not credential-shaped`);
+  }
+
+  assert.equal(reduceUrl("https://hooks.example.com/services/T000/B000/secret?token=abc"), "https://hooks.example.com");
+  assert.equal(reduceUrl("https://user:pw@idp.example.com:8443/sso"), "https://idp.example.com:8443");
+  assert.equal(reduceUrl("/api/v1/hook?api_key=abc"), "[REDACTED]");
+  assert.equal(reduceUrl("/api/v1/hook?page=2"), "/api/v1/hook?page=2");
+  assert.equal(reduceUrl("http://[bad"), "[REDACTED]");
+
+  const redacted = redactCredentialValues({
+    secrets: { nested: "value" },
+    tokens: ["t1", "t2"],
+    apiKey: "plain",
+    accessKeyId: "AKIA0000",
+    nested: { clientSecret: "s", name: "ok", count: 3, enabled: true, empty: null },
+    pairs: [{ name: "api_token", value: "v" }, { name: "region", value: "us" }, { name: "password", value: { inner: "x" } }],
+    webhook_url: "https://hooks.example.com/x?token=abc",
+    link: "/relative?api_key=abc",
+    endpoint: "GET /api/v1/org",
+    plain: "/relative/path?query=1",
+  });
+  assert.deepEqual(redacted, {
+    secrets: "[REDACTED]",
+    tokens: "[REDACTED]",
+    apiKey: "[REDACTED]",
+    accessKeyId: "[REDACTED]",
+    nested: { clientSecret: "[REDACTED]", name: "ok", count: 3, enabled: true, empty: null },
+    pairs: [{ name: "api_token", value: "[REDACTED]" }, { name: "region", value: "us" }, { name: "password", value: "[REDACTED]" }],
+    webhook_url: "https://hooks.example.com",
+    link: "[REDACTED]",
+    endpoint: "GET /api/v1/org",
+    plain: "/relative/path?query=1",
+  });
+
+  // Booleans, numbers, and nulls under credential keys pass through: they cannot carry a secret and often mean "is set".
+  assert.deepEqual(redactCredentialValues({ api_key: null, has_secret: true, token: 4 }), { api_key: null, has_secret: true, token: 4 });
+
+  let deep = { leaf: "value" };
+  for (let depth = 0; depth < 80; depth += 1) deep = { level: deep };
+  let cursor = redactCredentialValues(deep);
+  let steps = 0;
+  while (cursor && typeof cursor === "object") {
+    cursor = cursor.level;
+    steps += 1;
+  }
+  assert.equal(cursor, "[REDACTED]", "nesting beyond the depth cap collapses to [REDACTED]");
+  assert.ok(steps <= 66 && steps >= 60, `redaction recursed ${steps} levels before capping`);
+});
+
+test("projection helpers keep only assessment fields and drop key values, cloud credentials, signal payloads, and configuration bodies", () => {
+  const apiKey = projectKeyRecord({ id: "k1", type: "api_keys", attributes: { name: "agent", key: "dd-api-key-value-FAKE0001", last4: "0001", created_at: daysAgo(1) } });
+  assert.equal(apiKey.attributes.key, undefined);
+  assert.equal(apiKey.attributes.last4, "0001");
+  assert.equal(apiKey.attributes.name, "agent");
+
+  const aws = projectCloudIntegration("aws", {
+    account_id: "123456789012",
+    access_key_id: "AKIAFAKEACCESSKEY0003",
+    secret_access_key: "aws-secret-access-key-FAKE0004",
+    cspm_resource_collection_enabled: true,
+    host_tags: ["env:prod"],
+  });
+  assert.deepEqual(aws, {
+    account_id: "123456789012",
+    cspm_resource_collection_enabled: true,
+    host_tags: ["env:prod"],
+    authentication: "access_key",
+    credential_fields_dropped: ["access_key_id", "secret_access_key"],
+  });
+  assert.equal(projectCloudIntegration("aws", { account_id: "1", role_name: "DatadogRole" }).authentication, "role_delegation");
+  assert.equal(projectCloudIntegration("aws", { account_id: "1" }).authentication, "unknown");
+  const gcp = projectCloudIntegration("gcp", { project_id: "p1", client_email: "dd@p1.iam.gserviceaccount.com", private_key: "gcp-private-key-FAKE0005", private_key_id: "kid", is_cspm_enabled: true });
+  assert.deepEqual(gcp, { project_id: "p1", client_email: "dd@p1.iam.gserviceaccount.com", is_cspm_enabled: true, credential_fields_dropped: ["private_key", "private_key_id"] });
+  const azure = projectCloudIntegration("azure", { tenant_name: "t1", client_id: "cid", client_secret: "azure-client-secret-FAKE0006", cspm_enabled: false });
+  assert.deepEqual(azure, { tenant_name: "t1", client_id: "cid", cspm_enabled: false, credential_fields_dropped: ["client_secret"] });
+
+  const signal = projectSecuritySignal({
+    id: "sig-1",
+    type: "signal",
+    attributes: {
+      timestamp: hoursAgo(1),
+      message: "Brute force from 203.0.113.9",
+      status: "high",
+      tags: ["source:okta"],
+      attributes: {
+        status: "high",
+        workflow: { triage: { state: "open", assignee: { handle: "alice" } }, rule: { id: "r1", name: "Okta brute force", query: "source:okta" } },
+        custom: { request: { headers: { authorization: "signal-authorization-header-FAKE0007" } } },
+        samples: [{ message: "raw log line with password=hunter2" }],
+      },
+    },
+  });
+  assert.deepEqual(signal, {
+    id: "sig-1",
+    type: "signal",
+    attributes: {
+      timestamp: signal.attributes.timestamp,
+      message: "Brute force from 203.0.113.9",
+      status: "high",
+      tags: ["source:okta"],
+      attributes: { status: "high", workflow: { triage: { state: "open" }, rule: { id: "r1", name: "Okta brute force" } } },
+    },
+  });
+
+  const event = projectAuditEvent({
+    id: "evt-1",
+    type: "audit",
+    attributes: {
+      timestamp: hoursAgo(2),
+      service: "audit",
+      attributes: { action: "user_login", asset: { type: "user", id: "u1" }, http: { request: { headers: { cookie: "audit-request-header-FAKE0008" } } }, usr: { email: "alice@acme.example" } },
+    },
+  });
+  assert.deepEqual(event, { id: "evt-1", type: "audit", attributes: { timestamp: event.attributes.timestamp, service: "audit", action: "user_login", asset_type: "user" } });
+  assert.equal(projectAuditEvent({ id: "evt-2", attributes: { attributes: { evt: { name: "logout" } } } }).attributes.action, "logout");
+
+  assert.deepEqual(
+    projectMonitor({ id: 1, name: "Security", type: "log alert", tags: ["team:security"], priority: 1, message: "@pagerduty-security", overall_state: "OK", query: "logs(\"token:monitor-query-secret-FAKE0014\")", options: { notify_audit: true }, creator: { email: "alice@acme.example" } }),
+    { id: 1, name: "Security", type: "log alert", tags: ["team:security"], priority: 1, message: "@pagerduty-security", overall_state: "OK" },
+  );
+  assert.deepEqual(
+    projectDashboard({ id: "d1", title: "Shared", layout_type: "ordered", is_read_only: false, url: "https://app.datadoghq.com/dashboard/d1?token=dashboard-url-secret-FAKE0015", author_handle: "alice@acme.example" }),
+    { id: "d1", title: "Shared", layout_type: "ordered", is_read_only: false },
+  );
+  assert.deepEqual(
+    projectPostureFinding({ id: "f1", type: "finding", attributes: { evaluation: "fail", status: "critical", resource_type: "aws_s3_bucket", resource: "arn:aws:s3:::bucket", rule: { id: "r1", name: "S3 public", description: "long text" }, resource_configuration: { policy: "posture-resource-secret-FAKE0016" } } }),
+    { id: "f1", type: "finding", attributes: { evaluation: "fail", status: "critical", resource_type: "aws_s3_bucket", resource: "arn:aws:s3:::bucket", rule: { id: "r1", name: "S3 public" } } },
+  );
+});
+
+test("DatadogApiClient withholds non-JSON error bodies, caps JSON error detail, and strips userinfo from explicit base URLs", async () => {
+  const htmlDenied = new DatadogApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async () => new Response("<html><body>Forbidden for token SECRET-IN-HTML-FAKE</body></html>", { status: 403, statusText: "Forbidden", headers: { "content-type": "text/html; charset=utf-8" } }),
+  });
+  await assert.rejects(() => htmlDenied.listUsers(1), (error) => {
+    assert.ok(error instanceof DatadogApiError);
+    assert.doesNotMatch(error.message, /SECRET-IN-HTML-FAKE/);
+    assert.match(error.message, /non-JSON text\/html response body \(\d+ characters\) withheld/);
+    return true;
+  });
+
+  const longDetail = new DatadogApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async () => jsonResponse({ errors: [`Bad request ${"x".repeat(600)} TAIL-FAKE`] }, { status: 400 }),
+  });
+  await assert.rejects(() => longDetail.listUsers(1), (error) => {
+    assert.match(error.message, /\.\.\. \(truncated\)$/);
+    assert.doesNotMatch(error.message, /TAIL-FAKE/);
+    assert.ok(error.message.length < 400, `error message is capped (${error.message.length} characters)`);
+    return true;
+  });
+
+  const emptyJson = new DatadogApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async () => jsonResponse({ unexpected: "shape" }, { status: 400 }),
+  });
+  await assert.rejects(() => emptyJson.listUsers(1), /JSON error body without a message \(\d+ characters\)/);
+
+  const resolved = resolveDatadogConfiguration(
+    { api_key: "arg-api-key-0123456789", app_key: "arg-app-key-0123456789", base_url: "https://svc:hunter2@api.datadoghq.eu/?token=abc#frag" },
+    {},
+    "/nonexistent-home",
+  );
+  assert.equal(resolved.baseUrl, "https://api.datadoghq.eu");
+});
+
+test("DatadogApiClient stops on a repeated cursor or repeated empty pages and reports why the listing is incomplete", async () => {
+  let stuckCalls = 0;
+  const stuck = new DatadogApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      stuckCalls += 1;
+      return jsonResponse({ data: [{ id: `sig-${stuckCalls}`, attributes: {} }], meta: { page: { after: "same-cursor" } } });
+    },
+  });
+  const repeated = await stuck.listSecuritySignals({ from: "now-7d", to: "now", limit: 50 });
+  assert.equal(repeated.items.length, 2);
+  assert.equal(repeated.truncated, true);
+  assert.match(repeated.truncationReason, /repeated the same page cursor/);
+  assert.equal(stuckCalls, 2, "the client stops as soon as the cursor repeats");
+
+  let emptyCalls = 0;
+  const empty = new DatadogApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      emptyCalls += 1;
+      return jsonResponse({ data: [], meta: { page: { after: `cursor-${emptyCalls}` } } });
+    },
+  });
+  const spun = await empty.listAuditEvents({ from: "now-7d", to: "now", limit: 50 });
+  assert.equal(spun.items.length, 0);
+  assert.equal(spun.truncated, true);
+  assert.match(spun.truncationReason, /5 consecutive empty pages arrived with a next-page cursor/);
+  assert.equal(emptyCalls, 5, "the client gives up after the configured number of empty pages");
+
+  let sparseCalls = 0;
+  const sparse = new DatadogApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      sparseCalls += 1;
+      if (sparseCalls === 2) return jsonResponse({ data: [], meta: { page: { after: "cursor-2" } } });
+      if (sparseCalls === 3) return jsonResponse({ data: [{ id: "e3", attributes: {} }], meta: { page: {} } });
+      return jsonResponse({ data: [{ id: "e1", attributes: {} }], meta: { page: { after: "cursor-1" } } });
+    },
+  });
+  const tolerated = await sparse.listAuditEvents({ from: "now-7d", to: "now", limit: 50 });
+  assert.deepEqual(tolerated.items.map((item) => item.id), ["e1", "e3"]);
+  assert.equal(tolerated.truncated, false, "a single empty page between two populated pages is followed, not treated as the end");
+
+  let postureCalls = 0;
+  const posture = new DatadogApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      postureCalls += 1;
+      return jsonResponse({ data: [{ id: `f${postureCalls}` }], meta: { page: { cursor: "same-cursor" } } });
+    },
+  });
+  const findings = await posture.listPostureFindings({ evaluation: "fail", limit: 100 });
+  assert.equal(findings.truncated, true);
+  assert.equal(findings.seen, 2);
+  assert.equal(findings.total_filtered_count, null);
+  assert.match(findings.truncation_reason, /repeated the same page cursor/);
+
+  let emptyPostureCalls = 0;
+  const emptyPosture = new DatadogApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      emptyPostureCalls += 1;
+      return jsonResponse({ data: [], meta: { page: { cursor: `cursor-${emptyPostureCalls}` } } });
+    },
+  });
+  const spunPosture = await emptyPosture.listPostureFindings({ evaluation: "pass", limit: 100 });
+  assert.equal(spunPosture.truncated, true);
+  assert.match(spunPosture.truncation_reason, /5 consecutive empty pages/);
+  assert.equal(emptyPostureCalls, 5);
+
+  const seen = [];
+  const keys = new DatadogApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      seen.push(url);
+      const page = Number(url.searchParams.get("page[number]"));
+      const size = Number(url.searchParams.get("page[size]"));
+      return jsonResponse({ data: fill(size, (index) => ({ id: `ak-${page * size + index}`, attributes: { last4: "0000" } })) });
+    },
+  });
+  const currentUserKeys = await keys.listCurrentUserApplicationKeys(250);
+  assert.equal(currentUserKeys.items.length, 250);
+  assert.equal(currentUserKeys.truncated, true, "a full last page under the cap without a total is reported as truncated");
+  assert.deepEqual(seen.map((url) => url.pathname), Array(3).fill("/api/v2/current_user/application_keys"));
+  assert.deepEqual(seen.map((url) => url.searchParams.get("page[number]")), ["0", "1", "2"]);
+});
+
+// Fake credential material planted in every collected surface. Each value must be absent from every bundle file and
+// zip entry: keys through the key projection, cloud credentials through the integration projection, signal, audit,
+// monitor, dashboard, and posture payloads through their projections, and the verbatim configuration exports
+// (organization, org configs, pipelines, archives, scanner, rules) through the credential-key redactor.
+const DATADOG_FAKE_SECRETS = [
+  "dd-api-key-value-FAKE0001",
+  "dd-app-key-value-FAKE0002",
+  "AKIAFAKEACCESSKEY0003",
+  "aws-secret-access-key-FAKE0004",
+  "gcp-private-key-FAKE0005",
+  "azure-client-secret-FAKE0006",
+  "signal-authorization-header-FAKE0007",
+  "audit-request-header-FAKE0008",
+  "org-setting-token-FAKE0009",
+  "pipeline-processor-token-FAKE0010",
+  "archive-secret-FAKE0011",
+  "scanner-api-key-FAKE0012",
+  "org-config-value-FAKE0013",
+  "monitor-query-secret-FAKE0014",
+  "dashboard-url-secret-FAKE0015",
+  "posture-resource-secret-FAKE0016",
+  "rule-signing-secret-FAKE0017",
+  "index-webhook-secret-FAKE0018",
+];
+
+function leakyClient() {
+  const organization = healthyOrganization();
+  organization.settings.saml_idp_endpoint = "https://idp.example.com/sso?token=org-setting-token-FAKE0009";
+  const scanner = healthySensitiveDataScanner();
+  scanner.included[0].attributes.api_key = "scanner-api-key-FAKE0012";
+  return healthyClient({
+    async getOrganization() {
+      return organization;
+    },
+    async listOrgConfigs() {
+      return [
+        { id: "monitor_timezone", type: "org_configs", attributes: { name: "monitor_timezone", value: "UTC" } },
+        { id: "api_token", type: "org_configs", attributes: { name: "api_token", value: "org-config-value-FAKE0013" } },
+      ];
+    },
+    async listApiKeys() {
+      return [{ id: "key-1", type: "api_keys", attributes: { name: "prod-agent", key: "dd-api-key-value-FAKE0001", last4: "0001", created_at: daysAgo(10), date_last_used: daysAgo(1) } }];
+    },
+    async listApplicationKeys() {
+      const keys = healthyApplicationKeys();
+      keys.data[0].attributes.key = "dd-app-key-value-FAKE0002";
+      return keys;
+    },
+    async listAwsIntegrations() {
+      return [{ account_id: "123456789012", access_key_id: "AKIAFAKEACCESSKEY0003", secret_access_key: "aws-secret-access-key-FAKE0004", cspm_resource_collection_enabled: true }];
+    },
+    async listGcpIntegrations() {
+      return [{ project_id: "p1", client_email: "dd@p1.iam.gserviceaccount.com", private_key: "gcp-private-key-FAKE0005", is_cspm_enabled: true }];
+    },
+    async listAzureIntegrations() {
+      return [{ tenant_name: "t1", client_id: "cid", client_secret: "azure-client-secret-FAKE0006", cspm_enabled: true }];
+    },
+    async listSecurityRules() {
+      const rules = await healthyClient().listSecurityRules();
+      rules[0].options = { signing_secret: "rule-signing-secret-FAKE0017", evaluationWindow: 300 };
+      return rules;
+    },
+    async listSecuritySignals() {
+      return [{
+        id: "sig-1",
+        type: "signal",
+        attributes: {
+          timestamp: hoursAgo(1),
+          message: "Brute force",
+          attributes: { status: "high", workflow: { triage: { state: "open" } }, custom: { request: { headers: { authorization: "signal-authorization-header-FAKE0007" } } } },
+        },
+      }];
+    },
+    async listPostureFindings(options = {}) {
+      return {
+        data: [{ id: "f1", attributes: { evaluation: options.evaluation, resource_configuration: { policy: "posture-resource-secret-FAKE0016" } } }],
+        total_filtered_count: options.evaluation === "fail" ? 10 : 90,
+      };
+    },
+    async listAuditEvents(options = {}) {
+      const headers = { cookie: "audit-request-header-FAKE0008" };
+      if (options.sort === "timestamp") {
+        return [{ id: "evt-old", type: "audit", attributes: { timestamp: daysAgo(100), service: "audit", attributes: { http: { request: { headers } } } } }];
+      }
+      return [{ id: "evt-1", type: "audit", attributes: { timestamp: hoursAgo(2), attributes: { http: { request: { headers } } } } }];
+    },
+    async listLogPipelines() {
+      return [{ id: "p1", name: "cloudtrail", is_enabled: true, filter: { query: "source:cloudtrail" }, processors: [{ type: "lookup-processor", api_token: "pipeline-processor-token-FAKE0010" }] }];
+    },
+    async listLogIndexes() {
+      return [{ name: "main", num_retention_days: 30, exclusion_filters: [], daily_limit_reset: { webhook_secret: "index-webhook-secret-FAKE0018" } }];
+    },
+    async listLogArchives() {
+      return [{ id: "a1", type: "archives", attributes: { name: "s3-archive", state: "WORKING", destination: { type: "s3", integration: { account_id: "123456789012", secret_access_key: "archive-secret-FAKE0011" } } } }];
+    },
+    async getSensitiveDataScannerConfig() {
+      return scanner;
+    },
+    async listDashboards() {
+      return [{ id: "d1", title: "Shared", url: "https://app.datadoghq.com/dashboard/d1?token=dashboard-url-secret-FAKE0015", author_handle: "alice@acme.example" }];
+    },
+    async listMonitors() {
+      return [{ id: 1, name: "Security: root login", tags: ["team:security"], priority: 1, message: "@pagerduty-security", query: "logs(\"monitor-query-secret-FAKE0014\")" }];
+    },
+  });
+}
+
+test("exportDatadogAuditBundle never writes credential material from any collected surface into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-datadog-export-secrets-");
+  const config = sampleConfig();
+  const result = await exportDatadogAuditBundle(leakyClient(), config, base, { now: NOW });
+  assert.equal(result.findingCount, 20);
+
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.size >= 35, `bundle has ${files.size} files`);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(entries.size >= 35, `zip has ${entries.size} entries`);
+  const secrets = [...DATADOG_FAKE_SECRETS, config.apiKey, config.appKey];
+  assertSecretsAbsent(assert, files, secrets, "bundle file");
+  assertSecretsAbsent(assert, entries, secrets, "zip entry");
+
+  const apiKeys = JSON.parse(files.get("core_data/api_keys.json"));
+  assert.equal(apiKeys[0].attributes.key, undefined);
+  assert.equal(apiKeys[0].attributes.last4, "0001");
+  const cloud = JSON.parse(files.get("core_data/cloud_integrations.json"));
+  assert.equal(cloud.aws[0].authentication, "access_key");
+  assert.deepEqual(cloud.aws[0].credential_fields_dropped, ["access_key_id", "secret_access_key"]);
+  assert.deepEqual(cloud.gcp[0].credential_fields_dropped, ["private_key"]);
+  assert.deepEqual(cloud.azure[0].credential_fields_dropped, ["client_secret"]);
+  const signals = JSON.parse(files.get("core_data/security_signals.json"));
+  assert.equal(signals[0].attributes.attributes.custom, undefined);
+  assert.equal(signals[0].attributes.attributes.workflow.triage.state, "open");
+  const organization = JSON.parse(files.get("core_data/organization.json"));
+  assert.equal(organization.settings.saml_idp_endpoint, "https://idp.example.com");
+  const orgConfigs = JSON.parse(files.get("core_data/org_configs.json"));
+  assert.equal(orgConfigs[1].attributes.value, "[REDACTED]");
+  assert.equal(orgConfigs[0].attributes.value, "UTC");
+  const rules = JSON.parse(files.get("core_data/security_rules.json"));
+  assert.equal(rules[0].options.signing_secret, "[REDACTED]");
+  assert.equal(rules[0].options.evaluationWindow, 300);
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  const integrations = findings.find((item) => item.id === "DD-18");
+  assert.deepEqual(integrations.evidence.aws_accounts_with_static_key_authentication, ["123456789012"]);
+  assert.match(integrations.summary, /1 AWS integrations authenticate with static access keys/);
+  assert.equal(findings.find((item) => item.id === "DD-12").status, "pass");
+});
+
+test("exportDatadogAuditBundle writes collection_status.json with readable, complete, seen, and total for every inventory", async () => {
+  const base = createTempBase("grclanker-datadog-export-status-");
+  const result = await exportDatadogAuditBundle(healthyClient({
+    async listUsers(limit) {
+      return fill(limit, (index) => user(`u${index}`));
+    },
+    async listOrgConnections(limit) {
+      // The client stopped under the probe limit on its own (a stuck cursor, say) and reported the server total.
+      return { items: fill(Math.min(limit, 10000), (index) => ({ id: `c${index}`, attributes: { connection_types: ["logs"] } })), truncated: true, total: 12000 };
+    },
+    async getIpAllowlist() {
+      throw forbidden("/api/v2/ip_allowlist");
+    },
+    async listPostureFindings(options = {}) {
+      return options.evaluation === "fail"
+        ? { data: fill(3, (index) => ({ id: `f${index}` })), total_filtered_count: null, truncated: true, truncation_reason: "the server repeated the same page cursor", seen: 3 }
+        : { data: [], total_filtered_count: 90 };
+    },
+  }), sampleConfig(), base, { now: NOW, userLimit: 50 });
+
+  const status = JSON.parse(readFileSync(join(result.outputDir, "core_data", "collection_status.json"), "utf8"));
+  const byInventory = new Map(status.map((row) => [row.inventory, row]));
+  assert.equal(byInventory.size, 23);
+  assert.ok([...byInventory.values()].every((row) => typeof row.readable === "boolean" && typeof row.complete === "boolean" && row.endpoint && row.permission));
+
+  const users = byInventory.get("users");
+  assert.equal(users.readable, true);
+  assert.equal(users.complete, false);
+  assert.equal(users.truncated, true);
+  assert.equal(users.seen, 50);
+  assert.equal(users.total, null);
+  assert.equal(users.limit, 50);
+  assert.match(users.truncation_reason, /more than 50 items exist/);
+
+  const connections = byInventory.get("org_connections");
+  assert.equal(connections.complete, false);
+  assert.equal(connections.seen, 10000);
+  assert.equal(connections.total, 12000);
+
+  const allowlist = byInventory.get("ip_allowlist");
+  assert.equal(allowlist.readable, false);
+  assert.equal(allowlist.complete, false);
+  assert.match(allowlist.error, /403 Forbidden/);
+
+  const failing = byInventory.get("posture_findings_fail");
+  assert.equal(failing.complete, false);
+  assert.equal(failing.seen, 3);
+  assert.equal(failing.total, null);
+  assert.match(failing.truncation_reason, /repeated the same page cursor/);
+  const passing = byInventory.get("posture_findings_pass");
+  assert.equal(passing.complete, true);
+  assert.equal(passing.total, 90);
+
+  const roles = byInventory.get("roles");
+  assert.deepEqual([roles.readable, roles.complete, roles.seen, roles.total], [true, true, 4, 4]);
+
+  const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /users: inventory truncated at 50 items \(50 of an unknown total loaded; more than 50 items exist\); raise user_limit to inspect the full list/);
+  assert.match(errorLog, /org_connections: inventory truncated at 10000 items \(10000 of 12000 loaded; the listing stopped early\); raise the org connection limit/);
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.find((item) => item.id === "DD-12").status, "warn");
+  assert.match(findings.find((item) => item.id === "DD-12").summary, /paged counts hit the finding_limit/);
+  const orgSettings = findings.find((item) => item.id === "DD-20");
+  assert.equal(orgSettings.status, "warn");
+  // DD-20 already warns on the readable inventories, so the truncation caveat is recorded in evidence rather than re-demoting the verdict.
+  assert.match(orgSettings.evidence.verdict_caveats.join(" "), /org_connections inventory is truncated at 10000 items \(10000 of 12000 loaded; raise the org connection limit\)/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
