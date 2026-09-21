@@ -1327,8 +1327,13 @@ test("exportElasticAuditBundle records partial failures in _errors.log and still
   assert.equal(findings.find((item) => item.id === "ELASTIC-15").status, "manual");
   const certificates = JSON.parse(readFileSync(join(result.outputDir, "core_data", "ssl_certificates.json"), "utf8"));
   assert.match(certificates.error, /403/);
+  assert.equal(certificates.collected, false);
+  assert.equal(certificates.status, 403);
   const spaces = JSON.parse(readFileSync(join(result.outputDir, "core_data", "kibana_spaces.json"), "utf8"));
-  assert.equal(spaces.skipped, "KIBANA_URL is not configured");
+  assert.equal(spaces.collected, false);
+  assert.equal(spaces.status, "not-collected");
+  assert.equal(spaces.reason, "not_configured");
+  assert.equal(spaces.error, "KIBANA_URL is not configured");
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
   assert.match(summary, /Collection errors: 2 \(see _errors.log\)/);
 

@@ -72,9 +72,13 @@ const REQUIRED_CLUSTER_PRIVILEGES = [
   "manage_slm",
   "monitor_watcher",
 ];
-const SECRET_KEY_PATTERN = /^(password|passwd|secret|client_secret|secret_key|secure_key|access_key|secret_access_key|api_key|apikey|token|access_token|refresh_token|bearer_token|private_key|bind_password|credential|credentials|authorization)$/i;
-const SECRET_KEY_SUFFIX_PATTERN = /(?:^|[._-])(?:password|passwd|secret|token|api_?key|private_?key|credentials?)$/i;
-const SECRET_FIELD_NAME_PATTERN = /(password|passwd|secret|token|api[_-]?key|authorization|private[_-]?key|credential)/i;
+const SECRET_KEY_PATTERN = /^(password|passwd|secret|secrets|client_secret|secret_key|secure_key|access_key|secret_access_key|api_key|apikey|token|tokens|access_token|refresh_token|bearer_token|private_key|bind_password|credential|credentials|authorization|cookie|set-cookie|session_token|service_token|passphrase|keystore_password|truststore_password)$/i;
+const SECRET_KEY_SUFFIX_PATTERN = /(?:^|[._-]|[a-z0-9])(?:password|passwd|passphrase|secrets?|tokens?|api[_-]?keys?|private[_-]?keys?|credentials?)$/i;
+const SECRET_FIELD_NAME_PATTERN = /(password|passwd|secret|token|api[_-]?key|authorization|private[_-]?key|credential|passphrase)/i;
+const TOKEN_LITERAL_PATTERN = /^(?:[A-Za-z0-9+/=_-]{32,})$/;
+const MAX_REDACTION_DEPTH = 32;
+const REDACTED = "[REDACTED]";
+const MAX_ERROR_DETAIL_CHARS = 240;
 
 export type ElasticFrameworkKey = "fedramp" | "cmmc" | "soc2" | "cis" | "pci-dss" | "stig" | "irap" | "ismap";
 
@@ -184,7 +188,14 @@ export interface ElasticAccessSurface {
   target: ElasticTarget;
   endpoint: string;
   status: "readable" | "not_readable" | "not_configured";
-  count?: number;
+  /** True only when the request was made and answered with a readable payload. */
+  collected: boolean;
+  /** HTTP status observed on a failing request; null when the surface was read, skipped, or failed before a response. */
+  http_status: number | null;
+  /** Record count of the readable payload; null when the surface was not collected. */
+  count: number | null;
+  /** Whether the readable listing was cut short; null when the surface was not collected or is not paged. */
+  truncated: boolean | null;
   error?: string;
 }
 
@@ -196,8 +207,10 @@ export interface ElasticAccessCheckResult {
   authenticatedAs?: string;
   authenticationRealm?: string;
   surfaces: ElasticAccessSurface[];
-  missingClusterPrivileges: string[];
-  missingIndexPrivileges: string[];
+  /** Missing privileges from the has_privileges probe; null when the probe itself failed. */
+  missingClusterPrivileges: string[] | null;
+  missingIndexPrivileges: string[] | null;
+  privilegeProbe: "readable" | "not_readable" | "not_available";
   notes: string[];
   recommendedNextStep: string;
 }
@@ -217,7 +230,12 @@ export interface ElasticAssessmentResult {
   title: string;
   summary: JsonRecord;
   findings: ElasticFinding[];
+  /** Datasets whose read failed, each naming the endpoint and the observed error. */
   errors: string[];
+  /** Datasets that were never requested because their target is not configured. */
+  not_collected: string[];
+  /** Paged datasets whose collection stopped before the inventory was exhausted. */
+  truncated: string[];
 }
 
 export interface ElasticAuditBundleResult {
@@ -226,6 +244,10 @@ export interface ElasticAuditBundleResult {
   fileCount: number;
   findingCount: number;
   errorCount: number;
+  /** Paged datasets whose collection stopped before the inventory was exhausted. */
+  truncatedCount: number;
+  /** Datasets never requested because their target is not configured. */
+  notCollectedCount: number;
 }
 
 export interface ElasticPageInfo {
@@ -246,6 +268,8 @@ export interface ElasticDataset<T = unknown> {
   data?: T;
   page?: ElasticPageInfo;
   error?: string;
+  /** HTTP status observed on the failing request, when the failure was an HTTP response. */
+  status?: number;
   skipped?: string;
 }
 
@@ -383,6 +407,8 @@ function normalizeBaseUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl.trim());
   parsed.hash = "";
   parsed.search = "";
+  parsed.username = "";
+  parsed.password = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
 }
@@ -535,6 +561,35 @@ export function normalizeElasticApiKey(rawValue: string): string {
   return value;
 }
 
+/** Reduces every URL in the text to scheme and host, dropping userinfo, path, query, and fragment wherever it appears. */
+function scrubUrlsInText(text: string): string {
+  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)\]]+/gi, (match) => {
+    try {
+      const parsed = new URL(match);
+      const hadUserinfo = parsed.username.length > 0 || parsed.password.length > 0;
+      const hadDetail = parsed.search.length > 0 || parsed.hash.length > 0 || hadUserinfo;
+      return hadDetail ? `${parsed.protocol}//${parsed.host}${parsed.pathname}?${REDACTED}` : match;
+    } catch {
+      return REDACTED;
+    }
+  });
+}
+
+/**
+ * Configuration-independent scrub applied to every error string before it is
+ * recorded: authorization values, session and cookie values, JWT-shaped
+ * strings, credential-shaped key/value pairs, and URL userinfo and query strings
+ * anywhere in the text.
+ */
+export function scrubErrorText(text: string): string {
+  return scrubUrlsInText(text)
+    .replace(/\b(authorization|proxy-authorization)\b(\s*[:=]\s*)(?:apikey|basic|bearer|token|digest)?\s*[^\s,;"']+/gi, `$1$2${REDACTED}`)
+    .replace(/\b(bearer|basic|apikey)\s+[A-Za-z0-9+/=_.:-]{8,}/gi, `$1 ${REDACTED}`)
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, REDACTED)
+    .replace(/\b((?:set-)?cookie|session(?:[_-]?(?:id|token))?|sid|jsessionid|xsrf[_-]?token|csrf[_-]?token)(["']?\s*[:=]\s*["']?)([^"';,\s}]+)/gi, `$1$2${REDACTED}`)
+    .replace(/\b((?:api[_-]?key|x-api-key|access[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|private[_-]?key|credentials?)["']?\s*[:=]\s*["']?)([^"',;\s}]+)/gi, `$1${REDACTED}`);
+}
+
 export function redactSecrets(text: string, config: Pick<ElasticResolvedConfig, "apiKey" | "password" | "bearerToken" | "cloudApiKey" | "username">): string {
   let output = text;
   const secrets = [
@@ -543,34 +598,161 @@ export function redactSecrets(text: string, config: Pick<ElasticResolvedConfig, 
     config.bearerToken,
     config.cloudApiKey,
     config.username && config.password ? encodeBase64(`${config.username}:${config.password}`) : undefined,
+    config.apiKey ? decodeBase64(config.apiKey)?.split(":")[1] : undefined,
   ].filter((item): item is string => Boolean(item && item.length >= 4));
   for (const secret of secrets) {
-    output = output.split(secret).join("[REDACTED]");
+    output = output.split(secret).join(REDACTED);
   }
-  return output
-    .replace(/(authorization\s*[:=]\s*)(?:apikey|basic|bearer)\s+\S+/gi, "$1[REDACTED]")
-    .replace(/((?:api[_-]?key|password|secret|token)["']?\s*[:=]\s*["']?)([^"',\s}]+)/gi, "$1[REDACTED]");
+  return scrubErrorText(output);
 }
 
 function isSecretKey(key: string, parentKey: string | undefined): boolean {
   const segments = key.split(".");
   const last = segments[segments.length - 1] ?? key;
+  if (/^(is|has)_/i.test(last)) return false;
   if (SECRET_KEY_PATTERN.test(last) || SECRET_KEY_SUFFIX_PATTERN.test(last)) return true;
-  return /^key$/i.test(last) && /^ssl$/i.test(parentKey ?? segments[segments.length - 2] ?? "");
+  return /^key$/i.test(last) && /^(ssl|tls|keystore|secrets)$/i.test(parentKey ?? segments[segments.length - 2] ?? "");
+}
+
+function isRedactableValue(value: unknown): boolean {
+  return value !== null && value !== undefined && typeof value !== "boolean";
 }
 
 export function redactSensitiveValues(value: unknown, depth = 0, parentKey?: string): unknown {
-  if (depth > 12) return value;
+  if (depth > MAX_REDACTION_DEPTH) {
+    return value !== null && typeof value === "object" ? `${REDACTED}: nesting deeper than ${MAX_REDACTION_DEPTH} levels` : value;
+  }
   if (Array.isArray(value)) return value.map((item) => redactSensitiveValues(item, depth + 1, parentKey));
   const object = asObject(value);
   if (!object) return value;
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
-    if (isSecretKey(key, parentKey) && (typeof entry === "string" || typeof entry === "number")) {
-      output[key] = "[REDACTED]";
+    if (isSecretKey(key, parentKey) && isRedactableValue(entry)) {
+      output[key] = REDACTED;
     } else {
       output[key] = redactSensitiveValues(entry, depth + 1, key);
     }
+  }
+  return output;
+}
+
+/** Keeps only scheme and host of a URL-shaped value so paths and query strings carrying tokens never reach the bundle. */
+function reduceUrlToOrigin(value: unknown): unknown {
+  if (typeof value !== "string" || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+const CONNECTOR_URL_KEYS = ["url", "webhookUrl", "apiUrl", "configUrl", "webhook_url", "api_url"];
+
+/** Projects a Kibana connector to its identity, type, and origin-only URL fields; secrets and headers are dropped. */
+function projectConnector(connector: JsonRecord): JsonRecord {
+  const config = asObject(connector.config) ?? {};
+  const projectedConfig: JsonRecord = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (CONNECTOR_URL_KEYS.includes(key)) {
+      projectedConfig[key] = reduceUrlToOrigin(value);
+    } else if (/^(headers|hasAuth|has_auth|authType|auth_type|method|from|service|host|port|secure|index|executionTimeField|apiProvider|defaultModel|isDeprecated|usesTableApi|createIncidentUrl|getIncidentUrl|updateIncidentUrl|viewIncidentUrl)$/i.test(key)) {
+      projectedConfig[key] = key.toLowerCase() === "headers" ? (asObject(value) ? Object.keys(asObject(value) ?? {}) : null) : /url$/i.test(key) ? reduceUrlToOrigin(value) : value;
+    } else if (typeof value === "boolean" || typeof value === "number") {
+      projectedConfig[key] = value;
+    }
+  }
+  return {
+    id: asString(connector.id) ?? null,
+    name: asString(connector.name) ?? null,
+    connector_type_id: asString(connector.connector_type_id) ?? asString(connector.actionTypeId) ?? null,
+    is_preconfigured: asBoolean(connector.is_preconfigured) ?? null,
+    is_deprecated: asBoolean(connector.is_deprecated) ?? null,
+    is_missing_secrets: asBoolean(connector.is_missing_secrets) ?? null,
+    is_system_action: asBoolean(connector.is_system_action) ?? null,
+    referenced_by_count: asNumber(connector.referenced_by_count) ?? null,
+    config: projectedConfig,
+  };
+}
+
+/** Projects a Watcher watch to the action shape needed for the transport check: scheme, host, port, method, and whether auth is embedded. */
+function projectWatch(watch: JsonRecord): JsonRecord {
+  const definition = asObject(watch.watch) ?? watch;
+  const actions: JsonRecord = {};
+  for (const [name, rawAction] of Object.entries(asObject(definition.actions) ?? {})) {
+    const action = asObject(rawAction) ?? {};
+    const projected: JsonRecord = { types: Object.keys(action) };
+    const webhook = asObject(action.webhook);
+    if (webhook) {
+      projected.webhook = {
+        scheme: asString(webhook.scheme) ?? null,
+        host: asString(webhook.host) ?? null,
+        port: asNumber(webhook.port) ?? null,
+        method: asString(webhook.method) ?? null,
+        path: webhook.path === undefined ? null : REDACTED,
+        params: webhook.params === undefined ? null : REDACTED,
+        headers: asObject(webhook.headers) ? Object.keys(asObject(webhook.headers) ?? {}) : null,
+        auth: asObject(webhook.auth) ? { types: Object.keys(asObject(webhook.auth) ?? {}), value: REDACTED } : null,
+        body: webhook.body === undefined ? null : REDACTED,
+      };
+    }
+    actions[name] = projected;
+  }
+  return {
+    _id: asString(watch._id) ?? null,
+    status: asObject(watch.status) ? { state: asObject(asObject(watch.status)?.state) ?? null } : null,
+    trigger: asObject(definition.trigger) ?? null,
+    action_count: Object.keys(actions).length,
+    actions,
+  };
+}
+
+/** Projects ingest pipeline processors to type, target field, and whether a set literal looks like a secret; literal values themselves are never copied. */
+function projectPipelineProcessors(processors: unknown): unknown {
+  if (!Array.isArray(processors)) return processors === undefined ? undefined : null;
+  return processors.map((processor) => {
+    const object = asObject(processor);
+    if (!object) return null;
+    const projected: JsonRecord = {};
+    for (const [type, rawConfig] of Object.entries(object)) {
+      const config = asObject(rawConfig) ?? {};
+      const entry: JsonRecord = {
+        field: asString(config.field) ?? null,
+        target_field: asString(config.target_field) ?? null,
+        ...(config.description !== undefined ? { description: asString(config.description) ?? null } : {}),
+        ...(config.if !== undefined ? { has_condition: true } : {}),
+        ...(config.ignore_failure !== undefined ? { ignore_failure: asBoolean(config.ignore_failure) ?? null } : {}),
+      };
+      if (type === "set") {
+        entry.value_is_template = typeof config.value === "string" && config.value.includes("{{");
+        entry.value_kind = config.value === undefined ? (config.copy_from !== undefined ? "copy_from" : null) : typeof config.value;
+        entry.sensitive_literal = setProcessorLooksSensitive(config);
+      }
+      if (type === "script") {
+        entry.lang = asString(config.lang) ?? null;
+        entry.source_present = config.source !== undefined;
+        entry.id = asString(config.id) ?? null;
+      }
+      if (type === "foreach" && config.processor !== undefined) entry.processor = asArray(projectPipelineProcessors([config.processor]))[0] ?? null;
+      if (config.on_failure !== undefined) entry.on_failure = projectPipelineProcessors(config.on_failure);
+      projected[type] = entry;
+    }
+    return projected;
+  });
+}
+
+/** Projects the ingest pipeline inventory so processor configuration literals never reach the bundle. */
+function projectPipelines(pipelines: JsonRecord): JsonRecord {
+  const output: JsonRecord = {};
+  for (const [name, value] of Object.entries(pipelines)) {
+    const entry = asObject(value) ?? {};
+    output[name] = {
+      description: asString(entry.description) ?? null,
+      version: asNumber(entry.version) ?? null,
+      _meta: asObject(entry._meta) ? { managed: asBoolean(asObject(entry._meta)?.managed) ?? null, managed_by: asString(asObject(entry._meta)?.managed_by) ?? null } : null,
+      processors: projectPipelineProcessors(entry.processors) ?? null,
+      on_failure: projectPipelineProcessors(entry.on_failure) ?? null,
+    };
   }
   return output;
 }
@@ -755,18 +937,39 @@ export class ElasticRequestError extends Error {
   }
 }
 
+/**
+ * Extracts only the documented error fields of the Elasticsearch, Kibana, and
+ * Elastic Cloud JSON error shapes; anything else in the body is never echoed.
+ */
 function elasticErrorSummary(payload: unknown): string | undefined {
   const object = asObject(payload);
   if (!object) return undefined;
   const error = asObject(object.error);
+  const cloudErrors = asObjectArray(object.errors).map((entry) => [asString(entry.code), asString(entry.message)].filter(Boolean).join(" ")).filter(Boolean);
   const candidates = [
     asString(error?.reason),
     asString(error?.type),
     asString(object.message),
     typeof object.error === "string" ? object.error : undefined,
+    cloudErrors.length > 0 ? cloudErrors.join("; ") : undefined,
     asString(object.statusCode) ? `statusCode ${asString(object.statusCode)}` : undefined,
   ];
-  return candidates.filter((item): item is string => Boolean(item)).join(": ") || undefined;
+  const summary = candidates.filter((item): item is string => Boolean(item)).join(": ");
+  if (!summary) return undefined;
+  return summary.length > MAX_ERROR_DETAIL_CHARS ? `${summary.slice(0, MAX_ERROR_DETAIL_CHARS)}… (truncated)` : summary;
+}
+
+function contentTypeLabel(response: Response): string {
+  const raw = response.headers.get("content-type");
+  return raw ? raw.split(";")[0].trim().toLowerCase() || "unknown content type" : "unknown content type";
+}
+
+/** Describes a body that is not a documented JSON error shape by status, media type, and length only. */
+function describeOpaqueBody(response: Response, rawText: string, parsedJson: boolean): string {
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  return parsedJson
+    ? `${response.status} ${response.statusText}: JSON body without a documented error field (${contentTypeLabel(response)}, ${bytes} bytes, not echoed)`
+    : `${response.status} ${response.statusText}: non-JSON body (${contentTypeLabel(response)}, ${bytes} bytes, not echoed)`;
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -887,18 +1090,26 @@ export class ElasticApiClient {
         }
         const rawText = await response.text();
         let payload: unknown = {};
+        let parsedJson = true;
         if (rawText.length > 0) {
           try {
             payload = JSON.parse(rawText);
           } catch {
-            payload = { message: rawText.slice(0, 240) };
+            parsedJson = false;
           }
         }
         if (!response.ok) {
-          const detail = elasticErrorSummary(payload) ?? rawText.slice(0, 240);
+          const detail = (parsedJson ? elasticErrorSummary(payload) : undefined) ?? describeOpaqueBody(response, rawText, parsedJson);
+          throw new ElasticRequestError(
+            redactSecrets(`${target} request ${method} ${path} failed (${response.status} ${response.statusText}): ${detail}`, this.config),
+            response.status,
+            target,
+          );
+        }
+        if (!parsedJson) {
           throw new ElasticRequestError(
             redactSecrets(
-              `${target} request ${method} ${path} failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+              `${target} request ${method} ${path} returned a ${describeOpaqueBody(response, rawText, false)}; the endpoint is not serving the JSON API`,
               this.config,
             ),
             response.status,
@@ -1024,6 +1235,7 @@ export class ElasticApiClient {
     let total: number | undefined;
     let pages = 0;
     let exhausted = false;
+    let cursorMissing = false;
     while (items.length < maxItems) {
       const payload = asObject(await this.esPost("/_security/_query/api_key", {
         size,
@@ -1034,14 +1246,20 @@ export class ElasticApiClient {
       const pageItems = asObjectArray(payload.api_keys);
       items.push(...pageItems.slice(0, maxItems - items.length));
       total = asNumber(payload.total) ?? total;
-      const last = pageItems[pageItems.length - 1];
-      searchAfter = last ? asArray(last._sort) : undefined;
-      if (pageItems.length < size || !searchAfter || searchAfter.length === 0 || (total !== undefined && items.length >= total)) {
+      if (pageItems.length < size || (total !== undefined && items.length >= total)) {
         exhausted = true;
         break;
       }
+      const last = pageItems[pageItems.length - 1];
+      searchAfter = last ? asArray(last._sort) : undefined;
+      if (!searchAfter || searchAfter.length === 0) {
+        // A full page without a search_after cursor cannot be continued, so the remainder is unknown.
+        cursorMissing = true;
+        break;
+      }
     }
-    return pagedList(items, total, pages, exhausted);
+    const page = pagedList(items, total, pages, exhausted);
+    return cursorMissing ? { ...page, truncated: true } : page;
   }
 
   async getIlmStatus(): Promise<JsonRecord> {
@@ -1105,8 +1323,11 @@ export class ElasticApiClient {
     return this.listKibanaPages("/api/fleet/agent_policies", { perPageParam: "perPage", itemsKey: "items", limit });
   }
 
-  async listFleetOutputs(): Promise<JsonRecord[]> {
-    return asObjectArray(asObject(await this.kibanaGet("/api/fleet/outputs"))?.items);
+  async listFleetOutputs(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
+    const cap = clampNumber(limit, DEFAULT_KIBANA_LIMIT, 1, 10_000);
+    const payload = asObject(await this.kibanaGet("/api/fleet/outputs")) ?? {};
+    const outputs = asObjectArray(payload.items);
+    return pagedList(outputs.slice(0, cap), asNumber(payload.total) ?? outputs.length, 1, outputs.length <= cap);
   }
 
   async listEnrollmentApiKeys(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
@@ -1240,7 +1461,7 @@ const DATASET_SPECS: Record<ElasticDatasetName, DatasetSpec> = {
   kibana_spaces: { name: "kibana_spaces", target: "kibana", endpoint: "GET /api/spaces/space", load: (client) => requireMethod(client, "listSpaces")() },
   kibana_roles: { name: "kibana_roles", target: "kibana", endpoint: "GET /api/security/role", load: (client) => requireMethod(client, "listKibanaRoles")() },
   fleet_agent_policies: { name: "fleet_agent_policies", target: "kibana", endpoint: "GET /api/fleet/agent_policies", load: (client, options) => requireMethod(client, "listAgentPolicies")(options.kibanaLimit) },
-  fleet_outputs: { name: "fleet_outputs", target: "kibana", endpoint: "GET /api/fleet/outputs", load: (client) => requireMethod(client, "listFleetOutputs")() },
+  fleet_outputs: { name: "fleet_outputs", target: "kibana", endpoint: "GET /api/fleet/outputs", load: (client, options) => requireMethod(client, "listFleetOutputs")(options.kibanaLimit) },
   fleet_enrollment_api_keys: { name: "fleet_enrollment_api_keys", target: "kibana", endpoint: "GET /api/fleet/enrollment_api_keys", load: (client, options) => requireMethod(client, "listEnrollmentApiKeys")(options.kibanaLimit) },
   fleet_server_hosts: { name: "fleet_server_hosts", target: "kibana", endpoint: "GET /api/fleet/fleet_server_hosts", load: (client, options) => requireMethod(client, "listFleetServerHosts")(options.kibanaLimit) },
   detection_rules: { name: "detection_rules", target: "kibana", endpoint: "GET /api/detection_engine/rules/_find", load: (client, options) => requireMethod(client, "listDetectionRules")(options.kibanaLimit) },
@@ -1321,7 +1542,7 @@ export async function collectElasticSnapshot(
         name,
         target: spec.target,
         endpoint: spec.endpoint,
-        data: redactSensitiveValues(paged ? paged.items : loaded),
+        data: redactSensitiveValues(projectDataset(name, paged ? paged.items : loaded)),
         ...(paged ? { page: { seen: paged.seen, total: paged.total, truncated: paged.truncated, pages: paged.pages } } : {}),
       };
     } catch (error) {
@@ -1330,16 +1551,47 @@ export async function collectElasticSnapshot(
         target: spec.target,
         endpoint: spec.endpoint,
         error: redactSecrets(errorMessage(error), config),
+        ...(error instanceof ElasticRequestError ? { status: error.status } : {}),
       };
     }
   }));
   return snapshot;
 }
 
+/** Applies the per-dataset projection that drops free-form configuration before anything is stored or assessed. */
+function projectDataset(name: ElasticDatasetName, data: unknown): unknown {
+  switch (name) {
+    case "connectors":
+      return asObjectArray(data).map(projectConnector);
+    case "watches":
+      return asObjectArray(data).map(projectWatch);
+    case "ingest_pipelines": {
+      const pipelines = asObject(data);
+      return pipelines ? projectPipelines(pipelines) : data;
+    }
+    default:
+      return data;
+  }
+}
+
 export function listSnapshotErrors(snapshot: ElasticSnapshot): string[] {
   return Object.values(snapshot)
     .filter((dataset): dataset is ElasticDataset => Boolean(dataset?.error))
     .map((dataset) => `${dataset.name} (${dataset.endpoint}): ${dataset.error}`);
+}
+
+/** Lists datasets that were never requested because their target (Kibana or Elastic Cloud) is not configured. */
+export function listSnapshotSkips(snapshot: ElasticSnapshot): string[] {
+  return Object.values(snapshot)
+    .filter((dataset): dataset is ElasticDataset => Boolean(dataset?.skipped))
+    .map((dataset) => `${dataset.name} (${dataset.endpoint}): not requested, ${dataset.skipped}`);
+}
+
+/** Lists paged datasets whose collection stopped before the inventory was exhausted. */
+export function listSnapshotTruncations(snapshot: ElasticSnapshot): string[] {
+  return Object.values(snapshot)
+    .filter((dataset): dataset is ElasticDataset => Boolean(dataset && dataset.error === undefined && dataset.skipped === undefined && dataset.page?.truncated))
+    .map((dataset) => `${dataset.name} (${dataset.endpoint}): truncated after ${dataset.page?.seen} of ${dataset.page?.total ?? "an unknown total"} across ${dataset.page?.pages} page(s)`);
 }
 
 function datasetData<T = unknown>(snapshot: ElasticSnapshot, name: ElasticDatasetName): T | undefined {
@@ -1383,8 +1635,12 @@ function emptyInventoryProblem(snapshot: ElasticSnapshot, name: ElasticDatasetNa
 }
 
 interface VerdictGuard {
+  /** Essential inventories that could not be read; the verdict becomes manual. */
   problems: string[];
+  /** Inventories read only partially (truncated, capped, or single-node views); the verdict is capped at warn. */
   partial: string[];
+  /** Secondary inventories that could not be read but are not essential; the verdict is capped at warn and the summary names them. */
+  unchecked?: string[];
   collect: string;
 }
 
@@ -1400,13 +1656,15 @@ function guardedFinding(
   computed: Verdict,
   guard: VerdictGuard,
 ): ElasticFinding {
+  const unchecked = guard.unchecked ?? [];
   const evidence: JsonRecord = {
     ...(computed.evidence ?? {}),
     unreadable_sources: guard.problems,
     partial_sources: guard.partial,
+    unchecked_sources: unchecked,
   };
   if (computed.status === "fail") {
-    const notes = [...guard.problems, ...guard.partial];
+    const notes = [...guard.problems, ...guard.partial, ...unchecked];
     return finding(number, severity, "fail", notes.length > 0 ? `${computed.summary} Additional sources were unreadable or partial: ${notes.join("; ")}.` : computed.summary, evidence);
   }
   if (guard.problems.length > 0) {
@@ -1418,16 +1676,70 @@ function guardedFinding(
       evidence,
     );
   }
-  if (guard.partial.length > 0) {
+  if (guard.partial.length > 0 || unchecked.length > 0) {
+    const reasons = [
+      ...(guard.partial.length > 0 ? [`the inventory is partial: ${guard.partial.join("; ")}`] : []),
+      ...(unchecked.length > 0 ? [`these inventories were not checked because they could not be read: ${unchecked.join("; ")}`] : []),
+    ];
     return finding(
       number,
       severity,
       computed.status === "manual" ? "manual" : "warn",
-      `${computed.summary} Verdict is capped at warn because the inventory is partial: ${guard.partial.join("; ")}.`,
+      `${computed.summary} Verdict is capped at warn because ${reasons.join(", and ")}.`,
       evidence,
     );
   }
   return finding(number, severity, computed.status, computed.summary, evidence);
+}
+
+/** Lists the unreadable datasets among the supplied secondaries so a finding can name what it did not check. */
+function uncheckedSources(snapshot: ElasticSnapshot, names: ElasticDatasetName[]): string[] {
+  return dependencyProblems(snapshot, names);
+}
+
+function datasetReadable(snapshot: ElasticSnapshot, name: ElasticDatasetName): boolean {
+  const dataset = snapshot[name];
+  return Boolean(dataset && dataset.error === undefined && dataset.skipped === undefined);
+}
+
+/** True only when the dataset was read and its pagination (if any) ran to completion. */
+function datasetComplete(snapshot: ElasticSnapshot, name: ElasticDatasetName): boolean {
+  return datasetReadable(snapshot, name) && datasetPage(snapshot, name)?.truncated !== true;
+}
+
+/** Renders a value only when the inventory it derives from was read; otherwise null so unread never looks like zero or empty. */
+function whenRead<T>(readable: boolean, value: T): T | null {
+  return readable ? value : null;
+}
+
+/** Renders a count from an inventory that was read; unread inventories render null rather than 0. */
+function countWhenRead(readable: boolean, count: number): number | null {
+  return readable ? count : null;
+}
+
+/**
+ * Renders a list of named principals (users, keys, roles, policies) only when
+ * the inventory proving the property was read completely; denied or partial
+ * sets render null so no principal is asserted as violating or compliant
+ * from data that was not fully seen.
+ */
+function principalsWhenComplete<T>(complete: boolean, items: T[], cap = 25): T[] | null {
+  return complete ? items.slice(0, cap) : null;
+}
+
+/** Describes what an inventory contributed: read completely, read partially, or not read at all. */
+function inventoryState(snapshot: ElasticSnapshot, name: ElasticDatasetName, seen: number | undefined, extraPartial = false): JsonRecord {
+  const readable = datasetReadable(snapshot, name);
+  const page = datasetPage(snapshot, name);
+  return {
+    dataset: name,
+    endpoint: DATASET_SPECS[name].endpoint,
+    read: readable,
+    complete: readable && page?.truncated !== true && !extraPartial,
+    seen: readable ? seen ?? page?.seen ?? null : null,
+    total: readable ? page?.total ?? seen ?? null : null,
+    status: readable ? "readable" : snapshot[name]?.skipped ? "not_configured" : "not_readable",
+  };
 }
 
 function nodeInventoryNotes(nodeSettings: JsonRecord | undefined): string[] {
@@ -1695,7 +2007,8 @@ export function evaluateElasticIdentity(
   const nodeSettings = datasetData<JsonRecord>(snapshot, "node_settings");
   const view = buildSettingsView(nodeSettings, datasetData<JsonRecord>(snapshot, "cluster_settings"));
   const usage = datasetData<JsonRecord>(snapshot, "xpack_usage");
-  const license = licenseState(datasetData<JsonRecord>(snapshot, "license"));
+  const licenseData = datasetData<JsonRecord>(snapshot, "license");
+  const license = licenseState(licenseData);
   const privileges = datasetData<JsonRecord>(snapshot, "privileges");
   const roles = datasetData<JsonRecord>(snapshot, "roles");
   const roleMappings = datasetData<JsonRecord>(snapshot, "role_mappings");
@@ -1704,6 +2017,11 @@ export function evaluateElasticIdentity(
   const settingsProblems = settingsDependencyProblems(snapshot, view);
   const nodeNotes = nodeInventoryNotes(nodeSettings);
   const security = securityEnabledState(view, usage);
+  const settingsReadable = settingsProblems.length === 0;
+  const usageReadable = usage !== undefined;
+  const usageUnchecked = uncheckedSources(snapshot, ["xpack_usage"]);
+  const rolesReadable = roles !== undefined;
+  const roleMappingsReadable = roleMappings !== undefined;
 
   const allRealms = parseRealms(view);
   const realms = allRealms.filter((realm) => realm.enabled);
@@ -1712,12 +2030,12 @@ export function evaluateElasticIdentity(
   const secureRealmTypes = [...realmTypes].filter((type) => SECURE_REALM_TYPES.has(type));
   const realmEvidence = allRealms.map((realm) => ({ type: realm.type, name: realm.name, order: realm.order ?? null, enabled: realm.enabled }));
   const realmCollect = "the xpack.security.authc.realms.* section of elasticsearch.yml from every node (including order and enabled flags), or the Elastic Cloud deployment security settings page.";
+  const usageTypesLabel = usageReadable ? (usageTypes.join(", ") || "none enabled") : "unread";
 
-  const realmsReadable = settingsProblems.length === 0;
   findings.push(guardedFinding(1, "high", {
     status: security.enabled === false
       ? "fail"
-      : !realmsReadable
+      : !settingsReadable
         ? "manual"
         : secureRealmTypes.length === 0
           ? "fail"
@@ -1726,30 +2044,45 @@ export function evaluateElasticIdentity(
             : "pass",
     summary: security.enabled === false
       ? `xpack.security.enabled is false${security.disabledNodes.length > 0 ? ` on ${security.disabledNodes.join(", ")}` : ""}, so no authentication realm is enforced.`
-      : !realmsReadable
-        ? `realm settings were not readable (usage statistics report realm types: ${usageTypes.join(", ") || "none"}).`
+      : !settingsReadable
+        ? `realm settings were not readable (usage statistics report realm types: ${usageTypesLabel}).`
         : secureRealmTypes.length === 0
           ? `Only native/file style realms are enabled (${[...realmTypes].join(", ") || "none configured, so the implicit native and file realms apply"}); no LDAP, Active Directory, PKI, SAML, Kerberos, OIDC, or JWT realm is enabled.`
           : security.enabled === undefined
           ? `Secure realms are enabled (${secureRealmTypes.join(", ")}) but xpack.security.enabled was not visible in settings or usage statistics, so enforcement could not be confirmed.`
-          : `Secure authentication realms are enabled beyond native/file: ${secureRealmTypes.join(", ")} (xpack.security.enabled confirmed true).`,
-    evidence: { realms: realmEvidence, usage_realm_types: usageTypes, secure_realm_types: secureRealmTypes, security_enabled: security.enabled ?? null },
-  }, { problems: settingsProblems, partial: nodeNotes, collect: realmCollect }));
+          : `Secure authentication realms are enabled beyond native/file: ${secureRealmTypes.join(", ")} (xpack.security.enabled confirmed true${usageReadable ? "; usage statistics agree" : ""}).`,
+    evidence: {
+      realms: whenRead(settingsReadable, realmEvidence),
+      usage_realm_types: whenRead(usageReadable, usageTypes),
+      secure_realm_types: whenRead(settingsReadable, secureRealmTypes),
+      security_enabled: security.enabled ?? null,
+      security_enabled_source: security.source,
+    },
+  }, { problems: settingsProblems, partial: nodeNotes, unchecked: usageUnchecked, collect: realmCollect }));
 
   const ssoRealms = realms.filter((realm) => SSO_REALM_TYPES.has(realm.type));
   const usageSso = usageTypes.filter((type) => SSO_REALM_TYPES.has(type));
   const ssoCollect = "the SAML or OIDC realm settings (attributes.principal, attributes.groups, claims.principal, claims.groups, authorization_realms), the role mappings that assign roles to SSO users (GET /_security/role_mapping), and the identity provider integration evidence.";
-  if (settingsProblems.length > 0) {
-    findings.push(manualFinding(13, "medium", `SSO realm settings could not be read: ${settingsProblems.join("; ")}.`, ssoCollect, { unreadable_sources: settingsProblems }));
+  if (!settingsReadable) {
+    findings.push(manualFinding(13, "medium", `SSO realm settings could not be read: ${settingsProblems.join("; ")}.`, ssoCollect, {
+      sso_realms: null,
+      usage_sso_realm_types: whenRead(usageReadable, usageSso),
+      role_mapping_count: countWhenRead(roleMappingsReadable, Object.keys(roleMappings ?? {}).length),
+      unreadable_sources: settingsProblems,
+      partial_sources: nodeNotes,
+      unchecked_sources: usageUnchecked,
+    }));
   } else if (ssoRealms.length === 0) {
     findings.push(manualFinding(
       13,
       "medium",
       usageSso.length > 0
         ? `Not applicable from settings: no enabled SAML or OIDC realm is configured on the inspected nodes, although usage statistics report ${usageSso.join(", ")} realms.`
-        : "Not applicable: no SAML or OIDC realm is enabled, so SSO attribute mapping and role assignment are scoped out of the API assessment.",
+        : usageReadable
+          ? "Not applicable: no SAML or OIDC realm is enabled, so SSO attribute mapping and role assignment are scoped out of the API assessment."
+          : `Not applicable from settings: no SAML or OIDC realm is enabled on the inspected nodes; usage statistics could not be read to cross-check (${usageUnchecked.join("; ")}).`,
       "confirmation that SSO is not required for this cluster, or the identity provider integration evidence if SSO is delivered outside Elasticsearch realms (for example Elastic Cloud SSO).",
-      { sso_realms: [], usage_sso_realm_types: usageSso, realms: realmEvidence },
+      { sso_realms: [], usage_sso_realm_types: whenRead(usageReadable, usageSso), realms: realmEvidence, unreadable_sources: [], partial_sources: nodeNotes, unchecked_sources: usageUnchecked },
     ));
   } else {
     const mappingEntries = Object.entries(roleMappings ?? {}).map(([name, value]) => ({ name, mapping: asObject(value) ?? {} }));
@@ -1767,12 +2100,12 @@ export function evaluateElasticIdentity(
         principal_attribute: principal ?? null,
         groups_attribute: groups ?? null,
         authorization_realms: authorizationRealms,
-        role_mappings: mappings,
-        has_role_assignment: mappings.length > 0 || authorizationRealms.length > 0,
+        role_mappings: whenRead(roleMappingsReadable, mappings),
+        has_role_assignment: roleMappingsReadable ? mappings.length > 0 || authorizationRealms.length > 0 : authorizationRealms.length > 0 ? true : null,
       };
     });
     const missingPrincipal = ssoEvidence.filter((entry) => !entry.principal_attribute);
-    const withoutRoles = roleMappings ? ssoEvidence.filter((entry) => !entry.has_role_assignment) : [];
+    const withoutRoles = roleMappingsReadable ? ssoEvidence.filter((entry) => entry.has_role_assignment === false) : [];
     const ssoLicense = licenseSupports(license, LICENSE_RANK.platinum);
     const ssoProblems = [...dependencyProblems(snapshot, ["role_mappings", "license"])];
     findings.push(guardedFinding(13, "medium", {
@@ -1790,9 +2123,14 @@ export function evaluateElasticIdentity(
             : missingPrincipal.length > 0
               ? `${missingPrincipal.length}/${ssoRealms.length} SSO realm(s) lack a principal attribute or claim: ${missingPrincipal.map((entry) => `${entry.type}.${entry.name}`).join(", ")}.`
               : ssoLicense === undefined || security.enabled === undefined
-                ? `${ssoRealms.length} SSO realm(s) define a principal attribute and role assignment, but ${ssoLicense === undefined ? `the license tier (${license.type ?? "unknown"}, status ${license.status ?? "unknown"}) could not be confirmed to include SSO` : "xpack.security.enabled was not visible"}, so enforcement is unconfirmed.`
+                ? `${ssoRealms.length} SSO realm(s) define a principal attribute and role assignment, but ${ssoLicense === undefined ? `the license tier (${license.type ?? "unread"}, status ${license.status ?? "unread"}) could not be confirmed to include SSO` : "xpack.security.enabled was not visible"}, so enforcement is unconfirmed.`
                 : `${ssoRealms.length} SSO realm(s) define a principal attribute and have enabled role mappings or authorization realms assigning roles (${mappingEntries.length} role mappings read; ${license.type} license supports SSO).`,
-      evidence: { sso_realms: ssoEvidence, role_mapping_count: mappingEntries.length, license_supports_sso: ssoLicense ?? null, security_enabled: security.enabled ?? null },
+      evidence: {
+        sso_realms: ssoEvidence,
+        role_mapping_count: countWhenRead(roleMappingsReadable, mappingEntries.length),
+        license_supports_sso: ssoLicense ?? null,
+        security_enabled: security.enabled ?? null,
+      },
     }, { problems: ssoProblems, partial: nodeNotes, collect: ssoCollect }));
   }
 
@@ -1801,9 +2139,10 @@ export function evaluateElasticIdentity(
   const anonymousAuthzException = asBoolean(view.get("xpack.security.authc.anonymous.authz_exception"));
   const usageAnonymous = usageFlag(usage, ["anonymous", "enabled"]);
   const anonymousEnabled = anonymousRoles.length > 0 || usageAnonymous === true;
-  const anonymousRoleDescriptors = anonymousRoles.map((name) => asObject(roles?.[name]) ?? {});
+  const anonymousRoleDescriptors = rolesReadable ? anonymousRoles.map((name) => asObject(roles?.[name]) ?? {}) : [];
   const broadAnonymous = anonymousRoles.includes("superuser")
     || anonymousRoleDescriptors.some((descriptor) => descriptorGrantsClusterAll(descriptor) || descriptorGrantsWildcardIndexAll(descriptor));
+  const anonymousRoleProblems = anonymousRoles.length > 0 && !rolesReadable ? dependencyProblems(snapshot, ["roles"]) : [];
   findings.push(guardedFinding(14, "high", {
     status: security.enabled === false || broadAnonymous
       ? "fail"
@@ -1818,27 +2157,38 @@ export function evaluateElasticIdentity(
           ? `Anonymous access is enabled with roles ${anonymousRoles.join(", ") || "(reported by usage statistics only)"}; confirm they only permit non-sensitive operations.`
           : security.enabled === undefined
             ? "No xpack.security.authc.anonymous.roles are configured, but xpack.security.enabled was not visible, so anonymous access could not be confirmed disabled."
-            : "Anonymous access is disabled: xpack.security.authc.anonymous.roles is unset on every inspected node and xpack.security.enabled is true (absence of anonymous roles is the compliant state for this control).",
+            : `Anonymous access is disabled: xpack.security.authc.anonymous.roles is unset on every inspected node and xpack.security.enabled is true${usageReadable ? " (usage statistics agree that anonymous access is disabled)" : ""}; absence of anonymous roles is the compliant state for this control.`,
     evidence: {
-      anonymous_enabled: anonymousEnabled,
-      anonymous_roles: anonymousRoles,
+      anonymous_enabled: whenRead(settingsReadable || usageAnonymous !== undefined, anonymousEnabled),
+      anonymous_roles: whenRead(settingsReadable, anonymousRoles),
+      anonymous_roles_grant_broad_access: settingsReadable && (anonymousRoles.length === 0 || rolesReadable) ? broadAnonymous : null,
       anonymous_username: anonymousUsername ?? null,
       anonymous_authz_exception: anonymousAuthzException ?? null,
       usage_anonymous_enabled: usageAnonymous ?? null,
       security_enabled: security.enabled ?? null,
     },
-  }, { problems: settingsProblems, partial: nodeNotes, collect: "the xpack.security.authc.anonymous.* settings and xpack.security.enabled from elasticsearch.yml on every node." }));
+  }, {
+    problems: [...settingsProblems, ...anonymousRoleProblems],
+    partial: nodeNotes,
+    unchecked: usageUnchecked,
+    collect: "the xpack.security.authc.anonymous.* settings and xpack.security.enabled from elasticsearch.yml on every node, plus the role definitions of any anonymous roles (GET /_security/role).",
+  }));
 
   const apiKeyPage = datasetPage(snapshot, "api_keys");
+  const apiKeysReadable = apiKeys !== undefined;
   const apiKeyVisibility = apiKeyInventoryVisibility(privileges);
   const apiKeyProblems = dependencyProblems(snapshot, ["api_keys", "privileges"]);
   const apiKeyPartial = [
     ...truncationNotes(snapshot, ["api_keys"]),
     ...(apiKeyVisibility === false
-      ? [`the credential lacks read_security, manage_api_key, and manage_security, so POST /_security/_query/api_key returns only its own keys (${apiKeys?.length ?? 0} seen of an unknown total)`]
+      ? [`the credential lacks read_security, manage_api_key, and manage_security, so POST /_security/_query/api_key returns only its own keys (${apiKeys?.length ?? "an unknown number of"} seen of an unknown total)`]
       : []),
   ];
-  const keyInventoryLabel = `${apiKeys?.length ?? 0} key(s) seen${apiKeyPage?.total !== undefined ? ` of ${apiKeyPage.total} total` : ""}`;
+  const apiKeysComplete = apiKeysReadable && apiKeyProblems.length === 0 && apiKeyPartial.length === 0;
+  const apiKeyInventory = inventoryState(snapshot, "api_keys", apiKeys?.length, apiKeyVisibility === false);
+  const keyInventoryLabel = apiKeysReadable
+    ? `${apiKeys.length} key(s) seen${apiKeyPage?.total !== undefined ? ` of ${apiKeyPage.total} total` : ""}`
+    : "api_keys unread";
   const keys = apiKeys ?? [];
   const active = keys.filter((key) => asBoolean(key.invalidated) !== true && (asNumber(key.expiration) === undefined || (asNumber(key.expiration) ?? 0) > now));
   const invalidated = keys.filter((key) => asBoolean(key.invalidated) === true);
@@ -1857,34 +2207,45 @@ export function evaluateElasticIdentity(
     : fleetIssues > 0 || invalidated.length > 0 || expired.length > 0 || missingCreation.length > 0
       ? "warn"
       : "pass";
+  const partialKeyLabel = `the api_keys inventory was not fully read (${keyInventoryLabel}), so violators are neither counted nor named`;
   findings.push(guardedFinding(9, "high", {
     status: hygieneStatus,
-    summary: hygieneStatus === "fail"
-      ? `${unmanagedWithoutExpiration.length} active non-Fleet API key(s) have no expiration and ${unmanagedStale.length} are older than ${maxApiKeyAgeDays} days (${active.length} active, ${keyInventoryLabel}).`
-      : hygieneStatus === "warn"
-        ? `${fleetIssues} Fleet-managed key(s) lack expiration or exceed ${maxApiKeyAgeDays} days, ${missingCreation.length} active key(s) report no creation date and are not counted as fresh, and ${invalidated.length} invalidated plus ${expired.length} expired keys still linger (${active.length} active, ${keyInventoryLabel}).`
-        : keys.length === 0
-          ? `No API keys exist (${keyInventoryLabel} with full inventory visibility). This control concerns existing keys, so an empty inventory is compliant.`
-          : `All ${active.length} active API keys carry an expiration, are newer than ${maxApiKeyAgeDays} days, report creation dates, and no inactive keys linger (${keyInventoryLabel}).`,
+    summary: !apiKeysComplete
+      ? hygieneStatus === "fail"
+        ? `Among the API keys that were read, at least one active non-Fleet key has no expiration or is older than ${maxApiKeyAgeDays} days; ${partialKeyLabel}.`
+        : hygieneStatus === "warn"
+          ? `Among the API keys that were read, Fleet-managed keys lack expiration or exceed ${maxApiKeyAgeDays} days, keys report no creation date, or inactive keys linger; ${partialKeyLabel}.`
+          : `No hygiene violation was observed among the API keys that were read, but ${partialKeyLabel}.`
+      : hygieneStatus === "fail"
+        ? `${unmanagedWithoutExpiration.length} active non-Fleet API key(s) have no expiration and ${unmanagedStale.length} are older than ${maxApiKeyAgeDays} days (${active.length} active, ${keyInventoryLabel}).`
+        : hygieneStatus === "warn"
+          ? `${fleetIssues} Fleet-managed key(s) lack expiration or exceed ${maxApiKeyAgeDays} days, ${missingCreation.length} active key(s) report no creation date and are not counted as fresh, and ${invalidated.length} invalidated plus ${expired.length} expired keys still linger (${active.length} active, ${keyInventoryLabel}).`
+          : keys.length === 0
+            ? `No API keys exist (${keyInventoryLabel} with full inventory visibility). This control concerns existing keys, so an empty inventory is compliant.`
+            : `All ${active.length} active API keys carry an expiration, are newer than ${maxApiKeyAgeDays} days, report creation dates, and no inactive keys linger (${keyInventoryLabel}).`,
     evidence: {
-      inspected: keys.length,
-      total_reported: apiKeyPage?.total ?? null,
-      active: active.length,
-      invalidated: invalidated.length,
-      expired: expired.length,
-      without_expiration: withoutExpiration.length,
-      missing_creation_date: missingCreation.slice(0, 25).map((key) => apiKeySample(key)),
-      older_than_max_age: stale.length,
+      inventory: apiKeyInventory,
+      inspected: countWhenRead(apiKeysComplete, keys.length),
+      total_reported: whenRead(apiKeysReadable, apiKeyPage?.total ?? null),
+      active: countWhenRead(apiKeysComplete, active.length),
+      invalidated: countWhenRead(apiKeysComplete, invalidated.length),
+      expired: countWhenRead(apiKeysComplete, expired.length),
+      without_expiration: countWhenRead(apiKeysComplete, withoutExpiration.length),
+      missing_creation_date: principalsWhenComplete(apiKeysComplete, missingCreation.map((key) => apiKeySample(key))),
+      older_than_max_age: countWhenRead(apiKeysComplete, stale.length),
       max_api_key_age_days: maxApiKeyAgeDays,
       full_visibility: apiKeyVisibility ?? null,
-      flagged: [...unmanagedWithoutExpiration, ...unmanagedStale.filter((key) => !unmanagedWithoutExpiration.includes(key))]
-        .slice(0, 25)
-        .map((key) => apiKeySample(key, { age_days: asNumber(key.creation) === undefined ? null : daysBetween(asNumber(key.creation) ?? now, now) })),
+      violation_observed: apiKeysReadable ? hygieneStatus !== "pass" : null,
+      flagged: principalsWhenComplete(
+        apiKeysComplete,
+        [...unmanagedWithoutExpiration, ...unmanagedStale.filter((key) => !unmanagedWithoutExpiration.includes(key))]
+          .map((key) => apiKeySample(key, { age_days: asNumber(key.creation) === undefined ? null : daysBetween(asNumber(key.creation) ?? now, now) })),
+      ),
     },
   }, {
     problems: apiKeyProblems,
     partial: apiKeyPartial,
-    collect: "the output of GET /_security/_query/api_key run by a principal with read_security or manage_api_key (all pages), and the API key rotation records.",
+    collect: "the output of POST /_security/_query/api_key run by a principal with read_security or manage_api_key (all pages), and the API key rotation records.",
   }));
 
   const privileged: JsonRecord[] = [];
@@ -1907,37 +2268,57 @@ export function evaluateElasticIdentity(
       privileged.push(apiKeySample(key, { reason: "role_descriptors grant cluster all" }));
     }
   }
+  const scopeStatus: ElasticFinding["status"] = privileged.length > 0 ? "fail" : unverifiable > 0 ? "warn" : "pass";
   findings.push(guardedFinding(10, "high", {
-    status: privileged.length > 0 ? "fail" : unverifiable > 0 ? "warn" : "pass",
-    summary: privileged.length > 0
-      ? `${privileged.length}/${active.length} active API keys carry superuser-equivalent or cluster-wide privileges (${keyInventoryLabel}).`
-      : unverifiable > 0
-        ? `${unverifiable}/${active.length} active API keys inherit owner privileges but limited_by was not visible (requires manage_api_key), so their scope could not be verified.`
-        : active.length === 0
-          ? `No active API keys exist (${keyInventoryLabel} with full inventory visibility). This control concerns existing keys, so an empty inventory is compliant.`
-          : `All ${active.length} active API keys are scoped below superuser-equivalent privileges (${keyInventoryLabel}).`,
-    evidence: { active: active.length, inspected: keys.length, total_reported: apiKeyPage?.total ?? null, privileged: privileged.slice(0, 25), unverifiable, full_visibility: apiKeyVisibility ?? null },
+    status: scopeStatus,
+    summary: !apiKeysComplete
+      ? scopeStatus === "fail"
+        ? `Among the API keys that were read, at least one active key carries superuser-equivalent or cluster-wide privileges; ${partialKeyLabel}.`
+        : scopeStatus === "warn"
+          ? `Among the API keys that were read, some active keys inherit owner privileges without a visible limited_by section (requires manage_api_key); ${partialKeyLabel}.`
+          : `No over-privileged key was observed among the API keys that were read, but ${partialKeyLabel}.`
+      : privileged.length > 0
+        ? `${privileged.length}/${active.length} active API keys carry superuser-equivalent or cluster-wide privileges (${keyInventoryLabel}).`
+        : unverifiable > 0
+          ? `${unverifiable}/${active.length} active API keys inherit owner privileges but limited_by was not visible (requires manage_api_key), so their scope could not be verified.`
+          : active.length === 0
+            ? `No active API keys exist (${keyInventoryLabel} with full inventory visibility). This control concerns existing keys, so an empty inventory is compliant.`
+            : `All ${active.length} active API keys are scoped below superuser-equivalent privileges (${keyInventoryLabel}).`,
+    evidence: {
+      inventory: apiKeyInventory,
+      active: countWhenRead(apiKeysComplete, active.length),
+      inspected: countWhenRead(apiKeysComplete, keys.length),
+      total_reported: whenRead(apiKeysReadable, apiKeyPage?.total ?? null),
+      privileged: principalsWhenComplete(apiKeysComplete, privileged),
+      unverifiable: countWhenRead(apiKeysComplete, unverifiable),
+      full_visibility: apiKeyVisibility ?? null,
+      violation_observed: apiKeysReadable ? scopeStatus === "fail" : null,
+    },
   }, {
     problems: apiKeyProblems,
     partial: apiKeyPartial,
-    collect: "the role_descriptors and limited_by sections of every active API key (GET /_security/_query/api_key?with_limited_by=true, all pages, run with manage_api_key).",
+    collect: "the role_descriptors and limited_by sections of every active API key (POST /_security/_query/api_key?with_limited_by=true, all pages, run with manage_api_key).",
   }));
 
   return {
     area: "identity",
     title: "Elastic identity and authentication",
     summary: {
-      realm_types: [...realmTypes],
-      secure_realm_types: secureRealmTypes,
+      realm_types: whenRead(settingsReadable, [...realmTypes]),
+      secure_realm_types: whenRead(settingsReadable, secureRealmTypes),
       security_enabled: security.enabled ?? null,
-      anonymous_roles: anonymousRoles,
-      api_keys_inspected: apiKeys?.length ?? 0,
-      api_keys_total: apiKeyPage?.total ?? null,
+      anonymous_roles: whenRead(settingsReadable, anonymousRoles),
+      api_keys_inspected: countWhenRead(apiKeysReadable, apiKeys?.length ?? 0),
+      api_keys_total: whenRead(apiKeysReadable, apiKeyPage?.total ?? null),
+      api_keys_complete: apiKeysReadable ? apiKeysComplete : null,
       api_key_full_visibility: apiKeyVisibility ?? null,
-      role_mappings: Object.keys(roleMappings ?? {}).length,
+      role_mappings: countWhenRead(roleMappingsReadable, Object.keys(roleMappings ?? {}).length),
+      license_type: whenRead(licenseData !== undefined, license.type ?? null),
     },
     findings: findings.sort((left, right) => left.id.localeCompare(right.id)),
     errors: listSnapshotErrors(snapshot),
+    not_collected: listSnapshotSkips(snapshot),
+    truncated: listSnapshotTruncations(snapshot),
   };
 }
 
@@ -1986,6 +2367,14 @@ function roleFeatureUsage(usage: JsonRecord | undefined, feature: "fls" | "dls")
   };
 }
 
+interface IndexRestrictionSources {
+  rolesReadable: boolean;
+  usageReadable: boolean;
+  licenseReadable: boolean;
+  problems: string[];
+  unchecked: string[];
+}
+
 function evaluateIndexRestriction(
   number: number,
   label: string,
@@ -1993,38 +2382,44 @@ function evaluateIndexRestriction(
   patterns: string[],
   license: ReturnType<typeof licenseState>,
   usageInUse: RoleFeatureUsage,
-  problems: string[],
+  sources: IndexRestrictionSources,
 ): ElasticFinding {
   const supported = licenseSupports(license, LICENSE_RANK.platinum);
   const restrictedRoles = [...new Set(restricted.map((entry) => entry.role))];
   const evidence: JsonRecord = {
-    roles_with_restriction: restricted.slice(0, 50).map((entry) => ({ role: entry.role, indices: entry.names })),
-    usage_reports_in_use: { native_roles: usageInUse.native ?? null, file_roles: usageInUse.file ?? null },
-    license_type: license.type ?? null,
-    license_status: license.status ?? null,
+    roles_with_restriction: principalsWhenComplete(sources.rolesReadable, restricted.map((entry) => ({ role: entry.role, indices: entry.names })), 50),
+    roles_with_restriction_count: countWhenRead(sources.rolesReadable, restrictedRoles.length),
+    usage_reports_in_use: whenRead(sources.usageReadable, { native_roles: usageInUse.native ?? null, file_roles: usageInUse.file ?? null }),
+    license_type: whenRead(sources.licenseReadable, license.type ?? null),
+    license_status: whenRead(sources.licenseReadable, license.status ?? null),
     license_supports_feature: supported ?? null,
     patterns,
   };
   const collect = `the role definitions (GET /_security/role), the license (GET /_license), and the list of indices holding sensitive or tenant data, then confirm which roles apply ${label} to them.`;
-  if (problems.length === 0 && supported === false) {
+  const guard: VerdictGuard = { problems: sources.problems, partial: [], unchecked: sources.unchecked, collect };
+  if (sources.problems.length === 0 && supported === false) {
     if (patterns.length > 0) {
-      return finding(number, "medium", "fail", `The ${license.type ?? "current"} license (status ${license.status ?? "unknown"}) does not include ${label}, so the ${patterns.length} supplied index pattern(s) cannot be protected by it.`, evidence);
+      return guardedFinding(number, "medium", {
+        status: "fail",
+        summary: `The ${license.type ?? "current"} license (status ${license.status ?? "unknown"}) does not include ${label}, so the ${patterns.length} supplied index pattern(s) cannot be protected by it.`,
+        evidence: { ...evidence, uncovered_patterns: patterns },
+      }, guard);
     }
     return manualFinding(
       number,
       "medium",
       `Not applicable on this license tier: the ${license.type ?? "current"} license (status ${license.status ?? "unknown"}) does not include ${label}, so it cannot be enforced on this cluster.`,
       `evidence of compensating controls (separate indices or clusters per sensitivity level) or confirmation that no index requires ${label}.`,
-      evidence,
+      { ...evidence, unreadable_sources: [], partial_sources: [], unchecked_sources: sources.unchecked },
     );
   }
   if (patterns.length > 0) {
-    if (problems.length > 0) {
+    if (sources.problems.length > 0) {
       return guardedFinding(number, "medium", {
         status: "manual",
         summary: `coverage of the ${patterns.length} supplied index pattern(s) by ${label} could not be evaluated.`,
         evidence: { ...evidence, uncovered_patterns: null },
-      }, { problems, partial: [], collect });
+      }, guard);
     }
     const uncovered = patterns.filter((pattern) => !restricted.some((entry) => entry.names.some((name) => patternsOverlap(name, pattern))));
     return guardedFinding(number, "medium", {
@@ -2033,17 +2428,19 @@ function evaluateIndexRestriction(
         ? `${uncovered.length}/${patterns.length} supplied index patterns have no role applying ${label}: ${uncovered.join(", ")}.`
         : supported === true
           ? `Every supplied index pattern (${patterns.join(", ")}) is covered by at least one role applying ${label} (${license.type} license supports it).`
-          : `Every supplied index pattern (${patterns.join(", ")}) is covered by a role applying ${label}, but the license tier (${license.type ?? "unknown"}, status ${license.status ?? "unknown"}) could not be confirmed to include it.`,
+          : `Every supplied index pattern (${patterns.join(", ")}) is covered by a role applying ${label}, but the license tier (${license.type ?? "unread"}, status ${license.status ?? "unread"}) could not be confirmed to include it.`,
       evidence: { ...evidence, uncovered_patterns: uncovered },
-    }, { problems, partial: [], collect });
+    }, guard);
   }
   return guardedFinding(number, "medium", {
     status: "warn",
-    summary: restrictedRoles.length > 0
-      ? `${restrictedRoles.length} role(s) apply ${label} (${restrictedRoles.slice(0, 10).join(", ")}), but no index patterns were supplied, so coverage of the sensitive indices could not be verified.`
-      : `No role applies ${label} and no index patterns were supplied; identify indices holding sensitive or tenant data and confirm whether ${label} is required.`,
+    summary: !sources.rolesReadable
+      ? `the role inventory could not be read and no index patterns were supplied, so ${label} coverage is unknown.`
+      : restrictedRoles.length > 0
+        ? `${restrictedRoles.length} role(s) apply ${label} (${restrictedRoles.slice(0, 10).join(", ")}), but no index patterns were supplied, so coverage of the sensitive indices could not be verified.`
+        : `No role applies ${label} and no index patterns were supplied; identify indices holding sensitive or tenant data and confirm whether ${label} is required.`,
     evidence,
-  }, { problems, partial: [], collect });
+  }, guard);
 }
 
 export function evaluateElasticAccessControl(
@@ -2055,11 +2452,13 @@ export function evaluateElasticAccessControl(
   const users = datasetData<JsonRecord>(snapshot, "users");
   const roleMappings = datasetData<JsonRecord>(snapshot, "role_mappings");
   const usage = datasetData<JsonRecord>(snapshot, "xpack_usage");
-  const license = licenseState(datasetData<JsonRecord>(snapshot, "license"));
+  const licenseData = datasetData<JsonRecord>(snapshot, "license");
+  const license = licenseState(licenseData);
   const findings: ElasticFinding[] = [];
 
   const roleEntries = Object.entries(roles ?? {}).map(([name, value]) => ({ name, role: asObject(value) ?? {} }));
   const userEntries = Object.entries(users ?? {}).map(([name, value]) => ({ name, user: asObject(value) ?? {} }));
+  const mappingEntries = Object.entries(roleMappings ?? {});
   const customRoles = roleEntries.filter(({ role }) => !roleIsReserved(role));
   const clusterAllRoles = customRoles.filter(({ role }) => descriptorGrantsClusterAll(role)).map(({ name }) => name);
   const wildcardIndexRoles = customRoles.filter(({ role }) => descriptorGrantsWildcardIndexAll(role)).map(({ name }) => name);
@@ -2070,22 +2469,29 @@ export function evaluateElasticAccessControl(
   const usersWithBroadRoles = userEntries
     .filter(({ user }) => asBoolean(user.enabled) !== false && asStringList(user.roles).some((role) => broadRoles.includes(role)))
     .map(({ name }) => name);
-  const superuserMappings = Object.entries(roleMappings ?? {})
+  const superuserMappings = mappingEntries
     .filter(([, value]) => asBoolean(asObject(value)?.enabled) !== false && asStringList(asObject(value)?.roles).some((role) => role === "superuser" || broadRoles.includes(role)))
     .map(([name]) => name);
   const roleInventoryProblems = [
     ...dependencyProblems(snapshot, ["roles"]),
     ...[emptyInventoryProblem(snapshot, "roles", roles ? roleEntries.length : undefined, "built-in roles such as superuser are always returned")].filter((item): item is string => Boolean(item)),
   ];
-  const rbacProblems = [
-    ...roleInventoryProblems,
-    ...dependencyProblems(snapshot, ["users", "role_mappings"]),
+  const userInventoryProblems = [
+    ...dependencyProblems(snapshot, ["users"]),
     ...[emptyInventoryProblem(snapshot, "users", users ? userEntries.length : undefined, "built-in users such as elastic are always returned")].filter((item): item is string => Boolean(item)),
   ];
+  const mappingProblems = dependencyProblems(snapshot, ["role_mappings"]);
+  const rbacProblems = [...roleInventoryProblems, ...userInventoryProblems, ...mappingProblems];
+  const rolesComplete = roleInventoryProblems.length === 0;
+  const usersComplete = userInventoryProblems.length === 0;
+  const mappingsComplete = mappingProblems.length === 0;
+  // A user holds a broad role only if both the user list and the role definitions were read.
+  const userRoleJoinComplete = rolesComplete && usersComplete;
+  const mappingRoleJoinComplete = rolesComplete && mappingsComplete;
 
-  const rbacStatus: ElasticFinding["status"] = (users && superusers.length > maxSuperusers) || usersWithBroadRoles.length > 0
+  const rbacStatus: ElasticFinding["status"] = (usersComplete && superusers.length > maxSuperusers) || (userRoleJoinComplete && usersWithBroadRoles.length > 0)
     ? "fail"
-    : broadRoles.length > 0 || superuserMappings.length > 0
+    : (rolesComplete && broadRoles.length > 0) || (mappingRoleJoinComplete && superuserMappings.length > 0)
       ? "warn"
       : "pass";
   findings.push(guardedFinding(6, "high", {
@@ -2093,19 +2499,27 @@ export function evaluateElasticAccessControl(
     summary: rbacStatus === "fail"
       ? `${superusers.length} native users hold superuser (threshold ${maxSuperusers}) and ${usersWithBroadRoles.length} users hold custom roles granting cluster all or index all on *.`
       : rbacStatus === "warn"
-        ? `${broadRoles.length} custom role(s) grant cluster all or wildcard index all and ${superuserMappings.length} role mapping(s) assign superuser or broad roles; no native user currently exceeds the superuser threshold.`
-        : `${roleEntries.length} roles, ${userEntries.length} users, and ${Object.keys(roleMappings ?? {}).length} role mappings reviewed; ${superusers.length} superuser holder(s) within threshold ${maxSuperusers}, no custom role grants cluster all or wildcard index all, and no role mapping assigns broad roles.`,
+        ? `${broadRoles.length} custom role(s) grant cluster all or wildcard index all and ${mappingRoleJoinComplete ? superuserMappings.length : "an unknown number of"} role mapping(s) assign superuser or broad roles; no native user currently exceeds the superuser threshold.`
+        : rbacProblems.length > 0
+          ? "the readable inventories show no superuser overuse or broad custom roles, but the RBAC picture is incomplete."
+          : `${roleEntries.length} roles, ${userEntries.length} users, and ${mappingEntries.length} role mappings reviewed; ${superusers.length} superuser holder(s) within threshold ${maxSuperusers}, no custom role grants cluster all or wildcard index all, and no role mapping assigns broad roles.`,
     evidence: {
-      roles_reviewed: roleEntries.length,
-      custom_roles: customRoles.length,
-      users_reviewed: userEntries.length,
-      role_mappings_reviewed: Object.keys(roleMappings ?? {}).length,
-      superusers,
+      inventories: [
+        inventoryState(snapshot, "roles", roleEntries.length),
+        inventoryState(snapshot, "users", userEntries.length),
+        inventoryState(snapshot, "role_mappings", mappingEntries.length),
+      ],
+      roles_reviewed: countWhenRead(rolesComplete, roleEntries.length),
+      custom_roles: countWhenRead(rolesComplete, customRoles.length),
+      users_reviewed: countWhenRead(usersComplete, userEntries.length),
+      role_mappings_reviewed: countWhenRead(mappingsComplete, mappingEntries.length),
+      superusers: principalsWhenComplete(usersComplete, superusers),
+      superuser_count: countWhenRead(usersComplete, superusers.length),
       max_superusers: maxSuperusers,
-      cluster_all_roles: clusterAllRoles,
-      wildcard_index_all_roles: wildcardIndexRoles,
-      users_with_broad_roles: usersWithBroadRoles.slice(0, 25),
-      superuser_role_mappings: superuserMappings,
+      cluster_all_roles: principalsWhenComplete(rolesComplete, clusterAllRoles),
+      wildcard_index_all_roles: principalsWhenComplete(rolesComplete, wildcardIndexRoles),
+      users_with_broad_roles: principalsWhenComplete(userRoleJoinComplete, usersWithBroadRoles),
+      superuser_role_mappings: principalsWhenComplete(mappingRoleJoinComplete, superuserMappings),
     },
   }, {
     problems: rbacProblems,
@@ -2114,41 +2528,38 @@ export function evaluateElasticAccessControl(
   }));
 
   const indexEntries = roles ? roleIndexEntries(roles) : [];
-  const flsProblems = [...roleInventoryProblems, ...dependencyProblems(snapshot, ["license"])];
-  findings.push(evaluateIndexRestriction(
-    7,
-    "field-level security",
-    indexEntries.filter((entry) => entry.fieldSecurity && Object.keys(entry.fieldSecurity).length > 0),
-    options.sensitiveIndexPatterns ?? [],
-    license,
-    roleFeatureUsage(usage, "fls"),
-    flsProblems,
-  ));
-  findings.push(evaluateIndexRestriction(
-    8,
-    "document-level security",
-    indexEntries.filter((entry) => entry.query !== undefined && entry.query !== null && entry.query !== ""),
-    options.tenantIndexPatterns ?? [],
-    license,
-    roleFeatureUsage(usage, "dls"),
-    flsProblems,
-  ));
+  const usageReadable = usage !== undefined;
+  const licenseReadable = licenseData !== undefined;
+  const restrictionSources: IndexRestrictionSources = {
+    rolesReadable: rolesComplete,
+    usageReadable,
+    licenseReadable,
+    problems: [...roleInventoryProblems, ...dependencyProblems(snapshot, ["license"])],
+    unchecked: uncheckedSources(snapshot, ["xpack_usage"]),
+  };
+  const flsEntries = indexEntries.filter((entry) => entry.fieldSecurity && Object.keys(entry.fieldSecurity).length > 0);
+  const dlsEntries = indexEntries.filter((entry) => entry.query !== undefined && entry.query !== null && entry.query !== "");
+  findings.push(evaluateIndexRestriction(7, "field-level security", flsEntries, options.sensitiveIndexPatterns ?? [], license, roleFeatureUsage(usage, "fls"), restrictionSources));
+  findings.push(evaluateIndexRestriction(8, "document-level security", dlsEntries, options.tenantIndexPatterns ?? [], license, roleFeatureUsage(usage, "dls"), restrictionSources));
 
   return {
     area: "access_control",
     title: "Elastic role-based access control",
     summary: {
-      roles_reviewed: roleEntries.length,
-      users_reviewed: userEntries.length,
-      superusers: superusers.length,
-      broad_custom_roles: broadRoles.length,
-      roles_with_fls: new Set(indexEntries.filter((entry) => entry.fieldSecurity).map((entry) => entry.role)).size,
-      roles_with_dls: new Set(indexEntries.filter((entry) => entry.query !== undefined && entry.query !== null).map((entry) => entry.role)).size,
-      license_type: license.type ?? null,
-      license_status: license.status ?? null,
+      roles_reviewed: countWhenRead(rolesComplete, roleEntries.length),
+      users_reviewed: countWhenRead(usersComplete, userEntries.length),
+      role_mappings_reviewed: countWhenRead(mappingsComplete, mappingEntries.length),
+      superusers: countWhenRead(usersComplete, superusers.length),
+      broad_custom_roles: countWhenRead(rolesComplete, broadRoles.length),
+      roles_with_fls: countWhenRead(rolesComplete, new Set(flsEntries.map((entry) => entry.role)).size),
+      roles_with_dls: countWhenRead(rolesComplete, new Set(dlsEntries.map((entry) => entry.role)).size),
+      license_type: whenRead(licenseReadable, license.type ?? null),
+      license_status: whenRead(licenseReadable, license.status ?? null),
     },
     findings: findings.sort((left, right) => left.id.localeCompare(right.id)),
     errors: listSnapshotErrors(snapshot),
+    not_collected: listSnapshotSkips(snapshot),
+    truncated: listSnapshotTruncations(snapshot),
   };
 }
 
@@ -2198,6 +2609,8 @@ function evaluateTlsLayer(
   guard: VerdictGuard,
 ): ElasticFinding {
   const key = `xpack.security.${layer}.ssl.enabled`;
+  const settingsReadable = guard.problems.length === 0;
+  const usageReadable = usage !== undefined;
   const perNode = perNodeBooleans(view, key);
   const usageEnabled = usageFlag(usage, ["ssl", layer, "enabled"]);
   const effective = asBoolean(view.get(key));
@@ -2211,14 +2624,14 @@ function evaluateTlsLayer(
   const noVerificationNodes = verificationModes.filter((entry) => entry.value === "none").map((entry) => entry.node);
   const evidence: JsonRecord = {
     setting: key,
-    per_node: perNode.map((entry) => ({ node: entry.node, value: entry.value ?? null })),
-    enabled_nodes: enabledNodes,
-    disabled_nodes: disabledNodes,
-    unset_nodes: unsetNodes,
+    per_node: whenRead(settingsReadable, perNode.map((entry) => ({ node: entry.node, value: entry.value ?? null }))),
+    enabled_nodes: whenRead(settingsReadable, enabledNodes),
+    disabled_nodes: whenRead(settingsReadable, disabledNodes),
+    unset_nodes: whenRead(settingsReadable, unsetNodes),
     effective_setting: effective ?? null,
-    usage_reported_enabled: usageEnabled ?? null,
+    usage_reported_enabled: whenRead(usageReadable, usageEnabled ?? null),
     security_enabled: security.enabled ?? null,
-    ...(layer === "transport" ? { verification_mode_per_node: verificationModes } : {}),
+    ...(layer === "transport" ? { verification_mode_per_node: whenRead(settingsReadable, verificationModes) } : {}),
     ...(layer === "http" ? { elasticsearch_url_scheme: elasticsearchUrl ? new URL(elasticsearchUrl).protocol.replace(":", "") : null } : {}),
   };
   const layerLabel = layer === "transport" ? "Transport" : "HTTP";
@@ -2235,7 +2648,7 @@ function evaluateTlsLayer(
   } else if (unsetNodes.length > 0) {
     computed = {
       status: "warn",
-      summary: `${key} is not explicitly set on ${unsetNodes.join(", ")} (the documented default is false) and ${usageEnabled === true ? "usage statistics report it enabled" : "usage statistics do not confirm it"}; verify the effective value on every node.`,
+      summary: `${key} is not explicitly set on ${unsetNodes.join(", ")} (the documented default is false) and ${usageEnabled === true ? "usage statistics report it enabled" : usageReadable ? "usage statistics do not confirm it" : "usage statistics could not be read"}; verify the effective value on every node.`,
     };
   } else if (enabledNodes.length === 0) {
     computed = { status: "warn", summary: `${key} was not observed as true on any node; verify the effective value on every node.` };
@@ -2246,7 +2659,7 @@ function evaluateTlsLayer(
   } else {
     computed = {
       status: "pass",
-      summary: `${layerLabel} layer TLS is explicitly enabled on all ${enabledNodes.length} node(s) with xpack.security.enabled true${layer === "transport" ? ` and verification_mode ${[...new Set(verificationModes.map((entry) => entry.value))].join(", ")}` : ""}.`,
+      summary: `${layerLabel} layer TLS is explicitly enabled on all ${enabledNodes.length} node(s) with xpack.security.enabled true${layer === "transport" ? ` and verification_mode ${[...new Set(verificationModes.map((entry) => entry.value))].join(", ")}` : ""}${usageEnabled === true ? "; usage statistics agree" : ""}.`,
     };
   }
   return guardedFinding(number, "critical", { ...computed, evidence }, guard);
@@ -2269,11 +2682,14 @@ export function evaluateElasticTransportSecurity(
   const usage = datasetData<JsonRecord>(snapshot, "xpack_usage");
   const certificates = datasetData<JsonRecord[]>(snapshot, "ssl_certificates");
   const settingsProblems = settingsDependencyProblems(snapshot, view);
+  const settingsReadable = settingsProblems.length === 0;
+  const usageReadable = usage !== undefined;
+  const usageUnchecked = uncheckedSources(snapshot, ["xpack_usage"]);
   const nodeNotes = nodeInventoryNotes(nodeSettings);
   const security = securityEnabledState(view, usage);
-  const settingsGuard = (collect: string): VerdictGuard => ({ problems: settingsProblems, partial: nodeNotes, collect });
-  const transportFinding = evaluateTlsLayer(2, "transport", view, usage, security, elasticsearchUrl, settingsGuard("xpack.security.transport.ssl.enabled and verification_mode from elasticsearch.yml on every node (or the Elastic Cloud deployment TLS configuration)."));
-  const httpFinding = evaluateTlsLayer(3, "http", view, usage, security, elasticsearchUrl, settingsGuard("xpack.security.http.ssl.enabled from elasticsearch.yml on every node (or the Elastic Cloud deployment TLS configuration)."));
+  const settingsGuard = (collect: string, unchecked: string[] = []): VerdictGuard => ({ problems: settingsProblems, partial: nodeNotes, unchecked, collect });
+  const transportFinding = evaluateTlsLayer(2, "transport", view, usage, security, elasticsearchUrl, settingsGuard("xpack.security.transport.ssl.enabled and verification_mode from elasticsearch.yml on every node (or the Elastic Cloud deployment TLS configuration).", usageUnchecked));
+  const httpFinding = evaluateTlsLayer(3, "http", view, usage, security, elasticsearchUrl, settingsGuard("xpack.security.http.ssl.enabled from elasticsearch.yml on every node (or the Elastic Cloud deployment TLS configuration).", usageUnchecked));
   const findings: ElasticFinding[] = [transportFinding, httpFinding];
 
   const protocolKeys = ["xpack.security.transport.ssl.supported_protocols", "xpack.security.http.ssl.supported_protocols"];
@@ -2306,15 +2722,16 @@ export function evaluateElasticTransportSecurity(
   findings.push(guardedFinding(4, "high", {
     ...protocolComputed,
     evidence: {
-      protocols_per_node: perNodeProtocols,
-      weak_protocols: weakProtocols,
-      unset_supported_protocols: unsetProtocolNodes,
+      protocols_per_node: whenRead(settingsReadable, perNodeProtocols),
+      weak_protocols: whenRead(settingsReadable, weakProtocols),
+      unset_supported_protocols: whenRead(settingsReadable, unsetProtocolNodes),
       documented_default: DEFAULT_TLS_SUPPORTED_PROTOCOLS,
-      node_major_versions: majors,
+      node_major_versions: whenRead(settingsReadable, majors),
       tls_enforcement_status: tlsCeiling,
     },
   }, settingsGuard("xpack.security.transport.ssl.supported_protocols and xpack.security.http.ssl.supported_protocols from elasticsearch.yml on every node.")));
 
+  const certificatesReadable = certificates !== undefined;
   const inventory = (certificates ?? []).map((certificate) => {
     const expiry = isoDate(certificate.expiry);
     const daysRemaining = expiry ? daysBetween(now, Date.parse(expiry)) : undefined;
@@ -2334,10 +2751,12 @@ export function evaluateElasticTransportSecurity(
     ...dependencyProblems(snapshot, ["ssl_certificates"]),
     ...[emptyInventoryProblem(snapshot, "ssl_certificates", certificates ? certificates.length : undefined, "a TLS-enabled node always reports its keystore and truststore certificates")].filter((item): item is string => Boolean(item)),
   ];
-  const nodeTotal = asNumber(asObject(nodeSettings?._nodes)?.total) ?? view.nodes.length;
+  const certificatesComplete = certificatesReadable && certificateProblems.length === 0;
+  const nodeHeaderTotal = asNumber(asObject(nodeSettings?._nodes)?.total);
+  const nodeTotal = nodeHeaderTotal ?? (nodeSettings !== undefined ? view.nodes.length : undefined);
   const certificatePartial = nodeSettings === undefined
-    ? ["GET /_ssl/certificates reports only the node that handled the request and the node inventory could not be read, so certificates on other nodes are unknown"]
-    : nodeTotal > 1
+    ? [`GET /_ssl/certificates reports only the node that handled the request and the node inventory could not be read (${datasetProblem(snapshot, "node_settings") ?? "node_settings unread"}), so certificates on other nodes are unknown`]
+    : (nodeTotal ?? 0) > 1
       ? [`GET /_ssl/certificates reports only the node that handled the request, but the cluster has ${nodeTotal} nodes; run the check against each node to cover every keystore and truststore`]
       : [];
   findings.push(guardedFinding(5, "high", {
@@ -2346,8 +2765,20 @@ export function evaluateElasticTransportSecurity(
       ? `${expired.length} TLS certificate(s) have expired and ${expiring.length} expire within ${warningDays} days.`
       : expiring.length > 0 || missingExpiry.length > 0
         ? `${expiring.length}/${inventory.length} TLS certificate(s) expire within ${warningDays} days and ${missingExpiry.length} report no expiry date (not counted as valid).`
-        : `All ${inventory.length} TLS certificates on the responding node report an expiry date and remain valid for at least ${warningDays} more days${nodeTotal === 1 ? " (single-node cluster, so the inventory is complete)" : ""}.`,
-    evidence: { certificates: inventory.slice(0, 25), expired: expired.length, expiring_soon: expiring.length, missing_expiry: missingExpiry.length, cert_expiry_warning_days: warningDays, nodes_in_cluster: nodeTotal, single_node_view: true },
+        : !certificatesReadable
+          ? "the certificate inventory could not be read."
+          : `All ${inventory.length} TLS certificates on the responding node report an expiry date and remain valid for at least ${warningDays} more days${nodeTotal === 1 ? " (single-node cluster, so the inventory is complete)" : ""}.`,
+    evidence: {
+      inventory: inventoryState(snapshot, "ssl_certificates", certificates?.length, (nodeTotal ?? 2) > 1),
+      certificates: principalsWhenComplete(certificatesComplete, inventory),
+      certificate_count: countWhenRead(certificatesComplete, inventory.length),
+      expired: countWhenRead(certificatesComplete, expired.length),
+      expiring_soon: countWhenRead(certificatesComplete, expiring.length),
+      missing_expiry: countWhenRead(certificatesComplete, missingExpiry.length),
+      cert_expiry_warning_days: warningDays,
+      nodes_in_cluster: nodeTotal ?? null,
+      single_node_view: true,
+    },
   }, {
     problems: certificateProblems,
     partial: certificatePartial,
@@ -2358,15 +2789,18 @@ export function evaluateElasticTransportSecurity(
     area: "transport_security",
     title: "Elastic transport and HTTP TLS",
     summary: {
-      nodes_inspected: view.nodes.length,
+      nodes_inspected: countWhenRead(nodeSettings !== undefined, view.nodes.length),
       security_enabled: security.enabled ?? null,
       transport_tls: asBoolean(view.get("xpack.security.transport.ssl.enabled")) ?? usageFlag(usage, ["ssl", "transport", "enabled"]) ?? null,
       http_tls: asBoolean(view.get("xpack.security.http.ssl.enabled")) ?? usageFlag(usage, ["ssl", "http", "enabled"]) ?? null,
-      weak_protocols: weakProtocols,
-      certificates: certificates?.length ?? 0,
+      weak_protocols: whenRead(settingsReadable, weakProtocols),
+      certificates: countWhenRead(certificatesReadable, certificates?.length ?? 0),
+      usage_statistics_read: usageReadable,
     },
     findings: findings.sort((left, right) => left.id.localeCompare(right.id)),
     errors: listSnapshotErrors(snapshot),
+    not_collected: listSnapshotSkips(snapshot),
+    truncated: listSnapshotTruncations(snapshot),
   };
 }
 
@@ -2395,10 +2829,11 @@ function pipelineProcessors(processors: unknown, collected: Array<{ type: string
 }
 
 function setProcessorLooksSensitive(config: JsonRecord): boolean {
+  if (config.sensitive_literal === true) return true;
   const field = asString(config.field) ?? "";
   const value = config.value;
   const literal = typeof value === "string" && !value.includes("{{");
-  return literal && (SECRET_FIELD_NAME_PATTERN.test(field) || /^(?:[A-Za-z0-9+/=_-]{32,})$/.test(value));
+  return literal && (SECRET_FIELD_NAME_PATTERN.test(field) || TOKEN_LITERAL_PATTERN.test(value));
 }
 
 function watchActionIssues(watch: JsonRecord): { insecureWebhooks: string[]; embeddedCredentials: string[] } {
@@ -2476,8 +2911,12 @@ export function evaluateElasticClusterHardening(
   const detectionRules = datasetData<JsonRecord[]>(snapshot, "detection_rules");
   const findings: ElasticFinding[] = [];
   const settingsProblems = settingsDependencyProblems(snapshot, view);
+  const settingsReadable = settingsProblems.length === 0;
   const nodeNotes = nodeInventoryNotes(nodeSettings);
   const licenseProblems = dependencyProblems(snapshot, ["license"]);
+  const licenseReadable = licenseData !== undefined;
+  const usageReadable = usage !== undefined;
+  const usageUnchecked = uncheckedSources(snapshot, ["xpack_usage"]);
   const security = securityEnabledState(view, usage, xpackInfo);
 
   const audit = resolveAuditEnabled(view);
@@ -2494,24 +2933,26 @@ export function evaluateElasticClusterHardening(
     setting: AUDIT_ENABLED_KEY,
     cluster_level_value: audit.clusterLevel ?? null,
     cluster_level_source: audit.clusterLevelSource ?? null,
-    per_node: audit.perNode.map((entry) => ({ node: entry.node, node_value: entry.nodeValue ?? null, effective: entry.effective ?? null, source: entry.source })),
-    enabled_nodes: auditEnabledNodes,
-    disabled_or_unset_nodes: auditDisabledNodes,
-    usage_reported_enabled: usageFlag(usage, ["audit", "enabled"]) ?? null,
-    events_include: includeSetting,
-    events_exclude: excludeSetting,
-    effective_include: effectiveInclude,
-    outputs: auditOutputs,
-    license_type: license.type ?? null,
+    per_node: whenRead(settingsReadable, audit.perNode.map((entry) => ({ node: entry.node, node_value: entry.nodeValue ?? null, effective: entry.effective ?? null, source: entry.source }))),
+    enabled_nodes: whenRead(settingsReadable, auditEnabledNodes),
+    disabled_or_unset_nodes: whenRead(settingsReadable, auditDisabledNodes),
+    audit_enabled: whenRead(settingsReadable, auditEnabled),
+    usage_reported_enabled: whenRead(usageReadable, usageFlag(usage, ["audit", "enabled"]) ?? null),
+    events_include: whenRead(settingsReadable, includeSetting),
+    events_exclude: whenRead(settingsReadable, excludeSetting),
+    effective_include: whenRead(settingsReadable, effectiveInclude),
+    outputs: whenRead(usageReadable, auditOutputs),
+    license_type: whenRead(licenseReadable, license.type ?? null),
     license_supports_audit: auditLicense ?? null,
     security_enabled: security.enabled ?? null,
   };
   const auditGuard: VerdictGuard = {
     problems: [...settingsProblems, ...licenseProblems],
     partial: nodeNotes,
+    unchecked: usageUnchecked,
     collect: "xpack.security.audit.* settings from the cluster settings API (transient and persistent) and elasticsearch.yml on every node, the license tier (GET /_license), and a sample of <cluster>_audit.json.",
   };
-  const auditOff = settingsProblems.length === 0 && !auditEnabled;
+  const auditOff = settingsReadable && !auditEnabled;
   const auditSourceLabel = audit.clusterLevelSource
     ? `${audit.clusterLevelSource} cluster settings`
     : "node settings";
@@ -2535,22 +2976,25 @@ export function evaluateElasticClusterHardening(
             ? `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) but the effective event include list omits ${missingEvents.join(", ")}.`
             : security.enabled === undefined
               ? `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) but xpack.security.enabled was not visible, so enforcement could not be confirmed.`
-              : `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) via ${auditSourceLabel} with authentication_failed, access_denied, and security_config_change events included (${license.type} license supports audit logging).`,
-    evidence: { ...auditEvidence, missing_required_events: missingEvents },
+              : `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) via ${auditSourceLabel} with authentication_failed, access_denied, and security_config_change events included (${license.type} license supports audit logging${usageReadable ? "; usage statistics agree" : ""}).`,
+    evidence: { ...auditEvidence, missing_required_events: whenRead(settingsReadable, missingEvents) },
   }, auditGuard));
+  const auditForwardCollect = "evidence that <cluster>_audit.json is shipped to a tamper-resistant destination (Filebeat or Elastic Agent elasticsearch.audit integration, or a SIEM) with retention and integrity controls.";
+  const auditManualEvidence: JsonRecord = { ...auditEvidence, unreadable_sources: settingsProblems, partial_sources: nodeNotes, unchecked_sources: usageUnchecked };
   findings.push(auditOff || security.enabled === false
     ? guardedFinding(12, "medium", { status: "fail", summary: "Audit logging is disabled on at least one node, so no complete audit output exists to protect.", evidence: auditEvidence }, auditGuard)
-    : settingsProblems.length > 0
-      ? manualFinding(12, "medium", `Audit settings could not be read: ${settingsProblems.join("; ")}.`, "evidence that <cluster>_audit.json is shipped to a tamper-resistant destination (Filebeat or Elastic Agent elasticsearch.audit integration, or a SIEM) with retention and integrity controls.", auditEvidence)
+    : !settingsReadable
+      ? manualFinding(12, "medium", `Audit settings could not be read: ${settingsProblems.join("; ")}.`, auditForwardCollect, auditManualEvidence)
       : manualFinding(
         12,
         "medium",
-        `Elasticsearch writes audit events only to the local logfile output (${auditOutputs.join(", ") || "logfile"}) on each node; forwarding to a tamper-resistant store cannot be verified through the API.`,
-        "evidence that <cluster>_audit.json is shipped to a tamper-resistant destination (Filebeat or Elastic Agent elasticsearch.audit integration, or a SIEM) with retention and integrity controls.",
-        auditEvidence,
+        `Elasticsearch writes audit events only to the local logfile output (${usageReadable ? auditOutputs.join(", ") || "logfile" : "outputs unread because usage statistics could not be read"}) on each node; forwarding to a tamper-resistant store cannot be verified through the API.`,
+        auditForwardCollect,
+        auditManualEvidence,
       ));
 
   const ilmMode = asString(ilmStatus?.operation_mode)?.toUpperCase();
+  const ilmReadable = ilmPolicies !== undefined;
   const policies = Object.entries(ilmPolicies ?? {}).map(([name, value]) => {
     const entry = asObject(value) ?? {};
     const phases = asObject(getNestedValue(entry, ["policy", "phases"])) ?? {};
@@ -2569,7 +3013,7 @@ export function evaluateElasticClusterHardening(
   });
   const inUseWithoutDelete = policies.filter((policy) => policy.in_use && !policy.has_delete_phase);
   const ilmProblems = dependencyProblems(snapshot, ["ilm_policies", "ilm_status"]);
-  const ilmEmpty = ilmPolicies !== undefined && policies.length === 0;
+  const ilmEmpty = ilmReadable && policies.length === 0;
   const ilmStopped = ilmStatus !== undefined && ilmMode !== "RUNNING";
   findings.push(guardedFinding(17, "medium", {
     status: ilmEmpty || ilmStopped ? "fail" : inUseWithoutDelete.length > 0 ? "warn" : "pass",
@@ -2579,11 +3023,16 @@ export function evaluateElasticClusterHardening(
         ? `ILM operation_mode is ${ilmMode ?? "unknown"} rather than RUNNING, so lifecycle policies are not executing.`
         : inUseWithoutDelete.length > 0
           ? `${inUseWithoutDelete.length}/${policies.length} in-use ILM policies have no delete phase: ${inUseWithoutDelete.slice(0, 10).map((policy) => policy.name).join(", ")}.`
-          : `All ${policies.filter((policy) => policy.in_use).length} in-use ILM policies define a delete phase and ILM operation_mode is RUNNING.`,
+          : ilmReadable
+            ? `All ${policies.filter((policy) => policy.in_use).length} in-use ILM policies define a delete phase and ILM operation_mode is RUNNING.`
+            : "the ILM policy inventory could not be read.",
     evidence: {
+      inventories: [inventoryState(snapshot, "ilm_policies", policies.length), inventoryState(snapshot, "ilm_status", ilmStatus ? 1 : undefined)],
       operation_mode: ilmMode ?? null,
-      policies: policies.slice(0, 50),
-      without_rollover: policies.filter((policy) => policy.in_use && !policy.has_rollover).map((policy) => policy.name).slice(0, 25),
+      policy_count: countWhenRead(ilmReadable, policies.length),
+      in_use_without_delete_count: countWhenRead(ilmReadable, inUseWithoutDelete.length),
+      policies: principalsWhenComplete(ilmReadable, policies, 50),
+      without_rollover: principalsWhenComplete(ilmReadable, policies.filter((policy) => policy.in_use && !policy.has_rollover).map((policy) => policy.name)),
     },
   }, {
     problems: ilmProblems,
@@ -2591,6 +3040,8 @@ export function evaluateElasticClusterHardening(
     collect: "the ILM policy definitions (GET /_ilm/policy), the ILM status (GET /_ilm/status), and the retention schedule approved for each regulated data stream.",
   }));
 
+  const reposReadable = repositories !== undefined;
+  const slmReadable = slmPolicies !== undefined;
   const repoEntries = Object.entries(repositories ?? {}).map(([name, value]) => {
     const entry = asObject(value) ?? {};
     const type = asString(entry.type) ?? "unknown";
@@ -2617,14 +3068,21 @@ export function evaluateElasticClusterHardening(
   const manualRepos = repoEntries.filter((repo) => repo.encryption === "manual");
   const snapshotProblems = dependencyProblems(snapshot, ["snapshot_repositories", "slm_policies", "slm_status"]);
   const snapshotEvidence: JsonRecord = {
-    repositories: repoEntries,
-    slm_policies: slmEntries,
+    inventories: [
+      inventoryState(snapshot, "snapshot_repositories", repoEntries.length),
+      inventoryState(snapshot, "slm_policies", slmEntries.length),
+      inventoryState(snapshot, "slm_status", slmStatus ? 1 : undefined),
+    ],
+    repository_count: countWhenRead(reposReadable, repoEntries.length),
+    repositories: principalsWhenComplete(reposReadable, repoEntries, 50),
+    slm_policy_count: countWhenRead(slmReadable, slmEntries.length),
+    slm_policies: principalsWhenComplete(slmReadable, slmEntries, 50),
     slm_operation_mode: slmMode ?? null,
-    slm_policies_without_last_success: slmNeverSucceeded.map((entry) => entry.name),
+    slm_policies_without_last_success: principalsWhenComplete(slmReadable, slmNeverSucceeded.map((entry) => entry.name)),
   };
   const snapshotCollect = "the repository settings (GET /_snapshot/_all), storage encryption evidence for each bucket or filesystem, the SLM policies and status (GET /_slm/policy, GET /_slm/status), and the most recent successful snapshot per policy.";
-  const reposEmpty = repositories !== undefined && repoEntries.length === 0;
-  const slmEmpty = slmPolicies !== undefined && slmEntries.length === 0;
+  const reposEmpty = reposReadable && repoEntries.length === 0;
+  const slmEmpty = slmReadable && slmEntries.length === 0;
   const slmStopped = slmStatus !== undefined && slmMode !== "RUNNING";
   if (snapshotProblems.length === 0 && !reposEmpty && !slmEmpty && !slmStopped && manualRepos.length > 0) {
     findings.push(manualFinding(
@@ -2632,7 +3090,7 @@ export function evaluateElasticClusterHardening(
       "high",
       `${manualRepos.length}/${repoEntries.length} repositories (${manualRepos.map((repo) => `${repo.name}:${repo.type}`).join(", ")}) do not expose an encryption setting through the API.`,
       "bucket default-encryption or filesystem/disk encryption evidence for each listed repository (S3 repositories can also set server_side_encryption: true).",
-      snapshotEvidence,
+      { ...snapshotEvidence, unreadable_sources: [], partial_sources: [], unchecked_sources: [] },
     ));
   } else {
     findings.push(guardedFinding(18, "high", {
@@ -2645,7 +3103,9 @@ export function evaluateElasticClusterHardening(
             ? `SLM operation_mode is ${slmMode ?? "unknown"} rather than RUNNING, so snapshot lifecycle policies are not executing.`
             : slmNeverSucceeded.length > 0
               ? `${slmNeverSucceeded.length}/${slmEntries.length} SLM policies report no last_success time (${slmNeverSucceeded.map((entry) => entry.name).join(", ")}), so they are not counted as working backups.`
-              : `All ${repoEntries.length} snapshot repositories use encrypted storage, ${slmEntries.length} SLM policies report a last successful snapshot, and SLM operation_mode is RUNNING.`,
+              : snapshotProblems.length > 0
+                ? "the readable snapshot sources show no failure, but the repository, SLM policy, or SLM status inventory is incomplete."
+                : `All ${repoEntries.length} snapshot repositories use encrypted storage, ${slmEntries.length} SLM policies report a last successful snapshot, and SLM operation_mode is RUNNING.`,
       evidence: snapshotEvidence,
     }, { problems: snapshotProblems, partial: [], collect: snapshotCollect }));
   }
@@ -2663,10 +3123,10 @@ export function evaluateElasticClusterHardening(
   const clusterEvidence: JsonRecord = {
     security_enabled: security.enabled ?? null,
     security_enabled_source: security.source,
-    security_enabled_per_node: securityPerNode.map((entry) => ({ node: entry.node, value: entry.value ?? null })),
-    password_hashing_algorithm: passwordHashing,
-    password_hashing_explicit: passwordHashingSetting !== undefined,
-    api_key_hashing_algorithm: apiKeyHashing,
+    security_enabled_per_node: whenRead(settingsReadable, securityPerNode.map((entry) => ({ node: entry.node, value: entry.value ?? null }))),
+    password_hashing_algorithm: whenRead(settingsReadable, passwordHashing),
+    password_hashing_explicit: whenRead(settingsReadable, passwordHashingSetting !== undefined),
+    api_key_hashing_algorithm: whenRead(settingsReadable, apiKeyHashing),
     token_service_enabled: tokenService ?? null,
     api_key_service_enabled: apiKeyService ?? null,
     fips_mode_enabled: fipsMode ?? null,
@@ -2686,9 +3146,13 @@ export function evaluateElasticClusterHardening(
   }, {
     problems: settingsProblems,
     partial: nodeNotes,
+    unchecked: uncheckedSources(snapshot, ["xpack_usage", "xpack_info"]),
     collect: "the xpack.security.* section of elasticsearch.yml from every node plus GET /_cluster/settings?include_defaults=true.",
   }));
 
+  const watchesComplete = datasetComplete(snapshot, "watches");
+  const connectorsComplete = datasetComplete(snapshot, "connectors");
+  const rulesReadable = datasetReadable(snapshot, "alerting_rules") && datasetReadable(snapshot, "detection_rules");
   const watchIssues = (watches ?? []).map((watch) => ({ id: asString(watch._id) ?? "watch", ...watchActionIssues(watch) }));
   const insecureWatchActions = watchIssues.filter((watch) => watch.insecureWebhooks.length > 0);
   const credentialWatchActions = watchIssues.filter((watch) => watch.embeddedCredentials.length > 0);
@@ -2707,12 +3171,19 @@ export function evaluateElasticClusterHardening(
     ...(connectors || kibanaScopedOut ? [] : [`connectors (${DATASET_SPECS.connectors.endpoint}): ${connectorProblem}`]),
     ...(kibanaScopedOut ? [] : dependencyProblems(snapshot, ["alerting_rules", "detection_rules"])),
   ];
-  const alertingPartial = [...truncationNotes(snapshot, ["watches", "alerting_rules", "detection_rules"]), ...spaceScopeNotes];
+  const alertingPartial = [...truncationNotes(snapshot, ["watches", "alerting_rules", "detection_rules", "connectors"]), ...spaceScopeNotes];
+  const alertingUnchecked = watches ? uncheckedSources(snapshot, ["license"]) : [];
   const alertingEvidence: JsonRecord = {
+    inventories: [
+      inventoryState(snapshot, "watches", watches?.length),
+      inventoryState(snapshot, "connectors", connectors?.length),
+      inventoryState(snapshot, "alerting_rules", alertingRules?.length),
+      inventoryState(snapshot, "detection_rules", detectionRules?.length),
+    ],
     watches: watches?.length ?? null,
     watcher_unreadable: watcherProblem ?? null,
     watcher_licensed: watcherLicensed ?? null,
-    watcher_not_applicable: watcherNotApplicable,
+    watcher_not_applicable: whenRead(licenseReadable, watcherNotApplicable),
     kibana_scoped_out: kibanaScopedOut ?? null,
     kibana_space_queried: kibanaSpaceId ?? "default",
     kibana_spaces_total: kibanaSpaces?.length ?? null,
@@ -2720,23 +3191,26 @@ export function evaluateElasticClusterHardening(
     connectors_unreadable: connectorProblem ?? null,
     alerting_rules: alertingRules?.length ?? null,
     detection_rules: detectionRules?.length ?? null,
-    rules_with_actions: rulesWithActions,
-    insecure_watch_webhooks: insecureWatchActions.slice(0, 25).map((watch) => ({ id: watch.id, actions: watch.insecureWebhooks })),
-    watch_actions_with_embedded_credentials: credentialWatchActions.slice(0, 25).map((watch) => ({ id: watch.id, actions: watch.embeddedCredentials })),
-    insecure_connectors: insecureConnectors.slice(0, 25).map((connector) => ({ id: asString(connector.id), name: asString(connector.name), type: asString(connector.connector_type_id), url: connectorUrl(connector) })),
-    connectors_missing_secrets: connectorsMissingSecrets.slice(0, 25).map((connector) => asString(connector.name) ?? asString(connector.id)),
+    rules_with_actions: countWhenRead(rulesReadable, rulesWithActions),
+    insecure_watch_webhooks: principalsWhenComplete(watchesComplete, insecureWatchActions.map((watch) => ({ id: watch.id, actions: watch.insecureWebhooks }))),
+    watch_actions_with_embedded_credentials: principalsWhenComplete(watchesComplete, credentialWatchActions.map((watch) => ({ id: watch.id, actions: watch.embeddedCredentials }))),
+    insecure_connectors: principalsWhenComplete(connectorsComplete, insecureConnectors.map((connector) => ({ id: asString(connector.id), name: asString(connector.name), type: asString(connector.connector_type_id), url: connectorUrl(connector) }))),
+    connectors_missing_secrets: principalsWhenComplete(connectorsComplete, connectorsMissingSecrets.map((connector) => asString(connector.name) ?? asString(connector.id))),
   };
-  const alertingCollect = "the watch definitions (GET /_watcher/_query/watches) and the Kibana connector inventory from every space (GET /s/<space>/api/actions/connectors), then confirm webhook destinations use https and credentials are stored as secrets.";
+  const alertingCollect = kibanaScopedOut
+    ? "the watch definitions (POST /_watcher/_query/watches) and the Kibana connector inventory from every space (configure KIBANA_URL so the connectors API can be queried, or export the connectors from each space), then confirm webhook destinations use https and credentials are stored as secrets."
+    : "the watch definitions (POST /_watcher/_query/watches) and the Kibana connector inventory from every space (GET /api/actions/connectors in each space), then confirm webhook destinations use https and credentials are stored as secrets.";
   const alertingFailed = insecureWatchActions.length > 0 || insecureConnectors.length > 0;
   const alertingWarned = credentialWatchActions.length > 0 || connectorsMissingSecrets.length > 0;
   const alertingEmpty = (watches?.length ?? 0) === 0 && (connectors?.length ?? 0) === 0;
+  const alertingManualEvidence: JsonRecord = { ...alertingEvidence, unreadable_sources: alertingProblems, partial_sources: alertingPartial, unchecked_sources: alertingUnchecked };
   if (!alertingFailed && alertingProblems.length === 0 && watcherNotApplicable && kibanaScopedOut) {
     findings.push(manualFinding(
       20,
       "medium",
       `Not applicable or scoped out: Watcher is not available on the ${license.type ?? "current"} license and Kibana is not configured (${kibanaScopedOut}), so no alerting destinations could be assessed.`,
       alertingCollect,
-      alertingEvidence,
+      alertingManualEvidence,
     ));
   } else if (!alertingFailed && alertingProblems.length === 0 && kibanaScopedOut) {
     findings.push(manualFinding(
@@ -2744,7 +3218,7 @@ export function evaluateElasticClusterHardening(
       "medium",
       `Scoped out: Kibana is not configured (${kibanaScopedOut}), so only ${watches?.length ?? 0} watch(es) were reviewed${alertingWarned ? ` (${credentialWatchActions.length} embed basic-auth credentials)` : " and none use plain http webhooks"}; Kibana connectors and rule actions were not assessed.`,
       alertingCollect,
-      alertingEvidence,
+      alertingManualEvidence,
     ));
   } else if (!alertingFailed && alertingProblems.length === 0 && alertingEmpty && spaceScopeNotes.length > 0) {
     findings.push(manualFinding(
@@ -2752,7 +3226,7 @@ export function evaluateElasticClusterHardening(
       "medium",
       `Zero watches and zero connectors were visible in the queried scope, but the connector inventory is space-scoped (${spaceScopeNotes.join("; ")}), so emptiness cannot be confirmed as compliant.`,
       alertingCollect,
-      alertingEvidence,
+      alertingManualEvidence,
     ));
   } else {
     findings.push(guardedFinding(20, "medium", {
@@ -2761,13 +3235,16 @@ export function evaluateElasticClusterHardening(
         ? `${insecureWatchActions.length} watch(es) and ${insecureConnectors.length} Kibana connector(s) send to plain http webhook destinations.`
         : alertingWarned
           ? `${credentialWatchActions.length} watch action(s) embed basic-auth credentials and ${connectorsMissingSecrets.length} connector(s) are missing secrets.`
-          : alertingEmpty
-            ? `Zero watches and zero connectors exist in the only Kibana space${watcherNotApplicable ? ` (Watcher is not available on the ${license.type} license)` : ""}; this passes because the control governs the security of existing alerting destinations and none exist.`
-            : `${watches?.length ?? 0} watches and ${connectors?.length ?? 0} connectors reviewed (${rulesWithActions} rules carry actions); all webhook destinations use https and no inline credentials were found${watcherNotApplicable ? `; Watcher is not available on the ${license.type} license, so only Kibana connectors were assessed` : ""}.`,
+          : alertingProblems.length > 0
+            ? "the readable alerting inventories show no insecure destination, but the alerting picture is incomplete."
+            : alertingEmpty
+              ? `Zero watches and zero connectors exist in the only Kibana space${watcherNotApplicable ? ` (Watcher is not available on the ${license.type} license)` : ""}; this passes because the control governs the security of existing alerting destinations and none exist.`
+              : `${watches?.length ?? 0} watches and ${connectors?.length ?? 0} connectors reviewed (${rulesWithActions} rules carry actions); all webhook destinations use https and no inline credentials were found${watcherNotApplicable ? `; Watcher is not available on the ${license.type} license, so only Kibana connectors were assessed` : ""}.`,
       evidence: alertingEvidence,
-    }, { problems: alertingProblems, partial: alertingPartial, collect: alertingCollect }));
+    }, { problems: alertingProblems, partial: alertingPartial, unchecked: alertingUnchecked, collect: alertingCollect }));
   }
 
+  const pipelinesReadable = pipelines !== undefined;
   const pipelineEntries = Object.entries(pipelines ?? {}).map(([name, value]) => {
     const entry = asObject(value) ?? {};
     const processors = pipelineProcessors(entry.processors);
@@ -2783,12 +3260,14 @@ export function evaluateElasticClusterHardening(
   const pipelinesWithScripts = customPipelines.filter((pipeline) => pipeline.script_processors > 0);
   const pipelineProblems = dependencyProblems(snapshot, ["ingest_pipelines"]);
   const pipelinesEmpty = emptyInventoryProblem(snapshot, "ingest_pipelines", pipelines ? pipelineEntries.length : undefined, "Elasticsearch ships managed pipelines (Fleet, logs, and behavioral analytics) in every supported release");
+  const pipelinesComplete = pipelinesReadable && !pipelinesEmpty;
   const pipelineEvidence: JsonRecord = {
-    pipelines: pipelineEntries.length,
-    custom_pipelines: customPipelines.length,
-    managed_pipelines: pipelineEntries.length - customPipelines.length,
-    pipelines_with_sensitive_set: pipelinesWithSecrets.slice(0, 25),
-    pipelines_with_scripts: pipelinesWithScripts.slice(0, 25).map((pipeline) => pipeline.name),
+    inventory: inventoryState(snapshot, "ingest_pipelines", pipelineEntries.length),
+    pipelines: countWhenRead(pipelinesReadable, pipelineEntries.length),
+    custom_pipelines: countWhenRead(pipelinesReadable, customPipelines.length),
+    managed_pipelines: countWhenRead(pipelinesReadable, pipelineEntries.length - customPipelines.length),
+    pipelines_with_sensitive_set: principalsWhenComplete(pipelinesComplete, pipelinesWithSecrets),
+    pipelines_with_scripts: principalsWhenComplete(pipelinesComplete, pipelinesWithScripts.map((pipeline) => pipeline.name)),
   };
   findings.push(guardedFinding(22, "medium", {
     status: pipelinesWithSecrets.length > 0 ? "fail" : pipelinesWithScripts.length > 0 ? "warn" : "pass",
@@ -2796,7 +3275,9 @@ export function evaluateElasticClusterHardening(
       ? `${pipelinesWithSecrets.length} custom ingest pipeline(s) set sensitive-looking literal values: ${pipelinesWithSecrets.slice(0, 10).map((pipeline) => pipeline.name).join(", ")}.`
       : pipelinesWithScripts.length > 0
         ? `${pipelinesWithScripts.length}/${customPipelines.length} custom ingest pipeline(s) use script processors; review them for data exposure.`
-        : `${pipelineEntries.length} ingest pipelines reviewed (${customPipelines.length} custom, ${pipelineEntries.length - customPipelines.length} managed); no script processors or hardcoded sensitive values in custom pipelines.`,
+        : pipelinesReadable
+          ? `${pipelineEntries.length} ingest pipelines reviewed (${customPipelines.length} custom, ${pipelineEntries.length - customPipelines.length} managed); no script processors or hardcoded sensitive values in custom pipelines.`
+          : "the ingest pipeline inventory could not be read.",
     evidence: pipelineEvidence,
   }, {
     problems: [...pipelineProblems, ...(pipelinesEmpty ? [pipelinesEmpty] : [])],
@@ -2807,39 +3288,43 @@ export function evaluateElasticClusterHardening(
   const licenseInfo = asObject(licenseData?.license);
   const licenseExpiry = isoDate(licenseInfo?.expiry_date_in_millis ?? licenseInfo?.expiry_date);
   const realmTypes = new Set([...parseRealms(view).filter((realm) => realm.enabled).map((realm) => realm.type), ...usageRealmTypes(usage)]);
+  const rolesReadable = roles !== undefined;
   const usesFlsOrDls = roles ? roleIndexEntries(roles).some((entry) => (entry.fieldSecurity && Object.keys(entry.fieldSecurity).length > 0) || (entry.query !== undefined && entry.query !== null)) : false;
   const requirements = requiredLicenseRankFor(realmTypes, usesFlsOrDls, auditEnabled, watches?.length ?? 0);
   const unsupported = license.rank === undefined ? [] : requirements.filter((requirement) => requirement.rank > (license.rank as number));
   const expiryDays = licenseExpiry ? daysBetween(now, Date.parse(licenseExpiry)) : undefined;
-  const expiryMissing = licenseData !== undefined && licenseExpiry === undefined && license.type !== "basic";
-  const coverageProblems = license.rank !== undefined && license.rank >= LICENSE_RANK.platinum
-    ? []
-    : [...settingsProblems, ...dependencyProblems(snapshot, ["roles"])];
+  const expiryMissing = licenseReadable && licenseExpiry === undefined && license.type !== "basic";
+  const featureSourceProblems = [...settingsProblems, ...dependencyProblems(snapshot, ["roles"])];
+  const featureSourcesUnchecked = uncheckedSources(snapshot, ["xpack_usage", "xpack_info"]).concat(watches || watcherNotApplicable ? [] : uncheckedSources(snapshot, ["watches"]));
+  const requirementsComplete = settingsReadable && rolesReadable && usageReadable && (watches !== undefined || watcherNotApplicable);
+  // Below platinum the configured features decide coverage, so their sources are essential; at platinum or above every feature is covered and they only cross-check.
+  const coverageEssential = license.rank === undefined || license.rank < LICENSE_RANK.platinum;
   const licenseEvidence: JsonRecord = {
-    type: license.type ?? null,
-    status: license.status ?? null,
-    expiry: licenseExpiry ?? null,
-    expiry_missing: expiryMissing,
+    type: whenRead(licenseReadable, license.type ?? null),
+    status: whenRead(licenseReadable, license.status ?? null),
+    expiry: whenRead(licenseReadable, licenseExpiry ?? null),
+    expiry_missing: whenRead(licenseReadable, expiryMissing),
     days_until_expiry: expiryDays ?? null,
     security_available: asBoolean(getNestedValue(xpackInfo, ["features", "security", "available"])) ?? null,
     security_enabled: asBoolean(getNestedValue(xpackInfo, ["features", "security", "enabled"])) ?? null,
+    requirements_complete: requirementsComplete,
     required_features: requirements.map((requirement) => ({ feature: requirement.feature, minimum_license: licenseLabel(requirement.rank) })),
-    unsupported_features: unsupported.map((item) => item.feature),
+    unsupported_features: requirementsComplete && licenseReadable ? unsupported.map((item) => item.feature) : null,
   };
   findings.push(guardedFinding(23, "medium", {
-    status: unsupported.length > 0 || license.active === false || (licenseData !== undefined && license.type === undefined)
+    status: unsupported.length > 0 || license.active === false || (licenseReadable && license.type === undefined)
       ? "fail"
       : license.type === "trial" || (expiryDays !== undefined && expiryDays < 30) || expiryMissing || license.active === undefined
         ? "warn"
         : "pass",
-    summary: licenseData !== undefined && license.type === undefined
+    summary: licenseReadable && license.type === undefined
       ? "GET /_license returned no license type, so the subscription tier could not be determined."
       : unsupported.length > 0
         ? `The ${license.type} license does not cover configured features: ${unsupported.map((item) => `${item.feature} (needs ${licenseLabel(item.rank)})`).join(", ")}.`
         : license.active === false
           ? `The license status is ${license.status}.`
           : license.active === undefined
-            ? `The ${license.type} license reports no status field, so it cannot be confirmed as active.`
+            ? licenseReadable ? `The ${license.type} license reports no status field, so it cannot be confirmed as active.` : "the license could not be read."
             : license.type === "trial"
               ? `A trial license is active${expiryDays !== undefined ? ` and expires in ${expiryDays} days` : ""}; security features will lapse when it ends.`
               : expiryMissing
@@ -2849,8 +3334,9 @@ export function evaluateElasticClusterHardening(
                   : `The ${license.type} license is active${expiryDays !== undefined ? ` (expires in ${expiryDays} days)` : ""} and covers every configured security feature (${requirements.length} requirement(s) checked).`,
     evidence: licenseEvidence,
   }, {
-    problems: [...licenseProblems, ...coverageProblems],
+    problems: [...licenseProblems, ...(coverageEssential ? featureSourceProblems : [])],
     partial: nodeNotes,
+    unchecked: [...(coverageEssential ? [] : featureSourceProblems), ...featureSourcesUnchecked],
     collect: "the output of GET /_license and the subscription tier that covers the configured realms, FLS/DLS, audit logging, and Watcher.",
   }));
 
@@ -2858,22 +3344,26 @@ export function evaluateElasticClusterHardening(
     area: "cluster_hardening",
     title: "Elastic cluster hardening and data protection",
     summary: {
-      audit_enabled: auditEnabled,
-      audit_outputs: auditOutputs,
-      ilm_policies: Object.keys(ilmPolicies ?? {}).length,
+      audit_enabled: whenRead(settingsReadable, auditEnabled),
+      audit_outputs: whenRead(usageReadable, auditOutputs),
+      ilm_policies: countWhenRead(ilmReadable, Object.keys(ilmPolicies ?? {}).length),
       ilm_operation_mode: ilmMode ?? null,
-      snapshot_repositories: Object.keys(repositories ?? {}).length,
-      slm_policies: Object.keys(slmPolicies ?? {}).length,
+      snapshot_repositories: countWhenRead(reposReadable, Object.keys(repositories ?? {}).length),
+      slm_policies: countWhenRead(slmReadable, Object.keys(slmPolicies ?? {}).length),
       slm_operation_mode: slmMode ?? null,
-      watches: watches?.length ?? 0,
-      connectors: connectors?.length ?? 0,
-      ingest_pipelines: Object.keys(pipelines ?? {}).length,
-      license_type: license.type ?? null,
-      license_status: license.status ?? null,
+      watches: watches?.length ?? null,
+      connectors: connectors?.length ?? null,
+      alerting_rules: alertingRules?.length ?? null,
+      detection_rules: detectionRules?.length ?? null,
+      ingest_pipelines: countWhenRead(pipelinesReadable, Object.keys(pipelines ?? {}).length),
+      license_type: whenRead(licenseReadable, license.type ?? null),
+      license_status: whenRead(licenseReadable, license.status ?? null),
       security_enabled: security.enabled ?? null,
     },
     findings: findings.sort((left, right) => left.id.localeCompare(right.id)),
     errors: listSnapshotErrors(snapshot),
+    not_collected: listSnapshotSkips(snapshot),
+    truncated: listSnapshotTruncations(snapshot),
   };
 }
 
@@ -2909,6 +3399,8 @@ export function evaluateElasticKibana(
   const findings: ElasticFinding[] = [];
   const kibanaSkipped = snapshot.kibana_spaces?.skipped ?? snapshot.kibana_roles?.skipped;
 
+  const rolesReadable = roles !== undefined;
+  const spacesReadable = spaces !== undefined;
   const customRoles = (roles ?? []).filter((role) => !kibanaRoleIsReserved(role));
   const reservedRoles = (roles ?? []).length - customRoles.length;
   const globalAllRoles = customRoles
@@ -2924,24 +3416,37 @@ export function evaluateElasticKibana(
   const rolesEmpty = emptyInventoryProblem(snapshot, "kibana_roles", roles?.length, "Kibana always returns its reserved roles");
   const roleProblems = [...dependencyProblems(snapshot, ["kibana_roles"]), ...(rolesEmpty ? [rolesEmpty] : [])];
   const spaceProblems = [...dependencyProblems(snapshot, ["kibana_spaces"]), ...(spacesEmpty ? [spacesEmpty] : [])];
+  const rolesComplete = rolesReadable && roleProblems.length === 0;
+  const spacesComplete = spacesReadable && spaceProblems.length === 0;
   const roleEvidence: JsonRecord = {
+    inventory: inventoryState(snapshot, "kibana_roles", roles?.length),
     roles_reviewed: roles?.length ?? null,
-    custom_roles: customRoles.length,
-    reserved_roles: reservedRoles,
-    global_all_roles: globalAllRoles.slice(0, 25),
-    space_scoped_roles: spaceScopedRoles.slice(0, 25),
-    feature_scoped_roles: featureScopedRoles.slice(0, 25),
-    elasticsearch_cluster_all_roles: customRoles
-      .filter((role) => asStringList(getNestedValue(role, ["elasticsearch", "cluster"])).includes("all"))
-      .map((role) => asString(role.name))
-      .slice(0, 25),
+    custom_roles: countWhenRead(rolesReadable, customRoles.length),
+    reserved_roles: countWhenRead(rolesReadable, reservedRoles),
+    global_all_roles: principalsWhenComplete(rolesComplete, globalAllRoles),
+    space_scoped_roles: principalsWhenComplete(rolesComplete, spaceScopedRoles),
+    feature_scoped_roles: principalsWhenComplete(rolesComplete, featureScopedRoles),
+    elasticsearch_cluster_all_roles: principalsWhenComplete(
+      rolesComplete,
+      customRoles
+        .filter((role) => asStringList(getNestedValue(role, ["elasticsearch", "cluster"])).includes("all"))
+        .map((role) => asString(role.name)),
+    ),
   };
 
   if (kibanaSkipped) {
-    const collect = "Kibana evidence manually or set KIBANA_URL so the API can be queried:";
-    findings.push(manualFinding(15, "medium", `Scoped out: Kibana is not configured (${kibanaSkipped}).`, `${collect} the space list (GET /api/spaces/space) and the roles that scope privileges to individual spaces.`));
-    findings.push(manualFinding(16, "high", `Scoped out: Kibana is not configured (${kibanaSkipped}).`, `${collect} the Kibana role definitions (GET /api/security/role) and identify roles granting base all across all spaces.`));
-    findings.push(manualFinding(21, "medium", `Scoped out: Kibana is not configured (${kibanaSkipped}).`, `${collect} Fleet agent policies, outputs, Fleet Server hosts, and enrollment keys (GET /api/fleet/agent_policies, /api/fleet/outputs, /api/fleet/fleet_server_hosts, /api/fleet/enrollment_api_keys).`));
+    // Kibana was never requested, so no endpoint is named here; the collect text asks for the configuration instead.
+    const collect = "Kibana evidence manually or set KIBANA_URL so the Kibana API can be queried:";
+    const skippedEvidence = (names: ElasticDatasetName[]): JsonRecord => ({
+      inventories: names.map((name) => inventoryState(snapshot, name, undefined)),
+      unreadable_sources: [],
+      partial_sources: [],
+      unchecked_sources: [],
+      not_collected_sources: listSnapshotSkips(snapshot).filter((entry) => names.some((name) => entry.startsWith(`${name} (`))),
+    });
+    findings.push(manualFinding(15, "medium", `Scoped out: Kibana is not configured (${kibanaSkipped}).`, `${collect} the space list and the roles that scope privileges to individual spaces.`, skippedEvidence(["kibana_spaces", "kibana_roles"])));
+    findings.push(manualFinding(16, "high", `Scoped out: Kibana is not configured (${kibanaSkipped}).`, `${collect} the Kibana role definitions and identify roles granting base all across all spaces.`, skippedEvidence(["kibana_roles"])));
+    findings.push(manualFinding(21, "medium", `Scoped out: Kibana is not configured (${kibanaSkipped}).`, `${collect} the Fleet agent policies, outputs, Fleet Server hosts, and enrollment keys.`, skippedEvidence(["fleet_agent_policies", "fleet_outputs", "fleet_server_hosts", "fleet_enrollment_api_keys"])));
   } else {
     const spaceEvidence = (spaces ?? []).map((space) => ({
       id: asString(space.id),
@@ -2956,12 +3461,20 @@ export function evaluateElasticKibana(
         : spaceScopedRoles.length > 0 && globalAllRoles.length === 0
           ? "pass"
           : "warn",
-      summary: spaceCount <= 1
-        ? "Only the default space exists, so Kibana space isolation between teams is not in use; confirm whether multi-team separation is required."
-        : spaceScopedRoles.length > 0 && globalAllRoles.length === 0
-          ? `${spaceCount} spaces exist and ${spaceScopedRoles.length} custom role(s) scope privileges to specific spaces with no custom role granting all privileges across every space.`
-          : `${spaceCount} spaces exist but ${spaceScopedRoles.length} role(s) are space-scoped and ${globalAllRoles.length} custom role(s) grant all privileges across every space.`,
-      evidence: { spaces: spaceEvidence, space_scoped_roles: spaceScopedRoles.slice(0, 25), global_all_roles: globalAllRoles.slice(0, 25) },
+      summary: !spacesReadable || !rolesReadable
+        ? "the space or role inventory could not be read, so space isolation is unknown."
+        : spaceCount <= 1
+          ? "Only the default space exists, so Kibana space isolation between teams is not in use; confirm whether multi-team separation is required."
+          : spaceScopedRoles.length > 0 && globalAllRoles.length === 0
+            ? `${spaceCount} spaces exist and ${spaceScopedRoles.length} custom role(s) scope privileges to specific spaces with no custom role granting all privileges across every space.`
+            : `${spaceCount} spaces exist but ${spaceScopedRoles.length} role(s) are space-scoped and ${globalAllRoles.length} custom role(s) grant all privileges across every space.`,
+      evidence: {
+        inventories: [inventoryState(snapshot, "kibana_spaces", spaces?.length), inventoryState(snapshot, "kibana_roles", roles?.length)],
+        space_count: countWhenRead(spacesReadable, spaceCount),
+        spaces: principalsWhenComplete(spacesComplete, spaceEvidence, 50),
+        space_scoped_roles: principalsWhenComplete(rolesComplete, spaceScopedRoles),
+        global_all_roles: principalsWhenComplete(rolesComplete, globalAllRoles),
+      },
     }, {
       problems: [...spaceProblems, ...roleProblems],
       partial: [],
@@ -2972,9 +3485,11 @@ export function evaluateElasticKibana(
       status: globalAllRoles.length > 0 ? "fail" : customRoles.length === 0 ? "warn" : "pass",
       summary: globalAllRoles.length > 0
         ? `${globalAllRoles.length} custom Kibana role(s) grant base all privileges across every space: ${globalAllRoles.slice(0, 10).join(", ")}.`
-        : customRoles.length === 0
-          ? `No custom Kibana roles exist (${reservedRoles} reserved roles only), so users rely on reserved roles such as kibana_admin or superuser and feature-level privilege separation is not implemented.`
-          : `${customRoles.length} custom Kibana roles reviewed; none grants base all across every space (${featureScopedRoles.length} use feature-level privileges only).`,
+        : !rolesReadable
+          ? "the Kibana role inventory could not be read."
+          : customRoles.length === 0
+            ? `No custom Kibana roles exist (${reservedRoles} reserved roles only), so users rely on reserved roles such as kibana_admin or superuser and feature-level privilege separation is not implemented.`
+            : `${customRoles.length} custom Kibana roles reviewed; none grants base all across every space (${featureScopedRoles.length} use feature-level privileges only).`,
       evidence: roleEvidence,
     }, {
       problems: roleProblems,
@@ -2982,6 +3497,10 @@ export function evaluateElasticKibana(
       collect: "the Kibana role definitions (GET /api/security/role) and identify roles granting base all across all spaces.",
     }));
 
+    const policiesComplete = datasetComplete(snapshot, "fleet_agent_policies");
+    const outputsComplete = datasetComplete(snapshot, "fleet_outputs");
+    const hostsComplete = datasetComplete(snapshot, "fleet_server_hosts");
+    const keysComplete = datasetComplete(snapshot, "fleet_enrollment_api_keys");
     const insecureOutputs = (outputs ?? []).filter((output) => hostListIsPlainHttp(output.hosts).length > 0).map((output) => asString(output.name) ?? asString(output.id) ?? "output");
     const outputsWithoutTrust = (outputs ?? [])
       .filter((output) => asString(output.type) === "elasticsearch" && !asString(output.ca_sha256) && !asString(output.ca_trusted_fingerprint) && !asObject(output.ssl))
@@ -2996,22 +3515,30 @@ export function evaluateElasticKibana(
     }
     const crowdedPolicies = [...keysPerPolicy.entries()].filter(([, count]) => count > maxEnrollmentKeys).map(([policyId, count]) => ({ policy_id: policyId, active_keys: count }));
     const fleetProblems = dependencyProblems(snapshot, ["fleet_agent_policies", "fleet_outputs", "fleet_enrollment_api_keys", "fleet_server_hosts"]);
-    const fleetPartial = truncationNotes(snapshot, ["fleet_agent_policies", "fleet_enrollment_api_keys", "fleet_server_hosts"]);
+    const fleetPartial = truncationNotes(snapshot, ["fleet_agent_policies", "fleet_outputs", "fleet_enrollment_api_keys", "fleet_server_hosts"]);
+    const enrollmentKeysReadable = enrollmentKeys !== undefined;
     const fleetEvidence: JsonRecord = {
       kibana_space_queried: kibanaSpaceId ?? "default",
+      inventories: [
+        inventoryState(snapshot, "fleet_agent_policies", agentPolicies?.length),
+        inventoryState(snapshot, "fleet_outputs", outputs?.length),
+        inventoryState(snapshot, "fleet_server_hosts", fleetServerHosts?.length),
+        inventoryState(snapshot, "fleet_enrollment_api_keys", enrollmentKeys?.length),
+      ],
       agent_policies: agentPolicies?.length ?? null,
       outputs: outputs?.length ?? null,
       fleet_server_hosts: fleetServerHosts?.length ?? null,
-      enrollment_keys_active: activeKeys.length,
-      enrollment_keys_inactive: (enrollmentKeys ?? []).length - activeKeys.length,
-      insecure_outputs: insecureOutputs,
-      outputs_without_ca_trust: outputsWithoutTrust,
-      insecure_fleet_server_hosts: insecureFleetServers,
-      unprotected_policies: unprotectedPolicies.slice(0, 25),
-      policies_over_enrollment_key_threshold: crowdedPolicies,
+      enrollment_keys_active: countWhenRead(enrollmentKeysReadable, activeKeys.length),
+      enrollment_keys_inactive: countWhenRead(enrollmentKeysReadable, (enrollmentKeys ?? []).length - activeKeys.length),
+      insecure_outputs: principalsWhenComplete(outputsComplete, insecureOutputs),
+      outputs_without_ca_trust: principalsWhenComplete(outputsComplete, outputsWithoutTrust),
+      insecure_fleet_server_hosts: principalsWhenComplete(hostsComplete, insecureFleetServers),
+      unprotected_policies: principalsWhenComplete(policiesComplete, unprotectedPolicies),
+      unprotected_policy_count: countWhenRead(policiesComplete, unprotectedPolicies.length),
+      policies_over_enrollment_key_threshold: principalsWhenComplete(keysComplete, crowdedPolicies),
       max_enrollment_keys_per_policy: maxEnrollmentKeys,
     };
-    const fleetCollect = "Fleet agent policies, outputs, Fleet Server hosts, and enrollment keys (GET /api/fleet/agent_policies, /api/fleet/outputs, /api/fleet/fleet_server_hosts, /api/fleet/enrollment_api_keys).";
+    const fleetCollect = "Fleet agent policies, outputs, Fleet Server hosts, and enrollment keys (GET /api/fleet/agent_policies, GET /api/fleet/outputs, GET /api/fleet/fleet_server_hosts, GET /api/fleet/enrollment_api_keys).";
     const fleetFailed = insecureOutputs.length > 0 || insecureFleetServers.length > 0;
     const fleetEmpty = agentPolicies !== undefined && agentPolicies.length === 0;
     const outputsEmpty = agentPolicies !== undefined && agentPolicies.length > 0 && outputs !== undefined && outputs.length === 0;
@@ -3021,24 +3548,26 @@ export function evaluateElasticKibana(
         "medium",
         `Not applicable: zero Fleet agent policies exist in the ${kibanaSpaceId ?? "default"} space, so Fleet enrollment and output hardening has nothing to evaluate (emptiness is reported as manual, not pass).`,
         "confirmation that Fleet and Elastic Agent are not in use in any space, or the policies from the space where Fleet is managed.",
-        fleetEvidence,
+        { ...fleetEvidence, unreadable_sources: [], partial_sources: fleetPartial, unchecked_sources: [] },
       ));
     } else {
       findings.push(guardedFinding(21, "medium", {
         status: fleetFailed
           ? "fail"
-          : unprotectedPolicies.length > 0 || crowdedPolicies.length > 0 || outputsWithoutTrust.length > 0 || outputsEmpty || (fleetServerHosts ?? []).length === 0
+          : unprotectedPolicies.length > 0 || crowdedPolicies.length > 0 || outputsWithoutTrust.length > 0 || outputsEmpty || (fleetServerHosts !== undefined && fleetServerHosts.length === 0)
             ? "warn"
             : "pass",
         summary: fleetFailed
           ? `${insecureOutputs.length} Fleet output(s) and ${insecureFleetServers.length} Fleet Server host(s) use plain http.`
-          : outputsEmpty
-            ? `${agentPolicies?.length ?? 0} agent policies exist but zero Fleet outputs were returned although Fleet always defines a default output, so output hardening could not be verified.`
-            : (fleetServerHosts ?? []).length === 0
-              ? `${agentPolicies?.length ?? 0} agent policies exist but no Fleet Server hosts are registered, so agent enrollment transport could not be verified.`
-              : unprotectedPolicies.length > 0 || crowdedPolicies.length > 0 || outputsWithoutTrust.length > 0
-                ? `${unprotectedPolicies.length}/${agentPolicies?.length ?? 0} agent policies lack tamper protection (is_protected is not true), ${crowdedPolicies.length} policies exceed ${maxEnrollmentKeys} active enrollment keys, and ${outputsWithoutTrust.length} Elasticsearch outputs pin no CA trust.`
-                : `All ${agentPolicies?.length ?? 0} agent policies are tamper protected, ${outputs?.length ?? 0} outputs and ${fleetServerHosts?.length ?? 0} Fleet Server hosts use https with CA trust, and enrollment keys stay within ${maxEnrollmentKeys} per policy.`,
+          : fleetProblems.length > 0
+            ? "the readable Fleet inventories show no plain-http destination, but the Fleet picture is incomplete."
+            : outputsEmpty
+              ? `${agentPolicies?.length ?? 0} agent policies exist but zero Fleet outputs were returned although Fleet always defines a default output, so output hardening could not be verified.`
+              : (fleetServerHosts ?? []).length === 0
+                ? `${agentPolicies?.length ?? 0} agent policies exist but no Fleet Server hosts are registered, so agent enrollment transport could not be verified.`
+                : unprotectedPolicies.length > 0 || crowdedPolicies.length > 0 || outputsWithoutTrust.length > 0
+                  ? `${unprotectedPolicies.length}/${agentPolicies?.length ?? 0} agent policies lack tamper protection (is_protected is not true), ${crowdedPolicies.length} policies exceed ${maxEnrollmentKeys} active enrollment keys, and ${outputsWithoutTrust.length} Elasticsearch outputs pin no CA trust.`
+                  : `All ${agentPolicies?.length ?? 0} agent policies are tamper protected, ${outputs?.length ?? 0} outputs and ${fleetServerHosts?.length ?? 0} Fleet Server hosts use https with CA trust, and enrollment keys stay within ${maxEnrollmentKeys} per policy.`,
         evidence: fleetEvidence,
       }, { problems: fleetProblems, partial: fleetPartial, collect: fleetCollect }));
     }
@@ -3052,14 +3581,18 @@ export function evaluateElasticKibana(
       kibana_space: kibanaSpaceId ?? "default",
       kibana_version: asString(getNestedValue(status, ["version", "number"])) ?? null,
       kibana_status: asString(getNestedValue(status, ["status", "overall", "level"])) ?? asString(getNestedValue(status, ["status", "overall", "state"])) ?? null,
-      spaces: spaces?.length ?? 0,
-      kibana_roles: roles?.length ?? 0,
-      global_all_roles: globalAllRoles.length,
-      agent_policies: agentPolicies?.length ?? 0,
-      fleet_outputs: outputs?.length ?? 0,
+      spaces: spaces?.length ?? null,
+      kibana_roles: roles?.length ?? null,
+      global_all_roles: countWhenRead(rolesReadable, globalAllRoles.length),
+      agent_policies: agentPolicies?.length ?? null,
+      fleet_outputs: outputs?.length ?? null,
+      fleet_server_hosts: fleetServerHosts?.length ?? null,
+      enrollment_keys: enrollmentKeys?.length ?? null,
     },
     findings: findings.sort((left, right) => left.id.localeCompare(right.id)),
     errors: listSnapshotErrors(snapshot),
+    not_collected: listSnapshotSkips(snapshot),
+    truncated: listSnapshotTruncations(snapshot),
   };
 }
 
@@ -3190,31 +3723,36 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
   const config = client.getResolvedConfig();
   const snapshot = await collectElasticSnapshot(client, ACCESS_SURFACES, { apiKeyLimit: 100, watchLimit: 100, kibanaLimit: 100 });
   const surfaces: ElasticAccessSurface[] = ACCESS_SURFACES.map((name) => {
-    const dataset = snapshot[name] ?? { name, target: DATASET_SPECS[name].target, endpoint: DATASET_SPECS[name].endpoint, error: "not collected" };
+    const dataset = snapshot[name] ?? { name, target: DATASET_SPECS[name].target, endpoint: DATASET_SPECS[name].endpoint, skipped: "not requested" };
+    const collected = dataset.error === undefined && dataset.skipped === undefined;
     return {
       name,
       target: dataset.target,
       endpoint: dataset.endpoint,
       status: dataset.skipped ? "not_configured" : dataset.error ? "not_readable" : "readable",
-      count: dataset.error || dataset.skipped ? undefined : datasetCount(dataset),
+      collected,
+      http_status: dataset.status ?? null,
+      count: collected ? datasetCount(dataset) ?? null : null,
+      truncated: collected ? dataset.page?.truncated ?? null : null,
       error: dataset.error ?? dataset.skipped,
     };
   });
 
   let privileges: JsonRecord | undefined;
   let privilegeError: string | undefined;
+  const privilegeProbeAvailable = typeof client.hasPrivileges === "function";
   try {
-    privileges = typeof client.hasPrivileges === "function" ? await client.hasPrivileges() : undefined;
+    privileges = privilegeProbeAvailable ? await client.hasPrivileges?.() : undefined;
   } catch (error) {
     privilegeError = redactSecrets(errorMessage(error), config);
   }
-  const missing = privileges ? missingPrivilegeSummary(privileges) : { cluster: [], index: [] };
+  const missing = privileges ? missingPrivilegeSummary(privileges) : undefined;
 
   const authenticated = datasetData<JsonRecord>(snapshot, "authenticate");
   const coreReadable = CORE_ACCESS_SURFACES.every((name) => snapshot[name]?.error === undefined && snapshot[name]?.skipped === undefined);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const configuredCount = surfaces.filter((surface) => surface.status !== "not_configured").length;
-  const status: ElasticAccessCheckResult["status"] = coreReadable && missing.cluster.length === 0 ? "healthy" : "limited";
+  const status: ElasticAccessCheckResult["status"] = coreReadable && missing !== undefined && missing.cluster.length === 0 ? "healthy" : "limited";
   const notes = [
     `Using Elasticsearch ${config.elasticsearchUrl} with ${config.authMode} authentication.`,
     config.kibanaUrl ? `Kibana ${config.kibanaUrl}${config.kibanaSpaceId ? ` (space ${config.kibanaSpaceId})` : ""} is configured.` : "Kibana is not configured (set KIBANA_URL to enable Kibana checks).",
@@ -3223,9 +3761,10 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
       ? `Authenticated as ${asString(authenticated.username) ?? "unknown"} via ${asString(getNestedValue(authenticated, ["authentication_realm", "type"])) ?? "unknown"} realm with roles ${asStringList(authenticated.roles).join(", ") || "(none)"}.`
       : `Authentication probe failed: ${datasetProblem(snapshot, "authenticate")}.`,
     `${readableCount}/${configuredCount} configured audit surfaces are readable.`,
-    ...(privilegeError ? [`Privilege probe failed: ${privilegeError}`] : []),
-    ...(missing.cluster.length > 0 ? [`Missing cluster privileges: ${missing.cluster.join(", ")}.`] : []),
-    ...(missing.index.length > 0 ? [`Missing index privileges: ${missing.index.join(", ")}.`] : []),
+    ...(privilegeError ? [`Privilege probe failed, so missing privileges are unknown: ${privilegeError}`] : []),
+    ...(!privilegeProbeAvailable ? ["Privilege probe not available on this client, so missing privileges are unknown."] : []),
+    ...(missing && missing.cluster.length > 0 ? [`Missing cluster privileges: ${missing.cluster.join(", ")}.`] : []),
+    ...(missing && missing.index.length > 0 ? [`Missing index privileges: ${missing.index.join(", ")}.`] : []),
   ];
 
   return {
@@ -3236,8 +3775,9 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
     authenticatedAs: asString(authenticated?.username),
     authenticationRealm: asString(getNestedValue(authenticated, ["authentication_realm", "type"])),
     surfaces,
-    missingClusterPrivileges: missing.cluster,
-    missingIndexPrivileges: missing.index,
+    missingClusterPrivileges: missing?.cluster ?? null,
+    missingIndexPrivileges: missing?.index ?? null,
+    privilegeProbe: missing ? "readable" : privilegeError ? "not_readable" : "not_available",
     notes,
     recommendedNextStep: status === "healthy"
       ? "Run elastic_assess_identity, elastic_assess_access_control, elastic_assess_transport_security, elastic_assess_cluster_hardening, elastic_assess_kibana, or elastic_export_audit_bundle."
@@ -3250,7 +3790,7 @@ function formatAccessCheckText(result: ElasticAccessCheckResult): string {
     surface.name,
     surface.target,
     surface.status,
-    surface.count === undefined ? "-" : String(surface.count),
+    surface.count === null ? "unknown" : String(surface.count),
     surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 90) : "",
   ]);
 
@@ -3274,7 +3814,7 @@ function formatAssessmentText(result: ElasticAssessmentResult): string {
     item.summary,
   ]);
   const summary = Object.entries(result.summary)
-    .map(([key, value]) => `- ${key}: ${Array.isArray(value) ? value.join(", ") || "(none)" : String(value)}`)
+    .map(([key, value]) => `- ${key}: ${value === null || value === undefined ? "unread" : Array.isArray(value) ? value.join(", ") || "(none)" : String(value)}`)
     .join("\n");
 
   return [
@@ -3285,6 +3825,8 @@ function formatAssessmentText(result: ElasticAssessmentResult): string {
     "",
     formatTable(["Control", "Severity", "Status", "Title", "Summary"], rows),
     ...(result.errors.length > 0 ? ["", "Collection errors:", ...result.errors.map((error) => `- ${error}`)] : []),
+    ...(result.truncated.length > 0 ? ["", "Truncated inventories:", ...result.truncated.map((entry) => `- ${entry}`)] : []),
+    ...(result.not_collected.length > 0 ? ["", "Not collected:", ...result.not_collected.map((entry) => `- ${entry}`)] : []),
   ].join("\n");
 }
 
@@ -3297,7 +3839,7 @@ function countByStatus(findings: ElasticFinding[]): Record<ElasticFinding["statu
   };
 }
 
-function buildExecutiveSummary(config: ElasticResolvedConfig, assessments: ElasticAssessmentResult[], errors: string[]): string {
+function buildExecutiveSummary(config: ElasticResolvedConfig, assessments: ElasticAssessmentResult[], errors: string[], truncated: string[] = [], notCollected: string[] = []): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const counts = countByStatus(findings);
   const severityOrder: Record<ElasticFinding["severity"], number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -3316,7 +3858,10 @@ function buildExecutiveSummary(config: ElasticResolvedConfig, assessments: Elast
     `- Manual controls: ${counts.manual}`,
     `- Passing controls: ${counts.pass}`,
     `- Collection errors: ${errors.length}${errors.length > 0 ? " (see _errors.log)" : ""}`,
+    `- Truncated inventories: ${truncated.length}${truncated.length > 0 ? " (see collection_status.json)" : ""}`,
+    `- Datasets not collected (target not configured): ${notCollected.length}`,
     "",
+    ...(truncated.length > 0 ? ["## Truncated Inventories", "", ...truncated.map((entry) => `- ${entry}`), ""] : []),
     "## Assessment Areas",
     "",
     ...assessments.map((assessment) => {
@@ -3384,7 +3929,8 @@ function buildQuickReference(): string {
     "",
     "## Contents",
     "",
-    "- `core_data/*.json`: raw API snapshots (secrets redacted, Fleet enrollment api_key values removed)",
+    "- `core_data/*.json`: API snapshots projected to the fields the checks read (secrets redacted, connector/watch/pipeline literals dropped, Fleet enrollment api_key values removed)",
+    "- `collection_status.json`: per-dataset read status, HTTP status of failures, counts, and truncation; flags are null for datasets that were not read",
     "- `analysis/findings.json`: normalized findings for all 23 spec controls",
     "- `analysis/<area>.json`: per-area assessment output with summaries",
     "- `analysis/access.json`: readable surface inventory and missing privileges",
@@ -3398,8 +3944,88 @@ function buildQuickReference(): string {
     "- `fail`: API evidence shows the control is violated",
     "- `manual`: cannot be verified through the API; the summary states exactly what a human must collect",
     "",
+    "## Reading Unread Data",
+    "",
+    "- A `core_data` file whose `collected` is false is a not-collected marker (`status` carries the observed HTTP status, `error` the redacted message); it is never an empty list",
+    "- Counts, lists, and flags derived from an inventory that was denied, errored, or truncated render `null` in findings and summaries; `[]` and `0` always mean the inventory was read and is empty",
+    "- Named principals (users, keys, roles, policies) are listed only from inventories that were read completely",
+    "",
     "Credentials are never written into the bundle.",
   ].join("\n");
+}
+
+/** Marker written in place of a list whenever the dataset was denied, errored, or never requested, so a consumer cannot mistake it for an empty inventory. */
+export interface ElasticNotCollectedMarker {
+  collected: false;
+  status: number | "error" | "not-collected";
+  endpoint: string;
+  target: ElasticTarget;
+  error: string | null;
+  reason: "not_readable" | "not_configured";
+}
+
+function notCollectedMarker(dataset: ElasticDataset): ElasticNotCollectedMarker {
+  return {
+    collected: false,
+    status: dataset.skipped ? "not-collected" : dataset.status ?? "error",
+    endpoint: dataset.endpoint,
+    target: dataset.target,
+    error: dataset.error ?? dataset.skipped ?? null,
+    reason: dataset.skipped ? "not_configured" : "not_readable",
+  };
+}
+
+/** Builds the core_data file for a dataset: the payload when it was read, or the not-collected marker when it was not. */
+export function coreDataFile(dataset: ElasticDataset): JsonRecord {
+  const collected = dataset.error === undefined && dataset.skipped === undefined;
+  if (!collected) {
+    const marker = notCollectedMarker(dataset);
+    return { ...marker, page: null, data: marker };
+  }
+  return {
+    collected: true,
+    status: "readable",
+    endpoint: dataset.endpoint,
+    target: dataset.target,
+    error: null,
+    page: dataset.page ?? null,
+    data: dataset.data ?? null,
+  };
+}
+
+/** Per-dataset collection status; flags and counters render null for datasets whose read never completed. */
+export function buildCollectionStatus(snapshot: ElasticSnapshot): JsonRecord {
+  const datasets = Object.values(snapshot).filter((dataset): dataset is ElasticDataset => Boolean(dataset)).map((dataset) => {
+    const collected = dataset.error === undefined && dataset.skipped === undefined;
+    return {
+      name: dataset.name,
+      endpoint: dataset.endpoint,
+      target: dataset.target,
+      status: collected ? "readable" : dataset.skipped ? "not_configured" : "not_readable",
+      collected,
+      http_status: dataset.status ?? null,
+      count: collected ? datasetCount(dataset) ?? null : null,
+      paged: collected ? dataset.page !== undefined : null,
+      truncated: collected ? dataset.page?.truncated ?? null : null,
+      seen: collected ? dataset.page?.seen ?? null : null,
+      total: collected ? dataset.page?.total ?? null : null,
+      pages: collected ? dataset.page?.pages ?? null : null,
+      error: dataset.error ?? dataset.skipped ?? null,
+    };
+  });
+  const collected = datasets.filter((dataset) => dataset.collected);
+  return {
+    datasets,
+    totals: {
+      datasets: datasets.length,
+      readable: collected.length,
+      not_readable: datasets.filter((dataset) => dataset.status === "not_readable").length,
+      not_configured: datasets.filter((dataset) => dataset.status === "not_configured").length,
+      truncated: collected.filter((dataset) => dataset.truncated === true).length,
+      // Datasets that were never read cannot be classified as complete or truncated.
+      truncation_unknown: datasets.length - collected.length,
+    },
+  };
 }
 
 export async function exportElasticAuditBundle(
@@ -3414,6 +4040,8 @@ export async function exportElasticAuditBundle(
   const assessments = areas.map((area) => evaluateElasticArea(area, snapshot, options, { elasticsearchUrl: config.elasticsearchUrl, kibanaSpaceId: config.kibanaSpaceId }));
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = listSnapshotErrors(snapshot);
+  const truncated = listSnapshotTruncations(snapshot);
+  const notCollected = listSnapshotSkips(snapshot);
 
   ensurePrivateDir(outputRoot);
   const clusterLabel = safeDirName(new URL(config.elasticsearchUrl).hostname);
@@ -3433,15 +4061,9 @@ export async function exportElasticAuditBundle(
 
   for (const dataset of Object.values(snapshot)) {
     if (!dataset) continue;
-    await writeSecureTextFile(outputDir, `core_data/${dataset.name}.json`, serializeJson({
-      endpoint: dataset.endpoint,
-      target: dataset.target,
-      error: dataset.error ?? null,
-      skipped: dataset.skipped ?? null,
-      page: dataset.page ?? null,
-      data: dataset.data ?? null,
-    }));
+    await writeSecureTextFile(outputDir, `core_data/${dataset.name}.json`, serializeJson(coreDataFile(dataset)));
   }
+  await writeSecureTextFile(outputDir, "collection_status.json", serializeJson(buildCollectionStatus(snapshot)));
 
   await writeSecureTextFile(outputDir, "analysis/access.json", serializeJson(access));
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
@@ -3449,7 +4071,7 @@ export async function exportElasticAuditBundle(
     await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson(assessment));
   }
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, errors)}\n`);
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, errors, truncated, notCollected)}\n`);
   await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
   for (const framework of ELASTIC_FRAMEWORKS) {
     await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.key}.md`, `${buildFrameworkReport(framework, findings)}\n`);
@@ -3471,6 +4093,8 @@ export async function exportElasticAuditBundle(
     fileCount: await countFilesRecursively(outputDir),
     findingCount: findings.length,
     errorCount: errors.length,
+    truncatedCount: truncated.length,
+    notCollectedCount: notCollected.length,
   };
 }
 
@@ -3673,6 +4297,8 @@ export function registerElasticTools(pi: any): void {
             `Findings: ${result.findingCount}`,
             `Files: ${result.fileCount}`,
             `Collection errors: ${result.errorCount}${result.errorCount > 0 ? " (see _errors.log)" : ""}`,
+            `Truncated inventories: ${result.truncatedCount}${result.truncatedCount > 0 ? " (see collection_status.json)" : ""}`,
+            `Datasets not collected: ${result.notCollectedCount}`,
           ].join("\n"),
           {
             tool: "elastic_export_audit_bundle",
@@ -3681,6 +4307,8 @@ export function registerElasticTools(pi: any): void {
             finding_count: result.findingCount,
             file_count: result.fileCount,
             error_count: result.errorCount,
+            truncated_count: result.truncatedCount,
+            not_collected_count: result.notCollectedCount,
           },
         );
       } catch (error) {
