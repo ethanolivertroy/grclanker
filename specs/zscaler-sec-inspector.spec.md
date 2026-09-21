@@ -3,11 +3,11 @@ slug: "zscaler-sec-inspector"
 name: "Zscaler Security Inspector"
 vendor: "Zscaler"
 category: "security-network-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/zscaler-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # zscaler-sec-inspector -- Architecture Specification
@@ -426,4 +426,33 @@ zscaler-inspector test-connection \
 
 ## 10. Status
 
-**Not yet implemented. Spec only.**
+**Implemented in grclanker** (TypeScript, `cli/extensions/grc-tools/zscaler.ts`) on 2026-09-21.
+
+### grclanker implementation
+
+- `zscaler_check_access`: probes ten ZIA and seven ZPA read surfaces and reports which products are configured.
+- `zscaler_assess_zia_access_control`: controls 6, 7, 14.
+- `zscaler_assess_zia_policy`: controls 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25.
+- `zscaler_assess_zpa`: controls 8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24.
+- `zscaler_export_audit_bundle`: `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log`, zip named after the allocated directory.
+- Tests: `cli/tests/zscaler.test.mjs`; live smoke: `npm --prefix cli run test:zscaler:live`; guide: `src/content/docs/docs/integrations/zscaler.md`.
+
+### What shipped
+
+All 25 controls produce findings. Controls that the published API cannot verify render as `manual` findings that name the portal evidence to collect: control 6 (per-admin MFA is not exposed by the ZIA API; password-login bypasses are reported), the ZIA half of control 13 (admin session timeout is not exposed), and the ZIA CA chain half of control 24. ZIA uses the legacy API key obfuscation plus `POST /api/v1/authenticatedSession` session login and `DELETE` logout; ZPA uses `POST /signin` client credentials with bearer tokens and `page`/`pagesize` pagination to `totalPages`. Verdicts never pass on unreadable, empty, unconfigured, undated, or partial evidence.
+
+### Deviations from this spec (official docs were followed)
+
+- ZIA base URLs are `https://zsapi.<cloud>.net/api/v1` (section 2.1 lists `https://<cloud>.net/api/v1`).
+- Cloud firewall rules are read from `/firewallFilteringRules` (section 4 lists `/firewallRules`).
+- Advanced threat and malware settings are read from `/cyberThreatProtection/advancedThreatSettings`, `/cyberThreatProtection/malwarePolicy`, and `/cyberThreatProtection/malwareSettings` (section 4 lists `/security/advanced`, which is the denylist and is read for control 25 evidence).
+- Cloud app control rules are read from `/webApplicationRules/{ruleType}` (section 4 lists `/cloudApplications`).
+- ZPA administrators are read from `/administrators` (section 4 lists `/admin/users`); ZPA policy rules from `/policySet/rules/policyType/{policyType}`.
+- Audit logging uses `GET /auditlogEntryReport` (status only, no report is generated) plus `GET /nssFeeds` for export evidence.
+
+### Not yet implemented
+
+- ZDX metrics and ZDX-based enrichment.
+- OneAPI (Zidentity) OAuth mode; OneAPI credentials are detected and reported but legacy ZIA and ZPA credentials are required.
+- Cloud Service API key inventory, per-file-type sandbox depth, and ATP risk tolerance scoring beyond the enabling flags.
+- ZIA admin session timeout and per-admin MFA state, which the published API does not expose.
