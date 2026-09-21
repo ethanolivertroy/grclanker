@@ -1277,6 +1277,69 @@ test("assessAwsIdentity new findings never pass on AccessDenied, empty policies 
   assert.match(findingById(truncated, "AWS-IAM-08").summary, /policy inventory truncated at 1000/);
 });
 
+test("assessAwsIdentity reads root activity from us-east-1 when the configured region differs (review repro)", async () => {
+  const lookups = [];
+  const result = await assessAwsIdentity(compliantIdentityClient({
+    getResolvedConfig: () => sampleConfig({ region: "eu-west-1" }),
+    async lookupRootEvents(region, start, end, limit) {
+      lookups.push({ region, start: start.toISOString(), end: end.toISOString(), limit });
+      return { items: [], truncated: false };
+    },
+  }));
+  assert.deepEqual(lookups, [{ region: "us-east-1", start: "2026-01-16T00:00:00.000Z", end: "2026-04-16T00:00:00.000Z", limit: 500 }]);
+  const root = findingById(result, "AWS-IAM-07");
+  assert.equal(root.status, "pass");
+  assert.match(root.summary, /in us-east-1, the region that receives global console sign-in events/);
+  assert.equal(root.evidence.region, "eu-west-1");
+  assert.equal(root.evidence.lookup_region, "us-east-1");
+  assert.equal(root.evidence.global_event_region, "us-east-1");
+  assert.equal(root.evidence.global_lookup_error, null);
+  assert.deepEqual(result.errors, []);
+
+  const consoleLogin = await assessAwsIdentity(compliantIdentityClient({
+    getResolvedConfig: () => sampleConfig({ region: "eu-west-1" }),
+    async lookupRootEvents(region) {
+      return {
+        items: region === "us-east-1" ? [{ EventId: "e1", EventName: "ConsoleLogin", EventTime: "2026-04-10T08:00:00Z", EventSource: "signin.amazonaws.com", Username: "root" }] : [],
+        truncated: false,
+      };
+    },
+  }));
+  assert.equal(findingById(consoleLogin, "AWS-IAM-07").status, "fail");
+  assert.match(findingById(consoleLogin, "AWS-IAM-07").summary, /lookup region us-east-1/);
+});
+
+test("assessAwsIdentity caps root activity at warn when us-east-1 is unreadable and goes manual when nothing is readable", async () => {
+  const lookups = [];
+  const capped = await assessAwsIdentity(compliantIdentityClient({
+    getResolvedConfig: () => sampleConfig({ region: "eu-west-1" }),
+    async lookupRootEvents(region) {
+      lookups.push(region);
+      if (region === "us-east-1") throw accessDenied();
+      return { items: [], truncated: false };
+    },
+  }));
+  assert.deepEqual(lookups, ["us-east-1", "eu-west-1"]);
+  const root = findingById(capped, "AWS-IAM-07");
+  assert.equal(root.status, "warn");
+  assert.match(root.summary, /Downgraded to warn: us-east-1 lookup failed \(cloudtrail:LookupEvents Username=root us-east-1: AccessDenied/);
+  assert.match(root.summary, /only eu-west-1 API activity was read/);
+  assert.equal(root.evidence.lookup_region, "eu-west-1");
+  assert.match(root.evidence.global_lookup_error, /^cloudtrail:LookupEvents Username=root us-east-1: AccessDenied/);
+  assert.deepEqual(capped.errors.filter((line) => line.startsWith("cloudtrail:LookupEvents")).length, 1);
+
+  const unreadable = await assessAwsIdentity(compliantIdentityClient({
+    getResolvedConfig: () => sampleConfig({ region: "eu-west-1" }),
+    async lookupRootEvents() {
+      throw new Error("endpoint unreachable");
+    },
+  }));
+  const manual = findingById(unreadable, "AWS-IAM-07");
+  assert.equal(manual.status, "manual");
+  assert.match(manual.summary, /Username=root us-east-1: error \(.*endpoint unreachable.*\); cloudtrail:LookupEvents Username=root eu-west-1: error/);
+  assert.equal(unreadable.errors.filter((line) => line.startsWith("cloudtrail:LookupEvents")).length, 2);
+});
+
 function compliantOrgClient(overrides = {}) {
   return {
     async describeOrganization() {

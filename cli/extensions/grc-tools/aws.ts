@@ -114,6 +114,8 @@ const DEFAULT_RESOURCE_LIMIT = 2000;
 const DEFAULT_POLICY_LIMIT = 1000;
 const DEFAULT_EVENT_LIMIT = 500;
 const DEFAULT_ROOT_LOOKBACK_DAYS = 90;
+/** Global service events such as root ConsoleLogin are delivered to CloudTrail in us-east-1 only. */
+export const ROOT_EVENT_REGION = "us-east-1";
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_SENSITIVE_PORTS = [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017];
 const ANY_IPV4 = "0.0.0.0/0";
@@ -797,6 +799,7 @@ export class AwsAuditorClient {
   private readonly ec2Clients = new Map<string, EC2Client>();
   private readonly rdsClients = new Map<string, RDSClient>();
   private readonly kmsClients = new Map<string, KMSClient>();
+  private readonly cloudTrailClients = new Map<string, CloudTrailClient>();
   private readonly now: () => Date;
 
   constructor(
@@ -854,13 +857,16 @@ export class AwsAuditorClient {
     return normalizePolicyDocument(result.PolicyVersion?.Document, "iam-url-encoded") ?? null;
   }
 
-  /** CloudTrail LookupEvents filtered on Username root within the window (management events, 90-day history). */
-  async lookupRootEvents(startTime: Date, endTime: Date, limit = DEFAULT_EVENT_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+  /**
+   * CloudTrail LookupEvents filtered on Username root within the window (management events, 90-day history).
+   * The lookup is regional; callers pass us-east-1 to see global sign-in events regardless of the configured region.
+   */
+  async lookupRootEvents(region: string, startTime: Date, endTime: Date, limit = DEFAULT_EVENT_LIMIT): Promise<AwsPagedList<JsonRecord>> {
     const events: JsonRecord[] = [];
     let nextToken: string | undefined;
     let truncated = false;
     do {
-      const result = await this.cloudTrail.send(new LookupEventsCommand({
+      const result = await this.cloudTrailFor(region).send(new LookupEventsCommand({
         LookupAttributes: [{ AttributeKey: "Username", AttributeValue: "root" }],
         StartTime: startTime,
         EndTime: endTime,
@@ -939,6 +945,16 @@ export class AwsAuditorClient {
     if (!client) {
       client = new EC2Client({ region, credentials: this.credentials });
       this.ec2Clients.set(region, client);
+    }
+    return client;
+  }
+
+  private cloudTrailFor(region: string): CloudTrailClient {
+    if (region === this.config.region) return this.cloudTrail;
+    let client = this.cloudTrailClients.get(region);
+    if (!client) {
+      client = new CloudTrailClient({ region, credentials: this.credentials });
+      this.cloudTrailClients.set(region, client);
     }
     return client;
   }
@@ -1696,6 +1712,42 @@ export interface AwsIdentityOptions {
   policyLimit?: number;
 }
 
+interface RootActivityLookup {
+  result: AwsSurfaceResult<AwsPagedList<JsonRecord>>;
+  /** Region the returned events were read from. */
+  lookupRegion: string;
+  /** Set when the us-east-1 lookup failed and the configured region was read instead. */
+  globalLookupError?: string;
+}
+
+/**
+ * Root ConsoleLogin is a global event delivered to us-east-1 only, so the lookup always runs there first.
+ * When us-east-1 cannot be read and the configured region differs, the configured region is read as a
+ * fallback; its verdict is capped at warn because console sign-ins remain unverified.
+ */
+async function lookupRootActivity(
+  client: Pick<AwsIdentityClient, "lookupRootEvents">,
+  configuredRegion: string,
+  start: Date,
+  end: Date,
+  errors: string[],
+): Promise<RootActivityLookup> {
+  const global = await attemptAwsRead(
+    `cloudtrail:LookupEvents Username=root ${ROOT_EVENT_REGION}`,
+    () => client.lookupRootEvents(ROOT_EVENT_REGION, start, end, DEFAULT_EVENT_LIMIT),
+    errors,
+  );
+  if (!global.error || configuredRegion === ROOT_EVENT_REGION) {
+    return { result: global, lookupRegion: ROOT_EVENT_REGION };
+  }
+  const regional = await attemptAwsRead(
+    `cloudtrail:LookupEvents Username=root ${configuredRegion}`,
+    () => client.lookupRootEvents(configuredRegion, start, end, DEFAULT_EVENT_LIMIT),
+    errors,
+  );
+  return { result: regional, lookupRegion: configuredRegion, globalLookupError: global.error };
+}
+
 export async function assessAwsIdentity(
   client: AwsIdentityClient,
   options: AwsIdentityOptions = {},
@@ -1711,14 +1763,15 @@ export async function assessAwsIdentity(
   const lookbackStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
   const region = typeof client.getResolvedConfig === "function" ? client.getResolvedConfig().region : DEFAULT_REGION;
 
-  const [summary, passwordPolicy, users, roles, rootEvents, customerPolicies] = await Promise.all([
+  const [summary, passwordPolicy, users, roles, rootActivity, customerPolicies] = await Promise.all([
     client.getAccountSummary(),
     client.getPasswordPolicy(),
     client.listIamUsers(userLimit),
     client.getAccountAuthorizationDetails(roleLimit),
-    attemptAwsRead("cloudtrail:LookupEvents Username=root", () => client.lookupRootEvents(lookbackStart, now, DEFAULT_EVENT_LIMIT), errors),
+    lookupRootActivity(client, region, lookbackStart, now, errors),
     attemptAwsRead("iam:ListPolicies Scope=Local", () => client.listCustomerManagedPolicies(policyLimit), errors),
   ]);
+  const rootEvents = rootActivity.result;
 
   const policyRows = await mapWithConcurrency(customerPolicies.value?.items ?? [], DEFAULT_CONCURRENCY, async (policy) => {
     const arn = asString(policy.Arn) ?? "";
@@ -1854,7 +1907,9 @@ export async function assessAwsIdentity(
     ),
   ];
 
-  // Control 4 (root sign-ins): CloudTrail LookupEvents for Username root within the lookback window.
+  // Control 4 (root sign-ins): CloudTrail LookupEvents for Username root within the lookback window,
+  // read from us-east-1 because root ConsoleLogin is a global event delivered only there.
+  const rootLookupRegion = rootActivity.lookupRegion;
   const rootEventList = rootEvents.value?.items ?? [];
   const rootConsoleLogins = rootEventList.filter((event) => asString(event.EventName) === "ConsoleLogin");
   const rootOtherEvents = rootEventList.filter((event) => asString(event.EventName) !== "ConsoleLogin");
@@ -1862,19 +1917,23 @@ export async function assessAwsIdentity(
   let rootStatus: AwsFinding["status"];
   let rootSummary: string;
   if (rootEvents.error) {
+    const attempted = rootActivity.globalLookupError ? `${rootActivity.globalLookupError}; ${rootEvents.error}` : rootEvents.error;
     rootStatus = "manual";
-    rootSummary = `Root activity could not be read from CloudTrail LookupEvents (${rootEvents.error}); review root sign-in history in the CloudTrail console or IAM credential report.`;
+    rootSummary = `Root activity could not be read from CloudTrail LookupEvents (${attempted}); review root sign-in history in the CloudTrail console or IAM credential report.`;
   } else if (rootConsoleLogins.length > 0) {
     rootStatus = "fail";
-    rootSummary = `${rootConsoleLogins.length} root ConsoleLogin event(s) were recorded in the last ${lookbackDays} days (region ${region}); root should not be used for daily or administrative tasks.`;
+    rootSummary = `${rootConsoleLogins.length} root ConsoleLogin event(s) were recorded in the last ${lookbackDays} days (lookup region ${rootLookupRegion}); root should not be used for daily or administrative tasks.`;
   } else if (rootOtherEvents.length > 0) {
     rootStatus = "warn";
-    rootSummary = `No root ConsoleLogin events, but ${rootOtherEvents.length} other root API event(s) were recorded in the last ${lookbackDays} days (region ${region}); confirm each was a sanctioned root-only task.`;
+    rootSummary = `No root ConsoleLogin events, but ${rootOtherEvents.length} other root API event(s) were recorded in the last ${lookbackDays} days (lookup region ${rootLookupRegion}); confirm each was a sanctioned root-only task.`;
   } else {
     rootStatus = "pass";
-    rootSummary = `No CloudTrail events attributed to the root user were found in the last ${lookbackDays} days in region ${region}. Global sign-in events are recorded in us-east-1, so run there for console sign-in coverage.`;
+    rootSummary = `No CloudTrail events attributed to the root user were found in the last ${lookbackDays} days in ${rootLookupRegion}, the region that receives global console sign-in events.`;
   }
   const rootCaps: string[] = [];
+  if (rootActivity.globalLookupError) {
+    rootCaps.push(`${ROOT_EVENT_REGION} lookup failed (${rootActivity.globalLookupError}), so global console sign-in events are unverified and only ${rootLookupRegion} API activity was read`);
+  }
   if (rootEvents.value?.truncated) rootCaps.push(`event lookup truncated at ${DEFAULT_EVENT_LIMIT}`);
   if (undatedRootEvents.length > 0) rootCaps.push(`${undatedRootEvents.length} event(s) without EventTime`);
   const rootVerdict = withCap(rootStatus, rootSummary, rootCaps);
@@ -1887,6 +1946,9 @@ export async function assessAwsIdentity(
     buildAwsMappings(4),
     {
       region,
+      lookup_region: rootLookupRegion,
+      global_event_region: ROOT_EVENT_REGION,
+      global_lookup_error: rootActivity.globalLookupError ?? null,
       lookback_days: lookbackDays,
       window_start: lookbackStart.toISOString(),
       root_events: rootEventList.length,

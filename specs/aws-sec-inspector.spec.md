@@ -464,7 +464,7 @@ Implemented in grclanker as native TypeScript (`cli/extensions/grc-tools/aws.ts`
 ### Deviations from this spec (official docs win)
 
 - Controls 11, 12, 13, 14, 20, 21, and 22 read the resource APIs directly (S3, S3 Control, EC2, RDS, KMS) rather than Security Hub or Config compliance results, so the verdicts do not depend on which standards or rules a tenant has enabled.
-- Control 4 uses `cloudtrail:LookupEvents` with `LookupAttributes Username=root` in the configured region; console sign-ins are global events recorded in `us-east-1`, and the finding says so.
+- Control 4 uses `cloudtrail:LookupEvents` with `LookupAttributes Username=root` issued against `us-east-1` regardless of the configured region, because console sign-ins are global events recorded only there; the finding records the lookup region, and a denied or failed `us-east-1` lookup caps the verdict at `warn`.
 - Control 11 treats `NoSuchPublicAccessBlockConfiguration` from S3 Control as `fail` (the account block is unset) and reads `GetBucketPolicyStatus.IsPublic` for every bucket; a bucket policy that evaluates public under a full account block is `warn`, not `pass`.
 - Control 13 assesses S3 bucket policies for a `Deny` on `aws:SecureTransport=false`; load balancer and API endpoint TLS policies are not read and the finding states that.
 - Control 22 applies automatic rotation only to `KeyManager=CUSTOMER` keys with `KeyState=Enabled`, `KeySpec=SYMMETRIC_DEFAULT`, and `Origin=AWS_KMS`, following the KMS documentation on which keys support automatic rotation; other customer keys are listed as out of scope and cap the verdict at `warn`.
