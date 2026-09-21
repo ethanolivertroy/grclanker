@@ -1335,6 +1335,13 @@ export class MulesoftApiClient {
     );
   }
 
+  // The per-DLB resource is where docs.mulesoft.com/cloudhub/lb-cert-validation documents defaultCipherSuite.
+  async getLoadBalancer(vpcId: string, loadBalancerId: string): Promise<JsonRecord> {
+    return asObject(await this.get(
+      `/cloudhub/api/organizations/${encodeURIComponent(this.config.organizationId)}/vpcs/${encodeURIComponent(vpcId)}/loadbalancers/${encodeURIComponent(loadBalancerId)}`,
+    )) ?? {};
+  }
+
   async probeCertificate(host: string): Promise<MulesoftCertificateSummary> {
     return this.certificateProbe(host, this.config.timeoutMs);
   }
@@ -1415,6 +1422,7 @@ type RuntimeClient = Pick<
   | "listVpcs"
   | "getVpc"
   | "listLoadBalancers"
+  | "getLoadBalancer"
   | "probeCertificate"
   | "listHybridServers"
   | "listMqRegions"
@@ -2505,6 +2513,38 @@ function loadBalancerLabel(loadBalancer: JsonRecord): string {
   return asString(loadBalancer.name) ?? asString(loadBalancer.domain) ?? asString(loadBalancer.id) ?? "load balancer";
 }
 
+// OpenSSL cipher-string review for a DLB defaultCipherSuite. Entries prefixed with ! or - are exclusions and are ignored.
+const WEAK_CIPHER_PATTERN = /(^|-)(RC4|RC2|DES|3DES|DES-CBC3|NULL|EXPORT|EXP|MD5|aNULL|eNULL|ADH|AECDH|IDEA|SEED|LOW|MEDIUM|SSLv3|SSLv2|COMPLEMENTOFDEFAULT|COMPLEMENTOFALL)(-|$)/i;
+const BROAD_CIPHER_KEYWORD_PATTERN = /^(ALL|DEFAULT|HIGH|TLSv1|TLSv1\.[0-2]|kRSA|aRSA|RSA|AES|AESGCM|SHA|SHA1|SHA256|SHA384|CAMELLIA|kEECDH|kEDH)$/i;
+const FORWARD_SECRET_CIPHER_PATTERN = /^(ECDHE|DHE|EECDH|EDH|TLS_|TLS13-)/i;
+
+interface CipherSuiteReview {
+  suites: string[];
+  weak: string[];
+  broadKeywords: string[];
+  nonForwardSecrecy: string[];
+}
+
+interface CipherReviewRecord {
+  loadBalancer: JsonRecord;
+  cipherSuite?: string;
+  review?: CipherSuiteReview;
+}
+
+function reviewCipherSuite(value: string): CipherSuiteReview {
+  const suites = value.split(/[:,\s]+/).map((entry) => entry.trim()).filter((entry) => entry && !entry.startsWith("!") && !entry.startsWith("-"));
+  const weak = suites.filter((entry) => WEAK_CIPHER_PATTERN.test(entry));
+  const broadKeywords = suites.filter((entry) => BROAD_CIPHER_KEYWORD_PATTERN.test(entry));
+  const nonForwardSecrecy = suites.filter((entry) =>
+    !weak.includes(entry) && !broadKeywords.includes(entry) && !FORWARD_SECRET_CIPHER_PATTERN.test(entry) && !/^\+/.test(entry),
+  );
+  return { suites, weak, broadKeywords, nonForwardSecrecy };
+}
+
+function loadBalancerCipherSuite(loadBalancer: JsonRecord): string | undefined {
+  return asString(loadBalancer.defaultCipherSuite);
+}
+
 function daysUntil(date: Date, now: number): number {
   return Math.floor((date.getTime() - now) / DAY_MS);
 }
@@ -2613,7 +2653,20 @@ export async function assessMulesoftRuntimeInfrastructure(
 
   const loadBalancerSource = await collectPage("load_balancers", () => client.listLoadBalancers(DEFAULT_LOAD_BALANCER_LIMIT), errors);
   const loadBalancerPage = capPage(loadBalancerSource.value, DEFAULT_LOAD_BALANCER_LIMIT);
-  const loadBalancers = loadBalancerPage.items;
+  const loadBalancerDetails: Array<Collected<JsonRecord>> = [];
+  const loadBalancers: JsonRecord[] = [];
+  for (const summary of loadBalancerPage.items) {
+    const vpcId = asString(summary.vpcId);
+    const loadBalancerId = asString(summary.id);
+    if (loadBalancerCipherSuite(summary) !== undefined || !vpcId || !loadBalancerId) {
+      loadBalancers.push(summary);
+      continue;
+    }
+    const detail = await collect<JsonRecord>(`load_balancer:${loadBalancerLabel(summary)}`, {}, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
+    loadBalancerDetails.push(detail);
+    loadBalancers.push({ ...summary, ...detail.value });
+  }
+  const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails);
   const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
   const certificateProbes: Array<{ loadBalancer: JsonRecord; certificate?: MulesoftCertificateSummary; error?: string }> = [];
   for (const loadBalancer of loadBalancers) {
@@ -2674,6 +2727,15 @@ export async function assessMulesoftRuntimeInfrastructure(
   const tls10LoadBalancers = loadBalancers.filter((item) => asBoolean(item.tlsv1) === true);
   const plainHttpLoadBalancers = loadBalancers.filter((item) => /^on$/i.test(asString(item.httpMode) ?? ""));
   const loadBalancersMissingFlags = loadBalancers.filter((item) => asBoolean(item.tlsv1) === undefined || asString(item.httpMode) === undefined);
+  const cipherReviews: CipherReviewRecord[] = loadBalancers.map((item) => {
+    const cipherSuite = loadBalancerCipherSuite(item);
+    return { loadBalancer: item, cipherSuite, review: cipherSuite === undefined ? undefined : reviewCipherSuite(cipherSuite) };
+  });
+  const loadBalancersMissingCiphers = cipherReviews.filter((item) => item.review === undefined);
+  const weakCipherLoadBalancers = cipherReviews.filter((item) => item.review !== undefined && item.review.weak.length > 0);
+  const legacyCipherLoadBalancers = cipherReviews.filter((item) =>
+    item.review !== undefined && item.review.weak.length === 0 && (item.review.nonForwardSecrecy.length > 0 || item.review.broadKeywords.length > 0),
+  );
 
   const certificateResults = certificateProbes.map((probe) => {
     const validTo = probe.certificate?.validTo ? asDate(probe.certificate.validTo) : undefined;
@@ -2717,6 +2779,7 @@ export async function assessMulesoftRuntimeInfrastructure(
   ];
   const applicationInputs: EvaluationInputs = { primary: [environments.source, applicationsSource], partial: applicationPartialNotes };
   const vpcInputs: EvaluationInputs = { primary: [vpcSummaries, vpcDetailsSource], partial: [vpcPartialNote, scope.note] };
+  const loadBalancerTlsInputs: EvaluationInputs = { primary: [loadBalancerSource, loadBalancerDetailsSource], partial: [loadBalancerPartialNote, scope.note] };
   const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote, scope.note] };
   const zeroApplicationsSummary = `Zero CloudHub 1.0 applications were visible in ${environments.sampled.length} sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.`;
   const noVpcSummary = "Zero CloudHub VPCs are visible, which is treated as manual. If applications run in CloudHub 2.0 private spaces or Runtime Fabric, export the private space firewall rules or cluster network policy from Runtime Manager as evidence.";
@@ -2851,21 +2914,32 @@ export async function assessMulesoftRuntimeInfrastructure(
     ),
     evaluate(
       15,
-      loadBalancerInputs,
-      "Export Runtime Manager > Load Balancers > each load balancer's TLS settings (tlsv1, tlsv13, httpMode) as evidence.",
+      loadBalancerTlsInputs,
+      "Export Runtime Manager > Load Balancers > each load balancer's TLS settings (tlsv1, tlsv13, httpMode) and the defaultCipherSuite from GET /cloudhub/api/organizations/{orgId}/vpcs/{vpcId}/loadbalancers/{dlbId} as evidence.",
       () => {
+        const describeCiphers = (items: CipherReviewRecord[], pick: (review: CipherSuiteReview) => string[]) =>
+          sample(items.flatMap((item) => (item.review ? [`${loadBalancerLabel(item.loadBalancer)}: ${pick(item.review).join(", ")}`] : [])));
         const evidence = {
-          load_balancers: loadBalancers.map((item) => ({
-            name: loadBalancerLabel(item),
-            http_mode: asString(item.httpMode) ?? null,
-            tlsv1: asBoolean(item.tlsv1) ?? null,
-            tlsv13: asBoolean(item.tlsv13) ?? null,
-            state: asString(item.state) ?? null,
+          load_balancers: cipherReviews.map((item) => ({
+            name: loadBalancerLabel(item.loadBalancer),
+            http_mode: asString(item.loadBalancer.httpMode) ?? null,
+            tlsv1: asBoolean(item.loadBalancer.tlsv1) ?? null,
+            tlsv13: asBoolean(item.loadBalancer.tlsv13) ?? null,
+            state: asString(item.loadBalancer.state) ?? null,
+            default_cipher_suite: item.cipherSuite ?? null,
+            cipher_suites: item.review?.suites.length ?? null,
+            weak_ciphers: item.review?.weak ?? [],
+            non_forward_secrecy_ciphers: item.review?.nonForwardSecrecy ?? [],
+            broad_cipher_keywords: item.review?.broadKeywords ?? [],
           })),
+          weak_cipher_pattern: "RC4, DES/3DES, NULL, EXPORT, MD5, anonymous (aNULL/ADH/AECDH), IDEA, SEED, LOW, MEDIUM, SSLv2/SSLv3",
         };
         if (loadBalancers.length === 0) return verdict("manual", noLoadBalancerSummary, evidence);
         if (tls10LoadBalancers.length > 0) {
           return verdict("fail", `${tls10LoadBalancers.length}/${loadBalancers.length} dedicated load balancer(s) still accept TLS 1.0 and 1.1.`, evidence);
+        }
+        if (weakCipherLoadBalancers.length > 0) {
+          return verdict("fail", `${weakCipherLoadBalancers.length}/${loadBalancers.length} dedicated load balancer(s) have a defaultCipherSuite that still offers weak ciphers (${describeCiphers(weakCipherLoadBalancers, (review) => review.weak).join("; ")}); rotate to a suite such as NewDefault-v1 via PATCH /defaultCipherSuiteName.`, evidence);
         }
         if (plainHttpLoadBalancers.length > 0) {
           return verdict("warn", `${plainHttpLoadBalancers.length} dedicated load balancer(s) accept plain HTTP without redirecting to HTTPS.`, evidence);
@@ -2873,7 +2947,13 @@ export async function assessMulesoftRuntimeInfrastructure(
         if (loadBalancersMissingFlags.length > 0) {
           return verdict("warn", `${loadBalancersMissingFlags.length}/${loadBalancers.length} dedicated load balancer(s) did not return the tlsv1 or httpMode flags, so their TLS posture cannot be confirmed.`, evidence);
         }
-        return verdict("pass", `All ${loadBalancers.length} dedicated load balancer(s) report tlsv1=false and an httpMode that does not serve plain HTTP; cipher suite selection is managed by Anypoint and should be confirmed in Runtime Manager.`, evidence);
+        if (loadBalancersMissingCiphers.length > 0) {
+          return verdict("warn", `${loadBalancersMissingCiphers.length}/${loadBalancers.length} dedicated load balancer(s) did not return defaultCipherSuite (${sample(loadBalancersMissingCiphers.map((item) => loadBalancerLabel(item.loadBalancer))).join(", ")}), so cipher strength cannot be confirmed and is not counted as strong.`, evidence);
+        }
+        if (legacyCipherLoadBalancers.length > 0) {
+          return verdict("warn", `${legacyCipherLoadBalancers.length}/${loadBalancers.length} dedicated load balancer(s) have a defaultCipherSuite that includes non-forward-secret or broad OpenSSL groups (${describeCiphers(legacyCipherLoadBalancers, (review) => [...review.nonForwardSecrecy, ...review.broadKeywords]).join("; ")}); prefer ECDHE/DHE AES-GCM suites only.`, evidence);
+        }
+        return verdict("pass", `All ${loadBalancers.length} dedicated load balancer(s) report tlsv1=false, an httpMode that does not serve plain HTTP, and a defaultCipherSuite limited to forward-secret suites with no RC4, DES, NULL, EXPORT, or MD5 ciphers.`, evidence);
       },
     ),
     evaluate(

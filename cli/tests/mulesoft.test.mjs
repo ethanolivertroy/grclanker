@@ -81,6 +81,10 @@ function statusOf(result, id) {
   return findingById(result, id)?.status;
 }
 
+// The NewDefault-v1 and OldDefault suites documented at docs.mulesoft.com/cloudhub/lb-cert-validation.
+const STRONG_CIPHER_SUITE = "ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384";
+const OLD_DEFAULT_CIPHER_SUITE = "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:DHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA:AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA256:AES128-SHA256:AES256-SHA:AES128-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4";
+
 const ENVIRONMENTS = [
   { id: "env-prod", name: "Production", isProduction: true, type: "production" },
   { id: "env-sandbox", name: "Sandbox", isProduction: false, type: "sandbox" },
@@ -197,7 +201,16 @@ function healthyRuntimeClient(overrides = {}) {
       return { id: "vpc-1", name: "prod-vpc", firewallRules: [{ cidrBlock: "10.0.0.0/16", protocol: "tcp", fromPort: 8091, toPort: 8092 }] };
     },
     async listLoadBalancers() {
-      return [{ id: "lb-1", name: "prod-dlb", domain: "prod-dlb.lb.anypointdns.net", httpMode: "redirect", tlsv1: false, tlsv13: true, state: "STARTED" }];
+      return [{
+        id: "lb-1",
+        name: "prod-dlb",
+        domain: "prod-dlb.lb.anypointdns.net",
+        httpMode: "redirect",
+        tlsv1: false,
+        tlsv13: true,
+        state: "STARTED",
+        defaultCipherSuite: STRONG_CIPHER_SUITE,
+      }];
     },
     async probeCertificate(host) {
       return { host, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200) };
@@ -2251,4 +2264,63 @@ test("review fix 10: a business-group-scoped credential flags the partial view o
   const root = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient());
   assert.equal(statusOf(root, "MULESOFT-RT-13"), "pass");
   assert.deepEqual(root.summary.partial_view, []);
+});
+
+test("review fix 4: RT-15 evaluates defaultCipherSuite, failing weak ciphers and warning on legacy or missing suites", async () => {
+  const dlb = (overrides) => ({
+    id: "lb-1",
+    name: "prod-dlb",
+    domain: "prod-dlb.lb.anypointdns.net",
+    httpMode: "redirect",
+    tlsv1: false,
+    tlsv13: true,
+    state: "STARTED",
+    ...overrides,
+  });
+  const withLoadBalancers = (loadBalancers, extra = {}) => healthyRuntimeClient({
+    async listLoadBalancers() {
+      return loadBalancers;
+    },
+    ...extra,
+  });
+
+  const rc4 = await assessMulesoftRuntimeInfrastructure(withLoadBalancers([dlb({ defaultCipherSuite: `${STRONG_CIPHER_SUITE}:RC4-SHA:DES-CBC3-SHA` })]));
+  assert.equal(statusOf(rc4, "MULESOFT-RT-15"), "fail");
+  assert.match(findingById(rc4, "MULESOFT-RT-15").summary, /weak ciphers \(prod-dlb: RC4-SHA, DES-CBC3-SHA\)/);
+  assert.deepEqual(findingById(rc4, "MULESOFT-RT-15").evidence.load_balancers[0].weak_ciphers, ["RC4-SHA", "DES-CBC3-SHA"]);
+
+  const legacy = await assessMulesoftRuntimeInfrastructure(withLoadBalancers([dlb({ defaultCipherSuite: OLD_DEFAULT_CIPHER_SUITE })]));
+  assert.equal(statusOf(legacy, "MULESOFT-RT-15"), "warn");
+  assert.match(findingById(legacy, "MULESOFT-RT-15").summary, /non-forward-secret or broad OpenSSL groups/);
+  const legacyEvidence = findingById(legacy, "MULESOFT-RT-15").evidence.load_balancers[0];
+  assert.deepEqual(legacyEvidence.weak_ciphers, [], "exclusions such as !RC4 and !MD5 are not counted as offered ciphers");
+  assert.ok(legacyEvidence.non_forward_secrecy_ciphers.includes("AES128-SHA"));
+  assert.deepEqual(legacyEvidence.broad_cipher_keywords, ["HIGH"]);
+
+  const strong = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient());
+  assert.equal(statusOf(strong, "MULESOFT-RT-15"), "pass");
+  assert.match(findingById(strong, "MULESOFT-RT-15").summary, /defaultCipherSuite limited to forward-secret suites/);
+  assert.doesNotMatch(findingById(strong, "MULESOFT-RT-15").summary, /managed by Anypoint/);
+
+  const missing = await assessMulesoftRuntimeInfrastructure(withLoadBalancers([dlb({})]));
+  assert.equal(statusOf(missing, "MULESOFT-RT-15"), "warn");
+  assert.match(findingById(missing, "MULESOFT-RT-15").summary, /did not return defaultCipherSuite \(prod-dlb\)/);
+
+  const detailReads = [];
+  const fromDetail = await assessMulesoftRuntimeInfrastructure(withLoadBalancers([dlb({ vpcId: "vpc-1" })], {
+    async getLoadBalancer(vpcId, loadBalancerId) {
+      detailReads.push([vpcId, loadBalancerId]);
+      return { id: loadBalancerId, defaultCipherSuite: STRONG_CIPHER_SUITE, sslEndpoints: [] };
+    },
+  }));
+  assert.deepEqual(detailReads, [["vpc-1", "lb-1"]]);
+  assert.equal(statusOf(fromDetail, "MULESOFT-RT-15"), "pass");
+  assert.equal(findingById(fromDetail, "MULESOFT-RT-15").evidence.load_balancers[0].default_cipher_suite, STRONG_CIPHER_SUITE);
+
+  const detailForbidden = await assessMulesoftRuntimeInfrastructure(withLoadBalancers([dlb({ vpcId: "vpc-1" })], {
+    getLoadBalancer: forbidden("/vpcs/vpc-1/loadbalancers/lb-1"),
+  }));
+  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-15"), "manual");
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-15").summary, /Could not evaluate: load_balancer_details could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "pass", "the certificate control does not depend on the DLB detail read");
 });
