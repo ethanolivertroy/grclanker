@@ -136,6 +136,9 @@ function healthyIdentityClient(overrides = {}) {
 function healthyApiGatewayClient(overrides = {}) {
   return {
     getResolvedConfig: () => sampleConfig(),
+    async getOrganizationHierarchy() {
+      return { id: ORG_ID, isRoot: true, subOrganizations: [] };
+    },
     async listEnvironments() {
       return ENVIRONMENTS;
     },
@@ -161,6 +164,9 @@ function healthyApiGatewayClient(overrides = {}) {
 function healthyRuntimeClient(overrides = {}) {
   return {
     getResolvedConfig: () => sampleConfig(),
+    async getOrganizationHierarchy() {
+      return { id: ORG_ID, isRoot: true, subOrganizations: [] };
+    },
     async listEnvironments() {
       return ENVIRONMENTS;
     },
@@ -218,6 +224,9 @@ function healthyRuntimeClient(overrides = {}) {
 function healthyAuditClient(overrides = {}) {
   return {
     getResolvedConfig: () => sampleConfig(),
+    async getOrganizationHierarchy() {
+      return { id: ORG_ID, isRoot: true, subOrganizations: [] };
+    },
     async listEnvironments() {
       return ENVIRONMENTS;
     },
@@ -1911,6 +1920,10 @@ function routedFetch(routes, seen = []) {
   };
 }
 
+function rootHierarchyRoute() {
+  return (url) => (url.pathname === `/accounts/api/organizations/${ORG_ID}/hierarchy` ? jsonResponse({ id: ORG_ID, isRoot: true, subOrganizations: [] }) : undefined);
+}
+
 function manyEnvironments(count, productionIndex) {
   return Array.from({ length: count }, (_, index) => ({
     id: `env-${index}`,
@@ -1945,6 +1958,7 @@ test("review fix 1: a production environment beyond the 25th is sampled through 
   const environments = manyEnvironments(30, 29);
   const client = new MulesoftApiClient(sampleConfig(), {
     fetchImpl: routedFetch([
+      rootHierarchyRoute(),
       pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, environments, 25),
       (url) => (url.pathname.endsWith("/environments/env-29/apis")
         ? jsonResponse({
@@ -2016,6 +2030,7 @@ test("review fix 2: the ARM server envelope is unwrapped so a RUNNING hybrid ser
   };
   const client = new MulesoftApiClient(sampleConfig(), {
     fetchImpl: routedFetch([
+      rootHierarchyRoute(),
       pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, ENVIRONMENTS, 25),
       (url, init) => (url.pathname === "/hybrid/api/v1/servers" && headerValue(init.headers, "X-ANYPNT-ENV-ID") === "env-prod" ? jsonResponse(armServers) : undefined),
       (url) => (url.pathname === "/hybrid/api/v1/alerts" ? jsonResponse({ data: [{ data: { id: "alert-1", name: "Server down", enabled: true } }] }) : undefined),
@@ -2197,4 +2212,43 @@ test("review fix 8: CloudHub applications are listed with retrieveStatistics=tru
   assert.equal(statusOf(noStatistics, "MULESOFT-RT-11"), "warn");
   assert.match(findingById(noStatistics, "MULESOFT-RT-11").summary, /returned no recentStatistics\.cpu even with retrieveStatistics=true/);
   assert.deepEqual(findingById(noStatistics, "MULESOFT-RT-11").evidence.large_applications_without_cpu_statistics, ["Production: orders-prod"]);
+});
+
+test("review fix 10: a business-group-scoped credential flags the partial view on runtime, gateway, and audit findings too", async () => {
+  const businessGroup = async () => ({ id: ORG_ID, isRoot: false, parentId: "root-org", subOrganizations: [] });
+  const note = /Partial view: this organization is a business group \(isRoot=false\), so root-level settings and sibling business groups are outside the view/;
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({ getOrganizationHierarchy: businessGroup }));
+  for (const id of ["MULESOFT-RT-13", "MULESOFT-RT-14", "MULESOFT-RT-15", "MULESOFT-RT-16", "MULESOFT-RT-10", "MULESOFT-RT-23"]) {
+    assert.equal(statusOf(runtime, id), "warn", `${id}: ${findingById(runtime, id).summary}`);
+    assert.match(findingById(runtime, id).summary, note, id);
+  }
+  assert.deepEqual(runtime.summary.partial_view, [
+    "this organization is a business group (isRoot=false), so root-level settings and sibling business groups are outside the view",
+  ]);
+
+  const gateway = await assessMulesoftApiGateway(healthyApiGatewayClient({ getOrganizationHierarchy: businessGroup }));
+  for (const id of ["MULESOFT-API-07", "MULESOFT-API-08"]) {
+    assert.equal(statusOf(gateway, id), "warn", id);
+    assert.match(findingById(gateway, id).summary, note, id);
+  }
+  assert.match(findingById(gateway, "MULESOFT-API-20").summary, note);
+
+  const audit = await assessMulesoftAuditMonitoring(healthyAuditClient({ getOrganizationHierarchy: businessGroup }));
+  for (const id of ["MULESOFT-AUD-17", "MULESOFT-AUD-24"]) {
+    assert.equal(statusOf(audit, id), "warn", id);
+    assert.match(findingById(audit, id).summary, note, id);
+  }
+
+  const unreadable = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({ getOrganizationHierarchy: forbidden("/hierarchy") }));
+  assert.equal(statusOf(unreadable, "MULESOFT-RT-13"), "warn");
+  assert.match(findingById(unreadable, "MULESOFT-RT-13").summary, /Partial view: organization_hierarchy could not be read, the credential lacks permission \(HTTP 403\)/);
+
+  const untyped = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({ async getOrganizationHierarchy() { return { id: ORG_ID }; } }));
+  assert.equal(statusOf(untyped, "MULESOFT-RT-15"), "warn");
+  assert.match(findingById(untyped, "MULESOFT-RT-15").summary, /did not expose isRoot/);
+
+  const root = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient());
+  assert.equal(statusOf(root, "MULESOFT-RT-13"), "pass");
+  assert.deepEqual(root.summary.partial_view, []);
 });

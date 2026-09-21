@@ -1403,12 +1403,13 @@ type IdentityClient = Pick<
 
 type ApiGatewayClient = Pick<
   MulesoftApiClient,
-  "getResolvedConfig" | "listEnvironments" | "listManagedApis" | "listApiPolicies" | "listExchangeAssets"
+  "getResolvedConfig" | "getOrganizationHierarchy" | "listEnvironments" | "listManagedApis" | "listApiPolicies" | "listExchangeAssets"
 >;
 
 type RuntimeClient = Pick<
   MulesoftApiClient,
   | "getResolvedConfig"
+  | "getOrganizationHierarchy"
   | "listEnvironments"
   | "listCloudhubApplications"
   | "listVpcs"
@@ -1425,6 +1426,7 @@ type RuntimeClient = Pick<
 type AuditClient = Pick<
   MulesoftApiClient,
   | "getResolvedConfig"
+  | "getOrganizationHierarchy"
   | "listEnvironments"
   | "listAuditPlatforms"
   | "queryAuditLogs"
@@ -1712,6 +1714,30 @@ function businessGroupScopeNote(hierarchy: JsonRecord): string | undefined {
     : undefined;
 }
 
+// Root scope is only established by isRoot=true on a readable hierarchy; a failed read or a missing flag leaves the scope unknown.
+function organizationScopeNote(hierarchy: Collected<JsonRecord>): string | undefined {
+  if (hierarchy.error) {
+    return `${describeFailure(hierarchy)}, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view`;
+  }
+  if (asBoolean(hierarchy.value.isRoot) === undefined) {
+    return "the organization hierarchy did not expose isRoot, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view";
+  }
+  return businessGroupScopeNote(hierarchy.value);
+}
+
+interface OrganizationScope {
+  source: Collected<JsonRecord>;
+  note?: string;
+}
+
+async function collectOrganizationScope(
+  client: Pick<MulesoftApiClient, "getOrganizationHierarchy">,
+  errors: string[],
+): Promise<OrganizationScope> {
+  const source = await collect<JsonRecord>("organization_hierarchy", {}, () => client.getOrganizationHierarchy(), errors);
+  return { source, note: organizationScopeNote(source) };
+}
+
 export async function assessMulesoftIdentityAccess(
   client: IdentityClient,
   options: MulesoftIdentityAccessOptions = {},
@@ -1771,7 +1797,7 @@ export async function assessMulesoftIdentityAccess(
   const activeProviders = providers.filter((provider) => !providerIsDisabled(provider));
   const allowNewNonSsoUsers = asBoolean(identityProviderSettings.value.allow_new_non_sso_users);
   const isFederated = asBoolean(organization.value.isFederated) ?? asBoolean(hierarchy.value.isFederated);
-  const scopeNote = businessGroupScopeNote(hierarchy.value);
+  const scopeNote = organizationScopeNote(hierarchy);
 
   const exemptReturned = mfaExemptUsers.value.items;
   const exemptFlagged = exemptReturned.filter((user) => asBoolean(user.mfaVerificationExcluded) === true);
@@ -2229,6 +2255,7 @@ export async function assessMulesoftApiGateway(
   const environmentLimit = clampNumber(options.environmentLimit, DEFAULT_ENVIRONMENT_LIMIT, 1, 100);
   const apiLimit = clampNumber(options.apiLimit, DEFAULT_API_LIMIT, 1, 2000);
 
+  const scope = await collectOrganizationScope(client, errors);
   const environments = await sampleEnvironments(client, environmentLimit, errors);
   const apiSources: Array<Collected<MulesoftPage>> = [];
   const apiRecords: ApiRecord[] = [];
@@ -2283,9 +2310,10 @@ export async function assessMulesoftApiGateway(
 
   const describeApis = (records: ApiRecord[]) =>
     sample(records.map((record) => `${environmentLabel(record.environment)}: ${apiLabel(record.api)}`));
+  const gatewayPartialNotes = [...environments.partialNotes, ...apiPartialNotes, scope.note];
   const gatewayInputs: EvaluationInputs = {
     primary: [environments.source, apisSource, policiesSource],
-    partial: [...environments.partialNotes, ...apiPartialNotes],
+    partial: gatewayPartialNotes,
   };
   const apiInventoryFailure = [environments.source, apisSource].find((source) => source.error);
 
@@ -2326,12 +2354,12 @@ export async function assessMulesoftApiGateway(
         active_contracts: apiInventoryFailure ? null : activeContracts,
         apis_sampled: apiRecords.length,
         unreadable_sources: apiInventoryFailure ? [describeFailure(apiInventoryFailure)] : [],
-        partial_view: [...environments.partialNotes, ...apiPartialNotes],
+        partial_view: gatewayPartialNotes.filter((note): note is string => Boolean(note)),
       },
     ),
     evaluate(
       20,
-      { primary: [exchangeAssets], partial: [truncationNote("Exchange asset", exchangeAssets.value)] },
+      { primary: [exchangeAssets], partial: [truncationNote("Exchange asset", exchangeAssets.value), scope.note] },
       "Export the API Governance conformance report and the Exchange publishing settings that require review before publication.",
       () => {
         const evidence = {
@@ -2365,7 +2393,7 @@ export async function assessMulesoftApiGateway(
       active_contracts: activeContracts,
       exchange_assets: organizationAssets.length,
       public_exchange_assets: publicAssets.length,
-      partial_view: [...environments.partialNotes, ...apiPartialNotes],
+      partial_view: gatewayPartialNotes.filter((note): note is string => Boolean(note)),
       unreadable_sources: errors.length,
     },
     findings,
@@ -2501,6 +2529,7 @@ export async function assessMulesoftRuntimeInfrastructure(
   const certificateWarningDays = clampNumber(options.certificateWarningDays, DEFAULT_CERTIFICATE_WARNING_DAYS, DEFAULT_CERTIFICATE_FAIL_DAYS, 3650);
   const now = Date.now();
 
+  const scope = await collectOrganizationScope(client, errors);
   const environments = await sampleEnvironments(client, environmentLimit, errors);
   const applicationSources: Array<Collected<JsonRecord[]>> = [];
   const serverSources: Array<Collected<JsonRecord[]>> = [];
@@ -2681,13 +2710,14 @@ export async function assessMulesoftRuntimeInfrastructure(
   const describeServers = (records: Array<{ environment: JsonRecord; server: JsonRecord }>) =>
     sample(records.map((item) => `${environmentLabel(item.environment)}: ${serverLabel(item.server)} (${asString(item.server.status) ?? "unknown"})`));
 
+  const environmentPartialNotes = [...environments.partialNotes, scope.note];
   const applicationPartialNotes = [
-    ...environments.partialNotes,
+    ...environmentPartialNotes,
     applicationsDropped > 0 ? `the application limit of ${applicationLimit} left ${applicationsDropped} application(s) uninspected` : undefined,
   ];
   const applicationInputs: EvaluationInputs = { primary: [environments.source, applicationsSource], partial: applicationPartialNotes };
-  const vpcInputs: EvaluationInputs = { primary: [vpcSummaries, vpcDetailsSource], partial: [vpcPartialNote] };
-  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote] };
+  const vpcInputs: EvaluationInputs = { primary: [vpcSummaries, vpcDetailsSource], partial: [vpcPartialNote, scope.note] };
+  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote, scope.note] };
   const zeroApplicationsSummary = `Zero CloudHub 1.0 applications were visible in ${environments.sampled.length} sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.`;
   const noVpcSummary = "Zero CloudHub VPCs are visible, which is treated as manual. If applications run in CloudHub 2.0 private spaces or Runtime Fabric, export the private space firewall rules or cluster network policy from Runtime Manager as evidence.";
   const noLoadBalancerSummary = "No dedicated load balancers exist, so this control is not applicable and is recorded as manual: confirm whether applications are exposed through the shared load balancer or CloudHub 2.0 ingress, whose TLS configuration MuleSoft manages.";
@@ -2874,7 +2904,7 @@ export async function assessMulesoftRuntimeInfrastructure(
     ),
     evaluate(
       21,
-      { primary: [environments.source, mqRegionsSource, mqQueuesSource], secondary: [mqClientsSource], partial: environments.partialNotes },
+      { primary: [environments.source, mqRegionsSource, mqQueuesSource], secondary: [mqClientsSource], partial: environmentPartialNotes },
       "Export Anypoint MQ client apps per environment and the MQ role assignments from Access Management, then confirm no client credential is shared across environments.",
       () => {
         const evidence = {
@@ -2925,7 +2955,7 @@ export async function assessMulesoftRuntimeInfrastructure(
     ),
     evaluate(
       23,
-      { primary: [environments.source, serversSource], partial: environments.partialNotes },
+      { primary: [environments.source, serversSource], partial: environmentPartialNotes },
       "Export Runtime Manager > Servers for each environment and confirm every registered server reports RUNNING.",
       () => {
         const evidence = {
@@ -2963,7 +2993,7 @@ export async function assessMulesoftRuntimeInfrastructure(
       hybrid_servers: servers.length,
       mq_queues: allQueues.length,
       secret_groups: totalSecretGroups,
-      partial_view: [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote].filter(Boolean),
+      partial_view: [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote].filter((note): note is string => Boolean(note)),
       unreadable_sources: errors.length,
     },
     findings,
@@ -3035,6 +3065,7 @@ export async function assessMulesoftAuditMonitoring(
   const lookbackHours = clampNumber(options.auditLookbackHours, DEFAULT_AUDIT_LOOKBACK_HOURS, 1, 24 * 90);
   const now = Date.now();
 
+  const scope = await collectOrganizationScope(client, errors);
   const platforms = await collect<JsonRecord[]>("audit_platforms", [], () => client.listAuditPlatforms(), errors);
   const startDate = new Date(now - lookbackHours * 60 * 60 * 1000).toISOString();
   const endDate = new Date(now).toISOString();
@@ -3051,6 +3082,7 @@ export async function assessMulesoftAuditMonitoring(
   const fallbackEntries = extractCollection(fallbackQuery.value);
 
   const environments = await sampleEnvironments(client, environmentLimit, errors);
+  const environmentPartialNotes = [...environments.partialNotes, scope.note];
   const productionEnvironments = environments.sampled.filter(isProductionEnvironment);
   const alertCoverage: AlertCoverage[] = [];
   for (const environment of productionEnvironments) {
@@ -3108,7 +3140,7 @@ export async function assessMulesoftAuditMonitoring(
   const findings: MulesoftFinding[] = [
     evaluate(
       17,
-      { primary: [recentQuery, fallbackQuery] },
+      { primary: [recentQuery, fallbackQuery], partial: [scope.note] },
       "Export Access Management > Audit Log for the review period, or grant the credential the Audit Log Viewer permission and rerun.",
       () => {
         const entriesInWindow = recentTotal ?? recentEntries.length;
@@ -3134,7 +3166,7 @@ export async function assessMulesoftAuditMonitoring(
     ),
     evaluate(
       24,
-      { primary: [environments.source, alertsSource, applicationsSource], partial: environments.partialNotes },
+      { primary: [environments.source, alertsSource, applicationsSource], partial: environmentPartialNotes },
       "Export Runtime Manager > Alerts and Anypoint Monitoring > Alerts for each production environment and map every production application to at least one enabled alert.",
       () => {
         const evidence = {
@@ -3187,7 +3219,7 @@ export async function assessMulesoftAuditMonitoring(
       production_applications: totalProductionApplications,
       enabled_alerts: totalEnabledAlerts,
       uncovered_production_applications: uncoveredApplications.length,
-      partial_view: environments.partialNotes,
+      partial_view: environmentPartialNotes.filter((note): note is string => Boolean(note)),
       unreadable_sources: errors.length,
     },
     findings,
