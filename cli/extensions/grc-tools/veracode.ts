@@ -135,12 +135,15 @@ export interface VeracodeAssessmentResult {
 
 export interface VeracodeAccessSurface {
   name: string;
+  /** The path the probe read, or the path whose request failed when the probe was not readable. */
   endpoint: string;
   status: "readable" | "not_readable";
-  count?: number;
+  /** Items the probe saw; null, never 0, when the surface was not read. */
+  count: number | null;
   /** Set when the probe's single page carried no vendor total, so `count` is the first page only. */
   countNote?: string;
-  statusCode?: number;
+  /** HTTP status of the failed request; null when the failure carried no HTTP status. Absent on a readable surface. */
+  statusCode?: number | null;
   error?: string;
   requiredRole: string;
 }
@@ -173,17 +176,28 @@ export interface HalListResult {
   notes?: string[];
 }
 
+/** A failed surface names the endpoint whose request failed, when the error carried one. */
 type Surface<T> =
   | { status: "ok"; value: T }
-  | { status: "error"; error: string; statusCode?: number };
+  | { status: "error"; error: string; statusCode?: number; endpoint?: string };
+
+/** What a bundle consumer reads in place of a dataset that was never collected. */
+export interface VeracodeNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
 
 export class VeracodeApiError extends Error {
   readonly statusCode?: number;
+  readonly endpoint?: string;
 
-  constructor(message: string, statusCode?: number) {
+  constructor(message: string, statusCode?: number, endpoint?: string) {
     super(message);
     this.name = "VeracodeApiError";
     this.statusCode = statusCode;
+    this.endpoint = endpoint;
   }
 }
 
@@ -626,6 +640,7 @@ export class VeracodeApiClient {
         throw new VeracodeApiError(
           `Veracode request failed (${response.status} ${response.statusText}) for ${url.pathname}${detail ? `: ${detail}` : ""}`,
           response.status,
+          url.pathname,
         );
       } catch (error) {
         if (error instanceof VeracodeApiError) throw error;
@@ -635,7 +650,7 @@ export class VeracodeApiClient {
           await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        throw new VeracodeApiError(`Veracode request failed for ${url.pathname}: ${message}`);
+        throw new VeracodeApiError(`Veracode request failed for ${url.pathname}: ${message}`, undefined, url.pathname);
       } finally {
         clearTimeout(timeout);
       }
@@ -799,8 +814,36 @@ async function surface<T>(load: () => Promise<T>): Promise<Surface<T>> {
       status: "error",
       error: error instanceof Error ? error.message : String(error),
       statusCode,
+      endpoint: asString(asObject(error)?.endpoint),
     };
   }
+}
+
+/**
+ * The single serializer for a surface on every raw-data path: a surface that
+ * was never collected is written as { collected: false, status, endpoint,
+ * error } so a bundle consumer cannot mistake a denial for an empty
+ * inventory; readable-but-empty lists keep []. `project` narrows a readable
+ * value to the part the snapshot keeps.
+ */
+function rawSurface<T, R = T>(item: Surface<T>, project: (value: T) => R = (value) => value as unknown as R): R | VeracodeNotCollectedMarker {
+  if (item.status === "ok") return project(item.value);
+  return { collected: false, status: item.statusCode ?? null, endpoint: item.endpoint ?? null, error: item.error };
+}
+
+/** The marker for a dataset whose requests were never issued because an inventory it depends on was not readable. */
+function notAttempted(reason: string): VeracodeNotCollectedMarker {
+  return { collected: false, status: null, endpoint: null, error: `Not requested: ${reason}` };
+}
+
+/** A count derived from a surface: null, never 0, when the surface was not read. */
+function countIfRead(item: Surface<HalListResult>): number | null {
+  return item.status === "ok" ? item.value.items.length : null;
+}
+
+/** The vendor total when the list carried one, the seen count when the walk finished, otherwise null: a capped walk has no known total. */
+function knownTotal(list: HalListResult): number | null {
+  return list.totalElements ?? (list.complete ? list.items.length : null);
 }
 
 function surfaceErrors(name: string, item: Surface<unknown>): string[] {
@@ -1217,7 +1260,7 @@ function evaluateScanCompletion(snapshot: ApplicationSnapshot): VeracodeFinding 
 
 async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSnapshot, maxApplications: number): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
   const blocker = applicationInventoryBlocker(10, "medium", snapshot, ["Confirm sandbox usage per application in the Platform."]);
-  if (blocker) return { finding: blocker, raw: {}, errors: [] };
+  if (blocker) return { finding: blocker, raw: { sandboxes_by_application: notAttempted("the application inventory was not readable, so no sandbox list was requested.") }, errors: [] };
   const list = (snapshot.applications as { value: HalListResult }).value;
   const sampled = list.items.slice(0, maxApplications);
   const results = await Promise.all(sampled.map(async (app) => ({
@@ -1229,9 +1272,9 @@ async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSna
   const unreadable = results.filter((item) => item.sandboxes.status === "error");
   const withoutSandboxes = results.filter((item) => item.sandboxes.status === "ok" && item.sandboxes.value.items.length === 0).map((item) => item.application);
   const withSandboxes = results.filter((item) => item.sandboxes.status === "ok" && item.sandboxes.value.items.length > 0).length;
-  const raw = { sandboxes_by_application: Object.fromEntries(results.map((item) => [item.guid, item.sandboxes.status === "ok" ? item.sandboxes.value.items : { error: item.sandboxes.error }])) };
+  const raw = { sandboxes_by_application: Object.fromEntries(results.map((item) => [item.guid, rawSurface(item.sandboxes, (value) => value.items)])) };
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications")];
-  const evidence = { applications_sampled: sampled.length, applications_total: list.totalElements ?? list.items.length, applications_with_sandboxes: withSandboxes, applications_without_sandboxes: withoutSandboxes.slice(0, 50), unreadable_applications: unreadable.length };
+  const evidence = { applications_sampled: sampled.length, applications_total: knownTotal(list), applications_with_sandboxes: withSandboxes, applications_without_sandboxes: withoutSandboxes.slice(0, 50), unreadable_applications: unreadable.length };
   if (unreadable.length === results.length) {
     return { finding: manualFinding(10, "medium", unreadableReason("sandboxes", unreadable[0].sandboxes), ["Confirm sandbox usage per application in the Platform."], evidence), raw, errors };
   }
@@ -1272,10 +1315,11 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
     const reason = isUnavailable(analyses)
       ? `The Dynamic Analysis API was not available to this credential (${analyses.statusCode}); Dynamic Analysis may be unlicensed or the API user lacks a Dynamic Analysis role, so the control is not applicable through the API.`
       : unreadableReason("Dynamic Analysis analyses", analyses);
-    return { finding: manualFinding(13, "medium", reason, manualEvidence, { status_code: analyses.statusCode ?? null }), raw: {}, errors: surfaceErrors("dynamic analyses", analyses) };
+    const skipped = notAttempted("the Dynamic Analysis list was not readable, so no scan list or scan configuration was requested.");
+    return { finding: manualFinding(13, "medium", reason, manualEvidence, { status_code: analyses.statusCode ?? null }), raw: { analyses: rawSurface(analyses), scans_by_analysis: skipped, scan_configurations: skipped }, errors: surfaceErrors("dynamic analyses", analyses) };
   }
   if (analyses.value.items.length === 0) {
-    return { finding: manualFinding(13, "medium", "No Dynamic Analysis configurations exist, so there is no DAST configuration to evaluate; the empty inventory is treated as not applicable rather than compliant.", ["Confirm whether Dynamic Analysis is in scope and document DAST coverage decisions."]), raw: { analyses: [] }, errors: [] };
+    return { finding: manualFinding(13, "medium", "No Dynamic Analysis configurations exist, so there is no DAST configuration to evaluate; the empty inventory is treated as not applicable rather than compliant.", ["Confirm whether Dynamic Analysis is in scope and document DAST coverage decisions."]), raw: { analyses: [], scans_by_analysis: {}, scan_configurations: [] }, errors: [] };
   }
   const sampled = analyses.value.items.slice(0, maxAnalyses);
   const errors: string[] = [];
@@ -1285,12 +1329,14 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
   const scanCaveats: string[] = [];
   const scanCoverage: JsonRecord[] = [];
   let configured = 0;
+  const rawScansByAnalysis: JsonRecord = {};
   const rawScans: JsonRecord[] = [];
   for (const analysis of sampled) {
     const analysisId = asString(analysis.analysis_id) ?? "";
     const analysisLabel = asString(analysis.name) ?? analysisId;
     const scans = await surface(() => client.listDynamicAnalysisScans(analysisId));
     errors.push(...surfaceErrors(`dynamic scans ${analysisId}`, scans));
+    rawScansByAnalysis[analysisId] = rawSurface(scans, (value) => value.items.map((scan) => ({ scan_id: asString(scan.scan_id) ?? null, target_url: scrubUrlValue(asString(scan.target_url) ?? "") || null })));
     if (scans.status === "error") {
       unreadable.push(analysisLabel);
       continue;
@@ -1307,6 +1353,7 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
       const label = `${analysisLabel}:${scrubUrlValue(asString(scan.target_url) ?? scanId)}`;
       if (configuration.status === "error") {
         unreadable.push(label);
+        rawScans.push({ analysis_id: analysisId, scan_id: scanId, ...rawSurface(configuration) });
         continue;
       }
       const authentications = asObject(asObject(configuration.value.auth_configuration)?.authentications);
@@ -1319,7 +1366,9 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
   }
   const caveats = [partialInventoryNote(analyses.value, "analyses"), scopeNote(sampled.length, analyses.value.items.length, "analyses"), ...scanCaveats, unreadable.length > 0 ? `${unreadable.length} scan configurations were unreadable.` : undefined];
   const evidence = { analyses_seen: analyses.value.items.length, analyses_sampled: sampled.length, scan_coverage: scanCoverage.slice(0, 50), configured_scans: configured, unauthenticated_scans: unauthenticated.slice(0, 50), crawl_disabled_scans: crawlDisabled.slice(0, 50), unreadable: unreadable.slice(0, 50) };
-  const raw = { analyses: analyses.value.items, scan_configurations: rawScans };
+  // No readable scan list means no configuration request was issued, so the list carries a marker rather than [].
+  const scanListsUnreadable = sampled.length > 0 && scanCoverage.length === 0;
+  const raw = { analyses: analyses.value.items, scans_by_analysis: rawScansByAnalysis, scan_configurations: scanListsUnreadable ? notAttempted("no scan list was readable, so no scan configuration was requested.") : rawScans };
   if (configured === 0 && unauthenticated.length === 0 && crawlDisabled.length === 0) {
     return { finding: manualFinding(13, "medium", "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.", manualEvidence, evidence), raw, errors };
   }
@@ -1330,7 +1379,7 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
 }
 
 function prescanManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
-  const seen = snapshot.applications.status === "ok" ? snapshot.applications.value.items.length : 0;
+  const seen = countIfRead(snapshot.applications);
   return manualFinding(
     11,
     "low",
@@ -1341,7 +1390,7 @@ function prescanManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
 }
 
 function pipelineManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
-  const seen = snapshot.applications.status === "ok" ? snapshot.applications.value.items.length : 0;
+  const seen = countIfRead(snapshot.applications);
   return manualFinding(
     14,
     "low",
@@ -1386,7 +1435,7 @@ export async function assessVeracodeScanCoverage(
     title: "Veracode scan coverage",
     summary: {
       base_url: client.getResolvedConfig().baseUrl,
-      applications_seen: snapshot.applications.status === "ok" ? snapshot.applications.value.items.length : 0,
+      applications_seen: countIfRead(snapshot.applications),
       applications_total: snapshot.applications.status === "ok" ? snapshot.applications.value.totalElements ?? null : null,
       max_scan_age_days: maxScanAgeDays,
       ...countByStatus(findings),
@@ -1394,8 +1443,8 @@ export async function assessVeracodeScanCoverage(
     findings,
     errors,
     rawData: {
-      applications: snapshot.applications.status === "ok" ? snapshot.applications.value : { error: snapshot.applications.error },
-      policies: policies.status === "ok" ? policies.value : { error: policies.error },
+      applications: rawSurface(snapshot.applications),
+      policies: rawSurface(policies),
       ...sandbox.raw,
       dynamic_analysis: dynamic.raw,
     },
@@ -1506,15 +1555,15 @@ export async function assessVeracodePolicyCompliance(
     title: "Veracode policy compliance",
     summary: {
       base_url: client.getResolvedConfig().baseUrl,
-      applications_seen: snapshot.applications.status === "ok" ? snapshot.applications.value.items.length : 0,
-      policies_seen: policies.status === "ok" ? policies.value.items.length : 0,
+      applications_seen: countIfRead(snapshot.applications),
+      policies_seen: countIfRead(policies),
       ...countByStatus(findings),
     },
     findings,
     errors: [...surfaceErrors("applications", snapshot.applications), ...surfaceErrors("policies", policies)],
     rawData: {
-      applications: snapshot.applications.status === "ok" ? snapshot.applications.value : { error: snapshot.applications.error },
-      policies: policies.status === "ok" ? policies.value : { error: policies.error },
+      applications: rawSurface(snapshot.applications),
+      policies: rawSurface(policies),
     },
   };
 }
@@ -1734,7 +1783,14 @@ export async function assessVeracodeFindingsHygiene(
   const blocker = applicationInventoryBlocker(3, "high", snapshot, manualEvidence);
   if (blocker) {
     const findings = [3, 12, 16, 17].map((number) => ({ ...blocker, ...finding(number, blocker.severity, "manual", blocker.summary, blocker.evidence) }));
-    return { title: "Veracode findings hygiene", summary: { base_url: client.getResolvedConfig().baseUrl, applications_seen: 0, ...countByStatus(findings) }, findings, errors: surfaceErrors("applications", snapshot.applications), rawData: { applications: snapshot.applications.status === "ok" ? snapshot.applications.value : { error: snapshot.applications.error } } };
+    const skipped = notAttempted("the application inventory was not readable or empty, so no per-application list was requested.");
+    return {
+      title: "Veracode findings hygiene",
+      summary: { base_url: client.getResolvedConfig().baseUrl, applications_seen: countIfRead(snapshot.applications), applications_sampled: null, ...countByStatus(findings) },
+      findings,
+      errors: surfaceErrors("applications", snapshot.applications),
+      rawData: { applications: rawSurface(snapshot.applications), findings_by_application: skipped, summary_reports_by_application: skipped },
+    };
   }
   const inventory = (snapshot.applications as { value: HalListResult }).value;
   const sampled = inventory.items.slice(0, maxApplications);
@@ -1765,8 +1821,8 @@ export async function assessVeracodeFindingsHygiene(
     errors,
     rawData: {
       applications: inventory,
-      findings_by_application: Object.fromEntries(samples.map((sample) => [sample.guid, sample.findings.status === "ok" ? sample.findings.value : { error: sample.findings.error }])),
-      summary_reports_by_application: Object.fromEntries(samples.map((sample) => [sample.guid, sample.summaryReport.status === "ok" ? sample.summaryReport.value : { error: sample.summaryReport.error }])),
+      findings_by_application: Object.fromEntries(samples.map((sample) => [sample.guid, rawSurface(sample.findings)])),
+      summary_reports_by_application: Object.fromEntries(samples.map((sample) => [sample.guid, rawSurface(sample.summaryReport)])),
     },
   };
 }
@@ -1832,7 +1888,8 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
     libraryListsUnreadable > 0 ? `${libraryListsUnreadable} workspace library lists were unreadable, so libraries_seen undercounts the scanned libraries.` : undefined,
     libraryListsIncomplete > 0 ? `${libraryListsIncomplete} library lists were truncated, so libraries_seen is a lower bound.` : undefined,
   ];
-  const evidence = { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: librariesSeen, library_lists_unreadable: libraryListsUnreadable, library_lists_truncated: libraryListsIncomplete, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold };
+  const anyLibraryListRead = readable.some((sample) => sample.libraries.status === "ok");
+  const evidence = { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: anyLibraryListRead ? librariesSeen : null, library_lists_unreadable: libraryListsUnreadable, library_lists_truncated: libraryListsIncomplete, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold };
   if (high.length > 0) {
     return finding(5, "high", "fail", joinNotes(`${high.length} open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces.`, ...caveats), evidence);
   }
@@ -1879,7 +1936,7 @@ function evaluateScaLicenseRisk(workspaces: Surface<HalListResult>, samples: Sca
 
 async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: ApplicationSnapshot, workspaces: Surface<HalListResult>, maxApplications: number): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
   const blocker = applicationInventoryBlocker(18, "medium", snapshot, ["Map each application with third-party dependencies to an SCA workspace or upload-and-scan SCA."]);
-  if (blocker) return { finding: blocker, raw: {}, errors: [] };
+  if (blocker) return { finding: blocker, raw: { sca_projects_by_application: notAttempted("the application inventory was not readable, so no linked project list was requested.") }, errors: [] };
   const scaBlocker = scaUnavailableFinding(18, "medium", workspaces, ["Map each application to an SCA workspace or confirm upload-and-scan SCA is enabled."]);
   const list = (snapshot.applications as { value: HalListResult }).value;
   const sampled = list.items.slice(0, maxApplications);
@@ -1901,11 +1958,11 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     }
     const projects = await surface(() => client.getScaApplicationProjects(guid));
     errors.push(...surfaceErrors(`sca projects ${applicationName(app)}`, projects));
+    rawProjects[guid] = rawSurface(projects);
     if (projects.status === "error") {
       unreadable.push(applicationName(app));
       continue;
     }
-    rawProjects[guid] = projects.value;
     const linked = asRecords(projects.value.linked_projects);
     linkedProjectsByApplication[applicationName(app)] = linked.slice(0, 20).map((project) => ({
       name: asString(project.name) ?? asString(project.id) ?? null,
@@ -1917,17 +1974,19 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   }
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} linked project lists were unreadable.` : undefined];
   const evidence = { applications_sampled: sampled.length, covered_applications: covered.length, uncovered_applications: uncovered.slice(0, 50), unreadable_applications: unreadable.slice(0, 50), linked_projects_by_application: linkedProjectsByApplication, sca_agent_api_available: !scaBlocker };
+  // With the SCA Agent API unreadable no project list is requested, so the snapshot carries a marker rather than an empty map.
+  const raw = { sca_projects_by_application: scaBlocker ? notAttempted("the SCA Agent API was not readable, so no linked project list was requested.") : rawProjects };
   if (scaBlocker && covered.length === 0) {
-    return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw: {}, errors };
+    return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw, errors };
   }
   if (uncovered.length > 0) {
-    return { finding: finding(18, "medium", "warn", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, scaBlocker ? "The SCA Agent API was unavailable, so linked agent projects could not be checked." : undefined, ...caveats), evidence), raw: { sca_projects_by_application: rawProjects }, errors };
+    return { finding: finding(18, "medium", "warn", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, scaBlocker ? "The SCA Agent API was unavailable, so linked agent projects could not be checked." : undefined, ...caveats), evidence), raw, errors };
   }
   if (covered.length === 0) {
-    return { finding: manualFinding(18, "medium", "No application could be evaluated for SCA coverage.", ["Map each application to an SCA workspace."], evidence), raw: { sca_projects_by_application: rawProjects }, errors };
+    return { finding: manualFinding(18, "medium", "No application could be evaluated for SCA coverage.", ["Map each application to an SCA workspace."], evidence), raw, errors };
   }
   const scaAgentNote = scaBlocker ? `The SCA Agent API was unavailable (${workspaces.status === "error" ? `${workspaces.statusCode ?? "error"}` : "no workspaces"}), so linked agent projects were not checked; every sampled application is covered by upload-and-scan SCA alone.` : undefined;
-  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, scaAgentNote, ...caveats), evidence), raw: { sca_projects_by_application: rawProjects }, errors };
+  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, scaAgentNote, ...caveats), evidence), raw, errors };
 }
 
 export async function assessVeracodeScaPosture(
@@ -1966,17 +2025,19 @@ export async function assessVeracodeScaPosture(
   ];
   return {
     title: "Veracode SCA posture",
-    summary: { base_url: client.getResolvedConfig().baseUrl, workspaces_seen: workspaces.status === "ok" ? workspaces.value.items.length : 0, workspaces_sampled: samples.length, cvss_threshold: cvssThreshold, ...countByStatus(findings) },
+    summary: { base_url: client.getResolvedConfig().baseUrl, workspaces_seen: countIfRead(workspaces), workspaces_sampled: workspaces.status === "ok" ? samples.length : null, cvss_threshold: cvssThreshold, ...countByStatus(findings) },
     findings,
     errors,
     rawData: {
-      applications: snapshot.applications.status === "ok" ? snapshot.applications.value : { error: snapshot.applications.error },
-      sca_workspaces: workspaces.status === "ok" ? workspaces.value : { error: workspaces.error },
-      sca_issues_by_workspace: Object.fromEntries(samples.map((sample) => [sample.id, {
-        vulnerabilities: sample.vulnerabilities.status === "ok" ? sample.vulnerabilities.value : { error: sample.vulnerabilities.error },
-        licenses: sample.licenses.status === "ok" ? sample.licenses.value : { error: sample.licenses.error },
-        libraries: sample.libraries.status === "ok" ? sample.libraries.value : { error: sample.libraries.error },
-      }])),
+      applications: rawSurface(snapshot.applications),
+      sca_workspaces: rawSurface(workspaces),
+      sca_issues_by_workspace: workspaces.status === "ok"
+        ? Object.fromEntries(samples.map((sample) => [sample.id, {
+          vulnerabilities: rawSurface(sample.vulnerabilities),
+          licenses: rawSurface(sample.licenses),
+          libraries: rawSurface(sample.libraries),
+        }]))
+        : notAttempted("the SCA workspace list was not readable, so no workspace issue or library list was requested."),
       ...coverage.raw,
     },
   };
@@ -2063,10 +2124,11 @@ function evaluateUserRoles(snapshot: IdentitySnapshot, maxAdmins: number, inacti
 
 async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnapshot, maxAgeDays: number, now: Date): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
   const manualEvidence = ["Export API credential creation and expiration dates per API service account from the Platform."];
-  if (snapshot.users.status === "error") return { finding: manualFinding(9, "high", unreadableReason("users (Administrator role)", snapshot.users), manualEvidence, { status_code: snapshot.users.statusCode ?? null }), raw: {}, errors: [] };
+  const skipped = (reason: string) => ({ api_credentials_by_user: notAttempted(reason) });
+  if (snapshot.users.status === "error") return { finding: manualFinding(9, "high", unreadableReason("users (Administrator role)", snapshot.users), manualEvidence, { status_code: snapshot.users.statusCode ?? null }), raw: skipped("the user list was not readable, so no credential record was requested."), errors: [] };
   const apiUsers = snapshot.users.value.items.filter((user) => isApiAccount(user) && asBoolean(user.active) === true);
-  if (snapshot.users.value.items.length === 0) return { finding: manualFinding(9, "high", "The users endpoint returned zero users, so API credentials could not be inventoried; the empty list is treated as unverifiable rather than compliant.", manualEvidence), raw: {}, errors: [] };
-  if (apiUsers.length === 0) return { finding: manualFinding(9, "high", "No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable.", manualEvidence, { users_seen: snapshot.users.value.items.length }), raw: {}, errors: [] };
+  if (snapshot.users.value.items.length === 0) return { finding: manualFinding(9, "high", "The users endpoint returned zero users, so API credentials could not be inventoried; the empty list is treated as unverifiable rather than compliant.", manualEvidence), raw: skipped("the user list was empty, so no credential record was requested."), errors: [] };
+  if (apiUsers.length === 0) return { finding: manualFinding(9, "high", "No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable.", manualEvidence, { users_seen: snapshot.users.value.items.length }), raw: skipped("the user list carried no active API account, so no credential record was requested."), errors: [] };
   const sampled = apiUsers.slice(0, 200);
   const results = await Promise.all(sampled.map(async (user) => ({ user: userLabel(user), userId: asString(user.user_id) ?? "", credentials: await surface(() => client.getUserApiCredentials(asString(user.user_id) ?? "")) })));
   const errors = results.flatMap((item) => surfaceErrors(`api credentials ${item.user}`, item.credentials));
@@ -2076,10 +2138,10 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
   const expired: string[] = [];
   const missingDates: string[] = [];
   let current = 0;
-  const rawCredentials: JsonRecord = {};
+  const projectCredential = (credential: JsonRecord): JsonRecord => ({ api_id: asString(credential.api_id) ?? null, created_ts: asString(credential.created_ts) ?? null, expiration_ts: asString(credential.expiration_ts) ?? null, revocation_ts: asString(credential.revocation_ts) ?? null, last_used_ts: asString(credential.last_used_ts) ?? null });
+  const rawCredentials: JsonRecord = Object.fromEntries(results.map((item) => [item.userId, rawSurface(item.credentials, projectCredential)]));
   for (const item of readable) {
     const credential = (item.credentials as { value: JsonRecord }).value;
-    rawCredentials[item.userId] = { api_id: asString(credential.api_id) ?? null, created_ts: asString(credential.created_ts) ?? null, expiration_ts: asString(credential.expiration_ts) ?? null, revocation_ts: asString(credential.revocation_ts) ?? null, last_used_ts: asString(credential.last_used_ts) ?? null };
     if (asString(credential.revocation_ts)) continue;
     const created = parseDate(credential.created_ts);
     const expiration = parseDate(credential.expiration_ts);
@@ -2131,14 +2193,14 @@ export async function assessVeracodeAccessControls(
   ];
   return {
     title: "Veracode access controls",
-    summary: { base_url: client.getResolvedConfig().baseUrl, users_seen: users.status === "ok" ? users.value.items.length : 0, teams_seen: teams.status === "ok" ? teams.value.items.length : 0, roles_seen: roles.status === "ok" ? roles.value.items.length : 0, ...countByStatus(findings) },
+    summary: { base_url: client.getResolvedConfig().baseUrl, users_seen: countIfRead(users), teams_seen: countIfRead(teams), roles_seen: countIfRead(roles), ...countByStatus(findings) },
     findings,
     errors: [...surfaceErrors("users", users), ...surfaceErrors("teams", teams), ...surfaceErrors("roles", roles), ...surfaceErrors("self", self), ...surfaceErrors("applications", applications), ...credentials.errors],
     rawData: {
-      users: users.status === "ok" ? users.value : { error: users.error },
-      teams: teams.status === "ok" ? teams.value : { error: teams.error },
-      roles: roles.status === "ok" ? roles.value : { error: roles.error },
-      self: self.status === "ok" ? self.value : { error: self.error },
+      users: rawSurface(users),
+      teams: rawSurface(teams),
+      roles: rawSurface(roles),
+      self: rawSurface(self),
       ...credentials.raw,
     },
   };
@@ -2220,7 +2282,7 @@ export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeA
     const result = await surface(probe.load);
     surfaces.push(result.status === "ok"
       ? { name: probe.name, endpoint: probe.endpoint, status: "readable", count: result.value.count, ...(result.value.countNote ? { countNote: result.value.countNote } : {}), requiredRole: probe.requiredRole }
-      : { name: probe.name, endpoint: probe.endpoint, status: "not_readable", statusCode: result.statusCode, error: result.error, requiredRole: probe.requiredRole });
+      : { name: probe.name, endpoint: result.endpoint ?? probe.endpoint, status: "not_readable", count: null, statusCode: result.statusCode ?? null, error: result.error, requiredRole: probe.requiredRole });
   }
   const self = await surface(() => client.getSelf());
   const principal = self.status === "ok" ? userLabel(self.value) : undefined;
@@ -2254,7 +2316,7 @@ function formatAccessCheckText(result: VeracodeAccessCheckResult): string {
   const rows = result.surfaces.map((item) => [
     item.name,
     item.status,
-    item.count === undefined ? "-" : `${item.count}${item.countNote ? ` (${item.countNote})` : ""}`,
+    item.count === null ? "-" : `${item.count}${item.countNote ? ` (${item.countNote})` : ""}`,
     item.requiredRole,
     item.error ? item.error.replace(/\s+/g, " ").slice(0, 90) : "",
   ]);

@@ -960,6 +960,222 @@ test("rule 1 corollary: unreadable library lists and an unavailable SCA Agent AP
   assert.equal(coverage.evidence.sca_agent_api_available, false);
 });
 
+/** The healthy fixture served as HAL pages by path, so a real VeracodeApiClient walks it exactly as it would the vendor API. */
+function veracodeRoutes(fixture) {
+  const page = (key, items) => ({ _embedded: { [key]: items }, page: { number: 0, size: Math.max(items.length, 1), total_elements: items.length, total_pages: 1 } });
+  return [
+    [/^\/api\/authn\/v2\/users\/self$/, () => fixture.self],
+    [/^\/api\/authn\/v2\/api_credentials$/, () => fixture.credentials],
+    [/^\/api\/authn\/v2\/api_credentials\/user_id\/[^/]+$/, () => fixture.credentials],
+    [/^\/api\/authn\/v2\/users$/, () => page("users", fixture.users)],
+    [/^\/api\/authn\/v2\/teams$/, () => page("teams", fixture.teams)],
+    [/^\/api\/authn\/v2\/roles$/, () => page("roles", fixture.roles)],
+    [/^\/appsec\/v1\/applications$/, () => page("applications", fixture.applications)],
+    [/^\/appsec\/v1\/applications\/[^/]+\/sandboxes$/, () => page("sandboxes", fixture.sandboxes)],
+    [/^\/appsec\/v2\/applications\/[^/]+\/findings$/, () => page("findings", fixture.findings)],
+    [/^\/appsec\/v2\/applications\/[^/]+\/summary_report$/, () => fixture.summaryReport],
+    [/^\/appsec\/v1\/policies$/, () => page("policy_versions", fixture.policies)],
+    [/^\/srcclr\/v3\/workspaces$/, () => page("workspaces", fixture.workspaces)],
+    [/^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, (url) => page("issues", url.searchParams.get("type") === "vulnerability" ? fixture.vulnerabilityIssues : fixture.licenseIssues)],
+    [/^\/srcclr\/v3\/workspaces\/[^/]+\/libraries$/, () => page("libraries", fixture.libraries)],
+    [/^\/srcclr\/v3\/applications\/[^/]+\/projects$/, () => fixture.scaProjects],
+    [/^\/was\/configservice\/v1\/analyses$/, () => page("analyses", fixture.analyses)],
+    [/^\/was\/configservice\/v1\/analyses\/[^/]+\/scans$/, () => page("scans", fixture.scans)],
+    [/^\/was\/configservice\/v1\/scans\/[^/]+\/configuration$/, () => fixture.scanConfiguration],
+  ];
+}
+
+/**
+ * Serves the route table, denies every path matching `denied` with a 403 JSON
+ * body, and records every request it answered so the outputs can be checked
+ * against what the run observed.
+ */
+function recordingVeracodeFetch({ denied = [], fixture = healthyFixture() } = {}) {
+  const routes = veracodeRoutes(fixture);
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    let response;
+    if (denied.some((pattern) => pattern.test(url.pathname))) {
+      response = new Response(JSON.stringify({ message: "Access denied" }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+    } else {
+      const route = routes.find(([pattern]) => pattern.test(url.pathname));
+      assert.ok(route, `unexpected request to ${url.pathname}`);
+      response = jsonResponse(route[1](url));
+    }
+    requests.push({ method: init.method ?? "GET", path: url.pathname, status: response.status });
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+// Every dataset the assessments collect: the path it reads, the core_data file
+// it lands in, where it sits inside that file, and the access probe (if any)
+// that reads the same path.
+const VERACODE_DATASETS = [
+  ["applications", /^\/appsec\/v1\/applications$/, "scan-coverage.json", (data) => data.applications, "applications"],
+  ["policies", /^\/appsec\/v1\/policies$/, "policy-compliance.json", (data) => data.policies, "policies"],
+  ["sandboxes", /^\/appsec\/v1\/applications\/[^/]+\/sandboxes$/, "scan-coverage.json", (data) => data.sandboxes_by_application["app-1"]],
+  ["findings", /^\/appsec\/v2\/applications\/[^/]+\/findings$/, "findings-hygiene.json", (data) => data.findings_by_application["app-1"]],
+  ["summary_report", /^\/appsec\/v2\/applications\/[^/]+\/summary_report$/, "findings-hygiene.json", (data) => data.summary_reports_by_application["app-1"]],
+  ["users", /^\/api\/authn\/v2\/users$/, "access-controls.json", (data) => data.users, "users"],
+  ["teams", /^\/api\/authn\/v2\/teams$/, "access-controls.json", (data) => data.teams, "teams"],
+  ["roles", /^\/api\/authn\/v2\/roles$/, "access-controls.json", (data) => data.roles, "roles"],
+  ["api_credentials", /^\/api\/authn\/v2\/api_credentials\/user_id\/[^/]+$/, "access-controls.json", (data) => data.api_credentials_by_user["u-2"]],
+  ["sca_workspaces", /^\/srcclr\/v3\/workspaces$/, "sca-posture.json", (data) => data.sca_workspaces, "sca_workspaces"],
+  ["sca_issues", /^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, "sca-posture.json", (data) => data.sca_issues_by_workspace["ws-1"].vulnerabilities],
+  ["sca_libraries", /^\/srcclr\/v3\/workspaces\/[^/]+\/libraries$/, "sca-posture.json", (data) => data.sca_issues_by_workspace["ws-1"].libraries],
+  ["sca_projects", /^\/srcclr\/v3\/applications\/[^/]+\/projects$/, "sca-posture.json", (data) => data.sca_projects_by_application["app-2"]],
+  ["dynamic_analyses", /^\/was\/configservice\/v1\/analyses$/, "scan-coverage.json", (data) => data.dynamic_analysis.analyses, "dynamic_analyses"],
+  ["dynamic_scans", /^\/was\/configservice\/v1\/analyses\/[^/]+\/scans$/, "scan-coverage.json", (data) => data.dynamic_analysis.scans_by_analysis["an-1"]],
+  ["dynamic_scan_configuration", /^\/was\/configservice\/v1\/scans\/[^/]+\/configuration$/, "scan-coverage.json", (data) => data.dynamic_analysis.scan_configurations[0]],
+];
+
+// Sub-datasets whose requests are skipped, not denied, when the inventory they hang off is unreadable.
+const VERACODE_SKIPPED_ON_DENIAL = {
+  applications: [["scan-coverage.json", (data) => data.sandboxes_by_application], ["findings-hygiene.json", (data) => data.findings_by_application], ["findings-hygiene.json", (data) => data.summary_reports_by_application]],
+  users: [["access-controls.json", (data) => data.api_credentials_by_user]],
+  sca_workspaces: [["sca-posture.json", (data) => data.sca_issues_by_workspace], ["sca-posture.json", (data) => data.sca_projects_by_application]],
+  dynamic_analyses: [["scan-coverage.json", (data) => data.dynamic_analysis.scans_by_analysis], ["scan-coverage.json", (data) => data.dynamic_analysis.scan_configurations]],
+};
+
+const MENTIONED_STATUS_PATTERNS = [
+  /\((\d{3})(?: [A-Za-z][A-Za-z ]*)?\)/g,
+  /"(?:status_code|statusCode|status)":\s*(\d{3})\b/g,
+  /\b(?:HTTP|status|returned|refused)\s+(\d{3})\b/gi,
+];
+const MENTIONED_ENDPOINT_PATTERN = /\/(?:api\/authn|appsec|srcclr|was\/configservice)\/v\d[A-Za-z0-9_./{}-]*[A-Za-z0-9}]/g;
+
+/**
+ * Every 4xx or 5xx status code and every API path named anywhere in the
+ * outputs must belong to a request the fixture actually served: a code or
+ * endpoint that never appears in the request log is a claim the run did not
+ * observe.
+ */
+function assertOutputsNameOnlyObservedRequests(outputs, requests, label) {
+  const observedStatuses = new Set(requests.map((request) => request.status));
+  const observedPaths = requests.map((request) => request.path);
+  for (const [name, text] of outputs) {
+    for (const pattern of MENTIONED_STATUS_PATTERNS) {
+      for (const match of text.matchAll(pattern)) {
+        const status = Number(match[1]);
+        if (status < 400 || status > 599) continue;
+        assert.ok(observedStatuses.has(status), `${label} ${name}: mentions status ${status} but the run observed only ${[...observedStatuses].join(", ")} (in: ${match[0]})`);
+      }
+    }
+    for (const match of text.matchAll(MENTIONED_ENDPOINT_PATTERN)) {
+      const mention = match[0].replace(/[.)]+$/, "");
+      const template = new RegExp(`^${mention.replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\\{[^}]*\\\}|\{[^}]*\}/g, "[^/]+")}$`);
+      assert.ok(observedPaths.some((path) => template.test(path)), `${label} ${name}: names endpoint ${mention} but the run requested only ${[...new Set(observedPaths)].join(", ")}`);
+    }
+  }
+}
+
+function veracodeOutputs(access, results, exported) {
+  return new Map([
+    ["check_access", JSON.stringify(access)],
+    ...results.map((result) => [`assess ${result.title}`, JSON.stringify(result)]),
+    ...[...readBundleFiles(exported.outputDir)].map(([name, content]) => [`bundle ${name}`, content]),
+  ]);
+}
+
+async function runVeracodeAssessments(client) {
+  return Promise.all([
+    assessVeracodeScanCoverage(client, { now: NOW }),
+    assessVeracodePolicyCompliance(client, {}),
+    assessVeracodeFindingsHygiene(client, { now: NOW }),
+    assessVeracodeScaPosture(client, {}),
+    assessVeracodeAccessControls(client, { now: NOW }),
+  ]);
+}
+
+function assertNotCollectedMarker(entry, label, expected) {
+  assert.ok(entry && typeof entry === "object" && !Array.isArray(entry), `${label}: a dataset that was not collected is never written as an array or scalar, got ${JSON.stringify(entry)}`);
+  assert.equal(entry.collected, false, `${label}: carries collected: false`);
+  assert.equal(entry.status, expected.status, `${label}: status is the observed HTTP status or null`);
+  if (expected.endpoint) assert.match(entry.endpoint, expected.endpoint, `${label}: names the endpoint whose request failed`);
+  else assert.equal(entry.endpoint, null, `${label}: names no endpoint when no request was issued`);
+  assert.match(entry.error, expected.error, `${label}: carries the recorded error`);
+}
+
+test("collection status: a denied dataset is written to core_data and the assess payload as a not-collected marker, skipped sub-datasets carry a not-requested marker, counts render null, and every status code and endpoint named in any output was actually observed", async () => {
+  const base = createTempBase("grclanker-veracode-denied-markers-");
+
+  for (const [dataset, pattern, coreFile, locate, probeName] of VERACODE_DATASETS) {
+    const { fetchImpl, requests } = recordingVeracodeFetch({ denied: [pattern] });
+    const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+    const access = await checkVeracodeAccess(client);
+    const results = await runVeracodeAssessments(client);
+    const exported = await exportVeracodeAuditBundle(client, sampleConfig(), join(base, dataset), { now: NOW });
+
+    const snapshot = JSON.parse(readFileSync(join(exported.outputDir, "core_data", coreFile), "utf8"));
+    const entry = locate(snapshot);
+    assertNotCollectedMarker(entry, `${dataset} core_data/${coreFile}`, { status: 403, endpoint: pattern, error: /Veracode request failed \(403 Forbidden\) for \// });
+    const payloadEntry = results.map((result) => { try { return locate(result.rawData); } catch { return undefined; } }).find(Boolean);
+    assert.deepEqual(payloadEntry, entry, `${dataset}: the assess payload carries the same marker as core_data`);
+    assert.ok(requests.some((request) => pattern.test(request.path) && request.status === 403), `${dataset}: the denied request was actually issued`);
+
+    for (const [skippedFile, locateSkipped] of VERACODE_SKIPPED_ON_DENIAL[dataset] ?? []) {
+      const skipped = locateSkipped(JSON.parse(readFileSync(join(exported.outputDir, "core_data", skippedFile), "utf8")));
+      assertNotCollectedMarker(skipped, `${dataset} skipped sub-dataset in core_data/${skippedFile}`, { status: null, endpoint: null, error: /^Not requested: / });
+    }
+
+    if (probeName) {
+      const surface = access.surfaces.find((item) => item.name === probeName);
+      assert.equal(surface.status, "not_readable");
+      assert.equal(surface.count, null, `${dataset}: the access check count is null, not 0, when the probe failed`);
+      assert.equal(surface.statusCode, 403);
+      assert.match(surface.endpoint, pattern, `${dataset}: the surface names the endpoint that failed, got ${surface.endpoint}`);
+      assert.match(surface.error, /403 Forbidden/);
+    }
+
+    assertOutputsNameOnlyObservedRequests(veracodeOutputs(access, results, exported), requests, `${dataset} denied`);
+  }
+
+  // Summary counters derived from a denied inventory render null rather than 0.
+  const denied = async (pattern) => {
+    const { fetchImpl } = recordingVeracodeFetch({ denied: [pattern] });
+    return runVeracodeAssessments(new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} }));
+  };
+  const [scanCoverage, policyCompliance, findingsHygiene] = await denied(/^\/appsec\/v1\/applications$/);
+  assert.equal(scanCoverage.summary.applications_seen, null);
+  assert.equal(scanCoverage.summary.applications_total, null);
+  assert.equal(policyCompliance.summary.applications_seen, null);
+  assert.equal(findingsHygiene.summary.applications_seen, null);
+  assert.equal(findingsHygiene.summary.applications_sampled, null);
+  const [, , , scaPosture] = await denied(/^\/srcclr\/v3\/workspaces$/);
+  assert.equal(scaPosture.summary.workspaces_seen, null);
+  assert.equal(scaPosture.summary.workspaces_sampled, null);
+  const [, , , , accessControls] = await denied(/^\/api\/authn\/v2\/users$/);
+  assert.equal(accessControls.summary.users_seen, null);
+  assert.equal(typeof accessControls.summary.roles_seen, "number", "a readable inventory keeps its count");
+
+  // Readable but empty lists stay [] with a zero count, and the healthy run names no status or endpoint it did not observe.
+  const fixture = healthyFixture();
+  fixture.sandboxes = [];
+  fixture.scans = [];
+  fixture.licenseIssues = [];
+  const { fetchImpl, requests } = recordingVeracodeFetch({ fixture });
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+  const access = await checkVeracodeAccess(client);
+  const results = await runVeracodeAssessments(client);
+  const exported = await exportVeracodeAuditBundle(client, sampleConfig(), join(base, "empty"), { now: NOW });
+  const scan = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "scan-coverage.json"), "utf8"));
+  const sca = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "sca-posture.json"), "utf8"));
+  assert.deepEqual(scan.sandboxes_by_application["app-1"], [], "a readable empty sandbox list stays []");
+  assert.deepEqual(scan.dynamic_analysis.scans_by_analysis["an-1"], [], "a readable empty scan list stays []");
+  assert.deepEqual(scan.dynamic_analysis.scan_configurations, [], "no scan means no configuration was requested and nothing was denied");
+  assert.deepEqual(sca.sca_issues_by_workspace["ws-1"].vulnerabilities.items, [], "a readable empty issue list stays []");
+  assert.equal(sca.sca_issues_by_workspace["ws-1"].vulnerabilities.complete, true);
+  assert.equal(sca.sca_issues_by_workspace["ws-1"].licenses.totalElements, 0);
+  for (const surface of access.surfaces) {
+    assert.equal(surface.status, "readable", `${surface.name} is readable on the healthy fixture`);
+    assert.equal(typeof surface.count, "number");
+    assert.equal(surface.statusCode, undefined, "a readable surface carries no failure status");
+  }
+  assertOutputsNameOnlyObservedRequests(veracodeOutputs(access, results, exported), requests, "healthy with empty lists");
+});
+
 test("exportVeracodeAuditBundle writes the layout, logs errors, and never overwrites a prior bundle", async () => {
   const base = createTempBase("grclanker-veracode-export-");
   const client = mockClient(healthyFixture(), { async listScaWorkspaces() { throw forbidden("/srcclr/v3/workspaces"); } });
