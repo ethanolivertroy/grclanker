@@ -4,6 +4,9 @@ cli/.cache/
 cli/dist/
 cli/release/
 
+# Cursor Agent SDK local state (sessions, traces, evals)
+.agent-serve/
+
 # Astro
 dist/
 .astro/
