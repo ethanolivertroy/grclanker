@@ -3,16 +3,25 @@ slug: "gcp-sec-inspector"
 name: "GCP Security Inspector"
 vendor: "Google Cloud"
 category: "cloud-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/gcp-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # gcp-sec-inspector
 
 Multi-framework security compliance audit tool for Google Cloud Platform.
+
+## grclanker implementation
+
+The spec ships as native grclanker tools in `cli/extensions/grc-tools/gcp.ts` with tests in `cli/tests/gcp.test.mjs` and the integration guide at `src/content/docs/docs/integrations/gcp.md`:
+
+- `gcp_check_access`, `gcp_assess_identity`, `gcp_assess_logging_detection`, `gcp_assess_org_guardrails`, `gcp_assess_data_protection`, `gcp_assess_network_security`, `gcp_export_audit_bundle`
+- Authentication: explicit token, service account key or ADC JSON via `GCP_CREDENTIALS_FILE` or `GOOGLE_APPLICATION_CREDENTIALS` (OAuth 2.0 JWT bearer flow signed with `node:crypto`), the ADC well-known file, then `gcloud auth print-access-token`; `GCP_ORG_ID` is accepted as an alias of `GCP_ORGANIZATION_ID`
+- Verdicts follow the grclanker verdict-safety rules: forbidden, errored, empty, API-disabled, or partial inventories never pass
+- Live smoke: `npm --prefix cli run test:gcp:live`
 
 ## Overview
 
@@ -364,4 +373,30 @@ gcp-sec-inspector diff --baseline baseline.json --current current.json
 
 ## Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as of 2026-09-21 (TypeScript, `cli/extensions/grc-tools/gcp.ts`).
+
+### What shipped
+
+- 31 findings across five assess tools cover all 23 controls: `GCP-IAM-01..05`, `GCP-LOG-01..05`, `GCP-ORG-01..08`, `GCP-DATA-01..07`, `GCP-NET-01..06`. The finding-to-control map is in the integration guide's coverage table.
+- Multi-project scope: projects are enumerated with Cloud Asset Inventory `searchAllResources` under the organization, capped by `project_limit` (alias `max_projects`, default 20). A truncated inventory, a denied project, or a disabled API downgrades every dependent finding to `warn` or `manual` with seen and total counts.
+- Export bundle: `core_data/` (redacted snapshots), `analysis/` (`findings.json`, `category_summaries.json`, per-category JSON and markdown), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, `frameworks/<framework>.md` for the eight frameworks in the mapping table), `QUICK_REFERENCE.md`, `_errors.log` only when collection partially failed, and a zip named after the allocated directory (`-2`, `-3` on rerun).
+- Tests: a four-fixture false-pass self-check (all endpoints 403, all lists empty, partial inventory, fully compliant organization) plus regression tests for the credential chain, JWT signing, encoded query strings, pagination, violation detection, bundle layout, and secure output paths.
+
+### Deviations from this spec, following the official documentation
+
+- Cloud Asset Inventory `searchAllResources` and `searchAllIamPolicies` are `GET` requests with query parameters (`scope`, `query`, `assetTypes`, `pageSize` max 500, `pageToken`), not `POST` as listed in the API table.
+- Cloud KMS keys are inventoried through Cloud Asset Inventory `assets.list` with `assetTypes=cloudkms.googleapis.com/CryptoKey` and `contentType=RESOURCE` instead of per-location `keyRings.list` and `cryptoKeys.list`, because the KMS list APIs require an explicit location per call.
+- API keys are read from the API Keys API (`apikeys.googleapis.com/v2`), not IAM as the control table states.
+- Cloud NAT, firewall, subnetwork, SSL policy, backend service, disk, and instance data come from the Compute Engine API (`list` and `aggregatedList`) rather than Cloud Asset Inventory, so the read works with only the Compute API enabled in the target project.
+- Security Command Center is visibility only (`GCP-LOG-05`); it never scores a control. The `assets`, `findings:group`, `notificationConfigs`, custom module, and compliance report endpoints are not called.
+- Effective organization policies are read with the v1 `projects.getEffectiveOrgPolicy` method (`booleanPolicy.enforced`, `listPolicy`) against the first inventoried project; the v2 `policies` endpoints are not used.
+- The tool is read-only: the `export --format scc` write-back, HTML dashboard, CKL and OSCAL output, and baseline diffing described under CLI Interface and Output Formats are not implemented.
+
+### What remains (deferrals)
+
+- Control 2: unused permission analysis (Policy Intelligence recommender) is not evaluated; only owner/editor-style bindings are scored.
+- Control 4: unused firewall rule detection (Firewall Insights) is not evaluated.
+- Control 8: attestor configuration is not evaluated; only the default admission rule is scored.
+- Control 11: OS Login 2FA enforcement is not evaluated.
+- Folder-scoped inventory (`GCP_FOLDER_ID`) is not supported; scope is an organization or a single project.
+- Object ACLs on non-uniform buckets are not inspected; public exposure relies on IAM policy search.
