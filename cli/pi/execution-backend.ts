@@ -105,9 +105,12 @@ export type CommandRunnerSync = (executable: string, args: string[]) => CommandR
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+// The constructor is the one point every adapter error passes through, so a message assembled
+// from a provider body, a CLI's stderr, or a job error string is scrubbed even when the throw
+// site forgot to. Subclasses inherit it through super().
 export class ExecutionBackendError extends Error {
   constructor(message: string) {
-    super(`Compute backend error: ${message}`);
+    super(`Compute backend error: ${redactErrorMessage(message)}`);
     this.name = "ExecutionBackendError";
   }
 }
@@ -164,11 +167,50 @@ export function redactUnterminatedPemBlocks(text: string): string {
     `${body.length > 0 ? PEM_OPEN_BODY_REDACTION : PEM_OPEN_REDACTION}${lineBreak ?? ""}`);
 }
 
+// Any scheme://... substring, unanchored, so a URL embedded mid-sentence in a provider error
+// message is found. The character class stops at whitespace, quotes, angle brackets, and closing
+// punctuation so the surrounding text survives.
+const URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{},;]+/gi;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^/@]+@/i;
+
+// Credentials travel in URLs as userinfo, query values, and fragments. Every query value is
+// redacted (not only credential-named parameters) because a session token does not announce
+// itself by name; the parameter names and the path stay so the URL remains recognizable.
+function redactUrl(url: string): string {
+  const cut = url.search(/[?#]/);
+  const base = (cut === -1 ? url : url.slice(0, cut)).replace(URL_USERINFO_PATTERN, "$1[REDACTED]@");
+  if (cut === -1) return base;
+  const rest = url.slice(cut);
+  const hash = rest.indexOf("#");
+  const query = hash === -1 ? rest : rest.slice(0, hash);
+  const fragment = hash === -1 ? "" : "#[REDACTED]";
+  const redactedQuery = query.length <= 1
+    ? query
+    : `?${query.slice(1).split("&").map((part) => (part.includes("=") ? `${part.slice(0, part.indexOf("="))}=[REDACTED]` : "[REDACTED]")).join("&")}`;
+  return `${base}${redactedQuery}${fragment}`;
+}
+
+// A credential-named header or parameter followed by its value, in header (`X-Api-Key: v`),
+// assignment (`token=v`), or JSON (`"session": "v"`) form. Quoted values keep their quotes so
+// JSON stays parseable.
+const CREDENTIAL_FIELD_PATTERN = /\b((?:x-)?(?:api[_-]?key|apikey|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|sessionid|session|sid|cookie|client[_-]?secret|secret|password|passwd|token|signature|sig)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s;,&"'<>]{4,})/gi;
+
+function redactCredentialField(_match: string, prefix: string, value: string): string {
+  const quote = value.startsWith("\"") || value.startsWith("'") ? value[0] : "";
+  return `${prefix}${quote}[REDACTED]${quote}`;
+}
+
+type SecretPattern = {
+  pattern: RegExp;
+  replacement: string | ((match: string, ...groups: string[]) => string);
+};
+
 // Secondary, format-based patterns for the providers this runtime talks to. The primary
 // mechanism is the exact values of the credential environment variables above; these
 // patterns catch the same credentials when they arrive from a remote (for example a
-// container echoing its own environment) without ever being set locally.
-const SECRET_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
+// container echoing its own environment, or an upstream error page quoting request headers)
+// without ever being set locally.
+const SECRET_PATTERNS: ReadonlyArray<SecretPattern> = [
   { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: PEM_REDACTION },
   { pattern: /(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1[REDACTED]" },
   { pattern: /\brpa_[A-Za-z0-9]{16,}\b/g, replacement: "[REDACTED]" },
@@ -177,7 +219,14 @@ const SECRET_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> =
     pattern: /((?:RUNPOD_API_KEY|MODAL_TOKEN_ID|MODAL_TOKEN_SECRET|VERCEL_TOKEN|CLOUDFLARE_API_TOKEN)=)(?:"[^"]*"|'[^']*'|[^\s'"]+)/g,
     replacement: "$1[REDACTED]",
   },
+  { pattern: URL_PATTERN, replacement: redactUrl },
+  { pattern: /\b((?:set-)?cookie\s*:\s*)[^\r\n<>"']+/gi, replacement: "$1[REDACTED]" },
+  { pattern: CREDENTIAL_FIELD_PATTERN, replacement: redactCredentialField },
 ];
+
+function applySecretPattern(text: string, { pattern, replacement }: SecretPattern): string {
+  return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
+}
 
 export function redactSecrets(text: string, extraSecrets: Array<string | undefined> = []): string {
   let redacted = text;
@@ -188,10 +237,92 @@ export function redactSecrets(text: string, extraSecrets: Array<string | undefin
   for (const secret of secrets) {
     redacted = redacted.split(secret).join("[REDACTED]");
   }
-  for (const { pattern, replacement } of SECRET_PATTERNS) {
-    redacted = redacted.replace(pattern, replacement);
+  for (const entry of SECRET_PATTERNS) {
+    redacted = applySecretPattern(redacted, entry);
   }
   return redacted;
+}
+
+// An HTML document has no place in an error message: it is an upstream error page, and the
+// cookies or keys it may quote come in shapes no pattern can promise to know.
+const HTML_DOCUMENT_PATTERN = /<!doctype\s+html[^>]*>[\s\S]*?(?:<\/html\s*>|$)|<html\b[\s\S]*?(?:<\/html\s*>|$)/gi;
+
+// The single scrub for text that becomes an error message: every ExecutionBackendError runs its
+// message through this in the constructor, and the CLI applies it to messages it re-throws. It
+// withholds HTML documents wholesale, then applies the same value and pattern redaction as
+// command output, then neutralizes a truncated PEM block.
+export function redactErrorMessage(message: string): string {
+  const withoutHtml = message.replace(HTML_DOCUMENT_PATTERN, (document) => `[HTML document withheld (${document.length} chars)]`);
+  return redactUnterminatedPemBlocks(redactSecrets(withoutHtml));
+}
+
+function parseJson(text: string): unknown | undefined {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+const MESSAGE_FIELDS = ["error", "message", "detail", "details", "reason", "title", "description"] as const;
+const MAX_QUOTED_DETAIL = 400;
+
+function truncateDetail(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length > MAX_QUOTED_DETAIL ? `${trimmed.slice(0, MAX_QUOTED_DETAIL)}... (${trimmed.length} chars)` : trimmed;
+}
+
+// Describes a parsed JSON value for an error message by quoting only its message-bearing string
+// fields (which the ExecutionBackendError constructor then scrubs) and naming the other keys, so
+// an unexpected field carrying a credential is never copied into the message.
+export function summarizeJsonBody(value: unknown, depth = 0): string {
+  if (value === undefined || value === null) return "no detail";
+  if (typeof value === "string") return truncateDetail(value) || "empty string";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `JSON array with ${value.length} entries`;
+  if (typeof value !== "object") return "no detail";
+  const record = value as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const field of MESSAGE_FIELDS) {
+    const entry = record[field];
+    if (typeof entry === "string" && entry.trim().length > 0) {
+      parts.push(`${field}: ${truncateDetail(entry)}`);
+    } else if (depth === 0 && entry && typeof entry === "object" && !Array.isArray(entry)) {
+      parts.push(`${field}: ${summarizeJsonBody(entry, depth + 1)}`);
+    }
+  }
+  if (parts.length > 0) return parts.join("; ");
+  const keys = Object.keys(record);
+  return keys.length > 0 ? `JSON body with keys ${keys.join(", ")}` : "empty JSON body";
+}
+
+export type ProviderBody = {
+  json?: unknown;
+  detail: string;
+};
+
+// Reads a provider response body once and describes it for error messages. A body that does not
+// parse as JSON is reported by content type and length only, never quoted, because an upstream
+// error page (a 502 from a gateway, a login page) can carry session cookies or keys in shapes no
+// pattern knows. JSON bodies are summarized by summarizeJsonBody.
+export async function readProviderBody(response: Response): Promise<ProviderBody> {
+  const text = await response.text();
+  const json = parseJson(text);
+  if (json === undefined) {
+    const contentType = response.headers.get("content-type")?.split(";")[0].trim() || "unknown content type";
+    return { detail: `non-JSON ${contentType} body (${Buffer.byteLength(text, "utf8")} bytes) withheld` };
+  }
+  return { json, detail: summarizeJsonBody(json) };
+}
+
+// Host and path of a request URL for error messages: no query, no fragment, no userinfo.
+export function describeEndpoint(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}`;
+  } catch {
+    return "the provider endpoint";
+  }
 }
 
 export type RedactingSink = {

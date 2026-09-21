@@ -5,12 +5,14 @@ import {
   createExecutionOutputGuard,
   createProcessCommandRunner,
   createProcessCommandRunnerSync,
+  describeEndpoint,
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   ExecutionBackendUnsupportedError,
   normalizeExitCode,
-  redactSecrets,
+  readProviderBody,
   requireEnv,
+  summarizeJsonBody,
   type CommandRunner,
   type CommandRunnerSync,
   type ExecutionBackend,
@@ -85,12 +87,20 @@ function authHeaders(apiKey: string): Record<string, string> {
   };
 }
 
-async function readJson<T>(response: Response, apiKey: string, action: string): Promise<T> {
+// Every RunPod response goes through here. A non-JSON body (a gateway's 502 page, a login page
+// on a 200) is never quoted: the message carries status, endpoint, content type, and length.
+// JSON error bodies contribute only their message-bearing fields, and the ExecutionBackendError
+// constructor scrubs whatever those fields carry.
+async function readJson<T>(response: Response, action: string, url: string): Promise<T> {
+  const body = await readProviderBody(response);
+  const endpoint = describeEndpoint(url);
   if (!response.ok) {
-    const body = redactSecrets(await response.text(), [apiKey]);
-    throw new ExecutionBackendError(`${action} failed with HTTP ${response.status}. ${body.slice(0, 400)}`);
+    throw new ExecutionBackendError(`${action} failed with HTTP ${response.status} from ${endpoint}: ${body.detail}`);
   }
-  return (await response.json()) as T;
+  if (body.json === undefined) {
+    throw new ExecutionBackendError(`${action} returned HTTP ${response.status} from ${endpoint} with a ${body.detail}; expected JSON.`);
+  }
+  return body.json as T;
 }
 
 export function parseRunpodWorkerOutput(output: unknown): RunpodWorkerOutput {
@@ -129,8 +139,9 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
     },
     async healthcheck() {
       const apiKey = requireEnv("RUNPOD_API_KEY");
-      const response = await fetchImpl(endpointUrl("/health"), { method: "GET", headers: authHeaders(apiKey) });
-      await readJson<Record<string, unknown>>(response, apiKey, "RunPod endpoint health check");
+      const url = endpointUrl("/health");
+      const response = await fetchImpl(url, { method: "GET", headers: authHeaders(apiKey) });
+      await readJson<Record<string, unknown>>(response, "RunPod endpoint health check", url);
     },
     async stageWorkspace(input: StageWorkspaceInput): Promise<StagedWorkspace> {
       return {
@@ -150,14 +161,15 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
         },
         policy: request.timeoutMs ? { executionTimeout: Math.max(5_000, request.timeoutMs) } : undefined,
       };
+      const runUrl = endpointUrl("/run");
       const submitted = await readJson<RunpodJobResponse>(
-        await fetchImpl(endpointUrl("/run"), {
+        await fetchImpl(runUrl, {
           method: "POST",
           headers: authHeaders(apiKey),
           body: JSON.stringify(body),
         }),
-        apiKey,
         "RunPod job submission",
+        runUrl,
       );
       if (!submitted.id) {
         throw new ExecutionBackendError("RunPod /run did not return a job id.");
@@ -176,10 +188,11 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
             );
           }
           await sleep(pollIntervalMs);
+          const statusUrl = endpointUrl(`/status/${submitted.id}`);
           job = await readJson<RunpodJobResponse>(
-            await fetchImpl(endpointUrl(`/status/${submitted.id}`), { method: "GET", headers: authHeaders(apiKey) }),
-            apiKey,
+            await fetchImpl(statusUrl, { method: "GET", headers: authHeaders(apiKey) }),
             "RunPod job status",
+            statusUrl,
           );
         }
       } catch (error) {
@@ -188,8 +201,9 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
       }
 
       if (job.status !== "COMPLETED") {
-        const detail = redactSecrets(typeof job.error === "string" ? job.error : JSON.stringify(job.error ?? ""), [apiKey]);
-        throw new ExecutionBackendError(`RunPod job ${submitted.id} ended with status ${job.status}. ${detail}`.trim());
+        // The job error is provider text: a string is quoted (the constructor scrubs it), an
+        // object is described by its message fields and key names, never serialized whole.
+        throw new ExecutionBackendError(`RunPod job ${submitted.id} ended with status ${job.status}. ${summarizeJsonBody(job.error)}`);
       }
 
       // Worker output is untrusted remote text: it can echo the worker's own environment,
@@ -264,11 +278,12 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
   async function fetchPod(): Promise<RunpodPod> {
     const apiKey = requireEnv("RUNPOD_API_KEY");
     const podId = requireEnv("RUNPOD_POD_ID");
-    const response = await fetchImpl(`${RUNPOD_REST_BASE_URL}/pods/${encodeURIComponent(podId)}`, {
+    const url = `${RUNPOD_REST_BASE_URL}/pods/${encodeURIComponent(podId)}`;
+    const response = await fetchImpl(url, {
       method: "GET",
       headers: authHeaders(apiKey),
     });
-    cachedPod = await readJson<RunpodPod>(response, apiKey, `RunPod pod ${podId} lookup`);
+    cachedPod = await readJson<RunpodPod>(response, `RunPod pod ${podId} lookup`, url);
     return cachedPod;
   }
 
@@ -299,7 +314,7 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       const localRoot = resolve(input.localPath);
       const prepare = await runner("ssh", buildPodSshArgs(target, `mkdir -p -- ${quoteForBash(remotePath)}`));
       if (prepare.exitCode !== 0) {
-        throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${redactSecrets(prepare.stderr)}`);
+        throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${prepare.stderr}`);
       }
       stagedSessions.add(input.sessionId);
       const copy = await runner("scp", [
@@ -316,7 +331,7 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       if (copy.exitCode !== 0) {
         await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`)).catch(() => undefined);
         stagedSessions.delete(input.sessionId);
-        throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${redactSecrets(copy.stderr)}`);
+        throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${copy.stderr}`);
       }
       return { sessionId: input.sessionId, remotePath, detail: `copied ${localRoot} to ${target.host}:${remotePath} over scp` };
     },

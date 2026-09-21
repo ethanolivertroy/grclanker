@@ -8,7 +8,6 @@ import {
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   normalizeExitCode,
-  redactSecrets,
   type CommandRunner,
   type CommandRunnerResult,
   type CommandRunnerSync,
@@ -56,8 +55,9 @@ function sanitizeToken(value: string): string {
     .slice(0, 40) || "sandbox";
 }
 
+// prlctl output is quoted into the message; the ExecutionBackendError constructor scrubs it.
 function formatFailure(action: string, result: CommandRunnerResult): ExecutionBackendError {
-  const detail = redactSecrets([result.stdout, result.stderr].filter(Boolean).join("\n").trim());
+  const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
   return new ExecutionBackendError(`${action}. ${detail || "Check Parallels Desktop and the guest configuration."}`);
 }
 

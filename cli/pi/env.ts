@@ -21,7 +21,7 @@ import {
   type ComputeBackendKind,
   type ComputeBackendStatus,
 } from "./compute.js";
-import { redactSecrets } from "./execution-backend.js";
+import { redactErrorMessage, redactSecrets } from "./execution-backend.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
@@ -263,7 +263,7 @@ async function executeOnBackend(
       },
     });
   } catch (error) {
-    throw new GrclankerUserError(redactSecrets(getErrorMessage(error)));
+    throw new GrclankerUserError(redactErrorMessage(getErrorMessage(error)));
   }
 
   return {

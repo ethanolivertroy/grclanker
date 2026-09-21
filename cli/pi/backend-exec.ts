@@ -30,7 +30,7 @@ import {
   assertExhaustive,
   createRedactingSink,
   createSessionId,
-  redactSecrets,
+  ExecutionBackendError,
   type ExecutionBackend,
 } from "./execution-backend.js";
 import { assertParallelsSourceIsUsable } from "./parallels-sandbox.js";
@@ -105,7 +105,7 @@ type BackendCommandAdapter = {
 };
 
 function formatBackendError(message: string): Error {
-  return new Error(`Compute backend error: ${message}`);
+  return new ExecutionBackendError(message);
 }
 
 function ensureWorkspaceMapping(localRoot: string, cwd: string, remoteRoot: string): string {
@@ -612,7 +612,7 @@ function createContractCommandAdapter(
         redactOutput: false,
       });
       if (result.exitCode !== 0) {
-        throw new Error(redactSecrets(result.stderr.trim()) || `Command failed (${result.exitCode}) on ${backend.kind}`);
+        throw new ExecutionBackendError(result.stderr.trim() || `Command failed (${result.exitCode}) on ${backend.kind}`);
       }
       return Buffer.from(result.stdout, "utf8");
     },

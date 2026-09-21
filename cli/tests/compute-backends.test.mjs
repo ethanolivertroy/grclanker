@@ -53,10 +53,14 @@ import { createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
 import {
   assertSafeSessionId,
   createRedactingSink,
+  describeEndpoint,
+  ExecutionBackendError,
   ExecutionBackendTimeoutError,
   REDACTING_SINK_MAX_HELD_CHARS,
+  redactErrorMessage,
   redactSecrets,
   redactUnterminatedPemBlocks,
+  summarizeJsonBody,
 } from "../dist/pi/execution-backend.js";
 import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
 import { quoteForBash } from "../dist/pi/shell.js";
@@ -1119,6 +1123,309 @@ test("every backend output path redacts credentials echoed by the remote under e
       rmSync(keyDir, { recursive: true, force: true });
     }
   });
+});
+
+test("redactErrorMessage scrubs embedded URL, bearer, session, API key, and HTML shapes", () => {
+  const html = "<html><body><h1>502 Bad Gateway</h1><pre>Authorization: Bearer CANARY-BEARER-u1; Cookie: session=CANARY-SESSION-u1; X-Api-Key: CANARY-APIKEY-u1</pre></body></html>";
+  const DOCTYPE_HTML = "<!DOCTYPE html>\n<html lang=\"en\"><body>CANARY-DOC-u1</body></html>";
+  const cases = [
+    [
+      "Re-authorize at https://example.invalid/callback?access_token=CANARY-URLTOKEN-u1&state=x now",
+      "Re-authorize at https://example.invalid/callback?access_token=[REDACTED]&state=[REDACTED] now",
+    ],
+    ["see https://host/p#CANARY-FRAGMENT-u1 and https://host/q?CANARY-BAREQUERY-u1", "see https://host/p#[REDACTED] and https://host/q?[REDACTED]"],
+    ["https://user:CANARY-PASSWORD-u1@host/path?x=1", "https://[REDACTED]@host/path?x=[REDACTED]"],
+    ["Authorization: Bearer CANARY-BEARER-u1", "Authorization: Bearer [REDACTED]"],
+    ["Cookie: session=CANARY-SESSION-u1; other=1</pre>", "Cookie: [REDACTED]</pre>"],
+    ["Set-Cookie: sid=CANARY-SESSION-u1; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+    ["X-Api-Key: CANARY-APIKEY-u1", "X-Api-Key: [REDACTED]"],
+    ["api_key=CANARY-APIKEY-u1 session_id=CANARY-SESSION-u1", "api_key=[REDACTED] session_id=[REDACTED]"],
+    [
+      "{\"session\":\"CANARY-SESSION-u1\",\"token\":\"CANARY-TOKEN-u1\",\"cookie\":\"CANARY-COOKIE-u1\"}",
+      "{\"session\":\"[REDACTED]\",\"token\":\"[REDACTED]\",\"cookie\":\"[REDACTED]\"}",
+    ],
+    [`upstream said: ${html}`, `upstream said: [HTML document withheld (${html.length} chars)]`],
+    [`${DOCTYPE_HTML} trailing`, `[HTML document withheld (${DOCTYPE_HTML.length} chars)] trailing`],
+    [`Could not prepare /workspace/s on the pod. -----BEGIN RSA PRIVATE KEY-----\n${FAKE_PEM_BODY[0]}`, `Could not prepare /workspace/s on the pod. ${UNTERMINATED_PEM}`],
+    // Ordinary text survives: a documentation URL without a query, a short value, prose.
+    ["see https://docs.runpod.io/serverless/endpoints/send-requests; token: 3; session count 4", "see https://docs.runpod.io/serverless/endpoints/send-requests; token: 3; session count 4"],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(redactErrorMessage(input), expected);
+    assert.ok(!/CANARY-[A-Z]+-u1/.test(redactErrorMessage(input)), input);
+  }
+  // Command output keeps HTML (it may be the legitimate result of the command) but the same
+  // header, cookie, and URL shapes are scrubbed inside it.
+  assert.equal(
+    redactSecrets(`${html} https://example.invalid/cb?access_token=CANARY-URLTOKEN-u1`),
+    "<html><body><h1>502 Bad Gateway</h1><pre>Authorization: Bearer [REDACTED]; Cookie: [REDACTED]</pre></body></html> https://example.invalid/cb?access_token=[REDACTED]",
+  );
+  // The constructor is the choke point: a subclass message and a message with our own markers
+  // both come out scrubbed, and scrubbing is idempotent.
+  const thrown = new ExecutionBackendError(`lookup failed: ${html} at https://x/cb?access_token=CANARY-URLTOKEN-u1`);
+  assert.equal(thrown.message, `Compute backend error: lookup failed: [HTML document withheld (${html.length} chars)] at https://x/cb?access_token=[REDACTED]`);
+  assert.equal(redactErrorMessage(thrown.message), thrown.message);
+  const timeout = new ExecutionBackendTimeoutError("runpod-serverless", "job at https://x/status?token=CANARY-URLTOKEN-u1", 5000);
+  assert.equal(timeout.message, "Compute backend error: runpod-serverless timed out after 5s: job at https://x/status?token=[REDACTED]");
+
+  // JSON bodies contribute message-bearing fields only; other keys are named, never serialized.
+  assert.equal(summarizeJsonBody({ error: "Forbidden. Re-authorize at https://x/cb?access_token=t" }), "error: Forbidden. Re-authorize at https://x/cb?access_token=t");
+  assert.equal(summarizeJsonBody({ error: { message: "nested", code: 7 } }), "error: message: nested");
+  assert.equal(summarizeJsonBody({ upstream: html, session: "CANARY-SESSION-u1" }), "JSON body with keys upstream, session");
+  assert.equal(summarizeJsonBody([1, 2, 3]), "JSON array with 3 entries");
+  assert.equal(summarizeJsonBody(undefined), "no detail");
+  assert.equal(summarizeJsonBody({}), "empty JSON body");
+  assert.equal(summarizeJsonBody(`${"x".repeat(500)}`), `${"x".repeat(400)}... (500 chars)`);
+  assert.equal(describeEndpoint("https://api.runpod.ai/v2/ep123/status/job-1?token=CANARY-URLTOKEN-u1#frag"), "api.runpod.ai/v2/ep123/status/job-1");
+  assert.equal(describeEndpoint("not a url"), "the provider endpoint");
+});
+
+// The rule 9 error-path sweep: every provider surface, failing with every body shape the sweep
+// used, observed on every channel the runtime surfaces (thrown message, result.stdout,
+// result.stderr, streamed chunks, console). No canary may reach any of them.
+test("provider error bodies never reach thrown messages, results, streams, or logs on any surface", async () => {
+  const canary = (name) => `CANARY-${name}-sweep`;
+  const CANARY_PATTERN = /CANARY-[A-Z]+-sweep/;
+  const html = `<html><body><h1>502 Bad Gateway</h1><pre>Authorization: Bearer ${canary("BEARER")}; Cookie: session=${canary("SESSION")}; X-Api-Key: ${canary("APIKEY")}</pre></body></html>`;
+  const tokenUrl = `https://example.invalid/callback?access_token=${canary("URLTOKEN")}&state=x`;
+  const forbiddenJson = JSON.stringify({ error: `Forbidden. Re-authorize at ${tokenUrl}` });
+  const urlLine = `worker rejected: re-authorize at ${tokenUrl}\n`;
+
+  const HTTP_SHAPES = {
+    "502-html": () => new Response(html, { status: 502, headers: { "content-type": "text/html; charset=utf-8" } }),
+    "403-json-url": () => new Response(forbiddenJson, { status: 403, headers: { "content-type": "application/json" } }),
+    "200-html": () => new Response(html, { status: 200, headers: { "content-type": "text/html" } }),
+  };
+  const STDERR_SHAPES = { "html-stderr": `${html}\n`, "url-stderr": urlLine };
+
+  const consoleLines = [];
+  const original = { log: console.log, error: console.error, warn: console.warn };
+  for (const method of Object.keys(original)) {
+    console[method] = (...args) => consoleLines.push(args.map(String).join(" "));
+  }
+
+  const rows = [];
+  // Runs one surface and asserts every channel is canary-free; returns the channels for callers
+  // that also want to pin the exact message.
+  const observe = async (backend, surface, shape, action) => {
+    const chunks = [];
+    const channels = { thrown: "", stdout: "", stderr: "", streamed: "", logs: "" };
+    try {
+      const result = await action((chunk) => chunks.push(chunk.toString("utf8")));
+      channels.stdout = result?.stdout ?? "";
+      channels.stderr = result?.stderr ?? "";
+    } catch (error) {
+      channels.thrown = `${error.name}: ${error.message}`;
+    }
+    channels.streamed = chunks.join("");
+    channels.logs = consoleLines.splice(0).join("\n");
+    const label = `${backend} ${surface} ${shape}`;
+    for (const [channel, text] of Object.entries(channels)) {
+      const hit = CANARY_PATTERN.exec(text);
+      assert.equal(hit, null, `${label}: ${channel} carried ${hit?.[0]}: ${text}`);
+    }
+    assert.ok(!channels.thrown.startsWith("SyntaxError"), `${label}: raw parse error escaped: ${channels.thrown}`);
+    rows.push({ backend, surface, shape, outcome: channels.thrown ? "thrown" : "returned" });
+    return channels;
+  };
+
+  try {
+    await withEnv({
+      RUNPOD_API_KEY: "fake-runpod-key-0123456789",
+      RUNPOD_POD_ID: "pod42",
+      RUNPOD_ENDPOINT_ID: "ep123",
+      MODAL_TOKEN_ID: "ak-FAKEID0123456789ABCD",
+      MODAL_TOKEN_SECRET: "as-FAKESECRET0123456789",
+    }, async () => {
+      const serverlessFetch = (failing, shape, jobOverride) => async (url) => {
+        if (failing === "/health" && url.endsWith("/health")) return HTTP_SHAPES[shape]();
+        if (url.endsWith("/health")) return new Response("{}", { status: 200 });
+        if (failing === "/run" && url.endsWith("/run")) return HTTP_SHAPES[shape]();
+        if (url.endsWith("/run")) return new Response(JSON.stringify({ id: "job-1", status: "IN_QUEUE" }), { status: 200 });
+        if (url.includes("/status/")) {
+          if (jobOverride) return new Response(JSON.stringify(jobOverride), { status: 200 });
+          return HTTP_SHAPES[shape]();
+        }
+        if (url.includes("/cancel/")) return failing === "/cancel" ? HTTP_SHAPES["502-html"]() : new Response("{}", { status: 200 });
+        throw new Error(`unexpected url ${url}`);
+      };
+      const serverless = (fetch) => createRunpodServerlessBackend({ fetch, sleep: async () => {}, pollIntervalMs: 0 });
+      const execServerless = (fetch) => (onData) => serverless(fetch).exec({ sessionId: "s", command: ["env"], cwd: "/workspace", onData });
+
+      // RunPod serverless HTTP surfaces, three shapes each.
+      for (const shape of Object.keys(HTTP_SHAPES)) {
+        const health = await observe("runpod-serverless", "GET /health", shape, () => serverless(serverlessFetch("/health", shape)).healthcheck());
+        assert.match(health.thrown, /^ExecutionBackendError: Compute backend error: RunPod endpoint health check/);
+        await observe("runpod-serverless", "POST /run", shape, execServerless(serverlessFetch("/run", shape)));
+        await observe("runpod-serverless", "GET /status (poll)", shape, execServerless(serverlessFetch("/status", shape)));
+      }
+      const health502 = await observe("runpod-serverless", "GET /health", "502-html (message)", () => serverless(serverlessFetch("/health", "502-html")).healthcheck());
+      assert.equal(
+        health502.thrown,
+        `ExecutionBackendError: Compute backend error: RunPod endpoint health check failed with HTTP 502 from api.runpod.ai/v2/ep123/health: non-JSON text/html body (${Buffer.byteLength(html)} bytes) withheld`,
+      );
+      const health403 = await observe("runpod-serverless", "GET /health", "403-json-url (message)", () => serverless(serverlessFetch("/health", "403-json-url")).healthcheck());
+      assert.equal(
+        health403.thrown,
+        "ExecutionBackendError: Compute backend error: RunPod endpoint health check failed with HTTP 403 from api.runpod.ai/v2/ep123/health: error: Forbidden. Re-authorize at https://example.invalid/callback?access_token=[REDACTED]&state=[REDACTED]",
+      );
+      const health200 = await observe("runpod-serverless", "GET /health", "200-html (message)", () => serverless(serverlessFetch("/health", "200-html")).healthcheck());
+      assert.equal(
+        health200.thrown,
+        `ExecutionBackendError: Compute backend error: RunPod endpoint health check returned HTTP 200 from api.runpod.ai/v2/ep123/health with a non-JSON text/html body (${Buffer.byteLength(html)} bytes) withheld; expected JSON.`,
+      );
+
+      // Job-level shapes on the status poll: FAILED with a URL string, FAILED with an object
+      // holding the HTML (as a message field and as an unknown field), COMPLETED with worker
+      // stderr carrying both, and a 403 status followed by a 502 cancel.
+      const failedUrl = await observe("runpod-serverless", "GET /status (poll)", "FAILED error string with URL", execServerless(
+        serverlessFetch("/status", "200-html", { id: "job-1", status: "FAILED", error: urlLine.trim() }),
+      ));
+      assert.equal(
+        failedUrl.thrown,
+        "ExecutionBackendError: Compute backend error: RunPod job job-1 ended with status FAILED. worker rejected: re-authorize at https://example.invalid/callback?access_token=[REDACTED]&state=[REDACTED]",
+      );
+      const failedHtmlMessage = await observe("runpod-serverless", "GET /status (poll)", "FAILED error object with HTML message", execServerless(
+        serverlessFetch("/status", "200-html", { id: "job-1", status: "FAILED", error: { message: html, code: 502 } }),
+      ));
+      assert.equal(
+        failedHtmlMessage.thrown,
+        `ExecutionBackendError: Compute backend error: RunPod job job-1 ended with status FAILED. message: [HTML document withheld (${html.length} chars)]`,
+      );
+      const failedHtmlField = await observe("runpod-serverless", "GET /status (poll)", "FAILED error object with HTML in an unknown field", execServerless(
+        serverlessFetch("/status", "200-html", { id: "job-1", status: "FAILED", error: { upstream: html, session: canary("SESSION") } }),
+      ));
+      assert.equal(failedHtmlField.thrown, "ExecutionBackendError: Compute backend error: RunPod job job-1 ended with status FAILED. JSON body with keys upstream, session");
+      const completed = await observe("runpod-serverless", "GET /status (poll)", "COMPLETED worker stderr with HTML and URL", execServerless(
+        serverlessFetch("/status", "200-html", { id: "job-1", status: "COMPLETED", output: { exitCode: 1, stdout: `${html}\n`, stderr: urlLine } }),
+      ));
+      assert.equal(completed.stdout, "<html><body><h1>502 Bad Gateway</h1><pre>Authorization: Bearer [REDACTED]; Cookie: [REDACTED]</pre></body></html>\n");
+      assert.equal(completed.stderr, "worker rejected: re-authorize at https://example.invalid/callback?access_token=[REDACTED]&state=[REDACTED]\n");
+      assert.equal(completed.streamed, completed.stdout + completed.stderr);
+      const cancelAfterStatus = await observe("runpod-serverless", "GET /status 403 then POST /cancel 502", "cancel-on-error", execServerless(
+        async (url) => (url.includes("/cancel/") ? HTTP_SHAPES["502-html"]() : serverlessFetch("/status", "403-json-url")(url)),
+      ));
+      assert.match(cancelAfterStatus.thrown, /RunPod job status failed with HTTP 403/);
+
+      // RunPod pod: GET /pods/{podId} from all three entry points, then ssh and scp stderr.
+      const podFetch = (shape) => async () => HTTP_SHAPES[shape]();
+      const quietRunner = async () => ({ exitCode: 0, stdout: "", stderr: "" });
+      for (const shape of Object.keys(HTTP_SHAPES)) {
+        for (const [entry, run] of [
+          ["healthcheck", (backend) => () => backend.healthcheck()],
+          ["exec", (backend) => (onData) => backend.exec({ sessionId: "s", command: ["env"], cwd: "/workspace/s", onData })],
+          ["stageWorkspace", (backend) => () => backend.stageWorkspace({ localPath: "/repo", sessionId: "s" })],
+        ]) {
+          const backend = createRunpodPodBackend({ fetch: podFetch(shape), runner: quietRunner });
+          const channels = await observe("runpod-pod", `GET /pods/pod42 via ${entry}`, shape, run(backend));
+          assert.match(channels.thrown, /^ExecutionBackendError: Compute backend error: RunPod pod pod42 lookup/);
+        }
+      }
+      const podJsonFetch = async () => new Response(RUNPOD_POD_JSON, { status: 200 });
+      const stderrRunner = (text, { failing }) => async (executable, args, options = {}) => {
+        const isMkdir = executable === "ssh" && String(args.at(-1)).startsWith("mkdir");
+        const isScp = executable === "scp";
+        const isExec = executable === "ssh" && !isMkdir && !String(args.at(-1)).startsWith("rm -rf");
+        const fails = (failing === "mkdir" && isMkdir) || (failing === "scp" && isScp) || (failing === "exec" && isExec);
+        if (!fails) return { exitCode: 0, stdout: "", stderr: "" };
+        options.onData?.(Buffer.from(text, "utf8"));
+        return { exitCode: 1, stdout: "", stderr: text };
+      };
+      for (const [shape, text] of Object.entries(STDERR_SHAPES)) {
+        const mkdir = await observe("runpod-pod", "ssh mkdir stderr", shape, () =>
+          createRunpodPodBackend({ fetch: podJsonFetch, runner: stderrRunner(text, { failing: "mkdir" }) }).stageWorkspace({ localPath: "/repo", sessionId: "s" }));
+        assert.match(mkdir.thrown, /Could not prepare \/workspace\/s on the pod\./);
+        const scp = await observe("runpod-pod", "scp stderr", shape, () =>
+          createRunpodPodBackend({ fetch: podJsonFetch, runner: stderrRunner(text, { failing: "scp" }) }).stageWorkspace({ localPath: "/repo", sessionId: "s" }));
+        assert.match(scp.thrown, /Could not copy the workspace to the pod\./);
+        const exec = await observe("runpod-pod", "ssh exec stderr", shape, (onData) =>
+          createRunpodPodBackend({ fetch: podJsonFetch, runner: stderrRunner(text, { failing: "exec" }) }).exec({ sessionId: "s", command: ["env"], cwd: "/workspace/s", onData }));
+        assert.ok(exec.stderr.includes("[REDACTED]"), exec.stderr);
+        assert.equal(exec.streamed, exec.stderr);
+
+        // The file tools' capture() adapter over a pod: a failing remote command's stderr becomes
+        // the thrown error the read tool reports.
+        const captureChannels = await observe("runpod-pod", "capture() over ssh", shape, (onData) =>
+          withComputeBackendExecution("/repo", { computeBackend: "runpod-pod" }, async (execution) => {
+            await execution.bashOperations.exec("env", "/repo", { onData });
+            return execution.editOperations.readFile("/repo/.env");
+          }, { runner: stderrRunner(text, { failing: "exec" }), fetch: podJsonFetch }));
+        assert.match(captureChannels.thrown, /^ExecutionBackendError: Compute backend error: /);
+      }
+
+      // Spawned CLI backends: the provider CLI's stderr is command output and goes through the
+      // guard; the same shapes must come out clean on stderr and on the stream.
+      const cliRunner = (text) => async (_executable, args, options = {}) => {
+        if (["info", "--version", "list"].includes(args[0])) return { exitCode: 0, stdout: "ok", stderr: "" };
+        if (args[0] === "exec" && String(args.at(-1)).includes("test -d")) return { exitCode: 0, stdout: "ok", stderr: "" };
+        if (["clone", "create", "set", "start", "stop", "delete", "snapshot", "snapshot-switch"].includes(args[0])) {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        options.onData?.(Buffer.from(text, "utf8"));
+        return { exitCode: 1, stdout: "", stderr: text };
+      };
+      for (const [shape, text] of Object.entries(STDERR_SHAPES)) {
+        for (const kind of ["docker", "parallels-vm", "modal"]) {
+          const backend = createExecutionBackend("/repo", { computeBackend: kind, parallelsTemplateName: "tpl" }, { runner: cliRunner(text) }, kind);
+          const channels = await observe(kind, "CLI stderr", shape, async (onData) => {
+            const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "s" });
+            try {
+              return await backend.exec({ sessionId: "s", command: ["env"], cwd: staged.remotePath, onData });
+            } finally {
+              await backend.teardown("s");
+            }
+          });
+          assert.ok(channels.stderr.includes("[REDACTED]"), `${kind} ${shape}: ${channels.stderr}`);
+          assert.equal(channels.streamed, channels.stderr, `${kind} ${shape}`);
+        }
+        const sandbox = await observe("sandbox-runtime", "CLI stderr", shape, (onData) =>
+          createSandboxRuntimeBackend({ runner: cliRunner(text), wrapCommand: async (command) => command })
+            .exec({ sessionId: "s", command: ["env"], cwd: "/repo", onData }));
+        assert.equal(sandbox.streamed, sandbox.stderr);
+
+        // Parallels quotes prlctl output into thrown errors on create and snapshot failures.
+        const failingPrlctl = (failingVerb) => async (_executable, args, options = {}) => {
+          if (args[0] === failingVerb) return { exitCode: 1, stdout: text, stderr: text };
+          return cliRunner(text)(_executable, args, options);
+        };
+        const create = await observe("parallels-vm", "prlctl create stdout/stderr", shape, () =>
+          createExecutionBackend("/repo", { computeBackend: "parallels-vm", parallelsTemplateName: "tpl" }, { runner: failingPrlctl("create") }, "parallels-vm")
+            .stageWorkspace({ localPath: "/repo", sessionId: "s" }));
+        assert.match(create.thrown, /Could not create disposable Parallels sandbox/);
+        const snapshotBackend = createExecutionBackend("/repo", { computeBackend: "parallels-vm", parallelsTemplateName: "tpl" }, { runner: failingPrlctl("snapshot") }, "parallels-vm");
+        const snapshot = await observe("parallels-vm", "prlctl snapshot stdout/stderr", shape, async () => {
+          await snapshotBackend.stageWorkspace({ localPath: "/repo", sessionId: "s" });
+          try {
+            return await snapshotBackend.snapshot("s");
+          } finally {
+            await snapshotBackend.teardown("s");
+          }
+        });
+        assert.match(snapshot.thrown, /Could not snapshot Parallels sandbox/);
+      }
+
+      // Host: a real shell writing the shapes to stderr, streamed through the guard.
+      const host = resolveComputeBackendExecution(tmpdir(), { computeBackend: "host" });
+      for (const [shape, text] of Object.entries(STDERR_SHAPES)) {
+        const channels = await observe("host", "bash -lc stderr", shape, (onData) =>
+          host.bashOperations.exec(`printf '%s' ${quoteForBash(text)} >&2; exit 1`, tmpdir(), { onData }));
+        assert.ok(channels.streamed.includes("[REDACTED]"), channels.streamed);
+      }
+    });
+  } finally {
+    Object.assign(console, original);
+  }
+
+  // 17 serverless rows (3 shapes x 3 surfaces, 3 pinned messages, 4 job shapes, cancel-on-error),
+  // 17 pod rows (3 shapes x 3 entry points, 2 stderr shapes x mkdir, scp, exec, capture), 12 CLI
+  // rows (2 shapes x docker, parallels-vm, modal, sandbox-runtime, prlctl create, prlctl
+  // snapshot), 2 host rows.
+  const surfaces = new Set(rows.map((row) => `${row.backend} ${row.surface}`));
+  assert.equal(rows.length, 48, `expected the full sweep table, ran ${rows.length} rows`);
+  for (const backend of ["runpod-serverless", "runpod-pod", "modal", "docker", "parallels-vm", "sandbox-runtime", "host"]) {
+    assert.ok(rows.some((row) => row.backend === backend), `no rows for ${backend}`);
+  }
+  assert.ok(surfaces.has("runpod-pod capture() over ssh"));
 });
 
 test("search caps through the contract adapters are reported instead of silently truncated", async () => {
