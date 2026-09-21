@@ -12,7 +12,7 @@ import type {
   ToolDefinition as PiToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition as FlueToolDefinition } from "@flue/runtime";
-import { collectRegisteredTools, isComputeToolName } from "../pi/tool-catalog.js";
+import { collectRegisteredToolDefinitions, resolveToolGroup } from "../pi/tool-catalog.js";
 import { jsonSchemaToToolInput } from "./schema.js";
 
 /** The subset of a Pi tool definition the bridge relies on. */
@@ -95,7 +95,7 @@ export function toFlueTool(tool: PiBridgeableTool): FlueToolDefinition {
 
 /** Every grclanker domain tool (compute-backend wrappers are Pi-specific and excluded). */
 export function collectGrclankerDomainTools(): PiToolDefinition[] {
-  return collectRegisteredTools().filter((tool) => !isComputeToolName(tool.name));
+  return collectRegisteredToolDefinitions().filter((tool) => resolveToolGroup(tool.name).kind !== "compute");
 }
 
 export function createGrclankerFlueTools(tools: PiBridgeableTool[] = collectGrclankerDomainTools()): FlueToolDefinition[] {

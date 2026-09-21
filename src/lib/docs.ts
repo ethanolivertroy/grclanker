@@ -9,6 +9,7 @@ export const docsSections = [
       { label: 'Quick Start', slug: 'getting-started/quick-start' },
       { label: 'Setup', slug: 'getting-started/setup' },
       { label: 'Configuration', slug: 'getting-started/configuration' },
+      { label: 'Cursor Agent SDK', slug: 'getting-started/agent-sdk' },
       { label: 'Flue Runtime', slug: 'getting-started/flue-runtime' },
     ],
   },
