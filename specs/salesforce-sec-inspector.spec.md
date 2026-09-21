@@ -3,11 +3,11 @@ slug: "salesforce-sec-inspector"
 name: "Salesforce Security Inspector"
 vendor: "Salesforce"
 category: "saas-collaboration"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/salesforce-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # salesforce-sec-inspector
@@ -19,6 +19,17 @@ Multi-framework security compliance audit tool for Salesforce.
 salesforce-sec-inspector is a command-line tool that audits Salesforce org configurations against multiple security compliance frameworks. It queries the REST API, Tooling API, Metadata API, and Shield Platform to evaluate security settings, user permissions, authentication policies, and data protection controls, then maps findings to FedRAMP, CMMC 2.0, SOC 2, CIS Benchmarks, PCI-DSS, DISA STIG, IRAP, and ISMAP controls.
 
 Salesforce orgs accumulate permission sprawl, stale integrations, and misconfigured session policies over time. The built-in Security Health Check provides a 0-100 score but does not map to external compliance frameworks. salesforce-sec-inspector bridges that gap by correlating Health Check findings with granular permission set analysis, connected app inventory, Shield event monitoring, and setup audit trail data to produce actionable, framework-mapped compliance reports.
+
+### grclanker implementation
+
+The inspector ships as native TypeScript tools in `cli/extensions/grc-tools/salesforce.ts` (tests in `cli/tests/salesforce.test.mjs`, live smoke in `cli/scripts/salesforce-live-smoke.mjs`, guide in `src/content/docs/docs/integrations/salesforce.md`):
+
+- `salesforce_check_access`: probes every read surface and reports likely missing permissions
+- `salesforce_assess_platform_security`: controls 1, 2, 3, 5, 18, 19, 20
+- `salesforce_assess_identity_access`: controls 4, 6, 7, 9, 10, 13
+- `salesforce_assess_data_protection`: controls 8, 12, 16, 17
+- `salesforce_assess_monitoring_integrations`: controls 11, 14, 15
+- `salesforce_export_audit_bundle`: `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log`, zip archive
 
 ## APIs & SDKs
 
@@ -390,4 +401,33 @@ salesforce-sec-inspector controls --framework pci-dss
 
 ## Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as native TypeScript tools (2026-09-21). The Go rewrite described in the Architecture section was not pursued; the implementation lives in `cli/extensions/grc-tools/salesforce.ts` and follows the shared `zoom.ts` and `webex.ts` patterns.
+
+### Shipped
+
+- `salesforce_check_access`, four `salesforce_assess_*` tools, and `salesforce_export_audit_bundle`, all read-only
+- All 20 security controls render a finding with the framework mappings from the table above; 19 are evaluated from API evidence and control 6 (Login Hour Restrictions) is always `manual` because profile `loginHours` metadata is not retrieved
+- Authentication: JWT bearer (RS256 assertion signed with `node:crypto`), username-password with security token, refresh token exchange, and direct access token reuse; login hosts for production, sandbox (`test.salesforce.com`), and My Domain; precedence explicit args > env vars > `SF_CREDENTIALS_FILE`
+- Verdict safety: unreadable or forbidden data renders `manual` with the Setup evidence to collect, empty inventories never pass except zero guest users (control 13), truncated or partial inventories downgrade `pass` to `warn`, undated rows are reported in a separate bucket, SOQL pagination follows `nextRecordsUrl` until `done` or records truncation
+- Audit bundle: `core_data/`, `analysis/`, `compliance/` with eight framework reports, `QUICK_REFERENCE.md`, `_errors.log` on partial collection, and a zip paired with the allocated output directory
+- Regression tests in `cli/tests/salesforce.test.mjs`, live smoke in `cli/scripts/salesforce-live-smoke.mjs` (`npm --prefix cli run test:salesforce:live`), and the integration guide in `src/content/docs/docs/integrations/salesforce.md`
+
+### Deviations from this spec (official docs followed)
+
+- Session settings are the `sessionSettings` element of the `SecuritySettings` metadata type, not a separate `SessionSettings` type; trusted IP ranges come from `SecuritySettings.networkAccess`, not a `NetworkAccess` type
+- Settings are read with the synchronous Metadata API `readMetadata()` SOAP call instead of the asynchronous `retrieve()` zip flow; `readMetadata` requires `Modify Metadata Through Metadata API Functions` (or `Modify All Data`), not `Customize Application`
+- Health Check data comes from Tooling API SOQL (`SELECT Score FROM SecurityHealthCheck`, `SecurityHealthCheckRisks`) rather than `tooling/sobjects/...` GETs
+- `PermissionSet`, `PermissionSetAssignment`, and `FieldPermissions` are queried through the standard REST `query` endpoint because they are standard sObjects
+- MFA enrollment uses the documented `TwoFactorMethodsInfo` object instead of `TwoFactorInfo`; My Domain policy uses the `MyDomainSettings` metadata type (`canOnlyLoginWithMyDomainUrl`, `doesApiLoginRequireOrgDomain`) instead of a `CustomDomain` object
+- Platform Encryption status uses the `TenantSecret` sObject; `EncryptedFieldsInfo` is not queried
+- The interactive authorization code flow is not implemented; a refresh token obtained from that flow (or a `grant_type: authorization_code` credentials file that carries `refresh_token`) is exchanged instead
+- API version defaults to 64.0 and can be overridden with `SF_API_VERSION`
+
+### Not yet implemented
+
+- `SessionPermSetActivation`, `ObjectPermissions`, `ProfilePasswordPolicy`, `AuthSession`, `SetupEntityAccess`, and Profile metadata (login hours, per-profile login IP ranges)
+- `SharingRules`, `RemoteSiteSetting`, `CspTrustedSite`, `ExternalDataSource`, `NamedCredential`, `HistoryRetentionPolicy`, `FieldHistoryArchive`, `EventBusSubscriber`, `TransactionSecurityPolicy`
+- Connected app OAuth scopes, IP relaxation, and per-app session policies beyond `OptionsAllowAdminApprovedUsersOnly` and refresh token validity (not exposed by SOQL)
+- Custom object organization-wide defaults; only the standard object `Default*Access` fields on `Organization` are evaluated
+- Geolocation baselines for login forensics; the current check evaluates failure ratios, repeated failing sources, and legacy TLS
+- A standalone CLI binary with the `--frameworks` and `--output` flags described in the CLI Interface section; grclanker exposes the same behavior through tool arguments
