@@ -272,6 +272,60 @@ test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts
   });
 });
 
+function fullPageFetch(collectionKey, pageLimit, options = {}) {
+  const { shortPageAt, total } = options;
+  return async (url) => {
+    const parsed = new URL(url);
+    const offset = Number(parsed.searchParams.get("offset") ?? "0");
+    const page = offset / pageLimit;
+    const count = shortPageAt !== undefined && page >= shortPageAt ? 1 : pageLimit;
+    const items = Array.from({ length: count }, (_, index) => ({ uuid: `${collectionKey}-${offset + index}`, name: `${collectionKey} ${offset + index}`, scanner_count: 1 }));
+    return jsonResponse(total === undefined ? { [collectionKey]: items } : { [collectionKey]: items, pagination: { total } });
+  };
+}
+
+test("listPaginated marks a walk that exhausts maxPages on full pages without pagination.total as truncated", async () => {
+  const capped = createTenableClients(vmConfig(), { fetchImpl: fullPageFetch("networks", 2), sleepImpl: async () => {} });
+  const cappedPage = await capped.vm.listPaginated("/networks", "networks", {}, { pageLimit: 2, maxPages: 3 });
+  assert.equal(cappedPage.items.length, 6, "every permitted page was fetched");
+  assert.equal(cappedPage.total, undefined);
+  assert.equal(cappedPage.truncated, true, "leaving the loop at the page cap is a partial inventory");
+
+  const short = createTenableClients(vmConfig(), { fetchImpl: fullPageFetch("networks", 2, { shortPageAt: 2 }), sleepImpl: async () => {} });
+  const shortPage = await short.vm.listPaginated("/networks", "networks", {}, { pageLimit: 2, maxPages: 3 });
+  assert.equal(shortPage.items.length, 5);
+  assert.equal(shortPage.truncated, false, "a short page ends the collection");
+
+  const totalled = createTenableClients(vmConfig(), { fetchImpl: fullPageFetch("networks", 2, { total: 6 }), sleepImpl: async () => {} });
+  const totalledPage = await totalled.vm.listPaginated("/networks", "networks", {}, { pageLimit: 2, maxPages: 3 });
+  assert.equal(totalledPage.items.length, 6);
+  assert.equal(totalledPage.total, 6);
+  assert.equal(totalledPage.truncated, false, "reaching the reported total on the last permitted page is complete");
+});
+
+test("a page-capped inventory without pagination.total demotes the finding instead of passing", async () => {
+  const routes = healthyRoutes();
+  const fallback = routerFetch(routes);
+  const networksFetch = fullPageFetch("networks", 50);
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => (new URL(url).pathname === "/networks" ? networksFetch(url) : fallback(url, init)),
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const data = await collectTenableSensorCoverageData(clients, { now: NOW });
+  assert.equal(data.networks.status, "ok");
+  assert.equal(data.networks.truncated, true);
+  assert.equal(data.networks.seen, 200 * 50, "the walk stopped at the default page cap");
+  assert.equal(data.networks.total, undefined, "no total was reported, so none is invented");
+
+  const result = assessTenableSensorCoverage(data, { now: NOW });
+  const networks = result.findings.find((item) => item.id === "TENABLE-09");
+  assert.equal(networks.status, "warn", networks.summary);
+  assert.match(networks.summary, /Only 10000 of unknown records were retrieved, so the verdict is capped at warn/);
+  assert.ok(result.errors.some((error) => error.includes("partial view (10000 of unknown records retrieved)")), JSON.stringify(result.errors));
+});
+
 test("TenableApiClient retries 429 and 5xx responses honoring retry-after", async () => {
   let calls = 0;
   const delays = [];

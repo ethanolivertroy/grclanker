@@ -370,11 +370,83 @@ export class ZendeskApiError extends Error {
   }
 }
 
+export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
+
+// A property name is split into lower-case segments on underscores, hyphens,
+// dots, spaces, and camelCase boundaries, so api_key, apiKey, APIKey, and the
+// header name X-Api-Key all end in ["api", "key"]. The value is a credential when
+// the last segment is one of these words (token, full_token, refreshToken,
+// clientSecret, password, passwd, passphrase, apikey, Authorization,
+// X-Auth-Token) or a qualified key such as api_key, private_key, secret_key, or
+// signing_key. A bare key and public_key are kept, and ids, scopes, client ids,
+// dates, and usernames never match because their last segment is id, scopes,
+// at, or name. Only string values are replaced; objects and arrays are recursed,
+// so the authentication.agent.password policy object keeps its numeric fields.
+const CREDENTIAL_LAST_SEGMENTS = new Set(["token", "secret", "password", "passwd", "pwd", "passphrase", "apikey", "authorization"]);
+const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
+// Containers whose every string value is a credential apart from the name that
+// labels it: webhook authentication.data (basic_auth password, bearer_token
+// token, api_key value, with username and name kept) and header maps such as
+// webhook custom_headers (header names are kept as keys or name fields, header
+// values are replaced).
+const HEADER_MAP_SEGMENTS = new Set(["headers", "custom_headers"]);
+const CREDENTIAL_CONTAINER_SAFE_KEYS = new Set(["username", "name"]);
+
+function propertyNameSegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment.length > 0);
+}
+
+export function isCredentialPropertyName(name: string): boolean {
+  const segments = propertyNameSegments(name);
+  const last = segments[segments.length - 1];
+  if (last === undefined) return false;
+  if (CREDENTIAL_LAST_SEGMENTS.has(last)) return true;
+  if (last === "key" && segments.length > 1) return !NON_CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2]);
+  return false;
+}
+
+function isHeaderMapName(name: string): boolean {
+  return HEADER_MAP_SEGMENTS.has(propertyNameSegments(name).join("_"));
+}
+
+function redactCredentialValue(value: unknown, insideContainer: boolean, parentKey: string | undefined): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactCredentialValue(item, insideContainer, parentKey));
+  const record = asObject(value);
+  if (!record) return value;
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(record)) {
+    const credentialName = isCredentialPropertyName(key) || (insideContainer && !CREDENTIAL_CONTAINER_SAFE_KEYS.has(key.toLowerCase()));
+    if (credentialName && typeof entry === "string" && entry.length > 0) {
+      output[key] = CREDENTIAL_REDACTION_MARKER;
+      continue;
+    }
+    const childContainer = insideContainer || isHeaderMapName(key) || (parentKey === "authentication" && key === "data");
+    output[key] = redactCredentialValue(entry, childContainer, key);
+  }
+  return output;
+}
+
+/**
+ * Returns a deep copy of an API payload with every credential-bearing string
+ * property replaced by CREDENTIAL_REDACTION_MARKER. Identifiers, scopes, client
+ * ids, expiry and creation dates, usernames, header names, and every other
+ * non-credential field are kept so the assessments read the redacted copy
+ * unchanged.
+ */
+export function redactCredentialProperties(value: unknown): unknown {
+  return redactCredentialValue(value, false, undefined);
+}
+
 function redactSecrets(text: string, secrets: Array<string | undefined>): string {
   let output = text;
   for (const secret of secrets) {
     if (secret && secret.length >= 4) {
-      output = output.split(secret).join("[REDACTED]");
+      output = output.split(secret).join(CREDENTIAL_REDACTION_MARKER);
     }
   }
   return output;
@@ -729,9 +801,12 @@ export type ZendeskReadClient = Pick<
   | "listSuspendedTickets"
 >;
 
+// Every API read the assessments keep passes through here, so the in-memory
+// snapshot, the core_data/ files, the analysis/ objects, and the tool results
+// all see the redacted copy and never the raw credential values.
 async function snapshot<T>(load: () => Promise<T>): Promise<ZendeskSnapshot<T>> {
   try {
-    return { status: "ok", data: await load() };
+    return { status: "ok", data: redactCredentialProperties(await load()) as T };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof ZendeskApiError) {
@@ -2234,7 +2309,7 @@ function buildQuickReference(): string {
   return [
     "# Zendesk Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Zendesk API snapshots used during this assessment (credentials are never written).",
+    `- \`core_data/\` contains raw Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}).`,
     "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
     "- `_errors.log` appears only when some reads failed but the bundle still completed.",

@@ -96,7 +96,7 @@ Status semantics: `pass` requires complete, readable evidence with every enablin
 | 19 | Export and reporting automation | vulnerability_management | TENABLE-19 | Export jobs from `GET /vulns/export/status` and `GET /assets/export/status` within the previous three days (the documented window for completed jobs), excluding this tool's own runs by UUID and by export shape (`num_assets_per_chunk` 5000 with the open, reopened, fixed state filter; 10000 with no filters): jobs on two distinct days `pass`, jobs on one day `warn`, none `manual`. Report schedules are not exposed by the API and remain a manual check. |
 | 20 | Target group management | scan_program | TENABLE-20 | Deprecated target groups: stale or overlapping members `warn`; an empty list passes because tags replaced target groups. |
 
-Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP mappings from the spec table for that control. Verdicts are additionally capped at `warn` whenever the API key is not confirmed as Administrator, a paginated list returned fewer records than `pagination.total`, or an export downloaded fewer chunks than were available.
+Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP mappings from the spec table for that control. Verdicts are additionally capped at `warn` whenever the API key is not confirmed as Administrator, a paginated list returned fewer records than `pagination.total` or was still returning full pages when the page cap was reached (an endpoint that omits `pagination.total` is treated as partial rather than complete in that case), or an export downloaded fewer chunks than were available.
 
 ## Live smoke
 

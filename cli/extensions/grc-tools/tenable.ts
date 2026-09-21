@@ -702,17 +702,22 @@ export class TenableApiClient extends TenableHttpClient {
     const items: JsonRecord[] = [];
     let offset = 0;
     let total: number | undefined;
+    // Set only when the endpoint signalled the end of the collection (an empty or
+    // short page, or the reported total reached). Leaving the loop at maxPages
+    // without it means the inventory is partial even when no total was reported.
+    let complete = false;
     for (let page = 0; page < maxPages; page += 1) {
       const payload = await this.get(path, { ...query, limit: pageLimit, offset });
       const pageItems = asRecords(payload[collectionKey]);
       items.push(...pageItems);
       total = asNumber(asObject(payload.pagination)?.total) ?? total;
       offset += pageItems.length;
-      if (pageItems.length === 0) break;
-      if (total !== undefined && items.length >= total) break;
-      if (total === undefined && pageItems.length < pageLimit) break;
+      if (pageItems.length === 0 || (total !== undefined && items.length >= total) || (total === undefined && pageItems.length < pageLimit)) {
+        complete = true;
+        break;
+      }
     }
-    return { items, total, truncated: total !== undefined && items.length < total };
+    return { items, total, truncated: !complete || (total !== undefined && items.length < total) };
   }
 
   async getServerProperties(): Promise<JsonRecord> {
@@ -976,7 +981,10 @@ async function collectList(load: () => Promise<JsonRecord[]>): Promise<TenableDa
 async function collectPaginated(load: () => Promise<{ items: JsonRecord[]; total?: number; truncated: boolean }>): Promise<TenableDataset<JsonRecord[]>> {
   try {
     const page = await load();
-    return okDataset(page.items, page.items.length, page.total ?? page.items.length, page.truncated);
+    // A walk that stopped at the page cap without a reported total has an unknown
+    // size; only a complete walk may use its own length as the total.
+    const total = page.total ?? (page.truncated ? undefined : page.items.length);
+    return okDataset(page.items, page.items.length, total, page.truncated);
   } catch (error) {
     return failedDataset<JsonRecord[]>([], error);
   }
