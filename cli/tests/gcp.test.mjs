@@ -438,11 +438,225 @@ test("findings fail on documented violations (firewall, KMS, SSL, DNSSEC, OS Log
   assert.equal(all["GCP-ORG-03"], "fail");
 });
 
+const COMPUTE_BACKED_FINDINGS = ["GCP-ORG-06", "GCP-ORG-08", "GCP-DATA-04", "GCP-NET-02", "GCP-NET-03", "GCP-NET-04", "GCP-NET-05", "GCP-NET-06"];
+
+function withUnreachableScopes(data, decorate) {
+  const copy = { ...data };
+  for (const key of ["instances", "disks", "subnetworks", "routers", "sslPolicies", "targetHttpsProxies", "backendServices"]) {
+    copy[key] = decorate(structuredClone(data[key]));
+  }
+  return copy;
+}
+
+test("self-check (c2): aggregatedList unreachables[] downgrade every compute-backed finding and name the scope", async () => {
+  const partial = withUnreachableScopes(COMPLIANT, (list) => ({ ...list, unreachables: ["regions/europe-west1"] }));
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, partial)));
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  for (const id of COMPUTE_BACKED_FINDINGS) {
+    assert.equal(all[id], "warn", `${id} must not pass when a scope was unreachable`);
+  }
+  const flowLogs = assessments[4].findings.find((item) => item.id === "GCP-NET-02");
+  assert.match(flowLogs.summary, /Partial view: 1 unreachable scopes not enumerated \(prod-audit: regions\/europe-west1\)/);
+  assert.deepEqual(flowLogs.evidence.unreachable_scopes, ["prod-audit: regions/europe-west1"]);
+  assert.equal(flowLogs.evidence.truncated, true);
+  const osLogin = assessments[2].findings.find((item) => item.id === "GCP-ORG-06");
+  assert.match(osLogin.summary, /unreachable scopes not enumerated/);
+  assert.equal(Object.values(all).filter((status) => status === "pass").length, 31 - COMPUTE_BACKED_FINDINGS.length);
+});
+
+test("self-check (c3): a scope answering with warning.code UNREACHABLE is treated as not enumerated", async () => {
+  const partial = withUnreachableScopes(COMPLIANT, (list) => ({
+    ...list,
+    items: { ...list.items, "zones/europe-west1-b": { warning: { code: "UNREACHABLE", message: "Scope unreachable", data: [{ key: "scope", value: "zones/europe-west1-b" }] } } },
+  }));
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, partial)));
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  for (const id of COMPUTE_BACKED_FINDINGS) {
+    assert.equal(all[id], "warn", `${id} must not pass when a scope warns UNREACHABLE`);
+  }
+  const shielded = assessments[2].findings.find((item) => item.id === "GCP-ORG-08");
+  assert.deepEqual(shielded.evidence.unreachable_scopes, ["prod-audit: zones/europe-west1-b"]);
+
+  const client2 = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, withUnreachableScopes(COMPLIANT, (list) => ({
+    ...list,
+    items: { ...list.items, "zones/europe-west1-c": { warning: { code: "NO_RESULTS_ON_PAGE", message: "No results" } } },
+  })))));
+  const emptyScope = await client2.listInstances("prod-audit");
+  assert.equal(emptyScope.truncated, false, "an empty scope with NO_RESULTS_ON_PAGE is complete, not unreachable");
+  assert.equal(emptyScope.unreachable, undefined);
+});
+
+test("GCP-NET-05 keys SSL policies by scope so a weak regional policy sharing a global name fails", async () => {
+  const regionalPolicy = {
+    name: "strict",
+    minTlsVersion: "TLS_1_0",
+    profile: "COMPATIBLE",
+    region: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1",
+    selfLink: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1/sslPolicies/strict",
+  };
+  const regionalProxy = {
+    name: "eu-proxy",
+    region: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1",
+    sslPolicy: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/europe-west1/sslPolicies/strict",
+  };
+  for (const globalFirst of [true, false]) {
+    const globalScope = COMPLIANT.sslPolicies.items.global;
+    const regionalScope = { sslPolicies: [regionalPolicy] };
+    const colliding = {
+      ...COMPLIANT,
+      sslPolicies: { items: globalFirst ? { global: globalScope, "regions/europe-west1": regionalScope } : { "regions/europe-west1": regionalScope, global: globalScope } },
+      targetHttpsProxies: { items: { ...COMPLIANT.targetHttpsProxies.items, "regions/europe-west1": { targetHttpsProxies: [regionalProxy] } } },
+    };
+    const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, colliding)));
+    const result = await assessGcpNetworkSecurity(client);
+    const finding = result.findings.find((item) => item.id === "GCP-NET-05");
+    assert.equal(finding.status, "fail", `regional TLS_1_0 policy must fail regardless of scope order (globalFirst=${globalFirst})`);
+    assert.deepEqual(finding.evidence.weak_proxies.map((proxy) => proxy.proxy), ["eu-proxy"]);
+    assert.equal(finding.evidence.weak_proxies[0].sslPolicy, "projects/prod-audit/regions/europe-west1/sslPolicies/strict");
+    assert.deepEqual(finding.evidence.unresolved_proxies, []);
+  }
+});
+
+test("GCP-NET-04 counts DIRECT_IPV6 access configs as external addresses", async () => {
+  const ipv6Only = {
+    ...COMPLIANT,
+    instances: structuredClone(COMPLIANT.instances),
+  };
+  ipv6Only.instances.items["zones/us-central1-a"].instances[0].networkInterfaces[0].ipv6AccessConfigs = [
+    { type: "DIRECT_IPV6", name: "external-ipv6", externalIpv6: "2600:1900:4000::", externalIpv6PrefixLength: 96, networkTier: "PREMIUM" },
+  ];
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, ipv6Only)));
+  const result = await assessGcpNetworkSecurity(client);
+  const finding = result.findings.find((item) => item.id === "GCP-NET-04");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.instances_with_external_ip, [{ projectId: "prod-audit", instance: "vm-1" }]);
+  assert.equal(result.summary.instances_with_external_ip, 1);
+});
+
+test("GCP-NET-02 reads enableFlowLogs as well as logConfig.enable", async () => {
+  const legacyField = {
+    ...COMPLIANT,
+    subnetworks: { items: { "regions/us-central1": { subnetworks: [{ ...COMPLIANT.subnetworks.items["regions/us-central1"].subnetworks[0], logConfig: undefined, enableFlowLogs: true }] } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, legacyField)));
+  const result = await assessGcpNetworkSecurity(client);
+  assert.equal(result.findings.find((item) => item.id === "GCP-NET-02").status, "pass");
+
+  const neither = {
+    ...COMPLIANT,
+    subnetworks: { items: { "regions/us-central1": { subnetworks: [{ ...COMPLIANT.subnetworks.items["regions/us-central1"].subnetworks[0], logConfig: { enable: false }, enableFlowLogs: false }] } } },
+  };
+  const client2 = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, neither)));
+  const result2 = await assessGcpNetworkSecurity(client2);
+  assert.equal(result2.findings.find((item) => item.id === "GCP-NET-02").status, "fail");
+});
+
+test("GCP-NET-04 judges NAT coverage per subnetwork from sourceSubnetworkIpRangesToNat", async () => {
+  const base = COMPLIANT.subnetworks.items["regions/us-central1"].subnetworks[0];
+  const sibling = { ...base, name: "backend", selfLink: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/backend" };
+  const listOfSubnetworks = {
+    ...COMPLIANT,
+    subnetworks: { items: { "regions/us-central1": { subnetworks: [{ ...base, selfLink: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/default" }, sibling] } } },
+    routers: {
+      items: {
+        "regions/us-central1": {
+          routers: [{
+            ...COMPLIANT.routers.items["regions/us-central1"].routers[0],
+            nats: [{
+              name: "nat",
+              sourceSubnetworkIpRangesToNat: "LIST_OF_SUBNETWORKS",
+              subnetworks: [{ name: "https://www.googleapis.com/compute/v1/projects/prod-audit/regions/us-central1/subnetworks/default", sourceIpRangesToNat: ["ALL_IP_RANGES"] }],
+            }],
+          }],
+        },
+      },
+    },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, listOfSubnetworks)));
+  const result = await assessGcpNetworkSecurity(client);
+  const finding = result.findings.find((item) => item.id === "GCP-NET-04");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.subnets_without_nat.map((subnet) => subnet.subnetwork), ["backend"]);
+
+  const noOption = structuredClone(listOfSubnetworks);
+  delete noOption.routers.items["regions/us-central1"].routers[0].nats[0].sourceSubnetworkIpRangesToNat;
+  const client2 = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, noOption)));
+  const result2 = await assessGcpNetworkSecurity(client2);
+  assert.deepEqual(
+    result2.findings.find((item) => item.id === "GCP-NET-04").evidence.subnets_without_nat.map((subnet) => subnet.subnetwork),
+    ["default", "backend"],
+    "a NAT without the documented option cannot support coverage (rule 6)",
+  );
+});
+
+test("GCP-ORG-07 evaluates cluster, namespace, service account, and Istio admission rules", async () => {
+  const strictDefault = COMPLIANT.binaryAuthorization.defaultAdmissionRule;
+  const cases = [
+    ["clusterAdmissionRules", "us-central1-a.prod-cluster"],
+    ["kubernetesNamespaceAdmissionRules", "payments"],
+    ["kubernetesServiceAccountAdmissionRules", "payments:deployer"],
+    ["istioServiceIdentityAdmissionRules", "spiffe://example.com/ns/payments/sa/default"],
+  ];
+  for (const [mapName, key] of cases) {
+    const permissive = {
+      ...COMPLIANT,
+      binaryAuthorization: { name: "projects/prod-audit/policy", defaultAdmissionRule: strictDefault, [mapName]: { [key]: { evaluationMode: "ALWAYS_ALLOW", enforcementMode: "ENFORCED_BLOCK_AND_AUDIT_LOG" } } },
+    };
+    const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, permissive)));
+    const result = await assessGcpOrgGuardrails(client);
+    const finding = result.findings.find((item) => item.id === "GCP-ORG-07");
+    assert.equal(finding.status, "fail", `${mapName} ALWAYS_ALLOW must fail under a strict default rule`);
+    assert.deepEqual(finding.evidence.permissive_rules, [{ projectId: "prod-audit", rule: `${mapName}[${key}]`, evaluationMode: "ALWAYS_ALLOW" }]);
+  }
+
+  const dryRunCluster = {
+    ...COMPLIANT,
+    binaryAuthorization: { name: "projects/prod-audit/policy", defaultAdmissionRule: strictDefault, clusterAdmissionRules: { "us-central1-a.prod-cluster": { evaluationMode: "REQUIRE_ATTESTATION", enforcementMode: "DRYRUN_AUDIT_LOG_ONLY" } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, dryRunCluster)));
+  const finding = (await assessGcpOrgGuardrails(client)).findings.find((item) => item.id === "GCP-ORG-07");
+  assert.equal(finding.status, "warn");
+  assert.equal(finding.evidence.dry_run_rules[0].rule, "clusterAdmissionRules[us-central1-a.prod-cluster]");
+});
+
+test("project identifiers come only from the documented full resource name", async () => {
+  const numbered = {
+    ...COMPLIANT,
+    projects: { results: [{ name: "//cloudresourcemanager.googleapis.com/projects/111", assetType: "cloudresourcemanager.googleapis.com/Project", project: "projects/111", displayName: "Prod Audit", state: "ACTIVE", additionalAttributes: { projectId: "ignored-attribute" } }] },
+  };
+  const seen = [];
+  const client = createClient(async (url, init) => {
+    seen.push(url);
+    return jsonResponse(routeCompliant(url, init, numbered));
+  });
+  const result = await assessGcpNetworkSecurity(client);
+  assert.deepEqual(result.snapshot.projects, ["111"]);
+  assert.ok(seen.some((url) => url.includes("/compute/v1/projects/111/")));
+  assert.ok(!seen.some((url) => url.includes("ignored-attribute")));
+
+  const singleProject = new GcpAuditorClient(sampleConfig({ organizationId: undefined }), { fetchImpl: async () => jsonResponse({}), now: () => NOW });
+  const inventory = await singleProject.listProjectInventory();
+  assert.deepEqual(inventory.projects, [{ name: "//cloudresourcemanager.googleapis.com/projects/prod-audit", displayName: "prod-audit" }]);
+});
+
+test("GCP-NET-06 treats H2C backend services as HTTP(S) backends", async () => {
+  const h2c = {
+    ...COMPLIANT,
+    backendServices: { items: { global: { backendServices: [{ name: "grpc-web", loadBalancingScheme: "EXTERNAL_MANAGED", protocol: "H2C" }] } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, h2c)));
+  const finding = (await assessGcpNetworkSecurity(client)).findings.find((item) => item.id === "GCP-NET-06");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.backends_without_security_policy.map((backend) => backend.backendService), ["grpc-web"]);
+});
+
 test("assessGcpIdentity flags stale keys, undated keys, and privileged default service accounts", async () => {
   const client = {
     getNow: () => NOW,
     async listProjectInventory() {
-      return { projects: [{ projectId: "prod-audit" }], truncated: false };
+      return { projects: [{ name: "//cloudresourcemanager.googleapis.com/projects/prod-audit" }], truncated: false };
     },
     async listServiceAccounts() {
       return [{ email: "svc@prod-audit.iam.gserviceaccount.com" }, { email: "other@prod-audit.iam.gserviceaccount.com" }];

@@ -46,6 +46,7 @@ export const GCP_DOCS = {
   effectiveOrgPolicy: "https://cloud.google.com/resource-manager/reference/rest/v1/projects/getEffectiveOrgPolicy",
   orgPolicyResource: "https://cloud.google.com/resource-manager/reference/rest/v1/Policy",
   searchAllResources: "https://cloud.google.com/asset-inventory/docs/reference/rest/v1/TopLevel/searchAllResources",
+  resourceNameFormat: "https://cloud.google.com/asset-inventory/docs/resource-name-format",
   searchAllIamPolicies: "https://cloud.google.com/asset-inventory/docs/reference/rest/v1/TopLevel/searchAllIamPolicies",
   iamPolicyQuery: "https://cloud.google.com/asset-inventory/docs/searching-iam-policies#how_to_construct_a_query",
   assetsList: "https://cloud.google.com/asset-inventory/docs/reference/rest/v1/assets/list",
@@ -202,6 +203,8 @@ export interface GcpAuditBundleResult {
 export interface GcpListResult {
   items: JsonRecord[];
   truncated: boolean;
+  /** Scopes (zones or regions) the API reported as not enumerated; any entry marks the list as truncated. */
+  unreachable?: string[];
 }
 
 export interface GcpProjectInventory {
@@ -655,14 +658,37 @@ function inferRootScope(config: GcpResolvedConfig): string {
   throw new Error("A GCP audit scope requires organizationId or projectId.");
 }
 
+/**
+ * ResourceSearchResult exposes no projectId field and documents
+ * additionalAttributes as not for programmatic use, so the project identifier
+ * is taken from the documented full resource name
+ * //cloudresourcemanager.googleapis.com/projects/{PROJECT_ID or PROJECT_NUMBER}
+ * (GCP_DOCS.resourceNameFormat). Either form is a valid project path segment.
+ */
 function parseProjectId(resource: JsonRecord): string | undefined {
   const name = asString(resource.name);
-  return (
-    asString(resource.projectId)
-    ?? (name?.includes("/projects/") ? name.split("/projects/").at(-1)?.split("/")[0] : undefined)
-    ?? asString(resource.displayName)
-    ?? name?.split("/").at(-1)
-  );
+  if (!name?.includes("/projects/")) return undefined;
+  return asString(name.split("/projects/").at(-1)?.split("/")[0]);
+}
+
+function projectResourceName(projectId: string): string {
+  return `//cloudresourcemanager.googleapis.com/projects/${projectId}`;
+}
+
+/** Unreachable scopes in a Compute aggregatedList response: unreachables[] plus scopes whose warning.code is UNREACHABLE. */
+function collectUnreachableScopes(response: JsonRecord): string[] {
+  const scopes = asArray(response.unreachables).map(asString).filter((value): value is string => Boolean(value));
+  for (const [scope, scoped] of Object.entries(asObject(response.items) ?? {})) {
+    if (asString(asObject(asObject(scoped)?.warning)?.code) === "UNREACHABLE") scopes.push(scope);
+  }
+  return scopes;
+}
+
+/** Reduces a Compute Engine resource URL (full, partial, or self link) to its projects/... path. */
+function computeResourcePath(value: unknown): string | undefined {
+  const text = asString(value);
+  const index = text?.indexOf("projects/") ?? -1;
+  return text && index >= 0 ? text.slice(index) : undefined;
 }
 
 function parsePolicyBindings(value: unknown): JsonRecord[] {
@@ -782,20 +808,24 @@ export class GcpAuditorClient {
     buildUrl: (pageToken?: string) => string,
     collect: (response: JsonRecord) => JsonRecord[],
     limit: number,
+    collectUnreachable?: (response: JsonRecord) => string[],
   ): Promise<GcpListResult> {
     const items: JsonRecord[] = [];
+    const unreachable = new Set<string>();
     let pageToken: string | undefined;
     let truncated = false;
     do {
       const response = await this.requestJson(buildUrl(pageToken));
       items.push(...collect(response));
+      for (const scope of collectUnreachable?.(response) ?? []) unreachable.add(scope);
       pageToken = asString(response.nextPageToken);
       if (pageToken && items.length >= limit) {
         truncated = true;
         break;
       }
     } while (pageToken);
-    return { items, truncated };
+    if (unreachable.size === 0) return { items, truncated };
+    return { items, truncated: true, unreachable: [...unreachable] };
   }
 
   /** GCP_DOCS.organizationsGet */
@@ -812,7 +842,9 @@ export class GcpAuditorClient {
   async listProjectInventory(limit = DEFAULT_MAX_PROJECTS): Promise<GcpProjectInventory> {
     if (!this.config.organizationId) {
       return {
-        projects: this.config.projectId ? [{ projectId: this.config.projectId, name: this.config.projectId }] : [],
+        projects: this.config.projectId
+          ? [{ name: projectResourceName(this.config.projectId), displayName: this.config.projectId }]
+          : [],
         truncated: false,
       };
     }
@@ -1003,13 +1035,16 @@ export class GcpAuditorClient {
 
   /**
    * Compute aggregatedList family (GCP_DOCS.*AggregatedList): maxResults 0..500,
-   * response items is a map of scope -> {<collection>: [...], warning}.
+   * response items is a map of scope -> {<collection>: [...], warning}. The
+   * top-level unreachables[] ("Output only. Unreachable resources") and any
+   * scope whose warning.code is UNREACHABLE mean the inventory is partial.
    */
   private async listAggregated(projectId: string, collection: string, limit: number): Promise<GcpListResult> {
     return this.paginate(
       (pageToken) => `https://compute.googleapis.com/compute/v1/projects/${projectId}/aggregated/${collection}${buildQuery({ maxResults: 500, pageToken })}`,
       (response) => Object.values(asObject(response.items) ?? {}).flatMap((scoped) => asObjectArray(asObject(scoped)?.[collection])),
       limit,
+      collectUnreachableScopes,
     );
   }
 
@@ -1119,6 +1154,7 @@ interface ProjectScan<T> {
   rows: ProjectScanRow<T>[];
   denied: Array<{ projectId: string; error: string }>;
   apiDisabled: string[];
+  unreachable: string[];
   truncated: boolean;
 }
 
@@ -1126,12 +1162,15 @@ async function scanProjects<T>(
   projectIds: string[],
   load: (projectId: string) => Promise<T>,
 ): Promise<ProjectScan<T>> {
-  const scan: ProjectScan<T> = { rows: [], denied: [], apiDisabled: [], truncated: false };
+  const scan: ProjectScan<T> = { rows: [], denied: [], apiDisabled: [], unreachable: [], truncated: false };
   for (const projectId of projectIds) {
     try {
       const data = await load(projectId);
       const list = asObject(data);
       if (list && list.truncated === true) scan.truncated = true;
+      for (const scope of asArray(list?.unreachable).map(asString)) {
+        if (scope) scan.unreachable.push(`${projectId}: ${scope}`);
+      }
       scan.rows.push({ projectId, data });
     } catch (error) {
       const message = describeError(error);
@@ -1161,6 +1200,7 @@ interface VerdictInput {
   scannedProjects?: number;
   apiDisabledProjects?: number;
   truncated?: boolean;
+  unreachableScopes?: string[];
   emptyVerdict: "pass" | "fail" | "manual";
   passSummary: string;
   failSummary: string;
@@ -1168,11 +1208,17 @@ interface VerdictInput {
   manualEvidence: string;
 }
 
-function partialNote(input: VerdictInput): string {
+type PartialViewInput = Pick<VerdictInput, "total" | "deniedProjects" | "scannedProjects" | "apiDisabledProjects" | "truncated" | "unreachableScopes">;
+
+function partialNote(input: PartialViewInput): string {
   const notes: string[] = [];
+  const unreachable = input.unreachableScopes ?? [];
   if (input.deniedProjects) notes.push(`${input.deniedProjects} of ${input.scannedProjects ?? 0} projects denied`);
   if (input.apiDisabledProjects) notes.push(`${input.apiDisabledProjects} projects without the API enabled`);
-  if (input.truncated) notes.push(`inventory truncated at ${input.total} items`);
+  if (unreachable.length > 0) {
+    notes.push(`${unreachable.length} unreachable scopes not enumerated (${unreachable.slice(0, 5).join(", ")}${unreachable.length > 5 ? ", ..." : ""})`);
+  }
+  if (input.truncated) notes.push(`inventory incomplete at ${input.total} items`);
   return notes.length > 0 ? ` Partial view: ${notes.join("; ")}.` : "";
 }
 
@@ -1182,7 +1228,13 @@ function verdict(input: VerdictInput): GcpFinding {
   const isPartial = partial.length > 0;
   const allDenied = (input.deniedProjects ?? 0) > 0 && input.deniedProjects === input.scannedProjects;
   const allDisabled = (input.apiDisabledProjects ?? 0) > 0 && input.apiDisabledProjects === input.scannedProjects;
-  const evidence = { ...input.evidence, seen: input.total, truncated: input.truncated ?? false, denied_projects: input.deniedProjects ?? 0 };
+  const evidence = {
+    ...input.evidence,
+    seen: input.total,
+    truncated: input.truncated ?? false,
+    denied_projects: input.deniedProjects ?? 0,
+    unreachable_scopes: (input.unreachableScopes ?? []).slice(0, 25),
+  };
   const base = { id: input.id, title: input.title, severity: input.severity, mappings, controls: input.controls, evidence };
 
   if (input.inventoryError) {
@@ -1727,6 +1779,26 @@ function isTruthyMetadata(value: string | undefined): boolean {
   return value !== undefined && /^(true|1)$/i.test(value);
 }
 
+/** Binary Authorization Policy rule maps (GCP_DOCS.binaryAuthorizationPolicy); each overrides defaultAdmissionRule for its key. */
+const BINARY_AUTHORIZATION_RULE_MAPS = [
+  "clusterAdmissionRules",
+  "kubernetesNamespaceAdmissionRules",
+  "kubernetesServiceAccountAdmissionRules",
+  "istioServiceIdentityAdmissionRules",
+] as const;
+
+function binaryAuthorizationRules(policy: JsonRecord): Array<{ scope: string; rule: JsonRecord | undefined }> {
+  const rules: Array<{ scope: string; rule: JsonRecord | undefined }> = [
+    { scope: "defaultAdmissionRule", rule: asObject(policy.defaultAdmissionRule) },
+  ];
+  for (const mapName of BINARY_AUTHORIZATION_RULE_MAPS) {
+    for (const [key, rule] of Object.entries(asObject(policy[mapName]) ?? {})) {
+      rules.push({ scope: `${mapName}[${key}]`, rule: asObject(rule) });
+    }
+  }
+  return rules;
+}
+
 function orgPolicyFinding(
   id: string,
   title: string,
@@ -1817,15 +1889,17 @@ export async function assessGcpOrgGuardrails(
   const binaryAuthViolations: JsonRecord[] = [];
   const binaryAuthDryRun: JsonRecord[] = [];
   for (const row of binaryAuthScan.rows) {
-    const rule = asObject(row.data.defaultAdmissionRule);
-    const evaluationMode = asString(rule?.evaluationMode);
-    const enforcementMode = asString(rule?.enforcementMode);
-    if (evaluationMode !== "REQUIRE_ATTESTATION" && evaluationMode !== "ALWAYS_DENY") {
-      binaryAuthViolations.push({ projectId: row.projectId, evaluationMode: evaluationMode ?? null });
-    } else if (enforcementMode !== "ENFORCED_BLOCK_AND_AUDIT_LOG") {
-      binaryAuthDryRun.push({ projectId: row.projectId, enforcementMode: enforcementMode ?? null });
+    for (const { scope, rule } of binaryAuthorizationRules(row.data)) {
+      const evaluationMode = asString(rule?.evaluationMode);
+      const enforcementMode = asString(rule?.enforcementMode);
+      if (evaluationMode !== "REQUIRE_ATTESTATION" && evaluationMode !== "ALWAYS_DENY") {
+        binaryAuthViolations.push({ projectId: row.projectId, rule: scope, evaluationMode: evaluationMode ?? null });
+      } else if (enforcementMode !== "ENFORCED_BLOCK_AND_AUDIT_LOG") {
+        binaryAuthDryRun.push({ projectId: row.projectId, rule: scope, enforcementMode: enforcementMode ?? null });
+      }
     }
   }
+  const binaryAuthViolatingProjects = new Set(binaryAuthViolations.map((violation) => violation.projectId)).size;
 
   const scanBase = (scan: ProjectScan<unknown>) => ({
     inventoryError: context.error,
@@ -1833,6 +1907,7 @@ export async function assessGcpOrgGuardrails(
     scannedProjects: context.projectIds.length,
     apiDisabledProjects: scan.apiDisabled.length,
     truncated: context.truncated || scan.truncated,
+    unreachableScopes: scan.unreachable,
   });
 
   const organizationFinding: GcpFinding = !config.organizationId
@@ -1898,8 +1973,8 @@ export async function assessGcpOrgGuardrails(
           status: osLoginOverrides.length > 0 || context.truncated || instanceScan.denied.length > 0 || instanceScan.truncated ? "warn" : "pass",
           summary: osLoginOverrides.length > 0
             ? `constraints/compute.requireOsLogin is enforced but ${osLoginOverrides.length} instances carry an enable-oslogin metadata override that is not TRUE.`
-            : `constraints/compute.requireOsLogin is enforced in the effective policy and no instance overrides enable-oslogin.${context.truncated || instanceScan.denied.length > 0 || instanceScan.truncated ? " Partial view: the instance inventory was truncated or partly denied." : ""}`,
-          evidence: { policy: osLoginPolicy.data ?? null, instance_overrides: osLoginOverrides.slice(0, 25) },
+            : `constraints/compute.requireOsLogin is enforced in the effective policy and no instance overrides enable-oslogin.${partialNote({ ...scanBase(instanceScan), total: instances.length })}`,
+          evidence: { policy: osLoginPolicy.data ?? null, instance_overrides: osLoginOverrides.slice(0, 25), unreachable_scopes: instanceScan.unreachable.slice(0, 25) },
           mappings: controlMappings(11),
           controls: [11],
         }
@@ -1924,15 +1999,15 @@ export async function assessGcpOrgGuardrails(
       title: "Binary Authorization admission policy",
       severity: "medium",
       controls: [8],
-      evidence: { permissive_policies: binaryAuthViolations.slice(0, 25), dry_run_policies: binaryAuthDryRun.slice(0, 25), projects_read: binaryAuthScan.rows.length },
+      evidence: { permissive_rules: binaryAuthViolations.slice(0, 25), dry_run_rules: binaryAuthDryRun.slice(0, 25), projects_read: binaryAuthScan.rows.length },
       total: binaryAuthScan.rows.length,
       violations: binaryAuthViolations.length,
       unknown: binaryAuthDryRun.length,
       emptyVerdict: "manual",
-      passSummary: `All ${binaryAuthScan.rows.length} sampled projects with Binary Authorization enabled require attestation (or deny) with ENFORCED_BLOCK_AND_AUDIT_LOG.`,
-      failSummary: `${binaryAuthViolations.length} of ${binaryAuthScan.rows.length} sampled projects use a defaultAdmissionRule that does not require attestation.`,
+      passSummary: `All ${binaryAuthScan.rows.length} sampled projects with Binary Authorization enabled require attestation (or deny) with ENFORCED_BLOCK_AND_AUDIT_LOG in the default rule and every per-cluster, namespace, service account, and Istio identity rule.`,
+      failSummary: `${binaryAuthViolatingProjects} of ${binaryAuthScan.rows.length} sampled projects carry ${binaryAuthViolations.length} admission rules (default or scoped) that do not require attestation.`,
       emptySummary: "No Binary Authorization policy was readable.",
-      manualEvidence: "review the Binary Authorization policy for every project running GKE or Cloud Run.",
+      manualEvidence: "review the Binary Authorization policy, including cluster and namespace admission rules, for every project running GKE or Cloud Run.",
     }),
     verdict({
       ...scanBase(instanceScan),
@@ -2123,6 +2198,7 @@ export async function assessGcpDataProtection(
     scannedProjects: context.projectIds.length,
     apiDisabledProjects: scan.apiDisabled.length,
     truncated: context.truncated || scan.truncated,
+    unreachableScopes: scan.unreachable,
   });
 
   const findings: GcpFinding[] = [
@@ -2180,6 +2256,7 @@ export async function assessGcpDataProtection(
       ...scanBase(bucketScan),
       deniedProjects: bucketScan.denied.length + diskScan.denied.length,
       truncated: context.truncated || bucketScan.truncated || diskScan.truncated,
+      unreachableScopes: [...bucketScan.unreachable, ...diskScan.unreachable],
       id: "GCP-DATA-04",
       title: "Customer-managed encryption keys",
       severity: "medium",
@@ -2313,8 +2390,67 @@ function isOpenAdminFirewall(rule: JsonRecord): boolean {
 
 const FLOW_LOG_UNSUPPORTED_PURPOSES = new Set(["REGIONAL_MANAGED_PROXY", "GLOBAL_MANAGED_PROXY", "INTERNAL_HTTPS_LOAD_BALANCER", "PRIVATE_SERVICE_CONNECT", "PRIVATE_NAT"]);
 
+/** BackendService.protocol values that front HTTP(S) traffic (GCP_DOCS.backendServicesAggregatedList). */
+const HTTP_BACKEND_PROTOCOLS = new Set(["HTTP", "HTTPS", "HTTP2", "H2C"]);
+
 function lastSegment(value: unknown): string | undefined {
   return asString(value)?.split("/").at(-1);
+}
+
+/** Subnetwork flow logging is documented on both logConfig.enable and the top-level enableFlowLogs field. */
+function flowLogsEnabled(subnet: JsonRecord): boolean {
+  return asObject(subnet.logConfig)?.enable === true || subnet.enableFlowLogs === true;
+}
+
+/** Instance has a public address when any interface carries accessConfigs (IPv4) or ipv6AccessConfigs (DIRECT_IPV6). */
+function hasExternalAddress(instance: JsonRecord): boolean {
+  return asObjectArray(instance.networkInterfaces).some(
+    (nic) => asObjectArray(nic.accessConfigs).length > 0 || asObjectArray(nic.ipv6AccessConfigs).length > 0,
+  );
+}
+
+function subnetworkPath(subnet: JsonRecord & { projectId: string }): string | undefined {
+  const selfLink = computeResourcePath(subnet.selfLink);
+  if (selfLink) return selfLink;
+  const name = asString(subnet.name);
+  const region = lastSegment(subnet.region);
+  return name && region ? `projects/${subnet.projectId}/regions/${region}/subnetworks/${name}` : undefined;
+}
+
+/**
+ * RouterNat.sourceSubnetworkIpRangesToNat (GCP_DOCS.routersAggregatedList):
+ * ALL_SUBNETWORKS_* options cover every subnetwork in the router's network and
+ * region; LIST_OF_SUBNETWORKS covers only the subnetworks[].name URLs listed.
+ */
+function natCoversSubnetwork(nat: JsonRecord, subnetPath: string): boolean {
+  const option = asString(nat.sourceSubnetworkIpRangesToNat);
+  if (option === "ALL_SUBNETWORKS_ALL_IP_RANGES" || option === "ALL_SUBNETWORKS_ALL_PRIMARY_IP_RANGES") return true;
+  if (option !== "LIST_OF_SUBNETWORKS") return false;
+  return asObjectArray(nat.subnetworks).some((entry) => computeResourcePath(entry.name) === subnetPath);
+}
+
+function networkScopeKey(resource: JsonRecord & { projectId: string }): string {
+  return `${resource.projectId}|${lastSegment(resource.network)}|${lastSegment(resource.region)}`;
+}
+
+/**
+ * Global and regional SSL policies are separate namespaces that may share a
+ * name, so policies are keyed by their full projects/... path (selfLink, else
+ * the documented region field plus name) and proxies by their sslPolicy URL.
+ */
+function sslPolicyPath(policy: JsonRecord & { projectId: string }): string | undefined {
+  const selfLink = computeResourcePath(policy.selfLink);
+  if (selfLink) return selfLink;
+  const name = asString(policy.name);
+  if (!name) return undefined;
+  const region = lastSegment(policy.region);
+  return `projects/${policy.projectId}/${region ? `regions/${region}` : "global"}/sslPolicies/${name}`;
+}
+
+function attachedSslPolicyPath(proxy: JsonRecord & { projectId: string }): string | undefined {
+  const reference = asString(proxy.sslPolicy);
+  if (!reference) return undefined;
+  return computeResourcePath(reference) ?? `projects/${proxy.projectId}/${reference.replace(/^\/+/, "")}`;
 }
 
 export async function assessGcpNetworkSecurity(
@@ -2341,43 +2477,48 @@ export async function assessGcpNetworkSecurity(
 
   const subnets = flattenScan(subnetScan).filter((subnet) => !FLOW_LOG_UNSUPPORTED_PURPOSES.has(asString(subnet.purpose) ?? ""));
   const subnetsWithoutFlowLogs = subnets
-    .filter((subnet) => asObject(subnet.logConfig)?.enable !== true)
+    .filter((subnet) => !flowLogsEnabled(subnet))
     .map((subnet) => ({ projectId: subnet.projectId, subnetwork: asString(subnet.name), region: lastSegment(subnet.region) }));
   const subnetsWithoutPrivateAccess = subnets
     .filter((subnet) => subnet.privateIpGoogleAccess !== true)
     .map((subnet) => ({ projectId: subnet.projectId, subnetwork: asString(subnet.name), region: lastSegment(subnet.region) }));
 
   const routers = flattenScan(routerScan);
-  const natCoverage = new Set(
-    routers
-      .filter((router) => asObjectArray(router.nats).length > 0)
-      .map((router) => `${router.projectId}|${lastSegment(router.network)}|${lastSegment(router.region)}`),
-  );
+  const routersByScope = new Map<string, JsonRecord[]>();
+  for (const router of routers) {
+    const key = networkScopeKey(router);
+    routersByScope.set(key, [...(routersByScope.get(key) ?? []), router]);
+  }
   const subnetsWithoutNat = subnets
-    .filter((subnet) => !natCoverage.has(`${subnet.projectId}|${lastSegment(subnet.network)}|${lastSegment(subnet.region)}`))
+    .filter((subnet) => {
+      const path = subnetworkPath(subnet);
+      return !(routersByScope.get(networkScopeKey(subnet)) ?? []).some((router) =>
+        asObjectArray(router.nats).some((nat) => path !== undefined && natCoversSubnetwork(nat, path)),
+      );
+    })
     .map((subnet) => ({ projectId: subnet.projectId, subnetwork: asString(subnet.name), network: lastSegment(subnet.network), region: lastSegment(subnet.region) }));
   const instances = flattenScan(instanceScan);
   const publicInstances = instances
-    .filter((instance) => asObjectArray(instance.networkInterfaces).some((nic) => asObjectArray(nic.accessConfigs).length > 0))
+    .filter(hasExternalAddress)
     .map((instance) => ({ projectId: instance.projectId, instance: asString(instance.name) }));
 
   const sslPolicies = flattenScan(sslPolicyScan);
-  const sslPolicyByLink = new Map<string, JsonRecord>();
+  const sslPolicyByPath = new Map<string, JsonRecord>();
   for (const policy of sslPolicies) {
-    const name = asString(policy.name);
-    if (name) sslPolicyByLink.set(`${policy.projectId}|${name}`, policy);
+    const path = sslPolicyPath(policy);
+    if (path) sslPolicyByPath.set(path, policy);
   }
   const proxies = flattenScan(proxyScan);
   const weakProxies: JsonRecord[] = [];
   const unresolvedProxies: JsonRecord[] = [];
   for (const proxy of proxies) {
-    const policyName = lastSegment(proxy.sslPolicy);
-    const record = { projectId: proxy.projectId, proxy: asString(proxy.name), sslPolicy: policyName ?? null };
-    if (!policyName) {
+    const policyPath = attachedSslPolicyPath(proxy);
+    const record = { projectId: proxy.projectId, proxy: asString(proxy.name), sslPolicy: policyPath ?? null };
+    if (!policyPath) {
       weakProxies.push({ ...record, reason: "no SSL policy attached; the default policy allows TLS 1.0 with the COMPATIBLE profile" });
       continue;
     }
-    const policy = sslPolicyByLink.get(`${proxy.projectId}|${policyName}`);
+    const policy = sslPolicyByPath.get(policyPath);
     if (!policy) {
       unresolvedProxies.push({ ...record, reason: "attached SSL policy not found in the project inventory" });
       continue;
@@ -2391,8 +2532,7 @@ export async function assessGcpNetworkSecurity(
 
   const externalBackends = flattenScan(backendScan).filter((backend) => {
     const scheme = asString(backend.loadBalancingScheme);
-    const protocol = asString(backend.protocol);
-    return (scheme === "EXTERNAL" || scheme === "EXTERNAL_MANAGED") && ["HTTP", "HTTPS", "HTTP2"].includes(protocol ?? "");
+    return (scheme === "EXTERNAL" || scheme === "EXTERNAL_MANAGED") && HTTP_BACKEND_PROTOCOLS.has(asString(backend.protocol) ?? "");
   });
   const backendsWithoutArmor = externalBackends
     .filter((backend) => !asString(backend.securityPolicy))
@@ -2404,6 +2544,7 @@ export async function assessGcpNetworkSecurity(
     scannedProjects: context.projectIds.length,
     apiDisabledProjects: Math.max(...scans.map((scan) => scan.apiDisabled.length)),
     truncated: context.truncated || scans.some((scan) => scan.truncated),
+    unreachableScopes: scans.flatMap((scan) => scan.unreachable),
   });
 
   const findings: GcpFinding[] = [
@@ -2432,10 +2573,10 @@ export async function assessGcpNetworkSecurity(
       total: subnets.length,
       violations: subnetsWithoutFlowLogs.length,
       emptyVerdict: "manual",
-      passSummary: `All ${subnets.length} eligible subnetworks set logConfig.enable=true (proxy-only and Private Service Connect subnets excluded).`,
-      failSummary: `${subnetsWithoutFlowLogs.length} of ${subnets.length} eligible subnetworks do not enable flow logs (logConfig.enable).`,
+      passSummary: `All ${subnets.length} eligible subnetworks enable flow logs via logConfig.enable or enableFlowLogs (proxy-only and Private Service Connect subnets excluded).`,
+      failSummary: `${subnetsWithoutFlowLogs.length} of ${subnets.length} eligible subnetworks do not enable flow logs (neither logConfig.enable nor enableFlowLogs is true).`,
       emptySummary: "No eligible subnetworks were listed in the sampled projects.",
-      manualEvidence: "review logConfig.enable on each subnetwork.",
+      manualEvidence: "review logConfig.enable and enableFlowLogs on each subnetwork.",
     }),
     verdict({
       ...scanBase(subnetScan),
@@ -2464,10 +2605,10 @@ export async function assessGcpNetworkSecurity(
       violations: subnetsWithoutNat.length + publicInstances.length,
       violationStatus: "warn",
       emptyVerdict: "manual",
-      passSummary: `Every eligible subnetwork region has a Cloud Router with NAT and none of ${instances.length} instances has an external access config.`,
-      failSummary: `${subnetsWithoutNat.length} subnetworks lack a Cloud NAT in their network and region, and ${publicInstances.length} of ${instances.length} instances carry external IP access configs.`,
+      passSummary: `Every eligible subnetwork is covered by a Cloud NAT (sourceSubnetworkIpRangesToNat) in its network and region, and none of ${instances.length} instances has an IPv4 or IPv6 external access config.`,
+      failSummary: `${subnetsWithoutNat.length} subnetworks are not covered by a Cloud NAT in their network and region, and ${publicInstances.length} of ${instances.length} instances carry external IPv4 or IPv6 access configs.`,
       emptySummary: "No subnetworks or instances were listed in the sampled projects.",
-      manualEvidence: "review Cloud Routers with nats[] per region and instance networkInterfaces[].accessConfigs.",
+      manualEvidence: "review Cloud Router nats[].sourceSubnetworkIpRangesToNat and subnetworks[] per region, plus instance networkInterfaces[].accessConfigs and ipv6AccessConfigs.",
     }),
     verdict({
       ...scanBase(proxyScan, sslPolicyScan),
