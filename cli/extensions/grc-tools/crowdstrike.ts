@@ -2666,17 +2666,52 @@ function withRoleVisibility(item: CrowdstrikeFinding, views: UserView[], roleErr
   };
 }
 
-function scopeStrings(client: JsonRecord): string[] {
-  return asArray(client.scopes).map((scope) => {
-    const object = asObject(scope);
-    if (object) return asString(object.id) ?? asString(object.name) ?? asString(object.scope) ?? "";
-    return asString(scope) ?? "";
-  }).filter(Boolean);
+interface ApiClientScope {
+  id?: string;
+  group?: string;
+  action?: string;
 }
 
-function isSensitiveWriteScope(scope: string): boolean {
-  if (!/write|admin/i.test(scope)) return false;
-  return SENSITIVE_WRITE_SCOPE_PATTERNS.some((pattern) => pattern.test(scope));
+function parseScopeText(text: string | undefined): { group?: string; action?: string } {
+  if (!text) return {};
+  const match = /^\s*([^:]+?)\s*:\s*([A-Za-z_-]+)\s*$/.exec(text);
+  if (!match) return { group: text.trim() || undefined };
+  return { group: match[1], action: match[2] };
+}
+
+function apiClientScopes(client: JsonRecord): ApiClientScope[] {
+  return asArray(client.scopes).map((scope): ApiClientScope => {
+    const object = asObject(scope);
+    if (object) {
+      const id = asString(object.id) ?? asString(object.name) ?? asString(object.scope);
+      const parsed = parseScopeText(id);
+      return {
+        id,
+        group: asString(object.group) ?? parsed.group,
+        action: asString(object.action) ?? parsed.action,
+      };
+    }
+    const text = asString(scope);
+    return { id: text, ...parseScopeText(text) };
+  });
+}
+
+function normalizeScopeSubject(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
+function isWriteAction(action: string | undefined): boolean {
+  return action !== undefined && /write|admin/i.test(action);
+}
+
+function isSensitiveWriteScope(scope: ApiClientScope): boolean {
+  if (!isWriteAction(scope.action)) return false;
+  const subjects = [scope.group, scope.id].filter((value): value is string => Boolean(value)).map(normalizeScopeSubject);
+  return subjects.some((subject) => SENSITIVE_WRITE_SCOPE_PATTERNS.some((pattern) => pattern.test(subject)));
+}
+
+function scopeLabel(scope: ApiClientScope): string {
+  return `${scope.group ?? scope.id ?? "unknown"}:${scope.action ?? "unknown"}`;
 }
 
 const API_CLIENT_CONSOLE_EVIDENCE = "export the API client list with scopes and last-used dates from Falcon console > Support and resources > API clients and keys and confirm write scopes are limited to documented integrations.";
@@ -2695,33 +2730,45 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   }
   const staleCutoff = now - staleDays * 86_400_000;
   const views = clients.data.items.map((client) => {
-    const scopes = scopeStrings(client);
+    const scopes = apiClientScopes(client);
+    const writeScopes = scopes.filter(isSensitiveWriteScope);
+    const actionless = scopes.filter((scope) => scope.action === undefined);
     const lastUsed = parseTimestamp(client.last_used_at) ?? parseTimestamp(client.last_used) ?? parseTimestamp(client.last_used_timestamp);
     return {
       id: asString(client.id) ?? asString(client.client_id),
       name: asString(client.name),
       scopes_count: scopes.length,
-      sensitive_write_scopes: scopes.filter(isSensitiveWriteScope),
+      sensitive_write_scopes: writeScopes.map(scopeLabel),
       scopes_exposed: Array.isArray(client.scopes),
+      scope_actions_readable: actionless.length === 0,
+      scopes_without_action: actionless.map(scopeLabel),
       last_used_at: lastUsed === undefined ? undefined : new Date(lastUsed).toISOString(),
       stale: lastUsed !== undefined && lastUsed < staleCutoff,
     };
   });
   const writeClients = views.filter((view) => view.sensitive_write_scopes.length > 0);
   const unexposed = views.filter((view) => !view.scopes_exposed);
+  const actionsUnreadable = views.filter((view) => view.scopes_exposed && !view.scope_actions_readable);
   const staleWriteClients = writeClients.filter((view) => view.stale);
   const withoutLastUsed = views.filter((view) => view.last_used_at === undefined).length;
+  const lastUsedCoverage = withoutLastUsed === views.length
+    ? "The public API reference documents no last-used field for API clients and none was returned, so unused-client staleness was not evaluated from API data; review last-used dates in the Falcon console."
+    : `Last-used timestamps were returned for ${views.length - withoutLastUsed} of ${views.length} clients${staleWriteClients.length > 0 ? `; ${staleWriteClients.length} write clients were unused for more than ${staleDays} days` : ""}.`;
   const status: CrowdstrikeFinding["status"] = writeClients.length > maxWriteClients
     ? "fail"
-    : writeClients.length > 0 || unexposed.length > 0
+    : writeClients.length > 0 || unexposed.length > 0 || actionsUnreadable.length > 0
       ? "warn"
       : "pass";
+  const coverageNotes = [
+    unexposed.length > 0 ? `${unexposed.length} clients did not expose a scopes array` : undefined,
+    actionsUnreadable.length > 0 ? `${actionsUnreadable.length} clients expose scopes without an action field, so their read or write level is unknown` : undefined,
+  ].filter((note): note is string => Boolean(note));
   return withPartialInventory(finding(
     "CS-18",
     status,
     status === "pass"
-      ? `None of the ${views.length} API clients hold write scopes on sensitive collections; scopes were read for every client.`
-      : `${writeClients.length} of ${views.length} API clients hold write scopes on sensitive collections (threshold ${maxWriteClients})${staleWriteClients.length > 0 ? `, ${staleWriteClients.length} of them unused for more than ${staleDays} days` : ""}${unexposed.length > 0 ? `; ${unexposed.length} clients did not expose scopes` : ""}.`,
+      ? `None of the ${views.length} API clients hold write-action scopes on sensitive collections; the scopes array with its action and group fields was read for every client. ${lastUsedCoverage}`
+      : `${writeClients.length} of ${views.length} API clients hold write-action scopes on sensitive collections (threshold ${maxWriteClients})${coverageNotes.length > 0 ? `; ${coverageNotes.join("; ")}` : ""}. ${lastUsedCoverage}`,
     {
       api_clients: views.length,
       reported_total_api_clients: clients.data.total,
@@ -2729,8 +2776,9 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
       write_clients: writeClients.slice(0, 25),
       stale_write_clients: staleWriteClients.slice(0, 25).map((view) => view.name ?? view.id),
       clients_without_scope_data: unexposed.length,
+      clients_without_scope_action_data: actionsUnreadable.length,
       clients_without_last_used_data: withoutLastUsed,
-      last_used_note: withoutLastUsed > 0 ? "The public API reference does not document a last-used field for API clients; review unused clients in the Falcon console." : undefined,
+      last_used_evaluated_from_api: withoutLastUsed < views.length,
     },
   ), [partialInventory(clients.data, "API clients")]);
 }

@@ -103,6 +103,18 @@ function forbidden(path) {
   };
 }
 
+const SCOPE_GROUP_NAMES = {
+  "prevention-policies": "Prevention Policies",
+  hosts: "Hosts",
+  "user-management": "User Management",
+  "sensor-update-policies": "Sensor Update Policies",
+  detects: "Detections",
+};
+
+function apiScope(id, action) {
+  return { id, group: SCOPE_GROUP_NAMES[id] ?? id, action };
+}
+
 const PAGED_METHODS = [
   "listPreventionPolicies",
   "listResponsePolicies",
@@ -348,7 +360,7 @@ function createFakeClient(overrides = {}) {
     getUsers: async () => users.users,
     listUserRoles: async (uuid) => users.roles[uuid] ?? [],
     listRoles: async () => [{ id: "falcon_administrator", display_name: "Falcon Administrator" }, { id: "falcon_analyst", display_name: "Falcon Analyst" }],
-    listApiClients: async () => [{ id: "api-1", name: "grclanker audit", scopes: ["prevention-policies:read", "hosts:read", "user-management:read"] }],
+    listApiClients: async () => [{ id: "api-1", name: "grclanker audit", scopes: [apiScope("prevention-policies", "read"), apiScope("hosts", "read"), apiScope("user-management", "read")] }],
     listIoaExclusions: async () => [{ id: "ioa-1", name: "Backup agent", ifn_regex: "C:\\\\Program Files\\\\Backup\\\\agent\\.exe", cl_regex: ".*--quiet.*", applied_globally: false, groups: [{ id: "hg-1" }] }],
     listMlExclusions: async () => [{ id: "ml-1", value: "D:\\Builds\\artifacts\\*.pdb", excluded_from: ["blocking"], applied_globally: false, groups: [{ id: "hg-1" }] }],
     listSensorVisibilityExclusions: async () => [{ id: "sv-1", value: "/opt/vendor/agent/collector", applied_globally: false, groups: [{ id: "hg-1" }] }],
@@ -927,7 +939,7 @@ test("assessCrowdstrikeAccessGovernance fails excessive admins, write-heavy API 
         { role_id: "dashboard_admin", role_name: "Dashboard Admin" },
         { role_id: "fw_manager", role_name: "Firewall Manager" },
       ]),
-    listApiClients: async () => Array.from({ length: 4 }, (_, index) => ({ id: `api-${index}`, name: `integration-${index}`, scopes: ["prevention-policies:write", "hosts:write"] })),
+    listApiClients: async () => Array.from({ length: 4 }, (_, index) => ({ id: `api-${index}`, name: `integration-${index}`, scopes: [apiScope("prevention-policies", "write"), apiScope("hosts", "write")] })),
     listIoaExclusions: async () => [{ id: "ioa-1", name: "Everything", ifn_regex: ".*", cl_regex: ".*", applied_globally: true, groups: [] }],
     listMlExclusions: async () => [{ id: "ml-1", value: "C:\\Windows\\Temp\\*", excluded_from: ["blocking", "extraction"], applied_globally: true, groups: [] }],
     listSensorVisibilityExclusions: async () => [{ id: "sv-1", value: "/usr/*", applied_globally: true, groups: [] }],
@@ -1233,6 +1245,69 @@ test("verdict safety rule 8: re-running an export pairs each bundle directory wi
   assert.deepEqual(readFileSync(first.zipPath), firstBytes);
   const zips = readdirSync(base).filter((entry) => entry.endsWith(".zip")).sort();
   assert.deepEqual(zips, ["us-1-audit-bundle-2.zip", "us-1-audit-bundle-3.zip", "us-1-audit-bundle.zip"]);
+});
+
+test("review fix 1: API client write scopes are read from the action and group fields, never from the id alone", async () => {
+  const writeClients = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => [
+      { id: "api-hosts", name: "host-writer", scopes: [apiScope("hosts", "write")] },
+      { id: "api-prev", name: "policy-writer", scopes: [apiScope("prevention-policies", "write")] },
+      { id: "api-users", name: "user-writer", scopes: [apiScope("user-management", "write")] },
+    ],
+  }));
+  const finding = findingById(writeClients, "CS-18");
+  assert.notEqual(finding.status, "pass");
+  assert.equal(finding.status, "warn");
+  assert.equal(finding.evidence.write_clients.length, 3);
+  assert.deepEqual(
+    finding.evidence.write_clients.map((client) => client.sensitive_write_scopes).flat().sort(),
+    ["Hosts:write", "Prevention Policies:write", "User Management:write"],
+  );
+  assert.match(finding.summary, /3 of 3 API clients hold write-action scopes/);
+
+  const fourWriters = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => Array.from({ length: 4 }, (_, index) => ({ id: `api-${index}`, name: `writer-${index}`, scopes: [apiScope("hosts", "write")] })),
+  }));
+  assert.equal(findingById(fourWriters, "CS-18").status, "fail");
+
+  const readOnly = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => [
+      { id: "api-1", name: "reader", scopes: [apiScope("hosts", "read"), apiScope("prevention-policies", "read"), { id: "hosts", group: "Hosts", action: "READ" }] },
+    ],
+  }));
+  assert.equal(findingById(readOnly, "CS-18").status, "pass");
+  assert.match(findingById(readOnly, "CS-18").summary, /action and group fields was read for every client/);
+  assert.match(findingById(readOnly, "CS-18").summary, /documents no last-used field for API clients and none was returned, so unused-client staleness was not evaluated from API data/);
+  assert.equal(findingById(readOnly, "CS-18").evidence.last_used_evaluated_from_api, false);
+
+  const upperCaseAction = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => [{ id: "api-1", name: "writer", scopes: [{ id: "user-management", group: "User Management", action: "WRITE" }] }],
+  }));
+  assert.equal(findingById(upperCaseAction, "CS-18").status, "warn");
+  assert.equal(findingById(upperCaseAction, "CS-18").evidence.write_clients.length, 1);
+
+  const legacyStrings = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => [{ id: "api-1", name: "legacy", scopes: ["hosts:write", "prevention-policies:read"] }],
+  }));
+  assert.equal(findingById(legacyStrings, "CS-18").status, "warn");
+  assert.deepEqual(findingById(legacyStrings, "CS-18").evidence.write_clients[0].sensitive_write_scopes, ["hosts:write"]);
+
+  const missingAction = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => [{ id: "api-1", name: "opaque", scopes: [{ id: "hosts", group: "Hosts" }] }],
+  }));
+  assert.equal(findingById(missingAction, "CS-18").status, "warn");
+  assert.equal(findingById(missingAction, "CS-18").evidence.clients_without_scope_action_data, 1);
+  assert.match(findingById(missingAction, "CS-18").summary, /without an action field, so their read or write level is unknown/);
+
+  const withLastUsed = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listApiClients: async () => [
+      { id: "api-1", name: "recent", scopes: [apiScope("hosts", "read")], last_used_at: new Date().toISOString() },
+      { id: "api-2", name: "stale-writer", scopes: [apiScope("hosts", "write")], last_used_at: "2020-01-01T00:00:00Z" },
+    ],
+  }));
+  assert.match(findingById(withLastUsed, "CS-18").summary, /Last-used timestamps were returned for 2 of 2 clients; 1 write clients were unused/);
+  assert.equal(findingById(withLastUsed, "CS-18").evidence.last_used_evaluated_from_api, true);
+  assert.deepEqual(findingById(withLastUsed, "CS-18").evidence.stale_write_clients, ["stale-writer"]);
 });
 
 test("false-pass self-check (a): every endpoint forbidden yields 25 manual findings and zero passes", async () => {
