@@ -70,6 +70,8 @@ const DEFAULT_CONFIG_DIR = join(".config", "webex-sec-inspector");
 const CONFIG_FILE_NAMES = ["config.json", "config.yaml", "config.yml"];
 const MAX_RETRY_AFTER_MS = 30_000;
 const MAX_429_RETRIES = 2;
+/** Ceiling on rel="next" hops per listing; reaching it reports truncated: true. */
+const MAX_LIST_PAGES = 1000;
 
 /**
  * Per-page `max` for the endpoints whose reference documents a `max` query
@@ -726,6 +728,7 @@ export class WebexApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly maxPages: number;
   private accessToken?: string;
 
   constructor(
@@ -734,12 +737,14 @@ export class WebexApiClient {
       fetchImpl?: FetchImpl;
       now?: () => Date;
       sleep?: (ms: number) => Promise<void>;
+      maxPages?: number;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+    this.maxPages = clampNumber(options.maxPages, MAX_LIST_PAGES, 1, 100_000);
     this.accessToken = config.token;
   }
 
@@ -860,9 +865,11 @@ export class WebexApiClient {
   }
 
   /**
-   * Follows rel="next" until absent or the item limit is reached; truncation is
-   * reported, never hidden. `max` is sent only when the caller passes pageMax,
-   * which happens only for endpoints whose reference documents that parameter.
+   * Follows rel="next" until absent, the item limit is reached, or the page
+   * ceiling is hit (a server that keeps emitting rel="next" on empty pages
+   * would otherwise never stop); every early exit reports truncated: true.
+   * `max` is sent only when the caller passes pageMax, which happens only for
+   * endpoints whose reference documents that parameter.
    */
   async list(
     path: string,
@@ -883,6 +890,9 @@ export class WebexApiClient {
       items.push(...pageItems.slice(0, remaining));
       nextUrl = response.nextUrl;
       if (items.length >= limit && (nextUrl || pageItems.length > remaining)) {
+        return { items, truncated: true, pageCount };
+      }
+      if (nextUrl && pageCount >= this.maxPages) {
         return { items, truncated: true, pageCount };
       }
     }
@@ -1528,7 +1538,7 @@ export async function assessWebexIdentity(
   } else if (complianceOfficers.length > 0) {
     complianceFinding = finding("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", people.truncated ? "warn" : "pass",
       `${complianceOfficers.length} of ${humans.length} people carry the Compliance Officer role.${peoplePartial}`,
-      { compliance_officers: complianceOfficers.slice(0, 50).map(personLabel), people_seen: humans.length, people_truncated: people.truncated });
+      { compliance_officers: complianceOfficers.slice(0, 50).map(personLabel), compliance_officer_count: complianceOfficers.length, people_seen: humans.length, people_truncated: people.truncated });
   } else {
     complianceFinding = finding("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", "fail",
       `No person among ${humans.length} listed carries the Compliance Officer role.${peoplePartial}`,
@@ -1695,7 +1705,12 @@ export async function assessWebexCollaborationGovernance(
   } else {
     classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", "fail",
       `${roomsWithoutClassification.length} of ${roomItems.length} visible spaces have no classificationId.${partialNote(rooms, "rooms")}`,
-      { rooms_seen: roomItems.length, rooms_without_classification: roomsWithoutClassification.slice(0, 25).map((room) => asString(room.title) ?? asString(room.id)), rooms_truncated: rooms.truncated });
+      {
+        rooms_seen: roomItems.length,
+        rooms_without_classification: roomsWithoutClassification.slice(0, 25).map((room) => asString(room.title) ?? asString(room.id)),
+        rooms_without_classification_count: roomsWithoutClassification.length,
+        rooms_truncated: rooms.truncated,
+      });
   }
 
   const webhookItems = surfaceItems(webhooks);
@@ -1719,7 +1734,11 @@ export async function assessWebexCollaborationGovernance(
   } else {
     webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "fail",
       `${insecureWebhooks.length} of ${webhookItems.length} visible webhooks lack an https targetUrl or a secret.${partialNote(webhooks, "webhooks")}`,
-      { insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: scrubValue(asString(item.targetUrl) ?? "") })), webhooks_seen: webhookItems.length });
+      {
+        insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: scrubValue(asString(item.targetUrl) ?? "") })),
+        insecure_webhooks_count: insecureWebhooks.length,
+        webhooks_seen: webhookItems.length,
+      });
   }
 
   const licenseItems = surfaceItems(licenses);
@@ -1878,7 +1897,12 @@ export async function assessWebexMeetingHybridSecurity(
   } else {
     hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", "fail",
       `${nonOperational.length} of ${connectorItems.length} hybrid connectors are not operational.${partialNote(hybridConnectors, "connectors")}`,
-      { non_operational: nonOperational.slice(0, 25).map((item) => ({ id: asString(item.id), type: asString(item.type), status: asString(item.status) ?? null })), connectors_seen: connectorItems.length, clusters_seen: clusterItems.length });
+      {
+        non_operational: nonOperational.slice(0, 25).map((item) => ({ id: asString(item.id), type: asString(item.type), status: asString(item.status) ?? null })),
+        non_operational_count: nonOperational.length,
+        connectors_seen: connectorItems.length,
+        clusters_seen: clusterItems.length,
+      });
   }
 
   const deviceItems = surfaceItems(devices);
@@ -1896,7 +1920,9 @@ export async function assessWebexMeetingHybridSecurity(
         devices_truncated: devices.truncated,
         personal_mode_devices: personalModeDevices.length,
         software_versions: softwareVersions.slice(0, 50),
+        software_version_count: softwareVersions.length,
         upgrade_channels: upgradeChannels.slice(0, 50),
+        upgrade_channel_count: upgradeChannels.length,
         devices_without_upgrade_channel: devicesWithoutUpgradeChannel,
         managed_by: [...new Set(deviceItems.map((item) => asString(item.managedBy)).filter(Boolean))],
         workspaces_seen: surfaceItems(workspaces).length,

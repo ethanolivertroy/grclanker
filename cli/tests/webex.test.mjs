@@ -1230,6 +1230,64 @@ test("projectSurface fails closed: unlisted keys are dropped, nested objects nee
   assert.deepEqual(Object.keys(byId(identity.findings, "WEBEX-ID-01").evidence.organization).sort(), ["created", "displayName", "id"]);
 });
 
+test("WebexApiClient stops an endless rel=next chain at the page ceiling and reports truncated: true", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return jsonResponse({ items: [] }, { headers: { link: `<https://webexapis.com/v1/people?after=page${calls}>; rel="next"` } });
+  };
+  const capped = await new WebexApiClient(sampleConfig(), { fetchImpl, maxPages: 5 }).listPeople();
+  assert.deepEqual(capped, { items: [], truncated: true, pageCount: 5 });
+  assert.equal(calls, 5);
+
+  calls = 0;
+  const defaulted = await new WebexApiClient(sampleConfig(), { fetchImpl }).listRoles();
+  assert.equal(defaulted.truncated, true);
+  assert.equal(defaulted.pageCount, 1000);
+  assert.equal(calls, 1000);
+
+  calls = 0;
+  const finished = await new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ items: [{ id: "a" }] }), maxPages: 1 }).listRoles();
+  assert.deepEqual(finished, { items: [{ id: "a" }], truncated: false, pageCount: 1 });
+});
+
+test("evidence slices capped at 25 entries carry the matching total and scrubbed URLs", async () => {
+  const many = (count, build) => Array.from({ length: count }, (_, index) => build(index + 1));
+  const collaboration = await assessWebexCollaborationGovernance(compliantClient({
+    async listRooms() {
+      return page(many(30, (index) => ({ id: `room-${index}`, title: `Space ${index}`, type: "group" })));
+    },
+    async listWebhooks() {
+      return page(many(30, (index) => ({ id: `hook-${index}`, name: `Hook ${index}`, targetUrl: `http://example.com/hook${index}?token=FAKE-URL-TOKEN-${index}`, status: "active" })));
+    },
+  }));
+  const classification = byId(collaboration.findings, "WEBEX-COLLAB-04");
+  assert.equal(classification.status, "fail");
+  assert.equal(classification.evidence.rooms_without_classification.length, 25);
+  assert.equal(classification.evidence.rooms_without_classification_count, 30);
+  const webhooks = byId(collaboration.findings, "WEBEX-COLLAB-05");
+  assert.equal(webhooks.status, "fail");
+  assert.equal(webhooks.evidence.insecure_webhooks.length, 25);
+  assert.equal(webhooks.evidence.insecure_webhooks_count, 30);
+  assert.equal(webhooks.evidence.insecure_webhooks[0].target_url, "http://example.com/hook1");
+  assert.ok(!JSON.stringify(collaboration).includes("FAKE-URL-TOKEN"));
+
+  const meeting = await assessWebexMeetingHybridSecurity(compliantClient({
+    async listHybridConnectors() {
+      return page(many(30, (index) => ({ id: `conn-${index}`, type: "calendar", status: "impaired", created: "2026-01-01T00:00:00.000Z" })));
+    },
+  }));
+  const hybrid = byId(meeting.findings, "WEBEX-MTG-04");
+  assert.equal(hybrid.status, "fail");
+  assert.equal(hybrid.evidence.non_operational.length, 25);
+  assert.equal(hybrid.evidence.non_operational_count, 30);
+  const devices = byId(meeting.findings, "WEBEX-MTG-05");
+  assert.equal(devices.evidence.software_version_count, devices.evidence.software_versions.length);
+  assert.equal(devices.evidence.upgrade_channel_count, devices.evidence.upgrade_channels.length);
+  const identity = await assessWebexIdentity(compliantClient());
+  assert.equal(byId(identity.findings, "WEBEX-ID-03").evidence.compliance_officer_count, 1);
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-webex-path-");
   const outside = createTempBase("grclanker-webex-outside-");

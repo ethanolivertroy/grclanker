@@ -102,7 +102,9 @@ The script skips with exit code 0 when no `WEBEX_TOKEN`, refresh credential trio
 - `GET /rooms`, `GET /webhooks`, and `GET /meetings` list only what the authenticated identity can see; findings state this and downgrade to `warn` under a bot token.
 - `GET /people` returns 400 for non-admin tokens without a filter; that renders as manual, not empty.
 - `GET /admin/meeting/config/commonSettings` needs a site administrator with `meeting:admin_config_read`; `GET /guests/count` needs `guest-issuer:read`. A denied guest count is noted in WEBEX-ID-07 without blocking the people-based inventory.
-- Events older than 90 days require Pro Pack for Control Hub.- SARIF, CSV, and HTML reporters from the spec are out of scope for this pass.
+- Events older than 90 days require Pro Pack for Control Hub.
+- Pagination follows `Link rel="next"` for at most 1000 pages per listing; both the item limit and the page ceiling report `truncated: true`, and evidence lists capped at 25 or 50 entries carry a matching `*_count` total.
+- SARIF, CSV, and HTML reporters from the spec are out of scope for this pass.
 
 ## Endpoints
 
