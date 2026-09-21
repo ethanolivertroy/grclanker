@@ -609,6 +609,16 @@ test("session_shutdown tears down a staged runpod-pod session regardless of the 
   });
 });
 
+test("parseParallelsSnapshotId round-trips braced and bare ids verbatim", () => {
+  const uuid = "a1b2c3d4-0000-1111-2222-333344445555";
+  assert.equal(parseParallelsSnapshotId(`Snapshot {${uuid}} has been created`), `{${uuid}}`);
+  assert.equal(parseParallelsSnapshotId(`Snapshot ${uuid} has been created`), uuid);
+  assert.equal(parseParallelsSnapshotId(`ID: {${uuid.toUpperCase()}}`), `{${uuid.toUpperCase()}}`);
+  assert.equal(parseParallelsSnapshotId("Snapshot created: 0123456789abcdef and nothing else"), undefined);
+  assert.equal(parseParallelsSnapshotId(`prefix-${uuid}`), undefined, "a uuid glued to other hex is not an id");
+  assert.equal(parseParallelsSnapshotId(""), undefined);
+});
+
 test("runpod pod adapter removes the directory it created when scp fails", async () => {
   await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
     const { runner, calls } = createFakeRunner(async (executable) => (

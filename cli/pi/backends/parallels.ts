@@ -61,11 +61,15 @@ function formatFailure(action: string, result: CommandRunnerResult): ExecutionBa
   return new ExecutionBackendError(`${action}. ${detail || "Check Parallels Desktop and the guest configuration."}`);
 }
 
-// prlctl prints and accepts snapshot ids in braced form ({uuid}); `prlctl snapshot-list` output
-// and the `snapshot-switch <vm> --id <snapshot_id>` examples in the Parallels Desktop
-// command-line reference both use the braces, so the id is kept verbatim.
+// The adapter never synthesizes a snapshot id: it only round-trips the id that `prlctl snapshot`
+// printed back into `snapshot-switch --id`, in whatever form prlctl emitted it. The Parallels
+// command-line reference documents the flag but shows no concrete id form, so both the braced
+// form seen in practice ({uuid}) and a bare uuid are accepted and returned verbatim.
+const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+const SNAPSHOT_ID_PATTERN = new RegExp(`\\{${UUID_PATTERN}\\}|(?<![0-9a-fA-F-])${UUID_PATTERN}(?![0-9a-fA-F-])`);
+
 export function parseParallelsSnapshotId(output: string): string | undefined {
-  const match = /\{[0-9a-fA-F-]{8,}\}/.exec(output);
+  const match = SNAPSHOT_ID_PATTERN.exec(output);
   return match?.[0];
 }
 
