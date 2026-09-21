@@ -20,6 +20,7 @@ import {
   assessPanosThreatPrevention,
   assessPrismaCloudPosture,
   assessPrismaCompute,
+  buildComplianceMatrix,
   collectPrismaSnapshot,
   createInsecureFetch,
   PrismaComputeClient,
@@ -27,6 +28,7 @@ import {
   collectPanosSnapshot,
   createPaloaltoClients,
   exportPaloaltoAuditBundle,
+  isPrimaryFinding,
   parseXml,
   redactSecrets,
   resolvePaloaltoConfiguration,
@@ -203,14 +205,44 @@ function computeSnapshot(overrides = {}) {
     vulnerabilityImagePolicy: { rules: good ? [{ name: "block-critical", disabled: false, effect: "block" }] : [{ name: "alert", effect: "alert" }] },
     registrySettings: { specifications: good ? [{ registry: "registry.example.com", repository: "*", cap: 5, scanners: 2 }] : [] },
     registryScans: good ? [{ id: "sha256:1", scanTime: "2026-09-01T00:00:00Z" }] : [],
-    images: good ? [{ id: "sha256:2", scanTime: "2026-09-01T00:00:00Z", repoTag: { repo: "app" } }] : [],
-    vulnerabilityStats: good ? { criticalVulnerabilities: 0, highVulnerabilities: 3 } : { criticalVulnerabilities: 12 },
-    complianceStats: good ? { complianceRate: 97 } : {},
+    images: good
+      ? [{ id: "sha256:2", scanTime: "2026-09-01T00:00:00Z", repoTag: { repo: "app" }, vulnerabilityDistribution: { critical: 0, high: 2, medium: 4, low: 1, total: 7 } }]
+      : [],
+    vulnerabilityStats: good ? documentedVulnerabilityStats({ critical: 0, high: 3 }) : documentedVulnerabilityStats({ critical: 12, high: 30 }),
+    complianceStats: good ? documentedComplianceStats({ failed: 3, total: 100 }) : documentedComplianceStats({ failed: 0, total: 0 }),
     cloudDiscovery: good ? [{ provider: "aws", serviceType: "eks", total: 3, defended: 3 }] : [],
     ciScans: good ? [{ time: "2026-09-01T00:00:00Z", pass: true }] : [],
     failed: overrides.failed ?? [],
     truncated: overrides.truncated ?? [],
     errors: overrides.errors ?? [],
+  };
+}
+
+function documentedVulnerabilityStats({ critical, high }) {
+  const resource = (count, criticalShare, highShare) => ({
+    count,
+    cves: { critical: criticalShare, high: highShare, medium: 5, low: 2, total: criticalShare + highShare + 7 },
+    impacted: { critical: criticalShare, high: highShare, medium: 3, low: 1, total: criticalShare + highShare + 4 },
+    vulnerabilities: [],
+  });
+  return [{
+    _id: "stats",
+    modified: "2026-09-01T00:00:00Z",
+    images: resource(40, critical, high),
+    registryImages: resource(10, 0, 0),
+    containers: resource(12, 0, 0),
+    hosts: resource(3, 0, 0),
+    functions: resource(0, 0, 0),
+  }];
+}
+
+function documentedComplianceStats({ failed, total }) {
+  return {
+    categories: [{ name: "CIS", failed, total }],
+    daily: [{ _id: "2026-09-01", distribution: { critical: 0, high: failed, medium: 0, low: 0, total: failed }, modified: "2026-09-01T00:00:00Z" }],
+    ids: [{ id: 41, benchmarkID: "CIS_Docker_v1.6.0", failed, total, severity: "high", type: "container" }],
+    rules: [{ name: "cis-hosts", policyType: "hostCompliance", failed, total }],
+    templates: [{ name: "CIS", failed, total }],
   };
 }
 
@@ -461,7 +493,7 @@ function mockedFetch(options = {}) {
       if (url.pathname === "/cloud") return partial ? jsonResponse({ message: "role cannot read accounts" }, { status: 403 }) : jsonResponse(prismaSnapshot().cloudAccounts);
       if (url.pathname === "/cloud/group") return jsonResponse(prismaSnapshot().accountGroups);
       if (url.pathname === "/user/role") return jsonResponse(prismaSnapshot().userRoles);
-      if (url.pathname === "/integration") {
+      if (url.pathname === "/integration" || url.pathname === "/api/v1/tenant/tenant-1/integration") {
         return options.integrationsDenied ? jsonResponse([], { status: 403 }) : jsonResponse(prismaSnapshot().integrations);
       }
       return jsonResponse({}, { status: 404 });
@@ -827,7 +859,9 @@ test("rule 1: unreadable, forbidden, or errored evidence yields manual, never pa
 
   const compute = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ failed: ["defenders"] }) }));
   assert.equal(byId(compute, "PA-10").status, "manual");
-  assert.equal(byId(compute, "PA-09").status, "pass");
+  assert.equal(byId(compute, "PA-09").status, "manual");
+  assert.equal(byId(compute, "PA-08").status, "manual");
+  assert.equal(byId(compute, "PA-11").status, "pass");
 
   const failedVsys = assessPanosFirewallPolicy([panosSnapshot({ failedXpaths: ["/config/devices/entry/vsys"] })]);
   assert.ok(failedVsys.every((item) => item.status === "manual"), failedVsys.map((item) => `${item.id}:${item.status}`).join(","));
@@ -1054,4 +1088,160 @@ test("false-pass self-check (c): partial inventories never pass", async () => {
   assert.equal(byId(findings, "PA-10").status, "manual");
   assert.equal(byId(findings, "PA-12").status, "manual");
   assert.match(byId(findings, "PA-12").summary, /fw2.example.com unreachable/);
+});
+
+test("review fix 1: PA-07 parses the documented /stats/vulnerabilities array and fails above the CVE threshold", () => {
+  const above = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({}) }));
+  assert.equal(byId(above, "PA-07").status, "pass");
+  assert.equal(byId(above, "PA-07").evidence.critical_cves, 0);
+  assert.equal(byId(above, "PA-07").evidence.high_cves, 3);
+  assert.equal(byId(above, "PA-07").evidence.cve_stats_by_resource.images.count, 40);
+  assert.match(byId(above, "PA-07").summary, /0 critical and 3 high CVEs/);
+
+  const hot = computeSnapshot({});
+  hot.vulnerabilityStats = documentedVulnerabilityStats({ critical: 4, high: 9 });
+  const failing = byId(assessPrismaCompute(prismaSnapshot({ compute: hot })), "PA-07");
+  assert.equal(failing.status, "fail");
+  assert.equal(failing.evidence.critical_cves, 4);
+  assert.match(failing.summary, /4 critical CVEs remain/);
+
+  const imageOnly = computeSnapshot({});
+  imageOnly.vulnerabilityStats = [];
+  imageOnly.images = [{ id: "sha256:9", scanTime: "2026-09-01T00:00:00Z", vulnerabilityDistribution: { critical: 2, high: 1, medium: 0, low: 0, total: 3 } }];
+  const fromImages = byId(assessPrismaCompute(prismaSnapshot({ compute: imageOnly })), "PA-07");
+  assert.equal(fromImages.status, "fail");
+  assert.equal(fromImages.evidence.cve_stats_source, "image vulnerabilityDistribution");
+
+  const stricter = computeSnapshot({});
+  stricter.images = [{ id: "sha256:9", scanTime: "2026-09-01T00:00:00Z", vulnerabilityDistribution: { critical: 1, high: 0, medium: 0, low: 0, total: 1 } }];
+  assert.equal(byId(assessPrismaCompute(prismaSnapshot({ compute: stricter })), "PA-07").status, "fail");
+
+  const legacyObject = computeSnapshot({});
+  legacyObject.vulnerabilityStats = [];
+  legacyObject.images = [{ id: "sha256:9", scanTime: "2026-09-01T00:00:00Z" }];
+  const unknown = byId(assessPrismaCompute(prismaSnapshot({ compute: legacyObject })), "PA-07");
+  assert.equal(unknown.status, "warn");
+  assert.equal(unknown.evidence.critical_cves, null);
+});
+
+test("review fix 2: PA-08 derives the compliance rate from documented rules[] or categories[] failed versus total", () => {
+  const healthy = byId(assessPrismaCompute(prismaSnapshot()), "PA-08");
+  assert.equal(healthy.status, "pass");
+  assert.equal(healthy.evidence.compliance_rate, 97);
+  assert.equal(healthy.evidence.compliance_source, "rules[] failed versus total");
+  assert.match(healthy.summary, /3 failed of 100 compliance evaluations/);
+
+  const below = computeSnapshot({});
+  below.complianceStats = documentedComplianceStats({ failed: 15, total: 100 });
+  const failing = byId(assessPrismaCompute(prismaSnapshot({ compute: below })), "PA-08");
+  assert.equal(failing.status, "fail");
+  assert.equal(failing.evidence.compliance_rate, 85);
+
+  const categoriesOnly = computeSnapshot({});
+  categoriesOnly.complianceStats = { categories: [{ name: "CIS", failed: 2, total: 50 }, { name: "PCI", failed: 0, total: 50 }], rules: [], daily: [], ids: [], templates: [] };
+  const fromCategories = byId(assessPrismaCompute(prismaSnapshot({ compute: categoriesOnly })), "PA-08");
+  assert.equal(fromCategories.status, "pass");
+  assert.equal(fromCategories.evidence.compliance_rate, 98);
+  assert.equal(fromCategories.evidence.compliance_source, "categories[] failed versus total");
+
+  const legacy = computeSnapshot({});
+  legacy.complianceStats = { complianceRate: 99 };
+  const noEvaluations = byId(assessPrismaCompute(prismaSnapshot({ compute: legacy })), "PA-08");
+  assert.equal(noEvaluations.status, "warn");
+  assert.equal(noEvaluations.evidence.compliance_rate, null);
+  assert.match(noEvaluations.summary, /zero evaluations/);
+});
+
+test("review fix 3: PA-08 and PA-09 gate on the Defender population and never pass when defenders are unreadable or absent", () => {
+  const defendersForbidden = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ failed: ["defenders"], errors: ["GET /api/v1/defenders returned 403"] }) }));
+  assert.equal(byId(defendersForbidden, "PA-09").status, "manual");
+  assert.match(byId(defendersForbidden, "PA-09").summary, /defenders/);
+  assert.equal(byId(defendersForbidden, "PA-08").status, "manual");
+  assert.equal(byId(defendersForbidden, "PA-10").status, "manual");
+
+  const noDefenders = computeSnapshot({});
+  noDefenders.defenders = [];
+  const none = assessPrismaCompute(prismaSnapshot({ compute: noDefenders }));
+  assert.equal(byId(none, "PA-09").status, "fail");
+  assert.match(byId(none, "PA-09").summary, /no Defender reports connected=true/);
+  assert.equal(byId(none, "PA-08").status, "fail");
+  assert.match(byId(none, "PA-08").summary, /no Defender reports connected=true/);
+
+  const disconnected = computeSnapshot({});
+  disconnected.defenders = [{ hostname: "node-3", connected: false, version: "34.00.100" }];
+  const offline = assessPrismaCompute(prismaSnapshot({ compute: disconnected }));
+  assert.equal(byId(offline, "PA-09").status, "fail");
+  assert.equal(byId(offline, "PA-09").evidence.connected_defenders, 0);
+});
+
+test("review fix 4: integrations are read from the tenant-scoped microservice path when login returns a prismaId", async () => {
+  const calls = [];
+  const client = new PrismaCloudClient(
+    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: "secret" },
+    {
+      fetchImpl: async (input) => {
+        const url = new URL(input);
+        calls.push(url.pathname);
+        if (url.pathname === "/login") return jsonResponse({ token: "jwt", customerNames: [{ customerName: "acme", prismaId: "tenant-1", tosAccepted: true }] });
+        if (url.pathname === "/api/v1/tenant/tenant-1/integration") return jsonResponse([{ name: "siem", integrationType: "splunk", enabled: true }]);
+        return jsonResponse({ message: "unexpected path" }, { status: 404 });
+      },
+      sleep: noSleep,
+    },
+  );
+  const integrations = await client.listIntegrations();
+  assert.equal(client.tenantPrismaId, "tenant-1");
+  assert.deepEqual(integrations.map((item) => item.integrationType), ["splunk"]);
+  assert.ok(calls.includes("/api/v1/tenant/tenant-1/integration"));
+  assert.ok(!calls.includes("/integration"));
+
+  const fallback = new PrismaCloudClient(
+    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: "secret" },
+    {
+      fetchImpl: async (input) => {
+        const url = new URL(input);
+        if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
+        if (url.pathname === "/integration") return jsonResponse([{ name: "okta", integrationType: "okta" }]);
+        return jsonResponse({}, { status: 404 });
+      },
+      sleep: noSleep,
+    },
+  );
+  assert.deepEqual((await fallback.listIntegrations()).map((item) => item.name), ["okta"]);
+  assert.equal(fallback.tenantPrismaId, undefined);
+});
+
+test("review fix 5: PA-SW-01 maps to control 23 and the unified matrix has exactly one row per numbered control", async () => {
+  const hardening = assessPanosDeviceHardening([panosSnapshot()]);
+  const software = byId(hardening, "PA-SW-01");
+  assert.equal(software.control, 23);
+  assert.ok(software.mappings.some((mapping) => mapping.startsWith("FedRAMP ") && /CM-6/.test(mapping)));
+  assert.ok(!software.mappings.some((mapping) => /RA-5|SI-2/.test(mapping)));
+  assert.equal(byId(hardening, "PA-HA-01").control, 23);
+
+  const all = [
+    ...(await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mockedFetch()))).findings,
+    ...(await assessPaloaltoFirewallPolicy(createPaloaltoClients(bothProductsConfig(), mockedFetch()))).findings,
+    ...(await assessPaloaltoThreatPrevention(createPaloaltoClients(bothProductsConfig(), mockedFetch()))).findings,
+    ...(await assessPaloaltoDeviceHardening(createPaloaltoClients(bothProductsConfig(), mockedFetch()))).findings,
+  ];
+  const primary = all.filter(isPrimaryFinding);
+  assert.equal(primary.length, 25);
+  assert.deepEqual([...new Set(primary.map((item) => item.control))].sort((a, b) => a - b), Array.from({ length: 25 }, (_, index) => index + 1));
+
+  const matrix = buildComplianceMatrix(all);
+  const [primarySection, supplementarySection] = matrix.split("## Supplementary findings");
+  const controlColumn = (section) => section
+    .split("\n")
+    .filter((line) => /^\| PA-/.test(line))
+    .map((line) => line.split("|").map((cell) => cell.trim()));
+  const primaryRows = controlColumn(primarySection);
+  assert.equal(primaryRows.length, 25);
+  const controls = primaryRows.map((cells) => Number(cells[2]));
+  assert.deepEqual(controls, Array.from({ length: 25 }, (_, index) => index + 1));
+  assert.equal(new Set(controls).size, 25);
+  assert.equal(controls.filter((control) => control === 7).length, 1);
+  const supplementaryRows = controlColumn(supplementarySection);
+  assert.deepEqual(supplementaryRows.map((cells) => cells[1]).sort(), ["PA-HA-01", "PA-SW-01"]);
+  assert.ok(supplementaryRows.every((cells) => cells[2] === "23"));
 });

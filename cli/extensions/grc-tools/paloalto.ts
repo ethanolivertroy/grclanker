@@ -34,6 +34,7 @@ const DEFAULT_ALERT_PAGE_SIZE = 100;
 const DEFAULT_COMPUTE_PAGE_SIZE = 50;
 const DEFAULT_COMPUTE_LIMIT = 500;
 const DEFAULT_MAX_CRITICAL_CVES = 0;
+const DEFAULT_MIN_HOST_COMPLIANCE_RATE = 90;
 const DEFAULT_MAX_SUPERUSERS = 3;
 const DEFAULT_MIN_COMPLIANCE_PASS_RATE = 90;
 const PRISMA_TOKEN_TTL_MS = 9 * 60 * 1000;
@@ -149,7 +150,7 @@ export interface ComputeSnapshot {
   registrySettings: JsonRecord;
   registryScans: JsonRecord[];
   images: JsonRecord[];
-  vulnerabilityStats: JsonRecord;
+  vulnerabilityStats: JsonRecord[];
   complianceStats: JsonRecord;
   cloudDiscovery: JsonRecord[];
   ciScans: JsonRecord[];
@@ -814,6 +815,7 @@ export class PrismaCloudClient {
   private readonly http: HttpOptions;
   private token?: string;
   private tokenExpiresAt = 0;
+  private prismaId?: string;
   private tokenPromise?: Promise<string>;
 
   constructor(
@@ -844,8 +846,10 @@ export class PrismaCloudClient {
     if (!response.ok) {
       throw new Error(redactSecrets(`Prisma Cloud login failed (${response.status}): ${prismaErrorSummary(response, rawText)}`, this.http.secrets));
     }
-    const token = asString(asObject(JSON.parse(rawText))?.token);
+    const payload = asObject(JSON.parse(rawText));
+    const token = asString(payload?.token);
     if (!token) throw new Error("Prisma Cloud login response did not include a token.");
+    this.prismaId = asString(asRecords(payload?.customerNames)[0]?.prismaId) ?? this.prismaId;
     this.token = token;
     this.tokenExpiresAt = Date.now() + PRISMA_TOKEN_TTL_MS;
     return token;
@@ -959,8 +963,20 @@ export class PrismaCloudClient {
     return asRecords(await this.get("/user/role"));
   }
 
+  /**
+   * Push integrations (Splunk, SQS, webhook, ServiceNow, and so on) live under
+   * the tenant-scoped microservice path; GET /integration only returns the
+   * Okta, Qualys, and Tenable pull integrations. The prismaId comes from the
+   * login response customerNames[] entry.
+   */
   async listIntegrations(): Promise<JsonRecord[]> {
+    await this.getToken();
+    if (this.prismaId) return asRecords(await this.get(`/api/v1/tenant/${encodeURIComponent(this.prismaId)}/integration`));
     return asRecords(await this.get("/integration"));
+  }
+
+  get tenantPrismaId(): string | undefined {
+    return this.prismaId;
   }
 }
 
@@ -1072,8 +1088,8 @@ export class PrismaComputeClient {
     return this.listPaged("/images", limit);
   }
 
-  async getVulnerabilityStats(): Promise<JsonRecord> {
-    return asObject(await this.get("/stats/vulnerabilities")) ?? {};
+  async getVulnerabilityStats(): Promise<JsonRecord[]> {
+    return asRecords(await this.get("/stats/vulnerabilities"));
   }
 
   async getComplianceStats(): Promise<JsonRecord> {
@@ -1291,7 +1307,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
   const registrySettings = await guard("registry settings", {} as JsonRecord, () => client.getRegistrySettings());
   const registryScans = await paged("registry scans", () => client.listRegistryScans());
   const images = await paged("images", () => client.listImages());
-  const vulnerabilityStats = await guard("vulnerability stats", {} as JsonRecord, () => client.getVulnerabilityStats());
+  const vulnerabilityStats = await guard("vulnerability stats", [] as JsonRecord[], () => client.getVulnerabilityStats());
   const complianceStats = await guard("compliance stats", {} as JsonRecord, () => client.getComplianceStats());
   const cloudDiscovery = await paged("cloud discovery", () => client.listCloudDiscovery());
   const ciScans = await paged("ci scans", () => client.listCiScans());
@@ -1691,6 +1707,86 @@ function ruleEffect(rule: JsonRecord): string {
   return (asString(rule.effect) ?? asString(asObject(rule.processes)?.effect) ?? "").toLowerCase();
 }
 
+const VULNERABILITY_RESOURCE_KEYS = ["images", "registryImages", "containers", "hosts", "functions"];
+
+/**
+ * Aggregates the documented /stats/vulnerabilities shape: an array of
+ * types.VulnerabilityStats whose images, registryImages, containers, hosts,
+ * and functions members carry a cves distribution (critical, high, medium,
+ * low, total). Image scan results contribute vulnerabilityDistribution as a
+ * second source; the stricter of the two drives the verdict.
+ */
+function summarizeVulnerabilityStats(stats: JsonRecord[], images: JsonRecord[]): { critical?: number; high?: number; source: string; byResource: JsonRecord } {
+  const byResource: JsonRecord = {};
+  let statsCritical: number | undefined;
+  let statsHigh: number | undefined;
+  for (const entry of stats) {
+    for (const key of VULNERABILITY_RESOURCE_KEYS) {
+      const resource = asObject(entry[key]);
+      const cves = asObject(resource?.cves);
+      if (!resource || !cves) continue;
+      const critical = asNumber(cves.critical);
+      const high = asNumber(cves.high);
+      byResource[key] = {
+        count: asNumber(resource.count) ?? null,
+        critical: critical ?? null,
+        high: high ?? null,
+        impacted_critical: asNumber(asObject(resource.impacted)?.critical) ?? null,
+      };
+      if (critical !== undefined) statsCritical = (statsCritical ?? 0) + critical;
+      if (high !== undefined) statsHigh = (statsHigh ?? 0) + high;
+    }
+  }
+  let imageCritical: number | undefined;
+  let imageHigh: number | undefined;
+  for (const image of images) {
+    const distribution = asObject(image.vulnerabilityDistribution);
+    if (!distribution) continue;
+    const critical = asNumber(distribution.critical);
+    const high = asNumber(distribution.high);
+    if (critical !== undefined) imageCritical = (imageCritical ?? 0) + critical;
+    if (high !== undefined) imageHigh = (imageHigh ?? 0) + high;
+  }
+  const pick = (a: number | undefined, b: number | undefined): number | undefined => (a === undefined ? b : b === undefined ? a : Math.max(a, b));
+  const source = statsCritical !== undefined && imageCritical !== undefined
+    ? "stats/vulnerabilities cves plus image vulnerabilityDistribution, stricter value used"
+    : statsCritical !== undefined
+      ? "stats/vulnerabilities cves distribution"
+      : imageCritical !== undefined
+        ? "image vulnerabilityDistribution"
+        : "no severity distribution available";
+  return { critical: pick(statsCritical, imageCritical), high: pick(statsHigh, imageHigh), source, byResource };
+}
+
+/**
+ * Derives a compliance rate from the documented types.ComplianceStats shape:
+ * rules[] (preferred) or categories[] entries carrying failed and total.
+ */
+function summarizeComplianceStats(stats: JsonRecord): { rate?: number; failed: number; total: number; source: string; worst: string[] } {
+  const rules = asRecords(stats.rules);
+  const categories = asRecords(stats.categories);
+  const source = rules.some((rule) => asNumber(rule.total) !== undefined) ? "rules" : "categories";
+  const entries = source === "rules" ? rules : categories;
+  let failed = 0;
+  let total = 0;
+  for (const entry of entries) {
+    failed += asNumber(entry.failed) ?? 0;
+    total += asNumber(entry.total) ?? 0;
+  }
+  const worst = entries
+    .filter((entry) => (asNumber(entry.total) ?? 0) > 0)
+    .sort((a, b) => ((asNumber(b.failed) ?? 0) / (asNumber(b.total) ?? 1)) - ((asNumber(a.failed) ?? 0) / (asNumber(a.total) ?? 1)))
+    .slice(0, 10)
+    .map((entry) => `${asString(entry.name) ?? "unnamed"}: ${asNumber(entry.failed) ?? 0}/${asNumber(entry.total) ?? 0} failed`);
+  return {
+    rate: total > 0 ? Math.round(((total - Math.min(failed, total)) / total) * 1000) / 10 : undefined,
+    failed,
+    total,
+    source: total > 0 ? `${source}[] failed versus total` : "no evaluations recorded",
+    worst,
+  };
+}
+
 function computeManual(control: number, severity: PaloaltoSeverity, reason: string): PaloaltoFinding {
   const item = CWPP_EVIDENCE.find((entry) => entry.control === control);
   return manualFinding(control, severity, item?.instruction ?? "export the corresponding Prisma Cloud Compute console page.", reason);
@@ -1707,8 +1803,9 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
 
   const vulnPolicyRules = enabledPolicyRules(compute.vulnerabilityImagePolicy);
   const blockingRules = vulnPolicyRules.filter((rule) => ruleEffect(rule).includes("block") || ruleEffect(rule).includes("prevent"));
-  const criticalCves = asNumber(asObject(compute.vulnerabilityStats.criticalVulnerabilities ?? compute.vulnerabilityStats)?.critical) ?? asNumber(compute.vulnerabilityStats.criticalVulnerabilities) ?? asNumber(compute.vulnerabilityStats.critical);
-  const highCves = asNumber(compute.vulnerabilityStats.highVulnerabilities) ?? asNumber(compute.vulnerabilityStats.high);
+  const cveStats = summarizeVulnerabilityStats(compute.vulnerabilityStats, compute.images);
+  const criticalCves = cveStats.critical;
+  const highCves = cveStats.high;
   const imagesWithoutScanTime = compute.images.filter((image) => !asString(image.scanTime));
   findings.push(gate(finding(
     7,
@@ -1731,8 +1828,8 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
             : imagesWithoutScanTime.length > 0
               ? `${imagesWithoutScanTime.length} of ${compute.images.length} images have no scanTime and cannot be counted as freshly scanned.`
               : criticalCves === undefined
-                ? "Vulnerability stats did not expose critical CVE counts, so the environment-wide CVE exposure is unknown."
-                : `${blockingRules.length} blocking image vulnerability rules enforce thresholds; ${compute.images.length} scanned images, ${criticalCves} critical and ${highCves ?? "unknown"} high CVEs reported.`,
+                ? "Neither /stats/vulnerabilities nor the image scan results exposed severity distributions, so the environment-wide CVE exposure is unknown."
+                : `${blockingRules.length} blocking image vulnerability rules enforce thresholds; ${compute.images.length} scanned images, ${criticalCves} critical and ${highCves ?? "unknown"} high CVEs reported (${cveStats.source}).`,
     {
       vulnerability_rules_enabled: vulnPolicyRules.length,
       blocking_rules: blockingRules.map((rule) => asString(rule.name)).slice(0, 25),
@@ -1740,25 +1837,50 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       images_without_scan_time: imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25),
       critical_cves: criticalCves ?? null,
       high_cves: highCves ?? null,
+      cve_stats_by_resource: cveStats.byResource,
+      cve_stats_source: cveStats.source,
     },
   ), computeGate(compute, ["vulnerability image policy", "images", "vulnerability stats"]), CWPP_EVIDENCE[0].instruction));
 
   const hostRules = enabledPolicyRules(compute.complianceHostPolicy);
   const containerRules = enabledPolicyRules(compute.complianceContainerPolicy);
-  const complianceRate = asNumber(compute.complianceStats.complianceRate) ?? asNumber(asObject(compute.complianceStats.summary)?.complianceRate);
+  const compliance = summarizeComplianceStats(compute.complianceStats);
+  const complianceRate = compliance.rate;
+  const connectedDefenders = compute.defenders.filter((defender) => asBoolean(defender.connected) === true).length;
   findings.push(gate(finding(
     8,
     "medium",
-    hostRules.length === 0 && containerRules.length === 0 ? "fail" : hostRules.length === 0 ? "fail" : complianceRate === undefined ? "warn" : complianceRate < 90 ? "fail" : "pass",
+    hostRules.length === 0 && containerRules.length === 0
+      ? "fail"
+      : hostRules.length === 0
+        ? "fail"
+        : connectedDefenders === 0
+          ? "fail"
+          : complianceRate === undefined
+            ? "warn"
+            : complianceRate < DEFAULT_MIN_HOST_COMPLIANCE_RATE
+              ? "fail"
+              : "pass",
     hostRules.length === 0 && containerRules.length === 0
       ? "Zero enabled host or container compliance rules were returned; emptiness is treated as fail because CIS benchmarks are not being evaluated."
       : hostRules.length === 0
         ? `${containerRules.length} container compliance rules are enabled but no host compliance rule is, so host CIS benchmarks are not evaluated.`
-        : complianceRate === undefined
-          ? `${hostRules.length} host and ${containerRules.length} container compliance rules are enabled, but compliance stats returned no complianceRate; treated as warn.`
-          : `${hostRules.length} host and ${containerRules.length} container compliance rules enabled; overall compliance rate ${complianceRate}%.`,
-    { host_rules_enabled: hostRules.length, container_rules_enabled: containerRules.length, compliance_rate: complianceRate ?? null },
-  ), computeGate(compute, ["compliance host policy", "compliance container policy", "compliance stats"]), CWPP_EVIDENCE[1].instruction));
+        : connectedDefenders === 0
+          ? `${hostRules.length} host compliance rules are enabled but no Defender reports connected=true, so no host is actually being evaluated.`
+          : complianceRate === undefined
+            ? `${hostRules.length} host and ${containerRules.length} container compliance rules are enabled, but /stats/compliance recorded zero evaluations in rules[] and categories[], so no compliance rate can be derived; treated as warn.`
+            : `${hostRules.length} host and ${containerRules.length} container compliance rules enabled across ${connectedDefenders} connected Defenders; ${compliance.failed} failed of ${compliance.total} compliance evaluations (${compliance.source}) gives a ${complianceRate}% compliance rate (threshold ${DEFAULT_MIN_HOST_COMPLIANCE_RATE}%).`,
+    {
+      host_rules_enabled: hostRules.length,
+      container_rules_enabled: containerRules.length,
+      connected_defenders: connectedDefenders,
+      compliance_rate: complianceRate ?? null,
+      compliance_failed: compliance.failed,
+      compliance_total: compliance.total,
+      compliance_source: compliance.source,
+      worst_rules: compliance.worst,
+    },
+  ), computeGate(compute, ["compliance host policy", "compliance container policy", "compliance stats", "defenders"]), CWPP_EVIDENCE[1].instruction));
 
   const runtimeRules = enabledPolicyRules(compute.runtimeContainerPolicy);
   const protectiveRules = runtimeRules.filter((rule) => {
@@ -1766,17 +1888,20 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
     return effects.some((effect) => effect === "prevent" || effect === "block");
   });
   const alertOnlyRules = runtimeRules.filter((rule) => !protectiveRules.includes(rule));
+  const runtimeDefenders = compute.defenders.filter((defender) => asBoolean(defender.connected) === true).length;
   findings.push(gate(finding(
     9,
     "high",
-    runtimeRules.length === 0 ? "fail" : protectiveRules.length === 0 ? "warn" : "pass",
+    runtimeRules.length === 0 ? "fail" : protectiveRules.length === 0 ? "warn" : runtimeDefenders === 0 ? "fail" : "pass",
     runtimeRules.length === 0
       ? "Zero enabled container runtime rules were returned; emptiness is treated as fail because Defenders have no runtime policy to enforce."
       : protectiveRules.length === 0
         ? `${runtimeRules.length} container runtime rules are enabled but every process, network, file system, and DNS effect is alert or disable, so nothing is prevented.`
-        : `${protectiveRules.length} of ${runtimeRules.length} enabled container runtime rules prevent or block at least one behavior class (${alertOnlyRules.length} alert-only).`,
-    { runtime_rules_enabled: runtimeRules.length, protective_rules: protectiveRules.map((rule) => asString(rule.name)).slice(0, 25), alert_only_rules: alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25) },
-  ), computeGate(compute, ["runtime container policy"]), CWPP_EVIDENCE[2].instruction));
+        : runtimeDefenders === 0
+          ? `${protectiveRules.length} preventive runtime rules exist but no Defender reports connected=true, so nothing enforces them.`
+          : `${protectiveRules.length} of ${runtimeRules.length} enabled container runtime rules prevent or block at least one behavior class (${alertOnlyRules.length} alert-only), enforced by ${runtimeDefenders} connected Defenders.`,
+    { runtime_rules_enabled: runtimeRules.length, connected_defenders: runtimeDefenders, protective_rules: protectiveRules.map((rule) => asString(rule.name)).slice(0, 25), alert_only_rules: alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25) },
+  ), computeGate(compute, ["runtime container policy", "defenders"]), CWPP_EVIDENCE[2].instruction));
 
   const connected = compute.defenders.filter((defender) => asBoolean(defender.connected) === true);
   const disconnected = compute.defenders.filter((defender) => asBoolean(defender.connected) !== true);
@@ -2467,7 +2592,7 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
   const withoutVersion = versions.filter((item) => !item.sw_version);
   findings.push({
     id: "PA-SW-01",
-    control: 7,
+    control: 23,
     title: "Software and content versions",
     severity: "high",
     status: versions.length === 0 || unreadableInfo.length > 0 ? "manual" : legacy.length > 0 ? "fail" : missingContent.length > 0 || withoutVersion.length > 0 ? "warn" : "pass",
@@ -2475,7 +2600,7 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
       ? `System information was not readable from ${unreadableInfo.map((snapshot) => snapshot.host).join(", ") || "any device"}. Manual evidence required: export show system info for each device.`
       : `${legacy.length} devices run PAN-OS 9.x or older; ${missingContent.length} devices lack installed antivirus or threat content; ${withoutVersion.length} report no sw-version (not counted as current). Content release dates are not exposed by show system info, so freshness must be confirmed against Device > Dynamic Updates.`,
     evidence: { devices: versions },
-    mappings: controlMappings(7),
+    mappings: controlMappings(23),
   });
 
   return findings;
@@ -2516,7 +2641,7 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
       await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", "GET /cloud", () => prisma.listCloudAccounts(), arrayCount),
       await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", "GET /cloud/group", () => prisma.listAccountGroups(), arrayCount),
       await readableSurface("prisma-cloud", prisma.apiUrl, "user_roles", "GET /user/role", () => prisma.listUserRoles(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", "GET /integration", () => prisma.listIntegrations(), arrayCount),
+      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", "GET /api/v1/tenant/{prismaId}/integration", () => prisma.listIntegrations(), arrayCount),
     );
     const compute = await resolveComputeClient(clients);
     if (compute) {
@@ -2528,7 +2653,7 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
         await readableSurface("prisma-compute", compute.baseUrl, "compliance_policies", "GET /api/v1/policies/compliance/{container,host}", async () => [await compute.getComplianceContainerPolicy(), await compute.getComplianceHostPolicy()], () => 2),
         await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_image_policy", "GET /api/v1/policies/vulnerability/images", () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
         await readableSurface("prisma-compute", compute.baseUrl, "registry_settings", "GET /api/v1/settings/registry", () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", "GET /api/v1/stats/vulnerabilities", () => compute.getVulnerabilityStats(), () => 1),
+        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", "GET /api/v1/stats/vulnerabilities", () => compute.getVulnerabilityStats(), arrayCount),
         await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", "GET /api/v1/cloud/discovery", () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), (value) => (value as { items: unknown[] }).items.length),
         await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", "GET /api/v1/scans", () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), (value) => (value as { items: unknown[] }).items.length),
       );
@@ -2755,20 +2880,47 @@ function buildExecutiveSummary(config: PaloaltoResolvedConfig, assessments: Palo
   ].join("\n");
 }
 
-function buildComplianceMatrix(findings: PaloaltoFinding[]): string {
-  const rows = findings.map((item) => [
+const PRIMARY_FINDING_ID = /^PA-\d\d$/;
+
+export function isPrimaryFinding(item: PaloaltoFinding): boolean {
+  return PRIMARY_FINDING_ID.test(item.id);
+}
+
+function matrixRow(item: PaloaltoFinding): string[] {
+  return [
     item.id,
     String(item.control),
     item.status.toUpperCase(),
     ...FRAMEWORK_ORDER.map((framework) =>
       item.mappings.filter((mapping) => mapping.startsWith(`${framework} `)).map((mapping) => mapping.slice(framework.length + 1)).join(", ") || "-"),
-  ]);
+  ];
+}
+
+export function buildComplianceMatrix(findings: PaloaltoFinding[]): string {
+  const primary = new Map<number, PaloaltoFinding>();
+  for (const item of findings) {
+    if (isPrimaryFinding(item) && !primary.has(item.control)) primary.set(item.control, item);
+  }
+  const primaryRows = [...primary.values()].sort((a, b) => a.control - b.control).map(matrixRow);
+  const supplementary = findings.filter((item) => !isPrimaryFinding(item));
+  const header = [
+    `| Finding | Control | Status | ${FRAMEWORK_ORDER.join(" | ")} |`,
+    `|${"---|".repeat(FRAMEWORK_ORDER.length + 3)}`,
+  ];
   return [
     "# Unified Compliance Matrix",
     "",
-    `| Finding | Control | Status | ${FRAMEWORK_ORDER.join(" | ")} |`,
-    `|${"---|".repeat(FRAMEWORK_ORDER.length + 3)}`,
-    ...rows.map((row) => `| ${row.join(" | ")} |`),
+    `One row per numbered spec control (${primaryRows.length} of ${PALOALTO_CONTROLS.length}).`,
+    "",
+    ...header,
+    ...primaryRows.map((row) => `| ${row.join(" | ")} |`),
+    "",
+    "## Supplementary findings",
+    "",
+    "Additional evidence rows that share a numbered control and are excluded from the per-control matrix above.",
+    "",
+    ...header,
+    ...supplementary.map((item) => `| ${matrixRow(item).join(" | ")} |`),
   ].join("\n");
 }
 
