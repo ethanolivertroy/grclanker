@@ -56,6 +56,7 @@ import {
   ExecutionBackendTimeoutError,
   REDACTING_SINK_MAX_HELD_CHARS,
   redactSecrets,
+  redactUnterminatedPemBlocks,
 } from "../dist/pi/execution-backend.js";
 import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
 import { quoteForBash } from "../dist/pi/shell.js";
@@ -818,6 +819,7 @@ test("redacting sink catches a secret split across streamed chunks", () => {
 
 const FAKE_PEM_BODY = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW", "QyNTUxOQAAACBmYWtlIGtleSBib2R5IGZvciB0ZXN0cyBvbmx5AAAAAAAAAAAAAAAAAAA"];
 const FAKE_PEM = `-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY.join("\n")}\n-----END OPENSSH PRIVATE KEY-----\n`;
+const UNTERMINATED_PEM = "[REDACTED PRIVATE KEY: unterminated block, body withheld]";
 
 // Chunking strategies a producer can exhibit: one write, a line-flushing script or tty, and a
 // byte-at-a-time trickle (which also splits multi-byte characters).
@@ -858,33 +860,80 @@ test("redacting sink never flushes through an open PEM block under any chunking"
   sink.end();
   assert.equal(chunks.join(""), "before\n./notes.md:[REDACTED PRIVATE KEY]\nafter\n");
 
-  // A closed block followed by an open one: the closed block is redacted, the open one held.
+  // A closed block followed by an open one: the closed block is redacted, the open one held and
+  // then withheld at end() together with its body.
   const two = collectSink(`${FAKE_PEM}-----BEGIN RSA PRIVATE KEY-----\n${FAKE_PEM_BODY[0]}\n`, CHUNKERS["per-line"]);
   assert.equal(two.beforeEnd, "[REDACTED PRIVATE KEY]\n");
-  assert.equal(two.joined, `[REDACTED PRIVATE KEY]\n[REDACTED PRIVATE KEY]\n${FAKE_PEM_BODY[0]}\n`);
+  assert.equal(two.joined, `[REDACTED PRIVATE KEY]\n${UNTERMINATED_PEM}\n`);
+
+  // END arriving in the same chunk as the last body line but without its newline: the block is
+  // held, then flushed as one redacted block once the newline lands.
+  const crossing = [];
+  const crossingSink = createRedactingSink((chunk) => crossing.push(chunk.toString("utf8")));
+  crossingSink.write(Buffer.from(`-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY[0]}\n`));
+  crossingSink.write(Buffer.from(`${FAKE_PEM_BODY[1]}\n-----END OPENSSH PRIVATE KEY-----`));
+  assert.deepEqual(crossing, []);
+  crossingSink.write(Buffer.from("\nnext\n"));
+  assert.deepEqual(crossing, ["[REDACTED PRIVATE KEY]\nnext\n"]);
+  crossingSink.write(Buffer.from(`${FAKE_PEM}`));
+  assert.deepEqual(crossing, ["[REDACTED PRIVATE KEY]\nnext\n", "[REDACTED PRIVATE KEY]\n"], "a later block is still found after the first one closed");
+  crossingSink.end();
 });
 
-test("redacting sink neutralizes a never-closed PEM block at end() and at the hold cap", () => {
-  const unterminated = collectSink(`-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY[0]}\n`, CHUNKERS["per-line"]);
-  assert.equal(unterminated.beforeEnd, "", "nothing is emitted while the block is open");
-  assert.equal(unterminated.joined, `[REDACTED PRIVATE KEY]\n${FAKE_PEM_BODY[0]}\n`);
+test("unterminated PEM blocks are withheld with their body and ordinary output after them survives", () => {
+  const marker = "-----BEGIN OPENSSH PRIVATE KEY-----";
+  const cases = [
+    [`${marker}\n${FAKE_PEM_BODY[0]}\n${FAKE_PEM_BODY[1]}\ndone\n`, `${UNTERMINATED_PEM}\ndone\n`],
+    [`${marker}\r\n${FAKE_PEM_BODY[0]}\r\n${FAKE_PEM_BODY[1]}\r\ndone\r\n`, `${UNTERMINATED_PEM}\r\ndone\r\n`],
+    [`${marker}\n${FAKE_PEM_BODY[0]}\nlog one\nlog two\nlog three\nlog four\nlog five\n`, `${UNTERMINATED_PEM}\nlog one\nlog two\nlog three\nlog four\nlog five\n`],
+    [`${marker}\n${FAKE_PEM_BODY[0]}\nok\n`, `${UNTERMINATED_PEM}\nok\n`],
+    [`${marker}\n${FAKE_PEM_BODY[0]}\nMIIEow`, UNTERMINATED_PEM],
+    [`${marker}\n${FAKE_PEM_BODY[0]}`, UNTERMINATED_PEM],
+    [`${marker}`, "[REDACTED PRIVATE KEY: unterminated block]"],
+    [`${marker}\n`, "[REDACTED PRIVATE KEY: unterminated block]\n"],
+    [`${marker}\nnot a body line at all\n`, "[REDACTED PRIVATE KEY: unterminated block]\nnot a body line at all\n"],
+    [`${marker}\n${FAKE_PEM_BODY[0]}:trailer\n`, `[REDACTED PRIVATE KEY: unterminated block]\n${FAKE_PEM_BODY[0]}:trailer\n`],
+    [`prefix ${marker}\n${FAKE_PEM_BODY[0]}\n`, `prefix ${UNTERMINATED_PEM}\n`],
+    ["no marker here\n", "no marker here\n"],
+    [`${FAKE_PEM}${marker}\n${FAKE_PEM_BODY[0]}\n`, `[REDACTED PRIVATE KEY]\n${UNTERMINATED_PEM}\n`],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(redactUnterminatedPemBlocks(redactSecrets(input)), expected, JSON.stringify(input));
+  }
+});
 
+test("redacting sink withholds a never-closed PEM body at end() and at the hold cap", () => {
+  // A truncated key file (END missing) followed by ordinary output, under every chunking.
+  const truncated = `-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY.join("\n")}\ndone\n`;
+  for (const [strategy, chunker] of Object.entries(CHUNKERS)) {
+    const { beforeEnd, joined } = collectSink(truncated, chunker);
+    assert.equal(beforeEnd, "", `${strategy}: nothing is emitted while the block is open`);
+    assert.equal(joined, `${UNTERMINATED_PEM}\ndone\n`, strategy);
+    assert.ok(!FAKE_PEM_BODY.some((line) => joined.includes(line)), `${strategy}: a body line survived`);
+  }
+
+  // The cap: filled with key-shaped base64, none of it may escape, and ordinary output appended
+  // afterwards still flows.
   const chunks = [];
   const sink = createRedactingSink((chunk) => chunks.push(chunk.toString("utf8")));
-  sink.write(Buffer.from("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
-  const filler = `${"x".repeat(1023)}\n`;
+  sink.write(Buffer.from("-----BEGIN RSA PRIVATE KEY-----\n"));
+  const bodyLines = [];
   let written = 0;
   while (chunks.length === 0 && written < REDACTING_SINK_MAX_HELD_CHARS * 2) {
-    sink.write(Buffer.from(filler));
-    written += filler.length;
+    const line = `MIIE${bodyLines.length.toString(36).padStart(6, "0")}${"QUFB".repeat(15)}\n`;
+    bodyLines.push(line.trimEnd());
+    sink.write(Buffer.from(line));
+    written += line.length;
   }
   assert.ok(chunks.length > 0, "the held buffer is flushed once it reaches the cap");
-  assert.ok(written <= REDACTING_SINK_MAX_HELD_CHARS + filler.length);
-  assert.ok(chunks[0].startsWith("[REDACTED PRIVATE KEY]\n"), "the marker is replaced before the forced flush");
-  assert.ok(!chunks.join("").includes("BEGIN OPENSSH"));
+  assert.ok(written <= REDACTING_SINK_MAX_HELD_CHARS + 128);
+  assert.deepEqual(chunks, [`${UNTERMINATED_PEM}\n`], "the marker and every body line are withheld at the cap");
   sink.write(Buffer.from("later line\n"));
   assert.equal(chunks.at(-1), "later line\n", "the sink is back to per-line flushing after the forced flush");
   sink.end();
+  const flushed = chunks.join("");
+  assert.ok(!flushed.includes("BEGIN RSA"));
+  assert.ok(!bodyLines.some((line) => flushed.includes(line)), "no key-shaped fill line escaped");
 
   // A long single line without a newline is bounded by the same cap.
   const single = [];
@@ -1030,6 +1079,42 @@ test("every backend output path redacts credentials echoed by the remote under e
       assert.ok(!streamed.includes("BEGIN OPENSSH PRIVATE KEY"), streamed);
       assert.ok(!FAKE_PEM_BODY.some((line) => streamed.includes(line)), streamed);
       assert.equal(streamed, "[REDACTED PRIVATE KEY]\ndone\n");
+
+      // A truncated key file (END missing) read in one go: the block never closes, so the marker
+      // and body are withheld at the end of the command and the output after them survives.
+      const truncatedPath = join(keyDir, "id_ed25519.partial");
+      writeFileSync(truncatedPath, `-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY.join("\n")}\n`);
+      const truncatedChunks = [];
+      const truncatedResult = await host.bashOperations.exec(
+        `cat ${quoteForBash(truncatedPath)}; printf 'done\\n'`,
+        keyDir,
+        { onData: (chunk) => truncatedChunks.push(chunk.toString("utf8")) },
+      );
+      assert.equal(truncatedResult.exitCode, 0);
+      const truncatedStream = truncatedChunks.join("");
+      assert.ok(!truncatedStream.includes("BEGIN OPENSSH PRIVATE KEY"), truncatedStream);
+      assert.ok(!FAKE_PEM_BODY.some((line) => truncatedStream.includes(line)), truncatedStream);
+      assert.equal(truncatedStream, `${UNTERMINATED_PEM}\ndone\n`);
+
+      // The runtime's own command timeout killing a key mid-stream: END never arrives, the sink is
+      // ended on the throw path, and neither the header nor any body line reaches the stream.
+      const longBody = Array.from({ length: 8 }, (_, index) => `MIIEowIBAAKCAQEA${index}FAKEKEYBODYLINE${"QUFB".repeat(10)}`);
+      const longKeyPath = join(keyDir, "id_rsa");
+      writeFileSync(longKeyPath, `-----BEGIN RSA PRIVATE KEY-----\n${longBody.join("\n")}\n-----END RSA PRIVATE KEY-----\n`);
+      const killedChunks = [];
+      await assert.rejects(
+        host.bashOperations.exec(
+          `while IFS= read -r l; do printf '%s\\n' "$l"; sleep 0.2; done < ${quoteForBash(longKeyPath)}`,
+          keyDir,
+          { timeout: 1, onData: (chunk) => killedChunks.push(chunk.toString("utf8")) },
+        ),
+        /timeout:1/,
+      );
+      const killedStream = killedChunks.join("");
+      assert.ok(!killedStream.includes("BEGIN RSA PRIVATE KEY"), killedStream);
+      assert.ok(!longBody.some((line) => killedStream.includes(line)), killedStream);
+      assert.ok(!killedStream.includes("MIIEow"), killedStream);
+      assert.equal(killedStream, `${UNTERMINATED_PEM}\n`);
     } finally {
       rmSync(keyDir, { recursive: true, force: true });
     }

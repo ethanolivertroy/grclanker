@@ -145,9 +145,24 @@ const SECRET_ENV_KEYS = [
 ] as const;
 
 const PEM_BEGIN_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
-const PEM_BEGIN_GLOBAL_PATTERN = new RegExp(PEM_BEGIN_PATTERN.source, "g");
 const PEM_END_PATTERN = /-----END [A-Z ]*PRIVATE KEY-----/;
 const PEM_REDACTION = "[REDACTED PRIVATE KEY]";
+
+// A BEGIN marker whose END never arrived, together with the contiguous run of body-shaped lines
+// after it (base64 of 16 or more characters, each ending the line) and a trailing base64 fragment
+// cut off by the end of the text. Stops at the first line that is not body shaped, so ordinary
+// output after a truncated key survives. Group 1 is the body, group 2 the line break after it.
+const PEM_OPEN_BLOCK_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----((?:\r?\n[A-Za-z0-9+/=]{16,}(?=\r?\n|$))*(?:\r?\n[A-Za-z0-9+/=]{1,15}$)?)(\r?\n)?/g;
+const PEM_OPEN_REDACTION = "[REDACTED PRIVATE KEY: unterminated block]";
+const PEM_OPEN_BODY_REDACTION = "[REDACTED PRIVATE KEY: unterminated block, body withheld]";
+
+// Scrubs text that may hold a PEM block whose END never arrived: complete blocks go first through
+// the regular patterns, then any surviving marker is replaced together with its body. The
+// replacement says when body text was withheld, because that truncation is otherwise invisible.
+export function redactUnterminatedPemBlocks(text: string): string {
+  return text.replace(PEM_OPEN_BLOCK_PATTERN, (_match, body: string, lineBreak: string | undefined) =>
+    `${body.length > 0 ? PEM_OPEN_BODY_REDACTION : PEM_OPEN_REDACTION}${lineBreak ?? ""}`);
+}
 
 // Secondary, format-based patterns for the providers this runtime talks to. The primary
 // mechanism is the exact values of the credential environment variables above; these
@@ -186,28 +201,30 @@ export type RedactingSink = {
 
 // Upper bound on text the sink holds back before it flushes regardless of an open block or a
 // missing newline. Real private keys are a few KB, so a block still open at this size is not
-// a key; flushing it (with its marker neutralized) keeps a hostile stream from pinning memory.
+// a key; flushing it (marker and body-shaped lines withheld, everything else kept) keeps a
+// hostile stream from pinning memory.
 export const REDACTING_SINK_MAX_HELD_CHARS = 256 * 1024;
 
 // How far back the incremental END search re-reads, so an END marker straddling two writes is
 // still found. Longer than any realistic "-----END <label> PRIVATE KEY-----" marker.
 const PEM_MARKER_OVERLAP = 128;
 
-type UnflushablePemBlock = { start: number; open: boolean };
+// A PEM block that cannot be flushed yet: `closedAt` is where it ends once its END marker has
+// arrived (the block still crosses the flush boundary), undefined while END is missing.
+type HeldPemBlock = { start: number; searched: number; closedAt?: number };
 
-// Finds the first PEM private key block that starts before `boundary` and is not complete before
-// it: `open` when its END marker has not arrived at all, closed-but-crossing the boundary otherwise.
-function findUnflushablePemBlock(text: string, boundary: number): UnflushablePemBlock | undefined {
-  let cursor = 0;
+// Finds the first PEM private key block that starts at or after `cursor` and before `boundary`
+// and is not complete before the boundary.
+function findUnflushablePemBlock(text: string, boundary: number, cursor = 0): HeldPemBlock | undefined {
   while (cursor < boundary) {
     const begin = PEM_BEGIN_PATTERN.exec(text.slice(cursor, boundary));
     if (!begin) return undefined;
     const start = cursor + begin.index;
     const bodyStart = start + begin[0].length;
     const end = PEM_END_PATTERN.exec(text.slice(bodyStart));
-    if (!end) return { start, open: true };
+    if (!end) return { start, searched: text.length };
     const blockEnd = bodyStart + end.index + end[0].length;
-    if (blockEnd > boundary) return { start, open: false };
+    if (blockEnd > boundary) return { start, searched: text.length, closedAt: blockEnd };
     cursor = blockEnd;
   }
   return undefined;
@@ -228,17 +245,19 @@ function findDanglingBearerStart(text: string, boundary: number): number | undef
 // caught, and the sink never flushes through an open PEM block: from a `-----BEGIN ... PRIVATE
 // KEY-----` marker onward, text is held until the matching END marker arrives (so a
 // line-at-a-time producer cannot leak the header and body one line at a time), until `end()`,
-// or until the held buffer reaches the cap. A block still open at that point has its BEGIN
-// marker replaced before the flush so it can never be emitted verbatim.
+// or until the held buffer reaches the cap. A block still open at that point (a truncated key
+// file, a command killed by its timeout mid-key) is flushed with its marker and body-shaped lines
+// withheld, so neither the header nor the key material can be emitted verbatim.
 export function createRedactingSink(
   onData: ((chunk: Buffer) => void) | undefined,
   extraSecrets: Array<string | undefined> = [],
 ): RedactingSink {
   const decoder = new StringDecoder("utf8");
   let pending = "";
-  // Set while a PEM block is known to be open: where it starts in `pending` and how far the END
-  // search has already looked, so a long body is not rescanned on every write.
-  let openBlock: { start: number; searched: number } | undefined;
+  // Set while a PEM block is being held: where it starts in `pending`, how far the END search has
+  // already looked (so a long body is not rescanned on every write), and once END has arrived,
+  // where the block ends (it stays held until the line break after END lands).
+  let heldBlock: HeldPemBlock | undefined;
 
   const emit = (text: string) => {
     if (text.length === 0 || !onData) return;
@@ -246,12 +265,12 @@ export function createRedactingSink(
   };
 
   const flushEverything = () => {
-    openBlock = undefined;
+    heldBlock = undefined;
     if (pending.length === 0 || !onData) {
       pending = "";
       return;
     }
-    const scrubbed = redactSecrets(pending, extraSecrets).replace(PEM_BEGIN_GLOBAL_PATTERN, PEM_REDACTION);
+    const scrubbed = redactUnterminatedPemBlocks(redactSecrets(pending, extraSecrets));
     pending = "";
     onData(Buffer.from(scrubbed, "utf8"));
   };
@@ -259,18 +278,23 @@ export function createRedactingSink(
   // Returns the index from which `pending` must be held back, or undefined when everything up to
   // `boundary` may be flushed.
   const findHoldStart = (boundary: number): number | undefined => {
-    if (openBlock) {
-      const from = Math.max(openBlock.start, openBlock.searched - PEM_MARKER_OVERLAP);
-      if (!PEM_END_PATTERN.test(pending.slice(from))) {
-        openBlock.searched = pending.length;
-        return openBlock.start;
+    let scanFrom = 0;
+    if (heldBlock) {
+      if (heldBlock.closedAt === undefined) {
+        const from = Math.max(heldBlock.start, heldBlock.searched - PEM_MARKER_OVERLAP);
+        const end = PEM_END_PATTERN.exec(pending.slice(from));
+        if (!end) {
+          heldBlock.searched = pending.length;
+          return heldBlock.start;
+        }
+        heldBlock.closedAt = from + end.index + end[0].length;
       }
-      openBlock = undefined;
+      if (heldBlock.closedAt > boundary) return heldBlock.start;
+      scanFrom = heldBlock.closedAt;
+      heldBlock = undefined;
     }
-    const block = findUnflushablePemBlock(pending, boundary);
-    if (!block) return undefined;
-    if (block.open) openBlock = { start: block.start, searched: pending.length };
-    return block.start;
+    heldBlock = findUnflushablePemBlock(pending, boundary, scanFrom);
+    return heldBlock?.start;
   };
 
   const flushCompletedLines = () => {
@@ -284,9 +308,10 @@ export function createRedactingSink(
     if (boundary === 0) return;
     emit(pending.slice(0, boundary));
     pending = pending.slice(boundary);
-    if (openBlock) {
-      openBlock.start -= boundary;
-      openBlock.searched -= boundary;
+    if (heldBlock) {
+      heldBlock.start -= boundary;
+      heldBlock.searched -= boundary;
+      if (heldBlock.closedAt !== undefined) heldBlock.closedAt -= boundary;
     }
   };
 
