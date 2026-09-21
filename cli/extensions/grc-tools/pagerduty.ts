@@ -384,6 +384,14 @@ function countSeen(view: InventoryView): string {
     : `${view.seen} ${view.label}`;
 }
 
+/**
+ * Evidence derived from a read that failed renders null, never the 0 or [] its empty fallback
+ * would produce, so a denied inventory cannot be mistaken for an empty one.
+ */
+function whenRead<T>(value: T, ...sources: Array<InventoryView | Snapshot<unknown>>): T | null {
+  return sources.every((source) => ("readable" in source ? source.readable : !source.error)) ? value : null;
+}
+
 function asObject(value: unknown): JsonRecord | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as JsonRecord;
@@ -615,8 +623,47 @@ function safeDirName(value: string): string {
   return normalized || "pagerduty";
 }
 
+const MIN_REMEMBERED_SECRET_LENGTH = 8;
+const KNOWN_SECRETS = new Set<string>();
+const URL_IN_TEXT_PATTERN = /\b(https?:\/\/)(?:([^\s/?#@"'<>]+)@)?([^\s/?#"'<>]+)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
+const AUTHORIZATION_VALUE_PATTERN = /\b(bearer|basic|digest|negotiate|ntlm)\s+([A-Za-z0-9\-._~+/]{8,}=*)/gi;
+const SECRET_ASSIGNMENT_PATTERN = /\b([\w-]*(?:session|token|secret|password|passwd|pwd|api[_-]?key|apikey|credential|assertion|signature|sid|jsessionid)[\w-]*=)([^\s"'&;,<>]+)/gi;
+const SECRET_FIELD_PATTERN = /\b((?:api[\s_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|bearer[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|authorization|set-cookie|cookie|session[_-]?id|jsessionid|sid|assertion|signature|credential)["']?\s*:\s*["']?)([^\s"'&;,<>]+)/gi;
+
+/**
+ * The unanchored redaction pass every error string receives, once in the error constructor and
+ * again at the sink: the secrets any client in this process has seen, then credential shapes
+ * (URL userinfo, query strings, and fragments anywhere in the text, JWTs, Authorization scheme
+ * values, cookie and query assignments whose name suggests a credential, and message or JSON
+ * fields whose key names one).
+ */
+function scrubErrorText(text: string, secrets: Iterable<string | undefined> = KNOWN_SECRETS): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret && secret.length > 0) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (_match, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, fragment?: string) =>
+      `${scheme}${userinfo ? `${REDACTED}@` : ""}${host}${path}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(AUTHORIZATION_VALUE_PATTERN, (match: string, scheme: string, value: string) => (/^[a-z]+$/.test(value) ? match : `${scheme} ${REDACTED}`))
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, assignment: string) => `${assignment}${REDACTED}`)
+    .replace(SECRET_FIELD_PATTERN, (_match, field: string) => `${field}${REDACTED}`);
+}
+
+function rememberSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_REMEMBERED_SECRET_LENGTH) KNOWN_SECRETS.add(value);
+  }
+}
+
+/**
+ * The redacting sink: the single point where an error becomes a string that a snapshot, access
+ * check surface, finding, summary, analysis object, tool result, or bundle can carry.
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -847,13 +894,23 @@ function pagerdutyErrorSummary(payload: unknown): string | undefined {
 }
 
 /**
- * A non-JSON error body (a proxy or WAF page) is described by shape only; its text is never
- * copied into an error string because those strings land in the bundle's error log.
+ * A response body that carried no recognizable JSON message (a proxy or WAF page, or JSON in an
+ * unexpected shape) is described by content type and length only, whatever its content type; its
+ * text is never sliced into an error string because those strings land in the bundle's error log.
  */
-function describeOpaqueBody(response: Response, rawText: string): string | undefined {
+function describeOpaqueBody(response: Response, rawText: string, parsedAsJson: boolean): string | undefined {
   if (rawText.length === 0) return undefined;
   const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
-  return `response body omitted (${contentType}, ${rawText.length} characters)`;
+  return `${parsedAsJson ? "JSON body without a recognized message" : "non-JSON body"} (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+}
+
+function parseJsonObject(rawText: string): { payload: JsonRecord; parsed: boolean } {
+  if (rawText.length === 0) return { payload: {}, parsed: false };
+  try {
+    return { payload: asObject(JSON.parse(rawText)) ?? {}, parsed: true };
+  } catch {
+    return { payload: {}, parsed: false };
+  }
 }
 
 function requestPath(url: string): string {
@@ -864,11 +921,16 @@ function requestPath(url: string): string {
   }
 }
 
+/**
+ * The only field carrying response text is the message, built from the status line plus either
+ * PagerDuty's documented error fields or the opaque-body note; the constructor scrubs it so a
+ * throw site cannot hand an unredacted body to a catch block.
+ */
 export class PagerdutyRequestError extends Error {
   readonly status: number;
 
   constructor(status: number, message: string) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "PagerdutyRequestError";
     this.status = status;
   }
@@ -897,6 +959,7 @@ export class PagerdutyApiClient {
     this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
+    rememberSecrets(config.apiToken, config.accessToken, config.clientSecret);
     if (config.accessToken) {
       this.bearerToken = config.accessToken;
       this.bearerExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -912,11 +975,7 @@ export class PagerdutyApiClient {
   }
 
   redact(text: string): string {
-    let redacted = text;
-    for (const secret of [this.config.apiToken, this.config.accessToken, this.config.clientSecret, this.bearerToken]) {
-      if (secret && secret.length > 0) redacted = redacted.split(secret).join("[REDACTED]");
-    }
-    return redacted;
+    return scrubErrorText(text, [this.config.apiToken, this.config.accessToken, this.config.clientSecret, this.bearerToken, ...KNOWN_SECRETS]);
   }
 
   private buildUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -956,19 +1015,26 @@ export class PagerdutyApiClient {
         signal: controller.signal,
       });
       const rawText = await response.text();
-      const payload = rawText.length > 0 ? asObject(JSON.parse(rawText)) ?? {} : {};
+      const { payload, parsed } = parseJsonObject(rawText);
       if (!response.ok) {
         throw new PagerdutyRequestError(
           response.status,
-          this.redact(`PagerDuty OAuth token request failed (${response.status}): ${asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText) ?? "empty response body"}`),
+          this.redact(`PagerDuty OAuth token request failed (${response.status} ${response.statusText}): ${asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText, parsed) ?? "empty response body"}`),
         );
       }
       const token = asString(payload.access_token);
       if (!token) throw new Error("PagerDuty OAuth token response did not include access_token.");
       const expiresIn = asNumber(payload.expires_in) ?? 3600;
+      rememberSecrets(token);
       this.bearerToken = token;
       this.bearerExpiresAt = this.now().getTime() + Math.max((expiresIn - 60) * 1000, 60_000);
       return token;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("PagerDuty")) throw error;
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`PagerDuty OAuth token request timed out after ${this.config.timeoutMs}ms: ${requestPath(this.config.identityTokenUrl)}`);
+      }
+      throw new Error(this.redact(`PagerDuty OAuth token request failed: ${errorMessage(error)}`));
     } finally {
       clearTimeout(timeout);
     }
@@ -1033,16 +1099,9 @@ export class PagerdutyApiClient {
         continue;
       }
       const rawText = await response.text();
-      let payload: JsonRecord = {};
-      if (rawText.length > 0) {
-        try {
-          payload = asObject(JSON.parse(rawText)) ?? {};
-        } catch {
-          payload = {};
-        }
-      }
+      const { payload, parsed } = parseJsonObject(rawText);
       if (!response.ok) {
-        const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText);
+        const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText, parsed);
         throw new PagerdutyRequestError(
           response.status,
           this.redact(`PagerDuty request failed (${response.status} ${response.statusText}) for ${path}${detail ? `: ${detail}` : ""}`),
@@ -1522,8 +1581,9 @@ export function assessPagerdutyAccessControl(
     : "";
   const truncatedTeamMembers = data.teamMembersTruncated ?? [];
   const teamMembershipSample = [
-    `${teamManagers} team manager assignments sampled`,
-    ...(data.teamMembers.error ? [`team membership listing failed: ${data.teamMembers.error}`] : []),
+    data.teamMembers.error
+      ? `team manager assignments unknown because the team membership listing failed: ${data.teamMembers.error}`
+      : `${teamManagers} team manager assignments sampled`,
     ...(truncatedTeamMembers.length > 0 ? [`member lists were truncated for ${truncatedTeamMembers.length} teams`] : []),
   ].join("; ");
 
@@ -1546,10 +1606,10 @@ export function assessPagerdutyAccessControl(
             ? `The account exposes the "sso" ability and ${ssoUsers.length}/${users.seen} returned users were created via SSO. The REST API does not expose whether SSO login is required, so collect a screenshot of Account Settings > Single Sign-On showing SSO enabled and password login disallowed.`
             : `The account exposes ${abilities.length} abilities and "sso" is not one of them, so SSO is not available or not configured for this account.`,
       {
-        sso_ability: ssoAbility,
-        abilities: abilities.slice(0, 50),
-        users_created_via_sso: ssoUsers.length,
-        users_not_created_via_sso: nonSsoUsers.slice(0, 25).map(userLabel),
+        sso_ability: whenRead(ssoAbility, data.abilities),
+        abilities: whenRead(abilities.slice(0, 50), data.abilities),
+        users_created_via_sso: whenRead(ssoUsers.length, users),
+        users_not_created_via_sso: whenRead(nonSsoUsers.slice(0, 25).map(userLabel), users),
       },
     ),
     finding(
@@ -1562,11 +1622,11 @@ export function assessPagerdutyAccessControl(
           ? `${privilegedUsers.length} of ${countSeen(users)} hold owner or admin roles, exceeding the threshold of ${maxAdmins}.${roleNote}`
           : `${privilegedUsers.length} of ${countSeen(users)} hold owner or admin roles, within the threshold of ${maxAdmins}.${roleNote}`,
       {
-        privileged_users: privilegedUsers.slice(0, 25).map((user) => `${userLabel(user)} (${roleOf(user)})`),
-        users_without_role: usersWithoutRole.slice(0, 25).map(userLabel),
-        role_counts: roleCounts,
+        privileged_users: whenRead(privilegedUsers.slice(0, 25).map((user) => `${userLabel(user)} (${roleOf(user)})`), users),
+        users_without_role: whenRead(usersWithoutRole.slice(0, 25).map(userLabel), users),
+        role_counts: whenRead(roleCounts, users),
         max_admins: maxAdmins,
-        users_seen: users.seen,
+        users_seen: whenRead(users.seen, users),
         users_total: users.total ?? null,
       },
       userNotes,
@@ -1582,7 +1642,7 @@ export function assessPagerdutyAccessControl(
           : owners.length === 0
             ? `No owner role was found among ${countSeen(users)}; confirm the account owner is within the returned user set.${roleNote}`
             : `Exactly one owner among ${countSeen(users)}.${roleNote}`,
-      { owners: owners.slice(0, 10).map(userLabel), users_without_role: usersWithoutRole.slice(0, 25).map(userLabel) },
+      { owners: whenRead(owners.slice(0, 10).map(userLabel), users), users_without_role: whenRead(usersWithoutRole.slice(0, 25).map(userLabel), users) },
       userNotes,
     ),
     finding(
@@ -1611,11 +1671,11 @@ export function assessPagerdutyAccessControl(
       {
         teams_ability: abilitiesUnavailable ? null : teamsAbility,
         abilities_status: abilitiesUnavailable ?? "readable",
-        teams_seen: teams.seen,
+        teams_seen: whenRead(teams.seen, teams),
         teams_total: teams.total ?? null,
-        team_manager_assignments: teamManagers,
+        team_manager_assignments: whenRead(teamManagers, data.teamMembers),
         team_member_lists_truncated: truncatedTeamMembers,
-        users_without_teams: usersWithoutTeams.slice(0, 25).map(userLabel),
+        users_without_teams: whenRead(usersWithoutTeams.slice(0, 25).map(userLabel), users),
       },
       partialNotes(data.scope, users, teams),
     ),
@@ -1624,8 +1684,8 @@ export function assessPagerdutyAccessControl(
       "manual",
       `${abilitiesReadable ? `The REST API exposes ${analyticsAbilities.length} analytics-related abilities` : `Abilities could not be read (${data.abilities.error})`} and never exposes per-role analytics permissions, so this control is outside the API's scope. Record which roles can open Analytics and Insights in the web app (compare the Users page role list against your approved analytics viewer list) and attach that review as evidence.`,
       {
-        analytics_abilities: analyticsAbilities,
-        role_counts: roleCounts,
+        analytics_abilities: whenRead(analyticsAbilities, data.abilities),
+        role_counts: whenRead(roleCounts, users),
       },
     ),
   ];
@@ -1635,14 +1695,14 @@ export function assessPagerdutyAccessControl(
     title: "PagerDuty access control",
     summary: {
       credential_scope: data.scope.error ? "unknown" : data.scope.data.kind,
-      abilities: abilities.length,
-      sso_ability: ssoAbility,
-      users_seen: users.seen,
+      abilities: whenRead(abilities.length, data.abilities),
+      sso_ability: whenRead(ssoAbility, data.abilities),
+      users_seen: whenRead(users.seen, users),
       users_total: users.total ?? null,
-      privileged_users: privilegedUsers.length,
-      owners: owners.length,
-      teams_seen: teams.seen,
-      users_without_teams: usersWithoutTeams.length,
+      privileged_users: whenRead(privilegedUsers.length, users),
+      owners: whenRead(owners.length, users),
+      teams_seen: whenRead(teams.seen, teams),
+      users_without_teams: whenRead(usersWithoutTeams.length, users),
       ...countByStatus(findings),
     },
     findings,
@@ -1798,11 +1858,11 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
           ? `All ${active.length} active services (of ${countSeen(services)}) reference an escalation policy.`
           : `${servicesWithoutPolicy.length} of ${active.length} active services have no escalation policy.`,
       {
-        services_seen: services.seen,
+        services_seen: whenRead(services.seen, services),
         services_total: services.total ?? null,
-        active_services: active.length,
-        services_without_policy: servicesWithoutPolicy.slice(0, 25).map(nameOf),
-        disabled_services: services.seen - active.length,
+        active_services: whenRead(active.length, services),
+        services_without_policy: whenRead(servicesWithoutPolicy.slice(0, 25).map(nameOf), services),
+        disabled_services: whenRead(services.seen - active.length, services),
       },
       serviceNotes,
     ),
@@ -1815,10 +1875,10 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
           ? `All ${attachedPolicies.length} escalation policies attached to services (of ${countSeen(policies)}) define two or more escalation levels.`
           : `${singleLevelPolicies.length} of ${attachedPolicies.length} escalation policies attached to services define a single escalation level.`,
       {
-        policies_seen: policies.seen,
+        policies_seen: whenRead(policies.seen, policies),
         policies_total: policies.total ?? null,
-        attached_policies: attachedPolicies.length,
-        single_level_policies: singleLevelPolicies.slice(0, 25).map(nameOf),
+        attached_policies: whenRead(attachedPolicies.length, policies),
+        single_level_policies: whenRead(singleLevelPolicies.slice(0, 25).map(nameOf), policies),
       },
       policyNotes,
     ),
@@ -1833,9 +1893,9 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
             ? `${nonRepeatingPolicies.length} of ${attachedPolicies.length} attached escalation policies never repeat (num_loops is 0${missingLoops.length > 0 ? ` or absent on ${missingLoops.length}` : ""}), so an unacknowledged incident stops notifying after the final level.`
             : `Every one of ${attachedPolicies.length} attached escalation policies has targets on each rule and a num_loops value above 0.`,
       {
-        empty_target_policies: emptyTargetPolicies.slice(0, 25).map(nameOf),
-        non_repeating_policies: nonRepeatingPolicies.slice(0, 25).map(nameOf),
-        policies_missing_num_loops: missingLoops.slice(0, 25).map(nameOf),
+        empty_target_policies: whenRead(emptyTargetPolicies.slice(0, 25).map(nameOf), policies),
+        non_repeating_policies: whenRead(nonRepeatingPolicies.slice(0, 25).map(nameOf), policies),
+        policies_missing_num_loops: whenRead(missingLoops.slice(0, 25).map(nameOf), policies),
       },
       policyNotes,
     ),
@@ -1866,16 +1926,16 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
                 ? `The Incident Workflows API is readable and returned zero workflows and zero triggers, and no service references a response play, so no automated incident response is configured; emptiness fails this control.`
                 : `The Incident Workflows API is readable and returned zero workflows and zero triggers, so no workflow automation is configured; ${responsePlayReferences}. Emptiness fails this control.`,
       {
-        incident_workflows_seen: workflows.seen,
-        enabled_workflows: enabledWorkflows.length,
-        triggers_seen: triggers.seen,
-        enabled_triggers: enabledTriggers.length,
-        disabled_triggers: disabledTriggers.length,
-        unresolved_triggers: unresolvedTriggers.slice(0, 25).map((item) => nameOf(item.trigger)),
-        triggers_missing_is_disabled_flag: triggersMissingDisabledFlag,
-        triggers_verified_by_parent_workflow: triggersVerifiedByParent,
+        incident_workflows_seen: whenRead(workflows.seen, workflows),
+        enabled_workflows: whenRead(enabledWorkflows.length, workflows),
+        triggers_seen: whenRead(triggers.seen, triggers),
+        enabled_triggers: whenRead(enabledTriggers.length, triggers),
+        disabled_triggers: whenRead(disabledTriggers.length, triggers),
+        unresolved_triggers: whenRead(unresolvedTriggers.slice(0, 25).map((item) => nameOf(item.trigger)), triggers),
+        triggers_missing_is_disabled_flag: whenRead(triggersMissingDisabledFlag, triggers),
+        triggers_verified_by_parent_workflow: whenRead(triggersVerifiedByParent, triggers, workflows),
         services_readable: services.readable,
-        services_with_legacy_response_plays: legacyResponsePlays.slice(0, 25).map(nameOf),
+        services_with_legacy_response_plays: whenRead(legacyResponsePlays.slice(0, 25).map(nameOf), services),
       },
       partialNotes(data.scope, workflows, triggers),
     ),
@@ -1890,9 +1950,9 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
             ? `All ${active.length} active services use a constant high urgency; consider support-hours or severity-based urgency for lower-impact services.`
             : `All ${active.length} active services expose an incident urgency rule, using a mix of modes: ${[...new Set(urgencyModes)].join(", ")}.`,
       {
-        active_services: active.length,
-        services_without_urgency_rule: missingUrgency.slice(0, 25).map(nameOf),
-        urgency_modes: urgencyModes.reduce<Record<string, number>>((acc, mode) => ({ ...acc, [mode]: (acc[mode] ?? 0) + 1 }), {}),
+        active_services: whenRead(active.length, services),
+        services_without_urgency_rule: whenRead(missingUrgency.slice(0, 25).map(nameOf), services),
+        urgency_modes: whenRead(urgencyModes.reduce<Record<string, number>>((acc, mode) => ({ ...acc, [mode]: (acc[mode] ?? 0) + 1 }), {}), services),
       },
       serviceNotes,
     ),
@@ -1906,7 +1966,7 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         : priorities.empty
           ? "GET /priorities is readable and returned zero priorities, so no custom incident priorities are defined; emptiness fails this control."
           : `${countSeen(priorities)} are defined (${priorities.items.slice(0, 10).map(nameOf).join(", ")}); confirm they are applied to incidents during postmortem review.`,
-      { priorities: priorities.items.slice(0, 10).map(nameOf), priorities_seen: priorities.seen },
+      { priorities: whenRead(priorities.items.slice(0, 10).map(nameOf), priorities), priorities_seen: whenRead(priorities.seen, priorities) },
       partialNotes(data.scope, priorities),
     ),
     finding(
@@ -1917,7 +1977,7 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         : noAckTimeout.length === 0
           ? `All ${active.length} active services (of ${countSeen(services)}) configure an acknowledgement timeout.`
           : `${noAckTimeout.length} of ${active.length} active services have acknowledgement timeout disabled or absent.`,
-      { active_services: active.length, services_without_ack_timeout: noAckTimeout.slice(0, 25).map(nameOf) },
+      { active_services: whenRead(active.length, services), services_without_ack_timeout: whenRead(noAckTimeout.slice(0, 25).map(nameOf), services) },
       serviceNotes,
     ),
     finding(
@@ -1928,7 +1988,7 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         : noAutoResolve.length === 0
           ? `All ${active.length} active services (of ${countSeen(services)}) configure an auto-resolve timeout.`
           : `${noAutoResolve.length} of ${active.length} active services have auto-resolve disabled or absent.`,
-      { active_services: active.length, services_without_auto_resolve: noAutoResolve.slice(0, 25).map(nameOf) },
+      { active_services: whenRead(active.length, services), services_without_auto_resolve: whenRead(noAutoResolve.slice(0, 25).map(nameOf), services) },
       serviceNotes,
     ),
   ];
@@ -1938,14 +1998,14 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
     title: "PagerDuty incident response configuration",
     summary: {
       credential_scope: data.scope.error ? "unknown" : data.scope.data.kind,
-      services_seen: services.seen,
+      services_seen: whenRead(services.seen, services),
       services_total: services.total ?? null,
-      active_services: active.length,
-      escalation_policies_seen: policies.seen,
-      incident_workflows_seen: workflows.seen,
-      workflow_triggers_seen: triggers.seen,
-      enabled_workflow_triggers: enabledTriggers.length,
-      priorities_seen: priorities.seen,
+      active_services: whenRead(active.length, services),
+      escalation_policies_seen: whenRead(policies.seen, policies),
+      incident_workflows_seen: whenRead(workflows.seen, workflows),
+      workflow_triggers_seen: whenRead(triggers.seen, triggers),
+      enabled_workflow_triggers: whenRead(enabledTriggers.length, triggers),
+      priorities_seen: whenRead(priorities.seen, priorities),
       ...countByStatus(findings),
     },
     findings,
@@ -2132,18 +2192,18 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
             : `All ${attached.length} schedules attached to escalation policies (of ${countSeen(schedules)}) render continuous final-schedule coverage from ${data.coverageWindow.since} to ${data.coverageWindow.until}.`,
       {
         coverage_window: data.coverageWindow,
-        schedules_seen: schedules.seen,
-        attached_schedules: attached.length,
-        schedules_with_gaps: schedulesWithGaps.slice(0, 25).map((item) => ({
+        schedules_seen: whenRead(schedules.seen, schedules),
+        attached_schedules: whenRead(attached.length, schedules, data.scheduleDetails),
+        schedules_with_gaps: whenRead(schedulesWithGaps.slice(0, 25).map((item) => ({
           schedule: nameOf(item.schedule),
           gaps: item.coverage.gaps.slice(0, 5),
           rendered_coverage_percentage: asNumber(asObject(item.schedule.final_schedule)?.rendered_coverage_percentage) ?? null,
-        })),
-        schedules_with_undated_entries: schedulesWithUndatedEntries.slice(0, 25).map((item) => ({
+        })), schedules, data.scheduleDetails),
+        schedules_with_undated_entries: whenRead(schedulesWithUndatedEntries.slice(0, 25).map((item) => ({
           schedule: nameOf(item.schedule),
           entries_missing_dates: item.coverage.entriesMissingDates,
-        })),
-        unattached_schedules: details.length - attached.length,
+        })), schedules, data.scheduleDetails),
+        unattached_schedules: whenRead(details.length - attached.length, schedules, data.scheduleDetails),
       },
       scheduleNotes,
     ),
@@ -2155,7 +2215,10 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
         : singleParticipant.length === 0
           ? `All ${attached.length} attached schedules (of ${countSeen(schedules)}) include at least two distinct participants.`
           : `${singleParticipant.length} of ${attached.length} attached schedules rely on a single participant.`,
-      { attached_schedules: attached.length, single_participant_schedules: singleParticipant.slice(0, 25).map(nameOf) },
+      {
+        attached_schedules: whenRead(attached.length, schedules, data.scheduleDetails),
+        single_participant_schedules: whenRead(singleParticipant.slice(0, 25).map(nameOf), schedules, data.scheduleDetails),
+      },
       scheduleNotes,
     ),
     finding(
@@ -2180,10 +2243,10 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
               ? `${respondersWithoutRules.length} of ${responders.length} responders have no notification rules, ${respondersWithoutHighUrgencyRule.length} have no high-urgency rule, and ${usersWithoutRole.length} users have no role field.`
               : `All ${responders.length} responders (of ${countSeen(users)}) define notification rules including a high-urgency rule.`,
       {
-        responders: responders.length,
-        users_without_role: usersWithoutRole.slice(0, 25).map(userLabel),
-        responders_without_rules: respondersWithoutRules.slice(0, 25).map(userLabel),
-        responders_without_high_urgency_rule: respondersWithoutHighUrgencyRule.slice(0, 25).map(userLabel),
+        responders: whenRead(responders.length, users),
+        users_without_role: whenRead(usersWithoutRole.slice(0, 25).map(userLabel), users),
+        responders_without_rules: whenRead(respondersWithoutRules.slice(0, 25).map(userLabel), users),
+        responders_without_high_urgency_rule: whenRead(respondersWithoutHighUrgencyRule.slice(0, 25).map(userLabel), users),
       },
       userNotes,
     ),
@@ -2213,12 +2276,12 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
                   ? `${oncallEmailOnly.length} of ${oncallUsers.length} current on-call users rely on email only, ${oncallUnverifiable.length} have phone, SMS, or push methods whose enabled or blacklisted flags are absent, and ${unresolvedOncallUsers.length} on-call users were outside the returned user set; the REST API does not expose phone verification, so confirm in the web app.`
                   : `All ${oncallUsers.length} current on-call users have a phone or SMS method with enabled true and blacklisted false, or a push method with blacklisted false (the push contact method schema has no enabled flag).`,
       {
-        current_oncall_users: oncallUsers.length,
-        oncall_entries_seen: oncalls.seen,
-        oncall_users_not_in_returned_set: unresolvedOncallUsers.length,
-        oncall_without_contact_methods: oncallWithoutContact.slice(0, 25).map(userLabel),
-        oncall_email_only: oncallEmailOnly.slice(0, 25).map(userLabel),
-        oncall_unverifiable_methods: oncallUnverifiable.slice(0, 25).map(userLabel),
+        current_oncall_users: whenRead(oncallUsers.length, users, oncalls),
+        oncall_entries_seen: whenRead(oncalls.seen, oncalls),
+        oncall_users_not_in_returned_set: whenRead(unresolvedOncallUsers.length, users, oncalls),
+        oncall_without_contact_methods: whenRead(oncallWithoutContact.slice(0, 25).map(userLabel), users, oncalls),
+        oncall_email_only: whenRead(oncallEmailOnly.slice(0, 25).map(userLabel), users, oncalls),
+        oncall_unverifiable_methods: whenRead(oncallUnverifiable.slice(0, 25).map(userLabel), users, oncalls),
       },
       partialNotes(data.scope, users, oncalls),
     ),
@@ -2229,12 +2292,12 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
     title: "PagerDuty on-call coverage",
     summary: {
       credential_scope: data.scope.error ? "unknown" : data.scope.data.kind,
-      schedules_seen: schedules.seen,
-      attached_schedules: attached.length,
-      schedules_with_gaps: schedulesWithGaps.length,
-      single_participant_schedules: singleParticipant.length,
-      responders: responders.length,
-      current_oncall_users: oncallUsers.length,
+      schedules_seen: whenRead(schedules.seen, schedules),
+      attached_schedules: whenRead(attached.length, schedules, data.scheduleDetails),
+      schedules_with_gaps: whenRead(schedulesWithGaps.length, schedules, data.scheduleDetails),
+      single_participant_schedules: whenRead(singleParticipant.length, schedules, data.scheduleDetails),
+      responders: whenRead(responders.length, users),
+      current_oncall_users: whenRead(oncallUsers.length, users, oncalls),
       ...countByStatus(findings),
     },
     findings,
@@ -2363,11 +2426,11 @@ export function assessPagerdutyAuditLogging(
             : `The audit records API is readable but returned zero records between ${data.windows.recent.since} and ${data.windows.recent.until}; an empty audit trail cannot demonstrate active logging, so confirm recent configuration changes appear in the web app audit trail.`,
       {
         window: data.windows.recent,
-        records_returned: recent.seen,
-        records_dated_in_window: recentDated.dated.length,
-        records_missing_execution_time: recentDated.undated,
-        records_outside_window: recentDated.outside,
-        method_types: methodCounts,
+        records_returned: whenRead(recent.seen, recent),
+        records_dated_in_window: whenRead(recentDated.dated.length, recent),
+        records_missing_execution_time: whenRead(recentDated.undated, recent),
+        records_outside_window: whenRead(recentDated.outside, recent),
+        method_types: whenRead(methodCounts, recent),
       },
       auditNotes,
     ),
@@ -2399,9 +2462,9 @@ export function assessPagerdutyAuditLogging(
         documented_retention_days: 365,
         required_retention_days: minRetentionDays,
         probe_window: data.windows.retention,
-        probe_records_returned: probe.seen,
-        probe_records_dated_in_window: probeDated.dated.length,
-        probe_records_missing_execution_time: probeDated.undated,
+        probe_records_returned: whenRead(probe.seen, probe),
+        probe_records_dated_in_window: whenRead(probeDated.dated.length, probe),
+        probe_records_missing_execution_time: whenRead(probeDated.undated, probe),
       },
       auditNotes,
     ),
@@ -2411,7 +2474,7 @@ export function assessPagerdutyAuditLogging(
       recentError
         ? `The REST API has no endpoint that lists API keys or their creation dates, and audit records could not be read (${recentError}). Open Integrations > API Access Keys and each user's User Settings > API Access in the web app, record the Created date of every key, and rotate keys older than ${apiKeyMaxAgeDays} days.`
         : `The REST API has no endpoint that lists API keys or their creation dates; ${apiTokens.length} distinct API tokens (by truncated suffix) performed configuration changes in the last window. Open Integrations > API Access Keys and each user's User Settings > API Access in the web app, record the Created date of every key, and rotate keys older than ${apiKeyMaxAgeDays} days.`,
-      { api_key_max_age_days: apiKeyMaxAgeDays, api_tokens_observed: apiTokens.slice(0, 25) },
+      { api_key_max_age_days: apiKeyMaxAgeDays, api_tokens_observed: whenRead(apiTokens.slice(0, 25), recent) },
     ),
   ];
 
@@ -2420,10 +2483,10 @@ export function assessPagerdutyAuditLogging(
     title: "PagerDuty audit logging",
     summary: {
       credential_scope: data.scope.error ? "unknown" : data.scope.data.kind,
-      recent_records_returned: recent.seen,
-      recent_records_dated_in_window: recentDated.dated.length,
-      retention_probe_records: probe.seen,
-      api_tokens_observed: apiTokens.length,
+      recent_records_returned: whenRead(recent.seen, recent),
+      recent_records_dated_in_window: whenRead(recentDated.dated.length, recent),
+      retention_probe_records: whenRead(probe.seen, probe),
+      api_tokens_observed: whenRead(apiTokens.length, recent),
       ...countByStatus(findings),
     },
     findings,
@@ -2587,11 +2650,11 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
             ? `${insecureExtensions.length} of ${countSeen(extensions)} and ${insecureSubscriptions.length} of ${countSeen(subscriptions)} deliver to non-https or missing endpoint URLs.`
             : `All ${countSeen(extensions)} and ${countSeen(subscriptions)} have an endpoint URL whose scheme is https.`,
       {
-        extensions_seen: extensions.seen,
-        subscriptions_seen: subscriptions.seen,
-        insecure_extensions: insecureExtensions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(reduceUrl(item.endpoint_url)) ?? "missing"}`),
-        insecure_subscriptions: insecureSubscriptions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(reduceUrl(asObject(item.delivery_method)?.url)) ?? "missing"}`),
-        temporarily_disabled_deliveries: disabledDeliveries.slice(0, 25),
+        extensions_seen: whenRead(extensions.seen, extensions),
+        subscriptions_seen: whenRead(subscriptions.seen, subscriptions),
+        insecure_extensions: whenRead(insecureExtensions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(reduceUrl(item.endpoint_url)) ?? "missing"}`), extensions),
+        insecure_subscriptions: whenRead(insecureSubscriptions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(reduceUrl(asObject(item.delivery_method)?.url)) ?? "missing"}`), subscriptions),
+        temporarily_disabled_deliveries: whenRead(disabledDeliveries.slice(0, 25), extensions, subscriptions),
       },
       webhookNotes,
     ),
@@ -2618,13 +2681,13 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
                   ? `${subscriptionsMissingActive.length} of ${countSeen(subscriptions)} did not return the active flag, so their delivery state is unknown.`
                   : `${countSeen(extensions)} were read and none is a legacy generic webhook; ${activeSubscriptions.length} of ${countSeen(subscriptions)} have active true and v3 deliveries carry an HMAC-SHA256 X-PagerDuty-Signature header. Confirm receiving systems verify the signature.`,
       {
-        extensions_seen: extensions.seen,
-        legacy_webhook_extensions: legacyWebhookExtensions.slice(0, 25).map(nameOf),
-        unclassified_extensions: unclassifiedExtensions.slice(0, 25).map(nameOf),
-        subscriptions_seen: subscriptions.seen,
-        active_v3_subscriptions: activeSubscriptions.length,
-        subscriptions_missing_active_flag: subscriptionsMissingActive.length,
-        subscriptions_with_custom_headers: subscriptions.items.filter((item) => asArray(asObject(item.delivery_method)?.custom_headers).length > 0).length,
+        extensions_seen: whenRead(extensions.seen, extensions),
+        legacy_webhook_extensions: whenRead(legacyWebhookExtensions.slice(0, 25).map(nameOf), extensions),
+        unclassified_extensions: whenRead(unclassifiedExtensions.slice(0, 25).map(nameOf), extensions),
+        subscriptions_seen: whenRead(subscriptions.seen, subscriptions),
+        active_v3_subscriptions: whenRead(activeSubscriptions.length, subscriptions),
+        subscriptions_missing_active_flag: whenRead(subscriptionsMissingActive.length, subscriptions),
+        subscriptions_with_custom_headers: whenRead(subscriptions.items.filter((item) => asArray(asObject(item.delivery_method)?.custom_headers).length > 0).length, subscriptions),
       },
       webhookNotes,
     ),
@@ -2647,11 +2710,11 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
               ? `${servicesWithoutIntegrationField.length} of ${countSeen(services)} did not return the integrations expansion, so their integrations could not be reviewed.`
               : `All ${integrations.length} integrations across ${countSeen(services)} use current integration types and email integrations apply filters.`,
       {
-        services_seen: services.seen,
-        integrations: integrations.length,
-        services_without_integration_expansion: servicesWithoutIntegrationField.slice(0, 25).map(nameOf),
-        legacy_integrations: legacyIntegrations.slice(0, 25).map((item) => `${item.service}: ${nameOf(item.integration)} (${asString(item.integration.type)})`),
-        unfiltered_email_integrations: unfilteredEmailIntegrations.slice(0, 25).map((item) => `${item.service}: ${nameOf(item.integration)}`),
+        services_seen: whenRead(services.seen, services),
+        integrations: whenRead(integrations.length, services),
+        services_without_integration_expansion: whenRead(servicesWithoutIntegrationField.slice(0, 25).map(nameOf), services),
+        legacy_integrations: whenRead(legacyIntegrations.slice(0, 25).map((item) => `${item.service}: ${nameOf(item.integration)} (${asString(item.integration.type)})`), services),
+        unfiltered_email_integrations: whenRead(unfilteredEmailIntegrations.slice(0, 25).map((item) => `${item.service}: ${nameOf(item.integration)}`), services),
       },
       serviceNotes,
     ),
@@ -2673,7 +2736,10 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
           : unmappedBusinessServices.length === 0 && !data.businessServiceDependencies.error
             ? `All ${countSeen(businessServices)} have at least one mapped dependency.`
             : `${unmappedBusinessServices.length} of ${countSeen(businessServices)} have no mapped dependencies${data.businessServiceDependencies.error ? ` (dependency listing failed: ${data.businessServiceDependencies.error})` : ""}.`,
-      { business_services_seen: businessServices.seen, unmapped_business_services: unmappedBusinessServices.slice(0, 25).map(nameOf) },
+      {
+        business_services_seen: whenRead(businessServices.seen, businessServices),
+        unmapped_business_services: whenRead(unmappedBusinessServices.slice(0, 25).map(nameOf), businessServices, data.businessServiceDependencies),
+      },
       partialNotes(data.scope, businessServices),
     ),
     finding(
@@ -2700,13 +2766,13 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
                 : `GET /change_events is readable and returned zero events, and none of ${countSeen(services)} exposes an Events API v2 integration, so change tracking is not enabled; emptiness fails this control.`,
       {
         change_window: data.changeWindow,
-        change_events_returned: changeEvents.seen,
-        change_events_complete: changeEvents.complete,
+        change_events_returned: whenRead(changeEvents.seen, changeEvents),
+        change_events_complete: whenRead(changeEvents.complete, changeEvents),
         change_events_pagination: CHANGE_EVENTS_PAGINATION_NOTE,
-        change_events_dated_in_window: changeEventsDated.dated.length,
-        change_events_missing_timestamp: changeEventsDated.undated,
-        services_with_change_events: servicesWithChangeEvents.size,
-        events_v2_services: eventsV2Services.length,
+        change_events_dated_in_window: whenRead(changeEventsDated.dated.length, changeEvents),
+        change_events_missing_timestamp: whenRead(changeEventsDated.undated, changeEvents),
+        services_with_change_events: whenRead(servicesWithChangeEvents.size, changeEvents),
+        events_v2_services: whenRead(eventsV2Services.length, services),
       },
       partialNotes(data.scope, changeEvents, services),
     ),
@@ -2717,11 +2783,11 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
     title: "PagerDuty integration security",
     summary: {
       credential_scope: data.scope.error ? "unknown" : data.scope.data.kind,
-      extensions_seen: extensions.seen,
-      webhook_subscriptions_seen: subscriptions.seen,
-      service_integrations: integrations.length,
-      business_services_seen: businessServices.seen,
-      change_events_returned: changeEvents.seen,
+      extensions_seen: whenRead(extensions.seen, extensions),
+      webhook_subscriptions_seen: whenRead(subscriptions.seen, subscriptions),
+      service_integrations: whenRead(integrations.length, services),
+      business_services_seen: whenRead(businessServices.seen, businessServices),
+      change_events_returned: whenRead(changeEvents.seen, changeEvents),
       ...countByStatus(findings),
     },
     findings,
