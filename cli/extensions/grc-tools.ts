@@ -40,6 +40,7 @@ import { registerScfTools } from "./grc-tools/scf.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
+import { registerZendeskTools } from "./grc-tools/zendesk.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
 
 /**
@@ -67,6 +68,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerSlackTools,
   registerVantaTools,
   registerWebexTools,
+  registerZendeskTools,
   registerZoomTools,
 ];
 
