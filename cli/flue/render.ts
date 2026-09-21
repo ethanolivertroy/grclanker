@@ -45,6 +45,8 @@ export interface LoadGrclankerFlueAgentOptionsInput {
   cwd: string;
   createLocalSandbox: CreateLocalSandbox;
   settings?: GrclankerSettings;
+  /** Provider ids registered with Flue's `setProvider()` on top of Pi's built-ins. */
+  customProviderIds?: readonly string[];
 }
 
 export const DEFAULT_FLUE_MODEL = "anthropic/claude-sonnet-4-6";
@@ -65,24 +67,28 @@ function isNonEmptyString(value: unknown): value is string {
 
 /**
  * Pick the `provider/model` specifier Flue should run with. Explicit env wins,
- * then a hosted grclanker setup, then Flue's documented default. A local-first
- * grclanker setup is rejected instead of silently switching providers, because
- * the Flue runtime only registers Pi's built-in hosted providers.
+ * then the `grclanker setup` choice (hosted, or local-first when the adapter
+ * registered that provider from models.json), then Flue's documented default.
+ * A local-first setup whose provider could not be registered is rejected
+ * instead of silently switching providers.
  */
-export function resolveFlueModel(env: NodeJS.ProcessEnv, settings: GrclankerSettings): string {
+export function resolveFlueModel(
+  env: NodeJS.ProcessEnv,
+  settings: GrclankerSettings,
+  customProviderIds: readonly string[] = [],
+): string {
   const explicit = env[FLUE_MODEL_ENV]?.trim();
   if (explicit) return explicit;
 
+  const provider = isNonEmptyString(settings.defaultProvider) ? settings.defaultProvider.trim() : undefined;
   const configured =
-    isNonEmptyString(settings.defaultProvider) && isNonEmptyString(settings.defaultModel)
-      ? `${settings.defaultProvider.trim()}/${settings.defaultModel.trim()}`
-      : undefined;
+    provider && isNonEmptyString(settings.defaultModel) ? `${provider}/${settings.defaultModel.trim()}` : undefined;
 
-  if (settings.modelMode === "local") {
+  if (settings.modelMode === "local" && !(provider && customProviderIds.includes(provider))) {
     throw new GrclankerFlueConfigError(
       [
-        `grclanker is configured for a local model${configured ? ` (${configured})` : ""}, which the Flue runtime cannot serve: it only registers Pi's built-in providers.`,
-        `Set ${FLUE_MODEL_ENV}=<provider/model> (for example ${DEFAULT_FLUE_MODEL}) with that provider's API key in the environment.`,
+        `grclanker is configured for a local model${configured ? ` (${configured})` : ""}, but this adapter found no usable provider entry for "${provider ?? "(unset)"}" in models.json to register with Flue.`,
+        `Rerun grclanker setup, or set ${FLUE_MODEL_ENV}=<provider/model> (for example ${DEFAULT_FLUE_MODEL}) with that provider's API key in the environment.`,
       ].join(" "),
     );
   }
@@ -159,7 +165,7 @@ export function loadGrclankerFlueAgentOptions(input: LoadGrclankerFlueAgentOptio
   const appRoot = resolveFlueAppRoot(input.currentDir);
 
   return {
-    model: resolveFlueModel(input.env, settings),
+    model: resolveFlueModel(input.env, settings, input.customProviderIds),
     sandbox: resolveFlueSandboxMode(input.env),
     cwd: input.cwd,
     content: loadGrclankerAgentContent(appRoot),

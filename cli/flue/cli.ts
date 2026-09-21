@@ -49,9 +49,11 @@ Options:
   --help, -h             Show this help
 
 Environment:
-  GRCLANKER_FLUE_MODEL     provider/model specifier (default: hosted setup, else anthropic/claude-sonnet-4-6)
+  GRCLANKER_FLUE_MODEL     provider/model specifier (default: the grclanker setup choice, else anthropic/claude-sonnet-4-6)
   GRCLANKER_FLUE_SANDBOX   "local" (default) attaches a local sandbox for file and shell tools, "none" disables it
   Provider API keys        for example ANTHROPIC_API_KEY or OPENAI_API_KEY, read by the Flue runtime
+
+Local-first setups (Ollama) are registered from ~/.grclanker/agent/models.json, so the setup choice carries over.
 
 Official CLI alternative (from the cli/ directory):
   npx flue run flue/agent.ts --message "<text>"

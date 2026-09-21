@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import * as v from "valibot";
-import { init, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
+import { init, setProvider, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
 import { start } from "@flue/runtime/node";
 
 import {
@@ -48,6 +49,13 @@ import {
   runGrclankerFlueAgent,
 } from "../dist/flue/run.js";
 import { formatFlueHelp, formatFlueRunOutcome, parseFlueRunArgs, runFlueCommand } from "../dist/flue/cli.js";
+import {
+  createCustomProvider,
+  listCustomProviderConfigs,
+  localProviderConfigFromSettings,
+  registerGrclankerProviders,
+  resolveApiKeyValue,
+} from "../dist/flue/providers.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const cliRoot = resolve(testDir, "..");
@@ -660,9 +668,18 @@ test("model and sandbox resolution follow env, hosted settings, then Flue defaul
     "google/gemini-2.5-pro",
   );
   assert.equal(resolveFlueModel({}, {}), DEFAULT_FLUE_MODEL);
+  assert.equal(
+    resolveFlueModel({}, { modelMode: "local", defaultProvider: "ollama", defaultModel: "gemma4" }, ["ollama"]),
+    "ollama/gemma4",
+    "a local-first setup resolves once its provider is registered",
+  );
   assert.throws(
-    () => resolveFlueModel({}, { modelMode: "local", defaultProvider: "ollama", defaultModel: "gemma4" }),
-    (error) => error instanceof GrclankerFlueConfigError && /ollama\/gemma4/.test(error.message) && /GRCLANKER_FLUE_MODEL/.test(error.message),
+    () => resolveFlueModel({}, { modelMode: "local", defaultProvider: "ollama", defaultModel: "gemma4" }, []),
+    (error) =>
+      error instanceof GrclankerFlueConfigError &&
+      /ollama\/gemma4/.test(error.message) &&
+      /models\.json/.test(error.message) &&
+      /GRCLANKER_FLUE_MODEL/.test(error.message),
   );
 
   assert.equal(resolveFlueSandboxMode({}), "local");
@@ -1003,4 +1020,181 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
   assert.ok(chunks.some((chunk) => chunk.type === "tool-output"));
   assert.ok(chunks.some((chunk) => chunk.type === "tool-output-error"));
   assert.ok(chunks.some((chunk) => chunk.type === "submission-settled" && chunk.outcome === "completed"));
+});
+
+const OLLAMA_MODELS_JSON = {
+  providers: {
+    ollama: {
+      baseUrl: "http://localhost:11434/v1",
+      api: "openai-completions",
+      apiKey: "ollama",
+      compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+      models: [{ id: "gemma4", name: "gemma4 (Local)", reasoning: false, input: ["text"] }],
+    },
+  },
+};
+
+test("custom providers are read from Pi models.json the way grclanker setup writes them", () => {
+  const configs = listCustomProviderConfigs({
+    ...OLLAMA_MODELS_JSON,
+    providers: {
+      ...OLLAMA_MODELS_JSON.providers,
+      "override-only": { baseUrl: "https://example.test" },
+      broken: { models: [{ name: "no id" }] },
+    },
+  });
+  assert.deepEqual(
+    configs.map((config) => config.id),
+    ["ollama"],
+    "entries without their own models are Pi overrides, not providers to register",
+  );
+  assert.equal(configs[0].apiKey, "ollama");
+  assert.deepEqual(configs[0].models, [{ id: "gemma4", name: "gemma4 (Local)", api: undefined, baseUrl: undefined, reasoning: false, input: ["text"], cost: undefined, contextWindow: undefined, maxTokens: undefined, compat: undefined }]);
+  assert.deepEqual(listCustomProviderConfigs({}), []);
+
+  assert.deepEqual(
+    localProviderConfigFromSettings({ modelMode: "local", defaultProvider: "ollama", defaultModel: "gemma4", providerBaseUrl: "http://localhost:11434/v1" }),
+    { id: "ollama", baseUrl: "http://localhost:11434/v1", api: "openai-completions", models: [{ id: "gemma4", name: "gemma4 (Local)" }] },
+  );
+  assert.equal(localProviderConfigFromSettings({ modelMode: "hosted", defaultProvider: "anthropic", defaultModel: "x" }), undefined);
+  assert.equal(localProviderConfigFromSettings({ modelMode: "local", defaultProvider: "ollama" }), undefined);
+
+  assert.equal(resolveApiKeyValue("ollama", {}), "ollama");
+  assert.equal(resolveApiKeyValue("$LOCAL_KEY", { LOCAL_KEY: "abc" }), "abc");
+  assert.equal(resolveApiKeyValue("Bearer ${LOCAL_KEY}", { LOCAL_KEY: "abc" }), "Bearer abc");
+  assert.equal(resolveApiKeyValue("$MISSING_KEY", {}), undefined, "an unset env var means the provider is not configured");
+  assert.throws(() => resolveApiKeyValue("!security find-generic-password", {}), GrclankerFlueConfigError);
+});
+
+test("custom providers build Pi Provider objects with Pi's models.json defaults", () => {
+  const warnings = [];
+  const provider = createCustomProvider(listCustomProviderConfigs(OLLAMA_MODELS_JSON)[0], {}, warnings);
+  assert.equal(provider.id, "ollama");
+  assert.deepEqual(warnings, []);
+  const models = provider.getModels();
+  assert.equal(models.length, 1);
+  assert.deepEqual(
+    { ...models[0] },
+    {
+      id: "gemma4",
+      name: "gemma4 (Local)",
+      api: "openai-completions",
+      provider: "ollama",
+      baseUrl: "http://localhost:11434/v1",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+      compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    },
+  );
+
+  const mixed = createCustomProvider(
+    {
+      id: "mixed",
+      baseUrl: "https://mixed.test/v1",
+      apiKey: "$MIXED_KEY",
+      models: [
+        { id: "chat", api: "openai-completions" },
+        { id: "claude-ish", api: "anthropic-messages", baseUrl: "https://mixed.test/anthropic", contextWindow: 200000 },
+        { id: "unsupported", api: "google-generative-ai" },
+        { id: "no-url", api: "openai-responses", baseUrl: undefined },
+      ],
+    },
+    { MIXED_KEY: "k" },
+    warnings,
+  );
+  assert.deepEqual(mixed.getModels().map((model) => [model.id, model.api, model.baseUrl, model.contextWindow]), [
+    ["chat", "openai-completions", "https://mixed.test/v1", 128000],
+    ["claude-ish", "anthropic-messages", "https://mixed.test/anthropic", 200000],
+    ["no-url", "openai-responses", "https://mixed.test/v1", 128000],
+  ]);
+  assert.deepEqual(warnings, [
+    'Skipping mixed/unsupported for Flue: api "google-generative-ai" is not one of openai-completions, openai-responses, anthropic-messages.',
+  ]);
+
+  assert.equal(createCustomProvider({ id: "empty", models: [{ id: "x", api: "openai-completions" }] }, {}, []), undefined, "no baseUrl anywhere means nothing to serve");
+
+  const registered = [];
+  const result = registerGrclankerProviders({
+    env: {},
+    settings: { modelMode: "local", defaultProvider: "ollama", defaultModel: "gemma4", providerBaseUrl: "http://localhost:11434/v1" },
+    modelsConfig: OLLAMA_MODELS_JSON,
+    setProvider: (candidate) => registered.push(candidate.id),
+  });
+  assert.deepEqual(result, { providerIds: ["ollama"], warnings: [] });
+  assert.deepEqual(registered, ["ollama"], "models.json wins over the settings fallback for the same id");
+
+  const fallback = registerGrclankerProviders({
+    env: {},
+    settings: { modelMode: "local", defaultProvider: "lmstudio", defaultModel: "qwen", providerBaseUrl: "http://localhost:1234/v1" },
+    modelsConfig: {},
+    setProvider: (candidate) => registered.push(candidate.id),
+  });
+  assert.deepEqual(fallback.providerIds, ["lmstudio"]);
+  assert.deepEqual(registerGrclankerProviders({ env: {}, settings: {}, modelsConfig: {}, setProvider: () => assert.fail("nothing to register") }), {
+    providerIds: [],
+    warnings: [],
+  });
+});
+
+test("a local-first grclanker setup runs under Flue through setProvider() against an OpenAI-compatible endpoint", async () => {
+  const requests = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      requests.push({ url: request.url, authorization: request.headers.authorization, body: JSON.parse(body) });
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      const chunk = (delta, finish) =>
+        `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "gemma4", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+      response.write(chunk({ role: "assistant", content: "BoringCrypto holds " }, null));
+      response.write(chunk({ content: "certificate #4407." }, null));
+      response.write(chunk({}, "stop"));
+      response.write("data: [DONE]\n\n");
+      response.end();
+    });
+  });
+  await new Promise((ready) => server.listen(0, "127.0.0.1", ready));
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+
+  try {
+    const settings = { modelMode: "local", providerKind: "ollama", providerBaseUrl: baseUrl, defaultProvider: "ollama", defaultModel: "gemma4" };
+    const modelsConfig = { providers: { ollama: { ...OLLAMA_MODELS_JSON.providers.ollama, baseUrl } } };
+    const registered = registerGrclankerProviders({ env: {}, settings, modelsConfig, setProvider });
+    assert.deepEqual(registered, { providerIds: ["ollama"], warnings: [] });
+
+    const model = resolveFlueModel({}, settings, registered.providerIds);
+    assert.equal(model, "ollama/gemma4");
+
+    const content = loadGrclankerAgentContent(cliRoot);
+    function GrclankerLocalTest() {
+      return renderGrclankerAgent(
+        { useModel, useSandbox, useSkill, useSubagent, useTool },
+        { model, sandbox: "none", cwd: process.cwd(), content, tools: [], createLocalSandbox: () => assert.fail("no sandbox") },
+      );
+    }
+    GrclankerLocalTest.agentName = "grclanker-local-test";
+
+    const flue = await start({ agents: [GrclankerLocalTest] });
+    try {
+      const handle = init(GrclankerLocalTest, { id: "local-e2e-1" });
+      const reply = await handle.read(await handle.dispatch("Is BoringCrypto FIPS validated?"));
+      assert.equal(reply.text, "BoringCrypto holds certificate #4407.");
+    } finally {
+      await flue.stop();
+    }
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "/v1/chat/completions");
+    assert.equal(requests[0].authorization, "Bearer ollama", "the models.json apiKey is sent as in the Pi CLI");
+    assert.equal(requests[0].body.model, "gemma4");
+    assert.equal(requests[0].body.stream, true);
+    assert.match(requests[0].body.messages.find((message) => message.role === "system").content, /GRC Clanker/);
+  } finally {
+    await new Promise((closed) => server.close(closed));
+  }
 });

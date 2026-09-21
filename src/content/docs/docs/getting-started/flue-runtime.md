@@ -57,15 +57,20 @@ The CLI has to be installed next to the runtime it drives. `@flue/runtime` publi
 
 | Setting | Effect |
 | --- | --- |
-| `GRCLANKER_FLUE_MODEL` | `provider/model` specifier, for example `anthropic/claude-sonnet-4-6` or `openai/gpt-5.5`. Without it, a hosted `grclanker setup` provider and model are reused; with no setup at all, `anthropic/claude-sonnet-4-6` is used. |
-| Provider API keys | Read from the environment by the Flue runtime (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and so on). `flue run` also loads a project `.env`. |
+| `GRCLANKER_FLUE_MODEL` | `provider/model` specifier, for example `anthropic/claude-sonnet-4-6`, `openai/gpt-5.5`, or `ollama/gemma4`. Without it, the `grclanker setup` provider and model are reused (hosted or local-first); with no setup at all, `anthropic/claude-sonnet-4-6` is used. |
+| Provider API keys | Read from the environment by the Flue runtime for hosted providers (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and so on). `flue run` also loads a project `.env`. |
 | `GRCLANKER_FLUE_SANDBOX` | `local` (default) attaches Flue's local sandbox for the current directory. `none` runs with domain tools only. |
 | `--db <path>` | SQLite file for conversations. Defaults to `~/.grclanker/flue/conversations.db`; `:memory:` keeps nothing. |
 | `GRCLANKER_HOME` | Honored as in the Pi CLI, both for reading settings and for the default database location. |
 
+## Local-first models
+
+The Flue runtime registers Pi's built-in hosted providers on its own. To keep grclanker's local-first path working, the agent module reads the custom providers `grclanker setup` wrote to `~/.grclanker/agent/models.json` (the Ollama entry, or any other provider with its own `models` list), rebuilds each one with Pi's `createProvider()`, and registers it with Flue's `setProvider()` at module scope, as the Flue Models guide prescribes for custom endpoints. That happens whether the module is loaded by `grclanker flue run` or by `flue run`, so a local-first setup resolves to `ollama/gemma4` without any extra configuration.
+
+Supported `models.json` entries use the `openai-completions`, `openai-responses`, or `anthropic-messages` API with a `baseUrl` on the provider or model; other APIs are skipped with a warning. The `apiKey` may be a literal or an environment variable template such as `$OLLAMA_API_KEY`. Entries whose `apiKey` runs a shell command (`!command`) are refused. Model metadata defaults match the Pi CLI (`contextWindow` 128000, `maxTokens` 16384, zero cost). If a local-first setup has no usable entry, the adapter reports that instead of switching to a hosted provider silently.
+
 ## Limitations
 
-- Local-first models configured through `grclanker setup` (the Ollama path) are not available under Flue. The Flue runtime registers Pi's built-in providers only, and grclanker refuses to switch providers silently. Set `GRCLANKER_FLUE_MODEL` to a supported `provider/model` instead.
 - The Pi compute backends (`host`, `sandbox-runtime`, Docker, Parallels) do not apply. Use `GRCLANKER_FLUE_SANDBOX` to attach or skip Flue's local sandbox, or swap in another Flue sandbox adapter in your own agent module.
 - Flue's runtime validates the raw model arguments against the rendered JSON Schema before the adapter (and therefore any normalizer) sees them. Payloads that a Pi normalizer would have repaired instead return a validation error naming the field, and the model retries: alias keys standing in for a missing required argument, invalid enum values, wrong-typed or out-of-range values a normalizer would drop or clamp, scalars sent for array fields, non-integer numbers for integer fields, and bare non-object payloads. Numeric strings, `"true"` and `"false"`, and numbers for string fields pass that check. One coercion differs in effect: `null` for an optional scalar becomes `0`, `false`, or an empty string at that check instead of being dropped.
 - Tool output reaches the model as a JSON string, because Flue JSON-serializes every tool `output`. Multi-line tables therefore arrive with escaped newlines and quotes rather than as raw text as under Pi.
@@ -77,4 +82,4 @@ The CLI has to be installed next to the runtime it drives. `@flue/runtime` publi
 npm --prefix cli run test:cli
 ```
 
-`cli/tests/flue.test.mjs` covers the schema conversion, tool bridging for all 107 tools, prompt loading, the hook-level render, the runner and command surface, and one end-to-end run on the real Flue runtime with a faux model provider. No test makes a live model call.
+`cli/tests/flue.test.mjs` covers the schema conversion, tool bridging for all 107 tools, a differential check of argument handling against Pi's own loop for every tool, prompt loading, the hook-level render, the runner and command surface, custom provider registration, and two end-to-end runs on the real Flue runtime: one with a faux model provider and one with a local-first provider against a mock OpenAI-compatible server. No test makes a live model call.
