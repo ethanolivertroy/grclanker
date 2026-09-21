@@ -441,6 +441,53 @@ test("verdict rule 7: AnsibleAapClient records truncation when a limit stops bef
   assert.equal(full.complete, true);
 });
 
+test("verdict rule 10: listCollection reports a trimmed last page, a repeated next link, an empty page with next, and a count mismatch as incomplete", async () => {
+  const makeClient = (fetchImpl) => new AnsibleAapClient(
+    { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] },
+    { fetchImpl },
+  );
+
+  const trimmedLastPage = makeClient(async () => jsonResponse({
+    count: 120,
+    next: null,
+    results: Array.from({ length: 120 }, (_, index) => ({ id: index + 1 })),
+  }));
+  const trimmed = await trimmedLastPage.listCollection("/api/v2/activity_stream/", {}, { limit: 10 });
+  assert.equal(trimmed.items.length, 10);
+  assert.equal(trimmed.complete, false, "a limit below the page size must not report the collection complete");
+  assert.equal(trimmed.total, 120);
+  assert.match(trimmed.truncation, /stopped at the requested limit of 10; 110 items on the last page were not collected/);
+
+  let repeatedCalls = 0;
+  const repeatedNext = makeClient(async () => {
+    repeatedCalls += 1;
+    return jsonResponse({ count: 500, next: "/api/v2/organizations/?page=2&page_size=100", results: Array.from({ length: 100 }, (_, index) => ({ id: index + 1 })) });
+  });
+  const repeated = await repeatedNext.listCollection("/api/v2/organizations/");
+  assert.equal(repeated.complete, false);
+  assert.equal(repeatedCalls, 2, "a repeated next link exits after the first repeat instead of looping");
+  assert.match(repeated.truncation, /repeated the same next page link/);
+
+  const emptyWithNext = makeClient(async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const page = Number(url.searchParams.get("page") ?? "1");
+    return jsonResponse({ count: 200, next: `/api/v2/users/?page=${page + 1}&page_size=100`, results: page === 1 ? [{ id: 1 }] : [] });
+  });
+  const stalled = await emptyWithNext.listCollection("/api/v2/users/");
+  assert.equal(stalled.items.length, 1);
+  assert.equal(stalled.complete, false);
+  assert.match(stalled.truncation, /empty page while advertising a next page/);
+
+  const shortCount = makeClient(async () => jsonResponse({ count: 7, next: null, results: [{ id: 1 }, { id: 2 }] }));
+  const mismatch = await shortCount.listCollection("/api/v2/teams/");
+  assert.equal(mismatch.complete, false);
+  assert.equal(mismatch.total, 7);
+  assert.match(mismatch.truncation, /reported 7 items but only 2 were returned/);
+
+  const noCount = makeClient(async () => jsonResponse({ results: [{ id: 1 }] }));
+  assert.equal(await noCount.count("/api/v2/teams/"), undefined, "a missing count is reported as unknown, not as the probe page size");
+});
+
 test("checkAnsibleAccess reports readable AAP audit surfaces and visibility", async () => {
   const counts = {
     "/api/v2/organizations/": 2,

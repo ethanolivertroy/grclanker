@@ -745,21 +745,47 @@ export class AnsibleAapClient {
     let next: string | null = appendQuery(path, { page_size: DEFAULT_PAGE_SIZE, ...query });
     const items: JsonRecord[] = [];
     let total: number | undefined;
+    let dropped = 0;
+    let stalled: string | undefined;
 
     while (next && items.length < limit) {
       const page: AapListResponse<JsonRecord> | JsonRecord[] = await this.get<AapListResponse<JsonRecord> | JsonRecord[]>(next);
       const results = Array.isArray(page) ? page : page.results ?? [];
       if (!Array.isArray(page) && typeof page.count === "number") total = page.count;
-      items.push(...results.slice(0, limit - items.length));
-      next = Array.isArray(page) ? null : page.next ?? null;
+      const remaining = limit - items.length;
+      if (results.length > remaining) dropped += results.length - remaining;
+      items.push(...results.slice(0, remaining));
+      const following: string | null = Array.isArray(page) ? null : page.next ?? null;
+      if (following && following === next) {
+        stalled = "the API repeated the same next page link, so the walk was stopped";
+        break;
+      }
+      if (following && results.length === 0) {
+        stalled = "the API returned an empty page while advertising a next page, so the walk was stopped";
+        break;
+      }
+      next = following;
     }
 
-    if (next) {
+    if (stalled) {
+      return { items, complete: false, total, truncation: stalled };
+    }
+    if (next || dropped > 0) {
       return {
         items,
         complete: false,
         total,
-        truncation: `stopped at the requested limit of ${limit} with a next page still available`,
+        truncation: dropped > 0 && !next
+          ? `stopped at the requested limit of ${limit}; ${dropped} items on the last page were not collected`
+          : `stopped at the requested limit of ${limit} with a next page still available`,
+      };
+    }
+    if (total !== undefined && items.length < total) {
+      return {
+        items,
+        complete: false,
+        total,
+        truncation: `the API reported ${total} items but only ${items.length} were returned across every page`,
       };
     }
     return { items, complete: true, total: total ?? items.length };
@@ -774,9 +800,9 @@ export class AnsibleAapClient {
     return collection.items as T[];
   }
 
-  async count(path: string): Promise<number> {
+  async count(path: string): Promise<number | undefined> {
     const page = await this.get<AapListResponse<unknown>>(appendQuery(path, { page_size: 1 }));
-    return typeof page.count === "number" ? page.count : page.results?.length ?? 0;
+    return typeof page.count === "number" ? page.count : undefined;
   }
 
   getNow(): Date {
