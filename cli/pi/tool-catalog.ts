@@ -44,6 +44,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["kevs_", "KEV / EPSS"],
   ["launchdarkly_", "LaunchDarkly"],
   ["knowbe4_", "KnowBe4"],
+  ["mulesoft_", "MuleSoft"],
   ["oci_", "OCI"],
   ["okta_", "Okta"],
   ["oscal_", "OSCAL"],

@@ -38,6 +38,7 @@ import { installGrclankerHeader } from "./grc-tools/header.js";
 import { registerKevsTools } from "./grc-tools/kevs.js";
 import { registerLaunchdarklyTools } from "./grc-tools/launchdarkly.js";
 import { registerKnowbe4Tools } from "./grc-tools/knowbe4.js";
+import { registerMulesoftTools } from "./grc-tools/mulesoft.js";
 import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOciTools } from "./grc-tools/oci.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
@@ -70,6 +71,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerKevsTools,
   registerLaunchdarklyTools,
   registerKnowbe4Tools,
+  registerMulesoftTools,
   registerOciTools,
   registerOktaTools,
   registerOscalTools,

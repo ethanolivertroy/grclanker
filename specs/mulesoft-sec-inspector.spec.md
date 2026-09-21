@@ -3,20 +3,35 @@ slug: "mulesoft-sec-inspector"
 name: "MuleSoft Security Inspector"
 vendor: "MuleSoft"
 category: "devops-developer-platforms"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/mulesoft-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# MuleSoft Anypoint Platform Security Inspector — Architecture Specification
+# MuleSoft Anypoint Platform Security Inspector - Architecture Specification
 
 ## 1. Overview
 
 MuleSoft Anypoint Platform Security Inspector is a hybrid CLI/TUI tool that audits the security posture of a MuleSoft Anypoint Platform organization. It connects to the Anypoint Platform REST APIs to evaluate identity and access management, API gateway policies, runtime security, environment isolation, and audit logging. The tool produces structured findings mapped to enterprise compliance frameworks and outputs reports in JSON, CSV, and HTML formats.
 
 The inspector targets Anypoint Platform organizations on Enterprise and Titanium tiers where advanced RBAC, external identity management, and dedicated infrastructure capabilities are available. It operates in read-only mode and requires no agent installation on CloudHub workers or runtime servers.
+
+### grclanker implementation
+
+The shipped implementation is the native TypeScript module `cli/extensions/grc-tools/mulesoft.ts` in [grclanker](https://github.com/hackIDLE/grclanker), not the standalone Go binary sketched in sections 7 to 9. It registers six read-only tools:
+
+| Tool | Covers |
+|------|--------|
+| `mulesoft_check_access` | Probes every read surface used below and names the missing permission for each 401 or 403 |
+| `mulesoft_assess_identity_access` | Controls 1-6, 18, 19, 25 |
+| `mulesoft_assess_api_gateway` | Controls 7-9, 20 |
+| `mulesoft_assess_runtime_infrastructure` | Controls 10-16, 21-23 |
+| `mulesoft_assess_audit_monitoring` | Controls 17, 24 |
+| `mulesoft_export_audit_bundle` | Runs the access check and all four assessments, then writes the evidence bundle and `.zip` |
+
+Finding ids follow `MULESOFT-IAM-nn`, `MULESOFT-API-nn`, `MULESOFT-RT-nn`, and `MULESOFT-AUD-nn`, where `nn` is the control number from section 4. Every finding carries the eight framework mappings from section 5. Setup, permissions, and status semantics are documented in `src/content/docs/docs/integrations/mulesoft.md`.
 
 ## 2. APIs & SDKs
 
@@ -47,6 +62,7 @@ The inspector targets Anypoint Platform organizations on Enterprise and Titanium
 | `/armui/api/v1/organizations/{orgId}/environments/{envId}/serverGroups` | GET | List server groups and clusters |
 | `/audit/v2/organizations/{orgId}/query` | POST | Query audit log entries with filters |
 | `/audit/v2/organizations/{orgId}/platforms` | GET | Get available audit log platforms |
+| `/audit/v2/organizations/{orgId}/retentionSettings` | GET | Get audit log retention period entries (evidence for control 17) |
 | `/mq/admin/api/v1/organizations/{orgId}/environments/{envId}/regions` | GET | List MQ regions and access config |
 | `/mq/admin/api/v1/organizations/{orgId}/environments/{envId}/regions/{regionId}/queues` | GET | List message queues |
 | `/secrets/api/v1/organizations/{orgId}/environments/{envId}/secretGroups` | GET | List Secrets Manager groups |
@@ -62,8 +78,8 @@ There is no official Python SDK for the Anypoint Platform management APIs. The i
 
 | Package | Notes |
 |---------|-------|
-| Direct REST via `net/http` | Recommended approach — full API coverage, no third-party dependency |
-| `anypoint-cli` (MuleSoft official) | Node.js CLI — reference implementation for endpoint behavior |
+| Direct REST via `net/http` | Recommended approach: full API coverage, no third-party dependency |
+| `anypoint-cli` (MuleSoft official) | Node.js CLI, reference implementation for endpoint behavior |
 
 ## 3. Authentication
 
@@ -73,7 +89,7 @@ There is no official Python SDK for the Anypoint Platform management APIs. The i
 | Connected App (client credentials) | `Authorization: Bearer {token}` | Automated pipelines; OAuth client_credentials grant |
 | Connected App (authorization code) | `Authorization: Bearer {token}` | Delegated user context; OAuth authorization_code grant |
 
-**Token acquisition — client credentials flow:**
+**Token acquisition, client credentials flow:**
 ```
 POST https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
 Content-Type: application/json
@@ -81,7 +97,7 @@ Content-Type: application/json
 {"grant_type": "client_credentials", "client_id": "...", "client_secret": "..."}
 ```
 
-**Token acquisition — username/password:**
+**Token acquisition, username/password:**
 ```
 POST https://anypoint.mulesoft.com/accounts/login
 Content-Type: application/json
@@ -165,12 +181,12 @@ The tool never stores credentials beyond the current session. Tokens and secrets
 
 | Tool | Type | Overlap | Gap Addressed |
 |------|------|---------|---------------|
-| Anypoint CLI (`anypoint-cli`) | Official CLI | Operational management — no security posture analysis | No automated compliance assessment |
-| Anypoint Monitoring | Native | Performance/availability metrics — no security controls | No security control evaluation or compliance mapping |
+| Anypoint CLI (`anypoint-cli`) | Official CLI | Operational management, no security posture analysis | No automated compliance assessment |
+| Anypoint Monitoring | Native | Performance/availability metrics, no security controls | No security control evaluation or compliance mapping |
 | MuleSoft Audit Log (built-in) | Native | Logs actions but does not evaluate posture | No automated security posture scoring |
-| API Governance (Exchange) | Native | API conformance checks — no platform-level security | No IAM, runtime, or infrastructure security review |
-| Prowler | Cloud security | AWS/Azure/GCP focused — no SaaS integration platform coverage | No MuleSoft-specific controls |
-| ScoutSuite | Cloud security | Multi-cloud auditor — no SaaS platform support | No Anypoint Platform coverage |
+| API Governance (Exchange) | Native | API conformance checks, no platform-level security | No IAM, runtime, or infrastructure security review |
+| Prowler | Cloud security | AWS/Azure/GCP focused, no SaaS integration platform coverage | No MuleSoft-specific controls |
+| ScoutSuite | Cloud security | Multi-cloud auditor, no SaaS platform support | No Anypoint Platform coverage |
 | Steampipe | SQL query engine | No MuleSoft plugin available | No Anypoint Platform data source |
 
 ## 7. Architecture
@@ -322,4 +338,40 @@ goreleaser release --clean
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as the native TypeScript module `cli/extensions/grc-tools/mulesoft.ts`, with mocked API coverage in `cli/tests/mulesoft.test.mjs`, a live smoke script at `cli/scripts/mulesoft-live-smoke.mjs` (`npm --prefix cli run test:mulesoft:live`, skips when no credentials are present), and an integration guide at `src/content/docs/docs/integrations/mulesoft.md`. Sections 7 to 9 describe the original standalone Go design and are retained for reference only.
+
+### Shipped
+
+- Six read-only tools: `mulesoft_check_access`, `mulesoft_assess_identity_access`, `mulesoft_assess_api_gateway`, `mulesoft_assess_runtime_infrastructure`, `mulesoft_assess_audit_monitoring`, and `mulesoft_export_audit_bundle`. No tool issues a write request other than the token exchange and the audit log query (`POST` by API design).
+- All 25 controls in section 4 produce a finding with the framework mappings from section 5. Controls 9 (client credential rotation), 20 (Exchange governance review), and 21 (Anypoint MQ scoping) never pass because no public API exposes the deciding evidence; controls 2, 12, 13, 14, 15, 16, 23, and 25 return `manual` with the exact evidence to collect when the API cannot settle them or the control does not apply (no MFA exemptions found, no persistent queues, no Anypoint VPC, no dedicated load balancer, no certificate probed, no hybrid server, no business group entitlement).
+- Verdict safety: an unreadable or forbidden primary source yields `manual` naming the HTTP cause; an empty inventory is `fail` or `manual` per control and never `pass`; controls that do not apply are `manual`; items without dates yield at most `warn`; partial views (environment filters and limits, API and application caps, truncated pages, a credential scoped to a business group) downgrade `pass` to `warn` with seen and total counts; every deciding flag (`isFederated`, `allow_new_non_sso_users`, `mfaVerificationExcluded`, policy `disabled`, `tlsv1` and `httpMode`, `persistentQueuesEncrypted`, property `secure`, alert `enabled`, `entitlements.createSubOrgs`) must be present to support `pass`; every paginated list records whether it was truncated; and re-running the export never overwrites a prior bundle or archive.
+- Authentication: connected app client credentials (`POST /accounts/api/v2/oauth2/token`), username and password (`POST /accounts/login`), and a pre-issued bearer token, chosen in the order token, connected app, credentials. Every setting resolves as explicit tool argument, then environment variable, then `~/.config/mulesoft-sec-inspector/config.toml` (path override: `config_file` argument or `MULESOFT_SEC_INSPECTOR_CONFIG`). Environment variables: `ANYPOINT_ORG_ID`, `ANYPOINT_CLIENT_ID`, `ANYPOINT_CLIENT_SECRET`, `ANYPOINT_USERNAME`, `ANYPOINT_PASSWORD`, `ANYPOINT_TOKEN`, `ANYPOINT_CONTROL_PLANE`, `ANYPOINT_BASE_URL`, `ANYPOINT_ENVIRONMENTS`, `ANYPOINT_TIMEOUT`.
+- Control planes `us`, `eu`, and `gov` map to the base URLs in section 2; `base_url` accepts any other host.
+- Client: organization and environment scoping (`X-ANYPNT-ORG-ID`, `X-ANYPNT-ENV-ID`), `limit` and `offset` pagination, retry with backoff on 429 and 5xx, per-request timeouts, and redaction of secrets, tokens, and passwords in errors, tool output, and bundle snapshots.
+- Audit bundle: `core_data/` raw snapshots, `analysis/` findings and category summaries, `compliance/` executive summary, unified matrix, and one report per framework in section 5, `QUICK_REFERENCE.md`, `_errors.log` on partial collection failure, and a `.zip`, written under an output path that rejects traversal and symlinked parents.
+
+### Deviations from this spec
+
+Where this document and the official Anypoint Platform API specifications on Anypoint Exchange disagreed, the implementation follows the published specifications:
+
+| This spec | Implementation | Source |
+|-----------|----------------|--------|
+| `/cloudhub/api/v2/vpcs`, `/cloudhub/api/v2/vpcs/{vpcId}`, `/cloudhub/api/v2/dlbs` | `/cloudhub/api/organizations/{orgId}/vpcs`, `/cloudhub/api/organizations/{orgId}/vpcs/{vpcId}`, `/cloudhub/api/organizations/{orgId}/loadbalancers` | CloudHub API |
+| `/cloudhub/api/v2/applications` with no scoping | Same path plus the `X-ANYPNT-ENV-ID` header; `/cloudhub/api/v2/alerts` added for control 24 | CloudHub API |
+| `/armui/api/v1/organizations/{orgId}/environments/{envId}/servers` | `/hybrid/api/v1/servers` and `/hybrid/api/v1/alerts` scoped by `X-ANYPNT-ORG-ID` and `X-ANYPNT-ENV-ID` headers | ARM REST Services |
+| `/exchange/api/v2/assets` | `/exchange/api/v2/assets/search` with `limit` and `offset` | Exchange API v2 |
+| `/mq/admin/api/v1/.../regions/{regionId}/queues` | `/mq/admin/api/v1/organizations/{orgId}/environments/{envId}/regions/{regionId}/destinations/queues` and `/environments/{envId}/clients` | Anypoint MQ Admin API |
+| `/secrets/api/v1/.../secretGroups` | `/secrets-manager/api/v1/organizations/{orgId}/environments/{envId}/secretGroups` | Secrets Manager API |
+| `/monitoring/api/v1/.../applications` | No public Anypoint Monitoring alerts API exists; control 24 uses CloudHub and Runtime Manager alerts and asks for Anypoint Monitoring exports as manual evidence | Anypoint Monitoring docs |
+| `/accounts/api/organizations/{orgId}/users/{userId}` for per-user MFA status | `/accounts/api/organizations/{orgId}/users?mfaVerificationExcluded=true`; organization-wide MFA enforcement is not exposed, so control 2 fails only on exempt users and is otherwise manual | Access Management API |
+| DLB cipher suites and certificate expiry from `/dlbs/{dlbId}` | The load balancer API returns TLS version flags and `httpMode` but no certificate dates or cipher list; control 16 performs a live TLS handshake with `node:tls` and control 15 evaluates the version flags only | CloudHub API |
+| Configuration precedence with username and password ranked below client credentials environment variables | Argument, environment variable, then config file for every setting; the auth mode is selected from whichever credential set is complete | grclanker convention |
+| JSON, CSV, HTML reports and a Bubble Tea TUI | grclanker findings plus the Markdown, JSON, and `.zip` audit bundle; no standalone binary | grclanker tool model |
+
+### Remaining
+
+- Live validation against a real Anypoint Platform organization on each control plane; the smoke script is wired but has only been exercised against mocked responses.
+- CloudHub 2.0 private spaces and Runtime Fabric inventory; controls 13 and 14 fall back to `manual` when no Anypoint VPC is visible.
+- Anypoint Monitoring alert inventory if MuleSoft publishes a public alerts API.
+- API Governance conformance results and client secret rotation timestamps if Exchange or API Manager expose them (controls 9 and 20).
+- Rate limit figures in section 2 were not confirmed against current documentation; the client relies on 429 retry rather than fixed budgets.
