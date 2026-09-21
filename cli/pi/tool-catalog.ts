@@ -50,6 +50,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["okta_", "Okta"],
   ["oscal_", "OSCAL"],
   ["paloalto_", "Palo Alto Networks"],
+  ["pagerduty_", "PagerDuty"],
   ["scf_", "SCF"],
   ["slack_", "Slack"],
   ["vanta_", "Vanta"],

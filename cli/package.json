@@ -47,6 +47,7 @@
     "test:okta:live": "npm run build && node scripts/okta-live-smoke.mjs",
     "test:oscal:live": "npm run build && node scripts/oscal-live-smoke.mjs",
     "test:paloalto:live": "npm run build && node scripts/paloalto-live-smoke.mjs",
+    "test:pagerduty:live": "npm run build && node scripts/pagerduty-live-smoke.mjs",
     "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },
