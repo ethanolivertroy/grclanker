@@ -768,6 +768,17 @@ export class QualysApiClient {
     return url.toString();
   }
 
+  // Pagination follows absolute WARNING/URL continuations; error text keeps only the
+  // endpoint path so the Qualys error code and message fit inside finding summaries.
+  private endpointLabel(pathOrUrl: string): string {
+    if (!/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+    try {
+      return new URL(pathOrUrl).pathname;
+    } catch {
+      return pathOrUrl;
+    }
+  }
+
   private async fetchGatewayToken(): Promise<string> {
     if (!this.config.username || !this.config.password) {
       throw new Error("Qualys OAuth mode requires QUALYS_USERNAME and QUALYS_PASSWORD.");
@@ -880,12 +891,13 @@ export class QualysApiClient {
     const response = await this.rawRequest("GET", url);
     const document = looksLikeXml(response.text) ? parseXml(response.text) : undefined;
     const errorSummary = document ? xmlErrorSummary(document) : undefined;
+    const label = this.endpointLabel(path);
     if (response.status >= 400 || errorSummary) {
       const detail = errorSummary ?? response.text.replace(/\s+/g, " ").slice(0, 240);
-      throw new Error(redactSecrets(`Qualys request failed (${response.status}) for ${path}${detail ? `: ${detail}` : ""}`, this.config));
+      throw new Error(redactSecrets(`Qualys request failed (${response.status}) for ${label}${detail ? `: ${detail}` : ""}`, this.config));
     }
     if (!document) {
-      throw new Error(`Qualys request for ${path} did not return XML.`);
+      throw new Error(`Qualys request for ${label} did not return XML.`);
     }
     return document;
   }
@@ -893,12 +905,13 @@ export class QualysApiClient {
   async getText(path: string, query: JsonRecord = {}): Promise<string> {
     const url = this.buildUrl(path, query);
     const response = await this.rawRequest("GET", url, { accept: "text/csv, application/xml" });
+    const label = this.endpointLabel(path);
     if (looksLikeXml(response.text)) {
       const errorSummary = xmlErrorSummary(parseXml(response.text));
-      if (errorSummary) throw new Error(`Qualys request failed (${response.status}) for ${path}: ${errorSummary}`);
+      if (errorSummary) throw new Error(`Qualys request failed (${response.status}) for ${label}: ${errorSummary}`);
     }
     if (response.status >= 400) {
-      throw new Error(redactSecrets(`Qualys request failed (${response.status}) for ${path}: ${response.text.replace(/\s+/g, " ").slice(0, 240)}`, this.config));
+      throw new Error(redactSecrets(`Qualys request failed (${response.status}) for ${label}: ${response.text.replace(/\s+/g, " ").slice(0, 240)}`, this.config));
     }
     return response.text;
   }
