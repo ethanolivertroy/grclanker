@@ -1012,8 +1012,8 @@ test("scrubbing recognizes transformed echoes: encodings, reflowed PEM, case cha
     `stripped ${REDACTED_VALUE}; encoded ${REDACTED_VALUE}; padded ${REDACTED_VALUE}`,
   );
 
-  // A form-encoded request body echoes the value the way URLSearchParams writes it (space to +, and ~ ! ' ( ) * percent-encoded),
-  // which differs from encodeURIComponent; both spellings must be scrubbed.
+  // A form-encoded request body echoes the value the way URLSearchParams writes it (space to +, and ~ ! ' ( ) percent-encoded,
+  // while * is left alone by both encodings), which differs from encodeURIComponent; both spellings must be scrubbed.
   const spaced = "abcd efgh~!'()*end";
   const formEncoded = new URLSearchParams({ v: spaced }).toString().slice(2);
   const componentEncoded = encodeURIComponent(spaced);

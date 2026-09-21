@@ -168,7 +168,7 @@ function urlEncoded(value: string): string | undefined {
 /**
  * The application/x-www-form-urlencoded form `URLSearchParams` produces for a
  * field value, as in an echoed request body: spaces become `+`, and
- * `~ ! ' ( ) *` are percent-encoded.
+ * `~ ! ' ( )` are percent-encoded (`*` is left alone by both encodings).
  */
 function formEncoded(value: string): string {
   return new URLSearchParams({ v: value }).toString().slice("v=".length);
