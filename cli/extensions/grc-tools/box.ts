@@ -203,6 +203,7 @@ export interface BoxAssessmentResult {
   summary: JsonRecord;
   findings: BoxFinding[];
   errors: string[];
+  truncated: string[];
 }
 
 export interface BoxAuditBundleResult {
@@ -213,10 +214,16 @@ export interface BoxAuditBundleResult {
   errorCount: number;
 }
 
+export interface BoxListPage {
+  items: JsonRecord[];
+  truncated: boolean;
+}
+
 export interface CollectedDataset<T> {
   data: T;
   error?: string;
   statusCode?: number;
+  truncated?: boolean;
 }
 
 type AuthArgs = {
@@ -250,6 +257,7 @@ type SharingArgs = AuthArgs & {
   event_limit?: number;
   lookback_days?: number;
   stale_allowlist_days?: number;
+  list_limit?: number;
 };
 
 type GovernanceArgs = AuthArgs & {
@@ -278,6 +286,7 @@ export interface BoxSharingOptions {
   eventLimit?: number;
   lookbackDays?: number;
   staleAllowlistDays?: number;
+  listLimit?: number;
 }
 
 export interface BoxGovernanceOptions {
@@ -913,22 +922,26 @@ export interface BoxReadClient {
   getCurrentUser(): Promise<JsonRecord>;
   resolveEnterpriseId(): Promise<string>;
   getEnterpriseConfiguration(categories?: string[]): Promise<JsonRecord>;
-  listUsers(limit?: number): Promise<JsonRecord[]>;
-  listGroups(limit?: number): Promise<JsonRecord[]>;
-  listEnterpriseEvents(options?: { eventTypes?: string[]; createdAfter?: Date; limit?: number }): Promise<JsonRecord[]>;
-  listDevicePinners(limit?: number): Promise<JsonRecord[]>;
-  listRetentionPolicies(limit?: number): Promise<JsonRecord[]>;
-  listRetentionPolicyAssignments(policyId: string, limit?: number): Promise<JsonRecord[]>;
-  listLegalHoldPolicies(limit?: number): Promise<JsonRecord[]>;
-  listLegalHoldPolicyAssignments(policyId: string, limit?: number): Promise<JsonRecord[]>;
-  listShieldInformationBarriers(limit?: number): Promise<JsonRecord[]>;
-  listShieldInformationBarrierSegments(barrierId: string, limit?: number): Promise<JsonRecord[]>;
-  listShieldLists(): Promise<JsonRecord[]>;
-  listCollaborationAllowlistEntries(limit?: number): Promise<JsonRecord[]>;
-  listCollaborationAllowlistExemptTargets(limit?: number): Promise<JsonRecord[]>;
-  listEnterpriseMetadataTemplates(limit?: number): Promise<JsonRecord[]>;
+  listUsers(limit?: number): Promise<BoxListPage>;
+  listGroups(limit?: number): Promise<BoxListPage>;
+  listEnterpriseEvents(options?: { eventTypes?: string[]; createdAfter?: Date; limit?: number }): Promise<BoxListPage>;
+  listDevicePinners(limit?: number): Promise<BoxListPage>;
+  listRetentionPolicies(limit?: number): Promise<BoxListPage>;
+  listRetentionPolicyAssignments(policyId: string, limit?: number): Promise<BoxListPage>;
+  listLegalHoldPolicies(limit?: number): Promise<BoxListPage>;
+  listLegalHoldPolicyAssignments(policyId: string, limit?: number): Promise<BoxListPage>;
+  listShieldInformationBarriers(limit?: number): Promise<BoxListPage>;
+  listShieldInformationBarrierSegments(barrierId: string, limit?: number): Promise<BoxListPage>;
+  listShieldLists(): Promise<BoxListPage>;
+  listCollaborationAllowlistEntries(limit?: number): Promise<BoxListPage>;
+  listCollaborationAllowlistExemptTargets(limit?: number): Promise<BoxListPage>;
+  listEnterpriseMetadataTemplates(limit?: number): Promise<BoxListPage>;
   getClassificationTemplate(): Promise<JsonRecord>;
-  listTermsOfServices(): Promise<JsonRecord[]>;
+  listTermsOfServices(): Promise<BoxListPage>;
+}
+
+function completePage(items: JsonRecord[]): BoxListPage {
+  return { items, truncated: false };
 }
 
 export class BoxApiClient implements BoxReadClient {
@@ -1186,49 +1199,68 @@ export class BoxApiClient implements BoxReadClient {
     path: string,
     query: JsonRecord = {},
     options: { limit?: number; pageSize?: number; useMarkerFlag?: boolean; headers?: Record<string, string> } = {},
-  ): Promise<JsonRecord[]> {
+  ): Promise<BoxListPage> {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, 100_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 1000);
     const items: JsonRecord[] = [];
     let marker: string | undefined;
+    let truncated = false;
 
-    while (items.length < limit) {
+    while (true) {
+      const remaining = limit - items.length;
       const payload = await this.get(path, {
         ...query,
-        limit: Math.min(pageSize, limit - items.length),
+        limit: Math.min(pageSize, remaining),
         ...(options.useMarkerFlag ? { usemarker: "true" } : {}),
         marker,
       }, options.headers);
       const entries = asRecordArray(payload.entries);
-      items.push(...entries.slice(0, limit - items.length));
+      items.push(...entries.slice(0, remaining));
       const nextMarker = asString(payload.next_marker);
-      if (!nextMarker || entries.length === 0) break;
+      if (entries.length === 0) break;
+      if (entries.length > remaining) {
+        truncated = true;
+        break;
+      }
+      if (!nextMarker) break;
+      if (items.length >= limit) {
+        truncated = true;
+        break;
+      }
       marker = nextMarker;
     }
 
-    return items;
+    return { items, truncated };
   }
 
   async listOffset(
     path: string,
     query: JsonRecord = {},
     options: { limit?: number; pageSize?: number } = {},
-  ): Promise<JsonRecord[]> {
+  ): Promise<BoxListPage> {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, 10_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 1000);
     const items: JsonRecord[] = [];
     let offset = 0;
+    let truncated = false;
 
-    while (items.length < limit) {
-      const payload = await this.get(path, { ...query, limit: Math.min(pageSize, limit - items.length), offset });
+    while (true) {
+      const remaining = limit - items.length;
+      const requested = Math.min(pageSize, remaining);
+      const payload = await this.get(path, { ...query, limit: requested, offset });
       const entries = asRecordArray(payload.entries);
-      items.push(...entries.slice(0, limit - items.length));
+      items.push(...entries.slice(0, remaining));
       offset += entries.length;
       const totalCount = asNumber(payload.total_count);
-      if (entries.length === 0 || (totalCount !== undefined && offset >= totalCount)) break;
+      const moreAvailable = totalCount !== undefined ? offset < totalCount : entries.length >= requested;
+      if (entries.length === 0 || !moreAvailable) break;
+      if (items.length >= limit) {
+        truncated = true;
+        break;
+      }
     }
 
-    return items;
+    return { items, truncated };
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
@@ -1261,85 +1293,91 @@ export class BoxApiClient implements BoxReadClient {
     );
   }
 
-  async listUsers(limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listUsers(limit = DEFAULT_USER_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/users", { fields: USER_FIELDS }, { limit, pageSize: DEFAULT_USER_PAGE_SIZE, useMarkerFlag: true });
   }
 
-  async listGroups(limit = DEFAULT_GROUP_LIMIT): Promise<JsonRecord[]> {
+  async listGroups(limit = DEFAULT_GROUP_LIMIT): Promise<BoxListPage> {
     return this.listOffset("/groups", { fields: GROUP_FIELDS }, { limit, pageSize: 1000 });
   }
 
-  async listEnterpriseEvents(options: { eventTypes?: string[]; createdAfter?: Date; limit?: number } = {}): Promise<JsonRecord[]> {
+  async listEnterpriseEvents(options: { eventTypes?: string[]; createdAfter?: Date; limit?: number } = {}): Promise<BoxListPage> {
     const limit = clampNumber(options.limit, DEFAULT_EVENT_LIMIT, 1, 100_000);
     const key = `EVENTS ${JSON.stringify([options.eventTypes ?? [], options.createdAfter?.toISOString() ?? null, limit])}`;
     return this.memoized(key, async () => {
       const items: JsonRecord[] = [];
       let streamPosition: string | undefined;
-      while (items.length < limit) {
+      let truncated = false;
+      while (true) {
+        const remaining = limit - items.length;
         const payload = await this.requestJson(this.buildUrl("/events", {
           stream_type: "admin_logs",
-          limit: Math.min(DEFAULT_EVENT_PAGE_SIZE, limit - items.length),
+          limit: Math.min(DEFAULT_EVENT_PAGE_SIZE, remaining),
           event_type: options.eventTypes && options.eventTypes.length > 0 ? options.eventTypes.join(",") : undefined,
           created_after: options.createdAfter?.toISOString(),
           stream_position: streamPosition,
         }), { method: "GET" });
         const entries = asRecordArray(payload.entries);
-        items.push(...entries.slice(0, limit - items.length));
+        items.push(...entries.slice(0, remaining));
         const nextPosition = asString(payload.next_stream_position);
         if (entries.length === 0 || !nextPosition || nextPosition === streamPosition) break;
+        if (entries.length > remaining || items.length >= limit) {
+          truncated = true;
+          break;
+        }
         streamPosition = nextPosition;
       }
-      return items;
+      return { items, truncated };
     });
   }
 
-  async listDevicePinners(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listDevicePinners(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     const enterpriseId = await this.resolveEnterpriseId();
     return this.listMarker(`/enterprises/${encodeURIComponent(enterpriseId)}/device_pinners`, {}, { limit });
   }
 
-  async listRetentionPolicies(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listRetentionPolicies(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/retention_policies", {
       fields: "id,type,policy_name,policy_type,retention_length,retention_type,disposition_action,status,assignment_counts,created_at,modified_at",
     }, { limit });
   }
 
-  async listRetentionPolicyAssignments(policyId: string, limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listRetentionPolicyAssignments(policyId: string, limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker(`/retention_policies/${encodeURIComponent(policyId)}/assignments`, {}, { limit });
   }
 
-  async listLegalHoldPolicies(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listLegalHoldPolicies(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/legal_hold_policies", {
       fields: "id,type,policy_name,description,status,assignment_counts,created_at,modified_at",
     }, { limit });
   }
 
-  async listLegalHoldPolicyAssignments(policyId: string, limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listLegalHoldPolicyAssignments(policyId: string, limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/legal_hold_policy_assignments", { policy_id: policyId }, { limit });
   }
 
-  async listShieldInformationBarriers(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listShieldInformationBarriers(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/shield_information_barriers", {}, { limit });
   }
 
-  async listShieldInformationBarrierSegments(barrierId: string, limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listShieldInformationBarrierSegments(barrierId: string, limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/shield_information_barrier_segments", { shield_information_barrier_id: barrierId }, { limit });
   }
 
-  async listShieldLists(): Promise<JsonRecord[]> {
+  async listShieldLists(): Promise<BoxListPage> {
     const payload = await this.get("/shield_lists", {}, { "box-version": BOX_VERSION_HEADER });
-    return asRecordArray(payload.entries);
+    return completePage(asRecordArray(payload.entries));
   }
 
-  async listCollaborationAllowlistEntries(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listCollaborationAllowlistEntries(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/collaboration_whitelist_entries", {}, { limit });
   }
 
-  async listCollaborationAllowlistExemptTargets(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listCollaborationAllowlistExemptTargets(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/collaboration_whitelist_exempt_targets", {}, { limit });
   }
 
-  async listEnterpriseMetadataTemplates(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listEnterpriseMetadataTemplates(limit = DEFAULT_LIST_LIMIT): Promise<BoxListPage> {
     return this.listMarker("/metadata_templates/enterprise", {}, { limit });
   }
 
@@ -1347,9 +1385,9 @@ export class BoxApiClient implements BoxReadClient {
     return this.get(`/metadata_templates/enterprise/${CLASSIFICATION_TEMPLATE_KEY}/schema`);
   }
 
-  async listTermsOfServices(): Promise<JsonRecord[]> {
+  async listTermsOfServices(): Promise<BoxListPage> {
     const payload = await this.get("/terms_of_services");
-    return asRecordArray(payload.entries);
+    return completePage(asRecordArray(payload.entries));
   }
 }
 
@@ -1365,8 +1403,35 @@ async function collect<T>(loader: () => Promise<T>, fallback: T): Promise<Collec
   }
 }
 
+async function collectList(loader: () => Promise<BoxListPage>): Promise<CollectedDataset<JsonRecord[]>> {
+  const collected = await collect(loader, completePage([]));
+  return {
+    data: collected.data.items,
+    error: collected.error,
+    statusCode: collected.statusCode,
+    truncated: collected.data.truncated,
+  };
+}
+
 function datasetErrors(label: string, dataset: CollectedDataset<unknown>): string[] {
   return dataset.error ? [`${label}: ${dataset.error}`] : [];
+}
+
+function datasetRecordCount(data: unknown): number | null {
+  if (Array.isArray(data)) return data.length;
+  const record = asObject(data);
+  if (!record) return null;
+  const values = Object.values(record);
+  if (values.length > 0 && values.every((value) => Array.isArray(value))) {
+    return values.reduce((total, items) => total + (items as unknown[]).length, 0);
+  }
+  return values.length > 0 ? 1 : 0;
+}
+
+function datasetTruncations(label: string, dataset: CollectedDataset<unknown>, limitOption?: string): string[] {
+  if (!dataset.truncated) return [];
+  const remedy = limitOption ? `raise ${limitOption} and rerun` : `the built-in ${DEFAULT_LIST_LIMIT}-record cap was reached, so review the remainder in the Admin Console`;
+  return [`${label}: collection stopped at the ${datasetRecordCount(dataset.data) ?? 0}-record cap while the server reported more records; ${remedy} before treating absence as compliance`];
 }
 
 function finding(
@@ -1500,9 +1565,12 @@ function isExemptFromLoginVerification(user: JsonRecord): boolean {
   return asBoolean(user.is_exempt_from_login_verification) === true;
 }
 
-function userInventoryGap(users: JsonRecord[]): string | undefined {
+function userInventoryGap(users: JsonRecord[], truncated: boolean): string | undefined {
   if (users.length === 0) {
     return "the user list was readable but returned zero managed users; a Box enterprise always has at least the primary admin, so the inventory is empty and nothing was assessed";
+  }
+  if (truncated) {
+    return `the user list stopped at the ${users.length}-record cap while Box reported more users (a next_marker remained), so the inventory is partial and the absence of a matching record proves nothing; raise user_limit and rerun`;
   }
   if (!users.some(isAdminUser)) {
     return `the ${users.length}-user inventory contains no admin account; a Box enterprise always has a primary admin, so the listing is incomplete or the audit principal cannot see admin accounts`;
@@ -1659,13 +1727,13 @@ export async function collectBoxIdentityData(
     safeEnterpriseId(client),
     collect(() => client.getCurrentUser(), {}),
     collect(() => client.getEnterpriseConfiguration(["security", "user_settings"]), {}),
-    collect(() => client.listUsers(userLimit), []),
-    collect(() => client.listEnterpriseEvents({
+    collectList(() => client.listUsers(userLimit)),
+    collectList(() => client.listEnterpriseEvents({
       eventTypes: IDENTITY_EVENT_TYPES,
       createdAfter: lookbackStart(now, lookbackDays),
       limit: eventLimit,
-    }), []),
-    collect(() => client.listShieldLists(), []),
+    })),
+    collectList(() => client.listShieldLists()),
   ]);
   return { enterpriseId, currentUser, configuration, users, events, shieldLists, lookbackDays, eventLimit, now };
 }
@@ -1691,8 +1759,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const exemptPrivileged = privileged.filter(isExemptFromLoginVerification);
   const exemptUsers = users.filter((user) => !isPrivilegedUser(user) && isExemptFromLoginVerification(user));
   const activeUsers = users.filter(isActiveHumanUser);
-  const inventoryGap = usersReadable ? userInventoryGap(users) : undefined;
-  const inventoryEvidence = { sampled_users: users.length, admin_users: admins.length, inventory_gap: inventoryGap ?? null };
+  const usersTruncated = data.users.truncated === true;
+  const inventoryGap = usersReadable ? userInventoryGap(users, usersTruncated) : undefined;
+  const inventoryEvidence = { sampled_users: users.length, admin_users: admins.length, users_truncated: usersTruncated, inventory_gap: inventoryGap ?? null };
   const inventoryManualEvidence = "Admin Console > Users & Groups: export the full managed user list (including the primary admin) and confirm the count matches the API inventory before relying on user-level findings.";
 
   const findings: BoxFinding[] = [];
@@ -1735,7 +1804,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     unused_settings: mfaUnused,
     privileged_users: privileged.length,
     exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)),
-    inventory_gap: inventoryGap ?? null,
+    ...inventoryEvidence,
   };
   const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
   findings.push(
@@ -1766,9 +1835,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     is_enterprise_sso_required: ssoRequired ?? null,
     is_used: isUsedStates(mfaSettings),
     unused_settings: mfaUnused,
-    sampled_users: users.length,
     exempt_users: truncateList(exemptUsers.map(userLabel)),
-    inventory_gap: inventoryGap ?? null,
+    ...inventoryEvidence,
   };
   const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
   findings.push(
@@ -1934,7 +2002,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   const failedLoginActorIds = new Set(failedLogins.map(eventActorId).filter((id): id is string => Boolean(id)));
   const inactiveWithFailedLogins = inactiveCandidates.filter((user) => failedLoginActorIds.has(asString(user.id) ?? ""));
-  const eventsTruncated = events.length >= data.eventLimit;
+  const eventsTruncated = data.events.truncated === true;
   const inactiveRatio = activeUsers.length > 0 ? inactiveCandidates.length / activeUsers.length : 0;
   const inactivityEvidence = {
     lookback_days: data.lookbackDays,
@@ -1945,6 +2013,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     activity_events: activityEvents.length,
     failed_login_events: failedLogins.length,
     event_limit: data.eventLimit,
+    events_truncated: eventsTruncated,
     ...inventoryEvidence,
   };
   const inactivityManualEvidence = `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`;
@@ -1956,7 +2025,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
         : activeUsers.length === 0
           ? finding(24, "warn", `None of the ${users.length} sampled users are active managed users (only deactivated or platform-only app users were returned), so there was no activity to assess.`, inactivityEvidence, inactivityManualEvidence)
           : eventsTruncated
-            ? finding(24, "warn", `The ${data.eventLimit}-event sample window filled up, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence)
+            ? finding(24, "warn", `The event collection stopped at the ${events.length}-event cap while Box reported more events (a next_stream_position remained), so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence, inactivityManualEvidence)
             : inactiveCandidates.length === 0
               ? finding(24, "pass", `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
               : inactiveRatio > 0.25
@@ -1989,6 +2058,10 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
       ...datasetErrors("enterprise_events", data.events),
       ...datasetErrors("shield_lists", data.shieldLists),
     ],
+    truncated: [
+      ...datasetTruncations("users", data.users, "user_limit"),
+      ...datasetTruncations("enterprise_events", data.events, "event_limit"),
+    ],
   };
 }
 
@@ -2020,18 +2093,19 @@ export async function collectBoxSharingData(
   const now = client.getNow();
   const lookbackDays = clampNumber(options.lookbackDays, DEFAULT_LOOKBACK_DAYS, 1, 365);
   const eventLimit = clampNumber(options.eventLimit, DEFAULT_EVENT_LIMIT, 1, 100_000);
+  const listLimit = clampNumber(options.listLimit, DEFAULT_LIST_LIMIT, 1, 100_000);
   const [enterpriseId, configuration, allowlistEntries, exemptTargets, termsOfServices, shieldLists, events] = await Promise.all([
     safeEnterpriseId(client),
     collect(() => client.getEnterpriseConfiguration(["security", "content_and_sharing", "user_settings"]), {}),
-    collect(() => client.listCollaborationAllowlistEntries(), []),
-    collect(() => client.listCollaborationAllowlistExemptTargets(), []),
-    collect(() => client.listTermsOfServices(), []),
-    collect(() => client.listShieldLists(), []),
-    collect(() => client.listEnterpriseEvents({
+    collectList(() => client.listCollaborationAllowlistEntries(listLimit)),
+    collectList(() => client.listCollaborationAllowlistExemptTargets(listLimit)),
+    collectList(() => client.listTermsOfServices()),
+    collectList(() => client.listShieldLists()),
+    collectList(() => client.listEnterpriseEvents({
       eventTypes: SHARING_EVENT_TYPES,
       createdAfter: lookbackStart(now, lookbackDays),
       limit: eventLimit,
-    }), []),
+    })),
   ]);
   return { enterpriseId, configuration, allowlistEntries, exemptTargets, termsOfServices, shieldLists, events, lookbackDays, now };
 }
@@ -2042,6 +2116,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const configReadable = categoryReadable(data.configuration, "content_and_sharing");
   const configUnreadableReason = categoryUnreadableReason(data.configuration, "content_and_sharing");
   const allowlistReadable = !data.allowlistEntries.error;
+  const allowlistTruncated = data.allowlistEntries.truncated === true || data.exemptTargets.truncated === true;
   const entries = data.allowlistEntries.data;
   const exemptTargets = data.exemptTargets.data;
   const events = data.events.data;
@@ -2093,12 +2168,16 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     both_direction_entries: bothDirectionEntries.length,
     exempt_targets: exemptTargets.length,
     stale_days: staleDays,
+    allowlist_truncated: allowlistTruncated,
   };
+  const allowlistManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and review each entry for business justification, direction, and age.";
   findings.push(
     !allowlistReadable
-      ? finding(5, "manual", `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and review each entry for business justification, direction, and age.")
+      ? finding(5, "manual", `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, allowlistManualEvidence)
       : publicDomainEntries.length > 0
         ? finding(5, "fail", `${publicDomainEntries.length} allowlisted domains are public consumer email providers, which effectively allow anyone to collaborate.`, allowlistEvidence)
+        : allowlistTruncated
+          ? finding(5, "warn", `The collaboration allowlist collection stopped at the cap (${entries.length} entries and ${exemptTargets.length} exempt users retrieved) while Box reported more records, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`, allowlistEvidence, allowlistManualEvidence)
         : entries.length === 0
           ? finding(5, externalStatus === "limit_collaboration_to_allowlisted_domains" ? "warn" : "pass", entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
           : staleEntries.length > 0 || exemptTargets.length > 0
@@ -2262,6 +2341,11 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       ...datasetErrors("shield_lists", data.shieldLists),
       ...datasetErrors("enterprise_events", data.events),
     ],
+    truncated: [
+      ...datasetTruncations("collaboration_allowlist_entries", data.allowlistEntries, "list_limit"),
+      ...datasetTruncations("collaboration_allowlist_exempt_targets", data.exemptTargets, "list_limit"),
+      ...datasetTruncations("enterprise_events", data.events, "event_limit"),
+    ],
   };
 }
 
@@ -2274,21 +2358,24 @@ export async function assessBoxSharingCollaboration(
 
 async function collectAssignments(
   policies: JsonRecord[],
-  loader: (policyId: string) => Promise<JsonRecord[]>,
+  loader: (policyId: string) => Promise<BoxListPage>,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
   const result: Record<string, JsonRecord[]> = {};
   const errors: string[] = [];
+  let truncated = false;
   for (const policy of policies.slice(0, 50)) {
     const policyId = asString(policy.id);
     if (!policyId) continue;
     try {
-      result[policyId] = await loader(policyId);
+      const page = await loader(policyId);
+      result[policyId] = page.items;
+      truncated = truncated || page.truncated;
     } catch (error) {
       result[policyId] = [];
       errors.push(`${policyId}: ${errorMessage(error)}`);
     }
   }
-  return { data: result, error: errors.length > 0 ? errors.join("; ") : undefined };
+  return { data: result, error: errors.length > 0 ? errors.join("; ") : undefined, truncated };
 }
 
 export async function collectBoxGovernanceData(
@@ -2299,11 +2386,11 @@ export async function collectBoxGovernanceData(
   const [enterpriseId, configuration, devicePinners, classificationTemplate, metadataTemplates, retentionPolicies, legalHoldPolicies] = await Promise.all([
     safeEnterpriseId(client),
     collect(() => client.getEnterpriseConfiguration(["user_settings", "content_and_sharing"]), {}),
-    collect(() => client.listDevicePinners(listLimit), []),
+    collectList(() => client.listDevicePinners(listLimit)),
     collect(() => client.getClassificationTemplate(), {}),
-    collect(() => client.listEnterpriseMetadataTemplates(listLimit), []),
-    collect(() => client.listRetentionPolicies(listLimit), []),
-    collect(() => client.listLegalHoldPolicies(listLimit), []),
+    collectList(() => client.listEnterpriseMetadataTemplates(listLimit)),
+    collectList(() => client.listRetentionPolicies(listLimit)),
+    collectList(() => client.listLegalHoldPolicies(listLimit)),
   ]);
   const [retentionAssignments, legalHoldAssignments] = await Promise.all([
     collectAssignments(retentionPolicies.data, (policyId) => client.listRetentionPolicyAssignments(policyId, listLimit)),
@@ -2446,6 +2533,14 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
       ...datasetErrors("legal_hold_policies", data.legalHoldPolicies),
       ...datasetErrors("legal_hold_policy_assignments", data.legalHoldAssignments),
     ],
+    truncated: [
+      ...datasetTruncations("device_pinners", data.devicePinners, "list_limit"),
+      ...datasetTruncations("metadata_templates", data.metadataTemplates, "list_limit"),
+      ...datasetTruncations("retention_policies", data.retentionPolicies, "list_limit"),
+      ...datasetTruncations("retention_policy_assignments", data.retentionAssignments, "list_limit"),
+      ...datasetTruncations("legal_hold_policies", data.legalHoldPolicies, "list_limit"),
+      ...datasetTruncations("legal_hold_policy_assignments", data.legalHoldAssignments, "list_limit"),
+    ],
   };
 }
 
@@ -2475,13 +2570,13 @@ export async function collectBoxShieldData(
   const [enterpriseId, configuration, barriers, shieldLists, events] = await Promise.all([
     safeEnterpriseId(client),
     collect(() => client.getEnterpriseConfiguration(["shield"]), {}),
-    collect(() => client.listShieldInformationBarriers(), []),
-    collect(() => client.listShieldLists(), []),
-    collect(() => client.listEnterpriseEvents({
+    collectList(() => client.listShieldInformationBarriers()),
+    collectList(() => client.listShieldLists()),
+    collectList(() => client.listEnterpriseEvents({
       eventTypes: SHIELD_EVENT_TYPES,
       createdAfter: lookbackStart(now, lookbackDays),
       limit: eventLimit,
-    }), []),
+    })),
   ]);
   const barrierSegments = await collectAssignments(barriers.data, (barrierId) => client.listShieldInformationBarrierSegments(barrierId));
   return { enterpriseId, configuration, barriers, barrierSegments, shieldLists, events, lookbackDays, eventLimit, now };
@@ -2575,7 +2670,9 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
             ? finding(25, "warn", `No Shield anomaly detection rules exist and the enterprise event stream could not be read (${unreadableReason(data.events)}), so content access monitoring cannot be confirmed from the API.`, monitoringEvidence, monitoringManualEvidence)
             : accessEvents.length > 0
               ? finding(25, "warn", `${accessEvents.length} download and preview events are recorded, but no Shield anomaly rules or alerts were observed, so detection depends on external analytics.`, monitoringEvidence, "Confirm the SIEM applies anomaly detection to Box download and preview events, or enable Shield threat detection rules.")
-              : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
+              : data.events.truncated
+                ? finding(25, "warn", `No Shield anomaly detection rules exist and no Shield alerts appeared in the ${events.length} sampled events, but the event collection stopped at the cap while Box reported more events, so alerts may exist beyond the sample; raise event_limit and rerun.`, monitoringEvidence, monitoringManualEvidence)
+                : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
   );
 
   return {
@@ -2598,6 +2695,11 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
       ...datasetErrors("shield_information_barrier_segments", data.barrierSegments),
       ...datasetErrors("shield_lists", data.shieldLists),
       ...datasetErrors("enterprise_events", data.events),
+    ],
+    truncated: [
+      ...datasetTruncations("shield_information_barriers", data.barriers),
+      ...datasetTruncations("shield_information_barrier_segments", data.barrierSegments),
+      ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
 }
@@ -2623,8 +2725,9 @@ async function readableSurface(
   }
 }
 
-function arrayLength(value: unknown): number | undefined {
-  return Array.isArray(value) ? value.length : undefined;
+function pageLength(value: unknown): number | undefined {
+  const items = asObject(value)?.items;
+  return Array.isArray(items) ? items.length : undefined;
 }
 
 export async function checkBoxAccess(
@@ -2668,19 +2771,19 @@ export async function checkBoxAccess(
     });
   }
   surfaces.push(
-    await readableSurface("users", "/users", () => client.listUsers(100), arrayLength),
-    await readableSurface("groups", "/groups", () => client.listGroups(100), arrayLength),
-    await readableSurface("enterprise_events", "/events?stream_type=admin_logs", () => client.listEnterpriseEvents({ limit: 50 }), arrayLength),
-    await readableSurface("device_pinners", `/enterprises/${enterpriseId ?? "{enterprise_id}"}/device_pinners`, () => client.listDevicePinners(100), arrayLength),
-    await readableSurface("retention_policies", "/retention_policies", () => client.listRetentionPolicies(100), arrayLength),
-    await readableSurface("legal_hold_policies", "/legal_hold_policies", () => client.listLegalHoldPolicies(100), arrayLength),
-    await readableSurface("shield_information_barriers", "/shield_information_barriers", () => client.listShieldInformationBarriers(100), arrayLength),
-    await readableSurface("shield_lists", "/shield_lists", () => client.listShieldLists(), arrayLength),
-    await readableSurface("collaboration_allowlist_entries", "/collaboration_whitelist_entries", () => client.listCollaborationAllowlistEntries(100), arrayLength),
-    await readableSurface("collaboration_allowlist_exempt_targets", "/collaboration_whitelist_exempt_targets", () => client.listCollaborationAllowlistExemptTargets(100), arrayLength),
-    await readableSurface("metadata_templates", "/metadata_templates/enterprise", () => client.listEnterpriseMetadataTemplates(100), arrayLength),
+    await readableSurface("users", "/users", () => client.listUsers(100), pageLength),
+    await readableSurface("groups", "/groups", () => client.listGroups(100), pageLength),
+    await readableSurface("enterprise_events", "/events?stream_type=admin_logs", () => client.listEnterpriseEvents({ limit: 50 }), pageLength),
+    await readableSurface("device_pinners", `/enterprises/${enterpriseId ?? "{enterprise_id}"}/device_pinners`, () => client.listDevicePinners(100), pageLength),
+    await readableSurface("retention_policies", "/retention_policies", () => client.listRetentionPolicies(100), pageLength),
+    await readableSurface("legal_hold_policies", "/legal_hold_policies", () => client.listLegalHoldPolicies(100), pageLength),
+    await readableSurface("shield_information_barriers", "/shield_information_barriers", () => client.listShieldInformationBarriers(100), pageLength),
+    await readableSurface("shield_lists", "/shield_lists", () => client.listShieldLists(), pageLength),
+    await readableSurface("collaboration_allowlist_entries", "/collaboration_whitelist_entries", () => client.listCollaborationAllowlistEntries(100), pageLength),
+    await readableSurface("collaboration_allowlist_exempt_targets", "/collaboration_whitelist_exempt_targets", () => client.listCollaborationAllowlistExemptTargets(100), pageLength),
+    await readableSurface("metadata_templates", "/metadata_templates/enterprise", () => client.listEnterpriseMetadataTemplates(100), pageLength),
     await readableSurface("classification_template", `/metadata_templates/enterprise/${CLASSIFICATION_TEMPLATE_KEY}/schema`, () => client.getClassificationTemplate(), () => 1),
-    await readableSurface("terms_of_services", "/terms_of_services", () => client.listTermsOfServices(), arrayLength),
+    await readableSurface("terms_of_services", "/terms_of_services", () => client.listTermsOfServices(), pageLength),
   );
 
   const readable = new Set(surfaces.filter((surface) => surface.status === "readable").map((surface) => surface.name));
@@ -2774,6 +2877,7 @@ function formatAssessmentText(result: BoxAssessmentResult): string {
     formatTable(["Control", "Severity", "Status", "Title", "Summary"], rows),
     ...(manualNotes.length > 0 ? ["", "Manual evidence to collect:", ...manualNotes] : []),
     ...(result.errors.length > 0 ? ["", "Collection warnings:", ...result.errors.map((error) => `- ${error}`)] : []),
+    ...(result.truncated.length > 0 ? ["", "Truncated datasets:", ...result.truncated.map((note) => `- ${note}`)] : []),
   ].join("\n");
 }
 
@@ -2781,7 +2885,7 @@ function markdownEscapePipes(value: string): string {
   return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
-function buildExecutiveSummary(config: BoxResolvedConfig, enterpriseId: string | undefined, assessments: BoxAssessmentResult[], errors: string[]): string {
+function buildExecutiveSummary(config: BoxResolvedConfig, enterpriseId: string | undefined, assessments: BoxAssessmentResult[], errors: string[], truncated: string[]): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const counts = summarizeFindingStatuses(findings);
   const priority = findings
@@ -2812,6 +2916,7 @@ function buildExecutiveSummary(config: BoxResolvedConfig, enterpriseId: string |
       ? manual.map((item) => `- ${item.id} ${item.title}: ${item.manualEvidence ?? item.summary}`)
       : ["- No controls require manual evidence."]),
     ...(errors.length > 0 ? ["", "## Partial Collection Warnings", "", ...errors.map((error) => `- ${error}`)] : []),
+    ...(truncated.length > 0 ? ["", "## Truncated Datasets", "", ...truncated.map((note) => `- ${note}`)] : []),
     "",
   ].join("\n");
 }
@@ -2872,6 +2977,7 @@ function buildQuickReference(): string {
     "# Box Audit Bundle Quick Reference",
     "",
     "- `core_data/` contains raw Box API responses used during this assessment.",
+    "- `core_data/collection_status.json` records, per snapshot file, the record count, any read error, and whether the list was truncated at its cap; truncated lists never support a PASS that depends on the absence of a record.",
     "- `analysis/` contains normalized findings and per-area assessment summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -2922,7 +3028,7 @@ export async function exportBoxAuditBundle(
   const sharingData = await collectBoxSharingData(client, options);
   const governanceData = await collectBoxGovernanceData(client, options);
   const shieldData = await collectBoxShieldData(client, options);
-  const groups = await collect(() => client.listGroups(), []);
+  const groups = await collectList(() => client.listGroups());
   const assessments = [
     assessBoxIdentityAccessData(identityData, options),
     assessBoxSharingCollaborationData(sharingData, options),
@@ -2931,38 +3037,62 @@ export async function exportBoxAuditBundle(
   ];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set([...assessments.flatMap((assessment) => assessment.errors), ...datasetErrors("groups", groups)])];
+  const truncated = [...new Set([...assessments.flatMap((assessment) => assessment.truncated), ...datasetTruncations("groups", groups)])];
   const enterpriseId = access.enterpriseId ?? identityData.enterpriseId;
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(enterpriseId ?? "box-enterprise")}-audit-bundle`);
 
+  const coreDatasets: Array<[string, CollectedDataset<unknown>]> = [
+    ["core_data/current_user.json", identityData.currentUser],
+    ["core_data/users.json", identityData.users],
+    ["core_data/groups.json", groups],
+    ["core_data/enterprise_events_activity.json", identityData.events],
+    ["core_data/enterprise_events_sharing.json", sharingData.events],
+    ["core_data/enterprise_events_shield.json", shieldData.events],
+    ["core_data/device_pinners.json", governanceData.devicePinners],
+    ["core_data/classification_template.json", governanceData.classificationTemplate],
+    ["core_data/metadata_templates.json", governanceData.metadataTemplates],
+    ["core_data/retention_policies.json", governanceData.retentionPolicies],
+    ["core_data/retention_policy_assignments.json", governanceData.retentionAssignments],
+    ["core_data/legal_hold_policies.json", governanceData.legalHoldPolicies],
+    ["core_data/legal_hold_policy_assignments.json", governanceData.legalHoldAssignments],
+    ["core_data/shield_information_barriers.json", shieldData.barriers],
+    ["core_data/shield_information_barrier_segments.json", shieldData.barrierSegments],
+    ["core_data/shield_lists.json", shieldData.shieldLists],
+    ["core_data/collaboration_allowlist_entries.json", sharingData.allowlistEntries],
+    ["core_data/collaboration_allowlist_exempt_targets.json", sharingData.exemptTargets],
+    ["core_data/terms_of_services.json", sharingData.termsOfServices],
+  ];
+  const configurationDatasets = [identityData.configuration, sharingData.configuration, governanceData.configuration, shieldData.configuration];
+  const mergedConfiguration: JsonRecord = Object.assign({}, ...configurationDatasets.map((dataset) => dataset.data));
+  const configurationErrors = configurationDatasets.map((dataset) => dataset.error).filter((error): error is string => Boolean(error));
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/current_user.json", identityData.currentUser.data],
-    ["core_data/enterprise_configuration.json", {
-      ...identityData.configuration.data,
-      ...sharingData.configuration.data,
-      ...governanceData.configuration.data,
-      ...shieldData.configuration.data,
+    ["core_data/enterprise_configuration.json", mergedConfiguration],
+    ...coreDatasets.map(([pathname, dataset]): [string, unknown] => [pathname, dataset.data]),
+    ["core_data/collection_status.json", {
+      generated_at: new Date().toISOString(),
+      datasets: [
+        {
+          file: "core_data/enterprise_configuration.json",
+          count: Object.keys(mergedConfiguration).length,
+          complete: configurationErrors.length === 0,
+          truncated: false,
+          error: configurationErrors.length > 0 ? [...new Set(configurationErrors)].join("; ") : null,
+          status_code: configurationDatasets.find((dataset) => dataset.statusCode !== undefined)?.statusCode ?? null,
+        },
+        ...coreDatasets.map(([pathname, dataset]) => ({
+          file: pathname,
+          count: datasetRecordCount(dataset.data),
+          complete: !dataset.error && dataset.truncated !== true,
+          truncated: dataset.truncated === true,
+          error: dataset.error ?? null,
+          status_code: dataset.statusCode ?? null,
+        })),
+      ],
+      truncated_datasets: truncated,
     }],
-    ["core_data/users.json", identityData.users.data],
-    ["core_data/groups.json", groups.data],
-    ["core_data/enterprise_events_activity.json", identityData.events.data],
-    ["core_data/enterprise_events_sharing.json", sharingData.events.data],
-    ["core_data/enterprise_events_shield.json", shieldData.events.data],
-    ["core_data/device_pinners.json", governanceData.devicePinners.data],
-    ["core_data/classification_template.json", governanceData.classificationTemplate.data],
-    ["core_data/metadata_templates.json", governanceData.metadataTemplates.data],
-    ["core_data/retention_policies.json", governanceData.retentionPolicies.data],
-    ["core_data/retention_policy_assignments.json", governanceData.retentionAssignments.data],
-    ["core_data/legal_hold_policies.json", governanceData.legalHoldPolicies.data],
-    ["core_data/legal_hold_policy_assignments.json", governanceData.legalHoldAssignments.data],
-    ["core_data/shield_information_barriers.json", shieldData.barriers.data],
-    ["core_data/shield_information_barrier_segments.json", shieldData.barrierSegments.data],
-    ["core_data/shield_lists.json", shieldData.shieldLists.data],
-    ["core_data/collaboration_allowlist_entries.json", sharingData.allowlistEntries.data],
-    ["core_data/collaboration_allowlist_exempt_targets.json", sharingData.exemptTargets.data],
-    ["core_data/terms_of_services.json", sharingData.termsOfServices.data],
   ];
   for (const [pathname, value] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathname, serializeJson(value));
@@ -2980,8 +3110,9 @@ export async function exportBoxAuditBundle(
     controls_assessed: findings.length,
     status_counts: summarizeFindingStatuses(findings),
     errors,
+    truncated_datasets: truncated,
   }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, enterpriseId, assessments, errors));
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, enterpriseId, assessments, errors, truncated));
   await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const report of FRAMEWORK_REPORTS) {
     await writeSecureTextFile(outputDir, report.path, buildFrameworkReport(report.title, report.framework, findings));
@@ -3051,6 +3182,7 @@ function normalizeSharingArgs(args: unknown): SharingArgs {
     event_limit: asNumber(value.event_limit),
     lookback_days: asNumber(value.lookback_days),
     stale_allowlist_days: asNumber(value.stale_allowlist_days),
+    list_limit: asNumber(value.list_limit),
   };
 }
 
@@ -3097,6 +3229,7 @@ function sharingOptions(args: SharingArgs): BoxSharingOptions {
     eventLimit: args.event_limit,
     lookbackDays: args.lookback_days,
     staleAllowlistDays: args.stale_allowlist_days,
+    listLimit: args.list_limit,
   };
 }
 
@@ -3135,13 +3268,16 @@ const identityParams = {
   max_session_hours: Type.Optional(Type.Number({ description: "Maximum acceptable session duration in hours. Defaults to 24.", default: 24 })),
 };
 
+const listLimitParam = Type.Optional(Type.Number({ description: "Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500.", default: 500 }));
+
 const sharingParams = {
   ...eventParams,
   stale_allowlist_days: Type.Optional(Type.Number({ description: "Age in days after which a collaboration allowlist entry is flagged for review. Defaults to 365.", default: 365 })),
+  list_limit: listLimitParam,
 };
 
 const governanceParams = {
-  list_limit: Type.Optional(Type.Number({ description: "Maximum device pins, policies, and assignments to inspect per list. Defaults to 500.", default: 500 })),
+  list_limit: listLimitParam,
 };
 
 function runTool<TArgs extends AuthArgs>(

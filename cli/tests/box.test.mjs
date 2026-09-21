@@ -279,13 +279,21 @@ function weakFixture() {
   };
 }
 
+function page(items, truncated = false) {
+  return { items, truncated };
+}
+
+function truncatedList(items) {
+  return async () => page(items, true);
+}
+
 function createStubClient(fixture, overrides = {}) {
   const filterEvents = (options = {}) => {
     const eventTypes = options.eventTypes;
     const filtered = eventTypes && eventTypes.length > 0
       ? fixture.events.filter((event) => eventTypes.includes(event.event_type))
       : fixture.events;
-    return filtered.slice(0, options.limit ?? filtered.length);
+    return page(filtered.slice(0, options.limit ?? filtered.length));
   };
   return {
     getResolvedConfig: () => sampleConfig(),
@@ -300,52 +308,52 @@ function createStubClient(fixture, overrides = {}) {
       return fixture.configuration;
     },
     async listUsers() {
-      return fixture.users;
+      return page(fixture.users);
     },
     async listGroups() {
-      return fixture.groups;
+      return page(fixture.groups);
     },
     async listEnterpriseEvents(options) {
       return filterEvents(options);
     },
     async listDevicePinners() {
-      return fixture.devicePinners;
+      return page(fixture.devicePinners);
     },
     async listRetentionPolicies() {
-      return fixture.retentionPolicies;
+      return page(fixture.retentionPolicies);
     },
     async listRetentionPolicyAssignments() {
-      return fixture.retentionAssignments;
+      return page(fixture.retentionAssignments);
     },
     async listLegalHoldPolicies() {
-      return fixture.legalHoldPolicies;
+      return page(fixture.legalHoldPolicies);
     },
     async listLegalHoldPolicyAssignments() {
-      return fixture.legalHoldAssignments;
+      return page(fixture.legalHoldAssignments);
     },
     async listShieldInformationBarriers() {
-      return fixture.barriers;
+      return page(fixture.barriers);
     },
     async listShieldInformationBarrierSegments() {
-      return fixture.barrierSegments;
+      return page(fixture.barrierSegments);
     },
     async listShieldLists() {
-      return fixture.shieldLists;
+      return page(fixture.shieldLists);
     },
     async listCollaborationAllowlistEntries() {
-      return fixture.allowlistEntries;
+      return page(fixture.allowlistEntries);
     },
     async listCollaborationAllowlistExemptTargets() {
-      return fixture.exemptTargets;
+      return page(fixture.exemptTargets);
     },
     async listEnterpriseMetadataTemplates() {
-      return fixture.metadataTemplates;
+      return page(fixture.metadataTemplates);
     },
     async getClassificationTemplate() {
       return fixture.classificationTemplate;
     },
     async listTermsOfServices() {
-      return fixture.termsOfServices;
+      return page(fixture.termsOfServices);
     },
     ...overrides,
   };
@@ -612,7 +620,8 @@ test("BoxApiClient exchanges Client Credentials Grant and paginates users with m
   }, {}, { homeDir: createTempBase("grclanker-box-ccg-") }), { fetchImpl, now: () => NOW });
 
   const users = await client.listUsers(3);
-  assert.deepEqual(users.map((entry) => entry.id), ["user-1", "user-2", "user-3"]);
+  assert.deepEqual(users.items.map((entry) => entry.id), ["user-1", "user-2", "user-3"]);
+  assert.equal(users.truncated, true, "a next_marker remained after the cap, so the list is partial");
 
   const tokenBody = new URLSearchParams(seen[0].body);
   assert.equal(seen[0].pathname, "/oauth2/token");
@@ -633,16 +642,65 @@ test("BoxApiClient exchanges Client Credentials Grant and paginates users with m
   assert.equal(userCalls[1].params.get("limit"), "1");
 
   const groups = await client.listGroups(5);
-  assert.deepEqual(groups.map((entry) => entry.id), ["group-1", "group-2"]);
+  assert.deepEqual(groups.items.map((entry) => entry.id), ["group-1", "group-2"]);
+  assert.equal(groups.truncated, false, "offset paging reached total_count");
 
   const events = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], createdAfter: NOW, limit: 5 });
-  assert.deepEqual(events.map((entry) => entry.event_id), ["e-1", "e-2"]);
+  assert.deepEqual(events.items.map((entry) => entry.event_id), ["e-1", "e-2"]);
+  assert.equal(events.truncated, false, "the stream position stopped advancing, so the stream was drained");
   const eventCalls = seen.filter((call) => call.pathname === "/2.0/events");
   assert.equal(eventCalls[0].params.get("stream_type"), "admin_logs");
   assert.equal(eventCalls[0].params.get("event_type"), "LOGIN");
   assert.equal(eventCalls[0].params.get("created_after"), NOW.toISOString());
   assert.equal(eventCalls[1].params.get("stream_position"), "1152922976252290800");
   assert.equal(seen.filter((call) => call.pathname === "/oauth2/token").length, 1, "token should be cached across calls");
+});
+
+test("BoxApiClient reports list truncation only when a marker, offset, or stream position remains past the cap", async () => {
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/2.0/users") {
+      const marker = url.searchParams.get("marker");
+      if (!marker) return jsonResponse({ entries: [{ id: "user-1", type: "user" }, { id: "user-2", type: "user" }], next_marker: "marker-2" });
+      return jsonResponse({ entries: [{ id: "user-3", type: "user" }], next_marker: null });
+    }
+    if (url.pathname === "/2.0/collaboration_whitelist_entries") {
+      return jsonResponse({ entries: [{ id: "entry-1", type: "collaboration_whitelist_entry" }], next_marker: "" });
+    }
+    if (url.pathname === "/2.0/groups") {
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      return jsonResponse({ entries: [{ id: `group-${offset + 1}`, type: "group" }], total_count: 3, offset, limit: 1 });
+    }
+    if (url.pathname === "/2.0/events") {
+      const position = url.searchParams.get("stream_position");
+      const limit = Number(url.searchParams.get("limit"));
+      const start = position ? Number(position) : 0;
+      const entries = Array.from({ length: limit }, (_, index) => ({ event_id: `e-${start + index + 1}`, event_type: "LOGIN" }));
+      return jsonResponse({ entries, next_stream_position: String(start + limit), chunk_size: entries.length });
+    }
+    return jsonResponse({}, { status: 404 });
+  };
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
+
+  const complete = await client.listUsers(10);
+  assert.deepEqual(complete.items.map((entry) => entry.id), ["user-1", "user-2", "user-3"]);
+  assert.equal(complete.truncated, false, "the final page carried no next_marker");
+
+  const partial = await client.listUsers(2);
+  assert.deepEqual(partial.items.map((entry) => entry.id), ["user-1", "user-2"]);
+  assert.equal(partial.truncated, true, "exactly the cap was returned and a next_marker remained");
+
+  const emptyMarker = await client.listCollaborationAllowlistEntries(1);
+  assert.equal(emptyMarker.items.length, 1);
+  assert.equal(emptyMarker.truncated, false, "an empty next_marker means the list is complete");
+
+  const groups = await client.listGroups(2);
+  assert.deepEqual(groups.items.map((entry) => entry.id), ["group-1", "group-2"]);
+  assert.equal(groups.truncated, true, "offset paging stopped before total_count");
+
+  const events = await client.listEnterpriseEvents({ limit: 3 });
+  assert.equal(events.items.length, 3);
+  assert.equal(events.truncated, true, "the cap filled while a fresh next_stream_position remained");
 });
 
 test("BoxApiClient retries 429 and 5xx responses with backoff and redacts secrets from errors", async () => {
@@ -721,7 +779,8 @@ test("BoxApiClient refreshes an expired OAuth token after a 401", async () => {
 
   const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "stale-token", refreshToken: "refresh-1" }), { fetchImpl, now: () => NOW });
   const terms = await client.listTermsOfServices();
-  assert.equal(terms[0].id, "tos-1");
+  assert.equal(terms.items[0].id, "tos-1");
+  assert.equal(terms.truncated, false);
   assert.equal(seen[0].auth, "Bearer stale-token");
   const refreshBody = new URLSearchParams(seen[1].body);
   assert.equal(seen[1].pathname, "/oauth2/token");
@@ -974,6 +1033,102 @@ test("assessBoxIdentityAccess warns instead of passing on an empty user inventor
   }));
   assertStatuses(onlyAppUsers, { "BOX-02": "pass", "BOX-17": "pass", "BOX-18": "pass", "BOX-24": "warn" });
   assert.match(findingById(onlyAppUsers, "BOX-24").summary, /None of the 2 sampled users are active managed users/);
+});
+
+test("truncated user and event lists downgrade absence-based identity verdicts to warn", async () => {
+  const fixture = hardenedFixture();
+  const truncatedUsers = await assessBoxIdentityAccess(createStubClient(fixture, { listUsers: truncatedList(fixture.users) }));
+  assertStatuses(truncatedUsers, {
+    "BOX-01": "pass",
+    "BOX-02": "warn",
+    "BOX-03": "warn",
+    "BOX-17": "warn",
+    "BOX-18": "warn",
+    "BOX-21": "pass",
+    "BOX-24": "warn",
+  });
+  for (const id of ["BOX-02", "BOX-03", "BOX-17", "BOX-18", "BOX-24"]) {
+    const entry = findingById(truncatedUsers, id);
+    assert.match(entry.summary, /stopped at the 4-record cap while Box reported more users/, id);
+    assert.match(entry.summary, /raise user_limit/, id);
+    assert.equal(entry.evidence.users_truncated, true, id);
+    assert.match(entry.evidence.inventory_gap, /inventory is partial/, id);
+  }
+  assert.deepEqual(truncatedUsers.errors, []);
+  assert.equal(truncatedUsers.truncated.length, 1);
+  assert.match(truncatedUsers.truncated[0], /^users: collection stopped at the 4-record cap .*raise user_limit/);
+
+  const weak = weakFixture();
+  const truncatedWeak = await assessBoxIdentityAccess(createStubClient(weak, { listUsers: truncatedList(weak.users) }), { maxAdmins: 10 });
+  assertStatuses(truncatedWeak, { "BOX-02": "fail", "BOX-03": "fail", "BOX-17": "warn", "BOX-18": "manual" });
+  assert.match(findingById(truncatedWeak, "BOX-02").summary, /leaving 12 admin or co-admin accounts without an enforced second factor/);
+  assert.match(findingById(truncatedWeak, "BOX-17").summary, /12 admin or co-admin accounts exceed/);
+  assert.equal(findingById(truncatedWeak, "BOX-17").evidence.users_truncated, true);
+
+  const base = createStubClient(fixture);
+  const truncatedEvents = await assessBoxIdentityAccess({
+    ...base,
+    async listEnterpriseEvents(options) {
+      const result = await base.listEnterpriseEvents(options);
+      return page(result.items, true);
+    },
+  });
+  assertStatuses(truncatedEvents, { "BOX-02": "pass", "BOX-17": "pass", "BOX-24": "warn" });
+  const inactive = findingById(truncatedEvents, "BOX-24");
+  assert.match(inactive.summary, /stopped at the 3-event cap while Box reported more events/);
+  assert.match(inactive.summary, /raise event_limit/);
+  assert.equal(inactive.evidence.events_truncated, true);
+  assert.equal(inactive.evidence.users_truncated, false);
+  assert.equal(truncatedEvents.truncated.length, 1);
+  assert.match(truncatedEvents.truncated[0], /^enterprise_events: .*raise event_limit/);
+
+  const exactCap = await assessBoxIdentityAccess(createStubClient(fixture), { eventLimit: 3 });
+  assertStatuses(exactCap, { "BOX-24": "pass" });
+  assert.equal(findingById(exactCap, "BOX-24").evidence.sampled_events, 3);
+  assert.equal(findingById(exactCap, "BOX-24").evidence.events_truncated, false);
+  assert.deepEqual(exactCap.truncated, []);
+});
+
+test("truncated allowlist and Shield event lists downgrade absence-based verdicts to warn", async () => {
+  const fixture = hardenedFixture();
+  const truncatedEntries = await assessBoxSharingCollaboration(createStubClient(fixture, {
+    listCollaborationAllowlistEntries: truncatedList(fixture.allowlistEntries),
+  }));
+  assertStatuses(truncatedEntries, { "BOX-04": "pass", "BOX-05": "warn" });
+  assert.match(findingById(truncatedEntries, "BOX-05").summary, /stopped at the cap \(1 entries and 0 exempt users retrieved\)/);
+  assert.match(findingById(truncatedEntries, "BOX-05").summary, /raise list_limit/);
+  assert.equal(findingById(truncatedEntries, "BOX-05").evidence.allowlist_truncated, true);
+  assert.equal(truncatedEntries.truncated.length, 1);
+  assert.match(truncatedEntries.truncated[0], /^collaboration_allowlist_entries: /);
+
+  const truncatedExempt = await assessBoxSharingCollaboration(createStubClient(fixture, {
+    listCollaborationAllowlistExemptTargets: truncatedList(fixture.exemptTargets),
+  }));
+  assertStatuses(truncatedExempt, { "BOX-05": "warn" });
+  assert.match(truncatedExempt.truncated[0], /^collaboration_allowlist_exempt_targets: /);
+
+  const weak = weakFixture();
+  const publicStillFails = await assessBoxSharingCollaboration(createStubClient(weak, {
+    listCollaborationAllowlistEntries: truncatedList(weak.allowlistEntries),
+  }));
+  assertStatuses(publicStillFails, { "BOX-05": "fail" });
+
+  const deviceTrustEvent = { event_id: "device-1", event_type: "DEVICE_TRUST_CHECK_FAILED", created_at: "2026-09-11T00:00:00Z", created_by: { id: "member-1", type: "user" } };
+  const shieldBase = createStubClient({ ...weak, events: [deviceTrustEvent] });
+  const noRulesTruncated = await assessBoxShieldMonitoring({
+    ...shieldBase,
+    async listEnterpriseEvents(options) {
+      const result = await shieldBase.listEnterpriseEvents(options);
+      return page(result.items, true);
+    },
+  });
+  assertStatuses(noRulesTruncated, { "BOX-16": "pass", "BOX-25": "warn" });
+  assert.match(findingById(noRulesTruncated, "BOX-25").summary, /no Shield alerts appeared in the 1 sampled events, but the event collection stopped at the cap while Box reported more events/);
+  assert.match(noRulesTruncated.truncated[0], /^enterprise_events: collection stopped at the 1-record cap .*raise event_limit/);
+
+  const noRulesComplete = await assessBoxShieldMonitoring(shieldBase);
+  assertStatuses(noRulesComplete, { "BOX-25": "fail" });
+  assert.deepEqual(noRulesComplete.truncated, []);
 });
 
 test("assessBoxIdentityAccess treats null configuration categories as absent data instead of failing", async () => {
@@ -1286,13 +1441,14 @@ test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a
   assert.match(result.zipPath, /123456-audit-bundle\.zip$/);
   assert.equal(result.findingCount, 25);
   assert.equal(result.errorCount, 0);
-  assert.equal(result.fileCount, 39);
+  assert.equal(result.fileCount, 40);
   assert.equal(existsSync(join(result.outputDir, "_errors.log")), false);
 
   const expectedFiles = [
     "QUICK_REFERENCE.md",
     "metadata.json",
     "core_data/access_check.json",
+    "core_data/collection_status.json",
     "core_data/current_user.json",
     "core_data/enterprise_configuration.json",
     "core_data/users.json",
@@ -1344,6 +1500,15 @@ test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a
   assert.equal(summary.controls_assessed, 25);
   assert.equal(summary.enterprise_id, "123456");
   assert.equal(summary.auth_mode, "ccg");
+  assert.deepEqual(summary.truncated_datasets, []);
+
+  const collectionStatus = JSON.parse(readFileSync(join(result.outputDir, "core_data/collection_status.json"), "utf8"));
+  assert.equal(collectionStatus.datasets.length, 20);
+  assert.ok(collectionStatus.datasets.every((entry) => entry.complete === true && entry.truncated === false && entry.error === null));
+  const usersStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/users.json");
+  assert.equal(usersStatus.count, 4);
+  assert.equal(collectionStatus.datasets.find((entry) => entry.file === "core_data/retention_policy_assignments.json").count, 1);
+  assert.deepEqual(collectionStatus.truncated_datasets, []);
 
   const executive = readFileSync(join(result.outputDir, "compliance/executive_summary.md"), "utf8");
   assert.match(executive, /Controls assessed: 25 of 25/);
@@ -1385,6 +1550,46 @@ test("exportBoxAuditBundle records partial collection failures in _errors.log", 
   assert.equal(findings.find((entry) => entry.id === "BOX-15").status, "manual");
   const executive = readFileSync(join(result.outputDir, "compliance/executive_summary.md"), "utf8");
   assert.match(executive, /Partial Collection Warnings/);
+  assert.doesNotMatch(executive, /Truncated Datasets/);
+
+  const collectionStatus = JSON.parse(readFileSync(join(result.outputDir, "core_data/collection_status.json"), "utf8"));
+  const retentionStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/retention_policies.json");
+  assert.equal(retentionStatus.complete, false);
+  assert.equal(retentionStatus.status_code, 403);
+  assert.match(retentionStatus.error, /manage_data_retention/);
+});
+
+test("exportBoxAuditBundle records truncated snapshots without counting them as errors", async () => {
+  const base = createTempBase("grclanker-box-export-truncated-");
+  const fixture = hardenedFixture();
+  const result = await exportBoxAuditBundle(createStubClient(fixture, {
+    listUsers: truncatedList(fixture.users),
+    listGroups: truncatedList(fixture.groups),
+  }), sampleConfig(), base);
+
+  assert.equal(result.errorCount, 0);
+  assert.equal(existsSync(join(result.outputDir, "_errors.log")), false);
+
+  const collectionStatus = JSON.parse(readFileSync(join(result.outputDir, "core_data/collection_status.json"), "utf8"));
+  const usersStatus = collectionStatus.datasets.find((entry) => entry.file === "core_data/users.json");
+  assert.equal(usersStatus.truncated, true);
+  assert.equal(usersStatus.complete, false);
+  assert.equal(usersStatus.error, null);
+  assert.equal(collectionStatus.datasets.find((entry) => entry.file === "core_data/groups.json").truncated, true);
+  assert.equal(collectionStatus.datasets.find((entry) => entry.file === "core_data/enterprise_events_activity.json").truncated, false);
+  assert.equal(collectionStatus.truncated_datasets.length, 2);
+  assert.match(collectionStatus.truncated_datasets[0], /^users: collection stopped at the 4-record cap/);
+  assert.match(collectionStatus.truncated_datasets[1], /^groups: collection stopped at the 1-record cap/);
+
+  const summary = JSON.parse(readFileSync(join(result.outputDir, "analysis/summary.json"), "utf8"));
+  assert.deepEqual(summary.truncated_datasets, collectionStatus.truncated_datasets);
+  const identity = JSON.parse(readFileSync(join(result.outputDir, "analysis/identity_access.json"), "utf8"));
+  assert.equal(identity.truncated.length, 1);
+  assert.equal(identity.findings.find((entry) => entry.id === "BOX-17").status, "warn");
+  const executive = readFileSync(join(result.outputDir, "compliance/executive_summary.md"), "utf8");
+  assert.match(executive, /## Truncated Datasets/);
+  assert.match(executive, /raise user_limit/);
+  assert.doesNotMatch(executive, /Partial Collection Warnings/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

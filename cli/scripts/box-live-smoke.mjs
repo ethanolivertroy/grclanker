@@ -53,6 +53,9 @@ try {
   for (const error of assessment.errors) {
     log(`- collection warning: ${error}`);
   }
+  for (const note of assessment.truncated) {
+    log(`- truncated dataset: ${note}`);
+  }
   log("Live Box smoke test passed.");
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
