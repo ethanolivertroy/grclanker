@@ -281,7 +281,7 @@ function healthyFixture() {
       sys_security_acl_role: aclRoles,
       sys_public: [],
       sys_script: [{ sys_id: "br-1", name: "Set assignment", collection: "incident", active: "true", script: "current.assigned_to = gs.getUserID();" }],
-      sys_ip_address_access: [{ sys_id: "ip-1", name: "Corporate VPN", type: "allow", active: "true" }],
+      ip_access: [{ sys_id: "ip-1", type: "allow", direction: "inbound", active: "true", range_start: "10.0.0.0", range_end: "10.0.255.255", description: "Corporate VPN" }],
       sys_email_account: [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", enable_tls: "true", server: "smtp.example.com", port: "587" }],
       sys_encryption_context: [],
       sys_dictionary: [
@@ -302,6 +302,7 @@ function healthyFixture() {
         { sys_id: "plg-2", name: "Contextual Security: Role Management V2", source: "com.glide.role_management.v2", active: "active", version: "1.0" },
         { sys_id: "plg-3", name: "Security Jump Start (ACL Rules)", source: "com.snc.security_jump_start", active: "active", version: "1.0" },
         { sys_id: "plg-4", name: "Instance Security Center", source: "com.glide.security_center", active: "active", version: "1.0" },
+        { sys_id: "plg-5", name: "IP Range Based Authentication", source: "com.snc.ipauthenticator", active: "active", version: "1.0" },
       ],
     },
     counts: {
@@ -348,7 +349,7 @@ function failingFixture() {
   fixture.tables.sys_security_acl_role = aclRoles;
   fixture.tables.sys_public = [{ sys_id: "pub-1", page: "custom_status", active: "true" }];
   fixture.tables.sys_script.push({ sys_id: "br-2", name: "Dynamic eval", collection: "incident", active: "true", script: "eval(current.script);" });
-  fixture.tables.sys_ip_address_access = [];
+  fixture.tables.ip_access = [];
   fixture.tables.sys_email_account = [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", enable_tls: "false", server: "smtp.example.com", port: "25" }];
   fixture.tables.sys_dictionary = fixture.tables.sys_dictionary.map((row) => (row.name === "sys_user" ? { ...row, audit: "false" } : row));
   fixture.tables.sys_update_set.push({ sys_id: "us-open", name: "Security tweaks", state: "in progress", application: "global", sys_created_by: "dev" });
@@ -730,6 +731,52 @@ test("assessServicenowPlatformHardening warns instead of assuming defaults for a
   assert.match(byId.get("SNOW-05").summary, /not assumed/);
   assert.equal(byId.get("SNOW-01").status, "warn");
   assert.match(byId.get("SNOW-01").summary, /glide.security.diag_txns_acl/);
+});
+
+test("SNOW-17 reads the documented ip_access table and the com.snc.ipauthenticator plugin row", async () => {
+  const { fetchImpl, calls } = fixtureFetch(healthyFixture());
+  const ipAccess = findingsById(await assessServicenowPlatformHardening(createClient(fetchImpl))).get("SNOW-17");
+
+  assert.equal(ipAccess.status, "pass", ipAccess.summary);
+  assert.match(ipAccess.summary, /com.snc.ipauthenticator is active, 1 active ip_access rules/);
+  assert.equal(ipAccess.evidence.ip_authenticator_plugin_active, true);
+  assert.deepEqual(ipAccess.evidence.active_rules, ["allow inbound 10.0.0.0-10.0.255.255"]);
+  const tables = calls.map((call) => call.url.pathname.replace("/api/now/table/", ""));
+  assert.ok(tables.includes("ip_access"));
+  assert.equal(tables.includes("sys_ip_address_access"), false);
+  const pluginCall = calls.find((call) => call.url.pathname === "/api/now/table/sys_plugins");
+  assert.equal(pluginCall.url.searchParams.get("sysparm_query"), "source=com.snc.ipauthenticator");
+});
+
+test("SNOW-17 fails when the IP authenticator plugin is inactive or absent, even when the table is missing", async () => {
+  const inactive = healthyFixture();
+  inactive.tables.sys_plugins = inactive.tables.sys_plugins.map((row) => (row.source === "com.snc.ipauthenticator" ? { ...row, active: "inactive" } : row));
+  const inactiveFinding = findingsById(await assessServicenowPlatformHardening(createClient(fixtureFetch(inactive).fetchImpl))).get("SNOW-17");
+  assert.equal(inactiveFinding.status, "fail");
+  assert.match(inactiveFinding.summary, /com.snc.ipauthenticator\) is inactive in sys_plugins/);
+
+  const notInstalled = healthyFixture();
+  notInstalled.tables.sys_plugins = notInstalled.tables.sys_plugins.filter((row) => row.source !== "com.snc.ipauthenticator");
+  delete notInstalled.tables.ip_access;
+  const result = await assessServicenowPlatformHardening(createClient(fixtureFetch(notInstalled).fetchImpl));
+  const missing = findingsById(result).get("SNOW-17");
+  assert.equal(missing.status, "fail", missing.summary);
+  assert.match(missing.summary, /has no row in sys_plugins and the ip_access table does not exist/);
+  assert.equal(missing.evidence.ip_access_table_available, false);
+  assert.equal(result.errors.some((issue) => /ip_access read failed/.test(issue)), false, "a missing plugin table is a documented state, not a collection error");
+});
+
+test("SNOW-17 stays manual when the plugin inventory is forbidden and warns when only the rules are visible", async () => {
+  const forbidden = fixtureFetch(healthyFixture(), { forbiddenTables: ["sys_plugins"] });
+  const gated = findingsById(await assessServicenowPlatformHardening(createClient(forbidden.fetchImpl))).get("SNOW-17");
+  assert.equal(gated.status, "manual");
+  assert.match(gated.summary, /sys_plugins read was forbidden \(403\)/);
+
+  const filtered = healthyFixture();
+  filtered.tables.sys_plugins = filtered.tables.sys_plugins.filter((row) => row.source !== "com.snc.ipauthenticator");
+  const partial = findingsById(await assessServicenowPlatformHardening(createClient(fixtureFetch(filtered).fetchImpl))).get("SNOW-17");
+  assert.equal(partial.status, "warn");
+  assert.match(partial.summary, /plugin activation could not be confirmed/);
 });
 
 test("assessServicenowAccessControl passes complete role-protected ACL coverage", async () => {

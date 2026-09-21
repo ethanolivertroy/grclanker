@@ -14,7 +14,7 @@ The tools cover the twenty security controls in `specs/servicenow-sec-inspector.
 - Access control: ACL rule completeness (wildcard, unrestricted, and public page exposure) and table-level ACL coverage for sensitive tables
 - Operations governance: encryption at rest, audit logging, update set management, MID Server security, plugin inventory
 
-Tables read: `sys_user`, `sys_user_has_role`, `sys_user_role`, `sys_user_role_contains`, `sys_properties`, `password_policy`, `sso_properties`, `ldap_server_config`, `sys_certificate`, `oauth_entity`, `sys_security_acl`, `sys_security_acl_role`, `sys_public`, `sys_script`, `sys_ip_address_access`, `sys_email_account`, `sys_encryption_context`, `sys_dictionary`, `sys_audit` (count only), `syslog_transaction` (count only), `sys_update_set`, `sys_update_xml`, `sys_user_session` (access probe), `ecc_agent`, and `sys_plugins`.
+Tables read: `sys_user`, `sys_user_has_role`, `sys_user_role`, `sys_user_role_contains`, `sys_properties`, `password_policy`, `sso_properties`, `ldap_server_config`, `sys_certificate`, `oauth_entity`, `sys_security_acl`, `sys_security_acl_role`, `sys_public`, `sys_script`, `ip_access` (IP Address Access Controls, present once `com.snc.ipauthenticator` is active), `sys_email_account`, `sys_encryption_context`, `sys_dictionary`, `sys_audit` (count only), `syslog_transaction` (count only), `sys_update_set`, `sys_update_xml`, `sys_user_session` (access probe), `ecc_agent`, and `sys_plugins`.
 
 ## Setup and authentication
 
@@ -91,7 +91,7 @@ Rows without a date (`last_login_time`, `expires`) are bucketed separately and n
 | 14 | Integration user permissions | identity_access | SNOW-14 | fail when an integration account holds `admin` or `security_admin`; manual when no integration-flagged user exists; warn on other privileged roles |
 | 15 | Update set management | operations_governance | SNOW-15 | manual unless the update set inventory is proven visible; warn on in-progress sets or pending ACL, role, script, or property changes |
 | 16 | Debug mode verification | platform_hardening | SNOW-16 | fail when any `*debug*` property is true; manual when `sys_properties` visibility is unproven |
-| 17 | IP access restrictions | platform_hardening | SNOW-17 | fail with no active IP access rules; warn when `glide.ip.authenticate.strict` is not true |
+| 17 | IP access restrictions | platform_hardening | SNOW-17 | fail when the IP Range Based Authentication plugin (`com.snc.ipauthenticator`) is inactive or absent from `sys_plugins`, or when no active `ip_access` rule exists (a missing `ip_access` table is treated as the plugin not being activated); warn when the plugin row is not visible or `glide.ip.authenticate.strict` is not true |
 | 18 | Email security | platform_hardening | SNOW-18 | fail when an active SMTP account lacks TLS or `glide.smtp.auth=false`; otherwise manual because DKIM and notification headers are not exposed through the API |
 | 19 | MID Server security | operations_governance | SNOW-19 | fail on unvalidated MID Servers; warn when `mid.version.override` pins upgrades; manual for mutual authentication and allow lists, or "not applicable as observed" when no MID Server exists |
 | 20 | Plugin inventory and licensing | operations_governance | SNOW-20 | fail when High Security Settings, Contextual Security: Role Management V2, or Security Jump Start is inactive; otherwise manual for necessity review |
@@ -129,6 +129,8 @@ The script prints a skip message and exits 0 when no ServiceNow configuration is
 - High Security Settings: https://www.servicenow.com/docs/r/platform-security/exploring-high-security-settings.html
 - Session activity timeout hardening: https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-session-activity-timeout.html
 - Anti-CSRF token hardening: https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/anti-csrf-token.html
+- Restrict access to specific IP ranges plugin: https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-restrict-access-to-specific-ip-ranges-plugin.html
+- IP address access control (`ip_access` fields): https://www.servicenow.com/docs/r/platform-security/authentication/t_AccessControl.html
 - Configuring auditing for a table: https://www.servicenow.com/docs/r/platform-security/t_EnableAuditingForATable.html
 - Sys Audit table: https://www.servicenow.com/docs/r/platform-security/servicenow-ai-platform-security/c_UnderstandingTheSysAuditTable.html
 - Instance security best practices guide: https://www.servicenow.com/content/dam/servicenow-assets/public/en-us/doc-type/resource-center/white-paper/instance-security-best-practice.pdf

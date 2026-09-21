@@ -87,6 +87,7 @@ export interface TableSnapshot {
   partial: boolean;
   error?: string;
   statusCode?: number;
+  unavailable?: string;
 }
 
 export interface CountResult {
@@ -1007,6 +1008,18 @@ function snapshotIssue(snapshot: TableSnapshot): string | undefined {
   return undefined;
 }
 
+/**
+ * Tables that belong to an inactive plugin do not exist on the instance and the
+ * Table API answers 400 Invalid table. That is a documented state, not a read
+ * failure, so the snapshot is marked unavailable and left readable for gating.
+ */
+function normalizeMissingTable(snapshot: TableSnapshot, reason: string): TableSnapshot {
+  if (snapshot.statusCode === 400 && /invalid table/i.test(snapshot.error ?? "")) {
+    return { ...snapshot, rows: [], error: undefined, statusCode: undefined, truncated: false, partial: false, unavailable: reason };
+  }
+  return snapshot;
+}
+
 function snapshotPartialNote(snapshot: TableSnapshot): string | undefined {
   if (snapshot.error) return undefined;
   if (snapshot.truncated) {
@@ -1042,6 +1055,7 @@ function snapshotEvidence(snapshot: TableSnapshot): JsonRecord {
     partial: snapshot.partial,
     error: snapshot.error ?? null,
     status_code: snapshot.statusCode ?? null,
+    unavailable: snapshot.unavailable ?? null,
   };
 }
 
@@ -1252,6 +1266,11 @@ const ROLE_CONTAINS_FIELDS = ["sys_id", "role", "role.name", "contains", "contai
 const CERTIFICATE_FIELDS = ["sys_id", "name", "type", "expires", "active", "sys_updated_on"];
 const ACL_FIELDS = ["sys_id", "name", "operation", "type", "active", "admin_overrides", "condition", "script", "advanced", "description"];
 const ACL_ROLE_FIELDS = ["sys_id", "sys_security_acl", "sys_security_acl.name", "sys_user_role", "sys_user_role.name"];
+const PLUGIN_FIELDS = ["sys_id", "name", "source", "active", "version"];
+const IP_ACCESS_TABLE = "ip_access";
+const IP_AUTHENTICATOR_PLUGIN = "com.snc.ipauthenticator";
+const IP_ACCESS_FIELDS = ["sys_id", "type", "direction", "active", "range_start", "range_end", "description", "sys_updated_on"];
+const EMAIL_ACCOUNT_FIELDS = ["sys_id", "name", "type", "active", "enable_tls", "server", "port", "sys_updated_on"];
 
 export interface ServicenowIdentityData {
   users: TableSnapshot;
@@ -1701,6 +1720,7 @@ export interface ServicenowHardeningData {
   debugProperties: TableSnapshot;
   evalScripts: TableSnapshot;
   ipAccessRules: TableSnapshot;
+  ipAuthenticatorPlugin: TableSnapshot;
   emailAccounts: TableSnapshot;
   maxSessionTimeoutMinutes: number;
 }
@@ -1710,18 +1730,20 @@ export async function collectServicenowHardeningData(
   options: ServicenowHardeningOptions = {},
 ): Promise<ServicenowHardeningData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
-  const [properties, debugProperties, evalScripts, ipAccessRules, emailAccounts] = await Promise.all([
+  const [properties, debugProperties, evalScripts, ipAccessRules, ipAuthenticatorPlugin, emailAccounts] = await Promise.all([
     client.queryTable("sys_properties", { query: `nameIN${HARDENING_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
     client.queryTable("sys_properties", { query: "nameLIKEdebug^value=true", fields: PROPERTY_FIELDS, limit: recordLimit }),
     client.queryTable("sys_script", { query: "active=true^scriptLIKEeval(", fields: ["sys_id", "name", "collection", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_ip_address_access", { fields: ["sys_id", "name", "type", "active", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable("sys_email_account", { fields: ["sys_id", "name", "type", "active", "enable_tls", "server", "port", "sys_updated_on"], limit: recordLimit }),
+    client.queryTable(IP_ACCESS_TABLE, { fields: IP_ACCESS_FIELDS, limit: recordLimit }),
+    client.queryTable("sys_plugins", { query: `source=${IP_AUTHENTICATOR_PLUGIN}`, fields: PLUGIN_FIELDS, limit: recordLimit }),
+    client.queryTable("sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, limit: recordLimit }),
   ]);
   return {
     properties,
     debugProperties,
     evalScripts,
-    ipAccessRules,
+    ipAccessRules: normalizeMissingTable(ipAccessRules, `${IP_ACCESS_TABLE} does not exist on this instance; the ${IP_AUTHENTICATOR_PLUGIN} plugin creates it when activated`),
+    ipAuthenticatorPlugin,
     emailAccounts,
     maxSessionTimeoutMinutes: clampNumber(options.maxSessionTimeoutMinutes, DEFAULT_MAX_SESSION_TIMEOUT_MINUTES, 1, 1440),
   };
@@ -1733,6 +1755,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     ...snapshotErrors("debug properties", data.debugProperties),
     ...snapshotErrors("business rules using eval", data.evalScripts),
     ...snapshotErrors("ip access rules", data.ipAccessRules),
+    ...snapshotErrors("ip authenticator plugin", data.ipAuthenticatorPlugin),
     ...snapshotErrors("email accounts", data.emailAccounts),
   ];
 
@@ -1816,33 +1839,62 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     };
   });
 
-  const ipAccess = gatedFinding(17, [data.properties, data.ipAccessRules], "Open System Security > IP Address Access Control and record the allow and deny rules for administrative access, plus glide.ip.authenticate.strict.", () => {
+  const ipAccess = gatedFinding(17, [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin], `Open System Definition > Plugins and confirm IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) is active, then open System Security > IP Address Access Control and record the active allow and deny rules (type, direction, range) plus glide.ip.authenticate.strict.`, () => {
     const strict = readProperty(data.properties, "glide.ip.authenticate.strict");
+    const pluginRow = data.ipAuthenticatorPlugin.rows.find((row) => rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? data.ipAuthenticatorPlugin.rows[0];
+    const pluginState = pluginRow ? pluginActive(pluginRow) : undefined;
+    const tableUnavailable = data.ipAccessRules.unavailable;
     const rules = data.ipAccessRules.rows;
     const activeRules = rules.filter((row) => rowBoolean(row, "active") !== false);
     const evidence: JsonRecord = {
+      ip_authenticator_plugin: IP_AUTHENTICATOR_PLUGIN,
+      ip_authenticator_plugin_present: Boolean(pluginRow),
+      ip_authenticator_plugin_active: pluginState ?? null,
+      ip_access_table_available: !tableUnavailable,
       ip_access_rules: rules.length,
       active_ip_access_rules: activeRules.length,
-      rule_types: truncateList(activeRules.map((row) => `${rowString(row, "name") ?? "rule"}:${rowString(row, "type") ?? "type"}`)),
+      active_rules: truncateList(activeRules.map((row) => `${rowString(row, "type") ?? "type"} ${rowString(row, "direction") ?? "direction"} ${rowString(row, "range_start") ?? "?"}-${rowString(row, "range_end") ?? "?"}`)),
       glide_ip_authenticate_strict: strict.exists ? strict.value : null,
     };
+    if (pluginState !== true) {
+      if (!pluginRow && activeRules.length > 0) {
+        return {
+          status: "warn",
+          summary: `${activeRules.length} active ${IP_ACCESS_TABLE} rules exist, but ${IP_AUTHENTICATOR_PLUGIN} was not visible in sys_plugins, so plugin activation could not be confirmed from this credential.`,
+          evidence,
+        };
+      }
+      const pluginDescription = pluginRow ? `is ${rowString(pluginRow, "active") ?? "not active"} in sys_plugins` : "has no row in sys_plugins";
+      return {
+        status: "fail",
+        summary: `IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) ${pluginDescription}${tableUnavailable ? ` and the ${IP_ACCESS_TABLE} table does not exist` : ` and ${activeRules.length} active ${IP_ACCESS_TABLE} rules are visible`}; administrative access is not restricted by source network.`,
+        evidence,
+      };
+    }
+    if (tableUnavailable) {
+      return {
+        status: "manual",
+        summary: `${IP_AUTHENTICATOR_PLUGIN} is active but the ${IP_ACCESS_TABLE} table was reported as invalid (${tableUnavailable}); review IP Address Access Control manually.`,
+        evidence,
+      };
+    }
     if (activeRules.length === 0) {
       return {
         status: "fail",
-        summary: "No active IP address access control rules exist (sys_ip_address_access is empty), so administrative access is not restricted by source network.",
+        summary: `${IP_AUTHENTICATOR_PLUGIN} is active but no active IP Address Access Control rule exists (${IP_ACCESS_TABLE} has ${rules.length} rows, none active), so administrative access is not restricted by source network.`,
         evidence,
       };
     }
     if (!strict.exists || asBoolean(strict.value) !== true) {
       return {
         status: "warn",
-        summary: `${activeRules.length} active IP access rules exist, but glide.ip.authenticate.strict is ${strict.exists ? strict.value : "absent"}; strict enforcement is not confirmed.`,
+        summary: `${IP_AUTHENTICATOR_PLUGIN} is active with ${activeRules.length} active ${IP_ACCESS_TABLE} rules, but glide.ip.authenticate.strict is ${strict.exists ? strict.value : "absent"}; strict enforcement is not confirmed.`,
         evidence,
       };
     }
     return {
       status: "pass",
-      summary: `${activeRules.length} active IP access rules exist and glide.ip.authenticate.strict=true.`,
+      summary: `${IP_AUTHENTICATOR_PLUGIN} is active, ${activeRules.length} active ${IP_ACCESS_TABLE} rules restrict access by source network, and glide.ip.authenticate.strict=true.`,
       evidence,
     };
   });
@@ -1888,6 +1940,7 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
       enabled_debug_properties: data.debugProperties.rows.length,
       business_rules_using_eval: data.evalScripts.rows.length,
       active_ip_access_rules: data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false).length,
+      ip_authenticator_plugin_active: data.ipAuthenticatorPlugin.rows.some((row) => pluginActive(row) === true),
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2111,7 +2164,7 @@ export async function collectServicenowOperationsData(
     client.queryTable("sys_update_xml", { query: sensitiveXmlQuery, fields: ["sys_id", "name", "type", "target_name", "action", "update_set", "update_set.name", "sys_updated_on"], limit: recordLimit }),
     client.queryTable("ecc_agent", { fields: ["sys_id", "name", "status", "validated", "version", "host_name", "sys_updated_on"], limit: recordLimit }),
     client.queryTable("sys_properties", { query: `nameIN${MID_PROPERTY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_plugins", { fields: ["sys_id", "name", "source", "active", "version"], limit: recordLimit }),
+    client.queryTable("sys_plugins", { fields: PLUGIN_FIELDS, limit: recordLimit }),
   ]);
   return {
     encryptionContexts,
@@ -2381,7 +2434,7 @@ const ACCESS_SURFACES: Array<{ name: string; table: string }> = [
   { name: "dictionary", table: "sys_dictionary" },
   { name: "encryption_contexts", table: "sys_encryption_context" },
   { name: "business_rules", table: "sys_script" },
-  { name: "ip_access_rules", table: "sys_ip_address_access" },
+  { name: "ip_access_rules", table: IP_ACCESS_TABLE },
   { name: "email_accounts", table: "sys_email_account" },
   { name: "mid_servers", table: "ecc_agent" },
   { name: "plugins", table: "sys_plugins" },
@@ -2685,7 +2738,8 @@ export async function exportServicenowAuditBundle(
     ["core_data/sys_properties_hardening.json", hardeningData.properties],
     ["core_data/sys_properties_debug.json", hardeningData.debugProperties],
     ["core_data/sys_script_eval.json", hardeningData.evalScripts],
-    ["core_data/sys_ip_address_access.json", hardeningData.ipAccessRules],
+    ["core_data/ip_access.json", hardeningData.ipAccessRules],
+    ["core_data/sys_plugins_ip_authenticator.json", hardeningData.ipAuthenticatorPlugin],
     ["core_data/sys_email_account.json", hardeningData.emailAccounts],
     ["core_data/sys_security_acl.json", accessControlData.acls],
     ["core_data/sys_security_acl_role.json", accessControlData.aclRoles],
