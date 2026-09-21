@@ -44,6 +44,8 @@ const DEFAULT_ENTITY_LIMIT = 1000;
 const DEFAULT_SCRIPT_SAMPLE_LIMIT = 25;
 const DEFAULT_MAX_RETRIES = 3;
 const MAX_PAGES = 200;
+const NRQL_MAX_ROWS = 2000;
+const CAUSE_MAX_LENGTH = 200;
 const DEFAULT_ADMIN_ROLE_PATTERN = "organization manager|authentication domain manager|all product admin";
 const DEFAULT_PRODUCTION_ACCOUNT_PATTERN = "prod";
 const DEFAULT_NONPRODUCTION_ACCOUNT_PATTERN = "dev|test|stag|sandbox|qa|nonprod|non-prod|uat|demo";
@@ -195,6 +197,7 @@ export interface NewrelicAssessmentResult {
   summary: JsonRecord;
   findings: NewrelicFinding[];
   errors: string[];
+  coverage: string[];
   coreData: Record<string, unknown>;
 }
 
@@ -206,9 +209,27 @@ export interface NewrelicAuditBundleResult {
   errorCount: number;
 }
 
+export interface PagedList<T = JsonRecord> {
+  items: T[];
+  complete: boolean;
+  totalCount?: number;
+  note?: string;
+  failures?: string[];
+}
+
 export interface Collected<T> {
   data: T;
   error?: string;
+  partial?: string[];
+  truncated?: boolean;
+  seen?: number;
+  total?: number;
+  note?: string;
+}
+
+interface Verdict {
+  status: NewrelicFindingStatus;
+  summary: string;
 }
 
 type AuthArgs = {
@@ -820,6 +841,7 @@ const QUERY_OBFUSCATION_EXPRESSIONS = `query($accountId: Int!) {
 const QUERY_PIPELINE_CLOUD_RULES = `{
   actor { entityManagement {
     entitySearch(query: "type = 'PIPELINE_CLOUD_RULE'") {
+      nextCursor
       entities {
         id name type
         ... on EntityManagementPipelineCloudRuleEntity { nrql description enabled }
@@ -936,22 +958,35 @@ export class NewrelicApiClient {
     pagePath: Array<string | number>,
     itemsKey: string,
     limit: number,
-  ): Promise<JsonRecord[]> {
+    totalPath?: Array<string | number>,
+  ): Promise<PagedList> {
     const items: JsonRecord[] = [];
     let cursor: string | undefined;
-    for (let page = 0; page < MAX_PAGES && items.length < limit; page += 1) {
+    let totalCount: number | undefined;
+    let remaining = true;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
       const data = await this.nerdgraph(query, cursor ? { ...variables, cursor } : variables);
       const pageObject = asObject(getNestedValue(data, pagePath));
       if (!pageObject) {
         throw new Error(`NerdGraph response did not include ${pagePath.filter((segment) => typeof segment === "string").join(".")}.`);
       }
       const pageItems = asRecords(pageObject[itemsKey]);
-      items.push(...pageItems.slice(0, limit - items.length));
+      totalCount = asNumber(totalPath ? getNestedValue(data, totalPath) : pageObject.totalCount ?? pageObject.count) ?? totalCount;
+      items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
       const nextCursor = asString(pageObject.nextCursor);
-      if (!nextCursor || nextCursor === cursor || pageItems.length === 0) break;
+      if (!nextCursor || nextCursor === cursor || pageItems.length === 0) {
+        remaining = false;
+        break;
+      }
+      if (items.length >= limit) break;
       cursor = nextCursor;
     }
-    return items;
+    return {
+      items,
+      complete: !remaining,
+      totalCount,
+      note: remaining ? `stopped after ${items.length} items with more pages available` : undefined,
+    };
   }
 
   private buildRestUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -992,7 +1027,7 @@ export class NewrelicApiClient {
     return { payload, nextUrl: parseLinkNext(response.headers.get("link")) };
   }
 
-  async restList(path: string, collectionKey: string, limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async restList(path: string, collectionKey: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     const items: JsonRecord[] = [];
     let url: string | undefined = path;
     for (let page = 0; url && page < MAX_PAGES && items.length < limit; page += 1) {
@@ -1001,7 +1036,11 @@ export class NewrelicApiClient {
       items.push(...pageItems.slice(0, limit - items.length));
       url = nextUrl;
     }
-    return items;
+    return {
+      items,
+      complete: url === undefined,
+      note: url === undefined ? undefined : `stopped after ${items.length} items with a Link rel="next" page remaining`,
+    };
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
@@ -1014,16 +1053,16 @@ export class NewrelicApiClient {
     return asObject(getNestedValue(data, ["actor", "organization"])) ?? {};
   }
 
-  async listAccounts(): Promise<JsonRecord[]> {
+  async listAccounts(): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_ACCOUNTS);
-    return asRecords(getNestedValue(data, ["actor", "accounts"]));
+    return completeList(asRecords(getNestedValue(data, ["actor", "accounts"])));
   }
 
   async resolveAccountIds(): Promise<number[]> {
     if (this.config.accountIds.length > 0) return this.config.accountIds;
     if (!this.discoveredAccountIds) {
       this.discoveredAccountIds = this.listAccounts().then((accounts) => {
-        const ids = accounts.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined);
+        const ids = accounts.items.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined);
         if (ids.length === 0) {
           throw new Error("No New Relic accounts were visible to the API key. Set NEW_RELIC_ACCOUNT_ID explicitly.");
         }
@@ -1036,7 +1075,7 @@ export class NewrelicApiClient {
     return this.discoveredAccountIds;
   }
 
-  async listAuthenticationDomains(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listAuthenticationDomains(limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.paginate(
       QUERY_AUTHENTICATION_DOMAINS,
       {},
@@ -1046,7 +1085,7 @@ export class NewrelicApiClient {
     );
   }
 
-  async listOrganizationAuthenticationDomains(organizationId: string): Promise<JsonRecord[]> {
+  async listOrganizationAuthenticationDomains(organizationId: string): Promise<PagedList> {
     const query = `{
   customerAdministration {
     authenticationDomains(filter: { organizationId: { eq: ${JSON.stringify(organizationId)} } }) {
@@ -1056,10 +1095,16 @@ export class NewrelicApiClient {
   }
 }`;
     const data = await this.nerdgraph(query);
-    return asRecords(getNestedValue(data, ["customerAdministration", "authenticationDomains", "items"]));
+    const collection = asObject(getNestedValue(data, ["customerAdministration", "authenticationDomains"]));
+    const nextCursor = asString(collection?.nextCursor);
+    return {
+      items: asRecords(collection?.items),
+      complete: !nextCursor,
+      note: nextCursor ? "customerAdministration.authenticationDomains returned more pages than were read" : undefined,
+    };
   }
 
-  async listDomainUsers(domainId: string, limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listDomainUsers(domainId: string, limit = DEFAULT_USER_LIMIT): Promise<PagedList> {
     return this.paginate(
       QUERY_DOMAIN_USERS,
       { domainId: [domainId] },
@@ -1069,7 +1114,7 @@ export class NewrelicApiClient {
     );
   }
 
-  async listDomainGroupGrants(domainId: string, limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listDomainGroupGrants(domainId: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     const groups = await this.paginate(
       QUERY_DOMAIN_GROUP_GRANTS,
       { domainId: [domainId] },
@@ -1077,18 +1122,25 @@ export class NewrelicApiClient {
       "groups",
       limit,
     );
-    return groups.map((group) => ({
-      id: group.id,
-      displayName: group.displayName,
-      roles: asRecords(asObject(group.roles)?.roles),
-    }));
+    return {
+      ...groups,
+      items: groups.items.map((group) => {
+        const roleContainer = asObject(group.roles);
+        return {
+          id: group.id,
+          displayName: group.displayName,
+          roles: asRecords(roleContainer?.roles),
+          rolesReadable: roleContainer !== undefined,
+        };
+      }),
+    };
   }
 
-  async listRoles(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listRoles(limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.paginate(QUERY_ROLES, {}, ["actor", "organization", "authorizationManagement", "roles"], "roles", limit);
   }
 
-  async listApiKeys(types: Array<"USER" | "INGEST">, accountIds?: number[], limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listApiKeys(types: Array<"USER" | "INGEST">, accountIds?: number[], limit = DEFAULT_USER_LIMIT): Promise<PagedList> {
     const scope = accountIds && accountIds.length > 0 ? { accountIds } : undefined;
     const variables = { query: scope ? { types, scope } : { types } };
     try {
@@ -1096,7 +1148,15 @@ export class NewrelicApiClient {
     } catch (error) {
       if (!isUnknownCursorArgumentError(error)) throw error;
       const data = await this.nerdgraph(QUERY_API_KEYS_SINGLE_PAGE, variables);
-      return asRecords(asObject(getNestedValue(data, ["actor", "apiAccess", "keySearch"]))?.keys).slice(0, limit);
+      const search = asObject(getNestedValue(data, ["actor", "apiAccess", "keySearch"]));
+      const keys = asRecords(search?.keys).slice(0, limit);
+      const totalCount = asNumber(search?.count);
+      return {
+        items: keys,
+        complete: totalCount !== undefined && keys.length >= totalCount,
+        totalCount,
+        note: `keySearch rejected the cursor argument, so only the first page was read (${keys.length}${totalCount !== undefined ? ` of ${totalCount}` : ""} keys)`,
+      };
     }
   }
 
@@ -1105,8 +1165,15 @@ export class NewrelicApiClient {
     return asRecords(getNestedValue(data, ["actor", "account", "nrql", "results"]));
   }
 
-  async searchEntities(query: string, limit = DEFAULT_ENTITY_LIMIT): Promise<JsonRecord[]> {
-    return this.paginate(QUERY_ENTITY_SEARCH, { query }, ["actor", "entitySearch", "results"], "entities", limit);
+  async searchEntities(query: string, limit = DEFAULT_ENTITY_LIMIT): Promise<PagedList> {
+    return this.paginate(
+      QUERY_ENTITY_SEARCH,
+      { query },
+      ["actor", "entitySearch", "results"],
+      "entities",
+      limit,
+      ["actor", "entitySearch", "count"],
+    );
   }
 
   async countEntities(query: string): Promise<number> {
@@ -1114,11 +1181,11 @@ export class NewrelicApiClient {
     return asNumber(getNestedValue(data, ["actor", "entitySearch", "count"])) ?? 0;
   }
 
-  async listAlertPolicies(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listAlertPolicies(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.paginate(QUERY_ALERT_POLICIES, { accountId }, ["actor", "account", "alerts", "policiesSearch"], "policies", limit);
   }
 
-  async listNrqlConditions(accountId: number, limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listNrqlConditions(accountId: number, limit = DEFAULT_USER_LIMIT): Promise<PagedList> {
     return this.paginate(
       QUERY_NRQL_CONDITIONS,
       { accountId },
@@ -1128,51 +1195,57 @@ export class NewrelicApiClient {
     );
   }
 
-  async listNotificationDestinations(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listNotificationDestinations(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.paginate(QUERY_DESTINATIONS, { accountId }, ["actor", "account", "aiNotifications", "destinations"], "entities", limit);
   }
 
-  async listNotificationChannels(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listNotificationChannels(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.paginate(QUERY_CHANNELS, { accountId }, ["actor", "account", "aiNotifications", "channels"], "entities", limit);
   }
 
-  async listWorkflows(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listWorkflows(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.paginate(QUERY_WORKFLOWS, { accountId }, ["actor", "account", "aiWorkflows", "workflows"], "entities", limit);
   }
 
-  async listEventRetentionRules(accountId: number): Promise<JsonRecord[]> {
+  async listEventRetentionRules(accountId: number): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_RETENTION_RULES, { accountId });
-    return asRecords(getNestedValue(data, ["actor", "account", "dataManagement", "eventRetentionRules"]));
+    return completeList(asRecords(getNestedValue(data, ["actor", "account", "dataManagement", "eventRetentionRules"])));
   }
 
-  async listRetentionNamespaces(accountId: number): Promise<JsonRecord[]> {
+  async listRetentionNamespaces(accountId: number): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_RETENTION_NAMESPACES, { accountId });
-    return asRecords(getNestedValue(data, ["actor", "account", "dataManagement", "customizableRetention", "eventNamespaces"]));
+    return completeList(asRecords(getNestedValue(data, ["actor", "account", "dataManagement", "customizableRetention", "eventNamespaces"])));
   }
 
-  async listObfuscationRules(accountId: number): Promise<JsonRecord[]> {
+  async listObfuscationRules(accountId: number): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_OBFUSCATION_RULES, { accountId });
-    return asRecords(getNestedValue(data, ["actor", "account", "logConfigurations", "obfuscationRules"]));
+    return completeList(asRecords(getNestedValue(data, ["actor", "account", "logConfigurations", "obfuscationRules"])));
   }
 
-  async listObfuscationExpressions(accountId: number): Promise<JsonRecord[]> {
+  async listObfuscationExpressions(accountId: number): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_OBFUSCATION_EXPRESSIONS, { accountId });
-    return asRecords(getNestedValue(data, ["actor", "account", "logConfigurations", "obfuscationExpressions"]));
+    return completeList(asRecords(getNestedValue(data, ["actor", "account", "logConfigurations", "obfuscationExpressions"])));
   }
 
-  async listPipelineCloudRules(): Promise<JsonRecord[]> {
+  async listPipelineCloudRules(): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_PIPELINE_CLOUD_RULES);
-    return asRecords(getNestedValue(data, ["actor", "entityManagement", "entitySearch", "entities"]));
+    const search = asObject(getNestedValue(data, ["actor", "entityManagement", "entitySearch"]));
+    const nextCursor = asString(search?.nextCursor);
+    return {
+      items: asRecords(search?.entities),
+      complete: !nextCursor,
+      note: nextCursor ? "entityManagement.entitySearch returned more pages than were read" : undefined,
+    };
   }
 
-  async listNrqlDropRules(accountId: number): Promise<JsonRecord[]> {
+  async listNrqlDropRules(accountId: number): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_NRQL_DROP_RULES, { accountId });
     const list = asObject(getNestedValue(data, ["actor", "account", "nrqlDropRules", "list"]));
     const error = asObject(list?.error);
     if (error) {
       throw new Error(`NRQL drop rule listing failed: ${asString(error.reason) ?? "unknown"} ${asString(error.description) ?? ""}`.trim());
     }
-    return asRecords(list?.rules);
+    return completeList(asRecords(list?.rules));
   }
 
   async getSyntheticScript(accountId: number, monitorGuid: string): Promise<string> {
@@ -1180,21 +1253,21 @@ export class NewrelicApiClient {
     return asString(getNestedValue(data, ["actor", "account", "synthetics", "script", "text"])) ?? "";
   }
 
-  async listDashboardLiveUrls(): Promise<JsonRecord[]> {
+  async listDashboardLiveUrls(): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_DASHBOARD_LIVE_URLS);
     const result = asObject(getNestedValue(data, ["actor", "dashboard", "liveUrls"]));
     const errors = asRecords(result?.errors);
     if (errors.length > 0) {
       throw new Error(`Dashboard live URL listing failed: ${errors.map((error) => asString(error.description) ?? "unknown error").join("; ")}`);
     }
-    return asRecords(result?.liveUrls);
+    return completeList(asRecords(result?.liveUrls));
   }
 
-  async listRestUsers(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listRestUsers(limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.restList("/v2/users.json", "users", limit);
   }
 
-  async listRestAlertPolicies(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
+  async listRestAlertPolicies(limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     return this.restList("/v2/alerts_policies.json", "policies", limit);
   }
 }
@@ -1285,35 +1358,98 @@ type DataGovernanceClient = Pick<
   | "runNrql"
 >;
 
+function completeList<T>(items: T[]): PagedList<T> {
+  return { items, complete: true };
+}
+
+function toPagedList<T>(value: PagedList<T> | T[]): PagedList<T> {
+  return Array.isArray(value) ? completeList(value) : value;
+}
+
 async function collect<T>(source: string, fallback: T, load: () => Promise<T>): Promise<Collected<T>> {
   try {
     return { data: await load() };
   } catch (error) {
+    return { data: fallback, error: `${source}: ${errorMessage(error)}` };
+  }
+}
+
+async function collectList(source: string, load: () => Promise<PagedList | JsonRecord[]>): Promise<Collected<JsonRecord[]>> {
+  try {
+    const page = toPagedList(await load());
     return {
-      data: fallback,
-      error: `${source}: ${error instanceof Error ? error.message : String(error)}`,
+      data: page.items,
+      partial: page.failures && page.failures.length > 0 ? page.failures.map((failure) => `${source}: ${failure}`) : undefined,
+      truncated: page.complete ? undefined : true,
+      seen: page.items.length,
+      total: page.totalCount,
+      note: page.note ? `${source}: ${page.note}` : undefined,
     };
+  } catch (error) {
+    return { data: [], error: `${source}: ${errorMessage(error)}` };
   }
 }
 
 function collectedErrors(items: Array<Collected<unknown>>): string[] {
-  return items.map((item) => item.error).filter((error): error is string => Boolean(error));
+  return items.flatMap((item) => [...(item.error ? [item.error] : []), ...(item.partial ?? [])]);
 }
 
-function finding(
-  controlNumber: number,
-  status: NewrelicFindingStatus,
-  summary: string,
-  evidence?: JsonRecord,
-): NewrelicFinding {
+function isComplete(item: Collected<unknown>): boolean {
+  return !item.error && !(item.partial && item.partial.length > 0) && !item.truncated && !item.note;
+}
+
+function coverageNote(label: string, item: Collected<unknown[]>): string | undefined {
+  if (item.error) return undefined;
+  const parts: string[] = [];
+  if (item.truncated) {
+    parts.push(`${item.seen ?? item.data.length}${item.total !== undefined ? ` of ${item.total}` : ""} seen before pagination stopped`);
+  }
+  if (item.partial && item.partial.length > 0) {
+    parts.push(`${item.partial.length} scope${item.partial.length === 1 ? "" : "s"} unreadable (${item.partial.join("; ")})`);
+  }
+  if (item.note) parts.push(item.note);
+  return parts.length > 0 ? `${label}: ${parts.join("; ")}` : undefined;
+}
+
+function coverageNotes(entries: Array<[string, Collected<unknown[]>]>): string[] {
+  return entries.map(([label, item]) => coverageNote(label, item)).filter((note): note is string => Boolean(note));
+}
+
+function causeOf(item: Collected<unknown>): string {
+  const cause = item.error ?? "unknown cause";
+  return cause.length > CAUSE_MAX_LENGTH ? `${cause.slice(0, CAUSE_MAX_LENGTH)}...` : cause;
+}
+
+function verdict(status: NewrelicFindingStatus, summary: string): Verdict {
+  return { status, summary };
+}
+
+function manualVerdict(summary: string): Verdict {
+  return { status: "manual", summary };
+}
+
+function unreadableVerdict(surface: string, item: Collected<unknown>, evidence: string): Verdict {
+  return manualVerdict(`${surface} could not be read (${causeOf(item)}), so this control is unknown rather than passing. Collect ${evidence}`);
+}
+
+function limitCoverage(base: Verdict, notes: string[]): Verdict {
+  if (notes.length === 0) return base;
+  const suffix = ` Partial view: ${notes.join("; ")}.`;
+  if (base.status === "pass") {
+    return verdict("warn", `${base.summary} The inventory was incomplete, so the verdict is limited to warn instead of pass.${suffix}`);
+  }
+  return verdict(base.status, `${base.summary}${suffix}`);
+}
+
+function finding(controlNumber: number, result: Verdict, evidence?: JsonRecord): NewrelicFinding {
   const control = CONTROLS[controlNumber];
   return {
     id: control.id,
     control: control.number,
     title: control.title,
     severity: control.severity,
-    status,
-    summary,
+    status: result.status,
+    summary: result.summary,
     evidence,
     mappings: control.mappings,
   };
@@ -1341,7 +1477,9 @@ async function readableSurface(
 }
 
 function arrayCount(value: unknown): number | undefined {
-  return Array.isArray(value) ? value.length : undefined;
+  if (Array.isArray(value)) return value.length;
+  const items = asObject(value)?.items;
+  return Array.isArray(items) ? items.length : undefined;
 }
 
 export async function checkNewrelicAccess(
@@ -1464,38 +1602,96 @@ export interface NewrelicIdentityData {
   roles: Collected<JsonRecord[]>;
 }
 
+async function collectScoped(
+  scopes: Array<{ id: string; label: string }>,
+  load: (scopeId: string) => Promise<PagedList | JsonRecord[]>,
+  decorate: (item: JsonRecord, scopeId: string) => JsonRecord,
+  limit = Number.POSITIVE_INFINITY,
+): Promise<PagedList> {
+  if (scopes.length === 0) throw new Error("no scopes were available to query");
+  const items: JsonRecord[] = [];
+  const failures: string[] = [];
+  const notes: string[] = [];
+  let complete = true;
+  let totalCount: number | undefined = 0;
+  for (const scope of scopes) {
+    const room = limit - items.length;
+    if (room <= 0) {
+      complete = false;
+      notes.push(`${scope.label} skipped because the ${limit} item limit was reached`);
+      continue;
+    }
+    try {
+      const page = toPagedList(await load(scope.id));
+      items.push(...page.items.slice(0, room).map((item) => decorate(item, scope.id)));
+      if (page.items.length > room) {
+        complete = false;
+        notes.push(`${scope.label}: ${limit} item limit reached`);
+      }
+      if (!page.complete) complete = false;
+      if (page.note) notes.push(`${scope.label}: ${page.note}`);
+      if (page.failures) failures.push(...page.failures.map((failure) => `${scope.label}: ${failure}`));
+      totalCount = totalCount === undefined || page.totalCount === undefined ? undefined : totalCount + page.totalCount;
+    } catch (error) {
+      failures.push(`${scope.label}: ${errorMessage(error)}`);
+      totalCount = undefined;
+    }
+  }
+  if (failures.length >= scopes.length) {
+    throw new Error(failures.join("; "));
+  }
+  return {
+    items,
+    complete,
+    totalCount: totalCount ?? (complete && failures.length === 0 ? items.length : undefined),
+    note: notes.length > 0 ? notes.join("; ") : undefined,
+    failures: failures.length > 0 ? failures : undefined,
+  };
+}
+
+function requireDomains(domains: Collected<JsonRecord[]>): JsonRecord[] {
+  if (domains.error) throw new Error(`authentication domains were not readable (${domains.error})`);
+  return domains.data;
+}
+
+function domainScopes(domains: JsonRecord[]): Array<{ id: string; label: string }> {
+  return domains
+    .map((domain) => ({ id: asString(domain.id) ?? "", label: `authentication domain ${domainLabel(domain)}` }))
+    .filter((scope) => scope.id.length > 0);
+}
+
+function accountScopes(accountIds: number[]): Array<{ id: string; label: string }> {
+  return accountIds.map((accountId) => ({ id: String(accountId), label: `account ${accountId}` }));
+}
+
 async function collectUsers(
   client: Pick<NewrelicClientSurface, "listDomainUsers">,
   domains: JsonRecord[],
   limit: number,
-): Promise<JsonRecord[]> {
-  const users: JsonRecord[] = [];
-  for (const domain of domains) {
-    const domainId = asString(domain.id);
-    if (!domainId || users.length >= limit) continue;
-    const domainUsers = await client.listDomainUsers(domainId, limit - users.length);
-    users.push(...domainUsers.map((user) => ({
+): Promise<PagedList> {
+  const domainById = new Map(domains.map((domain) => [asString(domain.id) ?? "", domain]));
+  return collectScoped(
+    domainScopes(domains),
+    (domainId) => client.listDomainUsers(domainId, limit),
+    (user, domainId) => ({
       ...user,
       authenticationDomainId: domainId,
-      authenticationDomainName: asString(domain.name),
-      provisioningType: asString(domain.provisioningType),
-    })));
-  }
-  return users;
+      authenticationDomainName: asString(domainById.get(domainId)?.name),
+      provisioningType: asString(domainById.get(domainId)?.provisioningType),
+    }),
+    limit,
+  );
 }
 
 async function collectGroupGrants(
   client: Pick<NewrelicClientSurface, "listDomainGroupGrants">,
   domains: JsonRecord[],
-): Promise<JsonRecord[]> {
-  const groups: JsonRecord[] = [];
-  for (const domain of domains) {
-    const domainId = asString(domain.id);
-    if (!domainId) continue;
-    const domainGroups = await client.listDomainGroupGrants(domainId);
-    groups.push(...domainGroups.map((group) => ({ ...group, authenticationDomainId: domainId })));
-  }
-  return groups;
+): Promise<PagedList> {
+  return collectScoped(
+    domainScopes(domains),
+    (domainId) => client.listDomainGroupGrants(domainId),
+    (group, domainId) => ({ ...group, authenticationDomainId: domainId }),
+  );
 }
 
 export async function collectNewrelicIdentityData(
@@ -1504,19 +1700,18 @@ export async function collectNewrelicIdentityData(
 ): Promise<NewrelicIdentityData> {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 50_000);
   const organization = await collect("organization", {} as JsonRecord, () => client.getOrganization());
-  const authenticationDomains = await collect("userManagement.authenticationDomains", [] as JsonRecord[], () => client.listAuthenticationDomains());
+  const authenticationDomains = await collectList("userManagement.authenticationDomains", () => client.listAuthenticationDomains());
   const organizationId = asString(organization.data.id);
-  const organizationAuthenticationDomains = await collect(
+  const organizationAuthenticationDomains = await collectList(
     "customerAdministration.authenticationDomains",
-    [] as JsonRecord[],
     async () => {
-      if (!organizationId) throw new Error("organization id was not readable");
+      if (!organizationId) throw new Error(`organization id was not readable (${organization.error ?? "actor.organization returned no id"})`);
       return client.listOrganizationAuthenticationDomains(organizationId);
     },
   );
-  const users = await collect("userManagement.users", [] as JsonRecord[], () => collectUsers(client, authenticationDomains.data, userLimit));
-  const groupGrants = await collect("authorizationManagement.groups", [] as JsonRecord[], () => collectGroupGrants(client, authenticationDomains.data));
-  const roles = await collect("authorizationManagement.roles", [] as JsonRecord[], () => client.listRoles());
+  const users = await collectList("userManagement.users", () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
+  const groupGrants = await collectList("authorizationManagement.groups", () => collectGroupGrants(client, requireDomains(authenticationDomains)));
+  const roles = await collectList("authorizationManagement.roles", () => client.listRoles());
   return { organization, authenticationDomains, organizationAuthenticationDomains, users, groupGrants, roles };
 }
 
@@ -1585,7 +1780,7 @@ export function assessNewrelicIdentityData(
   const domainsReadable = !data.authenticationDomains.error;
   const usersReadable = !data.users.error;
   const grantsReadable = !data.groupGrants.error;
-  const authTypeVisible = !data.organizationAuthenticationDomains.error && orgDomains.length > 0;
+  const authTypeReadable = !data.organizationAuthenticationDomains.error;
 
   const domainAuthTypes = orgDomains.map((domain) => ({
     id: asString(domain.id),
@@ -1595,19 +1790,27 @@ export function assessNewrelicIdentityData(
   }));
   const passwordDomains = domainAuthTypes.filter((domain) => domain.authenticationType === "PASSWORD");
   const ssoDomains = domainAuthTypes.filter((domain) => SSO_AUTHENTICATION_TYPES.has(domain.authenticationType));
+  const unknownAuthTypeDomains = domainAuthTypes.filter((domain) => domain.authenticationType !== "PASSWORD" && !SSO_AUTHENTICATION_TYPES.has(domain.authenticationType));
+  const authTypeDomainIds = new Set(domainAuthTypes.map((domain) => domain.id).filter((id): id is string => Boolean(id)));
   const domainProvisioning = domains.map((domain) => ({
     id: asString(domain.id),
     name: domainLabel(domain),
     provisioningType: asString(domain.provisioningType)?.toUpperCase() ?? "UNKNOWN",
   }));
+  const domainsWithoutAuthType = domainProvisioning.filter((domain) => !domain.id || !authTypeDomainIds.has(domain.id));
   const manualProvisioningDomains = domainProvisioning.filter((domain) => domain.provisioningType === "MANUAL");
   const scimDomains = domainProvisioning.filter((domain) => domain.provisioningType === "SCIM");
+  const unknownProvisioningDomains = domainProvisioning.filter((domain) => domain.provisioningType !== "MANUAL" && domain.provisioningType !== "SCIM");
 
   const fullPlatformUsers = users.filter(isFullPlatformUser);
+  const unknownTypeUsers = users.filter((user) => userTypeId(user) === "UNKNOWN");
   const inactiveFullPlatformUsers = fullPlatformUsers.filter((user) => {
     const age = lastActiveAgeDays(user, now);
-    return age === undefined || age > inactiveDays;
+    return age !== undefined && age > inactiveDays;
   });
+  const undatedFullPlatformUsers = fullPlatformUsers.filter((user) => lastActiveAgeDays(user, now) === undefined);
+  const usersWithoutGroupData = users.filter((user) => asObject(user.groups) === undefined);
+  const groupsWithoutRoleData = groupGrants.filter((group) => group.rolesReadable === false);
   const fullPlatformShare = percent(fullPlatformUsers.length, users.length);
   const userTypeCounts: Record<string, number> = {};
   for (const user of users) {
@@ -1628,131 +1831,147 @@ export function assessNewrelicIdentityData(
   const neverActiveUsers = users.filter((user) => lastActiveAgeDays(user, now) === undefined);
   const customRoles = roles.filter((role) => (asString(role.type) ?? "").toUpperCase() === "CUSTOM");
 
+  const domainCoverage = coverageNotes([["authentication domains", data.authenticationDomains]]);
+  const authTypeCoverage = coverageNotes([["authentication domain settings", data.organizationAuthenticationDomains]]);
+  const userCoverage = coverageNotes([["users", data.users]]);
+  const groupCoverage = coverageNotes([["groups", data.groupGrants]]);
+  const domainEvidence = "the Authentication method shown in Administration > Access Management > Authentication domains for every domain.";
+  const userEvidence = "an export of Administration > Access Management > Users including the User type and Last active columns.";
+  const groupEvidence = "Administration > Access Management > Groups with each group's roles and member counts.";
+
+  const control1 = (): Verdict => {
+    if (!domainsReadable) return unreadableVerdict("Authentication domains", data.authenticationDomains, domainEvidence);
+    if (domains.length === 0) {
+      return manualVerdict(`userManagement.authenticationDomains returned zero domains; every organization has at least one, so the key cannot see them and emptiness is treated as unknown rather than compliant. Collect ${domainEvidence}`);
+    }
+    if (!authTypeReadable) {
+      return manualVerdict(`${domains.length} authentication domains were listed, but authenticationType is not available to this key (${causeOf(data.organizationAuthenticationDomains)}); customerAdministration is limited to multi-tenant organizations, so SSO enforcement is scoped out of the API check and not applicable to automated verification. Collect ${domainEvidence}`);
+    }
+    if (passwordDomains.length > 0) {
+      return verdict("fail", `${passwordDomains.length}/${domainAuthTypes.length} authentication domains still authenticate users with New Relic passwords instead of SAML or OIDC SSO.`);
+    }
+    if (orgDomains.length === 0 || domainsWithoutAuthType.length > 0) {
+      const missing = domainsWithoutAuthType.map((domain) => domain.name).join(", ");
+      return manualVerdict(`customerAdministration.authenticationDomains exposed authenticationType for ${orgDomains.length}/${domains.length} domains; ${missing || "the listed domains"} had no readable authentication type, so SSO enforcement cannot be confirmed. Collect ${domainEvidence}`);
+    }
+    if (unknownAuthTypeDomains.length > 0) {
+      return manualVerdict(`${unknownAuthTypeDomains.length}/${domainAuthTypes.length} authentication domains exposed an unrecognized authenticationType (${unknownAuthTypeDomains.map((domain) => `${domain.name}: ${domain.authenticationType}`).join(", ")}), so SSO enforcement cannot be confirmed for them. Collect ${domainEvidence}`);
+    }
+    return verdict("pass", `All ${domainAuthTypes.length} authentication domains authenticate through SSO (${ssoDomains.map((domain) => domain.authenticationType).join(", ")}).`);
+  };
+
+  const control2 = (): Verdict => {
+    if (!usersReadable) return unreadableVerdict("Users", data.users, userEvidence);
+    if (users.length === 0) {
+      return manualVerdict(`userManagement.users returned zero users across ${domains.length} authentication domains; at least the key owner must exist, so the inventory is unknown rather than compliant. Collect ${userEvidence}`);
+    }
+    if (inactiveFullPlatformUsers.length > 0) {
+      return verdict("fail", `${inactiveFullPlatformUsers.length}/${fullPlatformUsers.length} full platform users have not been active in the last ${inactiveDays} days, indicating over-provisioned user types.`);
+    }
+    if (fullPlatformShare > maxFullPlatformPercent) {
+      return verdict("warn", `${fullPlatformShare}% of ${users.length} users hold the full platform user type, above the ${maxFullPlatformPercent}% review threshold.`);
+    }
+    if (undatedFullPlatformUsers.length > 0 || unknownTypeUsers.length > 0) {
+      return verdict("warn", `${fullPlatformUsers.length}/${users.length} users hold the full platform user type; ${undatedFullPlatformUsers.length} of them have no lastActive value and ${unknownTypeUsers.length} users expose no user type, so they cannot be counted as active or right-sized.`);
+    }
+    return verdict("pass", `${fullPlatformUsers.length}/${users.length} users hold the full platform user type, every user exposed a type, and all full platform users were active within ${inactiveDays} days.`);
+  };
+
+  const control3 = (): Verdict => {
+    if (!grantsReadable) return unreadableVerdict("Group role grants", data.groupGrants, groupEvidence);
+    if (!usersReadable) return unreadableVerdict("Users", data.users, userEvidence);
+    if (groupGrants.length === 0) {
+      return manualVerdict(`authorizationManagement.groups returned zero groups across ${domains.length} authentication domains, so admin concentration cannot be measured; emptiness is unknown rather than compliant. Collect ${groupEvidence}`);
+    }
+    if (users.length === 0) return manualVerdict(`userManagement.users returned zero users, so admin group membership cannot be counted. Collect ${userEvidence}`);
+    if (groupsWithoutRoleData.length === groupGrants.length) {
+      return manualVerdict(`Role grants were not exposed for any of the ${groupGrants.length} groups, so admin groups cannot be identified. Collect ${groupEvidence}`);
+    }
+    if (adminGroups.size === 0) {
+      return verdict("warn", `No groups matched the admin role pattern /${adminRolePattern.source}/ across ${groupGrants.length} groups (${groupsWithoutRoleData.length} exposed no role data), so admin concentration could not be measured.`);
+    }
+    if (usersWithoutGroupData.length === users.length) {
+      return manualVerdict(`Group membership was not exposed for any of the ${users.length} users, so members of the ${adminGroups.size} admin groups cannot be counted. Collect ${groupEvidence}`);
+    }
+    if (adminUsers.length > maxAdmins) return verdict("fail", `${adminUsers.length} users are members of admin groups, above the threshold of ${maxAdmins}.`);
+    if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
+      return verdict("warn", `${adminUsers.length} users are members of admin groups (threshold ${maxAdmins}), but ${usersWithoutGroupData.length} users expose no group membership and ${groupsWithoutRoleData.length} groups expose no role grants, so the count may be understated.`);
+    }
+    return verdict("pass", `${adminUsers.length} users are members of admin groups, within the threshold of ${maxAdmins}.`);
+  };
+
+  const control18 = (): Verdict => {
+    if (!domainsReadable) return unreadableVerdict("Authentication domains", data.authenticationDomains, "provisioning method, session timeout, and user upgrade settings from Administration > Access Management > Authentication domains.");
+    if (domains.length === 0) {
+      return manualVerdict(`userManagement.authenticationDomains returned zero domains, so provisioning and session settings are unknown rather than compliant. Collect ${domainEvidence}`);
+    }
+    if (manualProvisioningDomains.length > 0) {
+      return verdict("warn", `${manualProvisioningDomains.length}/${domains.length} authentication domains provision users manually instead of through SCIM. Session duration and user upgrade approval settings are not exposed by NerdGraph; record them from Administration > Access Management > Authentication domains.`);
+    }
+    if (unknownProvisioningDomains.length > 0) {
+      return manualVerdict(`${unknownProvisioningDomains.length}/${domains.length} authentication domains exposed no recognizable provisioningType (${unknownProvisioningDomains.map((domain) => domain.name).join(", ")}), so provisioning cannot be confirmed. Record provisioning, session, and user upgrade settings from Administration > Access Management > Authentication domains.`);
+    }
+    return manualVerdict(`All ${domains.length} authentication domains provision users through SCIM (${scimDomains.map((domain) => domain.name).join(", ")}). Session duration and user upgrade approval settings are not exposed by NerdGraph, so this control stays manual until those settings are recorded from Administration > Access Management > Authentication domains.`);
+  };
+
+  const control19 = (): Verdict => {
+    if (!usersReadable) return unreadableVerdict("Users", data.users, `the user list with the Last active column, flagging anyone inactive for more than ${inactiveDays} days.`);
+    if (users.length === 0) return manualVerdict(`userManagement.users returned zero users, so inactivity cannot be evaluated and emptiness is unknown rather than compliant. Collect ${userEvidence}`);
+    if (inactiveUsers.length > 0) return verdict("fail", `${inactiveUsers.length}/${users.length} users have not been active for more than ${inactiveDays} days.`);
+    if (neverActiveUsers.length > 0) {
+      return verdict("warn", `No dated user exceeded ${inactiveDays} days of inactivity, but ${neverActiveUsers.length} users have no lastActive value and cannot be counted as active; review them separately.`);
+    }
+    return verdict("pass", `All ${users.length} users were active within the last ${inactiveDays} days.`);
+  };
+
   const findings: NewrelicFinding[] = [];
 
-  findings.push(finding(
-    1,
-    !domainsReadable
-      ? "manual"
-      : authTypeVisible
-        ? passwordDomains.length > 0 ? "fail" : ssoDomains.length > 0 ? "pass" : "warn"
-        : "manual",
-    !domainsReadable
-      ? "Authentication domains were not readable. Collect a screenshot of Administration > Access Management > Authentication domains showing the Authentication method for every domain."
-      : authTypeVisible
-        ? passwordDomains.length > 0
-          ? `${passwordDomains.length}/${domainAuthTypes.length} authentication domains still authenticate users with New Relic passwords instead of SAML or OIDC SSO.`
-          : ssoDomains.length > 0
-            ? `All ${domainAuthTypes.length} authentication domains authenticate through SSO (${ssoDomains.map((domain) => domain.authenticationType).join(", ")}).`
-            : "Authentication domains exposed no password or SSO authentication type, so SSO enforcement is unclear."
-        : `${domains.length} authentication domains were listed, but NerdGraph did not expose authenticationType (customerAdministration is limited to multi-tenant organizations). Collect the Authentication method shown in Administration > Access Management > Authentication domains for each domain and confirm it is SAML SSO or OIDC SSO with password login disabled.`,
-    {
-      authentication_domains: domainProvisioning,
-      authentication_types: domainAuthTypes,
-      password_domains: passwordDomains.map((domain) => domain.name),
-      authentication_type_visible: authTypeVisible,
-      manual_evidence: authTypeVisible ? undefined : "Administration > Access Management > Authentication domains > Authentication: SAML SSO or OIDC SSO for each domain.",
-    },
-  ));
+  findings.push(finding(1, limitCoverage(control1(), [...domainCoverage, ...authTypeCoverage]), {
+    authentication_domains: domainProvisioning,
+    authentication_types: domainAuthTypes,
+    password_domains: passwordDomains.map((domain) => domain.name),
+    domains_without_authentication_type: domainsWithoutAuthType.map((domain) => domain.name),
+    unknown_authentication_type_domains: unknownAuthTypeDomains.map((domain) => domain.name),
+    authentication_type_readable: authTypeReadable,
+    manual_evidence: "Administration > Access Management > Authentication domains > Authentication: SAML SSO or OIDC SSO for each domain.",
+  }));
 
-  findings.push(finding(
-    2,
-    !usersReadable
-      ? "manual"
-      : inactiveFullPlatformUsers.length > 0
-        ? "fail"
-        : fullPlatformShare > maxFullPlatformPercent
-          ? "warn"
-          : "pass",
-    !usersReadable
-      ? "Users were not readable. Export Administration > Access Management > Users with the User type column and review full platform assignments manually."
-      : inactiveFullPlatformUsers.length > 0
-        ? `${inactiveFullPlatformUsers.length}/${fullPlatformUsers.length} full platform users have not been active in the last ${inactiveDays} days, indicating over-provisioned user types.`
-        : fullPlatformShare > maxFullPlatformPercent
-          ? `${fullPlatformShare}% of ${users.length} users hold the full platform user type, above the ${maxFullPlatformPercent}% review threshold.`
-          : `${fullPlatformUsers.length}/${users.length} users hold the full platform user type and all of them were active within ${inactiveDays} days.`,
-    {
-      users: users.length,
-      user_type_counts: userTypeCounts,
-      full_platform_percent: fullPlatformShare,
-      max_full_platform_percent: maxFullPlatformPercent,
-      inactive_full_platform_users: sample(inactiveFullPlatformUsers.map(userLabel)),
-    },
-  ));
+  findings.push(finding(2, limitCoverage(control2(), userCoverage), {
+    users: users.length,
+    user_type_counts: userTypeCounts,
+    full_platform_percent: fullPlatformShare,
+    max_full_platform_percent: maxFullPlatformPercent,
+    inactive_full_platform_users: sample(inactiveFullPlatformUsers.map(userLabel)),
+    undated_full_platform_users: sample(undatedFullPlatformUsers.map(userLabel)),
+    unknown_type_users: sample(unknownTypeUsers.map(userLabel)),
+  }));
 
-  findings.push(finding(
-    3,
-    !grantsReadable || !usersReadable
-      ? "manual"
-      : adminGroups.size === 0
-        ? "warn"
-        : adminUsers.length > maxAdmins
-          ? "fail"
-          : "pass",
-    !grantsReadable || !usersReadable
-      ? "Group role grants or users were not readable. Review Administration > Access Management > Groups and record which groups hold Organization manager, Authentication domain manager, or All product admin roles and their member counts."
-      : adminGroups.size === 0
-        ? `No groups matched the admin role pattern /${adminRolePattern.source}/ across ${groupGrants.length} groups, so admin concentration could not be measured.`
-        : adminUsers.length > maxAdmins
-          ? `${adminUsers.length} users are members of admin groups, above the threshold of ${maxAdmins}.`
-          : `${adminUsers.length} users are members of admin groups, within the threshold of ${maxAdmins}.`,
-    {
-      admin_groups: sample(adminGroupNames),
-      admin_users: adminUsers.length,
-      admin_user_sample: sample(adminUsers.map(userLabel)),
-      max_admins: maxAdmins,
-      admin_role_pattern: adminRolePattern.source,
-    },
-  ));
+  findings.push(finding(3, limitCoverage(control3(), [...groupCoverage, ...userCoverage]), {
+    admin_groups: sample(adminGroupNames),
+    admin_users: adminUsers.length,
+    admin_user_sample: sample(adminUsers.map(userLabel)),
+    max_admins: maxAdmins,
+    admin_role_pattern: adminRolePattern.source,
+    users_without_group_data: usersWithoutGroupData.length,
+    groups_without_role_data: groupsWithoutRoleData.length,
+  }));
 
-  findings.push(finding(
-    18,
-    !domainsReadable
-      ? "manual"
-      : domains.length === 0
-        ? "warn"
-        : manualProvisioningDomains.length > 0
-          ? "warn"
-          : "pass",
-    !domainsReadable
-      ? "Authentication domains were not readable. Record provisioning method, session timeout, and user upgrade settings from Administration > Access Management > Authentication domains."
-      : domains.length === 0
-        ? "No authentication domains were visible to the API key."
-        : manualProvisioningDomains.length > 0
-          ? `${manualProvisioningDomains.length}/${domains.length} authentication domains provision users manually instead of through SCIM. Confirm session duration and user upgrade approval settings in the UI, which NerdGraph does not expose.`
-          : `All ${domains.length} authentication domains provision users through SCIM (${scimDomains.map((domain) => domain.name).join(", ")}). Confirm session duration and user upgrade approval settings in the UI, which NerdGraph does not expose.`,
-    {
-      authentication_domains: domainProvisioning,
-      manual_provisioning_domains: manualProvisioningDomains.map((domain) => domain.name),
-      custom_roles_visible: customRoles.length,
-      manual_evidence: "Administration > Access Management > Authentication domains: Session settings and User upgrade settings for each domain.",
-    },
-  ));
+  findings.push(finding(18, limitCoverage(control18(), domainCoverage), {
+    authentication_domains: domainProvisioning,
+    manual_provisioning_domains: manualProvisioningDomains.map((domain) => domain.name),
+    unknown_provisioning_domains: unknownProvisioningDomains.map((domain) => domain.name),
+    custom_roles_visible: customRoles.length,
+    manual_evidence: "Administration > Access Management > Authentication domains: Session settings and User upgrade settings for each domain.",
+  }));
 
-  findings.push(finding(
-    19,
-    !usersReadable
-      ? "manual"
-      : inactiveUsers.length > 0
-        ? "fail"
-        : neverActiveUsers.length > 0
-          ? "warn"
-          : "pass",
-    !usersReadable
-      ? `Users were not readable. Export the user list with the Last active column and flag anyone inactive for more than ${inactiveDays} days.`
-      : inactiveUsers.length > 0
-        ? `${inactiveUsers.length}/${users.length} users have not been active for more than ${inactiveDays} days.`
-        : neverActiveUsers.length > 0
-          ? `No users exceeded ${inactiveDays} days of inactivity, but ${neverActiveUsers.length} users have never recorded activity and should be reviewed.`
-          : `All ${users.length} users were active within the last ${inactiveDays} days.`,
-    {
-      inactive_days: inactiveDays,
-      inactive_users: inactiveUsers.length,
-      inactive_user_sample: sample(inactiveUsers.map(userLabel)),
-      never_active_users: sample(neverActiveUsers.map(userLabel)),
-    },
-  ));
+  findings.push(finding(19, limitCoverage(control19(), userCoverage), {
+    inactive_days: inactiveDays,
+    inactive_users: inactiveUsers.length,
+    inactive_user_sample: sample(inactiveUsers.map(userLabel)),
+    never_active_users: sample(neverActiveUsers.map(userLabel)),
+  }));
 
+  const allCollected = Object.values(data);
   return {
     category: "identity",
     title: "New Relic identity posture",
@@ -1768,10 +1987,12 @@ export function assessNewrelicIdentityData(
       admin_users: adminUsers.length,
       inactive_users: inactiveUsers.length,
       custom_roles: customRoles.length,
-      collection_errors: collectedErrors(Object.values(data)).length,
+      collection_errors: collectedErrors(allCollected).length,
+      coverage_limitations: [...domainCoverage, ...authTypeCoverage, ...userCoverage, ...groupCoverage].length,
     },
     findings,
-    errors: collectedErrors(Object.values(data)),
+    errors: collectedErrors(allCollected),
+    coverage: [...domainCoverage, ...authTypeCoverage, ...userCoverage, ...groupCoverage, ...coverageNotes([["roles", data.roles]])],
     coreData: {
       "core_data/organization.json": data.organization.data,
       "core_data/authentication_domains.json": domains,
@@ -1808,13 +2029,19 @@ async function runNrqlAcrossAccounts(
   client: Pick<NewrelicClientSurface, "runNrql">,
   accountIds: number[],
   nrql: string,
-): Promise<JsonRecord[]> {
-  const results: JsonRecord[] = [];
-  for (const accountId of accountIds) {
-    const rows = await client.runNrql(accountId, nrql);
-    results.push(...rows.map((row) => ({ ...row, queriedAccountId: accountId })));
-  }
-  return results;
+): Promise<PagedList> {
+  return collectScoped(
+    accountScopes(accountIds),
+    async (accountId) => {
+      const rows = await client.runNrql(Number(accountId), nrql);
+      return {
+        items: rows,
+        complete: rows.length < NRQL_MAX_ROWS,
+        note: rows.length >= NRQL_MAX_ROWS ? `NRQL returned the ${NRQL_MAX_ROWS} row maximum, so older events were not read` : undefined,
+      };
+    },
+    (row, accountId) => ({ ...row, queriedAccountId: Number(accountId) }),
+  );
 }
 
 export async function collectNewrelicAccessControlData(
@@ -1824,25 +2051,23 @@ export async function collectNewrelicAccessControlData(
   const config = client.getResolvedConfig();
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 50_000);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
-  const accounts = await collect("accounts", [] as JsonRecord[], () => client.listAccounts());
-  const authenticationDomains = await collect("userManagement.authenticationDomains", [] as JsonRecord[], () => client.listAuthenticationDomains());
-  const users = await collect("userManagement.users", [] as JsonRecord[], () => collectUsers(client, authenticationDomains.data, userLimit));
-  const groupGrants = await collect("authorizationManagement.groups", [] as JsonRecord[], () => collectGroupGrants(client, authenticationDomains.data));
-  const roles = await collect("authorizationManagement.roles", [] as JsonRecord[], () => client.listRoles());
-  const apiKeys = await collect("apiAccess.keySearch", [] as JsonRecord[], () => client.listApiKeys(["USER", "INGEST"], accountIds.length > 0 ? accountIds : undefined));
+  const accounts = await collectList("accounts", () => client.listAccounts());
+  const authenticationDomains = await collectList("userManagement.authenticationDomains", () => client.listAuthenticationDomains());
+  const users = await collectList("userManagement.users", () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
+  const groupGrants = await collectList("authorizationManagement.groups", () => collectGroupGrants(client, requireDomains(authenticationDomains)));
+  const roles = await collectList("authorizationManagement.roles", () => client.listRoles());
+  const apiKeys = await collectList("apiAccess.keySearch", () => client.listApiKeys(["USER", "INGEST"], accountIds.length > 0 ? accountIds : undefined));
   const window = config.auditWindowDays;
-  const apiKeyAuditEvents = await collect(
+  const apiKeyAuditEvents = await collectList(
     "nrql.NrAuditEvent.api_key_actor",
-    [] as JsonRecord[],
     () => runNrqlAcrossAccounts(
       client,
       accountIds,
       `SELECT actorAPIKey, actorId, actorEmail, actionIdentifier, targetType, targetId, timestamp FROM NrAuditEvent WHERE actorType = 'api_key' SINCE ${window} days ago LIMIT MAX`,
     ),
   );
-  const apiKeyChangeEvents = await collect(
+  const apiKeyChangeEvents = await collectList(
     "nrql.NrAuditEvent.api_key_changes",
-    [] as JsonRecord[],
     () => runNrqlAcrossAccounts(
       client,
       accountIds,
@@ -1936,13 +2161,20 @@ export function assessNewrelicAccessControlData(
   const keysReadable = !data.apiKeys.error;
   const usersReadable = !data.users.error;
   const grantsReadable = !data.groupGrants.error;
+  const accountsReadable = !data.accounts.error;
+  const rolesReadable = !data.roles.error;
   const auditReadable = !data.apiKeyAuditEvents.error;
 
   const userKeys = keys.filter((key) => (asString(key.type) ?? "").toUpperCase() === "USER");
   const ingestKeys = keys.filter((key) => (asString(key.type) ?? "").toUpperCase() === "INGEST");
+  const unknownTypeKeys = keys.filter((key) => !["USER", "INGEST"].includes((asString(key.type) ?? "").toUpperCase()));
   const licenseKeys = ingestKeys.filter((key) => (asString(key.ingestType) ?? "").toUpperCase() === "LICENSE");
   const browserKeys = ingestKeys.filter((key) => (asString(key.ingestType) ?? "").toUpperCase() === "BROWSER");
   const unnamedKeys = keys.filter((key) => !asString(key.name));
+  const visibleAccountIds = new Set(accounts.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined));
+  const unseenScopeAccounts = accountsReadable ? data.accountIds.filter((id) => !visibleAccountIds.has(id)) : data.accountIds;
+  const usersWithoutGroupData = users.filter((user) => asObject(user.groups) === undefined);
+  const groupsWithoutRoleData = groupGrants.filter((group) => group.rolesReadable === false);
 
   const userById = new Map<string, JsonRecord>();
   for (const user of users) {
@@ -1973,6 +2205,10 @@ export function assessNewrelicAccessControlData(
     const age = lastActiveAgeDays(owner, now);
     return age !== undefined && age > inactiveDays;
   }) : [];
+  const undatedOwnerKeys = usersReadable ? userKeys.filter((key) => {
+    const owner = userById.get(asString(key.userId) ?? "");
+    return owner !== undefined && lastActiveAgeDays(owner, now) === undefined;
+  }) : [];
   const distinctActorKeys = new Set(
     data.apiKeyAuditEvents.data.map((event) => asString(event.actorAPIKey)).filter((value): value is string => Boolean(value)),
   );
@@ -1982,6 +2218,7 @@ export function assessNewrelicAccessControlData(
 
   const productionAccounts = accounts.filter((account) => productionPattern.test(accountLabel(account)) && !nonproductionPattern.test(accountLabel(account)));
   const nonproductionAccounts = accounts.filter((account) => nonproductionPattern.test(accountLabel(account)));
+  const unclassifiedAccounts = accounts.filter((account) => !productionPattern.test(accountLabel(account)) && !nonproductionPattern.test(accountLabel(account)));
   const productionIds = new Set(productionAccounts.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined));
   const nonproductionIds = new Set(nonproductionAccounts.map((account) => asNumber(account.id)).filter((id): id is number => id !== undefined));
   const classifiable = productionIds.size > 0 && nonproductionIds.size > 0;
@@ -1996,162 +2233,197 @@ export function assessNewrelicAccessControlData(
     : [];
 
   const customRoles = roles.filter((role) => (asString(role.type) ?? "").toUpperCase() === "CUSTOM");
+  const standardRoles = roles.filter((role) => (asString(role.type) ?? "").toUpperCase() === "STANDARD");
+  const unknownTypeRoles = roles.filter((role) => !["CUSTOM", "STANDARD"].includes((asString(role.type) ?? "").toUpperCase()));
   const customRoleGrants = groupGrants.filter((group) =>
     asRecords(group.roles).some((role) => (asString(role.type) ?? "").toUpperCase() === "CUSTOM"),
   );
 
+  const keyCoverage = coverageNotes([["API keys", data.apiKeys]]);
+  const userCoverage = coverageNotes([["users", data.users]]);
+  const groupCoverage = coverageNotes([["groups", data.groupGrants]]);
+  const accountCoverage = coverageNotes([["accounts", data.accounts]]);
+  const roleCoverage = coverageNotes([["roles", data.roles]]);
+  const auditCoverage = coverageNotes([["NrAuditEvent api_key actors", data.apiKeyAuditEvents]]);
+  const scopeCoverage = unseenScopeAccounts.length > 0
+    ? [`accounts in scope not visible to this key: ${unseenScopeAccounts.join(", ")}${accountsReadable ? "" : ` (${causeOf(data.accounts)})`}`]
+    : [];
+  const keyInventoryLabel = `${keys.length} keys inventoried (${userKeys.length} user, ${licenseKeys.length} license, ${browserKeys.length} browser${unknownTypeKeys.length > 0 ? `, ${unknownTypeKeys.length} unknown type` : ""})`;
+  const keyEvidence = "the API keys UI list (all key types) for every account in scope with owners, creation dates, and purposes.";
+  const groupEvidence = "Administration > Access Management > Groups with the accounts and roles each group grants.";
+  const userEvidence = "an export of Administration > Access Management > Users with group membership.";
+  const zeroKeysNote = `apiAccess.keySearch returned zero keys for ${data.accountIds.length} accounts in scope (${data.accountIds.join(", ") || "none"})`;
+
+  const control4 = (): Verdict => {
+    if (!keysReadable) return unreadableVerdict("API keys (apiAccess.keySearch)", data.apiKeys, keyEvidence);
+    if (keys.length === 0) {
+      return manualVerdict(`${zeroKeysNote}; every account has at least its original license key, so an empty inventory means the key cannot see them and is unknown rather than compliant. Collect ${keyEvidence}`);
+    }
+    if (!usersReadable) return manualVerdict(`${keyInventoryLabel}, but users were not readable (${causeOf(data.users)}), so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
+    if (!grantsReadable) return manualVerdict(`${keyInventoryLabel}, but group role grants were not readable (${causeOf(data.groupGrants)}), so admin group members cannot be identified as key owners. Collect ${keyEvidence}`);
+    if (unnamedKeys.length > 0 || adminOwnedUserKeys.length > 0 || unknownTypeKeys.length > 0) {
+      return verdict("warn", `${keyInventoryLabel}; ${unnamedKeys.length} lack a name, ${adminOwnedUserKeys.length} user keys inherit admin-level permissions from their owners, and ${unknownTypeKeys.length} expose no key type.`);
+    }
+    if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
+      return verdict("warn", `${keyInventoryLabel} with names and readable key types, but ${usersWithoutGroupData.length} users expose no group membership and ${groupsWithoutRoleData.length} groups expose no role grants, so admin-owned user keys may be undercounted.`);
+    }
+    return verdict("pass", `${keyInventoryLabel} with names, readable key types, and no user keys owned by admin group members (${adminUserIds.size} admin users matched against ${userKeys.length} user keys).`);
+  };
+
+  const control5 = (): Verdict => {
+    if (!keysReadable) return unreadableVerdict("API keys (apiAccess.keySearch)", data.apiKeys, `the Created column of the API keys UI, flagging user keys older than ${maxKeyAgeDays} days.`);
+    if (keys.length === 0) return manualVerdict(`${zeroKeysNote}; key age cannot be evaluated on an empty inventory, which is unknown rather than compliant. Collect ${keyEvidence}`);
+    if (agedUserKeys.length > 0) return verdict("fail", `${agedUserKeys.length}/${userKeys.length} user keys are older than ${maxKeyAgeDays} days without rotation.`);
+    if (keysWithoutCreatedAt.length === keys.length) return manualVerdict(`createdAt was not exposed for any of the ${keys.length} keys, so key age is unknown. Review key creation dates in the API keys UI.`);
+    if (agedLicenseKeys.length > 0) {
+      return verdict("warn", `No dated user keys exceed ${maxKeyAgeDays} days, but ${agedLicenseKeys.length} license keys are older than that threshold and should have a rotation plan${keysWithoutCreatedAt.length > 0 ? `; ${keysWithoutCreatedAt.length} keys have no createdAt and were not counted as fresh` : ""}.`);
+    }
+    if (keysWithoutCreatedAt.length > 0) {
+      return verdict("warn", `${userKeys.length - agedUserKeys.length} dated user keys were created within ${maxKeyAgeDays} days, but ${keysWithoutCreatedAt.length}/${keys.length} keys have no createdAt value and cannot be counted as rotated.`);
+    }
+    if (userKeys.length === 0 && licenseKeys.length === 0) {
+      return manualVerdict(`${keyInventoryLabel}; no user or license keys were returned, so there is nothing to age-check and the empty rotation population is unknown rather than compliant. Confirm in the API keys UI that no user or license keys exist.`);
+    }
+    return verdict("pass", `All ${userKeys.length} user keys and ${licenseKeys.length} license keys were created within the last ${maxKeyAgeDays} days and every one of the ${keys.length} keys exposed a creation date${browserKeys.length > 0 ? `; ${browserKeys.length} browser keys are inventoried but not age-checked` : ""}.`);
+  };
+
+  const control6 = (): Verdict => {
+    if (!keysReadable) return unreadableVerdict("API keys (apiAccess.keySearch)", data.apiKeys, "key usage evidence from the API keys UI and NrAuditEvent queries for every key.");
+    if (keys.length === 0) {
+      if (!accountsReadable || data.accountIds.length === 0 || unseenScopeAccounts.length > 0) {
+        return manualVerdict(`${zeroKeysNote}, but keySearch coverage of every account in scope cannot be confirmed (${!accountsReadable ? causeOf(data.accounts) : unseenScopeAccounts.length > 0 ? `accounts ${unseenScopeAccounts.join(", ")} are not visible to this key` : "no accounts are in scope"}), so the empty inventory is unknown rather than compliant. Collect ${keyEvidence}`);
+      }
+      if (!isComplete(data.apiKeys)) {
+        return verdict("warn", `${zeroKeysNote}, but the listing was incomplete (${keyCoverage.join("; ")}), so no key can be confirmed as absent. Collect ${keyEvidence}`);
+      }
+      return verdict("pass", `${zeroKeysNote}. Both conditions for accepting an empty inventory hold: keySearch was readable and complete for every account in scope, and every in-scope account (${data.accountIds.join(", ")}) is visible to this key in actor.accounts.`);
+    }
+    if (orphanedUserKeys.length > 0 || inactiveOwnerKeys.length > 0 || undatedOwnerKeys.length > 0) {
+      return verdict("warn", `${orphanedUserKeys.length} user keys belong to users no longer visible, ${inactiveOwnerKeys.length} belong to users inactive for more than ${inactiveDays} days, and ${undatedOwnerKeys.length} belong to users with no lastActive value; ${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days${auditReadable ? "" : ` (audit events unreadable: ${causeOf(data.apiKeyAuditEvents)})`}.`);
+    }
+    return manualVerdict(`${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days${auditReadable ? "" : ` (audit events unreadable: ${causeOf(data.apiKeyAuditEvents)})`}. NrAuditEvent only records configuration changes, so read-only key usage cannot be confirmed through the API; review the remaining ${keys.length} keys with their owners and revoke any without a documented consumer.`);
+  };
+
+  const control7 = (): Verdict => {
+    if (!grantsReadable) return unreadableVerdict("Group role grants", data.groupGrants, groupEvidence);
+    if (!usersReadable) return unreadableVerdict("Users", data.users, userEvidence);
+    if (groupGrants.length === 0) return manualVerdict(`authorizationManagement.groups returned zero groups, so account access cannot be mapped; emptiness is unknown rather than compliant. Collect ${groupEvidence}`);
+    if (users.length === 0) return manualVerdict(`userManagement.users returned zero users, so account access per user cannot be evaluated. Collect ${userEvidence}`);
+    if (groupsWithoutRoleData.length === groupGrants.length || usersWithoutGroupData.length === users.length) {
+      return manualVerdict(`Role grants were exposed for ${groupGrants.length - groupsWithoutRoleData.length}/${groupGrants.length} groups and group membership for ${users.length - usersWithoutGroupData.length}/${users.length} users, so account access cannot be mapped. Collect ${groupEvidence}`);
+    }
+    if (broadAccessUsers.length > 0) {
+      return verdict("warn", `${broadAccessUsers.length}/${users.length} non-admin users hold organization-scoped grants or access to more than ${maxAccountsPerUser} accounts.`);
+    }
+    if (!accountsReadable) return manualVerdict(`No non-admin users exceed ${maxAccountsPerUser} accounts, but actor.accounts was not readable (${causeOf(data.accounts)}), so the account population is unknown. Collect the account list from Administration > Access Management > Accounts.`);
+    if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
+      return verdict("warn", `No mapped non-admin user exceeds ${maxAccountsPerUser} accounts, but ${usersWithoutGroupData.length} users expose no group membership and ${groupsWithoutRoleData.length} groups expose no role grants, so their access is unknown.`);
+    }
+    return verdict("pass", `No non-admin users exceed ${maxAccountsPerUser} accounts or hold organization-scoped grants across ${accounts.length} visible accounts.`);
+  };
+
+  const control8 = (): Verdict => {
+    if (!grantsReadable) return unreadableVerdict("Group role grants", data.groupGrants, "each group's account access from the UI, flagging users who reach both production and non-production accounts.");
+    if (!usersReadable) return unreadableVerdict("Users", data.users, userEvidence);
+    if (!accountsReadable) return unreadableVerdict("Accounts (actor.accounts)", data.accounts, "the account inventory with environment classification from Administration > Access Management > Accounts.");
+    if (accounts.length === 0) return manualVerdict("actor.accounts returned zero accounts, so environment separation cannot be evaluated; emptiness is unknown rather than compliant. Collect the account inventory from Administration > Access Management > Accounts.");
+    if (accounts.length === 1) {
+      return manualVerdict(`Not applicable through the API: only one account (${accountLabel(accounts[0])}) is visible to this key, so production and non-production separation has nothing to compare. Confirm in Administration > Access Management > Accounts that the organization has a single account.`);
+    }
+    if (!classifiable) {
+      return manualVerdict(`Account names did not match both the production pattern /${productionPattern.source}/ and the non-production pattern /${nonproductionPattern.source}/. Classify the ${accounts.length} accounts manually or pass production_account_pattern and nonproduction_account_pattern.`);
+    }
+    if (groupGrants.length === 0 || users.length === 0) return manualVerdict(`${groupGrants.length} groups and ${users.length} users were returned, so cross-environment access cannot be mapped; emptiness is unknown rather than compliant. Collect ${groupEvidence}`);
+    if (crossEnvironmentUsers.length > 0) {
+      return verdict("warn", `${crossEnvironmentUsers.length} non-admin users can reach both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`);
+    }
+    if (unclassifiedAccounts.length > 0 || usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
+      return verdict("warn", `No mapped non-admin user reaches both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts, but ${unclassifiedAccounts.length} accounts matched neither pattern, ${usersWithoutGroupData.length} users expose no group membership, and ${groupsWithoutRoleData.length} groups expose no role grants.`);
+    }
+    return verdict("pass", `No non-admin users hold access to both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts, and every account was classified.`);
+  };
+
+  const control20 = (): Verdict => {
+    if (!rolesReadable) return unreadableVerdict("Roles (authorizationManagement.roles)", data.roles, "every custom role's capabilities from Administration > Access Management > Roles.");
+    if (roles.length === 0) return manualVerdict("authorizationManagement.roles returned zero roles; New Relic always exposes standard roles, so the key cannot read them and emptiness is unknown rather than compliant. Collect the role list from Administration > Access Management > Roles.");
+    if (customRoles.length > 0) {
+      return manualVerdict(`${customRoles.length} custom roles exist (${sample(customRoles.map((role) => asString(role.displayName) ?? asString(role.name) ?? asString(role.id) ?? "role"), 10).join(", ")}). NerdGraph does not expose role capabilities, so open each role in Administration > Access Management > Roles and confirm no unnecessary manage or delete capabilities are granted.`);
+    }
+    if (unknownTypeRoles.length > 0) return manualVerdict(`${unknownTypeRoles.length}/${roles.length} roles exposed no role type, so custom roles cannot be distinguished from standard ones. Collect the role list with types from Administration > Access Management > Roles.`);
+    if (!isComplete(data.roles)) return verdict("warn", `No custom roles appeared among ${roles.length} roles, but the role listing was incomplete, so unseen custom roles cannot be ruled out.`);
+    if (standardRoles.length === 0) return manualVerdict(`No custom roles appeared among ${roles.length} roles, but no STANDARD roles were returned either, so the role listing is not trustworthy. Collect the role list from Administration > Access Management > Roles.`);
+    return verdict("pass", `No custom roles exist. Both conditions for accepting this hold: the roles query was readable and complete, and it returned ${standardRoles.length} standard roles.`);
+  };
+
   const findings: NewrelicFinding[] = [];
 
-  findings.push(finding(
-    4,
-    !keysReadable
-      ? "manual"
-      : unnamedKeys.length > 0 || adminOwnedUserKeys.length > 0
-        ? "warn"
-        : "pass",
-    !keysReadable
-      ? "API keys were not readable through apiAccess.keySearch. Export the API keys UI list (all key types) for every account and record owners and purposes manually."
-      : unnamedKeys.length > 0 || adminOwnedUserKeys.length > 0
-        ? `${keys.length} keys inventoried (${userKeys.length} user, ${licenseKeys.length} license, ${browserKeys.length} browser); ${unnamedKeys.length} lack a name and ${adminOwnedUserKeys.length} user keys inherit admin-level permissions from their owners.`
-        : `${keys.length} keys inventoried (${userKeys.length} user, ${licenseKeys.length} license, ${browserKeys.length} browser) with names and no user keys owned by admin group members.`,
-    {
-      keys_total: keys.length,
-      user_keys: userKeys.length,
-      license_keys: licenseKeys.length,
-      browser_keys: browserKeys.length,
-      unnamed_keys: sample(unnamedKeys.map(keyLabel)),
-      admin_owned_user_keys: sample(adminOwnedUserKeys.map(keyLabel)),
-      audit_events_by_api_keys: data.apiKeyAuditEvents.data.length,
-    },
-  ));
+  findings.push(finding(4, limitCoverage(control4(), [...keyCoverage, ...userCoverage, ...scopeCoverage]), {
+    keys_total: keys.length,
+    keys_reported_total: data.apiKeys.total ?? null,
+    user_keys: userKeys.length,
+    license_keys: licenseKeys.length,
+    browser_keys: browserKeys.length,
+    unknown_type_keys: unknownTypeKeys.length,
+    unnamed_keys: sample(unnamedKeys.map(keyLabel)),
+    admin_owned_user_keys: sample(adminOwnedUserKeys.map(keyLabel)),
+    audit_events_by_api_keys: data.apiKeyAuditEvents.data.length,
+    key_listing_complete: isComplete(data.apiKeys),
+  }));
 
-  findings.push(finding(
-    5,
-    !keysReadable
-      ? "manual"
-      : agedUserKeys.length > 0
-        ? "fail"
-        : userKeys.length > 0 && keysWithoutCreatedAt.length === keys.length
-          ? "manual"
-          : agedLicenseKeys.length > 0
-            ? "warn"
-            : "pass",
-    !keysReadable
-      ? `API keys were not readable. Review the Created column in the API keys UI and flag user keys older than ${maxKeyAgeDays} days.`
-      : agedUserKeys.length > 0
-        ? `${agedUserKeys.length}/${userKeys.length} user keys are older than ${maxKeyAgeDays} days without rotation.`
-        : userKeys.length > 0 && keysWithoutCreatedAt.length === keys.length
-          ? `createdAt was not exposed for any of the ${keys.length} keys. Review key creation dates in the API keys UI manually.`
-          : agedLicenseKeys.length > 0
-            ? `No user keys exceed ${maxKeyAgeDays} days, but ${agedLicenseKeys.length} license keys are older than that threshold and should have a rotation plan.`
-            : `All ${userKeys.length} user keys were created within the last ${maxKeyAgeDays} days.`,
-    {
-      max_key_age_days: maxKeyAgeDays,
-      aged_user_keys: sample(agedUserKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
-      aged_license_keys: sample(agedLicenseKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
-      keys_without_created_at: keysWithoutCreatedAt.length,
-    },
-  ));
+  findings.push(finding(5, limitCoverage(control5(), [...keyCoverage, ...scopeCoverage]), {
+    max_key_age_days: maxKeyAgeDays,
+    aged_user_keys: sample(agedUserKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
+    aged_license_keys: sample(agedLicenseKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
+    keys_without_created_at: sample(keysWithoutCreatedAt.map(keyLabel)),
+    key_listing_complete: isComplete(data.apiKeys),
+  }));
 
-  findings.push(finding(
-    6,
-    !keysReadable
-      ? "manual"
-      : keys.length === 0
-        ? "pass"
-        : orphanedUserKeys.length > 0 || inactiveOwnerKeys.length > 0
-          ? "warn"
-          : "manual",
-    !keysReadable
-      ? "API keys were not readable, so unused key detection is not possible. Review key usage with the API keys UI and NrAuditEvent queries manually."
-      : keys.length === 0
-        ? "No API keys are present, so there are no unused keys to review."
-        : orphanedUserKeys.length > 0 || inactiveOwnerKeys.length > 0
-          ? `${orphanedUserKeys.length} user keys belong to users no longer visible and ${inactiveOwnerKeys.length} belong to users inactive for more than ${inactiveDays} days; ${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days.`
-          : `${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days. NrAuditEvent only records configuration changes, so read-only key usage cannot be confirmed through the API; review the remaining ${keys.length} keys with their owners and revoke any without a documented consumer.`,
-    {
-      keys_total: keys.length,
-      distinct_api_keys_in_audit: distinctActorKeys.size,
-      audit_window_days: data.auditWindowDays,
-      audit_readable: auditReadable,
-      orphaned_user_keys: sample(orphanedUserKeys.map(keyLabel)),
-      inactive_owner_user_keys: sample(inactiveOwnerKeys.map(keyLabel)),
-      manual_evidence: "API keys UI export plus owner confirmation for every key without a documented consumer; NrAuditEvent WHERE actorType = 'api_key' for change activity.",
-    },
-  ));
+  findings.push(finding(6, limitCoverage(control6(), [...keyCoverage, ...userCoverage, ...auditCoverage, ...scopeCoverage]), {
+    keys_total: keys.length,
+    accounts_in_scope: data.accountIds,
+    accounts_in_scope_not_visible: unseenScopeAccounts,
+    key_listing_complete: isComplete(data.apiKeys),
+    distinct_api_keys_in_audit: distinctActorKeys.size,
+    audit_window_days: data.auditWindowDays,
+    audit_readable: auditReadable,
+    orphaned_user_keys: sample(orphanedUserKeys.map(keyLabel)),
+    inactive_owner_user_keys: sample(inactiveOwnerKeys.map(keyLabel)),
+    undated_owner_user_keys: sample(undatedOwnerKeys.map(keyLabel)),
+    manual_evidence: "API keys UI export plus owner confirmation for every key without a documented consumer; NrAuditEvent WHERE actorType = 'api_key' for change activity.",
+  }));
 
-  findings.push(finding(
-    7,
-    !grantsReadable || !usersReadable
-      ? "manual"
-      : broadAccessUsers.length > 0
-        ? "warn"
-        : "pass",
-    !grantsReadable || !usersReadable
-      ? "Group grants or users were not readable. Review Administration > Access Management > Groups and record the accounts each group can access."
-      : broadAccessUsers.length > 0
-        ? `${broadAccessUsers.length}/${users.length} non-admin users hold organization-scoped grants or access to more than ${maxAccountsPerUser} accounts.`
-        : `No non-admin users exceed ${maxAccountsPerUser} accounts or hold organization-scoped grants across ${accounts.length} accounts.`,
-    {
-      accounts_visible: accounts.length,
-      max_accounts_per_user: maxAccountsPerUser,
-      broad_access_users: sample(broadAccessUsers.map((entry) => `${userLabel(entry.user)} (${entry.organizationScoped ? "organization scope" : `${entry.accountIds.size} accounts`})`)),
-      users_without_grants: usersWithoutGrants.length,
-    },
-  ));
+  findings.push(finding(7, limitCoverage(control7(), [...groupCoverage, ...userCoverage, ...accountCoverage, ...scopeCoverage]), {
+    accounts_visible: accounts.length,
+    max_accounts_per_user: maxAccountsPerUser,
+    broad_access_users: sample(broadAccessUsers.map((entry) => `${userLabel(entry.user)} (${entry.organizationScoped ? "organization scope" : `${entry.accountIds.size} accounts`})`)),
+    users_without_grants: usersWithoutGrants.length,
+    users_without_group_data: usersWithoutGroupData.length,
+    groups_without_role_data: groupsWithoutRoleData.length,
+  }));
 
-  findings.push(finding(
-    8,
-    !grantsReadable || !usersReadable
-      ? "manual"
-      : accounts.length <= 1
-        ? "pass"
-        : !classifiable
-          ? "manual"
-          : crossEnvironmentUsers.length > 0
-            ? "warn"
-            : "pass",
-    !grantsReadable || !usersReadable
-      ? "Group grants or users were not readable. Map each group's account access in the UI and flag users who reach both production and non-production accounts."
-      : accounts.length <= 1
-        ? "Only one account is visible, so production and non-production separation does not apply."
-        : !classifiable
-          ? `Account names did not match both the production pattern /${productionPattern.source}/ and the non-production pattern /${nonproductionPattern.source}/. Classify the ${accounts.length} accounts manually or pass production_account_pattern and nonproduction_account_pattern.`
-          : crossEnvironmentUsers.length > 0
-            ? `${crossEnvironmentUsers.length} non-admin users can reach both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`
-            : `No non-admin users hold access to both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`,
-    {
-      production_accounts: sample(productionAccounts.map(accountLabel)),
-      nonproduction_accounts: sample(nonproductionAccounts.map(accountLabel)),
-      cross_environment_users: sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user))),
-      admin_users_excluded: adminUserIds.size,
-      manual_evidence: classifiable ? undefined : "Account inventory with environment classification from Administration > Access Management > Accounts.",
-    },
-  ));
+  findings.push(finding(8, limitCoverage(control8(), [...groupCoverage, ...userCoverage, ...accountCoverage, ...scopeCoverage]), {
+    accounts_visible: accounts.length,
+    production_accounts: sample(productionAccounts.map(accountLabel)),
+    nonproduction_accounts: sample(nonproductionAccounts.map(accountLabel)),
+    unclassified_accounts: sample(unclassifiedAccounts.map(accountLabel)),
+    cross_environment_users: sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user))),
+    admin_users_excluded: adminUserIds.size,
+    manual_evidence: "Account inventory with environment classification from Administration > Access Management > Accounts.",
+  }));
 
-  findings.push(finding(
-    20,
-    data.roles.error
-      ? "manual"
-      : customRoles.length === 0
-        ? "pass"
-        : "manual",
-    data.roles.error
-      ? "Roles were not readable. Review Administration > Access Management > Roles and record every custom role's capabilities."
-      : customRoles.length === 0
-        ? `No custom roles exist; only ${roles.length} standard roles are in use.`
-        : `${customRoles.length} custom roles exist (${sample(customRoles.map((role) => asString(role.displayName) ?? asString(role.name) ?? asString(role.id) ?? "role"), 10).join(", ")}). NerdGraph does not expose role capabilities, so open each role in Administration > Access Management > Roles and confirm no unnecessary manage or delete capabilities are granted.`,
-    {
-      roles_total: roles.length,
-      custom_roles: sample(customRoles.map((role) => ({
-        id: asString(role.id),
-        name: asString(role.displayName) ?? asString(role.name),
-        scope: asString(role.scope),
-      }))),
-      groups_granted_custom_roles: sample(customRoleGrants.map((group) => asString(group.displayName) ?? asString(group.id) ?? "group")),
-      manual_evidence: "Capability list for each custom role from Administration > Access Management > Roles.",
-    },
-  ));
+  findings.push(finding(20, limitCoverage(control20(), roleCoverage), {
+    roles_total: roles.length,
+    standard_roles: standardRoles.length,
+    unknown_type_roles: unknownTypeRoles.length,
+    role_listing_complete: isComplete(data.roles),
+    custom_roles: sample(customRoles.map((role) => ({
+      id: asString(role.id),
+      name: asString(role.displayName) ?? asString(role.name),
+      scope: asString(role.scope),
+    }))),
+    groups_granted_custom_roles: sample(customRoleGrants.map((group) => asString(group.displayName) ?? asString(group.id) ?? "group")),
+    manual_evidence: "Capability list for each custom role from Administration > Access Management > Roles.",
+  }));
 
   const allCollected = [
     data.accounts,
@@ -2163,6 +2435,7 @@ export function assessNewrelicAccessControlData(
     data.apiKeyAuditEvents,
     data.apiKeyChangeEvents,
   ];
+  const coverage = [...accountCoverage, ...scopeCoverage, ...userCoverage, ...groupCoverage, ...roleCoverage, ...keyCoverage, ...auditCoverage];
 
   return {
     category: "access_control",
@@ -2181,9 +2454,11 @@ export function assessNewrelicAccessControlData(
       custom_roles: customRoles.length,
       api_key_audit_events: data.apiKeyAuditEvents.data.length,
       collection_errors: collectedErrors(allCollected).length,
+      coverage_limitations: coverage.length,
     },
     findings,
     errors: collectedErrors(allCollected),
+    coverage,
     coreData: {
       "core_data/accounts.json": accounts,
       "core_data/api_keys.json": keys,
@@ -2218,14 +2493,13 @@ export interface NewrelicAlertingData {
 
 async function collectPerAccount(
   accountIds: number[],
-  load: (accountId: number) => Promise<JsonRecord[]>,
-): Promise<JsonRecord[]> {
-  const items: JsonRecord[] = [];
-  for (const accountId of accountIds) {
-    const rows = await load(accountId);
-    items.push(...rows.map((row) => ({ ...row, queriedAccountId: accountId })));
-  }
-  return items;
+  load: (accountId: number) => Promise<PagedList | JsonRecord[]>,
+): Promise<PagedList> {
+  return collectScoped(
+    accountScopes(accountIds),
+    (accountId) => load(Number(accountId)),
+    (row, accountId) => ({ ...row, queriedAccountId: Number(accountId) }),
+  );
 }
 
 export async function collectNewrelicAlertingData(
@@ -2236,19 +2510,17 @@ export async function collectNewrelicAlertingData(
   const entityLimit = clampNumber(options.entityLimit, DEFAULT_ENTITY_LIMIT, 1, 20_000);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
   const currentUser = await collect("actor.user", {} as JsonRecord, () => client.getCurrentUser());
-  const policies = await collect("alerts.policiesSearch", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listAlertPolicies(id)));
-  const conditions = await collect("alerts.nrqlConditionsSearch", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listNrqlConditions(id)));
-  const destinations = await collect("aiNotifications.destinations", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listNotificationDestinations(id)));
-  const channels = await collect("aiNotifications.channels", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listNotificationChannels(id)));
-  const workflows = await collect("aiWorkflows.workflows", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listWorkflows(id)));
-  const alertableEntities = await collect(
+  const policies = await collectList("alerts.policiesSearch", () => collectPerAccount(accountIds, (id) => client.listAlertPolicies(id)));
+  const conditions = await collectList("alerts.nrqlConditionsSearch", () => collectPerAccount(accountIds, (id) => client.listNrqlConditions(id)));
+  const destinations = await collectList("aiNotifications.destinations", () => collectPerAccount(accountIds, (id) => client.listNotificationDestinations(id)));
+  const channels = await collectList("aiNotifications.channels", () => collectPerAccount(accountIds, (id) => client.listNotificationChannels(id)));
+  const workflows = await collectList("aiWorkflows.workflows", () => collectPerAccount(accountIds, (id) => client.listWorkflows(id)));
+  const alertableEntities = await collectList(
     "entitySearch.alertable",
-    [] as JsonRecord[],
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`alertSeverity IS NOT NULL AND accountId = ${id}`, entityLimit)),
   );
-  const workloads = await collect(
+  const workloads = await collectList(
     "entitySearch.workloads",
-    [] as JsonRecord[],
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`type = 'WORKLOAD' AND accountId = ${id}`, entityLimit)),
   );
   return { accountIds, currentUser, policies, conditions, destinations, channels, workflows, alertableEntities, workloads };
@@ -2286,14 +2558,18 @@ export function assessNewrelicAlertingData(
   const workloads = data.workloads.data;
 
   const policiesReadable = !data.policies.error;
+  const conditionsReadable = !data.conditions.error;
   const entitiesReadable = !data.alertableEntities.error;
   const destinationsReadable = !data.destinations.error;
+  const channelsReadable = !data.channels.error;
   const workflowsReadable = !data.workflows.error;
+  const currentUserReadable = !data.currentUser.error;
 
   const reportingEntities = entities.filter(isReporting);
   const uncoveredEntities = reportingEntities.filter((entity) => (asString(entity.alertSeverity) ?? "").toUpperCase() === "NOT_CONFIGURED");
   const uncoveredCritical = uncoveredEntities.filter((entity) => CRITICAL_ENTITY_TYPES.has(entityDomainType(entity)));
-  const enabledConditions = conditions.filter((condition) => asBoolean(condition.enabled) !== false);
+  const enabledConditions = conditions.filter((condition) => asBoolean(condition.enabled) === true);
+  const conditionsWithoutEnabledFlag = conditions.filter((condition) => asBoolean(condition.enabled) === undefined);
   const policyIdsWithConditions = new Set(enabledConditions.map((condition) => asString(condition.policyId)).filter(Boolean));
   const emptyPolicies = policies.filter((policy) => !policyIdsWithConditions.has(asString(policy.id) ?? ""));
   const disruptedWorkloads = workloads.filter((workload) =>
@@ -2316,8 +2592,13 @@ export function assessNewrelicAlertingData(
       return domain !== undefined && !PERSONAL_EMAIL_DOMAINS.has(domain) && approvedDomains.size > 0 && !approvedDomains.has(domain);
     }),
   );
+  const emailDestinationsWithoutAddress = emailDestinations.filter((destination) => destinationEmails(destination).length === 0);
   const inactiveDestinations = destinations.filter((destination) => asBoolean(destination.active) === false);
-  const enabledWorkflows = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) !== false);
+  const destinationsWithoutActiveFlag = destinations.filter((destination) => asBoolean(destination.active) === undefined);
+  const destinationsWithoutType = destinations.filter((destination) => !asString(destination.type));
+  const enabledWorkflows = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) === true);
+  const workflowsWithoutEnabledFlag = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) === undefined);
+  const possiblyEnabledWorkflows = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) !== false);
   const destinationTypeCounts: Record<string, number> = {};
   for (const destination of destinations) {
     const type = asString(destination.type) ?? "UNKNOWN";
@@ -2334,13 +2615,13 @@ export function assessNewrelicAlertingData(
     const id = asString(channel.id);
     if (id) channelById.set(id, channel);
   }
-  const enrichedWorkflows = enabledWorkflows.filter((workflow) => asRecords(workflow.enrichments).length > 0 && asBoolean(workflow.enrichmentsEnabled) !== false);
+  const enrichedWorkflows = possiblyEnabledWorkflows.filter((workflow) => asRecords(workflow.enrichments).length > 0 && asBoolean(workflow.enrichmentsEnabled) !== false);
   const enrichedExternalWorkflows = enrichedWorkflows.filter((workflow) =>
     asRecords(workflow.destinationConfigurations).some((configuration) => {
       const channel = channelById.get(asString(configuration.channelId) ?? "");
       const destination = destinationById.get(asString(channel?.destinationId) ?? "");
       const type = (asString(configuration.type) ?? asString(channel?.type) ?? asString(destination?.type) ?? "").toUpperCase();
-      return EXTERNAL_DESTINATION_TYPES.has(type);
+      return type === "" || EXTERNAL_DESTINATION_TYPES.has(type);
     }),
   );
   const enrichmentQueries = enrichedWorkflows.flatMap((workflow) =>
@@ -2349,93 +2630,130 @@ export function assessNewrelicAlertingData(
     ),
   );
 
+  const policyCoverage = coverageNotes([["alert policies", data.policies]]);
+  const conditionCoverage = coverageNotes([["NRQL conditions", data.conditions]]);
+  const entityCoverage = coverageNotes([["alertable entities", data.alertableEntities]]);
+  const destinationCoverage = coverageNotes([["destinations", data.destinations]]);
+  const channelCoverage = coverageNotes([["channels", data.channels]]);
+  const workflowCoverage = coverageNotes([["workflows", data.workflows]]);
+  const accountCount = data.accountIds.length;
+  const policyEvidence = "the Alerts > Alert policies list with condition counts for every account in scope.";
+  const entityEvidence = "the entity explorer alert status column for every reporting APM application, host, and synthetic monitor.";
+  const destinationEvidence = "Alerts > Destinations with the address or endpoint of every destination and its active state.";
+  const workflowEvidence = "Alerts > Workflows with each workflow's enabled state and destinations.";
+
+  const control9 = (): Verdict => {
+    if (!policiesReadable) return unreadableVerdict("Alert policies (alerts.policiesSearch)", data.policies, policyEvidence);
+    if (!conditionsReadable) return unreadableVerdict("NRQL conditions (alerts.nrqlConditionsSearch)", data.conditions, policyEvidence);
+    if (!entitiesReadable) return unreadableVerdict("Alertable entities (entitySearch)", data.alertableEntities, entityEvidence);
+    if (policies.length === 0 && reportingEntities.length === 0) {
+      return manualVerdict(`No alert policies and no reporting alertable entities were returned across ${accountCount} accounts, so there is nothing to compare; emptiness is unknown rather than compliant. Confirm the accounts are unused or that this key can see their entities, and collect ${policyEvidence}`);
+    }
+    if (policies.length === 0) return verdict("fail", `No alert policies exist across ${accountCount} accounts while ${reportingEntities.length} reporting entities are monitored.`);
+    if (enabledConditions.length === 0) {
+      return verdict("fail", `${policies.length} policies exist but none has a NRQL condition with enabled = true (${conditions.length} conditions returned, ${conditionsWithoutEnabledFlag.length} without an enabled flag), so no alerting is active.`);
+    }
+    if (uncoveredCritical.length > 0) {
+      return verdict("fail", `${uncoveredCritical.length} reporting APM applications, infrastructure hosts, or synthetic monitors have no alert conditions targeting them (${uncoveredEntities.length}/${reportingEntities.length} alertable entities uncovered).`);
+    }
+    if (reportingEntities.length === 0) {
+      return manualVerdict(`${policies.length} policies with ${enabledConditions.length} enabled NRQL conditions exist, but entitySearch returned zero reporting alertable entities across ${accountCount} accounts, so coverage cannot be measured; emptiness is unknown rather than compliant. Confirm entity visibility for this key and collect ${entityEvidence}`);
+    }
+    if (uncoveredEntities.length > 0 || emptyPolicies.length > 0) {
+      return verdict("warn", `${uncoveredEntities.length}/${reportingEntities.length} reporting alertable entities have no alert conditions and ${emptyPolicies.length}/${policies.length} policies have no enabled NRQL conditions.`);
+    }
+    if (conditionsWithoutEnabledFlag.length > 0) {
+      return verdict("warn", `${enabledConditions.length} enabled NRQL conditions cover all ${reportingEntities.length} reporting alertable entities, but ${conditionsWithoutEnabledFlag.length} conditions did not expose the enabled flag and were not counted as active.`);
+    }
+    return verdict("pass", `${policies.length} policies with ${enabledConditions.length} enabled NRQL conditions cover all ${reportingEntities.length} reporting alertable entities.`);
+  };
+
+  const control10 = (): Verdict => {
+    if (!destinationsReadable) return unreadableVerdict("Notification destinations (aiNotifications.destinations)", data.destinations, destinationEvidence);
+    if (!workflowsReadable) return unreadableVerdict("Workflows (aiWorkflows.workflows)", data.workflows, workflowEvidence);
+    if (!channelsReadable) return unreadableVerdict("Notification channels (aiNotifications.channels)", data.channels, destinationEvidence);
+    if (personalEmailDestinations.length > 0) return verdict("fail", `${personalEmailDestinations.length} email destinations route alerts to personal email providers.`);
+    if (destinations.length === 0) {
+      if (!policiesReadable) {
+        return manualVerdict(`No notification destinations were returned across ${accountCount} accounts and alert policies were not readable (${causeOf(data.policies)}), so it is unknown whether alerts have anywhere to go. Collect ${destinationEvidence}`);
+      }
+      return policies.length > 0
+        ? verdict("fail", `No notification destinations exist across ${accountCount} accounts while ${policies.length} alert policies are defined, so alerts cannot reach anyone.`)
+        : manualVerdict(`No notification destinations and no alert policies exist across ${accountCount} accounts; emptiness is unknown rather than compliant. Confirm alerting is intentionally unused and collect ${destinationEvidence}`);
+    }
+    if (unapprovedEmailDestinations.length > 0) {
+      return verdict("warn", `${unapprovedEmailDestinations.length} email destinations use domains outside the approved set (${[...approvedDomains].join(", ")}).`);
+    }
+    if (enabledWorkflows.length === 0) {
+      const workflowInventory = `${workflows.length} workflows returned, ${workflowsWithoutEnabledFlag.length} without an enabled flag`;
+      if (!policiesReadable) {
+        return manualVerdict(`${destinations.length} destinations exist but no workflow has workflowEnabled = true (${workflowInventory}) and alert policies were not readable (${causeOf(data.policies)}), so routing cannot be evaluated. Collect ${workflowEvidence}`);
+      }
+      if (policies.length > 0) {
+        return verdict("warn", `${policies.length} alert policies exist but no workflow has workflowEnabled = true (${workflowInventory}), so issues are not routed to destinations.`);
+      }
+      return manualVerdict(`${destinations.length} destinations exist but no enabled workflow routes to them (${workflowInventory}) and no alert policies exist across ${accountCount} accounts; emptiness is unknown rather than compliant. Confirm alerting is intentionally unused and collect ${workflowEvidence}`);
+    }
+    if (inactiveDestinations.length > 0 || destinationsWithoutActiveFlag.length > 0 || destinationsWithoutType.length > 0 || emailDestinationsWithoutAddress.length > 0 || workflowsWithoutEnabledFlag.length > 0) {
+      return verdict("warn", `${destinations.length} destinations were inventoried, but ${inactiveDestinations.length} are inactive, ${destinationsWithoutActiveFlag.length} expose no active flag, ${destinationsWithoutType.length} expose no type, ${emailDestinationsWithoutAddress.length} email destinations expose no address, and ${workflowsWithoutEnabledFlag.length} workflows expose no enabled flag; those cannot be counted as approved and working.`);
+    }
+    if (emailDestinations.length > 0 && approvedDomains.size === 0) {
+      return verdict("warn", `${emailDestinations.length} email destinations could not be checked against an approved domain list${currentUserReadable ? "" : ` (actor.user unreadable: ${causeOf(data.currentUser)})`}; pass approved_email_domains to confirm they are corporate addresses.`);
+    }
+    return verdict("pass", `${destinations.length} destinations across ${Object.keys(destinationTypeCounts).length} types route ${enabledWorkflows.length} enabled workflows; every destination exposed its type and active state, and all ${emailDestinations.length} email destinations use approved domains${approvedDomains.size > 0 ? ` (${[...approvedDomains].join(", ")})` : ""}.`);
+  };
+
+  const control17 = (): Verdict => {
+    if (!workflowsReadable) return unreadableVerdict("Workflows (aiWorkflows.workflows)", data.workflows, "Alerts > Workflows NRQL enrichments and Alerts > Correlation decisions settings that could expose sensitive attributes.");
+    if (enrichedExternalWorkflows.length > 0) {
+      return verdict("warn", `${enrichedExternalWorkflows.length} workflows attach NRQL enrichment results to notifications sent to external or unidentified destination types, so query output leaves the platform with each notification. Review the ${enrichmentQueries.length} enrichment queries and confirm they exclude sensitive attributes.`);
+    }
+    if (workflows.length === 0) {
+      return manualVerdict(`No workflows were returned across ${accountCount} accounts, so there are no enrichments to review through the API. Correlation decision settings are not exposed by NerdGraph: record Alerts > Correlation decisions and confirm custom decisions do not correlate on sensitive attributes.`);
+    }
+    return manualVerdict(`${enrichedWorkflows.length} enabled workflows use NRQL enrichments and none route to external destination types${channelsReadable && destinationsReadable ? "" : " (channel or destination types were partly unreadable, so unidentified types were treated as external)"}. Correlation decision settings are not exposed by NerdGraph: record Alerts > Correlation decisions and confirm custom decisions do not correlate on sensitive attributes.`);
+  };
+
   const findings: NewrelicFinding[] = [];
 
-  findings.push(finding(
-    9,
-    !policiesReadable && !entitiesReadable
-      ? "manual"
-      : policies.length === 0
-        ? "fail"
-        : uncoveredCritical.length > 0
-          ? "fail"
-          : uncoveredEntities.length > 0 || emptyPolicies.length > 0
-            ? "warn"
-            : "pass",
-    !policiesReadable && !entitiesReadable
-      ? "Alert policies and alertable entities were not readable. Review Alerts > Alert policies and the entity explorer alert status column manually."
-      : policies.length === 0
-        ? `No alert policies exist across ${data.accountIds.length} accounts while ${reportingEntities.length} reporting entities are monitored.`
-        : uncoveredCritical.length > 0
-          ? `${uncoveredCritical.length} reporting APM applications, infrastructure hosts, or synthetic monitors have no alert conditions targeting them (${uncoveredEntities.length}/${reportingEntities.length} alertable entities uncovered).`
-          : uncoveredEntities.length > 0 || emptyPolicies.length > 0
-            ? `${uncoveredEntities.length}/${reportingEntities.length} reporting alertable entities have no alert conditions and ${emptyPolicies.length}/${policies.length} policies have no enabled NRQL conditions.`
-            : `${policies.length} policies with ${enabledConditions.length} enabled NRQL conditions cover all ${reportingEntities.length} reporting alertable entities.`,
-    {
-      policies: policies.length,
-      enabled_conditions: enabledConditions.length,
-      empty_policies: sample(emptyPolicies.map((policy) => asString(policy.name) ?? asString(policy.id) ?? "policy")),
-      reporting_alertable_entities: reportingEntities.length,
-      uncovered_entities: uncoveredEntities.length,
-      uncovered_critical_entities: sample(uncoveredCritical.map(entityLabel)),
-      workloads: workloads.length,
-      disrupted_workloads: sample(disruptedWorkloads.map((workload) => asString(workload.name) ?? "workload")),
-    },
-  ));
+  findings.push(finding(9, limitCoverage(control9(), [...policyCoverage, ...conditionCoverage, ...entityCoverage]), {
+    policies: policies.length,
+    conditions: conditions.length,
+    enabled_conditions: enabledConditions.length,
+    conditions_without_enabled_flag: conditionsWithoutEnabledFlag.length,
+    empty_policies: sample(emptyPolicies.map((policy) => asString(policy.name) ?? asString(policy.id) ?? "policy")),
+    reporting_alertable_entities: reportingEntities.length,
+    alertable_entities_reported_total: data.alertableEntities.total ?? null,
+    uncovered_entities: uncoveredEntities.length,
+    uncovered_critical_entities: sample(uncoveredCritical.map(entityLabel)),
+    workloads: workloads.length,
+    disrupted_workloads: sample(disruptedWorkloads.map((workload) => asString(workload.name) ?? "workload")),
+  }));
 
-  findings.push(finding(
-    10,
-    !destinationsReadable
-      ? "manual"
-      : personalEmailDestinations.length > 0
-        ? "fail"
-        : unapprovedEmailDestinations.length > 0 || (policies.length > 0 && enabledWorkflows.length === 0) || inactiveDestinations.length > 0
-          ? "warn"
-          : "pass",
-    !destinationsReadable
-      ? "Notification destinations were not readable. Review Alerts > Destinations and confirm every email destination uses a corporate address."
-      : personalEmailDestinations.length > 0
-        ? `${personalEmailDestinations.length} email destinations route alerts to personal email providers.`
-        : unapprovedEmailDestinations.length > 0
-          ? `${unapprovedEmailDestinations.length} email destinations use domains outside the approved set (${[...approvedDomains].join(", ")}).`
-          : policies.length > 0 && enabledWorkflows.length === 0
-            ? `${policies.length} alert policies exist but no enabled workflows route issues to destinations.`
-            : inactiveDestinations.length > 0
-              ? `${inactiveDestinations.length}/${destinations.length} destinations are inactive; the rest route to approved destinations.`
-              : `${destinations.length} destinations across ${Object.keys(destinationTypeCounts).length} types route ${enabledWorkflows.length} enabled workflows without personal email addresses.`,
-    {
-      destinations: destinations.length,
-      destination_types: destinationTypeCounts,
-      channels: channels.length,
-      enabled_workflows: enabledWorkflows.length,
-      approved_email_domains: [...approvedDomains],
-      personal_email_destinations: sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
-      unapproved_email_destinations: sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
-      inactive_destinations: sample(inactiveDestinations.map((destination) => asString(destination.name) ?? "destination")),
-    },
-  ));
+  findings.push(finding(10, limitCoverage(control10(), [...destinationCoverage, ...channelCoverage, ...workflowCoverage, ...policyCoverage]), {
+    destinations: destinations.length,
+    destination_types: destinationTypeCounts,
+    channels: channels.length,
+    workflows: workflows.length,
+    enabled_workflows: enabledWorkflows.length,
+    workflows_without_enabled_flag: workflowsWithoutEnabledFlag.length,
+    approved_email_domains: [...approvedDomains],
+    personal_email_destinations: sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
+    unapproved_email_destinations: sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
+    inactive_destinations: sample(inactiveDestinations.map((destination) => asString(destination.name) ?? "destination")),
+    destinations_without_active_flag: destinationsWithoutActiveFlag.length,
+    destinations_without_type: destinationsWithoutType.length,
+    email_destinations_without_address: emailDestinationsWithoutAddress.length,
+  }));
 
-  findings.push(finding(
-    17,
-    !workflowsReadable
-      ? "manual"
-      : enrichedExternalWorkflows.length > 0
-        ? "warn"
-        : "manual",
-    !workflowsReadable
-      ? "Workflows were not readable. Review Alerts > Workflows for NRQL enrichments and Alerts > Correlation decisions for correlation settings that could expose sensitive attributes."
-      : enrichedExternalWorkflows.length > 0
-        ? `${enrichedExternalWorkflows.length} enabled workflows attach NRQL enrichment results to notifications sent to external destinations, so query output leaves the platform with each notification. Review the ${enrichmentQueries.length} enrichment queries and confirm they exclude sensitive attributes.`
-        : `${enrichedWorkflows.length} enabled workflows use NRQL enrichments and none route to external destination types. Correlation decision settings are not exposed by NerdGraph: record Alerts > Correlation decisions and confirm custom decisions do not correlate on sensitive attributes.`,
-    {
-      workflows: workflows.length,
-      enabled_workflows: enabledWorkflows.length,
-      enriched_workflows: sample(enrichedWorkflows.map((workflow) => asString(workflow.name) ?? "workflow")),
-      enriched_external_workflows: sample(enrichedExternalWorkflows.map((workflow) => asString(workflow.name) ?? "workflow")),
-      enrichment_queries: sample(enrichmentQueries, 10),
-      manual_evidence: "Alerts > Correlation decisions: list of enabled decisions and the attributes they correlate on.",
-    },
-  ));
+  findings.push(finding(17, limitCoverage(control17(), [...workflowCoverage, ...channelCoverage, ...destinationCoverage]), {
+    workflows: workflows.length,
+    enabled_workflows: enabledWorkflows.length,
+    enriched_workflows: sample(enrichedWorkflows.map((workflow) => asString(workflow.name) ?? "workflow")),
+    enriched_external_workflows: sample(enrichedExternalWorkflows.map((workflow) => asString(workflow.name) ?? "workflow")),
+    enrichment_queries: sample(enrichmentQueries, 10),
+    manual_evidence: "Alerts > Correlation decisions: list of enabled decisions and the attributes they correlate on.",
+  }));
 
   const allCollected = [
     data.currentUser,
@@ -2446,6 +2764,15 @@ export function assessNewrelicAlertingData(
     data.workflows,
     data.alertableEntities,
     data.workloads,
+  ];
+  const coverage = [
+    ...policyCoverage,
+    ...conditionCoverage,
+    ...destinationCoverage,
+    ...channelCoverage,
+    ...workflowCoverage,
+    ...entityCoverage,
+    ...coverageNotes([["workloads", data.workloads]]),
   ];
 
   return {
@@ -2464,9 +2791,11 @@ export function assessNewrelicAlertingData(
       enriched_external_workflows: enrichedExternalWorkflows.length,
       workloads: workloads.length,
       collection_errors: collectedErrors(allCollected).length,
+      coverage_limitations: coverage.length,
     },
     findings,
     errors: collectedErrors(allCollected),
+    coverage,
     coreData: {
       "core_data/alert_policies.json": policies,
       "core_data/alert_nrql_conditions.json": conditions,
@@ -2510,29 +2839,50 @@ function scanScriptForSecrets(text: string): string[] {
   return SECRET_PATTERNS.filter((entry) => entry.pattern.test(text)).map((entry) => entry.label);
 }
 
+function isScriptedMonitor(monitor: JsonRecord): boolean {
+  return SCRIPTED_MONITOR_TYPES.has((asString(monitor.monitorType) ?? "").toUpperCase());
+}
+
 async function collectSyntheticScripts(
   client: Pick<NewrelicClientSurface, "getSyntheticScript">,
   monitors: JsonRecord[],
   limit: number,
-): Promise<JsonRecord[]> {
-  const scripted = monitors.filter((monitor) => SCRIPTED_MONITOR_TYPES.has((asString(monitor.monitorType) ?? "").toUpperCase())).slice(0, limit);
+): Promise<PagedList> {
+  const scripted = monitors.filter(isScriptedMonitor);
+  const sampled = scripted.slice(0, limit);
   const snapshots: JsonRecord[] = [];
-  for (const monitor of scripted) {
+  const failures: string[] = [];
+  for (const monitor of sampled) {
     const guid = asString(monitor.guid);
     const accountId = asNumber(monitor.accountId) ?? asNumber(monitor.queriedAccountId);
-    if (!guid || accountId === undefined) continue;
-    const text = await client.getSyntheticScript(accountId, guid);
-    snapshots.push({
-      guid,
-      name: asString(monitor.name),
-      accountId,
-      monitorType: asString(monitor.monitorType),
-      scriptLength: text.length,
-      usesSecureCredentials: /\$secure\./.test(text),
-      secretIndicators: scanScriptForSecrets(text),
-    });
+    const label = asString(monitor.name) ?? guid ?? "monitor";
+    if (!guid || accountId === undefined) {
+      failures.push(`${label}: monitor exposed no guid or account id`);
+      continue;
+    }
+    try {
+      const text = await client.getSyntheticScript(accountId, guid);
+      snapshots.push({
+        guid,
+        name: asString(monitor.name),
+        accountId,
+        monitorType: asString(monitor.monitorType),
+        scriptLength: text.length,
+        usesSecureCredentials: /\$secure\./.test(text),
+        secretIndicators: scanScriptForSecrets(text),
+      });
+    } catch (error) {
+      failures.push(`${label}: ${errorMessage(error)}`);
+    }
   }
-  return snapshots;
+  if (sampled.length > 0 && failures.length >= sampled.length) throw new Error(failures.join("; "));
+  return {
+    items: snapshots,
+    complete: scripted.length <= limit,
+    totalCount: scripted.length,
+    note: scripted.length > limit ? `only ${sampled.length} of ${scripted.length} scripted monitors were sampled (script_sample_limit ${limit})` : undefined,
+    failures: failures.length > 0 ? failures : undefined,
+  };
 }
 
 export async function collectNewrelicDataGovernanceData(
@@ -2544,54 +2894,47 @@ export async function collectNewrelicDataGovernanceData(
   const scriptSampleLimit = clampNumber(options.scriptSampleLimit, DEFAULT_SCRIPT_SAMPLE_LIMIT, 0, 500);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
 
-  const retentionRules = await collect("dataManagement.eventRetentionRules", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listEventRetentionRules(id)));
-  const retentionNamespaces = await collect("dataManagement.customizableRetention", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listRetentionNamespaces(id)));
-  const obfuscationRules = await collect("logConfigurations.obfuscationRules", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listObfuscationRules(id)));
-  const obfuscationExpressions = await collect("logConfigurations.obfuscationExpressions", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listObfuscationExpressions(id)));
-  const cloudRules = await collect("entityManagement.pipelineCloudRules", [] as JsonRecord[], () => client.listPipelineCloudRules());
-  const dropRules = await collect("nrqlDropRules.list", [] as JsonRecord[], () => collectPerAccount(accountIds, (id) => client.listNrqlDropRules(id)));
-  const dashboards = await collect(
+  const retentionRules = await collectList("dataManagement.eventRetentionRules", () => collectPerAccount(accountIds, (id) => client.listEventRetentionRules(id)));
+  const retentionNamespaces = await collectList("dataManagement.customizableRetention", () => collectPerAccount(accountIds, (id) => client.listRetentionNamespaces(id)));
+  const obfuscationRules = await collectList("logConfigurations.obfuscationRules", () => collectPerAccount(accountIds, (id) => client.listObfuscationRules(id)));
+  const obfuscationExpressions = await collectList("logConfigurations.obfuscationExpressions", () => collectPerAccount(accountIds, (id) => client.listObfuscationExpressions(id)));
+  const cloudRules = await collectList("entityManagement.pipelineCloudRules", () => client.listPipelineCloudRules());
+  const dropRules = await collectList("nrqlDropRules.list", () => collectPerAccount(accountIds, (id) => client.listNrqlDropRules(id)));
+  const dashboards = await collectList(
     "entitySearch.dashboards",
-    [] as JsonRecord[],
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`type = 'DASHBOARD' AND accountId = ${id}`, entityLimit)),
   );
-  const dashboardLiveUrls = await collect("dashboard.liveUrls", [] as JsonRecord[], () => client.listDashboardLiveUrls());
-  const syntheticMonitors = await collect(
+  const dashboardLiveUrls = await collectList("dashboard.liveUrls", () => client.listDashboardLiveUrls());
+  const syntheticMonitors = await collectList(
     "entitySearch.syntheticMonitors",
-    [] as JsonRecord[],
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`domain = 'SYNTH' AND type = 'MONITOR' AND accountId = ${id}`, entityLimit)),
   );
-  const secureCredentials = await collect(
+  const secureCredentials = await collectList(
     "entitySearch.secureCredentials",
-    [] as JsonRecord[],
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`domain = 'SYNTH' AND type = 'SECURE_CRED' AND accountId = ${id}`, entityLimit)),
   );
-  const syntheticScripts = await collect("synthetics.script", [] as JsonRecord[], () => collectSyntheticScripts(client, syntheticMonitors.data, scriptSampleLimit));
-  const logVolume = await collect(
+  const syntheticScripts = await collectList("synthetics.script", () => collectSyntheticScripts(client, syntheticMonitors.data, scriptSampleLimit));
+  const logVolume = await collectList(
     "nrql.Log.volume",
-    [] as JsonRecord[],
     () => runNrqlAcrossAccounts(client, accountIds, "SELECT count(*) AS logCount FROM Log SINCE 1 day ago"),
   );
-  const logSecretMatches = await collect(
+  const logSecretMatches = await collectList(
     "nrql.Log.secret_patterns",
-    [] as JsonRecord[],
     () => runNrqlAcrossAccounts(client, accountIds, `SELECT count(*) AS matchCount FROM Log WHERE message RLIKE r'${LOG_SECRET_NRQL_PATTERN}' SINCE 1 day ago`),
   );
-  const infraHosts = await collect(
+  const infraHosts = await collectList(
     "entitySearch.infraHosts",
-    [] as JsonRecord[],
-    async () => {
-      const rows: JsonRecord[] = [];
-      for (const accountId of accountIds) {
+    () => collectScoped(
+      accountScopes(accountIds),
+      async (accountId) => {
         const count = await client.countEntities(`domain = 'INFRA' AND type = 'HOST' AND reporting = 'true' AND accountId = ${accountId}`);
-        rows.push({ queriedAccountId: accountId, reportingHosts: count });
-      }
-      return rows;
-    },
+        return [{ reportingHosts: count }];
+      },
+      (row, accountId) => ({ ...row, queriedAccountId: Number(accountId) }),
+    ),
   );
-  const infraAgentVersions = await collect(
+  const infraAgentVersions = await collectList(
     "nrql.SystemSample.agentVersion",
-    [] as JsonRecord[],
     () => runNrqlAcrossAccounts(client, accountIds, "SELECT uniqueCount(entityGuid) AS hosts FROM SystemSample FACET agentVersion SINCE 1 day ago LIMIT 50"),
   );
 
@@ -2637,8 +2980,17 @@ export function assessNewrelicDataGovernanceData(
   const secureCredentials = data.secureCredentials.data;
   const scripts = data.syntheticScripts.data;
 
-  const shortRetentionRules = retentionRules.filter((rule) => (asNumber(rule.retentionInDays) ?? Number.POSITIVE_INFINITY) < minRetentionDays);
-  const enabledObfuscationRules = obfuscationRules.filter((rule) => asBoolean(rule.enabled) !== false);
+  const shortRetentionRules = retentionRules.filter((rule) => {
+    const days = asNumber(rule.retentionInDays);
+    return days !== undefined && days < minRetentionDays;
+  });
+  const rulesWithoutRetentionDays = retentionRules.filter((rule) => asNumber(rule.retentionInDays) === undefined);
+  const ruledNamespaces = new Set(retentionRules.map((rule) => `${asNumber(rule.queriedAccountId) ?? ""}:${asString(rule.namespace) ?? ""}`));
+  const namespacesWithoutRules = data.retentionNamespaces.data.filter((row) =>
+    !ruledNamespaces.has(`${asNumber(row.queriedAccountId) ?? ""}:${asString(row.namespace) ?? ""}`),
+  );
+  const enabledObfuscationRules = obfuscationRules.filter((rule) => asBoolean(rule.enabled) === true);
+  const obfuscationRulesWithoutEnabledFlag = obfuscationRules.filter((rule) => asBoolean(rule.enabled) === undefined);
   const expressionText = [
     ...obfuscationExpressions.map((expression) => `${asString(expression.name) ?? ""} ${asString(expression.regex) ?? ""} ${asString(expression.description) ?? ""}`),
     ...obfuscationRules.map((rule) => `${asString(rule.name) ?? ""} ${asString(rule.description) ?? ""}`),
@@ -2652,12 +3004,19 @@ export function assessNewrelicDataGovernanceData(
   const logCount = sumField(data.logVolume.data, "logCount");
   const secretMatchCount = sumField(data.logSecretMatches.data, "matchCount");
 
-  const scriptedMonitors = monitors.filter((monitor) => SCRIPTED_MONITOR_TYPES.has((asString(monitor.monitorType) ?? "").toUpperCase()));
+  const scriptedMonitors = monitors.filter(isScriptedMonitor);
+  const monitorsWithoutType = monitors.filter((monitor) => !asString(monitor.monitorType));
+  const monitorTypeCounts: Record<string, number> = {};
+  for (const monitor of monitors) {
+    const type = asString(monitor.monitorType)?.toUpperCase() ?? "UNKNOWN";
+    monitorTypeCounts[type] = (monitorTypeCounts[type] ?? 0) + 1;
+  }
   const scriptsWithSecrets = scripts.filter((script) => asArray(script.secretIndicators).length > 0);
   const scriptsUsingSecureCredentials = scripts.filter((script) => asBoolean(script.usesSecureCredentials) === true);
 
   const publicReadWriteDashboards = dashboards.filter((dashboard) => (asString(dashboard.permissions) ?? "").toUpperCase() === "PUBLIC_READ_WRITE");
   const privateDashboards = dashboards.filter((dashboard) => (asString(dashboard.permissions) ?? "").toUpperCase() === "PRIVATE");
+  const dashboardsWithoutPermissions = dashboards.filter((dashboard) => !asString(dashboard.permissions));
   const liveUrlSnapshots = liveUrls.map((liveUrl) => ({
     title: asString(liveUrl.title) ?? "",
     type: asString(liveUrl.type)?.toUpperCase() ?? "UNKNOWN",
@@ -2671,152 +3030,208 @@ export function assessNewrelicDataGovernanceData(
     .map((row) => ({ version: asString(row.agentVersion) ?? asString(row.facet) ?? "unknown", hosts: asNumber(row.hosts) ?? 0 }))
     .filter((row) => row.version !== "unknown" || row.hosts > 0);
 
+  const accountCount = data.accountIds.length;
+  const retentionReadable = !data.retentionRules.error;
+  const namespacesReadable = !data.retentionNamespaces.error;
+  const obfuscationReadable = !data.obfuscationRules.error;
+  const expressionsReadable = !data.obfuscationExpressions.error;
+  const cloudRulesReadable = !data.cloudRules.error;
+  const dropRulesReadable = !data.dropRules.error;
+  const monitorsReadable = !data.syntheticMonitors.error;
+  const scriptsReadable = !data.syntheticScripts.error;
+  const secureCredentialsReadable = !data.secureCredentials.error;
+  const dashboardsReadable = !data.dashboards.error;
+  const liveUrlsReadable = !data.dashboardLiveUrls.error;
+  const logVolumeReadable = !data.logVolume.error;
+  const secretMatchesReadable = !data.logSecretMatches.error;
+  const infraReadable = !data.infraHosts.error;
+
+  const retentionCoverage = coverageNotes([["retention rules", data.retentionRules], ["retention namespaces", data.retentionNamespaces]]);
+  const obfuscationCoverage = coverageNotes([["obfuscation rules", data.obfuscationRules], ["obfuscation expressions", data.obfuscationExpressions]]);
+  const monitorCoverage = coverageNotes([["synthetic monitors", data.syntheticMonitors], ["secure credentials", data.secureCredentials], ["synthetic scripts", data.syntheticScripts]]);
+  const dashboardCoverage = coverageNotes([["dashboards", data.dashboards], ["dashboard live URLs", data.dashboardLiveUrls]]);
+  const logCoverage = coverageNotes([["log volume", data.logVolume], ["log secret matches", data.logSecretMatches]]);
+  const retentionEvidence = "the retention per data type from Administration > Data management > Data retention for every account.";
+  const obfuscationEvidence = "the rules and expressions shown in Logs > Obfuscation for every account.";
+  const scriptEvidence = "each scripted monitor's script from Synthetic monitoring, confirming credentials come from secure credentials ($secure.NAME).";
+  const dashboardEvidence = "dashboard permissions and public sharing links from the Dashboards UI.";
+  const pipelineControlNote = cloudRulesReadable
+    ? `${cloudRules.length} Pipeline Control cloud rules`
+    : `Pipeline Control cloud rules were not readable and are treated as unavailable on this account (${causeOf(data.cloudRules)})`;
+
+  const control11 = (): Verdict => {
+    if (!retentionReadable) return unreadableVerdict("Data retention rules (dataManagement.eventRetentionRules)", data.retentionRules, retentionEvidence);
+    if (shortRetentionRules.length > 0) return verdict("fail", `${shortRetentionRules.length}/${retentionRules.length} active retention rules keep data for less than ${minRetentionDays} days.`);
+    if (retentionRules.length === 0) {
+      return manualVerdict(`No active custom retention rules exist across ${accountCount} accounts, so New Relic default retention applies to ${namespacesReadable ? `all ${data.retentionNamespaces.data.length}` : "every"} customizable namespace and the API does not expose default values; emptiness is unknown rather than compliant. Confirm in Administration > Data management > Data retention that each namespace meets ${minRetentionDays} days.`);
+    }
+    if (rulesWithoutRetentionDays.length > 0) {
+      return verdict("warn", `${rulesWithoutRetentionDays.length}/${retentionRules.length} active retention rules expose no retentionInDays value and cannot be counted as compliant; the remaining rules keep data for at least ${minRetentionDays} days.`);
+    }
+    if (!namespacesReadable) {
+      return verdict("warn", `All ${retentionRules.length} active retention rules keep data for at least ${minRetentionDays} days, but customizable namespaces were not readable (${causeOf(data.retentionNamespaces)}), so namespaces relying on unexposed default retention cannot be enumerated.`);
+    }
+    if (namespacesWithoutRules.length > 0) {
+      return verdict("warn", `All ${retentionRules.length} active retention rules keep data for at least ${minRetentionDays} days, but ${namespacesWithoutRules.length}/${data.retentionNamespaces.data.length} customizable namespaces have no rule and rely on New Relic defaults that the API does not expose (${sample(namespacesWithoutRules.map((row) => asString(row.namespace) ?? "namespace"), 10).join(", ")}). Confirm those defaults meet ${minRetentionDays} days in the Data retention UI.`);
+    }
+    return verdict("pass", `All ${retentionRules.length} active retention rules keep data for at least ${minRetentionDays} days and every one of the ${data.retentionNamespaces.data.length} customizable namespaces has an explicit rule.`);
+  };
+
+  const control12 = (): Verdict => {
+    if (!obfuscationReadable) return unreadableVerdict("Log obfuscation rules (logConfigurations.obfuscationRules)", data.obfuscationRules, obfuscationEvidence);
+    if (enabledObfuscationRules.length === 0) {
+      if (obfuscationRules.length === 0 && logVolumeReadable && isComplete(data.logVolume) && logCount === 0) {
+        return manualVerdict(`No log obfuscation rules exist and no log events were ingested in the last day across ${accountCount} accounts, so the control is not applicable through the API while logging stays disabled; emptiness is unknown rather than compliant. Confirm log ingestion is intentionally disabled and collect ${obfuscationEvidence}`);
+      }
+      return verdict("fail", `No obfuscation rule with enabled = true exists across ${accountCount} accounts (${obfuscationRules.length} rules returned, ${obfuscationRulesWithoutEnabledFlag.length} without an enabled flag)${logCount > 0 ? ` while ${logCount} log events were ingested in the last day` : ""}.`);
+    }
+    if (!expressionsReadable) {
+      return verdict("warn", `${enabledObfuscationRules.length} enabled obfuscation rules exist, but obfuscation expressions were not readable (${causeOf(data.obfuscationExpressions)}), so credential and PII coverage cannot be confirmed.`);
+    }
+    if (!credentialCoverage || !piiCoverage) {
+      return verdict("warn", `${enabledObfuscationRules.length} enabled obfuscation rules exist, but the ${obfuscationExpressions.length} expressions do not clearly cover ${!credentialCoverage ? "credentials or tokens" : "PII"}.`);
+    }
+    if (obfuscationRulesWithoutEnabledFlag.length > 0) {
+      return verdict("warn", `${enabledObfuscationRules.length} enabled obfuscation rules cover credential and PII patterns, but ${obfuscationRulesWithoutEnabledFlag.length} rules expose no enabled flag and were not counted as active.`);
+    }
+    return verdict("pass", `${enabledObfuscationRules.length} enabled obfuscation rules and ${obfuscationExpressions.length} expressions cover credential and PII patterns; ${attributeDropRules.length} pipeline or drop rules also drop sensitive attributes (${pipelineControlNote}).`);
+  };
+
+  const control13 = (): Verdict => {
+    if (!monitorsReadable) return unreadableVerdict("Synthetic monitors (entitySearch)", data.syntheticMonitors, scriptEvidence);
+    if (scriptsWithSecrets.length > 0) {
+      return verdict("fail", `${scriptsWithSecrets.length}/${scripts.length} sampled scripted monitors contain hardcoded credential patterns (${[...new Set(scriptsWithSecrets.flatMap((script) => asArray(script.secretIndicators).map(String)))].join(", ")}).`);
+    }
+    if (monitors.length === 0) {
+      return manualVerdict(`Not applicable through the API: entitySearch returned zero synthetic monitors across ${accountCount} accounts, so there are no scripts to review; emptiness is unknown rather than compliant. Confirm in Synthetic monitoring that no monitors exist.`);
+    }
+    if (scriptedMonitors.length === 0 && monitorsWithoutType.length > 0) {
+      return manualVerdict(`${monitorsWithoutType.length}/${monitors.length} synthetic monitors exposed no monitorType, so scripted monitors cannot be identified. Collect ${scriptEvidence}`);
+    }
+    if (scriptedMonitors.length === 0) {
+      return manualVerdict(`Not applicable through the API: none of the ${monitors.length} synthetic monitors is scripted (${Object.entries(monitorTypeCounts).map(([type, count]) => `${type}: ${count}`).join(", ")}), so there are no scripts to review. Confirm in Synthetic monitoring that no scripted monitors exist.`);
+    }
+    if (!scriptsReadable) return manualVerdict(`${scriptedMonitors.length} scripted monitors exist but their scripts were not readable (${causeOf(data.syntheticScripts)}). Collect ${scriptEvidence}`);
+    if (scripts.length === 0) return manualVerdict(`${scriptedMonitors.length} scripted monitors exist but zero scripts were sampled, so credential handling is unknown. Collect ${scriptEvidence}`);
+    if (!isComplete(data.syntheticScripts)) {
+      return verdict("warn", `${scripts.length} of ${scriptedMonitors.length} scripted monitors were sampled and none contains hardcoded credential patterns, but the unsampled scripts cannot be counted as clean.`);
+    }
+    if (!secureCredentialsReadable) {
+      return verdict("warn", `All ${scripts.length} scripted monitor scripts were scanned without hardcoded credential patterns, but secure credentials were not readable (${causeOf(data.secureCredentials)}), so credential storage cannot be confirmed.`);
+    }
+    if (scriptsUsingSecureCredentials.length === 0 && secureCredentials.length === 0) {
+      return verdict("warn", `All ${scripts.length} scripted monitor scripts were scanned without obvious hardcoded secrets, but no secure credentials exist and no script references $secure.*, so credential handling should be confirmed.`);
+    }
+    if (monitorsWithoutType.length > 0) {
+      return verdict("warn", `All ${scripts.length} scripted monitor scripts were scanned without hardcoded credential patterns, but ${monitorsWithoutType.length} monitors exposed no monitorType and could not be classified.`);
+    }
+    return verdict("pass", `All ${scripts.length} scripted monitor scripts were scanned and contain no hardcoded credential patterns; ${scriptsUsingSecureCredentials.length} reference secure credentials and ${secureCredentials.length} secure credentials are stored.`);
+  };
+
+  const control14 = (): Verdict => {
+    if (!dashboardsReadable) return unreadableVerdict("Dashboards (entitySearch)", data.dashboards, dashboardEvidence);
+    if (liveUrls.length > 0) {
+      return verdict("fail", `${dashboardLiveUrls.length} dashboards and ${widgetLiveUrls.length} widgets are shared through public live URLs that anyone with the link can open; ${publicReadWriteDashboards.length}/${dashboards.length} dashboards also allow every account user to edit.`);
+    }
+    if (!liveUrlsReadable) {
+      return manualVerdict(`${dashboards.length} dashboards were inventoried (${publicReadWriteDashboards.length} PUBLIC_READ_WRITE), but the public live URL listing failed (${causeOf(data.dashboardLiveUrls)}), so public sharing cannot be ruled out. Collect ${dashboardEvidence}`);
+    }
+    if (dashboards.length === 0) {
+      return manualVerdict(`Not applicable through the API: entitySearch returned zero dashboards across ${accountCount} accounts and no public live URLs are visible to this user; emptiness is unknown rather than compliant. Confirm in the Dashboards UI that no dashboards exist.`);
+    }
+    if (publicReadWriteDashboards.length > 0) {
+      return verdict("warn", `${publicReadWriteDashboards.length}/${dashboards.length} dashboards grant edit access to everyone in the account (PUBLIC_READ_WRITE) and no public live URLs are visible to this user.`);
+    }
+    if (dashboardsWithoutPermissions.length > 0) {
+      return verdict("warn", `${dashboardsWithoutPermissions.length}/${dashboards.length} dashboards exposed no permissions value and cannot be counted as restricted; no public live URLs are visible to this user.`);
+    }
+    return verdict("pass", `${dashboards.length} dashboards use read-only or private permissions and no public live URLs are visible to this user.`);
+  };
+
+  const control15 = (): Verdict => {
+    if (!secretMatchesReadable) return unreadableVerdict("Log secret pattern query (NRQL over Log)", data.logSecretMatches, "a NRQL search over Log for password, token, API key, and private key patterns in every account.");
+    if (secretMatchCount > 0) return verdict("fail", `${secretMatchCount} log messages in the last day matched credential or token patterns across ${accountCount} accounts.`);
+    if (!logVolumeReadable) {
+      return manualVerdict(`No log messages matched credential patterns, but the log volume query failed (${causeOf(data.logVolume)}), so it is unknown whether any logs were available to evaluate. Collect a NRQL count over Log for the last day in every account.`);
+    }
+    if (logCount === 0) {
+      return manualVerdict(`No log events were ingested in the last day across ${accountCount} accounts, so plaintext secret exposure could not be evaluated; emptiness is unknown rather than compliant. Confirm whether logs are forwarded to New Relic.`);
+    }
+    return verdict("pass", `${logCount} log events in the last day contained no messages matching credential or token patterns.`);
+  };
+
+  const control16 = (): Verdict => {
+    if (!infraReadable) {
+      return manualVerdict(`Infrastructure host counts were not readable (${causeOf(data.infraHosts)}). Agent transport settings are not exposed by the API: collect newrelic-infra.yml from a representative host and confirm HTTPS endpoints, proxy_validate_certificates, and ca_bundle settings, and that the agent version is current.`);
+    }
+    return manualVerdict(reportingHosts > 0
+      ? `${reportingHosts} infrastructure hosts are reporting across ${agentVersions.length} agent versions. Agent transport settings are not exposed by the API: collect newrelic-infra.yml from a representative host per version and confirm HTTPS endpoints, proxy_validate_certificates, and ca_bundle settings, and that the agent version is current.`
+      : "No reporting infrastructure hosts were found. If infrastructure agents are deployed, collect newrelic-infra.yml from a representative host and confirm TLS and proxy settings.");
+  };
+
   const findings: NewrelicFinding[] = [];
 
-  findings.push(finding(
-    11,
-    data.retentionRules.error
-      ? "manual"
-      : shortRetentionRules.length > 0
-        ? "fail"
-        : retentionRules.length === 0
-          ? "warn"
-          : "pass",
-    data.retentionRules.error
-      ? "Data retention rules were not readable. Record the retention per data type from Administration > Data management > Data retention for every account."
-      : shortRetentionRules.length > 0
-        ? `${shortRetentionRules.length}/${retentionRules.length} active retention rules keep data for less than ${minRetentionDays} days.`
-        : retentionRules.length === 0
-          ? `No custom retention rules exist across ${data.accountIds.length} accounts, so New Relic default retention applies to all ${data.retentionNamespaces.data.length} customizable namespaces. Confirm the defaults meet the ${minRetentionDays}-day requirement.`
-          : `All ${retentionRules.length} active retention rules keep data for at least ${minRetentionDays} days.`,
-    {
-      min_retention_days: minRetentionDays,
-      active_rules: sample(retentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`), 50),
-      short_retention_rules: sample(shortRetentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`)),
-      customizable_namespaces: data.retentionNamespaces.data.length,
-    },
-  ));
+  findings.push(finding(11, limitCoverage(control11(), retentionCoverage), {
+    min_retention_days: minRetentionDays,
+    active_rules: sample(retentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`), 50),
+    short_retention_rules: sample(shortRetentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`)),
+    rules_without_retention_days: rulesWithoutRetentionDays.length,
+    customizable_namespaces: data.retentionNamespaces.data.length,
+    namespaces_without_rules: sample(namespacesWithoutRules.map((row) => asString(row.namespace) ?? "namespace"), 50),
+  }));
 
-  findings.push(finding(
-    12,
-    data.obfuscationRules.error
-      ? "manual"
-      : enabledObfuscationRules.length === 0
-        ? "fail"
-        : !credentialCoverage || !piiCoverage
-          ? "warn"
-          : "pass",
-    data.obfuscationRules.error
-      ? "Log obfuscation rules were not readable. Record the rules and expressions shown in Logs > Obfuscation for every account."
-      : enabledObfuscationRules.length === 0
-        ? `No enabled log obfuscation rules exist across ${data.accountIds.length} accounts${logCount > 0 ? ` while ${logCount} log events were ingested in the last day` : ""}.`
-        : !credentialCoverage || !piiCoverage
-          ? `${enabledObfuscationRules.length} enabled obfuscation rules exist, but the ${obfuscationExpressions.length} expressions do not clearly cover ${!credentialCoverage ? "credentials or tokens" : "PII"}.`
-          : `${enabledObfuscationRules.length} enabled obfuscation rules and ${obfuscationExpressions.length} expressions cover credential and PII patterns; ${attributeDropRules.length} pipeline rules also drop sensitive attributes.`,
-    {
-      obfuscation_rules: obfuscationRules.length,
-      enabled_obfuscation_rules: enabledObfuscationRules.length,
-      obfuscation_expressions: sample(obfuscationExpressions.map((expression) => asString(expression.name) ?? "expression")),
-      credential_coverage: credentialCoverage,
-      pii_coverage: piiCoverage,
-      pipeline_cloud_rules: cloudRules.length,
-      legacy_drop_rules: dropRules.length,
-      attribute_drop_rules: attributeDropRules.length,
-    },
-  ));
+  findings.push(finding(12, limitCoverage(control12(), obfuscationCoverage), {
+    obfuscation_rules: obfuscationRules.length,
+    enabled_obfuscation_rules: enabledObfuscationRules.length,
+    obfuscation_rules_without_enabled_flag: obfuscationRulesWithoutEnabledFlag.length,
+    obfuscation_expressions: sample(obfuscationExpressions.map((expression) => asString(expression.name) ?? "expression")),
+    credential_coverage: credentialCoverage,
+    pii_coverage: piiCoverage,
+    log_events_last_day: logCount,
+    pipeline_cloud_rules: cloudRulesReadable ? cloudRules.length : null,
+    pipeline_control_status: cloudRulesReadable ? "readable" : `not available: ${causeOf(data.cloudRules)}`,
+    legacy_drop_rules: dropRulesReadable ? dropRules.length : null,
+    legacy_drop_rules_status: dropRulesReadable ? "readable" : `not available: ${causeOf(data.dropRules)}`,
+    attribute_drop_rules: attributeDropRules.length,
+  }));
 
-  findings.push(finding(
-    13,
-    scriptsWithSecrets.length > 0
-      ? "fail"
-      : scriptedMonitors.length === 0
-        ? "pass"
-        : data.syntheticScripts.error
-          ? "manual"
-          : scriptsUsingSecureCredentials.length === 0 && secureCredentials.length === 0
-            ? "warn"
-            : "pass",
-    scriptsWithSecrets.length > 0
-      ? `${scriptsWithSecrets.length}/${scripts.length} sampled scripted monitors contain hardcoded credential patterns (${[...new Set(scriptsWithSecrets.flatMap((script) => asArray(script.secretIndicators).map(String)))].join(", ")}).`
-      : scriptedMonitors.length === 0
-        ? `No scripted synthetic monitors exist across ${monitors.length} monitors, so there are no scripts to review.`
-        : data.syntheticScripts.error
-          ? `${scriptedMonitors.length} scripted monitors exist but their scripts were not readable. Open each script in Synthetic monitoring and confirm credentials come from secure credentials ($secure.NAME).`
-          : scriptsUsingSecureCredentials.length === 0 && secureCredentials.length === 0
-            ? `${scripts.length} sampled scripts contain no obvious hardcoded secrets, but no secure credentials exist and no script references $secure.*, so credential handling should be confirmed.`
-            : `${scripts.length} sampled scripts contain no hardcoded credential patterns; ${scriptsUsingSecureCredentials.length} reference secure credentials and ${secureCredentials.length} secure credentials are stored.`,
-    {
-      monitors: monitors.length,
-      scripted_monitors: scriptedMonitors.length,
-      scripts_sampled: scripts.length,
-      scripts_with_secret_indicators: sample(scriptsWithSecrets.map((script) => `${asString(script.name) ?? asString(script.guid)}: ${asArray(script.secretIndicators).join(", ")}`)),
-      scripts_using_secure_credentials: scriptsUsingSecureCredentials.length,
-      secure_credentials: secureCredentials.length,
-    },
-  ));
+  findings.push(finding(13, limitCoverage(control13(), monitorCoverage), {
+    monitors: monitors.length,
+    monitor_types: monitorTypeCounts,
+    monitors_without_type: monitorsWithoutType.length,
+    scripted_monitors: scriptedMonitors.length,
+    scripts_sampled: scripts.length,
+    scripts_sample_complete: isComplete(data.syntheticScripts),
+    scripts_with_secret_indicators: sample(scriptsWithSecrets.map((script) => `${asString(script.name) ?? asString(script.guid)}: ${asArray(script.secretIndicators).join(", ")}`)),
+    scripts_using_secure_credentials: scriptsUsingSecureCredentials.length,
+    secure_credentials: secureCredentials.length,
+  }));
 
-  findings.push(finding(
-    14,
-    data.dashboards.error
-      ? "manual"
-      : liveUrls.length > 0
-        ? "fail"
-        : publicReadWriteDashboards.length > 0
-          ? "warn"
-          : "pass",
-    data.dashboards.error
-      ? "Dashboards were not readable. Review dashboard permissions and public sharing links in the Dashboards UI manually."
-      : liveUrls.length > 0
-        ? `${dashboardLiveUrls.length} dashboards and ${widgetLiveUrls.length} widgets are shared through public live URLs that anyone with the link can open; ${publicReadWriteDashboards.length}/${dashboards.length} dashboards also allow every account user to edit.`
-        : publicReadWriteDashboards.length > 0
-          ? `${publicReadWriteDashboards.length}/${dashboards.length} dashboards grant edit access to everyone in the account (PUBLIC_READ_WRITE) and no public live URLs are visible to this user.`
-          : `${dashboards.length} dashboards use read-only or private permissions and no public live URLs are visible to this user.`,
-    {
-      dashboards: dashboards.length,
-      public_read_write_dashboards: sample(publicReadWriteDashboards.map((dashboard) => asString(dashboard.name) ?? "dashboard")),
-      private_dashboards: privateDashboards.length,
-      public_live_urls: liveUrls.length,
-      public_dashboard_live_urls: sample(dashboardLiveUrls.map((liveUrl) => liveUrl.title || "untitled dashboard")),
-      public_widget_live_urls: widgetLiveUrls.length,
-      live_url_visibility_note: "liveUrls only lists public links visible to the authenticated user; link values are intentionally not collected.",
-    },
-  ));
+  findings.push(finding(14, limitCoverage(control14(), dashboardCoverage), {
+    dashboards: dashboards.length,
+    dashboards_reported_total: data.dashboards.total ?? null,
+    public_read_write_dashboards: sample(publicReadWriteDashboards.map((dashboard) => asString(dashboard.name) ?? "dashboard")),
+    private_dashboards: privateDashboards.length,
+    dashboards_without_permissions: dashboardsWithoutPermissions.length,
+    public_live_urls: liveUrls.length,
+    live_urls_readable: liveUrlsReadable,
+    public_dashboard_live_urls: sample(dashboardLiveUrls.map((liveUrl) => liveUrl.title || "untitled dashboard")),
+    public_widget_live_urls: widgetLiveUrls.length,
+    live_url_visibility_note: "liveUrls only lists public links visible to the authenticated user; link values are intentionally not collected.",
+  }));
 
-  findings.push(finding(
-    15,
-    data.logSecretMatches.error
-      ? "manual"
-      : secretMatchCount > 0
-        ? "fail"
-        : logCount === 0
-          ? "warn"
-          : "pass",
-    data.logSecretMatches.error
-      ? "Log data could not be queried for secret patterns. Run a NRQL search over Log for password, token, API key, and private key patterns manually."
-      : secretMatchCount > 0
-        ? `${secretMatchCount} log messages in the last day matched credential or token patterns across ${data.accountIds.length} accounts.`
-        : logCount === 0
-          ? "No log events were ingested in the last day, so plaintext secret exposure in logs could not be evaluated."
-          : `${logCount} log events in the last day contained no messages matching credential or token patterns.`,
-    {
-      log_events_last_day: logCount,
-      secret_pattern_matches: secretMatchCount,
-      nrql_pattern: LOG_SECRET_NRQL_PATTERN,
-    },
-  ));
+  findings.push(finding(15, limitCoverage(control15(), logCoverage), {
+    log_events_last_day: logCount,
+    log_volume_readable: logVolumeReadable,
+    secret_pattern_matches: secretMatchCount,
+    nrql_pattern: LOG_SECRET_NRQL_PATTERN,
+  }));
 
-  findings.push(finding(
-    16,
-    "manual",
-    reportingHosts > 0
-      ? `${reportingHosts} infrastructure hosts are reporting across ${agentVersions.length} agent versions. Agent transport settings are not exposed by the API: collect newrelic-infra.yml from a representative host per version and confirm HTTPS endpoints, proxy_validate_certificates, and ca_bundle settings, and that the agent version is current.`
-      : "No reporting infrastructure hosts were found. If infrastructure agents are deployed, collect newrelic-infra.yml from a representative host and confirm TLS and proxy settings.",
-    {
-      reporting_hosts: reportingHosts,
-      agent_versions: sample(agentVersions, 50),
-      manual_evidence: "newrelic-infra.yml (or fleet configuration) showing proxy, proxy_validate_certificates, ca_bundle_file, and agent version for each host group.",
-    },
-  ));
+  findings.push(finding(16, control16(), {
+    reporting_hosts: reportingHosts,
+    agent_versions: sample(agentVersions, 50),
+    manual_evidence: "newrelic-infra.yml (or fleet configuration) showing proxy, proxy_validate_certificates, ca_bundle_file, and agent version for each host group.",
+  }));
 
   const allCollected = [
     data.retentionRules,
@@ -2834,6 +3249,15 @@ export function assessNewrelicDataGovernanceData(
     data.logSecretMatches,
     data.infraHosts,
     data.infraAgentVersions,
+  ];
+  const coverage = [
+    ...retentionCoverage,
+    ...obfuscationCoverage,
+    ...coverageNotes([["pipeline cloud rules", data.cloudRules], ["legacy drop rules", data.dropRules]]),
+    ...dashboardCoverage,
+    ...monitorCoverage,
+    ...logCoverage,
+    ...coverageNotes([["infrastructure hosts", data.infraHosts], ["agent versions", data.infraAgentVersions]]),
   ];
 
   return {
@@ -2853,9 +3277,11 @@ export function assessNewrelicDataGovernanceData(
       log_secret_pattern_matches: secretMatchCount,
       reporting_hosts: reportingHosts,
       collection_errors: collectedErrors(allCollected).length,
+      coverage_limitations: coverage.length,
     },
     findings,
     errors: collectedErrors(allCollected),
+    coverage,
     coreData: {
       "core_data/retention_rules.json": data.retentionRules.data,
       "core_data/retention_namespaces.json": data.retentionNamespaces.data,
@@ -2930,6 +3356,9 @@ function formatAssessmentText(result: NewrelicAssessmentResult): string {
   ];
   if (result.errors.length > 0) {
     lines.push("", "Partial collection warnings:", ...result.errors.map((error) => `- ${error}`));
+  }
+  if (result.coverage.length > 0) {
+    lines.push("", "Coverage limitations (verdicts capped at warn or manual):", ...result.coverage.map((note) => `- ${note}`));
   }
   return lines.join("\n");
 }
@@ -3007,6 +3436,13 @@ function buildExecutiveSummary(
     lines.push("", "## Partial Collection Warnings", "");
     for (const error of errors) {
       lines.push(`- ${error}`);
+    }
+  }
+  const coverage = [...new Set(assessments.flatMap((assessment) => assessment.coverage))];
+  if (coverage.length > 0) {
+    lines.push("", "## Coverage Limitations", "", "Verdicts affected by these limits were capped at warn or manual instead of pass.", "");
+    for (const note of coverage) {
+      lines.push(`- ${note}`);
     }
   }
   return `${lines.join("\n")}\n`;
@@ -3105,6 +3541,7 @@ export async function exportNewrelicAuditBundle(
       summary: assessment.summary,
       findings: assessment.findings,
       errors: assessment.errors,
+      coverage: assessment.coverage,
     }));
   }
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));

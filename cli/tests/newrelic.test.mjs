@@ -253,7 +253,10 @@ function dataGovernanceClient(overrides = {}) {
       return [111];
     },
     async listEventRetentionRules() {
-      return [{ id: "rule-1", namespace: "Log", retentionInDays: 90, createdAt: secondsAgo(100), deletedAt: null }];
+      return [
+        { id: "rule-1", namespace: "Log", retentionInDays: 90, createdAt: secondsAgo(100), deletedAt: null },
+        { id: "rule-2", namespace: "Transaction", retentionInDays: 120, createdAt: secondsAgo(100), deletedAt: null },
+      ];
     },
     async listRetentionNamespaces() {
       return [{ namespace: "Log" }, { namespace: "Transaction" }];
@@ -448,7 +451,9 @@ test("NewrelicApiClient posts NerdGraph queries with the Api-Key header and foll
   const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
   const domains = await client.listAuthenticationDomains();
 
-  assert.deepEqual(domains.map((domain) => domain.id), ["domain-1", "domain-2"]);
+  assert.deepEqual(domains.items.map((domain) => domain.id), ["domain-1", "domain-2"]);
+  assert.equal(domains.complete, true);
+  assert.equal(domains.totalCount, 2);
   assert.equal(seen.length, 2);
   assert.equal(seen[0].url, "https://api.newrelic.com/graphql");
   assert.equal(seen[0].method, "POST");
@@ -557,7 +562,8 @@ test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header
   const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
   const users = await client.listRestUsers();
 
-  assert.deepEqual(users.map((item) => item.id), [1, 2]);
+  assert.deepEqual(users.items.map((item) => item.id), [1, 2]);
+  assert.equal(users.complete, true);
   assert.equal(seen[0].pathname, "/v2/users.json");
   assert.equal(seen[0].method, "GET");
   assert.equal(seen[0].apiKey, TEST_KEY);
@@ -577,7 +583,10 @@ test("NewrelicApiClient paginates keySearch with a cursor and scopes it to accou
   const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
   const keys = await client.listApiKeys(["USER", "INGEST"], [111]);
 
-  assert.deepEqual(keys.map((key) => key.id), ["key-1", "key-2"]);
+  assert.deepEqual(keys.items.map((key) => key.id), ["key-1", "key-2"]);
+  assert.equal(keys.complete, true);
+  assert.equal(keys.totalCount, 2);
+  assert.equal(keys.note, undefined);
   assert.deepEqual(seen[0].variables.query, { types: ["USER", "INGEST"], scope: { accountIds: [111] } });
   assert.match(seen[0].query, /keySearch\(query: \$query, cursor: \$cursor\)/);
   assert.equal(seen[1].variables.cursor, "keys-2");
@@ -591,12 +600,15 @@ test("NewrelicApiClient falls back to a single-page keySearch when the cursor ar
     if (body.query.includes("cursor: $cursor")) {
       return jsonResponse({ errors: [{ message: 'Unknown argument "cursor" on field "ApiAccessActorStitchedFields.keySearch".' }] });
     }
-    return jsonResponse({ data: { actor: { apiAccess: { keySearch: { count: 1, keys: [{ id: "key-1", name: "user", type: "USER" }] } } } } });
+    return jsonResponse({ data: { actor: { apiAccess: { keySearch: { count: 3, keys: [{ id: "key-1", name: "user", type: "USER" }] } } } } });
   };
   const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
   const keys = await client.listApiKeys(["USER"]);
 
-  assert.deepEqual(keys.map((key) => key.id), ["key-1"]);
+  assert.deepEqual(keys.items.map((key) => key.id), ["key-1"]);
+  assert.equal(keys.complete, false);
+  assert.equal(keys.totalCount, 3);
+  assert.match(keys.note, /rejected the cursor argument.*1 of 3 keys/);
   assert.equal(seen.length, 2);
   assert.doesNotMatch(seen[1], /cursor/);
 });
@@ -608,7 +620,7 @@ test("NewrelicApiClient surfaces dashboard live URL errors and omits link values
     return jsonResponse({ data: { actor: { dashboard: { liveUrls: { liveUrls: [{ title: "Ops", type: "DASHBOARD", createdAt: NOW }], errors: null } } } } });
   };
   const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
-  assert.deepEqual(await client.listDashboardLiveUrls(), [{ title: "Ops", type: "DASHBOARD", createdAt: NOW }]);
+  assert.deepEqual(await client.listDashboardLiveUrls(), { items: [{ title: "Ops", type: "DASHBOARD", createdAt: NOW }], complete: true });
 
   const failing = new NewrelicApiClient(sampleConfig(), {
     fetchImpl: async () => jsonResponse({ data: { actor: { dashboard: { liveUrls: { liveUrls: [], errors: [{ description: "Live URL listing is not permitted" }] } } } } }),
@@ -746,9 +758,11 @@ test("assessNewrelicIdentity passes a SCIM-provisioned SSO domain with active, m
   assert.equal(findingStatus(result, "NR-01-SSO-ENFORCEMENT"), "pass");
   assert.equal(findingStatus(result, "NR-02-USER-TYPE-LEAST-PRIVILEGE"), "pass");
   assert.equal(findingStatus(result, "NR-03-ADMIN-MINIMIZATION"), "pass");
-  assert.equal(findingStatus(result, "NR-18-AUTH-DOMAIN-CONFIGURATION"), "pass");
+  assert.equal(findingStatus(result, "NR-18-AUTH-DOMAIN-CONFIGURATION"), "manual");
+  assert.match(findingById(result, "NR-18-AUTH-DOMAIN-CONFIGURATION").summary, /provision users through SCIM .*Session duration and user upgrade approval settings are not exposed/);
   assert.equal(findingStatus(result, "NR-19-INACTIVE-USER-ACCOUNTS"), "pass");
   assert.equal(result.errors.length, 0);
+  assert.deepEqual(result.coverage, []);
   assert.equal(result.summary.users, 3);
   assert.equal(result.summary.admin_users, 1);
   assert.ok(result.findings.every((item) => item.mappings.length === 8));
