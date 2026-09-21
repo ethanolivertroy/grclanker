@@ -1745,9 +1745,12 @@ test("self-check (c): partial inventories never pass an inventory-driven control
   }
   assert.equal(byId["GITHUB-ACT-004"].status, "Manual");
   assert.equal(byId["GITHUB-CODE-001"].status, "Manual");
+  // Corollary round: the defaults endpoint is the primary inventory, so the deprecated flag cannot
+  // lift these above Manual while it is unreadable (previously Partial).
   for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004"]) {
-    assert.equal(byId[id].status, "Partial", `${id} must not pass on the deprecated flag while the default configurations are unreadable`);
-    assert.match(byId[id].summary, /enforcement is unverified/);
+    assert.equal(byId[id].status, "Manual", `${id} must not pass on the deprecated flag while the default configurations are unreadable`);
+    assert.match(byId[id].summary, /default code security configurations \(GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\) were not readable/);
+    assert.match(byId[id].summary, /deprecated organization flag reports .* enabled for new repositories, but it only corroborates/);
   }
   assert.equal(byId["GITHUB-CODE-005"].status, "Manual");
   assert.equal(byId["GITHUB-INTEG-001"].status, "Partial");
@@ -1897,7 +1900,7 @@ test("self-check (e): unenforced pilot configurations never pass the code securi
     codeSecurityDefaults: dataset([], "HTTP 403"),
   });
   for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004"]) {
-    assert.equal(flagsOnly[id].status, "Partial", `${id} must not pass on the deprecated flag alone`);
+    assert.equal(flagsOnly[id].status, "Manual", `${id} must not pass on the deprecated flag alone`);
   }
   assert.equal(flagsOnly["GITHUB-CODE-005"].status, "Manual");
   assert.equal(flagsOnly["GITHUB-CODE-001"].status, "Manual");
@@ -2628,7 +2631,7 @@ test("corollary hit 12: CODE-001 demotes when the default assignments are unread
   assert.doesNotMatch(sweepText(finding), /0 default assignment|default_configurations = 0/);
   for (const id of CODE_DEFAULT_IDS) {
     assert.equal(byId[id].status, "Manual", `${id} is Manual when its primary inventory is unreadable`);
-    assert.match(byId[id].summary, /default code security configurations \(GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\) was not readable: GitHub request failed \(403\)/);
+    assert.match(byId[id].summary, /default code security configurations \(GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\) were not readable: GitHub request failed \(403\)/);
   }
 });
 

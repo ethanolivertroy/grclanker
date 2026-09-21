@@ -1098,8 +1098,9 @@ function nullEvidence(field: string, endpoint: string, error: string | undefined
 }
 
 // Summary clause for the same situation: "<label> (<endpoint>) was not readable: <error>".
-function unreadableClause(label: string, endpoint: string, error: string | undefined): string {
-  return `${label} (${endpoint}) was not readable: ${error ?? "no data returned"}`;
+// Pass plural for labels such as "organization roles" so the verb agrees.
+function unreadableClause(label: string, endpoint: string, error: string | undefined, plural = false): string {
+  return `${label} (${endpoint}) ${plural ? "were" : "was"} not readable: ${error ?? "no data returned"}`;
 }
 
 // Renders the request target without the base URL or the per_page pagination knob so the path
@@ -2746,11 +2747,15 @@ function assessSamlSso(data: GitHubOrgAccessData): GitHubFinding {
   const recommendation = "Configure SAML SSO (or enterprise-level SSO with EMU), require SSO for the organization, and make sure every member has a linked external identity.";
   const snapshot = data.samlIdentity.data;
   if (data.samlIdentity.error || !snapshot) {
+    const failure = data.samlIdentity.error ?? "no data returned";
     return buildFinding(
       "GITHUB-ORG-006",
       "Manual",
-      "The tool could not query the organization SAML identity provider through GraphQL.",
-      [`graphql_error = ${data.samlIdentity.error ?? "no data returned"}`],
+      `The organization SAML identity provider query (GraphQL organization.samlIdentityProvider) was not readable, so SSO status is unverified: ${failure}`,
+      [
+        `organization.samlIdentityProvider = null (GraphQL organization.samlIdentityProvider unreadable: ${failure})`,
+        "external_identities_linked_to_members = null (externalIdentities were not collected)",
+      ],
       recommendation,
       "Confirm SAML SSO status in Settings > Authentication security with an org owner token that is SSO-authorized.",
     );
@@ -2915,11 +2920,12 @@ function assessEnterpriseManagedUsers(data: GitHubOrgAccessData): GitHubFinding 
 
   const snapshot = data.enterpriseIdentity.data;
   if (!snapshot.ownerInfo) {
+    const failure = describeGraphqlErrors(snapshot.errors) || "ownerInfo returned null without a GraphQL error";
     return buildFinding(
       "GITHUB-ORG-007",
       "Manual",
-      `enterprise.ownerInfo for ${snapshot.slug} was not readable, so EMU status is unverified.`,
-      [`graphql errors = ${describeGraphqlErrors(snapshot.errors) || "ownerInfo returned null"}`],
+      `enterprise.ownerInfo for ${snapshot.slug} was not readable: ${failure}; EMU status is unverified.`,
+      [`enterprise.ownerInfo = null (GraphQL enterprise(slug).ownerInfo unreadable: ${failure})`],
       recommendation,
       "ownerInfo is visible only to enterprise owners or their classic PATs with read:enterprise or admin:enterprise.",
     );
@@ -2986,10 +2992,16 @@ function assessIpAllowList(data: GitHubOrgAccessData): GitHubFinding {
     );
   }
   const activeEntries = snapshot.entries.filter((entry) => asBoolean(entry.isActive) === true);
+  // The entries connection returned null with a pathed error and nothing was collected: the
+  // count is unknown, not zero (rule 1 corollary).
+  const entriesErrors = graphqlErrorsForPath(errors, ["organization", "ipAllowListEntries"]);
+  const entriesUnreadable = entriesErrors.length > 0 && snapshot.entries.length === 0 && snapshot.entriesTotalCount === null;
   const evidence = [
     `ipAllowListEnabledSetting = ${snapshot.ipAllowListEnabledSetting}`,
     `ipAllowListForInstalledAppsEnabledSetting = ${snapshot.ipAllowListForInstalledAppsEnabledSetting ?? "null"}`,
-    `ip_allow_list_entries = ${snapshot.entries.length} (active ${activeEntries.length}, totalCount ${snapshot.entriesTotalCount ?? "unknown"}${snapshot.entriesTruncated ? ", truncated" : ""})`,
+    entriesUnreadable
+      ? `ip_allow_list_entries = null (GraphQL organization.ipAllowListEntries unreadable: ${describeGraphqlErrors(entriesErrors)})`
+      : `ip_allow_list_entries = ${snapshot.entries.length} (active ${activeEntries.length}, totalCount ${snapshot.entriesTotalCount ?? "unknown"}${snapshot.entriesTruncated ? ", truncated" : ""})`,
     ...activeEntries.slice(0, 10).map((entry) => `entry ${asString(entry.allowListValue) ?? "?"} (${asString(entry.name) ?? "unnamed"}, created ${asString(entry.createdAt) ?? "unknown"})`),
   ];
   if (snapshot.ipAllowListEnabledSetting !== "ENABLED") {
@@ -2999,6 +3011,16 @@ function assessIpAllowList(data: GitHubOrgAccessData): GitHubFinding {
       `The organization IP allow list is ${snapshot.ipAllowListEnabledSetting}.`,
       evidence,
       recommendation,
+    );
+  }
+  if (entriesUnreadable) {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Partial",
+      `The IP allow list is enabled, but the organization.ipAllowListEntries inventory was not readable (GraphQL errors: ${describeGraphqlErrors(entriesErrors)}), so coverage cannot be confirmed.`,
+      [...evidence, `graphql errors = ${describeGraphqlErrors(errors)}`],
+      recommendation,
+      "Rerun with an org owner principal or review the allow list entries in the organization security settings UI.",
     );
   }
   if (errors.length > 0 || snapshot.entriesTruncated) {
@@ -3816,7 +3838,7 @@ export function assessGitHubOrgAccess(
         : (adminCount === 0
           ? "The tool did not find any explicit organization admins, which is unexpected because every organization has at least one owner."
           : (organizationRolesUnreadable
-            ? `${adminCount} org admin member(s) were identified, but the ${unreadableClause("organization roles", ORG_ENDPOINTS.organizationRoles, data.organizationRoles.error)}; delegated privileges are unverified.`
+            ? `${adminCount} org admin member(s) were identified, but the ${unreadableClause("organization roles", ORG_ENDPOINTS.organizationRoles, data.organizationRoles.error, true)}; delegated privileges are unverified.`
             : `${adminCount} org admin member(s) and ${organizationRoleCount} organization role(s) were identified.`)),
       [
         adminsUnreadable
@@ -4368,10 +4390,10 @@ export function assessGitHubActionsSecurity(
   }).length;
 
   const permissionsUnreadable = (field: string): string => (data.actionsPermissions.error
-    ? `The ${unreadableClause("Actions permissions", ORG_ENDPOINTS.actionsPermissions, data.actionsPermissions.error)}; ${field} is unverified.`
+    ? `The ${unreadableClause("Actions permissions", ORG_ENDPOINTS.actionsPermissions, data.actionsPermissions.error, true)}; ${field} is unverified.`
     : `The ${ORG_ENDPOINTS.actionsPermissions} response did not include ${field}, so it is unverified.`);
   const workflowUnreadable = (field: string): string => (data.workflowPermissions.error
-    ? `The ${unreadableClause("workflow permissions", ORG_ENDPOINTS.workflowPermissions, data.workflowPermissions.error)}; ${field} is unverified.`
+    ? `The ${unreadableClause("workflow permissions", ORG_ENDPOINTS.workflowPermissions, data.workflowPermissions.error, true)}; ${field} is unverified.`
     : `The ${ORG_ENDPOINTS.workflowPermissions} response did not include ${field}, so it is unverified.`);
   const allowedActionsConstrained = allowedActions === "selected" || allowedActions === "local_only";
   const selectedActionsGap = allowedActions === "selected" && data.selectedActions.error
@@ -4553,20 +4575,15 @@ function evaluateCodeSecurityDefault(data: GitHubCodeSecurityData, feature: Code
   const withFlag = (lines: string[]): string[] => (flagEvidence ? [...lines, flagEvidence] : lines);
   const defaultsDataset = data.codeSecurityDefaults;
 
+  // The defaults endpoint is the primary inventory for these findings, so when it is unreadable the
+  // verdict is Manual whatever the deprecated flag says; the flag is kept as corroborating evidence.
   if (defaultsDataset.error) {
-    const defaultsClause = unreadableClause("default code security configurations", ORG_ENDPOINTS.codeSecurityDefaults, defaultsDataset.error);
+    const defaultsClause = unreadableClause("default code security configurations", ORG_ENDPOINTS.codeSecurityDefaults, defaultsDataset.error, true);
     const evidence = withFlag([nullEvidence("default_configurations", ORG_ENDPOINTS.codeSecurityDefaults, defaultsDataset.error)]);
-    if (orgFlag === true) {
-      return {
-        status: "Partial",
-        detail: `The deprecated organization flag reports ${feature.label} enabled for new repositories, but the ${defaultsClause}; enforcement is unverified.`,
-        evidence,
-      };
-    }
-    if (orgFlag === false) {
-      return { status: "Fail", detail: `The organization flag reports ${feature.label} disabled for new repositories and the ${defaultsClause}.`, evidence };
-    }
-    return { status: "Manual", detail: `The ${defaultsClause}; ${feature.label} defaults are unverified.`, evidence };
+    const flagNote = orgFlag === undefined
+      ? ""
+      : ` The deprecated organization flag reports ${feature.label} ${orgFlag ? "enabled" : "disabled"} for new repositories, but it only corroborates the defaults and cannot carry the verdict.`;
+    return { status: "Manual", detail: `The ${defaultsClause}; ${feature.label} defaults are unverified.${flagNote}`, evidence };
   }
 
   const entries = readCodeSecurityDefaultEntries(defaultsDataset.data);
@@ -4690,7 +4707,7 @@ export function assessGitHubCodeSecurity(
   });
   const manualIf = (status: CodeSecurityDefaultStatus): string | undefined =>
     (status === "Manual" ? CODE_SECURITY_DEFAULT_MANUAL_NOTE : undefined);
-  const defaultsClause = unreadableClause("default assignments", ORG_ENDPOINTS.codeSecurityDefaults, defaultsDataset.error);
+  const defaultsClause = unreadableClause("default assignments", ORG_ENDPOINTS.codeSecurityDefaults, defaultsDataset.error, true);
   const configurationsStatus: GitHubFindingStatus = configsDataset.error
     ? "Manual"
     : (configs.length === 0
