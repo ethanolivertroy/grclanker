@@ -6,23 +6,47 @@
  * `app_private_key`, Zoom and Vanta `client_secret`, Duo `skey`, ...), so any
  * activity line that echoes a tool input has to go through here first.
  */
+import { Buffer } from "node:buffer";
 
 export const REDACTED_VALUE = "[redacted]";
 
-// Matched against each argument name, case-insensitively, at any depth. The
-// Duo integration and secret keys (`ikey`, `skey`) are listed by name.
-const SENSITIVE_KEY_PATTERN = /token|secret|pass(?:word|wd|phrase)|private_?key|api_?key|credential|authorization|assertion|^[is]key$/i;
+// Names shaped like thresholds, durations, counts, or file references are
+// never credentials (`max_keys`, `token_limit`, `stale_token_days`,
+// `credentials_file`, `app_private_key_path`) and stay visible.
+const SAFE_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
+
+// Words that name a credential wherever they appear inside a key. The last
+// alternative covers concatenated spellings such as `apikey` or `privatekey`,
+// which the segment rule below cannot see.
+const SENSITIVE_SUBSTRING_PATTERN =
+  /token|secret|passw|passphrase|passcode|credential|authorization|assertion|bearer|hmac|signature|kubeconfig|connection[_-]?string|webhook[_-]?url|session[_-]?id|auth[_-]?header|basic[_-]?auth|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)[_-]?keys?/i;
+
+// Short words that only count as whole segments of a key (`api_key`, `pin_code`,
+// `sas_url`, Duo's `ikey` and `skey`), never as substrings (`keyword`, `monkey`).
+const SENSITIVE_KEY_SEGMENTS = new Set(["key", "keys", "pin", "otp", "totp", "jwt", "dsn", "sas", "pem", "cookie", "cookies", "ikey", "skey"]);
 
 // Pi's `validateToolArguments` appends the raw payload after this marker.
 const ECHOED_ARGUMENTS_MARKER = "Received arguments:";
 
 export const ARGUMENTS_WITHHELD_NOTE = "(arguments withheld)";
 
-// Shorter values are not scrubbed from free text: they are too likely to be
-// ordinary substrings, and structural redaction already covers them.
+// A value (or one of its forms) this long is scrubbed wherever it appears.
 const MIN_SCRUBBED_VALUE_LENGTH = 8;
 
+// Shorter values are scrubbed only as whole tokens, so a four-digit passcode
+// disappears from "passcode 4711 rejected" but ordinary substrings survive.
+// Anything shorter than this is not scrubbed at all.
+const MIN_WHOLE_TOKEN_VALUE_LENGTH = 4;
+
+const TOKEN_CHARACTER = /[A-Za-z0-9]/;
+
 type SchemaNode = Record<string, unknown>;
+
+interface ScrubNeedle {
+  text: string;
+  lower: string;
+  wholeToken: boolean;
+}
 
 function asSchemaNode(value: unknown): SchemaNode | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -35,9 +59,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+function keySegments(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
 /** True when an argument name looks like it carries a credential. */
 export function isSensitiveArgumentKey(key: string): boolean {
-  return SENSITIVE_KEY_PATTERN.test(key);
+  if (SAFE_SHAPE_PATTERN.test(key)) return false;
+  if (SENSITIVE_SUBSTRING_PATTERN.test(key)) return true;
+  return keySegments(key).some((segment) => SENSITIVE_KEY_SEGMENTS.has(segment));
 }
 
 /**
@@ -82,13 +116,17 @@ export function redactSensitiveArguments(value: unknown, schema?: unknown): unkn
   return redacted;
 }
 
-function collectStrings(value: unknown, out: Set<string>): void {
+function collectScalars(value: unknown, out: Set<string>): void {
   if (typeof value === "string") {
-    if (value.length >= MIN_SCRUBBED_VALUE_LENGTH) out.add(value);
+    if (value.length >= MIN_WHOLE_TOKEN_VALUE_LENGTH) out.add(value);
+  } else if (typeof value === "number" || typeof value === "bigint") {
+    // A numeric secret echoes in its decimal form, which is what JSON.stringify prints too.
+    const text = String(value);
+    if (text.length >= MIN_WHOLE_TOKEN_VALUE_LENGTH) out.add(text);
   } else if (Array.isArray(value)) {
-    for (const item of value) collectStrings(item, out);
+    for (const item of value) collectScalars(item, out);
   } else if (isPlainObject(value)) {
-    for (const item of Object.values(value)) collectStrings(item, out);
+    for (const item of Object.values(value)) collectScalars(item, out);
   }
 }
 
@@ -100,15 +138,16 @@ function collectSensitive(value: unknown, schema: SchemaNode | undefined, out: S
   if (!isPlainObject(value)) return;
   for (const [key, entry] of Object.entries(value)) {
     const entrySchema = propertySchema(schema, key);
-    if (isSensitiveArgumentKey(key) || isSensitiveSchema(entrySchema)) collectStrings(entry, out);
+    if (isSensitiveArgumentKey(key) || isSensitiveSchema(entrySchema)) collectScalars(entry, out);
     else collectSensitive(entry, asSchemaNode(entrySchema), out);
   }
 }
 
 /**
- * Every string that `redactSensitiveArguments` would hide for this input
- * (including strings nested inside a sensitive object), so free text that
- * echoes the input, such as a tool's error message, can be scrubbed too.
+ * Every value that `redactSensitiveArguments` would hide for this input
+ * (including values nested inside a sensitive object, and numbers in their
+ * decimal form), so free text that echoes the input, such as a tool's error
+ * message, can be scrubbed too. Longest first.
  */
 export function collectSensitiveValues(value: unknown, schema?: unknown): string[] {
   const out = new Set<string>();
@@ -116,15 +155,97 @@ export function collectSensitiveValues(value: unknown, schema?: unknown): string
   return [...out].sort((left, right) => right.length - left.length);
 }
 
-/** Replace each value, raw or JSON-escaped (as inside a serialized payload), with `[redacted]`. */
-export function scrubSensitiveValues(text: string, values: readonly string[]): string {
-  let scrubbed = text;
+function urlEncoded(value: string): string | undefined {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The forms a tool might echo a secret in: as is, JSON-escaped (inside a
+ * serialized payload), URL-encoded, base64 (with and without padding, and
+ * URL-encoded) and base64url, re-flowed onto one line, and each individual
+ * line of a multi-line value such as a PEM key.
+ */
+export function scrubbedFormsOf(value: string): string[] {
+  const lines = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const bytes = Buffer.from(value, "utf8");
+  const base64 = bytes.toString("base64");
+  const forms = new Set<string>([
+    value,
+    JSON.stringify(value).slice(1, -1),
+    base64,
+    base64.replace(/=+$/, ""),
+    bytes.toString("base64url"),
+    lines.join(" "),
+    lines.join(""),
+    ...lines,
+  ]);
+  for (const encoded of [urlEncoded(value), urlEncoded(base64)]) {
+    if (encoded !== undefined) forms.add(encoded);
+  }
+  return [...forms];
+}
+
+function buildNeedles(values: readonly string[]): ScrubNeedle[] {
+  const seen = new Set<string>();
+  const needles: ScrubNeedle[] = [];
   for (const value of values) {
-    const escaped = JSON.stringify(value).slice(1, -1);
-    for (const needle of escaped === value ? [value] : [value, escaped]) {
-      scrubbed = scrubbed.split(needle).join(REDACTED_VALUE);
+    for (const form of scrubbedFormsOf(value)) {
+      const lower = form.toLowerCase();
+      if (form.length < MIN_WHOLE_TOKEN_VALUE_LENGTH || seen.has(lower)) continue;
+      seen.add(lower);
+      needles.push({ text: form, lower, wholeToken: form.length < MIN_SCRUBBED_VALUE_LENGTH });
     }
   }
+  return needles.sort((left, right) => right.text.length - left.text.length);
+}
+
+function isTokenBoundary(text: string, index: number): boolean {
+  return index < 0 || index >= text.length || !TOKEN_CHARACTER.test(text[index]);
+}
+
+/** Lower-case `text` for index-preserving comparison, or undefined when folding would move indexes. */
+function foldCase(text: string): string | undefined {
+  const lower = text.toLowerCase();
+  return lower.length === text.length ? lower : undefined;
+}
+
+function replaceNeedle(text: string, needle: ScrubNeedle): string {
+  const folded = foldCase(text);
+  const haystack = folded ?? text;
+  const target = folded === undefined ? needle.text : needle.lower;
+  let out = "";
+  let last = 0;
+  let from = 0;
+  while (from <= haystack.length - target.length) {
+    const index = haystack.indexOf(target, from);
+    if (index === -1) break;
+    const end = index + target.length;
+    if (!needle.wholeToken || (isTokenBoundary(text, index - 1) && isTokenBoundary(text, end))) {
+      out += `${text.slice(last, index)}${REDACTED_VALUE}`;
+      last = end;
+      from = end;
+    } else {
+      from = index + 1;
+    }
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/**
+ * Replace each collected value with `[redacted]` in every form
+ * `scrubbedFormsOf` produces, matching case-insensitively. Forms shorter than
+ * eight characters are replaced only where they stand as a whole token.
+ */
+export function scrubSensitiveValues(text: string, values: readonly string[]): string {
+  let scrubbed = text;
+  for (const needle of buildNeedles(values)) scrubbed = replaceNeedle(scrubbed, needle);
   return scrubbed;
 }
 
