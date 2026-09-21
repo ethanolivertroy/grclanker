@@ -734,6 +734,7 @@ export interface ZiaReadClient {
   getSecurityAllowlist(): Promise<JsonRecord>;
   getSecurityDenylist(): Promise<JsonRecord>;
   listLocations(): Promise<PagedList>;
+  listSubLocations(locationId: string): Promise<JsonRecord[]>;
   listGreTunnels(): Promise<JsonRecord[]>;
   listVpnCredentials(): Promise<JsonRecord[]>;
   listBandwidthControlRules(): Promise<JsonRecord[]>;
@@ -977,6 +978,10 @@ export class ZiaApiClient implements ZiaReadClient {
 
   listLocations(): Promise<PagedList> {
     return this.getPaged("/locations");
+  }
+
+  listSubLocations(locationId: string): Promise<JsonRecord[]> {
+    return this.getList(`/locations/${encodeURIComponent(locationId)}/sublocations`);
   }
 
   listGreTunnels(): Promise<JsonRecord[]> {
@@ -1702,7 +1707,544 @@ export class ZpaApiClient implements ZpaReadClient {
   }
 }
 
-// ZIA_POLICY_PLACEHOLDER
+const MAX_SUBLOCATION_PARENTS = 100;
+const MAX_CLOUD_APP_RULE_TYPES = 25;
+const DEFAULT_MAX_SSL_EXEMPTIONS = 50;
+const REQUIRED_URL_BLOCK_CATEGORIES = ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"];
+const REQUIRED_ATP_FLAGS = [
+  "malwareSitesBlocked",
+  "cmdCtlServerBlocked",
+  "cmdCtlTrafficBlocked",
+  "knownPhishingSitesBlocked",
+  "suspectedPhishingSitesBlocked",
+  "browserExploitsBlocked",
+  "potentialMaliciousRequestsBlocked",
+];
+const REQUIRED_MALWARE_FLAGS = ["virusBlocked", "trojanBlocked", "wormBlocked", "ransomwareBlocked", "spywareBlocked"];
+
+export interface ZiaPolicyData {
+  urlFilteringRules: CollectedDataset<JsonRecord[]>;
+  firewallRules: CollectedDataset<JsonRecord[]>;
+  dnsRules: CollectedDataset<JsonRecord[]>;
+  dlpEngines: CollectedDataset<JsonRecord[]>;
+  dlpDictionaries: CollectedDataset<JsonRecord[]>;
+  webDlpRules: CollectedDataset<JsonRecord[]>;
+  sslInspectionRules: CollectedDataset<JsonRecord[]>;
+  sslExemptedUrls: CollectedDataset<JsonRecord>;
+  sandboxRules: CollectedDataset<JsonRecord[]>;
+  sandboxSettings: CollectedDataset<JsonRecord>;
+  advancedThreatSettings: CollectedDataset<JsonRecord>;
+  malwarePolicy: CollectedDataset<JsonRecord>;
+  malwareSettings: CollectedDataset<JsonRecord>;
+  securityAllowlist: CollectedDataset<JsonRecord>;
+  securityDenylist: CollectedDataset<JsonRecord>;
+  locations: CollectedDataset<JsonRecord[]>;
+  subLocations: CollectedDataset<JsonRecord[]>;
+  greTunnels: CollectedDataset<JsonRecord[]>;
+  vpnCredentials: CollectedDataset<JsonRecord[]>;
+  bandwidthRules: CollectedDataset<JsonRecord[]>;
+  isolationProfiles: CollectedDataset<JsonRecord[]>;
+  cloudAppRules: CollectedDataset<JsonRecord[]>;
+}
+
+async function collectSubLocations(client: ZiaReadClient, locations: CollectedDataset<JsonRecord[]>): Promise<CollectedDataset<JsonRecord[]>> {
+  if (locations.error) {
+    return { data: [], error: `skipped because locations were unreadable: ${locations.error}`, statusCode: locations.statusCode };
+  }
+  const parents = locations.data.map((location) => asString(location.id)).filter((id): id is string => Boolean(id));
+  const items: JsonRecord[] = [];
+  const errors: string[] = [];
+  for (const parentId of parents.slice(0, MAX_SUBLOCATION_PARENTS)) {
+    try {
+      items.push(...(await client.listSubLocations(parentId)));
+    } catch (error) {
+      errors.push(`${parentId}: ${errorMessage(error)}`);
+    }
+  }
+  return {
+    data: items,
+    error: errors.length > 0 ? errors.slice(0, 5).join("; ") : undefined,
+    truncated: parents.length > MAX_SUBLOCATION_PARENTS || locations.truncated,
+    seen: Math.min(parents.length, MAX_SUBLOCATION_PARENTS),
+    total: parents.length,
+  };
+}
+
+async function collectCloudAppRules(client: ZiaReadClient): Promise<CollectedDataset<JsonRecord[]>> {
+  let ruleTypes: string[];
+  try {
+    ruleTypes = await client.listCloudAppRuleTypes();
+  } catch (error) {
+    return {
+      data: [],
+      error: errorMessage(error),
+      statusCode: error instanceof ZscalerApiError ? error.status : undefined,
+    };
+  }
+  const items: JsonRecord[] = [];
+  const errors: string[] = [];
+  for (const ruleType of ruleTypes.slice(0, MAX_CLOUD_APP_RULE_TYPES)) {
+    try {
+      for (const rule of await client.listCloudAppRules(ruleType)) {
+        items.push({ ...rule, ruleType });
+      }
+    } catch (error) {
+      errors.push(`${ruleType}: ${errorMessage(error)}`);
+    }
+  }
+  return {
+    data: items,
+    error: errors.length > 0 ? errors.slice(0, 5).join("; ") : undefined,
+    truncated: ruleTypes.length > MAX_CLOUD_APP_RULE_TYPES,
+    seen: Math.min(ruleTypes.length, MAX_CLOUD_APP_RULE_TYPES),
+    total: ruleTypes.length,
+  };
+}
+
+export async function collectZiaPolicyData(client: ZiaReadClient): Promise<ZiaPolicyData> {
+  const locations = await collectPaged("zia", () => client.listLocations());
+  return {
+    urlFilteringRules: await collect("zia", () => client.listUrlFilteringRules(), []),
+    firewallRules: await collect("zia", () => client.listFirewallFilteringRules(), []),
+    dnsRules: await collect("zia", () => client.listFirewallDnsRules(), []),
+    dlpEngines: await collect("zia", () => client.listDlpEngines(), []),
+    dlpDictionaries: await collect("zia", () => client.listDlpDictionaries(), []),
+    webDlpRules: await collect("zia", () => client.listWebDlpRules(), []),
+    sslInspectionRules: await collect("zia", () => client.listSslInspectionRules(), []),
+    sslExemptedUrls: await collect("zia", () => client.getSslExemptedUrls(), {}),
+    sandboxRules: await collect("zia", () => client.listSandboxRules(), []),
+    sandboxSettings: await collect("zia", () => client.getSandboxAdvancedSettings(), {}),
+    advancedThreatSettings: await collect("zia", () => client.getAdvancedThreatSettings(), {}),
+    malwarePolicy: await collect("zia", () => client.getMalwarePolicy(), {}),
+    malwareSettings: await collect("zia", () => client.getMalwareSettings(), {}),
+    securityAllowlist: await collect("zia", () => client.getSecurityAllowlist(), {}),
+    securityDenylist: await collect("zia", () => client.getSecurityDenylist(), {}),
+    locations,
+    subLocations: await collectSubLocations(client, locations),
+    greTunnels: await collect("zia", () => client.listGreTunnels(), []),
+    vpnCredentials: await collect("zia", () => client.listVpnCredentials(), []),
+    bandwidthRules: await collect("zia", () => client.listBandwidthControlRules(), []),
+    isolationProfiles: await collect("zia", () => client.listBrowserIsolationProfiles(), []),
+    cloudAppRules: await collectCloudAppRules(client),
+  };
+}
+
+function enabledRules(rules: JsonRecord[]): JsonRecord[] {
+  return rules.filter(isEnabledState);
+}
+
+function ruleSummaries(rules: JsonRecord[], actionKey = "action"): Array<{ name: string; action: string | null; state: string | null }> {
+  return truncateList(rules.map((rule) => ({
+    name: ruleLabel(rule),
+    action: asString(rule[actionKey]) ?? asString(asObject(rule[actionKey])?.type) ?? null,
+    state: asString(rule.state) ?? null,
+  })));
+}
+
+function assessUrlFiltering(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Policy > URL & Cloud App Control > URL Filtering Policy and show that anonymizer, security-risk, adult, and gambling categories are blocked by enabled rules.";
+  const rules = data.urlFilteringRules;
+  if (rules.error) return unreadableFinding(1, "GET /urlFilteringRules", rules, evidenceNote);
+  if (rules.data.length === 0) {
+    return finding(1, "fail", "Empty inventory: zero URL filtering rules exist, so no web category is blocked and all traffic is implicitly allowed.", { rule_count: 0 }, evidenceNote);
+  }
+  const active = enabledRules(rules.data);
+  const blockRules = active.filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "BLOCK");
+  const blockedCategories = new Set(blockRules.flatMap((rule) => asStringList(rule.urlCategories).map((category) => category.toUpperCase())));
+  const missing = REQUIRED_URL_BLOCK_CATEGORIES.filter((category) => !blockedCategories.has(category));
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    disabled_rules: rules.data.length - active.length,
+    block_rules: blockRules.length,
+    blocked_categories: blockedCategories.size,
+    missing_required_categories: missing,
+    rules: ruleSummaries(rules.data),
+  };
+  if (active.length === 0) {
+    return finding(1, "fail", `${rules.data.length} URL filtering rules exist but every rule has state DISABLED, so nothing is enforced.`, evidence, evidenceNote);
+  }
+  if (blockRules.length === 0) {
+    return finding(1, "fail", `${active.length} enabled URL filtering rules exist but none uses action BLOCK; high-risk categories are not blocked.`, evidence, evidenceNote);
+  }
+  if (missing.length > 0) {
+    return finding(1, "warn", `${blockRules.length} enabled BLOCK rules cover ${blockedCategories.size} categories, but these baseline categories are not blocked: ${missing.join(", ")}.`, evidence, evidenceNote);
+  }
+  return finding(1, "pass", `${blockRules.length} enabled BLOCK rules cover all ${REQUIRED_URL_BLOCK_CATEGORIES.length} baseline high-risk categories across ${blockedCategories.size} blocked categories.`, evidence);
+}
+
+function isUnboundedAllow(rule: JsonRecord): boolean {
+  if ((asString(rule.action) ?? "").toUpperCase() !== "ALLOW") return false;
+  const scopeKeys = ["nwServices", "nwServiceGroups", "nwApplications", "nwApplicationGroups", "destAddresses", "destCountries", "destIpCategories", "destIpGroups", "srcIps", "srcIpGroups", "locations", "locationGroups", "users", "groups", "departments", "appServices", "appServiceGroups", "labels", "devices", "deviceGroups"];
+  return scopeKeys.every((key) => asArray(rule[key]).length === 0);
+}
+
+function assessFirewall(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Policy > Firewall Control > Firewall Filtering Policy showing the Default Firewall Filtering Rule action and every rule that allows traffic without destination or service restrictions.";
+  const rules = data.firewallRules;
+  if (rules.error) return unreadableFinding(2, "GET /firewallFilteringRules", rules, evidenceNote);
+  if (rules.data.length === 0) {
+    return finding(2, "fail", "Empty inventory: zero firewall filtering rules were returned, so no cloud firewall policy is enforced (a live tenant always returns at least the default rule, so the credential may also be scoped).", { rule_count: 0 }, evidenceNote);
+  }
+  const active = enabledRules(rules.data);
+  const defaultRules = rules.data.filter((rule) => asBoolean(rule.defaultRule) === true);
+  const defaultRule = defaultRules[0];
+  const defaultAction = defaultRule ? (asString(defaultRule.action) ?? "").toUpperCase() : undefined;
+  const unbounded = active.filter((rule) => asBoolean(rule.defaultRule) !== true && isUnboundedAllow(rule));
+  const blockWithoutLogging = active.filter((rule) => (asString(rule.action) ?? "").toUpperCase().startsWith("BLOCK") && asBoolean(rule.enableFullLogging) === false);
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    default_rule_action: defaultAction ?? null,
+    unbounded_allow_rules: truncateList(unbounded.map(ruleLabel)),
+    block_rules_without_full_logging: blockWithoutLogging.length,
+    rules: ruleSummaries(rules.data),
+  };
+  if (!defaultRule) {
+    return finding(2, "warn", `${rules.data.length} firewall rules were returned but none is flagged defaultRule, so the fallback action is unknown; the inventory may be partial.`, evidence, evidenceNote);
+  }
+  if (defaultAction === "ALLOW") {
+    return finding(2, "fail", `The Default Firewall Filtering Rule action is ALLOW, so any traffic not matched by ${active.length} enabled rules is permitted.`, evidence, evidenceNote);
+  }
+  if (unbounded.length > 0) {
+    return finding(2, "fail", `${unbounded.length} enabled ALLOW rule(s) have no service, destination, source, or user restriction: ${unbounded.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  if (active.length === defaultRules.length) {
+    return finding(2, "warn", `Only the default rule (${defaultAction}) is enabled; no explicit firewall rules define allowed services, so review whether required egress is being blocked or bypassed elsewhere.`, evidence, evidenceNote);
+  }
+  return finding(2, blockWithoutLogging.length > 0 ? "warn" : "pass", `Default rule action is ${defaultAction}, ${active.length} enabled rules are scoped, and no unbounded allow rules exist${blockWithoutLogging.length > 0 ? `; ${blockWithoutLogging.length} block rule(s) have full logging disabled` : ""}.`, evidence);
+}
+
+function assessDlp(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Policy > Data Loss Prevention showing enabled DLP engines, dictionaries, and web DLP rules with their actions.";
+  if (data.webDlpRules.error) return unreadableFinding(3, "GET /webDlpRules", data.webDlpRules, evidenceNote);
+  if (data.dlpEngines.error) return unreadableFinding(3, "GET /dlpEngines", data.dlpEngines, evidenceNote);
+  const rules = data.webDlpRules.data;
+  const engines = data.dlpEngines.data;
+  const active = enabledRules(rules);
+  const blocking = active.filter((rule) => ["BLOCK", "ICAP_RESPONSE"].includes((asString(rule.action) ?? "").toUpperCase()));
+  const withEngines = blocking.filter((rule) => asArray(rule.dlpEngines).length > 0 || asBoolean(rule.withoutContentInspection) === true);
+  const evidence = {
+    engine_count: engines.length,
+    dictionary_count: data.dlpDictionaries.error ? null : data.dlpDictionaries.data.length,
+    rule_count: rules.length,
+    enabled_rules: active.length,
+    blocking_rules: blocking.length,
+    rules: ruleSummaries(rules),
+  };
+  if (rules.length === 0) {
+    return finding(3, "fail", `Empty inventory: zero web DLP rules exist (${engines.length} engines defined), so no data loss prevention is enforced on web traffic.`, evidence, evidenceNote);
+  }
+  if (engines.length === 0) {
+    return finding(3, "fail", `${rules.length} web DLP rules exist but zero DLP engines are defined, so rules cannot match sensitive content.`, evidence, evidenceNote);
+  }
+  if (active.length === 0) {
+    return finding(3, "fail", `${rules.length} web DLP rules exist but all are DISABLED.`, evidence, evidenceNote);
+  }
+  if (blocking.length === 0) {
+    return finding(3, "warn", `${active.length} enabled web DLP rules only monitor (action ALLOW); no rule blocks or quarantines sensitive data.`, evidence, evidenceNote);
+  }
+  if (withEngines.length === 0) {
+    return finding(3, "warn", `${blocking.length} blocking DLP rules reference no DLP engine and do not use withoutContentInspection, so they may never match.`, evidence, evidenceNote);
+  }
+  return finding(3, "pass", `${engines.length} DLP engines and ${blocking.length} enabled blocking web DLP rules are in force (${active.length} enabled rules total).`, evidence);
+}
+
+function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): ZscalerFinding {
+  const evidenceNote = "Export Policy > SSL Inspection showing enabled DECRYPT rules, the exempted URL list, and per-location SSL scanning state.";
+  const rules = data.sslInspectionRules;
+  if (rules.error) return unreadableFinding(4, "GET /sslInspectionRules", rules, evidenceNote);
+  const exempted = data.sslExemptedUrls.error ? undefined : asStringList(data.sslExemptedUrls.data.urls);
+  const active = enabledRules(rules.data);
+  const actionType = (rule: JsonRecord): string => (asString(asObject(rule.action)?.type) ?? asString(rule.action) ?? "").toUpperCase();
+  const decrypt = active.filter((rule) => actionType(rule) === "DECRYPT");
+  const blanketBypass = active.filter((rule) => actionType(rule) === "DO_NOT_DECRYPT" && asArray(rule.urlCategories).length === 0 && asArray(rule.cloudApplications).length === 0 && asArray(rule.destIpGroups).length === 0 && asArray(rule.locations).length === 0 && asArray(rule.users).length === 0 && asArray(rule.groups).length === 0 && asArray(rule.departments).length === 0);
+  const locationsWithoutScan = data.locations.error ? undefined : data.locations.data.filter((location) => asBoolean(location.sslScanEnabled) === false).length;
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    decrypt_rules: decrypt.length,
+    blanket_do_not_decrypt_rules: truncateList(blanketBypass.map(ruleLabel)),
+    exempted_urls: exempted ? exempted.length : null,
+    exempted_urls_readable: exempted !== undefined,
+    locations_without_ssl_scan: locationsWithoutScan ?? null,
+    rules: ruleSummaries(rules.data),
+  };
+  if (rules.data.length === 0) {
+    return finding(4, "fail", "Empty inventory: zero SSL inspection rules exist, so encrypted traffic is not decrypted for inspection.", evidence, evidenceNote);
+  }
+  if (decrypt.length === 0) {
+    return finding(4, "fail", `${active.length} enabled SSL inspection rules exist but none has action type DECRYPT.`, evidence, evidenceNote);
+  }
+  if (blanketBypass.length > 0) {
+    return finding(4, "fail", `${blanketBypass.length} enabled DO_NOT_DECRYPT rule(s) apply to all traffic with no category, application, location, or user scope: ${blanketBypass.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  if (exempted === undefined) {
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but GET /sslSettings/exemptedUrls could not be read (${unreadableReason(data.sslExemptedUrls)}), so exemption hygiene is unverified.`, evidence, evidenceNote);
+  }
+  if (exempted.length > maxExemptions) {
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but ${exempted.length} URLs are exempted from inspection (threshold ${maxExemptions}).`, evidence, evidenceNote);
+  }
+  if ((locationsWithoutScan ?? 0) > 0) {
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules and ${exempted.length} exemptions, but ${locationsWithoutScan} location(s) have sslScanEnabled=false.`, evidence, evidenceNote);
+  }
+  return finding(4, "pass", `${decrypt.length} enabled DECRYPT rules, ${exempted.length} exempted URLs (threshold ${maxExemptions}), no blanket bypass rules${locationsWithoutScan === undefined ? "" : ", and SSL scanning enabled on every location"}.`, evidence);
+}
+
+function assessSandbox(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Confirm the Cloud Sandbox subscription under Administration > Company Profile > Subscriptions and export Policy > Sandbox showing enabled rules with Block or Quarantine actions.";
+  const rules = data.sandboxRules;
+  if (rules.error) return unreadableFinding(5, "GET /sandboxRules", rules, `${evidenceNote} A 4xx here can also mean Cloud Sandbox is not licensed.`);
+  const active = enabledRules(rules.data);
+  const blocking = active.filter((rule) => (asString(rule.baRuleAction) ?? "").toUpperCase() === "BLOCK");
+  const quarantineFirst = active.filter((rule) => asBoolean(rule.firstTimeEnable) === true && (asString(rule.firstTimeOperation) ?? "").toUpperCase() === "QUARANTINE");
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    blocking_rules: blocking.length,
+    quarantine_first_time_rules: quarantineFirst.length,
+    blocked_file_hashes: data.sandboxSettings.error ? null : asArray(data.sandboxSettings.data.fileHashesToBeBlocked).length,
+    rules: ruleSummaries(rules.data, "baRuleAction"),
+  };
+  if (rules.data.length === 0) {
+    return finding(5, "manual", "Not configured: zero sandbox rules were returned, which means Cloud Sandbox is either unlicensed or unconfigured; the control cannot pass until a rule inventory exists.", evidence, evidenceNote);
+  }
+  if (active.length === 0) {
+    return finding(5, "fail", `${rules.data.length} sandbox rules exist but all are DISABLED.`, evidence, evidenceNote);
+  }
+  if (blocking.length === 0) {
+    return finding(5, "warn", `${active.length} enabled sandbox rules only ALLOW; no rule blocks malicious verdicts.`, evidence, evidenceNote);
+  }
+  return finding(5, "pass", `${blocking.length} enabled sandbox rules block malicious verdicts (${quarantineFirst.length} quarantine first-time files).`, evidence);
+}
+
+function assessBandwidth(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Confirm whether Bandwidth Control is licensed and, if so, export Policy > Bandwidth Control showing enabled rules for critical application classes.";
+  const rules = data.bandwidthRules;
+  if (rules.error) return unreadableFinding(16, "GET /bandwidthControlRules", rules, evidenceNote);
+  const active = enabledRules(rules.data);
+  const evidence = { rule_count: rules.data.length, enabled_rules: active.length, rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), state: asString(rule.state) ?? null, minBandwidth: asNumber(rule.minBandwidth) ?? null, maxBandwidth: asNumber(rule.maxBandwidth) ?? null }))) };
+  if (rules.data.length === 0) {
+    return finding(16, "manual", "Not configured: zero bandwidth control rules exist; confirm whether bandwidth control is licensed and required for this tenant before treating this as compliant.", evidence, evidenceNote);
+  }
+  if (active.length === 0) {
+    return finding(16, "warn", `${rules.data.length} bandwidth control rules exist but all are DISABLED.`, evidence, evidenceNote);
+  }
+  return finding(16, "pass", `${active.length} enabled bandwidth control rules are in force.`, evidence);
+}
+
+function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Confirm the Cloud Browser Isolation subscription and export the URL filtering rules that use the Isolate action together with the isolation profiles under Administration > Isolation Profile.";
+  const profiles = data.isolationProfiles;
+  if (profiles.error) return unreadableFinding(17, "GET /browserIsolation/profiles", profiles, `${evidenceNote} A 4xx here can also mean Cloud Browser Isolation is not licensed.`);
+  if (data.urlFilteringRules.error) return unreadableFinding(17, "GET /urlFilteringRules", data.urlFilteringRules, evidenceNote);
+  const isolateRules = enabledRules(data.urlFilteringRules.data).filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "ISOLATE");
+  const evidence = { profile_count: profiles.data.length, profiles: truncateList(profiles.data.map((profile) => asString(profile.name) ?? asString(profile.id) ?? "profile")), isolate_url_rules: truncateList(isolateRules.map(ruleLabel)) };
+  if (profiles.data.length === 0) {
+    return finding(17, "manual", "Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.", evidence, evidenceNote);
+  }
+  if (isolateRules.length === 0) {
+    return finding(17, "warn", `${profiles.data.length} isolation profile(s) exist but no enabled URL filtering rule uses action ISOLATE, so isolation is never applied.`, evidence, evidenceNote);
+  }
+  return finding(17, "pass", `${profiles.data.length} isolation profile(s) are applied by ${isolateRules.length} enabled ISOLATE URL filtering rule(s).`, evidence);
+}
+
+function locationLabel(location: JsonRecord): string {
+  return asString(location.name) ?? asString(location.id) ?? "location";
+}
+
+function assessLocations(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Administration > Location Management showing per-location authentication, SSL inspection, firewall enablement, and the GRE tunnel or IPSec VPN credentials that carry each site.";
+  const locations = data.locations;
+  if (locations.error) return unreadableFinding(18, "GET /locations", locations, evidenceNote);
+  const all = [...locations.data, ...data.subLocations.data];
+  const noAuth = all.filter((location) => asBoolean(location.authRequired) !== true);
+  const noSsl = all.filter((location) => asBoolean(location.sslScanEnabled) !== true);
+  const noFirewall = all.filter((location) => asBoolean(location.ofwEnabled) !== true);
+  const evidence = {
+    location_count: locations.data.length,
+    sub_location_count: data.subLocations.data.length,
+    sub_locations_readable: !data.subLocations.error,
+    gre_tunnels: data.greTunnels.error ? null : data.greTunnels.data.length,
+    vpn_credentials: data.vpnCredentials.error ? null : data.vpnCredentials.data.length,
+    locations_without_auth: truncateList(noAuth.map(locationLabel)),
+    locations_without_ssl_scan: truncateList(noSsl.map(locationLabel)),
+    locations_without_firewall: truncateList(noFirewall.map(locationLabel)),
+    partial_inventory: locations.truncated === true,
+  };
+  if (locations.data.length === 0) {
+    return finding(18, "manual", "Empty inventory: zero locations exist, so the tenant may forward traffic only through Zscaler Client Connector; confirm that no GRE or IPSec sites are expected.", evidence, evidenceNote);
+  }
+  const issues: string[] = [];
+  if (noAuth.length > 0) issues.push(`${noAuth.length} without authRequired`);
+  if (noSsl.length > 0) issues.push(`${noSsl.length} without sslScanEnabled`);
+  if (noFirewall.length > 0) issues.push(`${noFirewall.length} without ofwEnabled`);
+  if (issues.length > 0) {
+    return finding(18, "warn", `${all.length} locations and sub-locations reviewed: ${issues.join(", ")}.${partialSuffix(locations, "location")}`, evidence, evidenceNote);
+  }
+  return finding(18, capForPartial("pass", locations), `All ${all.length} locations and sub-locations enforce authentication, SSL inspection, and the cloud firewall.${partialSuffix(locations, "location")}`, evidence);
+}
+
+function assessCloudAppControl(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Policy > URL & Cloud App Control > Cloud App Control Policy showing enabled rules that block or isolate unsanctioned applications per rule type.";
+  const rules = data.cloudAppRules;
+  if (rules.error && rules.data.length === 0) return unreadableFinding(19, "GET /webApplicationRules/{ruleType}", rules, evidenceNote);
+  const active = enabledRules(rules.data);
+  const restrictive = active.filter((rule) => asStringList(rule.actions).some((action) => /^(BLOCK|ISOLATE|CAUTION|DENY)/i.test(action)));
+  const evidence = {
+    rule_types_seen: rules.seen ?? null,
+    rule_types_total: rules.total ?? null,
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    restrictive_rules: restrictive.length,
+    partial_reads: rules.error ?? null,
+    rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), type: asString(rule.ruleType) ?? asString(rule.type) ?? null, state: asString(rule.state) ?? null, actions: asStringList(rule.actions) }))),
+  };
+  if (rules.error) {
+    return finding(19, "manual", `Some cloud app control rule types could not be read (${rules.error}), so the ${rules.data.length} rules seen are a partial view.`, evidence, evidenceNote);
+  }
+  if (rules.data.length === 0) {
+    return finding(19, "fail", "Empty inventory: zero cloud app control rules exist, so no application-level restrictions apply to unsanctioned SaaS.", evidence, evidenceNote);
+  }
+  if (restrictive.length === 0) {
+    return finding(19, "fail", `${active.length} enabled cloud app control rules exist but none blocks, isolates, or cautions any application.`, evidence, evidenceNote);
+  }
+  if (rules.truncated) {
+    return finding(19, "warn", `${restrictive.length} restrictive rules were found, but only ${rules.seen} of ${rules.total} rule types were read, so the view is partial.`, evidence, evidenceNote);
+  }
+  return finding(19, "pass", `${restrictive.length} enabled cloud app control rules block, isolate, or caution applications across ${rules.total ?? rules.seen} rule types.`, evidence);
+}
+
+function assessDnsSecurity(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Policy > Firewall Control > DNS Control showing enabled block or redirect rules and the Advanced Threat Protection DGA domain setting.";
+  const rules = data.dnsRules;
+  if (rules.error) return unreadableFinding(20, "GET /firewallDnsRules", rules, evidenceNote);
+  const active = enabledRules(rules.data);
+  const protective = active.filter((rule) => asBoolean(rule.defaultRule) !== true && /^(BLOCK|REDIR)/i.test(asString(rule.action) ?? ""));
+  const defaultRule = rules.data.find((rule) => asBoolean(rule.defaultRule) === true);
+  const dgaBlocked = data.advancedThreatSettings.error ? undefined : asBoolean(data.advancedThreatSettings.data.dgaDomainsBlocked);
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    protective_rules: truncateList(protective.map(ruleLabel)),
+    default_rule_action: defaultRule ? asString(defaultRule.action) ?? null : null,
+    dga_domains_blocked: dgaBlocked ?? null,
+    rules: ruleSummaries(rules.data),
+  };
+  if (rules.data.length === 0) {
+    return finding(20, "fail", "Empty inventory: zero DNS control rules were returned, so DNS traffic is not filtered by the cloud firewall.", evidence, evidenceNote);
+  }
+  if (protective.length === 0) {
+    return finding(20, "fail", `${active.length} enabled DNS control rules exist but none blocks or redirects DNS requests beyond the default rule.`, evidence, evidenceNote);
+  }
+  if (dgaBlocked !== true) {
+    return finding(20, "warn", `${protective.length} protective DNS rules are enabled, but dgaDomainsBlocked is ${dgaBlocked === undefined ? "unreadable" : "false"} in Advanced Threat Protection.`, evidence, evidenceNote);
+  }
+  return finding(20, "pass", `${protective.length} enabled DNS control rules block or redirect DNS requests and DGA domains are blocked.`, evidence);
+}
+
+function assessSecurityBaseline(data: ZiaPolicyData): ZscalerFinding {
+  const evidenceNote = "Export Policy > Malware Protection and Policy > Advanced Threat Protection showing every blocked category and the unscannable file handling.";
+  if (data.advancedThreatSettings.error) return unreadableFinding(25, "GET /cyberThreatProtection/advancedThreatSettings", data.advancedThreatSettings, evidenceNote);
+  if (data.malwareSettings.error) return unreadableFinding(25, "GET /cyberThreatProtection/malwareSettings", data.malwareSettings, evidenceNote);
+  const atp = data.advancedThreatSettings.data;
+  const malware = data.malwareSettings.data;
+  const missingAtp = REQUIRED_ATP_FLAGS.filter((flag) => asBoolean(atp[flag]) !== true);
+  const missingMalware = REQUIRED_MALWARE_FLAGS.filter((flag) => asBoolean(malware[flag]) !== true);
+  const blockUnscannable = data.malwarePolicy.error ? undefined : asBoolean(data.malwarePolicy.data.blockUnscannableFiles);
+  const allowlist = data.securityAllowlist.error ? undefined : asStringList(data.securityAllowlist.data.whitelistUrls);
+  const denylist = data.securityDenylist.error ? undefined : asStringList(data.securityDenylist.data.blacklistUrls);
+  const evidence = {
+    required_atp_flags_not_enabled: missingAtp,
+    required_malware_flags_not_enabled: missingMalware,
+    risk_tolerance: asNumber(atp.riskTolerance) ?? null,
+    block_unscannable_files: blockUnscannable ?? null,
+    block_password_protected_archives: data.malwarePolicy.error ? null : asBoolean(data.malwarePolicy.data.blockPasswordProtectedArchiveFiles) ?? null,
+    allowlist_urls: allowlist ? allowlist.length : null,
+    denylist_urls: denylist ? denylist.length : null,
+  };
+  if (Object.keys(atp).length === 0 || Object.keys(malware).length === 0) {
+    return finding(25, "fail", "Empty response: the ATP or malware settings object contained no flags, so none of the required protections can be confirmed enabled.", evidence, evidenceNote);
+  }
+  if (missingAtp.length > 0 || missingMalware.length > 0) {
+    return finding(25, "fail", `Required protections are not enabled: ${[...missingAtp, ...missingMalware].join(", ")}.`, evidence, evidenceNote);
+  }
+  if (blockUnscannable !== true) {
+    return finding(25, "warn", `All ${REQUIRED_ATP_FLAGS.length + REQUIRED_MALWARE_FLAGS.length} required ATP and malware protections are enabled, but blockUnscannableFiles is ${blockUnscannable === undefined ? "unreadable" : "false"}.`, evidence, evidenceNote);
+  }
+  if ((allowlist?.length ?? 0) > 100) {
+    return finding(25, "warn", `All required protections are enabled, but ${allowlist?.length} URLs bypass security policy via the allowlist.`, evidence, evidenceNote);
+  }
+  return finding(25, "pass", `All ${REQUIRED_ATP_FLAGS.length} required ATP protections and ${REQUIRED_MALWARE_FLAGS.length} malware protections are enabled, unscannable files are blocked, and the allowlist holds ${allowlist?.length ?? "an unreadable number of"} URLs.`, evidence);
+}
+
+export function assessZiaPolicyData(data: ZiaPolicyData, options: { maxSslExemptions?: number } = {}): ZscalerAssessmentResult {
+  const maxExemptions = clampNumber(options.maxSslExemptions, DEFAULT_MAX_SSL_EXEMPTIONS, 0, 100_000);
+  const findings = [
+    assessUrlFiltering(data),
+    assessFirewall(data),
+    assessDlp(data),
+    assessSslInspection(data, maxExemptions),
+    assessSandbox(data),
+    assessBandwidth(data),
+    assessBrowserIsolation(data),
+    assessLocations(data),
+    assessCloudAppControl(data),
+    assessDnsSecurity(data),
+    assessSecurityBaseline(data),
+  ];
+  const datasets: Array<[string, CollectedDataset<unknown>]> = [
+    ["urlFilteringRules", data.urlFilteringRules],
+    ["firewallFilteringRules", data.firewallRules],
+    ["firewallDnsRules", data.dnsRules],
+    ["dlpEngines", data.dlpEngines],
+    ["dlpDictionaries", data.dlpDictionaries],
+    ["webDlpRules", data.webDlpRules],
+    ["sslInspectionRules", data.sslInspectionRules],
+    ["sslSettings/exemptedUrls", data.sslExemptedUrls],
+    ["sandboxRules", data.sandboxRules],
+    ["behavioralAnalysisAdvancedSettings", data.sandboxSettings],
+    ["advancedThreatSettings", data.advancedThreatSettings],
+    ["malwarePolicy", data.malwarePolicy],
+    ["malwareSettings", data.malwareSettings],
+    ["security", data.securityAllowlist],
+    ["security/advanced", data.securityDenylist],
+    ["locations", data.locations],
+    ["sublocations", data.subLocations],
+    ["greTunnels", data.greTunnels],
+    ["vpnCredentials", data.vpnCredentials],
+    ["bandwidthControlRules", data.bandwidthRules],
+    ["browserIsolation/profiles", data.isolationProfiles],
+    ["webApplicationRules", data.cloudAppRules],
+  ];
+  return {
+    title: "Zscaler ZIA security policy",
+    area: "zia_policy",
+    summary: {
+      url_filtering_rules: data.urlFilteringRules.data.length,
+      firewall_rules: data.firewallRules.data.length,
+      dns_rules: data.dnsRules.data.length,
+      dlp_engines: data.dlpEngines.data.length,
+      web_dlp_rules: data.webDlpRules.data.length,
+      ssl_inspection_rules: data.sslInspectionRules.data.length,
+      sandbox_rules: data.sandboxRules.data.length,
+      locations: data.locations.data.length,
+      sub_locations: data.subLocations.data.length,
+      cloud_app_rules: data.cloudAppRules.data.length,
+      status_counts: summarizeFindingStatuses(findings),
+    },
+    findings,
+    errors: datasets.flatMap(([label, dataset]) => datasetErrors(label, dataset)),
+    truncated: datasets.flatMap(([label, dataset]) => datasetTruncations(label, dataset)),
+  };
+}
+
+export async function assessZiaPolicy(client: ZiaReadClient | undefined, options: { maxSslExemptions?: number } = {}): Promise<ZscalerAssessmentResult> {
+  if (!client) {
+    return notConfiguredAssessment("zia_policy", "Zscaler ZIA security policy", "zia", [1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25]);
+  }
+  return assessZiaPolicyData(await collectZiaPolicyData(client), options);
+}
 
 // ZPA_ASSESSMENT_PLACEHOLDER
 
@@ -1853,6 +2395,26 @@ export function registerZscalerTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zia_access_control", ...result });
       } catch (error) {
         return errorResult(`ZIA access control assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zia_access_control" });
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "zscaler_assess_zia_policy",
+    label: "Assess ZIA security policy",
+    description:
+      "Assess ZIA policy posture (spec controls 1-5, 16-20, 25): URL filtering, cloud firewall, DLP, SSL inspection and exemptions, sandbox, bandwidth control, browser isolation, locations and sub-locations with GRE/VPN, cloud app control, DNS control, and the ATP/malware baseline. Empty inventories fail or render manual per control intent; unreadable surfaces never pass.",
+    parameters: Type.Object({
+      ...authParams,
+      max_ssl_exemptions: Type.Optional(Type.Number({ description: "Maximum acceptable SSL inspection exempted URLs before warning. Defaults to 50.", default: 50 })),
+    }),
+    prepareArguments: normalizePolicyArgs,
+    async execute(_toolCallId: string, args: PolicyArgs) {
+      try {
+        const result = await withClients(args, (clients) => assessZiaPolicy(clients.zia, { maxSslExemptions: args.max_ssl_exemptions }));
+        return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zia_policy", ...result });
+      } catch (error) {
+        return errorResult(`ZIA policy assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zia_policy" });
       }
     },
   });

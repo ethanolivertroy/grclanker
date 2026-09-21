@@ -9,6 +9,8 @@ import {
   ZpaApiClient,
   assessZiaAccessControl,
   assessZiaAccessControlData,
+  assessZiaPolicy,
+  assessZiaPolicyData,
   checkZscalerAccess,
   listZscalerControls,
   mappingsForControl,
@@ -361,6 +363,177 @@ test("assessZiaAccessControl renders not-configured manual findings without ZIA 
   }
 });
 
+function policyFixture(overrides = {}) {
+  return {
+    urlFilteringRules: readable([
+      { id: 1, name: "Block risky", state: "ENABLED", action: "BLOCK", urlCategories: ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"] },
+      { id: 2, name: "Isolate uncategorized", state: "ENABLED", action: "ISOLATE", urlCategories: ["MISCELLANEOUS_OR_UNKNOWN"] },
+      { id: 3, name: "Old rule", state: "DISABLED", action: "ALLOW", urlCategories: [] },
+    ]),
+    firewallRules: readable([
+      { id: 1, name: "Allow web", state: "ENABLED", action: "ALLOW", nwServices: [{ id: 1, name: "HTTP" }], enableFullLogging: true },
+      { id: 2, name: "Block bad countries", state: "ENABLED", action: "BLOCK_DROP", destCountries: ["COUNTRY_KP"], enableFullLogging: true },
+      { id: 99, name: "Default Firewall Filtering Rule", state: "ENABLED", action: "BLOCK_DROP", defaultRule: true, enableFullLogging: true },
+    ]),
+    dnsRules: readable([
+      { id: 1, name: "Block malicious DNS", state: "ENABLED", action: "BLOCK" },
+      { id: 9, name: "Default DNS rule", state: "ENABLED", action: "ALLOW", defaultRule: true },
+    ]),
+    dlpEngines: readable([{ id: 1, name: "PCI", predefinedEngineName: "PCI" }]),
+    dlpDictionaries: readable([{ id: 1, name: "Credit Cards", custom: false }]),
+    webDlpRules: readable([{ id: 1, name: "Block card data", state: "ENABLED", action: "BLOCK", dlpEngines: [{ id: 1 }] }]),
+    sslInspectionRules: readable([
+      { id: 1, name: "Decrypt all", state: "ENABLED", action: { type: "DECRYPT" } },
+      { id: 2, name: "Bypass banking", state: "ENABLED", action: { type: "DO_NOT_DECRYPT" }, urlCategories: ["FINANCE"] },
+    ]),
+    sslExemptedUrls: readable({ urls: ["bank.example.com"] }),
+    sandboxRules: readable([{ id: 1, name: "Sandbox block", state: "ENABLED", baRuleAction: "BLOCK", firstTimeEnable: true, firstTimeOperation: "QUARANTINE" }]),
+    sandboxSettings: readable({ fileHashesToBeBlocked: ["abc"] }),
+    advancedThreatSettings: readable({
+      riskTolerance: 50,
+      malwareSitesBlocked: true,
+      cmdCtlServerBlocked: true,
+      cmdCtlTrafficBlocked: true,
+      knownPhishingSitesBlocked: true,
+      suspectedPhishingSitesBlocked: true,
+      browserExploitsBlocked: true,
+      potentialMaliciousRequestsBlocked: true,
+      dgaDomainsBlocked: true,
+    }),
+    malwarePolicy: readable({ blockUnscannableFiles: true, blockPasswordProtectedArchiveFiles: true }),
+    malwareSettings: readable({ virusBlocked: true, trojanBlocked: true, wormBlocked: true, ransomwareBlocked: true, spywareBlocked: true }),
+    securityAllowlist: readable({ whitelistUrls: ["trusted.example.com"] }),
+    securityDenylist: readable({ blacklistUrls: ["bad.example.com"] }),
+    locations: readable([{ id: 100, name: "HQ", authRequired: true, sslScanEnabled: true, ofwEnabled: true }]),
+    subLocations: readable([{ id: 101, name: "HQ Guest", parentId: 100, authRequired: true, sslScanEnabled: true, ofwEnabled: true }]),
+    greTunnels: readable([{ id: 1, sourceIp: "203.0.113.10" }]),
+    vpnCredentials: readable([{ id: 1, type: "UFQDN", fqdn: "hq@example.com" }]),
+    bandwidthRules: readable([{ id: 1, name: "Video cap", state: "ENABLED", minBandwidth: 10, maxBandwidth: 40 }]),
+    isolationProfiles: readable([{ id: "p1", name: "Default isolation", url: "https://isolation.example.com" }]),
+    cloudAppRules: { data: [{ id: 1, name: "Block personal webmail", state: "ENABLED", ruleType: "WEBMAIL", actions: ["BLOCK_WEBMAIL_SEND"] }], seen: 3, total: 3 },
+    ...overrides,
+  };
+}
+
+const POLICY_CONTROL_IDS = ["ZS-01", "ZS-02", "ZS-03", "ZS-04", "ZS-05", "ZS-16", "ZS-17", "ZS-18", "ZS-19", "ZS-20", "ZS-25"];
+
+test("assessZiaPolicy: compliant tenant passes every automatable policy control", () => {
+  const result = assessZiaPolicyData(policyFixture());
+  assert.deepEqual(result.findings.map((item) => item.id), POLICY_CONTROL_IDS);
+  for (const item of result.findings) {
+    assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+    assert.equal(item.mappings.length, 8);
+  }
+  assert.equal(result.errors.length, 0);
+});
+
+test("assessZiaPolicy: risky configurations fail or warn with specific reasons", () => {
+  const result = assessZiaPolicyData(policyFixture({
+    urlFilteringRules: readable([{ id: 1, name: "Allow all", state: "ENABLED", action: "ALLOW", urlCategories: [] }]),
+    firewallRules: readable([
+      { id: 1, name: "Any any", state: "ENABLED", action: "ALLOW" },
+      { id: 99, name: "Default", state: "ENABLED", action: "ALLOW", defaultRule: true },
+    ]),
+    webDlpRules: readable([{ id: 1, name: "Monitor", state: "ENABLED", action: "ALLOW", dlpEngines: [{ id: 1 }] }]),
+    sslInspectionRules: readable([{ id: 1, name: "Decrypt", state: "ENABLED", action: { type: "DECRYPT" } }, { id: 2, name: "Bypass everything", state: "ENABLED", action: { type: "DO_NOT_DECRYPT" } }]),
+    sandboxRules: readable([{ id: 1, name: "Allow", state: "ENABLED", baRuleAction: "ALLOW" }]),
+    advancedThreatSettings: readable({ malwareSitesBlocked: true, cmdCtlServerBlocked: false, dgaDomainsBlocked: false }),
+    locations: readable([{ id: 1, name: "Branch", authRequired: false, sslScanEnabled: false, ofwEnabled: true }]),
+    subLocations: readable([]),
+    dnsRules: readable([{ id: 9, name: "Default", state: "ENABLED", action: "ALLOW", defaultRule: true }]),
+  }), { maxSslExemptions: 50 });
+  assert.equal(findingById(result, "ZS-01").status, "fail");
+  assert.match(findingById(result, "ZS-01").summary, /none uses action BLOCK/);
+  assert.equal(findingById(result, "ZS-02").status, "fail");
+  assert.match(findingById(result, "ZS-02").summary, /Default Firewall Filtering Rule action is ALLOW/);
+  assert.equal(findingById(result, "ZS-03").status, "warn");
+  assert.equal(findingById(result, "ZS-04").status, "fail");
+  assert.match(findingById(result, "ZS-04").summary, /DO_NOT_DECRYPT/);
+  assert.equal(findingById(result, "ZS-05").status, "warn");
+  assert.equal(findingById(result, "ZS-18").status, "warn");
+  assert.equal(findingById(result, "ZS-20").status, "fail");
+  assert.equal(findingById(result, "ZS-25").status, "fail");
+  assert.match(findingById(result, "ZS-25").summary, /cmdCtlServerBlocked/);
+});
+
+test("assessZiaPolicy: 403 everywhere yields manual findings only", () => {
+  const fixture = policyFixture();
+  for (const key of Object.keys(fixture)) {
+    fixture[key] = forbidden(Array.isArray(fixture[key].data) ? [] : {});
+  }
+  const result = assessZiaPolicyData(fixture);
+  assert.equal(result.findings.length, POLICY_CONTROL_IDS.length);
+  for (const item of result.findings) {
+    assert.equal(item.status, "manual", `${item.id}: ${item.summary}`);
+    assert.match(item.summary, /403/);
+  }
+});
+
+test("assessZiaPolicy: empty inventories fail or render manual, never pass", () => {
+  const fixture = policyFixture();
+  for (const key of Object.keys(fixture)) {
+    fixture[key] = readable(Array.isArray(fixture[key].data) ? [] : {});
+  }
+  fixture.cloudAppRules = { data: [], seen: 0, total: 0 };
+  const result = assessZiaPolicyData(fixture);
+  const expected = { "ZS-01": "fail", "ZS-02": "fail", "ZS-03": "fail", "ZS-04": "fail", "ZS-05": "manual", "ZS-16": "manual", "ZS-17": "manual", "ZS-18": "manual", "ZS-19": "fail", "ZS-20": "fail", "ZS-25": "fail" };
+  for (const [id, status] of Object.entries(expected)) {
+    assert.equal(findingById(result, id).status, status, `${id}: ${findingById(result, id).summary}`);
+  }
+});
+
+test("assessZiaPolicy: partial location and rule-type inventories cap verdicts at warn", () => {
+  const fixture = policyFixture();
+  fixture.locations = { ...fixture.locations, truncated: true, seen: 50 };
+  fixture.cloudAppRules = { ...fixture.cloudAppRules, truncated: true, seen: 25, total: 30 };
+  const result = assessZiaPolicyData(fixture);
+  assert.equal(findingById(result, "ZS-18").status, "warn");
+  assert.match(findingById(result, "ZS-18").summary, /partial/);
+  assert.equal(findingById(result, "ZS-19").status, "warn");
+  assert.match(findingById(result, "ZS-19").summary, /25 of 30 rule types/);
+  assert.ok(result.truncated.length >= 2);
+});
+
+test("assessZiaPolicy collects through the client, follows sub-locations, and renders not-configured without ZIA", async () => {
+  const calls = [];
+  const client = {
+    getResolvedConfig: () => ziaConfig(),
+    getNow: () => NOW,
+    listUrlFilteringRules: async () => [],
+    listFirewallFilteringRules: async () => { throw Object.assign(new Error("ZIA GET /firewallFilteringRules failed (403)"), { status: 403, product: "zia" }); },
+    listFirewallDnsRules: async () => [],
+    listDlpEngines: async () => [],
+    listDlpDictionaries: async () => [],
+    listWebDlpRules: async () => [],
+    listSslInspectionRules: async () => [],
+    getSslExemptedUrls: async () => ({ urls: [] }),
+    listSandboxRules: async () => [],
+    getSandboxAdvancedSettings: async () => ({}),
+    getAdvancedThreatSettings: async () => ({}),
+    getMalwarePolicy: async () => ({}),
+    getMalwareSettings: async () => ({}),
+    getSecurityAllowlist: async () => ({}),
+    getSecurityDenylist: async () => ({}),
+    listLocations: async () => ({ items: [{ id: 7, name: "HQ" }], truncated: false, pagesFetched: 1 }),
+    listSubLocations: async (id) => { calls.push(id); return [{ id: 8, name: "Guest", parentId: 7 }]; },
+    listGreTunnels: async () => [],
+    listVpnCredentials: async () => [],
+    listBandwidthControlRules: async () => [],
+    listBrowserIsolationProfiles: async () => [],
+    listCloudAppRuleTypes: async () => ["WEBMAIL"],
+    listCloudAppRules: async () => [],
+  };
+  const result = await assessZiaPolicy(client);
+  assert.deepEqual(calls, ["7"]);
+  assert.equal(result.summary.sub_locations, 1);
+  assert.equal(findingById(result, "ZS-02").status, "manual");
+  assert.ok(result.findings.every((item) => item.status !== "pass"));
+
+  const missing = await assessZiaPolicy(undefined);
+  assert.equal(missing.findings.length, POLICY_CONTROL_IDS.length);
+  assert.ok(missing.findings.every((item) => item.status === "manual" && /Not configured: ZIA/.test(item.summary)));
+});
+
 test("control catalog covers all 25 spec controls with eight framework mappings each", () => {
   const controls = listZscalerControls();
   assert.equal(controls.length, 25);
@@ -373,6 +546,7 @@ test("zscaler tools are registered in the tool catalog under the Zscaler group",
   const names = tools.map((tool) => tool.name);
   assert.ok(names.includes("zscaler_check_access"));
   assert.ok(names.includes("zscaler_assess_zia_access_control"));
+  assert.ok(names.includes("zscaler_assess_zia_policy"));
   for (const tool of tools) {
     assert.equal(tool.group, "Zscaler");
     assert.equal(tool.kind, "domain");
