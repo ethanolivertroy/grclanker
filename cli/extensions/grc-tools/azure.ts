@@ -39,6 +39,11 @@ const LONG_LIVED_CREDENTIAL_DAYS = 730;
  * https://learn.microsoft.com/en-us/graph/deployments
  * https://learn.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure
  * https://learn.microsoft.com/en-us/entra/identity-platform/authentication-national-cloud
+ *
+ * The China cloud (operated by 21Vianet) is documented under two authority hosts:
+ * login.chinacloudapi.cn on the Graph deployments page and
+ * login.partner.microsoftonline.cn on the national cloud authentication page.
+ * Both resolve to the same Graph and ARM endpoints.
  */
 export interface AzureCloudEndpoints {
   name: "public" | "usgovernment" | "usgovernment-dod" | "china";
@@ -46,6 +51,9 @@ export interface AzureCloudEndpoints {
   graphBaseUrl: string;
   managementBaseUrl: string;
 }
+
+const CHINA_GRAPH_BASE_URL = "https://microsoftgraph.chinacloudapi.cn";
+const CHINA_MANAGEMENT_BASE_URL = "https://management.chinacloudapi.cn";
 
 export const AZURE_CLOUDS: Record<string, AzureCloudEndpoints> = {
   "login.microsoftonline.com": {
@@ -63,8 +71,14 @@ export const AZURE_CLOUDS: Record<string, AzureCloudEndpoints> = {
   "login.chinacloudapi.cn": {
     name: "china",
     authorityHost: "https://login.chinacloudapi.cn",
-    graphBaseUrl: "https://microsoftgraph.chinacloudapi.cn",
-    managementBaseUrl: "https://management.chinacloudapi.cn",
+    graphBaseUrl: CHINA_GRAPH_BASE_URL,
+    managementBaseUrl: CHINA_MANAGEMENT_BASE_URL,
+  },
+  "login.partner.microsoftonline.cn": {
+    name: "china",
+    authorityHost: "https://login.partner.microsoftonline.cn",
+    graphBaseUrl: CHINA_GRAPH_BASE_URL,
+    managementBaseUrl: CHINA_MANAGEMENT_BASE_URL,
   },
 };
 
@@ -110,9 +124,9 @@ export const AZURE_ENDPOINT_DOCS = {
   deviceCompliancePolicies: "https://learn.microsoft.com/en-us/graph/api/intune-deviceconfig-devicecompliancepolicy-list?view=graph-rest-1.0",
   managedDevices: "https://learn.microsoft.com/en-us/graph/api/intune-devices-manageddevice-list?view=graph-rest-1.0",
   complianceState: "https://learn.microsoft.com/en-us/graph/api/resources/intune-devices-compliancestate?view=graph-rest-1.0",
-  sensitivityLabels: "https://learn.microsoft.com/en-us/graph/api/security-informationprotection-list-sensitivitylabels?view=graph-rest-1.0",
-  sensitivityLabelResource: "https://learn.microsoft.com/en-us/graph/api/resources/security-sensitivitylabel?view=graph-rest-1.0",
-  informationProtectionResource: "https://learn.microsoft.com/en-us/graph/api/resources/security-informationprotection?view=graph-rest-1.0",
+  sensitivityLabels: "https://learn.microsoft.com/en-us/graph/api/security-informationprotection-list-sensitivitylabels?view=graph-rest-beta",
+  sensitivityLabelResource: "https://learn.microsoft.com/en-us/graph/api/resources/security-sensitivitylabel?view=graph-rest-beta",
+  informationProtectionResource: "https://learn.microsoft.com/en-us/graph/api/resources/security-informationprotection?view=graph-rest-beta",
   dlpPowerShell: "https://learn.microsoft.com/en-us/powershell/module/exchange/get-dlpcompliancepolicy",
   messageRules: "https://learn.microsoft.com/en-us/graph/api/mailfolder-list-messagerules?view=graph-rest-1.0",
   messageRuleActions: "https://learn.microsoft.com/en-us/graph/api/resources/messageruleactions?view=graph-rest-1.0",
@@ -128,9 +142,11 @@ export const AZURE_ENDPOINT_DOCS = {
   entraLogRetention: "https://learn.microsoft.com/en-us/entra/identity/monitoring-health/reference-reports-data-retention",
   entraDiagnosticSettings: "https://learn.microsoft.com/en-us/entra/identity/monitoring-health/howto-configure-diagnostic-settings",
   securityContacts: "https://learn.microsoft.com/en-us/rest/api/defenderforcloud/security-contacts/list",
+  securityContactsSpec: "https://github.com/Azure/azure-rest-api-specs/blob/main/specification/security/resource-manager/Microsoft.Security/Security/preview/2020-01-01-preview/securityContacts.json",
   roleAssignments: "https://learn.microsoft.com/en-us/rest/api/authorization/role-assignments/list-for-subscription",
   roleDefinitions: "https://learn.microsoft.com/en-us/rest/api/authorization/role-definitions/list",
   networkWatchers: "https://learn.microsoft.com/en-us/rest/api/network-watcher/network-watchers/list-all",
+  flowLogs: "https://learn.microsoft.com/en-us/rest/api/network-watcher/flow-logs/list",
   networkSecurityGroups: "https://learn.microsoft.com/en-us/rest/api/virtualnetwork/network-security-groups/list-all",
   keyVaults: "https://learn.microsoft.com/en-us/rest/api/keyvault/keyvault/vaults/list-by-subscription",
   storageAccounts: "https://learn.microsoft.com/en-us/rest/api/storagerp/storage-accounts/list",
@@ -139,15 +155,22 @@ export const AZURE_ENDPOINT_DOCS = {
   builtInPolicies: "https://learn.microsoft.com/en-us/azure/governance/policy/samples/built-in-policies",
 } as const;
 
-/** ARM api-versions, each taken from the request sample on the cited page. */
+/**
+ * ARM api-versions, each taken from the request sample on the cited page.
+ * securityContacts is the exception: the Learn page renders the composite
+ * package moniker (2023-12-01-preview), but Microsoft.Security/securityContacts
+ * is only defined in the 2020-01-01-preview (and 2017-08-01-preview) spec files,
+ * so that is the version the resource provider accepts.
+ */
 export const AZURE_ARM_API_VERSIONS = {
   subscription: "2022-12-01",
   defenderPricings: "2024-01-01",
   diagnosticSettings: "2021-05-01-preview",
-  securityContacts: "2023-12-01-preview",
+  securityContacts: "2020-01-01-preview",
   roleAssignments: "2022-04-01",
   roleDefinitions: "2022-04-01",
   networkWatchers: "2025-09-01",
+  flowLogs: "2025-09-01",
   networkSecurityGroups: "2025-09-01",
   keyVaults: "2024-11-01",
   storageAccounts: "2026-06-01",
@@ -929,9 +952,10 @@ export class AzureAuditorClient {
     return this.collectGraph("/v1.0/oauth2PermissionGrants");
   }
 
+  /** List users caps $top at 500 whenever $select or $filter includes signInActivity. */
   async listGuestUsers(): Promise<AzurePage> {
     return this.collectGraph(
-      "/v1.0/users?$filter=userType eq 'Guest'&$count=true&$top=999&$select=id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,externalUserState,signInActivity",
+      "/v1.0/users?$filter=userType eq 'Guest'&$count=true&$top=500&$select=id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,externalUserState,signInActivity",
       5000,
       { ConsistencyLevel: "eventual" },
     );
@@ -977,8 +1001,9 @@ export class AzureAuditorClient {
     return this.collectGraph("/v1.0/deviceManagement/managedDevices?$select=id,deviceName,complianceState,lastSyncDateTime");
   }
 
+  /** The tenant-wide (application) sensitivity label list is documented only under /beta. */
   async listSensitivityLabels(): Promise<AzurePage> {
-    return this.collectGraph("/v1.0/security/informationProtection/sensitivityLabels");
+    return this.collectGraph("/beta/security/informationProtection/sensitivityLabels");
   }
 
   async getSharePointSettings(): Promise<JsonRecord | null> {
@@ -1039,6 +1064,12 @@ export class AzureAuditorClient {
     return this.collectArm(`/subscriptions/${this.config.subscriptionId}/providers/Microsoft.Network/networkWatchers?api-version=${AZURE_ARM_API_VERSIONS.networkWatchers}`);
   }
 
+  async listFlowLogs(resourceGroupName: string, networkWatcherName: string): Promise<AzurePage> {
+    return this.collectArm(
+      `/subscriptions/${this.config.subscriptionId}/resourceGroups/${encodeURIComponent(resourceGroupName)}/providers/Microsoft.Network/networkWatchers/${encodeURIComponent(networkWatcherName)}/flowLogs?api-version=${AZURE_ARM_API_VERSIONS.flowLogs}`,
+    );
+  }
+
   async listNetworkSecurityGroups(): Promise<AzurePage> {
     return this.collectArm(`/subscriptions/${this.config.subscriptionId}/providers/Microsoft.Network/networkSecurityGroups?api-version=${AZURE_ARM_API_VERSIONS.networkSecurityGroups}`);
   }
@@ -1084,7 +1115,7 @@ type DataProtectionClient = Pick<
   "getNow" | "listConditionalAccessPolicies" | "listSubscribedSkus" | "listDeviceCompliancePolicies" | "listManagedDevices" | "listSensitivityLabels" | "listKeyVaults" | "listStorageAccounts" | "listMemberUsers" | "listInboxMessageRules" | "getSharePointSettings"
 >;
 
-type NetworkPolicyClient = Pick<AzureAuditorClient, "listNetworkSecurityGroups" | "listPolicyAssignments" | "summarizePolicyStates">;
+type NetworkPolicyClient = Pick<AzureAuditorClient, "listNetworkSecurityGroups" | "listPolicyAssignments" | "summarizePolicyStates" | "listNetworkWatchers" | "listFlowLogs">;
 
 function optionalCall<T>(method: (() => Promise<T>) | undefined, missing: string): () => Promise<T> {
   return method ?? (async () => {
@@ -1125,7 +1156,7 @@ export async function checkAzureAccess(
     notes,
     recommendedNextStep:
       status === "healthy"
-        ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, or azure_export_audit_bundle."
+        ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle."
         : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
   };
 }
@@ -1409,10 +1440,13 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
       const scopes = (asString(grant.scope) ?? "").toLowerCase().split(/\s+/);
       return scopes.some((scope) => HIGH_PRIVILEGE_DELEGATED_SCOPES.includes(scope));
     });
-    findings.push(finding("AZURE-ID-13", 22, "Tenant-wide delegated permission grants", "high", risky.length > 0 ? "fail" : capForPartial("pass", grants.value),
-      risky.length > 0
-        ? `${risky.length} AllPrincipals grants include high-privilege delegated scopes.`
-        : `No AllPrincipals grant carries a high-privilege delegated scope across ${grants.value.items.length} grants; zero risky grants is compliant by intent.${partialNote(grants.value, "permission grants")}`,
+    const status: AzureFindingStatus = grants.value.items.length === 0 ? "manual" : risky.length > 0 ? "fail" : capForPartial("pass", grants.value);
+    findings.push(finding("AZURE-ID-13", 22, "Tenant-wide delegated permission grants", "high", status,
+      grants.value.items.length === 0
+        ? "Zero oauth2PermissionGrants were returned; tenants with any consented enterprise application expose at least one grant, so confirm Directory.Read.All before treating the tenant as having no tenant-wide grants."
+        : risky.length > 0
+          ? `${risky.length} AllPrincipals grants include high-privilege delegated scopes.`
+          : `No AllPrincipals grant carries a high-privilege delegated scope across ${grants.value.items.length} grants; zero risky grants is compliant by intent.${partialNote(grants.value, "permission grants")}`,
       { grants: grants.value.items.length, risky_grants: risky.slice(0, 25).map((grant) => ({ clientId: grant.clientId, scope: grant.scope })), ...pageEvidence(grants.value) }));
   }
 
@@ -1632,7 +1666,7 @@ export async function assessAzureSubscriptionGuardrails(
   } else {
     findings.push(finding("AZURE-SUB-04", 24, "Network Watcher coverage", "medium", networkWatchers.value.items.length > 0 ? capForPartial("pass", networkWatchers.value) : "warn",
       networkWatchers.value.items.length > 0
-        ? `${networkWatchers.value.items.length} Network Watcher resources exist across the subscription; NSG flow log status is not read and stays a manual check.${partialNote(networkWatchers.value, "network watchers")}`
+        ? `${networkWatchers.value.items.length} Network Watcher resources exist across the subscription; NSG flow log coverage is assessed by AZURE-NP-04.${partialNote(networkWatchers.value, "network watchers")}`
         : "No Network Watcher resources exist for the subscription.",
       { network_watchers: networkWatchers.value.items.length, regions: networkWatchers.value.items.map((item) => item.location).slice(0, 50) }));
   }
@@ -1715,20 +1749,21 @@ export async function assessAzureDataProtection(
   }
 
   findings.push(finding("AZURE-DP-02", 10, "Data Loss Prevention policies", "medium", "manual",
-    "Microsoft Graph v1.0 exposes no DLP policy resource (the security informationProtection resource lists only sensitivityLabels and labelPolicySettings). Collect Get-DlpCompliancePolicy and Get-DlpComplianceRule output from Security & Compliance PowerShell as evidence.",
+    "Microsoft Graph exposes no DLP policy resource in v1.0 or beta (the beta security informationProtection resource lists only sensitivityLabels and labelPolicySettings). Collect Get-DlpCompliancePolicy and Get-DlpComplianceRule output from Security & Compliance PowerShell as evidence.",
     { graph_reference: AZURE_ENDPOINT_DOCS.informationProtectionResource, evidence_command: "Get-DlpCompliancePolicy | Format-List Name,Mode,Enabled,ExchangeLocation,SharePointLocation,OneDriveLocation", documentation: AZURE_ENDPOINT_DOCS.dlpPowerShell }));
 
+  const betaCaveat = "Read from the Graph beta endpoint, which Microsoft may change without notice.";
   if (!labels.ok) {
-    findings.push(manualForError("AZURE-DP-03", 11, "Sensitivity labels published", "medium", "GET /v1.0/security/informationProtection/sensitivityLabels", "InformationProtectionPolicy.Read.All with a Purview Information Protection license", "the sensitivity label policy export from the Purview portal", labels, AZURE_ENDPOINT_DOCS.sensitivityLabels, errors));
+    findings.push(manualForError("AZURE-DP-03", 11, "Sensitivity labels published", "medium", "GET /beta/security/informationProtection/sensitivityLabels", "InformationProtectionPolicy.Read.All with a Purview Information Protection license", "the sensitivity label policy export from the Purview portal", labels, AZURE_ENDPOINT_DOCS.sensitivityLabels, errors));
   } else {
     const active = labels.value.items.filter((label) => label.isActive === true);
     findings.push(finding("AZURE-DP-03", 11, "Sensitivity labels published", "medium", active.length > 0 ? capForPartial("pass", labels.value) : "fail",
       active.length > 0
-        ? `${active.length}/${labels.value.items.length} sensitivity labels are active (${labels.value.items.filter((label) => label.hasProtection === true).length} apply protection). Label application to content is not exposed and stays a manual check.${partialNote(labels.value, "labels")}`
+        ? `${active.length}/${labels.value.items.length} sensitivity labels are active (${labels.value.items.filter((label) => label.hasProtection === true).length} apply protection). Label application to content is not exposed and stays a manual check. ${betaCaveat}${partialNote(labels.value, "labels")}`
         : labels.value.items.length === 0
-          ? "Zero sensitivity labels are published (empty inventory fails by intent)."
-          : `${labels.value.items.length} labels exist but none is active.`,
-      { labels: labels.value.items.length, active_labels: active.length, ...pageEvidence(labels.value) }));
+          ? `Zero sensitivity labels are published (empty inventory fails by intent). ${betaCaveat}`
+          : `${labels.value.items.length} labels exist but none is active. ${betaCaveat}`,
+      { labels: labels.value.items.length, active_labels: active.length, endpoint: "GET /beta/security/informationProtection/sensitivityLabels", documentation: AZURE_ENDPOINT_DOCS.sensitivityLabels, ...pageEvidence(labels.value) }));
   }
 
   if (!vaults.ok) {
@@ -1889,12 +1924,35 @@ export function isExposedAdminRule(rule: JsonRecord): boolean {
   return ports.some(portRangeCoversAdminPort);
 }
 
+/** Resource ID shape from the Network Watchers - List All response sample. */
+const NETWORK_WATCHER_ID_PATTERN = /^\/subscriptions\/[^/]+\/resourceGroups\/([^/]+)\/providers\/Microsoft\.Network\/networkWatchers\/([^/]+)$/i;
+
+export function parseNetworkWatcherId(id: unknown): { resourceGroupName: string; networkWatcherName: string } | undefined {
+  const match = asString(id)?.match(NETWORK_WATCHER_ID_PATTERN);
+  return match ? { resourceGroupName: match[1], networkWatcherName: match[2] } : undefined;
+}
+
+function combinePages(pages: AzurePage[]): AzurePage {
+  const totals = pages.map((page) => page.total);
+  return {
+    items: pages.flatMap((page) => page.items),
+    truncated: pages.some((page) => page.truncated),
+    seen: pages.reduce((sum, page) => sum + page.seen, 0),
+    total: totals.every((total): total is number => total !== undefined) ? totals.reduce((sum, total) => sum + total, 0) : undefined,
+  };
+}
+
+function isNetworkSecurityGroupId(value: string): boolean {
+  return value.includes("/providers/microsoft.network/networksecuritygroups/");
+}
+
 export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): Promise<AzureAssessmentResult> {
   const errors: string[] = [];
-  const [nsgs, assignments, summary] = await Promise.all([
+  const [nsgs, assignments, summary, watchers] = await Promise.all([
     attemptPage(() => client.listNetworkSecurityGroups()),
     attemptPage(() => client.listPolicyAssignments()),
     attempt(() => client.summarizePolicyStates()),
+    attemptPage(() => client.listNetworkWatchers()),
   ]);
   const findings: AzureFinding[] = [];
 
@@ -1918,6 +1976,65 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
           ? `${exposed.length} inbound Allow rules expose ports ${ADMIN_PORTS.join("/")} to any source across ${nsgs.value.items.length} NSGs.`
           : `No inbound Allow rule exposes ports ${ADMIN_PORTS.join("/")} to any source across ${nsgs.value.items.length} NSGs.${partialNote(nsgs.value, "NSGs")}`,
       { network_security_groups: nsgs.value.items.length, exposed_rules: exposed.slice(0, 25), admin_ports: ADMIN_PORTS, ...pageEvidence(nsgs.value) }));
+  }
+
+  const flowLogPages: AzurePage[] = [];
+  let flowLogFailure: { error: string; status?: number } | undefined;
+  const unparsedWatchers: string[] = [];
+  if (watchers.ok && nsgs.ok) {
+    for (const watcher of watchers.value.items) {
+      const parsed = parseNetworkWatcherId(watcher.id);
+      if (!parsed) {
+        unparsedWatchers.push(asString(watcher.name) ?? asString(watcher.id) ?? "unknown");
+        continue;
+      }
+      const page = await attemptPage(() => client.listFlowLogs(parsed.resourceGroupName, parsed.networkWatcherName));
+      if (!page.ok) {
+        flowLogFailure = page;
+        break;
+      }
+      flowLogPages.push(page.value);
+    }
+  }
+  const flowLogPage = combinePages(flowLogPages);
+  if (!watchers.ok) {
+    findings.push(manualForError("AZURE-NP-04", 24, "NSG flow logs enabled", "medium", "GET Microsoft.Network/networkWatchers", "Reader on the subscription", "the flow logs page of every Network Watcher", watchers, AZURE_ENDPOINT_DOCS.networkWatchers, errors));
+  } else if (!nsgs.ok) {
+    findings.push(manualForError("AZURE-NP-04", 24, "NSG flow logs enabled", "medium", "GET Microsoft.Network/networkSecurityGroups", "Reader on the subscription", "the NSG inventory with flow log status", nsgs, AZURE_ENDPOINT_DOCS.networkSecurityGroups, errors));
+  } else if (flowLogFailure) {
+    findings.push(manualForError("AZURE-NP-04", 24, "NSG flow logs enabled", "medium", "GET Microsoft.Network/networkWatchers/{networkWatcherName}/flowLogs", "Reader on the Network Watcher resource group", "the flow logs page of every Network Watcher", flowLogFailure, AZURE_ENDPOINT_DOCS.flowLogs, errors));
+  } else if (unparsedWatchers.length > 0) {
+    errors.push(`AZURE-NP-04 GET Microsoft.Network/networkWatchers: ${unparsedWatchers.length} watcher ids did not match the documented resource ID shape`);
+    findings.push(finding("AZURE-NP-04", 24, "NSG flow logs enabled", "medium", "manual",
+      `${unparsedWatchers.length} Network Watcher ids did not match the documented /subscriptions/{id}/resourceGroups/{rg}/providers/Microsoft.Network/networkWatchers/{name} shape, so their flow logs were not read; collect the flow logs page manually.`,
+      { unparsed_watchers: unparsedWatchers.slice(0, 25), documentation: AZURE_ENDPOINT_DOCS.networkWatchers }));
+  } else {
+    const flowLogs = flowLogPage.items;
+    const enabledTargets = new Set<string>();
+    let disabledFlowLogs = 0;
+    const details: JsonRecord[] = [];
+    for (const flowLog of flowLogs) {
+      const properties = asObject(flowLog.properties) ?? {};
+      const target = asLower(properties.targetResourceId);
+      const retentionPolicy = asObject(properties.retentionPolicy);
+      if (properties.enabled === true && target) enabledTargets.add(target);
+      else disabledFlowLogs += 1;
+      details.push({ name: flowLog.name ?? null, targetResourceId: properties.targetResourceId ?? null, enabled: properties.enabled ?? null, retention_days: asNumber(retentionPolicy?.days) ?? null, retention_enabled: retentionPolicy?.enabled ?? null, provisioningState: properties.provisioningState ?? null });
+    }
+    const uncovered = nsgs.value.items.filter((nsg) => !enabledTargets.has(asLower(nsg.id) ?? ""));
+    const covered = nsgs.value.items.length - uncovered.length;
+    const nonNsgTargets = [...enabledTargets].filter((target) => !isNetworkSecurityGroupId(target)).length;
+    const pages = [nsgs.value, watchers.value, flowLogPage];
+    const status: AzureFindingStatus = nsgs.value.items.length === 0
+      ? "manual"
+      : uncovered.length === 0 ? capForPartial("pass", ...pages) : covered > 0 ? "warn" : "fail";
+    findings.push(finding("AZURE-NP-04", 24, "NSG flow logs enabled", "medium", status,
+      nsgs.value.items.length === 0
+        ? "Zero network security groups were returned; confirm the subscription has none before treating flow logging as not applicable."
+        : watchers.value.items.length === 0
+          ? `${nsgs.value.items.length} NSGs exist but no Network Watcher resource exists, so no flow log can be enabled.`
+          : `${covered}/${nsgs.value.items.length} NSGs have an enabled flow log (${flowLogs.length} flow logs across ${watchers.value.items.length} Network Watchers, ${disabledFlowLogs} disabled or without a target, ${nonNsgTargets} enabled flow logs target other resource types and are not credited to an NSG). Retention policy values are reported as evidence, not judged.${partialNote(nsgs.value, "NSGs")}${partialNote(watchers.value, "network watchers")}${partialNote(flowLogPage, "flow logs")}`,
+      { network_security_groups: nsgs.value.items.length, covered_nsgs: covered, uncovered_nsgs: uncovered.slice(0, 25).map((nsg) => nsg.name ?? nsg.id), network_watchers: watchers.value.items.length, flow_logs: flowLogs.length, disabled_flow_logs: disabledFlowLogs, non_nsg_targets: nonNsgTargets, flow_log_details: details.slice(0, 25), ...pageEvidence(flowLogPage) }));
   }
 
   if (!assignments.ok) {
@@ -1951,6 +2068,8 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
     title: "Azure network and policy posture",
     summary: {
       network_security_groups: nsgs.ok ? nsgs.value.items.length : null,
+      network_watchers: watchers.ok ? watchers.value.items.length : null,
+      flow_logs: flowLogPage.seen,
       policy_assignments: assignments.ok ? assignments.value.items.length : null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
@@ -2146,8 +2265,7 @@ export async function exportAzureAuditBundle(
   const networkAndPolicy = await assessAzureNetworkAndPolicy(client);
 
   const assessments = [identity, monitoring, subscriptionGuardrails, dataProtection, networkAndPolicy];
-  const findings = assessments.flatMap((assessment) => assessment.findings);
-  const errors = assessments.flatMap((assessment) => assessment.errors);
+  const { findings, errors } = mergeAssessments("Azure audit bundle", assessments);
   const generatedAt = new Date().toISOString();
   const targetName = safeDirName(`${config.tenantId}-${config.subscriptionId}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
@@ -2223,10 +2341,6 @@ function normalizeDataProtectionArgs(args: unknown): DataProtectionArgs {
   };
 }
 
-function normalizeGuardrailArgs(args: unknown): SubscriptionArgs & DataProtectionArgs {
-  return { ...normalizeSubscriptionArgs(args), ...normalizeDataProtectionArgs(args) };
-}
-
 export function mergeAssessments(title: string, assessments: AzureAssessmentResult[]): AzureAssessmentResult {
   return {
     title,
@@ -2256,7 +2370,7 @@ const authParams = {
   management_token: Type.Optional(Type.String({ description: "Explicit ARM bearer token. Defaults to AZURE_MANAGEMENT_TOKEN, client credentials, or az account get-access-token." })),
   client_id: Type.Optional(Type.String({ description: "App registration client ID for the OAuth 2.0 client credentials flow. Defaults to AZURE_CLIENT_ID." })),
   client_secret: Type.Optional(Type.String({ description: "Client secret for the client credentials flow. Defaults to AZURE_CLIENT_SECRET." })),
-  authority_host: Type.Optional(Type.String({ description: "Authority host: login.microsoftonline.com (default), login.microsoftonline.us (US Government), or login.chinacloudapi.cn. Defaults to AZURE_AUTHORITY_HOST." })),
+  authority_host: Type.Optional(Type.String({ description: "Authority host: login.microsoftonline.com (default), login.microsoftonline.us (US Government), login.chinacloudapi.cn or login.partner.microsoftonline.cn (China). Defaults to AZURE_AUTHORITY_HOST." })),
 };
 
 const maxMailboxesParam = Type.Optional(Type.Number({ description: `Maximum member mailboxes to inspect for inbox forwarding rules. Defaults to ${DEFAULT_MAX_MAILBOXES}.`, default: DEFAULT_MAX_MAILBOXES }));
@@ -2325,24 +2439,59 @@ export function registerAzureTools(pi: any): void {
 
   pi.registerTool({
     name: "azure_assess_subscription_guardrails",
-    label: "Assess Azure subscription and tenant guardrails",
+    label: "Assess Azure subscription guardrails",
     description:
-      "Assess Azure subscription guardrails (RBAC sprawl, security contacts, Network Watcher, privileged service principals), network and policy posture (NSG admin-port exposure, Azure Policy enforcement and compliance), and data and endpoint protection (Intune compliance, DLP and sensitivity labels, Key Vault, storage, inbox forwarding, SharePoint sharing).",
-    parameters: Type.Object({ ...authParams, max_assignments: maxAssignmentsParam, max_mailboxes: maxMailboxesParam }),
-    prepareArguments: normalizeGuardrailArgs,
-    async execute(_toolCallId: string, args: SubscriptionArgs & DataProtectionArgs) {
+      "Assess Azure subscription guardrails: Owner and Contributor sprawl at subscription scope, Defender for Cloud security contacts, Network Watcher presence, and service principals holding Owner or Contributor.",
+    parameters: Type.Object({ ...authParams, max_assignments: maxAssignmentsParam }),
+    prepareArguments: normalizeSubscriptionArgs,
+    async execute(_toolCallId: string, args: SubscriptionArgs) {
       try {
-        const client = createClient(args);
-        const result = mergeAssessments("Azure subscription and tenant guardrails", [
-          await assessAzureSubscriptionGuardrails(client, { maxAssignments: args.max_assignments }),
-          await assessAzureNetworkAndPolicy(client),
-          await assessAzureDataProtection(client, { maxMailboxes: args.max_mailboxes }),
-        ]);
+        const result = await assessAzureSubscriptionGuardrails(createClient(args), { maxAssignments: args.max_assignments });
         return textResult(formatAssessmentText(result), { tool: "azure_assess_subscription_guardrails", ...result });
       } catch (error) {
         return errorResult(
           `Azure subscription guardrail assessment failed: ${error instanceof Error ? error.message : String(error)}`,
           { tool: "azure_assess_subscription_guardrails" },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "azure_assess_data_protection",
+    label: "Assess Azure data and endpoint protection",
+    description:
+      "Assess Intune device compliance, DLP policy evidence, sensitivity labels (Graph beta), Key Vault soft delete, purge protection, RBAC and network ACLs, storage HTTPS-only, public blob access and TLS, inbox forwarding rules, and SharePoint external sharing.",
+    parameters: Type.Object({ ...authParams, max_mailboxes: maxMailboxesParam }),
+    prepareArguments: normalizeDataProtectionArgs,
+    async execute(_toolCallId: string, args: DataProtectionArgs) {
+      try {
+        const result = await assessAzureDataProtection(createClient(args), { maxMailboxes: args.max_mailboxes });
+        return textResult(formatAssessmentText(result), { tool: "azure_assess_data_protection", ...result });
+      } catch (error) {
+        return errorResult(
+          `Azure data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "azure_assess_data_protection" },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "azure_assess_network_and_policy",
+    label: "Assess Azure network and policy posture",
+    description:
+      "Assess NSG inbound rules exposing admin ports to any source, NSG flow log coverage per Network Watcher, Azure Policy assignment enforcement, and Azure Policy compliance state.",
+    parameters: Type.Object(authParams),
+    prepareArguments: normalizeCheckAccessArgs,
+    async execute(_toolCallId: string, args: CheckAccessArgs) {
+      try {
+        const result = await assessAzureNetworkAndPolicy(createClient(args));
+        return textResult(formatAssessmentText(result), { tool: "azure_assess_network_and_policy", ...result });
+      } catch (error) {
+        return errorResult(
+          `Azure network and policy assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "azure_assess_network_and_policy" },
         );
       }
     },

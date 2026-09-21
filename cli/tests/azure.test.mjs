@@ -22,11 +22,13 @@ import {
   checkAzureAccess,
   exportAzureAuditBundle,
   isExposedAdminRule,
+  parseNetworkWatcherId,
   resolveAzureCloud,
   resolveAzureConfiguration,
   resolveSecureOutputPath,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
+import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
 const ASSESSORS = [
@@ -41,10 +43,23 @@ const CLIENT_METHODS = [
   "listServicePrincipals", "getAuthorizationPolicy", "listGuestUsers", "listSubscribedSkus", "listRiskyUsers", "listRiskDetections",
   "listRoleEligibilitySchedules", "listRoleAssignmentSchedules", "listApplications", "listOAuth2PermissionGrants", "listSecureScores",
   "listSecurityAlerts", "listDirectoryAudits", "listSignIns", "listDefenderPricings", "listDiagnosticSettings", "listLogAnalyticsWorkspaces",
-  "listRoleAssignments", "listRoleDefinitions", "listSecurityContacts", "listNetworkWatchers", "listDeviceCompliancePolicies", "listManagedDevices",
+  "listRoleAssignments", "listRoleDefinitions", "listSecurityContacts", "listNetworkWatchers", "listFlowLogs", "listDeviceCompliancePolicies", "listManagedDevices",
   "listSensitivityLabels", "listKeyVaults", "listStorageAccounts", "listMemberUsers", "listInboxMessageRules", "getSharePointSettings",
-  "listNetworkSecurityGroups", "listPolicyAssignments", "summarizePolicyStates", "getOrganization",
+  "listNetworkSecurityGroups", "listPolicyAssignments", "summarizePolicyStates", "getOrganization", "getSubscription",
 ];
+const NSG_ID = "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg-1";
+const WATCHER_ID = "/subscriptions/sub-123/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_eastus";
+const ENABLED_FLOW_LOG = {
+  name: "nsg-1-flowlog",
+  type: "Microsoft.Network/networkWatchers/FlowLogs",
+  properties: {
+    enabled: true,
+    targetResourceId: NSG_ID,
+    storageId: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/st1",
+    retentionPolicy: { days: 90, enabled: true },
+    provisioningState: "Succeeded",
+  },
+};
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -124,7 +139,8 @@ function compliantClient() {
     async listRoleAssignments() { return [{ properties: { roleDefinitionId: "/subscriptions/sub-123/providers/Microsoft.Authorization/roleDefinitions/reader-role", principalType: "User" } }]; },
     async listRoleDefinitions() { return [{ id: "/subscriptions/sub-123/providers/Microsoft.Authorization/roleDefinitions/reader-role", properties: { roleName: "Reader" } }]; },
     async listSecurityContacts() { return [{ properties: { emails: "soc@example.com" } }]; },
-    async listNetworkWatchers() { return [{ id: "nw-1", location: "eastus" }]; },
+    async listNetworkWatchers() { return [{ id: WATCHER_ID, name: "NetworkWatcher_eastus", location: "eastus" }]; },
+    async listFlowLogs() { return [ENABLED_FLOW_LOG]; },
     async listDeviceCompliancePolicies() { return [{ id: "cp-1", displayName: "Windows baseline" }]; },
     async listManagedDevices() { return [{ id: "dev-1", complianceState: "compliant" }]; },
     async listSensitivityLabels() { return [{ id: "label-1", name: "Confidential", isActive: true, hasProtection: true }]; },
@@ -133,7 +149,7 @@ function compliantClient() {
     async listMemberUsers() { return [{ id: "user-1", userPrincipalName: "alice@example.com" }]; },
     async listInboxMessageRules() { return [{ id: "rule-1", displayName: "Archive", isEnabled: true, actions: { moveToFolder: "archive" } }]; },
     async getSharePointSettings() { return { sharingCapability: "existingExternalUserSharingOnly", sharingDomainRestrictionMode: "allowList", isResharingByExternalUsersEnabled: false }; },
-    async listNetworkSecurityGroups() { return [{ name: "nsg-1", properties: { securityRules: [{ name: "allow-https", properties: { access: "Allow", direction: "Inbound", protocol: "Tcp", sourceAddressPrefix: "Internet", destinationPortRange: "443" } }] } }]; },
+    async listNetworkSecurityGroups() { return [{ id: NSG_ID, name: "nsg-1", properties: { securityRules: [{ name: "allow-https", properties: { access: "Allow", direction: "Inbound", protocol: "Tcp", sourceAddressPrefix: "Internet", destinationPortRange: "443" } }] } }]; },
     async listPolicyAssignments() { return [{ name: "locations", properties: { enforcementMode: "Default", policyDefinitionId: "/providers/Microsoft.Authorization/policyDefinitions/e56962a6-4747-49cd-b67b-bf8b01975c4c" } }]; },
     async summarizePolicyStates() { return { value: [{ results: { nonCompliantResources: 0, nonCompliantPolicies: 0 } }] }; },
   });
@@ -175,6 +191,34 @@ test("resolveAzureConfiguration accepts client credentials without az CLI and ma
   assert.equal(resolved.cloud.managementBaseUrl, "https://management.usgovcloudapi.net");
   assert.equal(resolveAzureCloud("https://login.chinacloudapi.cn/").managementBaseUrl, "https://management.chinacloudapi.cn");
   assert.throws(() => resolveAzureCloud("login.example.invalid"), /Unsupported AZURE_AUTHORITY_HOST/);
+});
+
+test("resolveAzureCloud accepts both documented China authority hosts", async () => {
+  // login.chinacloudapi.cn comes from the Graph deployments page; login.partner.microsoftonline.cn from the national cloud authentication page.
+  for (const host of ["login.chinacloudapi.cn", "login.partner.microsoftonline.cn", "https://login.partner.microsoftonline.cn/"]) {
+    const cloud = resolveAzureCloud(host);
+    assert.equal(cloud.name, "china", host);
+    assert.equal(cloud.graphBaseUrl, "https://microsoftgraph.chinacloudapi.cn", host);
+    assert.equal(cloud.managementBaseUrl, "https://management.chinacloudapi.cn", host);
+  }
+  assert.equal(resolveAzureCloud("login.partner.microsoftonline.cn").authorityHost, "https://login.partner.microsoftonline.cn");
+  assert.equal(resolveAzureCloud("login.chinacloudapi.cn").authorityHost, "https://login.chinacloudapi.cn");
+
+  const requests = [];
+  const fetchImpl = async (url, init = {}) => {
+    requests.push({ url, init });
+    if (url.endsWith("/oauth2/v2.0/token")) return new Response(JSON.stringify({ access_token: "cn-token", expires_in: 3599 }), { status: 200 });
+    return new Response(JSON.stringify({ value: [] }), { status: 200 });
+  };
+  const config = resolveAzureConfiguration(
+    {},
+    { AZURE_TENANT_ID: "tenant-cn", AZURE_SUBSCRIPTION_ID: "sub-cn", AZURE_CLIENT_ID: "client-cn", AZURE_CLIENT_SECRET: "secret-cn", AZURE_AUTHORITY_HOST: "login.partner.microsoftonline.cn" },
+    () => undefined,
+  );
+  await new AzureAuditorClient(config, { fetchImpl, now: () => NOW }).listSubscribedSkus();
+  assert.equal(requests[0].url, "https://login.partner.microsoftonline.cn/tenant-cn/oauth2/v2.0/token");
+  assert.equal(new URLSearchParams(requests[0].init.body).get("scope"), "https://microsoftgraph.chinacloudapi.cn/.default");
+  assert.equal(requests[1].url, "https://microsoftgraph.chinacloudapi.cn/v1.0/subscribedSkus");
   assert.throws(
     () => resolveAzureConfiguration({}, { AZURE_TENANT_ID: "t", AZURE_SUBSCRIPTION_ID: "s", AZURE_CLIENT_ID: "c", AZURE_CLIENT_CERTIFICATE_PATH: "/tmp/cert.pem" }, () => undefined),
     /certificate credentials are not implemented/,
@@ -215,7 +259,10 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
   assert.equal(requests[3].url, `https://management.usgovcloudapi.net/subscriptions/sub-1?api-version=${AZURE_ARM_API_VERSIONS.subscription}`);
 });
 
-test("AzureAuditorClient sends the documented request URL and API version for every endpoint", async () => {
+// Prototype members that do not issue a Graph or ARM request; every other client method must appear in the URL assertions below.
+const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectGraph", "collectArm", "graph", "arm"]);
+
+test("AzureAuditorClient sends the documented request URL and API version for every request method", async () => {
   const requests = [];
   const fetchImpl = async (url, init = {}) => {
     requests.push({ url, init });
@@ -224,51 +271,71 @@ test("AzureAuditorClient sends the documented request URL and API version for ev
   const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
   const sub = "https://management.azure.com/subscriptions/sub-123";
   const graph = "https://graph.microsoft.com/v1.0";
+  const graphBeta = "https://graph.microsoft.com/beta";
   const expectations = [
-    [() => client.listConditionalAccessPolicies(), `${graph}/identity/conditionalAccess/policies`],
-    [() => client.listUserRegistrationDetails(), `${graph}/reports/authenticationMethods/userRegistrationDetails`],
-    [() => client.listDirectoryRoles(), `${graph}/directoryRoles`],
-    [() => client.listDirectoryRoleMembers("role 1"), `${graph}/directoryRoles/role%201/members`],
-    [() => client.getSecurityDefaultsPolicy(), `${graph}/policies/identitySecurityDefaultsEnforcementPolicy`],
-    [() => client.getAuthorizationPolicy(), `${graph}/policies/authorizationPolicy`],
-    [() => client.listApplications(), `${graph}/applications?$top=999&$select=id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials&$expand=owners($select=id)`],
-    [() => client.listOAuth2PermissionGrants(), `${graph}/oauth2PermissionGrants`],
-    [() => client.listGuestUsers(), `${graph}/users?$filter=userType eq 'Guest'&$count=true&$top=999&$select=id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,externalUserState,signInActivity`],
-    [() => client.listInboxMessageRules("user-1"), `${graph}/users/user-1/mailFolders/inbox/messageRules`],
-    [() => client.listRiskyUsers(), `${graph}/identityProtection/riskyUsers?$filter=riskState eq 'atRisk' or riskState eq 'confirmedCompromised'`],
-    [() => client.listRiskDetections(), `${graph}/identityProtection/riskDetections?$top=500`],
-    [() => client.listSubscribedSkus(), `${graph}/subscribedSkus`],
-    [() => client.listRoleEligibilitySchedules(), `${graph}/roleManagement/directory/roleEligibilitySchedules`],
-    [() => client.listRoleAssignmentSchedules(), `${graph}/roleManagement/directory/roleAssignmentSchedules?$filter=assignmentType eq 'Assigned'`],
-    [() => client.listDeviceCompliancePolicies(), `${graph}/deviceManagement/deviceCompliancePolicies`],
-    [() => client.listManagedDevices(), `${graph}/deviceManagement/managedDevices?$select=id,deviceName,complianceState,lastSyncDateTime`],
-    [() => client.listSensitivityLabels(), `${graph}/security/informationProtection/sensitivityLabels`],
-    [() => client.getSharePointSettings(), `${graph}/admin/sharepoint/settings`],
-    [() => client.listSecureScores(), `${graph}/security/secureScores?$top=20`],
-    [() => client.listDefenderPricings(), `${sub}/providers/Microsoft.Security/pricings?api-version=2024-01-01`],
-    [() => client.listDiagnosticSettings(), `${sub}/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview`],
-    [() => client.listLogAnalyticsWorkspaces(), `${sub}/providers/Microsoft.OperationalInsights/workspaces?api-version=2026-03-01`],
-    [() => client.listSecurityContacts(), `${sub}/providers/Microsoft.Security/securityContacts?api-version=2023-12-01-preview`],
-    [() => client.listRoleAssignments(), `${sub}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()`],
-    [() => client.listRoleDefinitions(), `${sub}/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01`],
-    [() => client.listNetworkWatchers(), `${sub}/providers/Microsoft.Network/networkWatchers?api-version=2025-09-01`],
-    [() => client.listNetworkSecurityGroups(), `${sub}/providers/Microsoft.Network/networkSecurityGroups?api-version=2025-09-01`],
-    [() => client.listKeyVaults(), `${sub}/providers/Microsoft.KeyVault/vaults?api-version=2024-11-01`],
-    [() => client.listStorageAccounts(), `${sub}/providers/Microsoft.Storage/storageAccounts?api-version=2026-06-01`],
-    [() => client.listPolicyAssignments(), `${sub}/providers/Microsoft.Authorization/policyAssignments?api-version=2026-07-01&$filter=atScope()`],
-    [() => client.summarizePolicyStates(), `${sub}/providers/Microsoft.PolicyInsights/policyStates/latest/summarize?api-version=2024-10-01`],
+    ["getOrganization", () => client.getOrganization(), `${graph}/organization`],
+    ["listConditionalAccessPolicies", () => client.listConditionalAccessPolicies(), `${graph}/identity/conditionalAccess/policies`],
+    ["listUserRegistrationDetails", () => client.listUserRegistrationDetails(), `${graph}/reports/authenticationMethods/userRegistrationDetails`],
+    ["listDirectoryRoles", () => client.listDirectoryRoles(), `${graph}/directoryRoles`],
+    ["listDirectoryRoleMembers", () => client.listDirectoryRoleMembers("role 1"), `${graph}/directoryRoles/role%201/members`],
+    ["getSecurityDefaultsPolicy", () => client.getSecurityDefaultsPolicy(), `${graph}/policies/identitySecurityDefaultsEnforcementPolicy`],
+    ["getAuthorizationPolicy", () => client.getAuthorizationPolicy(), `${graph}/policies/authorizationPolicy`],
+    ["listServicePrincipals", () => client.listServicePrincipals(), `${graph}/servicePrincipals?$top=100&$select=id,displayName,appId,passwordCredentials,keyCredentials`],
+    ["listApplications", () => client.listApplications(), `${graph}/applications?$top=999&$select=id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials&$expand=owners($select=id)`],
+    ["listOAuth2PermissionGrants", () => client.listOAuth2PermissionGrants(), `${graph}/oauth2PermissionGrants`],
+    // List users caps $top at 500 when $select includes signInActivity; the plain member list keeps the 999 maximum.
+    ["listGuestUsers", () => client.listGuestUsers(), `${graph}/users?$filter=userType eq 'Guest'&$count=true&$top=500&$select=id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,externalUserState,signInActivity`],
+    ["listMemberUsers", () => client.listMemberUsers(10), `${graph}/users?$filter=userType eq 'Member' and accountEnabled eq true&$count=true&$top=999&$select=id,userPrincipalName,mail`],
+    ["listInboxMessageRules", () => client.listInboxMessageRules("user-1"), `${graph}/users/user-1/mailFolders/inbox/messageRules`],
+    ["listRiskyUsers", () => client.listRiskyUsers(), `${graph}/identityProtection/riskyUsers?$filter=riskState eq 'atRisk' or riskState eq 'confirmedCompromised'`],
+    ["listRiskDetections", () => client.listRiskDetections(), `${graph}/identityProtection/riskDetections?$top=500`],
+    ["listSubscribedSkus", () => client.listSubscribedSkus(), `${graph}/subscribedSkus`],
+    ["listRoleEligibilitySchedules", () => client.listRoleEligibilitySchedules(), `${graph}/roleManagement/directory/roleEligibilitySchedules`],
+    ["listRoleAssignmentSchedules", () => client.listRoleAssignmentSchedules(), `${graph}/roleManagement/directory/roleAssignmentSchedules?$filter=assignmentType eq 'Assigned'`],
+    ["listDeviceCompliancePolicies", () => client.listDeviceCompliancePolicies(), `${graph}/deviceManagement/deviceCompliancePolicies`],
+    ["listManagedDevices", () => client.listManagedDevices(), `${graph}/deviceManagement/managedDevices?$select=id,deviceName,complianceState,lastSyncDateTime`],
+    // The tenant-wide sensitivity label list is documented only under /beta.
+    ["listSensitivityLabels", () => client.listSensitivityLabels(), `${graphBeta}/security/informationProtection/sensitivityLabels`],
+    ["getSharePointSettings", () => client.getSharePointSettings(), `${graph}/admin/sharepoint/settings`],
+    ["listSecureScores", () => client.listSecureScores(), `${graph}/security/secureScores?$top=20`],
+    ["listSecurityAlerts", () => client.listSecurityAlerts(), `${graph}/security/alerts_v2?$top=50`],
+    ["listDirectoryAudits", () => client.listDirectoryAudits(), `${graph}/auditLogs/directoryAudits?$top=50`],
+    ["listSignIns", () => client.listSignIns(), `${graph}/auditLogs/signIns?$top=50`],
+    ["getSubscription", () => client.getSubscription(), `${sub}?api-version=2022-12-01`],
+    ["listDefenderPricings", () => client.listDefenderPricings(), `${sub}/providers/Microsoft.Security/pricings?api-version=2024-01-01`],
+    ["listDiagnosticSettings", () => client.listDiagnosticSettings(), `${sub}/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview`],
+    ["listLogAnalyticsWorkspaces", () => client.listLogAnalyticsWorkspaces(), `${sub}/providers/Microsoft.OperationalInsights/workspaces?api-version=2026-03-01`],
+    // Microsoft.Security/securityContacts is defined only in the 2020-01-01-preview and 2017-08-01-preview spec files.
+    ["listSecurityContacts", () => client.listSecurityContacts(), `${sub}/providers/Microsoft.Security/securityContacts?api-version=2020-01-01-preview`],
+    ["listRoleAssignments", () => client.listRoleAssignments(), `${sub}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()`],
+    ["listRoleDefinitions", () => client.listRoleDefinitions(), `${sub}/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01`],
+    ["listNetworkWatchers", () => client.listNetworkWatchers(), `${sub}/providers/Microsoft.Network/networkWatchers?api-version=2025-09-01`],
+    ["listFlowLogs", () => client.listFlowLogs("rg1", "nw1"), `${sub}/resourceGroups/rg1/providers/Microsoft.Network/networkWatchers/nw1/flowLogs?api-version=2025-09-01`],
+    ["listNetworkSecurityGroups", () => client.listNetworkSecurityGroups(), `${sub}/providers/Microsoft.Network/networkSecurityGroups?api-version=2025-09-01`],
+    ["listKeyVaults", () => client.listKeyVaults(), `${sub}/providers/Microsoft.KeyVault/vaults?api-version=2024-11-01`],
+    ["listStorageAccounts", () => client.listStorageAccounts(), `${sub}/providers/Microsoft.Storage/storageAccounts?api-version=2026-06-01`],
+    ["listPolicyAssignments", () => client.listPolicyAssignments(), `${sub}/providers/Microsoft.Authorization/policyAssignments?api-version=2026-07-01&$filter=atScope()`],
+    ["summarizePolicyStates", () => client.summarizePolicyStates(), `${sub}/providers/Microsoft.PolicyInsights/policyStates/latest/summarize?api-version=2024-10-01`],
   ];
-  for (const [call, expectedUrl] of expectations) {
+
+  const requestMethods = Object.getOwnPropertyNames(AzureAuditorClient.prototype).filter((name) => !NON_REQUEST_CLIENT_MEMBERS.has(name)).sort();
+  assert.deepEqual(expectations.map(([name]) => name).sort(), requestMethods, "every request method needs a URL assertion");
+  assert.equal(AZURE_ARM_API_VERSIONS.securityContacts, "2020-01-01-preview");
+  assert.equal(AZURE_ARM_API_VERSIONS.flowLogs, AZURE_ARM_API_VERSIONS.networkWatchers);
+
+  for (const [name, call, expectedUrl] of expectations) {
     requests.length = 0;
     await call();
-    assert.equal(requests[0].url, expectedUrl);
+    assert.equal(requests.length, 1, name);
+    assert.equal(requests[0].url, expectedUrl, name);
+    assert.equal(requests[0].init.method ?? "GET", name === "summarizePolicyStates" ? "POST" : "GET", name);
   }
   requests.length = 0;
   await client.listGuestUsers();
   assert.equal(requests[0].init.headers.ConsistencyLevel, "eventual");
   requests.length = 0;
-  await client.summarizePolicyStates();
-  assert.equal(requests[0].init.method, "POST");
+  await client.listMemberUsers(10);
+  assert.equal(requests[0].init.headers.ConsistencyLevel, "eventual");
 });
 
 test("pagination follows @odata.nextLink and nextLink to completion and records truncation", async () => {
@@ -320,6 +387,7 @@ test("checkAzureAccess reports readable audit surfaces", async () => {
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 8);
   assert.equal(result.surfaces.find((surface) => surface.name === "defender_pricings").count, 1);
   assert.match(result.recommendedNextStep, /azure_assess_subscription_guardrails/);
+  assert.match(result.recommendedNextStep, /azure_assess_data_protection, azure_assess_network_and_policy/);
 });
 
 test("assessAzureIdentity flags weak auth baseline and privileged role sprawl", async () => {
@@ -439,6 +507,8 @@ test("assessAzureDataProtection and assessAzureNetworkAndPolicy detect misconfig
   assert.equal(network["AZURE-NP-01"], "fail");
   assert.equal(network["AZURE-NP-02"], "fail");
   assert.equal(network["AZURE-NP-03"], "warn");
+  // An NSG exists but the subscription has no Network Watcher, so no flow log can exist.
+  assert.equal(network["AZURE-NP-04"], "fail");
   assert.equal(isExposedAdminRule({ properties: { access: "Deny", direction: "Inbound", protocol: "*", sourceAddressPrefix: "*", destinationPortRange: "22" } }), false);
   assert.equal(isExposedAdminRule({ properties: { access: "Allow", direction: "Outbound", protocol: "*", sourceAddressPrefix: "*", destinationPortRange: "22" } }), false);
   assert.equal(isExposedAdminRule({ properties: { access: "Allow", direction: "Inbound", protocol: "Udp", sourceAddressPrefix: "*", destinationPortRange: "22" } }), false);
@@ -469,7 +539,8 @@ test("verdict safety 2: empty inventories never pass by default (fixture b)", as
     async getSharePointSettings() { return {}; },
     async summarizePolicyStates() { return { value: [] }; },
   });
-  const compliantByIntent = new Set(["AZURE-ID-08", "AZURE-ID-11", "AZURE-ID-13"]);
+  // AZURE-ID-13 used to pass on an empty grant list; it now renders manual like ID-05 and ID-12 because emptiness usually means a read problem.
+  const compliantByIntent = new Set(["AZURE-ID-08", "AZURE-ID-11"]);
   const expectedFail = new Set(["AZURE-ID-01", "AZURE-ID-02", "AZURE-MON-05", "AZURE-MON-06", "AZURE-SUB-03", "AZURE-DP-03", "AZURE-NP-02"]);
   for (const [name, run] of ASSESSORS) {
     const result = await run(emptyClient);
@@ -484,6 +555,13 @@ test("verdict safety 2: empty inventories never pass by default (fixture b)", as
       }
     }
   }
+  const grants = (await assessAzureIdentity(emptyClient)).findings.find((item) => item.id === "AZURE-ID-13");
+  assert.equal(grants.status, "manual");
+  assert.match(grants.summary, /Zero oauth2PermissionGrants were returned/);
+  assert.match(grants.summary, /Directory\.Read\.All/);
+  const flowLogs = (await assessAzureNetworkAndPolicy(emptyClient)).findings.find((item) => item.id === "AZURE-NP-04");
+  assert.equal(flowLogs.status, "manual");
+  assert.match(flowLogs.summary, /Zero network security groups were returned/);
 });
 
 test("verdict safety 3: missing licenses render manual naming the license, never pass", async () => {
@@ -536,6 +614,96 @@ test("verdict safety 5: partial inventories are flagged with seen and total coun
   const network = await assessAzureNetworkAndPolicy(partial);
   assert.notEqual(network.findings.find((item) => item.id === "AZURE-NP-01").status, "pass");
   assert.equal(network.findings.find((item) => item.id === "AZURE-NP-02").status, "warn");
+  assert.notEqual(network.findings.find((item) => item.id === "AZURE-NP-04").status, "pass");
+
+  const partialFlowLogs = clientWith(compliantClient(), {});
+  partialFlowLogs.listFlowLogs = async () => ({ items: [ENABLED_FLOW_LOG], truncated: true, seen: 1, total: 3 });
+  const flowLogs = (await assessAzureNetworkAndPolicy(partialFlowLogs)).findings.find((item) => item.id === "AZURE-NP-04");
+  assert.equal(flowLogs.status, "warn");
+  assert.match(flowLogs.summary, /Inventory of flow logs is partial \(1 seen of 3 total\)/);
+  assert.equal(flowLogs.evidence.truncated, true);
+});
+
+test("AZURE-NP-04 reads flow logs per Network Watcher and judges enabled targetResourceId coverage", async () => {
+  const calls = [];
+  const client = clientWith(compliantClient(), {});
+  const secondNsgId = "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg-2";
+  client.listNetworkSecurityGroups = async () => [{ id: NSG_ID, name: "nsg-1", properties: {} }, { id: secondNsgId, name: "nsg-2", properties: {} }];
+  client.listNetworkWatchers = async () => [
+    { id: WATCHER_ID, name: "NetworkWatcher_eastus", location: "eastus" },
+    { id: "/subscriptions/sub-123/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_westus", name: "NetworkWatcher_westus", location: "westus" },
+  ];
+  client.listFlowLogs = async (resourceGroupName, networkWatcherName) => {
+    calls.push([resourceGroupName, networkWatcherName]);
+    return networkWatcherName === "NetworkWatcher_eastus"
+      ? [ENABLED_FLOW_LOG, { name: "disabled", properties: { enabled: false, targetResourceId: secondNsgId, retentionPolicy: { days: 0, enabled: false } } }]
+      : [{ name: "vnet", properties: { enabled: true, targetResourceId: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet-1" } }];
+  };
+
+  const partialCoverage = (await assessAzureNetworkAndPolicy(client)).findings.find((item) => item.id === "AZURE-NP-04");
+  assert.deepEqual(calls, [["NetworkWatcherRG", "NetworkWatcher_eastus"], ["NetworkWatcherRG", "NetworkWatcher_westus"]]);
+  assert.equal(partialCoverage.status, "warn");
+  assert.match(partialCoverage.summary, /1\/2 NSGs have an enabled flow log \(3 flow logs across 2 Network Watchers, 1 disabled or without a target, 1 enabled flow logs target other resource types/);
+  assert.deepEqual(partialCoverage.evidence.uncovered_nsgs, ["nsg-2"]);
+  assert.equal(partialCoverage.evidence.flow_log_details[0].retention_days, 90);
+  assert.equal(partialCoverage.control, 24);
+
+  client.listFlowLogs = async () => [ENABLED_FLOW_LOG, { ...ENABLED_FLOW_LOG, name: "nsg-2-flowlog", properties: { ...ENABLED_FLOW_LOG.properties, targetResourceId: secondNsgId.toUpperCase() } }];
+  assert.equal((await assessAzureNetworkAndPolicy(client)).findings.find((item) => item.id === "AZURE-NP-04").status, "pass");
+
+  client.listFlowLogs = async () => [];
+  const uncovered = (await assessAzureNetworkAndPolicy(client)).findings.find((item) => item.id === "AZURE-NP-04");
+  assert.equal(uncovered.status, "fail");
+  assert.match(uncovered.summary, /0\/2 NSGs have an enabled flow log/);
+
+  client.listFlowLogs = async () => { throw forbidden(); };
+  const denied = (await assessAzureNetworkAndPolicy(client)).findings.find((item) => item.id === "AZURE-NP-04");
+  assert.equal(denied.status, "manual");
+  assert.match(denied.summary, /networkWatchers\/\{networkWatcherName\}\/flowLogs returned 403 Forbidden/);
+  assert.match(denied.evidence.documentation, /flow-logs\/list/);
+
+  client.listFlowLogs = async () => [ENABLED_FLOW_LOG];
+  client.listNetworkWatchers = async () => [{ id: "nw-1", name: "odd", location: "eastus" }];
+  const unparsed = (await assessAzureNetworkAndPolicy(client)).findings.find((item) => item.id === "AZURE-NP-04");
+  assert.equal(unparsed.status, "manual");
+  assert.deepEqual(unparsed.evidence.unparsed_watchers, ["odd"]);
+
+  assert.deepEqual(parseNetworkWatcherId(WATCHER_ID), { resourceGroupName: "NetworkWatcherRG", networkWatcherName: "NetworkWatcher_eastus" });
+  assert.equal(parseNetworkWatcherId("/subscriptions/sub/providers/Microsoft.Network/networkWatchers/nw"), undefined);
+});
+
+test("AZURE-DP-03 reads the beta sensitivity label endpoint and states the beta caveat", async () => {
+  const labels = (await assessAzureDataProtection(compliantClient())).findings.find((item) => item.id === "AZURE-DP-03");
+  assert.equal(labels.status, "pass");
+  assert.match(labels.summary, /Graph beta endpoint/);
+  assert.equal(labels.evidence.endpoint, "GET /beta/security/informationProtection/sensitivityLabels");
+  assert.match(labels.evidence.documentation, /view=graph-rest-beta/);
+
+  const denied = clientWith(compliantClient(), {});
+  denied.listSensitivityLabels = async () => { throw forbidden(); };
+  const manual = (await assessAzureDataProtection(denied)).findings.find((item) => item.id === "AZURE-DP-03");
+  assert.equal(manual.status, "manual");
+  assert.equal(manual.evidence.endpoint, "GET /beta/security/informationProtection/sensitivityLabels");
+});
+
+test("azure_assess_data_protection and azure_assess_network_and_policy are registered under the Azure group", () => {
+  const tools = getRegisteredToolSummaries();
+  const azureTools = tools.filter((tool) => tool.group === "Azure").map((tool) => tool.name).sort();
+  assert.deepEqual(azureTools, [
+    "azure_assess_data_protection",
+    "azure_assess_identity",
+    "azure_assess_monitoring",
+    "azure_assess_network_and_policy",
+    "azure_assess_subscription_guardrails",
+    "azure_check_access",
+    "azure_export_audit_bundle",
+  ]);
+  const group = groupRegisteredTools(tools).find((entry) => entry.group === "Azure");
+  assert.equal(group.tools.length, 7);
+  const guardrails = tools.find((tool) => tool.name === "azure_assess_subscription_guardrails");
+  assert.ok(!guardrails.parameterSummaries.some((parameter) => parameter.name === "max_mailboxes"));
+  const dataProtection = tools.find((tool) => tool.name === "azure_assess_data_protection");
+  assert.ok(dataProtection.parameterSummaries.some((parameter) => parameter.name === "max_mailboxes"));
 });
 
 test("verdict safety 6: documented flags drive the verdict", async () => {
