@@ -21,6 +21,7 @@ import {
   assessZendeskIntegrations,
   checkZendeskAccess,
   exportZendeskAuditBundle,
+  isCredentialPropertyName,
   redactCredentialProperties,
   resolveSecureOutputPath,
   resolveZendeskConfiguration,
@@ -1501,7 +1502,19 @@ const FAKE_ZENDESK_SECRETS = {
   targetPassword: "zd-target-password-fake",
   targetToken: "zd-target-token-fake-0123456789",
   appApiKey: "zd-app-setting-api-key-fake",
+  appApiKeyCamel: "zd-app-setting-apiKey-camel-fake",
+  appClientSecretCamel: "zd-app-setting-clientSecret-camel-fake",
+  appRefreshTokenCamel: "zd-app-setting-refreshToken-camel-fake",
+  appAccessTokenCamel: "zd-app-setting-accessToken-camel-fake",
+  appAuthorizationHeader: "Bearer zd-app-setting-authorization-header-fake",
+  appXApiKeyHeader: "zd-app-setting-x-api-key-header-fake",
+  webhookCustomHeaderAuthorization: "Basic zd-webhook-custom-header-authorization-fake",
+  webhookCustomHeaderApiKey: "zd-webhook-custom-header-x-api-key-fake",
+  webhookCustomHeaderPlain: "zd-webhook-custom-header-plain-value-fake",
 };
+
+// Header names that must survive redaction as keys or name fields.
+const FAKE_ZENDESK_HEADER_NAMES = ["Authorization", "X-Api-Key", "X-Tenant"];
 
 function secretBearingClient(overrides = {}) {
   return healthyClient({
@@ -1517,8 +1530,8 @@ function secretBearingClient(overrides = {}) {
     },
     async listWebhooks() {
       return list([
-        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } } },
-        { id: "wh2", name: "SIEM", status: "active", endpoint: "https://siem.example.com/ingest", authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookApiKeyValue } }, signing_secret: { algorithm: "SHA256", secret: FAKE_ZENDESK_SECRETS.signingSecret } },
+        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } }, custom_headers: { Authorization: FAKE_ZENDESK_SECRETS.webhookCustomHeaderAuthorization, "X-Tenant": FAKE_ZENDESK_SECRETS.webhookCustomHeaderPlain } },
+        { id: "wh2", name: "SIEM", status: "active", endpoint: "https://siem.example.com/ingest", authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookApiKeyValue } }, signing_secret: { algorithm: "SHA256", secret: FAKE_ZENDESK_SECRETS.signingSecret }, custom_headers: [{ name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookCustomHeaderApiKey }] },
       ]);
     },
     async listTargets() {
@@ -1530,6 +1543,26 @@ function secretBearingClient(overrides = {}) {
     async listAppInstallations() {
       return list([
         { id: 900, app_id: 42, product: "support", enabled: true, settings: { name: "Ticket enricher", title: "Ticket enricher", api_key: FAKE_ZENDESK_SECRETS.appApiKey } },
+        {
+          id: 901,
+          app_id: 43,
+          product: "support",
+          enabled: true,
+          settings: {
+            name: "CRM sync",
+            title: "CRM sync",
+            apiKey: FAKE_ZENDESK_SECRETS.appApiKeyCamel,
+            clientId: "crm-client-0042",
+            clientSecret: FAKE_ZENDESK_SECRETS.appClientSecretCamel,
+            refreshToken: FAKE_ZENDESK_SECRETS.appRefreshTokenCamel,
+            accessToken: FAKE_ZENDESK_SECRETS.appAccessTokenCamel,
+            tokenExpiresAt: "2027-01-01T00:00:00Z",
+            Authorization: FAKE_ZENDESK_SECRETS.appAuthorizationHeader,
+            "X-Api-Key": FAKE_ZENDESK_SECRETS.appXApiKeyHeader,
+            username: "crm-sync@example.com",
+            scopes: "read write",
+          },
+        },
       ]);
     },
     ...overrides,
@@ -1561,6 +1594,34 @@ test("redactCredentialProperties replaces credential strings and keeps identifie
   assert.equal(redactCredentialProperties("plain"), "plain");
   assert.equal(redactCredentialProperties(undefined), undefined);
   assert.deepEqual(redactCredentialProperties({ token: "" }), { token: "" }, "empty strings are not replaced with a marker");
+
+  const camelSettings = redactCredentialProperties({
+    settings: { apiKey: "k", APIKey: "k2", clientId: "cid", clientSecret: "cs", refreshToken: "rt", accessToken: "at", tokenExpiresAt: "2027-01-01T00:00:00Z", privateKey: "pk", publicKey: "pub", secretKey: "sk", passphrase: "pp", passwd: "pw", username: "svc", displayName: "CRM", key: "generic", keyId: "kid" },
+  });
+  assert.deepEqual(camelSettings, {
+    settings: { apiKey: "[REDACTED]", APIKey: "[REDACTED]", clientId: "cid", clientSecret: "[REDACTED]", refreshToken: "[REDACTED]", accessToken: "[REDACTED]", tokenExpiresAt: "2027-01-01T00:00:00Z", privateKey: "[REDACTED]", publicKey: "pub", secretKey: "[REDACTED]", passphrase: "[REDACTED]", passwd: "[REDACTED]", username: "svc", displayName: "CRM", key: "generic", keyId: "kid" },
+  });
+
+  const headerSettings = redactCredentialProperties({ settings: { Authorization: "Bearer abc", "Proxy-Authorization": "Basic xyz", "X-Api-Key": "k", "X-Auth-Token": "t", "Content-Type": "application/json" } });
+  assert.deepEqual(headerSettings, { settings: { Authorization: "[REDACTED]", "Proxy-Authorization": "[REDACTED]", "X-Api-Key": "[REDACTED]", "X-Auth-Token": "[REDACTED]", "Content-Type": "application/json" } });
+
+  const customHeaders = redactCredentialProperties({
+    id: "wh3",
+    custom_headers: { Authorization: "Bearer abc", "X-Tenant": "acme" },
+    customHeaders: [{ name: "X-Api-Key", value: "k" }, { name: "X-Trace", value: "trace-1" }],
+  });
+  assert.deepEqual(customHeaders, {
+    id: "wh3",
+    custom_headers: { Authorization: "[REDACTED]", "X-Tenant": "[REDACTED]" },
+    customHeaders: [{ name: "X-Api-Key", value: "[REDACTED]" }, { name: "X-Trace", value: "[REDACTED]" }],
+  }, "every header value is redacted while header names stay as keys or name fields");
+
+  for (const name of ["token", "full_token", "refresh_token", "refreshToken", "access_token", "accessToken", "bearer_token", "api_token", "apiToken", "secret", "client_secret", "clientSecret", "signing_secret", "shared_secret", "password", "passwd", "pwd", "passphrase", "api_key", "apiKey", "APIKey", "apikey", "private_key", "privateKey", "secret_key", "access_key", "signing_key", "Authorization", "authorization", "Proxy-Authorization", "X-Api-Key", "X-Auth-Token", "oauth_token", "id_token"]) {
+    assert.equal(isCredentialPropertyName(name), true, `${name} should be redacted`);
+  }
+  for (const name of ["id", "user_id", "client_id", "clientId", "token_id", "api_key_id", "key_id", "keyId", "scopes", "scope", "expires_at", "tokenExpiresAt", "created_at", "used_at", "username", "user_name", "name", "displayName", "email", "url", "key", "public_key", "publicKey", "token_type", "api_token_access", "api_password_access_end_users", "password_length", "password_complexity", "password_history_length", "security_policy_name", "source_type", "manage_api_credentials", "two_factor_enforce", "Content-Type", "identifier", "kind"]) {
+    assert.equal(isCredentialPropertyName(name), false, `${name} should be kept`);
+  }
 });
 
 test("assessZendeskAccessControl never retains OAuth token values in its snapshots, evidence, or verdicts", async () => {
@@ -1621,14 +1682,34 @@ test("exportZendeskAuditBundle never writes OAuth tokens, client secrets, or web
   assert.equal(analysis.snapshots.oauth_clients.items[0].secret, "[REDACTED]");
   const webhooks = JSON.parse(files.get(join("core_data", "webhooks.json")));
   assert.equal(webhooks.items[0].authentication.data.token, "[REDACTED]");
+  assert.deepEqual(webhooks.items[0].custom_headers, { Authorization: "[REDACTED]", "X-Tenant": "[REDACTED]" }, "custom header values are redacted and header names stay as keys");
   assert.equal(webhooks.items[1].authentication.data.name, "X-Api-Key");
   assert.equal(webhooks.items[1].authentication.data.value, "[REDACTED]");
   assert.equal(webhooks.items[1].signing_secret.secret, "[REDACTED]");
+  assert.deepEqual(webhooks.items[1].custom_headers, [{ name: "X-Api-Key", value: "[REDACTED]" }], "custom header values are redacted and header names stay as name fields");
   const targets = JSON.parse(files.get(join("core_data", "targets.json")));
   assert.equal(targets.items[0].username, "svc-zendesk");
   assert.equal(targets.items[0].password, "[REDACTED]");
   assert.equal(targets.items[1].token, "[REDACTED]");
-  assert.equal(JSON.parse(files.get(join("core_data", "app_installations.json"))).items[0].settings.api_key, "[REDACTED]");
+  const installations = JSON.parse(files.get(join("core_data", "app_installations.json")));
+  assert.equal(installations.items[0].settings.api_key, "[REDACTED]");
+  assert.deepEqual(installations.items[1].settings, {
+    name: "CRM sync",
+    title: "CRM sync",
+    apiKey: "[REDACTED]",
+    clientId: "crm-client-0042",
+    clientSecret: "[REDACTED]",
+    refreshToken: "[REDACTED]",
+    accessToken: "[REDACTED]",
+    tokenExpiresAt: "2027-01-01T00:00:00Z",
+    Authorization: "[REDACTED]",
+    "X-Api-Key": "[REDACTED]",
+    username: "crm-sync@example.com",
+    scopes: "read write",
+  }, "camelCase and header-valued settings are redacted while client ids, expiry, usernames, and scopes stay");
+  for (const headerName of FAKE_ZENDESK_HEADER_NAMES) {
+    assert.ok(files.get(join("core_data", "webhooks.json")).includes(`"${headerName}"`), `${headerName} header name survives in webhooks.json`);
+  }
 
   const findings = JSON.parse(files.get(join("analysis", "findings.json")));
   assert.equal(findings.find((item) => item.id === "ZD-14").status, "pass");

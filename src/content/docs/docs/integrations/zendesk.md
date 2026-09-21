@@ -44,7 +44,7 @@ The config file accepts `subdomain`, `email`, `api_token`, `oauth_token`, `base_
 }
 ```
 
-Tokens never appear in tool output, bundle files, or error messages; the client redacts them before surfacing any failure. Credential-bearing properties inside API records are redacted the same way before a snapshot is kept: `token`, `full_token`, and `refresh_token` on `/oauth/tokens` records, `secret` on OAuth clients, `password` and `token` on legacy targets, webhook `authentication.data` values and signing secrets, and `api_key`, `password`, or `token` values in app installation settings are replaced with `[REDACTED]` while ids, scopes, client ids, expiry, and creation dates are kept for the assessments.
+Tokens never appear in tool output, bundle files, or error messages; the client redacts them before surfacing any failure. Credential-bearing properties inside API records are redacted the same way before a snapshot is kept: `token`, `full_token`, and `refresh_token` on `/oauth/tokens` records, `secret` on OAuth clients, `password` and `token` on legacy targets, webhook `authentication.data` values, `custom_headers` values, and signing secrets, and `api_key`, `password`, or `token` values in app installation settings are replaced with `[REDACTED]`. Property names are matched on their last segment after splitting `snake_case`, `camelCase`, and header spellings, so `apiKey`, `clientSecret`, `refreshToken`, `accessToken`, `secretKey`, `passphrase`, `Authorization`, `X-Api-Key`, and `X-Auth-Token` are covered too, while ids, scopes, client ids, expiry and creation dates, usernames, header names, `public_key`, and a bare `key` are kept for the assessments.
 
 ## Tools
 
