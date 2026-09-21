@@ -1014,6 +1014,80 @@ test("assessKnowbe4TrainingProgram degrades remedial training to warn when tests
   assert.equal(full.evidence.sampled_security_tests.length, 3);
 });
 
+test("assessKnowbe4TrainingProgram treats a -1 completion sentinel with truncated enrollments as unmeasurable", async () => {
+  const fixture = healthyFixture();
+  // The documented "too large to calculate" sentinel forces the enrollment fallback; the first three enrollments passed and the next three never started.
+  fixture.trainingCampaigns[0].completion_percentage = -1;
+  fixture.enrollments = [
+    ...fixture.users.slice(0, 3).map((record, index) => enrollment(index + 1, record, 700, "Security Awareness Fundamentals", daysAgo(199))),
+    ...fixture.users.slice(3, 6).map((record, index) => enrollment(index + 4, record, 700, "Security Awareness Fundamentals", daysAgo(199), { status: "Not Started", start_date: null, completion_date: null })),
+  ];
+
+  const truncatedSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: 3 });
+  assert.equal(truncatedSnapshot.enrollmentLimitReached, true);
+  const truncated = findingFor(assessKnowbe4TrainingProgram(truncatedSnapshot, { now: NOW }), 3);
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /-1 completion sentinel/);
+  assert.match(truncated.summary, /truncated at enrollment_limit \(3\)/);
+  assert.equal(truncated.evidence.enrollment_limit_reached, true);
+  assert.deepEqual(truncated.evidence.campaigns_evaluated, []);
+  assert.equal(truncated.evidence.campaigns_with_truncated_enrollments.length, 1);
+  assert.equal(truncated.evidence.campaigns_with_truncated_enrollments[0].name, "2026 Annual Security Awareness");
+  assert.equal(truncated.evidence.campaigns_with_truncated_enrollments[0].partial_completion_pct, 100);
+  assert.equal(truncated.evidence.campaigns_with_truncated_enrollments[0].enrollments_loaded, 3);
+
+  // The full enrollment list measures the same campaign at 50% and fails it.
+  const fullSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
+  const full = findingFor(assessKnowbe4TrainingProgram(fullSnapshot, { now: NOW }), 3);
+  assert.equal(full.status, "fail");
+  assert.equal(full.evidence.enrollment_limit_reached, false);
+  assert.deepEqual(full.evidence.campaigns_with_truncated_enrollments, []);
+  assert.equal(full.evidence.campaigns_evaluated[0].completion_pct, 50);
+  assert.equal(full.evidence.campaigns_evaluated[0].source, "enrollments");
+
+  // A reported completion_percentage is still trusted when the enrollment list is truncated.
+  fixture.trainingCampaigns[0].completion_percentage = 96;
+  const reportedSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: 3 });
+  const reported = findingFor(assessKnowbe4TrainingProgram(reportedSnapshot, { now: NOW }), 3);
+  assert.equal(reported.status, "pass");
+  assert.equal(reported.evidence.campaigns_evaluated[0].source, "completion_percentage");
+  assert.deepEqual(reported.evidence.campaigns_with_truncated_enrollments, []);
+});
+
+test("assessKnowbe4TrainingProgram never passes compliance completion computed over a truncated enrollment list", async () => {
+  const fixture = healthyFixture();
+  // The first three PCI enrollments passed and the next three never started, so a cap of three sees 100% while the full list is 50%.
+  fixture.enrollments = [
+    ...fixture.users.slice(0, 3).map((record, index) => enrollment(index + 1, record, 700, "PCI DSS Compliance Basics", daysAgo(198), { store_purchase_id: 2 })),
+    ...fixture.users.slice(3, 6).map((record, index) => enrollment(index + 4, record, 700, "PCI DSS Compliance Basics", daysAgo(198), { store_purchase_id: 2, status: "Not Started", start_date: null, completion_date: null })),
+    ...fixture.users.slice(0, 8).map((record, index) => enrollment(index + 7, record, 700, "Security Awareness Fundamentals", daysAgo(199))),
+  ];
+
+  const truncatedSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: 3 });
+  const truncated = findingFor(assessKnowbe4TrainingProgram(truncatedSnapshot, { now: NOW, requiredComplianceTopics: ["PCI"] }), 17);
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /truncated at enrollment_limit \(3\)/);
+  assert.match(truncated.summary, /cannot be verified/);
+  assert.equal(truncated.evidence.topics[0].enrollments, 3);
+  assert.equal(truncated.evidence.topics[0].completion_pct, 100);
+  assert.equal(truncated.evidence.enrollment_limit_reached, true);
+  assert.equal(truncated.evidence.completion_data_partial, true);
+  assert.deepEqual(truncated.evidence.topics_without_enrollments, []);
+
+  // Without the cap the same topic is measured at 50% and warns on low completion instead.
+  const fullSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
+  const full = findingFor(assessKnowbe4TrainingProgram(fullSnapshot, { now: NOW, requiredComplianceTopics: ["PCI"] }), 17);
+  assert.equal(full.status, "warn");
+  assert.match(full.summary, /below 90%/);
+  assert.equal(full.evidence.topics[0].completion_pct, 50);
+  assert.equal(full.evidence.completion_data_partial, false);
+
+  // The auto-detect path is guarded the same way.
+  const detected = findingFor(assessKnowbe4TrainingProgram(truncatedSnapshot, { now: NOW }), 17);
+  assert.equal(detected.status, "warn");
+  assert.equal(detected.evidence.completion_data_partial, true);
+});
+
 test("assessKnowbe4UserRisk passes balanced risk, full group coverage, and active users", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
@@ -1043,6 +1117,50 @@ test("assessKnowbe4UserRisk fails high risk, uncovered groups, and inactive user
   assert.deepEqual(findingFor(result, 8).evidence.groups_missing_training.map((group) => group.name), ["Engineering"]);
   assert.equal(findingFor(result, 18).evidence.inactive_users, 7);
   assert.equal(findingFor(result, 18).evidence.partial_activity_data, false);
+});
+
+test("user-set controls warn instead of passing when the Reporting API returns no active users", async () => {
+  // Anonymized accounts cannot retrieve user data, so /v1/users returns [] without an error.
+  const fixture = healthyFixture();
+  fixture.users = [];
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { now: NOW });
+  assert.equal(snapshot.activeUsers.error, undefined);
+  assert.equal(snapshot.activeUsers.data.length, 0);
+  assert.equal(snapshot.userLimitReached, false);
+
+  const phishing = assessKnowbe4PhishingProgram(snapshot, { now: NOW });
+  const training = assessKnowbe4TrainingProgram(snapshot, { now: NOW });
+  const risk = assessKnowbe4UserRisk(snapshot, { now: NOW });
+
+  const timeliness = findingFor(training, 4);
+  assert.equal(timeliness.status, "warn");
+  assert.match(timeliness.summary, /returned no active users/);
+  assert.match(timeliness.summary, /Anonymized KnowBe4 accounts cannot retrieve user data/);
+  assert.equal(timeliness.evidence.user_list_empty, true);
+  assert.equal(timeliness.evidence.new_users_evaluated, 0);
+
+  const inactive = findingFor(risk, 18);
+  assert.equal(inactive.status, "warn");
+  assert.match(inactive.summary, /returned no active users/);
+  assert.equal(inactive.evidence.user_list_empty, true);
+  assert.equal(inactive.evidence.users_evaluated, 0);
+
+  const coverage = findingFor(phishing, 2);
+  assert.equal(coverage.status, "warn");
+  assert.equal(coverage.evidence.user_list_empty, true);
+  assert.equal(coverage.evidence.security_tests_in_window, 3);
+
+  assert.equal(findingFor(risk, 5).status, "warn");
+  for (const [result, control] of [[phishing, 2], [training, 4], [risk, 5], [risk, 18]]) {
+    assert.notEqual(findingFor(result, control).status, "pass", `control ${control} must not pass on zero users`);
+    assert.equal(findingFor(result, control).evidence.active_users, 0);
+  }
+
+  // An unreadable user list still reports the collection error rather than the empty-list guard.
+  const unreadable = await collectKnowbe4Snapshot(mockClient(fixture, { failures: { listUsers: "KnowBe4 request failed (403 Forbidden) for /v1/users" } }), { now: NOW });
+  const unreadableTimeliness = findingFor(assessKnowbe4TrainingProgram(unreadable, { now: NOW }), 4);
+  assert.match(unreadableTimeliness.summary, /not readable/);
+  assert.equal(unreadableTimeliness.evidence.user_list_empty, undefined);
 });
 
 test("collectKnowbe4Snapshot flags user_limit truncation and user-set controls degrade to warn", async () => {

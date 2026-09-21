@@ -1388,6 +1388,18 @@ function unavailableFinding(number: number, severity: Knowbe4Finding["severity"]
   );
 }
 
+// An empty user list is a data-access condition, not a clean population: anonymized KnowBe4 accounts cannot
+// retrieve user data through the Reporting API, so controls computed over users must not pass on zero users.
+function emptyUserListFinding(number: number, severity: Knowbe4Finding["severity"], subject: string, evidence: JsonRecord = {}): Knowbe4Finding {
+  return finding(
+    number,
+    severity,
+    "warn",
+    `The Reporting API returned no active users, so ${subject} cannot be evaluated. Anonymized KnowBe4 accounts cannot retrieve user data through the API; confirm the account's anonymization setting and the API key before treating this control as met.`,
+    { active_users: 0, user_list_empty: true, ...evidence },
+  );
+}
+
 // Findings computed over the active user list cannot pass when user_limit truncated that list.
 function withUserCapCaveat(item: Knowbe4Finding, snapshot: Knowbe4Snapshot): Knowbe4Finding {
   const evidence = { ...(item.evidence ?? {}), user_limit: snapshot.userLimit, user_limit_reached: snapshot.userLimitReached };
@@ -1590,6 +1602,15 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
   if (snapshot.activeUsers.error) return unavailableFinding(2, "high", snapshot.activeUsers.error);
   const active = activeUserIds(snapshot);
   const testsInWindow = testsWithin(snapshot.securityTests.data, lookbackDays, now);
+  // With no tests the fail below stands on the test data alone; only a measured coverage needs a user population.
+  if (testsInWindow.length > 0 && snapshot.activeUsers.data.length === 0) {
+    return emptyUserListFinding(2, "high", "phishing simulation coverage", {
+      tested_users: 0,
+      coverage_pct: null,
+      min_coverage_pct: minCoveragePct,
+      security_tests_in_window: testsInWindow.length,
+    });
+  }
   const samples = sampledTestsWithin(snapshot, lookbackDays, now);
   const tested = new Set<string>();
   for (const sample of samples) {
@@ -2001,7 +2022,7 @@ function completionFromEnrollments(enrollments: JsonRecord[]): number | undefine
   return percentage(enrollments.filter(enrollmentCompleted).length, enrollments.length);
 }
 
-function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, failCompletionPct: number): Knowbe4Finding {
+function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, failCompletionPct: number, enrollmentLimitReached: boolean): Knowbe4Finding {
   if (snapshot.trainingCampaigns.error) return unavailableFinding(3, "high", snapshot.trainingCampaigns.error);
   const enrollmentsByCampaign = new Map<string, JsonRecord[]>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
@@ -2013,22 +2034,36 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
   }
 
   const evaluated: Array<{ name: string; campaign_id: string | null; completion_pct: number; source: string; end_date: string | null }> = [];
+  const truncated: Array<{ name: string; campaign_id: string | null; partial_completion_pct: number; enrollments_loaded: number; end_date: string | null }> = [];
   const unmeasured: string[] = [];
   for (const campaign of snapshot.trainingCampaigns.data) {
     if (campaignCancelled(campaign) || !campaignCompletedOrEnded(campaign, now) || !campaignInWindow(campaign, lookbackDays, now)) continue;
     const id = trainingCampaignId(campaign);
     const reported = asNumber(campaign.completion_percentage);
-    const computed = id ? completionFromEnrollments(enrollmentsByCampaign.get(id) ?? []) : undefined;
-    const completion = reported !== undefined && reported >= 0 ? reported : computed;
+    const campaignEnrollments = id ? enrollmentsByCampaign.get(id) ?? [] : [];
+    const computed = completionFromEnrollments(campaignEnrollments);
+    const reportedUsable = reported !== undefined && reported >= 0;
+    const completion = reportedUsable ? reported : computed;
     if (completion === undefined) {
       unmeasured.push(campaignName(campaign));
+      continue;
+    }
+    if (!reportedUsable && enrollmentLimitReached) {
+      // The -1 sentinel forces the enrollment fallback, and a truncated enrollment list cannot measure the campaign.
+      truncated.push({
+        name: campaignName(campaign),
+        campaign_id: id ?? null,
+        partial_completion_pct: roundTo(completion),
+        enrollments_loaded: campaignEnrollments.length,
+        end_date: campaignEndDate(campaign)?.toISOString() ?? null,
+      });
       continue;
     }
     evaluated.push({
       name: campaignName(campaign),
       campaign_id: id ?? null,
       completion_pct: roundTo(completion),
-      source: reported !== undefined && reported >= 0 ? "completion_percentage" : "enrollments",
+      source: reportedUsable ? "completion_percentage" : "enrollments",
       end_date: campaignEndDate(campaign)?.toISOString() ?? null,
     });
   }
@@ -2037,15 +2072,18 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
   const warning = evaluated.filter((item) => item.completion_pct < minCompletionPct && item.completion_pct >= failCompletionPct);
   let status: Knowbe4Finding["status"];
   let summary: string;
-  if (evaluated.length === 0) {
-    status = "warn";
-    summary = `No completed or ended training campaigns with measurable completion were found in the last ${lookbackDays} days.`;
-  } else if (failing.length > 0) {
+  if (failing.length > 0) {
     status = "fail";
     summary = `${failing.length} of ${evaluated.length} completed training campaigns finished below ${failCompletionPct}% completion.`;
   } else if (warning.length > 0) {
     status = "warn";
     summary = `${warning.length} of ${evaluated.length} completed training campaigns finished between ${failCompletionPct}% and ${minCompletionPct}% completion.`;
+  } else if (truncated.length > 0) {
+    status = "warn";
+    summary = `${truncated.length} completed training campaigns report the -1 completion sentinel and the enrollment list was truncated at enrollment_limit (${snapshot.enrollmentLimit}), so their completion cannot be measured: ${truncated.map((item) => item.name).join(", ")}. Raise enrollment_limit or export the campaign report from the console.`;
+  } else if (evaluated.length === 0) {
+    status = "warn";
+    summary = `No completed or ended training campaigns with measurable completion were found in the last ${lookbackDays} days.`;
   } else {
     status = "pass";
     summary = `All ${evaluated.length} completed training campaigns in the last ${lookbackDays} days met the ${minCompletionPct}% completion target.`;
@@ -2053,7 +2091,9 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
 
   return finding(3, "high", status, summary, {
     campaigns_evaluated: evaluated,
+    campaigns_with_truncated_enrollments: truncated,
     campaigns_without_measurable_completion: unmeasured,
+    enrollment_limit_reached: enrollmentLimitReached,
     min_completion_pct: minCompletionPct,
     fail_completion_pct: failCompletionPct,
     training_lookback_days: lookbackDays,
@@ -2063,6 +2103,14 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
 function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, graceDays: number, enrollmentLimitReached: boolean, redact: boolean): Knowbe4Finding {
   if (snapshot.activeUsers.error) return unavailableFinding(4, "medium", snapshot.activeUsers.error);
   if (snapshot.trainingEnrollments.error) return unavailableFinding(4, "medium", snapshot.trainingEnrollments.error);
+  if (snapshot.activeUsers.data.length === 0) {
+    return emptyUserListFinding(4, "medium", "training enrollment timeliness for new users", {
+      new_users_evaluated: 0,
+      enrollment_grace_days: graceDays,
+      training_lookback_days: lookbackDays,
+      enrollment_limit_reached: enrollmentLimitReached,
+    });
+  }
   const earliestEnrollment = new Map<string, Date>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
     const userId = enrollmentUserId(enrollment);
@@ -2342,6 +2390,10 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
   } else if (lowCompletion.length > 0) {
     status = "warn";
     summary = `Compliance modules are assigned but completion is below ${minCompletionPct}% for: ${lowCompletion.map((item) => `${item.topic} (${item.completion_pct}%)`).join(", ")}.`;
+  } else if (enrollmentDataPartial) {
+    // Completion figures computed over a truncated enrollment list cannot back a passing verdict.
+    status = "warn";
+    summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)}, but enrollment data is ${enrollmentsUnavailable ? "unavailable" : `truncated at enrollment_limit (${snapshot.enrollmentLimit})`}, so the completion figures cover only the loaded enrollments and cannot be verified.`;
   } else {
     status = "pass";
     summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)} with completion at or above ${minCompletionPct}%.`;
@@ -2355,6 +2407,7 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     training_lookback_days: lookbackDays,
     enrollments_available: !enrollmentsUnavailable,
     enrollment_limit_reached: enrollmentLimitReached,
+    completion_data_partial: enrollmentDataPartial,
     uploaded_policies: snapshot.trainingPolicies.data.length,
   });
 }
@@ -2376,7 +2429,7 @@ export function assessKnowbe4TrainingProgram(
   const enrollmentLimitReached = snapshot.enrollmentLimitReached;
 
   const findings = [
-    assessTrainingCompletion(snapshot, now, trainingLookbackDays, minCompletionPct, failCompletionPct),
+    assessTrainingCompletion(snapshot, now, trainingLookbackDays, minCompletionPct, failCompletionPct, enrollmentLimitReached),
     withUserCapCaveat(assessEnrollmentTimeliness(snapshot, now, trainingLookbackDays, graceDays, enrollmentLimitReached, redact), snapshot),
     assessRemedialTraining(snapshot, now, lookbackDays, remedialWindowDays, redact),
     assessContentCurrency(snapshot, now, trainingLookbackDays, maxContentAgeDays),
@@ -2404,6 +2457,14 @@ export function assessKnowbe4TrainingProgram(
 
 function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: number, maxStddev: number, redact: boolean): Knowbe4Finding {
   if (snapshot.activeUsers.error) return unavailableFinding(5, "medium", snapshot.activeUsers.error);
+  if (snapshot.activeUsers.data.length === 0) {
+    return emptyUserListFinding(5, "medium", "the user risk score distribution", {
+      users_scored: 0,
+      max_mean_risk_score: maxMeanRiskScore,
+      max_risk_score_stddev: maxStddev,
+      account_current_risk_score: asNumber(snapshot.account.data.current_risk_score) ?? null,
+    });
+  }
   const scored = snapshot.activeUsers.data
     .map((user) => ({ user, score: asNumber(user.current_risk_score) }))
     .filter((item): item is { user: JsonRecord; score: number } => item.score !== undefined);
@@ -2510,6 +2571,13 @@ function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays:
 
 function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays: number, enrollmentLimitReached: boolean, redact: boolean): Knowbe4Finding {
   if (snapshot.activeUsers.error) return unavailableFinding(18, "medium", snapshot.activeUsers.error);
+  if (snapshot.activeUsers.data.length === 0) {
+    return emptyUserListFinding(18, "medium", "inactive user cleanup", {
+      users_evaluated: 0,
+      inactive_users: 0,
+      inactive_days: inactiveDays,
+    });
+  }
   const cutoff = daysAgo(now, inactiveDays).getTime();
   const activeSignals = new Set<string>();
   for (const sample of sampledTestsWithin(snapshot, inactiveDays, now)) {
