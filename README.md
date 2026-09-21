@@ -168,7 +168,7 @@ Configuration:
 
 - `GRCLANKER_FLUE_MODEL` sets the `provider/model` specifier. Without it, the `grclanker setup` choice is reused (hosted, or local-first: the Ollama entry from `~/.grclanker/agent/models.json` is registered with Flue through `setProvider()`), otherwise `anthropic/claude-sonnet-4-6`. Hosted provider API keys come from the environment, as in any Flue project.
 - `GRCLANKER_FLUE_SANDBOX=none` disables the local sandbox that provides file and shell tools for the current directory.
-- Conversations persist in `~/.grclanker/flue/conversations.db`. Pass `--db <path>` or `--db :memory:` to change that.
+- Conversations persist in `~/.grclanker/flue/conversations.db`, verbatim, raw tool arguments and credentials included (Flue offers no pre-persistence redaction). Pass `--db <path>` or `--db :memory:` to change that; use `:memory:` in CI. `flue run` writes `node_modules/.cache/flue/run.db` instead, which must not end up in a CI cache.
 
 Limitations: the Pi compute backends (`host`, `sandbox-runtime`, Docker, Parallels) do not apply; Flue's own sandbox model is used instead. Flue validates the raw model arguments against each tool's schema (coercing typed values) before the tool's own normalizer runs, and tool output reaches the model as a JSON string. See [`/docs/getting-started/flue-runtime`](https://grclanker.com/docs/getting-started/flue-runtime) for the exact behavior.
 

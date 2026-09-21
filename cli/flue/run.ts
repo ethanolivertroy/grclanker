@@ -18,7 +18,7 @@ import {
 import { sqlite as flueSqlite, start as flueStart, type Flue, type StartOptions } from "@flue/runtime/node";
 import { getGrclankerHome } from "../config/paths.js";
 import { Grclanker, prepareGrclankerAgent } from "./agent.js";
-import { redactSensitiveArguments } from "./redact.js";
+import { collectSensitiveValues, redactSensitiveArguments, scrubSensitiveValues, withholdEchoedArguments } from "./redact.js";
 import { collectGrclankerDomainTools } from "./tools.js";
 
 export const FLUE_AGENT_NAME = "grclanker";
@@ -93,26 +93,36 @@ function truncate(text: string, limit = ACTIVITY_PREVIEW_LENGTH): string {
 /**
  * Compact one-line renderings of tool activity for stderr; other chunks are
  * silent. Tool inputs are redacted before serialization because credentials
- * (API tokens, client secrets, private keys) travel as tool arguments.
+ * (API tokens, client secrets, private keys) travel as tool arguments, and
+ * tool error text loses the payload Pi's validation error echoes, plus any
+ * sensitive value from the matching input that a message repeats verbatim.
  */
 export function createFlueActivityFormatter(
   options: FlueActivityFormatterOptions = {},
 ): (chunk: ConversationStreamChunk) => string | undefined {
   const toolNames = new Map<string, string>();
+  const sensitiveValues = new Map<string, string[]>();
 
   return (chunk) => {
     switch (chunk.type) {
       case "tool-input": {
         toolNames.set(chunk.toolCallId, chunk.toolName);
-        const shown = redactSensitiveArguments(chunk.input ?? {}, options.parameterSchemas?.get(chunk.toolName));
-        return `-> ${chunk.toolName} ${truncate(JSON.stringify(shown))}`;
+        const schema = options.parameterSchemas?.get(chunk.toolName);
+        const input = chunk.input ?? {};
+        sensitiveValues.set(chunk.toolCallId, collectSensitiveValues(input, schema));
+        return `-> ${chunk.toolName} ${truncate(JSON.stringify(redactSensitiveArguments(input, schema)))}`;
       }
       case "tool-output": {
+        sensitiveValues.delete(chunk.toolCallId);
         const duration = chunk.durationMs === undefined ? "" : ` (${chunk.durationMs}ms)`;
         return `<- ${toolNames.get(chunk.toolCallId) ?? chunk.toolCallId} ok${duration}`;
       }
-      case "tool-output-error":
-        return `<- ${toolNames.get(chunk.toolCallId) ?? chunk.toolCallId} error: ${truncate(chunk.errorText)}`;
+      case "tool-output-error": {
+        const values = sensitiveValues.get(chunk.toolCallId) ?? [];
+        sensitiveValues.delete(chunk.toolCallId);
+        const shown = scrubSensitiveValues(withholdEchoedArguments(chunk.errorText), values);
+        return `<- ${toolNames.get(chunk.toolCallId) ?? chunk.toolCallId} error: ${truncate(shown)}`;
+      }
       case "conversation-reset":
       case "message-appended":
       case "message-started":

@@ -49,7 +49,15 @@ import {
   resolveFlueDatabasePath,
   runGrclankerFlueAgent,
 } from "../dist/flue/run.js";
-import { REDACTED_VALUE, isSensitiveArgumentKey, redactSensitiveArguments } from "../dist/flue/redact.js";
+import {
+  ARGUMENTS_WITHHELD_NOTE,
+  REDACTED_VALUE,
+  collectSensitiveValues,
+  isSensitiveArgumentKey,
+  redactSensitiveArguments,
+  scrubSensitiveValues,
+  withholdEchoedArguments,
+} from "../dist/flue/redact.js";
 import { formatFlueHelp, formatFlueRunOutcome, parseFlueRunArgs, runFlueCommand } from "../dist/flue/cli.js";
 import {
   createCustomProvider,
@@ -905,6 +913,78 @@ test("credential-bearing tool arguments are redacted before serialization, at an
   for (const key of ["query", "limit", "cert_number", "auth_mode", "max_keys", "org_url", "workspace_dir", "cve_ids", "installation_id"]) {
     assert.equal(isSensitiveArgumentKey(key), false, `${key} stays visible`);
   }
+
+  // Guard against future parameters: any declared name that even loosely smells like a credential must be
+  // redacted by the pattern or be listed here as reviewed and known to be safe to print.
+  const looselySensitive = /secret|key|token|pass|auth|cert|cookie|session|credential|assertion|jwt|pin\b|otp|dsn/i;
+  const reviewedSafeKeys = new Set([
+    "auth_mode", // selects an authentication strategy, not a credential
+    "cert_number", // CMVP certificate number, public
+    "max_keys", // count threshold
+    "max_session_hours", // duration threshold
+    "oauth_base_url", // endpoint
+  ]);
+  const unclassified = [...declaredKeys].filter(
+    (key) => looselySensitive.test(key) && !isSensitiveArgumentKey(key) && !reviewedSafeKeys.has(key),
+  );
+  assert.deepEqual(unclassified, [], "new credential-looking parameters must be redacted or explicitly reviewed as safe");
+  for (const key of reviewedSafeKeys) assert.ok(declaredKeys.has(key), `${key} is still declared; drop it from the safe list otherwise`);
+});
+
+test("tool error text loses Pi's echoed payload and any sensitive value from the matching input", () => {
+  const piError = 'Validation failed for tool "probe":\n  - lookback_days: must be >= 1\n\nReceived arguments:\n{\n  "skey": "s3cr3t",\n  "lookback_days": 0\n}';
+  assert.equal(withholdEchoedArguments(piError), `Validation failed for tool "probe":\n  - lookback_days: must be >= 1 ${ARGUMENTS_WITHHELD_NOTE}`);
+  assert.equal(withholdEchoedArguments("plain failure"), "plain failure", "text without the marker is unchanged");
+
+  const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----";
+  const values = collectSensitiveValues(
+    { api_token: "tok_1234567890", private_key: pem, credentials_json: { client_email: "svc@example.iam", private_key: "nested_secret_value" }, short: "x", passcode: "0000" },
+    { type: "object", properties: { passcode: { type: "string", writeOnly: true } } },
+  );
+  assert.deepEqual(
+    values,
+    [pem, "nested_secret_value", "svc@example.iam", "tok_1234567890"],
+    "everything inside a sensitive object counts, sorted longest first; short values are left to structural redaction",
+  );
+  assert.equal(
+    scrubSensitiveValues(`token tok_1234567890 rejected; key ${pem} and ${JSON.stringify(pem)} invalid`, values),
+    `token ${REDACTED_VALUE} rejected; key ${REDACTED_VALUE} and "${REDACTED_VALUE}" invalid`,
+    "raw and JSON-escaped forms are both scrubbed",
+  );
+});
+
+test("regression: gate validation errors for shipped credential tools never put the secret on stderr", () => {
+  const piTools = collectGrclankerDomainTools();
+  const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
+  const cases = [
+    ["duo_check_access", "skey", "s".repeat(40), { ikey: "DIXXXXXXXXXXXXXXXXXX", api_host: "api-xxxx.duosecurity.com", lookback_days: 0 }, /lookback_days: must be >= 1/],
+    ["okta_check_access", "client_assertion", `eyJ${"a".repeat(49)}`, { scopes: "okta.users.read" }, /scopes: must be array/],
+    ["cloudflare_check_access", "api_token", `cf-${"t".repeat(38)}`, { account_id: "acct", timeout_seconds: "x" }, /timeout_seconds: must be number/],
+    ["zoom_check_access", "client_secret", "z".repeat(32), { client_id: "app", account_id: "acct", timeout_seconds: "soon" }, /timeout_seconds: must be number/],
+  ];
+
+  for (const [name, secretKey, secret, rest, reason] of cases) {
+    const payload = { [secretKey]: secret, ...rest };
+    const gate = flueGate(flueTools.get(name), payload);
+    assert.equal(gate.ok, false, `${name}: the gate rejects the malformed call`);
+    assert.ok(gate.message.includes(secret), `${name}: Pi's real error text does embed the raw ${secretKey}`);
+
+    // With the matching tool-input seen first (the normal stream order).
+    const format = createFlueActivityFormatter({ parameterSchemas: collectToolParameterSchemas() });
+    const inputLine = format({ type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t1", toolName: name, input: payload, position: { batch: 1, index: 0 } });
+    const errorLine = format({ type: "tool-output-error", conversationId: "c", toolCallId: "t1", errorText: gate.message, position: { batch: 2, index: 0 } });
+    for (const line of [inputLine, errorLine]) {
+      assert.equal(line.includes(secret), false, `${name}: ${secretKey} must not appear in "${line}"`);
+      assert.equal(line.includes(secret.slice(0, 12)), false, `${name}: not even a prefix of ${secretKey}`);
+    }
+    assert.match(errorLine, reason, `${name}: the field-level reason survives`);
+    assert.ok(errorLine.endsWith(ARGUMENTS_WITHHELD_NOTE) || errorLine.endsWith("..."), `${name}: the payload is withheld: ${errorLine}`);
+
+    // Without a preceding tool-input (nothing to scrub by value), the structural cut alone must suffice.
+    const bare = createFlueActivityFormatter()({ type: "tool-output-error", conversationId: "c", toolCallId: "t9", errorText: gate.message, position: { batch: 2, index: 0 } });
+    assert.equal(bare.includes(secret), false, `${name}: structural withholding alone hides ${secretKey}`);
+    assert.match(bare, reason);
+  }
 });
 
 test("runner activity lines never echo credentials passed as tool arguments", async () => {
@@ -918,6 +998,16 @@ test("runner activity lines never echo credentials passed as tool arguments", as
     { type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t2", toolName: "zoom_check_access", input: { client_id: "zoom-app", client_secret: clientSecret, account_id: "zoom-acct" }, position: { batch: 1, index: 1 } },
     { type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t3", toolName: "vault_probe", input: { passcode, region: "eu" }, position: { batch: 1, index: 2 } },
     { type: "tool-output", conversationId: "c", toolCallId: "t1", output: "ok", position: { batch: 2, index: 0 } },
+    // Pi's validation error echoes the raw payload after "Received arguments:".
+    {
+      type: "tool-output-error",
+      conversationId: "c",
+      toolCallId: "t2",
+      errorText: `Validation failed for tool "zoom_check_access":\n  - timeout_seconds: must be number\n\nReceived arguments:\n${JSON.stringify({ client_id: "zoom-app", client_secret: clientSecret, account_id: "zoom-acct" }, null, 2)}`,
+      position: { batch: 2, index: 1 },
+    },
+    // A tool-authored message that repeats the credential verbatim.
+    { type: "tool-output-error", conversationId: "c", toolCallId: "t3", errorText: `vault rejected passcode ${passcode} for region eu`, position: { batch: 2, index: 2 } },
   ];
 
   await runGrclankerFlueAgent(
@@ -952,6 +1042,8 @@ test("runner activity lines never echo credentials passed as tool arguments", as
     '-> zoom_check_access {"client_id":"zoom-app","client_secret":"[redacted]","account_id":"zoom-acct"}',
     '-> vault_probe {"passcode":"[redacted]","region":"eu"}',
     "<- cloudflare_check_access ok",
+    `<- zoom_check_access error: Validation failed for tool "zoom_check_access": - timeout_seconds: must be number ${ARGUMENTS_WITHHELD_NOTE}`,
+    "<- vault_probe error: vault rejected passcode [redacted] for region eu",
   ]);
 
   // The default runner wiring redacts by name even without schema knowledge of the tool.
