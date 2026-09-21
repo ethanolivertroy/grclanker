@@ -118,6 +118,21 @@ export interface LaunchdarklyAccessCheckResult {
   recommendedNextStep: string;
 }
 
+export interface LaunchdarklyCollection {
+  items: JsonRecord[];
+  truncated: boolean;
+  seen: number;
+  total?: number;
+}
+
+export interface LaunchdarklyTruncationNote {
+  collection: string;
+  option?: string;
+  seen: number;
+  total: number | null;
+  scope?: string;
+}
+
 export interface LaunchdarklyFinding {
   id: string;
   control: number;
@@ -1088,32 +1103,48 @@ export class LaunchdarklyApiClient {
     path: string,
     query: JsonRecord = {},
     options: { limit?: number; pageSize?: number; apiVersion?: string } = {},
-  ): Promise<JsonRecord[]> {
+  ): Promise<LaunchdarklyCollection> {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, 50_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 100);
     const items: JsonRecord[] = [];
     let offset = 0;
+    let total: number | undefined;
+    let remaining = false;
     let nextUrl: string | undefined = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit), offset });
 
-    while (nextUrl && items.length < limit) {
+    while (nextUrl) {
+      if (items.length >= limit) {
+        remaining = true;
+        break;
+      }
       const payload = await this.fetchJson(nextUrl, options);
       const pageItems = extractItems(payload);
-      items.push(...pageItems.slice(0, limit - items.length));
+      const room = limit - items.length;
+      items.push(...pageItems.slice(0, room));
+      total = asNumber(payload.totalCount) ?? total;
+      if (pageItems.length > room) {
+        remaining = true;
+        break;
+      }
       if (pageItems.length === 0) break;
       offset += pageItems.length;
 
       const nextHref = asString(asObject(asObject(payload._links)?.next)?.href);
-      const totalCount = asNumber(payload.totalCount);
       if (nextHref) {
         nextUrl = this.buildUrl(nextHref);
-      } else if (totalCount !== undefined && offset < totalCount && pageItems.length >= Math.min(pageSize, limit)) {
+      } else if (total !== undefined && offset < total && pageItems.length >= Math.min(pageSize, limit)) {
         nextUrl = this.buildUrl(path, { ...query, limit: Math.min(pageSize, limit - items.length), offset });
       } else {
         nextUrl = undefined;
       }
     }
 
-    return items;
+    return {
+      items,
+      truncated: total !== undefined ? total > items.length : remaining,
+      seen: items.length,
+      total,
+    };
   }
 
   private async getItems(path: string, query: JsonRecord = {}, options: { apiVersion?: string } = {}): Promise<JsonRecord[]> {
@@ -1124,7 +1155,7 @@ export class LaunchdarklyApiClient {
     return this.get("/api/v2/caller-identity");
   }
 
-  async listMembers(limit = DEFAULT_MEMBER_LIMIT): Promise<JsonRecord[]> {
+  async listMembers(limit = DEFAULT_MEMBER_LIMIT): Promise<LaunchdarklyCollection> {
     return this.list("/api/v2/members", {}, { limit });
   }
 
@@ -1132,38 +1163,38 @@ export class LaunchdarklyApiClient {
     return this.get(`/api/v2/members/${encodeURIComponent(memberId)}`);
   }
 
-  async listTeams(limit = DEFAULT_TEAM_LIMIT): Promise<JsonRecord[]> {
+  async listTeams(limit = DEFAULT_TEAM_LIMIT): Promise<LaunchdarklyCollection> {
     return this.list("/api/v2/teams", { expand: "members" }, { limit });
   }
 
-  async listTeamRoles(teamKey: string, limit = DEFAULT_ROLE_LIMIT): Promise<JsonRecord[]> {
+  async listTeamRoles(teamKey: string, limit = DEFAULT_ROLE_LIMIT): Promise<LaunchdarklyCollection> {
     return this.list(`/api/v2/teams/${encodeURIComponent(teamKey)}/roles`, {}, { limit });
   }
 
-  async listCustomRoles(limit = DEFAULT_ROLE_LIMIT): Promise<JsonRecord[]> {
+  async listCustomRoles(limit = DEFAULT_ROLE_LIMIT): Promise<LaunchdarklyCollection> {
     return this.list("/api/v2/roles", {}, { limit });
   }
 
-  async listProjects(limit = DEFAULT_PROJECT_LIMIT, projectKeys: string[] = []): Promise<JsonRecord[]> {
+  async listProjects(limit = DEFAULT_PROJECT_LIMIT, projectKeys: string[] = []): Promise<LaunchdarklyCollection> {
     const filter = projectKeys.length > 0 ? `keys:${projectKeys.join("|")}` : undefined;
     return this.list("/api/v2/projects", { filter }, { limit });
   }
 
-  async listEnvironments(projectKey: string, limit = DEFAULT_ENVIRONMENT_LIMIT): Promise<JsonRecord[]> {
+  async listEnvironments(projectKey: string, limit = DEFAULT_ENVIRONMENT_LIMIT): Promise<LaunchdarklyCollection> {
     const environments = await this.list(`/api/v2/projects/${encodeURIComponent(projectKey)}/environments`, {}, { limit });
-    return environments.map(redactEnvironment);
+    return { ...environments, items: environments.items.map(redactEnvironment) };
   }
 
-  async listSdkKeys(projectKey: string, environmentKey: string, limit = 100): Promise<JsonRecord[]> {
+  async listSdkKeys(projectKey: string, environmentKey: string, limit = 100): Promise<LaunchdarklyCollection> {
     const sdkKeys = await this.list(
       `/api/v2/projects/${encodeURIComponent(projectKey)}/environments/${encodeURIComponent(environmentKey)}/sdk-keys`,
       {},
       { limit, apiVersion: BETA_API_VERSION },
     );
-    return sdkKeys.map(redactSdkKey);
+    return { ...sdkKeys, items: sdkKeys.items.map(redactSdkKey) };
   }
 
-  async listFlags(projectKey: string, environmentKey: string, limit = DEFAULT_FLAG_LIMIT): Promise<JsonRecord[]> {
+  async listFlags(projectKey: string, environmentKey: string, limit = DEFAULT_FLAG_LIMIT): Promise<LaunchdarklyCollection> {
     return this.list(
       `/api/v2/flags/${encodeURIComponent(projectKey)}`,
       { env: environmentKey, summary: "0" },
@@ -1180,7 +1211,7 @@ export class LaunchdarklyApiClient {
   async listAuditLogEntries(
     query: { before?: number; after?: number; spec?: string; q?: string } = {},
     limit = AUDIT_LOG_PAGE_SIZE,
-  ): Promise<JsonRecord[]> {
+  ): Promise<LaunchdarklyCollection> {
     return this.list(
       "/api/v2/auditlog",
       { before: query.before, after: query.after, spec: query.spec, q: query.q },
@@ -1188,7 +1219,7 @@ export class LaunchdarklyApiClient {
     );
   }
 
-  async listTokens(limit = DEFAULT_TOKEN_LIMIT): Promise<JsonRecord[]> {
+  async listTokens(limit = DEFAULT_TOKEN_LIMIT): Promise<LaunchdarklyCollection> {
     return this.list("/api/v2/tokens", { showAll: "true" }, { limit });
   }
 
@@ -1287,8 +1318,26 @@ async function readableSurface(
   }
 }
 
-function arrayCount(value: unknown): number | undefined {
-  return Array.isArray(value) ? value.length : undefined;
+function toCollection(value: unknown): LaunchdarklyCollection {
+  if (Array.isArray(value)) {
+    const items = asRecordArray(value);
+    return { items, truncated: false, seen: items.length };
+  }
+  const record = asObject(value);
+  const items = asRecordArray(record?.items);
+  const total = asNumber(record?.total);
+  return {
+    items,
+    truncated: asBoolean(record?.truncated) === true || (total !== undefined && total > items.length),
+    seen: items.length,
+    total,
+  };
+}
+
+function listCount(value: unknown): number | undefined {
+  if (Array.isArray(value)) return value.length;
+  const items = asObject(value)?.items;
+  return Array.isArray(items) ? items.length : undefined;
 }
 
 function parseCallerIdentity(payload: JsonRecord): LaunchdarklyCallerIdentity {
@@ -1314,37 +1363,37 @@ export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promis
 
   let firstProjectKey: string | undefined;
   const projectsSurface = await readableSurface("projects", "/api/v2/projects", async () => {
-    const projects = await client.listProjects(5, config.projectKeys);
-    firstProjectKey = asString(projects[0]?.key);
+    const projects = toCollection(await client.listProjects(5, config.projectKeys));
+    firstProjectKey = asString(projects.items[0]?.key);
     return projects;
-  }, arrayCount);
+  }, listCount);
 
   let firstEnvironmentKey: string | undefined;
   const environmentsSurface = firstProjectKey
     ? await readableSurface("environments", "/api/v2/projects/{projectKey}/environments", async () => {
-      const environments = await client.listEnvironments(firstProjectKey ?? "", 5);
-      firstEnvironmentKey = asString(environments[0]?.key);
+      const environments = toCollection(await client.listEnvironments(firstProjectKey ?? "", 5));
+      firstEnvironmentKey = asString(environments.items[0]?.key);
       return environments;
-    }, arrayCount)
+    }, listCount)
     : { name: "environments", endpoint: "/api/v2/projects/{projectKey}/environments", status: "not_configured" as const, error: "No project was readable." };
 
   const flagsSurface = firstProjectKey && firstEnvironmentKey
-    ? await readableSurface("flags", "/api/v2/flags/{projectKey}", () => client.listFlags(firstProjectKey ?? "", firstEnvironmentKey ?? "", 5), arrayCount)
+    ? await readableSurface("flags", "/api/v2/flags/{projectKey}", () => client.listFlags(firstProjectKey ?? "", firstEnvironmentKey ?? "", 5), listCount)
     : { name: "flags", endpoint: "/api/v2/flags/{projectKey}", status: "not_configured" as const, error: "No project environment was readable." };
 
   const surfaces: LaunchdarklyAccessSurface[] = [
     callerSurface,
-    await readableSurface("members", "/api/v2/members", () => client.listMembers(5), arrayCount),
-    await readableSurface("teams", "/api/v2/teams", () => client.listTeams(5), arrayCount),
-    await readableSurface("custom_roles", "/api/v2/roles", () => client.listCustomRoles(5), arrayCount),
+    await readableSurface("members", "/api/v2/members", () => client.listMembers(5), listCount),
+    await readableSurface("teams", "/api/v2/teams", () => client.listTeams(5), listCount),
+    await readableSurface("custom_roles", "/api/v2/roles", () => client.listCustomRoles(5), listCount),
     projectsSurface,
     environmentsSurface,
     flagsSurface,
-    await readableSurface("access_tokens", "/api/v2/tokens", () => client.listTokens(5), arrayCount),
-    await readableSurface("audit_log", "/api/v2/auditlog", () => client.listAuditLogEntries({}, 5), arrayCount),
-    await readableSurface("webhooks", "/api/v2/webhooks", () => client.listWebhooks(), arrayCount),
-    await readableSurface("relay_proxy_configs", "/api/v2/account/relay-auto-configs", () => client.listRelayProxyConfigs(), arrayCount),
-    await readableSurface("integration_subscriptions", "/api/v2/integrations/{integrationKey}", () => client.listIntegrationSubscriptions(DEFAULT_INTEGRATION_KEYS[0]), arrayCount),
+    await readableSurface("access_tokens", "/api/v2/tokens", () => client.listTokens(5), listCount),
+    await readableSurface("audit_log", "/api/v2/auditlog", () => client.listAuditLogEntries({}, 5), listCount),
+    await readableSurface("webhooks", "/api/v2/webhooks", () => client.listWebhooks(), listCount),
+    await readableSurface("relay_proxy_configs", "/api/v2/account/relay-auto-configs", () => client.listRelayProxyConfigs(), listCount),
+    await readableSurface("integration_subscriptions", "/api/v2/integrations/{integrationKey}", () => client.listIntegrationSubscriptions(DEFAULT_INTEGRATION_KEYS[0]), listCount),
   ];
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
@@ -1403,6 +1452,61 @@ async function collect<T>(errors: string[], label: string, load: () => Promise<T
   }
 }
 
+async function collectList(
+  errors: string[],
+  label: string,
+  load: () => Promise<LaunchdarklyCollection | JsonRecord[]>,
+): Promise<LaunchdarklyCollection> {
+  return toCollection(await collect<LaunchdarklyCollection | JsonRecord[]>(errors, label, load, []));
+}
+
+function truncationNote(
+  collection: string,
+  option: string | undefined,
+  result: LaunchdarklyCollection,
+  scope?: string,
+): LaunchdarklyTruncationNote[] {
+  if (!result.truncated) return [];
+  return [{
+    collection,
+    ...(option ? { option } : {}),
+    seen: result.seen,
+    total: result.total ?? null,
+    ...(scope ? { scope } : {}),
+  }];
+}
+
+function truncationCaveat(notes: LaunchdarklyTruncationNote[]): string {
+  const parts = notes.map((note) =>
+    `${note.collection}${note.scope ? ` for ${note.scope}` : ""} (${note.seen} of ${note.total ?? "an unknown total"} collected)`);
+  const options = uniqueStrings(notes.map((note) => note.option).filter((option): option is string => Boolean(option)));
+  const remedy = options.length > 0
+    ? `raise ${options.join(" and ")} and rerun for a complete evaluation`
+    : "review the uncollected items manually";
+  return `Truncated listing: ${parts.join("; ")}. The verdict covers only the collected items, so ${remedy}.`;
+}
+
+type FindingBuilder = (
+  controlNumber: number,
+  status: LaunchdarklyFindingStatus,
+  summary: string,
+  evidence?: JsonRecord,
+) => LaunchdarklyFinding;
+
+function truncationAwareFinding(notes: LaunchdarklyTruncationNote[]): FindingBuilder {
+  if (notes.length === 0) return buildFinding;
+  return (controlNumber, status, summary, evidence) => buildFinding(
+    controlNumber,
+    status === "pass" ? "warn" : status,
+    `${summary} ${truncationCaveat(notes)}`,
+    { ...(evidence ?? {}), truncated_collections: notes },
+  );
+}
+
+function collectionSnapshot(result: LaunchdarklyCollection, items: unknown[] = result.items): JsonRecord {
+  return { truncated: result.truncated, seen: result.seen, total: result.total ?? null, items };
+}
+
 function memberEmail(member: JsonRecord): string {
   return asString(member.email) ?? asString(member._id) ?? "unknown-member";
 }
@@ -1441,19 +1545,29 @@ export async function assessLaunchdarklyIdentity(
       .map((domain) => domain.toLowerCase().replace(/^@/, "")),
   );
 
-  const [members, teams, accountAuditEntries] = await Promise.all([
-    collect(errors, "members", () => client.listMembers(memberLimit), [] as JsonRecord[]),
-    collect(errors, "teams", () => client.listTeams(teamLimit), [] as JsonRecord[]),
-    collect(errors, "audit_log_account", () => client.listAuditLogEntries({ spec: "acct" }, AUDIT_LOG_PAGE_SIZE), [] as JsonRecord[]),
+  const [memberCollection, teamCollection, accountAuditCollection] = await Promise.all([
+    collectList(errors, "members", () => client.listMembers(memberLimit)),
+    collectList(errors, "teams", () => client.listTeams(teamLimit)),
+    collectList(errors, "audit_log_account", () => client.listAuditLogEntries({ spec: "acct" }, AUDIT_LOG_PAGE_SIZE)),
   ]);
+  const members = memberCollection.items;
+  const teams = teamCollection.items;
+  const accountAuditEntries = accountAuditCollection.items;
 
   const teamRoles = await Promise.all(teams.slice(0, teamLimit).map(async (team) => {
     const key = asString(team.key) ?? "";
-    const roles = key
-      ? await collect(errors, `team_roles:${key}`, () => client.listTeamRoles(key), [] as JsonRecord[])
-      : [];
-    return { key, name: asString(team.name) ?? key, roles };
+    const roleCollection = key
+      ? await collectList(errors, `team_roles:${key}`, () => client.listTeamRoles(key))
+      : toCollection([]);
+    return { key, name: asString(team.name) ?? key, roles: roleCollection.items, collection: roleCollection };
   }));
+
+  const memberNotes = truncationNote("members", "member_limit", memberCollection);
+  const teamNotes = truncationNote("teams", "team_limit", teamCollection);
+  const teamRoleNotes = teamRoles.flatMap((team) => truncationNote("team_roles", "role_limit", team.collection, `team ${team.key}`));
+  const memberFinding = truncationAwareFinding(memberNotes);
+  const membershipFinding = truncationAwareFinding([...memberNotes, ...teamNotes]);
+  const teamRoleFinding = truncationAwareFinding([...teamNotes, ...teamRoleNotes]);
 
   const activeMembers = members.filter((member) => !isPendingMember(member));
   const pendingMembers = members.filter(isPendingMember);
@@ -1488,7 +1602,7 @@ export async function assessLaunchdarklyIdentity(
     : [];
 
   const findings: LaunchdarklyFinding[] = [
-    buildFinding(
+    memberFinding(
       1,
       "manual",
       [
@@ -1520,7 +1634,7 @@ export async function assessLaunchdarklyIdentity(
         ],
       },
     ),
-    buildFinding(
+    memberFinding(
       2,
       activeMembers.length === 0 ? "warn" : membersWithoutMfa.length === 0 ? "pass" : "fail",
       activeMembers.length === 0
@@ -1535,7 +1649,7 @@ export async function assessLaunchdarklyIdentity(
         mfa_enforced_members: mfaEnforcedMembers.length,
       },
     ),
-    buildFinding(
+    memberFinding(
       3,
       owners.length > maxOwners ? "fail" : admins.length > maxAdmins ? "warn" : members.length === 0 ? "warn" : "pass",
       owners.length > maxOwners
@@ -1553,7 +1667,7 @@ export async function assessLaunchdarklyIdentity(
         total_members: members.length,
       },
     ),
-    buildFinding(
+    membershipFinding(
       6,
       teams.length === 0
         ? "warn"
@@ -1568,7 +1682,7 @@ export async function assessLaunchdarklyIdentity(
         orphaned_members: sample(orphanedMembers.map(memberEmail)),
       },
     ),
-    buildFinding(
+    teamRoleFinding(
       7,
       teams.length === 0
         ? "warn"
@@ -1585,7 +1699,7 @@ export async function assessLaunchdarklyIdentity(
         team_roles: sample(teamRoles.map((team) => ({ team: team.key, roles: team.roles.map((role) => asString(role.key) ?? asString(role.name)) }))),
       },
     ),
-    buildFinding(
+    memberFinding(
       24,
       allowedDomains.length === 0
         ? "manual"
@@ -1619,15 +1733,16 @@ export async function assessLaunchdarklyIdentity(
       teams_without_custom_roles: teamsWithoutCustomRoles.length,
       allowed_domains: allowedDomains.length,
       off_domain_members: offDomainMembers.length,
+      truncated_collections: memberNotes.length + teamNotes.length + teamRoleNotes.length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      members,
-      teams,
-      team_roles: teamRoles,
-      audit_log_account: accountAuditEntries,
+      members: collectionSnapshot(memberCollection),
+      teams: collectionSnapshot(teamCollection),
+      team_roles: teamRoles.map((team) => ({ team: team.key, name: team.name, ...collectionSnapshot(team.collection) })),
+      audit_log_account: collectionSnapshot(accountAuditCollection),
     },
   };
 }
@@ -1730,6 +1845,7 @@ function knownMemberBaseRole(member: JsonRecord | undefined): string | undefined
 interface TokenInventory {
   scope: "full" | "partial" | "unknown";
   reason: string;
+  remedy?: string;
   callerToken?: JsonRecord;
   callerTokenRole?: string;
   callerMemberRole?: string;
@@ -1783,9 +1899,19 @@ function resolveTokenInventory(
   return { ...base, scope: "unknown", reason: "The assessment token was not present in the listing and every visible personal token belongs to the caller, so the listing may contain only the caller's own tokens." };
 }
 
+function withTruncatedTokens(inventory: TokenInventory, tokens: LaunchdarklyCollection): TokenInventory {
+  if (!tokens.truncated || inventory.scope === "partial") return inventory;
+  return {
+    ...inventory,
+    scope: "partial",
+    reason: `The token listing was truncated at ${tokens.seen} of ${tokens.total ?? "an unknown total"} tokens, so the uncollected tokens were not evaluated.`,
+    remedy: "Raise token_limit and rerun for a complete inventory.",
+  };
+}
+
 function tokenInventoryCaveat(inventory: TokenInventory): string {
   const prefix = inventory.scope === "partial" ? "Partial token inventory:" : "Token inventory completeness is unknown:";
-  return `${prefix} ${inventory.reason} Rerun with an Admin or Owner token for a complete inventory.`;
+  return `${prefix} ${inventory.reason} ${inventory.remedy ?? "Rerun with an Admin or Owner token for a complete inventory."}`;
 }
 
 export async function assessLaunchdarklyAccessControl(
@@ -1800,23 +1926,36 @@ export async function assessLaunchdarklyAccessControl(
   const staleTokenDays = clampNumber(options.staleTokenDays, DEFAULT_STALE_TOKEN_DAYS, 1, 3650);
 
   const tokenErrors: string[] = [];
+  const memberErrors: string[] = [];
   const callerErrors: string[] = [];
-  const [roles, tokens, members, callerPayload] = await Promise.all([
-    collect(errors, "custom_roles", () => client.listCustomRoles(roleLimit), [] as JsonRecord[]),
-    collect(tokenErrors, "access_tokens", () => client.listTokens(tokenLimit), [] as JsonRecord[]),
-    collect(errors, "members", () => client.listMembers(DEFAULT_MEMBER_LIMIT), [] as JsonRecord[]),
+  const [roleCollection, tokenCollection, memberCollection, callerPayload] = await Promise.all([
+    collectList(errors, "custom_roles", () => client.listCustomRoles(roleLimit)),
+    collectList(tokenErrors, "access_tokens", () => client.listTokens(tokenLimit)),
+    collectList(memberErrors, "members", () => client.listMembers(DEFAULT_MEMBER_LIMIT)),
     collect(callerErrors, "caller_identity", () => client.getCallerIdentity(), {} as JsonRecord),
   ]);
-  errors.push(...tokenErrors, ...callerErrors);
+  errors.push(...tokenErrors, ...memberErrors, ...callerErrors);
+  const roles = roleCollection.items;
+  const tokens = tokenCollection.items;
+  const members = memberCollection.items;
   const tokensReadable = tokenErrors.length === 0;
+  const membersComplete = memberErrors.length === 0 && !memberCollection.truncated;
+  const roleNotes = truncationNote("custom_roles", "role_limit", roleCollection);
+  const tokenNotes = truncationNote("access_tokens", "token_limit", tokenCollection);
+  const memberNotes = truncationNote("members", "member_limit", memberCollection);
+  const roleFinding = truncationAwareFinding(roleNotes);
   const callerIdentity = parseCallerIdentity(callerPayload);
-  const inventory = resolveTokenInventory(tokens, members, callerIdentity, callerErrors.length === 0);
+  const inventory = withTruncatedTokens(
+    resolveTokenInventory(tokens, members, callerIdentity, callerErrors.length === 0),
+    tokenCollection,
+  );
   const inventoryEvidence: JsonRecord = {
     scope: inventory.scope,
     reason: inventory.reason,
     caller_token_role: inventory.callerTokenRole ?? null,
     caller_member_role: inventory.callerMemberRole ?? null,
     visible_tokens: tokens.length,
+    total_tokens: tokenCollection.total ?? null,
     visible_personal_token_members: inventory.visibleMemberIds,
   };
   const degradeForInventory = tokensReadable && inventory.scope !== "full";
@@ -1825,12 +1964,21 @@ export async function assessLaunchdarklyAccessControl(
     status: LaunchdarklyFindingStatus,
     summary: string,
     evidence: JsonRecord,
-  ): LaunchdarklyFinding => buildFinding(
-    control,
-    degradeForInventory && status === "pass" ? "warn" : status,
-    degradeForInventory ? `${summary} ${tokenInventoryCaveat(inventory)}` : summary,
-    { ...evidence, token_inventory: inventoryEvidence },
-  );
+    extraNotes: LaunchdarklyTruncationNote[] = [],
+  ): LaunchdarklyFinding => {
+    const notes = [...tokenNotes, ...extraNotes];
+    const degraded = degradeForInventory || extraNotes.length > 0;
+    return buildFinding(
+      control,
+      degraded && status === "pass" ? "warn" : status,
+      [
+        summary,
+        degradeForInventory ? tokenInventoryCaveat(inventory) : undefined,
+        extraNotes.length > 0 ? truncationCaveat(extraNotes) : undefined,
+      ].filter((part): part is string => Boolean(part)).join(" "),
+      { ...evidence, token_inventory: inventoryEvidence, ...(notes.length > 0 ? { truncated_collections: notes } : {}) },
+    );
+  };
 
   const roleAnalyses = roles.map((role) => {
     const statements = parseStatements(role.policy);
@@ -1877,12 +2025,14 @@ export async function assessLaunchdarklyAccessControl(
   const membersById = new Map(members
     .map((member) => [asString(member._id), member] as const)
     .filter((entry): entry is readonly [string, JsonRecord] => Boolean(entry[0])));
-  const orphanedPersonalTokens = membersById.size > 0
+  const unmatchedPersonalTokens = membersById.size > 0
     ? personalTokens.filter((token) => {
       const memberId = asString(token.memberId);
       return !memberId || !membersById.has(memberId);
     })
     : [];
+  const orphanedPersonalTokens = membersComplete ? unmatchedPersonalTokens : [];
+  const unverifiedPersonalTokens = membersComplete ? [] : unmatchedPersonalTokens;
   const overScopedPersonalTokens = personalTokens.flatMap((token) => {
     if (tokenHasCustomScope(token)) return [];
     const memberRole = knownMemberBaseRole(membersById.get(asString(token.memberId) ?? ""));
@@ -1893,7 +2043,7 @@ export async function assessLaunchdarklyAccessControl(
   });
 
   const findings: LaunchdarklyFinding[] = [
-    buildFinding(
+    roleFinding(
       4,
       roles.length === 0 ? "warn" : wildcardRoles.length === 0 ? "pass" : "fail",
       roles.length === 0
@@ -1909,7 +2059,7 @@ export async function assessLaunchdarklyAccessControl(
         }))),
       },
     ),
-    buildFinding(
+    roleFinding(
       5,
       roles.length === 0
         ? "warn"
@@ -1988,21 +2138,27 @@ export async function assessLaunchdarklyAccessControl(
       11,
       !tokensReadable
         ? "warn"
-        : orphanedPersonalTokens.length > 0 ? "fail" : overScopedPersonalTokens.length > 0 ? "warn" : "pass",
+        : orphanedPersonalTokens.length > 0
+          ? "fail"
+          : overScopedPersonalTokens.length > 0 || unverifiedPersonalTokens.length > 0 ? "warn" : "pass",
       !tokensReadable
         ? "Access tokens could not be read, so personal token scope could not be evaluated."
         : orphanedPersonalTokens.length > 0
           ? `${orphanedPersonalTokens.length} visible personal tokens are not tied to a current account member.`
           : overScopedPersonalTokens.length > 0
             ? `${overScopedPersonalTokens.length}/${personalTokens.length} visible personal tokens carry a base role above their member's own role; personal tokens must stay within the member's scope.`
-            : personalTokens.length === 0
-              ? "No personal tokens are visible."
-              : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
+            : unverifiedPersonalTokens.length > 0
+              ? `${unverifiedPersonalTokens.length}/${personalTokens.length} visible personal tokens could not be matched to a member in the truncated member listing, so orphaned tokens cannot be ruled out.`
+              : personalTokens.length === 0
+                ? "No personal tokens are visible."
+                : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
       {
         personal_tokens: personalTokens.length,
         orphaned_personal_tokens: sample(orphanedPersonalTokens.map(tokenLabel)),
+        unverified_personal_tokens: sample(unverifiedPersonalTokens.map(tokenLabel)),
         over_scoped_personal_tokens: sample(overScopedPersonalTokens),
       },
+      memberNotes,
     ),
   ];
 
@@ -2020,13 +2176,14 @@ export async function assessLaunchdarklyAccessControl(
       personal_tokens: personalTokens.length,
       tokens_without_expiry: tokensWithoutExpiry.length,
       stale_tokens: staleTokens.length,
+      truncated_collections: roleNotes.length + tokenNotes.length + memberNotes.length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      custom_roles: roles,
-      access_tokens: tokens,
+      custom_roles: collectionSnapshot(roleCollection),
+      access_tokens: collectionSnapshot(tokenCollection),
     },
   };
 }
@@ -2035,28 +2192,35 @@ function environmentKeyOf(environment: JsonRecord): string {
   return asString(environment.key) ?? asString(environment._id) ?? "environment";
 }
 
+interface EnvironmentInventory {
+  projects: LaunchdarklyCollection;
+  environments: EnvironmentContext[];
+  environmentCollections: Array<{ projectKey: string; collection: LaunchdarklyCollection }>;
+  notes: LaunchdarklyTruncationNote[];
+}
+
 async function collectEnvironmentContexts(
   client: Pick<LaunchdarklyApiClient, "listProjects" | "listEnvironments">,
   errors: string[],
   options: { projectLimit: number; environmentLimit: number; projectKeys: string[]; productionPattern: RegExp },
-): Promise<{ projects: JsonRecord[]; environments: EnvironmentContext[] }> {
-  const projects = await collect(
+): Promise<EnvironmentInventory> {
+  const projects = await collectList(
     errors,
     "projects",
     () => client.listProjects(options.projectLimit, options.projectKeys),
-    [] as JsonRecord[],
   );
   const environments: EnvironmentContext[] = [];
-  for (const project of projects) {
+  const environmentCollections: EnvironmentInventory["environmentCollections"] = [];
+  for (const project of projects.items) {
     const projectKey = asString(project.key);
     if (!projectKey) continue;
-    const projectEnvironments = await collect(
+    const projectEnvironments = await collectList(
       errors,
       `environments:${projectKey}`,
       () => client.listEnvironments(projectKey, options.environmentLimit),
-      [] as JsonRecord[],
     );
-    for (const environment of projectEnvironments) {
+    environmentCollections.push({ projectKey, collection: projectEnvironments });
+    for (const environment of projectEnvironments.items) {
       const key = environmentKeyOf(environment);
       const name = asString(environment.name) ?? key;
       environments.push({
@@ -2072,7 +2236,29 @@ async function collectEnvironmentContexts(
       });
     }
   }
-  return { projects, environments };
+  const notes = [
+    ...truncationNote("projects", "project_limit", projects),
+    ...environmentCollections.flatMap((entry) =>
+      truncationNote("environments", "environment_limit", entry.collection, `project ${entry.projectKey}`)),
+  ];
+  return { projects, environments, environmentCollections, notes };
+}
+
+function environmentsSnapshot(inventory: EnvironmentInventory): JsonRecord {
+  const truncatedProjects = inventory.environmentCollections
+    .filter((entry) => entry.collection.truncated)
+    .map((entry) => entry.projectKey);
+  const totals = inventory.environmentCollections.map((entry) => entry.collection.total);
+  const total = totals.length > 0 && totals.every((value) => value !== undefined)
+    ? totals.reduce((sum, value) => sum + (value ?? 0), 0)
+    : null;
+  return {
+    truncated: truncatedProjects.length > 0,
+    seen: inventory.environments.length,
+    total,
+    truncated_projects: truncatedProjects,
+    items: inventory.environments.map((context) => ({ project: context.projectKey, production: context.production, ...context.environment })),
+  };
 }
 
 function environmentLabel(context: EnvironmentContext): string {
@@ -2246,30 +2432,39 @@ export async function assessLaunchdarklyEnvironmentGovernance(
   const testProjectPattern = buildRegex(options.testProjectPattern, DEFAULT_TEST_PROJECT_PATTERN);
   const sdkKeyMaxAgeDays = clampNumber(options.sdkKeyMaxAgeDays, DEFAULT_SDK_KEY_MAX_AGE_DAYS, 1, 3650);
 
-  const { projects, environments } = await collectEnvironmentContexts(client, errors, {
+  const inventory = await collectEnvironmentContexts(client, errors, {
     projectLimit: clampNumber(options.projectLimit, DEFAULT_PROJECT_LIMIT, 1, 1000),
     environmentLimit: clampNumber(options.environmentLimit, DEFAULT_ENVIRONMENT_LIMIT, 1, 500),
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
   });
+  const projects = inventory.projects.items;
+  const environments = inventory.environments;
   const roleErrors: string[] = [];
-  const roles = await collect(roleErrors, "custom_roles", () => client.listCustomRoles(DEFAULT_ROLE_LIMIT), [] as JsonRecord[]);
+  const roleCollection = await collectList(roleErrors, "custom_roles", () => client.listCustomRoles(DEFAULT_ROLE_LIMIT));
   errors.push(...roleErrors);
+  const roles = roleCollection.items;
   const rolesReadable = roleErrors.length === 0;
   const roleStatements = roles.map((role) => ({ key: roleKey(role), statements: parseStatements(role.policy) }));
 
   const productionEnvironments = environments.filter((context) => context.production);
   const sdkKeyResults = await Promise.all(environments.map(async (context) => {
     const sdkKeyErrors: string[] = [];
-    const keys = await collect(
+    const collection = await collectList(
       sdkKeyErrors,
       `sdk_keys:${environmentLabel(context)}`,
       () => client.listSdkKeys(context.projectKey, context.key),
-      [] as JsonRecord[],
     );
-    return { context, keys, readable: sdkKeyErrors.length === 0, error: sdkKeyErrors[0] };
+    return { context, keys: collection.items, collection, readable: sdkKeyErrors.length === 0, error: sdkKeyErrors[0] };
   }));
   const unreadableSdkKeyEnvironments = sdkKeyResults.filter((result) => !result.readable);
+
+  const roleNotes = truncationNote("custom_roles", "role_limit", roleCollection);
+  const sdkKeyNotes = sdkKeyResults.flatMap((result) =>
+    truncationNote("sdk_keys", undefined, result.collection, `environment ${environmentLabel(result.context)}`));
+  const environmentFinding = truncationAwareFinding(inventory.notes);
+  const restrictionFinding = truncationAwareFinding([...inventory.notes, ...roleNotes]);
+  const sdkKeyFinding = truncationAwareFinding([...inventory.notes, ...sdkKeyNotes]);
   const staleSdkKeys = sdkKeyResults.flatMap((result) => result.keys
     .filter((key) => (asString(key.kind) ?? "sdk").toLowerCase() === "sdk")
     .filter((key) => {
@@ -2329,7 +2524,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
   const noProductionSummary = "No production environments were detected (environments marked critical or matching the production pattern); adjust production_pattern or mark production environments as critical in LaunchDarkly.";
 
   const findings: LaunchdarklyFinding[] = [
-    buildFinding(
+    restrictionFinding(
       16,
       productionEnvironments.length === 0 || !rolesReadable
         ? "warn"
@@ -2355,7 +2550,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
         custom_roles_evaluated: roles.length,
       },
     ),
-    buildFinding(
+    environmentFinding(
       17,
       productionEnvironments.length === 0
         ? "warn"
@@ -2375,7 +2570,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
         }))),
       },
     ),
-    buildFinding(
+    sdkKeyFinding(
       19,
       environments.length === 0
         ? "warn"
@@ -2400,7 +2595,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
           : [],
       },
     ),
-    buildFinding(
+    environmentFinding(
       22,
       projects.length === 0 ? "warn" : testProjects.length === 0 ? "pass" : "warn",
       projects.length === 0
@@ -2413,7 +2608,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
         test_like_projects: sample(testProjects.map((project) => asString(project.key) ?? asString(project.name) ?? "project")),
       },
     ),
-    buildFinding(
+    environmentFinding(
       23,
       productionEnvironments.length === 0
         ? "warn"
@@ -2449,14 +2644,19 @@ export async function assessLaunchdarklyEnvironmentGovernance(
       stale_sdk_keys: staleSdkKeys.length,
       test_like_projects: testProjects.length,
       secure_mode_missing: secureModeMissing.length,
+      truncated_collections: inventory.notes.length + roleNotes.length + sdkKeyNotes.length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      projects,
-      environments: environments.map((context) => ({ project: context.projectKey, production: context.production, ...context.environment })),
-      sdk_keys: sdkKeyResults.map((result) => ({ environment: environmentLabel(result.context), readable: result.readable, items: result.keys })),
+      projects: collectionSnapshot(inventory.projects),
+      environments: environmentsSnapshot(inventory),
+      sdk_keys: sdkKeyResults.map((result) => ({
+        environment: environmentLabel(result.context),
+        readable: result.readable,
+        ...collectionSnapshot(result.collection),
+      })),
     },
   };
 }
@@ -2512,12 +2712,14 @@ export async function assessLaunchdarklyFlagHygiene(
   const staleFlagDays = clampNumber(options.staleFlagDays, DEFAULT_STALE_FLAG_DAYS, 1, 3650);
   const flagLimit = clampNumber(options.flagLimit, DEFAULT_FLAG_LIMIT, 1, 10_000);
 
-  const { projects, environments } = await collectEnvironmentContexts(client, errors, {
+  const inventory = await collectEnvironmentContexts(client, errors, {
     projectLimit: clampNumber(options.projectLimit, DEFAULT_PROJECT_LIMIT, 1, 1000),
     environmentLimit: DEFAULT_ENVIRONMENT_LIMIT,
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
   });
+  const projects = inventory.projects.items;
+  const environments = inventory.environments;
 
   const targetEnvironments: EnvironmentContext[] = [];
   for (const project of projects) {
@@ -2529,10 +2731,13 @@ export async function assessLaunchdarklyFlagHygiene(
   }
 
   const environmentResults = await Promise.all(targetEnvironments.map(async (context) => {
-    const flags = await collect(errors, `flags:${environmentLabel(context)}`, () => client.listFlags(context.projectKey, context.key, flagLimit), [] as JsonRecord[]);
+    const flagCollection = await collectList(errors, `flags:${environmentLabel(context)}`, () => client.listFlags(context.projectKey, context.key, flagLimit));
     const statuses = await collect(errors, `flag_statuses:${environmentLabel(context)}`, () => client.listFlagStatuses(context.projectKey, context.key), [] as JsonRecord[]);
-    return { context, flags, statuses };
+    return { context, flags: flagCollection.items, flagCollection, statuses };
   }));
+  const flagNotes = environmentResults.flatMap((result) =>
+    truncationNote("flags", "flag_limit", result.flagCollection, `environment ${environmentLabel(result.context)}`));
+  const flagFinding = truncationAwareFinding([...inventory.notes, ...flagNotes]);
 
   const individuallyTargetedFlags: Array<{ environment: string; flag: string; targets: number; context_kinds: string[] }> = [];
   const staleFlags: Array<{ environment: string; flag: string; status: string | null; last_requested: string | null }> = [];
@@ -2583,7 +2788,7 @@ export async function assessLaunchdarklyFlagHygiene(
   const productionTargets = targetEnvironments.filter((context) => context.production);
   const noFlagsSummary = `No flags were readable in the ${targetEnvironments.length} evaluated environments, so flag hygiene could not be evaluated.`;
   const findings: LaunchdarklyFinding[] = [
-    buildFinding(
+    flagFinding(
       14,
       productionTargets.length === 0 || evaluatedFlags === 0
         ? "warn"
@@ -2600,7 +2805,7 @@ export async function assessLaunchdarklyFlagHygiene(
         individually_targeted_flags: sample(individuallyTargetedFlags),
       },
     ),
-    buildFinding(
+    flagFinding(
       15,
       targetEnvironments.length === 0 || evaluatedFlags === 0 ? "warn" : staleFlags.length === 0 ? "pass" : "warn",
       targetEnvironments.length === 0
@@ -2615,7 +2820,7 @@ export async function assessLaunchdarklyFlagHygiene(
         stale_flags: sample(staleFlags),
       },
     ),
-    buildFinding(
+    flagFinding(
       25,
       targetEnvironments.length === 0 || evaluatedFlags === 0 ? "warn" : prerequisiteCycles.length === 0 ? "pass" : "fail",
       targetEnvironments.length === 0
@@ -2642,12 +2847,13 @@ export async function assessLaunchdarklyFlagHygiene(
       individually_targeted_flags: individuallyTargetedFlags.length,
       stale_flags: staleFlags.length,
       prerequisite_cycles: prerequisiteCycles.length,
+      truncated_collections: inventory.notes.length + flagNotes.length,
       evaluated_at: new Date(now).toISOString(),
     },
     findings,
     errors,
     snapshots: {
-      flags: environmentResults.map((result) => ({ environment: environmentLabel(result.context), items: result.flags })),
+      flags: environmentResults.map((result) => ({ environment: environmentLabel(result.context), ...collectionSnapshot(result.flagCollection) })),
       flag_statuses: environmentResults.map((result) => ({ environment: environmentLabel(result.context), items: result.statuses })),
     },
   };
@@ -2699,15 +2905,19 @@ export async function assessLaunchdarklyMonitoringIntegrations(
 
   const auditErrors: string[] = [];
   const webhookErrors: string[] = [];
-  const [recentAuditEntries, retentionProbe, memberAuditEntries, roleAuditEntries, relayConfigs, webhooks] = await Promise.all([
-    collect(auditErrors, "audit_log_recent", () => client.listAuditLogEntries({}, AUDIT_LOG_PAGE_SIZE), [] as JsonRecord[]),
-    collect(auditErrors, "audit_log_retention_probe", () => client.listAuditLogEntries({ before: now - retentionDays * DAY_MS }, 1), [] as JsonRecord[]),
-    collect(auditErrors, "audit_log_members", () => client.listAuditLogEntries({ spec: "member/*" }, AUDIT_LOG_PAGE_SIZE), [] as JsonRecord[]),
-    collect(auditErrors, "audit_log_roles", () => client.listAuditLogEntries({ spec: "role/*" }, AUDIT_LOG_PAGE_SIZE), [] as JsonRecord[]),
+  const [recentAuditCollection, retentionProbeCollection, memberAuditCollection, roleAuditCollection, relayConfigs, webhooks] = await Promise.all([
+    collectList(auditErrors, "audit_log_recent", () => client.listAuditLogEntries({}, AUDIT_LOG_PAGE_SIZE)),
+    collectList(auditErrors, "audit_log_retention_probe", () => client.listAuditLogEntries({ before: now - retentionDays * DAY_MS }, 1)),
+    collectList(auditErrors, "audit_log_members", () => client.listAuditLogEntries({ spec: "member/*" }, AUDIT_LOG_PAGE_SIZE)),
+    collectList(auditErrors, "audit_log_roles", () => client.listAuditLogEntries({ spec: "role/*" }, AUDIT_LOG_PAGE_SIZE)),
     collect(errors, "relay_proxy_configs", () => client.listRelayProxyConfigs(), [] as JsonRecord[]),
     collect(webhookErrors, "webhooks", () => client.listWebhooks(), [] as JsonRecord[]),
   ]);
   errors.push(...auditErrors, ...webhookErrors);
+  const recentAuditEntries = recentAuditCollection.items;
+  const retentionProbe = retentionProbeCollection.items;
+  const memberAuditEntries = memberAuditCollection.items;
+  const roleAuditEntries = roleAuditCollection.items;
   const auditReadable = auditErrors.length < 4;
   const webhooksReadable = webhookErrors.length === 0;
 
@@ -2720,14 +2930,16 @@ export async function assessLaunchdarklyMonitoringIntegrations(
 
   const relayStatements = relayConfigs.map((relayConfig) => ({ relayConfig, statements: parseStatements(relayConfig.policy) }));
   const referencedProjects = uniqueStrings(relayStatements.flatMap((item) => relayReferencedEnvironments(item.statements).map((reference) => reference.projectKey)));
-  const relayEnvironments = referencedProjects.length > 0
-    ? (await collectEnvironmentContexts(client, errors, {
+  const relayInventory = referencedProjects.length > 0
+    ? await collectEnvironmentContexts(client, errors, {
       projectLimit: referencedProjects.length,
       environmentLimit: DEFAULT_ENVIRONMENT_LIMIT,
       projectKeys: referencedProjects,
       productionPattern,
-    })).environments
-    : [];
+    })
+    : undefined;
+  const relayEnvironments = relayInventory?.environments ?? [];
+  const relayFinding = truncationAwareFinding(relayInventory?.notes ?? []);
 
   const oldestRecentEntry = recentAuditEntries
     .map((entry) => asTimestamp(entry.date))
@@ -2802,7 +3014,7 @@ export async function assessLaunchdarklyMonitoringIntegrations(
         recent_entry_kinds: uniqueStrings(recentAuditEntries.map((entry) => asString(entry.kind) ?? "unknown")),
       },
     ),
-    buildFinding(
+    relayFinding(
       18,
       relayConfigs.length === 0
         ? "manual"
@@ -2897,10 +3109,10 @@ export async function assessLaunchdarklyMonitoringIntegrations(
     findings,
     errors,
     snapshots: {
-      audit_log_recent: recentAuditEntries,
-      audit_log_retention_probe: retentionProbe,
-      audit_log_members: memberAuditEntries,
-      audit_log_roles: roleAuditEntries,
+      audit_log_recent: collectionSnapshot(recentAuditCollection),
+      audit_log_retention_probe: collectionSnapshot(retentionProbeCollection),
+      audit_log_members: collectionSnapshot(memberAuditCollection),
+      audit_log_roles: collectionSnapshot(roleAuditCollection),
       relay_proxy_configs: relayConfigs,
       integration_subscriptions: subscriptionResults,
       webhooks,
@@ -2974,6 +3186,7 @@ function buildExecutiveSummary(
   const count = (status: LaunchdarklyFindingStatus) => findings.filter((item) => item.status === status).length;
   const priority = sortFindings(findings).filter((item) => item.status === "fail" || item.status === "warn").slice(0, 10);
   const manual = findings.filter((item) => item.status === "manual");
+  const truncated = collectTruncationNotes(findings);
 
   const lines = [
     "# LaunchDarkly Security Inspector Executive Summary",
@@ -3006,6 +3219,13 @@ function buildExecutiveSummary(
     }
   }
 
+  if (truncated.length > 0) {
+    lines.push("", "## Truncated Listings", "");
+    for (const note of truncated) {
+      lines.push(`- ${note.collection}${note.scope ? ` (${note.scope})` : ""}: ${note.seen} of ${note.total ?? "an unknown total"} collected${note.option ? `; raise ${note.option}` : ""}`);
+    }
+  }
+
   if (errors.length > 0) {
     lines.push("", "## Partial Collection Warnings", "");
     for (const error of errors) {
@@ -3014,6 +3234,29 @@ function buildExecutiveSummary(
   }
 
   return `${lines.join("\n")}\n`;
+}
+
+function collectTruncationNotes(findings: LaunchdarklyFinding[]): LaunchdarklyTruncationNote[] {
+  const seen = new Set<string>();
+  const notes: LaunchdarklyTruncationNote[] = [];
+  for (const finding of findings) {
+    for (const entry of asRecordArray(finding.evidence?.truncated_collections)) {
+      const collection = asString(entry.collection);
+      if (!collection) continue;
+      const scope = asString(entry.scope);
+      const key = `${collection}|${scope ?? ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      notes.push({
+        collection,
+        ...(asString(entry.option) ? { option: asString(entry.option) } : {}),
+        seen: asNumber(entry.seen) ?? 0,
+        total: asNumber(entry.total) ?? null,
+        ...(scope ? { scope } : {}),
+      });
+    }
+  }
+  return notes;
 }
 
 function buildUnifiedMatrix(findings: LaunchdarklyFinding[]): string {

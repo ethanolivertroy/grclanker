@@ -381,7 +381,10 @@ test("LaunchdarklyApiClient sends the raw token, LD-API-Version header, and foll
   const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
   const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 1 });
 
-  assert.deepEqual(members.map((member) => member._id), ["m1", "m2"]);
+  assert.deepEqual(members.items.map((member) => member._id), ["m1", "m2"]);
+  assert.equal(members.truncated, false);
+  assert.equal(members.seen, 2);
+  assert.equal(members.total, 2);
   assert.equal(seen.length, 2);
   assert.equal(seen[0].pathname, "/api/v2/members");
   assert.equal(seen[0].auth, TEST_TOKEN);
@@ -391,7 +394,7 @@ test("LaunchdarklyApiClient sends the raw token, LD-API-Version header, and foll
   assert.match(seen[1].search, /offset=1/);
 });
 
-test("LaunchdarklyApiClient falls back to offset pagination when _links.next is absent and stops at the limit", async () => {
+test("LaunchdarklyApiClient falls back to offset pagination when _links.next is absent and signals truncation at the limit", async () => {
   const seen = [];
   const fetchImpl = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
@@ -403,8 +406,36 @@ test("LaunchdarklyApiClient falls back to offset pagination when _links.next is 
   const client = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl });
   const tokens = await client.list("/api/v2/tokens", { showAll: "true" }, { limit: 3, pageSize: 2 });
 
-  assert.equal(tokens.length, 3);
+  assert.equal(tokens.items.length, 3);
+  assert.deepEqual(tokens.items.map((token) => token._id), ["t0", "t1", "t2"]);
+  assert.equal(tokens.truncated, true);
+  assert.equal(tokens.seen, 3);
+  assert.equal(tokens.total, 6);
   assert.deepEqual(seen, [0, 2]);
+});
+
+test("LaunchdarklyApiClient signals truncation when _links.next remains at the limit and reports complete listings otherwise", async () => {
+  const withNext = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [{ _id: "a" }, { _id: "b" }], _links: { next: { href: "/api/v2/members?limit=2&offset=2" } } }),
+  });
+  const capped = await withNext.list("/api/v2/members", {}, { limit: 2, pageSize: 2 });
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.seen, 2);
+  assert.equal(capped.total, undefined);
+
+  const complete = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [{ _id: "a" }, { _id: "b" }], totalCount: 2 }),
+  });
+  const all = await complete.list("/api/v2/members", {}, { limit: 2, pageSize: 2 });
+  assert.equal(all.truncated, false);
+  assert.equal(all.seen, 2);
+  assert.equal(all.total, 2);
+
+  const empty = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [], totalCount: 0 }),
+  });
+  const none = await empty.list("/api/v2/members", {}, { limit: 5 });
+  assert.deepEqual(none, { items: [], truncated: false, seen: 0, total: 0 });
 });
 
 test("LaunchdarklyApiClient retries 429 using X-Ratelimit-Reset and retries 5xx responses", async () => {
@@ -497,9 +528,10 @@ test("LaunchdarklyApiClient uses the beta API version for SDK keys and masks sec
 
   assert.equal(seen.find((item) => item.pathname.endsWith("/sdk-keys"))?.version, "beta");
   assert.equal(seen.find((item) => item.pathname.endsWith("/environments"))?.version, "20240415");
-  assert.equal(sdkKeys[0].value, "****1234");
-  assert.equal(environments[0].apiKey, "****abcd");
-  assert.equal(environments[0].mobileKey, "****efgh");
+  assert.equal(sdkKeys.items[0].value, "****1234");
+  assert.equal(sdkKeys.truncated, false);
+  assert.equal(environments.items[0].apiKey, "****abcd");
+  assert.equal(environments.items[0].mobileKey, "****efgh");
   assert.equal(webhooks[0].secret, "[REDACTED]");
   assert.equal(relays[0].fullKey, "****9999");
 });
@@ -849,6 +881,101 @@ test("assessLaunchdarklyAccessControl flags wildcard roles, sensitive grants, mi
   assert.equal(findingStatus(result, "LD-11"), "fail");
 });
 
+async function truncatedListing(client, method, seen, total, ...args) {
+  const items = await client[method](...args);
+  return { items: items.slice(0, seen), truncated: true, seen: Math.min(seen, items.length), total };
+}
+
+test("assessLaunchdarklyIdentity never passes member or team controls on truncated listings", async () => {
+  const base = healthyClient();
+  const truncatedMembers = await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: () => truncatedListing(base, "listMembers", 3, 400),
+  }), { now: NOW });
+
+  for (const id of ["LD-02", "LD-03", "LD-06", "LD-24"]) {
+    assert.equal(findingStatus(truncatedMembers, id), "warn", `${id} must not pass on 3 of 400 members`);
+    assert.match(finding(truncatedMembers, id).summary, /Truncated listing: members \(3 of 400 collected\)/);
+    assert.match(finding(truncatedMembers, id).summary, /raise member_limit and rerun/);
+    assert.deepEqual(finding(truncatedMembers, id).evidence.truncated_collections, [
+      { collection: "members", option: "member_limit", seen: 3, total: 400 },
+    ]);
+  }
+  assert.equal(findingStatus(truncatedMembers, "LD-01"), "manual");
+  assert.equal(findingStatus(truncatedMembers, "LD-07"), "pass");
+  assert.equal(truncatedMembers.summary.truncated_collections, 1);
+  assert.equal(truncatedMembers.snapshots.members.truncated, true);
+  assert.equal(truncatedMembers.snapshots.members.seen, 3);
+  assert.equal(truncatedMembers.snapshots.members.total, 400);
+  assert.equal(truncatedMembers.snapshots.members.items.length, 3);
+  assert.equal(truncatedMembers.snapshots.teams.truncated, false);
+
+  const truncatedTeams = await assessLaunchdarklyIdentity(healthyClient({
+    listTeams: () => truncatedListing(base, "listTeams", 1, 30),
+  }), { now: NOW });
+  assert.equal(findingStatus(truncatedTeams, "LD-06"), "warn");
+  assert.equal(findingStatus(truncatedTeams, "LD-07"), "warn");
+  assert.match(finding(truncatedTeams, "LD-07").summary, /teams \(1 of 30 collected\)/);
+  assert.match(finding(truncatedTeams, "LD-07").summary, /raise team_limit/);
+  assert.equal(findingStatus(truncatedTeams, "LD-02"), "pass");
+
+  const failingAndTruncated = await assessLaunchdarklyIdentity(healthyClient({
+    async listMembers() {
+      const members = await base.listMembers();
+      return { items: [{ ...members[1], mfa: "disabled" }], truncated: true, seen: 1, total: 400 };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(failingAndTruncated, "LD-02"), "fail");
+  assert.match(finding(failingAndTruncated, "LD-02").summary, /1\/1 active members do not have MFA enabled\. Truncated listing/);
+});
+
+test("assessLaunchdarklyAccessControl never passes role or token controls on truncated listings", async () => {
+  const base = healthyClient();
+  const truncatedRoles = await assessLaunchdarklyAccessControl(healthyClient({
+    listCustomRoles: () => truncatedListing(base, "listCustomRoles", 1, 80),
+  }), { now: NOW });
+  for (const id of ["LD-04", "LD-05"]) {
+    assert.equal(findingStatus(truncatedRoles, id), "warn", `${id} must not pass on 1 of 80 roles`);
+    assert.match(finding(truncatedRoles, id).summary, /Truncated listing: custom_roles \(1 of 80 collected\)/);
+    assert.match(finding(truncatedRoles, id).summary, /raise role_limit/);
+    assert.deepEqual(finding(truncatedRoles, id).evidence.truncated_collections, [
+      { collection: "custom_roles", option: "role_limit", seen: 1, total: 80 },
+    ]);
+  }
+  assert.equal(findingStatus(truncatedRoles, "LD-08"), "pass");
+  assert.equal(truncatedRoles.snapshots.custom_roles.truncated, true);
+  assert.equal(truncatedRoles.snapshots.custom_roles.total, 80);
+
+  const truncatedTokens = await assessLaunchdarklyAccessControl(healthyClient({
+    listTokens: () => truncatedListing(base, "listTokens", 3, 500),
+  }), { now: NOW });
+  assert.equal(truncatedTokens.summary.token_inventory_scope, "partial");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.equal(findingStatus(truncatedTokens, id), "warn", `${id} must not pass on 3 of 500 tokens`);
+    assert.match(finding(truncatedTokens, id).summary, /Partial token inventory: The token listing was truncated at 3 of 500 tokens/);
+    assert.match(finding(truncatedTokens, id).summary, /Raise token_limit and rerun/);
+    assert.equal(finding(truncatedTokens, id).evidence.token_inventory.total_tokens, 500);
+    assert.deepEqual(finding(truncatedTokens, id).evidence.truncated_collections, [
+      { collection: "access_tokens", option: "token_limit", seen: 3, total: 500 },
+    ]);
+  }
+  assert.equal(findingStatus(truncatedTokens, "LD-04"), "pass");
+  assert.equal(truncatedTokens.snapshots.access_tokens.truncated, true);
+
+  const truncatedMembers = await assessLaunchdarklyAccessControl(healthyClient({
+    listMembers: () => truncatedListing(base, "listMembers", 1, 400),
+  }), { now: NOW });
+  assert.equal(truncatedMembers.summary.token_inventory_scope, "full");
+  assert.equal(findingStatus(truncatedMembers, "LD-08"), "pass");
+  assert.equal(findingStatus(truncatedMembers, "LD-11"), "warn");
+  assert.match(finding(truncatedMembers, "LD-11").summary, /1\/2 visible personal tokens could not be matched to a member in the truncated member listing/);
+  assert.match(finding(truncatedMembers, "LD-11").summary, /Truncated listing: members \(1 of 400 collected\)/);
+  assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.unverified_personal_tokens, ["dev-personal"]);
+  assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.orphaned_personal_tokens, []);
+  assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.truncated_collections, [
+    { collection: "members", option: "member_limit", seen: 1, total: 400 },
+  ]);
+});
+
 test("assessLaunchdarklyAccessControl warns instead of passing when tokens cannot be read", async () => {
   const result = await assessLaunchdarklyAccessControl(healthyClient({
     async listTokens() {
@@ -1039,6 +1166,69 @@ test("assessLaunchdarklyEnvironmentGovernance marks SDK key rotation manual when
   assert.equal(result.errors.length, 0);
 });
 
+test("assessLaunchdarklyEnvironmentGovernance never passes on truncated project, environment, role, or SDK key listings", async () => {
+  const base = healthyClient();
+  const truncatedProjects = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
+    listProjects: () => truncatedListing(base, "listProjects", 1, 12),
+  }), { now: NOW });
+  for (const id of ["LD-16", "LD-17", "LD-19", "LD-22", "LD-23"]) {
+    assert.equal(findingStatus(truncatedProjects, id), "warn", `${id} must not pass on 1 of 12 projects`);
+    assert.match(finding(truncatedProjects, id).summary, /Truncated listing: projects \(1 of 12 collected\)/);
+    assert.match(finding(truncatedProjects, id).summary, /raise project_limit/);
+    assert.deepEqual(finding(truncatedProjects, id).evidence.truncated_collections, [
+      { collection: "projects", option: "project_limit", seen: 1, total: 12 },
+    ]);
+  }
+  assert.equal(truncatedProjects.summary.truncated_collections, 1);
+  assert.equal(truncatedProjects.snapshots.projects.truncated, true);
+  assert.equal(truncatedProjects.snapshots.projects.total, 12);
+  assert.equal(truncatedProjects.snapshots.environments.truncated, false);
+
+  const truncatedEnvironments = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
+    listEnvironments: (projectKey) => truncatedListing(base, "listEnvironments", 2, 9, projectKey),
+  }), { now: NOW });
+  for (const id of ["LD-16", "LD-17", "LD-19", "LD-22", "LD-23"]) {
+    assert.equal(findingStatus(truncatedEnvironments, id), "warn", `${id} must not pass on 2 of 9 environments`);
+    assert.match(finding(truncatedEnvironments, id).summary, /environments for project web \(2 of 9 collected\)/);
+    assert.match(finding(truncatedEnvironments, id).summary, /raise environment_limit/);
+    assert.deepEqual(finding(truncatedEnvironments, id).evidence.truncated_collections, [
+      { collection: "environments", option: "environment_limit", seen: 2, total: 9, scope: "project web" },
+    ]);
+  }
+  assert.equal(truncatedEnvironments.snapshots.environments.truncated, true);
+  assert.deepEqual(truncatedEnvironments.snapshots.environments.truncated_projects, ["web"]);
+  assert.equal(truncatedEnvironments.snapshots.environments.seen, 2);
+  assert.equal(truncatedEnvironments.snapshots.environments.total, 9);
+
+  const truncatedRoles = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
+    listCustomRoles: () => truncatedListing(base, "listCustomRoles", 1, 80),
+  }), { now: NOW });
+  assert.equal(findingStatus(truncatedRoles, "LD-16"), "warn");
+  assert.match(finding(truncatedRoles, "LD-16").summary, /All 1 production environments are restricted by custom role statements .* Truncated listing: custom_roles \(1 of 80 collected\)/);
+  for (const id of ["LD-17", "LD-19", "LD-22", "LD-23"]) {
+    assert.equal(findingStatus(truncatedRoles, id), "pass", `${id} is unaffected by role truncation`);
+  }
+
+  const truncatedSdkKeys = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
+    listSdkKeys: (projectKey, environmentKey) => truncatedListing(base, "listSdkKeys", 1, 150, projectKey, environmentKey),
+  }), { now: NOW });
+  assert.equal(findingStatus(truncatedSdkKeys, "LD-19"), "warn");
+  assert.match(finding(truncatedSdkKeys, "LD-19").summary, /sdk_keys for environment web\/production \(1 of 150 collected\)/);
+  assert.match(finding(truncatedSdkKeys, "LD-19").summary, /review the uncollected items manually/);
+  assert.equal(findingStatus(truncatedSdkKeys, "LD-16"), "pass");
+  assert.equal(truncatedSdkKeys.snapshots.sdk_keys[0].truncated, true);
+
+  const failingAndTruncated = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
+    listProjects: () => truncatedListing(base, "listProjects", 1, 12),
+    async listEnvironments() {
+      return [{ key: "production", name: "Production", critical: true, secureMode: false, approvalSettings: { required: false } }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(failingAndTruncated, "LD-17"), "fail");
+  assert.equal(findingStatus(failingAndTruncated, "LD-23"), "fail");
+  assert.match(finding(failingAndTruncated, "LD-23").summary, /do not enable secure mode\. Truncated listing/);
+});
+
 test("assessLaunchdarklyFlagHygiene passes clean production flags", async () => {
   const result = await assessLaunchdarklyFlagHygiene(healthyClient(), { now: NOW });
 
@@ -1107,6 +1297,68 @@ test("assessLaunchdarklyFlagHygiene warns instead of passing when flags cannot b
   assert.equal(findingStatus(result, "LD-15"), "warn");
   assert.equal(findingStatus(result, "LD-25"), "warn");
   assert.ok(result.errors.some((error) => error.startsWith("flags:web/production")));
+});
+
+test("assessLaunchdarklyFlagHygiene never passes on truncated flag, project, or environment listings", async () => {
+  const base = healthyClient();
+  const truncatedFlags = await assessLaunchdarklyFlagHygiene(healthyClient({
+    listFlags: (projectKey, environmentKey) => truncatedListing(base, "listFlags", 2, 900, projectKey, environmentKey),
+  }), { now: NOW });
+  for (const id of ["LD-14", "LD-15", "LD-25"]) {
+    assert.equal(findingStatus(truncatedFlags, id), "warn", `${id} must not pass on 2 of 900 flags`);
+    assert.match(finding(truncatedFlags, id).summary, /Truncated listing: flags for environment web\/production \(2 of 900 collected\)/);
+    assert.match(finding(truncatedFlags, id).summary, /raise flag_limit/);
+    assert.deepEqual(finding(truncatedFlags, id).evidence.truncated_collections, [
+      { collection: "flags", option: "flag_limit", seen: 2, total: 900, scope: "environment web/production" },
+    ]);
+  }
+  assert.equal(truncatedFlags.summary.evaluated_flags, 2);
+  assert.equal(truncatedFlags.summary.truncated_collections, 1);
+  assert.equal(truncatedFlags.snapshots.flags[0].truncated, true);
+  assert.equal(truncatedFlags.snapshots.flags[0].total, 900);
+  assert.equal(truncatedFlags.snapshots.flags[0].items.length, 2);
+
+  const truncatedProjects = await assessLaunchdarklyFlagHygiene(healthyClient({
+    listProjects: () => truncatedListing(base, "listProjects", 1, 12),
+  }), { now: NOW });
+  for (const id of ["LD-14", "LD-15", "LD-25"]) {
+    assert.equal(findingStatus(truncatedProjects, id), "warn", `${id} must not pass on 1 of 12 projects`);
+    assert.match(finding(truncatedProjects, id).summary, /projects \(1 of 12 collected\)/);
+  }
+
+  const truncatedEnvironments = await assessLaunchdarklyFlagHygiene(healthyClient({
+    listEnvironments: (projectKey) => truncatedListing(base, "listEnvironments", 1, 9, projectKey),
+  }), { now: NOW });
+  for (const id of ["LD-14", "LD-15", "LD-25"]) {
+    assert.equal(findingStatus(truncatedEnvironments, id), "warn", `${id} must not pass on 1 of 9 environments`);
+    assert.match(finding(truncatedEnvironments, id).summary, /environments for project web \(1 of 9 collected\)/);
+  }
+
+  const failingAndTruncated = await assessLaunchdarklyFlagHygiene(healthyClient({
+    async listFlags() {
+      return {
+        items: [{ key: "vip-access", creationDate: OLD_MS, environments: { production: { targets: [{ values: ["user-123"], variation: 0 }] } } }],
+        truncated: true,
+        seen: 1,
+        total: 900,
+      };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(failingAndTruncated, "LD-14"), "fail");
+  assert.match(finding(failingAndTruncated, "LD-14").summary, /production targeting\. Truncated listing/);
+});
+
+test("assessLaunchdarklyMonitoringIntegrations does not pass relay scoping when referenced environments are truncated", async () => {
+  const base = healthyClient();
+  const result = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
+    listEnvironments: (projectKey) => truncatedListing(base, "listEnvironments", 1, 9, projectKey),
+  }), { now: NOW });
+
+  assert.equal(findingStatus(result, "LD-18"), "warn");
+  assert.match(finding(result, "LD-18").summary, /environments for project web \(1 of 9 collected\)/);
+  for (const id of ["LD-12", "LD-13", "LD-20", "LD-21"]) {
+    assert.equal(findingStatus(result, id), "pass", `${id} is unaffected by environment truncation`);
+  }
 });
 
 test("assessLaunchdarklyMonitoringIntegrations passes retained audit logs, scoped relay and integrations, and signed webhooks", async () => {
@@ -1285,6 +1537,34 @@ test("exportLaunchdarklyAuditBundle records partial collection failures in _erro
   assert.match(errorLog, /403 Forbidden/);
   const executive = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
   assert.match(executive, /Partial Collection Warnings/);
+});
+
+test("exportLaunchdarklyAuditBundle records truncated listings in core data snapshots and the executive summary", async () => {
+  const base = createTempBase("grclanker-ld-export-truncated-");
+  const reference = healthyClient();
+  const result = await exportLaunchdarklyAuditBundle(healthyClient({
+    listMembers: () => truncatedListing(reference, "listMembers", 3, 400),
+  }), sampleConfig(), base, { now: NOW });
+
+  assert.equal(result.findingCount, 25);
+  assert.equal(result.errorCount, 0);
+  const members = JSON.parse(readFileSync(join(result.outputDir, "core_data", "members.json"), "utf8"));
+  assert.equal(members.truncated, true);
+  assert.equal(members.seen, 3);
+  assert.equal(members.total, 400);
+  assert.equal(members.items.length, 3);
+  const roles = JSON.parse(readFileSync(join(result.outputDir, "core_data", "custom_roles.json"), "utf8"));
+  assert.equal(roles.truncated, false);
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const mfa = findings.find((item) => item.id === "LD-02");
+  assert.equal(mfa.status, "warn");
+  assert.deepEqual(mfa.evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 3, total: 400 }]);
+
+  const executive = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  assert.match(executive, /## Truncated Listings/);
+  assert.match(executive, /- members: 3 of 400 collected; raise member_limit/);
+  assert.doesNotMatch(executive, /Partial Collection Warnings/);
 });
 
 test("exportLaunchdarklyAuditBundle keeps directory and zip paired across repeated exports", async () => {
