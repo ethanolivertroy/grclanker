@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 
 import { AGENT_DESCRIPTION, grclankerAgentConfig, MODEL_ENV_VAR } from "../dist/agent-sdk/lib/agent.js";
-import { classifyGrcToolEffect } from "../dist/agent-sdk/lib/effects.js";
+import { classifyGrcToolEffect, isGrcWriteTool } from "../dist/agent-sdk/lib/effects.js";
 import { buildGrclankerInstructions } from "../dist/agent-sdk/lib/instructions.js";
 import { parsePersona, personaAgentConfig } from "../dist/agent-sdk/lib/personas.js";
 import {
@@ -36,7 +36,31 @@ const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const agentSdkRoot = resolve(cliRoot, "agent-sdk");
 const distAgentDir = resolve(cliRoot, "dist", "agent-sdk", "agent");
 const COMPUTE_TOOL_NAMES = ["bash", "read", "write", "edit", "ls", "find", "grep"];
-const WRITE_MARKER = /_(export|generate|plan|collect|init|import|create|assemble)_/;
+const WRITE_MARKER = /_(export|generate|collect|init|import|create|assemble)_/;
+const EXPECTED_WRITE_TOOLS = [
+  "ansible_export_audit_bundle",
+  "aws_export_audit_bundle",
+  "azure_export_audit_bundle",
+  "cloudflare_export_audit_bundle",
+  "duo_export_audit_bundle",
+  "fedramp_generate_ads_bundle",
+  "fedramp_generate_ads_site",
+  "gcp_export_audit_bundle",
+  "github_export_audit_bundle",
+  "gws_export_audit_bundle",
+  "gws_ops_collect_evidence_bundle",
+  "oci_export_audit_bundle",
+  "okta_export_audit_bundle",
+  "oscal_assemble_ssp",
+  "oscal_create_model",
+  "oscal_generate_ssp_markdown",
+  "oscal_import_model",
+  "oscal_init_workspace",
+  "slack_export_audit_bundle",
+  "vanta_export_audit",
+  "webex_export_audit_bundle",
+  "zoom_export_audit_bundle",
+];
 
 function importAgentEntry(...segments) {
   return import(pathToFileURL(resolve(distAgentDir, ...segments)).href);
@@ -145,21 +169,35 @@ test("every registered tool converts to a plain object input schema without cons
   }
 });
 
-test("effect classification marks query tools read-only and leaves writers undeclared", () => {
+test("effect classification marks query tools read-only and lets write verbs win", () => {
   assert.equal(classifyGrcToolEffect("cmvp_search_modules"), "read");
   assert.equal(classifyGrcToolEffect("gws_ops_check_cli"), "read");
   assert.equal(classifyGrcToolEffect("kevs_recent"), "read");
   assert.equal(classifyGrcToolEffect("oscal_validate_model"), "read");
   assert.equal(classifyGrcToolEffect("okta_assess_identity"), "read");
+  assert.equal(classifyGrcToolEffect("fedramp_plan_ads_package"), "read");
   assert.equal(classifyGrcToolEffect("aws_export_audit_bundle"), undefined);
   assert.equal(classifyGrcToolEffect("fedramp_generate_ads_site"), undefined);
   assert.equal(classifyGrcToolEffect("oscal_init_workspace"), undefined);
-  assert.equal(classifyGrcToolEffect("fedramp_plan_ads_package"), undefined);
+  assert.equal(classifyGrcToolEffect("future_check_and_export_bundle"), undefined);
+  assert.equal(classifyGrcToolEffect("future_upload_report"), undefined);
+  assert.equal(isGrcWriteTool("vanta_export_audit"), true);
+  assert.equal(isGrcWriteTool("vanta_list_audits"), false);
+});
 
-  const undeclared = listRegisteredGrcToolNames().filter((name) => classifyGrcToolEffect(name) === undefined);
-  assert.equal(undeclared.length, 24);
-  for (const name of undeclared) {
-    assert.match(name, WRITE_MARKER);
+test("every registered tool is classified in the expected direction", () => {
+  const names = listRegisteredGrcToolNames();
+  const undeclared = names.filter((name) => classifyGrcToolEffect(name) === undefined).sort();
+  const read = names.filter((name) => classifyGrcToolEffect(name) === "read");
+
+  assert.deepEqual(undeclared, EXPECTED_WRITE_TOOLS);
+  assert.equal(read.length, names.length - EXPECTED_WRITE_TOOLS.length);
+  for (const name of names) {
+    if (WRITE_MARKER.test(name)) {
+      assert.equal(classifyGrcToolEffect(name), undefined, `${name} writes and must stay undeclared`);
+    } else {
+      assert.equal(classifyGrcToolEffect(name), "read", `${name} reads and must declare effect: "read"`);
+    }
   }
 });
 
