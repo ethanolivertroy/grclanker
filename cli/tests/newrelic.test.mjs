@@ -1095,6 +1095,668 @@ test("assessNewrelicDataGovernance marks unreadable scripts and log queries as m
   assert.ok(result.errors.some((error) => error.startsWith("nrql.Log.secret_patterns:")));
 });
 
+function forbiddenClient(overrides = {}) {
+  const fetchImpl = async (_input, init = {}) => {
+    if ((init.method ?? "GET").toUpperCase() === "POST") {
+      return jsonResponse({ data: null, errors: [{ message: "Not authorized", path: ["actor"], extensions: { errorClass: "SERVER_ERROR" } }] });
+    }
+    return new Response(JSON.stringify({ error: { title: "Forbidden" } }), {
+      status: 403,
+      statusText: "Forbidden",
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return new NewrelicApiClient(sampleConfig(overrides), { fetchImpl });
+}
+
+function emptyClient(overrides = {}) {
+  const empty = async () => [];
+  return {
+    getResolvedConfig: () => sampleConfig({ accountIds: [111] }),
+    async resolveAccountIds() {
+      return [111];
+    },
+    async getCurrentUser() {
+      return { id: "u-1", email: "auditor@example.com", name: "Auditor" };
+    },
+    async getOrganization() {
+      return { id: "org-1", name: "Example Org" };
+    },
+    listAccounts: empty,
+    listAuthenticationDomains: empty,
+    listOrganizationAuthenticationDomains: empty,
+    listDomainUsers: empty,
+    listDomainGroupGrants: empty,
+    listRoles: empty,
+    listApiKeys: empty,
+    listAlertPolicies: empty,
+    listNrqlConditions: empty,
+    listNotificationDestinations: empty,
+    listNotificationChannels: empty,
+    listWorkflows: empty,
+    searchEntities: empty,
+    async countEntities() {
+      return 0;
+    },
+    listEventRetentionRules: empty,
+    listRetentionNamespaces: empty,
+    listObfuscationRules: empty,
+    listObfuscationExpressions: empty,
+    listPipelineCloudRules: empty,
+    listNrqlDropRules: empty,
+    listDashboardLiveUrls: empty,
+    async getSyntheticScript() {
+      return "";
+    },
+    async runNrql() {
+      return [];
+    },
+    ...overrides,
+  };
+}
+
+function forbidden(scope) {
+  return new Error(`NerdGraph returned errors: Not authorized (at ${scope})`);
+}
+
+function twoDomains() {
+  return [
+    { id: "domain-1", name: "Corporate SSO", provisioningType: "SCIM" },
+    { id: "domain-2", name: "Contractors", provisioningType: "SCIM" },
+  ];
+}
+
+function onlyDomainOne(load) {
+  return async (domainId, ...rest) => {
+    if (domainId !== "domain-1") throw forbidden("actor.organization.userManagement.authenticationDomains");
+    return load(domainId, ...rest);
+  };
+}
+
+function onlyAccount111(load) {
+  return async (accountId, ...rest) => {
+    if (accountId !== 111) throw forbidden("actor.account");
+    return load(accountId, ...rest);
+  };
+}
+
+async function assessAll(clients, options = {}) {
+  const results = [
+    await assessNewrelicIdentity(clients.identity, { now: NOW, ...options.identity }),
+    await assessNewrelicAccessControl(clients.accessControl, { now: NOW, ...options.accessControl }),
+    await assessNewrelicAlerting(clients.alerting, options.alerting),
+    await assessNewrelicDataGovernance(clients.dataGovernance, options.dataGovernance),
+  ];
+  const findings = results.flatMap((result) => result.findings);
+  assert.equal(findings.length, 20);
+  assert.deepEqual([...new Set(findings.map((item) => item.control))].sort((a, b) => a - b), Array.from({ length: 20 }, (_, index) => index + 1));
+  return { results, findings };
+}
+
+function passing(findings) {
+  return findings.filter((item) => item.status === "pass").map((item) => item.id);
+}
+
+test("verdict safety rule 1: NerdGraph errors alongside partial data are treated as failures, not data", async () => {
+  const fetchImpl = async () => jsonResponse({
+    data: { actor: { user: { id: "u-1", email: "auditor@example.com" }, organization: null } },
+    errors: [{ message: "Not authorized", path: ["actor", "organization"] }],
+  });
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+
+  await assert.rejects(client.getCurrentUser(), /NerdGraph returned errors: Not authorized \(at actor\.organization\)/);
+  await assert.rejects(client.getOrganization(), /NerdGraph returned errors/);
+});
+
+test("verdict safety rule 1 and self-check (a): forbidden NerdGraph and REST surfaces yield manual verdicts that name the cause and the evidence", async () => {
+  const client = forbiddenClient();
+  const { results, findings } = await assessAll({ identity: client, accessControl: client, alerting: client, dataGovernance: client });
+
+  assert.deepEqual(passing(findings), []);
+  assert.deepEqual([...new Set(findings.map((item) => item.status))], ["manual"]);
+  for (const item of findings) {
+    assert.match(item.summary, /Not authorized/, `${item.id} does not name the cause: ${item.summary}`);
+    assert.match(item.summary, /[Cc]ollect|[Rr]ecord|[Cc]onfirm|[Rr]eview/, `${item.id} does not name the evidence: ${item.summary}`);
+  }
+  assert.ok(results.every((result) => result.errors.length > 0));
+  assert.ok(results.every((result) => result.errors.every((error) => /Not authorized|403 Forbidden/.test(error))));
+
+  const access = await checkNewrelicAccess(client);
+  assert.equal(access.status, "limited");
+  assert.ok(access.surfaces.filter((surface) => surface.required).every((surface) => surface.status === "not_readable"));
+  const restUsers = access.surfaces.find((surface) => surface.name === "rest_v2_users");
+  assert.equal(restUsers.status, "not_readable");
+  assert.match(restUsers.error, /403 Forbidden/);
+});
+
+test("verdict safety rule 2 and self-check (b): empty inventories never pass and each summary says emptiness is unknown", async () => {
+  const client = emptyClient();
+  const { results, findings } = await assessAll({ identity: client, accessControl: client, alerting: client, dataGovernance: client });
+
+  assert.deepEqual(passing(findings), []);
+  assert.deepEqual(findings.filter((item) => item.status === "fail").map((item) => item.id), []);
+  assert.ok(results.every((result) => result.errors.length === 0), JSON.stringify(results.map((result) => result.errors)));
+  const emptinessControls = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20];
+  for (const control of emptinessControls) {
+    const item = findings.find((entry) => entry.control === control);
+    assert.equal(item.status, "manual", `${item.id}: ${item.summary}`);
+    assert.match(item.summary, /unknown rather than compliant|zero|No |no /, `${item.id} does not explain emptiness: ${item.summary}`);
+  }
+  assert.match(findings.find((item) => item.control === 12).summary, /not applicable through the API while logging stays disabled/);
+  assert.match(findings.find((item) => item.control === 13).summary, /Not applicable through the API/);
+  assert.match(findings.find((item) => item.control === 8).summary, /zero accounts/);
+});
+
+test("verdict safety rule 2: control 6 passes on zero keys only when keySearch was complete and every in-scope account is visible", async () => {
+  const clean = await assessNewrelicAccessControl(accessControlClient({ async listApiKeys() { return []; } }), { now: NOW });
+  const unused = findingById(clean, "NR-06-UNUSED-API-KEYS");
+  assert.equal(unused.status, "pass");
+  assert.match(unused.summary, /Both conditions for accepting an empty inventory hold/);
+  assert.match(unused.summary, /keySearch was readable and complete for every account in scope/);
+  assert.match(unused.summary, /every in-scope account \(111, 222\) is visible to this key/);
+  assert.equal(findingStatus(clean, "NR-04-API-KEY-INVENTORY"), "manual");
+  assert.equal(findingStatus(clean, "NR-05-API-KEY-AGE"), "manual");
+
+  const hiddenAccount = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() { return []; },
+    async listAccounts() { return [{ id: 111, name: "Payments Production" }]; },
+  }), { now: NOW });
+  assert.equal(findingStatus(hiddenAccount, "NR-06-UNUSED-API-KEYS"), "manual");
+  assert.match(findingById(hiddenAccount, "NR-06-UNUSED-API-KEYS").summary, /accounts 222 are not visible to this key/);
+  assert.deepEqual(findingById(hiddenAccount, "NR-06-UNUSED-API-KEYS").evidence.accounts_in_scope_not_visible, [222]);
+
+  const fallback = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() {
+      return { items: [], complete: false, totalCount: undefined, note: "keySearch rejected the cursor argument, so only the first page was read (0 keys)" };
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(fallback, "NR-06-UNUSED-API-KEYS"), "warn");
+  assert.match(findingById(fallback, "NR-06-UNUSED-API-KEYS").summary, /listing was incomplete/);
+
+  const accountsUnreadable = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() { return []; },
+    async listAccounts() { throw forbidden("actor.accounts"); },
+  }), { now: NOW });
+  assert.equal(findingStatus(accountsUnreadable, "NR-06-UNUSED-API-KEYS"), "manual");
+  assert.match(findingById(accountsUnreadable, "NR-06-UNUSED-API-KEYS").summary, /Not authorized/);
+});
+
+test("verdict safety rule 2: control 20 passes on zero custom roles only when the role listing is readable, complete, and lists standard roles", async () => {
+  const clean = await assessNewrelicAccessControl(accessControlClient(), { now: NOW });
+  const roles = findingById(clean, "NR-20-CUSTOM-ROLE-PERMISSIONS");
+  assert.equal(roles.status, "pass");
+  assert.match(roles.summary, /Both conditions for accepting this hold/);
+  assert.match(roles.summary, /readable and complete/);
+  assert.match(roles.summary, /returned 2 standard roles/);
+
+  const noRoles = await assessNewrelicAccessControl(accessControlClient({ async listRoles() { return []; } }), { now: NOW });
+  assert.equal(findingStatus(noRoles, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
+  assert.match(findingById(noRoles, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /zero roles.*unknown rather than compliant/);
+
+  const untyped = await assessNewrelicAccessControl(accessControlClient({
+    async listRoles() { return [{ id: "role-1", name: "Organization manager" }]; },
+  }), { now: NOW });
+  assert.equal(findingStatus(untyped, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
+  assert.match(findingById(untyped, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /exposed no role type/);
+
+  const truncated = await assessNewrelicAccessControl(accessControlClient({
+    async listRoles() { return { items: standardRoles(), complete: false, note: "stopped after 2 items with more pages available" }; },
+  }), { now: NOW });
+  assert.equal(findingStatus(truncated, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "warn");
+  assert.match(findingById(truncated, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /role listing was incomplete/);
+  assert.equal(findingById(truncated, "NR-20-CUSTOM-ROLE-PERMISSIONS").evidence.role_listing_complete, false);
+});
+
+test("verdict safety rule 3: scoped-out or not-applicable controls render as manual, never pass", async () => {
+  const singleTenant = await assessNewrelicIdentity(identityClient({
+    async listOrganizationAuthenticationDomains() {
+      throw forbidden("customerAdministration.authenticationDomains");
+    },
+  }), { now: NOW });
+  const sso = findingById(singleTenant, "NR-01-SSO-ENFORCEMENT");
+  assert.equal(sso.status, "manual");
+  assert.match(sso.summary, /scoped out of the API check and not applicable to automated verification/);
+  assert.equal(sso.evidence.authentication_type_readable, false);
+
+  const singleAccount = await assessNewrelicAccessControl(accessControlClient({
+    async resolveAccountIds() { return [111]; },
+    async listAccounts() { return [{ id: 111, name: "Payments Production" }]; },
+  }), { now: NOW });
+  assert.equal(findingStatus(singleAccount, "NR-08-CROSS-ACCOUNT-RESTRICTIONS"), "manual");
+  assert.match(findingById(singleAccount, "NR-08-CROSS-ACCOUNT-RESTRICTIONS").summary, /Not applicable through the API: only one account/);
+
+  const noPipelineControl = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async listPipelineCloudRules() { throw forbidden("actor.entityManagement"); },
+    async searchEntities(query) {
+      if (query.includes("MONITOR")) return [{ guid: "mon-1", name: "Ping", domain: "SYNTH", type: "MONITOR", monitorType: "SIMPLE", accountId: 111 }];
+      if (query.includes("DASHBOARD")) return [{ guid: "dash-1", name: "Ops", domain: "VIZ", type: "DASHBOARD", permissions: "PRIVATE", accountId: 111 }];
+      return [];
+    },
+  }));
+  const obfuscation = findingById(noPipelineControl, "NR-12-LOG-OBFUSCATION");
+  assert.equal(obfuscation.status, "pass");
+  assert.match(obfuscation.summary, /Pipeline Control cloud rules were not readable and are treated as unavailable on this account/);
+  assert.match(obfuscation.evidence.pipeline_control_status, /^not available: /);
+  assert.equal(obfuscation.evidence.pipeline_cloud_rules, null);
+  const synthetics = findingById(noPipelineControl, "NR-13-SYNTHETIC-MONITOR-SECURITY");
+  assert.equal(synthetics.status, "manual");
+  assert.match(synthetics.summary, /Not applicable through the API: none of the 1 synthetic monitors is scripted/);
+  assert.equal(findingStatus(noPipelineControl, "NR-16-INFRA-AGENT-CONFIGURATION"), "manual");
+  assert.equal(findingStatus(noPipelineControl, "NR-14-DASHBOARD-PERMISSIONS"), "pass");
+});
+
+test("verdict safety rule 4: items without dates are bucketed separately and cap the verdict at warn", async () => {
+  const identity = await assessNewrelicIdentity(identityClient({
+    async listDomainUsers() {
+      return [
+        user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"], lastActive: null }),
+        user("bob", { type: "BASIC", groups: ["g-dev"], lastActive: null }),
+      ];
+    },
+  }), { now: NOW });
+  const userTypes = findingById(identity, "NR-02-USER-TYPE-LEAST-PRIVILEGE");
+  assert.equal(userTypes.status, "warn");
+  assert.match(userTypes.summary, /1 of them have no lastActive value/);
+  assert.deepEqual(userTypes.evidence.undated_full_platform_users, ["alice@example.com"]);
+  const inactive = findingById(identity, "NR-19-INACTIVE-USER-ACCOUNTS");
+  assert.equal(inactive.status, "warn");
+  assert.match(inactive.summary, /2 users have no lastActive value and cannot be counted as active/);
+  assert.deepEqual(inactive.evidence.never_active_users, ["alice@example.com", "bob@example.com"]);
+  assert.equal(inactive.evidence.inactive_users, 0);
+
+  const someUndated = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() {
+      return [
+        { id: "key-1", name: "ci-deploy", type: "USER", createdAt: secondsAgo(10), userId: "bob", accountId: 111 },
+        { id: "key-2", name: "legacy", type: "USER", createdAt: null, userId: "bob", accountId: 111 },
+      ];
+    },
+  }), { now: NOW });
+  const age = findingById(someUndated, "NR-05-API-KEY-AGE");
+  assert.equal(age.status, "warn");
+  assert.match(age.summary, /1\/2 keys have no createdAt value and cannot be counted as rotated/);
+  assert.deepEqual(age.evidence.keys_without_created_at, ["legacy"]);
+
+  const allUndated = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() {
+      return [{ id: "key-1", name: "ci-deploy", type: "USER", userId: "bob", accountId: 111 }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(allUndated, "NR-05-API-KEY-AGE"), "manual");
+  assert.match(findingById(allUndated, "NR-05-API-KEY-AGE").summary, /createdAt was not exposed for any of the 1 keys/);
+
+  const undatedOwner = await assessNewrelicAccessControl(accessControlClient({
+    async listDomainUsers() {
+      return [user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"] }), user("bob", { type: "BASIC", groups: ["g-dev"], lastActive: null })];
+    },
+  }), { now: NOW });
+  const unused = findingById(undatedOwner, "NR-06-UNUSED-API-KEYS");
+  assert.equal(unused.status, "warn");
+  assert.match(unused.summary, /1 belong to users with no lastActive value/);
+  assert.deepEqual(unused.evidence.undated_owner_user_keys, ["ci-deploy"]);
+});
+
+test("verdict safety rule 5: the keySearch single-page fallback downgrades every key-hygiene verdict to warn", async () => {
+  const result = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() {
+      return {
+        items: [
+          { id: "key-1", name: "ci-deploy", type: "USER", createdAt: secondsAgo(10), userId: "bob", accountId: 111 },
+          { id: "key-2", name: "license-prod", type: "INGEST", ingestType: "LICENSE", createdAt: secondsAgo(20), accountId: 111 },
+        ],
+        complete: false,
+        totalCount: 7,
+        note: "keySearch rejected the cursor argument, so only the first page was read (2 of 7 keys)",
+      };
+    },
+  }), { now: NOW });
+
+  for (const id of ["NR-04-API-KEY-INVENTORY", "NR-05-API-KEY-AGE"]) {
+    const item = findingById(result, id);
+    assert.equal(item.status, "warn", `${id}: ${item.summary}`);
+    assert.match(item.summary, /limited to warn instead of pass/);
+    assert.match(item.summary, /Partial view: API keys: 2 of 7 seen before pagination stopped; apiAccess\.keySearch: keySearch rejected the cursor argument/);
+    assert.equal(item.evidence.key_listing_complete, false);
+  }
+  assert.equal(findingById(result, "NR-04-API-KEY-INVENTORY").evidence.keys_reported_total, 7);
+  assert.equal(findingStatus(result, "NR-06-UNUSED-API-KEYS"), "manual");
+  assert.match(findingById(result, "NR-06-UNUSED-API-KEYS").summary, /Partial view: API keys: 2 of 7 seen/);
+  assert.ok(result.coverage.some((note) => /keySearch rejected the cursor argument/.test(note)));
+});
+
+test("verdict safety rule 5: sampled scripts at the limit, truncated entitySearch, and a hidden in-scope account flag partial views", async () => {
+  const sampled = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async searchEntities(query) {
+      if (query.includes("SECURE_CRED")) return [{ guid: "cred-1", name: "LOGIN_PASSWORD", domain: "SYNTH", type: "SECURE_CRED", accountId: 111 }];
+      if (query.includes("MONITOR")) {
+        return [
+          { guid: "mon-1", name: "Login flow", domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_BROWSER", accountId: 111 },
+          { guid: "mon-2", name: "Checkout flow", domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_API", accountId: 111 },
+        ];
+      }
+      if (query.includes("DASHBOARD")) return [{ guid: "dash-1", name: "Ops", domain: "VIZ", type: "DASHBOARD", permissions: "PRIVATE", accountId: 111 }];
+      return [];
+    },
+  }), { scriptSampleLimit: 1 });
+  const synthetics = findingById(sampled, "NR-13-SYNTHETIC-MONITOR-SECURITY");
+  assert.equal(synthetics.status, "warn");
+  assert.match(synthetics.summary, /1 of 2 scripted monitors were sampled/);
+  assert.match(synthetics.summary, /only 1 of 2 scripted monitors were sampled \(script_sample_limit 1\)/);
+  assert.equal(synthetics.evidence.scripts_sample_complete, false);
+  assert.equal(synthetics.evidence.scripts_sampled, 1);
+
+  const truncated = await assessNewrelicAlerting(alertingClient({
+    async searchEntities(query) {
+      if (query.includes("WORKLOAD")) return [];
+      return {
+        items: [{ guid: "app-1", name: "checkout-api", domain: "APM", type: "APPLICATION", reporting: true, alertSeverity: "NOT_ALERTING" }],
+        complete: false,
+        totalCount: 340,
+        note: "stopped after 1 items with more pages available",
+      };
+    },
+  }));
+  const coverage = findingById(truncated, "NR-09-ALERT-POLICY-COVERAGE");
+  assert.equal(coverage.status, "warn");
+  assert.match(coverage.summary, /Partial view: alertable entities: 1 of 340 seen before pagination stopped/);
+  assert.equal(coverage.evidence.alertable_entities_reported_total, 340);
+
+  const hidden = await assessNewrelicAccessControl(accessControlClient({
+    async listAccounts() { return [{ id: 111, name: "Payments Production" }]; },
+  }), { now: NOW });
+  for (const id of ["NR-04-API-KEY-INVENTORY", "NR-05-API-KEY-AGE", "NR-07-ACCOUNT-ACCESS-CONTROLS"]) {
+    const item = findingById(hidden, id);
+    assert.notEqual(item.status, "pass", `${id}: ${item.summary}`);
+    assert.match(item.summary, /accounts in scope not visible to this key: 222/, `${id}: ${item.summary}`);
+  }
+  assert.equal(findingStatus(hidden, "NR-08-CROSS-ACCOUNT-RESTRICTIONS"), "manual");
+});
+
+test("verdict safety rule 6: verdicts read every enabling flag and treat absent flags as not enabled", async () => {
+  const alerting = await assessNewrelicAlerting(alertingClient({
+    async listNrqlConditions() {
+      return [{ id: "cond-1", name: "Error rate", type: "STATIC", policyId: "policy-1", nrql: { query: "SELECT count(*) FROM TransactionError" } }];
+    },
+  }));
+  const policyCoverage = findingById(alerting, "NR-09-ALERT-POLICY-COVERAGE");
+  assert.equal(policyCoverage.status, "fail");
+  assert.match(policyCoverage.summary, /none has a NRQL condition with enabled = true \(1 conditions returned, 1 without an enabled flag\)/);
+  assert.equal(policyCoverage.evidence.conditions_without_enabled_flag, 1);
+
+  const disabledCondition = await assessNewrelicAlerting(alertingClient({
+    async listNrqlConditions() {
+      return [{ id: "cond-1", name: "Error rate", type: "STATIC", enabled: false, policyId: "policy-1", nrql: { query: "SELECT count(*) FROM TransactionError" } }];
+    },
+  }));
+  assert.equal(findingStatus(disabledCondition, "NR-09-ALERT-POLICY-COVERAGE"), "fail");
+
+  const unflaggedWorkflow = await assessNewrelicAlerting(alertingClient({
+    async listWorkflows() {
+      return [{ id: "wf-1", name: "Production issues", destinationConfigurations: [{ channelId: "chan-1", name: "Ops email", type: "EMAIL" }], enrichments: [] }];
+    },
+  }));
+  const channels = findingById(unflaggedWorkflow, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(channels.status, "warn");
+  assert.match(channels.summary, /no workflow has workflowEnabled = true \(1 workflows returned, 1 without an enabled flag\)/);
+
+  const untypedDestination = await assessNewrelicAlerting(alertingClient({
+    async listNotificationDestinations() {
+      return [{ id: "dest-1", name: "Ops distribution list", properties: [{ key: "email", value: "ops@example.com" }] }];
+    },
+  }));
+  const destinations = findingById(untypedDestination, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(destinations.status, "warn");
+  assert.match(destinations.summary, /1 expose no active flag, 1 expose no type/);
+
+  const disabledObfuscation = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async listObfuscationRules() {
+      return [
+        { id: "obf-1", name: "Mask credentials", enabled: false, actions: [] },
+        { id: "obf-2", name: "Mask PII", actions: [] },
+      ];
+    },
+  }));
+  const obfuscation = findingById(disabledObfuscation, "NR-12-LOG-OBFUSCATION");
+  assert.equal(obfuscation.status, "fail");
+  assert.match(obfuscation.summary, /No obfuscation rule with enabled = true exists .*\(2 rules returned, 1 without an enabled flag\)/);
+
+  const retention = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async listEventRetentionRules() {
+      return [
+        { id: "rule-1", namespace: "Log", retentionInDays: 90, deletedAt: null },
+        { id: "rule-2", namespace: "Transaction", deletedAt: null },
+      ];
+    },
+  }));
+  const retentionFinding = findingById(retention, "NR-11-DATA-RETENTION");
+  assert.equal(retentionFinding.status, "warn");
+  assert.match(retentionFinding.summary, /1\/2 active retention rules expose no retentionInDays value/);
+
+  const defaults = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async listEventRetentionRules() {
+      return [{ id: "rule-1", namespace: "Log", retentionInDays: 90, deletedAt: null }];
+    },
+  }));
+  assert.equal(findingStatus(defaults, "NR-11-DATA-RETENTION"), "warn");
+  assert.match(findingById(defaults, "NR-11-DATA-RETENTION").summary, /1\/2 customizable namespaces have no rule and rely on New Relic defaults that the API does not expose \(Transaction\)/);
+
+  const untypedUsers = await assessNewrelicIdentity(identityClient({
+    async listDomainUsers() {
+      return [{ id: "alice", email: "alice@example.com", lastActive: secondsAgo(1), groups: { groups: [{ id: "g-admin" }] } }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(untypedUsers, "NR-02-USER-TYPE-LEAST-PRIVILEGE"), "warn");
+  assert.match(findingById(untypedUsers, "NR-02-USER-TYPE-LEAST-PRIVILEGE").summary, /1 users expose no user type/);
+
+  const noGroupData = await assessNewrelicIdentity(identityClient({
+    async listDomainUsers() {
+      return [{ id: "alice", email: "alice@example.com", lastActive: secondsAgo(1), type: { id: "FULL_PLATFORM" } }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(noGroupData, "NR-03-ADMIN-MINIMIZATION"), "manual");
+  assert.match(findingById(noGroupData, "NR-03-ADMIN-MINIMIZATION").summary, /Group membership was not exposed for any of the 1 users/);
+
+  const noRoleData = await assessNewrelicIdentity(identityClient({
+    async listDomainGroupGrants() {
+      return [{ id: "g-admin", displayName: "Organization admins", roles: [], rolesReadable: false }, { id: "g-dev", displayName: "g-dev", roles: [], rolesReadable: false }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(noRoleData, "NR-03-ADMIN-MINIMIZATION"), "manual");
+  assert.match(findingById(noRoleData, "NR-03-ADMIN-MINIMIZATION").summary, /Role grants were not exposed for any of the 2 groups/);
+
+  const noAuthType = await assessNewrelicIdentity(identityClient({
+    async listOrganizationAuthenticationDomains() {
+      return [{ id: "domain-1", name: "Corporate SSO", organizationId: "org-1", provisioningType: "SCIM" }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(noAuthType, "NR-01-SSO-ENFORCEMENT"), "manual");
+  assert.match(findingById(noAuthType, "NR-01-SSO-ENFORCEMENT").summary, /unrecognized authenticationType \(Corporate SSO: UNKNOWN\)/);
+
+  const grantsUnreadable = await assessNewrelicAccessControl(accessControlClient({
+    async listDomainGroupGrants() { throw forbidden("actor.organization.authorizationManagement"); },
+  }), { now: NOW });
+  assert.equal(findingStatus(grantsUnreadable, "NR-04-API-KEY-INVENTORY"), "manual");
+  assert.match(findingById(grantsUnreadable, "NR-04-API-KEY-INVENTORY").summary, /group role grants were not readable/);
+});
+
+test("verdict safety rule 7: the client records truncation when it stops before nextCursor is exhausted", async () => {
+  let calls = 0;
+  const fetchImpl = async (_input, init = {}) => {
+    calls += 1;
+    const body = JSON.parse(init.body);
+    const page = {
+      nextCursor: `page-${calls + 1}`,
+      totalCount: 10,
+      users: [{ id: `user-${calls}`, email: `user-${calls}@example.com` }],
+    };
+    assert.deepEqual(body.variables.domainId, ["domain-1"]);
+    return jsonResponse({ data: { actor: { organization: { userManagement: { authenticationDomains: { authenticationDomains: [{ users: page }] } } } } } });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+
+  const users = await client.listDomainUsers("domain-1", 2);
+
+  assert.equal(users.items.length, 2);
+  assert.equal(users.complete, false);
+  assert.equal(users.totalCount, 10);
+  assert.match(users.note, /stopped after 2 items with more pages available/);
+  assert.equal(calls, 2);
+});
+
+test("verdict safety rule 7: a truncated user or entity population downgrades passing verdicts to warn", async () => {
+  const identity = await assessNewrelicIdentity(identityClient({
+    async listDomainUsers() {
+      return {
+        items: [user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"] }), user("bob", { type: "BASIC", groups: ["g-dev"] })],
+        complete: false,
+        totalCount: 250,
+        note: "stopped after 2 items with more pages available",
+      };
+    },
+  }), { now: NOW });
+
+  for (const id of ["NR-02-USER-TYPE-LEAST-PRIVILEGE", "NR-03-ADMIN-MINIMIZATION", "NR-19-INACTIVE-USER-ACCOUNTS"]) {
+    const item = findingById(identity, id);
+    assert.equal(item.status, "warn", `${id}: ${item.summary}`);
+    assert.match(item.summary, /Partial view: users: 2 of 250 seen before pagination stopped/);
+  }
+  assert.equal(findingStatus(identity, "NR-01-SSO-ENFORCEMENT"), "pass");
+  assert.deepEqual(identity.coverage, ["users: 2 of 250 seen before pagination stopped; userManagement.users: authentication domain Corporate SSO: stopped after 2 items with more pages available"]);
+  assert.equal(identity.summary.coverage_limitations, 1);
+
+  const dashboards = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async searchEntities(query) {
+      if (query.includes("DASHBOARD")) {
+        return { items: [{ guid: "dash-1", name: "Ops", domain: "VIZ", type: "DASHBOARD", permissions: "PRIVATE", accountId: 111 }], complete: false, totalCount: 90, note: "stopped after 1 items with more pages available" };
+      }
+      if (query.includes("SECURE_CRED")) return [{ guid: "cred-1", name: "LOGIN_PASSWORD", domain: "SYNTH", type: "SECURE_CRED", accountId: 111 }];
+      if (query.includes("MONITOR")) return [{ guid: "mon-1", name: "Login flow", domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_BROWSER", accountId: 111 }];
+      return [];
+    },
+  }));
+  const permissions = findingById(dashboards, "NR-14-DASHBOARD-PERMISSIONS");
+  assert.equal(permissions.status, "warn");
+  assert.match(permissions.summary, /Partial view: dashboards: 1 of 90 seen before pagination stopped/);
+  assert.equal(permissions.evidence.dashboards_reported_total, 90);
+});
+
+test("false-pass self-check (c): a partial inventory never yields pass in any assess tool", async () => {
+  const identity = identityClient({
+    async listAuthenticationDomains() {
+      return twoDomains();
+    },
+    async listOrganizationAuthenticationDomains() {
+      return {
+        items: [
+          { id: "domain-1", name: "Corporate SSO", organizationId: "org-1", provisioningType: "SCIM", authenticationType: "SAML_SSO" },
+          { id: "domain-2", name: "Contractors", organizationId: "org-1", provisioningType: "SCIM", authenticationType: "SAML_SSO" },
+        ],
+        complete: false,
+        note: "customerAdministration.authenticationDomains returned more pages than were read",
+      };
+    },
+    listDomainUsers: onlyDomainOne(async () => [user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"] }), user("bob", { type: "BASIC", groups: ["g-dev"] })]),
+    listDomainGroupGrants: onlyDomainOne(async () => [orgManagerGroup(), accountGroup("g-dev", [222])]),
+  });
+  const accessControl = accessControlClient({
+    async listAuthenticationDomains() {
+      return twoDomains();
+    },
+    async listAccounts() {
+      return [{ id: 111, name: "Payments Production" }];
+    },
+    listDomainUsers: onlyDomainOne(async () => [user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"] }), user("bob", { type: "BASIC", groups: ["g-dev"] })]),
+    listDomainGroupGrants: onlyDomainOne(async () => [orgManagerGroup(), accountGroup("g-dev", [222])]),
+    async listApiKeys() {
+      return {
+        items: [{ id: "key-1", name: "ci-deploy", type: "USER", createdAt: secondsAgo(10), userId: "bob", accountId: 111 }],
+        complete: false,
+        totalCount: 4,
+        note: "keySearch rejected the cursor argument, so only the first page was read (1 of 4 keys)",
+      };
+    },
+    async listRoles() {
+      return { items: standardRoles(), complete: false, note: "stopped after 2 items with more pages available" };
+    },
+  });
+  const baseAlerting = alertingClient();
+  const alerting = alertingClient({
+    getResolvedConfig: () => sampleConfig({ accountIds: [111, 222] }),
+    async resolveAccountIds() {
+      return [111, 222];
+    },
+    listAlertPolicies: onlyAccount111(baseAlerting.listAlertPolicies),
+    listNrqlConditions: onlyAccount111(baseAlerting.listNrqlConditions),
+    listNotificationDestinations: onlyAccount111(baseAlerting.listNotificationDestinations),
+    listNotificationChannels: onlyAccount111(baseAlerting.listNotificationChannels),
+    listWorkflows: onlyAccount111(baseAlerting.listWorkflows),
+    async searchEntities(query) {
+      if (query.includes("accountId = 222")) throw forbidden("actor.entitySearch");
+      if (query.includes("WORKLOAD")) return [];
+      return {
+        items: [{ guid: "app-1", name: "checkout-api", domain: "APM", type: "APPLICATION", reporting: true, alertSeverity: "NOT_ALERTING" }],
+        complete: false,
+        totalCount: 120,
+        note: "stopped after 1 items with more pages available",
+      };
+    },
+  });
+  const baseGovernance = dataGovernanceClient();
+  const dataGovernance = dataGovernanceClient({
+    getResolvedConfig: () => sampleConfig({ accountIds: [111, 222] }),
+    async resolveAccountIds() {
+      return [111, 222];
+    },
+    listEventRetentionRules: onlyAccount111(baseGovernance.listEventRetentionRules),
+    listRetentionNamespaces: onlyAccount111(baseGovernance.listRetentionNamespaces),
+    listObfuscationRules: onlyAccount111(baseGovernance.listObfuscationRules),
+    listObfuscationExpressions: onlyAccount111(baseGovernance.listObfuscationExpressions),
+    listNrqlDropRules: onlyAccount111(baseGovernance.listNrqlDropRules),
+    async searchEntities(query) {
+      if (query.includes("accountId = 222")) throw forbidden("actor.entitySearch");
+      if (query.includes("MONITOR")) {
+        return [
+          { guid: "mon-1", name: "Login flow", domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_BROWSER", accountId: 111 },
+          { guid: "mon-2", name: "Checkout flow", domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_API", accountId: 111 },
+        ];
+      }
+      return baseGovernance.searchEntities(query);
+    },
+    async countEntities(query) {
+      if (query.includes("accountId = 222")) throw forbidden("actor.entitySearch");
+      return 4;
+    },
+    async runNrql(accountId, nrql) {
+      if (accountId !== 111) throw forbidden("actor.account.nrql");
+      return baseGovernance.runNrql(accountId, nrql);
+    },
+  });
+
+  const { results, findings } = await assessAll(
+    { identity, accessControl, alerting, dataGovernance },
+    { dataGovernance: { scriptSampleLimit: 1 } },
+  );
+
+  assert.deepEqual(passing(findings), []);
+  assert.deepEqual(findings.filter((item) => item.status === "fail").map((item) => item.id), []);
+  const partialControls = [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 14, 15];
+  for (const control of partialControls) {
+    const item = findings.find((entry) => entry.control === control);
+    assert.equal(item.status, "warn", `${item.id}: ${item.summary}`);
+    assert.match(item.summary, /Partial view: /, `${item.id}: ${item.summary}`);
+  }
+  assert.match(findings.find((item) => item.control === 2).summary, /Partial view: users: 1 scope unreadable \(userManagement\.users: authentication domain Contractors: NerdGraph returned errors: Not authorized/);
+  assert.match(findings.find((item) => item.control === 4).summary, /keySearch rejected the cursor argument/);
+  assert.match(findings.find((item) => item.control === 4).summary, /accounts in scope not visible to this key: 222/);
+  assert.match(findings.find((item) => item.control === 9).summary, /alertable entities: 1 seen before pagination stopped; 1 scope unreadable/);
+  assert.match(findings.find((item) => item.control === 9).summary, /account 111: stopped after 1 items with more pages available/);
+  assert.match(findings.find((item) => item.control === 9).summary, /account 222: NerdGraph returned errors: Not authorized/);
+  assert.match(findings.find((item) => item.control === 13).summary, /1 of 2 scripted monitors were sampled/);
+  assert.equal(findings.find((item) => item.control === 20).status, "warn");
+  assert.ok(results.every((result) => result.coverage.length > 0));
+  assert.ok(results.every((result) => result.errors.length > 0));
+});
+
 test("exportNewrelicAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {
   const base = createTempBase("grclanker-newrelic-export-");
   const config = sampleConfig({ accountIds: [111] });
@@ -1185,6 +1847,27 @@ test("exportNewrelicAuditBundle allocates a fresh directory and zip on repeated 
   assert.match(second.zipPath, /newrelic-111-audit-bundle-2\.zip$/);
   assert.ok(existsSync(first.zipPath));
   assert.ok(existsSync(second.zipPath));
+  assert.equal(first.zipPath, `${first.outputDir}.zip`);
+  assert.equal(second.zipPath, `${second.outputDir}.zip`);
+  assert.notEqual(readFileSync(first.zipPath).length, 0);
+  assert.notEqual(readFileSync(second.zipPath).length, 0);
+});
+
+test("verdict safety rule 8: an export never overwrites a stale zip whose directory was removed", async () => {
+  const base = createTempBase("grclanker-newrelic-export-stale-zip-");
+  const staleZip = join(base, "newrelic-111-audit-bundle.zip");
+  writeFileSync(staleZip, "stale archive from a prior run");
+
+  const result = await exportNewrelicAuditBundle(bundleClient(), sampleConfig({ accountIds: [111] }), base, { now: NOW });
+
+  assert.match(result.outputDir, /newrelic-111-audit-bundle-2$/);
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
+  assert.equal(readFileSync(staleZip, "utf8"), "stale archive from a prior run");
+  assert.ok(existsSync(result.zipPath));
+  assert.deepEqual(
+    readdirSync(base).sort(),
+    ["newrelic-111-audit-bundle-2", "newrelic-111-audit-bundle-2.zip", "newrelic-111-audit-bundle.zip"],
+  );
 });
 
 test("exportNewrelicAuditBundle writes _errors.log when collection partially fails", async () => {
