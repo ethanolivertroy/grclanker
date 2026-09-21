@@ -899,7 +899,7 @@ export class DatadogApiClient {
   }
 
   async listOrgConnections(limit = 100): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v2/org_connections", { "page[limit]": limit })) ?? {};
+    const payload = asObject(await this.get("/api/v2/org_connections", { limit, offset: 0 })) ?? {};
     return asRecordArray(payload.data);
   }
 

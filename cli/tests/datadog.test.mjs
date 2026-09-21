@@ -437,6 +437,9 @@ test("DatadogApiClient follows meta.page.after cursors and page/page_size monito
       const page = Number(url.searchParams.get("page"));
       return jsonResponse(page === 0 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }]);
     }
+    if (url.pathname === "/api/v2/org_connections") {
+      return jsonResponse({ data: [{ id: "c1", attributes: { connection_types: ["logs"] } }], meta: { page: { total_count: 1 } } });
+    }
     throw new Error(`unexpected ${url.pathname}`);
   };
 
@@ -454,6 +457,13 @@ test("DatadogApiClient follows meta.page.after cursors and page/page_size monito
   const monitorCalls = seen.filter((url) => url.pathname === "/api/v1/monitor");
   assert.equal(monitorCalls.length, 1);
   assert.equal(monitorCalls[0].searchParams.get("page_size"), "2");
+
+  const connections = await client.listOrgConnections(25);
+  assert.equal(connections.length, 1);
+  const connectionCalls = seen.filter((url) => url.pathname === "/api/v2/org_connections");
+  assert.equal(connectionCalls[0].searchParams.get("limit"), "25");
+  assert.equal(connectionCalls[0].searchParams.get("offset"), "0");
+  assert.equal(connectionCalls[0].searchParams.has("page[limit]"), false);
 });
 
 test("DatadogApiClient retries 429 honoring X-RateLimit-Reset and retries 5xx with backoff", async () => {
