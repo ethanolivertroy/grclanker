@@ -473,6 +473,16 @@ function extractCollection(payload: unknown, keys: string[] = ["data"]): JsonRec
   return [];
 }
 
+// Runtime Manager (ARM) wraps each server and alert as {"data":[{"data":{...}}]}; merge the inner record over the outer one.
+function unwrapDataEnvelope(items: JsonRecord[]): JsonRecord[] {
+  return items.map((item) => {
+    const inner = asObject(item.data);
+    if (!inner) return item;
+    const outer = Object.fromEntries(Object.entries(item).filter(([key]) => key !== "data"));
+    return { ...outer, ...inner };
+  });
+}
+
 function isPage(value: unknown): value is MulesoftPage {
   const object = asObject(value);
   return object !== undefined && Array.isArray(object.items) && typeof object.truncated === "boolean";
@@ -1318,11 +1328,11 @@ export class MulesoftApiClient {
   }
 
   async listHybridServers(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get("/hybrid/api/v1/servers", {}, this.environmentHeaders(environmentId)));
+    return unwrapDataEnvelope(extractCollection(await this.get("/hybrid/api/v1/servers", {}, this.environmentHeaders(environmentId))));
   }
 
   async listHybridAlerts(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get("/hybrid/api/v1/alerts", {}, this.environmentHeaders(environmentId)));
+    return unwrapDataEnvelope(extractCollection(await this.get("/hybrid/api/v1/alerts", {}, this.environmentHeaders(environmentId))));
   }
 
   async listAuditPlatforms(): Promise<JsonRecord[]> {

@@ -1997,3 +1997,43 @@ test("review fix 1: a truncated environment inventory downgrades every environme
   assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "warn");
   assert.match(findingById(audit, "MULESOFT-AUD-24").summary, note);
 });
+
+test("review fix 2: the ARM server envelope is unwrapped so a RUNNING hybrid server passes RT-23 through the real client", async () => {
+  const armServers = {
+    data: [{
+      data: {
+        id: 1,
+        timeCreated: 1700000000000,
+        timeUpdated: 1700000600000,
+        name: "onprem-1",
+        type: "SERVER",
+        muleVersion: "4.6.0",
+        agentVersion: "2.7.0",
+        status: "RUNNING",
+        addresses: [{ ip: "10.0.0.5", networkInterface: "eth0" }],
+      },
+    }],
+  };
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, ENVIRONMENTS, 25),
+      (url, init) => (url.pathname === "/hybrid/api/v1/servers" && headerValue(init.headers, "X-ANYPNT-ENV-ID") === "env-prod" ? jsonResponse(armServers) : undefined),
+      (url) => (url.pathname === "/hybrid/api/v1/alerts" ? jsonResponse({ data: [{ data: { id: "alert-1", name: "Server down", enabled: true } }] }) : undefined),
+    ]),
+  });
+
+  const servers = await client.listHybridServers("env-prod");
+  assert.equal(servers.length, 1);
+  assert.equal(servers[0].status, "RUNNING");
+  assert.equal(servers[0].muleVersion, "4.6.0");
+  assert.equal(servers[0].name, "onprem-1");
+  assert.equal(servers[0].data, undefined);
+
+  const alerts = await client.listHybridAlerts("env-prod");
+  assert.deepEqual(alerts, [{ id: "alert-1", name: "Server down", enabled: true }]);
+
+  const result = await assessMulesoftRuntimeInfrastructure(client);
+  assert.equal(statusOf(result, "MULESOFT-RT-23"), "pass", findingById(result, "MULESOFT-RT-23").summary);
+  assert.deepEqual(findingById(result, "MULESOFT-RT-23").evidence.mule_versions, ["4.6.0"]);
+  assert.deepEqual(findingById(result, "MULESOFT-RT-23").evidence.disconnected_servers, []);
+});
