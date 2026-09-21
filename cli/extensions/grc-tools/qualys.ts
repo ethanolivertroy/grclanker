@@ -1051,7 +1051,9 @@ export class QualysApiClient {
   }
 
   async listOptionProfiles(): Promise<QualysListResult> {
-    return this.listSingleXml("/api/2.0/fo/subscription/option_profile/", { action: "list" }, "OPTION_PROFILE");
+    // VM/PC API user guide, "VM Option Profile List": action=list lives under /option_profile/vm/;
+    // the parent path documents action=export and action=import only. Output follows option_profile_info.dtd.
+    return this.listSingleXml("/api/2.0/fo/subscription/option_profile/vm/", { action: "list" }, "OPTION_PROFILE");
   }
 
   async listExcludedIps(): Promise<QualysListResult> {
@@ -1543,20 +1545,15 @@ function optionProfileAuthTypes(profile: JsonRecord): string[] {
   return Object.keys(asObject(value) ?? {}).filter((key) => !key.startsWith("@") && key !== "#text");
 }
 
+function optionProfileExclusionLists(profile: JsonRecord): string[] {
+  // option_profile_info.dtd: SCAN > VULNERABILITY_DETECTION > DETECTION_EXCLUDE (CUSTOM_LIST+) > CUSTOM (ID, TITLE, ...)
+  return pathRecords(profile, "SCAN", "VULNERABILITY_DETECTION", "DETECTION_EXCLUDE", "CUSTOM_LIST")
+    .flatMap((list) => asRecords(list.CUSTOM))
+    .map((custom) => xmlScalarText(custom.TITLE) ?? xmlScalarText(custom.ID) ?? "search list");
+}
+
 function optionProfileExcludedQidCount(profile: JsonRecord): number {
-  let count = 0;
-  const visit = (value: unknown, key: string): void => {
-    if (/EXCLUDE/i.test(key)) {
-      const text = asString(value);
-      if (text) count += text.split(",").filter(Boolean).length;
-      else count += asRecords(value).length;
-      return;
-    }
-    const object = asObject(value);
-    if (object) for (const [childKey, childValue] of Object.entries(object)) visit(childValue, childKey);
-  };
-  visit(profile, "");
-  return count;
+  return optionProfileExclusionLists(profile).length;
 }
 
 export async function assessQualysScanCoverage(
@@ -1744,21 +1741,22 @@ export async function assessQualysScanCoverage(
       : broadExclusions.length > 0
         ? `${broadExclusions.length} excluded IP ranges span more than ${BROAD_EXCLUSION_ADDRESS_COUNT} addresses.`
         : excluded.data.length > 0 || excludedQidCount > 0
-          ? `${excluded.data.length} excluded host entries and ${excludedQidCount} QID exclusions in option profiles require documented justification.`
+          ? `${excluded.data.length} excluded host entries and ${excludedQidCount} detection exclusion search lists (VULNERABILITY_DETECTION/DETECTION_EXCLUDE) in option profiles require documented justification.`
           : profiles.error
             ? unreadableSummary(16, [profiles])
             : profiles.data.length === 0
-            ? "The excluded host list is empty, but no option profiles were returned so QID exclusions could not be evaluated."
-            : `No excluded hosts and no QID exclusions across ${profiles.data.length} option profiles; the excluded host list was read completely, so emptiness is compliant for this control.`,
+            ? "The excluded host list is empty, but no option profiles were returned so detection exclusion search lists could not be evaluated."
+            : `No excluded hosts and no detection exclusion search lists across ${profiles.data.length} option profiles; the excluded host list was read completely, so emptiness is compliant for this control.`,
     evidence: {
       excluded_entries: excluded.data.slice(0, 100),
       broad_exclusions: broadExclusions.slice(0, 50),
       option_profiles_reviewed: profiles.data.length,
-      option_profile_qid_exclusions: excludedQidCount,
+      option_profile_detection_exclusions: excludedQidCount,
+      option_profile_exclusion_lists: profiles.data.flatMap(optionProfileExclusionLists).slice(0, 50),
     },
     sources: [excluded, profiles],
     scope,
-    manualEvidence: "export Assets > Excluded Hosts and review each excluded IP range and option profile QID exclusion for justification.",
+    manualEvidence: "export Assets > Excluded Hosts and review each excluded IP range and option profile detection exclusion search list for justification.",
   }));
 
   findings.push(guardedFinding({
@@ -2810,7 +2808,7 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
     await probeSurface("scheduled_scans", "VM", "/api/2.0/fo/schedule/scan/", () => client.listScheduledScans()),
     await probeSurface("hosts", "VM", "/api/2.0/fo/asset/host/", () => client.listHosts(100)),
     await probeSurface("asset_groups", "VM", "/api/2.0/fo/asset/group/", () => client.listAssetGroups()),
-    await probeSurface("option_profiles", "VM", "/api/2.0/fo/subscription/option_profile/", () => client.listOptionProfiles()),
+    await probeSurface("option_profiles", "VM", "/api/2.0/fo/subscription/option_profile/vm/", () => client.listOptionProfiles()),
     await probeSurface("appliances", "VM", "/api/2.0/fo/appliance/", () => client.listAppliances()),
     await probeSurface("auth_records", "VM", "/api/2.0/fo/auth/", () => client.listAuthRecordSummary()),
     await probeSurface("detections", "VMDR", "/api/2.0/fo/asset/host/vm/detection/", () => client.listDetections(100)),
