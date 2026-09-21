@@ -1648,9 +1648,10 @@ function unavailableEvidence(endpoint: string, permission: string, error: string
   ];
 }
 
-function inventoryNote(dataset: CollectedDataset<unknown[]>): string | undefined {
+function inventoryNote(dataset: CollectedDataset<unknown[]>, capSize?: number): string | undefined {
   if (dataset.complete === false) {
-    return `inventory_seen=${dataset.data.length} inventory_total=${dataset.total ?? "unknown"} (paging incomplete, results not treated as authoritative)`;
+    const cap = capSize === undefined ? "" : ` collection_cap=${capSize}`;
+    return `inventory_seen=${dataset.data.length} inventory_total=${dataset.total ?? "unknown"}${cap} (paging incomplete, results not treated as authoritative)`;
   }
   return undefined;
 }
@@ -1664,8 +1665,9 @@ function capStatus(status: DuoFindingStatus, cap: DuoFindingStatus): DuoFindingS
 function withInventoryCap(
   finding: DuoFinding,
   dataset: CollectedDataset<unknown[]>,
+  capSize?: number,
 ): DuoFinding {
-  const note = inventoryNote(dataset);
+  const note = inventoryNote(dataset, capSize);
   if (!note) return finding;
   return {
     ...finding,
@@ -3395,27 +3397,35 @@ export function assessDuoMonitoring(
     );
   } else if (bypassEvents > 0 || telephonyFactors > 0 || fraudEvents > 0) {
     findings.push(
-      buildFinding(
-        "DUO-MON-001",
-        "Partial",
-        "Authentication telemetry is available and shows events worth review.",
-        [
-          `auth_logs_collected=${authLogs.length}`,
-          `bypass_factor_events=${bypassEvents}`,
-          `telephony_factor_events=${telephonyFactors}`,
-          `fraud_related_events=${fraudEvents}`,
-        ],
-        "Review bypass, telephony, and fraud-related auth events to ensure the tenant is not leaning on weaker factors or recurring exception paths.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-MON-001",
+          "Partial",
+          "Authentication telemetry is available and shows events worth review.",
+          [
+            `auth_logs_collected=${authLogs.length}`,
+            `bypass_factor_events=${bypassEvents}`,
+            `telephony_factor_events=${telephonyFactors}`,
+            `fraud_related_events=${fraudEvents}`,
+          ],
+          "Review bypass, telephony, and fraud-related auth events to ensure the tenant is not leaning on weaker factors or recurring exception paths.",
+        ),
+        data.authenticationLogs,
+        MAX_LOG_RECORDS,
       ),
     );
   } else {
     findings.push(
-      buildFinding(
-        "DUO-MON-001",
-        "Pass",
-        "Authentication telemetry is available and does not show obvious weak-factor reliance in the sampled window.",
-        [`auth_logs_collected=${authLogs.length}`],
-        "Keep the authentication log workflow in place and expand the lookback window when performing deeper investigations.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-MON-001",
+          "Pass",
+          "Authentication telemetry is available and does not show obvious weak-factor reliance in the sampled window.",
+          [`auth_logs_collected=${authLogs.length}`],
+          "Keep the authentication log workflow in place and expand the lookback window when performing deeper investigations.",
+        ),
+        data.authenticationLogs,
+        MAX_LOG_RECORDS,
       ),
     );
   }
@@ -3467,37 +3477,49 @@ export function assessDuoMonitoring(
     );
   } else if ((creditsRemaining ?? 0) < 25 && smsOrPhoneLogs > 0) {
     findings.push(
-      buildFinding(
-        "DUO-MON-003",
-        "Fail",
-        "Telephony-backed MFA usage is active while available credits are low.",
-        [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
-        "Reduce telephony reliance and replenish credits before low balance creates an authentication bottleneck.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-MON-003",
+          "Fail",
+          "Telephony-backed MFA usage is active while available credits are low.",
+          [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
+          "Reduce telephony reliance and replenish credits before low balance creates an authentication bottleneck.",
+        ),
+        data.telephonyLogs,
+        MAX_LOG_RECORDS,
       ),
     );
   } else if (smsOrPhoneLogs > 0 || (creditsRemaining ?? Number.POSITIVE_INFINITY) < 100) {
     findings.push(
-      buildFinding(
-        "DUO-MON-003",
-        "Partial",
-        "Telephony capacity needs periodic review.",
-        [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
-        "Keep telephony credits monitored and continue moving users away from SMS and phone callback factors.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-MON-003",
+          "Partial",
+          "Telephony capacity needs periodic review.",
+          [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
+          "Keep telephony credits monitored and continue moving users away from SMS and phone callback factors.",
+        ),
+        data.telephonyLogs,
+        MAX_LOG_RECORDS,
       ),
     );
   } else {
     findings.push(
-      buildFinding(
-        "DUO-MON-003",
-        "Pass",
-        "Telephony capacity looks healthy in the sampled window.",
-        [`telephony_logs=${telephonyLogs.length}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
-        "Continue monitoring telephony usage so low credits or weak-factor fallback do not become a surprise.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-MON-003",
+          "Pass",
+          "Telephony capacity looks healthy in the sampled window.",
+          [`telephony_logs=${telephonyLogs.length}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
+          "Continue monitoring telephony usage so low credits or weak-factor fallback do not become a surprise.",
+        ),
+        data.telephonyLogs,
+        MAX_LOG_RECORDS,
       ),
     );
   }
 
-  findings.push(assessAuthenticationAnomalies(data, config));
+  findings.push(withInventoryCap(assessAuthenticationAnomalies(data, config), data.authenticationLogs, MAX_LOG_RECORDS));
 
   const settings = asRecord(data.settings.data);
   const notificationSignals = [

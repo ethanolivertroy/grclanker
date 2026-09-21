@@ -930,6 +930,31 @@ test("assessDuoMonitoring evaluates authentication attempts and impossible trave
   assert.match(noLocationFinding.summary, /Duo Essentials/);
 });
 
+test("assessDuoMonitoring caps log-backed findings at Partial when the log sample is incomplete", () => {
+  const config = createSampleConfig();
+  const capped = compliantMonitoringData();
+  capped.authenticationLogs = { data: capped.authenticationLogs.data, total: 5000, complete: false };
+  capped.telephonyLogs = { data: [], complete: false };
+  const result = assessDuoMonitoring(capped, config);
+  for (const id of ["DUO-MON-001", "DUO-MON-005"]) {
+    const finding = findingById(result, id);
+    assert.equal(finding.status, "Partial", `${id} must not pass on a capped authentication log sample`);
+    assert.ok(
+      finding.evidence.some((line) => line.includes("inventory_seen=2 inventory_total=5000 collection_cap=400")),
+      `${id} reports seen, total, and the cap size`,
+    );
+    assert.match(finding.manualNote, /next_offset/);
+  }
+  const telephony = findingById(result, "DUO-MON-003");
+  assert.equal(telephony.status, "Partial", "telephony capacity cannot pass on an incomplete telephony log");
+  assert.ok(telephony.evidence.some((line) => line.includes("inventory_seen=0 inventory_total=unknown collection_cap=400")));
+
+  const complete = assessDuoMonitoring(compliantMonitoringData(), config);
+  for (const id of ["DUO-MON-001", "DUO-MON-003", "DUO-MON-005"]) {
+    assert.equal(findingById(complete, id).status, "Pass", `${id} still passes on a complete sample`);
+  }
+});
+
 test("resolveDuoConfiguration prefers explicit args over environment values", () => {
   const base = resolveDuoConfiguration(
     {},
