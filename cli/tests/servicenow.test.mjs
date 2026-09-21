@@ -16,6 +16,7 @@ import {
   assessServicenowIdentityAccess,
   assessServicenowOperationsGovernance,
   assessServicenowPlatformHardening,
+  buildSensitiveAclQuery,
   checkServicenowAccess,
   exportServicenowAuditBundle,
   listServicenowControls,
@@ -104,9 +105,14 @@ function matchesCondition(row, condition, fixture) {
   return true;
 }
 
-function filterRows(rows, query, fixture) {
+function matchesQuery(row, query, fixture) {
   const groups = parseConditionGroups(query);
-  return rows.filter((row) => groups.every((group) => group.some((condition) => matchesCondition(row, condition, fixture))));
+  return groups.every((group) => group.some((condition) => matchesCondition(row, condition, fixture)));
+}
+
+function filterRows(rows, query, fixture) {
+  const alternatives = query ? query.split("^NQ") : [""];
+  return rows.filter((row) => alternatives.some((alternative) => matchesQuery(row, alternative, fixture)));
 }
 
 function fixtureFetch(fixture, options = {}) {
@@ -825,6 +831,35 @@ test("assessServicenowAccessControl passes complete role-protected ACL coverage"
   assert.equal(byId.get("SNOW-11").status, "pass", byId.get("SNOW-11").summary);
   assert.equal(result.summary.record_acl_total, 24);
   assert.deepEqual(result.errors, []);
+});
+
+test("buildSensitiveAclQuery ANDs the name filter with active=true^type=record through ^NQ groups", async () => {
+  const base = "active=true^type=record";
+  const names = ["*", "sys_user", "sys_user_has_role", "sys_user_role", "sys_properties", "sys_script", "sys_security_acl", "syslog", "sys_audit"];
+  const expected = [
+    `${base}^nameIN${names.join(",")}`,
+    ...names.map((name) => `${base}^nameSTARTSWITH${name}.`),
+  ].join("^NQ");
+  assert.equal(buildSensitiveAclQuery(), expected);
+  assert.equal(buildSensitiveAclQuery().includes("^OR"), false, "^OR binds to the adjacent condition only and must not be used for the name group");
+  for (const group of buildSensitiveAclQuery().split("^NQ")) {
+    assert.ok(group.startsWith(`${base}^name`), `every group repeats the active and type conditions: ${group}`);
+  }
+
+  const fixture = healthyFixture();
+  fixture.tables.sys_security_acl.push(
+    { sys_id: "acl-incident-read", name: "incident", operation: "read", type: "record", active: "true", admin_overrides: "true", condition: "", script: "", advanced: "false", description: "" },
+    { sys_id: "acl-ui-sys_user", name: "sys_user", operation: "read", type: "ui_page", active: "true", admin_overrides: "true", condition: "", script: "", advanced: "false", description: "" },
+    { sys_id: "acl-inactive-sys_user", name: "sys_user", operation: "read", type: "record", active: "false", admin_overrides: "true", condition: "", script: "", advanced: "false", description: "" },
+    { sys_id: "acl-sys_user-field", name: "sys_user.password", operation: "read", type: "record", active: "true", admin_overrides: "true", condition: "", script: "", advanced: "false", description: "" },
+  );
+  fixture.tables.sys_security_acl_role.push({ sys_id: "aclrole-field", sys_security_acl: "acl-sys_user-field", "sys_security_acl.name": "sys_user.password", sys_user_role: "role-admin", "sys_user_role.name": "admin" });
+  const { fetchImpl, calls } = fixtureFetch(fixture);
+  const result = await assessServicenowAccessControl(createClient(fetchImpl));
+  const aclCall = calls.find((call) => call.url.pathname === "/api/now/table/sys_security_acl");
+  assert.equal(aclCall.url.searchParams.get("sysparm_query"), expected);
+  assert.equal(result.summary.sensitive_acls_visible, 25, "only active record ACLs on sensitive or wildcard tables (including field-level rules) are fetched");
+  assert.equal(findingsById(result).get("SNOW-11").status, "pass");
 });
 
 test("assessServicenowAccessControl fails unrestricted ACLs and uncovered sensitive tables", async () => {

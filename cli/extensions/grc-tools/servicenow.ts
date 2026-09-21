@@ -2025,9 +2025,19 @@ export interface ServicenowAccessControlData {
   publicPages: TableSnapshot;
 }
 
-function sensitiveAclQuery(): string {
-  const clauses = SENSITIVE_ACL_TABLES.flatMap((table) => [`name=${table}`, `nameSTARTSWITH${table}.`]);
-  return `active=true^type=record^${["name=*", "nameSTARTSWITH*.", ...clauses].join("^OR")}`;
+/**
+ * ServiceNow encoded queries bind ^OR to the adjacent condition only, so the
+ * name alternatives are expressed as ^NQ groups that each repeat the active
+ * and type conditions. The result is (active AND record AND name-in-list) OR
+ * (active AND record AND name starts with "table.") for every sensitive table.
+ */
+export function buildSensitiveAclQuery(): string {
+  const base = "active=true^type=record";
+  const names = ["*", ...SENSITIVE_ACL_TABLES];
+  return [
+    `${base}^nameIN${names.join(",")}`,
+    ...names.map((name) => `${base}^nameSTARTSWITH${name}.`),
+  ].join("^NQ");
 }
 
 export async function collectServicenowAccessControlData(
@@ -2035,7 +2045,7 @@ export async function collectServicenowAccessControlData(
   options: ServicenowAccessControlOptions = {},
 ): Promise<ServicenowAccessControlData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
-  const acls = await client.queryTable("sys_security_acl", { query: sensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
+  const acls = await client.queryTable("sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
   const aclIds = acls.rows.map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
   const [aclRoles, aclTotal, publicPages] = await Promise.all([
     aclIds.length > 0
