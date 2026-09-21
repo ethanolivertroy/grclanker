@@ -75,7 +75,9 @@ test("tool catalog groups tools by domain for CLI display", () => {
     new RegExp(`${countTools(tools, "domain")} domain tools \\+ ${countTools(tools, "compute")} compute backend tools`),
   );
   assert.match(text, /Ansible AAP \(5\)/);
-  assert.match(text, /AWS \(5\)/);
+  const awsToolCount = tools.filter((tool) => tool.name.startsWith("aws_")).length;
+  assert.ok(awsToolCount >= 6, `expected at least 6 AWS tools, saw ${awsToolCount}`);
+  assert.match(text, new RegExp(`AWS \\(${awsToolCount}\\)`));
   assert.match(text, /Azure \(5\)/);
   assert.match(text, /Cloudflare \(5\)/);
   assert.match(text, /FedRAMP \(10\)/);
