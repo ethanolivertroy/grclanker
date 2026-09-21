@@ -112,6 +112,7 @@ Every finding applies these rules, and `cli/tests/gws.test.mjs` carries a regres
 7. Pagination follows `nextPageToken` until it is absent or the collection cap is hit; the cap is recorded as truncation.
 8. Re-running the export allocates `-2`, `-3`, and so on and never overwrites an earlier directory or zip.
 9. Bundle secret hygiene: every `core_data/` object is projected to the documented fields the verdicts read before it is written (Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, and undocumented keys are never stored), then a second pass redacts credential-like keys matched on normalized names (`privateKey`, `refresh_token`, `clientSecret`), redacts `{name, value}` pairs whose name is credential-like, and strips query strings from URL values.
+10. Every cap exit reports `truncated: true`: the collection caps, a `nextPageToken` equal to the previous one (a stalled cursor), and a 1000-page ceiling all end the listing as truncation, and privileged verdicts (GWS-ID-001, GWS-ID-004, GWS-ADMIN-001 to 003, GWS-ADMIN-005, GWS-INTEG-002) cap at Partial when the user, role, or role-assignment listing was truncated.
 
 ## Framework mappings
 
@@ -149,7 +150,7 @@ Runs `gws_check_access`, all four assessments, and the export into a temp direct
 
 - Installed-app OAuth (client secrets plus a stored refresh token) is deferred; use a delegated service account or a pre-obtained access token.
 - Token inventory samples privileged users first and then active users, up to 50 users per run; the finding reports `seen` versus `total` and caps at Partial when the sample is smaller than the active population.
-- The user listing stops at 5000 users, activity listings at 5000 records, alerts at 1000, and policies at 1000; a hit cap is recorded as truncation and caps dependent verdicts at Partial.
+- The user listing stops at 5000 users, roles at 1000, role assignments at 10000, activity listings at 5000 records, alerts at 1000, and policies at 1000, and no listing follows more than 1000 pages or a cursor that stops advancing; every such exit is recorded as truncation and caps dependent verdicts at Partial.
 - GWS-ADMIN-005 does not expand group membership; any group-based admin grant renders Manual for a membership review.
 - Chrome Policy API (`chromepolicy/v1`) and Cloud Identity device surfaces listed in the spec are not called; no shipped control depends on them.
 - Alert Center `pageSize` has no documented maximum ([alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list)); grclanker requests 100 and follows `nextPageToken`.

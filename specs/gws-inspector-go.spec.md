@@ -171,6 +171,7 @@ go build -o gws-inspector ./cmd/gws-inspector
 - The `--frameworks` flag from the CLI interface above maps to the `frameworks` argument of `gws_export_audit_bundle`.
 - Verdict-safety rules 1 to 10 applied to every finding, with a regression test per rule and a four-fixture false-pass self-check (all 403, all empty, partial inventory, compliant tenant) in `cli/tests/gws.test.mjs`.
 - Rule 9 (bundle secret hygiene) projects every `core_data/` object to documented fields, never stores Alert Center `data` or `events[].parameters[]`, and redacts credential-like keys on normalized names, `{name, value}` pairs, and URL query strings; an end-to-end test exports a bundle from fixtures carrying a planted secret in every carrier and greps every file and zip entry.
+- Rule 10 (truncation on every cap exit) gives roles (1000) and role assignments (10000) finite caps, ends a listing whose `nextPageToken` stops advancing or exceeds 1000 pages as `truncated: true`, and caps GWS-ID-001, GWS-ID-004, GWS-ADMIN-001 to 003, GWS-ADMIN-005, and GWS-INTEG-002 at Partial whenever the user, role, or role-assignment listing was truncated.
 
 ### Deviations from this spec
 

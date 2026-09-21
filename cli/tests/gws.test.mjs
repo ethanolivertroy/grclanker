@@ -642,6 +642,49 @@ test("verdict rule 7: pagination follows nextPageToken to the end and records tr
   assert.equal(alerts.truncated, false);
 });
 
+test("rule 10: a stalled or endless cursor is recorded as truncation and privileged verdicts stop passing", async () => {
+  const config = createSampleConfig();
+  let rolePages = 0;
+  let assignmentPages = 0;
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname.endsWith("/roles")) {
+      rolePages += 1;
+      return jsonResponse({ items: rolePages === 1 ? createRoles() : [], nextPageToken: "same-cursor" });
+    }
+    if (url.pathname.endsWith("/roleassignments")) {
+      assignmentPages += 1;
+      return jsonResponse({ items: [], nextPageToken: `cursor-${assignmentPages}` });
+    }
+    return jsonResponse({ error: { message: "unexpected" } }, 404);
+  };
+  const client = new GoogleWorkspaceAuditorClient(config, fetchImpl);
+
+  const roles = await client.collectRoles();
+  assert.equal(roles.truncated, true);
+  assert.equal(roles.pages, 2);
+  assert.equal(rolePages, 2);
+  assert.equal(roles.items.length, 2);
+
+  const assignments = await client.collectRoleAssignments();
+  assert.equal(assignments.truncated, true);
+  assert.equal(assignments.pages, 1000);
+  assert.equal(assignmentPages, 1000);
+
+  const collector = createFakeCollector({
+    collectUsers: async () => collection(createUsers().map((user) => ({ ...user, isEnforcedIn2Sv: true }))),
+    collectRoles: async () => roles,
+    collectRoleAssignments: async () => collection([createRoleAssignments()[0]]),
+  });
+  const assessments = assessAll(await collectGwsAuditData(collector), config);
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  for (const id of ["GWS-ID-001", "GWS-ID-004", "GWS-ADMIN-001", "GWS-ADMIN-002", "GWS-ADMIN-003", "GWS-ADMIN-005", "GWS-INTEG-002"]) {
+    const finding = findings.find((entry) => entry.id === id);
+    assert.notEqual(finding.status, "Pass", `${id} must not pass on a truncated roles listing`);
+    assert.ok(finding.evidence.some((line) => /^Roles: partial view, seen 2 across 2 page\(s\)/.test(line)), `${id} must flag the truncated roles listing`);
+  }
+});
+
 test("GWS assessments produce stable findings across identity, admin, integrations, and monitoring", () => {
   const config = createSampleConfig();
   const identity = assessGwsIdentity({

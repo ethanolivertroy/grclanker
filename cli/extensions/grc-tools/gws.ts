@@ -65,9 +65,13 @@ const ALERTS_PAGE_SIZE = 100;
 /** policies.list pageSize maximum is 100 (Cloud Identity reference). */
 const POLICIES_PAGE_SIZE = 100;
 const MAX_USERS = 5000;
+const MAX_ROLES = 1000;
+const MAX_ROLE_ASSIGNMENTS = 10000;
 const MAX_ACTIVITY_RECORDS = 5000;
 const MAX_ALERTS = 1000;
 const MAX_POLICIES = 1000;
+/** A cursor that keeps advancing past this many pages is recorded as truncation rather than followed forever. */
+const MAX_PAGES = 1000;
 const MAX_TOKEN_USERS = 50;
 const MAX_RETRIES = 4;
 const TOKEN_SKEW_MS = 60 * 1000;
@@ -1005,6 +1009,15 @@ function partialViewEvidence(label: string, dataset: CollectedDataset<unknown[]>
   ];
 }
 
+/** Privileged-user identification joins users, roles, and role assignments, so a truncated listing of any of them caps the verdict. */
+function privilegedViewEvidence(data: Pick<GwsIdentityData, "users" | "roles" | "roleAssignments">): string[] {
+  return [
+    ...partialViewEvidence("Users", data.users),
+    ...partialViewEvidence("Roles", data.roles),
+    ...partialViewEvidence("Role assignments", data.roleAssignments),
+  ];
+}
+
 function withPartialCap(finding: GwsFinding, notes: string[]): GwsFinding {
   if (notes.length === 0) return finding;
   const status: GwsFindingStatus = finding.status === "Pass" ? "Partial" : finding.status;
@@ -1765,9 +1778,13 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
       const payload = await this.fetchJson(buildPageUrl(pageToken, maxItems - items.length), scopes);
       pages += 1;
       items.push(...asArray(payload[itemsKey]).map(asRecord));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken) return { items, truncated: false, pages };
-      if (items.length >= maxItems) return { items: items.slice(0, maxItems), truncated: true, pages };
+      const nextPageToken = asString(payload.nextPageToken);
+      if (!nextPageToken) return { items, truncated: false, pages };
+      const cursorStalled = nextPageToken === pageToken;
+      if (items.length >= maxItems || cursorStalled || pages >= MAX_PAGES) {
+        return { items: items.slice(0, maxItems), truncated: true, pages };
+      }
+      pageToken = nextPageToken;
     }
   }
 
@@ -1799,7 +1816,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
         pageToken,
       }),
       "items",
-      Number.POSITIVE_INFINITY,
+      MAX_ROLES,
     );
   }
 
@@ -1814,7 +1831,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
         pageToken,
       }),
       "items",
-      Number.POSITIVE_INFINITY,
+      MAX_ROLE_ASSIGNMENTS,
     );
   }
 
@@ -2283,6 +2300,7 @@ export function assessGwsIdentity(
   const dormancy = bucketDormancy(activeUsers, dormantCutoff);
   const directoryProblem = directoryUnreadable(data.users, data.roles, data.roleAssignments);
   const userPartial = partialViewEvidence("Users", data.users);
+  const privilegedViewNotes = privilegedViewEvidence(data);
   const privilegedPartial = privileged.unresolvedAssignments > 0
     ? [`Role assignments pointing at users outside the collected listing: ${privileged.unresolvedAssignments}`]
     : [];
@@ -2305,7 +2323,7 @@ export function assessGwsIdentity(
       [
         `Users collected: ${users.length}`,
         `Role assignments collected: ${roleAssignments.length}`,
-        ...userPartial,
+        ...privilegedViewNotes,
       ],
       "Confirm the delegated admin can read every user and role assignment, then re-run the assessment.",
       "Collect manually: Admin console > Account > Admin roles, listing every assigned administrator.",
@@ -2340,7 +2358,7 @@ export function assessGwsIdentity(
             evidence,
             "Make enforced 2-step verification mandatory for privileged users immediately.",
           ),
-      [...userPartial, ...privilegedPartial],
+      [...privilegedViewNotes, ...privilegedPartial],
     ));
   }
 
@@ -2466,7 +2484,7 @@ export function assessGwsIdentity(
       [
         `Role assignments collected: ${roleAssignments.length}`,
         `Users with isAdmin=true: ${users.filter((user) => asBoolean(user.isAdmin) === true).length}`,
-        ...userPartial,
+        ...privilegedViewNotes,
       ],
       "Confirm the audit principal can read super admins (users.list isAdmin and the _SEED_ADMIN_ROLE assignments) and re-run.",
       "Collect manually: Admin console > Account > Admin roles > Super Admin membership.",
@@ -2492,7 +2510,7 @@ export function assessGwsIdentity(
           evidence,
           "Require enforced 2-step verification for every super-admin account immediately.",
         ),
-      [...userPartial, ...privilegedPartial],
+      [...privilegedViewNotes, ...privilegedPartial],
     ));
   }
 
@@ -2531,7 +2549,7 @@ export function assessGwsAdminAccess(
   const stalePrivileged = bucketDormancy(privileged.privilegedUsers.filter(isActiveUser), staleCutoff);
   const directoryProblem = directoryUnreadable(data.users, data.roles, data.roleAssignments);
   const partialNotes = [
-    ...partialViewEvidence("Users", data.users),
+    ...privilegedViewEvidence(data),
     ...(privileged.unresolvedAssignments > 0
       ? [`Role assignments pointing at users outside the collected listing: ${privileged.unresolvedAssignments}`]
       : []),
@@ -2719,7 +2737,7 @@ export function assessGwsAdminAccess(
         [`Role assignments reviewed: ${roleAssignments.length}`, `Group role assignments: ${privileged.groupAssignmentCount}`],
         "Keep group-based privileged grants documented if they are introduced later.",
       ),
-      partialViewEvidence("Role assignments", data.roleAssignments),
+      privilegedViewEvidence(data),
     ));
   } else {
     findings.push(buildFinding(
@@ -2864,7 +2882,7 @@ export function assessGwsIntegrations(
     ];
     const capNotes = [
       ...(privilegedSampled ? [] : [`Privileged users beyond the ${MAX_TOKEN_USERS}-user token sample were not inspected`]),
-      ...partialViewEvidence("Users", data.users),
+      ...privilegedViewEvidence(data),
     ];
     findings.push(withPartialCap(
       privilegedTokens.length === 0
