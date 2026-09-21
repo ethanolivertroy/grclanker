@@ -39,6 +39,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["gws_", "Google Workspace"],
   ["gws_ops_", "Google Workspace Operator"],
   ["kevs_", "KEV / EPSS"],
+  ["mulesoft_", "MuleSoft"],
   ["oci_", "OCI"],
   ["okta_", "Okta"],
   ["oscal_", "OSCAL"],
