@@ -15,10 +15,12 @@ import { inflateRawSync } from "node:zlib";
 
 import {
   API_KEY_DOCUMENTED_ONLY_NOTE,
+  NEWRELIC_CLIENT_SURFACE_METHODS,
   NEWRELIC_CONTROL_CATALOG,
   NEWRELIC_NERDGRAPH_SELECTIONS,
   NEWRELIC_STORED_RECORD_SHAPES,
   NewrelicApiClient,
+  NewrelicNoAccountsError,
   assessNewrelicAccessControl,
   assessNewrelicAlerting,
   assessNewrelicDataGovernance,
@@ -2906,43 +2908,44 @@ const COROLLARY_BASELINE_PASS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 const NRQL_LOG_VOLUME = (nrql) => nrql.includes("AS logCount FROM Log");
 const NRQL_API_KEY_ACTORS = (nrql) => nrql.includes("actorType = 'api_key'");
 
-// Every NerdGraph query and NRQL the four collectors run, the client method that carries it, its scoping (per
-// account, per authentication domain, or per monitor), the query path a denial reports, and the pass-capable
-// findings that read it. `match` narrows shared methods (runNrql, searchEntities) to one inventory.
+// Every NerdGraph query and NRQL the four collectors run, the client method that carries it, the `source` the
+// collector records for it (the name every `*_status` field and coverage note uses), its scoping (per account, per
+// authentication domain, or per monitor), the query path a denial reports, and the pass-capable findings that read
+// it. `match` narrows shared methods (runNrql, searchEntities) to one inventory.
 const COROLLARY_INVENTORIES = [
-  { inventory: "actor.user", method: "getCurrentUser", path: "actor.user", dependents: [10] },
-  { inventory: "actor.organization", method: "getOrganization", path: "actor.organization", dependents: [1, 20] },
-  { inventory: "actor.accounts", method: "listAccounts", path: "actor.accounts", dependents: [4, 5, 7, 8] },
-  { inventory: "userManagement.authenticationDomains", method: "listAuthenticationDomains", path: "actor.organization.userManagement.authenticationDomains", dependents: [1, 2, 3, 4, 7, 8, 19, 20] },
-  { inventory: "customerAdministration.authenticationDomains", method: "listOrganizationAuthenticationDomains", path: "customerAdministration.authenticationDomains", dependents: [1] },
-  { inventory: "userManagement.users", method: "listDomainUsers", scope: "domain", path: "actor.organization.userManagement.authenticationDomains.users", dependents: [2, 3, 4, 7, 8, 19] },
-  { inventory: "authorizationManagement.groups", method: "listDomainGroupGrants", scope: "domain", path: "actor.organization.authorizationManagement.authenticationDomains.groups", dependents: [3, 4, 7, 8, 20] },
-  { inventory: "customerAdministration.roles", method: "listRoles", path: "customerAdministration.roles", dependents: [20] },
-  { inventory: "apiAccess.keySearch", method: "listApiKeys", path: "actor.apiAccess.keySearch", dependents: [4, 5] },
-  { inventory: "NRQL NrAuditEvent actorType api_key", method: "runNrql", scope: "account", match: NRQL_API_KEY_ACTORS, path: "actor.account.nrql", dependents: [] },
-  { inventory: "NRQL NrAuditEvent api_key changes", method: "runNrql", scope: "account", match: (nrql) => nrql.includes("actionIdentifier LIKE 'api_key%'"), path: "actor.account.nrql", dependents: [] },
-  { inventory: "alerts.policiesSearch", method: "listAlertPolicies", scope: "account", path: "actor.account.alerts.policiesSearch", dependents: [9, 10] },
-  { inventory: "alerts.nrqlConditionsSearch", method: "listNrqlConditions", scope: "account", path: "actor.account.alerts.nrqlConditionsSearch", dependents: [9] },
-  { inventory: "aiNotifications.destinations", method: "listNotificationDestinations", scope: "account", path: "actor.account.aiNotifications.destinations", dependents: [10] },
-  { inventory: "aiNotifications.channels", method: "listNotificationChannels", scope: "account", path: "actor.account.aiNotifications.channels", dependents: [10] },
-  { inventory: "aiWorkflows.workflows", method: "listWorkflows", scope: "account", path: "actor.account.aiWorkflows.workflows", dependents: [10] },
-  { inventory: "entitySearch alertable entities", method: "searchEntities", scope: "account", match: (query) => query.includes("alertSeverity"), path: "actor.entitySearch", dependents: [9] },
-  { inventory: "entitySearch workloads", method: "searchEntities", scope: "account", match: (query) => query.includes("WORKLOAD"), path: "actor.entitySearch", dependents: [9] },
-  { inventory: "dataManagement.eventRetentionRules", method: "listEventRetentionRules", scope: "account", path: "actor.account.dataManagement.eventRetentionRules", dependents: [11] },
-  { inventory: "dataManagement.customizableRetention", method: "listRetentionNamespaces", scope: "account", path: "actor.account.dataManagement.customizableRetention", dependents: [11] },
-  { inventory: "logConfigurations.obfuscationRules", method: "listObfuscationRules", scope: "account", path: "actor.account.logConfigurations.obfuscationRules", dependents: [12] },
-  { inventory: "logConfigurations.obfuscationExpressions", method: "listObfuscationExpressions", scope: "account", path: "actor.account.logConfigurations.obfuscationExpressions", dependents: [12] },
-  { inventory: "entityManagement.pipelineCloudRules", method: "listPipelineCloudRules", path: "actor.entityManagement.entitySearch", dependents: [12] },
-  { inventory: "nrqlDropRules.list", method: "listNrqlDropRules", scope: "account", path: "actor.account.nrqlDropRules.list", dependents: [12] },
-  { inventory: "entitySearch dashboards", method: "searchEntities", scope: "account", match: (query) => query.includes("DASHBOARD"), path: "actor.entitySearch", dependents: [14] },
-  { inventory: "dashboard.liveUrls", method: "listDashboardLiveUrls", path: "actor.dashboard.liveUrls", dependents: [14] },
-  { inventory: "entitySearch synthetic monitors", method: "searchEntities", scope: "account", match: (query) => query.includes("MONITOR"), path: "actor.entitySearch", dependents: [13] },
-  { inventory: "entitySearch secure credentials", method: "searchEntities", scope: "account", match: (query) => query.includes("SECURE_CRED"), path: "actor.entitySearch", dependents: [13] },
-  { inventory: "synthetics.script", method: "getSyntheticScript", scope: "monitor", path: "actor.account.synthetics.script", dependents: [13] },
-  { inventory: "NRQL Log volume", method: "runNrql", scope: "account", match: NRQL_LOG_VOLUME, path: "actor.account.nrql", dependents: [12, 15] },
-  { inventory: "NRQL Log secret patterns", method: "runNrql", scope: "account", match: (nrql) => nrql.includes("RLIKE"), path: "actor.account.nrql", dependents: [15] },
-  { inventory: "entitySearch infra hosts", method: "countEntities", scope: "account", path: "actor.entitySearch.count", dependents: [] },
-  { inventory: "NRQL SystemSample agent versions", method: "runNrql", scope: "account", match: (nrql) => nrql.includes("SystemSample"), path: "actor.account.nrql", dependents: [] },
+  { inventory: "actor.user", method: "getCurrentUser", source: "actor.user", path: "actor.user", dependents: [10] },
+  { inventory: "actor.organization", method: "getOrganization", source: "actor.organization", path: "actor.organization", dependents: [1, 20] },
+  { inventory: "actor.accounts", method: "listAccounts", source: "actor.accounts", path: "actor.accounts", dependents: [4, 5, 7, 8] },
+  { inventory: "userManagement.authenticationDomains", method: "listAuthenticationDomains", source: "userManagement.authenticationDomains", path: "actor.organization.userManagement.authenticationDomains", dependents: [1, 2, 3, 4, 7, 8, 19, 20] },
+  { inventory: "customerAdministration.authenticationDomains", method: "listOrganizationAuthenticationDomains", source: "customerAdministration.authenticationDomains", path: "customerAdministration.authenticationDomains", dependents: [1] },
+  { inventory: "userManagement.users", method: "listDomainUsers", source: "userManagement.users", scope: "domain", path: "actor.organization.userManagement.authenticationDomains.users", dependents: [2, 3, 4, 7, 8, 19] },
+  { inventory: "authorizationManagement.groups", method: "listDomainGroupGrants", source: "authorizationManagement.groups", scope: "domain", path: "actor.organization.authorizationManagement.authenticationDomains.groups", dependents: [3, 4, 7, 8, 20] },
+  { inventory: "customerAdministration.roles", method: "listRoles", source: "customerAdministration.roles", path: "customerAdministration.roles", dependents: [20] },
+  { inventory: "apiAccess.keySearch", method: "listApiKeys", source: "apiAccess.keySearch", path: "actor.apiAccess.keySearch", dependents: [4, 5] },
+  { inventory: "NRQL NrAuditEvent actorType api_key", method: "runNrql", source: "nrql.NrAuditEvent.api_key_actor", scope: "account", match: NRQL_API_KEY_ACTORS, path: "actor.account.nrql", dependents: [] },
+  { inventory: "NRQL NrAuditEvent api_key changes", method: "runNrql", source: "nrql.NrAuditEvent.api_key_changes", scope: "account", match: (nrql) => nrql.includes("actionIdentifier LIKE 'api_key%'"), path: "actor.account.nrql", dependents: [] },
+  { inventory: "alerts.policiesSearch", method: "listAlertPolicies", source: "alerts.policiesSearch", scope: "account", path: "actor.account.alerts.policiesSearch", dependents: [9, 10] },
+  { inventory: "alerts.nrqlConditionsSearch", method: "listNrqlConditions", source: "alerts.nrqlConditionsSearch", scope: "account", path: "actor.account.alerts.nrqlConditionsSearch", dependents: [9] },
+  { inventory: "aiNotifications.destinations", method: "listNotificationDestinations", source: "aiNotifications.destinations", scope: "account", path: "actor.account.aiNotifications.destinations", dependents: [10] },
+  { inventory: "aiNotifications.channels", method: "listNotificationChannels", source: "aiNotifications.channels", scope: "account", path: "actor.account.aiNotifications.channels", dependents: [10] },
+  { inventory: "aiWorkflows.workflows", method: "listWorkflows", source: "aiWorkflows.workflows", scope: "account", path: "actor.account.aiWorkflows.workflows", dependents: [10] },
+  { inventory: "entitySearch alertable entities", method: "searchEntities", source: "entitySearch.alertable", scope: "account", match: (query) => query.includes("alertSeverity"), path: "actor.entitySearch", dependents: [9] },
+  { inventory: "entitySearch workloads", method: "searchEntities", source: "entitySearch.workloads", scope: "account", match: (query) => query.includes("WORKLOAD"), path: "actor.entitySearch", dependents: [9] },
+  { inventory: "dataManagement.eventRetentionRules", method: "listEventRetentionRules", source: "dataManagement.eventRetentionRules", scope: "account", path: "actor.account.dataManagement.eventRetentionRules", dependents: [11] },
+  { inventory: "dataManagement.customizableRetention", method: "listRetentionNamespaces", source: "dataManagement.customizableRetention", scope: "account", path: "actor.account.dataManagement.customizableRetention", dependents: [11] },
+  { inventory: "logConfigurations.obfuscationRules", method: "listObfuscationRules", source: "logConfigurations.obfuscationRules", scope: "account", path: "actor.account.logConfigurations.obfuscationRules", dependents: [12] },
+  { inventory: "logConfigurations.obfuscationExpressions", method: "listObfuscationExpressions", source: "logConfigurations.obfuscationExpressions", scope: "account", path: "actor.account.logConfigurations.obfuscationExpressions", dependents: [12] },
+  { inventory: "entityManagement.pipelineCloudRules", method: "listPipelineCloudRules", source: "entityManagement.pipelineCloudRules", path: "actor.entityManagement.entitySearch", dependents: [12] },
+  { inventory: "nrqlDropRules.list", method: "listNrqlDropRules", source: "nrqlDropRules.list", scope: "account", path: "actor.account.nrqlDropRules.list", dependents: [12] },
+  { inventory: "entitySearch dashboards", method: "searchEntities", source: "entitySearch.dashboards", scope: "account", match: (query) => query.includes("DASHBOARD"), path: "actor.entitySearch", dependents: [14] },
+  { inventory: "dashboard.liveUrls", method: "listDashboardLiveUrls", source: "dashboard.liveUrls", path: "actor.dashboard.liveUrls", dependents: [14] },
+  { inventory: "entitySearch synthetic monitors", method: "searchEntities", source: "entitySearch.syntheticMonitors", scope: "account", match: (query) => query.includes("MONITOR"), path: "actor.entitySearch", dependents: [13] },
+  { inventory: "entitySearch secure credentials", method: "searchEntities", source: "entitySearch.secureCredentials", scope: "account", match: (query) => query.includes("SECURE_CRED"), path: "actor.entitySearch", dependents: [13] },
+  { inventory: "synthetics.script", method: "getSyntheticScript", source: "synthetics.script", scope: "monitor", path: "actor.account.synthetics.script", dependents: [13] },
+  { inventory: "NRQL Log volume", method: "runNrql", source: "nrql.Log.volume", scope: "account", match: NRQL_LOG_VOLUME, path: "actor.account.nrql", dependents: [12, 15] },
+  { inventory: "NRQL Log secret patterns", method: "runNrql", source: "nrql.Log.secret_patterns", scope: "account", match: (nrql) => nrql.includes("RLIKE"), path: "actor.account.nrql", dependents: [15] },
+  { inventory: "entitySearch infra hosts", method: "countEntities", source: "entitySearch.infraHosts", scope: "account", path: "actor.entitySearch.count", dependents: [] },
+  { inventory: "NRQL SystemSample agent versions", method: "runNrql", source: "nrql.SystemSample.agentVersion", scope: "account", match: (nrql) => nrql.includes("SystemSample"), path: "actor.account.nrql", dependents: [] },
 ];
 
 const COROLLARY_SECOND_SCOPE = { account: "222", domain: "domain-2", monitor: "222" };
@@ -2985,11 +2988,122 @@ function belowPass(item, context) {
   assert.ok(item.status === "warn" || item.status === "manual", `${item.id} is ${item.status} ${context}: ${item.summary}`);
 }
 
+/** Wraps a fixture client so every query it receives is recorded as the collector `source` it carries. */
+function recordingClient(client) {
+  const requested = new Set();
+  const recorded = {};
+  for (const method of NEWRELIC_CLIENT_SURFACE_METHODS) {
+    if (typeof client[method] !== "function") continue;
+    recorded[method] = (...args) => {
+      // resolveAccountIds discovers accounts through actor.accounts when none are configured.
+      if (method === "resolveAccountIds") requested.add("actor.accounts");
+      const text = String(method === "runNrql" ? args[1] : args[0]);
+      for (const row of COROLLARY_INVENTORIES) {
+        if (row.method === method && (!row.match || row.match(text))) requested.add(row.source);
+      }
+      return client[method](...args);
+    };
+  }
+  return { client: recorded, requested };
+}
+
+const UNAVAILABLE_STATUS = /^(unreadable|not collected|unknown)\b/;
+const NULL_COMPANION_STATUS = /^(unreadable|not collected|unknown|partial)\b/;
+const COLLECTED_STATUS = /^(complete|partial|truncated)\b/;
+const SOURCE_MENTION = new RegExp(
+  `(?<![\\w.])(?:${[...new Set(COROLLARY_INVENTORIES.map((row) => row.source))]
+    .sort((a, b) => b.length - a.length)
+    .map((source) => source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|")})(?![\\w.])`,
+  "g",
+);
+
+function isFabricatedPlaceholder(value) {
+  return value === 0
+    || value === false
+    || (Array.isArray(value) && value.length === 0)
+    || (value !== null && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0);
+}
+
+/**
+ * No count, list, map, or flag renders 0, [], {}, or false beside a status that says the data was unreadable, not
+ * collected, unknown, or only partly readable: the companion of such a `*_status` is null, and the siblings of a
+ * nested `status` marker (core_data files, summary sub-objects) carry no placeholder value.
+ */
+function assertNoFabricatedValues(value, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    assert.notEqual(entry, "unknown", `${label}: ${path}.${key} is the "unknown" placeholder`);
+    if (typeof entry === "string" && key.endsWith("_status") && NULL_COMPANION_STATUS.test(entry)) {
+      const base = key.slice(0, -"_status".length);
+      if (base in value) assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+    }
+    if (key === "status" && typeof entry === "string" && UNAVAILABLE_STATUS.test(entry)) {
+      for (const [sibling, siblingValue] of Object.entries(value)) {
+        assert.ok(!isFabricatedPlaceholder(siblingValue), `${label}: ${path}.${sibling} renders ${JSON.stringify(siblingValue)} beside status "${entry}"`);
+      }
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+/** A status that says complete, partial, or truncated may only name queries the client actually received. */
+function assertStatusesMatchRequests(value, requested, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStatusesMatchRequests(item, requested, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && (key.endsWith("_status") || key === "status") && COLLECTED_STATUS.test(entry)) {
+      for (const mention of entry.match(SOURCE_MENTION) ?? []) {
+        assert.ok(requested.has(mention), `${label}: ${path}.${key} says "${entry}" but ${mention} was never requested`);
+      }
+    }
+    assertStatusesMatchRequests(entry, requested, label, `${path}.${key}`);
+  }
+}
+
+/** Runs the four assessors on a recording client and checks every evidence, summary, and core_data value with both guards. */
+async function assessGuarded(client, label) {
+  const recorder = recordingClient(client);
+  const { results, findings } = await assessAll({ identity: recorder.client, accessControl: recorder.client, alerting: recorder.client, dataGovernance: recorder.client });
+  const rendered = {
+    summaries: results.map((result) => result.summary),
+    evidence: findings.map((item) => item.evidence ?? null),
+    coreData: results.map((result) => result.coreData),
+  };
+  assertNoFabricatedValues(rendered, label);
+  assertStatusesMatchRequests(rendered, recorder.requested, label);
+  return { results, findings, requested: recorder.requested };
+}
+
 test("rule 1 corollary: the corollary baseline passes every pass-capable finding with no collection errors", async () => {
-  const { results, findings } = await assessCorollary();
+  const { results, findings, requested } = await assessGuarded(corollaryClient(), "corollary baseline");
   assert.deepEqual(passing(findings).sort(), [...COROLLARY_BASELINE_PASS].sort());
   assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.control).sort((a, b) => a - b), [6, 16, 17, 18]);
   assert.ok(results.every((result) => result.errors.length === 0 && result.coverage.length === 0), JSON.stringify(results.map((result) => [result.errors, result.coverage])));
+  // The baseline issues every inventory in the table, so every `complete` status names a query that ran.
+  assert.deepEqual([...requested].sort(), [...new Set(COROLLARY_INVENTORIES.map((row) => row.source))].sort());
+
+  // The other compliant fixtures render no placeholder either, and the all-empty fixture's statuses only name issued queries.
+  await assessGuarded(bundleClient(), "bundle baseline");
+  await assessGuarded(emptyClient(), "empty fixture");
+});
+
+test("rule 1 corollary table: the per-inventory table covers exactly the collectors' client methods", () => {
+  // getResolvedConfig reads local configuration and resolveAccountIds resolves the account scope through
+  // actor.accounts, which the table carries under listAccounts. listRestUsers is the REST v2 probe that only
+  // check_access issues, so no finding depends on it and it is excluded from the denial sweep.
+  const nonQueryMethods = ["getResolvedConfig", "resolveAccountIds", "listRestUsers"];
+  const collectorMethods = NEWRELIC_CLIENT_SURFACE_METHODS.filter((method) => !nonQueryMethods.includes(method));
+  assert.deepEqual([...new Set(COROLLARY_INVENTORIES.map((row) => row.method))].sort(), [...collectorMethods].sort());
+  assert.equal(new Set(COROLLARY_INVENTORIES.map((row) => row.source)).size, COROLLARY_INVENTORIES.length, "every row records a distinct collector source");
+  for (const method of collectorMethods) assert.equal(typeof corollaryClient()[method], "function", `${method} is stubbed by the corollary fixture`);
 });
 
 test("rule 1 corollary root cause: a fully denied secondary dataset produces a coverage note and caps the verdict at warn", async () => {
@@ -3241,18 +3355,22 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
 test("rule 1 corollary sweep: denying any one inventory demotes exactly the findings that read it, fully and per scope", async () => {
   for (const row of COROLLARY_INVENTORIES) {
     for (const mode of row.scope ? ["full", "partial"] : ["full"]) {
-      const { findings } = await assessCorollary([[row.inventory, mode]]);
       const context = `with ${row.inventory} denied (${mode})`;
+      // Both generic guards run over every finding's evidence, every category summary, and every core_data value.
+      const { results, findings } = await assessGuarded(denyInventories(corollaryClient(), [[row.inventory, mode]]), context);
       const expectedDemoted = row.dependents.map(controlId);
       const expectedPass = COROLLARY_BASELINE_PASS.filter((id) => !expectedDemoted.includes(id));
       assert.deepEqual(passing(findings).sort(), expectedPass.sort(), `pass set ${context}`);
       assert.deepEqual(findings.filter((item) => item.status === "fail").map((item) => item.id), [], `no false fail ${context}`);
+      assert.ok(results.some((result) => result.errors.some((error) => error.includes(row.path))), `the denial is disclosed in an errors array ${context}`);
       for (const id of expectedDemoted) {
         const item = findingById({ findings }, id);
         belowPass(item, context);
         assert.ok(item.summary.includes(row.path), `${id} does not name the query path ${row.path} ${context}: ${item.summary}`);
         if (mode === "partial") {
           assert.ok(item.summary.includes(COROLLARY_SCOPE_LABEL[row.scope]), `${id} does not name the denied scope ${context}: ${item.summary}`);
+          // Counts from the readable scopes only never lead: the Partial view clause states the gap first.
+          assert.ok(item.summary.startsWith("Partial view: "), `${id} states a readable-scope count ahead of the gap ${context}: ${item.summary}`);
         }
       }
     }

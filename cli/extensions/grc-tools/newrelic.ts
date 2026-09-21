@@ -215,6 +215,8 @@ export interface PagedList<T = JsonRecord> {
   totalCount?: number;
   note?: string;
   failures?: string[];
+  /** Set when the listing's own query was never needed: the issued query that established the empty result. */
+  basis?: string;
 }
 
 /**
@@ -288,6 +290,11 @@ export interface Collected<T> {
   note?: string;
   /** The inventory this one was computed from (the script scan reads the monitor listing); its gaps are this one's gaps too. */
   derivedFrom?: Collected<unknown>;
+  /**
+   * Set when this inventory's own query was never issued because its input left nothing to query (a monitor listing
+   * with no scripted monitor): the issued query the status names instead of `source`, so no status claims a query ran.
+   */
+  basis?: string;
 }
 
 /** Thrown by a scoped collector when it had no scopes to query; `collectList` records it as a not-collected inventory. */
@@ -2088,6 +2095,7 @@ async function collectList(source: string, shape: RecordShape, load: () => Promi
       seen: page.items.length,
       total: page.totalCount,
       note: page.note ? `${source}: ${page.note}` : undefined,
+      basis: page.basis,
     };
   } catch (error) {
     if (error instanceof NotCollectedError) return { data: [], source, notCollected: `${source} ${error.message}` };
@@ -2185,11 +2193,17 @@ function coverageNotes(entries: Array<[string, Collected<unknown>]>): string[] {
   return entries.map(([label, item]) => coverageNote(label, item)).filter((note): note is string => Boolean(note));
 }
 
+/** The query a status names for an inventory: the one that answered, or the issued input query when its own was never needed. */
+function statusSource(item: Collected<unknown>): string {
+  return item.basis ?? item.source;
+}
+
 /**
  * Evidence status for the inventories a value is derived from. The leading word classifies it: `complete` (naming the
  * queries that answered), `truncated` (a pagination cap, with seen and total counts, naming the query), `partial` (at
  * least one scope unreadable, named with its query path), `unreadable`, or `not collected` (naming the upstream query
- * that left nothing to query). A value beside a partial, unreadable, or not-collected status is always null.
+ * that left nothing to query). A value beside a partial, unreadable, or not-collected status is always null, and a
+ * complete, truncated, or partial status names only queries that were issued.
  */
 function collectionStatus(items: Inventories): string {
   const list = inventoriesOf(items);
@@ -2198,11 +2212,11 @@ function collectionStatus(items: Inventories): string {
   const unreadable = list.filter((item) => item.error);
   if (unreadable.length > 0) return `unreadable (${unreadable.map(causeOf).join("; ")})`;
   const complete = list.filter(isComplete);
-  const completeClause = `complete (${complete.map((item) => item.source).join(", ")})`;
+  const completeClause = `complete (${complete.map(statusSource).join(", ")})`;
   if (complete.length === list.length) return completeClause;
   const details = list
     .filter((item) => !isComplete(item))
-    .map((item) => (hasUnreadableScope(item) ? coverageDetail(item) : `${coverageDetail(item)} (${item.source})`));
+    .map((item) => (hasUnreadableScope(item) ? coverageDetail(item) : `${coverageDetail(item)} (${statusSource(item)})`));
   const tail = complete.length > 0 ? `; ${completeClause}` : "";
   return `${list.some(hasUnreadableScope) ? "partial" : "truncated"}: ${details.join("; ")}${tail}`;
 }
@@ -3369,6 +3383,7 @@ export function assessNewrelicAccessControlData(
       return verdict("warn", `${broadAccessUsers.length}/${users.length} non-admin users hold organization-scoped grants or access to more than ${maxAccountsPerUser} accounts.`);
     }
     if (!accountsReadable) return manualVerdict(`Accounts (actor.accounts) were ${unavailableDetail(data.accounts)}, so the account population is unknown; within the readable group grants, no non-admin user exceeds ${maxAccountsPerUser} accounts. Collect the account list from Administration > Access Management > Accounts.`);
+    if (accounts.length === 0) return manualVerdict(`actor.accounts returned zero accounts, so the account population is unknown rather than empty (every key belongs to at least one account); within the readable group grants, no non-admin user exceeds ${maxAccountsPerUser} accounts. Collect the account list from Administration > Access Management > Accounts.`);
     if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
       return verdict("warn", `No mapped non-admin user exceeds ${maxAccountsPerUser} accounts, but ${usersWithoutGroupData.length} users expose no group membership and ${groupsWithoutRoleData.length} groups expose no role grants, so their access is unknown.`);
     }
@@ -3433,7 +3448,7 @@ export function assessNewrelicAccessControlData(
   const keyOwnership = [data.apiKeys, ...adminRoster];
   findings.push(finding(4, limitCoverage(control4(), [...keyCoverage, ...userCoverage, ...groupCoverage, ...accountCoverage, ...scopeCoverage]), {
     ...measured("keys_total", data.apiKeys, keys.length),
-    keys_reported_total: data.apiKeys.total ?? null,
+    ...measured("keys_reported_total", data.apiKeys, data.apiKeys.total ?? null),
     ...measured("user_keys", data.apiKeys, userKeys.length),
     ...measured("license_keys", data.apiKeys, licenseKeys.length),
     ...measured("browser_keys", data.apiKeys, browserKeys.length),
@@ -3844,7 +3859,7 @@ export function assessNewrelicAlertingData(
     ...measured("conditions_without_enabled_flag", data.conditions, conditionsWithoutEnabledFlag.length),
     ...measured("empty_policies", policyConditions, sample(emptyPolicies.map((policy) => asString(policy.name) ?? asString(policy.id) ?? "policy"))),
     ...measured("reporting_alertable_entities", data.alertableEntities, reportingEntities.length),
-    alertable_entities_reported_total: data.alertableEntities.total ?? null,
+    ...measured("alertable_entities_reported_total", data.alertableEntities, data.alertableEntities.total ?? null),
     ...measured("uncovered_entities", data.alertableEntities, uncoveredEntities.length),
     ...measured("uncovered_critical_entities", data.alertableEntities, sample(uncoveredCritical.map(entityLabel))),
     ...measured("workloads", data.workloads, workloads.length),
@@ -3976,11 +3991,14 @@ function isScriptedMonitor(monitor: JsonRecord): boolean {
 }
 
 const SYNTHETIC_SCRIPT_SOURCE = "synthetics.script";
+const SYNTHETIC_MONITOR_SOURCE = "entitySearch.syntheticMonitors";
 
 /**
  * The script scan is computed from the monitor listing, so it inherits that listing's state: when the listing was
  * unreadable or never collected no script was fetched and the scan is recorded as not collected, naming
  * `entitySearch.syntheticMonitors`; a partly readable or truncated listing makes the scan partial or truncated too.
+ * When the listing holds no scripted monitor no script query is issued, and the scan's status names the listing as
+ * the query its (empty) result rests on rather than `synthetics.script`.
  */
 async function collectSyntheticScripts(
   client: Pick<NewrelicClientSurface, "getSyntheticScript">,
@@ -4037,6 +4055,7 @@ async function scanSyntheticScripts(
     totalCount: scripted.length,
     note: scripted.length > limit ? `only ${sampled.length} of ${scripted.length} scripted monitors were sampled (script_sample_limit ${limit})` : undefined,
     failures: failures.length > 0 ? failures : undefined,
+    basis: scripted.length === 0 ? `${SYNTHETIC_MONITOR_SOURCE} listed no scripted monitor, so no script was fetched` : undefined,
   };
 }
 
@@ -4061,7 +4080,7 @@ export async function collectNewrelicDataGovernanceData(
   );
   const dashboardLiveUrls = await collectList("dashboard.liveUrls", LIVE_URL_SHAPE, () => client.listDashboardLiveUrls());
   const syntheticMonitors = await collectList(
-    "entitySearch.syntheticMonitors",
+    SYNTHETIC_MONITOR_SOURCE,
     ENTITY_SHAPE,
     () => collectPerAccount(accountScope, (id) => client.searchEntities(`domain = 'SYNTH' AND type = 'MONITOR' AND accountId = ${id}`, entityLimit)),
   );
@@ -4415,7 +4434,7 @@ export function assessNewrelicDataGovernanceData(
 
   findings.push(finding(14, limitCoverage(control14(), dashboardCoverage), {
     ...measured("dashboards", data.dashboards, dashboards.length),
-    dashboards_reported_total: data.dashboards.total ?? null,
+    ...measured("dashboards_reported_total", data.dashboards, data.dashboards.total ?? null),
     ...measured("public_read_write_dashboards", data.dashboards, sample(publicReadWriteDashboards.map((dashboard) => asString(dashboard.name) ?? "dashboard"))),
     ...measured("private_dashboards", data.dashboards, privateDashboards.length),
     ...measured("dashboards_without_permissions", data.dashboards, dashboardsWithoutPermissions.length),
