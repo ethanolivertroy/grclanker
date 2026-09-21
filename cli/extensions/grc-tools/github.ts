@@ -310,6 +310,7 @@ interface GitHubCodeSecurityData {
   org: CollectedDataset<JsonRecord | null>;
   repositories: CollectedDataset<JsonRecord[]>;
   codeSecurityConfigurations: CollectedDataset<JsonRecord[]>;
+  codeSecurityDefaults: CollectedDataset<JsonRecord[]>;
 }
 
 export interface GitHubRepoListEntry {
@@ -353,6 +354,7 @@ const GITHUB_ACCESS_PROBES = [
   { key: "rulesets", path: (org: string) => `/orgs/${org}/rulesets?per_page=1` },
   { key: "actions_permissions", path: (org: string) => `/orgs/${org}/actions/permissions` },
   { key: "code_security", path: (org: string) => `/orgs/${org}/code-security/configurations?per_page=1` },
+  { key: "code_security_defaults", path: (org: string) => `/orgs/${org}/code-security/configurations/defaults` },
 ] as const;
 
 const GITHUB_CHECKS: Record<string, CheckDefinition> = {
@@ -1685,6 +1687,13 @@ export class GitHubAuditorClient {
     return this.paginate(`/orgs/${this.config.organization}/code-security/configurations?per_page=${PAGE_SIZE}`);
   }
 
+  // code-security/get-default-configurations: each entry pairs default_for_new_repos
+  // (public | private_and_internal | all) with the configuration applied to that visibility.
+  async listCodeSecurityDefaultConfigurations(): Promise<JsonRecord[]> {
+    const { payload } = await this.requestJson(`/orgs/${this.config.organization}/code-security/configurations/defaults`);
+    return extractRecords(payload);
+  }
+
   private async paginate(pathname: string): Promise<JsonRecord[]> {
     const { records } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
     return records;
@@ -2133,15 +2142,6 @@ function featureEnabled(value: unknown): boolean {
     return featureEnabled(record.status) || featureEnabled(record.enabled) || featureEnabled(record.enforcement);
   }
   return false;
-}
-
-function selectPrimaryCodeSecurityConfigurations(configs: JsonRecord[]): JsonRecord[] {
-  const defaults = configs.filter((config) =>
-    asBoolean(config.default_for_new_repos) === true
-    || asBoolean(config.default_for_new_repositories) === true
-    || asBoolean(config.is_default) === true,
-  );
-  return defaults.length > 0 ? defaults : configs;
 }
 
 function buildFrameworkReports(findings: GitHubFinding[]): Record<string, string> {
@@ -2801,12 +2801,14 @@ export async function collectGitHubCodeSecurityData(
     | "getOrganization"
     | "listRepositories"
     | "listCodeSecurityConfigurations"
+    | "listCodeSecurityDefaultConfigurations"
   >,
 ): Promise<GitHubCodeSecurityData> {
   return {
     org: await collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
     repositories: await collectDataset<JsonRecord[]>([], () => client.listRepositories()),
     codeSecurityConfigurations: await collectDataset<JsonRecord[]>([], () => client.listCodeSecurityConfigurations()),
+    codeSecurityDefaults: await collectDataset<JsonRecord[]>([], () => client.listCodeSecurityDefaultConfigurations()),
   };
 }
 
@@ -3769,115 +3771,239 @@ function assessSecurityPolicyPresence(data: GitHubCodeSecurityData): GitHubFindi
   );
 }
 
+type CodeSecurityDefaultStatus = "Pass" | "Partial" | "Fail" | "Manual";
+
+interface CodeSecurityDefaultEvaluation {
+  status: CodeSecurityDefaultStatus;
+  detail: string;
+  evidence: string[];
+}
+
+interface CodeSecurityFeature {
+  label: string;
+  configField: string;
+  orgFlagField?: string;
+}
+
+interface CodeSecurityDefaultEntry {
+  visibility: string;
+  configuration: JsonRecord;
+}
+
+const CODE_SECURITY_DEFAULT_MANUAL_NOTE = "Confirm the default code security configurations in Settings > Code security > Configurations with an organization owner or security manager, or rerun with a principal that holds organization administration read access.";
+
+function isEnforcedConfiguration(configuration: JsonRecord): boolean {
+  const enforcement = asString(configuration.enforcement);
+  return enforcement === "enforced" || enforcement === "enterprise_enforced";
+}
+
+function readCodeSecurityDefaultEntries(defaults: JsonRecord[]): CodeSecurityDefaultEntry[] {
+  return defaults.map((entry) => ({
+    visibility: asString(entry.default_for_new_repos) ?? "unspecified",
+    configuration: asRecord(entry.configuration),
+  }));
+}
+
+function describeDefaultEntry(entry: CodeSecurityDefaultEntry, configField: string): string {
+  const configuration = entry.configuration;
+  return `default_for_new_repos[${entry.visibility}] = ${asString(configuration.name) ?? "unnamed"} (id ${asNumber(configuration.id) ?? "?"}): ${configField} = ${String(configuration[configField] ?? "not returned")}, enforcement = ${asString(configuration.enforcement) ?? "not returned"}`;
+}
+
+function defaultsCoverAllVisibilities(entries: CodeSecurityDefaultEntry[]): boolean {
+  const visibilities = new Set(entries.map((entry) => entry.visibility));
+  return visibilities.has("all") || (visibilities.has("public") && visibilities.has("private_and_internal"));
+}
+
+// The organization-full *_enabled_for_new_repositories flags are deprecated ("use code security
+// configurations instead") and owner-only, so the defaults endpoint is authoritative for what new
+// repositories receive and the flags only corroborate; enforcement is read from the configuration.
+function evaluateCodeSecurityDefault(data: GitHubCodeSecurityData, feature: CodeSecurityFeature): CodeSecurityDefaultEvaluation {
+  const org = data.org.data ? asRecord(data.org.data) : null;
+  const orgFlag = feature.orgFlagField && org ? asBoolean(org[feature.orgFlagField]) : undefined;
+  const flagEvidence = feature.orgFlagField
+    ? `${feature.orgFlagField} = ${orgFlag === undefined ? "not returned (deprecated, owner-only field)" : String(orgFlag)}`
+    : null;
+  const withFlag = (lines: string[]): string[] => (flagEvidence ? [...lines, flagEvidence] : lines);
+  const defaultsDataset = data.codeSecurityDefaults;
+
+  if (defaultsDataset.error) {
+    const evidence = withFlag([`default configurations unreadable: ${defaultsDataset.error}`]);
+    if (orgFlag === true) {
+      return {
+        status: "Partial",
+        detail: `The deprecated organization flag reports ${feature.label} enabled for new repositories, but the default code security configurations are unreadable, so enforcement is unverified.`,
+        evidence,
+      };
+    }
+    if (orgFlag === false) {
+      return { status: "Fail", detail: `The organization flag reports ${feature.label} disabled for new repositories and the default configurations are unreadable.`, evidence };
+    }
+    return { status: "Manual", detail: `The tool could not read the default code security configurations, so ${feature.label} defaults are unverified.`, evidence };
+  }
+
+  const entries = readCodeSecurityDefaultEntries(defaultsDataset.data);
+  if (entries.length === 0) {
+    const evidence = withFlag(["default_configurations = 0"]);
+    if (orgFlag === true) {
+      return {
+        status: "Partial",
+        detail: `The deprecated organization flag reports ${feature.label} enabled, but no default code security configuration applies to new repositories; configurations are the authoritative source, so the default is unverified.`,
+        evidence,
+      };
+    }
+    return { status: "Fail", detail: `No default code security configuration applies to new repositories, so ${feature.label} is not enabled by default.`, evidence };
+  }
+
+  const evidence = withFlag(entries.map((entry) => describeDefaultEntry(entry, feature.configField)));
+  const enabledEntries = entries.filter((entry) => featureEnabled(entry.configuration[feature.configField]));
+  const disabledEntries = entries.filter((entry) => !featureEnabled(entry.configuration[feature.configField]));
+  if (enabledEntries.length === 0) {
+    return { status: "Fail", detail: `The default code security configuration(s) do not enable ${feature.label} for new repositories.`, evidence };
+  }
+  if (disabledEntries.length > 0) {
+    return {
+      status: "Partial",
+      detail: `${feature.label} is enabled by default for ${enabledEntries.map((entry) => entry.visibility).join(", ")} repositories only; the default for ${disabledEntries.map((entry) => entry.visibility).join(", ")} repositories leaves it off.`,
+      evidence,
+    };
+  }
+  if (!defaultsCoverAllVisibilities(entries)) {
+    return {
+      status: "Partial",
+      detail: `${feature.label} is enabled by default for ${entries.map((entry) => entry.visibility).join(", ")} repositories only; no default configuration covers the other visibilities.`,
+      evidence,
+    };
+  }
+  const unenforced = enabledEntries.filter((entry) => !isEnforcedConfiguration(entry.configuration));
+  if (unenforced.length > 0) {
+    return {
+      status: "Partial",
+      detail: `${feature.label} is enabled by default, but the default configuration is ${unenforced.map((entry) => asString(entry.configuration.enforcement) ?? "missing enforcement").join(", ")}, so repository administrators can disable it.`,
+      evidence,
+    };
+  }
+  return {
+    status: "Pass",
+    detail: `${feature.label} is enabled and enforced by default for new ${entries.map((entry) => entry.visibility).join(", ")} repositories.`,
+    evidence,
+  };
+}
+
+function combineDefaultEvaluations(evaluations: CodeSecurityDefaultEvaluation[]): CodeSecurityDefaultStatus {
+  const statuses = new Set(evaluations.map((evaluation) => evaluation.status));
+  if (statuses.size === 1) {
+    return evaluations[0].status;
+  }
+  if (statuses.has("Manual") && !statuses.has("Pass") && !statuses.has("Fail")) {
+    return "Manual";
+  }
+  return "Partial";
+}
+
 export function assessGitHubCodeSecurity(
   data: GitHubCodeSecurityData,
   config: GitHubResolvedConfig,
 ): GitHubAssessmentResult {
-  const org = data.org.data ?? null;
   const configsDataset = data.codeSecurityConfigurations;
   const configs = configsDataset.data;
-  const primaryConfigs = selectPrimaryCodeSecurityConfigurations(configs);
-  // The *_enabled_for_new_repositories flags are documented on organization-full and are only
-  // returned to organization owners; when absent, fall back to the readable default configurations.
-  const resolveDefault = (orgField: string, configField: string): boolean | undefined => {
-    const orgFlag = asBoolean(org && asRecord(org)[orgField]);
-    if (orgFlag !== undefined) return orgFlag;
-    if (configsDataset.error || primaryConfigs.length === 0) return undefined;
-    return primaryConfigs.some((entry) => featureEnabled(asRecord(entry)[configField]));
-  };
-  const secretScanningDefault = resolveDefault("secret_scanning_enabled_for_new_repositories", "secret_scanning");
-  const pushProtectionDefault = resolveDefault("secret_scanning_push_protection_enabled_for_new_repositories", "secret_scanning_push_protection");
-  const dependabotDefault = resolveDefault("dependabot_alerts_enabled_for_new_repositories", "dependabot_alerts");
-  const dependabotUpdatesDefault = resolveDefault("dependabot_security_updates_enabled_for_new_repositories", "dependabot_security_updates");
-  const codeScanningDefault = configsDataset.error
-    ? undefined
-    : primaryConfigs.some((entry) => featureEnabled(asRecord(entry).code_scanning_default_setup));
+  const defaultsDataset = data.codeSecurityDefaults;
+  const defaultEntries = defaultsDataset.error ? [] : readCodeSecurityDefaultEntries(defaultsDataset.data);
+  const secretScanning = evaluateCodeSecurityDefault(data, {
+    label: "secret scanning",
+    configField: "secret_scanning",
+    orgFlagField: "secret_scanning_enabled_for_new_repositories",
+  });
+  const pushProtection = evaluateCodeSecurityDefault(data, {
+    label: "secret scanning push protection",
+    configField: "secret_scanning_push_protection",
+    orgFlagField: "secret_scanning_push_protection_enabled_for_new_repositories",
+  });
+  const dependabotAlerts = evaluateCodeSecurityDefault(data, {
+    label: "Dependabot alerts",
+    configField: "dependabot_alerts",
+    orgFlagField: "dependabot_alerts_enabled_for_new_repositories",
+  });
+  const dependabotUpdates = evaluateCodeSecurityDefault(data, {
+    label: "Dependabot security updates",
+    configField: "dependabot_security_updates",
+    orgFlagField: "dependabot_security_updates_enabled_for_new_repositories",
+  });
+  const codeScanning = evaluateCodeSecurityDefault(data, {
+    label: "code scanning default setup",
+    configField: "code_scanning_default_setup",
+  });
+  const dependabotStatus = combineDefaultEvaluations([dependabotAlerts, dependabotUpdates]);
   const unreadableSources = [
     data.org.error ? `organization profile unreadable: ${data.org.error}` : null,
     configsDataset.error ? `code security configurations unreadable: ${configsDataset.error}` : null,
   ].filter((entry): entry is string => entry !== null);
-  const manualNote = "Confirm the code security defaults in Settings > Code security with an organization owner, or rerun with an owner token or an App that holds organization administration read access.";
+  const manualIf = (status: CodeSecurityDefaultStatus): string | undefined =>
+    (status === "Manual" ? CODE_SECURITY_DEFAULT_MANUAL_NOTE : undefined);
+  const configurationsStatus: GitHubFindingStatus = configsDataset.error
+    ? "Manual"
+    : (configs.length === 0
+      ? "Fail"
+      : (!defaultsDataset.error && defaultEntries.length === 0 ? "Partial" : "Pass"));
+  const defaultsEvidence = defaultsDataset.error
+    ? `default configurations unreadable: ${defaultsDataset.error}`
+    : `default_configurations = ${defaultEntries.length}${defaultEntries.length > 0 ? ` (${defaultEntries.map((entry) => `${entry.visibility}: ${asString(entry.configuration.name) ?? "unnamed"}, enforcement ${asString(entry.configuration.enforcement) ?? "not returned"}`).join("; ")})` : ""}`;
 
   const findings: GitHubFinding[] = [
     buildFinding(
       "GITHUB-CODE-001",
-      configsDataset.error ? "Manual" : (configs.length > 0 ? "Pass" : "Fail"),
+      configurationsStatus,
       configsDataset.error
         ? "The tool could not read organization code security configurations, so the control is unverified."
-        : (configs.length > 0
-          ? `${configs.length} code security configuration(s) were found at the organization layer.`
-          : "No organization-level code security configurations exist. An empty configuration list is a fail for this control because new repositories inherit no security baseline."),
+        : (configs.length === 0
+          ? "No organization-level code security configurations exist. An empty configuration list is a fail for this control because new repositories inherit no security baseline."
+          : (configurationsStatus === "Partial"
+            ? `${configs.length} code security configuration(s) exist, but none is applied to new repositories by default, so they act as pilots rather than an organization baseline.`
+            : `${configs.length} code security configuration(s) were found at the organization layer and ${defaultEntries.length} default assignment(s) apply them to new repositories.`)),
       [
         configsDataset.error ? `code security configurations unreadable: ${configsDataset.error}` : `code_security_configurations = ${configs.length}`,
-        `primary_configurations = ${primaryConfigs.length}`,
+        defaultsEvidence,
+        ...(configs.length > 0 ? configs.slice(0, 10).map((entry) => `configuration ${asString(entry.name) ?? "unnamed"} (id ${asNumber(entry.id) ?? "?"}): target_type ${asString(entry.target_type) ?? "?"}, enforcement ${asString(entry.enforcement) ?? "not returned"}`) : []),
       ],
-      "Define code security configurations so repository defaults are managed centrally instead of relying only on ad hoc per-repo toggles.",
-      configsDataset.error ? manualNote : undefined,
+      "Define code security configurations and set them as the default for new public and private repositories so the baseline is applied centrally instead of relying on ad hoc per-repo toggles.",
+      configsDataset.error ? CODE_SECURITY_DEFAULT_MANUAL_NOTE : undefined,
     ),
     buildFinding(
       "GITHUB-CODE-002",
-      secretScanningDefault === true ? "Pass" : (secretScanningDefault === false ? "Fail" : "Manual"),
-      secretScanningDefault === true
-        ? "Secret scanning defaults are enabled for new repositories."
-        : (secretScanningDefault === false
-          ? "Secret scanning defaults are not enabled for new repositories."
-          : "The tool could not confirm secret-scanning defaults."),
-      [
-        `secret_scanning_default = ${String(secretScanningDefault)}`,
-        ...unreadableSources,
-      ],
-      "Enable secret scanning by default for new repositories and align repo enrollment with an org security configuration when available.",
-      secretScanningDefault === undefined ? manualNote : undefined,
+      secretScanning.status,
+      secretScanning.detail,
+      [...secretScanning.evidence, ...unreadableSources],
+      "Enable secret scanning in the default code security configurations for every repository visibility and set the configuration to enforced.",
+      manualIf(secretScanning.status),
     ),
     buildFinding(
       "GITHUB-CODE-003",
-      pushProtectionDefault === true ? "Pass" : (pushProtectionDefault === false ? "Fail" : "Manual"),
-      pushProtectionDefault === true
-        ? "Secret scanning push protection defaults are enabled."
-        : (pushProtectionDefault === false
-          ? "Secret scanning push protection defaults are not enabled."
-          : "The tool could not confirm push-protection defaults."),
-      [
-        `push_protection_default = ${String(pushProtectionDefault)}`,
-        ...unreadableSources,
-      ],
-      "Enable push protection so secret exposures are blocked before they land in the repository history.",
-      pushProtectionDefault === undefined ? manualNote : undefined,
+      pushProtection.status,
+      pushProtection.detail,
+      [...pushProtection.evidence, ...unreadableSources],
+      "Enable push protection in the enforced default configurations so secret exposures are blocked before they land in the repository history.",
+      manualIf(pushProtection.status),
     ),
     buildFinding(
       "GITHUB-CODE-004",
-      dependabotDefault === undefined && dependabotUpdatesDefault === undefined
-        ? "Manual"
-        : (dependabotDefault === true && dependabotUpdatesDefault === true
-          ? "Pass"
-          : ((dependabotDefault === true || dependabotUpdatesDefault === true) ? "Partial" : "Fail")),
-      dependabotDefault === undefined && dependabotUpdatesDefault === undefined
-        ? "The tool could not confirm Dependabot defaults."
-        : (dependabotDefault === true && dependabotUpdatesDefault === true
-          ? "Dependabot alerts and security updates are enabled by default."
-          : `Dependabot defaults are incomplete (alerts=${String(dependabotDefault)}, security_updates=${String(dependabotUpdatesDefault)}).`),
+      dependabotStatus,
+      dependabotStatus === "Pass"
+        ? "Dependabot alerts and security updates are enabled and enforced by default for new repositories."
+        : `Dependabot defaults are incomplete: alerts ${dependabotAlerts.status} (${dependabotAlerts.detail}) security updates ${dependabotUpdates.status} (${dependabotUpdates.detail})`,
       [
-        `dependabot_alerts_default = ${String(dependabotDefault)}`,
-        `dependabot_security_updates_default = ${String(dependabotUpdatesDefault)}`,
+        ...dependabotAlerts.evidence,
+        ...dependabotUpdates.evidence.filter((line) => !dependabotAlerts.evidence.includes(line)),
         ...unreadableSources,
       ],
-      "Enable both Dependabot alerts and security updates so vulnerable dependencies are surfaced and can be remediated quickly.",
-      dependabotDefault === undefined && dependabotUpdatesDefault === undefined ? manualNote : undefined,
+      "Enable both Dependabot alerts and security updates in the enforced default configurations so vulnerable dependencies are surfaced and remediated.",
+      manualIf(dependabotStatus),
     ),
     buildFinding(
       "GITHUB-CODE-005",
-      codeScanningDefault === undefined ? "Manual" : (codeScanningDefault ? "Pass" : "Partial"),
-      codeScanningDefault === undefined
-        ? "The tool could not read organization code security configurations, so code scanning default setup is unverified."
-        : (codeScanningDefault
-          ? "Code scanning default setup is enabled through an organization configuration."
-          : "The tool did not find code scanning default setup enabled in the available org security configurations."),
-      [
-        `code_scanning_default_setup = ${String(codeScanningDefault)}`,
-        ...unreadableSources,
-      ],
-      "Enable code scanning default setup where supported so repositories inherit baseline static-analysis coverage.",
-      codeScanningDefault === undefined ? manualNote : undefined,
+      codeScanning.status,
+      codeScanning.detail,
+      [...codeScanning.evidence, ...unreadableSources],
+      "Enable code scanning default setup in the enforced default configurations so repositories inherit baseline static-analysis coverage.",
+      manualIf(codeScanning.status),
     ),
     assessSecurityPolicyPresence(data),
   ];
@@ -3887,12 +4013,13 @@ export function assessGitHubCodeSecurity(
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      code_security_configurations: configs.length,
+      code_security_configurations: configsDataset.error ? "error" : configs.length,
+      default_configurations: defaultsDataset.error ? "error" : defaultEntries.length,
       repositories: datasetSnapshotCount(data.repositories),
-      secret_scanning_default: String(secretScanningDefault),
-      push_protection_default: String(pushProtectionDefault),
-      dependabot_default: `${String(dependabotDefault)}/${String(dependabotUpdatesDefault)}`,
-      code_scanning_default_setup: String(codeScanningDefault),
+      secret_scanning_default: secretScanning.status,
+      push_protection_default: pushProtection.status,
+      dependabot_default: `${dependabotAlerts.status}/${dependabotUpdates.status}`,
+      code_scanning_default_setup: codeScanning.status,
     },
     text: buildAssessmentText("GitHub code security assessment", config.organization, findings),
   };
@@ -3925,6 +4052,7 @@ export async function exportGitHubAuditBundle(
     | "listRunnerGroups"
     | "listRunners"
     | "listCodeSecurityConfigurations"
+    | "listCodeSecurityDefaultConfigurations"
     | "listRepoHooks"
     | "listDeployKeys"
   >,

@@ -315,7 +315,29 @@ function createIntegrationsData(overrides = {}) {
   };
 }
 
-function createCodeSecurityData() {
+function createCodeSecurityConfiguration(overrides = {}) {
+  return {
+    id: 1,
+    name: "Default security baseline",
+    target_type: "organization",
+    description: "Baseline applied to new repositories",
+    enforcement: "enforced",
+    advanced_security: "enabled",
+    dependency_graph: "enabled",
+    dependabot_alerts: "enabled",
+    dependabot_security_updates: "enabled",
+    code_scanning_default_setup: "enabled",
+    secret_scanning: "enabled",
+    secret_scanning_push_protection: "enabled",
+    ...overrides,
+  };
+}
+
+function createCodeSecurityData(overrides = {}) {
+  const configuration = createCodeSecurityConfiguration({
+    secret_scanning_push_protection: "disabled",
+    dependabot_security_updates: "disabled",
+  });
   return {
     org: dataset({
       login: "example-org",
@@ -325,18 +347,9 @@ function createCodeSecurityData() {
       dependabot_security_updates_enabled_for_new_repositories: false,
     }),
     repositories: dataset([{ id: 1 }, { id: 2 }]),
-    codeSecurityConfigurations: dataset([
-      {
-        id: 1,
-        name: "Default security baseline",
-        default_for_new_repos: true,
-        secret_scanning: "enabled",
-        secret_scanning_push_protection: "disabled",
-        dependabot_alerts: "enabled",
-        dependabot_security_updates: "disabled",
-        code_scanning_default_setup: "enabled",
-      },
-    ]),
+    codeSecurityConfigurations: dataset([configuration]),
+    codeSecurityDefaults: dataset([{ default_for_new_repos: "all", configuration }]),
+    ...overrides,
   };
 }
 
@@ -1304,6 +1317,9 @@ test("exportGitHubAuditBundle writes evidence and respects secure output roots",
       async listCodeSecurityConfigurations() {
         return createCodeSecurityData().codeSecurityConfigurations.data;
       },
+      async listCodeSecurityDefaultConfigurations() {
+        return createCodeSecurityData().codeSecurityDefaults.data;
+      },
       async listRepoHooks(_owner, repo) {
         return createIntegrationsData().repoHooks.data[`example-org/${repo}`]?.items ?? [];
       },
@@ -1453,21 +1469,12 @@ function createCompliantClient() {
       return [{ id: 1, name: "prod", visibility: "selected", allows_public_repositories: false, restricted_to_workflows: true }];
     },
     async listRunners() { return [{ id: 1, name: "runner-1", status: "online" }]; },
-    async listCodeSecurityConfigurations() {
-      return [{
-        id: 1,
-        name: "Default security baseline",
-        target_type: "organization",
-        enforcement: "enforced",
-        default_for_new_repos: true,
-        advanced_security: "enabled",
-        dependency_graph: "enabled",
-        dependabot_alerts: "enabled",
-        dependabot_security_updates: "enabled",
-        code_scanning_default_setup: "enabled",
-        secret_scanning: "enabled",
-        secret_scanning_push_protection: "enabled",
-      }];
+    async listCodeSecurityConfigurations() { return [createCodeSecurityConfiguration()]; },
+    async listCodeSecurityDefaultConfigurations() {
+      return [
+        { default_for_new_repos: "public", configuration: createCodeSecurityConfiguration() },
+        { default_for_new_repos: "private_and_internal", configuration: createCodeSecurityConfiguration({ id: 2, name: "Private baseline" }) },
+      ];
     },
     async listRepoHooks() { return [{ id: 5, config: { url: "https://ci.example.test/hook", insecure_ssl: "0", secret: "********" } }]; },
     async listDeployKeys() { return [{ id: 1, title: "reader", read_only: true, created_at: "2026-06-01T00:00:00Z", last_used: "2026-09-01T00:00:00Z" }]; },
@@ -1499,6 +1506,7 @@ function createEmptyClient() {
     async listRunnerGroups() { return []; },
     async listRunners() { return []; },
     async listCodeSecurityConfigurations() { return []; },
+    async listCodeSecurityDefaultConfigurations() { return []; },
     async listRepoHooks() { return []; },
     async listDeployKeys() { return []; },
   };
@@ -1542,6 +1550,7 @@ function createPartialClient() {
     },
     async listRunners() { throw new ForbiddenError(); },
     async listCodeSecurityConfigurations() { throw new ForbiddenError(); },
+    async listCodeSecurityDefaultConfigurations() { throw new ForbiddenError(); },
     async listRepoHooks(_owner, repo) {
       if (repo === "app-two") throw new ForbiddenError();
       return base.listRepoHooks();
@@ -1574,14 +1583,13 @@ function passingIds(findings) {
   return findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id).sort();
 }
 
+// CODE-002 to CODE-005 are configuration-driven (default code security configurations), not
+// setting-driven: the deprecated organization flags alone never carry a pass.
 const SETTING_DRIVEN_IDS = [
   "GITHUB-ACT-001",
   "GITHUB-ACT-002",
   "GITHUB-ACT-003",
   "GITHUB-ACT-005",
-  "GITHUB-CODE-002",
-  "GITHUB-CODE-003",
-  "GITHUB-CODE-004",
   "GITHUB-ORG-002",
   "GITHUB-ORG-009",
   "GITHUB-ORG-010",
@@ -1616,6 +1624,11 @@ test("self-check (b): empty inventories pass only where the control intent makes
   assert.equal(byId["GITHUB-INTEG-002"].status, "Partial");
   assert.equal(byId["GITHUB-CODE-001"].status, "Fail");
   assert.match(byId["GITHUB-CODE-001"].summary, /empty configuration list is a fail/);
+  for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004"]) {
+    assert.equal(byId[id].status, "Partial", `${id} must not pass when no default configuration exists even though the deprecated flag is true`);
+    assert.match(byId[id].summary, /no default code security configuration applies/);
+  }
+  assert.equal(byId["GITHUB-CODE-005"].status, "Fail");
   assert.equal(byId["GITHUB-ORG-004"].status, "Manual");
   assert.equal(byId["GITHUB-ORG-005"].status, "Info");
   assert.equal(byId["GITHUB-ORG-006"].status, "Fail");
@@ -1642,6 +1655,10 @@ test("self-check (c): partial inventories never pass an inventory-driven control
   }
   assert.equal(byId["GITHUB-ACT-004"].status, "Manual");
   assert.equal(byId["GITHUB-CODE-001"].status, "Manual");
+  for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004"]) {
+    assert.equal(byId[id].status, "Partial", `${id} must not pass on the deprecated flag while the default configurations are unreadable`);
+    assert.match(byId[id].summary, /enforcement is unverified/);
+  }
   assert.equal(byId["GITHUB-CODE-005"].status, "Manual");
   assert.equal(byId["GITHUB-INTEG-001"].status, "Partial");
   assert.equal(byId["GITHUB-INTEG-002"].status, "Partial");
@@ -1664,6 +1681,112 @@ test("self-check (d): a compliant tenant built from documented fields passes eve
   assert.match(byId["GITHUB-INTEG-005"].evidence.join("\n"), /\/orgs\/\{org\}\/packages\?package_type=/);
   for (const id of ["GITHUB-CODE-006", "GITHUB-INTEG-004", "GITHUB-INTEG-005", "GITHUB-ORG-011"]) {
     assert.ok(byId[id].manualNote, `${id} must tell the reviewer what evidence to collect`);
+  }
+});
+
+function codeSecurityById(data) {
+  const result = assessGitHubCodeSecurity(data, SELF_CHECK_CONFIG);
+  return Object.fromEntries(result.findings.map((finding) => [finding.id, finding]));
+}
+
+test("self-check (e): unenforced pilot configurations never pass the code security default controls", () => {
+  // A pilot: the configuration exists and enables everything, but it is not a default for any visibility.
+  const pilot = createCodeSecurityConfiguration({ enforcement: "unenforced", name: "Pilot" });
+  const pilotOnly = codeSecurityById({
+    org: dataset({ login: "example-org" }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([pilot]),
+    codeSecurityDefaults: dataset([]),
+  });
+  assert.equal(pilotOnly["GITHUB-CODE-001"].status, "Partial");
+  assert.match(pilotOnly["GITHUB-CODE-001"].summary, /none is applied to new repositories by default/);
+  for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004", "GITHUB-CODE-005"]) {
+    assert.equal(pilotOnly[id].status, "Fail", `${id} must fail when no default configuration exists`);
+    assert.match(pilotOnly[id].evidence.join("\n"), /default_configurations = 0/);
+  }
+
+  // A default that repository administrators can switch off: enabled but unenforced.
+  const unenforcedDefault = codeSecurityById({
+    org: dataset({ login: "example-org" }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([pilot]),
+    codeSecurityDefaults: dataset([{ default_for_new_repos: "all", configuration: pilot }]),
+  });
+  for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004", "GITHUB-CODE-005"]) {
+    assert.equal(unenforcedDefault[id].status, "Partial", `${id} must not pass on an unenforced default`);
+    assert.match(unenforcedDefault[id].evidence.join("\n"), /enforcement = unenforced/);
+  }
+  assert.match(unenforcedDefault["GITHUB-CODE-002"].summary, /repository administrators can disable it/);
+  assert.equal(unenforcedDefault["GITHUB-CODE-001"].status, "Pass");
+
+  // The deprecated owner flags alone never carry a pass when the defaults contradict or are unreadable.
+  const flagsOnly = codeSecurityById({
+    org: dataset({
+      login: "example-org",
+      secret_scanning_enabled_for_new_repositories: true,
+      secret_scanning_push_protection_enabled_for_new_repositories: true,
+      dependabot_alerts_enabled_for_new_repositories: true,
+      dependabot_security_updates_enabled_for_new_repositories: true,
+    }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([], "HTTP 403"),
+    codeSecurityDefaults: dataset([], "HTTP 403"),
+  });
+  for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004"]) {
+    assert.equal(flagsOnly[id].status, "Partial", `${id} must not pass on the deprecated flag alone`);
+  }
+  assert.equal(flagsOnly["GITHUB-CODE-005"].status, "Manual");
+  assert.equal(flagsOnly["GITHUB-CODE-001"].status, "Manual");
+
+  // Coverage gaps: an enforced default for public repositories only, and a private default that disables a feature.
+  const publicOnly = codeSecurityById({
+    org: dataset({ login: "example-org" }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([createCodeSecurityConfiguration()]),
+    codeSecurityDefaults: dataset([{ default_for_new_repos: "public", configuration: createCodeSecurityConfiguration() }]),
+  });
+  assert.equal(publicOnly["GITHUB-CODE-002"].status, "Partial");
+  assert.match(publicOnly["GITHUB-CODE-002"].summary, /public repositories only/);
+  const privateDisabled = codeSecurityById({
+    org: dataset({ login: "example-org" }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([createCodeSecurityConfiguration()]),
+    codeSecurityDefaults: dataset([
+      { default_for_new_repos: "public", configuration: createCodeSecurityConfiguration() },
+      { default_for_new_repos: "private_and_internal", configuration: createCodeSecurityConfiguration({ id: 2, secret_scanning_push_protection: "disabled" }) },
+    ]),
+  });
+  assert.equal(privateDisabled["GITHUB-CODE-003"].status, "Partial");
+  assert.match(privateDisabled["GITHUB-CODE-003"].summary, /enabled by default for public repositories only/);
+  assert.equal(privateDisabled["GITHUB-CODE-002"].status, "Pass");
+});
+
+test("self-check (f): enforced defaults for every visibility pass without the deprecated owner flags", () => {
+  const enforced = codeSecurityById({
+    org: dataset({ login: "example-org" }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([createCodeSecurityConfiguration(), createCodeSecurityConfiguration({ id: 3, name: "Pilot", enforcement: "unenforced" })]),
+    codeSecurityDefaults: dataset([{ default_for_new_repos: "all", configuration: createCodeSecurityConfiguration({ enforcement: "enterprise_enforced" }) }]),
+  });
+  for (const id of ["GITHUB-CODE-001", "GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004", "GITHUB-CODE-005"]) {
+    assert.equal(enforced[id].status, "Pass", `${id} should pass on an enterprise_enforced default covering all visibilities`);
+  }
+  assert.match(enforced["GITHUB-CODE-002"].summary, /enabled and enforced by default for new all repositories/);
+  assert.match(enforced["GITHUB-CODE-002"].evidence.join("\n"), /secret_scanning_enabled_for_new_repositories = not returned \(deprecated, owner-only field\)/);
+  assert.match(enforced["GITHUB-CODE-002"].evidence.join("\n"), /default_for_new_repos\[all\] = Default security baseline \(id 1\): secret_scanning = enabled, enforcement = enterprise_enforced/);
+  assert.match(enforced["GITHUB-CODE-001"].summary, /1 default assignment\(s\)/);
+
+  const split = codeSecurityById({
+    org: dataset({ login: "example-org" }),
+    repositories: dataset([{ id: 1 }]),
+    codeSecurityConfigurations: dataset([createCodeSecurityConfiguration()]),
+    codeSecurityDefaults: dataset([
+      { default_for_new_repos: "public", configuration: createCodeSecurityConfiguration() },
+      { default_for_new_repos: "private_and_internal", configuration: createCodeSecurityConfiguration({ id: 2, name: "Private baseline" }) },
+    ]),
+  });
+  for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004", "GITHUB-CODE-005"]) {
+    assert.equal(split[id].status, "Pass", `${id} should pass when public and private_and_internal defaults are both enforced`);
   }
 });
 
