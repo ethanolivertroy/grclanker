@@ -69,7 +69,7 @@ Every finding is `{ id, title, severity, status, summary, evidence, mappings }` 
 | 19 | Scan completion rate | scan_coverage | VERACODE-19 | latest scans in `ANALYSIS_ERRORS`, `SCAN_CANCELED`, `PRE_SCAN_FAILED`, `INCOMPLETE`, or similar statuses fail; applications without scan records warn |
 | 20 | Collections compliance posture | policy_compliance | VERACODE-20 | manual: the Collections API is not in the published REST reference; business-unit grouping is provided as evidence |
 
-Verdict safety rules apply to every control: forbidden or errored endpoints yield `manual` with the cause, empty inventories never pass, items missing dates never count as fresh, pagination runs to `page.total_pages` or the verdict is downgraded, and any sampled or team-scoped partial view downgrades `pass` to `warn` with seen and total counts.
+Verdict safety rules apply to every control: forbidden or errored endpoints yield `manual` with the cause, empty inventories never pass, items missing dates never count as fresh, pagination runs to `page.total_pages` or the verdict is downgraded (a page-cap exit without page metadata, a repeated page, or a truncated findings, scans, roles, or library list reports `complete: false` and the summary states seen versus total or "total unknown"), and any sampled or team-scoped partial view downgrades `pass` to `warn` with seen and total counts. Bundle JSON has credential-named fields, JWT-shaped values, and URL userinfo or query strings replaced by `[REDACTED]`, and dynamic scan configurations are projected to their non-secret settings.
 
 ## Framework mappings
 

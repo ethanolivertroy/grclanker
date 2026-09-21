@@ -24,7 +24,7 @@ The assessors follow these rules so a verdict never rests on missing or partial 
 4. Items missing a date (`lastLogin`, `created`, `expiresAt`, `lastUpdated`) are never counted fresh; they cap the finding at `Partial`.
 5. Partial inventories (a truncated user listing, capped factor or group expansion, failed per-item lookups) cap the finding at `Partial` and list the gap in evidence.
 6. Every status flag the verdict depends on is read: policy, rule, authenticator, app, user, zone, log stream, event hook, behavior, and factor status.
-7. Pagination follows the `Link: rel="next"` header to completion; the user listing stops after 50 pages (10,000 users) and records the truncation.
+7. Pagination follows the `Link: rel="next"` header to completion within a 50-page cap per list (5 pages for the bounded System Log sample); a walk that hits its cap, sees a repeated cursor, or gets an empty page with a next link is recorded as truncated and every finding that reads it caps at `Partial` with a total-unknown statement. `core_data/` records have credential fields (client secrets, passwords, hook header values, tokens) replaced by `[REDACTED]`, event hook URIs reduced to scheme and host, and System Log events projected to identity and outcome fields.
 8. Re-running the export never overwrites a prior bundle; the zip name is derived from the newly allocated directory.
 
 ## Setup and authentication

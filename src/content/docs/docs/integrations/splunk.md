@@ -89,7 +89,7 @@ Each assessment returns findings shaped as `{ id, control, title, severity, stat
 `splunk_export_audit_bundle` allocates a fresh directory under `output_dir` (`<host>-splunk-audit-<timestamp>`, with a numeric suffix if that directory or its zip already exists, so a rerun never overwrites a prior bundle) and writes:
 
 - `metadata.json` with the target URL, ACS state, configuration source chain, and TLS verification flag
-- `core_data/` raw REST and ACS snapshots as JSON (tokens and session keys redacted) plus `access_check.json`
+- `core_data/` REST and ACS snapshots as JSON with every credential-named field, `$1$` or `$7$` ciphertext, URL userinfo and query string replaced by `[REDACTED]`, saved searches projected to scheduling and action fields, plus `access_check.json`; page-capped or cursor-stalled listings are marked truncated and demote the findings that read them
 - `analysis/findings.json`, one JSON file per assessment area, and `analysis/summary.md`
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci.md`, `stig.md`, `irap.md`, `ismap.md`)
 - `QUICK_REFERENCE.md`
