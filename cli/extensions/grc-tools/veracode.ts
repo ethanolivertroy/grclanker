@@ -31,6 +31,7 @@ const DEFAULT_MAX_PAGES = 50;
 const DEFAULT_MAX_APPLICATIONS = 100;
 const DEFAULT_MAX_WORKSPACES = 25;
 const DEFAULT_MAX_ANALYSES = 25;
+const MAX_DYNAMIC_SCANS_PER_ANALYSIS = 10;
 const DEFAULT_MAX_SCAN_AGE_DAYS = 90;
 const DEFAULT_CRITICAL_SCAN_INTERVAL_DAYS = 7;
 const DEFAULT_STANDARD_SCAN_INTERVAL_DAYS = 31;
@@ -137,6 +138,8 @@ export interface VeracodeAccessSurface {
   endpoint: string;
   status: "readable" | "not_readable";
   count?: number;
+  /** Set when the probe's single page carried no vendor total, so `count` is the first page only. */
+  countNote?: string;
   statusCode?: number;
   error?: string;
   requiredRole: string;
@@ -528,6 +531,19 @@ function redactSecret(text: string, secret: string): string {
   return secret.length > 0 ? text.split(secret).join("[REDACTED]") : text;
 }
 
+/** Keeps only the vendor's message fields from an error body; a non-JSON body is described by size, never quoted. */
+function errorDetailFrom(rawText: string): string {
+  if (rawText.length === 0) return "";
+  try {
+    const payload = asObject(JSON.parse(rawText)) ?? {};
+    const embeddedErrors = asRecords(asObject(payload._embedded)?.errors).map((item) => asString(item.detail) ?? asString(item.message)).filter((item): item is string => Boolean(item));
+    const message = [asString(payload.message), asString(payload.error_description), asString(payload.error), ...embeddedErrors].filter((item): item is string => Boolean(item)).join("; ");
+    return message.length > 0 ? message.replace(/\s+/g, " ").slice(0, 240) : `JSON response body (${rawText.length} bytes) carried no message field`;
+  } catch {
+    return `non-JSON response body (${rawText.length} bytes, not recorded)`;
+  }
+}
+
 function extractEmbedded(payload: JsonRecord, embeddedKey: string): JsonRecord[] {
   const embedded = payload._embedded;
   if (Array.isArray(embedded)) return asRecords(embedded);
@@ -606,7 +622,7 @@ export class VeracodeApiClient {
           await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        const detail = redactSecret(rawText.replace(/\s+/g, " ").slice(0, 240), this.config.apiKeySecret);
+        const detail = redactSecret(errorDetailFrom(rawText), this.config.apiKeySecret);
         throw new VeracodeApiError(
           `Veracode request failed (${response.status} ${response.statusText}) for ${url.pathname}${detail ? `: ${detail}` : ""}`,
           response.status,
@@ -638,19 +654,31 @@ export class VeracodeApiClient {
     let pagesFetched = 0;
     let totalPages: number | undefined;
     let totalElements: number | undefined;
+    let exhausted = false;
+    let previousPage: string | undefined;
 
     for (let page = 0; page < maxPages; page += 1) {
       const payload = await this.get(path, { ...query, page, size: pageSize });
       pagesFetched += 1;
       const pageItems = extractEmbedded(payload, embeddedKey);
+      const pageKey = JSON.stringify(pageItems.map((item) => item.guid ?? item.id ?? item.user_id ?? item.team_id ?? item.issue_id ?? item.scan_id ?? item));
+      if (pageItems.length > 0 && pageKey === previousPage) {
+        // The server ignored the page parameter, so the walk can never advance; report it as truncated.
+        return { items, pagesFetched, totalPages, totalElements, complete: false, notes: [`${path} returned the same page twice, so pagination stopped after ${items.length} items.`] };
+      }
+      previousPage = pageKey;
       items.push(...pageItems);
       const metadata = readPageMetadata(payload);
       totalPages = metadata.totalPages ?? totalPages;
       totalElements = metadata.totalElements ?? totalElements;
-      if (totalPages !== undefined ? page + 1 >= totalPages : pageItems.length < pageSize) break;
+      if (totalPages !== undefined ? page + 1 >= totalPages : pageItems.length < pageSize) {
+        exhausted = true;
+        break;
+      }
     }
 
-    const complete = totalPages === undefined ? true : pagesFetched >= totalPages;
+    // A page-cap exit without page metadata leaves the total unknown, so the partial-inventory note prints "an unknown total".
+    const complete = exhausted || (totalPages !== undefined && pagesFetched >= totalPages);
     return { items, pagesFetched, totalPages, totalElements, complete: complete && (totalElements === undefined || items.length >= totalElements) };
   }
 
@@ -1214,6 +1242,28 @@ async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSna
   return { finding: finding(10, "medium", status, joinNotes(`All ${withSandboxes} sampled applications with readable sandbox lists use at least one development sandbox.`, ...caveats, unreadable.length > 0 ? `${unreadable.length} sandbox lists were unreadable.` : undefined), evidence), raw, errors };
 }
 
+/**
+ * Rule 9 projection of GET /was/configservice/v1/scans/{id}/configuration:
+ * the verdict reads only the authentication types and crawl.disabled, while
+ * auth_configuration.authentications carries usernames, passwords, login
+ * script bodies, and client certificates verbatim, so only the keys are kept.
+ */
+function projectDynamicScanConfiguration(analysisId: string, scanId: string, configuration: JsonRecord): JsonRecord {
+  const authentications = asObject(asObject(configuration.auth_configuration)?.authentications) ?? {};
+  const crawl = asObject(configuration.crawl_configuration);
+  const allowedHosts = asRecords(asObject(configuration.scan_setting)?.allowed_hosts ?? configuration.allowed_hosts);
+  return {
+    analysis_id: analysisId,
+    scan_id: scanId,
+    target_url: asString(asObject(configuration.target_url)?.url) ?? asString(configuration.target_url) ?? null,
+    authentication_types: Object.keys(authentications),
+    authentication_details: Object.keys(authentications).length > 0 ? "[REDACTED]" : null,
+    crawl_disabled: asBoolean(crawl?.disabled) ?? null,
+    crawl_script_present: Boolean(asObject(crawl?.crawl_script_data)),
+    allowed_host_count: allowedHosts.length,
+  };
+}
+
 async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses: number): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
   const analyses = await surface(() => client.listDynamicAnalyses());
   const manualEvidence = ["Export each Dynamic Analysis configuration (authentication, allowed hosts, crawl settings) from the Platform."];
@@ -1231,35 +1281,43 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
   const unauthenticated: string[] = [];
   const crawlDisabled: string[] = [];
   const unreadable: string[] = [];
+  const scanCaveats: string[] = [];
+  const scanCoverage: JsonRecord[] = [];
   let configured = 0;
   const rawScans: JsonRecord[] = [];
   for (const analysis of sampled) {
     const analysisId = asString(analysis.analysis_id) ?? "";
+    const analysisLabel = asString(analysis.name) ?? analysisId;
     const scans = await surface(() => client.listDynamicAnalysisScans(analysisId));
     errors.push(...surfaceErrors(`dynamic scans ${analysisId}`, scans));
     if (scans.status === "error") {
-      unreadable.push(asString(analysis.name) ?? analysisId);
+      unreadable.push(analysisLabel);
       continue;
     }
-    for (const scan of scans.value.items.slice(0, 10)) {
+    const inspected = scans.value.items.slice(0, MAX_DYNAMIC_SCANS_PER_ANALYSIS);
+    const scanListNote = partialInventoryNote(scans.value, `scans of ${analysisLabel}`);
+    const scanSampleNote = scopeNote(inspected.length, scans.value.items.length, `scans of ${analysisLabel}`);
+    scanCaveats.push(...[scanListNote, scanSampleNote].filter((note): note is string => Boolean(note)));
+    scanCoverage.push({ analysis_id: analysisId, scans_inspected: inspected.length, scans_seen: scans.value.items.length, scans_total: scans.value.totalElements ?? null, scan_list_complete: scans.value.complete });
+    for (const scan of inspected) {
       const scanId = asString(scan.scan_id) ?? "";
       const configuration = await surface(() => client.getDynamicScanConfiguration(scanId));
       errors.push(...surfaceErrors(`dynamic scan configuration ${scanId}`, configuration));
-      const label = `${asString(analysis.name) ?? analysisId}:${asString(scan.target_url) ?? scanId}`;
+      const label = `${analysisLabel}:${asString(scan.target_url) ?? scanId}`;
       if (configuration.status === "error") {
         unreadable.push(label);
         continue;
       }
-      rawScans.push({ analysis_id: analysisId, scan_id: scanId, configuration: configuration.value });
       const authentications = asObject(asObject(configuration.value.auth_configuration)?.authentications);
       const crawl = asObject(configuration.value.crawl_configuration);
+      rawScans.push(projectDynamicScanConfiguration(analysisId, scanId, configuration.value));
       if (!authentications || Object.keys(authentications).length === 0) unauthenticated.push(label);
       else if (asBoolean(crawl?.disabled) === true) crawlDisabled.push(label);
       else configured += 1;
     }
   }
-  const caveats = [partialInventoryNote(analyses.value, "analyses"), scopeNote(sampled.length, analyses.value.items.length, "analyses"), unreadable.length > 0 ? `${unreadable.length} scan configurations were unreadable.` : undefined];
-  const evidence = { analyses_seen: analyses.value.items.length, analyses_sampled: sampled.length, configured_scans: configured, unauthenticated_scans: unauthenticated.slice(0, 50), crawl_disabled_scans: crawlDisabled.slice(0, 50), unreadable: unreadable.slice(0, 50) };
+  const caveats = [partialInventoryNote(analyses.value, "analyses"), scopeNote(sampled.length, analyses.value.items.length, "analyses"), ...scanCaveats, unreadable.length > 0 ? `${unreadable.length} scan configurations were unreadable.` : undefined];
+  const evidence = { analyses_seen: analyses.value.items.length, analyses_sampled: sampled.length, scan_coverage: scanCoverage.slice(0, 50), configured_scans: configured, unauthenticated_scans: unauthenticated.slice(0, 50), crawl_disabled_scans: crawlDisabled.slice(0, 50), unreadable: unreadable.slice(0, 50) };
   const raw = { analyses: analyses.value.items, scan_configurations: rawScans };
   if (configured === 0 && unauthenticated.length === 0 && crawlDisabled.length === 0) {
     return { finding: manualFinding(13, "medium", "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.", manualEvidence, evidence), raw, errors };
@@ -1585,17 +1643,21 @@ function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], invento
     return manualFinding(16, "medium", unreadable.length > 0 ? unreadableReason("findings", unreadable[0].findings) : "No application findings were sampled.", manualEvidence);
   }
   const exceeding: Array<{ application: string; rate_percent: number; findings: number; fp_annotated_findings: number }> = [];
-  const perApplication: Array<{ application: string; findings: number; fp_annotated_findings: number; fp_approved_findings: number; resolution_values: Record<string, number> }> = [];
+  const perApplication: Array<{ application: string; findings_seen: number; findings_total: number | null; list_complete: boolean; fp_annotated_findings: number; fp_approved_findings: number; resolution_values: Record<string, number> }> = [];
   let evaluated = 0;
+  let incomplete = 0;
   for (const sample of readable) {
     const list = (sample.findings as { value: HalListResult }).value;
     if (list.items.length === 0) continue;
     evaluated += 1;
+    if (!list.complete) incomplete += 1;
     const fpFindings = list.items.filter((item) => hasAnnotationAction(item, "FP"));
     const fpApproved = fpFindings.filter((item) => hasAnnotationAction(item, "APPROVED")).length;
     perApplication.push({
       application: sample.application,
-      findings: list.items.length,
+      findings_seen: list.items.length,
+      findings_total: list.totalElements ?? null,
+      list_complete: list.complete,
       fp_annotated_findings: fpFindings.length,
       fp_approved_findings: fpApproved,
       resolution_values: countValues(list.items.map((item) => asString(findingStatus(item).resolution) ?? "absent")),
@@ -1603,7 +1665,7 @@ function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], invento
     const rate = (fpFindings.length / list.items.length) * 100;
     if (rate > maxRatePercent) exceeding.push({ application: sample.application, rate_percent: Number(rate.toFixed(1)), findings: list.items.length, fp_annotated_findings: fpFindings.length });
   }
-  const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} application finding lists were unreadable.` : undefined];
+  const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} application finding lists were unreadable.` : undefined, incomplete > 0 ? `${incomplete} finding lists were truncated, so the rate was computed over the findings seen (total unknown or larger).` : undefined];
   const evidence = {
     applications_sampled: samples.length,
     applications_with_findings: evaluated,
@@ -1742,10 +1804,17 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
   let issues = 0;
   let librariesSeen = 0;
   let incomplete = 0;
+  let libraryListsUnreadable = 0;
+  let libraryListsIncomplete = 0;
   for (const sample of readable) {
     const issueList = (sample.vulnerabilities as { value: HalListResult }).value;
     if (!issueList.complete) incomplete += 1;
-    if (sample.libraries.status === "ok") librariesSeen += sample.libraries.value.items.length;
+    if (sample.libraries.status === "ok") {
+      librariesSeen += sample.libraries.value.items.length;
+      if (!sample.libraries.value.complete) libraryListsIncomplete += 1;
+    } else {
+      libraryListsUnreadable += 1;
+    }
     for (const issue of issueList.items) {
       issues += 1;
       const severity = asNumber(issue.severity) ?? asNumber(asObject(issue.vulnerability)?.cvss3_score) ?? asNumber(asObject(issue.vulnerability)?.cvss2_score);
@@ -1754,8 +1823,15 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
       }
     }
   }
-  const caveats = [partialInventoryNote(list, "workspaces"), scopeNote(samples.length, list.items.length, "workspaces"), unreadable.length > 0 ? `${unreadable.length} workspace issue lists were unreadable.` : undefined, incomplete > 0 ? `${incomplete} issue lists were truncated.` : undefined];
-  const evidence = { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: librariesSeen, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold };
+  const caveats = [
+    partialInventoryNote(list, "workspaces"),
+    scopeNote(samples.length, list.items.length, "workspaces"),
+    unreadable.length > 0 ? `${unreadable.length} workspace issue lists were unreadable.` : undefined,
+    incomplete > 0 ? `${incomplete} issue lists were truncated.` : undefined,
+    libraryListsUnreadable > 0 ? `${libraryListsUnreadable} workspace library lists were unreadable, so libraries_seen undercounts the scanned libraries.` : undefined,
+    libraryListsIncomplete > 0 ? `${libraryListsIncomplete} library lists were truncated, so libraries_seen is a lower bound.` : undefined,
+  ];
+  const evidence = { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: librariesSeen, library_lists_unreadable: libraryListsUnreadable, library_lists_truncated: libraryListsIncomplete, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold };
   if (high.length > 0) {
     return finding(5, "high", "fail", joinNotes(`${high.length} open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces.`, ...caveats), evidence);
   }
@@ -1849,7 +1925,8 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   if (covered.length === 0) {
     return { finding: manualFinding(18, "medium", "No application could be evaluated for SCA coverage.", ["Map each application to an SCA workspace."], evidence), raw: { sca_projects_by_application: rawProjects }, errors };
   }
-  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, ...caveats), evidence), raw: { sca_projects_by_application: rawProjects }, errors };
+  const scaAgentNote = scaBlocker ? `The SCA Agent API was unavailable (${workspaces.status === "error" ? `${workspaces.statusCode ?? "error"}` : "no workspaces"}), so linked agent projects were not checked; every sampled application is covered by upload-and-scan SCA alone.` : undefined;
+  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, scaAgentNote, ...caveats), evidence), raw: { sca_projects_by_application: rawProjects }, errors };
 }
 
 export async function assessVeracodeScaPosture(
@@ -1939,8 +2016,8 @@ function evaluateTeamAccess(snapshot: IdentitySnapshot, maxUnrestricted: number)
   const unrestrictedUsers = snapshot.users.value.items.filter((user) => isActiveHuman(user) && userRoleNames(user).some((role) => unrestrictedRoles.has(role))).map(userLabel);
   const appsWithoutTeams = snapshot.applications.status === "ok" ? snapshot.applications.value.items.filter((app) => applicationTeams(app).length === 0).map(applicationName) : [];
   const teamScopeNotes = snapshot.teams.value.notes ?? [];
-  const caveats = [partialInventoryNote(snapshot.users.value, "users"), partialInventoryNote(snapshot.teams.value, "teams"), ...teamScopeNotes, snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so application team assignment was not verified."];
-  const evidence = { users_seen: snapshot.users.value.items.length, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: appsWithoutTeams.slice(0, 50), max_unrestricted_users: maxUnrestricted };
+  const caveats = [partialInventoryNote(snapshot.users.value, "users"), partialInventoryNote(snapshot.roles.value, "roles"), partialInventoryNote(snapshot.teams.value, "teams"), ...teamScopeNotes, snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so application team assignment was not verified."];
+  const evidence = { users_seen: snapshot.users.value.items.length, roles_seen: snapshot.roles.value.items.length, roles_complete: snapshot.roles.value.complete, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: appsWithoutTeams.slice(0, 50), max_unrestricted_users: maxUnrestricted };
   if (snapshot.teams.value.items.length === 0 && teamScopeNotes.length > 0) {
     return manualFinding(7, "high", joinNotes("The organization-wide team list was refused and the API user is a member of no teams, so team scoping could not be verified.", ...teamScopeNotes), manualEvidence, evidence);
   }
@@ -2113,11 +2190,15 @@ function severityRank(severity: VeracodeFinding["severity"]): number {
 export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeAccessCheckResult> {
   const config = client.getResolvedConfig();
   const probeNotes: string[] = [];
-  const probes: Array<{ name: string; endpoint: string; requiredRole: string; load: () => Promise<number> }> = [
-    { name: "self", endpoint: "/api/authn/v2/users/self", requiredRole: "any API user", load: async () => (await client.getSelf() ? 1 : 0) },
-    { name: "applications", endpoint: "/appsec/v1/applications", requiredRole: "Security Insights or Reviewer", load: async () => (await client.listApplications({ maxPages: 1 })).items.length },
-    { name: "policies", endpoint: "/appsec/v1/policies", requiredRole: "Security Insights or Reviewer", load: async () => (await client.listPolicies({ maxPages: 1 })).items.length },
-    { name: "users", endpoint: "/api/authn/v2/users", requiredRole: "Administrator", load: async () => (await client.listUsers({ maxPages: 1 })).items.length },
+  // Probes read one page; the vendor total is reported when the page carries it, otherwise the count is marked as first page only.
+  const listProbe = (list: HalListResult): { count: number; countNote?: string } => (list.totalElements !== undefined
+    ? { count: list.totalElements }
+    : { count: list.items.length, countNote: list.complete ? undefined : "first page only, total unknown" });
+  const probes: Array<{ name: string; endpoint: string; requiredRole: string; load: () => Promise<{ count: number; countNote?: string }> }> = [
+    { name: "self", endpoint: "/api/authn/v2/users/self", requiredRole: "any API user", load: async () => ({ count: (await client.getSelf()) ? 1 : 0 }) },
+    { name: "applications", endpoint: "/appsec/v1/applications", requiredRole: "Security Insights or Reviewer", load: async () => listProbe(await client.listApplications({ maxPages: 1 })) },
+    { name: "policies", endpoint: "/appsec/v1/policies", requiredRole: "Security Insights or Reviewer", load: async () => listProbe(await client.listPolicies({ maxPages: 1 })) },
+    { name: "users", endpoint: "/api/authn/v2/users", requiredRole: "Administrator", load: async () => listProbe(await client.listUsers({ maxPages: 1 })) },
     {
       name: "teams",
       endpoint: "/api/authn/v2/teams?all_for_org=true",
@@ -2125,19 +2206,19 @@ export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeA
       load: async () => {
         const teams = await client.listTeams({ maxPages: 1 });
         probeNotes.push(...(teams.notes ?? []));
-        return teams.items.length;
+        return listProbe(teams);
       },
     },
-    { name: "roles", endpoint: "/api/authn/v2/roles", requiredRole: "Administrator", load: async () => (await client.listRoles({ maxPages: 1 })).items.length },
-    { name: "api_credentials", endpoint: "/api/authn/v2/api_credentials", requiredRole: "any API user", load: async () => (await client.getSelfApiCredentials() ? 1 : 0) },
-    { name: "sca_workspaces", endpoint: "/srcclr/v3/workspaces", requiredRole: "Workspace Administrator or Workspace Editor (SCA license)", load: async () => (await client.listScaWorkspaces({ maxPages: 1 })).items.length },
-    { name: "dynamic_analyses", endpoint: "/was/configservice/v1/analyses", requiredRole: "Security Insights (Dynamic Analysis license)", load: async () => (await client.listDynamicAnalyses({ maxPages: 1 })).items.length },
+    { name: "roles", endpoint: "/api/authn/v2/roles", requiredRole: "Administrator", load: async () => listProbe(await client.listRoles({ maxPages: 1 })) },
+    { name: "api_credentials", endpoint: "/api/authn/v2/api_credentials", requiredRole: "any API user", load: async () => ({ count: (await client.getSelfApiCredentials()) ? 1 : 0 }) },
+    { name: "sca_workspaces", endpoint: "/srcclr/v3/workspaces", requiredRole: "Workspace Administrator or Workspace Editor (SCA license)", load: async () => listProbe(await client.listScaWorkspaces({ maxPages: 1 })) },
+    { name: "dynamic_analyses", endpoint: "/was/configservice/v1/analyses", requiredRole: "Security Insights (Dynamic Analysis license)", load: async () => listProbe(await client.listDynamicAnalyses({ maxPages: 1 })) },
   ];
   const surfaces: VeracodeAccessSurface[] = [];
   for (const probe of probes) {
     const result = await surface(probe.load);
     surfaces.push(result.status === "ok"
-      ? { name: probe.name, endpoint: probe.endpoint, status: "readable", count: result.value, requiredRole: probe.requiredRole }
+      ? { name: probe.name, endpoint: probe.endpoint, status: "readable", count: result.value.count, ...(result.value.countNote ? { countNote: result.value.countNote } : {}), requiredRole: probe.requiredRole }
       : { name: probe.name, endpoint: probe.endpoint, status: "not_readable", statusCode: result.statusCode, error: result.error, requiredRole: probe.requiredRole });
   }
   const self = await surface(() => client.getSelf());
@@ -2172,7 +2253,7 @@ function formatAccessCheckText(result: VeracodeAccessCheckResult): string {
   const rows = result.surfaces.map((item) => [
     item.name,
     item.status,
-    item.count === undefined ? "-" : String(item.count),
+    item.count === undefined ? "-" : `${item.count}${item.countNote ? ` (${item.countNote})` : ""}`,
     item.requiredRole,
     item.error ? item.error.replace(/\s+/g, " ").slice(0, 90) : "",
   ]);
@@ -2313,6 +2394,60 @@ function buildQuickReference(result: { outputDir: string; findings: VeracodeFind
   ].join("\n");
 }
 
+const REDACTED = "[REDACTED]";
+
+/**
+ * Rule 9 deny list for the whole-resource snapshots in core_data: matched on
+ * the lowercased key with dots, underscores, and hyphens removed. Suffix
+ * matches keep evidence keys such as credentials_readable and api_id legible
+ * while catching password, api_token, client_secret, login_script_data, and
+ * certificate material wherever an operator-authored record carries them.
+ */
+const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|secret|token|apikey|privatekey|scriptdata|scriptbody|certificate)$/;
+
+const JWT_PATTERN = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./;
+
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[._-]/g, ""));
+}
+
+/** Rewrites only URLs whose userinfo or query string could carry a token (git_repo_url with user:token@, target URLs with session parameters). */
+function scrubUrlValue(value: string): string {
+  const match = /^[a-z][a-z0-9+.-]*:\/\/(.*)$/i.exec(value);
+  if (!match || !/[@?]/.test(match[1])) return value;
+  try {
+    const url = new URL(value);
+    const userinfo = url.username || url.password ? `${REDACTED}@` : "";
+    const query = url.search.length > 1 ? `?${REDACTED}` : "";
+    return `${url.protocol}//${userinfo}${url.host}${url.pathname}${query}`;
+  } catch {
+    return value.replace(/\/\/[^/@]*@/, `//${REDACTED}@`).replace(/\?.*$/, `?${REDACTED}`);
+  }
+}
+
+/**
+ * Applied to every JSON object written into the bundle: redacts the value of
+ * every credential-named key (including {name, value} pair shapes such as
+ * application profile custom_fields), every JWT-shaped string, and the
+ * userinfo and query string of every URL-valued string, keeping key names so
+ * the evidence stays legible.
+ */
+function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  const object = asObject(value);
+  if (!object) return typeof value === "string" ? (JWT_PATTERN.test(value) ? REDACTED : scrubUrlValue(value)) : value;
+  const pairName = asString(object.name) ?? asString(object.key);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(object)) {
+    if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
+      output[key] = item === null || item === undefined ? item : REDACTED;
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
 export async function exportVeracodeAuditBundle(
   client: ClientLike,
   config: VeracodeResolvedConfig,
@@ -2350,7 +2485,7 @@ export async function exportVeracodeAuditBundle(
 
   await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, findings, errors }));
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({ generated_at: generatedAt.toISOString(), base_url: config.baseUrl, region: config.region, profile: config.profile, source_chain: config.sourceChain, principal: access.principal ?? null }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(redactSnapshot(access)));
   const assessmentFiles: Array<[string, VeracodeAssessmentResult]> = [
     ["scan-coverage", scanCoverage],
     ["policy-compliance", policyCompliance],
@@ -2359,10 +2494,10 @@ export async function exportVeracodeAuditBundle(
     ["access-controls", accessControls],
   ];
   for (const [name, assessment] of assessmentFiles) {
-    await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(assessment.rawData));
-    await writeSecureTextFile(outputDir, `analysis/${name}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, findings: assessment.findings, errors: assessment.errors }));
+    await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(redactSnapshot(assessment.rawData)));
+    await writeSecureTextFile(outputDir, `analysis/${name}.json`, serializeJson(redactSnapshot({ title: assessment.title, summary: assessment.summary, findings: assessment.findings, errors: assessment.errors })));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactSnapshot(findings)));
   await writeSecureTextFile(outputDir, "analysis/summary.md", [formatAccessCheckText(access), "", ...assessments.map(formatAssessmentText)].join("\n\n"));
   await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
   await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
