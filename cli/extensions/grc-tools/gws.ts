@@ -76,6 +76,17 @@ const MAX_TOKEN_USERS = 50;
 const MAX_RETRIES = 4;
 const TOKEN_SKEW_MS = 60 * 1000;
 const DORMANT_DAYS = 90;
+/** Endpoint names as they appear in every status, evidence line, and core_data marker. */
+const USERS_ENDPOINT = "Directory users.list";
+const ROLES_ENDPOINT = "Directory roles.list";
+const ROLE_ASSIGNMENTS_ENDPOINT = "Directory roleAssignments.list";
+const TOKENS_ENDPOINT = "Directory tokens.list";
+const ALERTS_ENDPOINT = "Alert Center alerts.list";
+const POLICIES_ENDPOINT = "Cloud Identity policies.list";
+
+function activitiesEndpoint(applicationName: "login" | "admin" | "token"): string {
+  return `Reports activities.list (applicationName=${applicationName})`;
+}
 /** Every field below is documented on the Directory API User resource. */
 const USERS_FIELDS = [
   "users(id,primaryEmail,isAdmin,isDelegatedAdmin,suspended,archived,lastLoginTime,isEnrolledIn2Sv,isEnforcedIn2Sv,orgUnitPath)",
@@ -304,11 +315,19 @@ export interface GwsFinding {
   frameworks: FrameworkMap;
 }
 
+/**
+ * A snapshot count is a number, or null when the inventory it is derived from was unreadable or never collected; every
+ * `<key>` count has a `<key>_status` companion that reads `complete: ...`, `partial: ...`, `unreadable: ...`, or
+ * `not collected: ...` and names the endpoint(s) it rests on.
+ */
+export type GwsSnapshotValue = number | string | null;
+export type GwsSnapshotSummary = Record<string, GwsSnapshotValue>;
+
 export interface GwsAssessmentResult {
   category: CheckDefinition["category"];
   findings: GwsFinding[];
   summary: Record<GwsFindingStatus, number>;
-  snapshotSummary: Record<string, number | string>;
+  snapshotSummary: GwsSnapshotSummary;
   text: string;
 }
 
@@ -328,6 +347,8 @@ export interface CollectedDataset<T = unknown> {
   seen?: number;
   total?: number;
   failed?: number;
+  /** Set when the read was never issued; names the input whose failure prevented it (for example an unreadable users.list). */
+  notCollected?: string;
 }
 
 interface TokenInventoryRecord {
@@ -1122,6 +1143,157 @@ function withPartialCap(
   };
 }
 
+type SourceStatusKind = "complete" | "partial" | "unreadable" | "not collected";
+
+/** How one inventory read went, worded so the status names the endpoint and, when it failed, the projected error. */
+interface SourceStatus {
+  kind: SourceStatusKind;
+  detail: string;
+}
+
+function sourceStatus(endpoint: string, dataset: CollectedDataset<unknown[]> | undefined): SourceStatus {
+  if (!dataset) return { kind: "not collected", detail: `${endpoint} was not queried in this run` };
+  if (dataset.notCollected) return { kind: "not collected", detail: `${endpoint} was not called because ${dataset.notCollected}` };
+  if (dataset.error) return { kind: "unreadable", detail: `${endpoint} (${dataset.error})` };
+  const seen = dataset.seen ?? dataset.data.length;
+  if (dataset.truncated) {
+    return {
+      kind: "partial",
+      detail: `${endpoint} stopped at the collection cap after ${dataset.pages ?? 0} page(s) with ${seen} seen, more pages exist`,
+    };
+  }
+  return { kind: "complete", detail: `${endpoint} returned ${seen} record(s) across ${dataset.pages ?? 1} page(s)` };
+}
+
+function describeTokenReadFailures(dataset: TokenInventoryDataset): string {
+  if (dataset.failures && dataset.failures.length > 0) {
+    return dataset.failures.map((failure) => `${failure.primaryEmail}: ${failure.error}`).join("; ");
+  }
+  return dataset.error ?? "users not recorded";
+}
+
+/**
+ * The token inventory is a per-user sample: "inventory" scope reports the records as partial whenever a per-user read
+ * failed or the sample was capped, while "sample" scope only says whether sampling happened at all, for counts that
+ * describe the sample itself (users sampled, reads that failed) and are exact once sampling ran.
+ */
+function tokenInventoryStatus(dataset: TokenInventoryDataset, scope: "inventory" | "sample" = "inventory"): SourceStatus {
+  if (dataset.notCollected) return { kind: "not collected", detail: `${TOKENS_ENDPOINT} was not called because ${dataset.notCollected}` };
+  const seen = dataset.seen ?? 0;
+  const total = dataset.total ?? seen;
+  const failed = dataset.failed ?? 0;
+  if (scope === "sample") {
+    return { kind: "complete", detail: `${TOKENS_ENDPOINT} was attempted for ${seen} sampled user(s) of ${total} active users` };
+  }
+  if (seen > 0 && failed >= seen) {
+    return { kind: "unreadable", detail: `${TOKENS_ENDPOINT} failed for all ${seen} sampled users (${describeTokenReadFailures(dataset)})` };
+  }
+  const clauses = [
+    ...(failed > 0 ? [`${TOKENS_ENDPOINT} failed for ${failed} of ${seen} sampled users (${describeTokenReadFailures(dataset)})`] : []),
+    ...(seen < total ? [`${TOKENS_ENDPOINT} sampled ${seen} of ${total} active users (privileged users first)`] : []),
+  ];
+  if (clauses.length > 0) return { kind: "partial", detail: clauses.join("; ") };
+  return { kind: "complete", detail: `${TOKENS_ENDPOINT} read for all ${seen} sampled user(s)` };
+}
+
+function statusText(status: SourceStatus): string {
+  return `${status.kind}: ${status.detail}`;
+}
+
+/**
+ * A count derived from several inventories is only as readable as its weakest source: any unreadable or never-collected
+ * source makes the count unknown, any partial source makes it a lower bound, and only when every source was read to
+ * the end is the count complete. The detail names the sources that set the kind.
+ */
+function combineSources(sources: SourceStatus[]): SourceStatus {
+  const unreadable = sources.filter((source) => source.kind === "unreadable");
+  const notCollected = sources.filter((source) => source.kind === "not collected");
+  if (unreadable.length > 0 || notCollected.length > 0) {
+    return {
+      kind: unreadable.length > 0 ? "unreadable" : "not collected",
+      detail: [...unreadable, ...notCollected].map((source) => source.detail).join("; "),
+    };
+  }
+  const partial = sources.filter((source) => source.kind === "partial");
+  if (partial.length > 0) return { kind: "partial", detail: partial.map((source) => source.detail).join("; ") };
+  return { kind: "complete", detail: sources.map((source) => source.detail).join("; ") };
+}
+
+/**
+ * Every snapshot count goes through here: a count that rests on an unreadable or never-collected inventory renders null
+ * with a status naming that read; a count over a partially read inventory keeps its value and a `partial: at least N`
+ * status; only a count whose every source was read to the end gets a `complete` status.
+ */
+function snapshotCount(summary: GwsSnapshotSummary, key: string, value: number, sources: SourceStatus[]): void {
+  const combined = combineSources(sources);
+  switch (combined.kind) {
+    case "complete":
+      summary[key] = value;
+      summary[`${key}_status`] = statusText(combined);
+      return;
+    case "partial":
+      summary[key] = value;
+      summary[`${key}_status`] = `partial: at least ${value}; ${combined.detail}`;
+      return;
+    case "unreadable":
+    case "not collected":
+      summary[key] = null;
+      summary[`${key}_status`] = statusText(combined);
+      return;
+    default: {
+      const exhaustive: never = combined.kind;
+      throw new Error(`Unhandled source status ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** An evidence line for a count: exact, `at least N` naming the partial reads, or the status word naming the failed read. */
+function countLine(label: string, value: number, sources: SourceStatus[]): string {
+  const combined = combineSources(sources);
+  switch (combined.kind) {
+    case "complete":
+      return `${label}: ${value}`;
+    case "partial":
+      return `${label}: at least ${value} (${combined.detail})`;
+    case "unreadable":
+    case "not collected":
+      return `${label}: ${combined.kind} (${combined.detail})`;
+    default: {
+      const exhaustive: never = combined.kind;
+      return exhaustive;
+    }
+  }
+}
+
+/** The users.list partial-view flag reads from the collection status, so a failed listing never renders as `no`. */
+function partialViewFlag(status: SourceStatus): string {
+  switch (status.kind) {
+    case "complete":
+      return "no";
+    case "partial":
+      return "yes";
+    case "unreadable":
+    case "not collected":
+      return `${status.kind} (${status.detail})`;
+    default: {
+      const exhaustive: never = status.kind;
+      return exhaustive;
+    }
+  }
+}
+
+/** A token count over an unreadable or partial inventory is a lower bound or unknown, and the line says which read failed. */
+function tokenCountLine(label: string, value: number, dataset: TokenInventoryDataset): string {
+  return countLine(label, value, [tokenInventoryStatus(dataset)]);
+}
+
+function renderSnapshotLine(summary: GwsSnapshotSummary, key: string, value: GwsSnapshotValue): string {
+  const status = summary[`${key}_status`];
+  if (value === null) return `- ${key}: ${typeof status === "string" ? status.split(":")[0] : "null"}`;
+  if (typeof value === "number" && typeof status === "string" && status.startsWith("partial")) return `- ${key}: at least ${value}`;
+  return `- ${key}: ${value}`;
+}
+
 function findingTable(findings: GwsFinding[]): string {
   return formatTable(
     ["Check", "Status", "Severity", "Title"],
@@ -1133,7 +1305,7 @@ function buildAssessmentText(
   categoryLabel: string,
   organization: string,
   findings: GwsFinding[],
-  snapshotSummary: Record<string, number | string>,
+  snapshotSummary: GwsSnapshotSummary,
 ): string {
   const summary = countByStatus(findings);
   return [
@@ -1141,7 +1313,7 @@ function buildAssessmentText(
     `Summary: Pass ${summary.Pass}, Partial ${summary.Partial}, Fail ${summary.Fail}, Manual ${summary.Manual}, Info ${summary.Info}`,
     "",
     "Snapshot:",
-    ...Object.entries(snapshotSummary).map(([key, value]) => `- ${key}: ${value}`),
+    ...Object.entries(snapshotSummary).map(([key, value]) => renderSnapshotLine(snapshotSummary, key, value)),
     "",
     findingTable(findings),
     "",
@@ -1359,8 +1531,104 @@ function projectPolicySnapshot(policy: JsonRecord): JsonRecord {
   return output;
 }
 
-function projectDataset<T>(dataset: CollectedDataset<T[]>, projector: (item: T) => JsonRecord): CollectedDataset<JsonRecord[]> {
-  return { ...dataset, data: dataset.data.map(projector) };
+/**
+ * The core_data/ file for one listing. A read that failed or never happened writes an explicit marker (`status`,
+ * `endpoint`, `error`, `errorKind`) with `data`, `seen`, `pages`, and `truncated` all null, so nothing in the file can be
+ * mistaken for an empty but complete inventory; a read that succeeded carries its records with the same status and
+ * endpoint fields in front of them.
+ */
+function projectDatasetFile<T>(
+  endpoint: string,
+  dataset: CollectedDataset<T[]> | undefined,
+  projector: (item: T) => JsonRecord,
+): JsonRecord {
+  const status = sourceStatus(endpoint, dataset);
+  const marker: JsonRecord = { status: statusText(status), endpoint };
+  switch (status.kind) {
+    case "unreadable":
+    case "not collected":
+      return {
+        ...marker,
+        error: dataset?.error ?? null,
+        errorKind: dataset?.errorKind ?? null,
+        data: null,
+        seen: null,
+        pages: null,
+        truncated: null,
+      };
+    case "complete":
+    case "partial": {
+      const collected = dataset as CollectedDataset<T[]>;
+      return {
+        ...marker,
+        data: collected.data.map(projector),
+        seen: collected.seen ?? collected.data.length,
+        pages: collected.pages ?? null,
+        truncated: collected.truncated ?? null,
+      };
+    }
+    default: {
+      const exhaustive: never = status.kind;
+      throw new Error(`Unhandled source status ${String(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * The token inventory is a per-user sample, so its file also records how many sampled users were readable. When every
+ * read failed or the sample was never drawn, `data` and `truncated` are null; while any read failed, `truncated` is null
+ * too, because the sample cap no longer describes how complete the inventory is.
+ */
+function projectTokenInventoryFile(dataset: TokenInventoryDataset): JsonRecord {
+  const status = tokenInventoryStatus(dataset);
+  const seen = dataset.seen ?? 0;
+  const failed = dataset.failed ?? 0;
+  const marker: JsonRecord = { status: statusText(status), endpoint: TOKENS_ENDPOINT };
+  switch (status.kind) {
+    case "not collected":
+      return {
+        ...marker,
+        error: null,
+        errorKind: null,
+        data: null,
+        seen: null,
+        total: null,
+        failed: null,
+        failures: null,
+        readable_users: null,
+        truncated: null,
+      };
+    case "unreadable":
+      return {
+        ...marker,
+        error: dataset.error ?? null,
+        errorKind: dataset.errorKind ?? null,
+        data: null,
+        seen,
+        total: dataset.total ?? seen,
+        failed,
+        failures: dataset.failures ?? null,
+        readable_users: `0 of ${seen}`,
+        truncated: null,
+      };
+    case "complete":
+    case "partial":
+      return {
+        ...marker,
+        ...(dataset.error ? { error: dataset.error, errorKind: dataset.errorKind ?? null } : {}),
+        data: dataset.data.map(projectTokenInventorySnapshot),
+        seen,
+        total: dataset.total ?? seen,
+        failed,
+        failures: dataset.failures ?? [],
+        readable_users: `${seen - failed} of ${seen}`,
+        truncated: failed > 0 ? null : dataset.truncated ?? null,
+      };
+    default: {
+      const exhaustive: never = status.kind;
+      throw new Error(`Unhandled source status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function safeDirName(value: string): string {
@@ -2229,6 +2497,28 @@ async function collectTokenInventory(
   };
 }
 
+function notCollectedTokenInventory(reason: string): TokenInventoryDataset {
+  return { data: [], seen: 0, total: 0, failed: 0, failures: [], truncated: false, notCollected: reason };
+}
+
+/**
+ * The per-user tokens.list sample is drawn from the user listing, so when users.list was unreadable or returned nobody to
+ * sample the inventory is recorded as never collected (naming that cause) instead of as an empty, complete read.
+ */
+async function collectTokenInventoryFromDirectory(
+  client: Pick<GwsAuditCollector, "listUserTokens">,
+  users: CollectedDataset<JsonRecord[]>,
+  roles: CollectedDataset<JsonRecord[]>,
+  roleAssignments: CollectedDataset<JsonRecord[]>,
+): Promise<TokenInventoryDataset> {
+  if (users.error) return notCollectedTokenInventory(`${USERS_ENDPOINT} was unreadable (${users.error})`);
+  const privilegedContext = getPrivilegedUsers(users.data, roles.data, roleAssignments.data);
+  const tokenUsers = selectUsersForTokenInventory(users.data, privilegedContext.privilegedUsers);
+  if (tokenUsers.length === 0) return notCollectedTokenInventory(`${USERS_ENDPOINT} returned no users to sample`);
+  const activePopulation = users.data.filter(isActiveUser).length;
+  return collectTokenInventory(client, tokenUsers, Math.max(activePopulation, tokenUsers.length));
+}
+
 export async function collectGwsAuditData(client: GwsAuditCollector): Promise<GwsAuditData> {
   const [users, roles, roleAssignments, loginActivities, adminActivities, tokenActivities, alerts, twoStepPolicies] =
     await Promise.all([
@@ -2242,10 +2532,7 @@ export async function collectGwsAuditData(client: GwsAuditCollector): Promise<Gw
       collectDataset(() => client.collectTwoStepPolicies()),
     ]);
 
-  const privilegedContext = getPrivilegedUsers(users.data, roles.data, roleAssignments.data);
-  const tokenUsers = selectUsersForTokenInventory(users.data, privilegedContext.privilegedUsers);
-  const activePopulation = users.data.filter(isActiveUser).length;
-  const tokenInventory = await collectTokenInventory(client, tokenUsers, Math.max(activePopulation, tokenUsers.length));
+  const tokenInventory = await collectTokenInventoryFromDirectory(client, users, roles, roleAssignments);
 
   return {
     identity: { users, roles, roleAssignments, loginActivities, twoStepPolicies },
@@ -2286,10 +2573,7 @@ export async function collectGwsIntegrationData(client: GwsAuditCollector): Prom
     collectDataset(() => client.collectActivities("token")),
   ]);
 
-  const privilegedContext = getPrivilegedUsers(users.data, roles.data, roleAssignments.data);
-  const tokenUsers = selectUsersForTokenInventory(users.data, privilegedContext.privilegedUsers);
-  const activePopulation = users.data.filter(isActiveUser).length;
-  const tokenInventory = await collectTokenInventory(client, tokenUsers, Math.max(activePopulation, tokenUsers.length));
+  const tokenInventory = await collectTokenInventoryFromDirectory(client, users, roles, roleAssignments);
 
   return { users, roles, roleAssignments, tokenInventory, tokenActivities };
 }
@@ -2380,7 +2664,7 @@ function tokenReadFailureEvidence(dataset: TokenInventoryDataset, privilegedIds:
   if (privilegedFailures.length > 0) {
     notes.push(`Directory tokens.list failed for privileged users: ${privilegedFailures.map((failure) => `${failure.primaryEmail} (${failure.error})`).join(", ")}`);
   } else {
-    notes.push("Directory tokens.list failed only for users outside the privileged set, so the privileged counts are complete");
+    notes.push("Directory tokens.list failed only for users outside the identified privileged set; every token count is still a lower bound");
   }
   return { notes, privilegedFailed: privilegedFailures.length, privilegedFailures, attributed: true };
 }
@@ -2406,6 +2690,7 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     );
   }
 
+  const policiesStatus = sourceStatus(POLICIES_ENDPOINT, dataset);
   const enforcement = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_ENFORCEMENT_SETTING);
   const enrollment = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_ENROLLMENT_SETTING);
   const factors = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_FACTOR_SETTING);
@@ -2414,7 +2699,7 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
       "GWS-ID-005",
       "Manual",
       `The Policy API returned ${dataset.data.length} 2-step verification policies but none of type ${TWO_STEP_ENFORCEMENT_SETTING}; emptiness is treated as an unconfirmed policy, not as compliance.`,
-      [`Policies returned: ${dataset.data.length}`],
+      [countLine("Policies returned", dataset.data.length, [policiesStatus])],
       "Confirm the Policy API is enabled for the customer and that the enforcement setting is returned, then re-run.",
       "Collect manually: Admin console > Security > Authentication > 2-Step Verification > Enforcement for the root organizational unit.",
     );
@@ -2439,9 +2724,10 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     return asString(value.allowedSignInFactorSet) ?? "unspecified";
   })));
   const evidence = [
-    `Enforcement policies returned: ${enforcement.length} (${enforcement.map((policy) => `${describeScope(policy)} [${asString(policy.type) ?? "type unknown"}]`).join("; ")})`,
-    `Enforcement policies with enforcedFrom at or before now: ${enforced.length}`,
-    `Enrollment policies with allowEnrollment=false: ${enrollmentDisabled.length}`,
+    countLine("Enforcement policies returned", enforcement.length, [policiesStatus]),
+    `Enforcement policy scopes: ${enforcement.map((policy) => `${describeScope(policy)} [${asString(policy.type) ?? "type unknown"}]`).join("; ")}`,
+    countLine("Enforcement policies with enforcedFrom at or before now", enforced.length, [policiesStatus]),
+    countLine("Enrollment policies with allowEnrollment=false", enrollmentDisabled.length, [policiesStatus]),
     `Allowed sign-in factor sets observed: ${factorSets.join(", ") || "none returned"}`,
     ...partialViewEvidence("Policies", dataset),
   ];
@@ -2497,6 +2783,9 @@ export function assessGwsIdentity(
   const privilegedPartial = privileged.unresolvedAssignments > 0
     ? [`Role assignments pointing at users outside the collected listing: ${privileged.unresolvedAssignments}`]
     : [];
+  const usersStatus = sourceStatus(USERS_ENDPOINT, data.users);
+  const roleAssignmentsStatus = sourceStatus(ROLE_ASSIGNMENTS_ENDPOINT, data.roleAssignments);
+  const directoryStatuses = [usersStatus, sourceStatus(ROLES_ENDPOINT, data.roles), roleAssignmentsStatus];
 
   const findings: GwsFinding[] = [];
 
@@ -2514,8 +2803,8 @@ export function assessGwsIdentity(
       "Manual",
       "No privileged users were identified, which cannot be a compliant state because every tenant has at least one super admin; treat this as a scoped or incomplete read.",
       [
-        `Users collected: ${users.length}`,
-        `Role assignments collected: ${roleAssignments.length}`,
+        countLine("Users collected", users.length, [usersStatus]),
+        countLine("Role assignments collected", roleAssignments.length, [roleAssignmentsStatus]),
         ...privilegedViewNotes,
       ],
       "Confirm the delegated admin can read every user and role assignment, then re-run the assessment.",
@@ -2524,8 +2813,8 @@ export function assessGwsIdentity(
   } else {
     const coverage = privilegedEnforced.length / privileged.privilegedUsers.length;
     const evidence = [
-      `Privileged users: ${privileged.privilegedUsers.length}`,
-      `Privileged users with isEnforcedIn2Sv=true: ${privilegedEnforced.length}`,
+      countLine("Privileged users", privileged.privilegedUsers.length, directoryStatuses),
+      countLine("Privileged users with isEnforcedIn2Sv=true", privilegedEnforced.length, directoryStatuses),
     ];
     findings.push(withPartialCap(
       coverage >= 1
@@ -2568,16 +2857,16 @@ export function assessGwsIdentity(
       "GWS-ID-002",
       "Manual",
       "No active users were returned; an empty directory cannot be compliant because the auditing admin is itself a user, so the read is treated as scoped or incomplete.",
-      [`Users collected: ${users.length}`],
+      [countLine("Users collected", users.length, [usersStatus])],
       "Verify the delegated admin can read the whole user directory and re-run the assessment.",
       "Collect manually: the Admin console user list with 2-Step Verification enrollment and enforcement columns.",
     ));
   } else {
     const coverage = enforcedUsers.length / activeUsers.length;
     const evidence = [
-      `Active users: ${activeUsers.length}`,
-      `Users with isEnforcedIn2Sv=true: ${enforcedUsers.length}`,
-      `Users with isEnrolledIn2Sv=true: ${enrolledUsers.length}`,
+      countLine("Active users", activeUsers.length, [usersStatus]),
+      countLine("Users with isEnforcedIn2Sv=true", enforcedUsers.length, [usersStatus]),
+      countLine("Users with isEnrolledIn2Sv=true", enrolledUsers.length, [usersStatus]),
     ];
     findings.push(withPartialCap(
       coverage >= 0.98
@@ -2620,15 +2909,15 @@ export function assessGwsIdentity(
       "GWS-ID-003",
       "Manual",
       "No active users were returned, so dormancy could not be evaluated; emptiness is treated as an incomplete read rather than as zero dormant accounts.",
-      [`Users collected: ${users.length}`],
+      [countLine("Users collected", users.length, [usersStatus])],
       "Verify directory read access and re-run the assessment.",
       "Collect manually: the Admin console user list with the last sign-in column.",
     ));
   } else {
     const evidence = [
-      `Active users reviewed: ${activeUsers.length}`,
-      `Dormant active users (lastLoginTime older than ${DORMANT_DAYS} days): ${dormancy.dormant}`,
-      `Active users with no parseable lastLoginTime (reported separately, never counted as fresh): ${dormancy.unknownLastLogin}`,
+      countLine("Active users reviewed", activeUsers.length, [usersStatus]),
+      countLine(`Dormant active users (lastLoginTime older than ${DORMANT_DAYS} days)`, dormancy.dormant, [usersStatus]),
+      countLine("Active users with no parseable lastLoginTime (reported separately, never counted as fresh)", dormancy.unknownLastLogin, [usersStatus]),
     ];
     const unknownNotes = dormancy.unknownLastLogin > 0
       ? [`${dormancy.unknownLastLogin} active user(s) have no lastLoginTime and need a manual freshness check`]
@@ -2675,8 +2964,8 @@ export function assessGwsIdentity(
       "Manual",
       "No super-admin accounts were identified; every Google Workspace tenant has at least one, so the collected view is incomplete rather than compliant.",
       [
-        `Role assignments collected: ${roleAssignments.length}`,
-        `Users with isAdmin=true: ${users.filter((user) => asBoolean(user.isAdmin) === true).length}`,
+        countLine("Role assignments collected", roleAssignments.length, [roleAssignmentsStatus]),
+        countLine("Users with isAdmin=true", users.filter((user) => asBoolean(user.isAdmin) === true).length, [usersStatus]),
         ...privilegedViewNotes,
       ],
       "Confirm the audit principal can read super admins (users.list isAdmin and the _SEED_ADMIN_ROLE assignments) and re-run.",
@@ -2684,8 +2973,8 @@ export function assessGwsIdentity(
     ));
   } else {
     const evidence = [
-      `Super admins: ${privileged.superAdmins.length}`,
-      `Super admins with isEnforcedIn2Sv=true: ${superAdminEnforced.length}`,
+      countLine("Super admins", privileged.superAdmins.length, directoryStatuses),
+      countLine("Super admins with isEnforcedIn2Sv=true", superAdminEnforced.length, directoryStatuses),
     ];
     findings.push(withPartialCap(
       superAdminEnforced.length === privileged.superAdmins.length
@@ -2709,16 +2998,15 @@ export function assessGwsIdentity(
 
   findings.push(assessTwoStepPolicy(data.twoStepPolicies));
 
-  const snapshotSummary = {
-    active_users: activeUsers.length,
-    users_seen_partial_view: data.users.truncated ? "yes" : "no",
-    privileged_users: privileged.privilegedUsers.length,
-    super_admins: privileged.superAdmins.length,
-    users_enforced_in_2sv: enforcedUsers.length,
-    dormant_active_users: dormancy.dormant,
-    users_without_last_login: dormancy.unknownLastLogin,
-    two_step_policies: data.twoStepPolicies?.data.length ?? "not collected",
-  };
+  const snapshotSummary: GwsSnapshotSummary = {};
+  snapshotCount(snapshotSummary, "active_users", activeUsers.length, [usersStatus]);
+  snapshotSummary.users_seen_partial_view = partialViewFlag(usersStatus);
+  snapshotCount(snapshotSummary, "privileged_users", privileged.privilegedUsers.length, directoryStatuses);
+  snapshotCount(snapshotSummary, "super_admins", privileged.superAdmins.length, directoryStatuses);
+  snapshotCount(snapshotSummary, "users_enforced_in_2sv", enforcedUsers.length, [usersStatus]);
+  snapshotCount(snapshotSummary, "dormant_active_users", dormancy.dormant, [usersStatus]);
+  snapshotCount(snapshotSummary, "users_without_last_login", dormancy.unknownLastLogin, [usersStatus]);
+  snapshotCount(snapshotSummary, "two_step_policies", data.twoStepPolicies?.data.length ?? 0, [sourceStatus(POLICIES_ENDPOINT, data.twoStepPolicies)]);
 
   return {
     category: "identity",
@@ -2747,6 +3035,10 @@ export function assessGwsAdminAccess(
       ? [`Role assignments pointing at users outside the collected listing: ${privileged.unresolvedAssignments}`]
       : []),
   ];
+  const usersStatus = sourceStatus(USERS_ENDPOINT, data.users);
+  const roleAssignmentsStatus = sourceStatus(ROLE_ASSIGNMENTS_ENDPOINT, data.roleAssignments);
+  const directoryStatuses = [usersStatus, sourceStatus(ROLES_ENDPOINT, data.roles), roleAssignmentsStatus];
+  const adminActivitiesStatus = sourceStatus(activitiesEndpoint("admin"), data.adminActivities);
 
   const findings: GwsFinding[] = [];
 
@@ -2763,12 +3055,16 @@ export function assessGwsAdminAccess(
       "GWS-ADMIN-001",
       "Manual",
       "No super admins were identified; every tenant has at least one, so the collected view is incomplete and the population cannot be judged constrained.",
-      [`Users collected: ${users.length}`, `Role assignments collected: ${roleAssignments.length}`, ...partialNotes],
+      [
+        countLine("Users collected", users.length, [usersStatus]),
+        countLine("Role assignments collected", roleAssignments.length, [roleAssignmentsStatus]),
+        ...partialNotes,
+      ],
       "Confirm directory and role-assignment read access, then re-run.",
       "Collect manually: Admin console > Account > Admin roles > Super Admin membership.",
     ));
   } else {
-    const evidence = [`Super admins identified: ${privileged.superAdmins.length}`];
+    const evidence = [countLine("Super admins identified", privileged.superAdmins.length, directoryStatuses)];
     findings.push(withPartialCap(
       privileged.superAdmins.length <= 4
         ? buildFinding(
@@ -2810,7 +3106,7 @@ export function assessGwsAdminAccess(
       "GWS-ADMIN-002",
       "Manual",
       "No privileged users were identified, so the privileged lifecycle could not be checked; emptiness is treated as an incomplete read.",
-      [`Users collected: ${users.length}`, ...partialNotes],
+      [countLine("Users collected", users.length, [usersStatus]), ...partialNotes],
       "Confirm directory and role-assignment read access, then re-run.",
       "Collect manually: Admin role membership cross-checked against suspended and archived users.",
     ));
@@ -2821,7 +3117,7 @@ export function assessGwsAdminAccess(
           "GWS-ADMIN-002",
           "Pass",
           "No suspended or archived privileged accounts were identified among the privileged population.",
-          [`Privileged users reviewed: ${privileged.privilegedUsers.length}`],
+          [countLine("Privileged users reviewed", privileged.privilegedUsers.length, directoryStatuses)],
           "Keep deprovisioning reviews tied to privileged-role assignments.",
         )
         : buildFinding(
@@ -2829,8 +3125,8 @@ export function assessGwsAdminAccess(
           "Fail",
           "Suspended or archived users still appear in the privileged population.",
           [
-            `Privileged users reviewed: ${privileged.privilegedUsers.length}`,
-            `Suspended or archived privileged users: ${suspendedPrivileged.length}`,
+            countLine("Privileged users reviewed", privileged.privilegedUsers.length, directoryStatuses),
+            countLine("Suspended or archived privileged users", suspendedPrivileged.length, directoryStatuses),
           ],
           "Remove or verify every privileged assignment attached to suspended or archived identities.",
         ),
@@ -2854,8 +3150,8 @@ export function assessGwsAdminAccess(
           "Pass",
           "The tenant uses delegated or custom admin roles in addition to super-admin access.",
           [
-            `Delegated admin users identified: ${privileged.delegatedAdmins.length}`,
-            `Total privileged users: ${privileged.privilegedUsers.length}`,
+            countLine("Delegated admin users identified", privileged.delegatedAdmins.length, directoryStatuses),
+            countLine("Total privileged users", privileged.privilegedUsers.length, directoryStatuses),
           ],
           "Continue using delegated roles to keep Super Admin access exceptional.",
         )
@@ -2864,8 +3160,8 @@ export function assessGwsAdminAccess(
           "Manual",
           "The collected data did not show delegated-admin usage beyond Super Admin; an empty delegated set is not treated as compliant.",
           [
-            `Delegated admin users identified: ${privileged.delegatedAdmins.length}`,
-            `Total privileged users: ${privileged.privilegedUsers.length}`,
+            countLine("Delegated admin users identified", privileged.delegatedAdmins.length, directoryStatuses),
+            countLine("Total privileged users", privileged.privilegedUsers.length, directoryStatuses),
           ],
           "Review whether the tenant intentionally uses only Super Admin or whether delegated roles should be expanded.",
           "Collect manually: the documented administrative model and the role assignment list.",
@@ -2887,7 +3183,7 @@ export function assessGwsAdminAccess(
       "GWS-ADMIN-004",
       "Manual",
       `The admin audit log returned zero events for the ${config.lookbackDays}-day window; an empty window is treated as unconfirmed observability rather than as a pass.`,
-      ["Admin activities collected: 0"],
+      [countLine("Admin activities collected", 0, [adminActivitiesStatus])],
       "Confirm admin audit logging is retained and that the window contains expected administrative changes.",
       "Collect manually: Admin console > Reporting > Audit and investigation > Admin log events.",
     ));
@@ -2897,7 +3193,10 @@ export function assessGwsAdminAccess(
         "GWS-ADMIN-004",
         "Pass",
         "Admin activity telemetry is readable for the configured lookback window.",
-        [`Admin activities collected: ${data.adminActivities.data.length} across ${data.adminActivities.pages ?? 1} page(s)`],
+        [
+          countLine("Admin activities collected", data.adminActivities.data.length, [adminActivitiesStatus]),
+          `Admin activity pages read: ${data.adminActivities.pages ?? 1}`,
+        ],
         "Use the admin activity stream during periodic privileged-access reviews and incident response.",
       ),
       partialViewEvidence("Admin activities", data.adminActivities),
@@ -2927,7 +3226,10 @@ export function assessGwsAdminAccess(
         "GWS-ADMIN-005",
         "Pass",
         "No group-based role assignments exist among the returned assignments (assigneeType=GROUP count is zero within a non-empty assignment inventory), which is compliant by intent.",
-        [`Role assignments reviewed: ${roleAssignments.length}`, `Group role assignments: ${privileged.groupAssignmentCount}`],
+        [
+          countLine("Role assignments reviewed", roleAssignments.length, [roleAssignmentsStatus]),
+          countLine("Group role assignments", privileged.groupAssignmentCount, [roleAssignmentsStatus]),
+        ],
         "Keep group-based privileged grants documented if they are introduced later.",
       ),
       privilegedViewEvidence(data),
@@ -2937,21 +3239,20 @@ export function assessGwsAdminAccess(
       "GWS-ADMIN-005",
       "Manual",
       "Group-based role assignments exist and need explicit membership review.",
-      [`Group role assignments: ${privileged.groupAssignmentCount}`],
+      [countLine("Group role assignments", privileged.groupAssignmentCount, [roleAssignmentsStatus])],
       "Review security-group membership and make sure external or stale principals cannot inherit admin access indirectly.",
       "This slice does not expand group membership, so the inherited privileged population needs a manual spot check.",
     ));
   }
 
-  const snapshotSummary = {
-    privileged_users: privileged.privilegedUsers.length,
-    super_admins: privileged.superAdmins.length,
-    delegated_admins: privileged.delegatedAdmins.length,
-    stale_privileged_users: stalePrivileged.dormant,
-    privileged_users_without_last_login: stalePrivileged.unknownLastLogin,
-    group_role_assignments: privileged.groupAssignmentCount,
-    users_seen_partial_view: data.users.truncated ? "yes" : "no",
-  };
+  const snapshotSummary: GwsSnapshotSummary = {};
+  snapshotCount(snapshotSummary, "privileged_users", privileged.privilegedUsers.length, directoryStatuses);
+  snapshotCount(snapshotSummary, "super_admins", privileged.superAdmins.length, directoryStatuses);
+  snapshotCount(snapshotSummary, "delegated_admins", privileged.delegatedAdmins.length, directoryStatuses);
+  snapshotCount(snapshotSummary, "stale_privileged_users", stalePrivileged.dormant, directoryStatuses);
+  snapshotCount(snapshotSummary, "privileged_users_without_last_login", stalePrivileged.unknownLastLogin, directoryStatuses);
+  snapshotCount(snapshotSummary, "group_role_assignments", privileged.groupAssignmentCount, [roleAssignmentsStatus]);
+  snapshotSummary.users_seen_partial_view = partialViewFlag(usersStatus);
 
   return {
     category: "admin_access",
@@ -2988,9 +3289,15 @@ export function assessGwsIntegrations(
     ...(failed > 0 ? [`Per-user token reads that failed: ${failed}`, `Token inventory errors: ${data.tokenInventory.error ?? "unknown"}`] : []),
   ];
   const tokenFailures = tokenReadFailureEvidence(data.tokenInventory, privilegedIds);
+  const directoryStatuses = [
+    sourceStatus(USERS_ENDPOINT, data.users),
+    sourceStatus(ROLES_ENDPOINT, data.roles),
+    sourceStatus(ROLE_ASSIGNMENTS_ENDPOINT, data.roleAssignments),
+  ];
+  const tokenActivitiesStatus = sourceStatus(activitiesEndpoint("token"), data.tokenActivities);
   const inventoryEvidence = [
-    `Users sampled for token inventory: ${sampled}`,
-    `Token records collected: ${allTokens.length}`,
+    countLine("Users sampled for token inventory", sampled, [tokenInventoryStatus(data.tokenInventory, "sample")]),
+    tokenCountLine("Token records collected", allTokens.length, data.tokenInventory),
   ];
 
   const findings: GwsFinding[] = [];
@@ -3062,9 +3369,14 @@ export function assessGwsIntegrations(
     ));
   } else if (privileged.privilegedUsers.length === 0 || allTokens.length === 0 || failed > 0 && privilegedTokens.length === 0) {
     const failedUsers = tokenFailures.privilegedFailures.map((failure) => failure.primaryEmail);
+    const inventoryReason = sampled > 0 && failed >= sampled
+      ? "the token inventory is unreadable"
+      : failed > 0
+        ? "the token inventory is empty for the readable users"
+        : "the token inventory is empty";
     const reasons = [
       ...(privileged.privilegedUsers.length === 0 ? ["no privileged users were identified"] : []),
-      ...(allTokens.length === 0 ? ["the token inventory is empty"] : []),
+      ...(allTokens.length === 0 ? [inventoryReason] : []),
       ...(failed > 0
         ? [`Directory tokens.list failed for ${failed} of ${sampled} sampled users${failedUsers.length > 0 ? ` including privileged ${failedUsers.join(", ")}` : ""}`]
         : []),
@@ -3074,9 +3386,9 @@ export function assessGwsIntegrations(
       "Manual",
       `Privileged OAuth exposure could not be confirmed: ${reasons.join("; ")}, so zero privileged tokens is not treated as a pass.`,
       [
-        `Privileged users identified: ${privileged.privilegedUsers.length}`,
-        `Token records collected: ${allTokens.length}`,
-        `Privileged third-party tokens: ${privilegedTokens.length}`,
+        countLine("Privileged users identified", privileged.privilegedUsers.length, directoryStatuses),
+        tokenCountLine("Token records collected", allTokens.length, data.tokenInventory),
+        tokenCountLine("Privileged third-party tokens", privilegedTokens.length, data.tokenInventory),
         ...sampleCoverageNotes,
         ...tokenFailures.notes,
       ],
@@ -3084,26 +3396,25 @@ export function assessGwsIntegrations(
       "Collect manually: connected third-party apps for each administrator account.",
     ));
   } else {
-    // A failed privileged tokens.list read means the counts below are lower bounds, and the finding must say so.
+    // Any failed tokens.list read makes the counts below lower bounds, and the finding must say so and name the read.
     const privilegedInSample = Math.min(privileged.privilegedUsers.length, MAX_TOKEN_USERS);
     const privilegedFailed = tokenFailures.privilegedFailed;
-    const readableLine = tokenFailures.attributed
-      ? `Privileged users with readable tokens.list: ${Math.max(privilegedInSample - privilegedFailed, 0)} of ${privileged.privilegedUsers.length} (tokens.list failed: ${tokenFailures.privilegedFailures.map((failure) => failure.primaryEmail).join(", ")})`
-      : `Privileged users with readable tokens.list: at most ${privilegedInSample} of ${privileged.privilegedUsers.length} (${privilegedFailed} tokens.list read(s) failed, users not recorded)`;
-    const evidence = privilegedFailed > 0
-      ? [
-        readableLine,
-        `Privileged third-party tokens: at least ${privilegedTokens.length} (tokens.list failed for ${privilegedFailed} privileged user(s))`,
-        `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
-      ]
-      : [
-        `Privileged users sampled: ${privilegedInSample} of ${privileged.privilegedUsers.length}`,
-        `Privileged third-party tokens: ${privilegedTokens.length}`,
-        `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
-      ];
+    const failedPrivilegedEmails = tokenFailures.privilegedFailures.map((failure) => failure.primaryEmail).join(", ");
+    const readableLine = failed === 0
+      ? `Privileged users sampled: ${privilegedInSample} of ${privileged.privilegedUsers.length}`
+      : tokenFailures.attributed
+        ? `Privileged users with readable tokens.list: ${Math.max(privilegedInSample - privilegedFailed, 0)} of ${privileged.privilegedUsers.length}${privilegedFailed > 0 ? ` (tokens.list failed: ${failedPrivilegedEmails})` : ""}`
+        : `Privileged users with readable tokens.list: at most ${privilegedInSample} of ${privileged.privilegedUsers.length} (${privilegedFailed} tokens.list read(s) failed, users not recorded)`;
+    const evidence = [
+      readableLine,
+      tokenCountLine("Privileged third-party tokens", privilegedTokens.length, data.tokenInventory),
+      `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
+    ];
     const lowerBoundNote = privilegedFailed > 0
       ? ` Directory tokens.list failed for ${privilegedFailed} of the privileged users, so the privileged token count is a lower bound.`
-      : "";
+      : failed > 0
+        ? ` Directory tokens.list failed for ${failed} of ${sampled} sampled users, so the token counts are lower bounds.`
+        : "";
     const capNotes = [
       ...(privilegedSampled ? [] : [`Privileged users beyond the ${MAX_TOKEN_USERS}-user token sample were not inspected`]),
       ...privilegedViewEvidence(data),
@@ -3150,14 +3461,14 @@ export function assessGwsIntegrations(
       "GWS-INTEG-003",
       "Manual",
       "The token inventory is empty or unreadable, so high-scope app sprawl could not be measured; emptiness is not treated as a pass.",
-      [`Token records collected: ${allTokens.length}`, ...sampleNotes],
+      [tokenCountLine("Token records collected", allTokens.length, data.tokenInventory), ...sampleNotes],
       "Restore token readability or confirm the tenant has no authorized third-party apps.",
       "Collect manually: Admin console > Security > API controls > App access control with scopes per app.",
     ));
   } else {
     const evidence = [
-      `Third-party clients observed: ${uniqueClients.length}`,
-      `High-scope token records: ${highRiskTokens}`,
+      tokenCountLine("Third-party clients observed", uniqueClients.length, data.tokenInventory),
+      tokenCountLine("High-scope token records", highRiskTokens, data.tokenInventory),
     ];
     findings.push(withPartialCap(
       highRiskTokens === 0
@@ -3201,7 +3512,7 @@ export function assessGwsIntegrations(
       "GWS-INTEG-004",
       "Manual",
       `The token audit log returned zero events for the ${config.lookbackDays}-day window; an empty window is treated as unconfirmed telemetry rather than as a pass.`,
-      ["Token activity records collected: 0"],
+      [countLine("Token activity records collected", 0, [tokenActivitiesStatus])],
       "Confirm OAuth log events are retained and that the window should contain authorizations.",
       "Collect manually: Admin console > Reporting > Audit and investigation > OAuth log events.",
     ));
@@ -3212,7 +3523,7 @@ export function assessGwsIntegrations(
         "Pass",
         "Token activity telemetry is readable for the configured lookback window.",
         [
-          `Token activity records collected: ${data.tokenActivities.data.length}`,
+          countLine("Token activity records collected", data.tokenActivities.data.length, [tokenActivitiesStatus]),
           `Observed token event names: ${Array.from(new Set(tokenEvents)).slice(0, 6).join(", ") || "none"}`,
         ],
         "Use token-activity reporting to support OAuth app reviews and incident triage.",
@@ -3221,16 +3532,17 @@ export function assessGwsIntegrations(
     ));
   }
 
-  const snapshotSummary = {
-    sampled_users: sampled,
-    active_user_population: population,
-    privileged_users: privileged.privilegedUsers.length,
-    token_records: allTokens.length,
-    privileged_token_records: privilegedTokens.length,
-    high_scope_token_records: highRiskTokens,
-    token_read_failures: failed,
-    token_activity_records: data.tokenActivities.data.length,
-  };
+  const tokenStatus = tokenInventoryStatus(data.tokenInventory);
+  const tokenSampleStatus = tokenInventoryStatus(data.tokenInventory, "sample");
+  const snapshotSummary: GwsSnapshotSummary = {};
+  snapshotCount(snapshotSummary, "sampled_users", sampled, [tokenSampleStatus]);
+  snapshotCount(snapshotSummary, "active_user_population", population, [directoryStatuses[0]]);
+  snapshotCount(snapshotSummary, "privileged_users", privileged.privilegedUsers.length, directoryStatuses);
+  snapshotCount(snapshotSummary, "token_records", allTokens.length, [tokenStatus]);
+  snapshotCount(snapshotSummary, "privileged_token_records", privilegedTokens.length, [tokenStatus, ...directoryStatuses]);
+  snapshotCount(snapshotSummary, "high_scope_token_records", highRiskTokens, [tokenStatus]);
+  snapshotCount(snapshotSummary, "token_read_failures", failed, [tokenSampleStatus]);
+  snapshotCount(snapshotSummary, "token_activity_records", data.tokenActivities.data.length, [tokenActivitiesStatus]);
 
   return {
     category: "integrations",
@@ -3247,6 +3559,10 @@ export function assessGwsMonitoring(
 ): GwsAssessmentResult {
   const suspiciousLogins = countMatchingEvents(data.loginActivities.data, SUSPICIOUS_LOGIN_NAMES);
   const alerts = bucketAlerts(data.alerts.data);
+  const loginStatus = sourceStatus(activitiesEndpoint("login"), data.loginActivities);
+  const adminStatus = sourceStatus(activitiesEndpoint("admin"), data.adminActivities);
+  const tokenStatus = sourceStatus(activitiesEndpoint("token"), data.tokenActivities);
+  const alertsStatus = sourceStatus(ALERTS_ENDPOINT, data.alerts);
 
   const findings: GwsFinding[] = [];
 
@@ -3263,7 +3579,7 @@ export function assessGwsMonitoring(
       "GWS-MON-001",
       "Manual",
       "Alert Center responded but returned zero alerts; an empty list is reported for confirmation rather than treated as proof of a healthy alerting pipeline.",
-      ["Alerts collected: 0"],
+      [countLine("Alerts collected", 0, [alertsStatus])],
       "Confirm Alert Center is enabled and that system-defined rules are turned on for the tenant.",
       "Collect manually: Admin console > Security > Alert center and Rules.",
     ));
@@ -3273,7 +3589,7 @@ export function assessGwsMonitoring(
         "GWS-MON-001",
         "Pass",
         "Alert Center is readable for the tenant.",
-        [`Alerts collected: ${data.alerts.data.length} across ${data.alerts.pages ?? 1} page(s)`],
+        [countLine("Alerts collected", data.alerts.data.length, [alertsStatus]), `Alert pages read: ${data.alerts.pages ?? 1}`],
         "Use Alert Center as one of the tenant's primary security-monitoring inputs.",
       ),
       partialViewEvidence("Alerts", data.alerts),
@@ -3293,14 +3609,14 @@ export function assessGwsMonitoring(
       "GWS-MON-002",
       "Manual",
       `The login audit log returned zero events for the ${config.lookbackDays}-day window, so the suspicious-login backlog could not be measured; emptiness is not treated as a pass.`,
-      ["Login activity records collected: 0"],
+      [countLine("Login activity records collected", 0, [loginStatus])],
       "Confirm login audit logging is retained and that users signed in during the window.",
       "Collect manually: Admin console > Reporting > Audit and investigation > User log events.",
     ));
   } else {
     const evidence = [
-      `Login activity records collected: ${data.loginActivities.data.length}`,
-      `Suspicious login signals: ${suspiciousLogins}`,
+      countLine("Login activity records collected", data.loginActivities.data.length, [loginStatus]),
+      countLine("Suspicious login signals", suspiciousLogins, [loginStatus]),
     ];
     findings.push(withPartialCap(
       suspiciousLogins === 0
@@ -3343,7 +3659,7 @@ export function assessGwsMonitoring(
       "GWS-MON-003",
       "Manual",
       `The admin audit log returned zero events for the ${config.lookbackDays}-day window; emptiness is not treated as proof of telemetry.`,
-      ["Admin activity records collected: 0"],
+      [countLine("Admin activity records collected", 0, [adminStatus])],
       "Confirm admin audit logging is retained for the tenant.",
       "Collect manually: Admin console > Reporting > Audit and investigation > Admin log events.",
     ));
@@ -3353,7 +3669,7 @@ export function assessGwsMonitoring(
         "GWS-MON-003",
         "Pass",
         "Admin audit telemetry is readable for the configured lookback window.",
-        [`Admin activity records collected: ${data.adminActivities.data.length}`],
+        [countLine("Admin activity records collected", data.adminActivities.data.length, [adminStatus])],
         "Use admin activity as a standing control for privileged-change review and investigations.",
       ),
       partialViewEvidence("Admin activities", data.adminActivities),
@@ -3373,7 +3689,7 @@ export function assessGwsMonitoring(
       "GWS-MON-004",
       "Manual",
       `The token audit log returned zero events for the ${config.lookbackDays}-day window; emptiness is not treated as proof of telemetry.`,
-      ["Token activity records collected: 0"],
+      [countLine("Token activity records collected", 0, [tokenStatus])],
       "Confirm OAuth log events are retained for the tenant.",
       "Collect manually: Admin console > Reporting > Audit and investigation > OAuth log events.",
     ));
@@ -3383,7 +3699,7 @@ export function assessGwsMonitoring(
         "GWS-MON-004",
         "Pass",
         "Token audit telemetry is readable for the configured lookback window.",
-        [`Token activity records collected: ${data.tokenActivities.data.length}`],
+        [countLine("Token activity records collected", data.tokenActivities.data.length, [tokenStatus])],
         "Use token activity in third-party app governance and incident response.",
       ),
       partialViewEvidence("Token activities", data.tokenActivities),
@@ -3403,16 +3719,16 @@ export function assessGwsMonitoring(
       "GWS-MON-005",
       "Manual",
       "Alert Center returned zero alerts, so the backlog could not be measured; see GWS-MON-001 for the availability check.",
-      ["Alerts collected: 0"],
+      [countLine("Alerts collected", 0, [alertsStatus])],
       "Confirm Alert Center is populated before relying on the backlog signal.",
       "Collect manually: Admin console > Security > Alert center.",
     ));
   } else {
     const evidence = [
-      `Alerts collected: ${data.alerts.data.length}`,
-      `Open alerts (metadata.status NOT_STARTED or IN_PROGRESS): ${alerts.open}`,
-      `Closed alerts (metadata.status CLOSED): ${alerts.closed}`,
-      `Alerts without metadata.status (reported separately, never counted as closed): ${alerts.unknownStatus}`,
+      countLine("Alerts collected", data.alerts.data.length, [alertsStatus]),
+      countLine("Open alerts (metadata.status NOT_STARTED or IN_PROGRESS)", alerts.open, [alertsStatus]),
+      countLine("Closed alerts (metadata.status CLOSED)", alerts.closed, [alertsStatus]),
+      countLine("Alerts without metadata.status (reported separately, never counted as closed)", alerts.unknownStatus, [alertsStatus]),
     ];
     const unknownNotes = alerts.unknownStatus > 0
       ? [`${alerts.unknownStatus} alert(s) carry no metadata.status and need a manual triage check`]
@@ -3445,15 +3761,14 @@ export function assessGwsMonitoring(
     ));
   }
 
-  const snapshotSummary = {
-    login_activity_records: data.loginActivities.data.length,
-    suspicious_login_signals: suspiciousLogins,
-    admin_activity_records: data.adminActivities.data.length,
-    token_activity_records: data.tokenActivities.data.length,
-    alerts_collected: data.alerts.data.length,
-    open_alerts: alerts.open,
-    alerts_without_status: alerts.unknownStatus,
-  };
+  const snapshotSummary: GwsSnapshotSummary = {};
+  snapshotCount(snapshotSummary, "login_activity_records", data.loginActivities.data.length, [loginStatus]);
+  snapshotCount(snapshotSummary, "suspicious_login_signals", suspiciousLogins, [loginStatus]);
+  snapshotCount(snapshotSummary, "admin_activity_records", data.adminActivities.data.length, [adminStatus]);
+  snapshotCount(snapshotSummary, "token_activity_records", data.tokenActivities.data.length, [tokenStatus]);
+  snapshotCount(snapshotSummary, "alerts_collected", data.alerts.data.length, [alertsStatus]);
+  snapshotCount(snapshotSummary, "open_alerts", alerts.open, [alertsStatus]);
+  snapshotCount(snapshotSummary, "alerts_without_status", alerts.unknownStatus, [alertsStatus]);
 
   return {
     category: "monitoring",
@@ -3542,19 +3857,19 @@ export async function exportGwsAuditBundle(
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, safeName);
 
-  const coreDataFiles: Array<[string, CollectedDataset<JsonRecord[]>]> = [
-    ["core_data/users.json", projectDataset(identity.users, projectUserSnapshot)],
-    ["core_data/roles.json", projectDataset(identity.roles, projectRoleSnapshot)],
-    ["core_data/role_assignments.json", projectDataset(identity.roleAssignments, projectRoleAssignmentSnapshot)],
-    ["core_data/login_activities.json", projectDataset(identity.loginActivities, projectActivitySnapshot)],
-    ["core_data/admin_activities.json", projectDataset(adminAccess.adminActivities, projectActivitySnapshot)],
-    ["core_data/token_activities.json", projectDataset(integrations.tokenActivities, projectActivitySnapshot)],
-    ["core_data/token_inventory.json", projectDataset(integrations.tokenInventory, projectTokenInventorySnapshot)],
-    ["core_data/alerts.json", projectDataset(monitoring.alerts, projectAlertSnapshot)],
-    ["core_data/two_step_verification_policies.json", projectDataset(identity.twoStepPolicies ?? { data: [], error: "not collected" }, projectPolicySnapshot)],
+  const coreDataFiles: Array<[string, JsonRecord]> = [
+    ["core_data/users.json", projectDatasetFile(USERS_ENDPOINT, identity.users, projectUserSnapshot)],
+    ["core_data/roles.json", projectDatasetFile(ROLES_ENDPOINT, identity.roles, projectRoleSnapshot)],
+    ["core_data/role_assignments.json", projectDatasetFile(ROLE_ASSIGNMENTS_ENDPOINT, identity.roleAssignments, projectRoleAssignmentSnapshot)],
+    ["core_data/login_activities.json", projectDatasetFile(activitiesEndpoint("login"), identity.loginActivities, projectActivitySnapshot)],
+    ["core_data/admin_activities.json", projectDatasetFile(activitiesEndpoint("admin"), adminAccess.adminActivities, projectActivitySnapshot)],
+    ["core_data/token_activities.json", projectDatasetFile(activitiesEndpoint("token"), integrations.tokenActivities, projectActivitySnapshot)],
+    ["core_data/token_inventory.json", projectTokenInventoryFile(integrations.tokenInventory)],
+    ["core_data/alerts.json", projectDatasetFile(ALERTS_ENDPOINT, monitoring.alerts, projectAlertSnapshot)],
+    ["core_data/two_step_verification_policies.json", projectDatasetFile(POLICIES_ENDPOINT, identity.twoStepPolicies, projectPolicySnapshot)],
   ];
-  for (const [pathName, dataset] of coreDataFiles) {
-    await writeBundleFile(outputDir, pathName, serializeJson(redactSecrets(dataset)), knownSecrets);
+  for (const [pathName, file] of coreDataFiles) {
+    await writeBundleFile(outputDir, pathName, serializeJson(redactSecrets(file)), knownSecrets);
   }
 
   await writeBundleFile(outputDir, "analysis/findings.json", serializeJson(allFindings), knownSecrets);

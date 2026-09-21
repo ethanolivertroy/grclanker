@@ -834,7 +834,9 @@ test("verdict rule 3: surfaces not collected in this run render Manual instead o
   const finding = findingById(identity, "GWS-ID-005");
   assert.equal(finding.status, "Manual");
   assert.match(finding.summary, /not collected in this run/);
-  assert.equal(identity.snapshotSummary.two_step_policies, "not collected");
+  assert.equal(identity.snapshotSummary.two_step_policies, null);
+  assert.equal(identity.snapshotSummary.two_step_policies_status, "not collected: Cloud Identity policies.list was not queried in this run");
+  assert.match(identity.text, /^- two_step_policies: not collected$/m);
 
   const noEnforcement = assessGwsIdentity({
     users: dataset(createUsers()),
@@ -1387,6 +1389,7 @@ test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INT
     `https://admin.googleapis.com/admin/directory/v1/users/${encodeURIComponent(userKey)}/tokens`,
   );
   const failedRead = "super@example.com (403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions))";
+  const failedFor = (email) => `Directory tokens.list failed for 1 of 4 sampled users (${email}: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions))`;
 
   // Partial branch: super@example.com is denied while delegated@example.com (also privileged) holds one token.
   const partial = await collectGwsAuditData(createFakeCollector({
@@ -1404,7 +1407,7 @@ test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INT
   assert.equal(exposure.status, "Partial");
   assert.match(exposure.summary, /Directory tokens\.list failed for 1 of the privileged users, so the privileged token count is a lower bound\.$/);
   assert.ok(exposure.evidence.includes("Privileged users with readable tokens.list: 1 of 2 (tokens.list failed: super@example.com)"), exposure.evidence.join("\n"));
-  assert.ok(exposure.evidence.includes("Privileged third-party tokens: at least 1 (tokens.list failed for 1 privileged user(s))"));
+  assert.ok(exposure.evidence.includes(`Privileged third-party tokens: at least 1 (${failedFor("super@example.com")})`), exposure.evidence.join("\n"));
   assert.ok(exposure.evidence.includes("Privileged token clients: Drive Syncer (client-1)"));
   assert.ok(exposure.evidence.includes("Per-user token reads that failed: 1 of 4 sampled users"));
   assert.ok(exposure.evidence.includes("Token inventory errors: super@example.com: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"));
@@ -1432,7 +1435,7 @@ test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INT
   const broadExposure = findingById(assessGwsIntegrations(broad.integrations, config), "GWS-INTEG-002");
   assert.equal(broadExposure.status, "Fail");
   assert.match(broadExposure.summary, /so the privileged token count is a lower bound\.$/);
-  assert.ok(broadExposure.evidence.includes("Privileged third-party tokens: at least 4 (tokens.list failed for 1 privileged user(s))"));
+  assert.ok(broadExposure.evidence.includes(`Privileged third-party tokens: at least 4 (${failedFor("super@example.com")})`), broadExposure.evidence.join("\n"));
   assert.ok(broadExposure.evidence.includes(`Directory tokens.list failed for privileged users: ${failedRead}`));
 
   // Manual branch: the denied privileged read with no privileged token in sight names the endpoint and the user in the summary.
@@ -1448,7 +1451,7 @@ test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INT
   assert.ok(manual.evidence.includes(`Directory tokens.list failed for privileged users: ${failedRead}`));
   assert.ok(manual.evidence.includes("Per-user token reads that failed: 1 of 4 sampled users"));
 
-  // A failure outside the privileged set is still named, but the privileged counts stay exact.
+  // A failure outside the privileged set is still named, every privileged read is shown as readable, and the counts stay lower bounds.
   const outsider = await collectGwsAuditData(createFakeCollector({
     listUserTokens: async (userKey) => {
       if (userKey === "dormant@example.com") throw denied(userKey);
@@ -1457,11 +1460,12 @@ test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INT
   }));
   const outsiderExposure = findingById(assessGwsIntegrations(outsider.integrations, config), "GWS-INTEG-002");
   assert.equal(outsiderExposure.status, "Partial");
-  assert.ok(outsiderExposure.evidence.includes("Privileged users sampled: 2 of 2"));
-  assert.ok(outsiderExposure.evidence.includes("Privileged third-party tokens: 1"));
+  assert.ok(outsiderExposure.evidence.includes("Privileged users with readable tokens.list: 2 of 2"), outsiderExposure.evidence.join("\n"));
+  assert.ok(outsiderExposure.evidence.includes(`Privileged third-party tokens: at least 1 (${failedFor("dormant@example.com")})`));
   assert.ok(outsiderExposure.evidence.includes("Token inventory errors: dormant@example.com: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"));
-  assert.ok(outsiderExposure.evidence.includes("Directory tokens.list failed only for users outside the privileged set, so the privileged counts are complete"));
-  assert.equal(/lower bound/.test(outsiderExposure.summary), false);
+  assert.ok(outsiderExposure.evidence.includes("Directory tokens.list failed only for users outside the identified privileged set; every token count is still a lower bound"));
+  assert.match(outsiderExposure.summary, /Directory tokens\.list failed for 1 of 4 sampled users, so the token counts are lower bounds\.$/);
+  assert.equal(outsiderExposure.evidence.some((line) => /^Privileged third-party tokens: \d+$/.test(line)), false, "no exact privileged count beside a failed read");
 
   // A dataset that reports failures without naming users cannot attribute them, so every privileged count is a lower bound.
   const unattributed = assessGwsIntegrations({
