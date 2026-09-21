@@ -124,7 +124,11 @@ const AUTHENTICATION_POLICY_PATTERN =
   /client-id-enforcement|jwt|oauth|openid|basic-auth|http-basic|saml|mtls|tls/i;
 const RATE_LIMIT_POLICY_PATTERN = /rate-limit|spike-control/i;
 const SENSITIVE_PROPERTY_PATTERN = /pass(word|wd)?|secret|token|api[-_]?key|private[-_]?key|credential/i;
-const SECRET_KEY_PATTERN = /secret|password|passwd|token|private[_-]?key|authorization/i;
+// Tested against key names normalized to lowercase with underscores, hyphens, and spaces removed, so camelCase and
+// snake_case variants (apiKey, api_key, signing-key) all match.
+const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorization|apikey|accesskey|credential|textkey|signingkey|community|hash/;
+const REDACTED = "[REDACTED]";
+const MAX_REDACTION_DEPTH = 32;
 const PRODUCTION_NAME_PATTERN = /\bprod(uction)?\b/i;
 const NON_PRODUCTION_NAME_PATTERN = /\b(sandbox|dev(elopment)?|test|qa|uat|staging|stage)\b/i;
 
@@ -513,15 +517,37 @@ function truncationNote(label: string, page: MulesoftPage): string | undefined {
   return `${label} list truncated at ${page.items.length} of ${pageTotalLabel(page)}`;
 }
 
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key.toLowerCase().replace(/[-_\s]/g, ""));
+}
+
+function redactUrlQuery(text: string): string {
+  if (!/^https?:\/\/[^?]+\?/i.test(text)) return text;
+  return text.replace(/([?&])([^=&#]+)=([^&#]*)/g, (match, separator: string, key: string) => (
+    isSecretKey(key) ? `${separator}${key}=${REDACTED}` : match
+  ));
+}
+
+function isSecretNamedPair(object: JsonRecord): boolean {
+  if (!("value" in object)) return false;
+  const name = asString(object.name) ?? asString(object.key);
+  return name !== undefined && isSecretKey(name);
+}
+
+function redactedValue(entry: unknown): unknown {
+  return entry === null || entry === undefined || typeof entry === "boolean" ? entry : REDACTED;
+}
+
 export function redactSnapshot(value: unknown, depth = 0): unknown {
-  if (depth > 16) return value;
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED;
+  if (typeof value === "string") return redactUrlQuery(value);
   if (Array.isArray(value)) return value.map((item) => redactSnapshot(item, depth + 1));
   const object = asObject(value);
   if (!object) return value;
+  const secretPair = isSecretNamedPair(object);
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
-    const isScalar = typeof entry === "string" || typeof entry === "number";
-    output[key] = SECRET_KEY_PATTERN.test(key) && isScalar ? "[REDACTED]" : redactSnapshot(entry, depth + 1);
+    output[key] = isSecretKey(key) || (secretPair && key === "value") ? redactedValue(entry) : redactSnapshot(entry, depth + 1);
   }
   return output;
 }
@@ -1203,7 +1229,11 @@ export class MulesoftApiClient {
       items.push(...pageItems.slice(0, limit - items.length));
       offset += pageItems.length;
 
-      if (pageItems.length === 0) break;
+      if (pageItems.length === 0) {
+        // An empty page below a server-reported total means the remainder was never delivered.
+        truncated = total !== undefined && offset < total;
+        break;
+      }
       if (total !== undefined && offset >= total) break;
       if (items.length >= limit) {
         truncated = total !== undefined
@@ -1925,7 +1955,10 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       2,
-      { primary: [mfaExemptUsers], partial: [truncationNote("members", members.value), scopeNote] },
+      {
+        primary: [mfaExemptUsers],
+        partial: [truncationNote("MFA-exempt users", mfaExemptUsers.value), truncationNote("members", members.value), scopeNote],
+      },
       "Capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.",
       () => {
         const evidence = {
@@ -1949,6 +1982,7 @@ export async function assessMulesoftIdentityAccess(
         primary: [roleGroups, roleGroupRolesSource, adminUsersSource],
         partial: [
           truncationNote("role groups", roleGroups.value),
+          truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
           adminUsersTruncated ? `admin role group membership truncated at ${adminUsers.size} users` : undefined,
           scopeNote,
         ],
@@ -2201,6 +2235,32 @@ function policyAssetId(policy: JsonRecord): string {
   ])) ?? "policy";
 }
 
+function projectPolicyAsset(asset: unknown): JsonRecord | null {
+  const record = asObject(asset);
+  if (!record) return null;
+  return {
+    groupId: asString(record.groupId) ?? null,
+    assetId: asString(record.assetId) ?? null,
+    assetVersion: asString(record.assetVersion) ?? asString(record.version) ?? null,
+  };
+}
+
+// configurationData carries the policy's own settings (JWT secrets, injected header values, client credentials),
+// so the snapshot keeps a marker in its place rather than the tree.
+function projectApiPolicy(policy: JsonRecord): JsonRecord {
+  return {
+    policyId: asString(policy.policyId) ?? asString(policy.id) ?? null,
+    assetId: asString(policy.assetId) ?? null,
+    assetVersion: asString(policy.assetVersion) ?? null,
+    policyTemplateId: asString(policy.policyTemplateId) ?? null,
+    template: projectPolicyAsset(policy.template),
+    implementationAsset: projectPolicyAsset(policy.implementationAsset),
+    disabled: asBoolean(policy.disabled) ?? null,
+    order: asNumber(policy.order) ?? null,
+    configurationData: policy.configurationData === undefined ? null : REDACTED,
+  };
+}
+
 type PolicyState = "enabled" | "disabled" | "unknown";
 type PolicyCoverage = "enforced" | "unknown_state" | "missing";
 
@@ -2427,7 +2487,7 @@ export async function assessMulesoftApiGateway(
         environment: environmentLabel(record.environment),
         environment_id: asString(record.environment.id),
         api: record.api,
-        policies: record.policies.value,
+        policies: record.policies.value.map(projectApiPolicy),
         policies_error: record.policies.error ?? null,
       }))),
       exchange_assets: redactSnapshot(organizationAssets),
@@ -2480,6 +2540,46 @@ function insecureSensitiveProperties(application: JsonRecord): string[] {
       return !secure && !masked;
     })
     .map(([key]) => key);
+}
+
+// The snapshot keeps only what the runtime verdicts read. Property values are never copied, since CloudHub returns
+// plaintext values for every property that is not marked secure.
+function projectCloudhubApplication(application: JsonRecord): JsonRecord {
+  const properties = asObject(application.properties);
+  const propertyOptions = asObject(application.propertiesOptions) ?? {};
+  const workers = asObject(application.workers);
+  const workerType = asObject(workers?.type);
+  const version = asObject(application.muleVersion);
+  return {
+    id: asString(application.id) ?? null,
+    domain: asString(application.domain) ?? null,
+    name: asString(application.name) ?? null,
+    status: asString(application.status) ?? null,
+    region: asString(application.region) ?? null,
+    muleVersion: version
+      ? {
+        version: asString(version.version) ?? null,
+        endOfSupportDate: asString(version.endOfSupportDate) ?? null,
+        endOfLifeDate: asString(version.endOfLifeDate) ?? null,
+      }
+      : asString(application.muleVersion) ?? null,
+    runtimeVersion: asString(application.runtimeVersion) ?? null,
+    workers: workers
+      ? {
+        amount: asNumber(workers.amount) ?? null,
+        type: workerType ? { name: asString(workerType.name) ?? null, weight: asNumber(workerType.weight) ?? null } : null,
+        recentStatistics: { cpu: workerCpu(application) ?? null },
+      }
+      : null,
+    persistentQueues: asBoolean(application.persistentQueues) ?? null,
+    persistentQueuesEncrypted: asBoolean(application.persistentQueuesEncrypted) ?? null,
+    persistentQueuesEncryptionEnabled: asBoolean(application.persistentQueuesEncryptionEnabled) ?? null,
+    properties: properties ? Object.fromEntries(Object.keys(properties).map((key) => [key, REDACTED])) : null,
+    securePropertyKeys: properties
+      ? Object.keys(properties).filter((key) => asBoolean(getNestedValue(propertyOptions, [key, "secure"])) === true)
+      : null,
+    insecureSensitiveProperties: insecureSensitiveProperties(application),
+  };
 }
 
 function cidrPrefixLength(cidr: string): number | undefined {
@@ -2715,6 +2815,10 @@ export async function assessMulesoftRuntimeInfrastructure(
   }
   const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails);
   const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
+  // Certificate probes read sslEndpoints from the merged record, so a failed detail read leaves endpoints unprobed.
+  const loadBalancerDetailNote = loadBalancerDetailsSource.error
+    ? `${describeFailure(loadBalancerDetailsSource)}, so SSL endpoints carried only by the detail record were not probed`
+    : undefined;
   const certificateProbes: CertificateProbeRecord[] = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);
@@ -2837,7 +2941,7 @@ export async function assessMulesoftRuntimeInfrastructure(
   const applicationInputs: EvaluationInputs = { primary: [environments.source, applicationsSource], partial: applicationPartialNotes };
   const vpcInputs: EvaluationInputs = { primary: [vpcSummaries, vpcDetailsSource], partial: [vpcPartialNote, scope.note] };
   const loadBalancerTlsInputs: EvaluationInputs = { primary: [loadBalancerSource, loadBalancerDetailsSource], partial: [loadBalancerPartialNote, scope.note] };
-  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote, scope.note] };
+  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote, loadBalancerDetailNote, scope.note] };
   const zeroApplicationsSummary = `Zero CloudHub 1.0 applications were visible in ${environments.sampled.length} sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.`;
   const noVpcSummary = "Zero CloudHub VPCs are visible, which is treated as manual. If applications run in CloudHub 2.0 private spaces or Runtime Fabric, export the private space firewall rules or cluster network policy from Runtime Manager as evidence.";
   const noLoadBalancerSummary = "No dedicated load balancers exist, so this control is not applicable and is recorded as manual: confirm whether applications are exposed through the shared load balancer or CloudHub 2.0 ingress, whose TLS configuration MuleSoft manages.";
@@ -3145,7 +3249,7 @@ export async function assessMulesoftRuntimeInfrastructure(
       cloudhub_applications: redactSnapshot(applications.map((item) => ({
         environment: environmentLabel(item.environment),
         environment_id: asString(item.environment.id),
-        application: item.application,
+        application: projectCloudhubApplication(item.application),
       }))),
       vpcs: redactSnapshot(vpcs),
       load_balancers: redactSnapshot(loadBalancers),
@@ -3363,7 +3467,10 @@ export async function assessMulesoftAuditMonitoring(
         const retentionNote = auditRetentionNote(retention, retentionSettings);
         if (recentEntries.length > 0) {
           const fetchedNote = entriesInWindow > recentEntries.length ? ` (${recentEntries.length} fetched)` : "";
-          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote} across ${platforms.value.length} platform(s).${retentionNote}`, evidence);
+          const platformsNote = platforms.error
+            ? `; the audit platform list is unknown because ${describeFailure(platforms)}.`
+            : ` across ${platforms.value.length} platform(s).`;
+          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote}${platformsNote}${retentionNote}`, evidence);
         }
         if (fallbackEntries.length > 0) {
           return verdict("warn", `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.${retentionNote}`, evidence);
@@ -3434,7 +3541,7 @@ export async function assessMulesoftAuditMonitoring(
     snapshots: {
       audit_platforms: redactSnapshot(platforms.value),
       audit_retention_settings: redactSnapshot(retentionSettings.value),
-      audit_log_recent: redactSnapshot(recentEntries),
+      audit_log_recent: redactSnapshot(recentEntries.map(auditEntrySummary)),
       alerts: redactSnapshot(alertCoverage.map((item) => ({
         environment: item.environment,
         cloudhub_alerts: item.cloudhubAlerts.value,
@@ -3783,7 +3890,7 @@ function buildQuickReference(): string {
   return [
     "# MuleSoft Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Anypoint Platform API responses used during this assessment, with secret-bearing fields redacted.",
+    "- `core_data/` contains the Anypoint Platform API responses used during this assessment, with secret-bearing fields redacted; CloudHub application properties, API policy configuration, and audit log entries are projected to the fields the verdicts read.",
     "- `analysis/findings.json` contains every normalized finding; `analysis/<category>.json` contains each assessment with its summary.",
     "- `analysis/summary.json` contains per-category status counts.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",

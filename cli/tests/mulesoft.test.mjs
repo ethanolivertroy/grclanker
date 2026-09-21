@@ -32,6 +32,7 @@ import {
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/mulesoft.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ORG_ID = "org-1";
@@ -2375,7 +2376,8 @@ test("review fix 4: RT-15 evaluates defaultCipherSuite, failing weak ciphers and
   }));
   assert.equal(statusOf(detailForbidden, "MULESOFT-RT-15"), "manual");
   assert.match(findingById(detailForbidden, "MULESOFT-RT-15").summary, /Could not evaluate: load_balancer_details could not be read, the credential lacks permission \(HTTP 403\)/);
-  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "pass", "the certificate control does not depend on the DLB detail read");
+  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "warn", "the certificate probe reads sslEndpoints from the merged record, so a failed detail read is a partial view");
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-16").summary, /^Partial view: load_balancer_details could not be read, the credential lacks permission \(HTTP 403\): .*so SSL endpoints carried only by the detail record were not probed/);
 });
 
 function opensslAvailable() {
@@ -2534,4 +2536,321 @@ test("optional: AUD-17 records the audit log retention period as evidence withou
   const allForbidden = await assessMulesoftAuditMonitoring(forbidAll(healthyAuditClient()));
   assert.equal(statusOf(allForbidden, "MULESOFT-AUD-17"), "manual");
   assert.ok(allForbidden.errors.some((error) => error.startsWith("audit_retention_settings:")));
+});
+
+// Verdict safety rules 9 and 10 (export credential hygiene and pagination truncation), plus the rule 1 corollary.
+
+const FAKE_MULESOFT_SECRETS = {
+  connectedAppSecret: "FAKE-MULESOFT-CONNECTED-APP-SECRET-01",
+  oidcClientSecret: "FAKE-MULESOFT-OIDC-CLIENT-SECRET-02",
+  mqClientSecret: "FAKE-MULESOFT-MQ-CLIENT-SECRET-03",
+  cloudhubApiKey: "FAKE-MULESOFT-CLOUDHUB-API-KEY-04",
+  cloudhubJdbcPassword: "FAKE-MULESOFT-JDBC-PASSWORD-05",
+  cloudhubPlainProperty: "FAKE-MULESOFT-PLAIN-PROPERTY-VALUE-06",
+  policyTextKey: "FAKE-MULESOFT-JWT-TEXT-KEY-07",
+  policyHeaderValue: "FAKE-MULESOFT-HEADER-BEARER-08",
+  policyClientSecret: "FAKE-MULESOFT-POLICY-CLIENT-SECRET-09",
+  auditPayloadSecret: "FAKE-MULESOFT-AUDIT-PAYLOAD-SECRET-10",
+  exchangeUrlToken: "FAKE-MULESOFT-EXCHANGE-URL-TOKEN-11",
+  alertWebhookToken: "FAKE-MULESOFT-ALERT-WEBHOOK-TOKEN-12",
+  secretGroupValue: "FAKE-MULESOFT-SECRET-GROUP-VALUE-13",
+  loadBalancerPrivateKey: "FAKE-MULESOFT-DLB-PRIVATE-KEY-14",
+  organizationAccessKey: "FAKE-MULESOFT-ORGANIZATION-ACCESS-KEY-15",
+  serverCredential: "FAKE-MULESOFT-HYBRID-SERVER-CREDENTIAL-16",
+};
+
+function secretBearingBundleClient() {
+  const secrets = FAKE_MULESOFT_SECRETS;
+  return healthyBundleClient({
+    async getOrganization() {
+      return { id: ORG_ID, name: "Acme", isFederated: true, entitlements: { createSubOrgs: true }, accessKey: secrets.organizationAccessKey };
+    },
+    async listIdentityProviders() {
+      return [
+        { provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" } },
+        { provider_id: "idp-2", name: "Entra OIDC", type: { name: "openid" }, oidc_provider: { client: { credentials: { client_id: "oidc-client", client_secret: secrets.oidcClientSecret } } } },
+      ];
+    },
+    async listConnectedApplications() {
+      return [{ client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3), client_secret: secrets.connectedAppSecret }];
+    },
+    async listApiPolicies() {
+      return [
+        {
+          policyId: 1,
+          assetId: "jwt-validation",
+          template: { groupId: "68ef9520-24e9-4cf2-b2f5-620025690913", assetId: "jwt-validation", assetVersion: "1.3.2" },
+          disabled: false,
+          order: 1,
+          configurationData: {
+            jwtOrigin: "httpBearerAuthenticationHeader",
+            signingMethod: "hmac",
+            textKey: secrets.policyTextKey,
+            clientIdExpression: "#[vars.claimSet.client_id]",
+          },
+        },
+        {
+          policyId: 2,
+          assetId: "header-injection",
+          disabled: false,
+          order: 2,
+          configurationData: { inboundHeaders: [{ key: "Authorization", value: `Bearer ${secrets.policyHeaderValue}` }] },
+        },
+        {
+          policyId: 3,
+          assetId: "rate-limiting",
+          disabled: false,
+          order: 3,
+          configurationData: { rateLimits: [{ maximumRequests: 100, timePeriodInMilliseconds: 60000 }], upstream: { client_secret: secrets.policyClientSecret } },
+        },
+      ];
+    },
+    async listExchangeAssets() {
+      return [{
+        organizationId: ORG_ID,
+        assetId: "orders-api",
+        name: "Orders API",
+        status: "published",
+        isPublic: false,
+        type: "rest-api",
+        icon: `https://exchange.example.com/icons/orders-api.png?token=${secrets.exchangeUrlToken}&v=2`,
+      }];
+    },
+    async listCloudhubApplications(environmentId) {
+      if (environmentId !== "env-prod") return [];
+      return [{
+        domain: "orders-prod",
+        muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
+        workers: { amount: 2, type: { name: "Small", weight: 0.2 }, recentStatistics: { cpu: 45 } },
+        persistentQueues: true,
+        persistentQueuesEncrypted: true,
+        properties: {
+          "db.password": "****",
+          "db.url": `jdbc:postgresql://db.internal/orders?user=svc&sslmode=require&plain=${secrets.cloudhubPlainProperty}`,
+          "downstream.apiKey": secrets.cloudhubApiKey,
+          "legacy.jdbc.password": secrets.cloudhubJdbcPassword,
+        },
+        propertiesOptions: { "db.password": { secure: true }, "legacy.jdbc.password": { secure: false } },
+      }];
+    },
+    async listLoadBalancers() {
+      return [{
+        id: "lb-1",
+        name: "prod-dlb",
+        domain: "prod-dlb.lb.anypointdns.net",
+        httpMode: "redirect",
+        tlsv1: false,
+        tlsv13: true,
+        state: "STARTED",
+        defaultCipherSuite: STRONG_CIPHER_SUITE,
+        sslEndpoints: [{ publicKeyLabel: "api-cert", privateKeyLabel: "api-key", privateKey: secrets.loadBalancerPrivateKey }],
+      }];
+    },
+    async listHybridServers(environmentId) {
+      return environmentId === "env-prod"
+        ? [{ id: 1, name: "onprem-1", status: "RUNNING", muleVersion: "4.6.0", registration: { credentials: { token: secrets.serverCredential } } }]
+        : [];
+    },
+    async listMqClients() {
+      return [{ clientId: "mq-client-1", clientSecret: secrets.mqClientSecret }];
+    },
+    async listSecretGroups(environmentId) {
+      return environmentId === "env-prod" ? [{ id: "sg-1", name: "prod-secrets", secrets: [{ name: "tls-key", value: secrets.secretGroupValue }] }] : [];
+    },
+    async queryAuditLogs() {
+      return {
+        data: [{
+          timestamp: new Date().toISOString(),
+          platform: "Access Management",
+          action: "LOGIN",
+          objectType: "User",
+          payload: { body: `password=${secrets.auditPayloadSecret}` },
+        }],
+        total: 42,
+      };
+    },
+    async listCloudhubAlerts(environmentId) {
+      return environmentId === "env-prod"
+        ? [{ id: "alert-1", name: "CPU", enabled: true, condition: { resources: ["*"] }, actions: [{ type: "webhook", url: `https://hooks.example.com/services/T1/B2?token=${secrets.alertWebhookToken}` }] }]
+        : [];
+    },
+  });
+}
+
+test("verdict safety rule 9: redactSnapshot masks normalized key variants, nested trees, name/value pairs, URL query tokens, and deep nesting", () => {
+  const deep = { level: 0 };
+  let cursor = deep;
+  for (let index = 1; index <= 40; index += 1) {
+    cursor.child = { level: index, password: `deep-secret-${index}` };
+    cursor = cursor.child;
+  }
+  const redacted = redactSnapshot({
+    apiKey: "camel-secret",
+    access_key: "snake-secret",
+    "signing-key": "kebab-secret",
+    textKey: "jwt-secret",
+    community: "public-community",
+    passwordHash: "hash-secret",
+    credentials: { client_id: "keep-me", client_secret: "nested-secret" },
+    tokens: ["array-secret-1", "array-secret-2"],
+    headers: [{ key: "Authorization", value: "Bearer pair-secret" }, { name: "X-Trace", value: "trace-1" }],
+    webhook: "https://hooks.example.com/hook?token=url-secret&channel=ops",
+    flag: true,
+    hashed: false,
+    nothing: null,
+    deep,
+  });
+
+  for (const key of ["apiKey", "access_key", "signing-key", "textKey", "community", "passwordHash", "credentials", "tokens"]) {
+    assert.equal(redacted[key], "[REDACTED]", key);
+  }
+  assert.equal(redacted.headers[0].value, "[REDACTED]");
+  assert.equal(redacted.headers[0].key, "Authorization");
+  assert.equal(redacted.headers[1].value, "trace-1");
+  assert.equal(redacted.webhook, "https://hooks.example.com/hook?token=[REDACTED]&channel=ops");
+  assert.equal(redacted.flag, true);
+  assert.equal(redacted.hashed, false);
+  assert.equal(redacted.nothing, null);
+  const serialized = JSON.stringify(redacted);
+  assert.doesNotMatch(serialized, /deep-secret-/);
+  assert.doesNotMatch(serialized, /-secret"/);
+  assert.doesNotMatch(serialized, /keep-me/, "an object under a credential-bearing key is dropped whole rather than descended into");
+});
+
+test("verdict safety rule 9: exportMulesoftAuditBundle never writes connected app, OIDC, MQ, CloudHub property, policy configuration, or URL-embedded secrets into the bundle, its zip, or the tool payloads", async () => {
+  const base = createTempBase("grclanker-mulesoft-export-secrets-");
+  const secrets = Object.values(FAKE_MULESOFT_SECRETS);
+  const client = secretBearingBundleClient();
+  const result = await exportMulesoftAuditBundle(client, sampleConfig(), base);
+  assert.equal(result.errorCount, 0);
+
+  const files = readBundleFiles(result.outputDir);
+  for (const file of [
+    "core_data/connected_applications.json",
+    "core_data/identity_providers.json",
+    "core_data/api_manager_apis.json",
+    "core_data/exchange_assets.json",
+    "core_data/cloudhub_applications.json",
+    "core_data/load_balancers.json",
+    "core_data/hybrid_servers.json",
+    "core_data/mq_clients.json",
+    "core_data/secret_groups.json",
+    "core_data/audit_log_recent.json",
+    "core_data/alerts.json",
+    "core_data/organization.json",
+    "analysis/runtime_infrastructure.json",
+  ]) {
+    assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const payloads = JSON.stringify([
+    await checkMulesoftAccess(client),
+    await assessMulesoftIdentityAccess(client),
+    await assessMulesoftApiGateway(client),
+    await assessMulesoftRuntimeInfrastructure(client),
+    await assessMulesoftAuditMonitoring(client),
+  ]);
+  for (const secret of secrets) {
+    assert.ok(!payloads.includes(secret), `tool payloads must not carry ${secret}`);
+  }
+
+  const connectedApps = JSON.parse(files.get("core_data/connected_applications.json"));
+  assert.equal(connectedApps[0].client_secret, "[REDACTED]");
+  assert.equal(connectedApps[0].client_id, "app-1");
+  const providers = JSON.parse(files.get("core_data/identity_providers.json"));
+  assert.equal(providers[1].oidc_provider.client.credentials, "[REDACTED]");
+  const applications = JSON.parse(files.get("core_data/cloudhub_applications.json"));
+  assert.deepEqual(applications[0].application.properties, {
+    "db.password": "[REDACTED]",
+    "db.url": "[REDACTED]",
+    "downstream.apiKey": "[REDACTED]",
+    "legacy.jdbc.password": "[REDACTED]",
+  });
+  assert.deepEqual(applications[0].application.securePropertyKeys, ["db.password"]);
+  assert.deepEqual(applications[0].application.insecureSensitiveProperties, ["downstream.apiKey", "legacy.jdbc.password"]);
+  assert.equal(applications[0].application.muleVersion.version, "4.6.0");
+  assert.equal(applications[0].application.workers.recentStatistics.cpu, 45);
+  const apis = JSON.parse(files.get("core_data/api_manager_apis.json"));
+  const productionPolicies = apis.find((record) => record.environment === "Production").policies;
+  assert.deepEqual(productionPolicies.map((policy) => policy.assetId), ["jwt-validation", "header-injection", "rate-limiting"]);
+  assert.ok(productionPolicies.every((policy) => policy.configurationData === "[REDACTED]"));
+  assert.equal(productionPolicies[0].template.assetVersion, "1.3.2");
+  assert.equal(productionPolicies[0].disabled, false);
+  const assets = JSON.parse(files.get("core_data/exchange_assets.json"));
+  assert.equal(assets[0].icon, "https://exchange.example.com/icons/orders-api.png?token=[REDACTED]&v=2");
+  const mqClients = JSON.parse(files.get("core_data/mq_clients.json"));
+  assert.equal(mqClients[0].clients[0].clientSecret, "[REDACTED]");
+  const auditLog = JSON.parse(files.get("core_data/audit_log_recent.json"));
+  assert.deepEqual(Object.keys(auditLog[0]).sort(), ["action", "object_type", "platform", "timestamp"]);
+  const alerts = JSON.parse(files.get("core_data/alerts.json"));
+  assert.equal(alerts[0].cloudhub_alerts[0].actions[0].url, "https://hooks.example.com/services/T1/B2?token=[REDACTED]");
+  const runtime = JSON.parse(files.get("analysis/runtime_infrastructure.json"));
+  assert.equal(findingById(runtime, "MULESOFT-RT-22").status, "fail");
+  assert.deepEqual(findingById(runtime, "MULESOFT-RT-22").evidence.insecure_property_keys, ["Production: orders-prod: downstream.apiKey, legacy.jdbc.password"]);
+});
+
+test("verdict safety rule 10: listOffset marks an empty page below the server-reported total as truncated and the dependent findings demote", async () => {
+  const requests = [];
+  const hiddenRemainder = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const offset = Number(url.searchParams.get("offset"));
+    requests.push(offset);
+    return jsonResponse(offset === 0 ? { data: [{ id: "u1" }, { id: "u2" }], total: 6 } : { data: [], total: 6 });
+  };
+  const page = await new MulesoftApiClient(sampleConfig(), { fetchImpl: hiddenRemainder })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 100, pageSize: 2 });
+  assert.deepEqual(page.items.map((item) => item.id), ["u1", "u2"]);
+  assert.equal(page.total, 6);
+  assert.equal(page.truncated, true, "the server said 6 but delivered 2, so the remainder was never seen");
+  assert.deepEqual(requests, [0, 2]);
+
+  const completeEmpty = await new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ data: [], total: 0 }),
+  }).listOffset("/accounts/api/organizations/org-1/members", { limit: 100, pageSize: 2 });
+  assert.equal(completeEmpty.truncated, false, "an empty collection with total 0 is complete");
+
+  const mfaTruncated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listMfaExemptUsers() {
+      return truncatedPage([], 3);
+    },
+  }));
+  assert.equal(statusOf(mfaTruncated, "MULESOFT-IAM-02"), "manual");
+  assert.match(findingById(mfaTruncated, "MULESOFT-IAM-02").summary, /Partial view: MFA-exempt users list truncated at 0 of 3 total/);
+
+  const rolesTruncated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listRoleGroupRoles(roleGroupId) {
+      const roles = await healthyIdentityClient().listRoleGroupRoles(roleGroupId);
+      return roleGroupId === "rg-dev" ? truncatedPage(roles, 80) : roles;
+    },
+  }));
+  assert.equal(statusOf(rolesTruncated, "MULESOFT-IAM-03"), "warn");
+  assert.match(findingById(rolesTruncated, "MULESOFT-IAM-03").summary, /Partial view: role assignments truncated for Developers/);
+  assert.match(findingById(rolesTruncated, "MULESOFT-IAM-03").summary, /cannot pass on this sample/);
+});
+
+test("rule 1 corollary: each secondary read forbidden one at a time with the primary healthy is named in the dependent summary", async () => {
+  const detailForbidden = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listLoadBalancers() {
+      return [{ id: "lb-1", name: "prod-dlb", domain: "prod-dlb.lb.anypointdns.net", vpcId: "vpc-1", httpMode: "redirect", tlsv1: false, tlsv13: true, state: "STARTED" }];
+    },
+    getLoadBalancer: forbidden("/cloudhub/api/organizations/org-1/vpcs/vpc-1/loadbalancers/lb-1"),
+  }));
+  assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "warn");
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-16").summary, /load_balancer_details could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.match(findingById(detailForbidden, "MULESOFT-RT-16").summary, /cannot pass on this sample/);
+  assert.deepEqual(findingById(detailForbidden, "MULESOFT-RT-16").evidence.partial_view.length, 1);
+
+  const platformsForbidden = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    listAuditPlatforms: forbidden("/audit/v2/organizations/org-1/platforms"),
+  }));
+  const audit = findingById(platformsForbidden, "MULESOFT-AUD-17");
+  assert.equal(audit.status, "pass", "the verdict rests on the audit query, which succeeded");
+  assert.match(audit.summary, /42 audit log entries recorded within the last 24 hours \(1 fetched\); the audit platform list is unknown because audit_platforms could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.doesNotMatch(audit.summary, /across 0 platform\(s\)/);
+  assert.match(audit.evidence.platforms_error, /403 Forbidden/);
+  assert.ok(platformsForbidden.errors.some((error) => error.startsWith("audit_platforms:")));
 });
