@@ -33,7 +33,7 @@ Required read access for a complete run: organization owner (or an App with orga
 
 | Tool | What it does |
 |------|--------------|
-| `github_check_access` | Probes the org profile, members, repositories, audit log, organization roles, rulesets, Actions permissions, and code security configurations and reports `healthy` or `limited` |
+| `github_check_access` | Probes the org profile, members, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations and reports `healthy` or `limited` |
 | `github_assess_org_access` | Identity and access findings GITHUB-ORG-001 to GITHUB-ORG-011 |
 | `github_assess_repo_protection` | Repository protection findings GITHUB-REPO-001 to GITHUB-REPO-007 |
 | `github_assess_actions_security` | Actions findings GITHUB-ACT-001 to GITHUB-ACT-005 |
@@ -61,11 +61,11 @@ All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app
 | 12 Required Status Checks | repo_protection | GITHUB-REPO-007 | Pass when every active repository requires a status check |
 | 13 Signed Commit Requirement | repo_protection | GITHUB-REPO-003 | Pass when every active repository enforces signatures |
 | 14 Repository Rulesets | repo_protection | GITHUB-REPO-001 | Pass when active org rulesets reach every repository |
-| 15 Code Scanning Enabled | code_security | GITHUB-CODE-005 | Pass when a default configuration enables default setup |
-| 16 Secret Scanning Enabled | code_security | GITHUB-CODE-002, GITHUB-CODE-003 | Pass on the org defaults or the default configuration |
-| 17 Dependabot Enabled | code_security | GITHUB-CODE-004 | Pass when alerts and security updates are both on |
+| 15 Code Scanning Enabled | code_security | GITHUB-CODE-005 | Pass when every default code security configuration (public and private_and_internal, or all) enables default setup and is enforced; Partial on an unenforced default or a single-visibility default; Fail with no default |
+| 16 Secret Scanning Enabled | code_security | GITHUB-CODE-002, GITHUB-CODE-003 | Same defaults evaluation for secret scanning and push protection; the deprecated organization flags corroborate only |
+| 17 Dependabot Enabled | code_security | GITHUB-CODE-004 | Same defaults evaluation with alerts and security updates both required |
 | 18 Security Policy | code_security | GITHUB-CODE-006 | Manual (deferred GraphQL sweep) |
-| 19 Audit Log Streaming | org_access | GITHUB-ORG-011 | Manual (enterprise-level endpoint); GITHUB-ORG-005 covers visibility only |
+| 19 Audit Log Streaming | org_access | GITHUB-ORG-011 | Manual (enterprise-level endpoint); GITHUB-ORG-005 covers visibility only, reads the lookback window through `phrase=created:>=YYYY-MM-DD`, and states when the 200-event sample was capped |
 | 20 Webhook Security | integrations | GITHUB-INTEG-001 | Fail on plain HTTP, `insecure_ssl = 1`, or a missing secret |
 | 21 Actions Permissions | actions_security | GITHUB-ACT-001, 002, 003, 005 | Pass on selected or local-only actions, read-only tokens, no workflow approval |
 | 22 Runner Group Restrictions | actions_security | GITHUB-ACT-004 | Pass when no group is org-wide or open to public repositories; Info with no org-level runners |
@@ -73,7 +73,7 @@ All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app
 | 24 GitHub App Permissions Audit | integrations | GITHUB-INTEG-003 | Fail on admin or write-to-all permissions |
 | 25 Package Registry Access | integrations | GITHUB-INTEG-005 | Manual (deferred packages sweep) |
 
-Extra findings: GITHUB-ORG-004 (privileged access ratio) and GITHUB-REPO-005 (web commit signoff).
+Extra findings: GITHUB-ORG-004 (privileged access ratio, mapping row 5), GITHUB-ORG-005 (audit log visibility, row 19), GITHUB-REPO-005 (web commit signoff, row 13), and GITHUB-CODE-001 (code security configurations exist, union of rows 15 to 17).
 
 ## Verdict rules
 
@@ -81,7 +81,8 @@ Extra findings: GITHUB-ORG-004 (privileged access ratio) and GITHUB-REPO-005 (we
 - Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial, or Pass only for the visibility-only audit log control with the cap stated.
 - Empty inventories pass only where the summary says emptiness is compliant (outside collaborators, App installations, webhooks and deploy keys with a non-empty repository inventory). Empty repository inventories render Info or Partial because the sweep covered nothing.
 - Deploy keys without `created_at` never count as fresh.
-- REST pagination follows `Link` headers to completion; GraphQL connections page on `endCursor` and record truncation.
+- REST pagination follows `Link` headers to completion and reports truncation when a record cap stops it; GraphQL connections page on `endCursor` and report truncation when `hasNextPage` is true without a cursor, when the cursor repeats, at the page cap, and whenever `totalCount` exceeds the collected nodes. Truncated inventories never pass.
+- Collected records are projected to the documented fields the verdicts read before they are persisted: webhook secrets become a `[redacted]` presence marker, deploy key material, `token_last_eight`, `openssh_public_key`, and the unconstrained audit event bags are dropped, and every JSON file in the bundle passes a key-name redaction belt. A test exports a canary-laden tenant and walks every bundle file and zip entry.
 - A rerun of the export allocates a new directory and a zip with the same stem, so prior bundles are never overwritten.
 
 ## Framework mappings
@@ -135,7 +136,8 @@ The script exits 0 with a skip message when no credentials are present. With cre
 - [List deploy keys](https://docs.github.com/en/rest/deploy-keys/deploy-keys#list-deploy-keys)
 - [Actions permissions for an organization](https://docs.github.com/en/rest/actions/permissions)
 - [Self-hosted runner groups](https://docs.github.com/en/rest/actions/self-hosted-runner-groups) and [Self-hosted runners](https://docs.github.com/en/rest/actions/self-hosted-runners)
-- [Code security configurations](https://docs.github.com/en/rest/code-security/configurations)
+- [Code security configurations](https://docs.github.com/en/rest/code-security/configurations) and [Get default code security configurations](https://docs.github.com/en/rest/code-security/configurations#get-default-code-security-configurations)
+- [Searching the audit log](https://docs.github.com/en/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/reviewing-the-audit-log-for-your-organization#searching-the-audit-log) (`created:>=` phrase syntax)
 - GraphQL [Organization](https://docs.github.com/en/graphql/reference/objects#organization), [OrganizationIdentityProvider](https://docs.github.com/en/graphql/reference/objects#organizationidentityprovider), [IpAllowListEntry](https://docs.github.com/en/graphql/reference/objects#ipallowlistentry), [EnterpriseOwnerInfo](https://docs.github.com/en/graphql/reference/objects#enterpriseownerinfo)
 - [Generating a JWT for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
 - Deferred collectors: [Audit log stream configurations](https://docs.github.com/en/enterprise-cloud@latest/rest/enterprise-admin/audit-log#list-audit-log-stream-configurations-for-an-enterprise), [List packages for an organization](https://docs.github.com/en/rest/packages/packages#list-packages-for-an-organization), GraphQL [Repository.isSecurityPolicyEnabled](https://docs.github.com/en/graphql/reference/objects#repository)

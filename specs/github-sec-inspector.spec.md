@@ -665,11 +665,11 @@ Authentication: fine-grained or classic PAT (`GITHUB_TOKEN` or `GH_TOKEN`) and G
 | 12 | Required Status Checks | GITHUB-REPO-007 | Pass when every active repository requires at least one status check; strict mode reported |
 | 13 | Signed Commit Requirement | GITHUB-REPO-003 | Pass when every active repository enforces `required_signatures` |
 | 14 | Repository Rulesets | GITHUB-REPO-001 | Pass when active org rulesets exist and reach every repository |
-| 15 | Code Scanning Enabled | GITHUB-CODE-005 | Pass when a default configuration enables code scanning default setup; org-wide alert counts are deferred |
-| 16 | Secret Scanning Enabled | GITHUB-CODE-002, GITHUB-CODE-003 | Pass on the org defaults or the default configuration; alert counts are deferred |
-| 17 | Dependabot Enabled | GITHUB-CODE-004 | Pass when alerts and security updates are both enabled by default |
+| 15 | Code Scanning Enabled | GITHUB-CODE-005 | Pass when every default configuration from `GET /orgs/{org}/code-security/configurations/defaults` (public and private_and_internal, or all) enables code scanning default setup and is `enforced` or `enterprise_enforced`; Partial when a default is `unenforced` or covers one visibility; Fail when no default exists; org-wide alert counts are deferred |
+| 16 | Secret Scanning Enabled | GITHUB-CODE-002, GITHUB-CODE-003 | Same defaults evaluation for `secret_scanning` and `secret_scanning_push_protection`; the deprecated `*_enabled_for_new_repositories` organization flags corroborate only and never carry a pass on their own; alert counts are deferred |
+| 17 | Dependabot Enabled | GITHUB-CODE-004 | Same defaults evaluation for `dependabot_alerts` and `dependabot_security_updates`, both required |
 | 18 | Security Policy | GITHUB-CODE-006 | Manual, cites GraphQL `isSecurityPolicyEnabled` as the deferred collector |
-| 19 | Audit Log Streaming | GITHUB-ORG-011 | Manual, cites `GET /enterprises/{enterprise}/audit-log/streams`; GITHUB-ORG-005 covers visibility only |
+| 19 | Audit Log Streaming | GITHUB-ORG-011 | Manual, cites `GET /enterprises/{enterprise}/audit-log/streams`; GITHUB-ORG-005 covers visibility only, reads the window through `phrase=created:>=YYYY-MM-DD` (`after` is a pagination cursor), and states when the 200-event sample was capped |
 | 20 | Webhook Security | GITHUB-INTEG-001 | Fail on any hook with a non-HTTPS URL, `insecure_ssl = 1`, or no secret; Partial when repository hooks are only partially readable |
 | 21 | Actions Permissions | GITHUB-ACT-001, GITHUB-ACT-002, GITHUB-ACT-003, GITHUB-ACT-005 | Pass on `selected` or `local_only`, read-only tokens, no workflow PR approval |
 | 22 | Runner Group Restrictions | GITHUB-ACT-004 | Pass when no runner group is org-wide or open to public repositories; Info when no org-level runners exist; Manual when the inventory is forbidden |
@@ -681,7 +681,13 @@ Extra findings beyond the numbered controls carry the mapping row of the closest
 
 ### Verdict safety
 
-Every finding follows the shared rules: forbidden or errored endpoints render Manual with the cause and the evidence to collect, partial inventories (truncated GraphQL connections, per-repository 403s, capped audit samples) render Partial, empty inventories pass only where the summary states that emptiness is compliant (outside collaborators, App installations, webhooks and deploy keys once the repository inventory is non-empty), undated deploy keys never count as fresh, REST pagination follows `Link` headers to completion, and reruns allocate a new bundle directory and zip. The four-fixture self-check (all-403, all-empty, partial, fully compliant) is encoded in `cli/tests/github.test.mjs`.
+Every finding follows the shared rules: forbidden or errored endpoints render Manual with the cause and the evidence to collect, partial inventories (truncated GraphQL connections, per-repository 403s, capped audit samples) render Partial, empty inventories pass only where the summary states that emptiness is compliant (outside collaborators, App installations, webhooks and deploy keys once the repository inventory is non-empty), undated deploy keys never count as fresh, REST pagination follows `Link` headers to completion, and reruns allocate a new bundle directory and zip. The self-check fixtures (a) all-403, (b) all-empty, (c) partial, (d) fully compliant, (e) unenforced code security pilots, and (f) enforced defaults without owner flags are encoded in `cli/tests/github.test.mjs`.
+
+Truncation is reported on every paging exit: GraphQL loops set `truncated` when `hasNextPage` is true without an `endCursor` (the schema allows a null cursor), when the cursor repeats, at the page cap, and whenever `totalCount` exceeds the collected nodes, so GITHUB-ORG-006 and GITHUB-ORG-008 demote instead of passing on a partial inventory; the REST paginate helper returns a truncation flag alongside the records, and the audit log snapshot carries it so exactly 200 events are not misreported as capped.
+
+### Bundle hygiene
+
+Collectors project every record to the documented fields the verdicts read before anything is persisted: audit log events keep identifying fields only (the unconstrained `config`, `config_was`, and `data` bags and `openssh_public_key` are dropped), credential authorizations drop `token_last_eight` and `fingerprint`, deploy keys drop `key`, and webhook `config.secret` is replaced by a `[redacted]` presence marker so GITHUB-INTEG-001 still reads it. GraphQL data is already limited by the field selections in the queries. Every JSON file written to the bundle also passes a key-name belt that masks credential-named keys at any depth. `cli/tests/github.test.mjs` drives the real client through a tenant that carries a distinct canary in every documented carrier, exports, and asserts that no canary appears in any bundle file or extracted zip entry.
 
 ### Deferred
 
