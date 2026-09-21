@@ -14,6 +14,7 @@ import {
   assessDuoAuthentication,
   assessDuoIntegrations,
   assessDuoMonitoring,
+  collectDuoAuthenticationData,
   exportDuoAuditBundle,
   resolveDuoConfiguration,
   resolveSecureOutputPath,
@@ -208,6 +209,400 @@ function createSampleMonitoringData() {
     trustMonitorEvents: dataset([{ sekey: "SE1", priority_event: true, state: "new" }]),
   };
 }
+
+const NOW_SECONDS = Math.floor(Date.now() / 1000);
+const DAY_SECONDS = 24 * 60 * 60;
+
+function forbidden(path) {
+  return `Duo API request failed for ${path} (403 Forbidden): Received 403 Forbidden`;
+}
+
+function forbiddenDataset(path, fallback) {
+  return { data: fallback, error: forbidden(path) };
+}
+
+function compliantGlobalPolicy() {
+  return {
+    policy_key: "POGLOBAL",
+    policy_name: "Global Policy",
+    is_global_policy: true,
+    sections: {
+      authentication_policy: { user_auth_behavior: "enforce" },
+      authentication_methods: {
+        allowed_auth_list: ["webauthn", "duo-push"],
+        require_verified_push: true,
+        verified_push_digits: 6,
+      },
+      new_user: { new_user_behavior: "enroll" },
+      remembered_devices: { browser_apps: { enabled: false } },
+      trusted_endpoints: {
+        trusted_endpoint_checking: "require-trusted",
+        trusted_endpoint_checking_mobile: "require-trusted",
+      },
+      health_checks: {
+        requires_duo_desktop: ["macos", "windows", "linux"],
+        enforce_encryption: ["macos", "windows", "linux"],
+        enforce_firewall: ["macos", "windows", "linux"],
+        enforce_system_password: ["macos", "windows", "linux"],
+      },
+      operating_systems: {
+        os_restrictions: {
+          macos: { block_policy: "block" },
+          windows: { block_policy: "block" },
+        },
+      },
+      full_disk_encryption: { require_encryption: true },
+      screen_lock: { require_screen_lock: true },
+    },
+  };
+}
+
+function compliantUser(id, extra = {}) {
+  return {
+    user_id: id,
+    username: `${id}@example.gov`,
+    status: "active",
+    is_enrolled: true,
+    created: NOW_SECONDS - 400 * DAY_SECONDS,
+    last_login: NOW_SECONDS - 3 * DAY_SECONDS,
+    phones: [{ phone_id: `P-${id}`, activated: true }],
+    tokens: [],
+    u2f_tokens: [],
+    webauthncredentials: [{ webauthnkey: `WK-${id}`, credential_name: "Security key" }],
+    ...extra,
+  };
+}
+
+function compliantSettings() {
+  return {
+    helpdesk_bypass: "deny",
+    helpdesk_bypass_expiration: 0,
+    global_ssp_policy_enforced: true,
+    fraud_email_enabled: true,
+    push_activity_notification_enabled: true,
+    email_activity_notification_enabled: true,
+    lockout_threshold: 10,
+    lockout_expire_duration: 30,
+    unenrolled_user_lockout_threshold: 0,
+  };
+}
+
+function compliantAuthenticationData() {
+  const policy = compliantGlobalPolicy();
+  return {
+    settings: dataset(compliantSettings()),
+    policies: dataset([policy], undefined),
+    globalPolicy: dataset(policy),
+    users: { data: [compliantUser("DU1"), compliantUser("DU2")], total: 2, complete: true },
+    bypassCodes: { data: [], total: 0, complete: true },
+    webauthnCredentials: {
+      data: [
+        { webauthnkey: "WK-DU1", uv_capable: true, user: { user_id: "DU1" } },
+        { webauthnkey: "WK-DU2", uv_capable: true, user: { user_id: "DU2" } },
+      ],
+      total: 2,
+      complete: true,
+    },
+    allowedAdminAuthMethods: dataset({
+      verified_push_enabled: true,
+      verified_push_length: 6,
+      webauthn_enabled: true,
+      sms_enabled: false,
+      voice_enabled: false,
+    }),
+    authenticationLogs: { data: [{ txid: "tx-1", factor: "webauthn", result: "success" }], complete: true },
+    offlineEnrollmentLogs: { data: [], complete: true },
+  };
+}
+
+function forbiddenAuthenticationData() {
+  return {
+    settings: forbiddenDataset("/admin/v1/settings", null),
+    policies: forbiddenDataset("/admin/v2/policies", []),
+    globalPolicy: forbiddenDataset("/admin/v2/policies/global", null),
+    users: forbiddenDataset("/admin/v1/users", []),
+    bypassCodes: forbiddenDataset("/admin/v1/bypass_codes", []),
+    webauthnCredentials: forbiddenDataset("/admin/v1/webauthncredentials", []),
+    allowedAdminAuthMethods: forbiddenDataset("/admin/v1/admins/allowed_auth_methods", null),
+    authenticationLogs: forbiddenDataset("/admin/v2/logs/authentication", []),
+    offlineEnrollmentLogs: forbiddenDataset("/admin/v1/logs/offline_enrollment", []),
+  };
+}
+
+function emptyAuthenticationData() {
+  return {
+    settings: dataset({}),
+    policies: dataset([]),
+    globalPolicy: dataset(null),
+    users: dataset([]),
+    bypassCodes: dataset([]),
+    webauthnCredentials: dataset([]),
+    allowedAdminAuthMethods: dataset({}),
+    authenticationLogs: dataset([]),
+    offlineEnrollmentLogs: dataset([]),
+  };
+}
+
+function compliantAdminData() {
+  return {
+    settings: dataset(compliantSettings()),
+    admins: {
+      data: [
+        { admin_id: "A1", email: "owner@example.gov", role: "Owner", status: "Active", last_login: NOW_SECONDS - DAY_SECONDS },
+        { admin_id: "A2", email: "helpdesk@example.gov", role: "Help Desk", status: "Active", last_login: NOW_SECONDS - 2 * DAY_SECONDS },
+      ],
+      total: 2,
+      complete: true,
+    },
+    allowedAdminAuthMethods: dataset({
+      verified_push_enabled: true,
+      verified_push_length: 6,
+      webauthn_enabled: true,
+      sms_enabled: false,
+      voice_enabled: false,
+    }),
+    activityLogs: { data: [{ txid: "a-1", action: "admin_login" }], complete: true },
+  };
+}
+
+function forbiddenAdminData() {
+  return {
+    settings: forbiddenDataset("/admin/v1/settings", null),
+    admins: forbiddenDataset("/admin/v1/admins", []),
+    allowedAdminAuthMethods: forbiddenDataset("/admin/v1/admins/allowed_auth_methods", null),
+    activityLogs: forbiddenDataset("/admin/v2/logs/activity", []),
+  };
+}
+
+function findingById(result, id) {
+  const finding = result.findings.find((item) => item.id === id);
+  assert.ok(finding, `expected finding ${id}`);
+  return finding;
+}
+
+function assertNoPass(result, label) {
+  const passed = result.findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id);
+  assert.deepEqual(passed, [], `${label} must not produce Pass findings`);
+}
+
+test("DuoAuditorClient sends documented paths and second-based windows for info and offline endpoints", async () => {
+  const requests = [];
+  const fetchImpl = async (input) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    requests.push(requestUrl);
+    if (requestUrl.pathname === "/admin/v1/info/authentication_attempts") {
+      return new Response(
+        JSON.stringify({
+          stat: "OK",
+          response: { authentication_attempts: { ERROR: 0, FAILURE: 1, FRAUD: 0, SUCCESS: 50 }, mintime: 1, maxtime: 2 },
+        }),
+        { status: 200 },
+      );
+    }
+    if (requestUrl.pathname === "/admin/v1/logs/offline_enrollment") {
+      return new Response(
+        JSON.stringify({ stat: "OK", response: [{ action: "o2fa_user_provisioned", username: "jsmith" }] }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`Unexpected request: ${requestUrl.pathname}`);
+  };
+
+  const client = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  const attempts = await client.getAuthenticationAttempts(30);
+  const offline = await client.listOfflineEnrollmentLogs(30);
+
+  assert.equal(attempts.authentication_attempts.SUCCESS, 50);
+  assert.equal(offline.length, 1);
+
+  const attemptsRequest = requests.find((url) => url.pathname === "/admin/v1/info/authentication_attempts");
+  const mintime = Number(attemptsRequest.searchParams.get("mintime"));
+  const maxtime = Number(attemptsRequest.searchParams.get("maxtime"));
+  assert.equal(String(mintime).length, 10, "mintime must be Unix seconds, not milliseconds");
+  assert.equal(String(maxtime).length, 10, "maxtime must be Unix seconds, not milliseconds");
+  assert.equal(maxtime - mintime, 30 * DAY_SECONDS);
+  assert.deepEqual([...attemptsRequest.searchParams.keys()].sort(), ["maxtime", "mintime"]);
+
+  const offlineRequest = requests.find((url) => url.pathname === "/admin/v1/logs/offline_enrollment");
+  assert.deepEqual([...offlineRequest.searchParams.keys()], ["mintime"]);
+  assert.equal(String(offlineRequest.searchParams.get("mintime")).length, 10);
+});
+
+test("DuoAuditorClient records incomplete inventories when total_objects exceeds the collected records", async () => {
+  const fetchImpl = async (input) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    if (requestUrl.pathname === "/admin/v1/users") {
+      assert.equal(requestUrl.searchParams.get("limit"), "100");
+      return new Response(
+        JSON.stringify({
+          stat: "OK",
+          response: [{ user_id: "DU-1" }],
+          metadata: { total_objects: 5 },
+        }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`Unexpected request: ${requestUrl.pathname}`);
+  };
+  const client = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  const users = await client.listUsers();
+  assert.equal(users.length, 1);
+  assert.deepEqual(client.collectionStatus("/admin/v1/users"), { totalObjects: 5, complete: false });
+
+  const data = await collectDuoAuthenticationData(
+    {
+      getSettings: async () => compliantSettings(),
+      listPolicies: async () => [compliantGlobalPolicy()],
+      getGlobalPolicy: async () => compliantGlobalPolicy(),
+      listUsers: () => client.listUsers(),
+      listBypassCodes: async () => [],
+      listWebauthnCredentials: async () => [],
+      getAdminAllowedAuthMethods: async () => ({ webauthn_enabled: true }),
+      listAuthenticationLogs: async () => [],
+      collectionStatus: (path) => client.collectionStatus(path),
+    },
+    30,
+  );
+  assert.equal(data.users.complete, false);
+  assert.equal(data.users.total, 5);
+  assert.match(data.offlineEnrollmentLogs.error, /offline_enrollment/);
+});
+
+test("assessDuoAuthentication passes a fully compliant tenant on every automatable control", () => {
+  const result = assessDuoAuthentication(compliantAuthenticationData(), createSampleConfig());
+  const statuses = Object.fromEntries(result.findings.map((finding) => [finding.id, finding.status]));
+  assert.equal(statuses["DUO-AUTH-001"], "Pass");
+  assert.equal(statuses["DUO-AUTH-002"], "Pass");
+  assert.equal(statuses["DUO-AUTH-003"], "Pass");
+  assert.equal(statuses["DUO-AUTH-004"], "Pass");
+  assert.equal(statuses["DUO-AUTH-005"], "Pass");
+  assert.equal(statuses["DUO-AUTH-006"], "Pass");
+  assert.equal(statuses["DUO-AUTH-007"], "Pass");
+  assert.equal(statuses["DUO-AUTH-008"], "Pass");
+  assert.equal(statuses["DUO-AUTH-009"], "Pass");
+  assert.equal(statuses["DUO-AUTH-010"], "Pass");
+  assert.equal(statuses["DUO-AUTH-011"], "Manual", "offline access has no documented policy section and stays Manual");
+  assert.match(findingById(result, "DUO-AUTH-011").summary, /Policy Section Data/);
+});
+
+test("assessDuoAuthentication never passes when every call is forbidden", () => {
+  const result = assessDuoAuthentication(forbiddenAuthenticationData(), createSampleConfig());
+  assertNoPass(result, "forbidden authentication data");
+  assert.equal(result.findings.length, 11);
+  for (const finding of result.findings) {
+    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
+    assert.ok(finding.evidence.some((line) => line.startsWith("endpoint=/admin/")), `${finding.id} names the endpoint`);
+    assert.ok(finding.evidence.some((line) => line.startsWith("required_permission=Grant")), `${finding.id} names the permission`);
+    assert.ok(finding.evidence.some((line) => line.startsWith("manual_evidence=")), `${finding.id} names the evidence to collect`);
+  }
+});
+
+test("assessDuoAuthentication treats empty inventories as Manual except compliant-by-intent bypass codes", () => {
+  const result = assessDuoAuthentication(emptyAuthenticationData(), createSampleConfig());
+  const passed = result.findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id);
+  assert.deepEqual(passed, ["DUO-AUTH-006"], "only the empty bypass-code inventory is compliant by intent");
+  assert.match(findingById(result, "DUO-AUTH-006").evidence.join(" "), /compliant by intent/);
+  assert.equal(findingById(result, "DUO-AUTH-008").status, "Manual");
+  assert.equal(findingById(result, "DUO-AUTH-009").status, "Manual");
+  assert.equal(findingById(result, "DUO-AUTH-010").status, "Manual");
+  assert.equal(findingById(result, "DUO-AUTH-007").status, "Manual");
+});
+
+test("assessDuoAuthentication fails on bypass, unenrolled, inactive, and undated users", () => {
+  const data = compliantAuthenticationData();
+  data.users = dataset([
+    compliantUser("DU1"),
+    compliantUser("DU2", { status: "bypass" }),
+    compliantUser("DU3", { is_enrolled: false, phones: [], webauthncredentials: [] }),
+    compliantUser("DU4", { last_login: NOW_SECONDS - 120 * DAY_SECONDS, webauthncredentials: [] }),
+    compliantUser("DU5", { last_login: null, webauthncredentials: [] }),
+    compliantUser("DU6", { status: "disabled", last_login: null }),
+  ]);
+  const result = assessDuoAuthentication(data, createSampleConfig());
+
+  const enrollment = findingById(result, "DUO-AUTH-008");
+  assert.equal(enrollment.status, "Fail");
+  assert.ok(enrollment.evidence.includes("status_bypass=1"));
+  assert.ok(enrollment.evidence.includes("not_enrolled=1"));
+  assert.ok(enrollment.evidence.includes("bypass_user=DU2@example.gov"));
+
+  const inactive = findingById(result, "DUO-AUTH-009");
+  assert.equal(inactive.status, "Fail");
+  assert.ok(inactive.evidence.includes("inactive_over_90_days=1"));
+  assert.ok(inactive.evidence.includes("never_logged_in_or_undated=1"), "disabled users are excluded from the undated bucket");
+
+  const adoption = findingById(result, "DUO-AUTH-010");
+  assert.equal(adoption.status, "Partial");
+});
+
+test("assessDuoAuthentication caps undated-only populations at Partial and fails bypass enforcement", () => {
+  const data = compliantAuthenticationData();
+  data.users = dataset([compliantUser("DU1"), compliantUser("DU2", { last_login: null })]);
+  data.globalPolicy.data.sections.authentication_policy.user_auth_behavior = "bypass";
+  data.policies.data[0].sections.authentication_policy.user_auth_behavior = "bypass";
+  const result = assessDuoAuthentication(data, createSampleConfig());
+  assert.equal(findingById(result, "DUO-AUTH-009").status, "Partial");
+  assert.equal(findingById(result, "DUO-AUTH-007").status, "Fail");
+
+  const noWebauthn = compliantAuthenticationData();
+  noWebauthn.users = dataset([compliantUser("DU1", { webauthncredentials: [] })]);
+  assert.equal(findingById(assessDuoAuthentication(noWebauthn, createSampleConfig()), "DUO-AUTH-010").status, "Fail");
+});
+
+test("assessDuoAuthentication downgrades incomplete user inventories to Partial with seen and total counts", () => {
+  const data = compliantAuthenticationData();
+  data.users = { data: [compliantUser("DU1")], total: 40, complete: false };
+  const result = assessDuoAuthentication(data, createSampleConfig());
+  for (const id of ["DUO-AUTH-008", "DUO-AUTH-009", "DUO-AUTH-010"]) {
+    const finding = findingById(result, id);
+    assert.equal(finding.status, "Partial", `${id} must not pass on a partial inventory`);
+    assert.ok(finding.evidence.some((line) => line.includes("inventory_seen=1 inventory_total=40")), `${id} reports seen and total`);
+  }
+});
+
+test("assessDuoAdminAccess evaluates lockout policy and undated administrators", () => {
+  const compliant = assessDuoAdminAccess(compliantAdminData(), createSampleConfig());
+  for (const id of ["DUO-ADMIN-001", "DUO-ADMIN-002", "DUO-ADMIN-003", "DUO-ADMIN-004", "DUO-ADMIN-005"]) {
+    assert.equal(findingById(compliant, id).status, "Pass", `${id} passes on the compliant tenant`);
+  }
+
+  const forbiddenResult = assessDuoAdminAccess(forbiddenAdminData(), createSampleConfig());
+  assertNoPass(forbiddenResult, "forbidden admin data");
+  for (const finding of forbiddenResult.findings) {
+    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
+    assert.ok(finding.evidence.some((line) => line.startsWith("required_permission=Grant")), `${finding.id} names the permission`);
+  }
+
+  const emptyResult = assessDuoAdminAccess(
+    { settings: dataset({}), admins: dataset([]), allowedAdminAuthMethods: dataset({}), activityLogs: dataset([]) },
+    createSampleConfig(),
+  );
+  assert.deepEqual(
+    emptyResult.findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id),
+    ["DUO-MON-004"],
+    "readable-but-empty activity logs remain the only Pass because the control only asserts readability",
+  );
+
+  const weak = compliantAdminData();
+  weak.settings = dataset({ ...compliantSettings(), lockout_threshold: 25 });
+  assert.equal(findingById(assessDuoAdminAccess(weak, createSampleConfig()), "DUO-ADMIN-005").status, "Partial");
+  weak.settings = dataset({ ...compliantSettings(), lockout_threshold: 0 });
+  assert.equal(findingById(assessDuoAdminAccess(weak, createSampleConfig()), "DUO-ADMIN-005").status, "Fail");
+  weak.settings = dataset({ ...compliantSettings(), lockout_threshold: "unknown" });
+  assert.equal(findingById(assessDuoAdminAccess(weak, createSampleConfig()), "DUO-ADMIN-005").status, "Manual");
+
+  const undated = compliantAdminData();
+  undated.admins = dataset([
+    { admin_id: "A1", email: "owner@example.gov", role: "Owner", status: "Active", last_login: null },
+  ]);
+  const undatedResult = findingById(assessDuoAdminAccess(undated, createSampleConfig()), "DUO-ADMIN-004");
+  assert.equal(undatedResult.status, "Partial");
+  assert.ok(undatedResult.evidence.includes("undated_admins=1"));
+
+  const partial = compliantAdminData();
+  partial.admins = { data: partial.admins.data, total: 9, complete: false };
+  assert.equal(findingById(assessDuoAdminAccess(partial, createSampleConfig()), "DUO-ADMIN-001").status, "Partial");
+});
 
 test("resolveDuoConfiguration prefers explicit args over environment values", () => {
   const base = resolveDuoConfiguration(

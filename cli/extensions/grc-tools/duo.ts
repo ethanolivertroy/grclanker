@@ -40,6 +40,40 @@ const OFFSET_PAGE_SIZE = 100;
 const LOG_PAGE_SIZE = 200;
 const MAX_LOG_RECORDS = 400;
 const MAX_RETRIES = 4;
+const INACTIVE_USER_DAYS = 90;
+const LOCKOUT_THRESHOLD_MAX = 10;
+const IMPOSSIBLE_TRAVEL_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * Admin API endpoints read by this module. Each path is documented in the Duo
+ * Admin API reference (https://duo.com/docs/adminapi) under the named section.
+ */
+const DUO_ENDPOINTS = {
+  settings: "/admin/v1/settings",
+  infoSummary: "/admin/v1/info/summary",
+  authenticationAttempts: "/admin/v1/info/authentication_attempts",
+  adminAllowedAuthMethods: "/admin/v1/admins/allowed_auth_methods",
+  globalPolicy: "/admin/v2/policies/global",
+  policies: "/admin/v2/policies",
+  users: "/admin/v1/users",
+  bypassCodes: "/admin/v1/bypass_codes",
+  webauthnCredentials: "/admin/v1/webauthncredentials",
+  admins: "/admin/v1/admins",
+  integrations: "/admin/v3/integrations",
+  authenticationLogs: "/admin/v2/logs/authentication",
+  activityLogs: "/admin/v2/logs/activity",
+  telephonyLogs: "/admin/v2/logs/telephony",
+  offlineEnrollmentLogs: "/admin/v1/logs/offline_enrollment",
+  trustMonitorEvents: "/admin/v1/trust_monitor/events",
+} as const;
+
+const DUO_PERMISSIONS = {
+  settings: "Grant settings",
+  readInformation: "Grant read information",
+  readResource: "Grant resource - Read",
+  readLog: "Grant read log",
+  adminsRead: "Grant administrators - Read",
+} as const;
 
 type RawConfigArgs = {
   api_host?: string;
@@ -122,12 +156,21 @@ export interface DuoAssessmentResult {
   text: string;
 }
 
-interface CollectedDataset<T = unknown> {
+export interface CollectedDataset<T = unknown> {
   data: T;
   error?: string;
+  /** Documented metadata.total_objects for the list when the API reported it. */
+  total?: number;
+  /** False when paging stopped before metadata.next_offset was exhausted or a record cap was hit. */
+  complete?: boolean;
 }
 
-interface DuoAuthenticationData {
+export interface DuoCollectionStatus {
+  totalObjects?: number;
+  complete: boolean;
+}
+
+export interface DuoAuthenticationData {
   settings: CollectedDataset<JsonRecord | null>;
   policies: CollectedDataset<JsonRecord[]>;
   globalPolicy: CollectedDataset<JsonRecord | null>;
@@ -136,29 +179,32 @@ interface DuoAuthenticationData {
   webauthnCredentials: CollectedDataset<JsonRecord[]>;
   allowedAdminAuthMethods: CollectedDataset<JsonRecord | null>;
   authenticationLogs: CollectedDataset<JsonRecord[]>;
+  offlineEnrollmentLogs?: CollectedDataset<JsonRecord[]>;
 }
 
-interface DuoAdminAccessData {
+export interface DuoAdminAccessData {
   settings: CollectedDataset<JsonRecord | null>;
   admins: CollectedDataset<JsonRecord[]>;
   allowedAdminAuthMethods: CollectedDataset<JsonRecord | null>;
   activityLogs: CollectedDataset<JsonRecord[]>;
 }
 
-interface DuoIntegrationData {
+export interface DuoIntegrationData {
   settings: CollectedDataset<JsonRecord | null>;
   policies: CollectedDataset<JsonRecord[]>;
   globalPolicy: CollectedDataset<JsonRecord | null>;
   integrations: CollectedDataset<JsonRecord[]>;
+  infoSummary?: CollectedDataset<JsonRecord | null>;
 }
 
-interface DuoMonitoringData {
+export interface DuoMonitoringData {
   settings: CollectedDataset<JsonRecord | null>;
   infoSummary: CollectedDataset<JsonRecord | null>;
   authenticationLogs: CollectedDataset<JsonRecord[]>;
   activityLogs: CollectedDataset<JsonRecord[]>;
   telephonyLogs: CollectedDataset<JsonRecord[]>;
   trustMonitorEvents: CollectedDataset<JsonRecord[]>;
+  authenticationAttempts?: CollectedDataset<JsonRecord | null>;
 }
 
 interface DuoAuditBundleResult {
@@ -285,6 +331,91 @@ const DUO_CHECKS: Record<string, CheckDefinition> = {
       general: ["break-glass controls constrained"],
     },
   },
+  "DUO-AUTH-007": {
+    id: "DUO-AUTH-007",
+    title: "Global MFA enforcement mode",
+    category: "authentication",
+    severity: "critical",
+    frameworks: {
+      fedramp: ["IA-2(1)"],
+      cmmc: ["3.5.3"],
+      soc2: ["CC6.1"],
+      cis: ["6.3"],
+      pci_dss: ["8.4.2"],
+      disa_stig: ["SRG-APP-000149"],
+      irap: ["ISM-1504"],
+      ismap: ["CPS.AT-2"],
+      general: ["MFA enforced globally"],
+    },
+  },
+  "DUO-AUTH-008": {
+    id: "DUO-AUTH-008",
+    title: "User enrollment completeness",
+    category: "authentication",
+    severity: "high",
+    frameworks: {
+      fedramp: ["IA-2(2)"],
+      cmmc: ["3.5.3"],
+      soc2: ["CC6.1"],
+      cis: ["6.3"],
+      pci_dss: ["8.4.1"],
+      disa_stig: ["SRG-APP-000150"],
+      irap: ["ISM-1504"],
+      ismap: ["CPS.AT-2"],
+      general: ["all users enrolled, no bypass status"],
+    },
+  },
+  "DUO-AUTH-009": {
+    id: "DUO-AUTH-009",
+    title: "Inactive user detection",
+    category: "authentication",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-2(3)"],
+      cmmc: ["3.1.12"],
+      soc2: ["CC6.2"],
+      cis: ["5.3"],
+      pci_dss: ["8.1.4"],
+      disa_stig: ["SRG-APP-000025"],
+      irap: ["ISM-1591"],
+      ismap: ["CPS.AC-2"],
+      general: ["inactive users reviewed"],
+    },
+  },
+  "DUO-AUTH-010": {
+    id: "DUO-AUTH-010",
+    title: "WebAuthn and U2F credential adoption",
+    category: "authentication",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["IA-2(12)"],
+      cmmc: ["3.5.3"],
+      soc2: ["CC6.1"],
+      cis: ["6.4"],
+      pci_dss: ["8.4.3"],
+      disa_stig: ["SRG-APP-000395"],
+      irap: ["ISM-1515"],
+      ismap: ["CPS.IA-2"],
+      general: ["phishing-resistant credential adoption"],
+    },
+  },
+  "DUO-AUTH-011": {
+    id: "DUO-AUTH-011",
+    title: "Offline access configuration",
+    category: "authentication",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["IA-2(11)"],
+      cmmc: ["3.5.3"],
+      soc2: ["CC6.1"],
+      cis: [],
+      pci_dss: ["8.4.1"],
+      disa_stig: ["SRG-APP-000394"],
+      irap: ["ISM-1504"],
+      ismap: ["CPS.IA-2"],
+      general: ["offline MFA bounded"],
+    },
+  },
   "DUO-ADMIN-001": {
     id: "DUO-ADMIN-001",
     title: "Owner and privileged admin concentration",
@@ -351,6 +482,74 @@ const DUO_CHECKS: Record<string, CheckDefinition> = {
       irap: ["ISM-1591"],
       ismap: ["CPS.AC-2"],
       general: ["inactive admins reviewed"],
+    },
+  },
+  "DUO-ADMIN-005": {
+    id: "DUO-ADMIN-005",
+    title: "User lockout policy",
+    category: "admin_access",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-7"],
+      cmmc: ["3.1.8"],
+      soc2: ["CC6.1"],
+      cis: ["5.4"],
+      pci_dss: ["8.3.4"],
+      disa_stig: ["SRG-APP-000065"],
+      irap: ["ISM-1403"],
+      ismap: ["CPS.AC-7"],
+      general: ["failed-attempt lockout enabled"],
+    },
+  },
+  "DUO-INTEGRATIONS-005": {
+    id: "DUO-INTEGRATIONS-005",
+    title: "Critical application protection coverage",
+    category: "integrations",
+    severity: "high",
+    frameworks: {
+      fedramp: ["CM-8"],
+      cmmc: ["3.4.1"],
+      soc2: ["CC6.1"],
+      cis: [],
+      pci_dss: ["2.4"],
+      disa_stig: ["SRG-APP-000383"],
+      irap: ["ISM-1599"],
+      ismap: ["CPS.CM-8"],
+      general: ["critical apps carry explicit MFA policy"],
+    },
+  },
+  "DUO-INTEGRATIONS-006": {
+    id: "DUO-INTEGRATIONS-006",
+    title: "Device health requirements depth",
+    category: "integrations",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["CM-6"],
+      cmmc: ["3.4.2"],
+      soc2: ["CC6.7"],
+      cis: [],
+      pci_dss: ["2.2.1"],
+      disa_stig: ["SRG-APP-000384"],
+      irap: ["ISM-1082"],
+      ismap: ["CPS.CM-6"],
+      general: ["device health checks enforced"],
+    },
+  },
+  "DUO-MON-005": {
+    id: "DUO-MON-005",
+    title: "Authentication outcome and travel anomalies",
+    category: "monitoring",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AU-6"],
+      cmmc: ["3.3.5"],
+      soc2: ["CC7.2"],
+      cis: [],
+      pci_dss: ["10.6.1"],
+      disa_stig: ["SRG-APP-000516"],
+      irap: ["ISM-0109"],
+      ismap: ["CPS.AU-6"],
+      general: ["fraud, denial, and travel anomalies reviewed"],
     },
   },
   "DUO-INTEGRATIONS-001": {
@@ -748,10 +947,16 @@ function nextOffsetValue(metadata: JsonRecord, key: "offset" | "next_offset"): s
 export class DuoAuditorClient {
   private readonly config: DuoResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly collectionStatuses = new Map<string, DuoCollectionStatus>();
 
   constructor(config: DuoResolvedConfig, options?: { fetchImpl?: FetchImpl }) {
     this.config = config;
     this.fetchImpl = options?.fetchImpl ?? fetch;
+  }
+
+  /** Paging outcome of the most recent list call for a documented endpoint path. */
+  collectionStatus(path: string): DuoCollectionStatus | undefined {
+    return this.collectionStatuses.get(path);
   }
 
   private buildWindow(days: number): Record<string, number> {
@@ -759,6 +964,15 @@ export class DuoAuditorClient {
     return {
       mintime: now - clampLookbackDays(days) * 24 * 60 * 60 * 1000,
       maxtime: now,
+    };
+  }
+
+  /** Same window in Unix seconds, for the v1 info and offline enrollment endpoints. */
+  private buildSecondsWindow(days: number): Record<string, number> {
+    const window = this.buildWindow(days);
+    return {
+      mintime: Math.floor(window.mintime / 1000),
+      maxtime: Math.floor(window.maxtime / 1000),
     };
   }
 
@@ -861,60 +1075,89 @@ export class DuoAuditorClient {
     return envelope.response as T;
   }
 
+  /** Admin API reference: Settings > Retrieve Settings. */
   async getSettings(): Promise<JsonRecord> {
-    return this.request<JsonRecord>("/admin/v1/settings");
+    return this.request<JsonRecord>(DUO_ENDPOINTS.settings);
   }
 
+  /** Admin API reference: Account Info > Retrieve Summary. */
   async getInfoSummary(): Promise<JsonRecord> {
-    return this.request<JsonRecord>("/admin/v1/info/summary");
+    return this.request<JsonRecord>(DUO_ENDPOINTS.infoSummary);
   }
 
+  /** Admin API reference: Account Info > Authentication Attempts Report (mintime and maxtime in Unix seconds). */
+  async getAuthenticationAttempts(days: number): Promise<JsonRecord> {
+    return this.request<JsonRecord>(DUO_ENDPOINTS.authenticationAttempts, this.buildSecondsWindow(days));
+  }
+
+  /** Admin API reference: Administrators > Retrieve Allowed Authentication Methods. */
   async getAdminAllowedAuthMethods(): Promise<JsonRecord> {
-    return this.request<JsonRecord>("/admin/v1/admins/allowed_auth_methods");
+    return this.request<JsonRecord>(DUO_ENDPOINTS.adminAllowedAuthMethods);
   }
 
+  /** Admin API reference: Policies > Retrieve Global Policy. */
   async getGlobalPolicy(): Promise<JsonRecord> {
-    return this.request<JsonRecord>("/admin/v2/policies/global");
+    return this.request<JsonRecord>(DUO_ENDPOINTS.globalPolicy);
   }
 
+  /** Admin API reference: Policies > Retrieve Policies. */
   async listPolicies(): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v2/policies", {}, OFFSET_PAGE_SIZE);
+    return this.listOffsetPages(DUO_ENDPOINTS.policies, {}, OFFSET_PAGE_SIZE);
   }
 
+  /** Admin API reference: Users > Retrieve Users (limit max 300). */
   async listUsers(): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v1/users", {}, OFFSET_PAGE_SIZE);
+    return this.listOffsetPages(DUO_ENDPOINTS.users, {}, OFFSET_PAGE_SIZE);
   }
 
+  /** Admin API reference: Bypass Codes > Retrieve Bypass Codes. */
   async listBypassCodes(): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v1/bypass_codes", {}, OFFSET_PAGE_SIZE);
+    return this.listOffsetPages(DUO_ENDPOINTS.bypassCodes, {}, OFFSET_PAGE_SIZE);
   }
 
+  /** Admin API reference: WebAuthn Credentials > Retrieve WebAuthn Credentials (limit max 500). */
   async listWebauthnCredentials(): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v1/webauthncredentials", {}, OFFSET_PAGE_SIZE);
+    return this.listOffsetPages(DUO_ENDPOINTS.webauthnCredentials, {}, OFFSET_PAGE_SIZE);
   }
 
+  /** Admin API reference: Administrators > Retrieve Administrators. */
   async listAdmins(): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v1/admins", {}, OFFSET_PAGE_SIZE);
+    return this.listOffsetPages(DUO_ENDPOINTS.admins, {}, OFFSET_PAGE_SIZE);
   }
 
+  /** Admin API reference: Integrations > Retrieve Integrations (v3, limit max 500). */
   async listIntegrations(): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v3/integrations", {}, OFFSET_PAGE_SIZE, 5);
+    return this.listOffsetPages(DUO_ENDPOINTS.integrations, {}, OFFSET_PAGE_SIZE, 5);
   }
 
+  /** Admin API reference: Logs > Authentication Logs (v2, mintime and maxtime in milliseconds). */
   async listAuthenticationLogs(days: number, maxRecords: number = MAX_LOG_RECORDS): Promise<JsonRecord[]> {
-    return this.listCursorPages("/admin/v2/logs/authentication", this.buildWindow(days), maxRecords);
+    return this.listCursorPages(DUO_ENDPOINTS.authenticationLogs, this.buildWindow(days), maxRecords);
   }
 
+  /** Admin API reference: Logs > Activity Logs (v2). */
   async listActivityLogs(days: number, maxRecords: number = MAX_LOG_RECORDS): Promise<JsonRecord[]> {
-    return this.listCursorPages("/admin/v2/logs/activity", this.buildWindow(days), maxRecords);
+    return this.listCursorPages(DUO_ENDPOINTS.activityLogs, this.buildWindow(days), maxRecords);
   }
 
+  /** Admin API reference: Logs > Telephony Logs (v2). */
   async listTelephonyLogs(days: number, maxRecords: number = MAX_LOG_RECORDS): Promise<JsonRecord[]> {
-    return this.listCursorPages("/admin/v2/logs/telephony", this.buildWindow(days), maxRecords);
+    return this.listCursorPages(DUO_ENDPOINTS.telephonyLogs, this.buildWindow(days), maxRecords);
   }
 
+  /** Admin API reference: Logs > Offline Enrollment Logs (mintime in Unix seconds, unpaged). */
+  async listOfflineEnrollmentLogs(days: number): Promise<JsonRecord[]> {
+    const envelope = await this.requestEnvelope(DUO_ENDPOINTS.offlineEnrollmentLogs, {
+      mintime: this.buildSecondsWindow(days).mintime,
+    });
+    const items = extractArrayPayload(envelope.response);
+    this.collectionStatuses.set(DUO_ENDPOINTS.offlineEnrollmentLogs, { complete: true, totalObjects: items.length });
+    return items;
+  }
+
+  /** Admin API reference: Trust Monitor > Retrieve Events. */
   async listTrustMonitorEvents(days: number, maxRecords: number = MAX_LOG_RECORDS): Promise<JsonRecord[]> {
-    return this.listOffsetPages("/admin/v1/trust_monitor/events", this.buildWindow(days), 50, 2, maxRecords);
+    return this.listOffsetPages(DUO_ENDPOINTS.trustMonitorEvents, this.buildWindow(days), 50, 2, maxRecords);
   }
 
   private async listOffsetPages(
@@ -926,6 +1169,8 @@ export class DuoAuditorClient {
   ): Promise<JsonRecord[]> {
     const items: JsonRecord[] = [];
     let offset = 0;
+    let totalObjects: number | undefined;
+    let complete = true;
 
     while (true) {
       const envelope = await this.requestEnvelope(
@@ -934,14 +1179,21 @@ export class DuoAuditorClient {
         signatureVersion ? { signatureVersion } : undefined,
       );
       items.push(...extractArrayPayload(envelope.response));
-      if (maxRecords && items.length >= maxRecords) break;
       const metadata = extractMetadata(envelope);
+      totalObjects = asNumber(metadata.total_objects) ?? totalObjects;
       const next = nextOffsetValue(metadata, "offset");
+      if (maxRecords && items.length >= maxRecords) {
+        complete = typeof next !== "number" && items.length <= maxRecords;
+        break;
+      }
       if (typeof next !== "number") break;
       offset = next;
     }
 
-    return maxRecords ? items.slice(0, maxRecords) : items;
+    const result = maxRecords ? items.slice(0, maxRecords) : items;
+    if (totalObjects !== undefined && result.length < totalObjects) complete = false;
+    this.collectionStatuses.set(path, { totalObjects, complete });
+    return result;
   }
 
   private async listCursorPages(
@@ -951,6 +1203,8 @@ export class DuoAuditorClient {
   ): Promise<JsonRecord[]> {
     const items: JsonRecord[] = [];
     let nextOffset: string | undefined;
+    let totalObjects: number | undefined;
+    let complete = true;
 
     while (items.length < maxRecords) {
       const envelope = await this.requestEnvelope(path, {
@@ -961,11 +1215,15 @@ export class DuoAuditorClient {
       });
       items.push(...extractArrayPayload(envelope.response));
       const metadata = extractMetadata(envelope);
+      totalObjects = asNumber(metadata.total_objects) ?? totalObjects;
       const next = nextOffsetValue(metadata, "next_offset");
       if (next === undefined) break;
       nextOffset = String(next);
+      if (items.length >= maxRecords) complete = false;
     }
 
+    if (totalObjects !== undefined && items.length < totalObjects) complete = false;
+    this.collectionStatuses.set(path, { totalObjects, complete });
     return items;
   }
 }
@@ -1013,11 +1271,21 @@ function daysSince(value: unknown): number | null {
   return Math.floor((Date.now() - timestamp) / (24 * 60 * 60 * 1000));
 }
 
+type CollectionStatusLookup = Partial<Pick<DuoAuditorClient, "collectionStatus">>;
+
+function collectionStatusFor(client: CollectionStatusLookup, path: string): DuoCollectionStatus | undefined {
+  return typeof client.collectionStatus === "function" ? client.collectionStatus(path) : undefined;
+}
+
 async function collectArrayDataset<T extends JsonRecord>(
   loader: () => Promise<T[]>,
+  statusLookup?: () => DuoCollectionStatus | undefined,
 ): Promise<CollectedDataset<T[]>> {
   try {
-    return { data: await loader() };
+    const data = await loader();
+    const status = statusLookup?.();
+    if (!status) return { data };
+    return { data, total: status.totalObjects, complete: status.complete };
   } catch (error) {
     return { data: [], error: error instanceof Error ? error.message : String(error) };
   }
@@ -1034,77 +1302,134 @@ async function collectObjectDataset<T>(
   }
 }
 
+export type DuoAuthenticationClient = Pick<
+  DuoAuditorClient,
+  | "getSettings"
+  | "listPolicies"
+  | "getGlobalPolicy"
+  | "listUsers"
+  | "listBypassCodes"
+  | "listWebauthnCredentials"
+  | "getAdminAllowedAuthMethods"
+  | "listAuthenticationLogs"
+> & Partial<Pick<DuoAuditorClient, "listOfflineEnrollmentLogs">> & CollectionStatusLookup;
+
+export type DuoAdminAccessClient = Pick<
+  DuoAuditorClient,
+  "getSettings" | "listAdmins" | "getAdminAllowedAuthMethods" | "listActivityLogs"
+> & CollectionStatusLookup;
+
+export type DuoIntegrationClient = Pick<
+  DuoAuditorClient,
+  "getSettings" | "listPolicies" | "getGlobalPolicy" | "listIntegrations"
+> & Partial<Pick<DuoAuditorClient, "getInfoSummary">> & CollectionStatusLookup;
+
+export type DuoMonitoringClient = Pick<
+  DuoAuditorClient,
+  | "getSettings"
+  | "getInfoSummary"
+  | "listAuthenticationLogs"
+  | "listActivityLogs"
+  | "listTelephonyLogs"
+  | "listTrustMonitorEvents"
+> & Partial<Pick<DuoAuditorClient, "getAuthenticationAttempts">> & CollectionStatusLookup;
+
 export async function collectDuoAuthenticationData(
-  client: Pick<
-    DuoAuditorClient,
-    | "getSettings"
-    | "listPolicies"
-    | "getGlobalPolicy"
-    | "listUsers"
-    | "listBypassCodes"
-    | "listWebauthnCredentials"
-    | "getAdminAllowedAuthMethods"
-    | "listAuthenticationLogs"
-  >,
+  client: DuoAuthenticationClient,
   lookbackDays: number,
 ): Promise<DuoAuthenticationData> {
+  const status = (path: string) => () => collectionStatusFor(client, path);
   return {
     settings: await collectObjectDataset(() => client.getSettings(), null),
-    policies: await collectArrayDataset(() => client.listPolicies()),
+    policies: await collectArrayDataset(() => client.listPolicies(), status(DUO_ENDPOINTS.policies)),
     globalPolicy: await collectObjectDataset(() => client.getGlobalPolicy(), null),
-    users: await collectArrayDataset(() => client.listUsers()),
-    bypassCodes: await collectArrayDataset(() => client.listBypassCodes()),
-    webauthnCredentials: await collectArrayDataset(() => client.listWebauthnCredentials()),
+    users: await collectArrayDataset(() => client.listUsers(), status(DUO_ENDPOINTS.users)),
+    bypassCodes: await collectArrayDataset(() => client.listBypassCodes(), status(DUO_ENDPOINTS.bypassCodes)),
+    webauthnCredentials: await collectArrayDataset(
+      () => client.listWebauthnCredentials(),
+      status(DUO_ENDPOINTS.webauthnCredentials),
+    ),
     allowedAdminAuthMethods: await collectObjectDataset(() => client.getAdminAllowedAuthMethods(), null),
-    authenticationLogs: await collectArrayDataset(() => client.listAuthenticationLogs(lookbackDays)),
+    authenticationLogs: await collectArrayDataset(
+      () => client.listAuthenticationLogs(lookbackDays),
+      status(DUO_ENDPOINTS.authenticationLogs),
+    ),
+    offlineEnrollmentLogs: await collectArrayDataset(
+      () =>
+        client.listOfflineEnrollmentLogs
+          ? client.listOfflineEnrollmentLogs(lookbackDays)
+          : Promise.reject(new Error(`${DUO_ENDPOINTS.offlineEnrollmentLogs} is not available on this client.`)),
+      status(DUO_ENDPOINTS.offlineEnrollmentLogs),
+    ),
   };
 }
 
 export async function collectDuoAdminAccessData(
-  client: Pick<
-    DuoAuditorClient,
-    "getSettings" | "listAdmins" | "getAdminAllowedAuthMethods" | "listActivityLogs"
-  >,
+  client: DuoAdminAccessClient,
   lookbackDays: number,
 ): Promise<DuoAdminAccessData> {
+  const status = (path: string) => () => collectionStatusFor(client, path);
   return {
     settings: await collectObjectDataset(() => client.getSettings(), null),
-    admins: await collectArrayDataset(() => client.listAdmins()),
+    admins: await collectArrayDataset(() => client.listAdmins(), status(DUO_ENDPOINTS.admins)),
     allowedAdminAuthMethods: await collectObjectDataset(() => client.getAdminAllowedAuthMethods(), null),
-    activityLogs: await collectArrayDataset(() => client.listActivityLogs(lookbackDays)),
+    activityLogs: await collectArrayDataset(
+      () => client.listActivityLogs(lookbackDays),
+      status(DUO_ENDPOINTS.activityLogs),
+    ),
   };
 }
 
 export async function collectDuoIntegrationData(
-  client: Pick<DuoAuditorClient, "getSettings" | "listPolicies" | "getGlobalPolicy" | "listIntegrations">,
+  client: DuoIntegrationClient,
 ): Promise<DuoIntegrationData> {
+  const status = (path: string) => () => collectionStatusFor(client, path);
   return {
     settings: await collectObjectDataset(() => client.getSettings(), null),
-    policies: await collectArrayDataset(() => client.listPolicies()),
+    policies: await collectArrayDataset(() => client.listPolicies(), status(DUO_ENDPOINTS.policies)),
     globalPolicy: await collectObjectDataset(() => client.getGlobalPolicy(), null),
-    integrations: await collectArrayDataset(() => client.listIntegrations()),
+    integrations: await collectArrayDataset(() => client.listIntegrations(), status(DUO_ENDPOINTS.integrations)),
+    infoSummary: await collectObjectDataset(
+      () =>
+        client.getInfoSummary
+          ? client.getInfoSummary()
+          : Promise.reject(new Error(`${DUO_ENDPOINTS.infoSummary} is not available on this client.`)),
+      null,
+    ),
   };
 }
 
 export async function collectDuoMonitoringData(
-  client: Pick<
-    DuoAuditorClient,
-    | "getSettings"
-    | "getInfoSummary"
-    | "listAuthenticationLogs"
-    | "listActivityLogs"
-    | "listTelephonyLogs"
-    | "listTrustMonitorEvents"
-  >,
+  client: DuoMonitoringClient,
   lookbackDays: number,
 ): Promise<DuoMonitoringData> {
+  const status = (path: string) => () => collectionStatusFor(client, path);
   return {
     settings: await collectObjectDataset(() => client.getSettings(), null),
     infoSummary: await collectObjectDataset(() => client.getInfoSummary(), null),
-    authenticationLogs: await collectArrayDataset(() => client.listAuthenticationLogs(lookbackDays)),
-    activityLogs: await collectArrayDataset(() => client.listActivityLogs(lookbackDays)),
-    telephonyLogs: await collectArrayDataset(() => client.listTelephonyLogs(lookbackDays)),
-    trustMonitorEvents: await collectArrayDataset(() => client.listTrustMonitorEvents(lookbackDays)),
+    authenticationLogs: await collectArrayDataset(
+      () => client.listAuthenticationLogs(lookbackDays),
+      status(DUO_ENDPOINTS.authenticationLogs),
+    ),
+    activityLogs: await collectArrayDataset(
+      () => client.listActivityLogs(lookbackDays),
+      status(DUO_ENDPOINTS.activityLogs),
+    ),
+    telephonyLogs: await collectArrayDataset(
+      () => client.listTelephonyLogs(lookbackDays),
+      status(DUO_ENDPOINTS.telephonyLogs),
+    ),
+    trustMonitorEvents: await collectArrayDataset(
+      () => client.listTrustMonitorEvents(lookbackDays),
+      status(DUO_ENDPOINTS.trustMonitorEvents),
+    ),
+    authenticationAttempts: await collectObjectDataset(
+      () =>
+        client.getAuthenticationAttempts
+          ? client.getAuthenticationAttempts(lookbackDays)
+          : Promise.reject(new Error(`${DUO_ENDPOINTS.authenticationAttempts} is not available on this client.`)),
+      null,
+    ),
   };
 }
 
@@ -1247,8 +1572,335 @@ function hasUniversalPrompt(integration: JsonRecord): boolean {
   return getBooleanish(integration, "prompt_v4_enabled") === true || getBooleanish(integration, "frameless_auth_prompt_enabled") === true;
 }
 
-function listErrors(datasets: Array<CollectedDataset<unknown>>): string[] {
-  return datasets.map((dataset) => dataset.error).filter((item): item is string => Boolean(item));
+function listErrors(datasets: Array<CollectedDataset<unknown> | undefined>): string[] {
+  return datasets
+    .map((dataset) => dataset?.error)
+    .filter((item): item is string => Boolean(item));
+}
+
+function unavailableEvidence(endpoint: string, permission: string, error: string | undefined, collect: string): string[] {
+  return [
+    `endpoint=${endpoint}`,
+    `required_permission=${permission}`,
+    error ? `collection_error=${error}` : `${endpoint} returned no usable payload.`,
+    `manual_evidence=${collect}`,
+  ];
+}
+
+function inventoryNote(dataset: CollectedDataset<unknown[]>): string | undefined {
+  if (dataset.complete === false) {
+    return `inventory_seen=${dataset.data.length} inventory_total=${dataset.total ?? "unknown"} (paging incomplete, results not treated as authoritative)`;
+  }
+  return undefined;
+}
+
+const STATUS_RANK: Record<DuoFindingStatus, number> = { Pass: 0, Info: 1, Partial: 2, Manual: 3, Fail: 4 };
+
+function capStatus(status: DuoFindingStatus, cap: DuoFindingStatus): DuoFindingStatus {
+  return STATUS_RANK[status] < STATUS_RANK[cap] ? cap : status;
+}
+
+function withInventoryCap(
+  finding: DuoFinding,
+  dataset: CollectedDataset<unknown[]>,
+): DuoFinding {
+  const note = inventoryNote(dataset);
+  if (!note) return finding;
+  return {
+    ...finding,
+    status: finding.status === "Manual" ? "Manual" : capStatus(finding.status, "Partial"),
+    evidence: [...finding.evidence, note],
+    manualNote: `${finding.manualNote ? `${finding.manualNote} ` : ""}Follow metadata.next_offset to completion before relying on this verdict.`,
+  };
+}
+
+function userStatus(user: JsonRecord): string {
+  return asString(user.status)?.toLowerCase() ?? "unknown";
+}
+
+function userIsEnrolled(user: JsonRecord): boolean | undefined {
+  const documentedFlag = asBoolean(user.is_enrolled);
+  if (documentedFlag !== undefined) return documentedFlag;
+  const authenticatorLists = [user.phones, user.tokens, user.u2f_tokens, user.webauthncredentials];
+  if (authenticatorLists.every((list) => list === undefined)) return undefined;
+  return authenticatorLists.some((list) => asArray(list).length > 0);
+}
+
+function userHasWebauthn(user: JsonRecord): boolean {
+  return asArray(user.webauthncredentials).length > 0;
+}
+
+function userLabel(user: JsonRecord): string {
+  return asString(user.username) ?? asString(user.email) ?? asString(user.user_id) ?? "unknown-user";
+}
+
+function percentage(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0;
+  return Math.round((numerator / denominator) * 1000) / 10;
+}
+
+function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
+  const findings: DuoFinding[] = [];
+  const users = data.users.data;
+  const usersEvidence = unavailableEvidence(
+    DUO_ENDPOINTS.users,
+    DUO_PERMISSIONS.readResource,
+    data.users.error,
+    "Export the Users report from the Duo Admin Panel with status, last login, and enrolled authenticators.",
+  );
+
+  if (data.users.error || users.length === 0) {
+    const reason = data.users.error
+      ? "User inventory could not be collected."
+      : "The user inventory was empty, so enrollment, inactivity, and credential adoption cannot be measured (Manual, not Pass).";
+    findings.push(
+      buildFinding("DUO-AUTH-008", "Manual", reason, usersEvidence, "Grant the audit principal Grant resource - Read and confirm the tenant has enrolled users."),
+      buildFinding("DUO-AUTH-009", "Manual", reason, usersEvidence, "Review user last-login activity in the Duo Admin Panel Users page."),
+      buildFinding("DUO-AUTH-010", "Manual", reason, usersEvidence, "Review WebAuthn registrations per user in the Duo Admin Panel."),
+    );
+  } else {
+    const statusCounts = users.reduce<Record<string, number>>((counts, user) => {
+      const status = userStatus(user);
+      counts[status] = (counts[status] ?? 0) + 1;
+      return counts;
+    }, {});
+    const bypassUsers = users.filter((user) => userStatus(user) === "bypass");
+    const accessUsers = users.filter((user) => ["active", "bypass"].includes(userStatus(user)));
+    const enrollmentKnown = accessUsers.filter((user) => userIsEnrolled(user) !== undefined);
+    const enrolledUsers = enrollmentKnown.filter((user) => userIsEnrolled(user) === true);
+    const unenrolledUsers = enrollmentKnown.filter((user) => userIsEnrolled(user) === false);
+    const enrollmentPercent = percentage(enrolledUsers.length, enrollmentKnown.length);
+    const enrollmentEvidence = [
+      `users_total=${users.length}`,
+      ...Object.entries(statusCounts).map(([status, count]) => `status_${status.replace(/\s+/g, "_")}=${count}`),
+      `enrolled=${enrolledUsers.length}`,
+      `not_enrolled=${unenrolledUsers.length}`,
+      `enrollment_percent=${enrollmentPercent}`,
+      ...bypassUsers.slice(0, 10).map((user) => `bypass_user=${userLabel(user)}`),
+      ...unenrolledUsers.slice(0, 10).map((user) => `not_enrolled_user=${userLabel(user)}`),
+    ];
+
+    if (enrollmentKnown.length === 0) {
+      findings.push(
+        buildFinding(
+          "DUO-AUTH-008",
+          "Manual",
+          "No active user exposed the documented is_enrolled flag or authenticator lists, so enrollment could not be measured.",
+          enrollmentEvidence,
+          "Confirm the audit principal reads full user objects (is_enrolled, phones, tokens, u2f_tokens, webauthncredentials).",
+        ),
+      );
+    } else if (bypassUsers.length === 0 && unenrolledUsers.length === 0) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-008",
+            "Pass",
+            "Every active user is enrolled and no user is in bypass status.",
+            enrollmentEvidence,
+            "Keep enrollment completeness at 100 percent and treat bypass status as a time-boxed exception.",
+          ),
+          data.users,
+        ),
+      );
+    } else if (bypassUsers.length === 0 && enrollmentPercent >= 90) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-008",
+            "Partial",
+            `Enrollment is at ${enrollmentPercent} percent with no bypass users, but some active users still have no authenticator.`,
+            enrollmentEvidence,
+            "Drive the remaining users through enrollment or disable accounts that no longer need access.",
+          ),
+          data.users,
+        ),
+      );
+    } else {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-008",
+            "Fail",
+            `Enrollment is incomplete: ${bypassUsers.length} bypass user(s) and ${unenrolledUsers.length} unenrolled active user(s).`,
+            enrollmentEvidence,
+            "Remove bypass status from standing accounts and enforce enrollment for every active user.",
+          ),
+          data.users,
+        ),
+      );
+    }
+
+    const inactiveUsers = accessUsers.filter((user) => {
+      const age = daysSince(user.last_login);
+      return age !== null && age > INACTIVE_USER_DAYS;
+    });
+    const undatedUsers = accessUsers.filter((user) => parseTimestamp(user.last_login) === null);
+    const inactiveShare = percentage(inactiveUsers.length, accessUsers.length);
+    const inactiveEvidence = [
+      `access_users=${accessUsers.length}`,
+      `inactive_over_${INACTIVE_USER_DAYS}_days=${inactiveUsers.length}`,
+      `never_logged_in_or_undated=${undatedUsers.length}`,
+      ...inactiveUsers.slice(0, 10).map((user) => `inactive_user=${userLabel(user)} last_login_age_days=${daysSince(user.last_login)}`),
+      ...undatedUsers.slice(0, 10).map((user) => `undated_user=${userLabel(user)} last_login=null`),
+    ];
+    if (accessUsers.length === 0) {
+      findings.push(
+        buildFinding(
+          "DUO-AUTH-009",
+          "Manual",
+          "No users are in active or bypass status, so inactivity review has no population to assess.",
+          inactiveEvidence,
+          "Confirm the user population and re-run once active users exist.",
+        ),
+      );
+    } else if (inactiveUsers.length === 0 && undatedUsers.length === 0) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-009",
+            "Pass",
+            `No active user has been inactive for more than ${INACTIVE_USER_DAYS} days.`,
+            inactiveEvidence,
+            "Keep periodic access reviews in place and disable users who stop authenticating.",
+          ),
+          data.users,
+        ),
+      );
+    } else if (inactiveUsers.length === 0) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-009",
+            "Partial",
+            `${undatedUsers.length} active user(s) have never logged in (last_login=null) and cannot be counted as active.`,
+            inactiveEvidence,
+            "Review users who have never authenticated and remove access that was never used.",
+          ),
+          data.users,
+        ),
+      );
+    } else {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-009",
+            inactiveShare > 10 ? "Fail" : "Partial",
+            `${inactiveUsers.length} active user(s) (${inactiveShare} percent) have not authenticated in ${INACTIVE_USER_DAYS}+ days.`,
+            inactiveEvidence,
+            "Disable or remove users who have not authenticated in 90 days and document any exceptions.",
+          ),
+          data.users,
+        ),
+      );
+    }
+
+    const enrolledWithWebauthn = enrolledUsers.filter(userHasWebauthn);
+    const u2fUsers = enrolledUsers.filter((user) => asArray(user.u2f_tokens).length > 0);
+    const adoptionPercent = percentage(enrolledWithWebauthn.length, enrolledUsers.length);
+    const credentialInventory = data.webauthnCredentials.data;
+    const uvCapable = credentialInventory.filter((credential) => asBoolean(credential.uv_capable) === true).length;
+    const adoptionEvidence = [
+      `enrolled_users=${enrolledUsers.length}`,
+      `users_with_webauthn=${enrolledWithWebauthn.length}`,
+      `webauthn_adoption_percent=${adoptionPercent}`,
+      `users_with_deprecated_u2f=${u2fUsers.length}`,
+      data.webauthnCredentials.error
+        ? `webauthn_inventory_error=${data.webauthnCredentials.error}`
+        : `webauthn_credentials_total=${credentialInventory.length} uv_capable=${uvCapable}`,
+    ];
+    if (enrolledUsers.length === 0) {
+      findings.push(
+        buildFinding(
+          "DUO-AUTH-010",
+          "Manual",
+          "No enrolled users were available to measure WebAuthn adoption.",
+          adoptionEvidence,
+          "Confirm enrollment first, then measure phishing-resistant credential adoption.",
+        ),
+      );
+    } else if (adoptionPercent >= 75 && u2fUsers.length === 0) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-010",
+            "Pass",
+            `${adoptionPercent} percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain.`,
+            adoptionEvidence,
+            "Keep WebAuthn as the default enrollment path and retire remaining non-phishing-resistant authenticators.",
+          ),
+          data.users,
+        ),
+      );
+    } else if (enrolledWithWebauthn.length > 0) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-010",
+            "Partial",
+            `${adoptionPercent} percent of enrolled users have a WebAuthn credential${u2fUsers.length > 0 ? ` and ${u2fUsers.length} still hold deprecated U2F tokens` : ""}.`,
+            adoptionEvidence,
+            "Expand WebAuthn enrollment toward full coverage and migrate U2F tokens to WebAuthn.",
+          ),
+          data.users,
+        ),
+      );
+    } else {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-010",
+            "Fail",
+            "No enrolled user has a WebAuthn credential.",
+            adoptionEvidence,
+            "Enable WebAuthn in the authentication methods policy and run an enrollment campaign for security keys or platform authenticators.",
+          ),
+          data.users,
+        ),
+      );
+    }
+  }
+
+  const offline = data.offlineEnrollmentLogs;
+  const offlineEvents = offline?.data ?? [];
+  const provisioned = offlineEvents.filter((event) => asString(event.action) === "o2fa_user_provisioned").length;
+  const deprovisioned = offlineEvents.filter((event) => asString(event.action) === "o2fa_user_deprovisioned").length;
+  const securityKeyEvents = offlineEvents.filter((event) => {
+    const description = asString(event.description);
+    if (!description) return false;
+    try {
+      return asString(asRecord(JSON.parse(description)).factor) === "security_key";
+    } catch {
+      return false;
+    }
+  }).length;
+  findings.push(
+    buildFinding(
+      "DUO-AUTH-011",
+      "Manual",
+      "Offline access limits are not exposed by the Admin API; the Policy Section Data reference documents no offline access section, so configuration must be verified in the Admin Panel.",
+      offline?.error
+        ? unavailableEvidence(
+            DUO_ENDPOINTS.offlineEnrollmentLogs,
+            DUO_PERMISSIONS.readLog,
+            offline.error,
+            "Review the Offline Access policy section and the Windows Logon offline enrollment report in the Duo Admin Panel.",
+          )
+        : [
+            `offline_enrollment_events=${offlineEvents.length}`,
+            `o2fa_user_provisioned=${provisioned}`,
+            `o2fa_user_deprovisioned=${deprovisioned}`,
+            `security_key_factor_events=${securityKeyEvents}`,
+            "Policy Section Data (duo.com/docs/adminapi) lists no offline access section; limits cannot be read programmatically.",
+          ],
+      "Confirm in the Global Policy Offline Access section that offline access is disabled or limited by days and authentication count, and that security keys are preferred over Duo Mobile OTP.",
+      {
+        manualNote: "Offline access policy values are not returned by GET /admin/v2/policies/global; only offline enrollment events are readable.",
+      },
+    ),
+  );
+
+  return findings;
 }
 
 export function assessDuoAuthentication(
@@ -1257,6 +1909,14 @@ export function assessDuoAuthentication(
 ): DuoAssessmentResult {
   const findings: DuoFinding[] = [];
   const globalPolicy = getGlobalPolicyRecord(data);
+  const policyUnavailable = Object.keys(getPolicySections(globalPolicy)).length === 0;
+  const policyError = data.globalPolicy.error ?? data.policies.error;
+  const policyEvidence = unavailableEvidence(
+    DUO_ENDPOINTS.globalPolicy,
+    DUO_PERMISSIONS.readResource,
+    policyError,
+    "Export the Global Policy from the Duo Admin Panel Policies page.",
+  );
   const allowedFactors = getAllowedAuthList(globalPolicy);
   const authMethods = asRecord(getPolicySections(globalPolicy).authentication_methods);
   const requireVerifiedPush = getBooleanish(authMethods, "require_verified_push");
@@ -1271,7 +1931,70 @@ export function assessDuoAuthentication(
       : undefined,
   ].filter((item): item is string => Boolean(item));
 
-  if (hasWebAuthn || (allowsPush && requireVerifiedPush)) {
+  const userAuthBehavior = asString(asRecord(getPolicySections(globalPolicy).authentication_policy).user_auth_behavior)?.toLowerCase();
+  if (policyUnavailable) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-007",
+        "Manual",
+        "Global MFA enforcement mode could not be read because the global policy was unavailable.",
+        policyEvidence,
+        "Grant the audit principal Grant resource - Read and confirm authentication_policy.user_auth_behavior=enforce in the Global Policy.",
+      ),
+    );
+  } else if (userAuthBehavior === undefined) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-007",
+        "Manual",
+        "The global policy payload did not include the authentication_policy section.",
+        ["sections.authentication_policy.user_auth_behavior was absent from the Global Policy response."],
+        "Confirm in the Duo Admin Panel that the Global Policy Authentication Policy is set to enforce 2FA.",
+      ),
+    );
+  } else if (userAuthBehavior === "enforce") {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-007",
+        "Pass",
+        "The global policy enforces two-factor authentication for all users.",
+        ["authentication_policy.user_auth_behavior=enforce"],
+        "Keep the Global Policy authentication behavior on enforce and review any custom policy that overrides it.",
+      ),
+    );
+  } else if (userAuthBehavior === "bypass") {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-007",
+        "Fail",
+        "The global policy bypasses two-factor authentication and enrollment.",
+        ["authentication_policy.user_auth_behavior=bypass"],
+        "Set the Global Policy authentication behavior to enforce so primary credentials alone never grant access.",
+      ),
+    );
+  } else {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-007",
+        "Partial",
+        `The global policy authentication behavior is ${userAuthBehavior}, which denies all authentication rather than enforcing MFA.`,
+        [`authentication_policy.user_auth_behavior=${userAuthBehavior}`],
+        "Confirm the deny posture is intentional (for example a maintenance freeze) and return the Global Policy to enforce afterwards.",
+      ),
+    );
+  }
+
+  if (policyUnavailable) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-001",
+        "Manual",
+        "Phishing-resistant factor posture could not be read because the global policy was unavailable.",
+        policyEvidence,
+        "Grant the audit principal Grant resource - Read and confirm WebAuthn or Verified Duo Push in authentication_methods.",
+      ),
+    );
+  } else if (hasWebAuthn || (allowsPush && requireVerifiedPush)) {
     findings.push(
       buildFinding(
         "DUO-AUTH-001",
@@ -1312,7 +2035,9 @@ export function assessDuoAuthentication(
         "DUO-AUTH-002",
         "Manual",
         "Authentication method restrictions could not be confirmed from the global policy payload.",
-        ["The global policy did not expose authentication_methods.allowed_auth_list."],
+        policyUnavailable
+          ? policyEvidence
+          : ["The global policy did not expose authentication_methods.allowed_auth_list."],
         "Review the Authentication Methods policy section manually and verify SMS and phone callback posture.",
       ),
     );
@@ -1345,7 +2070,7 @@ export function assessDuoAuthentication(
         "DUO-AUTH-003",
         "Manual",
         "New user policy could not be resolved from the collected policy data.",
-        ["The global policy did not include a new_user.new_user_behavior value."],
+        policyUnavailable ? policyEvidence : ["The global policy did not include a new_user.new_user_behavior value."],
         "Confirm that new users must enroll before accessing protected applications.",
       ),
     );
@@ -1372,7 +2097,17 @@ export function assessDuoAuthentication(
   }
 
   const rememberedDays = rememberedDeviceWindowDays(globalPolicy);
-  if (rememberedDays === null) {
+  if (policyUnavailable) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-004",
+        "Manual",
+        "Remembered device posture could not be read because the global policy was unavailable.",
+        policyEvidence,
+        "Grant the audit principal Grant resource - Read and review remembered_devices.browser_apps in the Global Policy.",
+      ),
+    );
+  } else if (rememberedDays === null) {
     findings.push(
       buildFinding(
         "DUO-AUTH-004",
@@ -1437,7 +2172,17 @@ export function assessDuoAuthentication(
     getBooleanish(screenLock, "require_screen_lock") ? "Screen lock required." : undefined,
     getBooleanish(diskEncryption, "require_disk_encryption") ? "Full disk encryption required." : undefined,
   ].filter((item): item is string => Boolean(item));
-  if (trustedChecking === "require-trusted") {
+  if (policyUnavailable) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-005",
+        "Manual",
+        "Trusted endpoint posture could not be read because the global policy was unavailable.",
+        policyEvidence,
+        "Grant the audit principal Grant resource - Read and review trusted_endpoints.trusted_endpoint_checking in the Global Policy.",
+      ),
+    );
+  } else if (trustedChecking === "require-trusted") {
     findings.push(
       buildFinding(
         "DUO-AUTH-005",
@@ -1478,14 +2223,32 @@ export function assessDuoAuthentication(
     return remainingUses === 0 || validSecs === 0;
   }).length;
 
-  if (bypassCount === 0) {
+  if (data.bypassCodes.error) {
     findings.push(
       buildFinding(
         "DUO-AUTH-006",
-        "Pass",
-        "No active bypass codes were returned.",
-        ["Global bypass code inventory is empty."],
-        "Keep break-glass issuance exceptional and time-bounded.",
+        "Manual",
+        "Bypass code inventory could not be collected.",
+        unavailableEvidence(
+          DUO_ENDPOINTS.bypassCodes,
+          DUO_PERMISSIONS.readResource,
+          data.bypassCodes.error,
+          "Export the Bypass Codes report from the Duo Admin Panel.",
+        ),
+        "Grant the audit principal Grant resource - Read so active bypass codes can be enumerated.",
+      ),
+    );
+  } else if (bypassCount === 0) {
+    findings.push(
+      withInventoryCap(
+        buildFinding(
+          "DUO-AUTH-006",
+          "Pass",
+          "No active bypass codes were returned.",
+          ["Global bypass code inventory is empty, which is compliant by intent: no outstanding break-glass codes."],
+          "Keep break-glass issuance exceptional and time-bounded.",
+        ),
+        data.bypassCodes,
       ),
     );
   } else if (helpdeskBypass === "allow" || unlimitedLikeCodes > 0 || (helpdeskBypass === "limit" && (helpdeskBypassExpiration ?? 0) <= 0)) {
@@ -1519,11 +2282,14 @@ export function assessDuoAuthentication(
     );
   }
 
+  findings.push(...assessUserPopulation(data));
+
   const snapshotSummary = {
     users: data.users.data.length,
     active_bypass_codes: bypassCount,
     webauthn_credentials: data.webauthnCredentials.data.length,
     auth_logs_collected: data.authenticationLogs.data.length,
+    offline_enrollment_events: data.offlineEnrollmentLogs?.data.length ?? 0,
   };
 
   return {
@@ -1541,30 +2307,43 @@ export function assessDuoAdminAccess(
 ): DuoAssessmentResult {
   const findings: DuoFinding[] = [];
   const admins = data.admins.data;
-  const ownerCount = admins.filter(isOwnerAdmin).length;
-  const staleAdmins = admins.filter((admin) => {
-    const age = daysSince(admin.last_login ?? admin.last_login_time ?? admin.last_seen);
-    return age !== null && age > 90;
+  const activeAdmins = admins.filter((admin) => (asString(admin.status)?.toLowerCase() ?? "active") !== "disabled");
+  const ownerCount = activeAdmins.filter(isOwnerAdmin).length;
+  const staleAdmins = activeAdmins.filter((admin) => {
+    const age = daysSince(admin.last_login);
+    return age !== null && age > INACTIVE_USER_DAYS;
   });
+  const undatedAdmins = activeAdmins.filter((admin) => parseTimestamp(admin.last_login) === null);
+  const adminsEvidence = unavailableEvidence(
+    DUO_ENDPOINTS.admins,
+    `${DUO_PERMISSIONS.adminsRead} and ${DUO_PERMISSIONS.readResource}`,
+    data.admins.error,
+    "Export the Administrators list from the Duo Admin Panel with role, status, and last login.",
+  );
 
   if (admins.length === 0) {
     findings.push(
       buildFinding(
         "DUO-ADMIN-001",
         "Manual",
-        "Administrator inventory could not be established.",
-        [data.admins.error ?? "No administrators were returned by the Admin API."],
+        data.admins.error
+          ? "Administrator inventory could not be collected."
+          : "The administrator inventory was empty, which cannot be true for a live tenant, so the result is Manual rather than Pass.",
+        adminsEvidence,
         "Confirm that the audit principal has Grant administrators - Read and Grant resource - Read permissions.",
       ),
     );
   } else if (ownerCount <= 2) {
     findings.push(
-      buildFinding(
-        "DUO-ADMIN-001",
-        "Pass",
-        "Owner-level access is concentrated in a small number of admins.",
-        [`admins=${admins.length}`, `owners=${ownerCount}`],
-        "Keep Owner-role assignments limited and review them periodically.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-ADMIN-001",
+          "Pass",
+          "Owner-level access is concentrated in a small number of admins.",
+          [`admins=${admins.length}`, `active_admins=${activeAdmins.length}`, `owners=${ownerCount}`],
+          "Keep Owner-role assignments limited and review them periodically.",
+        ),
+        data.admins,
       ),
     );
   } else if (ownerCount <= Math.max(3, Math.ceil(admins.length / 2))) {
@@ -1594,7 +2373,22 @@ export function assessDuoAdminAccess(
   const webauthnEnabled = getBooleanish(allowed, "webauthn_enabled");
   const smsEnabled = getBooleanish(allowed, "sms_enabled");
   const voiceEnabled = getBooleanish(allowed, "voice_enabled");
-  if (verifiedPushEnabled || webauthnEnabled) {
+  if (data.allowedAdminAuthMethods.error || Object.keys(allowed).length === 0) {
+    findings.push(
+      buildFinding(
+        "DUO-ADMIN-002",
+        "Manual",
+        "Administrator authentication methods could not be collected.",
+        unavailableEvidence(
+          DUO_ENDPOINTS.adminAllowedAuthMethods,
+          DUO_PERMISSIONS.adminsRead,
+          data.allowedAdminAuthMethods.error,
+          "Review Administrators > Admin Login Settings in the Duo Admin Panel.",
+        ),
+        "Grant the audit principal Grant administrators - Read so admin login factors can be verified.",
+      ),
+    );
+  } else if (verifiedPushEnabled || webauthnEnabled) {
     findings.push(
       buildFinding(
         "DUO-ADMIN-002",
@@ -1625,9 +2419,26 @@ export function assessDuoAdminAccess(
   }
 
   const settings = asRecord(data.settings.data);
+  const settingsUnavailable = Boolean(data.settings.error) || Object.keys(settings).length === 0;
+  const settingsEvidence = unavailableEvidence(
+    DUO_ENDPOINTS.settings,
+    DUO_PERMISSIONS.settings,
+    data.settings.error,
+    "Review Settings in the Duo Admin Panel (help desk bypass, lockout threshold, lockout duration).",
+  );
   const helpdeskBypass = asString(settings.helpdesk_bypass)?.toLowerCase();
   const helpdeskBypassExpiration = asNumber(settings.helpdesk_bypass_expiration);
-  if (helpdeskBypass === "deny") {
+  if (settingsUnavailable) {
+    findings.push(
+      buildFinding(
+        "DUO-ADMIN-003",
+        "Manual",
+        "Help desk bypass settings could not be collected.",
+        settingsEvidence,
+        "Grant the audit principal Grant settings so helpdesk_bypass can be verified.",
+      ),
+    );
+  } else if (helpdeskBypass === "deny") {
     findings.push(
       buildFinding(
         "DUO-ADMIN-003",
@@ -1665,34 +2476,126 @@ export function assessDuoAdminAccess(
     );
   }
 
+  const staleEvidence = [
+    `admins_reviewed=${activeAdmins.length}`,
+    `stale_admins=${staleAdmins.length}`,
+    `undated_admins=${undatedAdmins.length}`,
+    ...staleAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login_age_days=${daysSince(admin.last_login) ?? "unknown"}`),
+    ...undatedAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login=null`),
+  ];
   if (admins.length === 0) {
     findings.push(
       buildFinding(
         "DUO-ADMIN-004",
         "Manual",
         "Stale administrator review could not be completed.",
-        ["No administrator inventory was available."],
+        adminsEvidence,
         "Review privileged account activity directly in the Duo admin console.",
+      ),
+    );
+  } else if (staleAdmins.length === 0 && undatedAdmins.length === 0) {
+    findings.push(
+      withInventoryCap(
+        buildFinding(
+          "DUO-ADMIN-004",
+          "Pass",
+          "No privileged administrators were obviously stale based on available login timestamps.",
+          staleEvidence,
+          "Keep periodic access reviews in place for privileged administrators.",
+        ),
+        data.admins,
       ),
     );
   } else if (staleAdmins.length === 0) {
     findings.push(
+      withInventoryCap(
+        buildFinding(
+          "DUO-ADMIN-004",
+          "Partial",
+          `${undatedAdmins.length} administrator(s) have never logged in (last_login=null) and cannot be counted as active.`,
+          staleEvidence,
+          "Review administrators who have never logged in and remove accounts that were never activated or used.",
+        ),
+        data.admins,
+      ),
+    );
+  } else {
+    findings.push(
+      withInventoryCap(
+        buildFinding(
+          "DUO-ADMIN-004",
+          staleAdmins.length >= Math.max(1, Math.ceil(activeAdmins.length / 3)) ? "Fail" : "Partial",
+          "Some privileged administrators appear stale.",
+          staleEvidence,
+          "Review stale privileged accounts and remove or re-justify access for administrators who no longer need it.",
+        ),
+        data.admins,
+      ),
+    );
+  }
+
+  const lockoutThreshold = settings.lockout_threshold;
+  const lockoutThresholdNumber = asNumber(lockoutThreshold);
+  const lockoutExpire = asNumber(settings.lockout_expire_duration);
+  const unenrolledLockoutDays = asNumber(settings.unenrolled_user_lockout_threshold);
+  const lockoutEvidence = [
+    `lockout_threshold=${lockoutThreshold ?? "null"}`,
+    `lockout_expire_duration=${settings.lockout_expire_duration ?? "null"}`,
+    `unenrolled_user_lockout_threshold=${unenrolledLockoutDays ?? "null"}`,
+  ];
+  if (settingsUnavailable) {
+    findings.push(
       buildFinding(
-        "DUO-ADMIN-004",
+        "DUO-ADMIN-005",
+        "Manual",
+        "User lockout settings could not be collected.",
+        settingsEvidence,
+        "Grant the audit principal Grant settings so lockout_threshold can be verified.",
+      ),
+    );
+  } else if (lockoutThresholdNumber === undefined) {
+    findings.push(
+      buildFinding(
+        "DUO-ADMIN-005",
+        "Manual",
+        "The settings payload did not include a numeric lockout_threshold.",
+        lockoutEvidence,
+        "Confirm the Lockout and Fraud settings in the Duo Admin Panel.",
+      ),
+    );
+  } else if (lockoutThresholdNumber <= 0) {
+    findings.push(
+      buildFinding(
+        "DUO-ADMIN-005",
+        "Fail",
+        "Failed-attempt lockout is not configured.",
+        lockoutEvidence,
+        `Set lockout_threshold to ${LOCKOUT_THRESHOLD_MAX} or fewer consecutive failed attempts.`,
+      ),
+    );
+  } else if (lockoutThresholdNumber <= LOCKOUT_THRESHOLD_MAX) {
+    findings.push(
+      buildFinding(
+        "DUO-ADMIN-005",
         "Pass",
-        "No privileged administrators were obviously stale based on available login timestamps.",
-        [`admins_reviewed=${admins.length}`],
-        "Keep periodic access reviews in place for privileged administrators.",
+        `Users are locked out after ${lockoutThresholdNumber} consecutive failed attempts.`,
+        [
+          ...lockoutEvidence,
+          lockoutExpire && lockoutExpire > 0
+            ? `Locked-out users revert to Active after ${lockoutExpire} minutes.`
+            : "Locked-out users stay locked until an administrator or API call clears the status.",
+        ],
+        "Keep the lockout threshold at or below 10 and review lockout events in the authentication log.",
       ),
     );
   } else {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-004",
-        staleAdmins.length >= Math.max(1, Math.ceil(admins.length / 3)) ? "Fail" : "Partial",
-        "Some privileged administrators appear stale.",
-        staleAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login_age_days=${daysSince(admin.last_login ?? admin.last_login_time ?? admin.last_seen) ?? "unknown"}`),
-        "Review stale privileged accounts and remove or re-justify access for administrators who no longer need it.",
+        "DUO-ADMIN-005",
+        "Partial",
+        `Lockout is enabled but only after ${lockoutThresholdNumber} consecutive failed attempts.`,
+        lockoutEvidence,
+        `Lower lockout_threshold to ${LOCKOUT_THRESHOLD_MAX} or fewer consecutive failed attempts.`,
       ),
     );
   }
@@ -1705,7 +2608,12 @@ export function assessDuoAdminAccess(
         ? "Administrative activity logs could not be collected."
         : "Administrative activity logs are readable to the audit principal.",
       data.activityLogs.error
-        ? [data.activityLogs.error]
+        ? unavailableEvidence(
+            DUO_ENDPOINTS.activityLogs,
+            DUO_PERMISSIONS.readLog,
+            data.activityLogs.error,
+            "Export the Administrator Actions report from the Duo Admin Panel.",
+          )
         : [`activity_logs_collected=${data.activityLogs.data.length}`],
       "Keep admin activity logs available to the audit or monitoring workflow so privileged changes are reviewable.",
     ),
@@ -1715,6 +2623,7 @@ export function assessDuoAdminAccess(
     admins: admins.length,
     owners: ownerCount,
     stale_admins: staleAdmins.length,
+    undated_admins: undatedAdmins.length,
     activity_logs_collected: data.activityLogs.data.length,
   };
 
