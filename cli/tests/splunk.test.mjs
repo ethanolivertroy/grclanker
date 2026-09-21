@@ -1141,6 +1141,143 @@ test("rule 9: every Splunk surface that fails with a 502 HTML page or a JSON err
   assert.match(noContext.notes[1], /an unread capability list/);
 });
 
+/** Like forbidding(), but records method, endpoint, and status for every request the fixture answered. */
+function recording(fixture, deniedEndpoints, options = {}, configOverrides = {}) {
+  const { fetchImpl } = createFetch(fixture, options);
+  const denied = new Set(deniedEndpoints);
+  const requests = [];
+  const wrapped = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const endpoint = endpointOf(url);
+    const response = denied.has(endpoint)
+      ? jsonResponse({ messages: [{ type: "ERROR", text: "You (user=auditor) do not have permission to perform this operation." }] }, 403)
+      : await fetchImpl(input, init);
+    requests.push({ method: init.method ?? "GET", endpoint, status: response.status });
+    return response;
+  };
+  return { client: new SplunkApiClient(sampleConfig(configOverrides), { fetchImpl: wrapped, retryDelayMs: 0, retryAttempts: 1 }), requests };
+}
+
+const MENTIONED_STATUS_PATTERNS = [
+  /\((\d{3})(?: [A-Za-z][A-Za-z ]*)?\)/g,
+  /"(?:http_status|httpStatus|status)":\s*(\d{3})\b/g,
+  /\b(?:HTTP|status|returned)\s+(\d{3})\b/gi,
+];
+const MENTIONED_ENDPOINT_PATTERN = /(?:acs:)?\/services(?:NS)?\/[A-Za-z0-9_./:{}*-]*[A-Za-z0-9*}]/g;
+
+/**
+ * Every 4xx or 5xx status code and every REST or ACS path named anywhere in
+ * the outputs must belong to a request the fixture actually served; a code or
+ * endpoint absent from the request log is a claim the run did not observe.
+ */
+function assertOutputsNameOnlyObservedRequests(outputs, requests, label) {
+  const observedStatuses = new Set(requests.map((request) => request.status));
+  const observedEndpoints = [...new Set(requests.map((request) => request.endpoint))];
+  for (const [name, text] of outputs) {
+    for (const pattern of MENTIONED_STATUS_PATTERNS) {
+      for (const match of text.matchAll(pattern)) {
+        const status = Number(match[1]);
+        if (status < 400 || status > 599) continue;
+        assert.ok(observedStatuses.has(status), `${label} ${name}: mentions status ${status} but the run observed only ${[...observedStatuses].join(", ")} (in: ${match[0]})`);
+      }
+    }
+    for (const match of text.matchAll(MENTIONED_ENDPOINT_PATTERN)) {
+      const mention = match[0].replace(/[.)]+$/, "");
+      const template = new RegExp(`^${mention.replace(/[.+?^$()|[\]\\]/g, "\\$&").replace(/\{[^}]*\}|\*/g, "[^/]*")}$`);
+      assert.ok(observedEndpoints.some((endpoint) => template.test(endpoint)), `${label} ${name}: names endpoint ${mention} but the run requested only ${observedEndpoints.join(", ")}`);
+    }
+  }
+}
+
+function splunkOutputs(access, results, exported) {
+  return new Map([
+    ["check_access", JSON.stringify(access)],
+    ...results.map((result) => [`assess ${result.title}`, JSON.stringify(result)]),
+    ...[...readBundleFiles(exported.outputDir)].map(([name, content]) => [`bundle ${name}`, content]),
+  ]);
+}
+
+// Every core_data snapshot the export writes and the endpoint it reads.
+const SPLUNK_SNAPSHOTS = [
+  ["server_info", "/services/server/info"],
+  ["current_context", "/services/authentication/current-context"],
+  ["users", "/services/authentication/users"],
+  ["roles", "/services/authorization/roles"],
+  ["tokens", "/services/authorization/tokens"],
+  ["conf_authentication", "/services/configs/conf-authentication"],
+  ["conf_server", "/services/configs/conf-server"],
+  ["conf_web", "/services/configs/conf-web"],
+  ["conf_outputs", "/services/configs/conf-outputs"],
+  ["conf_inputs", "/services/configs/conf-inputs"],
+  ["indexes", "/services/data/indexes"],
+  ["hec_inputs", "/services/data/inputs/http"],
+  ["saved_searches", "/servicesNS/-/-/saved/searches"],
+  ["apps", "/services/apps/local"],
+  ["kv_collections", "/servicesNS/-/-/storage/collections/config"],
+  ["tcp_cooked_inputs", "/services/data/inputs/tcp/cooked"],
+];
+
+test("collection status: a denied snapshot is written to core_data as a not-collected marker naming the real endpoint and status, access surfaces render null counts for failed probes, a readable empty list stays [], and every status code and endpoint named in any output was actually requested", async () => {
+  const cloud = { ...HARDENED, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
+  const acs = {
+    "/inputs/http-event-collectors": { "http-event-collectors": [{ spec: { name: "firehose", allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useACK: true } }] },
+    "/access/search-api/ipallowlists": { subnets: ["10.0.0.0/8"] },
+    "/access/hec/ipallowlists": { subnets: ["10.0.0.0/8"] },
+    "/access/s2s/ipallowlists": { subnets: ["10.0.0.0/8"] },
+    "/access/search-ui/ipallowlists": { subnets: ["10.0.0.0/8"] },
+  };
+  const acsConfig = { url: "https://acme.splunkcloud.com:8089", stack: "acme-stack", acsToken: "acs-jwt-token-value" };
+  const base = createTempBase("grclanker-splunk-denied-markers-");
+
+  for (const [name, endpoint] of SPLUNK_SNAPSHOTS) {
+    const { client: api, requests } = recording(cloud, [endpoint], { acs }, acsConfig);
+    const access = await checkSplunkAccess(api);
+    const results = await runAllAssessments(api);
+    const exported = await exportSplunkAuditBundle(api, sampleConfig(acsConfig), join(base, name));
+
+    const file = JSON.parse(readFileSync(join(exported.outputDir, "core_data", `${name}.json`), "utf8"));
+    assert.ok(!Array.isArray(file) && !Array.isArray(file.entries), `${name}: a denied snapshot is never written as an array`);
+    assert.deepEqual(file, { collected: false, status: 403, endpoint, error: file.error }, `${name}: core_data carries the not-collected marker`);
+    assert.match(file.error, /failed \(403\)/, `${name}: the marker error names the observed status`);
+    assert.match(readFileSync(join(exported.outputDir, "_errors.log"), "utf8"), new RegExp(`core_data/${name}: `));
+
+    const surface = access.surfaces.find((item) => item.name === name);
+    if (surface) {
+      assert.equal(surface.status, "not_readable");
+      assert.equal(surface.endpoint, endpoint);
+      assert.equal(surface.count, null, `${name}: count is null, not 0, when the probe failed`);
+      assert.equal(surface.total, null, `${name}: total is null when the probe failed`);
+      assert.equal(surface.truncated, null, `${name}: truncated is null, not false, when the probe failed`);
+      assert.equal(surface.httpStatus, 403);
+    }
+    for (const item of results.flatMap((result) => result.findings).filter((finding) => finding.evidence.endpoint !== undefined && finding.evidence.http_status === 403)) {
+      assert.ok(requests.some((request) => request.endpoint === item.evidence.endpoint && request.status === 403), `${name}: ${item.id} names ${item.evidence.endpoint} as denied but no such request was observed`);
+    }
+
+    assertOutputsNameOnlyObservedRequests(splunkOutputs(access, results, exported), requests, `${name} denied`);
+  }
+
+  const emptyTokens = { ...cloud, "/services/authorization/tokens": [] };
+  const { client: api, requests } = recording(emptyTokens, [], { acs }, acsConfig);
+  const access = await checkSplunkAccess(api);
+  const results = await runAllAssessments(api);
+  const exported = await exportSplunkAuditBundle(api, sampleConfig(acsConfig), join(base, "empty"));
+  const tokens = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "tokens.json"), "utf8"));
+  assert.deepEqual(tokens.entries, [], "a readable empty list stays []");
+  assert.equal(tokens.total, 0);
+  assert.equal(tokens.truncated, false);
+  assert.equal(tokens.totalKnown, true);
+  assert.equal(tokens.collected, undefined);
+  const tokenSurface = access.surfaces.find((item) => item.name === "tokens");
+  assert.deepEqual({ count: tokenSurface.count, total: tokenSurface.total, truncated: tokenSurface.truncated, httpStatus: tokenSurface.httpStatus }, { count: 0, total: 0, truncated: false, httpStatus: null });
+  for (const surface of access.surfaces) {
+    assert.equal(surface.status, "readable", `${surface.name} is readable on the healthy fixture`);
+    assert.equal(typeof surface.count, "number");
+    assert.equal(surface.httpStatus, null);
+  }
+  assertOutputsNameOnlyObservedRequests(splunkOutputs(access, results, exported), requests, "healthy with an empty token list");
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-splunk-path-");
   const outside = createTempBase("grclanker-splunk-outside-");

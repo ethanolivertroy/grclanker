@@ -84,9 +84,23 @@ export interface SplunkAccessSurface {
   name: string;
   endpoint: string;
   status: "readable" | "not_readable" | "not_configured";
-  count?: number;
-  total?: number;
+  /** Entries seen on a readable surface; null when the probe did not succeed or was not configured. */
+  count: number | null;
+  /** The total splunkd reported for a readable list; null when it was omitted or the probe did not succeed. */
+  total: number | null;
+  /** Whether a readable list was cut short; null when the probe did not succeed or the surface is not a list. */
+  truncated: boolean | null;
+  /** The observed HTTP status of a failed probe; null when the probe succeeded or failed before a response. */
+  httpStatus: number | null;
   error?: string;
+}
+
+/** What a bundle consumer reads in place of a snapshot that was never collected. */
+export interface SplunkNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string;
+  error: string;
 }
 
 export interface SplunkAccessCheckResult {
@@ -141,9 +155,10 @@ export interface SplunkSearchResult {
   results: JsonRecord[];
 }
 
+/** A failed collection names the endpoint whose request failed, when the error carried one. */
 type Collected<T> =
   | { ok: true; value: T }
-  | { ok: false; error: string; httpStatus?: number };
+  | { ok: false; error: string; httpStatus?: number; endpoint?: string };
 
 interface ControlDefinition {
   number: number;
@@ -357,6 +372,10 @@ function parseResponseBody(response: Response, rawText: string): ParsedResponseB
 function errorStatus(error: unknown): number | undefined {
   const status = asNumber(asObject(error)?.status ?? asObject(error)?.httpStatus);
   return status;
+}
+
+function errorEndpoint(error: unknown): string | undefined {
+  return error instanceof SplunkApiError ? error.endpoint : undefined;
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -956,8 +975,17 @@ async function collect<T>(client: SplunkInspectorClient, load: () => Promise<T>)
   try {
     return { ok: true, value: await load() };
   } catch (error) {
-    return { ok: false, error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)), httpStatus: errorStatus(error) };
+    return { ok: false, error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)), httpStatus: errorStatus(error), endpoint: errorEndpoint(error) };
   }
+}
+
+/**
+ * The object written in place of a snapshot that was never collected, so a
+ * bundle consumer cannot mistake a denied or failed read for an empty
+ * inventory; the endpoint is the one the error came from when it named one.
+ */
+function notCollectedMarker(item: { error: string; httpStatus?: number; endpoint?: string }, declaredEndpoint: string): SplunkNotCollectedMarker {
+  return { collected: false, status: item.httpStatus ?? null, endpoint: item.endpoint ?? declaredEndpoint, error: item.error };
 }
 
 async function collectOptionalConf(client: SplunkInspectorClient, file: string): Promise<Collected<SplunkListResult>> {
@@ -1025,12 +1053,18 @@ function finding(
   };
 }
 
-function manualUnreadable(controlNumber: number, endpoint: string, item: { error: string; httpStatus?: number }, evidenceNeeded: string): SplunkFinding {
+/**
+ * The endpoint named in the summary is the one the failed request actually
+ * went to when the error carried it; the caller's label is only a fallback
+ * for errors that did not name their endpoint.
+ */
+function manualUnreadable(controlNumber: number, endpoint: string, item: { error: string; httpStatus?: number; endpoint?: string }, evidenceNeeded: string): SplunkFinding {
+  const named = item.endpoint ?? endpoint;
   return finding(
     controlNumber,
     "manual",
-    `Unknown: ${endpoint} could not be evaluated because ${unreadableCause(item)}. Collect manually: ${evidenceNeeded}`,
-    { endpoint, error: item.error, http_status: item.httpStatus ?? null },
+    `Unknown: ${named} could not be evaluated because ${unreadableCause(item)}. Collect manually: ${evidenceNeeded}`,
+    { endpoint: named, error: item.error, http_status: item.httpStatus ?? null },
   );
 }
 
@@ -2194,10 +2228,33 @@ async function readableSurface(
     const value = await load();
     const list = asObject(value);
     const entries = Array.isArray(list?.entries) ? list?.entries : undefined;
-    return { name, endpoint, status: "readable", count: entries ? entries.length : value === undefined ? 0 : 1, total: asNumber(list?.total) };
+    const totalKnown = list?.totalKnown !== false;
+    return {
+      name,
+      endpoint,
+      status: "readable",
+      count: entries ? entries.length : value === undefined ? 0 : 1,
+      total: entries && totalKnown ? asNumber(list?.total) ?? null : null,
+      truncated: entries && typeof list?.truncated === "boolean" ? list.truncated : null,
+      httpStatus: null,
+    };
   } catch (error) {
-    return { name, endpoint, status: "not_readable", error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)) };
+    return {
+      name,
+      endpoint: errorEndpoint(error) ?? endpoint,
+      status: "not_readable",
+      count: null,
+      total: null,
+      truncated: null,
+      httpStatus: errorStatus(error) ?? null,
+      error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)),
+    };
   }
+}
+
+function collectedSurface(name: string, endpoint: string, collected: Collected<unknown>): SplunkAccessSurface {
+  if (collected.ok) return { name, endpoint, status: "readable", count: 1, total: null, truncated: null, httpStatus: null };
+  return { name, endpoint: collected.endpoint ?? endpoint, status: "not_readable", count: null, total: null, truncated: null, httpStatus: collected.httpStatus ?? null, error: collected.error };
 }
 
 export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<SplunkAccessCheckResult> {
@@ -2208,8 +2265,8 @@ export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<
   const authenticatedAs = context.ok ? asString(context.value?.content.username) ?? context.value?.name : undefined;
 
   const surfaces: SplunkAccessSurface[] = [
-    { name: "server_info", endpoint: "/services/server/info", status: deployment.collected.ok ? "readable" : "not_readable", count: deployment.collected.ok ? 1 : undefined, error: deployment.collected.ok ? undefined : deployment.collected.error },
-    { name: "current_context", endpoint: "/services/authentication/current-context", status: context.ok ? "readable" : "not_readable", count: context.ok ? 1 : undefined, error: context.ok ? undefined : context.error },
+    collectedSurface("server_info", "/services/server/info", deployment.collected),
+    collectedSurface("current_context", "/services/authentication/current-context", context),
     await readableSurface(client, "users", "/services/authentication/users", () => client.listUsers()),
     await readableSurface(client, "roles", "/services/authorization/roles", () => client.listRoles()),
     await readableSurface(client, "tokens", "/services/authorization/tokens", () => client.listTokens()),
@@ -2224,7 +2281,7 @@ export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<
     await readableSurface(client, "kv_collections", "/servicesNS/-/-/storage/collections/config", () => client.listKvCollections()),
     client.hasAcs()
       ? await readableSurface(client, "acs_ip_allowlist", "acs:/access/search-api/ipallowlists", () => client.acsGet("/access/search-api/ipallowlists"))
-      : { name: "acs_ip_allowlist", endpoint: "acs:/access/search-api/ipallowlists", status: "not_configured" },
+      : { name: "acs_ip_allowlist", endpoint: "acs:/access/search-api/ipallowlists", status: "not_configured", count: null, total: null, truncated: null, httpStatus: null },
   ];
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
@@ -2258,7 +2315,7 @@ function formatAccessCheckText(result: SplunkAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
     surface.status,
-    surface.count === undefined ? "-" : surface.total !== undefined && surface.total !== surface.count ? `${surface.count}/${surface.total}` : String(surface.count),
+    surface.count === null ? "-" : surface.total !== null && surface.total !== surface.count ? `${surface.count}/${surface.total}` : String(surface.count),
     surface.error ? surface.error.replace(/\s+/g, " ").slice(0, 90) : "",
   ]);
   return [
@@ -2368,33 +2425,37 @@ export async function exportSplunkAuditBundle(
   ];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
-  const rawSnapshots: Array<[string, () => Promise<unknown>]> = [
-    ["server_info", () => client.getServerInfo()],
-    ["current_context", () => client.getCurrentContext()],
-    ["users", () => client.listUsers()],
-    ["roles", () => client.listRoles()],
-    ["tokens", () => client.listTokens()],
-    ["conf_authentication", () => client.getConfStanzas("authentication")],
-    ["conf_server", () => client.getConfStanzas("server")],
-    ["conf_web", () => client.getConfStanzas("web")],
-    ["conf_outputs", () => client.getConfStanzas("outputs")],
-    ["conf_inputs", () => client.getConfStanzas("inputs")],
-    ["indexes", () => client.listIndexes()],
-    ["hec_inputs", () => client.listHecInputs()],
-    ["saved_searches", async () => projectSavedSearchSnapshot(await client.listSavedSearches())],
-    ["apps", () => client.listApps()],
-    ["kv_collections", () => client.listKvCollections()],
-    ["tcp_cooked_inputs", () => client.listCookedTcpInputs()],
+  const rawSnapshots: Array<[string, string, () => Promise<unknown>]> = [
+    ["server_info", "/services/server/info", () => client.getServerInfo()],
+    ["current_context", "/services/authentication/current-context", () => client.getCurrentContext()],
+    ["users", "/services/authentication/users", () => client.listUsers()],
+    ["roles", "/services/authorization/roles", () => client.listRoles()],
+    ["tokens", "/services/authorization/tokens", () => client.listTokens()],
+    ["conf_authentication", "/services/configs/conf-authentication", () => client.getConfStanzas("authentication")],
+    ["conf_server", "/services/configs/conf-server", () => client.getConfStanzas("server")],
+    ["conf_web", "/services/configs/conf-web", () => client.getConfStanzas("web")],
+    ["conf_outputs", "/services/configs/conf-outputs", () => client.getConfStanzas("outputs")],
+    ["conf_inputs", "/services/configs/conf-inputs", () => client.getConfStanzas("inputs")],
+    ["indexes", "/services/data/indexes", () => client.listIndexes()],
+    ["hec_inputs", "/services/data/inputs/http", () => client.listHecInputs()],
+    ["saved_searches", "/servicesNS/-/-/saved/searches", async () => projectSavedSearchSnapshot(await client.listSavedSearches())],
+    ["apps", "/services/apps/local", () => client.listApps()],
+    ["kv_collections", "/servicesNS/-/-/storage/collections/config", () => client.listKvCollections()],
+    ["tcp_cooked_inputs", "/services/data/inputs/tcp/cooked", () => client.listCookedTcpInputs()],
   ];
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(new URL(config.url).host)}-splunk-audit`);
 
-  for (const [name, load] of rawSnapshots) {
+  // A snapshot that could not be collected is still written, as a marker
+  // naming the endpoint, status, and error, so the file's absence or an empty
+  // list can never stand in for a denial; readable-but-empty lists stay [].
+  for (const [name, endpoint, load] of rawSnapshots) {
     const snapshot = await collect(client, load);
     if (snapshot.ok) {
       await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(redactSnapshot(snapshot.value)));
     } else {
+      await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(notCollectedMarker(snapshot, endpoint)));
       errors.push(`core_data/${name}: ${snapshot.error}`);
     }
   }
