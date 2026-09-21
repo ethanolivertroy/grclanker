@@ -25,6 +25,7 @@
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
     "test:cli": "npm run build && node --test \"tests/*.test.mjs\"",
+    "test:compute-backends:live": "npm run build && node scripts/compute-backends-live-smoke.mjs",
     "test:duo:live": "npm run build && node scripts/duo-live-smoke.mjs",
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
     "test:gws-ops:live": "npm run build && node scripts/gws-ops-live-smoke.mjs",

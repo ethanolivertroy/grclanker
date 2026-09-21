@@ -8,13 +8,15 @@ import {
 } from "../config/paths.js";
 import { assertEmbeddedPiBranding } from "./branding.js";
 import {
+  COMPUTE_BACKEND_OVERRIDE_ENV,
   type GrclankerSettings,
+  applyComputeBackendOverride,
   normalizeGrclankerSettings,
   readGrclankerSettings,
   resolveSkillDiscoveryMode,
 } from "./settings.js";
-import { resolveComputeBackend } from "./compute.js";
-import { ensureCliConfigured, runSetupWizard } from "./setup.js";
+import { resolveComputeBackend, type ComputeBackendKind } from "./compute.js";
+import { ensureCliConfigured, runComputeSetup, runSetupWizard } from "./setup.js";
 
 function resolveExtensionEntrypoint(appRoot: string): string {
   const compiledPath = resolve(appRoot, "dist", "extensions", "grc-tools.js");
@@ -40,8 +42,12 @@ export function prepareCliRuntime(appRoot: string): {
   return { agentDir, settingsPath };
 }
 
-export async function runCliSetup(appRoot: string): Promise<void> {
+export async function runCliSetup(appRoot: string, compute?: ComputeBackendKind): Promise<void> {
   prepareCliRuntime(appRoot);
+  if (compute) {
+    await runComputeSetup(compute);
+    return;
+  }
   await runSetupWizard(true);
 }
 
@@ -82,11 +88,15 @@ export function buildCliLaunchArgs(
 export async function launchCli(
   appRoot: string,
   workflow?: string,
+  compute?: ComputeBackendKind,
 ): Promise<void> {
   const workingDir = process.cwd();
   const { agentDir, settingsPath } = prepareCliRuntime(appRoot);
   await ensureCliConfigured();
-  const settings = readGrclankerSettings(settingsPath);
+  if (compute) {
+    process.env[COMPUTE_BACKEND_OVERRIDE_ENV] = compute;
+  }
+  const settings = applyComputeBackendOverride(readGrclankerSettings(settingsPath), compute);
   const args = buildCliLaunchArgs(appRoot, agentDir, settings, workflow);
 
   process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;

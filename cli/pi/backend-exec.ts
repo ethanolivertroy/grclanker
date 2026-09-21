@@ -10,11 +10,14 @@ import {
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { minimatch } from "minimatch";
+import { createExecutionBackend } from "./backends/index.js";
+import { buildDockerRunArgs, resolveDockerIdentity } from "./backends/docker.js";
 import {
   getComputeBackendConfigurationIssues,
   getComputeBackendLabel,
   isComputeBackendAvailable,
   resolveComputeBackend,
+  resolveComputeDefaults,
   resolveDockerImage,
   resolveDockerWorkspacePath,
   resolveParallelsBaseVmName,
@@ -24,6 +27,7 @@ import {
   resolveParallelsWorkspacePath,
   type ComputeBackendKind,
 } from "./compute.js";
+import { assertExhaustive, type ExecutionBackend } from "./execution-backend.js";
 import { ensureParallelsSandbox } from "./parallels-sandbox.js";
 import {
   createSandboxEditOperations,
@@ -40,11 +44,6 @@ type StreamExecOptions = {
   onData: (chunk: Buffer) => void;
   signal?: AbortSignal;
   timeout?: number;
-};
-
-type DockerIdentity = {
-  userArgs: string[];
-  envArgs: string[];
 };
 
 export type ComputeBackendGrepMatch = {
@@ -595,15 +594,24 @@ function createBackendGrepOperations(
   };
 }
 
-function resolveDockerIdentityArgs(): DockerIdentity {
-  if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
-    return { userArgs: [], envArgs: [] };
-  }
-
-  return {
-    userArgs: ["--user", `${process.getuid()}:${process.getgid()}`],
-    envArgs: ["--env", "HOME=/tmp"],
-  };
+export function buildDockerToolRunArgs(
+  localCwd: string,
+  settings: GrclankerSettings,
+  cwd: string,
+  command: string,
+): string[] {
+  const workspaceRoot = resolveDockerWorkspacePath(settings);
+  const defaults = resolveComputeDefaults(settings);
+  return buildDockerRunArgs({
+    image: resolveDockerImage(settings),
+    hostWorkspace: resolve(localCwd),
+    workspaceRoot,
+    workdir: ensureWorkspaceMapping(localCwd, cwd, workspaceRoot),
+    command,
+    mountMode: defaults.workspaceMountMode,
+    networkPolicy: defaults.networkPolicy,
+    identity: resolveDockerIdentity(),
+  });
 }
 
 function createDockerCommandAdapter(
@@ -611,73 +619,78 @@ function createDockerCommandAdapter(
   settings: GrclankerSettings,
 ): BackendCommandAdapter {
   const workspaceRoot = resolveDockerWorkspacePath(settings);
+  const assertDockerReady = () => {
+    if (!isComputeBackendAvailable("docker")) {
+      throw formatBackendError(
+        "Docker is selected, but the Docker daemon is not reachable. Run `grclanker env doctor` for details.",
+      );
+    }
+  };
   return {
     mapPath: async (absolutePath) => ensureWorkspaceMapping(localCwd, absolutePath, workspaceRoot),
     async stream(command, cwd, options) {
-      if (!isComputeBackendAvailable("docker")) {
-        throw formatBackendError(
-          "Docker is selected, but the Docker daemon is not reachable. Run `grclanker env doctor` for details.",
-        );
-      }
-
-      const image = resolveDockerImage(settings);
-      const mappedCwd = ensureWorkspaceMapping(localCwd, cwd, workspaceRoot);
-      const hostWorkspace = resolve(localCwd);
-      const dockerIdentity = resolveDockerIdentityArgs();
-
-      return execStreamingCommand(
-        "docker",
-        [
-          "run",
-          "--rm",
-          "-i",
-          "--init",
-          "--volume",
-          `${hostWorkspace}:${workspaceRoot}`,
-          "--workdir",
-          mappedCwd,
-          ...dockerIdentity.userArgs,
-          "--env",
-          "GRCLANKER_COMPUTE_BACKEND=docker",
-          ...dockerIdentity.envArgs,
-          image,
-          "bash",
-          "-lc",
-          command,
-        ],
-        options,
-      );
+      assertDockerReady();
+      return execStreamingCommand("docker", buildDockerToolRunArgs(localCwd, settings, cwd, command), options);
     },
     async capture(command, cwd) {
-      if (!isComputeBackendAvailable("docker")) {
-        throw formatBackendError(
-          "Docker is selected, but the Docker daemon is not reachable. Run `grclanker env doctor` for details.",
-        );
+      assertDockerReady();
+      return execCapturedCommand("docker", buildDockerToolRunArgs(localCwd, settings, cwd, command));
+    },
+  };
+}
+
+function createContractCommandAdapter(
+  localCwd: string,
+  backend: ExecutionBackend,
+): BackendCommandAdapter {
+  const sessionId = `grclanker-${process.pid}-${Date.now().toString(36)}`;
+  let stagedPromise: Promise<string> | undefined;
+  let teardownInstalled = false;
+
+  const ensureStaged = (): Promise<string> => {
+    if (!stagedPromise) {
+      stagedPromise = backend
+        .stageWorkspace({ localPath: localCwd, sessionId })
+        .then((staged) => staged.remotePath)
+        .catch((error: unknown) => {
+          stagedPromise = undefined;
+          throw error;
+        });
+      if (!teardownInstalled) {
+        teardownInstalled = true;
+        process.once("exit", () => {
+          void backend.teardown(sessionId).catch(() => undefined);
+        });
       }
+    }
+    return stagedPromise;
+  };
 
-      const image = resolveDockerImage(settings);
-      const mappedCwd = ensureWorkspaceMapping(localCwd, cwd, workspaceRoot);
-      const hostWorkspace = resolve(localCwd);
-      const dockerIdentity = resolveDockerIdentityArgs();
-
-      return execCapturedCommand("docker", [
-        "run",
-        "--rm",
-        "-i",
-        "--init",
-        "--volume",
-        `${hostWorkspace}:${workspaceRoot}`,
-        "--workdir",
-        mappedCwd,
-        ...dockerIdentity.userArgs,
-        "--env",
-        "GRCLANKER_COMPUTE_BACKEND=docker",
-        ...dockerIdentity.envArgs,
-        image,
-        "bash",
-        "-lc",
-        command,
-      ]);
+  return {
+    mapPath: async (absolutePath) => ensureWorkspaceMapping(localCwd, absolutePath, await ensureStaged()),
+    async stream(command, cwd, options) {
+      const remoteRoot = await ensureStaged();
+      const result = await backend.exec({
+        sessionId,
+        command: [command],
+        cwd: ensureWorkspaceMapping(localCwd, cwd, remoteRoot),
+        timeoutMs: options.timeout ? options.timeout * 1000 : undefined,
+        onData: options.onData,
+        signal: options.signal,
+      });
+      return { exitCode: result.exitCode };
+    },
+    async capture(command, cwd) {
+      const remoteRoot = await ensureStaged();
+      const result = await backend.exec({
+        sessionId,
+        command: [command],
+        cwd: ensureWorkspaceMapping(localCwd, cwd, remoteRoot),
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(result.stderr.trim() || `Command failed (${result.exitCode}) on ${backend.kind}`);
+      }
+      return Buffer.from(result.stdout, "utf8");
     },
   };
 }
@@ -750,6 +763,48 @@ function createParallelsCommandAdapter(
   };
 }
 
+function buildFullToolSurface(
+  kind: ComputeBackendKind,
+  label: string,
+  summary: string,
+  localCwd: string,
+  adapter: BackendCommandAdapter,
+): ResolvedComputeBackendExecution {
+  return {
+    kind,
+    label,
+    summary,
+    bashOperations: { exec: adapter.stream },
+    readOperations: createBackendReadOperations(localCwd, adapter),
+    writeOperations: createBackendWriteOperations(localCwd, adapter),
+    editOperations: createBackendEditOperations(localCwd, adapter),
+    lsOperations: createBackendLsOperations(localCwd, adapter),
+    findOperations: createBackendFindOperations(localCwd, adapter),
+    grepOperations: createBackendGrepOperations(localCwd, adapter),
+  };
+}
+
+function describeRemoteSummary(kind: ComputeBackendKind): string {
+  switch (kind) {
+    case "modal":
+      return "bash, read, write, edit, ls, grep, and find run one-shot inside a Modal container via `modal shell`; the repo is copied in per command and changes are not synced back";
+    case "runpod-pod":
+      return "bash, read, write, edit, ls, grep, and find run over SSH inside the configured RunPod pod after the repo is copied to a per-session directory";
+    case "runpod-serverless":
+      return "bash, read, write, edit, ls, grep, and find are dispatched as jobs to the configured RunPod serverless endpoint running the grclanker worker contract";
+    case "cloudflare-sandbox":
+    case "vercel-sandbox":
+      return `${kind} is selected, but the adapter is a stub that fails fast; pick another backend`;
+    case "host":
+    case "sandbox-runtime":
+    case "docker":
+    case "parallels-vm":
+      return `${kind} is a local backend`;
+    default:
+      return assertExhaustive(kind);
+  }
+}
+
 export function resolveComputeBackendExecution(
   localCwd: string,
   settings: GrclankerSettings,
@@ -757,22 +812,36 @@ export function resolveComputeBackendExecution(
   const kind = resolveComputeBackend(settings);
   const label = getComputeBackendLabel(kind);
 
+  switch (kind) {
+    case "docker":
+    case "parallels-vm":
+    case "sandbox-runtime":
+    case "host":
+      break;
+    case "modal":
+    case "runpod-pod":
+    case "runpod-serverless":
+    case "cloudflare-sandbox":
+    case "vercel-sandbox": {
+      const backend = createExecutionBackend(localCwd, settings, {}, kind);
+      const adapter = createContractCommandAdapter(localCwd, backend);
+      return buildFullToolSurface(kind, label, describeRemoteSummary(kind), localCwd, adapter);
+    }
+    default:
+      return assertExhaustive(kind);
+  }
+
   if (kind === "docker") {
     const image = resolveDockerImage(settings);
     const workspaceRoot = resolveDockerWorkspacePath(settings);
     const adapter = createDockerCommandAdapter(localCwd, settings);
-    return {
+    return buildFullToolSurface(
       kind,
       label,
-      summary: `bash, read, write, edit, ls, grep, and find run in Docker image ${image} with the host repo mounted at ${workspaceRoot}`,
-      bashOperations: { exec: adapter.stream },
-      readOperations: createBackendReadOperations(localCwd, adapter),
-      writeOperations: createBackendWriteOperations(localCwd, adapter),
-      editOperations: createBackendEditOperations(localCwd, adapter),
-      lsOperations: createBackendLsOperations(localCwd, adapter),
-      findOperations: createBackendFindOperations(localCwd, adapter),
-      grepOperations: createBackendGrepOperations(localCwd, adapter),
-    };
+      `bash, read, write, edit, ls, grep, and find run in Docker image ${image} with the host repo mounted at ${workspaceRoot}`,
+      localCwd,
+      adapter,
+    );
   }
 
   if (kind === "parallels-vm") {

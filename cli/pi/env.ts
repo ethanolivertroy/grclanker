@@ -7,9 +7,18 @@ import {
 } from "./backend-exec.js";
 import { cleanupParallelsSandboxes } from "./parallels-sandbox.js";
 import {
+  COMPUTE_BACKEND_KINDS,
+  describeNetworkPolicy,
+  detectComputeBackendStatuses,
   getComputeBackendConfigurationIssues,
   getComputeBackendLabel,
+  getComputeBackendShipState,
+  getComputeProfileIssues,
+  getRoutingBucket,
+  parseComputeBackendKind,
   resolveComputeBackend,
+  resolveComputeDefaults,
+  resolveComputeProfile,
   type ComputeBackendKind,
 } from "./compute.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
@@ -31,23 +40,113 @@ type ParsedEnvCommand = {
   commandArgs: string[];
 };
 
+export type ComputeBackendListEntry = {
+  kind: ComputeBackendKind;
+  label: string;
+  bucket: string;
+  readiness: "ready" | "not detected" | "needs configuration" | "not available";
+  preferred: boolean;
+  detail: string;
+};
+
 function parseBackendFlag(value: string): ComputeBackendKind | undefined {
-  switch (value.trim().toLowerCase()) {
-    case "host":
-      return "host";
-    case "sandbox-runtime":
-    case "sandbox":
-    case "srt":
-      return "sandbox-runtime";
-    case "docker":
-      return "docker";
-    case "parallels-vm":
-    case "parallels":
-    case "vm":
-      return "parallels-vm";
-    default:
-      return undefined;
+  return parseComputeBackendKind(value);
+}
+
+export function parseComputeFlag(value: string): ComputeBackendKind {
+  const kind = parseComputeBackendKind(value);
+  if (!kind) {
+    throw new GrclankerUserError(
+      `Unknown compute backend: ${value}. Expected one of: ${COMPUTE_BACKEND_KINDS.join(", ")}.`,
+    );
   }
+  return kind;
+}
+
+export function extractComputeFlag(args: string[]): { compute?: ComputeBackendKind; rest: string[] } {
+  const rest: string[] = [];
+  let compute: ComputeBackendKind | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--compute") {
+      const value = args[index + 1];
+      if (!value) throw new GrclankerUserError("Missing value for --compute.");
+      compute = parseComputeFlag(value);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--compute=")) {
+      compute = parseComputeFlag(arg.slice("--compute=".length));
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { compute, rest };
+}
+
+export function buildComputeBackendList(settings: GrclankerSettings): ComputeBackendListEntry[] {
+  const preferred = resolveComputeBackend(settings);
+  const statuses = detectComputeBackendStatuses();
+  return COMPUTE_BACKEND_KINDS.map((kind) => {
+    const status = statuses.find((entry) => entry.kind === kind);
+    const issues = getComputeBackendConfigurationIssues(settings, kind);
+    const readiness: ComputeBackendListEntry["readiness"] = getComputeBackendShipState(kind) === "stub"
+      ? "not available"
+      : !status?.available
+        ? "not detected"
+        : issues.length > 0
+          ? "needs configuration"
+          : "ready";
+    return {
+      kind,
+      label: getComputeBackendLabel(kind),
+      bucket: getRoutingBucket(kind),
+      readiness,
+      preferred: kind === preferred,
+      detail: issues[0] ?? status?.detail ?? "",
+    };
+  });
+}
+
+export function formatComputeBackendList(
+  entries: ComputeBackendListEntry[],
+  settings: GrclankerSettings,
+): string {
+  const defaults = resolveComputeDefaults(settings);
+  const lines = [
+    "",
+    "grclanker env list",
+    "",
+    `Preferred compute backend: ${resolveComputeBackend(settings)}`,
+    `Compute profile:           ${resolveComputeProfile(settings)}`,
+    `Network policy default:    ${describeNetworkPolicy(defaults.networkPolicy)}`,
+    `Workspace mount mode:      ${defaults.workspaceMountMode}`,
+    "",
+    `  ${"backend".padEnd(20)} ${"bucket".padEnd(18)} ${"readiness".padEnd(20)} detail`,
+  ];
+  for (const entry of entries) {
+    const marker = entry.preferred ? "*" : " ";
+    lines.push(
+      `${marker} ${entry.kind.padEnd(20)} ${entry.bucket.padEnd(18)} ${entry.readiness.padEnd(20)} ${entry.detail}`,
+    );
+  }
+  const profileIssues = getComputeProfileIssues(settings);
+  if (profileIssues.length > 0) {
+    lines.push("", "Profile issues:");
+    for (const issue of profileIssues) lines.push(`  - ${issue}`);
+  }
+  lines.push("", "* marks the preferred backend from settings.json (override per run with --compute <kind>).", "");
+  return lines.join("\n");
+}
+
+export async function runComputeList(rawArgs: string[]): Promise<void> {
+  const settings = readGrclankerSettings(getGrclankerSettingsPath());
+  const entries = buildComputeBackendList(settings);
+  if (rawArgs.includes("--json")) {
+    console.log(JSON.stringify(entries, null, 2));
+    return;
+  }
+  console.log(formatComputeBackendList(entries, settings));
 }
 
 function parseTimeoutFlag(value: string): number {
@@ -77,7 +176,7 @@ function parseEnvCommandArgs(rawArgs: string[]): ParsedEnvCommand {
       continue;
     }
 
-    if (parsingFlags && (arg === "--backend" || arg === "-b")) {
+    if (parsingFlags && (arg === "--backend" || arg === "-b" || arg === "--compute")) {
       const value = rawArgs[index + 1];
       if (!value) throw new GrclankerUserError("Missing value for --backend.");
       const backend = parseBackendFlag(value);
@@ -308,7 +407,7 @@ Usage:
   grclanker env smoke-test [--backend <kind>] [--cwd <path>] [--timeout <seconds>]
 
 Options:
-  --backend, -b   host | sandbox-runtime | docker | parallels-vm
+  --backend, -b   host | sandbox-runtime | docker | parallels-vm | modal | runpod-pod | runpod-serverless (alias: --compute)
   --cwd           Working directory to validate on the selected backend
   --timeout, -t   Command timeout in seconds (default: 30)
 `);
@@ -323,7 +422,7 @@ Usage:
   grclanker env exec [--backend <kind>] [--cwd <path>] [--timeout <seconds>] <command>
 
 Options:
-  --backend, -b   host | sandbox-runtime | docker | parallels-vm
+  --backend, -b   host | sandbox-runtime | docker | parallels-vm | modal | runpod-pod | runpod-serverless (alias: --compute)
   --cwd           Working directory to execute from on the selected backend
   --timeout, -t   Command timeout in seconds
 `);

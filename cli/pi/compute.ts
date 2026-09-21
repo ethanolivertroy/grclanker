@@ -1,16 +1,29 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { cpus, totalmem } from "node:os";
+import {
+  assertExhaustive,
+  hasEnv,
+  type ExecutionBackendKind,
+  type NetworkPolicy,
+  type RoutingBucket,
+  type WorkspaceMountMode,
+} from "./execution-backend.js";
 import { quoteForBash } from "./shell.js";
 import type { GrclankerSettings } from "./settings.js";
 
 const require = createRequire(import.meta.url);
 
-export type ComputeBackendKind =
-  | "host"
-  | "sandbox-runtime"
-  | "docker"
-  | "parallels-vm";
+export type ComputeBackendKind = ExecutionBackendKind;
+
+export type ComputeProfile = "local-host" | "isolated-local" | "gpu-burst" | "persistent-remote";
+
+export type ComputeDefaults = {
+  networkPolicy: NetworkPolicy;
+  workspaceMountMode: WorkspaceMountMode;
+};
+
+export type ComputeBackendShipState = "implemented" | "stub";
 
 export type ParallelsSourceKind = "template" | "base-vm";
 
@@ -41,28 +54,224 @@ export const DEFAULT_DOCKER_WORKSPACE_PATH = "/workspace";
 export const DEFAULT_PARALLELS_AUTO_START = true;
 export const DEFAULT_PARALLELS_CLONE_PREFIX = "grclanker-sandbox";
 export const DEFAULT_PARALLELS_SOURCE_KIND: ParallelsSourceKind = "template";
+export const DEFAULT_COMPUTE_DEFAULTS: ComputeDefaults = {
+  networkPolicy: "default",
+  workspaceMountMode: "rw",
+};
+export const COMPUTE_BACKEND_KINDS: readonly ComputeBackendKind[] = [
+  "host",
+  "sandbox-runtime",
+  "docker",
+  "parallels-vm",
+  "modal",
+  "runpod-pod",
+  "runpod-serverless",
+  "cloudflare-sandbox",
+  "vercel-sandbox",
+];
+export const COMPUTE_PROFILES: readonly ComputeProfile[] = [
+  "local-host",
+  "isolated-local",
+  "gpu-burst",
+  "persistent-remote",
+];
 
-const COMPUTE_BACKEND_OPTIONS: Record<
-  ComputeBackendKind,
-  { label: string; summary: string }
-> = {
+type ComputeBackendMetadata = {
+  label: string;
+  summary: string;
+  bucket: RoutingBucket;
+  shipState: ComputeBackendShipState;
+  credentialEnv: readonly string[];
+};
+
+const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata> = {
   host: {
     label: "Host",
     summary: "run directly in the current shell on this machine",
+    bucket: "host",
+    shipState: "implemented",
+    credentialEnv: [],
   },
   "sandbox-runtime": {
     label: "sandbox-runtime",
     summary: "wrap tool execution in a local filesystem/network sandbox",
+    bucket: "sandboxed",
+    shipState: "implemented",
+    credentialEnv: [],
   },
   docker: {
     label: "Docker",
     summary: "run work inside an isolated local container",
+    bucket: "sandboxed",
+    shipState: "implemented",
+    credentialEnv: [],
   },
   "parallels-vm": {
     label: "Parallels VM",
     summary: "run work inside a disposable Parallels sandbox deployed from a template or stopped base VM",
+    bucket: "sandboxed",
+    shipState: "implemented",
+    credentialEnv: [],
+  },
+  modal: {
+    label: "Modal",
+    summary: "run one-shot commands in a Modal container through the modal CLI, optionally with GPUs",
+    bucket: "gpu-burst",
+    shipState: "implemented",
+    credentialEnv: ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"],
+  },
+  "runpod-pod": {
+    label: "RunPod Pod",
+    summary: "run commands over SSH inside a persistent RunPod pod you already own",
+    bucket: "persistent-remote",
+    shipState: "implemented",
+    credentialEnv: ["RUNPOD_API_KEY", "RUNPOD_POD_ID"],
+  },
+  "runpod-serverless": {
+    label: "RunPod Serverless",
+    summary: "dispatch stateless jobs to a RunPod serverless endpoint running the grclanker worker contract",
+    bucket: "gpu-burst",
+    shipState: "implemented",
+    credentialEnv: ["RUNPOD_API_KEY", "RUNPOD_ENDPOINT_ID"],
+  },
+  "cloudflare-sandbox": {
+    label: "Cloudflare Sandbox",
+    summary: "remote CPU-only sandbox embedded in a Cloudflare Worker (not yet available)",
+    bucket: "sandboxed",
+    shipState: "stub",
+    credentialEnv: ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
+  },
+  "vercel-sandbox": {
+    label: "Vercel Sandbox",
+    summary: "remote CPU-only sandbox on Vercel (not yet available)",
+    bucket: "sandboxed",
+    shipState: "stub",
+    credentialEnv: ["VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID"],
   },
 };
+
+const PROFILE_BUCKETS: Record<ComputeProfile, RoutingBucket> = {
+  "local-host": "host",
+  "isolated-local": "sandboxed",
+  "gpu-burst": "gpu-burst",
+  "persistent-remote": "persistent-remote",
+};
+
+export function isComputeBackendKind(value: unknown): value is ComputeBackendKind {
+  return typeof value === "string" && (COMPUTE_BACKEND_KINDS as readonly string[]).includes(value);
+}
+
+export function isComputeProfile(value: unknown): value is ComputeProfile {
+  return typeof value === "string" && (COMPUTE_PROFILES as readonly string[]).includes(value);
+}
+
+export function getRoutingBucket(kind: ComputeBackendKind): RoutingBucket {
+  return COMPUTE_BACKEND_OPTIONS[kind].bucket;
+}
+
+export function getComputeBackendShipState(kind: ComputeBackendKind): ComputeBackendShipState {
+  return COMPUTE_BACKEND_OPTIONS[kind].shipState;
+}
+
+export function getComputeBackendCredentialEnv(kind: ComputeBackendKind): readonly string[] {
+  return COMPUTE_BACKEND_OPTIONS[kind].credentialEnv;
+}
+
+export function getProfileRoutingBucket(profile: ComputeProfile): RoutingBucket {
+  return PROFILE_BUCKETS[profile];
+}
+
+export function getDefaultComputeProfile(kind: ComputeBackendKind): ComputeProfile {
+  const bucket = getRoutingBucket(kind);
+  switch (bucket) {
+    case "host":
+      return "local-host";
+    case "sandboxed":
+      return "isolated-local";
+    case "gpu-burst":
+      return "gpu-burst";
+    case "persistent-remote":
+      return "persistent-remote";
+    default:
+      return assertExhaustive(bucket);
+  }
+}
+
+export function normalizeComputeProfile(
+  value: unknown,
+  kind: ComputeBackendKind,
+): ComputeProfile {
+  return isComputeProfile(value) ? value : getDefaultComputeProfile(kind);
+}
+
+export function normalizeNetworkPolicy(value: unknown): NetworkPolicy {
+  if (value === "deny-all") return "deny-all";
+  if (value && typeof value === "object" && Array.isArray((value as { allowDomains?: unknown }).allowDomains)) {
+    const allowDomains = ((value as { allowDomains: unknown[] }).allowDomains)
+      .filter((domain): domain is string => typeof domain === "string" && domain.trim().length > 0)
+      .map((domain) => domain.trim());
+    return { allowDomains };
+  }
+  return "default";
+}
+
+export function normalizeWorkspaceMountMode(value: unknown): WorkspaceMountMode {
+  return value === "ro" ? "ro" : "rw";
+}
+
+export function normalizeComputeDefaults(value: unknown): ComputeDefaults {
+  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    networkPolicy: normalizeNetworkPolicy(record.networkPolicy),
+    workspaceMountMode: normalizeWorkspaceMountMode(record.workspaceMountMode),
+  };
+}
+
+export function resolveComputeProfile(settings: GrclankerSettings): ComputeProfile {
+  return normalizeComputeProfile(settings.computeProfile, resolveComputeBackend(settings));
+}
+
+export function resolveComputeDefaults(settings: GrclankerSettings): ComputeDefaults {
+  return normalizeComputeDefaults(settings.computeDefaults);
+}
+
+export function describeNetworkPolicy(policy: NetworkPolicy): string {
+  if (policy === "default") return "default";
+  if (policy === "deny-all") return "deny-all";
+  return policy.allowDomains.length > 0
+    ? `allow ${policy.allowDomains.join(", ")}`
+    : "allow (no domains)";
+}
+
+export function getComputeProfileIssues(settings: GrclankerSettings): string[] {
+  if (!("computeProfile" in settings) || settings.computeProfile === undefined) return [];
+  const kind = resolveComputeBackend(settings);
+  if (!isComputeProfile(settings.computeProfile)) {
+    return [
+      `Unknown computeProfile "${String(settings.computeProfile)}". Use one of: ${COMPUTE_PROFILES.join(", ")}.`,
+    ];
+  }
+  const expectedBucket = getProfileRoutingBucket(settings.computeProfile);
+  const actualBucket = getRoutingBucket(kind);
+  if (expectedBucket !== actualBucket) {
+    return [
+      `computeProfile "${settings.computeProfile}" routes to the ${expectedBucket} bucket, but computeBackend "${kind}" belongs to the ${actualBucket} bucket.`,
+    ];
+  }
+  return [];
+}
+
+function credentialsPresent(kind: ComputeBackendKind): boolean {
+  return COMPUTE_BACKEND_OPTIONS[kind].credentialEnv.every((name) => hasEnv(name));
+}
+
+function describeCredentialState(kind: ComputeBackendKind): string {
+  const names = COMPUTE_BACKEND_OPTIONS[kind].credentialEnv;
+  const missing = names.filter((name) => !hasEnv(name));
+  return missing.length === 0
+    ? `Found ${names.join(", ")} in the environment.`
+    : `Set ${missing.join(", ")} to use this backend.`;
+}
 
 function binaryExists(command: string): boolean {
   const locator = process.platform === "win32" ? "where" : "which";
@@ -135,10 +344,39 @@ export function getComputeBackendChoices(): Array<{
 }
 
 export function normalizeComputeBackend(value: unknown): ComputeBackendKind {
-  if (value === "sandbox-runtime" || value === "docker" || value === "parallels-vm") {
-    return value;
+  return isComputeBackendKind(value) ? value : DEFAULT_COMPUTE_BACKEND;
+}
+
+export function parseComputeBackendKind(value: string): ComputeBackendKind | undefined {
+  switch (value.trim().toLowerCase()) {
+    case "host":
+      return "host";
+    case "sandbox-runtime":
+    case "sandbox":
+    case "srt":
+      return "sandbox-runtime";
+    case "docker":
+      return "docker";
+    case "parallels-vm":
+    case "parallels":
+    case "vm":
+      return "parallels-vm";
+    case "modal":
+      return "modal";
+    case "runpod-pod":
+    case "runpod":
+      return "runpod-pod";
+    case "runpod-serverless":
+      return "runpod-serverless";
+    case "cloudflare-sandbox":
+    case "cloudflare":
+      return "cloudflare-sandbox";
+    case "vercel-sandbox":
+    case "vercel":
+      return "vercel-sandbox";
+    default:
+      return undefined;
   }
-  return DEFAULT_COMPUTE_BACKEND;
 }
 
 export function normalizeParallelsSourceKind(value: unknown): ParallelsSourceKind {
@@ -200,14 +438,26 @@ export function getComputeBackendLabel(kind: ComputeBackendKind): string {
 
 export function getComputeBackendSurfaceLabel(kind: ComputeBackendKind): string {
   switch (kind) {
+    case "host":
+      return "local shell";
     case "sandbox-runtime":
       return "sandbox-runtime";
     case "docker":
       return "docker";
     case "parallels-vm":
       return "parallels vm";
+    case "modal":
+      return "modal";
+    case "runpod-pod":
+      return "runpod pod";
+    case "runpod-serverless":
+      return "runpod serverless";
+    case "cloudflare-sandbox":
+      return "cloudflare sandbox";
+    case "vercel-sandbox":
+      return "vercel sandbox";
     default:
-      return "local shell";
+      return assertExhaustive(kind);
   }
 }
 
@@ -412,7 +662,50 @@ export function getComputeBackendConfigurationIssues(
     return issues;
   }
 
-  return [];
+  const shipState = getComputeBackendShipState(kind);
+  if (shipState === "stub") {
+    return [
+      `${kind} is not yet available: no documented public HTTP API or CLI lifecycle surface is wired in. Pick another backend or wait for a later release.`,
+    ];
+  }
+
+  const issues = getComputeBackendCredentialEnv(kind)
+    .filter((name) => !hasEnv(name))
+    .map((name) => `Set ${name} in the environment to use ${kind}.`);
+  if (kind === "modal" && !binaryExists("modal")) {
+    issues.push("Install the modal CLI (`pip install modal`) and run `modal setup`; grclanker drives Modal through `modal shell`.");
+  }
+  if (kind === "runpod-pod" && !binaryExists("ssh")) {
+    issues.push("Install an `ssh` client; grclanker executes inside RunPod pods over SSH.");
+  }
+  return issues;
+}
+
+function detectRemoteBackendStatus(kind: ComputeBackendKind, binary?: string): ComputeBackendStatus {
+  const metadata = COMPUTE_BACKEND_OPTIONS[kind];
+  if (metadata.shipState === "stub") {
+    return {
+      kind,
+      label: metadata.label,
+      summary: metadata.summary,
+      available: false,
+      detail: "Not yet available: the adapter fails fast until a documented lifecycle surface is wired in.",
+    };
+  }
+
+  const credentialsOk = credentialsPresent(kind);
+  const binaryOk = binary ? binaryExists(binary) : true;
+  const detail = [
+    describeCredentialState(kind),
+    binary ? (binaryOk ? `Found \`${binary}\` on PATH.` : `Install \`${binary}\` to use this backend.`) : undefined,
+  ].filter(Boolean).join(" ");
+  return {
+    kind,
+    label: metadata.label,
+    summary: metadata.summary,
+    available: credentialsOk && binaryOk,
+    detail,
+  };
 }
 
 export function detectComputeBackendStatuses(): ComputeBackendStatus[] {
@@ -462,6 +755,11 @@ export function detectComputeBackendStatuses(): ComputeBackendStatus[] {
           ? "Found `prlctl` on PATH."
           : "Install Parallels Desktop and ensure `prlctl` is available.",
     },
+    detectRemoteBackendStatus("modal", "modal"),
+    detectRemoteBackendStatus("runpod-pod", "ssh"),
+    detectRemoteBackendStatus("runpod-serverless"),
+    detectRemoteBackendStatus("cloudflare-sandbox"),
+    detectRemoteBackendStatus("vercel-sandbox"),
   ];
 
   return statuses;

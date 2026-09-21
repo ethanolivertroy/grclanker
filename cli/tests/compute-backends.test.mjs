@@ -1,0 +1,482 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  COMPUTE_BACKEND_KINDS,
+  getComputeBackendSurfaceLabel,
+  getComputeProfileIssues,
+  getDefaultComputeProfile,
+  getRoutingBucket,
+  normalizeComputeBackend,
+  normalizeComputeDefaults,
+  parseComputeBackendKind,
+  resolveComputeProfile,
+} from "../dist/pi/compute.js";
+import { buildDockerToolRunArgs } from "../dist/pi/backend-exec.js";
+import { buildDockerRunArgs, createDockerBackend } from "../dist/pi/backends/docker.js";
+import { createExecutionBackend } from "../dist/pi/backends/index.js";
+import { buildModalShellArgs, createModalBackend } from "../dist/pi/backends/modal.js";
+import { createParallelsBackend, parseParallelsSnapshotId } from "../dist/pi/backends/parallels.js";
+import {
+  buildPodSshArgs,
+  createRunpodPodBackend,
+  createRunpodServerlessBackend,
+  parseRunpodWorkerOutput,
+} from "../dist/pi/backends/runpod.js";
+import {
+  buildComputeBackendList,
+  extractComputeFlag,
+  formatComputeBackendList,
+} from "../dist/pi/env.js";
+import { redactSecrets } from "../dist/pi/execution-backend.js";
+import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
+
+function createFakeRunner(handler) {
+  const calls = [];
+  const runner = async (executable, args, options = {}) => {
+    calls.push({ executable, args, options });
+    const result = await handler(executable, args, options);
+    return { exitCode: 0, stdout: "", stderr: "", ...result };
+  };
+  return { runner, calls };
+}
+
+function withEnv(values, fn) {
+  const previous = {};
+  for (const [key, value] of Object.entries(values)) {
+    previous[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  const restore = () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  try {
+    const result = fn();
+    if (result && typeof result.then === "function") {
+      return result.finally(restore);
+    }
+    restore();
+    return result;
+  } catch (error) {
+    restore();
+    throw error;
+  }
+}
+
+test("every spec kind normalizes, has a routing bucket, a profile, and a surface label", () => {
+  assert.equal(COMPUTE_BACKEND_KINDS.length, 9);
+  for (const kind of COMPUTE_BACKEND_KINDS) {
+    assert.equal(normalizeComputeBackend(kind), kind);
+    assert.ok(["host", "sandboxed", "gpu-burst", "persistent-remote"].includes(getRoutingBucket(kind)));
+    assert.ok(getDefaultComputeProfile(kind));
+    assert.ok(getComputeBackendSurfaceLabel(kind).length > 0);
+    assert.equal(parseComputeBackendKind(kind), kind);
+  }
+  assert.equal(normalizeComputeBackend("nope"), "host");
+  assert.equal(getRoutingBucket("modal"), "gpu-burst");
+  assert.equal(getRoutingBucket("runpod-pod"), "persistent-remote");
+  assert.equal(getRoutingBucket("runpod-serverless"), "gpu-burst");
+  assert.equal(getRoutingBucket("vercel-sandbox"), "sandboxed");
+});
+
+test("every adapter implements the ExecutionBackend contract with capability flags", () => {
+  const settings = { computeBackend: "host", parallelsTemplateName: "tpl" };
+  for (const kind of COMPUTE_BACKEND_KINDS) {
+    const backend = createExecutionBackend("/tmp/repo", settings, { runner: async () => ({ exitCode: 0, stdout: "", stderr: "" }) }, kind);
+    assert.equal(backend.kind, kind);
+    for (const method of ["healthcheck", "stageWorkspace", "exec", "snapshot", "restore", "teardown"]) {
+      assert.equal(typeof backend[method], "function", `${kind}.${method}`);
+    }
+    for (const flag of ["snapshot", "restore", "gpu", "stageWorkspace", "artifactSync", "interactive"]) {
+      assert.equal(typeof backend.capabilities[flag], "boolean", `${kind}.capabilities.${flag}`);
+    }
+  }
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "parallels-vm").capabilities.snapshot, true);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "modal").capabilities.gpu, true);
+  assert.equal(createExecutionBackend("/tmp/repo", settings, {}, "docker").capabilities.gpu, false);
+});
+
+test("computeProfile and computeDefaults validate against the spec JSON shape", () => {
+  const settings = {
+    computeBackend: "docker",
+    computeProfile: "isolated-local",
+    computeDefaults: { networkPolicy: "default", workspaceMountMode: "rw" },
+  };
+  assert.deepEqual(getComputeProfileIssues(settings), []);
+  assert.equal(resolveComputeProfile(settings), "isolated-local");
+  assert.deepEqual(normalizeComputeDefaults(settings.computeDefaults), {
+    networkPolicy: "default",
+    workspaceMountMode: "rw",
+  });
+  assert.deepEqual(normalizeComputeDefaults({ networkPolicy: { allowDomains: ["github.com", " "] }, workspaceMountMode: "ro" }), {
+    networkPolicy: { allowDomains: ["github.com"] },
+    workspaceMountMode: "ro",
+  });
+  assert.deepEqual(normalizeComputeDefaults("garbage"), { networkPolicy: "default", workspaceMountMode: "rw" });
+
+  const mismatch = getComputeProfileIssues({ computeBackend: "modal", computeProfile: "isolated-local" });
+  assert.equal(mismatch.length, 1);
+  assert.match(mismatch[0], /gpu-burst/);
+  assert.equal(resolveComputeProfile({ computeBackend: "runpod-pod" }), "persistent-remote");
+  assert.match(getComputeProfileIssues({ computeBackend: "host", computeProfile: "weird" })[0], /Unknown computeProfile/);
+});
+
+test("normalizeGrclankerSettings keeps remote kinds and drops invalid profile values", () => {
+  const dir = mkdtempSync(join(tmpdir(), "grclanker-compute-settings-"));
+  const settingsPath = join(dir, "settings.json");
+  const bundledPath = join(dir, "bundled.json");
+  writeFileSync(bundledPath, "{}\n");
+  writeFileSync(settingsPath, JSON.stringify({
+    computeBackend: "runpod-serverless",
+    computeProfile: "not-a-profile",
+    computeDefaults: { networkPolicy: "deny-all", workspaceMountMode: "ro" },
+  }));
+  normalizeGrclankerSettings(settingsPath, bundledPath);
+  const saved = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.equal(saved.computeBackend, "runpod-serverless");
+  assert.equal(saved.computeProfile, undefined);
+  assert.deepEqual(saved.computeDefaults, { networkPolicy: "deny-all", workspaceMountMode: "ro" });
+
+  withEnv({ GRCLANKER_COMPUTE_BACKEND_OVERRIDE: "docker" }, () => {
+    assert.equal(readGrclankerSettings(settingsPath).computeBackend, "docker");
+  });
+  withEnv({ GRCLANKER_COMPUTE_BACKEND_OVERRIDE: "bogus" }, () => {
+    assert.equal(readGrclankerSettings(settingsPath).computeBackend, "runpod-serverless");
+  });
+});
+
+test("extractComputeFlag plumbs --compute for setup, investigate, and audit", () => {
+  assert.deepEqual(extractComputeFlag(["--compute", "modal"]), { compute: "modal", rest: [] });
+  assert.deepEqual(extractComputeFlag(["--compute=docker", "extra"]), { compute: "docker", rest: ["extra"] });
+  assert.deepEqual(extractComputeFlag([]), { compute: undefined, rest: [] });
+  assert.throws(() => extractComputeFlag(["--compute", "nope"]), /Unknown compute backend/);
+  assert.throws(() => extractComputeFlag(["--compute"]), /Missing value/);
+});
+
+test("docker run args keep the phase 1 shape and honor computeDefaults", () => {
+  const identity = { uid: 1000, gid: 1000 };
+  const args = buildDockerRunArgs({
+    image: "ubuntu:24.04",
+    hostWorkspace: "/repo",
+    workspaceRoot: "/workspace",
+    workdir: "/workspace/sub",
+    command: "pwd",
+    identity,
+  });
+  assert.deepEqual(args, [
+    "run", "--rm", "-i", "--init",
+    "--volume", "/repo:/workspace",
+    "--workdir", "/workspace/sub",
+    "--user", "1000:1000",
+    "--env", "GRCLANKER_COMPUTE_BACKEND=docker",
+    "--env", "HOME=/tmp",
+    "ubuntu:24.04", "bash", "-lc", "pwd",
+  ]);
+
+  const locked = buildDockerRunArgs({
+    image: "ubuntu:24.04",
+    hostWorkspace: "/repo",
+    workspaceRoot: "/workspace",
+    workdir: "/workspace",
+    command: "pwd",
+    mountMode: "ro",
+    networkPolicy: "deny-all",
+    env: { FOO: "bar" },
+  });
+  assert.ok(locked.includes("/repo:/workspace:ro"));
+  assert.ok(locked.includes("--network") && locked.includes("none"));
+  assert.ok(locked.includes("FOO=bar"));
+  assert.ok(!locked.includes("--user"));
+
+  const toolArgs = buildDockerToolRunArgs("/repo", {
+    computeBackend: "docker",
+    dockerImage: "python:3.12-slim",
+    computeDefaults: { workspaceMountMode: "ro" },
+  }, "/repo/pkg", "ls");
+  assert.ok(toolArgs.includes("/repo:/workspace:ro"));
+  assert.equal(toolArgs[toolArgs.indexOf("--workdir") + 1], "/workspace/pkg");
+  assert.throws(() => buildDockerToolRunArgs("/repo", { computeBackend: "docker" }, "/elsewhere", "ls"), /session root/);
+});
+
+test("docker adapter runs through the injected runner and reports health", async () => {
+  const { runner, calls } = createFakeRunner(async (executable, args) => {
+    if (args[0] === "info") return { exitCode: 0 };
+    return { exitCode: 3, stdout: "out", stderr: "err" };
+  });
+  const backend = createDockerBackend({
+    image: "ubuntu:24.04",
+    workspaceRoot: "/workspace",
+    localRoot: "/repo",
+    runner,
+    identity: null,
+  });
+  await backend.healthcheck();
+  const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "s1" });
+  assert.equal(staged.remotePath, "/workspace");
+  const result = await backend.exec({ sessionId: "s1", command: ["echo", "hi there"], cwd: "/workspace" });
+  assert.deepEqual(result, { exitCode: 3, stdout: "out", stderr: "err", artifacts: [] });
+  assert.equal(calls[1].executable, "docker");
+  assert.equal(calls[1].args.at(-1), "'echo' 'hi there'");
+  await assert.rejects(() => backend.snapshot("s1"), /does not support snapshot/);
+  await backend.teardown("s1");
+
+  const { runner: failing } = createFakeRunner(async () => ({ exitCode: 1 }));
+  await assert.rejects(
+    () => createDockerBackend({ image: "x", workspaceRoot: "/w", localRoot: "/repo", runner: failing }).healthcheck(),
+    /daemon is not reachable/,
+  );
+});
+
+test("parallels adapter stages, execs, snapshots, restores, and tears down through prlctl", async () => {
+  const { runner, calls } = createFakeRunner(async (executable, args) => {
+    assert.equal(executable, "prlctl");
+    if (args[0] === "exec" && args.at(-1).includes("test -d")) return { exitCode: 0, stdout: "ok" };
+    if (args[0] === "exec") return { exitCode: 0, stdout: "hello\n" };
+    if (args[0] === "snapshot") return { exitCode: 0, stdout: "The snapshot with id {a1b2c3d4-0000-1111-2222-333344445555} has been successfully created.\n" };
+    return { exitCode: 0 };
+  });
+  const backend = createParallelsBackend({
+    sourceKind: "template",
+    sourceName: "grclanker-template",
+    clonePrefix: "grclanker-sandbox",
+    runner,
+    sleep: async () => {},
+  });
+
+  await backend.healthcheck();
+  const staged = await backend.stageWorkspace({ localPath: "/Users/me/repo", sessionId: "sess" });
+  assert.equal(staged.remotePath, "/media/psf/grclanker-workspace-repo");
+  const create = calls.find((call) => call.args[0] === "create");
+  assert.deepEqual(create.args.slice(2), ["--ostemplate", "grclanker-template"]);
+  assert.ok(calls.some((call) => call.args[0] === "set" && call.args.includes("--shf-host-add")));
+  assert.ok(calls.some((call) => call.args[0] === "start"));
+
+  const result = await backend.exec({ sessionId: "sess", command: ["echo hello"], cwd: "/media/psf/grclanker-workspace-repo/sub" });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "hello\n");
+  const exec = calls.at(-1);
+  assert.deepEqual(exec.args.slice(0, 1), ["exec"]);
+  assert.match(exec.args.at(-1), /^cd -- '\/media\/psf\/grclanker-workspace-repo\/sub' && echo hello$/);
+
+  const snapshotId = await backend.snapshot("sess");
+  assert.equal(snapshotId, "a1b2c3d4-0000-1111-2222-333344445555");
+  await backend.restore("sess", snapshotId);
+  const restore = calls.at(-1);
+  assert.deepEqual(restore.args.slice(0, 1).concat(restore.args.slice(2)), ["snapshot-switch", "--id", snapshotId]);
+  await assert.rejects(() => backend.restore("sess", "someone-elses"), /not created by this session/);
+
+  await backend.teardown("sess");
+  const tail = calls.slice(-2).map((call) => call.args[0]);
+  assert.deepEqual(tail, ["stop", "delete"]);
+  await assert.rejects(() => backend.exec({ sessionId: "sess", command: ["true"], cwd: "/x" }), /Call stageWorkspace first/);
+  assert.equal(parseParallelsSnapshotId("nothing here"), undefined);
+});
+
+test("parallels adapter destroys the clone when staging fails", async () => {
+  const { runner, calls } = createFakeRunner(async (_executable, args) => {
+    if (args[0] === "start") return { exitCode: 1, stderr: "boot failed" };
+    return { exitCode: 0 };
+  });
+  const backend = createParallelsBackend({
+    sourceKind: "base-vm",
+    sourceName: "base",
+    clonePrefix: "p",
+    runner,
+    sleep: async () => {},
+    mountTimeoutMs: 0,
+  });
+  await assert.rejects(() => backend.stageWorkspace({ localPath: "/repo", sessionId: "s" }), /Could not start/);
+  assert.equal(calls[0].args[0], "clone");
+  assert.deepEqual(calls.slice(-2).map((call) => call.args[0]), ["stop", "delete"]);
+});
+
+test("modal adapter shells out through documented modal shell flags and redacts tokens", async () => {
+  const args = buildModalShellArgs({
+    image: "debian:bookworm-slim",
+    command: "pwd",
+    localPath: "/repo",
+    gpu: "a10g",
+    environment: "main",
+  });
+  assert.deepEqual(args, [
+    "shell", "--no-pty", "--image", "debian:bookworm-slim",
+    "--add-local", "/repo", "--gpu", "a10g", "--env", "main", "--cmd", "pwd",
+  ]);
+
+  await withEnv({ MODAL_TOKEN_ID: "ak-testtoken123", MODAL_TOKEN_SECRET: "as-supersecret456" }, async () => {
+    const { runner, calls } = createFakeRunner(async (_executable, invocation) => {
+      if (invocation[0] === "--version") return { exitCode: 0, stdout: "modal client version: 1.0" };
+      return { exitCode: 0, stdout: "leaked as-supersecret456\n" };
+    });
+    const backend = createModalBackend({ runner, gpu: "any" });
+    await backend.healthcheck();
+    const staged = await backend.stageWorkspace({ localPath: "/home/me/repo", sessionId: "m1" });
+    assert.equal(staged.remotePath, "/mnt/repo");
+    const result = await backend.exec({ sessionId: "m1", command: ["pwd"], cwd: "/mnt/repo", env: { A: "b c" } });
+    assert.equal(result.stdout, "leaked [REDACTED]\n");
+    const call = calls.at(-1);
+    assert.equal(call.executable, "modal");
+    assert.ok(call.args.includes("--add-local") && call.args.includes("/home/me/repo"));
+    assert.match(call.args.at(-1), /^export A='b c'; cd -- '\/mnt\/repo' && pwd$/);
+    await assert.rejects(() => backend.snapshot("m1"), /does not support/);
+    await backend.teardown("m1");
+  });
+
+  await withEnv({ MODAL_TOKEN_ID: undefined, MODAL_TOKEN_SECRET: undefined }, async () => {
+    const backend = createModalBackend({ runner: async () => ({ exitCode: 0, stdout: "", stderr: "" }) });
+    await assert.rejects(() => backend.healthcheck(), /Set MODAL_TOKEN_ID/);
+  });
+});
+
+test("runpod serverless adapter follows the documented run, status, and cancel operations", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_secretkey_ABCDEFG", RUNPOD_ENDPOINT_ID: "ep123" }, async () => {
+    const requests = [];
+    let statusPolls = 0;
+    const fetchMock = async (url, init = {}) => {
+      requests.push({ url, method: init.method, headers: init.headers, body: init.body });
+      const respond = (payload, status = 200) => new Response(JSON.stringify(payload), { status });
+      if (url.endsWith("/health")) return respond({ workers: { ready: 1 } });
+      if (url.endsWith("/run")) return respond({ id: "job-1", status: "IN_QUEUE" });
+      if (url.includes("/status/job-1")) {
+        statusPolls += 1;
+        return statusPolls < 2
+          ? respond({ id: "job-1", status: "IN_PROGRESS" })
+          : respond({ id: "job-1", status: "COMPLETED", output: { exitCode: 0, stdout: "done\n", stderr: "", artifacts: ["out/report.json"] } });
+      }
+      return respond({ error: "unexpected" }, 500);
+    };
+    const backend = createRunpodServerlessBackend({ fetch: fetchMock, sleep: async () => {}, pollIntervalMs: 0 });
+    await backend.healthcheck();
+    assert.equal(requests[0].url, "https://api.runpod.ai/v2/ep123/health");
+    assert.equal(requests[0].headers.authorization, "Bearer rpa_secretkey_ABCDEFG");
+
+    const chunks = [];
+    const result = await backend.exec({
+      sessionId: "s",
+      command: ["make test"],
+      cwd: "/workspace",
+      timeoutMs: 30_000,
+      onData: (chunk) => chunks.push(chunk.toString()),
+    });
+    assert.deepEqual(result, { exitCode: 0, stdout: "done\n", stderr: "", artifacts: ["out/report.json"] });
+    assert.deepEqual(chunks, ["done\n"]);
+    const run = requests.find((request) => request.url.endsWith("/run"));
+    assert.equal(run.method, "POST");
+    assert.deepEqual(JSON.parse(run.body), {
+      input: { command: "make test", cwd: "/workspace", env: {} },
+      policy: { executionTimeout: 30_000 },
+    });
+    assert.equal(requests.filter((request) => request.url.includes("/status/job-1")).length, 2);
+
+    const failingFetch = async (url) => {
+      if (url.endsWith("/run")) return new Response(JSON.stringify({ id: "job-2", status: "IN_QUEUE" }), { status: 200 });
+      if (url.includes("/status/")) return new Response(JSON.stringify({ id: "job-2", status: "FAILED", error: "boom rpa_secretkey_ABCDEFG" }), { status: 200 });
+      return new Response("{}", { status: 200 });
+    };
+    const failing = createRunpodServerlessBackend({ fetch: failingFetch, sleep: async () => {}, pollIntervalMs: 0 });
+    await assert.rejects(
+      () => failing.exec({ sessionId: "s", command: ["false"], cwd: "/workspace" }),
+      (error) => /status FAILED/.test(error.message) && !error.message.includes("rpa_secretkey_ABCDEFG"),
+    );
+
+    const unauthorized = createRunpodServerlessBackend({ fetch: async () => new Response("denied", { status: 401 }) });
+    await assert.rejects(() => unauthorized.healthcheck(), /HTTP 401/);
+  });
+  assert.deepEqual(parseRunpodWorkerOutput(null), { exitCode: 1, stdout: "", stderr: "", artifacts: [] });
+});
+
+test("runpod pod adapter reads the documented pod fields and execs over ssh", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+    const requests = [];
+    const fetchMock = async (url, init = {}) => {
+      requests.push({ url, headers: init.headers });
+      return new Response(JSON.stringify({
+        id: "pod42",
+        desiredStatus: "RUNNING",
+        publicIp: "203.0.113.10",
+        portMappings: { "22": 22022 },
+      }), { status: 200 });
+    };
+    const { runner, calls } = createFakeRunner(async () => ({ exitCode: 0, stdout: "ok\n" }));
+    const backend = createRunpodPodBackend({ fetch: fetchMock, runner });
+    await backend.healthcheck();
+    assert.equal(requests[0].url, "https://rest.runpod.io/v1/pods/pod42");
+    assert.equal(requests[0].headers.authorization, "Bearer rpa_podkey_ABCDEFG");
+
+    const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "sess" });
+    assert.equal(staged.remotePath, "/workspace/sess");
+    assert.equal(calls[0].executable, "ssh");
+    assert.equal(calls[1].executable, "scp");
+    assert.ok(calls[1].args.includes("root@203.0.113.10:/workspace/sess"));
+
+    const result = await backend.exec({ sessionId: "sess", command: ["uname -a"], cwd: "/workspace/sess" });
+    assert.equal(result.stdout, "ok\n");
+    const exec = calls.at(-1);
+    assert.deepEqual(exec.args.slice(0, 7), [
+      "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", "22022", "root@203.0.113.10",
+    ]);
+    assert.match(exec.args.at(-1), /^cd -- '\/workspace\/sess' && uname -a$/);
+
+    await backend.teardown("sess");
+    assert.match(calls.at(-1).args.at(-1), /^rm -rf -- '\/workspace\/sess'$/);
+    assert.deepEqual(buildPodSshArgs({ host: "h", port: 1, user: "u" }, "true").slice(-2), ["u@h", "true"]);
+
+    const noSsh = createRunpodPodBackend({
+      fetch: async () => new Response(JSON.stringify({ id: "pod42", desiredStatus: "RUNNING" }), { status: 200 }),
+      runner,
+    });
+    await assert.rejects(() => noSsh.healthcheck(), /does not expose public SSH/);
+  });
+});
+
+test("cloudflare and vercel stubs fail fast with a clear message", async () => {
+  for (const kind of ["cloudflare-sandbox", "vercel-sandbox"]) {
+    const backend = createExecutionBackend("/repo", { computeBackend: kind });
+    await assert.rejects(() => backend.healthcheck(), /not available yet/);
+    await assert.rejects(() => backend.exec({ sessionId: "s", command: ["true"], cwd: "/" }), /not available yet/);
+    await backend.teardown("s");
+  }
+});
+
+test("env list reports every backend with kind, bucket, and readiness", () => {
+  withEnv({
+    MODAL_TOKEN_ID: undefined,
+    MODAL_TOKEN_SECRET: undefined,
+    RUNPOD_API_KEY: undefined,
+    RUNPOD_ENDPOINT_ID: undefined,
+    RUNPOD_POD_ID: undefined,
+  }, () => {
+    const settings = { computeBackend: "modal", computeProfile: "gpu-burst" };
+    const entries = buildComputeBackendList(settings);
+    assert.equal(entries.length, 9);
+    assert.deepEqual(entries.map((entry) => entry.kind), [...COMPUTE_BACKEND_KINDS]);
+    const host = entries.find((entry) => entry.kind === "host");
+    assert.equal(host.readiness, "ready");
+    assert.equal(host.bucket, "host");
+    const modal = entries.find((entry) => entry.kind === "modal");
+    assert.equal(modal.preferred, true);
+    assert.equal(modal.readiness, "not detected");
+    assert.equal(modal.bucket, "gpu-burst");
+    assert.equal(entries.find((entry) => entry.kind === "vercel-sandbox").readiness, "not available");
+
+    const text = formatComputeBackendList(entries, settings);
+    assert.match(text, /Preferred compute backend: modal/);
+    assert.match(text, /Compute profile:\s+gpu-burst/);
+    assert.match(text, /\* modal\s+gpu-burst\s+not detected/);
+    assert.match(text, /runpod-pod\s+persistent-remote/);
+  });
+});
+
+test("redactSecrets hides bearer tokens and configured provider secrets", () => {
+  withEnv({ RUNPOD_API_KEY: "rpa_abcdefghijk" }, () => {
+    assert.equal(redactSecrets("key rpa_abcdefghijk used"), "key [REDACTED] used");
+    assert.equal(redactSecrets("Authorization: Bearer abcdefghijklmnop"), "Authorization: Bearer [REDACTED]");
+  });
+});
