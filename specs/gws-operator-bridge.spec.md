@@ -6,11 +6,11 @@ category: "identity-access-management"
 language: "typescript"
 status: "implemented"
 version: "1.0"
-last_updated: "2026-04-14"
-source_repo: "https://github.com/googleworkspace/cli"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# gws-operator-bridge — Architecture Specification
+# gws-operator-bridge: Architecture Specification
 
 Implemented in grclanker as a companion to the native Google Workspace audit family:
 
@@ -78,6 +78,28 @@ grclanker adds only:
 - `GRCLANKER_GWS_BIN` for the binary path
 - `config_dir` tool override mapped to `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`
 
+### grclanker implementation
+
+- Source: `cli/extensions/grc-tools/gws-ops.ts`; tests: `cli/tests/gws-ops.test.mjs`; live smoke: `cli/scripts/gws-ops-live-smoke.mjs` (`npm --prefix cli run test:gws-ops:live`); guide: `src/content/docs/docs/integrations/gws-ops.md`.
+- Command shapes (`gws <service> <resource> <method> --params '<json>'`, `--version`, `--page-all` NDJSON), exit codes 0 to 5, and the environment variables above are taken from the published googleworkspace/cli README; the `admin-reports` alias and the `<api>:<version>` form are confirmed against `crates/google-workspace/src/services.rs` and `crates/google-workspace-cli/src/main.rs`.
+- Tests assert the `gws_bin` > `GRCLANKER_GWS_BIN` > `PATH` binary precedence, the `config_dir` to `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` mapping, and that inherited `GOOGLE_WORKSPACE_CLI_TOKEN` and `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` values reach the child process untouched.
+
 ## Status
 
-Implemented locally in grclanker as an optional operator workflow layer. Real smoke testing depends on having `gws` installed and authenticated against a tenant.
+**Implemented in grclanker (TypeScript)** as an optional operator workflow layer. Real smoke testing depends on having `gws` installed and authenticated against a tenant; the live smoke skips cleanly otherwise.
+
+### What shipped
+
+- 5 of 5 workflows: `gws_ops_check_cli`, `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, `gws_ops_review_tokens`, `gws_ops_collect_evidence_bundle`, each with `dry_run` previews and the exact executed command in the result.
+- Arbitrary passthrough is refused; only the curated read-only commands are built.
+- Verdict-safety rules applied to the bridge: a non-zero exit is an explicit error mapped from the documented exit codes (rule 1); a zero exit with non-JSON output is an explicit error, except `--version` (rule 1); every result carries `complete` and `nextPageToken` so a page with a trailing token is recorded as a partial view (rules 5 and 7); `--page-all` NDJSON pages aggregate with completeness taken from the last page (rule 7); the evidence bundle allocates `-2`, `-3` and never overwrites an earlier directory or zip (rule 8).
+- Normalized records read only documented fields: Alert Center `alertId`, `type`, `source`, `createTime`, `updateTime`, `metadata.status`, `metadata.severity`, `metadata.assignee`; Reports `id.time`, `id.uniqueQualifier`, `actor.email`, `actor.callerType`, `actor.applicationInfo.applicationName`, `events[].name`, `ipAddress`.
+
+### Deviations and caveats
+
+- The googleworkspace/cli source consulted for this release registers no `alertcenter` service alias, and `parse_service_and_version` resolves the `<service>:<version>` form through the alias table, so `gws alertcenter:v1beta1 alerts list` fails with a validation error (exit 3) on such a build. `gws_ops_investigate_alerts` reports that as an explicit error naming the cause and pointing to `gws_assess_monitoring`; the command is left in place so a build that adds the alias works unchanged.
+- `max_results` is clamped to 250 even though `activities.list` allows 1000, keeping operator output bounded; a trailing `nextPageToken` is reported instead of silently dropping records.
+
+### What remains
+
+- No further scope is planned for this slice; write helpers stay out of scope by design.
