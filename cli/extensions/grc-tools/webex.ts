@@ -1,29 +1,87 @@
 /**
  * Cisco Webex organization audit tools for grclanker.
  *
- * This native TypeScript surface starts with read-only token-backed Webex API
- * access across identity posture, collaboration governance, and meeting plus
- * hybrid security controls.
+ * Read-only Webex REST API inspector covering identity posture, collaboration
+ * governance, and meeting plus hybrid security controls. Every request path,
+ * query parameter, and response field read here is traceable to a public
+ * developer.webex.com page named in WEBEX_DOCS.
  */
 import {
   createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { parse as parseYaml } from "yaml";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
 
+/**
+ * Public documentation pages backing each request. Reference pages on
+ * developer.webex.com are client-rendered; the guide pages (basics,
+ * compliance, bots, integrations, service-apps) render statically.
+ */
+export const WEBEX_DOCS = {
+  basics: "https://developer.webex.com/docs/api/basics",
+  integrations: "https://developer.webex.com/docs/integrations",
+  serviceApps: "https://developer.webex.com/docs/service-apps",
+  bots: "https://developer.webex.com/docs/bots",
+  complianceGuide: "https://developer.webex.com/docs/api/guides/compliance",
+  accessToken: "https://developer.webex.com/docs/api/v1/oauth/access-token",
+  peopleMe: "https://developer.webex.com/docs/api/v1/people/get-my-own-details",
+  peopleList: "https://developer.webex.com/docs/api/v1/people/list-people",
+  organizationsList: "https://developer.webex.com/docs/api/v1/organizations/list-organizations",
+  organizationGet: "https://developer.webex.com/docs/api/v1/organizations/get-organization-details",
+  rolesList: "https://developer.webex.com/docs/api/v1/roles/list-roles",
+  licensesList: "https://developer.webex.com/docs/api/v1/licenses/list-licenses",
+  eventsList: "https://developer.webex.com/docs/api/v1/events/list-events",
+  adminAuditEvents: "https://developer.webex.com/docs/api/v1/admin-audit-events/list-admin-audit-events",
+  adminRecordings: "https://developer.webex.com/docs/api/v1/recordings/list-recordings-for-an-admin-or-compliance-officer",
+  meetingsList: "https://developer.webex.com/docs/api/v1/meetings/list-meetings",
+  meetingPreferences: "https://developer.webex.com/docs/api/v1/meeting-preferences/get-meeting-preference-details",
+  meetingSites: "https://developer.webex.com/docs/api/v1/meeting-preferences/get-site-list",
+  hybridClusters: "https://developer.webex.com/docs/api/v1/hybrid-clusters/list-hybrid-clusters",
+  hybridConnectors: "https://developer.webex.com/docs/api/v1/hybrid-connectors/list-hybrid-connectors",
+  devicesList: "https://developer.webex.com/docs/api/v1/devices/list-devices",
+  workspacesList: "https://developer.webex.com/docs/api/v1/workspaces/list-workspaces",
+  roomsList: "https://developer.webex.com/docs/api/v1/rooms/list-rooms",
+  webhooksList: "https://developer.webex.com/docs/api/v1/webhooks/list-webhooks",
+} as const;
+
 const DEFAULT_OUTPUT_DIR = "./export/webex";
 const DEFAULT_TIMEOUT_MS = 30_000;
-const DEFAULT_PAGE_LIMIT = 200;
+const DEFAULT_CONFIG_DIR = join(".config", "webex-sec-inspector");
+const CONFIG_FILE_NAMES = ["config.json", "config.yaml", "config.yml"];
+const MAX_RETRY_AFTER_MS = 30_000;
+const MAX_429_RETRIES = 2;
+
+/** Documented `max` per page ceilings; the API silently caps larger values (basics guide). */
+const PAGE_MAX = {
+  people: 100,
+  organizations: 100,
+  roles: 100,
+  licenses: 100,
+  events: 100,
+  adminAudit: 200,
+  adminRecordings: 100,
+  meetings: 100,
+  sites: 100,
+  hybrid: 100,
+  devices: 100,
+  workspaces: 100,
+  rooms: 100,
+  webhooks: 100,
+} as const;
+
 const DEFAULT_PEOPLE_LIMIT = 1000;
 const DEFAULT_EVENT_LIMIT = 500;
 const DEFAULT_LICENSE_LIMIT = 200;
@@ -32,27 +90,93 @@ const DEFAULT_MEETING_LIMIT = 200;
 const DEFAULT_WEBHOOK_LIMIT = 200;
 const DEFAULT_DEVICE_LIMIT = 500;
 const DEFAULT_ROOM_LIMIT = 500;
+const DEFAULT_GENERIC_LIMIT = 200;
 const DEFAULT_MAX_ADMINS = 10;
+const ADMIN_AUDIT_WINDOW_DAYS = 30;
+
+export type WebexFrameworkKey = "fedramp" | "cmmc" | "soc2" | "cis" | "pci_dss" | "disa_stig" | "irap" | "ismap";
+export type WebexFrameworkMap = Record<WebexFrameworkKey, string[]>;
+export type WebexFindingStatus = "pass" | "warn" | "fail" | "manual";
+export type WebexTokenType = "person" | "bot" | "appuser" | "unknown";
+
+export const WEBEX_FRAMEWORK_LABELS: Record<WebexFrameworkKey, string> = {
+  fedramp: "FedRAMP / NIST 800-53",
+  cmmc: "CMMC",
+  soc2: "SOC 2",
+  cis: "CIS Controls",
+  pci_dss: "PCI-DSS",
+  disa_stig: "DISA STIG",
+  irap: "IRAP / ISM",
+  ismap: "ISMAP",
+};
+
+function frameworks(
+  fedramp: string, cmmc: string, soc2: string, cis: string, pci: string, stig: string, irap: string, ismap: string,
+): WebexFrameworkMap {
+  const list = (value: string): string[] => value ? [value] : [];
+  return { fedramp: list(fedramp), cmmc: list(cmmc), soc2: list(soc2), cis: list(cis), pci_dss: list(pci), disa_stig: list(stig), irap: list(irap), ismap: list(ismap) };
+}
+
+/** Spec section 5 mapping table, keyed by spec control number. */
+export const WEBEX_CONTROL_FRAMEWORKS: Record<number, WebexFrameworkMap> = {
+  1: frameworks("IA-2(1)", "L2 3.5.3", "CC6.1", "16.2", "8.4.1", "SRG-APP-000148", "ISM-1546", "CPS-7.1"),
+  2: frameworks("IA-2(2)", "L2 3.5.3", "CC6.1", "16.3", "8.4.2", "SRG-APP-000149", "ISM-1401", "CPS-7.2"),
+  3: frameworks("AU-1", "L2 3.3.2", "CC7.2", "8.1", "12.5.2", "SRG-APP-000516", "ISM-0042", "CPS-12.1"),
+  4: frameworks("AC-4", "L2 3.1.3", "CC6.6", "13.4", "1.3.7", "SRG-APP-000100", "ISM-1528", "CPS-11.1"),
+  5: frameworks("AC-4(1)", "L2 3.1.3", "CC6.7", "13.4", "1.3.7", "SRG-APP-000100", "ISM-0947", "CPS-11.2"),
+  6: frameworks("SC-28", "L2 3.13.16", "CC6.7", "14.8", "3.4.1", "SRG-APP-000428", "ISM-0457", "CPS-11.3"),
+  7: frameworks("SI-12", "L2 3.8.9", "CC6.5", "14.8", "3.1", "SRG-APP-000504", "ISM-0859", "CPS-12.2"),
+  8: frameworks("SC-8(1)", "L2 3.13.8", "CC6.7", "14.4", "4.1", "SRG-APP-000441", "ISM-0484", "CPS-11.4"),
+  9: frameworks("AC-3", "L2 3.1.1", "CC6.1", "16.7", "7.1.3", "SRG-APP-000033", "ISM-1506", "CPS-8.1"),
+  10: frameworks("IA-5", "L2 3.5.7", "CC6.1", "16.5", "8.2.3", "SRG-APP-000170", "ISM-1557", "CPS-7.3"),
+  11: frameworks("AU-11", "L2 3.3.1", "CC7.3", "8.3", "10.7", "SRG-APP-000515", "ISM-0859", "CPS-12.3"),
+  12: frameworks("SI-12", "L2 3.8.9", "CC6.5", "14.8", "3.1", "SRG-APP-000504", "ISM-0859", "CPS-12.4"),
+  13: frameworks("AC-14", "L2 3.1.1", "CC6.1", "16.7", "7.1.3", "SRG-APP-000033", "ISM-1506", "CPS-8.2"),
+  14: frameworks("AC-16", "L2 3.13.12", "CC6.7", "14.1", "9.6.1", "SRG-APP-000311", "ISM-0271", "CPS-11.5"),
+  15: frameworks("CM-8", "L2 3.4.1", "CC6.8", "1.1", "2.4", "SRG-APP-000383", "ISM-1409", "CPS-10.1"),
+  16: frameworks("SI-4", "L2 3.14.6", "CC7.1", "1.1", "10.6", "SRG-APP-000516", "ISM-0576", "CPS-12.5"),
+  17: frameworks("SI-2", "L2 3.14.1", "CC7.1", "7.4", "6.2", "SRG-APP-000456", "ISM-1143", "CPS-13.1"),
+  18: frameworks("CM-8(3)", "L2 3.4.1", "CC6.8", "1.4", "9.7.1", "SRG-APP-000383", "ISM-1482", "CPS-10.2"),
+  19: frameworks("CM-7", "L2 3.4.6", "CC6.8", "4.8", "2.2.2", "SRG-APP-000141", "ISM-1407", "CPS-10.3"),
+  20: frameworks("SC-8(1)", "L2 3.13.8", "CC6.7", "14.4", "4.1", "SRG-APP-000441", "ISM-0484", "CPS-11.6"),
+  21: frameworks("SC-7(8)", "L2 3.13.1", "CC6.7", "13.4", "1.3.7", "SRG-APP-000516", "ISM-0947", "CPS-11.7"),
+  22: frameworks("SC-8", "L2 3.13.8", "CC6.7", "14.4", "4.1", "SRG-APP-000439", "ISM-0484", "CPS-11.8"),
+  23: frameworks("AC-3", "L2 3.1.1", "CC6.1", "", "", "SRG-APP-000033", "", ""),
+  24: frameworks("CM-8", "L2 3.4.1", "CC6.8", "1.1", "2.4", "SRG-APP-000383", "ISM-1409", "CPS-10.4"),
+  25: frameworks("AU-12", "L2 3.3.1", "CC7.2", "8.5", "10.2.2", "SRG-APP-000507", "ISM-0580", "CPS-12.6"),
+};
+
+export interface WebexRefreshCredentials {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}
 
 export interface WebexResolvedConfig {
-  token: string;
+  token?: string;
+  refresh?: WebexRefreshCredentials;
   orgId?: string;
   baseUrl: string;
   timeoutMs: number;
   sourceChain: string[];
+  configFile?: string;
 }
 
 export interface WebexAccessSurface {
   name: string;
   endpoint: string;
-  status: "readable" | "not_readable" | "not_configured";
+  doc: string;
+  status: "readable" | "not_readable" | "not_configured" | "manual";
   count?: number;
+  truncated?: boolean;
   error?: string;
 }
 
 export interface WebexAccessCheckResult {
   status: "healthy" | "limited";
   orgId?: string;
+  tokenType: WebexTokenType;
+  adminCapable: boolean;
   surfaces: WebexAccessSurface[];
   notes: string[];
   recommendedNextStep: string;
@@ -60,18 +184,23 @@ export interface WebexAccessCheckResult {
 
 export interface WebexFinding {
   id: string;
+  control: number[];
   title: string;
   severity: "critical" | "high" | "medium" | "low" | "info";
-  status: "pass" | "warn" | "fail";
+  status: WebexFindingStatus;
   summary: string;
   evidence?: JsonRecord;
   mappings: string[];
+  frameworks: WebexFrameworkMap;
 }
 
 export interface WebexAssessmentResult {
   title: string;
+  category: string;
   summary: JsonRecord;
   findings: WebexFinding[];
+  errors: string[];
+  rawData: Record<string, unknown>;
 }
 
 export interface WebexAuditBundleResult {
@@ -79,13 +208,40 @@ export interface WebexAuditBundleResult {
   zipPath: string;
   fileCount: number;
   findingCount: number;
+  errorCount: number;
 }
+
+export interface WebexPage {
+  items: JsonRecord[];
+  truncated: boolean;
+  pageCount: number;
+}
+
+export class WebexApiError extends Error {
+  readonly status: number;
+  readonly endpoint: string;
+
+  constructor(message: string, status: number, endpoint: string) {
+    super(message);
+    this.name = "WebexApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+type SurfaceResult<T> =
+  | { ok: true; data: T; truncated: boolean }
+  | { ok: false; error: string; status?: number };
 
 type CheckAccessArgs = {
   token?: string;
   org_id?: string;
   base_url?: string;
   timeout_seconds?: number;
+  client_id?: string;
+  client_secret?: string;
+  refresh_token?: string;
+  config_file?: string;
 };
 
 type IdentityArgs = CheckAccessArgs & {
@@ -106,17 +262,20 @@ type MeetingHybridArgs = CheckAccessArgs & {
   device_limit?: number;
 };
 
-type ExportAuditBundleArgs = CheckAccessArgs & {
+type ExportAuditBundleArgs = IdentityArgs & CollaborationArgs & MeetingHybridArgs & {
   output_dir?: string;
-  people_limit?: number;
-  max_admins?: number;
-  event_limit?: number;
-  recording_limit?: number;
-  webhook_limit?: number;
-  license_limit?: number;
-  room_limit?: number;
-  meeting_limit?: number;
-  device_limit?: number;
+};
+
+type AssessmentOptions = {
+  peopleLimit?: number;
+  maxAdmins?: number;
+  eventLimit?: number;
+  recordingLimit?: number;
+  webhookLimit?: number;
+  licenseLimit?: number;
+  roomLimit?: number;
+  meetingLimit?: number;
+  deviceLimit?: number;
 };
 
 function asObject(value: unknown): JsonRecord | undefined {
@@ -146,13 +305,11 @@ function asNumber(value: unknown): number | undefined {
   return undefined;
 }
 
-function asBoolean(value: unknown): boolean | undefined {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    if (/^(true|1|yes|enabled|on|active|required|strict)$/i.test(value.trim())) return true;
-    if (/^(false|0|no|disabled|off|inactive|optional)$/i.test(value.trim())) return false;
-  }
-  return undefined;
+function asDate(value: unknown): Date | undefined {
+  const text = asString(value);
+  if (!text) return undefined;
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -172,14 +329,31 @@ function parseTimeoutSeconds(value: number | undefined): number {
   return clampNumber(value, DEFAULT_TIMEOUT_MS / 1000, 1, 300) * 1000;
 }
 
-function parseLinkHeaderNext(linkHeader: string | null): string | null {
+/** RFC 5988 Link header; only rel="next" is guaranteed by Webex (basics guide). */
+export function parseLinkHeaderNext(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/i);
-  return match?.[1] ?? null;
+  for (const part of linkHeader.split(",")) {
+    const match = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
+    if (match?.[1]) return match[1];
+  }
+  return null;
 }
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+const SECRET_KEY_PATTERN = /token|secret|password|hostpin|authorization/i;
+
+export function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  const object = asObject(value);
+  if (!object) return value;
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(object)) {
+    output[key] = SECRET_KEY_PATTERN.test(key) && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry);
+  }
+  return output;
 }
 
 function safeDirName(value: string): string {
@@ -236,10 +410,10 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
+  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -256,7 +430,7 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
@@ -283,39 +457,12 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function getNestedValue(value: unknown, path: string[]): unknown {
-  let current: unknown = value;
-  for (const segment of path) {
-    current = asObject(current)?.[segment];
-    if (current === undefined) return undefined;
-  }
-  return current;
-}
-
-function firstDefined(value: unknown, paths: string[][]): unknown {
-  for (const path of paths) {
-    const candidate = getNestedValue(value, path);
-    if (candidate !== undefined) return candidate;
-  }
-  return undefined;
-}
-
+/** Webex list payloads wrap results in `items`; the meeting sites list uses `sites`. */
 function extractItems(payload: unknown): JsonRecord[] {
   const object = asObject(payload);
   if (!object) return [];
-  if (Array.isArray(object.items)) {
-    return object.items.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  if (Array.isArray(object.people)) {
-    return object.people.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  if (Array.isArray(object.organizations)) {
-    return object.organizations.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  if (Array.isArray(object.roles)) {
-    return object.roles.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  return [];
+  const list = Array.isArray(object.items) ? object.items : Array.isArray(object.sites) ? object.sites : [];
+  return list.map(asObject).filter((item): item is JsonRecord => Boolean(item));
 }
 
 function webexErrorSummary(payload: unknown): string | undefined {
@@ -324,33 +471,83 @@ function webexErrorSummary(payload: unknown): string | undefined {
   const messages = [
     ...asArray(object.errors).map((item) => asString(asObject(item)?.description) ?? asString(asObject(item)?.message)),
     asString(object.message),
+    asString(object.error_description),
     asString(object.error),
   ].filter((item): item is string => Boolean(item));
   return messages.length > 0 ? messages.join("; ") : undefined;
 }
 
+function loadConfigFile(pathname: string): JsonRecord {
+  const raw = readFileSync(pathname, "utf8");
+  const parsed = pathname.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw);
+  const object = asObject(parsed);
+  if (!object) throw new Error(`Webex config file ${pathname} must contain an object.`);
+  return object;
+}
+
+function discoverConfigFile(env: NodeJS.ProcessEnv, homeDir: string, explicitPath?: string): string | undefined {
+  const candidates = explicitPath
+    ? [explicitPath]
+    : asString(env.WEBEX_CONFIG_FILE)
+      ? [asString(env.WEBEX_CONFIG_FILE) as string]
+      : CONFIG_FILE_NAMES.map((name) => join(homeDir, DEFAULT_CONFIG_DIR, name));
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+/**
+ * Precedence: explicit arguments, then environment variables, then the config
+ * file at ~/.config/webex-sec-inspector/config.{json,yaml,yml}. The spec names
+ * config.toml; JSON or YAML is accepted instead to avoid a TOML dependency.
+ */
 export function resolveWebexConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
+  options: { homeDir?: string } = {},
 ): WebexResolvedConfig {
   const sourceChain: string[] = [];
-  const token = asString(input.token)
-    ?? asString(env.WEBEX_TOKEN);
-  if (!token) {
-    throw new Error("WEBEX_TOKEN or a token argument is required.");
-  }
-  sourceChain.push(asString(input.token) ? "arguments-token" : "environment-token");
+  const configFile = discoverConfigFile(env, options.homeDir ?? homedir(), asString(input.config_file));
+  const fileValues = configFile ? loadConfigFile(configFile) : {};
+  if (configFile) sourceChain.push(`config-file:${basename(configFile)}`);
 
-  const orgId = asString(input.org_id)
-    ?? asString(env.WEBEX_ORG_ID);
-  if (orgId) sourceChain.push(asString(input.org_id) ? "arguments-org" : "environment-org");
+  const pick = (argKey: string, envKey: string, fileKey: string, label: string): string | undefined => {
+    const argValue = asString(input[argKey]);
+    if (argValue) {
+      sourceChain.push(`arguments-${label}`);
+      return argValue;
+    }
+    const envValue = asString(env[envKey]);
+    if (envValue) {
+      sourceChain.push(`environment-${label}`);
+      return envValue;
+    }
+    const fileValue = asString(fileValues[fileKey]);
+    if (fileValue) sourceChain.push(`file-${label}`);
+    return fileValue;
+  };
+
+  const token = pick("token", "WEBEX_TOKEN", "token", "token");
+  const clientId = pick("client_id", "WEBEX_CLIENT_ID", "client_id", "client-id");
+  const clientSecret = pick("client_secret", "WEBEX_CLIENT_SECRET", "client_secret", "client-secret");
+  const refreshToken = pick("refresh_token", "WEBEX_REFRESH_TOKEN", "refresh_token", "refresh-token");
+  const orgId = pick("org_id", "WEBEX_ORG_ID", "org_id", "org");
+  const baseUrl = pick("base_url", "WEBEX_API_BASE_URL", "base_url", "base-url") ?? "https://webexapis.com/v1";
+  const timeoutSeconds = asNumber(input.timeout_seconds) ?? asNumber(env.WEBEX_TIMEOUT) ?? asNumber(fileValues.timeout_seconds);
+
+  const refresh = clientId && clientSecret && refreshToken ? { clientId, clientSecret, refreshToken } : undefined;
+  if (!token && !refresh) {
+    throw new Error(
+      "WEBEX_TOKEN (or a token argument) or the WEBEX_CLIENT_ID, WEBEX_CLIENT_SECRET, and WEBEX_REFRESH_TOKEN trio is required.",
+    );
+  }
 
   return {
     token,
+    refresh,
     orgId,
-    baseUrl: normalizeBaseUrl(asString(input.base_url) ?? asString(env.WEBEX_API_BASE_URL) ?? "https://webexapis.com/v1"),
-    timeoutMs: parseTimeoutSeconds(asNumber(input.timeout_seconds) ?? asNumber(env.WEBEX_TIMEOUT)),
+    baseUrl: normalizeBaseUrl(baseUrl),
+    timeoutMs: parseTimeoutSeconds(timeoutSeconds),
     sourceChain: [...new Set(sourceChain)],
+    configFile,
   };
 }
 
@@ -358,17 +555,22 @@ export class WebexApiClient {
   private readonly config: WebexResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private accessToken?: string;
 
   constructor(
     config: WebexResolvedConfig,
     options: {
       fetchImpl?: FetchImpl;
       now?: () => Date;
+      sleep?: (ms: number) => Promise<void>;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
+    this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+    this.accessToken = config.token;
   }
 
   getResolvedConfig(): WebexResolvedConfig {
@@ -396,26 +598,80 @@ export class WebexApiClient {
     return url.toString();
   }
 
-  private async fetchJson(url: string): Promise<{ payload: JsonRecord; nextUrl: string | null }> {
+  /**
+   * Integration and Service App refresh grant: POST /access_token with
+   * grant_type=refresh_token (integrations guide, service-apps guide).
+   */
+  async refreshAccessToken(): Promise<string> {
+    const refresh = this.config.refresh;
+    if (!refresh) throw new Error("No Webex refresh credentials configured.");
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: refresh.clientId,
+      client_secret: refresh.clientSecret,
+      refresh_token: refresh.refreshToken,
+    });
+    const response = await this.fetchImpl(this.buildUrl("/access_token"), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: body.toString(),
+    });
+    const rawText = await response.text();
+    const payload = rawText.length > 0 ? JSON.parse(rawText) as JsonRecord : {};
+    if (!response.ok) {
+      throw new WebexApiError(
+        `Webex token refresh failed (${response.status})${webexErrorSummary(payload) ? `: ${webexErrorSummary(payload)}` : ""}`,
+        response.status,
+        "/access_token",
+      );
+    }
+    const accessToken = asString(payload.access_token);
+    if (!accessToken) throw new Error("Webex token refresh response did not include access_token.");
+    this.accessToken = accessToken;
+    return accessToken;
+  }
+
+  private async currentToken(): Promise<string> {
+    if (this.accessToken) return this.accessToken;
+    return this.refreshAccessToken();
+  }
+
+  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; nextUrl: string | null }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const endpoint = new URL(url).pathname;
 
     try {
       const response = await this.fetchImpl(url, {
         method: "GET",
         headers: {
           accept: "application/json",
-          authorization: `Bearer ${this.config.token}`,
+          authorization: `Bearer ${await this.currentToken()}`,
         },
         signal: controller.signal,
       });
 
+      if (response.status === 429 && attempt < MAX_429_RETRIES) {
+        const retryAfterSeconds = asNumber(response.headers.get("retry-after")) ?? 1;
+        await this.sleep(Math.min(Math.max(retryAfterSeconds, 1) * 1000, MAX_RETRY_AFTER_MS));
+        return this.fetchJson(url, attempt + 1);
+      }
+
       const rawText = await response.text();
-      const payload = rawText.length > 0 ? JSON.parse(rawText) as JsonRecord : {};
+      let payload: JsonRecord = {};
+      try {
+        payload = rawText.length > 0 ? JSON.parse(rawText) as JsonRecord : {};
+      } catch {
+        payload = {};
+      }
 
       if (!response.ok) {
         const detail = webexErrorSummary(payload) ?? rawText.slice(0, 240);
-        throw new Error(`Webex request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`);
+        throw new WebexApiError(
+          `Webex request failed (${response.status} ${response.statusText}) for ${endpoint}${detail ? `: ${detail}` : ""}`,
+          response.status,
+          endpoint,
+        );
       }
 
       return {
@@ -432,185 +688,260 @@ export class WebexApiClient {
     return payload;
   }
 
+  /** Follows rel="next" until absent or the item limit is reached; truncation is reported, never hidden. */
   async list(
     path: string,
     query: JsonRecord = {},
-    options: { limit?: number; pageLimit?: number } = {},
-  ): Promise<JsonRecord[]> {
-    const limit = clampNumber(options.limit, DEFAULT_PAGE_LIMIT, 1, 5000);
-    const pageLimit = clampNumber(options.pageLimit, DEFAULT_PAGE_LIMIT, 1, 1000);
+    options: { limit?: number; pageMax?: number } = {},
+  ): Promise<WebexPage> {
+    const limit = clampNumber(options.limit, DEFAULT_GENERIC_LIMIT, 1, 50_000);
+    const pageMax = clampNumber(options.pageMax, 100, 1, 1000);
     const items: JsonRecord[] = [];
-    let nextUrl: string | null = this.buildUrl(path, { max: pageLimit, ...query });
+    let pageCount = 0;
+    let nextUrl: string | null = this.buildUrl(path, { max: pageMax, ...query });
 
-    while (nextUrl && items.length < limit) {
+    while (nextUrl) {
       const response = await this.fetchJson(nextUrl);
+      pageCount += 1;
       const pageItems = extractItems(response.payload);
-      items.push(...pageItems.slice(0, limit - items.length));
+      const remaining = limit - items.length;
+      items.push(...pageItems.slice(0, remaining));
       nextUrl = response.nextUrl;
-      if (pageItems.length === 0) break;
+      if (items.length >= limit && (nextUrl || pageItems.length > remaining)) {
+        return { items, truncated: true, pageCount };
+      }
     }
 
-    return items;
+    return { items, truncated: false, pageCount };
   }
 
   async getMe(): Promise<JsonRecord> {
     return this.get("/people/me");
   }
 
-  async listOrganizations(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/organizations", {}, { limit });
+  async listOrganizations(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
+    return this.list("/organizations", {}, { limit, pageMax: PAGE_MAX.organizations });
   }
 
   async getOrganization(orgId: string): Promise<JsonRecord> {
     return this.get(`/organizations/${encodeURIComponent(orgId)}`);
   }
 
-  async listPeople(limit = DEFAULT_PEOPLE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/people", this.getOrgQuery(), { limit });
+  async listPeople(limit = DEFAULT_PEOPLE_LIMIT): Promise<WebexPage> {
+    return this.list("/people", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.people });
   }
 
-  async listRoles(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/roles", this.getOrgQuery(), { limit });
+  async listRoles(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
+    return this.list("/roles", {}, { limit, pageMax: PAGE_MAX.roles });
   }
 
-  async listLicenses(limit = DEFAULT_LICENSE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/licenses", this.getOrgQuery(), { limit });
+  async listLicenses(limit = DEFAULT_LICENSE_LIMIT): Promise<WebexPage> {
+    return this.list("/licenses", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.licenses });
   }
 
-  async listEvents(limit = DEFAULT_EVENT_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/events", this.getOrgQuery(), { limit });
+  async listEvents(limit = DEFAULT_EVENT_LIMIT): Promise<WebexPage> {
+    return this.list("/events", {}, { limit, pageMax: PAGE_MAX.events });
   }
 
-  async listRecordings(limit = DEFAULT_RECORDING_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/recordings", this.getOrgQuery(), { limit });
+  /** Admin audit events require orgId, from, and to (admin-audit-events reference). */
+  async listAdminAuditEvents(orgId: string, limit = DEFAULT_EVENT_LIMIT, windowDays = ADMIN_AUDIT_WINDOW_DAYS): Promise<WebexPage> {
+    const to = this.now();
+    const from = new Date(to.getTime() - windowDays * 24 * 60 * 60 * 1000);
+    return this.list(
+      "/adminAudit/events",
+      { orgId, from: from.toISOString(), to: to.toISOString() },
+      { limit, pageMax: PAGE_MAX.adminAudit },
+    );
   }
 
-  async listMeetings(limit = DEFAULT_MEETING_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/meetings", this.getOrgQuery(), { limit });
+  async listAdminRecordings(limit = DEFAULT_RECORDING_LIMIT): Promise<WebexPage> {
+    return this.list("/admin/recordings", {}, { limit, pageMax: PAGE_MAX.adminRecordings });
+  }
+
+  async listMeetings(limit = DEFAULT_MEETING_LIMIT): Promise<WebexPage> {
+    return this.list("/meetings", {}, { limit, pageMax: PAGE_MAX.meetings });
   }
 
   async getMeetingPreferences(): Promise<JsonRecord> {
-    return this.get("/meetingPreferences", this.getOrgQuery());
+    return this.get("/meetingPreferences");
   }
 
-  async listMeetingSites(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/meetingPreferences/sites", this.getOrgQuery(), { limit });
+  async listMeetingSites(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
+    return this.list("/meetingPreferences/sites", {}, { limit, pageMax: PAGE_MAX.sites });
   }
 
-  async getAdminSettings(orgId: string): Promise<JsonRecord> {
-    return this.get(`/admin/organizations/${encodeURIComponent(orgId)}/settings`);
+  async listHybridClusters(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
+    return this.list("/hybrid/clusters", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.hybrid });
   }
 
-  async getSecuritySettings(orgId: string): Promise<JsonRecord> {
-    return this.get(`/admin/organizations/${encodeURIComponent(orgId)}/security`);
+  async listHybridConnectors(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
+    return this.list("/hybrid/connectors", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.hybrid });
   }
 
-  async listHybridClusters(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/hybrid/clusters", this.getOrgQuery(), { limit });
+  async listDevices(limit = DEFAULT_DEVICE_LIMIT): Promise<WebexPage> {
+    return this.list("/devices", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.devices });
   }
 
-  async listHybridConnectors(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/hybrid/connectors", this.getOrgQuery(), { limit });
+  async listWorkspaces(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
+    return this.list("/workspaces", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.workspaces });
   }
 
-  async listDevices(limit = DEFAULT_DEVICE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/devices", this.getOrgQuery(), { limit });
+  async listRooms(limit = DEFAULT_ROOM_LIMIT): Promise<WebexPage> {
+    return this.list("/rooms", {}, { limit, pageMax: PAGE_MAX.rooms });
   }
 
-  async listWorkspaces(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/workspaces", this.getOrgQuery(), { limit });
+  async listWebhooks(limit = DEFAULT_WEBHOOK_LIMIT): Promise<WebexPage> {
+    return this.list("/webhooks", {}, { limit, pageMax: PAGE_MAX.webhooks });
   }
+}
 
-  async listRooms(limit = DEFAULT_ROOM_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/rooms", this.getOrgQuery(), { limit });
-  }
+type WebexClientLike = Pick<
+  WebexApiClient,
+  | "getResolvedConfig"
+  | "getMe"
+  | "listOrganizations"
+  | "getOrganization"
+  | "listPeople"
+  | "listRoles"
+  | "listLicenses"
+  | "listEvents"
+  | "listAdminAuditEvents"
+  | "listAdminRecordings"
+  | "listMeetings"
+  | "getMeetingPreferences"
+  | "listMeetingSites"
+  | "listHybridClusters"
+  | "listHybridConnectors"
+  | "listDevices"
+  | "listWorkspaces"
+  | "listRooms"
+  | "listWebhooks"
+>;
 
-  async listWebhooks(limit = DEFAULT_WEBHOOK_LIMIT): Promise<JsonRecord[]> {
-    return this.list("/webhooks", this.getOrgQuery(), { limit });
+function errorStatus(error: unknown): number | undefined {
+  if (error instanceof WebexApiError) return error.status;
+  const status = asNumber(asObject(error)?.status);
+  return status;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function collectPage(load: () => Promise<WebexPage>): Promise<SurfaceResult<JsonRecord[]>> {
+  try {
+    const page = await load();
+    return { ok: true, data: page.items, truncated: page.truncated };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error), status: errorStatus(error) };
   }
+}
+
+async function collectObject(load: () => Promise<JsonRecord>): Promise<SurfaceResult<JsonRecord>> {
+  try {
+    return { ok: true, data: await load(), truncated: false };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error), status: errorStatus(error) };
+  }
+}
+
+function surfaceItems(result: SurfaceResult<JsonRecord[]>): JsonRecord[] {
+  return result.ok ? result.data : [];
+}
+
+function surfaceErrors(entries: Record<string, SurfaceResult<unknown>>): string[] {
+  return Object.entries(entries)
+    .filter(([, result]) => !result.ok)
+    .map(([name, result]) => `${name}: ${result.ok ? "" : result.error}`);
+}
+
+function surfaceRaw(entries: Record<string, SurfaceResult<unknown>>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const [name, result] of Object.entries(entries)) {
+    output[name] = result.ok ? redactSecrets(result.data) : { error: result.error, status: result.status ?? null };
+  }
+  return output;
 }
 
 function deriveOrgContext(
   config: WebexResolvedConfig,
-  orgs: JsonRecord[],
+  orgs: SurfaceResult<JsonRecord[]>,
 ): { orgId?: string; note: string } {
   if (config.orgId) {
     return { orgId: config.orgId, note: `Using configured Webex org ${config.orgId}.` };
   }
-
-  const soleId = asString(orgs[0]?.id);
-  if (orgs.length === 1 && soleId) {
+  if (!orgs.ok) {
+    return { orgId: undefined, note: `GET /organizations was not readable (${orgs.error}); set WEBEX_ORG_ID to run org-scoped checks.` };
+  }
+  const soleId = asString(orgs.data[0]?.id);
+  if (orgs.data.length === 1 && soleId) {
     return { orgId: soleId, note: `Using the only visible Webex org ${soleId}.` };
   }
-
-  if (orgs.length === 0) {
-    return { orgId: undefined, note: "No Webex organizations were visible; org-scoped checks will stay limited." };
+  if (orgs.data.length === 0) {
+    return { orgId: undefined, note: "No Webex organizations were visible; org-scoped checks stay manual until WEBEX_ORG_ID is set." };
   }
-
   return {
     orgId: undefined,
-    note: "Multiple Webex organizations were visible with no org_id selected; org-scoped checks will stay limited.",
-  };
-}
-
-async function readableSurface(
-  name: string,
-  endpoint: string,
-  load: () => Promise<unknown>,
-  countResolver?: (value: unknown) => number | undefined,
-): Promise<WebexAccessSurface> {
-  try {
-    const value = await load();
-    return {
-      name,
-      endpoint,
-      status: "readable",
-      count: countResolver?.(value),
-    };
-  } catch (error) {
-    return {
-      name,
-      endpoint,
-      status: "not_readable",
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function notConfiguredSurface(name: string, endpoint: string, error: string): WebexAccessSurface {
-  return {
-    name,
-    endpoint,
-    status: "not_configured",
-    error,
+    note: "Multiple Webex organizations were visible with no org_id selected; org-scoped checks stay manual until WEBEX_ORG_ID is set.",
   };
 }
 
 function finding(
   id: string,
+  control: number[],
   title: string,
   severity: WebexFinding["severity"],
-  status: WebexFinding["status"],
+  status: WebexFindingStatus,
   summary: string,
-  mappings: string[],
   evidence?: JsonRecord,
 ): WebexFinding {
-  return { id, title, severity, status, summary, evidence, mappings };
+  const merged: WebexFrameworkMap = frameworks("", "", "", "", "", "", "", "");
+  for (const number of control) {
+    const map = WEBEX_CONTROL_FRAMEWORKS[number];
+    if (!map) continue;
+    for (const key of Object.keys(merged) as WebexFrameworkKey[]) {
+      merged[key] = [...new Set([...merged[key], ...map[key]])];
+    }
+  }
+  const mappings = (Object.keys(merged) as WebexFrameworkKey[])
+    .flatMap((key) => merged[key].map((value) => `${WEBEX_FRAMEWORK_LABELS[key]} ${value}`));
+  return { id, control, title, severity, status, summary, evidence, mappings, frameworks: merged };
+}
+
+function deniedSummary(surface: string, endpoint: string, result: { error: string; status?: number }, requirement: string): string {
+  const cause = /bot token/i.test(result.error)
+    ? `${endpoint} was not queried because a bot token cannot read admin surfaces (${surface})`
+    : result.status === 401 || result.status === 403
+      ? `${endpoint} returned ${result.status}; the token lacks the scope or admin role for ${surface}`
+      : `${endpoint} could not be read (${result.error})`;
+  return `Manual: ${cause}. Collect ${requirement}.`;
+}
+
+function partialNote(result: SurfaceResult<JsonRecord[]>, label: string): string {
+  return result.ok && result.truncated
+    ? ` The ${label} listing was truncated at ${result.data.length} items (more pages remained), so the population is partial.`
+    : "";
+}
+
+/** Person.type is documented as person, bot, or appuser (people reference, bots guide). */
+export function detectTokenType(me: JsonRecord | undefined): WebexTokenType {
+  const type = asString(me?.type);
+  switch (type) {
+    case "person":
+      return "person";
+    case "bot":
+      return "bot";
+    case "appuser":
+      return "appuser";
+    case undefined:
+      return "unknown";
+    default:
+      return "unknown";
+  }
 }
 
 function personRoleIds(person: JsonRecord): string[] {
-  return [
-    ...asArray(person.roles).map((item) => asString(item)),
-    ...asArray(person.adminRoles).map((item) => asString(asObject(item)?.id) ?? asString(item)),
-  ].filter((item): item is string => Boolean(item));
-}
-
-function expandRoleNames(person: JsonRecord, roleMap: Map<string, string>): string[] {
-  const values = [
-    ...personRoleIds(person).map((id) => roleMap.get(id) ?? id),
-    ...asArray(person.adminRoles).map((item) => asString(asObject(item)?.displayName) ?? asString(asObject(item)?.name)),
-  ];
-  return values.filter((item): item is string => Boolean(item));
+  return asArray(person.roles).map((item) => asString(item)).filter((item): item is string => Boolean(item));
 }
 
 function roleMapFromRoles(roles: JsonRecord[]): Map<string, string> {
@@ -618,593 +949,542 @@ function roleMapFromRoles(roles: JsonRecord[]): Map<string, string> {
     roles
       .map((role) => {
         const id = asString(role.id);
-        const name = asString(role.name) ?? asString(role.displayName);
+        const name = asString(role.name);
         return id && name ? [id, name] as const : undefined;
       })
       .filter((item): item is readonly [string, string] => Boolean(item)),
   );
 }
 
-function objectHasAnyEnabledSignal(value: unknown): boolean {
-  const object = asObject(value);
-  if (!object) return false;
-  for (const entry of Object.values(object)) {
-    if (isExplicitlyEnabled(entry)) return true;
-    if (asObject(entry) && objectHasAnyEnabledSignal(entry)) return true;
+function personRoleNames(person: JsonRecord, roleMap: Map<string, string>): string[] {
+  return personRoleIds(person).map((id) => roleMap.get(id) ?? id);
+}
+
+function personLabel(person: JsonRecord): string {
+  return asString(person.displayName) ?? asString(asArray(person.emails)[0]) ?? asString(person.id) ?? "person";
+}
+
+function statusRank(status: WebexFindingStatus): number {
+  switch (status) {
+    case "fail":
+      return 0;
+    case "warn":
+      return 1;
+    case "manual":
+      return 2;
+    case "pass":
+      return 3;
+    default: {
+      const exhaustive: never = status;
+      return exhaustive;
+    }
   }
-  return false;
 }
 
-function isExplicitlyEnabled(value: unknown): boolean {
-  return asBoolean(value) === true || /^(enabled|active|required|strict|e2ee|srtp)$/i.test(asString(value) ?? "");
+function countStatuses(findings: WebexFinding[]): Record<WebexFindingStatus, number> {
+  const counts: Record<WebexFindingStatus, number> = { pass: 0, warn: 0, fail: 0, manual: 0 };
+  for (const item of findings) counts[item.status] += 1;
+  return counts;
 }
 
-function isExplicitlyDisabled(value: unknown): boolean {
-  return asBoolean(value) === false || /^(disabled|inactive|off|none|optional|personal)$/i.test(asString(value) ?? "");
-}
-
-function roomName(room: JsonRecord): string {
-  return asString(room.title) ?? asString(room.displayName) ?? asString(room.id) ?? "room";
-}
-
-function orgSignalsEnabled(value: unknown, candidatePaths: string[][]): boolean {
-  return candidatePaths.some((path) => isExplicitlyEnabled(getNestedValue(value, path)));
-}
-
-function orgSignalsDisabled(value: unknown, candidatePaths: string[][]): boolean {
-  return candidatePaths.some((path) => isExplicitlyDisabled(getNestedValue(value, path)));
-}
-
-export async function checkWebexAccess(
-  client: Pick<
-    WebexApiClient,
-    | "getResolvedConfig"
-    | "getMe"
-    | "listOrganizations"
-    | "listPeople"
-    | "listRoles"
-    | "listLicenses"
-    | "listMeetings"
-    | "listRecordings"
-    | "listEvents"
-    | "getAdminSettings"
-    | "getSecuritySettings"
-    | "listHybridClusters"
-    | "listDevices"
-    | "listWebhooks"
-  >,
-): Promise<WebexAccessCheckResult> {
+export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const [me, orgs] = await Promise.all([
-    client.getMe(),
-    client.listOrganizations(),
-  ]);
+  const me = await collectObject(() => client.getMe());
+  const orgs = await collectPage(() => client.listOrganizations());
   const { orgId, note } = deriveOrgContext(config, orgs);
+  const tokenType = detectTokenType(me.ok ? me.data : undefined);
+
+  const pageSurface = async (name: string, endpoint: string, doc: string, load: () => Promise<WebexPage>): Promise<WebexAccessSurface> => {
+    const result = await collectPage(load);
+    return result.ok
+      ? { name, endpoint, doc, status: "readable", count: result.data.length, truncated: result.truncated }
+      : { name, endpoint, doc, status: "not_readable", error: result.error };
+  };
+  const objectSurface = async (name: string, endpoint: string, doc: string, load: () => Promise<JsonRecord>): Promise<WebexAccessSurface> => {
+    const result = await collectObject(load);
+    return result.ok
+      ? { name, endpoint, doc, status: "readable", count: 1 }
+      : { name, endpoint, doc, status: "not_readable", error: result.error };
+  };
 
   const surfaces: WebexAccessSurface[] = [
-    await readableSurface("me", "/people/me", () => client.getMe(), () => 1),
-    await readableSurface("organizations", "/organizations", () => client.listOrganizations(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("people", "/people", () => client.listPeople(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("roles", "/roles", () => client.listRoles(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("licenses", "/licenses", () => client.listLicenses(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("meetings", "/meetings", () => client.listMeetings(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("recordings", "/recordings", () => client.listRecordings(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("events", "/events", () => client.listEvents(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("hybrid_clusters", "/hybrid/clusters", () => client.listHybridClusters(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("devices", "/devices", () => client.listDevices(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("webhooks", "/webhooks", () => client.listWebhooks(), (value) => Array.isArray(value) ? value.length : undefined),
+    me.ok
+      ? { name: "me", endpoint: "/people/me", doc: WEBEX_DOCS.peopleMe, status: "readable", count: 1 }
+      : { name: "me", endpoint: "/people/me", doc: WEBEX_DOCS.peopleMe, status: "not_readable", error: me.error },
+    orgs.ok
+      ? { name: "organizations", endpoint: "/organizations", doc: WEBEX_DOCS.organizationsList, status: "readable", count: orgs.data.length, truncated: orgs.truncated }
+      : { name: "organizations", endpoint: "/organizations", doc: WEBEX_DOCS.organizationsList, status: "not_readable", error: orgs.error },
   ];
 
+  const adminSurfaces: Array<[string, string, string, () => Promise<WebexPage>]> = [
+    ["people", "/people", WEBEX_DOCS.peopleList, () => client.listPeople()],
+    ["roles", "/roles", WEBEX_DOCS.rolesList, () => client.listRoles()],
+    ["licenses", "/licenses", WEBEX_DOCS.licensesList, () => client.listLicenses()],
+    ["admin_recordings", "/admin/recordings", WEBEX_DOCS.adminRecordings, () => client.listAdminRecordings()],
+    ["events", "/events", WEBEX_DOCS.eventsList, () => client.listEvents()],
+    ["hybrid_clusters", "/hybrid/clusters", WEBEX_DOCS.hybridClusters, () => client.listHybridClusters()],
+    ["hybrid_connectors", "/hybrid/connectors", WEBEX_DOCS.hybridConnectors, () => client.listHybridConnectors()],
+    ["devices", "/devices", WEBEX_DOCS.devicesList, () => client.listDevices()],
+    ["workspaces", "/workspaces", WEBEX_DOCS.workspacesList, () => client.listWorkspaces()],
+  ];
+  const userSurfaces: Array<[string, string, string, () => Promise<WebexPage>]> = [
+    ["rooms", "/rooms", WEBEX_DOCS.roomsList, () => client.listRooms()],
+    ["webhooks", "/webhooks", WEBEX_DOCS.webhooksList, () => client.listWebhooks()],
+    ["meetings", "/meetings", WEBEX_DOCS.meetingsList, () => client.listMeetings()],
+  ];
+
+  for (const [name, endpoint, doc, load] of adminSurfaces) {
+    if (tokenType === "bot") {
+      surfaces.push({ name, endpoint, doc, status: "manual", error: "Bot tokens cannot read admin surfaces; use an admin, integration, or Service App token." });
+    } else {
+      surfaces.push(await pageSurface(name, endpoint, doc, load));
+    }
+  }
   if (orgId) {
-    surfaces.push(
-      await readableSurface("admin_settings", `/admin/organizations/${orgId}/settings`, () => client.getAdminSettings(orgId), () => 1),
-      await readableSurface("security_settings", `/admin/organizations/${orgId}/security`, () => client.getSecuritySettings(orgId), () => 1),
-    );
+    surfaces.push(await objectSurface("organization", `/organizations/${orgId}`, WEBEX_DOCS.organizationGet, () => client.getOrganization(orgId)));
+    if (tokenType === "bot") {
+      surfaces.push({ name: "admin_audit_events", endpoint: "/adminAudit/events", doc: WEBEX_DOCS.adminAuditEvents, status: "manual", error: "Bot tokens cannot read admin audit events." });
+    } else {
+      surfaces.push(await pageSurface("admin_audit_events", "/adminAudit/events", WEBEX_DOCS.adminAuditEvents, () => client.listAdminAuditEvents(orgId)));
+    }
   } else {
     surfaces.push(
-      notConfiguredSurface("admin_settings", "/admin/organizations/{orgId}/settings", note),
-      notConfiguredSurface("security_settings", "/admin/organizations/{orgId}/security", note),
+      { name: "organization", endpoint: "/organizations/{orgId}", doc: WEBEX_DOCS.organizationGet, status: "not_configured", error: note },
+      { name: "admin_audit_events", endpoint: "/adminAudit/events", doc: WEBEX_DOCS.adminAuditEvents, status: "not_configured", error: note },
     );
   }
+  for (const [name, endpoint, doc, load] of userSurfaces) {
+    surfaces.push(await pageSurface(name, endpoint, doc, load));
+  }
+  surfaces.push(await objectSurface("meeting_preferences", "/meetingPreferences", WEBEX_DOCS.meetingPreferences, () => client.getMeetingPreferences()));
 
-  const readableCount = surfaces.filter((surfaceItem) => surfaceItem.status === "readable").length;
-  const status = readableCount >= 7 ? "healthy" : "limited";
+  const readable = surfaces.filter((item) => item.status === "readable");
+  const adminCapable = tokenType !== "bot"
+    && ["people", "roles"].every((name) => readable.some((item) => item.name === name));
+  const status = adminCapable && readable.length >= 8 ? "healthy" : "limited";
 
   return {
     status,
     orgId,
+    tokenType,
+    adminCapable,
     surfaces,
     notes: [
-      `Authenticated as ${asString(me.displayName) ?? asString(asArray(me.emails)[0]) ?? asString(me.id) ?? "current Webex user"}.`,
+      me.ok
+        ? `Authenticated as ${personLabel(me.data)} (token type: ${tokenType}).`
+        : `GET /people/me failed (${me.error}); token type unknown.`,
       note,
-      `${readableCount}/${surfaces.length} Webex audit surfaces are readable.`,
+      `${readable.length}/${surfaces.length} Webex audit surfaces are readable.`,
+      ...(tokenType === "bot" ? ["Bot tokens cannot read admin surfaces; admin-only controls will render as manual."] : []),
+      ...(config.refresh ? ["Access token obtained through the refresh_token grant; tokens are redacted from all output."] : []),
     ],
     recommendedNextStep:
       status === "healthy"
         ? "Run webex_assess_identity, webex_assess_collaboration_governance, webex_assess_meeting_hybrid_security, or webex_export_audit_bundle."
-        : "Provide a read-only Webex token with people, org, meetings, recordings, events, and Control Hub admin read scopes.",
+        : "Provide an admin, integration, or Service App token with spark-admin:people_read, spark-admin:roles_read, spark-admin:licenses_read, spark-admin:organizations_read, spark-admin:devices_read, spark-admin:hybrid_clusters_read, spark-compliance:events_read, spark-compliance:recordings_read, and audit:events_read.",
   };
 }
 
 export async function assessWebexIdentity(
-  client: Pick<
-    WebexApiClient,
-    "getResolvedConfig" | "listOrganizations" | "listPeople" | "listRoles" | "getAdminSettings"
-  >,
-  options: {
-    peopleLimit?: number;
-    maxAdmins?: number;
-  } = {},
+  client: WebexClientLike,
+  options: AssessmentOptions = {},
 ): Promise<WebexAssessmentResult> {
   const config = client.getResolvedConfig();
-  const peopleLimit = clampNumber(options.peopleLimit, DEFAULT_PEOPLE_LIMIT, 1, 10000);
+  const peopleLimit = clampNumber(options.peopleLimit, DEFAULT_PEOPLE_LIMIT, 1, 50_000);
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 5000);
 
-  const orgs = await client.listOrganizations();
+  const me = await collectObject(() => client.getMe());
+  const tokenType = detectTokenType(me.ok ? me.data : undefined);
+  const orgs = await collectPage(() => client.listOrganizations());
   const { orgId, note } = deriveOrgContext(config, orgs);
-  const [people, roles, adminSettings] = await Promise.all([
-    client.listPeople(peopleLimit),
-    client.listRoles(),
-    orgId ? client.getAdminSettings(orgId).catch(() => ({})) : Promise.resolve({}),
+  const botDenied: SurfaceResult<JsonRecord[]> = { ok: false, error: "bot token cannot read admin surfaces", status: 403 };
+  const [people, roles, organization] = await Promise.all([
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listPeople(peopleLimit)),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listRoles()),
+    orgId ? collectObject(() => client.getOrganization(orgId)) : Promise.resolve<SurfaceResult<JsonRecord>>({ ok: false, error: note }),
   ]);
+  const surfaces = { me, organizations: orgs, people, roles, organization };
 
-  const roleMap = roleMapFromRoles(roles);
-  const adminUsers = people.filter((person) => expandRoleNames(person, roleMap).some((role) => /admin/i.test(role)));
-  const complianceOfficers = people.filter((person) => expandRoleNames(person, roleMap).some((role) => /compliance/i.test(role)));
-  const adminsWithoutMfa = adminUsers.filter((person) => !isExplicitlyEnabled(firstDefined(person, [
-    ["mfaEnabled"],
-    ["mfaRequired"],
-    ["security", "mfaEnabled"],
-    ["status", "mfaEnabled"],
-  ])));
+  const roleMap = roleMapFromRoles(surfaceItems(roles));
+  const humans = surfaceItems(people).filter((person) => asString(person.type) !== "bot");
+  const bots = surfaceItems(people).filter((person) => asString(person.type) === "bot");
+  const adminUsers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => /administrator/i.test(role)));
+  const complianceOfficers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => /compliance officer/i.test(role)));
+  const peoplePartial = partialNote(people, "people");
+  const orgLabel = organization.ok ? asString(organization.data.displayName) ?? orgId ?? "org" : orgId ?? "org";
 
-  const ssoEnabled = orgSignalsEnabled(adminSettings, [
-    ["ssoEnabled"],
-    ["security", "ssoEnabled"],
-    ["authentication", "ssoEnabled"],
-    ["authentication", "sso", "enabled"],
-    ["idp", "enabled"],
-  ]);
-  const adminMfaRequired = orgSignalsEnabled(adminSettings, [
-    ["adminMfaRequired"],
-    ["security", "adminMfaRequired"],
-    ["security", "mfa", "requiredForAdmins"],
-    ["authentication", "mfa", "requiredForAdmins"],
-  ]);
+  const ssoFinding = finding(
+    "WEBEX-ID-01",
+    [1],
+    "Organization SSO enforcement",
+    "critical",
+    "manual",
+    `Manual: the Organizations API (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created, so SSO enforcement for ${orgLabel} is not readable. Export the Control Hub Organization Settings > Authentication page showing SSO enabled.`,
+    { org_id: orgId ?? null, organization: organization.ok ? redactSecrets(organization.data) : { error: organization.error }, citation: WEBEX_DOCS.organizationGet },
+  );
 
-  const findings = [
-    finding(
-      "WEBEX-ID-01",
-      "Organization SSO enforcement",
-      "critical",
-      orgId ? (ssoEnabled ? "pass" : "fail") : "warn",
-      orgId
-        ? (ssoEnabled
-          ? "Webex org settings exposed SSO as enabled."
-          : "Webex org settings did not expose SSO as enabled.")
-        : note,
-      ["FedRAMP IA-2(1)", "SOC 2 CC6.1", "PCI-DSS 8.4.1", "CIS 16.2"],
-      { org_id: orgId ?? null, sso_enabled: ssoEnabled },
-    ),
-    finding(
-      "WEBEX-ID-02",
-      "Admin MFA enforcement",
-      "critical",
-      orgId ? (adminMfaRequired && adminsWithoutMfa.length === 0 ? "pass" : "fail") : "warn",
-      orgId
-        ? (adminMfaRequired && adminsWithoutMfa.length === 0
-          ? "Org policy required MFA for admins and no sampled admins were missing it."
-          : `${adminsWithoutMfa.length}/${adminUsers.length} sampled admins appeared to lack MFA or org MFA enforcement was not visible.`)
-        : note,
-      ["FedRAMP IA-2(2)", "SOC 2 CC6.1", "PCI-DSS 8.4.2", "CIS 16.3"],
-      { admin_users: adminUsers.length, admins_without_mfa: adminsWithoutMfa.length, admin_mfa_required: adminMfaRequired },
-    ),
-    finding(
-      "WEBEX-ID-03",
-      "Compliance Officer assignment",
-      "high",
-      complianceOfficers.length > 0 ? "pass" : "warn",
-      complianceOfficers.length > 0
-        ? `${complianceOfficers.length} sampled users carried a compliance-oriented role.`
-        : "No sampled users carried a Compliance Officer style role.",
-      ["FedRAMP AU-1", "SOC 2 CC7.2", "PCI-DSS 12.5.2", "CIS 8.1"],
-      { compliance_officers: complianceOfficers.length },
-    ),
-    finding(
-      "WEBEX-ID-04",
-      "Administrative privilege concentration",
-      "medium",
-      adminUsers.length <= maxAdmins ? "pass" : "warn",
-      adminUsers.length <= maxAdmins
-        ? `${adminUsers.length} sampled users had admin roles, within the configured threshold of ${maxAdmins}.`
-        : `${adminUsers.length} sampled users had admin roles, exceeding the configured threshold of ${maxAdmins}.`,
-      ["FedRAMP AC-2", "FedRAMP AC-6", "SOC 2 CC6.3", "PCI-DSS 7.2.2"],
-      { admin_users: adminUsers.length, max_admins: maxAdmins, sampled_people: people.length },
-    ),
-  ];
+  const adminMfaFinding = !people.ok
+    ? finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
+      deniedSummary("people", "/people", people, "the Control Hub admin list with MFA status for each administrator"),
+      { citation: WEBEX_DOCS.peopleList, token_type: tokenType })
+    : finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
+      `Manual: the People API (${WEBEX_DOCS.peopleList}) exposes roles but no MFA attribute, so MFA status for the ${adminUsers.length} administrators found cannot be read. Confirm MFA enforcement in Control Hub Organization Settings > Authentication for each listed admin.${peoplePartial}`,
+      { admin_users: adminUsers.slice(0, 50).map(personLabel), admin_count: adminUsers.length, people_seen: surfaceItems(people).length, people_truncated: people.truncated, citation: WEBEX_DOCS.peopleList });
 
+  let complianceFinding: WebexFinding;
+  if (!people.ok || !roles.ok) {
+    const denied = !people.ok ? people : roles;
+    complianceFinding = finding("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", "manual",
+      deniedSummary(!people.ok ? "people" : "roles", !people.ok ? "/people" : "/roles", denied as { error: string; status?: number }, "the Control Hub Users list filtered to the Compliance Officer role"),
+      { citation: WEBEX_DOCS.rolesList, token_type: tokenType });
+  } else if (surfaceItems(people).length === 0) {
+    complianceFinding = finding("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", "manual",
+      "Manual: GET /people returned zero people, which is not a valid population for an active org; confirm the token has spark-admin:people_read and the org is correct.",
+      { people_seen: 0, citation: WEBEX_DOCS.peopleList });
+  } else if (complianceOfficers.length > 0) {
+    complianceFinding = finding("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", people.truncated ? "warn" : "pass",
+      `${complianceOfficers.length} of ${humans.length} people carry the Compliance Officer role.${peoplePartial}`,
+      { compliance_officers: complianceOfficers.slice(0, 50).map(personLabel), people_seen: humans.length, people_truncated: people.truncated });
+  } else {
+    complianceFinding = finding("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", "fail",
+      `No person among ${humans.length} listed carries the Compliance Officer role.${peoplePartial}`,
+      { people_seen: humans.length, people_truncated: people.truncated, roles_seen: [...roleMap.values()] });
+  }
+
+  let concentrationFinding: WebexFinding;
+  if (!people.ok || !roles.ok) {
+    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium", "manual",
+      deniedSummary("people and roles", "/people and /roles", (!people.ok ? people : roles) as { error: string; status?: number }, "the Control Hub administrator list"),
+      { token_type: tokenType });
+  } else if (surfaceItems(people).length === 0) {
+    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium", "manual",
+      "Manual: GET /people returned zero people; an empty population cannot demonstrate bounded admin counts.",
+      { people_seen: 0 });
+  } else if (adminUsers.length === 0) {
+    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium", "warn",
+      `No administrators were visible among ${humans.length} people; every org has at least one Full Administrator, so the role data is incomplete.${peoplePartial}`,
+      { admin_users: 0, people_seen: humans.length, people_truncated: people.truncated });
+  } else {
+    const within = adminUsers.length <= maxAdmins;
+    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium",
+      within ? (people.truncated ? "warn" : "pass") : "warn",
+      `${adminUsers.length} of ${humans.length} people hold administrator roles (threshold ${maxAdmins}).${peoplePartial}`,
+      { admin_users: adminUsers.slice(0, 50).map(personLabel), admin_count: adminUsers.length, max_admins: maxAdmins, people_seen: humans.length, people_truncated: people.truncated });
+  }
+
+  let botInventoryFinding: WebexFinding;
+  if (!people.ok) {
+    botInventoryFinding = finding("WEBEX-ID-05", [19], "Bot account inventory", "medium", "manual",
+      deniedSummary("people", "/people", people, "the Control Hub Apps > Bots list"),
+      { citation: WEBEX_DOCS.bots, token_type: tokenType });
+  } else if (surfaceItems(people).length === 0) {
+    botInventoryFinding = finding("WEBEX-ID-05", [19], "Bot account inventory", "medium", "manual",
+      "Manual: GET /people returned zero people, so no bot inventory could be built.",
+      { people_seen: 0 });
+  } else {
+    botInventoryFinding = finding("WEBEX-ID-05", [19], "Bot account inventory", "medium", people.truncated ? "warn" : "pass",
+      `${bots.length} bot accounts (Person.type = bot) were inventoried among ${surfaceItems(people).length} people; review the list against the approved bot register.${peoplePartial}`,
+      {
+        bots: bots.slice(0, 100).map((bot) => ({ id: asString(bot.id), display_name: asString(bot.displayName), emails: asArray(bot.emails).map(asString), created: asString(bot.created) })),
+        bot_count: bots.length,
+        people_seen: surfaceItems(people).length,
+        people_truncated: people.truncated,
+        citation: WEBEX_DOCS.bots,
+      });
+  }
+
+  const botApprovalFinding = finding("WEBEX-ID-06", [19], "Bot approval state", "medium", "manual",
+    `Manual: bot approval is managed in Control Hub (Management > Apps) and the bots guide (${WEBEX_DOCS.bots}) documents no API field for approval state. Export the Control Hub bot management page and reconcile it with the ${bots.length} inventoried bots.`,
+    { bot_count: people.ok ? bots.length : null, citation: WEBEX_DOCS.bots });
+
+  const findings = [ssoFinding, adminMfaFinding, complianceFinding, concentrationFinding, botInventoryFinding, botApprovalFinding];
   return {
     title: "Webex identity posture",
+    category: "identity",
     summary: {
       org_id: orgId ?? null,
-      sampled_people: people.length,
+      token_type: tokenType,
+      people_seen: surfaceItems(people).length,
+      people_truncated: people.ok ? people.truncated : null,
       admin_users: adminUsers.length,
-      admins_without_mfa: adminsWithoutMfa.length,
       compliance_officers: complianceOfficers.length,
-      sso_enabled: ssoEnabled,
-      admin_mfa_required: adminMfaRequired,
+      bots: bots.length,
+      ...countStatuses(findings),
     },
     findings,
+    errors: surfaceErrors(surfaces),
+    rawData: surfaceRaw(surfaces),
   };
 }
 
 export async function assessWebexCollaborationGovernance(
-  client: Pick<
-    WebexApiClient,
-    "getResolvedConfig" | "listOrganizations" | "getSecuritySettings" | "getAdminSettings" | "listEvents" | "listRecordings" | "listRooms" | "listWebhooks" | "listLicenses"
-  >,
-  options: {
-    eventLimit?: number;
-    recordingLimit?: number;
-    webhookLimit?: number;
-    licenseLimit?: number;
-    roomLimit?: number;
-  } = {},
+  client: WebexClientLike,
+  options: AssessmentOptions = {},
 ): Promise<WebexAssessmentResult> {
   const config = client.getResolvedConfig();
-  const eventLimit = clampNumber(options.eventLimit, DEFAULT_EVENT_LIMIT, 1, 10000);
-  const recordingLimit = clampNumber(options.recordingLimit, DEFAULT_RECORDING_LIMIT, 1, 10000);
-  const webhookLimit = clampNumber(options.webhookLimit, DEFAULT_WEBHOOK_LIMIT, 1, 10000);
-  const licenseLimit = clampNumber(options.licenseLimit, DEFAULT_LICENSE_LIMIT, 1, 10000);
-  const roomLimit = clampNumber(options.roomLimit, DEFAULT_ROOM_LIMIT, 1, 10000);
+  const eventLimit = clampNumber(options.eventLimit, DEFAULT_EVENT_LIMIT, 1, 50_000);
+  const recordingLimit = clampNumber(options.recordingLimit, DEFAULT_RECORDING_LIMIT, 1, 50_000);
+  const webhookLimit = clampNumber(options.webhookLimit, DEFAULT_WEBHOOK_LIMIT, 1, 50_000);
+  const licenseLimit = clampNumber(options.licenseLimit, DEFAULT_LICENSE_LIMIT, 1, 50_000);
+  const roomLimit = clampNumber(options.roomLimit, DEFAULT_ROOM_LIMIT, 1, 50_000);
 
-  const orgs = await client.listOrganizations();
+  const me = await collectObject(() => client.getMe());
+  const tokenType = detectTokenType(me.ok ? me.data : undefined);
+  const orgs = await collectPage(() => client.listOrganizations());
   const { orgId, note } = deriveOrgContext(config, orgs);
-  const [securitySettings, adminSettings, events, recordings, rooms, webhooks, licenses] = await Promise.all([
-    orgId ? client.getSecuritySettings(orgId).catch(() => ({})) : Promise.resolve({}),
-    orgId ? client.getAdminSettings(orgId).catch(() => ({})) : Promise.resolve({}),
-    client.listEvents(eventLimit).catch(() => []),
-    client.listRecordings(recordingLimit).catch(() => []),
-    client.listRooms(roomLimit).catch(() => []),
-    client.listWebhooks(webhookLimit).catch(() => []),
-    client.listLicenses(licenseLimit).catch(() => []),
+  const botDenied: SurfaceResult<JsonRecord[]> = { ok: false, error: "bot token cannot read admin surfaces", status: 403 };
+  const notConfigured: SurfaceResult<JsonRecord[]> = { ok: false, error: note };
+  const [events, adminAudit, recordings, rooms, webhooks, licenses] = await Promise.all([
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listEvents(eventLimit)),
+    tokenType === "bot" ? Promise.resolve(botDenied) : orgId ? collectPage(() => client.listAdminAuditEvents(orgId, eventLimit)) : Promise.resolve(notConfigured),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listAdminRecordings(recordingLimit)),
+    collectPage(() => client.listRooms(roomLimit)),
+    collectPage(() => client.listWebhooks(webhookLimit)),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listLicenses(licenseLimit)),
   ]);
+  const surfaces = { me, organizations: orgs, events, admin_audit_events: adminAudit, admin_recordings: recordings, rooms, webhooks, licenses };
 
-  const externalRestricted = orgSignalsEnabled(securitySettings, [
-    ["externalCommunicationsRestricted"],
-    ["externalMessagingRestricted"],
-    ["messaging", "external", "restricted"],
-    ["externalCommunicationPolicy", "approvedDomainsOnly"],
-    ["allowedDomainsOnly"],
-  ]);
-  const fileControlsEnabled = orgSignalsEnabled(securitySettings, [
-    ["fileSharingRestricted"],
-    ["fileSharing", "restricted"],
-    ["messagingDlpEnabled"],
-    ["dlp", "enabled"],
-    ["fileTypeFilteringEnabled"],
-  ]);
-  const guestRestricted = orgSignalsDisabled(securitySettings, [
-    ["guestAccessEnabled"],
-    ["guestsAllowed"],
-    ["messaging", "guestAccessEnabled"],
-  ]) || orgSignalsEnabled(securitySettings, [
-    ["guestAccessRestricted"],
-    ["messaging", "guestAccessRestricted"],
-  ]);
+  const externalFinding = finding("WEBEX-COLLAB-01", [4, 13], "External communications and guest access policy", "high", "manual",
+    `Manual: no public Webex API exposes external communication or guest access policy; the Organizations reference (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created. Export Control Hub Messaging settings (external communication allow list, guest access).`,
+    { org_id: orgId ?? null, citation: WEBEX_DOCS.organizationGet });
 
-  const riskyRecordings = recordings.filter((recording) =>
-    isExplicitlyDisabled(firstDefined(recording, [
-      ["organizationOwned"],
-      ["orgControlledStorage"],
-      ["storage", "organizationControlled"],
-    ])),
-  );
-  const retentionConfigured = orgSignalsEnabled(adminSettings, [
-    ["recordingRetentionEnabled"],
-    ["recordings", "autoDeleteEnabled"],
-    ["retention", "configured"],
-    ["dataRetentionPolicyEnabled"],
-  ]) || asNumber(firstDefined(adminSettings, [
-    ["recordingRetentionDays"],
-    ["recordings", "autoDeleteDays"],
-    ["retention", "days"],
-  ])) !== undefined;
+  const fileDlpFinding = finding("WEBEX-COLLAB-02", [5, 21], "File sharing restrictions and messaging DLP", "high", "manual",
+    `Manual: file sharing restrictions are Control Hub settings and DLP is delivered through Events API integrations (${WEBEX_DOCS.complianceGuide}); no API field reports the policy state. Export Control Hub file sharing controls and the DLP/CASB integration evidence.${events.ok ? ` ${surfaceItems(events).length} compliance events were readable as integration evidence.` : ""}`,
+    { events_readable: events.ok, events_seen: surfaceItems(events).length, citation: WEBEX_DOCS.complianceGuide });
 
-  const roomsWithoutClassification = rooms.filter((room) => {
-    const value = firstDefined(room, [
-      ["classification"],
-      ["classificationLabel"],
-      ["retention", "classification"],
-    ]);
-    return !asString(value);
+  const recordingItems = surfaceItems(recordings);
+  const deletedRecordings = recordingItems.filter((item) => asString(item.status) === "deleted");
+  const recordingFinding = !recordings.ok
+    ? finding("WEBEX-COLLAB-03", [6, 7, 12], "Recording storage and retention governance", "medium", "manual",
+      deniedSummary("admin recordings", "/admin/recordings", recordings, "Control Hub recording retention and storage settings"),
+      { citation: WEBEX_DOCS.adminRecordings, token_type: tokenType })
+    : finding("WEBEX-COLLAB-03", [6, 7, 12], "Recording storage and retention governance", "medium", "manual",
+      `Manual: the admin recordings reference (${WEBEX_DOCS.adminRecordings}) documents no storage location or retention field; ${recordingItems.length} recordings were inventoried (${deletedRecordings.length} in deleted status). Export Control Hub retention settings for recordings and messaging.${partialNote(recordings, "recordings")}`,
+      { recordings_seen: recordingItems.length, deleted_recordings: deletedRecordings.length, recordings_truncated: recordings.truncated, citation: WEBEX_DOCS.adminRecordings });
+
+  const roomItems = surfaceItems(rooms);
+  const roomsWithoutClassification = roomItems.filter((room) => !asString(room.classificationId));
+  let classificationFinding: WebexFinding;
+  if (!rooms.ok) {
+    classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", "manual",
+      deniedSummary("rooms", "/rooms", rooms, "the Control Hub space classification settings"), { citation: WEBEX_DOCS.roomsList });
+  } else if (roomItems.length === 0) {
+    classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", "manual",
+      "Manual: GET /rooms lists only spaces the token is a member of and returned none; confirm classification enforcement in Control Hub.",
+      { rooms_seen: 0, citation: WEBEX_DOCS.roomsList });
+  } else if (roomsWithoutClassification.length === 0) {
+    classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", rooms.truncated || tokenType === "bot" ? "warn" : "pass",
+      `All ${roomItems.length} spaces visible to this token carry a classificationId. GET /rooms only lists spaces the token is a member of, so this is the credential's view, not the whole org.${tokenType === "bot" ? " A bot token sees only its own spaces, so the view is partial." : ""}${partialNote(rooms, "rooms")}`,
+      { rooms_seen: roomItems.length, rooms_truncated: rooms.truncated, token_type: tokenType });
+  } else {
+    classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", "fail",
+      `${roomsWithoutClassification.length} of ${roomItems.length} visible spaces have no classificationId.${partialNote(rooms, "rooms")}`,
+      { rooms_seen: roomItems.length, rooms_without_classification: roomsWithoutClassification.slice(0, 25).map((room) => asString(room.title) ?? asString(room.id)), rooms_truncated: rooms.truncated });
+  }
+
+  const webhookItems = surfaceItems(webhooks);
+  const insecureWebhooks = webhookItems.filter((webhook) => {
+    const targetUrl = asString(webhook.targetUrl) ?? "";
+    return !targetUrl.startsWith("https://") || !asString(webhook.secret);
   });
-  const insecureWebhooks = webhooks.filter((webhook) => {
-    const targetUrl = asString(webhook.targetUrl) ?? asString(webhook.url) ?? "";
-    const secret = asString(webhook.secret);
-    return !targetUrl.startsWith("https://") || !secret;
-  });
-  const adminAuditEvents = events.filter((event) => {
-    const text = JSON.stringify(event).toLowerCase();
-    return text.includes("admin") || text.includes("role") || text.includes("compliance");
-  });
+  const inactiveWebhooks = webhookItems.filter((webhook) => asString(webhook.status) === "inactive");
+  let webhookFinding: WebexFinding;
+  if (!webhooks.ok) {
+    webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "manual",
+      deniedSummary("webhooks", "/webhooks", webhooks, "the webhook list from each integration owner"), { citation: WEBEX_DOCS.webhooksList });
+  } else if (webhookItems.length === 0) {
+    webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "manual",
+      "Manual: no webhooks are visible to this token (GET /webhooks lists only the caller's webhooks); collect webhook inventories from integration owners.",
+      { webhooks_seen: 0, citation: WEBEX_DOCS.webhooksList });
+  } else if (insecureWebhooks.length === 0) {
+    webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", webhooks.truncated || tokenType === "bot" ? "warn" : "pass",
+      `All ${webhookItems.length} webhooks visible to this token use https targetUrl values and have a secret (${inactiveWebhooks.length} inactive).${tokenType === "bot" ? " A bot token sees only its own webhooks, so the view is partial." : ""}${partialNote(webhooks, "webhooks")}`,
+      { webhooks_seen: webhookItems.length, inactive_webhooks: inactiveWebhooks.length, webhooks_truncated: webhooks.truncated, token_type: tokenType });
+  } else {
+    webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "fail",
+      `${insecureWebhooks.length} of ${webhookItems.length} visible webhooks lack an https targetUrl or a secret.${partialNote(webhooks, "webhooks")}`,
+      { insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: asString(item.targetUrl) })), webhooks_seen: webhookItems.length });
+  }
 
-  const totalAssignedLicenses = licenses.reduce((count, license) => count + (asNumber(firstDefined(license, [
-    ["consumedUnits"],
-    ["assigned"],
-    ["consumed"],
-  ])) ?? 0), 0);
-  const totalAvailableLicenses = licenses.reduce((count, license) => count + (asNumber(firstDefined(license, [
-    ["totalUnits"],
-    ["capacity"],
-    ["total"],
-  ])) ?? 0), 0);
-  const unassignedLicenses = Math.max(totalAvailableLicenses - totalAssignedLicenses, 0);
-  const unassignedRatio = totalAvailableLicenses > 0 ? unassignedLicenses / totalAvailableLicenses : 0;
+  const licenseItems = surfaceItems(licenses);
+  const totalUnits = licenseItems.reduce((count, license) => count + (asNumber(license.totalUnits) ?? 0), 0);
+  const consumedUnits = licenseItems.reduce((count, license) => count + (asNumber(license.consumedUnits) ?? 0), 0);
+  const unassigned = Math.max(totalUnits - consumedUnits, 0);
+  const unassignedRatio = totalUnits > 0 ? unassigned / totalUnits : 0;
+  let licenseFinding: WebexFinding;
+  if (!licenses.ok) {
+    licenseFinding = finding("WEBEX-COLLAB-06", [24], "License utilization review", "low", "manual",
+      deniedSummary("licenses", "/licenses", licenses, "the Control Hub subscriptions and license usage report"), { citation: WEBEX_DOCS.licensesList, token_type: tokenType });
+  } else if (licenseItems.length === 0 || totalUnits === 0) {
+    licenseFinding = finding("WEBEX-COLLAB-06", [24], "License utilization review", "low", "manual",
+      "Manual: GET /licenses returned no licenses with totalUnits; a paid org always has licenses, so confirm scope and org selection.",
+      { licenses_seen: licenseItems.length, citation: WEBEX_DOCS.licensesList });
+  } else {
+    licenseFinding = finding("WEBEX-COLLAB-06", [24], "License utilization review", "low",
+      unassignedRatio <= 0.2 ? (licenses.truncated ? "warn" : "pass") : "warn",
+      `${unassigned} of ${totalUnits} license units are unassigned (${Math.round(unassignedRatio * 100)}%, threshold 20%) across ${licenseItems.length} licenses.${partialNote(licenses, "licenses")}`,
+      { total_units: totalUnits, consumed_units: consumedUnits, unassigned_units: unassigned, licenses_seen: licenseItems.length, licenses_truncated: licenses.truncated });
+  }
 
-  const findings = [
-    finding(
-      "WEBEX-COLLAB-01",
-      "External communications restrictions",
-      "high",
-      orgId ? (externalRestricted && guestRestricted ? "pass" : "warn") : "warn",
+  const auditItems = surfaceItems(adminAudit);
+  const datedAudit = auditItems.filter((item) => asDate(item.created));
+  let auditFinding: WebexFinding;
+  if (!adminAudit.ok) {
+    auditFinding = finding("WEBEX-COLLAB-07", [25], "Admin activity audit visibility", "high", "manual",
       orgId
-        ? (externalRestricted && guestRestricted
-          ? "External communications and guest access controls appeared restricted."
-          : "External communications or guest access controls did not appear tightly restricted.")
-        : note,
-      ["FedRAMP AC-4", "SOC 2 CC6.6", "PCI-DSS 1.3.7", "CIS 13.4"],
-      { org_id: orgId ?? null, external_restricted: externalRestricted, guest_restricted: guestRestricted },
-    ),
-    finding(
-      "WEBEX-COLLAB-02",
-      "File sharing and DLP controls",
-      "high",
-      orgId ? (fileControlsEnabled ? "pass" : "warn") : "warn",
-      orgId
-        ? (fileControlsEnabled
-          ? "File sharing restrictions or DLP-style controls were visible."
-          : "File sharing restrictions or DLP-style controls were not clearly visible.")
-        : note,
-      ["FedRAMP AC-4(1)", "SOC 2 CC6.7", "PCI-DSS 1.3.7", "CIS 13.4"],
-      { org_id: orgId ?? null, file_controls_enabled: fileControlsEnabled },
-    ),
-    finding(
-      "WEBEX-COLLAB-03",
-      "Recording storage and retention governance",
-      "medium",
-      riskyRecordings.length === 0 && retentionConfigured ? "pass" : riskyRecordings.length > 0 ? "fail" : "warn",
-      riskyRecordings.length === 0 && retentionConfigured
-        ? "Sampled recordings appeared organization-controlled and retention settings were visible."
-        : `${riskyRecordings.length} sampled recordings appeared outside org-controlled storage or retention settings were not clearly visible.`,
-      ["FedRAMP SC-28", "FedRAMP SI-12", "SOC 2 CC6.7", "PCI-DSS 3.4.1"],
-      { risky_recordings: riskyRecordings.slice(0, 25).map((item) => asString(item.id)), retention_configured: retentionConfigured },
-    ),
-    finding(
-      "WEBEX-COLLAB-04",
-      "Room classification and retention coverage",
-      "medium",
-      rooms.length === 0 || roomsWithoutClassification.length === 0 ? "pass" : "warn",
-      rooms.length === 0 || roomsWithoutClassification.length === 0
-        ? "Sampled rooms exposed classification coverage or there were no rooms in scope."
-        : `${roomsWithoutClassification.length}/${rooms.length} sampled rooms lacked visible classification labels.`,
-      ["FedRAMP AC-16", "SOC 2 CC6.7", "PCI-DSS 9.6.1", "CIS 14.1"],
-      { sampled_rooms: rooms.length, rooms_without_classification: roomsWithoutClassification.slice(0, 25).map(roomName) },
-    ),
-    finding(
-      "WEBEX-COLLAB-05",
-      "Webhook transport and admin audit visibility",
-      "high",
-      insecureWebhooks.length === 0 && adminAuditEvents.length > 0 ? "pass" : insecureWebhooks.length > 0 ? "fail" : "warn",
-      insecureWebhooks.length === 0 && adminAuditEvents.length > 0
-        ? "All sampled webhooks used HTTPS with secrets and admin activity events were visible."
-        : `${insecureWebhooks.length} sampled webhooks were missing HTTPS or a secret, or admin audit events were not visible.`,
-      ["FedRAMP AU-12", "FedRAMP SC-8(1)", "SOC 2 CC7.2", "PCI-DSS 10.2.2"],
-      { insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => asString(item.id)), admin_audit_events: adminAuditEvents.length },
-    ),
-    finding(
-      "WEBEX-COLLAB-06",
-      "License utilization review",
-      "low",
-      totalAvailableLicenses === 0 || unassignedRatio <= 0.2 ? "pass" : "warn",
-      totalAvailableLicenses === 0 || unassignedRatio <= 0.2
-        ? "License assignment looked reasonably utilized in the sampled inventory."
-        : `${unassignedLicenses}/${totalAvailableLicenses} sampled licenses were unassigned, above the 20% review threshold.`,
-      ["FedRAMP CM-8", "SOC 2 CC6.8", "PCI-DSS 2.4", "CIS 1.1"],
-      { total_available_licenses: totalAvailableLicenses, total_assigned_licenses: totalAssignedLicenses, unassigned_licenses: unassignedLicenses },
-    ),
-  ];
+        ? deniedSummary("admin audit events", "/adminAudit/events", adminAudit, "a Control Hub admin audit log export (audit:events_read scope required)")
+        : `Manual: ${note}`,
+      { citation: WEBEX_DOCS.adminAuditEvents, token_type: tokenType });
+  } else if (auditItems.length === 0) {
+    auditFinding = finding("WEBEX-COLLAB-07", [25], "Admin activity audit visibility", "high", "warn",
+      `GET /adminAudit/events returned no events in the last ${ADMIN_AUDIT_WINDOW_DAYS} days; confirm the log is populated and reviewed (an active org normally records admin activity).`,
+      { events_seen: 0, window_days: ADMIN_AUDIT_WINDOW_DAYS });
+  } else {
+    auditFinding = finding("WEBEX-COLLAB-07", [25], "Admin activity audit visibility", "high", adminAudit.truncated ? "warn" : "pass",
+      `${auditItems.length} admin audit events (${datedAudit.length} with a created timestamp) were readable for the last ${ADMIN_AUDIT_WINDOW_DAYS} days; attach the review record.${partialNote(adminAudit, "admin audit events")}`,
+      { events_seen: auditItems.length, events_with_dates: datedAudit.length, undated_events: auditItems.length - datedAudit.length, window_days: ADMIN_AUDIT_WINDOW_DAYS, events_truncated: adminAudit.truncated });
+  }
 
+  const ediscoveryFinding = finding("WEBEX-COLLAB-08", [11], "eDiscovery and legal hold capability", "high", "manual",
+    `Manual: the compliance guide (${WEBEX_DOCS.complianceGuide}) states the eDiscovery report is available through Control Hub and documents no API for eDiscovery or legal hold configuration. Events older than 90 days require Pro Pack. Export the Control Hub eDiscovery and legal hold configuration${events.ok ? `; ${surfaceItems(events).length} compliance events were readable as capability evidence` : `; GET /events was not readable (${events.error})`}.`,
+    { events_readable: events.ok, events_seen: surfaceItems(events).length, events_truncated: events.ok ? events.truncated : null, citation: WEBEX_DOCS.complianceGuide });
+
+  const findings = [externalFinding, fileDlpFinding, recordingFinding, classificationFinding, webhookFinding, licenseFinding, auditFinding, ediscoveryFinding];
   return {
     title: "Webex collaboration governance",
+    category: "collaboration-governance",
     summary: {
       org_id: orgId ?? null,
-      external_restricted: externalRestricted,
-      file_controls_enabled: fileControlsEnabled,
-      guest_restricted: guestRestricted,
-      risky_recordings: riskyRecordings.length,
-      retention_configured: retentionConfigured,
-      sampled_rooms: rooms.length,
+      token_type: tokenType,
+      rooms_seen: roomItems.length,
       rooms_without_classification: roomsWithoutClassification.length,
+      webhooks_seen: webhookItems.length,
       insecure_webhooks: insecureWebhooks.length,
-      admin_audit_events: adminAuditEvents.length,
-      unassigned_licenses: unassignedLicenses,
-      total_available_licenses: totalAvailableLicenses,
+      recordings_seen: recordingItems.length,
+      admin_audit_events: auditItems.length,
+      compliance_events: surfaceItems(events).length,
+      unassigned_license_units: unassigned,
+      total_license_units: totalUnits,
+      ...countStatuses(findings),
     },
     findings,
+    errors: surfaceErrors(surfaces),
+    rawData: surfaceRaw(surfaces),
   };
 }
 
 export async function assessWebexMeetingHybridSecurity(
-  client: Pick<
-    WebexApiClient,
-    "getResolvedConfig" | "listOrganizations" | "getAdminSettings" | "getMeetingPreferences" | "listMeetingSites" | "listMeetings" | "listHybridClusters" | "listHybridConnectors" | "listDevices" | "listWorkspaces"
-  >,
-  options: {
-    meetingLimit?: number;
-    deviceLimit?: number;
-  } = {},
+  client: WebexClientLike,
+  options: AssessmentOptions = {},
 ): Promise<WebexAssessmentResult> {
   const config = client.getResolvedConfig();
-  const meetingLimit = clampNumber(options.meetingLimit, DEFAULT_MEETING_LIMIT, 1, 10000);
-  const deviceLimit = clampNumber(options.deviceLimit, DEFAULT_DEVICE_LIMIT, 1, 10000);
+  const meetingLimit = clampNumber(options.meetingLimit, DEFAULT_MEETING_LIMIT, 1, 50_000);
+  const deviceLimit = clampNumber(options.deviceLimit, DEFAULT_DEVICE_LIMIT, 1, 50_000);
 
-  const orgs = await client.listOrganizations();
-  const { orgId, note } = deriveOrgContext(config, orgs);
-  const [adminSettings, meetingPreferences, meetingSites, meetings, hybridClusters, hybridConnectors, devices, workspaces] = await Promise.all([
-    orgId ? client.getAdminSettings(orgId).catch(() => ({})) : Promise.resolve({}),
-    client.getMeetingPreferences().catch(() => ({})),
-    client.listMeetingSites().catch(() => []),
-    client.listMeetings(meetingLimit).catch(() => []),
-    client.listHybridClusters().catch(() => []),
-    client.listHybridConnectors().catch(() => []),
-    client.listDevices(deviceLimit).catch(() => []),
-    client.listWorkspaces().catch(() => []),
+  const me = await collectObject(() => client.getMe());
+  const tokenType = detectTokenType(me.ok ? me.data : undefined);
+  const orgs = await collectPage(() => client.listOrganizations());
+  const { orgId } = deriveOrgContext(config, orgs);
+  const botDenied: SurfaceResult<JsonRecord[]> = { ok: false, error: "bot token cannot read admin surfaces", status: 403 };
+  const [meetingPreferences, meetingSites, meetings, hybridClusters, hybridConnectors, devices, workspaces] = await Promise.all([
+    collectObject(() => client.getMeetingPreferences()),
+    collectPage(() => client.listMeetingSites()),
+    collectPage(() => client.listMeetings(meetingLimit)),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listHybridClusters()),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listHybridConnectors()),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listDevices(deviceLimit)),
+    tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listWorkspaces()),
   ]);
+  const surfaces = { me, organizations: orgs, meeting_preferences: meetingPreferences, meeting_sites: meetingSites, meetings, hybrid_clusters: hybridClusters, hybrid_connectors: hybridConnectors, devices, workspaces };
 
-  const encryptionEnabled = orgSignalsEnabled(meetingPreferences, [
-    ["e2eeEnabled"],
-    ["encryption", "e2eeEnabled"],
-    ["meetingSecurity", "e2eeEnabled"],
-  ]) || orgSignalsEnabled(adminSettings, [
-    ["calling", "srtpRequired"],
-    ["calling", "encryptionRequired"],
-  ]);
+  const encryptionFinding = finding("WEBEX-MTG-01", [8, 22], "Meeting E2EE and calling SRTP defaults", "high", "manual",
+    `Manual: the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}) documents personalMeetingRoom, audio, video, schedulingOptions, and sites with no encryption field, and no public API exposes a Webex Calling SRTP setting, so calling SRTP (control 22) stays folded into this finding. Export the Control Hub meeting session type (E2EE) and calling security configuration.`,
+    { meeting_preferences_readable: meetingPreferences.ok, sites_seen: surfaceItems(meetingSites).map((site) => asString(site.siteUrl)), citation: WEBEX_DOCS.meetingPreferences });
 
-  const lobbyEnabled = orgSignalsEnabled(meetingPreferences, [
-    ["lobbyEnabled"],
-    ["meetingSecurity", "lobbyEnabled"],
-    ["join", "lobbyEnabled"],
-  ]) || meetingSites.some((site) => orgSignalsEnabled(site, [
-    ["lobbyEnabled"],
-    ["meetingSecurity", "lobbyEnabled"],
-  ]));
-  const passwordRequired = orgSignalsEnabled(meetingPreferences, [
-    ["passwordRequired"],
-    ["meetingSecurity", "passwordRequired"],
-    ["join", "passwordRequired"],
-  ]) || meetingSites.some((site) => orgSignalsEnabled(site, [
-    ["passwordRequired"],
-    ["meetingSecurity", "passwordRequired"],
-  ]));
+  const meetingItems = surfaceItems(meetings);
+  const sampledWithoutLobby = meetingItems.filter((meeting) => asString(meeting.unlockedMeetingJoinSecurity) === "allowJoin");
+  const sampledWithoutPassword = meetingItems.filter((meeting) => !asString(meeting.password));
+  const pmr = asObject(meetingPreferences.ok ? meetingPreferences.data.personalMeetingRoom : undefined);
+  const lobbyFinding = finding("WEBEX-MTG-02", [9, 10], "Meeting lobby and password defaults", "high", "manual",
+    `Manual: org-wide lobby and password defaults are Control Hub site settings not exposed by the meetings API (${WEBEX_DOCS.meetingsList}); ${meetingItems.length} meetings visible to this token were sampled (${sampledWithoutLobby.length} with unlockedMeetingJoinSecurity = allowJoin, ${sampledWithoutPassword.length} without a password). Export the Control Hub site security settings.${partialNote(meetings, "meetings")}`,
+    {
+      meetings_seen: meetingItems.length,
+      meetings_truncated: meetings.ok ? meetings.truncated : null,
+      sampled_allow_join_without_lobby: sampledWithoutLobby.length,
+      sampled_without_password: sampledWithoutPassword.length,
+      personal_meeting_room_auto_lock: pmr ? asObject(pmr)?.enabledAutoLock ?? null : null,
+      citation: WEBEX_DOCS.meetingsList,
+    });
 
-  const guestRestricted = orgSignalsDisabled(adminSettings, [
-    ["guestAccessEnabled"],
-    ["meetings", "guestAccessEnabled"],
-  ]) || orgSignalsEnabled(adminSettings, [
-    ["guestAccessRestricted"],
-    ["meetings", "guestAccessRestricted"],
-  ]);
-  const virtualBackgroundEnforced = orgSignalsEnabled(meetingPreferences, [
-    ["virtualBackgroundEnforced"],
-    ["video", "virtualBackgroundEnforced"],
-  ]);
+  const guestBackgroundFinding = finding("WEBEX-MTG-03", [13, 23], "Guest meeting access and virtual background policy", "medium", "manual",
+    `Manual: guest join policy and virtual background enforcement are Control Hub settings; the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}) exposes only the caller's video device preferences. Export the Control Hub meeting settings for guest join and virtual backgrounds.`,
+    { citation: WEBEX_DOCS.meetingPreferences });
 
-  const unhealthyClusters = hybridClusters.filter((cluster) => !/active|healthy|online/i.test(asString(firstDefined(cluster, [
-    ["status"],
-    ["state"],
-    ["health", "status"],
-  ])) ?? ""));
-  const inactiveConnectors = hybridConnectors.filter((connector) => !/active|connected|healthy/i.test(asString(firstDefined(connector, [
-    ["status"],
-    ["state"],
-    ["connectionStatus"],
-  ])) ?? ""));
+  const clusterItems = surfaceItems(hybridClusters);
+  const connectorItems = surfaceItems(hybridConnectors);
+  const nonOperational = connectorItems.filter((connector) => asString(connector.status) !== "operational");
+  const undatedConnectors = connectorItems.filter((connector) => !asDate(connector.createdAt));
+  let hybridFinding: WebexFinding;
+  if (!hybridClusters.ok || !hybridConnectors.ok) {
+    const denied = (!hybridClusters.ok ? hybridClusters : hybridConnectors) as { error: string; status?: number };
+    hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", "manual",
+      deniedSummary("hybrid services", !hybridClusters.ok ? "/hybrid/clusters" : "/hybrid/connectors", denied, "the Control Hub Hybrid Services status page"),
+      { citation: WEBEX_DOCS.hybridConnectors, token_type: tokenType });
+  } else if (clusterItems.length === 0 && connectorItems.length === 0) {
+    hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", "manual",
+      "Manual: no hybrid clusters or connectors are registered; confirm in Control Hub that hybrid services are not deployed, in which case controls 15 and 16 are not applicable.",
+      { clusters_seen: 0, connectors_seen: 0 });
+  } else if (nonOperational.length === 0 && connectorItems.length > 0) {
+    hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high",
+      hybridClusters.truncated || hybridConnectors.truncated ? "warn" : "pass",
+      `All ${connectorItems.length} hybrid connectors across ${clusterItems.length} clusters report status = operational.${partialNote(hybridConnectors, "connectors")}`,
+      { clusters_seen: clusterItems.length, connectors_seen: connectorItems.length, connector_versions: [...new Set(connectorItems.map((item) => asString(item.version)).filter(Boolean))], undated_connectors: undatedConnectors.length });
+  } else if (connectorItems.length === 0) {
+    hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", "fail",
+      `${clusterItems.length} hybrid clusters are registered but no connectors report status, so nothing demonstrates the clusters are healthy.`,
+      { clusters_seen: clusterItems.length, connectors_seen: 0 });
+  } else {
+    hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", "fail",
+      `${nonOperational.length} of ${connectorItems.length} hybrid connectors are not operational.${partialNote(hybridConnectors, "connectors")}`,
+      { non_operational: nonOperational.slice(0, 25).map((item) => ({ id: asString(item.id), type: asString(item.type), status: asString(item.status) ?? null })), connectors_seen: connectorItems.length, clusters_seen: clusterItems.length });
+  }
 
-  const outdatedDevices = devices.filter((device) => /eol|unsupported|outdated/i.test(asString(firstDefined(device, [
-    ["firmwareStatus"],
-    ["status", "firmware"],
-    ["software", "status"],
-  ])) ?? ""));
-  const unmanagedDevices = devices.filter((device) => {
-    const managedValue = firstDefined(device, [
-      ["managed"],
-      ["management", "managed"],
-      ["isManaged"],
-    ]);
-    return managedValue !== undefined && asBoolean(managedValue) === false;
-  });
+  const deviceItems = surfaceItems(devices);
+  const personalModeDevices = deviceItems.filter((device) => asString(device.personId));
+  const softwareVersions = [...new Set(deviceItems.map((item) => asString(item.software)).filter(Boolean))];
+  const deviceFinding = !devices.ok
+    ? finding("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", "manual",
+      deniedSummary("devices", "/devices", devices, "the Control Hub device inventory with software versions"), { citation: WEBEX_DOCS.devicesList, token_type: tokenType })
+    : finding("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", "manual",
+      `Manual: the devices reference (${WEBEX_DOCS.devicesList}) documents software, upgradeChannel, connectionStatus, managedBy, personId, and workspaceId but no end-of-life flag or device-blocking policy; ${deviceItems.length} devices were inventoried (${personalModeDevices.length} assigned to a person, ${softwareVersions.length} distinct software versions, ${surfaceItems(workspaces).length} workspaces). Compare the versions against Cisco RoomOS release notes and export the Control Hub device activation policy.${partialNote(devices, "devices")}`,
+      {
+        devices_seen: deviceItems.length,
+        devices_truncated: devices.truncated,
+        personal_mode_devices: personalModeDevices.length,
+        software_versions: softwareVersions.slice(0, 50),
+        managed_by: [...new Set(deviceItems.map((item) => asString(item.managedBy)).filter(Boolean))],
+        workspaces_seen: surfaceItems(workspaces).length,
+        citation: WEBEX_DOCS.devicesList,
+      });
 
-  const meetingsWithoutGuards = meetings.filter((meeting) =>
-    !orgSignalsEnabled(meeting, [["lobbyEnabled"], ["security", "lobbyEnabled"]])
-    || !orgSignalsEnabled(meeting, [["passwordRequired"], ["security", "passwordRequired"]]),
-  );
-
-  const findings = [
-    finding(
-      "WEBEX-MTG-01",
-      "Meeting and calling encryption defaults",
-      "high",
-      encryptionEnabled ? "pass" : "warn",
-      encryptionEnabled
-        ? "Meeting or calling encryption controls appeared enabled by default."
-        : "Meeting or calling encryption controls were not clearly visible as enabled by default.",
-      ["FedRAMP SC-8(1)", "SOC 2 CC6.7", "PCI-DSS 4.1", "CIS 14.4"],
-      { encryption_enabled: encryptionEnabled },
-    ),
-    finding(
-      "WEBEX-MTG-02",
-      "Lobby and password defaults",
-      "high",
-      lobbyEnabled && passwordRequired ? "pass" : "fail",
-      lobbyEnabled && passwordRequired
-        ? "Meeting preferences exposed both lobby and password defaults."
-        : "Meeting preferences did not clearly expose both lobby and password defaults as enabled.",
-      ["FedRAMP AC-3", "FedRAMP IA-5", "SOC 2 CC6.1", "PCI-DSS 8.2.3"],
-      { lobby_enabled: lobbyEnabled, password_required: passwordRequired, sampled_meetings_without_guards: meetingsWithoutGuards.length },
-    ),
-    finding(
-      "WEBEX-MTG-03",
-      "Guest and virtual background governance",
-      "medium",
-      guestRestricted && virtualBackgroundEnforced ? "pass" : guestRestricted ? "warn" : "fail",
-      guestRestricted && virtualBackgroundEnforced
-        ? "Guest meeting access appeared restricted and virtual backgrounds were enforced."
-        : "Guest meeting access or virtual background governance was not fully visible.",
-      ["FedRAMP AC-14", "SOC 2 CC6.1", "PCI-DSS 7.1.3", "CIS 16.7"],
-      { guest_restricted: guestRestricted, virtual_background_enforced: virtualBackgroundEnforced },
-    ),
-    finding(
-      "WEBEX-MTG-04",
-      "Hybrid cluster and connector health",
-      "high",
-      unhealthyClusters.length === 0 && inactiveConnectors.length === 0 ? "pass" : unhealthyClusters.length > 0 ? "fail" : "warn",
-      unhealthyClusters.length === 0 && inactiveConnectors.length === 0
-        ? "All sampled hybrid clusters and connectors appeared healthy."
-        : `${unhealthyClusters.length} clusters or ${inactiveConnectors.length} connectors appeared unhealthy or inactive.`,
-      ["FedRAMP CM-8", "FedRAMP SI-4", "SOC 2 CC7.1", "PCI-DSS 10.6"],
-      { unhealthy_clusters: unhealthyClusters.slice(0, 25).map((item) => asString(item.id)), inactive_connectors: inactiveConnectors.slice(0, 25).map((item) => asString(item.id)) },
-    ),
-    finding(
-      "WEBEX-MTG-05",
-      "Device firmware and management posture",
-      "high",
-      outdatedDevices.length === 0 && unmanagedDevices.length === 0 ? "pass" : outdatedDevices.length > 0 ? "fail" : "warn",
-      outdatedDevices.length === 0 && unmanagedDevices.length === 0
-        ? `Sampled devices and ${workspaces.length} workspaces did not expose firmware or management issues.`
-        : `${outdatedDevices.length} devices appeared outdated and ${unmanagedDevices.length} devices appeared unmanaged.`,
-      ["FedRAMP SI-2", "FedRAMP CM-8(3)", "SOC 2 CC6.8", "PCI-DSS 6.2"],
-      { outdated_devices: outdatedDevices.slice(0, 25).map((item) => asString(item.id)), unmanaged_devices: unmanagedDevices.slice(0, 25).map((item) => asString(item.id)), workspaces: workspaces.length },
-    ),
-  ];
-
+  const findings = [encryptionFinding, lobbyFinding, guestBackgroundFinding, hybridFinding, deviceFinding];
   return {
     title: "Webex meeting and hybrid security",
+    category: "meeting-hybrid-security",
     summary: {
       org_id: orgId ?? null,
-      encryption_enabled: encryptionEnabled,
-      lobby_enabled: lobbyEnabled,
-      password_required: passwordRequired,
-      guest_restricted: guestRestricted,
-      virtual_background_enforced: virtualBackgroundEnforced,
-      unhealthy_clusters: unhealthyClusters.length,
-      inactive_connectors: inactiveConnectors.length,
-      outdated_devices: outdatedDevices.length,
-      unmanaged_devices: unmanagedDevices.length,
-      sampled_meetings_without_guards: meetingsWithoutGuards.length,
-      workspaces: workspaces.length,
+      token_type: tokenType,
+      meetings_seen: meetingItems.length,
+      hybrid_clusters: clusterItems.length,
+      hybrid_connectors: connectorItems.length,
+      non_operational_connectors: nonOperational.length,
+      devices_seen: deviceItems.length,
+      workspaces_seen: surfaceItems(workspaces).length,
+      ...countStatuses(findings),
     },
     findings,
+    errors: surfaceErrors(surfaces),
+    rawData: surfaceRaw(surfaces),
   };
 }
 
@@ -1212,7 +1492,7 @@ function formatAccessCheckText(result: WebexAccessCheckResult): string {
   const rows = result.surfaces.map((surfaceItem) => [
     surfaceItem.name,
     surfaceItem.status,
-    surfaceItem.count === undefined ? "-" : String(surfaceItem.count),
+    surfaceItem.count === undefined ? "-" : `${surfaceItem.count}${surfaceItem.truncated ? "+" : ""}`,
     surfaceItem.error ? surfaceItem.error.replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
 
@@ -1246,107 +1526,100 @@ function formatAssessmentText(result: WebexAssessmentResult): string {
     summary,
     "",
     formatTable(["Control", "Severity", "Status", "Title", "Summary"], rows),
+    ...(result.errors.length > 0 ? ["", "Collection errors:", ...result.errors.map((item) => `- ${item}`)] : []),
   ].join("\n");
 }
 
-function buildExecutiveSummary(config: WebexResolvedConfig, assessments: WebexAssessmentResult[]): string {
+function buildExecutiveSummary(config: WebexResolvedConfig, assessments: WebexAssessmentResult[], errors: string[]): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const failCount = findings.filter((item) => item.status === "fail").length;
-  const warnCount = findings.filter((item) => item.status === "warn").length;
-  const passCount = findings.filter((item) => item.status === "pass").length;
+  const counts = countStatuses(findings);
+  const prioritized = [...findings]
+    .filter((item) => item.status !== "pass")
+    .sort((left, right) => statusRank(left.status) - statusRank(right.status))
+    .slice(0, 12);
 
   return [
-    "# Webex Audit Bundle",
+    "# Webex Executive Summary",
     "",
     `Org: ${config.orgId ?? "auto / unspecified"}`,
     `Generated: ${new Date().toISOString()}`,
     "",
     "## Result Counts",
     "",
-    `- Failed controls: ${failCount}`,
-    `- Warning controls: ${warnCount}`,
-    `- Passing controls: ${passCount}`,
+    `- Fail: ${counts.fail}`,
+    `- Warn: ${counts.warn}`,
+    `- Manual: ${counts.manual}`,
+    `- Pass: ${counts.pass}`,
     "",
     "## Highest Priority Findings",
     "",
-    ...findings
-      .filter((item) => item.status !== "pass")
-      .slice(0, 10)
-      .map((item) => `- ${item.id} (${item.severity.toUpperCase()} / ${item.status.toUpperCase()}): ${item.summary}`),
+    ...(prioritized.length > 0
+      ? prioritized.map((item) => `- ${item.id} (${item.severity.toUpperCase()} / ${item.status.toUpperCase()}): ${item.summary}`)
+      : ["- No failing, warning, or manual findings were generated."]),
+    ...(errors.length > 0 ? ["", "## Partial Collection Warnings", "", ...errors.map((item) => `- ${item}`)] : []),
+    "",
   ].join("\n");
 }
 
-function buildControlMatrix(findings: WebexFinding[]): string {
+function buildUnifiedMatrix(findings: WebexFinding[]): string {
+  const keys = Object.keys(WEBEX_FRAMEWORK_LABELS) as WebexFrameworkKey[];
   const rows = findings.map((item) => [
     item.id,
-    item.severity.toUpperCase(),
+    item.control.join(", "),
     item.status.toUpperCase(),
-    item.title,
-    item.mappings.join(", "),
+    ...keys.map((key) => item.frameworks[key].join(", ") || "-"),
   ]);
+  return `${["# Webex Unified Compliance Matrix", "", formatTable(["Finding", "Spec control", "Status", ...keys.map((key) => WEBEX_FRAMEWORK_LABELS[key])], rows)].join("\n")}\n`;
+}
+
+function buildFrameworkReport(key: WebexFrameworkKey, findings: WebexFinding[]): string {
+  const mapped = findings.filter((item) => item.frameworks[key].length > 0);
+  const rows = mapped.map((item) => [item.frameworks[key].join(", "), item.id, item.status.toUpperCase(), item.title, item.summary]);
   return [
-    "# Webex Control Matrix",
+    `# ${WEBEX_FRAMEWORK_LABELS[key]} Compliance Report (Webex)`,
     "",
-    formatTable(["Control", "Severity", "Status", "Title", "Mappings"], rows),
+    `${mapped.length} findings map to ${WEBEX_FRAMEWORK_LABELS[key]}. Manual findings require exported Control Hub evidence before asserting compliance.`,
+    "",
+    formatTable(["Requirement", "Finding", "Status", "Title", "Summary"], rows),
+    "",
   ].join("\n");
 }
 
-function buildBundleReadme(): string {
+function buildQuickReference(): string {
   return [
-    "# Webex Evidence Bundle",
+    "# Webex Audit Bundle Quick Reference",
     "",
-    "This bundle was generated by grclanker's native Webex tools.",
+    "- `core_data/` contains raw Webex API responses with tokens, secrets, and passwords redacted.",
+    "- `analysis/` contains normalized findings and per-category summaries.",
+    "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
+    "- `_errors.log` appears only when some reads fail but the bundle still completes.",
+    "- Manual findings name the Control Hub evidence a reviewer must export; they never count as pass.",
     "",
-    "## Contents",
+    "Recommended reading order:",
+    "1. `compliance/executive_summary.md`",
+    "2. `compliance/unified_compliance_matrix.md`",
+    "3. framework-specific report matching your engagement",
+    "4. `analysis/*.json` for the supporting evidence behind each finding",
     "",
-    "- `summary.md`: combined human-readable assessment output",
-    "- `reports/executive-summary.md`: prioritized audit summary",
-    "- `reports/control-matrix.md`: framework mapping matrix",
-    "- `reports/*.md`: per-assessment markdown reports",
-    "- `analysis/*.json`: normalized findings and assessment details",
-    "- `core_data/access.json`: accessible Webex audit surface inventory",
-    "- `metadata.json`: non-secret run metadata",
-    "",
-    "Credentials are never written into the bundle.",
   ].join("\n");
 }
+
+const FRAMEWORK_REPORT_PATHS: Record<WebexFrameworkKey, string> = {
+  fedramp: "compliance/fedramp/fedramp_compliance_report.md",
+  cmmc: "compliance/cmmc/cmmc_compliance_report.md",
+  soc2: "compliance/soc2/soc2_compliance_report.md",
+  cis: "compliance/cis/cis_controls_report.md",
+  pci_dss: "compliance/pci_dss/pci_dss_compliance_report.md",
+  disa_stig: "compliance/disa_stig/stig_compliance_checklist.md",
+  irap: "compliance/irap/irap_compliance_report.md",
+  ismap: "compliance/ismap/ismap_compliance_report.md",
+};
 
 export async function exportWebexAuditBundle(
-  client: Pick<
-    WebexApiClient,
-    | "getResolvedConfig"
-    | "getMe"
-    | "listOrganizations"
-    | "listPeople"
-    | "listRoles"
-    | "getAdminSettings"
-    | "getSecuritySettings"
-    | "listEvents"
-    | "listRecordings"
-    | "listRooms"
-    | "listWebhooks"
-    | "listLicenses"
-    | "getMeetingPreferences"
-    | "listMeetingSites"
-    | "listMeetings"
-    | "listHybridClusters"
-    | "listHybridConnectors"
-    | "listDevices"
-    | "listWorkspaces"
-  >,
+  client: WebexClientLike,
   config: WebexResolvedConfig,
   outputRoot: string,
-  options: {
-    peopleLimit?: number;
-    maxAdmins?: number;
-    eventLimit?: number;
-    recordingLimit?: number;
-    webhookLimit?: number;
-    licenseLimit?: number;
-    roomLimit?: number;
-    meetingLimit?: number;
-    deviceLimit?: number;
-  } = {},
+  options: AssessmentOptions = {},
 ): Promise<WebexAuditBundleResult> {
   const access = await checkWebexAccess(client);
   const identity = await assessWebexIdentity(client, options);
@@ -1354,44 +1627,46 @@ export async function exportWebexAuditBundle(
   const meetingHybrid = await assessWebexMeetingHybridSecurity(client, options);
   const assessments = [identity, collaboration, meetingHybrid];
   const findings = assessments.flatMap((assessment) => assessment.findings);
+  const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((item) => `${assessment.category}: ${item}`)))];
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(
     outputRoot,
-    `${safeDirName(config.orgId ?? "webex-org")}-audit-bundle`,
+    `${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`,
   );
 
-  await writeSecureTextFile(outputDir, "README.md", `${buildBundleReadme()}\n`);
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
     generated_at: new Date().toISOString(),
-    org_id: config.orgId ?? null,
+    org_id: config.orgId ?? access.orgId ?? null,
+    token_type: access.tokenType,
     source_chain: config.sourceChain,
+    config_file: config.configFile ? basename(config.configFile) : null,
   }));
-  await writeSecureTextFile(
-    outputDir,
-    "summary.md",
-    [
-      formatAccessCheckText(access),
-      "",
-      formatAssessmentText(identity),
-      "",
-      formatAssessmentText(collaboration),
-      "",
-      formatAssessmentText(meetingHybrid),
-    ].join("\n"),
-  );
-  await writeSecureTextFile(outputDir, "reports/executive-summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
-  await writeSecureTextFile(outputDir, "reports/control-matrix.md", `${buildControlMatrix(findings)}\n`);
-  await writeSecureTextFile(outputDir, "reports/identity.md", `${formatAssessmentText(identity)}\n`);
-  await writeSecureTextFile(outputDir, "reports/collaboration-governance.md", `${formatAssessmentText(collaboration)}\n`);
-  await writeSecureTextFile(outputDir, "reports/meeting-hybrid-security.md", `${formatAssessmentText(meetingHybrid)}\n`);
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/collaboration-governance.json", serializeJson(collaboration));
-  await writeSecureTextFile(outputDir, "analysis/meeting-hybrid-security.json", serializeJson(meetingHybrid));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  for (const assessment of assessments) {
+    for (const [name, value] of Object.entries(assessment.rawData)) {
+      await writeSecureTextFile(outputDir, `core_data/${assessment.category}/${name}.json`, serializeJson(value));
+    }
+    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+      title: assessment.title,
+      category: assessment.category,
+      summary: assessment.summary,
+      findings: assessment.findings,
+      errors: assessment.errors,
+    }));
+  }
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  for (const key of Object.keys(FRAMEWORK_REPORT_PATHS) as WebexFrameworkKey[]) {
+    await writeSecureTextFile(outputDir, FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
+  }
+  if (errors.length > 0) {
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+  }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${safeDirName(config.orgId ?? "webex-org")}-audit-bundle.zip`);
+  const zipPath = `${outputDir}.zip`;
   await createZipArchive(outputDir, zipPath);
 
   return {
@@ -1399,6 +1674,7 @@ export async function exportWebexAuditBundle(
     zipPath,
     fileCount: await countFilesRecursively(outputDir),
     findingCount: findings.length,
+    errorCount: errors.length,
   };
 }
 
@@ -1409,6 +1685,10 @@ function normalizeCheckAccessArgs(args: unknown): CheckAccessArgs {
     org_id: asString(value.org_id),
     base_url: asString(value.base_url),
     timeout_seconds: asNumber(value.timeout_seconds),
+    client_id: asString(value.client_id),
+    client_secret: asString(value.client_secret),
+    refresh_token: asString(value.refresh_token),
+    config_file: asString(value.config_file),
   };
 }
 
@@ -1446,23 +1726,36 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   const value = asObject(args) ?? {};
   return {
     ...normalizeIdentityArgs(args),
-    event_limit: asNumber(value.event_limit),
-    recording_limit: asNumber(value.recording_limit),
-    webhook_limit: asNumber(value.webhook_limit),
-    license_limit: asNumber(value.license_limit),
-    room_limit: asNumber(value.room_limit),
-    meeting_limit: asNumber(value.meeting_limit),
-    device_limit: asNumber(value.device_limit),
+    ...normalizeCollaborationArgs(args),
+    ...normalizeMeetingHybridArgs(args),
     output_dir: asString(value.output_dir) ?? asString(value.output),
   };
 }
 
+function assessmentOptions(args: ExportAuditBundleArgs): AssessmentOptions {
+  return {
+    peopleLimit: args.people_limit,
+    maxAdmins: args.max_admins,
+    eventLimit: args.event_limit,
+    recordingLimit: args.recording_limit,
+    webhookLimit: args.webhook_limit,
+    licenseLimit: args.license_limit,
+    roomLimit: args.room_limit,
+    meetingLimit: args.meeting_limit,
+    deviceLimit: args.device_limit,
+  };
+}
+
 function createClient(args: CheckAccessArgs): WebexApiClient {
-  return new WebexApiClient(resolveWebexConfiguration(args));
+  return new WebexApiClient(resolveWebexConfiguration(args as JsonRecord));
 }
 
 const authParams = {
-  token: Type.Optional(Type.String({ description: "Webex access token. Defaults to WEBEX_TOKEN." })),
+  token: Type.Optional(Type.String({ description: "Webex access token. Defaults to WEBEX_TOKEN, then the config file." })),
+  client_id: Type.Optional(Type.String({ description: "Integration or Service App client ID for the refresh_token grant. Defaults to WEBEX_CLIENT_ID." })),
+  client_secret: Type.Optional(Type.String({ description: "Integration or Service App client secret. Defaults to WEBEX_CLIENT_SECRET." })),
+  refresh_token: Type.Optional(Type.String({ description: "Integration or Service App refresh token. Defaults to WEBEX_REFRESH_TOKEN." })),
+  config_file: Type.Optional(Type.String({ description: "Config file path. Defaults to WEBEX_CONFIG_FILE, then ~/.config/webex-sec-inspector/config.{json,yaml,yml}." })),
   org_id: Type.Optional(Type.String({ description: "Webex organization ID. Defaults to WEBEX_ORG_ID or auto-detect when only one org is visible." })),
   base_url: Type.Optional(Type.String({ description: "Webex API base URL. Defaults to https://webexapis.com/v1." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
@@ -1473,7 +1766,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_check_access",
     label: "Check Webex audit access",
     description:
-      "Validate read-only Webex access across people, organizations, meetings, recordings, events, admin settings, hybrid, devices, and webhooks.",
+      "Validate read-only Webex access across people, organizations, roles, licenses, recordings, events, admin audit, hybrid, devices, workspaces, rooms, webhooks, and meetings, and report the token type.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {
@@ -1482,7 +1775,7 @@ export function registerWebexTools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "webex_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `Webex access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Webex access check failed: ${errorMessage(error)}`,
           { tool: "webex_check_access" },
         );
       }
@@ -1493,7 +1786,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_assess_identity",
     label: "Assess Webex identity posture",
     description:
-      "Assess Webex identity posture across SSO enforcement, admin MFA coverage, compliance-role assignment, and administrative privilege concentration.",
+      "Assess Webex identity posture across SSO enforcement, admin MFA, Compliance Officer assignment, administrative privilege concentration, bot inventory, and bot approval state.",
     parameters: Type.Object({
       ...authParams,
       people_limit: Type.Optional(Type.Number({ description: "Maximum people to inspect. Defaults to 1000.", default: 1000 })),
@@ -1502,14 +1795,11 @@ export function registerWebexTools(pi: any): void {
     prepareArguments: normalizeIdentityArgs,
     async execute(_toolCallId: string, args: IdentityArgs) {
       try {
-        const result = await assessWebexIdentity(createClient(args), {
-          peopleLimit: args.people_limit,
-          maxAdmins: args.max_admins,
-        });
+        const result = await assessWebexIdentity(createClient(args), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "webex_assess_identity", ...result });
       } catch (error) {
         return errorResult(
-          `Webex identity assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Webex identity assessment failed: ${errorMessage(error)}`,
           { tool: "webex_assess_identity" },
         );
       }
@@ -1520,7 +1810,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_assess_collaboration_governance",
     label: "Assess Webex collaboration governance",
     description:
-      "Assess Webex collaboration governance across external communications, file sharing and DLP, recording retention, room classification, webhook security, admin audit visibility, and license utilization.",
+      "Assess Webex collaboration governance across external communications, file sharing and DLP, recording governance, space classification, webhook security, license utilization, admin audit visibility, and eDiscovery capability.",
     parameters: Type.Object({
       ...authParams,
       event_limit: Type.Optional(Type.Number({ description: "Maximum events to inspect. Defaults to 500.", default: 500 })),
@@ -1532,17 +1822,11 @@ export function registerWebexTools(pi: any): void {
     prepareArguments: normalizeCollaborationArgs,
     async execute(_toolCallId: string, args: CollaborationArgs) {
       try {
-        const result = await assessWebexCollaborationGovernance(createClient(args), {
-          eventLimit: args.event_limit,
-          recordingLimit: args.recording_limit,
-          webhookLimit: args.webhook_limit,
-          licenseLimit: args.license_limit,
-          roomLimit: args.room_limit,
-        });
+        const result = await assessWebexCollaborationGovernance(createClient(args), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "webex_assess_collaboration_governance", ...result });
       } catch (error) {
         return errorResult(
-          `Webex collaboration governance assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Webex collaboration governance assessment failed: ${errorMessage(error)}`,
           { tool: "webex_assess_collaboration_governance" },
         );
       }
@@ -1553,7 +1837,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_assess_meeting_hybrid_security",
     label: "Assess Webex meeting and hybrid security",
     description:
-      "Assess Webex meeting and hybrid security across encryption defaults, lobby and password controls, guest governance, hybrid cluster health, and device management posture.",
+      "Assess Webex meeting and hybrid security across encryption defaults, lobby and password controls, guest and virtual background policy, hybrid connector health, and device inventory posture.",
     parameters: Type.Object({
       ...authParams,
       meeting_limit: Type.Optional(Type.Number({ description: "Maximum meetings to inspect. Defaults to 200.", default: 200 })),
@@ -1562,14 +1846,11 @@ export function registerWebexTools(pi: any): void {
     prepareArguments: normalizeMeetingHybridArgs,
     async execute(_toolCallId: string, args: MeetingHybridArgs) {
       try {
-        const result = await assessWebexMeetingHybridSecurity(createClient(args), {
-          meetingLimit: args.meeting_limit,
-          deviceLimit: args.device_limit,
-        });
+        const result = await assessWebexMeetingHybridSecurity(createClient(args), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "webex_assess_meeting_hybrid_security", ...result });
       } catch (error) {
         return errorResult(
-          `Webex meeting and hybrid assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Webex meeting and hybrid assessment failed: ${errorMessage(error)}`,
           { tool: "webex_assess_meeting_hybrid_security" },
         );
       }
@@ -1580,7 +1861,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_export_audit_bundle",
     label: "Export Webex audit bundle",
     description:
-      "Export a Webex audit package with access checks, identity findings, collaboration governance, meeting and hybrid security findings, markdown reports, JSON analysis, and a zip archive.",
+      "Export a Webex audit bundle with redacted core_data snapshots, analysis JSON, compliance reports per framework, a quick reference, and a zip archive named after the allocated output directory.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
@@ -1597,19 +1878,9 @@ export function registerWebexTools(pi: any): void {
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
       try {
-        const config = resolveWebexConfiguration(args);
+        const config = resolveWebexConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportWebexAuditBundle(new WebexApiClient(config), config, outputRoot, {
-          peopleLimit: args.people_limit,
-          maxAdmins: args.max_admins,
-          eventLimit: args.event_limit,
-          recordingLimit: args.recording_limit,
-          webhookLimit: args.webhook_limit,
-          licenseLimit: args.license_limit,
-          roomLimit: args.room_limit,
-          meetingLimit: args.meeting_limit,
-          deviceLimit: args.device_limit,
-        });
+        const result = await exportWebexAuditBundle(new WebexApiClient(config), config, outputRoot, assessmentOptions(args));
         return textResult(
           [
             "Webex audit bundle exported.",
@@ -1617,6 +1888,7 @@ export function registerWebexTools(pi: any): void {
             `Zip archive: ${result.zipPath}`,
             `Findings: ${result.findingCount}`,
             `Files: ${result.fileCount}`,
+            `Collection errors: ${result.errorCount}`,
           ].join("\n"),
           {
             tool: "webex_export_audit_bundle",
@@ -1624,11 +1896,12 @@ export function registerWebexTools(pi: any): void {
             zip_path: result.zipPath,
             finding_count: result.findingCount,
             file_count: result.fileCount,
+            error_count: result.errorCount,
           },
         );
       } catch (error) {
         return errorResult(
-          `Webex audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Webex audit bundle export failed: ${errorMessage(error)}`,
           { tool: "webex_export_audit_bundle" },
         );
       }
