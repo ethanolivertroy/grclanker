@@ -3353,12 +3353,13 @@ function assessWebhookSecurity(data: GitHubIntegrationsData): GitHubFinding {
   const repoHooksEvidence = (): string => {
     if (data.repositories.error) return nullEvidence("repo_webhooks", ORG_ENDPOINTS.repos, data.repositories.error);
     if (data.repoHooks.error) return nullEvidence("repo_webhooks", "GET /repos/{owner}/{repo}/hooks", data.repoHooks.error);
-    return `repo_webhooks = ${repoHookCount} across ${repoEntries.length - repoHooksUnreadable.length} readable repositories${repoHooksUnreadable.length > 0 ? ` (${repoHooksUnreadable.length} repositories unreadable: ${describeUnreadableRepos(repoHooksUnreadable, "hooks", 10)})` : ""}`;
+    return perRepoCountEvidence("repo_webhooks", repoHookCount, repoEntries.length, repoHooksUnreadable, "hooks");
   };
+  const repoHooksPartial = Boolean(data.repositories.error || data.repoHooks.error) || repoHooksUnreadable.length > 0;
   const evidence = [
     `org_webhooks = ${orgHooks.length}`,
     repoHooksEvidence(),
-    `webhooks_with_issues = ${issues.length}`,
+    `webhooks_with_issues = ${issues.length}${repoHooksPartial ? " among readable webhooks" : ""}`,
     ...issues.slice(0, 10).map((issue) => `${issue.location}: ${issue.problems.join("; ")}`),
   ];
   if (issues.length > 0) {
@@ -3420,6 +3421,21 @@ function describeUnreadableRepos(entries: Array<[string, GitHubRepoListEntry]>, 
   return `${shown.join("; ")}${remainder > 0 ? `; and ${remainder} more` : ""}`;
 }
 
+// A per-repository count is only a count while at least one repository answered; when every
+// repository was unreadable the total renders as null with the failures, not as 0 across 0.
+function perRepoCountEvidence(
+  field: string,
+  count: number,
+  total: number,
+  unreadable: Array<[string, GitHubRepoListEntry]>,
+  endpointSuffix: string,
+): string {
+  if (total > 0 && unreadable.length === total) {
+    return `${field} = null (GET /repos/{owner}/{repo}/${endpointSuffix} unreadable for all ${total} repositories: ${describeUnreadableRepos(unreadable, endpointSuffix, 10)})`;
+  }
+  return `${field} = ${count} across ${total - unreadable.length} readable repositories${unreadable.length > 0 ? ` (${unreadable.length} repositories unreadable: ${describeUnreadableRepos(unreadable, endpointSuffix, 10)})` : ""}`;
+}
+
 // Deploy key fields follow the REST deploy-key schema: read_only, created_at, last_used, title.
 function assessDeployKeys(data: GitHubIntegrationsData, now: number): GitHubFinding {
   const recommendation = "Remove write-capable deploy keys in favor of GitHub Apps or fine-grained tokens, and rotate or delete deploy keys older than a year.";
@@ -3462,14 +3478,18 @@ function assessDeployKeys(data: GitHubIntegrationsData, now: number): GitHubFind
     const created = Date.parse(asString(key.created_at) ?? "");
     return Number.isFinite(created) && created < staleCutoff;
   });
+  const allUnreadable = data.deployKeys.error !== undefined || (entries.length > 0 && unreadable.length === entries.length);
+  const keyCount = (field: string, value: number): string => (allUnreadable
+    ? `${field} = null (no repository's deploy keys were readable)`
+    : `${field} = ${value}${unreadable.length > 0 ? " among readable repositories" : ""}`);
   const evidence = [
     killSwitchEvidence,
     data.deployKeys.error
       ? nullEvidence("deploy_keys", "GET /repos/{owner}/{repo}/keys", data.deployKeys.error)
-      : `deploy_keys = ${allKeys.length} across ${entries.length - unreadable.length} readable repositories${unreadable.length > 0 ? ` (${unreadable.length} repositories unreadable: ${describeUnreadableRepos(unreadable, "keys", 10)})` : ""}`,
-    `write_capable_keys = ${writeKeys.length}`,
-    `keys_older_than_365_days = ${stale.length}`,
-    `keys_without_created_at = ${undated.length}`,
+      : perRepoCountEvidence("deploy_keys", allKeys.length, entries.length, unreadable, "keys"),
+    keyCount("write_capable_keys", writeKeys.length),
+    keyCount("keys_older_than_365_days", stale.length),
+    keyCount("keys_without_created_at", undated.length),
     ...writeKeys.slice(0, 10).map(({ repo, key }) => `${repo}: write key "${asString(key.title) ?? "untitled"}" created ${asString(key.created_at) ?? "unknown"}`),
     ...stale.slice(0, 10).map(({ repo, key }) => `${repo}: stale key "${asString(key.title) ?? "untitled"}" created ${asString(key.created_at) ?? "unknown"}, last_used ${asString(key.last_used) ?? "unknown"}`),
   ];
@@ -4023,10 +4043,16 @@ function coverageSummary(label: string, coverage: RepoCoverage): string {
   if (coverage.unevaluated.length === 0) {
     return `${coverage.compliant} of ${coverage.total} active repositories ${label}.`;
   }
+  if (coverage.evaluated === 0) {
+    return `No repository could be fully evaluated for whether they ${label} (${coverage.total} active); ${unevaluatedNote(coverage.unevaluated, UNEVALUATED_SUMMARY_LIMIT)}.`;
+  }
   return `${coverage.compliant} of ${coverage.evaluated} evaluated repositories (${coverage.total} active) ${label}; ${unevaluatedNote(coverage.unevaluated, UNEVALUATED_SUMMARY_LIMIT)}.`;
 }
 
 function coverageRatio(count: number, coverage: RepoCoverage): string {
+  if (coverage.total > 0 && coverage.evaluated === 0) {
+    return `null (no repository could be fully evaluated: ${coverage.total} active, ${coverage.unevaluated.length} not fully evaluated)`;
+  }
   return coverage.unevaluated.length > 0
     ? `${count}/${coverage.evaluated} evaluated (${coverage.total} active, ${coverage.unevaluated.length} not fully evaluated)`
     : `${count}/${coverage.total}`;
@@ -4071,6 +4097,7 @@ export function assessGitHubRepoProtection(
     .filter((posture) => !posture.evaluated)
     .map((posture) => describeUnevaluatedRepo(posture, repoByKey.get(posture.key) ?? {}));
   const nothingReadable = repoCount > 0 && postures.every((posture) => posture.rulesError !== null && posture.protectionError !== null);
+  const noneEvaluated = repoCount > 0 && evaluated.length === 0;
   const coverage = (compliant: number): RepoCoverage => ({ compliant, evaluated: evaluated.length, total: repoCount, unevaluated });
   const protectedCount = evaluated.filter((posture) => posture.requiresPullRequest && posture.blocksForcePush && posture.blocksDeletion).length;
   const adminEnforcedCount = evaluated.filter((posture) => posture.adminEnforced === true).length;
@@ -4089,7 +4116,7 @@ export function assessGitHubRepoProtection(
   const ratio = (count: number): string => coverageRatio(count, coverage(count));
 
   const unreadableEvidence = [
-    `repositories error = ${data.repositories.error}`,
+    nullEvidence("active_repositories", ORG_ENDPOINTS.repos, data.repositories.error),
   ];
   const unreadableNote = "Rerun with a principal that can list organization repositories (metadata read) or export the repository list from the org UI.";
 
@@ -4143,9 +4170,11 @@ export function assessGitHubRepoProtection(
         ? `${repoRuleCoveredCount} repositories receive repository-level rules, but no active organization rulesets exist.`
         : "No active organization rulesets exist and no evaluated default branch receives ruleset rules.";
     }
-    const base = unevaluated.length > 0
-      ? `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${evaluated.length} evaluated default branches (${repoCount} active) receive organization-sourced rules; ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`
-      : `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${repoCount} active default branches receive organization-sourced rules`;
+    const base = noneEvaluated
+      ? `${orgRulesets.length} active organization ruleset(s) exist but no default branch could be fully evaluated (${repoCount} active); ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`
+      : (unevaluated.length > 0
+        ? `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${evaluated.length} evaluated default branches (${repoCount} active) receive organization-sourced rules; ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`
+        : `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${repoCount} active default branches receive organization-sourced rules`);
     return `${base}.`;
   };
 
@@ -4183,7 +4212,7 @@ export function assessGitHubRepoProtection(
       protectedCount,
       [
         `protected_default_branches = ${ratio(protectedCount)}`,
-        `admin_enforced_legacy_protections = ${adminEnforcedCount}/${legacyCoveredCount}`,
+        `admin_enforced_legacy_protections = ${noneEvaluated ? "null (no repository could be fully evaluated)" : `${adminEnforcedCount}/${legacyCoveredCount}`}`,
         data.orgRulesets.error ? nullEvidence("org_rulesets", ORG_ENDPOINTS.rulesets, data.orgRulesets.error) : `org_rulesets = ${orgRulesets.length}`,
       ],
       "Require pull requests, block force pushes and deletions, and enforce the rules for administrators on every default branch.",
@@ -4230,7 +4259,7 @@ export function assessGitHubRepoProtection(
         `repos_requiring_code_owner_review = ${ratio(codeOwnerCount)}`,
         `repos_dismissing_stale_reviews = ${ratio(dismissStaleCount)}`,
         `repos_requiring_last_push_approval = ${ratio(lastPushApprovalCount)}`,
-        `repos_requiring_pull_request_without_review_count = ${evaluated.filter((posture) => posture.requiresPullRequest && posture.approvingReviewCount === 0).length}`,
+        `repos_requiring_pull_request_without_review_count = ${noneEvaluated ? "null (no repository could be fully evaluated)" : evaluated.filter((posture) => posture.requiresPullRequest && posture.approvingReviewCount === 0).length}`,
       ],
       "Set required_approving_review_count to at least 1 (2 for sensitive repositories), require code owner review, dismiss stale approvals, and require last-push approval.",
     ),

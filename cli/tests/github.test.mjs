@@ -1063,7 +1063,10 @@ test("repo protection findings never pass on unreadable or partially readable in
     assert.match(finding.summary, /GET \/repos\/example-org\/app-two\/rules\/branches\/main\) unreadable: GitHub request failed \(403\): forbidden/);
     assert.match(finding.summary, /GET \/repos\/example-org\/app-one\/branches\/main\/protection\) unreadable: GitHub request failed \(403\): branch protection requires admin/);
   }
-  assert.match(protectionDatasetFailed.findings.find((entry) => entry.id === "GITHUB-REPO-001").evidence.join("\n"), /repos_with_legacy_branch_protection = 0\/0 evaluated \(2 active, 2 not fully evaluated\)/);
+  const protectionDatasetFailedRepo001 = protectionDatasetFailed.findings.find((entry) => entry.id === "GITHUB-REPO-001");
+  assert.match(protectionDatasetFailedRepo001.evidence.join("\n"), /repos_with_legacy_branch_protection = null \(no repository could be fully evaluated: 2 active, 2 not fully evaluated\)/);
+  assert.doesNotMatch(protectionDatasetFailedRepo001.evidence.join("\n"), /= 0\/[02]/);
+  assert.match(protectionDatasetFailedRepo001.summary, /no default branch could be fully evaluated \(2 active\)/);
 
   const oneRepoProtectionForbidden = assessGitHubRepoProtection(createRepoProtectionData({
     branchProtections: dataset({
@@ -2369,28 +2372,52 @@ function sweepRestBody(surface, variant) {
   }
 }
 
+// First page of a paginated GraphQL connection that promises a second page (the second page is
+// then denied with an HTTP 403), so the whole snapshot fails mid-collection.
+function sweepGraphqlFirstPage(key, variant) {
+  const body = sweepGraphqlBody(key, variant);
+  const connection = key === "graphql:saml"
+    ? body.data.organization.samlIdentityProvider?.externalIdentities
+    : body.data.organization.ipAllowListEntries;
+  if (connection) {
+    connection.totalCount = connection.nodes.length + 3;
+    connection.pageInfo = { hasNextPage: true, endCursor: "cursor-1" };
+  }
+  return body;
+}
+
 function createSweepFetch({ variant = "A", deny = [], graphqlStyle = "http403", restStatus = 403 } = {}) {
   const denied = new Set(deny);
   const requests = [];
+  const deniedTargets = {};
+  const calls = {};
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
     const key = sweepInventoryKey(url, init);
     requests.push(key);
+    calls[key] = (calls[key] ?? 0) + 1;
     if (key.startsWith("graphql:")) {
-      return denied.has(key) ? sweepGraphqlDenied(key, graphqlStyle) : jsonResponse(sweepGraphqlBody(key, variant));
+      if (!denied.has(key)) return jsonResponse(sweepGraphqlBody(key, variant));
+      deniedTargets[key] = "POST /graphql";
+      if (graphqlStyle === "page2_http403") {
+        return calls[key] === 1 ? jsonResponse(sweepGraphqlFirstPage(key, variant)) : jsonResponse({ message: "Resource not accessible by integration" }, {}, 403);
+      }
+      return sweepGraphqlDenied(key, graphqlStyle);
     }
     if (denied.has(key)) {
+      const params = [...url.searchParams.entries()].filter(([name]) => name !== "per_page").map(([name, value]) => `${name}=${value}`);
+      deniedTargets[key] = `GET ${url.pathname}${params.length > 0 ? `?${params.join("&")}` : ""}`;
       return jsonResponse({ message: restStatus === 401 ? "Bad credentials" : "Resource not accessible by integration" }, {}, restStatus);
     }
     const body = sweepRestBody(key.split(":")[0], variant);
     if (body === null) return jsonResponse({ message: "Branch not protected" }, {}, 404);
     return jsonResponse(body);
   };
-  return { fetchImpl, requests };
+  return { fetchImpl, requests, deniedTargets };
 }
 
 async function runSweepScenario(options = {}) {
-  const { fetchImpl } = createSweepFetch(options);
+  const { fetchImpl, deniedTargets } = createSweepFetch(options);
   const client = new GitHubAuditorClient(SWEEP_CONFIG, fetchImpl);
   const [orgAccess, repoProtection, actions, codeSecurity, integrations] = await Promise.all([
     collectGitHubOrgAccessData(client, SWEEP_CONFIG),
@@ -2406,7 +2433,7 @@ async function runSweepScenario(options = {}) {
     assessGitHubCodeSecurity(codeSecurity, SWEEP_CONFIG),
     assessGitHubIntegrations(integrations, SWEEP_CONFIG),
   ].flatMap((assessment) => assessment.findings);
-  return { findings, byId: Object.fromEntries(findings.map((finding) => [finding.id, finding])) };
+  return { findings, byId: Object.fromEntries(findings.map((finding) => [finding.id, finding])), deniedTargets };
 }
 
 const SWEEP_BASELINE_MANUAL = ["GITHUB-CODE-006", "GITHUB-INTEG-004", "GITHUB-INTEG-005", "GITHUB-ORG-011"];
@@ -2453,3 +2480,517 @@ test("bundle check: one repository's classic protection 403 reaches _errors.log 
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
   assert.match(summary, /Collection warnings[\s\S]*branchProtections for example-org\/beta/);
 });
+
+const CODE_DEFAULT_IDS = ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004", "GITHUB-CODE-005"];
+const CODE_ALL_IDS = ["GITHUB-CODE-001", ...CODE_DEFAULT_IDS];
+const REST_403 = /\(403\)/;
+
+function sweepText(finding) {
+  return `${finding.summary}\n${finding.evidence.join("\n")}`;
+}
+
+// One regression per reviewer hit: a 403 on exactly that inventory with everything else compliant,
+// asserting the verdict is below Pass, the summary names the endpoint and status, and no 0 or []
+// stands in for the unreadable data.
+test("corollary hit 1: ORG-001 demotes when the member list is unreadable behind a compliant 2FA posture", async () => {
+  const { byId } = await runSweepScenario({ deny: ["members"] });
+  const finding = byId["GITHUB-ORG-001"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /requires 2FA and the 2fa_disabled filter returned no members, but the member list \(GET \/orgs\/\{org\}\/members\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/members\?role=all: Resource not accessible by integration/);
+  assert.match(finding.evidence.join("\n"), /^members = null \(GET \/orgs\/\{org\}\/members unreadable: GitHub request failed \(403\)/m);
+  assert.doesNotMatch(finding.summary, /\d+ member\(s\) enumerated/);
+});
+
+test("corollary hit 2: ORG-002 demotes when the member list is unreadable behind a read default permission", async () => {
+  const { byId } = await runSweepScenario({ deny: ["members"] });
+  const finding = byId["GITHUB-ORG-002"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /constrained to read, but the member list \(GET \/orgs\/\{org\}\/members\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/members\?role=all/);
+  assert.match(finding.evidence.join("\n"), /members = null \(GET \/orgs\/\{org\}\/members unreadable/);
+  assert.doesNotMatch(sweepText(finding), /members = 0/);
+});
+
+test("corollary hit 3: ORG-003 demotes when pending invitations are unreadable behind an empty collaborator list", async () => {
+  const { byId } = await runSweepScenario({ deny: ["invitations"] });
+  const finding = byId["GITHUB-ORG-003"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /No outside collaborators were found.*but pending invitations \(GET \/orgs\/\{org\}\/invitations\) were not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/invitations/);
+  assert.match(finding.evidence.join("\n"), /pending_invitations = null \(GET \/orgs\/\{org\}\/invitations unreadable/);
+  assert.doesNotMatch(sweepText(finding), /pending_invitations = 0/);
+});
+
+test("corollary hit 4: ORG-004 demotes when organization roles are unreadable and never fabricates a zero", async () => {
+  const { byId } = await runSweepScenario({ deny: ["organization_roles"] });
+  const finding = byId["GITHUB-ORG-004"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /1 org admin member\(s\) were identified, but the organization roles \(GET \/orgs\/\{org\}\/organization-roles\) were not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/organization-roles/);
+  assert.match(finding.evidence.join("\n"), /organization_roles = null \(GET \/orgs\/\{org\}\/organization-roles unreadable/);
+  assert.doesNotMatch(sweepText(finding), /0 organization role|organization_roles = 0/);
+});
+
+test("corollary hit 5: ORG-005 no longer carries webhook or installation fields; INTEG-001 and INTEG-003 own those inventories", async () => {
+  for (const key of ["hooks", "installations"]) {
+    const { byId } = await runSweepScenario({ deny: [key] });
+    assert.equal(byId["GITHUB-ORG-005"].status, "Pass", `ORG-005 reads the audit log only (${key} denied)`);
+    assert.doesNotMatch(sweepText(byId["GITHUB-ORG-005"]), /webhooks|app_installations/);
+    const owner = key === "hooks" ? "GITHUB-INTEG-001" : "GITHUB-INTEG-003";
+    assert.equal(byId[owner].status, "Manual");
+    assert.match(byId[owner].summary, key === "hooks"
+      ? /organization webhook list \(GET \/orgs\/\{org\}\/hooks\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/hooks/
+      : /GitHub App installation list \(GET \/orgs\/\{org\}\/installations\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/installations/);
+  }
+  const auditDenied = await runSweepScenario({ deny: ["audit_log"] });
+  assert.equal(auditDenied.byId["GITHUB-ORG-005"].status, "Manual");
+  assert.match(auditDenied.byId["GITHUB-ORG-005"].summary, /organization audit log \(GET \/orgs\/\{org\}\/audit-log\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/audit-log/);
+  assert.match(auditDenied.byId["GITHUB-ORG-005"].evidence.join("\n"), /audit_events_last_\d+_days = null \(GET \/orgs\/\{org\}\/audit-log unreadable/);
+});
+
+test("corollary hit 6: REPO-002 demotes when the organization ruleset list is unreadable while classic protection carries the verdict", async () => {
+  const { byId } = await runSweepScenario({ variant: "A", deny: ["org_rulesets"] });
+  const finding = byId["GITHUB-REPO-002"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /^2 of 2 active repositories require pull requests and block force pushes and deletions on the default branch; the organization ruleset list \(GET \/orgs\/\{org\}\/rulesets\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/rulesets/);
+  assert.match(finding.evidence.join("\n"), /org_rulesets = null \(GET \/orgs\/\{org\}\/rulesets unreadable/);
+  assert.doesNotMatch(sweepText(finding), /org_rulesets = 0/);
+  assert.equal(byId["GITHUB-REPO-001"].status, "Manual");
+  assert.match(byId["GITHUB-REPO-001"].summary, /organization ruleset list \(GET \/orgs\/\{org\}\/rulesets\) was not readable: GitHub request failed \(403\)/);
+});
+
+test("corollary hit 7: branch rules 403 for one repository demotes every repository-scoped finding even when classic protection answered", async () => {
+  const { byId } = await runSweepScenario({ variant: "A", deny: ["branch_rules:beta"] });
+  for (const id of SWEEP_REPO_SCOPED_IDS) {
+    const finding = byId[id];
+    assert.equal(finding.status, "Partial", `${id} must not pass while beta's branch rules were 403`);
+    assert.match(finding.summary, /example-org\/beta: branch rules \(GET \/repos\/example-org\/beta\/rules\/branches\/main\) unreadable: GitHub request failed \(403\) for GET \/repos\/example-org\/beta\/rules\/branches\/main/);
+    assert.doesNotMatch(finding.summary, /beta: .*classic branch protection/);
+    assert.doesNotMatch(finding.evidence.join("\n"), /= [012]\/2\b/);
+    assert.match(finding.evidence.join("\n"), /repositories_not_fully_evaluated = 1/);
+  }
+  assert.match(byId["GITHUB-REPO-001"].summary, /1 of 1 evaluated default branches \(2 active\) receive organization-sourced rules/);
+});
+
+test("corollary hit 8: classic protection 403 for one repository is never read as absence, in the rulesets-only variant too", async () => {
+  const { byId } = await runSweepScenario({ variant: "B", deny: ["branch_protection:beta"] });
+  for (const id of SWEEP_REPO_SCOPED_IDS) {
+    const finding = byId[id];
+    assert.equal(finding.status, "Partial", `${id} must not pass while beta's classic protection was 403`);
+    assert.match(finding.summary, /example-org\/beta: classic branch protection \(GET \/repos\/example-org\/beta\/branches\/main\/protection\) unreadable: GitHub request failed \(403\)/);
+    assert.doesNotMatch(finding.evidence.join("\n"), /= [012]\/2\b/);
+  }
+  assert.match(byId["GITHUB-REPO-001"].evidence.join("\n"), /repos_with_legacy_branch_protection = 0\/1 evaluated \(2 active, 1 not fully evaluated\)/);
+  const everyRepo = await runSweepScenario({ variant: "B", deny: ["branch_protection:alpha", "branch_protection:beta"] });
+  for (const id of SWEEP_REPO_SCOPED_IDS) {
+    assert.equal(everyRepo.byId[id].status, "Partial");
+    assert.doesNotMatch(everyRepo.byId[id].evidence.join("\n"), /= 0\/[02]/);
+    assert.match(everyRepo.byId[id].evidence.join("\n"), /= null \(no repository could be fully evaluated: 2 active, 2 not fully evaluated\)/);
+  }
+});
+
+test("corollary hit 9: ACT-001 demotes when the selected-actions allow list is unreadable behind a selected policy", async () => {
+  const { byId } = await runSweepScenario({ deny: ["selected_actions"] });
+  const finding = byId["GITHUB-ACT-001"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /constrained to selected, but the selected-actions allow list \(GET \/orgs\/\{org\}\/actions\/permissions\/selected-actions\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/actions\/permissions\/selected-actions/);
+  assert.match(finding.evidence.join("\n"), /patterns_allowed = null \(GET \/orgs\/\{org\}\/actions\/permissions\/selected-actions unreadable/);
+  assert.doesNotMatch(sweepText(finding), /patterns_allowed = 0|details unavailable/);
+});
+
+test("corollary hit 10: CODE-002 to CODE-005 demote when the configuration list is unreadable while the defaults carry the verdict", async () => {
+  const { byId } = await runSweepScenario({ deny: ["code_security_configurations"] });
+  for (const id of CODE_DEFAULT_IDS) {
+    const finding = byId[id];
+    assert.equal(finding.status, "Partial", `${id} must not pass while the configuration list was 403`);
+    assert.match(finding.summary, /, but the code security configuration list \(GET \/orgs\/\{org\}\/code-security\/configurations\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/code-security\/configurations/);
+    assert.match(finding.evidence.join("\n"), /code_security_configurations = null \(GET \/orgs\/\{org\}\/code-security\/configurations unreadable/);
+  }
+  assert.equal(byId["GITHUB-CODE-001"].status, "Manual");
+  assert.match(byId["GITHUB-CODE-001"].summary, /code security configuration list \(GET \/orgs\/\{org\}\/code-security\/configurations\) was not readable: GitHub request failed \(403\)/);
+});
+
+test("corollary hit 11: CODE-002 to CODE-005 demote when the org profile is unreadable and the flag is not misattributed to the deprecated field", async () => {
+  const { byId } = await runSweepScenario({ deny: ["org"] });
+  for (const id of CODE_DEFAULT_IDS) {
+    const finding = byId[id];
+    assert.equal(finding.status, "Partial", `${id} must not pass while the org profile was 403`);
+    assert.match(finding.summary, /, but the organization profile \(GET \/orgs\/\{org\}\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org: Resource not accessible by integration/);
+    assert.doesNotMatch(finding.evidence.join("\n"), /not returned \(deprecated, owner-only field\)/);
+  }
+  assert.match(byId["GITHUB-CODE-002"].evidence.join("\n"), /secret_scanning_enabled_for_new_repositories = null \(GET \/orgs\/\{org\} unreadable: GitHub request failed \(403\)/);
+  assert.match(byId["GITHUB-CODE-004"].evidence.join("\n"), /dependabot_alerts_enabled_for_new_repositories = null \(GET \/orgs\/\{org\} unreadable/);
+});
+
+test("corollary hit 12: CODE-001 demotes when the default assignments are unreadable and never fabricates a zero", async () => {
+  const { byId } = await runSweepScenario({ deny: ["code_security_defaults"] });
+  const finding = byId["GITHUB-CODE-001"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /^1 code security configuration\(s\) exist, but the default assignments \(GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\) were not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/code-security\/configurations\/defaults/);
+  assert.match(finding.evidence.join("\n"), /default_configurations = null \(GET \/orgs\/\{org\}\/code-security\/configurations\/defaults unreadable/);
+  assert.doesNotMatch(sweepText(finding), /0 default assignment|default_configurations = 0/);
+  for (const id of CODE_DEFAULT_IDS) {
+    assert.equal(byId[id].status, "Manual", `${id} is Manual when its primary inventory is unreadable`);
+    assert.match(byId[id].summary, /default code security configurations \(GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\) was not readable: GitHub request failed \(403\)/);
+  }
+});
+
+test("corollary hit 13: INTEG-002 demotes when the org profile carrying the deploy key kill switch is unreadable", async () => {
+  const { byId } = await runSweepScenario({ deny: ["org"] });
+  const finding = byId["GITHUB-INTEG-002"];
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /^All 2 deploy key\(s\) are read-only and newer than 365 days, but the organization profile \(GET \/orgs\/\{org\}\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org/);
+  assert.match(finding.evidence.join("\n"), /deploy_keys_enabled_for_repositories = null \(GET \/orgs\/\{org\} unreadable/);
+  assert.doesNotMatch(sweepText(finding), /= undefined/);
+});
+
+test("corollary hit 14: ORG-006 treats organization null with a pathed GraphQL error as unreadable instead of passing through the enterprise", async () => {
+  for (const variant of ["A", "B"]) {
+    const { byId } = await runSweepScenario({ variant, deny: ["graphql:saml"], graphqlStyle: "root_null" });
+    const finding = byId["GITHUB-ORG-006"];
+    assert.equal(finding.status, "Manual", `variant ${variant}`);
+    assert.match(finding.summary, /GraphQL did not return organization\.samlIdentityProvider \(NOT_FOUND: Could not resolve to an Organization with the login of 'example-org'\.\), so SSO status is unverified/);
+    assert.doesNotMatch(finding.summary, /enterprise example-ent carries|all \d+ member\(s\) carry/);
+    assert.match(finding.evidence.join("\n"), /organization\.samlIdentityProvider = null \(GraphQL errors present, so this is not an absent provider\)/);
+  }
+});
+
+test("corollary wording: ORG-006 returns Manual naming enterprise.ownerInfo when the enterprise inventory is unreadable in the enterprise-only variant", async () => {
+  const styles = {
+    http403: /No organization-level SAML provider exists and the enterprise\.ownerInfo \(GraphQL enterprise\(slug\)\) was not readable: GitHub request failed \(403\) for POST \/graphql: Resource not accessible by integration; enterprise-level SSO is unverified/,
+    data_null: /enterprise\.ownerInfo for example-ent was not readable: FORBIDDEN: Resource not accessible by integration/,
+    field_null: /enterprise\.ownerInfo for example-ent was not readable: FORBIDDEN: Resource not accessible by integration/,
+    root_null: /enterprise\.ownerInfo for example-ent was not readable: NOT_FOUND: Could not resolve to an Enterprise/,
+  };
+  for (const [style, pattern] of Object.entries(styles)) {
+    const { byId } = await runSweepScenario({ variant: "B", deny: ["graphql:enterprise"], graphqlStyle: style });
+    const finding = byId["GITHUB-ORG-006"];
+    assert.equal(finding.status, "Manual", `style ${style} must be Manual, not a false Fail`);
+    assert.match(finding.summary, pattern, `style ${style}`);
+    assert.doesNotMatch(finding.summary, /no enterprise slug was supplied/);
+    assert.match(finding.evidence.join("\n"), /enterprise\.ownerInfo = null \(/);
+    assert.equal(byId["GITHUB-ORG-007"].status, "Manual");
+  }
+  const memberDenied = await runSweepScenario({ variant: "A", deny: ["members"] });
+  assert.match(memberDenied.byId["GITHUB-ORG-006"].summary, /^SAML SSO is configured, but the member-to-identity comparison is incomplete: the member list \(GET \/orgs\/\{org\}\/members\) was not readable: GitHub request failed \(403\) for GET \/orgs\/example-org\/members\?role=all/);
+  assert.doesNotMatch(memberDenied.byId["GITHUB-ORG-006"].summary, /identities truncated, or partial GraphQL errors/);
+});
+
+// Mirrors the reviewer's per-inventory table: each row denies exactly one inventory (fully, or
+// for `beta` only where the collector reads per repository) with everything else compliant and
+// names the findings that must drop below Pass in each variant (A: org SAML plus classic
+// protection; B: enterprise OIDC plus rulesets only). `names` must appear in every demoted
+// summary, `nullish` in the evidence of at least one demoted finding, and `forbidden` in none.
+const CORROLLARY_SWEEP_ROWS = [
+  {
+    label: "GET /orgs/{org} (org profile)",
+    deny: ["org"],
+    expect: ["GITHUB-ORG-001", "GITHUB-ORG-002", "GITHUB-ORG-009", "GITHUB-ORG-010", "GITHUB-REPO-005", ...CODE_DEFAULT_IDS, "GITHUB-INTEG-002"],
+    names: /GET \/orgs\/\{org\}\)/,
+    nullish: /= null \(GET \/orgs\/\{org\} unreadable: GitHub request failed \((403|401)\)/,
+    forbidden: /= undefined|default_repository_permission = unknown|not returned \(deprecated|two_factor_requirement_enabled = not returned/,
+  },
+  {
+    label: "GET /orgs/{org}/members",
+    deny: ["members"],
+    expect: ["GITHUB-ORG-001", "GITHUB-ORG-002", "GITHUB-ORG-006"],
+    expectB: ["GITHUB-ORG-001", "GITHUB-ORG-002"],
+    names: /GET \/orgs\/\{org\}\/members\)/,
+    nullish: /members = null \(GET \/orgs\/\{org\}\/members unreadable/,
+    forbidden: /members = 0|members_without_saml_identity = 0|member\(s\) enumerated/,
+  },
+  {
+    label: "GET /orgs/{org}/members?role=admin",
+    deny: ["members_admin"],
+    expect: ["GITHUB-ORG-004"],
+    names: /GET \/orgs\/\{org\}\/members\?role=admin\)/,
+    nullish: /admin_members = null/,
+    forbidden: /admin_members = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/members?filter=2fa_disabled",
+    deny: ["members_2fa_disabled"],
+    expect: ["GITHUB-ORG-001"],
+    names: /GET \/orgs\/\{org\}\/members\?filter=2fa_disabled\)/,
+    nullish: /members_without_2fa = null/,
+    forbidden: /members_without_2fa = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/outside_collaborators",
+    deny: ["outside_collaborators"],
+    expect: ["GITHUB-ORG-003"],
+    names: /GET \/orgs\/\{org\}\/outside_collaborators\)/,
+    nullish: /outside_collaborators = null/,
+    forbidden: /outside_collaborators = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/invitations",
+    deny: ["invitations"],
+    expect: ["GITHUB-ORG-003"],
+    names: /GET \/orgs\/\{org\}\/invitations\)/,
+    nullish: /pending_invitations = null/,
+    forbidden: /pending_invitations = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/organization-roles",
+    deny: ["organization_roles"],
+    expect: ["GITHUB-ORG-004"],
+    names: /GET \/orgs\/\{org\}\/organization-roles\)/,
+    nullish: /organization_roles = null/,
+    forbidden: /organization_roles = 0|0 organization role/,
+  },
+  {
+    label: "GET /orgs/{org}/credential-authorizations",
+    deny: ["credential_authorizations"],
+    expect: [],
+    check: ["GITHUB-INTEG-004"],
+    nullish: /saml_credential_authorizations = null \(GET \/orgs\/\{org\}\/credential-authorizations unreadable/,
+    forbidden: /saml_credential_authorizations = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/audit-log",
+    deny: ["audit_log"],
+    expect: ["GITHUB-ORG-005"],
+    names: /GET \/orgs\/\{org\}\/audit-log\)/,
+    nullish: /audit_events_last_\d+_days = null/,
+    forbidden: /audit_events_last_\d+_days = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/hooks",
+    deny: ["hooks"],
+    expect: ["GITHUB-INTEG-001"],
+    names: /GET \/orgs\/\{org\}\/hooks\)/,
+    nullish: /org_webhooks = null/,
+    forbidden: /org_webhooks = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/installations",
+    deny: ["installations"],
+    expect: ["GITHUB-INTEG-003"],
+    names: /GET \/orgs\/\{org\}\/installations\)/,
+    nullish: /app_installations = null/,
+    forbidden: /app_installations = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/repos",
+    deny: ["repos"],
+    expect: [...SWEEP_REPO_SCOPED_IDS, "GITHUB-INTEG-001", "GITHUB-INTEG-002"],
+    names: /GET \/orgs\/\{org\}\/repos\)/,
+    nullish: /(active_repositories|repo_webhooks|repositories) = null \(GET \/orgs\/\{org\}\/repos unreadable/,
+    forbidden: /= 0\/|deploy_keys = 0|repo_webhooks = 0|across 0 readable/,
+  },
+  {
+    label: "GET /orgs/{org}/rulesets",
+    deny: ["org_rulesets"],
+    expect: ["GITHUB-REPO-001", "GITHUB-REPO-002"],
+    names: /GET \/orgs\/\{org\}\/rulesets\)/,
+    nullish: /org_rulesets = null \(GET \/orgs\/\{org\}\/rulesets unreadable/,
+    forbidden: /org_rulesets = 0/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/rules/branches/{b} every repo",
+    deny: ["branch_rules:alpha", "branch_rules:beta"],
+    expect: SWEEP_REPO_SCOPED_IDS,
+    names: /GET \/repos\/example-org\/(alpha|beta)\/rules\/branches\/main\)/,
+    nullish: /= null \(no repository could be fully evaluated: 2 active, 2 not fully evaluated\)/,
+    forbidden: /= 0\/[02]/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/rules/branches/{b} for beta only",
+    deny: ["branch_rules:beta"],
+    expect: SWEEP_REPO_SCOPED_IDS,
+    names: /example-org\/beta: branch rules \(GET \/repos\/example-org\/beta\/rules\/branches\/main\)/,
+    nullish: /repositories_not_fully_evaluated = 1/,
+    forbidden: /= [012]\/2\b/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/rulesets every repo (collected, never read)",
+    deny: ["repo_rulesets:alpha", "repo_rulesets:beta"],
+    expect: [],
+  },
+  {
+    label: "GET /repos/{o}/{r}/rulesets for beta only (collected, never read)",
+    deny: ["repo_rulesets:beta"],
+    expect: [],
+  },
+  {
+    label: "GET /repos/{o}/{r}/branches/{b}/protection every repo",
+    deny: ["branch_protection:alpha", "branch_protection:beta"],
+    expect: SWEEP_REPO_SCOPED_IDS,
+    names: /GET \/repos\/example-org\/(alpha|beta)\/branches\/main\/protection\)/,
+    nullish: /= null \(no repository could be fully evaluated: 2 active, 2 not fully evaluated\)/,
+    forbidden: /= 0\/[02]/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/branches/{b}/protection for beta only",
+    deny: ["branch_protection:beta"],
+    expect: SWEEP_REPO_SCOPED_IDS,
+    names: /example-org\/beta: classic branch protection \(GET \/repos\/example-org\/beta\/branches\/main\/protection\)/,
+    nullish: /repositories_not_fully_evaluated = 1/,
+    forbidden: /= [012]\/2\b/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/hooks every repo",
+    deny: ["repo_hooks:alpha", "repo_hooks:beta"],
+    expect: ["GITHUB-INTEG-001"],
+    names: /GET \/repos\/example-org\/(alpha|beta)\/hooks/,
+    nullish: /repo_webhooks = null \(GET \/repos\/\{owner\}\/\{repo\}\/hooks unreadable for all 2 repositories/,
+    forbidden: /repo_webhooks = 0|across 0 readable/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/hooks for beta only",
+    deny: ["repo_hooks:beta"],
+    expect: ["GITHUB-INTEG-001"],
+    names: /example-org\/beta \(GET \/repos\/example-org\/beta\/hooks: GitHub request failed \((403|401)\)/,
+    nullish: /1 repositories unreadable: example-org\/beta \(GET \/repos\/example-org\/beta\/hooks/,
+    forbidden: /across 0 readable/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/keys every repo",
+    deny: ["deploy_keys:alpha", "deploy_keys:beta"],
+    expect: ["GITHUB-INTEG-002"],
+    names: /GET \/repos\/example-org\/(alpha|beta)\/keys/,
+    nullish: /deploy_keys = null \(GET \/repos\/\{owner\}\/\{repo\}\/keys unreadable for all 2 repositories/,
+    forbidden: /deploy_keys = 0|write_capable_keys = 0|keys_older_than_365_days = 0|across 0 readable/,
+  },
+  {
+    label: "GET /repos/{o}/{r}/keys for beta only",
+    deny: ["deploy_keys:beta"],
+    expect: ["GITHUB-INTEG-002"],
+    names: /example-org\/beta \(GET \/repos\/example-org\/beta\/keys: GitHub request failed \((403|401)\)/,
+    nullish: /1 repositories unreadable: example-org\/beta \(GET \/repos\/example-org\/beta\/keys/,
+    forbidden: /across 0 readable/,
+  },
+  {
+    label: "GET /orgs/{org}/actions/permissions",
+    deny: ["actions_permissions"],
+    expect: ["GITHUB-ACT-001", "GITHUB-ACT-005"],
+    names: /GET \/orgs\/\{org\}\/actions\/permissions\)/,
+    nullish: /allowed_actions = null|enabled_repositories = null/,
+    forbidden: /allowed_actions = unknown|enabled_repositories = unknown/,
+  },
+  {
+    label: "GET /orgs/{org}/actions/permissions/selected-actions",
+    deny: ["selected_actions"],
+    expect: ["GITHUB-ACT-001"],
+    names: /GET \/orgs\/\{org\}\/actions\/permissions\/selected-actions\)/,
+    nullish: /patterns_allowed = null/,
+    forbidden: /patterns_allowed = 0|details unavailable/,
+  },
+  {
+    label: "GET /orgs/{org}/actions/permissions/workflow",
+    deny: ["workflow_permissions"],
+    expect: ["GITHUB-ACT-002", "GITHUB-ACT-003"],
+    names: /GET \/orgs\/\{org\}\/actions\/permissions\/workflow\)/,
+    nullish: /default_workflow_permissions = null|can_approve_pull_request_reviews = null/,
+    forbidden: /= unknown|= undefined/,
+  },
+  {
+    label: "GET /orgs/{org}/actions/runner-groups",
+    deny: ["runner_groups"],
+    expect: ["GITHUB-ACT-004"],
+    names: /GET \/orgs\/\{org\}\/actions\/runner-groups\)/,
+    nullish: /runner_groups = null/,
+    forbidden: /runner_groups = 0|open_runner_groups = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/actions/runners",
+    deny: ["runners"],
+    expect: ["GITHUB-ACT-004"],
+    names: /GET \/orgs\/\{org\}\/actions\/runners\)/,
+    nullish: /self_hosted_runners = null/,
+    forbidden: /self_hosted_runners = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/code-security/configurations",
+    deny: ["code_security_configurations"],
+    expect: CODE_ALL_IDS,
+    names: /GET \/orgs\/\{org\}\/code-security\/configurations\)/,
+    nullish: /code_security_configurations = null/,
+    forbidden: /code_security_configurations = 0/,
+  },
+  {
+    label: "GET /orgs/{org}/code-security/configurations/defaults",
+    deny: ["code_security_defaults"],
+    expect: CODE_ALL_IDS,
+    names: /GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\)/,
+    nullish: /default_configurations = null/,
+    forbidden: /default_configurations = 0|0 default assignment/,
+  },
+  ...["http403", "data_null", "field_null", "root_null", "page2_http403"].map((style) => ({
+    label: `GraphQL organization.samlIdentityProvider (${style})`,
+    deny: ["graphql:saml"],
+    graphqlStyle: style,
+    expect: ["GITHUB-ORG-006"],
+    expectB: style === "page2_http403" ? [] : ["GITHUB-ORG-006"],
+    names: /samlIdentityProvider/,
+    forbidden: /members_without_saml_identity = 0|external_identities_linked_to_members = 0|enterprise example-ent carries/,
+  })),
+  ...["http403", "data_null", "field_null", "root_null", "page2_http403"].map((style) => ({
+    label: `GraphQL organization.ipAllowList* (${style})`,
+    deny: ["graphql:ip_allow_list"],
+    graphqlStyle: style,
+    expect: ["GITHUB-ORG-008"],
+    names: /ipAllowList(EnabledSetting|Entries)/,
+    forbidden: /ip_allow_list_entries = 0/,
+  })),
+  ...["http403", "data_null", "field_null", "root_null"].map((style) => ({
+    label: `GraphQL enterprise.ownerInfo (${style})`,
+    deny: ["graphql:enterprise"],
+    graphqlStyle: style,
+    expect: ["GITHUB-ORG-007"],
+    expectB: ["GITHUB-ORG-006", "GITHUB-ORG-007"],
+    names: /ownerInfo/,
+    forbidden: /readable, no identity provider|ownerInfo\.oidcProvider = null|no enterprise slug was supplied/,
+  })),
+];
+
+const GRAPHQL_STATUS_PATTERNS = {
+  http403: /\(403\)/,
+  page2_http403: /\(403\)/,
+  data_null: /FORBIDDEN/,
+  field_null: /FORBIDDEN/,
+  root_null: /NOT_FOUND/,
+};
+
+async function assertSweepRow(row, variant, restStatus) {
+  const context = `${row.label} [variant ${variant}${row.graphqlStyle ? "" : `, ${restStatus}`}]`;
+  const { findings, byId, deniedTargets } = await runSweepScenario({ variant, deny: row.deny, graphqlStyle: row.graphqlStyle, restStatus });
+  const expected = [...(variant === "B" && row.expectB ? row.expectB : row.expect)].sort();
+  const demoted = findings
+    .filter((finding) => finding.status !== "Pass" && !SWEEP_BASELINE_MANUAL.includes(finding.id))
+    .map((finding) => finding.id)
+    .sort();
+  assert.deepEqual(demoted, expected, `${context}: exactly the dependent findings drop below Pass`);
+  assert.ok(Object.keys(deniedTargets).length > 0, `${context}: the denied inventory was requested`);
+  const statusPattern = row.graphqlStyle ? GRAPHQL_STATUS_PATTERNS[row.graphqlStyle] : new RegExp(`\\(${restStatus}\\)`);
+  for (const id of expected) {
+    const finding = byId[id];
+    assert.notEqual(finding.status, "Pass", `${context}: ${id}`);
+    assert.match(finding.summary, row.names, `${context}: ${id} summary names the endpoint`);
+    assert.match(finding.summary, statusPattern, `${context}: ${id} summary names the status`);
+    if (row.forbidden) {
+      assert.doesNotMatch(sweepText(finding), row.forbidden, `${context}: ${id} renders no 0 or [] for unreadable data`);
+    }
+  }
+  const checked = row.check ?? expected;
+  if (row.nullish && checked.length > 0) {
+    assert.ok(checked.some((id) => row.nullish.test(byId[id].evidence.join("\n"))), `${context}: a demoted finding renders the unreadable inventory as null plus status`);
+  }
+  if (row.check) {
+    for (const id of row.check) {
+      assert.doesNotMatch(sweepText(byId[id]), row.forbidden, `${context}: ${id}`);
+    }
+  }
+}
+
+for (const row of CORROLLARY_SWEEP_ROWS) {
+  test(`corollary sweep: ${row.label}`, async () => {
+    for (const variant of ["A", "B"]) {
+      if (row.graphqlStyle) {
+        await assertSweepRow(row, variant, 403);
+      } else {
+        for (const restStatus of [403, 401]) {
+          await assertSweepRow(row, variant, restStatus);
+        }
+      }
+    }
+  });
+}
