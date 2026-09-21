@@ -1329,6 +1329,56 @@ test("assessBoxSharingCollaboration fails open collaboration, public allowlist d
   assert.equal(unreadable.errors.length, 3);
 });
 
+test("assessBoxSharingCollaboration warns on allowlist entries without a usable created_at instead of treating them as fresh", async () => {
+  const entry = (id, domain, overrides = {}) => ({ id, type: "collaboration_whitelist_entry", domain, direction: "both", created_at: "2026-06-01T00:00:00Z", ...overrides });
+  const undated = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    allowlistEntries: [
+      entry("entry-1", "partner.example"),
+      { id: "entry-2", type: "collaboration_whitelist_entry", domain: "missing-date.example", direction: "inbound" },
+      entry("entry-3", "garbage-date.example", { created_at: "not-a-date" }),
+      entry("entry-4", "null-date.example", { created_at: null }),
+    ],
+  }));
+  assertStatuses(undated, { "BOX-04": "pass", "BOX-05": "warn" });
+  const allowlist = findingById(undated, "BOX-05");
+  assert.match(allowlist.summary, /^3 allowlist entries have a missing or unparseable created_at/);
+  assert.match(allowlist.summary, /age cannot be assessed/);
+  assert.doesNotMatch(allowlist.summary, /older than/);
+  assert.deepEqual(allowlist.evidence.undated_entries, [
+    "missing-date.example (created_at: missing)",
+    'garbage-date.example (created_at: "not-a-date")',
+    "null-date.example (created_at: null)",
+  ]);
+  assert.deepEqual(allowlist.evidence.stale_entries, []);
+  assert.match(allowlist.manualEvidence, /record the creation date of any undated entry/);
+  assert.equal(undated.summary.undated_allowlist_entries, 3);
+  assert.equal(undated.summary.stale_allowlist_entries, 0);
+
+  const mixed = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    allowlistEntries: [
+      entry("entry-1", "old-partner.example", { created_at: "2019-01-01T00:00:00Z" }),
+      entry("entry-2", "undated.example", { created_at: "" }),
+    ],
+    exemptTargets: [{ id: "exempt-1", type: "collaboration_whitelist_exempt_target", user: { id: "member-1", type: "user" } }],
+  }));
+  assertStatuses(mixed, { "BOX-05": "warn" });
+  assert.match(findingById(mixed, "BOX-05").summary, /^1 allowlist entries are older than 365 days; 1 allowlist entries have a missing or unparseable created_at .*; 1 users are exempt from domain restrictions; review them/);
+
+  const dated = await assessBoxSharingCollaboration(createStubClient(hardenedFixture()));
+  assertStatuses(dated, { "BOX-05": "pass" });
+  assert.deepEqual(findingById(dated, "BOX-05").evidence.undated_entries, []);
+  assert.match(findingById(dated, "BOX-05").summary, /1 allowlist entries are dated, recent, non-public domains/);
+
+  const publicWins = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    allowlistEntries: [{ id: "entry-1", type: "collaboration_whitelist_entry", domain: "gmail.com", direction: "both" }],
+  }));
+  assertStatuses(publicWins, { "BOX-05": "fail" });
+  assert.equal(findingById(publicWins, "BOX-05").evidence.undated_entries.length, 1);
+});
+
 test("assessBoxDataGovernance passes with classification, retention, and legal hold coverage", async () => {
   const result = await assessBoxDataGovernance(createStubClient(hardenedFixture()));
   assert.equal(result.area, "data_governance");

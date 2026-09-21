@@ -2156,6 +2156,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   );
 
   const publicDomainEntries = entries.filter((entry) => isPublicEmailDomain(asString(entry.domain) ?? ""));
+  const undatedEntries = entries.filter((entry) => parseIsoDate(entry.created_at) === undefined);
   const staleEntries = entries.filter((entry) => {
     const createdAt = parseIsoDate(entry.created_at);
     return createdAt !== undefined && daysBetween(data.now, createdAt) > staleDays;
@@ -2165,12 +2166,18 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     allowlist_entries: truncateList(entries.map((entry) => `${asString(entry.domain) ?? "domain"} (${asString(entry.direction) ?? "direction"})`)),
     public_email_domains: publicDomainEntries.map((entry) => asString(entry.domain)),
     stale_entries: truncateList(staleEntries.map((entry) => asString(entry.domain))),
+    undated_entries: truncateList(undatedEntries.map((entry) => `${asString(entry.domain) ?? asString(entry.id) ?? "entry"} (created_at: ${entry.created_at === undefined ? "missing" : JSON.stringify(entry.created_at)})`)),
     both_direction_entries: bothDirectionEntries.length,
     exempt_targets: exemptTargets.length,
     stale_days: staleDays,
     allowlist_truncated: allowlistTruncated,
   };
   const allowlistManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and review each entry for business justification, direction, and age.";
+  const allowlistReviewReasons = [
+    ...(staleEntries.length > 0 ? [`${staleEntries.length} allowlist entries are older than ${staleDays} days`] : []),
+    ...(undatedEntries.length > 0 ? [`${undatedEntries.length} allowlist entries have a missing or unparseable created_at (a documented CollaborationAllowlistEntry field), so their age cannot be assessed`] : []),
+    ...(exemptTargets.length > 0 ? [`${exemptTargets.length} users are exempt from domain restrictions`] : []),
+  ];
   findings.push(
     !allowlistReadable
       ? finding(5, "manual", `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, allowlistManualEvidence)
@@ -2180,9 +2187,9 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
           ? finding(5, "warn", `The collaboration allowlist collection stopped at the cap (${entries.length} entries and ${exemptTargets.length} exempt users retrieved) while Box reported more records, so unreviewed public, stale, or exempt entries may remain; raise list_limit and rerun.`, allowlistEvidence, allowlistManualEvidence)
         : entries.length === 0
           ? finding(5, externalStatus === "limit_collaboration_to_allowlisted_domains" ? "warn" : "pass", entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
-          : staleEntries.length > 0 || exemptTargets.length > 0
-            ? finding(5, "warn", `${staleEntries.length} allowlist entries are older than ${staleDays} days and ${exemptTargets.length} users are exempt from domain restrictions; review them for continued need.`, allowlistEvidence, "Confirm with content owners that each stale domain and exempt user still has an active business relationship.")
-            : finding(5, "pass", `${entries.length} allowlist entries are recent, non-public domains with no user exemptions.`, allowlistEvidence),
+          : allowlistReviewReasons.length > 0
+            ? finding(5, "warn", `${allowlistReviewReasons.join("; ")}; review them for continued need.`, allowlistEvidence, "Confirm with content owners that each stale, undated, or exempt entry still has an active business relationship, and record the creation date of any undated entry from the Admin Console export.")
+            : finding(5, "pass", `${entries.length} allowlist entries are dated, recent, non-public domains with no user exemptions.`, allowlistEvidence),
   );
 
   const sharedLinkDefault = configString(configuration, "content_and_sharing", "shared_link_default_access");
@@ -2324,6 +2331,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       allowlist_entries: entries.length,
       public_email_domains: publicDomainEntries.length,
       stale_allowlist_entries: staleEntries.length,
+      undated_allowlist_entries: undatedEntries.length,
       exempt_targets: exemptTargets.length,
       shared_link_default_access: sharedLinkDefault ?? null,
       shared_links_expiration_enabled: expirationEnabled ?? null,
