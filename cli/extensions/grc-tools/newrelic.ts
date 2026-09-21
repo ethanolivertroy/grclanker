@@ -2102,8 +2102,8 @@ function mergeScopeFailures(segments: string[]): string[] {
 
 /**
  * Shortens one long cause to the budget while keeping its tail: the status text and the query path ("Not authorized
- * (at actor.x.y)") survive and the boilerplate ahead of them is cut. When the status does not fit, the path alone is
- * kept; a cause without a path is cut at the end.
+ * (at actor.x.y)") survive and the boilerplate ahead of them is cut, at a word boundary so no token is split. When the
+ * status does not fit, the path alone is kept; a cause without a path is cut at the end.
  */
 function truncateAheadOfPath(text: string, budget: number): string {
   if (text.length <= budget) return text;
@@ -2114,10 +2114,16 @@ function truncateAheadOfPath(text: string, budget: number): string {
     for (const tailStart of tailStarts) {
       const tail = text.slice(tailStart);
       const room = budget - tail.length - 3;
-      if (room > 0) return `${text.slice(0, room)}...${tail}`;
+      if (room > 0) return `${headToWordBoundary(text.slice(0, room))}...${tail}`;
     }
   }
   return `${text.slice(0, Math.max(budget - 3, 1))}...`;
+}
+
+/** Backs a cut head up to the last space (kept, so "domain: ...Not authorized" reads as words) instead of mid-token. */
+function headToWordBoundary(head: string): string {
+  const boundary = head.lastIndexOf(" ");
+  return boundary > 0 ? head.slice(0, boundary + 1) : head;
 }
 
 function causeOf(item: Collected<unknown>): string {

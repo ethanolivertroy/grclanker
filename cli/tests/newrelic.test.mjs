@@ -2999,6 +2999,12 @@ test("rule 1 corollary wording: compactCause keeps the dataset, status, and quer
   assert.ok(compact.length <= 200, `${compact.length}: ${compact}`);
   assert.match(compact, /^authorizationManagement\.groups: authentication domains were not readable \(userManagement\.authenticationDomains: /);
   assert.match(compact, /\.\.\.Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)$/);
+  assert.match(compact, / \.\.\.Not authorized/, `the head is cut at a word boundary, not mid-token: ${compact}`);
+
+  const twoDomainsMerged = `authorizationManagement.groups: ${["Corporate SSO", "Contractors"].map((name) => `authentication domain ${name}: NerdGraph returned errors: Not authorized (at actor.organization.authorizationManagement.authenticationDomains.groups)`).join("; ")}`;
+  const mergedDomains = compactCause(twoDomainsMerged);
+  assert.ok(mergedDomains.length <= 200, `${mergedDomains.length}: ${mergedDomains}`);
+  assert.match(mergedDomains, /^authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: \.\.\.Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)$/);
 
   const twoAccounts = `alerts.policiesSearch: ${[111, 222].map((id) => `account ${id}: NerdGraph returned errors: Not authorized (at actor.account.alerts.policiesSearch)`).join("; ")}`;
   assert.ok(twoAccounts.length > 200);
