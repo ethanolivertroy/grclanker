@@ -999,7 +999,7 @@ async function collectExport(load: () => Promise<TenableExportResult>): Promise<
 
 function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[] {
   const errors: string[] = [];
-  if (dataset.error) errors.push(`${label}: ${dataset.error}`);
+  if (dataset.error && dataset.status !== "not_configured") errors.push(`${label}: ${dataset.error}`);
   if (dataset.status === "ok" && dataset.truncated) errors.push(`${label}: partial view (${dataset.seen} of ${dataset.total ?? "unknown"} records retrieved).`);
   return errors;
 }
@@ -1343,12 +1343,12 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     const overlapping = [...memberIndex.entries()].filter(([, owners]) => owners.length > 1);
     findings.push(finding(
       20,
-      groups.length === 0 ? "pass" : stale.length === 0 && overlapping.length === 0 ? "pass" : "warn",
+      groups.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : stale.length === 0 && overlapping.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : "warn",
       "low",
       groups.length === 0
-        ? "No legacy target groups exist (GET /target-groups returned an empty list); target groups were deprecated in February 2022 in favor of tags, so emptiness is compliant."
+        ? `No legacy target groups are visible (GET /target-groups returned an empty list); target groups were deprecated in February 2022 in favor of tags, so emptiness is compliant.${nonAdminNote(callerIsAdministrator)}`
         : stale.length === 0 && overlapping.length === 0
-          ? `${groups.length} legacy target groups exist, all modified within the last year with no overlapping members. Plan a migration to tags.`
+          ? `${groups.length} legacy target groups exist, all modified within the last year with no overlapping members. Plan a migration to tags.${nonAdminNote(callerIsAdministrator)}`
           : `${groups.length} legacy target groups exist: ${stale.length} unmodified for over a year or undated, ${overlapping.length} member targets appear in more than one group.`,
       {
         target_group_count: groups.length,
@@ -1650,13 +1650,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
     findings.push(finding(
       7,
-      unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : "pass",
+      unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForPartial("pass", data.agents),
       "high",
       unhealthy.size > 0
         ? `${unhealthy.size} of ${linkedScanners.length} linked scanners are unlinked, off, or have not connected in 24 hours: ${[...unhealthy].slice(0, 10).join(", ")}.`
         : undated.length > 0 || outdated.length > 0
           ? `${linkedScanners.length} linked scanners are on and linked, but ${undated.length} have no last_connect and ${outdated.length} run a version older than ${newest ?? "unknown"}.`
-          : `All ${linkedScanners.length} linked scanners are on, linked, connected within 24 hours, and run version ${newest ?? "unknown"}.`,
+          : `All ${linkedScanners.length} linked scanners are on, linked, connected within 24 hours, and run version ${newest ?? "unknown"}.${partialNote(data.agents)}`,
       {
         linked_scanner_count: linkedScanners.length,
         total_scanner_entries: data.scanners.data.length,
@@ -1695,9 +1695,12 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     } else if (undatedScanners.length > 0 || staleAgents.length > 0) {
       status = "warn";
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old; ${undatedScanners.length} linked scanners expose no parseable plugin set and ${staleAgents.length} online agents load a plugin set older than ${pluginStaleHours} hours.`;
+    } else if (data.scanners.status !== "ok" || data.scanners.data.length === 0) {
+      status = "warn";
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but GET /scanners ${data.scanners.status === "ok" ? "returned zero scanners" : `failed (${data.scanners.error ?? "unknown"})`}, so per-scanner plugin currency is unverified and the verdict is capped at warn.`;
     } else {
-      status = "pass";
-      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${linkedScanners.length} linked scanners load a plugin set newer than ${pluginStaleHours} hours.`;
+      status = capForPartial("pass", data.agents);
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${linkedScanners.length} linked scanners load a plugin set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
     findings.push(finding(8, status, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
@@ -1925,13 +1928,15 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     const legacyAccessGroups = data.accessGroups.status === "ok" ? data.accessGroups.data.filter((group) => asBoolean(group.all_assets) !== true) : [];
     findings.push(finding(
       11,
-      broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 ? "warn" : "pass",
+      broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForPartial("pass", data.accessGroups), callerIsAdministrator),
       "high",
       broad.length > 0
         ? `${broad.length} of ${permissions.length} user-created permissions grant AllUsers write-style actions (CanEdit, CanScan, or CanUse) on all assets or all objects: ${broad.map((permission) => asString(permission.name)).slice(0, 10).join(", ")}.`
         : legacyAccessGroups.length > 0
           ? `${permissions.length} permissions follow least privilege for AllUsers, but ${legacyAccessGroups.length} deprecated access groups still exist and should be migrated to permissions.`
-          : `${permissions.length} permissions are defined and none grants AllUsers write-style actions on all assets; no legacy access groups remain.${data.accessGroups.status !== "ok" ? ` (GET /v2/access-groups: ${data.accessGroups.error ?? "unreadable"}.)` : ""}`,
+          : data.accessGroups.status !== "ok"
+            ? `${permissions.length} permissions follow least privilege for AllUsers, but GET /v2/access-groups could not be read (${data.accessGroups.error ?? "unreadable"}), so legacy access groups are unverified and the verdict is capped at warn.`
+            : `${permissions.length} permissions are defined and none grants AllUsers write-style actions on all assets; no legacy access groups remain.${partialNote(data.accessGroups)}${nonAdminNote(callerIsAdministrator)}`,
       {
         permission_count: permissions.length,
         broad_permissions: broad.map((permission) => asString(permission.name)).slice(0, 50),
@@ -2090,21 +2095,23 @@ export interface TenableVulnerabilityData {
   assetExport: TenableDataset<TenableExportResult>;
   vulnExportJobs: TenableDataset<JsonRecord[]>;
   assetExportJobs: TenableDataset<JsonRecord[]>;
+  users: TenableDataset<JsonRecord[]>;
 }
 
 export async function collectTenableVulnerabilityData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableVulnerabilityData> {
   const now = options.now ?? Date.now();
   const lookbackDays = clampInteger(options.vulnLookbackDays, DEFAULT_VULN_LOOKBACK_DAYS, 1, 730);
   const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
-  const [vulnExportJobs, assetExportJobs] = await Promise.all([
+  const [vulnExportJobs, assetExportJobs, users] = await Promise.all([
     vmList(clients, (client) => client.listVulnExportJobs()),
     vmList(clients, (client) => client.listAssetExportJobs()),
+    vmList(clients, (client) => client.listUsers()),
   ]);
   const [vulnExport, assetExport] = await Promise.all([
     vmExport(clients, (client) => client.exportVulnerabilities(Math.floor((now - lookbackDays * DAY_MS) / 1000), maxChunks)),
     vmExport(clients, (client) => client.exportAssets(maxChunks)),
   ]);
-  return { vulnExport, assetExport, vulnExportJobs, assetExportJobs };
+  return { vulnExport, assetExport, vulnExportJobs, assetExportJobs, users };
 }
 
 export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
@@ -2117,7 +2124,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
   };
   const lookbackDays = clampInteger(options.vulnLookbackDays, DEFAULT_VULN_LOOKBACK_DAYS, 1, 730);
   const findings: TenableFinding[] = [];
+  const callerIsAdministrator = detectAdministrator(data.users);
   const assetCount = data.assetExport.status === "ok" ? data.assetExport.data.records.length : undefined;
+  const capPopulation = (status: TenableFindingStatus): TenableFindingStatus => capForNonAdmin(capForPartial(status, data.assetExport), callerIsAdministrator);
+  const populationNote = `${partialNote(data.assetExport)}${nonAdminNote(callerIsAdministrator)}`;
 
   if (data.vulnExport.status !== "ok") {
     findings.push(unreadableFinding(14, "high", data.vulnExport, "POST /vulns/export", "the VPR distribution of open findings from Findings > Vulnerabilities"));
@@ -2152,8 +2162,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       vprStatus = "warn";
       vprSummary = `Only ${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score, so VPR-based prioritization has limited coverage.`;
     } else {
-      vprStatus = "pass";
-      vprSummary = `${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score across ${assetCount} assets; ${vprCritical.length} findings have VPR 9 or higher and ${vprHigh.length} are VPR 7 to 8.9. Confirm remediation workflows sort by VPR.`;
+      vprStatus = capPopulation("pass");
+      vprSummary = `${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score across ${assetCount} assets; ${vprCritical.length} findings have VPR 9 or higher and ${vprHigh.length} are VPR 7 to 8.9. Confirm remediation workflows sort by VPR.${populationNote}`;
     }
     findings.push(finding(14, vprStatus, "high", vprSummary, {
       exported_records: records.length,
@@ -2202,11 +2212,11 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       slaStatus = "warn";
       slaSummary = `No critical or high findings exceed SLA, but ${overdue.medium} medium and ${overdue.low} low findings are overdue and ${undated} open findings have no first_found date (not counted as compliant).`;
     } else if (open.length === 0) {
-      slaStatus = "pass";
-      slaSummary = `Zero open findings were exported for the last ${lookbackDays} days; this passes only because the export FINISHED completely and the asset export returned ${assetCount} assets.`;
+      slaStatus = capPopulation("pass");
+      slaSummary = `Zero open findings were exported for the last ${lookbackDays} days; this passes only because the export FINISHED completely and the asset export returned ${assetCount} assets.${populationNote}`;
     } else {
-      slaStatus = "pass";
-      slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.`;
+      slaStatus = capPopulation("pass");
+      slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.${populationNote}`;
     }
     findings.push(finding(15, slaStatus, "high", slaSummary, {
       open_by_severity: openBySeverity,
@@ -2230,10 +2240,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     });
     findings.push(finding(
       19,
-      recentJobs.length >= 2 ? "pass" : recentJobs.length === 1 ? "warn" : "fail",
+      recentJobs.length >= 2 ? capForNonAdmin("pass", callerIsAdministrator) : recentJobs.length === 1 ? "warn" : "fail",
       "medium",
       recentJobs.length >= 2
-        ? `${recentJobs.length} export jobs other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days, indicating automated exports. Report schedules are not exposed by the API and need a manual check in Reports.`
+        ? `${recentJobs.length} export jobs other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days, indicating automated exports. Report schedules are not exposed by the API and need a manual check in Reports.${nonAdminNote(callerIsAdministrator)}`
         : recentJobs.length === 1
           ? `Only one export job other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days; recurring automation is not demonstrated. Report schedules need a manual check in Reports.`
           : `No export jobs other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days, so no automated vulnerability or asset export is evident. Report schedules need a manual check in Reports.`,
