@@ -31,20 +31,25 @@ const READ_ONLY_VERBS = new Set([
   "validate",
 ]);
 
-const WRITE_VERBS = new Set(["assemble", "collect", "create", "export", "generate", "import", "init"]);
+/** Name segments that mark a tool as a writer; exported so tests derive expectations from the same list. */
+export const WRITE_VERBS: ReadonlySet<string> = new Set(["assemble", "collect", "create", "export", "generate", "import", "init"]);
 
 export type GrcToolEffect = "read" | undefined;
+
+/** True when any name segment after the domain prefix is a write verb, wherever it sits in the name. */
+export function hasWriteVerb(toolName: string): boolean {
+  return toolName.split("_").slice(1).some((segment) => WRITE_VERBS.has(segment));
+}
 
 /**
  * `"read"` when a name segment after the domain prefix is a read-only verb
  * and no segment is a write verb; `undefined` (treated as a write) otherwise.
  */
 export function classifyGrcToolEffect(toolName: string): GrcToolEffect {
-  const segments = toolName.split("_").slice(1);
-  if (segments.some((segment) => WRITE_VERBS.has(segment))) {
+  if (hasWriteVerb(toolName)) {
     return undefined;
   }
-  return segments.some((segment) => READ_ONLY_VERBS.has(segment)) ? "read" : undefined;
+  return toolName.split("_").slice(1).some((segment) => READ_ONLY_VERBS.has(segment)) ? "read" : undefined;
 }
 
 /** True for tools the adapter treats as writers (undeclared effect). */

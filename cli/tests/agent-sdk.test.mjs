@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 
 import { AGENT_DESCRIPTION, grclankerAgentConfig, MODEL_ENV_VAR } from "../dist/agent-sdk/lib/agent.js";
-import { classifyGrcToolEffect, isGrcWriteTool } from "../dist/agent-sdk/lib/effects.js";
+import { classifyGrcToolEffect, hasWriteVerb, isGrcWriteTool, WRITE_VERBS } from "../dist/agent-sdk/lib/effects.js";
 import { buildGrclankerInstructions } from "../dist/agent-sdk/lib/instructions.js";
 import { parsePersona, personaAgentConfig } from "../dist/agent-sdk/lib/personas.js";
 import {
@@ -38,8 +38,12 @@ const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const agentSdkRoot = resolve(cliRoot, "agent-sdk");
 const distAgentDir = resolve(cliRoot, "dist", "agent-sdk", "agent");
 const COMPUTE_TOOL_NAMES = ["bash", "read", "write", "edit", "ls", "find", "grep"];
-const WRITE_MARKER = /_(export|generate|collect|init|import|create|assemble)_/;
-const EXPECTED_WRITE_TOOLS = [
+// Registered domain tools on main after the batch 1 integration train; integrations only add to it.
+const BASELINE_DOMAIN_TOOL_COUNT = 219;
+// Every writer registered when this floor was set. Integration PRs never edit it: new writers are
+// covered by the derived expectation below, and the list only changes when a writer is intentionally
+// renamed or removed, so renaming a writer onto a read verb (which would drop the approval gate) fails.
+const BASELINE_WRITE_TOOLS = [
   "ansible_export_audit_bundle",
   "aws_export_audit_bundle",
   "azure_export_audit_bundle",
@@ -80,6 +84,12 @@ const EXPECTED_WRITE_TOOLS = [
   "zendesk_export_audit_bundle",
   "zoom_export_audit_bundle",
 ];
+
+/** Baseline writers that are no longer registered under a write classification. */
+function missingBaselineWriters(registeredNames) {
+  const registered = new Set(registeredNames);
+  return BASELINE_WRITE_TOOLS.filter((name) => !registered.has(name) || classifyGrcToolEffect(name) !== undefined);
+}
 
 function importAgentEntry(...segments) {
   return import(pathToFileURL(resolve(distAgentDir, ...segments)).href);
@@ -123,7 +133,8 @@ test("agent sdk registry exposes every domain tool and excludes compute backend 
     .filter((tool) => tool.kind === "domain")
     .map((tool) => tool.name);
 
-  assert.equal(tools.length, 219);
+  assert.equal(tools.length, expected.length);
+  assert.ok(tools.length >= BASELINE_DOMAIN_TOOL_COUNT, `registry shrank below ${BASELINE_DOMAIN_TOOL_COUNT} tools`);
   assert.deepEqual(names, expected);
   assert.equal(new Set(names).size, names.length);
   for (const computeTool of COMPUTE_TOOL_NAMES) {
@@ -208,16 +219,39 @@ test("every registered tool is classified in the expected direction", () => {
   const names = listRegisteredGrcToolNames();
   const undeclared = names.filter((name) => classifyGrcToolEffect(name) === undefined).sort();
   const read = names.filter((name) => classifyGrcToolEffect(name) === "read");
+  const expectedWriteTools = names.filter((name) => hasWriteVerb(name)).sort();
 
-  assert.deepEqual(undeclared, EXPECTED_WRITE_TOOLS);
-  assert.equal(read.length, names.length - EXPECTED_WRITE_TOOLS.length);
+  assert.deepEqual(undeclared, expectedWriteTools);
+  assert.equal(read.length, names.length - expectedWriteTools.length);
+  assert.deepEqual(missingBaselineWriters(names), [], "every baseline writer must remain registered as a write tool");
   for (const name of names) {
-    if (WRITE_MARKER.test(name)) {
+    if (hasWriteVerb(name)) {
       assert.equal(classifyGrcToolEffect(name), undefined, `${name} writes and must stay undeclared`);
     } else {
       assert.equal(classifyGrcToolEffect(name), "read", `${name} reads and must declare effect: "read"`);
     }
   }
+});
+
+test("a writer whose write verb is the final name segment needs no test edit", () => {
+  const names = [...listRegisteredGrcToolNames(), "acme_collect", "acme_bundle_export"];
+  const undeclared = names.filter((name) => classifyGrcToolEffect(name) === undefined).sort();
+  const expectedWriteTools = names.filter((name) => hasWriteVerb(name)).sort();
+
+  assert.ok(WRITE_VERBS.has("collect") && WRITE_VERBS.has("export"));
+  assert.equal(isGrcWriteTool("acme_collect"), true);
+  assert.equal(isGrcWriteTool("acme_bundle_export"), true);
+  assert.deepEqual(undeclared, expectedWriteTools);
+  assert.ok(expectedWriteTools.includes("acme_collect") && expectedWriteTools.includes("acme_bundle_export"));
+});
+
+test("renaming a baseline writer onto a read verb is caught", () => {
+  const names = listRegisteredGrcToolNames();
+  const renamed = names.map((name) => (name === "box_export_audit_bundle" ? "box_assess_audit_bundle" : name));
+
+  assert.equal(classifyGrcToolEffect("box_assess_audit_bundle"), "read", "the renamed tool would lose its approval gate");
+  assert.deepEqual(missingBaselineWriters(renamed), ["box_export_audit_bundle"]);
+  assert.deepEqual(missingBaselineWriters(names), []);
 });
 
 test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and the result envelope", async () => {
@@ -468,7 +502,7 @@ test("agent/tools has exactly one generated entry per registered domain tool", a
   const files = await listAgentSdkToolFiles(toolsDir);
   const names = [...listRegisteredGrcToolNames()].sort();
 
-  assert.equal(files.length, 219);
+  assert.equal(files.length, names.length);
   assert.deepEqual(files, names);
   for (const name of names) {
     const source = readFileSync(resolve(toolsDir, `${name}.ts`), "utf8");
@@ -510,8 +544,9 @@ test("agent entry files hand the adapter configs to the mocked Agent SDK define 
 
 test("every generated tool entry registers a server tool for its filename", async () => {
   const before = mockCalls().filter((call) => call.helper === "defineTool").length;
+  const toolNames = [...listRegisteredGrcToolNames()];
 
-  for (const name of listRegisteredGrcToolNames()) {
+  for (const name of toolNames) {
     const tool = (await importAgentEntry("tools", `${name}.js`)).default;
     const registered = getRegisteredGrcTool(name);
 
@@ -527,5 +562,5 @@ test("every generated tool entry registers a server tool for its filename", asyn
   }
 
   const after = mockCalls().filter((call) => call.helper === "defineTool").length;
-  assert.equal(after - before, 219);
+  assert.equal(after - before, toolNames.length);
 });
