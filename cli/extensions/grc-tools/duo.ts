@@ -39,6 +39,11 @@ const DEFAULT_LOOKBACK_DAYS = 30;
 const OFFSET_PAGE_SIZE = 100;
 const LOG_PAGE_SIZE = 200;
 const MAX_LOG_RECORDS = 400;
+/** Trust Monitor > Retrieve Events documents limit default 50, max 200. */
+const TRUST_MONITOR_PAGE_SIZE = 200;
+/** Offline Enrollment Logs returns the 1000 earliest events per call. */
+const OFFLINE_ENROLLMENT_PAGE_SIZE = 1000;
+const MAX_OFFLINE_ENROLLMENT_RECORDS = 5000;
 const MAX_RETRIES = 4;
 const INACTIVE_USER_DAYS = 90;
 const LOCKOUT_THRESHOLD_MAX = 10;
@@ -1318,19 +1323,70 @@ export class DuoAuditorClient {
     return this.listCursorPages(DUO_ENDPOINTS.telephonyLogs, this.buildWindow(days), maxRecords);
   }
 
-  /** Admin API reference: Logs > Offline Enrollment Logs (mintime in Unix seconds, unpaged). */
-  async listOfflineEnrollmentLogs(days: number): Promise<JsonRecord[]> {
-    const envelope = await this.requestEnvelope(DUO_ENDPOINTS.offlineEnrollmentLogs, {
-      mintime: this.buildSecondsWindow(days).mintime,
-    });
-    const items = extractArrayPayload(envelope.response);
-    this.collectionStatuses.set(DUO_ENDPOINTS.offlineEnrollmentLogs, { complete: true, totalObjects: items.length });
-    return items;
+  /**
+   * Admin API reference: Logs > Offline Enrollment Logs. Each call returns the 1000 earliest
+   * events at or after mintime (Unix seconds); later pages are fetched by advancing mintime to
+   * the last returned timestamp plus one, as the reference recommends to avoid duplicates.
+   */
+  async listOfflineEnrollmentLogs(days: number, maxRecords: number = MAX_OFFLINE_ENROLLMENT_RECORDS): Promise<JsonRecord[]> {
+    const items: JsonRecord[] = [];
+    let mintime = this.buildSecondsWindow(days).mintime;
+    let complete = true;
+
+    while (true) {
+      const envelope = await this.requestEnvelope(DUO_ENDPOINTS.offlineEnrollmentLogs, { mintime });
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
+      if (page.length < OFFLINE_ENROLLMENT_PAGE_SIZE) break;
+      const newestSeconds = page.reduce<number | undefined>((newest, event) => {
+        const timestamp = parseTimestamp(event.timestamp);
+        if (timestamp === null) return newest;
+        const seconds = Math.floor(timestamp / 1000);
+        return newest === undefined || seconds > newest ? seconds : newest;
+      }, undefined);
+      if (items.length >= maxRecords || newestSeconds === undefined || newestSeconds + 1 <= mintime) {
+        complete = false;
+        break;
+      }
+      mintime = newestSeconds + 1;
+    }
+
+    const result = items.slice(0, maxRecords);
+    if (result.length < items.length) complete = false;
+    this.collectionStatuses.set(DUO_ENDPOINTS.offlineEnrollmentLogs, { complete, totalObjects: complete ? result.length : undefined });
+    return result;
   }
 
-  /** Admin API reference: Trust Monitor > Retrieve Events. */
+  /**
+   * Admin API reference: Trust Monitor > Retrieve Events (limit max 200). The response metadata
+   * carries an opaque next_offset string that is sent back as the offset parameter until it is
+   * absent; there is no total_objects count for this endpoint.
+   */
   async listTrustMonitorEvents(days: number, maxRecords: number = MAX_LOG_RECORDS): Promise<JsonRecord[]> {
-    return this.listOffsetPages(DUO_ENDPOINTS.trustMonitorEvents, this.buildWindow(days), 50, 2, maxRecords);
+    const path = DUO_ENDPOINTS.trustMonitorEvents;
+    const window = this.buildWindow(days);
+    const items: JsonRecord[] = [];
+    let cursor: string | undefined;
+    let complete = true;
+
+    while (true) {
+      const envelope = await this.requestEnvelope(path, {
+        ...window,
+        limit: Math.min(TRUST_MONITOR_PAGE_SIZE, Math.max(1, maxRecords - items.length)),
+        offset: cursor,
+      });
+      items.push(...extractArrayPayload(envelope.response));
+      const next = nextOffsetValue(extractMetadata(envelope), "next_offset");
+      if (next === undefined) break;
+      if (items.length >= maxRecords) {
+        complete = false;
+        break;
+      }
+      cursor = String(next);
+    }
+
+    this.collectionStatuses.set(path, { totalObjects: undefined, complete });
+    return items.slice(0, maxRecords);
   }
 
   private async listOffsetPages(
@@ -3678,18 +3734,22 @@ export function assessDuoMonitoring(
     const priorityEvents = trustMonitorEvents.filter((event) => getBooleanish(event, "priority_event")).length;
     const newStateEvents = trustMonitorEvents.filter((event) => asString(event.state)?.toLowerCase() === "new").length;
     findings.push(
-      buildFinding(
-        "DUO-MON-002",
-        trustMonitorEvents.length > 0 ? "Pass" : "Partial",
-        trustMonitorEvents.length > 0
-          ? "Trust Monitor surfaced recent events for review."
-          : "No Trust Monitor events were returned in the requested lookback window.",
-        [
-          `trust_monitor_events=${trustMonitorEvents.length}`,
-          `priority_events=${priorityEvents}`,
-          `new_state_events=${newStateEvents}`,
-        ],
-        "Keep Trust Monitor triage wired into the response workflow and verify zero-event windows are expected for the tenant.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-MON-002",
+          trustMonitorEvents.length > 0 ? "Pass" : "Partial",
+          trustMonitorEvents.length > 0
+            ? "Trust Monitor surfaced recent events for review."
+            : "No Trust Monitor events were returned in the requested lookback window.",
+          [
+            `trust_monitor_events=${trustMonitorEvents.length}`,
+            `priority_events=${priorityEvents}`,
+            `new_state_events=${newStateEvents}`,
+          ],
+          "Keep Trust Monitor triage wired into the response workflow and verify zero-event windows are expected for the tenant.",
+        ),
+        data.trustMonitorEvents,
+        MAX_LOG_RECORDS,
       ),
     );
   }

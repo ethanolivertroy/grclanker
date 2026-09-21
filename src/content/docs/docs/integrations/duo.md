@@ -59,8 +59,8 @@ Do not grant any write permission. The tools never call a mutating endpoint.
 | `GET /admin/v3/integrations` | Integrations, Retrieve Integrations | `type`, `policy_key`, `user_access`, `sensitivity_level`, `compliance_requirements`, `prompt_v4_enabled`, `frameless_auth_prompt_enabled`, `self_service_allowed`, `adminapi_*`; `limit` max 500; v5 signing |
 | `GET /admin/v2/logs/authentication` | Logs, Authentication Logs | `mintime` and `maxtime` in milliseconds, `next_offset` cursor; `result`, `factor`, `timestamp`, `user.key`, `access_device.location.country` |
 | `GET /admin/v2/logs/activity`, `GET /admin/v2/logs/telephony` | Logs | activity log evidence; telephony usage (`type` sms or phone) |
-| `GET /admin/v1/logs/offline_enrollment` | Logs, Offline Enrollment Logs | `mintime` in Unix seconds; `action`, `description.factor` |
-| `GET /admin/v1/trust_monitor/events` | Trust Monitor | `priority_event`, `state` |
+| `GET /admin/v1/logs/offline_enrollment` | Logs, Offline Enrollment Logs | `mintime` in Unix seconds; returns the 1000 earliest events per call, so full pages are followed by advancing `mintime` to the newest `timestamp` plus one (capped at 5000 events, reported incomplete beyond that); `action`, `description.factor` |
+| `GET /admin/v1/trust_monitor/events` | Trust Monitor, Retrieve Events | `mintime` and `maxtime` in milliseconds, `limit` max 200; `metadata.next_offset` is an opaque cursor sent back as `offset`; `priority_event`, `state` |
 
 ## Control coverage
 
@@ -123,7 +123,8 @@ The smoke test exits 0 without credentials. With credentials it runs the access 
 - Offline access limits (days and authentication count) are not exposed by the Admin API; verify them in the Global Policy Offline Access section.
 - Device health, operating system, disk encryption, screen lock, User Location, and access device location data require Duo Advantage or Premier. On other editions the affected findings are Manual and name the edition reported by `/admin/v1/info/summary`.
 - Critical application detection relies on `sensitivity_level` and `compliance_requirements`, which administrators set in the Admin Panel. Untagged tenants receive a Manual finding.
-- Log-based checks sample up to 400 events per log within the lookback window and report when the sample is incomplete.
+- Log-based checks sample up to 400 events per log within the lookback window; when the sample is incomplete the affected findings are capped at Partial and report seen, total, and cap counts.
+- The reference notes that Trust Monitor is available to Duo Premier and Advantage accounts created before September 29, 2025 and that the events endpoint reaches end of support on January 31, 2027. Tenants without it receive a Manual DUO-MON-002 naming the endpoint and permission.
 - The Auth API and Accounts API are out of scope; only Admin API read endpoints are used.
 
 ## References

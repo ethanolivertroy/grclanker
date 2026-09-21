@@ -448,6 +448,90 @@ test("DuoAuditorClient sends documented paths and second-based windows for info 
   assert.equal(String(offlineRequest.searchParams.get("mintime")).length, 10);
 });
 
+test("DuoAuditorClient pages offline enrollment logs by advancing mintime and marks capped reads incomplete", async () => {
+  const requests = [];
+  const firstPageStart = NOW_SECONDS - 20 * DAY_SECONDS;
+  const fetchImpl = async (input) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    assert.equal(requestUrl.pathname, "/admin/v1/logs/offline_enrollment");
+    const mintime = Number(requestUrl.searchParams.get("mintime"));
+    requests.push(mintime);
+    if (requests.length === 1) {
+      // Exactly 1000 events: the documented page size, so more may exist.
+      const events = Array.from({ length: 1000 }, (_, index) => ({
+        action: "o2fa_user_provisioned",
+        username: `user${index}`,
+        timestamp: firstPageStart + index,
+      }));
+      return new Response(JSON.stringify({ stat: "OK", response: events }), { status: 200 });
+    }
+    return new Response(
+      JSON.stringify({
+        stat: "OK",
+        response: [
+          { action: "o2fa_user_reenrolled", username: "late", timestamp: mintime + 5 },
+          { action: "o2fa_user_deprovisioned", username: "later", timestamp: mintime + 9 },
+        ],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const client = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  const events = await client.listOfflineEnrollmentLogs(30);
+  assert.equal(events.length, 1002);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1], firstPageStart + 999 + 1, "the second call starts at the newest timestamp plus one");
+  assert.deepEqual(client.collectionStatus("/admin/v1/logs/offline_enrollment"), { complete: true, totalObjects: 1002 });
+
+  const cappedClient = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  requests.length = 0;
+  const capped = await cappedClient.listOfflineEnrollmentLogs(30, 1000);
+  assert.equal(capped.length, 1000);
+  assert.equal(requests.length, 1, "the cap stops paging after the full first page");
+  assert.deepEqual(cappedClient.collectionStatus("/admin/v1/logs/offline_enrollment"), { complete: false, totalObjects: undefined });
+});
+
+test("DuoAuditorClient follows the Trust Monitor next_offset cursor and never reports a truncated read complete", async () => {
+  const requests = [];
+  const fetchImpl = async (input) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    assert.equal(requestUrl.pathname, "/admin/v1/trust_monitor/events");
+    requests.push(Object.fromEntries(requestUrl.searchParams.entries()));
+    const offset = requestUrl.searchParams.get("offset");
+    if (offset === null) {
+      return new Response(
+        JSON.stringify({
+          stat: "OK",
+          response: { events: [{ sekey: "SE1", state: "new" }, { sekey: "SE2", state: "new" }], metadata: { next_offset: "31229" } },
+        }),
+        { status: 200 },
+      );
+    }
+    assert.equal(offset, "31229", "the documented opaque cursor is sent back verbatim as offset");
+    return new Response(
+      JSON.stringify({ stat: "OK", response: { events: [{ sekey: "SE3", state: "closed" }], metadata: {} } }),
+      { status: 200 },
+    );
+  };
+
+  const client = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  const events = await client.listTrustMonitorEvents(30);
+  assert.equal(events.length, 3);
+  assert.equal(requests.length, 2);
+  assert.equal("offset" in requests[0], false, "the first request carries no offset");
+  assert.equal("next_offset" in requests[1], false, "the cursor is passed as offset, not next_offset");
+  assert.equal(requests[0].limit, "200");
+  assert.equal(String(requests[0].mintime).length, 13, "Trust Monitor mintime is a 13-digit millisecond timestamp");
+  assert.equal(String(requests[0].maxtime).length, 13);
+  assert.deepEqual(client.collectionStatus("/admin/v1/trust_monitor/events"), { totalObjects: undefined, complete: true });
+
+  const cappedClient = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  const capped = await cappedClient.listTrustMonitorEvents(30, 2);
+  assert.equal(capped.length, 2);
+  assert.deepEqual(cappedClient.collectionStatus("/admin/v1/trust_monitor/events"), { totalObjects: undefined, complete: false });
+});
+
 test("DuoAuditorClient records incomplete inventories when total_objects exceeds the collected records", async () => {
   const fetchImpl = async (input) => {
     const requestUrl = new URL(typeof input === "string" ? input : input.toString());
@@ -1090,6 +1174,10 @@ test("assessDuoMonitoring caps log-backed findings at Partial when the log sampl
   const telephony = findingById(result, "DUO-MON-003");
   assert.equal(telephony.status, "Partial", "telephony capacity cannot pass on an incomplete telephony log");
   assert.ok(telephony.evidence.some((line) => line.includes("inventory_seen=0 inventory_total=unknown collection_cap=400")));
+
+  const truncatedTrustMonitor = compliantMonitoringData();
+  truncatedTrustMonitor.trustMonitorEvents = { data: truncatedTrustMonitor.trustMonitorEvents.data, complete: false };
+  assert.equal(findingById(assessDuoMonitoring(truncatedTrustMonitor, config), "DUO-MON-002").status, "Partial");
 
   const complete = assessDuoMonitoring(compliantMonitoringData(), config);
   for (const id of ["DUO-MON-001", "DUO-MON-003", "DUO-MON-005"]) {
