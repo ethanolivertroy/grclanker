@@ -391,7 +391,7 @@ function policyFixture(overrides = {}) {
     ]),
     sslExemptedUrls: readable({ urls: ["bank.example.com"] }),
     sandboxRules: readable([{ id: 1, name: "Sandbox block", state: "ENABLED", baRuleAction: "BLOCK", firstTimeEnable: true, firstTimeOperation: "QUARANTINE" }]),
-    sandboxSettings: readable({ fileHashesToBeBlocked: ["abc"] }),
+    sandboxSettings: readable({ md5HashValueList: ["d41d8cd98f00b204e9800998ecf8427e"] }),
     advancedThreatSettings: readable({
       riskTolerance: 50,
       malwareSitesBlocked: true,
@@ -502,7 +502,7 @@ test("assessZiaPolicy collects through the client, follows sub-locations, and re
   const client = {
     getResolvedConfig: () => ziaConfig(),
     getNow: () => NOW,
-    listUrlFilteringRules: async () => [],
+    listUrlFilteringRules: async () => ({ items: [], truncated: false, pagesFetched: 1 }),
     listFirewallFilteringRules: async () => { throw Object.assign(new Error("ZIA GET /firewallFilteringRules failed (403)"), { status: 403, product: "zia" }); },
     listFirewallDnsRules: async () => [],
     listDlpEngines: async () => [],
@@ -519,8 +519,8 @@ test("assessZiaPolicy collects through the client, follows sub-locations, and re
     getSecurityDenylist: async () => ({}),
     listLocations: async () => ({ items: [{ id: 7, name: "HQ" }], truncated: false, pagesFetched: 1 }),
     listSubLocations: async (id) => { calls.push(id); return [{ id: 8, name: "Guest", parentId: 7 }]; },
-    listGreTunnels: async () => [],
-    listVpnCredentials: async () => [],
+    listGreTunnels: async () => ({ items: [], truncated: false, pagesFetched: 1 }),
+    listVpnCredentials: async () => ({ items: [], truncated: false, pagesFetched: 1 }),
     listBandwidthControlRules: async () => [],
     listBrowserIsolationProfiles: async () => [],
     listCloudAppRuleTypes: async () => ["WEBMAIL"],
@@ -646,7 +646,7 @@ test("assessZpa: partial pagination and undated records cap verdicts at warn", (
   fixture.accessRules = { ...fixture.accessRules, truncated: true, seen: 200, total: 201 };
   fixture.appConnectors = readable([
     { id: "c-1", name: "connector-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: RECENT_EPOCH_MS },
-    { id: "c-2", name: "connector-2", enabled: true, controlChannelStatus: "ZPN_STATUS_UNKNOWN", appConnectorGroupName: "DC East" },
+    { id: "c-2", name: "connector-2", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East" },
   ]);
   fixture.enrollmentCertificates = readable([{ id: "ec-1", name: "Connector", validToInEpochSec: FUTURE_EPOCH }, { id: "ec-2", name: "Undated" }]);
   const result = assessZpaData(fixture);
@@ -655,7 +655,8 @@ test("assessZpa: partial pagination and undated records cap verdicts at warn", (
   assert.equal(findingById(result, "ZS-09").status, "warn");
   assert.equal(findingById(result, "ZS-10").status, "warn");
   assert.equal(findingById(result, "ZS-11").status, "warn");
-  assert.match(findingById(result, "ZS-11").summary, /no lastBrokerConnectTime/);
+  assert.match(findingById(result, "ZS-11").summary, /1 authenticated but with no lastBrokerConnectTime/);
+  assert.deepEqual(findingById(result, "ZS-11").evidence.authenticated_without_connect_time, ["connector-2"]);
   assert.equal(findingById(result, "ZS-24").status, "warn");
   assert.match(findingById(result, "ZS-24").summary, /no validToInEpochSec/);
   assert.ok(result.findings.every((item) => item.status !== "pass" || !["ZS-08", "ZS-09", "ZS-10", "ZS-11", "ZS-24"].includes(item.id)));

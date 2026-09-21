@@ -31,6 +31,8 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
 const MAX_RETRY_AFTER_MS = 60_000;
 const ZIA_PAGE_SIZE = 1000;
+const ZIA_URL_RULE_PAGE_SIZE = 100;
+const ZIA_FIREWALL_RULE_PAGE_SIZE = 5000;
 const ZIA_MAX_PAGES = 50;
 const ZPA_PAGE_SIZE = 500;
 const ZPA_MAX_PAGES = 200;
@@ -721,8 +723,8 @@ export interface ZiaReadClient {
   getPasswordExpirySettings(): Promise<JsonRecord>;
   getAuditLogReportStatus(): Promise<JsonRecord>;
   listNssFeeds(): Promise<JsonRecord[]>;
-  listUrlFilteringRules(): Promise<JsonRecord[]>;
-  listFirewallFilteringRules(): Promise<JsonRecord[]>;
+  listUrlFilteringRules(): Promise<PagedList>;
+  listFirewallFilteringRules(): Promise<PagedList>;
   listFirewallDnsRules(): Promise<JsonRecord[]>;
   listDlpEngines(): Promise<JsonRecord[]>;
   listDlpDictionaries(): Promise<JsonRecord[]>;
@@ -738,8 +740,8 @@ export interface ZiaReadClient {
   getSecurityDenylist(): Promise<JsonRecord>;
   listLocations(): Promise<PagedList>;
   listSubLocations(locationId: string): Promise<JsonRecord[]>;
-  listGreTunnels(): Promise<JsonRecord[]>;
-  listVpnCredentials(): Promise<JsonRecord[]>;
+  listGreTunnels(): Promise<PagedList>;
+  listVpnCredentials(): Promise<PagedList>;
   listBandwidthControlRules(): Promise<JsonRecord[]>;
   listBrowserIsolationProfiles(): Promise<JsonRecord[]>;
   listCloudAppRuleTypes(): Promise<string[]>;
@@ -871,13 +873,16 @@ export class ZiaApiClient implements ZiaReadClient {
     return asRecordArray(await this.request("GET", path, query));
   }
 
-  async getPaged(path: string, query: JsonRecord = {}): Promise<PagedList> {
+  // Offset paging for the ZIA endpoints whose reference documents page and pageSize. The requested
+  // pageSize is the documented maximum (1000) or, where the reference states no maximum, the documented
+  // default, so a short page is a reliable end-of-list signal and a full final page costs one extra call.
+  async getPaged(path: string, query: JsonRecord = {}, pageSize = ZIA_PAGE_SIZE): Promise<PagedList> {
     const items: JsonRecord[] = [];
     let page = 1;
     for (; page <= ZIA_MAX_PAGES; page += 1) {
-      const pageItems = await this.getList(path, { ...query, page, pageSize: ZIA_PAGE_SIZE });
+      const pageItems = await this.getList(path, { ...query, page, pageSize });
       items.push(...pageItems);
-      if (pageItems.length < ZIA_PAGE_SIZE) {
+      if (pageItems.length < pageSize) {
         return { items, truncated: false, pagesFetched: page };
       }
     }
@@ -911,6 +916,10 @@ export class ZiaApiClient implements ZiaReadClient {
     return this.get("/passwordExpiry/settings");
   }
 
+  // The reference marks statusId as a required query parameter on GET /auditlogEntryReport but documents no
+  // value for it; it refers to an export task that POST /auditlogEntryReport creates, which this read-only
+  // inspector never issues. zscaler-sdk-go (adminauditlogs.GetAll) and zscaler-sdk-python (audit_logs.get_status)
+  // both send the bare GET, so the same request is sent here and a 400 is reported as unreadable, never pass.
   getAuditLogReportStatus(): Promise<JsonRecord> {
     return this.get("/auditlogEntryReport");
   }
@@ -919,12 +928,12 @@ export class ZiaApiClient implements ZiaReadClient {
     return this.getList("/nssFeeds");
   }
 
-  listUrlFilteringRules(): Promise<JsonRecord[]> {
-    return this.getList("/urlFilteringRules");
+  listUrlFilteringRules(): Promise<PagedList> {
+    return this.getPaged("/urlFilteringRules", {}, ZIA_URL_RULE_PAGE_SIZE);
   }
 
-  listFirewallFilteringRules(): Promise<JsonRecord[]> {
-    return this.getList("/firewallFilteringRules");
+  listFirewallFilteringRules(): Promise<PagedList> {
+    return this.getPaged("/firewallFilteringRules", {}, ZIA_FIREWALL_RULE_PAGE_SIZE);
   }
 
   listFirewallDnsRules(): Promise<JsonRecord[]> {
@@ -987,12 +996,14 @@ export class ZiaApiClient implements ZiaReadClient {
     return this.getList(`/locations/${encodeURIComponent(locationId)}/sublocations`);
   }
 
-  listGreTunnels(): Promise<JsonRecord[]> {
-    return this.getList("/greTunnels");
+  listGreTunnels(): Promise<PagedList> {
+    return this.getPaged("/greTunnels");
   }
 
-  listVpnCredentials(): Promise<JsonRecord[]> {
-    return this.getList("/vpnCredentials");
+  // includeOnlyWithoutLocation defaults to true in the reference, which would hide every credential bound
+  // to a location, so it is sent explicitly as false to read the whole inventory.
+  listVpnCredentials(): Promise<PagedList> {
+    return this.getPaged("/vpnCredentials", { includeOnlyWithoutLocation: false });
   }
 
   listBandwidthControlRules(): Promise<JsonRecord[]> {
@@ -1043,9 +1054,9 @@ function datasetErrors(label: string, dataset: CollectedDataset<unknown>): strin
   return dataset.error ? [`${label}: ${dataset.error}`] : [];
 }
 
-function datasetTruncations(label: string, dataset: CollectedDataset<unknown>): string[] {
+function datasetTruncations(label: string, dataset: CollectedDataset<unknown>, unit = "pages"): string[] {
   if (!dataset.truncated) return [];
-  const pages = dataset.total !== undefined ? `${dataset.seen ?? 0} of ${dataset.total} pages` : `${dataset.seen ?? 0} pages`;
+  const pages = dataset.total !== undefined ? `${dataset.seen ?? 0} of ${dataset.total} ${unit}` : `${dataset.seen ?? 0} ${unit}`;
   return [`${label}: only ${pages} were read, so the inventory is partial and absence of a record cannot support a pass`];
 }
 
@@ -1149,6 +1160,23 @@ function isSuperAdminRole(role: JsonRecord): boolean {
   return /super/i.test(asString(role.name) ?? "");
 }
 
+type AdminScopeSource = "adminScope.Type" | "adminScopeType" | "absent";
+
+// The reference documents adminScope as an object whose Type attribute carries the scope enum (ORGANIZATION,
+// DEPARTMENT, LOCATION, LOCATION_GROUP, ZDX_APP, USER_GROUP) and warns that the attribute name is subject to
+// change. The flattened adminScopeType key exists only in zscaler-sdk-go (adminusers.go) and is read as legacy
+// evidence; an admin with neither is reported as unscoped-unknown rather than assumed organization-wide.
+function adminScopeType(admin: JsonRecord): { type?: string; source: AdminScopeSource } {
+  const scope = asObject(admin.adminScope);
+  const documented = asString(scope?.Type) ?? asString(scope?.type);
+  if (documented) return { type: documented.toUpperCase(), source: "adminScope.Type" };
+  const legacy = asString(admin.adminScopeType);
+  if (legacy) return { type: legacy.toUpperCase(), source: "adminScopeType" };
+  return { source: "absent" };
+}
+
+const AUDIT_REPORT_STATUS_ID_NOTE = "the published reference marks statusId as a required query parameter that names an export task created by POST /auditlogEntryReport, which this read-only inspector never issues, and both zscaler-sdk-go and zscaler-sdk-python send the same bare GET";
+
 export function assessZiaAccessControlData(
   data: ZiaAccessControlData,
   options: { maxSuperAdmins?: number } = {},
@@ -1190,10 +1218,14 @@ export function assessZiaAccessControlData(
       const roleId = asString(asObject(admin.role)?.id);
       return (roleId !== undefined && superRoleIds.has(roleId)) || /super/i.test(adminRoleName(admin));
     });
-    const unscopedAdmins = enabledAdmins.filter((admin) => (asString(admin.adminScopeType) ?? "ORGANIZATION").toUpperCase() === "ORGANIZATION");
+    const scopes = enabledAdmins.map(adminScopeType);
+    const unscopedAdmins = scopes.filter((scope) => scope.type === "ORGANIZATION");
+    const scopeUnknown = scopes.filter((scope) => scope.type === undefined);
+    const legacyScopeField = scopes.filter((scope) => scope.source === "adminScopeType");
+    const scopeNote = scopeUnknown.length > 0 ? ` (${scopeUnknown.length} returned no adminScope and are not counted as scoped)` : "";
     const disabledAdmins = admins.length - enabledAdmins.length;
     let status: ZscalerFindingStatus = "pass";
-    let summary = `${superAdmins.length} of ${enabledAdmins.length} enabled administrators hold a Super Admin role (threshold ${maxSuperAdmins}); ${unscopedAdmins.length} are organization-scoped.`;
+    let summary = `${superAdmins.length} of ${enabledAdmins.length} enabled administrators hold a Super Admin role (threshold ${maxSuperAdmins}); ${unscopedAdmins.length} are organization-scoped${scopeNote}.`;
     if (superRoleIds.size === 0) {
       status = "warn";
       summary = `No role returned by GET /adminRoles/lite was identifiable as Super Admin, so privilege concentration could not be measured across ${enabledAdmins.length} enabled administrators.`;
@@ -1210,13 +1242,24 @@ export function assessZiaAccessControlData(
       super_admins: truncateList(superAdmins.map(adminLabel)),
       roles: truncateList(data.adminRoles.data.map((role) => ({ name: asString(role.name) ?? null, roleType: asString(role.roleType) ?? null }))),
       organization_scoped_admins: unscopedAdmins.length,
+      admins_without_scope: scopeUnknown.length,
+      admins_scoped_via_legacy_field: legacyScopeField.length,
+      admin_scope_field_source: "adminScope.Type per the published reference; adminScopeType is accepted only as zscaler-sdk-go legacy evidence",
       password_expiration_enabled: asBoolean(data.passwordExpiry.data.passwordExpirationEnabled) ?? null,
       password_expiry_days: asNumber(data.passwordExpiry.data.passwordExpiryDays) ?? null,
     }));
   }
 
   const auditEvidence = "Confirm in Analytics > Insights > Audit Logs that administrator actions are recorded, and document the NSS or Cloud NSS feed (Administration > Nanolog Streaming Service) that exports admin audit logs plus the SIEM retention period.";
-  if (data.auditLogReport.error) {
+  if (data.auditLogReport.statusCode === 400) {
+    findings.push(finding(14, "manual", `Verdict unknown: GET /auditlogEntryReport returned 400 (${data.auditLogReport.error ?? "bad request"}); ${AUDIT_REPORT_STATUS_ID_NOTE}. The tenant enforces the documented statusId requirement, so audit log reachability cannot be verified through the API. ${auditEvidence}`, {
+      status_code: 400,
+      error: data.auditLogReport.error ?? null,
+      documented_request_shape: "GET /auditlogEntryReport?statusId={export task id}",
+      request_sent: "GET /auditlogEntryReport (bare, matching zscaler-sdk-go and zscaler-sdk-python)",
+      nss_feeds: data.nssFeeds.error ? null : data.nssFeeds.data.length,
+    }, auditEvidence));
+  } else if (data.auditLogReport.error) {
     findings.push(unreadableFinding(14, "GET /auditlogEntryReport", data.auditLogReport, auditEvidence));
   } else {
     const feeds = data.nssFeeds.data;
@@ -1505,7 +1548,6 @@ export interface ZpaReadClient {
   listBrowserAccessCertificates(): Promise<PagedList>;
   listEmergencyAccessUsers(): Promise<PagedList>;
   listAdministrators(): Promise<PagedList>;
-  listRoles(): Promise<PagedList>;
 }
 
 export class ZpaApiClient implements ZpaReadClient {
@@ -1623,6 +1665,7 @@ export class ZpaApiClient implements ZpaReadClient {
     return payload;
   }
 
+  // Offset paging for the ZPA list endpoints documented with page and pagesize and a list/totalPages wrapper.
   async getPaged(path: string, query: JsonRecord = {}): Promise<PagedList> {
     const items: JsonRecord[] = [];
     let totalPages: number | undefined;
@@ -1632,13 +1675,36 @@ export class ZpaApiClient implements ZpaReadClient {
         return { items: asRecordArray(payload), truncated: false, pagesFetched: 1, totalPages: 1 };
       }
       const object = asObject(payload) ?? {};
-      items.push(...asRecordArray(object.list ?? object.items));
-      totalPages = asNumber(object.totalPages) ?? (asString(object.nextPage) ? page + 1 : 1);
+      items.push(...asRecordArray(object.list));
+      totalPages = asNumber(object.totalPages) ?? 1;
       if (page >= totalPages) {
         return { items, truncated: false, pagesFetched: page, totalPages };
       }
     }
     return { items, truncated: true, pagesFetched: ZPA_MAX_PAGES, totalPages };
+  }
+
+  // Cursor paging for GET /emergencyAccess/users, the one ZPA surface documented with pageId and pageSize
+  // query parameters and an items/nextPage wrapper instead of list/totalPages.
+  async getCursorPaged(path: string, query: JsonRecord = {}, idKeys: string[] = ["id"]): Promise<PagedList> {
+    const items: JsonRecord[] = [];
+    const seen = new Set<string>();
+    let pageId: string | undefined;
+    for (let page = 1; page <= ZPA_MAX_PAGES; page += 1) {
+      const object = asObject(await this.get(path, { ...query, pageSize: ZPA_PAGE_SIZE, pageId })) ?? {};
+      for (const item of asRecordArray(object.items)) {
+        const key = idKeys.map((idKey) => asString(item[idKey])).find((value) => value !== undefined) ?? JSON.stringify(item);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push(item);
+      }
+      const nextPage = asString(object.nextPage);
+      if (!nextPage || nextPage === pageId) {
+        return { items, truncated: false, pagesFetched: page };
+      }
+      pageId = nextPage;
+    }
+    return { items, truncated: true, pagesFetched: ZPA_MAX_PAGES };
   }
 
   listApplicationSegments(): Promise<PagedList> {
@@ -1674,7 +1740,7 @@ export class ZpaApiClient implements ZpaReadClient {
   }
 
   listTrustedNetworks(): Promise<PagedList> {
-    return this.getPaged(this.customerPath("v2", "/trustedNetwork"));
+    return this.getPaged(this.customerPath("v2", "/network"));
   }
 
   listIdpControllers(): Promise<PagedList> {
@@ -1698,15 +1764,13 @@ export class ZpaApiClient implements ZpaReadClient {
   }
 
   listEmergencyAccessUsers(): Promise<PagedList> {
-    return this.getPaged(this.customerPath("v1", "/emergencyAccess/users"));
+    return this.getCursorPaged(this.customerPath("v1", "/emergencyAccess/users"), {}, ["userId", "emailId"]);
   }
 
+  // GET /administrators is absent from the published ZPA API reference; it is documented only by zscaler-sdk-go
+  // (administratorcontroller). Findings that use it say so and never let it carry a pass on its own.
   listAdministrators(): Promise<PagedList> {
     return this.getPaged(this.customerPath("v1", "/administrators"));
-  }
-
-  listRoles(): Promise<PagedList> {
-    return this.getPaged(this.customerPath("v1", "/roles"));
   }
 }
 
@@ -1767,7 +1831,7 @@ async function collectSubLocations(client: ZiaReadClient, locations: CollectedDa
   return {
     data: items,
     error: errors.length > 0 ? errors.slice(0, 5).join("; ") : undefined,
-    truncated: parents.length > MAX_SUBLOCATION_PARENTS || locations.truncated,
+    truncated: parents.length > MAX_SUBLOCATION_PARENTS,
     seen: Math.min(parents.length, MAX_SUBLOCATION_PARENTS),
     total: parents.length,
   };
@@ -1807,8 +1871,8 @@ async function collectCloudAppRules(client: ZiaReadClient): Promise<CollectedDat
 export async function collectZiaPolicyData(client: ZiaReadClient): Promise<ZiaPolicyData> {
   const locations = await collectPaged("zia", () => client.listLocations());
   return {
-    urlFilteringRules: await collect("zia", () => client.listUrlFilteringRules(), []),
-    firewallRules: await collect("zia", () => client.listFirewallFilteringRules(), []),
+    urlFilteringRules: await collectPaged("zia", () => client.listUrlFilteringRules()),
+    firewallRules: await collectPaged("zia", () => client.listFirewallFilteringRules()),
     dnsRules: await collect("zia", () => client.listFirewallDnsRules(), []),
     dlpEngines: await collect("zia", () => client.listDlpEngines(), []),
     dlpDictionaries: await collect("zia", () => client.listDlpDictionaries(), []),
@@ -1824,8 +1888,8 @@ export async function collectZiaPolicyData(client: ZiaReadClient): Promise<ZiaPo
     securityDenylist: await collect("zia", () => client.getSecurityDenylist(), {}),
     locations,
     subLocations: await collectSubLocations(client, locations),
-    greTunnels: await collect("zia", () => client.listGreTunnels(), []),
-    vpnCredentials: await collect("zia", () => client.listVpnCredentials(), []),
+    greTunnels: await collectPaged("zia", () => client.listGreTunnels()),
+    vpnCredentials: await collectPaged("zia", () => client.listVpnCredentials()),
     bandwidthRules: await collect("zia", () => client.listBandwidthControlRules(), []),
     isolationProfiles: await collect("zia", () => client.listBrowserIsolationProfiles(), []),
     cloudAppRules: await collectCloudAppRules(client),
@@ -1863,6 +1927,7 @@ function assessUrlFiltering(data: ZiaPolicyData): ZscalerFinding {
     blocked_categories: blockedCategories.size,
     missing_required_categories: missing,
     rules: ruleSummaries(rules.data),
+    partial_inventory: rules.truncated === true,
   };
   if (active.length === 0) {
     return finding(1, "fail", `${rules.data.length} URL filtering rules exist but every rule has state DISABLED, so nothing is enforced.`, evidence, evidenceNote);
@@ -1871,9 +1936,9 @@ function assessUrlFiltering(data: ZiaPolicyData): ZscalerFinding {
     return finding(1, "fail", `${active.length} enabled URL filtering rules exist but none uses action BLOCK; high-risk categories are not blocked.`, evidence, evidenceNote);
   }
   if (missing.length > 0) {
-    return finding(1, "warn", `${blockRules.length} enabled BLOCK rules cover ${blockedCategories.size} categories, but these baseline categories are not blocked: ${missing.join(", ")}.`, evidence, evidenceNote);
+    return finding(1, "warn", `${blockRules.length} enabled BLOCK rules cover ${blockedCategories.size} categories, but these baseline categories are not blocked: ${missing.join(", ")}.${partialSuffix(rules, "URL filtering rule")}`, evidence, evidenceNote);
   }
-  return finding(1, "pass", `${blockRules.length} enabled BLOCK rules cover all ${REQUIRED_URL_BLOCK_CATEGORIES.length} baseline high-risk categories across ${blockedCategories.size} blocked categories.`, evidence);
+  return finding(1, capForPartial("pass", rules), `${blockRules.length} enabled BLOCK rules cover all ${REQUIRED_URL_BLOCK_CATEGORIES.length} baseline high-risk categories across ${blockedCategories.size} blocked categories.${partialSuffix(rules, "URL filtering rule")}`, evidence, rules.truncated ? evidenceNote : undefined);
 }
 
 function isUnboundedAllow(rule: JsonRecord): boolean {
@@ -1894,17 +1959,25 @@ function assessFirewall(data: ZiaPolicyData): ZscalerFinding {
   const defaultRule = defaultRules[0];
   const defaultAction = defaultRule ? (asString(defaultRule.action) ?? "").toUpperCase() : undefined;
   const unbounded = active.filter((rule) => asBoolean(rule.defaultRule) !== true && isUnboundedAllow(rule));
-  const blockWithoutLogging = active.filter((rule) => (asString(rule.action) ?? "").toUpperCase().startsWith("BLOCK") && asBoolean(rule.enableFullLogging) === false);
+  // enableFullLogging is not part of the published GET /firewallFilteringRules schema; it is documented only by
+  // zscaler-sdk-go (filteringrules.go, EnableFullLogging). It is read as supplementary evidence: an explicit false
+  // downgrades the verdict, while an absent field is reported as unevaluated and never counts toward pass.
+  const blockRules = active.filter((rule) => (asString(rule.action) ?? "").toUpperCase().startsWith("BLOCK"));
+  const blockWithoutLogging = blockRules.filter((rule) => asBoolean(rule.enableFullLogging) === false);
+  const blockLoggingUnknown = blockRules.filter((rule) => asBoolean(rule.enableFullLogging) === undefined);
   const evidence = {
     rule_count: rules.data.length,
     enabled_rules: active.length,
     default_rule_action: defaultAction ?? null,
     unbounded_allow_rules: truncateList(unbounded.map(ruleLabel)),
     block_rules_without_full_logging: blockWithoutLogging.length,
+    block_rules_with_unknown_logging: blockLoggingUnknown.length,
+    full_logging_field_source: "enableFullLogging is documented by zscaler-sdk-go only, not by the published response schema",
     rules: ruleSummaries(rules.data),
+    partial_inventory: rules.truncated === true,
   };
   if (!defaultRule) {
-    return finding(2, "warn", `${rules.data.length} firewall rules were returned but none is flagged defaultRule, so the fallback action is unknown; the inventory may be partial.`, evidence, evidenceNote);
+    return finding(2, "warn", `${rules.data.length} firewall rules were returned but none is flagged defaultRule, so the fallback action is unknown; the inventory may be partial.${partialSuffix(rules, "firewall rule")}`, evidence, evidenceNote);
   }
   if (defaultAction === "ALLOW") {
     return finding(2, "fail", `The Default Firewall Filtering Rule action is ALLOW, so any traffic not matched by ${active.length} enabled rules is permitted.`, evidence, evidenceNote);
@@ -1915,7 +1988,13 @@ function assessFirewall(data: ZiaPolicyData): ZscalerFinding {
   if (active.length === defaultRules.length) {
     return finding(2, "warn", `Only the default rule (${defaultAction}) is enabled; no explicit firewall rules define allowed services, so review whether required egress is being blocked or bypassed elsewhere.`, evidence, evidenceNote);
   }
-  return finding(2, blockWithoutLogging.length > 0 ? "warn" : "pass", `Default rule action is ${defaultAction}, ${active.length} enabled rules are scoped, and no unbounded allow rules exist${blockWithoutLogging.length > 0 ? `; ${blockWithoutLogging.length} block rule(s) have full logging disabled` : ""}.`, evidence);
+  const loggingNote = blockWithoutLogging.length > 0
+    ? `; ${blockWithoutLogging.length} block rule(s) have full logging disabled`
+    : blockLoggingUnknown.length > 0
+      ? `; block-rule logging was not evaluated for ${blockLoggingUnknown.length} rule(s) because enableFullLogging is absent from the response`
+      : "";
+  const status: ZscalerFindingStatus = blockWithoutLogging.length > 0 ? "warn" : "pass";
+  return finding(2, capForPartial(status, rules), `Default rule action is ${defaultAction}, ${active.length} enabled rules are scoped, and no unbounded allow rules exist${loggingNote}.${partialSuffix(rules, "firewall rule")}`, evidence, status === "warn" || rules.truncated ? evidenceNote : undefined);
 }
 
 function assessDlp(data: ZiaPolicyData): ZscalerFinding {
@@ -2001,12 +2080,16 @@ function assessSandbox(data: ZiaPolicyData): ZscalerFinding {
   const active = enabledRules(rules.data);
   const blocking = active.filter((rule) => (asString(rule.baRuleAction) ?? "").toUpperCase() === "BLOCK");
   const quarantineFirst = active.filter((rule) => asBoolean(rule.firstTimeEnable) === true && (asString(rule.firstTimeOperation) ?? "").toUpperCase() === "QUARANTINE");
+  // GET /behavioralAnalysisAdvancedSettings documents md5HashValueList; fileHashesToBeBlocked is the legacy shape
+  // kept by zscaler-sdk-go (sandbox_settings.go) and is recorded only as evidence when a tenant still returns it.
+  const legacyHashes = data.sandboxSettings.error ? [] : asArray(data.sandboxSettings.data.fileHashesToBeBlocked);
   const evidence = {
     rule_count: rules.data.length,
     enabled_rules: active.length,
     blocking_rules: blocking.length,
     quarantine_first_time_rules: quarantineFirst.length,
-    blocked_file_hashes: data.sandboxSettings.error ? null : asArray(data.sandboxSettings.data.fileHashesToBeBlocked).length,
+    blocked_file_hashes: data.sandboxSettings.error ? null : asArray(data.sandboxSettings.data.md5HashValueList).length,
+    legacy_file_hashes_to_be_blocked: legacyHashes.length > 0 ? legacyHashes.length : null,
     rules: ruleSummaries(rules.data, "baRuleAction"),
   };
   if (rules.data.length === 0) {
@@ -2041,15 +2124,21 @@ function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
   const profiles = data.isolationProfiles;
   if (profiles.error) return unreadableFinding(17, "GET /browserIsolation/profiles", profiles, `${evidenceNote} A 4xx here can also mean Cloud Browser Isolation is not licensed.`);
   if (data.urlFilteringRules.error) return unreadableFinding(17, "GET /urlFilteringRules", data.urlFilteringRules, evidenceNote);
-  const isolateRules = enabledRules(data.urlFilteringRules.data).filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "ISOLATE");
-  const evidence = { profile_count: profiles.data.length, profiles: truncateList(profiles.data.map((profile) => asString(profile.name) ?? asString(profile.id) ?? "profile")), isolate_url_rules: truncateList(isolateRules.map(ruleLabel)) };
+  const urlRules = data.urlFilteringRules;
+  const isolateRules = enabledRules(urlRules.data).filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "ISOLATE");
+  const evidence = {
+    profile_count: profiles.data.length,
+    profiles: truncateList(profiles.data.map((profile) => asString(profile.name) ?? asString(profile.id) ?? "profile")),
+    isolate_url_rules: truncateList(isolateRules.map(ruleLabel)),
+    url_rule_inventory_partial: urlRules.truncated === true,
+  };
   if (profiles.data.length === 0) {
     return finding(17, "manual", "Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.", evidence, evidenceNote);
   }
   if (isolateRules.length === 0) {
-    return finding(17, "warn", `${profiles.data.length} isolation profile(s) exist but no enabled URL filtering rule uses action ISOLATE, so isolation is never applied.`, evidence, evidenceNote);
+    return finding(17, "warn", `${profiles.data.length} isolation profile(s) exist but no enabled URL filtering rule uses action ISOLATE, so isolation is never applied.${partialSuffix(urlRules, "URL filtering rule")}`, evidence, evidenceNote);
   }
-  return finding(17, "pass", `${profiles.data.length} isolation profile(s) are applied by ${isolateRules.length} enabled ISOLATE URL filtering rule(s).`, evidence);
+  return finding(17, capForPartial("pass", urlRules), `${profiles.data.length} isolation profile(s) are applied by ${isolateRules.length} enabled ISOLATE URL filtering rule(s).${partialSuffix(urlRules, "URL filtering rule")}`, evidence, urlRules.truncated ? evidenceNote : undefined);
 }
 
 function locationLabel(location: JsonRecord): string {
@@ -2060,20 +2149,33 @@ function assessLocations(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Export Administration > Location Management showing per-location authentication, SSL inspection, firewall enablement, and the GRE tunnel or IPSec VPN credentials that carry each site.";
   const locations = data.locations;
   if (locations.error) return unreadableFinding(18, "GET /locations", locations, evidenceNote);
-  const all = [...locations.data, ...data.subLocations.data];
+  const subLocations = data.subLocations;
+  const all = [...locations.data, ...subLocations.data];
   const noAuth = all.filter((location) => asBoolean(location.authRequired) !== true);
   const noSsl = all.filter((location) => asBoolean(location.sslScanEnabled) !== true);
   const noFirewall = all.filter((location) => asBoolean(location.ofwEnabled) !== true);
+  const subLocationParentsRead = subLocations.seen ?? locations.data.length;
+  const subLocationParentsTotal = subLocations.total ?? locations.data.length;
+  const subLocationsPartial = subLocations.truncated === true || subLocations.error !== undefined;
+  const subLocationSuffix = subLocations.truncated
+    ? ` Sub-locations were read for only ${subLocationParentsRead} of ${subLocationParentsTotal} parent locations, so the sub-location inventory is partial and this verdict is capped at warn.`
+    : subLocations.error
+      ? ` Sub-locations could not be read for every parent (${subLocations.error}), so the sub-location inventory is partial and this verdict is capped at warn.`
+      : "";
   const evidence = {
     location_count: locations.data.length,
-    sub_location_count: data.subLocations.data.length,
-    sub_locations_readable: !data.subLocations.error,
+    sub_location_count: subLocations.data.length,
+    sub_locations_readable: !subLocations.error,
+    sub_location_parents_read: subLocationParentsRead,
+    sub_location_parents_total: subLocationParentsTotal,
     gre_tunnels: data.greTunnels.error ? null : data.greTunnels.data.length,
+    gre_tunnel_inventory_partial: data.greTunnels.truncated === true,
     vpn_credentials: data.vpnCredentials.error ? null : data.vpnCredentials.data.length,
+    vpn_credential_inventory_partial: data.vpnCredentials.truncated === true,
     locations_without_auth: truncateList(noAuth.map(locationLabel)),
     locations_without_ssl_scan: truncateList(noSsl.map(locationLabel)),
     locations_without_firewall: truncateList(noFirewall.map(locationLabel)),
-    partial_inventory: locations.truncated === true,
+    partial_inventory: locations.truncated === true || subLocationsPartial,
   };
   if (locations.data.length === 0) {
     return finding(18, "manual", "Empty inventory: zero locations exist, so the tenant may forward traffic only through Zscaler Client Connector; confirm that no GRE or IPSec sites are expected.", evidence, evidenceNote);
@@ -2083,9 +2185,10 @@ function assessLocations(data: ZiaPolicyData): ZscalerFinding {
   if (noSsl.length > 0) issues.push(`${noSsl.length} without sslScanEnabled`);
   if (noFirewall.length > 0) issues.push(`${noFirewall.length} without ofwEnabled`);
   if (issues.length > 0) {
-    return finding(18, "warn", `${all.length} locations and sub-locations reviewed: ${issues.join(", ")}.${partialSuffix(locations, "location")}`, evidence, evidenceNote);
+    return finding(18, "warn", `${all.length} locations and sub-locations reviewed: ${issues.join(", ")}.${partialSuffix(locations, "location")}${subLocationSuffix}`, evidence, evidenceNote);
   }
-  return finding(18, capForPartial("pass", locations), `All ${all.length} locations and sub-locations enforce authentication, SSL inspection, and the cloud firewall.${partialSuffix(locations, "location")}`, evidence);
+  const status = subLocationsPartial ? "warn" : capForPartial("pass", locations);
+  return finding(18, status, `All ${all.length} locations and sub-locations that were read enforce authentication, SSL inspection, and the cloud firewall.${partialSuffix(locations, "location")}${subLocationSuffix}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessCloudAppControl(data: ZiaPolicyData): ZscalerFinding {
@@ -2196,7 +2299,7 @@ export function assessZiaPolicyData(data: ZiaPolicyData, options: { maxSslExempt
     assessDnsSecurity(data),
     assessSecurityBaseline(data),
   ];
-  const datasets: Array<[string, CollectedDataset<unknown>]> = [
+  const datasets: Array<[string, CollectedDataset<unknown>, string?]> = [
     ["urlFilteringRules", data.urlFilteringRules],
     ["firewallFilteringRules", data.firewallRules],
     ["firewallDnsRules", data.dnsRules],
@@ -2213,12 +2316,12 @@ export function assessZiaPolicyData(data: ZiaPolicyData, options: { maxSslExempt
     ["security", data.securityAllowlist],
     ["security/advanced", data.securityDenylist],
     ["locations", data.locations],
-    ["sublocations", data.subLocations],
+    ["locations/{locationId}/sublocations", data.subLocations, "parent locations"],
     ["greTunnels", data.greTunnels],
     ["vpnCredentials", data.vpnCredentials],
     ["bandwidthControlRules", data.bandwidthRules],
     ["browserIsolation/profiles", data.isolationProfiles],
-    ["webApplicationRules", data.cloudAppRules],
+    ["webApplicationRules/{ruleType}", data.cloudAppRules, "rule types"],
   ];
   return {
     title: "Zscaler ZIA security policy",
@@ -2238,7 +2341,7 @@ export function assessZiaPolicyData(data: ZiaPolicyData, options: { maxSslExempt
     },
     findings,
     errors: datasets.flatMap(([label, dataset]) => datasetErrors(label, dataset)),
-    truncated: datasets.flatMap(([label, dataset]) => datasetTruncations(label, dataset)),
+    truncated: datasets.flatMap(([label, dataset, unit]) => datasetTruncations(label, dataset, unit)),
   };
 }
 
@@ -2250,7 +2353,8 @@ export async function assessZiaPolicy(client: ZiaReadClient | undefined, options
 }
 
 const ZPA_CONNECTED_STATUS = "ZPN_STATUS_AUTHENTICATED";
-const IDENTITY_OPERAND_TYPES = ["SCIM_GROUP", "SCIM", "SAML", "IDP", "POSTURE", "TRUSTED_NETWORK", "CLIENT_TYPE", "MACHINE_GRP", "PLATFORM", "COUNTRY_CODE", "RISK_FACTOR_TYPE", "CHROME_ENTERPRISE", "BRANCH_CONNECTOR_GROUP", "EDGE_CONNECTOR_GROUP", "USER_PORTAL", "CONSOLE"];
+const ZPA_ADMINISTRATORS_PROVENANCE = "a surface documented only by zscaler-sdk-go, not by the published ZPA API reference";
+const IDENTITY_OPERAND_TYPES = ["USER", "USER_GROUP", "SCIM_GROUP", "SCIM", "SAML", "IDP", "POSTURE", "TRUSTED_NETWORK", "CLIENT_TYPE", "MACHINE_GRP", "PLATFORM", "COUNTRY_CODE", "RISK_FACTOR_TYPE", "CHROME_ENTERPRISE", "BRANCH_CONNECTOR_GROUP", "EDGE_CONNECTOR_GROUP", "USER_PORTAL", "CONSOLE"];
 
 export interface ZpaData {
   applicationSegments: CollectedDataset<JsonRecord[]>;
@@ -2449,24 +2553,40 @@ function assessPosture(data: ZpaData): ZscalerFinding {
   return finding(10, profiles.truncated || data.accessRules.truncated ? "warn" : "pass", `All ${allow.length} enabled ALLOW rules enforce one of ${profiles.data.length} posture profiles.${partialSuffix(data.accessRules, "access rule")}`, evidence);
 }
 
-function connectorHealth(items: JsonRecord[], now: Date, staleDays: number): { connected: JsonRecord[]; disconnected: JsonRecord[]; undated: JsonRecord[] } {
-  const connected: JsonRecord[] = [];
-  const disconnected: JsonRecord[] = [];
-  const undated: JsonRecord[] = [];
+interface ConnectorHealth {
+  connected: JsonRecord[];
+  stale: JsonRecord[];
+  undated: JsonRecord[];
+  disconnected: JsonRecord[];
+}
+
+// A connector counts as healthy only when controlChannelStatus is ZPN_STATUS_AUTHENTICATED and lastBrokerConnectTime
+// is present and within staleDays. Authenticated connectors with an older timestamp are stale and those with no
+// timestamp are undated; both cap the verdict at warn because freshness cannot be shown (rule 4).
+function connectorHealth(items: JsonRecord[], now: Date, staleDays: number): ConnectorHealth {
+  const health: ConnectorHealth = { connected: [], stale: [], undated: [], disconnected: [] };
   for (const item of items) {
     const status = (asString(item.controlChannelStatus) ?? "").toUpperCase();
     const lastConnect = epochToDate(item.lastBrokerConnectTime);
-    if (status === ZPA_CONNECTED_STATUS) {
-      connected.push(item);
+    if (status !== ZPA_CONNECTED_STATUS) {
+      health.disconnected.push(item);
     } else if (!lastConnect) {
-      undated.push(item);
+      health.undated.push(item);
     } else if (daysBetween(now, lastConnect) > staleDays) {
-      disconnected.push(item);
+      health.stale.push(item);
     } else {
-      disconnected.push(item);
+      health.connected.push(item);
     }
   }
-  return { connected, disconnected, undated };
+  return health;
+}
+
+function connectorHealthIssues(health: ConnectorHealth, staleDays: number): string[] {
+  const issues: string[] = [];
+  if (health.disconnected.length > 0) issues.push(`${health.disconnected.length} not authenticated (controlChannelStatus is not ${ZPA_CONNECTED_STATUS})`);
+  if (health.stale.length > 0) issues.push(`${health.stale.length} authenticated but with lastBrokerConnectTime older than ${staleDays} days (stale_connector_days)`);
+  if (health.undated.length > 0) issues.push(`${health.undated.length} authenticated but with no lastBrokerConnectTime (cannot be counted as fresh, capped at warn)`);
+  return issues;
 }
 
 function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
@@ -2482,12 +2602,15 @@ function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
   }
   const groups = data.appConnectorGroups.error ? [] : data.appConnectorGroups.data.filter((group) => asBoolean(group.enabled) !== false);
   const singleConnectorGroups = groups.filter((group) => (perGroup.get(asString(group.name) ?? asString(group.id) ?? "") ?? 0) < 2).map(ruleLabel);
+  const authenticated = health.connected.length + health.stale.length + health.undated.length;
   const evidence = {
     connector_count: connectors.data.length,
     enabled_connectors: enabled.length,
     connected: health.connected.length,
+    stale_connector_days: staleDays,
+    stale: truncateList(health.stale.map(ruleLabel)),
+    authenticated_without_connect_time: truncateList(health.undated.map(ruleLabel)),
     disconnected: truncateList(health.disconnected.map(ruleLabel)),
-    never_connected_or_undated: truncateList(health.undated.map(ruleLabel)),
     connector_groups: data.appConnectorGroups.error ? null : groups.length,
     groups_without_redundancy: truncateList(singleConnectorGroups),
     partial_inventory: connectors.truncated === true,
@@ -2495,17 +2618,15 @@ function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
   if (connectors.data.length === 0) {
     return finding(11, "fail", "Empty inventory: zero app connectors are enrolled, so no private application can be reached through ZPA.", evidence, evidenceNote);
   }
-  if (health.connected.length === 0) {
+  if (authenticated === 0) {
     return finding(11, "fail", `None of the ${enabled.length} enabled connectors reports controlChannelStatus ${ZPA_CONNECTED_STATUS}.`, evidence, evidenceNote);
   }
-  const issues: string[] = [];
-  if (health.disconnected.length > 0) issues.push(`${health.disconnected.length} disconnected`);
-  if (health.undated.length > 0) issues.push(`${health.undated.length} with no lastBrokerConnectTime (treated as unhealthy, not fresh)`);
+  const issues = connectorHealthIssues(health, staleDays);
   if (singleConnectorGroups.length > 0) issues.push(`${singleConnectorGroups.length} group(s) with fewer than two connected connectors`);
   if (issues.length > 0) {
-    return finding(11, "warn", `${health.connected.length} of ${enabled.length} enabled connectors are connected; ${issues.join(", ")}.${partialSuffix(connectors, "connector")}`, evidence, evidenceNote);
+    return finding(11, "warn", `${health.connected.length} of ${enabled.length} enabled connectors are authenticated with a broker connect time within ${staleDays} days; ${issues.join(", ")}.${partialSuffix(connectors, "connector")}`, evidence, evidenceNote);
   }
-  return finding(11, capForPartial("pass", connectors), `All ${health.connected.length} enabled connectors are connected and every enabled connector group has at least two connected connectors.${partialSuffix(connectors, "connector")}`, evidence);
+  return finding(11, capForPartial("pass", connectors), `All ${health.connected.length} enabled connectors are authenticated with a broker connect time within ${staleDays} days, and every enabled connector group has at least two connected connectors.${partialSuffix(connectors, "connector")}`, evidence, connectors.truncated ? evidenceNote : undefined);
 }
 
 function assessIdp(data: ZpaData): ZscalerFinding {
@@ -2530,6 +2651,7 @@ function assessIdp(data: ZpaData): ZscalerFinding {
     saml_attributes: data.samlAttributes.error ? null : data.samlAttributes.data.length,
     zpa_admins_enabled: admins ? admins.length : null,
     zpa_admins_local_login_without_2fa: truncateList(weakAdmins.map((admin) => asString(admin.username) ?? asString(admin.email) ?? asString(admin.id) ?? "admin")),
+    zpa_administrators_surface: `${ZPA_ADMINISTRATORS_PROVENANCE}; it supplements the IdP evidence and is never the sole basis for pass`,
   };
   if (idps.data.length === 0) {
     return finding(12, "fail", "Empty inventory: zero identity providers are configured, so ZPA cannot authenticate users through SAML.", evidence, evidenceNote);
@@ -2540,13 +2662,13 @@ function assessIdp(data: ZpaData): ZscalerFinding {
   const issues: string[] = [];
   if (scimIdps.length === 0) issues.push("no user IdP has SCIM provisioning enabled");
   if (unsignedIdps.length > 0) issues.push(`${unsignedIdps.length} user IdP(s) do not sign SAML requests`);
-  if (admins === undefined) issues.push(`ZPA administrators could not be read (${unreadableReason(data.administrators)})`);
+  if (admins === undefined) issues.push(`ZPA administrators could not be read from GET /administrators (${unreadableReason(data.administrators)}; ${ZPA_ADMINISTRATORS_PROVENANCE})`);
   if (weakAdmins.length > 0) issues.push(`${weakAdmins.length} enabled ZPA administrator(s) allow local login without two-factor authentication`);
   if (adminIdps.length === 0) issues.push("no IdP is enabled for admin SSO");
   if (issues.length > 0) {
     return finding(12, "warn", `${userIdps.length} enabled user IdP(s) found, but: ${issues.join("; ")}.`, evidence, evidenceNote);
   }
-  return finding(12, "pass", `${userIdps.length} enabled user IdP(s) with SCIM provisioning and signed SAML requests, ${adminIdps.length} admin SSO IdP(s), and every enabled ZPA administrator has local login disabled or two-factor authentication.`, evidence);
+  return finding(12, "pass", `${userIdps.length} enabled user IdP(s) with SCIM provisioning and signed SAML requests, ${adminIdps.length} admin SSO IdP(s), and every enabled ZPA administrator has local login disabled or two-factor authentication (administrator state read from GET /administrators, ${ZPA_ADMINISTRATORS_PROVENANCE}).`, evidence);
 }
 
 function assessTimeoutPolicy(data: ZpaData, maxTimeoutHours: number): ZscalerFinding {
@@ -2587,7 +2709,7 @@ function assessTimeoutPolicy(data: ZpaData, maxTimeoutHours: number): ZscalerFin
 function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
   const evidenceNote = "Export Administration > Trusted Networks and identify the access or forwarding rules that reference them; if no on-premises detection is required, document that decision.";
   const networks = data.trustedNetworks;
-  if (networks.error) return unreadableFinding(15, "GET /trustedNetwork", networks, evidenceNote);
+  if (networks.error) return unreadableFinding(15, "GET /network", networks, evidenceNote);
   const referencing = [
     ...(data.accessRules.error ? [] : ruleUsesOperand(data.accessRules.data.filter(zpaRuleEnabled), "TRUSTED_NETWORK")),
     ...(data.forwardingRules.error ? [] : ruleUsesOperand(data.forwardingRules.data.filter(zpaRuleEnabled), "TRUSTED_NETWORK")),
@@ -2620,17 +2742,24 @@ function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
     service_edge_count: edges.data.length,
     enabled: enabled.length,
     connected: health.connected.length,
+    stale_connector_days: staleDays,
+    stale: truncateList(health.stale.map(ruleLabel)),
+    authenticated_without_connect_time: truncateList(health.undated.map(ruleLabel)),
     disconnected: truncateList(health.disconnected.map(ruleLabel)),
-    undated: truncateList(health.undated.map(ruleLabel)),
     service_edge_groups: data.serviceEdgeGroups.error ? null : data.serviceEdgeGroups.data.length,
+    partial_inventory: edges.truncated === true,
   };
   if (edges.data.length === 0) {
     return finding(21, "manual", "Not applicable or not configured: zero private service edges are enrolled, so the tenant relies on Zscaler public service edges; document that decision.", evidence, evidenceNote);
   }
-  if (health.disconnected.length + health.undated.length > 0) {
-    return finding(21, "warn", `${health.connected.length} of ${enabled.length} enabled private service edges are connected; ${health.disconnected.length} disconnected and ${health.undated.length} without a connect timestamp.`, evidence, evidenceNote);
+  if (health.connected.length + health.stale.length + health.undated.length === 0) {
+    return finding(21, "fail", `None of the ${enabled.length} enabled private service edges reports controlChannelStatus ${ZPA_CONNECTED_STATUS}.`, evidence, evidenceNote);
   }
-  return finding(21, capForPartial("pass", edges), `All ${health.connected.length} enabled private service edges are connected.`, evidence);
+  const issues = connectorHealthIssues(health, staleDays);
+  if (issues.length > 0) {
+    return finding(21, "warn", `${health.connected.length} of ${enabled.length} enabled private service edges are authenticated with a broker connect time within ${staleDays} days; ${issues.join(", ")}.${partialSuffix(edges, "service edge")}`, evidence, evidenceNote);
+  }
+  return finding(21, capForPartial("pass", edges), `All ${health.connected.length} enabled private service edges are authenticated with a broker connect time within ${staleDays} days.${partialSuffix(edges, "service edge")}`, evidence, edges.truncated ? evidenceNote : undefined);
 }
 
 function assessForwardingPolicy(data: ZpaData): ZscalerFinding {
@@ -2773,7 +2902,7 @@ export function assessZpaData(data: ZpaData, options: ZpaAssessmentOptions = {})
     ["serviceEdgeGroup", data.serviceEdgeGroups],
     ["serviceEdge", data.serviceEdges],
     ["posture", data.postureProfiles],
-    ["trustedNetwork", data.trustedNetworks],
+    ["network", data.trustedNetworks],
     ["idp", data.idpControllers],
     ["samlAttribute", data.samlAttributes],
     ["scimgroup", data.scimGroups],
