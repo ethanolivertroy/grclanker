@@ -28,16 +28,20 @@ import {
   collectPanosSnapshot,
   createPaloaltoClients,
   exportPaloaltoAuditBundle,
+  isCredentialXmlName,
   isPrimaryFinding,
   parseXml,
   redactSecrets,
+  redactXmlCredentials,
   resolvePaloaltoConfiguration,
   resolveSecureOutputPath,
   xmlFindAll,
   xmlPath,
   xmlText,
+  xmlToJson,
 } from "../dist/extensions/grc-tools/paloalto.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const noSleep = async () => {};
 
@@ -164,6 +168,44 @@ function goodMgtConfigXml() {
 
 function badMgtConfigXml() {
   return `<mgt-config><users>${["a", "b", "c", "d"].map((name) => `<entry name="${name}"><permissions><role-based><superuser>yes</superuser></role-based></permissions><phash>x</phash></entry>`).join("")}</users><password-complexity><enabled>no</enabled></password-complexity></mgt-config>`;
+}
+
+// Fake credential values a real PAN-OS config carries verbatim; none may reach the bundle.
+const FAKE_PANOS_SECRETS = {
+  phash: "$1$fakesalt$fakehashvalue0123456789",
+  radiusSecret: "radius-shared-secret-fake",
+  ldapBindPassword: "ldap-bind-password-fake",
+  presharedKey: "ike-psk-fake-0123456789abcdef",
+  communityString: "snmp-c0mmun1ty-fake",
+  authpwd: "snmpv3-auth-password-fake",
+  privpwd: "snmpv3-priv-password-fake",
+  privateKey: "-----BEGIN PRIVATE KEY-----fakekeymaterial-----END PRIVATE KEY-----",
+  apiKey: "integration-api-key-fake",
+};
+
+function secretsMgtConfigXml() {
+  return `<mgt-config><users><entry name="admin"><phash>${FAKE_PANOS_SECRETS.phash}</phash><permissions><role-based><superuser>yes</superuser></role-based></permissions><authentication-profile>mfa-radius</authentication-profile></entry><entry name="auditor"><permissions><role-based><superreader>yes</superreader></role-based></permissions><public-key>c3NoLXJzYSBBQUFBQjNOemFDMXlj</public-key></entry></users><password-complexity><enabled>yes</enabled></password-complexity></mgt-config>`;
+}
+
+function secretsSharedXml() {
+  return goodSharedXml().replace("</shared>", `<server-profile>
+      <radius><entry name="corp-radius"><server><entry name="r1"><ip-address>10.9.9.9</ip-address><secret>${FAKE_PANOS_SECRETS.radiusSecret}</secret><port>1812</port></entry></server></entry></radius>
+      <ldap><entry name="corp-ad"><bind-dn>cn=svc-panos,dc=example,dc=com</bind-dn><bind-password>${FAKE_PANOS_SECRETS.ldapBindPassword}</bind-password></entry></ldap>
+    </server-profile>
+    <certificate><entry name="gp-portal"><private-key>${FAKE_PANOS_SECRETS.privateKey}</private-key><public-key>-----BEGIN CERTIFICATE-----fakecert-----END CERTIFICATE-----</public-key></entry></certificate>
+    <integration api-key="${FAKE_PANOS_SECRETS.apiKey}" name="siem-connector"><url>https://siem.example.com</url></integration>
+  </shared>`);
+}
+
+function secretsNetworkXml() {
+  return `<network><ike><gateway><entry name="site-b"><authentication><pre-shared-key><key>${FAKE_PANOS_SECRETS.presharedKey}</key></pre-shared-key></authentication><peer-address><ip>203.0.113.10</ip></peer-address></entry></gateway></ike></network>`;
+}
+
+function secretsDeviceconfigXml() {
+  return goodDeviceconfigXml().replace(
+    "<snmp-setting><access-setting><version><v3/></version></access-setting></snmp-setting>",
+    `<snmp-setting><access-setting><version><v2c><snmp-community-string>${FAKE_PANOS_SECRETS.communityString}</snmp-community-string></v2c><v3><users><entry name="monitor"><authpwd>${FAKE_PANOS_SECRETS.authpwd}</authpwd><privpwd>${FAKE_PANOS_SECRETS.privpwd}</privpwd></entry></users></v3></version></access-setting></snmp-setting>`,
+  );
 }
 
 function systemInfoXml(version = "11.1.2") {
@@ -527,11 +569,12 @@ function mockedFetch(options = {}) {
     const xpath = url.searchParams.get("xpath");
     if (emptyAll) return xmlResponse(panosSuccess(`<${xpath.split("/").at(-1)}/>`));
     if (xpath.endsWith("/vsys")) return xmlResponse(panosSuccess(goodVsysXml()));
-    if (xpath.endsWith("/network")) return xmlResponse(panosSuccess("<network/>"));
-    if (xpath.endsWith("/deviceconfig")) return xmlResponse(panosSuccess(goodDeviceconfigXml()));
-    if (xpath.endsWith("/shared")) return xmlResponse(panosSuccess(goodSharedXml()));
+    if (xpath.endsWith("/network")) return xmlResponse(panosSuccess(options.withSecrets ? secretsNetworkXml() : "<network/>"));
+    if (xpath.endsWith("/deviceconfig")) return xmlResponse(panosSuccess(options.withSecrets ? secretsDeviceconfigXml() : goodDeviceconfigXml()));
+    if (xpath.endsWith("/shared")) return xmlResponse(panosSuccess(options.withSecrets ? secretsSharedXml() : goodSharedXml()));
     if (xpath.endsWith("/mgt-config")) {
-      return options.mgtDenied ? xmlResponse(PANOS_FORBIDDEN, 403) : xmlResponse(panosSuccess(goodMgtConfigXml()));
+      if (options.mgtDenied) return xmlResponse(PANOS_FORBIDDEN, 403);
+      return xmlResponse(panosSuccess(options.withSecrets ? secretsMgtConfigXml() : goodMgtConfigXml()));
     }
     return xmlResponse(panosSuccess("<empty/>"));
   };
@@ -756,6 +799,86 @@ test("exportPaloaltoAuditBundle writes core_data, analysis, compliance reports, 
   assert.equal(basename(clean.zipPath), `${basename(clean.outputDir)}.zip`);
   assert.notEqual(clean.zipPath, result.zipPath);
   assert.ok(existsSync(result.zipPath) && existsSync(clean.zipPath));
+});
+
+test("redactXmlCredentials collapses credential-bearing PAN-OS nodes and leaves settings and the source tree intact", () => {
+  const tree = parseXml(`<config>${secretsMgtConfigXml()}${secretsSharedXml()}${secretsNetworkXml()}${secretsDeviceconfigXml()}<placeholder><secret/></placeholder></config>`);
+  const redacted = xmlToJson(redactXmlCredentials(tree));
+  const text = JSON.stringify(redacted);
+  for (const secret of Object.values(FAKE_PANOS_SECRETS)) {
+    assert.ok(!text.includes(secret), `${secret} leaked into the redacted tree`);
+  }
+
+  const config = redacted.config;
+  assert.equal(config["mgt-config"].users.entry[0].phash, "[REDACTED]");
+  assert.equal(config["mgt-config"].users.entry[0]["@name"], "admin");
+  assert.equal(config["mgt-config"].users.entry[0]["authentication-profile"], "mfa-radius");
+  assert.equal(config["mgt-config"].users.entry[1]["public-key"], "c3NoLXJzYSBBQUFBQjNOemFDMXlj");
+  assert.equal(config["mgt-config"]["password-complexity"].enabled, "yes");
+  assert.equal(config.shared["server-profile"].radius.entry.server.entry.secret, "[REDACTED]");
+  assert.equal(config.shared["server-profile"].radius.entry.server.entry.port, "1812");
+  assert.equal(config.shared["server-profile"].ldap.entry["bind-password"], "[REDACTED]");
+  assert.equal(config.shared["server-profile"].ldap.entry["bind-dn"], "cn=svc-panos,dc=example,dc=com");
+  assert.equal(config.shared.certificate.entry["private-key"], "[REDACTED]");
+  assert.match(config.shared.certificate.entry["public-key"], /BEGIN CERTIFICATE/);
+  assert.equal(config.shared.integration["@api-key"], "[REDACTED]");
+  assert.equal(config.shared.integration["@name"], "siem-connector");
+  assert.equal(config.network.ike.gateway.entry.authentication["pre-shared-key"], "[REDACTED]", "the whole pre-shared-key subtree collapses");
+  assert.equal(config.network.ike.gateway.entry["peer-address"].ip, "203.0.113.10");
+  const snmpVersion = config.deviceconfig.system["snmp-setting"]["access-setting"].version;
+  assert.equal(snmpVersion.v2c["snmp-community-string"], "[REDACTED]");
+  assert.equal(snmpVersion.v3.users.entry.authpwd, "[REDACTED]");
+  assert.equal(snmpVersion.v3.users.entry.privpwd, "[REDACTED]");
+  assert.equal(config.placeholder.secret, "", "an empty credential node stays empty rather than claiming a redacted value");
+
+  assert.equal(xmlText(xmlFindAll(tree, "snmp-community-string")[0]), FAKE_PANOS_SECRETS.communityString, "the source tree is not mutated");
+  assert.equal(xmlText(xmlFindAll(tree, "phash")[0]), FAKE_PANOS_SECRETS.phash);
+  assert.equal(xmlFindAll(tree, "pre-shared-key")[0].children.length, 1);
+
+  for (const name of ["phash", "password", "bind-password", "secret", "shared-secret", "client-secret", "key", "pre-shared-key", "private-key", "master-key", "api-key", "passphrase", "private-key-passphrase", "authpwd", "privpwd", "snmp-community-string", "community", "token", "access-token", "hash", "Password", "api_key"]) {
+    assert.equal(isCredentialXmlName(name), true, `${name} should be redacted`);
+  }
+  for (const name of ["public-key", "password-complexity", "password-profile", "password-change", "key-usage", "credential-enforcement", "api-key-lifetime", "hostname", "entry", "permissions", "enabled", "secret-key-length", "hashing"]) {
+    assert.equal(isCredentialXmlName(name), false, `${name} should be kept`);
+  }
+});
+
+test("exportPaloaltoAuditBundle never writes PAN-OS credentials into the bundle directory or its zip", async () => {
+  const base = createTempBase("grclanker-paloalto-export-secrets-");
+  const secrets = Object.values(FAKE_PANOS_SECRETS);
+  const result = await exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mockedFetch({ withSecrets: true })), base);
+  assert.equal(result.errorCount, 0);
+
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.has(join("core_data", "panos_fw1.example.com.json")));
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assert.ok(zipEntries.has("core_data/panos_fw1.example.com.json"));
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const device = JSON.parse(files.get(join("core_data", "panos_fw1.example.com.json")));
+  const mgtConfig = device.config.find((tree) => tree["mgt-config"])["mgt-config"];
+  assert.equal(mgtConfig.users.entry[0].phash, "[REDACTED]");
+  assert.equal(mgtConfig.users.entry[1]["public-key"], "c3NoLXJzYSBBQUFBQjNOemFDMXlj");
+  assert.equal(mgtConfig["password-complexity"].enabled, "yes");
+  const shared = device.config.find((tree) => tree.shared).shared;
+  assert.equal(shared["server-profile"].radius.entry.server.entry.secret, "[REDACTED]");
+  assert.equal(shared["server-profile"].ldap.entry["bind-password"], "[REDACTED]");
+  assert.equal(shared.certificate.entry["private-key"], "[REDACTED]");
+  assert.equal(shared.integration["@api-key"], "[REDACTED]");
+  const network = device.config.find((tree) => tree.network).network;
+  assert.equal(network.ike.gateway.entry.authentication["pre-shared-key"], "[REDACTED]");
+  const deviceconfig = device.config.find((tree) => tree.deviceconfig).deviceconfig;
+  assert.equal(deviceconfig.system["snmp-setting"]["access-setting"].version.v2c["snmp-community-string"], "[REDACTED]");
+  assert.equal(JSON.stringify(device).split("[REDACTED]").length - 1, 9, "every fixture secret is replaced by one marker");
+
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  const hardening = findings.find((item) => item.id === "PA-23");
+  assert.equal(hardening.status, "pass", hardening.summary);
+  assert.equal(hardening.evidence.devices[0].default_snmp_community, false, "the assessment still evaluated the raw community string in memory");
+  assert.equal(findings.find((item) => item.id === "PA-19").status, "pass");
+  assert.match(files.get("QUICK_REFERENCE.md"), /replaced with \[REDACTED\] before core_data\/ is written/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
