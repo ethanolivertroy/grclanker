@@ -420,17 +420,32 @@ export function parseSimpleToml(text: string): Record<string, JsonRecord> {
   return sections;
 }
 
+function findClosingQuote(raw: string, quote: string, start: number): number {
+  for (let index = start; index < raw.length; index += 1) {
+    if (raw[index] === "\\" && quote === "\"") {
+      index += 1;
+      continue;
+    }
+    if (raw[index] === quote) return index;
+  }
+  return -1;
+}
+
 function parseTomlValue(raw: string): unknown {
-  const withoutComment = raw.startsWith("\"") || raw.startsWith("'") ? raw : raw.replace(/\s+#.*$/, "").trim();
-  if (withoutComment.startsWith("\"\"\"") && withoutComment.endsWith("\"\"\"") && withoutComment.length >= 6) {
-    return withoutComment.slice(3, -3);
+  if (raw.startsWith("\"\"\"")) {
+    const end = raw.indexOf("\"\"\"", 3);
+    return end >= 0 ? raw.slice(3, end) : raw.slice(3);
   }
-  if (withoutComment.startsWith("\"") && withoutComment.endsWith("\"") && withoutComment.length >= 2) {
-    return withoutComment.slice(1, -1).replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
+  if (raw.startsWith("\"")) {
+    const end = findClosingQuote(raw, "\"", 1);
+    const inner = end >= 0 ? raw.slice(1, end) : raw.slice(1);
+    return inner.replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
   }
-  if (withoutComment.startsWith("'") && withoutComment.endsWith("'") && withoutComment.length >= 2) {
-    return withoutComment.slice(1, -1);
+  if (raw.startsWith("'")) {
+    const end = findClosingQuote(raw, "'", 1);
+    return end >= 0 ? raw.slice(1, end) : raw.slice(1);
   }
+  const withoutComment = raw.replace(/\s+#.*$/, "").trim();
   if (/^(true|false)$/i.test(withoutComment)) return withoutComment.toLowerCase() === "true";
   const numeric = Number(withoutComment);
   if (withoutComment.length > 0 && Number.isFinite(numeric)) return numeric;
@@ -482,11 +497,14 @@ export function normalizeAccountHost(account: string): string {
 
 export function normalizeJwtAccountIdentifier(account: string): string {
   let identifier = account.trim();
-  if (!identifier.toLowerCase().includes(".global")) {
+  if (identifier.toLowerCase().includes(".global")) {
+    const hyphenIndex = identifier.indexOf("-");
+    if (hyphenIndex > 0) identifier = identifier.slice(0, hyphenIndex);
+  } else {
     const dotIndex = identifier.indexOf(".");
     if (dotIndex > 0) identifier = identifier.slice(0, dotIndex);
   }
-  return identifier.replace(/\./g, "-").toUpperCase();
+  return identifier.toUpperCase();
 }
 
 function parseTokenType(value: string | undefined): SnowflakeTokenType | undefined {
@@ -1256,6 +1274,9 @@ export async function assessSnowflakeNetworkAndAuthentication(
       account_policy_level: accountParameter.level ?? null,
       user_level_attachments: userAttachments.length,
     };
+    if (policyNames.length === 0 && accountAttached && !hasFullVisibility(role)) {
+      return { status: "warn", summary: `The account parameter reports network policy ${accountParameter.value} activated at ACCOUNT level, but SHOW NETWORK POLICIES returned zero policies under role ${role ?? "(unknown)"}; confirm the policy definition as ACCOUNTADMIN.`, evidence };
+    }
     if (policyNames.length === 0) {
       return { status: "fail", summary: `SHOW NETWORK POLICIES returned zero policies; an empty inventory fails this control.${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW NETWORK POLICIES")}`}`, evidence };
     }
@@ -1819,6 +1840,9 @@ export async function assessSnowflakeDataProtection(
     };
     if (shares.rows.length === 0 && !hasFullVisibility(role)) {
       return { status: "manual", summary: `SHOW SHARES returned zero rows under role ${role ?? "(unknown)"}; Snowflake returns empty results without the IMPORT SHARE privilege, so re-run as ACCOUNTADMIN to confirm there are no outbound shares.`, evidence };
+    }
+    if (outbound.length === 0 && !hasFullVisibility(role)) {
+      return { status: "warn", summary: `SHOW SHARES under role ${role ?? "(unknown)"} lists ${shares.rows.length} shares and no OUTBOUND share, but the role lacks ACCOUNTADMIN visibility so outbound shares may be hidden; confirm as ACCOUNTADMIN.`, evidence };
     }
     if (outbound.length === 0) {
       return { status: "pass", summary: `SHOW SHARES was readable under ${role} and lists no OUTBOUND shares (${shares.rows.length} inbound shares seen); for this control an empty outbound inventory is compliant.`, evidence };
