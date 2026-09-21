@@ -1250,9 +1250,9 @@ export interface UnreadableInventory {
   error: string;
 }
 
-/** Leading HTTP status text ("403 Forbidden") or the start of a non-HTTP error, for summaries. */
+/** HTTP status text ("403 Forbidden") from a request error, or the start of a non-HTTP error, for summaries. */
 function shortError(error: string): string {
-  return error.match(/^\d{3} [A-Za-z][A-Za-z ]*/)?.[0]?.trim() ?? error.slice(0, 80);
+  return error.match(/(?:^|: )(\d{3} [A-Za-z][A-Za-z ]*)/)?.[1]?.trim() ?? error.slice(0, 80);
 }
 
 function describeUnreadable(entry: UnreadableInventory): string {
@@ -1922,8 +1922,13 @@ export async function assessGcpIdentity(
     emptySummary: "Cloud Asset Inventory returned no IAM policies for the scope; an org or project always carries at least one binding, so treat this as a denied or empty scope.",
     manualEvidence: "export the IAM policy bindings for the organization, folders, and projects and review privileged roles.",
   };
+  const keyErrorProjects = [...new Set(keyErrors.map((entry) => entry.projectId))];
   const keyReadsUnreadable: UnreadableInventory[] = keyErrors.length > 0
-    ? [{ ...GCP_INVENTORIES.serviceAccountKeys, scope: `${keyErrors.length} of ${keyListsAttempted} service accounts`, error: keyErrors[0].error }]
+    ? [{
+        ...GCP_INVENTORIES.serviceAccountKeys,
+        scope: `${keyErrors.length} of ${keyListsAttempted} service accounts (${keyErrorProjects.slice(0, 3).join(", ")}${keyErrorProjects.length > 3 ? ", ..." : ""})`,
+        error: keyErrors[0].error,
+      }]
     : [];
   const keysReadable = keyListsAttempted === 0 || keyErrors.length < keyListsAttempted;
   const keyBase = {

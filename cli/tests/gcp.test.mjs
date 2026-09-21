@@ -15,6 +15,7 @@ import { inflateRawSync } from "node:zlib";
 
 import {
   GCP_FRAMEWORKS,
+  GCP_INVENTORIES,
   GCP_MAX_LIST_PAGES,
   GcpAuditorClient,
   PUBLIC_MEMBER_IAM_QUERY,
@@ -328,6 +329,10 @@ test("self-check (a): every endpoint forbidden yields only manual verdicts", asy
   assert.equal(Object.keys(all).length, 31);
   for (const [id, status] of Object.entries(all)) {
     assert.equal(status, "manual", `${id} must be manual when every endpoint is forbidden`);
+  }
+  for (const finding of assessments.flatMap((assessment) => assessment.findings)) {
+    if ("seen" in finding.evidence) assert.equal(finding.evidence.seen, null, `${finding.id} must not render a count from an unreadable inventory`);
+    assert.ok(finding.evidence.unreadable_inventories.length > 0, `${finding.id} must list the unreadable inventories`);
   }
   const identity = assessments[0];
   assert.match(identity.findings[0].summary, /403 Forbidden/);
@@ -1029,6 +1034,343 @@ test("exportGcpAuditBundle writes the shared layout, allocates -2 on rerun, and 
   assert.ok(partial.errorCount > 0);
   const errorLog = readFileSync(join(partial.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /\[data-protection\] prod-audit: 403 Forbidden/);
+});
+
+const ALL_FINDING_IDS = [
+  "GCP-IAM-01", "GCP-IAM-02", "GCP-IAM-03", "GCP-IAM-04", "GCP-IAM-05",
+  "GCP-LOG-01", "GCP-LOG-02", "GCP-LOG-03", "GCP-LOG-04", "GCP-LOG-05",
+  "GCP-ORG-01", "GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05", "GCP-ORG-06", "GCP-ORG-07", "GCP-ORG-08",
+  "GCP-DATA-01", "GCP-DATA-02", "GCP-DATA-03", "GCP-DATA-04", "GCP-DATA-05", "GCP-DATA-06", "GCP-DATA-07",
+  "GCP-NET-01", "GCP-NET-02", "GCP-NET-03", "GCP-NET-04", "GCP-NET-05", "GCP-NET-06",
+];
+
+const SECOND_PROJECT = "second-project";
+const TWO_PROJECTS = {
+  ...COMPLIANT,
+  projects: {
+    results: [
+      ...COMPLIANT.projects.results,
+      { name: `//cloudresourcemanager.googleapis.com/projects/${SECOND_PROJECT}`, assetType: "cloudresourcemanager.googleapis.com/Project", project: "projects/222", displayName: "Second", state: "ACTIVE" },
+    ],
+  },
+};
+
+function requestProject(url, init) {
+  const parsed = new URL(url);
+  const fromPath = parsed.pathname.match(/\/projects\/([^/:]+)/)?.[1];
+  const fromQuery = parsed.searchParams.get("project");
+  const body = init?.body ? JSON.parse(init.body) : {};
+  const fromBody = body.resourceNames?.[0]?.replace(/^projects\//, "");
+  return fromPath ?? fromQuery ?? fromBody ?? undefined;
+}
+
+/** Serves the compliant fixture for any project by rewriting the prod-audit references to the requested project. */
+function routeForProject(url, init, data = TWO_PROJECTS) {
+  const projectId = requestProject(url, init);
+  const scoped = projectId && projectId !== "prod-audit" ? JSON.parse(JSON.stringify(data).replaceAll("prod-audit", projectId)) : data;
+  return routeCompliant(url, init, scoped);
+}
+
+function requestFacts(url, init) {
+  const parsed = new URL(url);
+  return { host: parsed.hostname, path: parsed.pathname, query: parsed.searchParams, body: init?.body ? JSON.parse(init.body) : {} };
+}
+
+function denied(status) {
+  return jsonResponse({ error: { code: status, message: "denied", status: status === 500 ? "INTERNAL" : "PERMISSION_DENIED" } }, status);
+}
+
+/** A client that serves two compliant projects except for one inventory, made unreadable fully or for the second project only. */
+function clientWithUnreadable(match, status = 403, mode = "full", data = TWO_PROJECTS) {
+  return createClient(async (url, init) => {
+    if (match(requestFacts(url, init)) && (mode === "full" || requestProject(url, init) === SECOND_PROJECT)) return denied(status);
+    return jsonResponse(routeForProject(url, init, data));
+  });
+}
+
+function findingsById(assessments) {
+  return Object.fromEntries(assessments.flatMap((assessment) => assessment.findings.map((item) => [item.id, item])));
+}
+
+const ORG_POLICY_DEPENDENTS = {
+  "constraints/iam.allowedPolicyMemberDomains": ["GCP-ORG-02"],
+  "constraints/iam.disableServiceAccountKeyCreation": ["GCP-ORG-03"],
+  "constraints/iam.disableServiceAccountKeyUpload": ["GCP-ORG-04"],
+  "constraints/compute.disableSerialPortAccess": ["GCP-ORG-05"],
+  "constraints/compute.requireShieldedVm": ["GCP-ORG-05"],
+  "constraints/compute.requireOsLogin": ["GCP-ORG-06"],
+};
+
+/**
+ * Every inventory the five assessments read, the URL shape that identifies it,
+ * whether it is read per project, and exactly which findings depend on it.
+ * Mirrors the reviewer's corollary harness so the dependency map stays true.
+ */
+const INVENTORY_SURFACES = [
+  { name: GCP_INVENTORIES.organization.dataset, endpoint: "/v1/organizations/{organization}", perProject: false, match: (r) => r.host === "cloudresourcemanager.googleapis.com" && r.path.startsWith("/v1/organizations/"), dependents: ["GCP-ORG-01"] },
+  { name: GCP_INVENTORIES.projects.dataset, endpoint: ":searchAllResources", perProject: false, match: (r) => r.path.endsWith(":searchAllResources"), dependents: ALL_FINDING_IDS },
+  { name: GCP_INVENTORIES.iamPolicies.dataset, endpoint: ":searchAllIamPolicies", perProject: false, match: (r) => r.path.endsWith(":searchAllIamPolicies") && r.query.get("query") !== PUBLIC_MEMBER_IAM_QUERY, dependents: ["GCP-IAM-01", "GCP-IAM-04", "GCP-IAM-05"] },
+  { name: GCP_INVENTORIES.publicBindings.dataset, endpoint: ":searchAllIamPolicies", perProject: false, match: (r) => r.path.endsWith(":searchAllIamPolicies") && r.query.get("query") === PUBLIC_MEMBER_IAM_QUERY, dependents: ["GCP-DATA-02"] },
+  { name: GCP_INVENTORIES.cryptoKeys.dataset, endpoint: "/assets", perProject: false, match: (r) => r.path.endsWith("/assets"), dependents: ["GCP-DATA-03"] },
+  { name: GCP_INVENTORIES.serviceAccounts.dataset, endpoint: "/serviceAccounts", perProject: true, match: (r) => r.path.endsWith("/serviceAccounts"), dependents: ["GCP-IAM-02", "GCP-IAM-03"] },
+  { name: GCP_INVENTORIES.serviceAccountKeys.dataset, endpoint: "/keys", perProject: true, match: (r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys"), dependents: ["GCP-IAM-02", "GCP-IAM-03"] },
+  { name: GCP_INVENTORIES.adminActivity.dataset, endpoint: "entries:list", perProject: true, match: (r) => r.path.endsWith("/entries:list") && /activity/.test(r.body.filter ?? ""), dependents: ["GCP-LOG-01"] },
+  { name: GCP_INVENTORIES.dataAccess.dataset, endpoint: "entries:list", perProject: true, match: (r) => r.path.endsWith("/entries:list") && /data_access/.test(r.body.filter ?? ""), dependents: ["GCP-LOG-02"] },
+  { name: GCP_INVENTORIES.sinks.dataset, endpoint: "/sinks", perProject: true, match: (r) => r.path.endsWith("/sinks"), dependents: ["GCP-LOG-03"] },
+  { name: GCP_INVENTORIES.logBuckets.dataset, endpoint: "/locations/-/buckets", perProject: true, match: (r) => r.host === "logging.googleapis.com" && r.path.endsWith("/buckets"), dependents: ["GCP-LOG-04"] },
+  { name: GCP_INVENTORIES.loggingSettings.dataset, endpoint: "/settings", perProject: true, match: (r) => r.path.endsWith("/settings"), dependents: [] },
+  { name: GCP_INVENTORIES.sccSources.dataset, endpoint: "/sources", perProject: false, match: (r) => r.path.endsWith("/sources"), dependents: ["GCP-LOG-05"] },
+  { name: GCP_INVENTORIES.sccFindings.dataset, endpoint: "/sources/-/findings", perProject: false, match: (r) => r.path.endsWith("/findings"), dependents: ["GCP-LOG-05"] },
+  ...Object.entries(ORG_POLICY_DEPENDENTS).map(([constraint, dependents]) => ({
+    name: `${GCP_INVENTORIES.effectiveOrgPolicy.dataset} ${constraint}`,
+    endpoint: ":getEffectiveOrgPolicy",
+    perProject: false,
+    match: (r) => r.path.endsWith(":getEffectiveOrgPolicy") && r.body.constraint === constraint,
+    dependents,
+  })),
+  { name: GCP_INVENTORIES.computeProject.dataset, endpoint: "compute/v1/projects/{project}", perProject: true, match: (r) => r.host === "compute.googleapis.com" && /^\/compute\/v1\/projects\/[^/]+$/.test(r.path), dependents: ["GCP-ORG-06"] },
+  { name: GCP_INVENTORIES.instances.dataset, endpoint: "aggregated/instances", perProject: true, match: (r) => r.path.endsWith("/aggregated/instances"), dependents: ["GCP-ORG-06", "GCP-ORG-08", "GCP-NET-04"] },
+  { name: GCP_INVENTORIES.binaryAuthorization.dataset, endpoint: "binaryauthorization.googleapis.com/v1/projects/{project}/policy", perProject: true, match: (r) => r.host === "binaryauthorization.googleapis.com", dependents: ["GCP-ORG-07"] },
+  { name: GCP_INVENTORIES.buckets.dataset, endpoint: "storage/v1/b", perProject: true, match: (r) => r.host === "storage.googleapis.com", dependents: ["GCP-DATA-01", "GCP-DATA-02", "GCP-DATA-04"] },
+  { name: GCP_INVENTORIES.disks.dataset, endpoint: "aggregated/disks", perProject: true, match: (r) => r.path.endsWith("/aggregated/disks"), dependents: ["GCP-DATA-04"] },
+  { name: GCP_INVENTORIES.managedZones.dataset, endpoint: "/managedZones", perProject: true, match: (r) => r.host === "dns.googleapis.com", dependents: ["GCP-DATA-05"] },
+  { name: GCP_INVENTORIES.apiKeys.dataset, endpoint: "/locations/global/keys", perProject: true, match: (r) => r.host === "apikeys.googleapis.com", dependents: ["GCP-DATA-06"] },
+  { name: GCP_INVENTORIES.accessPolicies.dataset, endpoint: "/v1/accessPolicies", perProject: false, match: (r) => r.path === "/v1/accessPolicies", dependents: ["GCP-DATA-07"] },
+  { name: GCP_INVENTORIES.servicePerimeters.dataset, endpoint: "/servicePerimeters", perProject: false, match: (r) => r.path.endsWith("/servicePerimeters"), dependents: ["GCP-DATA-07"] },
+  { name: GCP_INVENTORIES.firewalls.dataset, endpoint: "global/firewalls", perProject: true, match: (r) => r.path.endsWith("/global/firewalls"), dependents: ["GCP-NET-01"] },
+  { name: GCP_INVENTORIES.subnetworks.dataset, endpoint: "aggregated/subnetworks", perProject: true, match: (r) => r.path.endsWith("/aggregated/subnetworks"), dependents: ["GCP-NET-02", "GCP-NET-03", "GCP-NET-04"] },
+  { name: GCP_INVENTORIES.routers.dataset, endpoint: "aggregated/routers", perProject: true, match: (r) => r.path.endsWith("/aggregated/routers"), dependents: ["GCP-NET-04"] },
+  { name: GCP_INVENTORIES.sslPolicies.dataset, endpoint: "aggregated/sslPolicies", perProject: true, match: (r) => r.path.endsWith("/aggregated/sslPolicies"), dependents: ["GCP-NET-05"] },
+  { name: GCP_INVENTORIES.targetHttpsProxies.dataset, endpoint: "aggregated/targetHttpsProxies", perProject: true, match: (r) => r.path.endsWith("/aggregated/targetHttpsProxies"), dependents: ["GCP-NET-05"] },
+  { name: GCP_INVENTORIES.backendServices.dataset, endpoint: "aggregated/backendServices", perProject: true, match: (r) => r.path.endsWith("/aggregated/backendServices"), dependents: ["GCP-NET-06"] },
+];
+
+test("per-inventory sweep: exactly the dependent findings drop below pass when any inventory is unreadable, fully or for one project", async () => {
+  const baseline = statuses(await runAllAssessments(createClient(async (url, init) => jsonResponse(routeForProject(url, init)))));
+  assert.equal(Object.keys(baseline).length, 31);
+  assert.deepEqual(Object.entries(baseline).filter(([, status]) => status !== "pass"), [], "two compliant projects must pass every control before the sweep");
+  assert.equal(INVENTORY_SURFACES.length, 35);
+
+  const table = [];
+  for (const surface of INVENTORY_SURFACES) {
+    const expected = [...surface.dependents].sort();
+    for (const status of [403, 401, 500]) {
+      const full = await runAllAssessments(clientWithUnreadable(surface.match, status, "full"));
+      const fullStatuses = statuses(full);
+      const demoted = Object.entries(fullStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
+      assert.deepEqual(demoted, expected, `${surface.name} unreadable (${status}, fully) must demote exactly ${expected.join(", ") || "nothing"}`);
+      const fullFindings = findingsById(full);
+      for (const id of surface.dependents) {
+        const finding = fullFindings[id];
+        assert.ok(finding.summary.includes(surface.name), `${id} must name "${surface.name}" when it is unreadable (${status}); got: ${finding.summary}`);
+        assert.ok(finding.summary.includes(surface.endpoint), `${id} must name the endpoint "${surface.endpoint}" (${status}); got: ${finding.summary}`);
+        assert.ok(
+          finding.evidence.unreadable_inventories.some((entry) => entry.dataset === surface.name && entry.endpoint.includes(surface.endpoint)),
+          `${id} evidence.unreadable_inventories must carry ${surface.name}`,
+        );
+      }
+      if (status === 403) table.push({ surface: surface.name, mode: "fully", demoted: demoted.map((id) => `${id}=${fullStatuses[id]}`) });
+
+      if (!surface.perProject) continue;
+      const partial = await runAllAssessments(clientWithUnreadable(surface.match, status, "project"));
+      const partialStatuses = statuses(partial);
+      const demotedPartial = Object.entries(partialStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
+      assert.deepEqual(demotedPartial, expected, `${surface.name} unreadable (${status}, ${SECOND_PROJECT} only) must demote exactly ${expected.join(", ") || "nothing"}`);
+      const partialFindings = findingsById(partial);
+      for (const id of surface.dependents) {
+        const finding = partialFindings[id];
+        assert.equal(finding.status, "warn", `${id} must warn, not pass or go manual, when one of two projects denies ${surface.name}`);
+        assert.ok(finding.summary.includes(surface.name) && finding.summary.includes(surface.endpoint), `${id} must name dataset and endpoint; got: ${finding.summary}`);
+        assert.ok(finding.summary.includes(SECOND_PROJECT), `${id} must name the denied project; got: ${finding.summary}`);
+      }
+      if (status === 403) table.push({ surface: surface.name, mode: `${SECOND_PROJECT} only`, demoted: demotedPartial.map((id) => `${id}=${partialStatuses[id]}`) });
+    }
+  }
+  assert.equal(table.length, INVENTORY_SURFACES.length + INVENTORY_SURFACES.filter((surface) => surface.perProject).length);
+});
+
+test("GCP-ORG-06 demotes and names constraints/compute.requireOsLogin when the effective policy is unreadable (rule 1 corollary)", async () => {
+  const client = clientWithUnreadable((r) => r.path.endsWith(":getEffectiveOrgPolicy") && r.body.constraint === "constraints/compute.requireOsLogin", 403, "full", COMPLIANT);
+  const result = await assessGcpOrgGuardrails(client);
+  const finding = result.findings.find((item) => item.id === "GCP-ORG-06");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /enable-oslogin=TRUE is set in commonInstanceMetadata for all 1 sampled projects/);
+  assert.match(finding.summary, /Partial view: effective org policy constraints\/compute\.requireOsLogin unreadable for the sampled project prod-audit via cloudresourcemanager\.googleapis\.com\/v1\/projects\/\{project\}:getEffectiveOrgPolicy \(403 Forbidden\)/);
+  assert.equal(finding.evidence.policy, null);
+  assert.equal(finding.evidence.policy_enforced, null);
+  assert.deepEqual(finding.evidence.projects_without_os_login, []);
+  assert.equal(finding.evidence.unreadable_inventories.length, 1);
+  assert.equal(finding.evidence.unreadable_inventories[0].dataset, "effective org policy constraints/compute.requireOsLogin");
+  assert.match(finding.evidence.unreadable_inventories[0].error, /403 Forbidden/);
+  assert.equal(result.summary.os_login_required_by_policy, null);
+  assert.equal(statuses([result])["GCP-ORG-05"], "pass", "other constraints stay readable and pass");
+});
+
+test("GCP-ORG-06 demotes when the instance inventory is unreadable and renders instance overrides as null", async () => {
+  for (const enforced of [true, false]) {
+    const data = { ...COMPLIANT, booleanPolicy: { constraint: "constraints/x", booleanPolicy: { enforced } } };
+    const client = clientWithUnreadable((r) => r.path.endsWith("/aggregated/instances"), 403, "full", data);
+    const result = await assessGcpOrgGuardrails(client);
+    const finding = result.findings.find((item) => item.id === "GCP-ORG-06");
+    assert.equal(finding.status, "warn", `policy enforced=${enforced}`);
+    assert.match(finding.summary, /Partial view: Compute Engine instances unreadable for 1 of 1 projects \(prod-audit\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/instances \(403 Forbidden\)/);
+    assert.equal(finding.evidence.instance_overrides, null);
+    assert.equal(finding.evidence.instances_read, null);
+    assert.equal(finding.evidence.policy_enforced, enforced);
+    assert.equal(result.summary.instances, null);
+    const shielded = result.findings.find((item) => item.id === "GCP-ORG-08");
+    assert.equal(shielded.status, "manual");
+    assert.match(shielded.summary, /every sampled project denied the read of Compute Engine instances \(compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/instances\)/);
+    assert.equal(shielded.evidence.seen, null);
+  }
+});
+
+test("GCP-ORG-02 through ORG-06 demote and name the project inventory when it is unreadable while a project ID is configured", async () => {
+  const client = clientWithUnreadable((r) => r.path.endsWith(":searchAllResources"), 403, "full", COMPLIANT);
+  const result = await assessGcpOrgGuardrails(client);
+  const byId = findingsById([result]);
+  for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05"]) {
+    assert.equal(byId[id].status, "warn", `${id} must not pass when the project list could not be read`);
+    assert.match(byId[id].summary, /Partial view: project inventory unreadable for the configured scope via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources \(403 Forbidden\), so the effective policy was resolved only for the configured project prod-audit/);
+    assert.equal(byId[id].evidence.partial, true);
+    assert.equal(byId[id].evidence.unreadable_inventories[0].dataset, "project inventory");
+  }
+  assert.equal(byId["GCP-ORG-06"].status, "manual");
+  assert.match(byId["GCP-ORG-06"].summary, /Manual: project inventory unreadable for the configured scope via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources \(403 Forbidden/);
+  assert.equal(byId["GCP-ORG-06"].evidence.seen, null);
+  assert.equal(byId["GCP-ORG-06"].evidence.instance_overrides, null);
+  assert.equal(byId["GCP-ORG-06"].evidence.projects_without_os_login, null);
+  assert.equal(byId["GCP-ORG-01"].status, "manual");
+  assert.match(byId["GCP-ORG-01"].summary, /project inventory unreadable for the configured scope via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources/);
+  assert.equal(byId["GCP-ORG-01"].evidence.sampled_projects, null);
+
+  assert.equal(Object.values(statuses([result])).filter((status) => status === "pass").length, 0);
+
+  const orgOnlyClient = createClient(async (url, init) => (requestFacts(url, init).path.endsWith(":searchAllResources") ? denied(403) : jsonResponse(routeCompliant(url, init))), sampleConfig({ projectId: undefined }));
+  const withoutProject = findingsById([await assessGcpOrgGuardrails(orgOnlyClient)]);
+  for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05", "GCP-ORG-06"]) {
+    assert.equal(withoutProject[id].status, "manual", `${id} has no project to resolve the effective policy against`);
+    assert.match(withoutProject[id].summary, /:searchAllResources/, `${id} must name the failed project inventory`);
+  }
+});
+
+test("GCP-LOG-05 demotes when the findings list is unreadable or truncated and never fabricates a zero", async () => {
+  const unreadable = await assessGcpLoggingDetection(clientWithUnreadable((r) => r.path.endsWith("/findings"), 403, "full", COMPLIANT));
+  const finding = unreadable.findings.find((item) => item.id === "GCP-LOG-05");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /returned 1 sources and an unreadable findings list/);
+  assert.match(finding.summary, /Partial view: Security Command Center findings unreadable for the organization scope via securitycenter\.googleapis\.com\/v1\/organizations\/\{organization\}\/sources\/-\/findings \(403 Forbidden\)\. A partial view cannot pass\./);
+  assert.equal(finding.evidence.scc_findings, null);
+  assert.match(finding.evidence.findings_error, /403 Forbidden/);
+  assert.equal(finding.evidence.unreadable_inventories[0].dataset, "Security Command Center findings");
+  assert.equal(unreadable.summary.scc_findings, null);
+  assert.equal(unreadable.summary.scc_sources, 1);
+
+  const truncated = await assessGcpLoggingDetection(createClient(async (url, init) => {
+    const facts = requestFacts(url, init);
+    if (facts.path.endsWith("/findings")) return jsonResponse({ listFindingsResults: [{ finding: { name: "f" } }], nextPageToken: "stuck" });
+    return jsonResponse(routeCompliant(url, init));
+  }));
+  const truncatedFinding = truncated.findings.find((item) => item.id === "GCP-LOG-05");
+  assert.equal(truncatedFinding.status, "warn");
+  assert.match(truncatedFinding.summary, /returned 1 sources and 2\+ findings/, "a stuck cursor exits after two pages and reports the count as a floor");
+  assert.match(truncatedFinding.summary, /Partial view: the findings list was truncated/);
+  assert.equal(truncatedFinding.evidence.findings_truncated, true);
+
+  const sourcesUnreadable = await assessGcpLoggingDetection(clientWithUnreadable((r) => r.path.endsWith("/sources"), 403, "full", COMPLIANT));
+  const manual = sourcesUnreadable.findings.find((item) => item.id === "GCP-LOG-05");
+  assert.equal(manual.status, "manual");
+  assert.match(manual.summary, /Security Command Center sources were not readable via securitycenter\.googleapis\.com\/v1\/organizations\/\{organization\}\/sources \(403 Forbidden/);
+  assert.equal(manual.evidence.scc_sources, null);
+  assert.equal(sourcesUnreadable.summary.scc_sources, null);
+});
+
+test("GCP-ORG-06 fails on existing projects and instances without OS Login even when constraints/compute.requireOsLogin is enforced (rule 6)", async () => {
+  const run = async (computeProject, instances = COMPLIANT.instances) => {
+    const data = { ...COMPLIANT, computeProject, instances };
+    const result = await assessGcpOrgGuardrails(createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data))));
+    return result.findings.find((item) => item.id === "GCP-ORG-06");
+  };
+
+  const disabled = await run({ name: "prod-audit", commonInstanceMetadata: { items: [{ key: "enable-oslogin", value: "FALSE" }] } });
+  assert.equal(disabled.status, "fail", "an enforced constraint never enables OS Login on an existing project with enable-oslogin=FALSE");
+  assert.match(disabled.summary, /1 of 1 sampled projects lack enable-oslogin=TRUE in commonInstanceMetadata \(prod-audit\) and 0 instances override it/);
+  assert.match(disabled.summary, /constraints\/compute\.requireOsLogin is enforced in the effective policy, which protects newly created projects and blocks future disabling but does not enable OS Login on existing resources/);
+  assert.equal(disabled.evidence.policy_enforced, true);
+  assert.deepEqual(disabled.evidence.projects_without_os_login, ["prod-audit"]);
+
+  const absent = await run({ name: "prod-audit", commonInstanceMetadata: { items: [] } });
+  assert.equal(absent.status, "fail", "an absent enable-oslogin key means OS Login is off on an existing project");
+  assert.deepEqual(absent.evidence.projects_without_os_login, ["prod-audit"]);
+
+  const override = await run(COMPLIANT.computeProject, {
+    items: { "zones/us-central1-a": { instances: [{ ...COMPLIANT.instances.items["zones/us-central1-a"].instances[0], metadata: { items: [{ key: "enable-oslogin", value: "false" }] } }] } },
+  });
+  assert.equal(override.status, "fail");
+  assert.match(override.summary, /0 of 1 sampled projects lack enable-oslogin=TRUE in commonInstanceMetadata and 1 instances override it \(prod-audit\/vm-1\)/);
+  assert.deepEqual(override.evidence.instance_overrides, [{ projectId: "prod-audit", instance: "vm-1" }]);
+
+  const compliant = await run(COMPLIANT.computeProject);
+  assert.equal(compliant.status, "pass");
+  assert.match(compliant.summary, /enable-oslogin=TRUE is set in commonInstanceMetadata for all 1 sampled projects with Compute Engine and none of 1 instances overrides it\. constraints\/compute\.requireOsLogin is enforced/);
+  assert.equal(compliant.evidence.policy_enforced, true);
+});
+
+test("multi-inventory findings name the unreadable dataset and endpoint instead of a bare denied count", async () => {
+  const routers = await assessGcpNetworkSecurity(clientWithUnreadable((r) => r.path.endsWith("/aggregated/routers"), 403, "full", COMPLIANT));
+  const nat = routers.findings.find((item) => item.id === "GCP-NET-04");
+  assert.equal(nat.status, "warn");
+  assert.match(nat.summary, /^1 of 1 eligible subnetworks could not be evaluated for Cloud NAT coverage because Cloud Routers were unreadable in their project \(compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/routers\)\./);
+  assert.match(nat.summary, /Partial view: Cloud Routers unreadable for 1 of 1 projects \(prod-audit\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/routers \(403 Forbidden\)/);
+  assert.doesNotMatch(nat.summary, /not covered by a Cloud NAT/, "a denied router list is not a coverage violation");
+  assert.deepEqual(nat.evidence.subnets_without_nat, []);
+  assert.equal(nat.evidence.subnets_with_unknown_nat.length, 1);
+  assert.match(nat.evidence.subnets_with_unknown_nat[0].reason, /Cloud Routers unreadable in this project/);
+  assert.equal(nat.evidence.routers_read, null);
+  assert.equal(routers.summary.subnets_without_nat, null);
+  assert.equal(routers.summary.subnets_with_unknown_nat, 1);
+
+  const sslPolicies = await assessGcpNetworkSecurity(clientWithUnreadable((r) => r.path.endsWith("/aggregated/sslPolicies"), 403, "full", COMPLIANT));
+  const ssl = sslPolicies.findings.find((item) => item.id === "GCP-NET-05");
+  assert.equal(ssl.status, "warn");
+  assert.match(ssl.summary, /^1 of 1 HTTPS target proxies could not be evaluated: SSL policies unreadable in this project via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/sslPolicies\./);
+  assert.doesNotMatch(ssl.summary, /lacked the documented flag/);
+  assert.match(ssl.evidence.unresolved_proxies[0].reason, /SSL policies unreadable in this project/);
+  assert.equal(ssl.evidence.ssl_policies_read, null);
+
+  const disks = await assessGcpDataProtection(clientWithUnreadable((r) => r.path.endsWith("/aggregated/disks"), 403, "full", COMPLIANT));
+  const cmek = disks.findings.find((item) => item.id === "GCP-DATA-04");
+  assert.equal(cmek.status, "warn");
+  assert.match(cmek.summary, /Partial view: Compute Engine disks unreadable for 1 of 1 projects \(prod-audit\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/disks \(403 Forbidden\)/);
+  assert.equal(cmek.evidence.disks_read, null);
+  assert.equal(cmek.evidence.disks_without_cmek, null);
+  assert.equal(cmek.evidence.buckets_read, 1);
+  assert.deepEqual(cmek.evidence.buckets_without_cmek, []);
+  assert.equal(disks.summary.disks, null);
+
+  const keys = await assessGcpIdentity(clientWithUnreadable((r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys"), 403, "full", COMPLIANT));
+  const minimization = keys.findings.find((item) => item.id === "GCP-IAM-03");
+  assert.equal(minimization.status, "warn");
+  assert.match(minimization.summary, /Partial view: service account keys unreadable for 1 of 1 service accounts \(prod-audit\) via iam\.googleapis\.com\/v1\/projects\/\{project\}\/serviceAccounts\/\{account\}\/keys \(403 Forbidden\)/);
+  assert.equal(minimization.evidence.user_managed_keys, null);
+  const rotation = keys.findings.find((item) => item.id === "GCP-IAM-02");
+  assert.equal(rotation.status, "warn");
+  assert.match(rotation.summary, /^User-managed keys could not be listed for any of the 1 sampled service accounts, so no key age is known\./);
+  assert.equal(rotation.evidence.stale_keys, null);
+});
+
+test("GCP-DATA-02 folds bucket list truncation into its partial view", async () => {
+  const client = createClient(async (url, init) => {
+    const facts = requestFacts(url, init);
+    if (facts.host === "storage.googleapis.com") return jsonResponse({ ...COMPLIANT.buckets, nextPageToken: "stuck" });
+    return jsonResponse(routeCompliant(url, init));
+  });
+  const result = await assessGcpDataProtection(client);
+  const exposure = result.findings.find((item) => item.id === "GCP-DATA-02");
+  assert.equal(exposure.status, "warn");
+  assert.equal(exposure.evidence.truncated, true);
+  assert.match(exposure.summary, /seen, total unknown \(inventory incomplete\)/);
+  assert.equal(result.findings.find((item) => item.id === "GCP-DATA-01").status, "warn");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
