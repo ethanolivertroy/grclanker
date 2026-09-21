@@ -709,25 +709,150 @@ export function resolveQualysConfiguration(
   };
 }
 
-function redactSecrets(message: string, config: QualysResolvedConfig): string {
-  let redacted = message;
-  for (const secret of [config.password, config.token]) {
-    if (secret && secret.length > 0) redacted = redacted.split(secret).join("[redacted]");
-  }
-  if (config.username && config.password) {
-    const basic = Buffer.from(`${config.username}:${config.password}`).toString("base64");
-    redacted = redacted.split(basic).join("[redacted]");
-  }
-  return redacted.replace(/Bearer\s+[A-Za-z0-9._-]{16,}/g, "Bearer [redacted]");
+// ---------------------------------------------------------------------------------------------
+// Rule 9, error-body class. Every error string the client creates passes through scrubErrorText in
+// the QualysApiError constructor, and a response body that is not a recognised XML or JSON error
+// envelope is never echoed at all: describeOpaqueBody substitutes the content type and byte length,
+// while the status and endpoint are part of every message. The rules below therefore guard the
+// documented fields that are echoed (SIMPLE_RETURN CODE and TEXT, GENERIC_RETURN RETURN, the /msp/
+// USER_LIST_OUTPUT ERROR text, QPS responseCode and responseErrorDetails.errorMessage) and any prose
+// assembled from them. Every pattern is unanchored so an embedded URL, header, or name-value pair
+// anywhere in free text is caught. The bundle writer applies the same rules once more to every file,
+// without the long-token heuristic, because QIDs, asset ids, and tag ids are evidence.
+// ---------------------------------------------------------------------------------------------
+
+const REDACTED = "[REDACTED]";
+// Everything from the first ? of a scheme-prefixed URL found anywhere in the text (fetch tokens, session
+// parameters); the host and path stay because they name the surface.
+const EMBEDDED_URL_QUERY_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()?#]+)\?[^\s"'<>()#]*/gi;
+// A fragment carrying name=value pairs (implicit-flow tokens); plain anchors stay.
+const EMBEDDED_URL_FRAGMENT_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()#]+#)[^\s"'<>()]*=[^\s"'<>()]*/gi;
+// A plain lowercase word after the scheme ("bearer authentication", "basic auth") is prose, not a credential.
+const BEARER_PATTERN = /\b([Bb]earer)\s+(?![a-z]+\b)[A-Za-z0-9._~+/=-]{8,}/g;
+const BASIC_AUTH_PATTERN = /\b([Bb]asic)\s+(?![a-z]+\b)[A-Za-z0-9+/=]{16,}/g;
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookie)(["']?\s*[:=]\s*)(?!\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
+// key=value, key: value, or "key":"value" where the key names a credential (api key, session, access, refresh, and
+// id tokens, client secret, password, cookie, signature). X-Requested-With names no credential and survives; a
+// short plain value such as "token: user" is prose.
+const CREDENTIAL_KEY_WORDS = "token|secret|passw(?:or)?d|passcode|session|api[_-]?key|apikey|private[_-]?key|signature|credential|cookie";
+const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
+  `\\b([a-z0-9_-]*(?:${CREDENTIAL_KEY_WORDS})[a-z0-9_-]*|authorization|x-auth-token|jsessionid|pwd)(["']?\\s*[:=]\\s*)(["']?)(?!bearer\\b|basic\\b|\\[REDACTED\\])[^\\s"'<>;,&]{6,}`,
+  "gi",
+);
+// "/", ".", ":", and "=" are not run characters, so endpoint paths, JWT segments, timestamps, and query pairs split
+// into short pieces that are judged on their own; base64url and hex material never contains them.
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}/g;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_-]*$/;
+const WORD_SEGMENT_PATTERN = /^(?:[A-Z]?[a-z]+|[A-Z]+|[a-z]+(?:[A-Z][a-z]+)+)$/;
+
+function hasTokenShape(value: string): boolean {
+  return /\d/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
 }
 
-function xmlErrorSummary(document: XmlNode): string | undefined {
+// A run of 16 or more token characters is a credential when it carries a digit or mixed case and is not made of
+// words: uppercase codes and DTD element names (SCHEDULE_SCAN_LIST_OUTPUT), snake_case and camelCase identifiers
+// (truncation_limit, hasMoreRecords), and Header-Style names (X-Requested-With) are left alone.
+function looksLikeToken(run: string): boolean {
+  if (UPPERCASE_CODE_PATTERN.test(run)) return false;
+  if (run.split(/[-_]/).every((segment) => WORD_SEGMENT_PATTERN.test(segment))) return false;
+  return hasTokenShape(run);
+}
+
+export interface ScrubErrorTextOptions {
+  // On by default because error text is the only place a bare token can arrive; data values and the bundle sink
+  // turn it off because Qualys identifiers are evidence, not secrets.
+  longTokens?: boolean;
+}
+
+// Exact credential values known to this process: the configured password and token plus the derived basic string.
+export function credentialValues(config: Pick<QualysResolvedConfig, "username" | "password" | "token">): string[] {
+  const values = [config.password, config.token];
+  if (config.username && config.password) values.push(Buffer.from(`${config.username}:${config.password}`).toString("base64"));
+  return values.filter((value): value is string => typeof value === "string" && value.length >= 4);
+}
+
+export function scrubErrorText(text: string, secrets: string[] = [], options: ScrubErrorTextOptions = {}): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret.length >= 4) scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  scrubbed = scrubbed
+    .replace(EMBEDDED_URL_QUERY_PATTERN, `$1?${REDACTED}`)
+    .replace(EMBEDDED_URL_FRAGMENT_PATTERN, `$1${REDACTED}`)
+    .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
+    .replace(BASIC_AUTH_PATTERN, (match, scheme: string) => (hasTokenShape(match.slice(scheme.length)) ? `${scheme} ${REDACTED}` : match))
+    .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, `$1$2$3${REDACTED}`);
+  if (options.longTokens === false) return scrubbed;
+  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? REDACTED : run));
+}
+
+// Data values and bundle content: every rule except the long-token heuristic (see ScrubErrorTextOptions).
+function scrubDataText(text: string, secrets: string[]): string {
+  return scrubErrorText(text, secrets, { longTokens: false });
+}
+
+// The one place a client error string is created. Every site that fails a request builds its message here, so
+// no downstream consumer (errors arrays, collection.sources reasons, finding summaries, access.json, _errors.log,
+// compliance reports) ever receives an unscrubbed string.
+export class QualysApiError extends Error {
+  readonly status: number;
+  readonly endpoint: string;
+
+  constructor(message: string, status: number, endpoint: string, secrets: string[] = []) {
+    super(scrubErrorText(message, secrets));
+    this.name = "QualysApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
+// Every thrown value that becomes a surface error string goes through here, so a plain Error raised outside the
+// client (a data-client stub, a parser) gets the same treatment as a QualysApiError.
+function errorMessage(error: unknown): string {
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+function mediaType(headers: Headers): string {
+  const type = headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+  return type ? type : "unknown content type";
+}
+
+// What a failed response contributes to its error string when it carries no recognised envelope: the content type
+// and byte length only, never the body.
+function describeOpaqueBody(response: QualysHttpResponse, description: string): string {
+  const bytes = Buffer.byteLength(response.text, "utf8");
+  if (bytes === 0) return "empty body";
+  return `${description} (${mediaType(response.headers)}; ${bytes} bytes)`;
+}
+
+// The documented error envelopes, echoing only their documented fields: SIMPLE_RETURN or GENERIC_RETURN with
+// CODE and TEXT (VM/PC API v2), GENERIC_RETURN/RETURN status="FAILED" with a number attribute (generic_return.dtd),
+// and a root-level ERROR with a number attribute (user_list_output.dtd and the other /msp/ outputs).
+function xmlErrorEnvelope(document: XmlNode): string | undefined {
   const simpleReturn = findXmlElement(document, "SIMPLE_RETURN") ?? findXmlElement(document, "GENERIC_RETURN");
-  if (!simpleReturn) return undefined;
-  const code = xmlText(findXmlElement(simpleReturn, "CODE"));
-  const text = xmlText(findXmlElement(simpleReturn, "TEXT"));
-  if (!code && !text) return undefined;
-  return `${code ? `code ${code}` : "error"}${text ? `: ${text}` : ""}`;
+  if (simpleReturn) {
+    const code = xmlText(findXmlElement(simpleReturn, "CODE"));
+    const text = xmlText(findXmlElement(simpleReturn, "TEXT"));
+    if (code || text) return `${code ? `code ${code}` : "error"}${text ? `: ${text}` : ""}`;
+    const failed = findXmlElements(simpleReturn, "RETURN").find((node) => /^failed$/i.test(node.attributes.status ?? ""));
+    if (failed) return `error${failed.attributes.number ? ` ${failed.attributes.number}` : ""}${xmlText(failed) ? `: ${xmlText(failed)}` : ""}`;
+  }
+  const rootError = document.children.flatMap((root) => root.children).find((child) => child.name === "ERROR");
+  if (rootError) {
+    return `error${rootError.attributes.number ? ` ${rootError.attributes.number}` : ""}${xmlText(rootError) ? `: ${xmlText(rootError)}` : ""}`;
+  }
+  return undefined;
+}
+
+function parseXmlBody(text: string): XmlNode | undefined {
+  if (!looksLikeXml(text)) return undefined;
+  try {
+    return parseXml(text);
+  } catch {
+    // An HTML gateway page starts with "<" but is not XML; it is described by type and length, never echoed.
+    return undefined;
+  }
 }
 
 function isModuleUnavailableError(message: string): boolean {
@@ -789,12 +914,21 @@ export class QualysApiClient {
   // Pagination follows absolute WARNING/URL continuations; error text keeps only the
   // endpoint path so the Qualys error code and message fit inside finding summaries.
   private endpointLabel(pathOrUrl: string): string {
-    if (!/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+    if (!/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl.split("?")[0];
     try {
       return new URL(pathOrUrl).pathname;
     } catch {
       return pathOrUrl;
     }
+  }
+
+  // Exact credential values removed from every error string: the configured ones plus a gateway-issued JWT.
+  private secrets(): string[] {
+    return [...credentialValues(this.config), ...(this.bearerToken && this.bearerToken.length >= 4 ? [this.bearerToken] : [])];
+  }
+
+  private failure(what: string, response: Pick<QualysHttpResponse, "status">, endpoint: string, detail: string | undefined): QualysApiError {
+    return new QualysApiError(`${what} failed (${response.status}) for ${endpoint}${detail ? `: ${detail}` : ""}`, response.status, endpoint, this.secrets());
   }
 
   private async fetchGatewayToken(): Promise<string> {
@@ -812,7 +946,7 @@ export class QualysApiClient {
       skipAuth: true,
     });
     if (response.status >= 400 || response.text.trim().length === 0) {
-      throw new Error(`Qualys gateway token request failed (${response.status}).`);
+      throw this.failure("Qualys gateway token request", response, "/auth", describeOpaqueBody(response, "error body"));
     }
     this.bearerToken = response.text.trim();
     this.bearerExpiresAt = Date.now() + 3.5 * 3_600_000;
@@ -897,25 +1031,36 @@ export class QualysApiClient {
           continue;
         }
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error(redactSecrets(`Qualys request to ${url} failed: ${message}`, this.config));
+        throw new QualysApiError(`Qualys request to ${this.endpointLabel(url)} failed: ${message}`, 0, this.endpointLabel(url), this.secrets());
       } finally {
         clearTimeout(timeout);
       }
     }
   }
 
+  // XML and CSV surfaces share one failure path: a documented envelope contributes its CODE and TEXT (scrubbed
+  // by the constructor), anything else contributes only its content type and byte length.
+  private xmlFailure(response: QualysHttpResponse, endpoint: string, document: XmlNode | undefined): QualysApiError | undefined {
+    const envelope = document ? xmlErrorEnvelope(document) : undefined;
+    if (envelope) return this.failure("Qualys request", response, endpoint, envelope);
+    if (response.status < 400) return undefined;
+    return this.failure(
+      "Qualys request",
+      response,
+      endpoint,
+      describeOpaqueBody(response, document ? "XML error body without a SIMPLE_RETURN or ERROR envelope" : "non-XML error body"),
+    );
+  }
+
   async getXml(path: string, query: JsonRecord = {}): Promise<XmlNode> {
     const url = this.buildUrl(path, query);
     const response = await this.rawRequest("GET", url);
-    const document = looksLikeXml(response.text) ? parseXml(response.text) : undefined;
-    const errorSummary = document ? xmlErrorSummary(document) : undefined;
-    const label = this.endpointLabel(path);
-    if (response.status >= 400 || errorSummary) {
-      const detail = errorSummary ?? response.text.replace(/\s+/g, " ").slice(0, 240);
-      throw new Error(redactSecrets(`Qualys request failed (${response.status}) for ${label}${detail ? `: ${detail}` : ""}`, this.config));
-    }
+    const endpoint = this.endpointLabel(path);
+    const document = parseXmlBody(response.text);
+    const failure = this.xmlFailure(response, endpoint, document);
+    if (failure) throw failure;
     if (!document) {
-      throw new Error(`Qualys request for ${label} did not return XML.`);
+      throw new QualysApiError(`Qualys request for ${endpoint} did not return XML (${response.status}; ${describeOpaqueBody(response, "body")}).`, response.status, endpoint, this.secrets());
     }
     return document;
   }
@@ -923,14 +1068,8 @@ export class QualysApiClient {
   async getText(path: string, query: JsonRecord = {}): Promise<string> {
     const url = this.buildUrl(path, query);
     const response = await this.rawRequest("GET", url, { accept: "text/csv, application/xml" });
-    const label = this.endpointLabel(path);
-    if (looksLikeXml(response.text)) {
-      const errorSummary = xmlErrorSummary(parseXml(response.text));
-      if (errorSummary) throw new Error(`Qualys request failed (${response.status}) for ${label}: ${errorSummary}`);
-    }
-    if (response.status >= 400) {
-      throw new Error(redactSecrets(`Qualys request failed (${response.status}) for ${label}: ${response.text.replace(/\s+/g, " ").slice(0, 240)}`, this.config));
-    }
+    const failure = this.xmlFailure(response, this.endpointLabel(path), parseXmlBody(response.text));
+    if (failure) throw failure;
     return response.text;
   }
 
@@ -941,19 +1080,26 @@ export class QualysApiClient {
       contentType: "application/json",
       accept: "application/json",
     });
-    let payload: JsonRecord = {};
+    const endpoint = this.endpointLabel(path);
+    let payload: JsonRecord | undefined = {};
     if (response.text.trim().length > 0) {
       try {
-        payload = asObject(JSON.parse(response.text)) ?? {};
+        payload = asObject(JSON.parse(response.text));
       } catch {
-        throw new Error(redactSecrets(`Qualys QPS request failed (${response.status}) for ${path}: ${response.text.replace(/\s+/g, " ").slice(0, 240)}`, this.config));
+        payload = undefined;
       }
+      if (!payload) throw this.failure("Qualys QPS request", response, endpoint, describeOpaqueBody(response, "non-JSON error body"));
     }
+    // ServiceResponse (qps/rest): only responseCode and responseErrorDetails.errorMessage are documented error fields,
+    // and only those two are echoed.
     const serviceResponse = asObject(payload.ServiceResponse) ?? payload;
     const responseCode = asString(serviceResponse.responseCode);
     if (response.status >= 400 || (responseCode && responseCode !== "SUCCESS")) {
-      const detail = pathString(serviceResponse, "responseErrorDetails", "errorMessage") ?? responseCode ?? response.text.slice(0, 240);
-      throw new Error(redactSecrets(`Qualys QPS request failed (${response.status}) for ${path}: ${detail}`, this.config));
+      const message = pathString(serviceResponse, "responseErrorDetails", "errorMessage");
+      const detail = responseCode
+        ? `responseCode ${responseCode}${message ? `: ${message}` : ""}`
+        : describeOpaqueBody(response, "JSON error body without a ServiceResponse.responseCode");
+      throw this.failure("Qualys QPS request", response, endpoint, detail);
     }
     return serviceResponse;
   }
@@ -1208,16 +1354,12 @@ export class QualysApiClient {
   async listUsers(): Promise<QualysListResult> {
     // VM/PC API user guide "User List" (/msp/user_list.php, user_list_output.dtd): USER carries USER_LOGIN,
     // USER_STATUS, CREATION_DATE, LAST_LOGIN_DATE (Manager and Unit Manager callers only), USER_ROLE,
-    // BUSINESS_UNIT, and CONTACT_INFO/EMAIL. Errors arrive as USER_LIST_OUTPUT/ERROR with a number attribute.
+    // BUSINESS_UNIT, and CONTACT_INFO/EMAIL. Errors arrive as USER_LIST_OUTPUT/ERROR with a number attribute, which
+    // getXml recognises as a documented envelope.
     const document = await this.getXml("/msp/user_list.php", {});
     const output = findXmlElement(document, "USER_LIST_OUTPUT");
-    const error = output?.children.find((child) => child.name === "ERROR");
-    if (error) {
-      const number = error.attributes.number;
-      throw new Error(redactSecrets(`Qualys request failed for /msp/user_list.php: error${number ? ` ${number}` : ""}: ${error.text.trim()}`, this.config));
-    }
     if (!output) {
-      throw new Error("Qualys request for /msp/user_list.php did not return USER_LIST_OUTPUT.");
+      throw new QualysApiError("Qualys request for /msp/user_list.php did not return USER_LIST_OUTPUT.", 200, "/msp/user_list.php", this.secrets());
     }
     return listResult(xmlRecords(output, "USER"), 1);
   }
@@ -1367,7 +1509,7 @@ export type QualysDataClient = Pick<
 >;
 
 // Every inventory a finding can read, keyed by the source name used in collection.sources and core_data.
-const SURFACE_ENDPOINTS: Record<string, string> = {
+export const SURFACE_ENDPOINTS: Record<string, string> = {
   scheduled_scans: "/api/2.0/fo/schedule/scan/",
   scans: "/api/2.0/fo/scan/",
   hosts: "/api/2.0/fo/asset/host/",
@@ -1436,7 +1578,7 @@ async function collect(
     }
     return { name, endpoint, data: list.items, moduleUnavailable: false, truncated: Boolean(truncationReason), truncationReason, cap };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     errors.push(`${name}: ${message}`);
     return { name, endpoint, data: [], error: message, moduleUnavailable: isModuleUnavailableError(message), truncated: false, cap };
   }
@@ -3648,6 +3790,15 @@ export async function assessQualysAdministration(
       ? `unreadable: ${unreadableLabel(userList)}; ${unreadableLabel(users)}`
       : `partial: ${unreadableLabel(userList)}, so the population is the Administration API user search (${users.endpoint}), which returns Active users only and hides other Manager and Super User accounts`;
   const fromPopulation = (value: unknown): Disclosed => disclosed(bothUserSourcesUnreadable ? null : value, populationStatus);
+  // Matching over the Administration API fallback can surface accounts but never show their absence, because that
+  // population hides other Manager and Super User accounts; an empty match list is therefore withheld, and a
+  // non-empty one is a lower bound.
+  const partialPopulation = !userListReadable && !bothUserSourcesUnreadable;
+  const matchStatus = partialPopulation
+    ? `${populationStatus}, so matches are a lower bound and an empty match list cannot show there are none`
+    : populationStatus;
+  const fromMatches = (matches: string[], render: (matches: string[]) => unknown): Disclosed =>
+    disclosed(bothUserSourcesUnreadable || (partialPopulation && matches.length === 0) ? null : render(matches), matchStatus);
   const excessiveManagers = managers.length > settings.maxManagers;
   const userStatusVerdict: QualysFindingStatus = bothUserSourcesUnreadable
     ? "manual"
@@ -3695,8 +3846,8 @@ export async function assessQualysAdministration(
       pending_activation_users: countIfReadable(userList, pendingUsers.length),
       managers: fromPopulation(managers.slice(0, 50)),
       max_managers: settings.maxManagers,
-      shared_emails: fromPopulation(sharedEmails.slice(0, 50)),
-      generic_accounts: fromPopulation(genericAccounts.slice(0, 50)),
+      shared_emails: fromMatches(sharedEmails, (matches) => matches.slice(0, 50)),
+      generic_accounts: fromMatches(genericAccounts, (matches) => matches.slice(0, 50)),
       stale_login_users: listIfReadable(userList, staleLoginUsers.slice(0, 50)),
       inactive_user_days: INACTIVE_USER_DAYS,
       users_with_last_login: countIfReadable(userList, usersWithLastLogin.length),
@@ -3805,7 +3956,7 @@ export async function assessQualysAdministration(
       user_list_users: sourceCount(userList),
       active_users: fromPopulation(activeUsers.length),
       managers: fromPopulation(managers.length),
-      shared_emails: fromPopulation(sharedEmails.length),
+      shared_emails: fromMatches(sharedEmails, (matches) => matches.length),
       activity_entries: sourceCount(activity),
       sensitive_actions: countIfReadable(activity, sensitiveActions.length),
       web_apps: sourceCount(webApps),
@@ -3840,7 +3991,7 @@ async function probeSurface(
       ...(list.truncated ? { truncation: list.truncationReason } : {}),
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     return {
       name,
       module,
@@ -4139,21 +4290,25 @@ export async function exportQualysAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, safeDirName(`qualys-${config.platform}-audit-bundle`));
+  // Second layer for every bundle file: the same scrub the error constructor applies, minus the long-token heuristic
+  // (QIDs, asset ids, and tag ids are evidence). The first layer is the constructor plus the per-surface allowlist.
+  const secrets = credentialValues(config);
+  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await write("QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
+  await write("metadata.json", serializeJson({
     generated_at: new Date().toISOString(),
     platform: config.platform,
     base_url: config.baseUrl,
     auth_mode: config.authMode,
     source_chain: config.sourceChain,
   }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  await write("core_data/access.json", serializeJson(access));
   for (const assessment of assessments) {
     for (const [name, value] of Object.entries(assessment.rawData)) {
-      await writeSecureTextFile(outputDir, `core_data/${assessment.category}/${name}.json`, serializeJson(value));
+      await write(`core_data/${assessment.category}/${name}.json`, serializeJson(value));
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+    await write(`analysis/${assessment.category}.json`, serializeJson({
       category: assessment.category,
       title: assessment.title,
       summary: assessment.summary,
@@ -4161,14 +4316,14 @@ export async function exportQualysAuditBundle(
       errors: assessment.errors,
     }));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await write("analysis/findings.json", serializeJson(findings));
+  await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const framework of FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.dir}/${framework.file}`, buildFrameworkReport(framework.title, framework.prefix, findings));
+    await write(`compliance/${framework.dir}/${framework.file}`, buildFrameworkReport(framework.title, framework.prefix, findings));
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await write("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = bundleZipPath(outputDir);

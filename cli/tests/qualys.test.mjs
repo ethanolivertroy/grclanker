@@ -8,12 +8,15 @@ import { inflateRawSync } from "node:zlib";
 import {
   QUALYS_PLATFORMS,
   QualysApiClient,
+  QualysApiError,
+  SURFACE_ENDPOINTS,
   assessQualysAdministration,
   assessQualysAssetInventory,
   assessQualysScanCoverage,
   assessQualysVulnerabilityManagement,
   bundleZipPath,
   checkQualysAccess,
+  credentialValues,
   exportQualysAuditBundle,
   exportableRecords,
   normalizeList,
@@ -24,6 +27,7 @@ import {
   resolveQualysPlatform,
   resolveSecureOutputPath,
   resolveViewScope,
+  scrubErrorText,
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -2070,7 +2074,7 @@ test("rule 1: a SIMPLE_RETURN or 403 response through the real client yields man
   for (const item of findings) {
     assert.equal(item.status, "manual", `${item.id} must be manual when its evidence is forbidden`);
     assert.match(item.summary, /Collect manually:/);
-    assert.match(item.summary, /code 2010|not authorized/);
+    assert.match(item.summary, /code 2010|responseCode UNAUTHORIZED/, "the parsed SIMPLE_RETURN code or QPS responseCode names the cause");
     assert.ok(item.evidence.collection.sources.some((source) => source.status === "unreadable"));
   }
   assert.ok(results.every((result) => result.errors.length > 0));
@@ -2616,6 +2620,249 @@ test("rule 9: every rawData surface has an allowlist and an unknown surface is r
 });
 
 // ---------------------------------------------------------------------------------------------
+// Rule 9, error-body class: a secret a Qualys server echoes in an error body (not the configured credential) must
+// never reach a finding, summary, errors array, collection.sources reason, bundle file, zip entry, or thrown error.
+// ---------------------------------------------------------------------------------------------
+
+const ERROR_CANARIES = {
+  bearer: "CANARY-BEARER-7f3a9c1d",
+  session: "CANARY-SESSION-7f3a9c1d",
+  apiKey: "CANARY-APIKEY-7f3a9c1d",
+  urlToken: "CANARY-URLTOKEN-7f3a9c1d",
+  // 64 characters, the shape of a QPS or gateway token, with no header, name, or scheme around it.
+  longToken: `C4NARYL0NGT0KEN${"7f3a9c1d".repeat(6)}0`,
+  // The caller's own password (sampleConfig), which a SIMPLE_RETURN TEXT may echo.
+  password: "s3cret-value",
+  // Plain lowercase letters: no header, no name, no token shape. Only the rule that never echoes a body keeps them out.
+  bareHtml: "canaryhtmlbodyzqxwvutsrp",
+  bareCsv: "canarycsvrowzqxwvutsrp",
+};
+
+function canaryHtmlPage() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway ${ERROR_CANARIES.bareHtml}</h1><p>Authorization: Bearer ${ERROR_CANARIES.bearer}</p><p>Set-Cookie: QualysSession=${ERROR_CANARIES.session}; Path=/; HttpOnly</p><p>X-Api-Key: qk_live_${ERROR_CANARIES.apiKey}</p><br></body></html>`;
+}
+
+function canarySimpleReturn() {
+  return `<?xml version="1.0" encoding="UTF-8" ?><!DOCTYPE SIMPLE_RETURN SYSTEM "https://qualysapi.qualys.com/api/2.0/simple_return.dtd"><SIMPLE_RETURN><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><CODE>1903</CODE><TEXT>Login failed for acme_api with password ${ERROR_CANARIES.password}; retry at https://qualysapi.qualys.com/api/2.0/fo/report/?action=fetch&amp;token=${ERROR_CANARIES.urlToken}</TEXT></RESPONSE></SIMPLE_RETURN>`;
+}
+
+function canaryQpsError() {
+  return { ServiceResponse: { responseCode: "INVALID_REQUEST", responseErrorDetails: { errorMessage: `Upstream rejected token ${ERROR_CANARIES.longToken} for QualysSession=${ERROR_CANARIES.session}` } } };
+}
+
+function canaryCsvBody() {
+  return `${CSV_HEADER}"${daysAgo(0)}","login","auth","password=${ERROR_CANARIES.password} X-Api-Key: ${ERROR_CANARIES.apiKey} ${ERROR_CANARIES.bareCsv}","acme_api","Manager","10.0.0.9"\n`;
+}
+
+function assertNoCanary(text, label) {
+  for (const [name, canary] of Object.entries(ERROR_CANARIES)) {
+    assert.ok(!text.includes(canary), `${label}: ${name} canary leaked`);
+  }
+}
+
+test("scrubErrorText redacts every credential shape in free text and leaves benign Qualys operator text untouched", () => {
+  const basic = Buffer.from("acme_api:s3cret-value").toString("base64");
+  const cases = [
+    { name: "tokenised URL query", input: `retry at https://qualysapi.qualys.com/api/2.0/fo/report/?action=fetch&token=${ERROR_CANARIES.urlToken}`, expect: /^retry at https:\/\/qualysapi\.qualys\.com\/api\/2\.0\/fo\/report\/\?\[REDACTED\]$/ },
+    { name: "tokenised URL fragment", input: `see https://qualysguard.qg1.apps.qualys.com/portal/#access_token=${ERROR_CANARIES.urlToken}&token_type=bearer`, expect: /^see https:\/\/qualysguard\.qg1\.apps\.qualys\.com\/portal\/#\[REDACTED\]$/ },
+    { name: "Bearer", input: `Authorization: Bearer ${ERROR_CANARIES.bearer}`, expect: /^Authorization: Bearer \[REDACTED\]$/ },
+    { name: "Basic", input: `Authorization: Basic ${basic}`, expect: /^Authorization: Basic \[REDACTED\]$/ },
+    { name: "Cookie", input: `Cookie: QualysSession=${ERROR_CANARIES.session}; theme=dark`, expect: /^Cookie: \[REDACTED\]$/ },
+    { name: "Set-Cookie", input: `Set-Cookie: QualysSession=${ERROR_CANARIES.session}; Path=/; HttpOnly`, expect: /^Set-Cookie: \[REDACTED\]$/ },
+    { name: "session assignment", input: `QualysSession=${ERROR_CANARIES.session}`, expect: /^QualysSession=\[REDACTED\]$/ },
+    { name: "session id quoted", input: `"session_id": "${ERROR_CANARIES.session}"`, expect: /^"session_id": "\[REDACTED\]"$/ },
+    { name: "API key header", input: `X-Api-Key: qk_live_${ERROR_CANARIES.apiKey}`, expect: /^X-Api-Key: \[REDACTED\]$/ },
+    { name: "API key quoted", input: `api_key="${ERROR_CANARIES.apiKey}"`, expect: /^api_key="\[REDACTED\]"$/ },
+    { name: "client secret", input: `client_secret=${ERROR_CANARIES.apiKey}`, expect: /^client_secret=\[REDACTED\]$/ },
+    { name: "client secret JSON", input: `{"client_secret": "${ERROR_CANARIES.apiKey}"}`, expect: /^\{"client_secret": "\[REDACTED\]"\}$/ },
+    { name: "password unquoted", input: "password: hunter22seven", expect: /^password: \[REDACTED\]$/ },
+    { name: "password quoted", input: "password='hunter22seven'", expect: /^password='\[REDACTED\]'$/ },
+    { name: "access, refresh, and id tokens", input: "access_token=abcdef123456 refresh_token=abcdef123456 id_token=abcdef123456", expect: /^access_token=\[REDACTED\] refresh_token=\[REDACTED\] id_token=\[REDACTED\]$/ },
+    { name: "HTML page headers", input: canaryHtmlPage(), expect: /<p>Authorization: Bearer \[REDACTED\]<\/p><p>Set-Cookie: \[REDACTED\]<\/p><p>X-Api-Key: \[REDACTED\]<\/p>/ },
+    { name: "long token in free text", input: `Upstream rejected token ${ERROR_CANARIES.longToken} for tenant 9f8e7d6c5b4a39281706f5e4d3c2b1a0`, expect: /^Upstream rejected token \[REDACTED\] for tenant \[REDACTED\]$/ },
+    { name: "JWT segments", input: "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhY21lIn0.s3cr3tS1gnatur3Valu3", expect: /^token \[REDACTED\]\.\[REDACTED\]\.\[REDACTED\]$/ },
+  ];
+  for (const item of cases) {
+    const scrubbed = scrubErrorText(item.input);
+    assert.match(scrubbed, item.expect, item.name);
+    for (const name of ["bearer", "session", "apiKey", "urlToken", "longToken"]) {
+      assert.ok(!scrubbed.includes(ERROR_CANARIES[name]), `${item.name}: ${name} canary survived the scrub`);
+    }
+    assert.doesNotMatch(scrubbed, /hunter22seven|abcdef123456|9f8e7d6c5b4a39281706f5e4d3c2b1a0|YWNtZV9hcGk|eyJhbGci/, item.name);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `${item.name}: idempotent`);
+  }
+
+  const secrets = credentialValues(sampleConfig());
+  assert.deepEqual(secrets, ["s3cret-value", basic], "the configured password and the derived basic string are exact secrets");
+  assert.equal(scrubErrorText(`Bad Login/Password ${ERROR_CANARIES.password} for acme_api`, secrets), "Bad Login/Password [REDACTED] for acme_api", "the configured password is removed wherever it appears");
+  assert.equal(scrubErrorText(`header ${basic} echoed`, secrets), "header [REDACTED] echoed");
+  assert.equal(scrubErrorText("Bearer pre-issued-token-value-1234", credentialValues(sampleConfig({ password: undefined, username: undefined, token: "pre-issued-token-value-1234" }))), "Bearer [REDACTED]");
+
+  const benign = [
+    "Qualys request failed (403) for /api/2.0/fo/asset/host/vm/detection/: code 2010: Forbidden, module not subscribed for this user",
+    "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/assetdataconnector: responseCode UNAUTHORIZED: User is not authorized to access this module",
+    "Qualys request failed (502) for /api/2.0/fo/asset/host/: non-XML error body (text/html; 236 bytes)",
+    "Qualys QPS request failed (500) for /qps/rest/3.0/search/was/wasscanschedule: non-JSON error body (text/csv; 180 bytes)",
+    "Qualys request failed (200) for /msp/user_list.php: error 999: Forbidden: this account is not authorized to list users",
+    "Qualys request to /api/2.0/fo/schedule/scan/ failed: fetch failed",
+    "X-Requested-With: grclanker",
+    "token: user",
+    "SCHEDULE_SCAN_LIST_OUTPUT, HOST_LIST_VM_DETECTION_OUTPUT, LAST_VM_AUTH_SCANNED_DATE, KNOWLEDGE_BASE_VULN_LIST_OUTPUT",
+    "ISCANNER_NAME External Scanner, TAG_SET_INCLUDE, AUTH_UNIX_IDS, ML_VERSION versus ML_LATEST",
+    "QID 90001, 105191, 38170 open on host 12345678 tagged 7654321 since 2026-09-21T12:17:03Z",
+    "activity log truncation_limit 5000 reached; item cap 5000 reached with hasMoreRecords true; page cap 25 reached with a WARNING/URL continuation not followed",
+    "a full page was returned without hasMoreRecords or lastId, so the population may continue beyond it",
+    "Using Qualys platform US1 at https://qualysapi.qualys.com with basic authentication.",
+    "Using Qualys platform GOV1 at https://qualysapi.qg1.apps.qualysgov.com with bearer authentication.",
+    "was not called because detections (/api/2.0/fo/asset/host/vm/detection/) was not readable (module unlicensed or role not permitted)",
+    "Authentication record types windows, unix cover the host OS mix and 3/3 scanned hosts (100%) had a recent authenticated scan",
+    "authStatus SUCCESSFUL, AUTHENTICATION Windows, Unix, oauth2Record grantType, activationKey title",
+  ];
+  for (const text of benign) {
+    assert.equal(scrubErrorText(text), text, `benign text must survive: ${text}`);
+    assert.equal(scrubErrorText(text, secrets), text, `benign text must survive the configured secrets: ${text}`);
+  }
+
+  // The heuristic cannot recognise arbitrary words, which is exactly why no response body is ever echoed.
+  assert.equal(scrubErrorText(ERROR_CANARIES.bareHtml), ERROR_CANARIES.bareHtml);
+  const agentId = "agentId 3f2a9c1d-7b4e-4c8a-9d2e-1f0a8b7c6d5e on tag 7654321";
+  assert.equal(scrubErrorText(agentId, [], { longTokens: false }), agentId, "data mode keeps opaque identifiers as evidence");
+  assert.equal(scrubErrorText(agentId), "agentId [REDACTED] on tag 7654321", "error mode treats the same run as a token");
+});
+
+const ERROR_BODY_SHAPES = {
+  "502 text/html": {
+    status: 502,
+    respond: () => new Response(canaryHtmlPage(), { status: 502, headers: { "content-type": "text/html; charset=utf-8" } }),
+    disclosure: /non-(?:XML|JSON) error body \(text\/html; \d+ bytes\)/,
+  },
+  "SIMPLE_RETURN TEXT with a tokenised URL and the caller's password": {
+    status: 401,
+    respond: () => xmlResponse(canarySimpleReturn(), { status: 401 }),
+    // XML and CSV surfaces parse the envelope and echo CODE plus the scrubbed TEXT; QPS surfaces never echo a non-JSON body.
+    disclosure: /code 1903: Login failed for acme_api with password \[REDACTED\]; retry at https:\/\/qualysapi\.qualys\.com\/api\/2\.0\/fo\/report\/\?\[REDACTED\]|non-JSON error body \(application\/xml; \d+ bytes\)/,
+  },
+  "QPS errorMessage with a 64-character token": {
+    status: 400,
+    respond: () => jsonResponse(canaryQpsError(), { status: 400 }),
+    disclosure: /responseCode INVALID_REQUEST: Upstream rejected token \[REDACTED\] for QualysSession=\[REDACTED\]|non-XML error body \(application\/json; \d+ bytes\)/,
+  },
+  "CSV path failure": {
+    status: 500,
+    respond: () => new Response(canaryCsvBody(), { status: 500, headers: { "content-type": "text/csv" } }),
+    disclosure: /non-(?:XML|JSON) error body \(text\/csv; \d+ bytes\)/,
+  },
+};
+
+// The direct client call that reads each surface endpoint, so the thrown error itself can be inspected.
+const SURFACE_CLIENT_CALLS = {
+  "/api/2.0/fo/schedule/scan/": (client) => client.listScheduledScans(),
+  "/api/2.0/fo/scan/": (client) => client.listScans(),
+  "/api/2.0/fo/asset/host/": (client) => client.listHosts(100),
+  "/api/2.0/fo/subscription/option_profile/vm/": (client) => client.listOptionProfiles(),
+  "/api/2.0/fo/asset/excluded_ip/": (client) => client.listExcludedIps(),
+  "/api/2.0/fo/asset/group/": (client) => client.listAssetGroups(),
+  "/qps/rest/2.0/search/am/assetdataconnector": (client) => client.searchConnectors(),
+  "/api/2.0/fo/appliance/": (client) => client.listAppliances(),
+  "/qps/rest/2.0/search/am/hostasset": (client) => client.searchCloudAgents(100),
+  "/qps/rest/2.0/search/am/tag": (client) => client.searchTags(100),
+  "/api/2.0/fo/auth/": (client) => client.listAuthRecordSummary(),
+  "/api/2.0/fo/compliance/policy/": (client) => client.listCompliancePolicies(),
+  "/api/2.0/fo/asset/host/vm/detection/": (client) => client.listDetections(100),
+  "/api/2.0/fo/knowledge_base/vuln/": (client) => client.listKnowledgeBase(["90001"]),
+  "/api/2.0/fo/schedule/report/": (client) => client.listScheduledReports(),
+  "/api/2.0/fo/report/": (client) => client.listReports(),
+  "/qps/rest/2.0/search/am/user/": (client) => client.searchUsers(),
+  "/msp/user_list.php": (client) => client.listUsers(),
+  "/api/2.0/fo/activity_log/": (client) => client.listActivityLog(7),
+  "/qps/rest/3.0/search/was/webapp": (client) => client.searchWebApps(),
+  "/qps/rest/3.0/search/was/wasscan": (client) => client.searchWasScans(),
+  "/qps/rest/3.0/search/was/webappauthrecord": (client) => client.searchWasAuthRecords(),
+  "/qps/rest/3.0/search/was/wasscanschedule": (client) => client.searchWasSchedules(),
+};
+
+function failingEndpointRouter(endpoint, shape) {
+  return async (url, init) => (new URL(url).pathname === endpoint ? shape.respond() : compliantRouter(url, init));
+}
+
+test("error-body walk: every surface the collectors call, failing in four body shapes, leaks no canary and is disclosed with status, endpoint, and content type and length or the parsed code", async () => {
+  const outputRoot = createTempBase("qualys-error-body-walk-");
+  const endpoints = [...new Set(Object.values(SURFACE_ENDPOINTS))].sort();
+  assert.ok(endpoints.length >= 22, `expected every surface endpoint, saw ${endpoints.length}`);
+  assert.deepEqual(Object.keys(SURFACE_CLIENT_CALLS).sort(), endpoints, "every SURFACE_ENDPOINTS entry has a direct client call in the walk");
+
+  const baseline = recordingClient(compliantRouter);
+  await runAllAssessments(baseline.client);
+  await checkQualysAccess(baseline.client);
+  for (const endpoint of endpoints) {
+    assert.ok(baseline.requested.has(endpoint), `the compliant baseline reads ${endpoint}, so the walk exercises a real call`);
+  }
+
+  const walked = [];
+  for (const endpoint of endpoints) {
+    for (const [shapeName, shape] of Object.entries(ERROR_BODY_SHAPES)) {
+      const label = `${endpoint} [${shapeName}]`;
+      const client = routedClient(failingEndpointRouter(endpoint, shape));
+
+      const thrown = await SURFACE_CLIENT_CALLS[endpoint](client).then(() => null, (error) => error);
+      assert.ok(thrown instanceof QualysApiError, `${label}: the direct client call throws a QualysApiError`);
+      assert.equal(thrown.status, shape.status, `${label}: the error carries the HTTP status`);
+      assert.equal(thrown.endpoint, endpoint, `${label}: the error carries the endpoint`);
+      assertNoCanary(thrown.message, `${label} thrown message`);
+      assert.match(thrown.message, new RegExp(`^Qualys (?:QPS )?request failed \\(${shape.status}\\) for ${endpoint.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}: `), label);
+      assert.match(thrown.message, shape.disclosure, `${label}: the failure is described by content type and length or by the parsed code`);
+      assert.doesNotMatch(thrown.message, /<html|<p>|Bad Gateway|"Date","Action"/, `${label}: no body text is echoed`);
+
+      const results = await runAllAssessments(client);
+      const access = await checkQualysAccess(client);
+      assertNoCanary(JSON.stringify(results), `${label} findings, summaries, evidence, sources, and errors arrays`);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.ok(errors.length > 0, `${label}: an assessment errors array records the failure`);
+      assert.ok(errors.some((entry) => entry.includes(endpoint) && entry.includes(`(${shape.status})`) && shape.disclosure.test(entry)), `${label}: the errors array names the endpoint, status, and body description (${errors.join(" | ")})`);
+      const reasons = allFindings(results).flatMap((item) => item.evidence.collection.sources.filter((source) => source.status === "unreadable").map((source) => source.reason));
+      assert.ok(reasons.length > 0, `${label}: a finding lists the surface as unreadable`);
+
+      const exported = await exportQualysAuditBundle(client, client.getResolvedConfig(), outputRoot);
+      assert.ok(exported.errorCount > 0, `${label}: the bundle records the failure`);
+      for (const file of walkFiles(exported.outputDir)) {
+        assertNoCanary(file.content, `${label} bundle file ${file.name}`);
+      }
+      for (const member of readZipMembers(exported.zipPath)) {
+        assertNoCanary(member.content, `${label} zip member ${member.name}`);
+      }
+      const errorsLog = readFileSync(join(exported.outputDir, "_errors.log"), "utf8");
+      assert.ok(errorsLog.includes(endpoint), `${label}: _errors.log names the endpoint`);
+      assert.ok(errorsLog.includes(`(${shape.status})`), `${label}: _errors.log carries the HTTP status`);
+      assert.match(errorsLog, shape.disclosure, `${label}: _errors.log carries the content type and length or the parsed code`);
+      rmSync(exported.outputDir, { recursive: true, force: true });
+      rmSync(exported.zipPath, { force: true });
+      walked.push(label);
+    }
+  }
+  assert.equal(walked.length, endpoints.length * Object.keys(ERROR_BODY_SHAPES).length);
+});
+
+test("rule 9: the activity log's XML error envelope on the CSV path goes through the same scrubbed constructor as every other site", async () => {
+  const client = routedClient(async (url, init) => (url.includes("/activity_log/") ? xmlResponse(canarySimpleReturn(), { status: 401 }) : compliantRouter(url, init)));
+  const thrown = await client.listActivityLog(7).then(() => null, (error) => error);
+  assert.ok(thrown instanceof QualysApiError);
+  assert.equal(thrown.message, "Qualys request failed (401) for /api/2.0/fo/activity_log/: code 1903: Login failed for acme_api with password [REDACTED]; retry at https://qualysapi.qualys.com/api/2.0/fo/report/?[REDACTED]");
+
+  const result = await assessQualysAdministration(client);
+  const activity = findingById(result, "QUALYS-C19");
+  assert.equal(activity.status, "manual");
+  assert.doesNotMatch(activity.summary, /s3cret-value|CANARY/);
+  assert.match(activity.summary, /code 1903/);
+  const source = activity.evidence.collection.sources.find((item) => item.name === "activity_log");
+  assert.equal(source.status, "unreadable");
+  assert.match(source.reason, /password \[REDACTED\]/);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /^activity_log: Qualys request failed \(401\) for \/api\/2\.0\/fo\/activity_log\/: code 1903/);
+  assertNoCanary(JSON.stringify(result), "administration assessment, including the caller's password");
+});
+
+// ---------------------------------------------------------------------------------------------
 // False-pass self-check fixtures (a) forbidden, (b) empty, (c) partial, (d) compliant
 // ---------------------------------------------------------------------------------------------
 
@@ -2739,10 +2986,19 @@ function rendersEmpty(value) {
   return value !== null && typeof value === "object" && Object.keys(value).length === 0;
 }
 
-/** Any status reading unreadable, not_collected, or unknown needs a null companion, and a status item carrying one never renders 0, [], or {} beside it. */
-function assertNoFabricatedValues(value, label, path = "") {
+/** A core_data wrapper's records are API values: a null inside one is the API's own field, not a rendering. */
+function isSurfaceWrapper(value) {
+  return typeof value.endpoint === "string" && typeof value.status === "string" && "records" in value;
+}
+
+/**
+ * Any status reading unreadable, not_collected, or unknown needs a null companion, a status item carrying one never
+ * renders 0, [], or {} beside it, and conversely every null rendered value needs a status sibling (<field>_status or
+ * a status on the same item) explaining why it is unknown.
+ */
+function assertNoFabricatedValues(value, label, path = "", apiRecords = false) {
   if (Array.isArray(value)) {
-    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`, apiRecords));
     return;
   }
   if (value === null || typeof value !== "object") return;
@@ -2759,7 +3015,11 @@ function assertNoFabricatedValues(value, label, path = "") {
         }
       }
     }
-    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+    if (entry === null && !apiRecords) {
+      const explained = typeof value[`${key}_status`] === "string" || typeof value.status === "string";
+      assert.ok(explained, `${label}: ${path}.${key} is null without a ${key}_status or status sibling`);
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`, apiRecords || (key === "records" && isSurfaceWrapper(value)));
   }
 }
 
@@ -3280,8 +3540,12 @@ test("C13 discloses which surface its user population came from: the User List A
   const fallback = findingById(await assessQualysAdministration(withForbidden((url) => url.includes("/msp/user_list.php"))), "QUALYS-C13");
   assert.equal(fallback.evidence.active_users, tenant.adminUsers.length, "pre-fix: the Administration API population rendered with no indication of its source");
   assert.match(fallback.evidence.active_users_status, /^partial: user_list \(\/msp\/user_list\.php\) was not readable \(.*\), so the population is the Administration API user search \(\/qps\/rest\/2\.0\/search\/am\/user\/\), which returns Active users only and hides other Manager and Super User accounts$/);
-  for (const key of ["users_returned", "managers", "shared_emails", "generic_accounts"]) {
+  for (const key of ["users_returned", "managers"]) {
     assert.equal(fallback.evidence[`${key}_status`], fallback.evidence.active_users_status, `${key} discloses the same population source`);
+  }
+  for (const key of ["shared_emails", "generic_accounts"]) {
+    assert.equal(fallback.evidence[key], null, `${key}: an empty match list over the partial population is withheld, never []`);
+    assert.equal(fallback.evidence[`${key}_status`], `${fallback.evidence.active_users_status}, so matches are a lower bound and an empty match list cannot show there are none`);
   }
   assert.equal(fallback.status, "manual");
   assert.match(fallback.summary, /the Administration API search returns Active users only, hides other Manager and Super User accounts, and documents no status or last-login field, so inactive-user detection is manual and the manager count is a lower bound/);
@@ -3297,6 +3561,29 @@ test("C13 discloses which surface its user population came from: the User List A
   assert.equal(primary.evidence.active_users, 3);
   assert.equal(primary.evidence.active_users_status, "readable: USER_STATUS Active users from user_list (/msp/user_list.php)");
   assert.equal(primary.evidence.managers_status, primary.evidence.active_users_status);
+  assert.deepEqual(primary.evidence.generic_accounts, [], "a complete User List read can show there are no generic accounts");
+  assert.equal(primary.evidence.generic_accounts_status, primary.evidence.active_users_status);
+});
+
+test("C13 keeps a non-empty match list over the partial Administration API population as a lower bound and withholds only an empty one", async () => {
+  const matching = [...tenant.adminUsers, adminUser(3, "svc_backup", "Reader", { emailAddress: "mgr@example.com" })];
+  const result = await assessQualysAdministration(routedClient(async (url, init) => {
+    if (url.includes("/msp/user_list.php")) return forbiddenRouter(url);
+    if (url.includes("/am/user")) return jsonResponse(qpsResponse("User", matching));
+    return compliantRouter(url, init);
+  }));
+  const users = findingById(result, "QUALYS-C13");
+  assert.deepEqual(users.evidence.generic_accounts, ["svc_backup"], "a match found in the partial population is real evidence");
+  assert.deepEqual(users.evidence.shared_emails, ["mgr@example.com"]);
+  assert.match(users.evidence.generic_accounts_status, /^partial: user_list \(\/msp\/user_list\.php\) was not readable \(.*\), so the population is the Administration API user search \(\/qps\/rest\/2\.0\/search\/am\/user\/\), which returns Active users only and hides other Manager and Super User accounts, so matches are a lower bound and an empty match list cannot show there are none$/);
+  assert.equal(users.evidence.shared_emails_status, users.evidence.generic_accounts_status);
+  assert.equal(users.status, "fail", "a shared email in the lower bound still fails the control");
+  assert.equal(result.summary.shared_emails, 1);
+  assert.equal(result.summary.shared_emails_status, users.evidence.shared_emails_status);
+
+  const none = await assessQualysAdministration(withForbidden((url) => url.includes("/msp/user_list.php")));
+  assert.equal(none.summary.shared_emails, null, "the summary count is withheld with the list");
+  assert.match(none.summary.shared_emails_status, /an empty match list cannot show there are none$/);
 });
 
 test("all four assessments together cover every one of the 20 spec controls with framework mappings and collection evidence", async () => {
