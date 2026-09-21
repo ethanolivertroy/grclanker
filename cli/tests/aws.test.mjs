@@ -23,6 +23,7 @@ import {
   checkAwsAccess,
   exportAwsAuditBundle,
   isAwsAccessDenied,
+  normalizePolicyDocument,
   permissiveNaclEntries,
   resolveAwsConfiguration,
   resolveRegionScope,
@@ -660,6 +661,64 @@ test("statementDeniesInsecureTransport matches Deny statements on aws:SecureTran
   assert.ok(!statementDeniesInsecureTransport({ Effect: "Deny" }));
 });
 
+test("normalizePolicyDocument keeps literal % in plain S3 JSON and URL-decodes IAM documents inside a guard", () => {
+  const policy = {
+    Version: "2012-10-17",
+    Statement: [{ Sid: "Deny100%Insecure", Effect: "Deny", Action: "s3:*", Resource: "arn:aws:s3:::bucket/reports%202026/*" }],
+  };
+
+  const s3 = normalizePolicyDocument(JSON.stringify(policy), "plain-json");
+  assert.equal(s3.Statement[0].Sid, "Deny100%Insecure");
+  assert.equal(s3.Statement[0].Resource, "arn:aws:s3:::bucket/reports%202026/*");
+
+  const iam = normalizePolicyDocument(encodeURIComponent(JSON.stringify(policy)), "iam-url-encoded");
+  assert.equal(iam.Statement[0].Sid, "Deny100%Insecure");
+  assert.equal(iam.Statement[0].Resource, "arn:aws:s3:::bucket/reports%202026/*");
+
+  const notEncoded = normalizePolicyDocument(JSON.stringify(policy), "iam-url-encoded");
+  assert.equal(notEncoded.Statement[0].Sid, "Deny100%Insecure");
+
+  assert.equal(normalizePolicyDocument("not json", "plain-json"), undefined);
+  assert.equal(normalizePolicyDocument("%7Bnot json", "iam-url-encoded"), undefined);
+  assert.deepEqual(normalizePolicyDocument(policy, "plain-json"), policy);
+});
+
+test("assessAwsDataProtection keeps all four findings when a bucket policy contains a literal % (review repro)", async () => {
+  const policyWithPercent = JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Sid: "Deny100%Insecure",
+        Effect: "Deny",
+        Principal: "*",
+        Action: "s3:*",
+        Resource: ["arn:aws:s3:::reports", "arn:aws:s3:::reports/quarterly%202026/*"],
+        Condition: { Bool: { "aws:SecureTransport": "false" } },
+      },
+    ],
+  });
+  const result = await assessAwsDataProtection(compliantDataProtectionClient({
+    async describeRegions() {
+      return ["us-east-1"];
+    },
+    async listBuckets() {
+      return { items: [{ Name: "reports", BucketRegion: "us-east-1" }], truncated: false };
+    },
+    async getBucketPolicy() {
+      return policyWithPercent;
+    },
+  }));
+  assert.equal(result.findings.length, 4);
+  assert.deepEqual(statusMap(result), {
+    "AWS-DATA-11": "pass",
+    "AWS-DATA-12": "pass",
+    "AWS-DATA-13": "pass",
+    "AWS-DATA-22": "pass",
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(findingById(result, "AWS-DATA-13").evidence.buckets_without_tls_deny, []);
+});
+
 test("resolveRegionScope prefers arguments, then DescribeRegions, then the configured region", () => {
   const fromArgs = resolveRegionScope(["eu-west-1", "us-east-1", "ap-south-1"], {}, "us-east-1", 2);
   assert.deepEqual(fromArgs.regions, ["eu-west-1", "us-east-1"]);
@@ -1141,6 +1200,28 @@ test("assessAwsIdentity fails on root console logins and attached full-admin cus
   assert.equal(policies.status, "fail");
   assert.deepEqual(policies.evidence.full_admin_attached, [{ name: "ReadOnlyAudit", attachment_count: 1 }]);
   assert.deepEqual(policies.evidence.full_admin_unattached, ["Deploy"]);
+});
+
+test("assessAwsIdentity URL-decodes IAM documents and survives a literal % in inline and managed policies", async () => {
+  const fullAdmin = { Sid: "Allow100%Admin", Effect: "Allow", Action: "*", Resource: "*" };
+  const result = await assessAwsIdentity(compliantIdentityClient({
+    async getAccountAuthorizationDetails() {
+      return [
+        { RoleName: "EncodedInline", Arn: "arn:aws:iam::123456789012:role/EncodedInline", RolePolicyList: [{ PolicyName: "admin", PolicyDocument: encodeURIComponent(JSON.stringify({ Statement: [fullAdmin] })) }] },
+        { RoleName: "RawInline", Arn: "arn:aws:iam::123456789012:role/RawInline", RolePolicyList: [{ PolicyName: "admin", PolicyDocument: JSON.stringify({ Statement: [fullAdmin] }) }] },
+      ];
+    },
+    async getPolicyVersionDocument(arn) {
+      const document = JSON.stringify({ Statement: [arn.endsWith("/Deploy") ? fullAdmin : { Sid: "Read50%", Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::audit/q%202026/*" }] });
+      return arn.endsWith("/Deploy") ? encodeURIComponent(document) : document;
+    },
+  }));
+  assert.equal(findingById(result, "AWS-IAM-05").evidence.privileged_roles, 2);
+  const policies = findingById(result, "AWS-IAM-08");
+  assert.equal(policies.status, "warn");
+  assert.deepEqual(policies.evidence.full_admin_unattached, ["Deploy"]);
+  assert.deepEqual(policies.evidence.policies_unreadable, []);
+  assert.deepEqual(result.errors, []);
 });
 
 test("assessAwsIdentity warns on non-console root activity, unattached wildcards, and unreadable policy versions", async () => {

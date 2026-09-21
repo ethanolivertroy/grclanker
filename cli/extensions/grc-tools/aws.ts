@@ -702,20 +702,45 @@ export function resolveAwsConfiguration(
   };
 }
 
-function normalizePolicyDocument(policyDocument: unknown): JsonRecord | undefined {
-  if (typeof policyDocument === "string") {
-    const decoded = decodeURIComponent(policyDocument);
-    try {
-      return asObject(JSON.parse(decoded));
-    } catch {
-      return undefined;
-    }
+/**
+ * Wire encoding of a policy document string. IAM (GetPolicyVersion, GetAccountAuthorizationDetails) returns
+ * documents URL-encoded per RFC 3986; S3 GetBucketPolicy returns the policy as plain JSON text.
+ */
+export type PolicyDocumentEncoding = "iam-url-encoded" | "plain-json";
+
+function parsePolicyJson(text: string): JsonRecord | undefined {
+  try {
+    return asObject(JSON.parse(text));
+  } catch {
+    return undefined;
   }
-  return asObject(policyDocument);
 }
 
-function normalizeStatements(policyDocument: unknown): JsonRecord[] {
-  const document = normalizePolicyDocument(policyDocument);
+function parseUrlEncodedPolicyJson(text: string): JsonRecord | undefined {
+  try {
+    return asObject(JSON.parse(decodeURIComponent(text)));
+  } catch {
+    // A document that was not URL-encoded after all (or carries a stray %) is still readable as plain JSON.
+    return parsePolicyJson(text);
+  }
+}
+
+export function normalizePolicyDocument(policyDocument: unknown, encoding: PolicyDocumentEncoding): JsonRecord | undefined {
+  if (typeof policyDocument !== "string") return asObject(policyDocument);
+  switch (encoding) {
+    case "iam-url-encoded":
+      return parseUrlEncodedPolicyJson(policyDocument);
+    case "plain-json":
+      return parsePolicyJson(policyDocument);
+    default: {
+      const exhaustive: never = encoding;
+      return exhaustive;
+    }
+  }
+}
+
+function normalizeStatements(policyDocument: unknown, encoding: PolicyDocumentEncoding): JsonRecord[] {
+  const document = normalizePolicyDocument(policyDocument, encoding);
   if (!document) return [];
   const statement = document.Statement;
   if (Array.isArray(statement)) {
@@ -743,7 +768,7 @@ function hasAdministratorPolicy(role: JsonRecord): boolean {
   const inline = Array.isArray(role.RolePolicyList) ? role.RolePolicyList : [];
   return inline.some((policy) => {
     const item = asObject(policy);
-    const statements = normalizeStatements(item?.PolicyDocument);
+    const statements = normalizeStatements(item?.PolicyDocument, "iam-url-encoded");
     return statements.some((statement) => matchesWildcard(statement.Action) && matchesWildcard(statement.Resource));
   });
 }
@@ -826,7 +851,7 @@ export class AwsAuditorClient {
   /** IAM GetPolicyVersion; the Document is URL-encoded JSON per the API reference. */
   async getPolicyVersionDocument(policyArn: string, versionId: string): Promise<JsonRecord | null> {
     const result = await this.iam.send(new GetPolicyVersionCommand({ PolicyArn: policyArn, VersionId: versionId }));
-    return normalizePolicyDocument(result.PolicyVersion?.Document) ?? null;
+    return normalizePolicyDocument(result.PolicyVersion?.Document, "iam-url-encoded") ?? null;
   }
 
   /** CloudTrail LookupEvents filtered on Username root within the window (management events, 90-day history). */
@@ -1635,7 +1660,7 @@ function isServiceWildcardAction(value: unknown): boolean {
 function classifyPolicyStatements(document: JsonRecord | null): { fullAdmin: number; serviceWildcard: number } {
   let fullAdmin = 0;
   let serviceWildcard = 0;
-  for (const statement of normalizeStatements(document)) {
+  for (const statement of normalizeStatements(document, "iam-url-encoded")) {
     if (asString(statement.Effect)?.toLowerCase() !== "allow") continue;
     if (matchesWildcard(statement.Action) && matchesWildcard(statement.Resource)) {
       fullAdmin += 1;
@@ -2483,9 +2508,9 @@ export async function assessAwsDataProtection(
   if (scope.partial) encryptionCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
   const encryptionVerdict = withCap(encryptionStatus, encryptionSummary, encryptionCaps);
 
-  // Control 13: TLS-only bucket policies (aws:SecureTransport deny).
+  // Control 13: TLS-only bucket policies (aws:SecureTransport deny). GetBucketPolicy returns plain JSON, not URL-encoded.
   const transitRows = bucketDetails.map((bucket) => {
-    const statements = bucket.policy.value ? normalizeStatements(bucket.policy.value) : [];
+    const statements = bucket.policy.value ? normalizeStatements(bucket.policy.value, "plain-json") : [];
     return {
       name: bucket.name,
       has_policy: typeof bucket.policy.value === "string",
