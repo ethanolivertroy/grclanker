@@ -768,6 +768,62 @@ test("NewrelicApiClient surfaces dashboard live URL errors and omits link values
     fetchImpl: async () => jsonResponse({ data: { actor: { dashboard: { liveUrls: { liveUrls: [], errors: [{ description: "Live URL listing is not permitted" }] } } } } }),
   });
   await assert.rejects(failing.listDashboardLiveUrls(), /Live URL listing is not permitted/);
+
+  const missingContainer = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ data: { actor: { dashboard: { liveUrls: null } } } }),
+  });
+  await assert.rejects(missingContainer.listDashboardLiveUrls(), /did not include actor\.dashboard\.liveUrls\./);
+
+  const missingList = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ data: { actor: { dashboard: { liveUrls: { errors: null } } } } }),
+  });
+  await assert.rejects(missingList.listDashboardLiveUrls(), /did not include actor\.dashboard\.liveUrls\.liveUrls/);
+});
+
+test("NewrelicApiClient parses the documented live URL sample response and control 14 fails on public links", async () => {
+  const seen = [];
+  const client = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      seen.push(JSON.parse(init.body).query);
+      return jsonResponse({
+        data: {
+          actor: {
+            dashboard: {
+              liveUrls: {
+                errors: null,
+                liveUrls: [
+                  { createdAt: 1753000000346, title: "", type: "WIDGET", url: "https://chart-embed.example.newrelic.com/herald/9ac583f4" },
+                  { createdAt: 1753000000572, title: "", type: "WIDGET", url: "https://chart-embed.example.newrelic.com/herald/5d81451a" },
+                  { createdAt: 1728900000694, title: "Ops overview", type: "DASHBOARD", uuid: "c1eac5ac-4a93-42d4-8b25-36078ecc8d79" },
+                ],
+              },
+            },
+          },
+        },
+      });
+    },
+  });
+  const liveUrls = await client.listDashboardLiveUrls();
+  assert.equal(liveUrls.complete, true);
+  assert.equal(liveUrls.items.length, 3);
+  assert.match(seen[0], /actor \{ dashboard \{ liveUrls \{ liveUrls \{ title type createdAt \} errors \{ description \} \} \} \}/);
+  assert.doesNotMatch(seen[0], /filter|\burl\b|uuid/);
+
+  const result = await assessNewrelicDataGovernance(dataGovernanceClient({
+    async listDashboardLiveUrls() {
+      return liveUrls;
+    },
+  }), { now: NOW });
+  const exposure = findingById(result, "NR-14-DASHBOARD-PERMISSIONS");
+  assert.equal(exposure.status, "fail");
+  assert.match(exposure.summary, /1 dashboards and 2 widgets are shared through public live URLs/);
+  assert.equal(exposure.evidence.public_live_urls, 3);
+  assert.deepEqual(exposure.evidence.public_dashboard_live_urls, ["Ops overview"]);
+  assert.equal(exposure.evidence.public_widget_live_urls, 2);
+  const snapshots = result.coreData["core_data/dashboard_live_urls.json"];
+  assert.deepEqual(snapshots[2], { title: "Ops overview", type: "DASHBOARD", createdAt: 1728900000694 });
+  assert.ok(!JSON.stringify(snapshots).includes("chart-embed"));
+  assert.ok(!JSON.stringify(snapshots).includes("c1eac5ac"));
 });
 
 test("NewrelicApiClient discovers account IDs from actor.accounts when none are configured", async () => {

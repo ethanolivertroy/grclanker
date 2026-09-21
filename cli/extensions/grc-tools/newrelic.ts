@@ -914,6 +914,15 @@ const QUERY_NRQL_DROP_RULES = `query($accountId: Int!) {
 const QUERY_SYNTHETIC_SCRIPT = `query($accountId: Int!, $monitorGuid: EntityGuid!) {
   actor { account(id: $accountId) { synthetics { script(monitorGuid: $monitorGuid) { text } } } }
 }`;
+/**
+ * Public live URLs for dashboards and charts.
+ * Documented: docs.newrelic.com/docs/apis/nerdgraph/examples/manage-live-chart-urls-via-api ("List all live chart URLs"):
+ *   actor.dashboard.liveUrls { liveUrls { title url createdAt type } errors { description } } (unfiltered, returns
+ *   DASHBOARD and WIDGET entries), and manage-live-dashboard-urls-via-api ("List the public dashboard URLs"):
+ *   liveUrls(filter: { type: DASHBOARD }) { liveUrls { createdAt type uuid } }.
+ * The query stays unfiltered because a public widget URL exposes data just as a public dashboard URL does; `url`
+ * and `uuid` are never requested so link values do not land in evidence bundles.
+ */
 const QUERY_DASHBOARD_LIVE_URLS = `{
   actor { dashboard { liveUrls { liveUrls { title type createdAt } errors { description } } } }
 }`;
@@ -1362,11 +1371,13 @@ export class NewrelicApiClient {
   async listDashboardLiveUrls(): Promise<PagedList> {
     const data = await this.nerdgraph(QUERY_DASHBOARD_LIVE_URLS);
     const result = asObject(getNestedValue(data, ["actor", "dashboard", "liveUrls"]));
-    const errors = asRecords(result?.errors);
+    if (!result) throw new Error("NerdGraph response did not include actor.dashboard.liveUrls.");
+    const errors = asRecords(result.errors);
     if (errors.length > 0) {
       throw new Error(`Dashboard live URL listing failed: ${errors.map((error) => asString(error.description) ?? "unknown error").join("; ")}`);
     }
-    return completeList(asRecords(result?.liveUrls));
+    if (!Array.isArray(result.liveUrls)) throw new Error("NerdGraph response did not include actor.dashboard.liveUrls.liveUrls.");
+    return completeList(asRecords(result.liveUrls));
   }
 
   async listRestUsers(limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
