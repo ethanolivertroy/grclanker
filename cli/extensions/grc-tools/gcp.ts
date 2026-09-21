@@ -1931,10 +1931,12 @@ export async function assessGcpIdentity(
       }]
     : [];
   const keysReadable = keyListsAttempted === 0 || keyErrors.length < keyListsAttempted;
+  const accountBase = scanVerdictBase(context, accountScan);
   const keyBase = {
-    ...scanVerdictBase(context, accountScan),
+    ...accountBase,
+    inventoryError: accountBase.inventoryError ?? (keysReadable ? undefined : keyReadsUnreadable[0]),
     truncated: context.truncated || keyInventoryTruncated || accountScan.truncated,
-    unreadable: [...unreadableScans(accountScan), ...keyReadsUnreadable],
+    unreadable: [...unreadableScans(accountScan), ...(keysReadable ? keyReadsUnreadable : [])],
   };
 
   const findings: GcpFinding[] = [
@@ -1972,9 +1974,7 @@ export async function assessGcpIdentity(
           emptyVerdict: "pass",
           passSummary: `None of ${userManagedKeys.length} user-managed keys exceeded ${staleDays} days.`,
           failSummary: `${staleKeys.length} of ${userManagedKeys.length} user-managed service account keys exceed the ${staleDays}-day threshold.`,
-          emptySummary: keysReadable
-            ? `No user-managed service account keys exist across ${serviceAccountCount} service accounts.`
-            : `User-managed keys could not be listed for any of the ${serviceAccountCount} sampled service accounts, so no key age is known.`,
+          emptySummary: `No user-managed service account keys exist across ${serviceAccountCount} service accounts.`,
           manualEvidence: "list user-managed keys per service account and check validAfterTime.",
         }),
     verdict({

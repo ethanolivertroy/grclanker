@@ -1348,15 +1348,27 @@ test("multi-inventory findings name the unreadable dataset and endpoint instead 
   assert.deepEqual(cmek.evidence.buckets_without_cmek, []);
   assert.equal(disks.summary.disks, null);
 
-  const keys = await assessGcpIdentity(clientWithUnreadable((r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys"), 403, "full", COMPLIANT));
-  const minimization = keys.findings.find((item) => item.id === "GCP-IAM-03");
-  assert.equal(minimization.status, "warn");
-  assert.match(minimization.summary, /Partial view: service account keys unreadable for 1 of 1 service accounts \(prod-audit\) via iam\.googleapis\.com\/v1\/projects\/\{project\}\/serviceAccounts\/\{account\}\/keys \(403 Forbidden\)/);
-  assert.equal(minimization.evidence.user_managed_keys, null);
-  const rotation = keys.findings.find((item) => item.id === "GCP-IAM-02");
-  assert.equal(rotation.status, "warn");
-  assert.match(rotation.summary, /^User-managed keys could not be listed for any of the 1 sampled service accounts, so no key age is known\./);
-  assert.equal(rotation.evidence.stale_keys, null);
+  const keyMatch = (r) => r.host === "iam.googleapis.com" && r.path.endsWith("/keys");
+  const keys = await assessGcpIdentity(clientWithUnreadable(keyMatch, 403, "full", COMPLIANT));
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    const finding = keys.findings.find((item) => item.id === id);
+    assert.equal(finding.status, "manual", `${id}: keys are the dataset both findings score, so denying every key list leaves nothing to evaluate`);
+    assert.match(finding.summary, /^Manual: service account keys unreadable for 1 of 1 service accounts \(prod-audit\) via iam\.googleapis\.com\/v1\/projects\/\{project\}\/serviceAccounts\/\{account\}\/keys \(svc@prod-audit\.iam\.gserviceaccount\.com: 403 Forbidden/);
+    assert.equal(finding.evidence.seen, null);
+    assert.equal(finding.evidence.unreadable_inventories.length, 1);
+    assert.equal(finding.evidence.unreadable_inventories[0].dataset, "service account keys");
+  }
+  assert.equal(keys.findings.find((item) => item.id === "GCP-IAM-02").evidence.stale_keys, null);
+  assert.equal(keys.findings.find((item) => item.id === "GCP-IAM-03").evidence.user_managed_keys, null);
+
+  const someKeys = await assessGcpIdentity(clientWithUnreadable(keyMatch, 403, "project"));
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    const finding = someKeys.findings.find((item) => item.id === id);
+    assert.equal(finding.status, "warn", `${id}: one of two service accounts denied its key list is a partial view, not a missing dataset`);
+    assert.match(finding.summary, /Partial view: service account keys unreadable for 1 of 2 service accounts \(second-project\) via iam\.googleapis\.com\/v1\/projects\/\{project\}\/serviceAccounts\/\{account\}\/keys \(403 Forbidden\)/);
+    assert.equal(finding.evidence.unreadable_inventories.length, 1);
+  }
+  assert.deepEqual(someKeys.findings.find((item) => item.id === "GCP-IAM-03").evidence.user_managed_keys, []);
 });
 
 test("GCP-DATA-02 folds bucket list truncation into its partial view", async () => {
