@@ -42,6 +42,43 @@ export const docsSections = [
   },
 ];
 
+export interface DocsSectionItem {
+  label: string;
+  slug: string;
+}
+
+export interface DocsSection {
+  title: string;
+  items: DocsSectionItem[];
+}
+
+/**
+ * Docs under this prefix are integration guides (one file per grclanker
+ * integration, for example `integrations/box.md`). They are picked up
+ * automatically, so adding a guide never requires touching this file.
+ */
+export const integrationsDocsPrefix = 'integrations/';
+
+export function buildDocsSections(
+  entries: Array<{ id: string; data: { title: string } }>,
+): DocsSection[] {
+  const integrations = entries
+    .filter((entry) => entry.id.startsWith(integrationsDocsPrefix))
+    .map((entry) => ({ label: entry.data.title, slug: entry.id }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  if (integrations.length === 0) return docsSections;
+
+  const sections: DocsSection[] = [];
+  for (const section of docsSections) {
+    sections.push(section);
+    if (section.title === 'Tools') {
+      sections.push({ title: 'Integrations', items: integrations });
+    }
+  }
+  return sections;
+}
+
 export function getDocHref(slug: string) {
   if (!slug || slug === 'index') return '/docs';
   return `/docs/${slug}`;
