@@ -355,7 +355,10 @@ Implemented in grclanker (TypeScript) on 2026-09-21; the Go/TUI architecture in 
 - Control 1 expiration: the IAM `PasswordPolicy` datatype exposes no expiration setting, so expiration is a separate always-manual finding (OCI-IAM-06); length and complexity are judged from the documented fields.
 - Control 2 uses the documented `User.isMfaActivated` field instead of enumerating TOTP devices per user.
 - Control 9 uses `ProblemSummary.riskLevel` and `lifecycleDetail=OPEN` (the API has no `severity` field on problems).
-- Control 19 key length is not exposed by `KeySummary`; only the algorithm enum (AES, RSA, ECDSA) is judged and length stays manual.
+- Control 19 key length lives on `Key.keyShape` (GetKey), not on `KeySummary`, so every ENABLED key is fetched with `oci kms management key get --key-id --endpoint` (capped by `max_keys`). `KeyShape.length` is documented in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66): AES below 32 bytes and RSA below 512 bytes fail. The control text names only AES-256 and RSA-4096, so ECDSA keys pass on any documented `curveId` (NIST_P256, NIST_P384, NIST_P521) and fail when the curve is missing or undocumented. A denied key get renders the key inventory partial: warn when some keys were read, manual when none were.
+- Control 16: a bastion whose `clientCidrBlockAllowList` contains `0.0.0.0/0` or `::/0` and whose `maxSessionTtlInSeconds` exceeds 3 hours fails; either condition alone warns.
+- Control 14: `SecurityRule.isValid` is read into the NSG evidence (count of rules with `isValid=false`, flag on each permissive rule).
+- `OCI-LOG-04` (audit event visibility) is supporting evidence for control 11, not a numbered control, so it carries no framework mappings.
 - Controls 6, 12, 13, 14, 15, 16, 18, 20, 22, 23: the list APIs have no subtree parameter, so resources are listed per accessible compartment up to `max_compartments`.
 - Control 20: `BucketSummary` omits `publicAccessType`, so each bucket is fetched with `GetBucket` up to `max_buckets`.
 - Control 16: `BastionSummary` omits TTL and CIDR fields, so each bastion is fetched with `GetBastion`.
@@ -364,7 +367,7 @@ Implemented in grclanker (TypeScript) on 2026-09-21; the Go/TUI architecture in 
 
 ### Deferred
 
-- Control 24 budgets and alert rules (`oci budgets budget list`, `oci budgets alert-rule list`).
+- Control 24 budgets and alert rules (`oci budgets budget budget list`, `oci budgets budget alert-rule list`).
 - Control 25 OS Management patching: the current API reference index lists only OS Management Hub (`osmh`, `/20220901`); the legacy OS Management Service (`/20190801`) is no longer in the reference and should not be targeted.
 - Auth modes: session token (`security_token_file`), instance principal, resource principal, delegation token.
 - Unfolding controls 3-5 (OCI-IAM-03), 16-17 (OCI-GRD-04), 18-19 (OCI-GRD-05), and 20-21 (OCI-GRD-06) into one finding each; today each folded control is judged and reported as separate evidence buckets inside the shared finding.
