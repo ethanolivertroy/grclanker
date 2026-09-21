@@ -29,6 +29,7 @@ import {
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/launchdarkly.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
 const RECENT = "2026-09-15T00:00:00Z";
@@ -512,10 +513,31 @@ test("LaunchdarklyApiClient uses the beta API version for SDK keys and masks sec
       return jsonResponse({ items: [{ key: "production", apiKey: "sdk-secret-abcd", mobileKey: "mob-secret-efgh" }] });
     }
     if (url.pathname.endsWith("/webhooks")) {
-      return jsonResponse({ items: [{ name: "hook", url: "https://example.com", secret: "whsec_super_secret" }] });
+      return jsonResponse({ items: [{ name: "hook", url: "https://hooks.example.com/services/T0/B0/FAKE_HOOK_TOKEN?token=FAKE_QUERY_TOKEN", secret: "whsec_super_secret", on: true }] });
     }
     if (url.pathname.endsWith("/relay-auto-configs")) {
-      return jsonResponse({ items: [{ name: "relay", fullKey: "rel-secret-9999" }] });
+      return jsonResponse({ items: [{ name: "relay", fullKey: "rel-secret-9999", displayKey: "9999" }] });
+    }
+    if (url.pathname.endsWith("/tokens")) {
+      return jsonResponse({ items: [{ _id: "t1", name: "ci", token: "api-xxxxxxxx-1234", serviceToken: true, role: "reader" }], totalCount: 1 });
+    }
+    if (url.pathname.endsWith("/integrations/datadog")) {
+      return jsonResponse({
+        items: [{
+          _id: "sub-1",
+          name: "datadog-prod",
+          on: true,
+          apiKey: "dd-api-FAKE",
+          config: {
+            url: "https://hooks.example.com/services/FAKE_CONFIG_TOKEN",
+            endpoint: "hooks.example.com/relative/FAKE_RELATIVE_TOKEN",
+            destination: { webhookUrl: "https://example.com/hook?key=FAKE_NESTED_TOKEN", channel: "#audit" },
+            headers: [{ name: "Authorization", value: "Bearer FAKE_HEADER_TOKEN" }],
+            api_key: "FAKE_SNAKE_KEY",
+          },
+          statements: [{ effect: "allow", actions: ["updateOn"], resources: ["proj/web:env/production:flag/*"] }],
+        }],
+      });
     }
     return jsonResponse({ items: [] });
   };
@@ -525,15 +547,110 @@ test("LaunchdarklyApiClient uses the beta API version for SDK keys and masks sec
   const environments = await client.listEnvironments("web");
   const webhooks = await client.listWebhooks();
   const relays = await client.listRelayProxyConfigs();
+  const tokens = await client.listTokens();
+  const subscriptions = await client.listIntegrationSubscriptions("datadog");
 
   assert.equal(seen.find((item) => item.pathname.endsWith("/sdk-keys"))?.version, "beta");
   assert.equal(seen.find((item) => item.pathname.endsWith("/environments"))?.version, "20240415");
-  assert.equal(sdkKeys.items[0].value, "****1234");
+  assert.equal(sdkKeys.items[0].value, "[REDACTED]");
   assert.equal(sdkKeys.truncated, false);
-  assert.equal(environments.items[0].apiKey, "****abcd");
-  assert.equal(environments.items[0].mobileKey, "****efgh");
-  assert.equal(webhooks[0].secret, "[REDACTED]");
-  assert.equal(relays[0].fullKey, "****9999");
+  assert.equal(environments.items[0].apiKey, "[REDACTED]");
+  assert.equal(environments.items[0].mobileKey, "[REDACTED]");
+  assert.equal(webhooks.items[0].secret, "[REDACTED]");
+  assert.equal(webhooks.items[0].url, "https://hooks.example.com", "the destination is reduced to scheme plus host");
+  assert.equal(webhooks.items[0].on, true);
+  assert.equal(webhooks.truncated, false);
+  assert.equal(relays.items[0].fullKey, "[REDACTED]");
+  assert.equal(relays.items[0].displayKey, "9999", "the vendor display key is not a credential");
+  assert.equal(tokens.items[0].token, "[REDACTED]");
+  assert.equal(tokens.items[0].serviceToken, true, "booleans under credential-shaped keys are kept");
+  assert.equal(tokens.items[0].role, "reader");
+  const config = subscriptions.items[0].config;
+  assert.equal(subscriptions.items[0].apiKey, "[REDACTED]");
+  assert.equal(config.url, "https://hooks.example.com");
+  assert.equal(config.endpoint, "[REDACTED]", "a host-relative endpoint path is blanked, not echoed");
+  assert.equal(config.destination.webhookUrl, "https://example.com");
+  assert.equal(config.destination.channel, "#audit");
+  assert.deepEqual(config.headers, [{ name: "Authorization", value: "[REDACTED]" }]);
+  assert.equal(config.api_key, "[REDACTED]");
+  assert.deepEqual(subscriptions.items[0].statements, [{ effect: "allow", actions: ["updateOn"], resources: ["proj/web:env/production:flag/*"] }]);
+  const serialized = JSON.stringify({ sdkKeys, environments, webhooks, relays, tokens, subscriptions });
+  for (const secret of ["sdk-secret-value-1234", "sdk-secret-abcd", "mob-secret-efgh", "whsec_super_secret", "rel-secret-9999", "api-xxxxxxxx-1234", "dd-api-FAKE", "FAKE_HOOK_TOKEN", "FAKE_QUERY_TOKEN", "FAKE_CONFIG_TOKEN", "FAKE_RELATIVE_TOKEN", "FAKE_NESTED_TOKEN", "FAKE_HEADER_TOKEN", "FAKE_SNAKE_KEY"]) {
+    assert.ok(!serialized.includes(secret), `${secret} must not survive collection`);
+  }
+});
+
+test("LaunchdarklyApiClient reports single-request listings as truncated when the payload advertises a next page", async () => {
+  const client = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({
+      items: [{ _id: "wh-1", name: "hook", url: "https://hooks.example.com/a", on: true }],
+      _links: { next: { href: "/api/v2/webhooks?offset=1" } },
+    }),
+  });
+  const webhooks = await client.listWebhooks();
+  assert.equal(webhooks.truncated, true, "a dropped _links.next must be reported as truncation");
+  assert.equal(webhooks.seen, 1);
+
+  const byTotal = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [{ name: "relay" }], totalCount: 3 }),
+  });
+  const relays = await byTotal.listRelayProxyConfigs();
+  assert.equal(relays.truncated, true);
+  assert.equal(relays.total, 3);
+});
+
+test("verdict rule 10: LaunchdarklyApiClient.list reports truncation on an empty page with a next link and on a repeated next href", async () => {
+  const emptyWithNext = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.searchParams.get("offset") === "2") {
+        return jsonResponse({ items: [], _links: { next: { href: "/api/v2/members?limit=2&offset=4" } } });
+      }
+      return jsonResponse({ items: [{ _id: "a" }, { _id: "b" }], _links: { next: { href: "/api/v2/members?limit=2&offset=2" } } });
+    },
+  });
+  const members = await emptyWithNext.list("/api/v2/members", {}, { limit: 10, pageSize: 2 });
+  assert.equal(members.seen, 2);
+  assert.equal(members.truncated, true, "an empty page that still advertises a next link leaves records behind");
+
+  let calls = 0;
+  const repeating = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({ items: [{ _id: `x${calls}` }], _links: { next: { href: "/api/v2/members?limit=1&offset=1" } } });
+    },
+  });
+  const looped = await repeating.list("/api/v2/members", {}, { limit: 50, pageSize: 1 });
+  assert.equal(calls, 2, "the repeated href is fetched once, not until the cap");
+  assert.equal(looped.seen, 2);
+  assert.equal(looped.truncated, true, "a repeated next href cannot be drained, so the listing is partial");
+
+  const drained = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.searchParams.get("offset") === "2") return jsonResponse({ items: [] });
+      return jsonResponse({ items: [{ _id: "a" }, { _id: "b" }], _links: { next: { href: "/api/v2/members?limit=2&offset=2" } } });
+    },
+  });
+  const complete = await drained.list("/api/v2/members", {}, { limit: 10, pageSize: 2 });
+  assert.equal(complete.truncated, false, "a bare empty page drains the listing");
+});
+
+test("verdict rule 9: non-JSON error bodies are described, never echoed, into LaunchDarkly error text", async () => {
+  const client = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => new Response("<html>proxy denied FAKE_REFLECTED_SECRET</html>", {
+      status: 403,
+      statusText: "Forbidden",
+      headers: { "content-type": "text/html" },
+    }),
+    maxRetries: 0,
+  });
+  await assert.rejects(client.listMembers(5), (error) => {
+    assert.match(error.message, /403 Forbidden/);
+    assert.match(error.message, /non-JSON text\/html response body \(\d+ bytes, not echoed\)/);
+    assert.ok(!error.message.includes("FAKE_REFLECTED_SECRET"));
+    return true;
+  });
 });
 
 test("checkLaunchdarklyAccess reports healthy when every audit surface is readable", async () => {
@@ -775,11 +892,15 @@ test("assessLaunchdarklyAccessControl treats an Admin personal caller with an un
     },
   }), { now: NOW });
   assert.equal(membersUnreadable.summary.token_inventory_scope, "unknown");
-  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+  for (const id of ["LD-08", "LD-09", "LD-10"]) {
     assert.equal(findingStatus(membersUnreadable, id), "warn", `${id} must not pass when the caller member cannot be resolved`);
-    assert.match(finding(membersUnreadable, id).summary, /member record could not be resolved from the member listing/);
+    assert.match(finding(membersUnreadable, id).summary, /member inventory was unreadable \(GET \/api\/v2\/members: .*403 Forbidden/);
     assert.equal(finding(membersUnreadable, id).evidence.token_inventory.caller_member_role, null);
   }
+  assert.equal(findingStatus(membersUnreadable, "LD-11"), "manual", "personal token ownership cannot be judged without members");
+  assert.match(finding(membersUnreadable, "LD-11").summary, /could not be reconciled against members because the member inventory was unreadable/);
+  assert.match(finding(membersUnreadable, "LD-11").summary, /Unreadable inventory: members \(GET \/api\/v2\/members/);
+  assert.deepEqual(finding(membersUnreadable, "LD-11").evidence.unreadable_inventories.map((gap) => gap.inventory), ["members"]);
 
   const memberMissing = await assessLaunchdarklyAccessControl(healthyClient({
     async listMembers() {
@@ -1109,8 +1230,10 @@ test("assessLaunchdarklyEnvironmentGovernance parses role resource specifiers wh
       throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/roles");
     },
   }), { now: NOW });
-  assert.equal(findingStatus(unreadable, "LD-16"), "warn");
+  assert.equal(findingStatus(unreadable, "LD-16"), "manual");
   assert.match(finding(unreadable, "LD-16").summary, /Custom roles could not be read/);
+  assert.match(finding(unreadable, "LD-16").summary, /Unreadable inventory: custom_roles \(GET \/api\/v2\/roles: .*403 Forbidden/);
+  assert.equal(finding(unreadable, "LD-16").evidence.unreadable_inventories[0].inventory, "custom_roles");
 });
 
 test("assessLaunchdarklyEnvironmentGovernance flags unrestricted production, missing approvals, old SDK keys, and test projects", async () => {
@@ -1374,17 +1497,20 @@ test("assessLaunchdarklyFlagHygiene flags individual targeting, stale flags, and
   assert.ok(cycle.includes("beta-gate"));
 });
 
-test("assessLaunchdarklyFlagHygiene warns instead of passing when flags cannot be read", async () => {
+test("assessLaunchdarklyFlagHygiene marks flag controls manual instead of passing when flags cannot be read", async () => {
   const result = await assessLaunchdarklyFlagHygiene(healthyClient({
     async listFlags() {
       throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/flags/web");
     },
   }), { now: NOW });
 
-  assert.equal(findingStatus(result, "LD-14"), "warn");
-  assert.equal(findingStatus(result, "LD-15"), "warn");
-  assert.equal(findingStatus(result, "LD-25"), "warn");
+  for (const id of ["LD-14", "LD-15", "LD-25"]) {
+    assert.equal(findingStatus(result, id), "manual", `${id} cannot be judged without the flag inventory`);
+    assert.match(finding(result, id).summary, /flag listing was unreadable in every one of the 1 evaluated environments/);
+    assert.match(finding(result, id).summary, /Unreadable inventory: flags for environment web\/production/);
+  }
   assert.ok(result.errors.some((error) => error.startsWith("flags:web/production")));
+  assert.equal(result.snapshots.flags[0].readable, false);
 });
 
 test("assessLaunchdarklyFlagHygiene never passes on truncated flag, project, or environment listings", async () => {
@@ -1509,6 +1635,216 @@ test("assessLaunchdarklyMonitoringIntegrations warns on short retention and mark
   assert.equal(findingStatus(result, "LD-18"), "manual");
   assert.equal(findingStatus(result, "LD-20"), "manual");
   assert.equal(findingStatus(result, "LD-21"), "pass");
+});
+
+function forbidden(endpoint) {
+  return new Error(`LaunchDarkly request failed (403 Forbidden) for GET ${endpoint}: access_denied`);
+}
+
+function forbidAuditQuery(base, matches, endpoint) {
+  return {
+    async listAuditLogEntries(query = {}) {
+      if (matches(query)) throw forbidden(endpoint);
+      return base.listAuditLogEntries(query);
+    },
+  };
+}
+
+// Every LaunchDarkly finding whose verdict reads two or more collected inventories, with each secondary inventory
+// forbidden in turn while the primary stays healthy. Status is what the finding must report; names is the inventory the
+// summary must name. LD-08/09/10 also read members and the caller identity through the token inventory scope gate.
+const LAUNCHDARKLY_MULTI_INVENTORY_CASES = [
+  { id: "LD-01", assess: assessLaunchdarklyIdentity, secondary: "audit_log_account", status: "manual", baseline: "manual", names: /Unreadable inventory: audit_log_account \(GET \/api\/v2\/auditlog\?spec=acct: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "acct", "/api/v2/auditlog?spec=acct") },
+  { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams: .*403 Forbidden/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams"); } }) },
+  { id: "LD-06", assess: assessLaunchdarklyIdentity, secondary: "members", status: "manual", names: /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
+  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "team_roles", status: "manual", names: /Unreadable inventory: team_roles for team platform \(GET \/api\/v2\/teams\/\{teamKey\}\/roles: .*403 Forbidden/, overrides: () => ({ listTeamRoles: async () => { throw forbidden("/api/v2/teams/platform/roles"); } }) },
+  { id: "LD-07", assess: assessLaunchdarklyIdentity, secondary: "teams", status: "manual", names: /Unreadable inventory: teams \(GET \/api\/v2\/teams/, overrides: () => ({ listTeams: async () => { throw forbidden("/api/v2/teams"); } }) },
+  { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
+  { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
+  { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "warn", names: /member inventory was unreadable \(GET \/api\/v2\/members/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
+  { id: "LD-11", assess: assessLaunchdarklyAccessControl, secondary: "members", status: "manual", names: /Unreadable inventory: members \(GET \/api\/v2\/members: .*403 Forbidden/, overrides: () => ({ listMembers: async () => { throw forbidden("/api/v2/members"); } }) },
+  { id: "LD-08", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read \(GET \/api\/v2\/caller-identity: .*403 Forbidden/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-09", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-10", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-11", assess: assessLaunchdarklyAccessControl, secondary: "caller_identity", status: "warn", names: /caller identity could not be read/, overrides: () => ({ getCallerIdentity: async () => { throw forbidden("/api/v2/caller-identity"); } }) },
+  { id: "LD-16", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "custom_roles", status: "manual", names: /Unreadable inventory: custom_roles \(GET \/api\/v2\/roles: .*403 Forbidden/, overrides: () => ({ listCustomRoles: async () => { throw forbidden("/api/v2/roles"); } }) },
+  { id: "LD-16", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/\{projectKey\}\/environments: .*403 Forbidden/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-17", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-19", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-19", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "sdk_keys", status: "manual", names: /SDK keys endpoint was not readable for any environment \(.*403 Forbidden/, overrides: () => ({ listSdkKeys: async () => { throw forbidden("/api/v2/projects/web/environments/production/sdk-keys"); } }) },
+  { id: "LD-23", assess: assessLaunchdarklyEnvironmentGovernance, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-14", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-14", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production \(GET \/api\/v2\/flags\/\{projectKey\}\?env=\{environmentKey\}: .*403 Forbidden/, overrides: () => ({ listFlags: async () => { throw forbidden("/api/v2/flags/web"); } }) },
+  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "flag_statuses", status: "manual", names: /Unreadable inventory: flag_statuses for environment web\/production \(GET \/api\/v2\/flag-statuses\/\{projectKey\}\/\{environmentKey\}: .*403 Forbidden/, overrides: () => ({ listFlagStatuses: async () => { throw forbidden("/api/v2/flag-statuses/web/production"); } }) },
+  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production/, overrides: () => ({ listFlags: async () => { throw forbidden("/api/v2/flags/web"); } }) },
+  { id: "LD-15", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-25", assess: assessLaunchdarklyFlagHygiene, secondary: "environments", status: "manual", names: /Unreadable inventory: environments for project web/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-25", assess: assessLaunchdarklyFlagHygiene, secondary: "flags", status: "manual", names: /Unreadable inventory: flags for environment web\/production/, overrides: () => ({ listFlags: async () => { throw forbidden("/api/v2/flags/web"); } }) },
+  { id: "LD-12", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_recent", status: "warn", names: /Unreadable inventory: audit_log_recent \(GET \/api\/v2\/auditlog: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.before === undefined && query.spec === undefined, "/api/v2/auditlog") },
+  { id: "LD-12", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_retention_probe", status: "manual", names: /Unreadable inventory: audit_log_retention_probe \(GET \/api\/v2\/auditlog\?before=<now - 90 days>: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.before !== undefined, "/api/v2/auditlog?before=...") },
+  { id: "LD-13", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_members", status: "warn", names: /Unreadable inventory: audit_log_members \(GET \/api\/v2\/auditlog\?spec=member\/\*: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "member/*", "/api/v2/auditlog?spec=member/*") },
+  { id: "LD-13", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "audit_log_roles", status: "warn", names: /Unreadable inventory: audit_log_roles \(GET \/api\/v2\/auditlog\?spec=role\/\*: .*403 Forbidden/, overrides: (base) => forbidAuditQuery(base, (query) => query.spec === "role/*", "/api/v2/auditlog?spec=role/*") },
+  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "environments", status: "warn", names: /Unreadable inventory: environments for project web \(GET \/api\/v2\/projects\/\{projectKey\}\/environments: .*403 Forbidden.*\), so secure mode on the production environments the Relay Proxy serves was not checked/, overrides: () => ({ listEnvironments: async () => { throw forbidden("/api/v2/projects/web/environments"); } }) },
+  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "projects", status: "warn", names: /Unreadable inventory: projects \(GET \/api\/v2\/projects: .*403 Forbidden/, overrides: () => ({ listProjects: async () => { throw forbidden("/api/v2/projects"); } }) },
+  { id: "LD-18", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "relay_proxy_configs", status: "manual", names: /Unreadable inventory: relay_proxy_configs \(GET \/api\/v2\/account\/relay-auto-configs: .*403 Forbidden/, overrides: () => ({ listRelayProxyConfigs: async () => { throw forbidden("/api/v2/account/relay-auto-configs"); } }) },
+  { id: "LD-20", assess: assessLaunchdarklyMonitoringIntegrations, secondary: "integration_subscriptions:splunk", status: "warn", names: /Unreadable inventory: integration_subscriptions for splunk \(GET \/api\/v2\/integrations\/\{integrationKey\}: .*403 Forbidden.*\), so splunk audit log subscriptions were not checked/, overrides: (base) => ({ async listIntegrationSubscriptions(key) { if (key === "splunk") throw forbidden("/api/v2/integrations/splunk"); return base.listIntegrationSubscriptions(key); } }) },
+];
+
+test("verdict rule 1 corollary: LaunchDarkly findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
+  const baselines = new Map();
+  for (const item of LAUNCHDARKLY_MULTI_INVENTORY_CASES) {
+    if (!baselines.has(item.assess)) baselines.set(item.assess, await item.assess(healthyClient(), { now: NOW }));
+    const baseline = baselines.get(item.assess);
+    assert.equal(findingStatus(baseline, item.id), item.baseline ?? "pass", `${item.id} baseline on the healthy fixture`);
+
+    const base = healthyClient();
+    const result = await item.assess(healthyClient(item.overrides(base)), { now: NOW });
+    const found = finding(result, item.id);
+    const label = `${item.id} with ${item.secondary} forbidden`;
+    assert.notEqual(found.status, "pass", `${label} must not pass`);
+    assert.equal(found.status, item.status, `${label} status`);
+    assert.match(found.summary, item.names, `${label} must name the unreadable inventory`);
+    assert.match(found.summary, /403 Forbidden/, `${label} must carry the HTTP error`);
+    if (/Unreadable inventory:/.test(found.summary)) {
+      assert.match(found.summary, /Collect manually: /, `${label} must tell the human what to collect`);
+      assert.ok(Array.isArray(found.evidence.unreadable_inventories) && found.evidence.unreadable_inventories.length > 0, `${label} evidence lists the gap`);
+      assert.ok(found.evidence.manual_evidence.length > 0, `${label} evidence names manual evidence`);
+    }
+  }
+});
+
+test("verdict rule 1 corollary: LaunchDarkly findings keep judging readable inventories and fail when the readable half fails", async () => {
+  const base = healthyClient();
+  const partialTeams = await assessLaunchdarklyIdentity(healthyClient({
+    async listTeams() {
+      return [{ key: "platform", name: "Platform" }, { key: "data", name: "Data" }];
+    },
+    async listTeamRoles(teamKey) {
+      if (teamKey === "data") throw forbidden("/api/v2/teams/data/roles");
+      return base.listTeamRoles(teamKey);
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(partialTeams, "LD-07"), "warn", "one unreadable team role listing demotes but does not fail");
+  assert.match(finding(partialTeams, "LD-07").summary, /All 1 sampled teams with readable roles have at least one custom role assigned/);
+  assert.match(finding(partialTeams, "LD-07").summary, /team_roles for team data/);
+  assert.deepEqual(finding(partialTeams, "LD-07").evidence.teams_with_unreadable_roles, ["data"]);
+  assert.deepEqual(finding(partialTeams, "LD-07").evidence.teams_without_custom_roles, [], "an unreadable listing is not counted as zero roles");
+
+  const failingAndGapped = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
+    ...forbidAuditQuery(base, (query) => query.spec === "role/*", "/api/v2/auditlog?spec=role/*"),
+    async listWebhooks() {
+      return [{ name: "legacy", url: "http://hooks.example.com/ld", on: true }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(failingAndGapped, "LD-13"), "warn");
+  assert.match(finding(failingAndGapped, "LD-13").summary, /^Audit log entries for member resources are present with critical actions \(createMember\)\. Unreadable inventory: audit_log_roles/);
+  assert.equal(findingStatus(failingAndGapped, "LD-21"), "fail", "a readable insecure webhook still fails");
+  assert.equal(findingStatus(failingAndGapped, "LD-12"), "pass", "LD-12 does not read the role audit query");
+
+  const allAudit = await assessLaunchdarklyMonitoringIntegrations(healthyClient({
+    async listAuditLogEntries() {
+      throw forbidden("/api/v2/auditlog");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(allAudit, "LD-12"), "fail", "a wholly unreadable audit log remains a fail");
+  assert.equal(findingStatus(allAudit, "LD-13"), "fail");
+});
+
+const LAUNCHDARKLY_FAKE_SECRETS = [
+  "FAKE_WEBHOOK_PATH_TOKEN_1",
+  "FAKE_WEBHOOK_QUERY_TOKEN_2",
+  "FAKE_INTEGRATION_URL_TOKEN_3",
+  "FAKE_INTEGRATION_HEADER_TOKEN_4",
+  "FAKE_INTEGRATION_NESTED_KEY_5",
+  "FAKE_FLAG_VARIATION_SECRET_6",
+  "FAKE_ACCESS_TOKEN_VALUE_7",
+  "FAKE_RELAY_FULL_KEY_8",
+  "FAKE_PROJECT_ENV_API_KEY_9",
+  "sdk-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+];
+
+function secretBearingLaunchdarklyClient() {
+  const base = healthyClient();
+  return healthyClient({
+    async listWebhooks() {
+      return [{ _id: "wh-1", name: "ci-hook", url: `https://hooks.example.com/services/T0/B0/${LAUNCHDARKLY_FAKE_SECRETS[0]}?token=${LAUNCHDARKLY_FAKE_SECRETS[1]}`, secret: "whsec_FAKE", on: true }];
+    },
+    async listIntegrationSubscriptions(integrationKey) {
+      if (integrationKey !== "datadog") return [];
+      return [{
+        _id: "sub-1",
+        name: "datadog-prod",
+        on: true,
+        config: {
+          url: `https://hooks.example.com/services/${LAUNCHDARKLY_FAKE_SECRETS[2]}`,
+          headers: [{ name: "Authorization", value: `Bearer ${LAUNCHDARKLY_FAKE_SECRETS[3]}` }],
+          destination: { credentials: { apiKey: LAUNCHDARKLY_FAKE_SECRETS[4] } },
+        },
+        statements: [{ effect: "allow", actions: ["updateOn", "updateRules"], resources: ["proj/web:env/production:flag/*"] }],
+      }];
+    },
+    async listFlags(...args) {
+      const flags = await base.listFlags(...args);
+      return flags.map((flag) => ({
+        ...flag,
+        variations: [{ value: { apiSecret: LAUNCHDARKLY_FAKE_SECRETS[5] }, name: "on" }, { value: false, name: "off" }],
+        environments: { production: { ...flag.environments.production, on: true, rules: [{ clauses: [{ attribute: "email", op: "in", values: [LAUNCHDARKLY_FAKE_SECRETS[5]] }] }] } },
+      }));
+    },
+    async listTokens() {
+      const tokens = await base.listTokens();
+      return tokens.map((token) => ({ ...token, token: LAUNCHDARKLY_FAKE_SECRETS[6] }));
+    },
+    async listRelayProxyConfigs() {
+      const relays = await base.listRelayProxyConfigs();
+      return relays.map((relay) => ({ ...relay, fullKey: LAUNCHDARKLY_FAKE_SECRETS[7], displayKey: "y-8" }));
+    },
+    async listProjects() {
+      return [{ key: "web", name: "Web App", tags: [], environments: [{ key: "production", apiKey: LAUNCHDARKLY_FAKE_SECRETS[8], mobileKey: "mob-FAKE" }] }];
+    },
+    async listSdkKeys() {
+      return [{ key: LAUNCHDARKLY_FAKE_SECRETS[9], kind: "sdk", _createdAt: RECENT_MS, isDefault: true, value: LAUNCHDARKLY_FAKE_SECRETS[9] }];
+    },
+  });
+}
+
+test("verdict rule 9: the LaunchDarkly bundle and its zip never carry credential-shaped values or token-bearing URLs from any collected object", async () => {
+  const base = createTempBase("grclanker-ld-secrets-");
+  const result = await exportLaunchdarklyAuditBundle(secretBearingLaunchdarklyClient(), sampleConfig(), base, { now: NOW });
+
+  assert.equal(result.findingCount, 25);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size >= 30, "the bundle directory was written");
+  assert.ok(entries.size >= 30, "the zip archive carries the bundle files");
+  assertSecretsAbsent(assert, files, [...LAUNCHDARKLY_FAKE_SECRETS, TEST_TOKEN], "bundle file");
+  assertSecretsAbsent(assert, entries, [...LAUNCHDARKLY_FAKE_SECRETS, TEST_TOKEN], "zip entry");
+
+  const webhooks = JSON.parse(files.get(join("core_data", "webhooks.json")));
+  assert.equal(webhooks.items[0].url, "https://hooks.example.com", "the webhook destination is reduced to scheme plus host");
+  assert.equal(webhooks.items[0].secret, "[REDACTED]");
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  const webhookFinding = findings.find((item) => item.id === "LD-21");
+  assert.equal(webhookFinding.status, "pass", "an HTTPS signed webhook still passes on the reduced URL");
+  const subscriptions = JSON.parse(files.get(join("core_data", "integration_subscriptions.json")));
+  const config = subscriptions[0].items[0].config;
+  assert.equal(config.url, "https://hooks.example.com");
+  assert.deepEqual(config.headers, [{ name: "Authorization", value: "[REDACTED]" }]);
+  assert.equal(config.destination.credentials.apiKey, "[REDACTED]");
+  const flags = JSON.parse(files.get(join("core_data", "flags.json")));
+  assert.equal(flags[0].items[0].variations, 2, "flag variations are projected to a count");
+  assert.equal(flags[0].items[0].environments.production.rules, 1, "rule clauses are projected to a count");
+  assert.equal(flags[0].items[0].key, "checkout-v2");
+  const tokens = JSON.parse(files.get(join("core_data", "access_tokens.json")));
+  assert.ok(tokens.items.every((token) => token.token === "[REDACTED]"));
+  const relays = JSON.parse(files.get(join("core_data", "relay_proxy_configs.json")));
+  assert.equal(relays.items[0].fullKey, "[REDACTED]");
+  assert.equal(relays.items[0].displayKey, "y-8");
+  const projects = JSON.parse(files.get(join("core_data", "projects.json")));
+  assert.equal(projects.items[0].environments[0].apiKey, "[REDACTED]", "environments embedded in the project rep are redacted");
+  const sdkKeys = JSON.parse(files.get(join("core_data", "sdk_keys.json")));
+  assert.equal(sdkKeys[0].items[0].value, "[REDACTED]");
+  assert.equal(sdkKeys[0].items[0].key, "[REDACTED]", "an SDK-key-shaped key field is scrubbed");
 });
 
 test("LAUNCHDARKLY_CONTROL_CATALOG covers all 25 spec controls with every framework mapping", () => {
