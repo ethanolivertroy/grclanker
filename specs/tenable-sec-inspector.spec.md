@@ -3,11 +3,11 @@ slug: "tenable-sec-inspector"
 name: "Tenable Security Inspector"
 vendor: "Tenable"
 category: "vulnerability-application-security"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/tenable-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # tenable-sec-inspector
@@ -15,6 +15,19 @@ source_repo: "https://github.com/hackIDLE/tenable-sec-inspector"
 ## 1. Overview
 
 A security compliance inspection tool for **Tenable.io** (now Tenable Vulnerability Management) that audits scan configurations, asset discovery coverage, credential scan ratios, agent deployment status, user permissions, scanner health, and vulnerability management program maturity. The tool connects to the Tenable.io REST API to evaluate scan policy configurations, plugin update currency, network segmentation, access controls, and vulnerability prioritization effectiveness. Results are output as structured compliance reports mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP controls.
+
+### grclanker implementation
+
+Shipped as native grclanker CLI tools in `cli/extensions/grc-tools/tenable.ts` (read-only; POST is used only for the documented export request and status calls):
+
+- `tenable_check_access`
+- `tenable_assess_scan_program` (controls 1, 2, 4, 13, 17, 20 plus the Security Center schedule equivalent)
+- `tenable_assess_sensor_coverage` (controls 3, 5, 6, 7, 8, 9, 16 plus the Security Center scanner equivalent)
+- `tenable_assess_access_control` (controls 10, 11, 12, 18 plus the Security Center user equivalent)
+- `tenable_assess_vulnerability_management` (controls 14, 15, 19)
+- `tenable_export_audit_bundle`
+
+Integration guide: `src/content/docs/docs/integrations/tenable.md`. Live smoke: `npm --prefix cli run test:tenable:live`.
 
 ## 2. APIs & SDKs
 
@@ -346,4 +359,29 @@ goreleaser release --snapshot
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) on 2026-09-21. Every one of the 20 numbered controls is emitted as a finding with framework mappings; controls that cannot be verified through the published API render as `manual` findings that state the evidence a human must collect.
+
+What shipped:
+
+- Tenable Vulnerability Management support for cloud.tenable.com and the FedRAMP cloud fedcloud.tenable.com using the documented `X-ApiKeys` header, limit and offset pagination with `pagination.total`, the `POST /assets/export` and `POST /vulns/export` workflows (status polling and chunk download), 429 and 5xx retry honoring `retry-after`, request timeouts, and key redaction in errors.
+- Tenable Security Center equivalents (scan schedules, scanner health and plugin feed, user hygiene) over `/rest/` resources with the documented `x-apikey` header; they render as `manual` naming `TENABLE_SC_URL` when Security Center is not configured.
+- Verdict safety: forbidden or errored reads never pass, empty inventories pass only where emptiness is compliant (exclusions with `pagination.total` 0, deprecated target groups), undated items cap at warn, partial pagination or truncated exports cap at warn, non-Administrator keys cap at warn, and each rule has a regression test in `cli/tests/tenable.test.mjs`.
+- Audit bundle export with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` on partial collection, and a zip paired with the allocated output directory.
+
+Deviations from this spec, following the official documentation:
+
+- Configuration: `TENABLE_URL` selects the platform by host (cloud.tenable.com and fedcloud.tenable.com are Vulnerability Management; any other host is Security Center). `TENABLE_SC_URL`, `TENABLE_SC_ACCESS_KEY`, and `TENABLE_SC_SECRET_KEY` allow both platforms at once, and an optional YAML or JSON config file (`TENABLE_CONFIG_FILE` or `~/.tenable/config.yaml`) is read after arguments and environment variables.
+- Section 2 lists `GET /assets` and `/workbenches`; the implementation uses the documented bulk exports instead because the workbench endpoints are capped at 5,000 records and the assets list is not intended for full inventory.
+- Section 2 lists `/permissions`; the implementation reads `GET /api/v3/access-control/permissions` and `GET /access-control/v1/roles`, the documented access control endpoints, and treats `/v2/access-groups` as the deprecated legacy surface.
+- The audit log is read from `GET /audit-log/v1/events` with the documented `f=date.gte:` filter and `limit` (max 5000).
+- Agents and agent groups are read from `GET /scanners/null/agents` and `GET /scanners/null/agent-groups` as documented for tenant-wide agent listing.
+- Control 1 scan policy settings (port range, plugin families, safe checks, performance) are not exposed in the published `GET /policies/{policy_id}` response schema, so the control is `manual` with template usage as evidence instead of an automated pass or fail.
+- Control 19 report schedules have no documented read endpoint; the control relies on export job history from `GET /vulns/export/status` and `GET /assets/export/status`.
+- Security Center session token authentication (`POST /rest/token`) is not implemented because it requires a login write call; API keys are supported.
+- The Go CLI described in sections 7 through 9 was replaced by native grclanker tools; the command names in section 8 map to the tools listed under "grclanker implementation".
+
+What remains:
+
+- Lumin or exposure metrics (no read-only endpoint verified) and report schedule enumeration.
+- Security Center controls beyond schedules, scanners, and users (repository and credential hygiene).
+- A live tenant smoke run; the shipped smoke script skips without credentials.
