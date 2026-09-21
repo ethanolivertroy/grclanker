@@ -40,6 +40,8 @@ Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair 
 | `cloudflare_assess_traffic_controls` | CF-TRF-01 through CF-TRF-06 |
 | `cloudflare_export_audit_bundle` | Run everything and write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip named after the allocated directory |
 
+The bundle never carries credentials or contact details. `core_data/accounts.json` and `core_data/zones.json` are projected before they are written: accounts keep `id`, `name`, `type`, `created_on`, and the governance settings (`enforce_twofactor`, `api_access_enabled`, `access_approval_expiry`, `use_account_custom_ns_by_default`, plus an `abuse_contact_email_configured` boolean in place of the address); zones keep identity, status, name server, `plan`, `owner` (`id`, `type`), and `account` (`id`, `name`) fields. Token lists are never written; finding evidence records token names or ids, counts, and per-source seen and total figures only. Error text keeps the structured Cloudflare error messages and describes any non-JSON error body by content type and length instead of echoing it.
+
 ## Status semantics
 
 - `pass`: every sampled item met the control using documented fields
@@ -47,7 +49,9 @@ Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair 
 - `fail`: at least one sampled item violates the control
 - `manual`: the API could not prove the control (401/403, plan not present, empty inventory that cannot be judged, or no automatable signal); the summary names the endpoint, the missing permission, and the evidence to collect
 
-A 401, 403, or errored read never produces `pass`. Items without dates (`expires_on`, `last_used_on`, certificate `expires_on`, `modified_on`) are never counted valid or fresh.
+A 401, 403, or errored read never produces `pass`. That holds for every inventory a finding reads, not only its primary one: CF-IAM-04 is manual when `/accounts/{account_id}/access/policies` cannot be read even though the application list was (a bypass decision can live in a reusable policy), CF-IAM-06 is warn when only one of `/user/tokens` and `/accounts/{account_id}/tokens` is readable, and CF-TRF-06 is manual when zero Gateway rules exist and `/accounts/{account_id}/gateway` cannot be read; each summary names the endpoint and the permission to grant. Items without dates (`expires_on`, `last_used_on`, certificate `expires_on`, `modified_on`) are never counted valid or fresh.
+
+A truncated listing never produces `pass` either. Page-numbered listings stop at their item cap or when `result_info.total_count` exceeds the collected items, cursor listings (`/zones/{zone_id}/rulesets`) stop at their cap, at a 100-page budget, at a cursor that repeats, or at an empty page that still carries a cursor, and a 404 that arrives after items were collected keeps them; every one of those exits reports `truncated` with the total when the API supplied one, and the dependent finding is capped at warn with `Partial <inventory> inventory: <seen> seen of <total>` in its summary. CF-IAM-04 applies that to both the application list and the reusable policy list.
 
 ## Control coverage
 
