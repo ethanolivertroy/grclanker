@@ -1744,7 +1744,8 @@ function resolveTokenInventory(
 ): TokenInventory {
   const callerToken = caller.tokenId ? tokens.find((token) => asString(token._id) === caller.tokenId) : undefined;
   const callerTokenRole = callerToken ? tokenRole(callerToken) : undefined;
-  const callerMemberRole = knownMemberBaseRole(caller.memberId ? members.find((member) => asString(member._id) === caller.memberId) : undefined);
+  const callerMemberId = caller.memberId ?? (callerToken ? asString(callerToken.memberId) : undefined);
+  const callerMemberRole = knownMemberBaseRole(callerMemberId ? members.find((member) => asString(member._id) === callerMemberId) : undefined);
   const personalMemberIds = new Set(tokens
     .filter((token) => asBoolean(token.serviceToken) !== true)
     .map((token) => asString(token.memberId))
@@ -1758,12 +1759,20 @@ function resolveTokenInventory(
     if (!ADMIN_BASE_ROLES.has(callerTokenRole)) {
       return { ...base, scope: "partial", reason: `The assessment token has the ${callerTokenRole || "unknown"} base role; showAll returns other members' personal tokens only for Admin or Owner tokens.` };
     }
-    if (asBoolean(callerToken.serviceToken) !== true && callerMemberRole !== undefined && !ADMIN_BASE_ROLES.has(callerMemberRole)) {
-      return { ...base, scope: "partial", reason: `The assessment token carries the ${callerTokenRole} base role but its member holds the ${callerMemberRole} role, which caps the token below Admin.` };
+    if (asBoolean(callerToken.serviceToken) !== true) {
+      if (callerMemberRole === undefined) {
+        return { ...base, scope: "unknown", reason: `The assessment token carries the ${callerTokenRole} base role, but its member record could not be resolved from the member listing, so the member role that caps a personal token could not be confirmed.` };
+      }
+      if (!ADMIN_BASE_ROLES.has(callerMemberRole)) {
+        return { ...base, scope: "partial", reason: `The assessment token carries the ${callerTokenRole} base role but its member holds the ${callerMemberRole} role, which caps the token below Admin.` };
+      }
     }
     return { ...base, scope: "full", reason: `The assessment token has the ${callerTokenRole} base role, so showAll returned every member's personal tokens.` };
   }
 
+  if (tokens.length === 0) {
+    return { ...base, scope: "unknown", reason: "The token listing was empty even though the assessment token itself should appear in it, so the caller most likely lacks permission to list tokens." };
+  }
   const otherMembers = caller.memberId ? [...personalMemberIds].filter((memberId) => memberId !== caller.memberId) : [];
   if (otherMembers.length > 0 || personalMemberIds.size > 1) {
     return { ...base, scope: "full", reason: `Personal tokens from ${Math.max(otherMembers.length, personalMemberIds.size - 1)} other members are visible, which only Admin or Owner tokens can list.` };
@@ -1810,7 +1819,7 @@ export async function assessLaunchdarklyAccessControl(
     visible_tokens: tokens.length,
     visible_personal_token_members: inventory.visibleMemberIds,
   };
-  const degradeForInventory = tokensReadable && tokens.length > 0 && inventory.scope !== "full";
+  const degradeForInventory = tokensReadable && inventory.scope !== "full";
   const tokenFinding = (
     control: number,
     status: LaunchdarklyFindingStatus,
@@ -1986,7 +1995,9 @@ export async function assessLaunchdarklyAccessControl(
           ? `${orphanedPersonalTokens.length} visible personal tokens are not tied to a current account member.`
           : overScopedPersonalTokens.length > 0
             ? `${overScopedPersonalTokens.length}/${personalTokens.length} visible personal tokens carry a base role above their member's own role; personal tokens must stay within the member's scope.`
-            : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
+            : personalTokens.length === 0
+              ? "No personal tokens are visible."
+              : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
       {
         personal_tokens: personalTokens.length,
         orphaned_personal_tokens: sample(orphanedPersonalTokens.map(tokenLabel)),

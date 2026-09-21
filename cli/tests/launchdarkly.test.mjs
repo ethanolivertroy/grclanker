@@ -720,6 +720,60 @@ test("assessLaunchdarklyAccessControl infers inventory completeness when the cal
   assert.ok(identityUnreadable.errors.some((error) => error.startsWith("caller_identity:")));
 });
 
+test("assessLaunchdarklyAccessControl never passes LD-10 or LD-11 on an empty permission-limited token listing", async () => {
+  const result = await assessLaunchdarklyAccessControl(readerCallerClient([]), { now: NOW });
+
+  assert.equal(result.summary.token_inventory_scope, "unknown");
+  assert.equal(result.summary.tokens, 0);
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.equal(findingStatus(result, id), "warn", `${id} must not pass on an empty listing of unknown scope`);
+    assert.match(finding(result, id).summary, /Token inventory completeness is unknown: The token listing was empty/);
+    assert.match(finding(result, id).summary, /Rerun with an Admin or Owner token for a complete inventory/);
+    assert.equal(finding(result, id).evidence.token_inventory.visible_tokens, 0);
+  }
+  assert.match(finding(result, "LD-10").summary, /^No service tokens are visible\./);
+  assert.match(finding(result, "LD-11").summary, /^No personal tokens are visible\./);
+  assert.equal(result.errors.length, 0);
+});
+
+test("assessLaunchdarklyAccessControl treats an Admin personal caller with an unresolvable member record as unknown inventory", async () => {
+  const membersUnreadable = await assessLaunchdarklyAccessControl(healthyClient({
+    async listMembers() {
+      throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/members");
+    },
+  }), { now: NOW });
+  assert.equal(membersUnreadable.summary.token_inventory_scope, "unknown");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.equal(findingStatus(membersUnreadable, id), "warn", `${id} must not pass when the caller member cannot be resolved`);
+    assert.match(finding(membersUnreadable, id).summary, /member record could not be resolved from the member listing/);
+    assert.equal(finding(membersUnreadable, id).evidence.token_inventory.caller_member_role, null);
+  }
+
+  const memberMissing = await assessLaunchdarklyAccessControl(healthyClient({
+    async listMembers() {
+      return [{ _id: "m2", email: "dev@example.com", role: "writer" }];
+    },
+  }), { now: NOW });
+  assert.equal(memberMissing.summary.token_inventory_scope, "unknown");
+  assert.equal(findingStatus(memberMissing, "LD-08"), "warn");
+
+  const serviceCallerWithoutMembers = await assessLaunchdarklyAccessControl(healthyClient({
+    async getCallerIdentity() {
+      return { accountId: "acct-123", memberId: "m1", tokenId: "svc-audit", tokenName: "grc-audit-service", serviceToken: true };
+    },
+    async listTokens() {
+      return [
+        { _id: "svc-audit", name: "grc-audit-service", role: "admin", serviceToken: true, memberId: "m1", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+      ];
+    },
+    async listMembers() {
+      return [];
+    },
+  }), { now: NOW });
+  assert.equal(serviceCallerWithoutMembers.summary.token_inventory_scope, "full");
+  assert.equal(findingStatus(serviceCallerWithoutMembers, "LD-08"), "pass");
+});
+
 test("assessLaunchdarklyAccessControl discloses an Admin assessment service token and scopes personal tokens to member roles", async () => {
   const serviceCaller = {
     async getCallerIdentity() {
