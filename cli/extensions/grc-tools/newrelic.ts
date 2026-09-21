@@ -2053,8 +2053,9 @@ async function collectList(source: string, shape: RecordShape, load: () => Promi
   }
 }
 
+/** Every failure and skipped query, uncompacted, for the errors array and `_errors.log`; summaries and statuses carry the compacted form. */
 function collectedErrors(items: Array<Collected<unknown>>): string[] {
-  return items.flatMap((item) => [...(item.error ? [item.error] : []), ...(item.partial ?? [])]);
+  return items.flatMap((item) => [...(item.error ? [item.error] : []), ...(item.notCollected ? [item.notCollected] : []), ...(item.partial ?? [])]);
 }
 
 type Inventories = Collected<unknown> | Array<Collected<unknown>>;
@@ -2091,6 +2092,24 @@ function partialCause(item: Collected<unknown>): string {
 /** "unreadable (cause)" or "not collected (cause)" for an inventory whose query failed or was never issued, for use inside a sentence. */
 function unavailableDetail(item: Collected<unknown>): string {
   return item.notCollected ? `not collected (${causeOf(item)})` : `unreadable (${causeOf(item)})`;
+}
+
+/**
+ * Names an unavailable input inside the not-collected reason of the query that depended on it: "<source> was
+ * unreadable (<cause>)" with the source prefix of the cause removed, or the input's own not-collected text.
+ */
+function upstreamUnavailable(item: Collected<unknown>): string {
+  if (item.notCollected) return item.notCollected;
+  const cause = item.error ?? "unknown cause";
+  const prefix = `${item.source}: `;
+  return `${item.source} was unreadable (${cause.startsWith(prefix) ? cause.slice(prefix.length) : cause})`;
+}
+
+/** Skips a query whose organization id input was not readable, recording the dependent inventory as not collected. */
+function requireOrganizationId(organization: Collected<JsonRecord>): string {
+  const organizationId = asString(organization.data.id);
+  if (organizationId) return organizationId;
+  throw new NotCollectedError(`was not queried for any organization: ${organization.error ? upstreamUnavailable(organization) : "actor.organization returned no id"}`);
 }
 
 /**
@@ -2539,8 +2558,9 @@ async function collectScoped(
   };
 }
 
+/** Skips a domain-scoped query whose domain listing was unavailable, recording the dependent inventory as not collected. */
 function requireDomains(domains: Collected<JsonRecord[]>): JsonRecord[] {
-  if (!isReadable(domains)) throw new Error(`authentication domains were not readable (${domains.error ?? domains.notCollected})`);
+  if (!isReadable(domains)) throw new NotCollectedError(`was not queried for any authentication domain: ${upstreamUnavailable(domains)}`);
   return domains.data;
 }
 
@@ -2617,14 +2637,10 @@ export async function collectNewrelicIdentityData(
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 50_000);
   const organization = await collectRecord("actor.organization", ORGANIZATION_SHAPE, () => client.getOrganization());
   const authenticationDomains = await collectList("userManagement.authenticationDomains", AUTHENTICATION_DOMAIN_SHAPE, () => client.listAuthenticationDomains());
-  const organizationId = asString(organization.data.id);
   const organizationAuthenticationDomains = await collectList(
     "customerAdministration.authenticationDomains",
     ORGANIZATION_AUTHENTICATION_DOMAIN_SHAPE,
-    async () => {
-      if (!organizationId) throw new Error(`organization id was not readable (${organization.error ?? "actor.organization returned no id"})`);
-      return client.listOrganizationAuthenticationDomains(organizationId);
-    },
+    () => client.listOrganizationAuthenticationDomains(requireOrganizationId(organization)),
   );
   const users = await collectList("userManagement.users", USER_SHAPE, () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
   const groupGrants = await collectList("authorizationManagement.groups", GROUP_GRANT_SHAPE, () => collectGroupGrants(client, requireDomains(authenticationDomains)));
@@ -2636,11 +2652,7 @@ async function collectRoles(
   client: Pick<NewrelicClientSurface, "listRoles">,
   organization: Collected<JsonRecord>,
 ): Promise<Collected<JsonRecord[]>> {
-  return collectList(ROLE_CATALOG_SOURCE, ROLE_SHAPE, async () => {
-    const organizationId = asString(organization.data.id);
-    if (!organizationId) throw new Error(`organization id was not readable (${organization.error ?? "actor.organization returned no id"})`);
-    return client.listRoles(organizationId);
-  });
+  return collectList(ROLE_CATALOG_SOURCE, ROLE_SHAPE, () => client.listRoles(requireOrganizationId(organization)));
 }
 
 function roleType(role: JsonRecord): string {
@@ -3232,8 +3244,8 @@ export function assessNewrelicAccessControlData(
     if (keys.length === 0) {
       return manualVerdict(`${zeroKeysNote}; every account has at least its original license key, so an empty inventory means the key cannot see them and is unknown rather than compliant. Collect ${keyEvidence}`);
     }
-    if (!usersReadable) return manualVerdict(`${keyInventoryLabel}, but users were not readable (${causeOf(data.users)}), so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
-    if (!grantsReadable) return manualVerdict(`${keyInventoryLabel}, but group role grants were not readable (${causeOf(data.groupGrants)}), so admin group members cannot be identified as key owners. Collect ${keyEvidence}`);
+    if (!usersReadable) return manualVerdict(`${keyInventoryLabel}, but users were ${unavailableDetail(data.users)}, so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
+    if (!grantsReadable) return manualVerdict(`${keyInventoryLabel}, but group role grants were ${unavailableDetail(data.groupGrants)}, so admin group members cannot be identified as key owners. Collect ${keyEvidence}`);
     if (ownerIdsUnavailable) return manualVerdict(`${keyInventoryLabel}, but ${ownerIdsUnavailableNote}, so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
     if (unnamedKeys.length > 0 || adminOwnedUserKeys.length > 0 || unknownTypeKeys.length > 0) {
       const adminOwned = adminOwnedUserKeys.length > 0 ? ` (${sample(adminOwnedUserKeys.map(keyLabel)).join(", ")})` : "";
@@ -3346,7 +3358,7 @@ export function assessNewrelicAccessControlData(
         : "No custom role appears in the readable group grants, but custom roles that are defined and not granted to any group cannot be enumerated without the catalog."
       : "Group grants were not readable either, so custom roles in use cannot be enumerated.";
     if (!rolesReadable) {
-      return manualVerdict(`The role catalog (${ROLE_CATALOG_SOURCE}) was not readable: ${causeOf(data.roles)}. The documented catalog is only served to organizations with the multi-tenancy entitlement. ${grantedCustomRolesNote} Collect every custom role's capabilities from Administration > Access Management > Roles.`);
+      return manualVerdict(`The role catalog (${ROLE_CATALOG_SOURCE}) was ${unavailableDetail(data.roles)}. The documented catalog is only served to organizations with the multi-tenancy entitlement. ${grantedCustomRolesNote} Collect every custom role's capabilities from Administration > Access Management > Roles.`);
     }
     if (roles.length === 0) return manualVerdict(`${ROLE_CATALOG_SOURCE} returned zero roles; New Relic always exposes standard roles, so the key cannot read them and emptiness is unknown rather than compliant. Collect the role list from Administration > Access Management > Roles.`);
     if (customRoles.length > 0) {
@@ -3357,7 +3369,7 @@ export function assessNewrelicAccessControlData(
     if (standardRoles.length === 0) return manualVerdict(`No custom roles appeared among ${roles.length} roles, but no ${ROLE_TYPE_STANDARD} roles were returned either, so the role listing is not trustworthy. Collect the role list from Administration > Access Management > Roles.`);
     const catalogClause = `the ${ROLE_CATALOG_SOURCE} query was readable and complete, and it returned ${standardRoles.length} ${ROLE_TYPE_STANDARD} roles`;
     if (!grantsReadable) {
-      return verdict("warn", `No custom roles exist in the catalog (${catalogClause}), but group grants (authorizationManagement.groups) were not readable (${causeOf(data.groupGrants)}), so the roles in use were not cross-checked against the catalog.`);
+      return verdict("warn", `No custom roles exist in the catalog (${catalogClause}), but group grants (authorizationManagement.groups) were ${unavailableDetail(data.groupGrants)}, so the roles in use were not cross-checked against the catalog.`);
     }
     if (!isComplete(data.groupGrants)) {
       return verdict("warn", `No custom roles exist in the catalog (${catalogClause}) and none appears in the readable group grants, but the group grant listing (authorizationManagement.groups) is incomplete, so the roles in use were only partly cross-checked against the catalog.`);
@@ -3928,11 +3940,10 @@ async function collectSyntheticScripts(
   limit: number,
 ): Promise<Collected<JsonRecord[]>> {
   if (!isReadable(monitors)) {
-    const state = monitors.notCollected ? "was not collected" : "was unreadable";
     return {
       data: [],
       source: SYNTHETIC_SCRIPT_SOURCE,
-      notCollected: `${SYNTHETIC_SCRIPT_SOURCE} was not queried for any monitor: ${monitors.source} ${state} (${causeOf(monitors)})`,
+      notCollected: `${SYNTHETIC_SCRIPT_SOURCE} was not queried for any monitor: ${upstreamUnavailable(monitors)}`,
     };
   }
   const scan = await collectList(SYNTHETIC_SCRIPT_SOURCE, SYNTHETIC_SCRIPT_SCAN_SHAPE, () => scanSyntheticScripts(client, monitors.data, limit));
@@ -4638,7 +4649,8 @@ function buildQuickReference(): string {
     "- Drop-rule and pipeline-rule NRQL, obfuscation rule filters, and obfuscation expression regexes are stored verbatim as evidence and may quote literals from your configuration.",
     "- `analysis/` contains normalized findings and per-category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
-    "- `_errors.log` appears only when some reads fail but the bundle still completes.",
+    "- `_errors.log` appears only when some reads fail, or are skipped because the account or domain list they iterate was unavailable, while the bundle still completes.",
+    "- A `core_data/` file whose query failed, was skipped, or lost a scope is written as `{ status, records }` (records null when nothing was read) rather than as an empty list.",
     "- Review manual findings before asserting framework compliance from the automated output alone.",
     "",
     "Recommended reading order:",

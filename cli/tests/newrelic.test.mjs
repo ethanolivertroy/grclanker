@@ -1242,7 +1242,7 @@ test("control 20 reads the role catalog from customerAdministration.roles and cl
     },
   }), { now: NOW });
   assert.equal(findingStatus(noOrganizationId, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
-  assert.match(findingById(noOrganizationId, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /role catalog \(customerAdministration\.roles\) was not readable: .*organization id was not readable \(actor\.organization returned no id\)/);
+  assert.match(findingById(noOrganizationId, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /role catalog \(customerAdministration\.roles\) was not collected \(customerAdministration\.roles was not queried for any organization: actor\.organization returned no id\)/);
 });
 
 test("control 20 renders manual with custom roles from group grants when the role catalog is entitlement-gated", async () => {
@@ -1257,7 +1257,7 @@ test("control 20 renders manual with custom roles from group grants when the rol
 
   const finding = findingById(result, "NR-20-CUSTOM-ROLE-PERMISSIONS");
   assert.equal(finding.status, "manual");
-  assert.match(finding.summary, /role catalog \(customerAdministration\.roles\) was not readable: .*Not authorized \(at customerAdministration\.roles\)/);
+  assert.match(finding.summary, /role catalog \(customerAdministration\.roles\) was unreadable \(customerAdministration\.roles: .*Not authorized \(at customerAdministration\.roles\)\)/);
   assert.match(finding.summary, /only served to organizations with the multi-tenancy entitlement/);
   assert.match(finding.summary, /Group grants expose 1 custom roles in use \(Deploy operators\)/);
   assert.equal(finding.evidence.role_catalog_readable, false);
@@ -1964,7 +1964,11 @@ test("verdict safety rule 2 and self-check (b): empty inventories never pass and
 
   assert.deepEqual(passing(findings), []);
   assert.deepEqual(findings.filter((item) => item.status === "fail").map((item) => item.id), []);
-  assert.ok(results.every((result) => result.errors.length === 0), JSON.stringify(results.map((result) => result.errors)));
+  // Nothing failed, so the errors array carries only the disclosure of the domain-scoped queries that were skipped
+  // because the domain listing returned zero domains (they surface in _errors.log the same way).
+  const skippedQueryPattern = /^(userManagement\.users|authorizationManagement\.groups) was not queried for any authentication domain: userManagement\.authenticationDomains returned zero domains$/;
+  assert.ok(results.every((result) => result.errors.every((error) => skippedQueryPattern.test(error))), JSON.stringify(results.map((result) => result.errors)));
+  assert.deepEqual(results.map((result) => result.errors.length), [2, 2, 0, 0]);
   const emptinessControls = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20];
   for (const control of emptinessControls) {
     const item = findings.find((entry) => entry.control === control);
@@ -2328,7 +2332,7 @@ test("verdict safety rule 6: verdicts read every enabling flag and treat absent 
     async listDomainGroupGrants() { throw forbidden("actor.organization.authorizationManagement"); },
   }), { now: NOW });
   assert.equal(findingStatus(grantsUnreadable, "NR-04-API-KEY-INVENTORY"), "manual");
-  assert.match(findingById(grantsUnreadable, "NR-04-API-KEY-INVENTORY").summary, /group role grants were not readable/);
+  assert.match(findingById(grantsUnreadable, "NR-04-API-KEY-INVENTORY").summary, /group role grants were unreadable \(authorizationManagement\.groups: /);
 });
 
 test("verdict safety rule 7: the client records truncation when it stops before nextCursor is exhausted", async () => {
@@ -3046,7 +3050,7 @@ test("rule 1 corollary hit 1: NR-04 never concludes no admin-owned keys on a par
   const full = await assessCorollary([["authorizationManagement.groups", "full"]]);
   const unreadable = full.findings.find((item) => item.control === 4);
   assert.equal(unreadable.status, "manual");
-  assert.match(unreadable.summary, /group role grants were not readable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
+  assert.match(unreadable.summary, /group role grants were unreadable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
   assert.equal(unreadable.evidence.admin_owned_user_keys, null);
   assert.match(unreadable.evidence.admin_roster_status, /^unreadable \(authorizationManagement\.groups: /);
 
@@ -3206,7 +3210,7 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
   const full = await assessCorollary([["authorizationManagement.groups", "full"]]);
   const roles = full.findings.find((item) => item.control === 20);
   assert.equal(roles.status, "warn");
-  assert.match(roles.summary, /^No custom roles exist in the catalog \(the customerAdministration\.roles query was readable and complete, and it returned 2 STANDARD roles\), but group grants \(authorizationManagement\.groups\) were not readable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\), so the roles in use were not cross-checked against the catalog\.$/);
+  assert.match(roles.summary, /^No custom roles exist in the catalog \(the customerAdministration\.roles query was readable and complete, and it returned 2 STANDARD roles\), but group grants \(authorizationManagement\.groups\) were unreadable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\), so the roles in use were not cross-checked against the catalog\.$/);
   assert.equal(roles.evidence.custom_roles_in_group_grants, null);
   assert.equal(roles.evidence.groups_granted_custom_roles, null);
   assert.match(roles.evidence.group_grants_status, /^unreadable \(authorizationManagement\.groups: /);
@@ -3224,9 +3228,13 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
   const chained = await assessCorollary([["userManagement.authenticationDomains", "full"]]);
   const viaDomains = chained.findings.find((item) => item.control === 20);
   assert.equal(viaDomains.status, "warn");
-  assert.match(viaDomains.summary, /group grants \(authorizationManagement\.groups\) were not readable \(authorizationManagement\.groups: authentication domains were not readable \(userManagement\.authenticationDomains: .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\)/);
+  // The group query is never issued when the domain listing it iterates is unreadable, so the grants are not
+  // collected (not unreadable) and the status names the upstream query, its failure status, and its path. The
+  // compacted cause keeps the status and path and elides the boilerplate between them.
+  assert.match(viaDomains.summary, /group grants \(authorizationManagement\.groups\) were not collected \(authorizationManagement\.groups was not queried for any authentication domain: userManagement\.authenticationDomains was .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\)/);
   assert.equal(viaDomains.evidence.custom_roles_in_group_grants, null);
   assert.equal(viaDomains.evidence.groups_granted_custom_roles, null);
+  assert.match(viaDomains.evidence.group_grants_status, /^not collected \(authorizationManagement\.groups was not queried for any authentication domain: userManagement\.authenticationDomains was .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\)$/);
 });
 
 test("rule 1 corollary sweep: denying any one inventory demotes exactly the findings that read it, fully and per scope", async () => {
