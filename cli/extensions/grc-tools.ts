@@ -37,6 +37,7 @@ import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOciTools } from "./grc-tools/oci.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
 import { registerScfTools } from "./grc-tools/scf.js";
+import { registerServicenowTools } from "./grc-tools/servicenow.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
@@ -64,6 +65,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerOktaTools,
   registerOscalTools,
   registerScfTools,
+  registerServicenowTools,
   registerSlackTools,
   registerVantaTools,
   registerWebexTools,
