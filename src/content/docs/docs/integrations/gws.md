@@ -111,7 +111,7 @@ Every finding applies these rules, and `cli/tests/gws.test.mjs` carries a regres
 6. Only the documented enabling flag counts: `isEnrolledIn2Sv` without `isEnforcedIn2Sv=true` does not support a pass, and an enforcement policy without a past `enforcedFrom` is not enforced.
 7. Pagination follows `nextPageToken` until it is absent or the collection cap is hit; the cap is recorded as truncation.
 8. Re-running the export allocates `-2`, `-3`, and so on and never overwrites an earlier directory or zip.
-9. Bundle secret hygiene: every `core_data/` object is projected to the documented fields the verdicts read before it is written (Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, and undocumented keys are never stored), then a second pass redacts credential-like keys matched on normalized names (`privateKey`, `refresh_token`, `clientSecret`), redacts `{name, value}` pairs whose name is credential-like, and strips query strings from URL values.
+9. Bundle secret hygiene: every `core_data/` object is projected to the documented fields the verdicts read before it is written (Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, and undocumented keys are never stored), then a second pass redacts credential-like keys matched on normalized names (`privateKey`, `refresh_token`, `clientSecret`) and `{name, value}` pairs whose name is credential-like. Every file in the bundle, not only `core_data/`, then passes through one text scrubber before it is written: the query string and fragment of every URL are removed whether the URL is the whole value or sits mid-prose, well-known credential shapes (bearer credentials, `ya29.` and `1//` tokens, `AIza` keys, `GOCSPX-` secrets, JWTs, PEM private keys) and `key=value` or `key: value` pairs naming a credential are replaced, and the run's own bearer token, service-account key, and minted tokens are replaced wherever they appear. API error bodies are reduced at the client to the HTTP status plus documented identifiers (`error.status`, `errors[].reason`, `details[].reason`, or the RFC 6749 `error` code); the server's free-text `message` is never stored, and `_errors.log` names the failing endpoint on each line. Third-party OAuth `displayText` is scrubbed and paired with the documented `clientId` wherever a finding renders it.
 10. Every cap exit reports `truncated: true`: the collection caps, a `nextPageToken` equal to the previous one (a stalled cursor), and a 1000-page ceiling all end the listing as truncation, and privileged verdicts (GWS-ID-001, GWS-ID-004, GWS-ADMIN-001 to 003, GWS-ADMIN-005, GWS-INTEG-002) cap at Partial when the user, role, or role-assignment listing was truncated.
 
 ## Framework mappings
@@ -134,7 +134,9 @@ Each finding maps to FedRAMP (NIST 800-53), CMMC 2.0 (NIST 800-171), SOC 2, CIS 
 - `analysis/` `findings.json` plus one JSON and one Markdown summary per category
 - `compliance/` `executive_summary.md`, `unified_compliance_matrix.md`, and one report per framework (`fedramp/`, `cmmc/`, `soc2/`, `disa_stig/`, `irap/`, `ismap/`, `pci_dss/`, `cis/`)
 - `QUICK_REFERENCE.md`
-- `_errors.log` only when at least one collection failed
+- `_errors.log` only when at least one collection failed, one `<endpoint>: <status and reasons>` line per failure
+
+Findings and collection errors are redacted as objects before any Markdown or JSON is rendered, and every file above passes through the same text scrubber on its way to disk (verdict-safety rule 9), so `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and the zip entries carry the same guarantees as `core_data/`.
 
 Pass `frameworks` (for example `["soc2", "cis"]`) to limit the per-framework reports. Output paths are validated against traversal and symlinked parents.
 
