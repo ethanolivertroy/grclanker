@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import {
   ANSIBLE_CONTROLS,
+  ANSIBLE_REDACTION_MARKER,
   AnsibleAapClient,
   assessAnsibleHostCoverage,
   assessAnsibleJobHealth,
@@ -26,9 +27,13 @@ import {
   exportAnsibleAuditBundle,
   findPlaintextSecrets,
   parseRruleInterval,
+  redactCredentialTree,
+  redactVariables,
   resolveAnsibleConfiguration,
   resolveSecureOutputPath,
+  sanitizeScmUrl,
 } from "../dist/extensions/grc-tools/ansible.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -179,7 +184,7 @@ function forbidden(path) {
  * - forbidden: every endpoint except /api/v2/me/ returns 403
  * - empty: every list is empty and every settings object is {}
  */
-function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "normal", counts = {} } = {}) {
+function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "normal", counts = {}, forbiddenPaths = [] } = {}) {
   const resolvedRoutes = { ...HEALTHY_ROUTES, ...routes };
   const requested = [];
   const client = {
@@ -188,7 +193,7 @@ function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "norm
     async get(path) {
       requested.push(path);
       if (path === "/api/v2/me/") return { count: 1, results: [me] };
-      if (mode === "forbidden") forbidden(path);
+      if (mode === "forbidden" || forbiddenPaths.includes(path)) forbidden(path);
       if (path === "/api/v2/ping/") return { version: "4.6.0", active_node: "controller-1" };
       if (mode === "empty") return {};
       const value = resolvedRoutes[path];
@@ -197,7 +202,7 @@ function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "norm
     },
     async listCollection(path, _query = {}, options = {}) {
       requested.push(path);
-      if (mode === "forbidden") forbidden(path);
+      if (mode === "forbidden" || forbiddenPaths.includes(path)) forbidden(path);
       if (mode === "empty") return { items: [], complete: true, total: 0 };
       const value = resolvedRoutes[path];
       if (value === undefined) throw new Error(`AAP request failed: ${path} (404 Not Found)`);
@@ -216,7 +221,7 @@ function createMockClient({ now = NOW, routes = {}, me = SUPERUSER, mode = "norm
       return (await client.listCollection(path, query, options)).items;
     },
     async count(path) {
-      if (mode === "forbidden") forbidden(path);
+      if (mode === "forbidden" || forbiddenPaths.includes(path)) forbidden(path);
       if (path in counts) return counts[path];
       const value = resolvedRoutes[path];
       if (Array.isArray(value)) return mode === "empty" ? 0 : value.length;
@@ -1189,6 +1194,303 @@ test("verdict rule 8: re-running the export allocates a new directory and never 
     readdirSync(base).filter((entry) => entry.endsWith(".zip")).sort(),
     [first.zipPath, second.zipPath].map((entry) => entry.slice(entry.lastIndexOf("/") + 1)).sort(),
   );
+});
+
+const FAKE_ANSIBLE_SECRETS = {
+  jobVar: "FAKE_SECRET_JOB_VAR_1",
+  templateVar: "FAKE_SECRET_TEMPLATE_VAR_1",
+  workflowVar: "FAKE_SECRET_WORKFLOW_VAR_1",
+  scheduleVar: "FAKE_SECRET_SCHEDULE_VAR_1",
+  hostVar: "FAKE_SECRET_HOST_VAR_1",
+  sourceVar: "FAKE_SECRET_SOURCE_VAR_1",
+  inventoryVar: "FAKE_SECRET_INVENTORY_VAR_1",
+  groupVar: "FAKE_SECRET_GROUP_VAR_1",
+  proxyPassword: "FAKE_SECRET_PROXY_1",
+  galaxyToken: "FAKE_SECRET_GALAXY_1",
+  webhookPath: "FAKE_SECRET_WEBHOOK_1",
+  errorWebhookPath: "FAKE_SECRET_ERROR_WEBHOOK_1",
+  headerValue: "FAKE_SECRET_HEADER_1",
+  pairHeaderValue: "FAKE_SECRET_PAIR_HEADER_1",
+  slackToken: "FAKE_SECRET_SLACK_TOKEN_1",
+  scmToken: "FAKE_SECRET_SCM_TOKEN_1",
+  activityChange: "FAKE_SECRET_ACTIVITY_1",
+  surveyDefault: "FAKE_SECRET_SURVEY_DEFAULT_1",
+  credentialInput: "FAKE_SECRET_CRED_INPUT_1",
+  tokenValue: "FAKE_SECRET_TOKEN_VALUE_1",
+  refreshToken: "FAKE_SECRET_REFRESH_1",
+  ldapBind: "FAKE_SECRET_LDAP_BIND_1",
+  samlKey: "FAKE_PRIVATE_KEY_SAML_1",
+  oauthSecret: "FAKE_SECRET_OAUTH_1",
+  redhatPassword: "FAKE_SECRET_REDHAT_1",
+  licenseKey: "FAKE_SECRET_LICENSE_1",
+  loggingPassword: "FAKE_SECRET_LOGGING_1",
+  userHash: "FAKE_HASH_USER_1",
+  meHash: "FAKE_HASH_ME_1",
+  podSpec: "FAKE_SECRET_POD_SPEC_1",
+  notificationBody: "FAKE_SECRET_NOTIFICATION_BODY_1",
+};
+
+function secretBearingRoutes() {
+  const secrets = FAKE_ANSIBLE_SECRETS;
+  const webhook = (path, headers) => ({
+    id: 1,
+    name: "slack alerts",
+    notification_type: "webhook",
+    organization: 1,
+    notification_configuration: { url: `https://hooks.slack.com/services/${path}`, headers, token: secrets.slackToken, http_method: "POST" },
+  });
+  return {
+    "/api/v2/jobs/": HEALTHY_ROUTES["/api/v2/jobs/"].map((entry, index) => (index === 0 ? { ...entry, extra_vars: `---\ndb_password: ${secrets.jobVar}\nregion: us-east-1` } : entry)),
+    "/api/v2/settings/jobs/": {
+      SCHEDULE_MAX_JOBS: 10,
+      MAX_FORKS: 200,
+      AWX_TASK_ENV: { HTTPS_PROXY: `http://svc:${secrets.proxyPassword}@proxy.example.com:3128` },
+      GALAXY_TASK_ENV: { ANSIBLE_GALAXY_SERVER_TOKEN: secrets.galaxyToken },
+    },
+    "/api/v2/instance_groups/": [{ id: 1, name: "default", max_concurrent_jobs: 0, max_forks: 100, pod_spec_override: `env:\n  - name: API_TOKEN\n    value: ${secrets.podSpec}` }],
+    "/api/v2/hosts/": [{ ...host(1, "web-1", "2026-09-20T00:10:00Z"), variables: `---\nansible_password: ${secrets.hostVar}` }],
+    "/api/v2/inventory_sources/": [{ id: 1, name: "aws", status: "successful", last_update_failed: false, last_updated: "2026-09-20T00:00:00Z", source_vars: `---\naws_secret_key: ${secrets.sourceVar}` }],
+    "/api/v2/job_templates/": [
+      jobTemplate(10, "Patch Linux", { extra_vars: `---\napi_token: ${secrets.templateVar}\nregion: us-east-1` }),
+      jobTemplate(11, "Survey Template", { survey_enabled: true }),
+    ],
+    "/api/v2/job_templates/11/survey_spec/": { name: "", spec: [{ variable: "api_token", type: "text", default: secrets.surveyDefault, required: true }] },
+    "/api/v2/job_templates/10/notification_templates_error/": [webhook(secrets.errorWebhookPath, { "X-Api-Key": secrets.headerValue })],
+    "/api/v2/schedules/": [
+      { id: 1, name: "weekly patch", unified_job_template: 10, enabled: true, next_run: "2026-09-27T00:00:00Z", rrule: "DTSTART:20260101T000000Z RRULE:FREQ=WEEKLY;INTERVAL=1", extra_data: { api_token: secrets.scheduleVar } },
+    ],
+    "/api/v2/workflow_job_templates/": [{ id: 1, name: "Patch and validate", description: "", extra_vars: `{"client_secret": "${secrets.workflowVar}"}` }],
+    "/api/v2/organizations/1/admins/": [{ id: 1, username: "auditor", password: secrets.userHash, email: "auditor@example.com" }],
+    "/api/v2/users/": [
+      { ...SUPERUSER, password: secrets.userHash, email: "auditor@example.com", ldap_dn: "cn=auditor,dc=example" },
+      { ...LIMITED_USER, password: secrets.userHash },
+      { id: 3, username: "reviewer", is_superuser: false, is_system_auditor: true, password: secrets.userHash },
+    ],
+    "/api/v2/credentials/": [
+      { id: 1, name: "machine", kind: "ssh", managed: false, modified: "2026-09-01T00:00:00Z", inputs: { username: "ansible", password: secrets.credentialInput }, summary_fields: { owners: [{ type: "user", name: "auditor" }] } },
+    ],
+    "/api/v2/tokens/": [{ id: 1, created: "2026-09-01T00:00:00Z", expires: "2026-12-01T00:00:00Z", token: secrets.tokenValue, refresh_token: secrets.refreshToken, scope: "read" }],
+    "/api/v2/projects/": [{ id: 1, name: "playbooks", scm_type: "git", scm_url: `https://svc:${secrets.scmToken}@git.example.com/org/playbooks.git`, last_update_failed: false, last_updated: "2026-09-20T00:00:00Z" }],
+    "/api/v2/inventories/": [{ id: 1, name: "prod", variables: `---\nvault_password: ${secrets.inventoryVar}` }],
+    "/api/v2/groups/": [{ id: 1, name: "web", variables: `{"service_token": "${secrets.groupVar}"}` }],
+    "/api/v2/notification_templates/": [webhook(secrets.webhookPath, [{ name: "Authorization", value: secrets.pairHeaderValue }])],
+    "/api/v2/notifications/": [{ id: 1, status: "successful", body: `token=${secrets.notificationBody}` }],
+    "/api/v2/activity_stream/": [{ id: 1, timestamp: "2026-09-20T22:00:00Z", operation: "update", object1: "job_template", changes: { extra_vars: ["---", `db_password: ${secrets.activityChange}`] }, summary_fields: { actor: { id: 1, username: "auditor", email: "auditor@example.com" } } }],
+    "/api/v2/settings/authentication/": {
+      AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com",
+      AUTH_LDAP_BIND_DN: "cn=svc,dc=example",
+      AUTH_LDAP_BIND_PASSWORD: secrets.ldapBind,
+      SOCIAL_AUTH_SAML_SP_PRIVATE_KEY: secrets.samlKey,
+      SOCIAL_AUTH_GITHUB_SECRET: secrets.oauthSecret,
+      SOCIAL_AUTH_SAML_ENABLED_IDPS: { okta: { entity_id: "https://idp.example.com", url: `https://idp.example.com/sso?token=${secrets.oauthSecret}` } },
+    },
+    "/api/v2/settings/system/": { ACTIVITY_STREAM_ENABLED: true, REDHAT_PASSWORD: secrets.redhatPassword, LICENSE: { license_key: secrets.licenseKey, subscription_name: "AAP" } },
+    "/api/v2/settings/logging/": { LOG_AGGREGATOR_ENABLED: true, LOG_AGGREGATOR_TYPE: "splunk", LOG_AGGREGATOR_PASSWORD: secrets.loggingPassword },
+  };
+}
+
+test("verdict rule 9: exportAnsibleAuditBundle never writes variables bodies, credential inputs, tokens, webhook secrets, or settings secrets into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-ansible-export-secrets-");
+  const secrets = Object.values(FAKE_ANSIBLE_SECRETS);
+  const client = createMockClient({ routes: secretBearingRoutes(), me: { ...SUPERUSER, password: FAKE_ANSIBLE_SECRETS.meHash, email: "auditor@example.com" } });
+  const config = { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+
+  const result = await exportAnsibleAuditBundle(client, config, base, {});
+  assert.equal(result.findingCount, 30);
+  const files = readBundleFiles(result.outputDir);
+  for (const relativePath of ["core_data/jobs.json", "core_data/job_settings.json", "core_data/credentials.json", "core_data/tokens.json", "core_data/projects.json", "core_data/notification_templates.json", "core_data/template_error_notifications.json", "core_data/survey_specs.json", "core_data/activity_stream.json", "core_data/settings_authentication.json", "analysis/platform-security.json"]) {
+    assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
+  }
+  assertSecretsAbsent(assert, files, [...secrets, "aap-token", "auditor@example.com"], "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertSecretsAbsent(assert, zipEntries, [...secrets, "aap-token"], "zip archive");
+
+  const assessments = await runAllAssessments(client);
+  const access = await checkAnsibleAccess(client);
+  for (const secret of [...secrets, "auditor@example.com"]) {
+    assert.ok(!JSON.stringify(assessments).includes(secret), `${secret} appears in an assessment result`);
+    assert.ok(!JSON.stringify(access).includes(secret), `${secret} appears in the access check result`);
+  }
+  const plaintext = byId(assessments[2], "AAP-CRED-04");
+  assert.equal(plaintext.status, "fail", "the in-memory scanner still sees the raw variables");
+  assert.deepEqual(plaintext.evidence.hits.map((hit) => hit.type).sort(), ["group", "inventory", "job_template", "survey_spec"]);
+
+  const read = (name) => JSON.parse(files.get(join("core_data", name)));
+  assert.equal(read("jobs.json").data.items[0].extra_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: db_password, region)`);
+  assert.equal(read("jobs.json").data.items[0].status, "running");
+  assert.equal(read("job_templates.json").data.items[0].extra_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: api_token, region)`);
+  assert.deepEqual(read("job_templates.json").data.items[0].summary_fields.credentials, [{ id: 1, name: "machine", kind: "ssh" }]);
+  assert.equal(read("workflow_job_templates.json").data.items[0].extra_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: client_secret)`);
+  assert.equal(read("schedules.json").data.items[0].extra_data, `${ANSIBLE_REDACTION_MARKER} (variable names: api_token)`);
+  assert.equal(read("schedules.json").data.items[0].rrule, "DTSTART:20260101T000000Z RRULE:FREQ=WEEKLY;INTERVAL=1");
+  assert.equal(read("hosts.json").data.items[0].variables, `${ANSIBLE_REDACTION_MARKER} (variable names: ansible_password)`);
+  assert.equal(read("hosts.json").data.items[0].summary_fields.last_job.status, "successful");
+  assert.equal(read("inventory_sources.json").data.items[0].source_vars, `${ANSIBLE_REDACTION_MARKER} (variable names: aws_secret_key)`);
+  assert.equal(read("inventories.json").data.items[0].variables, `${ANSIBLE_REDACTION_MARKER} (variable names: vault_password)`);
+  assert.equal(read("groups.json").data.items[0].variables, `${ANSIBLE_REDACTION_MARKER} (variable names: service_token)`);
+  const jobSettings = read("job_settings.json").data;
+  assert.deepEqual(jobSettings, {
+    SCHEDULE_MAX_JOBS: 10,
+    MAX_FORKS: 200,
+    AWX_TASK_ENV: { HTTPS_PROXY: ANSIBLE_REDACTION_MARKER },
+    GALAXY_TASK_ENV: { ANSIBLE_GALAXY_SERVER_TOKEN: ANSIBLE_REDACTION_MARKER },
+  });
+  assert.ok(!("pod_spec_override" in read("instance_groups.json").data.items[0]));
+  assert.deepEqual(read("credentials.json").data.items[0].inputs, { username: ANSIBLE_REDACTION_MARKER, password: ANSIBLE_REDACTION_MARKER });
+  assert.deepEqual(read("credentials.json").data.items[0].summary_fields.owners, [{ type: "user", name: "auditor" }]);
+  assert.equal(read("tokens.json").data.items[0].token, ANSIBLE_REDACTION_MARKER);
+  assert.equal(read("tokens.json").data.items[0].refresh_token, ANSIBLE_REDACTION_MARKER);
+  assert.equal(read("tokens.json").data.items[0].scope, "read");
+  assert.equal(read("projects.json").data.items[0].scm_url, "https://git.example.com/org/playbooks.git");
+  const notification = read("notification_templates.json").data.items[0];
+  assert.equal(notification.notification_configuration.url, "https://hooks.slack.com");
+  assert.equal(notification.notification_configuration.token, ANSIBLE_REDACTION_MARKER);
+  assert.deepEqual(notification.notification_configuration.headers, [{ name: "Authorization", value: ANSIBLE_REDACTION_MARKER }]);
+  const errorNotification = read("template_error_notifications.json")["10"].data.items[0];
+  assert.equal(errorNotification.notification_configuration.url, "https://hooks.slack.com");
+  assert.deepEqual(errorNotification.notification_configuration.headers, { "X-Api-Key": ANSIBLE_REDACTION_MARKER });
+  const survey = read("survey_specs.json")["11"].data.spec[0];
+  assert.deepEqual(survey, { variable: "api_token", type: "text", required: true, default: ANSIBLE_REDACTION_MARKER });
+  assert.equal(read("activity_stream.json").data.items[0].changes, `${ANSIBLE_REDACTION_MARKER} (variable names: extra_vars)`);
+  assert.deepEqual(read("activity_stream.json").data.items[0].summary_fields.actor, { id: 1, username: "auditor" });
+  const authSettings = read("settings_authentication.json").data;
+  assert.equal(authSettings.AUTH_LDAP_SERVER_URI, "ldaps://ldap.example.com");
+  assert.equal(authSettings.AUTH_LDAP_BIND_DN, "cn=svc,dc=example");
+  assert.equal(authSettings.AUTH_LDAP_BIND_PASSWORD, ANSIBLE_REDACTION_MARKER);
+  assert.equal(authSettings.SOCIAL_AUTH_SAML_SP_PRIVATE_KEY, ANSIBLE_REDACTION_MARKER);
+  assert.equal(authSettings.SOCIAL_AUTH_SAML_ENABLED_IDPS.okta.url, "https://idp.example.com/sso", "URL query strings are dropped from settings values");
+  assert.deepEqual(read("settings_system.json").data, { ACTIVITY_STREAM_ENABLED: true, REDHAT_PASSWORD: ANSIBLE_REDACTION_MARKER, LICENSE: { license_key: ANSIBLE_REDACTION_MARKER, subscription_name: "AAP" } });
+  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_PASSWORD, ANSIBLE_REDACTION_MARKER);
+  assert.equal(read("settings_logging.json").data.LOG_AGGREGATOR_TYPE, "splunk");
+  assert.deepEqual(Object.keys(read("users.json").data.items[0]).sort(), ["id", "is_superuser", "is_system_auditor", "username"]);
+  assert.deepEqual(read("access.json").currentUser, { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false });
+  assert.deepEqual(Object.keys(read("notifications.json").data.items[0]).sort(), ["id", "status"]);
+  assert.match(files.get("QUICK_REFERENCE.md"), /\[REDACTED\]/);
+});
+
+test("verdict rule 9: redaction helpers cover camelCase keys, pair shapes, environment dictionaries, and URL userinfo", () => {
+  assert.deepEqual(redactCredentialTree({
+    apiKey: "FAKE_SECRET_TOKEN_1",
+    refreshToken: "FAKE_SECRET_TOKEN_2",
+    "X-Auth-Token": "FAKE_SECRET_TOKEN_3",
+    AUTH_LDAP_BIND_DN: "cn=svc",
+    nested: { client_secret: "FAKE_SECRET_TOKEN_4", enabled: true, empty: "", missing: null },
+    headers: [{ name: "Authorization", value: "FAKE_SECRET_TOKEN_5" }, { key: "X-Tenant", value: "acme" }],
+    AWX_TASK_ENV: { HTTP_PROXY: "http://user:FAKE_SECRET_TOKEN_6@proxy:3128", NO_PROXY: "localhost" },
+    endpoint: "https://user:FAKE_SECRET_TOKEN_7@api.example.com/v1?sig=FAKE_SECRET_TOKEN_8#frag",
+    list: ["plain", { token: "FAKE_SECRET_TOKEN_9" }],
+  }), {
+    apiKey: "[REDACTED]",
+    refreshToken: "[REDACTED]",
+    "X-Auth-Token": "[REDACTED]",
+    AUTH_LDAP_BIND_DN: "cn=svc",
+    nested: { client_secret: "[REDACTED]", enabled: true, empty: "", missing: null },
+    headers: [{ name: "Authorization", value: "[REDACTED]" }, { key: "X-Tenant", value: "[REDACTED]" }],
+    AWX_TASK_ENV: { HTTP_PROXY: "[REDACTED]", NO_PROXY: "[REDACTED]" },
+    endpoint: "https://api.example.com/v1",
+    list: ["plain", { token: "[REDACTED]" }],
+  });
+  assert.equal(redactVariables(`---\ndb_password: x\nregion: us-east-1\n  nested: y`), "[REDACTED] (variable names: db_password, region)");
+  assert.equal(redactVariables('{"api_token": "x", "count": 1}'), "[REDACTED] (variable names: api_token, count)");
+  assert.equal(redactVariables({ vault_pass: "x" }), "[REDACTED] (variable names: vault_pass)");
+  assert.equal(redactVariables("hunter22"), "[REDACTED]");
+  assert.equal(redactVariables(""), "");
+  assert.equal(redactVariables(null), null);
+  assert.equal(sanitizeScmUrl("https://svc:FAKE_SECRET_TOKEN_1@git.example.com/org/repo.git?token=FAKE_SECRET_TOKEN_2"), "https://git.example.com/org/repo.git");
+  assert.equal(sanitizeScmUrl("git@github.com:org/repo.git"), "git@github.com:org/repo.git");
+  assert.equal(sanitizeScmUrl("svc:FAKE_SECRET_TOKEN_1@git.example.com:org/repo.git"), "[REDACTED]");
+  assert.equal(sanitizeScmUrl(""), "");
+});
+
+test("verdict rule 9: AnsibleAapClient error messages keep the structured detail and never echo raw response bodies", async () => {
+  const client = new AnsibleAapClient(
+    { baseUrl: "https://aap.example.com", token: "aap-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] },
+    {
+      fetchImpl: async (input) => {
+        const url = new URL(typeof input === "string" ? input : input.toString());
+        if (url.pathname === "/api/v2/jobs/") {
+          return new Response(JSON.stringify({ detail: "You do not have permission to perform this action.", token: "FAKE_SECRET_TOKEN_1" }), {
+            status: 403,
+            statusText: "Forbidden",
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("<html>gateway error FAKE_SECRET_TOKEN_2</html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+      },
+    },
+  );
+  await assert.rejects(() => client.get("/api/v2/jobs/"), (error) => {
+    assert.match(error.message, /\/api\/v2\/jobs\/ \(403 Forbidden\) You do not have permission/);
+    assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_1"));
+    return true;
+  });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
+    assert.equal(error.message, "AAP request failed: /api/v2/hosts/ (502 Bad Gateway)");
+    return true;
+  });
+});
+
+test("verdict rule 10: survey spec and error notification probes capped at 50 templates demote controls 18 and 27 with seen versus total", async () => {
+  const templates = Array.from({ length: 60 }, (_, index) => jobTemplate(100 + index, `Patch Server ${index}`, { survey_enabled: true }));
+  const routes = { "/api/v2/job_templates/": templates };
+  for (const template of templates) {
+    routes[`/api/v2/job_templates/${template.id}/survey_spec/`] = { name: "", spec: [{ variable: "target", type: "text", default: "web" }] };
+    routes[`/api/v2/job_templates/${template.id}/notification_templates_error/`] = [{ id: 1, name: "slack alerts" }];
+  }
+  const result = await assessAnsiblePlatformSecurity(createMockClient({ routes }));
+
+  const plaintext = byId(result, "AAP-CRED-04");
+  assert.equal(plaintext.status, "warn");
+  assert.equal(plaintext.evidence.surveys_scanned, 50);
+  assert.equal(plaintext.evidence.survey_templates_eligible, 60);
+  assert.ok(plaintext.evidence.partial_view.some((note) => /survey specs: 50 of 60 probed/.test(note)), plaintext.summary);
+  assert.match(plaintext.summary, /survey specs: 50 of 60 probed/);
+
+  const notifications = byId(result, "AAP-AUDIT-02");
+  assert.equal(notifications.status, "warn");
+  assert.equal(notifications.evidence.critical_templates, 50);
+  assert.equal(notifications.evidence.critical_templates_eligible, 60);
+  assert.match(notifications.summary, /critical templates: 50 of 60 probed/);
+
+  const underCap = await assessAnsiblePlatformSecurity(createMockClient({ routes: {
+    ...routes,
+    "/api/v2/job_templates/": templates.slice(0, 50),
+  } }));
+  assert.equal(byId(underCap, "AAP-CRED-04").status, "pass");
+  assert.equal(byId(underCap, "AAP-AUDIT-02").status, "pass");
+});
+
+test("rule 1 corollary: multi-inventory findings never pass when a secondary inventory returns 403 and name the unreadable inventory", async () => {
+  const cases = [
+    { control: 12, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/schedules/", names: /schedules could not be read/ },
+    { control: 13, assess: assessAnsibleHostCoverage, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/ },
+    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credentials: /, expected: "warn" },
+    { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /variable sources \(inventories\) could not be read/, expected: "manual" },
+    { control: 21, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/organizations/1/admins/", names: /admins list of 1 organizations \(Default\) could not be read/, expected: "manual" },
+    { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /inventories list could not be read/, expected: "warn" },
+    { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/teams/1/roles/", names: /roles of 1 teams could not be read/, expected: "manual" },
+    { control: 23, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/users/2/roles/", names: /roles of 1 users could not be read/, expected: "manual" },
+    { control: 24, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/teams/", names: /teams list could not be read/, expected: "warn" },
+    { control: 24, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/users/3/roles/", names: /1 user or team role lists could not be read/, expected: "warn" },
+    { control: 26, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/settings/system/", names: /system settings could not be read/, expected: "warn" },
+    { control: 26, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/settings/logging/", names: /logging settings could not be read/, expected: "warn" },
+    { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/notifications/", names: /notification delivery history could not be read/, expected: "warn" },
+    { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/, expected: "manual" },
+    { control: 28, assess: assessAnsibleJobHealth, forbidden: "/api/v2/instance_groups/", names: /instance groups could not be read/, expected: "manual" },
+    { control: 28, assess: assessAnsibleJobHealth, forbidden: "/api/v2/settings/jobs/", names: /job settings could not be read/, expected: "manual" },
+    { control: 30, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/execution_environments/", names: /Execution environments could not be read/, expected: "manual" },
+  ];
+  for (const testCase of cases) {
+    const result = await testCase.assess(createMockClient({ forbiddenPaths: [testCase.forbidden] }));
+    const finding = byControl(result, testCase.control);
+    assert.notEqual(finding.status, "pass", `control ${testCase.control} passed with ${testCase.forbidden} forbidden: ${finding.summary}`);
+    if (testCase.expected) assert.equal(finding.status, testCase.expected, `control ${testCase.control} with ${testCase.forbidden} forbidden: ${finding.summary}`);
+    assert.match(finding.summary, testCase.names, `control ${testCase.control} with ${testCase.forbidden} forbidden`);
+    assert.ok(result.errors.some((error) => error.includes(testCase.forbidden)), `control ${testCase.control}: errors array names ${testCase.forbidden}`);
+  }
+  const healthy = await runAllAssessments(createMockClient());
+  assert.equal(healthy.flatMap((result) => result.findings).filter((item) => item.status !== "pass").length, 0, "the healthy fixture still passes every control");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

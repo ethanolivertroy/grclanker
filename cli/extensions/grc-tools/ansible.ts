@@ -27,6 +27,7 @@ const DEFAULT_TEMPLATE_LIMIT = 500;
 const DEFAULT_SUMMARY_LIMIT = 2000;
 const DEFAULT_USER_LIMIT = 200;
 const DEFAULT_ROLE_PROBE_LIMIT = 50;
+const DEFAULT_TEMPLATE_PROBE_LIMIT = 50;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const TOKEN_SKEW_MS = 5 * 60 * 1000;
 const REMEDIATION_WINDOW_DAYS = 7;
@@ -35,6 +36,14 @@ const DEFAULT_OUTPUT_DIR = "./export/ansible-aap";
 const CRITICAL_TEMPLATE_PATTERN = /patch|harden|cis|stig|baseline|logging|audit|access|password|compliance|security|firewall/i;
 const SECRET_KEY_PATTERN = /(password|passwd|secret|token|api[_-]?key|private[_-]?key|client[_-]?secret)/i;
 const SECRET_ASSIGNMENT_PATTERN = /([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|client[_-]?secret)[A-Za-z0-9_.-]*)["']?\s*[:=]\s*["']?([^\s"',}\]]{4,})/gi;
+export const ANSIBLE_REDACTION_MARKER = "[REDACTED]";
+// Matched against a key name lowered and stripped of separators, so
+// AUTH_LDAP_BIND_PASSWORD, refreshToken, ssh_key_data, X-Api-Key, and
+// SOCIAL_AUTH_GITHUB_KEY all count as credential-bearing.
+const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|secret|token|credential|authorization|signature|key)/;
+const ENVIRONMENT_KEY_PATTERN = /env$/;
+const URL_KEY_PATTERN = /(url|uri|endpoint|webhook)/;
+const URL_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -628,6 +637,316 @@ async function countFilesRecursively(pathname: string): Promise<number> {
   return count;
 }
 
+/**
+ * Keeps only the structured `detail` or `error` message of a failed AAP
+ * response so raw bodies never reach error logs or finding summaries.
+ */
+function responseDetail(text: string): string {
+  try {
+    const parsed = asObject(JSON.parse(text));
+    const detail = asString(parsed?.detail) ?? asString(parsed?.error);
+    return detail ? ` ${detail.slice(0, 200)}` : "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeKeyName(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function isCredentialKeyName(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(normalizeKeyName(key));
+}
+
+function isEmptyValue(value: unknown): boolean {
+  return value === undefined || value === null || value === "";
+}
+
+function redactedOr(value: unknown): unknown {
+  return isEmptyValue(value) ? value : ANSIBLE_REDACTION_MARKER;
+}
+
+function urlOrigin(value: string, keepPath: boolean): string | undefined {
+  try {
+    const parsed = new URL(value);
+    if (!parsed.host) return undefined;
+    return keepPath ? `${parsed.protocol}//${parsed.host}${parsed.pathname}` : `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeUrlText(value: string): string {
+  if (!URL_SCHEME_PATTERN.test(value)) return value;
+  return urlOrigin(value, true) ?? ANSIBLE_REDACTION_MARKER;
+}
+
+/**
+ * Drops userinfo, query strings, and fragments from an SCM URL while keeping
+ * the repository path; scp-style user:secret@host forms are redacted whole.
+ */
+export function sanitizeScmUrl(value: unknown): unknown {
+  if (typeof value !== "string" || value.length === 0) return value;
+  return urlOrigin(value, true) ?? (/:[^@/]*@/.test(value) ? ANSIBLE_REDACTION_MARKER : value);
+}
+
+/**
+ * Returns a deep copy of a settings or configuration tree in which every value
+ * under a credential-bearing key, every value of an environment dictionary,
+ * and every value of a {name, value} or {key, value} pair is replaced by the
+ * redaction marker, and every URL string loses its userinfo and query string.
+ */
+export function redactCredentialTree(value: unknown, redactEveryValue = false): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => {
+      const pair = asObject(entry);
+      if (pair && "value" in pair && (typeof pair.name === "string" || typeof pair.key === "string")) {
+        return {
+          ...(redactCredentialTree(pair, redactEveryValue) as JsonRecord),
+          ...(typeof pair.name === "string" ? { name: pair.name } : {}),
+          ...(typeof pair.key === "string" ? { key: pair.key } : {}),
+          value: redactedOr(pair.value),
+        };
+      }
+      return redactCredentialTree(entry, redactEveryValue);
+    });
+  }
+  const object = asObject(value);
+  if (object) {
+    const output: JsonRecord = {};
+    for (const [key, entry] of Object.entries(object)) {
+      if (redactEveryValue || isCredentialKeyName(key)) {
+        output[key] = redactedOr(entry);
+      } else {
+        output[key] = redactCredentialTree(entry, ENVIRONMENT_KEY_PATTERN.test(normalizeKeyName(key)));
+      }
+    }
+    return output;
+  }
+  if (typeof value === "string") return sanitizeUrlText(value);
+  return value;
+}
+
+/** Top-level variable names of a YAML or JSON variables document, or the keys of a variables object. */
+export function variableNames(value: unknown): string[] {
+  const object = asObject(value);
+  if (object) return Object.keys(object);
+  const text = asString(value);
+  if (!text) return [];
+  try {
+    const parsed = asObject(JSON.parse(text));
+    if (parsed) return Object.keys(parsed);
+  } catch {
+    // YAML documents fall through to the line scan.
+  }
+  const names: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_.-]*)\s*:/);
+    if (match?.[1]) names.push(match[1]);
+  }
+  return [...new Set(names)];
+}
+
+/** Replaces a variables body with the redaction marker plus the variable names it declared. */
+export function redactVariables(value: unknown): unknown {
+  if (isEmptyValue(value)) return value;
+  const names = variableNames(value);
+  return names.length > 0 ? `${ANSIBLE_REDACTION_MARKER} (variable names: ${names.join(", ")})` : ANSIBLE_REDACTION_MARKER;
+}
+
+function pick(item: JsonRecord, keys: readonly string[]): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const key of keys) {
+    if (key in item) projected[key] = item[key];
+  }
+  return projected;
+}
+
+function redactField(item: JsonRecord, key: string, redact: (value: unknown) => unknown = redactedOr): JsonRecord {
+  return key in item ? { [key]: redact(item[key]) } : {};
+}
+
+function pickSummary(item: JsonRecord, field: string, keys: readonly string[]): JsonRecord | undefined {
+  const entry = asObject(summaryFields(item)[field]);
+  return entry ? pick(entry, keys) : undefined;
+}
+
+function pickSummaryList(item: JsonRecord, field: string, keys: readonly string[]): JsonRecord[] | undefined {
+  const entries = summaryFields(item)[field];
+  if (!Array.isArray(entries)) return undefined;
+  return entries
+    .map((entry) => asObject(entry))
+    .filter((entry): entry is JsonRecord => Boolean(entry))
+    .map((entry) => pick(entry, keys));
+}
+
+const USER_FIELDS = ["id", "username", "is_superuser", "is_system_auditor", "external_account", "last_login", "created", "modified"];
+const PING_FIELDS = ["version", "active_node", "ha", "instances", "instance_groups"];
+const JOB_FIELDS = ["id", "type", "name", "status", "failed", "launch_type", "started", "finished", "elapsed", "job_template", "unified_job_template", "inventory", "project", "playbook", "created"];
+const TEMPLATE_FIELDS = ["id", "type", "name", "description", "playbook", "project", "inventory", "status", "last_job_run", "last_job_failed", "execution_environment", "survey_enabled", "ask_variables_on_launch", "ask_credential_on_launch", "ask_execution_environment_on_launch", "created", "modified"];
+const SCHEDULE_FIELDS = ["id", "name", "unified_job_template", "enabled", "rrule", "next_run", "dtstart", "dtend", "created", "modified"];
+const HOST_FIELDS = ["id", "name", "enabled", "inventory", "last_job", "last_job_host_summary", "has_active_failures", "has_inventory_sources", "created", "modified"];
+const INVENTORY_SOURCE_FIELDS = ["id", "name", "source", "source_path", "inventory", "status", "last_updated", "last_update_failed", "last_job_run", "last_job_failed", "update_on_launch", "created", "modified"];
+const INVENTORY_FIELDS = ["id", "name", "kind", "organization", "total_hosts", "hosts_with_active_failures", "total_groups", "has_inventory_sources", "total_inventory_sources", "inventory_sources_with_failures", "has_active_failures", "created", "modified"];
+const GROUP_FIELDS = ["id", "name", "inventory", "created", "modified"];
+const PROJECT_FIELDS = ["id", "name", "scm_type", "scm_branch", "scm_refspec", "scm_update_on_launch", "status", "last_updated", "last_update_failed", "last_job_run", "last_job_failed", "organization", "created", "modified"];
+const CREDENTIAL_FIELDS = ["id", "name", "kind", "credential_type", "managed", "organization", "created", "modified"];
+const TOKEN_FIELDS = ["id", "user", "application", "scope", "description", "created", "modified", "expires", "last_used"];
+const ACTIVITY_FIELDS = ["id", "timestamp", "operation", "object1", "object2", "object_association"];
+const NOTIFICATION_TEMPLATE_FIELDS = ["id", "name", "description", "notification_type", "organization", "created", "modified"];
+const NOTIFICATION_FIELDS = ["id", "status", "notification_type", "notification_template", "notifications_sent", "created"];
+const ORGANIZATION_FIELDS = ["id", "name", "description", "max_hosts", "created", "modified"];
+const TEAM_FIELDS = ["id", "name", "description", "organization", "created", "modified"];
+const ROLE_FIELDS = ["id", "name", "description"];
+const INSTANCE_GROUP_FIELDS = ["id", "name", "max_concurrent_jobs", "max_forks", "is_container_group", "capacity", "consumed_capacity", "instances", "created", "modified"];
+const JOB_HOST_SUMMARY_FIELDS = ["id", "job", "host", "host_name", "failed", "changed", "ok", "failures", "skipped", "unreachable", "created"];
+const EXECUTION_ENVIRONMENT_FIELDS = ["id", "name", "description", "image", "pull", "organization", "credential", "managed", "created", "modified"];
+const SURVEY_QUESTION_FIELDS = ["variable", "type", "required", "question_name", "min", "max"];
+const JOB_SETTING_KEYS = ["SCHEDULE_MAX_JOBS", "MAX_FORKS", "DEFAULT_JOB_TIMEOUT", "DEFAULT_INVENTORY_UPDATE_TIMEOUT", "DEFAULT_PROJECT_UPDATE_TIMEOUT", "AD_HOC_COMMANDS", "AWX_TASK_ENV", "GALAXY_TASK_ENV"];
+const SUMMARY_CREDENTIAL_FIELDS = ["id", "name", "kind", "credential_type_id"];
+
+export function projectUser(user: JsonRecord): JsonRecord {
+  return pick(user, USER_FIELDS);
+}
+
+function projectJob(job: JsonRecord): JsonRecord {
+  return {
+    ...pick(job, JOB_FIELDS),
+    ...redactField(job, "extra_vars", redactVariables),
+    summary_fields: { credentials: pickSummaryList(job, "credentials", SUMMARY_CREDENTIAL_FIELDS) },
+  };
+}
+
+function projectTemplate(template: JsonRecord): JsonRecord {
+  return {
+    ...pick(template, TEMPLATE_FIELDS),
+    ...redactField(template, "extra_vars", redactVariables),
+    summary_fields: {
+      credentials: pickSummaryList(template, "credentials", SUMMARY_CREDENTIAL_FIELDS),
+      last_job: pickSummary(template, "last_job", ["id", "name", "status", "finished", "failed"]),
+    },
+  };
+}
+
+function projectSchedule(schedule: JsonRecord): JsonRecord {
+  return { ...pick(schedule, SCHEDULE_FIELDS), ...redactField(schedule, "extra_data", redactVariables) };
+}
+
+function projectHost(host: JsonRecord): JsonRecord {
+  return {
+    ...pick(host, HOST_FIELDS),
+    ...redactField(host, "variables", redactVariables),
+    summary_fields: {
+      last_job: pickSummary(host, "last_job", ["id", "name", "status", "finished", "failed"]),
+      inventory: pickSummary(host, "inventory", ["id", "name"]),
+    },
+  };
+}
+
+function projectInventorySource(source: JsonRecord): JsonRecord {
+  return { ...pick(source, INVENTORY_SOURCE_FIELDS), ...redactField(source, "source_vars", redactVariables) };
+}
+
+function projectInventory(item: JsonRecord): JsonRecord {
+  return { ...pick(item, INVENTORY_FIELDS), ...redactField(item, "variables", redactVariables) };
+}
+
+function projectGroup(group: JsonRecord): JsonRecord {
+  return { ...pick(group, GROUP_FIELDS), ...redactField(group, "variables", redactVariables) };
+}
+
+function projectProject(project: JsonRecord): JsonRecord {
+  return { ...pick(project, PROJECT_FIELDS), ...redactField(project, "scm_url", sanitizeScmUrl) };
+}
+
+function projectCredential(credential: JsonRecord): JsonRecord {
+  return {
+    ...pick(credential, CREDENTIAL_FIELDS),
+    ...redactField(credential, "inputs", (value) => redactCredentialTree(value, true)),
+    summary_fields: {
+      credential_type: pickSummary(credential, "credential_type", ["id", "name", "kind"]),
+      owners: pickSummaryList(credential, "owners", ["id", "type", "name"]),
+    },
+  };
+}
+
+function projectToken(token: JsonRecord): JsonRecord {
+  return { ...pick(token, TOKEN_FIELDS), ...redactField(token, "token"), ...redactField(token, "refresh_token") };
+}
+
+function projectActivity(entry: JsonRecord): JsonRecord {
+  return {
+    ...pick(entry, ACTIVITY_FIELDS),
+    ...redactField(entry, "changes", redactVariables),
+    summary_fields: { actor: pickSummary(entry, "actor", ["id", "username"]) },
+  };
+}
+
+/**
+ * Notification configurations mix vendor-masked passwords with raw webhook
+ * URLs and header maps, so every value is redacted: URL keys keep scheme and
+ * host, header maps keep their names, and everything else keeps the key only.
+ */
+function projectNotificationConfiguration(value: unknown): unknown {
+  const configuration = asObject(value);
+  if (!configuration) return redactedOr(value);
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(configuration)) {
+    const normalized = normalizeKeyName(key);
+    if (normalized.endsWith("headers")) {
+      output[key] = redactCredentialTree(entry, true);
+    } else if (URL_KEY_PATTERN.test(normalized)) {
+      output[key] = typeof entry === "string" && entry.length > 0 ? urlOrigin(entry, false) ?? ANSIBLE_REDACTION_MARKER : redactedOr(entry);
+    } else {
+      output[key] = redactedOr(entry);
+    }
+  }
+  return output;
+}
+
+function projectNotificationTemplate(template: JsonRecord): JsonRecord {
+  return {
+    ...pick(template, NOTIFICATION_TEMPLATE_FIELDS),
+    ...redactField(template, "notification_configuration", projectNotificationConfiguration),
+  };
+}
+
+function projectNotification(notification: JsonRecord): JsonRecord {
+  return pick(notification, NOTIFICATION_FIELDS);
+}
+
+function projectRole(role: JsonRecord): JsonRecord {
+  return {
+    ...pick(role, ROLE_FIELDS),
+    summary_fields: pick(summaryFields(role), ["resource_type", "resource_type_display_name", "resource_name", "resource_id"]),
+  };
+}
+
+function projectSurveySpec(spec: JsonRecord | undefined): JsonRecord | undefined {
+  if (!spec) return spec;
+  const questions = Array.isArray(spec.spec) ? spec.spec : [];
+  return {
+    ...pick(spec, ["name", "description"]),
+    spec: questions
+      .map((raw) => asObject(raw))
+      .filter((question): question is JsonRecord => Boolean(question))
+      .map((question) => ({ ...pick(question, SURVEY_QUESTION_FIELDS), ...redactField(question, "default") })),
+  };
+}
+
+function projectJobSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
+  return settings ? redactCredentialTree(pick(settings, JOB_SETTING_KEYS)) as JsonRecord : settings;
+}
+
+function projectSettings(settings: JsonRecord | undefined): JsonRecord | undefined {
+  return settings ? redactCredentialTree(settings) as JsonRecord : settings;
+}
+
+function projectPing(ping: JsonRecord | undefined): JsonRecord | undefined {
+  return ping ? pick(ping, PING_FIELDS) : ping;
+}
+
 export class AnsibleAapClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
@@ -730,7 +1049,7 @@ export class AnsibleAapClient {
     const response = await this.fetchWithTimeout(this.resolveUrl(pathOrUrl), { method: "GET", headers });
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`AAP request failed: ${pathOrUrl} (${response.status} ${response.statusText}) ${text.slice(0, 200)}`);
+      throw new Error(`AAP request failed: ${pathOrUrl} (${response.status} ${response.statusText})${responseDetail(text)}`);
     }
 
     return text.length > 0 ? JSON.parse(text) as T : undefined as T;
@@ -1078,8 +1397,8 @@ export async function checkAnsibleAccess(client: AnsibleAapClient): Promise<Ansi
 
   return {
     status,
-    currentUser,
-    ping,
+    currentUser: currentUser ? projectUser(currentUser) : undefined,
+    ping: projectPing(ping),
     surfaces,
     notes,
     recommendedNextStep:
@@ -1566,6 +1885,9 @@ export function assessAnsibleHostCoverageData(data: HostCoverageData, now: Date,
     }
   } else {
     const templateById = new Map(templates.items.map((template) => [String(template.id ?? ""), template]));
+    const templatesUnreadableNote = templates.readable
+      ? undefined
+      : `the job templates list could not be read (${templates.error}), so last-run ages were not checked`;
     const enabled = schedules.items.filter((schedule) => asBoolean(schedule.enabled) === true);
     const missed: JsonRecord[] = [];
     const unknown: JsonRecord[] = [];
@@ -1598,13 +1920,13 @@ export function assessAnsibleHostCoverageData(data: HostCoverageData, now: Date,
     }
     findings.push(finding(
       13,
-      missed.length > 0 ? "fail" : unknown.length > 0 ? "warn" : "pass",
+      missed.length > 0 ? "fail" : unknown.length > 0 || templatesUnreadableNote ? "warn" : "pass",
       missed.length > 0
         ? `${missed.length}/${enabled.length} enabled schedules have a past or null next_run, or a last run older than ${MISSED_RUN_MULTIPLIER}x their interval.`
-        : unknown.length > 0
-          ? `No enabled schedule missed its window, but ${unknown.length}/${enabled.length} could not be fully evaluated (unparsed rrule, never-run or unsampled template).`
+        : unknown.length > 0 || templatesUnreadableNote
+          ? `No enabled schedule missed its window, but ${unknown.length}/${enabled.length} could not be fully evaluated (unparsed rrule, never-run or unsampled template)${templatesUnreadableNote ? `; ${templatesUnreadableNote}` : ""}.`
           : `All ${enabled.length} enabled schedules have a future next_run and a last run within ${MISSED_RUN_MULTIPLIER}x their interval.`,
-      { enabled: enabled.length, missed: missed.slice(0, 10), unknown: unknown.slice(0, 10) },
+      { enabled: enabled.length, missed: missed.slice(0, 10), unknown: unknown.slice(0, 10), job_templates_readable: templates.readable },
       templatePartial,
     ));
 
@@ -1705,6 +2027,11 @@ export function findPlaintextSecrets(text: unknown): string[] {
   return [...new Set(matches)];
 }
 
+export interface ProbeCoverage {
+  eligible: number;
+  probed: number;
+}
+
 export interface PlatformSecurityData {
   scope: Snapshot<AnsibleScope>;
   organizations: Snapshot<AnsibleCollection>;
@@ -1729,6 +2056,10 @@ export interface PlatformSecurityData {
   authSettings: Snapshot<JsonRecord | undefined>;
   systemSettings: Snapshot<JsonRecord | undefined>;
   loggingSettings: Snapshot<JsonRecord | undefined>;
+  probeCoverage?: {
+    surveyTemplates: ProbeCoverage;
+    criticalTemplates: ProbeCoverage;
+  };
 }
 
 export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSurface, options: PlatformSecurityOptions = {}): Promise<PlatformSecurityData> {
@@ -1772,15 +2103,23 @@ export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSu
   const jobTemplates = await collect(client, "job templates", "/api/v2/job_templates/", { order_by: "name" }, templateLimit);
   const surveySpecs: Record<string, Snapshot<JsonRecord | undefined>> = {};
   const templateErrorNotifications: Record<string, Snapshot<AnsibleCollection>> = {};
+  let surveyTemplates = 0;
+  let criticalTemplates = 0;
   for (const template of jobTemplates.data.items) {
     const id = asString(template.id);
     if (!id) continue;
-    if (asBoolean(template.survey_enabled) === true && Object.keys(surveySpecs).length < 50) {
-      surveySpecs[id] = await fetchObject(client, `job template ${nameOf(template)} survey spec`, `/api/v2/job_templates/${id}/survey_spec/`);
+    if (asBoolean(template.survey_enabled) === true) {
+      surveyTemplates += 1;
+      if (Object.keys(surveySpecs).length < DEFAULT_TEMPLATE_PROBE_LIMIT) {
+        surveySpecs[id] = await fetchObject(client, `job template ${nameOf(template)} survey spec`, `/api/v2/job_templates/${id}/survey_spec/`);
+      }
     }
     const isCritical = CRITICAL_TEMPLATE_PATTERN.test([template.name, template.playbook, template.description].map((value) => extractText(value)).join(" "));
-    if (isCritical && Object.keys(templateErrorNotifications).length < 50) {
-      templateErrorNotifications[id] = await collect(client, `job template ${nameOf(template)} error notifications`, `/api/v2/job_templates/${id}/notification_templates_error/`, {}, 50);
+    if (isCritical) {
+      criticalTemplates += 1;
+      if (Object.keys(templateErrorNotifications).length < DEFAULT_TEMPLATE_PROBE_LIMIT) {
+        templateErrorNotifications[id] = await collect(client, `job template ${nameOf(template)} error notifications`, `/api/v2/job_templates/${id}/notification_templates_error/`, {}, 50);
+      }
     }
   }
   const inventories = await collect(client, "inventories", "/api/v2/inventories/", {}, 200);
@@ -1816,7 +2155,15 @@ export async function collectAnsiblePlatformSecurityData(client: AnsibleClientSu
     authSettings,
     systemSettings,
     loggingSettings,
+    probeCoverage: {
+      surveyTemplates: { eligible: surveyTemplates, probed: Object.keys(surveySpecs).length },
+      criticalTemplates: { eligible: criticalTemplates, probed: Object.keys(templateErrorNotifications).length },
+    },
   };
+}
+
+function probeNote(label: string, coverage: ProbeCoverage | undefined): string | undefined {
+  return coverage && coverage.eligible > coverage.probed ? `${label}: ${coverage.probed} of ${coverage.eligible} probed` : undefined;
 }
 
 function credentialKind(credential: JsonRecord): string {
@@ -2022,13 +2369,14 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const vaultCredentials = credentials.items.filter((credential) => isVaultCredential(credential));
     const vaultNote = credentials.readable
       ? ` ${vaultCredentials.length} Vault credentials (vault_id: ${vaultCredentials.map((credential) => vaultId(credential) ?? "default").join(", ") || "none"}) are defined for encrypted variables.`
-      : " Vault credential usage could not be read.";
+      : ` Vault credential usage could not be read (credentials: ${credentials.error}), so encrypted variable coverage was not checked.`;
     const launchNote = launchTimeVariableTemplates.length > 0
       ? ` ${launchTimeVariableTemplates.length} templates set ask_variables_on_launch; launch-time extra_vars are not scanned.`
       : "";
+    const surveyProbeNote = probeNote("survey specs", data.probeCoverage?.surveyTemplates);
     findings.push(finding(
       18,
-      hits.length > 0 ? "fail" : surveysUnreadable > 0 || variableSources.length > 0 ? "manual" : "pass",
+      hits.length > 0 ? "fail" : surveysUnreadable > 0 || variableSources.length > 0 ? "manual" : credentials.readable ? "pass" : "warn",
       hits.length > 0
         ? `${hits.length} templates, surveys, inventories, or groups carry plaintext values under secret-like variable names.${vaultNote}${launchNote}`
         : surveysUnreadable > 0 || variableSources.length > 0
@@ -2037,13 +2385,14 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
       {
         hits: hits.slice(0, 20),
         surveys_scanned: Object.keys(data.surveySpecs).length,
+        survey_templates_eligible: data.probeCoverage?.surveyTemplates.eligible ?? Object.keys(data.surveySpecs).length,
         surveys_unreadable: surveysUnreadable,
         inventories: inventories.seen,
         groups: groups.seen,
         ask_variables_on_launch_templates: launchTimeVariableTemplates.length,
         vault_credentials: vaultCredentials.map((credential) => ({ name: nameOf(credential), vault_id: vaultId(credential) ?? null })),
       },
-      partialNotes(data.scope, templates, inventories, groups),
+      [...partialNotes(data.scope, templates, inventories, groups), ...(surveyProbeNote ? [surveyProbeNote] : [])],
     ));
 
     if (!executionEnvironments.readable) {
@@ -2143,6 +2492,9 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const inventoryAdminTeams: JsonRecord[] = [];
     const unreadable: string[] = [];
     const totalInventories = inventories.readable && inventories.total !== undefined ? inventories.total : undefined;
+    const inventoryScopeNote = inventories.readable
+      ? undefined
+      : `the inventories list could not be read (${inventories.error}), so inventory-wide Admin roles were not checked`;
     for (const team of teams.items) {
       const snapshot = data.teamRoles[String(team.id ?? "")];
       if (!snapshot || snapshot.error) {
@@ -2159,13 +2511,15 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     }
     findings.push(finding(
       22,
-      orgAdminTeams.length + inventoryAdminTeams.length > 0 ? "fail" : unreadable.length > 0 ? "manual" : "pass",
+      orgAdminTeams.length + inventoryAdminTeams.length > 0 ? "fail" : unreadable.length > 0 ? "manual" : inventoryScopeNote ? "warn" : "pass",
       orgAdminTeams.length + inventoryAdminTeams.length > 0
         ? `${orgAdminTeams.length} teams hold the Admin role on an organization and ${inventoryAdminTeams.length} hold Admin on every visible inventory.`
         : unreadable.length > 0
           ? `No team holds organization-wide or inventory-wide Admin, but the roles of ${unreadable.length} teams could not be read; review them manually.`
-          : `None of the ${teams.seen} teams holds the Admin role on an organization or on every inventory.`,
-      { org_admin_teams: orgAdminTeams, inventory_admin_teams: inventoryAdminTeams, unreadable, total_inventories: totalInventories },
+          : inventoryScopeNote
+            ? `None of the ${teams.seen} teams holds the Admin role on an organization, but ${inventoryScopeNote}.`
+            : `None of the ${teams.seen} teams holds the Admin role on an organization or on every inventory.`,
+      { org_admin_teams: orgAdminTeams, inventory_admin_teams: inventoryAdminTeams, unreadable, total_inventories: totalInventories, inventories_readable: inventories.readable },
       usersPartial,
     ));
   }
@@ -2225,13 +2579,19 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
       }
       const uncovered = organizations.items.filter((org) => !auditedOrgs.has(nameOf(org)));
       const covered = systemAuditors.length > 0 || uncovered.length === 0;
+      const unreadableRoleLists = [...Object.values(data.userRoles), ...Object.values(data.teamRoles)].filter((snapshot) => snapshot.error).length;
+      const auditorGapNote = !teams.readable
+        ? `the teams list could not be read (${teams.error}), so team-held Auditor roles were not checked`
+        : unreadableRoleLists > 0
+          ? `${unreadableRoleLists} user or team role lists could not be read, so their Auditor roles were not checked`
+          : undefined;
       findings.push(finding(
         24,
-        covered ? "pass" : "warn",
+        covered ? (auditorGapNote ? "warn" : "pass") : "warn",
         covered
-          ? `${systemAuditors.length} system auditors exist and ${auditedOrgs.size} organizations have an Auditor role holder among the probed users and teams.`
-          : `No system auditor exists and ${uncovered.length}/${organizations.seen} organizations have no Auditor role holder among the probed users and teams.`,
-        { system_auditors: sample(systemAuditors), audited_organizations: [...auditedOrgs], uncovered: sample(uncovered) },
+          ? `${systemAuditors.length} system auditors exist and ${auditedOrgs.size} organizations have an Auditor role holder among the probed users and teams${auditorGapNote ? `; ${auditorGapNote}` : ""}.`
+          : `No system auditor exists and ${uncovered.length}/${organizations.seen} organizations have no Auditor role holder among the probed users and teams${auditorGapNote ? `; ${auditorGapNote}` : ""}.`,
+        { system_auditors: sample(systemAuditors), audited_organizations: [...auditedOrgs], uncovered: sample(uncovered), teams_readable: teams.readable, unreadable_role_lists: unreadableRoleLists },
         probePartial,
       ));
     }
@@ -2262,6 +2622,16 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
   const loggingSettings = data.loggingSettings.data;
   const logAggregatorEnabled = loggingSettings ? asBoolean(loggingSettings.LOG_AGGREGATOR_ENABLED) : undefined;
   const auditEvidence = { activity_stream_enabled: activityEnabled, log_aggregator_enabled: logAggregatorEnabled, log_aggregator_type: loggingSettings ? asString(loggingSettings.LOG_AGGREGATOR_TYPE) : undefined };
+  const settingsGapNotes = [
+    data.systemSettings.error || !systemSettings
+      ? `the system settings could not be read (${data.systemSettings.error ?? "no settings object returned"}), so ACTIVITY_STREAM_ENABLED was not confirmed`
+      : activityEnabled === undefined
+        ? "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed"
+        : undefined,
+    data.loggingSettings.error || !loggingSettings
+      ? `the logging settings could not be read (${data.loggingSettings.error ?? "no settings object returned"}), so external log aggregation was not confirmed`
+      : undefined,
+  ].filter((note): note is string => Boolean(note));
   if (!activity.readable) {
     findings.push(manualForUnreadable(26, activity, "the Activity Stream page showing entries from the last 24 hours and Settings > System (Enable Activity Stream)"));
   } else if (activityEnabled === false) {
@@ -2273,11 +2643,11 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const latestAge = daysBetween(now, latest);
     findings.push(finding(
       26,
-      !latest ? "warn" : latestAge !== undefined && latestAge > 1 ? "fail" : "pass",
+      !latest ? "warn" : latestAge !== undefined && latestAge > 1 ? "fail" : settingsGapNotes.length > 0 ? "warn" : "pass",
       !latest
         ? "The newest activity stream record has no timestamp, so freshness cannot be confirmed."
-        : `Latest activity stream record is ${latestAge?.toFixed(1)} days old${activityEnabled === undefined ? " (ACTIVITY_STREAM_ENABLED not readable)" : ""}${logAggregatorEnabled === false ? "; external log aggregation is disabled" : ""}.`,
-      { ...auditEvidence, visible_activity_records: activity.seen, latest_activity_age_days: latestAge },
+        : `Latest activity stream record is ${latestAge?.toFixed(1)} days old${logAggregatorEnabled === false ? "; external log aggregation is disabled" : ""}${settingsGapNotes.length > 0 ? `; ${settingsGapNotes.join("; ")}` : ""}.`,
+      { ...auditEvidence, visible_activity_records: activity.seen, latest_activity_age_days: latestAge, settings_gaps: settingsGapNotes },
       scopeNotes(data.scope),
     ));
   }
@@ -2291,6 +2661,10 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
     const covered = critical.filter(([, snapshot]) => !snapshot.error && snapshot.data.items.length > 0).length;
     const unreadable = critical.filter(([, snapshot]) => snapshot.error).length;
     const failedNotifications = notifications.items.filter((item) => String(item.status ?? "").toLowerCase() === "failed").length;
+    const deliveryNote = notifications.readable
+      ? undefined
+      : `the notification delivery history could not be read (${notifications.error}), so failed deliveries were not checked`;
+    const criticalProbeNote = probeNote("critical templates", data.probeCoverage?.criticalTemplates);
     findings.push(finding(
       27,
       critical.length === 0
@@ -2301,14 +2675,26 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
             ? "warn"
             : unreadable > 0
               ? "manual"
-              : "pass",
+              : deliveryNote
+                ? "warn"
+                : "pass",
       critical.length === 0
-        ? `${notificationTemplates.seen} notification templates exist but no job template matched the critical keyword list; confirm failure notifications on the templates that matter manually.`
+        ? templates.readable
+          ? `${notificationTemplates.seen} notification templates exist but no job template matched the critical keyword list; confirm failure notifications on the templates that matter manually.`
+          : `${notificationTemplates.seen} notification templates exist but the job templates list could not be read (${templates.error}), so critical templates could not be identified; confirm failure notifications on the templates that matter manually.`
         : covered === 0
           ? `${notificationTemplates.seen} notification templates exist but none of the ${critical.length} critical job templates has an error notification attached.`
-          : `${covered}/${critical.length} critical job templates have an error notification attached; ${failedNotifications} of the last ${notifications.seen} notification deliveries failed${unreadable > 0 ? `; ${unreadable} template notification lists could not be read` : ""}.`,
-      { notification_template_count: notificationTemplates.seen, critical_templates: critical.length, covered, unreadable, failed_notifications: failedNotifications },
-      partialNotes(data.scope, notificationTemplates, templates),
+          : `${covered}/${critical.length} critical job templates have an error notification attached; ${failedNotifications} of the last ${notifications.seen} notification deliveries failed${unreadable > 0 ? `; ${unreadable} template notification lists could not be read` : ""}${deliveryNote ? `; ${deliveryNote}` : ""}.`,
+      {
+        notification_template_count: notificationTemplates.seen,
+        critical_templates: critical.length,
+        critical_templates_eligible: data.probeCoverage?.criticalTemplates.eligible ?? critical.length,
+        covered,
+        unreadable,
+        failed_notifications: failedNotifications,
+        notifications_readable: notifications.readable,
+      },
+      [...partialNotes(data.scope, notificationTemplates, templates), ...(criticalProbeNote ? [criticalProbeNote] : [])],
     ));
   }
 
@@ -2492,7 +2878,7 @@ function buildQuickReference(): string {
   return [
     "# Ansible AAP Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw controller REST API responses captured during this assessment (credential secrets are masked by the API and passwords are never written).",
+    "- `core_data/` contains controller REST API responses projected to the fields the findings read; variables bodies, credential inputs, tokens, notification configurations, survey defaults, activity changes, task environment values, and URL userinfo are replaced by `[REDACTED]` (variables keep their names).",
     "- `analysis/` contains normalized findings (`findings.json`), run metadata, and one JSON summary per assessment category.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework.",
     "- `_errors.log` appears only when some reads failed but the bundle still completed.",
@@ -2514,12 +2900,72 @@ function buildBundleReadme(): string {
     "",
     "This bundle was generated by grclanker's native Ansible Automation Platform tools.",
     "",
-    "See `QUICK_REFERENCE.md` for the layout. Secrets are not written to this bundle. AAP passwords must come from `AAP_PASSWORD` and are never accepted as tool arguments.",
+    "See `QUICK_REFERENCE.md` for the layout. Secrets are not written to this bundle: credential-bearing fields are redacted at export time. AAP passwords must come from `AAP_PASSWORD` and are never accepted as tool arguments.",
   ].join("\n");
 }
 
 function snapshotRecord<T>(snapshots: Record<string, Snapshot<T>>): JsonRecord {
   return Object.fromEntries(Object.entries(snapshots).map(([key, snapshot]) => [key, { data: snapshot.data, error: snapshot.error }]));
+}
+
+function projectCollectionSnapshot(snapshot: Snapshot<AnsibleCollection>, project: (item: JsonRecord) => JsonRecord): Snapshot<AnsibleCollection> {
+  return { data: { ...snapshot.data, items: snapshot.data.items.map(project) }, error: snapshot.error };
+}
+
+function projectObjectSnapshot(snapshot: Snapshot<JsonRecord | undefined>, project: (value: JsonRecord | undefined) => JsonRecord | undefined): Snapshot<JsonRecord | undefined> {
+  return { data: project(snapshot.data), error: snapshot.error };
+}
+
+function projectCollectionRecord(snapshots: Record<string, Snapshot<AnsibleCollection>>, project: (item: JsonRecord) => JsonRecord): JsonRecord {
+  return snapshotRecord(Object.fromEntries(Object.entries(snapshots).map(([key, snapshot]) => [key, projectCollectionSnapshot(snapshot, project)])));
+}
+
+/**
+ * Builds the core_data files of the bundle from the collected snapshots. Every
+ * dataset is projected to the fields the verdicts read; variables bodies,
+ * credential inputs, tokens, notification configurations, survey defaults,
+ * activity changes, environment dictionaries, and URL userinfo are redacted so
+ * no credential-bearing value reaches the bundle or its zip.
+ */
+export function buildAnsibleCoreDataFiles(
+  access: AnsibleAccessCheckResult,
+  jobHealthData: JobHealthData,
+  hostCoverageData: HostCoverageData,
+  platformData: PlatformSecurityData,
+): Array<[string, unknown]> {
+  return [
+    ["core_data/access.json", { ...access, currentUser: access.currentUser ? projectUser(access.currentUser) : undefined, ping: projectPing(access.ping) }],
+    ["core_data/scope.json", jobHealthData.scope],
+    ["core_data/jobs.json", projectCollectionSnapshot(jobHealthData.jobs, projectJob)],
+    ["core_data/job_settings.json", projectObjectSnapshot(jobHealthData.jobSettings, projectJobSettings)],
+    ["core_data/instance_groups.json", projectCollectionSnapshot(jobHealthData.instanceGroups, (item) => pick(item, INSTANCE_GROUP_FIELDS))],
+    ["core_data/hosts.json", projectCollectionSnapshot(hostCoverageData.hosts, projectHost)],
+    ["core_data/inventory_sources.json", projectCollectionSnapshot(hostCoverageData.inventorySources, projectInventorySource)],
+    ["core_data/job_host_summaries.json", projectCollectionSnapshot(hostCoverageData.hostSummaries, (item) => pick(item, JOB_HOST_SUMMARY_FIELDS))],
+    ["core_data/job_templates.json", projectCollectionSnapshot(hostCoverageData.jobTemplates, projectTemplate)],
+    ["core_data/schedules.json", projectCollectionSnapshot(hostCoverageData.schedules, projectSchedule)],
+    ["core_data/workflow_job_templates.json", projectCollectionSnapshot(hostCoverageData.workflowTemplates, projectTemplate)],
+    ["core_data/organizations.json", projectCollectionSnapshot(platformData.organizations, (item) => pick(item, ORGANIZATION_FIELDS))],
+    ["core_data/organization_admins.json", projectCollectionRecord(platformData.orgAdmins, projectUser)],
+    ["core_data/users.json", projectCollectionSnapshot(platformData.users, projectUser)],
+    ["core_data/user_roles.json", projectCollectionRecord(platformData.userRoles, projectRole)],
+    ["core_data/teams.json", projectCollectionSnapshot(platformData.teams, (item) => pick(item, TEAM_FIELDS))],
+    ["core_data/team_roles.json", projectCollectionRecord(platformData.teamRoles, projectRole)],
+    ["core_data/credentials.json", projectCollectionSnapshot(platformData.credentials, projectCredential)],
+    ["core_data/tokens.json", projectCollectionSnapshot(platformData.tokens, projectToken)],
+    ["core_data/projects.json", projectCollectionSnapshot(platformData.projects, projectProject)],
+    ["core_data/survey_specs.json", snapshotRecord(Object.fromEntries(Object.entries(platformData.surveySpecs).map(([key, snapshot]) => [key, projectObjectSnapshot(snapshot, projectSurveySpec)])))],
+    ["core_data/template_error_notifications.json", projectCollectionRecord(platformData.templateErrorNotifications, projectNotificationTemplate)],
+    ["core_data/inventories.json", projectCollectionSnapshot(platformData.inventories, projectInventory)],
+    ["core_data/groups.json", projectCollectionSnapshot(platformData.groups, projectGroup)],
+    ["core_data/execution_environments.json", projectCollectionSnapshot(platformData.executionEnvironments, (item) => pick(item, EXECUTION_ENVIRONMENT_FIELDS))],
+    ["core_data/notification_templates.json", projectCollectionSnapshot(platformData.notificationTemplates, projectNotificationTemplate)],
+    ["core_data/notifications.json", projectCollectionSnapshot(platformData.notifications, projectNotification)],
+    ["core_data/activity_stream.json", projectCollectionSnapshot(platformData.activity, projectActivity)],
+    ["core_data/settings_authentication.json", projectObjectSnapshot(platformData.authSettings, projectSettings)],
+    ["core_data/settings_system.json", projectObjectSnapshot(platformData.systemSettings, projectSettings)],
+    ["core_data/settings_logging.json", projectObjectSnapshot(platformData.loggingSettings, projectSettings)],
+  ];
 }
 
 export async function exportAnsibleAuditBundle(
@@ -2568,39 +3014,7 @@ export async function exportAnsibleAuditBundle(
   const targetName = safeDirName(`${new URL(config.baseUrl).host}-ansible-aap-audit`);
   const { outputDir, zipPath } = await nextAvailableAuditDir(outputRoot, targetName);
 
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/access.json", access],
-    ["core_data/scope.json", jobHealthData.scope],
-    ["core_data/jobs.json", jobHealthData.jobs],
-    ["core_data/job_settings.json", jobHealthData.jobSettings],
-    ["core_data/instance_groups.json", jobHealthData.instanceGroups],
-    ["core_data/hosts.json", hostCoverageData.hosts],
-    ["core_data/inventory_sources.json", hostCoverageData.inventorySources],
-    ["core_data/job_host_summaries.json", hostCoverageData.hostSummaries],
-    ["core_data/job_templates.json", hostCoverageData.jobTemplates],
-    ["core_data/schedules.json", hostCoverageData.schedules],
-    ["core_data/workflow_job_templates.json", hostCoverageData.workflowTemplates],
-    ["core_data/organizations.json", platformData.organizations],
-    ["core_data/organization_admins.json", snapshotRecord(platformData.orgAdmins)],
-    ["core_data/users.json", platformData.users],
-    ["core_data/user_roles.json", snapshotRecord(platformData.userRoles)],
-    ["core_data/teams.json", platformData.teams],
-    ["core_data/team_roles.json", snapshotRecord(platformData.teamRoles)],
-    ["core_data/credentials.json", platformData.credentials],
-    ["core_data/tokens.json", platformData.tokens],
-    ["core_data/projects.json", platformData.projects],
-    ["core_data/survey_specs.json", snapshotRecord(platformData.surveySpecs)],
-    ["core_data/template_error_notifications.json", snapshotRecord(platformData.templateErrorNotifications)],
-    ["core_data/inventories.json", platformData.inventories],
-    ["core_data/groups.json", platformData.groups],
-    ["core_data/execution_environments.json", platformData.executionEnvironments],
-    ["core_data/notification_templates.json", platformData.notificationTemplates],
-    ["core_data/notifications.json", platformData.notifications],
-    ["core_data/activity_stream.json", platformData.activity],
-    ["core_data/settings_authentication.json", platformData.authSettings],
-    ["core_data/settings_system.json", platformData.systemSettings],
-    ["core_data/settings_logging.json", platformData.loggingSettings],
-  ];
+  const coreDataFiles = buildAnsibleCoreDataFiles(access, jobHealthData, hostCoverageData, platformData);
   for (const [pathName, value] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathName, serializeJson(value));
   }
