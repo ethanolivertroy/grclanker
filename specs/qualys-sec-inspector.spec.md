@@ -3,11 +3,13 @@ slug: "qualys-sec-inspector"
 name: "Qualys Security Inspector"
 vendor: "Qualys"
 category: "vulnerability-application-security"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/qualys-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/qualys-sec-inspector"
+reference_docs: "https://docs.qualys.com/en/vm/api/"
 ---
 
 # qualys-sec-inspector
@@ -15,6 +17,19 @@ source_repo: "https://github.com/hackIDLE/qualys-sec-inspector"
 ## 1. Overview
 
 A security compliance inspection tool for the **Qualys Cloud Platform** that audits vulnerability management configurations, policy compliance profiles, scan coverage, asset group hygiene, authentication records, scanner appliance status, and cloud connector settings. The tool connects to Qualys VM, PC, WAS, GAV, CSAM, and CloudView APIs to evaluate scan scheduling discipline, asset coverage completeness, credential scan ratios, vulnerability SLA adherence, and agent deployment status. Results are output as structured compliance reports mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP controls.
+
+### grclanker implementation
+
+The shipped implementation is native TypeScript inside grclanker (`cli/extensions/grc-tools/qualys.ts`) rather than the standalone Go binary sketched in sections 7 to 9. It registers six read-only tools:
+
+- `qualys_check_access`: probes 14 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS and reports missing modules or roles
+- `qualys_assess_scan_coverage`: controls 1, 2, 3, 14, 16, 20
+- `qualys_assess_asset_inventory`: controls 4, 5, 6, 7, 18
+- `qualys_assess_vulnerability_management`: controls 8, 9, 10, 11, 17
+- `qualys_assess_administration`: controls 12, 13, 15, 19
+- `qualys_export_audit_bundle`: access check plus all four assessments written to `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip archive
+
+Findings are `{id, control, title, severity, status, summary, evidence, mappings[]}` with ids `QUALYS-C01` to `QUALYS-C20` and the framework mappings from section 5. Integration guide: `src/content/docs/docs/integrations/qualys.md`.
 
 ## 2. APIs & SDKs
 
@@ -356,4 +371,31 @@ goreleaser release --snapshot
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+**Implemented in grclanker (TypeScript), 2026-09-21.**
+
+### What shipped
+
+- `cli/extensions/grc-tools/qualys.ts`: configuration resolution (arguments, then `QUALYS_*` environment variables, then `~/.qcrc` or `QUALYS_CONFIG_FILE`), platform ID to API server and gateway mapping for 14 platforms, a `QualysApiClient` with basic auth, pre-issued bearer token, and gateway OAuth modes, the mandatory `X-Requested-With` header, a dependency-free XML parser for VM/PC responses, CSV parsing for the activity log, `WARNING/URL` continuation for XML lists, `ServiceRequest` paging for QPS 2.0 and 3.0 searches, `X-RateLimit-*` and `X-Concurrency-Limit-*` capture with 409/429 retry and backoff, timeouts, and credential redaction in errors.
+- Six registered tools: `qualys_check_access`, `qualys_assess_scan_coverage`, `qualys_assess_asset_inventory`, `qualys_assess_vulnerability_management`, `qualys_assess_administration`, `qualys_export_audit_bundle`. Together the four assessments emit one finding per control for all 20 controls, each carrying the section 5 framework mappings.
+- `cli/tests/qualys.test.mjs`: mocked coverage for configuration precedence, platform mapping, XML and CSV parsing, auth headers, pagination and retry, access check states, every assessment with passing and failing fixtures, the 20-control coverage invariant, bundle layout with zip and error log, output path safety, and tool catalog registration.
+- `cli/scripts/qualys-live-smoke.mjs` wired as `npm --prefix cli run test:qualys:live`; skips with exit 0 when credentials are absent.
+- Integration guide at `src/content/docs/docs/integrations/qualys.md`.
+
+### Deviations from this spec (official documentation wins)
+
+- Option profiles are listed from `/api/2.0/fo/subscription/option_profile/?action=list`, where the VM/PC API user guide documents the option profile list action. The `/api/2.0/fo/scan/option_profile/` path from section 2 is not used.
+- Users are read from the Administration API `POST /qps/rest/2.0/search/am/user/`. Neither `GET /api/2.0/fo/user/` nor the `/msp/` User API from section 2 is used; the `/msp/` paths belong to the API v1 user guide and are not needed for role auditing.
+- Cloud connectors are read from the Asset Management and Tagging API `POST /qps/rest/2.0/search/am/assetdataconnector`, which returns AWS, Azure, and GCP connectors with their state and last sync. The CloudView `/cloudview-api/rest/v1/...` connector endpoints in section 2 are not used.
+- Web applications are searched only through the WAS API `POST /qps/rest/3.0/search/was/webapp`, the version documented in the WAS API user guide. The `/qps/rest/2.0/search/was/webapp` path listed under QPS in section 2 is not used.
+- The OAuth token request goes to the platform API gateway (`https://gateway.<platform>/auth`, for example `https://gateway.qg1.apps.qualys.com/auth`) as documented on the platform identification page, not to `https://qualysapi.qualys.com/auth` as written in section 3.
+- The platform table gained US Platform 4, US Gov Platform 1, EU Platform 3, UK Platform 1, and KSA Platform 1 plus the per-platform gateway hosts from the platform identification page. `QUALYS_PLATFORM` accepts a platform ID (`US1`, `EU2`, ...), the API server hostname from section 3, or a full https URL.
+- Additional documented endpoints used that section 2 does not list: `/api/2.0/fo/asset/host/vm/detection/` (open detections with `LAST_FOUND_DATETIME`, `FIRST_FOUND_DATETIME`, and QDS), `/api/2.0/fo/knowledge_base/vuln/` (patch availability), `/api/2.0/fo/asset/excluded_ip/` (exclusion list), and `/api/2.0/fo/schedule/report/` (scheduled reports).
+
+### What remains
+
+- Control 4 (asset group completeness) is always `manual` because Qualys cannot see the authoritative CMDB or IPAM; the finding supplies asset groups without targets and never-scanned hosts to reconcile.
+- Controls 12 and 19 grade on API evidence but still require human confirmation of report recipients, log retention, and review cadence, which the API does not expose.
+- Output is JSON, markdown, and a zip bundle. The CSV, HTML, SARIF, and Bubble Tea TUI reporters from sections 7 and 8 are not implemented; grclanker's shared workflows cover reporting.
+- There is no per-control filter; controls are grouped into the four assessment tools instead of the `--controls` flag from section 8.
+- CloudView resource evaluations and Policy Compliance posture detail (`/api/2.0/fo/compliance/posture/info/`) are not consumed; control 9 grades policy assignment and status only.
+- The live smoke script has not been run against a real subscription as part of this change.
