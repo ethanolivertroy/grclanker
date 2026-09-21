@@ -20,11 +20,18 @@
     "start": "node dist/index.js",
     "sync:fedramp": "tsx scripts/sync-fedramp.ts",
     "sync:tool-catalog": "npm run build && node scripts/generate-tool-catalog-docs.mjs",
+    "sync:agent-sdk-tools": "npm run build && node scripts/generate-agent-sdk-tools.mjs",
+    "agent-sdk:validate": "agent-sdk validate --dir agent-sdk",
+    "agent-sdk:info": "agent-sdk info --dir agent-sdk",
+    "agent-sdk:dev": "agent-sdk dev agent-sdk --mode single",
+    "agent-sdk:run": "agent-sdk run --dir agent-sdk",
+    "agent-sdk:call": "agent-sdk call --dir agent-sdk",
     "postinstall": "node scripts/patch-embedded-pi.mjs --root .",
     "brand:embedded-pi": "node scripts/patch-embedded-pi.mjs",
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
     "test:cli": "npm run build && node --test \"tests/*.test.mjs\"",
+    "test:agent-sdk:validate": "npm run build && node scripts/agent-sdk-validate-smoke.mjs",
     "test:cloudflare:live": "npm run build && node scripts/cloudflare-live-smoke.mjs",
     "test:duo:live": "npm run build && node scripts/duo-live-smoke.mjs",
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
@@ -75,6 +82,7 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@cursor/july": "0.2.1",
     "@types/archiver": "^8.0.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
