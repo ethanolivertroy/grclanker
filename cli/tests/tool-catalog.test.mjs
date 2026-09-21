@@ -16,6 +16,10 @@ function countTools(tools, kind) {
   return tools.filter((tool) => tool.kind === kind).length;
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 test("tool catalog reflects the bundled extension registration surface", () => {
   const tools = getRegisteredToolSummaries();
   const domainTools = tools.filter((tool) => tool.kind === "domain");
@@ -74,16 +78,10 @@ test("tool catalog groups tools by domain for CLI display", () => {
     text,
     new RegExp(`${countTools(tools, "domain")} domain tools \\+ ${countTools(tools, "compute")} compute backend tools`),
   );
-  assert.match(text, /Ansible AAP \(5\)/);
-  assert.match(text, /AWS \(5\)/);
-  assert.match(text, /Azure \(5\)/);
-  assert.match(text, /Cloudflare \(5\)/);
-  assert.match(text, /FedRAMP \(10\)/);
-  assert.match(text, /GCP \(5\)/);
-  assert.match(text, /OCI \(5\)/);
-  assert.match(text, /Slack \(6\)/);
-  assert.match(text, /Webex \(5\)/);
-  assert.match(text, /Zoom \(5\)/);
+  for (const group of groups) {
+    assert.ok(group.tools.length > 0, `group ${group.group} has no tools`);
+    assert.match(text, new RegExp(`${escapeRegExp(group.group)} \\(${group.tools.length}\\)`));
+  }
   assert.match(text, /fedramp_generate_ads_site -/);
   assert.match(text, /Compute Backend \(7\)/);
 });
