@@ -39,7 +39,7 @@ Config file example (`~/.zoom.json`):
 
 The client exchanges the credentials for a bearer token at `{oauth_base_url}/oauth/token` with `grant_type=account_credentials`, refreshes it before expiry, and sends `Authorization: Bearer` on every call. For Zoom for Government set `base_url` to `https://api.zoomgov.com/v2`; the OAuth host is derived from it unless `oauth_base_url` is set. A pre-issued token can be supplied with `ZOOM_TOKEN` instead of the client credentials.
 
-Pagination follows the [documented `next_page_token` contract](https://developers.zoom.us/docs/api/rest/pagination/) and runs to completion or records truncation when a caller limit stops it (users default 1000, groups 50, operation logs 300, role members 3000). `429` responses are retried up to three times honoring `Retry-After` ([rate limits](https://developers.zoom.us/docs/api/rest/rate-limits/)), capped at 30 seconds per wait.
+Pagination follows the [documented `next_page_token` contract](https://developers.zoom.us/docs/api/rest/pagination/) and runs to completion or records truncation on every cap exit: a caller limit (users default 1000, groups 50, operation logs 300, role members 3000), the 500-page cap, a `next_page_token` that repeats or stops yielding items, or a `total_records` above the collected count. The single-response lists (`/roles`, `/im/groups`, managed domains) are complete only when `total_records` is present and matches; a missing total is reported as an unknown total. `/trusted_domains` documents a single array with no total, so it is complete by contract. Every truncated list demotes its dependent findings to warn with seen versus total counts. `429` responses are retried up to three times honoring `Retry-After` ([rate limits](https://developers.zoom.us/docs/api/rest/rate-limits/)), capped at 30 seconds per wait.
 
 ## Tools
 
@@ -55,15 +55,18 @@ Pagination follows the [documented `next_page_token` contract](https://developer
 
 ```
 <accountId>-audit-bundle[-2, -3, ...]/
-  core_data/            raw snapshots per endpoint (bearer tokens redacted)
+  core_data/            snapshots per endpoint, projected to the fields the verdicts read
   analysis/             findings.json plus identity, collaboration, and meeting summaries
   compliance/           executive_summary.md, unified_compliance_matrix.md, one report per framework
   QUICK_REFERENCE.md
+  metadata.json         non-secret run metadata, including the settings and lock paths that were read
   _errors.log           only when collection partially failed
 <accountId>-audit-bundle[-N].zip
 ```
 
 Reruns allocate `-2`, `-3`, and so on; a prior bundle is never overwritten, and the zip name always derives from the allocated directory. Output paths are resolved through `resolveSecureOutputPath`, which rejects traversal outside the output root and symlinked parents.
+
+Secret hygiene: the bundle never contains credential-bearing values. Every collected surface is sanitized once at collection time, so the tool output, the findings evidence, and the bundle all see the same view: keys that carry credential material (`host_key`, `pmi_password`, tokens, secrets, certificates, API keys) keep their name with a `[REDACTED]` marker, passcode and token query parameters in URLs are blanked, and the Server-to-Server OAuth client id, client secret, and token values are scrubbed from every string and error message. `core_data/account_settings.json` and `account_lock_settings.json` hold only the setting paths a verdict read (listed under `fields_read`), never the full configuration dump; list snapshots hold only the record fields a verdict read, and operation log `operation_detail` free text is dropped. Every written file is scrubbed again before it lands on disk.
 
 ## Control coverage
 
