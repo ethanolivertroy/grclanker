@@ -54,9 +54,12 @@ function sampleConfig(overrides = {}) {
   };
 }
 
+const REASON_PHRASES = { 200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable" };
+
 function jsonResponse(value, options = {}) {
   return new Response(JSON.stringify(value), {
     status: options.status ?? 200,
+    statusText: options.statusText ?? REASON_PHRASES[options.status ?? 200] ?? "",
     headers: {
       "content-type": "application/json",
       ...(options.headers ?? {}),
@@ -120,49 +123,57 @@ function filterRows(rows, query, fixture) {
 
 function fixtureFetch(fixture, options = {}) {
   const calls = [];
+  // Every served response is logged with its status so tests can prove that each status code and
+  // endpoint named anywhere in the output corresponds to a request the run made.
+  const requests = [];
   const forbidden = new Set(options.forbiddenTables ?? []);
   const forbiddenCounts = new Set(options.forbiddenCounts ?? []);
   const forbiddenQueries = options.forbiddenQueries ?? [];
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(String(input));
     calls.push({ url, init });
+    const respond = (response) => {
+      requests.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: response.status });
+      return response;
+    };
     const tableMatch = url.pathname.match(/^\/api\/now\/table\/([^/]+)$/);
     const statsMatch = url.pathname.match(/^\/api\/now\/stats\/([^/]+)$/);
     const table = tableMatch?.[1] ?? statsMatch?.[1];
-    if (options.forbidAll || (table && forbidden.has(table))) return forbiddenResponse();
-    if (statsMatch && forbiddenCounts.has(table)) return forbiddenResponse();
+    if (options.forbidAll || (table && forbidden.has(table))) return respond(forbiddenResponse());
+    if (statsMatch && forbiddenCounts.has(table)) return respond(forbiddenResponse());
     if (tableMatch && forbiddenQueries.some((rule) => rule.table === table && (url.searchParams.get("sysparm_query") ?? "").includes(rule.queryIncludes))) {
-      return forbiddenResponse();
+      return respond(forbiddenResponse());
     }
+    const inflate = options.inflateTotals?.[table] ?? options.inflateTotal ?? 0;
     if (tableMatch) {
       const rows = fixture.tables[table];
-      if (rows === undefined) return jsonResponse({ error: { message: `Invalid table ${table}` } }, { status: 400 });
+      if (rows === undefined) return respond(jsonResponse({ error: { message: `Invalid table ${table}` } }, { status: 400 }));
       const query = url.searchParams.get("sysparm_query") ?? "";
       const matched = filterRows(rows, query, fixture);
       const limit = Number(url.searchParams.get("sysparm_limit") ?? "500");
       const offset = Number(url.searchParams.get("sysparm_offset") ?? "0");
       const page = matched.slice(offset, offset + limit);
-      const headers = options.omitTotalCount ? {} : { "X-Total-Count": String(matched.length + (options.inflateTotal ?? 0)) };
+      const headers = options.omitTotalCount ? {} : { "X-Total-Count": String(matched.length + inflate) };
       if (offset + limit < matched.length) {
         const nextUrl = new URL(url);
         nextUrl.searchParams.set("sysparm_offset", String(offset + limit));
         headers.Link = `<${nextUrl.toString()}>;rel="next"`;
       }
-      return jsonResponse({ result: page }, { headers });
+      return respond(jsonResponse({ result: page }, { headers }));
     }
     if (statsMatch) {
       const explicit = fixture.counts?.[table];
       if (explicit !== undefined) {
-        return jsonResponse({ result: { stats: { count: String(explicit) } } });
+        return respond(jsonResponse({ result: { stats: { count: String(explicit) } } }));
       }
       const rows = fixture.tables[table];
-      if (rows === undefined) return jsonResponse({ error: { message: `Invalid table ${table}` } }, { status: 400 });
+      if (rows === undefined) return respond(jsonResponse({ error: { message: `Invalid table ${table}` } }, { status: 400 }));
       const query = url.searchParams.get("sysparm_query") ?? "";
-      return jsonResponse({ result: { stats: { count: String(filterRows(rows, query, fixture).length + (options.inflateTotal ?? 0)) } } });
+      return respond(jsonResponse({ result: { stats: { count: String(filterRows(rows, query, fixture).length + inflate) } } }));
     }
-    return jsonResponse({ error: { message: "not found" } }, { status: 404 });
+    return respond(jsonResponse({ error: { message: "not found" } }, { status: 404 }));
   };
-  return { fetchImpl, calls };
+  return { fetchImpl, calls, requests };
 }
 
 function createClient(fetchImpl, overrides = {}, sleeps = []) {
@@ -1574,4 +1585,388 @@ test("rule 1 corollary: every multi-inventory finding demotes and names the inve
     }
   }
   assert.equal(checked, 28, "every secondary inventory of every multi-inventory finding was exercised");
+});
+
+/** core_data files written from each Table API dataset, keyed by the table the request reads. */
+const SERVICENOW_TABLE_FILES = {
+  sys_user: ["core_data/sys_user.json"],
+  sys_user_has_role: ["core_data/sys_user_has_role_privileged.json"],
+  sys_user_role_contains: ["core_data/sys_user_role_contains.json"],
+  sys_properties: ["core_data/sys_properties_identity.json", "core_data/sys_properties_hardening.json", "core_data/sys_properties_debug.json", "core_data/sys_properties_mid.json"],
+  password_policy: ["core_data/password_policy.json"],
+  sso_properties: ["core_data/sso_properties.json"],
+  ldap_server_config: ["core_data/ldap_server_config.json"],
+  sys_certificate: ["core_data/sys_certificate.json"],
+  oauth_entity: ["core_data/oauth_entity.json"],
+  multi_factor_criteria: ["core_data/multi_factor_criteria.json"],
+  sys_script: ["core_data/sys_script_eval.json"],
+  ip_access: ["core_data/ip_access.json"],
+  sys_plugins: ["core_data/sys_plugins_ip_authenticator.json", "core_data/sys_plugins.json"],
+  sys_email_account: ["core_data/sys_email_account.json"],
+  sys_security_acl: ["core_data/sys_security_acl.json"],
+  sys_security_acl_role: ["core_data/sys_security_acl_role.json"],
+  sys_public: ["core_data/sys_public.json"],
+  sys_encryption_context: ["core_data/sys_encryption_context.json"],
+  sys_kmf_crypto_module: ["core_data/sys_kmf_crypto_module.json"],
+  sys_dictionary: ["core_data/sys_dictionary_encrypted.json", "core_data/sys_dictionary_audit.json"],
+  sys_update_set: ["core_data/sys_update_set_in_progress.json"],
+  sys_update_xml: ["core_data/sys_update_xml_sensitive.json"],
+  ecc_agent: ["core_data/ecc_agent.json"],
+};
+
+/** core_data files written from each Aggregate API count, keyed by table. */
+const SERVICENOW_COUNT_FILES = {
+  sys_user_role_contains: "core_data/sys_user_role_contains_count.json",
+  sys_security_acl: "core_data/sys_security_acl_count.json",
+  sys_audit: "core_data/sys_audit_count.json",
+  syslog_transaction: "core_data/syslog_transaction_count.json",
+  sys_update_set: "core_data/sys_update_set_count.json",
+};
+
+const SERVICENOW_AREAS = ["identity_access", "platform_hardening", "access_control", "operations_governance"];
+
+function isAbsenceValue(value) {
+  if (value === 0 || value === false) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
+// Objects and arrays of objects are descended so that a per-input or per-table record contributes
+// one leaf per field; arrays of scalars stay leaves.
+function fieldLeaves(value, path, out) {
+  if (Array.isArray(value) && value.length > 0 && value.every((item) => item !== null && typeof item === "object" && !Array.isArray(item))) {
+    value.forEach((item, index) => fieldLeaves(item, `${path}.${index}`, out));
+    return out;
+  }
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    out.set(path, value);
+    return out;
+  }
+  for (const [key, child] of Object.entries(value)) fieldLeaves(child, `${path}.${key}`, out);
+  return out;
+}
+
+function assessmentLeaves(result) {
+  const out = new Map();
+  fieldLeaves(result.summary, `${result.area}.summary`, out);
+  for (const item of result.findings) {
+    out.set(`${item.id}.status`, item.status);
+    out.set(`${item.id}.summary`, item.summary);
+    fieldLeaves(item.evidence ?? {}, `${item.id}.evidence`, out);
+  }
+  return out;
+}
+
+const STATUS_COUNT_KEYS = new Set(["pass", "warn", "fail", "manual"]);
+
+// Every leaf that carried a value in the all-readable baseline must, under a single denial, keep that
+// value, render null, or (for prose) change text. It must never fall to 0, [], {}, or false. A leaf may
+// disappear only when its finding was withheld whole because an input was unread.
+function assertNoDefaultedLeaves(baseline, current, label) {
+  for (const [path, base] of baseline) {
+    const [owner] = path.split(".");
+    if (STATUS_COUNT_KEYS.has(path.split(".").at(-1)) && path.includes(".summary.")) continue;
+    if (!current.has(path)) {
+      const withheld = current.get(`${owner}.status`) === "manual" && /^Verdict unknown:/.test(current.get(`${owner}.summary`) ?? "");
+      assert.ok(withheld, `${label}: leaf ${path} disappeared although ${owner} was not withheld as unread`);
+      continue;
+    }
+    const value = current.get(path);
+    if (base === null || isAbsenceValue(base)) continue;
+    if (typeof base === "string") continue;
+    if (value === null) continue;
+    assert.ok(!isAbsenceValue(value), `${label}: leaf ${path} defaulted from ${JSON.stringify(base)} to ${JSON.stringify(value)}`);
+    assert.deepEqual(value, base, `${label}: leaf ${path} changed from ${JSON.stringify(base)} to ${JSON.stringify(value)} instead of rendering null`);
+  }
+}
+
+function collectStrings(value, out = []) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (value && typeof value === "object") for (const item of Object.values(value)) collectStrings(item, out);
+  return out;
+}
+
+function collectStatusFields(value, out = []) {
+  if (Array.isArray(value)) for (const item of value) collectStatusFields(item, out);
+  else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      if (["status", "status_code", "http_status"].includes(key) && typeof child === "number") out.push(child);
+      collectStatusFields(child, out);
+    }
+  }
+  return out;
+}
+
+// Status codes appear in output as "(403 Forbidden)" or "forbidden (403)"; endpoints as Table API or
+// Aggregate API paths; tables named as failed reads appear as "<table> read was forbidden" or "<table> read failed".
+function mentionedStatusCodes(text) {
+  return [...text.matchAll(/\((\d{3})(?: [A-Za-z]|\))/g)].map((match) => Number(match[1]));
+}
+
+function mentionedEndpoints(text) {
+  return [...text.matchAll(/\/api\/now\/(?:table|stats)\/[A-Za-z0-9_]+/g)].map((match) => match[0]);
+}
+
+function mentionedFailedTables(text) {
+  return [...text.matchAll(/\b([a-z][a-z0-9_]+) read (?:was forbidden|failed)\b/g)].map((match) => match[1]);
+}
+
+function assertMentionsMatchRequests(outputs, requests, label) {
+  const loggedStatuses = new Set(requests.map((request) => request.status));
+  const loggedPaths = new Set(requests.map((request) => request.path));
+  for (const code of collectStatusFields(outputs)) {
+    assert.ok(loggedStatuses.has(code), `${label}: a status field carries HTTP ${code} but no request returned it`);
+  }
+  for (const text of collectStrings(outputs)) {
+    for (const code of mentionedStatusCodes(text)) {
+      assert.ok(loggedStatuses.has(code), `${label}: output names HTTP ${code} but no request returned it: ${text}`);
+    }
+    for (const endpoint of mentionedEndpoints(text)) {
+      assert.ok(loggedPaths.has(endpoint), `${label}: output names ${endpoint} but no request was made to it: ${text}`);
+    }
+    for (const table of mentionedFailedTables(text)) {
+      assert.ok(loggedPaths.has(`/api/now/table/${table}`), `${label}: output names a failed read of ${table} but no request was made to it: ${text}`);
+    }
+  }
+}
+
+function fixtureUserNames(fixture) {
+  return fixture.tables.sys_user.map((row) => row.user_name);
+}
+
+async function exportWithFixture(options = {}, fixture = healthyFixture()) {
+  const base = createTempBase("servicenow-sweep-");
+  const { fetchImpl, requests } = fixtureFetch(fixture, options);
+  const client = createClient(fetchImpl);
+  const result = await exportServicenowAuditBundle(client, sampleConfig(), base);
+  const files = readBundleFiles(result.outputDir);
+  const analysis = SERVICENOW_AREAS.map((area) => JSON.parse(files.get(`analysis/${area}.json`)));
+  const accessCheck = JSON.parse(files.get("core_data/access_check.json"));
+  const payloads = [await checkServicenowAccess(client), ...Object.values(await runAllAssessments(client))];
+  return {
+    result,
+    files,
+    analysis,
+    accessCheck,
+    payloads,
+    requests,
+    fixture,
+    errors: files.get("_errors.log") ?? "",
+    executive: files.get("compliance/executive_summary.md"),
+  };
+}
+
+function assertTableMarker(marker, table, label) {
+  assert.equal(marker.collected, false, `${label}: core_data carries the not-collected marker`);
+  assert.equal(marker.table, table, label);
+  assert.equal(marker.status, 403, `${label}: the marker status is the observed status`);
+  assert.equal(marker.endpoint, `/api/now/table/${table}`, `${label}: the marker endpoint is the requested path`);
+  assert.match(marker.error, /\(403 Forbidden\) for \/api\/now\/table\//, label);
+  assert.ok(!("rows" in marker), `${label}: a denied dataset is never written as a row list`);
+  assert.ok(!("truncated" in marker) && !("partial" in marker), `${label}: a denied dataset carries no collection flags`);
+}
+
+function assertCountMarker(marker, table, label) {
+  assert.equal(marker.collected, false, `${label}: the count file carries the not-collected marker`);
+  assert.equal(marker.status, 403, label);
+  assert.equal(marker.endpoint, `/api/now/stats/${table}`, label);
+  assert.match(marker.error, /\(403 Forbidden\) for \/api\/now\/stats\//, label);
+  assert.ok(!("count" in marker), `${label}: a denied count never carries a count`);
+}
+
+test("collection status, request matching, and denied-list markers: each table and aggregate denied one at a time writes a marker, renders dependent counts null, names no principal from the denied set, and mentions only observed statuses, endpoints, and tables", async () => {
+  const baseline = await exportWithFixture();
+  assert.equal(baseline.result.errorCount, 0);
+  assert.equal(baseline.accessCheck.status, "healthy");
+  for (const item of baseline.analysis) {
+    for (const [name, state] of Object.entries(item.summary.inventories)) {
+      assert.match(state, /: complete \(/, `${item.area}.inventories.${name} must be complete in the baseline: ${state}`);
+    }
+  }
+  for (const [table, files] of Object.entries(SERVICENOW_TABLE_FILES)) {
+    for (const file of files) {
+      const snapshot = JSON.parse(baseline.files.get(file));
+      assert.notEqual(snapshot.collected, false, `${file} is collected in the baseline`);
+      assert.equal(snapshot.table, table);
+      assert.ok(Array.isArray(snapshot.rows), `${file} carries a row list in the baseline`);
+    }
+  }
+  // ldap_server_config and sys_public are served readable but empty, so every run carries datasets that must stay [].
+  assert.deepEqual(JSON.parse(baseline.files.get("core_data/ldap_server_config.json")).rows, []);
+  assert.deepEqual(JSON.parse(baseline.files.get("core_data/sys_public.json")).rows, []);
+  assertMentionsMatchRequests([baseline.analysis, baseline.accessCheck, baseline.payloads, baseline.executive], baseline.requests, "baseline");
+  const baselineLeaves = new Map(baseline.analysis.flatMap((item) => [...assessmentLeaves(item)]));
+  const userNames = fixtureUserNames(baseline.fixture);
+
+  const tables = Object.keys(baseline.fixture.tables);
+  const denials = [
+    ...tables.map((table) => ({ label: `deny table ${table}`, table, options: { forbiddenTables: [table] }, tableDenied: true })),
+    ...Object.keys(SERVICENOW_COUNT_FILES).map((table) => ({ label: `deny count ${table}`, table, options: { forbiddenCounts: [table] }, tableDenied: false })),
+  ];
+  for (const { label, table, options, tableDenied } of denials) {
+    const run = await exportWithFixture(options);
+    const deniedPaths = tableDenied ? [`/api/now/table/${table}`, `/api/now/stats/${table}`] : [`/api/now/stats/${table}`];
+    const denied = run.requests.filter((request) => deniedPaths.includes(request.path));
+    assert.ok(denied.length > 0 && denied.every((request) => request.status === 403), `${label}: the fixture served 403 for the denied requests`);
+
+    if (tableDenied) {
+      for (const file of SERVICENOW_TABLE_FILES[table] ?? []) assertTableMarker(JSON.parse(run.files.get(file)), table, `${label} (${file})`);
+      if (SERVICENOW_COUNT_FILES[table]) assertCountMarker(JSON.parse(run.files.get(SERVICENOW_COUNT_FILES[table])), table, label);
+    } else {
+      assertCountMarker(JSON.parse(run.files.get(SERVICENOW_COUNT_FILES[table])), table, label);
+      for (const file of SERVICENOW_TABLE_FILES[table] ?? []) {
+        assert.ok(Array.isArray(JSON.parse(run.files.get(file)).rows), `${label}: the table read stays a row list when only the aggregate is denied`);
+      }
+    }
+    for (const [otherTable, files] of Object.entries(SERVICENOW_TABLE_FILES)) {
+      if (otherTable === table || (table === "sys_security_acl" && otherTable === "sys_security_acl_role")) continue;
+      for (const file of files) {
+        const snapshot = JSON.parse(run.files.get(file));
+        assert.notEqual(snapshot.collected, false, `${label}: ${file} stays collected`);
+        assert.ok(Array.isArray(snapshot.rows), `${label}: ${file} keeps its row list`);
+      }
+    }
+    if (table !== "ldap_server_config") assert.deepEqual(JSON.parse(run.files.get("core_data/ldap_server_config.json")).rows, [], `${label}: a readable-but-empty dataset keeps []`);
+    if (table !== "sys_public") assert.deepEqual(JSON.parse(run.files.get("core_data/sys_public.json")).rows, [], `${label}: a readable-but-empty dataset keeps []`);
+    if (tableDenied && table === "sys_security_acl") {
+      // No ACL ids were read, so no role lookup was issued: the marker says so and borrows no status code.
+      const roles = JSON.parse(run.files.get("core_data/sys_security_acl_role.json"));
+      assert.equal(roles.collected, false, label);
+      assert.equal(roles.status, null, `${label}: a request that was never made has no status`);
+      assert.equal(roles.endpoint, null, `${label}: a request that was never made has no endpoint`);
+      assert.match(roles.error, /^not requested: the sys_security_acl read failed/);
+      assert.ok(!("pages" in roles));
+      const accessControl = run.analysis.find((item) => item.area === "access_control");
+      assert.match(accessControl.summary.inventories.acl_roles, /^sys_security_acl_role: not requested \(/);
+      const roleInput = findingsById(accessControl).get("SNOW-02").evidence.inputs.find((input) => input.table === "sys_security_acl_role");
+      assert.equal(roleInput.state, "not_requested");
+      assert.equal(roleInput.status_code, null);
+      assert.equal(roleInput.pages, null);
+      assert.ok(run.errors.includes("sys_security_acl_role was not requested"), `${label}: _errors.log states that the lookup was not issued`);
+    }
+
+    const currentLeaves = new Map(run.analysis.flatMap((item) => [...assessmentLeaves(item)]));
+    assertNoDefaultedLeaves(baselineLeaves, currentLeaves, label);
+    const states = run.analysis.flatMap((item) => Object.values(item.summary.inventories));
+    const unread = states.filter((state) => /: unread \(/.test(state));
+    if (tableDenied && SERVICENOW_TABLE_FILES[table]) {
+      assert.ok(unread.some((state) => state.startsWith(`${table}: unread (`)), `${label}: an assessment summary names the unread table`);
+    }
+    if (!tableDenied || SERVICENOW_COUNT_FILES[table]) {
+      assert.ok(unread.some((state) => state.startsWith(`${table} aggregate: unread (`)), `${label}: an assessment summary names the unread aggregate`);
+    }
+    for (const state of unread) assert.match(state, /\(403 Forbidden\) for \/api\/now\//, `${label}: the unread state carries the observed failure`);
+    if (SERVICENOW_TABLE_FILES[table] || SERVICENOW_COUNT_FILES[table]) {
+      assert.match(run.errors, /\(403( Forbidden)?\)/, `${label}: _errors.log names the observed status`);
+      assert.ok(run.errors.includes(table), `${label}: _errors.log names the denied table`);
+      const text = collectStrings([run.analysis, run.errors]);
+      assert.ok(text.flatMap(mentionedStatusCodes).includes(403), `${label}: the scanner sees the 403 the output names`);
+      assert.ok(text.flatMap(mentionedEndpoints).some((endpoint) => deniedPaths.includes(endpoint)), `${label}: the scanner sees the denied path the output names`);
+    }
+    assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors, run.executive], run.requests, label);
+
+    for (const item of run.analysis) {
+      for (const finding of item.findings) {
+        for (const input of finding.evidence.inputs) {
+          if (input.state === "complete") continue;
+          for (const key of ["visible_rows", "total_rows", "truncated", "partial", "total_unknown"]) {
+            if (input.state === "partial") continue;
+            assert.equal(input[key], null, `${label}: ${finding.id} input ${input.table} (${input.state}) renders ${key} null`);
+          }
+        }
+      }
+    }
+
+    const surface = run.accessCheck.surfaces.find((item) => item.table === table);
+    assert.ok(surface, `${label}: the access check probes ${table}`);
+    if (tableDenied) {
+      assert.equal(surface.status, "forbidden", label);
+      assert.equal(surface.http_status, 403, label);
+      assert.ok(!("visible" in surface), `${label}: a forbidden surface carries no visible count`);
+      assert.ok(!("total" in surface), `${label}: a forbidden surface with a failed aggregate carries no total`);
+      assert.match(surface.error, /aggregate count also failed \(ServiceNow request failed \(403 Forbidden\) for \/api\/now\/stats\//);
+    } else {
+      assert.equal(surface.status, "readable", label);
+      assert.ok(!("http_status" in surface), label);
+    }
+
+    if (tableDenied && (table === "sys_user" || table === "sys_user_has_role")) {
+      const text = JSON.stringify([run.analysis, run.payloads.slice(1)]);
+      for (const name of userNames) assert.ok(!text.includes(name), `${label}: ${name} must not be named from the denied inventory`);
+      const identity = run.analysis.find((item) => item.area === "identity_access");
+      assert.equal(identity.summary.admin_users, null, `${label}: summary admin_users renders null`);
+      for (const id of ["SNOW-04", "SNOW-07", "SNOW-14"]) {
+        const finding = findingsById(identity).get(id);
+        assert.equal(finding.status, "manual", label);
+        assert.ok(!("admin_user_names" in finding.evidence) && !("integration_user_names" in finding.evidence), `${label}: ${id} withholds its principal lists`);
+        assert.ok(finding.summary.includes(table), `${label}: ${id} names the unread inventory`);
+      }
+      if (table === "sys_user") {
+        assert.equal(identity.summary.active_users_visible, null);
+        assert.equal(identity.summary.active_users_total, null);
+        assert.equal(run.accessCheck.identity, undefined, `${label}: no identity is claimed when sys_user cannot be read`);
+      } else {
+        assert.equal(identity.summary.active_users_visible, 4);
+        assert.equal(identity.summary.privileged_assignments_visible, null);
+      }
+    }
+    if (tableDenied && table === "sys_properties") {
+      const hardening = run.analysis.find((item) => item.area === "platform_hardening");
+      assert.equal(hardening.summary.hardening_properties_visible, null);
+      assert.equal(hardening.summary.enabled_debug_properties, null, `${label}: a debug property count from a denied read renders null`);
+      assert.ok(hardening.findings.every((finding) => finding.status === "manual"), label);
+    }
+    if (tableDenied && table === "sys_plugins") {
+      const hardening = run.analysis.find((item) => item.area === "platform_hardening");
+      assert.equal(hardening.summary.ip_authenticator_plugin_active, null, `${label}: a plugin flag never defaults to false on a denied read`);
+      assert.equal(run.analysis.find((item) => item.area === "operations_governance").summary.plugins_visible, null);
+    }
+    if (tableDenied && table === "sys_security_acl") {
+      const accessControl = run.analysis.find((item) => item.area === "access_control");
+      for (const key of ["sensitive_acls_visible", "wildcard_acls", "unrestricted_acls"]) {
+        assert.equal(accessControl.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+      assert.equal(accessControl.summary.record_acl_total, null);
+      assert.equal(accessControl.summary.public_pages, 0, `${label}: a readable-but-empty count stays 0`);
+    }
+    if (!tableDenied && table === "sys_audit") {
+      const operations = run.analysis.find((item) => item.area === "operations_governance");
+      assert.equal(operations.summary.audit_rows_last_7_days, null);
+      const audit = findingsById(operations).get("SNOW-10");
+      assert.equal(audit.evidence.audit_rows_last_7_days, null);
+      assert.match(audit.evidence.audit_count_error, /\(403 Forbidden\) for \/api\/now\/stats\/sys_audit/);
+    }
+  }
+});
+
+test("collection status: a partially visible user directory keeps seen and total counts, renders principal counts and lists null, and names no user from the partial set", async () => {
+  const run = await exportWithFixture({ inflateTotals: { sys_user: 2000 } });
+  const users = JSON.parse(run.files.get("core_data/sys_user.json"));
+  assert.equal(users.partial, true);
+  assert.equal(users.total, 2004);
+  assert.equal(users.rows.length, 4);
+  const identity = run.analysis.find((item) => item.area === "identity_access");
+  assert.equal(identity.summary.active_users_visible, 4);
+  assert.equal(identity.summary.active_users_total, 2004);
+  assert.equal(identity.summary.admin_users, null);
+  assert.match(identity.summary.inventories.users, /^sys_user: partial \(sys_user returned 4 of 2004 rows/);
+  const text = JSON.stringify([identity, run.payloads.slice(1)]);
+  for (const name of fixtureUserNames(run.fixture)) assert.ok(!text.includes(name), `${name} must not be named from a partly read directory`);
+  for (const id of ["SNOW-04", "SNOW-07", "SNOW-14"]) {
+    const finding = findingsById(identity).get(id);
+    assert.notEqual(finding.status, "pass", `${id} cannot pass on a partial directory`);
+    assert.match(finding.evidence.principals_withheld, /^sys_user returned 4 of 2004 rows/);
+    assert.match(finding.summary, /withheld because the user (or role )?inventory was not fully read|Partial view/);
+  }
+  const review = findingsById(identity).get("SNOW-04");
+  for (const key of ["admin_users", "admin_user_names", "inactive_users", "inactive_user_count", "locked_out_users", "multi_privileged_users"]) {
+    assert.equal(review.evidence[key], null, `SNOW-04 ${key} renders null on a partial directory`);
+  }
+  assert.equal(review.evidence.active_users, 4, "the seen count stays real");
+  assert.equal(review.evidence.max_admins, 10, "thresholds are never gated");
+  assert.equal(findingsById(identity).get("SNOW-07").evidence.admins_without_user_mfa_flag, null);
+  assert.equal(findingsById(identity).get("SNOW-14").evidence.integration_users, null);
+  assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors, run.executive], run.requests, "partial users");
 });

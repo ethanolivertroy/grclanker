@@ -92,6 +92,10 @@ export interface TableSnapshot {
   error?: string;
   statusCode?: number;
   unavailable?: string;
+  /** Path of the Table API request that was issued for this snapshot; absent when no request was made. */
+  endpoint?: string;
+  /** Set when no request was issued at all, with the reason; the flags and counts on such a snapshot are placeholders. */
+  skipped?: string;
 }
 
 export interface CountResult {
@@ -100,14 +104,67 @@ export interface CountResult {
   count?: number;
   error?: string;
   statusCode?: number;
+  /** Path of the Aggregate API request that was issued; absent when no request was made. */
+  endpoint?: string;
+}
+
+/**
+ * Written to core_data in place of a table or aggregate dataset that was denied, errored, unavailable,
+ * or never requested, so a bundle consumer cannot mistake a denial for an empty inventory. A readable
+ * table with no matching rows keeps its snapshot shape with `rows: []`.
+ */
+export interface NotCollectedMarker {
+  collected: false;
+  table: string;
+  query: string | null;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+  pages?: number;
+}
+
+/** True when a Table API request was issued and answered with rows (possibly none); false for denied, errored, unavailable, or skipped reads. */
+function tableCollected(snapshot: TableSnapshot): boolean {
+  return !snapshot.error && !snapshot.unavailable && !snapshot.skipped;
+}
+
+export function tableCoreData(snapshot: TableSnapshot): TableSnapshot | NotCollectedMarker {
+  if (tableCollected(snapshot)) return snapshot;
+  const reason = snapshot.error
+    ?? (snapshot.skipped ? `not requested: ${snapshot.skipped}` : `table unavailable: ${snapshot.unavailable}`);
+  return {
+    collected: false,
+    table: snapshot.table,
+    query: snapshot.query ?? null,
+    status: snapshot.statusCode ?? null,
+    endpoint: snapshot.endpoint ?? null,
+    error: reason,
+    ...(snapshot.pages > 0 ? { pages: snapshot.pages } : {}),
+  };
+}
+
+export function countCoreData(count: CountResult): CountResult | NotCollectedMarker {
+  if (!count.error) return count;
+  return {
+    collected: false,
+    table: count.table,
+    query: count.query ?? null,
+    status: count.statusCode ?? null,
+    endpoint: count.endpoint ?? null,
+    error: count.error,
+  };
 }
 
 export interface ServicenowAccessSurface {
   name: string;
   table: string;
   status: "readable" | "forbidden" | "acl_filtered" | "not_readable";
+  /** Rows the probe returned; absent when the Table API read was not answered with rows. */
   visible?: number;
+  /** Aggregate count, or the X-Total-Count header when the aggregate failed; absent when neither request answered. */
   total?: number;
+  /** HTTP status the failed Table API probe observed; absent for readable surfaces and non-HTTP failures. */
+  http_status?: number;
   error?: string;
 }
 
@@ -378,6 +435,11 @@ function parseServicenowDate(value: unknown): Date | undefined {
 
 function daysBetween(later: Date, earlier: Date): number {
   return Math.floor((later.getTime() - earlier.getTime()) / 86_400_000);
+}
+
+/** "403 Forbidden", or just "403" when the server (or an HTTP/2 hop) sent no reason phrase. */
+function describeStatus(response: Response): string {
+  return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
 }
 
 function errorMessage(error: unknown): string {
@@ -874,7 +936,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
     if (!response.ok) {
       const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? asString(payload.raw);
       throw new ServicenowApiError(
-        this.redact(`ServiceNow OAuth token request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)})${detail ? `: ${detail}` : ""}`),
         response.status,
         detail,
       );
@@ -943,7 +1005,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
       const detail = servicenowErrorDetail(payload) ?? asString(payload.raw);
       throw new ServicenowApiError(
-        this.redact(`ServiceNow request failed (${response.status} ${response.statusText}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow request failed (${describeStatus(response)}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
         response.status,
         detail,
       );
@@ -959,7 +1021,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
     let truncationReason: string | undefined;
     let currentOffset = 0;
     const visitedUrls = new Set<string>();
-    let url: string | undefined = this.buildUrl(`/api/now/table/${encodeURIComponent(table)}`, {
+    const endpoint = `/api/now/table/${encodeURIComponent(table)}`;
+    let url: string | undefined = this.buildUrl(endpoint, {
       sysparm_query: options.query,
       sysparm_fields: options.fields?.join(","),
       sysparm_limit: pageSize,
@@ -1001,6 +1064,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
         url = nextUrlText;
       }
     } catch (error) {
+      // The in-memory flags on a failed read are placeholders; every rendered surface (core_data,
+      // evidence, summaries) reads them through tableCoreData or snapshotEvidence, which render null.
       return {
         table,
         query: options.query,
@@ -1011,6 +1076,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
         partial: false,
         error: this.redact(errorMessage(error)),
         statusCode: error instanceof ServicenowApiError ? error.status : undefined,
+        endpoint,
       };
     }
 
@@ -1026,24 +1092,27 @@ export class ServicenowApiClient implements ServicenowReadClient {
       ...(truncationReason ? { truncationReason } : {}),
       ...(totalUnknown ? { totalUnknown } : {}),
       partial: truncated || totalUnknown || (total !== undefined && total > rows.length),
+      endpoint,
     };
   }
 
   async countRecords(table: string, query?: string): Promise<CountResult> {
+    const endpoint = `/api/now/stats/${encodeURIComponent(table)}`;
     try {
-      const { payload } = await this.requestJson(this.buildUrl(`/api/now/stats/${encodeURIComponent(table)}`, {
+      const { payload } = await this.requestJson(this.buildUrl(endpoint, {
         sysparm_count: "true",
         sysparm_query: query,
       }));
       const result = asObject(payload.result);
       const stats = asObject(result?.stats);
-      return { table, query, count: asNumber(stats?.count) };
+      return { table, query, count: asNumber(stats?.count), endpoint };
     } catch (error) {
       return {
         table,
         query,
         error: this.redact(errorMessage(error)),
         statusCode: error instanceof ServicenowApiError ? error.status : undefined,
+        endpoint,
       };
     }
   }
@@ -1051,6 +1120,9 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
 function snapshotIssue(snapshot: TableSnapshot): string | undefined {
   if (snapshot.error) {
+    if (snapshot.skipped) {
+      return `${snapshot.table} was not requested (${snapshot.skipped})`;
+    }
     if (snapshot.statusCode === 401 || snapshot.statusCode === 403) {
       return `${snapshot.table} read was forbidden (${snapshot.statusCode})`;
     }
@@ -1066,7 +1138,8 @@ function snapshotIssue(snapshot: TableSnapshot): string | undefined {
  */
 function normalizeMissingTable(snapshot: TableSnapshot, reason: string): TableSnapshot {
   if (snapshot.statusCode === 400 && /invalid table/i.test(snapshot.error ?? "")) {
-    return { ...snapshot, rows: [], error: undefined, statusCode: undefined, truncated: false, partial: false, unavailable: reason };
+    // The observed status code and message are kept so the core_data marker names what the API answered.
+    return { ...snapshot, rows: [], error: undefined, truncated: false, partial: false, unavailable: `${reason} (${snapshot.error})` };
   }
   return snapshot;
 }
@@ -1109,20 +1182,119 @@ function countErrors(label: string, count: CountResult): string[] {
   return count.error ? [`${label}: aggregate count failed (${count.error})`] : [];
 }
 
+type TableState = "complete" | "partial" | "unread" | "unavailable" | "not_requested";
+
+function tableState(snapshot: TableSnapshot): TableState {
+  if (snapshot.skipped) return "not_requested";
+  if (snapshot.error) return "unread";
+  if (snapshot.unavailable) return "unavailable";
+  if (snapshot.partial || visibilityUnproven(snapshot)) return "partial";
+  return "complete";
+}
+
+function describeTable(snapshot: TableSnapshot): string {
+  const state = tableState(snapshot);
+  switch (state) {
+    case "unread":
+      return `${snapshot.table}: unread (${snapshot.error})`;
+    case "not_requested":
+      return `${snapshot.table}: not requested (${snapshot.skipped})`;
+    case "unavailable":
+      return `${snapshot.table}: unavailable (${snapshot.unavailable})`;
+    case "partial":
+      return `${snapshot.table}: partial (${snapshotPartialNote(snapshot) ?? "visible rows are not the full population"})`;
+    case "complete":
+      return `${snapshot.table}: complete (${snapshot.rows.length} row${snapshot.rows.length === 1 ? "" : "s"}${snapshot.total !== undefined ? ` of ${snapshot.total}` : ""})`;
+    default: {
+      const exhaustive: never = state;
+      throw new Error(`Unhandled table state ${String(exhaustive)}`);
+    }
+  }
+}
+
+function describeCount(count: CountResult): string {
+  if (count.error) return `${count.table} aggregate: unread (${count.error})`;
+  if (count.count === undefined) return `${count.table} aggregate: unread (no count returned)`;
+  return `${count.table} aggregate: complete (${count.count})`;
+}
+
+/** True when every listed snapshot was read without error and its visible rows are the whole population. */
+function tablesComplete(snapshots: TableSnapshot[]): boolean {
+  return snapshots.every((snapshot) => tableState(snapshot) === "complete");
+}
+
+function tablesReadable(snapshots: TableSnapshot[]): boolean {
+  return snapshots.every((snapshot) => !snapshot.error);
+}
+
+function isAbsenceValue(value: unknown): boolean {
+  if (value === 0) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value as object).length === 0;
+  return false;
+}
+
+/**
+ * A count, list, or map derived from one or more table reads. It renders null when any source was not
+ * read, and null when a source is partial or unavailable and the value would assert absence (0, [], {}),
+ * because a partly read inventory cannot prove that nothing exists.
+ */
+function derived<T>(value: T, ...snapshots: TableSnapshot[]): T | null {
+  if (!tablesReadable(snapshots)) return null;
+  if (!tablesComplete(snapshots) && isAbsenceValue(value)) return null;
+  return value;
+}
+
+/** A boolean observation: true is a positive sighting from any read; false is an absence claim that needs a complete read. */
+function derivedFlag(value: boolean, ...snapshots: TableSnapshot[]): boolean | null {
+  if (!tablesReadable(snapshots)) return null;
+  if (!value && !tablesComplete(snapshots)) return null;
+  return value;
+}
+
+/** The number of rows read is meaningful whenever the table was read at all; it is null when it was not. */
+function visibleRows(snapshot: TableSnapshot): number | null {
+  return tableCollected(snapshot) ? snapshot.rows.length : null;
+}
+
+/** An X-Total-Count or aggregate total is reported only when the request that carries it was answered. */
+function totalRows(snapshot: TableSnapshot): number | null {
+  return tableCollected(snapshot) ? snapshot.total ?? null : null;
+}
+
+function countValue(count: CountResult): number | null {
+  return count.error ? null : count.count ?? null;
+}
+
+/** A count of principals holding or lacking a property, unknown unless every proving table was fully read. */
+function principalCount(value: number, ...snapshots: TableSnapshot[]): number | null {
+  return tablesComplete(snapshots) ? value : null;
+}
+
+/**
+ * Collection metadata for one input table. Counts and flags are real only when the read was answered
+ * with rows; a denied, errored, unavailable, or skipped read renders every one of them null so a
+ * consumer cannot mistake a placeholder `truncated: false` or `visible_rows: 0` for an observation.
+ */
 function snapshotEvidence(snapshot: TableSnapshot): JsonRecord {
+  const listed = tableCollected(snapshot);
   return {
     table: snapshot.table,
     query: snapshot.query ?? null,
-    visible_rows: snapshot.rows.length,
-    total_rows: snapshot.total ?? null,
-    pages: snapshot.pages,
-    truncated: snapshot.truncated,
+    state: tableState(snapshot),
+    visible_rows: listed ? snapshot.rows.length : null,
+    total_rows: listed ? snapshot.total ?? null : null,
+    // Pages read before a failure are an observation; zero pages on a read that was not answered is not.
+    pages: listed || snapshot.pages > 0 ? snapshot.pages : null,
+    truncated: listed ? snapshot.truncated : null,
     truncation_reason: snapshot.truncationReason ?? null,
-    total_unknown: snapshot.totalUnknown ?? false,
-    partial: snapshot.partial,
+    total_unknown: listed ? snapshot.totalUnknown ?? false : null,
+    partial: listed ? snapshot.partial : null,
     error: snapshot.error ?? null,
     status_code: snapshot.statusCode ?? null,
+    endpoint: snapshot.endpoint ?? null,
     unavailable: snapshot.unavailable ?? null,
+    skipped: snapshot.skipped ?? null,
   };
 }
 
@@ -1131,6 +1303,29 @@ interface Evaluation {
   summary: string;
   evidence?: JsonRecord;
   manualEvidence?: string;
+  /**
+   * Lists that name principals (users, accounts, integrations) as holding or lacking a property, and
+   * counts of such principals. They are emitted only when every input was read to completion; a partial
+   * input renders each of them null and `principals_withheld` names the inventory that was not fully read.
+   */
+  principals?: Record<string, unknown[] | number>;
+  /** Thresholds and options echoed into evidence verbatim; they describe the run, not the tenant, so they are never gated. */
+  parameters?: JsonRecord;
+}
+
+/** Under a partial read, evidence values that assert absence (0, [], {}) render null because the missing rows could hold the item. */
+function withoutAbsenceClaims(evidence: JsonRecord | undefined, complete: boolean): JsonRecord {
+  if (!evidence) return {};
+  if (complete) return evidence;
+  return Object.fromEntries(Object.entries(evidence).map(([key, value]) => [key, isAbsenceValue(value) ? null : value]));
+}
+
+function gatedPrincipals(principals: Record<string, unknown[] | number> | undefined, complete: boolean, partialNotes: string[]): JsonRecord {
+  if (!principals) return {};
+  const gated: JsonRecord = {};
+  for (const [key, value] of Object.entries(principals)) gated[key] = complete ? value : null;
+  gated.principals_withheld = complete ? null : partialNotes.join("; ");
+  return gated;
 }
 
 function finding(controlNumber: number, evaluation: Evaluation): ServicenowFinding {
@@ -1172,8 +1367,14 @@ function gatedFinding(
 
   const evaluation = evaluate();
   const partialNotes = inputs.map(snapshotPartialNote).filter((item): item is string => Boolean(item));
-  const evidence = { ...inputEvidence, ...(evaluation.evidence ?? {}) };
-  if (partialNotes.length === 0) {
+  const complete = partialNotes.length === 0;
+  const evidence = {
+    ...inputEvidence,
+    ...(evaluation.parameters ?? {}),
+    ...withoutAbsenceClaims(evaluation.evidence, complete),
+    ...gatedPrincipals(evaluation.principals, complete, partialNotes),
+  };
+  if (complete) {
     return finding(controlNumber, { ...evaluation, evidence, manualEvidence: evaluation.manualEvidence ?? (evaluation.status === "manual" ? manualEvidence : undefined) });
   }
 
@@ -1574,12 +1775,11 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const adminsWithoutLoginDate = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "") && !parseServicenowDate(user.last_login_time)).map(userLabel);
     const lockedOut = users.filter((user) => rowBoolean(user, "locked_out") === true);
     const lockedOutAdmins = lockedOut.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "")).map(userLabel);
-    const evidence: JsonRecord = {
-      active_users: users.length,
+    const evidence: JsonRecord = { active_users: users.length };
+    const parameters: JsonRecord = { max_admins: data.maxAdmins, inactive_days: data.inactiveDays };
+    const principals: Evaluation["principals"] = {
       admin_users: elevatedUserIds.size,
       admin_user_names: truncateList(elevatedUserNames),
-      max_admins: data.maxAdmins,
-      inactive_days: data.inactiveDays,
       inactive_users: truncateList(stale),
       inactive_user_count: stale.length,
       users_without_last_login: truncateList(neverLoggedIn),
@@ -1591,24 +1791,40 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       locked_out_admins: lockedOutAdmins,
       multi_privileged_users: truncateList(multiPrivilegedUsers.map(([user, roles]) => ({ user, roles: [...roles] }))),
     };
+    // Counts of principals are stated only when both inventories were read to completion; a partial
+    // read reports what was observed without a number or a name, since the missing rows could change both.
+    const complete = tablesComplete([data.users, data.privilegedAssignments]);
+    const withheld = "exact counts and names are withheld because the user inventory was not fully read";
     if (staleAdmins.length > 0 || elevatedUserIds.size > data.maxAdmins) {
       return {
         status: "fail",
-        summary: `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active; ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins).`,
+        summary: complete
+          ? `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active; ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins).`
+          : `Among the visible rows, ${staleAdmins.length > 0 ? `an admin or security_admin holder has not logged in for ${data.inactiveDays}+ days` : `more than ${data.maxAdmins} active users hold admin or security_admin`}; ${withheld}.`,
         evidence,
+        parameters,
+        principals,
       };
     }
     if (stale.length > 0 || neverLoggedIn.length > 0 || adminsWithoutLoginDate.length > 0 || multiPrivilegedUsers.length > 0 || lockedOut.length > 0) {
       return {
         status: "warn",
-        summary: `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins; review or deactivate them), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`,
+        summary: complete
+          ? `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins; review or deactivate them), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`
+          : `Among the visible rows, accounts that are inactive for ${data.inactiveDays}+ days, have no last login date, are locked out, or hold multiple privileged roles were observed; ${withheld}.`,
         evidence,
+        parameters,
+        principals,
       };
     }
     return {
       status: "pass",
-      summary: `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, no active account is locked out, and no user stacks multiple privileged roles.`,
+      summary: complete
+        ? `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, no active account is locked out, and no user stacks multiple privileged roles.`
+        : `No inactive, never-logged-in, locked-out, or multi-privileged account was observed among the visible rows and the visible admin holders are within the threshold of ${data.maxAdmins}, but the user inventory was not fully read, so the population is unknown.`,
       evidence,
+      parameters,
+      principals,
     };
   });
 
@@ -1695,13 +1911,23 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const evidence: JsonRecord = {
       glide_authenticate_multifactor: enabled.exists ? enabled.value : null,
       email_otp_enabled: emailOtp.exists ? emailOtp.value : null,
-      admin_users: admins.length,
-      admins_without_user_mfa_flag: truncateList(adminsWithoutFlag),
       multi_factor_criteria: truncateList(criteria),
       role_based_criteria_active: activeRoleBased.length > 0,
       role_based_criteria_roles: enforcedRoles,
       elevated_roles_covered_by_criteria: elevatedCovered,
     };
+    const principals: Evaluation["principals"] = {
+      admin_users: admins.length,
+      admins_without_user_mfa_flag: truncateList(adminsWithoutFlag),
+    };
+    // Admin ratios are stated only from a complete read; a partial user or role read reports the observation without numbers.
+    const complete = tablesComplete([data.users, data.privilegedAssignments]);
+    const unflaggedAdmins = complete
+      ? `${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn`
+      : "visible admin users without enable_multifactor_authn were observed (counts withheld because the user inventory was not fully read)";
+    const allAdminsFlagged = complete
+      ? `all ${admins.length} admin users carry enable_multifactor_authn`
+      : "every visible admin user carries enable_multifactor_authn (counts withheld because the user inventory was not fully read)";
     if (!enabled.exists || asBoolean(enabled.value) !== true) {
       return {
         status: "fail",
@@ -1709,6 +1935,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
           ? `glide.authenticate.multifactor=${enabled.value}; platform MFA is disabled.`
           : "glide.authenticate.multifactor has no sys_properties row; the documented default is false, so platform MFA is not enabled.",
         evidence,
+        principals,
       };
     }
     if (criteria.length === 0) {
@@ -1716,6 +1943,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         status: "manual",
         summary: `glide.authenticate.multifactor=true, but no ${MFA_CRITERIA_TABLE} rows were visible; the baseline Role-based multi-factor authentication record always exists, so the credential cannot read the enforcement criteria and enforcement is unknown.`,
         evidence,
+        principals,
       };
     }
     if (admins.length === 0) {
@@ -1723,20 +1951,23 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         status: "manual",
         summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is ${activeRoleBased.length > 0 ? "active" : "inactive"}, but no admin users were visible to verify enforcement.`,
         evidence,
+        principals,
       };
     }
     if (activeRoleBased.length === 0 && !userEnforced) {
       return {
         status: "fail",
-        summary: `glide.authenticate.multifactor=true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn, so MFA is not enforced for administrators.`,
+        summary: `glide.authenticate.multifactor=true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${unflaggedAdmins}, so MFA is not enforced for administrators.`,
         evidence,
+        principals,
       };
     }
     if (activeRoleBased.length === 0) {
       return {
         status: "warn",
-        summary: `glide.authenticate.multifactor=true and all ${admins.length} admin users carry enable_multifactor_authn, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
+        summary: `glide.authenticate.multifactor=true and ${allAdminsFlagged}, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
         evidence,
+        principals,
       };
     }
     if (!roleEnforced && !userEnforced) {
@@ -1745,25 +1976,32 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         : "its Multi-factor Roles list was not returned by the Table API";
       return {
         status: "warn",
-        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn; confirm admin and security_admin are enforced.`,
+        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${unflaggedAdmins}; confirm admin and security_admin are enforced.`,
         evidence,
+        principals,
       };
     }
     const enforcement = roleEnforced
       ? `the Role-based multi-factor authentication criteria record is active and covers ${elevatedCovered.join(" and ")}`
       : "the Role-based multi-factor authentication criteria record is active";
-    const perUser = userEnforced ? `; all ${admins.length} admin users also carry enable_multifactor_authn` : "";
+    const perUser = userEnforced
+      ? complete
+        ? `; all ${admins.length} admin users also carry enable_multifactor_authn`
+        : "; every visible admin user also carries enable_multifactor_authn (counts withheld because the user inventory was not fully read)"
+      : "";
     if (emailOtp.exists && asBoolean(emailOtp.value) === true) {
       return {
         status: "warn",
         summary: `MFA is enforced for administrators (${enforcement}${perUser}), but email OTP is enabled as a factor; ServiceNow hardening guidance treats email as a weak factor.`,
         evidence,
+        principals,
       };
     }
     return {
       status: "pass",
       summary: `glide.authenticate.multifactor=true and MFA is enforced for administrators: ${enforcement}${perUser}.`,
       evidence,
+      principals,
     };
   });
 
@@ -1831,17 +2069,25 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     const integrationWithAdmin = assignments.filter((row) => assignmentIsIntegration(row) && ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? "")).map(userLabel);
     const integrationWithPrivilege = assignments.filter(assignmentIsIntegration).map((row) => `${userLabel(row)}:${rowString(row, "role.name") ?? "role"}`);
     const evidence: JsonRecord = {
+      oauth_entities: data.oauthEntities.rows.length,
+    };
+    const principals: Evaluation["principals"] = {
       integration_users: integration.length,
       integration_user_names: truncateList(integration.map(userLabel)),
       integration_users_with_admin: [...new Set(integrationWithAdmin)],
       integration_privileged_assignments: truncateList([...new Set(integrationWithPrivilege)]),
-      oauth_entities: data.oauthEntities.rows.length,
     };
+    const complete = tablesComplete([data.users, data.privilegedAssignments, data.oauthEntities]);
+    const withheld = "counts and names are withheld because the user or role inventory was not fully read";
     if (integrationWithAdmin.length > 0) {
+      const names = [...new Set(integrationWithAdmin)];
       return {
         status: "fail",
-        summary: `${new Set(integrationWithAdmin).size} integration accounts hold admin or security_admin: ${[...new Set(integrationWithAdmin)].join(", ")}.`,
+        summary: complete
+          ? `${names.length} integration accounts hold admin or security_admin: ${names.join(", ")}.`
+          : `Among the visible rows, integration accounts hold admin or security_admin; ${withheld}.`,
         evidence,
+        principals,
       };
     }
     if (integration.length === 0) {
@@ -1849,19 +2095,26 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         status: "manual",
         summary: `No active user is flagged web_service_access_only or internal_integration_user although ${data.oauthEntities.rows.length} OAuth application registry entries exist; integrations may be running under interactive accounts, which cannot be told apart through the API.`,
         evidence,
+        principals,
       };
     }
     if (integrationWithPrivilege.length > 0) {
       return {
         status: "warn",
-        summary: `${integration.length} integration accounts exist and none hold admin, but ${new Set(integrationWithPrivilege).size} privileged assignments (${PRIVILEGED_ROLE_NAMES.join(", ")}) belong to integration accounts.`,
+        summary: complete
+          ? `${integration.length} integration accounts exist and none hold admin, but ${new Set(integrationWithPrivilege).size} privileged assignments (${PRIVILEGED_ROLE_NAMES.join(", ")}) belong to integration accounts.`
+          : `Among the visible rows, no integration account holds admin, but privileged assignments (${PRIVILEGED_ROLE_NAMES.join(", ")}) belong to integration accounts; ${withheld}.`,
         evidence,
+        principals,
       };
     }
     return {
       status: "pass",
-      summary: `${integration.length} integration accounts are flagged web service or internal integration users and none hold a privileged role.`,
+      summary: complete
+        ? `${integration.length} integration accounts are flagged web service or internal integration users and none hold a privileged role.`
+        : `No visible integration account holds a privileged role, but the user or role inventory was not fully read, so the population is unknown.`,
       evidence,
+      principals,
     };
   });
 
@@ -1870,13 +2123,26 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     area: "identity_access",
     title: "ServiceNow identity and access",
     summary: {
-      active_users_visible: users.length,
-      active_users_total: data.users.total ?? null,
-      admin_users: elevatedUserIds.size,
-      privileged_assignments_visible: assignments.length,
-      roles_inheriting_admin: data.roleInheritance.rows.length,
-      active_sso_providers: data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true).length,
-      active_ldap_servers: data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true).length,
+      active_users_visible: visibleRows(data.users),
+      active_users_total: totalRows(data.users),
+      admin_users: principalCount(elevatedUserIds.size, data.users, data.privilegedAssignments),
+      privileged_assignments_visible: visibleRows(data.privilegedAssignments),
+      roles_inheriting_admin: derived(data.roleInheritance.rows.length, data.roleInheritance),
+      active_sso_providers: derived(data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true).length, data.ssoProviders),
+      active_ldap_servers: derived(data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true).length, data.ldapServers),
+      inventories: {
+        users: describeTable(data.users),
+        privileged_assignments: describeTable(data.privilegedAssignments),
+        role_inheritance: describeTable(data.roleInheritance),
+        role_inheritance_total: describeCount(data.roleInheritanceTotal),
+        properties: describeTable(data.properties),
+        password_policies: describeTable(data.passwordPolicies),
+        sso_providers: describeTable(data.ssoProviders),
+        ldap_servers: describeTable(data.ldapServers),
+        certificates: describeTable(data.certificates),
+        oauth_entities: describeTable(data.oauthEntities),
+        mfa_criteria: describeTable(data.mfaCriteria),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2174,12 +2440,20 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     area: "platform_hardening",
     title: "ServiceNow platform hardening",
     summary: {
-      hardening_properties_visible: data.properties.rows.length,
+      hardening_properties_visible: visibleRows(data.properties),
       hardening_properties_expected: HARDENING_PROPERTY_QUERY_NAMES.length,
-      enabled_debug_properties: data.debugProperties.rows.length,
-      business_rules_using_eval: data.evalScripts.rows.length,
-      active_ip_access_rules: data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false).length,
-      ip_authenticator_plugin_active: data.ipAuthenticatorPlugin.rows.some((row) => pluginActive(row) === true),
+      enabled_debug_properties: derived(data.debugProperties.rows.length, data.debugProperties),
+      business_rules_using_eval: derived(data.evalScripts.rows.length, data.evalScripts),
+      active_ip_access_rules: derived(data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false).length, data.ipAccessRules),
+      ip_authenticator_plugin_active: derivedFlag(data.ipAuthenticatorPlugin.rows.some((row) => pluginActive(row) === true), data.ipAuthenticatorPlugin),
+      inventories: {
+        properties: describeTable(data.properties),
+        debug_properties: describeTable(data.debugProperties),
+        eval_scripts: describeTable(data.evalScripts),
+        ip_access_rules: describeTable(data.ipAccessRules),
+        ip_authenticator_plugin: describeTable(data.ipAuthenticatorPlugin),
+        email_accounts: describeTable(data.emailAccounts),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2234,10 +2508,24 @@ export async function collectServicenowAccessControlData(
   const rawAcls = await client.queryTable("sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
   const acls: TableSnapshot = { ...rawAcls, rows: rawAcls.rows.map(projectAclRow) };
   const aclIds = acls.rows.map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
+  // The role lookup is keyed on the ACL ids that were read. Without ids no request is issued, and the
+  // placeholder snapshot says so instead of borrowing the status code of the sys_security_acl read.
+  const skippedRoles = (reason: string, failed: boolean): TableSnapshot => ({
+    table: "sys_security_acl_role",
+    query: "sys_security_aclIN",
+    rows: [],
+    pages: 0,
+    truncated: false,
+    partial: false,
+    skipped: reason,
+    ...(failed ? { error: `not requested: ${reason}` } : {}),
+  });
   const [aclRoles, aclTotal, publicPages] = await Promise.all([
     aclIds.length > 0
       ? client.queryTable("sys_security_acl_role", { query: `sys_security_aclIN${aclIds.join(",")}`, fields: ACL_ROLE_FIELDS, limit: recordLimit })
-      : Promise.resolve<TableSnapshot>({ table: "sys_security_acl_role", query: "sys_security_aclIN", rows: [], pages: 0, truncated: false, partial: false, ...(acls.error ? { error: `skipped because ${acls.table} failed`, statusCode: acls.statusCode } : {}) }),
+      : Promise.resolve(acls.error
+        ? skippedRoles(`the ${acls.table} read failed, so there were no ACL ids to look up`, true)
+        : skippedRoles(`the ${acls.table} read returned no rows, so there were no ACL ids to look up`, false)),
     client.countRecords("sys_security_acl", "active=true^type=record"),
     client.queryTable("sys_public", { query: "active=true", fields: ["sys_id", "page", "active", "sys_updated_on"], limit: recordLimit }),
   ]);
@@ -2323,6 +2611,8 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
 
   const tableLevel = gatedFinding(11, [data.acls, data.aclRoles], `Open System Security > Access Control (ACL) and confirm read, write, and delete record ACLs with roles exist for ${SENSITIVE_ACL_TABLES.join(", ")}.`, () => {
     const proven = data.aclTotal.count;
+    // Per-table "no ACL" and "missing operation" claims are absence claims; on a partial ACL read they render null.
+    const complete = tablesComplete([data.acls, data.aclRoles]);
     const coverage = SENSITIVE_ACL_TABLES.map((table) => {
       const rows = described.filter((item) => item.name === table || item.name.startsWith(`${table}.`));
       const operations = new Set(rows.map((item) => item.operation));
@@ -2335,7 +2625,14 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
         role_protected_acls: roleProtected,
       };
     });
-    const evidence: JsonRecord = { record_acl_total: proven ?? null, sensitive_table_coverage: coverage };
+    const coverageEvidence = coverage.map((item) => ({
+      table: item.table,
+      acls: complete || item.acls > 0 ? item.acls : null,
+      operations: complete || item.operations.length > 0 ? item.operations : null,
+      missing_operations: complete ? item.missing_operations : null,
+      role_protected_acls: complete || item.role_protected_acls > 0 ? item.role_protected_acls : null,
+    }));
+    const evidence: JsonRecord = { record_acl_total: proven ?? null, sensitive_table_coverage: coverageEvidence };
     if (data.aclTotal.error || proven === undefined || proven === 0) {
       return {
         status: "manual",
@@ -2371,11 +2668,17 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
     area: "access_control",
     title: "ServiceNow access control",
     summary: {
-      record_acl_total: data.aclTotal.count ?? null,
-      sensitive_acls_visible: described.length,
-      wildcard_acls: wildcard.length,
-      unrestricted_acls: unrestricted.length,
-      public_pages: data.publicPages.rows.length,
+      record_acl_total: countValue(data.aclTotal),
+      sensitive_acls_visible: visibleRows(data.acls),
+      wildcard_acls: derived(wildcard.length, data.acls),
+      unrestricted_acls: derived(unrestricted.length, data.acls, data.aclRoles),
+      public_pages: derived(data.publicPages.rows.length, data.publicPages),
+      inventories: {
+        acls: describeTable(data.acls),
+        acl_roles: describeTable(data.aclRoles),
+        acl_total: describeCount(data.aclTotal),
+        public_pages: describeTable(data.publicPages),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2667,13 +2970,27 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     area: "operations_governance",
     title: "ServiceNow operations governance",
     summary: {
-      encryption_contexts: data.encryptionContexts.rows.length,
-      crypto_modules: data.cryptoModules.rows.length,
-      encrypted_fields: data.encryptedFields.rows.length,
-      audit_rows_last_7_days: data.recentAuditCount.count ?? null,
-      update_sets_in_progress: data.updateSetsInProgress.rows.length,
-      mid_servers: data.midServers.rows.length,
-      plugins_visible: data.plugins.rows.length,
+      encryption_contexts: derived(data.encryptionContexts.rows.length, data.encryptionContexts),
+      crypto_modules: derived(data.cryptoModules.rows.length, data.cryptoModules),
+      encrypted_fields: derived(data.encryptedFields.rows.length, data.encryptedFields),
+      audit_rows_last_7_days: countValue(data.recentAuditCount),
+      update_sets_in_progress: derived(data.updateSetsInProgress.rows.length, data.updateSetsInProgress),
+      mid_servers: derived(data.midServers.rows.length, data.midServers),
+      plugins_visible: visibleRows(data.plugins),
+      inventories: {
+        encryption_contexts: describeTable(data.encryptionContexts),
+        crypto_modules: describeTable(data.cryptoModules),
+        encrypted_fields: describeTable(data.encryptedFields),
+        audit_dictionary: describeTable(data.auditDictionary),
+        recent_audit_count: describeCount(data.recentAuditCount),
+        recent_transaction_count: describeCount(data.recentTransactionCount),
+        update_sets_in_progress: describeTable(data.updateSetsInProgress),
+        update_set_total: describeCount(data.updateSetTotal),
+        sensitive_update_xml: describeTable(data.sensitiveUpdateXml),
+        mid_servers: describeTable(data.midServers),
+        mid_properties: describeTable(data.properties),
+        plugins: describeTable(data.plugins),
+      },
       status_counts: summarizeFindingStatuses(findings),
     },
     findings,
@@ -2734,8 +3051,9 @@ async function probeSurface(
       name: surface.name,
       table: surface.table,
       status: snapshot.statusCode === 401 || snapshot.statusCode === 403 ? "forbidden" : "not_readable",
-      total,
-      error: snapshot.error,
+      ...(total !== undefined ? { total } : {}),
+      ...(snapshot.statusCode !== undefined ? { http_status: snapshot.statusCode } : {}),
+      error: count.error ? `${snapshot.error}; aggregate count also failed (${count.error})` : snapshot.error,
     };
   }
   if (snapshot.rows.length === 0 && total !== undefined && total > 0) {
@@ -2959,9 +3277,9 @@ function buildQuickReference(): string {
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw Table API and Aggregate API snapshots (rows, X-Total-Count, pagination, and errors)",
+    "- `core_data/`: projected Table API and Aggregate API snapshots (rows, X-Total-Count, pagination); a dataset that was denied, errored, unavailable, or never requested is written as `{ collected: false, status, endpoint, error }` instead of an empty row list, so `rows: []` always means a readable table with no matching rows",
     "- `analysis/findings.json`: normalized findings with framework mappings",
-    "- `analysis/<area>.json`: per-area assessment results and collection issues",
+    "- `analysis/<area>.json`: per-area assessment results, an `inventories` map stating each table read as complete, partial, unread, unavailable, or not requested, and collection issues; counts derived from an unread or partial table render null",
     "- `analysis/summary.json`: status counts and run metadata",
     "- `compliance/executive_summary.md`: prioritized findings and manual evidence list",
     "- `compliance/unified_compliance_matrix.md`: all controls against all frameworks",
@@ -3001,41 +3319,43 @@ export async function exportServicenowAuditBundle(
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.instanceName)}-audit-bundle`);
 
+  // Every table or aggregate dataset passes through tableCoreData or countCoreData, so a denied, errored,
+  // unavailable, or skipped read is written as a not-collected marker rather than as an empty snapshot.
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
-    ["core_data/sys_user.json", identityData.users],
-    ["core_data/sys_user_has_role_privileged.json", identityData.privilegedAssignments],
-    ["core_data/sys_user_role_contains.json", identityData.roleInheritance],
-    ["core_data/sys_user_role_contains_count.json", identityData.roleInheritanceTotal],
-    ["core_data/sys_properties_identity.json", identityData.properties],
-    ["core_data/password_policy.json", identityData.passwordPolicies],
-    ["core_data/sso_properties.json", identityData.ssoProviders],
-    ["core_data/ldap_server_config.json", identityData.ldapServers],
-    ["core_data/sys_certificate.json", identityData.certificates],
-    ["core_data/oauth_entity.json", identityData.oauthEntities],
-    ["core_data/multi_factor_criteria.json", identityData.mfaCriteria],
-    ["core_data/sys_properties_hardening.json", hardeningData.properties],
-    ["core_data/sys_properties_debug.json", hardeningData.debugProperties],
-    ["core_data/sys_script_eval.json", hardeningData.evalScripts],
-    ["core_data/ip_access.json", hardeningData.ipAccessRules],
-    ["core_data/sys_plugins_ip_authenticator.json", hardeningData.ipAuthenticatorPlugin],
-    ["core_data/sys_email_account.json", hardeningData.emailAccounts],
-    ["core_data/sys_security_acl.json", accessControlData.acls],
-    ["core_data/sys_security_acl_role.json", accessControlData.aclRoles],
-    ["core_data/sys_security_acl_count.json", accessControlData.aclTotal],
-    ["core_data/sys_public.json", accessControlData.publicPages],
-    ["core_data/sys_encryption_context.json", operationsData.encryptionContexts],
-    ["core_data/sys_kmf_crypto_module.json", operationsData.cryptoModules],
-    ["core_data/sys_dictionary_encrypted.json", operationsData.encryptedFields],
-    ["core_data/sys_dictionary_audit.json", operationsData.auditDictionary],
-    ["core_data/sys_audit_count.json", operationsData.recentAuditCount],
-    ["core_data/syslog_transaction_count.json", operationsData.recentTransactionCount],
-    ["core_data/sys_update_set_in_progress.json", operationsData.updateSetsInProgress],
-    ["core_data/sys_update_set_count.json", operationsData.updateSetTotal],
-    ["core_data/sys_update_xml_sensitive.json", operationsData.sensitiveUpdateXml],
-    ["core_data/ecc_agent.json", operationsData.midServers],
-    ["core_data/sys_properties_mid.json", operationsData.properties],
-    ["core_data/sys_plugins.json", operationsData.plugins],
+    ["core_data/sys_user.json", tableCoreData(identityData.users)],
+    ["core_data/sys_user_has_role_privileged.json", tableCoreData(identityData.privilegedAssignments)],
+    ["core_data/sys_user_role_contains.json", tableCoreData(identityData.roleInheritance)],
+    ["core_data/sys_user_role_contains_count.json", countCoreData(identityData.roleInheritanceTotal)],
+    ["core_data/sys_properties_identity.json", tableCoreData(identityData.properties)],
+    ["core_data/password_policy.json", tableCoreData(identityData.passwordPolicies)],
+    ["core_data/sso_properties.json", tableCoreData(identityData.ssoProviders)],
+    ["core_data/ldap_server_config.json", tableCoreData(identityData.ldapServers)],
+    ["core_data/sys_certificate.json", tableCoreData(identityData.certificates)],
+    ["core_data/oauth_entity.json", tableCoreData(identityData.oauthEntities)],
+    ["core_data/multi_factor_criteria.json", tableCoreData(identityData.mfaCriteria)],
+    ["core_data/sys_properties_hardening.json", tableCoreData(hardeningData.properties)],
+    ["core_data/sys_properties_debug.json", tableCoreData(hardeningData.debugProperties)],
+    ["core_data/sys_script_eval.json", tableCoreData(hardeningData.evalScripts)],
+    ["core_data/ip_access.json", tableCoreData(hardeningData.ipAccessRules)],
+    ["core_data/sys_plugins_ip_authenticator.json", tableCoreData(hardeningData.ipAuthenticatorPlugin)],
+    ["core_data/sys_email_account.json", tableCoreData(hardeningData.emailAccounts)],
+    ["core_data/sys_security_acl.json", tableCoreData(accessControlData.acls)],
+    ["core_data/sys_security_acl_role.json", tableCoreData(accessControlData.aclRoles)],
+    ["core_data/sys_security_acl_count.json", countCoreData(accessControlData.aclTotal)],
+    ["core_data/sys_public.json", tableCoreData(accessControlData.publicPages)],
+    ["core_data/sys_encryption_context.json", tableCoreData(operationsData.encryptionContexts)],
+    ["core_data/sys_kmf_crypto_module.json", tableCoreData(operationsData.cryptoModules)],
+    ["core_data/sys_dictionary_encrypted.json", tableCoreData(operationsData.encryptedFields)],
+    ["core_data/sys_dictionary_audit.json", tableCoreData(operationsData.auditDictionary)],
+    ["core_data/sys_audit_count.json", countCoreData(operationsData.recentAuditCount)],
+    ["core_data/syslog_transaction_count.json", countCoreData(operationsData.recentTransactionCount)],
+    ["core_data/sys_update_set_in_progress.json", tableCoreData(operationsData.updateSetsInProgress)],
+    ["core_data/sys_update_set_count.json", countCoreData(operationsData.updateSetTotal)],
+    ["core_data/sys_update_xml_sensitive.json", tableCoreData(operationsData.sensitiveUpdateXml)],
+    ["core_data/ecc_agent.json", tableCoreData(operationsData.midServers)],
+    ["core_data/sys_properties_mid.json", tableCoreData(operationsData.properties)],
+    ["core_data/sys_plugins.json", tableCoreData(operationsData.plugins)],
   ];
   for (const [pathname, value] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathname, serializeJson(value));
