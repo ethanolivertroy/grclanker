@@ -79,16 +79,18 @@ The projects you inventory must have the relevant APIs enabled: `cloudasset`, `c
 
 Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way: the per-list item cap was reached, the cursor repeated itself, or the page budget of 250 pages was spent. The summary then reads `N seen, total unknown`.
 
+Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass` even if its primary inventory was read completely: `manual` when the unreadable inventory is the one the finding scores, `warn` otherwise. The summary names the dataset and the endpoint, for example `Partial view: Cloud Routers unreadable for 1 of 2 projects (second-project) via compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers (403 Forbidden)`, and `evidence.unreadable_inventories` lists every entry with its scope and error. A count or list that would have been derived from the unreadable inventory is rendered as `null`, never as zero or an empty list.
+
 ## Status semantics
 
 | Status | Meaning |
 |--------|---------|
-| `pass` | Every inventoried resource satisfied the check and the inventory was complete (no cap, no truncated page, no denied project). |
-| `warn` | A violation on a lower-impact check, a partial inventory (project cap, truncated page, denied or API-disabled project), items missing a required date, or a dry-run or unresolved configuration. |
+| `pass` | Every inventoried resource satisfied the check and every inventory the finding depends on was complete (no cap, no truncated page, no denied project, no unreadable dependent inventory). |
+| `warn` | A violation on a lower-impact check, a partial inventory (project cap, truncated page, denied or API-disabled project, a dependent inventory unreadable in part or in whole), items missing a required date, or a dry-run or unresolved configuration. |
 | `fail` | A documented violation was found in a complete inventory. |
-| `manual` | The endpoint was forbidden or errored, the inventory was empty where emptiness is not compliant by intent, the API is disabled, or the control is outside the configured scope. The summary names the cause and the evidence to collect. |
+| `manual` | The inventory the finding scores was forbidden or errored, the inventory was empty where emptiness is not compliant by intent, the API is disabled, or the control is outside the configured scope. The summary names the dataset, the endpoint, and the evidence to collect. |
 
-Emptiness passes only for two findings: `GCP-IAM-02` (no user-managed keys across a non-empty set of service accounts) and `GCP-DATA-06` (no API keys in projects where the API Keys API answered). `GCP-DATA-07` fails on emptiness (no access policy means no perimeter). Every other finding renders `manual` on an empty inventory.
+Emptiness passes only for two findings: `GCP-IAM-02` (no user-managed keys across a non-empty set of service accounts whose key lists were all readable) and `GCP-DATA-06` (no API keys in projects where the API Keys API answered). `GCP-DATA-07` fails on emptiness (no access policy means no perimeter). Every other finding renders `manual` on an empty inventory.
 
 ## Control coverage
 
@@ -104,7 +106,7 @@ Emptiness passes only for two findings: `GCP-IAM-02` (no user-managed keys acros
 | 8 | Binary Authorization | `gcp_assess_org_guardrails` | `GCP-ORG-07` | fail unless `defaultAdmissionRule` and every `clusterAdmissionRules`, `kubernetesNamespaceAdmissionRules`, `kubernetesServiceAccountAdmissionRules`, and `istioServiceIdentityAdmissionRules` entry has `evaluationMode` `REQUIRE_ATTESTATION` or `ALWAYS_DENY`; dry-run enforcement warns; attestors are not evaluated |
 | 9 | VPC Flow Logs | `gcp_assess_network_security` | `GCP-NET-02` | fail when an eligible subnetwork has neither `logConfig.enable=true` nor `enableFlowLogs=true` |
 | 10 | Cloud NAT Configuration | `gcp_assess_network_security` | `GCP-NET-04` | warn when a subnetwork is not covered by a Cloud NAT in its network and region (`sourceSubnetworkIpRangesToNat`, with `LIST_OF_SUBNETWORKS` covering only the listed `subnetworks[]`) or instances carry IPv4 `accessConfigs` or IPv6 `ipv6AccessConfigs` |
-| 11 | OS Login Enforcement | `gcp_assess_org_guardrails` | `GCP-ORG-06` | pass when `constraints/compute.requireOsLogin` is enforced with no instance override, or every project sets `enable-oslogin=TRUE`; 2FA is not evaluated |
+| 11 | OS Login Enforcement | `gcp_assess_org_guardrails` | `GCP-ORG-06` | pass only when every sampled project with Compute Engine sets `enable-oslogin=TRUE` in `commonInstanceMetadata` and no instance overrides it; an existing project or instance without it fails and is named even when `constraints/compute.requireOsLogin` is enforced, because the constraint protects new projects and blocks future disabling but never enables OS Login on existing resources; the constraint is reported in the summary and warns the finding when it is unreadable; 2FA is not evaluated |
 | 12 | Serial Port Disabled | `gcp_assess_org_guardrails` | `GCP-ORG-05`, `GCP-ORG-08` | org policy `compute.disableSerialPortAccess` plus instance `serial-port-enable` metadata |
 | 13 | Default Service Account Usage | `gcp_assess_identity` | `GCP-IAM-05` | fail when a default compute or App Engine service account holds an owner/editor-style role |
 | 14 | Cross-Project Access | `gcp_assess_identity` | `GCP-IAM-04` | warn on service account bindings that cross project boundaries |
@@ -166,7 +168,8 @@ The script prints a skip message and exits 0 when no credential hint exists (no 
 - KMS keys are read from Cloud Asset Inventory (`cloudkms.googleapis.com/CryptoKey`) rather than per-location Cloud KMS list calls, so the Cloud Asset API must be enabled and the asset feed reflects its documented freshness.
 - Public exposure relies on the Cloud Asset Inventory IAM policy search at organization scope (`policy:(allUsers OR allAuthenticatedUsers)`), which covers every asset type CAI indexes; object ACLs on non-uniform buckets are not inspected.
 - Compute `aggregatedList` responses that report `unreachables[]` or a scope with `warning.code` `UNREACHABLE` mark the inventory as partial: every compute-backed finding downgrades to `warn` and names the unreachable scopes.
-- Effective organization policies are computed against the first inventoried project. When the project cap truncates the inventory, org-policy findings are downgraded to `warn`.
+- Effective organization policies are computed against the first inventoried project. When the project cap truncates the inventory, or the project inventory itself is unreadable while a project ID is configured, org-policy findings are downgraded to `warn` and name the project inventory endpoint; an unreadable constraint renders its finding `manual`.
+- Security Command Center visibility (`GCP-LOG-05`) is `manual` when the source list is unreadable and `warn` when the findings feed is unreadable or truncated; the findings count is then rendered as `null`, never as zero.
 - Single-project scope (no organization ID) renders `GCP-ORG-01` and `GCP-DATA-07` as `manual` because organization metadata and access policies are organization resources.
 
 ## Endpoint reference
