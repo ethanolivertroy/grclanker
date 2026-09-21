@@ -373,6 +373,7 @@ test("assessments pass on the healthy fixture and register every control exactly
 test("assessVeracodeScanCoverage fails on stale scans and failed scan statuses and warns on missing dates", async () => {
   const fixture = healthyFixture();
   fixture.applications[0].last_completed_scan_date = daysAgo(200);
+  fixture.applications[0].scans[0].modified_date = daysAgo(200);
   fixture.applications[1].scans = [{ scan_type: "STATIC", status: "ANALYSIS_ERRORS" }];
   fixture.sandboxes = [];
   fixture.scanConfiguration = { auth_configuration: { authentications: {} }, crawl_configuration: { disabled: false } };
@@ -385,16 +386,48 @@ test("assessVeracodeScanCoverage fails on stale scans and failed scan statuses a
 
   const missing = healthyFixture();
   missing.applications[0].last_completed_scan_date = null;
-  missing.applications[0].scans = [];
+  missing.applications[0].scans = [{ scan_type: "STATIC", status: "PUBLISHED" }];
   const missingResult = await assessVeracodeScanCoverage(mockClient(missing), { now: NOW });
   assert.equal(statusOf(missingResult.findings, 1), "warn");
-  assert.match(missingResult.findings[0].summary, /no last_completed_scan_date/);
+  assert.match(missingResult.findings.find((item) => item.id === "VERACODE-01").summary, /no modified_date on their published static scan/);
   assert.equal(statusOf(missingResult.findings, 4), "warn");
-  assert.equal(statusOf(missingResult.findings, 19), "warn");
+
+  const noRecords = healthyFixture();
+  noRecords.applications[0].scans = [];
+  const noRecordsResult = await assessVeracodeScanCoverage(mockClient(noRecords), { now: NOW });
+  assert.equal(statusOf(noRecordsResult.findings, 19), "warn");
+  assert.equal(statusOf(noRecordsResult.findings, 1), "fail");
 
   const noDast = await assessVeracodeScanCoverage(mockClient(healthyFixture(), { async listDynamicAnalyses() { const error = forbidden("/was/configservice/v1/analyses"); error.statusCode = 404; throw error; } }), { now: NOW });
   assert.equal(statusOf(noDast.findings, 13), "manual");
   assert.match(noDast.findings.find((item) => item.id === "VERACODE-13").summary, /not applicable/);
+});
+
+test("assessVeracodeScanCoverage judges control 1 on published static scans rather than the scan-type agnostic date", async () => {
+  const dastOnly = healthyFixture();
+  dastOnly.applications[1].scans = [{ scan_type: "DYNAMIC", status: "PUBLISHED", modified_date: daysAgo(3) }];
+  dastOnly.applications[1].last_completed_scan_date = daysAgo(3);
+  const result = await assessVeracodeScanCoverage(mockClient(dastOnly), { now: NOW });
+  assert.equal(statusOf(result.findings, 1), "fail");
+  const finding1 = result.findings.find((item) => item.id === "VERACODE-01");
+  assert.match(finding1.summary, /expose no static scan at all/);
+  assert.deepEqual(finding1.evidence.applications_without_static_scan[0].scan_types_present, ["DYNAMIC"]);
+
+  const inProgress = healthyFixture();
+  inProgress.applications[1].scans = [{ scan_type: "STATIC", status: "IN_PROGRESS", modified_date: daysAgo(1) }];
+  const inProgressResult = await assessVeracodeScanCoverage(mockClient(inProgress), { now: NOW });
+  assert.equal(statusOf(inProgressResult.findings, 1), "warn");
+  assert.match(inProgressResult.findings.find((item) => item.id === "VERACODE-01").summary, /not in a published status/);
+
+  const staleStatic = healthyFixture();
+  staleStatic.applications[1].scans = [
+    { scan_type: "STATIC", status: "PUBLISHED", modified_date: daysAgo(120) },
+    { scan_type: "DYNAMIC", status: "PUBLISHED", modified_date: daysAgo(2) },
+  ];
+  staleStatic.applications[1].last_completed_scan_date = daysAgo(2);
+  const staleResult = await assessVeracodeScanCoverage(mockClient(staleStatic), { now: NOW });
+  assert.equal(statusOf(staleResult.findings, 1), "fail");
+  assert.equal(staleResult.findings.find((item) => item.id === "VERACODE-01").evidence.stale_applications[0].days_since_published_static_scan, 120);
 });
 
 test("assessVeracodePolicyCompliance flags failing, unassigned, and default policies", async () => {

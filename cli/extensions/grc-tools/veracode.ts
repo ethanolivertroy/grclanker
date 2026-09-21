@@ -882,6 +882,29 @@ const FAILED_SCAN_STATUSES = new Set([
   "MODULE_SELECTION_REQUIRED",
 ]);
 
+const COMPLETED_SCAN_STATUSES = new Set([
+  "PUBLISHED",
+  "PUBLISHED_TO_VENDOR",
+  "PUBLISHED_TO_ENTERPRISE",
+  "PUBLISHED_TO_ENTERPRISEINT",
+]);
+
+type LatestScanState =
+  | { kind: "none" }
+  | { kind: "not_completed"; status: string }
+  | { kind: "missing_date" }
+  | { kind: "completed"; date: Date };
+
+function latestScanState(app: JsonRecord, scanType: string): LatestScanState {
+  const scans = applicationScans(app).filter((scan) => asString(scan.scan_type)?.toUpperCase() === scanType);
+  if (scans.length === 0) return { kind: "none" };
+  const completed = scans.filter((scan) => COMPLETED_SCAN_STATUSES.has(asString(scan.status)?.toUpperCase() ?? ""));
+  if (completed.length === 0) return { kind: "not_completed", status: asString(scans[0].status)?.toUpperCase() ?? "UNKNOWN" };
+  const dates = completed.map((scan) => parseDate(scan.modified_date)).filter((date): date is Date => date !== undefined);
+  if (dates.length === 0) return { kind: "missing_date" };
+  return { kind: "completed", date: new Date(Math.max(...dates.map((date) => date.getTime()))) };
+}
+
 const FREQUENCY_DAYS: Readonly<Record<string, number>> = {
   WEEKLY: 7,
   MONTHLY: 31,
@@ -933,20 +956,36 @@ function applicationInventoryBlocker(
 }
 
 function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: number, now: Date): VeracodeFinding {
-  const blocker = applicationInventoryBlocker(1, "critical", snapshot, ["Export the application list with last completed scan dates from the Platform."]);
+  const blocker = applicationInventoryBlocker(1, "critical", snapshot, ["Export the application list with the latest published static scan date per application from the Platform."]);
   if (blocker) return blocker;
   const list = (snapshot.applications as { value: HalListResult }).value;
-  const stale: string[] = [];
-  const neverScanned: string[] = [];
+  const stale: Array<{ application: string; days_since_published_static_scan: number; last_completed_scan_date: string | null }> = [];
+  const noStaticScan: Array<{ application: string; scan_types_present: string[]; last_completed_scan_date: string | null }> = [];
+  const notPublished: Array<{ application: string; latest_static_status: string }> = [];
+  const missingDate: string[] = [];
   let fresh = 0;
   for (const app of list.items) {
-    const lastScan = parseDate(app.last_completed_scan_date);
-    if (!lastScan) {
-      neverScanned.push(applicationName(app));
-    } else if (daysSince(lastScan, now) > maxScanAgeDays) {
-      stale.push(applicationName(app));
-    } else {
-      fresh += 1;
+    const state = latestScanState(app, "STATIC");
+    switch (state.kind) {
+      case "none":
+        noStaticScan.push({ application: applicationName(app), scan_types_present: applicationScans(app).map((scan) => asString(scan.scan_type) ?? "UNKNOWN"), last_completed_scan_date: asString(app.last_completed_scan_date) ?? null });
+        break;
+      case "not_completed":
+        notPublished.push({ application: applicationName(app), latest_static_status: state.status });
+        break;
+      case "missing_date":
+        missingDate.push(applicationName(app));
+        break;
+      case "completed": {
+        const age = daysSince(state.date, now);
+        if (age > maxScanAgeDays) stale.push({ application: applicationName(app), days_since_published_static_scan: age, last_completed_scan_date: asString(app.last_completed_scan_date) ?? null });
+        else fresh += 1;
+        break;
+      }
+      default: {
+        const exhaustive: never = state;
+        throw new Error(`Unhandled scan state ${String(exhaustive)}`);
+      }
     }
   }
   const partial = partialInventoryNote(list, "applications");
@@ -955,16 +994,25 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
     applications_total: list.totalElements ?? null,
     fresh_applications: fresh,
     stale_applications: stale.slice(0, 50),
-    never_scanned_applications: neverScanned.slice(0, 50),
+    applications_without_static_scan: noStaticScan.slice(0, 50),
+    applications_with_unpublished_latest_static_scan: notPublished.slice(0, 50),
+    applications_without_static_scan_date: missingDate.slice(0, 50),
     max_scan_age_days: maxScanAgeDays,
+    date_source: "scans[].modified_date of the latest STATIC scan in a published status",
   };
-  if (stale.length > 0) {
-    return finding(1, "critical", "fail", joinNotes(`${stale.length}/${list.items.length} applications have no completed scan within ${maxScanAgeDays} days${neverScanned.length > 0 ? ` and ${neverScanned.length} have no completed scan date at all` : ""}.`, partial), evidence);
+  if (stale.length > 0 || noStaticScan.length > 0) {
+    return finding(1, "critical", "fail", joinNotes(
+      `${stale.length}/${list.items.length} applications have no published static scan within ${maxScanAgeDays} days and ${noStaticScan.length} applications expose no static scan at all (dynamic, manual, or SCA scans and the scan-type agnostic last_completed_scan_date do not satisfy this control).`,
+      partial,
+    ), evidence);
   }
-  if (neverScanned.length > 0) {
-    return finding(1, "critical", "warn", joinNotes(`${neverScanned.length}/${list.items.length} applications expose no last_completed_scan_date, so they are not counted as covered; ${fresh} applications were scanned within ${maxScanAgeDays} days.`, partial), evidence);
+  if (notPublished.length > 0 || missingDate.length > 0) {
+    return finding(1, "critical", "warn", joinNotes(
+      `${notPublished.length}/${list.items.length} applications expose a latest static scan that is not in a published status and ${missingDate.length} expose no modified_date on their published static scan, so they are not counted as covered; ${fresh} applications have a published static scan within ${maxScanAgeDays} days.`,
+      partial,
+    ), evidence);
   }
-  return finding(1, "critical", limitedStatus("pass", [partial]), joinNotes(`All ${fresh} applications read have a completed scan within ${maxScanAgeDays} days.`, partial), evidence);
+  return finding(1, "critical", limitedStatus("pass", [partial]), joinNotes(`All ${fresh} applications read have a published static scan within ${maxScanAgeDays} days.`, partial), evidence);
 }
 
 function policyFrequencyDays(policy: JsonRecord | undefined): number | undefined {
