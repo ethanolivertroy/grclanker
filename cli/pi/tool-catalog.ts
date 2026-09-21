@@ -60,6 +60,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["splunk_", "Splunk"],
   ["tenable_", "Tenable"],
   ["vanta_", "Vanta"],
+  ["veracode_", "Veracode"],
   ["webex_", "Webex"],
   ["zoom_", "Zoom"],
 ];

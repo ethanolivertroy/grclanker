@@ -54,6 +54,7 @@ import { registerSnowflakeTools } from "./grc-tools/snowflake.js";
 import { registerSplunkTools } from "./grc-tools/splunk.js";
 import { registerTenableTools } from "./grc-tools/tenable.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
+import { registerVeracodeTools } from "./grc-tools/veracode.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
 
@@ -96,6 +97,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerSplunkTools,
   registerTenableTools,
   registerVantaTools,
+  registerVeracodeTools,
   registerWebexTools,
   registerZoomTools,
 ];
