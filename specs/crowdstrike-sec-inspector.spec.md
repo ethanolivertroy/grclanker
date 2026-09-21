@@ -431,7 +431,8 @@ Findings are normalized as `{id, title, severity, status, summary, evidence, map
 ### What shipped
 
 - All 25 controls produce a finding. 24 are evaluated from API evidence; CS-07 is always `manual` because no Falcon API endpoint exposes the RTR session timeout or concurrent session limit (RTR audit sessions are still analyzed and raise `warn` for long or concurrent sessions).
-- CS-15, CS-24, and CS-25 fall back to `manual` findings with console evidence instructions when Falcon Discover, Identity Protection, or Zero Trust Assessment return 403 or 404 (unlicensed module or missing scope).
+- CS-15, CS-24, and CS-25 fall back to `manual` findings with console evidence instructions when Falcon Discover, Identity Protection, or Zero Trust Assessment return 401, 403, or 404 (unlicensed module, not applicable, or missing scope).
+- Verdict safety: an unreadable or errored endpoint never yields `pass` (the control becomes `manual` naming the failed read); empty inventories `fail` or become `manual` unless emptiness is compliant (exclusions, alerts in the stated window, contained hosts); undated records are bucketed separately and cap the verdict at `warn`; every sampled or paginated read compares the returned count against `meta.pagination.total` and a truncated inventory caps the verdict at `warn` with seen and total counts; only enabled policies assigned to host groups (or `platform_default`) count as enforcement; and re-running the exporter allocates a new bundle directory with a matching zip name instead of overwriting.
 - OAuth2 client credentials with token caching and single refresh on 401, offset and `after` cursor pagination, 429 and 5xx retries honoring `X-RateLimit-RetryAfter` and `Retry-After`, request timeouts, and secret redaction in errors.
 - Eight framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP) in every audit bundle.
 

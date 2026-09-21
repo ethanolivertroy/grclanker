@@ -88,35 +88,46 @@ Every tool accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_ci
 
 ## Control coverage
 
-Status semantics: `pass` means the API evidence satisfies the control, `warn` means partial or threshold-adjacent evidence, `fail` means the evidence contradicts the control or the control cannot be enforced (for example no enabled policy), and `manual` means the API cannot verify the control and the summary states exactly what to collect from the Falcon console. Any control whose source endpoint is unreadable also becomes `manual`.
+Status semantics: `pass` means the API evidence satisfies the control across the complete inventory that was read, `warn` means partial or threshold-adjacent evidence, `fail` means the evidence contradicts the control or an inventory the control depends on is empty (for example zero prevention policies), and `manual` means the API cannot verify the control and the summary names the cause and exactly what to collect from the Falcon console.
+
+The verdicts follow these safety rules, each covered by a regression test in `cli/tests/crowdstrike.test.mjs`:
+
+- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`; the affected control becomes `manual` and the summary names the failed read.
+- An empty inventory never yields `pass` by default. Zero policies, hosts, host groups, or identity rules `fail`; zero users, API clients, Discover assets, or ZTA scores are `manual` because a live tenant cannot be empty; zero exclusions, zero critical/high alerts in the stated window, and zero contained hosts `pass` because emptiness is compliant, and the summary says so.
+- Falcon Discover, Identity Protection, and Zero Trust Assessment responses of 401, 403, or 404 render as `manual` with an "unlicensed or not applicable" summary.
+- Records without a timestamp (`last_seen`, `created_timestamp`, `last_login_at`, `modified_timestamp`) are never counted as fresh or compliant; they are reported in an `undated_items` bucket and cap the verdict at `warn`.
+- Every sampled read compares the returned count against `meta.pagination.total`; a truncated or sampled inventory is reported as `partial_inventory` with seen and total counts and caps the verdict at `warn`. Pagination runs to completion within the configured limit, and the client records truncation instead of treating a first page as the population.
+- Only policies that are enabled and assigned to host groups (or the `platform_default` policy) count as enforcement; an aggressive setting on a disabled or unassigned policy never supports `pass`, and an `mlslider` missing its `detection` or `prevention` value caps CS-01 at `warn`.
+- Re-running an export allocates a new suffixed bundle directory and a zip with the same name (`<bundle>-2/` and `<bundle>-2.zip`) instead of overwriting a prior bundle.
+- With `member_cid` set, every summary states that results cover that member CID only.
 
 | Control | Name | Tool | Finding | Status semantics |
 |---|---|---|---|---|
-| CS-01 | Prevention Policy - ML Detection Levels | `crowdstrike_assess_prevention_policies` | CS-01 | pass when `CloudAntiMalware` and `OnSensorMLSlider` detection and prevention are AGGRESSIVE or higher in every enabled policy; warn at MODERATE or missing platform coverage; fail at CAUTIOUS or DISABLED |
+| CS-01 | Prevention Policy - ML Detection Levels | `crowdstrike_assess_prevention_policies` | CS-01 | pass when `CloudAntiMalware` and `OnSensorMLSlider` detection and prevention are AGGRESSIVE or higher in every enabled, host-assigned policy; warn at MODERATE, when a slider or its `detection` or `prevention` value is missing, or when a platform has no assigned policy; fail at CAUTIOUS or DISABLED or with no assigned policy |
 | CS-02 | Prevention Policy - Exploit Mitigation | `crowdstrike_assess_prevention_policies` | CS-02 | fail when `ForceASLR`, `ForceDEP`, `HeapSprayPreallocation`, `NullPageAllocation`, or `SEHOverwriteProtection` is disabled; warn when only extended mitigations are disabled |
 | CS-03 | Prevention Policy - Script-Based Execution Control | `crowdstrike_assess_prevention_policies` | CS-03 | fail when `ScriptBasedExecutionMonitoring`, `InterpreterProtection`, or `EngineProtectionV2` is disabled |
-| CS-04 | Prevention Policy - Sensor Tamper Protection | `crowdstrike_assess_prevention_policies` | CS-04 | fail when `SensorTamperingProtection` is disabled in any enabled policy |
+| CS-04 | Prevention Policy - Sensor Tamper Protection | `crowdstrike_assess_prevention_policies` | CS-04 | fail when `SensorTamperingProtection` is disabled in any enabled, host-assigned policy |
 | CS-05 | Prevention Policy - On-Write Detection | `crowdstrike_assess_prevention_policies` | CS-05 | fail when `DetectOnWrite` is disabled; warn when `QuarantineOnWrite` is disabled |
-| CS-06 | Response Policy - RTR Enabled | `crowdstrike_assess_response_readiness` | CS-06 | fail when `RealTimeFunctionality` is disabled everywhere; warn when `CustomScripts` is allowed |
+| CS-06 | Response Policy - RTR Enabled | `crowdstrike_assess_response_readiness` | CS-06 | fail when `RealTimeFunctionality` is disabled in every enabled, host-assigned response policy or no such policy exists; warn when `CustomScripts` is allowed |
 | CS-07 | Response Policy - Session Limits | `crowdstrike_assess_response_readiness` | CS-07 | manual: the API does not expose timeout or concurrency settings; RTR audit sessions longer than `max_session_minutes` or above `max_concurrent_sessions` raise warn |
-| CS-08 | Device Control - USB Blocking | `crowdstrike_assess_device_firewall` | CS-08 | pass when USB `enforcement_mode` is `MONITOR_ENFORCE` and `MASS_STORAGE` is not `FULL_ACCESS`; warn above `max_usb_exceptions`; fail otherwise |
+| CS-08 | Device Control - USB Blocking | `crowdstrike_assess_device_firewall` | CS-08 | pass when USB `enforcement_mode` is `MONITOR_ENFORCE` and `MASS_STORAGE` is not `FULL_ACCESS` in every enabled, host-assigned policy; warn above `max_usb_exceptions`; fail otherwise; manual when the v2 policy details are unreadable |
 | CS-09 | Device Control - Peripheral Restrictions | `crowdstrike_assess_device_firewall` | CS-09 | pass when Bluetooth and PCIe/Thunderbolt enforce and mass storage (SD cards) is blocked; warn when partially configured; fail when none |
-| CS-10 | Firewall - Host Firewall Enabled | `crowdstrike_assess_device_firewall` | CS-10 | pass when every enabled firewall policy has `enforce` true, `test_mode` false, and active rule groups |
-| CS-11 | Firewall - Default Deny | `crowdstrike_assess_device_firewall` | CS-11 | fail when a policy container `default_inbound` is not `DENY`; warn when enabled allow rules lack descriptions |
+| CS-10 | Firewall - Host Firewall Enabled | `crowdstrike_assess_device_firewall` | CS-10 | pass when every enabled, host-assigned firewall policy has `enforce` true, `test_mode` false, and at least one returned rule group that is enabled and non-empty; warn when referenced rule groups were not returned; manual when containers or rule groups are unreadable |
+| CS-11 | Firewall - Default Deny | `crowdstrike_assess_device_firewall` | CS-11 | fail when a policy container `default_inbound` is not `DENY`; warn when enabled allow rules lack descriptions or zero rules were returned; manual when containers or rules are unreadable |
 | CS-12 | Sensor Update - Auto-Update Enabled | `crowdstrike_assess_sensor_coverage` | CS-12 | pass for `n`, `n-1`, `n-2` auto builds or pins inside the current N-2 window; fail for updates off or older pins; warn when uninstall protection is disabled |
-| CS-13 | Sensor Coverage - Deployment Completeness | `crowdstrike_assess_sensor_coverage` | CS-13 | pass when 95% or more sampled hosts checked in within `stale_sensor_days`; warn at 85%; fail below |
-| CS-14 | Sensor Coverage - Host Group Assignment | `crowdstrike_assess_sensor_coverage` | CS-14 | pass when 95% or more sampled hosts belong to a host group; warn at 80%; fail below or with no host groups |
-| CS-15 | Unmanaged Asset Detection | `crowdstrike_assess_sensor_coverage` | CS-15 | pass with zero Discover unmanaged assets; warn at 5% or less of discovered assets; fail above; manual when Discover is not licensed |
-| CS-16 | RBAC - Admin Count | `crowdstrike_assess_access_governance` | CS-16 | warn above `max_admins` or with shared-looking accounts; fail at double the threshold or shared admin accounts |
-| CS-17 | RBAC - Least Privilege | `crowdstrike_assess_access_governance` | CS-17 | warn for users above `max_roles_per_user` or redundant roles on admins; fail for admins without a login in 90 days |
-| CS-18 | RBAC - API Client Permissions | `crowdstrike_assess_access_governance` | CS-18 | warn when clients hold write scopes on sensitive collections; fail above `max_write_clients` |
+| CS-13 | Sensor Coverage - Deployment Completeness | `crowdstrike_assess_sensor_coverage` | CS-13 | pass when 95% or more dated hosts checked in within `stale_sensor_days`; warn at 85%, when hosts lack `last_seen`, or when the host sample is truncated; fail below 85% or with zero hosts |
+| CS-14 | Sensor Coverage - Host Group Assignment | `crowdstrike_assess_sensor_coverage` | CS-14 | pass when 95% or more sampled hosts belong to a host group; warn at 80% or on a truncated sample; fail below or with zero hosts or host groups; manual when host groups are unreadable |
+| CS-15 | Unmanaged Asset Detection | `crowdstrike_assess_sensor_coverage` | CS-15 | pass with zero Discover unmanaged assets against a non-zero managed count; warn at 5% or less of discovered assets; fail above; manual when Discover is unlicensed, unreadable, or reports zero assets |
+| CS-16 | RBAC - Admin Count | `crowdstrike_assess_access_governance` | CS-16 | warn above `max_admins`, with shared-looking accounts, or when some role lookups failed or the user list is truncated; fail at double the threshold or shared admin accounts; manual with zero users or when every role lookup failed |
+| CS-17 | RBAC - Least Privilege | `crowdstrike_assess_access_governance` | CS-17 | warn for users above `max_roles_per_user`, redundant roles on admins, or admins with no `last_login_at`; fail for admins whose last login is older than 90 days |
+| CS-18 | RBAC - API Client Permissions | `crowdstrike_assess_access_governance` | CS-18 | warn when clients hold write scopes on sensitive collections or the client list is truncated; fail above `max_write_clients`; manual with zero clients |
 | CS-19 | Exclusion Review - IOA Exclusions | `crowdstrike_assess_access_governance` | CS-19 | lists every exclusion; warn for wildcard-only `ifn_regex` or `cl_regex`; fail when such patterns apply globally |
 | CS-20 | Exclusion Review - ML Exclusions | `crowdstrike_assess_access_governance` | CS-20 | warn for exclusions under system, program, user, or temp directories; fail when applied globally |
 | CS-21 | Exclusion Review - Sensor Visibility | `crowdstrike_assess_access_governance` | CS-21 | warn for exclusions that hide whole directories; fail when applied globally |
-| CS-22 | Detection Response SLA | `crowdstrike_assess_response_readiness` | CS-22 | pass when 95% or more critical/high alerts in `lookback_days` are within 24h (critical) or 72h (high); warn at 80%; fail below |
-| CS-23 | Containment Policy | `crowdstrike_assess_response_readiness` | CS-23 | pass with no contained hosts; warn when hosts are contained so each can be documented |
+| CS-22 | Detection Response SLA | `crowdstrike_assess_response_readiness` | CS-22 | pass when 95% or more dated critical/high alerts in `lookback_days` are within 24h (critical) or 72h (high), including zero alerts when the endpoint was readable; warn at 80%, with undated alerts, or on a truncated alert page; fail below |
+| CS-23 | Containment Policy | `crowdstrike_assess_response_readiness` | CS-23 | pass with no contained hosts when the Hosts API was readable; warn when hosts are contained so each can be documented, or when the contained host read is truncated |
 | CS-24 | Identity Protection | `crowdstrike_assess_access_governance` | CS-24 | pass when enabled, non-simulation rules enforce; warn when rules exist only in simulation; fail with no rules; manual when the module is not licensed |
-| CS-25 | Zero Trust Assessment | `crowdstrike_assess_sensor_coverage` | CS-25 | pass with no hosts below `min_zta_score`; warn at 10% or less; fail above; manual when ZTA is not readable |
+| CS-25 | Zero Trust Assessment | `crowdstrike_assess_sensor_coverage` | CS-25 | pass with no hosts below `min_zta_score`; warn at 10% or less; fail above; manual when ZTA is unlicensed, unreadable, or reports zero scored hosts |
 
 ## Framework mappings
 
@@ -135,7 +146,7 @@ The script prints a skip message and exits 0 when credentials are absent. With c
 - CS-07 is always `manual` (or `warn` when audit data shows long or concurrent sessions): no Falcon API endpoint exposes the RTR session timeout or concurrent session limit, so capture them from the response policy in the console.
 - CS-15, CS-24, and CS-25 depend on Falcon Discover, Identity Protection, and Zero Trust Assessment licensing; a 403 or 404 from those collections produces a `manual` finding with the console evidence to collect.
 - CS-23 cannot read when containment started; the finding uses the host record's `modified_timestamp` as a proxy and asks for incident references.
-- Host, user, alert, exclusion, and rule reads are sampled up to the configured limits (5000 hosts, 500 users and API clients, 2000 alerts, 500 exclusions per type, 1000 firewall rules by default).
+- Host, user, alert, exclusion, and rule reads are sampled up to the configured limits (5000 hosts, 500 users and API clients, 2000 alerts, 500 exclusions per type, 1000 firewall rules by default). When the reported total exceeds the sample, the finding records `partial_inventory` with seen and total counts and cannot exceed `warn`; raise the limit to read the full population.
 - Identity Protection GraphQL requires a write scope, so the tools use the REST policy-rules endpoints and parse `enabled`, `simulationMode`, and `action` defensively.
 - Thunderbolt and SD card restrictions are evaluated through the PCIe enforcement mode and the `MASS_STORAGE` class because the API exposes no dedicated Thunderbolt or SD card classes.
 
