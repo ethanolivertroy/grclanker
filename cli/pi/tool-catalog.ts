@@ -56,6 +56,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["servicenow_", "ServiceNow"],
   ["slack_", "Slack"],
   ["sumologic_", "Sumo Logic"],
+  ["snowflake_", "Snowflake"],
   ["vanta_", "Vanta"],
   ["webex_", "Webex"],
   ["zoom_", "Zoom"],

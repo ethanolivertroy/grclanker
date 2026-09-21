@@ -3,11 +3,11 @@ slug: "snowflake-sec-inspector"
 name: "Snowflake Security Inspector"
 vendor: "Snowflake"
 category: "cloud-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/snowflake-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # Snowflake Security Inspector
@@ -17,6 +17,19 @@ source_repo: "https://github.com/hackIDLE/snowflake-sec-inspector"
 A security compliance inspection tool for **Snowflake** data platform environments. Audits identity and access management, network security, data protection policies, encryption configuration, and audit logging against enterprise security baselines and regulatory compliance frameworks.
 
 Snowflake exposes its configuration through SQL queries against the `ACCOUNT_USAGE` and `INFORMATION_SCHEMA` schemas rather than a traditional REST API. This tool connects via the Snowflake Connector for Python (or Go driver) and executes read-only queries to evaluate security posture.
+
+### grclanker implementation
+
+The spec shipped as native grclanker tools in `cli/extensions/grc-tools/snowflake.ts`, executing read-only `SHOW` and `SELECT` statements through the Snowflake SQL REST API (`POST /api/v2/statements?async=true` with `GET /api/v2/statements/{handle}` polling and partition fetching) using key-pair JWT, OAuth, or programmatic access token bearer auth:
+
+- `snowflake_check_access`: probes every `SHOW` command and `ACCOUNT_USAGE` view the assessments need and reports denied surfaces and partial visibility
+- `snowflake_assess_network_and_authentication`: controls 1-6 and 25
+- `snowflake_assess_access_control`: controls 7-10 and 16
+- `snowflake_assess_monitoring_and_lifecycle`: controls 11-13 and 24
+- `snowflake_assess_data_protection`: controls 14-15 and 17-23
+- `snowflake_export_audit_bundle`: raw result sets, findings, per-framework compliance reports, quick reference, error log, and a paired zip archive
+
+Integration guide: `src/content/docs/docs/integrations/snowflake.md`. Tests: `cli/tests/snowflake.test.mjs`. Live smoke: `npm --prefix cli run test:snowflake:live`.
 
 ## 2. APIs & SDKs
 
@@ -325,4 +338,33 @@ go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) as of 2026-09-21. The Go architecture in sections 7-9 is retained as the original design sketch; the shipped implementation lives in `cli/extensions/grc-tools/snowflake.ts` and follows the grclanker tool pattern (`*_check_access`, `*_assess_*`, `*_export_audit_bundle`).
+
+### What shipped
+
+- Six tools covering all 25 controls in section 4, each finding carrying the eight framework mappings from section 5.
+- Configuration precedence of explicit arguments, then the environment variables in section 3, then `~/.snowflake/connections.toml` or `config.toml` (`SNOWFLAKE_HOME` honored) through a dependency-free TOML reader.
+- Key-pair JWT (RS256, `iss` = `<ACCOUNT>.<USER>.SHA256:<fingerprint>`, `sub` = `<ACCOUNT>.<USER>`, one-hour expiry with automatic refresh, encrypted keys with passphrase), OAuth, and programmatic access token bearer auth.
+- SQL REST API client with async submit, `202` polling honoring `Retry-After`, full partition fetching, `429`/`5xx` retry with backoff, HTTP timeouts, a read-only statement guard applied to the whole statement (embedded write keywords and chained statements are rejected), and redaction of tokens, JWTs, private keys, and passphrases from errors.
+- Verdict safety: denied, failed, or timed-out statements yield `manual`; empty inventories yield `fail` or `manual` per control intent (only controls 10, 16, 22, and 23 can pass on a readable empty result: control 23 only under `ACCOUNTADMIN`/`SECURITYADMIN` and control 22 only under `ACCOUNTADMIN`); truncated partitions, row limits, and custom roles downgrade `pass` to `warn`; NULL `LAST_SUCCESS_LOGIN` is bucketed separately and never counted as active; exports never overwrite a prior bundle.
+- 41 regression tests including the three false-pass self-check fixtures (all statements denied, all result sets empty, partial results) and one regression test per compliance-review finding, plus a live smoke script.
+
+### Deviations from this spec, following the official documentation
+
+- Username/password (section 3) is not supported: the Snowflake SQL REST API only accepts key-pair JWT, OAuth, and programmatic access tokens, so the tools reject password-only configuration with an explicit error.
+- `NETWORK_POLICY_REFERENCES`, `MASKING_POLICY_REFERENCES`, and `ROW_ACCESS_POLICY_REFERENCES` (section 2) are not `ACCOUNT_USAGE` views; network, masking, and row access assignments are read from `ACCOUNT_USAGE.POLICY_REFERENCES` filtered by `POLICY_KIND`, and account-level network policy activation is read from `SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT`. The `ACCOUNT_USAGE.POLICY_REFERENCES` view supports aggregation, feature, masking, network, projection, row access, and storage lifecycle policies only; it does not expose password or session policy assignments.
+- Control 4 discovers policies in `ACCOUNT_USAGE.PASSWORD_POLICIES` and then reads each policy's assignments through the Information Schema table function `SELECT ... FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>'))`, treating a `REF_ENTITY_DOMAIN = 'ACCOUNT'` row as the account-level assignment (one statement per policy, capped at 20 lookups with unchecked policies recorded); control 25 reads `ACCOUNT_USAGE.SESSION_POLICIES` the same way. A denied lookup or a limited role that sees no account row renders `manual`.
+- Control 21: `SYSTEM$GET_SNOWFLAKE_PLATFORM_INFO()` returns VPC/VNet identifiers, not key management state, so controls 20 and 21 are always `manual` findings that describe the Snowflake Support and cloud KMS evidence to collect.
+- Control 13 is interpreted as the account `DATA_RETENTION_TIME_IN_DAYS` parameter plus `ACCESS_HISTORY` readability; `QUERY_HISTORY` and `ACCESS_HISTORY` retention is fixed at 365 days by Snowflake and cannot be configured.
+- `SHOW SHARES` lists every outbound share only for `ACCOUNTADMIN`; other roles holding `IMPORT SHARE` list only the shares they own, and roles without the privilege receive an empty result rather than an error. Control 22 therefore passes on zero outbound shares only under `ACCOUNTADMIN` and renders `manual` under every other role.
+- `USERS.TYPE` values `SERVICE`, `SERVICE_AGENT`, and `LEGACY_SERVICE` are assessed as service-class users (controls 3, 5, 12); `SNOWFLAKE_SERVICE` users are Snowflake managed and surfaced in evidence; an unrecognized `TYPE` value is surfaced and blocks `pass`.
+- Control 10 uses `GRANTS_TO_ROLES WHERE GRANTED_TO = 'USER'`, which is where Snowflake records privileges granted directly to users; `GRANTS_TO_USERS` only records role grants.
+- `SNOWFLAKE_DATABASE=SNOWFLAKE` is not required; queries use fully qualified `SNOWFLAKE.ACCOUNT_USAGE.<view>` names.
+
+### What remains
+
+- Trust Center findings (`SNOWFLAKE.TRUST_CENTER.FINDINGS`) are not queried; the CIS scanner results could become an additional assessment area.
+- Key rotation age for `RSA_PUBLIC_KEY` is not exposed by `ACCOUNT_USAGE.USERS`; control 5 verifies key presence and password absence only. `DESCRIBE USER` per service user could add `RSA_PUBLIC_KEY_LAST_SET_TIME` in a follow-up.
+- Network rules attached to network policies (`SHOW NETWORK RULES`) are not expanded; policies with empty `ALLOWED_IP_LIST` are flagged for manual review.
+- Replication and failover groups are collected as evidence only; a dedicated control would need edition detection.
+- Authentication policies (`AUTHENTICATION_POLICIES` view) could strengthen control 3 with `MFA_ENROLLMENT = REQUIRED` evidence.
