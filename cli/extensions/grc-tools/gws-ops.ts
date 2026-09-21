@@ -143,20 +143,40 @@ interface GwsOpsActivityRecord {
   source?: string;
 }
 
-interface GwsOpsActivityResult {
+interface GwsOpsActivityResultBase {
   title: string;
   category: ActivityCategory;
-  mode: GwsOpsMode;
+  command: GwsOpsCommandPreview;
+  /** `complete: ...`, `partial: ...`, or `not collected: ...`, always naming what the CLI call did or did not return. */
+  status: string;
+  notes: string[];
+  text: string;
+}
+
+/** The records one executed CLI call returned, with the page cursor that decides whether they are the whole population. */
+interface GwsOpsActivityExecution extends GwsOpsActivityResultBase {
+  mode: "execute";
   count: number;
   /** False when the CLI response carried a nextPageToken, so the page is a partial view. */
   complete: boolean;
   nextPageToken?: string;
-  command: GwsOpsCommandPreview;
-  raw?: unknown;
-  records?: GwsOpsActivityRecord[];
-  notes: string[];
-  text: string;
+  raw: unknown;
+  records: GwsOpsActivityRecord[];
 }
+
+/** A dry run never called the CLI, so every record-derived field is null beside a not-collected status, never 0 or []. */
+interface GwsOpsActivityPreview extends GwsOpsActivityResultBase {
+  mode: "dry_run";
+  count: null;
+  complete: null;
+  nextPageToken: null;
+  raw: null;
+  records: null;
+}
+
+type GwsOpsActivityResult = GwsOpsActivityExecution | GwsOpsActivityPreview;
+
+const PREVIEW_STATUS = "not collected: dry run previewed the command and did not execute it, so no records were requested";
 
 interface GwsOpsBundleResult {
   outputDir: string;
@@ -617,6 +637,55 @@ function completenessNote(nextPageToken: string | undefined, count: number): str
     : `Complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query.`;
 }
 
+/** The status of an executed call, worded like the inspector's: `complete: ...` or `partial: at least N; ...`. */
+function executionStatus(nextPageToken: string | undefined, count: number): string {
+  return nextPageToken
+    ? `partial: at least ${count}; the CLI response carried a nextPageToken after ${count} record(s), so more records exist beyond this page`
+    : `complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query`;
+}
+
+function buildPreviewResult(
+  title: string,
+  category: ActivityCategory,
+  command: GwsOpsCommandPreview,
+  notes: string[],
+): GwsOpsActivityPreview {
+  return {
+    title,
+    category,
+    mode: "dry_run",
+    status: PREVIEW_STATUS,
+    count: null,
+    complete: null,
+    nextPageToken: null,
+    raw: null,
+    records: null,
+    command,
+    notes,
+    text: [
+      title,
+      `Command: ${command.command}`,
+      `Status: ${PREVIEW_STATUS}`,
+      "",
+      ...notes.map((note) => `- ${note}`),
+    ].join("\n"),
+  };
+}
+
+/** The bundle only ever packages executed calls; a preview carries no records, so it is refused rather than counted as 0. */
+function executedResult(result: GwsOpsActivityResult): GwsOpsActivityExecution {
+  switch (result.mode) {
+    case "execute":
+      return result;
+    case "dry_run":
+      throw new Error(`${result.title} was previewed rather than executed, so it has no records to bundle.`);
+    default: {
+      const exhaustive: never = result;
+      throw new Error(`Unhandled activity result ${String(exhaustive)}`);
+    }
+  }
+}
+
 /** The clamp is stated in the notes so a request for 1000 is never silently reported as 250. */
 function maxResultsNote(value: unknown, label: string): string {
   const requested = asNumber(value);
@@ -898,25 +967,11 @@ export async function investigateGwsAlerts(
   ];
 
   if (mode === "dry_run") {
-    return {
-      title: "Google Workspace alert investigation (preview)",
-      category: "alerts",
-      mode,
-      count: 0,
-      complete: false,
-      command,
-      notes: [
-        "Dry-run mode only previewed the read-only Alert Center command.",
-        "The published googleworkspace/cli source registers no alertcenter service alias; if the installed build rejects the command (exit 3), use gws_assess_monitoring instead.",
-        ...notes,
-      ],
-      text: [
-        "Google Workspace alert investigation (preview)",
-        `Command: ${command.command}`,
-        "",
-        ...notes.map((note) => `- ${note}`),
-      ].join("\n"),
-    };
+    return buildPreviewResult("Google Workspace alert investigation (preview)", "alerts", command, [
+      "Dry-run mode only previewed the read-only Alert Center command.",
+      "The published googleworkspace/cli source registers no alertcenter service alias; if the installed build rejects the command (exit 3), use gws_assess_monitoring instead.",
+      ...notes,
+    ]);
   }
 
   let execution: GwsCliExecution;
@@ -937,6 +992,7 @@ export async function investigateGwsAlerts(
     title: "Google Workspace alert investigation",
     category: "alerts",
     mode,
+    status: executionStatus(nextPageToken, records.length),
     count: records.length,
     complete: nextPageToken === undefined,
     nextPageToken,
@@ -966,24 +1022,10 @@ export async function traceGwsAdminActivity(
   ];
 
   if (mode === "dry_run") {
-    return {
-      title: "Google Workspace admin activity trace (preview)",
-      category: "admin_activity",
-      mode,
-      count: 0,
-      complete: false,
-      command,
-      notes: [
-        "Dry-run mode only previewed the read-only Admin Reports command.",
-        ...notes,
-      ],
-      text: [
-        "Google Workspace admin activity trace (preview)",
-        `Command: ${command.command}`,
-        "",
-        ...notes.map((note) => `- ${note}`),
-      ].join("\n"),
-    };
+    return buildPreviewResult("Google Workspace admin activity trace (preview)", "admin_activity", command, [
+      "Dry-run mode only previewed the read-only Admin Reports command.",
+      ...notes,
+    ]);
   }
 
   const execution = await executePreview(command, args, runner, env);
@@ -995,6 +1037,7 @@ export async function traceGwsAdminActivity(
     title: "Google Workspace admin activity trace",
     category: "admin_activity",
     mode,
+    status: executionStatus(nextPageToken, records.length),
     count: records.length,
     complete: nextPageToken === undefined,
     nextPageToken,
@@ -1026,24 +1069,10 @@ export async function reviewGwsTokenActivity(
   ];
 
   if (mode === "dry_run") {
-    return {
-      title: "Google Workspace token activity review (preview)",
-      category: "token_activity",
-      mode,
-      count: 0,
-      complete: false,
-      command,
-      notes: [
-        "Dry-run mode only previewed the read-only Admin Reports token query.",
-        ...notes,
-      ],
-      text: [
-        "Google Workspace token activity review (preview)",
-        `Command: ${command.command}`,
-        "",
-        ...notes.map((note) => `- ${note}`),
-      ].join("\n"),
-    };
+    return buildPreviewResult("Google Workspace token activity review (preview)", "token_activity", command, [
+      "Dry-run mode only previewed the read-only Admin Reports token query.",
+      ...notes,
+    ]);
   }
 
   const execution = await executePreview(command, args, runner, env);
@@ -1055,6 +1084,7 @@ export async function reviewGwsTokenActivity(
     title: "Google Workspace token activity review",
     category: "token_activity",
     mode,
+    status: executionStatus(nextPageToken, records.length),
     count: records.length,
     complete: nextPageToken === undefined,
     nextPageToken,
@@ -1066,7 +1096,7 @@ export async function reviewGwsTokenActivity(
   };
 }
 
-function buildBundleSummary(results: GwsOpsActivityResult[]): string {
+function buildBundleSummary(results: GwsOpsActivityExecution[]): string {
   return [
     "# Google Workspace CLI Operator Evidence Summary",
     "",
@@ -1074,6 +1104,7 @@ function buildBundleSummary(results: GwsOpsActivityResult[]): string {
       `## ${result.title}`,
       "",
       `- Category: ${result.category}`,
+      `- Status: ${result.status}`,
       `- Records: ${result.count}`,
       `- Complete page: ${result.complete ? "yes" : "no (nextPageToken present)"}`,
       `- Command: ${result.command.command}`,
@@ -1108,9 +1139,9 @@ export async function collectGwsOperatorEvidenceBundle(
     };
   }
 
-  const alerts = await investigateGwsAlerts(args, runner, env);
-  const adminActivity = await traceGwsAdminActivity(workflowArgs, runner, env);
-  const tokenActivity = await reviewGwsTokenActivity(workflowArgs, runner, env);
+  const alerts = executedResult(await investigateGwsAlerts(args, runner, env));
+  const adminActivity = executedResult(await traceGwsAdminActivity(workflowArgs, runner, env));
+  const tokenActivity = executedResult(await reviewGwsTokenActivity(workflowArgs, runner, env));
   const results = [alerts, adminActivity, tokenActivity];
 
   const outputRoot = args.output_dir?.trim() || DEFAULT_OUTPUT_DIR;
@@ -1127,11 +1158,12 @@ export async function collectGwsOperatorEvidenceBundle(
   for (const result of results) {
     await writeSecureTextFile(outputDir, `analysis/${result.category}.json`, serializeJson({
       title: result.title,
+      status: result.status,
       count: result.count,
       complete: result.complete,
       nextPageToken: result.nextPageToken ?? null,
       notes: result.notes,
-      records: result.records ?? [],
+      records: result.records,
     }));
     await writeSecureTextFile(outputDir, `raw/${result.category}.json`, serializeJson({
       command: result.command,
@@ -1157,15 +1189,17 @@ export async function collectGwsOperatorEvidenceBundle(
   };
 }
 
+/** A preview renders null for every record-derived field beside its not-collected status; only an executed call renders counts. */
 function renderActivityToolResult(result: GwsOpsActivityResult) {
   return textResult(result.text, {
     category: result.category,
     mode: result.mode,
+    status: result.status,
     count: result.count,
     complete: result.complete,
     next_page_token: result.nextPageToken ?? null,
     command: result.command.command,
-    records: result.records ?? [],
+    records: result.records,
     notes: result.notes,
   });
 }

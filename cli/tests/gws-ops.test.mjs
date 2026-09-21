@@ -493,8 +493,55 @@ test("investigateGwsAlerts explains the missing alertcenter alias when gws exits
 
   const preview = await investigateGwsAlerts({ gwsBin: fake, dry_run: true }, defaultGwsCliRunner);
   assert.equal(preview.mode, "dry_run");
-  assert.equal(preview.complete, false);
+  assert.equal(preview.complete, null);
   assert.ok(preview.notes.some((note) => /registers no alertcenter service alias/.test(note)));
+});
+
+test("null standard: a dry-run preview renders null for every record-derived field beside a not-collected status, never 0 or []", async () => {
+  const base = createTempBase("grclanker-gws-ops-preview-null-");
+  const fake = createFakeBinary(base);
+  const seen = [];
+  const runner = createRunner({ seen });
+  const previewStatus = "not collected: dry run previewed the command and did not execute it, so no records were requested";
+
+  const previews = [
+    await investigateGwsAlerts({ gwsBin: fake, dry_run: true }, runner),
+    await traceGwsAdminActivity({ gwsBin: fake, dry_run: true }, runner),
+    await reviewGwsTokenActivity({ gwsBin: fake, dry_run: true }, runner),
+  ];
+  assert.equal(seen.length, 0, "a preview never invokes the CLI");
+  for (const preview of previews) {
+    assert.equal(preview.mode, "dry_run", preview.title);
+    assert.equal(preview.status, previewStatus, preview.title);
+    assert.equal(preview.count, null, preview.title);
+    assert.equal(preview.complete, null, preview.title);
+    assert.equal(preview.nextPageToken, null, preview.title);
+    assert.equal(preview.records, null, preview.title);
+    assert.equal(preview.raw, null, preview.title);
+    assert.match(preview.text, /^Status: not collected: dry run previewed the command/m, preview.title);
+    assert.doesNotMatch(preview.text, /^Records: /m, preview.title);
+  }
+
+  // The registered tool JSON is the agent-visible surface; it carries the same nulls and status, and no [] placeholder.
+  const tools = registeredTools();
+  for (const name of ["gws_ops_investigate_alerts", "gws_ops_trace_admin_activity", "gws_ops_review_tokens"]) {
+    const result = await tools.run(name, { gws_bin: fake, dry_run: true });
+    assert.equal(result.isError, undefined, name);
+    assert.equal(result.details.mode, "dry_run", name);
+    assert.equal(result.details.status, previewStatus, name);
+    assert.equal(result.details.count, null, name);
+    assert.equal(result.details.complete, null, name);
+    assert.equal(result.details.records, null, name);
+    assert.equal(result.details.next_page_token, null, name);
+  }
+
+  // An executed call keeps its real counts and states completeness from the page cursor.
+  const executed = await traceGwsAdminActivity({ gwsBin: fake }, createRunner());
+  assert.equal(executed.mode, "execute");
+  assert.equal(executed.count, 1);
+  assert.equal(executed.status, "complete: the CLI response carried no nextPageToken, so the 1 record(s) are the whole population for this query");
+  const truncated = await traceGwsAdminActivity({ gwsBin: fake }, createRunner({ admin: adminPayload({ nextPageToken: "CAoQ1" }) }));
+  assert.match(truncated.status, /^partial: at least 1; the CLI response carried a nextPageToken after 1 record\(s\)/);
 });
 
 test("traceGwsAdminActivity normalizes activity records", async () => {
@@ -588,12 +635,17 @@ test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, completen
   const tokenAnalysis = JSON.parse(readFileSync(join(result.outputDir, "analysis", "token_activity.json"), "utf8"));
   assert.equal(tokenAnalysis.complete, false);
   assert.equal(tokenAnalysis.nextPageToken, "more-tokens");
+  assert.match(tokenAnalysis.status, /^partial: at least 1; the CLI response carried a nextPageToken/);
   const adminAnalysis = JSON.parse(readFileSync(join(result.outputDir, "analysis", "admin_activity.json"), "utf8"));
   assert.equal(adminAnalysis.complete, true);
   assert.equal(adminAnalysis.nextPageToken, null);
+  assert.match(adminAnalysis.status, /^complete: the CLI response carried no nextPageToken/);
+  assert.equal(adminAnalysis.records.length, 1);
   const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
   assert.match(summary, /Complete page: no \(nextPageToken present\)/);
   assert.match(summary, /Complete page: yes/);
+  assert.match(summary, /^- Status: complete: the CLI response carried no nextPageToken/m);
+  assert.match(summary, /^- Status: partial: at least 1; /m);
 });
 
 test("rule 9 (end to end): the evidence bundle and tool results never carry a planted secret or the echoed CLI token", async () => {
