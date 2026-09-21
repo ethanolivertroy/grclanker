@@ -41,6 +41,7 @@ import { registerSlackTools } from "./grc-tools/slack.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
+import { registerZscalerTools } from "./grc-tools/zscaler.js";
 
 /**
  * Domain tool registrars, kept alphabetical by integration. Add a new
@@ -68,6 +69,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerVantaTools,
   registerWebexTools,
   registerZoomTools,
+  registerZscalerTools,
 ];
 
 function registerDomainTools(pi: ExtensionAPI): number {
