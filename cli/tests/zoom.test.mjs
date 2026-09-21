@@ -21,6 +21,7 @@ import {
   assessZoomCollaborationGovernance,
   assessZoomCollaborationGovernanceFromSnapshot,
   assessZoomIdentity,
+  assessZoomIdentityFromSnapshot,
   assessZoomMeetingSecurity,
   assessZoomMeetingSecurityFromSnapshot,
   checkZoomAccess,
@@ -28,6 +29,7 @@ import {
   exportZoomAuditBundle,
   resolveSecureOutputPath,
   resolveZoomConfiguration,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/zoom.js";
 
 function createTempBase(prefix) {
@@ -49,6 +51,7 @@ function sampleConfig(overrides = {}) {
 function jsonResponse(value, options = {}) {
   return new Response(JSON.stringify(value), {
     status: options.status ?? 200,
+    ...(options.statusText ? { statusText: options.statusText } : {}),
     headers: {
       "content-type": "application/json",
       ...(options.headers ?? {}),
@@ -349,6 +352,11 @@ function paginated(key, items, url, extra = {}) {
  * overrides whole responses by path suffix.
  */
 function httpAccountClient(account = {}, respond = {}) {
+  return new ZoomApiClient(sampleConfig(), { fetchImpl: routedFetch(account, respond), sleep: async () => {} });
+}
+
+/** Routes every Zoom endpoint the collectors call to a compliant JSON fixture; `respond` overrides by path suffix. */
+function routedFetch(account = {}, respond = {}) {
   const data = {
     users: range(2, (n) => ({ id: `user-${n}`, email: `user-${n}@example.com`, status: "active", type: 2, login_types: [101] })),
     roles: [
@@ -387,7 +395,7 @@ function httpAccountClient(account = {}, respond = {}) {
     }
     return jsonResponse({ code: 404, message: `unrouted ${path}` }, { status: 404 });
   };
-  return new ZoomApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+  return fetchImpl;
 }
 
 /** Minimal store/deflate zip reader (central directory driven) so the archive can be inspected without new dependencies. */
@@ -1189,10 +1197,10 @@ test("rule 9: the audit bundle and its zip never contain credential-bearing valu
 
   const snapshot = await collectZoomSnapshot(client, { now: NOW });
   assert.equal(snapshot.currentUser.data.host_key, "[REDACTED]");
-  assert.equal(snapshot.currentUser.data.personal_meeting_url, "https://zoom.us/j/1234567890?pwd=[REDACTED]");
+  assert.equal(snapshot.currentUser.data.personal_meeting_url, "https://zoom.us/j/1234567890?[REDACTED]", "the whole query of an embedded URL is dropped");
   assert.equal(snapshot.settings.settings.schedule_meeting.pmi_password, "[REDACTED]");
   assert.equal(snapshot.settings.settings.schedule_meeting.require_password_for_scheduling_new_meetings, true);
-  assert.match(snapshot.trustedDomains.error, /access_token=\[REDACTED\] failed with Bearer \[REDACTED\] and secret \[REDACTED\]/);
+  assert.match(snapshot.trustedDomains.error, /trusted_domains\?\[REDACTED\] failed with Bearer \[REDACTED\] and secret \[REDACTED\]/);
 
   const result = await exportZoomAuditBundle(client, config, base, { now: NOW });
   const files = walkFiles(result.outputDir);
@@ -1417,12 +1425,12 @@ test("round 2 blocking 1: a denied group settings option=meeting_security view d
     const item = findingById({ findings: result.findings }, id);
     assert.equal(item.status, "warn", `${id}: ${item.summary}`);
     assert.match(item.summary, /1 group settings surfaces were unreadable, so group overrides are unproven: Finance: \/groups\/group-1\/settings\?option=meeting_security was denied \(403/, `${id}: ${item.summary}`);
-    assert.deepEqual(item.evidence.groups_unreadable, [`Finance: ${endpoint} was denied (403; check the app scopes and admin role)`]);
+    assert.deepEqual(item.evidence.groups_unreadable, [`Finance: ${endpoint} was denied (403; check the app scopes and admin role): Invalid access token, does not contain scopes`]);
   }
   for (const id of ["ZOOM-ID-01", "ZOOM-ID-02", "ZOOM-ID-03", "ZOOM-ID-04", "ZOOM-ID-05", "ZOOM-ID-06", "ZOOM-COLLAB-01", "ZOOM-COLLAB-04", "ZOOM-COLLAB-05", "ZOOM-COLLAB-06"]) {
     assert.equal(findingById({ findings: result.findings }, id).status, "pass", id);
   }
-  const expectedError = `group_settings:group-1:meeting_security: ${endpoint} was denied (403; check the app scopes and admin role)`;
+  const expectedError = `group_settings:group-1:meeting_security: ${endpoint} was denied (403; check the app scopes and admin role): Invalid access token, does not contain scopes`;
   assert.deepEqual(result.collaboration.errors, [expectedError]);
   assert.deepEqual(result.meeting.errors, [expectedError]);
 
@@ -1442,7 +1450,7 @@ test("round 2 blocking 1: a denied group settings option=meeting_security view d
   for (const id of GROUP_DEPENDENT_IDS) {
     assert.equal(findingById({ findings: lockViewDenied.findings }, id).status, "pass", `${id}: no verdict reads group lock state, so it is disclosed but not demoted`);
   }
-  assert.deepEqual(lockViewDenied.meeting.errors, ["group_lock_settings:group-1:meeting_security: /groups/group-1/lock_settings?option=meeting_security was denied (403; check the app scopes and admin role)"]);
+  assert.deepEqual(lockViewDenied.meeting.errors, ["group_lock_settings:group-1:meeting_security: /groups/group-1/lock_settings?option=meeting_security was denied (403; check the app scopes and admin role): Invalid access token, does not contain scopes"]);
 });
 
 test("round 2 blocking 2: ZOOM-ID-02 never passes on an emptied admin role inventory when GET /roles is unreadable or truncated", async () => {
@@ -1524,4 +1532,164 @@ test("rule 1 corollary sweep: making each surface unreadable in turn demotes exa
       assert.ok(result.errors.some((entry) => scenario.endpoint.test(entry)), `${scenario.surface}: the errors arrays name the unreadable endpoint (${result.errors.join(" | ")})`);
     }
   }
+});
+
+const ERROR_CANARIES = {
+  bearer: "CANARY-BEARER-7f3a9c1d",
+  session: "CANARY-SESSION-7f3a9c1d",
+  apiKey: "CANARY-APIKEY-7f3a9c1d",
+  urlToken: "CANARY-URLTOKEN-7f3a9c1d",
+  longToken: "CANARY-LONGTOKEN-7f3a9c1d",
+  // Plain lowercase letters: no header, no name, no token shape. Only the rule that never echoes a non-JSON body keeps it out.
+  bareBody: "canaryhtmlbodyzqxwvutsrp",
+};
+
+function canaryHtmlPage({ bareBody = true } = {}) {
+  return `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${ERROR_CANARIES.bearer}</p><p>Set-Cookie: session_id=${ERROR_CANARIES.session}; Path=/; HttpOnly</p><p>X-Api-Key: ${ERROR_CANARIES.apiKey}</p>${bareBody ? `<p>${ERROR_CANARIES.bareBody}</p>` : ""}</body></html>`;
+}
+
+function assertNoCanary(text, label) {
+  for (const [name, canary] of Object.entries(ERROR_CANARIES)) {
+    assert.ok(!text.includes(canary), `${label}: ${name} canary leaked`);
+  }
+}
+
+test("scrubErrorText redacts every credential shape in free text and leaves benign operator text untouched", () => {
+  const cases = [
+    { name: "tokenised URL query", input: `retry at https://example.invalid/callback?access_token=${ERROR_CANARIES.urlToken}&state=x`, expect: /https:\/\/example\.invalid\/callback\?\[REDACTED\]$/ },
+    { name: "tokenised URL fragment", input: `see https://app.example.invalid/#access_token=${ERROR_CANARIES.urlToken}&token_type=bearer`, expect: /https:\/\/app\.example\.invalid\/#\[REDACTED\]$/ },
+    { name: "relative path query", input: `GET /callback?access_token=${ERROR_CANARIES.urlToken}&state=x failed`, expect: /\/callback\?access_token=\[REDACTED\]&state=x failed/ },
+    { name: "Bearer", input: `Authorization: Bearer ${ERROR_CANARIES.bearer}`, expect: /Bearer \[REDACTED\]/ },
+    { name: "Basic", input: "Authorization: Basic Y2xpZW50LWlkOmNsaWVudC1zZWNyZXQtN2YzYTljMWQ=", expect: /^Authorization: Basic \[REDACTED\]$/ },
+    { name: "Cookie", input: `Cookie: session_id=${ERROR_CANARIES.session}; theme=dark`, expect: /^Cookie: \[REDACTED\]$/ },
+    { name: "Set-Cookie", input: `Set-Cookie: session_id=${ERROR_CANARIES.session}; Path=/; HttpOnly`, expect: /^Set-Cookie: \[REDACTED\]$/ },
+    { name: "session id", input: `session_id=${ERROR_CANARIES.session}`, expect: /^session_id=\[REDACTED\]$/ },
+    { name: "API key header", input: `X-Api-Key: ${ERROR_CANARIES.apiKey}`, expect: /^X-Api-Key: \[REDACTED\]$/ },
+    { name: "API key quoted", input: `api_key="${ERROR_CANARIES.apiKey}"`, expect: /^api_key="\[REDACTED\]"$/ },
+    { name: "client secret", input: `client_secret=${ERROR_CANARIES.apiKey}`, expect: /^client_secret=\[REDACTED\]$/ },
+    { name: "client secret JSON", input: `{"client_secret": "${ERROR_CANARIES.apiKey}"}`, expect: /^\{"client_secret": "\[REDACTED\]"\}$/ },
+    { name: "password unquoted", input: "password: hunter22seven", expect: /^password: \[REDACTED\]$/ },
+    { name: "password quoted", input: `password='hunter22seven'`, expect: /^password='\[REDACTED\]'$/ },
+    { name: "access, refresh, and id tokens", input: "access_token=abcdef123456 refresh_token=abcdef123456 id_token=abcdef123456", expect: /^access_token=\[REDACTED\] refresh_token=\[REDACTED\] id_token=\[REDACTED\]$/ },
+    { name: "full HTML page", input: canaryHtmlPage({ bareBody: false }), expect: /Bearer \[REDACTED\]<\/p><p>Set-Cookie: \[REDACTED\]<\/p><p>X-Api-Key: \[REDACTED\]<\/p>/ },
+    { name: "free-text JSON message with a long token", input: `{"code":124,"message":"Upstream rejected request ${ERROR_CANARIES.longToken} for tenant 9f8e7d6c5b4a39281706f5e4d3c2b1a0"}`, expect: /"message":"Upstream rejected request \[REDACTED\] for tenant \[REDACTED\]"/ },
+  ];
+  for (const item of cases) {
+    const scrubbed = scrubErrorText(item.input);
+    assert.match(scrubbed, item.expect, item.name);
+    assertNoCanary(scrubbed, item.name);
+    assert.doesNotMatch(scrubbed, /hunter22seven|abcdef123456|9f8e7d6c5b4a39281706f5e4d3c2b1a0|Y2xpZW50/, item.name);
+    assert.equal(scrubErrorText(scrubbed), scrubbed, `${item.name}: idempotent`);
+  }
+
+  assert.equal(scrubErrorText("token zoom-token-value here", ["zoom-token-value"]), "token [REDACTED] here", "configured credential values are removed exactly");
+
+  const benign = [
+    "Zoom request failed for GET /v2/accounts/acct-123/settings?option=meeting_security (403 Forbidden): Invalid access token, does not contain scopes: [account:read:trusted_domains:master] (application/json body of 87 bytes)",
+    "Zoom request failed for GET /v2/report/operationlogs?from=2026-08-22&to=2026-09-21 (502 Bad Gateway): non-JSON text/html body of 236 bytes omitted",
+    "Zoom request failed for POST /oauth/token (502 Bad Gateway): non-JSON text/html body of 243 bytes omitted",
+    "GET /v2/phone/account_settings?setting_types=auto_call_recording,ad_hoc_call_recording",
+    "GET /v2/users?page_size=300 and GET /v2/roles/0/members?page_size=300",
+    "POST /oauth/token returned 401 Unauthorized",
+    "requires report:read:operation_logs:admin, contact_group:read:list_groups:admin, or imgroup:read:admin",
+    "token: user",
+    "sign_in_with_two_factor_auth is `all`; schedule_meeting.require_password_for_scheduling_new_meetings is true; meeting_authentication is locked",
+    "INVALID_ACCESS_TOKEN_SCOPE",
+    ZOOM_DOCS.accountSettings,
+    ZOOM_DOCS.groupLockSettings,
+    "In Meeting (Basic) > Screen sharing",
+  ];
+  for (const text of benign) {
+    assert.equal(scrubErrorText(text), text, `benign text must survive: ${text}`);
+  }
+
+  // The heuristic cannot recognise arbitrary words, which is exactly why fetchJson never echoes a non-JSON body.
+  assert.equal(scrubErrorText(ERROR_CANARIES.bareBody), ERROR_CANARIES.bareBody);
+  assert.equal(scrubErrorText("user-q2hCJZ7bT5C-lk1NXVApFA", [], { longTokens: false }), "user-q2hCJZ7bT5C-lk1NXVApFA", "data mode keeps opaque identifiers");
+  assert.equal(scrubErrorText("user-q2hCJZ7bT5C-lk1NXVApFA"), "[REDACTED]", "error mode treats the same run as a token");
+});
+
+const ERROR_BODY_SHAPES = {
+  "502 text/html": () => new Response(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }),
+  "403 JSON with tokenised URL": () => jsonResponse({ code: 124, message: `Access denied; retry at https://example.invalid/callback?access_token=${ERROR_CANARIES.urlToken}&state=x` }, { status: 403, statusText: "Forbidden" }),
+  "403 JSON free text with headers and a long token": () => jsonResponse({ code: 124, message: `Upstream rejected the request. Debug: Authorization: Bearer ${ERROR_CANARIES.bearer}; Cookie: session_id=${ERROR_CANARIES.session}; X-Api-Key: ${ERROR_CANARIES.apiKey}; trace ${ERROR_CANARIES.longToken}` }, { status: 403, statusText: "Forbidden" }),
+};
+
+/** A Server-to-Server OAuth client over the fixture router; records every request key and fails one key with one shape. */
+function walkClient({ record, failKey, shape } = {}) {
+  const config = sampleConfig({ token: undefined, clientId: "walk-client-id", clientSecret: "walk-client-secret-7f3a9c1d" });
+  const routed = routedFetch();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const key = `${(init.method ?? "GET").toUpperCase()} ${url.pathname}${url.search}`;
+    record?.add(key);
+    if (failKey === key) return ERROR_BODY_SHAPES[shape]();
+    if (url.pathname === "/oauth/token") return jsonResponse({ access_token: "walk-access-token-7f3a9c1d", token_type: "bearer", expires_in: 3600 });
+    return routed(input, init);
+  };
+  return { client: new ZoomApiClient(config, { fetchImpl, sleep: async () => {} }), config };
+}
+
+test("error-body walk: every surface the collectors call, failing in three body shapes, leaks no canary and is disclosed with status, endpoint, content type, and length", async () => {
+  const base = createTempBase("grclanker-zoom-error-body-walk-");
+  const record = new Set();
+  const baseline = walkClient({ record });
+  const baselineExport = await exportZoomAuditBundle(baseline.client, baseline.config, base, { now: NOW });
+  await checkZoomAccess(baseline.client);
+  assert.equal(baselineExport.errorCount, 0);
+  const surfaces = [...record].sort();
+  assert.ok(surfaces.includes("POST /oauth/token"), "the token exchange is part of the walk");
+  assert.ok(surfaces.filter((key) => key.startsWith("GET /v2/")).length >= 21, `expected at least 21 GET surfaces, saw ${surfaces.join(", ")}`);
+
+  const walked = [];
+  for (const key of surfaces) {
+    for (const shape of Object.keys(ERROR_BODY_SHAPES)) {
+      const label = `${key} [${shape}]`;
+      const { client, config } = walkClient({ failKey: key, shape });
+      const [method, target] = key.split(" ");
+      const targetUrl = new URL(target, "https://api.zoom.us");
+      const directPath = method === "POST" ? "/users/me" : targetUrl.pathname.replace(/^\/v2/, "");
+      const thrown = await client.get(directPath, Object.fromEntries(targetUrl.searchParams)).then(() => null, (error) => error);
+      assert.ok(thrown instanceof ZoomApiError, `${label}: the direct client call throws a ZoomApiError`);
+      assertNoCanary(thrown.message, `${label} thrown message`);
+      assert.match(thrown.message, /^Zoom request failed for (GET|POST) \/\S+ \((502 Bad Gateway|403 Forbidden)\): /, label);
+      assert.match(thrown.message, /(text\/html|application\/json) body of \d+ bytes/, label);
+      assert.ok(thrown.message.includes(targetUrl.pathname), `${label}: the thrown message names the endpoint`);
+
+      const snapshot = await collectZoomSnapshot(client, { now: NOW });
+      const access = await checkZoomAccess(client);
+      const assessments = [
+        assessZoomIdentityFromSnapshot(snapshot, { now: NOW }),
+        assessZoomCollaborationGovernanceFromSnapshot(snapshot, { now: NOW }),
+        assessZoomMeetingSecurityFromSnapshot(snapshot),
+      ];
+      assertNoCanary(JSON.stringify(snapshot), `${label} snapshot`);
+      assertNoCanary(JSON.stringify(access), `${label} access check`);
+      assertNoCanary(JSON.stringify(assessments), `${label} findings, summaries, and errors arrays`);
+      const disclosures = [
+        ...assessments.flatMap((assessment) => assessment.errors),
+        ...access.surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.error ?? ""),
+      ];
+      assert.ok(disclosures.length > 0, `${label}: an assessment errors array or the access check discloses the failure`);
+      assert.ok(disclosures.some((entry) => entry.includes(targetUrl.pathname.replace(/^\/v2/, ""))), `${label}: the in-memory disclosure names the endpoint (${disclosures.join(" | ")})`);
+
+      const exported = await exportZoomAuditBundle(client, config, createTempBase("grclanker-zoom-error-body-run-"), { now: NOW });
+      assert.ok(exported.errorCount > 0, `${label}: the bundle records the failure`);
+      for (const file of walkFiles(exported.outputDir)) {
+        assertNoCanary(readFileSync(file, "utf8"), `${label} ${file}`);
+      }
+      for (const entry of readZipEntries(readFileSync(exported.zipPath))) {
+        assertNoCanary(entry.content, `${label} zip entry ${entry.name}`);
+      }
+      const errorsLog = readFileSync(join(exported.outputDir, "_errors.log"), "utf8");
+      assert.ok(errorsLog.includes(targetUrl.pathname.replace(/^\/v2/, "")), `${label}: _errors.log names the endpoint`);
+      assert.match(errorsLog, /\((502 Bad Gateway|403 Forbidden)\)|was denied \(403;/, `${label}: _errors.log carries the HTTP status`);
+      assert.match(errorsLog, /(text\/html|application\/json) body of \d+ bytes/, `${label}: _errors.log carries the content type and body length`);
+      if (shape === "502 text/html") {
+        assert.match(errorsLog, /non-JSON text\/html body of \d+ bytes omitted/, `${label}: the non-JSON body is described, not echoed`);
+      }
+      walked.push(label);
+    }
+  }
+  assert.equal(walked.length, surfaces.length * Object.keys(ERROR_BODY_SHAPES).length);
 });

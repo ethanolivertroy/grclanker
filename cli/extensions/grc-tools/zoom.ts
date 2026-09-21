@@ -417,6 +417,26 @@ const POLICY_KEY_PATTERN = /^(require_|allow_|enable_|embed_|force_|only_|use_|s
 const SECRET_QUERY_PARAM_PATTERN = /([?&](?:pwd|passcode|password|token|access_token|refresh_token|tk|zak|sig|signature|api_key|apikey|secret|client_secret)=)[^&#\s"'<>]*/gi;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g;
 
+/**
+ * Error-text hygiene (rule 9, error-body class). Every error string passes
+ * through scrubErrorText: the ZoomApiError constructor, errorMessage (the
+ * helper every collector uses), and the bundle write sink. A non-JSON
+ * response body is never echoed at all (fetchJson substitutes status,
+ * endpoint, content type, and byte length), so these rules guard the
+ * documented JSON error fields that are echoed and any text assembled from
+ * them. The patterns are unanchored so an embedded URL, header, or
+ * name-value pair anywhere in free text is caught.
+ */
+const EMBEDDED_URL_QUERY_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()?#]+)\?[^\s"'<>()#]*/gi;
+// Doc anchors such as #tag/accounts/GET/accounts/{accountId}/settings stay; a fragment carrying name=value pairs (implicit-flow tokens) is dropped.
+const EMBEDDED_URL_FRAGMENT_PATTERN = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()#]+#)[^\s"'<>()]*=[^\s"'<>()]*/gi;
+const BASIC_AUTH_PATTERN = /\bBasic\s+(?=[A-Za-z0-9+/=]*[0-9+/=])[A-Za-z0-9+/=]{16,}/g;
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookie)(["']?\s*[:=]\s*)(?!\s*\[REDACTED\])[^\s<>"'][^\r\n<>"']*/gi;
+const CREDENTIAL_ASSIGNMENT_PATTERN = /\b((?:[a-z0-9_-]*(?:token|secret|password|passwd|passcode|session[_-]?id|sessionid|private[_-]?key|signature))|x-api-key|x-auth-token|api[_-]?key|apikey|authorization|jsessionid|session|pwd|sig|zak|tk)(["']?\s*[:=]\s*)(["']?)(?!Bearer\b|Basic\b)[^\s"'<>;,&]{6,}/gi;
+// "/" is not a run character so URL and endpoint paths split into short segments; base64url, hex, and JWT material never contains it and Basic values have their own rule.
+const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+=_-]{16,}/g;
+const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$/;
+
 function isSensitiveKey(key: string): boolean {
   return SENSITIVE_KEY_PATTERN.test(key) && !POLICY_KEY_PATTERN.test(key);
 }
@@ -426,19 +446,56 @@ function credentialValues(config: ZoomResolvedConfig): string[] {
     .filter((value): value is string => typeof value === "string" && value.trim().length >= 4);
 }
 
-function scrubSecretText(text: string, secrets: string[]): string {
+/**
+ * A run of 16 or more token characters is treated as a credential when it
+ * carries a digit or mixed case. Plain lowercase words (meeting_authentication,
+ * ad_hoc_call_recording) and uppercase error codes (INVALID_ACCESS_TOKEN) are
+ * left alone. Arbitrary words in a response body are therefore not something
+ * this heuristic can recognise, which is why fetchJson never echoes a non-JSON
+ * body in the first place.
+ */
+function looksLikeToken(run: string): boolean {
+  if (UPPERCASE_CODE_PATTERN.test(run)) return false;
+  const hasDigit = /\d/.test(run);
+  const mixedCase = /[a-z]/.test(run) && /[A-Z]/.test(run);
+  return hasDigit || mixedCase;
+}
+
+export interface ScrubErrorTextOptions {
+  /**
+   * Apply the long-token heuristic. On by default because error text is the
+   * only place a bare token can arrive; the bundle sink and data values turn
+   * it off because Zoom identifiers (22-character user, group, and account
+   * ids) are indistinguishable from tokens and are evidence, not secrets.
+   */
+  longTokens?: boolean;
+}
+
+export function scrubErrorText(text: string, secrets: string[] = [], options: ScrubErrorTextOptions = {}): string {
   let scrubbed = text;
   for (const secret of secrets) {
     scrubbed = scrubbed.split(secret).join(REDACTED);
   }
-  return scrubbed
+  scrubbed = scrubbed
+    .replace(EMBEDDED_URL_QUERY_PATTERN, `$1?${REDACTED}`)
+    .replace(EMBEDDED_URL_FRAGMENT_PATTERN, `$1${REDACTED}`)
     .replace(SECRET_QUERY_PARAM_PATTERN, `$1${REDACTED}`)
-    .replace(BEARER_PATTERN, `Bearer ${REDACTED}`);
+    .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
+    .replace(BASIC_AUTH_PATTERN, `Basic ${REDACTED}`)
+    .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, `$1$2$3${REDACTED}`);
+  if (options.longTokens === false) return scrubbed;
+  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? REDACTED : run));
+}
+
+/** Data values and bundle content: every rule except the long-token heuristic (see ScrubErrorTextOptions). */
+function scrubDataText(text: string, secrets: string[]): string {
+  return scrubErrorText(text, secrets, { longTokens: false });
 }
 
 function sanitizeValue(value: unknown, secrets: string[], redactLeaves = false): unknown {
   if (typeof value === "string") {
-    return redactLeaves ? REDACTED : scrubSecretText(value, secrets);
+    return redactLeaves ? REDACTED : scrubDataText(value, secrets);
   }
   if (typeof value === "number") {
     return redactLeaves ? REDACTED : value;
@@ -464,7 +521,7 @@ function sanitizeSurface<T>(surface: ZoomSurface<T>, secrets: string[]): ZoomSur
   return {
     ...surface,
     ...(surface.data === undefined ? {} : { data: sanitizeValue(surface.data, secrets) as T }),
-    ...(surface.error === undefined ? {} : { error: scrubSecretText(surface.error, secrets) }),
+    ...(surface.error === undefined ? {} : { error: scrubErrorText(surface.error, secrets) }),
   };
 }
 
@@ -642,6 +699,21 @@ function deriveDefaultOauthBaseUrl(baseUrl: string): string {
   return /zoomgov/i.test(baseUrl) ? "https://zoomgov.com" : "https://zoom.us";
 }
 
+interface ParsedJsonBody {
+  payload: JsonRecord;
+  /** False when the body was present but not JSON; such a body is described, never echoed. */
+  parsed: boolean;
+}
+
+function parseJsonBody(rawText: string): ParsedJsonBody {
+  if (rawText.length === 0) return { payload: {}, parsed: true };
+  try {
+    return { payload: asObject(JSON.parse(rawText)) ?? {}, parsed: true };
+  } catch {
+    return { payload: {}, parsed: false };
+  }
+}
+
 function zoomErrorSummary(payload: unknown): string | undefined {
   const object = asObject(payload);
   if (!object) return undefined;
@@ -660,7 +732,7 @@ export class ZoomApiError extends Error {
   readonly retryAfterMs?: number;
 
   constructor(message: string, status: number, retryAfterMs?: number) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "ZoomApiError";
     this.status = status;
     this.retryAfterMs = retryAfterMs;
@@ -674,7 +746,7 @@ function isDeniedError(error: unknown): boolean {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function readConfigFile(pathname: string): JsonRecord {
@@ -860,31 +932,59 @@ export class ZoomApiClient {
 
         const response = await this.fetchImpl(url, { ...init, headers, signal: controller.signal });
         const rawText = await response.text();
-        let payload: JsonRecord = {};
-        if (rawText.length > 0) {
-          try {
-            payload = asObject(JSON.parse(rawText)) ?? {};
-          } catch {
-            payload = {};
-          }
-        }
+        const body = parseJsonBody(rawText);
         if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
           await this.sleep(this.parseRetryAfter(response));
           continue;
         }
         if (!response.ok) {
-          const detail = zoomErrorSummary(payload) ?? rawText.slice(0, 240);
           throw new ZoomApiError(
-            `Zoom request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+            this.describeFailure(url, init.method ?? "GET", response, rawText, body),
             response.status,
             response.status === 429 ? this.parseRetryAfter(response) : undefined,
           );
         }
-        return payload;
+        return body.payload;
       } finally {
         clearTimeout(timeout);
       }
     }
+  }
+
+  /**
+   * Builds the thrown message from what the response is, never from what a
+   * non-JSON body says: HTTP status, method and endpoint, content type, and
+   * byte length. Only the documented JSON error fields (message, error,
+   * reason, errors[]) are echoed, and they pass through scrubErrorText with
+   * the configured credentials, so a proxy error page, an HTML sign-in page,
+   * or a debug dump can never reach a finding, a summary, or the bundle.
+   */
+  private describeFailure(
+    url: string,
+    method: string,
+    response: Response,
+    rawText: string,
+    body: ParsedJsonBody,
+  ): string {
+    const target = new URL(url);
+    const statusText = response.statusText ? ` ${response.statusText}` : "";
+    const mediaType = (response.headers.get("content-type") ?? "").split(";")[0].trim() || "untyped";
+    const bodyDescriptor = `${mediaType} body of ${Buffer.byteLength(rawText, "utf8")} bytes`;
+    const secrets = credentialValues(this.config);
+    const summary = body.parsed ? zoomErrorSummary(body.payload) : undefined;
+    const detail = rawText.length === 0
+      ? "empty body"
+      : !body.parsed
+        ? `non-JSON ${bodyDescriptor} omitted`
+        : summary
+          ? `${scrubErrorText(summary, secrets)} (${bodyDescriptor})`
+          : `${bodyDescriptor} carried no documented message field`;
+    // The status parenthetical sits after the endpoint so a path ending in
+    // "token" followed by ": detail" cannot read as a token assignment.
+    return scrubErrorText(
+      `Zoom request failed for ${method.toUpperCase()} ${target.pathname}${target.search} (${response.status}${statusText}): ${detail}`,
+      secrets,
+    );
   }
 
   private async fetchAccessToken(): Promise<string> {
@@ -1110,12 +1210,32 @@ function emptyList<T = JsonRecord>(): ZoomListResult<T> {
   return { items: [], truncated: false, pages: 0 };
 }
 
+const FAILURE_MESSAGE_PATTERN = /^Zoom request failed(?: for [A-Z]+ (\S+))? \([^)]*\): (.*)$/s;
+
+/**
+ * The scrubbed detail behind a failed surface without this module's own
+ * status and endpoint prefix. A failure raised by another request (the token
+ * exchange) keeps its full message so the real endpoint stays named.
+ */
+function surfaceDetail(surface: ZoomSurface): string | undefined {
+  const error = surface.error?.trim();
+  if (!error) return undefined;
+  const match = FAILURE_MESSAGE_PATTERN.exec(error);
+  if (!match) return error;
+  const [, requestPath, detail] = match;
+  const sameEndpoint = requestPath === undefined
+    || requestPath.replace(/^\/v2/, "").split("?")[0] === surface.endpoint.split("?")[0];
+  return sameEndpoint ? detail.trim() || undefined : error;
+}
+
 function surfaceCause(surface: ZoomSurface): string {
   switch (surface.status) {
     case "ok":
       return "readable";
-    case "denied":
-      return `${surface.endpoint} was denied (${surface.httpStatus ?? "401/403"}; check the app scopes and admin role)`;
+    case "denied": {
+      const detail = surfaceDetail(surface);
+      return `${surface.endpoint} was denied (${surface.httpStatus ?? "401/403"}; check the app scopes and admin role)${detail ? `: ${detail}` : ""}`;
+    }
     case "error":
       return `${surface.endpoint} failed: ${surface.error ?? "unknown error"}`;
     case "skipped":
@@ -1187,7 +1307,7 @@ function sanitizeSnapshot(snapshot: ZoomSnapshot, secrets: string[]): ZoomSnapsh
     groups: sanitizeSurface(snapshot.groups, secrets),
     groupPolicies: snapshot.groupPolicies.map((policy) => ({
       ...policy,
-      name: scrubSecretText(policy.name, secrets),
+      name: scrubDataText(policy.name, secrets),
       settings: sanitizeSurface(policy.settings, secrets),
       locks: sanitizeSurface(policy.locks, secrets),
       settingsSurfaces: policy.settingsSurfaces.map((surface) => sanitizeSurface(surface, secrets)),
@@ -2825,8 +2945,9 @@ export async function exportZoomAuditBundle(
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.accountId)}-audit-bundle`);
   const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
   const secrets = credentialValues(config);
+  // Second layer for every bundle file: the same scrub the error constructors apply, minus the long-token heuristic (opaque Zoom ids are evidence).
   const write = (relativePathname: string, content: string) =>
-    writeSecureTextFile(outputDir, relativePathname, scrubSecretText(content, secrets));
+    writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
   const readPaths = [...snapshot.settings.readPaths].sort();
   const lockPaths = [...snapshot.settings.lockPaths].sort();
 
