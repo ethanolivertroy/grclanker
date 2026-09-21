@@ -21,6 +21,7 @@ import {
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/cloudflare.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -977,4 +978,189 @@ test("self-check (d): a fully compliant account built from documented fields pas
     assert.deepEqual(result.errors, []);
   }
   assert.equal(results.identity.findings.length + results.zone.findings.length + results.traffic.findings.length, 27);
+});
+
+test("verdict rule 10: listCursorPaginated reports an empty page with a cursor, a repeated cursor, the page budget, and a mid-listing 404 as truncated", async () => {
+  const cursorClient = (handler) => new CloudflareApiClient(sampleConfig(), { fetchImpl: fakeFetch(handler).fetchImpl });
+
+  const emptyPageWithCursor = await cursorClient((url) => {
+    const cursor = url.searchParams.get("cursor");
+    return cursor
+      ? { payload: { success: true, result: [], result_info: { cursors: { after: "still-more" } } } }
+      : { payload: { success: true, result: [{ id: "rs-1" }], result_info: { cursors: { after: "c-1" } } } };
+  }).listZoneRulesets("zone-1");
+  assert.equal(emptyPageWithCursor.items.length, 1);
+  assert.equal(emptyPageWithCursor.truncated, true);
+  assert.equal(emptyPageWithCursor.totalCount, undefined);
+
+  const repeatedCursor = await cursorClient(() => ({ payload: { success: true, result: [{ id: "rs-x" }], result_info: { cursors: { after: "same" } } } })).listZoneRulesets("zone-1");
+  assert.equal(repeatedCursor.truncated, true, "a cursor that repeats the one just used is reported as truncated instead of following it forever");
+  assert.equal(repeatedCursor.items.length, 2);
+
+  let page = 0;
+  const budget = await cursorClient(() => {
+    page += 1;
+    return { payload: { success: true, result: [{ id: `rs-${page}` }], result_info: { cursors: { after: `c-${page}` } } } };
+  }).listZoneRulesets("zone-1");
+  assert.equal(page, 100, "the cursor loop stops at its page budget");
+  assert.equal(budget.items.length, 100);
+  assert.equal(budget.truncated, true);
+  assert.equal(budget.totalCount, undefined);
+
+  const cursorNotFound = await cursorClient((url) => (url.searchParams.get("cursor")
+    ? { status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } }
+    : { payload: { success: true, result: [{ id: "rs-1" }], result_info: { cursors: { after: "c-1" } } } })).listZoneRulesets("zone-1");
+  assert.equal(cursorNotFound.items.length, 1);
+  assert.equal(cursorNotFound.truncated, true, "a 404 after items were collected keeps them and reports the listing incomplete");
+
+  const pageNotFound = await cursorClient((url) => (Number(url.searchParams.get("page")) > 1
+    ? { status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } }
+    : { payload: { success: true, result: Array.from({ length: 50 }, (_, index) => ({ id: `ip-${index}` })), result_info: { page: 1, per_page: 50, total_pages: 3, total_count: 150 } } })).listIpAccessRules("acc-123");
+  assert.equal(pageNotFound.items.length, 50);
+  assert.equal(pageNotFound.truncated, true);
+  assert.equal(pageNotFound.totalCount, undefined);
+
+  const firstPageNotFound = await cursorClient(() => ({ status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } })).listIpAccessRules("acc-123");
+  assert.deepEqual(firstPageNotFound, { items: [], truncated: false, totalCount: 0 }, "a 404 on the first page still means the product is not provisioned");
+});
+
+test("verdict rule 10: CF-IAM-04 caps at warn when the reusable Access policy list is truncated and names seen versus total", async () => {
+  const client = fixtureClient("compliant", {
+    async listAccessPolicies() {
+      return { items: [{ id: "pol-2", name: "Staff", decision: "allow", reusable: true, include: [] }], truncated: true, totalCount: 1200 };
+    },
+  });
+  const identity = await assessCloudflareIdentity(client);
+  const access = byId(identity, "CF-IAM-04");
+  assert.equal(access.status, "warn");
+  assert.match(access.summary, /Partial reusable Access policy inventory: 1 seen of 1200 total/);
+  assert.equal(access.evidence.reusable_policies_truncated, true);
+  assert.equal(access.evidence.reusable_policies_total, 1200);
+  assert.equal(access.evidence.reusable_policies_readable, true);
+});
+
+test("rule 1 corollary: multi-inventory findings never pass when only a secondary read returns 403 and name the unreadable endpoint", async () => {
+  const policiesForbidden = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listAccessPolicies() {
+      throw forbidden("/accounts/acc-123/access/policies");
+    },
+  }));
+  const access = byId(policiesForbidden, "CF-IAM-04");
+  assert.equal(access.status, "manual", access.summary);
+  assert.match(access.summary, /reusable policy list could not be checked/);
+  assert.match(access.summary, /\/accounts\/acc-123\/access\/policies could not be read \(.*403/);
+  assert.match(access.summary, /Access: Apps and Policies: Read/);
+  assert.equal(access.evidence.reusable_policies_readable, false);
+  assert.equal(access.evidence.reusable_policies, 0);
+  assert.equal(access.evidence.inline_policies, 1);
+  assert.ok(policiesForbidden.errors.some((error) => error.includes("/accounts/acc-123/access/policies")));
+  for (const item of policiesForbidden.findings) {
+    if (item.id !== "CF-IAM-04") assert.equal(item.status, "pass", `${item.id} should be unaffected by the policies read: ${item.summary}`);
+  }
+
+  const accountTokensForbidden = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listAccountTokens() {
+      throw forbidden("/accounts/acc-123/tokens");
+    },
+  }));
+  const tokenExpiry = byId(accountTokensForbidden, "CF-IAM-06");
+  assert.equal(tokenExpiry.status, "warn", tokenExpiry.summary);
+  assert.match(tokenExpiry.summary, /\/accounts\/acc-123\/tokens could not be read/);
+  assert.deepEqual(tokenExpiry.evidence.sources.map((source) => source.readable), [true, false]);
+
+  const gatewayForbidden = await assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listGatewayRules() {
+      return { items: [], truncated: false, totalCount: 0 };
+    },
+    async getZeroTrustAccount() {
+      throw forbidden("/accounts/acc-123/gateway");
+    },
+  }));
+  const gateway = byId(gatewayForbidden, "CF-TRF-06");
+  assert.equal(gateway.status, "manual", gateway.summary);
+  assert.match(gateway.summary, /\/accounts\/\{account_id\}\/gateway could not be read \(.*403/);
+});
+
+const FAKE_CLOUDFLARE_SECRETS = {
+  tokenValue: "FAKE_SECRET_TOKEN_1_v4Qy8tRz",
+  abuseContactEmail: "FAKE_SECRET_ABUSE_2@example.test",
+  zoneOwnerEmail: "FAKE_SECRET_OWNER_3@example.test",
+  memberEmail: "FAKE_SECRET_MEMBER_4@example.test",
+  accountFreeformSetting: "FAKE_SECRET_SETTING_5_ghp_abc",
+};
+
+test("verdict rule 9: exportCloudflareAuditBundle never writes token values, contact emails, or unprojected account settings into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-cloudflare-secrets-");
+  const client = fixtureClient("compliant", {
+    async listAccounts() {
+      return {
+        items: [{
+          id: "acc-123",
+          name: "Example",
+          type: "standard",
+          settings: { enforce_twofactor: true, abuse_contact_email: FAKE_CLOUDFLARE_SECRETS.abuseContactEmail, default_nameservers: FAKE_CLOUDFLARE_SECRETS.accountFreeformSetting },
+          legacy_flags: { secret_hint: FAKE_CLOUDFLARE_SECRETS.accountFreeformSetting },
+        }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+    async listZones() {
+      return {
+        items: [{ id: "zone-1", name: "one.example", status: "active", plan: { id: "cf_pro", name: "Pro Website" }, owner: { id: "own-1", type: "user", email: FAKE_CLOUDFLARE_SECRETS.zoneOwnerEmail }, account: { id: "acc-123", name: "Example" } }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+    async listUserTokens() {
+      return {
+        items: [{ id: "tok-1", name: "audit", status: "active", expires_on: FUTURE, last_used_on: RECENT, issued_on: "2026-01-01T00:00:00Z", value: FAKE_CLOUDFLARE_SECRETS.tokenValue, policies: [] }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+    async listMembers() {
+      return {
+        items: [{ id: "m1", status: "accepted", user: { email: FAKE_CLOUDFLARE_SECRETS.memberEmail, two_factor_authentication_enabled: true }, roles: [{ id: "r1", name: "Super Administrator - All Privileges" }] }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  });
+
+  const result = await exportCloudflareAuditBundle(client, sampleConfig(), base);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size > 10);
+  assert.equal(entries.size, files.size, "every written file is in the zip");
+  assertSecretsAbsent(assert, files, Object.values(FAKE_CLOUDFLARE_SECRETS), "bundle files");
+  assertSecretsAbsent(assert, entries, Object.values(FAKE_CLOUDFLARE_SECRETS), "zip entries");
+
+  const accounts = JSON.parse(files.get("core_data/accounts.json"));
+  assert.deepEqual(Object.keys(accounts.items[0]).sort(), ["id", "name", "settings", "type"]);
+  assert.deepEqual(accounts.items[0].settings, { enforce_twofactor: true, abuse_contact_email_configured: true });
+  const zones = JSON.parse(files.get("core_data/zones.json"));
+  assert.deepEqual(zones.items[0].owner, { id: "own-1", type: "user" });
+  assert.deepEqual(zones.items[0].account, { id: "acc-123", name: "Example" });
+  assert.equal(zones.items[0].plan.name, "Pro Website");
+});
+
+test("verdict rule 9: non-JSON error bodies are described, never echoed, in CloudflareApiError messages", async () => {
+  const leaked = "FAKE_SECRET_HEADER_ECHO_6";
+  const fetchImpl = async () => ({
+    ok: false,
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { get: (name) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+    async text() {
+      return `<html><body>Proxy error: Authorization: Bearer ${leaked}</body></html>`;
+    },
+  });
+  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  await assert.rejects(client.listMembers("acc-123"), (error) => {
+    assert.equal(error.status, 502);
+    assert.ok(!error.message.includes(leaked), error.message);
+    assert.match(error.message, /non-JSON text\/html body of \d+ bytes not echoed/);
+    return true;
+  });
 });

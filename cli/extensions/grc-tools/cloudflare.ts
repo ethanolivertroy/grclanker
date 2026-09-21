@@ -37,6 +37,7 @@ const HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
 const STALE_IP_RULE_DAYS = 365;
 const CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
 const AUDIT_LOG_LOOKBACK_DAYS = 30;
+const CURSOR_PAGE_BUDGET = 100;
 
 /**
  * Documentation pages on developers.cloudflare.com/api that every request and
@@ -485,6 +486,15 @@ function cloudflareErrorSummary(payload: unknown): string | undefined {
   return errors.length > 0 ? errors.join("; ") : undefined;
 }
 
+/**
+ * Describes a non-JSON error body by content type and length only. Proxy and
+ * WAF pages can echo request headers, so the body text itself is never kept.
+ */
+function describeNonJsonBody(contentType: string | null, rawText: string): string | undefined {
+  if (rawText.length === 0) return undefined;
+  return `non-JSON ${contentType?.split(";")[0]?.trim() || "unknown content type"} body of ${rawText.length} bytes not echoed`;
+}
+
 export class CloudflareApiError extends Error {
   readonly status: number;
   readonly path: string;
@@ -573,7 +583,7 @@ export class CloudflareApiClient implements CloudflareReader {
       }
 
       if (!response.ok) {
-        const detail = cloudflareErrorSummary(payload) ?? rawText.slice(0, 240);
+        const detail = cloudflareErrorSummary(payload) ?? describeNonJsonBody(response.headers?.get?.("content-type") ?? null, rawText);
         throw new CloudflareApiError(
           `Cloudflare request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
           response.status,
@@ -624,7 +634,13 @@ export class CloudflareApiClient implements CloudflareReader {
         query: { ...options.query, page, per_page: perPage },
         allow404: options.allow404,
       });
-      if (payload === null) return { items: [], truncated: false, totalCount: 0 };
+      if (payload === null) {
+        // A 404 on the first page means the product is not provisioned; a 404
+        // after items were collected means the listing stopped early, so the
+        // collected items are kept and reported as truncated.
+        if (page === 1) return { items: [], truncated: false, totalCount: 0 };
+        return { items, truncated: true, totalCount: undefined };
+      }
 
       const pageItems = extractResultArray(payload);
       const resultInfo = asObject(payload.result_info);
@@ -655,23 +671,30 @@ export class CloudflareApiClient implements CloudflareReader {
   private async listCursorPaginated(path: string, limit: number, perPage: number): Promise<CloudflarePagedList> {
     const items: JsonRecord[] = [];
     let cursor: string | undefined;
-    for (let iteration = 0; iteration < 100; iteration += 1) {
+    for (let iteration = 0; iteration < CURSOR_PAGE_BUDGET; iteration += 1) {
       const payload = await this.requestJson(path, {
         query: { per_page: perPage, cursor },
         allow404: true,
       });
-      if (payload === null) return { items: [], truncated: false, totalCount: 0 };
+      if (payload === null) {
+        if (iteration === 0) return { items: [], truncated: false, totalCount: 0 };
+        return { items, truncated: true, totalCount: undefined };
+      }
       const pageItems = extractResultArray(payload);
       const remaining = limit - items.length;
       items.push(...pageItems.slice(0, remaining));
       if (pageItems.length > remaining) return { items, truncated: true };
 
       const cursors = asObject(asObject(payload.result_info)?.cursors);
-      cursor = asString(cursors?.after);
-      if (!cursor || pageItems.length === 0) break;
+      const nextCursor = asString(cursors?.after);
+      if (!nextCursor) return { items, truncated: false, totalCount: items.length };
+      // A cursor that arrives with an empty page or repeats the one just used
+      // cannot be followed safely; the listing is reported as incomplete.
+      if (pageItems.length === 0 || nextCursor === cursor) return { items, truncated: true, totalCount: undefined };
+      cursor = nextCursor;
       if (items.length >= limit) return { items, truncated: true };
     }
-    return { items, truncated: false, totalCount: items.length };
+    return { items, truncated: true, totalCount: undefined };
   }
 
   private zonePath(zoneId: string, suffix: string): string {
@@ -966,6 +989,50 @@ function deriveAccountContext(
     accountId: undefined,
     note: "Multiple Cloudflare accounts were visible with no account_id selected; account-scoped checks stay manual until account_id is set.",
   };
+}
+
+const ACCOUNT_RECORD_FIELDS = ["id", "name", "type", "created_on"] as const;
+const ACCOUNT_SETTING_FIELDS = ["enforce_twofactor", "api_access_enabled", "access_approval_expiry", "use_account_custom_ns_by_default"] as const;
+const ZONE_RECORD_FIELDS = ["id", "name", "status", "paused", "type", "development_mode", "created_on", "modified_on", "activated_on", "name_servers", "original_name_servers", "original_registrar", "original_dnshost"] as const;
+
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const field of fields) {
+    if (field in record) projected[field] = record[field];
+  }
+  return projected;
+}
+
+/**
+ * Projects a GET /accounts record to the fields the verdicts and the account
+ * context read; contact emails and free-form settings are dropped.
+ */
+function projectAccountRecord(account: JsonRecord): JsonRecord {
+  const settings = asObject(account.settings);
+  return {
+    ...pickFields(account, ACCOUNT_RECORD_FIELDS),
+    ...(settings ? { settings: { ...pickFields(settings, ACCOUNT_SETTING_FIELDS), abuse_contact_email_configured: Boolean(asString(settings.abuse_contact_email)) } } : {}),
+  };
+}
+
+/**
+ * Projects a GET /zones record to identity, status, plan, and account
+ * references; the owner email and other contact details are dropped.
+ */
+function projectZoneRecord(zone: JsonRecord): JsonRecord {
+  const plan = asObject(zone.plan);
+  const owner = asObject(zone.owner);
+  const account = asObject(zone.account);
+  return {
+    ...pickFields(zone, ZONE_RECORD_FIELDS),
+    ...(plan ? { plan: pickFields(plan, ["id", "name", "legacy_id", "is_subscribed"]) } : {}),
+    ...(owner ? { owner: pickFields(owner, ["id", "type"]) } : {}),
+    ...(account ? { account: pickFields(account, ["id", "name"]) } : {}),
+  };
+}
+
+function projectPagedList(list: CloudflarePagedList, project: (record: JsonRecord) => JsonRecord): CloudflarePagedList {
+  return { ...list, items: list.items.map((record) => project(record)) };
 }
 
 async function readableSurface(
@@ -1605,16 +1672,25 @@ export async function assessCloudflareIdentity(
   } else if (bypassPolicies.length > 0 || appsWithoutPolicies.length > 0) {
     accessStatus = "fail";
     accessSummary = `${bypassPolicies.length} Access policies use decision bypass and ${appsWithoutPolicies.length} applications have no attached policy.`;
+  } else if (accessPolicies && !accessPolicies.ok) {
+    // Reusable policies are where a bypass decision can hide outside any app's
+    // inline list, so an unreadable policies endpoint blocks the pass.
+    accessStatus = "manual";
+    accessSummary = `${apps!.items.length} Access applications carry ${inlinePolicies.length} inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(`/accounts/${accountId}/access/policies`, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", accessPolicies.error)}`;
   } else {
-    const partial = partialInventoryNote("Access application", apps!);
-    accessStatus = partial ? "warn" : "pass";
-    accessSummary = `${apps!.items.length} Access applications carry ${allPolicies.length} policies (allow, deny, or non_identity), none with bypass.${partial ? ` ${partial}` : ""}`;
+    const partials = [partialInventoryNote("Access application", apps!), partialInventoryNote("reusable Access policy", reusablePolicies!)]
+      .filter((entry): entry is string => Boolean(entry));
+    accessStatus = partials.length > 0 ? "warn" : "pass";
+    accessSummary = `${apps!.items.length} Access applications carry ${allPolicies.length} policies (${inlinePolicies.length} inline, ${reusablePolicies!.items.length} reusable; allow, deny, or non_identity), none with bypass.${partials.length > 0 ? ` ${partials.join(" ")}` : ""}`;
   }
   findings.push(finding("CF-IAM-04", "Zero Trust Access app and policy coverage", "high", accessStatus, accessSummary, 9, {
     access_apps: apps?.items.length ?? 0,
     access_apps_total: apps?.totalCount ?? null,
     inline_policies: inlinePolicies.length,
     reusable_policies: reusablePolicies?.items.length ?? 0,
+    reusable_policies_total: accessPolicies?.ok ? reusablePolicies?.totalCount ?? null : null,
+    reusable_policies_readable: accessPolicies ? accessPolicies.ok : null,
+    reusable_policies_truncated: accessPolicies?.ok ? reusablePolicies?.truncated ?? false : null,
     bypass_policies: bypassPolicies.length,
     apps_without_policies: appsWithoutPolicies.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "unknown"),
   }));
@@ -2374,8 +2450,8 @@ export async function exportCloudflareAuditBundle(
   await writeSecureTextFile(outputDir, "analysis/zone-security.json", serializeJson(zoneSecurity));
   await writeSecureTextFile(outputDir, "analysis/traffic-controls.json", serializeJson(trafficControls));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "core_data/accounts.json", serializeJson(accounts.ok ? accounts.value : { error: accounts.error }));
-  await writeSecureTextFile(outputDir, "core_data/zones.json", serializeJson(zones.ok ? zones.value : { error: zones.error }));
+  await writeSecureTextFile(outputDir, "core_data/accounts.json", serializeJson(accounts.ok ? projectPagedList(accounts.value, projectAccountRecord) : { error: accounts.error }));
+  await writeSecureTextFile(outputDir, "core_data/zones.json", serializeJson(zones.ok ? projectPagedList(zones.value, projectZoneRecord) : { error: zones.error }));
   if (errors.length > 0) {
     await writeSecureTextFile(outputDir, "_errors.log", `${errors.map((item) => `${generatedAt} ${item}`).join("\n")}\n`);
   }
