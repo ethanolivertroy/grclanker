@@ -3387,12 +3387,15 @@ export function assessDuoIntegrations(
     );
   } else if (universalPromptCount === universalPromptApplicable.length) {
     findings.push(
-      buildFinding(
-        "DUO-INTEGRATIONS-002",
-        "Pass",
-        "All inspected integrations that expose prompt posture are on Universal Prompt.",
-        [`universal_prompt_integrations=${universalPromptCount}`, `prompt_applicable=${universalPromptApplicable.length}`],
-        "Keep Universal Prompt adoption at full coverage as new integrations are added.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-INTEGRATIONS-002",
+          "Pass",
+          "All inspected integrations that expose prompt posture are on Universal Prompt.",
+          [`universal_prompt_integrations=${universalPromptCount}`, `prompt_applicable=${universalPromptApplicable.length}`],
+          "Keep Universal Prompt adoption at full coverage as new integrations are added.",
+        ),
+        data.integrations,
       ),
     );
   } else {

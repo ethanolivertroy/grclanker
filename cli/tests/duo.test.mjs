@@ -979,9 +979,15 @@ test("assessDuoIntegrations covers critical applications and device health depth
   const partial = compliantIntegrationData();
   partial.integrations = { data: partial.integrations.data, total: 30, complete: false };
   const partialResult = assessDuoIntegrations(partial, createSampleConfig());
-  for (const id of ["DUO-INTEGRATIONS-001", "DUO-INTEGRATIONS-004", "DUO-INTEGRATIONS-005"]) {
-    assert.equal(findingById(partialResult, id).status, "Partial", `${id} must not pass on a partial inventory`);
+  for (const id of ["DUO-INTEGRATIONS-001", "DUO-INTEGRATIONS-002", "DUO-INTEGRATIONS-003", "DUO-INTEGRATIONS-004", "DUO-INTEGRATIONS-005"]) {
+    const finding = findingById(partialResult, id);
+    assert.equal(finding.status, "Partial", `${id} must not pass on a partial inventory`);
+    assert.ok(
+      finding.evidence.some((line) => line.startsWith("inventory_seen=2 inventory_total=30")),
+      `${id} reports seen and total counts when paging is incomplete`,
+    );
   }
+  assert.equal(findingById(partialResult, "DUO-INTEGRATIONS-006").status, "Pass", "policy-backed device health depth does not depend on the integrations page");
 
   const essentials = compliantIntegrationData();
   essentials.infoSummary = dataset({ edition: "Duo Essentials" });
