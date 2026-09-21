@@ -231,9 +231,14 @@ export interface AzureAccessSurface {
   name: string;
   service: string;
   status: "readable" | "not_readable";
-  count?: number;
-  /** True when the probe stopped at its page cap, so `count` is a floor rather than the inventory size. */
-  truncated?: boolean;
+  /** Items the probe saw; null when the probe never completed, so a denial is never mistaken for an empty inventory. */
+  count?: number | null;
+  /** True when the probe stopped at its page cap, so `count` is a floor rather than the inventory size; null when the probe never completed. */
+  truncated?: boolean | null;
+  /** HTTP status the failing probe observed; null when the failure was not an HTTP response. */
+  http_status?: number | null;
+  /** URL (without query) of the request that failed, taken from the observed request. */
+  request_url?: string | null;
   error?: string;
 }
 
@@ -458,7 +463,8 @@ const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex API keys.
   [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
   [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
-  [/(?<![A-Za-z0-9+_=-])[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  // Long blobs must carry a digit so camelCase identifiers such as identitySecurityDefaultsEnforcementPolicy survive.
+  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
   [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
   // Cookie headers carry session values in free form.
   [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
@@ -504,14 +510,20 @@ export class AzureApiError extends Error {
   }
 }
 
-type Attempt<T> = { ok: true; value: T } | { ok: false; error: string; status?: number };
+type Attempt<T> = { ok: true; value: T } | { ok: false; error: string; status?: number; url?: string };
+
+/** The request URL without its query, so evidence names the observed request and never a token or filter value. */
+function observedRequestUrl(error: unknown): string | undefined {
+  if (!(error instanceof AzureApiError)) return undefined;
+  return redactErrorText(error.url.split("?")[0]);
+}
 
 async function attempt<T>(load: () => Promise<T>): Promise<Attempt<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
     const status = error instanceof AzureApiError ? error.status : undefined;
-    return { ok: false, error: describeThrown(error), status };
+    return { ok: false, error: describeThrown(error), status, url: observedRequestUrl(error) };
   }
 }
 
@@ -547,7 +559,7 @@ function manualForError(
   endpoint: string,
   requirement: string,
   evidenceToCollect: string,
-  result: { error: string; status?: number },
+  result: { error: string; status?: number; url?: string },
   docUrl: string,
   errors: string[],
 ): AzureFinding {
@@ -560,7 +572,7 @@ function manualForError(
     severity,
     "manual",
     `${endpoint} returned ${detail}. Grant ${requirement}, or collect ${evidenceToCollect} manually.`,
-    { endpoint, http_status: result.status ?? null, error: result.error.slice(0, 300), required_access: requirement, evidence_to_collect: evidenceToCollect, documentation: docUrl },
+    { endpoint, http_status: result.status ?? null, request_url: result.url ?? null, error: result.error.slice(0, 300), required_access: requirement, evidence_to_collect: evidenceToCollect, documentation: docUrl },
   );
 }
 
@@ -842,10 +854,16 @@ async function surface(
       ...(summary.truncated ? { truncated: true } : {}),
     };
   } catch (error) {
+    // A probe that never completed has no count or paging outcome; both stay null and the
+    // status and URL are the ones the request observed.
     return {
       name,
       service,
       status: "not_readable",
+      count: null,
+      truncated: null,
+      http_status: error instanceof AzureApiError ? error.status ?? null : null,
+      request_url: observedRequestUrl(error) ?? null,
       error: describeThrown(error),
     };
   }
@@ -1296,7 +1314,7 @@ type NetworkPolicyClient = Pick<AzureAuditorClient, "listNetworkSecurityGroups" 
 
 function optionalCall<T>(method: (() => Promise<T>) | undefined, missing: string): () => Promise<T> {
   return method ?? (async () => {
-    throw new Error(`${missing} is not available on this client.`);
+    throw new Error(`not attempted: this client does not expose ${missing}, so no request was made.`);
   });
 }
 
@@ -1427,7 +1445,13 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     // but when no such policy exists the verdict rests entirely on the defaults, so an unreadable read is manual, not fail.
     const defaultsFailure = securityDefaults.ok ? undefined : describeFailure(securityDefaults);
     const defaultsNote = defaultsFailure ? ` Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${defaultsFailure}).` : "";
-    const defaultsEvidence = { security_defaults_enabled: securityDefaultsEnabled, security_defaults_readable: securityDefaults.ok, security_defaults_error: defaultsFailure ?? null };
+    const defaultsEvidence = {
+      security_defaults_enabled: securityDefaults.ok ? securityDefaultsEnabled : null,
+      security_defaults_readable: securityDefaults.ok,
+      security_defaults_http_status: securityDefaults.ok ? null : securityDefaults.status ?? null,
+      security_defaults_request_url: securityDefaults.ok ? null : securityDefaults.url ?? null,
+      security_defaults_error: defaultsFailure ?? null,
+    };
     if (defaultsFailure) errors.push(`AZURE-ID-01 ${SECURITY_DEFAULTS_ENDPOINT}: ${defaultsFailure}`);
     const policyEvidence = { total_policies: policies.value.items.length, enabled_policies: enabled.length, report_only_policies: reportOnly.length, mfa_policies: mfaPolicies.length, ...defaultsEvidence, ...pageEvidence(policies.value) };
     const baseline = mfaPolicies.length > 0 || securityDefaultsEnabled;

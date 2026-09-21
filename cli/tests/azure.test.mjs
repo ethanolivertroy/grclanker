@@ -946,7 +946,8 @@ test("rule 1 corollary: AZURE-ID-01 and AZURE-ID-02 never call security defaults
     assert.doesNotMatch(item.summary, /security defaults are off/, id);
     assert.match(item.summary, /Security defaults could not be read \(GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\)\./, id);
     assert.equal(item.evidence.security_defaults_readable, false, id);
-    assert.equal(item.evidence.security_defaults_enabled, false, id);
+    assert.equal(item.evidence.security_defaults_enabled, null, `${id}: an unread flag renders null, never the false of its fallback`);
+    assert.equal(item.evidence.security_defaults_http_status, 403, id);
     assert.equal(item.evidence.security_defaults_error, "403 Forbidden", id);
   }
   assert.deepEqual(withPolicies.errors, ["AZURE-ID-01 GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy: 403 Forbidden"]);
@@ -1344,6 +1345,140 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
         if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes\)/);
       }
     }
+  }
+});
+
+function forbiddenAzureResponse() {
+  return new Response(JSON.stringify({ error: { code: "AuthorizationFailed", message: "The client does not have authorization." } }), {
+    status: 403,
+    statusText: "Forbidden",
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** The two user lists share a path and differ only by $filter, which request_url deliberately omits. */
+function surfacePath(surface) {
+  return surface.replace(/\((guest|member)\)$/, "");
+}
+
+/** Evidence written by manualForError: the failed read is described, never counted or listed. */
+const MANUAL_EVIDENCE_KEYS = ["documentation", "endpoint", "error", "evidence_to_collect", "http_status", "request_url", "required_access"];
+
+test("denied-list markers: a denied surface keeps count and truncated null in access.json, names the observed URL and status, and never renders a count or list for the denied read", async () => {
+  const config = canaryConfig();
+  const outputRoot = createTempBase("grclanker-azure-denied-");
+  const surfaces = Object.keys(healthyAzureRoutes()).filter((surface) => surface !== AZURE_TOKEN_PATH);
+
+  for (const surface of surfaces) {
+    const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: forbiddenAzureResponse }), now: () => NOW });
+    const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
+    const files = readBundleFiles(exported.outputDir);
+    const accessFile = JSON.parse(files.get("core_data/access.json"));
+
+    for (const entry of accessFile.surfaces.filter((candidate) => candidate.status === "not_readable")) {
+      assert.deepEqual(
+        { count: entry.count, truncated: entry.truncated, http_status: entry.http_status },
+        { count: null, truncated: null, http_status: 403 },
+        `${surface}: the denied probe ${entry.name} keeps count and truncated null and records the observed status`,
+      );
+      assert.ok(entry.request_url && !entry.request_url.includes("?"), `${surface}: the denied probe names the request URL without its query`);
+      assert.equal(new URL(entry.request_url).pathname, surfacePath(surface), `${surface}: the probe's request URL is the denied surface`);
+    }
+    for (const entry of access.surfaces.filter((candidate) => candidate.status === "readable")) {
+      assert.equal(typeof entry.count, "number", `${surface}: a readable probe still reports its count`);
+    }
+
+    const denied = assessments.flatMap((assessment) => assessment.findings.filter((finding) => finding.evidence?.http_status === 403));
+    if (surface === "/v1.0/policies/identitySecurityDefaultsEnforcementPolicy") {
+      // Secondary to readable Conditional Access policies: the flag renders null with the observed status, not the false of its fallback.
+      const identity = assessments.find((assessment) => assessment.title === "Azure identity posture");
+      for (const id of ["AZURE-ID-01", "AZURE-ID-02"]) {
+        const item = identity.findings.find((finding) => finding.id === id);
+        assert.equal(item.evidence.security_defaults_enabled, null, `${surface}: ${id} renders the unread flag as null`);
+        assert.equal(item.evidence.security_defaults_http_status, 403, `${surface}: ${id} records the observed status`);
+        assert.equal(new URL(item.evidence.security_defaults_request_url).pathname, surfacePath(surface), `${surface}: ${id} names the failing request URL`);
+      }
+    } else if (surface !== "/v1.0/organization" && surface !== "/v1.0/security/alerts_v2") {
+      assert.ok(denied.length > 0, `${surface}: at least one finding records the denied read`);
+    }
+    for (const finding of denied) {
+      assert.equal(finding.status, "manual", `${surface}: ${finding.id} renders manual for the denied read`);
+      assert.deepEqual(Object.keys(finding.evidence).sort(), MANUAL_EVIDENCE_KEYS, `${surface}: ${finding.id} describes the denied read without a count or list`);
+      assert.equal(new URL(finding.evidence.request_url).pathname, surfacePath(surface), `${surface}: ${finding.id} names the URL the failing request used`);
+    }
+  }
+});
+
+function recordingAzureFetch(routes, log) {
+  return async (url, init) => {
+    const key = azureSurfaceKey(url);
+    const route = routes[key];
+    if (!route) throw new Error(`Unexpected Azure request: ${url}`);
+    const response = await route();
+    log.push({ method: init?.method ?? "GET", url: String(url).split("?")[0], status: response.status });
+    return response;
+  };
+}
+
+/** Documentation-shaped endpoint mentions ("GET /v1.0/x", "POST Microsoft.Foo/bar/{name}/baz") and observed request URLs. */
+function namedAzureEndpoints(text) {
+  const mentions = new Set();
+  for (const match of text.matchAll(/\b(GET|POST) ((?:\/|Microsoft\.)[^\s",)]+)/g)) mentions.add(`${match[1]} ${match[2].replace(/[:.]+$/, "").split("?")[0]}`);
+  return mentions;
+}
+
+function namedAzureRequestUrls(text) {
+  return new Set([...text.matchAll(/https:\/\/(?:graph\.microsoft\.com|management\.azure\.com|login\.microsoftonline\.com)[^\s"?]+/g)].map((match) => match[0]));
+}
+
+function namedAzureStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\b(\d{3}) (?:Forbidden|Unauthorized|Payment Required|Not Found|Bad Gateway|Bad Request|Internal Server Error|Service Unavailable|Too Many Requests)/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"http_status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+function endpointWasRequested(mention, log) {
+  const [method, path] = mention.split(" ");
+  const pattern = new RegExp(`${path.startsWith("/") ? "" : "/providers/"}${path.replace(/[.]/g, "\\.").replace(/\{[^}]+\}/g, "[^/]+")}$`);
+  return log.some((entry) => entry.method === method && pattern.test(new URL(entry.url).pathname));
+}
+
+test("request matching: every endpoint, request URL, and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const config = canaryConfig();
+  const outputRoot = createTempBase("grclanker-azure-request-log-");
+  const log = [];
+  const routes = {
+    ...healthyAzureRoutes(),
+    "/v1.0/identity/conditionalAccess/policies": forbiddenAzureResponse,
+    [`${AZURE_SUB}/providers/Microsoft.KeyVault/vaults`]: canaryHtmlResponse,
+    "/v1.0/directoryRoles/role-ga/members": () => new Response("", { status: 404, statusText: "Not Found" }),
+    [`${AZURE_SUB}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_eastus/flowLogs`]: () =>
+      new Response(JSON.stringify({ error: { code: "AuthorizationFailed", message: "denied" } }), { status: 403, statusText: "Forbidden" }),
+  };
+  const client = new AzureAuditorClient(config, { fetchImpl: recordingAzureFetch(routes, log), now: () => NOW });
+  const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
+
+  const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...readBundleFiles(exported.outputDir).values()];
+  const text = outputs.join("\n");
+  const observedStatuses = new Set(log.map((entry) => entry.status));
+  const requestedUrls = new Set(log.map((entry) => entry.url));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+
+  const endpoints = namedAzureEndpoints(text);
+  assert.ok(endpoints.size >= 4, `the outputs name the failing endpoints (${[...endpoints].join(", ")})`);
+  for (const mention of endpoints) {
+    assert.ok(endpointWasRequested(mention, log), `endpoint "${mention}" is named in output but the run never requested it`);
+  }
+  const urls = namedAzureRequestUrls(text);
+  assert.ok(urls.size >= 4, "the outputs carry the observed request URLs");
+  for (const url of urls) {
+    assert.ok(requestedUrls.has(url), `request URL ${url} is named in output but the run never requested it`);
+  }
+  const statuses = namedAzureStatusCodes(text);
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), `the outputs name the observed failure statuses (${[...statuses].join(", ")})`);
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
   }
 });
 
