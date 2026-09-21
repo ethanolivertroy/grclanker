@@ -220,14 +220,12 @@ function alertingClient(overrides = {}) {
           id: "dest-1",
           name: "Ops distribution list",
           type: "EMAIL",
-          active: true,
-          status: "DEFAULT",
           properties: [{ key: "email", value: "ops@example.com" }],
         },
       ];
     },
     async listNotificationChannels() {
-      return [{ id: "chan-1", name: "Ops email", type: "EMAIL", destinationId: "dest-1", product: "IINT", active: true }];
+      return [{ id: "chan-1", name: "Ops email", type: "EMAIL", destinationId: "dest-1" }];
     },
     async listWorkflows() {
       return [
@@ -1303,9 +1301,119 @@ test("assessNewrelicAlerting passes covered entities routed to corporate destina
   assert.equal(findingStatus(result, "NR-10-ALERT-NOTIFICATION-CHANNELS"), "pass");
   assert.equal(findingStatus(result, "NR-17-APPLIED-INTELLIGENCE-SENSITIVITY"), "manual");
   assert.match(findingById(result, "NR-17-APPLIED-INTELLIGENCE-SENSITIVITY").summary, /Correlation decisions/);
-  assert.deepEqual(findingById(result, "NR-10-ALERT-NOTIFICATION-CHANNELS").evidence.approved_email_domains, ["example.com"]);
+  const channels = findingById(result, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.deepEqual(channels.evidence.approved_email_domains, ["example.com"]);
+  assert.match(channels.summary, /1 destinations across 1 types receive 1 enabled workflows \(1 destinations resolved through channels\)/);
+  assert.match(channels.summary, /every workflow exposed workflowEnabled/);
+  assert.match(channels.summary, /Destination active state is not among the documented aiNotifications\.destinations fields and is not read; enablement is verified through the documented workflowEnabled flag/);
+  assert.doesNotMatch(channels.summary, /active state, and/);
+  assert.equal(channels.evidence.destinations_routed_by_enabled_workflows, 1);
+  assert.equal(channels.evidence.destination_active_state, "not read: not among the documented aiNotifications.destinations fields");
   assert.equal(result.summary.reporting_alertable_entities, 2);
   assert.equal(result.errors.length, 0);
+});
+
+test("control 10 renders manual when enabled workflows cannot be resolved to inventoried destinations", async () => {
+  const unresolved = await assessNewrelicAlerting(alertingClient({
+    async listNotificationChannels() {
+      return [{ id: "chan-1", name: "Ops email", type: "EMAIL" }];
+    },
+  }));
+  const channels = findingById(unresolved, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(channels.status, "manual");
+  assert.match(channels.summary, /1 enabled workflows exist, but none of their destination configurations resolved to an inventoried destination through channels/);
+  assert.equal(channels.evidence.destinations_routed_by_enabled_workflows, 0);
+
+  const partlyResolved = await assessNewrelicAlerting(alertingClient({
+    async listWorkflows() {
+      return [
+        { id: "wf-1", name: "Production issues", workflowEnabled: true, destinationConfigurations: [{ channelId: "chan-1", name: "Ops email", type: "EMAIL" }], enrichments: [] },
+        { id: "wf-2", name: "Dangling", workflowEnabled: true, destinationConfigurations: [{ channelId: "chan-missing", name: "Old", type: "EMAIL" }], enrichments: [] },
+      ];
+    },
+  }));
+  const partly = findingById(partlyResolved, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(partly.status, "warn");
+  assert.match(partly.summary, /2 enabled workflows route to 1 of them/);
+  assert.match(partly.summary, /1 enabled workflows resolve to no inventoried destination/);
+  assert.deepEqual(partly.evidence.enabled_workflows_without_resolved_destination, ["Dangling"]);
+
+  const stripped = await assessNewrelicAlerting(alertingClient({
+    async listNotificationDestinations() {
+      return [{ id: "dest-1", name: "Ops distribution list", type: "EMAIL", active: false, status: "ERROR", properties: [{ key: "email", value: "ops@example.com" }] }];
+    },
+  }));
+  const ignoresUndocumented = findingById(stripped, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(ignoresUndocumented.status, "pass");
+  assert.equal(ignoresUndocumented.evidence.inactive_destinations, undefined);
+  assert.equal(ignoresUndocumented.evidence.destinations_without_active_flag, undefined);
+});
+
+test("NewrelicApiClient treats a documented aiNotifications error object as an unreadable account", async () => {
+  const seen = [];
+  const client = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      const body = JSON.parse(init.body);
+      seen.push(body.query);
+      if (body.query.includes("destinations(")) {
+        return jsonResponse({ data: { actor: { account: { aiNotifications: { destinations: { nextCursor: null, totalCount: 0, entities: [], error: { details: "Account 111 is not entitled to notifications" } } } } } } });
+      }
+      return jsonResponse({ data: { actor: { account: { aiNotifications: { channels: { nextCursor: null, totalCount: 1, entities: [{ id: "chan-1", name: "Ops", type: "EMAIL", destinationId: "dest-1" }], error: null } } } } } });
+    },
+  });
+
+  await assert.rejects(client.listNotificationDestinations(111), /aiNotifications\.destinations returned an error: Account 111 is not entitled to notifications/);
+  const channels = await client.listNotificationChannels(111);
+  assert.deepEqual(channels.items.map((channel) => channel.id), ["chan-1"]);
+  assert.equal(channels.complete, true);
+  assert.match(seen[0], /destinations\(cursor: \$cursor\) \{\s+nextCursor totalCount\s+entities \{ id name type properties \{ key value \} \}\s+error \{ details \}/);
+  assert.doesNotMatch(seen[0], /active|status|isUserAuthenticated|lastSent|displayValue|createdAt|updatedAt/);
+  assert.match(seen[1], /channels\(cursor: \$cursor\) \{\s+nextCursor totalCount\s+entities \{ id name type destinationId \}\s+error \{ details \}/);
+  assert.doesNotMatch(seen[1], /active|status|product/);
+
+  const alerting = await assessNewrelicAlerting(alertingClient({
+    async listNotificationDestinations() {
+      throw new Error("actor.account.aiNotifications.destinations returned an error: Account 111 is not entitled to notifications");
+    },
+  }));
+  const finding = findingById(alerting, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, /Notification destinations \(aiNotifications\.destinations\) could not be read \(.*not entitled to notifications\)/);
+});
+
+test("NewrelicApiClient falls back to a single workflows page when the cursor argument is rejected", async () => {
+  const seen = [];
+  const client = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      const body = JSON.parse(init.body);
+      seen.push(body.query);
+      if (body.query.includes("cursor: $cursor")) {
+        return jsonResponse({ errors: [{ message: 'Unknown argument "cursor" on field "AiWorkflowsAccountStitchedFields.workflows".' }] });
+      }
+      return jsonResponse({ data: { actor: { account: { aiWorkflows: { workflows: { nextCursor: null, totalCount: 1, entities: [{ id: "wf-1", name: "Production", workflowEnabled: true, destinationConfigurations: [], enrichments: [] }] } } } } } });
+    },
+  });
+  const workflows = await client.listWorkflows(111);
+  assert.deepEqual(workflows.items.map((workflow) => workflow.id), ["wf-1"]);
+  assert.equal(workflows.complete, true);
+  assert.equal(seen.length, 2);
+  assert.match(seen[1], /workflows\(filters: \{\}\) \{/);
+  assert.doesNotMatch(seen[1], /cursor/);
+  assert.match(seen[1], /enrichments \{ id name configurations/);
+  assert.doesNotMatch(seen[1], /enrichments \{ id name type/);
+
+  const truncated = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      const body = JSON.parse(init.body);
+      if (body.query.includes("cursor: $cursor")) {
+        return jsonResponse({ errors: [{ message: 'Unknown argument "cursor" on field "AiWorkflowsAccountStitchedFields.workflows".' }] });
+      }
+      return jsonResponse({ data: { actor: { account: { aiWorkflows: { workflows: { nextCursor: "more", totalCount: 5, entities: [{ id: "wf-1", name: "Production", workflowEnabled: true }] } } } } } });
+    },
+  });
+  const firstPage = await truncated.listWorkflows(111);
+  assert.equal(firstPage.complete, false);
+  assert.match(firstPage.note, /aiWorkflows\.workflows rejected the cursor argument, so only the first page was read \(1 of 5 workflows\)/);
 });
 
 test("assessNewrelicAlerting fails uncovered critical entities and personal email destinations, and warns on enriched external workflows", async () => {
@@ -1322,8 +1430,8 @@ test("assessNewrelicAlerting fails uncovered critical entities and personal emai
     },
     async listNotificationDestinations() {
       return [
-        { id: "dest-1", name: "Personal inbox", type: "EMAIL", active: true, properties: [{ key: "email", value: "oncall.person@gmail.com" }] },
-        { id: "dest-2", name: "Ops Slack", type: "SLACK", active: true, properties: [] },
+        { id: "dest-1", name: "Personal inbox", type: "EMAIL", properties: [{ key: "email", value: "oncall.person@gmail.com" }] },
+        { id: "dest-2", name: "Ops Slack", type: "SLACK", properties: [] },
       ];
     },
     async listNotificationChannels() {
@@ -1360,7 +1468,7 @@ test("assessNewrelicAlerting fails uncovered critical entities and personal emai
 test("assessNewrelicAlerting warns on unapproved email domains and missing workflows", async () => {
   const client = alertingClient({
     async listNotificationDestinations() {
-      return [{ id: "dest-1", name: "Vendor inbox", type: "EMAIL", active: true, properties: [{ key: "email", value: "noc@vendor.example.net" }] }];
+      return [{ id: "dest-1", name: "Vendor inbox", type: "EMAIL", properties: [{ key: "email", value: "noc@vendor.example.net" }] }];
     },
     async listWorkflows() {
       return [];
@@ -1882,8 +1990,20 @@ test("verdict safety rule 6: verdicts read every enabling flag and treat absent 
     },
   }));
   const channels = findingById(unflaggedWorkflow, "NR-10-ALERT-NOTIFICATION-CHANNELS");
-  assert.equal(channels.status, "warn");
-  assert.match(channels.summary, /no workflow has workflowEnabled = true \(1 workflows returned, 1 without an enabled flag\)/);
+  assert.equal(channels.status, "manual");
+  assert.match(channels.summary, /none of the 1 workflows exposed the documented workflowEnabled flag, so enablement cannot be verified through the API/);
+
+  const mixedWorkflowFlags = await assessNewrelicAlerting(alertingClient({
+    async listWorkflows() {
+      return [
+        { id: "wf-1", name: "Production issues", workflowEnabled: true, destinationConfigurations: [{ channelId: "chan-1", name: "Ops email", type: "EMAIL" }], enrichments: [] },
+        { id: "wf-2", name: "Legacy", destinationConfigurations: [{ channelId: "chan-1", name: "Ops email", type: "EMAIL" }], enrichments: [] },
+      ];
+    },
+  }));
+  const mixed = findingById(mixedWorkflowFlags, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(mixed.status, "warn");
+  assert.match(mixed.summary, /1 workflows expose no enabled flag/);
 
   const untypedDestination = await assessNewrelicAlerting(alertingClient({
     async listNotificationDestinations() {
@@ -1892,7 +2012,7 @@ test("verdict safety rule 6: verdicts read every enabling flag and treat absent 
   }));
   const destinations = findingById(untypedDestination, "NR-10-ALERT-NOTIFICATION-CHANNELS");
   assert.equal(destinations.status, "warn");
-  assert.match(destinations.summary, /1 expose no active flag, 1 expose no type/);
+  assert.match(destinations.summary, /1 destinations expose no type/);
 
   const disabledObfuscation = await assessNewrelicDataGovernance(dataGovernanceClient({
     async listObfuscationRules() {

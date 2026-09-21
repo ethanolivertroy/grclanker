@@ -684,6 +684,17 @@ function parseLinkNext(linkHeader: string | null): string | undefined {
  * `Unknown field`, or `Argument "query" has invalid value`. Authorization failures use different wording and must
  * not match, so they keep propagating as unreadable surfaces.
  */
+/**
+ * aiNotifications.destinations and aiNotifications.channels document a per-account `error { details }` object beside
+ * the entities list. A non-null error makes the account unreadable instead of an empty inventory.
+ */
+function notificationPageError(pageObject: JsonRecord): string | undefined {
+  const error = asObject(pageObject.error);
+  if (!error) return undefined;
+  const details = asString(error.details) ?? asString(error.description) ?? asString(error.type);
+  return details ?? JSON.stringify(error);
+}
+
 function isSchemaMismatchError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /cannot query field|unknown argument|unknown field|has invalid value|is not defined|does not accept|undefined argument|undefined field|does not exist on type|field .* doesn't exist/i.test(message);
@@ -844,22 +855,49 @@ const QUERY_NRQL_CONDITIONS = `query($accountId: Int!, $cursor: String) {
     }
   } } }
 }`;
+/**
+ * Notification destinations.
+ * Documented: docs.newrelic.com/docs/apis/nerdgraph/examples/nerdgraph-api-notifications-destinations:
+ *   aiNotifications.destinations(cursor: "") { nextCursor totalCount entities { id name } error { details } }, plus the
+ *   documented filters `type: EMAIL` and the mutation inputs `type` and `properties { key value }`.
+ * Schema reference: AiNotificationsDestination { id name type properties }; AiNotificationsProperty { key value }.
+ * The destination `active`, `status`, `isUserAuthenticated`, `lastSent`, and `properties.displayValue` fields are
+ * not requested; control 10 verifies enablement through the documented workflowEnabled flag instead.
+ */
 const QUERY_DESTINATIONS = `query($accountId: Int!, $cursor: String) {
   actor { account(id: $accountId) { aiNotifications {
     destinations(cursor: $cursor) {
       nextCursor totalCount
-      entities { id name type active status isUserAuthenticated createdAt updatedAt lastSent properties { key value displayValue } }
+      entities { id name type properties { key value } }
+      error { details }
     }
   } } }
 }`;
+/**
+ * Notification channels.
+ * Documented: docs.newrelic.com/docs/apis/nerdgraph/examples/nerdgraph-api-notifications-channels:
+ *   aiNotifications.channels(cursor: "") { nextCursor totalCount entities { id name } error { details } }, plus the
+ *   documented filters `destinationId` and `type`.
+ * Schema reference: AiNotificationsChannel { id name type destinationId }.
+ */
 const QUERY_CHANNELS = `query($accountId: Int!, $cursor: String) {
   actor { account(id: $accountId) { aiNotifications {
     channels(cursor: $cursor) {
       nextCursor totalCount
-      entities { id name type destinationId product active status }
+      entities { id name type destinationId }
+      error { details }
     }
   } } }
 }`;
+/**
+ * Workflows.
+ * Documented: docs.newrelic.com/docs/apis/nerdgraph/examples/nerdgraph-api-workflows ("List workflows" and the
+ *   create mutation response): aiWorkflows.workflows(filters: {}) { nextCursor totalCount entities { id name
+ *   workflowEnabled destinationConfigurations { channelId name type notificationTriggers } enrichments { id name
+ *   configurations { ... on AiWorkflowsNrqlConfiguration { query } } } enrichmentsEnabled destinationsEnabled } }.
+ *   The page describes cursor pagination through nextCursor; if the `cursor` argument is rejected the first page is
+ *   returned as an incomplete listing.
+ */
 const QUERY_WORKFLOWS = `query($accountId: Int!, $cursor: String) {
   actor { account(id: $accountId) { aiWorkflows {
     workflows(filters: {}, cursor: $cursor) {
@@ -867,11 +905,12 @@ const QUERY_WORKFLOWS = `query($accountId: Int!, $cursor: String) {
       entities {
         id name workflowEnabled enrichmentsEnabled destinationsEnabled
         destinationConfigurations { channelId name type notificationTriggers }
-        enrichments { id name type configurations { ... on AiWorkflowsNrqlConfiguration { query } } }
+        enrichments { id name configurations { ... on AiWorkflowsNrqlConfiguration { query } } }
       }
     }
   } } }
 }`;
+const QUERY_WORKFLOWS_SINGLE_PAGE = QUERY_WORKFLOWS.replace("query($accountId: Int!, $cursor: String)", "query($accountId: Int!)").replace("workflows(filters: {}, cursor: $cursor)", "workflows(filters: {})");
 const QUERY_RETENTION_RULES = `query($accountId: Int!) {
   actor { account(id: $accountId) { dataManagement {
     eventRetentionRules { id namespace retentionInDays createdAt createdById deletedAt deletedById }
@@ -1033,9 +1072,10 @@ export class NewrelicApiClient {
     for (let page = 0; page < MAX_PAGES; page += 1) {
       const data = await this.nerdgraph(query, cursor ? { ...variables, cursor } : variables);
       const pageObject = asObject(getNestedValue(data, pagePath));
-      if (!pageObject) {
-        throw new Error(`NerdGraph response did not include ${pagePath.filter((segment) => typeof segment === "string").join(".")}.`);
-      }
+      const pageLabel = pagePath.filter((segment) => typeof segment === "string").join(".");
+      if (!pageObject) throw new Error(`NerdGraph response did not include ${pageLabel}.`);
+      const pageError = notificationPageError(pageObject);
+      if (pageError) throw new Error(`${pageLabel} returned an error: ${pageError}`);
       const pageItems = asRecords(pageObject[itemsKey]);
       totalCount = asNumber(totalPath ? getNestedValue(data, totalPath) : pageObject.totalCount ?? pageObject.count) ?? totalCount;
       items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
@@ -1319,7 +1359,25 @@ export class NewrelicApiClient {
   }
 
   async listWorkflows(accountId: number, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
-    return this.paginate(QUERY_WORKFLOWS, { accountId }, ["actor", "account", "aiWorkflows", "workflows"], "entities", limit);
+    const pagePath = ["actor", "account", "aiWorkflows", "workflows"];
+    try {
+      return await this.paginate(QUERY_WORKFLOWS, { accountId }, pagePath, "entities", limit);
+    } catch (error) {
+      if (!isSchemaMismatchError(error)) throw error;
+    }
+    const data = await this.nerdgraph(QUERY_WORKFLOWS_SINGLE_PAGE, { accountId });
+    const page = asObject(getNestedValue(data, pagePath));
+    if (!page) throw new Error("NerdGraph response did not include actor.account.aiWorkflows.workflows.");
+    const items = asRecords(page.entities).slice(0, limit);
+    const totalCount = asNumber(page.totalCount);
+    const nextCursor = asString(page.nextCursor);
+    const complete = !nextCursor && (totalCount === undefined || items.length >= totalCount);
+    return {
+      items,
+      complete,
+      totalCount,
+      note: complete ? undefined : `aiWorkflows.workflows rejected the cursor argument, so only the first page was read (${items.length}${totalCount !== undefined ? ` of ${totalCount}` : ""} workflows)`,
+    };
   }
 
   async listEventRetentionRules(accountId: number): Promise<PagedList> {
@@ -2766,12 +2824,11 @@ export function assessNewrelicAlertingData(
     }),
   );
   const emailDestinationsWithoutAddress = emailDestinations.filter((destination) => destinationEmails(destination).length === 0);
-  const inactiveDestinations = destinations.filter((destination) => asBoolean(destination.active) === false);
-  const destinationsWithoutActiveFlag = destinations.filter((destination) => asBoolean(destination.active) === undefined);
   const destinationsWithoutType = destinations.filter((destination) => !asString(destination.type));
   const enabledWorkflows = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) === true);
   const workflowsWithoutEnabledFlag = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) === undefined);
   const possiblyEnabledWorkflows = workflows.filter((workflow) => asBoolean(workflow.workflowEnabled) !== false);
+  const enablementUnverifiable = workflows.length > 0 && workflowsWithoutEnabledFlag.length === workflows.length;
   const destinationTypeCounts: Record<string, number> = {};
   for (const destination of destinations) {
     const type = asString(destination.type) ?? "UNKNOWN";
@@ -2788,6 +2845,17 @@ export function assessNewrelicAlertingData(
     const id = asString(channel.id);
     if (id) channelById.set(id, channel);
   }
+  const resolveDestinationIds = (workflow: JsonRecord): Set<string> => {
+    const ids = new Set<string>();
+    for (const configuration of asRecords(workflow.destinationConfigurations)) {
+      const channel = channelById.get(asString(configuration.channelId) ?? "");
+      const destinationId = asString(channel?.destinationId);
+      if (destinationId && destinationById.has(destinationId)) ids.add(destinationId);
+    }
+    return ids;
+  };
+  const routedDestinationIds = new Set(enabledWorkflows.flatMap((workflow) => [...resolveDestinationIds(workflow)]));
+  const unroutedEnabledWorkflows = enabledWorkflows.filter((workflow) => resolveDestinationIds(workflow).size === 0);
   const enrichedWorkflows = possiblyEnabledWorkflows.filter((workflow) => asRecords(workflow.enrichments).length > 0 && asBoolean(workflow.enrichmentsEnabled) !== false);
   const enrichedExternalWorkflows = enrichedWorkflows.filter((workflow) =>
     asRecords(workflow.destinationConfigurations).some((configuration) => {
@@ -2812,8 +2880,9 @@ export function assessNewrelicAlertingData(
   const accountCount = data.accountIds.length;
   const policyEvidence = "the Alerts > Alert policies list with condition counts for every account in scope.";
   const entityEvidence = "the entity explorer alert status column for every reporting APM application, host, and synthetic monitor.";
-  const destinationEvidence = "Alerts > Destinations with the address or endpoint of every destination and its active state.";
+  const destinationEvidence = "Alerts > Destinations with the address or endpoint of every destination and its status.";
   const workflowEvidence = "Alerts > Workflows with each workflow's enabled state and destinations.";
+  const activeStateNote = "Destination active state is not among the documented aiNotifications.destinations fields and is not read; enablement is verified through the documented workflowEnabled flag";
 
   const control9 = (): Verdict => {
     if (!policiesReadable) return unreadableVerdict("Alert policies (alerts.policiesSearch)", data.policies, policyEvidence);
@@ -2857,6 +2926,9 @@ export function assessNewrelicAlertingData(
     if (unapprovedEmailDestinations.length > 0) {
       return verdict("warn", `${unapprovedEmailDestinations.length} email destinations use domains outside the approved set (${[...approvedDomains].join(", ")}).`);
     }
+    if (enablementUnverifiable) {
+      return manualVerdict(`${destinations.length} destinations exist, but none of the ${workflows.length} workflows exposed the documented workflowEnabled flag, so enablement cannot be verified through the API. ${activeStateNote}. Collect ${workflowEvidence}`);
+    }
     if (enabledWorkflows.length === 0) {
       const workflowInventory = `${workflows.length} workflows returned, ${workflowsWithoutEnabledFlag.length} without an enabled flag`;
       if (!policiesReadable) {
@@ -2867,13 +2939,16 @@ export function assessNewrelicAlertingData(
       }
       return manualVerdict(`${destinations.length} destinations exist but no enabled workflow routes to them (${workflowInventory}) and no alert policies exist across ${accountCount} accounts; emptiness is unknown rather than compliant. Confirm alerting is intentionally unused and collect ${workflowEvidence}`);
     }
-    if (inactiveDestinations.length > 0 || destinationsWithoutActiveFlag.length > 0 || destinationsWithoutType.length > 0 || emailDestinationsWithoutAddress.length > 0 || workflowsWithoutEnabledFlag.length > 0) {
-      return verdict("warn", `${destinations.length} destinations were inventoried, but ${inactiveDestinations.length} are inactive, ${destinationsWithoutActiveFlag.length} expose no active flag, ${destinationsWithoutType.length} expose no type, ${emailDestinationsWithoutAddress.length} email destinations expose no address, and ${workflowsWithoutEnabledFlag.length} workflows expose no enabled flag; those cannot be counted as approved and working.`);
+    if (routedDestinationIds.size === 0) {
+      return manualVerdict(`${enabledWorkflows.length} enabled workflows exist, but none of their destination configurations resolved to an inventoried destination through channels (channelId to channel.destinationId), so routing cannot be verified through the API. Collect ${workflowEvidence}`);
+    }
+    if (destinationsWithoutType.length > 0 || emailDestinationsWithoutAddress.length > 0 || workflowsWithoutEnabledFlag.length > 0 || unroutedEnabledWorkflows.length > 0) {
+      return verdict("warn", `${destinations.length} destinations were inventoried and ${enabledWorkflows.length} enabled workflows route to ${routedDestinationIds.size} of them, but ${destinationsWithoutType.length} destinations expose no type, ${emailDestinationsWithoutAddress.length} email destinations expose no address, ${workflowsWithoutEnabledFlag.length} workflows expose no enabled flag, and ${unroutedEnabledWorkflows.length} enabled workflows resolve to no inventoried destination; those cannot be counted as approved and working.`);
     }
     if (emailDestinations.length > 0 && approvedDomains.size === 0) {
       return verdict("warn", `${emailDestinations.length} email destinations could not be checked against an approved domain list${currentUserReadable ? "" : ` (actor.user unreadable: ${causeOf(data.currentUser)})`}; pass approved_email_domains to confirm they are corporate addresses.`);
     }
-    return verdict("pass", `${destinations.length} destinations across ${Object.keys(destinationTypeCounts).length} types route ${enabledWorkflows.length} enabled workflows; every destination exposed its type and active state, and all ${emailDestinations.length} email destinations use approved domains${approvedDomains.size > 0 ? ` (${[...approvedDomains].join(", ")})` : ""}.`);
+    return verdict("pass", `${destinations.length} destinations across ${Object.keys(destinationTypeCounts).length} types receive ${enabledWorkflows.length} enabled workflows (${routedDestinationIds.size} destinations resolved through channels); every destination exposed its type, every workflow exposed workflowEnabled, and all ${emailDestinations.length} email destinations use approved domains${approvedDomains.size > 0 ? ` (${[...approvedDomains].join(", ")})` : ""}. ${activeStateNote}.`);
   };
 
   const control17 = (): Verdict => {
@@ -2913,8 +2988,9 @@ export function assessNewrelicAlertingData(
     approved_email_domains: [...approvedDomains],
     personal_email_destinations: sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
     unapproved_email_destinations: sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
-    inactive_destinations: sample(inactiveDestinations.map((destination) => asString(destination.name) ?? "destination")),
-    destinations_without_active_flag: destinationsWithoutActiveFlag.length,
+    destinations_routed_by_enabled_workflows: routedDestinationIds.size,
+    enabled_workflows_without_resolved_destination: sample(unroutedEnabledWorkflows.map((workflow) => asString(workflow.name) ?? asString(workflow.id) ?? "workflow")),
+    destination_active_state: "not read: not among the documented aiNotifications.destinations fields",
     destinations_without_type: destinationsWithoutType.length,
     email_destinations_without_address: emailDestinationsWithoutAddress.length,
   }));
