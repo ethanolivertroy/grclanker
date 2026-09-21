@@ -3,11 +3,13 @@ slug: "datadog-sec-inspector"
 name: "Datadog Security Inspector"
 vendor: "Datadog"
 category: "monitoring-logging-observability"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/datadog-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/datadog-sec-inspector"
+reference_docs: "https://docs.datadoghq.com/api/latest/"
 ---
 
 # datadog-sec-inspector
@@ -267,6 +269,21 @@ datadog-sec-inspector/
 - **Hybrid CLI/TUI** using Cobra for headless CI/CD runs and Bubble Tea for interactive exploration.
 - **OSCAL output** for integration into GRC pipelines (compliance-trestle, etc.).
 
+### grclanker implementation
+
+The shipped implementation lives in grclanker as native TypeScript (`cli/extensions/grc-tools/datadog.ts`) rather than the Go layout above. It calls the Datadog v1 and v2 REST APIs directly with `fetch` (no SDK), resolves credentials from explicit arguments, then `DD_API_KEY`, `DD_APP_KEY`, `DD_SITE`, `DD_HOST`, then a dogshell-style `~/.dogrc`, and registers these read-only tools:
+
+| Tool | Controls |
+|---|---|
+| `datadog_check_access` | Validates the API key and probes every read surface, reporting missing application key permissions |
+| `datadog_assess_identity` | 1, 2, 3, 4, 16, 19 |
+| `datadog_assess_access_controls` | 5, 6, 14, 15, 18 |
+| `datadog_assess_security_monitoring` | 8, 9, 12, 13, 17 |
+| `datadog_assess_data_protection` | 7, 10, 11, 20 |
+| `datadog_export_audit_bundle` | All 20 controls: `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log`, and a zip archive |
+
+Findings are normalized as `{ id: DD-NN, title, severity, status: pass | warn | fail | manual, summary, evidence, mappings[] }` and carry the framework references from section 5. Tests live in `cli/tests/datadog.test.mjs`, the live smoke script is `npm --prefix cli run test:datadog:live`, and the user guide is `src/content/docs/docs/integrations/datadog.md`.
+
 ## 8. CLI Interface
 
 ```bash
@@ -359,4 +376,32 @@ datadog-sec-inspector audit --debug
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as native TypeScript on 2026-09-21 (see the grclanker implementation subsection in section 7). The Go, Cobra, Bubble Tea, and OSCAL plans in sections 7 through 9 are retained as the original design record and are not part of the shipped implementation.
+
+### What shipped
+
+- Configuration resolution with the precedence explicit arguments, then environment variables (`DD_API_KEY`, `DD_APP_KEY` or `DD_APPLICATION_KEY`, `DD_SITE`, `DD_HOST`, `DD_CONFIG_FILE`, `DD_TIMEOUT`, `DD_MAX_RETRIES`), then a dogshell-style `~/.dogrc` `[Connection]` section. Every site in section 3 plus `ap2`, `uk1`, and `us2.ddog-gov.com` maps to `https://api.<site>`.
+- A `fetch`-based API client that sends `DD-API-KEY` and `DD-APPLICATION-KEY`, follows each endpoint's documented pagination (`page[size]` and `page[number]`; `page[limit]` and `page[cursor]` with `meta.page.after`; `page` and `page_size`; `limit` and `offset`), retries 429 honoring `X-RateLimit-Reset`, retries 5xx with backoff, enforces timeouts, and redacts both keys from errors.
+- `datadog_check_access` plus four assessment tools covering all 20 controls, and `datadog_export_audit_bundle` producing raw snapshots, normalized findings, an executive summary, a unified compliance matrix, eight framework reports, a quick reference, an error log on partial collection, and a zip archive.
+- Mocked test coverage in `cli/tests/datadog.test.mjs` and a live smoke script that skips without credentials.
+
+### Deviations from this spec (official docs win)
+
+- Security signals: `POST /api/v1/security_analytics/signals/search` (control 9, section 2) is not in the official API reference. The implementation uses `GET /api/v2/security_monitoring/signals` with `filter[query]`, `filter[from]`, `filter[to]`, `sort`, `page[limit]`, and `page[cursor]`.
+- Key validation: `POST /api/v2/validate_keys` is not in the official reference. Only `GET /api/v1/validate` is used.
+- Application keys: `GET /api/v2/application_keys` requires `org_app_keys_read`, not `user_access_read` as listed in section 2. Owners are resolved through `include=owned_by`.
+- Audit Trail: the implementation reads `GET /api/v2/audit/events` (cursor paginated) instead of `POST /api/v2/audit/events/search`. Retention is inferred from the oldest event available inside the required window because the retention setting is not exposed by the API.
+- CSPM (control 12): enablement is derived from enabled `cloud_configuration` rules plus the `cspm_resource_collection_enabled`, `is_cspm_enabled`, and `cspm_enabled` flags on AWS, GCP, and Azure integrations, and the passing rate comes from `GET /api/v2/posture_management/findings` with `filter[evaluation]=pass|fail` and `meta.page.total_filtered_count`. That endpoint is marked legacy in the OpenAPI definition but remains the documented list endpoint.
+- Compliance coverage (control 13): derived from `framework:`, `compliance_framework:`, and `requirement_framework:` tags on enabled `cloud_configuration` and `infrastructure_configuration` rules.
+- Session timeout (control 16): `GET /api/v1/org` does not return a session duration, so this control is always a `manual` finding that names the console setting to capture.
+- Integration permissions (control 18): the Datadog API exposes the AWS, GCP, and Azure integration inventory (including AWS accounts using static access keys instead of role delegation) but not cloud-side IAM policies or webhook URLs (webhooks are only retrievable by exact name). This control is always a `manual` finding with the inventory attached as evidence.
+- Dashboards (control 14): `GET /api/v1/dashboard?filter[shared]=true` reports shared dashboards but not the share type, so shared dashboards produce `warn`; `private_widget_share` on the organization produces `fail`.
+- Organization settings (control 20): data retention is read from log index `num_retention_days` (`GET /api/v1/logs/config/indexes`) and cross-org sharing from `GET /api/v2/org_connections` (`limit` and `offset` pagination), because `GET /api/v1/org` exposes neither.
+- `GET /api/v1/logs/config/pipeline-order`, `GET /api/v2/audit/events/search`, `GET /api/v2/restriction_policy/{id}`, and the write endpoints listed in section 2 are not used; the tools are read-only.
+
+### What remains
+
+- Session timeout (16) and integration permissions (18) stay manual until Datadog exposes those settings through the public API.
+- The share type (public versus invite-only) of each shared dashboard is not exposed by the dashboard list endpoint and is not collected; shared dashboards surface as `warn` for human review.
+- OSCAL output, CSV and HTML reporters, and the interactive TUI from the original build sequence are not implemented; the bundle ships JSON findings and Markdown reports instead.
+- Live validation against a Datadog for Government (`ddog-gov.com`) organization has not been performed; the site mapping and endpoints follow the official documentation.
