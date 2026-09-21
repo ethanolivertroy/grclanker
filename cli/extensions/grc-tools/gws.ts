@@ -2985,7 +2985,7 @@ export function assessGwsIntegrations(
   ];
   const sampleNotes = [
     ...sampleCoverageNotes,
-    ...(failed > 0 ? [`Per-user token reads that failed: ${failed}`] : []),
+    ...(failed > 0 ? [`Per-user token reads that failed: ${failed}`, `Token inventory errors: ${data.tokenInventory.error ?? "unknown"}`] : []),
   ];
   const tokenFailures = tokenReadFailureEvidence(data.tokenInventory, privilegedIds);
   const inventoryEvidence = [
@@ -3025,7 +3025,7 @@ export function assessGwsIntegrations(
       "GWS-INTEG-001",
       "Partial",
       "Third-party token inventory was only partially readable.",
-      [...inventoryEvidence, `Token inventory errors: ${data.tokenInventory.error}`, ...sampleNotes],
+      [...inventoryEvidence, ...sampleNotes],
       "Grant the admin.directory.user.security scope and verify the delegated admin can enumerate third-party tokens for every user.",
     ));
   } else if (allTokens.length === 0) {

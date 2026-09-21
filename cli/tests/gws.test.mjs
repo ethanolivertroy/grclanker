@@ -1410,7 +1410,14 @@ test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INT
   assert.ok(exposure.evidence.includes("Token inventory errors: super@example.com: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"));
   assert.ok(exposure.evidence.includes(`Directory tokens.list failed for privileged users: ${failedRead}`));
   assert.equal(exposure.evidence.some((line) => /^Privileged users sampled: 2 of 2$/.test(line)), false, "the sampled count must not claim both users were read");
-  assert.equal(findingById(partialFindings, "GWS-INTEG-001").status, "Partial");
+  // The two neighbours that read the same inventory name the failed user as well.
+  const inventoryErrorLine = "Token inventory errors: super@example.com: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)";
+  for (const id of ["GWS-INTEG-001", "GWS-INTEG-003"]) {
+    const finding = findingById(partialFindings, id);
+    assert.equal(finding.status, "Partial", id);
+    assert.ok(finding.evidence.includes("Per-user token reads that failed: 1"), id);
+    assert.ok(finding.evidence.includes(inventoryErrorLine), `${id}: ${finding.evidence.join("\n")}`);
+  }
 
   // Fail branch: the same denied read while delegated@example.com holds four tokens keeps the lower-bound wording.
   const broad = await collectGwsAuditData(createFakeCollector({
