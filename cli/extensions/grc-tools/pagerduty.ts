@@ -314,7 +314,7 @@ function unreadable(view: InventoryView, evidenceToCollect: string): string {
 
 function countSeen(view: InventoryView): string {
   return view.total !== undefined && view.total !== view.seen
-    ? `${view.seen} of ${view.total} ${view.label}`
+    ? `${view.seen} ${view.label} (of ${view.total} total)`
     : `${view.seen} ${view.label}`;
 }
 
