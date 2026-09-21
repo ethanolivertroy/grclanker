@@ -774,10 +774,6 @@ export class SplunkApiClient {
     return this.list("/services/data/inputs/tcp/cooked");
   }
 
-  async listSslTcpInputs(): Promise<SplunkListResult> {
-    return this.list("/services/data/inputs/tcp/ssl");
-  }
-
   async listSavedSearches(): Promise<SplunkListResult> {
     return this.list("/servicesNS/-/-/saved/searches");
   }
@@ -850,7 +846,6 @@ export type SplunkInspectorClient = Pick<
   | "listIndexes"
   | "listHecInputs"
   | "listCookedTcpInputs"
-  | "listSslTcpInputs"
   | "listSavedSearches"
   | "listLookupTableFiles"
   | "listApps"
@@ -1421,9 +1416,9 @@ interface ForwarderTlsView {
   servers: ForwarderTargetTls[];
 }
 
-type TcpoutLevels = Array<[source: string, content: JsonRecord | undefined]>;
+type SettingLevels = Array<[source: string, content: JsonRecord | undefined]>;
 
-function tcpoutSetting(key: string, levels: TcpoutLevels): { value: string | undefined; source: string } {
+function resolveLayeredSetting(key: string, levels: SettingLevels): { value: string | undefined; source: string } {
   for (const [source, content] of levels) {
     const value = asString(content?.[key]);
     if (value !== undefined) return { value, source };
@@ -1460,11 +1455,11 @@ function forwarderTlsStatus(mode: ForwarderTlsMode): SplunkFindingStatus {
   }
 }
 
-function evaluateForwarderTarget(target: string, levels: TcpoutLevels): ForwarderTargetTls {
-  const useSsl = tcpoutSetting("useSSL", levels);
-  const clientCert = tcpoutSetting("clientCert", levels);
-  const certificate = clientCert.value === undefined ? tcpoutSetting("sslCertPath", levels) : clientCert;
-  const password = tcpoutSetting("sslPassword", levels);
+function evaluateForwarderTarget(target: string, levels: SettingLevels): ForwarderTargetTls {
+  const useSsl = resolveLayeredSetting("useSSL", levels);
+  const clientCert = resolveLayeredSetting("clientCert", levels);
+  const certificate = clientCert.value === undefined ? resolveLayeredSetting("sslCertPath", levels) : clientCert;
+  const password = resolveLayeredSetting("sslPassword", levels);
   const { mode, reason } = forwarderTlsMode(useSsl.value, certificate.value);
   return {
     target,
@@ -1759,15 +1754,58 @@ function appProvenance(app: SplunkEntry): "core" | "splunkbase" | "third_party" 
 
 type S2sListenerState = "tls" | "plaintext" | "unconfirmed";
 
+interface S2sTlsSettings {
+  serverCert: string | null;
+  serverCert_source: string;
+  requireClientCert: string | null;
+  requireClientCert_source: string;
+  sslVersions: string[];
+  sslVersions_source: string;
+  cipherSuite: string | null;
+  cipherSuite_source: string;
+}
+
 interface S2sListener {
   port: string;
   state: S2sListenerState;
   sources: string[];
+  tlsStanza?: JsonRecord;
+  tls?: S2sTlsSettings;
 }
+
+const REQUIRE_CLIENT_CERT_DEFAULT_NOTE = 'documented default: "false" if using self-signed and third-party certificates, "true" if using the default certificates, and the REST view cannot tell which certificates are in use';
 
 function listenerPort(name: string): string {
   const match = /(\d+)\s*$/.exec(name);
   return match ? match[1] : name;
+}
+
+function resolveS2sTlsSettings(listener: S2sListener, globalSsl: JsonRecord | undefined): S2sTlsSettings {
+  const levels: SettingLevels = [[`[splunktcp-ssl:${listener.port}]`, listener.tlsStanza], ["[SSL]", globalSsl]];
+  const serverCert = resolveLayeredSetting("serverCert", levels);
+  const requireClientCert = resolveLayeredSetting("requireClientCert", levels);
+  const sslVersions = resolveLayeredSetting("sslVersions", levels);
+  const cipherSuite = resolveLayeredSetting("cipherSuite", levels);
+  return {
+    serverCert: serverCert.value ?? null,
+    serverCert_source: serverCert.source,
+    requireClientCert: requireClientCert.value ?? null,
+    requireClientCert_source: requireClientCert.source,
+    sslVersions: asStringList(sslVersions.value),
+    sslVersions_source: sslVersions.source,
+    cipherSuite: cipherSuite.value ?? null,
+    cipherSuite_source: cipherSuite.source,
+  };
+}
+
+function describeRequireClientCert(listener: S2sListener, globalSsl: JsonRecord | undefined): string {
+  const tls = listener.tls;
+  if (!tls || tls.requireClientCert === null) {
+    return `port ${listener.port} requireClientCert absent from both [splunktcp-ssl:${listener.port}] and [SSL] (${REQUIRE_CLIENT_CERT_DEFAULT_NOTE})`;
+  }
+  const globalValue = asString(globalSsl?.requireClientCert);
+  const overriding = tls.requireClientCert_source !== "[SSL]" && globalValue !== undefined ? `, overriding [SSL] requireClientCert=${globalValue}` : "";
+  return `port ${listener.port} requireClientCert=${tls.requireClientCert} from ${tls.requireClientCert_source}${overriding}`;
 }
 
 function s2sListenerStatus(state: S2sListenerState): SplunkFindingStatus {
@@ -1799,8 +1837,13 @@ function s2sListeners(cooked: SplunkListResult, inputs: SplunkListResult): S2sLi
   }
   for (const entry of inputs.entries) {
     if (asBoolean(entry.content.disabled) === true) continue;
-    if (/^splunktcp-ssl:/.test(entry.name)) record(entry.name, `inputs.conf [${entry.name}]`, "tls");
-    else if (/^splunktcp:/.test(entry.name)) record(entry.name, `inputs.conf [${entry.name}]`, "plaintext");
+    if (/^splunktcp-ssl:/.test(entry.name)) {
+      record(entry.name, `inputs.conf [${entry.name}]`, "tls");
+      const listener = byPort.get(listenerPort(entry.name));
+      if (listener && !listener.tlsStanza) listener.tlsStanza = entry.content;
+    } else if (/^splunktcp:/.test(entry.name)) {
+      record(entry.name, `inputs.conf [${entry.name}]`, "plaintext");
+    }
   }
   return [...byPort.values()];
 }
@@ -1928,21 +1971,22 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
   } else if (!cookedInputs.ok) {
     findings.push(manualUnreadable(23, "/services/data/inputs/tcp/cooked", cookedInputs, "inputs.conf [splunktcp://*] and [splunktcp-ssl:*] receiving stanzas plus the [SSL] stanza serverCert and requireClientCert from each indexer."));
   } else {
+    const sslStanza = inputsConf.ok ? stanza(inputsConf.value, "SSL") : undefined;
     const listeners = s2sListeners(cookedInputs.value, inputsConf.ok ? inputsConf.value : { entries: [], total: 0, truncated: false });
+    for (const listener of listeners) {
+      if (listener.state === "tls") listener.tls = resolveS2sTlsSettings(listener, sslStanza);
+    }
     const plaintext = listeners.filter((item) => s2sListenerStatus(item.state) === "fail");
     const unconfirmed = listeners.filter((item) => s2sListenerStatus(item.state) === "manual");
-    const sslStanza = inputsConf.ok ? stanza(inputsConf.value, "SSL") : undefined;
-    const requireClientCert = asBoolean(sslStanza?.requireClientCert);
-    const serverCert = asString(sslStanza?.serverCert);
+    const withoutClientCert = listeners.filter((item) => item.state === "tls" && asBoolean(item.tls?.requireClientCert) !== true);
+    const withoutServerCert = listeners.filter((item) => item.state === "tls" && !item.tls?.serverCert);
     const evidence = {
       ...inventoryNote(cookedInputs.value),
       listeners,
       inputs_conf_readable: inputsConf.ok,
       ssl_stanza_present: Boolean(sslStanza),
-      serverCert: serverCert ?? null,
-      requireClientCert: sslStanza?.requireClientCert ?? null,
-      sslVersions: asStringList(sslStanza?.sslVersions),
-      note: "data/inputs/tcp/cooked does not report TLS; encryption is decided from inputs.conf [splunktcp-ssl:*] stanzas only",
+      ssl_stanza: { serverCert: asString(sslStanza?.serverCert) ?? null, requireClientCert: sslStanza?.requireClientCert ?? null, sslVersions: asStringList(sslStanza?.sslVersions) },
+      note: "data/inputs/tcp/cooked does not report TLS; encryption is decided from inputs.conf [splunktcp-ssl:*] stanzas, and serverCert and requireClientCert are resolved per port from [splunktcp-ssl:<port>] first, then [SSL]",
     };
     const ports = (items: S2sListener[]): string => items.map((item) => item.port).join(", ");
     if (listeners.length === 0) {
@@ -1953,14 +1997,12 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
       findings.push(finding(23, "manual", `Unknown: ${listeners.length} enabled splunktcp listeners exist (ports ${ports(listeners)}) but /services/configs/conf-inputs could not be read because ${unreadableCause(inputsConf)}, and the data/inputs/tcp/cooked REST view does not report TLS. Collect inputs.conf [splunktcp-ssl:*] and [SSL] from each indexer manually.`, evidence));
     } else if (unconfirmed.length > 0) {
       findings.push(finding(23, "manual", `Unknown: ${unconfirmed.length} of ${listeners.length} enabled splunktcp listeners (ports ${ports(unconfirmed)}) have no [splunktcp-ssl:<port>] stanza in the readable inputs.conf, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.`, evidence));
-    } else if (!sslStanza) {
-      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but inputs.conf returned no [SSL] stanza, so serverCert and requireClientCert are unknown.`, evidence));
-    } else if (requireClientCert !== true) {
-      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but [SSL] requireClientCert is ${sslStanza.requireClientCert === undefined ? "absent (the documented default varies with the certificate in use)" : String(sslStanza.requireClientCert)}, so forwarders are not certificate-authenticated.`, evidence));
-    } else if (!serverCert) {
-      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers with requireClientCert=true but [SSL] serverCert is absent, so the receiving certificate cannot be confirmed.`, evidence));
+    } else if (withoutClientCert.length > 0) {
+      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but requireClientCert is not true for ${withoutClientCert.length} of them: ${withoutClientCert.map((item) => describeRequireClientCert(item, sslStanza)).join("; ")}. Forwarders on those ports are not certificate-authenticated.`, evidence));
+    } else if (withoutServerCert.length > 0) {
+      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers with requireClientCert=true but serverCert is absent from both [splunktcp-ssl:<port>] and [SSL] for ports ${ports(withoutServerCert)}, so the receiving certificate cannot be confirmed.`, evidence));
     } else {
-      findings.push(finding(23, "pass", `All ${listeners.length} enabled S2S listeners are [splunktcp-ssl:*] receivers (ports ${ports(listeners)}) with [SSL] serverCert set and requireClientCert=true.`, evidence));
+      findings.push(finding(23, "pass", `All ${listeners.length} enabled S2S listeners are [splunktcp-ssl:*] receivers (ports ${ports(listeners)}) with serverCert set and requireClientCert=true, resolved per port from [splunktcp-ssl:<port>] first and [SSL] second.`, evidence));
     }
   }
 
