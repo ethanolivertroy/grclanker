@@ -744,6 +744,8 @@ test("rule 9: redaction keeps field names, replaces credential values, and scrub
   });
   assert.equal(redactSecretText("token known-secret-value and https://hooks.slack.com/services/T/B/X end", ["known-secret-value"]), `token ${SLACK_REDACTION_MARKER} and ${SLACK_REDACTION_MARKER} end`);
   assert.equal(redactSecretText("https://files.slack.com/f.png?token=abc123&size=2&Signature=zzz"), `https://files.slack.com/f.png?token=${SLACK_REDACTION_MARKER}&size=2&Signature=${SLACK_REDACTION_MARKER}`);
+  assert.equal(redactSecretText("a-b-c and channel-general stay intact", ["-", "a", "channel"]), "a-b-c and channel-general stay intact");
+  assert.equal(redactSecretText("long-secret-value stays scrubbed", ["long-secret-value"]), `${SLACK_REDACTION_MARKER} stays scrubbed`);
 
   const client = makeClient(secretLadenFixture, { token: FAKE_SECRETS.userToken, bot_token: FAKE_SECRETS.botToken, scim_token: FAKE_SECRETS.scimToken, org_id: "E1" });
   const auth = await client.web("auth.test");
@@ -867,10 +869,43 @@ test("rule 10: every pagination loop reports truncation on its cap exit and depe
     emojiPages += 1;
     return { ok: true, emoji: { [`e${emojiPages}`]: { url: "u", date_created: 1591720632, uploaded_by: "W1" } }, response_metadata: { next_cursor: "more" } };
   }));
-  assert.equal(emojiPages, 51);
+  assert.equal(emojiPages, 50, "the emoji loop stops at MAX_PAGES_PER_LIST requests");
   assert.equal(byId(emojiPageCap, "SLACK-ADMIN-08").status, "warn");
-  assert.match(byId(emojiPageCap, "SLACK-ADMIN-08").summary, /partial/);
+  assert.match(byId(emojiPageCap, "SLACK-ADMIN-08").summary, /All 50 seen custom emoji were uploaded by admins or owners, but the emoji inventory is partial \(emoji: 50 seen of unknown total \(partial view, page cap of 50 reached\); users: 2 seen \(complete\)\)/);
   assert.equal(byId(emojiPageCap, "SLACK-ADMIN-08").evidence.inventory_complete, false);
+  assert.equal(byId(emojiPageCap, "SLACK-ADMIN-08").evidence.emoji_truncation, "page_cap");
+  assert.equal(byId(emojiPageCap, "SLACK-ADMIN-08").evidence.emoji_count, 50);
+
+  let emojiStalledPages = 0;
+  const emojiStalled = await assessSlackAdminAccess(withOverride((request) => {
+    if (method(request) !== "admin.emoji.list") return undefined;
+    emojiStalledPages += 1;
+    return { ok: true, emoji: {}, response_metadata: { next_cursor: "still-more" } };
+  }));
+  assert.equal(emojiStalledPages, 1, "an empty page with a cursor outstanding stops the listing on the spot");
+  assert.notEqual(byId(emojiStalled, "SLACK-ADMIN-08").status, "pass");
+  assert.match(byId(emojiStalled, "SLACK-ADMIN-08").summary, /admin\.emoji\.list was truncated before any custom emoji were seen \(0 seen of unknown total \(partial view, cursor returned an empty page\)\)/);
+  assert.doesNotMatch(byId(emojiStalled, "SLACK-ADMIN-08").summary, /returned no custom emoji/);
+  assert.equal(byId(emojiStalled, "SLACK-ADMIN-08").evidence.inventory_complete, false);
+  assert.equal(byId(emojiStalled, "SLACK-ADMIN-08").evidence.emoji_truncation, "stalled_cursor");
+
+  let emojiLatePages = 0;
+  const emojiLateStall = await assessSlackAdminAccess(withOverride((request) => {
+    if (method(request) !== "admin.emoji.list") return undefined;
+    emojiLatePages += 1;
+    return emojiLatePages === 1
+      ? { ok: true, emoji: { party: { url: "u", date_created: 1591720632, uploaded_by: "W1" } }, response_metadata: { next_cursor: "page2" } }
+      : { ok: true, emoji: {}, response_metadata: { next_cursor: "page3" } };
+  }));
+  assert.equal(emojiLatePages, 2);
+  assert.equal(byId(emojiLateStall, "SLACK-ADMIN-08").status, "warn");
+  assert.match(byId(emojiLateStall, "SLACK-ADMIN-08").summary, /emoji: 1 seen of unknown total \(partial view, cursor returned an empty page\)/);
+
+  const emojiUsersPartial = await assessSlackAdminAccess(withOverride((request) => method(request) === "admin.users.list"
+    ? { ...compliantFixture(request), response_metadata: { next_cursor: "more" } }
+    : undefined), { userLimit: 2 });
+  assert.equal(byId(emojiUsersPartial, "SLACK-ADMIN-08").status, "warn");
+  assert.match(byId(emojiUsersPartial, "SLACK-ADMIN-08").summary, /but the user inventory is partial \(emoji: 1 seen \(complete\); users: 2 seen of unknown total \(partial view, item limit reached\)\)/);
 
   const appCap = await assessSlackIntegrations(withOverride((request) => method(request) === "admin.apps.approved.list"
     ? { ...compliantFixture(request), approved_apps: [...compliantFixture(request).approved_apps, { app: { id: "A3", name: "Second", is_app_directory_approved: true, is_internal: false, developer_type: "third_party" }, scopes: [] }], response_metadata: { next_cursor: "" } }

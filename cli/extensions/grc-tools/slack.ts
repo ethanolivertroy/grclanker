@@ -504,7 +504,11 @@ export const SLACK_REDACTION_MARKER = "[REDACTED]";
 
 /** Field names whose values are credentials; the name is kept and the value replaced. */
 const SECRET_KEY_PATTERN = /token|secret|password|passwd|webhook|signing|private_key|api_key|apikey|authorization|cookie|credential/i;
-/** Names matching the pattern that describe a credential without carrying one. */
+/**
+ * Names matching the pattern that describe a credential without carrying one. Any future evidence key that
+ * matches SECRET_KEY_PATTERN but holds a count or description (for example webhook_count or token_count) must be
+ * listed here, or its value is blanked in every bundle.
+ */
 const SECRET_KEY_ALLOWLIST = new Set(["token_type", "token_kinds", "tokenKinds", "token_format", "token_rotation", "is_token_rotating", "rotating_format", "scim_configured"]);
 /** Slack bot, user, refresh, app-level, and rotating tokens, incoming webhook URLs, and bearer headers. */
 const SECRET_VALUE_PATTERNS: RegExp[] = [
@@ -519,10 +523,13 @@ function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key) && !SECRET_KEY_ALLOWLIST.has(key);
 }
 
+/** Shorter configured values are not scrubbed by exact match, so a degenerate token cannot blank unrelated text. */
+export const MIN_KNOWN_SECRET_LENGTH = 8;
+
 export function redactSecretText(text: string, knownSecrets: readonly string[] = []): string {
   let output = text;
   for (const secret of knownSecrets) {
-    if (secret.length > 0) output = output.split(secret).join(SLACK_REDACTION_MARKER);
+    if (secret.length >= MIN_KNOWN_SECRET_LENGTH) output = output.split(secret).join(SLACK_REDACTION_MARKER);
   }
   for (const pattern of SECRET_VALUE_PATTERNS) {
     output = output.replace(pattern, (match, prefix: unknown) => (typeof prefix === "string" ? `${prefix}${SLACK_REDACTION_MARKER}` : SLACK_REDACTION_MARKER));
@@ -982,6 +989,41 @@ async function readAnalyticsProbe(client: SlackApiClient): Promise<ReadResult<{ 
   } catch (error) {
     return { ok: false, error: surfaceError(error), code: errorCode(error) };
   }
+}
+
+interface SlackEmojiEntry {
+  name: string;
+  uploaded_by?: string;
+  date_created?: string;
+}
+
+/**
+ * admin.emoji.list returns a name-keyed map rather than an array, so it cannot go through collectWeb.
+ * The loop records the same exit reasons: an empty page with a cursor outstanding is a stalled cursor
+ * and stops on the spot; MAX_PAGES_PER_LIST requests with a cursor outstanding is the page cap.
+ */
+async function collectEmoji(client: SlackApiClient): Promise<ReadResult<SlackEmojiEntry[]>> {
+  const entries: SlackEmojiEntry[] = [];
+  let truncation: SlackTruncation | undefined;
+  let cursor: string | undefined;
+  let pages = 0;
+  try {
+    do {
+      const page = await client.web("admin.emoji.list", { limit: 1000, cursor });
+      pages += 1;
+      const emoji = Object.entries(asObject(page.emoji) ?? {});
+      for (const [name, value] of emoji) {
+        const record = asObject(value);
+        entries.push({ name, uploaded_by: asString(record?.uploaded_by), date_created: extractTimestamp(record?.date_created) });
+      }
+      cursor = asString(asObject(page.response_metadata)?.next_cursor);
+      if (cursor && emoji.length === 0) truncation = "stalled_cursor";
+      else if (cursor && pages >= MAX_PAGES_PER_LIST) truncation = "page_cap";
+    } while (cursor && !truncation);
+  } catch (error) {
+    return { ok: false, error: surfaceError(error), code: errorCode(error) };
+  }
+  return { ok: true, value: entries, complete: truncation === undefined && !cursor, truncation };
 }
 
 async function readWebList(
@@ -1455,36 +1497,18 @@ export async function assessSlackAdminAccess(
   const overlongSessions = durations.filter((item) => item.duration_hours > maxSessionHours);
   const browserQuitKnown = sessionSettings.filter((item) => typeof item.desktop_app_browser_quit === "boolean");
 
-  const emojiResult = await readWebList(client, "admin.emoji.list", [], {}, { limit: 1 });
-  const emojiEntries: Array<{ name: string; uploaded_by?: string; date_created?: string }> = [];
-  let emojiComplete = false;
-  if (emojiResult.ok) {
-    try {
-      let cursor: string | undefined;
-      let pages = 0;
-      do {
-        const page = await client.web("admin.emoji.list", { limit: 1000, cursor });
-        pages += 1;
-        const emoji = asObject(page.emoji) ?? {};
-        for (const [name, value] of Object.entries(emoji)) {
-          const record = asObject(value);
-          emojiEntries.push({ name, uploaded_by: asString(record?.uploaded_by), date_created: extractTimestamp(record?.date_created) });
-        }
-        cursor = asString(asObject(page.response_metadata)?.next_cursor);
-      } while (cursor && pages < MAX_PAGES_PER_LIST);
-      emojiComplete = !cursor;
-    } catch (error) {
-      errors.push(`admin.emoji.list: ${surfaceError(error)}`);
-    }
-  } else {
-    errors.push(`admin.emoji.list: ${emojiResult.error}`);
-  }
+  const emojiResult = await collectEmoji(client);
+  if (!emojiResult.ok) errors.push(`admin.emoji.list: ${emojiResult.error}`);
+  const emojiEntries = emojiResult.ok ? emojiResult.value : [];
+  const emojiComplete = emojiResult.ok && emojiResult.complete;
+  const emojiView = emojiResult.ok ? partialNote(emojiEntries.length, emojiResult.complete, undefined, emojiResult.truncation) : "unreadable";
   const nonAdminUploads = emojiEntries.filter((item) => !item.uploaded_by || !adminUserIds.has(item.uploaded_by));
 
   const analyticsProbe = await readAnalyticsProbe(client);
   if (!analyticsProbe.ok) errors.push(`admin.analytics.getFile: ${analyticsProbe.error}`);
 
   const excessiveAdmins = adminInventory.filter((item) => item.admin_ids.length > maxWorkspaceAdmins);
+  const truncatedAdminLists = adminInventory.filter((item) => !item.complete).map((item) => `${item.name} (${item.id})`);
   const adminsComplete = workspacesComplete && adminErrors.length === 0 && adminInventory.every((item) => item.complete);
   const openWorkspaces = workspaces.filter((item) => item.discoverability === "open");
   const unknownDiscoverability = workspaces.filter((item) => !item.discoverability);
@@ -1504,10 +1528,10 @@ export async function assessSlackAdminAccess(
           "high",
           excessiveAdmins.length > 0 ? "fail" : adminsComplete ? "pass" : "warn",
           excessiveAdmins.length > 0
-            ? `${excessiveAdmins.length}/${adminInventory.length} workspaces exceed ${maxWorkspaceAdmins} admins (admin_ids; workspaces: ${workspaceView}).`
+            ? `${excessiveAdmins.length}/${adminInventory.length} workspaces exceed ${maxWorkspaceAdmins} admins (admin_ids; workspaces: ${workspaceView}${truncatedAdminLists.length > 0 ? `; admin lists truncated for ${truncatedAdminLists.join(", ")}` : ""}).`
             : adminsComplete
               ? `No workspace exceeds ${maxWorkspaceAdmins} admins across ${adminInventory.length} workspaces (${workspaceView}).`
-              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; admin lists truncated: ${adminInventory.filter((item) => !item.complete).length}; unreadable admin lists: ${adminErrors.length}).`,
+              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; admin lists truncated: ${truncatedAdminLists.length}${truncatedAdminLists.length > 0 ? ` (${truncatedAdminLists.join(", ")})` : ""}; unreadable admin lists: ${adminErrors.length}).`,
           { admin_counts: adminInventory.map((item) => ({ id: item.id, name: item.name, count: item.admin_ids.length, complete: item.complete })), max_workspace_admins: maxWorkspaceAdmins, unreadable_workspaces: adminErrors, inventory_complete: adminsComplete },
         ),
   );
@@ -1636,9 +1660,19 @@ export async function assessSlackAdminAccess(
     !emojiResult.ok
       ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `admin.emoji.list is not readable: ${unreadableReason(emojiResult)}.`, "capture the custom emoji upload permission from the workspace settings.")
       : emojiEntries.length === 0
-        ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `admin.emoji.list returned no custom emoji; the upload permission setting is not exposed by the API (${SLACK_DOC_PAGES.emojiList}).`, "capture the custom emoji upload permission from the workspace settings.", { citation: SLACK_DOC_PAGES.emojiList })
+        ? manualFinding(
+          "SLACK-ADMIN-08",
+          "Custom emoji governance",
+          19,
+          "low",
+          emojiComplete
+            ? `admin.emoji.list returned no custom emoji (${emojiView}); the upload permission setting is not exposed by the API (${SLACK_DOC_PAGES.emojiList}).`
+            : `admin.emoji.list was truncated before any custom emoji were seen (${emojiView}); the upload permission setting is not exposed by the API (${SLACK_DOC_PAGES.emojiList}).`,
+          "capture the custom emoji upload permission from the workspace settings.",
+          { citation: SLACK_DOC_PAGES.emojiList, emoji_count: 0, inventory_complete: emojiComplete, emoji_truncation: emojiResult.truncation ?? null },
+        )
         : adminUserIds.size === 0
-          ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", "No admin or owner identities were readable, so emoji uploaders could not be compared with the admin roster.", "compare the emoji uploader list with the admin roster.", { emoji_count: emojiEntries.length })
+          ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `No admin or owner identities were readable, so emoji uploaders could not be compared with the admin roster (emoji: ${emojiView}).`, "compare the emoji uploader list with the admin roster.", { emoji_count: emojiEntries.length, inventory_complete: emojiComplete })
           : finding(
             "SLACK-ADMIN-08",
             "Custom emoji governance",
@@ -1646,11 +1680,11 @@ export async function assessSlackAdminAccess(
             "low",
             nonAdminUploads.length > 0 ? "fail" : emojiComplete && orgUsersComplete ? "pass" : "warn",
             nonAdminUploads.length > 0
-              ? `${nonAdminUploads.length}/${emojiEntries.length} custom emoji were uploaded by non-admin users; uploads are not restricted to admins.`
+              ? `${nonAdminUploads.length}/${emojiEntries.length} custom emoji were uploaded by non-admin users; uploads are not restricted to admins (emoji: ${emojiView}).`
               : emojiComplete && orgUsersComplete
-                ? `All ${emojiEntries.length} custom emoji were uploaded by admins or owners (complete inventory).`
-                : `All seen custom emoji were uploaded by admins, but the emoji or user inventory is partial.`,
-            { emoji_count: emojiEntries.length, non_admin_uploads: nonAdminUploads.slice(0, 20).map((item) => item.name), inventory_complete: emojiComplete },
+                ? `All ${emojiEntries.length} custom emoji were uploaded by admins or owners (emoji: ${emojiView}; users: ${orgUsersView}).`
+                : `All ${emojiEntries.length} seen custom emoji were uploaded by admins or owners, but the ${emojiComplete ? "user" : orgUsersComplete ? "emoji" : "emoji and user"} inventory is partial (emoji: ${emojiView}; users: ${orgUsersView}).`,
+            { emoji_count: emojiEntries.length, non_admin_uploads: nonAdminUploads.slice(0, 20).map((item) => item.name), inventory_complete: emojiComplete, emoji_truncation: emojiResult.truncation ?? null, users_inventory_complete: orgUsersComplete },
           ),
   );
 
