@@ -743,9 +743,9 @@ export function scopedStatus<T>(
   emptyStatus: OciFindingStatus,
 ): OciFindingStatus {
   if (!collection.readable) return "manual";
-  if (collection.items.length === 0) return emptyStatus;
-  if (computed === "pass" && isPartial(collection)) return "warn";
-  return computed;
+  const status = collection.items.length === 0 ? emptyStatus : computed;
+  if (status === "pass" && isPartial(collection)) return "warn";
+  return status;
 }
 
 function scopeEvidence<T>(collection: OciScopedCollection<T>): JsonRecord {

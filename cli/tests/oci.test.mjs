@@ -10,14 +10,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  OCI_SURFACE_DOCS,
+  OciAuditorClient,
+  assessOciComputeAndStorage,
   assessOciIdentity,
   assessOciLoggingDetection,
   assessOciTenancyGuardrails,
   checkOciAccess,
+  collectAcrossCompartments,
   exportOciAuditBundle,
   resolveOciConfiguration,
   resolveSecureOutputPath,
+  ruleReachesSensitivePort,
+  scopedStatus,
 } from "../dist/extensions/grc-tools/oci.js";
+
+const NOW = new Date("2026-09-21T00:00:00.000Z");
+const TENANCY = "ocid1.tenancy.oc1..aaaaexample";
+const ROOT = { id: TENANCY, compartmentId: TENANCY, name: "root", lifecycleState: "ACTIVE" };
+const PROD = { id: "ocid1.compartment.oc1..prod", compartmentId: TENANCY, name: "prod", lifecycleState: "ACTIVE" };
+const APPS = { id: "ocid1.compartment.oc1..apps", compartmentId: PROD.id, name: "apps", lifecycleState: "ACTIVE" };
+const DENIED_ERROR = new Error("ServiceError: 404 NotAuthorizedOrNotFound: Authorization failed or requested resource not found.");
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -28,11 +41,203 @@ function sampleConfig(overrides = {}) {
     configFile: "/tmp/oci/config",
     profile: "prod-audit",
     region: "us-ashburn-1",
-    tenancyOcid: "ocid1.tenancy.oc1..aaaaexample",
-    compartmentOcid: "ocid1.compartment.oc1..aaaaexample",
+    tenancyOcid: TENANCY,
+    compartmentOcid: TENANCY,
     sourceChain: ["tests"],
     ...overrides,
   };
+}
+
+/**
+ * Fixture (d): a fully compliant tenancy built strictly from documented
+ * field names and shapes (REST datatypes cited in OCI_SURFACE_DOCS).
+ */
+function compliantClient() {
+  return {
+    getResolvedConfig: () => sampleConfig(),
+    getNow: () => NOW,
+    async listCompartments() {
+      return [ROOT, PROD, APPS];
+    },
+    async listUsers() {
+      return [
+        { id: "ocid1.user.oc1..alice", name: "alice", lifecycleState: "ACTIVE", isMfaActivated: true, capabilities: { canUseConsolePassword: true, canUseApiKeys: true } },
+        { id: "ocid1.user.oc1..svc", name: "svc", lifecycleState: "ACTIVE", isMfaActivated: false, capabilities: { canUseConsolePassword: false, canUseApiKeys: true } },
+      ];
+    },
+    async getAuthenticationPolicy() {
+      return {
+        compartmentId: TENANCY,
+        passwordPolicy: {
+          minimumPasswordLength: 16,
+          isLowercaseCharactersRequired: true,
+          isUppercaseCharactersRequired: true,
+          isNumericCharactersRequired: true,
+          isSpecialCharactersRequired: true,
+          isUsernameContainmentAllowed: false,
+        },
+      };
+    },
+    async listApiKeys() {
+      return [{ fingerprint: "aa:bb", lifecycleState: "ACTIVE", timeCreated: "2026-08-01T00:00:00.000Z" }];
+    },
+    async listCustomerSecretKeys() {
+      return [{ id: "csk-1", lifecycleState: "ACTIVE", timeCreated: "2026-08-15T00:00:00.000Z" }];
+    },
+    async listAuthTokens() {
+      return [{ id: "tok-1", lifecycleState: "ACTIVE", timeCreated: "2026-09-01T00:00:00.000Z" }];
+    },
+    async listPolicies(compartmentId) {
+      return compartmentId === TENANCY
+        ? [{ id: "pol-1", name: "Auditors", lifecycleState: "ACTIVE", statements: ["Allow group Auditors to inspect all-resources in tenancy"] }]
+        : [{ id: `pol-${compartmentId}`, name: "AppAdmins", lifecycleState: "ACTIVE", statements: ["Allow group AppAdmins to manage instance-family in compartment apps"] }];
+    },
+    async listAvailabilityDomains() {
+      return [{ name: "Uocm:US-ASHBURN-AD-1", compartmentId: TENANCY, id: "ad-1" }];
+    },
+    async getAuditConfiguration() {
+      return { retentionPeriodDays: 365 };
+    },
+    async listAuditEvents() {
+      return [{ eventId: "evt-1", eventTime: "2026-09-20T12:00:00.000Z", eventType: "com.oraclecloud.identitycontrolplane.createuser" }];
+    },
+    async getCloudGuardConfiguration() {
+      return { status: "ENABLED", reportingRegion: "us-ashburn-1", selfManageResources: false };
+    },
+    async listCloudGuardTargets() {
+      return [{ id: "target-1", lifecycleState: "ACTIVE", recipeCount: 2, targetResourceType: "COMPARTMENT" }];
+    },
+    async listCloudGuardProblems() {
+      return [];
+    },
+    async listResponderRecipes() {
+      return [{ id: "recipe-1", lifecycleState: "ACTIVE", responderRules: [{ id: "rule-1", details: { isEnabled: true, mode: "USERACTION" } }] }];
+    },
+    async listEventRules(compartmentId) {
+      return compartmentId === TENANCY
+        ? [{ id: "rule-1", displayName: "iam-changes", isEnabled: true, lifecycleState: "ACTIVE", condition: JSON.stringify({ eventType: ["com.oraclecloud.identitycontrolplane.createpolicy"] }) }]
+        : [];
+    },
+    async listSecurityLists(compartmentId) {
+      return compartmentId === APPS.id
+        ? [{ id: "sl-1", displayName: "app-sl", lifecycleState: "AVAILABLE", ingressSecurityRules: [{ protocol: "6", source: "10.0.0.0/8", sourceType: "CIDR_BLOCK", tcpOptions: { destinationPortRange: { min: 22, max: 22 } } }] }]
+        : [];
+    },
+    async listNetworkSecurityGroups(compartmentId) {
+      return compartmentId === APPS.id ? [{ id: "nsg-1", displayName: "app-nsg", lifecycleState: "AVAILABLE" }] : [];
+    },
+    async listNetworkSecurityGroupRules() {
+      return [{ id: "sr-1", direction: "INGRESS", protocol: "6", source: "10.0.0.0/8", sourceType: "CIDR_BLOCK", tcpOptions: { destinationPortRange: { min: 443, max: 443 } } }];
+    },
+    async listInternetGateways() {
+      return [];
+    },
+    async listBastions(compartmentId) {
+      return compartmentId === PROD.id ? [{ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE" }] : [];
+    },
+    async getBastion() {
+      return { id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 3600, clientCidrBlockAllowList: ["203.0.113.0/24"] };
+    },
+    async listBastionSessions() {
+      return [{ id: "session-1", lifecycleState: "ACTIVE", timeCreated: "2026-09-20T22:00:00.000Z", sessionTtlInSeconds: 1800 }];
+    },
+    async listVaults(compartmentId) {
+      return compartmentId === PROD.id ? [{ id: "vault-1", displayName: "core", compartmentId: PROD.id, lifecycleState: "ACTIVE", managementEndpoint: "https://vault-management.example" }] : [];
+    },
+    async listKeys() {
+      return [{ id: "key-1", displayName: "data", algorithm: "AES", lifecycleState: "ENABLED", protectionMode: "HSM", timeCreated: "2024-01-01T00:00:00.000Z" }];
+    },
+    async listKeyVersions() {
+      return [
+        { id: "kv-1", lifecycleState: "ENABLED", timeCreated: "2024-01-01T00:00:00.000Z" },
+        { id: "kv-2", lifecycleState: "ENABLED", timeCreated: "2026-06-01T00:00:00.000Z" },
+      ];
+    },
+    async getObjectStorageNamespace() {
+      return "tenantns";
+    },
+    async listBuckets(_namespace, compartmentId) {
+      return compartmentId === APPS.id ? [{ name: "logs", namespace: "tenantns", compartmentId: APPS.id }] : [];
+    },
+    async getBucket() {
+      return { name: "logs", namespace: "tenantns", publicAccessType: "NoPublicAccess" };
+    },
+    async listPreauthenticatedRequests() {
+      return [{ id: "par-1", name: "export", accessType: "ObjectRead", timeExpires: "2026-09-25T00:00:00.000Z" }];
+    },
+    async listInstances(compartmentId) {
+      return compartmentId === APPS.id ? [{ id: "inst-1", displayName: "web", lifecycleState: "RUNNING", instanceOptions: { areLegacyImdsEndpointsDisabled: true } }] : [];
+    },
+    async listVolumes(compartmentId) {
+      return compartmentId === APPS.id ? [{ id: "vol-1", displayName: "data", lifecycleState: "AVAILABLE", kmsKeyId: "ocid1.key.oc1..cmk" }] : [];
+    },
+    async listBootVolumes(compartmentId) {
+      return compartmentId === APPS.id ? [{ id: "bv-1", displayName: "web-boot", lifecycleState: "AVAILABLE", kmsKeyId: "ocid1.key.oc1..cmk" }] : [];
+    },
+  };
+}
+
+/** Fixture (a): every surface fails with the documented NotAuthorizedOrNotFound response. */
+function deniedClient() {
+  const client = compliantClient();
+  for (const key of Object.keys(client)) {
+    if (key === "getResolvedConfig" || key === "getNow") continue;
+    client[key] = async () => {
+      throw DENIED_ERROR;
+    };
+  }
+  return client;
+}
+
+/** Fixture (b): every list is empty and every single-object read returns null. */
+function emptyClient() {
+  const client = compliantClient();
+  const singles = new Set(["getAuthenticationPolicy", "getAuditConfiguration", "getCloudGuardConfiguration", "getBastion", "getBucket"]);
+  for (const key of Object.keys(client)) {
+    if (key === "getResolvedConfig" || key === "getNow") continue;
+    if (key === "getObjectStorageNamespace") {
+      client[key] = async () => "tenantns";
+    } else if (singles.has(key)) {
+      client[key] = async () => null;
+    } else {
+      client[key] = async () => [];
+    }
+  }
+  return client;
+}
+
+/** Fixture (c): one compartment denied for every compartment-scoped list. */
+function partialClient() {
+  const client = compliantClient();
+  const scopedLists = ["listPolicies", "listEventRules", "listSecurityLists", "listNetworkSecurityGroups", "listInternetGateways", "listBastions", "listVaults", "listInstances", "listVolumes", "listBootVolumes"];
+  for (const key of scopedLists) {
+    const original = client[key];
+    client[key] = async (...args) => {
+      if (args[0] === PROD.id) throw DENIED_ERROR;
+      return original(...args);
+    };
+  }
+  const originalBuckets = client.listBuckets;
+  client.listBuckets = async (namespace, compartmentId) => {
+    if (compartmentId === PROD.id) throw DENIED_ERROR;
+    return originalBuckets(namespace, compartmentId);
+  };
+  return client;
+}
+
+function byId(result, id) {
+  const item = result.findings.find((entry) => entry.id === id);
+  assert.ok(item, `missing finding ${id}`);
+  return item;
+}
+
+async function runAllAssessments(client, options = {}) {
+  return [
+    await assessOciIdentity(client, options),
+    await assessOciLoggingDetection(client, options),
+    await assessOciTenancyGuardrails(client, options),
+    await assessOciComputeAndStorage(client, options),
+  ];
 }
 
 test("resolveOciConfiguration prefers explicit arguments over environment and config", () => {
@@ -64,290 +269,376 @@ tenancy=ocid1.tenancy.oc1..config
   assert.equal(resolved.tenancyOcid, "ocid1.tenancy.oc1..explicit");
   assert.equal(resolved.compartmentOcid, "ocid1.compartment.oc1..explicit");
   assert.ok(resolved.sourceChain.includes("arguments-config-file"));
-  assert.ok(resolved.sourceChain.includes("arguments-profile"));
-  assert.ok(resolved.sourceChain.includes("arguments-region"));
+});
+
+test("OciAuditorClient sends documented CLI commands and flags", async () => {
+  const calls = [];
+  const runner = (args) => {
+    calls.push(args.slice(8));
+    return JSON.stringify({ data: [] });
+  };
+  const client = new OciAuditorClient(sampleConfig(), runner, { now: () => NOW });
+  await client.listCompartments();
+  await client.listPolicies("ocid1.compartment.oc1..x");
+  await client.listNetworkSecurityGroupRules("nsg-1");
+  await client.listKeys({ id: "vault-1", compartmentId: "c1", managementEndpoint: "https://kms.example" });
+  await client.listKeyVersions({ id: "vault-1", managementEndpoint: "https://kms.example" }, "key-1");
+  await client.listBootVolumes("c1", "AD-1");
+  await client.listInstances("c1");
+  await client.listVolumes("c1");
+  await client.getBucket("ns", "bucket");
+  await client.getBastion("bastion-1");
+  await client.listCloudGuardProblems();
+
+  assert.deepEqual(calls[0], ["iam", "compartment", "list", "--compartment-id", TENANCY, "--all", "--compartment-id-in-subtree", "true", "--access-level", "ACCESSIBLE", "--include-root", "true"]);
+  assert.deepEqual(calls[1], ["iam", "policy", "list", "--compartment-id", "ocid1.compartment.oc1..x", "--all"]);
+  assert.deepEqual(calls[2], ["network", "nsg", "rules", "list", "--nsg-id", "nsg-1", "--direction", "INGRESS", "--all"]);
+  assert.deepEqual(calls[3], ["kms", "management", "key", "list", "--endpoint", "https://kms.example", "--compartment-id", "c1", "--all"]);
+  assert.deepEqual(calls[4], ["kms", "management", "key-version", "list", "--endpoint", "https://kms.example", "--key-id", "key-1", "--all"]);
+  assert.deepEqual(calls[5], ["bv", "boot-volume", "list", "--compartment-id", "c1", "--availability-domain", "AD-1", "--all"]);
+  assert.deepEqual(calls[6], ["compute", "instance", "list", "--compartment-id", "c1", "--all"]);
+  assert.deepEqual(calls[7], ["bv", "volume", "list", "--compartment-id", "c1", "--all"]);
+  assert.deepEqual(calls[8], ["os", "bucket", "get", "--namespace-name", "ns", "--bucket-name", "bucket"]);
+  assert.deepEqual(calls[9], ["bastion", "bastion", "get", "--bastion-id", "bastion-1"]);
+  assert.deepEqual(calls[10], ["cloud-guard", "problem", "list", "--compartment-id", TENANCY, "--compartment-id-in-subtree", "true", "--access-level", "ACCESSIBLE", "--lifecycle-detail", "OPEN", "--all"]);
+  for (const args of calls) {
+    assert.ok(!args.includes("--query"), "no --query projection is used");
+  }
+  for (const [name, doc] of Object.entries(OCI_SURFACE_DOCS)) {
+    assert.match(doc.cli, /^https:\/\/docs\.oracle\.com\/en-us\/iaas\/tools\/oci-cli\//, `${name} cites the CLI reference`);
+    assert.match(doc.rest, /^https:\/\/docs\.oracle\.com\/en-us\/iaas\/api\//, `${name} cites the REST reference`);
+    assert.ok(doc.fields.length > 0);
+  }
 });
 
 test("checkOciAccess reports readable OCI surfaces", async () => {
-  const client = {
-    getResolvedConfig: () => sampleConfig(),
-    async listCompartments() {
-      return [{ id: "root" }, { id: "child" }];
-    },
-    async listUsers() {
-      return [{ id: "u1" }];
-    },
-    async getAuthenticationPolicy() {
-      return { passwordPolicy: { minimumPasswordLength: 16 } };
-    },
-    async listAuditEvents() {
-      return [{ id: "evt-1" }, { id: "evt-2" }];
-    },
-    async listCloudGuardTargets() {
-      return [{ id: "target-1" }];
-    },
-    async listSecurityLists() {
-      return [{ id: "sl-1" }];
-    },
-    async listVaults() {
-      return [{ id: "vault-1" }];
-    },
-    async getObjectStorageNamespace() {
-      return "tenantns";
-    },
-    async listBuckets() {
-      return [{ name: "logs" }];
-    },
-  };
-
-  const result = await checkOciAccess(client);
+  const result = await checkOciAccess(compliantClient());
   assert.equal(result.status, "healthy");
-  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 8);
-  assert.match(result.recommendedNextStep, /oci_assess_identity/);
+  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 10);
+  assert.match(result.recommendedNextStep, /oci_assess_compute_and_storage/);
+
+  const denied = await checkOciAccess(deniedClient());
+  assert.equal(denied.status, "limited");
+  assert.equal(denied.surfaces.filter((surface) => surface.status === "not_readable").length, 10);
+});
+
+test("self-check fixture (d): fully compliant tenancy passes every automatable control", async () => {
+  const results = await runAllAssessments(compliantClient());
+  const findings = results.flatMap((result) => result.findings);
+  const manual = findings.filter((item) => item.status === "manual").map((item) => item.id);
+  assert.deepEqual(manual, ["OCI-IAM-06"], "only the undocumented password expiration stays manual");
+  const nonPass = findings.filter((item) => item.status !== "pass" && item.id !== "OCI-IAM-06");
+  assert.deepEqual(nonPass.map((item) => `${item.id}:${item.status}:${item.summary}`), []);
+  assert.equal(findings.length, 21);
+  assert.equal(results.flatMap((result) => result.errors).length, 0);
+});
+
+test("self-check fixture (a): denied surfaces never pass and name the cause", async () => {
+  const results = await runAllAssessments(deniedClient());
+  const findings = results.flatMap((result) => result.findings);
+  assert.equal(findings.filter((item) => item.status === "pass").length, 0);
+  for (const item of findings) {
+    assert.equal(item.status, "manual", `${item.id} should be manual, got ${item.status}: ${item.summary}`);
+    assert.match(item.summary, /Manual/);
+  }
+  assert.ok(findings.some((item) => /NotAuthorizedOrNotFound/.test(item.summary)));
+  assert.ok(results.every((result) => result.errors.length > 0));
+});
+
+test("self-check fixture (b): empty inventories pass only where emptiness is compliant by intent", async () => {
+  const results = await runAllAssessments(emptyClient());
+  const findings = results.flatMap((result) => result.findings);
+  const statuses = Object.fromEntries(findings.map((item) => [item.id, item.status]));
+  assert.equal(statuses["OCI-IAM-01"], "manual");
+  assert.equal(statuses["OCI-IAM-02"], "manual");
+  assert.equal(statuses["OCI-IAM-03"], "manual");
+  assert.equal(statuses["OCI-IAM-04"], "manual");
+  assert.equal(statuses["OCI-IAM-05"], "fail");
+  assert.equal(statuses["OCI-LOG-01"], "manual");
+  assert.equal(statuses["OCI-LOG-02"], "manual");
+  assert.equal(statuses["OCI-LOG-03"], "manual");
+  assert.equal(statuses["OCI-LOG-06"], "manual");
+  assert.equal(statuses["OCI-LOG-04"], "warn");
+  assert.equal(statuses["OCI-LOG-05"], "manual");
+  for (const id of ["OCI-GRD-01", "OCI-GRD-02", "OCI-GRD-03", "OCI-GRD-04", "OCI-GRD-05", "OCI-GRD-06", "OCI-CMP-01", "OCI-CMP-02", "OCI-CMP-03"]) {
+    assert.equal(statuses[id], "manual", `${id} with no compartments must be manual`);
+  }
+  assert.equal(findings.filter((item) => item.status === "pass").length, 0);
+});
+
+test("self-check fixture (b) with compartments: vacuous NSG and gateway emptiness passes only beside readable security lists", async () => {
+  const client = emptyClient();
+  client.listCompartments = async () => [ROOT, PROD];
+  client.listSecurityLists = async () => [{ id: "sl-1", lifecycleState: "AVAILABLE", ingressSecurityRules: [] }];
+  const result = await assessOciTenancyGuardrails(client);
+  assert.equal(byId(result, "OCI-GRD-01").status, "pass");
+  assert.equal(byId(result, "OCI-GRD-02").status, "pass");
+  assert.match(byId(result, "OCI-GRD-02").summary, /emptiness is compliant/);
+  assert.equal(byId(result, "OCI-GRD-03").status, "pass");
+  assert.equal(byId(result, "OCI-GRD-04").status, "manual");
+  assert.equal(byId(result, "OCI-GRD-05").status, "manual");
+  assert.equal(byId(result, "OCI-GRD-06").status, "manual");
+  const compute = await assessOciComputeAndStorage(client);
+  for (const item of compute.findings) {
+    assert.equal(item.status, "manual", `${item.id} should be manual on empty inventory`);
+  }
+  const logging = await assessOciLoggingDetection(client);
+  assert.equal(byId(logging, "OCI-LOG-05").status, "fail");
+});
+
+test("self-check fixture (c): partial inventories never pass and report seen versus total", async () => {
+  const results = await runAllAssessments(partialClient());
+  const findings = results.flatMap((result) => result.findings);
+  const scoped = ["OCI-IAM-04", "OCI-LOG-05", "OCI-GRD-01", "OCI-GRD-02", "OCI-GRD-03", "OCI-GRD-04", "OCI-GRD-05", "OCI-GRD-06", "OCI-CMP-01", "OCI-CMP-02", "OCI-CMP-03"];
+  for (const id of scoped) {
+    const item = findings.find((entry) => entry.id === id);
+    assert.notEqual(item.status, "pass", `${id} must not pass on a partial view: ${item.summary}`);
+    assert.match(item.summary, /Partial view|Manual/, `${id} must flag the partial view`);
+    assert.equal(item.evidence.compartments_total, 3);
+    assert.ok(item.evidence.compartments_seen < 3);
+  }
+});
+
+test("compartment cap withholds pass and records truncation", async () => {
+  const client = compliantClient();
+  const compute = await assessOciComputeAndStorage(client, { maxCompartments: 1 });
+  for (const item of compute.findings) {
+    assert.notEqual(item.status, "pass");
+    assert.equal(item.evidence.truncated, true);
+    assert.equal(item.evidence.compartments_seen, 1);
+    assert.equal(item.evidence.compartments_total, 3);
+  }
+  const collection = await collectAcrossCompartments("x", [ROOT, PROD, APPS], 2, async () => [{ ok: true }]);
+  assert.equal(collection.truncated, true);
+  assert.equal(scopedStatus(collection, "pass", "manual"), "warn");
+  assert.equal(scopedStatus({ ...collection, readable: false }, "pass", "manual"), "manual");
+  assert.equal(scopedStatus({ ...collection, items: [] }, "pass", "fail"), "fail");
 });
 
 test("assessOciIdentity flags weak password policy, missing MFA, stale credentials, and broad policies", async () => {
-  const client = {
-    getNow: () => new Date("2026-04-16T00:00:00.000Z"),
-    async getAuthenticationPolicy() {
-      return {
-        passwordPolicy: {
-          minimumPasswordLength: 12,
-          passwordExpiresAfterDays: 180,
-          isLowerCaseCharactersRequired: true,
-          isUpperCaseCharactersRequired: true,
-          isNumericCharactersRequired: false,
-          isSpecialCharactersRequired: true,
-        },
-      };
+  const client = compliantClient();
+  client.getAuthenticationPolicy = async () => ({
+    passwordPolicy: {
+      minimumPasswordLength: 12,
+      isLowercaseCharactersRequired: true,
+      isUppercaseCharactersRequired: true,
+      isNumericCharactersRequired: false,
+      isSpecialCharactersRequired: true,
     },
-    async listUsers() {
-      return [
-        { id: "u1", name: "alice", capabilities: { canUseConsolePassword: true } },
-        { id: "u2", name: "bob", capabilities: { canUseConsolePassword: true } },
-      ];
-    },
-    async listMfaTotpDevices(userId) {
-      return userId === "u1" ? [] : [{ id: "mfa-bob" }];
-    },
-    async listApiKeys(userId) {
-      if (userId === "u1") {
-        return [{ fingerprint: "fp-1", timeCreated: "2025-01-01T00:00:00Z" }];
-      }
-      return [];
-    },
-    async listCustomerSecretKeys() {
-      return [{ id: "secret-1", timeCreated: "2025-02-01T00:00:00Z" }];
-    },
-    async listAuthTokens() {
-      return [{ id: "token-1", timeCreated: "2025-03-01T00:00:00Z" }];
-    },
-    async listPolicies() {
-      return [{ name: "AdminAll", statements: ["Allow group Admins to manage all-resources in tenancy"] }];
-    },
-    async listCompartments() {
-      return [{ id: "root", compartmentId: "root", name: "root" }];
-    },
-  };
+  });
+  client.listUsers = async () => [
+    { id: "u1", name: "alice", lifecycleState: "ACTIVE", isMfaActivated: false, capabilities: { canUseConsolePassword: true } },
+    { id: "u2", name: "bob", lifecycleState: "ACTIVE", isMfaActivated: true, capabilities: { canUseConsolePassword: true } },
+    { id: "u3", name: "gone", lifecycleState: "DELETED", isMfaActivated: false, capabilities: { canUseConsolePassword: true } },
+  ];
+  client.listApiKeys = async (userId) => (userId === "u1" ? [{ fingerprint: "fp-1", lifecycleState: "ACTIVE", timeCreated: "2025-01-01T00:00:00Z" }] : []);
+  client.listPolicies = async () => [{ id: "p", name: "AdminAll", lifecycleState: "ACTIVE", statements: ["Allow group Admins to manage all-resources in tenancy"] }];
+  client.listCompartments = async () => [ROOT];
 
-  const result = await assessOciIdentity(client, { staleDays: 90, maxKeys: 50, maxPolicies: 50 });
-  assert.equal(result.findings.find((item) => item.id === "OCI-IAM-01")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-IAM-02")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-IAM-03")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-IAM-04")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "OCI-IAM-05")?.status, "warn");
+  const result = await assessOciIdentity(client, { staleDays: 90 });
+  assert.equal(byId(result, "OCI-IAM-01").status, "fail");
+  assert.equal(byId(result, "OCI-IAM-02").status, "fail");
+  assert.match(byId(result, "OCI-IAM-02").summary, /1\/2 console-capable users/);
+  assert.equal(byId(result, "OCI-IAM-03").status, "fail");
+  assert.equal(byId(result, "OCI-IAM-04").status, "warn");
+  assert.equal(byId(result, "OCI-IAM-05").status, "fail");
+  assert.equal(byId(result, "OCI-IAM-06").status, "manual");
 });
 
-test("assessOciLoggingDetection classifies Cloud Guard, audit events, and event rules", async () => {
-  const client = {
-    async listCloudGuardTargets() {
-      return [{ id: "target-1", lifecycleState: "ACTIVE" }];
-    },
-    async listCloudGuardProblems() {
-      return [{ id: "prob-1", lifecycleState: "OPEN", severity: "HIGH" }];
-    },
-    async listResponderRecipes() {
-      return [{ id: "recipe-1", lifecycleState: "ACTIVE" }];
-    },
-    async listAuditEvents() {
-      return [{ id: "evt-1" }];
-    },
-    async listEventRules() {
-      return [{ id: "rule-1", condition: "identity policy changes" }];
-    },
+test("undated credentials and unknown MFA flags never count as compliant", async () => {
+  const client = compliantClient();
+  client.listApiKeys = async () => [{ fingerprint: "fp-undated", lifecycleState: "ACTIVE" }];
+  client.listUsers = async () => [
+    { id: "u1", name: "alice", lifecycleState: "ACTIVE", capabilities: { canUseConsolePassword: true } },
+  ];
+  const result = await assessOciIdentity(client);
+  assert.equal(byId(result, "OCI-IAM-02").status, "warn");
+  assert.match(byId(result, "OCI-IAM-02").summary, /did not report isMfaActivated/);
+  assert.equal(byId(result, "OCI-IAM-03").status, "warn");
+  assert.equal(byId(result, "OCI-IAM-03").evidence.undated_credentials.length, 1);
+});
+
+test("credential cap and per-user listing errors downgrade the rotation verdict", async () => {
+  const client = compliantClient();
+  const capped = await assessOciIdentity(client, { maxKeys: 1 });
+  assert.equal(byId(capped, "OCI-IAM-03").status, "warn");
+  assert.equal(byId(capped, "OCI-IAM-03").evidence.credential_cap_hit, true);
+
+  client.listAuthTokens = async () => {
+    throw DENIED_ERROR;
   };
+  const errored = await assessOciIdentity(client);
+  assert.equal(byId(errored, "OCI-IAM-03").status, "warn");
+  assert.ok(errored.errors.some((error) => /auth_token/.test(error)));
+});
+
+test("assessOciLoggingDetection judges Cloud Guard, retention, and event rules from documented fields", async () => {
+  const client = compliantClient();
+  client.listCloudGuardProblems = async () => [{ id: "prob-1", lifecycleDetail: "OPEN", lifecycleState: "ACTIVE", riskLevel: "HIGH" }];
+  client.getAuditConfiguration = async () => ({ retentionPeriodDays: 90 });
+  client.listResponderRecipes = async () => [{ id: "recipe-1", lifecycleState: "ACTIVE", responderRules: [{ details: { isEnabled: false } }] }];
+  client.listEventRules = async () => [{ id: "rule-1", isEnabled: false, lifecycleState: "ACTIVE", condition: "{\"eventType\":[\"com.oraclecloud.identitycontrolplane.createpolicy\"]}" }];
 
   const result = await assessOciLoggingDetection(client, { lookbackDays: 7 });
-  assert.equal(result.findings.find((item) => item.id === "OCI-LOG-01")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "OCI-LOG-02")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-LOG-03")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "OCI-LOG-04")?.status, "pass");
-  assert.equal(result.findings.find((item) => item.id === "OCI-LOG-05")?.status, "pass");
+  assert.equal(byId(result, "OCI-LOG-01").status, "pass");
+  assert.equal(byId(result, "OCI-LOG-02").status, "fail");
+  assert.equal(byId(result, "OCI-LOG-03").status, "fail");
+  assert.equal(byId(result, "OCI-LOG-06").status, "fail");
+  assert.match(byId(result, "OCI-LOG-06").summary, /retentionPeriodDays is 90/);
+  assert.equal(byId(result, "OCI-LOG-04").status, "pass");
+  assert.equal(byId(result, "OCI-LOG-05").status, "fail");
+  assert.match(byId(result, "OCI-LOG-05").summary, /none with a condition/);
+});
+
+test("Cloud Guard disabled turns empty problems and responders into manual, never pass", async () => {
+  const client = compliantClient();
+  client.getCloudGuardConfiguration = async () => ({ status: "DISABLED" });
+  const result = await assessOciLoggingDetection(client);
+  assert.equal(byId(result, "OCI-LOG-01").status, "fail");
+  assert.equal(byId(result, "OCI-LOG-02").status, "manual");
+  assert.equal(byId(result, "OCI-LOG-03").status, "manual");
+
+  client.getCloudGuardConfiguration = async () => ({ reportingRegion: "us-ashburn-1" });
+  const missingFlag = await assessOciLoggingDetection(client);
+  assert.equal(byId(missingFlag, "OCI-LOG-01").status, "manual");
+});
+
+test("audit retention needs the documented field and the 365-day threshold", async () => {
+  const client = compliantClient();
+  client.getAuditConfiguration = async () => ({});
+  assert.equal(byId(await assessOciLoggingDetection(client), "OCI-LOG-06").status, "manual");
+  client.getAuditConfiguration = async () => ({ retentionPeriodDays: 365 });
+  assert.equal(byId(await assessOciLoggingDetection(client), "OCI-LOG-06").status, "pass");
+  client.getAuditConfiguration = async () => {
+    throw new Error("oci: command not found");
+  };
+  const failed = byId(await assessOciLoggingDetection(client), "OCI-LOG-06");
+  assert.equal(failed.status, "manual");
+  assert.match(failed.summary, /oci audit config get failed/);
 });
 
 test("assessOciTenancyGuardrails flags exposed network paths, bastions, keys, and public buckets", async () => {
-  const client = {
-    getNow: () => new Date("2026-04-16T00:00:00.000Z"),
-    async listSecurityLists() {
-      return [
-        {
-          id: "sl-1",
-          ingressSecurityRules: [
-            {
-              source: "0.0.0.0/0",
-              tcpOptions: { destinationPortRange: { min: 22, max: 22 } },
-            },
-          ],
-        },
-      ];
-    },
-    async listNetworkSecurityGroups() {
-      return [{ id: "nsg-1" }];
-    },
-    async listNetworkSecurityGroupRules() {
-      return [
-        {
-          source: "0.0.0.0/0",
-          tcpOptions: { destinationPortRange: { min: 3389, max: 3389 } },
-        },
-      ];
-    },
-    async listInternetGateways() {
-      return [{ id: "igw-1" }];
-    },
-    async listBastions() {
-      return [{ id: "bastion-1", maxSessionTtlInSeconds: 14400, clientCidrBlockAllowList: [] }];
-    },
-    async listBastionSessions() {
-      return [{ id: "session-1", timeCreated: "2026-04-15T12:00:00Z" }];
-    },
-    async listVaults() {
-      return [{ id: "vault-1", displayName: "core-vault", managementEndpoint: "https://kms.example" }];
-    },
-    async listKeys() {
-      return [{ id: "key-1", displayName: "legacy-key", algorithm: "AES", timeCreated: "2024-01-01T00:00:00Z" }];
-    },
-    async getObjectStorageNamespace() {
-      return "tenantns";
-    },
-    async listBuckets() {
-      return [{ name: "public-assets", publicAccessType: "ObjectRead" }];
-    },
-    async listPreauthenticatedRequests() {
-      return [{ id: "par-1", timeExpires: "2026-06-30T00:00:00Z" }];
-    },
-  };
+  const client = compliantClient();
+  client.listSecurityLists = async (compartmentId) => (compartmentId === APPS.id
+    ? [{ id: "sl-1", lifecycleState: "AVAILABLE", ingressSecurityRules: [{ protocol: "6", source: "0.0.0.0/0", tcpOptions: { destinationPortRange: { min: 20, max: 25 } } }] }]
+    : []);
+  client.listNetworkSecurityGroupRules = async () => [{ id: "sr-1", direction: "INGRESS", protocol: "all", source: "::/0" }];
+  client.listInternetGateways = async (compartmentId) => (compartmentId === APPS.id ? [{ id: "igw-1", isEnabled: true, lifecycleState: "AVAILABLE" }] : []);
+  client.getBastion = async () => ({ id: "bastion-1", maxSessionTtlInSeconds: 14400, clientCidrBlockAllowList: [] });
+  client.listBastionSessions = async () => [{ id: "session-1", lifecycleState: "ACTIVE", timeCreated: "2026-09-20T00:00:00Z" }];
+  client.listKeyVersions = async () => [{ id: "kv-1", lifecycleState: "ENABLED", timeCreated: "2024-01-01T00:00:00Z" }];
+  client.getBucket = async () => ({ name: "logs", publicAccessType: "ObjectRead" });
+  client.listPreauthenticatedRequests = async () => [{ id: "par-1", accessType: "ObjectRead", timeExpires: "2027-06-30T00:00:00Z" }];
 
   const result = await assessOciTenancyGuardrails(client);
-  assert.equal(result.findings.find((item) => item.id === "OCI-GRD-01")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-GRD-02")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-GRD-03")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "OCI-GRD-04")?.status, "fail");
-  assert.equal(result.findings.find((item) => item.id === "OCI-GRD-05")?.status, "warn");
-  assert.equal(result.findings.find((item) => item.id === "OCI-GRD-06")?.status, "fail");
+  assert.equal(byId(result, "OCI-GRD-01").status, "fail");
+  assert.equal(byId(result, "OCI-GRD-02").status, "fail");
+  assert.equal(byId(result, "OCI-GRD-03").status, "warn");
+  assert.equal(byId(result, "OCI-GRD-04").status, "fail");
+  assert.equal(byId(result, "OCI-GRD-05").status, "fail");
+  assert.match(byId(result, "OCI-GRD-05").summary, /1 weak by algorithm or rotation age/);
+  assert.equal(byId(result, "OCI-GRD-06").status, "fail");
+  assert.equal(byId(result, "OCI-GRD-06").evidence.long_lived_pars.length, 1);
 });
 
-test("exportOciAuditBundle writes reports, analysis, and archive", async () => {
-  const base = createTempBase("grclanker-oci-export-");
-  const client = {
-    getResolvedConfig: () => sampleConfig(),
-    getNow: () => new Date("2026-04-16T00:00:00.000Z"),
-    async listCompartments() {
-      return [
-        { id: "root", compartmentId: "root", name: "root" },
-        { id: "child", compartmentId: "root", name: "root:prod" },
-      ];
-    },
-    async listUsers() {
-      return [{ id: "u1", name: "alice", capabilities: { canUseConsolePassword: true } }];
-    },
-    async getAuthenticationPolicy() {
-      return {
-        passwordPolicy: {
-          minimumPasswordLength: 16,
-          passwordExpiresAfterDays: 90,
-          isLowerCaseCharactersRequired: true,
-          isUpperCaseCharactersRequired: true,
-          isNumericCharactersRequired: true,
-          isSpecialCharactersRequired: true,
-        },
-      };
-    },
-    async listAuditEvents() {
-      return [{ id: "evt-1" }];
-    },
-    async listCloudGuardTargets() {
-      return [{ id: "target-1", lifecycleState: "ACTIVE" }];
-    },
-    async listSecurityLists() {
-      return [];
-    },
-    async listVaults() {
-      return [{ id: "vault-1", displayName: "core-vault", managementEndpoint: "https://kms.example" }];
-    },
-    async getObjectStorageNamespace() {
-      return "tenantns";
-    },
-    async listBuckets() {
-      return [];
-    },
-    async listMfaTotpDevices() {
-      return [{ id: "mfa-1" }];
-    },
-    async listApiKeys() {
-      return [];
-    },
-    async listCustomerSecretKeys() {
-      return [];
-    },
-    async listAuthTokens() {
-      return [];
-    },
-    async listPolicies() {
-      return [];
-    },
-    async listCloudGuardProblems() {
-      return [];
-    },
-    async listResponderRecipes() {
-      return [{ id: "recipe-1", lifecycleState: "ACTIVE" }];
-    },
-    async listEventRules() {
-      return [{ id: "rule-1", condition: "policy changes" }];
-    },
-    async listNetworkSecurityGroups() {
-      return [];
-    },
-    async listNetworkSecurityGroupRules() {
-      return [];
-    },
-    async listInternetGateways() {
-      return [];
-    },
-    async listBastions() {
-      return [];
-    },
-    async listBastionSessions() {
-      return [];
-    },
-    async listKeys() {
-      return [{ id: "key-1", displayName: "rotated-key", algorithm: "AES", timeCreated: "2026-01-01T00:00:00Z" }];
-    },
-    async listPreauthenticatedRequests() {
-      return [];
-    },
+test("guardrail sub-reads that fail or lack dates downgrade to warn instead of pass", async () => {
+  const client = compliantClient();
+  client.getBastion = async () => {
+    throw DENIED_ERROR;
   };
+  client.listKeyVersions = async () => [{ id: "kv-1", lifecycleState: "ENABLED" }];
+  client.listPreauthenticatedRequests = async () => [{ id: "par-1", accessType: "ObjectRead" }];
+  const result = await assessOciTenancyGuardrails(client);
+  assert.equal(byId(result, "OCI-GRD-04").status, "warn");
+  assert.equal(byId(result, "OCI-GRD-05").status, "warn");
+  assert.equal(byId(result, "OCI-GRD-05").evidence.undated_keys.length, 1);
+  assert.equal(byId(result, "OCI-GRD-06").status, "warn");
+  assert.equal(byId(result, "OCI-GRD-06").evidence.undated_pars.length, 1);
+  const twoBuckets = compliantClient();
+  twoBuckets.listBuckets = async (_namespace, compartmentId) => (compartmentId === APPS.id
+    ? [{ name: "logs", namespace: "tenantns", compartmentId: APPS.id }, { name: "backups", namespace: "tenantns", compartmentId: APPS.id }]
+    : []);
+  const capped = await assessOciTenancyGuardrails(twoBuckets, { maxBuckets: 1 });
+  assert.equal(byId(capped, "OCI-GRD-06").status, "warn");
+  assert.equal(byId(capped, "OCI-GRD-06").evidence.bucket_cap_hit, true);
+});
 
-  const result = await exportOciAuditBundle(client, sampleConfig(), base);
+test("ruleReachesSensitivePort follows protocol and destination port range semantics", () => {
+  assert.equal(ruleReachesSensitivePort({ protocol: "6", tcpOptions: { destinationPortRange: { min: 22, max: 22 } } }), true);
+  assert.equal(ruleReachesSensitivePort({ protocol: "6", tcpOptions: { destinationPortRange: { min: 1, max: 65535 } } }), true);
+  assert.equal(ruleReachesSensitivePort({ protocol: "6", tcpOptions: { destinationPortRange: { min: 443, max: 443 } } }), false);
+  assert.equal(ruleReachesSensitivePort({ protocol: "17", udpOptions: { destinationPortRange: { min: 22, max: 22 } } }), false);
+  assert.equal(ruleReachesSensitivePort({ protocol: "all" }), true);
+  assert.equal(ruleReachesSensitivePort({ protocol: "6" }), true);
+});
+
+test("assessOciComputeAndStorage requires the documented IMDS and kmsKeyId flags", async () => {
+  const client = compliantClient();
+  client.listInstances = async (compartmentId) => (compartmentId === APPS.id
+    ? [
+      { id: "inst-1", lifecycleState: "RUNNING", instanceOptions: { areLegacyImdsEndpointsDisabled: true } },
+      { id: "inst-2", lifecycleState: "RUNNING", instanceOptions: { areLegacyImdsEndpointsDisabled: false } },
+      { id: "inst-3", lifecycleState: "RUNNING" },
+      { id: "inst-4", lifecycleState: "TERMINATED" },
+    ]
+    : []);
+  client.listVolumes = async (compartmentId) => (compartmentId === APPS.id ? [{ id: "vol-1", lifecycleState: "AVAILABLE" }] : []);
+  client.listBootVolumes = async (compartmentId, availabilityDomain) => {
+    assert.equal(availabilityDomain, "Uocm:US-ASHBURN-AD-1");
+    return compartmentId === APPS.id ? [{ id: "bv-1", lifecycleState: "AVAILABLE", kmsKeyId: "ocid1.key.oc1..cmk" }] : [];
+  };
+  const result = await assessOciComputeAndStorage(client);
+  assert.equal(byId(result, "OCI-CMP-01").status, "fail");
+  assert.deepEqual(byId(result, "OCI-CMP-01").evidence.legacy_imds_instances, ["inst-2", "inst-3"]);
+  assert.equal(byId(result, "OCI-CMP-02").status, "fail");
+  assert.equal(byId(result, "OCI-CMP-03").status, "pass");
+
+  client.listAvailabilityDomains = async () => [];
+  const noAds = await assessOciComputeAndStorage(client);
+  assert.equal(byId(noAds, "OCI-CMP-03").status, "manual");
+  assert.match(byId(noAds, "OCI-CMP-03").summary, /availability domains/);
+});
+
+test("exportOciAuditBundle writes the shared layout and never overwrites a prior bundle", async () => {
+  const base = createTempBase("grclanker-oci-export-");
+  const result = await exportOciAuditBundle(compliantClient(), sampleConfig(), base);
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));
-  assert.ok(result.fileCount >= 12);
-  assert.equal(result.findingCount, 16);
-
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
+  assert.equal(result.findingCount, 21);
+  assert.equal(result.errorCount, 0);
+  assert.ok(existsSync(join(result.outputDir, "QUICK_REFERENCE.md")));
+  assert.ok(existsSync(join(result.outputDir, "analysis", "findings.json")));
+  assert.ok(existsSync(join(result.outputDir, "analysis", "compute-storage.json")));
+  assert.ok(existsSync(join(result.outputDir, "core_data", "access.json")));
+  assert.ok(existsSync(join(result.outputDir, "core_data", "compartments.json")));
+  assert.ok(existsSync(join(result.outputDir, "compliance", "executive_summary.md")));
+  assert.ok(existsSync(join(result.outputDir, "compliance", "unified_compliance_matrix.md")));
+  for (const framework of ["fedramp/fedramp_compliance_report.md", "cmmc/cmmc_compliance_report.md", "soc2/soc2_compliance_report.md", "cis_oci/cis_oci_benchmark_report.md", "pci_dss/pci_dss_compliance_report.md", "disa_stig/stig_compliance_checklist.md", "irap/irap_compliance_report.md", "ismap/ismap_compliance_report.md"]) {
+    assert.ok(existsSync(join(result.outputDir, "compliance", framework)), framework);
+  }
+  assert.equal(existsSync(join(result.outputDir, "_errors.log")), false);
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.region, "us-ashburn-1");
   assert.equal(metadata.profile, "prod-audit");
-  assert.ok(existsSync(join(result.outputDir, "analysis", "findings.json")));
+  const accessRaw = readFileSync(join(result.outputDir, "core_data", "access.json"), "utf8");
+  assert.ok(!accessRaw.includes("key_file"));
+
+  const rerun = await exportOciAuditBundle(compliantClient(), sampleConfig(), base);
+  assert.notEqual(rerun.outputDir, result.outputDir);
+  assert.match(rerun.outputDir, /-2$/);
+  assert.equal(rerun.zipPath, `${rerun.outputDir}.zip`);
+  assert.ok(existsSync(result.zipPath));
+});
+
+test("exportOciAuditBundle records partial collection in _errors.log", async () => {
+  const base = createTempBase("grclanker-oci-export-errors-");
+  const result = await exportOciAuditBundle(partialClient(), sampleConfig(), base);
+  assert.ok(result.errorCount > 0);
+  const errorsLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /NotAuthorizedOrNotFound/);
+  const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  assert.match(summary, /Partial Collection Warnings/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
