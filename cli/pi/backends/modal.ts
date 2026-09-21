@@ -1,11 +1,11 @@
 import { basename, posix, resolve } from "node:path";
 import {
   buildShellCommand,
+  createExecutionOutputGuard,
   createProcessCommandRunner,
   ExecutionBackendError,
   ExecutionBackendUnsupportedError,
   normalizeExitCode,
-  redactSecrets,
   requireEnv,
   type CommandRunner,
   type ExecutionBackend,
@@ -118,17 +118,22 @@ export function createModalBackend(options: ModalBackendOptions = {}): Execution
         environment: options.environment,
         region: options.region,
       });
-      const result = await runner("modal", args, {
-        timeoutMs: request.timeoutMs,
-        onData: request.onData,
-        signal: request.signal,
-      });
-      return {
-        exitCode: normalizeExitCode(result.exitCode),
-        stdout: redactSecrets(result.stdout),
-        stderr: redactSecrets(result.stderr),
-        artifacts: [],
-      };
+      const guard = createExecutionOutputGuard(request);
+      try {
+        const result = await runner("modal", args, {
+          timeoutMs: request.timeoutMs,
+          onData: guard.onData,
+          signal: request.signal,
+        });
+        return guard.finish({
+          exitCode: normalizeExitCode(result.exitCode),
+          stdout: result.stdout,
+          stderr: result.stderr,
+          artifacts: [],
+        });
+      } finally {
+        guard.end();
+      }
     },
     async snapshot() {
       throw new ExecutionBackendUnsupportedError("modal", "snapshot through the modal CLI");

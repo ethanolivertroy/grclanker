@@ -2,10 +2,13 @@ import { randomBytes } from "node:crypto";
 import { basename, resolve } from "node:path";
 import {
   buildShellCommand,
+  createExecutionOutputGuard,
   createProcessCommandRunner,
   createProcessCommandRunnerSync,
   ExecutionBackendError,
+  ExecutionBackendTimeoutError,
   normalizeExitCode,
+  redactSecrets,
   type CommandRunner,
   type CommandRunnerResult,
   type CommandRunnerSync,
@@ -54,7 +57,7 @@ function sanitizeToken(value: string): string {
 }
 
 function formatFailure(action: string, result: CommandRunnerResult): ExecutionBackendError {
-  const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+  const detail = redactSecrets([result.stdout, result.stderr].filter(Boolean).join("\n").trim());
   return new ExecutionBackendError(`${action}. ${detail || "Check Parallels Desktop and the guest configuration."}`);
 }
 
@@ -105,7 +108,8 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
   }
 
   async function waitForMount(cloneName: string, candidates: string[]): Promise<string> {
-    const deadline = Date.now() + (options.mountTimeoutMs ?? 45_000);
+    const mountTimeoutMs = options.mountTimeoutMs ?? 45_000;
+    const deadline = Date.now() + mountTimeoutMs;
     do {
       for (const candidate of candidates) {
         const check = await prlctl([
@@ -121,8 +125,10 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
       await sleep(1_500);
     } while (Date.now() < deadline);
 
-    throw new ExecutionBackendError(
-      `Could not locate the repo share inside Parallels clone "${cloneName}". Tried: ${candidates.join(", ")}. Set parallelsWorkspacePath if the guest mounts host shares elsewhere.`,
+    throw new ExecutionBackendTimeoutError(
+      "parallels-vm",
+      `could not locate the repo share inside Parallels clone "${cloneName}" before the mount deadline. Tried: ${candidates.join(", ")}. Set parallelsWorkspacePath if the guest mounts host shares elsewhere.`,
+      mountTimeoutMs,
     );
   }
 
@@ -193,17 +199,22 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {
       const session = requireSession(request.sessionId);
-      const result = await runner(
-        "prlctl",
-        buildParallelsExecArgs(session.cloneName, request.cwd, buildShellCommand(request.command)),
-        { timeoutMs: request.timeoutMs, onData: request.onData, signal: request.signal },
-      );
-      return {
-        exitCode: normalizeExitCode(result.exitCode),
-        stdout: result.stdout,
-        stderr: result.stderr,
-        artifacts: [],
-      };
+      const guard = createExecutionOutputGuard(request);
+      try {
+        const result = await runner(
+          "prlctl",
+          buildParallelsExecArgs(session.cloneName, request.cwd, buildShellCommand(request.command)),
+          { timeoutMs: request.timeoutMs, onData: guard.onData, signal: request.signal },
+        );
+        return guard.finish({
+          exitCode: normalizeExitCode(result.exitCode),
+          stdout: result.stdout,
+          stderr: result.stderr,
+          artifacts: [],
+        });
+      } finally {
+        guard.end();
+      }
     },
     async snapshot(sessionId: string): Promise<string> {
       const session = requireSession(sessionId);

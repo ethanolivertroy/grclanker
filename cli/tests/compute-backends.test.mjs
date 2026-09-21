@@ -48,7 +48,13 @@ import {
   extractComputeFlag,
   formatComputeBackendList,
 } from "../dist/pi/env.js";
-import { assertSafeSessionId, ExecutionBackendTimeoutError, redactSecrets } from "../dist/pi/execution-backend.js";
+import { createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
+import {
+  assertSafeSessionId,
+  createRedactingSink,
+  ExecutionBackendTimeoutError,
+  redactSecrets,
+} from "../dist/pi/execution-backend.js";
 import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
 
 const RUNPOD_POD_JSON = JSON.stringify({
@@ -717,4 +723,167 @@ test("redactSecrets hides bearer tokens and configured provider secrets", () => 
     assert.equal(redactSecrets("key rpa_abcdefghijk used"), "key [REDACTED] used");
     assert.equal(redactSecrets("Authorization: Bearer abcdefghijklmnop"), "Authorization: Bearer [REDACTED]");
   });
+  withEnv({ RUNPOD_API_KEY: undefined, MODAL_TOKEN_SECRET: undefined }, () => {
+    assert.equal(redactSecrets("remote key rpa_ZZZZZZZZZZZZZZZZZZZZZZZZ echoed"), "remote key [REDACTED] echoed");
+    assert.equal(redactSecrets("id ak-ABCDEFGHIJKLMNOP secret as-QRSTUVWXYZ123456"), "id [REDACTED] secret [REDACTED]");
+    assert.equal(
+      redactSecrets("RUNPOD_API_KEY=whatever-shape MODAL_TOKEN_SECRET='quoted value' VERCEL_TOKEN=\"dq\""),
+      "RUNPOD_API_KEY=[REDACTED] MODAL_TOKEN_SECRET=[REDACTED] VERCEL_TOKEN=[REDACTED]",
+    );
+    const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
+    assert.equal(redactSecrets(`cat ~/.ssh/id_ed25519\n${pem}\ndone`), "cat ~/.ssh/id_ed25519\n[REDACTED PRIVATE KEY]\ndone");
+    assert.equal(redactSecrets("plain output stays"), "plain output stays");
+  });
+});
+
+test("redacting sink catches a secret split across streamed chunks", () => {
+  withEnv({ RUNPOD_API_KEY: "fake-distinctive-secret-9f8e7d6c" }, () => {
+    const chunks = [];
+    const sink = createRedactingSink((chunk) => chunks.push(chunk.toString("utf8")));
+    sink.write(Buffer.from("token=fake-distinctive-"));
+    assert.deepEqual(chunks, []);
+    sink.write(Buffer.from("secret-9f8e7d6c\npartial trailing"));
+    assert.deepEqual(chunks, ["token=[REDACTED]\n"]);
+    sink.end();
+    assert.deepEqual(chunks, ["token=[REDACTED]\n", "partial trailing"]);
+    const silent = createRedactingSink(undefined);
+    silent.write(Buffer.from("ignored"));
+    silent.end();
+  });
+});
+
+test("every backend output path redacts credentials echoed by the remote", async () => {
+  const envSecret = "fake-distinctive-secret-9f8e7d6c";
+  const remoteOnlySecret = "rpa_REMOTEONLYKEY0123456789ABCDEF";
+  const leak = `token=${envSecret} remote=${remoteOnlySecret}\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\ntail without newline ${envSecret}`;
+  const leaks = (text) => text.includes(envSecret) || text.includes(remoteOnlySecret) || text.includes("BEGIN OPENSSH PRIVATE KEY");
+  const assertClean = (kind, ...texts) => {
+    for (const text of texts) {
+      assert.ok(!leaks(text), `${kind} surfaced a credential: ${text}`);
+    }
+    assert.ok(texts.some((text) => text.includes("[REDACTED]")), `${kind} produced no redaction marker`);
+  };
+
+  await withEnv({
+    RUNPOD_API_KEY: envSecret,
+    RUNPOD_POD_ID: "pod42",
+    RUNPOD_ENDPOINT_ID: "ep123",
+    MODAL_TOKEN_ID: "ak-FAKEID0123456789ABCD",
+    MODAL_TOKEN_SECRET: "as-FAKESECRET0123456789",
+  }, async () => {
+    const leakyRunner = async (_executable, args, options = {}) => {
+      if (options.onData) {
+        const split = Math.floor(leak.length / 2);
+        options.onData(Buffer.from(leak.slice(0, split), "utf8"));
+        options.onData(Buffer.from(leak.slice(split), "utf8"));
+      }
+      if (args[0] === "exec" && String(args.at(-1)).includes("test -d")) return { exitCode: 0, stdout: "ok", stderr: "" };
+      if (["info", "--version", "list"].includes(args[0])) return { exitCode: 0, stdout: "ok", stderr: "" };
+      return { exitCode: 0, stdout: leak, stderr: `stderr ${envSecret}\n` };
+    };
+    const leakyFetch = async (url) => {
+      if (url.includes("/pods/")) return new Response(RUNPOD_POD_JSON, { status: 200 });
+      if (url.endsWith("/run")) return new Response(JSON.stringify({ id: "job-1", status: "IN_QUEUE" }), { status: 200 });
+      if (url.includes("/status/")) {
+        return new Response(JSON.stringify({
+          id: "job-1",
+          status: "COMPLETED",
+          output: { exitCode: 0, stdout: leak, stderr: `stderr ${envSecret}` },
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    };
+
+    const runExec = async (kind, backend) => {
+      const chunks = [];
+      const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "leak" });
+      const result = await backend.exec({
+        sessionId: "leak",
+        command: ["env"],
+        cwd: staged.remotePath,
+        onData: (chunk) => chunks.push(chunk.toString("utf8")),
+      });
+      assertClean(kind, chunks.join(""), result.stdout, result.stderr);
+      await backend.teardown("leak");
+    };
+
+    for (const kind of ["docker", "parallels-vm", "modal", "runpod-pod", "runpod-serverless"]) {
+      const settings = { computeBackend: kind, parallelsTemplateName: "tpl" };
+      await runExec(kind, createExecutionBackend("/repo", settings, { runner: leakyRunner, fetch: leakyFetch }, kind));
+    }
+    await runExec("sandbox-runtime", createSandboxRuntimeBackend({ runner: leakyRunner, wrapCommand: async (command) => command }));
+
+    const runtimeChunks = [];
+    await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
+      await execution.bashOperations.exec("env", "/repo", { onData: (chunk) => runtimeChunks.push(chunk.toString("utf8")) });
+      assertClean("docker runtime", runtimeChunks.join(""));
+      // File content round-trips through the edit tool, so reads keep the raw bytes rather
+      // than writing a redaction marker back into the file.
+      const roundTrip = (await execution.editOperations.readFile("/repo/.env")).toString("utf8");
+      assert.equal(roundTrip, leak);
+    }, { runner: leakyRunner });
+
+    const hostChunks = [];
+    const host = resolveComputeBackendExecution(tmpdir(), { computeBackend: "host" });
+    const hostResult = await host.bashOperations.exec(
+      "printf '%s\\n' \"key=$RUNPOD_API_KEY\"; printf 'no newline %s' \"$RUNPOD_API_KEY\"",
+      tmpdir(),
+      { onData: (chunk) => hostChunks.push(chunk.toString("utf8")) },
+    );
+    assert.equal(hostResult.exitCode, 0);
+    assertClean("host", hostChunks.join(""));
+    assert.equal(hostChunks.join(""), "key=[REDACTED]\nno newline [REDACTED]");
+  });
+});
+
+test("search caps through the contract adapters are reported instead of silently truncated", async () => {
+  const rgMatch = (path, line) => JSON.stringify({ type: "match", data: { path: { text: path }, line_number: line } });
+  const { runner } = createFakeRunner(async (_executable, args) => {
+    const script = String(args.at(-1));
+    if (args[0] === "info") return { exitCode: 0, stdout: "ok" };
+    if (script.includes("printf yes")) return { exitCode: 0, stdout: "yes" };
+    if (script.includes("printf dir")) return { exitCode: 0, stdout: "dir" };
+    if (script.includes("rg --files")) return { exitCode: 0, stdout: "./a.md\n./b.md\n./c.md\n" };
+    if (script.includes("rg '--json'")) return { exitCode: 0, stdout: `${rgMatch("./a.md", 1)}\n${rgMatch("./b.md", 2)}\n` };
+    return { exitCode: 0, stdout: "" };
+  });
+
+  await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
+    const capped = await execution.findOperations.glob("*.md", "/repo", { ignore: [], limit: 2 });
+    assert.equal(capped.length, 2, "glob returns exactly the cap so Pi's find tool reports the results limit");
+    const uncapped = await execution.findOperations.glob("*.md", "/repo", { ignore: [], limit: 10 });
+    assert.equal(uncapped.length, 3);
+
+    const truncated = await execution.grepOperations.searchMatches({ pattern: "x", searchPath: "/repo", limit: 1 });
+    assert.equal(truncated.matches.length, 1);
+    assert.equal(truncated.matchLimitReached, true);
+    const complete = await execution.grepOperations.searchMatches({ pattern: "x", searchPath: "/repo", limit: 2 });
+    assert.equal(complete.matches.length, 2);
+    assert.equal(complete.matchLimitReached, false);
+  }, { runner });
+});
+
+test("parallels mount wait reports the deadline exit as a typed timeout and destroys the clone", async () => {
+  const { runner, calls } = createFakeRunner(async (_executable, args) => {
+    if (args[0] === "exec") return { exitCode: 0, stdout: "missing" };
+    return { exitCode: 0 };
+  });
+  const backend = createParallelsBackend({
+    sourceKind: "template",
+    sourceName: "tpl",
+    clonePrefix: "p",
+    workspacePathOverride: "/custom/mount",
+    runner,
+    sleep: async () => {},
+    mountTimeoutMs: 0,
+  });
+  await assert.rejects(
+    () => backend.stageWorkspace({ localPath: "/repo", sessionId: "s" }),
+    (error) => error instanceof ExecutionBackendTimeoutError
+      && /parallels-vm timed out after 0s/.test(error.message)
+      && /before the mount deadline/.test(error.message)
+      && /Tried: \/custom\/mount, \/media\/psf\/grclanker-workspace-repo/.test(error.message),
+  );
+  assert.deepEqual(calls.slice(-2).map((call) => call.args[0]), ["stop", "delete"]);
+  await assert.rejects(() => backend.exec({ sessionId: "s", command: ["true"], cwd: "/x" }), /Call stageWorkspace first/);
 });

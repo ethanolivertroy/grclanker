@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import {
   buildShellCommand,
+  createExecutionOutputGuard,
   createProcessCommandRunner,
   ExecutionBackendUnsupportedError,
   normalizeExitCode,
@@ -47,19 +48,24 @@ function createLocalBackend(
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {
       const command = await wrap(buildShellCommand(request.command), request.cwd);
-      const result = await runner("bash", ["-lc", command], {
-        cwd: request.cwd,
-        env: request.env,
-        timeoutMs: request.timeoutMs,
-        onData: request.onData,
-        signal: request.signal,
-      });
-      return {
-        exitCode: normalizeExitCode(result.exitCode),
-        stdout: result.stdout,
-        stderr: result.stderr,
-        artifacts: [],
-      };
+      const guard = createExecutionOutputGuard(request);
+      try {
+        const result = await runner("bash", ["-lc", command], {
+          cwd: request.cwd,
+          env: request.env,
+          timeoutMs: request.timeoutMs,
+          onData: guard.onData,
+          signal: request.signal,
+        });
+        return guard.finish({
+          exitCode: normalizeExitCode(result.exitCode),
+          stdout: result.stdout,
+          stderr: result.stderr,
+          artifacts: [],
+        });
+      } finally {
+        guard.end();
+      }
     },
     async snapshot() {
       throw new ExecutionBackendUnsupportedError(kind, "snapshot");

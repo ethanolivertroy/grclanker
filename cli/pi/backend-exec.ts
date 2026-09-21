@@ -26,7 +26,13 @@ import {
   type ComputeBackendKind,
 } from "./compute.js";
 import { registerComputeSession } from "./compute-sessions.js";
-import { assertExhaustive, createSessionId, type ExecutionBackend } from "./execution-backend.js";
+import {
+  assertExhaustive,
+  createRedactingSink,
+  createSessionId,
+  redactSecrets,
+  type ExecutionBackend,
+} from "./execution-backend.js";
 import { assertParallelsSourceIsUsable } from "./parallels-sandbox.js";
 import {
   createSandboxEditOperations,
@@ -597,13 +603,16 @@ function createContractCommandAdapter(
     },
     async capture(command, cwd) {
       const remoteRoot = await ensureStaged();
+      // File operations round-trip content through capture (read, then edit or write back),
+      // so the raw bytes are kept here and only the failure text is scrubbed.
       const result = await backend.exec({
         sessionId,
         command: [command],
         cwd: ensureWorkspaceMapping(localCwd, cwd, remoteRoot),
+        redactOutput: false,
       });
       if (result.exitCode !== 0) {
-        throw new Error(result.stderr.trim() || `Command failed (${result.exitCode}) on ${backend.kind}`);
+        throw new Error(redactSecrets(result.stderr.trim()) || `Command failed (${result.exitCode}) on ${backend.kind}`);
       }
       return Buffer.from(result.stdout, "utf8");
     },
@@ -656,6 +665,19 @@ function describeRemoteSummary(kind: ComputeBackendKind): string {
   }
 }
 
+function createRedactingBashOperations(operations: BashOperations): BashOperations {
+  return {
+    async exec(command, cwd, options) {
+      const sink = createRedactingSink(options.onData);
+      try {
+        return await operations.exec(command, cwd, { ...options, onData: sink.write });
+      } finally {
+        sink.end();
+      }
+    },
+  };
+}
+
 function describeParallelsSummary(settings: GrclankerSettings): string {
   const sourceKind = resolveParallelsSourceKind(settings);
   const templateName = resolveParallelsTemplateName(settings);
@@ -693,7 +715,7 @@ export function resolveComputeBackendExecution(
         summary: "bash runs directly on the local host shell",
         sessionId: createSessionId(),
         teardown: async () => undefined,
-        bashOperations: createLocalBashOperations(),
+        bashOperations: createRedactingBashOperations(createLocalBashOperations()),
       };
     case "sandbox-runtime": {
       const sandboxConfig = loadSandboxConfig(localCwd);

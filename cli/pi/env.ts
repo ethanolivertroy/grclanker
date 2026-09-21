@@ -21,6 +21,7 @@ import {
   type ComputeBackendKind,
   type ComputeBackendStatus,
 } from "./compute.js";
+import { redactSecrets } from "./execution-backend.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
@@ -262,7 +263,7 @@ async function executeOnBackend(
       },
     });
   } catch (error) {
-    throw new GrclankerUserError(getErrorMessage(error));
+    throw new GrclankerUserError(redactSecrets(getErrorMessage(error)));
   }
 
   return {
@@ -516,7 +517,7 @@ export async function runComputeExec(rawArgs: string[]): Promise<void> {
 
   console.log(`\nbackend: ${getComputeBackendLabel(backend)} (${backend})`);
   console.log(`cwd: ${options.cwd}`);
-  console.log(`command: ${command}\n`);
+  console.log(`command: ${redactSecrets(command)}\n`);
 
   await withEnvExecution(options, async (execution) => {
     const result = await executeOnBackend(command, options, execution);

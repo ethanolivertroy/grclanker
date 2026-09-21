@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import {
   buildShellCommand,
+  createExecutionOutputGuard,
   createProcessCommandRunner,
   ExecutionBackendError,
   ExecutionBackendUnsupportedError,
@@ -113,17 +114,22 @@ export function createDockerBackend(options: DockerBackendOptions): ExecutionBac
         env: request.env,
         identity,
       });
-      const result = await runner("docker", args, {
-        timeoutMs: request.timeoutMs,
-        onData: request.onData,
-        signal: request.signal,
-      });
-      return {
-        exitCode: normalizeExitCode(result.exitCode),
-        stdout: result.stdout,
-        stderr: result.stderr,
-        artifacts: [],
-      };
+      const guard = createExecutionOutputGuard(request);
+      try {
+        const result = await runner("docker", args, {
+          timeoutMs: request.timeoutMs,
+          onData: guard.onData,
+          signal: request.signal,
+        });
+        return guard.finish({
+          exitCode: normalizeExitCode(result.exitCode),
+          stdout: result.stdout,
+          stderr: result.stderr,
+          artifacts: [],
+        });
+      } finally {
+        guard.end();
+      }
     },
     async snapshot() {
       throw new ExecutionBackendUnsupportedError("docker", "snapshot (containers run with --rm)");

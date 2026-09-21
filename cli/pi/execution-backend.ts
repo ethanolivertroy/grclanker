@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 export type ExecutionBackendKind =
   | "host"
@@ -34,6 +35,10 @@ export type ExecutionRequest = {
   interactive?: boolean;
   onData?: (chunk: Buffer) => void;
   signal?: AbortSignal;
+  // Defaults to true: command output is scrubbed of credentials before it is streamed,
+  // returned, or persisted. File operations that round-trip content (read, edit) set this
+  // to false so a redaction marker is never written back into a file.
+  redactOutput?: boolean;
 };
 
 export type ExecutionResult = {
@@ -139,6 +144,21 @@ const SECRET_ENV_KEYS = [
   "CLOUDFLARE_API_TOKEN",
 ] as const;
 
+// Secondary, format-based patterns for the providers this runtime talks to. The primary
+// mechanism is the exact values of the credential environment variables above; these
+// patterns catch the same credentials when they arrive from a remote (for example a
+// container echoing its own environment) without ever being set locally.
+const SECRET_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED PRIVATE KEY]" },
+  { pattern: /(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1[REDACTED]" },
+  { pattern: /\brpa_[A-Za-z0-9]{16,}\b/g, replacement: "[REDACTED]" },
+  { pattern: /\ba[ks]-[A-Za-z0-9]{12,}\b/g, replacement: "[REDACTED]" },
+  {
+    pattern: /((?:RUNPOD_API_KEY|MODAL_TOKEN_ID|MODAL_TOKEN_SECRET|VERCEL_TOKEN|CLOUDFLARE_API_TOKEN)=)(?:"[^"]*"|'[^']*'|[^\s'"]+)/g,
+    replacement: "$1[REDACTED]",
+  },
+];
+
 export function redactSecrets(text: string, extraSecrets: Array<string | undefined> = []): string {
   let redacted = text;
   const secrets = [
@@ -148,7 +168,75 @@ export function redactSecrets(text: string, extraSecrets: Array<string | undefin
   for (const secret of secrets) {
     redacted = redacted.split(secret).join("[REDACTED]");
   }
-  return redacted.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, "$1[REDACTED]");
+  for (const { pattern, replacement } of SECRET_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
+export type RedactingSink = {
+  write: (chunk: Buffer) => void;
+  end: () => void;
+};
+
+// Streams are redacted per completed line so a credential split across two chunks is still
+// caught; the trailing partial line is held until the next newline or `end()`.
+export function createRedactingSink(
+  onData: ((chunk: Buffer) => void) | undefined,
+  extraSecrets: Array<string | undefined> = [],
+): RedactingSink {
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  const emit = (text: string) => {
+    if (text.length === 0 || !onData) return;
+    onData(Buffer.from(redactSecrets(text, extraSecrets), "utf8"));
+  };
+  return {
+    write(chunk) {
+      if (!onData) return;
+      pending += decoder.write(chunk);
+      const lastNewline = pending.lastIndexOf("\n");
+      if (lastNewline === -1) return;
+      emit(pending.slice(0, lastNewline + 1));
+      pending = pending.slice(lastNewline + 1);
+    },
+    end() {
+      pending += decoder.end();
+      emit(pending);
+      pending = "";
+    },
+  };
+}
+
+export function redactExecutionResult(result: ExecutionResult, extraSecrets: Array<string | undefined> = []): ExecutionResult {
+  return {
+    ...result,
+    stdout: redactSecrets(result.stdout, extraSecrets),
+    stderr: redactSecrets(result.stderr, extraSecrets),
+  };
+}
+
+export type ExecutionOutputGuard = {
+  onData: ((chunk: Buffer) => void) | undefined;
+  end: () => void;
+  finish: (result: ExecutionResult) => ExecutionResult;
+};
+
+// Every adapter routes its command output through one guard so the streamed chunks and the
+// returned result are scrubbed the same way, unless the caller opted out via redactOutput.
+export function createExecutionOutputGuard(
+  request: Pick<ExecutionRequest, "onData" | "redactOutput">,
+  extraSecrets: Array<string | undefined> = [],
+): ExecutionOutputGuard {
+  if (request.redactOutput === false) {
+    return { onData: request.onData, end: () => undefined, finish: (result) => result };
+  }
+  const sink = createRedactingSink(request.onData, extraSecrets);
+  return {
+    onData: request.onData ? sink.write : undefined,
+    end: sink.end,
+    finish: (result) => redactExecutionResult(result, extraSecrets),
+  };
 }
 
 export function requireEnv(name: string): string {

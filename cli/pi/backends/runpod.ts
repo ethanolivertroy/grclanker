@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import {
   assertSafeSessionId,
   buildShellCommand,
+  createExecutionOutputGuard,
   createProcessCommandRunner,
   createProcessCommandRunnerSync,
   ExecutionBackendError,
@@ -191,14 +192,19 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
         throw new ExecutionBackendError(`RunPod job ${submitted.id} ended with status ${job.status}. ${detail}`.trim());
       }
 
+      // Worker output is untrusted remote text: it can echo the worker's own environment,
+      // so it is redacted before it reaches onData, the tool result, or any evidence file.
       const output = parseRunpodWorkerOutput(job.output);
-      request.onData?.(Buffer.from(output.stdout + output.stderr, "utf8"));
-      return {
+      const guard = createExecutionOutputGuard(request, [apiKey]);
+      const result = guard.finish({
         exitCode: normalizeExitCode(output.exitCode),
         stdout: output.stdout,
         stderr: output.stderr,
         artifacts: output.artifacts ?? [],
-      };
+      });
+      guard.onData?.(Buffer.from(result.stdout + result.stderr, "utf8"));
+      guard.end();
+      return result;
     },
     async snapshot() {
       throw new ExecutionBackendUnsupportedError("runpod-serverless", "snapshot");
@@ -320,17 +326,22 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
         .map(([key, value]) => `export ${key}=${quoteForBash(value)};`)
         .join(" ");
       const remoteCommand = `${envPrefix} cd -- ${quoteForBash(request.cwd)} && ${buildShellCommand(request.command)}`.trim();
-      const result = await runner("ssh", buildPodSshArgs(target, remoteCommand), {
-        timeoutMs: request.timeoutMs,
-        onData: request.onData,
-        signal: request.signal,
-      });
-      return {
-        exitCode: normalizeExitCode(result.exitCode),
-        stdout: redactSecrets(result.stdout),
-        stderr: redactSecrets(result.stderr),
-        artifacts: [],
-      };
+      const guard = createExecutionOutputGuard(request);
+      try {
+        const result = await runner("ssh", buildPodSshArgs(target, remoteCommand), {
+          timeoutMs: request.timeoutMs,
+          onData: guard.onData,
+          signal: request.signal,
+        });
+        return guard.finish({
+          exitCode: normalizeExitCode(result.exitCode),
+          stdout: result.stdout,
+          stderr: result.stderr,
+          artifacts: [],
+        });
+      } finally {
+        guard.end();
+      }
     },
     async snapshot() {
       throw new ExecutionBackendUnsupportedError("runpod-pod", "snapshot");
