@@ -41,12 +41,14 @@ import {
   resolveFlueSandboxMode,
 } from "../dist/flue/render.js";
 import {
+  collectToolParameterSchemas,
   createFlueActivityFormatter,
   describeAgentRunError,
   exitCodeForOutcome,
   resolveFlueDatabasePath,
   runGrclankerFlueAgent,
 } from "../dist/flue/run.js";
+import { REDACTED_VALUE, isSensitiveArgumentKey, redactSensitiveArguments } from "../dist/flue/redact.js";
 import { formatFlueHelp, formatFlueRunOutcome, parseFlueRunArgs, runFlueCommand } from "../dist/flue/cli.js";
 import {
   createCustomProvider,
@@ -783,6 +785,139 @@ test("runner boots Flue, streams tool activity, and reports the settled reply", 
     "<- kevs_search ok (12ms)",
     "<- kevs_search error: boom",
   ]);
+});
+
+test("credential-bearing tool arguments are redacted before serialization, at any depth", () => {
+  const redacted = redactSensitiveArguments({
+    query: "CVE-2024-3400",
+    limit: 5,
+    api_token: "cf-token-VALUE",
+    client_secret: "zoom-secret-VALUE",
+    ClientSecret: "camel-secret-VALUE",
+    private_key: "-----BEGIN PRIVATE KEY-----",
+    app_private_key: "-----BEGIN RSA PRIVATE KEY-----",
+    apiKey: "api-key-VALUE",
+    password: "pw-VALUE",
+    passphrase: "phrase-VALUE",
+    credentials_json: { type: "service_account", private_key_id: "kid", private_key: "gcp-key-VALUE" },
+    authorization: "Bearer bearer-VALUE",
+    client_assertion: "jwt-VALUE",
+    skey: "duo-skey-VALUE",
+    ikey: "duo-ikey-VALUE",
+    nested: { access_token: "nested-token-VALUE", region: "us-east-1", deeper: [{ scim_token: "array-token-VALUE", ok: true }] },
+    list: ["plain", { management_token: "list-token-VALUE" }],
+    auth_mode: "app",
+    cert_number: "4282",
+    max_keys: 3,
+  });
+
+  const serialized = JSON.stringify(redacted);
+  assert.equal(serialized.includes("VALUE"), false, `no secret survives: ${serialized}`);
+  assert.equal(serialized.includes("BEGIN"), false, "private keys are replaced wholesale");
+  assert.deepEqual(redacted.credentials_json, REDACTED_VALUE, "a sensitive object is replaced wholesale, not walked");
+  assert.deepEqual(redacted.nested, { access_token: REDACTED_VALUE, region: "us-east-1", deeper: [{ scim_token: REDACTED_VALUE, ok: true }] });
+  assert.deepEqual(redacted.list, ["plain", { management_token: REDACTED_VALUE }]);
+  assert.equal(redacted.query, "CVE-2024-3400");
+  assert.equal(redacted.limit, 5);
+  assert.equal(redacted.auth_mode, "app");
+  assert.equal(redacted.cert_number, "4282");
+  assert.equal(redacted.max_keys, 3);
+
+  // Non-object inputs pass through untouched.
+  assert.equal(redactSensitiveArguments("plain"), "plain");
+  assert.equal(redactSensitiveArguments(null), null);
+  assert.deepEqual(redactSensitiveArguments([1, "two"]), [1, "two"]);
+
+  // Fields the schema marks sensitive are redacted even when their names look harmless.
+  const schema = {
+    type: "object",
+    properties: {
+      passcode: { type: "string", writeOnly: true },
+      pin: { type: "string", format: "password" },
+      handle: { type: "string", sensitive: true },
+      accounts: { type: "array", items: { type: "object", properties: { seed: { type: "string", writeOnly: true } } } },
+      label: { type: "string" },
+    },
+  };
+  assert.deepEqual(
+    redactSensitiveArguments({ passcode: "1234", pin: "0000", handle: "h", accounts: [{ seed: "s", name: "n" }], label: "ok" }, schema),
+    { passcode: REDACTED_VALUE, pin: REDACTED_VALUE, handle: REDACTED_VALUE, accounts: [{ seed: REDACTED_VALUE, name: "n" }], label: "ok" },
+  );
+
+  // Every credential-bearing parameter declared by a shipped domain tool is caught by the name pattern.
+  const declaredKeys = new Set();
+  const walk = (node) => {
+    for (const [key, property] of Object.entries(node?.properties ?? {})) {
+      declaredKeys.add(key);
+      walk(property);
+      walk(property?.items);
+    }
+  };
+  for (const parameters of collectToolParameterSchemas().values()) walk(parameters);
+  const credentialKeys = [
+    "access_token", "api_key", "api_token", "app_private_key", "client_assertion", "client_secret", "credentials_json",
+    "graph_token", "ikey", "management_token", "private_key", "scim_token", "skey", "token",
+  ];
+  for (const key of credentialKeys) {
+    assert.ok(declaredKeys.has(key), `${key} is still a declared tool parameter`);
+    assert.ok(isSensitiveArgumentKey(key), `${key} is redacted`);
+  }
+  for (const key of ["query", "limit", "cert_number", "auth_mode", "max_keys", "org_url", "workspace_dir", "cve_ids", "installation_id"]) {
+    assert.equal(isSensitiveArgumentKey(key), false, `${key} stays visible`);
+  }
+});
+
+test("runner activity lines never echo credentials passed as tool arguments", async () => {
+  const stderr = [];
+  const agent = () => "fake";
+  const apiToken = "cfut_9f8e7d6c5b4a-SECRET-TOKEN";
+  const clientSecret = "zsk_0123456789-SECRET-CLIENT";
+  const passcode = "otp-4711-SECRET-PASSCODE";
+  const events = [
+    { type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t1", toolName: "cloudflare_check_access", input: { api_token: apiToken, account_id: "acct-1" }, position: { batch: 1, index: 0 } },
+    { type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t2", toolName: "zoom_check_access", input: { client_id: "zoom-app", client_secret: clientSecret, account_id: "zoom-acct" }, position: { batch: 1, index: 1 } },
+    { type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t3", toolName: "vault_probe", input: { passcode, region: "eu" }, position: { batch: 1, index: 2 } },
+    { type: "tool-output", conversationId: "c", toolCallId: "t1", output: "ok", position: { batch: 2, index: 0 } },
+  ];
+
+  await runGrclankerFlueAgent(
+    { message: "Check access", id: "conv-secrets", db: ":memory:" },
+    {
+      prepare: () => {},
+      start: async () => ({ stop: async () => {} }),
+      sqlite: (path) => ({ fakeAdapter: path }),
+      init: (_target, options) => ({
+        id: options.id,
+        dispatch: async () => ({ submissionId: "sub-1", acceptedAt: "now", uid: "inst-1" }),
+        read: async (_receipt, readOptions) => {
+          for (const event of events) readOptions.onEvent(event);
+          return { text: "done", data: {}, submissionId: "sub-1" };
+        },
+        abort: async () => {},
+      }),
+      agent,
+      writeErr: (line) => stderr.push(line),
+      toolParameterSchemas: () =>
+        new Map([...collectToolParameterSchemas(), ["vault_probe", { type: "object", properties: { passcode: { type: "string", writeOnly: true } } }]]),
+    },
+  );
+
+  const captured = stderr.join("\n");
+  for (const secret of [apiToken, clientSecret, passcode, "SECRET"]) {
+    assert.equal(captured.includes(secret), false, `stderr must not contain ${secret}:\n${captured}`);
+  }
+  assert.deepEqual(stderr, [
+    "conversation: conv-secrets",
+    '-> cloudflare_check_access {"api_token":"[redacted]","account_id":"acct-1"}',
+    '-> zoom_check_access {"client_id":"zoom-app","client_secret":"[redacted]","account_id":"zoom-acct"}',
+    '-> vault_probe {"passcode":"[redacted]","region":"eu"}',
+    "<- cloudflare_check_access ok",
+  ]);
+
+  // The default runner wiring redacts by name even without schema knowledge of the tool.
+  const format = createFlueActivityFormatter();
+  const line = format({ type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t9", toolName: "custom_tool", input: { api_key: apiToken, nested: { private_key: "-----BEGIN" } }, position: { batch: 1, index: 0 } });
+  assert.equal(line, '-> custom_tool {"api_key":"[redacted]","nested":{"private_key":"[redacted]"}}');
 });
 
 test("runner surfaces failed settlements with Flue's recorded reason and still stops the runtime", async () => {

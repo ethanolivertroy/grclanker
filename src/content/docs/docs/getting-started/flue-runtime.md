@@ -38,7 +38,7 @@ grclanker flue run --message "Now check KEV exposure for it" --id fips-review
 grclanker flue run --message "Summarize the findings" --id fips-review --json
 ```
 
-The reply prints to stdout. Tool activity and the conversation id print to stderr. Exit codes follow `flue run`: `0` completed, `1` failed, `130` aborted.
+The reply prints to stdout. Tool activity and the conversation id print to stderr; tool arguments in those lines are redacted when their names look like credentials (`token`, `secret`, `password`, `private_key`, `api_key`, `credential`, `authorization`, `assertion`, Duo's `ikey` and `skey`) or when the tool schema marks them `writeOnly`, `format: "password"`, or `sensitive`, so API tokens and client secrets never reach terminal scrollback or CI logs. Exit codes follow `flue run`: `0` completed, `1` failed, `130` aborted.
 
 ## Run with the official Flue CLI
 

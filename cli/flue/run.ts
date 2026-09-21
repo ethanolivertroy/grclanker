@@ -18,6 +18,8 @@ import {
 import { sqlite as flueSqlite, start as flueStart, type Flue, type StartOptions } from "@flue/runtime/node";
 import { getGrclankerHome } from "../config/paths.js";
 import { Grclanker, prepareGrclankerAgent } from "./agent.js";
+import { redactSensitiveArguments } from "./redact.js";
+import { collectGrclankerDomainTools } from "./tools.js";
 
 export const FLUE_AGENT_NAME = "grclanker";
 export const FLUE_MEMORY_DATABASE = ":memory:";
@@ -46,6 +48,12 @@ export interface FlueRunDeps {
   agent: Agent;
   prepare: () => void;
   writeErr: (line: string) => void;
+  /** Tool name to JSON Schema parameters, so activity lines can honor schema-marked sensitive fields. */
+  toolParameterSchemas?: () => ReadonlyMap<string, unknown>;
+}
+
+export interface FlueActivityFormatterOptions {
+  parameterSchemas?: ReadonlyMap<string, unknown>;
 }
 
 interface AgentRunErrorLike extends Error {
@@ -55,6 +63,10 @@ interface AgentRunErrorLike extends Error {
 
 const ACTIVITY_PREVIEW_LENGTH = 160;
 
+export function collectToolParameterSchemas(): ReadonlyMap<string, unknown> {
+  return new Map(collectGrclankerDomainTools().map((tool) => [tool.name, tool.parameters]));
+}
+
 export function createDefaultFlueRunDeps(): FlueRunDeps {
   return {
     start: flueStart,
@@ -63,6 +75,7 @@ export function createDefaultFlueRunDeps(): FlueRunDeps {
     agent: Grclanker,
     prepare: prepareGrclankerAgent,
     writeErr: (line) => process.stderr.write(`${line}\n`),
+    toolParameterSchemas: collectToolParameterSchemas,
   };
 }
 
@@ -77,15 +90,23 @@ function truncate(text: string, limit = ACTIVITY_PREVIEW_LENGTH): string {
   return singleLine.length > limit ? `${singleLine.slice(0, limit - 3)}...` : singleLine;
 }
 
-/** Compact one-line renderings of tool activity for stderr; other chunks are silent. */
-export function createFlueActivityFormatter(): (chunk: ConversationStreamChunk) => string | undefined {
+/**
+ * Compact one-line renderings of tool activity for stderr; other chunks are
+ * silent. Tool inputs are redacted before serialization because credentials
+ * (API tokens, client secrets, private keys) travel as tool arguments.
+ */
+export function createFlueActivityFormatter(
+  options: FlueActivityFormatterOptions = {},
+): (chunk: ConversationStreamChunk) => string | undefined {
   const toolNames = new Map<string, string>();
 
   return (chunk) => {
     switch (chunk.type) {
-      case "tool-input":
+      case "tool-input": {
         toolNames.set(chunk.toolCallId, chunk.toolName);
-        return `-> ${chunk.toolName} ${truncate(JSON.stringify(chunk.input ?? {}))}`;
+        const shown = redactSensitiveArguments(chunk.input ?? {}, options.parameterSchemas?.get(chunk.toolName));
+        return `-> ${chunk.toolName} ${truncate(JSON.stringify(shown))}`;
+      }
       case "tool-output": {
         const duration = chunk.durationMs === undefined ? "" : ` (${chunk.durationMs}ms)`;
         return `<- ${toolNames.get(chunk.toolCallId) ?? chunk.toolCallId} ok${duration}`;
@@ -166,7 +187,7 @@ export async function runGrclankerFlueAgent(
     const handle = deps.init(deps.agent, request.id ? { id: request.id } : undefined);
     deps.writeErr(`conversation: ${handle.id}`);
     const receipt = await handle.dispatch(request.message);
-    const formatActivity = createFlueActivityFormatter();
+    const formatActivity = createFlueActivityFormatter({ parameterSchemas: deps.toolParameterSchemas?.() });
 
     try {
       const reply = await handle.read(receipt, {
