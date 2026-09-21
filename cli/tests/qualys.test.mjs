@@ -1553,7 +1553,8 @@ test("docs fidelity 5: user status, role, and last login come from /msp/user_lis
   assert.equal(fallback.evidence.inactive_status_users, null, "userStatus and lastLoginDate are not documented on search/am/user and are never read, so the count is unknown without the User List API");
   assert.equal(fallback.evidence.users_with_last_login, null);
   assert.equal(fallback.evidence.administration_api_users, 1);
-  assert.deepEqual(fallback.evidence.stale_login_users, []);
+  assert.equal(fallback.evidence.stale_login_users, null, "LAST_LOGIN_DATE exists only on /msp/user_list.php, so the stale list is unknown without it");
+  assert.match(fallback.evidence.stale_login_users_status, /^unreadable: user_list \(\/msp\/user_list\.php\) was not readable/);
   assert.match(fallback.summary, /documents no status or last-login field, so inactive-user detection is manual/);
 });
 
@@ -1604,7 +1605,8 @@ test("docs fidelity 6: web app scan dates come from the WAS scan search launched
   }));
   const unresolved = findingById(unreadableHistory, "QUALYS-C15");
   assert.deepEqual(unresolved.evidence.unresolved_web_apps, ["Portal"]);
-  assert.deepEqual(unresolved.evidence.never_scanned_web_apps, []);
+  assert.equal(unresolved.evidence.never_scanned_web_apps, null, "without the history the never-scanned set is unknown, not empty");
+  assert.match(unresolved.evidence.never_scanned_web_apps_status, /^unreadable: was_scan_history \(\/qps\/rest\/3\.0\/search\/was\/wasscan\) was not readable/);
   assert.equal(unresolved.status, "manual");
 });
 
@@ -2500,7 +2502,12 @@ test("rule 9: the audit bundle never carries a planted secret in any file or zip
     assert.equal(file.content.includes(config.password), false, `credential leaked into ${file.name}`);
   }
 
-  const read = (name) => JSON.parse(readFileSync(join(result.outputDir, "core_data", name), "utf8"));
+  const read = (name) => {
+    const surface = JSON.parse(readFileSync(join(result.outputDir, "core_data", name), "utf8"));
+    assert.equal(surface.status, "readable", `${name} was read completely`);
+    assert.equal(surface.count, surface.records.length, `${name} count matches its records`);
+    return surface.records;
+  };
   const profiles = read("scan_coverage/option_profiles.json");
   assert.equal(profiles[0].BASIC_INFO.GROUP_NAME, "Authenticated Full");
   assert.equal(profiles[0].SCAN.AUTHENTICATION, "Windows,Unix");
@@ -2585,9 +2592,17 @@ test("rule 9: every rawData surface has an allowlist and an unknown surface is r
   const results = await runAllAssessments(createFakeClient(healthyFixtures));
   const surfaces = rawDataSurfaceNames();
   for (const result of results) {
-    for (const [name, records] of Object.entries(result.rawData)) {
+    for (const [name, surface] of Object.entries(result.rawData)) {
       assert.ok(surfaces.includes(name), `${result.category}/${name} has no allowlist`);
-      assert.ok(Array.isArray(records));
+      assert.equal(surface.name, name);
+      assert.match(surface.endpoint, /^\/(api|qps|msp)\//, `${name} names its endpoint`);
+      if (surface.status === "readable" || surface.status === "truncated") {
+        assert.ok(Array.isArray(surface.records), `${name} carries projected records`);
+        assert.equal(surface.count, surface.records.length);
+      } else {
+        assert.equal(surface.records, null, `${name} was ${surface.status}, so it carries no records array`);
+        assert.equal(surface.count, null);
+      }
     }
   }
   assert.throws(() => exportableRecords("verbatim_surface", [{ password: "x" }]), /No rawData allowlist is defined for surface verbatim_surface/);
@@ -2647,7 +2662,20 @@ test("false-pass self-check (d): a fully compliant tenant built strictly from do
   assert.deepEqual(findings.filter((item) => item.status === "warn").map((item) => item.id).sort(), CAPPED_BY_DESIGN_IDS);
   assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.id), ["QUALYS-C04"]);
   for (const item of findings) {
-    assert.ok(item.evidence.collection.sources.every((source) => source.status === "readable"), `${item.id}: ${JSON.stringify(item.evidence.collection.sources)}`);
+    for (const source of item.evidence.collection.sources) {
+      if (source.name === "was_scan_history") {
+        // Every web app resolved through the bounded scan search, so the unbounded history read was never issued
+        // and must not be described as readable.
+        assert.equal(source.status, "not_collected", `${item.id}: ${JSON.stringify(source)}`);
+        assert.equal(source.count, null);
+        assert.match(source.reason, /was not issued because every web application returned by was_webapps \(\/qps\/rest\/3\.0\/search\/was\/webapp\) resolved a finished vulnerability scan inside the 30 day window/);
+      } else {
+        assert.equal(source.status, "readable", `${item.id}: ${JSON.stringify(source)}`);
+        assert.equal(source.count_status, "complete");
+        assert.equal(typeof source.count, "number");
+        assert.match(source.endpoint, /^\/(api|qps|msp)\//);
+      }
+    }
     assert.equal(item.evidence.collection.view_scope.partial, false);
     assert.equal(item.evidence.collection.view_scope.source, "user_search");
   }
@@ -2666,8 +2694,15 @@ test("false-pass self-check (d): a fully compliant tenant built strictly from do
   assert.deepEqual(findingById(vuln, "QUALYS-C08").evidence.auth_record_types, [{ type: "unix", count: 253 }, { type: "windows", count: 2 }]);
   assert.equal(findingById(vuln, "QUALYS-C10").evidence.sla_compliance_percent, 100);
   assert.equal(findingById(admin, "QUALYS-C13").evidence.active_users, 3);
+  assert.match(findingById(admin, "QUALYS-C13").evidence.active_users_status, /^readable: USER_STATUS Active users from user_list \(\/msp\/user_list\.php\)$/);
   assert.equal(findingById(admin, "QUALYS-C13").evidence.administration_api_users, 3);
-  assert.equal(findingById(admin, "QUALYS-C15").evidence.recently_scanned_web_apps, 1);
+  const was = findingById(admin, "QUALYS-C15");
+  assert.equal(was.evidence.recently_scanned_web_apps, 1);
+  assert.deepEqual(was.evidence.stale_web_apps, [], "known empty: every web app resolved without the history read");
+  assert.equal(was.evidence.scan_history_scans, null);
+  assert.match(was.evidence.scan_history_scans_status, /^not_collected: was_scan_history \(\/qps\/rest\/3\.0\/search\/was\/wasscan\) the unbounded WAS scan history search/);
+  assert.match(was.summary, /1\/1 web applications have a finished vulnerability scan \(WAS scan search launchedDate\) within 30 days; the unbounded WAS scan history search \(webApp\.id filtered, no launchedDate bound\) was not issued because every web application resolved a finished scan inside the window; /);
+  assert.doesNotMatch(was.summary, /fully read scan history|per the unbounded scan history/, "no completeness claim for a read that never happened");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -2675,8 +2710,110 @@ test("false-pass self-check (d): a fully compliant tenant built strictly from do
 // names the dataset and endpoint in its summary, and renders counts taken from it as null, never 0.
 // ---------------------------------------------------------------------------------------------
 
+function forbiddenHandler(matches) {
+  return async (url, init) => (matches(url) ? forbiddenRouter(url) : compliantRouter(url, init));
+}
+
 function withForbidden(matches) {
-  return routedClient(async (url, init) => (matches(url) ? forbiddenRouter(url) : compliantRouter(url, init)));
+  return routedClient(forbiddenHandler(matches));
+}
+
+// Records the pathname of every request the real client issues, so a status that claims a read happened can be
+// checked against the reads that actually did.
+function recordingClient(handler) {
+  const requested = new Set();
+  const client = routedClient(async (url, init) => {
+    requested.add(new URL(url).pathname);
+    return handler(url, init);
+  });
+  return { client, requested };
+}
+
+const UNAVAILABLE_STATUS = /^(unreadable|not_readable|module_unavailable|not_collected|unknown)\b/;
+const COLLECTED_STATUS = /^(readable|truncated|complete|partial)\b/;
+const ENDPOINT_MENTION = /\/(?:api\/2\.0\/fo\/[a-z_/]+\/|qps\/rest\/[23]\.0\/search\/(?:am|was)\/[a-z]+\/?|msp\/user_list\.php)/g;
+
+function rendersEmpty(value) {
+  if (value === 0) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  return value !== null && typeof value === "object" && Object.keys(value).length === 0;
+}
+
+/** Any status reading unreadable, not_collected, or unknown needs a null companion, and a status item carrying one never renders 0, [], or {} beside it. */
+function assertNoFabricatedValues(value, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && UNAVAILABLE_STATUS.test(entry)) {
+      if (key.endsWith("_status")) {
+        const base = key.slice(0, -"_status".length);
+        assert.ok(base in value, `${label}: ${path}.${key} has no companion field ${base}`);
+        assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}", got ${JSON.stringify(value[base])}`);
+      }
+      if (key === "status") {
+        for (const [sibling, siblingValue] of Object.entries(value)) {
+          assert.ok(!rendersEmpty(siblingValue), `${label}: ${path}.${sibling} renders ${JSON.stringify(siblingValue)} beside status "${entry}"`);
+        }
+      }
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+/** A status that says a read happened (readable, truncated, complete, partial) may only name endpoints that were actually requested. */
+function assertStatusesMatchRequests(value, requested, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStatusesMatchRequests(item, requested, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && (key === "status" || key.endsWith("_status")) && COLLECTED_STATUS.test(entry)) {
+      if (key === "status" && typeof value.endpoint === "string") {
+        assert.ok(requested.has(value.endpoint), `${label}: ${path} says "${entry}" but ${value.endpoint} was never requested`);
+      }
+      for (const mention of entry.match(ENDPOINT_MENTION) ?? []) {
+        assert.ok(requested.has(mention), `${label}: ${path}.${key} says "${entry}" but ${mention} was never requested`);
+      }
+    }
+    assertStatusesMatchRequests(entry, requested, label, `${path}.${key}`);
+  }
+}
+
+function readBundleJson(outputDir, directory) {
+  return walkFiles(join(outputDir, directory))
+    .filter((file) => file.name.endsWith(".json"))
+    .map((file) => ({ name: `${directory}/${file.name}`, value: JSON.parse(file.content) }));
+}
+
+// Runs every assessment and a bundle export through one recording client, then applies both generic assertions to
+// each finding's evidence (including collection.sources), each assessment summary, and every core_data and
+// analysis file in the bundle.
+async function assertRenderingStandard(handler, label, outputRoot) {
+  const recorder = recordingClient(handler);
+  const results = await runAllAssessments(recorder.client);
+  const findings = allFindings(results);
+  assertNoFabricatedValues(results.map((result) => result.summary), `${label}: summaries`);
+  assertNoFabricatedValues(findings.map((item) => item.evidence), `${label}: evidence`);
+  assertStatusesMatchRequests(results.map((result) => result.summary), recorder.requested, `${label}: summaries`);
+  assertStatusesMatchRequests(findings.map((item) => item.evidence), recorder.requested, `${label}: evidence`);
+
+  const config = recorder.client.getResolvedConfig();
+  const bundle = await exportQualysAuditBundle(recorder.client, config, outputRoot);
+  const files = [...readBundleJson(bundle.outputDir, "core_data"), ...readBundleJson(bundle.outputDir, "analysis")];
+  assert.ok(files.length >= 28, `${label}: expected core_data and analysis files, got ${files.length}`);
+  for (const file of files) {
+    assertNoFabricatedValues(file.value, `${label}: ${file.name}`);
+    assertStatusesMatchRequests(file.value, recorder.requested, `${label}: ${file.name}`);
+    if (file.name.startsWith("core_data/") && file.name !== "core_data/access.json") {
+      assert.equal(Array.isArray(file.value), false, `${label}: ${file.name} is a status wrapper, never a bare array`);
+      assert.match(file.value.endpoint, /^\/(api|qps|msp)\//, `${label}: ${file.name} names its endpoint`);
+    }
+  }
+  return { findings, results, requested: recorder.requested, files };
 }
 
 test("rule 1 corollary: C01 demotes and names /api/2.0/fo/scan/ when the scan list is forbidden instead of passing with finished_scans_in_lookback 0", async () => {
@@ -2766,12 +2903,16 @@ const SWEEP_SURFACES = [
 ];
 
 test("rule 1 corollary sweep: each surface made unreadable in turn demotes exactly its dependents below pass and names the endpoint", async () => {
-  const baseline = new Map(allFindings(await runAllAssessments(routedClient(compliantRouter))).map((item) => [item.id, item.status]));
+  const outputRoot = createTempBase("qualys-sweep-");
+  const compliant = await assertRenderingStandard(compliantRouter, "baseline", outputRoot);
+  const baseline = new Map(compliant.findings.map((item) => [item.id, item.status]));
   assert.equal(baseline.size, 20);
+  assert.ok(compliant.requested.has("/api/2.0/fo/knowledge_base/vuln/"), "the compliant tenant has open QIDs, so the knowledge base is read");
   const table = [];
   for (const { surface, endpoint, matches, dependents } of SWEEP_SURFACES) {
-    const findings = allFindings(await runAllAssessments(withForbidden(matches)));
+    const { findings, requested } = await assertRenderingStandard(forbiddenHandler(matches), surface, outputRoot);
     assert.equal(findings.length, 20, surface);
+    assert.ok(requested.has(endpoint), `${surface}: the denied endpoint ${endpoint} was requested`);
     const demoted = findings.filter((item) => item.evidence.collection.sources.some((source) => source.status === "unreadable")).map((item) => item.id).sort();
     assert.deepEqual(demoted, [...dependents].sort(), `${surface}: exactly the dependents record the unreadable source`);
     for (const item of findings) {
@@ -2782,7 +2923,9 @@ test("rule 1 corollary sweep: each surface made unreadable in turn demotes exact
         const unreadable = item.evidence.collection.sources.filter((source) => source.status === "unreadable");
         assert.ok(unreadable.some((source) => source.reason.includes(endpoint)), `${surface}: ${item.id} collection.sources must carry the endpoint`);
         for (const source of unreadable) {
-          assert.equal(source.count, 0);
+          assert.equal(source.count, null, `${surface}: ${item.id} sources.${source.name}.count must be null, never 0`);
+          assert.equal(source.endpoint, SWEEP_SURFACES.find((entry) => entry.surface === source.name)?.endpoint ?? endpoint);
+          assert.equal("count_status" in source, false, "an unreadable source carries no completeness marker");
         }
         // Every plain count of the unreadable surface renders as null, never as 0 (list-valued evidence such as
         // C03 option_profiles names is not a count).

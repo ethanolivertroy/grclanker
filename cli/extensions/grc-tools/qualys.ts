@@ -133,7 +133,7 @@ export interface QualysAssessmentResult {
   summary: JsonRecord;
   findings: QualysFinding[];
   errors: string[];
-  rawData: Record<string, JsonRecord[]>;
+  rawData: Record<string, QualysRawDataSurface>;
 }
 
 export interface QualysAuditBundleResult {
@@ -174,12 +174,24 @@ export interface QualysViewScope {
   note: string;
 }
 
+export type QualysSourceState = "readable" | "truncated" | "unreadable" | "not_collected";
+
+// One inventory read by a finding. A read that did not happen or was denied carries count null beside a status
+// that names the endpoint; a read that happened carries its count marked complete or partial.
 export interface QualysSourceStatus {
   name: string;
-  status: "readable" | "unreadable" | "truncated";
-  count: number;
+  endpoint: string;
+  status: QualysSourceState;
+  count: number | null;
+  count_status?: "complete" | "partial";
   cap?: number;
   reason?: string;
+}
+
+// A core_data file: the same status block as collection.sources plus the projected records, or null when the
+// inventory was denied or never requested so an empty array is never mistaken for an empty inventory.
+export interface QualysRawDataSurface extends QualysSourceStatus {
+  records: JsonRecord[] | null;
 }
 
 export interface XmlNode {
@@ -341,8 +353,9 @@ function pathRecords(value: unknown, ...keys: string[]): JsonRecord[] {
   return asRecords(pathValue(value, ...keys));
 }
 
-function percent(part: number, total: number): number {
-  if (total <= 0) return 0;
+// A ratio with a zero denominator is undefined, never 0%.
+function percent(part: number, total: number): number | null {
+  if (total <= 0) return null;
   return Math.round((part / total) * 1000) / 10;
 }
 
@@ -1352,10 +1365,55 @@ export type QualysDataClient = Pick<
   | "searchWasSchedules"
 >;
 
+// Every inventory a finding can read, keyed by the source name used in collection.sources and core_data.
+const SURFACE_ENDPOINTS: Record<string, string> = {
+  scheduled_scans: "/api/2.0/fo/schedule/scan/",
+  scans: "/api/2.0/fo/scan/",
+  hosts: "/api/2.0/fo/asset/host/",
+  option_profiles: "/api/2.0/fo/subscription/option_profile/vm/",
+  excluded_ips: "/api/2.0/fo/asset/excluded_ip/",
+  asset_groups: "/api/2.0/fo/asset/group/",
+  connectors: "/qps/rest/2.0/search/am/assetdataconnector",
+  appliances: "/api/2.0/fo/appliance/",
+  cloud_agents: "/qps/rest/2.0/search/am/hostasset",
+  tags: "/qps/rest/2.0/search/am/tag",
+  auth_records: "/api/2.0/fo/auth/",
+  compliance_policies: "/api/2.0/fo/compliance/policy/",
+  detections: "/api/2.0/fo/asset/host/vm/detection/",
+  knowledge_base: "/api/2.0/fo/knowledge_base/vuln/",
+  scheduled_reports: "/api/2.0/fo/schedule/report/",
+  reports: "/api/2.0/fo/report/",
+  users: "/qps/rest/2.0/search/am/user/",
+  user_list: "/msp/user_list.php",
+  activity_log: "/api/2.0/fo/activity_log/",
+  was_webapps: "/qps/rest/3.0/search/was/webapp",
+  was_scans: "/qps/rest/3.0/search/was/wasscan",
+  was_scan_history: "/qps/rest/3.0/search/was/wasscan",
+  was_auth_records: "/qps/rest/3.0/search/was/webappauthrecord",
+  was_schedules: "/qps/rest/3.0/search/was/wasscanschedule",
+  api_user: "/qps/rest/2.0/search/am/user/",
+  api_user_list: "/msp/user_list.php",
+};
+
+function surfaceEndpoint(name: string): string {
+  const endpoint = SURFACE_ENDPOINTS[name];
+  if (!endpoint) throw new Error(`No endpoint is registered for surface ${name}`);
+  return endpoint;
+}
+
+// A call that was never issued. blocked is true when an unreadable upstream inventory prevented the call, so
+// values derived from it are unknown; false when nothing needed the call, so derived values stay known.
+interface NotCollected {
+  reason: string;
+  blocked: boolean;
+}
+
 interface Collected {
   name: string;
+  endpoint: string;
   data: JsonRecord[];
   error?: string;
+  notCollected?: NotCollected;
   moduleUnavailable: boolean;
   truncated: boolean;
   truncationReason?: string;
@@ -1368,22 +1426,38 @@ async function collect(
   errors: string[],
   cap?: number,
 ): Promise<Collected> {
+  const endpoint = surfaceEndpoint(name);
   try {
     const list = normalizeList(await load());
     let truncationReason = list.truncationReason;
     if (!truncationReason && cap !== undefined && list.items.length >= cap) {
       truncationReason = `returned ${list.items.length} records, reaching the ${cap} record cap`;
     }
-    return { name, data: list.items, moduleUnavailable: false, truncated: Boolean(truncationReason), truncationReason, cap };
+    return { name, endpoint, data: list.items, moduleUnavailable: false, truncated: Boolean(truncationReason), truncationReason, cap };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     errors.push(`${name}: ${message}`);
-    return { name, data: [], error: message, moduleUnavailable: isModuleUnavailableError(message), truncated: false, cap };
+    return { name, endpoint, data: [], error: message, moduleUnavailable: isModuleUnavailableError(message), truncated: false, cap };
   }
 }
 
-function emptyCollected(name: string): Collected {
-  return { name, data: [], moduleUnavailable: false, truncated: false };
+function notCollected(name: string, reason: string, blockedBy?: Collected): Collected {
+  return {
+    name,
+    endpoint: surfaceEndpoint(name),
+    data: [],
+    notCollected: { reason, blocked: Boolean(blockedBy) },
+    moduleUnavailable: false,
+    truncated: false,
+  };
+}
+
+function sourceLabel(source: Collected): string {
+  return `${source.name} (${source.endpoint})`;
+}
+
+function unreadableLabel(source: Collected): string {
+  return `${sourceLabel(source)} was not readable (${shortenMessage(source.error ?? "", 120)})`;
 }
 
 function shortenMessage(message: string, length = 160): string {
@@ -1404,31 +1478,123 @@ async function collectApiUserContext(client: QualysDataClient): Promise<ApiUserC
   return { users, legacyUsers };
 }
 
-// Rule 1 corollary: a count read from an unreadable inventory is unknown, never zero. Evidence renders it as
-// null next to the source status in collection.sources.
-function countIfReadable(source: Collected, count: number): number | null {
-  return source.error ? null : count;
+// Rule 1 corollary and the uniform null standard: data taken from an inventory that was denied or never requested
+// renders as null beside a status that names the read, never as 0, [], or {}. A Disclosed pairs a value with that
+// status until the record is rendered, where it becomes `<field>` and `<field>_status`.
+class Disclosed {
+  constructor(readonly value: unknown, readonly status: string) {}
 }
 
-function sourceCount(source: Collected): number | null {
+function disclosed(value: unknown, status: string): Disclosed {
+  return new Disclosed(value, status);
+}
+
+function withheld(status: string): Disclosed {
+  return new Disclosed(null, status);
+}
+
+function isPlainRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof Date) && !(value instanceof Disclosed);
+}
+
+// Expands every Disclosed into its value and a sibling `<field>_status`, recursing through nested records.
+function renderRecord(record: JsonRecord): JsonRecord {
+  const rendered: JsonRecord = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (value instanceof Disclosed) {
+      rendered[key] = isPlainRecord(value.value) ? renderRecord(value.value) : value.value;
+      rendered[`${key}_status`] = value.status;
+    } else if (isPlainRecord(value)) {
+      rendered[key] = renderRecord(value);
+    } else {
+      rendered[key] = value;
+    }
+  }
+  return rendered;
+}
+
+// The status text for an inventory that did not deliver: unreadable, not_collected, or (when a partial read
+// leaves a derived value undeterminable) unknown.
+function unavailableStatus(source: Collected, truncatedIsUnknown = false): string | undefined {
+  if (source.error) return `unreadable: ${unreadableLabel(source)}`;
+  if (source.notCollected) return `not_collected: ${sourceLabel(source)} ${source.notCollected.reason}`;
+  if (truncatedIsUnknown && source.truncated) {
+    return `unknown: ${sourceLabel(source)} was read partially (${source.truncationReason ?? "truncated"}), so the value cannot be determined`;
+  }
+  return undefined;
+}
+
+// A call skipped because nothing needed it leaves derived values known; a denied call or one blocked by a denied
+// upstream leaves them unknown.
+function blocksDerivation(source: Collected, truncatedIsUnknown = false): boolean {
+  return Boolean(source.error) || Boolean(source.notCollected?.blocked) || (truncatedIsUnknown && source.truncated);
+}
+
+function toSources(sources: Collected | Collected[]): Collected[] {
+  return Array.isArray(sources) ? sources : [sources];
+}
+
+function withheldFor(sources: Collected | Collected[], truncatedIsUnknown = false): Disclosed | undefined {
+  const statuses = toSources(sources)
+    .filter((source) => blocksDerivation(source, truncatedIsUnknown))
+    .map((source) => unavailableStatus(source, truncatedIsUnknown))
+    .filter((status): status is string => Boolean(status));
+  return statuses.length > 0 ? withheld(statuses.join("; ")) : undefined;
+}
+
+// A count of an inventory, or of records inside it, is unknown unless that inventory was actually read.
+function countIfReadable(source: Collected, count: number): number | Disclosed {
+  const status = unavailableStatus(source);
+  return status ? withheld(status) : count;
+}
+
+function sourceCount(source: Collected): number | Disclosed {
   return countIfReadable(source, source.data.length);
 }
 
-// A count joined across inventories is unknown when any of them is unreadable; with anyReadable the count is a
-// fallback population that stands as long as one inventory answered (the two user surfaces).
-function countIfAllReadable(sources: Collected[], count: number, anyReadable = false): number | null {
-  const readable = sources.filter((source) => !source.error).length;
-  return (anyReadable ? readable > 0 : readable === sources.length) ? count : null;
+// A count joined across inventories is unknown when any of them was unreadable or blocked.
+function derivedCount(sources: Collected | Collected[], count: number): number | Disclosed {
+  return withheldFor(sources) ?? count;
+}
+
+function listIfReadable<T>(sources: Collected | Collected[], list: T[], truncatedIsUnknown = false): T[] | Disclosed {
+  return withheldFor(sources, truncatedIsUnknown) ?? list;
+}
+
+function objectIfReadable(sources: Collected | Collected[], value: JsonRecord): JsonRecord | Disclosed {
+  return withheldFor(sources) ?? value;
+}
+
+// A percentage is unknown when an input inventory was not read or when its denominator is zero.
+function percentIfReadable(sources: Collected | Collected[], part: number, total: number, denominator: string): number | Disclosed {
+  const blocked = withheldFor(sources);
+  if (blocked) return blocked;
+  const value = percent(part, total);
+  return value === null ? withheld(`unknown: ratio undefined because ${denominator} is 0`) : value;
 }
 
 function describeSource(source: Collected): QualysSourceStatus {
+  const base = { name: source.name, endpoint: source.endpoint };
   if (source.error) {
-    return { name: source.name, status: "unreadable", count: 0, cap: source.cap, reason: shortenMessage(source.error) };
+    return { ...base, status: "unreadable", count: null, reason: shortenMessage(source.error) };
+  }
+  if (source.notCollected) {
+    return { ...base, status: "not_collected", count: null, reason: source.notCollected.reason };
   }
   if (source.truncated) {
-    return { name: source.name, status: "truncated", count: source.data.length, cap: source.cap, reason: source.truncationReason };
+    return { ...base, status: "truncated", count: source.data.length, count_status: "partial", cap: source.cap, reason: source.truncationReason };
   }
-  return { name: source.name, status: "readable", count: source.data.length, cap: source.cap };
+  return { ...base, status: "readable", count: source.data.length, count_status: "complete", cap: source.cap };
+}
+
+// The core_data rendering of one inventory: the status block plus projected records, or null records when the
+// inventory was denied or never requested.
+function exportableSurface(source: Collected): QualysRawDataSurface {
+  const status = describeSource(source);
+  return {
+    ...status,
+    records: status.status === "unreadable" || status.status === "not_collected" ? null : exportableRecords(source.name, source.data),
+  };
 }
 
 function unverifiedScope(note: string): QualysViewScope {
@@ -1552,6 +1718,12 @@ function guardedFinding(input: VerdictInput): QualysFinding {
     if (status !== "fail") status = "manual";
     notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
   }
+  // A call blocked by an unreadable upstream is disclosed with the read it would have made; a call skipped because
+  // nothing needed it is recorded in collection.sources only.
+  const blocked = input.sources.filter((source) => source.notCollected?.blocked);
+  if (blocked.length > 0) {
+    notes.push(`Not collected: ${blocked.map((source) => `${sourceLabel(source)} ${source.notCollected?.reason ?? ""}`).join("; ")}.`);
+  }
   if (truncated.length > 0) {
     if (status === "pass") status = "warn";
     notes.push(`Partial view: ${truncated.map((source) => `${source.name} ${source.truncationReason} (${source.data.length} seen${source.cap ? ` of cap ${source.cap}` : ""})`).join("; ")}.`);
@@ -1570,7 +1742,7 @@ function guardedFinding(input: VerdictInput): QualysFinding {
     parts.push(`Collect manually: ${input.manualEvidence}`);
   }
   return finding(input.control, input.severity, status, parts.join(" "), {
-    ...input.evidence,
+    ...renderRecord(input.evidence),
     verdict_basis: input.status,
     manual_evidence: input.manualEvidence,
     unknown_buckets: Object.fromEntries(buckets),
@@ -2293,6 +2465,7 @@ export async function assessQualysScanCoverage(
   const staleScannedHosts = scannedHosts.filter((host) => (ageInDays(hostLastScan(host), now) ?? Number.POSITIVE_INFINITY) > settings.lookbackDays);
   const authScannedHosts = scannedHosts.filter((host) => hostRecentlyAuthScanned(host, now, settings.lookbackDays));
   const authPercent = percent(authScannedHosts.length, scannedHosts.length);
+  const authPercentEvidence = percentIfReadable(hosts, authScannedHosts.length, scannedHosts.length, "scanned_hosts");
 
   const profilesWithoutAuth = profiles.data.filter((profile) => optionProfileAuthTypes(profile).length === 0).map(optionProfileName);
   const excludedQidCount = profiles.data.reduce((total, profile) => total + optionProfileExcludedQidCount(profile), 0);
@@ -2336,11 +2509,11 @@ export async function assessQualysScanCoverage(
       schedules_without_active_flag: countIfReadable(schedules, schedulesWithoutActiveFlag.length),
       finished_scans_in_lookback: countIfReadable(scans, finishedScans.length),
       asset_groups: sourceCount(groups),
-      asset_groups_without_schedule: groupsWithoutSchedule.slice(0, 50),
+      asset_groups_without_schedule: listIfReadable([groups, schedules], groupsWithoutSchedule.slice(0, 50)),
       hosts: sourceCount(hosts),
       stale_scanned_hosts: countIfReadable(hosts, staleScannedHosts.length),
       hosts_without_scan_date: countIfReadable(hosts, hostsWithoutScanDate.length),
-      next_launches: activeSchedules.map(scheduleNextLaunch).filter(Boolean).slice(0, 20),
+      next_launches: listIfReadable(schedules, activeSchedules.map(scheduleNextLaunch).filter(Boolean).slice(0, 20)),
     },
     // The finished scan count is read from the scan list, so that inventory is a source of this finding too.
     sources: [schedules, scans, groups, hosts],
@@ -2355,7 +2528,7 @@ export async function assessQualysScanCoverage(
       ? "manual"
       : scannedHosts.length === 0
         ? "fail"
-        : authPercent >= settings.minAuthScanPercent
+        : (authPercent ?? 0) >= settings.minAuthScanPercent
           ? "pass"
           : "fail";
   findings.push(guardedFinding({
@@ -2373,7 +2546,7 @@ export async function assessQualysScanCoverage(
       hosts: sourceCount(hosts),
       scanned_hosts: countIfReadable(hosts, scannedHosts.length),
       authenticated_hosts: countIfReadable(hosts, authScannedHosts.length),
-      authenticated_percent: authPercent,
+      authenticated_percent: authPercentEvidence,
       threshold_percent: settings.minAuthScanPercent,
       hosts_without_scan_date: countIfReadable(hosts, hostsWithoutScanDate.length),
     },
@@ -2393,9 +2566,9 @@ export async function assessQualysScanCoverage(
         ? "No option profiles were returned; emptiness is a failure for this control because at least one authenticated option profile is required for scanning."
         : `${profiles.data.length} option profiles reviewed; ${profilesWithoutAuth.length} have no authentication types enabled (SCAN/AUTHENTICATION absent or empty). Port ranges and internal versus external intent are not machine-verifiable, so the verdict is capped at warn until reviewed.`,
     evidence: {
-      option_profiles: profiles.data.map(optionProfileName).slice(0, 50),
-      profiles_without_authentication: profilesWithoutAuth.slice(0, 50),
-      authentication_types: Object.fromEntries(profiles.data.slice(0, 50).map((profile) => [optionProfileName(profile), optionProfileAuthTypes(profile)])),
+      option_profiles: listIfReadable(profiles, profiles.data.map(optionProfileName).slice(0, 50)),
+      profiles_without_authentication: listIfReadable(profiles, profilesWithoutAuth.slice(0, 50)),
+      authentication_types: objectIfReadable(profiles, Object.fromEntries(profiles.data.slice(0, 50).map((profile) => [optionProfileName(profile), optionProfileAuthTypes(profile)]))),
     },
     sources: [profiles],
     scope,
@@ -2418,9 +2591,9 @@ export async function assessQualysScanCoverage(
           : `${activeSchedules.length} active schedules name only internal scanner appliances (${internalScanners.join(", ") || "none named"}); none names the Qualys External Scanner, so perimeter coverage is not confirmed.${unverifiedScannerNote}`,
     evidence: {
       active_schedules: countIfReadable(schedules, activeSchedules.length),
-      external_schedules: externalSchedules.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50),
-      schedules_without_scanner_name: schedulesWithoutScannerName.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50),
-      scanners_in_use: distinctScanners.slice(0, 50),
+      external_schedules: listIfReadable(schedules, externalSchedules.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50)),
+      schedules_without_scanner_name: listIfReadable(schedules, schedulesWithoutScannerName.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50)),
+      scanners_in_use: listIfReadable(schedules, distinctScanners.slice(0, 50)),
       external_scanner_match: "ISCANNER_NAME equals the documented literal External Scanner",
     },
     sources: [schedules],
@@ -2455,11 +2628,11 @@ export async function assessQualysScanCoverage(
             ? "The excluded host list is empty, but no option profiles were returned so detection exclusion search lists could not be evaluated."
             : `No excluded hosts and no detection exclusion search lists across ${profiles.data.length} option profiles; the excluded host list was read completely, so emptiness is compliant for this control.`,
     evidence: {
-      excluded_entries: excluded.data.slice(0, 100),
-      broad_exclusions: broadExclusions.slice(0, 50),
+      excluded_entries: listIfReadable(excluded, excluded.data.slice(0, 100)),
+      broad_exclusions: listIfReadable(excluded, broadExclusions.slice(0, 50)),
       option_profiles_reviewed: sourceCount(profiles),
-      option_profile_detection_exclusions: excludedQidCount,
-      option_profile_exclusion_lists: profiles.data.flatMap(optionProfileExclusionLists).slice(0, 50),
+      option_profile_detection_exclusions: countIfReadable(profiles, excludedQidCount),
+      option_profile_exclusion_lists: listIfReadable(profiles, profiles.data.flatMap(optionProfileExclusionLists).slice(0, 50)),
     },
     sources: [excluded, profiles],
     scope,
@@ -2477,8 +2650,8 @@ export async function assessQualysScanCoverage(
         : `${activeSchedules.length} active schedules target ${distinctTargets.length} distinct targets (asset group titles, TAG_SET_INCLUDE tags, and IP targets) across ${distinctScanners.length} named scanner sources${schedulesWithoutScannerName.length > 0 ? ` plus ${schedulesWithoutScannerName.length} schedules without an ISCANNER_NAME` : ""}. The API does not label segments, so mapping to DMZ, internal, and OT/ICS is manual and the verdict is capped at warn.`,
     evidence: {
       active_schedules: countIfReadable(schedules, activeSchedules.length),
-      distinct_targets: distinctTargets.slice(0, 50),
-      distinct_scanners: distinctScanners.slice(0, 50),
+      distinct_targets: listIfReadable(schedules, distinctTargets.slice(0, 50)),
+      distinct_scanners: listIfReadable(schedules, distinctScanners.slice(0, 50)),
       schedules_without_scanner_name: countIfReadable(schedules, schedulesWithoutScannerName.length),
     },
     sources: [schedules],
@@ -2489,7 +2662,7 @@ export async function assessQualysScanCoverage(
   return {
     category: "scan_coverage",
     title: "Qualys scan coverage and cadence",
-    summary: {
+    summary: renderRecord({
       platform: config.platform,
       lookback_days: settings.lookbackDays,
       view_scope: scope.note,
@@ -2498,23 +2671,16 @@ export async function assessQualysScanCoverage(
       hosts: sourceCount(hosts),
       hosts_without_scan_date: countIfReadable(hosts, hostsWithoutScanDate.length),
       stale_scanned_hosts: countIfReadable(hosts, staleScannedHosts.length),
-      authenticated_percent: authPercent,
+      authenticated_percent: authPercentEvidence,
       option_profiles: sourceCount(profiles),
       excluded_entries: sourceCount(excluded),
       external_schedules: countIfReadable(schedules, externalSchedules.length),
       truncated_sources: [schedules, scans, hosts, profiles, excluded, groups].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
-    },
+    }),
     findings,
     errors,
-    rawData: {
-      scheduled_scans: exportableRecords("scheduled_scans", schedules.data),
-      scans: exportableRecords("scans", scans.data),
-      hosts: exportableRecords("hosts", hosts.data),
-      option_profiles: exportableRecords("option_profiles", profiles.data),
-      excluded_ips: exportableRecords("excluded_ips", excluded.data),
-      asset_groups: exportableRecords("asset_groups", groups.data),
-    },
+    rawData: Object.fromEntries([schedules, scans, hosts, profiles, excluded, groups].map((source) => [source.name, exportableSurface(source)])),
   };
 }
 
@@ -2642,6 +2808,7 @@ export async function assessQualysAssetInventory(
   const agentHosts = hosts.data.filter(hostIsAgentTracked);
   const hostsWithoutTrackingMethod = hosts.data.filter((host) => hostTrackingMethod(host) === "");
   const agentPercent = percent(agentHosts.length, hosts.data.length);
+  const agentPercentEvidence = percentIfReadable(hosts, agentHosts.length, hosts.data.length, "hosts");
   const inactiveAgents = agents.data.filter((agent) => /INACTIVE|UNINSTALL/.test(agentStatus(agent)));
   const unknownStatusAgents = agents.data.filter(agentStatusUnknown);
   const agentsWithoutCheckIn = agents.data.filter((agent) => !parseDate(agentLastCheckIn(agent)));
@@ -2649,6 +2816,7 @@ export async function assessQualysAssetInventory(
   const staleAgents = agents.data.filter((agent) => (ageInDays(agentLastCheckIn(agent), now) ?? -1) > STALE_AGENT_DAYS);
   const untaggedHosts = hosts.data.filter((host) => hostTags(host).length === 0);
   const untaggedPercent = percent(untaggedHosts.length, hosts.data.length);
+  const untaggedPercentEvidence = percentIfReadable(hosts, untaggedHosts.length, hosts.data.length, "hosts");
   // tag.xsd: ruleType is a TagRuleType enum whose values include STATIC; only the other values are rule based.
   const dynamicTags = tags.data.filter((tag) => {
     const ruleType = asString(tag.ruleType);
@@ -2664,7 +2832,7 @@ export async function assessQualysAssetInventory(
     summary: `Qualys exposes ${groups.data.length} asset groups and ${hosts.data.length} host assets, but the API cannot compare them against the authoritative CMDB or network range register, so this control is always manual. Investigate ${emptyGroups.length} asset groups without targets and ${neverScannedHosts.length} hosts that were never scanned.`,
     evidence: {
       asset_groups: sourceCount(groups),
-      asset_groups_without_targets: emptyGroups.slice(0, 50),
+      asset_groups_without_targets: listIfReadable(groups, emptyGroups.slice(0, 50)),
       hosts: sourceCount(hosts),
       hosts_never_scanned: countIfReadable(hosts, neverScannedHosts.length),
     },
@@ -2696,13 +2864,13 @@ export async function assessQualysAssetInventory(
             ? `${staleConnectors.length}/${connectors.data.length} cloud connectors have not synchronized within ${STALE_CONNECTOR_DAYS} days.`
             : `All ${connectors.data.length} cloud connectors report a healthy state and synchronized within ${STALE_CONNECTOR_DAYS} days.`,
     evidence: {
-      connectors: connectors.data.map((connector) => ({
+      connectors: listIfReadable(connectors, connectors.data.map((connector) => ({
         name: asString(connector.name),
         type: asString(connector.type),
         state: connectorState(connector),
         last_sync: asString(connector.lastSync),
         last_error: asString(connector.lastError),
-      })).slice(0, 100),
+      })).slice(0, 100)),
       unhealthy_connectors: countIfReadable(connectors, unhealthyConnectors.length),
       stale_connectors: countIfReadable(connectors, staleConnectors.length),
     },
@@ -2735,18 +2903,18 @@ export async function assessQualysAssetInventory(
             ? `${outdatedAppliances.length}/${appliances.data.length} scanner appliances missed heartbeats (HEARTBEATS_MISSED) or run a scanner (ML_VERSION versus ML_LATEST) or signature (VULNSIGS_VERSION versus VULNSIGS_LATEST) release behind the latest.`
             : `All ${appliances.data.length} scanner appliances report an online STATUS, zero missed heartbeats, and ML_VERSION and VULNSIGS_VERSION equal to ML_LATEST and VULNSIGS_LATEST.`,
     evidence: {
-      appliances: appliances.data.map((appliance) => ({
+      appliances: listIfReadable(appliances, appliances.data.map((appliance) => ({
         name: xmlScalarText(appliance.NAME),
-        status: applianceStatus(appliance),
+        appliance_status: applianceStatus(appliance),
         software_version: xmlScalarText(appliance.SOFTWARE_VERSION),
         ml_version: xmlScalarText(appliance.ML_VERSION),
         ml_latest: xmlScalarText(appliance.ML_LATEST),
         vulnsigs_version: xmlScalarText(appliance.VULNSIGS_VERSION),
         vulnsigs_latest: xmlScalarText(appliance.VULNSIGS_LATEST),
         version_state: applianceVersionState(appliance),
-        heartbeats_missed: applianceMissedHeartbeats(appliance),
+        heartbeats_missed: asNumber(appliance.HEARTBEATS_MISSED) ?? null,
         last_updated: xmlScalarText(appliance.LAST_UPDATED_DATE),
-      })).slice(0, 100),
+      })).slice(0, 100)),
       offline_appliances: countIfReadable(appliances, offlineAppliances.length),
       outdated_appliances: countIfReadable(appliances, outdatedAppliances.length),
       version_comparison: "ML_VERSION against ML_LATEST and VULNSIGS_VERSION against VULNSIGS_LATEST (appliance_list_output.dtd); SOFTWARE_VERSION is reported only",
@@ -2761,9 +2929,9 @@ export async function assessQualysAssetInventory(
     ? "manual"
     : hosts.data.length === 0
       ? "manual"
-      : agentPercent >= settings.minAgentCoveragePercent && inactiveAgents.length === 0 && staleAgents.length === 0
+      : (agentPercent ?? 0) >= settings.minAgentCoveragePercent && inactiveAgents.length === 0 && staleAgents.length === 0
         ? "pass"
-        : agentPercent >= settings.minAgentCoveragePercent
+        : (agentPercent ?? 0) >= settings.minAgentCoveragePercent
           ? "warn"
           : "fail";
   findings.push(guardedFinding({
@@ -2778,7 +2946,7 @@ export async function assessQualysAssetInventory(
     evidence: {
       agent_tracked_hosts: countIfReadable(hosts, agentHosts.length),
       hosts: sourceCount(hosts),
-      agent_coverage_percent: agentPercent,
+      agent_coverage_percent: agentPercentEvidence,
       threshold_percent: settings.minAgentCoveragePercent,
       cloud_agents: sourceCount(agents),
       inactive_agents: countIfReadable(agents, inactiveAgents.length),
@@ -2802,9 +2970,9 @@ export async function assessQualysAssetInventory(
       ? "fail"
       : hosts.data.length === 0
         ? "manual"
-        : untaggedPercent > 20
+        : (untaggedPercent ?? 0) > 20
           ? "fail"
-          : untaggedPercent > 0
+          : (untaggedPercent ?? 0) > 0
             ? "warn"
             : "pass";
   findings.push(guardedFinding({
@@ -2823,8 +2991,8 @@ export async function assessQualysAssetInventory(
       dynamic_tags: countIfReadable(tags, dynamicTags.length),
       hosts: sourceCount(hosts),
       untagged_hosts: countIfReadable(hosts, untaggedHosts.length),
-      untagged_percent: untaggedPercent,
-      tag_names: tags.data.map((tag) => asString(tag.name)).filter(Boolean).slice(0, 100),
+      untagged_percent: untaggedPercentEvidence,
+      tag_names: listIfReadable(tags, tags.data.map((tag) => asString(tag.name)).filter(Boolean).slice(0, 100)),
     },
     sources: [tags, hosts],
     scope,
@@ -2834,7 +3002,7 @@ export async function assessQualysAssetInventory(
   return {
     category: "asset_inventory",
     title: "Qualys asset inventory and sensors",
-    summary: {
+    summary: renderRecord({
       platform: config.platform,
       view_scope: scope.note,
       asset_groups: sourceCount(groups),
@@ -2844,23 +3012,16 @@ export async function assessQualysAssetInventory(
       unhealthy_connectors: countIfReadable(connectors, unhealthyConnectors.length),
       appliances: sourceCount(appliances),
       offline_appliances: countIfReadable(appliances, offlineAppliances.length),
-      agent_coverage_percent: agentPercent,
+      agent_coverage_percent: agentPercentEvidence,
       cloud_agents: sourceCount(agents),
       tags: sourceCount(tags),
-      untagged_percent: untaggedPercent,
+      untagged_percent: untaggedPercentEvidence,
       truncated_sources: [groups, hosts, connectors, appliances, agents, tags].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
-    },
+    }),
     findings,
     errors,
-    rawData: {
-      asset_groups: exportableRecords("asset_groups", groups.data),
-      hosts: exportableRecords("hosts", hosts.data),
-      connectors: exportableRecords("connectors", connectors.data),
-      appliances: exportableRecords("appliances", appliances.data),
-      cloud_agents: exportableRecords("cloud_agents", agents.data),
-      tags: exportableRecords("tags", tags.data),
-    },
+    rawData: Object.fromEntries([groups, hosts, connectors, appliances, agents, tags].map((source) => [source.name, exportableSurface(source)])),
   };
 }
 
@@ -2962,9 +3123,13 @@ export async function assessQualysVulnerabilityManagement(
   const detectionsWithoutStatus = openDetections.filter((detection) => detectionStatus(detection) === undefined);
   const detectionsWithoutSeverity = openDetections.filter((detection) => !detectionHasSeverity(detection));
   const openQids = uniqueStrings(openDetections.map((detection) => asString(detection.QID)));
-  const knowledgeBase = openQids.length > 0
-    ? await collect("knowledge_base", () => client.listKnowledgeBase(openQids), errors)
-    : emptyCollected("knowledge_base");
+  // The knowledge base is looked up only for open QIDs, so without a readable detection list the call never happens
+  // and its status says so instead of claiming a readable, empty knowledge base.
+  const knowledgeBase = detections.error
+    ? notCollected("knowledge_base", `was not called because ${unreadableLabel(detections)}`, detections)
+    : openQids.length > 0
+      ? await collect("knowledge_base", () => client.listKnowledgeBase(openQids), errors)
+      : notCollected("knowledge_base", `was not called because ${sourceLabel(detections)} returned no open detections with a QID`);
 
   const authTypes = authRecords.data.filter((record) => (asNumber(record.count) ?? 0) > 0).map((record) => asString(record.type) ?? "");
   const windowsHosts = hosts.data.filter((host) => /windows/i.test(hostOs(host)));
@@ -2978,6 +3143,7 @@ export async function assessQualysVulnerabilityManagement(
   const scannedHosts = hosts.data.filter((host) => parseDate(hostLastScan(host)));
   const authScannedHosts = scannedHosts.filter((host) => hostRecentlyAuthScanned(host, now, settings.lookbackDays));
   const authScannedPercent = percent(authScannedHosts.length, scannedHosts.length);
+  const authScannedPercentEvidence = percentIfReadable(hosts, authScannedHosts.length, scannedHosts.length, "scanned_hosts");
 
   const inactivePolicies = policies.data.filter((policy) => policyStatus(policy) === "inactive").map((policy) => recordLabel(policy, "policy"));
   const unknownStatusPolicies = policies.data.filter((policy) => policyStatus(policy) === "unknown").map((policy) => recordLabel(policy, "policy"));
@@ -2988,12 +3154,13 @@ export async function assessQualysVulnerabilityManagement(
   const slaDated = slaScoped.filter((detection) => detectionAgeDays(detection, now) !== undefined);
   const slaUndated = slaScoped.filter((detection) => detectionAgeDays(detection, now) === undefined);
   const slaBreaches = slaDated.filter((detection) => (detectionAgeDays(detection, now) ?? 0) > (detectionSlaDays(detection, settings) ?? 0));
-  const slaPercent = slaDated.length === 0 ? 0 : percent(slaDated.length - slaBreaches.length, slaDated.length);
-  const breachBySeverity = {
+  const slaPercent = percent(slaDated.length - slaBreaches.length, slaDated.length);
+  const slaPercentEvidence = percentIfReadable(detections, slaDated.length - slaBreaches.length, slaDated.length, "sla_dated_detections");
+  const breachBySeverity = objectIfReadable(detections, {
     critical: slaBreaches.filter((detection) => detectionSeverity(detection) >= 5).length,
     high: slaBreaches.filter((detection) => detectionSeverity(detection) === 4).length,
     medium: slaBreaches.filter((detection) => detectionSeverity(detection) === 3).length,
-  };
+  });
 
   const patchableQids = new Set(knowledgeBase.data.filter((vuln) => asBoolean(vuln.PATCHABLE) === true).map((vuln) => asString(vuln.QID)).filter(Boolean));
   const kbQids = new Set(knowledgeBase.data.map((vuln) => asString(vuln.QID)).filter(Boolean));
@@ -3003,9 +3170,11 @@ export async function assessQualysVulnerabilityManagement(
   const patchableUndated = patchableDetections.filter((detection) => detectionAgeDays(detection, now) === undefined);
   const overduePatchable = patchableDated.filter((detection) => (detectionAgeDays(detection, now) ?? 0) > settings.slaHighDays);
   const overduePercent = percent(overduePatchable.length, patchableDated.length);
+  const overduePercentEvidence = percentIfReadable([detections, knowledgeBase], overduePatchable.length, patchableDated.length, "dated_patchable_detections");
 
   const qdsDetections = openDetections.filter(detectionHasQds);
   const qdsPercent = percent(qdsDetections.length, openDetections.length);
+  const qdsPercentEvidence = percentIfReadable(detections, qdsDetections.length, openDetections.length, "open_detections");
 
   const detectionsFullyRead = !detections.error && !detections.truncated;
   const hostPopulationKnown = !hosts.error && hosts.data.length > 0;
@@ -3022,7 +3191,7 @@ export async function assessQualysVulnerabilityManagement(
           ? "fail"
           : scannedHosts.length === 0
             ? "fail"
-            : authScannedPercent >= settings.minAuthScanPercent
+            : (authScannedPercent ?? 0) >= settings.minAuthScanPercent
               ? "pass"
               : "warn";
   findings.push(guardedFinding({
@@ -3041,12 +3210,12 @@ export async function assessQualysVulnerabilityManagement(
               ? `Authentication record types ${authTypes.join(", ")} cover the host OS mix, but none of the ${hosts.data.length} hosts has a scan date, so there is no evidence the credentials work.`
               : `Authentication record types ${authTypes.join(", ")} cover the host OS mix (${windowsHosts.length} Windows, ${unixHosts.length} Unix-like, ${networkHosts.length} network devices) and ${authScannedHosts.length}/${scannedHosts.length} scanned hosts (${authScannedPercent}%) had a recent authenticated scan, which is the API evidence that credentials are not expired or failing (threshold ${settings.minAuthScanPercent}%).`,
     evidence: {
-      auth_record_types: authRecords.data,
+      auth_record_types: listIfReadable(authRecords, authRecords.data),
       windows_hosts: countIfReadable(hosts, windowsHosts.length),
       unix_hosts: countIfReadable(hosts, unixHosts.length),
       network_device_hosts: countIfReadable(hosts, networkHosts.length),
-      missing_auth_types: missingAuthTypes,
-      authenticated_scan_percent: authScannedPercent,
+      missing_auth_types: listIfReadable([authRecords, hosts], missingAuthTypes),
+      authenticated_scan_percent: authScannedPercentEvidence,
     },
     sources: [authRecords, hosts],
     scope,
@@ -3078,9 +3247,9 @@ export async function assessQualysVulnerabilityManagement(
             : `All ${policies.data.length} compliance policies report STATUS active and carry an asset group or tag assignment.`,
     evidence: {
       policies: sourceCount(policies),
-      inactive_policies: inactivePolicies.slice(0, 50),
-      unassigned_policies: unassignedPolicies.slice(0, 50),
-      policies_with_hidden_asset_groups: hiddenAssignmentPolicies.slice(0, 50),
+      inactive_policies: listIfReadable(policies, inactivePolicies.slice(0, 50)),
+      unassigned_policies: listIfReadable(policies, unassignedPolicies.slice(0, 50)),
+      policies_with_hidden_asset_groups: listIfReadable(policies, hiddenAssignmentPolicies.slice(0, 50)),
     },
     sources: [policies],
     scope,
@@ -3096,9 +3265,9 @@ export async function assessQualysVulnerabilityManagement(
         ? detectionsFullyRead ? "pass" : "manual"
         : slaDated.length === 0
           ? "warn"
-          : slaPercent >= 95
+          : (slaPercent ?? 0) >= 95
             ? "pass"
-            : slaPercent >= 80
+            : (slaPercent ?? 0) >= 80
               ? "warn"
               : "fail";
   findings.push(guardedFinding({
@@ -3125,7 +3294,7 @@ export async function assessQualysVulnerabilityManagement(
       sla_scoped_detections: countIfReadable(detections, slaScoped.length),
       sla_dated_detections: countIfReadable(detections, slaDated.length),
       sla_breaches: countIfReadable(detections, slaBreaches.length),
-      sla_compliance_percent: slaPercent,
+      sla_compliance_percent: slaPercentEvidence,
       breaches_by_severity: breachBySeverity,
       sla_days: { critical: settings.slaCriticalDays, high: settings.slaHighDays, medium: settings.slaMediumDays },
     },
@@ -3150,7 +3319,7 @@ export async function assessQualysVulnerabilityManagement(
           ? "pass"
           : patchableDated.length === 0
             ? "warn"
-            : overduePercent > 25
+            : (overduePercent ?? 0) > 25
               ? "fail"
               : overduePatchable.length > 0
                 ? "warn"
@@ -3176,12 +3345,12 @@ export async function assessQualysVulnerabilityManagement(
                 : `${overduePatchable.length}/${patchableDated.length} dated patchable detections (${overduePercent}%) have been open longer than ${settings.slaHighDays} days; ${patchableUndated.length} undated patchable detections were excluded from the compliant count.`,
     evidence: {
       open_qids: countIfReadable(detections, openQids.length),
-      knowledge_base_qids: kbQids.size,
-      unresolved_qids: countIfAllReadable([detections, knowledgeBase], unresolvedQids.length),
-      patchable_qids: patchableQids.size,
-      patchable_detections: countIfAllReadable([detections, knowledgeBase], patchableDetections.length),
-      overdue_patchable_detections: countIfAllReadable([detections, knowledgeBase], overduePatchable.length),
-      overdue_percent: overduePercent,
+      knowledge_base_qids: countIfReadable(knowledgeBase, kbQids.size),
+      unresolved_qids: derivedCount([detections, knowledgeBase], unresolvedQids.length),
+      patchable_qids: countIfReadable(knowledgeBase, patchableQids.size),
+      patchable_detections: derivedCount([detections, knowledgeBase], patchableDetections.length),
+      overdue_patchable_detections: derivedCount([detections, knowledgeBase], overduePatchable.length),
+      overdue_percent: overduePercentEvidence,
     },
     sources: [detections, hosts, knowledgeBase],
     scope,
@@ -3193,7 +3362,7 @@ export async function assessQualysVulnerabilityManagement(
     ? "manual"
     : openDetections.length === 0
       ? "manual"
-      : qdsPercent > 0
+      : (qdsPercent ?? 0) > 0
         ? "warn"
         : "fail";
   findings.push(guardedFinding({
@@ -3204,11 +3373,11 @@ export async function assessQualysVulnerabilityManagement(
       ? unreadableSummary(17, [detections])
       : openDetections.length === 0
         ? "No open detections were returned, so QDS availability cannot be confirmed; treated as unknown, not compliant."
-        : `${qdsDetections.length}/${openDetections.length} open detections (${qdsPercent}%) carry a Qualys Detection Score${qdsPercent >= 90 ? ", which confirms QDS is exposed" : ""}. The triage workflow that consumes QDS or CVSS is not machine-verifiable, so the verdict is capped at warn until documented.`,
+        : `${qdsDetections.length}/${openDetections.length} open detections (${qdsPercent}%) carry a Qualys Detection Score${(qdsPercent ?? 0) >= 90 ? ", which confirms QDS is exposed" : ""}. The triage workflow that consumes QDS or CVSS is not machine-verifiable, so the verdict is capped at warn until documented.`,
     evidence: {
       detections_with_qds: countIfReadable(detections, qdsDetections.length),
       open_detections: countIfReadable(detections, openDetections.length),
-      qds_percent: qdsPercent,
+      qds_percent: qdsPercentEvidence,
     },
     sources: [detections],
     scope,
@@ -3218,31 +3387,25 @@ export async function assessQualysVulnerabilityManagement(
   return {
     category: "vulnerability_management",
     title: "Qualys vulnerability and compliance management",
-    summary: {
+    summary: renderRecord({
       platform: config.platform,
       view_scope: scope.note,
-      auth_record_types: authTypes,
+      auth_record_types: listIfReadable(authRecords, authTypes),
       compliance_policies: sourceCount(policies),
       hosts: sourceCount(hosts),
       detections_returned: sourceCount(detections),
       open_detections: countIfReadable(detections, openDetections.length),
-      sla_compliance_percent: slaPercent,
+      sla_compliance_percent: slaPercentEvidence,
       sla_breaches: countIfReadable(detections, slaBreaches.length),
-      patchable_detections: countIfAllReadable([detections, knowledgeBase], patchableDetections.length),
-      overdue_patchable_detections: countIfAllReadable([detections, knowledgeBase], overduePatchable.length),
-      qds_percent: qdsPercent,
+      patchable_detections: derivedCount([detections, knowledgeBase], patchableDetections.length),
+      overdue_patchable_detections: derivedCount([detections, knowledgeBase], overduePatchable.length),
+      qds_percent: qdsPercentEvidence,
       truncated_sources: [authRecords, hosts, policies, detections, knowledgeBase].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
-    },
+    }),
     findings,
     errors,
-    rawData: {
-      auth_records: exportableRecords("auth_records", authRecords.data),
-      hosts: exportableRecords("hosts", hosts.data),
-      compliance_policies: exportableRecords("compliance_policies", policies.data),
-      detections: exportableRecords("detections", detections.data),
-      knowledge_base: exportableRecords("knowledge_base", knowledgeBase.data),
-    },
+    rawData: Object.fromEntries([authRecords, hosts, policies, detections, knowledgeBase].map((source) => [source.name, exportableSurface(source)])),
   };
 }
 
@@ -3334,13 +3497,24 @@ function webAppLastScanDate(webApp: JsonRecord, scans: JsonRecord[]): Date | und
   return new Date(Math.max(...dates.map((date) => date.getTime())));
 }
 
-async function collectWasScanHistory(client: QualysDataClient, webApps: Collected, wasScans: Collected, errors: string[]): Promise<Collected> {
-  if (webApps.error || wasScans.error) return emptyCollected("was_scan_history");
+const WAS_HISTORY_SEARCH = "the unbounded WAS scan history search (webApp.id filtered, no launchedDate bound)";
+
+// The unbounded history search runs only for web applications the bounded scan search did not resolve. When it is
+// not issued, its status records why, so C15 never claims a readable history it did not read.
+async function collectWasScanHistory(client: QualysDataClient, webApps: Collected, wasScans: Collected, errors: string[], lookbackDays: number): Promise<Collected> {
+  const blockedBy = [webApps, wasScans].find((source) => source.error);
+  if (blockedBy) {
+    return notCollected("was_scan_history", `${WAS_HISTORY_SEARCH} was not issued because ${unreadableLabel(blockedBy)}`, blockedBy);
+  }
   const unresolved = webApps.data
     .filter((webApp) => !webAppLastScanDate(webApp, wasScans.data))
     .map((webApp) => asString(webApp.id))
     .filter((id): id is string => Boolean(id));
-  if (unresolved.length === 0) return emptyCollected("was_scan_history");
+  if (unresolved.length === 0) {
+    return notCollected("was_scan_history", webApps.data.length === 0
+      ? `${WAS_HISTORY_SEARCH} was not issued because ${sourceLabel(webApps)} returned no web applications`
+      : `${WAS_HISTORY_SEARCH} was not issued because every web application returned by ${sourceLabel(webApps)} resolved a finished vulnerability scan inside the ${lookbackDays} day window through ${sourceLabel(wasScans)}`);
+  }
   return collect("was_scan_history", () => client.searchWasScanHistory(unresolved), errors, DEFAULT_LIST_LIMIT);
 }
 
@@ -3394,7 +3568,7 @@ export async function assessQualysAdministration(
     collect("was_schedules", () => client.searchWasSchedules(), errors, DEFAULT_LIST_LIMIT),
   ]);
   const scope = resolveViewScope(config, users, activity, userList);
-  const wasHistory = await collectWasScanHistory(client, webApps, wasScans, errors);
+  const wasHistory = await collectWasScanHistory(client, webApps, wasScans, errors, settings.lookbackDays);
 
   const activeScheduledReports = scheduledReports.data.filter(reportIsActive);
   const reportsWithoutActiveFlag = scheduledReports.data.filter(reportActiveFlagMissing);
@@ -3445,7 +3619,7 @@ export async function assessQualysAdministration(
         ? "No active scheduled reports exist (queried with is_active=1), so automated report generation is not configured; emptiness is a failure for this control."
         : `${activeScheduledReports.length} active scheduled reports (queried with is_active=1) and ${recentReports.length} reports generated in the last ${settings.lookbackDays} days${recentReports.length === 0 ? ", so schedules exist but produced nothing in the review window" : ""}. Distribution recipients are not exposed by the API, so the verdict is capped at warn until reviewed in the UI.`,
     evidence: {
-      active_scheduled_reports: activeScheduledReports.map((report) => recordLabel(report, "report")).slice(0, 50),
+      active_scheduled_reports: listIfReadable(scheduledReports, activeScheduledReports.map((report) => recordLabel(report, "report")).slice(0, 50)),
       scheduled_reports_without_active_flag: countIfReadable(scheduledReports, reportsWithoutActiveFlag.length),
       active_filter: "is_active=1",
       recent_reports: countIfReadable(reports, recentReports.length),
@@ -3457,6 +3631,14 @@ export async function assessQualysAdministration(
   }));
 
   const bothUserSourcesUnreadable = Boolean(userList.error && users.error);
+  // Every population-derived value discloses which surface it was counted from, because the Administration API
+  // fallback is a partial population (Active users only, other Managers hidden), never the tenant's roster.
+  const populationStatus = userListReadable
+    ? `readable: USER_STATUS Active users from ${sourceLabel(userList)}`
+    : bothUserSourcesUnreadable
+      ? `unreadable: ${unreadableLabel(userList)}; ${unreadableLabel(users)}`
+      : `partial: ${unreadableLabel(userList)}, so the population is the Administration API user search (${users.endpoint}), which returns Active users only and hides other Manager and Super User accounts`;
+  const fromPopulation = (value: unknown): Disclosed => disclosed(bothUserSourcesUnreadable ? null : value, populationStatus);
   const excessiveManagers = managers.length > settings.maxManagers;
   const userStatusVerdict: QualysFindingStatus = bothUserSourcesUnreadable
     ? "manual"
@@ -3495,18 +3677,18 @@ export async function assessQualysAdministration(
             ? `The User List API returned ${userList.data.length} users but none with USER_STATUS Active, which cannot be true for a working subscription, so the API user cannot see the user population; treated as unknown, not compliant.${usersUnreadableNote}`
             : `${activeUsers.length} Active users (USER_STATUS) of ${userList.data.length} returned by the User List API, ${inactiveStatusUsers.length} Inactive, ${pendingUsers.length} Pending Activation; ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}), ${sharedEmails.length} shared email addresses, ${genericAccounts.length} generic-looking account names, ${staleLoginUsers.length} Active users whose LAST_LOGIN_DATE is older than ${INACTIVE_USER_DAYS} days, and ${usersWithoutLastLogin.length} Active users without a LAST_LOGIN_DATE (never counted as recently active).${usersUnreadableNote}${restrictedViewNote}`,
     evidence: {
-      users_returned: countIfAllReadable([userList, users], userPopulation.length, true),
+      users_returned: fromPopulation(userPopulation.length),
       user_list_users: sourceCount(userList),
       administration_api_users: sourceCount(users),
-      restricted_view_users_without_login: restrictedViewUsers.length,
-      active_users: countIfAllReadable([userList, users], activeUsers.length, true),
+      restricted_view_users_without_login: countIfReadable(userList, restrictedViewUsers.length),
+      active_users: fromPopulation(activeUsers.length),
       inactive_status_users: countIfReadable(userList, inactiveStatusUsers.length),
       pending_activation_users: countIfReadable(userList, pendingUsers.length),
-      managers: managers.slice(0, 50),
+      managers: fromPopulation(managers.slice(0, 50)),
       max_managers: settings.maxManagers,
-      shared_emails: sharedEmails.slice(0, 50),
-      generic_accounts: genericAccounts.slice(0, 50),
-      stale_login_users: staleLoginUsers.slice(0, 50),
+      shared_emails: fromPopulation(sharedEmails.slice(0, 50)),
+      generic_accounts: fromPopulation(genericAccounts.slice(0, 50)),
+      stale_login_users: listIfReadable(userList, staleLoginUsers.slice(0, 50)),
       inactive_user_days: INACTIVE_USER_DAYS,
       users_with_last_login: countIfReadable(userList, usersWithLastLogin.length),
       status_source: userListReadable ? "/msp/user_list.php USER_STATUS, USER_ROLE, LAST_LOGIN_DATE" : "not available",
@@ -3534,6 +3716,17 @@ export async function assessQualysAdministration(
         : staleWasAuth.length > 0
           ? "warn"
           : "pass";
+  // The history clause only claims a complete or unbounded read when that read happened and finished.
+  const historyClause = wasHistory.error
+    ? `; ${unresolvedWebApps.length} could not be resolved because ${WAS_HISTORY_SEARCH} on ${wasHistory.endpoint} was not readable, so the stale and never-scanned counts are unknown (reported, never counted as fresh or as never scanned)`
+    : wasHistory.truncated
+      ? `; ${unresolvedWebApps.length} could not be resolved because ${WAS_HISTORY_SEARCH} was truncated (${wasHistory.truncationReason ?? "truncated"}), so the stale and never-scanned counts are unknown (reported, never counted as fresh or as never scanned)`
+      : wasHistory.notCollected
+        ? `; ${WAS_HISTORY_SEARCH} was not issued because every web application resolved a finished scan inside the window`
+        : `, ${staleWebApps.length} were last scanned before the window per the unbounded scan history, and ${neverScannedWebApps.length} have no finished vulnerability scan in the fully read scan history`;
+  // Stale and never-scanned lists are unknown when the bounded scan search, the web app inventory, or a needed
+  // history read did not deliver; a history search that nothing needed leaves them known and empty.
+  const scanDateWithheld = withheldFor([webApps, wasScans]) ?? withheldFor(wasHistory, true);
   findings.push(guardedFinding({
     control: 15,
     severity: "medium",
@@ -3542,14 +3735,14 @@ export async function assessQualysAdministration(
       ? `${unreadableSummary(15, [webApps, wasScans, wasAuth])}${webApps.moduleUnavailable ? " The WAS module is not licensed or not enabled for this API user, so this control is not applicable unless web applications are scanned elsewhere." : ""}`
       : webApps.data.length === 0
         ? "WAS responded but no web applications are inventoried. This is not applicable if no web applications are in scope; otherwise the WAS inventory is missing. Emptiness is treated as unknown, not compliant."
-        : `${webAppScans.fresh.length}/${webApps.data.length} web applications have a finished vulnerability scan (WAS scan search launchedDate) within ${settings.lookbackDays} days, ${staleWebApps.length} were last scanned before the window per the unbounded scan history, ${neverScannedWebApps.length} have no finished vulnerability scan in the fully read scan history, and ${unresolvedWebApps.length} could not be resolved because the scan history was ${wasHistory.error ? "not readable" : "truncated"} (reported, never counted as fresh or as never scanned); ${staleWasAuth.length} WAS authentication records are older than ${STALE_WAS_AUTH_DAYS} days; ${activeWasSchedules.length}/${wasSchedules.data.length} WAS schedules report an active flag.`,
+        : `${webAppScans.fresh.length}/${webApps.data.length} web applications have a finished vulnerability scan (WAS scan search launchedDate) within ${settings.lookbackDays} days${historyClause}; ${staleWasAuth.length} WAS authentication records are older than ${STALE_WAS_AUTH_DAYS} days; ${activeWasSchedules.length}/${wasSchedules.data.length} WAS schedules report an active flag.`,
     evidence: {
       web_apps: sourceCount(webApps),
-      recently_scanned_web_apps: webAppScans.fresh.length,
-      never_scanned_web_apps: neverScannedWebApps.slice(0, 50),
-      stale_web_apps: staleWebApps.slice(0, 50),
-      unresolved_web_apps: unresolvedWebApps.slice(0, 50),
-      stale_auth_records: staleWasAuth.slice(0, 50),
+      recently_scanned_web_apps: derivedCount([webApps, wasScans], webAppScans.fresh.length),
+      never_scanned_web_apps: scanDateWithheld ?? neverScannedWebApps.slice(0, 50),
+      stale_web_apps: scanDateWithheld ?? staleWebApps.slice(0, 50),
+      unresolved_web_apps: listIfReadable([webApps, wasScans], unresolvedWebApps.slice(0, 50)),
+      stale_auth_records: listIfReadable(wasAuth, staleWasAuth.slice(0, 50)),
       active_schedules: countIfReadable(wasSchedules, activeWasSchedules.length),
       schedules_returned: sourceCount(wasSchedules),
       scans_in_lookback: sourceCount(wasScans),
@@ -3578,13 +3771,13 @@ export async function assessQualysAdministration(
     evidence: {
       entries: sourceCount(activity),
       sensitive_actions_count: countIfReadable(activity, sensitiveActions.length),
-      sensitive_actions: sensitiveActions.slice(0, 50).map((entry) => ({
+      sensitive_actions: listIfReadable(activity, sensitiveActions.slice(0, 50).map((entry) => ({
         date: asString(entry.date),
         action: asString(entry.action),
         module: asString(entry.module),
         user: asString(entry.user_name),
         role: asString(entry.user_role),
-      })),
+      }))),
     },
     sources: [activity],
     scope,
@@ -3594,37 +3787,29 @@ export async function assessQualysAdministration(
   return {
     category: "administration",
     title: "Qualys administration and reporting hygiene",
-    summary: {
+    summary: renderRecord({
       platform: config.platform,
       view_scope: scope.note,
       active_scheduled_reports: countIfReadable(scheduledReports, activeScheduledReports.length),
       recent_reports: countIfReadable(reports, recentReports.length),
       users: sourceCount(users),
-      active_users: countIfAllReadable([userList, users], activeUsers.length, true),
-      managers: managers.length,
-      shared_emails: sharedEmails.length,
+      user_list_users: sourceCount(userList),
+      active_users: fromPopulation(activeUsers.length),
+      managers: fromPopulation(managers.length),
+      shared_emails: fromPopulation(sharedEmails.length),
       activity_entries: sourceCount(activity),
       sensitive_actions: countIfReadable(activity, sensitiveActions.length),
       web_apps: sourceCount(webApps),
-      never_scanned_web_apps: countIfReadable(webApps, neverScannedWebApps.length),
-      stale_web_apps: countIfReadable(webApps, staleWebApps.length),
-      truncated_sources: [scheduledReports, reports, users, activity, webApps, wasScans, wasAuth, wasSchedules].filter((source) => source.truncated).map((source) => source.name),
+      never_scanned_web_apps: scanDateWithheld ?? neverScannedWebApps.length,
+      stale_web_apps: scanDateWithheld ?? staleWebApps.length,
+      truncated_sources: [scheduledReports, reports, users, userList, activity, webApps, wasScans, wasHistory, wasAuth, wasSchedules].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
-    },
+    }),
     findings,
     errors,
-    rawData: {
-      scheduled_reports: exportableRecords("scheduled_reports", scheduledReports.data),
-      reports: exportableRecords("reports", reports.data),
-      users: exportableRecords("users", users.data),
-      user_list: exportableRecords("user_list", userList.data),
-      activity_log: exportableRecords("activity_log", activity.data),
-      was_webapps: exportableRecords("was_webapps", webApps.data),
-      was_scans: exportableRecords("was_scans", wasScans.data),
-      was_scan_history: exportableRecords("was_scan_history", wasHistory.data),
-      was_auth_records: exportableRecords("was_auth_records", wasAuth.data),
-      was_schedules: exportableRecords("was_schedules", wasSchedules.data),
-    },
+    rawData: Object.fromEntries(
+      [scheduledReports, reports, users, userList, activity, webApps, wasScans, wasHistory, wasAuth, wasSchedules].map((source) => [source.name, exportableSurface(source)]),
+    ),
   };
 }
 
@@ -3665,21 +3850,21 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
   const activity = await collect("activity_log", () => client.listActivityLog(7), scopeErrors, DEFAULT_LIST_LIMIT);
   const viewScope = resolveViewScope(config, users, activity, userList);
   const surfaces: QualysAccessSurface[] = [
-    await probeSurface("scheduled_scans", "VM", "/api/2.0/fo/schedule/scan/", () => client.listScheduledScans()),
-    await probeSurface("hosts", "VM", "/api/2.0/fo/asset/host/", () => client.listHosts(100)),
-    await probeSurface("asset_groups", "VM", "/api/2.0/fo/asset/group/", () => client.listAssetGroups()),
-    await probeSurface("option_profiles", "VM", "/api/2.0/fo/subscription/option_profile/vm/", () => client.listOptionProfiles()),
-    await probeSurface("appliances", "VM", "/api/2.0/fo/appliance/", () => client.listAppliances()),
-    await probeSurface("auth_records", "VM", "/api/2.0/fo/auth/", () => client.listAuthRecordSummary()),
-    await probeSurface("detections", "VMDR", "/api/2.0/fo/asset/host/vm/detection/", () => client.listDetections(100)),
-    await probeSurface("compliance_policies", "PC", "/api/2.0/fo/compliance/policy/", () => client.listCompliancePolicies()),
-    await probeSurface("activity_log", "Administration", "/api/2.0/fo/activity_log/", () => (activity.error ? Promise.reject(new Error(activity.error)) : Promise.resolve(activity.data))),
-    await probeSurface("users", "Administration", "/qps/rest/2.0/search/am/user/", () => (users.error ? Promise.reject(new Error(users.error)) : Promise.resolve(users.data))),
-    await probeSurface("user_list", "Administration", "/msp/user_list.php", () => (userList.error ? Promise.reject(new Error(userList.error)) : Promise.resolve(userList.data))),
-    await probeSurface("tags", "Asset Management", "/qps/rest/2.0/search/am/tag", () => client.searchTags(100)),
-    await probeSurface("cloud_agents", "Cloud Agent", "/qps/rest/2.0/search/am/hostasset", () => client.searchCloudAgents(100)),
-    await probeSurface("connectors", "Asset Management", "/qps/rest/2.0/search/am/assetdataconnector", () => client.searchConnectors()),
-    await probeSurface("was_webapps", "WAS", "/qps/rest/3.0/search/was/webapp", () => client.searchWebApps()),
+    await probeSurface("scheduled_scans", "VM", surfaceEndpoint("scheduled_scans"), () => client.listScheduledScans()),
+    await probeSurface("hosts", "VM", surfaceEndpoint("hosts"), () => client.listHosts(100)),
+    await probeSurface("asset_groups", "VM", surfaceEndpoint("asset_groups"), () => client.listAssetGroups()),
+    await probeSurface("option_profiles", "VM", surfaceEndpoint("option_profiles"), () => client.listOptionProfiles()),
+    await probeSurface("appliances", "VM", surfaceEndpoint("appliances"), () => client.listAppliances()),
+    await probeSurface("auth_records", "VM", surfaceEndpoint("auth_records"), () => client.listAuthRecordSummary()),
+    await probeSurface("detections", "VMDR", surfaceEndpoint("detections"), () => client.listDetections(100)),
+    await probeSurface("compliance_policies", "PC", surfaceEndpoint("compliance_policies"), () => client.listCompliancePolicies()),
+    await probeSurface("activity_log", "Administration", surfaceEndpoint("activity_log"), () => (activity.error ? Promise.reject(new Error(activity.error)) : Promise.resolve(activity.data))),
+    await probeSurface("users", "Administration", surfaceEndpoint("users"), () => (users.error ? Promise.reject(new Error(users.error)) : Promise.resolve(users.data))),
+    await probeSurface("user_list", "Administration", surfaceEndpoint("user_list"), () => (userList.error ? Promise.reject(new Error(userList.error)) : Promise.resolve(userList.data))),
+    await probeSurface("tags", "Asset Management", surfaceEndpoint("tags"), () => client.searchTags(100)),
+    await probeSurface("cloud_agents", "Cloud Agent", surfaceEndpoint("cloud_agents"), () => client.searchCloudAgents(100)),
+    await probeSurface("connectors", "Asset Management", surfaceEndpoint("connectors"), () => client.searchConnectors()),
+    await probeSurface("was_webapps", "WAS", surfaceEndpoint("was_webapps"), () => client.searchWebApps()),
   ];
 
   const coreModules = new Set(["VM", "VMDR"]);
@@ -3816,8 +4001,9 @@ function buildQuickReference(): string {
   return [
     "# Qualys Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains normalized snapshots of the Qualys API responses used during this assessment.",
-    "- `analysis/` contains normalized findings and per-category summaries.",
+    "- `core_data/` contains one file per collected surface: `name`, `endpoint`, `status` (readable, truncated, unreadable, or not_collected), `count`, and the projected `records`.",
+    "- A surface that was denied or never requested carries `count` and `records` as null with the reason; an empty `records` array means the read completed and returned nothing.",
+    "- `analysis/` contains normalized findings and per-category summaries; a null value beside a `<field>_status` names the read that did not deliver it.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
     "- Review manual findings before asserting framework compliance from the automated output alone.",
