@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  SLACK_EXTERNAL_SHARING_AUDIT_ACTIONS,
+  SLACK_FILE_UPLOAD_VERDICTS,
   SLACK_METHODS,
+  SLACK_SECURITY_AUDIT_ACTIONS,
   SLACK_SPEC_CONTROLS,
   SlackApiClient,
   assessSlackAdminAccess,
@@ -15,6 +18,7 @@ import {
   assessSlackMonitoring,
   checkSlackAccess,
   exportSlackAuditBundle,
+  isSlackPostingRestricted,
   resolveSecureOutputPath,
   resolveSlackConfiguration,
 } from "../dist/extensions/grc-tools/slack.js";
@@ -28,6 +32,11 @@ function createTempBase(prefix) {
 
 function jsonResponse(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json", ...headers } });
+}
+
+function gzipResponse() {
+  const gzipMagic = Uint8Array.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
+  return new Response(gzipMagic, { status: 200, headers: { "content-type": "application/gzip" } });
 }
 
 async function requestParams(input, init = {}) {
@@ -80,8 +89,8 @@ const emptyFixture = ({ pathname }) => {
     "admin.teams.admins.list": { admin_ids: [] },
   };
   if (lists[method]) return { ok: true, ...lists[method], response_metadata: { next_cursor: "" } };
-  if (method === "discovery.enterprise.info") return { ok: true, enterprise: { id: "E1" } };
-  if (method === "admin.analytics.getFile") return { ok: true };
+  if (method === "admin.analytics.getFile") return gzipResponse();
+  if (method === "team.preferences.list") return { ok: true };
   return { ok: true };
 };
 
@@ -105,7 +114,8 @@ const compliantFixture = ({ pathname, params }) => {
   if (pathname === "/audit/v1/logs") {
     return { entries: [
       { id: "L1", date_create: 1789920000, action: "user_login", actor: { type: "user" }, entity: { type: "user" } },
-      { id: "L2", date_create: 1789910000, action: "channel_shared", actor: { type: "user" }, entity: { type: "channel" } },
+      { id: "L2", date_create: 1789910000, action: "external_shared_channel_connected", actor: { type: "user" }, entity: { type: "channel" } },
+      { id: "L3", date_create: 1789900000, action: "pref.sso_setting_changed", actor: { type: "user" }, entity: { type: "workspace" } },
     ], response_metadata: { next_cursor: "" } };
   }
   if (pathname === "/audit/v1/schemas") return { schemas: [{ type: "user", user: {} }] };
@@ -150,9 +160,11 @@ const compliantFixture = ({ pathname, params }) => {
     case "admin.emoji.list":
       return { ok: true, emoji: { party: { url: "https://emoji.slack-edge.com/T1/party/1.png", date_created: 1591720632, uploaded_by: "W1" } }, response_metadata: { next_cursor: "" } };
     case "admin.analytics.getFile":
-      return { ok: true };
-    case "discovery.enterprise.info":
-      return { ok: true, enterprise: { id: "E1", name: "Acme" } };
+      assert.equal(params.get("metadata_only"), "true");
+      assert.equal(params.get("type"), "public_channel");
+      return gzipResponse();
+    case "team.preferences.list":
+      return { ok: true, display_real_names: true, disable_file_uploads: "type:owner,type:admin", msg_edit_window_mins: 25, who_can_post_general: "admins" };
     default:
       throw new Error(`unexpected method ${method}`);
   }
@@ -171,7 +183,7 @@ const partialFixture = (request) => {
   return base;
 };
 
-const MANUAL_BY_DESIGN = new Set(["SLACK-ADMIN-04", "SLACK-ADMIN-06", "SLACK-ADMIN-09", "SLACK-APP-05", "SLACK-APP-06", "SLACK-APP-07", "SLACK-CHAN-04", "SLACK-CHAN-05", "SLACK-MON-06"]);
+const MANUAL_BY_DESIGN = new Set(["SLACK-ADMIN-04", "SLACK-ADMIN-06", "SLACK-ADMIN-09", "SLACK-APP-05", "SLACK-APP-07", "SLACK-CHAN-04", "SLACK-CHAN-05", "SLACK-MON-06"]);
 
 async function runAll(client, options = {}) {
   return [
@@ -331,6 +343,8 @@ test("fixture (b): empty inventories never pass by default", async () => {
   assert.equal(byId(results[2], "SLACK-APP-01").status, "warn");
   assert.match(byId(results[2], "SLACK-APP-01").summary, /not treated as compliant/);
   assert.equal(byId(results[2], "SLACK-APP-04").status, "warn");
+  assert.equal(byId(results[2], "SLACK-APP-06").status, "manual");
+  assert.match(byId(results[2], "SLACK-APP-06").summary, /did not return disable_file_uploads/);
   assert.equal(byId(results[4], "SLACK-MON-01").status, "fail");
   assert.equal(byId(results[4], "SLACK-MON-04").status, "warn");
 });
@@ -356,7 +370,18 @@ test("fixture (d): a compliant Enterprise Grid org passes every automatable cont
   const automatable = all.filter((item) => !MANUAL_BY_DESIGN.has(item.id));
   const notPassing = automatable.filter((item) => item.status !== "pass").map((item) => `${item.id}=${item.status}: ${item.summary}`);
   assert.deepEqual(notPassing, []);
+  assert.equal(automatable.length, 24);
+  assert.equal(all.length, 32);
   assert.equal(all.filter((item) => MANUAL_BY_DESIGN.has(item.id)).every((item) => item.status === "manual"), true);
+  assert.equal(byId(results[2], "SLACK-APP-06").status, "pass");
+  assert.equal(byId(results[4], "SLACK-MON-05").status, "pass");
+  assert.equal(byId(results[4], "SLACK-MON-05").evidence.external_event_count, 1);
+  assert.deepEqual(byId(results[4], "SLACK-MON-05").evidence.matched_actions, ["external_shared_channel_connected"]);
+  assert.deepEqual(byId(results[4], "SLACK-MON-03").evidence.matched_actions, ["user_login", "pref.sso_setting_changed"]);
+  assert.equal(byId(results[1], "SLACK-ADMIN-09").evidence.analytics_export_readable, true);
+  assert.equal(byId(results[1], "SLACK-ADMIN-09").evidence.analytics_content_type, "application/gzip");
+  assert.equal(byId(results[2], "SLACK-APP-05").status, "manual");
+  assert.match(byId(results[2], "SLACK-APP-05").summary, /no public reference page/);
   assert.equal(new Set(all.map((item) => item.control)).size, SLACK_SPEC_CONTROLS.length);
   assert.ok(all.every((item) => item.mappings.length > 0));
   assert.ok(results.every((result) => result.errors.length === 0));
@@ -407,6 +432,154 @@ test("verdict rules: apps with sensitive scopes, unrestricted default channels, 
   assert.equal(byId(channels, "SLACK-CHAN-02").status, "fail");
   assert.equal(byId(channels, "SLACK-CHAN-03").status, "fail");
   assert.equal(byId(channels, "SLACK-CHAN-03").evidence.short_retention_channels.length, 2);
+});
+
+test("review fix 2: SLACK-APP-06 reads team.preferences.list and maps every documented disable_file_uploads value", async () => {
+  const seen = [];
+  const withSetting = (value) => makeClient((request) => {
+    if (request.pathname === "/api/team.preferences.list") {
+      seen.push({ method: request.method, auth: request.auth, params: [...request.params.keys()] });
+      return value === undefined ? { ok: true, display_real_names: false } : { ok: true, disable_file_uploads: value };
+    }
+    return compliantFixture(request);
+  });
+  const expected = { disallow_all: "pass", "type:owner,type:admin": "pass", "type:regular": "warn", allow_all: "fail" };
+  assert.deepEqual(SLACK_FILE_UPLOAD_VERDICTS, expected);
+  for (const [value, status] of Object.entries(expected)) {
+    const item = byId(await assessSlackIntegrations(withSetting(value)), "SLACK-APP-06");
+    assert.equal(item.status, status, `${value} should be ${status}`);
+    assert.equal(item.evidence.disable_file_uploads, value);
+    assert.match(item.summary, new RegExp(`disable_file_uploads=${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  }
+  assert.deepEqual(seen[0], { method: "POST", auth: "Bearer xoxp-test", params: [] });
+  assert.equal(SLACK_METHODS["team.preferences.list"].verb, "POST");
+  assert.deepEqual(SLACK_METHODS["team.preferences.list"].tokens, ["user", "bot"]);
+  assert.equal(byId(await assessSlackIntegrations(withSetting("type:guest")), "SLACK-APP-06").status, "warn");
+  assert.equal(byId(await assessSlackIntegrations(withSetting(undefined)), "SLACK-APP-06").status, "manual");
+  const denied = byId(await assessSlackIntegrations(makeClient((request) => request.pathname === "/api/team.preferences.list" ? { ok: false, error: "missing_scope" } : compliantFixture(request))), "SLACK-APP-06");
+  assert.equal(denied.status, "manual");
+  assert.match(denied.summary, /team\.preferences\.list is not readable: .*missing_scope/);
+  const botOnly = byId(await assessSlackIntegrations(makeClient((request) => request.pathname === "/api/team.preferences.list" ? { ok: true, disable_file_uploads: "disallow_all" } : deniedFixture(), { bot_token: "xoxb-test" })), "SLACK-APP-06");
+  assert.equal(botOnly.status, "warn");
+  assert.match(botOnly.summary, /admin\.teams\.list is not readable/);
+  const multiWorkspace = byId(await assessSlackIntegrations(makeClient((request) => request.pathname === "/api/admin.teams.list"
+    ? { ok: true, teams: [{ id: "T1", name: "Core" }, { id: "T2", name: "Labs" }], response_metadata: { next_cursor: "" } }
+    : compliantFixture(request))), "SLACK-APP-06");
+  assert.equal(multiWorkspace.status, "warn");
+  assert.match(multiWorkspace.summary, /org has 2 workspaces and only the token's workspace was read/);
+  assert.equal(multiWorkspace.evidence.workspace_id, "T1");
+  const partialWorkspaces = byId(await assessSlackIntegrations(makeClient(partialFixture), { workspaceLimit: 1 }), "SLACK-APP-06");
+  assert.equal(partialWorkspaces.status, "warn");
+  assert.match(partialWorkspaces.summary, /workspace inventory is partial/);
+});
+
+test("review fixes 3 and 4: every matched audit action string is a documented Audit Logs action", async () => {
+  const documentedSecurityActions = [
+    "user_login",
+    "user_logout",
+    "app_installed",
+    "app_approved",
+    "app_restricted",
+    "role_change_to_admin",
+    "pref.sso_setting_changed",
+    "pref.two_factor_auth_changed",
+    "user_deactivated",
+  ];
+  const documentedExternalActions = [
+    "external_shared_channel_connected",
+    "external_shared_channel_reconnected",
+    "external_shared_channel_disconnected",
+    "external_shared_channel_disconnect_and_archived",
+    "external_shared_channel_invite_created",
+    "external_shared_channel_invite_accepted",
+    "external_shared_channel_invite_approved",
+    "external_shared_channel_invite_declined",
+    "external_shared_channel_invite_expired",
+    "external_shared_channel_invite_revoked",
+    "external_shared_channel_invite_auto_revoked",
+    "external_shared_channel_access_upgraded",
+  ];
+  assert.deepEqual([...SLACK_SECURITY_AUDIT_ACTIONS], documentedSecurityActions);
+  assert.deepEqual([...SLACK_EXTERNAL_SHARING_AUDIT_ACTIONS], documentedExternalActions);
+  const source = readFileSync(new URL("../extensions/grc-tools/slack.ts", import.meta.url), "utf8");
+  for (const invented of ["pref_sso_setting_changed", "pref_two_factor_auth_changed", "channel_shared", "channel_unshared", "file_shared_externally", "slack_connect_channel_created", "discovery.enterprise.info", "admin.enterprise.info"]) {
+    assert.equal(source.includes(`"${invented}"`), false, `${invented} must not appear in slack.ts`);
+  }
+
+  const withActions = (actions) => makeClient((request) => request.pathname === "/audit/v1/logs"
+    ? { entries: actions.map((action, index) => ({ id: `L${index}`, date_create: 1789920000 - index, action, actor: { type: "user" }, entity: { type: "channel" } })), response_metadata: { next_cursor: "" } }
+    : compliantFixture(request));
+  const external = await assessSlackMonitoring(withActions(["external_shared_channel_invite_accepted", "external_shared_channel_disconnected"]), { days: 30 });
+  assert.equal(byId(external, "SLACK-MON-05").status, "pass");
+  assert.equal(byId(external, "SLACK-MON-05").evidence.external_event_count, 2);
+  const invented = await assessSlackMonitoring(withActions(["channel_shared", "pref_sso_setting_changed", "user_login"]), { days: 30 });
+  assert.equal(byId(invented, "SLACK-MON-05").status, "warn");
+  assert.equal(byId(invented, "SLACK-MON-05").evidence.external_event_count, 0);
+  assert.equal(byId(invented, "SLACK-MON-03").evidence.security_event_count, 1);
+  assert.deepEqual(byId(invented, "SLACK-MON-03").evidence.matched_actions, ["user_login"]);
+  const prefs = await assessSlackMonitoring(withActions(["pref.sso_setting_changed", "pref.two_factor_auth_changed"]), { days: 30 });
+  assert.equal(byId(prefs, "SLACK-MON-03").status, "pass");
+  assert.equal(byId(prefs, "SLACK-MON-03").evidence.security_event_count, 2);
+});
+
+test("review fix 5: admin.analytics.getFile gzip bodies are a successful probe and ok:false JSON is the failure path", async () => {
+  let downloaded = false;
+  const gzipClient = makeClient((request) => {
+    if (request.pathname !== "/api/admin.analytics.getFile") return compliantFixture(request);
+    assert.equal(request.method, "GET");
+    assert.equal(request.params.get("metadata_only"), "true");
+    const stream = new ReadableStream({
+      pull(controller) {
+        downloaded = true;
+        controller.enqueue(Uint8Array.from([0x1f, 0x8b]));
+        controller.close();
+      },
+    }, { highWaterMark: 0 });
+    return new Response(stream, { status: 200, headers: { "content-type": "application/gzip" } });
+  });
+  const admin = await assessSlackAdminAccess(gzipClient);
+  assert.equal(byId(admin, "SLACK-ADMIN-09").evidence.analytics_export_readable, true);
+  assert.equal(byId(admin, "SLACK-ADMIN-09").evidence.analytics_content_type, "application/gzip");
+  assert.match(byId(admin, "SLACK-ADMIN-09").summary, /probe returned application\/gzip/);
+  assert.equal(downloaded, false);
+  assert.equal(admin.errors.some((entry) => entry.startsWith("admin.analytics.getFile")), false);
+
+  const jsonFailure = makeClient((request) => request.pathname === "/api/admin.analytics.getFile" ? { ok: false, error: "org_level_email_display_disabled" } : compliantFixture(request));
+  const failed = byId(await assessSlackAdminAccess(jsonFailure), "SLACK-ADMIN-09");
+  assert.equal(failed.evidence.analytics_export_readable, false);
+  assert.match(failed.summary, /probe failed: .*org_level_email_display_disabled/);
+
+  const untypedFailure = makeClient((request) => request.pathname === "/api/admin.analytics.getFile" ? new Response(JSON.stringify({ ok: false, error: "not_allowed_token_type" }), { status: 200 }) : compliantFixture(request));
+  assert.equal(byId(await assessSlackAdminAccess(untypedFailure), "SLACK-ADMIN-09").evidence.analytics_export_readable, false);
+
+  const forbidden = makeClient((request) => request.pathname === "/api/admin.analytics.getFile" ? jsonResponse({ ok: false, error: "invalid_auth" }, 403) : compliantFixture(request));
+  assert.match(byId(await assessSlackAdminAccess(forbidden), "SLACK-ADMIN-09").summary, /HTTP 403/);
+});
+
+test("review fix 6: who_can_post accepts the documented singular and plural type spellings", async () => {
+  const cases = [
+    [["admin"], true],
+    [["admins"], true],
+    [["owner"], true],
+    [["owners"], true],
+    [["admin", "owner"], true],
+    [["Admins", "Owners"], true],
+    ["admin, owner", true],
+    [["ra"], false],
+    [["admins", "ra"], false],
+    [[], undefined],
+  ];
+  for (const [type, expected] of cases) {
+    assert.equal(isSlackPostingRestricted({ who_can_post: { type, user: [] } }), expected, JSON.stringify(type));
+  }
+  assert.equal(isSlackPostingRestricted({ who_can_post: { type: [], user: ["W1"] } }), true);
+  assert.equal(isSlackPostingRestricted({}), undefined);
+  for (const type of ["admin", "admins", "owner", "owners"]) {
+    const client = makeClient((request) => request.pathname === "/api/admin.conversations.getConversationPrefs"
+      ? { ok: true, prefs: { who_can_post: { type: [type], user: [] } } }
+      : compliantFixture(request));
+    assert.equal(byId(await assessSlackChannelGovernance(client), "SLACK-CHAN-02").status, "pass", type);
+  }
 });
 
 test("SLACK_METHODS documents every Web API method the tools call", () => {

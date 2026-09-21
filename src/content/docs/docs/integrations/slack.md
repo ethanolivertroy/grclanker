@@ -9,13 +9,13 @@ The Slack tool family inspects a Slack Enterprise Grid organization (or a single
 
 | Variable | Purpose |
 |----------|---------|
-| `SLACK_USER_TOKEN` | Org-level user token (`xoxp-`) from an app installed on the whole Enterprise org. Required for every `admin.*`, Audit Logs, and Discovery method. |
-| `SLACK_BOT_TOKEN` | Optional bot token (`xoxb-`). Used only for methods whose reference page lists bot tokens (`auth.test`, `users.list`). Admin methods are refused locally with `not_allowed_token_type` when only a bot token is present. |
+| `SLACK_USER_TOKEN` | Org-level user token (`xoxp-`) from an app installed on the whole Enterprise org. Required for every `admin.*` and Audit Logs method. |
+| `SLACK_BOT_TOKEN` | Optional bot token (`xoxb-`). Used only for methods whose reference page lists bot tokens (`auth.test`, `users.list`, `team.preferences.list`). Admin methods are refused locally with `not_allowed_token_type` when only a bot token is present. |
 | `SLACK_SCIM_TOKEN` | SCIM bearer token (Business+ or Enterprise Grid). Enables provisioning and lifecycle checks. |
 | `SLACK_ORG_ID` | Enterprise Grid org ID (`E...`). Passed as `enterprise_id` to the app inventory methods. |
 | `SLACK_CONFIG_FILE` | Optional JSON file with `user_token`, `bot_token`, `scim_token`, and `org_id`. Defaults to `~/.config/grclanker/slack.json` when present. Arguments override environment variables, which override the file. |
 
-Required user-token scopes: `admin.teams:read`, `admin.users:read`, `admin.apps:read`, `admin.barriers:read`, `admin.conversations:read`, `admin.analytics:read` (optional probe), `auditlogs:read`, `users:read`, and `discovery:read` when the org holds the Discovery API entitlement. The Admin API and Audit Logs API require an Enterprise Grid plan; an `ok:false` response of `not_allowed_token_type`, `missing_scope`, `not_an_enterprise`, or `feature_not_enabled` is rendered as a manual finding that names the cause, never as an empty or passing result.
+Required user-token scopes: `admin.teams:read`, `admin.users:read`, `admin.apps:read`, `admin.barriers:read`, `admin.conversations:read`, `admin.analytics:read` (optional probe), `auditlogs:read`, `users:read`, and `team.preferences:read`. The Admin API and Audit Logs API require an Enterprise Grid plan; an `ok:false` response of `not_allowed_token_type`, `missing_scope`, `not_an_enterprise`, or `feature_not_enabled` is rendered as a manual finding that names the cause, never as an empty or passing result.
 
 Rate limits: the client honors `429` responses by sleeping for the `Retry-After` value (capped at 60 seconds) and retrying twice. Pagination follows `response_metadata.next_cursor` (or the top-level `next_cursor` on `admin.conversations.search`) up to each method's documented `limit` maximum and records truncation when a cap is hit.
 
@@ -23,10 +23,10 @@ Rate limits: the client honors `429` responses by sleeping for the `Retry-After`
 
 | Tool | What it does |
 |------|--------------|
-| `slack_check_access` | Calls `auth.test` and probes 15 surfaces (workspaces, users, admin users, approved and restricted apps, barriers, channels, emoji, Discovery, Audit Logs, SCIM). |
+| `slack_check_access` | Calls `auth.test` and probes 15 surfaces (workspaces, users, admin users, approved and restricted apps, barriers, channels, emoji, team preferences, Audit Logs, SCIM). |
 | `slack_assess_identity` | MFA enrollment (`has_2fa`), guest inventory, SCIM provisioning coverage, lifecycle alignment, deactivated user visibility. |
 | `slack_assess_admin_access` | Admin inventory, SSO coverage (`has_sso`), session duration, idle timeout, discoverability, mobile session controls, email domain restrictions, custom emoji governance, analytics access. |
-| `slack_assess_integrations` | Approved and restricted app inventories, internal and sensitive-scope apps, information barriers, Discovery visibility, file upload restrictions, token rotation. |
+| `slack_assess_integrations` | Approved and restricted app inventories, internal and sensitive-scope apps, information barriers, DLP and Discovery evidence, file upload restrictions (`team.preferences.list`), token rotation. |
 | `slack_assess_channel_governance` | Slack Connect exposure, posting restrictions on general and org default channels, channel retention overrides, external email ingestion, link previews. |
 | `slack_assess_monitoring` | Audit Logs access, recency, security event visibility, schema visibility, external sharing monitoring, SIEM streaming evidence. |
 | `slack_export_audit_bundle` | Runs everything and writes the evidence bundle described below. |
@@ -49,25 +49,25 @@ Empty inventories never pass by default. The only exceptions, stated in the find
 | 3 Session duration limits | admin_access | `SLACK-ADMIN-03` | `admin.users.session.getSettings` durations compared with `max_session_hours`; users in `no_settings_applied` inherit an org default the API does not expose. |
 | 4 Session idle timeout | admin_access | `SLACK-ADMIN-04` | manual: only `duration` and `desktop_app_browser_quit` are documented. |
 | 5 Mobile session controls | admin_access | `SLACK-ADMIN-06` | manual with the same citation; reports `desktop_app_browser_quit` coverage as evidence. |
-| 6 File upload restrictions | integrations | `SLACK-APP-06` | manual: `admin.teams.settings.info` documents no upload fields. |
-| 7 External sharing controls | channel_governance, monitoring | `SLACK-CHAN-01`, `SLACK-MON-05` | Connect exposure from `is_ext_shared` channels; events from the audit log. |
+| 6 File upload restrictions | integrations | `SLACK-APP-06` | `disable_file_uploads` from `team.preferences.list`: `disallow_all` and `type:owner,type:admin` pass, `type:regular` warns (only guests excluded), `allow_all` fails, an undocumented value warns, a missing field or unreadable method is manual. A pass is downgraded to warn when the org has more than one workspace or the workspace inventory is partial, because the method reads only the token's workspace. |
+| 7 External sharing controls | channel_governance, monitoring | `SLACK-CHAN-01`, `SLACK-MON-05` | Connect exposure from `is_ext_shared` channels; `external_shared_channel_*` actions from the audit log (documented action names only). |
 | 8 Information barriers | integrations | `SLACK-APP-04` | pass when barriers exist and the list is complete; empty is warn. |
 | 9 App management policy | integrations | `SLACK-APP-01`, `SLACK-APP-02` | inventories from `approved_apps` and `restricted_apps`; empty is warn. |
 | 10 Custom app restrictions | integrations | `SLACK-APP-03` | warn on `is_internal`, `is_app_directory_approved=false`, or `is_sensitive` scopes. |
-| 11 DLP policy configuration | integrations | `SLACK-APP-05` | manual: Discovery readability is reported, DLP scanning status is partner-side. |
+| 11 DLP policy configuration | integrations | `SLACK-APP-05` | manual: the Discovery API has no public reference page and no `discovery.*` method appears in the methods index (https://docs.slack.dev/reference/methods), so entitlement and DLP scanning status are collected from the DLP partner. |
 | 12 Channel retention policies | channel_governance | `SLACK-CHAN-03` | fail when a channel override is below `min_retention_days`; the workspace default is not API-readable. |
 | 13 Audit log streaming | monitoring | `SLACK-MON-01` to `SLACK-MON-04`, `SLACK-MON-06` | API access and recency are automated; SIEM streaming is manual. |
 | 14 Admin role inventory | admin_access | `SLACK-ADMIN-01` | `admin_ids` per workspace compared with `max_workspace_admins`. |
 | 15 Guest account controls | identity | `SLACK-ID-02` | `is_restricted` or `is_ultra_restricted` users. |
 | 16 Email domain restrictions | admin_access | `SLACK-ADMIN-07` | fail when `team.email_domain` is empty. |
 | 17 Workspace discoverability | admin_access | `SLACK-ADMIN-05` | fail when `discoverability=open` on `admin.teams.list`. |
-| 18 Channel posting restrictions | channel_governance | `SLACK-CHAN-02` | `prefs.who_can_post` on general and org default channels must be admin or owner only. |
+| 18 Channel posting restrictions | channel_governance | `SLACK-CHAN-02` | `prefs.who_can_post.type` on general and org default channels must contain only the documented admin or owner spellings (`admin`, `admins`, `owner`, `owners`), or list explicit users. |
 | 19 Custom emoji restrictions | admin_access | `SLACK-ADMIN-08` | fail when any emoji `uploaded_by` is not an admin or owner. |
 | 20 External email ingestion | channel_governance | `SLACK-CHAN-04` | manual: no documented read. |
 | 21 Link previews and URL unfurling | channel_governance | `SLACK-CHAN-05` | manual: no documented read. |
 | 22 SCIM provisioning status | identity | `SLACK-ID-03` | pass when `/ServiceProviderConfig` is readable and `/Users` returns provisioned users completely. |
 | 23 Deactivated user audit | identity | `SLACK-ID-04`, `SLACK-ID-05` | SCIM-active users deactivated in Slack fail. |
-| 24 Workspace analytics access | admin_access | `SLACK-ADMIN-09` | manual: `admin.analytics.getFile` is a capability probe only. |
+| 24 Workspace analytics access | admin_access | `SLACK-ADMIN-09` | manual: `admin.analytics.getFile` is a capability probe only; a `200` with `Content-type: application/gzip` is a successful probe (the file is never downloaded) and an `ok:false` JSON body is the failure path. |
 | 25 Token rotation and revocation | integrations | `SLACK-APP-07` | manual with `auth.test` identity and token format evidence. |
 
 Coverage: 25 of 25 spec controls are represented; 16 are automated and 9 are manual by design.
@@ -112,13 +112,15 @@ The script prints a skip message and exits 0 when no token is configured; otherw
 | `admin.conversations.getConversationPrefs` (POST, `channel_id`) | https://api.slack.com/methods/admin.conversations.getConversationPrefs | `prefs.who_can_post.type`, `prefs.who_can_post.user` |
 | `admin.conversations.getCustomRetention` (POST, `channel_id`) | https://api.slack.com/methods/admin.conversations.getCustomRetention | `is_policy_enabled`, `duration_days` |
 | `admin.emoji.list` (GET, `limit` max 1000) | https://api.slack.com/methods/admin.emoji.list | `emoji.<name>.uploaded_by`, `date_created` |
-| `admin.analytics.getFile` (GET, `type=public_channel`, `metadata_only=true`) | https://api.slack.com/methods/admin.analytics.getFile | capability probe only |
-| `discovery.enterprise.info` (GET) | https://docs.slack.dev/admins/discovery-api/ | readability only |
+| `admin.analytics.getFile` (GET, `type=public_channel`, `metadata_only=true`) | https://api.slack.com/methods/admin.analytics.getFile | capability probe only: `Content-type` header (`application/gzip` success, `application/json` with `ok:false` failure); the body is not downloaded |
+| `team.preferences.list` (POST, bot or user token, `team.preferences:read`) | https://docs.slack.dev/reference/methods/team.preferences.list | `disable_file_uploads` |
 | Audit Logs `GET /logs` (`limit`, `oldest`) and `GET /schemas` | https://docs.slack.dev/admins/audit-logs-api/ | `entries[].date_create`, `action`, `response_metadata.next_cursor`, `schemas[]` |
+| Audit Logs action names matched by `SLACK-MON-03` and `SLACK-MON-05` | https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference | `user_login`, `user_logout`, `app_installed`, `app_approved`, `app_restricted`, `role_change_to_admin`, `pref.sso_setting_changed`, `pref.two_factor_auth_changed`, `user_deactivated`; `external_shared_channel_connected`, `external_shared_channel_reconnected`, `external_shared_channel_disconnected`, `external_shared_channel_disconnect_and_archived`, `external_shared_channel_invite_created`, `external_shared_channel_invite_accepted`, `external_shared_channel_invite_approved`, `external_shared_channel_invite_declined`, `external_shared_channel_invite_expired`, `external_shared_channel_invite_revoked`, `external_shared_channel_invite_auto_revoked`, `external_shared_channel_access_upgraded` |
 | SCIM `GET /Users` (`startIndex`, `count`), `GET /Groups`, `GET /ServiceProviderConfig` | https://docs.slack.dev/admins/scim-api/ | `totalResults`, `Resources[].userName`, `emails[]`, `active` |
 
 ## Limitations
 
 - The TUI, `--controls`, and SARIF surfaces described in the spec are not part of this CLI pass.
-- Org-level policy toggles (SSO required, session default, Slack Connect permission, retention default, file upload, email ingestion, link previews, analytics roles, emoji upload permission) are not exposed by any documented read method; the corresponding findings report the evidence that is readable and name the manual artifact to collect.
+- Org-level policy toggles (SSO required, session default, Slack Connect permission, retention default, email ingestion, link previews, analytics roles, emoji upload permission) are not exposed by any documented read method; the corresponding findings report the evidence that is readable and name the manual artifact to collect. File upload permission is the exception: `team.preferences.list` documents `disable_file_uploads` for the token's workspace.
+- The Discovery API is not publicly documented (no reference page and no `discovery.*` method in the methods index), so Discovery entitlement and DLP scanning status are never read.
 - `admin.conversations.restrictAccess.listGroups` (IDP group channel restrictions) and guest expiration dates from `admin.users.list only_guests=true` are deferred.

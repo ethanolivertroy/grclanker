@@ -345,19 +345,23 @@ goreleaser release --snapshot
 
 ## 10. Status
 
-Implemented in grclanker (TypeScript) on 2026-09-21. 25 of 25 controls are represented by findings: 16 are automated from documented read methods and 9 are manual by design because no public reference page exposes the setting (controls 4, 5, 6, 11, 13, 20, 21, 24, 25). Verdicts follow eight safety rules: unreadable or forbidden methods render manual with the cause, empty inventories never pass by default, plan or scope gaps render manual naming the plan, undated items are bucketed, partial inventories are flagged with seen and total counts, enabling flags must be read, pagination runs to completion or downgrades the verdict, and export reruns allocate `-2`, `-3` directories.
+Implemented in grclanker (TypeScript) on 2026-09-21. 25 of 25 controls are represented by findings: 17 are automated from documented read methods and 8 are manual by design because no public reference page exposes the setting (controls 4, 5, 11, 13, 20, 21, 24, 25). Control 6 is automated from `team.preferences.list` `disable_file_uploads` (`disallow_all` and `type:owner,type:admin` pass, `type:regular` warns, `allow_all` fails). Verdicts follow eight safety rules: unreadable or forbidden methods render manual with the cause, empty inventories never pass by default, plan or scope gaps render manual naming the plan, undated items are bucketed, partial inventories are flagged with seen and total counts, enabling flags must be read, pagination runs to completion or downgrades the verdict, and export reruns allocate `-2`, `-3` directories.
 
 ### Deviations from this spec
 
 - `admin.teams.settings.info` documents only `id`, `name`, `domain`, `email_domain`, `icon`, `enterprise_id`, `enterprise_name`, and `default_channels`; SSO, session, idle, discoverability, and file settings listed in section 2 are not readable there. Discoverability is read from `admin.teams.list`, SSO coverage from `admin.users.list` `has_sso`, and session duration from `admin.users.session.getSettings`.
 - `admin.teams.admins.list` returns `admin_ids`, and the app inventories return `approved_apps` and `restricted_apps` with nested `app` objects; the implementation follows the documented shapes.
-- `admin.enterprise.info` is not a documented method and is no longer called.
+- `admin.enterprise.info` and `discovery.enterprise.info` are not documented methods and are not called. The Discovery API in sections 2 and 3 has no public reference page (no `discovery.*` method appears in https://docs.slack.dev/reference/methods), so control 11 is manual and the `discovery:read` scope is not requested.
+- Audit Logs action names follow https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference: `pref.sso_setting_changed`, `pref.two_factor_auth_changed`, and the `external_shared_channel_*` family; no other action strings are matched.
+- `admin.analytics.getFile` succeeds with a gzipped newline-delimited JSON file (`Content-type: application/gzip`) rather than an `ok:true` JSON body; the probe treats that header as success without downloading the file and treats `ok:false` JSON as the failure path.
+- `admin.conversations.getConversationPrefs` documents `who_can_post.type` values such as `admins`; the implementation accepts `admin`, `admins`, `owner`, and `owners`.
+- `team.preferences.list` reads the token's workspace only; when the org has more than one workspace or the workspace inventory is partial, a passing control 6 verdict is downgraded to warn.
 - The configuration file is not defined by this spec; the implementation reads `SLACK_CONFIG_FILE` or `~/.config/grclanker/slack.json` with `user_token`, `bot_token`, `scim_token`, and `org_id`.
-- `SLACK_BOT_TOKEN` is accepted for the two methods whose reference pages list bot tokens (`auth.test`, `users.list`).
+- `SLACK_BOT_TOKEN` is accepted for the three methods whose reference pages list bot tokens (`auth.test`, `users.list`, `team.preferences.list`).
 - The Go architecture, TUI, `--controls`, CSV, HTML, and SARIF outputs in sections 7 and 8 are not part of the CLI surface; results are Markdown and JSON in the export bundle.
 
 ### Remaining work
 
 - IDP group channel restrictions via `admin.conversations.restrictAccess.listGroups`.
 - Guest expiration dates via `admin.users.list only_guests=true`.
-- Discovery API DLP content checks (`discovery.conversations.*`), which require a Discovery-approved app.
+- Discovery API DLP content checks (`discovery.conversations.*`) cannot be implemented until Slack publishes a reference page for the Discovery API.
