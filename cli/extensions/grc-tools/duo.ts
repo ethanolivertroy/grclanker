@@ -1113,13 +1113,50 @@ function extractArrayPayload(payload: unknown): JsonRecord[] {
   return [];
 }
 
+/**
+ * Cursor value from metadata.next_offset. Offset endpoints (v1 users, admins, bypass codes,
+ * v3 integrations) document an integer; a numeric string is accepted as the same offset so a
+ * tenant that serialises it differently still pages instead of silently stopping.
+ */
 function nextOffsetValue(metadata: JsonRecord, key: "offset" | "next_offset"): string | number | undefined {
   const raw = metadata.next_offset;
   if (raw === undefined || raw === null) return undefined;
-  if (key === "offset" && typeof raw === "number") return raw;
+  if (key === "offset") {
+    if (typeof raw === "number") return raw;
+    if (typeof raw === "string" && /^\d+$/.test(raw.trim())) return Number.parseInt(raw.trim(), 10);
+    return typeof raw === "string" ? raw : undefined;
+  }
   if (typeof raw === "string" || typeof raw === "number") return raw;
   if (Array.isArray(raw)) return raw.map(String).join(",");
   return undefined;
+}
+
+/** True when metadata.next_offset is present in any shape, even one the pager cannot use. */
+function hasNextOffset(metadata: JsonRecord): boolean {
+  return metadata.next_offset !== undefined && metadata.next_offset !== null;
+}
+
+const REDACTED_VALUE = "[REDACTED]";
+/** Integrations v3 records carry secret_key (masked to its last four characters on list, but credential-shaped). */
+const INTEGRATION_SECRET_FIELDS = /^(secret_key|secretkey|skey)$/i;
+/** Retrieve Bypass Codes documents that the code value is omitted; strip it anyway in case a tenant returns it. */
+const BYPASS_CODE_FIELDS = /^(code|bypass_code)$/i;
+
+/** Replaces every value whose key matches `pattern`, recursing through nested objects and arrays. */
+export function redactFields<T>(value: T, pattern: RegExp): T {
+  if (Array.isArray(value)) return value.map((item) => redactFields(item, pattern)) as T;
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value as JsonRecord).map(([key, entry]) => [key, pattern.test(key) ? REDACTED_VALUE : redactFields(entry, pattern)]),
+  ) as T;
+}
+
+export function redactIntegrationRecords(records: JsonRecord[]): JsonRecord[] {
+  return redactFields(records, INTEGRATION_SECRET_FIELDS);
+}
+
+export function redactBypassCodeRecords(records: JsonRecord[]): JsonRecord[] {
+  return redactFields(records, BYPASS_CODE_FIELDS);
 }
 
 export class DuoAuditorClient {
@@ -1288,9 +1325,9 @@ export class DuoAuditorClient {
     return this.listOffsetPages(DUO_ENDPOINTS.users, {}, OFFSET_PAGE_SIZE);
   }
 
-  /** Admin API reference: Bypass Codes > Retrieve Bypass Codes. */
+  /** Admin API reference: Bypass Codes > Retrieve Bypass Codes. Code values are stripped before the records are kept. */
   async listBypassCodes(): Promise<JsonRecord[]> {
-    return this.listOffsetPages(DUO_ENDPOINTS.bypassCodes, {}, OFFSET_PAGE_SIZE);
+    return redactBypassCodeRecords(await this.listOffsetPages(DUO_ENDPOINTS.bypassCodes, {}, OFFSET_PAGE_SIZE));
   }
 
   /** Admin API reference: WebAuthn Credentials > Retrieve WebAuthn Credentials (limit max 500). */
@@ -1303,9 +1340,9 @@ export class DuoAuditorClient {
     return this.listOffsetPages(DUO_ENDPOINTS.admins, {}, OFFSET_PAGE_SIZE);
   }
 
-  /** Admin API reference: Integrations > Retrieve Integrations (v3, limit max 500). */
+  /** Admin API reference: Integrations > Retrieve Integrations (v3, limit max 500). secret_key is redacted before the records are kept. */
   async listIntegrations(): Promise<JsonRecord[]> {
-    return this.listOffsetPages(DUO_ENDPOINTS.integrations, {}, OFFSET_PAGE_SIZE, 5);
+    return redactIntegrationRecords(await this.listOffsetPages(DUO_ENDPOINTS.integrations, {}, OFFSET_PAGE_SIZE, 5));
   }
 
   /** Admin API reference: Logs > Authentication Logs (v2, mintime and maxtime in milliseconds). */
@@ -1375,10 +1412,12 @@ export class DuoAuditorClient {
         limit: Math.min(TRUST_MONITOR_PAGE_SIZE, Math.max(1, maxRecords - items.length)),
         offset: cursor,
       });
-      items.push(...extractArrayPayload(envelope.response));
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
       const next = nextOffsetValue(extractMetadata(envelope), "next_offset");
       if (next === undefined) break;
-      if (items.length >= maxRecords) {
+      // A cursor that repeats or arrives with an empty page would loop forever; stop and report the walk incomplete.
+      if (items.length >= maxRecords || String(next) === cursor || page.length === 0) {
         complete = false;
         break;
       }
@@ -1407,15 +1446,23 @@ export class DuoAuditorClient {
         { ...params, limit: pageSize, offset },
         signatureVersion ? { signatureVersion } : undefined,
       );
-      items.push(...extractArrayPayload(envelope.response));
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
       const metadata = extractMetadata(envelope);
       totalObjects = asNumber(metadata.total_objects) ?? totalObjects;
       const next = nextOffsetValue(metadata, "offset");
+      const hasNext = hasNextOffset(metadata);
       if (maxRecords && items.length >= maxRecords) {
-        complete = typeof next !== "number" && items.length <= maxRecords;
+        complete = !hasNext && items.length <= maxRecords;
         break;
       }
-      if (typeof next !== "number") break;
+      if (!hasNext) break;
+      // next_offset is present but not an offset this pager can send back, repeats the offset just
+      // fetched, or arrived with an empty page: every one of those would loop or skip records.
+      if (typeof next !== "number" || next <= offset || page.length === 0) {
+        complete = false;
+        break;
+      }
       offset = next;
     }
 
@@ -1442,11 +1489,17 @@ export class DuoAuditorClient {
         sort: "ts:desc",
         next_offset: nextOffset,
       });
-      items.push(...extractArrayPayload(envelope.response));
+      const page = extractArrayPayload(envelope.response);
+      items.push(...page);
       const metadata = extractMetadata(envelope);
       totalObjects = asNumber(metadata.total_objects) ?? totalObjects;
       const next = nextOffsetValue(metadata, "next_offset");
       if (next === undefined) break;
+      // A cursor that repeats or arrives with an empty page would loop forever; stop and report the walk incomplete.
+      if (String(next) === nextOffset || page.length === 0) {
+        complete = false;
+        break;
+      }
       nextOffset = String(next);
       if (items.length >= maxRecords) complete = false;
     }
@@ -1512,18 +1565,24 @@ function daysSince(value: unknown): number | null {
 
 type CollectionStatusLookup = Partial<Pick<DuoAuditorClient, "collectionStatus">>;
 
-function collectionStatusFor(client: CollectionStatusLookup, path: string): DuoCollectionStatus | undefined {
-  return typeof client.collectionStatus === "function" ? client.collectionStatus(path) : undefined;
+/**
+ * undefined: the client does not track paging outcomes at all (duck-typed fixtures).
+ * null: the client tracks them but recorded none for this path, so the walk cannot be presumed complete.
+ */
+function collectionStatusFor(client: CollectionStatusLookup, path: string): DuoCollectionStatus | null | undefined {
+  if (typeof client.collectionStatus !== "function") return undefined;
+  return client.collectionStatus(path) ?? null;
 }
 
 async function collectArrayDataset<T extends JsonRecord>(
   loader: () => Promise<T[]>,
-  statusLookup?: () => DuoCollectionStatus | undefined,
+  statusLookup?: () => DuoCollectionStatus | null | undefined,
 ): Promise<CollectedDataset<T[]>> {
   try {
     const data = await loader();
     const status = statusLookup?.();
-    if (!status) return { data };
+    if (status === undefined) return { data };
+    if (status === null) return { data, total: undefined, complete: false };
     return { data, total: status.totalObjects, complete: status.complete };
   } catch (error) {
     return { data: [], error: error instanceof Error ? error.message : String(error) };
@@ -1854,6 +1913,38 @@ function listErrors(datasets: Array<CollectedDataset<unknown> | undefined>): str
   return datasets
     .map((dataset) => dataset?.error)
     .filter((item): item is string => Boolean(item));
+}
+
+export interface DuoCollectionStatusEntry {
+  readable: boolean;
+  /** Record count for list endpoints; absent for single-object reads. */
+  records?: number;
+  /** metadata.total_objects when the endpoint reported one. */
+  total?: number;
+  /** Paging outcome when the client tracked it; false means the walk stopped early or a page was cut. */
+  complete?: boolean;
+  error?: string;
+}
+
+/**
+ * Collection outcome per dataset for core_data/collection_status.json. The raw records already live
+ * in their own core_data files, so only counts, totals, paging outcome, and the error are kept here.
+ */
+export function projectCollectionStatus(
+  datasets: Record<string, CollectedDataset<unknown> | undefined>,
+): Record<string, DuoCollectionStatusEntry> {
+  return Object.fromEntries(
+    Object.entries(datasets).map(([name, dataset]) => {
+      if (!dataset) return [name, { readable: false, error: "not collected" }];
+      const entry: DuoCollectionStatusEntry = { readable: !dataset.error };
+      if (Array.isArray(dataset.data)) entry.records = dataset.data.length;
+      else if (dataset.data === null || dataset.data === undefined) entry.readable = false;
+      if (dataset.total !== undefined) entry.total = dataset.total;
+      if (dataset.complete !== undefined) entry.complete = dataset.complete;
+      if (dataset.error) entry.error = dataset.error;
+      return [name, entry];
+    }),
+  );
 }
 
 function unavailableEvidence(endpoint: string, permission: string, error: string | undefined, collect: string): string[] {
@@ -2264,13 +2355,20 @@ export function assessDuoAuthentication(
   const verifiedDigits = asNumber(authMethods.verified_push_digits);
   const hasWebAuthn = allowedFactors.some((factor) => factor.includes("webauthn"));
   const allowsPush = allowedFactors.some((factor) => factor.includes("duo-push") || factor.includes("verified_duo_push"));
+  const adminMethods = asRecord(data.allowedAdminAuthMethods.data);
+  const adminMethodsUnreadable = Boolean(data.allowedAdminAuthMethods.error) || Object.keys(adminMethods).length === 0;
   const strongFactorEvidence = [
     hasWebAuthn ? "WebAuthn is allowed in authentication_methods.allowed_auth_list." : undefined,
     allowsPush && requireVerifiedPush ? `Verified Duo Push required (${verifiedDigits ?? 0} digits).` : undefined,
-    data.allowedAdminAuthMethods.data && getBooleanish(data.allowedAdminAuthMethods.data, "webauthn_enabled")
-      ? "Admin auth methods allow WebAuthn."
-      : undefined,
+    !adminMethodsUnreadable && getBooleanish(adminMethods, "webauthn_enabled") ? "Admin auth methods allow WebAuthn." : undefined,
   ].filter((item): item is string => Boolean(item));
+  // Retrieve Allowed Authentication Methods is a supporting read: the verdict rests on the global
+  // policy, so a failed read is named as unread rather than shown as "no WebAuthn for administrators".
+  const adminMethodsEvidence = adminMethodsUnreadable
+    ? `admin_allowed_auth_methods=unread (${DUO_ENDPOINTS.adminAllowedAuthMethods} ${
+        data.allowedAdminAuthMethods.error ? `failed: ${data.allowedAdminAuthMethods.error}` : "returned no usable payload"
+      }; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`
+    : `admin_allowed_auth_methods.webauthn_enabled=${getBooleanish(adminMethods, "webauthn_enabled") ?? false}`;
 
   const userAuthBehavior = asString(asRecord(getPolicySections(globalPolicy).authentication_policy).user_auth_behavior)?.toLowerCase();
   if (policyUnavailable) {
@@ -2341,7 +2439,7 @@ export function assessDuoAuthentication(
         "DUO-AUTH-001",
         "Pass",
         "The global authentication policy includes phishing-resistant factors.",
-        strongFactorEvidence,
+        [...strongFactorEvidence, adminMethodsEvidence],
         "Keep WebAuthn and Verified Duo Push coverage in policy and enrollment guidance.",
       ),
     );
@@ -2351,7 +2449,10 @@ export function assessDuoAuthentication(
         "DUO-AUTH-001",
         "Partial",
         "Duo Push or administrator hardening exists, but phishing-resistant coverage is incomplete or not enforced globally.",
-        strongFactorEvidence.length > 0 ? strongFactorEvidence : ["No explicit WebAuthn or Verified Duo Push requirement found in the global policy."],
+        [
+          ...(strongFactorEvidence.length > 0 ? strongFactorEvidence : ["No explicit WebAuthn or Verified Duo Push requirement found in the global policy."]),
+          adminMethodsEvidence,
+        ],
         "Prefer WebAuthn and Verified Duo Push as the default factors for regulated tenants.",
       ),
     );
@@ -2361,7 +2462,7 @@ export function assessDuoAuthentication(
         "DUO-AUTH-001",
         "Fail",
         "The global policy does not show phishing-resistant factors.",
-        ["No WebAuthn or Verified Duo Push requirement was detected in the collected policy data."],
+        ["No WebAuthn or Verified Duo Push requirement was detected in the collected policy data.", adminMethodsEvidence],
         "Enable WebAuthn or Verified Duo Push in Duo authentication methods before relying on the tenant for higher-assurance workflows.",
       ),
     );
@@ -2600,6 +2701,15 @@ export function assessDuoAuthentication(
   const helpdeskBypass = asString(asRecord(data.settings.data).helpdesk_bypass)?.toLowerCase();
   const helpdeskBypassExpiration = asNumber(asRecord(data.settings.data).helpdesk_bypass_expiration);
   const bypassReview = reviewBypassCodes(data.bypassCodes.data);
+  // Retrieve Settings supplies the help desk issuance limits; when that read failed, the limits are
+  // unread rather than "unknown", and the empty-inventory verdict cannot rise above Partial.
+  const settingsReadError = data.settings.error;
+  const helpdeskEvidence = settingsReadError
+    ? [
+        `helpdesk_bypass=unread (${DUO_ENDPOINTS.settings} failed: ${settingsReadError}; requires ${DUO_PERMISSIONS.settings})`,
+        "helpdesk_bypass_expiration=unread",
+      ]
+    : [`helpdesk_bypass=${helpdeskBypass ?? "unknown"}`, `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`];
   const bypassEvidence = [
     `active_bypass_codes=${bypassCount}`,
     `codes_older_than_24_hours=${bypassReview.stale.length}`,
@@ -2607,8 +2717,7 @@ export function assessDuoAuthentication(
     `codes_without_expiration=${bypassReview.neverExpire}`,
     `codes_undated=${bypassReview.undated}`,
     `codes_expired=${bypassReview.expired}`,
-    `helpdesk_bypass=${helpdeskBypass ?? "unknown"}`,
-    `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`,
+    ...helpdeskEvidence,
     ...bypassReview.stale.slice(0, 5).map((code) =>
       `stale_bypass_code=${code.id} user=${code.user} created=${code.created} age_hours=${code.ageHours}`,
     ),
@@ -2638,10 +2747,14 @@ export function assessDuoAuthentication(
       withInventoryCap(
         buildFinding(
           "DUO-AUTH-006",
-          "Pass",
-          "No active bypass codes were returned.",
-          ["Global bypass code inventory is empty, which is compliant by intent: no outstanding break-glass codes."],
-          "Keep break-glass issuance exceptional and time-bounded.",
+          settingsReadError ? "Partial" : "Pass",
+          settingsReadError
+            ? `No active bypass codes were returned, but help desk issuance limits could not be read from ${DUO_ENDPOINTS.settings} (${settingsReadError}), so the zero-code inventory is capped at Partial.`
+            : "No active bypass codes were returned.",
+          ["Global bypass code inventory is empty, which is compliant by intent: no outstanding break-glass codes.", ...helpdeskEvidence],
+          settingsReadError
+            ? `Grant the audit principal ${DUO_PERMISSIONS.settings} so helpdesk_bypass and helpdesk_bypass_expiration can be verified alongside the empty inventory.`
+            : "Keep break-glass issuance exceptional and time-bounded.",
         ),
         data.bypassCodes,
       ),
@@ -4066,7 +4179,8 @@ function buildQuickReference(): string {
   return [
     "# Duo Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Duo Admin API responses used during this assessment.",
+    "- `core_data/` contains the Duo Admin API responses used during this assessment; integration secret_key values and bypass code values are redacted at collection time.",
+    "- `core_data/collection_status.json` records per-endpoint readability, record counts, total_objects, paging completeness, and the collection error, without repeating the records.",
     "- `analysis/` contains normalized findings and category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -4269,10 +4383,10 @@ export async function exportDuoAuditBundle(
     await writeJson(outputDir, path, value);
   }
   await writeJson(outputDir, "core_data/collection_status.json", {
-    authentication,
-    admin_access: adminAccess,
-    integrations,
-    monitoring,
+    authentication: projectCollectionStatus({ ...authentication }),
+    admin_access: projectCollectionStatus({ ...adminAccess }),
+    integrations: projectCollectionStatus({ ...integrations }),
+    monitoring: projectCollectionStatus({ ...monitoring }),
   });
 
   for (const assessment of assessments) {
