@@ -2214,8 +2214,254 @@ test("verdict safety rule 7: the client records truncation when it stops before 
   assert.equal(users.items.length, 2);
   assert.equal(users.complete, false);
   assert.equal(users.totalCount, 10);
-  assert.match(users.note, /stopped after 2 items with more pages available/);
+  assert.match(users.note, /stopped after 2 of 10 items with more pages available \(2 item limit\)/);
   assert.equal(calls, 2);
+});
+
+function nestedData(path, leaf) {
+  let value = leaf;
+  for (let index = path.length - 1; index >= 0; index -= 1) {
+    const segment = path[index];
+    value = typeof segment === "number" ? [value] : { [segment]: value };
+  }
+  return value;
+}
+
+function setNested(target, path, value) {
+  let current = target;
+  for (const segment of path.slice(0, -1)) current = current[segment];
+  current[path[path.length - 1]] = value;
+}
+
+const CURSOR_SURFACES = [
+  {
+    name: "userManagement.users",
+    call: (client) => client.listDomainUsers("domain-1"),
+    path: ["actor", "organization", "userManagement", "authenticationDomains", "authenticationDomains", 0, "users"],
+    itemsKey: "users",
+    item: (n) => ({ id: `user-${n}`, email: `user-${n}@example.com` }),
+  },
+  {
+    name: "authorizationManagement.groups",
+    call: (client) => client.listDomainGroupGrants("domain-1"),
+    path: ["actor", "organization", "authorizationManagement", "authenticationDomains", "authenticationDomains", 0, "groups"],
+    itemsKey: "groups",
+    item: (n) => ({ id: `group-${n}`, displayName: `Group ${n}`, roles: { roles: [] } }),
+  },
+  {
+    name: "apiAccess.keySearch",
+    call: (client) => client.listApiKeys(["USER", "INGEST"]),
+    path: ["actor", "apiAccess", "keySearch"],
+    itemsKey: "keys",
+    totalKey: "count",
+    item: (n) => ({ id: `key-${n}`, name: `key-${n}`, type: "USER", userId: n, accountId: 111 }),
+  },
+  {
+    name: "entitySearch",
+    call: (client) => client.searchEntities("type = 'DASHBOARD'"),
+    path: ["actor", "entitySearch", "results"],
+    itemsKey: "entities",
+    totalPath: ["actor", "entitySearch", "count"],
+    item: (n) => ({ guid: `entity-${n}`, name: `entity-${n}` }),
+  },
+  {
+    name: "alerts.policiesSearch",
+    call: (client) => client.listAlertPolicies(111),
+    path: ["actor", "account", "alerts", "policiesSearch"],
+    itemsKey: "policies",
+    item: (n) => ({ id: `policy-${n}`, name: `Policy ${n}` }),
+  },
+  {
+    name: "alerts.nrqlConditionsSearch",
+    call: (client) => client.listNrqlConditions(111),
+    path: ["actor", "account", "alerts", "nrqlConditionsSearch"],
+    itemsKey: "nrqlConditions",
+    item: (n) => ({ id: `cond-${n}`, name: `Condition ${n}`, enabled: true, policyId: "policy-1" }),
+  },
+  {
+    name: "aiNotifications.destinations",
+    call: (client) => client.listNotificationDestinations(111),
+    path: ["actor", "account", "aiNotifications", "destinations"],
+    itemsKey: "entities",
+    item: (n) => ({ id: `dest-${n}`, name: `Destination ${n}`, type: "EMAIL", properties: [] }),
+  },
+  {
+    name: "aiNotifications.channels",
+    call: (client) => client.listNotificationChannels(111),
+    path: ["actor", "account", "aiNotifications", "channels"],
+    itemsKey: "entities",
+    item: (n) => ({ id: `chan-${n}`, name: `Channel ${n}`, type: "EMAIL", destinationId: `dest-${n}` }),
+  },
+  {
+    name: "aiWorkflows.workflows",
+    call: (client) => client.listWorkflows(111),
+    path: ["actor", "account", "aiWorkflows", "workflows"],
+    itemsKey: "entities",
+    item: (n) => ({ id: `wf-${n}`, name: `Workflow ${n}`, workflowEnabled: true }),
+  },
+  {
+    name: "customerAdministration.authenticationDomains",
+    call: (client) => client.listOrganizationAuthenticationDomains("org-1"),
+    path: ["customerAdministration", "authenticationDomains"],
+    itemsKey: "items",
+    item: (n) => ({ id: `domain-${n}`, name: `Domain ${n}` }),
+  },
+  {
+    name: "customerAdministration.roles",
+    call: (client) => client.listRoles("org-1"),
+    path: ["customerAdministration", "roles"],
+    itemsKey: "items",
+    item: (n) => ({ id: `role-${n}`, name: `Role ${n}`, scope: "account", type: "STANDARD" }),
+  },
+];
+
+function cursorSurfaceClient(surface, pages) {
+  let calls = 0;
+  const fetchImpl = async () => {
+    const page = pages[Math.min(calls, pages.length - 1)];
+    calls += 1;
+    const pageObject = { nextCursor: page.nextCursor ?? null, [surface.itemsKey]: page.items };
+    if (surface.totalPath === undefined) pageObject[surface.totalKey ?? "totalCount"] = page.total;
+    const data = nestedData(surface.path, pageObject);
+    if (surface.totalPath !== undefined) setNested(data, surface.totalPath, page.total);
+    return jsonResponse({ data });
+  };
+  return { client: new NewrelicApiClient(sampleConfig(), { fetchImpl }), calls: () => calls };
+}
+
+test("verdict safety rule 10: a cursor that stops advancing is reported as truncated on every paginated surface", async () => {
+  for (const surface of CURSOR_SURFACES) {
+    const { client, calls } = cursorSurfaceClient(surface, [
+      { items: [surface.item(1), surface.item(2)], nextCursor: "page-2", total: 10 },
+      { items: [surface.item(3), surface.item(4)], nextCursor: "page-2", total: 10 },
+    ]);
+    const result = await surface.call(client);
+    assert.equal(calls(), 2, `${surface.name}: the walk must stop once the cursor repeats`);
+    assert.equal(result.items.length, 4, surface.name);
+    assert.equal(result.complete, false, `${surface.name} reported complete on a stalled cursor`);
+    assert.equal(result.totalCount, 10, surface.name);
+    assert.match(result.note, /stopped after 4 of 10 items because the next cursor did not advance/, surface.name);
+  }
+});
+
+test("verdict safety rule 10: an empty page beside a next cursor is reported as truncated on every paginated surface", async () => {
+  for (const surface of CURSOR_SURFACES) {
+    const { client, calls } = cursorSurfaceClient(surface, [
+      { items: [surface.item(1), surface.item(2)], nextCursor: "page-2", total: 10 },
+      { items: [], nextCursor: "page-3", total: 10 },
+    ]);
+    const result = await surface.call(client);
+    assert.equal(calls(), 2, surface.name);
+    assert.equal(result.items.length, 2, surface.name);
+    assert.equal(result.complete, false, `${surface.name} reported complete on an empty page with a next cursor`);
+    assert.match(result.note, /stopped after 2 of 10 items because a page returned no items while a next cursor was reported/, surface.name);
+  }
+});
+
+test("verdict safety rule 10: a listing that ends short of its reported total is truncated on every paginated surface", async () => {
+  for (const surface of CURSOR_SURFACES) {
+    const { client, calls } = cursorSurfaceClient(surface, [{ items: [surface.item(1)], nextCursor: null, total: 40 }]);
+    const result = await surface.call(client);
+    assert.equal(calls(), 1, surface.name);
+    assert.equal(result.items.length, 1, surface.name);
+    assert.equal(result.complete, false, `${surface.name} reported complete with 1 of 40 items`);
+    assert.equal(result.totalCount, 40, surface.name);
+    assert.match(result.note, /1 of 40 items seen before the listing ended without a next cursor/, surface.name);
+
+    const consistent = cursorSurfaceClient(surface, [{ items: [surface.item(1)], nextCursor: null, total: 1 }]);
+    const complete = await surface.call(consistent.client);
+    assert.equal(complete.complete, true, `${surface.name} must stay complete when the total matches`);
+    assert.equal(complete.note, undefined, surface.name);
+  }
+});
+
+test("verdict safety rule 10: a page larger than the item limit is truncated even without a next cursor", async () => {
+  const fetchImpl = async () => jsonResponse({
+    data: nestedData(["actor", "account", "alerts", "policiesSearch"], {
+      nextCursor: null,
+      totalCount: 3,
+      policies: [{ id: "policy-1", name: "A" }, { id: "policy-2", name: "B" }, { id: "policy-3", name: "C" }],
+    }),
+  });
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+
+  const policies = await client.listAlertPolicies(111, 2);
+
+  assert.equal(policies.items.length, 2);
+  assert.equal(policies.complete, false);
+  assert.match(policies.note, /stopped after 2 of 3 items with more pages available \(2 item limit\)/);
+
+  const restFetch = async () => jsonResponse({ users: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  const restClient = new NewrelicApiClient(sampleConfig(), { fetchImpl: restFetch });
+  const restUsers = await restClient.listRestUsers(2);
+  assert.equal(restUsers.items.length, 2);
+  assert.equal(restUsers.complete, false);
+  assert.match(restUsers.note, /stopped after 2 items at the 2 item limit with more items available/);
+});
+
+test("verdict safety rule 10: destinations behind a repeating cursor limit control 10 to warn", async () => {
+  const destination = (n) => ({ id: `dest-${n}`, name: `Ops ${n}`, type: "EMAIL", properties: [{ key: "email", value: "ops@example.com" }] });
+  const destinationsClient = (pages) => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      const page = pages[Math.min(calls, pages.length - 1)];
+      calls += 1;
+      return jsonResponse({
+        data: nestedData(["actor", "account", "aiNotifications", "destinations"], {
+          nextCursor: page.nextCursor,
+          totalCount: page.total,
+          entities: page.items,
+          error: null,
+        }),
+      });
+    };
+    return new NewrelicApiClient(sampleConfig({ accountIds: [111] }), { fetchImpl });
+  };
+
+  const consistent = destinationsClient([
+    { items: [destination(1), destination(2)], nextCursor: "page-2", total: 4 },
+    { items: [destination(3), destination(4)], nextCursor: null, total: 4 },
+  ]);
+  const baseline = await assessNewrelicAlerting(alertingClient({
+    listNotificationDestinations: (accountId) => consistent.listNotificationDestinations(accountId),
+  }));
+  assert.equal(findingStatus(baseline, "NR-10-ALERT-NOTIFICATION-CHANNELS"), "pass");
+
+  const stalled = destinationsClient([
+    { items: [destination(1), destination(2)], nextCursor: "page-2", total: 10 },
+    { items: [destination(3), destination(4)], nextCursor: "page-2", total: 10 },
+  ]);
+  const result = await assessNewrelicAlerting(alertingClient({
+    listNotificationDestinations: (accountId) => stalled.listNotificationDestinations(accountId),
+  }));
+  const channels = findingById(result, "NR-10-ALERT-NOTIFICATION-CHANNELS");
+  assert.equal(channels.status, "warn");
+  assert.match(channels.summary, /Partial view: destinations: 4 of 10 seen before pagination stopped/);
+  assert.match(channels.summary, /account 111: stopped after 4 of 10 items because the next cursor did not advance/);
+  assert.equal(result.summary.destinations, 4);
+});
+
+test("verdict safety rule 10: policiesSearch returning fewer policies than its total limits control 9 to warn", async () => {
+  const policiesClient = (total) => new NewrelicApiClient(sampleConfig({ accountIds: [111] }), {
+    fetchImpl: async () => jsonResponse({
+      data: nestedData(["actor", "account", "alerts", "policiesSearch"], {
+        nextCursor: null,
+        totalCount: total,
+        policies: [{ id: "policy-1", name: "Production", incidentPreference: "PER_CONDITION_AND_TARGET" }],
+      }),
+    }),
+  });
+
+  const consistent = policiesClient(1);
+  const baseline = await assessNewrelicAlerting(alertingClient({ listAlertPolicies: (accountId) => consistent.listAlertPolicies(accountId) }));
+  assert.equal(findingStatus(baseline, "NR-09-ALERT-POLICY-COVERAGE"), "pass");
+
+  const short = policiesClient(40);
+  const result = await assessNewrelicAlerting(alertingClient({ listAlertPolicies: (accountId) => short.listAlertPolicies(accountId) }));
+  const coverage = findingById(result, "NR-09-ALERT-POLICY-COVERAGE");
+  assert.equal(coverage.status, "warn");
+  assert.match(coverage.summary, /Partial view: alert policies: 1 of 40 seen before pagination stopped/);
+  assert.match(coverage.summary, /1 of 40 items seen before the listing ended without a next cursor/);
 });
 
 test("verdict safety rule 7: a truncated user or entity population downgrades passing verdicts to warn", async () => {

@@ -217,6 +217,57 @@ export interface PagedList<T = JsonRecord> {
   failures?: string[];
 }
 
+/**
+ * Why a cursor walk stopped. Only `exhausted` (no next cursor and every reported item seen) may yield a complete
+ * listing; every other exit is a cap or an anomaly and is reported as truncated so no verdict can pass on it.
+ */
+type PaginationStop =
+  | { kind: "exhausted" }
+  | { kind: "cursor_stalled" }
+  | { kind: "empty_page" }
+  | { kind: "limit"; limit: number }
+  | { kind: "page_cap"; pages: number };
+
+function describePagination(seen: number, totalCount: number | undefined, stop: PaginationStop): Pick<PagedList, "complete" | "note"> {
+  const progress = `${seen}${totalCount !== undefined ? ` of ${totalCount}` : ""} items`;
+  switch (stop.kind) {
+    case "exhausted":
+      if (totalCount !== undefined && seen < totalCount) {
+        return { complete: false, note: `${progress} seen before the listing ended without a next cursor` };
+      }
+      return { complete: true };
+    case "cursor_stalled":
+      return { complete: false, note: `stopped after ${progress} because the next cursor did not advance` };
+    case "empty_page":
+      return { complete: false, note: `stopped after ${progress} because a page returned no items while a next cursor was reported` };
+    case "limit":
+      return { complete: false, note: `stopped after ${progress} with more pages available (${stop.limit} item limit)` };
+    case "page_cap":
+      return { complete: false, note: `stopped after ${progress} with more pages available (${stop.pages} page maximum)` };
+    default: {
+      const unhandled: never = stop;
+      throw new Error(`Unhandled pagination stop ${String(unhandled)}`);
+    }
+  }
+}
+
+/** Classifies a page result; `undefined` means the walk continues with `nextCursor`. */
+function paginationStopAfterPage(
+  pageItemCount: number,
+  keptCount: number,
+  seen: number,
+  limit: number,
+  cursor: string | undefined,
+  nextCursor: string | undefined,
+): PaginationStop | undefined {
+  if (keptCount < pageItemCount) return { kind: "limit", limit };
+  if (!nextCursor) return { kind: "exhausted" };
+  if (nextCursor === cursor) return { kind: "cursor_stalled" };
+  if (pageItemCount === 0) return { kind: "empty_page" };
+  if (seen >= limit) return { kind: "limit", limit };
+  return undefined;
+}
+
 export interface Collected<T> {
   data: T;
   error?: string;
@@ -1209,33 +1260,25 @@ export class NewrelicApiClient {
     totalPath?: Array<string | number>,
   ): Promise<PagedList> {
     const items: JsonRecord[] = [];
+    const pageLabel = pagePath.filter((segment) => typeof segment === "string").join(".");
     let cursor: string | undefined;
     let totalCount: number | undefined;
-    let remaining = true;
-    for (let page = 0; page < MAX_PAGES; page += 1) {
+    let stop: PaginationStop | undefined;
+    for (let page = 0; page < MAX_PAGES && !stop; page += 1) {
       const data = await this.nerdgraph(query, cursor ? { ...variables, cursor } : variables);
       const pageObject = asObject(getNestedValue(data, pagePath));
-      const pageLabel = pagePath.filter((segment) => typeof segment === "string").join(".");
       if (!pageObject) throw new Error(`NerdGraph response did not include ${pageLabel}.`);
       const pageError = notificationPageError(pageObject);
       if (pageError) throw new Error(`${pageLabel} returned an error: ${pageError}`);
       const pageItems = asRecords(pageObject[itemsKey]);
       totalCount = asNumber(totalPath ? getNestedValue(data, totalPath) : pageObject.totalCount ?? pageObject.count) ?? totalCount;
-      items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
+      const kept = pageItems.slice(0, Math.max(0, limit - items.length));
+      items.push(...kept);
       const nextCursor = asString(pageObject.nextCursor);
-      if (!nextCursor || nextCursor === cursor || pageItems.length === 0) {
-        remaining = false;
-        break;
-      }
-      if (items.length >= limit) break;
+      stop = paginationStopAfterPage(pageItems.length, kept.length, items.length, limit, cursor, nextCursor);
       cursor = nextCursor;
     }
-    return {
-      items,
-      complete: !remaining,
-      totalCount,
-      note: remaining ? `stopped after ${items.length} items with more pages available` : undefined,
-    };
+    return { items, totalCount, ...describePagination(items.length, totalCount, stop ?? { kind: "page_cap", pages: MAX_PAGES }) };
   }
 
   private buildRestUrl(pathOrUrl: string, query: JsonRecord = {}): string {
@@ -1279,11 +1322,17 @@ export class NewrelicApiClient {
   async restList(path: string, collectionKey: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     const items: JsonRecord[] = [];
     let url: string | undefined = path;
+    let limitReached = false;
     for (let page = 0; url && page < MAX_PAGES && items.length < limit; page += 1) {
       const { payload, nextUrl } = await this.restGet(url);
       const pageItems = asRecords(payload[collectionKey]);
-      items.push(...pageItems.slice(0, limit - items.length));
+      const kept = pageItems.slice(0, Math.max(0, limit - items.length));
+      items.push(...kept);
+      if (kept.length < pageItems.length) limitReached = true;
       url = nextUrl;
+    }
+    if (limitReached) {
+      return { items, complete: false, note: `stopped after ${items.length} items at the ${limit} item limit with more items available` };
     }
     return {
       items,
@@ -1349,7 +1398,8 @@ export class NewrelicApiClient {
     const items: JsonRecord[] = [];
     let cursor: string | undefined;
     let totalCount: number | undefined;
-    for (let page = 0; page < MAX_PAGES; page += 1) {
+    let stop: PaginationStop | undefined;
+    for (let page = 0; page < MAX_PAGES && !stop; page += 1) {
       const cursorArgument = cursor ? `, cursor: ${JSON.stringify(cursor)}` : "";
       const query = `{ customerAdministration { ${collection}(filter: { organizationId: { eq: ${JSON.stringify(organizationId)} } }${cursorArgument}) { items { ${itemFields} } ${collectionFields} } } }`;
       let data: JsonRecord;
@@ -1370,13 +1420,13 @@ export class NewrelicApiClient {
       if (!result) throw new Error(`NerdGraph response did not include customerAdministration.${collection}.`);
       const pageItems = asRecords(result.items);
       totalCount = asNumber(result.totalCount) ?? totalCount;
-      items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
+      const kept = pageItems.slice(0, Math.max(0, limit - items.length));
+      items.push(...kept);
       const nextCursor = asString(result.nextCursor);
-      if (!nextCursor || nextCursor === cursor || pageItems.length === 0) return { items, complete: true, totalCount };
-      if (items.length >= limit) break;
+      stop = paginationStopAfterPage(pageItems.length, kept.length, items.length, limit, cursor, nextCursor);
       cursor = nextCursor;
     }
-    return { items, complete: false, totalCount, note: `stopped after ${items.length} items with more pages available` };
+    return { items, totalCount, ...describePagination(items.length, totalCount, stop ?? { kind: "page_cap", pages: MAX_PAGES }) };
   }
 
   async listOrganizationAuthenticationDomains(organizationId: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
@@ -1535,10 +1585,11 @@ export class NewrelicApiClient {
     const data = await this.nerdgraph(QUERY_WORKFLOWS_SINGLE_PAGE, { accountId });
     const page = asObject(getNestedValue(data, pagePath));
     if (!page) throw new Error("NerdGraph response did not include actor.account.aiWorkflows.workflows.");
-    const items = asRecords(page.entities).slice(0, limit);
+    const entities = asRecords(page.entities);
+    const items = entities.slice(0, limit);
     const totalCount = asNumber(page.totalCount);
     const nextCursor = asString(page.nextCursor);
-    const complete = !nextCursor && (totalCount === undefined || items.length >= totalCount);
+    const complete = !nextCursor && items.length === entities.length && (totalCount === undefined || items.length >= totalCount);
     return {
       items,
       complete,
