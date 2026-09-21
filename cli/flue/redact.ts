@@ -10,8 +10,12 @@
 export const REDACTED_VALUE = "[redacted]";
 
 // Matched against each argument name, case-insensitively, at any depth. The
-// Duo integration and secret keys (`ikey`, `skey`) are listed by name.
-const SENSITIVE_KEY_PATTERN = /token|secret|pass(?:word|wd|phrase)|private_?key|api_?key|credential|authorization|assertion|^[is]key$/i;
+// Duo integration and secret keys (`ikey`, `skey`) are listed by name. Access
+// keys cover Tenable and Sumo Logic `access_key`, Tenable `sc_access_key`, and
+// Prisma Cloud `prisma_access_key_id`; `app_key` is the Datadog application
+// key and `consumer_key` the Salesforce connected app key.
+const SENSITIVE_KEY_PATTERN =
+  /token|secret|pass(?:word|wd|phrase)|private_?key|api_?key|app_?key|access_?key|consumer_?key|credential|authorization|assertion|^[is]key$/i;
 
 // Pi's `validateToolArguments` appends the raw payload after this marker.
 const ECHOED_ARGUMENTS_MARKER = "Received arguments:";

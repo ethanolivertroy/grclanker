@@ -903,8 +903,9 @@ test("credential-bearing tool arguments are redacted before serialization, at an
   };
   for (const parameters of collectToolParameterSchemas().values()) walk(parameters);
   const credentialKeys = [
-    "access_token", "api_key", "api_token", "app_private_key", "client_assertion", "client_secret", "credentials_json",
-    "graph_token", "ikey", "management_token", "private_key", "scim_token", "skey", "token",
+    "access_key", "access_token", "api_key", "api_token", "app_key", "app_private_key", "client_assertion", "client_secret",
+    "consumer_key", "credentials_json", "graph_token", "ikey", "management_token", "prisma_access_key_id", "private_key",
+    "sc_access_key", "scim_token", "skey", "token",
   ];
   for (const key of credentialKeys) {
     assert.ok(declaredKeys.has(key), `${key} is still a declared tool parameter`);
@@ -918,11 +919,34 @@ test("credential-bearing tool arguments are redacted before serialization, at an
   // redacted by the pattern or be listed here as reviewed and known to be safe to print.
   const looselySensitive = /secret|key|token|pass|auth|cert|cookie|session|credential|assertion|jwt|pin\b|otp|dsn/i;
   const reviewedSafeKeys = new Set([
+    "auth_method", // selects an authentication strategy (Box, ServiceNow), not a credential
     "auth_mode", // selects an authentication strategy, not a credential
+    "authority_host", // Azure AD authority endpoint
+    "cert_expiry_warn_days", // duration threshold
+    "cert_expiry_warning_days", // duration threshold
     "cert_number", // CMVP certificate number, public
+    "certificate_expiry_warning_days", // duration threshold
+    "certificate_warning_days", // duration threshold
+    "integration_keys", // LaunchDarkly integration catalog identifiers (datadog, splunk, ...), public
+    "jwt_config_path", // filesystem path to the Box JWT config; the file holds the credential, the path does not
+    "key_inactive_days", // duration threshold
+    "key_limit", // count threshold
+    "key_max_age_days", // duration threshold
+    "key_rotation_days", // duration threshold
+    "key_unused_days", // duration threshold
+    "max_concurrent_sessions", // count threshold
+    "max_enrollment_keys_per_policy", // count threshold
     "max_keys", // count threshold
     "max_session_hours", // duration threshold
+    "max_session_idle_minutes", // duration threshold
+    "max_session_minutes", // duration threshold
+    "max_session_timeout_minutes", // duration threshold
+    "min_compliance_pass_rate", // percentage threshold
+    "min_posture_pass_rate", // ratio threshold
     "oauth_base_url", // endpoint
+    "project_keys", // LaunchDarkly project identifiers, not credentials
+    "sdk_key_max_age_days", // duration threshold
+    "session_timeout_minutes", // duration threshold
   ]);
   const unclassified = [...declaredKeys].filter(
     (key) => looselySensitive.test(key) && !isSensitiveArgumentKey(key) && !reviewedSafeKeys.has(key),
