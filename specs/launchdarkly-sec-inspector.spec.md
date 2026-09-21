@@ -3,14 +3,14 @@ slug: "launchdarkly-sec-inspector"
 name: "LaunchDarkly Security Inspector"
 vendor: "LaunchDarkly"
 category: "devops-developer-platforms"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/launchdarkly-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# LaunchDarkly Security Inspector — Architecture Specification
+# LaunchDarkly Security Inspector: Architecture Specification
 
 ## 1. Overview
 
@@ -140,12 +140,12 @@ The tool never writes, modifies, or stores tokens beyond the current session. To
 
 | Tool | Type | Overlap | Gap Addressed |
 |------|------|---------|---------------|
-| LaunchDarkly Audit Log (built-in) | Native | Partial — logs actions but does not evaluate posture | No automated compliance assessment or drift detection |
-| LaunchDarkly Accelerate | Native | Metrics-focused (DORA) — no security posture analysis | No security control evaluation |
-| ld-find-code-refs | CLI | Finds flag references in code — no API security audit | No account-level security inspection |
-| Steampipe LaunchDarkly plugin | SQL query engine | Queries LD resources via SQL — general purpose | No built-in security benchmarks or compliance mappings |
-| Prowler | Cloud security | AWS/Azure/GCP focused — no SaaS feature flag coverage | No LaunchDarkly-specific controls |
-| ScoutSuite | Cloud security | Multi-cloud auditor — no SaaS platform support | No feature flag platform coverage |
+| LaunchDarkly Audit Log (built-in) | Native | Partial: logs actions but does not evaluate posture | No automated compliance assessment or drift detection |
+| LaunchDarkly Accelerate | Native | Metrics-focused (DORA), no security posture analysis | No security control evaluation |
+| ld-find-code-refs | CLI | Finds flag references in code, no API security audit | No account-level security inspection |
+| Steampipe LaunchDarkly plugin | SQL query engine | Queries LD resources via SQL, general purpose | No built-in security benchmarks or compliance mappings |
+| Prowler | Cloud security | AWS/Azure/GCP focused, no SaaS feature flag coverage | No LaunchDarkly-specific controls |
+| ScoutSuite | Cloud security | Multi-cloud auditor, no SaaS platform support | No feature flag platform coverage |
 
 ## 7. Architecture
 
@@ -207,6 +207,22 @@ launchdarkly-sec-inspector/
 | `github.com/pelletier/go-toml/v2` | Configuration parsing |
 | `net/http` (stdlib) | HTTP client for API calls |
 | `encoding/json` (stdlib) | JSON serialization/deserialization |
+
+### grclanker implementation
+
+The shipped implementation lives in the grclanker CLI as a native TypeScript tool family (`cli/extensions/grc-tools/launchdarkly.ts`) rather than the standalone Go CLI/TUI sketched above. It registers seven read-only tools:
+
+| Tool | Spec controls |
+|------|---------------|
+| `launchdarkly_check_access` | Probes caller identity and every required read surface before an assessment |
+| `launchdarkly_assess_identity` | 1, 2, 3, 6, 7, 24 |
+| `launchdarkly_assess_access_control` | 4, 5, 8, 9, 10, 11 |
+| `launchdarkly_assess_environment_governance` | 16, 17, 19, 22, 23 |
+| `launchdarkly_assess_flag_hygiene` | 14, 15, 25 |
+| `launchdarkly_assess_monitoring_integrations` | 12, 13, 18, 20, 21 |
+| `launchdarkly_export_audit_bundle` | All 25, written as `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and a zip |
+
+Findings are `{ id, control, title, severity, status, summary, evidence, mappings, frameworks }` with ids `LD-01` through `LD-25` and the framework references from section 5. Tests live in `cli/tests/launchdarkly.test.mjs`, the live smoke script is `npm --prefix cli run test:launchdarkly:live`, and the operator guide is `src/content/docs/docs/integrations/launchdarkly.md`.
 
 ## 8. CLI Interface
 
@@ -282,4 +298,30 @@ goreleaser release --clean
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker on 2026-09-21 as the native TypeScript tool family described in the "grclanker implementation" subsection. All 25 controls in section 4 produce a finding. Control 1 is always `manual` because the API does not expose the account SSO setting; the other 24 are evaluated from API evidence. Controls 18, 19, 20, and 24 fall back to `manual`, stating the evidence a reviewer must collect, when the account has no Relay Proxy automatic configurations, the beta SDK keys endpoint is unavailable, no integration subscriptions exist for the probed integration keys, or no approved email domain policy is supplied.
+
+### Shipped
+
+- Configuration precedence exactly as section 3 (tool argument, `LAUNCHDARKLY_API_TOKEN`, `~/.config/launchdarkly-sec-inspector/config.toml`), plus `LAUNCHDARKLY_BASE_URL`, `LAUNCHDARKLY_API_VERSION`, `LAUNCHDARKLY_TIMEOUT`, `LAUNCHDARKLY_ALLOWED_DOMAINS`, `LAUNCHDARKLY_PROJECTS`, and `LAUNCHDARKLY_CONFIG`, with `LD_ACCESS_TOKEN` and `LD_BASE_URI` accepted as fallbacks. The TOML file is parsed with a dependency-free reader (key/value pairs, arrays, sections, comments).
+- API client with `Authorization: {token}`, `LD-API-Version` (`20240415` default, `beta` for SDK keys), `limit`/`offset` plus `_links.next` pagination, `429` retry driven by `X-Ratelimit-Reset` / `X-Ratelimit-Auth-Token-Reset` / `Retry-After`, exponential `5xx` retry, per-request timeouts, and token redaction in every error.
+- Read-only assessments, executive summary, unified compliance matrix, and one report per framework in section 5 (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, ISMAP).
+- Secret masking for SDK keys, mobile keys, Relay Proxy keys, webhook secrets, and integration credentials before any snapshot is written.
+
+### Deviations from this spec (official documentation wins)
+
+- Language and shape: TypeScript tools inside grclanker instead of a Go CLI/TUI; output is the audit bundle (JSON, Markdown, zip) rather than CSV/HTML/TUI reporters.
+- `/api/v2/account` (section 2, controls 1 and 2) does not exist. The REST API exposes no account SSO or Require MFA setting, so control 1 is `manual` and control 2 uses the per-member `mfa` and `mfaEnforced` fields from `/api/v2/members`.
+- `/api/v2/projects/{projectKey}/flags` (controls 14, 15, 25) does not exist. Flags are read from `/api/v2/flags/{projectKey}` with the `env` filter, and evaluation recency from `/api/v2/flag-statuses/{projectKey}/{environmentKey}`.
+- `/api/v2/relay-proxy-configs` (control 18) is actually `/api/v2/account/relay-auto-configs`.
+- `/api/v2/integrations` (control 20) has no list-all form. `/api/v2/integrations/{integrationKey}` returns audit log subscriptions for one integration, so the inspector probes a configurable list of integration keys.
+- SDK key age (control 19) is not available from `/api/v2/projects/{projectKey}/environments`, which returns only the current `apiKey`. The inspector uses the beta `/api/v2/projects/{projectKey}/environments/{environmentKey}/sdk-keys` endpoint with `LD-API-Version: beta` and reports `manual` when it is unavailable.
+- `/api/v2/tokens` returns only the caller's tokens unless `showAll=true` is passed by an Admin or Owner token (controls 8 through 11).
+- Rate limits are not a fixed 10 requests/second with a burst of 30. LaunchDarkly documents global, route-level, access token, and IP-based limits over ten-second windows with `X-Ratelimit-*-Remaining` and epoch-millisecond `X-Ratelimit-Reset` / `X-Ratelimit-Auth-Token-Reset` headers plus `Retry-After`; the client programs against those headers.
+- The `viewMembers`, `viewRoles`, and `viewAuditLog` actions named in section 3 do not exist in the role actions reference. A least-privilege audit role needs `basePermissions: reader` plus `viewProject` on the audited projects.
+- The `launchdarkly-api` Python SDK and Go dependencies listed in sections 2 and 7 are not used; the implementation relies on `fetch` and Node built-ins.
+
+### Remaining
+
+- Account-level SSO and MFA enforcement settings (control 1, the account half of control 2) stay manual until LaunchDarkly exposes them through the API.
+- Relay Proxy deployments that use static SDK keys instead of automatic configuration are outside API visibility and must be reviewed manually.
+- Integration types beyond the probed audit log subscription keys are not enumerable through the API.

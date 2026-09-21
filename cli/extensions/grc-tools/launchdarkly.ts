@@ -1349,7 +1349,7 @@ export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promis
     recommendedNextStep:
       status === "healthy"
         ? "Run launchdarkly_assess_identity, launchdarkly_assess_access_control, launchdarkly_assess_environment_governance, launchdarkly_assess_flag_hygiene, launchdarkly_assess_monitoring_integrations, or launchdarkly_export_audit_bundle."
-        : "Use an access token with the Reader base role (Admin for showAll token listing and audit log depth), or a custom role allowing viewProject, viewMembers, viewRoles, and viewAuditLog style read actions, then rerun the access check.",
+        : "Use an access token with the Reader base role (Admin or Owner for showAll token listing and audit log depth), or a custom role with reader base permissions plus viewProject on the audited projects, then rerun the access check.",
   };
 }
 
