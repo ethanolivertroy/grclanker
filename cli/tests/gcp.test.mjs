@@ -1153,8 +1153,14 @@ const INVENTORY_SURFACES = [
 ];
 const PER_PROJECT_SURFACE_IDS = new Set(INVENTORY_SURFACES.filter((row) => row.perProject).map((row) => row.id));
 
-/** Fields the verdict engine adds to every finding; they describe the read itself rather than data derived from it. */
-const ENGINE_EVIDENCE = new Set(["seen", "truncated", "denied_projects", "unreachable_scopes", "unreadable_inventories"]);
+/** The one evidence field that grows, rather than nulls, when a read fails: the list of unreadable inventories itself. */
+const ENGINE_EVIDENCE = new Set(["unreadable_inventories"]);
+
+/**
+ * Collection-status fields: each claims that a collection ran (a completeness flag, a denied count, or the
+ * unreachable-scope list). A non-null value may only describe calls the request recorder saw answered.
+ */
+const STATUS_FIELDS = new Set(["truncated", "projects_truncated", "sources_truncated", "findings_truncated", "denied_projects", "unreachable_scopes"]);
 
 /**
  * Which sweep surfaces each evidence field is derived from. A field derived from a surface
@@ -1163,23 +1169,49 @@ const ENGINE_EVIDENCE = new Set(["seen", "truncated", "denied_projects", "unreac
  */
 const KEY_SOURCES = ["serviceAccounts", "serviceAccountKeys"];
 const PERIMETER_SOURCES = ["accessPolicies", "servicePerimeters"];
+
+/**
+ * The engine fields of a finding scored from one primary per-project scan plus dependent scans: seen counts the
+ * primary list, truncated and unreachable_scopes describe every list read (and the project inventory they hang
+ * off), denied_projects describes the project scan as a whole.
+ */
+function scanEngine(primary, ...dependent) {
+  const lists = ["projects", primary, ...dependent];
+  return { seen: [primary], truncated: lists, denied_projects: ["projects"], unreachable_scopes: lists };
+}
+
+/** The engine fields of a finding scored from organization-scoped lists only; no per-project scan status is rendered. */
+function orgEngine(...lists) {
+  return { seen: lists, truncated: ["projects", ...lists] };
+}
+
 const EVIDENCE_SOURCES = {
-  "GCP-IAM-01": { bindings: ["iamPolicies"], policies_scanned: ["iamPolicies"] },
-  "GCP-IAM-02": { stale_keys: KEY_SOURCES, undated_keys: KEY_SOURCES, service_accounts: ["serviceAccounts"] },
-  "GCP-IAM-03": { user_managed_keys: KEY_SOURCES, service_accounts: ["serviceAccounts"] },
-  "GCP-IAM-04": { cross_project_bindings: ["iamPolicies"] },
-  "GCP-IAM-05": { privileged_default_service_accounts: ["iamPolicies"] },
-  "GCP-LOG-01": { projects_without_admin_activity: ["adminActivity"], projects_read: ["adminActivity"] },
-  "GCP-LOG-02": { projects_without_data_access: ["dataAccess"], projects_read: ["dataAccess"] },
-  "GCP-LOG-03": { projects_without_sinks: ["sinks"], disabled_sinks: ["sinks"], projects_read: ["sinks"] },
-  "GCP-LOG-04": { short_retention_buckets: ["logBuckets"], unknown_retention_buckets: ["logBuckets"], buckets_read: ["logBuckets"] },
-  "GCP-LOG-05": { scc_sources: ["sccSources"], sources_truncated: [], scc_findings: ["sccFindings"], findings_truncated: [] },
-  "GCP-ORG-01": { sampled_projects: ["projects"], projects_truncated: [], target_project: [] },
+  "GCP-IAM-01": { ...orgEngine("iamPolicies"), bindings: ["iamPolicies"], policies_scanned: ["iamPolicies"] },
+  "GCP-IAM-02": {
+    ...scanEngine("serviceAccounts"),
+    seen: KEY_SOURCES,
+    truncated: ["projects", ...KEY_SOURCES],
+    stale_keys: KEY_SOURCES,
+    undated_keys: KEY_SOURCES,
+    service_accounts: ["serviceAccounts"],
+    sampled_projects: ["projects"],
+    project_error: [],
+  },
+  "GCP-IAM-03": { ...scanEngine("serviceAccounts"), seen: KEY_SOURCES, truncated: ["projects", ...KEY_SOURCES], user_managed_keys: KEY_SOURCES, service_accounts: ["serviceAccounts"] },
+  "GCP-IAM-04": { ...orgEngine("iamPolicies"), cross_project_bindings: ["iamPolicies"] },
+  "GCP-IAM-05": { ...orgEngine("iamPolicies"), privileged_default_service_accounts: ["iamPolicies"] },
+  "GCP-LOG-01": { ...scanEngine("adminActivity"), projects_without_admin_activity: ["adminActivity"], projects_read: ["adminActivity"] },
+  "GCP-LOG-02": { ...scanEngine("dataAccess"), projects_without_data_access: ["dataAccess"], projects_read: ["dataAccess"] },
+  "GCP-LOG-03": { ...scanEngine("sinks"), projects_without_sinks: ["sinks"], disabled_sinks: ["sinks"], projects_read: ["sinks"] },
+  "GCP-LOG-04": { ...scanEngine("logBuckets"), short_retention_buckets: ["logBuckets"], unknown_retention_buckets: ["logBuckets"], buckets_read: ["logBuckets"] },
+  "GCP-LOG-05": { scc_sources: ["sccSources"], sources_truncated: ["sccSources"], scc_findings: ["sccFindings"], findings_truncated: ["sccFindings"] },
+  "GCP-ORG-01": { sampled_projects: ["projects"], projects_truncated: ["projects"], target_project: [] },
   "GCP-ORG-02": { policy: [policySurfaceId("constraints/iam.allowedPolicyMemberDomains")], partial: [] },
   "GCP-ORG-03": { policy: [policySurfaceId("constraints/iam.disableServiceAccountKeyCreation")], partial: [] },
   "GCP-ORG-04": { policy: [policySurfaceId("constraints/iam.disableServiceAccountKeyUpload")], partial: [] },
   "GCP-ORG-05": { serial_port_policy: [policySurfaceId("constraints/compute.disableSerialPortAccess")], shielded_vm_policy: [policySurfaceId("constraints/compute.requireShieldedVm")], partial: [] },
   "GCP-ORG-06": {
+    ...scanEngine("computeProject", "instances"),
     policy: [policySurfaceId("constraints/compute.requireOsLogin")],
     policy_enforced: [policySurfaceId("constraints/compute.requireOsLogin")],
     projects_without_os_login: ["computeProject"],
@@ -1187,19 +1219,29 @@ const EVIDENCE_SOURCES = {
     projects_read: ["computeProject"],
     instances_read: ["instances"],
   },
-  "GCP-ORG-07": { permissive_rules: ["binaryAuthorization"], dry_run_rules: ["binaryAuthorization"], projects_read: ["binaryAuthorization"] },
-  "GCP-ORG-08": { shielded_violations: ["instances"], shielded_unknown: ["instances"], serial_port_enabled: ["instances"], instances_read: ["instances"] },
-  "GCP-DATA-01": { non_uniform_buckets: ["buckets"], buckets_read: ["buckets"] },
-  "GCP-DATA-02": { public_bindings: ["publicBindings"], query: [], policies_matched: ["publicBindings"], buckets_read: ["buckets"] },
-  "GCP-DATA-03": { keys_without_rotation: ["cryptoKeys"], overdue_rotation: ["cryptoKeys"], keys_read: ["cryptoKeys"] },
-  "GCP-DATA-04": { buckets_without_cmek: ["buckets"], disks_without_cmek: ["disks"], buckets_read: ["buckets"], disks_read: ["disks"] },
-  "GCP-DATA-05": { zones_without_dnssec: ["managedZones"], public_zones: ["managedZones"], private_zones: ["managedZones"] },
-  "GCP-DATA-06": { unrestricted_keys: ["apiKeys"], keys_read: ["apiKeys"] },
-  "GCP-DATA-07": { enforced_perimeters: PERIMETER_SOURCES, dry_run_only_perimeters: PERIMETER_SOURCES, access_policies: ["accessPolicies"] },
-  "GCP-NET-01": { open_admin_rules: ["firewalls"], firewalls_read: ["firewalls"], admin_ports: [] },
-  "GCP-NET-02": { subnets_without_flow_logs: ["subnetworks"], subnets_read: ["subnetworks"] },
-  "GCP-NET-03": { subnets_without_private_google_access: ["subnetworks"], subnets_read: ["subnetworks"] },
+  "GCP-ORG-07": { ...scanEngine("binaryAuthorization"), permissive_rules: ["binaryAuthorization"], dry_run_rules: ["binaryAuthorization"], projects_read: ["binaryAuthorization"] },
+  "GCP-ORG-08": { ...scanEngine("instances"), shielded_violations: ["instances"], shielded_unknown: ["instances"], serial_port_enabled: ["instances"], instances_read: ["instances"] },
+  "GCP-DATA-01": { ...scanEngine("buckets"), non_uniform_buckets: ["buckets"], buckets_read: ["buckets"] },
+  "GCP-DATA-02": {
+    ...scanEngine("buckets"),
+    seen: ["buckets", "publicBindings"],
+    truncated: ["projects", "buckets", "publicBindings"],
+    public_bindings: ["publicBindings"],
+    query: [],
+    policies_matched: ["publicBindings"],
+    buckets_read: ["buckets"],
+  },
+  "GCP-DATA-03": { ...orgEngine("cryptoKeys"), keys_without_rotation: ["cryptoKeys"], overdue_rotation: ["cryptoKeys"], keys_read: ["cryptoKeys"] },
+  "GCP-DATA-04": { ...scanEngine("buckets", "disks"), seen: ["buckets", "disks"], buckets_without_cmek: ["buckets"], disks_without_cmek: ["disks"], buckets_read: ["buckets"], disks_read: ["disks"] },
+  "GCP-DATA-05": { ...scanEngine("managedZones"), zones_without_dnssec: ["managedZones"], public_zones: ["managedZones"], private_zones: ["managedZones"] },
+  "GCP-DATA-06": { ...scanEngine("apiKeys"), unrestricted_keys: ["apiKeys"], keys_read: ["apiKeys"] },
+  "GCP-DATA-07": { ...orgEngine(...PERIMETER_SOURCES), enforced_perimeters: PERIMETER_SOURCES, dry_run_only_perimeters: PERIMETER_SOURCES, access_policies: ["accessPolicies"] },
+  "GCP-NET-01": { ...scanEngine("firewalls"), open_admin_rules: ["firewalls"], firewalls_read: ["firewalls"], admin_ports: [] },
+  "GCP-NET-02": { ...scanEngine("subnetworks"), subnets_without_flow_logs: ["subnetworks"], subnets_read: ["subnetworks"] },
+  "GCP-NET-03": { ...scanEngine("subnetworks"), subnets_without_private_google_access: ["subnetworks"], subnets_read: ["subnetworks"] },
   "GCP-NET-04": {
+    ...scanEngine("subnetworks", "routers", "instances"),
+    seen: ["subnetworks", "instances"],
     subnets_without_nat: ["subnetworks", "routers"],
     subnets_with_unknown_nat: ["subnetworks"],
     instances_with_external_ip: ["instances"],
@@ -1207,15 +1249,21 @@ const EVIDENCE_SOURCES = {
     routers_read: ["routers"],
     instances_read: ["instances"],
   },
-  "GCP-NET-05": { weak_proxies: ["targetHttpsProxies"], unresolved_proxies: ["targetHttpsProxies"], proxies_read: ["targetHttpsProxies"], ssl_policies_read: ["sslPolicies"] },
-  "GCP-NET-06": { backends_without_security_policy: ["backendServices"], external_backends_read: ["backendServices"] },
+  "GCP-NET-05": {
+    ...scanEngine("targetHttpsProxies", "sslPolicies"),
+    weak_proxies: ["targetHttpsProxies", "sslPolicies"],
+    unresolved_proxies: ["targetHttpsProxies"],
+    proxies_read: ["targetHttpsProxies"],
+    ssl_policies_read: ["sslPolicies"],
+  },
+  "GCP-NET-06": { ...scanEngine("backendServices"), backends_without_security_policy: ["backendServices"], external_backends_read: ["backendServices"] },
 };
 
 /** The same classification for every assessment-level summary counter. */
 const SUMMARY_SOURCES = {
   identity: {
     sampled_projects: ["projects"],
-    projects_truncated: [],
+    projects_truncated: ["projects"],
     iam_policies: ["iamPolicies"],
     service_accounts: ["serviceAccounts"],
     privileged_bindings: ["iamPolicies"],
@@ -1228,7 +1276,7 @@ const SUMMARY_SOURCES = {
   },
   "logging-detection": {
     sampled_projects: ["projects"],
-    projects_truncated: [],
+    projects_truncated: ["projects"],
     projects_with_admin_activity: ["adminActivity"],
     projects_with_data_access: ["dataAccess"],
     projects_with_log_sinks: ["sinks"],
@@ -1241,7 +1289,7 @@ const SUMMARY_SOURCES = {
   },
   "org-guardrails": {
     sampled_projects: ["projects"],
-    projects_truncated: [],
+    projects_truncated: ["projects"],
     organization_visible: ["organization"],
     target_project: [],
     domain_restricted_sharing: [policySurfaceId("constraints/iam.allowedPolicyMemberDomains")],
@@ -1257,7 +1305,7 @@ const SUMMARY_SOURCES = {
   },
   "data-protection": {
     sampled_projects: ["projects"],
-    projects_truncated: [],
+    projects_truncated: ["projects"],
     buckets: ["buckets"],
     non_uniform_buckets: ["buckets"],
     public_bindings: ["publicBindings"],
@@ -1274,7 +1322,7 @@ const SUMMARY_SOURCES = {
   },
   "network-security": {
     sampled_projects: ["projects"],
-    projects_truncated: [],
+    projects_truncated: ["projects"],
     firewalls: ["firewalls"],
     open_admin_rules: ["firewalls"],
     subnetworks: ["subnetworks"],
@@ -1284,20 +1332,226 @@ const SUMMARY_SOURCES = {
     subnets_with_unknown_nat: ["subnetworks"],
     instances_with_external_ip: ["instances"],
     https_proxies: ["targetHttpsProxies"],
-    weak_ssl_proxies: ["targetHttpsProxies"],
+    weak_ssl_proxies: ["targetHttpsProxies", "sslPolicies"],
     external_backends: ["backendServices"],
     backends_without_cloud_armor: ["backendServices"],
     collection_errors: [],
   },
 };
 
-/** A denied project inventory blocks every per-project read, so their derived fields are nulled with it. */
-function derivedFromUnreadable(sources, row) {
-  return sources.includes(row.id) || (row.key === "projects" && sources.some((id) => PER_PROJECT_SURFACE_IDS.has(id)));
+const POLICY_SNAPSHOT_SOURCES = Object.fromEntries(
+  Object.keys(ORG_POLICY_DEPENDENTS).map((constraint) => [constraint.replace(/^constraints\/[a-z]+\./, ""), [policySurfaceId(constraint)]]),
+);
+
+/**
+ * Which sweep surfaces each core_data snapshot dataset is read from. A dataset whose surface was denied or never
+ * requested must be written as a {status, dataset, endpoint, scope, error, data: null} marker, never as [] or null.
+ */
+const SNAPSHOT_SOURCES = {
+  identity: { projects: ["projects"], iam_policies: ["iamPolicies"], service_accounts: ["serviceAccounts"], user_managed_keys: KEY_SOURCES },
+  "logging-detection": { projects: ["projects"], logging_settings: ["loggingSettings"], sinks: ["sinks"], log_buckets: ["logBuckets"], scc_sources: ["sccSources"] },
+  "org-guardrails": {
+    organization: ["organization"],
+    projects: ["projects"],
+    effective_policies: POLICY_SNAPSHOT_SOURCES,
+    compute_projects: ["computeProject"],
+    instances: ["instances"],
+    binary_authorization: ["binaryAuthorization"],
+  },
+  "data-protection": {
+    projects: ["projects"],
+    buckets: ["buckets"],
+    public_bindings: ["publicBindings"],
+    crypto_keys: ["cryptoKeys"],
+    disks: ["disks"],
+    managed_zones: ["managedZones"],
+    api_keys: ["apiKeys"],
+    service_perimeters: PERIMETER_SOURCES,
+  },
+  "network-security": {
+    projects: ["projects"],
+    firewalls: ["firewalls"],
+    subnetworks: ["subnetworks"],
+    routers: ["routers"],
+    instances: ["instances"],
+    ssl_policies: ["sslPolicies"],
+    target_https_proxies: ["targetHttpsProxies"],
+    backend_services: ["backendServices"],
+  },
+};
+
+/** Surfaces the request recorder never saw in a run: reads blocked upstream (denied project inventory, denied account list, no project). */
+function blockedSurfaces(requests) {
+  const requested = new Set(requests.flatMap((entry) => entry.surfaces));
+  return new Set(INVENTORY_SURFACES.filter((row) => !requested.has(row.id)).map((row) => row.id));
+}
+
+/** Surfaces the recorder saw answered successfully at least once; only these may be described as complete. */
+function answeredSurfaces(requests) {
+  return new Set(requests.filter((entry) => entry.status < 400).flatMap((entry) => entry.surfaces));
+}
+
+/**
+ * A field derives from the unreadable surface when the denied row is among its sources, or when one of its sources
+ * was never requested in the run because the denied read blocked it (a denied project inventory blocks every
+ * per-project read and, without a configured project, every effective org policy read).
+ */
+function derivedFromUnreadable(sources, row, blocked = new Set()) {
+  return sources.includes(row.id) || sources.some((id) => blocked.has(id));
 }
 
 function isStandInShape(value) {
   return value === 0 || (Array.isArray(value) && value.length === 0);
+}
+
+const MARKER_STATUSES = new Set(["unreadable", "not_collected"]);
+
+function isMarker(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && MARKER_STATUSES.has(value.status) && value.data === null;
+}
+
+function assertMarker(label, value) {
+  assert.ok(isMarker(value), `${label} must be a {status, dataset, endpoint, scope, error, data: null} marker for a dataset that was denied or not collected, never [] or null (got ${JSON.stringify(value)})`);
+  assert.deepEqual(Object.keys(value).sort(), ["data", "dataset", "endpoint", "error", "scope", "status"], `${label} marker shape`);
+  for (const key of ["dataset", "endpoint", "scope", "error"]) {
+    assert.ok(typeof value[key] === "string" && value[key].length > 0, `${label} marker must carry a non-empty ${key}`);
+  }
+}
+
+/**
+ * Asserts the snapshot contract for one core_data snapshot against its baseline: every dataset is classified, every
+ * dataset derived from the unreadable surface is a marker, and every other dataset is byte-identical to the baseline.
+ */
+function assertSnapshotRendering(label, sources, snapshot, baseline, row, blocked) {
+  for (const [field, value] of Object.entries(snapshot)) {
+    if (field === "unreadable_inventories") continue;
+    const fieldSources = sources[field];
+    assert.ok(fieldSources, `${label}: snapshot dataset "${field}" is not classified in SNAPSHOT_SOURCES`);
+    if (!Array.isArray(fieldSources)) {
+      assertSnapshotRendering(`${label}.${field}`, fieldSources, value, baseline[field], row, blocked);
+      continue;
+    }
+    if (derivedFromUnreadable(fieldSources, row, blocked)) {
+      assertMarker(`${label}: "${field}"`, value);
+    } else {
+      assert.deepEqual(value, baseline[field], `${label}: "${field}" does not read ${row.name}, so its snapshot must match the baseline`);
+    }
+  }
+}
+
+/** All snapshot datasets, including the nested effective policies, as [path, value] pairs. */
+function snapshotLeaves(snapshot, sources, prefix = "") {
+  return Object.entries(snapshot)
+    .filter(([field]) => field !== "unreadable_inventories")
+    .flatMap(([field, value]) => (sources[field] && !Array.isArray(sources[field]) ? snapshotLeaves(value, sources[field], `${prefix}${field}.`) : [[`${prefix}${field}`, value]]));
+}
+
+/** Every classified snapshot dataset as [path, sources] pairs, descending into nested groups such as effective_policies. */
+function classifiedSnapshotPaths(sources, prefix = "") {
+  return Object.entries(sources).flatMap(([field, value]) => (Array.isArray(value) ? [[`${prefix}${field}`, value]] : classifiedSnapshotPaths(value, `${prefix}${field}.`)));
+}
+
+const ENDPOINT_SURFACES = new Map();
+for (const row of INVENTORY_SURFACES) {
+  const endpoint = GCP_INVENTORIES[row.key].endpoint;
+  ENDPOINT_SURFACES.set(endpoint, [...(ENDPOINT_SURFACES.get(endpoint) ?? []), row.id]);
+}
+
+function surfacesForInventory(dataset, endpoint) {
+  return INVENTORY_SURFACES.filter((row) => row.name === dataset && GCP_INVENTORIES[row.key].endpoint === endpoint).map((row) => row.id);
+}
+
+function requestsTo(requests, surfaceIds) {
+  return requests.filter((entry) => entry.surfaces.some((id) => surfaceIds.includes(id)));
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The HTTP status named at the start of a request error, optionally behind one identifier prefix such as an email. */
+function leadingStatusCode(error) {
+  const code = error.match(/^(?:[^\s():]+: )?([1-5]\d{2}) [A-Za-z]/)?.[1];
+  return code === undefined ? undefined : Number(code);
+}
+
+/**
+ * Every unreadable-inventory entry or snapshot marker must describe a call the recorder saw: an "unreadable" entry
+ * names an endpoint that was requested and answered with the status it quotes, and a "not_collected" entry names an
+ * endpoint that was never requested at all.
+ */
+function assertInventoryEntriesMatchRequests(label, entries, requests) {
+  for (const entry of entries) {
+    const ids = surfacesForInventory(entry.dataset, entry.endpoint);
+    assert.ok(ids.length > 0, `${label}: "${entry.dataset}" via ${entry.endpoint} is not a sweep surface`);
+    const seen = requestsTo(requests, ids);
+    switch (entry.status) {
+      case "unreadable": {
+        assert.ok(seen.some((request) => request.status >= 400), `${label}: "${entry.dataset}" is marked unreadable but no request to ${entry.endpoint} was answered with an error`);
+        const code = leadingStatusCode(entry.error);
+        assert.ok(code !== undefined, `${label}: an unreadable "${entry.dataset}" must quote the HTTP status of its own request (got ${entry.error})`);
+        assert.ok(seen.some((request) => request.status === code), `${label}: "${entry.dataset}" quotes HTTP ${code} but no request to ${entry.endpoint} was answered with it`);
+        break;
+      }
+      case "not_collected":
+        assert.equal(seen.length, 0, `${label}: "${entry.dataset}" is marked not collected but ${seen.length} requests to ${entry.endpoint} were recorded`);
+        assert.ok(!/^(?:[^\s():]+: )?[1-5]\d{2} /.test(entry.error), `${label}: a not-collected "${entry.dataset}" must not attribute an HTTP status to the call it never made (got ${entry.error})`);
+        break;
+      default:
+        assert.fail(`${label}: "${entry.dataset}" carries unknown inventory status ${JSON.stringify(entry.status)}`);
+    }
+  }
+}
+
+function claimsCompletion(value) {
+  return value === false || value === 0 || (Array.isArray(value) && value.length === 0);
+}
+
+/**
+ * A collection-status field may say complete (false, 0, or []) only about scans the recorder saw answered; a
+ * scan that was denied everywhere or never requested renders null beside its unreadable_inventories entry.
+ */
+function assertStatusFieldsMatchRequests(label, sources, actual, requests) {
+  const answered = answeredSurfaces(requests);
+  for (const field of STATUS_FIELDS) {
+    if (!(field in actual) || !claimsCompletion(actual[field])) continue;
+    const fieldSources = sources[field];
+    assert.ok(fieldSources && fieldSources.length > 0, `${label}: status field "${field}" must be classified against the scans it describes`);
+    for (const id of fieldSources) {
+      assert.ok(answered.has(id), `${label}: "${field}" is ${JSON.stringify(actual[field])}, a completeness claim about ${id}, but no request to it was answered in this run`);
+    }
+  }
+}
+
+/**
+ * Every HTTP status a summary attributes to an endpoint ("via <endpoint> (403 Forbidden)") must have been answered
+ * on a request to that endpoint, every "<endpoint> was not called" clause must be true of the recorder, and every
+ * status code quoted anywhere in the summary must be one some request actually returned.
+ */
+function assertSummaryMatchesRequests(label, summary, requests) {
+  const codesSeen = new Set(requests.map((request) => request.status));
+  for (const match of summary.matchAll(/(?<![\w./:-])([1-5]\d{2}) [A-Z][A-Za-z]+/g)) {
+    assert.ok(codesSeen.has(Number(match[1])), `${label}: summary quotes HTTP ${match[1]} but no request was answered with it: ${summary}`);
+  }
+  for (const [endpoint, ids] of ENDPOINT_SURFACES) {
+    const escaped = escapeRegExp(endpoint);
+    for (const match of summary.matchAll(new RegExp(`via ${escaped} \\((?:[^\\s()]+: )?([1-5]\\d{2}) [A-Za-z]`, "g"))) {
+      const code = Number(match[1]);
+      assert.ok(requestsTo(requests, ids).some((request) => request.status === code), `${label}: summary attributes HTTP ${code} to ${endpoint}, which no request to it returned: ${summary}`);
+    }
+    if (new RegExp(`${escaped}(?: and \\S+)* (?:was|were) not called`).test(summary)) {
+      assert.equal(requestsTo(requests, ids).length, 0, `${label}: summary says ${endpoint} was not called, but the recorder saw requests to it: ${summary}`);
+    } else if (summary.includes(endpoint)) {
+      assert.ok(requestsTo(requests, ids).length > 0, `${label}: summary names ${endpoint} as read, but no request to it was recorded: ${summary}`);
+    }
+  }
+}
+
+/** The status contract for one finding or one assessment summary: status fields, attributed codes, and inventory entries all match the recorder. */
+function assertStatusesMatchRequests(label, sources, actual, summary, requests) {
+  assertStatusFieldsMatchRequests(label, sources, actual, requests);
+  assertSummaryMatchesRequests(label, summary, requests);
+  if (Array.isArray(actual.unreadable_inventories)) assertInventoryEntriesMatchRequests(label, actual.unreadable_inventories, requests);
 }
 
 /** Zero-count clauses such as "none of 0 instances" or "All 0 buckets"; HTTP codes such as 403 do not match. */
@@ -1310,12 +1564,12 @@ function zeroCountPhrases(summary) {
  * every field is classified, fields derived from the unreadable surface are null, and no other field flips from a
  * non-zero baseline to 0 or [] (a numeric stand-in for data that was not read).
  */
-function assertNullRendering(label, sources, actual, baseline, row, skip = new Set()) {
+function assertNullRendering(label, sources, actual, baseline, row, blocked, skip = ENGINE_EVIDENCE) {
   for (const [field, value] of Object.entries(actual)) {
     if (skip.has(field)) continue;
     const fieldSources = sources[field];
     assert.ok(fieldSources, `${label}: field "${field}" is not classified in the source map; add it with the surfaces it derives from`);
-    if (derivedFromUnreadable(fieldSources, row)) {
+    if (derivedFromUnreadable(fieldSources, row, blocked)) {
       assert.equal(value, null, `${label}: "${field}" derives from ${row.name}, which is unreadable, so it must render null (got ${JSON.stringify(value)})`);
     } else {
       assert.ok(!(isStandInShape(value) && !isStandInShape(baseline[field])), `${label}: "${field}" flipped from ${JSON.stringify(baseline[field])} to ${JSON.stringify(value)} while ${row.name} was unreadable; that is a stand-in for unread data`);
@@ -1342,14 +1596,18 @@ function assertNoNewZeroPhrases(label, summary, baselineSummary) {
   }
 }
 
-/** Like clientWithUnreadable, but records which sweep predicates each served request matched. */
-function sweepClient(requests, match, status = 403, mode = "full") {
+/** Like clientWithUnreadable, but records which sweep predicates each served request matched and the status it was answered with. */
+function sweepClient(requests, match, status = 403, mode = "full", config = sampleConfig()) {
   return createClient(async (url, init) => {
     const facts = requestFacts(url, init);
-    requests.push({ request: `${facts.host}${facts.path}`, surfaces: INVENTORY_SURFACES.filter((row) => row.match(facts)).map((row) => row.id) });
-    if (match && match(facts) && (mode === "full" || requestProject(url, init) === SECOND_PROJECT)) return denied(status);
-    return jsonResponse(routeForProject(url, init));
-  });
+    const deniedHere = Boolean(match && match(facts) && (mode === "full" || requestProject(url, init) === SECOND_PROJECT));
+    requests.push({ request: `${facts.host}${facts.path}`, surfaces: INVENTORY_SURFACES.filter((row) => row.match(facts)).map((row) => row.id), status: deniedHere ? status : 200 });
+    return deniedHere ? denied(status) : jsonResponse(routeForProject(url, init));
+  }, config);
+}
+
+function statusText(status) {
+  return status === 403 ? `${status} Forbidden` : `${status} Error`;
 }
 
 function assertEveryRequestClassified(requests, label) {
@@ -1379,25 +1637,104 @@ test("per-inventory sweep covers every GCP_INVENTORIES surface and every request
       for (const source of sources) assert.ok(INVENTORY_SURFACES.some((row) => row.id === source), `summary source ${source} is not a sweep surface`);
     }
   }
+  for (const [category, fields] of Object.entries(SNAPSHOT_SOURCES)) {
+    for (const [path, sources] of classifiedSnapshotPaths(fields)) {
+      assert.ok(sources.length > 0, `${category} snapshot dataset ${path} must name the surfaces it is read from`);
+      for (const source of sources) assert.ok(INVENTORY_SURFACES.some((row) => row.id === source), `${category} snapshot source ${source} is not a sweep surface`);
+    }
+  }
+  for (const [owner, fields] of [...Object.entries(EVIDENCE_SOURCES), ...Object.entries(SUMMARY_SOURCES)]) {
+    for (const field of STATUS_FIELDS) {
+      if (field in fields) assert.ok(fields[field].length > 0, `${owner}.${field} is a collection-status field and must name the scans it describes`);
+    }
+  }
 
   const requests = [];
   const assessments = await runAllAssessments(sweepClient(requests));
   assertEveryRequestClassified(requests, "compliant baseline");
-  const requested = new Set(requests.flatMap((entry) => entry.surfaces));
-  assert.deepEqual(INVENTORY_SURFACES.filter((row) => !requested.has(row.id)).map((row) => row.id), [], "every sweep surface must be requested by a compliant two-project run");
+  assert.deepEqual([...blockedSurfaces(requests)], [], "every sweep surface must be requested by a compliant two-project run");
+  assert.ok(requests.every((entry) => entry.status === 200));
   assert.deepEqual(assessments.map((assessment) => assessment.category).sort(), Object.keys(SUMMARY_SOURCES).sort(), "every assessment summary is classified");
   for (const assessment of assessments) {
     assert.deepEqual(Object.keys(assessment.summary).sort(), Object.keys(SUMMARY_SOURCES[assessment.category]).sort(), `${assessment.category} summary fields must all be classified`);
+    assert.deepEqual(
+      snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category]).map(([path]) => path).sort(),
+      classifiedSnapshotPaths(SNAPSHOT_SOURCES[assessment.category]).map(([path]) => path).sort(),
+      `${assessment.category} snapshot datasets must all be classified`,
+    );
+    assert.ok(Array.isArray(assessment.snapshot.unreadable_inventories) && assessment.snapshot.unreadable_inventories.length === 0, `${assessment.category} snapshot lists no unreadable inventories on the compliant run`);
+    for (const finding of assessment.findings) {
+      assertStatusesMatchRequests(`${finding.id} (compliant baseline)`, EVIDENCE_SOURCES[finding.id], finding.evidence, finding.summary, requests);
+    }
+    assertStatusesMatchRequests(`${assessment.category} summary (compliant baseline)`, SUMMARY_SOURCES[assessment.category], assessment.summary, "", requests);
   }
 });
 
-test("per-inventory sweep: exactly the dependent findings drop below pass when any inventory is unreadable, fully or for one project, and nothing derived from it renders as 0 or []", async () => {
-  const baselineRun = await runAllAssessments(createClient(async (url, init) => jsonResponse(routeForProject(url, init))));
-  const baseline = statuses(baselineRun);
-  const baselineFindings = findingsById(baselineRun);
-  const baselineSummaries = Object.fromEntries(baselineRun.map((assessment) => [assessment.category, assessment.summary]));
-  assert.equal(Object.keys(baseline).length, 31);
-  assert.deepEqual(Object.entries(baseline).filter(([, status]) => status !== "pass"), [], "two compliant projects must pass every control before the sweep");
+/** The compliant two-project run every sweep row is compared against; the org-only variant backs the zero-scope row. */
+async function sweepBaseline(config = sampleConfig()) {
+  const run = await runAllAssessments(sweepClient([], undefined, 403, "full", config));
+  const all = statuses(run);
+  assert.equal(Object.keys(all).length, 31);
+  assert.deepEqual(Object.entries(all).filter(([, status]) => status !== "pass"), [], "two compliant projects must pass every control before the sweep");
+  return {
+    findings: findingsById(run),
+    summaries: Object.fromEntries(run.map((assessment) => [assessment.category, assessment.summary])),
+    snapshots: Object.fromEntries(run.map((assessment) => [assessment.category, assessment.snapshot])),
+  };
+}
+
+/**
+ * Every assertion for one run in which a surface was unreadable everywhere (or, in the zero-scope row, blocked every
+ * per-project and policy read): verdicts, null rendering, status fields, attributed codes, and core_data markers.
+ */
+function assertFullDenialRun(run, requests, row, status, baseline, mode) {
+  const label = `${row.name} unreadable (${status}, ${mode})`;
+  assertEveryRequestClassified(requests, label);
+  const blocked = blockedSurfaces(requests);
+  assert.ok(!blocked.has(row.id), `${label}: the denied surface itself must have been requested`);
+  const findings = findingsById(run);
+  for (const id of ALL_FINDING_IDS) {
+    const finding = findings[id];
+    const findingLabel = `${id} with ${label}`;
+    if (!row.dependents.includes(id)) {
+      assert.deepEqual(finding.evidence, baseline.findings[id].evidence, `${findingLabel}: a finding that does not read the surface must be unchanged`);
+      assert.equal(finding.summary, baseline.findings[id].summary, `${findingLabel}: summary must be unchanged`);
+      continue;
+    }
+    assert.ok(finding.summary.includes(row.name), `${id} must name "${row.name}" when it is unreadable (${status}); got: ${finding.summary}`);
+    assert.ok(finding.summary.includes(row.endpoint), `${id} must name the endpoint "${row.endpoint}" (${status}); got: ${finding.summary}`);
+    assert.ok(
+      finding.evidence.unreadable_inventories.some((entry) => entry.dataset === row.name && entry.endpoint.includes(row.endpoint)),
+      `${id} evidence.unreadable_inventories must carry ${row.name}`,
+    );
+    if (finding.status === "manual" && "seen" in finding.evidence) {
+      assert.equal(finding.evidence.seen, null, `${findingLabel}: a manual finding has no readable primary inventory, so seen must be null`);
+    }
+    assertNullRendering(findingLabel, EVIDENCE_SOURCES[id], finding.evidence, baseline.findings[id].evidence, row, blocked);
+    assertNoNewZeroPhrases(findingLabel, finding.summary, baseline.findings[id].summary);
+    assertStatusesMatchRequests(findingLabel, EVIDENCE_SOURCES[id], finding.evidence, finding.summary, requests);
+  }
+  for (const assessment of run) {
+    const summaryLabel = `${assessment.category} summary with ${label}`;
+    assertNullRendering(summaryLabel, SUMMARY_SOURCES[assessment.category], assessment.summary, baseline.summaries[assessment.category], row, blocked);
+    assertStatusesMatchRequests(summaryLabel, SUMMARY_SOURCES[assessment.category], assessment.summary, "", requests);
+    const snapshotLabel = `${assessment.category} snapshot with ${label}`;
+    assertSnapshotRendering(snapshotLabel, SNAPSHOT_SOURCES[assessment.category], assessment.snapshot, baseline.snapshots[assessment.category], row, blocked);
+    assertInventoryEntriesMatchRequests(snapshotLabel, assessment.snapshot.unreadable_inventories, requests);
+    const markers = snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category]).filter(([, value]) => isMarker(value)).map(([, value]) => value);
+    assertInventoryEntriesMatchRequests(`${snapshotLabel} markers`, markers, requests);
+    for (const marker of markers) {
+      assert.ok(
+        assessment.snapshot.unreadable_inventories.some((entry) => entry.dataset === marker.dataset && entry.endpoint === marker.endpoint && entry.status === marker.status),
+        `${snapshotLabel}: marker for ${marker.dataset} must be listed in snapshot.unreadable_inventories`,
+      );
+    }
+  }
+  return blocked;
+}
+
+test("per-inventory sweep: exactly the dependent findings drop below pass when any inventory is unreadable, fully or for one project, and nothing derived from it renders as 0, [], or a complete status", async () => {
+  const baseline = await sweepBaseline();
 
   const table = [];
   for (const row of INVENTORY_SURFACES) {
@@ -1405,30 +1742,12 @@ test("per-inventory sweep: exactly the dependent findings drop below pass when a
     for (const status of [403, 401, 500]) {
       const requests = [];
       const full = await runAllAssessments(sweepClient(requests, row.match, status, "full"));
-      assertEveryRequestClassified(requests, `${row.name} unreadable (${status}, fully)`);
       const fullStatuses = statuses(full);
       const demoted = Object.entries(fullStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
       assert.deepEqual(demoted, expected, `${row.name} unreadable (${status}, fully) must demote exactly ${expected.join(", ") || "nothing"}`);
-      const fullFindings = findingsById(full);
-      for (const id of ALL_FINDING_IDS) {
-        const finding = fullFindings[id];
-        const label = `${id} with ${row.name} unreadable (${status}, fully)`;
-        if (!row.dependents.includes(id)) {
-          assert.deepEqual(finding.evidence, baselineFindings[id].evidence, `${label}: a finding that does not read the surface must be unchanged`);
-          assert.equal(finding.summary, baselineFindings[id].summary, `${label}: summary must be unchanged`);
-          continue;
-        }
-        assert.ok(finding.summary.includes(row.name), `${id} must name "${row.name}" when it is unreadable (${status}); got: ${finding.summary}`);
-        assert.ok(finding.summary.includes(row.endpoint), `${id} must name the endpoint "${row.endpoint}" (${status}); got: ${finding.summary}`);
-        assert.ok(
-          finding.evidence.unreadable_inventories.some((entry) => entry.dataset === row.name && entry.endpoint.includes(row.endpoint)),
-          `${id} evidence.unreadable_inventories must carry ${row.name}`,
-        );
-        assertNullRendering(label, EVIDENCE_SOURCES[id], finding.evidence, baselineFindings[id].evidence, row, ENGINE_EVIDENCE);
-        assertNoNewZeroPhrases(label, finding.summary, baselineFindings[id].summary);
-      }
-      for (const assessment of full) {
-        assertNullRendering(`${assessment.category} summary with ${row.name} unreadable (${status}, fully)`, SUMMARY_SOURCES[assessment.category], assessment.summary, baselineSummaries[assessment.category], row);
+      const blocked = assertFullDenialRun(full, requests, row, status, baseline, "fully");
+      if (row.key === "projects") {
+        assert.deepEqual([...blocked].sort(), [...PER_PROJECT_SURFACE_IDS].sort(), "a denied project inventory blocks exactly the per-project reads while a project is configured");
       }
       if (status === 403) table.push({ surface: row.name, mode: "fully", demoted: demoted.map((id) => `${id}=${fullStatuses[id]}`) });
 
@@ -1436,6 +1755,7 @@ test("per-inventory sweep: exactly the dependent findings drop below pass when a
       const partialRequests = [];
       const partial = await runAllAssessments(sweepClient(partialRequests, row.match, status, "project"));
       assertEveryRequestClassified(partialRequests, `${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`);
+      assert.deepEqual([...blockedSurfaces(partialRequests)], [], `${row.name} unreadable for one project blocks no other read`);
       const partialStatuses = statuses(partial);
       const demotedPartial = Object.entries(partialStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
       assert.deepEqual(demotedPartial, expected, `${row.name} unreadable (${status}, ${SECOND_PROJECT} only) must demote exactly ${expected.join(", ") || "nothing"}`);
@@ -1444,22 +1764,161 @@ test("per-inventory sweep: exactly the dependent findings drop below pass when a
         const finding = partialFindings[id];
         const label = `${id} with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`;
         if (!row.dependents.includes(id)) {
-          assert.deepEqual(finding.evidence, baselineFindings[id].evidence, `${label}: a finding that does not read the surface must be unchanged`);
+          assert.deepEqual(finding.evidence, baseline.findings[id].evidence, `${label}: a finding that does not read the surface must be unchanged`);
           continue;
         }
         assert.equal(finding.status, "warn", `${id} must warn, not pass or go manual, when one of two projects denies ${row.name}`);
         assert.ok(finding.summary.includes(row.name) && finding.summary.includes(row.endpoint), `${id} must name dataset and endpoint; got: ${finding.summary}`);
         assert.ok(finding.summary.includes(SECOND_PROJECT), `${id} must name the denied project; got: ${finding.summary}`);
-        assertPartialRendering(label, finding.evidence, baselineFindings[id].evidence, ENGINE_EVIDENCE);
-        assertNoNewZeroPhrases(label, finding.summary, baselineFindings[id].summary);
+        assertPartialRendering(label, finding.evidence, baseline.findings[id].evidence, ENGINE_EVIDENCE);
+        assertNoNewZeroPhrases(label, finding.summary, baseline.findings[id].summary);
+        assertStatusesMatchRequests(label, EVIDENCE_SOURCES[id], finding.evidence, finding.summary, partialRequests);
       }
       for (const assessment of partial) {
-        assertPartialRendering(`${assessment.category} summary with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`, assessment.summary, baselineSummaries[assessment.category]);
+        const label = `${assessment.category} summary with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`;
+        assertPartialRendering(label, assessment.summary, baseline.summaries[assessment.category]);
+        assertStatusesMatchRequests(label, SUMMARY_SOURCES[assessment.category], assessment.summary, "", partialRequests);
+        assertInventoryEntriesMatchRequests(`${assessment.category} snapshot with ${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`, assessment.snapshot.unreadable_inventories, partialRequests);
+        for (const [path, value] of snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category])) {
+          assert.ok(!isMarker(value), `${assessment.category} snapshot ${path}: one project still answered, so a partial dataset renders its rows, not a marker`);
+        }
       }
       if (status === 403) table.push({ surface: row.name, mode: `${SECOND_PROJECT} only`, demoted: demotedPartial.map((id) => `${id}=${partialStatuses[id]}`) });
     }
   }
   assert.equal(table.length, INVENTORY_SURFACES.length + INVENTORY_SURFACES.filter((row) => row.perProject).length);
+});
+
+const PROJECTS_ROW = INVENTORY_SURFACES.find((row) => row.key === "projects");
+const POLICY_SURFACE_IDS = new Set(INVENTORY_SURFACES.filter((row) => row.key === "effectiveOrgPolicy").map((row) => row.id));
+const ORG_ONLY_CONFIG = sampleConfig({ projectId: undefined });
+
+test("per-inventory sweep, zero-scope row: a denied project inventory with no configured project blocks every per-project and policy read, and nothing claims a call that never happened", async () => {
+  const baseline = await sweepBaseline(ORG_ONLY_CONFIG);
+  for (const status of [403, 401, 500]) {
+    const requests = [];
+    const run = await runAllAssessments(sweepClient(requests, PROJECTS_ROW.match, status, "full", ORG_ONLY_CONFIG));
+    const all = statuses(run);
+    assert.deepEqual(Object.entries(all).filter(([, value]) => value === "pass"), [], `nothing may pass when the project inventory is denied (${status})`);
+    const blocked = assertFullDenialRun(run, requests, PROJECTS_ROW, status, baseline, "zero scope");
+    assert.deepEqual([...blocked].sort(), [...PER_PROJECT_SURFACE_IDS, ...POLICY_SURFACE_IDS].sort(), "without a project, the denied inventory blocks every per-project read and every effective org policy read");
+    assert.ok(requests.every((entry) => !entry.surfaces.some((id) => blocked.has(id))), "no request may reach a blocked surface");
+    assert.ok(requests.some((entry) => entry.surfaces.includes("projects") && entry.status === status));
+
+    const findings = findingsById(run);
+    const policyNotCalled = new RegExp(
+      `not collected for the scope \\(${escapeRegExp(GCP_INVENTORIES.effectiveOrgPolicy.endpoint)} was not called\\): no project could be enumerated because project inventory was unreadable via ${escapeRegExp(GCP_INVENTORIES.projects.endpoint)} \\(${statusText(status)}\\), so no project was available to compute the effective policy\\.`,
+    );
+    for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05"]) {
+      assert.equal(findings[id].status, "manual", `${id} has no project to resolve the effective policy against (${status})`);
+      assert.match(findings[id].summary, policyNotCalled, `${id} must say the policy read was not attempted and attribute the status to the project inventory (${status})`);
+      assert.doesNotMatch(findings[id].summary, /getEffectiveOrgPolicy \([1-5]\d{2}/, `${id} must not attribute an HTTP status to a call that never happened`);
+      for (const entry of findings[id].evidence.unreadable_inventories.filter((item) => item.endpoint === GCP_INVENTORIES.effectiveOrgPolicy.endpoint)) {
+        assert.equal(entry.status, "not_collected");
+      }
+    }
+    assert.equal(findings["GCP-ORG-06"].status, "manual");
+    assert.match(findings["GCP-ORG-06"].summary, new RegExp(`^Manual: project inventory unreadable for the configured scope via ${escapeRegExp(GCP_INVENTORIES.projects.endpoint)} \\(${statusText(status)}`));
+    assert.equal(findings["GCP-ORG-06"].evidence.policy, null);
+    assert.equal(findings["GCP-ORG-01"].evidence.target_project, null);
+    for (const assessment of run) {
+      assert.equal(assessment.summary.sampled_projects, null);
+      assert.equal(assessment.summary.projects_truncated, null);
+    }
+    const guardrails = run.find((assessment) => assessment.category === "org-guardrails");
+    assert.equal(guardrails.summary.organization_visible, true, "the organization was read and stays a real value");
+    assert.equal(guardrails.summary.target_project, null);
+    for (const value of Object.values(guardrails.snapshot.effective_policies)) {
+      assert.equal(value.status, "not_collected");
+    }
+    for (const assessment of run) {
+      for (const marker of snapshotLeaves(assessment.snapshot, SNAPSHOT_SOURCES[assessment.category]).filter(([, value]) => isMarker(value)).map(([, value]) => value)) {
+        if (marker.dataset === GCP_INVENTORIES.projects.dataset) {
+          assert.equal(marker.status, "unreadable");
+          assert.equal(leadingStatusCode(marker.error), status);
+        } else {
+          assert.equal(marker.status, "not_collected", `${marker.dataset} was never requested, so its marker is not collected rather than unreadable`);
+          assert.ok(marker.error.includes(GCP_INVENTORIES.projects.endpoint), `${marker.dataset} marker must name the upstream project inventory call`);
+        }
+      }
+    }
+  }
+});
+
+/** Every array in a JSON document as path -> length, so a [] stand-in can be compared against the compliant bundle. */
+function arrayLengthsByPath(value, path = "", into = new Map()) {
+  if (Array.isArray(value)) {
+    into.set(path, value.length);
+    value.forEach((item, index) => arrayLengthsByPath(item, `${path}[${index}]`, into));
+  } else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) arrayLengthsByPath(item, path ? `${path}.${key}` : key, into);
+  }
+  return into;
+}
+
+function markersIn(value, into = []) {
+  if (isMarker(value)) into.push(value);
+  else if (Array.isArray(value)) value.forEach((item) => markersIn(item, into));
+  else if (value && typeof value === "object") Object.values(value).forEach((item) => markersIn(item, into));
+  return into;
+}
+
+test("exportGcpAuditBundle core_data writes a status marker, never [], for every dataset denied or not collected in the zero-scope row", async () => {
+  const base = createTempBase("grclanker-gcp-zero-scope-");
+  const compliant = await exportGcpAuditBundle(sweepClient([], undefined, 403, "full", ORG_ONLY_CONFIG), ORG_ONLY_CONFIG, base, { max_projects: 5 });
+  assert.equal(compliant.errorCount, 0);
+  const requests = [];
+  const denied = await exportGcpAuditBundle(sweepClient(requests, PROJECTS_ROW.match, 403, "full", ORG_ONLY_CONFIG), ORG_ONLY_CONFIG, base, { max_projects: 5 });
+  assert.ok(denied.errorCount > 0);
+  assertEveryRequestClassified(requests, "zero-scope bundle");
+  const blocked = blockedSurfaces(requests);
+  assert.deepEqual([...blocked].sort(), [...PER_PROJECT_SURFACE_IDS, ...POLICY_SURFACE_IDS].sort());
+  assert.match(readFileSync(join(denied.outputDir, "_errors.log"), "utf8"), /searchAllResources/);
+
+  const coreFiles = readdirSync(join(compliant.outputDir, "core_data")).filter((name) => name.endsWith(".json") && name !== "access.json").sort();
+  assert.deepEqual(coreFiles.map((name) => name.replace(/\.json$/, "")).sort(), Object.keys(SNAPSHOT_SOURCES).sort());
+  let markerCount = 0;
+  for (const name of coreFiles) {
+    const category = name.replace(/\.json$/, "");
+    const baselineLengths = arrayLengthsByPath(JSON.parse(readFileSync(join(compliant.outputDir, "core_data", name), "utf8")));
+    const snapshot = JSON.parse(readFileSync(join(denied.outputDir, "core_data", name), "utf8"));
+    for (const [path, length] of arrayLengthsByPath(snapshot)) {
+      assert.ok(
+        length > 0 || (baselineLengths.get(path) ?? 0) === 0,
+        `core_data/${name} ${path} renders [] although the compliant bundle lists ${baselineLengths.get(path)} rows; a denied or never-collected dataset needs a status marker`,
+      );
+    }
+    const markers = markersIn(snapshot);
+    markerCount += markers.length;
+    for (const marker of markers) assertMarker(`core_data/${name} ${marker.dataset}`, marker);
+    assertInventoryEntriesMatchRequests(`core_data/${name}`, [...markers, ...snapshot.unreadable_inventories], requests);
+    for (const [path, value] of snapshotLeaves(snapshot, SNAPSHOT_SOURCES[category])) {
+      const sources = path.split(".").reduce((node, key) => node[key], SNAPSHOT_SOURCES[category]);
+      if (derivedFromUnreadable(sources, PROJECTS_ROW, blocked)) assertMarker(`core_data/${name} ${path}`, value);
+      else assert.ok(!isMarker(value) && value !== null, `core_data/${name} ${path} was read and must carry its rows`);
+    }
+  }
+  const expectedMarkers = Object.values(SNAPSHOT_SOURCES).flatMap((fields) => classifiedSnapshotPaths(fields)).filter(([, sources]) => derivedFromUnreadable(sources, PROJECTS_ROW, blocked)).length;
+  assert.equal(markerCount, expectedMarkers, "one marker per dataset whose read was denied or blocked, and no other");
+  assert.ok(markerCount >= 30, `the zero-scope row blocks at least 30 datasets (got ${markerCount})`);
+
+  const summaries = JSON.parse(readFileSync(join(denied.outputDir, "analysis", "category_summaries.json"), "utf8"));
+  assert.equal(summaries.length, 5);
+  for (const entry of summaries) {
+    assert.equal(entry.summary.sampled_projects, null, `${entry.category} summary`);
+    assert.equal(entry.summary.projects_truncated, null, `${entry.category} summary`);
+    assertStatusesMatchRequests(`analysis/category_summaries.json ${entry.category}`, SUMMARY_SOURCES[entry.category], entry.summary, "", requests);
+  }
+  const findings = JSON.parse(readFileSync(join(denied.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.length, 31);
+  for (const finding of findings) {
+    assert.notEqual(finding.status, "pass", `${finding.id} must not pass in the zero-scope row`);
+    if (finding.status === "manual" && "seen" in finding.evidence) assert.equal(finding.evidence.seen, null, `${finding.id} seen`);
+    assertStatusesMatchRequests(`analysis/findings.json ${finding.id}`, EVIDENCE_SOURCES[finding.id], finding.evidence, finding.summary, requests);
+  }
+  for (const pathname of walkFiles(denied.outputDir)) {
+    assert.doesNotMatch(readFileSync(pathname, "utf8"), /\b(complete|healthy)\b/i, `${relative(denied.outputDir, pathname)} must not describe a denied scope as complete`);
+  }
 });
 
 test("GCP-ORG-06 demotes and names constraints/compute.requireOsLogin when the effective policy is unreadable (rule 1 corollary)", async () => {
@@ -1519,12 +1978,30 @@ test("GCP-ORG-02 through ORG-06 demote and name the project inventory when it is
 
   assert.equal(Object.values(statuses([result])).filter((status) => status === "pass").length, 0);
 
-  const orgOnlyClient = createClient(async (url, init) => (requestFacts(url, init).path.endsWith(":searchAllResources") ? denied(403) : jsonResponse(routeCompliant(url, init))), sampleConfig({ projectId: undefined }));
-  const withoutProject = findingsById([await assessGcpOrgGuardrails(orgOnlyClient)]);
+  const orgOnlyRequests = [];
+  const orgOnlyClient = createClient(async (url, init) => {
+    orgOnlyRequests.push(url);
+    return requestFacts(url, init).path.endsWith(":searchAllResources") ? denied(403) : jsonResponse(routeCompliant(url, init));
+  }, sampleConfig({ projectId: undefined }));
+  const withoutProjectRun = await assessGcpOrgGuardrails(orgOnlyClient);
+  const withoutProject = findingsById([withoutProjectRun]);
+  assert.ok(!orgOnlyRequests.some((url) => url.includes(":getEffectiveOrgPolicy")), "no effective policy read may be attempted without a project");
   for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05", "GCP-ORG-06"]) {
     assert.equal(withoutProject[id].status, "manual", `${id} has no project to resolve the effective policy against`);
-    assert.match(withoutProject[id].summary, /:searchAllResources/, `${id} must name the failed project inventory`);
+    assert.match(withoutProject[id].summary, /:searchAllResources \(403 Forbidden/, `${id} must name the failed project inventory and its status`);
   }
+  for (const id of ["GCP-ORG-02", "GCP-ORG-03", "GCP-ORG-04", "GCP-ORG-05"]) {
+    // Round 6: the policy read was never attempted, so no status is attributed to :getEffectiveOrgPolicy.
+    assert.match(withoutProject[id].summary, /^Manual: effective org policy constraints\/[\w.]+( and effective org policy constraints\/[\w.]+)? not collected for the scope \(cloudresourcemanager\.googleapis\.com\/v1\/projects\/\{project\}:getEffectiveOrgPolicy was not called\): no project could be enumerated because project inventory was unreadable via cloudasset\.googleapis\.com\/v1\/\{scope\}:searchAllResources \(403 Forbidden\), so no project was available to compute the effective policy\. Collect manually:/);
+    assert.doesNotMatch(withoutProject[id].summary, /getEffectiveOrgPolicy \(\d{3}/);
+    const policyField = "policy" in withoutProject[id].evidence ? "policy" : "serial_port_policy";
+    assert.equal(withoutProject[id].evidence[policyField], null, `${id} ${policyField} must render null when the read was not attempted`);
+    assert.ok(withoutProject[id].evidence.unreadable_inventories.some((entry) => entry.status === "not_collected" && entry.endpoint.endsWith(":getEffectiveOrgPolicy")));
+  }
+  assert.equal(withoutProjectRun.summary.target_project, null);
+  assert.equal(withoutProjectRun.summary.projects_truncated, null);
+  assert.equal(withoutProjectRun.snapshot.effective_policies.requireOsLogin.status, "not_collected");
+  assert.equal(withoutProjectRun.snapshot.effective_policies.requireOsLogin.data, null);
 });
 
 test("GCP-LOG-05 demotes when the findings list is unreadable or truncated and never fabricates a zero", async () => {
