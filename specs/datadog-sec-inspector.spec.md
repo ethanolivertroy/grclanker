@@ -58,7 +58,7 @@ Compliance matters because Datadog tenants are the control plane for observabili
 | `/api/v2/application_keys` | GET | List all application keys | `user_access_read` |
 | `/api/v2/application_keys/{app_key_id}` | GET | Get application key detail | `user_access_read` |
 | `/api/v2/current_user/application_keys` | GET | List current user's application keys | none (scoped) |
-| `/api/v2/validate_keys` | POST | Validate API and application key pair | API key only |
+| `/api/v2/validate_keys` | GET | Validate API and application key pair | none (`OPEN` permission, both key headers) |
 | `/api/v2/ip_allowlist` | GET | Get IP allowlist configuration | `org_management` |
 | `/api/v2/ip_allowlist` | PATCH | Update IP allowlist entries | `org_management` |
 | `/api/v2/sensitive-data-scanner/config` | GET | List sensitive data scanner groups/rules | `data_scanner_read` |
@@ -275,7 +275,7 @@ The shipped implementation lives in grclanker as native TypeScript (`cli/extensi
 
 | Tool | Controls |
 |---|---|
-| `datadog_check_access` | Validates the API key and probes every read surface, reporting missing application key permissions |
+| `datadog_check_access` | Validates the API key (`GET /api/v1/validate`) and the key pair (`GET /api/v2/validate_keys`), then probes every read surface including `org_connections`, reporting missing application key permissions |
 | `datadog_assess_identity` | 1, 2, 3, 4, 16, 19 |
 | `datadog_assess_access_controls` | 5, 6, 14, 15, 18 |
 | `datadog_assess_security_monitoring` | 8, 9, 12, 13, 17 |
@@ -283,6 +283,8 @@ The shipped implementation lives in grclanker as native TypeScript (`cli/extensi
 | `datadog_export_audit_bundle` | All 20 controls: `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log`, and a zip archive |
 
 Findings are normalized as `{ id: DD-NN, title, severity, status: pass | warn | fail | manual, summary, evidence, mappings[] }` and carry the framework references from section 5. Tests live in `cli/tests/datadog.test.mjs`, the live smoke script is `npm --prefix cli run test:datadog:live`, and the user guide is `src/content/docs/docs/integrations/datadog.md`.
+
+Every finding follows the same verdict-safety rules: an unreadable, forbidden (401 or 403), or errored endpoint yields `manual` with the cause and the evidence to collect; an empty inventory never passes by default and each control states whether emptiness is `fail` (audit events, detection rules, scanning groups, compliance rules) or `manual` (users, roles, keys, indexes, monitors, cloud footprint); controls the API cannot observe are `manual`; items without a date are bucketed and cap the verdict at `warn`; a partial or truncated inventory flags the partial view and downgrades a would-be `pass` to `warn`; every enabling flag the verdict depends on is read explicitly and an absent flag yields `manual`; and export reruns never overwrite a prior bundle.
 
 ## 8. CLI Interface
 
@@ -380,23 +382,26 @@ Implemented in grclanker as native TypeScript on 2026-09-21 (see the grclanker i
 
 ### What shipped
 
-- Configuration resolution with the precedence explicit arguments, then environment variables (`DD_API_KEY`, `DD_APP_KEY` or `DD_APPLICATION_KEY`, `DD_SITE`, `DD_HOST`, `DD_CONFIG_FILE`, `DD_TIMEOUT`, `DD_MAX_RETRIES`), then a dogshell-style `~/.dogrc` `[Connection]` section. Every site in section 3 plus `ap2`, `uk1`, and `us2.ddog-gov.com` maps to `https://api.<site>`.
-- A `fetch`-based API client that sends `DD-API-KEY` and `DD-APPLICATION-KEY`, follows each endpoint's documented pagination (`page[size]` and `page[number]`; `page[limit]` and `page[cursor]` with `meta.page.after`; `page` and `page_size`; `limit` and `offset`), retries 429 honoring `X-RateLimit-Reset`, retries 5xx with backoff, enforces timeouts, and redacts both keys from errors.
-- `datadog_check_access` plus four assessment tools covering all 20 controls, and `datadog_export_audit_bundle` producing raw snapshots, normalized findings, an executive summary, a unified compliance matrix, eight framework reports, a quick reference, an error log on partial collection, and a zip archive.
+- Configuration resolution with the precedence explicit arguments, then environment variables (`DD_API_KEY`, `DD_APP_KEY` or `DD_APPLICATION_KEY`, `DD_SITE`, `DD_HOST`, `DD_CONFIG_FILE`, `DD_TIMEOUT`, `DD_MAX_RETRIES`), then a dogshell-style `~/.dogrc` `[Connection]` section. Every site in section 3 plus `ap2`, `uk1`, and `us2.ddog-gov.com` (aliases `us2-fed` and `us2gov`, alongside `us1-fed` for `ddog-gov.com`) maps to `https://api.<site>`, following the sites guide and the OpenAPI `servers` list.
+- A `fetch`-based API client that sends `DD-API-KEY` and `DD-APPLICATION-KEY`, follows each endpoint's documented pagination to completion (`page[size]` and `page[number]`; `page[limit]` and `page[cursor]` with `meta.page.after` or `meta.page.cursor`; `page` and `page_size`; `count` and `start`; `limit` and `offset`), records truncation when a configured limit is reached, retries 429 honoring `X-RateLimit-Reset`, retries 5xx with backoff, enforces timeouts, and redacts both keys from errors.
+- `datadog_check_access` (validating the API key with `GET /api/v1/validate` and the key pair with `GET /api/v2/validate_keys`) plus four assessment tools covering all 20 controls, and `datadog_export_audit_bundle` producing raw snapshots, normalized findings, an executive summary, a unified compliance matrix, eight framework reports, a quick reference, an error log on partial collection, and a zip archive named after the allocated bundle directory so reruns never overwrite a prior bundle.
+- Verdict-safety rules applied to all 20 findings (see the grclanker implementation subsection in section 7), with regression tests for each rule and false-pass fixtures (every endpoint 403, every list empty, partial inventory) run through the built module.
 - Mocked test coverage in `cli/tests/datadog.test.mjs` and a live smoke script that skips without credentials.
 
 ### Deviations from this spec (official docs win)
 
 - Security signals: `POST /api/v1/security_analytics/signals/search` (control 9, section 2) is not in the official API reference. The implementation uses `GET /api/v2/security_monitoring/signals` with `filter[query]`, `filter[from]`, `filter[to]`, `sort`, `page[limit]`, and `page[cursor]`.
-- Key validation: `POST /api/v2/validate_keys` is not in the official reference. Only `GET /api/v1/validate` is used.
+- Key validation: `/api/v2/validate_keys` exists as `GET` (not `POST` as originally listed in section 2) with the `OPEN` permission and validates the API key and application key pair. `datadog_check_access` calls it alongside `GET /api/v1/validate`.
+- MFA (control 2): the API exposes only Datadog-native `mfa_enabled`. SAML strict mode disables password login but says nothing about IdP-enforced MFA, so a strict-mode org whose users lack native MFA is a `manual` finding naming the IdP authentication policy to capture, never `pass`.
+- Cloud integrations (controls 12 and 18): `GET /api/v1/integration/aws` and `GET /api/v1/integration/gcp` are marked `deprecated: true` in the OpenAPI definitions (the replacements are `GET /api/v2/integration/aws/accounts` and `GET /api/v2/integration/gcp/accounts`); `GET /api/v1/integration/azure` is not deprecated. The implementation still reads the v1 endpoints because they remain documented and return the CSPM resource collection flags the controls depend on.
 - Application keys: `GET /api/v2/application_keys` requires `org_app_keys_read`, not `user_access_read` as listed in section 2. Owners are resolved through `include=owned_by`.
 - Audit Trail: the implementation reads `GET /api/v2/audit/events` (cursor paginated) instead of `POST /api/v2/audit/events/search`. Retention is inferred from the oldest event available inside the required window because the retention setting is not exposed by the API.
-- CSPM (control 12): enablement is derived from enabled `cloud_configuration` rules plus the `cspm_resource_collection_enabled`, `is_cspm_enabled`, and `cspm_enabled` flags on AWS, GCP, and Azure integrations, and the passing rate comes from `GET /api/v2/posture_management/findings` with `filter[evaluation]=pass|fail` and `meta.page.total_filtered_count`. That endpoint is marked legacy in the OpenAPI definition but remains the documented list endpoint.
+- CSPM (control 12): enablement is derived from enabled `cloud_configuration` rules plus the `cspm_resource_collection_enabled`, `is_cspm_enabled`, and `cspm_enabled` flags on AWS, GCP, and Azure integrations, and the passing rate comes from `GET /api/v2/posture_management/findings` with `filter[evaluation]=pass|fail`, using `meta.page.total_filtered_count` when present and otherwise paging by `page[cursor]` up to `finding_limit` (a hit limit marks the count truncated and the verdict `warn`). That endpoint is marked legacy in the OpenAPI definition but remains the documented list endpoint. The finding is `manual` when the rules, the integrations, or either findings query is unreadable.
 - Compliance coverage (control 13): derived from `framework:`, `compliance_framework:`, and `requirement_framework:` tags on enabled `cloud_configuration` and `infrastructure_configuration` rules.
 - Session timeout (control 16): `GET /api/v1/org` does not return a session duration, so this control is always a `manual` finding that names the console setting to capture.
 - Integration permissions (control 18): the Datadog API exposes the AWS, GCP, and Azure integration inventory (including AWS accounts using static access keys instead of role delegation) but not cloud-side IAM policies or webhook URLs (webhooks are only retrievable by exact name). This control is always a `manual` finding with the inventory attached as evidence.
 - Dashboards (control 14): `GET /api/v1/dashboard?filter[shared]=true` reports shared dashboards but not the share type, so shared dashboards produce `warn`; `private_widget_share` on the organization produces `fail`.
-- Organization settings (control 20): data retention is read from log index `num_retention_days` (`GET /api/v1/logs/config/indexes`) and cross-org sharing from `GET /api/v2/org_connections` (`limit` and `offset` pagination), because `GET /api/v1/org` exposes neither.
+- Organization settings (control 20): data retention is read from log index `num_retention_days` (`GET /api/v1/logs/config/indexes`) and cross-org sharing from `GET /api/v2/org_connections` (`limit` and `offset` pagination, documented default limit 1000, paged to completion), because `GET /api/v1/org` exposes neither. An unreadable `org_connections` surface makes the finding `manual` rather than counting as zero connections.
 - `GET /api/v1/logs/config/pipeline-order`, `GET /api/v2/audit/events/search`, `GET /api/v2/restriction_policy/{id}`, and the write endpoints listed in section 2 are not used; the tools are read-only.
 
 ### What remains
@@ -404,4 +409,5 @@ Implemented in grclanker as native TypeScript on 2026-09-21 (see the grclanker i
 - Session timeout (16) and integration permissions (18) stay manual until Datadog exposes those settings through the public API.
 - The share type (public versus invite-only) of each shared dashboard is not exposed by the dashboard list endpoint and is not collected; shared dashboards surface as `warn` for human review.
 - OSCAL output, CSV and HTML reporters, and the interactive TUI from the original build sequence are not implemented; the bundle ships JSON findings and Markdown reports instead.
-- Live validation against a Datadog for Government (`ddog-gov.com`) organization has not been performed; the site mapping and endpoints follow the official documentation.
+- Migrating the AWS and GCP integration inventory from the deprecated v1 endpoints to `GET /api/v2/integration/aws/accounts` and `GET /api/v2/integration/gcp/accounts` (with their `aws_configuration_read` and `gcp_configuration_read` permissions) is pending.
+- Live validation against a Datadog for Government (`ddog-gov.com`, `us2.ddog-gov.com`) organization has not been performed; the site mapping and endpoints follow the official documentation.
