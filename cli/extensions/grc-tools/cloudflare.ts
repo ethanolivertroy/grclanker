@@ -1999,6 +1999,11 @@ export async function assessCloudflareZoneSecurity(
     const settings = settingMap(settingsOutcome.ok ? settingsOutcome.value : []);
     if (!settingsOutcome.ok) {
       for (const settingId of CLOUDFLARE_ZONE_SETTING_IDS) settings.set(settingId, { error: settingsOutcome.error });
+    } else {
+      // getZoneSettings reports each failed per-setting read inline instead of throwing; every one is recorded.
+      for (const [settingId, read] of settings) {
+        if (read.error) errors.push(`${name} /settings/${settingId}: ${read.error}`);
+      }
     }
 
     if (!managedOutcome.ok) {
@@ -2483,6 +2488,18 @@ function buildUnifiedMatrix(findings: CloudflareFinding[]): string {
   ].join("\n");
 }
 
+/**
+ * Shortens report cells without splitting a token, so a cut summary never leaves a partial endpoint
+ * path or status behind; the ellipsis marks that the full text lives in analysis/findings.json.
+ */
+function truncateAtWordBoundary(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const head = text.slice(0, maxLength);
+  const boundary = head.lastIndexOf(" ");
+  if (boundary <= 0) return text;
+  return `${head.slice(0, boundary).replace(/[\s(,;:]+$/, "")} …`;
+}
+
 function buildFrameworkReport(framework: { key: keyof ControlMapping; label: string }, findings: CloudflareFinding[], generatedAt: string): string {
   const mapped = findings.filter((item) => frameworkControlFor(item, framework.key) !== "n/a");
   const counts = statusCounts(mapped);
@@ -2491,7 +2508,7 @@ function buildFrameworkReport(framework: { key: keyof ControlMapping; label: str
     item.id,
     item.status.toUpperCase(),
     item.title,
-    item.summary.slice(0, 160),
+    truncateAtWordBoundary(item.summary, 160),
   ]);
   return [
     `# ${framework.label} Compliance Report (Cloudflare)`,

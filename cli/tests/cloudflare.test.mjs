@@ -18,10 +18,20 @@ import {
   assessCloudflareZoneSecurity,
   checkCloudflareAccess,
   exportCloudflareAuditBundle,
+  redactErrorText,
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/cloudflare.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  HTML_BODY_NOTE,
+  REDACTED_CANARY_URL,
+  assertNoCanaries,
+  assertNoCanariesInFiles,
+  assertRedactionCases,
+  htmlCanaryBody,
+  jsonCanaryMessage,
+} from "./helpers/error-canaries.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1051,7 +1061,11 @@ test("rule 1 corollary: multi-inventory findings never pass when only a secondar
   assert.match(access.summary, /\/accounts\/acc-123\/access\/policies could not be read \(.*403/);
   assert.match(access.summary, /Access: Apps and Policies: Read/);
   assert.equal(access.evidence.reusable_policies_readable, false);
-  assert.equal(access.evidence.reusable_policies, 0);
+  // The denied inventory renders null with the observed status, never the zero of an empty fallback.
+  assert.equal(access.evidence.reusable_policies, null);
+  assert.equal(access.evidence.reusable_policies_total, null);
+  assert.equal(access.evidence.reusable_policies_truncated, null);
+  assert.equal(access.evidence.reusable_policies_http_status, 403);
   assert.equal(access.evidence.inline_policies, 1);
   assert.ok(policiesForbidden.errors.some((error) => error.includes("/accounts/acc-123/access/policies")));
   for (const item of policiesForbidden.findings) {
@@ -1067,6 +1081,12 @@ test("rule 1 corollary: multi-inventory findings never pass when only a secondar
   assert.equal(tokenExpiry.status, "warn", tokenExpiry.summary);
   assert.match(tokenExpiry.summary, /\/accounts\/acc-123\/tokens could not be read/);
   assert.deepEqual(tokenExpiry.evidence.sources.map((source) => source.readable), [true, false]);
+  const deniedSource = tokenExpiry.evidence.sources[1];
+  assert.deepEqual(
+    { seen: deniedSource.seen, total: deniedSource.total, truncated: deniedSource.truncated, http_status: deniedSource.http_status, attempted: deniedSource.attempted },
+    { seen: null, total: null, truncated: null, http_status: 403, attempted: true },
+    "the denied token list carries no count or truncation flag, only the observed status",
+  );
 
   const gatewayForbidden = await assessCloudflareTrafficControls(fixtureClient("compliant", {
     async listGatewayRules() {
@@ -1159,8 +1179,389 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
   const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
   await assert.rejects(client.listMembers("acc-123"), (error) => {
     assert.equal(error.status, 502);
+    assert.equal(error.path, "/accounts/acc-123/members");
     assert.ok(!error.message.includes(leaked), error.message);
-    assert.match(error.message, /non-JSON text\/html body of \d+ bytes not echoed/);
+    assert.match(error.message, /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
     return true;
   });
+
+  // A 2xx answer that is not JSON (a proxy login page) is a failed read, not an empty inventory.
+  const okHtml = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: async () => new Response(`<html>Sign in with Bearer ${leaked}</html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }),
+  });
+  await assert.rejects(okHtml.listMembers("acc-123"), (error) => {
+    assert.equal(error.status, 200);
+    assert.ok(!error.message.includes(leaked), error.message);
+    assert.match(error.message, /non-JSON payload for \/accounts\/acc-123\/members \(200 OK\): non-JSON body \(text\/html, \d+ bytes\)/);
+    return true;
+  });
+
+  // Transport failures carry the path and the failure class, never a status they did not observe.
+  const timedOut = new CloudflareApiClient(sampleConfig({ timeoutMs: 5 }), {
+    fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error(`aborted while holding Bearer ${leaked}`)));
+    }),
+  });
+  await assert.rejects(timedOut.verifyCurrentToken(), (error) => {
+    assert.equal(error.status, undefined);
+    assert.equal(error.path, "/user/tokens/verify");
+    assert.match(error.message, /timed out after 5 ms/);
+    assert.ok(!error.message.includes(leaked), error.message);
+    return true;
+  });
+});
+
+test("rule 9: redactErrorText scrubs every credential shape anywhere in an error string and leaves prose alone", () => {
+  assertRedactionCases(assert, redactErrorText);
+  // The configured token is scrubbed wherever an upstream error echoes it.
+  new CloudflareApiClient(sampleConfig({ apiToken: "FAKE_SECRET_CONFIGURED_TOKEN_7" }), { fetchImpl: async () => new Response("{}") });
+  assert.equal(redactErrorText("proxy replayed FAKE_SECRET_CONFIGURED_TOKEN_7 upstream"), "proxy replayed [REDACTED] upstream");
+});
+
+const CLOUDFLARE_JSON_HEADERS = { "content-type": "application/json" };
+
+function cloudflareOk(result) {
+  return () => new Response(JSON.stringify({ success: true, errors: [], messages: [], result }), { status: 200, statusText: "OK", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+function cloudflareForbidden() {
+  return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null }), { status: 403, statusText: "Forbidden", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+function cloudflareNotFound() {
+  return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "not found" }], messages: [], result: null }), { status: 404, statusText: "Not Found", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+function cloudflareCanaryHtml() {
+  return new Response(htmlCanaryBody(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function cloudflareCanaryJson() {
+  return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: jsonCanaryMessage() }], messages: [], result: null }), { status: 403, statusText: "Forbidden", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+const ZONE = "zone-1";
+const ACCOUNT = "acc-123";
+
+/**
+ * Every documented path the access check, the three assessments, and the export request for one
+ * account with one zone, each answering with the compliant fixture. Keys are request paths without
+ * the /client/v4 prefix; the fallback routes (/firewall/rules, /rate_limits, /subscription) are
+ * included so a run that reaches them is still served.
+ */
+function healthyCloudflareRoutes() {
+  const routes = {
+    "/user/tokens/verify": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, not_before: "2026-01-01T00:00:00Z" }),
+    "/user/tokens/tok-current": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, policies: [{ id: "p1", effect: "allow", permission_groups: [{ id: "pg1", name: "Zone Read" }], resources: { "com.cloudflare.api.account.zone.zone-1": "*" } }] }),
+    "/user/tokens": cloudflareOk([
+      { id: "tok-1", name: "audit", status: "active", expires_on: FUTURE, last_used_on: RECENT, issued_on: "2026-01-01T00:00:00Z", policies: [] },
+      { id: "tok-2", name: "old", status: "expired", expires_on: "2025-01-01T00:00:00Z", policies: [] },
+    ]),
+    "/accounts": cloudflareOk([{ id: ACCOUNT, name: "Example", type: "standard", settings: { enforce_twofactor: true } }]),
+    "/zones": cloudflareOk([{ id: ZONE, name: "one.example", status: "active" }]),
+    [`/accounts/${ACCOUNT}/tokens`]: cloudflareOk([{ id: "atok-1", name: "ci", status: "active", expires_on: FUTURE, last_used_on: RECENT, policies: [] }]),
+    [`/accounts/${ACCOUNT}/members`]: cloudflareOk([
+      { id: "m1", status: "accepted", user: { email: "owner@example.com", two_factor_authentication_enabled: true }, roles: [{ id: "r1", name: "Super Administrator - All Privileges" }] },
+      { id: "m2", status: "accepted", user: { email: "auditor@example.com", two_factor_authentication_enabled: true }, roles: [{ id: "r2", name: "Administrator Read Only" }] },
+    ]),
+    [`/accounts/${ACCOUNT}/access/apps`]: cloudflareOk([{ id: "app-1", name: "Admin", type: "self_hosted", domain: "admin.one.example", policies: [{ id: "pol-1", decision: "allow", include: [{ email_domain: { domain: "example.com" } }] }] }]),
+    [`/accounts/${ACCOUNT}/access/policies`]: cloudflareOk([{ id: "pol-2", name: "Staff", decision: "allow", reusable: true, include: [] }]),
+    [`/accounts/${ACCOUNT}/access/identity_providers`]: cloudflareOk([{ id: "idp-1", name: "Okta", type: "okta" }]),
+    [`/accounts/${ACCOUNT}/audit_logs`]: cloudflareOk([{ id: "evt-1", when: RECENT, action: { type: "change_setting", result: true }, actor: { email: "admin@example.com" } }]),
+    [`/accounts/${ACCOUNT}/gateway/rules`]: cloudflareOk([{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }, { id: "gw-2", name: "Isolate", action: "isolate", enabled: true, filters: ["http"] }]),
+    [`/accounts/${ACCOUNT}/gateway`]: cloudflareOk({ id: ACCOUNT, gateway_tag: "gw-tag-1", provider_name: "Cloudflare" }),
+    [`/accounts/${ACCOUNT}/firewall/access_rules/rules`]: cloudflareOk([{ id: "ip-1", mode: "block", notes: "Known scanner", modified_on: RECENT, configuration: { target: "ip", value: "198.51.100.1" } }]),
+    [`/zones/${ZONE}/dnssec`]: cloudflareOk({ status: "active", algorithm: "13" }),
+    [`/zones/${ZONE}/rulesets`]: cloudflareOk([
+      { id: "rs-managed", kind: "zone", phase: CLOUDFLARE_RULESET_PHASES.firewallManaged, name: "zone", version: "1" },
+      { id: "rs-ddos", kind: "managed", phase: CLOUDFLARE_RULESET_PHASES.ddosL7, name: "DDoS L7 ruleset", version: "1" },
+    ]),
+    [`/zones/${ZONE}/ssl/universal/settings`]: cloudflareOk({ enabled: true }),
+    [`/zones/${ZONE}/origin_tls_client_auth/settings`]: cloudflareOk({ enabled: true }),
+    [`/zones/${ZONE}/origin_tls_client_auth/hostnames`]: cloudflareOk([{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT }]),
+    [`/zones/${ZONE}/ssl/certificate_packs`]: cloudflareOk([{ id: "pack-1", type: "universal", status: "active", hosts: ["one.example"], certificates: [{ id: "cert-1", status: "active", expires_on: FUTURE, hosts: ["one.example"] }] }]),
+    [`/zones/${ZONE}/dns_records`]: cloudflareOk([
+      { id: "rec-1", type: "A", name: "one.example", content: "203.0.113.10", proxied: true, proxiable: true, ttl: 1 },
+      { id: "rec-2", type: "TXT", name: "one.example", content: "v=spf1 -all", proxied: false, proxiable: false, ttl: 300 },
+    ]),
+    [`/zones/${ZONE}/pagerules`]: cloudflareOk([{ id: "pr-1", status: "active", priority: 1, targets: [{ target: "url", constraint: { operator: "matches", value: "one.example/static/*" } }], actions: [{ id: "browser_cache_ttl", value: 14400 }] }]),
+    [`/zones/${ZONE}/bot_management`]: cloudflareOk({ fight_mode: true }),
+    [`/zones/${ZONE}/subscription`]: cloudflareOk({ id: "sub-1", state: "Paid", rate_plan: { id: "cf_pro", public_name: "Pro Website", currency: "USD" } }),
+    [`/zones/${ZONE}/firewall/rules`]: cloudflareOk([]),
+    [`/zones/${ZONE}/rate_limits`]: cloudflareOk([]),
+  };
+  for (const setting of compliantSettings()) routes[`/zones/${ZONE}/settings/${setting.id}`] = cloudflareOk(setting);
+  for (const phase of [CLOUDFLARE_RULESET_PHASES.firewallManaged, CLOUDFLARE_RULESET_PHASES.firewallCustom, CLOUDFLARE_RULESET_PHASES.ddosL7, CLOUDFLARE_RULESET_PHASES.responseHeadersTransform, CLOUDFLARE_RULESET_PHASES.rateLimit]) {
+    routes[`/zones/${ZONE}/rulesets/phases/${phase}/entrypoint`] = cloudflareOk(compliantEntrypoint(phase));
+  }
+  return routes;
+}
+
+/** Fallback paths a compliant run never reaches; they are served so any run that does reach them is still healthy. */
+const CLOUDFLARE_FALLBACK_ROUTES = new Set([`/zones/${ZONE}/firewall/rules`, `/zones/${ZONE}/rate_limits`, `/zones/${ZONE}/subscription`]);
+
+/**
+ * Serves the route table over the real client and records every request (method, path, status).
+ * An unrouted path answers 500 with a distinctive message so the healthy baseline (errorCount 0)
+ * proves the table is complete.
+ */
+function cloudflareRoutedFetch(routes, log = []) {
+  return async (url, init) => {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace("/client/v4", "");
+    const route = routes[path];
+    const response = route
+      ? await route(parsed)
+      : new Response(JSON.stringify({ success: false, errors: [{ code: 1, message: `unrouted test path ${path}` }] }), { status: 500, statusText: "Internal Server Error", headers: CLOUDFLARE_JSON_HEADERS });
+    log.push({ method: init?.method ?? "GET", path, status: response.status });
+    return response;
+  };
+}
+
+async function runEveryCloudflareTool(client, outputRoot) {
+  const access = await checkCloudflareAccess(client);
+  const identity = await assessCloudflareIdentity(client);
+  const zone = await assessCloudflareZoneSecurity(client);
+  const traffic = await assessCloudflareTrafficControls(client);
+  const exported = await exportCloudflareAuditBundle(client, client.getResolvedConfig(), outputRoot);
+  return { access, assessments: [identity, zone, traffic], exported };
+}
+
+/** Every string an assessment records about a failed read: the errors array plus evidence error fields. */
+function recordedCloudflareErrors(assessments) {
+  const recorded = [];
+  for (const assessment of assessments) {
+    recorded.push(...assessment.errors);
+    for (const item of assessment.findings) {
+      for (const [key, value] of Object.entries(item.evidence ?? {})) {
+        if (typeof value === "string" && /(^|_)error$/.test(key)) recorded.push(value);
+      }
+      for (const source of item.evidence?.sources ?? []) {
+        if (typeof source.error === "string") recorded.push(source.error);
+      }
+    }
+  }
+  return recorded;
+}
+
+test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
+  const config = sampleConfig({ apiToken: "FAKE_SECRET_CANARY_RUN_TOKEN_8" });
+  const outputRoot = createTempBase("grclanker-cloudflare-canary-");
+
+  // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
+  const healthyLog = [];
+  const healthy = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), healthyLog) });
+  const healthyRun = await runEveryCloudflareTool(healthy, outputRoot);
+  assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
+  for (const assessment of healthyRun.assessments) {
+    for (const item of assessment.findings) assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+  }
+  const requested = new Set(healthyLog.map((entry) => entry.path));
+  const surfaces = Object.keys(healthyCloudflareRoutes()).filter((path) => !CLOUDFLARE_FALLBACK_ROUTES.has(path));
+  assert.deepEqual([...requested].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the assessments, or the export");
+  const accessLog = [];
+  await checkCloudflareAccess(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), accessLog) }));
+  const probed = new Set(accessLog.map((entry) => entry.path));
+
+  for (const surface of surfaces) {
+    for (const [variant, response, expectedNote] of [
+      ["html", cloudflareCanaryHtml, HTML_BODY_NOTE],
+      ["json", cloudflareCanaryJson, REDACTED_CANARY_URL],
+    ]) {
+      const label = `${surface} (${variant})`;
+      const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: response }) });
+      const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-canary-"));
+
+      assertNoCanaries(assert, access, `${label} check_access`);
+      if (probed.has(surface)) {
+        const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
+        assert.ok(failed.length > 0, `${label}: the access check records the failing surface`);
+        for (const entry of failed) {
+          assert.match(entry.error, expectedNote, `${label}: probe ${entry.name} carries the expected note`);
+          assert.equal(entry.count, null, `${label}: probe ${entry.name} renders no count`);
+          assert.equal(entry.http_status, variant === "html" ? 502 : 403, `${label}: probe ${entry.name} records the observed status`);
+        }
+      }
+
+      const recorded = recordedCloudflareErrors(assessments);
+      for (const assessment of assessments) assertNoCanaries(assert, assessment, `${label} ${assessment.title}`);
+      assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by an assessment`);
+      if (variant === "html") {
+        for (const error of recorded) assert.match(error, HTML_BODY_NOTE, `${label}: "${error}" carries the status-and-length note`);
+        assert.ok(recorded.some((error) => /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/.test(error)), `${label}: the note names the observed status`);
+      } else {
+        for (const error of recorded) assert.match(error, REDACTED_CANARY_URL, `${label}: "${error}" keeps the URL host and path with its query redacted`);
+      }
+
+      const files = readBundleFiles(exported.outputDir);
+      assertNoCanariesInFiles(assert, files, `${label} bundle`);
+      assertNoCanariesInFiles(assert, readZipEntries(exported.zipPath), `${label} zip`);
+      assert.ok(exported.errorCount > 0, `${label}: the export logs the failed read`);
+      if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+    }
+  }
+});
+
+/**
+ * Single-surface denials with the evidence a consumer reads for the denied inventory. Every field
+ * listed must render null (or false for readable flags), never the zero or empty list of a fallback.
+ */
+const CLOUDFLARE_DENIAL_TABLE = [
+  { surface: "/accounts", finding: null, summaryFields: { identity: ["visible_accounts"] }, coreData: "core_data/accounts.json" },
+  { surface: "/zones", finding: null, summaryFields: { zone: ["sampled_zones", "zones_total", "zone_inventory_truncated"], traffic: ["sampled_zones", "zones_total", "zone_inventory_truncated"], identity: ["sampled_zones"] }, coreData: "core_data/zones.json" },
+  { surface: "/user/tokens", finding: "CF-IAM-06", nullFields: [], sourceIndex: 0 },
+  { surface: `/accounts/${ACCOUNT}/tokens`, finding: "CF-IAM-06", nullFields: [], sourceIndex: 1 },
+  { surface: `/accounts/${ACCOUNT}/members`, finding: "CF-IAM-03", nullFields: ["super_admins", "members_seen", "members_total", "members_truncated", "members_without_2fa"], statusField: "members_http_status", summaryFields: { identity: ["super_admins"] } },
+  { surface: `/accounts/${ACCOUNT}/access/apps`, finding: "CF-IAM-04", nullFields: ["access_apps", "access_apps_total", "access_apps_truncated", "inline_policies", "bypass_policies", "apps_without_policies"], statusField: "access_apps_http_status", summaryFields: { identity: ["access_apps", "access_policies"] } },
+  { surface: `/accounts/${ACCOUNT}/access/policies`, finding: "CF-IAM-04", nullFields: ["reusable_policies", "reusable_policies_total", "reusable_policies_truncated"], statusField: "reusable_policies_http_status", summaryFields: { identity: ["access_policies"] } },
+  { surface: `/accounts/${ACCOUNT}/access/identity_providers`, finding: "CF-IAM-05", nullFields: ["identity_providers", "identity_provider_types", "identity_providers_truncated"], statusField: "identity_providers_http_status", summaryFields: { identity: ["identity_providers"] } },
+  { surface: `/accounts/${ACCOUNT}/audit_logs`, finding: "CF-TRF-04", nullFields: ["audit_events"], statusField: "http_status", summaryFields: { traffic: ["audit_events"] } },
+  { surface: `/accounts/${ACCOUNT}/firewall/access_rules/rules`, finding: "CF-TRF-05", nullFields: ["ip_access_rules"], statusField: "http_status", summaryFields: { traffic: ["ip_access_rules"] } },
+  { surface: `/accounts/${ACCOUNT}/gateway/rules`, finding: "CF-TRF-06", nullFields: ["gateway_rules"], statusField: "http_status", summaryFields: { traffic: ["gateway_rules"] } },
+];
+
+const ASSESSMENT_KEYS = { identity: "Cloudflare identity posture", zone: "Cloudflare zone security posture", traffic: "Cloudflare traffic controls posture" };
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and path, a readable-but-empty list stays [], and every count for the denied inventory renders null", async () => {
+  const config = sampleConfig();
+  const outputRoot = createTempBase("grclanker-cloudflare-denied-");
+
+  // Readable-but-empty lists keep an empty items array with real, observed flags.
+  const emptyRoutes = { ...healthyCloudflareRoutes(), "/zones": cloudflareOk([]) };
+  const emptyRun = await runEveryCloudflareTool(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(emptyRoutes) }), outputRoot);
+  const emptyZones = JSON.parse(readBundleFiles(emptyRun.exported.outputDir).get("core_data/zones.json"));
+  assert.deepEqual(emptyZones, { items: [], truncated: false, totalCount: 0 }, "a readable-but-empty zone list is written as an empty items array with observed flags");
+  assert.equal(emptyRun.access.surfaces.find((entry) => entry.name === "zones").count, 0, "a readable-but-empty probe reports the real zero");
+  for (const item of emptyRun.assessments[1].findings) {
+    assert.equal(item.status, "manual", `${item.id} with zero zones`);
+    assert.equal(item.evidence.zones_seen, 0, `${item.id}: a readable-but-empty zone list counts zero`);
+    assert.equal(item.evidence.zone_inventory_truncated, false);
+  }
+
+  for (const entry of CLOUDFLARE_DENIAL_TABLE) {
+    const log = [];
+    const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [entry.surface]: cloudflareForbidden }, log) });
+    const { access, assessments, exported } = await runEveryCloudflareTool(client, outputRoot);
+    const label = entry.surface;
+    const files = readBundleFiles(exported.outputDir);
+    const accessFile = JSON.parse(files.get("core_data/access.json"));
+    assert.ok(log.some((request) => request.path === entry.surface && request.status === 403), `${label}: the fixture served the 403`);
+
+    for (const probe of accessFile.surfaces.filter((candidate) => candidate.status === "not_readable")) {
+      assert.deepEqual(
+        { count: probe.count, http_status: probe.http_status, endpoint: probe.endpoint },
+        { count: null, http_status: 403, endpoint: entry.surface },
+        `${label}: the denied probe ${probe.name} keeps count null and records the observed status and path`,
+      );
+      assert.match(probe.error, /\(403 Forbidden\)/, `${label}: the probe error names the observed status`);
+    }
+    for (const probe of access.surfaces.filter((candidate) => candidate.status === "readable")) {
+      assert.equal(typeof probe.count, "number", `${label}: a readable probe still reports its count`);
+    }
+
+    if (entry.coreData) {
+      const marker = JSON.parse(files.get(entry.coreData));
+      assert.deepEqual(
+        { collected: marker.collected, status: marker.status, endpoint: marker.endpoint },
+        { collected: false, status: 403, endpoint: entry.surface },
+        `${label}: ${entry.coreData} is a not-collected marker, never an empty list`,
+      );
+      assert.match(marker.error, /403 Forbidden/, `${label}: the marker carries the scrubbed error`);
+      assert.ok(!("items" in marker), `${label}: the marker has no items array to mistake for an inventory`);
+    }
+
+    for (const [key, fields] of Object.entries(entry.summaryFields ?? {})) {
+      const assessment = assessments.find((candidate) => candidate.title === ASSESSMENT_KEYS[key]);
+      for (const field of fields) assert.equal(assessment.summary[field], null, `${label}: ${key} summary ${field} renders null for the denied inventory`);
+    }
+
+    if (entry.finding) {
+      const item = assessments.flatMap((assessment) => assessment.findings).find((candidate) => candidate.id === entry.finding);
+      assert.notEqual(item.status, "pass", `${label}: ${entry.finding} must not pass (${item.summary})`);
+      for (const field of entry.nullFields) assert.equal(item.evidence[field], null, `${label}: ${entry.finding} evidence ${field} renders null, not a fallback count`);
+      if (entry.statusField) assert.equal(item.evidence[entry.statusField], 403, `${label}: ${entry.finding} records the observed status`);
+      if (entry.sourceIndex !== undefined) {
+        const source = item.evidence.sources[entry.sourceIndex];
+        assert.deepEqual({ readable: source.readable, seen: source.seen, total: source.total, truncated: source.truncated, http_status: source.http_status, endpoint: source.endpoint }, { readable: false, seen: null, total: null, truncated: null, http_status: 403, endpoint: entry.surface }, `${label}: the denied token source carries no count`);
+      }
+      assert.match(item.summary, new RegExp(entry.surface.replace(/[/]/g, "\\/")), `${label}: ${entry.finding} names the denied endpoint`);
+    } else if (entry.surface === "/zones") {
+      // Every zone-scoped finding (the account-scoped CF-TRF-04..06 do not read the zone list).
+      const zoneScoped = [...assessments[1].findings, ...assessments[2].findings.filter((item) => /^CF-TRF-0[1-3]$/.test(item.id))];
+      assert.equal(zoneScoped.length, 18, `${label}: every zone-scoped finding is checked`);
+      {
+        for (const item of zoneScoped) {
+          assert.equal(item.status, "manual", `${label}: ${item.id} renders manual for the denied zone list`);
+          assert.deepEqual(
+            { zones_seen: item.evidence.zones_seen, zones_total: item.evidence.zones_total, zone_inventory_truncated: item.evidence.zone_inventory_truncated, zones_http_status: item.evidence.zones_http_status },
+            { zones_seen: null, zones_total: null, zone_inventory_truncated: null, zones_http_status: 403 },
+            `${label}: ${item.id} carries no zone count, total, or truncation flag`,
+          );
+          assert.ok(!("per_hostname_source" in item.evidence) && !("legacy_fallback" in item.evidence), `${label}: ${item.id} names no endpoint the run never requested`);
+        }
+      }
+    }
+  }
+});
+
+/** Endpoint mentions: absolute paths, `{zone_id}`-style templates, and per-zone suffix labels such as "/dnssec". */
+function namedCloudflareEndpoints(text) {
+  const mentions = new Set();
+  for (const match of text.matchAll(/(?<![\w.:/])(\/(?:user|accounts|zones|rulesets|dnssec|settings|ssl|origin_tls_client_auth|dns_records|pagerules|bot_management|rate_limits|firewall|subscription|access|gateway|audit_logs|members|tokens)(?:\/[A-Za-z0-9_{}.*-]+)*)/g)) {
+    mentions.add(match[1].replace(/[.,;:)]+$/, ""));
+  }
+  return mentions;
+}
+
+function namedCloudflareStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) (?:Forbidden|Unauthorized|Not Found|Bad Gateway|Bad Request|Internal Server Error|Service Unavailable|Too Many Requests|OK)\)/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"[a-z_]*(?:http_)?status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+function cloudflareEndpointWasRequested(mention, log) {
+  const pattern = new RegExp(`${mention.replace(/[.*]/g, "\\$&").replace(/\{[^}]+\}/g, "[^/]+")}$`);
+  return log.some((request) => pattern.test(request.path));
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const config = sampleConfig();
+  const outputRoot = createTempBase("grclanker-cloudflare-request-log-");
+  const log = [];
+  const routes = {
+    ...healthyCloudflareRoutes(),
+    [`/accounts/${ACCOUNT}/access/policies`]: cloudflareForbidden,
+    [`/accounts/${ACCOUNT}/members`]: cloudflareCanaryHtml,
+    [`/zones/${ZONE}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.firewallManaged}/entrypoint`]: cloudflareForbidden,
+    [`/zones/${ZONE}/dnssec`]: cloudflareNotFound,
+    // Enterprise-shaped bot management renders manual, which is the only path that requests the zone subscription.
+    [`/zones/${ZONE}/bot_management`]: cloudflareOk({ auto_update_model: true, suppress_session_score: false }),
+    [`/zones/${ZONE}/subscription`]: cloudflareForbidden,
+    [`/accounts/${ACCOUNT}/gateway`]: cloudflareForbidden,
+  };
+  const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(routes, log) });
+  const { access, assessments, exported } = await runEveryCloudflareTool(client, outputRoot);
+
+  const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...readBundleFiles(exported.outputDir).values()];
+  const text = outputs.join("\n");
+  const observedStatuses = new Set(log.map((request) => request.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+  assert.ok(log.some((request) => request.path === `/zones/${ZONE}/firewall/rules`), "the deprecated firewall rules fallback was requested because the managed ruleset read failed");
+  assert.ok(log.some((request) => request.path === `/zones/${ZONE}/subscription`), "the zone subscription was requested because the bot management verdict is manual");
+
+  const endpoints = namedCloudflareEndpoints(text);
+  assert.ok(endpoints.size >= 8, `the outputs name the failing endpoints (${[...endpoints].join(", ")})`);
+  for (const mention of endpoints) {
+    assert.ok(cloudflareEndpointWasRequested(mention, log), `endpoint "${mention}" is named in output but the run never requested it`);
+  }
+  const statuses = namedCloudflareStatusCodes(text);
+  assert.ok(statuses.has(403) && statuses.has(502), `the outputs name the observed failure statuses (${[...statuses].join(", ")})`);
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+  // The legacy fallback is documented only because the run requested it.
+  const managedWaf = assessments[1].findings.find((item) => item.id === "CF-ZONE-01");
+  assert.equal(managedWaf.evidence.legacy_firewall_rules_seen, 0);
+  assert.match(managedWaf.evidence.legacy_fallback, /was consulted for evidence only because the rulesets API was unreadable/);
 });
