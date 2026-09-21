@@ -765,10 +765,27 @@ const ROLE_TYPE_STANDARD = "STANDARD";
  */
 const AUTHENTICATION_DOMAIN_FIELDS = "id name organizationId provisioningType authenticationType";
 const AUTHENTICATION_DOMAIN_COLLECTION_FIELDS = "nextCursor";
+/**
+ * API key inventory. Three layers, tried in order; a schema mismatch on one layer falls through to the next.
+ * Documented: docs.newrelic.com/docs/apis/nerdgraph/examples/use-nerdgraph-manage-license-keys-user-keys
+ *   keySearch(query: { types, scope: { ingestTypes } }) { keys { name key type ... on ApiAccessIngestKey { ingestType } } }
+ *   and the mutation responses createdKeys/updatedKeys { id key name notes type }. The key string is never requested.
+ * Schema reference (public NerdGraph schema, mirrored by newrelic-client-go pkg/apiaccess/types.go):
+ *   ApiAccessKeySearchResult { count keys nextCursor }; ApiAccessKeySearchScope { accountIds ingestTypes userIds };
+ *   ApiAccessUserKey { accountId createdAt id name type userId }; ApiAccessIngestKey { accountId createdAt id ingestType name type }.
+ * Layer 1 (QUERY_API_KEYS) adds the schema-cited pagination fields and the `cursor` argument, layer 2
+ * (QUERY_API_KEYS_SINGLE_PAGE) keeps the schema-cited key fields without a cursor, and layer 3
+ * (QUERY_API_KEYS_DOCUMENTED) reads only fields shown on the docs page. When layer 3 is used, createdAt, userId and
+ * accountId are absent, so controls 4, 5 and 6 render manual for the parts that need them.
+ */
 const API_KEY_FIELDS = `keys {
-        id name notes type createdAt
+        id name type createdAt
         ... on ApiAccessIngestKey { accountId ingestType }
         ... on ApiAccessUserKey { accountId userId }
+      }`;
+const API_KEY_DOCUMENTED_FIELDS = `keys {
+        id name type
+        ... on ApiAccessIngestKey { ingestType }
       }`;
 const QUERY_API_KEYS = `query($query: ApiAccessKeySearchQuery!, $cursor: String) {
   actor { apiAccess {
@@ -786,6 +803,14 @@ const QUERY_API_KEYS_SINGLE_PAGE = `query($query: ApiAccessKeySearchQuery!) {
     }
   } }
 }`;
+const QUERY_API_KEYS_DOCUMENTED = `query($query: ApiAccessKeySearchQuery!) {
+  actor { apiAccess {
+    keySearch(query: $query) {
+      ${API_KEY_DOCUMENTED_FIELDS}
+    }
+  } }
+}`;
+export const API_KEY_DOCUMENTED_ONLY_NOTE = "keySearch rejected the schema-cited fields, so only the documented fields (id, name, type, ingestType) were read on a single page; createdAt, userId, accountId, and pagination are unavailable and completeness is unknown";
 const QUERY_NRQL = `query($accountId: Int!, $nrql: Nrql!) {
   actor { account(id: $accountId) { nrql(query: $nrql) { results } } }
 }`;
@@ -1215,17 +1240,30 @@ export class NewrelicApiClient {
       return await this.paginate(QUERY_API_KEYS, variables, ["actor", "apiAccess", "keySearch"], "keys", limit);
     } catch (error) {
       if (!isSchemaMismatchError(error)) throw error;
-      const data = await this.nerdgraph(QUERY_API_KEYS_SINGLE_PAGE, variables);
-      const search = asObject(getNestedValue(data, ["actor", "apiAccess", "keySearch"]));
-      const keys = asRecords(search?.keys).slice(0, limit);
-      const totalCount = asNumber(search?.count);
+    }
+    try {
+      const search = await this.keySearchPage(QUERY_API_KEYS_SINGLE_PAGE, variables);
+      const keys = asRecords(search.keys).slice(0, limit);
+      const totalCount = asNumber(search.count);
       return {
         items: keys,
         complete: totalCount !== undefined && keys.length >= totalCount,
         totalCount,
         note: `keySearch rejected the cursor argument, so only the first page was read (${keys.length}${totalCount !== undefined ? ` of ${totalCount}` : ""} keys)`,
       };
+    } catch (error) {
+      if (!isSchemaMismatchError(error)) throw error;
     }
+    const search = await this.keySearchPage(QUERY_API_KEYS_DOCUMENTED, variables);
+    const keys = asRecords(search.keys).slice(0, limit);
+    return { items: keys, complete: false, note: `${API_KEY_DOCUMENTED_ONLY_NOTE} (${keys.length} keys read)` };
+  }
+
+  private async keySearchPage(query: string, variables: JsonRecord): Promise<JsonRecord> {
+    const data = await this.nerdgraph(query, variables);
+    const search = asObject(getNestedValue(data, ["actor", "apiAccess", "keySearch"]));
+    if (!search) throw new Error("NerdGraph response did not include actor.apiAccess.keySearch.");
+    return search;
   }
 
   async runNrql(accountId: number, nrql: string): Promise<JsonRecord[]> {
@@ -2282,6 +2320,9 @@ export function assessNewrelicAccessControlData(
   const access = buildUserAccountAccess(users, groupGrants, adminRolePattern);
   const adminUserIds = new Set(access.filter((entry) => entry.admin).map((entry) => asString(entry.user.id) ?? ""));
   const adminOwnedUserKeys = userKeys.filter((key) => adminUserIds.has(asString(key.userId) ?? ""));
+  const userKeysWithoutOwner = userKeys.filter((key) => asString(key.userId) === undefined);
+  const ownerIdsUnavailable = userKeys.length > 0 && userKeysWithoutOwner.length === userKeys.length;
+  const ownerIdsUnavailableNote = `none of the ${userKeys.length} user keys exposed a userId (the schema-cited ApiAccessUserKey.userId field was not returned)`;
 
   const agedUserKeys = userKeys.filter((key) => {
     const age = keyAgeDays(key, now);
@@ -2360,20 +2401,23 @@ export function assessNewrelicAccessControlData(
     }
     if (!usersReadable) return manualVerdict(`${keyInventoryLabel}, but users were not readable (${causeOf(data.users)}), so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
     if (!grantsReadable) return manualVerdict(`${keyInventoryLabel}, but group role grants were not readable (${causeOf(data.groupGrants)}), so admin group members cannot be identified as key owners. Collect ${keyEvidence}`);
+    if (ownerIdsUnavailable) return manualVerdict(`${keyInventoryLabel}, but ${ownerIdsUnavailableNote}, so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
     if (unnamedKeys.length > 0 || adminOwnedUserKeys.length > 0 || unknownTypeKeys.length > 0) {
       return verdict("warn", `${keyInventoryLabel}; ${unnamedKeys.length} lack a name, ${adminOwnedUserKeys.length} user keys inherit admin-level permissions from their owners, and ${unknownTypeKeys.length} expose no key type.`);
     }
-    if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
-      return verdict("warn", `${keyInventoryLabel} with names and readable key types, but ${usersWithoutGroupData.length} users expose no group membership and ${groupsWithoutRoleData.length} groups expose no role grants, so admin-owned user keys may be undercounted.`);
+    if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0 || userKeysWithoutOwner.length > 0) {
+      return verdict("warn", `${keyInventoryLabel} with names and readable key types, but ${usersWithoutGroupData.length} users expose no group membership, ${groupsWithoutRoleData.length} groups expose no role grants, and ${userKeysWithoutOwner.length} user keys expose no userId, so admin-owned user keys may be undercounted.`);
     }
-    return verdict("pass", `${keyInventoryLabel} with names, readable key types, and no user keys owned by admin group members (${adminUserIds.size} admin users matched against ${userKeys.length} user keys).`);
+    return verdict("pass", `${keyInventoryLabel} with names, readable key types, and no user keys owned by admin group members (${adminUserIds.size} admin users matched against ${userKeys.length} user keys, every one exposing a userId).`);
   };
 
   const control5 = (): Verdict => {
     if (!keysReadable) return unreadableVerdict("API keys (apiAccess.keySearch)", data.apiKeys, `the Created column of the API keys UI, flagging user keys older than ${maxKeyAgeDays} days.`);
     if (keys.length === 0) return manualVerdict(`${zeroKeysNote}; key age cannot be evaluated on an empty inventory, which is unknown rather than compliant. Collect ${keyEvidence}`);
     if (agedUserKeys.length > 0) return verdict("fail", `${agedUserKeys.length}/${userKeys.length} user keys are older than ${maxKeyAgeDays} days without rotation.`);
-    if (keysWithoutCreatedAt.length === keys.length) return manualVerdict(`createdAt was not exposed for any of the ${keys.length} keys, so key age is unknown. Review key creation dates in the API keys UI.`);
+    if (keysWithoutCreatedAt.length === keys.length) {
+      return manualVerdict(`createdAt (the schema-cited ApiAccessUserKey.createdAt and ApiAccessIngestKey.createdAt fields) was not exposed for any of the ${keys.length} keys, so key age cannot be evaluated through the API. Review the Created column of the API keys UI for every account in scope.`);
+    }
     if (agedLicenseKeys.length > 0) {
       return verdict("warn", `No dated user keys exceed ${maxKeyAgeDays} days, but ${agedLicenseKeys.length} license keys are older than that threshold and should have a rotation plan${keysWithoutCreatedAt.length > 0 ? `; ${keysWithoutCreatedAt.length} keys have no createdAt and were not counted as fresh` : ""}.`);
     }
@@ -2397,10 +2441,14 @@ export function assessNewrelicAccessControlData(
       }
       return verdict("pass", `${zeroKeysNote}. Both conditions for accepting an empty inventory hold: keySearch was readable and complete for every account in scope, and every in-scope account (${data.accountIds.join(", ")}) is visible to this key in actor.accounts.`);
     }
-    if (orphanedUserKeys.length > 0 || inactiveOwnerKeys.length > 0 || undatedOwnerKeys.length > 0) {
-      return verdict("warn", `${orphanedUserKeys.length} user keys belong to users no longer visible, ${inactiveOwnerKeys.length} belong to users inactive for more than ${inactiveDays} days, and ${undatedOwnerKeys.length} belong to users with no lastActive value; ${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days${auditReadable ? "" : ` (audit events unreadable: ${causeOf(data.apiKeyAuditEvents)})`}.`);
+    const auditSummary = `${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days${auditReadable ? "" : ` (audit events unreadable: ${causeOf(data.apiKeyAuditEvents)})`}`;
+    if (ownerIdsUnavailable) {
+      return manualVerdict(`${keyInventoryLabel}, but ${ownerIdsUnavailableNote}, so orphaned and inactive-owner keys cannot be identified through the API; ${auditSummary}. Review every key with its owner in the API keys UI and revoke any without a documented consumer.`);
     }
-    return manualVerdict(`${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days${auditReadable ? "" : ` (audit events unreadable: ${causeOf(data.apiKeyAuditEvents)})`}. NrAuditEvent only records configuration changes, so read-only key usage cannot be confirmed through the API; review the remaining ${keys.length} keys with their owners and revoke any without a documented consumer.`);
+    if (orphanedUserKeys.length > 0 || inactiveOwnerKeys.length > 0 || undatedOwnerKeys.length > 0) {
+      return verdict("warn", `${orphanedUserKeys.length} user keys belong to users no longer visible, ${inactiveOwnerKeys.length} belong to users inactive for more than ${inactiveDays} days, and ${undatedOwnerKeys.length} belong to users with no lastActive value; ${auditSummary}.`);
+    }
+    return manualVerdict(`${auditSummary}. NrAuditEvent only records configuration changes, so read-only key usage cannot be confirmed through the API; review the remaining ${keys.length} keys with their owners${userKeysWithoutOwner.length > 0 ? ` (${userKeysWithoutOwner.length} user keys expose no userId)` : ""} and revoke any without a documented consumer.`);
   };
 
   const control7 = (): Verdict => {
@@ -2472,6 +2520,7 @@ export function assessNewrelicAccessControlData(
     unknown_type_keys: unknownTypeKeys.length,
     unnamed_keys: sample(unnamedKeys.map(keyLabel)),
     admin_owned_user_keys: sample(adminOwnedUserKeys.map(keyLabel)),
+    user_keys_without_user_id: userKeysWithoutOwner.length,
     audit_events_by_api_keys: data.apiKeyAuditEvents.data.length,
     key_listing_complete: isComplete(data.apiKeys),
   }));
@@ -2481,11 +2530,13 @@ export function assessNewrelicAccessControlData(
     aged_user_keys: sample(agedUserKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
     aged_license_keys: sample(agedLicenseKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
     keys_without_created_at: sample(keysWithoutCreatedAt.map(keyLabel)),
+    keys_without_created_at_total: keysWithoutCreatedAt.length,
     key_listing_complete: isComplete(data.apiKeys),
   }));
 
   findings.push(finding(6, limitCoverage(control6(), [...keyCoverage, ...userCoverage, ...auditCoverage, ...scopeCoverage]), {
     keys_total: keys.length,
+    user_keys_without_user_id: userKeysWithoutOwner.length,
     accounts_in_scope: data.accountIds,
     accounts_in_scope_not_visible: unseenScopeAccounts,
     key_listing_complete: isComplete(data.apiKeys),

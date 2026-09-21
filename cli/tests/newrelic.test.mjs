@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  API_KEY_DOCUMENTED_ONLY_NOTE,
   NEWRELIC_CONTROL_CATALOG,
   NewrelicApiClient,
   assessNewrelicAccessControl,
@@ -619,6 +620,85 @@ test("NewrelicApiClient falls back to a single-page keySearch when the cursor ar
   assert.match(keys.note, /rejected the cursor argument.*1 of 3 keys/);
   assert.equal(seen.length, 2);
   assert.doesNotMatch(seen[1], /cursor/);
+  assert.match(seen[1], /createdAt/);
+});
+
+test("NewrelicApiClient falls back to the documented keySearch fields when schema-cited fields are rejected", async () => {
+  const seen = [];
+  const fetchImpl = async (_input, init = {}) => {
+    const body = JSON.parse(init.body);
+    seen.push(body.query);
+    if (body.query.includes("cursor: $cursor")) {
+      return jsonResponse({ errors: [{ message: 'Cannot query field "nextCursor" on type "ApiAccessKeySearchResult".' }] });
+    }
+    if (body.query.includes("createdAt")) {
+      return jsonResponse({ errors: [{ message: 'Cannot query field "createdAt" on type "ApiAccessKey". Did you mean "created"?' }] });
+    }
+    return jsonResponse({
+      data: {
+        actor: {
+          apiAccess: {
+            keySearch: {
+              keys: [
+                { id: "key-1", name: "user", type: "USER" },
+                { id: "key-2", name: "license", type: "INGEST", ingestType: "LICENSE" },
+              ],
+            },
+          },
+        },
+      },
+    });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+  const keys = await client.listApiKeys(["USER", "INGEST"], [111]);
+
+  assert.equal(seen.length, 3);
+  assert.match(seen[0], /nextCursor count/);
+  assert.match(seen[1], /count\s+keys \{\s+id name type createdAt/);
+  assert.match(seen[2], /keySearch\(query: \$query\) \{\s+keys \{\s+id name type\s+\.\.\. on ApiAccessIngestKey \{ ingestType \}\s+\}/);
+  assert.doesNotMatch(seen[2], /createdAt|userId|accountId|notes|nextCursor|count|cursor|\bkey\b/);
+  assert.deepEqual(keys.items.map((key) => key.id), ["key-1", "key-2"]);
+  assert.equal(keys.complete, false);
+  assert.equal(keys.totalCount, undefined);
+  assert.match(keys.note, /only the documented fields \(id, name, type, ingestType\) were read on a single page; createdAt, userId, accountId, and pagination are unavailable and completeness is unknown \(2 keys read\)/);
+
+  const unauthorized = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ errors: [{ message: "Not authorized", path: ["actor", "apiAccess", "keySearch"] }] }),
+  });
+  await assert.rejects(unauthorized.listApiKeys(["USER"]), /Not authorized/);
+});
+
+test("NewrelicApiClient treats every NerdGraph schema validation wording as a schema mismatch", async () => {
+  const wordings = [
+    'Cannot query field "nextCursor" on type "ApiAccessKeySearchResult".',
+    'Unknown argument "cursor" on field "ApiAccessActorStitchedFields.keySearch".',
+    'Unknown field "count" on type "ApiAccessKeySearchResult".',
+    'Argument "query" has invalid value {types: [USER]}.',
+    'Field "createdAt" is not defined by type "ApiAccessKey".',
+    'Field "keySearch" does not accept argument "cursor".',
+    'Field "userId" doesn\'t exist on type "ApiAccessKey".',
+  ];
+  for (const wording of wordings) {
+    let calls = 0;
+    const client = new NewrelicApiClient(sampleConfig(), {
+      fetchImpl: async (_input, init = {}) => {
+        calls += 1;
+        const body = JSON.parse(init.body);
+        if (body.query.includes("cursor: $cursor")) return jsonResponse({ errors: [{ message: wording }] });
+        return jsonResponse({ data: { actor: { apiAccess: { keySearch: { count: 1, keys: [{ id: "key-1", name: "user", type: "USER", createdAt: 1 }] } } } } });
+      },
+    });
+    const keys = await client.listApiKeys(["USER"]);
+    assert.equal(calls, 2, `expected a fallback after: ${wording}`);
+    assert.deepEqual(keys.items.map((key) => key.id), ["key-1"]);
+  }
+
+  for (const wording of ["Not authorized", "Forbidden: this key cannot read keySearch", "Internal server error"]) {
+    const client = new NewrelicApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ errors: [{ message: wording }] }),
+    });
+    await assert.rejects(client.listApiKeys(["USER"]), new RegExp(wording.split(":")[0]));
+  }
 });
 
 test("NewrelicApiClient reads the role catalog from customerAdministration.roles with the documented fields and cursor", async () => {
@@ -1012,6 +1092,61 @@ test("assessNewrelicAccessControl flags unnamed and aged keys, orphaned owners, 
   assert.deepEqual(findingById(result, "NR-20-CUSTOM-ROLE-PERMISSIONS").evidence.custom_roles, [
     { id: "9", name: "Deploy operators", scope: "account", type: "CUSTOM" },
   ]);
+});
+
+test("controls 4, 5 and 6 render manual when keySearch only exposes the documented key fields", async () => {
+  const documentedOnly = accessControlClient({
+    async listApiKeys() {
+      return {
+        items: [
+          { id: "key-1", name: "ci-deploy", type: "USER" },
+          { id: "key-2", name: "license-prod", type: "INGEST", ingestType: "LICENSE" },
+        ],
+        complete: false,
+        note: `${API_KEY_DOCUMENTED_ONLY_NOTE} (2 keys read)`,
+      };
+    },
+  });
+  const result = await assessNewrelicAccessControl(documentedOnly, { now: NOW });
+
+  const inventory = findingById(result, "NR-04-API-KEY-INVENTORY");
+  assert.equal(inventory.status, "manual");
+  assert.match(inventory.summary, /none of the 1 user keys exposed a userId \(the schema-cited ApiAccessUserKey\.userId field was not returned\)/);
+  assert.match(inventory.summary, /key owners cannot be matched to admin group members/);
+  assert.match(inventory.summary, /Partial view: .*keySearch rejected the schema-cited fields, so only the documented fields/);
+  assert.equal(inventory.evidence.user_keys_without_user_id, 1);
+  assert.equal(inventory.evidence.key_listing_complete, false);
+
+  const age = findingById(result, "NR-05-API-KEY-AGE");
+  assert.equal(age.status, "manual");
+  assert.match(age.summary, /createdAt \(the schema-cited ApiAccessUserKey\.createdAt and ApiAccessIngestKey\.createdAt fields\) was not exposed for any of the 2 keys/);
+  assert.match(age.summary, /key age cannot be evaluated through the API/);
+  assert.equal(age.evidence.keys_without_created_at_total, 2);
+
+  const unused = findingById(result, "NR-06-UNUSED-API-KEYS");
+  assert.equal(unused.status, "manual");
+  assert.match(unused.summary, /none of the 1 user keys exposed a userId/);
+  assert.match(unused.summary, /orphaned and inactive-owner keys cannot be identified through the API/);
+  assert.equal(unused.evidence.user_keys_without_user_id, 1);
+
+  const partialOwners = await assessNewrelicAccessControl(accessControlClient({
+    async listApiKeys() {
+      return [
+        { id: "key-1", name: "ci-deploy", type: "USER", createdAt: secondsAgo(10), userId: "bob", accountId: 111 },
+        { id: "key-4", name: "legacy-user-key", type: "USER", createdAt: secondsAgo(10) },
+        { id: "key-2", name: "license-prod", type: "INGEST", ingestType: "LICENSE", createdAt: secondsAgo(20), accountId: 111 },
+      ];
+    },
+  }), { now: NOW });
+  const partialInventory = findingById(partialOwners, "NR-04-API-KEY-INVENTORY");
+  assert.equal(partialInventory.status, "warn");
+  assert.match(partialInventory.summary, /1 user keys expose no userId, so admin-owned user keys may be undercounted/);
+  assert.equal(findingStatus(partialOwners, "NR-06-UNUSED-API-KEYS"), "manual");
+  assert.match(findingById(partialOwners, "NR-06-UNUSED-API-KEYS").summary, /\(1 user keys expose no userId\)/);
+
+  const clean = await assessNewrelicAccessControl(accessControlClient(), { now: NOW });
+  assert.equal(findingStatus(clean, "NR-04-API-KEY-INVENTORY"), "pass");
+  assert.match(findingById(clean, "NR-04-API-KEY-INVENTORY").summary, /every one exposing a userId/);
 });
 
 test("control 20 reads the role catalog from customerAdministration.roles and classifies by the CUSTOM/STANDARD enum", async () => {
@@ -1576,7 +1711,7 @@ test("verdict safety rule 4: items without dates are bucketed separately and cap
     },
   }), { now: NOW });
   assert.equal(findingStatus(allUndated, "NR-05-API-KEY-AGE"), "manual");
-  assert.match(findingById(allUndated, "NR-05-API-KEY-AGE").summary, /createdAt was not exposed for any of the 1 keys/);
+  assert.match(findingById(allUndated, "NR-05-API-KEY-AGE").summary, /createdAt \(.*\) was not exposed for any of the 1 keys/);
 
   const undatedOwner = await assessNewrelicAccessControl(accessControlClient({
     async listDomainUsers() {
