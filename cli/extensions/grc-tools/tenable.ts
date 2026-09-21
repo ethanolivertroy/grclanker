@@ -48,6 +48,11 @@ const DEFAULT_VULN_LOOKBACK_DAYS = 90;
 const DEFAULT_SLA_DAYS = { critical: 15, high: 30, medium: 90, low: 180 };
 const DAY_MS = 86_400_000;
 const ADMINISTRATOR_PERMISSION = 64;
+const EXPORT_JOB_WINDOW_DAYS = 3;
+const OWN_VULN_EXPORT_NUM_ASSETS = 5000;
+const OWN_VULN_EXPORT_STATES = ["open", "reopened", "fixed"];
+const OWN_ASSET_EXPORT_CHUNK_SIZE = 10000;
+const MAX_POLICY_DETAILS = 100;
 
 export type TenableFindingStatus = "pass" | "warn" | "fail" | "manual";
 export type TenableSeverity = "critical" | "high" | "medium" | "low" | "info";
@@ -726,6 +731,10 @@ export class TenableApiClient extends TenableHttpClient {
     return asRecords((await this.get("/policies")).policies);
   }
 
+  async getPolicyDetails(policyId: string | number): Promise<JsonRecord> {
+    return this.get(`/policies/${encodeURIComponent(String(policyId))}`);
+  }
+
   async listScanTemplates(): Promise<JsonRecord[]> {
     return asRecords((await this.get("/editor/scan/templates")).templates);
   }
@@ -839,14 +848,14 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async exportAssets(maxChunks = DEFAULT_MAX_CHUNKS): Promise<TenableExportResult> {
-    return this.runExport("assets", { chunk_size: 10000 }, maxChunks);
+    return this.runExport("assets", { chunk_size: OWN_ASSET_EXPORT_CHUNK_SIZE }, maxChunks);
   }
 
   async exportVulnerabilities(sinceUnixSeconds: number, maxChunks = DEFAULT_MAX_CHUNKS): Promise<TenableExportResult> {
     return this.runExport("vulns", {
-      num_assets: 5000,
+      num_assets: OWN_VULN_EXPORT_NUM_ASSETS,
       include_plugin_output: false,
-      filters: { since: sinceUnixSeconds, state: ["open", "reopened", "fixed"] },
+      filters: { since: sinceUnixSeconds, state: OWN_VULN_EXPORT_STATES },
     }, maxChunks);
   }
 }
@@ -1083,6 +1092,75 @@ function templateLooksDiscovery(template: JsonRecord): boolean {
   return /discovery/i.test(text);
 }
 
+function portscanRangeIsFull(range: string): boolean {
+  return /^all$/i.test(range) || /^1-65535$/.test(range.replace(/\s+/g, ""));
+}
+
+function evaluatePolicyDetail(detail: TenablePolicyDetail, policyNames: Map<string, string>): PolicyEvaluation {
+  const settings = asObject(detail.details.settings) ?? {};
+  const plugins = asObject(detail.details.plugins) ?? {};
+  const families = Object.values(plugins).map((family) => asString(asObject(family)?.status)?.toLowerCase());
+  const familiesEnabled = families.filter((status) => status === "enabled").length;
+  const familiesDisabled = families.filter((status) => status === "disabled").length;
+  const familiesMixed = families.filter((status) => status === "mixed").length;
+  const safeChecks = asString(settings.safe_checks)?.toLowerCase() ?? null;
+  const portscanRange = asString(settings.portscan_range) ?? null;
+  const evaluation: PolicyEvaluation = {
+    policyId: detail.policyId,
+    name: policyNames.get(detail.policyId) ?? asString(detail.details.name) ?? `policy ${detail.policyId}`,
+    scanNames: detail.scanNames,
+    verdict: "ok",
+    reasons: [],
+    safeChecks,
+    portscanRange,
+    familiesEnabled,
+    familiesDisabled,
+    familiesMixed,
+    performance: {
+      max_hosts_per_scan: asString(settings.max_hosts_per_scan) ?? null,
+      max_checks_per_host: asString(settings.max_checks_per_host) ?? null,
+      thorough_tests: asString(settings.thorough_tests) ?? null,
+      report_paranoia: asString(settings.report_paranoia) ?? null,
+    },
+  };
+  if (detail.status !== "ok") {
+    evaluation.verdict = "unreadable";
+    evaluation.reasons.push(`GET /policies/${detail.policyId} ${detail.status === "forbidden" ? "was refused" : "failed"} (${detail.error ?? "unknown"})`);
+    return evaluation;
+  }
+  if (safeChecks === "no") {
+    evaluation.verdict = "fail";
+    evaluation.reasons.push("safe_checks is no (unsafe plugins may disrupt hosts)");
+  }
+  if (families.length > 0 && familiesEnabled + familiesMixed === 0) {
+    evaluation.verdict = "fail";
+    evaluation.reasons.push(`all ${families.length} plugin families are disabled`);
+  }
+  if (evaluation.verdict === "fail") return evaluation;
+  if (safeChecks === null || families.length === 0) {
+    evaluation.verdict = "unverified";
+    if (safeChecks === null) evaluation.reasons.push("settings.safe_checks is not exposed for this policy");
+    if (families.length === 0) evaluation.reasons.push("plugins family map is empty or not exposed for this policy");
+    return evaluation;
+  }
+  if (safeChecks !== "yes") {
+    evaluation.verdict = "warn";
+    evaluation.reasons.push(`safe_checks has unexpected value ${safeChecks}`);
+  }
+  if (portscanRange === null) {
+    evaluation.verdict = "warn";
+    evaluation.reasons.push("settings.portscan_range is not exposed");
+  } else if (!/^default$/i.test(portscanRange) && !portscanRangeIsFull(portscanRange)) {
+    evaluation.verdict = "warn";
+    evaluation.reasons.push(`portscan_range is a custom range (${portscanRange}) rather than default or all ports`);
+  }
+  if (familiesDisabled > families.length / 2) {
+    evaluation.verdict = "warn";
+    evaluation.reasons.push(`${familiesDisabled} of ${families.length} plugin families are disabled`);
+  }
+  return evaluation;
+}
+
 function exclusionIsBroad(members: string | undefined): boolean {
   if (!members) return false;
   return members.split(",").some((member) => {
@@ -1093,9 +1171,32 @@ function exclusionIsBroad(members: string | undefined): boolean {
   });
 }
 
+export interface TenablePolicyDetail {
+  policyId: string;
+  scanNames: string[];
+  status: "ok" | "forbidden" | "error";
+  error?: string;
+  details: JsonRecord;
+}
+
+interface PolicyEvaluation {
+  policyId: string;
+  name: string;
+  scanNames: string[];
+  verdict: "ok" | "warn" | "fail" | "unverified" | "unreadable";
+  reasons: string[];
+  safeChecks: string | null;
+  portscanRange: string | null;
+  familiesEnabled: number;
+  familiesDisabled: number;
+  familiesMixed: number;
+  performance: JsonRecord;
+}
+
 export interface TenableScanProgramData {
   scans: TenableDataset<JsonRecord[]>;
   policies: TenableDataset<JsonRecord[]>;
+  policyDetails: TenableDataset<TenablePolicyDetail[]>;
   templates: TenableDataset<JsonRecord[]>;
   exclusions: TenableDataset<JsonRecord[]>;
   targetGroups: TenableDataset<JsonRecord[]>;
@@ -1134,6 +1235,57 @@ async function vmExport(clients: TenableClients, load: (client: TenableApiClient
   return collectExport(() => load(clients.vm as TenableApiClient));
 }
 
+async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await worker(items[index]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function collectPolicyDetails(clients: TenableClients, scans: TenableDataset<JsonRecord[]>): Promise<TenableDataset<TenablePolicyDetail[]>> {
+  if (!clients.vm) return notConfiguredDataset<TenablePolicyDetail[]>([], VM_NOT_CONFIGURED);
+  if (scans.status !== "ok") {
+    return { data: [], status: scans.status === "forbidden" ? "forbidden" : "error", error: `policy details were not requested because GET /scans failed: ${scans.error ?? "unknown"}`, seen: 0, truncated: true };
+  }
+  const scanNamesByPolicy = new Map<string, string[]>();
+  for (const scan of scans.data) {
+    const policyId = asString(scan.policy_id);
+    if (!policyId) continue;
+    scanNamesByPolicy.set(policyId, [...(scanNamesByPolicy.get(policyId) ?? []), asString(scan.name) ?? asString(scan.id) ?? "scan"]);
+  }
+  const policyIds = [...scanNamesByPolicy.keys()];
+  const requested = policyIds.slice(0, MAX_POLICY_DETAILS);
+  const client = clients.vm;
+  const details = await mapWithConcurrency(requested, 4, async (policyId): Promise<TenablePolicyDetail> => {
+    try {
+      const payload = await client.getPolicyDetails(policyId);
+      return { policyId, scanNames: scanNamesByPolicy.get(policyId) ?? [], status: "ok", details: payload };
+    } catch (error) {
+      return { policyId, scanNames: scanNamesByPolicy.get(policyId) ?? [], status: isForbiddenError(error) ? "forbidden" : "error", error: errorMessage(error), details: {} };
+    }
+  });
+  const readable = details.filter((detail) => detail.status === "ok");
+  const failed = details.filter((detail) => detail.status !== "ok");
+  const dataset: TenableDataset<TenablePolicyDetail[]> = {
+    data: details,
+    status: readable.length > 0 || details.length === 0 ? "ok" : failed.every((detail) => detail.status === "forbidden") ? "forbidden" : "error",
+    seen: readable.length,
+    total: policyIds.length,
+    truncated: policyIds.length > requested.length,
+  };
+  if (failed.length > 0) {
+    dataset.error = `${failed.length} of ${details.length} GET /policies/{policy_id} reads failed: ${failed.slice(0, 5).map((detail) => `${detail.policyId} (${detail.error ?? detail.status})`).join("; ")}`;
+  }
+  return dataset;
+}
+
 export async function collectTenableScanProgramData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableScanProgramData> {
   const now = options.now ?? Date.now();
   const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
@@ -1148,7 +1300,8 @@ export async function collectTenableScanProgramData(clients: TenableClients, opt
     scDataset(clients, (client) => client.listScans()),
     scDataset(clients, (client) => client.listScanResults(Math.floor((now - DEFAULT_STALE_SCAN_DAYS * DAY_MS) / 1000))),
   ]);
-  return { scans, policies, templates, exclusions, targetGroups, users, assetExport, scScans, scScanResults };
+  const policyDetails = await collectPolicyDetails(clients, scans);
+  return { scans, policies, policyDetails, templates, exclusions, targetGroups, users, assetExport, scScans, scScanResults };
 }
 
 export function assessTenableScanProgram(data: TenableScanProgramData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
@@ -1184,24 +1337,73 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       ? data.policies.data.map((policy) => asString(templatesById.get(asString(policy.template_uuid) ?? "")?.title) ?? "unresolved template")
       : [];
     const allDiscovery = scans.length > 0 && discoveryOnly === scans.length;
-    findings.push(finding(
-      1,
-      scans.length === 0 ? "fail" : allDiscovery ? "fail" : "manual",
-      "high",
-      scans.length === 0
-        ? `No scans are visible to this API key (GET /scans returned zero scans), so no scan policy configuration exists to audit; emptiness fails this control.${nonAdminNote(callerIsAdministrator)}`
-        : allDiscovery
-          ? `All ${scans.length} visible scans use host discovery templates; no vulnerability assessment policy is configured.`
-          : `${scans.length} scans and ${data.policies.data.length} user-defined templates are visible. Port range, plugin family, safe-check, and performance settings are not part of the published policy details schema, so a human must review the template settings in the Tenable UI (Scans > Scan Templates > User Defined). Template usage is listed in the evidence.${data.policies.status !== "ok" ? ` GET /policies failed: ${data.policies.error ?? "unknown"}.` : ""}`,
-      {
-        scan_count: scans.length,
-        policy_count: data.policies.status === "ok" ? data.policies.data.length : null,
-        policy_templates: policyTemplates.slice(0, 50),
-        scan_templates_in_use: Object.fromEntries(templateNames),
-        discovery_only_scans: discoveryOnly,
-        caller_is_administrator: callerIsAdministrator ?? null,
-      },
-    ));
+    const policyNames = new Map<string, string>();
+    for (const policy of data.policies.data) {
+      const id = asString(policy.id);
+      const name = asString(policy.name);
+      if (id && name) policyNames.set(id, name);
+    }
+    const evaluations = data.policyDetails.data.map((detail) => evaluatePolicyDetail(detail, policyNames));
+    const failingPolicies = evaluations.filter((item) => item.verdict === "fail");
+    const warningPolicies = evaluations.filter((item) => item.verdict === "warn");
+    const unreadablePolicies = evaluations.filter((item) => item.verdict === "unreadable");
+    const unverifiedPolicies = evaluations.filter((item) => item.verdict === "unverified");
+    const scansWithoutPolicy = scans.filter((scan) => asString(scan.policy_id) === undefined);
+    const describe = (items: PolicyEvaluation[]): string => items.slice(0, 10).map((item) => `${item.name} [${item.reasons.join("; ")}]`).join(", ");
+    const scanTypes = Object.fromEntries(scans.reduce((map, scan) => {
+      const key = asString(scan.type) ?? "unknown";
+      map.set(key, (map.get(key) ?? 0) + 1);
+      return map;
+    }, new Map<string, number>()));
+    let policyStatus: TenableFindingStatus;
+    let policySummary: string;
+    if (scans.length === 0) {
+      policyStatus = "fail";
+      policySummary = `No scans are visible to this API key (GET /scans returned zero scans), so no scan policy configuration exists to audit; emptiness fails this control.${nonAdminNote(callerIsAdministrator)}`;
+    } else if (allDiscovery) {
+      policyStatus = "fail";
+      policySummary = `All ${scans.length} visible scans use host discovery templates; no vulnerability assessment policy is configured.`;
+    } else if (failingPolicies.length > 0) {
+      policyStatus = "fail";
+      policySummary = `${failingPolicies.length} of ${evaluations.length} scan policies referenced by scans have unsafe settings: ${describe(failingPolicies)}. Settings were read from GET /policies/{policy_id} (settings.safe_checks, settings.portscan_range, plugins family status).`;
+    } else if (data.policyDetails.status !== "ok" || (evaluations.length === 0 && scansWithoutPolicy.length === scans.length)) {
+      policyStatus = "manual";
+      policySummary = evaluations.length === 0 && data.policyDetails.status === "ok"
+        ? `Unknown: none of the ${scans.length} visible scans exposes a policy_id, so GET /policies/{policy_id} could not be called; a human must review port range, plugin families, and safe checks for each scan template in the Tenable UI (Scans > Scan Templates).`
+        : `Unknown: GET /policies/{policy_id} could not be read for the ${evaluations.length} policies referenced by scans because ${data.policyDetails.status === "forbidden" ? "the API key was refused (requires the Standard [32] role and Can View on each scan template)" : `the read failed (${data.policyDetails.error ?? "unknown"})`}. A human must collect safe_checks, portscan_range, and enabled plugin families for each template from the Tenable UI.`;
+    } else if (unreadablePolicies.length > 0 || unverifiedPolicies.length > 0 || data.policyDetails.truncated) {
+      policyStatus = "manual";
+      policySummary = `Unknown: ${evaluations.length - unreadablePolicies.length - unverifiedPolicies.length} of ${evaluations.length} referenced scan policies were verified from GET /policies/{policy_id}, but ${unreadablePolicies.length} could not be read and ${unverifiedPolicies.length} do not expose safe_checks or a plugin family map${data.policyDetails.truncated ? `, and only ${data.policyDetails.seen} of ${data.policyDetails.total ?? "unknown"} referenced policies were requested` : ""}: ${describe([...unreadablePolicies, ...unverifiedPolicies])}. A human must review those templates in the Tenable UI before this control can pass.`;
+    } else if (warningPolicies.length > 0) {
+      policyStatus = "warn";
+      policySummary = `All ${evaluations.length} scan policies referenced by scans enable safe checks and at least one plugin family, but ${warningPolicies.length} need review: ${describe(warningPolicies)}.`;
+    } else {
+      policyStatus = capForNonAdmin("pass", callerIsAdministrator);
+      policySummary = `All ${evaluations.length} scan policies referenced by the ${scans.length} visible scans enable safe checks (safe_checks=yes), scan the default or full port range, and keep more than half of their plugin families enabled, per GET /policies/{policy_id}.${scansWithoutPolicy.length > 0 ? ` ${scansWithoutPolicy.length} scans expose no policy_id and were not evaluated.` : ""}${nonAdminNote(callerIsAdministrator)}`;
+      if (scansWithoutPolicy.length > 0 && policyStatus === "pass") policyStatus = "warn";
+    }
+    findings.push(finding(1, policyStatus, "high", policySummary, {
+      scan_count: scans.length,
+      scan_types: scanTypes,
+      policy_count: data.policies.status === "ok" ? data.policies.data.length : null,
+      policy_templates: policyTemplates.slice(0, 50),
+      scan_templates_in_use: Object.fromEntries(templateNames),
+      discovery_only_scans: discoveryOnly,
+      scans_without_policy_id: scansWithoutPolicy.map((scan) => asString(scan.name) ?? asString(scan.id)).slice(0, 50),
+      policies_evaluated: evaluations.slice(0, 50).map((item) => ({
+        policy_id: item.policyId,
+        name: item.name,
+        scans: item.scanNames.slice(0, 10),
+        verdict: item.verdict,
+        reasons: item.reasons,
+        safe_checks: item.safeChecks,
+        portscan_range: item.portscanRange,
+        plugin_families: { enabled: item.familiesEnabled, disabled: item.familiesDisabled, mixed: item.familiesMixed },
+        performance: item.performance,
+      })),
+      policy_details_status: data.policyDetails.status,
+      caller_is_administrator: callerIsAdministrator ?? null,
+    }));
 
     const recurring = scans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
     const disabledRecurring = scans.filter((scan) => !scanIsEnabled(scan) && scanIsRecurring(scan));
@@ -1363,6 +1565,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
   const errors = [
     ...datasetErrors("scans", data.scans),
     ...datasetErrors("policies", data.policies),
+    ...datasetErrors("policy_details", data.policyDetails),
     ...datasetErrors("templates", data.templates),
     ...datasetErrors("exclusions", data.exclusions),
     ...datasetErrors("target_groups", data.targetGroups),
@@ -1674,11 +1877,12 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     findings.push(unreadableFinding(8, "high", data.serverProperties, "GET /server/properties", "the current plugin set date from Settings > About and each scanner's plugin set"));
   } else {
     const serverPluginMs = parsePluginSetMs(data.serverProperties.data.plugin_set) ?? parsePluginSetMs(data.serverProperties.data.loaded_plugin_set);
-    const staleScanners = linkedScanners.filter((scanner) => {
+    const datedScanners = data.scanners.data.filter((scanner) => parsePluginSetMs(scanner.loaded_plugin_set) !== undefined);
+    const staleScanners = datedScanners.filter((scanner) => {
       const stamp = parsePluginSetMs(scanner.loaded_plugin_set);
       return stamp !== undefined && now - stamp > pluginStaleHours * 3_600_000;
     });
-    const undatedScanners = linkedScanners.filter((scanner) => parsePluginSetMs(scanner.loaded_plugin_set) === undefined);
+    const undatedScanners = data.scanners.data.filter((scanner) => asBoolean(scanner.pool) !== true && asBoolean(scanner.group) !== true && parsePluginSetMs(scanner.loaded_plugin_set) === undefined);
     const staleAgents = data.agents.status === "ok" ? data.agents.data.filter((agent) => {
       const stamp = parsePluginSetMs(agent.plugin_feed_id);
       return stamp !== undefined && now - stamp > pluginStaleHours * 3_600_000 && asString(agent.status) === "on";
@@ -1691,20 +1895,25 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       summary = "GET /server/properties did not expose a parseable plugin_set, so plugin currency cannot be confirmed; collect the plugin set date from Settings > About.";
     } else if (!serverFresh || staleScanners.length > 0) {
       status = "fail";
-      summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${staleScanners.length} linked scanners load a plugin set older than ${pluginStaleHours} hours.`;
+      summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}.`;
+    } else if (data.scanners.status !== "ok") {
+      status = "manual";
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but GET /scanners failed (${data.scanners.error ?? "unknown"}), so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.`;
+    } else if (datedScanners.length === 0) {
+      status = "manual";
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${data.scanners.data.length === 0 ? "GET /scanners returned zero scanners" : `none of the ${data.scanners.data.length} scanner entries exposes a parseable loaded_plugin_set (${undatedScanners.length} scanner instances without one, the rest are cloud scanner pools or groups)`}, so per-scanner plugin currency is not applicable or unverifiable and cannot pass; confirm scanner plugin sets in Settings > Sensors.`;
     } else if (undatedScanners.length > 0 || staleAgents.length > 0) {
       status = "warn";
-      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old; ${undatedScanners.length} linked scanners expose no parseable plugin set and ${staleAgents.length} online agents load a plugin set older than ${pluginStaleHours} hours.`;
-    } else if (data.scanners.status !== "ok" || data.scanners.data.length === 0) {
-      status = "warn";
-      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but GET /scanners ${data.scanners.status === "ok" ? "returned zero scanners" : `failed (${data.scanners.error ?? "unknown"})`}, so per-scanner plugin currency is unverified and the verdict is capped at warn.`;
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${datedScanners.length} scanner entries load a fresh plugin set, but ${undatedScanners.length} scanner instances expose no parseable plugin set (not counted as current) and ${staleAgents.length} online agents load a plugin set older than ${pluginStaleHours} hours.`;
     } else {
       status = capForPartial("pass", data.agents);
-      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${linkedScanners.length} linked scanners load a plugin set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
+      summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
     findings.push(finding(8, status, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
+      scanner_entries: data.scanners.status === "ok" ? data.scanners.data.length : null,
+      evaluated_scanners: datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
       stale_scanners: staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
       undated_scanners: undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50),
       stale_online_agents: staleAgents.length,
@@ -1841,6 +2050,31 @@ export async function collectTenableAccessControlData(clients: TenableClients, o
   return { users, groups, roles, permissions, accessGroups, credentials, auditLog, scUsers };
 }
 
+const ALL_USERS_GROUP_UUID = "00000000-0000-0000-0000-000000000000";
+
+function exportJobMatchesOwnShape(job: JsonRecord, kind: "assets" | "vulns"): boolean {
+  const filters = asObject(job.filters) ?? {};
+  const perChunk = asNumber(job.num_assets_per_chunk);
+  switch (kind) {
+    case "vulns": {
+      const states = asArray(filters.state).map((state) => asString(state)?.toLowerCase() ?? "").sort();
+      return perChunk === OWN_VULN_EXPORT_NUM_ASSETS && states.join(",") === [...OWN_VULN_EXPORT_STATES].sort().join(",");
+    }
+    case "assets":
+      return perChunk === OWN_ASSET_EXPORT_CHUNK_SIZE && Object.keys(filters).length === 0;
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`Unhandled export kind: ${String(exhaustive)}`);
+    }
+  }
+}
+
+function subjectIsAllUsers(subject: JsonRecord): boolean {
+  const type = asString(subject.type);
+  if (type === "AllUsers") return true;
+  return type === "UserGroup" && (asString(subject.uuid) === ALL_USERS_GROUP_UUID || asString(subject.name) === "All Users");
+}
+
 function userHasStrongAuth(user: JsonRecord): boolean {
   return asBoolean(user.ui_saml_only) === true || asNumber(asObject(user.two_factor)?.sms_enabled) === 1;
 }
@@ -1878,14 +2112,18 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       const lastAccess = parseTimestampMs(user.last_apikey_access);
       return lastAccess !== undefined && daysBetween(now, lastAccess) > inactiveDays;
     });
+    const missingEnabledFlag = users.filter((user) => asBoolean(user.enabled) === undefined);
     let status: TenableFindingStatus;
     let summary: string;
     if (adminsWithoutStrongAuth.length > 0 || inactive.length > 0 || admins.length > maxAdmins) {
       status = "fail";
       summary = `${admins.length} enabled Administrator accounts (threshold ${maxAdmins}); ${adminsWithoutStrongAuth.length} UI-permitted administrators lack SAML-only or two-factor enforcement; ${inactive.length} enabled users have not logged in for ${inactiveDays} days.`;
-    } else if (neverLoggedIn.length > 0 || staleApiKeys.length > 0 || lockedOut.length > 0 || repeatedFailures.length > 0) {
+    } else if (enabledUsers.length === 0) {
+      status = "manual";
+      summary = `GET /users returned ${users.length} users but none has enabled=true (${missingEnabledFlag.length} expose no enabled flag), so no enabled population exists to verify and the calling user itself is unaccounted for; collect the user list with enabled state, role, and MFA from Settings > Access Control > Users.`;
+    } else if (neverLoggedIn.length > 0 || staleApiKeys.length > 0 || lockedOut.length > 0 || repeatedFailures.length > 0 || missingEnabledFlag.length > 0) {
       status = "warn";
-      summary = `${admins.length} administrators all enforce SAML or two-factor and no enabled user is inactive past ${inactiveDays} days, but ${neverLoggedIn.length} enabled users have never logged in (not counted as active), ${staleApiKeys.length} have API keys unused for ${inactiveDays} days, ${lockedOut.length} are locked out, and ${repeatedFailures.length} show 5 or more failed logins.`;
+      summary = `${admins.length} administrators all enforce SAML or two-factor and no enabled user is inactive past ${inactiveDays} days, but ${neverLoggedIn.length} enabled users have never logged in (not counted as active), ${staleApiKeys.length} have API keys unused for ${inactiveDays} days, ${lockedOut.length} are locked out, ${repeatedFailures.length} show 5 or more failed logins, and ${missingEnabledFlag.length} expose no enabled flag (not counted as enabled).`;
     } else {
       status = "pass";
       summary = `${enabledUsers.length} enabled users, ${admins.length} administrators (threshold ${maxAdmins}) all enforcing SAML-only or two-factor authentication, none inactive past ${inactiveDays} days.`;
@@ -1893,6 +2131,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     findings.push(finding(10, status, "high", summary, {
       user_count: users.length,
       enabled_users: enabledUsers.length,
+      users_without_enabled_flag: missingEnabledFlag.length,
       administrators: admins.map((user) => asString(user.username) ?? asString(user.email)).slice(0, 50),
       administrators_without_strong_auth: adminsWithoutStrongAuth.map((user) => asString(user.username)).slice(0, 50),
       inactive_users: inactive.map((user) => asString(user.username)).slice(0, 50),
@@ -1920,10 +2159,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       const subjects = asRecords(permission.subjects);
       const objects = asRecords(permission.objects);
       const actions = asArray(permission.actions).map((action) => asString(action) ?? "");
-      const allUsers = subjects.some((subject) => asString(subject.type) === "AllUsers");
+      const allUsers = subjects.some(subjectIsAllUsers);
       const allObjects = objects.some((object) => ["AllAssets", "AllObjects", "AllTags"].includes(asString(object.type) ?? ""));
       const writeActions = actions.some((action) => /CanEdit|CanScan|CanUse/i.test(action));
-      return allUsers && allObjects && writeActions && asString(permission.created_by) !== "System";
+      return allUsers && allObjects && writeActions;
     });
     const legacyAccessGroups = data.accessGroups.status === "ok" ? data.accessGroups.data.filter((group) => asBoolean(group.all_assets) !== true) : [];
     findings.push(finding(
@@ -1931,7 +2170,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForPartial("pass", data.accessGroups), callerIsAdministrator),
       "high",
       broad.length > 0
-        ? `${broad.length} of ${permissions.length} user-created permissions grant AllUsers write-style actions (CanEdit, CanScan, or CanUse) on all assets or all objects: ${broad.map((permission) => asString(permission.name)).slice(0, 10).join(", ")}.`
+        ? `${broad.length} of ${permissions.length} permissions grant every user (AllUsers or the tenant-wide All Users group ${ALL_USERS_GROUP_UUID}) write-style actions (CanEdit, CanScan, or CanUse) on all assets, objects, or tags: ${broad.map((permission) => asString(permission.name)).slice(0, 10).join(", ")}. Narrow these to specific groups and tags.`
         : legacyAccessGroups.length > 0
           ? `${permissions.length} permissions follow least privilege for AllUsers, but ${legacyAccessGroups.length} deprecated access groups still exist and should be migrated to permissions.`
           : data.accessGroups.status !== "ok"
@@ -2234,26 +2473,41 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     findings.push(unreadableFinding(19, "medium", data.vulnExportJobs, "GET /vulns/export/status", "evidence of scheduled exports or report schedules from the Tenable UI (Reports) and integration logs"));
   } else {
     const ownUuids = new Set([data.vulnExport.data.exportUuid, data.assetExport.data.exportUuid].filter(Boolean));
-    const recentJobs = [...data.vulnExportJobs.data, ...data.assetExportJobs.data].filter((job) => {
+    const inWindow = (job: JsonRecord): boolean => {
       const created = parseTimestampMs(job.created);
-      return !ownUuids.has(asString(job.uuid) ?? "") && created !== undefined && daysBetween(now, created) <= DEFAULT_AUDIT_LOOKBACK_DAYS;
-    });
-    findings.push(finding(
-      19,
-      recentJobs.length >= 2 ? capForNonAdmin("pass", callerIsAdministrator) : recentJobs.length === 1 ? "warn" : "fail",
-      "medium",
-      recentJobs.length >= 2
-        ? `${recentJobs.length} export jobs other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days, indicating automated exports. Report schedules are not exposed by the API and need a manual check in Reports.${nonAdminNote(callerIsAdministrator)}`
-        : recentJobs.length === 1
-          ? `Only one export job other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days; recurring automation is not demonstrated. Report schedules need a manual check in Reports.`
-          : `No export jobs other than this assessment ran in the last ${DEFAULT_AUDIT_LOOKBACK_DAYS} days, so no automated vulnerability or asset export is evident. Report schedules need a manual check in Reports.`,
-      {
-        recent_export_jobs: recentJobs.length,
-        vuln_export_jobs_listed: data.vulnExportJobs.status === "ok" ? data.vulnExportJobs.data.length : null,
-        asset_export_jobs_listed: data.assetExportJobs.status === "ok" ? data.assetExportJobs.data.length : null,
-        excluded_own_exports: [...ownUuids],
-      },
-    ));
+      return created !== undefined && daysBetween(now, created) <= EXPORT_JOB_WINDOW_DAYS;
+    };
+    const ownShaped = [
+      ...data.vulnExportJobs.data.filter((job) => !ownUuids.has(asString(job.uuid) ?? "") && exportJobMatchesOwnShape(job, "vulns")),
+      ...data.assetExportJobs.data.filter((job) => !ownUuids.has(asString(job.uuid) ?? "") && exportJobMatchesOwnShape(job, "assets")),
+    ];
+    const externalJobs = [
+      ...data.vulnExportJobs.data.filter((job) => !exportJobMatchesOwnShape(job, "vulns")),
+      ...data.assetExportJobs.data.filter((job) => !exportJobMatchesOwnShape(job, "assets")),
+    ].filter((job) => !ownUuids.has(asString(job.uuid) ?? "") && inWindow(job));
+    const externalDays = new Set(externalJobs.map((job) => new Date(parseTimestampMs(job.created) ?? 0).toISOString().slice(0, 10)));
+    const limitation = `The export job lists include completed jobs only from the previous ${EXPORT_JOB_WINDOW_DAYS} days, so this is a point-in-time signal of export activity, and report schedules are not exposed by the API, so they need a manual check in Reports.`;
+    let status: TenableFindingStatus;
+    let summary: string;
+    if (externalDays.size >= 2) {
+      status = capForNonAdmin("pass", callerIsAdministrator);
+      summary = `${externalJobs.length} export jobs not created by this tool ran on ${externalDays.size} distinct days within the last ${EXPORT_JOB_WINDOW_DAYS} days, indicating recurring automated exports. ${limitation}${nonAdminNote(callerIsAdministrator)}`;
+    } else if (externalJobs.length > 0) {
+      status = "warn";
+      summary = `${externalJobs.length} export jobs not created by this tool ran within the last ${EXPORT_JOB_WINDOW_DAYS} days, all on one day, so recurring automation is not demonstrated. ${limitation}`;
+    } else {
+      status = "manual";
+      summary = `No export jobs other than this tool's own runs (${ownUuids.size} from this assessment and ${ownShaped.length} matching this tool's export shape) appear within the last ${EXPORT_JOB_WINDOW_DAYS} days, so automated exports are not evident in the observable window; a human must collect the integration or report schedule that distributes results. ${limitation}`;
+    }
+    findings.push(finding(19, status, "medium", summary, {
+      external_export_jobs_in_window: externalJobs.length,
+      external_export_days: [...externalDays].sort(),
+      window_days: EXPORT_JOB_WINDOW_DAYS,
+      vuln_export_jobs_listed: data.vulnExportJobs.status === "ok" ? data.vulnExportJobs.data.length : null,
+      asset_export_jobs_listed: data.assetExportJobs.status === "ok" ? data.assetExportJobs.data.length : null,
+      excluded_own_exports: [...ownUuids],
+      excluded_own_shaped_jobs: ownShaped.map((job) => asString(job.uuid)).slice(0, 50),
+    }));
   }
 
   const errors = [
@@ -2512,6 +2766,7 @@ export async function exportTenableAuditBundle(
     ["core_data/access_check.json", access],
     ["core_data/scans.json", scanProgramData.scans.data],
     ["core_data/policies.json", scanProgramData.policies.data],
+    ["core_data/policy_details.json", scanProgramData.policyDetails.data],
     ["core_data/scan_templates.json", scanProgramData.templates.data],
     ["core_data/exclusions.json", scanProgramData.exclusions.data],
     ["core_data/target_groups.json", scanProgramData.targetGroups.data],

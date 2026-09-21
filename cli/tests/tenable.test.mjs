@@ -50,6 +50,21 @@ function healthyAssets() {
   ];
 }
 
+function healthyPolicyDetails(overrides = {}) {
+  return {
+    uuid: "tmpl-basic",
+    settings: { safe_checks: "yes", portscan_range: "default", thorough_tests: "no", max_hosts_per_scan: "80", max_checks_per_host: "5", report_paranoia: "Normal", ...(overrides.settings ?? {}) },
+    plugins: overrides.plugins ?? { "Windows": { status: "enabled" }, "Web Servers": { status: "enabled" }, "Denial of Service": { status: "disabled" } },
+    credentials: {},
+    audits: {},
+    scap: {},
+  };
+}
+
+function externalExportJob(uuid, createdMs, extra = {}) {
+  return { uuid, status: "FINISHED", created: createdMs, num_assets_per_chunk: 50, filters: { state: ["OPEN", "REOPENED"] }, total_chunks: 1, finished_chunks: 1, ...extra };
+}
+
 function healthyVulns() {
   return [
     { severity: "critical", state: "OPEN", first_found: RECENT_ISO, last_found: RECENT_ISO, plugin: { id: 1, vpr: { score: 9.3 }, cvss3_base_score: 9.8 } },
@@ -62,11 +77,13 @@ function healthyRoutes() {
     "GET /users": { users: healthyUsers() },
     "GET /scans": {
       scans: [
-        { id: 10, uuid: "s-10", name: "Weekly Prod", enabled: true, rrules: "FREQ=WEEKLY;INTERVAL=1", status: "completed", last_modification_date: RECENT_SECONDS, wizard_uuid: "tmpl-basic", template_uuid: "tmpl-basic" },
-        { id: 11, uuid: "s-11", name: "PCI Quarterly", enabled: true, rrules: "FREQ=MONTHLY;INTERVAL=3", status: "completed", last_modification_date: RECENT_SECONDS, wizard_uuid: "tmpl-pci", template_uuid: "tmpl-pci" },
+        { id: 10, uuid: "s-10", name: "Weekly Prod", enabled: true, rrules: "FREQ=WEEKLY;INTERVAL=1", status: "completed", type: "remote", policy_id: 1, last_modification_date: RECENT_SECONDS, wizard_uuid: "tmpl-basic", template_uuid: "tmpl-basic" },
+        { id: 11, uuid: "s-11", name: "PCI Quarterly", enabled: true, rrules: "FREQ=MONTHLY;INTERVAL=3", status: "completed", type: "remote", policy_id: 2, last_modification_date: RECENT_SECONDS, wizard_uuid: "tmpl-pci", template_uuid: "tmpl-pci" },
       ],
     },
-    "GET /policies": { policies: [{ id: 1, name: "Prod policy", template_uuid: "tmpl-basic" }] },
+    "GET /policies": { policies: [{ id: 1, name: "Prod policy", template_uuid: "tmpl-basic" }, { id: 2, name: "PCI policy", template_uuid: "tmpl-pci" }] },
+    "GET /policies/1": healthyPolicyDetails(),
+    "GET /policies/2": healthyPolicyDetails(),
     "GET /editor/scan/templates": {
       templates: [
         { uuid: "tmpl-basic", name: "basic", title: "Basic Network Scan" },
@@ -89,8 +106,8 @@ function healthyRoutes() {
     "GET /v2/access-groups": { access_groups: [], pagination: { total: 0 } },
     "GET /credentials": { credentials: [{ uuid: "c-1", name: "Linux SSH", type: { id: "ssh", name: "SSH" }, created_date: RECENT_SECONDS, last_used_by: { name: "Weekly Prod" } }], pagination: { total: 1 } },
     "GET /audit-log/v1/events": { events: [{ id: "e-1", action: "user.login", crud: "r", is_failure: false, received: RECENT_ISO, actor: { id: "u-1", name: "admin" }, target: { id: "u-1", type: "User" } }], pagination: { total: 1 } },
-    "GET /vulns/export/status": { exports: [{ uuid: "vx-1", status: "FINISHED", created: NOW - 86_400_000 }] },
-    "GET /assets/export/status": { exports: [{ uuid: "ax-1", status: "FINISHED", created: NOW - 86_400_000 }] },
+    "GET /vulns/export/status": { exports: [externalExportJob("vx-1", NOW - 86_400_000), externalExportJob("vx-2", NOW - 2 * 86_400_000)] },
+    "GET /assets/export/status": { exports: [externalExportJob("ax-1", NOW - 86_400_000, { filters: { has_plugin_results: true } })] },
     "POST /assets/export": { export_uuid: "asset-export-1" },
     "GET /assets/export/asset-export-1/status": { status: "FINISHED", chunks_available: [1], chunks_failed: [], total_chunks: 1 },
     "GET /assets/export/asset-export-1/chunks/1": healthyAssets(),
@@ -145,6 +162,7 @@ function routerFetch(routes, { status = 200, log } = {}) {
     if (status !== 200) return jsonResponse({ error: "forbidden" }, status);
     if (!(key in routes)) return jsonResponse({ error: `unrouted ${key}` }, 404);
     const value = routes[key];
+    if (value && typeof value === "object" && "__status" in value) return jsonResponse({ error: "forbidden" }, value.__status);
     const offset = Number(parsed.searchParams.get("offset") ?? "0");
     if (offset > 0 && value && typeof value === "object" && !Array.isArray(value)) {
       const paged = {};
@@ -363,7 +381,11 @@ test("healthy fixture yields passing verdicts and every control carries framewor
   assert.equal(byId(results, "TENABLE-04").status, "pass");
   assert.equal(byId(results, "TENABLE-13").status, "pass");
   assert.equal(byId(results, "TENABLE-17").status, "pass");
-  assert.equal(byId(results, "TENABLE-01").status, "manual");
+  assert.equal(byId(results, "TENABLE-01").status, "pass");
+  assert.equal(byId(results, "TENABLE-08").status, "pass");
+  assert.equal(byId(results, "TENABLE-10").status, "pass");
+  assert.equal(byId(results, "TENABLE-11").status, "pass");
+  assert.equal(byId(results, "TENABLE-19").status, "pass");
   assert.ok(findings.filter((item) => item.status === "pass").length >= 8, JSON.stringify(findings.map((item) => [item.id, item.status])));
   for (const item of findings.filter((entry) => entry.id.endsWith("-SC"))) {
     assert.equal(item.status, "manual");
@@ -404,11 +426,12 @@ test("false-pass self-check (b): empty inventories never pass except where empti
   assert.ok(byId(results, "TENABLE-13").summary.includes("emptiness is compliant"));
   assert.equal(byId(results, "TENABLE-20").status, "warn");
   assert.ok(byId(results, "TENABLE-20").summary.includes("not confirmed as Administrator"));
-  assert.equal(byId(results, "TENABLE-08").status, "warn");
-  for (const id of ["TENABLE-01", "TENABLE-02", "TENABLE-03", "TENABLE-17", "TENABLE-19"]) {
+  assert.ok(byId(results, "TENABLE-08").summary.includes("returned zero scanners"));
+  assert.ok(byId(results, "TENABLE-19").summary.includes("not evident in the observable window"));
+  for (const id of ["TENABLE-01", "TENABLE-02", "TENABLE-03", "TENABLE-17"]) {
     assert.equal(byId(results, id).status, "fail", `${id} should fail on emptiness`);
   }
-  for (const id of ["TENABLE-04", "TENABLE-05", "TENABLE-07", "TENABLE-10", "TENABLE-14", "TENABLE-15"]) {
+  for (const id of ["TENABLE-04", "TENABLE-05", "TENABLE-07", "TENABLE-08", "TENABLE-10", "TENABLE-14", "TENABLE-15", "TENABLE-19"]) {
     assert.equal(byId(results, id).status, "manual", `${id} should be manual on emptiness`);
   }
 });
@@ -450,6 +473,187 @@ test("disabled enabling flags do not support pass", async () => {
   assert.equal(byId(results, "TENABLE-02").status, "fail");
   assert.equal(byId(results, "TENABLE-17").status, "fail");
   assert.equal(byId(results, "TENABLE-13").status, "fail");
+});
+
+test("control 1 reads GET /policies/{policy_id} for every policy referenced by a scan and judges safe checks, port range, and plugin families", async () => {
+  const log = [];
+  const healthy = await runAll(clientsFor(healthyRoutes(), { log }));
+  const passing = byId(healthy, "TENABLE-01");
+  assert.equal(passing.status, "pass");
+  assert.ok(passing.summary.includes("safe_checks=yes"), passing.summary);
+  assert.deepEqual(log.filter((entry) => /^GET \/policies\/\d+$/.test(entry.key)).map((entry) => entry.key).sort(), ["GET /policies/1", "GET /policies/2"]);
+  assert.equal(passing.evidence.policies_evaluated.length, 2);
+  assert.equal(passing.evidence.policies_evaluated[0].safe_checks, "yes");
+  assert.equal(passing.evidence.policies_evaluated[0].plugin_families.enabled, 2);
+
+  const unsafe = healthyRoutes();
+  unsafe["GET /policies/2"] = healthyPolicyDetails({ settings: { safe_checks: "no" } });
+  const unsafeFinding = byId(await runAll(clientsFor(unsafe)), "TENABLE-01");
+  assert.equal(unsafeFinding.status, "fail");
+  assert.ok(unsafeFinding.summary.includes("PCI policy [safe_checks is no"), unsafeFinding.summary);
+
+  const disabledFamilies = healthyRoutes();
+  disabledFamilies["GET /policies/1"] = healthyPolicyDetails({ plugins: { Windows: { status: "disabled" }, "Web Servers": { status: "disabled" } } });
+  const disabledFinding = byId(await runAll(clientsFor(disabledFamilies)), "TENABLE-01");
+  assert.equal(disabledFinding.status, "fail");
+  assert.ok(disabledFinding.summary.includes("all 2 plugin families are disabled"), disabledFinding.summary);
+
+  const customPorts = healthyRoutes();
+  customPorts["GET /policies/1"] = healthyPolicyDetails({ settings: { portscan_range: "22,80,443" } });
+  const customFinding = byId(await runAll(clientsFor(customPorts)), "TENABLE-01");
+  assert.equal(customFinding.status, "warn");
+  assert.ok(customFinding.summary.includes("custom range (22,80,443)"), customFinding.summary);
+
+  const mostlyDisabled = healthyRoutes();
+  mostlyDisabled["GET /policies/1"] = healthyPolicyDetails({ plugins: { Windows: { status: "enabled" }, "Web Servers": { status: "disabled" }, DNS: { status: "disabled" } } });
+  assert.equal(byId(await runAll(clientsFor(mostlyDisabled)), "TENABLE-01").status, "warn");
+});
+
+test("control 1 is manual only when the policy details read is refused or the policy exposes no settings", async () => {
+  const forbidden = healthyRoutes();
+  forbidden["GET /policies/1"] = { __status: 403 };
+  forbidden["GET /policies/2"] = { __status: 403 };
+  const refused = byId(await runAll(clientsFor(forbidden)), "TENABLE-01");
+  assert.equal(refused.status, "manual");
+  assert.ok(refused.summary.includes("Standard [32]"), refused.summary);
+  assert.equal(refused.evidence.policy_details_status, "forbidden");
+
+  const partiallyForbidden = healthyRoutes();
+  partiallyForbidden["GET /policies/2"] = { __status: 403 };
+  const partial = byId(await runAll(clientsFor(partiallyForbidden)), "TENABLE-01");
+  assert.equal(partial.status, "manual");
+  assert.ok(partial.summary.includes("1 of 2 referenced scan policies were verified"), partial.summary);
+
+  const noSettings = healthyRoutes();
+  noSettings["GET /policies/1"] = { uuid: "tmpl-basic" };
+  const unverified = byId(await runAll(clientsFor(noSettings)), "TENABLE-01");
+  assert.equal(unverified.status, "manual");
+  assert.ok(unverified.summary.includes("do not expose safe_checks"), unverified.summary);
+
+  const noPolicyIds = healthyRoutes();
+  noPolicyIds["GET /scans"] = { scans: healthyRoutes()["GET /scans"].scans.map(({ policy_id, ...scan }) => scan) };
+  const unlinked = byId(await runAll(clientsFor(noPolicyIds)), "TENABLE-01");
+  assert.equal(unlinked.status, "manual");
+  assert.ok(unlinked.summary.includes("exposes a policy_id"), unlinked.summary);
+});
+
+test("control 11 treats the tenant-wide All Users group as broad, alongside AllUsers and AllTags", async () => {
+  const allUsersGroup = healthyRoutes();
+  allUsersGroup["GET /api/v3/access-control/permissions"] = {
+    permissions: [
+      { permission_uuid: "p-default", name: "All Assets [CanScan, CanView]", actions: ["CanView", "CanScan"], objects: [{ type: "AllAssets" }], subjects: [{ type: "UserGroup", uuid: "00000000-0000-0000-0000-000000000000", name: "All Users" }], created_by: "System" },
+    ],
+  };
+  const groupFinding = byId(await runAll(clientsFor(allUsersGroup)), "TENABLE-11");
+  assert.equal(groupFinding.status, "fail");
+  assert.ok(groupFinding.summary.includes("00000000-0000-0000-0000-000000000000"), groupFinding.summary);
+  assert.deepEqual(groupFinding.evidence.broad_permissions, ["All Assets [CanScan, CanView]"]);
+
+  const allTags = healthyRoutes();
+  allTags["GET /api/v3/access-control/permissions"] = {
+    permissions: [{ permission_uuid: "p-tags", name: "Everyone edits tags", actions: ["CanEdit"], objects: [{ type: "AllTags" }], subjects: [{ type: "AllUsers" }] }],
+  };
+  assert.equal(byId(await runAll(clientsFor(allTags)), "TENABLE-11").status, "fail");
+
+  const readOnly = healthyRoutes();
+  readOnly["GET /api/v3/access-control/permissions"] = {
+    permissions: [{ permission_uuid: "p-view", name: "Everyone views", actions: ["CanView"], objects: [{ type: "AllAssets" }], subjects: [{ type: "UserGroup", uuid: "00000000-0000-0000-0000-000000000000", name: "All Users" }] }],
+  };
+  assert.equal(byId(await runAll(clientsFor(readOnly)), "TENABLE-11").status, "pass");
+});
+
+test("control 19 ignores this tool's own export shape and only counts jobs within the documented three-day window", async () => {
+  const ownRuns = healthyRoutes();
+  ownRuns["GET /vulns/export/status"] = {
+    exports: [
+      { uuid: "prior-run-1", status: "FINISHED", created: NOW - 86_400_000, num_assets_per_chunk: 5000, filters: { state: ["OPEN", "REOPENED", "FIXED"], since: 1 } },
+      { uuid: "prior-run-2", status: "FINISHED", created: NOW - 2 * 86_400_000, num_assets_per_chunk: 5000, filters: { state: ["open", "reopened", "fixed"], since: 1 } },
+    ],
+  };
+  ownRuns["GET /assets/export/status"] = {
+    exports: [
+      { uuid: "prior-asset-1", status: "FINISHED", created: NOW - 86_400_000, num_assets_per_chunk: 10000, filters: {} },
+      { uuid: "prior-asset-2", status: "FINISHED", created: NOW - 2 * 86_400_000, num_assets_per_chunk: 10000 },
+    ],
+  };
+  const selfOnly = byId(await runAll(clientsFor(ownRuns)), "TENABLE-19");
+  assert.equal(selfOnly.status, "manual");
+  assert.equal(selfOnly.evidence.external_export_jobs_in_window, 0);
+  assert.equal(selfOnly.evidence.excluded_own_shaped_jobs.length, 4);
+  assert.ok(selfOnly.summary.includes("previous 3 days"), selfOnly.summary);
+
+  const stale = healthyRoutes();
+  stale["GET /vulns/export/status"] = { exports: [externalExportJob("old-1", NOW - 10 * 86_400_000), externalExportJob("old-2", NOW - 12 * 86_400_000)] };
+  stale["GET /assets/export/status"] = { exports: [] };
+  const staleFinding = byId(await runAll(clientsFor(stale)), "TENABLE-19");
+  assert.equal(staleFinding.status, "manual");
+  assert.equal(staleFinding.evidence.external_export_jobs_in_window, 0);
+
+  const singleDay = healthyRoutes();
+  singleDay["GET /vulns/export/status"] = { exports: [externalExportJob("one-1", NOW - 3_600_000), externalExportJob("one-2", NOW - 7_200_000)] };
+  singleDay["GET /assets/export/status"] = { exports: [] };
+  const singleDayFinding = byId(await runAll(clientsFor(singleDay)), "TENABLE-19");
+  assert.equal(singleDayFinding.status, "warn");
+  assert.equal(singleDayFinding.evidence.external_export_days.length, 1);
+
+  const healthy = byId(await runAll(clientsFor(healthyRoutes())), "TENABLE-19");
+  assert.equal(healthy.status, "pass");
+  assert.equal(healthy.evidence.external_export_days.length, 2);
+  assert.ok(healthy.summary.includes("report schedules are not exposed"), healthy.summary);
+});
+
+test("control 8 evaluates every scanner entry exposing loaded_plugin_set and never passes on zero evaluated scanners", async () => {
+  const cloudStale = healthyRoutes();
+  cloudStale["GET /scanners"] = { scanners: [{ id: 1, name: "US Cloud Scanner", status: "on", linked: 1, type: "local", pool: true, group: true, loaded_plugin_set: "202601010000" }] };
+  const staleFinding = byId(await runAll(clientsFor(cloudStale)), "TENABLE-08");
+  assert.equal(staleFinding.status, "fail");
+  assert.deepEqual(staleFinding.evidence.stale_scanners, ["US Cloud Scanner (202601010000)"]);
+
+  const cloudUndated = healthyRoutes();
+  cloudUndated["GET /scanners"] = { scanners: [{ id: 1, name: "US Cloud Scanner", status: "on", linked: 1, type: "local", pool: true, group: true }] };
+  const undatedFinding = byId(await runAll(clientsFor(cloudUndated)), "TENABLE-08");
+  assert.equal(undatedFinding.status, "manual");
+  assert.ok(undatedFinding.summary.includes("cannot pass"), undatedFinding.summary);
+
+  const noScanners = healthyRoutes();
+  noScanners["GET /scanners"] = { scanners: [] };
+  const noneFinding = byId(await runAll(clientsFor(noScanners)), "TENABLE-08");
+  assert.equal(noneFinding.status, "manual");
+  assert.ok(noneFinding.summary.includes("returned zero scanners"), noneFinding.summary);
+
+  const undatedInstance = healthyRoutes();
+  undatedInstance["GET /scanners"] = { scanners: [...healthyRoutes()["GET /scanners"].scanners, { id: 2, name: "Appliance without plugin set", status: "on", linked: 1, type: "managed", pool: false, group: false }] };
+  const mixed = byId(await runAll(clientsFor(undatedInstance)), "TENABLE-08");
+  assert.equal(mixed.status, "warn");
+  assert.deepEqual(mixed.evidence.undated_scanners, ["Appliance without plugin set"]);
+});
+
+test("control 10 requires at least one enabled user before it can pass", async () => {
+  const noEnabledFlag = healthyRoutes();
+  noEnabledFlag["GET /users"] = { users: healthyUsers().map(({ enabled, ...user }) => user) };
+  const missing = byId(await runAll(clientsFor(noEnabledFlag)), "TENABLE-10");
+  assert.equal(missing.status, "manual");
+  assert.equal(missing.evidence.enabled_users, 0);
+  assert.equal(missing.evidence.users_without_enabled_flag, 2);
+  assert.ok(missing.summary.includes("none has enabled=true"), missing.summary);
+
+  const allDisabled = healthyRoutes();
+  allDisabled["GET /users"] = { users: healthyUsers().map((user) => ({ ...user, enabled: false })) };
+  assert.equal(byId(await runAll(clientsFor(allDisabled)), "TENABLE-10").status, "manual");
+
+  const someMissing = healthyRoutes();
+  someMissing["GET /users"] = { users: [healthyUsers()[0], (({ enabled, ...user }) => user)(healthyUsers()[1])] };
+  const partial = byId(await runAll(clientsFor(someMissing)), "TENABLE-10");
+  assert.equal(partial.status, "warn");
+  assert.equal(partial.evidence.users_without_enabled_flag, 1);
+});
+
+test("integration guide cites the v1 asset export that the code calls", () => {
+  const guide = readFileSync(join(import.meta.dirname, "..", "..", "src", "content", "docs", "docs", "integrations", "tenable.md"), "utf8");
+  assert.ok(guide.includes("https://developer.tenable.com/reference/export-assets-v1"), "guide must cite export-assets-v1");
+  assert.ok(!guide.includes("export-assets-v2"), "guide must not cite the v2 asset export the code does not call");
+  assert.ok(guide.includes("https://developer.tenable.com/reference/policies-details"), "guide must cite policies-details");
+  assert.ok(!/[\u2014]/.test(guide), "guide must not contain em dashes");
 });
 
 test("Security Center controls become manual naming the missing URL when not configured, and read x-apikey when configured", async () => {
