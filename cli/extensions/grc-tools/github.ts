@@ -270,12 +270,18 @@ interface GitHubOrgAccessData {
   enterpriseIdentity: CollectedDataset<GitHubEnterpriseIdentitySnapshot | null>;
 }
 
+export interface GitHubBranchRulesEntry {
+  rules: JsonRecord[] | null;
+  error?: string;
+}
+
 interface GitHubRepoProtectionData {
   org: CollectedDataset<JsonRecord | null>;
   repositories: CollectedDataset<JsonRecord[]>;
   orgRulesets: CollectedDataset<JsonRecord[]>;
   repoRulesets: CollectedDataset<Record<string, JsonRecord[]>>;
   branchProtections: CollectedDataset<Record<string, JsonRecord | null>>;
+  branchRules: CollectedDataset<Record<string, GitHubBranchRulesEntry>>;
 }
 
 interface GitHubActionsData {
@@ -576,6 +582,40 @@ const GITHUB_CHECKS: Record<string, CheckDefinition> = {
       general: ["authorship traceability"],
     },
   },
+  "GITHUB-REPO-006": {
+    id: "GITHUB-REPO-006",
+    title: "Default branches require approving pull request reviews",
+    category: "repo_protection",
+    severity: "high",
+    frameworks: {
+      fedramp: ["CM-3", "CM-5"],
+      cmmc: ["CM.L2-3.4.5"],
+      soc2: ["CC8.1"],
+      cis: ["2.1.2"],
+      pci_dss: ["6.5.2"],
+      disa_stig: ["SRG-APP-000381"],
+      irap: ["ISM-1525"],
+      ismap: ["5.3.2"],
+      general: ["peer review before merge"],
+    },
+  },
+  "GITHUB-REPO-007": {
+    id: "GITHUB-REPO-007",
+    title: "Default branches require passing status checks",
+    category: "repo_protection",
+    severity: "high",
+    frameworks: {
+      fedramp: ["SI-7", "SA-11"],
+      cmmc: ["SA.L2-3.13.10"],
+      soc2: ["CC8.1"],
+      cis: ["2.1.3"],
+      pci_dss: ["6.5.3"],
+      disa_stig: ["SRG-APP-000456"],
+      irap: ["ISM-1525"],
+      ismap: ["5.3.3"],
+      general: ["automated verification before merge"],
+    },
+  },
   "GITHUB-ACT-001": {
     id: "GITHUB-ACT-001",
     title: "Actions allowed-actions policy is constrained",
@@ -862,6 +902,9 @@ function asNumber(value: unknown): number | undefined {
 }
 
 function summarizeError(error: unknown): string {
+  if (error instanceof GitHubHttpError) {
+    return `GitHub request failed (${error.status}): ${error.message}`;
+  }
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -1440,6 +1483,10 @@ export class GitHubAuditorClient {
     return payload ? asRecord(payload) : null;
   }
 
+  async listBranchRules(owner: string, repo: string, branch: string): Promise<JsonRecord[]> {
+    return this.paginate(`/repos/${owner}/${repo}/rules/branches/${encodeURIComponent(branch)}?per_page=${PAGE_SIZE}`);
+  }
+
   async getOrgActionsPermissions(): Promise<JsonRecord> {
     const { payload } = await this.requestJson<JsonRecord>(`/orgs/${this.config.organization}/actions/permissions`);
     return asRecord(payload);
@@ -1804,24 +1851,14 @@ function hasRuleType(rulesets: JsonRecord[], type: string): boolean {
   return rulesets.some((ruleset) => isActiveRuleset(ruleset) && rulesetRuleTypes(ruleset).has(type));
 }
 
-function branchProtectionRequiresReviewsOrChecks(protection: JsonRecord | null): boolean {
-  if (!protection) return false;
-  return Boolean(protection.required_pull_request_reviews || protection.required_status_checks);
+function rulesIncludeType(rules: JsonRecord[], type: string): boolean {
+  return rules.some((rule) => safeLower(rule.type) === type);
 }
 
 function branchProtectionRequiresSignatures(protection: JsonRecord | null): boolean {
   if (!protection) return false;
   const requiredSignatures = asRecord(protection.required_signatures);
   return asBoolean(requiredSignatures.enabled) === true;
-}
-
-function branchProtectionRestrictsBypass(protection: JsonRecord | null): boolean {
-  if (!protection) return false;
-  const allowForcePushes = asRecord(protection.allow_force_pushes);
-  const allowDeletions = asRecord(protection.allow_deletions);
-  const forcePushDisabled = asBoolean(allowForcePushes.enabled) !== true;
-  const deletionDisabled = asBoolean(allowDeletions.enabled) !== true;
-  return forcePushDisabled && deletionDisabled;
 }
 
 function featureEnabled(value: unknown): boolean {
@@ -2394,6 +2431,7 @@ export async function collectGitHubRepoProtectionData(
     | "listOrgRulesets"
     | "listRepoRulesets"
     | "getBranchProtection"
+    | "listBranchRules"
   >,
 ): Promise<GitHubRepoProtectionData> {
   const org = await collectDataset<JsonRecord | null>(null, () => client.getOrganization());
@@ -2401,6 +2439,24 @@ export async function collectGitHubRepoProtectionData(
   const orgRulesets = await collectDataset<JsonRecord[]>([], () => client.listOrgRulesets());
 
   const eligibleRepos = repositories.data.filter((repo) => !isArchivedRepo(repo));
+
+  const branchRules = await collectDataset<Record<string, GitHubBranchRulesEntry>>({}, async () => {
+    const entries = await mapWithConcurrency(eligibleRepos, 6, async (repo) => {
+      const owner = asString(asRecord(repo.owner).login) ?? "";
+      const name = asString(repo.name) ?? "";
+      const key = repoKey(repo);
+      const defaultBranch = asString(repo.default_branch);
+      if (!defaultBranch) {
+        return [key, { rules: null, error: "repository has no default_branch" }] as const;
+      }
+      try {
+        return [key, { rules: await client.listBranchRules(owner, name, defaultBranch) }] as const;
+      } catch (error) {
+        return [key, { rules: null, error: summarizeError(error) }] as const;
+      }
+    });
+    return Object.fromEntries(entries);
+  });
 
   const repoRulesets = await collectDataset<Record<string, JsonRecord[]>>({}, async () => {
     const entries = await mapWithConcurrency(eligibleRepos, 6, async (repo) => {
@@ -2431,6 +2487,7 @@ export async function collectGitHubRepoProtectionData(
     orgRulesets,
     repoRulesets,
     branchProtections,
+    branchRules,
   };
 }
 
@@ -2580,6 +2637,98 @@ export function assessGitHubOrgAccess(
   };
 }
 
+interface RepoProtectionPosture {
+  key: string;
+  requiresPullRequest: boolean;
+  approvingReviewCount: number;
+  requiresCodeOwnerReview: boolean;
+  dismissesStaleReviews: boolean;
+  requiresLastPushApproval: boolean;
+  requiredStatusCheckCount: number;
+  strictStatusChecks: boolean;
+  requiresSignatures: boolean;
+  blocksForcePush: boolean;
+  blocksDeletion: boolean;
+  adminEnforced: boolean | null;
+  orgSourcedRules: number;
+  repoSourcedRules: number;
+  legacyProtection: boolean;
+  unknown: boolean;
+}
+
+function ruleParameters(rule: JsonRecord): JsonRecord {
+  return asRecord(rule.parameters);
+}
+
+// Field names follow the REST "Get branch protection" schema (branch-protection,
+// protected-branch-pull-request-review, protected-branch-required-status-check) and the
+// "Get rules for a branch" schema (repository-rule-detailed with ruleset_source_type).
+function evaluateRepoProtection(
+  key: string,
+  protection: JsonRecord | null,
+  rulesEntry: GitHubBranchRulesEntry | undefined,
+  legacyUnknown: boolean,
+): RepoProtectionPosture {
+  const rules = rulesEntry?.rules ?? [];
+  const rulesUnknown = !rulesEntry || rulesEntry.rules === null;
+  const reviews = protection ? asRecord(protection.required_pull_request_reviews) : {};
+  const legacyHasReviews = Boolean(protection && protection.required_pull_request_reviews);
+  const statusChecks = protection ? asRecord(protection.required_status_checks) : {};
+  const legacyContexts = asArray(statusChecks.contexts).length + asArray(statusChecks.checks).length;
+
+  const pullRequestRules = rules.filter((rule) => safeLower(rule.type) === "pull_request");
+  const statusCheckRules = rules.filter((rule) => safeLower(rule.type) === "required_status_checks");
+  const ruleReviewCount = Math.max(0, ...pullRequestRules.map((rule) => asNumber(ruleParameters(rule).required_approving_review_count) ?? 0));
+  const ruleStatusCheckCount = statusCheckRules.reduce(
+    (total, rule) => total + asArray(ruleParameters(rule).required_status_checks).length,
+    0,
+  );
+
+  return {
+    key,
+    requiresPullRequest: legacyHasReviews || pullRequestRules.length > 0,
+    approvingReviewCount: Math.max(asNumber(reviews.required_approving_review_count) ?? 0, ruleReviewCount),
+    requiresCodeOwnerReview: asBoolean(reviews.require_code_owner_reviews) === true
+      || pullRequestRules.some((rule) => asBoolean(ruleParameters(rule).require_code_owner_review) === true),
+    dismissesStaleReviews: asBoolean(reviews.dismiss_stale_reviews) === true
+      || pullRequestRules.some((rule) => asBoolean(ruleParameters(rule).dismiss_stale_reviews_on_push) === true),
+    requiresLastPushApproval: asBoolean(reviews.require_last_push_approval) === true
+      || pullRequestRules.some((rule) => asBoolean(ruleParameters(rule).require_last_push_approval) === true),
+    requiredStatusCheckCount: legacyContexts + ruleStatusCheckCount,
+    strictStatusChecks: asBoolean(statusChecks.strict) === true
+      || statusCheckRules.some((rule) => asBoolean(ruleParameters(rule).strict_required_status_checks_policy) === true),
+    requiresSignatures: branchProtectionRequiresSignatures(protection) || rulesIncludeType(rules, "required_signatures"),
+    blocksForcePush: (protection !== null && asBoolean(asRecord(protection.allow_force_pushes).enabled) !== true)
+      || rulesIncludeType(rules, "non_fast_forward"),
+    blocksDeletion: (protection !== null && asBoolean(asRecord(protection.allow_deletions).enabled) !== true)
+      || rulesIncludeType(rules, "deletion"),
+    adminEnforced: protection ? (asBoolean(asRecord(protection.enforce_admins).enabled) ?? null) : null,
+    orgSourcedRules: rules.filter((rule) => safeLower(rule.ruleset_source_type) === "organization").length,
+    repoSourcedRules: rules.filter((rule) => safeLower(rule.ruleset_source_type) === "repository").length,
+    legacyProtection: protection !== null,
+    unknown: rulesUnknown && (legacyUnknown || protection === null),
+  };
+}
+
+function coverageStatus(
+  compliant: number,
+  total: number,
+  unknown: number,
+): GitHubFindingStatus {
+  if (total === 0) return "Info";
+  if (compliant === total && unknown === 0) return "Pass";
+  if (compliant > 0 || unknown > 0) return "Partial";
+  return "Fail";
+}
+
+function coverageSummary(label: string, compliant: number, total: number, unknown: number): string {
+  if (total === 0) return `No active repositories were found to assess ${label}.`;
+  const base = `${compliant} of ${total} active repositories ${label}`;
+  return unknown > 0
+    ? `${base}; ${unknown} repositories could not be evaluated because neither branch protection nor branch rules were readable.`
+    : `${base}.`;
+}
+
 export function assessGitHubRepoProtection(
   data: GitHubRepoProtectionData,
   config: GitHubResolvedConfig,
@@ -2587,85 +2736,118 @@ export function assessGitHubRepoProtection(
   const org = data.org.data ?? null;
   const orgRulesets = data.orgRulesets.data.filter(isActiveRuleset);
   const repos = data.repositories.data.filter((repo) => !isArchivedRepo(repo));
+  const repositoriesUnreadable = Boolean(data.repositories.error);
+  const legacyUnknown = Boolean(data.branchProtections.error);
+  const rulesDatasetUnknown = Boolean(data.branchRules.error);
 
-  let protectedCount = 0;
-  let signedCount = 0;
-  let bypassRestrictedCount = 0;
-  let repoRulesetCoverage = 0;
-
-  for (const repo of repos) {
+  const postures = repos.map((repo) => {
     const key = repoKey(repo);
-    const repoRulesets = (data.repoRulesets.data[key] ?? []).filter(isActiveRuleset);
-    const protection = data.branchProtections.data[key] ?? null;
-    const hasBranchProtection = branchProtectionRequiresReviewsOrChecks(protection);
-    const hasRepoRules = repoRulesets.length > 0;
-    if (hasBranchProtection || hasRepoRules) protectedCount += 1;
-    if (hasRuleType(repoRulesets, "required_signatures") || branchProtectionRequiresSignatures(protection)) signedCount += 1;
-    if (
-      hasRuleType(repoRulesets, "non_fast_forward")
-      || hasRuleType(repoRulesets, "deletion")
-      || branchProtectionRestrictsBypass(protection)
-    ) {
-      bypassRestrictedCount += 1;
-    }
-    if (repoRulesets.length > 0) repoRulesetCoverage += 1;
-  }
+    return evaluateRepoProtection(
+      key,
+      legacyUnknown ? null : (data.branchProtections.data[key] ?? null),
+      rulesDatasetUnknown ? undefined : data.branchRules.data[key],
+      legacyUnknown,
+    );
+  });
 
   const repoCount = repos.length;
+  const unknownCount = postures.filter((posture) => posture.unknown).length;
+  const protectedCount = postures.filter((posture) => posture.requiresPullRequest && posture.blocksForcePush && posture.blocksDeletion).length;
+  const adminEnforcedCount = postures.filter((posture) => posture.adminEnforced === true).length;
+  const reviewCount = postures.filter((posture) => posture.approvingReviewCount >= 1).length;
+  const codeOwnerCount = postures.filter((posture) => posture.requiresCodeOwnerReview).length;
+  const dismissStaleCount = postures.filter((posture) => posture.dismissesStaleReviews).length;
+  const lastPushApprovalCount = postures.filter((posture) => posture.requiresLastPushApproval).length;
+  const statusCheckCount = postures.filter((posture) => posture.requiredStatusCheckCount >= 1).length;
+  const strictCount = postures.filter((posture) => posture.strictStatusChecks).length;
+  const signedCount = postures.filter((posture) => posture.requiresSignatures).length;
+  const bypassRestrictedCount = postures.filter((posture) => posture.blocksForcePush && posture.blocksDeletion).length;
+  const orgRuleCoveredCount = postures.filter((posture) => posture.orgSourcedRules > 0).length;
+  const repoRuleCoveredCount = postures.filter((posture) => posture.repoSourcedRules > 0).length;
+  const legacyCoveredCount = postures.filter((posture) => posture.legacyProtection).length;
   const webCommitSignoffRequired = asBoolean(org && asRecord(org).web_commit_signoff_required);
 
+  const unreadableEvidence = [
+    `repositories error = ${data.repositories.error}`,
+  ];
+  const unreadableNote = "Rerun with a principal that can list organization repositories (metadata read) or export the repository list from the org UI.";
+
+  const repoScoped = (
+    id: string,
+    label: string,
+    compliant: number,
+    evidence: string[],
+    recommendation: string,
+    manualNote?: string,
+  ): GitHubFinding => {
+    if (repositoriesUnreadable) {
+      return buildFinding(id, "Manual", `The repository list was not readable, so ${label} could not be evaluated.`, unreadableEvidence, recommendation, unreadableNote);
+    }
+    return buildFinding(
+      id,
+      coverageStatus(compliant, repoCount, unknownCount),
+      coverageSummary(label, compliant, repoCount, unknownCount),
+      [...evidence, ...(unknownCount > 0 ? [`repos_not_evaluable = ${unknownCount}`] : [])],
+      recommendation,
+      manualNote,
+    );
+  };
+
   const findings: GitHubFinding[] = [
-    buildFinding(
-      "GITHUB-REPO-001",
-      orgRulesets.length > 0 || repoRulesetCoverage > 0
-        ? (orgRulesets.length > 0 ? "Pass" : "Partial")
-        : "Fail",
-      orgRulesets.length > 0
-        ? `${orgRulesets.length} active organization ruleset(s) were found.`
-        : (repoRulesetCoverage > 0
-          ? `${repoRulesetCoverage} repository-specific ruleset assignment(s) were found, but no org-wide rulesets were detected.`
-          : "No active organization or repository rulesets were found."),
-      [
-        `active_org_rulesets = ${orgRulesets.length}`,
-        `repos_with_repo_rulesets = ${repoRulesetCoverage}/${repoCount}`,
-      ],
-      "Use organization rulesets where possible so baseline branch protections are declarative and harder to drift.",
-    ),
-    buildFinding(
+    data.orgRulesets.error || repositoriesUnreadable
+      ? buildFinding(
+        "GITHUB-REPO-001",
+        "Manual",
+        "Organization rulesets or the repository list were not readable, so ruleset coverage is unverified.",
+        [
+          data.orgRulesets.error ? `org_rulesets error = ${data.orgRulesets.error}` : `active_org_rulesets = ${orgRulesets.length}`,
+          ...(repositoriesUnreadable ? unreadableEvidence : []),
+        ],
+        "Use organization rulesets where possible so baseline branch protections are declarative and harder to drift.",
+        "Confirm rulesets under Organization settings > Repository > Rulesets with an org owner.",
+      )
+      : buildFinding(
+        "GITHUB-REPO-001",
+        orgRulesets.length > 0
+          ? (repoCount === 0 || orgRuleCoveredCount === repoCount ? "Pass" : "Partial")
+          : (repoRuleCoveredCount > 0 ? "Partial" : "Fail"),
+        orgRulesets.length > 0
+          ? `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${repoCount} active default branches receive organization-sourced rules.`
+          : (repoRuleCoveredCount > 0
+            ? `${repoRuleCoveredCount} repositories receive repository-level rules, but no active organization rulesets exist.`
+            : "No active organization rulesets exist and no default branch receives ruleset rules."),
+        [
+          `active_org_rulesets = ${orgRulesets.length}`,
+          `repos_with_org_sourced_rules = ${orgRuleCoveredCount}/${repoCount}`,
+          `repos_with_repo_sourced_rules = ${repoRuleCoveredCount}/${repoCount}`,
+          `repos_with_legacy_branch_protection = ${legacyCoveredCount}/${repoCount}`,
+        ],
+        "Use organization rulesets where possible so baseline branch protections are declarative and harder to drift.",
+      ),
+    repoScoped(
       "GITHUB-REPO-002",
-      repoCount === 0 ? "Info" : (protectedCount === repoCount ? "Pass" : (protectedCount > 0 || orgRulesets.length > 0 ? "Partial" : "Fail")),
-      repoCount === 0
-        ? "No active repositories were found to assess."
-        : `${protectedCount} of ${repoCount} active repositories showed branch protection or repo-level ruleset coverage.`,
+      "require pull requests and block force pushes and deletions on the default branch",
+      protectedCount,
       [
-        `protected_or_ruleset_covered_repos = ${protectedCount}/${repoCount}`,
+        `protected_default_branches = ${protectedCount}/${repoCount}`,
+        `admin_enforced_legacy_protections = ${adminEnforcedCount}/${legacyCoveredCount}`,
         `org_rulesets = ${orgRulesets.length}`,
       ],
-      "Require pull requests and status checks on default branches across active repositories.",
-      orgRulesets.length > 0 && protectedCount < repoCount
-        ? "Org-wide rulesets exist, but this v1 check cannot prove which repos they target. Confirm org-ruleset targeting in the GitHub UI."
-        : undefined,
+      "Require pull requests, block force pushes and deletions, and enforce the rules for administrators on every default branch.",
+      adminEnforcedCount < legacyCoveredCount ? "Some legacy branch protections do not set enforce_admins; ruleset bypass actors must be reviewed in the ruleset UI." : undefined,
     ),
-    buildFinding(
+    repoScoped(
       "GITHUB-REPO-003",
-      repoCount === 0 ? "Info" : (signedCount === repoCount ? "Pass" : (signedCount > 0 ? "Partial" : "Fail")),
-      repoCount === 0
-        ? "No active repositories were found to assess commit-signature posture."
-        : `${signedCount} of ${repoCount} active repositories showed signed-commit enforcement.`,
-      [
-        `signed_commit_enforced_repos = ${signedCount}/${repoCount}`,
-      ],
+      "require signed commits on the default branch",
+      signedCount,
+      [`signed_commit_enforced_repos = ${signedCount}/${repoCount}`],
       "Require signed commits or equivalent integrity enforcement for protected branches.",
     ),
-    buildFinding(
+    repoScoped(
       "GITHUB-REPO-004",
-      repoCount === 0 ? "Info" : (bypassRestrictedCount === repoCount ? "Pass" : (bypassRestrictedCount > 0 ? "Partial" : "Fail")),
-      repoCount === 0
-        ? "No active repositories were found to assess bypass restrictions."
-        : `${bypassRestrictedCount} of ${repoCount} active repositories showed force-push/deletion restrictions through rulesets or branch protection.`,
-      [
-        `repos_with_bypass_restrictions = ${bypassRestrictedCount}/${repoCount}`,
-      ],
+      "block both force pushes and branch deletion on the default branch",
+      bypassRestrictedCount,
+      [`repos_with_bypass_restrictions = ${bypassRestrictedCount}/${repoCount}`],
       "Restrict force pushes and branch deletions on protected branches so administrative bypass stays exceptional.",
     ),
     buildFinding(
@@ -2681,6 +2863,29 @@ export function assessGitHubRepoProtection(
       ],
       "Require web commit signoff so browser-based changes retain author intent and acknowledgment.",
     ),
+    repoScoped(
+      "GITHUB-REPO-006",
+      "require at least one approving review on the default branch",
+      reviewCount,
+      [
+        `repos_requiring_approving_review = ${reviewCount}/${repoCount}`,
+        `repos_requiring_code_owner_review = ${codeOwnerCount}/${repoCount}`,
+        `repos_dismissing_stale_reviews = ${dismissStaleCount}/${repoCount}`,
+        `repos_requiring_last_push_approval = ${lastPushApprovalCount}/${repoCount}`,
+        `repos_requiring_pull_request_without_review_count = ${postures.filter((posture) => posture.requiresPullRequest && posture.approvingReviewCount === 0).length}`,
+      ],
+      "Set required_approving_review_count to at least 1 (2 for sensitive repositories), require code owner review, dismiss stale approvals, and require last-push approval.",
+    ),
+    repoScoped(
+      "GITHUB-REPO-007",
+      "require at least one status check on the default branch",
+      statusCheckCount,
+      [
+        `repos_requiring_status_checks = ${statusCheckCount}/${repoCount}`,
+        `repos_with_strict_status_checks = ${strictCount}/${repoCount}`,
+      ],
+      "Require named CI status checks (with the strict up-to-date policy) before merging into default branches.",
+    ),
   ];
 
   return {
@@ -2688,11 +2893,14 @@ export function assessGitHubRepoProtection(
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      active_repositories: repoCount,
-      active_org_rulesets: orgRulesets.length,
+      active_repositories: repositoriesUnreadable ? "error" : repoCount,
+      active_org_rulesets: data.orgRulesets.error ? "error" : orgRulesets.length,
       protected_repositories: protectedCount,
+      review_required_repositories: reviewCount,
+      status_check_required_repositories: statusCheckCount,
       signed_commit_repositories: signedCount,
       bypass_restricted_repositories: bypassRestrictedCount,
+      repos_not_evaluable: unknownCount,
     },
     text: buildAssessmentText("GitHub repository protection assessment", config.organization, findings),
   };
@@ -2926,6 +3134,7 @@ export async function exportGitHubAuditBundle(
     | "listOrgRulesets"
     | "listRepoRulesets"
     | "getBranchProtection"
+    | "listBranchRules"
     | "getOrgActionsPermissions"
     | "getOrgSelectedActions"
     | "getOrgWorkflowPermissions"
