@@ -3,20 +3,33 @@ slug: "sumologic-sec-inspector"
 name: "Sumo Logic Security Inspector"
 vendor: "Sumo Logic"
 category: "monitoring-logging-observability"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/sumologic-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# Sumo Logic Security Inspector — Architecture Specification
+# Sumo Logic Security Inspector: Architecture Specification
 
 ## 1. Overview
 
 **sumologic-sec-inspector** is a security compliance inspection tool for Sumo Logic environments. It audits authentication policies, access controls, data governance, and operational security settings across a Sumo Logic organization via the Management API. The tool produces structured findings mapped to major compliance frameworks, enabling security teams to identify misconfigurations, enforce least-privilege access, and maintain continuous compliance posture.
 
 Written in Go with a hybrid CLI/TUI architecture, it supports both automated pipeline execution (JSON/SARIF output) and interactive exploration of findings.
+
+### grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/sumologic.ts` as native grclanker tools (TypeScript, read-only Management API access with basic auth):
+
+- `sumologic_check_access`: probes 17 read surfaces and reports missing role capabilities
+- `sumologic_assess_identity`: controls 1 to 5
+- `sumologic_assess_access_control`: controls 6, 7, 8, 13, 14
+- `sumologic_assess_data_governance`: controls 9, 10, 12, 16, 17
+- `sumologic_assess_content_sharing`: controls 11, 15, 18, 19, 20
+- `sumologic_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified matrix, per-framework reports, error log, zip
+
+Findings use the statuses `pass`, `warn`, `fail`, and `manual`; unreadable, empty, or partial evidence never yields `pass`. See `src/content/docs/docs/integrations/sumologic.md` for setup and status semantics.
 
 ## 2. APIs & SDKs
 
@@ -58,7 +71,7 @@ Written in Go with a hybrid CLI/TUI architecture, it supports both automated pip
 | `sumologic-sdk-python` | Python | Community SDK, wraps REST API |
 | Sumo Logic Terraform Provider | HCL | `sumologic_*` resources for IaC auditing |
 | Sumo Logic CLI | Go | Official CLI tool |
-| OpenAPI Spec | — | Available at docs.sumologic.com for codegen |
+| OpenAPI Spec | - | Available at docs.sumologic.com for codegen |
 
 ## 3. Authentication
 
@@ -96,26 +109,26 @@ Alternatively, configure via `~/.sumologic-sec-inspector/config.yaml` or pass `-
 
 ## 4. Security Controls
 
-1. **SAML SSO Enforcement** — Verify SAML identity provider is configured and SSO is enforced for all users (no local-only auth).
-2. **SAML Allowlisted Users Minimized** — Ensure the SAML bypass allowlist contains only break-glass accounts, not regular users.
-3. **Password Policy Strength** — Validate minimum length >= 12, complexity requirements enabled, lockout after failed attempts.
-4. **Password Expiration Policy** — Confirm password rotation is enforced with a maximum age <= 90 days.
-5. **MFA Enforcement** — Verify multi-factor authentication is required for all users (when not using SSO).
-6. **Role-Based Access Control** — Ensure roles follow least-privilege; detect overly permissive roles with admin capabilities.
-7. **Access Key Rotation** — Identify access keys older than 90 days without rotation.
-8. **Inactive Access Keys** — Detect access keys that have not been used in 90+ days.
-9. **Audit Index Enabled** — Confirm the audit index is enabled and actively receiving events.
-10. **Data Forwarding Destinations Reviewed** — Validate outbound connections (webhooks, S3, etc.) point to approved destinations.
-11. **Content Sharing Permissions** — Detect overly broad content sharing (dashboards, searches shared to "org" unnecessarily).
-12. **Collector Management** — Identify unmanaged, offline, or ephemeral collectors; verify collector versions are current.
-13. **Service Allowlist Configured** — Verify IP-based service allowlist restricts API and UI access to corporate networks.
-14. **Session Timeout Policy** — Confirm session timeout is set to <= 15 minutes of inactivity.
-15. **Scheduled Search Permissions** — Ensure scheduled searches run with appropriate role bindings, not shared admin credentials.
-16. **Ingest Budget Controls** — Verify ingest budgets are configured to prevent runaway data ingestion costs and DoS.
-17. **Data Retention Policies** — Confirm partition retention periods align with compliance requirements (e.g., 365 days for audit data).
-18. **Lookup Table Access** — Verify lookup tables containing sensitive data have restricted access permissions.
-19. **Dashboard Sharing Restrictions** — Detect dashboards shared externally or with overly broad audience.
-20. **Monitor Alert Routing** — Verify alert notifications route to approved channels (not personal emails or unapproved webhooks).
+1. **SAML SSO Enforcement**: Verify SAML identity provider is configured and SSO is enforced for all users (no local-only auth).
+2. **SAML Allowlisted Users Minimized**: Ensure the SAML bypass allowlist contains only break-glass accounts, not regular users.
+3. **Password Policy Strength**: Validate minimum length >= 12, complexity requirements enabled, lockout after failed attempts.
+4. **Password Expiration Policy**: Confirm password rotation is enforced with a maximum age <= 90 days.
+5. **MFA Enforcement**: Verify multi-factor authentication is required for all users (when not using SSO).
+6. **Role-Based Access Control**: Ensure roles follow least-privilege; detect overly permissive roles with admin capabilities.
+7. **Access Key Rotation**: Identify access keys older than 90 days without rotation.
+8. **Inactive Access Keys**: Detect access keys that have not been used in 90+ days.
+9. **Audit Index Enabled**: Confirm the audit index is enabled and actively receiving events.
+10. **Data Forwarding Destinations Reviewed**: Validate outbound connections (webhooks, S3, etc.) point to approved destinations.
+11. **Content Sharing Permissions**: Detect overly broad content sharing (dashboards, searches shared to "org" unnecessarily).
+12. **Collector Management**: Identify unmanaged, offline, or ephemeral collectors; verify collector versions are current.
+13. **Service Allowlist Configured**: Verify IP-based service allowlist restricts API and UI access to corporate networks.
+14. **Session Timeout Policy**: Confirm session timeout is set to <= 15 minutes of inactivity.
+15. **Scheduled Search Permissions**: Ensure scheduled searches run with appropriate role bindings, not shared admin credentials.
+16. **Ingest Budget Controls**: Verify ingest budgets are configured to prevent runaway data ingestion costs and DoS.
+17. **Data Retention Policies**: Confirm partition retention periods align with compliance requirements (e.g., 365 days for audit data).
+18. **Lookup Table Access**: Verify lookup tables containing sensitive data have restricted access permissions.
+19. **Dashboard Sharing Restrictions**: Detect dashboards shared externally or with overly broad audience.
+20. **Monitor Alert Routing**: Verify alert notifications route to approved channels (not personal emails or unapproved webhooks).
 
 ## 5. Compliance Framework Mappings
 
@@ -301,4 +314,26 @@ make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as six native TypeScript tools (see "grclanker implementation" in section 1). The Go CLI/TUI, SARIF/CSV/HTML reporters, and Docker packaging described in sections 7 to 9 were not built; grclanker's export bundle (markdown plus JSON plus zip) replaces them.
+
+### Shipped
+
+- Basic-auth Management API client with `token` cursor pagination, `limit`/`offset` pagination for collectors and monitor search, 429 and 5xx retry with backoff honoring `Retry-After`, request timeouts, and access key redaction.
+- Deployment mapping for every deployment documented in the official OpenAPI definition and endpoint table: au, ca, ch, de, esc, eu, fed, in, jp, kr, us1, us2.
+- Configuration precedence: explicit arguments, then `SUMOLOGIC_ACCESS_ID` / `SUMOLOGIC_ACCESS_KEY` / `SUMOLOGIC_ENDPOINT` (or `SUMOLOGIC_DEPLOYMENT`), then `~/.sumologic-sec-inspector/config.yaml` (or `SUMOLOGIC_CONFIG_FILE`).
+- All 20 controls emit a finding with the section 5 framework mappings. Controls 1, 15, and 18 are `manual` by design (see deviations); every other control can reach `pass` only with complete, readable evidence.
+- Mocked regression tests in `cli/tests/sumologic.test.mjs`, including false-pass self-checks for all-403, all-empty, and partial-inventory fixtures, and a live smoke script (`npm --prefix cli run test:sumologic:live`).
+
+### Deviations from this spec, following the official documentation
+
+- Endpoints: content folders are served at `/v2/content/folders/personal` (not `/v1`), monitors are listed through `/v1/monitors/search` (there is no plain `/v1/monitors` list), ingest budgets use `/v2/ingestBudgets`, and the audit index is read from `/v1/policies/audit` plus `/v1/partitions?viewTypes=AuditIndex` (there is no `/v1/account/audit`). Lookup tables have no list endpoint (`/v1/lookupTables` only supports create), so control 18 is manual.
+- Capabilities: the official capability names differ from the table in section 3. Users and roles require `manageUsersAndRoles`; org-wide access keys require `manageAccessKeys`; policies require `manageOrgSettings`; the audit index is a partition read (`viewPartitions`) plus a policy read rather than `viewAuditLog`.
+- SAML enforcement: `/v1/saml/lockdown/enable` and `/disable` exist, but there is no status GET, so control 1 reports `manual` (or `warn` on debug mode or a missing certificate) once an identity provider exists and `fail` on zero providers.
+- Deployments: the official endpoint table adds CH and ESC beyond the list in section 2; both are supported.
+- Data forwarding review (control 10) and monitor alert routing (control 20) accept optional approved domain lists; without them, non-empty destination inventories are reported as `manual` because approval is a human decision.
+
+### Remaining
+
+- Admin Recommended and Global folder permission sweeps (asynchronous job endpoints) for controls 11 and 18.
+- Proof of audit event flow via the Search Job API (control 9 currently verifies configuration only).
+- Cloud SIEM and Cloud SOAR posture, which are outside this spec's 20 controls.
