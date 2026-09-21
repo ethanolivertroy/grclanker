@@ -1694,8 +1694,13 @@ export class GitHubAuditorClient {
     return extractRecords(payload).map(projectCodeSecurityDefault);
   }
 
+  // Unlimited lists have no truncation channel, so the only truncated exit they can hit (a Link
+  // header that repeats a page) surfaces as an error and the dependent dataset renders Manual.
   private async paginate(pathname: string): Promise<JsonRecord[]> {
-    const { records } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
+    const { records, truncated } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
+    if (truncated) {
+      throw new Error(`GitHub pagination for ${pathname} repeated a page already fetched (Link rel="next" loop); inventory incomplete after ${records.length} record(s)`);
+    }
     return records;
   }
 
@@ -1712,10 +1717,12 @@ export class GitHubAuditorClient {
   // advertised once the limit is reached. Exactly `limit` records with no next link is complete.
   private async paginateWithStatus(pathname: string, limit: number): Promise<GitHubPaginatedRecords> {
     const collected: JsonRecord[] = [];
+    const visited = new Set<string>();
     let nextPath: string | null = pathname;
     let truncated = false;
 
     while (nextPath) {
+      visited.add(this.buildUrl(nextPath));
       const { response, payload } = await this.requestJson(nextPath);
       const pageRecords = extractRecords(payload);
       for (const record of pageRecords) {
@@ -1729,6 +1736,11 @@ export class GitHubAuditorClient {
 
       nextPath = parseNextLink(response.headers.get("link"));
       if (nextPath && collected.length >= limit) {
+        truncated = true;
+        break;
+      }
+      // A next link that points back at a page already fetched can never complete the inventory.
+      if (nextPath && visited.has(this.buildUrl(nextPath))) {
         truncated = true;
         break;
       }

@@ -947,6 +947,17 @@ test("audit log collection uses the created:>= phrase window and reports the rec
   const smallSnapshot = await new GitHubAuditorClient(createSampleConfig(), small.fetchImpl).listAuditLog(30);
   assert.equal(smallSnapshot.truncated, false);
 
+  // A Link header that points back at the first page can never complete the inventory.
+  const loopingFetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    return jsonResponse([{ login: "alice" }], { link: `<${url.origin}${url.pathname}?${url.searchParams.toString()}>; rel="next"` });
+  };
+  const loopingClient = new GitHubAuditorClient(createSampleConfig(), loopingFetch);
+  const loopingAudit = await loopingClient.listAuditLog(30);
+  assert.equal(loopingAudit.truncated, true, "the capped audit log reports the repeated page as truncation");
+  assert.equal(loopingAudit.events.length, 1);
+  await assert.rejects(() => loopingClient.listMembers(), /repeated a page already fetched/);
+
   const cappedResult = assessGitHubOrgAccess(createOrgAccessData({ auditLog: dataset(cappedSnapshot) }), createSampleConfig());
   const cappedFinding = cappedResult.findings.find((finding) => finding.id === "GITHUB-ORG-005");
   assert.match(cappedFinding.summary, /sample capped at 200 events, so this is a visibility check/);
