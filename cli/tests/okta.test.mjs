@@ -185,7 +185,7 @@ function createSampleAdminData() {
       "user-1": [{ id: "factor-1", factorType: "webauthn", provider: "FIDO", status: "ACTIVE" }],
     }),
     oktaSupportAccess: dataset({ support: "DISABLED", expiration: null }),
-    thirdPartyAdminSetting: dataset({ thirdPartyAdminSetting: false }),
+    thirdPartyAdminSetting: dataset({ thirdPartyAdmin: false }),
   };
 }
 
@@ -463,7 +463,7 @@ function createPartialInventoryClient() {
       };
     },
     async getThirdPartyAdminSetting() {
-      throw forbidden("/api/v1/org/settings/thirdPartyAdminSetting");
+      throw forbidden("/api/v1/org/orgSettings/thirdPartyAdminSetting");
     },
     async listApps() {
       throw forbidden("/api/v1/apps");
@@ -746,6 +746,98 @@ test("OSCAL export marks manual findings not-satisfied with a manual reason", ()
   assert.equal(findings[0].target.status.reason, "manual");
   assert.equal(findings[0].target["target-id"], "au-6_obj");
 });
+
+
+test("OKTA-ADMIN-006 reads thirdPartyAdmin and passes only for a compliant org", () => {
+  const config = createSampleConfig();
+
+  const compliant = createSampleAdminData();
+  compliant.oktaSupportAccess = dataset({ support: "DISABLED", expiration: null, caseNumber: null });
+  compliant.thirdPartyAdminSetting = dataset({ thirdPartyAdmin: false });
+  const passFinding = findingById(assessOktaAdminAccess(compliant, config), "OKTA-ADMIN-006");
+  assert.equal(passFinding.status, "Pass");
+  assert.match(passFinding.summary, /third-party administrators are not permitted/);
+  assert.ok(passFinding.evidence.includes("Third-party administrators: false"));
+
+  const enabled = createSampleAdminData();
+  enabled.thirdPartyAdminSetting = dataset({ thirdPartyAdmin: true });
+  const enabledFinding = findingById(assessOktaAdminAccess(enabled, config), "OKTA-ADMIN-006");
+  assert.equal(enabledFinding.status, "Partial");
+  assert.match(enabledFinding.summary, /third-party administrator access is enabled/);
+
+  const legacyField = createSampleAdminData();
+  legacyField.thirdPartyAdminSetting = dataset({ thirdPartyAdminSetting: false });
+  const legacyFinding = findingById(assessOktaAdminAccess(legacyField, config), "OKTA-ADMIN-006");
+  assert.equal(legacyFinding.status, "Partial");
+  assert.match(legacyFinding.summary, /did not include the thirdPartyAdmin field/);
+
+  const supportEnabled = createSampleAdminData();
+  supportEnabled.oktaSupportAccess = dataset({ support: "ENABLED", expiration: "2026-10-01T00:00:00.000Z" });
+  const supportFinding = findingById(assessOktaAdminAccess(supportEnabled, config), "OKTA-ADMIN-006");
+  assert.equal(supportFinding.status, "Partial");
+  assert.match(supportFinding.summary, /ENABLED until 2026-10-01T00:00:00\.000Z/);
+});
+
+test("OKTA-ADMIN-006 names a 404 or 403 on the third-party admin surface instead of swallowing it", async () => {
+  const config = createSampleConfig();
+  const thirdPartyPath = "/api/v1/org/orgSettings/thirdPartyAdminSetting";
+
+  const notFoundClient = {
+    ...createSampleClient(),
+    async getThirdPartyAdminSetting() {
+      throw new Error(`Okta API request failed for ${thirdPartyPath} (404 Not Found): Not found`);
+    },
+  };
+  const notFoundData = await collectOktaAdminAccessData(notFoundClient);
+  assert.match(notFoundData.thirdPartyAdminSetting.error, /404 Not Found/);
+  const notFound = findingById(assessOktaAdminAccess(notFoundData, config), "OKTA-ADMIN-006");
+  assert.equal(notFound.status, "Partial");
+  assert.match(notFound.summary, /third-party admin setting could not be read because the endpoint returned 404 Not Found/);
+  assert.ok(notFound.evidence.some((entry) => entry.includes(thirdPartyPath)));
+
+  const forbiddenClient = {
+    ...createSampleClient(),
+    async getThirdPartyAdminSetting() {
+      throw forbidden(thirdPartyPath);
+    },
+  };
+  const forbiddenFinding = findingById(
+    assessOktaAdminAccess(await collectOktaAdminAccessData(forbiddenClient), config),
+    "OKTA-ADMIN-006",
+  );
+  assert.equal(forbiddenFinding.status, "Partial");
+  assert.match(forbiddenFinding.summary, /403 Forbidden/);
+
+  const supportForbiddenClient = {
+    ...createSampleClient(),
+    async getOktaSupportSettings() {
+      throw forbidden("/api/v1/org/privacy/oktaSupport");
+    },
+  };
+  const supportForbidden = findingById(
+    assessOktaAdminAccess(await collectOktaAdminAccessData(supportForbiddenClient), config),
+    "OKTA-ADMIN-006",
+  );
+  assert.equal(supportForbidden.status, "Manual");
+  assert.match(supportForbidden.summary, /403 Forbidden.*Okta Support access/);
+  assert.ok(supportForbidden.manualNote);
+
+  const bothForbidden = findingById(
+    assessOktaAdminAccess(
+      await collectOktaAdminAccessData({
+        ...supportForbiddenClient,
+        async getThirdPartyAdminSetting() {
+          throw new Error(`Okta API request failed for ${thirdPartyPath} (404 Not Found): Not found`);
+        },
+      }),
+      config,
+    ),
+    "OKTA-ADMIN-006",
+  );
+  assert.equal(bothForbidden.status, "Manual");
+  assert.match(bothForbidden.summary, /403 Forbidden.*Okta Support access.*404 Not Found.*third-party admin setting/);
+});
+
 
 test("rule 1: forbidden or errored endpoints yield manual findings that name the cause", () => {
   const config = createSampleConfig();
@@ -1051,4 +1143,29 @@ test("self-check (c): partial-inventory fixtures produce no pass in any assess t
   assert.equal(statusOf(results.admin, "OKTA-ADMIN-005"), "Partial");
   assert.equal(statusOf(results.admin, "OKTA-ADMIN-001"), "Partial");
   assert.equal(statusOf(results.monitoring, "OKTA-MON-008"), "Partial");
+});
+
+test("self-check (d): compliant-org fixtures pass every automatable finding (29 of 29)", async () => {
+  const results = await runAllAssessments(createSampleClient(), createSampleConfig());
+  const findings = allFindings(results);
+  assert.equal(findings.length, OKTA_CHECK_IDS.length);
+
+  const manual = findings.filter((finding) => finding.status === "Manual").map((finding) => finding.id);
+  assert.deepEqual(manual, ["OKTA-MON-009"], "only the API-invisible notification control stays Manual");
+
+  const automatable = findings.filter((finding) => finding.id !== "OKTA-MON-009");
+  assert.equal(automatable.length, 29);
+  const notPassing = automatable
+    .filter((finding) => finding.status !== "Pass")
+    .map((finding) => `${finding.id}=${finding.status}`);
+  assert.deepEqual(notPassing, [], "every automatable finding reaches Pass on a compliant org");
+
+  const adminGovernance = findingById(results.admin, "OKTA-ADMIN-006");
+  assert.equal(adminGovernance.status, "Pass");
+  assert.ok(adminGovernance.evidence.includes("Okta Support access: DISABLED"));
+  assert.ok(adminGovernance.evidence.includes("Third-party administrators: false"));
+  for (const result of Object.values(results)) {
+    assert.equal(result.summary.Fail, 0);
+    assert.equal(result.summary.Partial, 0);
+  }
 });

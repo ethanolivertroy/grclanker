@@ -67,7 +67,7 @@ The current tool family is designed for GRC engineers who need evidence-backed p
 - `GET /api/v1/org/contacts`
 - `GET /api/v1/org/contacts/{contactType}`
 - `GET /api/v1/org/privacy/oktaSupport`
-- `GET /api/v1/org/settings/thirdPartyAdminSetting`
+- `GET /api/v1/org/orgSettings/thirdPartyAdminSetting` (operationId `getThirdPartyAdminSetting`, tag `OrgSettingAdmin`, scope `okta.orgs.read`; response `{ thirdPartyAdmin: boolean }`)
 
 ### Reference Implementations
 

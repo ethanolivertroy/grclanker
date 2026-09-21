@@ -1308,11 +1308,11 @@ export class OktaAuditorClient {
   }
 
   async getOktaSupportSettings(): Promise<JsonRecord | null> {
-    return this.tryGetJson<JsonRecord>("/api/v1/org/privacy/oktaSupport");
+    return this.getJson<JsonRecord>("/api/v1/org/privacy/oktaSupport");
   }
 
   async getThirdPartyAdminSetting(): Promise<JsonRecord | null> {
-    return this.tryGetJson<JsonRecord>("/api/v1/org/settings/thirdPartyAdminSetting");
+    return this.getJson<JsonRecord>("/api/v1/org/orgSettings/thirdPartyAdminSetting");
   }
 
   async listGroups(): Promise<JsonRecord[]> {
@@ -2841,22 +2841,29 @@ export function assessOktaAdminAccess(
 
   const support = data.oktaSupportAccess.data;
   const thirdParty = data.thirdPartyAdminSetting.data;
+  const supportError = data.oktaSupportAccess.error;
+  const thirdPartyError = data.thirdPartyAdminSetting.error;
   const supportState = asString(support?.support)?.toUpperCase();
   const supportExpiration = asString(support?.expiration);
-  const thirdPartyAdmin = thirdParty?.thirdPartyAdminSetting;
+  // ThirdPartyAdminSetting exposes a single boolean property, thirdPartyAdmin (Okta OpenAPI, tag OrgSettingAdmin).
+  const thirdPartyAdmin = thirdParty?.thirdPartyAdmin;
   const supportEvidence =
     "Record Settings > Account > Okta Support access (state and expiration) and Settings > Account > Third-party administrators.";
-  if (data.oktaSupportAccess.error && data.thirdPartyAdminSetting.error) {
+  if (supportError) {
     findings.push(
       manualFinding(
         "OKTA-ADMIN-006",
         "Okta Support access and third-party admin governance",
-        describeEndpointError(data.oktaSupportAccess.error),
+        thirdPartyError
+          ? `${describeEndpointError(supportError)} for Okta Support access and ${describeEndpointError(thirdPartyError)} for the third-party admin setting`
+          : `${describeEndpointError(supportError)} for Okta Support access`,
         supportEvidence,
-        `Errors: ${data.oktaSupportAccess.error} | ${data.thirdPartyAdminSetting.error}`,
+        thirdPartyError
+          ? `Errors: ${supportError} | ${thirdPartyError}`
+          : `Error: ${supportError}. Third-party administrators: ${thirdPartyAdmin === undefined ? "unknown" : String(thirdPartyAdmin)}.`,
       ),
     );
-  } else if (!support && !data.oktaSupportAccess.error) {
+  } else if (!support) {
     findings.push(
       manualFinding(
         "OKTA-ADMIN-006",
@@ -2866,27 +2873,29 @@ export function assessOktaAdminAccess(
       ),
     );
   } else {
-    const partialData = Boolean(data.oktaSupportAccess.error) || Boolean(data.thirdPartyAdminSetting.error);
-    const baseStatus: OktaFindingStatus =
-      supportState === "DISABLED" && thirdPartyAdmin === false
-        ? "Pass"
-        : supportState === "DISABLED" || supportState === "ENABLED"
-          ? "Partial"
-          : "Partial";
+    const status: OktaFindingStatus =
+      supportState === "DISABLED" && thirdPartyAdmin === false && !thirdPartyError ? "Pass" : "Partial";
+    const summary =
+      status === "Pass"
+        ? "Okta Support access is DISABLED and third-party administrators are not permitted."
+        : supportState === "ENABLED"
+          ? `Okta Support access is ENABLED${supportExpiration ? ` until ${supportExpiration}` : " without a reported expiration"}.`
+          : thirdPartyError
+            ? `Okta Support access is ${supportState ?? "unknown"}, but the third-party admin setting could not be read because ${describeEndpointError(thirdPartyError)}.`
+            : thirdPartyAdmin === true
+              ? "Okta Support access is DISABLED, but third-party administrator access is enabled."
+              : thirdPartyAdmin === undefined
+                ? "Okta Support access is DISABLED, but the third-party admin setting response did not include the thirdPartyAdmin field."
+                : `Okta Support access reported an unexpected state (${supportState ?? "unknown"}).`;
     findings.push(
       buildFinding(
         "OKTA-ADMIN-006",
-        partialData ? capAtPartial(baseStatus) : baseStatus,
-        baseStatus === "Pass"
-          ? "Okta Support access is DISABLED and third-party administrators are not permitted."
-          : supportState === "ENABLED"
-            ? `Okta Support access is ENABLED${supportExpiration ? ` until ${supportExpiration}` : " without a reported expiration"}.`
-            : "Okta Support access is disabled, but third-party administrator access is enabled or could not be confirmed.",
+        status,
+        summary,
         [
           `Okta Support access: ${supportState ?? "unknown"}${supportExpiration ? `, expires ${supportExpiration}` : ""}`,
           `Third-party administrators: ${thirdPartyAdmin === undefined ? "unknown" : String(thirdPartyAdmin)}`,
-          ...(data.oktaSupportAccess.error ? [`Support setting error: ${data.oktaSupportAccess.error}`] : []),
-          ...(data.thirdPartyAdminSetting.error ? [`Third-party admin setting error: ${data.thirdPartyAdminSetting.error}`] : []),
+          ...(thirdPartyError ? [`Third-party admin setting error: ${thirdPartyError}`] : []),
         ],
         "Grant Okta Support access only for time-boxed cases, and keep third-party administrator access disabled unless a documented vendor agreement requires it.",
       ),
