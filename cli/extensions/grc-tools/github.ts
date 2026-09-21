@@ -1694,7 +1694,7 @@ function buildAssessmentText(
     findingTable(findings),
     "",
     ...findings.map((finding) => [
-      `${finding.id} — ${finding.summary}`,
+      `${finding.id}: ${finding.summary}`,
       ...finding.evidence.map((line) => `  • ${line}`),
       `  Recommendation: ${finding.recommendation}`,
       finding.manualNote ? `  Manual note: ${finding.manualNote}` : "",
