@@ -27,6 +27,7 @@ import {
   resolveSumologicConfiguration,
 } from "../dist/extensions/grc-tools/sumologic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRESH = "2026-09-01T00:00:00Z";
@@ -755,9 +756,13 @@ test("approved_email_domains drives control 20 when org domains cannot be derive
   assert.equal(byId(noDomains, "SUMO-20").status, "manual");
   assert.match(byId(noDomains, "SUMO-20").summary, /no org email domains could be derived/);
 
+  // Rule 1 corollary: approved domains let the recipients be judged, but the
+  // unreadable user list still caps the verdict at warn and is named.
   const approved = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW, approvedEmailDomains: ["partner.example.org"] });
-  assert.equal(byId(approved, "SUMO-20").status, "pass");
+  assert.equal(byId(approved, "SUMO-20").status, "warn");
+  assert.match(byId(approved, "SUMO-20").summary, /Not checked: the user list could not be read because the access key lacks the role capability \(403\)/);
   assert.deepEqual(byId(approved, "SUMO-20").evidence.org_email_domains, ["partner.example.org"]);
+  assert.deepEqual(byId(approved, "SUMO-20").evidence.unreadable_inventories, ["user list"]);
 
   const mismatch = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW, approvedEmailDomains: ["example.com"] });
   assert.equal(byId(mismatch, "SUMO-20").status, "fail");
@@ -900,6 +905,263 @@ test("exportSumologicAuditBundle writes the bundle layout, zip, and error log, a
   assert.equal(second.errorCount, 0);
   assert.ok(!existsSync(join(second.outputDir, "_errors.log")));
   assert.ok(existsSync(first.zipPath));
+});
+
+function secretCarrierData() {
+  const data = healthyData();
+  data.connections = [
+    {
+      id: "c1",
+      name: "pagerduty-hook",
+      type: "WebhookConnection",
+      webhookType: "PagerDuty",
+      url: "https://hooks.example.com/services/FAKE_WEBHOOK_PATH_TOKEN_1?token=FAKE_WEBHOOK_QUERY_TOKEN_1",
+      headers: [{ name: "Authorization", value: "Bearer FAKE_HEADER_SECRET_1" }],
+      customHeaders: [{ name: "X-Api-Key", value: "FAKE_CUSTOM_HEADER_SECRET_1" }],
+      defaultPayload: "{\"routing_key\":\"FAKE_ROUTING_KEY_1\"}",
+      resolutionPayload: "{\"routing_key\":\"FAKE_RESOLUTION_KEY_1\"}",
+    },
+    { id: "c2", name: "servicenow", type: "ServiceNowConnection", url: "https://example.service-now.com/api", username: "FAKE_SNOW_USERNAME_1" },
+  ];
+  data.monitors[0].notifications.push({
+    notification: { connectionType: "PagerDuty", connectionId: "c1", payloadOverride: "{\"routing_key\":\"FAKE_PAYLOAD_OVERRIDE_1\"}", resolutionPayloadOverride: "FAKE_RESOLUTION_OVERRIDE_1" },
+    runForTriggerTypes: ["Critical"],
+  });
+  data.monitors[0].notifications[0].notification.messageBody = "FAKE_EMAIL_BODY_SECRET_1";
+  data.accessKeys = [{ id: "suAKFAKE_ACCESS_ID_TAIL_1", label: "ci-key", disabled: false, createdAt: FRESH, lastUsed: FRESH, corsHeaders: ["https://app.example.com"] }];
+  data.identityProviders[0].x509cert1 = "FAKE_X509_CERT_1";
+  data.identityProviders[0].certificate = "FAKE_SP_CERT_1";
+  data.dashboards[0].panels = [{ queryString: "FAKE_DASHBOARD_QUERY_1" }];
+  data.collectors[0].fields = { token: "FAKE_COLLECTOR_FIELD_1" };
+  data.personalFolder.children[0].description = "FAKE_FOLDER_DESCRIPTION_1";
+  data.passwordPolicy.futureSecretSetting = "FAKE_POLICY_LEAF_1";
+  return data;
+}
+
+const CARRIER_SECRETS = [
+  "FAKE_WEBHOOK_PATH_TOKEN_1",
+  "FAKE_WEBHOOK_QUERY_TOKEN_1",
+  "FAKE_HEADER_SECRET_1",
+  "FAKE_CUSTOM_HEADER_SECRET_1",
+  "FAKE_ROUTING_KEY_1",
+  "FAKE_RESOLUTION_KEY_1",
+  "FAKE_SNOW_USERNAME_1",
+  "FAKE_PAYLOAD_OVERRIDE_1",
+  "FAKE_RESOLUTION_OVERRIDE_1",
+  "FAKE_EMAIL_BODY_SECRET_1",
+  "FAKE_ACCESS_ID_TAIL_1",
+  "FAKE_X509_CERT_1",
+  "FAKE_SP_CERT_1",
+  "FAKE_DASHBOARD_QUERY_1",
+  "FAKE_COLLECTOR_FIELD_1",
+  "FAKE_FOLDER_DESCRIPTION_1",
+  "FAKE_POLICY_LEAF_1",
+  "secret-access-key-value",
+];
+
+test("rule 9: the exported bundle, the zip, and the assess tool payloads never carry connection, monitor, key, or configuration secrets", async () => {
+  const base = createTempBase("grclanker-sumo-secrets-");
+  const data = secretCarrierData();
+  const reader = readerFrom(data);
+
+  const result = await exportSumologicAuditBundle(reader, sampleConfig(), base, { now: NOW, approvedDestinationDomains: ["example.com", "service-now.com"] });
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.has(join("core_data", "data-governance.json")));
+  assert.ok(files.has(join("core_data", "content-sharing.json")));
+  assertSecretsAbsent(assert, files, CARRIER_SECRETS, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assert.ok(zipEntries.has("core_data/data-governance.json"));
+  assertSecretsAbsent(assert, zipEntries, CARRIER_SECRETS, "zip archive");
+
+  // Evidence stays legible: field names survive with markers, hosts survive without paths.
+  const governance = JSON.parse(files.get(join("core_data", "data-governance.json")));
+  const [hook, snow] = governance.connections.data;
+  assert.equal(hook.url_host, "hooks.example.com");
+  assert.equal(hook.url, "[REDACTED]");
+  assert.deepEqual(hook.headers, [{ name: "Authorization", value: "[REDACTED]" }]);
+  assert.deepEqual(hook.customHeaders, [{ name: "X-Api-Key", value: "[REDACTED]" }]);
+  assert.equal(hook.defaultPayload, "[REDACTED]");
+  assert.equal(hook.resolutionPayload, "[REDACTED]");
+  assert.equal(snow.username, "[REDACTED]");
+  assert.equal(governance.connections.count, 2);
+  const accessControl = JSON.parse(files.get(join("core_data", "access-control.json")));
+  assert.deepEqual(accessControl.access_keys.data, [{ label: "ci-key", disabled: false, createdAt: FRESH, lastUsed: FRESH, id_prefix: "suAK", cors_header_count: 1 }]);
+  const content = JSON.parse(files.get(join("core_data", "content-sharing.json")));
+  const pagerduty = content.monitors.data[0].notifications[1].notification;
+  assert.equal(pagerduty.connectionId, "c1");
+  assert.equal(pagerduty.payloadOverride, "[REDACTED]");
+  assert.equal(pagerduty.resolutionPayloadOverride, "[REDACTED]");
+  const identity = JSON.parse(files.get(join("core_data", "identity.json")));
+  assert.equal(identity.saml_identity_providers.data[0].x509cert1, "[REDACTED]");
+  assert.equal(identity.saml_identity_providers.data[0].configurationName, "Okta");
+  assert.equal(identity.password_policy.data.minLength, 14);
+  assert.equal(identity.password_policy.data.futureSecretSetting, undefined);
+
+  // The assess tool payloads spread the same rawData, so they must be clean too,
+  // while the verdicts still read the in-memory records (SUMO-10 resolves the host).
+  const [identityResult, accessResult, governanceResult, contentResult] = [
+    await assessSumologicIdentity(reader, { now: NOW }),
+    await assessSumologicAccessControl(reader, { now: NOW }),
+    await assessSumologicDataGovernance(reader, { now: NOW, approvedDestinationDomains: ["example.com", "service-now.com"] }),
+    await assessSumologicContentSharing(reader, { now: NOW }),
+  ];
+  const payloads = new Map([
+    ["identity", JSON.stringify(identityResult)],
+    ["access-control", JSON.stringify(accessResult)],
+    ["data-governance", JSON.stringify(governanceResult)],
+    ["content-sharing", JSON.stringify(contentResult)],
+  ]);
+  assertSecretsAbsent(assert, payloads, CARRIER_SECRETS, "assess tool payload");
+  assert.equal(byId(governanceResult, "SUMO-10").status, "pass");
+  assert.deepEqual(byId(governanceResult, "SUMO-10").evidence.destinations.map((item) => item.host), ["hooks.example.com", "example.service-now.com"]);
+  assert.equal(byId(contentResult, "SUMO-20").status, "pass");
+});
+
+test("rule 10: token pagination stops on a repeated cursor or an empty page with a next token and reports the inventory incomplete", async () => {
+  let repeatedRequests = 0;
+  let emptyRequests = 0;
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/api/v1/roles") {
+      repeatedRequests += 1;
+      return jsonResponse({ data: [{ id: `r${repeatedRequests}`, name: `Role ${repeatedRequests}` }], next: "stuck-cursor" });
+    }
+    if (url.pathname === "/api/v2/ingestBudgets") {
+      emptyRequests += 1;
+      return jsonResponse({ data: emptyRequests === 1 ? [{ id: "b1", name: "budget" }] : [], next: `page-${emptyRequests + 1}` });
+    }
+    if (url.pathname === "/api/v1/collectors") return jsonResponse({ collectors: Array.from({ length: 1000 }, (_, index) => ({ id: index, name: `c${index}` })) });
+    return jsonResponse({});
+  };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, maxPages: 50, maxRetries: 0 });
+
+  const roles = await client.listRoles();
+  assert.equal(roles.ok, true);
+  assert.equal(roles.complete, false, "a repeated next token must not report a complete inventory");
+  assert.equal(repeatedRequests, 2, "the repeated cursor is detected on the second page, not at the page cap");
+  assert.equal(roles.data.length, 2);
+
+  const budgets = await client.listIngestBudgets();
+  assert.equal(budgets.complete, false, "an empty page with a next token must not report a complete inventory");
+  assert.equal(emptyRequests, 2);
+  assert.equal(budgets.data.length, 1);
+
+  const capped = new SumologicApiClient(sampleConfig(), { fetchImpl, maxPages: 2, maxRetries: 0 });
+  const collectors = await capped.listCollectors();
+  assert.equal(collectors.complete, false, "offset pagination that hits the page cap on a full page is incomplete");
+  assert.equal(collectors.data.length, 2000);
+
+  const governance = await assessSumologicDataGovernance(readerFrom(healthyData(), { listRoles: async () => roles, listCollectors: async () => collectors }), { now: NOW });
+  assert.equal(byId(governance, "SUMO-12").status, "warn");
+  assert.match(byId(governance, "SUMO-12").summary, /Pagination stopped before the last page, so only 2000 items were seen/);
+});
+
+test("rule 10: control 10 names each capped forwarding inventory and never passes on a truncated partition or scheduled view list", async () => {
+  const data = healthyData();
+  const partial = (items) => collectionOf(items, { complete: false });
+
+  const viewsCapped = await assessSumologicDataGovernance(readerFrom(data, { listScheduledViews: async () => partial(data.scheduledViews) }), { now: NOW });
+  assert.equal(byId(viewsCapped, "SUMO-10").status, "warn");
+  assert.match(byId(viewsCapped, "SUMO-10").summary, /Pagination of the scheduled view list stopped before the last page, so only 1 were seen/);
+  assert.deepEqual(byId(viewsCapped, "SUMO-10").evidence.incomplete_inventories, ["scheduled view list"]);
+  assert.equal(byId(viewsCapped, "SUMO-10").evidence.scheduled_views_complete, false);
+  assert.equal(byId(viewsCapped, "SUMO-10").evidence.partitions_complete, true);
+
+  const partitionsCapped = await assessSumologicDataGovernance(readerFrom(data, { listPartitions: async () => partial(data.partitions) }), { now: NOW, approvedDestinationDomains: ["example.com"] });
+  assert.equal(byId(partitionsCapped, "SUMO-10").status, "warn");
+  assert.match(byId(partitionsCapped, "SUMO-10").summary, /Pagination of the partition list stopped before the last page, so only 2 were seen/);
+  assert.equal(byId(partitionsCapped, "SUMO-09").status, "pass", "SUMO-09 is an existence check and keeps pass");
+  assert.match(byId(partitionsCapped, "SUMO-09").summary, /Pagination stopped before the last page/);
+  assert.equal(byId(partitionsCapped, "SUMO-09").evidence.partitions_complete, false);
+
+  const allCapped = await assessSumologicDataGovernance(readerFrom(data, {
+    listPartitions: async () => partial(data.partitions),
+    listScheduledViews: async () => partial(data.scheduledViews),
+    listConnections: async () => partial(data.connections),
+  }), { now: NOW });
+  assert.equal(byId(allCapped, "SUMO-10").status, "warn");
+  assert.deepEqual(byId(allCapped, "SUMO-10").evidence.incomplete_inventories, ["connection list", "partition list", "scheduled view list"]);
+});
+
+const MULTI_INVENTORY_FINDINGS = [
+  { id: "SUMO-02", area: "identity", secondary: "listSamlIdentityProviders", names: /the SAML identity provider list could not be read/ },
+  { id: "SUMO-05", area: "identity", secondary: "listUsers", names: /user list was unreadable/ },
+  { id: "SUMO-06", area: "access", secondary: "listUsers", names: /user list was unreadable/ },
+  { id: "SUMO-07", area: "access", secondary: "getPolicy:accessKeysLifetime", names: /lifetime policy was unreadable/ },
+  { id: "SUMO-13", area: "access", secondary: "listServiceAllowlistAddresses", names: /CIDR list was unreadable/ },
+  { id: "SUMO-14", area: "access", secondary: "getPolicy:userConcurrentSessionsLimit", names: /the concurrent sessions limit policy could not be read/ },
+  { id: "SUMO-09", area: "governance", secondary: "listPartitions", names: /partition list was unreadable/ },
+  { id: "SUMO-09", area: "governance", secondary: "getPolicy:searchAudit", names: /the search audit policy could not be read/ },
+  { id: "SUMO-10", area: "governance", secondary: "listPartitions", names: /the partition list could not be read/, options: { approvedDestinationDomains: ["example.com"] } },
+  { id: "SUMO-10", area: "governance", secondary: "listScheduledViews", names: /the scheduled view list could not be read/, options: { approvedDestinationDomains: ["example.com"] } },
+  { id: "SUMO-11", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/ },
+  { id: "SUMO-11", area: "content", secondary: "getContentPermissions", names: /1 content permission lookup\(s\) failed/ },
+  { id: "SUMO-15", area: "content", secondary: "listMonitors", names: /the monitor list could not be read/, baseline: "manual" },
+  { id: "SUMO-15", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual" },
+  { id: "SUMO-18", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual" },
+  { id: "SUMO-19", area: "content", secondary: "listDashboards", names: /dashboard list was unreadable/ },
+  { id: "SUMO-20", area: "content", secondary: "listUsers", names: /the user list could not be read/, options: { approvedEmailDomains: ["example.com"] } },
+  { id: "SUMO-20", area: "content", secondary: "listConnections", names: /the connection list could not be read/, options: { approvedEmailDomains: ["example.com"] } },
+];
+
+async function assessArea(area, reader, options) {
+  switch (area) {
+    case "identity":
+      return assessSumologicIdentity(reader, { now: NOW, ...options });
+    case "access":
+      return assessSumologicAccessControl(reader, { now: NOW, ...options });
+    case "governance":
+      return assessSumologicDataGovernance(reader, { now: NOW, ...options });
+    default:
+      return assessSumologicContentSharing(reader, { now: NOW, ...options });
+  }
+}
+
+test("rule 1 corollary: every multi-inventory finding drops below pass and names the inventory when one secondary inventory returns 403", async () => {
+  const forbidden = () => failedCollection("Sumo Logic request failed (403 forbidden)", 403);
+  for (const scenario of MULTI_INVENTORY_FINDINGS) {
+    const data = healthyData();
+    data.monitors[0].notifications.push({ notification: { connectionType: "Webhook", connectionId: "c1" }, runForTriggerTypes: ["Critical"] });
+    data.connections = [{ id: "c1", name: "hook", type: "WebhookConnection", url: "https://hooks.example.com/x" }];
+    const label = `${scenario.id} with ${scenario.secondary} forbidden`;
+
+    const healthy = await assessArea(scenario.area, readerFrom(data), scenario.options);
+    assert.equal(byId(healthy, scenario.id).status, scenario.baseline ?? "pass", `${label}: baseline must be ${scenario.baseline ?? "pass"} so the demotion is meaningful`);
+
+    const [method, policyName] = scenario.secondary.split(":");
+    const override = policyName
+      ? { getPolicy: async (name) => (name === policyName ? forbidden() : collectionOf(data.policies[name] ?? {})) }
+      : { [method]: async () => forbidden() };
+    const result = await assessArea(scenario.area, readerFrom(data, override), scenario.options);
+    const item = byId(result, scenario.id);
+    assert.notEqual(item.status, "pass", `${label}: must not pass (got ${item.status}: ${item.summary})`);
+    assert.match(item.summary, scenario.names, `${label}: summary names the unreadable inventory`);
+    assert.match(item.summary, /403|unreadable|could not be read|failed/, `${label}: summary states the cause`);
+  }
+
+  // Spot checks on the verdict each fix settles on.
+  const data = healthyData();
+  data.monitors[0].notifications.push({ notification: { connectionType: "Webhook", connectionId: "c1" }, runForTriggerTypes: ["Critical"] });
+  data.connections = [{ id: "c1", name: "hook", type: "WebhookConnection", url: "https://hooks.example.com/x" }];
+  const noConnections = await assessSumologicContentSharing(readerFrom(data, { listConnections: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(noConnections, "SUMO-20").status, "manual", "webhook notifications cannot be validated without the connection list");
+  assert.deepEqual(byId(noConnections, "SUMO-20").evidence.unreadable_inventories, ["connection list"]);
+  const emailOnly = healthyData();
+  const noConnectionsEmailOnly = await assessSumologicContentSharing(readerFrom(emailOnly, { listConnections: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(noConnectionsEmailOnly, "SUMO-20").status, "warn", "email-only routing can still be judged, so the missing connection list caps at warn");
+  const noViews = await assessSumologicDataGovernance(readerFrom(healthyData(), { listScheduledViews: async () => forbidden() }), { now: NOW, approvedDestinationDomains: ["example.com"] });
+  assert.equal(byId(noViews, "SUMO-10").status, "manual");
+  assert.equal(byId(noViews, "SUMO-10").evidence.scheduled_views_readable, false);
+  const noSearchAudit = await assessSumologicDataGovernance(readerFrom(healthyData(), { getPolicy: async (name) => (name === "searchAudit" ? forbidden() : collectionOf(healthyData().policies[name] ?? {})) }), { now: NOW });
+  assert.equal(byId(noSearchAudit, "SUMO-09").status, "warn");
+  assert.doesNotMatch(byId(noSearchAudit, "SUMO-09").summary, /search audit policies are enabled/);
+  const noIdps = await assessSumologicIdentity(readerFrom(healthyData(), { listSamlIdentityProviders: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(noIdps, "SUMO-02").status, "warn");
+  const noConcurrent = await assessSumologicAccessControl(readerFrom(healthyData(), { getPolicy: async (name) => (name === "userConcurrentSessionsLimit" ? forbidden() : collectionOf(healthyData().policies[name] ?? {})) }), { now: NOW });
+  assert.equal(byId(noConcurrent, "SUMO-14").status, "warn");
+  assert.doesNotMatch(byId(noConcurrent, "SUMO-14").summary, /policy is not enabled/);
+  assert.equal(byId(noConcurrent, "SUMO-14").evidence.concurrent_sessions_limit_enabled, null);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

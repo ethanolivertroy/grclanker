@@ -678,9 +678,15 @@ export class SumologicApiClient implements SumologicReader {
     let token: string | undefined;
     for (let page = 0; page < this.maxPages; page += 1) {
       const payload = asObject(await this.get(path, { ...query, limit: pageSize, token })) ?? {};
-      items.push(...asRecords(payload[collectionKey]));
-      token = asString(payload.next);
-      if (!token) return { data: items, complete: true };
+      const pageItems = asRecords(payload[collectionKey]);
+      items.push(...pageItems);
+      const nextToken = asString(payload.next);
+      if (!nextToken) return { data: items, complete: true };
+      // A repeated cursor or an empty page that still advertises a next page
+      // means the server is not advancing; stop and report the inventory as
+      // incomplete instead of spending the page budget on identical requests.
+      if (nextToken === token || pageItems.length === 0) return { data: items, complete: false };
+      token = nextToken;
     }
     return { data: items, complete: false };
   }
@@ -836,13 +842,16 @@ function finding(
   return { id: definition.id, title: definition.title, severity, status, summary, evidence, mappings: mappingsFor(definition) };
 }
 
-function unreadableSummary(what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): string {
-  const cause = collection.httpStatus === 401
+function unreadableCause(collection: SumologicCollection<unknown>): string {
+  return collection.httpStatus === 401
     ? "credentials were rejected (401)"
     : collection.httpStatus === 403
       ? "the access key lacks the role capability (403)"
       : `the endpoint returned an error (${collection.error ?? "unknown error"})`;
-  return `Unknown: ${what} could not be read because ${cause}. Collect manually: ${evidenceToCollect}`;
+}
+
+function unreadableSummary(what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): string {
+  return `Unknown: ${what} could not be read because ${unreadableCause(collection)}. Collect manually: ${evidenceToCollect}`;
 }
 
 function unreadable(number: number, severity: SumologicFinding["severity"], what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): SumologicFinding {
@@ -859,6 +868,51 @@ function partialNote(collection: SumologicCollection<unknown[]>): string {
 function withPartialDowngrade(item: SumologicFinding, collection: SumologicCollection<unknown[]>): SumologicFinding {
   if (collection.complete || item.status !== "pass") return item;
   return { ...item, status: "warn", summary: `${item.summary}${partialNote(collection)}` };
+}
+
+/**
+ * Rule 10 for findings that read several paginated inventories: every
+ * inventory whose pagination stopped early is named in the summary, and a
+ * pass becomes warn because the population it was judged on is incomplete.
+ */
+function withPartialDowngrades(item: SumologicFinding, inventories: Array<[string, SumologicCollection<unknown[]>]>): SumologicFinding {
+  const incomplete = inventories.filter(([, collection]) => collection.ok && !collection.complete);
+  if (incomplete.length === 0) return item;
+  const notes = incomplete
+    .map(([label, collection]) => ` Pagination of the ${label} stopped before the last page, so only ${collection.data?.length ?? 0} were seen and that population is incomplete.`)
+    .join("");
+  return {
+    ...item,
+    status: item.status === "pass" ? "warn" : item.status,
+    summary: `${item.summary}${notes}`,
+    evidence: { ...item.evidence, incomplete_inventories: incomplete.map(([label]) => label) },
+  };
+}
+
+/**
+ * Rule 1 corollary: a finding that reads several inventories never passes when
+ * one of them was unreadable, even if the primary inventory supports pass. The
+ * summary names the unreadable inventory and the evidence a human must collect;
+ * `status` is the verdict a pass drops to (manual when the inventory is
+ * essential to the control, warn when the control can still be judged from
+ * the readable inventories). Existing warn/fail/manual verdicts keep their
+ * status and only gain the note.
+ */
+function withUnreadableDowngrade(
+  item: SumologicFinding,
+  label: string,
+  collection: SumologicCollection<unknown>,
+  evidenceToCollect: string,
+  status: "warn" | "manual" = "warn",
+): SumologicFinding {
+  if (collection.ok) return item;
+  const previous = asArray(item.evidence?.unreadable_inventories).map((entry) => String(entry));
+  return {
+    ...item,
+    status: item.status === "pass" ? status : item.status,
+    summary: `${item.summary} Not checked: the ${label} could not be read because ${unreadableCause(collection)}; collect manually: ${evidenceToCollect}`,
+    evidence: { ...item.evidence, unreadable_inventories: [...previous, label] },
+  };
 }
 
 function names(items: JsonRecord[], key = "name", limit = 25): string[] {
@@ -913,6 +967,107 @@ function collectErrors(collections: Array<[string, SumologicCollection<unknown>]
   return collections.filter(([, item]) => !item.ok).map(([name, item]) => `${name}: ${item.error ?? "unknown error"}`);
 }
 
+const REDACTED = "[REDACTED]";
+
+function pick(record: JsonRecord, keys: readonly string[]): JsonRecord {
+  return Object.fromEntries(keys.filter((key) => record[key] !== undefined).map((key) => [key, record[key]]));
+}
+
+function redactionMarker(value: unknown): string | undefined {
+  return value === undefined || value === null ? undefined : REDACTED;
+}
+
+function redactedHeaderPairs(value: unknown): JsonRecord[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  return asRecords(value).map((pair) => ({ name: asString(pair.name) ?? null, value: REDACTED }));
+}
+
+function withoutUndefined(record: JsonRecord): JsonRecord {
+  return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+
+type SnapshotProjector = (record: JsonRecord) => JsonRecord;
+
+/**
+ * Rule 9 allowlist projections applied to every raw snapshot before it is
+ * written to core_data or echoed in a tool payload. Each projector keeps the
+ * fields the verdicts read plus identifying metadata, and replaces every
+ * credential-bearing or free-text field with a marker so the evidence stays
+ * legible without carrying the value.
+ */
+const SNAPSHOT_PROJECTIONS: Readonly<Record<string, SnapshotProjector>> = {
+  connections: (connection) => withoutUndefined({
+    ...pick(connection, ["id", "name", "type", "webhookType", "connectionSubtype", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+    url_host: hostOf(asString(connection.url)) ?? null,
+    url: redactionMarker(connection.url),
+    username: redactionMarker(connection.username),
+    headers: redactedHeaderPairs(connection.headers),
+    customHeaders: redactedHeaderPairs(connection.customHeaders),
+    defaultPayload: redactionMarker(connection.defaultPayload),
+    resolutionPayload: redactionMarker(connection.resolutionPayload),
+  }),
+  monitors: (monitor) => withoutUndefined({
+    ...pick(monitor, ["id", "name", "path", "type", "monitorType", "contentType", "isDisabled", "isSystem", "isMutable", "status", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+    runAs: monitor.runAs === undefined ? undefined : { runAsId: asString(asObject(monitor.runAs)?.runAsId) ?? null },
+    notifications: monitor.notifications === undefined ? undefined : asRecords(monitor.notifications).map((entry) => {
+      const notification = asObject(entry.notification) ?? {};
+      return withoutUndefined({
+        runForTriggerTypes: entry.runForTriggerTypes,
+        notification: withoutUndefined({
+          ...pick(notification, ["connectionType", "connectionId", "recipients"]),
+          subject: redactionMarker(notification.subject),
+          messageBody: redactionMarker(notification.messageBody),
+          payloadOverride: redactionMarker(notification.payloadOverride),
+          resolutionPayloadOverride: redactionMarker(notification.resolutionPayloadOverride),
+        }),
+      });
+    }),
+  }),
+  access_keys: (key) => ({
+    ...pick(key, ["label", "disabled", "createdAt", "createdBy", "modifiedAt", "lastUsed", "scopes"]),
+    id_prefix: asString(key.id)?.slice(0, 4) ?? null,
+    cors_header_count: asArray(key.corsHeaders).length,
+  }),
+  saml_identity_providers: (idp) => withoutUndefined({
+    ...pick(idp, [
+      "id", "configurationName", "issuer", "authnRequestUrl", "spInitiatedLoginEnabled", "spInitiatedLoginPath", "signAuthnRequest",
+      "disableRequestedAuthnContext", "debugMode", "isRedirectBinding", "rolesAttribute", "emailAttribute", "logoutEnabled", "logoutUrl",
+      "onDemandProvisioningEnabled", "createdBy", "createdAt", "modifiedBy", "modifiedAt",
+    ]),
+    x509cert1: redactionMarker(idp.x509cert1),
+    x509cert2: redactionMarker(idp.x509cert2),
+    x509cert3: redactionMarker(idp.x509cert3),
+    certificate: redactionMarker(idp.certificate),
+  }),
+  password_policy: (policy) => pick(policy, [
+    "minLength", "maxLength", "mustContainLowercase", "mustContainUppercase", "mustContainDigits", "mustContainSpecialChars",
+    "maxPasswordAgeInDays", "minUniquePasswords", "accountLockoutThreshold", "failedLoginResetDurationInMins", "accountLockoutDurationInMins",
+    "requireMfa", "rememberMfa", "disallowWeakPasswords",
+  ]),
+  users: (user) => pick(user, ["id", "email", "firstName", "lastName", "isActive", "isLocked", "isMfaEnabled", "lastLoginTimestamp", "createdAt", "createdBy", "modifiedAt", "roleIds"]),
+  collectors: (collector) => pick(collector, [
+    "id", "name", "collectorType", "alive", "ephemeral", "collectorVersion", "lastSeenAlive", "hostName", "osName", "osVersion", "category", "timeZone", "sourceSyncMode",
+  ]),
+  dashboards: (dashboard) => pick(dashboard, ["id", "title", "folderId", "contentId", "isPublic", "domain", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+  personal_folder: (folder) => withoutUndefined({
+    ...pick(folder, ["id", "name", "itemType", "parentId", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+    children: folder.children === undefined ? undefined : asRecords(folder.children).map((child) => pick(child, ["id", "name", "itemType", "parentId", "isScheduled", "permissions", "createdBy", "createdAt", "modifiedBy", "modifiedAt"])),
+  }),
+};
+
+function projectSnapshotData(name: string, data: unknown): unknown {
+  const projector = SNAPSHOT_PROJECTIONS[name];
+  if (!projector || data === undefined || data === null) return data ?? null;
+  if (Array.isArray(data)) return asRecords(data).map(projector);
+  const record = asObject(data);
+  return record ? projector(record) : data;
+}
+
+/**
+ * The single serializer for every raw snapshot: core_data/<area>.json and the
+ * rawData echoed by the assess tools both come from here, so the rule 9
+ * projection above is applied exactly once and on every path.
+ */
 function rawSnapshot(collections: Array<[string, SumologicCollection<unknown>]>): Record<string, unknown> {
   return Object.fromEntries(collections.map(([name, item]) => [name, {
     ok: item.ok,
@@ -921,7 +1076,7 @@ function rawSnapshot(collections: Array<[string, SumologicCollection<unknown>]>)
     count: item.count ?? null,
     error: item.error ?? null,
     http_status: item.httpStatus ?? null,
-    data: item.data ?? null,
+    data: projectSnapshotData(name, item.data),
   }]));
 }
 
@@ -1068,14 +1223,16 @@ export async function assessSumologicIdentity(
     findings.push(finding(2, "high", "manual", "Not applicable: no SAML identity provider is configured, so the SAML bypass allowlist has no effect. Re-run after SSO is configured.", { allowlisted_users: allowlistedUsers.length }));
   } else {
     const inactive = allowlistedUsers.filter((user) => user.isActive === false);
-    const evidence = { allowlisted_users: names(allowlistedUsers, "email"), inactive_allowlisted_users: names(inactive, "email"), threshold: maxAllowlisted };
+    const evidence = { allowlisted_users: names(allowlistedUsers, "email"), inactive_allowlisted_users: names(inactive, "email"), threshold: maxAllowlisted, identity_providers_readable: identityProviders.ok };
+    let allowlistFinding: SumologicFinding;
     if (allowlistedUsers.length > maxAllowlisted) {
-      findings.push(finding(2, "high", "fail", `${allowlistedUsers.length} users bypass SAML (threshold ${maxAllowlisted}); reduce the allowlist to break-glass accounts only.`, evidence));
+      allowlistFinding = finding(2, "high", "fail", `${allowlistedUsers.length} users bypass SAML (threshold ${maxAllowlisted}); reduce the allowlist to break-glass accounts only.`, evidence);
     } else if (inactive.length > 0) {
-      findings.push(finding(2, "high", "warn", `${allowlistedUsers.length} allowlisted users are within the threshold of ${maxAllowlisted}, but ${inactive.length} are inactive accounts that should be removed.`, evidence));
+      allowlistFinding = finding(2, "high", "warn", `${allowlistedUsers.length} allowlisted users are within the threshold of ${maxAllowlisted}, but ${inactive.length} are inactive accounts that should be removed.`, evidence);
     } else {
-      findings.push(finding(2, "high", "pass", `${allowlistedUsers.length} SAML allowlisted user(s) (endpoint readable, threshold ${maxAllowlisted}); emptiness here is compliant because the control asks for a minimized allowlist.`, evidence));
+      allowlistFinding = finding(2, "high", "pass", `${allowlistedUsers.length} SAML allowlisted user(s) (endpoint readable, threshold ${maxAllowlisted}); emptiness here is compliant because the control asks for a minimized allowlist.`, evidence);
     }
+    findings.push(withUnreadableDowngrade(allowlistFinding, "SAML identity provider list", identityProviders, "export Administration > Security > SAML to confirm SAML is configured so that this allowlist is actually in effect."));
   }
 
   const policy = passwordPolicy.data ?? {};
@@ -1344,14 +1501,17 @@ export async function assessSumologicAccessControl(
     const rawTimeout = sessionTimeout.data?.maxUserSessionTimeout;
     const minutes = parseSessionTimeoutMinutes(rawTimeout);
     const concurrent = concurrentSessions.ok ? concurrentSessions.data ?? {} : {};
-    const evidence = { max_user_session_timeout: asString(rawTimeout) ?? null, minutes: minutes ?? null, threshold_minutes: maxSessionMinutes, concurrent_sessions_limit_enabled: concurrent.enabled === true, max_concurrent_sessions: asNumber(concurrent.maxConcurrentSessions) ?? null };
+    const evidence = { max_user_session_timeout: asString(rawTimeout) ?? null, minutes: minutes ?? null, threshold_minutes: maxSessionMinutes, concurrent_sessions_policy_readable: concurrentSessions.ok, concurrent_sessions_limit_enabled: concurrentSessions.ok ? concurrent.enabled === true : null, max_concurrent_sessions: asNumber(concurrent.maxConcurrentSessions) ?? null };
+    let sessionFinding: SumologicFinding;
     if (minutes === undefined) {
-      findings.push(finding(14, "medium", "manual", "The maxUserSessionTimeout policy did not return a parsable value, so session timeout is unknown; confirm it in Administration > Security > Policies.", evidence));
+      sessionFinding = finding(14, "medium", "manual", "The maxUserSessionTimeout policy did not return a parsable value, so session timeout is unknown; confirm it in Administration > Security > Policies.", evidence);
     } else if (minutes > maxSessionMinutes) {
-      findings.push(finding(14, "medium", "fail", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes), above the ${maxSessionMinutes}-minute threshold.`, evidence));
+      sessionFinding = finding(14, "medium", "fail", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes), above the ${maxSessionMinutes}-minute threshold.`, evidence);
     } else {
-      findings.push(finding(14, "medium", concurrent.enabled === true ? "pass" : "warn", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes, threshold ${maxSessionMinutes})${concurrent.enabled === true ? " and concurrent session limits are enabled" : ", but the concurrent sessions limit policy is not enabled"}.`, evidence));
+      const concurrentText = !concurrentSessions.ok ? "" : concurrent.enabled === true ? " and concurrent session limits are enabled" : ", but the concurrent sessions limit policy is not enabled";
+      sessionFinding = finding(14, "medium", concurrent.enabled === true ? "pass" : "warn", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes, threshold ${maxSessionMinutes})${concurrentText}.`, evidence);
     }
+    findings.push(withUnreadableDowngrade(sessionFinding, "concurrent sessions limit policy", concurrentSessions, "screenshot Administration > Security > Policies > User Concurrent Sessions Limit."));
   }
 
   return {
@@ -1411,36 +1571,76 @@ export async function assessSumologicDataGovernance(
   } else if (auditPolicy.data?.enabled !== true) {
     findings.push(finding(9, "high", "fail", `The audit policy is not enabled (enabled=${String(auditPolicy.data?.enabled ?? "absent")}), so account events are not written to the audit index.`, { audit_policy_enabled: auditPolicy.data?.enabled ?? null, plan_type: planType ?? null }));
   } else {
-    const evidence = { audit_policy_enabled: true, search_audit_enabled: searchAuditPolicy.ok ? searchAuditPolicy.data?.enabled === true : null, audit_index_partitions: names(auditIndexes), active_audit_index_partitions: activeAuditIndexes.length, plan_type: planType ?? null };
+    const evidence = {
+      audit_policy_enabled: true,
+      search_audit_policy_readable: searchAuditPolicy.ok,
+      search_audit_enabled: searchAuditPolicy.ok ? searchAuditPolicy.data?.enabled === true : null,
+      audit_index_partitions: names(auditIndexes),
+      active_audit_index_partitions: activeAuditIndexes.length,
+      partitions_seen: partitionList.length,
+      partitions_complete: partitions.complete,
+      plan_type: planType ?? null,
+    };
     if (!partitions.ok) {
       findings.push(finding(9, "high", "manual", `The audit policy is enabled but the partition list was unreadable (${partitions.error ?? "unknown error"}), so the audit index state is unverified; run \`_index=sumologic_audit_events\` for the last 24 hours to prove events flow.`, evidence));
     } else if (activeAuditIndexes.length === 0) {
-      findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was visible${planType ? ` (plan ${planType})` : ""}; the audit index may be unavailable on this plan. Run \`_index=sumologic_audit_events\` to confirm events are received.`, evidence));
+      findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was visible${planType ? ` (plan ${planType})` : ""}; the audit index may be unavailable on this plan. Run \`_index=sumologic_audit_events\` to confirm events are received.${partialNote(partitions)}`, evidence));
     } else if (searchAuditPolicy.ok && searchAuditPolicy.data?.enabled !== true) {
-      findings.push(finding(9, "high", "warn", `The audit policy is enabled and ${activeAuditIndexes.length} active audit index partition(s) exist, but the search audit policy is disabled, so query activity is not logged. Event flow still requires a manual search of _index=sumologic_audit_events.`, evidence));
+      findings.push(finding(9, "high", "warn", `The audit policy is enabled and ${activeAuditIndexes.length} active audit index partition(s) exist, but the search audit policy is disabled, so query activity is not logged. Event flow still requires a manual search of _index=sumologic_audit_events.${partialNote(partitions)}`, evidence));
     } else {
-      findings.push(finding(9, "high", "pass", `Audit and search audit policies are enabled and ${activeAuditIndexes.length} active audit index partition(s) exist (${names(activeAuditIndexes).join(", ")}). Confirm event flow with a search of _index=sumologic_audit_events.`, evidence));
+      // An existence check: a truncated partition list cannot hide the active
+      // audit index that was seen, so the partial note is legibility only.
+      const policyText = searchAuditPolicy.ok ? "Audit and search audit policies are enabled" : "The audit policy is enabled";
+      findings.push(withUnreadableDowngrade(
+        finding(9, "high", "pass", `${policyText} and ${activeAuditIndexes.length} active audit index partition(s) exist (${names(activeAuditIndexes).join(", ")}). Confirm event flow with a search of _index=sumologic_audit_events.${partialNote(partitions)}`, evidence),
+        "search audit policy",
+        searchAuditPolicy,
+        "screenshot Administration > Security > Policies > Search Audit to confirm query activity is logged.",
+      ));
     }
   }
 
   const connectionList = connections.data ?? [];
+  const scheduledViewList = scheduledViews.data ?? [];
   const forwardingPartitions = partitionList.filter((partition) => asString(partition.dataForwardingId));
-  const forwardingViews = (scheduledViews.data ?? []).filter((view) => asString(view.dataForwardingId));
+  const forwardingViews = scheduledViewList.filter((view) => asString(view.dataForwardingId));
   if (!connections.ok) {
     findings.push(unreadable(10, "medium", "the connection list", connections, "export Manage Data > Monitoring > Connections and Manage Data > Logs > Data Forwarding destinations with owner approvals."));
   } else {
     const destinations = connectionList.map((connection) => ({ name: asString(connection.name) ?? asString(connection.id) ?? "connection", type: asString(connection.type) ?? "unknown", host: hostOf(asString(connection.url)) ?? null }));
     const unapproved = approvedDestinations.length > 0 ? destinations.filter((item) => !item.host || !domainMatches(item.host, approvedDestinations)) : [];
-    const evidence = { connections_seen: connectionList.length, connections_complete: connections.complete, destinations, partitions_forwarding: names(forwardingPartitions), scheduled_views_forwarding: names(forwardingViews, "indexName"), approved_destination_domains: approvedDestinations, unapproved_destinations: unapproved.map((item) => item.name) };
-    if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok && partitionList.length > 0) {
-      findings.push(withPartialDowngrade(finding(10, "medium", "pass", "Zero outbound connections and zero data forwarding destinations are configured (endpoints readable), so no external destination review is pending; emptiness is compliant for this control.", evidence), connections));
+    const evidence = {
+      connections_seen: connectionList.length,
+      connections_complete: connections.complete,
+      partitions_readable: partitions.ok,
+      partitions_seen: partitionList.length,
+      partitions_complete: partitions.complete,
+      scheduled_views_readable: scheduledViews.ok,
+      scheduled_views_seen: scheduledViewList.length,
+      scheduled_views_complete: scheduledViews.complete,
+      destinations,
+      partitions_forwarding: names(forwardingPartitions),
+      scheduled_views_forwarding: names(forwardingViews, "indexName"),
+      approved_destination_domains: approvedDestinations,
+      unapproved_destinations: unapproved.map((item) => item.name),
+    };
+    let forwardingFinding: SumologicFinding;
+    if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok && scheduledViews.ok && partitionList.length > 0) {
+      forwardingFinding = finding(10, "medium", "pass", "Zero outbound connections and zero data forwarding destinations are configured (endpoints readable), so no external destination review is pending; emptiness is compliant for this control.", evidence);
     } else if (approvedDestinations.length > 0 && unapproved.length > 0) {
-      findings.push(finding(10, "medium", "fail", `${unapproved.length}/${connectionList.length} connections point outside the approved destination domains (${unapproved.map((item) => item.name).join(", ")}).${partialNote(connections)}`, evidence));
+      forwardingFinding = finding(10, "medium", "fail", `${unapproved.length}/${connectionList.length} connections point outside the approved destination domains (${unapproved.map((item) => item.name).join(", ")}).`, evidence);
     } else if (approvedDestinations.length > 0) {
-      findings.push(withPartialDowngrade(finding(10, "medium", "pass", `All ${connectionList.length} connections resolve to approved destination domains; ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) still require owner review.`, evidence), connections));
+      forwardingFinding = finding(10, "medium", "pass", `All ${connectionList.length} connections resolve to approved destination domains; ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) still require owner review.`, evidence);
     } else {
-      findings.push(finding(10, "medium", "manual", `${connectionList.length} outbound connection(s) and ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) exist; no approved destination list was supplied, so a human must confirm each destination is approved (pass approved_destination_domains to automate).${partialNote(connections)}`, evidence));
+      forwardingFinding = finding(10, "medium", "manual", `${connectionList.length} outbound connection(s) and ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) exist; no approved destination list was supplied, so a human must confirm each destination is approved (pass approved_destination_domains to automate).`, evidence);
     }
+    // The data forwarding destinations live on partitions and scheduled views,
+    // so those inventories are essential: unreadable drops a pass to manual and
+    // a capped page drops it to warn, naming the inventory either way.
+    forwardingFinding = withPartialDowngrades(forwardingFinding, [["connection list", connections], ["partition list", partitions], ["scheduled view list", scheduledViews]]);
+    forwardingFinding = withUnreadableDowngrade(forwardingFinding, "partition list", partitions, "export Manage Data > Logs > Partitions with each data forwarding destination.", "manual");
+    forwardingFinding = withUnreadableDowngrade(forwardingFinding, "scheduled view list", scheduledViews, "export Manage Data > Logs > Scheduled Views with each data forwarding destination.", "manual");
+    findings.push(forwardingFinding);
   }
 
   const collectorList = collectors.data ?? [];
@@ -1568,38 +1768,47 @@ export async function assessSumologicContentSharing(
     org_shared_items: names(orgShared.map((entry) => entry.item)),
     permission_lookups_failed: unreadablePermissions.length,
   };
+  const personalFolderEvidence = "export the key owner's personal folder listing and /v2/content/{id}/permissions for each item to review org-wide shares.";
+  const permissionLookupNote = unreadablePermissions.length > 0 ? ` ${unreadablePermissions.length} content permission lookup(s) failed (${unreadablePermissions.slice(0, 5).map((entry) => `${asString(entry.item.name) ?? asString(entry.item.id) ?? "item"}: ${entry.permissions.error ?? "unknown error"}`).join("; ")}), so those items were not checked.` : "";
+  let sharingFinding: SumologicFinding;
   if (!dataAccessPolicy.ok) {
-    findings.push(unreadable(11, "medium", "the data access level policy", dataAccessPolicy, "screenshot Administration > Security > Policies > Data Access Level and review Library sharing for org-wide shares."));
+    sharingFinding = unreadable(11, "medium", "the data access level policy", dataAccessPolicy, "screenshot Administration > Security > Policies > Data Access Level and review Library sharing for org-wide shares.");
   } else if (dataAccessPolicy.data?.enabled !== true) {
-    findings.push(finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${orgShared.length} sampled item(s) are shared org-wide.${sampleNote}`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${orgShared.length} sampled item(s) are shared org-wide.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (orgShared.length > 0) {
-    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.${sampleNote}`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (!personalFolder.ok || permissionResults.length === 0 || unreadablePermissions.length > 0) {
-    findings.push(finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.${sampleNote}`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (unsampledChildren > 0) {
-    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide, but the population is incomplete.${sampleNote} Raise content_sample or review the remaining items in the Library before treating this control as satisfied.`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "warn", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide, but the population is incomplete.${sampleNote} Raise content_sample or review the remaining items in the Library before treating this control as satisfied.`, sharingEvidence);
   } else {
-    findings.push(finding(11, "medium", "pass", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide (all ${allChildren.length} items in the folder were evaluated); the sample covers the key owner's folder only, so Admin Recommended and Global folders still merit periodic review.`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "pass", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide (all ${allChildren.length} items in the folder were evaluated); the sample covers the key owner's folder only, so Admin Recommended and Global folders still merit periodic review.`, sharingEvidence);
   }
+  findings.push(withUnreadableDowngrade(sharingFinding, "personal folder", personalFolder, personalFolderEvidence, "manual"));
 
   const monitorList = monitors.data ?? [];
   const monitorsWithRunAs = monitorList.filter((monitor) => asString(asObject(monitor.runAs)?.runAsId));
   const scheduledContent = children.filter((item) => item.isScheduled === true);
-  const scheduleEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, monitors_with_run_as: monitorsWithRunAs.length, scheduled_searches_in_sampled_folder: names(scheduledContent), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, monitors_readable: monitors.ok };
+  const scheduleEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, monitors_with_run_as: monitorsWithRunAs.length, scheduled_searches_in_sampled_folder: names(scheduledContent), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, monitors_readable: monitors.ok, personal_folder_readable: personalFolder.ok };
   if (!monitors.ok && !personalFolder.ok) {
     findings.push(unreadable(15, "medium", "the monitor and content inventories", monitors, "list scheduled searches and monitors with their owners and runAs identities, and confirm none run under shared administrator accounts."));
   } else {
-    findings.push(finding(15, "medium", "manual", `Scheduled search role bindings are not exposed by the API: ${monitorList.length} monitor(s) seen (${monitorsWithRunAs.length} with an explicit runAs identity) and ${scheduledContent.length} scheduled search(es) in the sampled folder. A human must confirm each scheduled search and monitor runs under a scoped user, not a shared admin credential.${partialNote(monitors)}`, scheduleEvidence));
+    let scheduleFinding = finding(15, "medium", "manual", `Scheduled search role bindings are not exposed by the API: ${monitorList.length} monitor(s) seen (${monitorsWithRunAs.length} with an explicit runAs identity) and ${scheduledContent.length} scheduled search(es) in the sampled folder. A human must confirm each scheduled search and monitor runs under a scoped user, not a shared admin credential.${monitors.ok ? partialNote(monitors) : ""}`, scheduleEvidence);
+    scheduleFinding = withUnreadableDowngrade(scheduleFinding, "monitor list", monitors, "export Alerts > Monitors with each monitor's runAs identity.", "manual");
+    scheduleFinding = withUnreadableDowngrade(scheduleFinding, "personal folder", personalFolder, "list the scheduled searches in the key owner's folder with their owners.", "manual");
+    findings.push(scheduleFinding);
   }
 
   const lookupItems = children.filter((item) => /lookup/i.test(asString(item.itemType) ?? ""));
   const lookupOrgShared = orgShared.filter((entry) => /lookup/i.test(asString(entry.item.itemType) ?? ""));
-  const lookupEvidence = { lookup_tables_in_sampled_folder: names(lookupItems), lookup_tables_shared_org_wide: names(lookupOrgShared.map((entry) => entry.item)), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length };
+  const lookupEvidence = { lookup_tables_in_sampled_folder: names(lookupItems), lookup_tables_shared_org_wide: names(lookupOrgShared.map((entry) => entry.item)), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, personal_folder_readable: personalFolder.ok, permission_lookups_failed: unreadablePermissions.length };
+  let lookupFinding: SumologicFinding;
   if (lookupOrgShared.length > 0) {
-    findings.push(finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.`, lookupEvidence));
+    lookupFinding = finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.${permissionLookupNote}`, lookupEvidence);
   } else {
-    findings.push(finding(18, "medium", "manual", `The API has no lookup table listing endpoint (only /v1/lookupTables/{id}); ${lookupItems.length} lookup table(s) were seen in the sampled folder. A human must inventory lookup tables in the Library, identify those with sensitive data, and export /v2/content/{id}/permissions for each.`, lookupEvidence));
+    lookupFinding = finding(18, "medium", "manual", `The API has no lookup table listing endpoint (only /v1/lookupTables/{id}); ${lookupItems.length} lookup table(s) were seen in the sampled folder. A human must inventory lookup tables in the Library, identify those with sensitive data, and export /v2/content/{id}/permissions for each.${permissionLookupNote}`, lookupEvidence);
   }
+  findings.push(withUnreadableDowngrade(lookupFinding, "personal folder", personalFolder, personalFolderEvidence, "manual"));
 
   const dashboardList = dashboards.data ?? [];
   const publicDashboards = dashboardList.filter((dashboard) => dashboard.isPublic === true);
@@ -1625,6 +1834,7 @@ export async function assessSumologicContentSharing(
   const externalRecipients: string[] = [];
   const unknownConnections: string[] = [];
   let notificationCount = 0;
+  let connectionNotificationCount = 0;
   for (const monitor of monitorList) {
     for (const entry of asRecords(monitor.notifications)) {
       const notification = asObject(entry.notification) ?? {};
@@ -1635,25 +1845,52 @@ export async function assessSumologicContentSharing(
           if (domain && orgDomains.size > 0 && !domainMatches(domain, [...orgDomains])) externalRecipients.push(asString(recipient) as string);
         }
       } else {
+        connectionNotificationCount += 1;
         const connectionId = asString(notification.connectionId);
         if (connectionId && connections.ok && !connectionIds.has(connectionId)) unknownConnections.push(`${asString(monitor.name) ?? monitor.id}:${connectionId}`);
       }
     }
   }
   const disabledMonitors = monitorList.filter((monitor) => monitor.isDisabled === true);
-  const routingEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, notifications_seen: notificationCount, org_email_domains: [...orgDomains].slice(0, 25), external_email_recipients: externalRecipients.slice(0, 25), notifications_to_unknown_connections: unknownConnections.slice(0, 25), disabled_monitors: names(disabledMonitors) };
+  const routingEvidence = {
+    monitors_seen: monitorList.length,
+    monitors_complete: monitors.complete,
+    notifications_seen: notificationCount,
+    connection_notifications_seen: connectionNotificationCount,
+    users_readable: users.ok,
+    connections_readable: connections.ok,
+    org_email_domains: [...orgDomains].slice(0, 25),
+    external_email_recipients: externalRecipients.slice(0, 25),
+    notifications_to_unknown_connections: unknownConnections.slice(0, 25),
+    disabled_monitors: names(disabledMonitors),
+  };
   if (!monitors.ok) {
     findings.push(unreadable(20, "medium", "the monitor list", monitors, "export Alerts > Monitors with notification destinations and confirm each routes to an approved channel."));
-  } else if (monitorList.length === 0) {
-    findings.push(finding(20, "medium", "manual", "Zero monitors were returned (endpoint readable), so no alert routing exists to evaluate; confirm whether security alerting is implemented elsewhere.", routingEvidence));
-  } else if (externalRecipients.length > 0 || unknownConnections.length > 0) {
-    findings.push(finding(20, "medium", "fail", `${externalRecipients.length} email recipient(s) fall outside the org domains and ${unknownConnections.length} notification(s) reference connections not in the connection inventory.${partialNote(monitors)}`, routingEvidence));
-  } else if (orgDomains.size === 0) {
-    findings.push(finding(20, "medium", "manual", `${notificationCount} notification(s) across ${monitorList.length} monitors were seen, but no org email domains could be derived (user list unreadable and no approved_email_domains supplied), so recipient review is manual.`, routingEvidence));
-  } else if (disabledMonitors.length > 0 || notificationCount === 0) {
-    findings.push(finding(20, "medium", "warn", `Alert routing stays within org domains and known connections, but ${disabledMonitors.length} monitor(s) are disabled and ${notificationCount} notification(s) exist; confirm security monitors are active.${partialNote(monitors)}`, routingEvidence));
   } else {
-    findings.push(withPartialDowngrade(finding(20, "medium", "pass", `${notificationCount} notification(s) across ${monitorList.length} monitors route to org email domains or known connections, and no monitors are disabled.`, routingEvidence), monitors));
+    let routingFinding: SumologicFinding;
+    if (monitorList.length === 0) {
+      routingFinding = finding(20, "medium", "manual", "Zero monitors were returned (endpoint readable), so no alert routing exists to evaluate; confirm whether security alerting is implemented elsewhere.", routingEvidence);
+    } else if (externalRecipients.length > 0 || unknownConnections.length > 0) {
+      routingFinding = finding(20, "medium", "fail", `${externalRecipients.length} email recipient(s) fall outside the org domains and ${unknownConnections.length} notification(s) reference connections not in the connection inventory.${partialNote(monitors)}`, routingEvidence);
+    } else if (orgDomains.size === 0) {
+      routingFinding = finding(20, "medium", "manual", `${notificationCount} notification(s) across ${monitorList.length} monitors were seen, but no org email domains could be derived (${users.ok ? "no user emails were returned" : "user list unreadable"} and no approved_email_domains supplied), so recipient review is manual.`, routingEvidence);
+    } else if (disabledMonitors.length > 0 || notificationCount === 0) {
+      routingFinding = finding(20, "medium", "warn", `Alert routing stays within org domains and known connections, but ${disabledMonitors.length} monitor(s) are disabled and ${notificationCount} notification(s) exist; confirm security monitors are active.${partialNote(monitors)}`, routingEvidence);
+    } else {
+      routingFinding = withPartialDowngrade(finding(20, "medium", "pass", `${notificationCount} notification(s) across ${monitorList.length} monitors route to org email domains or known connections, and no monitors are disabled.`, routingEvidence), monitors);
+    }
+    // The user list supplies the org email domains and the connection list
+    // validates webhook targets; either being unreadable means part of the
+    // routing was judged blind, so a pass cannot stand.
+    routingFinding = withUnreadableDowngrade(routingFinding, "user list", users, "export Administration > Users and Roles > Users to confirm the org email domains that recipients were judged against.");
+    routingFinding = withUnreadableDowngrade(
+      routingFinding,
+      "connection list",
+      connections,
+      "export Manage Data > Monitoring > Connections and confirm every webhook notification targets an approved connection.",
+      connectionNotificationCount > 0 ? "manual" : "warn",
+    );
+    findings.push(routingFinding);
   }
 
   return {
