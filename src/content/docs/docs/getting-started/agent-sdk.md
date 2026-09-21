@@ -22,7 +22,8 @@ Each tool keeps the same behavior as in the CLI:
 - TypeBox parameter schemas are converted to plain JSON Schema at the adapter boundary. Literal unions become `enum`, TypeBox metadata is stripped, and the schema is forwarded to the model unchanged otherwise.
 - Arguments go through the tool's `prepareArguments` shim and Pi's own validator before `execute` runs, so loosely typed calls are normalized the same way the CLI normalizes them.
 - Results keep the text and image content the CLI shows the model; error results keep `isError`.
-- Tools whose name carries a read-only verb (`check`, `assess`, `search`, `get`, `list`, `plan`, `recent`, `review`, `investigate`, `trace`, `validate`) and no write verb (`export`, `generate`, `collect`, `init`, `import`, `create`, `assemble`) declare `effect: "read"`: 85 tools. An Agent SDK dry-run session executes them and stubs the 22 writers (the exporters, generators, evidence collector, and OSCAL workspace commands). No tool requires approval.
+- Tools whose name carries a read-only verb (`check`, `assess`, `search`, `get`, `list`, `plan`, `recent`, `review`, `investigate`, `trace`, `validate`) and no write verb (`export`, `generate`, `collect`, `init`, `import`, `create`, `assemble`) declare `effect: "read"`: 85 tools. An Agent SDK dry-run session executes them and stubs the 22 writers (the exporters, generators, evidence collector, and OSCAL workspace commands).
+- The 22 writers set `needsApproval: true`. A model-initiated call to one of them parks until a person approves or denies it from the playground Approve / Deny buttons or `POST /v1/session/:sessionId/approvals/:callId`; the terminal `agent-sdk chat` client shows the parked call but cannot resolve it, so use `agent-sdk:dev` and the playground for turns that export or generate files. Deterministic `agent-sdk call` runs bypass the gate because the caller chose the tool and input.
 
 ## Run it
 

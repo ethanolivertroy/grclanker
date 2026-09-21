@@ -207,8 +207,13 @@ test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and t
 
   assert.equal(config.description, tool.description);
   assert.equal(config.effect, "read");
+  assert.equal(config.needsApproval, false);
   assert.deepEqual(config.inputSchema.required, ["query"]);
   assert.deepEqual(config.inputSchema.properties.limit, { default: 5, type: "number" });
+
+  const writer = buildSdkToolConfig(fakeTool({ name: "fake_export_things" }).tool);
+  assert.equal(writer.effect, undefined);
+  assert.equal(writer.needsApproval, true);
 
   const result = await config.execute({ query: "openssl", limit: 3 }, { toolCallId: "call_1" });
   assert.deepEqual(result, { content: [{ type: "text", text: "found openssl" }] });
@@ -423,6 +428,7 @@ test("every generated tool entry registers a server tool for its filename", asyn
     assert.equal(tool.inputSchema.type, "object", name);
     assert.deepEqual(tool.inputSchema, toJsonSchema(registered.parameters), name);
     assert.equal(tool.effect, classifyGrcToolEffect(name), name);
+    assert.equal(tool.needsApproval, isGrcWriteTool(name), name);
     assert.equal(typeof tool.execute, "function", name);
   }
 

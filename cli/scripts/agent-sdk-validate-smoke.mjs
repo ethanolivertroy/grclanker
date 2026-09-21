@@ -73,7 +73,11 @@ assert.deepEqual(
 assert.deepEqual(agent.subagents.map((subagent) => subagent.name).sort(), [...PERSONA_NAMES].sort());
 assert.ok(agent.instructions?.chars > 0, "instructions must be discovered");
 
-const readTools = agent.tools.filter((tool) => tool.effect === "read").length;
+const readTools = agent.tools.filter((tool) => tool.effect === "read");
+const approvalTools = agent.tools.filter((tool) => tool.needsApproval === true);
+assert.ok(readTools.every((tool) => tool.needsApproval === false), "read-only tools must not require approval");
+assert.equal(approvalTools.length, agent.tools.length - readTools.length, "every writer must require approval");
+
 console.log(
-  `ok: discovered ${agent.tools.length} server tools (${readTools} read-only), ${agent.skills.length} skills, ${agent.subagents.length} subagents, ${agent.instructions.chars} instruction chars`,
+  `ok: discovered ${agent.tools.length} server tools (${readTools.length} read-only, ${approvalTools.length} approval-gated writers), ${agent.skills.length} skills, ${agent.subagents.length} subagents, ${agent.instructions.chars} instruction chars`,
 );

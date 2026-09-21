@@ -1,7 +1,7 @@
 import type { JsonObject, JsonSchemaObject } from "@cursor/july";
 import type { ToolContext, ToolExecuteResult } from "@cursor/july/tools";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
-import { classifyGrcToolEffect, type GrcToolEffect } from "./effects.js";
+import { classifyGrcToolEffect, type GrcToolEffect, isGrcWriteTool } from "./effects.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
 import { errorEnvelope, toSdkToolResult } from "./results.js";
 import { toJsonSchema } from "./schema.js";
@@ -11,6 +11,12 @@ export interface GrclankerSdkToolConfig {
   description: string;
   inputSchema: JsonSchemaObject;
   effect: GrcToolEffect;
+  /**
+   * Writers (exports, generators, evidence collectors, OSCAL workspace
+   * commands) park model-initiated calls until a person approves them.
+   * Deterministic `agent-sdk call` runs bypass the gate.
+   */
+  needsApproval: boolean;
   execute: (input: JsonObject, ctx: Pick<ToolContext, "toolCallId">) => Promise<ToolExecuteResult>;
 }
 
@@ -60,6 +66,7 @@ export function buildSdkToolConfig(tool: RegisteredGrcTool): GrclankerSdkToolCon
     description: tool.description,
     inputSchema: toJsonSchema(tool.parameters),
     effect: classifyGrcToolEffect(tool.name),
+    needsApproval: isGrcWriteTool(tool.name),
     execute: (input, ctx) => executeGrcTool(tool, input, ctx.toolCallId),
   };
 }
