@@ -57,6 +57,8 @@
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.61",
     "@aws-sdk/client-accessanalyzer": "^3.1075.0",
+    "@aws-sdk/client-account": "^3.1075.0",
+    "@aws-sdk/client-auditmanager": "^3.1075.0",
     "@aws-sdk/client-cloudtrail": "^3.1075.0",
     "@aws-sdk/client-config-service": "^3.1075.0",
     "@aws-sdk/client-ec2": "^3.1075.0",

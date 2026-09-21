@@ -477,13 +477,28 @@ test("exportAwsAuditBundle writes reports, analysis, and archive", async () => {
     async listIdentityCenterInstances() {
       return [{ InstanceArn: "arn:sso" }];
     },
+    async lookupRootEvents() {
+      return { items: [], truncated: false };
+    },
+    async listCustomerManagedPolicies() {
+      return { items: [{ PolicyName: "ReadOnlyAudit", Arn: "arn:aws:iam::123456789012:policy/ReadOnlyAudit", DefaultVersionId: "v2", AttachmentCount: 1 }], truncated: false };
+    },
+    async getPolicyVersionDocument() {
+      return { Statement: [{ Effect: "Allow", Action: ["s3:GetObject"], Resource: "arn:aws:s3:::audit/*" }] };
+    },
+    async listActiveAuditManagerAssessments() {
+      return { items: [{ id: "a-1", name: "FedRAMP Moderate", status: "ACTIVE", complianceType: "FedRAMP", lastUpdated: "2026-04-01T00:00:00Z" }], truncated: false };
+    },
+    async getSecurityAlternateContact() {
+      return { Name: "Security Team", Title: "CISO", EmailAddress: "security@example.com", PhoneNumber: "+1 555 0100" };
+    },
   };
 
   const result = await exportAwsAuditBundle(client, sampleConfig(), base);
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));
   assert.ok(result.fileCount >= 12);
-  assert.equal(result.findingCount, 16);
+  assert.equal(result.findingCount, 20);
 
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.region, "us-east-1");
@@ -933,4 +948,234 @@ test("assessAwsNetworkSecurity caps partial regions, unreadable flow logs, and t
   assert.equal(result.summary.regions_seen, 2);
   assert.equal(result.summary.regions_total, 3);
   assert.ok(result.errors.some((line) => /ec2:DescribeVpcs us-west-2: inventory truncated/.test(line)));
+});
+
+function compliantIdentityClient(overrides = {}) {
+  return {
+    getNow: () => new Date("2026-04-16T00:00:00.000Z"),
+    getResolvedConfig: () => sampleConfig(),
+    async getAccountSummary() {
+      return { SummaryMap: { AccountMFAEnabled: 1, AccountAccessKeysPresent: 0 } };
+    },
+    async getPasswordPolicy() {
+      return { MinimumPasswordLength: 16, RequireSymbols: true, RequireNumbers: true, RequireUppercaseCharacters: true, RequireLowercaseCharacters: true };
+    },
+    async listIamUsers() {
+      return [{ UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" }];
+    },
+    async listMfaDevices() {
+      return [{ SerialNumber: "mfa-alice" }];
+    },
+    async listAccessKeys() {
+      return [];
+    },
+    async getAccessKeyLastUsed() {
+      return null;
+    },
+    async getAccountAuthorizationDetails() {
+      return [];
+    },
+    async lookupRootEvents() {
+      return { items: [], truncated: false };
+    },
+    async listCustomerManagedPolicies() {
+      return {
+        items: [
+          { PolicyName: "ReadOnlyAudit", Arn: "arn:aws:iam::123456789012:policy/ReadOnlyAudit", DefaultVersionId: "v2", AttachmentCount: 1 },
+          { PolicyName: "Deploy", Arn: "arn:aws:iam::123456789012:policy/Deploy", DefaultVersionId: "v1", AttachmentCount: 0, PermissionsBoundaryUsageCount: 0 },
+        ],
+        truncated: false,
+      };
+    },
+    async getPolicyVersionDocument() {
+      return { Statement: [{ Effect: "Allow", Action: ["s3:GetObject", "s3:ListBucket"], Resource: ["arn:aws:s3:::audit", "arn:aws:s3:::audit/*"] }] };
+    },
+    ...overrides,
+  };
+}
+
+test("assessAwsIdentity fixture (d): compliant account passes root activity and policy wildcard checks", async () => {
+  const result = await assessAwsIdentity(compliantIdentityClient());
+  const statuses = statusMap(result);
+  for (const id of ["AWS-IAM-01", "AWS-IAM-02", "AWS-IAM-03", "AWS-IAM-04", "AWS-IAM-05", "AWS-IAM-06", "AWS-IAM-07", "AWS-IAM-08"]) {
+    assert.equal(statuses[id], "pass", `${id} should pass, saw ${statuses[id]}`);
+  }
+  assert.deepEqual(result.errors, []);
+  const root = findingById(result, "AWS-IAM-07");
+  assert.equal(root.evidence.lookback_days, 90);
+  assert.equal(root.evidence.window_start, "2026-01-16T00:00:00.000Z");
+  assert.ok(root.mappings.includes("CIS AWS 1.7"));
+  assert.equal(findingById(result, "AWS-IAM-08").evidence.customer_managed_policies, 2);
+  assert.ok(findingById(result, "AWS-IAM-08").mappings.includes("CIS AWS 1.16"));
+});
+
+test("assessAwsIdentity fails on root console logins and attached full-admin customer policies", async () => {
+  const result = await assessAwsIdentity(compliantIdentityClient({
+    async lookupRootEvents() {
+      return {
+        items: [
+          { EventId: "e1", EventName: "ConsoleLogin", EventTime: "2026-04-10T08:00:00Z", EventSource: "signin.amazonaws.com", Username: "root" },
+          { EventId: "e2", EventName: "GetAccountSummary", EventTime: "2026-04-10T08:05:00Z", EventSource: "iam.amazonaws.com", Username: "root" },
+        ],
+        truncated: false,
+      };
+    },
+    async getPolicyVersionDocument(arn) {
+      if (arn.endsWith("/Deploy")) {
+        return encodeURIComponent(JSON.stringify({ Statement: [{ Effect: "Allow", Action: "*", Resource: "*" }] }));
+      }
+      return { Statement: [{ Effect: "Allow", Action: "*", Resource: "*" }] };
+    },
+  }), { lookbackDays: 30 });
+  const root = findingById(result, "AWS-IAM-07");
+  assert.equal(root.status, "fail");
+  assert.match(root.summary, /1 root ConsoleLogin event/);
+  assert.equal(root.evidence.lookback_days, 30);
+  const policies = findingById(result, "AWS-IAM-08");
+  assert.equal(policies.status, "fail");
+  assert.deepEqual(policies.evidence.full_admin_attached, [{ name: "ReadOnlyAudit", attachment_count: 1 }]);
+  assert.deepEqual(policies.evidence.full_admin_unattached, ["Deploy"]);
+});
+
+test("assessAwsIdentity warns on non-console root activity, unattached wildcards, and unreadable policy versions", async () => {
+  const result = await assessAwsIdentity(compliantIdentityClient({
+    async lookupRootEvents() {
+      return { items: [{ EventId: "e2", EventName: "CreateAccessKey", EventTime: "2026-04-10T08:05:00Z", Username: "root" }], truncated: false };
+    },
+    async getPolicyVersionDocument(arn) {
+      if (arn.endsWith("/Deploy")) throw accessDenied();
+      return { Statement: [{ Effect: "Allow", Action: "ec2:*", Resource: "*" }] };
+    },
+  }));
+  assert.equal(findingById(result, "AWS-IAM-07").status, "warn");
+  const policies = findingById(result, "AWS-IAM-08");
+  assert.equal(policies.status, "warn");
+  assert.deepEqual(policies.evidence.service_wildcard_policies, ["ReadOnlyAudit"]);
+  assert.deepEqual(policies.evidence.policies_unreadable, ["Deploy"]);
+  assert.ok(result.errors.some((line) => line.startsWith("iam:GetPolicyVersion arn:aws:iam::123456789012:policy/Deploy: AccessDenied")));
+});
+
+test("assessAwsIdentity new findings never pass on AccessDenied, empty policies go manual, truncation caps at warn", async () => {
+  const denied = await assessAwsIdentity(compliantIdentityClient({
+    async lookupRootEvents() {
+      throw accessDenied();
+    },
+    async listCustomerManagedPolicies() {
+      throw accessDenied();
+    },
+  }));
+  assert.equal(findingById(denied, "AWS-IAM-07").status, "manual");
+  assert.equal(findingById(denied, "AWS-IAM-08").status, "manual");
+  assert.equal(denied.errors.length, 2);
+
+  const empty = await assessAwsIdentity(compliantIdentityClient({
+    async listCustomerManagedPolicies() {
+      return { items: [], truncated: false };
+    },
+  }));
+  assert.equal(findingById(empty, "AWS-IAM-08").status, "manual");
+  assert.match(findingById(empty, "AWS-IAM-08").summary, /No customer-managed IAM policies exist/);
+
+  const truncated = await assessAwsIdentity(compliantIdentityClient({
+    async lookupRootEvents() {
+      return { items: [], truncated: true };
+    },
+    async listCustomerManagedPolicies() {
+      return { items: [{ PolicyName: "P", Arn: "arn:p", DefaultVersionId: "v1", AttachmentCount: 1 }], truncated: true };
+    },
+  }));
+  assert.equal(findingById(truncated, "AWS-IAM-07").status, "warn");
+  assert.match(findingById(truncated, "AWS-IAM-07").summary, /event lookup truncated/);
+  assert.equal(findingById(truncated, "AWS-IAM-08").status, "warn");
+  assert.match(findingById(truncated, "AWS-IAM-08").summary, /policy inventory truncated at 1000/);
+});
+
+function compliantOrgClient(overrides = {}) {
+  return {
+    async describeOrganization() {
+      return { Id: "o-example", FeatureSet: "ALL" };
+    },
+    async listAccounts() {
+      return [{ Id: "123456789012" }];
+    },
+    async listScps() {
+      return [{ Id: "p-1", Name: "DenyRegions" }];
+    },
+    async listPolicyTargets() {
+      return [{ TargetId: "r-root", Type: "ROOT" }];
+    },
+    async listAnalyzers() {
+      return [{ arn: "arn:analyzer", status: "ACTIVE" }];
+    },
+    async listAccessAnalyzerFindings() {
+      return [];
+    },
+    async listIdentityCenterInstances() {
+      return [{ InstanceArn: "arn:sso" }];
+    },
+    async listActiveAuditManagerAssessments() {
+      return { items: [{ id: "a-1", name: "FedRAMP Moderate", status: "ACTIVE", complianceType: "FedRAMP", lastUpdated: "2026-04-01T00:00:00Z" }], truncated: false };
+    },
+    async getSecurityAlternateContact() {
+      return { AlternateContactType: "SECURITY", Name: "Security Team", Title: "CISO", EmailAddress: "security@example.com", PhoneNumber: "+1 555 0100" };
+    },
+    ...overrides,
+  };
+}
+
+test("assessAwsOrgGuardrails fixture (d): compliant account passes Audit Manager and security contact checks", async () => {
+  const result = await assessAwsOrgGuardrails(compliantOrgClient());
+  const statuses = statusMap(result);
+  for (const id of ["AWS-ORG-01", "AWS-ORG-02", "AWS-ORG-03", "AWS-ORG-04", "AWS-ORG-05", "AWS-ORG-06", "AWS-ORG-07"]) {
+    assert.equal(statuses[id], "pass", `${id} should pass, saw ${statuses[id]}`);
+  }
+  const contact = findingById(result, "AWS-ORG-07");
+  assert.equal(contact.evidence.email_domain, "@example.com");
+  assert.match(contact.summary, /\*\*\*@example\.com/);
+  assert.ok(!JSON.stringify(contact.evidence).includes("security@example.com"), "evidence must not carry the raw email");
+  assert.ok(findingById(result, "AWS-ORG-06").mappings.includes("FedRAMP CA-7"));
+  assert.ok(contact.mappings.includes("CIS AWS 1.2"));
+});
+
+test("assessAwsOrgGuardrails fails on missing Audit Manager assessments and missing security contact", async () => {
+  const result = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listActiveAuditManagerAssessments() {
+      return { items: [], truncated: false };
+    },
+    async getSecurityAlternateContact() {
+      return null;
+    },
+  }));
+  assert.equal(findingById(result, "AWS-ORG-06").status, "fail");
+  assert.match(findingById(result, "AWS-ORG-06").summary, /no ACTIVE assessments/);
+  assert.equal(findingById(result, "AWS-ORG-07").status, "fail");
+  assert.match(findingById(result, "AWS-ORG-07").summary, /ResourceNotFoundException/);
+});
+
+test("assessAwsOrgGuardrails goes manual on AccessDenied and warns on incomplete contacts or undated assessments", async () => {
+  const denied = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listActiveAuditManagerAssessments() {
+      throw accessDenied();
+    },
+    async getSecurityAlternateContact() {
+      throw accessDenied();
+    },
+  }));
+  assert.equal(findingById(denied, "AWS-ORG-06").status, "manual");
+  assert.match(findingById(denied, "AWS-ORG-06").summary, /Audit Manager may not be set up/);
+  assert.equal(findingById(denied, "AWS-ORG-07").status, "manual");
+  assert.equal(denied.errors.length, 2);
+
+  const partial = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listActiveAuditManagerAssessments() {
+      return { items: [{ id: "a-1", name: "Undated", status: "ACTIVE" }], truncated: false };
+    },
+    async getSecurityAlternateContact() {
+      return { Name: "Security Team", EmailAddress: "security@example.com" };
+    },
+  }));
+  assert.equal(findingById(partial, "AWS-ORG-06").status, "warn");
+  assert.match(findingById(partial, "AWS-ORG-06").summary, /without creation or update timestamps/);
+  assert.equal(findingById(partial, "AWS-ORG-07").status, "warn");
+  assert.match(findingById(partial, "AWS-ORG-07").summary, /missing a phone number/);
 });

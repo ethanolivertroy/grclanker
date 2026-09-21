@@ -10,11 +10,14 @@ import {
   ListAnalyzersCommand,
   ListFindingsCommand,
 } from "@aws-sdk/client-accessanalyzer";
+import { AccountClient, GetAlternateContactCommand } from "@aws-sdk/client-account";
+import { AuditManagerClient, ListAssessmentsCommand } from "@aws-sdk/client-auditmanager";
 import {
   CloudTrailClient,
   DescribeTrailsCommand,
   GetEventSelectorsCommand,
   GetTrailStatusCommand,
+  LookupEventsCommand,
 } from "@aws-sdk/client-cloudtrail";
 import {
   ConfigServiceClient,
@@ -60,9 +63,11 @@ import {
   GetAccountPasswordPolicyCommand,
   GetAccountSummaryCommand,
   GetAccessKeyLastUsedCommand,
+  GetPolicyVersionCommand,
   IAMClient,
   ListAccessKeysCommand,
   ListMFADevicesCommand,
+  ListPoliciesCommand as ListIamPoliciesCommand,
   ListUsersCommand,
 } from "@aws-sdk/client-iam";
 import {
@@ -106,6 +111,9 @@ const DEFAULT_BUCKET_LIMIT = 1000;
 const DEFAULT_KEY_LIMIT = 1000;
 const DEFAULT_INSTANCE_LIMIT = 500;
 const DEFAULT_RESOURCE_LIMIT = 2000;
+const DEFAULT_POLICY_LIMIT = 1000;
+const DEFAULT_EVENT_LIMIT = 500;
+const DEFAULT_ROOT_LOOKBACK_DAYS = 90;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_SENSITIVE_PORTS = [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017];
 const ANY_IPV4 = "0.0.0.0/0";
@@ -319,6 +327,8 @@ type IdentityArgs = CheckAccessArgs & {
   stale_days?: number;
   role_limit?: number;
   max_privileged_roles?: number;
+  lookback_days?: number;
+  policy_limit?: number;
 };
 
 type LoggingArgs = CheckAccessArgs & {
@@ -335,6 +345,8 @@ type ExportAuditBundleArgs = CheckAccessArgs & {
   stale_days?: number;
   role_limit?: number;
   max_privileged_roles?: number;
+  lookback_days?: number;
+  policy_limit?: number;
   max_findings?: number;
 };
 
@@ -746,6 +758,8 @@ export class AwsAuditorClient {
   private readonly ssoAdmin: SSOAdminClient;
   private readonly s3: S3Client;
   private readonly s3Control: S3ControlClient;
+  private readonly auditManager: AuditManagerClient;
+  private readonly account: AccountClient;
   private readonly credentials: ReturnType<typeof fromIni> | undefined;
   private readonly ec2Clients = new Map<string, EC2Client>();
   private readonly rdsClients = new Map<string, RDSClient>();
@@ -770,7 +784,121 @@ export class AwsAuditorClient {
     this.ssoAdmin = new SSOAdminClient(clientConfig);
     this.s3 = new S3Client({ ...clientConfig, followRegionRedirects: true });
     this.s3Control = new S3ControlClient(clientConfig);
+    this.auditManager = new AuditManagerClient(clientConfig);
+    this.account = new AccountClient(clientConfig);
     this.now = options.now ?? (() => new Date());
+  }
+
+  /** IAM ListPolicies with Scope Local (customer managed), paginated to completion up to limit. */
+  async listCustomerManagedPolicies(limit = DEFAULT_POLICY_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const policies: JsonRecord[] = [];
+    let marker: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.iam.send(new ListIamPoliciesCommand({ Scope: "Local", OnlyAttached: false, Marker: marker, MaxItems: 100 }));
+      for (const policy of result.Policies ?? []) {
+        policies.push({
+          PolicyName: policy.PolicyName,
+          Arn: policy.Arn,
+          DefaultVersionId: policy.DefaultVersionId,
+          AttachmentCount: policy.AttachmentCount,
+          PermissionsBoundaryUsageCount: policy.PermissionsBoundaryUsageCount,
+        });
+      }
+      marker = result.IsTruncated ? result.Marker : undefined;
+      if (policies.length > limit) {
+        truncated = true;
+        policies.length = limit;
+        break;
+      }
+    } while (marker);
+    return { items: policies, truncated };
+  }
+
+  /** IAM GetPolicyVersion; the Document is URL-encoded JSON per the API reference. */
+  async getPolicyVersionDocument(policyArn: string, versionId: string): Promise<JsonRecord | null> {
+    const result = await this.iam.send(new GetPolicyVersionCommand({ PolicyArn: policyArn, VersionId: versionId }));
+    return normalizePolicyDocument(result.PolicyVersion?.Document) ?? null;
+  }
+
+  /** CloudTrail LookupEvents filtered on Username root within the window (management events, 90-day history). */
+  async lookupRootEvents(startTime: Date, endTime: Date, limit = DEFAULT_EVENT_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const events: JsonRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.cloudTrail.send(new LookupEventsCommand({
+        LookupAttributes: [{ AttributeKey: "Username", AttributeValue: "root" }],
+        StartTime: startTime,
+        EndTime: endTime,
+        MaxResults: 50,
+        NextToken: nextToken,
+      }));
+      for (const event of result.Events ?? []) {
+        events.push({
+          EventId: event.EventId,
+          EventName: event.EventName,
+          EventTime: event.EventTime,
+          EventSource: event.EventSource,
+          Username: event.Username,
+          ReadOnly: event.ReadOnly,
+        });
+      }
+      nextToken = result.NextToken;
+      if (events.length > limit) {
+        truncated = true;
+        events.length = limit;
+        break;
+      }
+    } while (nextToken);
+    return { items: events, truncated };
+  }
+
+  /** Audit Manager ListAssessments with status ACTIVE. */
+  async listActiveAuditManagerAssessments(limit = DEFAULT_MAX_FINDINGS): Promise<AwsPagedList<JsonRecord>> {
+    const assessments: JsonRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.auditManager.send(new ListAssessmentsCommand({ status: "ACTIVE", maxResults: 100, nextToken }));
+      for (const assessment of result.assessmentMetadata ?? []) {
+        assessments.push({
+          id: assessment.id,
+          name: assessment.name,
+          status: assessment.status,
+          complianceType: assessment.complianceType,
+          creationTime: assessment.creationTime,
+          lastUpdated: assessment.lastUpdated,
+        });
+      }
+      nextToken = result.nextToken;
+      if (assessments.length > limit) {
+        truncated = true;
+        assessments.length = limit;
+        break;
+      }
+    } while (nextToken);
+    return { items: assessments, truncated };
+  }
+
+  /** Account GetAlternateContact SECURITY; null when ResourceNotFoundException (no contact set). */
+  async getSecurityAlternateContact(): Promise<JsonRecord | null> {
+    try {
+      const result = await this.account.send(new GetAlternateContactCommand({ AlternateContactType: "SECURITY" }));
+      const contact = result.AlternateContact;
+      return contact
+        ? {
+            AlternateContactType: contact.AlternateContactType,
+            Name: contact.Name,
+            Title: contact.Title,
+            EmailAddress: contact.EmailAddress,
+            PhoneNumber: contact.PhoneNumber,
+          }
+        : {};
+    } catch (error) {
+      if (isErrorCode(error, "ResourceNotFoundException")) return null;
+      throw error;
+    }
   }
 
   private ec2For(region: string): EC2Client {
@@ -1463,30 +1591,89 @@ export async function checkAwsAccess(
   };
 }
 
+function isServiceWildcardAction(value: unknown): boolean {
+  const actions = Array.isArray(value) ? value.map(String) : typeof value === "string" ? [value] : [];
+  return actions.some((action) => /^[a-z0-9-]+:\*$/i.test(action));
+}
+
+function classifyPolicyStatements(document: JsonRecord | null): { fullAdmin: number; serviceWildcard: number } {
+  let fullAdmin = 0;
+  let serviceWildcard = 0;
+  for (const statement of normalizeStatements(document)) {
+    if (asString(statement.Effect)?.toLowerCase() !== "allow") continue;
+    if (matchesWildcard(statement.Action) && matchesWildcard(statement.Resource)) {
+      fullAdmin += 1;
+    } else if (isServiceWildcardAction(statement.Action) && matchesWildcard(statement.Resource)) {
+      serviceWildcard += 1;
+    }
+  }
+  return { fullAdmin, serviceWildcard };
+}
+
+export type AwsIdentityClient = Pick<
+  AwsAuditorClient,
+  | "getNow"
+  | "getResolvedConfig"
+  | "getAccountSummary"
+  | "getPasswordPolicy"
+  | "listIamUsers"
+  | "listMfaDevices"
+  | "listAccessKeys"
+  | "getAccessKeyLastUsed"
+  | "getAccountAuthorizationDetails"
+  | "lookupRootEvents"
+  | "listCustomerManagedPolicies"
+  | "getPolicyVersionDocument"
+>;
+
+export interface AwsIdentityOptions {
+  userLimit?: number;
+  staleDays?: number;
+  roleLimit?: number;
+  maxPrivilegedRoles?: number;
+  lookbackDays?: number;
+  policyLimit?: number;
+}
+
 export async function assessAwsIdentity(
-  client: Pick<
-    AwsAuditorClient,
-    "getNow" | "getAccountSummary" | "getPasswordPolicy" | "listIamUsers" | "listMfaDevices" | "listAccessKeys" | "getAccessKeyLastUsed" | "getAccountAuthorizationDetails"
-  >,
-  options: {
-    userLimit?: number;
-    staleDays?: number;
-    roleLimit?: number;
-    maxPrivilegedRoles?: number;
-  } = {},
+  client: AwsIdentityClient,
+  options: AwsIdentityOptions = {},
 ): Promise<AwsAssessmentResult> {
   const now = client.getNow();
+  const errors: string[] = [];
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 5000);
   const staleDays = clampNumber(options.staleDays, DEFAULT_STALE_DAYS, 1, 3650);
   const roleLimit = clampNumber(options.roleLimit, DEFAULT_ROLE_LIMIT, 1, 5000);
   const maxPrivilegedRoles = clampNumber(options.maxPrivilegedRoles, DEFAULT_MAX_PRIVILEGED_ROLES, 1, 100);
+  const lookbackDays = clampNumber(options.lookbackDays, DEFAULT_ROOT_LOOKBACK_DAYS, 1, 90);
+  const policyLimit = clampNumber(options.policyLimit, DEFAULT_POLICY_LIMIT, 1, 10000);
+  const lookbackStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
+  const region = typeof client.getResolvedConfig === "function" ? client.getResolvedConfig().region : DEFAULT_REGION;
 
-  const [summary, passwordPolicy, users, roles] = await Promise.all([
+  const [summary, passwordPolicy, users, roles, rootEvents, customerPolicies] = await Promise.all([
     client.getAccountSummary(),
     client.getPasswordPolicy(),
     client.listIamUsers(userLimit),
     client.getAccountAuthorizationDetails(roleLimit),
+    attemptAwsRead("cloudtrail:LookupEvents Username=root", () => client.lookupRootEvents(lookbackStart, now, DEFAULT_EVENT_LIMIT), errors),
+    attemptAwsRead("iam:ListPolicies Scope=Local", () => client.listCustomerManagedPolicies(policyLimit), errors),
   ]);
+
+  const policyRows = await mapWithConcurrency(customerPolicies.value?.items ?? [], DEFAULT_CONCURRENCY, async (policy) => {
+    const arn = asString(policy.Arn) ?? "";
+    const versionId = asString(policy.DefaultVersionId) ?? "v1";
+    const document = await attemptAwsRead(`iam:GetPolicyVersion ${arn}`, () => client.getPolicyVersionDocument(arn, versionId), errors);
+    const attached = (asNumber(policy.AttachmentCount) ?? 0) > 0 || (asNumber(policy.PermissionsBoundaryUsageCount) ?? 0) > 0;
+    const classification = document.error ? { fullAdmin: 0, serviceWildcard: 0 } : classifyPolicyStatements(document.value ?? null);
+    return {
+      name: asString(policy.PolicyName) ?? arn,
+      arn,
+      attached,
+      attachment_count: asNumber(policy.AttachmentCount) ?? 0,
+      unreadable: Boolean(document.error),
+      ...classification,
+    };
+  });
 
   const summaryMap = asObject(summary.SummaryMap) ?? {};
   const accountMfaEnabled = asNumber(summaryMap.AccountMFAEnabled) ?? 0;
@@ -1606,6 +1793,93 @@ export async function assessAwsIdentity(
     ),
   ];
 
+  // Control 4 (root sign-ins): CloudTrail LookupEvents for Username root within the lookback window.
+  const rootEventList = rootEvents.value?.items ?? [];
+  const rootConsoleLogins = rootEventList.filter((event) => asString(event.EventName) === "ConsoleLogin");
+  const rootOtherEvents = rootEventList.filter((event) => asString(event.EventName) !== "ConsoleLogin");
+  const undatedRootEvents = rootEventList.filter((event) => extractTimestamp(event.EventTime) === undefined);
+  let rootStatus: AwsFinding["status"];
+  let rootSummary: string;
+  if (rootEvents.error) {
+    rootStatus = "manual";
+    rootSummary = `Root activity could not be read from CloudTrail LookupEvents (${rootEvents.error}); review root sign-in history in the CloudTrail console or IAM credential report.`;
+  } else if (rootConsoleLogins.length > 0) {
+    rootStatus = "fail";
+    rootSummary = `${rootConsoleLogins.length} root ConsoleLogin event(s) were recorded in the last ${lookbackDays} days (region ${region}); root should not be used for daily or administrative tasks.`;
+  } else if (rootOtherEvents.length > 0) {
+    rootStatus = "warn";
+    rootSummary = `No root ConsoleLogin events, but ${rootOtherEvents.length} other root API event(s) were recorded in the last ${lookbackDays} days (region ${region}); confirm each was a sanctioned root-only task.`;
+  } else {
+    rootStatus = "pass";
+    rootSummary = `No CloudTrail events attributed to the root user were found in the last ${lookbackDays} days in region ${region}. Global sign-in events are recorded in us-east-1, so run there for console sign-in coverage.`;
+  }
+  const rootCaps: string[] = [];
+  if (rootEvents.value?.truncated) rootCaps.push(`event lookup truncated at ${DEFAULT_EVENT_LIMIT}`);
+  if (undatedRootEvents.length > 0) rootCaps.push(`${undatedRootEvents.length} event(s) without EventTime`);
+  const rootVerdict = withCap(rootStatus, rootSummary, rootCaps);
+  findings.push(finding(
+    "AWS-IAM-07",
+    "Root account activity",
+    "high",
+    rootVerdict.status,
+    rootVerdict.summary,
+    buildAwsMappings(4),
+    {
+      region,
+      lookback_days: lookbackDays,
+      window_start: lookbackStart.toISOString(),
+      root_events: rootEventList.length,
+      root_console_logins: sample(rootConsoleLogins.map((event) => ({ time: event.EventTime, source: event.EventSource }))),
+      root_other_events: sample(rootOtherEvents.map((event) => ({ time: event.EventTime, name: event.EventName, source: event.EventSource }))),
+      lookup_truncated: rootEvents.value?.truncated ?? false,
+    },
+  ));
+
+  // Control 18 (least privilege): customer-managed policies with wildcard Action and Resource.
+  const fullAdminAttached = policyRows.filter((row) => row.fullAdmin > 0 && row.attached);
+  const fullAdminUnattached = policyRows.filter((row) => row.fullAdmin > 0 && !row.attached);
+  const serviceWildcardPolicies = policyRows.filter((row) => row.fullAdmin === 0 && row.serviceWildcard > 0);
+  const unreadablePolicies = policyRows.filter((row) => row.unreadable);
+  let leastPrivilegeStatus: AwsFinding["status"];
+  let leastPrivilegeSummary: string;
+  if (customerPolicies.error) {
+    leastPrivilegeStatus = "manual";
+    leastPrivilegeSummary = `Customer-managed policies could not be listed (${customerPolicies.error}); review IAM policies for wildcard actions and resources manually.`;
+  } else if (fullAdminAttached.length > 0) {
+    leastPrivilegeStatus = "fail";
+    leastPrivilegeSummary = `${fullAdminAttached.length}/${policyRows.length} customer-managed policies grant Allow with Action "*" and Resource "*" and are attached or used as boundaries.`;
+  } else if (policyRows.length === 0) {
+    leastPrivilegeStatus = "manual";
+    leastPrivilegeSummary = "No customer-managed IAM policies exist to evaluate. Inline user, group, and role policies are not evaluated by this check; review them manually.";
+  } else if (fullAdminUnattached.length > 0 || serviceWildcardPolicies.length > 0) {
+    leastPrivilegeStatus = "warn";
+    leastPrivilegeSummary = `${fullAdminUnattached.length} unattached customer-managed policies grant full "*":"*" access and ${serviceWildcardPolicies.length} grant service-wide wildcard actions on Resource "*"; scope them down or remove them.`;
+  } else {
+    leastPrivilegeStatus = "pass";
+    leastPrivilegeSummary = `None of the ${policyRows.length} customer-managed policies grants Allow with wildcard Action and Resource. Inline policies are not evaluated by this check.`;
+  }
+  const leastPrivilegeCaps: string[] = [];
+  if (unreadablePolicies.length > 0) leastPrivilegeCaps.push(`${unreadablePolicies.length} policy version(s) unreadable`);
+  if (customerPolicies.value?.truncated) leastPrivilegeCaps.push(`policy inventory truncated at ${policyLimit}`);
+  const leastPrivilegeVerdict = withCap(leastPrivilegeStatus, leastPrivilegeSummary, leastPrivilegeCaps);
+  findings.push(finding(
+    "AWS-IAM-08",
+    "Customer-managed policy wildcards",
+    "high",
+    leastPrivilegeVerdict.status,
+    leastPrivilegeVerdict.summary,
+    buildAwsMappings(18),
+    {
+      customer_managed_policies: policyRows.length,
+      full_admin_attached: sample(fullAdminAttached.map((row) => ({ name: row.name, attachment_count: row.attachment_count }))),
+      full_admin_unattached: sample(fullAdminUnattached.map((row) => row.name)),
+      service_wildcard_policies: sample(serviceWildcardPolicies.map((row) => row.name)),
+      policies_unreadable: sample(unreadablePolicies.map((row) => row.name)),
+      policy_inventory_truncated: customerPolicies.value?.truncated ?? false,
+      inline_policies: "not assessed",
+    },
+  ));
+
   return {
     title: "AWS identity posture",
     summary: {
@@ -1615,8 +1889,13 @@ export async function assessAwsIdentity(
       privileged_roles: privilegedRoles.length,
       roles_without_boundaries: rolesWithoutBoundaries.length,
       dormant_users: dormantUsers.length,
+      root_console_logins: rootConsoleLogins.length,
+      customer_managed_policies: policyRows.length,
+      full_admin_policies_attached: fullAdminAttached.length,
+      collection_errors: errors.length,
     },
     findings,
+    errors,
   };
 }
 
@@ -1752,20 +2031,33 @@ export async function assessAwsLoggingDetection(
   };
 }
 
+export type AwsOrgGuardrailsClient = Pick<
+  AwsAuditorClient,
+  | "describeOrganization"
+  | "listAccounts"
+  | "listScps"
+  | "listPolicyTargets"
+  | "listAnalyzers"
+  | "listAccessAnalyzerFindings"
+  | "listIdentityCenterInstances"
+  | "listActiveAuditManagerAssessments"
+  | "getSecurityAlternateContact"
+>;
+
 export async function assessAwsOrgGuardrails(
-  client: Pick<
-    AwsAuditorClient,
-    "describeOrganization" | "listAccounts" | "listScps" | "listPolicyTargets" | "listAnalyzers" | "listAccessAnalyzerFindings" | "listIdentityCenterInstances"
-  >,
+  client: AwsOrgGuardrailsClient,
   options: { maxFindings?: number } = {},
 ): Promise<AwsAssessmentResult> {
+  const errors: string[] = [];
   const maxFindings = clampNumber(options.maxFindings, DEFAULT_MAX_FINDINGS, 1, 5000);
-  const [organization, accounts, scps, analyzers, identityCenterInstances] = await Promise.all([
+  const [organization, accounts, scps, analyzers, identityCenterInstances, auditAssessments, securityContact] = await Promise.all([
     client.describeOrganization().catch(() => null),
     client.listAccounts().catch(() => []),
     client.listScps().catch(() => []),
     client.listAnalyzers().catch(() => []),
     client.listIdentityCenterInstances().catch(() => []),
+    attemptAwsRead("auditmanager:ListAssessments status=ACTIVE", () => client.listActiveAuditManagerAssessments(), errors),
+    attemptAwsRead("account:GetAlternateContact SECURITY", () => client.getSecurityAlternateContact(), errors),
   ]);
 
   const scpTargets = await Promise.all(scps.map(async (policy) => ({
@@ -1845,6 +2137,75 @@ export async function assessAwsOrgGuardrails(
     ),
   ];
 
+  // Control 24: Audit Manager assessments actively collecting evidence.
+  const activeAssessments = auditAssessments.value?.items ?? [];
+  const undatedAssessments = activeAssessments.filter((assessment) => extractTimestamp(assessment.lastUpdated) === undefined && extractTimestamp(assessment.creationTime) === undefined);
+  let auditStatus: AwsFinding["status"];
+  let auditSummary: string;
+  if (auditAssessments.error) {
+    auditStatus = "manual";
+    auditSummary = `AWS Audit Manager assessments could not be listed (${auditAssessments.error}). Audit Manager may not be set up in this region; verify in the Audit Manager console or record the control as not applicable.`;
+  } else if (activeAssessments.length === 0) {
+    auditStatus = "fail";
+    auditSummary = "AWS Audit Manager is reachable but has no ACTIVE assessments collecting evidence; create an assessment from a framework or record the control as not applicable if evidence is collected elsewhere.";
+  } else {
+    auditStatus = "pass";
+    auditSummary = `${activeAssessments.length} AWS Audit Manager assessment(s) are ACTIVE and collecting evidence.`;
+  }
+  const auditCaps: string[] = [];
+  if (undatedAssessments.length > 0) auditCaps.push(`${undatedAssessments.length} assessment(s) without creation or update timestamps`);
+  if (auditAssessments.value?.truncated) auditCaps.push(`assessment list truncated at ${DEFAULT_MAX_FINDINGS}`);
+  const auditVerdict = withCap(auditStatus, auditSummary, auditCaps);
+  findings.push(finding(
+    "AWS-ORG-06",
+    "Audit Manager active assessments",
+    "medium",
+    auditVerdict.status,
+    auditVerdict.summary,
+    buildAwsMappings(24),
+    {
+      active_assessments: activeAssessments.length,
+      assessments: sample(activeAssessments.map((assessment) => ({ name: assessment.name, compliance_type: assessment.complianceType, last_updated: assessment.lastUpdated }))),
+      list_truncated: auditAssessments.value?.truncated ?? false,
+    },
+  ));
+
+  // Control 25: account security alternate contact.
+  const contact = securityContact.value ?? undefined;
+  const contactEmail = asString(contact?.EmailAddress);
+  const contactPhone = asString(contact?.PhoneNumber);
+  let contactStatus: AwsFinding["status"];
+  let contactSummary: string;
+  if (securityContact.error) {
+    contactStatus = "manual";
+    contactSummary = `The account SECURITY alternate contact could not be read (${securityContact.error}); verify it under Account settings in the console.`;
+  } else if (securityContact.value === null) {
+    contactStatus = "fail";
+    contactSummary = "No SECURITY alternate contact is configured on the account (GetAlternateContact returned ResourceNotFoundException); AWS security notifications reach only the root email.";
+  } else if (!contactEmail || !contactPhone) {
+    contactStatus = "warn";
+    contactSummary = `A SECURITY alternate contact exists but is missing ${!contactEmail ? "an email address" : "a phone number"}; complete the contact so security notifications are actionable.`;
+  } else {
+    contactStatus = "pass";
+    contactSummary = `A SECURITY alternate contact is configured with a name, email address (${contactEmail.replace(/^[^@]+/, "***")}), and phone number. Billing and operations contacts are not assessed by this check.`;
+  }
+  findings.push(finding(
+    "AWS-ORG-07",
+    "Account security contact",
+    "medium",
+    contactStatus,
+    contactSummary,
+    buildAwsMappings(25),
+    {
+      security_contact_configured: securityContact.value !== null && securityContact.value !== undefined,
+      name: asString(contact?.Name) ?? null,
+      title: asString(contact?.Title) ?? null,
+      email_domain: contactEmail?.includes("@") ? contactEmail.slice(contactEmail.indexOf("@")) : null,
+      has_phone: Boolean(contactPhone),
+      billing_and_operations_contacts: "not assessed",
+    },
+  ));
+
   return {
     title: "AWS organization guardrails",
     summary: {
@@ -1854,8 +2215,12 @@ export async function assessAwsOrgGuardrails(
       analyzers: analyzers.length,
       active_external_findings: activeExternalFindings.length,
       identity_center_instances: identityCenterInstances.length,
+      audit_manager_active_assessments: activeAssessments.length,
+      security_contact_configured: securityContact.value !== null && securityContact.value !== undefined,
+      collection_errors: errors.length,
     },
     findings,
+    errors,
   };
 }
 
@@ -2671,6 +3036,8 @@ export async function exportAwsAuditBundle(
     staleDays: options.stale_days,
     roleLimit: options.role_limit,
     maxPrivilegedRoles: options.max_privileged_roles,
+    lookbackDays: options.lookback_days,
+    policyLimit: options.policy_limit,
   });
   const loggingDetection = await assessAwsLoggingDetection(client);
   const orgGuardrails = await assessAwsOrgGuardrails(client, {
@@ -2738,6 +3105,8 @@ function normalizeIdentityArgs(args: unknown): IdentityArgs {
     stale_days: asNumber(value.stale_days),
     role_limit: asNumber(value.role_limit),
     max_privileged_roles: asNumber(value.max_privileged_roles),
+    lookback_days: asNumber(value.lookback_days),
+    policy_limit: asNumber(value.policy_limit),
   };
 }
 
@@ -2814,6 +3183,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
     stale_days: asNumber(value.stale_days),
     role_limit: asNumber(value.role_limit),
     max_privileged_roles: asNumber(value.max_privileged_roles),
+    lookback_days: asNumber(value.lookback_days),
+    policy_limit: asNumber(value.policy_limit),
     max_findings: asNumber(value.max_findings),
   };
 }
@@ -2860,6 +3231,8 @@ export function registerAwsTools(pi: any): void {
       stale_days: Type.Optional(Type.Number({ description: "Staleness threshold in days for keys and dormant users. Defaults to 90.", default: 90 })),
       role_limit: Type.Optional(Type.Number({ description: "Maximum IAM roles to inspect. Defaults to 500.", default: 500 })),
       max_privileged_roles: Type.Optional(Type.Number({ description: "Maximum tolerated privileged roles without permission boundaries before failing. Defaults to 5.", default: 5 })),
+      lookback_days: Type.Optional(Type.Number({ description: "Days of CloudTrail history to search for root activity (LookupEvents keeps 90 days). Defaults to 90.", default: 90 })),
+      policy_limit: Type.Optional(Type.Number({ description: "Maximum customer-managed IAM policies to inspect before flagging truncation. Defaults to 1000.", default: 1000 })),
     }),
     prepareArguments: normalizeIdentityArgs,
     async execute(_toolCallId: string, args: IdentityArgs) {
@@ -2869,6 +3242,8 @@ export function registerAwsTools(pi: any): void {
           staleDays: args.stale_days,
           roleLimit: args.role_limit,
           maxPrivilegedRoles: args.max_privileged_roles,
+          lookbackDays: args.lookback_days,
+          policyLimit: args.policy_limit,
         });
         return textResult(formatAssessmentText(result), { tool: "aws_assess_identity", ...result });
       } catch (error) {
