@@ -386,6 +386,9 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 }
 
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
+  if (existsSync(root) && lstatSync(root).isSymbolicLink()) {
+    throw new Error(`Refusing to use symlinked output directory: ${root}`);
+  }
   ensurePrivateDir(root);
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
   for (const suffix of suffixes) {
@@ -2810,7 +2813,187 @@ export async function assessZpa(client: ZpaReadClient | undefined, options: ZpaA
   return assessZpaData(await collectZpaData(client), options);
 }
 
-// EXPORT_PLACEHOLDER
+const SENSITIVE_EXPORT_KEYS = new Set(["authenticationToken", "clientSecret", "preSharedKey", "password", "privateKey", "zrsaencryptedprivatekey", "zrsaencryptedsessionkey", "tmpPassword"]);
+
+function redactForExport(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactForExport);
+  const object = asObject(value);
+  if (!object) return value;
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(object)) {
+    output[key] = SENSITIVE_EXPORT_KEYS.has(key) && entry !== null && entry !== undefined ? "[REDACTED]" : redactForExport(entry);
+  }
+  return output;
+}
+
+export interface ZscalerExportOptions extends ZpaAssessmentOptions {
+  outputDir?: string;
+  maxSuperAdmins?: number;
+  maxSslExemptions?: number;
+}
+
+function statusCell(status: ZscalerFindingStatus): string {
+  return statusLabel(status);
+}
+
+function frameworkMapping(item: ZscalerFinding, framework: ZscalerFramework): string {
+  return ZSCALER_CONTROLS[item.control]?.mappings[framework] ?? "";
+}
+
+function renderExecutiveSummary(findings: ZscalerFinding[], access: ZscalerAccessCheckResult, generatedAt: string): string {
+  const counts = summarizeFindingStatuses(findings);
+  const prioritized = [...findings]
+    .filter((item) => item.status === "fail" || item.status === "warn")
+    .sort((left, right) => severityRank(right.severity) - severityRank(left.severity));
+  return [
+    "# Zscaler Security Assessment: Executive Summary",
+    "",
+    `Generated: ${generatedAt}`,
+    "",
+    `Access check: ${access.status} (ZIA ${access.products.zia}, ZPA ${access.products.zpa})`,
+    "",
+    "## Results",
+    "",
+    `- Pass: ${counts.pass}`,
+    `- Warn: ${counts.warn}`,
+    `- Fail: ${counts.fail}`,
+    `- Manual: ${counts.manual}`,
+    `- Total controls: ${findings.length} of ${Object.keys(ZSCALER_CONTROLS).length}`,
+    "",
+    "## Priority findings",
+    "",
+    ...(prioritized.length > 0
+      ? prioritized.map((item) => `- ${item.id} ${item.title} (${item.severity}, ${statusCell(item.status)}): ${item.summary}`)
+      : ["- No failing or warning findings."]),
+    "",
+    "## Manual evidence required",
+    "",
+    ...findings.filter((item) => item.status === "manual").map((item) => `- ${item.id} ${item.title}: ${item.manualEvidence ?? item.summary}`),
+    "",
+  ].join("\n");
+}
+
+function renderComplianceMatrix(findings: ZscalerFinding[]): string {
+  const header = ["Control", "Title", "Status", ...FRAMEWORK_ORDER];
+  const rows = findings.map((item) => [item.id, item.title, statusCell(item.status), ...FRAMEWORK_ORDER.map((framework) => frameworkMapping(item, framework))]);
+  return [
+    "# Unified Compliance Matrix",
+    "",
+    `| ${header.join(" | ")} |`,
+    `| ${header.map(() => "---").join(" | ")} |`,
+    ...rows.map((row) => `| ${row.join(" | ")} |`),
+    "",
+  ].join("\n");
+}
+
+function renderFrameworkReport(title: string, framework: ZscalerFramework, findings: ZscalerFinding[], generatedAt: string): string {
+  const counts = summarizeFindingStatuses(findings);
+  return [
+    `# ${title}`,
+    "",
+    `Generated: ${generatedAt}`,
+    "",
+    `Pass ${counts.pass}, Warn ${counts.warn}, Fail ${counts.fail}, Manual ${counts.manual}`,
+    "",
+    `| Control | ${framework} requirement | Status | Summary |`,
+    "| --- | --- | --- | --- |",
+    ...findings.map((item) => `| ${item.id} ${item.title} | ${frameworkMapping(item, framework)} | ${statusCell(item.status)} | ${item.summary.replace(/\|/g, "/")} |`),
+    "",
+  ].join("\n");
+}
+
+function renderQuickReference(outputDir: string, findings: ZscalerFinding[], errors: string[], generatedAt: string): string {
+  const counts = summarizeFindingStatuses(findings);
+  return [
+    "# Zscaler Audit Bundle Quick Reference",
+    "",
+    `Generated: ${generatedAt}`,
+    `Bundle directory: ${basename(outputDir)}`,
+    "",
+    "## Layout",
+    "",
+    "- core_data/: raw API snapshots (secrets redacted) per assessment area plus the access check",
+    "- analysis/findings.json: every normalized finding with evidence and framework mappings",
+    "- analysis/<area>.json: per-area summaries",
+    "- compliance/executive_summary.md and compliance/unified_compliance_matrix.md",
+    "- compliance/<framework>/: one report per framework in the spec mapping table",
+    ...(errors.length > 0 ? ["- _errors.log: collection failures that downgraded verdicts to manual"] : []),
+    "",
+    "## Results",
+    "",
+    `Pass ${counts.pass}, Warn ${counts.warn}, Fail ${counts.fail}, Manual ${counts.manual}`,
+    "",
+    "## Verdict semantics",
+    "",
+    "- pass: the documented enabling flags were read and satisfy the control",
+    "- warn: partially satisfied, partial inventory, or undated records",
+    "- fail: a documented flag or inventory contradicts the control",
+    "- manual: unreadable endpoint, unconfigured product, or evidence the API does not expose; the summary names what to collect",
+    "",
+  ].join("\n");
+}
+
+export async function exportZscalerAuditBundle(clients: ZscalerClients, options: ZscalerExportOptions = {}): Promise<ZscalerAuditBundleResult> {
+  const root = resolve(options.outputDir ?? DEFAULT_OUTPUT_DIR);
+  const generatedAt = new Date().toISOString();
+  const tenantLabel = safeDirName(clients.zia?.getResolvedConfig().cloud ?? clients.zpa?.getResolvedConfig().customerId ?? "zscaler");
+  const outputDir = await nextAvailableAuditDir(root, `zscaler-audit-${tenantLabel}-${generatedAt.slice(0, 10)}`);
+
+  const access = await checkZscalerAccess(clients);
+  const ziaAccessData = clients.zia ? await collectZiaAccessControlData(clients.zia) : undefined;
+  const ziaPolicyData = clients.zia ? await collectZiaPolicyData(clients.zia) : undefined;
+  const zpaData = clients.zpa ? await collectZpaData(clients.zpa) : undefined;
+
+  const assessments: ZscalerAssessmentResult[] = [
+    ziaAccessData && clients.zia
+      ? assessZiaAccessControlData(ziaAccessData, { maxSuperAdmins: options.maxSuperAdmins })
+      : await assessZiaAccessControl(undefined),
+    ziaPolicyData ? assessZiaPolicyData(ziaPolicyData, { maxSslExemptions: options.maxSslExemptions }) : await assessZiaPolicy(undefined),
+    zpaData ? assessZpaData(zpaData, options) : await assessZpa(undefined),
+  ];
+  const findings = assessments.flatMap((assessment) => assessment.findings).sort((left, right) => left.control - right.control);
+  const errors = [
+    ...access.surfaces.filter((surface) => surface.status === "not_readable").map((surface) => `access_check ${surface.product} ${surface.name}: ${surface.error ?? "unreadable"}`),
+    ...assessments.flatMap((assessment) => assessment.errors.map((error) => `${assessment.area}: ${error}`)),
+    ...assessments.flatMap((assessment) => assessment.truncated.map((note) => `${assessment.area} partial: ${note}`)),
+  ];
+
+  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
+  await writeSecureTextFile(outputDir, "core_data/zia_access_control.json", serializeJson(redactForExport(ziaAccessData ?? { configured: false })));
+  await writeSecureTextFile(outputDir, "core_data/zia_policy.json", serializeJson(redactForExport(ziaPolicyData ?? { configured: false })));
+  await writeSecureTextFile(outputDir, "core_data/zpa.json", serializeJson(redactForExport(zpaData ?? { configured: false })));
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
+    generated_at: generatedAt,
+    access_status: access.status,
+    products: access.products,
+    status_counts: summarizeFindingStatuses(findings),
+    controls_assessed: findings.length,
+    controls_in_spec: Object.keys(ZSCALER_CONTROLS).length,
+  }));
+  for (const assessment of assessments) {
+    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, errors: assessment.errors, truncated: assessment.truncated }));
+  }
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", renderExecutiveSummary(findings, access, generatedAt));
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", renderComplianceMatrix(findings));
+  for (const report of FRAMEWORK_REPORTS) {
+    await writeSecureTextFile(outputDir, report.path, renderFrameworkReport(report.title, report.framework, findings, generatedAt));
+  }
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", renderQuickReference(outputDir, findings, errors, generatedAt));
+  if (errors.length > 0) {
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+  }
+
+  const zipPath = `${outputDir}.zip`;
+  await createZipArchive(outputDir, zipPath);
+  return {
+    outputDir,
+    zipPath,
+    fileCount: await countFilesRecursively(outputDir),
+    findingCount: findings.length,
+    errorCount: errors.length,
+  };
+}
 
 type AuthArgs = {
   zia_cloud?: string;
@@ -3007,5 +3190,45 @@ export function registerZscalerTools(pi: any): void {
     },
   });
 
-  // REGISTER_PLACEHOLDER
+  pi.registerTool({
+    name: "zscaler_export_audit_bundle",
+    label: "Export Zscaler audit bundle",
+    description:
+      "Run every Zscaler assessment and write an evidence bundle: core_data/ raw snapshots (secrets redacted), analysis/ findings, compliance/ executive summary, unified matrix, and per-framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP), QUICK_REFERENCE.md, _errors.log on partial collection, and a zip named after the allocated directory. Reruns never overwrite a prior bundle.",
+    parameters: Type.Object({
+      ...authParams,
+      output_dir: Type.Optional(Type.String({ description: "Root directory for bundles. Defaults to ./export/zscaler.", default: DEFAULT_OUTPUT_DIR })),
+      max_super_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Super Admin count. Defaults to 5.", default: 5 })),
+      max_ssl_exemptions: Type.Optional(Type.Number({ description: "Maximum acceptable SSL exempted URLs. Defaults to 50.", default: 50 })),
+      cert_expiry_warn_days: Type.Optional(Type.Number({ description: "Certificate expiry warning window in days. Defaults to 30.", default: 30 })),
+      stale_connector_days: Type.Optional(Type.Number({ description: "Stale connector threshold in days. Defaults to 30.", default: 30 })),
+      max_timeout_hours: Type.Optional(Type.Number({ description: "Maximum acceptable reauthentication timeout in hours. Defaults to 24.", default: 24 })),
+    }),
+    prepareArguments: normalizeExportArgs,
+    async execute(_toolCallId: string, args: ExportArgs) {
+      try {
+        const result = await withClients(args, (clients) => exportZscalerAuditBundle(clients, {
+          outputDir: args.output_dir,
+          maxSuperAdmins: args.max_super_admins,
+          maxSslExemptions: args.max_ssl_exemptions,
+          certExpiryWarnDays: args.cert_expiry_warn_days,
+          staleConnectorDays: args.stale_connector_days,
+          maxTimeoutHours: args.max_timeout_hours,
+        }));
+        return textResult(
+          [
+            "Zscaler audit bundle exported",
+            `Directory: ${result.outputDir}`,
+            `Archive: ${result.zipPath}`,
+            `Files: ${result.fileCount}`,
+            `Findings: ${result.findingCount}`,
+            `Collection errors: ${result.errorCount}${result.errorCount > 0 ? " (see _errors.log)" : ""}`,
+          ].join("\n"),
+          { tool: "zscaler_export_audit_bundle", ...result },
+        );
+      } catch (error) {
+        return errorResult(`Zscaler audit bundle export failed: ${errorMessage(error)}`, { tool: "zscaler_export_audit_bundle" });
+      }
+    },
+  });
 }

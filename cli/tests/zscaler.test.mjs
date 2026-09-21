@@ -14,6 +14,7 @@ import {
   assessZpa,
   assessZpaData,
   checkZscalerAccess,
+  exportZscalerAuditBundle,
   listZscalerControls,
   mappingsForControl,
   obfuscateZiaApiKey,
@@ -694,6 +695,111 @@ test("assessZpa collects SCIM groups per SCIM-enabled IdP and renders not-config
   assert.ok(missing.findings.every((item) => item.status === "manual" && /ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, ZPA_CUSTOMER_ID/.test(item.summary)));
 });
 
+function ziaFetchMock(options = {}) {
+  const failPaths = new Set(options.failPaths ?? []);
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const path = url.pathname.replace("/api/v1", "");
+    if (path === "/authenticatedSession") {
+      return init.method === "POST"
+        ? jsonResponse({ authType: "ADMIN_LOGIN" }, { headers: { "set-cookie": "JSESSIONID=LIVE; Path=/" } })
+        : jsonResponse({});
+    }
+    if (failPaths.has(path)) return jsonResponse({ message: "forbidden" }, { status: 403 });
+    switch (path) {
+      case "/adminUsers":
+        return jsonResponse([{ id: 1, loginName: "admin@example.com", disabled: false, isPasswordLoginAllowed: false, role: { id: 10, name: "Super Admin" } }]);
+      case "/adminRoles/lite":
+        return jsonResponse([{ id: 10, name: "Super Admin" }, { id: 11, name: "Auditor" }]);
+      case "/authSettings":
+        return jsonResponse({ samlEnabled: true });
+      case "/passwordExpiry/settings":
+        return jsonResponse({ passwordExpirationEnabled: true, passwordExpiryDays: 90 });
+      case "/auditlogEntryReport":
+        return jsonResponse({ status: "COMPLETE" });
+      case "/nssFeeds":
+        return jsonResponse([{ id: 1, name: "siem", feedStatus: "ENABLED", nssLogType: "ADMIN_AUDIT", authenticationToken: "super-secret-token" }]);
+      case "/locations":
+        return jsonResponse([{ id: 5, name: "HQ", authRequired: true, sslScanEnabled: true, ofwEnabled: true }]);
+      case "/locations/5/sublocations":
+        return jsonResponse([]);
+      case "/sslSettings/exemptedUrls":
+        return jsonResponse({ urls: [] });
+      case "/webApplicationRules/ruleTypeMapping":
+        return jsonResponse({ WEBMAIL: "Webmail" });
+      case "/webApplicationRules/WEBMAIL":
+        return jsonResponse([]);
+      default:
+        return jsonResponse(path.endsWith("Rules") || path.endsWith("Engines") || path.endsWith("Dictionaries") || path.endsWith("Tunnels") || path.endsWith("Credentials") || path.endsWith("profiles") ? [] : {});
+    }
+  };
+}
+
+test("exportZscalerAuditBundle writes the bundle layout, redacts secrets, logs errors, and never overwrites", async () => {
+  const base = createTempBase("grclanker-zscaler-bundle-");
+  const config = { zia: ziaConfig(), zpa: undefined, oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] };
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetchMock({ failPaths: ["/firewallFilteringRules"] }), maxRetries: 0 });
+  const result = await exportZscalerAuditBundle({ config, zia }, { outputDir: base });
+
+  for (const relativePath of [
+    "core_data/access_check.json",
+    "core_data/zia_access_control.json",
+    "core_data/zia_policy.json",
+    "core_data/zpa.json",
+    "analysis/findings.json",
+    "analysis/summary.json",
+    "analysis/zia_access_control.json",
+    "analysis/zia_policy.json",
+    "analysis/zpa.json",
+    "compliance/executive_summary.md",
+    "compliance/unified_compliance_matrix.md",
+    "compliance/fedramp/fedramp_compliance_report.md",
+    "compliance/cmmc/cmmc_compliance_report.md",
+    "compliance/soc2/soc2_compliance_report.md",
+    "compliance/cis/cis_compliance_report.md",
+    "compliance/pci_dss/pci_dss_compliance_report.md",
+    "compliance/disa_stig/stig_compliance_checklist.md",
+    "compliance/irap/irap_compliance_report.md",
+    "compliance/ismap/ismap_compliance_report.md",
+    "QUICK_REFERENCE.md",
+    "_errors.log",
+  ]) {
+    assert.ok(existsSync(join(result.outputDir, relativePath)), `missing ${relativePath}`);
+  }
+  assert.ok(existsSync(result.zipPath));
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
+  assert.equal(result.findingCount, 25);
+  assert.ok(result.errorCount > 0);
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
+  assert.equal(findings.find((item) => item.id === "ZS-02").status, "manual");
+  assert.ok(findings.filter((item) => item.id.startsWith("ZS-0") || item.id.startsWith("ZS-")).length === 25);
+  assert.ok(findings.filter((item) => /Not configured: ZPA/.test(item.summary)).length === 11);
+  const rawAccess = readFileSync(join(result.outputDir, "core_data/zia_access_control.json"), "utf8");
+  assert.ok(!rawAccess.includes("super-secret-token"));
+  assert.ok(rawAccess.includes("[REDACTED]"));
+  assert.match(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), /firewallFilteringRules/);
+  assert.match(readFileSync(join(result.outputDir, "compliance/unified_compliance_matrix.md"), "utf8"), /ZS-14 \| Audit Logging Enabled \| PASS/);
+
+  const rerun = await exportZscalerAuditBundle({ config, zia: new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetchMock(), maxRetries: 0 }) }, { outputDir: base });
+  assert.notEqual(rerun.outputDir, result.outputDir);
+  assert.match(rerun.outputDir, /-2$/);
+  assert.equal(rerun.zipPath, `${rerun.outputDir}.zip`);
+  assert.ok(existsSync(result.zipPath));
+  assert.ok(!existsSync(join(rerun.outputDir, "_errors.log")) || readFileSync(join(rerun.outputDir, "_errors.log"), "utf8").length > 0);
+});
+
+test("exportZscalerAuditBundle rejects unsafe output paths", async () => {
+  const base = createTempBase("grclanker-zscaler-unsafe-");
+  const outside = createTempBase("grclanker-zscaler-unsafe-outside-");
+  symlinkSync(outside, join(base, "linked"), "dir");
+  const config = { zia: ziaConfig(), oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] };
+  await assert.rejects(
+    () => exportZscalerAuditBundle({ config, zia: new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetchMock(), maxRetries: 0 }) }, { outputDir: join(base, "linked") }),
+    /symlink/,
+  );
+});
+
 test("control catalog covers all 25 spec controls with eight framework mappings each", () => {
   const controls = listZscalerControls();
   assert.equal(controls.length, 25);
@@ -708,6 +814,8 @@ test("zscaler tools are registered in the tool catalog under the Zscaler group",
   assert.ok(names.includes("zscaler_assess_zia_access_control"));
   assert.ok(names.includes("zscaler_assess_zia_policy"));
   assert.ok(names.includes("zscaler_assess_zpa"));
+  assert.ok(names.includes("zscaler_export_audit_bundle"));
+  assert.equal(tools.length, 5);
   for (const tool of tools) {
     assert.equal(tool.group, "Zscaler");
     assert.equal(tool.kind, "domain");
