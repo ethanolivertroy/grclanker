@@ -1169,25 +1169,16 @@ test("error-body walk: no CLI surface echoes a stderr or stdout canary into find
       const access = await checkOciAccess(client);
       const results = await runAllAssessments(client);
       const bundle = await exportOciAuditBundle(client, sampleConfig(), base);
-
       assert.ok(thrown.length > 0, `${label}: the real client surface ran`);
+
+      // Leak assertions first: with the fix removed these are the ones that must fire.
       for (const error of thrown) {
-        assert.ok(error instanceof OciCommandError, `${label}: CLI failures surface as OciCommandError`);
-        assert.equal(error.message, disclosure, `${label}: the thrown error discloses the failure without echoing the body`);
-        assert.equal(error.exitCode, 1, label);
-        assert.equal(error.stderrBytes, Buffer.byteLength(shape.stderr, "utf8"), label);
+        assert.doesNotMatch(String(error?.message), CANARY_PATTERN, `${label}: a thrown error leaked a canary`);
+        assert.doesNotMatch(String(error?.message), /Command failed|<html>|Oracle-Python|request_endpoint/, `${label}: a thrown error echoed the CLI body`);
       }
       const inMemory = JSON.stringify({ access, results });
       assert.doesNotMatch(inMemory, CANARY_PATTERN, `${label}: an in-memory finding, summary, or errors array leaked a canary`);
       assert.doesNotMatch(inMemory, /Command failed|<html>|Oracle-Python|request_endpoint/, `${label}: an in-memory output echoed the CLI body`);
-      const allErrors = results.flatMap((result) => result.errors);
-      assert.ok(allErrors.some((line) => line.includes(disclosure)), `${label}: an errors array discloses the failure: ${allErrors.join(" | ")}`);
-      const dependents = results.flatMap((result) => result.findings).filter((item) => entry.dependents.includes(item.id));
-      for (const item of dependents) {
-        assert.notEqual(item.status, "pass", `${label}: ${item.id} must not pass`);
-        assert.match(item.summary, new RegExp(entry.command), `${label}: ${item.id} names the command`);
-      }
-
       const files = listFilesRecursively(bundle.outputDir);
       for (const file of files) {
         assert.doesNotMatch(readFileSync(file, "utf8"), CANARY_PATTERN, `${label}: ${relative(bundle.outputDir, file)} leaked a canary`);
@@ -1196,6 +1187,21 @@ test("error-body walk: no CLI surface echoes a stderr or stdout canary into find
       assert.equal(entries.filter((zipEntry) => !zipEntry.name.endsWith("/")).length, files.length, label);
       for (const zipEntry of entries) {
         assert.doesNotMatch(zipEntry.content, CANARY_PATTERN, `${label}: zip entry ${zipEntry.name} leaked a canary`);
+      }
+
+      // Disclosure assertions: every failure names the command, exit code, and byte counts or the parsed ServiceError fields.
+      for (const error of thrown) {
+        assert.ok(error instanceof OciCommandError, `${label}: CLI failures surface as OciCommandError`);
+        assert.equal(error.message, disclosure, `${label}: the thrown error discloses the failure without echoing the body`);
+        assert.equal(error.exitCode, 1, label);
+        assert.equal(error.stderrBytes, Buffer.byteLength(shape.stderr, "utf8"), label);
+      }
+      const allErrors = results.flatMap((result) => result.errors);
+      assert.ok(allErrors.some((line) => line.includes(disclosure)), `${label}: an errors array discloses the failure: ${allErrors.join(" | ")}`);
+      const dependents = results.flatMap((result) => result.findings).filter((item) => entry.dependents.includes(item.id));
+      for (const item of dependents) {
+        assert.notEqual(item.status, "pass", `${label}: ${item.id} must not pass`);
+        assert.match(item.summary, new RegExp(entry.command), `${label}: ${item.id} names the command`);
       }
       const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
       assert.ok(errorsLog.includes(disclosure), `${label}: _errors.log discloses the failure`);
