@@ -464,11 +464,18 @@ export function createRedactingSink(
   };
 }
 
+// The returned result is scrubbed exactly as the sink scrubs the stream at end(): complete
+// patterns first, then a PEM block whose END never arrived is withheld with its body, so the two
+// halves of the guard never disagree about the same output.
+function redactCompletedOutput(text: string, extraSecrets: Array<string | undefined>): string {
+  return redactUnterminatedPemBlocks(redactSecrets(text, extraSecrets));
+}
+
 export function redactExecutionResult(result: ExecutionResult, extraSecrets: Array<string | undefined> = []): ExecutionResult {
   return {
     ...result,
-    stdout: redactSecrets(result.stdout, extraSecrets),
-    stderr: redactSecrets(result.stderr, extraSecrets),
+    stdout: redactCompletedOutput(result.stdout, extraSecrets),
+    stderr: redactCompletedOutput(result.stderr, extraSecrets),
   };
 }
 

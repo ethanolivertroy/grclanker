@@ -49,15 +49,18 @@ import {
   extractComputeFlag,
   formatComputeBackendList,
 } from "../dist/pi/env.js";
-import { createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
+import { createHostBackend, createSandboxRuntimeBackend } from "../dist/pi/backends/local.js";
 import {
   assertSafeSessionId,
+  createExecutionOutputGuard,
+  createProcessCommandRunner,
   createRedactingSink,
   describeEndpoint,
   ExecutionBackendError,
   ExecutionBackendTimeoutError,
   REDACTING_SINK_MAX_HELD_CHARS,
   redactErrorMessage,
+  redactExecutionResult,
   redactSecrets,
   redactUnterminatedPemBlocks,
   summarizeJsonBody,
@@ -945,6 +948,96 @@ test("redacting sink withholds a never-closed PEM body at end() and at the hold 
   singleSink.write(Buffer.from("y".repeat(REDACTING_SINK_MAX_HELD_CHARS)));
   assert.equal(single.length, 1);
   singleSink.end();
+});
+
+test("redactExecutionResult withholds an unterminated PEM body like the sink and the file-tool exception keeps raw bytes", async () => {
+  const truncated = `-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY.join("\n")}\ndone\n`;
+  const expected = `${UNTERMINATED_PEM}\ndone\n`;
+  const leaks = (text) => text.includes("BEGIN OPENSSH PRIVATE KEY") || FAKE_PEM_BODY.some((line) => text.includes(line));
+
+  // The exported function on its own: stdout and stderr are withheld the same way, and the
+  // fields that are not output are untouched.
+  const direct = redactExecutionResult({ exitCode: 3, stdout: truncated, stderr: truncated, artifacts: ["out.txt"] });
+  assert.equal(direct.stdout, expected);
+  assert.equal(direct.stderr, expected);
+  assert.ok(!leaks(direct.stdout) && !leaks(direct.stderr));
+  assert.equal(direct.exitCode, 3);
+  assert.deepEqual(direct.artifacts, ["out.txt"]);
+
+  // Through the guard with redaction on: finish() and the stream agree byte for byte under
+  // every chunking.
+  for (const [strategy, chunker] of Object.entries(CHUNKERS)) {
+    const chunks = [];
+    const guard = createExecutionOutputGuard({ onData: (chunk) => chunks.push(chunk.toString("utf8")) });
+    for (const chunk of chunker(truncated)) guard.onData(chunk);
+    guard.end();
+    const finished = guard.finish({ exitCode: 0, stdout: truncated, stderr: truncated, artifacts: [] });
+    assert.equal(finished.stdout, expected, strategy);
+    assert.equal(finished.stderr, expected, strategy);
+    assert.equal(chunks.join(""), finished.stdout, strategy);
+  }
+
+  // The file-tool exception is unchanged: with redactOutput false neither half touches the bytes.
+  const rawChunks = [];
+  const off = createExecutionOutputGuard({ onData: (chunk) => rawChunks.push(chunk.toString("utf8")), redactOutput: false });
+  off.onData(Buffer.from(truncated, "utf8"));
+  off.end();
+  const raw = off.finish({ exitCode: 0, stdout: truncated, stderr: truncated, artifacts: [] });
+  assert.equal(raw.stdout, truncated);
+  assert.equal(raw.stderr, truncated);
+  assert.equal(rawChunks.join(""), truncated);
+
+  // On host through the contract adapter with a real shell: the returned result reads the same
+  // as the stream, on stdout and on stderr. The real process runner is kept but the shell is
+  // not a login shell, because a login profile may write to stderr and this asserts stderr exactly.
+  const keyDir = mkdtempSync(join(tmpdir(), "grclanker-result-"));
+  const keyPath = join(keyDir, "id_ed25519.partial");
+  writeFileSync(keyPath, truncated.slice(0, truncated.length - "done\n".length));
+  try {
+    const processRunner = createProcessCommandRunner();
+    const host = createHostBackend({
+      runner: (executable, args, options) => processRunner(executable, args.map((arg) => (arg === "-lc" ? "-c" : arg)), options),
+    });
+    const stdoutChunks = [];
+    const stdoutResult = await host.exec({
+      sessionId: "s",
+      command: [`cat ${quoteForBash(keyPath)}; printf 'done\\n'`],
+      cwd: keyDir,
+      onData: (chunk) => stdoutChunks.push(chunk.toString("utf8")),
+    });
+    assert.equal(stdoutResult.exitCode, 0);
+    assert.equal(stdoutResult.stdout, expected);
+    assert.equal(stdoutChunks.join(""), expected);
+    assert.equal(stdoutResult.stderr, "");
+
+    const stderrChunks = [];
+    const stderrResult = await host.exec({
+      sessionId: "s",
+      command: [`cat ${quoteForBash(keyPath)} >&2; printf 'done\\n' >&2`],
+      cwd: keyDir,
+      onData: (chunk) => stderrChunks.push(chunk.toString("utf8")),
+    });
+    assert.equal(stderrResult.exitCode, 0);
+    assert.equal(stderrResult.stderr, expected);
+    assert.equal(stderrChunks.join(""), expected);
+    assert.equal(stderrResult.stdout, "");
+
+    // The runtime file tools read through capture() with the guard off, so a truncated key file
+    // still round-trips its raw bytes for the edit tool.
+    const { runner } = createFakeRunner(async (_executable, args) => {
+      if (args[0] === "info") return { exitCode: 0, stdout: "ok" };
+      return { exitCode: 0, stdout: truncated };
+    });
+    await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
+      const roundTrip = (await execution.editOperations.readFile("/repo/id_ed25519.partial")).toString("utf8");
+      assert.equal(roundTrip, truncated);
+      const streamed = [];
+      await execution.bashOperations.exec("cat id_ed25519.partial", "/repo", { onData: (chunk) => streamed.push(chunk.toString("utf8")) });
+      assert.equal(streamed.join(""), expected);
+    }, { runner });
+  } finally {
+    rmSync(keyDir, { recursive: true, force: true });
+  }
 });
 
 test("redacting sink holds a dangling Bearer for the token on the next line", () => {
