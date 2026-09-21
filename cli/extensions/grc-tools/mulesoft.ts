@@ -257,6 +257,15 @@ export interface MulesoftCertificateSummary {
 
 export type MulesoftCertificateProbe = (host: string, timeoutMs: number) => Promise<MulesoftCertificateSummary>;
 
+export interface MulesoftPage {
+  items: JsonRecord[];
+  total?: number;
+  truncated: boolean;
+  limit: number;
+}
+
+export type MulesoftListResult = JsonRecord[] | MulesoftPage;
+
 export class MulesoftApiError extends Error {
   readonly status: number;
 
@@ -463,6 +472,26 @@ function extractCollection(payload: unknown, keys: string[] = ["data"]): JsonRec
   return [];
 }
 
+function isPage(value: unknown): value is MulesoftPage {
+  const object = asObject(value);
+  return object !== undefined && Array.isArray(object.items) && typeof object.truncated === "boolean";
+}
+
+export function toPage(value: MulesoftListResult | undefined): MulesoftPage {
+  if (isPage(value)) return value;
+  const items = asRecordArray(value ?? []);
+  return { items, total: items.length, truncated: false, limit: items.length };
+}
+
+function pageTotalLabel(page: MulesoftPage): string {
+  return page.total === undefined ? "an unknown total" : `${page.total} total`;
+}
+
+function truncationNote(label: string, page: MulesoftPage): string | undefined {
+  if (!page.truncated) return undefined;
+  return `${label} list truncated at ${page.items.length} of ${pageTotalLabel(page)}`;
+}
+
 export function redactSnapshot(value: unknown, depth = 0): unknown {
   if (depth > 16) return value;
   if (Array.isArray(value)) return value.map((item) => redactSnapshot(item, depth + 1));
@@ -538,18 +567,23 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
+const MAX_AUDIT_DIR_SUFFIX = 50;
+
+export function auditBundleZipPath(outputDir: string): string {
+  return `${outputDir}.zip`;
+}
+
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
+  const candidates = [preferredName, ...Array.from({ length: MAX_AUDIT_DIR_SUFFIX - 1 }, (_, index) => `${preferredName}-${index + 2}`)];
+  for (const name of candidates) {
+    const candidate = resolveSecureOutputPath(root, name);
+    if (existsSync(candidate) || existsSync(auditBundleZipPath(candidate))) continue;
+    mkdirSync(candidate, { recursive: true, mode: 0o700 });
+    await chmod(candidate, 0o700);
+    return candidate;
   }
-  throw new Error(`Unable to allocate output directory under ${root}`);
+  throw new Error(`Unable to allocate an unused output directory under ${root}: ${MAX_AUDIT_DIR_SUFFIX} bundle names are already taken.`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -559,8 +593,11 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
+  if (existsSync(zipPath)) {
+    throw new Error(`Refusing to overwrite existing archive: ${zipPath}`);
+  }
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
@@ -1120,28 +1157,39 @@ export class MulesoftApiClient {
     return this.requestJson(path, { method: "POST", body, query, headers });
   }
 
-  async listOffset(path: string, options: ListOptions = {}): Promise<JsonRecord[]> {
+  async listOffset(path: string, options: ListOptions = {}): Promise<MulesoftPage> {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, 100_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 250);
+    const collectionKeys = options.collectionKeys ?? ["data"];
     const items: JsonRecord[] = [];
     let offset = 0;
+    let total: number | undefined;
+    let truncated = false;
 
-    while (items.length < limit) {
-      const payload = await this.get(path, {
-        ...(options.query ?? {}),
-        limit: Math.min(pageSize, limit - items.length),
-        offset,
-      }, options.headers);
-      const pageItems = extractCollection(payload, options.collectionKeys ?? ["data"]);
+    for (;;) {
+      const requested = Math.min(pageSize, limit - items.length);
+      const payload = await this.get(path, { ...(options.query ?? {}), limit: requested, offset }, options.headers);
+      const pageItems = extractCollection(payload, collectionKeys);
+      total = asNumber(asObject(payload)?.total) ?? total;
       items.push(...pageItems.slice(0, limit - items.length));
       offset += pageItems.length;
-      const total = asNumber(asObject(payload)?.total);
-      if (pageItems.length === 0 || pageItems.length < Math.min(pageSize, limit) || (total !== undefined && offset >= total)) {
+
+      if (pageItems.length === 0) break;
+      if (total !== undefined && offset >= total) break;
+      if (items.length >= limit) {
+        truncated = total !== undefined
+          ? total > items.length
+          : await this.hasMoreItems(path, options, collectionKeys, offset);
         break;
       }
     }
 
-    return items;
+    return { items, total, truncated, limit };
+  }
+
+  private async hasMoreItems(path: string, options: ListOptions, collectionKeys: string[], offset: number): Promise<boolean> {
+    const payload = await this.get(path, { ...(options.query ?? {}), limit: 1, offset }, options.headers);
+    return extractCollection(payload, collectionKeys).length > 0;
   }
 
   private orgPath(suffix = ""): string {
@@ -1167,7 +1215,7 @@ export class MulesoftApiClient {
     return asObject(await this.get(this.orgPath("/hierarchy"))) ?? {};
   }
 
-  async listIdentityProviders(): Promise<JsonRecord[]> {
+  async listIdentityProviders(): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath("/identityProviders"));
   }
 
@@ -1175,23 +1223,23 @@ export class MulesoftApiClient {
     return asObject(await this.get(this.orgPath("/identityProviderSettings"))) ?? {};
   }
 
-  async listMembers(limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listMembers(limit = DEFAULT_USER_LIMIT): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath("/members"), { limit });
   }
 
-  async listMfaExemptUsers(limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listMfaExemptUsers(limit = DEFAULT_USER_LIMIT): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath("/users"), { query: { mfaVerificationExcluded: true }, limit });
   }
 
-  async listRoleGroups(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listRoleGroups(limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath("/rolegroups"), { limit });
   }
 
-  async listRoleGroupRoles(roleGroupId: string, limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listRoleGroupRoles(roleGroupId: string, limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath(`/rolegroups/${encodeURIComponent(roleGroupId)}/roles`), { limit });
   }
 
-  async listRoleGroupUsers(roleGroupId: string, limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
+  async listRoleGroupUsers(roleGroupId: string, limit = DEFAULT_USER_LIMIT): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath(`/rolegroups/${encodeURIComponent(roleGroupId)}/users`), { limit });
   }
 
@@ -1199,21 +1247,21 @@ export class MulesoftApiClient {
     return extractCollection(await this.get(this.orgPath("/environments")));
   }
 
-  async listConnectedApplications(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listConnectedApplications(limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath("/connectedApplications"), { query: { includeUsage: true }, limit });
   }
 
-  async listConnectedApplicationScopes(clientId: string): Promise<JsonRecord[]> {
+  async listConnectedApplicationScopes(clientId: string): Promise<MulesoftPage> {
     return this.listOffset(this.orgPath(`/connectedApplications/${encodeURIComponent(clientId)}/scopes`));
   }
 
-  async listManagedApis(environmentId: string, limit = DEFAULT_API_LIMIT): Promise<JsonRecord[]> {
+  async listManagedApis(environmentId: string, limit = DEFAULT_API_LIMIT): Promise<MulesoftPage> {
     const assets = await this.listOffset(
       `/apimanager/api/v1/organizations/${encodeURIComponent(this.config.organizationId)}/environments/${encodeURIComponent(environmentId)}/apis`,
       { collectionKeys: ["assets"], limit },
     );
     const apis: JsonRecord[] = [];
-    for (const asset of assets) {
+    for (const asset of assets.items) {
       for (const api of asRecordArray(asset.apis)) {
         apis.push({
           ...api,
@@ -1224,7 +1272,12 @@ export class MulesoftApiClient {
         });
       }
     }
-    return apis.slice(0, limit);
+    return {
+      items: apis.slice(0, limit),
+      total: assets.truncated || apis.length > limit ? undefined : apis.length,
+      truncated: assets.truncated || apis.length > limit,
+      limit,
+    };
   }
 
   async listApiPolicies(environmentId: string, apiId: string): Promise<JsonRecord[]> {
@@ -1235,7 +1288,7 @@ export class MulesoftApiClient {
     return extractCollection(payload, ["policies", "data"]);
   }
 
-  async listExchangeAssets(limit = DEFAULT_LIST_LIMIT): Promise<JsonRecord[]> {
+  async listExchangeAssets(limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
     return this.listOffset("/exchange/api/v2/assets/search", { limit, pageSize: 100 });
   }
 
@@ -1361,13 +1414,121 @@ type AccessClient = IdentityClient & ApiGatewayClient & RuntimeClient & AuditCli
 
 export type MulesoftBundleClient = AccessClient;
 
-async function collect<T>(label: string, fallback: T, load: () => Promise<T>, errors: string[]): Promise<T> {
+interface Collected<T> {
+  label: string;
+  value: T;
+  error?: string;
+  httpStatus?: number;
+}
+
+interface Verdict {
+  status: MulesoftFindingStatus;
+  summary: string;
+  evidence?: JsonRecord;
+}
+
+interface EvaluationInputs {
+  primary: Array<Collected<unknown>>;
+  secondary?: Array<Collected<unknown>>;
+  partial?: Array<string | undefined>;
+}
+
+async function collect<T>(label: string, fallback: T, load: () => Promise<T>, errors: string[]): Promise<Collected<T>> {
   try {
-    return await load();
+    return { label, value: await load() };
   } catch (error) {
-    errors.push(`${label}: ${errorMessage(error)}`);
-    return fallback;
+    const message = errorMessage(error);
+    errors.push(`${label}: ${message}`);
+    return {
+      label,
+      value: fallback,
+      error: message,
+      httpStatus: error instanceof MulesoftApiError ? error.status : undefined,
+    };
   }
+}
+
+async function collectPage(label: string, load: () => Promise<MulesoftListResult>, errors: string[]): Promise<Collected<MulesoftPage>> {
+  const collected = await collect<MulesoftListResult>(label, [], load, errors);
+  return { ...collected, value: toPage(collected.value) };
+}
+
+function readySource(label: string): Collected<undefined> {
+  return { label, value: undefined };
+}
+
+function failedSource(label: string, error: string): Collected<undefined> {
+  return { label, value: undefined, error };
+}
+
+function mergeSources(label: string, sources: Array<Collected<unknown>>): Collected<undefined> {
+  const failed = sources.filter((source) => source.error);
+  if (failed.length === 0) return readySource(label);
+  const detail = failed.slice(0, 3).map((source) => `${source.label}: ${source.error}`).join("; ");
+  return {
+    label,
+    value: undefined,
+    error: `${failed.length} of ${sources.length} reads failed (${detail}${failed.length > 3 ? "; ..." : ""})`,
+    httpStatus: failed[0].httpStatus,
+  };
+}
+
+function describeFailure(source: Collected<unknown>): string {
+  const status = source.httpStatus;
+  const cause = status === 401 || status === 403
+    ? `the credential lacks permission (HTTP ${status})`
+    : status === 404
+      ? "the endpoint is unavailable on this control plane or plan (HTTP 404)"
+      : "the read errored";
+  return `${source.label} could not be read, ${cause}: ${source.error}`;
+}
+
+function verdict(status: MulesoftFindingStatus, summary: string, evidence?: JsonRecord): Verdict {
+  return { status, summary, evidence };
+}
+
+function evaluate(
+  number: number,
+  inputs: EvaluationInputs,
+  evidenceToCollect: string,
+  compute: () => Verdict,
+): MulesoftFinding {
+  const primaryFailures = inputs.primary.filter((source) => source.error);
+  const secondaryFailures = (inputs.secondary ?? []).filter((source) => source.error);
+  const unreadableSources = [...primaryFailures, ...secondaryFailures].map(describeFailure);
+  const partialView = (inputs.partial ?? []).filter((note): note is string => Boolean(note));
+
+  if (primaryFailures.length > 0) {
+    return finding(
+      number,
+      "manual",
+      `Could not evaluate: ${primaryFailures.map(describeFailure).join("; ")}. ${evidenceToCollect}`,
+      { unreadable_sources: unreadableSources, partial_view: partialView },
+    );
+  }
+
+  const result = compute();
+  const evidence: JsonRecord = { ...(result.evidence ?? {}) };
+  if (unreadableSources.length > 0) evidence.unreadable_sources = unreadableSources;
+  if (partialView.length > 0) evidence.partial_view = partialView;
+
+  if (secondaryFailures.length > 0) {
+    const causes = secondaryFailures.map(describeFailure).join("; ");
+    if (result.status === "fail") {
+      return finding(number, "fail", `${result.summary} Note: ${causes}; the evidence may be incomplete.`, evidence);
+    }
+    return finding(number, "manual", `Could not confirm: ${causes}. ${evidenceToCollect} Partial evidence: ${result.summary}`, evidence);
+  }
+
+  if (partialView.length > 0) {
+    const note = `Partial view: ${partialView.join("; ")}.`;
+    if (result.status === "pass") {
+      return finding(number, "warn", `${note} ${result.summary} The unseen items were not evaluated, so the control cannot pass on this sample.`, evidence);
+    }
+    return finding(number, result.status, `${result.summary} ${note}`, evidence);
+  }
+
+  return finding(number, result.status, result.summary, evidence);
 }
 
 function finding(
@@ -1405,17 +1566,51 @@ function matchesEnvironmentFilter(environment: JsonRecord, filter: string[]): bo
     || wanted.has((asString(environment.id) ?? "").toLowerCase());
 }
 
-async function loadEnvironments(
+function hasEnvironmentType(environment: JsonRecord): boolean {
+  return asBoolean(environment.isProduction) !== undefined || asString(environment.type) !== undefined;
+}
+
+interface EnvironmentSample {
+  source: Collected<JsonRecord[]>;
+  all: JsonRecord[];
+  sampled: JsonRecord[];
+  excludedByFilter: JsonRecord[];
+  excludedByLimit: JsonRecord[];
+  partialNotes: string[];
+}
+
+function describeExcludedEnvironments(environments: JsonRecord[]): string {
+  const production = environments.filter(isProductionEnvironment).length;
+  return `${environments.length} environment(s) (${production} production): ${sample(environments.map(environmentLabel), 5).join(", ")}`;
+}
+
+async function sampleEnvironments(
   client: Pick<MulesoftApiClient, "getResolvedConfig" | "listEnvironments">,
   limit: number,
   errors: string[],
-): Promise<JsonRecord[]> {
+): Promise<EnvironmentSample> {
   const config = client.getResolvedConfig();
-  const environments = await collect("environments", [], () => client.listEnvironments(), errors);
-  return environments
-    .filter((environment) => matchesEnvironmentFilter(environment, config.environmentFilter))
-    .sort((left, right) => Number(isProductionEnvironment(right)) - Number(isProductionEnvironment(left)))
-    .slice(0, limit);
+  const source = await collect<JsonRecord[]>("environments", [], () => client.listEnvironments(), errors);
+  const all = source.value;
+  const matching = all.filter((environment) => matchesEnvironmentFilter(environment, config.environmentFilter));
+  const excludedByFilter = all.filter((environment) => !matching.includes(environment));
+  const sorted = [...matching].sort((left, right) => Number(isProductionEnvironment(right)) - Number(isProductionEnvironment(left)));
+  const sampled = sorted.slice(0, limit);
+  const excludedByLimit = sorted.slice(limit);
+  const partialNotes: string[] = [];
+  if (excludedByFilter.length > 0) {
+    partialNotes.push(`the environment filter excluded ${describeExcludedEnvironments(excludedByFilter)}`);
+  }
+  if (excludedByLimit.length > 0) {
+    partialNotes.push(`the environment limit of ${limit} excluded ${describeExcludedEnvironments(excludedByLimit)}`);
+  }
+  return { source, all, sampled, excludedByFilter, excludedByLimit, partialNotes };
+}
+
+function productionSampleNote(environments: EnvironmentSample): string {
+  const productionTotal = environments.all.filter(isProductionEnvironment).length;
+  const productionSampled = environments.sampled.filter(isProductionEnvironment).length;
+  return `${productionSampled} of ${productionTotal} production environment(s) sampled`;
 }
 
 function roleGroupName(roleGroup: JsonRecord): string {
@@ -1462,14 +1657,6 @@ function connectedAppLastUsed(app: JsonRecord): Date | undefined {
   ]));
 }
 
-function connectedAppCreatedAt(app: JsonRecord): Date | undefined {
-  return asDate(firstDefined(app, [["created_at"], ["createdAt"], ["created"]]));
-}
-
-function connectedAppHasUsageData(app: JsonRecord): boolean {
-  return connectedAppLastUsed(app) !== undefined || firstDefined(app, [["usage"], ["last_used"], ["lastUsed"]]) !== undefined;
-}
-
 function scopeName(scope: JsonRecord): string {
   return asString(scope.scope) ?? asString(scope.name) ?? "scope";
 }
@@ -1480,6 +1667,22 @@ function connectedAppScopeNames(app: JsonRecord, contextScopes: JsonRecord[]): s
 
 function isServiceConnectedApp(app: JsonRecord): boolean {
   return asStringList(app.grant_types).some((grant) => grant === "client_credentials");
+}
+
+function providerType(provider: JsonRecord): string {
+  return asString(getNestedValue(provider, ["type", "name"])) ?? asString(provider.type) ?? "unknown";
+}
+
+function providerIsDisabled(provider: JsonRecord): boolean {
+  return asBoolean(provider.enabled) === false
+    || asBoolean(provider.disabled) === true
+    || /disabled|inactive/i.test(asString(provider.status) ?? "");
+}
+
+function businessGroupScopeNote(hierarchy: JsonRecord): string | undefined {
+  return asBoolean(hierarchy.isRoot) === false
+    ? "this organization is a business group (isRoot=false), so root-level settings and sibling business groups are outside the view"
+    : undefined;
 }
 
 export async function assessMulesoftIdentityAccess(
@@ -1494,61 +1697,82 @@ export async function assessMulesoftIdentityAccess(
   const maxConnectedAppScopes = clampNumber(options.maxConnectedAppScopes, DEFAULT_MAX_CONNECTED_APP_SCOPES, 1, 500);
   const staleDays = clampNumber(options.staleConnectedAppDays, DEFAULT_STALE_CONNECTED_APP_DAYS, 1, 3650);
 
-  const organization = await collect("organization", {}, () => client.getOrganization(), errors);
-  const hierarchy = await collect("organization_hierarchy", {}, () => client.getOrganizationHierarchy(), errors);
-  const identityProviders = await collect("identity_providers", [], () => client.listIdentityProviders(), errors);
-  const identityProviderSettings = await collect("identity_provider_settings", {}, () => client.getIdentityProviderSettings(), errors);
-  const members = await collect("members", [], () => client.listMembers(userLimit), errors);
-  const mfaExemptUsers = await collect("mfa_exempt_users", [], () => client.listMfaExemptUsers(userLimit), errors);
-  const roleGroups = await collect("role_groups", [], () => client.listRoleGroups(), errors);
-  const environments = await collect("environments", [], () => client.listEnvironments(), errors);
-  const connectedApps = await collect("connected_applications", [], () => client.listConnectedApplications(), errors);
+  const organization = await collect<JsonRecord>("organization", {}, () => client.getOrganization(), errors);
+  const hierarchy = await collect<JsonRecord>("organization_hierarchy", {}, () => client.getOrganizationHierarchy(), errors);
+  const identityProviders = await collectPage("identity_providers", () => client.listIdentityProviders(), errors);
+  const identityProviderSettings = await collect<JsonRecord>("identity_provider_settings", {}, () => client.getIdentityProviderSettings(), errors);
+  const members = await collectPage("members", () => client.listMembers(userLimit), errors);
+  const mfaExemptUsers = await collectPage("mfa_exempt_users", () => client.listMfaExemptUsers(userLimit), errors);
+  const roleGroups = await collectPage("role_groups", () => client.listRoleGroups(), errors);
+  const environments = await collect<JsonRecord[]>("environments", [], () => client.listEnvironments(), errors);
+  const connectedApps = await collectPage("connected_applications", () => client.listConnectedApplications(), errors);
 
-  const roleGroupDetails: Array<{ roleGroup: JsonRecord; roles: JsonRecord[]; users: JsonRecord[] }> = [];
-  for (const roleGroup of roleGroups) {
+  const roleGroupDetails: Array<{ roleGroup: JsonRecord; roles: Collected<MulesoftPage>; users?: Collected<MulesoftPage> }> = [];
+  for (const roleGroup of roleGroups.value.items) {
     const id = roleGroupId(roleGroup);
-    if (!id) continue;
-    const roles = await collect(`role_group_roles:${roleGroupName(roleGroup)}`, [], () => client.listRoleGroupRoles(id), errors);
-    const users = isOrgAdminRoleGroup(roleGroup, roles)
-      ? await collect(`role_group_users:${roleGroupName(roleGroup)}`, [], () => client.listRoleGroupUsers(id), errors)
-      : [];
+    const name = roleGroupName(roleGroup);
+    if (!id) {
+      roleGroupDetails.push({ roleGroup, roles: { ...failedSource(`role_group_roles:${name}`, "role group has no id"), value: toPage([]) } });
+      continue;
+    }
+    const roles = await collectPage(`role_group_roles:${name}`, () => client.listRoleGroupRoles(id), errors);
+    const users = isOrgAdminRoleGroup(roleGroup, roles.value.items)
+      ? await collectPage(`role_group_users:${name}`, () => client.listRoleGroupUsers(id), errors)
+      : undefined;
     roleGroupDetails.push({ roleGroup, roles, users });
   }
+  const roleGroupRolesSource = mergeSources("role_group_roles", roleGroupDetails.map((detail) => detail.roles));
+  const adminUsersSource = mergeSources("role_group_users", roleGroupDetails.flatMap((detail) => (detail.users ? [detail.users] : [])));
 
-  const connectedAppScopes: Array<{ app: JsonRecord; scopes: JsonRecord[] }> = [];
-  for (const app of connectedApps) {
+  const connectedAppScopes: Array<{ app: JsonRecord; scopes: Collected<MulesoftPage> }> = [];
+  for (const app of connectedApps.value.items) {
     const clientId = asString(app.client_id);
+    const name = connectedAppName(app);
     const scopes = clientId
-      ? await collect(`connected_app_scopes:${connectedAppName(app)}`, [], () => client.listConnectedApplicationScopes(clientId), errors)
-      : [];
+      ? await collectPage(`connected_app_scopes:${name}`, () => client.listConnectedApplicationScopes(clientId), errors)
+      : { ...failedSource(`connected_app_scopes:${name}`, "connected app has no client_id"), value: toPage([]) };
     connectedAppScopes.push({ app, scopes });
   }
+  const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes));
 
-  const providerSummaries = identityProviders.map((provider) => ({
+  const providers = identityProviders.value.items;
+  const providerSummaries = providers.map((provider) => ({
     name: asString(provider.name) ?? asString(provider.provider_id) ?? "identity provider",
-    type: asString(getNestedValue(provider, ["type", "name"])) ?? asString(provider.type) ?? "unknown",
+    type: providerType(provider),
+    disabled: providerIsDisabled(provider),
   }));
-  const allowNewNonSsoUsers = asBoolean(identityProviderSettings.allow_new_non_sso_users);
-  const isFederated = asBoolean(organization.isFederated) === true || asBoolean(hierarchy.isFederated) === true;
+  const activeProviders = providers.filter((provider) => !providerIsDisabled(provider));
+  const allowNewNonSsoUsers = asBoolean(identityProviderSettings.value.allow_new_non_sso_users);
+  const isFederated = asBoolean(organization.value.isFederated) ?? asBoolean(hierarchy.value.isFederated);
+  const scopeNote = businessGroupScopeNote(hierarchy.value);
 
-  const adminGroups = roleGroupDetails.filter((detail) => isOrgAdminRoleGroup(detail.roleGroup, detail.roles));
+  const exemptReturned = mfaExemptUsers.value.items;
+  const exemptFlagged = exemptReturned.filter((user) => asBoolean(user.mfaVerificationExcluded) === true);
+  const exemptUnflagged = exemptReturned.filter((user) => asBoolean(user.mfaVerificationExcluded) !== true);
+
+  const roleGroupItems = roleGroups.value.items;
+  const adminGroups = roleGroupDetails.filter((detail) => isOrgAdminRoleGroup(detail.roleGroup, detail.roles.value.items));
   const adminUsers = new Map<string, string>();
   for (const detail of adminGroups) {
-    for (const user of detail.users) {
+    for (const user of detail.users?.value.items ?? []) {
       const id = asString(user.id) ?? memberLabel(user);
       adminUsers.set(id, memberLabel(user));
     }
   }
+  const adminUsersTruncated = adminGroups.some((detail) => detail.users?.value.truncated === true);
 
   const overPrivilegedGroups = roleGroupDetails
-    .filter((detail) => !isBuiltInAdminGroup(detail.roleGroup) && detail.roles.some((role) => ORG_ADMIN_ROLE_PATTERN.test(roleName(role))))
+    .filter((detail) => !isBuiltInAdminGroup(detail.roleGroup) && detail.roles.value.items.some((role) => ORG_ADMIN_ROLE_PATTERN.test(roleName(role))))
     .map((detail) => roleGroupName(detail.roleGroup));
   const broadGroups = roleGroupDetails
-    .filter((detail) => detail.roles.length > maxRolesPerGroup)
-    .map((detail) => ({ role_group: roleGroupName(detail.roleGroup), roles: detail.roles.length }));
+    .filter((detail) => detail.roles.value.items.length > maxRolesPerGroup)
+    .map((detail) => ({ role_group: roleGroupName(detail.roleGroup), roles: detail.roles.value.items.length }));
+  const truncatedRoleGroups = roleGroupDetails
+    .filter((detail) => detail.roles.value.truncated)
+    .map((detail) => roleGroupName(detail.roleGroup));
 
   const allAssignments = roleGroupDetails.flatMap((detail) =>
-    detail.roles.map((role) => ({ roleGroup: roleGroupName(detail.roleGroup), role })),
+    detail.roles.value.items.map((role) => ({ roleGroup: roleGroupName(detail.roleGroup), role })),
   );
   const environmentScopedAssignments = allAssignments.filter((item) => assignmentEnvironmentId(item.role) !== undefined);
   const orgWideEnvironmentRoles = allAssignments.filter((item) =>
@@ -1557,18 +1781,21 @@ export async function assessMulesoftIdentityAccess(
     && !ORG_ADMIN_ROLE_PATTERN.test(roleName(item.role)),
   );
 
-  const productionEnvironments = environments.filter(isProductionEnvironment);
-  const sandboxEnvironments = environments.filter((environment) => !isProductionEnvironment(environment));
-  const misclassifiedEnvironments = environments.filter((environment) => {
+  const environmentItems = environments.value;
+  const productionEnvironments = environmentItems.filter(isProductionEnvironment);
+  const sandboxEnvironments = environmentItems.filter((environment) => !isProductionEnvironment(environment));
+  const untypedEnvironments = environmentItems.filter((environment) => !hasEnvironmentType(environment));
+  const misclassifiedEnvironments = environmentItems.filter((environment) => {
     const name = environmentLabel(environment);
     const production = isProductionEnvironment(environment);
     return (PRODUCTION_NAME_PATTERN.test(name) && !production) || (NON_PRODUCTION_NAME_PATTERN.test(name) && production);
   });
 
+  const connectedAppItems = connectedApps.value.items;
   const scopedApps = connectedAppScopes.map((item) => ({
     name: connectedAppName(item.app),
     service: isServiceConnectedApp(item.app),
-    scopes: connectedAppScopeNames(item.app, item.scopes),
+    scopes: connectedAppScopeNames(item.app, item.scopes.value.items),
   }));
   const adminScoped = scopedApps.filter((item) => item.scopes.some((scope) => ADMIN_SCOPE_PATTERN.test(scope)));
   const adminScopedApps = adminScoped.filter((item) => item.service).map((item) => item.name);
@@ -1576,170 +1803,267 @@ export async function assessMulesoftIdentityAccess(
   const broadScopedApps = scopedApps
     .filter((item) => item.scopes.length > maxConnectedAppScopes)
     .map((item) => ({ app: item.name, scopes: item.scopes.length }));
+  const truncatedScopeApps = connectedAppScopes.filter((item) => item.scopes.value.truncated).map((item) => connectedAppName(item.app));
 
   const now = Date.now();
   const staleThreshold = now - staleDays * DAY_MS;
-  const appsWithUsage = connectedApps.filter(connectedAppHasUsageData);
-  const staleApps = connectedApps.filter((app) => {
-    const lastUsed = connectedAppLastUsed(app);
-    if (lastUsed) return lastUsed.getTime() < staleThreshold;
-    const created = connectedAppCreatedAt(app);
-    return connectedAppHasUsageData(app) && created !== undefined && created.getTime() < staleThreshold;
-  });
-  const disabledApps = connectedApps.filter((app) => asBoolean(app.enabled) === false);
+  const appsWithUsageDate = connectedAppItems.filter((app) => connectedAppLastUsed(app) !== undefined);
+  const appsWithoutUsageDate = connectedAppItems.filter((app) => connectedAppLastUsed(app) === undefined);
+  const staleApps = appsWithUsageDate.filter((app) => (connectedAppLastUsed(app) as Date).getTime() < staleThreshold);
+  const disabledApps = connectedAppItems.filter((app) => asBoolean(app.enabled) === false);
 
-  const subOrganizations = asRecordArray(hierarchy.subOrganizations);
-  const canCreateSubOrgs = asBoolean(getNestedValue(organization, ["entitlements", "createSubOrgs"]));
+  const subOrganizations = asRecordArray(hierarchy.value.subOrganizations);
+  const canCreateSubOrgs = asBoolean(getNestedValue(organization.value, ["entitlements", "createSubOrgs"]));
+  const isRoot = asBoolean(hierarchy.value.isRoot);
 
   const findings: MulesoftFinding[] = [
-    finding(
+    evaluate(
       1,
-      identityProviders.length === 0 ? "fail" : allowNewNonSsoUsers === true ? "warn" : "pass",
-      identityProviders.length === 0
-        ? "No external identity provider is configured; users authenticate with Anypoint Platform passwords."
-        : allowNewNonSsoUsers === true
-          ? `${identityProviders.length} external identity provider(s) configured, but new non-SSO users are still allowed.`
-          : `${identityProviders.length} external identity provider(s) configured and non-SSO user creation is not allowed.`,
-      {
-        identity_providers: providerSummaries,
-        is_federated: isFederated,
-        allow_new_non_sso_users: allowNewNonSsoUsers ?? null,
+      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote] },
+      "Export Access Management > Identity Providers (type and status) and the organization SSO settings as evidence.",
+      () => {
+        const evidence = {
+          identity_providers: providerSummaries,
+          active_identity_providers: activeProviders.length,
+          is_federated: isFederated ?? null,
+          allow_new_non_sso_users: allowNewNonSsoUsers ?? null,
+        };
+        if (providers.length === 0) {
+          return verdict("fail", "No external identity provider is configured (the identityProviders read succeeded and returned zero providers); users authenticate with Anypoint Platform passwords. Zero providers is treated as fail.", evidence);
+        }
+        if (activeProviders.length === 0) {
+          return verdict("fail", `${providers.length} identity provider(s) exist but every one is disabled, so SSO is not enforced.`, evidence);
+        }
+        if (isFederated !== true) {
+          return verdict("warn", `${activeProviders.length} active identity provider(s) configured (${activeProviders.map(providerType).join(", ")}), but the organization isFederated flag is ${isFederated === undefined ? "absent" : "false"}, so SSO enforcement cannot be confirmed from the API.`, evidence);
+        }
+        if (allowNewNonSsoUsers === undefined) {
+          return verdict("warn", `${activeProviders.length} active identity provider(s) configured and the organization is federated, but identity provider settings did not expose allow_new_non_sso_users; confirm non-SSO user creation is disabled.`, evidence);
+        }
+        if (allowNewNonSsoUsers) {
+          return verdict("warn", `${activeProviders.length} active identity provider(s) configured and the organization is federated, but new non-SSO users are still allowed.`, evidence);
+        }
+        return verdict("pass", `${activeProviders.length} active identity provider(s) configured (${activeProviders.map(providerType).join(", ")}), the organization isFederated flag is true, and non-SSO user creation is not allowed.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       2,
-      mfaExemptUsers.length > 0 ? "fail" : "manual",
-      mfaExemptUsers.length > 0
-        ? `${mfaExemptUsers.length} user(s) are excluded from MFA verification.`
-        : "No MFA-exempt users are visible. The organization-wide MFA requirement is not exposed by the Access Management API: capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.",
-      {
-        mfa_exempt_users: sample(mfaExemptUsers.map(memberLabel)),
-        members_sampled: members.length,
-        is_federated: isFederated,
+      { primary: [mfaExemptUsers], partial: [truncationNote("members", members.value)] },
+      "Capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.",
+      () => {
+        const evidence = {
+          mfa_exempt_users: sample(exemptFlagged.map(memberLabel)),
+          users_returned_without_flag: sample(exemptUnflagged.map(memberLabel)),
+          members_sampled: members.value.items.length,
+          is_federated: isFederated ?? null,
+        };
+        if (exemptFlagged.length > 0) {
+          return verdict("fail", `${exemptFlagged.length} user(s) carry mfaVerificationExcluded=true and are excluded from MFA verification.`, evidence);
+        }
+        if (exemptUnflagged.length > 0) {
+          return verdict("warn", `${exemptUnflagged.length} user(s) were returned by the mfaVerificationExcluded=true query but the response did not include the mfaVerificationExcluded flag; confirm each exemption in Access Management > Users.`, evidence);
+        }
+        return verdict("manual", "No MFA-exempt users are visible. Zero exemptions is treated as manual rather than pass because the organization-wide MFA requirement is not exposed by the Access Management API: capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.", evidence);
       },
     ),
-    finding(
+    evaluate(
       3,
-      adminGroups.length === 0 ? "warn" : adminUsers.size <= maxAdmins ? "pass" : "fail",
-      adminGroups.length === 0
-        ? "No Organization Administrator or Organization Owner role group was visible, so admin membership could not be counted."
-        : adminUsers.size <= maxAdmins
-          ? `${adminUsers.size} organization administrator(s) across ${adminGroups.length} admin role group(s), within the threshold of ${maxAdmins}.`
-          : `${adminUsers.size} organization administrator(s) exceed the threshold of ${maxAdmins}.`,
       {
-        admin_role_groups: adminGroups.map((detail) => roleGroupName(detail.roleGroup)),
-        admin_users: sample([...adminUsers.values()]),
-        max_admins: maxAdmins,
-        members_sampled: members.length,
+        primary: [roleGroups, roleGroupRolesSource, adminUsersSource],
+        partial: [
+          truncationNote("role groups", roleGroups.value),
+          adminUsersTruncated ? `admin role group membership truncated at ${adminUsers.size} users` : undefined,
+        ],
+      },
+      "Export Access Management > Users filtered by the Organization Administrator permission and record the member count.",
+      () => {
+        const evidence = {
+          admin_role_groups: adminGroups.map((detail) => roleGroupName(detail.roleGroup)),
+          admin_users: sample([...adminUsers.values()]),
+          admin_user_count: adminUsers.size,
+          max_admins: maxAdmins,
+          members_sampled: members.value.items.length,
+        };
+        if (roleGroupItems.length === 0) {
+          return verdict("manual", "Zero role groups were returned even though the read succeeded; every organization has a built-in Organization Administrators group, so the credential sees a scoped-down view. Zero role groups is treated as manual.", evidence);
+        }
+        if (adminGroups.length === 0) {
+          return verdict("manual", `No Organization Administrator or Organization Owner role group was visible among ${roleGroupItems.length} role group(s), so admin membership could not be counted. Treated as manual.`, evidence);
+        }
+        if (adminUsers.size > maxAdmins) {
+          return verdict("fail", `${adminUsers.size} organization administrator(s) exceed the threshold of ${maxAdmins}.`, evidence);
+        }
+        return verdict("pass", `${adminUsers.size} organization administrator(s) across ${adminGroups.length} admin role group(s), within the threshold of ${maxAdmins}.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       4,
-      roleGroups.length === 0 ? "warn" : overPrivilegedGroups.length > 0 ? "fail" : broadGroups.length > 0 ? "warn" : "pass",
-      roleGroups.length === 0
-        ? "No role groups were visible."
-        : overPrivilegedGroups.length > 0
-          ? `${overPrivilegedGroups.length} custom role group(s) grant Organization Administrator or Organization Owner roles.`
-          : broadGroups.length > 0
-            ? `${broadGroups.length} role group(s) carry more than ${maxRolesPerGroup} role assignments.`
-            : `${roleGroups.length} role group(s) reviewed with no organization-wide admin grants outside the built-in administrators group.`,
       {
-        role_groups: roleGroups.length,
-        over_privileged_groups: sample(overPrivilegedGroups),
-        broad_groups: sample(broadGroups),
-        max_roles_per_group: maxRolesPerGroup,
+        primary: [roleGroups, roleGroupRolesSource],
+        partial: [
+          truncationNote("role groups", roleGroups.value),
+          truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
+        ],
+      },
+      "Export each role group and its permissions from Access Management > Role Groups.",
+      () => {
+        const evidence = {
+          role_groups: roleGroupItems.length,
+          over_privileged_groups: sample(overPrivilegedGroups),
+          broad_groups: sample(broadGroups),
+          max_roles_per_group: maxRolesPerGroup,
+        };
+        if (roleGroupItems.length === 0) {
+          return verdict("manual", "Zero role groups were returned even though the read succeeded, which indicates a scoped-down credential. Zero role groups is treated as manual.", evidence);
+        }
+        if (overPrivilegedGroups.length > 0) {
+          return verdict("fail", `${overPrivilegedGroups.length} custom role group(s) grant Organization Administrator or Organization Owner roles.`, evidence);
+        }
+        if (broadGroups.length > 0) {
+          return verdict("warn", `${broadGroups.length} role group(s) carry more than ${maxRolesPerGroup} role assignments.`, evidence);
+        }
+        return verdict("pass", `${roleGroupItems.length} role group(s) reviewed with no organization-wide admin grants outside the built-in administrators group.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       5,
-      orgWideEnvironmentRoles.length === 0 ? "pass" : orgWideEnvironmentRoles.length <= MAX_ORG_WIDE_ENVIRONMENT_ROLES ? "warn" : "fail",
-      orgWideEnvironmentRoles.length === 0
-        ? `${environmentScopedAssignments.length} environment role assignment(s) are scoped to specific environments.`
-        : `${orgWideEnvironmentRoles.length} environment-level role assignment(s) apply to all environments instead of a specific environment.`,
       {
-        environment_scoped_assignments: environmentScopedAssignments.length,
-        org_wide_environment_roles: sample(orgWideEnvironmentRoles.map((item) => `${item.roleGroup}: ${roleName(item.role)}`)),
+        primary: [roleGroups, roleGroupRolesSource],
+        partial: [
+          truncationNote("role groups", roleGroups.value),
+          truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
+        ],
+      },
+      "Export environment permissions per user from Access Management > Users > Permissions and confirm each grant names a specific environment.",
+      () => {
+        const evidence = {
+          role_groups: roleGroupItems.length,
+          environment_scoped_assignments: environmentScopedAssignments.length,
+          org_wide_environment_roles: sample(orgWideEnvironmentRoles.map((item) => `${item.roleGroup}: ${roleName(item.role)}`)),
+        };
+        if (roleGroupItems.length === 0) {
+          return verdict("manual", "Zero role groups were returned even though the read succeeded, so environment scoping could not be evaluated. Zero role groups is treated as manual.", evidence);
+        }
+        if (orgWideEnvironmentRoles.length > MAX_ORG_WIDE_ENVIRONMENT_ROLES) {
+          return verdict("fail", `${orgWideEnvironmentRoles.length} environment-level role assignment(s) apply to all environments instead of a specific environment.`, evidence);
+        }
+        if (orgWideEnvironmentRoles.length > 0) {
+          return verdict("warn", `${orgWideEnvironmentRoles.length} environment-level role assignment(s) apply to all environments instead of a specific environment.`, evidence);
+        }
+        if (environmentScopedAssignments.length === 0) {
+          return verdict("manual", `No environment-level role assignments were found in ${roleGroupItems.length} role group(s), so environment permissions are either granted directly to users or absent; neither is visible through role groups. Zero assignments is treated as manual.`, evidence);
+        }
+        return verdict("pass", `${environmentScopedAssignments.length} environment role assignment(s) are scoped to specific environments and none apply organization-wide.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       6,
-      misclassifiedEnvironments.length > 0
-        ? "fail"
-        : productionEnvironments.length === 0 || sandboxEnvironments.length === 0
-          ? "warn"
-          : "pass",
-      misclassifiedEnvironments.length > 0
-        ? `${misclassifiedEnvironments.length} environment(s) have names that contradict their production or sandbox type.`
-        : productionEnvironments.length === 0 || sandboxEnvironments.length === 0
-          ? `Only ${productionEnvironments.length} production and ${sandboxEnvironments.length} sandbox environment(s) exist, so production workloads may share an environment with development.`
-          : `${productionEnvironments.length} production and ${sandboxEnvironments.length} sandbox environment(s) are typed separately.`,
-      {
-        production_environments: sample(productionEnvironments.map(environmentLabel)),
-        sandbox_environments: sample(sandboxEnvironments.map(environmentLabel)),
-        misclassified_environments: sample(misclassifiedEnvironments.map(environmentLabel)),
+      { primary: [environments] },
+      "Export Access Management > Environments with each environment's type and confirm production workloads do not share a sandbox environment.",
+      () => {
+        const evidence = {
+          production_environments: sample(productionEnvironments.map(environmentLabel)),
+          sandbox_environments: sample(sandboxEnvironments.map(environmentLabel)),
+          misclassified_environments: sample(misclassifiedEnvironments.map(environmentLabel)),
+          untyped_environments: sample(untypedEnvironments.map(environmentLabel)),
+        };
+        if (environmentItems.length === 0) {
+          return verdict("manual", "Zero environments were returned even though the read succeeded; every organization has at least a Sandbox and Design environment, so the credential sees a scoped-down view. Zero environments is treated as manual.", evidence);
+        }
+        if (misclassifiedEnvironments.length > 0) {
+          return verdict("fail", `${misclassifiedEnvironments.length} environment(s) have names that contradict their production or sandbox type.`, evidence);
+        }
+        if (untypedEnvironments.length > 0) {
+          return verdict("warn", `${untypedEnvironments.length} environment(s) did not expose an isProduction or type flag, so their classification cannot be confirmed.`, evidence);
+        }
+        if (productionEnvironments.length === 0 || sandboxEnvironments.length === 0) {
+          return verdict("warn", `Only ${productionEnvironments.length} production and ${sandboxEnvironments.length} sandbox environment(s) exist, so production workloads may share an environment with development.`, evidence);
+        }
+        return verdict("pass", `${productionEnvironments.length} production and ${sandboxEnvironments.length} sandbox environment(s) are typed separately.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       18,
-      connectedApps.length === 0
-        ? "pass"
-        : adminScopedApps.length > 0
-          ? "fail"
-          : adminScopedDelegatedApps.length > 0 || broadScopedApps.length > 0
-            ? "warn"
-            : "pass",
-      connectedApps.length === 0
-        ? "No connected apps are registered in this organization."
-        : adminScopedApps.length > 0
-          ? `${adminScopedApps.length} client credentials connected app(s) hold administrative or full-access scopes.`
-          : adminScopedDelegatedApps.length > 0
-            ? `${adminScopedDelegatedApps.length} user-delegated connected app(s) request the full or administrative scope; confirm each one needs the acting user's complete permissions.`
-            : broadScopedApps.length > 0
-              ? `${broadScopedApps.length} connected app(s) hold more than ${maxConnectedAppScopes} scopes.`
-              : `${connectedApps.length} connected app(s) reviewed with no administrative scopes.`,
       {
-        connected_apps: connectedApps.length,
-        service_apps: scopedApps.filter((item) => item.service).length,
-        admin_scoped_apps: sample(adminScopedApps),
-        admin_scoped_delegated_apps: sample(adminScopedDelegatedApps),
-        broad_scoped_apps: sample(broadScopedApps),
-        max_connected_app_scopes: maxConnectedAppScopes,
+        primary: [connectedApps, scopesSource],
+        partial: [
+          truncationNote("connected apps", connectedApps.value),
+          truncatedScopeApps.length > 0 ? `scope lists truncated for ${truncatedScopeApps.join(", ")}` : undefined,
+        ],
+      },
+      "Export Access Management > Connected Apps with each app's scopes and grant type.",
+      () => {
+        const evidence = {
+          connected_apps: connectedAppItems.length,
+          service_apps: scopedApps.filter((item) => item.service).length,
+          admin_scoped_apps: sample(adminScopedApps),
+          admin_scoped_delegated_apps: sample(adminScopedDelegatedApps),
+          broad_scoped_apps: sample(broadScopedApps),
+          max_connected_app_scopes: maxConnectedAppScopes,
+        };
+        if (connectedAppItems.length === 0) {
+          return verdict("manual", "Zero connected apps were returned for this organization. Zero apps is treated as manual rather than pass: confirm in Access Management > Connected Apps that no apps exist in child business groups either.", evidence);
+        }
+        if (adminScopedApps.length > 0) {
+          return verdict("fail", `${adminScopedApps.length} client credentials connected app(s) hold administrative or full-access scopes.`, evidence);
+        }
+        if (adminScopedDelegatedApps.length > 0) {
+          return verdict("warn", `${adminScopedDelegatedApps.length} user-delegated connected app(s) request the full or administrative scope; confirm each one needs the acting user's complete permissions.`, evidence);
+        }
+        if (broadScopedApps.length > 0) {
+          return verdict("warn", `${broadScopedApps.length} connected app(s) hold more than ${maxConnectedAppScopes} scopes.`, evidence);
+        }
+        return verdict("pass", `${connectedAppItems.length} connected app(s) reviewed with scopes read for every app and no administrative scopes.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       19,
-      connectedApps.length === 0
-        ? "pass"
-        : staleApps.length > 0 || disabledApps.length > 0
-          ? "warn"
-          : appsWithUsage.length === 0
-            ? "manual"
-            : "pass",
-      connectedApps.length === 0
-        ? "No connected apps are registered in this organization."
-        : staleApps.length > 0 || disabledApps.length > 0
-          ? `${staleApps.length} connected app(s) unused for more than ${staleDays} days and ${disabledApps.length} disabled app(s) should be reviewed for removal.`
-          : appsWithUsage.length === 0
-            ? "The API did not return usage data for connected apps. Export the connected apps list with last-used timestamps from Access Management > Connected Apps and confirm each app is still required."
-            : `${connectedApps.length} connected app(s) show activity within the last ${staleDays} days.`,
-      {
-        connected_apps: connectedApps.length,
-        apps_with_usage_data: appsWithUsage.length,
-        stale_apps: sample(staleApps.map(connectedAppName)),
-        disabled_apps: sample(disabledApps.map(connectedAppName)),
-        stale_days: staleDays,
+      { primary: [connectedApps], partial: [truncationNote("connected apps", connectedApps.value)] },
+      "Export the connected apps list with last-used timestamps from Access Management > Connected Apps and confirm each app is still required.",
+      () => {
+        const evidence = {
+          connected_apps: connectedAppItems.length,
+          apps_with_usage_data: appsWithUsageDate.length,
+          apps_without_usage_date: sample(appsWithoutUsageDate.map(connectedAppName)),
+          stale_apps: sample(staleApps.map(connectedAppName)),
+          disabled_apps: sample(disabledApps.map(connectedAppName)),
+          stale_days: staleDays,
+        };
+        if (connectedAppItems.length === 0) {
+          return verdict("manual", "Zero connected apps were returned for this organization. Zero apps is treated as manual rather than pass: confirm in Access Management > Connected Apps that no apps exist in child business groups either.", evidence);
+        }
+        if (staleApps.length > 0 || disabledApps.length > 0) {
+          return verdict("warn", `${staleApps.length} connected app(s) unused for more than ${staleDays} days and ${disabledApps.length} disabled app(s) should be reviewed for removal.`, evidence);
+        }
+        if (appsWithoutUsageDate.length > 0) {
+          return verdict("warn", `${appsWithoutUsageDate.length} of ${connectedAppItems.length} connected app(s) have no last-used timestamp and are not counted as active; review them manually.`, evidence);
+        }
+        return verdict("pass", `All ${connectedAppItems.length} connected app(s) have a last-used timestamp within the last ${staleDays} days.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       25,
-      subOrganizations.length > 0 ? "pass" : "manual",
-      subOrganizations.length > 0
-        ? `${subOrganizations.length} business group(s) separate teams or tenants under the root organization.`
-        : "No business groups exist. Confirm whether multiple business units or tenants share this organization; if they do, create business groups so ownership, environments, and permissions are isolated.",
-      {
-        sub_organizations: sample(subOrganizations.map((item) => asString(item.name) ?? asString(item.id) ?? "business group")),
-        can_create_sub_orgs: canCreateSubOrgs ?? null,
-        is_root: asBoolean(hierarchy.isRoot) ?? null,
+      { primary: [hierarchy], secondary: [organization] },
+      "Export the business group hierarchy from Access Management > Business Groups and confirm tenants or business units map to separate business groups.",
+      () => {
+        const evidence = {
+          sub_organizations: sample(subOrganizations.map((item) => asString(item.name) ?? asString(item.id) ?? "business group")),
+          can_create_sub_orgs: canCreateSubOrgs ?? null,
+          is_root: isRoot ?? null,
+        };
+        if (isRoot === false) {
+          return verdict("manual", "This organization is a business group (isRoot=false), so only its own children are visible and the tenant structure of the root organization is scoped out. Inspect the root organization hierarchy.", evidence);
+        }
+        if (subOrganizations.length === 0) {
+          if (canCreateSubOrgs === false) {
+            return verdict("manual", "No business groups exist and the createSubOrgs entitlement is false, so business groups are not available on this plan (not applicable). Confirm tenants are separated through separate organizations or environments.", evidence);
+          }
+          return verdict("manual", "No business groups exist. Confirm whether multiple business units or tenants share this organization; if they do, create business groups so ownership, environments, and permissions are isolated.", evidence);
+        }
+        if (canCreateSubOrgs === undefined) {
+          return verdict("warn", `${subOrganizations.length} business group(s) exist but the organization did not expose the entitlements.createSubOrgs flag; confirm business group entitlement in Access Management > Organization.`, evidence);
+        }
+        return verdict("pass", `${subOrganizations.length} business group(s) separate teams or tenants under the root organization (createSubOrgs entitlement ${canCreateSubOrgs}).`, evidence);
       },
     ),
   ];
@@ -1749,31 +2073,34 @@ export async function assessMulesoftIdentityAccess(
     title: "MuleSoft identity and access posture",
     summary: {
       organization_id: config.organizationId,
-      identity_providers: identityProviders.length,
-      members_sampled: members.length,
-      mfa_exempt_users: mfaExemptUsers.length,
+      identity_providers: providers.length,
+      members_sampled: members.value.items.length,
+      members_truncated: members.value.truncated,
+      mfa_exempt_users: exemptFlagged.length,
       organization_admins: adminUsers.size,
-      role_groups: roleGroups.length,
-      environments: environments.length,
-      connected_apps: connectedApps.length,
+      role_groups: roleGroupItems.length,
+      environments: environmentItems.length,
+      connected_apps: connectedAppItems.length,
       stale_connected_apps: staleApps.length,
       business_groups: subOrganizations.length,
+      unreadable_sources: errors.length,
     },
     findings,
     snapshots: {
-      organization: redactSnapshot(organization),
-      organization_hierarchy: redactSnapshot(hierarchy),
-      identity_providers: redactSnapshot(identityProviders),
-      identity_provider_settings: redactSnapshot(identityProviderSettings),
-      members: redactSnapshot(members),
-      mfa_exempt_users: redactSnapshot(mfaExemptUsers),
+      organization: redactSnapshot(organization.value),
+      organization_hierarchy: redactSnapshot(hierarchy.value),
+      identity_providers: redactSnapshot(providers),
+      identity_provider_settings: redactSnapshot(identityProviderSettings.value),
+      members: redactSnapshot(members.value.items),
+      mfa_exempt_users: redactSnapshot(exemptReturned),
       role_groups: redactSnapshot(roleGroupDetails.map((detail) => ({
         role_group: detail.roleGroup,
-        roles: detail.roles,
-        users: detail.users,
+        roles: detail.roles.value.items,
+        roles_truncated: detail.roles.value.truncated,
+        users: detail.users?.value.items ?? [],
       }))),
-      environments: redactSnapshot(environments),
-      connected_applications: redactSnapshot(connectedAppScopes.map((item) => ({ ...item.app, scopes: item.scopes }))),
+      environments: redactSnapshot(environmentItems),
+      connected_applications: redactSnapshot(connectedAppScopes.map((item) => ({ ...item.app, scopes: item.scopes.value.items }))),
     },
     errors,
   };
@@ -1788,14 +2115,74 @@ function policyAssetId(policy: JsonRecord): string {
   ])) ?? "policy";
 }
 
-function isActivePolicy(policy: JsonRecord): boolean {
-  return asBoolean(policy.disabled) !== true;
+type PolicyState = "enabled" | "disabled" | "unknown";
+type PolicyCoverage = "enforced" | "unknown_state" | "missing";
+
+function policyState(policy: JsonRecord): PolicyState {
+  const disabled = asBoolean(policy.disabled);
+  if (disabled === true) return "disabled";
+  if (disabled === false) return "enabled";
+  return "unknown";
+}
+
+function policyCoverage(policies: JsonRecord[], pattern: RegExp): PolicyCoverage {
+  const matching = policies.filter((policy) => pattern.test(policyAssetId(policy)));
+  if (matching.some((policy) => policyState(policy) === "enabled")) return "enforced";
+  if (matching.some((policy) => policyState(policy) === "unknown")) return "unknown_state";
+  return "missing";
 }
 
 function apiLabel(api: JsonRecord): string {
   const name = asString(api.assetName) ?? asString(api.assetId) ?? asString(api.autodiscoveryInstanceName) ?? asString(api.id) ?? "api";
   const label = asString(api.instanceLabel);
   return label ? `${name} (${label})` : name;
+}
+
+interface ApiRecord {
+  environment: JsonRecord;
+  api: JsonRecord;
+  policies: Collected<JsonRecord[]>;
+}
+
+function policyCoverageVerdict(
+  records: ApiRecord[],
+  environments: EnvironmentSample,
+  pattern: RegExp,
+  policyDescription: string,
+  describeApis: (records: ApiRecord[]) => string[],
+  evidenceKeyPrefix: string,
+): Verdict {
+  const production = records.filter((record) => isProductionEnvironment(record.environment));
+  const nonProduction = records.filter((record) => !isProductionEnvironment(record.environment));
+  const coverage = (record: ApiRecord) => policyCoverage(record.policies.value, pattern);
+  const productionMissing = production.filter((record) => coverage(record) === "missing");
+  const productionUnknown = production.filter((record) => coverage(record) === "unknown_state");
+  const nonProductionMissing = nonProduction.filter((record) => coverage(record) === "missing");
+  const evidence: JsonRecord = {
+    apis_sampled: records.length,
+    production_apis: production.length,
+    production_environments_sampled: productionSampleNote(environments),
+    [`production_without_${evidenceKeyPrefix}`]: describeApis(productionMissing),
+    [`production_${evidenceKeyPrefix}_unknown_state`]: describeApis(productionUnknown),
+    [`non_production_without_${evidenceKeyPrefix}`]: describeApis(nonProductionMissing),
+  };
+
+  if (records.length === 0) {
+    return verdict("manual", `Zero managed API instances were visible in ${environments.sampled.length} sampled environment(s) (${productionSampleNote(environments)}). Zero instances cannot pass a policy-coverage control and is treated as manual: confirm in API Manager whether any APIs are managed.`, evidence);
+  }
+  if (productionMissing.length > 0) {
+    return verdict("fail", `${productionMissing.length}/${production.length} production API instance(s) have no ${policyDescription}.`, evidence);
+  }
+  if (production.length === 0) {
+    return verdict("manual", `${records.length} API instance(s) were sampled but none belong to a production environment (${productionSampleNote(environments)}), so production coverage cannot be asserted. Treated as manual.`, evidence);
+  }
+  if (productionUnknown.length > 0) {
+    return verdict("warn", `${productionUnknown.length}/${production.length} production API instance(s) carry a matching ${policyDescription} whose disabled flag was not returned, so its enabled state is unknown.`, evidence);
+  }
+  if (nonProductionMissing.length > 0) {
+    return verdict("warn", `All ${production.length} production API instance(s) enforce an enabled ${policyDescription}, but ${nonProductionMissing.length} non-production instance(s) do not.`, evidence);
+  }
+  return verdict("pass", `All ${records.length} sampled API instance(s) enforce an enabled ${policyDescription} (disabled=false confirmed on each).`, evidence);
 }
 
 export async function assessMulesoftApiGateway(
@@ -1807,37 +2194,46 @@ export async function assessMulesoftApiGateway(
   const environmentLimit = clampNumber(options.environmentLimit, DEFAULT_ENVIRONMENT_LIMIT, 1, 100);
   const apiLimit = clampNumber(options.apiLimit, DEFAULT_API_LIMIT, 1, 2000);
 
-  const environments = await loadEnvironments(client, environmentLimit, errors);
-  const apiRecords: Array<{ environment: JsonRecord; api: JsonRecord; policies: JsonRecord[] }> = [];
-  for (const environment of environments) {
+  const environments = await sampleEnvironments(client, environmentLimit, errors);
+  const apiSources: Array<Collected<MulesoftPage>> = [];
+  const apiRecords: ApiRecord[] = [];
+  const apiPartialNotes: string[] = [];
+  for (const environment of environments.sampled) {
     const environmentId = asString(environment.id);
-    if (!environmentId || apiRecords.length >= apiLimit) continue;
-    const apis = await collect(`managed_apis:${environmentLabel(environment)}`, [], () => client.listManagedApis(environmentId, apiLimit - apiRecords.length), errors);
-    for (const api of apis) {
-      if (apiRecords.length >= apiLimit) break;
+    const label = environmentLabel(environment);
+    if (!environmentId) {
+      apiSources.push({ ...failedSource(`managed_apis:${label}`, "environment has no id"), value: toPage([]) });
+      continue;
+    }
+    const remaining = apiLimit - apiRecords.length;
+    if (remaining <= 0) {
+      apiPartialNotes.push(`the API limit of ${apiLimit} was reached before sampling ${label}`);
+      continue;
+    }
+    const apis = await collectPage(`managed_apis:${label}`, () => client.listManagedApis(environmentId, remaining), errors);
+    apiSources.push(apis);
+    const note = truncationNote(`${label} API instance`, apis.value);
+    if (note) apiPartialNotes.push(note);
+    for (const api of apis.value.items) {
       const apiId = asString(api.id);
-      const policies = apiId
-        ? await collect(`api_policies:${apiLabel(api)}`, [], () => client.listApiPolicies(environmentId, apiId), errors)
-        : [];
+      const policies: Collected<JsonRecord[]> = apiId
+        ? await collect<JsonRecord[]>(`api_policies:${apiLabel(api)}`, [], () => client.listApiPolicies(environmentId, apiId), errors)
+        : { label: `api_policies:${apiLabel(api)}`, value: [], error: "API instance has no id" };
       apiRecords.push({ environment, api, policies });
     }
   }
+  const apisSource = mergeSources("managed_apis", apiSources);
+  const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies));
 
-  const exchangeAssets = await collect("exchange_assets", [], () => client.listExchangeAssets(), errors);
-  const organizationAssets = exchangeAssets.filter((asset) => {
+  const exchangeAssets = await collectPage("exchange_assets", () => client.listExchangeAssets(), errors);
+  const organizationAssets = exchangeAssets.value.items.filter((asset) => {
     const owner = asString(asset.organizationId);
     return owner === undefined || owner === config.organizationId;
   });
 
   const productionApis = apiRecords.filter((record) => isProductionEnvironment(record.environment));
-  const nonProductionApis = apiRecords.filter((record) => !isProductionEnvironment(record.environment));
-  const lacksPolicy = (pattern: RegExp) => (record: { policies: JsonRecord[] }) =>
-    !record.policies.some((policy) => isActivePolicy(policy) && pattern.test(policyAssetId(policy)));
-
-  const productionWithoutAuth = productionApis.filter(lacksPolicy(AUTHENTICATION_POLICY_PATTERN));
-  const nonProductionWithoutAuth = nonProductionApis.filter(lacksPolicy(AUTHENTICATION_POLICY_PATTERN));
-  const productionWithoutRateLimit = productionApis.filter(lacksPolicy(RATE_LIMIT_POLICY_PATTERN));
-  const nonProductionWithoutRateLimit = nonProductionApis.filter(lacksPolicy(RATE_LIMIT_POLICY_PATTERN));
+  const productionWithoutAuth = productionApis.filter((record) => policyCoverage(record.policies.value, AUTHENTICATION_POLICY_PATTERN) === "missing");
+  const productionWithoutRateLimit = productionApis.filter((record) => policyCoverage(record.policies.value, RATE_LIMIT_POLICY_PATTERN) === "missing");
   const activeContracts = apiRecords.reduce((total, record) => total + (asNumber(record.api.activeContractsCount) ?? 0), 0);
 
   const publicAssets = organizationAssets.filter((asset) => asBoolean(asset.isPublic) === true);
@@ -1850,75 +2246,70 @@ export async function assessMulesoftApiGateway(
     assetTypeCounts[type] = (assetTypeCounts[type] ?? 0) + 1;
   }
 
-  const describeApis = (records: Array<{ environment: JsonRecord; api: JsonRecord }>) =>
+  const describeApis = (records: ApiRecord[]) =>
     sample(records.map((record) => `${environmentLabel(record.environment)}: ${apiLabel(record.api)}`));
+  const gatewayInputs: EvaluationInputs = {
+    primary: [environments.source, apisSource, policiesSource],
+    partial: [...environments.partialNotes, ...apiPartialNotes],
+  };
 
   const findings: MulesoftFinding[] = [
-    finding(
+    evaluate(
       7,
-      apiRecords.length === 0
-        ? "warn"
-        : productionWithoutAuth.length > 0
-          ? "fail"
-          : nonProductionWithoutAuth.length > 0
-            ? "warn"
-            : "pass",
-      apiRecords.length === 0
-        ? "No managed API instances were visible in the sampled environments."
-        : productionWithoutAuth.length > 0
-          ? `${productionWithoutAuth.length}/${productionApis.length} production API instance(s) have no active authentication policy (client ID enforcement, JWT, OAuth, basic auth, SAML, or TLS).`
-          : nonProductionWithoutAuth.length > 0
-            ? `All ${productionApis.length} production API instance(s) enforce authentication, but ${nonProductionWithoutAuth.length} non-production instance(s) do not.`
-            : `All ${apiRecords.length} sampled API instance(s) enforce an authentication policy.`,
-      {
-        apis_sampled: apiRecords.length,
-        production_apis: productionApis.length,
-        production_without_authentication: describeApis(productionWithoutAuth),
-        non_production_without_authentication: describeApis(nonProductionWithoutAuth),
-      },
+      gatewayInputs,
+      "Export each production API instance's applied policies from API Manager > API Administration > Policies.",
+      () => policyCoverageVerdict(
+        apiRecords,
+        environments,
+        AUTHENTICATION_POLICY_PATTERN,
+        "authentication policy (client ID enforcement, JWT, OAuth, basic auth, SAML, or TLS)",
+        describeApis,
+        "authentication",
+      ),
     ),
-    finding(
+    evaluate(
       8,
-      apiRecords.length === 0
-        ? "warn"
-        : productionWithoutRateLimit.length > 0
-          ? "fail"
-          : nonProductionWithoutRateLimit.length > 0
-            ? "warn"
-            : "pass",
-      apiRecords.length === 0
-        ? "No managed API instances were visible in the sampled environments."
-        : productionWithoutRateLimit.length > 0
-          ? `${productionWithoutRateLimit.length}/${productionApis.length} production API instance(s) have no active rate limiting or spike control policy.`
-          : nonProductionWithoutRateLimit.length > 0
-            ? `All production API instances are rate limited, but ${nonProductionWithoutRateLimit.length} non-production instance(s) are not.`
-            : `All ${apiRecords.length} sampled API instance(s) apply rate limiting or spike control.`,
-      {
-        apis_sampled: apiRecords.length,
-        production_without_rate_limiting: describeApis(productionWithoutRateLimit),
-        non_production_without_rate_limiting: describeApis(nonProductionWithoutRateLimit),
-      },
+      gatewayInputs,
+      "Export each production API instance's applied policies from API Manager > API Administration > Policies and confirm a rate limiting or spike control policy is enabled.",
+      () => policyCoverageVerdict(
+        apiRecords,
+        environments,
+        RATE_LIMIT_POLICY_PATTERN,
+        "rate limiting or spike control policy",
+        describeApis,
+        "rate_limiting",
+      ),
     ),
     finding(
       9,
       "manual",
-      `Anypoint Platform does not expose client secret rotation timestamps. Export the ${activeContracts} active contract(s) from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`,
+      apisSource.error || environments.source.error
+        ? `Anypoint Platform does not expose client secret rotation timestamps, and the API inventory could not be read (${(apisSource.error ?? environments.source.error) as string}). Export the active contracts from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`
+        : `Anypoint Platform does not expose client secret rotation timestamps. Export the ${activeContracts} active contract(s) from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`,
       {
-        active_contracts: activeContracts,
+        active_contracts: apisSource.error ? null : activeContracts,
         apis_sampled: apiRecords.length,
+        partial_view: [...environments.partialNotes, ...apiPartialNotes],
       },
     ),
-    finding(
+    evaluate(
       20,
-      publicAssets.length > 0 ? "warn" : "manual",
-      publicAssets.length > 0
-        ? `${publicAssets.length}/${organizationAssets.length} Exchange asset(s) are published to the public portal; confirm each public asset passed governance review.`
-        : `${organizationAssets.length} Exchange asset(s) inventoried. Exchange does not expose review approvals: export the API Governance conformance report and the publishing settings that require review before publication.`,
-      {
-        assets: organizationAssets.length,
-        public_assets: sample(publicAssets.map((asset) => asString(asset.name) ?? asString(asset.assetId) ?? "asset")),
-        status_counts: assetStatusCounts,
-        type_counts: assetTypeCounts,
+      { primary: [exchangeAssets], partial: [truncationNote("Exchange asset", exchangeAssets.value)] },
+      "Export the API Governance conformance report and the Exchange publishing settings that require review before publication.",
+      () => {
+        const evidence = {
+          assets: organizationAssets.length,
+          public_assets: sample(publicAssets.map((asset) => asString(asset.name) ?? asString(asset.assetId) ?? "asset")),
+          status_counts: assetStatusCounts,
+          type_counts: assetTypeCounts,
+        };
+        if (organizationAssets.length === 0) {
+          return verdict("manual", "Zero Exchange assets were visible for this organization. Zero assets is treated as manual: confirm in Exchange whether assets exist under this organization or its business groups, since Exchange Viewer may be granted per business group.", evidence);
+        }
+        if (publicAssets.length > 0) {
+          return verdict("warn", `${publicAssets.length}/${organizationAssets.length} Exchange asset(s) are published to the public portal; confirm each public asset passed governance review.`, evidence);
+        }
+        return verdict("manual", `${organizationAssets.length} Exchange asset(s) inventoried and none are public. Exchange does not expose review approvals: export the API Governance conformance report and the publishing settings that require review before publication.`, evidence);
       },
     ),
   ];
@@ -1928,7 +2319,8 @@ export async function assessMulesoftApiGateway(
     title: "MuleSoft API gateway and Exchange posture",
     summary: {
       organization_id: config.organizationId,
-      environments_sampled: environments.length,
+      environments_visible: environments.all.length,
+      environments_sampled: environments.sampled.length,
       apis_sampled: apiRecords.length,
       production_apis: productionApis.length,
       production_without_authentication: productionWithoutAuth.length,
@@ -1936,6 +2328,8 @@ export async function assessMulesoftApiGateway(
       active_contracts: activeContracts,
       exchange_assets: organizationAssets.length,
       public_exchange_assets: publicAssets.length,
+      partial_view: [...environments.partialNotes, ...apiPartialNotes],
+      unreadable_sources: errors.length,
     },
     findings,
     snapshots: {
@@ -1943,7 +2337,8 @@ export async function assessMulesoftApiGateway(
         environment: environmentLabel(record.environment),
         environment_id: asString(record.environment.id),
         api: record.api,
-        policies: record.policies,
+        policies: record.policies.value,
+        policies_error: record.policies.error ?? null,
       }))),
       exchange_assets: redactSnapshot(organizationAssets),
     },
@@ -2069,50 +2464,93 @@ export async function assessMulesoftRuntimeInfrastructure(
   const certificateWarningDays = clampNumber(options.certificateWarningDays, DEFAULT_CERTIFICATE_WARNING_DAYS, DEFAULT_CERTIFICATE_FAIL_DAYS, 3650);
   const now = Date.now();
 
-  const environments = await loadEnvironments(client, environmentLimit, errors);
+  const environments = await sampleEnvironments(client, environmentLimit, errors);
+  const applicationSources: Array<Collected<JsonRecord[]>> = [];
+  const serverSources: Array<Collected<JsonRecord[]>> = [];
+  const mqRegionSources: Array<Collected<JsonRecord[]>> = [];
+  const mqQueueSources: Array<Collected<JsonRecord[]>> = [];
+  const mqClientSources: Array<Collected<JsonRecord[]>> = [];
+  const secretGroupSources: Array<Collected<JsonRecord[]>> = [];
   const applications: Array<{ environment: JsonRecord; application: JsonRecord }> = [];
   const servers: Array<{ environment: JsonRecord; server: JsonRecord }> = [];
   const mqInventory: Array<{ environment: string; region: string; queues: JsonRecord[] }> = [];
   const mqClients: Array<{ environment: string; clients: JsonRecord[] }> = [];
   const secretGroupsByEnvironment: Array<{ environment: JsonRecord; secretGroups: JsonRecord[] }> = [];
+  let applicationsDropped = 0;
 
-  for (const environment of environments) {
+  for (const environment of environments.sampled) {
     const environmentId = asString(environment.id);
-    if (!environmentId) continue;
     const label = environmentLabel(environment);
-    const environmentApplications = await collect(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
-    for (const application of environmentApplications) {
-      if (applications.length >= applicationLimit) break;
+    if (!environmentId) {
+      applicationSources.push({ label: `cloudhub_applications:${label}`, value: [], error: "environment has no id" });
+      continue;
+    }
+    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
+    applicationSources.push(environmentApplications);
+    for (const application of environmentApplications.value) {
+      if (applications.length >= applicationLimit) {
+        applicationsDropped += 1;
+        continue;
+      }
       applications.push({ environment, application });
     }
-    const environmentServers = await collect(`hybrid_servers:${label}`, [], () => client.listHybridServers(environmentId), errors);
-    servers.push(...environmentServers.map((server) => ({ environment, server })));
 
-    const regions = await collect(`mq_regions:${label}`, [], () => client.listMqRegions(environmentId), errors);
-    for (const region of regions) {
+    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers:${label}`, [], () => client.listHybridServers(environmentId), errors);
+    serverSources.push(environmentServers);
+    servers.push(...environmentServers.value.map((server) => ({ environment, server })));
+
+    const regions = await collect<JsonRecord[]>(`mq_regions:${label}`, [], () => client.listMqRegions(environmentId), errors);
+    mqRegionSources.push(regions);
+    for (const region of regions.value) {
       const regionId = asString(region.regionId) ?? asString(region.id);
-      if (!regionId) continue;
-      const queues = await collect(`mq_queues:${label}:${regionId}`, [], () => client.listMqQueues(environmentId, regionId), errors);
-      mqInventory.push({ environment: label, region: regionId, queues });
+      if (!regionId) {
+        mqQueueSources.push({ label: `mq_queues:${label}`, value: [], error: "MQ region has no id" });
+        continue;
+      }
+      const queues = await collect<JsonRecord[]>(`mq_queues:${label}:${regionId}`, [], () => client.listMqQueues(environmentId, regionId), errors);
+      mqQueueSources.push(queues);
+      mqInventory.push({ environment: label, region: regionId, queues: queues.value });
     }
-    if (regions.length > 0) {
-      const clients = await collect(`mq_clients:${label}`, [], () => client.listMqClients(environmentId), errors);
-      mqClients.push({ environment: label, clients });
+    if (regions.value.length > 0) {
+      const clients = await collect<JsonRecord[]>(`mq_clients:${label}`, [], () => client.listMqClients(environmentId), errors);
+      mqClientSources.push(clients);
+      mqClients.push({ environment: label, clients: clients.value });
     }
 
-    const secretGroups = await collect(`secret_groups:${label}`, [], () => client.listSecretGroups(environmentId), errors);
-    secretGroupsByEnvironment.push({ environment, secretGroups });
+    const secretGroups = await collect<JsonRecord[]>(`secret_groups:${label}`, [], () => client.listSecretGroups(environmentId), errors);
+    secretGroupSources.push(secretGroups);
+    secretGroupsByEnvironment.push({ environment, secretGroups: secretGroups.value });
   }
+  const applicationsSource = mergeSources("cloudhub_applications", applicationSources);
+  const serversSource = mergeSources("hybrid_servers", serverSources);
+  const mqRegionsSource = mergeSources("mq_regions", mqRegionSources);
+  const mqQueuesSource = mergeSources("mq_queues", mqQueueSources);
+  const mqClientsSource = mergeSources("mq_clients", mqClientSources);
+  const secretGroupsSource = mergeSources("secret_groups", secretGroupSources);
 
-  const vpcSummaries = await collect("vpcs", [], () => client.listVpcs(), errors);
+  const vpcSummaries = await collect<JsonRecord[]>("vpcs", [], () => client.listVpcs(), errors);
+  const vpcDetails: Array<Collected<JsonRecord>> = [];
   const vpcs: JsonRecord[] = [];
-  for (const vpc of vpcSummaries.slice(0, DEFAULT_VPC_LIMIT)) {
+  for (const vpc of vpcSummaries.value.slice(0, DEFAULT_VPC_LIMIT)) {
     const vpcId = asString(vpc.id);
-    const detail = vpcId ? await collect(`vpc:${asString(vpc.name) ?? vpcId}`, vpc, () => client.getVpc(vpcId), errors) : vpc;
-    vpcs.push({ ...vpc, ...detail });
+    const vpcName = asString(vpc.name) ?? vpcId ?? "vpc";
+    const detail: Collected<JsonRecord> = vpcId
+      ? await collect<JsonRecord>(`vpc:${vpcName}`, {}, () => client.getVpc(vpcId), errors)
+      : { label: `vpc:${vpcName}`, value: {}, error: "VPC has no id" };
+    vpcDetails.push(detail);
+    vpcs.push({ ...vpc, ...detail.value });
   }
+  const vpcDetailsSource = mergeSources("vpc_details", vpcDetails);
+  const vpcPartialNote = vpcSummaries.value.length > DEFAULT_VPC_LIMIT
+    ? `VPC list truncated at ${DEFAULT_VPC_LIMIT} of ${vpcSummaries.value.length}`
+    : undefined;
+  const vpcsWithoutRules = vpcs.filter((vpc) => !Array.isArray(vpc.firewallRules));
 
-  const loadBalancers = (await collect("load_balancers", [], () => client.listLoadBalancers(), errors)).slice(0, DEFAULT_LOAD_BALANCER_LIMIT);
+  const loadBalancerSource = await collect<JsonRecord[]>("load_balancers", [], () => client.listLoadBalancers(), errors);
+  const loadBalancers = loadBalancerSource.value.slice(0, DEFAULT_LOAD_BALANCER_LIMIT);
+  const loadBalancerPartialNote = loadBalancerSource.value.length > DEFAULT_LOAD_BALANCER_LIMIT
+    ? `load balancer list truncated at ${DEFAULT_LOAD_BALANCER_LIMIT} of ${loadBalancerSource.value.length}`
+    : undefined;
   const certificateProbes: Array<{ loadBalancer: JsonRecord; certificate?: MulesoftCertificateSummary; error?: string }> = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);
@@ -2144,7 +2582,9 @@ export async function assessMulesoftRuntimeInfrastructure(
     return eos !== undefined && eos.getTime() >= now && daysUntil(eos, now) <= supportWarningDays && !unsupportedRuntime.includes(item);
   });
   const unknownRuntimeSupport = applicationRecords.filter((item) => endOfSupportDate(item.application) === undefined && !unsupportedRuntime.includes(item));
+  const missingRuntimeVersion = applicationRecords.filter((item) => muleVersion(item.application) === undefined);
 
+  const applicationsWithoutWorkerData = applicationRecords.filter((item) => asObject(item.application.workers) === undefined);
   const oversizedApplications = applicationRecords.filter((item) => {
     const amount = workerAmount(item.application);
     const weight = workerWeight(item.application);
@@ -2166,6 +2606,7 @@ export async function assessMulesoftRuntimeInfrastructure(
 
   const tls10LoadBalancers = loadBalancers.filter((item) => asBoolean(item.tlsv1) === true);
   const plainHttpLoadBalancers = loadBalancers.filter((item) => /^on$/i.test(asString(item.httpMode) ?? ""));
+  const loadBalancersMissingFlags = loadBalancers.filter((item) => asBoolean(item.tlsv1) === undefined || asString(item.httpMode) === undefined);
 
   const certificateResults = certificateProbes.map((probe) => {
     const validTo = probe.certificate?.validTo ? asDate(probe.certificate.validTo) : undefined;
@@ -2176,7 +2617,7 @@ export async function assessMulesoftRuntimeInfrastructure(
       issuer: probe.certificate?.issuer ?? null,
       valid_to: validTo ? validTo.toISOString() : null,
       days_remaining: validTo ? daysUntil(validTo, now) : null,
-      error: probe.error ?? null,
+      error: probe.error ?? (validTo ? null : "Certificate did not expose a validTo date."),
     };
   });
   const expiringCertificates = certificateResults.filter((item) => item.days_remaining !== null && item.days_remaining <= DEFAULT_CERTIFICATE_FAIL_DAYS);
@@ -2184,6 +2625,7 @@ export async function assessMulesoftRuntimeInfrastructure(
     item.days_remaining !== null && item.days_remaining > DEFAULT_CERTIFICATE_FAIL_DAYS && item.days_remaining <= certificateWarningDays,
   );
   const probedCertificates = certificateResults.filter((item) => item.days_remaining !== null);
+  const undatedCertificates = certificateResults.filter((item) => item.days_remaining === null);
 
   const allQueues = mqInventory.flatMap((item) => item.queues.map((queue) => ({ environment: item.environment, region: item.region, queue })));
   const unencryptedQueues = allQueues.filter((item) => asBoolean(item.queue.encrypted) !== true);
@@ -2195,230 +2637,269 @@ export async function assessMulesoftRuntimeInfrastructure(
   const insecureProperties = applicationRecords
     .map((item) => ({ application: item.label, keys: insecureSensitiveProperties(item.application) }))
     .filter((item) => item.keys.length > 0);
-  const applicationsWithPropertyData = applicationRecords.filter((item) => asObject(item.application.properties) !== undefined).length;
+  const applicationsWithoutPropertyData = applicationRecords.filter((item) => asObject(item.application.properties) === undefined);
 
   const disconnectedServers = servers.filter((item) => !isServerRunning(item.server));
   const describeServers = (records: Array<{ environment: JsonRecord; server: JsonRecord }>) =>
     sample(records.map((item) => `${environmentLabel(item.environment)}: ${serverLabel(item.server)} (${asString(item.server.status) ?? "unknown"})`));
 
-  const noVpcSummary = "No CloudHub VPCs are visible. If applications run in CloudHub 2.0 private spaces or Runtime Fabric, export the private space firewall rules or cluster network policy from Runtime Manager as evidence.";
+  const applicationPartialNotes = [
+    ...environments.partialNotes,
+    applicationsDropped > 0 ? `the application limit of ${applicationLimit} left ${applicationsDropped} application(s) uninspected` : undefined,
+  ];
+  const applicationInputs: EvaluationInputs = { primary: [environments.source, applicationsSource], partial: applicationPartialNotes };
+  const vpcInputs: EvaluationInputs = { primary: [vpcSummaries, vpcDetailsSource], partial: [vpcPartialNote] };
+  const loadBalancerInputs: EvaluationInputs = { primary: [loadBalancerSource], partial: [loadBalancerPartialNote] };
+  const zeroApplicationsSummary = `Zero CloudHub 1.0 applications were visible in ${environments.sampled.length} sampled environment(s). Zero applications is treated as manual: this tool inventories CloudHub 1.0 only, so if workloads run on CloudHub 2.0, Runtime Fabric, or hybrid servers, export their configuration from Runtime Manager.`;
+  const noVpcSummary = "Zero CloudHub VPCs are visible, which is treated as manual. If applications run in CloudHub 2.0 private spaces or Runtime Fabric, export the private space firewall rules or cluster network policy from Runtime Manager as evidence.";
+  const noLoadBalancerSummary = "No dedicated load balancers exist, so this control is not applicable and is recorded as manual: confirm whether applications are exposed through the shared load balancer or CloudHub 2.0 ingress, whose TLS configuration MuleSoft manages.";
 
   const findings: MulesoftFinding[] = [
-    finding(
+    evaluate(
       10,
-      applicationRecords.length === 0
-        ? "pass"
-        : unsupportedRuntime.length > 0
-          ? "fail"
-          : expiringRuntime.length > 0 || unknownRuntimeSupport.length > 0
-            ? "warn"
-            : "pass",
-      applicationRecords.length === 0
-        ? "No CloudHub applications were visible in the sampled environments."
-        : unsupportedRuntime.length > 0
-          ? `${unsupportedRuntime.length}/${applicationRecords.length} CloudHub application(s) run a Mule runtime that is past end of support or on Mule 3.`
-          : expiringRuntime.length > 0
-            ? `${expiringRuntime.length} CloudHub application(s) run a runtime reaching end of support within ${supportWarningDays} days.`
-            : unknownRuntimeSupport.length > 0
-              ? `${unknownRuntimeSupport.length} CloudHub application(s) did not expose an end of support date.`
-              : `All ${applicationRecords.length} CloudHub application(s) run supported Mule runtime versions.`,
-      {
-        applications: applicationRecords.length,
-        unsupported_runtime: sample(unsupportedRuntime.map((item) => `${item.label} (${muleVersion(item.application) ?? "unknown"})`)),
-        expiring_runtime: sample(expiringRuntime.map((item) => `${item.label} (${muleVersion(item.application) ?? "unknown"})`)),
-        unknown_support_dates: unknownRuntimeSupport.length,
-        support_warning_days: supportWarningDays,
+      applicationInputs,
+      "Export Runtime Manager > Applications with each application's Mule runtime version and confirm every version is within MuleSoft standard support.",
+      () => {
+        const evidence = {
+          applications: applicationRecords.length,
+          unsupported_runtime: sample(unsupportedRuntime.map((item) => `${item.label} (${muleVersion(item.application) ?? "unknown"})`)),
+          expiring_runtime: sample(expiringRuntime.map((item) => `${item.label} (${muleVersion(item.application) ?? "unknown"})`)),
+          unknown_support_dates: unknownRuntimeSupport.length,
+          missing_runtime_version: sample(missingRuntimeVersion.map((item) => item.label)),
+          support_warning_days: supportWarningDays,
+        };
+        if (applicationRecords.length === 0) return verdict("manual", zeroApplicationsSummary, evidence);
+        if (unsupportedRuntime.length > 0) {
+          return verdict("fail", `${unsupportedRuntime.length}/${applicationRecords.length} CloudHub application(s) run a Mule runtime that is past end of support or on Mule 3.`, evidence);
+        }
+        if (expiringRuntime.length > 0) {
+          return verdict("warn", `${expiringRuntime.length} CloudHub application(s) run a runtime reaching end of support within ${supportWarningDays} days.`, evidence);
+        }
+        if (missingRuntimeVersion.length > 0) {
+          return verdict("warn", `${missingRuntimeVersion.length} CloudHub application(s) did not expose a Mule runtime version, so their support status is unknown and not counted as supported.`, evidence);
+        }
+        if (unknownRuntimeSupport.length > 0) {
+          return verdict("warn", `${unknownRuntimeSupport.length} CloudHub application(s) did not expose an end of support date, so they are not counted as supported.`, evidence);
+        }
+        return verdict("pass", `All ${applicationRecords.length} CloudHub application(s) run supported Mule runtime versions with end of support dates in the future.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       11,
-      oversizedApplications.length > 0 ? "warn" : "pass",
-      applicationRecords.length === 0
-        ? "No CloudHub applications were visible in the sampled environments."
-        : oversizedApplications.length > 0
-          ? `${oversizedApplications.length} CloudHub application(s) look over-provisioned (multiple or large workers in non-production, or four or more workers with low CPU).`
-          : `${applicationRecords.length} CloudHub application(s) reviewed with no obvious over-provisioning.`,
-      {
-        applications: applicationRecords.length,
-        oversized_applications: sample(oversizedApplications.map((item) =>
-          `${item.label}: ${workerAmount(item.application)} x ${asString(getNestedValue(item.application, ["workers", "type", "name"])) ?? "worker"}`,
-        )),
+      applicationInputs,
+      "Export Runtime Manager > Applications with worker count, worker size, and recent CPU utilization for each application.",
+      () => {
+        const evidence = {
+          applications: applicationRecords.length,
+          oversized_applications: sample(oversizedApplications.map((item) =>
+            `${item.label}: ${workerAmount(item.application)} x ${asString(getNestedValue(item.application, ["workers", "type", "name"])) ?? "worker"}`,
+          )),
+          applications_without_worker_data: sample(applicationsWithoutWorkerData.map((item) => item.label)),
+        };
+        if (applicationRecords.length === 0) return verdict("manual", zeroApplicationsSummary, evidence);
+        if (oversizedApplications.length > 0) {
+          return verdict("warn", `${oversizedApplications.length} CloudHub application(s) look over-provisioned (multiple or large workers in non-production, or four or more workers with low CPU).`, evidence);
+        }
+        if (applicationsWithoutWorkerData.length > 0) {
+          return verdict("warn", `${applicationsWithoutWorkerData.length} CloudHub application(s) did not expose worker sizing data, so their sizing could not be reviewed.`, evidence);
+        }
+        return verdict("pass", `${applicationRecords.length} CloudHub application(s) reviewed with worker sizing data present and no obvious over-provisioning.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       12,
-      unencryptedQueueApplications.length > 0 ? "fail" : "pass",
-      persistentQueueApplications.length === 0
-        ? "No CloudHub applications use persistent queues."
-        : unencryptedQueueApplications.length > 0
-          ? `${unencryptedQueueApplications.length}/${persistentQueueApplications.length} application(s) with persistent queues do not encrypt them.`
-          : `All ${persistentQueueApplications.length} application(s) with persistent queues encrypt them.`,
-      {
-        persistent_queue_applications: persistentQueueApplications.length,
-        unencrypted_queue_applications: sample(unencryptedQueueApplications.map((item) => item.label)),
+      applicationInputs,
+      "Export each application's persistent queue settings from Runtime Manager > Application > Settings and confirm encryption is enabled wherever persistent queues are on.",
+      () => {
+        const evidence = {
+          applications: applicationRecords.length,
+          persistent_queue_applications: persistentQueueApplications.length,
+          unencrypted_queue_applications: sample(unencryptedQueueApplications.map((item) => item.label)),
+        };
+        if (applicationRecords.length === 0) return verdict("manual", zeroApplicationsSummary, evidence);
+        if (persistentQueueApplications.length === 0) {
+          return verdict("manual", `None of the ${applicationRecords.length} CloudHub application(s) enable persistent queues (persistentQueues is false or absent on every application), so encryption of persistent queues is not applicable and is recorded as manual rather than pass.`, evidence);
+        }
+        if (unencryptedQueueApplications.length > 0) {
+          return verdict("fail", `${unencryptedQueueApplications.length}/${persistentQueueApplications.length} application(s) with persistent queues do not encrypt them.`, evidence);
+        }
+        return verdict("pass", `All ${persistentQueueApplications.length} application(s) with persistent queues encrypt them (persistentQueuesEncrypted=true confirmed).`, evidence);
       },
     ),
-    finding(
+    evaluate(
       13,
-      vpcs.length === 0
-        ? "manual"
-        : allProtocolRules.length > 0
-          ? "fail"
-          : widePortRules.length > 0 || broadCidrRules.length > 0
-            ? "warn"
-            : "pass",
-      vpcs.length === 0
-        ? noVpcSummary
-        : allProtocolRules.length > 0
-          ? `${allProtocolRules.length} VPC firewall rule(s) allow all protocols.`
-          : widePortRules.length > 0 || broadCidrRules.length > 0
-            ? `${widePortRules.length} firewall rule(s) span wide port ranges and ${broadCidrRules.length} allow CIDR blocks broader than /16.`
-            : `${firewallRules.length} firewall rule(s) across ${vpcs.length} VPC(s) are limited to specific ports and networks.`,
-      {
-        vpcs: vpcs.length,
-        firewall_rules: firewallRules.length,
-        all_protocol_rules: sample(allProtocolRules.map((item) => ruleLabel(item.vpc, item.rule))),
-        wide_port_rules: sample(widePortRules.map((item) => ruleLabel(item.vpc, item.rule))),
-        broad_cidr_rules: sample(broadCidrRules.map((item) => ruleLabel(item.vpc, item.rule))),
+      vpcInputs,
+      "Export Runtime Manager > VPCs > Firewall Rules for every VPC and confirm each rule names a specific protocol, port range, and source network.",
+      () => {
+        const evidence = {
+          vpcs: vpcs.length,
+          firewall_rules: firewallRules.length,
+          vpcs_without_firewall_rules: sample(vpcsWithoutRules.map((vpc) => asString(vpc.name) ?? asString(vpc.id) ?? "vpc")),
+          all_protocol_rules: sample(allProtocolRules.map((item) => ruleLabel(item.vpc, item.rule))),
+          wide_port_rules: sample(widePortRules.map((item) => ruleLabel(item.vpc, item.rule))),
+          broad_cidr_rules: sample(broadCidrRules.map((item) => ruleLabel(item.vpc, item.rule))),
+        };
+        if (vpcs.length === 0) return verdict("manual", noVpcSummary, evidence);
+        if (allProtocolRules.length > 0) {
+          return verdict("fail", `${allProtocolRules.length} VPC firewall rule(s) allow all protocols.`, evidence);
+        }
+        if (vpcsWithoutRules.length > 0) {
+          return verdict("manual", `${vpcsWithoutRules.length}/${vpcs.length} VPC(s) did not return a firewallRules list, so their rules are unknown and cannot be counted as restrictive.`, evidence);
+        }
+        if (widePortRules.length > 0 || broadCidrRules.length > 0) {
+          return verdict("warn", `${widePortRules.length} firewall rule(s) span wide port ranges and ${broadCidrRules.length} allow CIDR blocks broader than /16.`, evidence);
+        }
+        return verdict("pass", `${firewallRules.length} firewall rule(s) across ${vpcs.length} VPC(s) are limited to specific ports and networks.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       14,
-      vpcs.length === 0
-        ? "manual"
-        : openNonStandardRules.length > 0
-          ? "fail"
-          : openStandardRules.length > 0
-            ? "warn"
-            : "pass",
-      vpcs.length === 0
-        ? noVpcSummary
-        : openNonStandardRules.length > 0
-          ? `${openNonStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on ports other than the CloudHub HTTP listener ports.`
-          : openStandardRules.length > 0
-            ? `${openStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on CloudHub HTTP listener ports; confirm the applications are intended to be internet-facing.`
-            : `No VPC firewall rules allow 0.0.0.0/0 ingress.`,
-      {
-        vpcs: vpcs.length,
-        open_non_standard_rules: sample(openNonStandardRules.map((item) => ruleLabel(item.vpc, item.rule))),
-        open_standard_port_rules: sample(openStandardRules.map((item) => ruleLabel(item.vpc, item.rule))),
+      vpcInputs,
+      "Export Runtime Manager > VPCs > Firewall Rules for every VPC and confirm no inbound rule uses 0.0.0.0/0 or ::/0 outside the CloudHub HTTP listener ports.",
+      () => {
+        const evidence = {
+          vpcs: vpcs.length,
+          vpcs_without_firewall_rules: sample(vpcsWithoutRules.map((vpc) => asString(vpc.name) ?? asString(vpc.id) ?? "vpc")),
+          open_non_standard_rules: sample(openNonStandardRules.map((item) => ruleLabel(item.vpc, item.rule))),
+          open_standard_port_rules: sample(openStandardRules.map((item) => ruleLabel(item.vpc, item.rule))),
+        };
+        if (vpcs.length === 0) return verdict("manual", noVpcSummary, evidence);
+        if (openNonStandardRules.length > 0) {
+          return verdict("fail", `${openNonStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on ports other than the CloudHub HTTP listener ports.`, evidence);
+        }
+        if (vpcsWithoutRules.length > 0) {
+          return verdict("manual", `${vpcsWithoutRules.length}/${vpcs.length} VPC(s) did not return a firewallRules list, so open ingress cannot be ruled out.`, evidence);
+        }
+        if (openStandardRules.length > 0) {
+          return verdict("warn", `${openStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on CloudHub HTTP listener ports; confirm the applications are intended to be internet-facing.`, evidence);
+        }
+        return verdict("pass", `No firewall rule across ${vpcs.length} VPC(s) with ${firewallRules.length} rule(s) allows 0.0.0.0/0 ingress.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       15,
-      loadBalancers.length === 0
-        ? "pass"
-        : tls10LoadBalancers.length > 0
-          ? "fail"
-          : plainHttpLoadBalancers.length > 0
-            ? "warn"
-            : "pass",
-      loadBalancers.length === 0
-        ? "No dedicated load balancers exist; control not applicable."
-        : tls10LoadBalancers.length > 0
-          ? `${tls10LoadBalancers.length}/${loadBalancers.length} dedicated load balancer(s) still accept TLS 1.0 and 1.1.`
-          : plainHttpLoadBalancers.length > 0
-            ? `${plainHttpLoadBalancers.length} dedicated load balancer(s) accept plain HTTP without redirecting to HTTPS.`
-            : `All ${loadBalancers.length} dedicated load balancer(s) disable TLS 1.0 and 1.1; cipher suite selection is managed by Anypoint and should be confirmed in Runtime Manager.`,
-      {
-        load_balancers: loadBalancers.map((item) => ({
-          name: loadBalancerLabel(item),
-          http_mode: asString(item.httpMode) ?? null,
-          tlsv1: asBoolean(item.tlsv1) ?? null,
-          tlsv13: asBoolean(item.tlsv13) ?? null,
-          state: asString(item.state) ?? null,
-        })),
+      loadBalancerInputs,
+      "Export Runtime Manager > Load Balancers > each load balancer's TLS settings (tlsv1, tlsv13, httpMode) as evidence.",
+      () => {
+        const evidence = {
+          load_balancers: loadBalancers.map((item) => ({
+            name: loadBalancerLabel(item),
+            http_mode: asString(item.httpMode) ?? null,
+            tlsv1: asBoolean(item.tlsv1) ?? null,
+            tlsv13: asBoolean(item.tlsv13) ?? null,
+            state: asString(item.state) ?? null,
+          })),
+        };
+        if (loadBalancers.length === 0) return verdict("manual", noLoadBalancerSummary, evidence);
+        if (tls10LoadBalancers.length > 0) {
+          return verdict("fail", `${tls10LoadBalancers.length}/${loadBalancers.length} dedicated load balancer(s) still accept TLS 1.0 and 1.1.`, evidence);
+        }
+        if (plainHttpLoadBalancers.length > 0) {
+          return verdict("warn", `${plainHttpLoadBalancers.length} dedicated load balancer(s) accept plain HTTP without redirecting to HTTPS.`, evidence);
+        }
+        if (loadBalancersMissingFlags.length > 0) {
+          return verdict("warn", `${loadBalancersMissingFlags.length}/${loadBalancers.length} dedicated load balancer(s) did not return the tlsv1 or httpMode flags, so their TLS posture cannot be confirmed.`, evidence);
+        }
+        return verdict("pass", `All ${loadBalancers.length} dedicated load balancer(s) report tlsv1=false and an httpMode that does not serve plain HTTP; cipher suite selection is managed by Anypoint and should be confirmed in Runtime Manager.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       16,
-      loadBalancers.length === 0
-        ? "pass"
-        : expiringCertificates.length > 0
-          ? "fail"
-          : warningCertificates.length > 0
-            ? "warn"
-            : probedCertificates.length === 0
-              ? "manual"
-              : "pass",
-      loadBalancers.length === 0
-        ? "No dedicated load balancers exist; control not applicable."
-        : expiringCertificates.length > 0
-          ? `${expiringCertificates.length} dedicated load balancer certificate(s) are expired or expire within ${DEFAULT_CERTIFICATE_FAIL_DAYS} days.`
-          : warningCertificates.length > 0
-            ? `${warningCertificates.length} dedicated load balancer certificate(s) expire within ${certificateWarningDays} days.`
-            : probedCertificates.length === 0
-              ? "The load balancer certificates could not be probed over TLS. Open Runtime Manager > Load Balancers > certificates and record each certificate expiry date."
-              : `All ${probedCertificates.length} probed dedicated load balancer certificate(s) remain valid for more than ${certificateWarningDays} days.`,
-      {
-        certificates: certificateResults,
-        fail_days: DEFAULT_CERTIFICATE_FAIL_DAYS,
-        warning_days: certificateWarningDays,
+      loadBalancerInputs,
+      "Open Runtime Manager > Load Balancers > certificates and record each certificate's expiry date.",
+      () => {
+        const evidence = {
+          certificates: certificateResults,
+          fail_days: DEFAULT_CERTIFICATE_FAIL_DAYS,
+          warning_days: certificateWarningDays,
+        };
+        if (loadBalancers.length === 0) return verdict("manual", noLoadBalancerSummary, evidence);
+        if (expiringCertificates.length > 0) {
+          return verdict("fail", `${expiringCertificates.length} dedicated load balancer certificate(s) are expired or expire within ${DEFAULT_CERTIFICATE_FAIL_DAYS} days.`, evidence);
+        }
+        if (warningCertificates.length > 0) {
+          return verdict("warn", `${warningCertificates.length} dedicated load balancer certificate(s) expire within ${certificateWarningDays} days.`, evidence);
+        }
+        if (probedCertificates.length === 0) {
+          return verdict("manual", "None of the load balancer certificates could be dated over TLS. Open Runtime Manager > Load Balancers > certificates and record each certificate expiry date.", evidence);
+        }
+        if (undatedCertificates.length > 0) {
+          return verdict("warn", `${undatedCertificates.length}/${loadBalancers.length} dedicated load balancer certificate(s) could not be dated (probe failed or no validTo date) and are not counted as valid; record their expiry dates manually.`, evidence);
+        }
+        return verdict("pass", `All ${probedCertificates.length} dedicated load balancer certificate(s) were probed and remain valid for more than ${certificateWarningDays} days.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       21,
-      mqInventory.length === 0
-        ? "pass"
-        : unencryptedQueues.length > 0
-          ? "warn"
-          : "manual",
-      mqInventory.length === 0
-        ? "Anypoint MQ is not in use in the sampled environments; control not applicable."
-        : unencryptedQueues.length > 0
-          ? `${unencryptedQueues.length}/${allQueues.length} Anypoint MQ queue(s) are not encrypted; MQ client apps are environment-scoped by design, so also confirm credentials are not shared across environments.`
-          : `${allQueues.length} queue(s) and ${totalMqClients} MQ client app(s) inventoried per environment. Confirm MQ client app credentials are not reused across environments and MQ roles are environment-scoped in Access Management.`,
-      {
-        environments_with_mq: [...new Set(mqInventory.map((item) => item.environment))],
-        queues: allQueues.length,
-        unencrypted_queues: sample(unencryptedQueues.map((item) => `${item.environment}/${item.region}: ${asString(item.queue.queueId) ?? "queue"}`)),
-        mq_clients: mqClients.map((item) => ({ environment: item.environment, clients: item.clients.length })),
+      { primary: [environments.source, mqRegionsSource, mqQueuesSource], secondary: [mqClientsSource], partial: environments.partialNotes },
+      "Export Anypoint MQ client apps per environment and the MQ role assignments from Access Management, then confirm no client credential is shared across environments.",
+      () => {
+        const evidence = {
+          environments_with_mq: [...new Set(mqInventory.map((item) => item.environment))],
+          queues: allQueues.length,
+          unencrypted_queues: sample(unencryptedQueues.map((item) => `${item.environment}/${item.region}: ${asString(item.queue.queueId) ?? "queue"}`)),
+          mq_clients: mqClients.map((item) => ({ environment: item.environment, clients: item.clients.length })),
+        };
+        if (mqInventory.length === 0) {
+          return verdict("manual", `Anypoint MQ returned zero regions in ${environments.sampled.length} sampled environment(s), so this control is not applicable and is recorded as manual: confirm in Anypoint MQ that no queues or client apps exist.`, evidence);
+        }
+        if (unencryptedQueues.length > 0) {
+          return verdict("warn", `${unencryptedQueues.length}/${allQueues.length} Anypoint MQ queue(s) are not encrypted; MQ client apps are environment-scoped by design, so also confirm credentials are not shared across environments.`, evidence);
+        }
+        return verdict("manual", `${allQueues.length} queue(s) and ${totalMqClients} MQ client app(s) inventoried per environment. Confirm MQ client app credentials are not reused across environments and MQ roles are environment-scoped in Access Management.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       22,
-      insecureProperties.length > 0
-        ? "fail"
-        : productionSecretGroups.length === 0 || productionWithoutSecretGroups.length > 0
-          ? "warn"
-          : "pass",
-      insecureProperties.length > 0
-        ? `${insecureProperties.length} CloudHub application(s) expose sensitive-looking properties that are not marked secure.`
-        : productionSecretGroups.length === 0
-          ? "No production environment was sampled, so Secrets Manager coverage could not be confirmed."
-          : productionWithoutSecretGroups.length > 0
-            ? `${productionWithoutSecretGroups.length} production environment(s) have no Secrets Manager secret groups.`
-            : `All ${productionSecretGroups.length} production environment(s) have Secrets Manager secret groups and no insecure sensitive properties were visible.`,
-      {
-        secret_groups_by_environment: secretGroupsByEnvironment.map((item) => ({
-          environment: environmentLabel(item.environment),
-          production: isProductionEnvironment(item.environment),
-          secret_groups: item.secretGroups.length,
-        })),
-        applications_with_property_data: applicationsWithPropertyData,
-        insecure_property_keys: sample(insecureProperties.map((item) => `${item.application}: ${item.keys.join(", ")}`)),
+      { primary: [environments.source, applicationsSource, secretGroupsSource], partial: applicationPartialNotes },
+      "Export Secrets Manager > Secret Groups per production environment and each application's properties (with the secure flag) from Runtime Manager.",
+      () => {
+        const evidence = {
+          secret_groups_by_environment: secretGroupsByEnvironment.map((item) => ({
+            environment: environmentLabel(item.environment),
+            production: isProductionEnvironment(item.environment),
+            secret_groups: item.secretGroups.length,
+          })),
+          applications_with_property_data: applicationRecords.length - applicationsWithoutPropertyData.length,
+          applications_without_property_data: sample(applicationsWithoutPropertyData.map((item) => item.label)),
+          insecure_property_keys: sample(insecureProperties.map((item) => `${item.application}: ${item.keys.join(", ")}`)),
+        };
+        if (insecureProperties.length > 0) {
+          return verdict("fail", `${insecureProperties.length} CloudHub application(s) expose sensitive-looking properties that are not marked secure.`, evidence);
+        }
+        if (applicationRecords.length === 0) return verdict("manual", zeroApplicationsSummary, evidence);
+        if (productionSecretGroups.length === 0) {
+          return verdict("manual", `No production environment was sampled (${productionSampleNote(environments)}), so Secrets Manager coverage cannot be confirmed. Treated as manual.`, evidence);
+        }
+        if (productionWithoutSecretGroups.length > 0) {
+          return verdict("warn", `${productionWithoutSecretGroups.length} production environment(s) have no Secrets Manager secret groups.`, evidence);
+        }
+        if (applicationsWithoutPropertyData.length > 0) {
+          return verdict("warn", `${applicationsWithoutPropertyData.length}/${applicationRecords.length} CloudHub application(s) did not return a properties object, so their configuration could not be checked for plaintext secrets.`, evidence);
+        }
+        return verdict("pass", `All ${productionSecretGroups.length} production environment(s) have Secrets Manager secret groups and every one of ${applicationRecords.length} application(s) returned properties with no insecure sensitive keys.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       23,
-      servers.length === 0
-        ? "pass"
-        : disconnectedServers.length === servers.length
-          ? "fail"
-          : disconnectedServers.length > 0
-            ? "warn"
-            : "pass",
-      servers.length === 0
-        ? "No hybrid runtime servers are registered in the sampled environments; control not applicable."
-        : disconnectedServers.length === servers.length
-          ? `All ${servers.length} hybrid runtime server(s) are disconnected or not reporting.`
-          : disconnectedServers.length > 0
-            ? `${disconnectedServers.length}/${servers.length} hybrid runtime server(s) are not in RUNNING state.`
-            : `All ${servers.length} hybrid runtime server(s) are registered and reporting RUNNING.`,
-      {
-        servers: servers.length,
-        disconnected_servers: describeServers(disconnectedServers),
-        mule_versions: [...new Set(servers.map((item) => asString(item.server.muleVersion) ?? "unknown"))],
+      { primary: [environments.source, serversSource], partial: environments.partialNotes },
+      "Export Runtime Manager > Servers for each environment and confirm every registered server reports RUNNING.",
+      () => {
+        const evidence = {
+          servers: servers.length,
+          disconnected_servers: describeServers(disconnectedServers),
+          mule_versions: [...new Set(servers.map((item) => asString(item.server.muleVersion) ?? "unknown"))],
+        };
+        if (servers.length === 0) {
+          return verdict("manual", `Zero hybrid runtime servers are registered in ${environments.sampled.length} sampled environment(s), so this control is not applicable and is recorded as manual: confirm in Runtime Manager > Servers that no on-premises runtimes are expected.`, evidence);
+        }
+        if (disconnectedServers.length === servers.length) {
+          return verdict("fail", `All ${servers.length} hybrid runtime server(s) are disconnected or not reporting.`, evidence);
+        }
+        if (disconnectedServers.length > 0) {
+          return verdict("warn", `${disconnectedServers.length}/${servers.length} hybrid runtime server(s) are not in RUNNING state.`, evidence);
+        }
+        return verdict("pass", `All ${servers.length} hybrid runtime server(s) are registered and reporting RUNNING.`, evidence);
       },
     ),
   ];
@@ -2428,8 +2909,10 @@ export async function assessMulesoftRuntimeInfrastructure(
     title: "MuleSoft runtime and infrastructure posture",
     summary: {
       organization_id: config.organizationId,
-      environments_sampled: environments.length,
+      environments_visible: environments.all.length,
+      environments_sampled: environments.sampled.length,
       cloudhub_applications: applicationRecords.length,
+      applications_not_inspected: applicationsDropped,
       unsupported_runtime_applications: unsupportedRuntime.length,
       vpcs: vpcs.length,
       firewall_rules: firewallRules.length,
@@ -2437,6 +2920,8 @@ export async function assessMulesoftRuntimeInfrastructure(
       hybrid_servers: servers.length,
       mq_queues: allQueues.length,
       secret_groups: totalSecretGroups,
+      partial_view: [...applicationPartialNotes, vpcPartialNote, loadBalancerPartialNote].filter(Boolean),
+      unreadable_sources: errors.length,
     },
     findings,
     snapshots: {
@@ -2460,8 +2945,13 @@ export async function assessMulesoftRuntimeInfrastructure(
   };
 }
 
-function alertIsEnabled(alert: JsonRecord): boolean {
-  return asBoolean(alert.enabled) !== false;
+type AlertState = "enabled" | "disabled" | "unknown";
+
+function alertState(alert: JsonRecord): AlertState {
+  const enabled = asBoolean(alert.enabled);
+  if (enabled === true) return "enabled";
+  if (enabled === false) return "disabled";
+  return "unknown";
 }
 
 function alertResources(alert: JsonRecord): string[] {
@@ -2469,9 +2959,7 @@ function alertResources(alert: JsonRecord): string[] {
 }
 
 function alertCoversApplication(alert: JsonRecord, domain: string): boolean {
-  const resources = alertResources(alert);
-  if (resources.length === 0) return true;
-  return resources.some((resource) => resource === "*" || resource.toLowerCase() === domain.toLowerCase());
+  return alertResources(alert).some((resource) => resource === "*" || resource.toLowerCase() === domain.toLowerCase());
 }
 
 function auditEntrySummary(entry: JsonRecord): JsonRecord {
@@ -2481,6 +2969,17 @@ function auditEntrySummary(entry: JsonRecord): JsonRecord {
     action: asString(firstDefined(entry, [["action"], ["actionType"], ["type"]])) ?? null,
     object_type: asString(firstDefined(entry, [["objectType"], ["objectTypes", "0"]])) ?? null,
   };
+}
+
+interface AlertCoverage {
+  environment: string;
+  cloudhubAlerts: Collected<JsonRecord[]>;
+  hybridAlerts: Collected<JsonRecord[]>;
+  applications: Collected<JsonRecord[]>;
+  enabledAlerts: JsonRecord[];
+  unknownStateAlerts: JsonRecord[];
+  uncoveredApplications: string[];
+  unknownCoverageApplications: string[];
 }
 
 export async function assessMulesoftAuditMonitoring(
@@ -2493,111 +2992,139 @@ export async function assessMulesoftAuditMonitoring(
   const lookbackHours = clampNumber(options.auditLookbackHours, DEFAULT_AUDIT_LOOKBACK_HOURS, 1, 24 * 90);
   const now = Date.now();
 
-  const platforms = await collect("audit_platforms", [], () => client.listAuditPlatforms(), errors);
+  const platforms = await collect<JsonRecord[]>("audit_platforms", [], () => client.listAuditPlatforms(), errors);
   const startDate = new Date(now - lookbackHours * 60 * 60 * 1000).toISOString();
   const endDate = new Date(now).toISOString();
-  let queryError: string | undefined;
-  let recentEntries: JsonRecord[] = [];
-  let fallbackEntries: JsonRecord[] = [];
-  let recentTotal: number | undefined;
-  try {
-    const result = await client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT });
-    recentEntries = extractCollection(result);
-    recentTotal = asNumber(result.total);
-    if (recentEntries.length === 0) {
-      const fallback = await client.queryAuditLogs({
-        startDate: new Date(now - AUDIT_FALLBACK_LOOKBACK_DAYS * DAY_MS).toISOString(),
-        endDate,
-        limit: 1,
-      });
-      fallbackEntries = extractCollection(fallback);
-    }
-  } catch (error) {
-    queryError = errorMessage(error);
-    errors.push(`audit_query: ${queryError}`);
-  }
+  const recentQuery = await collect<JsonRecord>("audit_query", {}, () => client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT }), errors);
+  const recentEntries = extractCollection(recentQuery.value);
+  const recentTotal = asNumber(recentQuery.value.total);
+  const fallbackQuery: Collected<JsonRecord> = !recentQuery.error && recentEntries.length === 0
+    ? await collect<JsonRecord>("audit_query_fallback", {}, () => client.queryAuditLogs({
+      startDate: new Date(now - AUDIT_FALLBACK_LOOKBACK_DAYS * DAY_MS).toISOString(),
+      endDate,
+      limit: 1,
+    }), errors)
+    : { label: "audit_query_fallback", value: {} };
+  const fallbackEntries = extractCollection(fallbackQuery.value);
 
-  const environments = await loadEnvironments(client, environmentLimit, errors);
-  const productionEnvironments = environments.filter(isProductionEnvironment);
-  const alertCoverage: Array<{
-    environment: string;
-    cloudhubAlerts: JsonRecord[];
-    hybridAlerts: JsonRecord[];
-    applications: JsonRecord[];
-    uncoveredApplications: string[];
-  }> = [];
+  const environments = await sampleEnvironments(client, environmentLimit, errors);
+  const productionEnvironments = environments.sampled.filter(isProductionEnvironment);
+  const alertCoverage: AlertCoverage[] = [];
   for (const environment of productionEnvironments) {
     const environmentId = asString(environment.id);
-    if (!environmentId) continue;
     const label = environmentLabel(environment);
-    const cloudhubAlerts = await collect(`cloudhub_alerts:${label}`, [], () => client.listCloudhubAlerts(environmentId), errors);
-    const hybridAlerts = await collect(`hybrid_alerts:${label}`, [], () => client.listHybridAlerts(environmentId), errors);
-    const applications = await collect(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
-    const enabledAlerts = [...cloudhubAlerts, ...hybridAlerts].filter(alertIsEnabled);
-    const uncoveredApplications = applications
-      .map(applicationLabel)
-      .filter((domain) => !enabledAlerts.some((alert) => alertCoversApplication(alert, domain)));
-    alertCoverage.push({ environment: label, cloudhubAlerts, hybridAlerts, applications, uncoveredApplications });
+    if (!environmentId) {
+      const missing = { label: `alerts:${label}`, value: [] as JsonRecord[], error: "environment has no id" };
+      alertCoverage.push({
+        environment: label,
+        cloudhubAlerts: missing,
+        hybridAlerts: missing,
+        applications: missing,
+        enabledAlerts: [],
+        unknownStateAlerts: [],
+        uncoveredApplications: [],
+        unknownCoverageApplications: [],
+      });
+      continue;
+    }
+    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts:${label}`, [], () => client.listCloudhubAlerts(environmentId), errors);
+    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts:${label}`, [], () => client.listHybridAlerts(environmentId), errors);
+    const applications = await collect<JsonRecord[]>(`cloudhub_applications:${label}`, [], () => client.listCloudhubApplications(environmentId), errors);
+    const allAlerts = [...cloudhubAlerts.value, ...hybridAlerts.value];
+    const enabledAlerts = allAlerts.filter((alert) => alertState(alert) === "enabled");
+    const unknownStateAlerts = allAlerts.filter((alert) => alertState(alert) === "unknown");
+    const domains = applications.value.map(applicationLabel);
+    const uncoveredApplications = domains.filter((domain) =>
+      !enabledAlerts.some((alert) => alertCoversApplication(alert, domain))
+      && !unknownStateAlerts.some((alert) => alertCoversApplication(alert, domain)));
+    const unknownCoverageApplications = domains.filter((domain) =>
+      !enabledAlerts.some((alert) => alertCoversApplication(alert, domain))
+      && unknownStateAlerts.some((alert) => alertCoversApplication(alert, domain)));
+    alertCoverage.push({
+      environment: label,
+      cloudhubAlerts,
+      hybridAlerts,
+      applications,
+      enabledAlerts,
+      unknownStateAlerts,
+      uncoveredApplications,
+      unknownCoverageApplications,
+    });
   }
+  const alertsSource = mergeSources("alerts", alertCoverage.flatMap((item) => [item.cloudhubAlerts, item.hybridAlerts]));
+  const applicationsSource = mergeSources("cloudhub_applications", alertCoverage.map((item) => item.applications));
 
-  const environmentsWithoutAlerts = alertCoverage.filter((item) =>
-    [...item.cloudhubAlerts, ...item.hybridAlerts].filter(alertIsEnabled).length === 0,
-  );
+  const environmentsWithoutAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length === 0);
+  const environmentsWithOnlyUnknownAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length > 0);
   const uncoveredApplications = alertCoverage.flatMap((item) => item.uncoveredApplications.map((domain) => `${item.environment}: ${domain}`));
-  const totalEnabledAlerts = alertCoverage.reduce(
-    (total, item) => total + [...item.cloudhubAlerts, ...item.hybridAlerts].filter(alertIsEnabled).length,
-    0,
-  );
+  const unknownCoverageApplications = alertCoverage.flatMap((item) => item.unknownCoverageApplications.map((domain) => `${item.environment}: ${domain}`));
+  const totalProductionApplications = alertCoverage.reduce((total, item) => total + item.applications.value.length, 0);
+  const totalEnabledAlerts = alertCoverage.reduce((total, item) => total + item.enabledAlerts.length, 0);
+  const totalUnknownStateAlerts = alertCoverage.reduce((total, item) => total + item.unknownStateAlerts.length, 0);
 
   const findings: MulesoftFinding[] = [
-    finding(
+    evaluate(
       17,
-      queryError
-        ? "fail"
-        : recentEntries.length > 0
-          ? "pass"
-          : fallbackEntries.length > 0
-            ? "warn"
-            : "fail",
-      queryError
-        ? `The audit log query failed: ${queryError}`
-        : recentEntries.length > 0
-          ? `${recentTotal ?? recentEntries.length} audit log entr${(recentTotal ?? recentEntries.length) === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours across ${platforms.length} platform(s).`
-          : fallbackEntries.length > 0
-            ? `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.`
-            : `Audit logging returned no entries in the last ${AUDIT_FALLBACK_LOOKBACK_DAYS} days.`,
-      {
-        lookback_hours: lookbackHours,
-        entries_in_window: recentTotal ?? recentEntries.length,
-        platforms: platforms.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"),
-        recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
+      { primary: [recentQuery, fallbackQuery] },
+      "Export Access Management > Audit Log for the review period, or grant the credential the Audit Log Viewer permission and rerun.",
+      () => {
+        const entriesInWindow = recentTotal ?? recentEntries.length;
+        const evidence = {
+          lookback_hours: lookbackHours,
+          entries_in_window: entriesInWindow,
+          entries_in_fallback_window: fallbackEntries.length,
+          fallback_lookback_days: AUDIT_FALLBACK_LOOKBACK_DAYS,
+          platforms: platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"),
+          platforms_error: platforms.error ?? null,
+          recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
+        };
+        if (recentEntries.length > 0) {
+          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours across ${platforms.value.length} platform(s).`, evidence);
+        }
+        if (fallbackEntries.length > 0) {
+          return verdict("warn", `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.`, evidence);
+        }
+        return verdict("fail", `Audit logging returned zero entries in the last ${AUDIT_FALLBACK_LOOKBACK_DAYS} days. Zero events is treated as fail: either the platform is not recording activity or the credential cannot see the entries; export Access Management > Audit Log to confirm.`, evidence);
       },
     ),
-    finding(
+    evaluate(
       24,
-      productionEnvironments.length === 0
-        ? "warn"
-        : environmentsWithoutAlerts.length > 0
-          ? "fail"
-          : uncoveredApplications.length > 0
-            ? "warn"
-            : "pass",
-      productionEnvironments.length === 0
-        ? "No production environment was sampled, so alert coverage could not be evaluated."
-        : environmentsWithoutAlerts.length > 0
-          ? `${environmentsWithoutAlerts.length} production environment(s) have no enabled CloudHub or Runtime Manager alerts.`
-          : uncoveredApplications.length > 0
-            ? `${uncoveredApplications.length} production application(s) are not covered by an enabled alert; Anypoint Monitoring advanced alerts must be exported manually.`
-            : `${totalEnabledAlerts} enabled alert(s) cover all sampled production applications; export Anypoint Monitoring advanced alerts manually if they are relied upon.`,
-      {
-        production_environments: alertCoverage.map((item) => ({
-          environment: item.environment,
-          cloudhub_alerts: item.cloudhubAlerts.length,
-          runtime_manager_alerts: item.hybridAlerts.length,
-          applications: item.applications.length,
-          uncovered_applications: sample(item.uncoveredApplications),
-        })),
-        environments_without_alerts: environmentsWithoutAlerts.map((item) => item.environment),
+      { primary: [environments.source, alertsSource, applicationsSource], partial: environments.partialNotes },
+      "Export Runtime Manager > Alerts and Anypoint Monitoring > Alerts for each production environment and map every production application to at least one enabled alert.",
+      () => {
+        const evidence = {
+          production_environments: alertCoverage.map((item) => ({
+            environment: item.environment,
+            cloudhub_alerts: item.cloudhubAlerts.value.length,
+            runtime_manager_alerts: item.hybridAlerts.value.length,
+            enabled_alerts: item.enabledAlerts.length,
+            unknown_state_alerts: item.unknownStateAlerts.length,
+            applications: item.applications.value.length,
+            uncovered_applications: sample(item.uncoveredApplications),
+            unknown_coverage_applications: sample(item.unknownCoverageApplications),
+          })),
+          environments_without_alerts: environmentsWithoutAlerts.map((item) => item.environment),
+          production_environments_sampled: productionSampleNote(environments),
+        };
+        if (productionEnvironments.length === 0) {
+          return verdict("manual", `No production environment was sampled (${productionSampleNote(environments)}), so alert coverage cannot be evaluated. Treated as manual.`, evidence);
+        }
+        if (environmentsWithoutAlerts.length > 0) {
+          return verdict("fail", `${environmentsWithoutAlerts.length} production environment(s) have no enabled CloudHub or Runtime Manager alerts.`, evidence);
+        }
+        if (environmentsWithOnlyUnknownAlerts.length > 0) {
+          return verdict("warn", `${environmentsWithOnlyUnknownAlerts.length} production environment(s) only have alerts whose enabled flag was not returned, so active alerting cannot be confirmed.`, evidence);
+        }
+        if (totalProductionApplications === 0) {
+          return verdict("manual", `${totalEnabledAlerts} enabled alert(s) exist but zero CloudHub applications are deployed in the sampled production environment(s), so there is nothing for the alerts to cover. Treated as manual: if workloads run on CloudHub 2.0 or Runtime Fabric, export their Anypoint Monitoring alerts.`, evidence);
+        }
+        if (uncoveredApplications.length > 0) {
+          return verdict("warn", `${uncoveredApplications.length} production application(s) are not covered by an enabled alert; Anypoint Monitoring advanced alerts must be exported manually.`, evidence);
+        }
+        if (unknownCoverageApplications.length > 0 || totalUnknownStateAlerts > 0) {
+          return verdict("warn", `${unknownCoverageApplications.length} production application(s) are covered only by alerts whose enabled flag was not returned.`, evidence);
+        }
+        return verdict("pass", `${totalEnabledAlerts} enabled alert(s) (enabled=true confirmed) cover all ${totalProductionApplications} sampled production application(s); export Anypoint Monitoring advanced alerts manually if they are relied upon.`, evidence);
       },
     ),
   ];
@@ -2607,21 +3134,25 @@ export async function assessMulesoftAuditMonitoring(
     title: "MuleSoft audit logging and monitoring posture",
     summary: {
       organization_id: config.organizationId,
-      audit_platforms: platforms.length,
+      audit_platforms: platforms.value.length,
       audit_entries_in_window: recentTotal ?? recentEntries.length,
       audit_lookback_hours: lookbackHours,
+      environments_visible: environments.all.length,
       production_environments: productionEnvironments.length,
+      production_applications: totalProductionApplications,
       enabled_alerts: totalEnabledAlerts,
       uncovered_production_applications: uncoveredApplications.length,
+      partial_view: environments.partialNotes,
+      unreadable_sources: errors.length,
     },
     findings,
     snapshots: {
-      audit_platforms: redactSnapshot(platforms),
+      audit_platforms: redactSnapshot(platforms.value),
       audit_log_recent: redactSnapshot(recentEntries),
       alerts: redactSnapshot(alertCoverage.map((item) => ({
         environment: item.environment,
-        cloudhub_alerts: item.cloudhubAlerts,
-        runtime_manager_alerts: item.hybridAlerts,
+        cloudhub_alerts: item.cloudhubAlerts.value,
+        runtime_manager_alerts: item.hybridAlerts.value,
       }))),
     },
     errors,
@@ -2637,7 +3168,9 @@ interface SurfaceDefinition {
 }
 
 function countItems(value: unknown): number | undefined {
-  return Array.isArray(value) ? value.length : undefined;
+  if (Array.isArray(value)) return value.length;
+  if (isPage(value)) return value.items.length;
+  return undefined;
 }
 
 async function probeSurface(definition: SurfaceDefinition): Promise<MulesoftAccessSurface> {
@@ -2682,8 +3215,8 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
     },
     count: () => 1,
   });
-  const environments = await loadEnvironments(client, 1, errors);
-  const environment = environments[0];
+  const environments = await sampleEnvironments(client, 1, errors);
+  const environment = environments.sampled[0];
   const environmentId = environment ? asString(environment.id) : undefined;
   const environmentName = environment ? environmentLabel(environment) : undefined;
 
@@ -3039,7 +3572,7 @@ export async function exportMulesoftAuditBundle(
     await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${relative(realpathSync(outputRoot), outputDir)}.zip`);
+  const zipPath = resolveSecureOutputPath(outputRoot, auditBundleZipPath(relative(realpathSync(outputRoot), outputDir)));
   await createZipArchive(outputDir, zipPath);
 
   return {

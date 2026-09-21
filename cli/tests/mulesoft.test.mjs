@@ -181,6 +181,7 @@ function healthyRuntimeClient(overrides = {}) {
         muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
         workers: { amount: 1, type: { name: "Micro", weight: 0.1 } },
         persistentQueues: false,
+        properties: {},
       }];
     },
     async listVpcs() {
@@ -431,7 +432,9 @@ test("MulesoftApiClient exchanges connected app credentials and paginates with l
   }, {}, { homeDir: createTempBase("grclanker-mulesoft-client-home-") }), { fetchImpl });
   const members = await client.listOffset(`/accounts/api/organizations/${ORG_ID}/members`, { limit: 10, pageSize: 2 });
 
-  assert.deepEqual(members.map((member) => member.id), ["u1", "u2", "u3"]);
+  assert.deepEqual(members.items.map((member) => member.id), ["u1", "u2", "u3"]);
+  assert.equal(members.total, 3);
+  assert.equal(members.truncated, false);
   assert.equal(seen[0].pathname, "/accounts/api/v2/oauth2/token");
   assert.equal(seen[0].method, "POST");
   assert.equal(seen[0].auth, undefined);
@@ -498,7 +501,7 @@ test("MulesoftApiClient retries 429 and 5xx responses with backoff", async () =>
     attempts += 1;
     if (attempts === 1) return jsonResponse({ message: "slow down" }, { status: 429, headers: { "retry-after": "2" } });
     if (attempts === 2) return jsonResponse({ message: "upstream" }, { status: 503 });
-    return jsonResponse({ data: [{ role_group_id: "rg-1", name: "Developers" }] });
+    return jsonResponse({ data: [{ role_group_id: "rg-1", name: "Developers" }], total: 1 });
   };
 
   const client = new MulesoftApiClient(sampleConfig(), {
@@ -510,7 +513,8 @@ test("MulesoftApiClient retries 429 and 5xx responses with backoff", async () =>
   });
   const roleGroups = await client.listRoleGroups();
 
-  assert.equal(roleGroups.length, 1);
+  assert.equal(roleGroups.items.length, 1);
+  assert.equal(roleGroups.truncated, false);
   assert.equal(attempts, 3);
   assert.deepEqual(sleeps, [2000, 20]);
 });
@@ -651,7 +655,7 @@ test("assessMulesoftIdentityAccess fails weak identity and privilege posture", a
       return { allow_new_non_sso_users: true };
     },
     async listMfaExemptUsers() {
-      return [{ id: "u3", username: "contractor" }];
+      return [{ id: "u3", username: "contractor", mfaVerificationExcluded: true }];
     },
     async listRoleGroups() {
       return [
@@ -704,7 +708,7 @@ test("assessMulesoftIdentityAccess fails weak identity and privilege posture", a
   assert.equal(statusOf(result, "MULESOFT-IAM-25"), "manual");
 });
 
-test("assessMulesoftIdentityAccess degrades to warnings and errors when reads fail", async () => {
+test("assessMulesoftIdentityAccess degrades to manual verdicts and records errors when reads fail", async () => {
   const client = healthyIdentityClient({
     async listRoleGroups() {
       throw new MulesoftApiError(403, "Anypoint request failed (403 Forbidden) for GET /rolegroups");
@@ -722,13 +726,19 @@ test("assessMulesoftIdentityAccess degrades to warnings and errors when reads fa
 
   const result = await assessMulesoftIdentityAccess(client);
 
-  assert.equal(statusOf(result, "MULESOFT-IAM-01"), "fail");
-  assert.equal(statusOf(result, "MULESOFT-IAM-03"), "warn");
-  assert.equal(statusOf(result, "MULESOFT-IAM-04"), "warn");
+  assert.equal(statusOf(result, "MULESOFT-IAM-01"), "manual");
+  assert.match(findingById(result, "MULESOFT-IAM-01").summary, /Could not evaluate: identity_providers could not be read, the read errored: timeout/);
+  assert.match(findingById(result, "MULESOFT-IAM-01").summary, /Export Access Management > Identity Providers/);
+  for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05"]) {
+    assert.equal(statusOf(result, id), "manual", id);
+    assert.match(findingById(result, id).summary, /role_groups could not be read, the credential lacks permission \(HTTP 403\)/);
+  }
   assert.equal(statusOf(result, "MULESOFT-IAM-18"), "warn");
   assert.match(findingById(result, "MULESOFT-IAM-18").summary, /user-delegated/);
+  assert.equal(statusOf(result, "MULESOFT-IAM-19"), "pass");
   assert.ok(result.errors.some((error) => error.startsWith("role_groups:")));
   assert.ok(result.errors.some((error) => error.startsWith("identity_providers:")));
+  assert.equal(result.summary.unreadable_sources, 2);
 });
 
 test("assessMulesoftApiGateway passes when production APIs enforce authentication and rate limiting", async () => {
@@ -775,21 +785,29 @@ test("assessMulesoftApiGateway fails unprotected production APIs and flags publi
   assert.equal(result.summary.exchange_assets, 1);
 });
 
-test("assessMulesoftApiGateway warns when only non-production APIs lack policies and honors environment filters", async () => {
+test("assessMulesoftApiGateway warns when only non-production APIs lack policies and flags environment filters as a partial view", async () => {
   const client = healthyApiGatewayClient({
     getResolvedConfig: () => sampleConfig({ environmentFilter: ["Production"] }),
     async listApiPolicies(environmentId) {
-      return environmentId === "env-prod" ? [{ assetId: "client-id-enforcement" }, { assetId: "spike-control" }] : [];
+      return environmentId === "env-prod"
+        ? [{ assetId: "client-id-enforcement", disabled: false }, { assetId: "spike-control", disabled: false }]
+        : [];
     },
   });
 
   const filtered = await assessMulesoftApiGateway(client);
+  assert.equal(filtered.summary.environments_visible, 2);
   assert.equal(filtered.summary.environments_sampled, 1);
-  assert.equal(statusOf(filtered, "MULESOFT-API-07"), "pass");
+  assert.equal(statusOf(filtered, "MULESOFT-API-07"), "warn");
+  assert.match(findingById(filtered, "MULESOFT-API-07").summary, /Partial view: the environment filter excluded 1 environment\(s\) \(0 production\): Sandbox/);
+  assert.match(findingById(filtered, "MULESOFT-API-07").summary, /cannot pass on this sample/);
+  assert.deepEqual(findingById(filtered, "MULESOFT-API-07").evidence.partial_view, ["the environment filter excluded 1 environment(s) (0 production): Sandbox"]);
 
   const unfiltered = await assessMulesoftApiGateway(healthyApiGatewayClient({ listApiPolicies: client.listApiPolicies }));
   assert.equal(statusOf(unfiltered, "MULESOFT-API-07"), "warn");
+  assert.match(findingById(unfiltered, "MULESOFT-API-07").summary, /1 non-production instance\(s\) do not/);
   assert.equal(statusOf(unfiltered, "MULESOFT-API-08"), "warn");
+  assert.equal(findingById(unfiltered, "MULESOFT-API-07").evidence.partial_view, undefined);
 });
 
 test("assessMulesoftRuntimeInfrastructure passes hardened CloudHub, VPC, DLB, MQ, and hybrid posture", async () => {
@@ -916,7 +934,7 @@ test("assessMulesoftAuditMonitoring passes when audit logs flow and production a
   assert.deepEqual(result.errors, []);
 });
 
-test("assessMulesoftAuditMonitoring fails when the audit query is forbidden and production has no alerts", async () => {
+test("assessMulesoftAuditMonitoring marks a forbidden audit query manual and fails production without alerts", async () => {
   const client = healthyAuditClient({
     async queryAuditLogs() {
       throw new MulesoftApiError(403, "Anypoint request failed (403 Forbidden) for POST /audit/v2/organizations/org-1/query");
@@ -928,8 +946,9 @@ test("assessMulesoftAuditMonitoring fails when the audit query is forbidden and 
 
   const result = await assessMulesoftAuditMonitoring(client);
 
-  assert.equal(statusOf(result, "MULESOFT-AUD-17"), "fail");
-  assert.match(findingById(result, "MULESOFT-AUD-17").summary, /audit log query failed/);
+  assert.equal(statusOf(result, "MULESOFT-AUD-17"), "manual");
+  assert.match(findingById(result, "MULESOFT-AUD-17").summary, /Could not evaluate: audit_query could not be read, the credential lacks permission \(HTTP 403\)/);
+  assert.match(findingById(result, "MULESOFT-AUD-17").summary, /Audit Log Viewer/);
   assert.equal(statusOf(result, "MULESOFT-AUD-24"), "fail");
   assert.deepEqual(findingById(result, "MULESOFT-AUD-24").evidence.environments_without_alerts, ["Production"]);
   assert.ok(result.errors.some((error) => error.startsWith("audit_query:")));
