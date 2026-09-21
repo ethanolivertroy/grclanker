@@ -289,12 +289,19 @@ export interface GitHubBranchRulesEntry {
   error?: string;
 }
 
+// protection is null both for a documented 404 (the branch carries no classic protection) and for
+// a failed read; only `error` distinguishes them, so absence is never inferred from a 403.
+export interface GitHubBranchProtectionEntry {
+  protection: JsonRecord | null;
+  error?: string;
+}
+
 interface GitHubRepoProtectionData {
   org: CollectedDataset<JsonRecord | null>;
   repositories: CollectedDataset<JsonRecord[]>;
   orgRulesets: CollectedDataset<JsonRecord[]>;
-  repoRulesets: CollectedDataset<Record<string, JsonRecord[]>>;
-  branchProtections: CollectedDataset<Record<string, JsonRecord | null>>;
+  repoRulesets: CollectedDataset<Record<string, GitHubRepoListEntry>>;
+  branchProtections: CollectedDataset<Record<string, GitHubBranchProtectionEntry>>;
   branchRules: CollectedDataset<Record<string, GitHubBranchRulesEntry>>;
 }
 
@@ -1051,11 +1058,32 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+// Every REST failure names the endpoint and HTTP status (rule 1 corollary): the demoted summaries
+// append this string, so the reader can tell which inventory was unreadable and why.
 function summarizeError(error: unknown): string {
   if (error instanceof GitHubHttpError) {
-    return `GitHub request failed (${error.status}): ${error.message}`;
+    return `GitHub request failed (${error.status}) for ${error.method} ${error.path}: ${error.message}`;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+// Renders the request target without the base URL or the per_page pagination knob so the path
+// reads like the documented endpoint (`/orgs/{org}/members?role=admin`).
+export function describeRequestTarget(pathname: string): string {
+  let target = pathname;
+  if (/^https?:\/\//i.test(pathname)) {
+    try {
+      const url = new URL(pathname);
+      target = `${url.pathname}${url.search}`;
+    } catch {
+      target = pathname;
+    }
+  }
+  const [path, query = ""] = target.split("?", 2);
+  const keptParams = query
+    .split("&")
+    .filter((param) => param.length > 0 && !/^per_page=/i.test(param));
+  return keptParams.length > 0 ? `${path}?${keptParams.join("&")}` : path;
 }
 
 function extractRecords(payload: unknown): JsonRecord[] {
@@ -1087,8 +1115,15 @@ function extractRecords(payload: unknown): JsonRecord[] {
     : [];
 }
 
-function listErrors(datasets: Array<CollectedDataset<unknown>>): string[] {
-  return datasets.flatMap((dataset) => dataset.error ? [dataset.error] : []);
+function listErrors(datasets: Array<[string, CollectedDataset<unknown>]>): string[] {
+  return datasets.flatMap(([name, dataset]) => dataset.error ? [`${name}: ${dataset.error}`] : []);
+}
+
+// Per-repository collectors record failures inside their entries rather than on the dataset, so
+// the bundle error log has to walk the entries to keep its "every failed collector is recorded" promise.
+function listPerRepoErrors(name: string, dataset: CollectedDataset<Record<string, { error?: string }>>): string[] {
+  if (dataset.error) return [];
+  return Object.entries(dataset.data).flatMap(([key, entry]) => entry.error ? [`${name} for ${key}: ${entry.error}`] : []);
 }
 
 async function collectDataset<T>(
@@ -1106,13 +1141,17 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-class GitHubHttpError extends Error {
+export class GitHubHttpError extends Error {
   status: number;
+  method: string;
+  path: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, method: string = "GET", path: string = "unknown") {
     super(message);
     this.name = "GitHubHttpError";
     this.status = status;
+    this.method = method;
+    this.path = path;
   }
 }
 
@@ -1391,11 +1430,12 @@ export class GitHubAuditorClient {
   ): Promise<ResponseEnvelope<T>> {
     let attempt = 0;
     let forceRefresh = false;
+    const method = options.method ?? (options.body ? "POST" : "GET");
 
     while (attempt <= MAX_RETRIES) {
       const token = await this.getAccessToken(forceRefresh);
       const response = await this.fetchImpl(this.buildUrl(pathname), {
-        method: options.method ?? (options.body ? "POST" : "GET"),
+        method,
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${token}`,
@@ -1430,10 +1470,10 @@ export class GitHubAuditorClient {
       }
 
       const message = asString(asRecord(payload).message) ?? response.statusText ?? rawText ?? "request failed";
-      throw new GitHubHttpError(response.status, message);
+      throw new GitHubHttpError(response.status, message, method, describeRequestTarget(pathname));
     }
 
-    throw new Error(`GitHub request retries exhausted for ${pathname}`);
+    throw new Error(`GitHub request retries exhausted for ${method} ${describeRequestTarget(pathname)}`);
   }
 
   async graphql<T = JsonRecord>(
@@ -2453,7 +2493,8 @@ async function buildBundleQuickReference(rootDir: string): Promise<void> {
       "- `core_data/` contains the raw GitHub API payloads collected for this assessment.",
       "- `analysis/` contains normalized findings in JSON (findings.json plus one file per assessment category).",
       "- `compliance/` contains the executive summary, unified matrix, and per-framework reports under frameworks/.",
-      "- `_errors.log` is present only when one or more collectors failed; every finding that depended on a failed collector is Manual or Partial, never Pass.",
+      "- `_errors.log` is present only when one or more collectors failed, including per-repository reads (branch rules, classic protection, repository rulesets, webhooks, deploy keys); each line names the dataset, the endpoint, and the HTTP status.",
+      "- Every finding that depended on a failed collector is Manual, Partial, or Fail, never Pass; counts derived from an unreadable inventory render as null with the failure named instead of 0.",
       "- The paired `.zip` next to this directory carries the same name, so a rerun allocates a new directory and archive instead of overwriting this one.",
       "",
       "This bundle is read-only evidence and analysis output. It does not contain GitHub write-capable credentials.",
@@ -3029,25 +3070,26 @@ export async function collectGitHubRepoProtectionData(
     return Object.fromEntries(entries);
   });
 
-  const repoRulesets = await collectDataset<Record<string, JsonRecord[]>>({}, async () => {
-    const entries = await mapWithConcurrency(eligibleRepos, 6, async (repo) => {
-      const owner = asString(asRecord(repo.owner).login) ?? "";
-      const name = asString(repo.name) ?? "";
-      const key = repoKey(repo);
-      const rulesets = await client.listRepoRulesets(owner, name);
-      return [key, rulesets] as const;
-    });
-    return Object.fromEntries(entries);
-  });
+  const repoRulesets = await collectDataset<Record<string, GitHubRepoListEntry>>({}, () =>
+    collectPerRepo(eligibleRepos, (owner, name) => client.listRepoRulesets(owner, name)));
 
-  const branchProtections = await collectDataset<Record<string, JsonRecord | null>>({}, async () => {
+  // A 404 is the documented "branch not protected" answer and is recorded as protection: null;
+  // every other failure (403, 401, 5xx) is recorded per repository so one denied repository
+  // neither fails the whole dataset nor reads as an absence of classic protection.
+  const branchProtections = await collectDataset<Record<string, GitHubBranchProtectionEntry>>({}, async () => {
     const entries = await mapWithConcurrency(eligibleRepos, 6, async (repo) => {
       const owner = asString(asRecord(repo.owner).login) ?? "";
       const name = asString(repo.name) ?? "";
       const key = repoKey(repo);
       const defaultBranch = asString(repo.default_branch);
-      const protection = defaultBranch ? await client.getBranchProtection(owner, name, defaultBranch) : null;
-      return [key, protection] as const;
+      if (!defaultBranch) {
+        return [key, { protection: null, error: "repository has no default_branch" }] as const;
+      }
+      try {
+        return [key, { protection: await client.getBranchProtection(owner, name, defaultBranch) }] as const;
+      } catch (error) {
+        return [key, { protection: null, error: summarizeError(error) }] as const;
+      }
     });
     return Object.fromEntries(entries);
   });
@@ -3645,24 +3687,76 @@ interface RepoProtectionPosture {
   orgSourcedRules: number;
   repoSourcedRules: number;
   legacyProtection: boolean;
-  unknown: boolean;
+  rulesError: string | null;
+  protectionError: string | null;
+  evaluated: boolean;
+}
+
+// What the collectors returned for one repository on each surface. An undefined entry means the
+// whole dataset failed (the dataset error is carried alongside) or the repository was never read.
+interface RepoSurfaceReads {
+  protectionEntry: GitHubBranchProtectionEntry | undefined;
+  rulesEntry: GitHubBranchRulesEntry | undefined;
+  protectionDatasetError: string | undefined;
+  rulesDatasetError: string | undefined;
 }
 
 function ruleParameters(rule: JsonRecord): JsonRecord {
   return asRecord(rule.parameters);
 }
 
+function repoEndpointParts(repo: JsonRecord): { owner: string; name: string; branch: string } {
+  return {
+    owner: asString(asRecord(repo.owner).login) ?? "{owner}",
+    name: asString(repo.name) ?? "{repo}",
+    branch: asString(repo.default_branch) ?? "{branch}",
+  };
+}
+
+function branchRulesEndpoint(repo: JsonRecord): string {
+  const { owner, name, branch } = repoEndpointParts(repo);
+  return `GET /repos/${owner}/${name}/rules/branches/${encodeURIComponent(branch)}`;
+}
+
+function branchProtectionEndpoint(repo: JsonRecord): string {
+  const { owner, name, branch } = repoEndpointParts(repo);
+  return `GET /repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`;
+}
+
+function surfaceReadError(
+  datasetError: string | undefined,
+  entry: { error?: string } | undefined,
+  missing: boolean,
+  notCollected: string,
+): string | null {
+  if (datasetError) return datasetError;
+  if (entry === undefined) return notCollected;
+  if (entry.error) return entry.error;
+  return missing ? notCollected : null;
+}
+
 // Field names follow the REST "Get branch protection" schema (branch-protection,
 // protected-branch-pull-request-review, protected-branch-required-status-check) and the
 // "Get rules for a branch" schema (repository-rule-detailed with ruleset_source_type).
-function evaluateRepoProtection(
-  key: string,
-  protection: JsonRecord | null,
-  rulesEntry: GitHubBranchRulesEntry | undefined,
-  legacyUnknown: boolean,
-): RepoProtectionPosture {
-  const rules = rulesEntry?.rules ?? [];
-  const rulesUnknown = !rulesEntry || rulesEntry.rules === null;
+// Rules and classic protection are additive surfaces, so a repository is evaluated only when
+// both were readable; a failed read on either surface never backfills from the other (rule 1
+// corollary), and a documented 404 on classic protection is the only reading of "absent".
+function evaluateRepoProtection(repo: JsonRecord, reads: RepoSurfaceReads): RepoProtectionPosture {
+  const key = repoKey(repo);
+  const rulesError = surfaceReadError(
+    reads.rulesDatasetError,
+    reads.rulesEntry,
+    reads.rulesEntry?.rules === null,
+    "branch rules were not collected for this repository",
+  );
+  const protectionError = surfaceReadError(
+    reads.protectionDatasetError,
+    reads.protectionEntry,
+    false,
+    "classic branch protection was not collected for this repository",
+  );
+  const rules = rulesError === null ? (reads.rulesEntry?.rules ?? []) : [];
+  const protection = protectionError === null ? (reads.protectionEntry?.protection ?? null) : null;
   const reviews = protection ? asRecord(protection.required_pull_request_reviews) : {};
   const legacyHasReviews = Boolean(protection && protection.required_pull_request_reviews);
   const statusChecks = protection ? asRecord(protection.required_status_checks) : {};
@@ -3698,27 +3792,70 @@ function evaluateRepoProtection(
     orgSourcedRules: rules.filter((rule) => safeLower(rule.ruleset_source_type) === "organization").length,
     repoSourcedRules: rules.filter((rule) => safeLower(rule.ruleset_source_type) === "repository").length,
     legacyProtection: protection !== null,
-    unknown: rulesUnknown && (legacyUnknown || protection === null),
+    rulesError,
+    protectionError,
+    evaluated: rulesError === null && protectionError === null,
   };
 }
 
-function coverageStatus(
-  compliant: number,
-  total: number,
-  unknown: number,
-): GitHubFindingStatus {
-  if (total === 0) return "Info";
-  if (compliant === total && unknown === 0) return "Pass";
-  if (compliant > 0 || unknown > 0) return "Partial";
-  return "Fail";
+const UNEVALUATED_SUMMARY_LIMIT = 3;
+const UNEVALUATED_EVIDENCE_LIMIT = 25;
+
+interface RepoCoverage {
+  compliant: number;
+  evaluated: number;
+  total: number;
+  unevaluated: string[];
 }
 
-function coverageSummary(label: string, compliant: number, total: number, unknown: number): string {
-  if (total === 0) return `No active repositories were found to assess ${label}.`;
-  const base = `${compliant} of ${total} active repositories ${label}`;
-  return unknown > 0
-    ? `${base}; ${unknown} repositories could not be evaluated because neither branch protection nor branch rules were readable.`
-    : `${base}.`;
+function describeUnevaluatedRepo(posture: RepoProtectionPosture, repo: JsonRecord): string {
+  const reasons = [
+    posture.rulesError !== null ? `branch rules (${branchRulesEndpoint(repo)}) unreadable: ${posture.rulesError}` : null,
+    posture.protectionError !== null ? `classic branch protection (${branchProtectionEndpoint(repo)}) unreadable: ${posture.protectionError}` : null,
+  ].filter((reason): reason is string => reason !== null);
+  return `${posture.key}: ${reasons.join("; ")}`;
+}
+
+function unevaluatedNote(unevaluated: string[], limit: number): string {
+  const shown = unevaluated.slice(0, limit);
+  const remainder = unevaluated.length - shown.length;
+  return `${unevaluated.length} could not be fully evaluated: ${shown.join(" | ")}${remainder > 0 ? ` | and ${remainder} more (see evidence)` : ""}`;
+}
+
+// Never Pass while any repository is unevaluated; Fail only when every evaluated repository is
+// non-compliant, since that failure is definite regardless of what the unread repositories hold.
+function coverageStatus(coverage: RepoCoverage): GitHubFindingStatus {
+  if (coverage.total === 0) return "Info";
+  if (coverage.unevaluated.length > 0) {
+    return coverage.evaluated > 0 && coverage.compliant === 0 ? "Fail" : "Partial";
+  }
+  if (coverage.compliant === coverage.evaluated) return "Pass";
+  return coverage.compliant > 0 ? "Partial" : "Fail";
+}
+
+function coverageSummary(label: string, coverage: RepoCoverage): string {
+  if (coverage.total === 0) return `No active repositories were found to assess ${label}.`;
+  if (coverage.unevaluated.length === 0) {
+    return `${coverage.compliant} of ${coverage.total} active repositories ${label}.`;
+  }
+  return `${coverage.compliant} of ${coverage.evaluated} evaluated repositories (${coverage.total} active) ${label}; ${unevaluatedNote(coverage.unevaluated, UNEVALUATED_SUMMARY_LIMIT)}.`;
+}
+
+function coverageRatio(count: number, coverage: RepoCoverage): string {
+  return coverage.unevaluated.length > 0
+    ? `${count}/${coverage.evaluated} evaluated (${coverage.total} active, ${coverage.unevaluated.length} not fully evaluated)`
+    : `${count}/${coverage.total}`;
+}
+
+function unevaluatedEvidence(unevaluated: string[]): string[] {
+  if (unevaluated.length === 0) return [];
+  const shown = unevaluated.slice(0, UNEVALUATED_EVIDENCE_LIMIT);
+  const remainder = unevaluated.length - shown.length;
+  return [
+    `repositories_not_fully_evaluated = ${unevaluated.length}`,
+    ...shown.map((entry) => `not evaluated: ${entry}`),
+    ...(remainder > 0 ? [`and ${remainder} more repositories not fully evaluated`] : []),
+  ];
 }
 
 export function assessGitHubRepoProtection(
@@ -3729,40 +3866,51 @@ export function assessGitHubRepoProtection(
   const orgRulesets = data.orgRulesets.data.filter(isActiveRuleset);
   const repos = data.repositories.data.filter((repo) => !isArchivedRepo(repo));
   const repositoriesUnreadable = Boolean(data.repositories.error);
-  const legacyUnknown = Boolean(data.branchProtections.error);
-  const rulesDatasetUnknown = Boolean(data.branchRules.error);
+  const protectionDatasetError = data.branchProtections.error;
+  const rulesDatasetError = data.branchRules.error;
 
   const postures = repos.map((repo) => {
     const key = repoKey(repo);
-    return evaluateRepoProtection(
-      key,
-      legacyUnknown ? null : (data.branchProtections.data[key] ?? null),
-      rulesDatasetUnknown ? undefined : data.branchRules.data[key],
-      legacyUnknown,
-    );
+    return evaluateRepoProtection(repo, {
+      protectionEntry: protectionDatasetError ? undefined : data.branchProtections.data[key],
+      rulesEntry: rulesDatasetError ? undefined : data.branchRules.data[key],
+      protectionDatasetError,
+      rulesDatasetError,
+    });
   });
+  const repoByKey = new Map(repos.map((repo) => [repoKey(repo), repo] as const));
 
   const repoCount = repos.length;
-  const unknownCount = postures.filter((posture) => posture.unknown).length;
-  const protectedCount = postures.filter((posture) => posture.requiresPullRequest && posture.blocksForcePush && posture.blocksDeletion).length;
-  const adminEnforcedCount = postures.filter((posture) => posture.adminEnforced === true).length;
-  const reviewCount = postures.filter((posture) => posture.approvingReviewCount >= 1).length;
-  const codeOwnerCount = postures.filter((posture) => posture.requiresCodeOwnerReview).length;
-  const dismissStaleCount = postures.filter((posture) => posture.dismissesStaleReviews).length;
-  const lastPushApprovalCount = postures.filter((posture) => posture.requiresLastPushApproval).length;
-  const statusCheckCount = postures.filter((posture) => posture.requiredStatusCheckCount >= 1).length;
-  const strictCount = postures.filter((posture) => posture.strictStatusChecks).length;
-  const signedCount = postures.filter((posture) => posture.requiresSignatures).length;
-  const bypassRestrictedCount = postures.filter((posture) => posture.blocksForcePush && posture.blocksDeletion).length;
-  const orgRuleCoveredCount = postures.filter((posture) => posture.orgSourcedRules > 0).length;
-  const repoRuleCoveredCount = postures.filter((posture) => posture.repoSourcedRules > 0).length;
-  const legacyCoveredCount = postures.filter((posture) => posture.legacyProtection).length;
+  const evaluated = postures.filter((posture) => posture.evaluated);
+  const unevaluated = postures
+    .filter((posture) => !posture.evaluated)
+    .map((posture) => describeUnevaluatedRepo(posture, repoByKey.get(posture.key) ?? {}));
+  const nothingReadable = repoCount > 0 && postures.every((posture) => posture.rulesError !== null && posture.protectionError !== null);
+  const coverage = (compliant: number): RepoCoverage => ({ compliant, evaluated: evaluated.length, total: repoCount, unevaluated });
+  const protectedCount = evaluated.filter((posture) => posture.requiresPullRequest && posture.blocksForcePush && posture.blocksDeletion).length;
+  const adminEnforcedCount = evaluated.filter((posture) => posture.adminEnforced === true).length;
+  const reviewCount = evaluated.filter((posture) => posture.approvingReviewCount >= 1).length;
+  const codeOwnerCount = evaluated.filter((posture) => posture.requiresCodeOwnerReview).length;
+  const dismissStaleCount = evaluated.filter((posture) => posture.dismissesStaleReviews).length;
+  const lastPushApprovalCount = evaluated.filter((posture) => posture.requiresLastPushApproval).length;
+  const statusCheckCount = evaluated.filter((posture) => posture.requiredStatusCheckCount >= 1).length;
+  const strictCount = evaluated.filter((posture) => posture.strictStatusChecks).length;
+  const signedCount = evaluated.filter((posture) => posture.requiresSignatures).length;
+  const bypassRestrictedCount = evaluated.filter((posture) => posture.blocksForcePush && posture.blocksDeletion).length;
+  const orgRuleCoveredCount = evaluated.filter((posture) => posture.orgSourcedRules > 0).length;
+  const repoRuleCoveredCount = evaluated.filter((posture) => posture.repoSourcedRules > 0).length;
+  const legacyCoveredCount = evaluated.filter((posture) => posture.legacyProtection).length;
   const webCommitSignoffRequired = asBoolean(org && asRecord(org).web_commit_signoff_required);
+  const ratio = (count: number): string => coverageRatio(count, coverage(count));
 
   const unreadableEvidence = [
     `repositories error = ${data.repositories.error}`,
   ];
   const unreadableNote = "Rerun with a principal that can list organization repositories (metadata read) or export the repository list from the org UI.";
+
+  const nothingReadableSummary = (label: string): string =>
+    `Neither branch rules nor classic branch protection were readable for any of the ${repoCount} active repositories, so ${label} could not be evaluated.`;
+  const nothingReadableNote = "Grant the principal repository administration read (classic protection) and metadata read (rules for a branch) on the repositories, or review Settings > Rules and Settings > Branches per repository.";
 
   const repoScoped = (
     id: string,
@@ -3773,16 +3921,39 @@ export function assessGitHubRepoProtection(
     manualNote?: string,
   ): GitHubFinding => {
     if (repositoriesUnreadable) {
-      return buildFinding(id, "Manual", `The repository list was not readable, so ${label} could not be evaluated.`, unreadableEvidence, recommendation, unreadableNote);
+      return buildFinding(id, "Manual", `The repository list (GET /orgs/{org}/repos) was not readable, so ${label} could not be evaluated: ${data.repositories.error}`, unreadableEvidence, recommendation, unreadableNote);
     }
+    if (nothingReadable) {
+      return buildFinding(id, "Manual", nothingReadableSummary(label), [...evidence, ...unevaluatedEvidence(unevaluated)], recommendation, nothingReadableNote);
+    }
+    const repoCoverage = coverage(compliant);
     return buildFinding(
       id,
-      coverageStatus(compliant, repoCount, unknownCount),
-      coverageSummary(label, compliant, repoCount, unknownCount),
-      [...evidence, ...(unknownCount > 0 ? [`repos_not_evaluable = ${unknownCount}`] : [])],
+      coverageStatus(repoCoverage),
+      coverageSummary(label, repoCoverage),
+      [...evidence, ...unevaluatedEvidence(unevaluated)],
       recommendation,
       manualNote,
     );
+  };
+
+  const orgRulesetStatus = (): GitHubFindingStatus => {
+    if (orgRulesets.length === 0) {
+      return repoRuleCoveredCount > 0 ? "Partial" : "Fail";
+    }
+    if (unevaluated.length > 0) return "Partial";
+    return repoCount === 0 || orgRuleCoveredCount === repoCount ? "Pass" : "Partial";
+  };
+  const orgRulesetSummary = (): string => {
+    if (orgRulesets.length === 0) {
+      return repoRuleCoveredCount > 0
+        ? `${repoRuleCoveredCount} repositories receive repository-level rules, but no active organization rulesets exist.`
+        : "No active organization rulesets exist and no evaluated default branch receives ruleset rules.";
+    }
+    const base = unevaluated.length > 0
+      ? `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${evaluated.length} evaluated default branches (${repoCount} active) receive organization-sourced rules; ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`
+      : `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${repoCount} active default branches receive organization-sourced rules`;
+    return `${base}.`;
   };
 
   const findings: GitHubFinding[] = [
@@ -3790,9 +3961,11 @@ export function assessGitHubRepoProtection(
       ? buildFinding(
         "GITHUB-REPO-001",
         "Manual",
-        "Organization rulesets or the repository list were not readable, so ruleset coverage is unverified.",
+        data.orgRulesets.error
+          ? `Organization rulesets (GET /orgs/{org}/rulesets) were not readable, so ruleset coverage is unverified: ${data.orgRulesets.error}`
+          : `The repository list (GET /orgs/{org}/repos) was not readable, so ruleset coverage is unverified: ${data.repositories.error}`,
         [
-          data.orgRulesets.error ? `org_rulesets error = ${data.orgRulesets.error}` : `active_org_rulesets = ${orgRulesets.length}`,
+          data.orgRulesets.error ? `active_org_rulesets = null (GET /orgs/{org}/rulesets unreadable: ${data.orgRulesets.error})` : `active_org_rulesets = ${orgRulesets.length}`,
           ...(repositoriesUnreadable ? unreadableEvidence : []),
         ],
         "Use organization rulesets where possible so baseline branch protections are declarative and harder to drift.",
@@ -3800,19 +3973,14 @@ export function assessGitHubRepoProtection(
       )
       : buildFinding(
         "GITHUB-REPO-001",
-        orgRulesets.length > 0
-          ? (repoCount === 0 || orgRuleCoveredCount === repoCount ? "Pass" : "Partial")
-          : (repoRuleCoveredCount > 0 ? "Partial" : "Fail"),
-        orgRulesets.length > 0
-          ? `${orgRulesets.length} active organization ruleset(s) exist and ${orgRuleCoveredCount} of ${repoCount} active default branches receive organization-sourced rules.`
-          : (repoRuleCoveredCount > 0
-            ? `${repoRuleCoveredCount} repositories receive repository-level rules, but no active organization rulesets exist.`
-            : "No active organization rulesets exist and no default branch receives ruleset rules."),
+        orgRulesetStatus(),
+        orgRulesetSummary(),
         [
           `active_org_rulesets = ${orgRulesets.length}`,
-          `repos_with_org_sourced_rules = ${orgRuleCoveredCount}/${repoCount}`,
-          `repos_with_repo_sourced_rules = ${repoRuleCoveredCount}/${repoCount}`,
-          `repos_with_legacy_branch_protection = ${legacyCoveredCount}/${repoCount}`,
+          `repos_with_org_sourced_rules = ${ratio(orgRuleCoveredCount)}`,
+          `repos_with_repo_sourced_rules = ${ratio(repoRuleCoveredCount)}`,
+          `repos_with_legacy_branch_protection = ${ratio(legacyCoveredCount)}`,
+          ...unevaluatedEvidence(unevaluated),
         ],
         "Use organization rulesets where possible so baseline branch protections are declarative and harder to drift.",
       ),
@@ -3821,7 +3989,7 @@ export function assessGitHubRepoProtection(
       "require pull requests and block force pushes and deletions on the default branch",
       protectedCount,
       [
-        `protected_default_branches = ${protectedCount}/${repoCount}`,
+        `protected_default_branches = ${ratio(protectedCount)}`,
         `admin_enforced_legacy_protections = ${adminEnforcedCount}/${legacyCoveredCount}`,
         `org_rulesets = ${orgRulesets.length}`,
       ],
@@ -3832,14 +4000,14 @@ export function assessGitHubRepoProtection(
       "GITHUB-REPO-003",
       "require signed commits on the default branch",
       signedCount,
-      [`signed_commit_enforced_repos = ${signedCount}/${repoCount}`],
+      [`signed_commit_enforced_repos = ${ratio(signedCount)}`],
       "Require signed commits or equivalent integrity enforcement for protected branches.",
     ),
     repoScoped(
       "GITHUB-REPO-004",
       "block both force pushes and branch deletion on the default branch",
       bypassRestrictedCount,
-      [`repos_with_bypass_restrictions = ${bypassRestrictedCount}/${repoCount}`],
+      [`repos_with_bypass_restrictions = ${ratio(bypassRestrictedCount)}`],
       "Restrict force pushes and branch deletions on protected branches so administrative bypass stays exceptional.",
     ),
     buildFinding(
@@ -3860,11 +4028,11 @@ export function assessGitHubRepoProtection(
       "require at least one approving review on the default branch",
       reviewCount,
       [
-        `repos_requiring_approving_review = ${reviewCount}/${repoCount}`,
-        `repos_requiring_code_owner_review = ${codeOwnerCount}/${repoCount}`,
-        `repos_dismissing_stale_reviews = ${dismissStaleCount}/${repoCount}`,
-        `repos_requiring_last_push_approval = ${lastPushApprovalCount}/${repoCount}`,
-        `repos_requiring_pull_request_without_review_count = ${postures.filter((posture) => posture.requiresPullRequest && posture.approvingReviewCount === 0).length}`,
+        `repos_requiring_approving_review = ${ratio(reviewCount)}`,
+        `repos_requiring_code_owner_review = ${ratio(codeOwnerCount)}`,
+        `repos_dismissing_stale_reviews = ${ratio(dismissStaleCount)}`,
+        `repos_requiring_last_push_approval = ${ratio(lastPushApprovalCount)}`,
+        `repos_requiring_pull_request_without_review_count = ${evaluated.filter((posture) => posture.requiresPullRequest && posture.approvingReviewCount === 0).length}`,
       ],
       "Set required_approving_review_count to at least 1 (2 for sensitive repositories), require code owner review, dismiss stale approvals, and require last-push approval.",
     ),
@@ -3873,8 +4041,8 @@ export function assessGitHubRepoProtection(
       "require at least one status check on the default branch",
       statusCheckCount,
       [
-        `repos_requiring_status_checks = ${statusCheckCount}/${repoCount}`,
-        `repos_with_strict_status_checks = ${strictCount}/${repoCount}`,
+        `repos_requiring_status_checks = ${ratio(statusCheckCount)}`,
+        `repos_with_strict_status_checks = ${ratio(strictCount)}`,
       ],
       "Require named CI status checks (with the strict up-to-date policy) before merging into default branches.",
     ),
@@ -3887,12 +4055,13 @@ export function assessGitHubRepoProtection(
     snapshotSummary: {
       active_repositories: repositoriesUnreadable ? "error" : repoCount,
       active_org_rulesets: data.orgRulesets.error ? "error" : orgRulesets.length,
+      evaluated_repositories: evaluated.length,
       protected_repositories: protectedCount,
       review_required_repositories: reviewCount,
       status_check_required_repositories: statusCheckCount,
       signed_commit_repositories: signedCount,
       bypass_restricted_repositories: bypassRestrictedCount,
-      repos_not_evaluable: unknownCount,
+      repos_not_evaluable: unevaluated.length,
     },
     text: buildAssessmentText("GitHub repository protection assessment", config.organization, findings),
   };
@@ -4360,11 +4529,16 @@ export async function exportGitHubAuditBundle(
   ];
 
   const errors = [
-    ...listErrors(Object.values(orgAccess)),
-    ...listErrors(Object.values(repoProtection)),
-    ...listErrors(Object.values(actions)),
-    ...listErrors(Object.values(codeSecurity)),
-    ...listErrors(Object.values(integrations)),
+    ...listErrors(Object.entries(orgAccess)),
+    ...listErrors(Object.entries(repoProtection)),
+    ...listPerRepoErrors("branchRules", repoProtection.branchRules),
+    ...listPerRepoErrors("branchProtections", repoProtection.branchProtections),
+    ...listPerRepoErrors("repoRulesets", repoProtection.repoRulesets),
+    ...listErrors(Object.entries(actions)),
+    ...listErrors(Object.entries(codeSecurity)),
+    ...listErrors(Object.entries(integrations)),
+    ...listPerRepoErrors("repoHooks", integrations.repoHooks),
+    ...listPerRepoErrors("deployKeys", integrations.deployKeys),
   ];
 
   const outputDir = await nextAvailableAuditDir(

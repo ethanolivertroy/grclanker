@@ -228,36 +228,46 @@ function createRepoProtectionData(overrides = {}) {
       },
     ]),
     repoRulesets: dataset({
-      "example-org/app-one": [
-        {
-          id: 2,
-          enforcement: "active",
-          rules: [
-            { type: "required_signatures" },
-            { type: "non_fast_forward" },
-          ],
-        },
-      ],
-      "example-org/app-two": [],
+      "example-org/app-one": {
+        items: [
+          {
+            id: 2,
+            enforcement: "active",
+            rules: [
+              { type: "required_signatures" },
+              { type: "non_fast_forward" },
+            ],
+          },
+        ],
+      },
+      "example-org/app-two": { items: [] },
     }),
     branchProtections: dataset({
       "example-org/app-one": {
-        required_pull_request_reviews: { required_approving_review_count: 2 },
-        required_status_checks: { strict: true, contexts: ["ci"] },
-        required_signatures: { enabled: true },
-        allow_force_pushes: { enabled: false },
-        allow_deletions: { enabled: false },
+        protection: {
+          required_pull_request_reviews: { required_approving_review_count: 2 },
+          required_status_checks: { strict: true, contexts: ["ci"] },
+          required_signatures: { enabled: true },
+          allow_force_pushes: { enabled: false },
+          allow_deletions: { enabled: false },
+        },
       },
       "example-org/app-two": {
-        required_pull_request_reviews: { required_approving_review_count: 1 },
-        required_status_checks: { strict: true, contexts: ["ci"] },
-        required_signatures: { enabled: false },
-        allow_force_pushes: { enabled: false },
-        allow_deletions: { enabled: false },
+        protection: {
+          required_pull_request_reviews: { required_approving_review_count: 1 },
+          required_status_checks: { strict: true, contexts: ["ci"] },
+          required_signatures: { enabled: false },
+          allow_force_pushes: { enabled: false },
+          allow_deletions: { enabled: false },
+        },
       },
     }),
     ...overrides,
   };
+}
+
+function protectionEntries(entries) {
+  return Object.fromEntries(Object.entries(entries).map(([key, protection]) => [key, { protection }]));
 }
 
 function createActionsData() {
@@ -774,8 +784,8 @@ test("GitHubAuditorClient identity collectors paginate GraphQL connections and u
   assert.equal(requests.filter((entry) => entry.url.pathname === "/graphql").length, 5);
 });
 
-function jsonResponse(body, headers = {}) {
-  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
+function jsonResponse(body, headers = {}, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
 function createGraphqlPagingFetch({ samlPageInfo, ipPageInfo, samlTotal = 7000, ipTotal = 7000 }) {
@@ -981,7 +991,7 @@ test("repo protection findings read review and status-check detail from rules an
   assert.match(mixed.findings.find((entry) => entry.id === "GITHUB-REPO-001").summary, /1 of 2 active default branches receive organization-sourced rules/);
 
   const rulesOnly = assessGitHubRepoProtection(createRepoProtectionData({
-    branchProtections: dataset({ "example-org/app-one": null, "example-org/app-two": null }),
+    branchProtections: dataset(protectionEntries({ "example-org/app-one": null, "example-org/app-two": null })),
     branchRules: dataset({
       "example-org/app-one": createBranchRules()["example-org/app-one"],
       "example-org/app-two": createBranchRules()["example-org/app-one"],
@@ -993,7 +1003,7 @@ test("repo protection findings read review and status-check detail from rules an
 
   const legacyOnly = assessGitHubRepoProtection(createRepoProtectionData({
     branchRules: dataset({ "example-org/app-one": { rules: [] }, "example-org/app-two": { rules: [] } }),
-    branchProtections: dataset({
+    branchProtections: dataset(protectionEntries({
       "example-org/app-one": {
         required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true, require_last_push_approval: false },
         required_status_checks: { strict: false, contexts: [], checks: [{ context: "build", app_id: 15368 }] },
@@ -1010,7 +1020,7 @@ test("repo protection findings read review and status-check detail from rules an
         allow_force_pushes: { enabled: true },
         allow_deletions: { enabled: false },
       },
-    }),
+    })),
   }), config);
   assert.equal(findingStatus(legacyOnly, "GITHUB-REPO-002"), "Partial");
   assert.equal(findingStatus(legacyOnly, "GITHUB-REPO-006"), "Partial");
@@ -1021,7 +1031,7 @@ test("repo protection findings read review and status-check detail from rules an
   const unprotected = assessGitHubRepoProtection(createRepoProtectionData({
     orgRulesets: dataset([]),
     branchRules: dataset({ "example-org/app-one": { rules: [] }, "example-org/app-two": { rules: [] } }),
-    branchProtections: dataset({ "example-org/app-one": null, "example-org/app-two": null }),
+    branchProtections: dataset(protectionEntries({ "example-org/app-one": null, "example-org/app-two": null })),
   }), config);
   for (const id of ["GITHUB-REPO-001", "GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
     assert.equal(findingStatus(unprotected, id), "Fail", `${id} should fail with no protection`);
@@ -1039,17 +1049,51 @@ test("repo protection findings never pass on unreadable or partially readable in
     assert.equal(findingStatus(unreadableRepos, id), "Manual", `${id} should be manual when repositories are unreadable`);
   }
 
-  const partiallyReadable = assessGitHubRepoProtection(createRepoProtectionData({
+  const protectionDatasetFailed = assessGitHubRepoProtection(createRepoProtectionData({
     branchProtections: dataset({}, "GitHub request failed (403): branch protection requires admin"),
     branchRules: dataset({
       "example-org/app-one": createBranchRules()["example-org/app-one"],
       "example-org/app-two": { rules: null, error: "GitHub request failed (403): forbidden" },
     }),
   }), config);
-  for (const id of ["GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
-    assert.equal(findingStatus(partiallyReadable, id), "Partial", `${id} should be partial when one repo is not evaluable`);
-    assert.match(partiallyReadable.findings.find((entry) => entry.id === id).summary, /1 repositories could not be evaluated/);
+  for (const id of ["GITHUB-REPO-001", "GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
+    const finding = protectionDatasetFailed.findings.find((entry) => entry.id === id);
+    assert.equal(finding.status, "Partial", `${id} should be partial when classic protection is unreadable for every repository`);
+    assert.match(finding.summary, /2 could not be fully evaluated/);
+    assert.match(finding.summary, /GET \/repos\/example-org\/app-two\/rules\/branches\/main\) unreadable: GitHub request failed \(403\): forbidden/);
+    assert.match(finding.summary, /GET \/repos\/example-org\/app-one\/branches\/main\/protection\) unreadable: GitHub request failed \(403\): branch protection requires admin/);
   }
+  assert.match(protectionDatasetFailed.findings.find((entry) => entry.id === "GITHUB-REPO-001").evidence.join("\n"), /repos_with_legacy_branch_protection = 0\/0 evaluated \(2 active, 2 not fully evaluated\)/);
+
+  const oneRepoProtectionForbidden = assessGitHubRepoProtection(createRepoProtectionData({
+    branchProtections: dataset({
+      ...createRepoProtectionData().branchProtections.data,
+      "example-org/app-two": { protection: null, error: "GitHub request failed (403) for GET /repos/example-org/app-two/branches/main/protection: Resource not accessible by integration" },
+    }),
+    branchRules: dataset({
+      "example-org/app-one": createBranchRules()["example-org/app-one"],
+      "example-org/app-two": createBranchRules()["example-org/app-one"],
+    }),
+  }), config);
+  for (const id of ["GITHUB-REPO-001", "GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
+    const finding = oneRepoProtectionForbidden.findings.find((entry) => entry.id === id);
+    assert.equal(finding.status, "Partial", `${id} must not pass when one repository's classic protection returned 403 even though its rules are compliant`);
+    assert.match(finding.summary, /1 of 1 evaluated (repositories|default branches) \(2 active\)/);
+    assert.match(finding.summary, /example-org\/app-two: classic branch protection \(GET \/repos\/example-org\/app-two\/branches\/main\/protection\) unreadable: GitHub request failed \(403\)/);
+    assert.doesNotMatch(finding.summary, /app-two: branch rules/);
+    assert.match(finding.evidence.join("\n"), /repositories_not_fully_evaluated = 1/);
+  }
+
+  const nothingReadable = assessGitHubRepoProtection(createRepoProtectionData({
+    branchProtections: dataset({}, "GitHub request failed (403): forbidden"),
+    branchRules: dataset({}, "GitHub request failed (403): forbidden"),
+  }), config);
+  for (const id of ["GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
+    const finding = nothingReadable.findings.find((entry) => entry.id === id);
+    assert.equal(finding.status, "Manual", `${id} should be manual when neither surface is readable for any repository`);
+    assert.match(finding.summary, /Neither branch rules nor classic branch protection were readable for any of the 2 active repositories/);
+  }
+  assert.equal(findingStatus(nothingReadable, "GITHUB-REPO-001"), "Partial");
 
   const noRepos = assessGitHubRepoProtection(createRepoProtectionData({
     repositories: dataset([]),
@@ -1075,8 +1119,12 @@ test("collectGitHubRepoProtectionData reads branch rules per repository and reco
       ]);
     }
     if (url.pathname === "/orgs/example-org/rulesets") return json([]);
+    if (url.pathname === "/repos/example-org/app-two/rulesets") return json({ message: "Resource not accessible by integration" }, 403);
     if (url.pathname.endsWith("/rulesets")) return json([]);
-    if (url.pathname.endsWith("/protection")) return json({ message: "Not Found" }, 404);
+    if (url.pathname === "/repos/example-org/app-one/branches/main/protection") return json({ message: "Not Found" }, 404);
+    if (url.pathname === "/repos/example-org/app-two/branches/release%2F2026/protection") {
+      return json({ message: "Resource not accessible by integration" }, 403);
+    }
     if (url.pathname === "/repos/example-org/app-one/rules/branches/main") {
       return json([{ type: "pull_request", parameters: { required_approving_review_count: 1 }, ruleset_source_type: "Organization", ruleset_source: "example-org", ruleset_id: 7 }]);
     }
@@ -1090,10 +1138,29 @@ test("collectGitHubRepoProtectionData reads branch rules per repository and reco
   assert.equal(data.branchRules.error, undefined);
   assert.equal(data.branchRules.data["example-org/app-one"].rules.length, 1);
   assert.equal(data.branchRules.data["example-org/app-two"].rules, null);
-  assert.match(data.branchRules.data["example-org/app-two"].error, /403/);
+  assert.match(data.branchRules.data["example-org/app-two"].error, /GitHub request failed \(403\) for GET \/repos\/example-org\/app-two\/rules\/branches\/release%2F2026: Resource not accessible by integration/);
   assert.equal(data.branchRules.data["example-org/old"], undefined);
   assert.ok(requests.includes("/repos/example-org/app-one/rules/branches/main?per_page=100"));
   assert.ok(requests.includes("/repos/example-org/app-two/rules/branches/release%2F2026?per_page=100"));
+
+  // A 404 is the documented "not protected" answer; a 403 is recorded per repository and never
+  // fails the whole dataset or reads as absence.
+  assert.equal(data.branchProtections.error, undefined);
+  assert.deepEqual(data.branchProtections.data["example-org/app-one"], { protection: null });
+  assert.equal(data.branchProtections.data["example-org/app-two"].protection, null);
+  assert.match(data.branchProtections.data["example-org/app-two"].error, /GitHub request failed \(403\) for GET \/repos\/example-org\/app-two\/branches\/release%2F2026\/protection/);
+  assert.equal(data.repoRulesets.error, undefined);
+  assert.deepEqual(data.repoRulesets.data["example-org/app-one"], { items: [] });
+  assert.equal(data.repoRulesets.data["example-org/app-two"].items, null);
+  assert.match(data.repoRulesets.data["example-org/app-two"].error, /\(403\) for GET \/repos\/example-org\/app-two\/rulesets/);
+
+  const assessed = assessGitHubRepoProtection(data, createSampleConfig());
+  for (const id of ["GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
+    const finding = assessed.findings.find((entry) => entry.id === id);
+    assert.notEqual(finding.status, "Pass", `${id} must not pass while app-two is unreadable on both surfaces`);
+    assert.match(finding.summary, /example-org\/app-two: branch rules \(GET \/repos\/example-org\/app-two\/rules\/branches\/release%2F2026\) unreadable: GitHub request failed \(403\)/);
+    assert.match(finding.summary, /classic branch protection \(GET \/repos\/example-org\/app-two\/branches\/release%2F2026\/protection\) unreadable: GitHub request failed \(403\)/);
+  }
 });
 
 test("integrations findings classify webhook, deploy key, and app installation posture", () => {
@@ -1307,10 +1374,10 @@ test("exportGitHubAuditBundle writes evidence and respects secure output roots",
         return createRepoProtectionData().orgRulesets.data;
       },
       async listRepoRulesets(_owner, repo) {
-        return createRepoProtectionData().repoRulesets.data[`example-org/${repo}`] ?? [];
+        return createRepoProtectionData().repoRulesets.data[`example-org/${repo}`]?.items ?? [];
       },
       async getBranchProtection(_owner, repo) {
-        return createRepoProtectionData().branchProtections.data[`example-org/${repo}`] ?? null;
+        return createRepoProtectionData().branchProtections.data[`example-org/${repo}`]?.protection ?? null;
       },
       async listBranchRules(_owner, repo) {
         return createBranchRules()[`example-org/${repo}`]?.rules ?? [];
@@ -2111,4 +2178,274 @@ test("exportGitHubAuditBundle records collector failures and never overwrites a 
   assert.match(errorLog, /HTTP 403/);
   const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
   assert.deepEqual(passingIds(findings), [...SETTING_DRIVEN_IDS, "GITHUB-ORG-005"].sort());
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rule 1 corollary sweep infrastructure: a fully compliant tenant served to the real client through
+// a routed fetch, with any single inventory deniable per scenario (fully or for one repository).
+// Variant A carries the branch verdicts on classic protection plus rulesets with org-level SAML;
+// variant B carries them on rulesets alone (classic protection 404) with enterprise OIDC only.
+// ---------------------------------------------------------------------------------------------
+
+const SWEEP_CONFIG = createSampleConfig({
+  apiBaseUrl: "https://api.github.test",
+  graphqlUrl: "https://api.github.test/graphql",
+  enterprise: "example-ent",
+});
+
+const SWEEP_REPOS = [
+  { full_name: "example-org/alpha", name: "alpha", default_branch: "main", archived: false, disabled: false, owner: { login: "example-org" } },
+  { full_name: "example-org/beta", name: "beta", default_branch: "main", archived: false, disabled: false, owner: { login: "example-org" } },
+];
+
+const SWEEP_REPO_SCOPED_IDS = ["GITHUB-REPO-001", "GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"];
+
+const SWEEP_ORG_SURFACES = {
+  "/orgs/example-org/outside_collaborators": "outside_collaborators",
+  "/orgs/example-org/invitations": "invitations",
+  "/orgs/example-org/organization-roles": "organization_roles",
+  "/orgs/example-org/credential-authorizations": "credential_authorizations",
+  "/orgs/example-org/audit-log": "audit_log",
+  "/orgs/example-org/hooks": "hooks",
+  "/orgs/example-org/installations": "installations",
+  "/orgs/example-org/repos": "repos",
+  "/orgs/example-org/rulesets": "org_rulesets",
+  "/orgs/example-org/actions/permissions": "actions_permissions",
+  "/orgs/example-org/actions/permissions/selected-actions": "selected_actions",
+  "/orgs/example-org/actions/permissions/workflow": "workflow_permissions",
+  "/orgs/example-org/actions/runner-groups": "runner_groups",
+  "/orgs/example-org/actions/runners": "runners",
+  "/orgs/example-org/code-security/configurations": "code_security_configurations",
+  "/orgs/example-org/code-security/configurations/defaults": "code_security_defaults",
+};
+
+const SWEEP_REPO_SURFACES = {
+  rulesets: "repo_rulesets",
+  hooks: "repo_hooks",
+  keys: "deploy_keys",
+  "branches/main/protection": "branch_protection",
+  "rules/branches/main": "branch_rules",
+};
+
+function sweepInventoryKey(url, init) {
+  if (url.pathname === "/graphql") {
+    const query = JSON.parse(init.body).query;
+    if (query.includes("externalIdentities")) return "graphql:saml";
+    if (query.includes("ipAllowListEntries")) return "graphql:ip_allow_list";
+    if (query.includes("enterprise(slug")) return "graphql:enterprise";
+    throw new Error(`Unexpected GraphQL query: ${query}`);
+  }
+  if (url.pathname === "/orgs/example-org") return "org";
+  if (url.pathname === "/orgs/example-org/members") {
+    if (url.searchParams.get("filter") === "2fa_disabled") return "members_2fa_disabled";
+    return url.searchParams.get("role") === "admin" ? "members_admin" : "members";
+  }
+  if (SWEEP_ORG_SURFACES[url.pathname]) return SWEEP_ORG_SURFACES[url.pathname];
+  const repoMatch = url.pathname.match(/^\/repos\/example-org\/([^/]+)\/(rulesets|hooks|keys|branches\/main\/protection|rules\/branches\/main)$/);
+  if (repoMatch) return `${SWEEP_REPO_SURFACES[repoMatch[2]]}:${repoMatch[1]}`;
+  throw new Error(`Unexpected request: ${url}`);
+}
+
+function sweepSamlOrganization(variant) {
+  if (variant === "B") {
+    return { login: "example-org", requiresTwoFactorAuthentication: true, samlIdentityProvider: null };
+  }
+  return {
+    login: "example-org",
+    requiresTwoFactorAuthentication: true,
+    samlIdentityProvider: {
+      ssoUrl: "https://idp.example.test/sso",
+      issuer: "https://idp.example.test",
+      digestMethod: "http://www.w3.org/2001/04/xmlenc#sha256",
+      signatureMethod: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+      externalIdentities: {
+        totalCount: 3,
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: ["alice", "bob", "carol"].map((login, index) => ({
+          guid: String(index + 1),
+          samlIdentity: { nameId: `${login}@example.test`, username: login },
+          scimIdentity: { username: login },
+          user: { login },
+        })),
+      },
+    },
+  };
+}
+
+function sweepEnterpriseOwnerInfo() {
+  return {
+    samlIdentityProvider: null,
+    oidcProvider: { providerType: "AAD", tenantId: "tenant-1" },
+    twoFactorRequiredSetting: "ENABLED",
+    affiliatedUsersWithTwoFactorDisabledExist: false,
+    ipAllowListEnabledSetting: "ENABLED",
+    ipAllowListForInstalledAppsEnabledSetting: "ENABLED",
+    ipAllowListUserLevelEnforcementEnabledSetting: "DISABLED",
+  };
+}
+
+function sweepGraphqlBody(key, variant) {
+  if (key === "graphql:saml") {
+    return { data: { organization: sweepSamlOrganization(variant) } };
+  }
+  if (key === "graphql:ip_allow_list") {
+    return {
+      data: {
+        organization: {
+          login: "example-org",
+          ipAllowListEnabledSetting: "ENABLED",
+          ipAllowListForInstalledAppsEnabledSetting: "ENABLED",
+          ipAllowListEntries: {
+            totalCount: 1,
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [{ allowListValue: "203.0.113.0/24", isActive: true, name: "HQ egress", createdAt: "2025-01-01T00:00:00Z" }],
+          },
+        },
+      },
+    };
+  }
+  return { data: { enterprise: { slug: "example-ent", ownerInfo: sweepEnterpriseOwnerInfo() } } };
+}
+
+// GraphQL denial styles: an HTTP 403, `data: null` with errors, the requested field null with a
+// pathed error, or the root object (organization / enterprise) null with a pathed error.
+function sweepGraphqlDenied(key, style) {
+  const field = key === "graphql:saml" ? "samlIdentityProvider" : (key === "graphql:ip_allow_list" ? "ipAllowListEntries" : "ownerInfo");
+  const root = key === "graphql:enterprise" ? "enterprise" : "organization";
+  const rootBody = key === "graphql:enterprise"
+    ? { slug: "example-ent" }
+    : { login: "example-org", requiresTwoFactorAuthentication: true, ipAllowListEnabledSetting: "ENABLED", ipAllowListForInstalledAppsEnabledSetting: "ENABLED" };
+  switch (style) {
+    case "http403":
+      return jsonResponse({ message: "Resource not accessible by integration" }, {}, 403);
+    case "data_null":
+      return jsonResponse({ data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration", path: [root, field] }] });
+    case "field_null":
+      return jsonResponse({ data: { [root]: { ...rootBody, [field]: null } }, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration", path: [root, field] }] });
+    case "root_null":
+      return jsonResponse({ data: { [root]: null }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to ${root === "enterprise" ? "an Enterprise" : "an Organization"} with the login of 'example-org'.`, path: [root] }] });
+    default:
+      throw new Error(`Unknown GraphQL denial style ${style}`);
+  }
+}
+
+function sweepRestBody(surface, variant) {
+  switch (surface) {
+    case "org": return SELF_CHECK_ORG;
+    case "members": return [{ login: "alice" }, { login: "bob" }, { login: "carol" }];
+    case "members_admin": return [{ login: "alice" }];
+    case "members_2fa_disabled": return [];
+    case "outside_collaborators": return [];
+    case "invitations": return [];
+    case "organization_roles": return { total_count: 1, roles: [{ id: 1, name: "all_repo_read" }] };
+    case "credential_authorizations": return [{ login: "alice", credential_type: "personal access token", credential_authorized_at: "2026-01-01T00:00:00Z" }];
+    case "audit_log": return [{ action: "repo.create", "@timestamp": 1758400000000, actor: "alice" }];
+    case "hooks": return [{ id: 100, active: true, config: { url: "https://siem.example.test/github", content_type: "json", insecure_ssl: "0", secret: "********" } }];
+    case "installations": return { total_count: 1, installations: [{ id: 99, app_slug: "compliance-bot", repository_selection: "selected", permissions: { metadata: "read", contents: "read" }, suspended_at: null, created_at: "2025-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] };
+    case "repos": return SWEEP_REPOS;
+    case "org_rulesets": return [{ id: 1, enforcement: "active", target: "branch", rules: SELF_CHECK_RULES.map((rule) => ({ type: rule.type })) }];
+    case "repo_rulesets": return [];
+    case "branch_protection": return variant === "A" ? SELF_CHECK_PROTECTION : null;
+    case "branch_rules": return SELF_CHECK_RULES;
+    case "repo_hooks": return [{ id: 5, config: { url: "https://ci.example.test/hook", insecure_ssl: "0", secret: "********" } }];
+    case "deploy_keys": return [{ id: 1, title: "reader", read_only: true, created_at: "2026-06-01T00:00:00Z", last_used: "2026-09-01T00:00:00Z" }];
+    case "actions_permissions": return { enabled_repositories: "selected", allowed_actions: "selected" };
+    case "selected_actions": return { github_owned_allowed: true, verified_allowed: false, patterns_allowed: ["example-org/*"] };
+    case "workflow_permissions": return { default_workflow_permissions: "read", can_approve_pull_request_reviews: false };
+    case "runner_groups": return { total_count: 1, runner_groups: [{ id: 1, name: "prod", visibility: "selected", allows_public_repositories: false, restricted_to_workflows: true }] };
+    case "runners": return { total_count: 1, runners: [{ id: 1, name: "runner-1", status: "online" }] };
+    case "code_security_configurations": return [createCodeSecurityConfiguration()];
+    case "code_security_defaults":
+      return [
+        { default_for_new_repos: "public", configuration: createCodeSecurityConfiguration() },
+        { default_for_new_repos: "private_and_internal", configuration: createCodeSecurityConfiguration({ id: 2, name: "Private baseline" }) },
+      ];
+    default:
+      throw new Error(`No compliant body for ${surface}`);
+  }
+}
+
+function createSweepFetch({ variant = "A", deny = [], graphqlStyle = "http403", restStatus = 403 } = {}) {
+  const denied = new Set(deny);
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const key = sweepInventoryKey(url, init);
+    requests.push(key);
+    if (key.startsWith("graphql:")) {
+      return denied.has(key) ? sweepGraphqlDenied(key, graphqlStyle) : jsonResponse(sweepGraphqlBody(key, variant));
+    }
+    if (denied.has(key)) {
+      return jsonResponse({ message: restStatus === 401 ? "Bad credentials" : "Resource not accessible by integration" }, {}, restStatus);
+    }
+    const body = sweepRestBody(key.split(":")[0], variant);
+    if (body === null) return jsonResponse({ message: "Branch not protected" }, {}, 404);
+    return jsonResponse(body);
+  };
+  return { fetchImpl, requests };
+}
+
+async function runSweepScenario(options = {}) {
+  const { fetchImpl } = createSweepFetch(options);
+  const client = new GitHubAuditorClient(SWEEP_CONFIG, fetchImpl);
+  const [orgAccess, repoProtection, actions, codeSecurity, integrations] = await Promise.all([
+    collectGitHubOrgAccessData(client, SWEEP_CONFIG),
+    collectGitHubRepoProtectionData(client),
+    collectGitHubActionsData(client),
+    collectGitHubCodeSecurityData(client),
+    collectGitHubIntegrationsData(client),
+  ]);
+  const findings = [
+    assessGitHubOrgAccess(orgAccess, SWEEP_CONFIG),
+    assessGitHubRepoProtection(repoProtection, SWEEP_CONFIG),
+    assessGitHubActionsSecurity(actions, SWEEP_CONFIG),
+    assessGitHubCodeSecurity(codeSecurity, SWEEP_CONFIG),
+    assessGitHubIntegrations(integrations, SWEEP_CONFIG),
+  ].flatMap((assessment) => assessment.findings);
+  return { findings, byId: Object.fromEntries(findings.map((finding) => [finding.id, finding])) };
+}
+
+const SWEEP_BASELINE_MANUAL = ["GITHUB-CODE-006", "GITHUB-INTEG-004", "GITHUB-INTEG-005", "GITHUB-ORG-011"];
+
+test("corollary sweep baseline: both variants pass every pass-capable finding through the real client", async () => {
+  for (const variant of ["A", "B"]) {
+    const { findings, byId } = await runSweepScenario({ variant });
+    assert.equal(findings.length, 34, `variant ${variant} finding count`);
+    const notPassing = findings.filter((finding) => finding.status !== "Pass").map((finding) => finding.id).sort();
+    assert.deepEqual(notPassing, SWEEP_BASELINE_MANUAL, `variant ${variant} baseline`);
+    if (variant === "B") {
+      assert.match(byId["GITHUB-ORG-006"].summary, /enterprise example-ent carries an identity provider \(OIDC\)/);
+      assert.match(byId["GITHUB-REPO-001"].evidence.join("\n"), /repos_with_legacy_branch_protection = 0\/2/);
+    } else {
+      assert.match(byId["GITHUB-ORG-006"].summary, /all 3 member\(s\) carry a linked SAML identity/);
+      assert.match(byId["GITHUB-REPO-001"].evidence.join("\n"), /repos_with_legacy_branch_protection = 2\/2/);
+    }
+  }
+});
+
+test("bundle check: one repository's classic protection 403 reaches _errors.log and demotes every repository-scoped finding", async () => {
+  const outputRoot = createTempBase("grclanker-github-corollary-");
+  const { fetchImpl } = createSweepFetch({ variant: "A", deny: ["branch_protection:beta"] });
+  const client = new GitHubAuditorClient(SWEEP_CONFIG, fetchImpl);
+  const result = await exportGitHubAuditBundle(client, SWEEP_CONFIG, outputRoot);
+
+  assert.equal(result.errorCount, 1);
+  const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /^branchProtections for example-org\/beta: GitHub request failed \(403\) for GET \/repos\/example-org\/beta\/branches\/main\/protection: Resource not accessible by integration$/m);
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const byId = Object.fromEntries(findings.map((finding) => [finding.id, finding]));
+  for (const id of SWEEP_REPO_SCOPED_IDS) {
+    assert.equal(byId[id].status, "Partial", `${id} must not be Pass in findings.json while beta's protection was 403`);
+    assert.match(byId[id].summary, /example-org\/beta: classic branch protection \(GET \/repos\/example-org\/beta\/branches\/main\/protection\) unreadable: GitHub request failed \(403\) for GET \/repos\/example-org\/beta\/branches\/main\/protection: Resource not accessible by integration/);
+    assert.doesNotMatch(byId[id].evidence.join("\n"), /= 0\/2/);
+  }
+  assert.equal(byId["GITHUB-REPO-005"].status, "Pass", "web commit signoff reads only the org profile and keeps passing");
+  const coreData = JSON.parse(readFileSync(join(result.outputDir, "core_data", "repo_protection.json"), "utf8"));
+  assert.equal(coreData.branchProtections.error, undefined);
+  assert.deepEqual(coreData.branchProtections.data["example-org/alpha"].protection.enforce_admins, { enabled: true });
+  assert.equal(coreData.branchProtections.data["example-org/beta"].protection, null);
+  assert.match(coreData.branchProtections.data["example-org/beta"].error, /\(403\)/);
+  const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  assert.match(summary, /Collection warnings[\s\S]*branchProtections for example-org\/beta/);
 });
