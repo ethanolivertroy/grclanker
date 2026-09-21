@@ -81,7 +81,7 @@ Why it matters: Azure and Microsoft 365 share a single identity plane (Entra ID)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/v1.0/informationProtection/sensitivityLabels` | GET | Sensitivity label definitions |
+| `/beta/security/informationProtection/sensitivityLabels` | GET | Sensitivity label definitions (tenant-wide form is documented only under beta) |
 | `/beta/security/informationProtection/sensitivityLabels/evaluate` | POST | Label evaluation |
 | `/v1.0/security/labels/retentionLabels` | GET | Retention labels |
 
@@ -116,7 +116,8 @@ Why it matters: Azure and Microsoft 365 share a single identity plane (Entra ID)
 | `/providers/Microsoft.Network/networkSecurityGroups` | GET | NSG rules |
 | `/providers/Microsoft.Network/virtualNetworks` | GET | VNet configuration |
 | `/providers/Microsoft.Network/applicationGateways` | GET | WAF configuration |
-| `/providers/Microsoft.Network/networkWatchers` | GET | Network Watcher and flow logs |
+| `/providers/Microsoft.Network/networkWatchers` | GET | Network Watcher inventory |
+| `/resourceGroups/{rg}/providers/Microsoft.Network/networkWatchers/{name}/flowLogs` | GET | NSG flow logs per Network Watcher |
 
 #### Key Vault
 
@@ -166,7 +167,7 @@ Why it matters: Azure and Microsoft 365 share a single identity plane (Entra ID)
 
 ### grclanker implementation
 
-The shipped implementation lives in `cli/extensions/grc-tools/azure.ts` and calls Microsoft Graph v1.0 and Azure Resource Manager REST endpoints directly with `fetch`; no SDKs are used. Tools: `azure_check_access`, `azure_assess_identity` (AZURE-ID-01 to 13), `azure_assess_monitoring` (AZURE-MON-01 to 07), `azure_assess_subscription_guardrails` (AZURE-SUB-01 to 05), `azure_assess_data_protection` (AZURE-DP-01 to 08), `azure_assess_network_and_policy` (AZURE-NP-01 to 03), and `azure_export_audit_bundle`. Every endpoint, API version, and field is traceable to a learn.microsoft.com page cited in `AZURE_ENDPOINT_DOCS` and `AZURE_ARM_API_VERSIONS`; the table above lists the original reference design and includes endpoints the implementation does not call (for example `mailboxSettings`, which exposes no forwarding property). Authentication supports explicit tokens, `az` CLI tokens, and the OAuth 2.0 client credentials grant with `AZURE_AUTHORITY_HOST` for US Government and China clouds; certificate credentials and managed identity are documented but not implemented. See `src/content/docs/docs/integrations/azure.md` for the control coverage table and status semantics.
+The shipped implementation lives in `cli/extensions/grc-tools/azure.ts` and calls Microsoft Graph and Azure Resource Manager REST endpoints directly with `fetch`; no SDKs are used. Seven registered tools: `azure_check_access`, `azure_assess_identity` (AZURE-ID-01 to 13), `azure_assess_monitoring` (AZURE-MON-01 to 07), `azure_assess_subscription_guardrails` (AZURE-SUB-01 to 05), `azure_assess_data_protection` (AZURE-DP-01 to 08), `azure_assess_network_and_policy` (AZURE-NP-01 to 04), and `azure_export_audit_bundle`, which runs all five assessments. Every endpoint, API version, and field is traceable to a learn.microsoft.com page cited in `AZURE_ENDPOINT_DOCS` and `AZURE_ARM_API_VERSIONS`; the table above lists the reference design and includes endpoints the implementation does not call (for example `mailboxSettings`, which exposes no forwarding property). All Graph calls use v1.0 except sensitivity labels (control 11), whose tenant-wide list is documented only as `GET /beta/security/informationProtection/sensitivityLabels`; the finding states the beta caveat. `Microsoft.Security/securityContacts` is called with `api-version=2020-01-01-preview`, the version of the only spec file that defines the resource. Authentication supports explicit tokens, `az` CLI tokens, and the OAuth 2.0 client credentials grant with `AZURE_AUTHORITY_HOST` for US Government (`login.microsoftonline.us`) and China (`login.chinacloudapi.cn` or `login.partner.microsoftonline.cn`) clouds; certificate credentials and managed identity are documented but not implemented. See `src/content/docs/docs/integrations/azure.md` for the control coverage table and status semantics.
 
 ## 3. Authentication
 
@@ -514,11 +515,14 @@ Implemented in grclanker as of 2026-09-21 (TypeScript, `cli/extensions/grc-tools
 
 Shipped:
 
-- 36 findings covering all 25 controls across five assessment tools plus an access check and an evidence bundle exporter (`core_data/`, `analysis/`, `compliance/` with executive summary, unified matrix, and one report per framework, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, zip per allocated directory).
+- 37 findings covering all 25 controls across five registered assessment tools plus an access check and an evidence bundle exporter (`core_data/`, `analysis/`, `compliance/` with executive summary, unified matrix, and one report per framework, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, zip per allocated directory).
 - Verdict safety: 401/403 or errored calls render manual with the endpoint, missing permission, and evidence to collect; empty inventories never pass by default; missing licenses (Entra ID P2, Intune, Purview) render manual; items without dates cap at warn; partial inventories report seen and total counts and cap at warn; pagination follows `@odata.nextLink` and `nextLink` to completion or records truncation; reruns never overwrite a prior bundle.
-- Client credentials flow, sovereign cloud endpoints, live smoke script (`npm --prefix cli run test:azure:live`), and regression tests including four self-check fixtures (all 403, all empty, partial inventory, fully compliant tenant).
+- NSG flow logs (control 24) are read per Network Watcher (`AZURE-NP-04`): every NSG needs an enabled flow log whose `targetResourceId` is that NSG; partial coverage warns, none fails, and truncated inventories cap at warn. Retention policy values are reported as evidence, not judged.
+- Client credentials flow, sovereign cloud endpoints (US Government and both documented China authority hosts), live smoke script (`npm --prefix cli run test:azure:live`), and regression tests including four self-check fixtures (all 403, all empty, partial inventory, fully compliant tenant) and a URL and api-version assertion for every client request method.
 
 Remaining manual controls and gaps:
 
-- Control 10 (DLP policies), transport rules and mailbox-level forwarding in control 20, Teams guest access in control 21, NSG flow logs in control 24, and Entra log export in control 19 are not exposed through Graph v1.0 or ARM and render manual with the evidence to collect.
+- Control 10 (DLP policies) has no Graph resource in v1.0 or beta, and Graph `mailboxSettings` exposes no forwarding property, so control 10 and the mailbox-forwarding and transport-rule half of control 20 render manual with the PowerShell evidence to collect.
+- Teams guest access in control 21 and Entra diagnostic settings for log export in control 19 are not read by this implementation; the findings name the admin center pages to collect.
+- Sensitivity labels (control 11) depend on a Graph beta endpoint that Microsoft may change without notice.
 - Certificate credentials, managed identity, multi-subscription aggregation, OSCAL and STIG CKL export, and snapshot diff are not implemented.
