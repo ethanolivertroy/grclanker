@@ -70,37 +70,50 @@ Output paths are resolved inside `output_dir`; traversal outside it and symlinke
 
 ## Control coverage
 
-Finding ids are `PD-01` through `PD-25`, one per spec control. Status semantics: `pass` means the API evidence satisfies the control, `warn` means partial or degraded evidence that should be reviewed, `fail` means the API evidence contradicts the control, and `manual` means the API cannot prove the control (or the endpoint was unreadable) and the finding summary states exactly which evidence to collect from the PagerDuty web app.
+Finding ids are `PD-01` through `PD-25`, one per spec control. Status semantics: `pass` means complete API evidence satisfies the control, `warn` means partial or degraded evidence that should be reviewed, `fail` means the API evidence contradicts the control, and `manual` means the API cannot prove the control (or the endpoint was unreadable) and the finding summary states exactly which evidence to collect from the PagerDuty web app.
+
+### Verdict safety rules
+
+Every finding follows these rules so that a `pass` is never issued on missing or partial evidence:
+
+- An unreadable, forbidden (401/403), or errored endpoint yields `manual`; the summary names the failing endpoint and the web app evidence to collect.
+- An empty inventory never yields `pass`. Zero users, teams, services, escalation policies, schedules, or on-call entries yield `manual` (the credential is probably not seeing the directory); zero incident workflows, priorities, or business services yield `fail` (the feature is readable but unused); zero webhooks make controls 14 and 15 `manual` (not applicable).
+- Plan-gated features (HTTP 402 or a plan message from Audit Trail, Incident Workflows, Priorities, Business Services) yield `manual` with a plan summary, and controls the API cannot observe (1, 13, 24) are always `manual`.
+- Records without a date (`execution_time`, change event `timestamp`, schedule entry `start` or `end`) are never counted as recent or as coverage; they are reported in their own evidence bucket and cap the verdict at `warn`.
+- The client requests `total=true`, follows `more` and `next_cursor` to completion, and records truncation when a `*_limit` or the 10,000 record ceiling stops it. Any finding that would pass on a truncated inventory is downgraded to `warn` with seen and total counts in the summary and `evidence.partial_view`.
+- `pagerduty_check_access` and every assessment call `GET /users/me`: a 400 identifies an account-level key (full visibility); a user-level key or OAuth user token with a role other than `owner` or `admin` only sees its own teams, so passing findings are downgraded to `warn` until an account-level key is used.
+- Enabling flags must be present and true: `is_enabled` on workflows, `active` on webhook subscriptions, `enabled` and `blacklisted` on phone and SMS methods, `blacklisted` on push methods, `enabled` on email methods, `num_loops` and rule `targets` on escalation policies, `role` on users, `extension_schema` on extensions, and ability names in `/abilities`. An absent or false flag never supports `pass`.
+- Re-running the export never overwrites: the bundle directory and the zip share the same allocated name (`pagerduty-us-audit-bundle-2/` and `pagerduty-us-audit-bundle-2.zip`).
 
 | # | Control | Tool | Finding | Status semantics |
 |---|---------|------|---------|------------------|
-| 1 | SSO enforcement enabled | `pagerduty_assess_access_control` | `PD-01` | `fail` when the `sso` ability is absent; otherwise always `manual` (the API does not expose whether SSO login is required; collect Account Settings > Single Sign-On) |
-| 2 | User roles follow least privilege | `pagerduty_assess_access_control` | `PD-02` | `pass` when owner plus admin users are within `max_admins` (default 5), else `fail` |
-| 3 | Owner role limited to the account owner | `pagerduty_assess_access_control` | `PD-03` | `pass` for exactly one owner, `warn` for none in the sample, `fail` for more than one |
-| 4 | Team-based access configured | `pagerduty_assess_access_control` | `PD-04` | `fail` with no teams or more than half of users teamless, `warn` for some teamless users, `pass` when everyone belongs to a team |
-| 5 | Services have escalation policies | `pagerduty_assess_incident_response` | `PD-05` | `pass` when every active service references a policy, else `fail` |
-| 6 | Escalation policies have multiple levels | `pagerduty_assess_incident_response` | `PD-06` | `pass` when every attached policy has two or more rules, else `warn` |
-| 7 | Escalation does not end without notification | `pagerduty_assess_incident_response` | `PD-07` | `fail` for rules without targets, `warn` for attached policies with `num_loops` 0, else `pass` |
-| 8 | Schedules provide 24/7 coverage | `pagerduty_assess_oncall_coverage` | `PD-08` | `pass` when rendered final schedules have no gaps over `coverage_days` (default 30), else `fail` |
-| 9 | Schedules have multiple participants | `pagerduty_assess_oncall_coverage` | `PD-09` | `pass` when every attached schedule has two or more distinct users, else `fail` |
-| 10 | Incident response automation configured | `pagerduty_assess_incident_response` | `PD-10` | `pass` with enabled incident workflows and triggers, `warn` when workflows or legacy response plays exist but are inactive, `fail` when none exist |
-| 11 | Audit logging active | `pagerduty_assess_audit_logging` | `PD-11` | `pass` when records exist in `audit_window_days`, `warn` when readable but empty, `fail` on HTTP 402 (plan lacks Audit Trail), `manual` on other errors |
-| 12 | Audit log retention | `pagerduty_assess_audit_logging` | `PD-12` | `pass` when the 11-to-12 month probe returns records, `warn` when it is empty or fails, `manual` when `min_retention_days` exceeds the documented 365 days |
+| 1 | SSO enforcement enabled | `pagerduty_assess_access_control` | `PD-01` | `fail` when abilities are readable, non-empty, and lack `sso`; otherwise `manual` (the API does not expose whether SSO login is required; collect Account Settings > Single Sign-On) |
+| 2 | User roles follow least privilege | `pagerduty_assess_access_control` | `PD-02` | `pass` when owner plus admin users are within `max_admins` (default 5) and every user has a `role`, `warn` when some users have no role field, `fail` above the threshold, `manual` with zero users |
+| 3 | Owner role limited to the account owner | `pagerduty_assess_access_control` | `PD-03` | `pass` for exactly one owner, `warn` for none or for users without a role, `fail` for more than one, `manual` with zero users |
+| 4 | Team-based access configured | `pagerduty_assess_access_control` | `PD-04` | `fail` with zero teams, a missing `teams` ability, or more than half of users teamless, `warn` for some teamless users, `pass` when everyone belongs to a team, `manual` when users or teams are unreadable |
+| 5 | Services have escalation policies | `pagerduty_assess_incident_response` | `PD-05` | `pass` when every active service references a policy, `fail` otherwise, `manual` with zero (active) services |
+| 6 | Escalation policies have multiple levels | `pagerduty_assess_incident_response` | `PD-06` | `pass` when every attached policy has two or more rules, `warn` otherwise, `manual` with zero policies or none attached to a service |
+| 7 | Escalation does not end without notification | `pagerduty_assess_incident_response` | `PD-07` | `fail` for policies without rules or rules without targets, `warn` for attached policies with `num_loops` 0 or absent, else `pass` |
+| 8 | Schedules provide 24/7 coverage | `pagerduty_assess_oncall_coverage` | `PD-08` | `pass` when rendered final schedules have no gaps over `coverage_days` (default 30), `warn` when entries missing a start or end were excluded, `fail` on gaps, `manual` with zero or unattached schedules |
+| 9 | Schedules have multiple participants | `pagerduty_assess_oncall_coverage` | `PD-09` | `pass` when every attached schedule has two or more distinct users, else `fail`; `manual` with zero or unattached schedules |
+| 10 | Incident response automation configured | `pagerduty_assess_incident_response` | `PD-10` | `pass` with `is_enabled` workflows and triggers, `warn` when workflows or legacy response plays exist but are inactive, `fail` when the readable endpoint returns none, `manual` on plan or read errors |
+| 11 | Audit logging active | `pagerduty_assess_audit_logging` | `PD-11` | `pass` when records dated inside `audit_window_days` exist, `warn` when readable but empty or undated, `manual` on HTTP 402 (plan lacks Audit Trail) or other errors |
+| 12 | Audit log retention | `pagerduty_assess_audit_logging` | `PD-12` | `pass` when the 11-to-12 month probe returns dated records, `warn` when it is empty, undated, or fails, `manual` when `min_retention_days` exceeds the documented 365 days or audit records are unreadable |
 | 13 | API keys rotated | `pagerduty_assess_audit_logging` | `PD-13` | Always `manual` (no API key inventory endpoint); evidence lists distinct truncated tokens seen in audit records |
-| 14 | Webhook endpoints use HTTPS | `pagerduty_assess_integration_security` | `PD-14` | `pass` when all extension `endpoint_url` and subscription `delivery_method.url` values are `https`, else `fail` |
-| 15 | Webhook signatures verified | `pagerduty_assess_integration_security` | `PD-15` | `warn` when unsigned legacy generic webhook extensions remain, `pass` when only signed v3 subscriptions are used (confirm receivers verify `X-PagerDuty-Signature`) |
-| 16 | Integration permissions scoped | `pagerduty_assess_integration_security` | `PD-16` | `pass` when no legacy inbound integrations or unfiltered email integrations exist, else `warn` |
-| 17 | Notification rules for all users | `pagerduty_assess_oncall_coverage` | `PD-17` | `pass` when every responder has rules including a high-urgency rule, `fail` when more than a quarter have none, else `warn` |
-| 18 | Contact methods for on-call users | `pagerduty_assess_oncall_coverage` | `PD-18` | `fail` when an on-call user has no enabled contact method, `warn` for email-only users, else `pass` |
-| 19 | Service urgency rules configured | `pagerduty_assess_incident_response` | `PD-19` | `fail` when a service lacks an urgency rule, `warn` when every service is constant high, else `pass` |
-| 20 | Custom incident priorities defined | `pagerduty_assess_incident_response` | `PD-20` | `pass` when priorities exist, else `fail` |
-| 21 | Service dependencies mapped | `pagerduty_assess_integration_security` | `PD-21` | `fail` with no business services, `warn` when some have no dependencies, else `pass` |
-| 22 | Acknowledgement timeouts configured | `pagerduty_assess_incident_response` | `PD-22` | `pass` when every active service sets one, else `warn` |
-| 23 | Auto-resolve timeouts configured | `pagerduty_assess_incident_response` | `PD-23` | `pass` when every active service sets one, else `warn` |
+| 14 | Webhook endpoints use HTTPS | `pagerduty_assess_integration_security` | `PD-14` | `pass` when all extension `endpoint_url` and subscription `delivery_method.url` values are `https`, `fail` otherwise, `manual` when no webhooks exist |
+| 15 | Webhook signatures verified | `pagerduty_assess_integration_security` | `PD-15` | `warn` when unsigned legacy generic webhook extensions remain, extensions lack a schema, or no subscription has `active: true`; `pass` only when `/extensions` was readable (count stated), none is a legacy webhook, and at least one v3 subscription is active (confirm receivers verify `X-PagerDuty-Signature`); `manual` when no webhooks exist |
+| 16 | Integration permissions scoped | `pagerduty_assess_integration_security` | `PD-16` | `pass` when no legacy inbound integrations or unfiltered email integrations exist and every service returned its integrations, else `warn`; `manual` with zero services |
+| 17 | Notification rules for all users | `pagerduty_assess_oncall_coverage` | `PD-17` | `pass` when every responder has rules including a high-urgency rule, `fail` when more than a quarter have none, `warn` otherwise or when users lack a role, `manual` with zero users or zero responders |
+| 18 | Contact methods for on-call users | `pagerduty_assess_oncall_coverage` | `PD-18` | `fail` when an on-call user has only blocked or disabled methods, `warn` for email-only users or methods whose `enabled`/`blacklisted` flags are absent, `pass` when every on-call user has a phone, SMS, or push method with `enabled: true` and `blacklisted: false`, `manual` when nobody is on call |
+| 19 | Service urgency rules configured | `pagerduty_assess_incident_response` | `PD-19` | `fail` when a service lacks an urgency rule, `warn` when every service is constant high, else `pass`; `manual` with zero services |
+| 20 | Custom incident priorities defined | `pagerduty_assess_incident_response` | `PD-20` | `pass` when priorities exist, `fail` when the readable endpoint returns none, `manual` on plan or read errors |
+| 21 | Service dependencies mapped | `pagerduty_assess_integration_security` | `PD-21` | `fail` with zero business services, `warn` when some have no dependencies, else `pass`; `manual` on plan or read errors |
+| 22 | Acknowledgement timeouts configured | `pagerduty_assess_incident_response` | `PD-22` | `pass` when every active service sets one, else `warn`; `manual` with zero services |
+| 23 | Auto-resolve timeouts configured | `pagerduty_assess_incident_response` | `PD-23` | `pass` when every active service sets one, else `warn`; `manual` with zero services |
 | 24 | Analytics access restricted | `pagerduty_assess_access_control` | `PD-24` | Always `manual` (per-role analytics permissions are not exposed); evidence lists analytics abilities and role counts |
-| 25 | Change events tracking enabled | `pagerduty_assess_integration_security` | `PD-25` | `pass` when change events arrived in `change_event_days`, `warn` when Events API v2 integrations exist but no events arrived, else `fail` |
+| 25 | Change events tracking enabled | `pagerduty_assess_integration_security` | `PD-25` | `pass` when change events with a `timestamp` inside `change_event_days` arrived, `warn` when events are undated or Events API v2 integrations exist but no events arrived, `fail` when neither exists, `manual` with zero services |
 
-Any control whose source endpoint cannot be read becomes `manual` with the collection error in the summary and the error recorded in the assessment `errors` list and the bundle `_errors.log`.
+Any control whose source endpoint cannot be read becomes `manual` with the collection error in the summary and the error recorded in the assessment `errors` list and the bundle `_errors.log`. Every `pass` listed above is downgraded to `warn` when the underlying inventory is partial or the credential is a non-admin user-level key.
 
 ## Framework mappings
 
@@ -121,7 +134,8 @@ The script skips with exit code 0 when no credentials are present. With credenti
 - Response plays are no longer in the published REST API reference; control 10 evaluates incident workflows and triggers and only reports legacy `response_play` references on services.
 - Webhook signature verification happens on the receiving side; control 15 confirms only that unsigned legacy generic webhook extensions are gone.
 - Audit records need the Audit Trail plan feature and an admin, owner, or global API key. PagerDuty retains them for 12 months, so longer retention requirements need SIEM or archive evidence.
-- Users and services are sampled up to `user_limit` and `service_limit` (default 1000 each) and the classic pagination ceiling of 10,000 records.
+- Users and services are read up to `user_limit` and `service_limit` (default 1000 each), audit records up to `audit_limit` (default 2000), all within the classic pagination ceiling of 10,000 records. When a limit stops the collection, the finding records seen and total counts and cannot pass; raise the limit or narrow the window to obtain a complete inventory.
+- A user-level API key with a role below `admin` only returns the objects that user can see, so its passing findings are downgraded to `warn`. Use an account-level read-only key for a complete assessment.
 
 ## Official documentation
 
