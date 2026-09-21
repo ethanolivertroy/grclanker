@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   QUALYS_PLATFORMS,
@@ -14,9 +15,11 @@ import {
   bundleZipPath,
   checkQualysAccess,
   exportQualysAuditBundle,
+  exportableRecords,
   normalizeList,
   parseCsv,
   parseXml,
+  rawDataSurfaceNames,
   resolveQualysConfiguration,
   resolveQualysPlatform,
   resolveSecureOutputPath,
@@ -2239,6 +2242,270 @@ test("rule 8: re-running an export never overwrites a prior bundle and the zip n
   assert.notEqual(third.outputDir, first.outputDir, "a leftover zip must block reuse of its directory name");
   assert.equal(third.outputDir, `${first.outputDir}-3`);
   assert.equal(statSync(first.zipPath).size, firstZipSize, "the prior archive is untouched");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rule 9: rawData is a per-record allowlist projection, never the verbatim API response
+// ---------------------------------------------------------------------------------------------
+
+// One distinct fake secret per surface that can carry credential or distribution material, each planted in the
+// documented field that holds it (option_profile_info.dtd LOGIN_PASSWORD and CUSTOM_HTTP_HEADER, agent_source.xsd
+// activationId, the AWS connector arn and externalId, webappauthrecord.xsd field values and clientSecret,
+// appliance_list_output.dtd ACTIVATION_CODE and PROXY USER, webapp.xsd headers, host METADATA, user_list_output.dtd
+// PHONE, tag.xsd ruleText, detection RESULTS, schedule NOTIFICATIONS, wasscanschedule.xsd recipients, wasscan.xsd
+// sensitiveContents) plus an undocumented recipients element on a scheduled report.
+const PLANTED_SECRETS = {
+  option_profile_password: "L:svc_scan,P:OPTIONPROFILE-BRUTEFORCE-SECRET-7f3a",
+  option_profile_header: "Authorization: Bearer OPTIONPROFILE-HEADER-SECRET-9c1d",
+  agent_activation_id: "AGENT-ACTIVATION-ID-SECRET-4b2e",
+  connector_external_id: "CONNECTOR-EXTERNAL-ID-SECRET-6d8f",
+  connector_arn: "arn:aws:iam::123456789012:role/CONNECTOR-ROLE-ARN-SECRET-1a2b",
+  was_form_password: "WAS-FORM-PASSWORD-SECRET-3c4d",
+  was_server_password: "WAS-SERVER-PASSWORD-SECRET-5e6f",
+  was_oauth_client_secret: "WAS-OAUTH-CLIENT-SECRET-7a8b",
+  report_recipient: "REPORT-RECIPIENT-SECRET-9c0d@example.com",
+  appliance_activation_code: "APPLIANCE-ACTIVATION-CODE-SECRET-1e2f",
+  appliance_proxy_user: "APPLIANCE-PROXY-USER-SECRET-3a4b",
+  webapp_header: "Authorization: Bearer WEBAPP-HEADER-SECRET-5c6d",
+  host_metadata_value: "HOST-METADATA-VALUE-SECRET-7e8f",
+  user_phone: "USER-PHONE-SECRET-9a0b",
+  tag_rule_text: "TAG-RULETEXT-SECRET-1c2d",
+  detection_results: "DETECTION-RESULTS-SECRET-3e4f",
+  schedule_notification: "SCHEDULE-NOTIFICATION-SECRET-5a6b",
+  was_schedule_recipient: "WAS-SCHEDULE-RECIPIENT-SECRET-7c8d@example.com",
+  was_scan_sensitive_content: "WAS-SCAN-SENSITIVE-CONTENT-SECRET-9e0f",
+};
+
+const secretFixtures = {
+  ...healthyFixtures,
+  listScheduledScans: async () => tenant.schedules.map((schedule) => ({
+    ...schedule,
+    NOTIFICATIONS: { BEFORE_LAUNCH: { TIME: "30", UNIT: "minutes", MESSAGE: PLANTED_SECRETS.schedule_notification } },
+  })),
+  listHosts: async () => tenant.hosts.map((host) => ({
+    ...host,
+    METADATA: { EC2: { ATTRIBUTE: { NAME: "latest/dynamic/instance-identity/document/accountId", LAST_STATUS: "Success", VALUE: PLANTED_SECRETS.host_metadata_value } } },
+  })),
+  listOptionProfiles: async () => tenant.profiles.map((profile) => ({
+    ...profile,
+    SCAN: {
+      ...profile.SCAN,
+      PASSWORD_BRUTE_FORCING: { SYSTEM: { HAS_SYSTEM: "1", SYSTEM_LEVEL: "Standard" }, CUSTOM_LIST: { CUSTOM: { ID: "1001", TITLE: "ssh - 1", TYPE: "SSH", LOGIN_PASSWORD: PLANTED_SECRETS.option_profile_password } } },
+      CUSTOM_HTTP_HEADER: { VALUE: PLANTED_SECRETS.option_profile_header, DEFINITION_KEY: "Authorization", DEFINITION_VALUE: PLANTED_SECRETS.option_profile_header },
+    },
+  })),
+  listAppliances: async () => tenant.appliances.map((appliance) => ({
+    ...appliance,
+    ACTIVATION_CODE: PLANTED_SECRETS.appliance_activation_code,
+    PROXY_SETTINGS: { SETTING: "Enabled", PROXY: { PROTOCOL: "https", HOSTNAME: "proxy.example.com", PORT: "3128", USER: PLANTED_SECRETS.appliance_proxy_user } },
+  })),
+  listDetections: async () => flattenDetections(tenant.detectionHosts).map((detection) => ({ ...detection, RESULTS: PLANTED_SECRETS.detection_results })),
+  listScheduledReports: async () => tenant.scheduledReports.map((report) => ({
+    ...report,
+    DISTRIBUTION_GROUPS: { DISTRIBUTION_GROUP: { TITLE: "Executives", RECIPIENTS: { EMAIL: PLANTED_SECRETS.report_recipient } } },
+  })),
+  listUsers: async () => tenant.legacyUsers.map((user) => ({ ...user, CONTACT_INFO: { ...user.CONTACT_INFO, PHONE: PLANTED_SECRETS.user_phone } })),
+  searchCloudAgents: async () => tenant.agents.map((agent) => ({
+    ...agent,
+    agentInfo: { ...agent.agentInfo, activationKey: { activationId: PLANTED_SECRETS.agent_activation_id, title: "prod-key" } },
+  })),
+  searchConnectors: async () => tenant.connectors.map((connector) => ({
+    ...connector,
+    arn: PLANTED_SECRETS.connector_arn,
+    externalId: PLANTED_SECRETS.connector_external_id,
+  })),
+  searchTags: async () => tenant.tags.map((tag) => ({ ...tag, ruleText: PLANTED_SECRETS.tag_rule_text })),
+  searchWebApps: async () => tenant.webApps.map((webApp) => ({
+    ...webApp,
+    headers: { count: 1, list: [{ WebAppHeader: PLANTED_SECRETS.webapp_header }] },
+  })),
+  searchWasScans: async () => tenant.wasScans.map((scan) => ({
+    ...scan,
+    sensitiveContents: { count: 1, list: [{ SensitiveContent: PLANTED_SECRETS.was_scan_sensitive_content }] },
+  })),
+  searchWasAuthRecords: async () => tenant.wasAuthRecords.map((record) => ({
+    ...record,
+    formRecord: {
+      ...record.formRecord,
+      fields: {
+        count: 2,
+        list: [
+          { WebAppAuthFormRecordField: { id: 1, name: "username", secured: false, value: "portal_user" } },
+          { WebAppAuthFormRecordField: { id: 2, name: "password", secured: true, value: PLANTED_SECRETS.was_form_password } },
+        ],
+      },
+    },
+    serverRecord: {
+      type: "BASIC",
+      sslOnly: true,
+      fields: { count: 1, list: [{ WebAppAuthServerRecordField: { id: 3, type: "BASIC", domain: "portal.example.com", username: "portal_admin", password: PLANTED_SECRETS.was_server_password } }] },
+    },
+    oauth2Record: { grantType: "CLIENT_CREDS", clientId: "portal-client", clientSecret: PLANTED_SECRETS.was_oauth_client_secret, accessTokenUrl: "https://portal.example.com/oauth/token" },
+  })),
+  searchWasSchedules: async () => tenant.wasSchedules.map((schedule) => ({
+    ...schedule,
+    notification: { sendMail: true, recipients: { count: 1, list: [{ EmailAddress: PLANTED_SECRETS.was_schedule_recipient }] } },
+  })),
+};
+
+function walkFiles(root, dir = root) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const pathname = join(dir, entry.name);
+    if (entry.isDirectory()) return walkFiles(root, pathname);
+    return [{ name: relative(root, pathname), content: readFileSync(pathname, "utf8") }];
+  });
+}
+
+// Minimal reader for the archives written by archiver: end of central directory, central directory entries, and
+// each local header, inflating deflate members with zlib.
+function readZipMembers(zipPath) {
+  const buffer = readFileSync(zipPath);
+  let eocd = buffer.length - 22;
+  while (eocd >= 0 && buffer.readUInt32LE(eocd) !== 0x06054b50) eocd -= 1;
+  assert.ok(eocd >= 0, "end of central directory record not found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const members = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory file header signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, `local file header signature for ${name}`);
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    assert.ok(method === 8 || method === 0, `unsupported compression method ${method} for ${name}`);
+    members.push({ name, content: (method === 8 ? inflateRawSync(data) : data).toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return members;
+}
+
+test("rule 9: the audit bundle never carries a planted secret in any file or zip member while the allowlisted fields survive", async () => {
+  const outputRoot = createTempBase("qualys-secrets-");
+  const config = sampleConfig();
+  const client = createFakeClient(secretFixtures, config);
+  const result = await exportQualysAuditBundle(client, config, outputRoot);
+  assert.equal(result.errorCount, 0);
+
+  const files = walkFiles(result.outputDir);
+  const members = readZipMembers(result.zipPath).filter((member) => !member.name.endsWith("/"));
+  assert.ok(files.length >= 30, `expected a full bundle, got ${files.length} files`);
+  assert.deepEqual(members.map((member) => member.name).sort(), files.map((file) => file.name).sort(), "every written file is a zip member");
+  for (const [label, secret] of Object.entries(PLANTED_SECRETS)) {
+    for (const file of files) {
+      assert.equal(file.content.includes(secret), false, `${label} leaked into ${file.name}`);
+    }
+    for (const member of members) {
+      assert.equal(member.content.includes(secret), false, `${label} leaked into zip member ${member.name}`);
+    }
+  }
+  for (const file of files) {
+    assert.equal(file.content.includes(config.password), false, `credential leaked into ${file.name}`);
+  }
+
+  const read = (name) => JSON.parse(readFileSync(join(result.outputDir, "core_data", name), "utf8"));
+  const profiles = read("scan_coverage/option_profiles.json");
+  assert.equal(profiles[0].BASIC_INFO.GROUP_NAME, "Authenticated Full");
+  assert.equal(profiles[0].SCAN.AUTHENTICATION, "Windows,Unix");
+  assert.equal(profiles[0].SCAN.PASSWORD_BRUTE_FORCING, undefined);
+  assert.equal(profiles[0].SCAN.CUSTOM_HTTP_HEADER, undefined);
+  assert.equal(profiles[0].SCAN.PORTS, undefined, "option profile configuration is not exported verbatim");
+
+  const agents = read("asset_inventory/cloud_agents.json");
+  assert.equal(agents[0].agentInfo.status, "STATUS_ACTIVE");
+  assert.deepEqual(agents[0].agentInfo.lastCheckedIn, { date: tenant.agents[0].agentInfo.lastCheckedIn.date });
+  assert.deepEqual(agents[0].agentInfo.activationKey, { title: "prod-key" });
+
+  const connectors = read("asset_inventory/connectors.json");
+  assert.equal(connectors[0].name, "prod-aws");
+  assert.equal(connectors[0].connectorState, "FINISHED_SUCCESS");
+  assert.equal(connectors[0].awsAccountId, "123456789012");
+  assert.equal(connectors[0].lastSync, tenant.connectors[0].lastSync);
+  assert.equal(connectors[0].arn, undefined);
+  assert.equal(connectors[0].externalId, undefined);
+
+  const appliances = read("asset_inventory/appliances.json");
+  assert.deepEqual(appliances[0].ML_VERSION, { "@updated": "yes", "#text": "12.7.50-1" }, "DTD text nodes keep their attributes");
+  assert.equal(appliances[0].STATUS, "Online");
+  assert.equal(appliances[0].ACTIVATION_CODE, undefined);
+  assert.equal(appliances[0].PROXY_SETTINGS, undefined);
+
+  const hosts = read("scan_coverage/hosts.json");
+  assert.deepEqual(hosts[0].TAGS.TAG.map((tag) => tag.NAME), ["PCI", "Prod"]);
+  assert.equal(hosts[0].LAST_VM_AUTH_SCANNED_DATE, tenant.hosts[0].LAST_VM_AUTH_SCANNED_DATE);
+  assert.equal(hosts[0].METADATA, undefined);
+
+  const authRecords = read("administration/was_auth_records.json");
+  assert.equal(authRecords[0].name, "portal-login");
+  assert.equal(authRecords[0].updatedDate, tenant.wasAuthRecords[0].updatedDate);
+  assert.deepEqual(authRecords[0].formRecord.fields.list.map((entry) => entry.WebAppAuthFormRecordField), [
+    { id: 1, name: "username", secured: false },
+    { id: 2, name: "password", secured: true },
+  ]);
+  assert.deepEqual(authRecords[0].serverRecord.fields.list, [{ WebAppAuthServerRecordField: { id: 3, type: "BASIC", domain: "portal.example.com" } }]);
+  assert.deepEqual(authRecords[0].oauth2Record, { grantType: "CLIENT_CREDS" });
+
+  const scheduledReports = read("administration/scheduled_reports.json");
+  assert.equal(scheduledReports[0].TITLE, "Weekly executive report");
+  assert.equal(scheduledReports[0].ACTIVE, "1");
+  assert.deepEqual(scheduledReports[0].SCHEDULE.WEEKLY, { "@frequency_weeks": "1", "@weekdays": "1" });
+  assert.equal(scheduledReports[0].DISTRIBUTION_GROUPS, undefined);
+
+  const schedules = read("scan_coverage/scheduled_scans.json");
+  assert.equal(schedules[1].ISCANNER_NAME, "External Scanner");
+  assert.equal(schedules[1].ASSET_TAGS.TAG_SET_INCLUDE, "DMZ");
+  assert.equal(schedules[0].NOTIFICATIONS, undefined);
+
+  const userList = read("administration/user_list.json");
+  assert.equal(userList.length, 3);
+  assert.equal(userList[0].USER_STATUS, "Active");
+  assert.equal(userList[0].USER_ROLE, "Manager");
+  assert.equal(userList[0].CONTACT_INFO.EMAIL, "api@example.com");
+  assert.equal(userList[0].CONTACT_INFO.PHONE, undefined);
+
+  const detections = read("vulnerability_management/detections.json");
+  assert.equal(detections[0].QID, "91000");
+  assert.equal(detections[0].host_id, "100");
+  assert.deepEqual(detections[0].QDS, { "@severity": "HIGH", "#text": "72" });
+  assert.equal(detections[0].RESULTS, undefined);
+
+  const webApps = read("administration/was_webapps.json");
+  assert.deepEqual(webApps[0].lastScan, { id: 1, name: "Portal weekly" });
+  assert.equal(webApps[0].headers, undefined);
+  const wasScans = read("administration/was_scans.json");
+  assert.equal(wasScans[0].launchedDate, tenant.wasScans[0].launchedDate);
+  assert.deepEqual(wasScans[0].target.webApp, { id: 500, name: "Portal", url: "https://portal.example.com" });
+  assert.equal(wasScans[0].sensitiveContents, undefined);
+  const wasSchedules = read("administration/was_schedules.json");
+  assert.equal(wasSchedules[0].active, true);
+  assert.equal(wasSchedules[0].notification, undefined);
+  const tags = read("asset_inventory/tags.json");
+  assert.equal(tags[0].ruleType, "NAME_CONTAINS");
+  assert.equal(tags[0].ruleText, undefined);
+});
+
+test("rule 9: every rawData surface has an allowlist and an unknown surface is refused rather than exported verbatim", async () => {
+  const results = await runAllAssessments(createFakeClient(healthyFixtures));
+  const surfaces = rawDataSurfaceNames();
+  for (const result of results) {
+    for (const [name, records] of Object.entries(result.rawData)) {
+      assert.ok(surfaces.includes(name), `${result.category}/${name} has no allowlist`);
+      assert.ok(Array.isArray(records));
+    }
+  }
+  assert.throws(() => exportableRecords("verbatim_surface", [{ password: "x" }]), /No rawData allowlist is defined for surface verbatim_surface/);
+  assert.deepEqual(exportableRecords("auth_records", [{ type: "unix", count: 3, password: "nope" }]), [{ type: "unix", count: 3 }]);
+  assert.deepEqual(
+    exportableRecords("cloud_agents", [{ id: 1, agentInfo: { lastCheckedIn: "2026-09-01T00:00:00Z", activationKey: { activationId: "secret", title: "key" } } }]),
+    [{ id: 1, agentInfo: { lastCheckedIn: "2026-09-01T00:00:00Z", activationKey: { title: "key" } } }],
+    "a plain dateTime survives the date rule and the activation ID never does",
+  );
+  assert.deepEqual(exportableRecords("connectors", [{ id: 1, lastSync: { date: "2026-09-01T00:00:00Z", zone: "UTC" } }]), [{ id: 1, lastSync: { date: "2026-09-01T00:00:00Z" } }]);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -133,7 +133,7 @@ export interface QualysAssessmentResult {
   summary: JsonRecord;
   findings: QualysFinding[];
   errors: string[];
-  rawData: Record<string, unknown>;
+  rawData: Record<string, JsonRecord[]>;
 }
 
 export interface QualysAuditBundleResult {
@@ -1689,6 +1689,545 @@ function optionProfileExcludedQidCount(profile: JsonRecord): number {
   return optionProfileExclusionLists(profile).length;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Rule 9: audit bundles carry a per-record projection of every collected surface, never the verbatim
+// API response. Each allowlist names the documented identifiers, names, statuses, dates, counts, and the
+// fields the verdicts read. Passwords, activation keys and IDs, connector role ARNs and external IDs,
+// authentication record values, report distribution settings, and option profile configuration are never
+// listed, so an undocumented or unexpected field is dropped rather than exported.
+// ---------------------------------------------------------------------------------------------
+
+// true keeps a scalar or a DTD text node; "date" also keeps the QPS JSON date wrapper {"date": "..."}; a nested
+// allowlist descends into an object (or into every element of an array) and keeps only the listed fields.
+type FieldRule = true | "date" | FieldAllowlist;
+type FieldAllowlist = { readonly [field: string]: FieldRule };
+
+function isXmlTextNode(record: JsonRecord): boolean {
+  return Object.keys(record).every((key) => key.startsWith("@") || key === "#text");
+}
+
+function projectScalar(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  // DTD scalars with attributes such as <ML_VERSION updated="no"> arrive as {"@updated", "#text"} nodes.
+  return isXmlTextNode(value as JsonRecord) ? value : undefined;
+}
+
+function projectField(value: unknown, rule: FieldRule): unknown {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) {
+    return value.map((item) => projectField(item, rule)).filter((item) => item !== undefined);
+  }
+  if (rule === true) return projectScalar(value);
+  if (rule === "date") {
+    const wrapped = asObject(value);
+    if (wrapped && !isXmlTextNode(wrapped)) {
+      const date = projectScalar(wrapped.date);
+      return date === undefined ? undefined : { date };
+    }
+    return projectScalar(value);
+  }
+  const record = asObject(value);
+  if (!record) return undefined;
+  const projected: JsonRecord = {};
+  for (const [field, nested] of Object.entries(rule)) {
+    const item = projectField(record[field], nested);
+    if (item !== undefined) projected[field] = item;
+  }
+  return projected;
+}
+
+export function projectRecords(records: JsonRecord[], allowlist: FieldAllowlist): JsonRecord[] {
+  return records
+    .map((record) => projectField(record, allowlist))
+    .filter((record): record is JsonRecord => Boolean(asObject(record)));
+}
+
+// schedule_scan_list_output.dtd and schedule_report_list_output.dtd: SCHEDULE
+const SCHEDULE_PLAN_FIELDS: FieldAllowlist = {
+  DAILY: true,
+  WEEKLY: true,
+  MONTHLY: true,
+  START_DATE_UTC: true,
+  START_HOUR: true,
+  START_MINUTE: true,
+  NEXTLAUNCH_UTC: true,
+  TIME_ZONE: { TIME_ZONE_CODE: true, TIME_ZONE_DETAILS: true },
+  DST_SELECTED: true,
+  MAX_OCCURRENCE: true,
+  END_AFTER: true,
+  END_AFTER_MINS: true,
+  PAUSE_AFTER_HOURS: true,
+  RESUME_IN_DAYS: true,
+  RESUME_IN_HOURS: true,
+};
+
+// host_list_output.dtd (details=All, show_tags=1). METADATA, CLOUD_PROVIDER_TAGS, USER_DEF, OWNER, and
+// COMMENTS are free-form and are not exported.
+const HOST_FIELDS: FieldAllowlist = {
+  ID: true,
+  ASSET_ID: true,
+  IP: true,
+  IPV6: true,
+  TRACKING_METHOD: true,
+  NETWORK_ID: true,
+  DNS: true,
+  DNS_DATA: { HOSTNAME: true, DOMAIN: true, FQDN: true },
+  CLOUD_PROVIDER: true,
+  CLOUD_SERVICE: true,
+  CLOUD_RESOURCE_ID: true,
+  EC2_INSTANCE_ID: true,
+  NETBIOS: true,
+  OS: true,
+  QG_HOSTID: true,
+  LAST_BOOT: true,
+  FIRST_FOUND_DATE: true,
+  LAST_ACTIVITY: true,
+  AGENT_STATUS: true,
+  CLOUD_AGENT_RUNNING_ON: true,
+  TAGS: { TAG: { TAG_ID: true, NAME: true } },
+  LAST_VULN_SCAN_DATETIME: true,
+  LAST_VULN_SCAN_DURATION: true,
+  LAST_VM_SCANNED_DATE: true,
+  LAST_VM_SCANNED_DURATION: true,
+  LAST_VM_AUTH_SCANNED_DATE: true,
+  LAST_VM_AUTH_SCANNED_DURATION: true,
+  LAST_COMPLIANCE_SCAN_DATETIME: true,
+  LAST_SCAP_SCAN_DATETIME: true,
+  ASSET_GROUP_IDS: true,
+};
+
+// asset_group_list_output.dtd; COMMENTS is not exported.
+const ASSET_GROUP_FIELDS: FieldAllowlist = {
+  ID: true,
+  TITLE: true,
+  OWNER_USER_ID: true,
+  OWNER_UNIT_ID: true,
+  OWNER_USER_NAME: true,
+  NETWORK_ID: true,
+  NETWORK_IDS: true,
+  LAST_UPDATE: true,
+  BUSINESS_IMPACT: true,
+  DEFAULT_APPLIANCE_ID: true,
+  APPLIANCE_IDS: true,
+  IP_SET: { IP: true, IP_RANGE: true },
+  DOMAIN_LIST: { DOMAIN: true },
+  DNS_LIST: { DNS: true },
+  NETBIOS_LIST: { NETBIOS: true },
+  HOST_IDS: true,
+  EC2_IDS: true,
+  ASSIGNED_USER_IDS: true,
+  ASSIGNED_UNIT_IDS: true,
+};
+
+// user.xsd (Administration API search/am/user)
+const ADMIN_USER_FIELDS: FieldAllowlist = {
+  id: true,
+  username: true,
+  firstName: true,
+  lastName: true,
+  title: true,
+  emailAddress: true,
+  roleList: { count: true, list: { RoleData: { id: true, name: true } } },
+  scopeTags: { count: true, list: { TagData: { id: true, name: true } } },
+};
+
+const QPS_USER_REFERENCE: FieldAllowlist = { id: true, username: true, firstName: true, lastName: true };
+const QPS_NAMED_REFERENCE: FieldAllowlist = { id: true, name: true };
+const QPS_TAG_LIST: FieldAllowlist = { count: true, list: { Tag: QPS_NAMED_REFERENCE } };
+const WAS_WEB_APP_REFERENCE: FieldAllowlist = { id: true, name: true, url: true };
+const WAS_SCANNER_REFERENCE: FieldAllowlist = { type: true, friendlyName: true };
+
+// wasscan.xsd: options, sensitiveContents, vulns, igs, and stats are not exported.
+const WAS_SCAN_FIELDS: FieldAllowlist = {
+  id: true,
+  name: true,
+  reference: true,
+  type: true,
+  mode: true,
+  multi: true,
+  progressiveScanning: true,
+  target: {
+    webApp: WAS_WEB_APP_REFERENCE,
+    webApps: { count: true, list: { WebApp: WAS_WEB_APP_REFERENCE } },
+    tags: QPS_TAG_LIST,
+    scannerAppliance: WAS_SCANNER_REFERENCE,
+    cancelOption: true,
+    authRecord: QPS_NAMED_REFERENCE,
+  },
+  profile: QPS_NAMED_REFERENCE,
+  launchedDate: "date",
+  launchedBy: QPS_USER_REFERENCE,
+  status: true,
+  endScanDate: "date",
+  scanDuration: true,
+  summary: { crawlDuration: true, testDuration: true, linksCrawled: true, nbRequests: true, resultsStatus: true, authStatus: true, os: true },
+};
+
+const RAW_DATA_ALLOWLISTS: Record<string, FieldAllowlist> = {
+  // schedule_scan_list_output.dtd; NOTIFICATIONS (custom messages and distribution) is not exported.
+  scheduled_scans: {
+    ID: true,
+    SCAN_TYPE: true,
+    ACTIVE: true,
+    TITLE: true,
+    CLIENT: { ID: true, NAME: true },
+    USER_LOGIN: true,
+    TARGET: true,
+    NETWORK_ID: true,
+    ISCANNER_NAME: true,
+    EC2_INSTANCE: { CONNECTOR_UUID: true, EC2_ENDPOINT: true, EC2_ONLY_CLASSIC: true },
+    CLOUD_DETAILS: { PROVIDER: true, CONNECTOR: { ID: true, UUID: true, NAME: true }, SCAN_TYPE: true, CLOUD_TARGET: { PLATFORM: true, REGION: { UUID: true, CODE: true, NAME: true }, VPC_SCOPE: true } },
+    ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: true },
+    ASSET_TAGS: {
+      TAG_INCLUDE_SELECTOR: true,
+      TAG_SET_INCLUDE: true,
+      TAG_EXCLUDE_SELECTOR: true,
+      TAG_SET_EXCLUDE: true,
+      USE_IP_NT_RANGE_TAGS: true,
+      USE_IP_NT_RANGE_TAGS_INCLUDE: true,
+      USE_IP_NT_RANGE_TAGS_EXCLUDE: true,
+    },
+    EXCLUDE_IP_PER_SCAN: true,
+    DEFAULT_SCANNER: true,
+    USER_ENTERED_IPS: { IP: true, RANGE: { START: true, END: true } },
+    ELB_DNS: { DNS: true },
+    OPTION_PROFILE: { TITLE: true, DEFAULT_FLAG: true },
+    PROCESSING_PRIORITY: true,
+    SCHEDULE: SCHEDULE_PLAN_FIELDS,
+  },
+  // scan_list_output.dtd
+  scans: {
+    ID: true,
+    REF: true,
+    SCAN_TYPE: true,
+    TYPE: true,
+    TITLE: true,
+    CLIENT: { ID: true, NAME: true },
+    USER_LOGIN: true,
+    LAUNCH_DATETIME: true,
+    DURATION: true,
+    PROCESSING_PRIORITY: true,
+    PROCESSED: true,
+    STATUS: { STATE: true, SUB_STATE: true },
+    TARGET: true,
+    ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: true },
+    OPTION_PROFILE: { TITLE: true, DEFAULT_FLAG: true },
+  },
+  hosts: HOST_FIELDS,
+  // option_profile_info.dtd: only the identity block and the settings the verdicts read (authentication types
+  // and detection exclusion search lists). PASSWORD_BRUTE_FORCING, CUSTOM_HTTP_HEADER, SYSTEM_AUTH_RECORD, and
+  // the rest of the configuration are never exported.
+  option_profiles: {
+    BASIC_INFO: { ID: true, GROUP_NAME: true, GROUP_TYPE: true, USER_ID: true, UNIT_ID: true, SUBSCRIPTION_ID: true, IS_DEFAULT: true, IS_GLOBAL: true, IS_OFFLINE_SYNCABLE: true, UPDATE_DATE: true },
+    SCAN: {
+      AUTHENTICATION: true,
+      AUTHENTICATION_LEAST_PRIVILEGE: true,
+      VULNERABILITY_DETECTION: {
+        COMPLETE: true,
+        RUNTIME: true,
+        CUSTOM_LIST: { CUSTOM: { ID: true, TITLE: true } },
+        DETECTION_INCLUDE: { BASIC_HOST_INFO_CHECKS: true, OVAL_CHECKS: true, QRDI_CHECKS: true },
+        DETECTION_EXCLUDE: { CUSTOM_LIST: { CUSTOM: { ID: true, TITLE: true } } },
+      },
+    },
+  },
+  // ip_list_output.dtd: IP and IP_RANGE text with network_id and expiration_date attributes.
+  excluded_ips: { type: true, value: true, network_id: true, expiration_date: true },
+  asset_groups: ASSET_GROUP_FIELDS,
+  // asset_data_connector.xsd plus the documented cloud account identifiers; arn, externalId, authRecord, and
+  // any other credential material are not exported.
+  connectors: {
+    id: true,
+    name: true,
+    awsAccountId: true,
+    subscriptionId: true,
+    projectId: true,
+    lastSync: "date",
+    lastError: true,
+    connectorState: true,
+    type: true,
+    serviceType: true,
+    disabled: true,
+    isGovCloudConfigured: true,
+    isChinaConfigured: true,
+    isInstantAssessmentEnabled: true,
+    isSnapshotAssessmentEnabled: true,
+    isAttachedToOrganization: true,
+    isDeleted: true,
+  },
+  // appliance_list_output.dtd; ACTIVATION_CODE, INTERFACE_SETTINGS, PROXY_SETTINGS, CLOUD_INFO, VLANS,
+  // STATIC_ROUTES, and COMMENTS are not exported.
+  appliances: {
+    ID: true,
+    UUID: true,
+    NAME: true,
+    NETWORK_ID: true,
+    SOFTWARE_VERSION: true,
+    RUNNING_SLICES_COUNT: true,
+    RUNNING_SCAN_COUNT: true,
+    STATUS: true,
+    MODEL_NUMBER: true,
+    TYPE: true,
+    IS_CLOUD_DEPLOYED: true,
+    ML_LATEST: true,
+    ML_VERSION: true,
+    VULNSIGS_LATEST: true,
+    VULNSIGS_VERSION: true,
+    ASSET_GROUP_COUNT: true,
+    ASSET_GROUP_LIST: { ASSET_GROUP: { ID: true, NAME: true } },
+    ASSET_TAGS_LIST: { ASSET_TAG: { UUID: true, NAME: true } },
+    LAST_UPDATED_DATE: true,
+    POLLING_INTERVAL: true,
+    USER_LOGIN: true,
+    HEARTBEATS_MISSED: true,
+    SS_CONNECTION: true,
+    SS_LAST_CONNECTED: true,
+    UPDATED: true,
+    MAX_CAPACITY_UNITS: true,
+  },
+  // hostasset.xsd with agent_source.xsd; activationKey keeps its title only, never the activationId.
+  cloud_agents: {
+    id: true,
+    name: true,
+    created: "date",
+    modified: "date",
+    type: true,
+    qwebHostId: true,
+    trackingMethod: true,
+    fqdn: true,
+    dnsHostName: true,
+    netbiosName: true,
+    os: true,
+    address: true,
+    lastVulnScan: "date",
+    lastComplianceScan: "date",
+    lastSystemBoot: "date",
+    criticalityScore: true,
+    agentInfo: {
+      agentVersion: true,
+      agentId: true,
+      status: true,
+      lastCheckedIn: "date",
+      platform: true,
+      activatedModule: true,
+      chirpStatus: true,
+      manifestVersion: { vm: true, pc: true, sca: true },
+      agentConfiguration: QPS_NAMED_REFERENCE,
+      activationKey: { title: true },
+    },
+    tags: QPS_TAG_LIST,
+  },
+  // tag.xsd; ruleText and description are free-form configuration and are not exported.
+  tags: {
+    id: true,
+    name: true,
+    created: "date",
+    modified: "date",
+    ruleType: true,
+    color: true,
+    parentTagId: true,
+    criticalityScore: true,
+    provider: true,
+    srcAssetGroupId: true,
+    srcBusinessUnitId: true,
+    srcOperatingSystemName: true,
+  },
+  // Summary rows built from auth_records.dtd ID_SET counts.
+  auth_records: { type: true, count: true },
+  // policy_list_output.dtd (details=Basic)
+  compliance_policies: {
+    ID: true,
+    TITLE: true,
+    CREATED: { DATETIME: true, BY: true },
+    LAST_MODIFIED: { DATETIME: true, BY: true },
+    LAST_EVALUATED: { DATETIME: true },
+    STATUS: true,
+    IS_LOCKED: true,
+    EVALUATE_NOW: true,
+    ASSET_GROUP_IDS: true,
+    TAG_SET_INCLUDE: { TAG_ID: true },
+    TAG_INCLUDE_SELECTOR: true,
+    TAG_SET_EXCLUDE: { TAG_ID: true },
+    TAG_EXCLUDE_SELECTOR: true,
+    INCLUDE_AGENT_IPS: true,
+  },
+  // host_list_vm_detection_output.dtd flattened with host_id and ip; RESULTS (scanner output) is not exported.
+  detections: {
+    host_id: true,
+    ip: true,
+    UNIQUE_VULN_ID: true,
+    QID: true,
+    TYPE: true,
+    SEVERITY: true,
+    PORT: true,
+    PROTOCOL: true,
+    FQDN: true,
+    SSL: true,
+    INSTANCE: true,
+    STATUS: true,
+    FIRST_FOUND_DATETIME: true,
+    LAST_FOUND_DATETIME: true,
+    QDS: true,
+    TIMES_FOUND: true,
+    LAST_TEST_DATETIME: true,
+    LAST_UPDATE_DATETIME: true,
+    LAST_FIXED_DATETIME: true,
+    LAST_PROCESSED_DATETIME: true,
+    IS_IGNORED: true,
+    IS_DISABLED: true,
+    AFFECT_RUNNING_KERNEL: true,
+    AFFECT_RUNNING_SERVICE: true,
+    AFFECT_EXPLOITABLE_CONFIG: true,
+  },
+  // knowledge_base_vuln_list_output.dtd (details=Basic); DIAGNOSIS, CONSEQUENCE, and SOLUTION text is not exported.
+  knowledge_base: {
+    QID: true,
+    VULN_TYPE: true,
+    SEVERITY_LEVEL: true,
+    TITLE: true,
+    CATEGORY: true,
+    LAST_SERVICE_MODIFICATION_DATETIME: true,
+    PUBLISHED_DATETIME: true,
+    PATCHABLE: true,
+    PCI_FLAG: true,
+    IS_DISABLED: true,
+    DISCOVERY: { REMOTE: true, AUTH_TYPE_LIST: { AUTH_TYPE: true } },
+    CVE_LIST: { CVE: { ID: true, URL: true } },
+    CVSS: { BASE: true, TEMPORAL: true, VECTOR_STRING: true },
+    CVSS_V3: { BASE: true, TEMPORAL: true, VECTOR_STRING: true, CVSS3_VERSION: true },
+    THREAT_INTELLIGENCE: { THREAT_INTEL: true },
+  },
+  // schedule_report_list_output.dtd; any distribution or recipient element is not exported.
+  scheduled_reports: {
+    ID: true,
+    TITLE: true,
+    OUTPUT_FORMAT: true,
+    TEMPLATE_TITLE: true,
+    ACTIVE: true,
+    SCHEDULE: SCHEDULE_PLAN_FIELDS,
+  },
+  // report_list_output.dtd
+  reports: {
+    ID: true,
+    TITLE: true,
+    TYPE: true,
+    USER_LOGIN: true,
+    LAUNCH_DATETIME: true,
+    OUTPUT_FORMAT: true,
+    SIZE: true,
+    STATUS: { STATE: true, MESSAGE: true, PERCENT: true },
+    EXPIRATION_DATETIME: true,
+  },
+  users: ADMIN_USER_FIELDS,
+  // user_list_output.dtd; postal address and phone contact details are not exported.
+  user_list: {
+    USER_LOGIN: true,
+    USER_ID: true,
+    EXTERNAL_ID: true,
+    CONTACT_INFO: { FIRSTNAME: true, LASTNAME: true, TITLE: true, EMAIL: true, COMPANY: true, COUNTRY: true, TIME_ZONE_CODE: true },
+    ASSIGNED_ASSET_GROUPS: { ASSET_GROUP_TITLE: true },
+    USER_STATUS: true,
+    CREATION_DATE: true,
+    LAST_LOGIN_DATE: true,
+    USER_ROLE: true,
+    BUSINESS_UNIT: true,
+    UNIT_MANAGER_POC: true,
+    MANAGER_POC: true,
+  },
+  // Activity Log CSV columns.
+  activity_log: { date: true, action: true, module: true, details: true, user_name: true, user_role: true, user_ip: true },
+  // webapp.xsd; headers, proxy, config, crawlingScripts, authRecords values, and screenshot are not exported.
+  was_webapps: {
+    id: true,
+    name: true,
+    url: true,
+    os: true,
+    owner: QPS_USER_REFERENCE,
+    scope: true,
+    tags: QPS_TAG_LIST,
+    defaultProfile: QPS_NAMED_REFERENCE,
+    defaultScanner: WAS_SCANNER_REFERENCE,
+    scannerLocked: true,
+    progressiveScanning: true,
+    authRecords: { count: true, list: { WebAppAuthRecord: QPS_NAMED_REFERENCE } },
+    useRobots: true,
+    useSitemap: true,
+    malwareMonitoring: true,
+    isScheduled: true,
+    lastScan: QPS_NAMED_REFERENCE,
+    lastScanStatus: true,
+    riskScore: true,
+    createdBy: QPS_USER_REFERENCE,
+    createdDate: "date",
+    updatedBy: QPS_USER_REFERENCE,
+    updatedDate: "date",
+  },
+  was_scans: WAS_SCAN_FIELDS,
+  was_scan_history: WAS_SCAN_FIELDS,
+  // webappauthrecord.xsd: form field values, server record credentials, OAuth2 client secrets and tokens,
+  // selenium scripts, certificates, and auth vault details are not exported.
+  was_auth_records: {
+    id: true,
+    name: true,
+    owner: QPS_USER_REFERENCE,
+    formRecord: {
+      type: true,
+      sslOnly: true,
+      fields: { count: true, list: { WebAppAuthFormRecordField: { id: true, name: true, secured: true } } },
+    },
+    serverRecord: {
+      type: true,
+      sslOnly: true,
+      fields: { count: true, list: { WebAppAuthServerRecordField: { id: true, type: true, domain: true } } },
+    },
+    oauth2Record: { grantType: true },
+    tags: QPS_TAG_LIST,
+    createdBy: QPS_USER_REFERENCE,
+    createdDate: "date",
+    updatedBy: QPS_USER_REFERENCE,
+    updatedDate: "date",
+  },
+  // wasscanschedule.xsd; notification recipients and proxy settings are not exported.
+  was_schedules: {
+    id: true,
+    name: true,
+    type: true,
+    active: true,
+    multi: true,
+    progressiveScanning: true,
+    target: {
+      webApp: WAS_WEB_APP_REFERENCE,
+      webApps: { count: true, list: { WebApp: WAS_WEB_APP_REFERENCE } },
+      tags: QPS_TAG_LIST,
+      scannerAppliance: WAS_SCANNER_REFERENCE,
+      cancelOption: true,
+      authRecord: QPS_NAMED_REFERENCE,
+    },
+    profile: QPS_NAMED_REFERENCE,
+    schedule: { startDate: "date", timeZone: { code: true, offset: true }, occurrenceType: true, occurrenceCount: true },
+    launchedCount: true,
+    launchedDate: "date",
+    nextLaunchDate: "date",
+    owner: QPS_USER_REFERENCE,
+    createdBy: QPS_USER_REFERENCE,
+    createdDate: "date",
+    updatedBy: QPS_USER_REFERENCE,
+    updatedDate: "date",
+  },
+};
+
+export function exportableRecords(name: string, records: JsonRecord[]): JsonRecord[] {
+  const allowlist = RAW_DATA_ALLOWLISTS[name];
+  if (!allowlist) {
+    throw new Error(`No rawData allowlist is defined for surface ${name}; refusing to export verbatim records.`);
+  }
+  return projectRecords(records, allowlist);
+}
+
+export function rawDataSurfaceNames(): string[] {
+  return Object.keys(RAW_DATA_ALLOWLISTS);
+}
+
 export async function assessQualysScanCoverage(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
@@ -1934,12 +2473,12 @@ export async function assessQualysScanCoverage(
     findings,
     errors,
     rawData: {
-      scheduled_scans: schedules.data,
-      scans: scans.data,
-      hosts: hosts.data,
-      option_profiles: profiles.data,
-      excluded_ips: excluded.data,
-      asset_groups: groups.data,
+      scheduled_scans: exportableRecords("scheduled_scans", schedules.data),
+      scans: exportableRecords("scans", scans.data),
+      hosts: exportableRecords("hosts", hosts.data),
+      option_profiles: exportableRecords("option_profiles", profiles.data),
+      excluded_ips: exportableRecords("excluded_ips", excluded.data),
+      asset_groups: exportableRecords("asset_groups", groups.data),
     },
   };
 }
@@ -2280,12 +2819,12 @@ export async function assessQualysAssetInventory(
     findings,
     errors,
     rawData: {
-      asset_groups: groups.data,
-      hosts: hosts.data,
-      connectors: connectors.data,
-      appliances: appliances.data,
-      cloud_agents: agents.data,
-      tags: tags.data,
+      asset_groups: exportableRecords("asset_groups", groups.data),
+      hosts: exportableRecords("hosts", hosts.data),
+      connectors: exportableRecords("connectors", connectors.data),
+      appliances: exportableRecords("appliances", appliances.data),
+      cloud_agents: exportableRecords("cloud_agents", agents.data),
+      tags: exportableRecords("tags", tags.data),
     },
   };
 }
@@ -2663,11 +3202,11 @@ export async function assessQualysVulnerabilityManagement(
     findings,
     errors,
     rawData: {
-      auth_records: authRecords.data,
-      hosts: hosts.data,
-      compliance_policies: policies.data,
-      detections: detections.data,
-      knowledge_base: knowledgeBase.data,
+      auth_records: exportableRecords("auth_records", authRecords.data),
+      hosts: exportableRecords("hosts", hosts.data),
+      compliance_policies: exportableRecords("compliance_policies", policies.data),
+      detections: exportableRecords("detections", detections.data),
+      knowledge_base: exportableRecords("knowledge_base", knowledgeBase.data),
     },
   };
 }
@@ -3024,14 +3563,16 @@ export async function assessQualysAdministration(
     findings,
     errors,
     rawData: {
-      scheduled_reports: scheduledReports.data,
-      reports: reports.data,
-      users: users.data,
-      activity_log: activity.data,
-      was_webapps: webApps.data,
-      was_scans: wasScans.data,
-      was_auth_records: wasAuth.data,
-      was_schedules: wasSchedules.data,
+      scheduled_reports: exportableRecords("scheduled_reports", scheduledReports.data),
+      reports: exportableRecords("reports", reports.data),
+      users: exportableRecords("users", users.data),
+      user_list: exportableRecords("user_list", userList.data),
+      activity_log: exportableRecords("activity_log", activity.data),
+      was_webapps: exportableRecords("was_webapps", webApps.data),
+      was_scans: exportableRecords("was_scans", wasScans.data),
+      was_scan_history: exportableRecords("was_scan_history", wasHistory.data),
+      was_auth_records: exportableRecords("was_auth_records", wasAuth.data),
+      was_schedules: exportableRecords("was_schedules", wasSchedules.data),
     },
   };
 }
