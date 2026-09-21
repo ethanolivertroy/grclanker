@@ -2368,9 +2368,14 @@ function isCredentialKey(key: string): boolean {
   return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[._-]/g, ""));
 }
 
-/** Keeps scheme, host, port, and path of a URL; userinfo and the query string can carry tokens. */
+/**
+ * Keeps scheme, host, port, and path of a URL whose userinfo or query string
+ * could carry a token. Values without either (including URL-shaped stanza
+ * names such as http://app-token or splunktcp://9997) are left verbatim.
+ */
 function scrubUrlValue(value: string): string {
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+  const match = /^[a-z][a-z0-9+.-]*:\/\/(.*)$/i.exec(value);
+  if (!match || !/[@?]/.test(match[1])) return value;
   try {
     const url = new URL(value);
     const userinfo = url.username || url.password ? `${REDACTED}@` : "";

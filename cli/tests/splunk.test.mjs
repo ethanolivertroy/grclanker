@@ -18,6 +18,7 @@ import {
   resolveSplunkConfiguration,
 } from "../dist/extensions/grc-tools/splunk.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW_SECONDS = Math.floor(Date.now() / 1000);
 
@@ -760,6 +761,293 @@ test("exportSplunkAuditBundle writes core_data, analysis, compliance reports, qu
   assert.notEqual(rerun.outputDir, result.outputDir);
   assert.notEqual(rerun.zipPath, result.zipPath);
   assert.ok(existsSync(result.zipPath) && existsSync(rerun.zipPath));
+});
+
+const FAKE_SECRETS = {
+  pass4SymmKey: "FAKE_PASS4SYMMKEY_1",
+  clusteringKey: "$7$FAKE_CIPHERTEXT_1",
+  sslKeysfilePassword: "FAKE_SSLKEYSFILE_PASSWORD_1",
+  proxyPassword: "FAKE_PROXY_PASSWORD_1",
+  httpEventCollectorToken: "FAKE_HEC_OUT_TOKEN_1",
+  discoveryKey: "FAKE_PASS4SYMMKEY_2",
+  outputsSslPassword: "FAKE_SSL_PASSWORD_1",
+  soapPassword: "FAKE_SOAP_PASSWORD_1",
+  rsaAccessKey: "FAKE_RSA_ACCESS_KEY_1",
+  bindPassword: "FAKE_BIND_PASSWORD_1",
+  duoSecret: "FAKE_DUO_SECRET_1",
+  hashedValue: "$1$FAKE_HASH_1",
+  hecToken: "FAKE_HEC_TOKEN_1",
+  inputsSslPassword: "FAKE_SSL_PASSWORD_2",
+  s2sPassword: "FAKE_S2S_PASSWORD_1",
+  webSslPassword: "FAKE_WEB_SSL_PASSWORD_1",
+  hecInputToken: "FAKE_HEC_TOKEN_2",
+  webhookToken: "FAKE_WEBHOOK_TOKEN_1",
+  slackToken: "FAKE_SLACK_TOKEN_1",
+  pagerdutyKey: "FAKE_PD_KEY_1",
+  customToken: "FAKE_CUSTOM_TOKEN_1",
+  splText: "FAKE_SPL_SECRET_1",
+  queryToken: "FAKE_QUERY_TOKEN_1",
+  acsHecToken: "FAKE_ACS_HEC_TOKEN_1",
+  errorBody: "FAKE_BODY_SECRET_1",
+};
+
+const SECRET_FIXTURE = {
+  ...HARDENED,
+  "/services/configs/conf-server": [
+    entry("general", { sessionTimeout: "30m", pass4SymmKey: FAKE_SECRETS.pass4SymmKey }),
+    entry("clustering", { mode: "manager", pass4SymmKey: FAKE_SECRETS.clusteringKey }),
+    entry("sslConfig", { enableSplunkdSSL: 1, sslVersions: "tls1.2", requireClientCert: 1, cipherSuite: "ECDHE-RSA-AES256-GCM-SHA384", sslKeysfilePassword: FAKE_SECRETS.sslKeysfilePassword }),
+    entry("proxyConfig", { http_proxy: `http://proxyuser:${FAKE_SECRETS.proxyPassword}@proxy.example.com:8080`, https_proxy: `https://proxyuser:${FAKE_SECRETS.proxyPassword}@proxy.example.com:8443` }),
+  ],
+  "/services/configs/conf-outputs": [
+    entry("tcpout:primary", { useSSL: "true", clientCert: "/opt/splunk/etc/auth/client.pem", sslPassword: FAKE_SECRETS.outputsSslPassword }),
+    entry("httpout", { uri: `https://hec.example.com:8088?token=${FAKE_SECRETS.queryToken}`, httpEventCollectorToken: FAKE_SECRETS.httpEventCollectorToken }),
+    entry("indexer_discovery:idx", { pass4SymmKey: FAKE_SECRETS.discoveryKey, manager_uri: "https://cm.example.com:8089" }),
+  ],
+  "/services/configs/conf-authentication": [
+    entry("authentication", { authType: "SAML", authSettings: "okta", externalTwoFactorAuthVendor: "Duo" }),
+    entry("okta", { disabled: 0, idpSSOUrl: "https://idp.example.com/sso", attributeQuerySoapPassword: FAKE_SECRETS.soapPassword }),
+    entry("rsa", { accessKey: FAKE_SECRETS.rsaAccessKey, replayCache: FAKE_SECRETS.hashedValue }),
+    entry("corp-ldap", { bindDNpassword: FAKE_SECRETS.bindPassword }),
+    entry("duo", { appSecretKey: FAKE_SECRETS.duoSecret, secretKey: FAKE_SECRETS.duoSecret }),
+    entry("splunk_auth", { minPasswordLength: 14, minPasswordUppercase: 1, minPasswordLowercase: 1, minPasswordDigit: 1, minPasswordSpecial: 1, expirePasswordDays: 90, forceWeakPasswordChange: 1, lockoutUsers: 1, passwordHistoryCount: 24 }),
+  ],
+  "/services/configs/conf-inputs": [
+    entry("splunktcp-ssl:9997", { disabled: 0, sslPassword: FAKE_SECRETS.s2sPassword, password: FAKE_SECRETS.s2sPassword }),
+    entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem", requireClientCert: 1, sslVersions: "tls1.2", sslPassword: FAKE_SECRETS.inputsSslPassword }),
+    entry("http://app-token", { token: FAKE_SECRETS.hecToken, index: "main" }),
+  ],
+  "/services/configs/conf-web": [entry("settings", { enableSplunkWebSSL: 1, "tools.sessions.timeout": 30, sslVersions: "tls1.2", sslPassword: FAKE_SECRETS.webSslPassword })],
+  "/services/data/inputs/http": [
+    entry("http", { disabled: 0, enableSSL: 1, port: 8088 }),
+    entry("app-token", { disabled: 0, indexes: "main", sourcetype: "app:json", useACK: 1, token: FAKE_SECRETS.hecInputToken }),
+  ],
+  "/servicesNS/-/-/saved/searches": [
+    entry("Errors", {
+      is_scheduled: 1,
+      disabled: 0,
+      dispatchAs: "user",
+      search: `index=main error ${FAKE_SECRETS.splText}`,
+      "dispatch.earliest_time": "-24h",
+      "action.webhook": 1,
+      "action.webhook.param.url": `https://hooks.example.com/services/${FAKE_SECRETS.webhookToken}`,
+      "action.slack": 1,
+      "action.slack.param.webhook_url": `https://hooks.slack.com/services/${FAKE_SECRETS.slackToken}`,
+      "action.pagerduty": 1,
+      "action.pagerduty.param.integration_key": FAKE_SECRETS.pagerdutyKey,
+      "action.custom.param.api_token": FAKE_SECRETS.customToken,
+    }, { sharing: "app", owner: "auditor", app: "search", perms: { read: ["*"], write: ["admin"] } }),
+  ],
+};
+
+test("rule 9: the exported bundle, the zip, the assess payloads, and the access check never carry conf secrets, HEC tokens, alert action parameters, or the raw splunktcp-ssl stanza", async () => {
+  const { fetchImpl } = createFetch(SECRET_FIXTURE);
+  const withErrorBody = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/servicesNS/-/-/storage/collections/config") return new Response(`<html>${FAKE_SECRETS.errorBody}</html>`, { status: 400, headers: { "content-type": "text/html" } });
+    return fetchImpl(input, init);
+  };
+  const api = new SplunkApiClient(sampleConfig(), { fetchImpl: withErrorBody, retryDelayMs: 0 });
+  const secrets = [...Object.values(FAKE_SECRETS), "test-bearer-token"];
+
+  const base = createTempBase("grclanker-splunk-rule9-");
+  const result = await exportSplunkAuditBundle(api, sampleConfig(), base);
+  const files = readBundleFiles(result.outputDir);
+  for (const file of ["core_data/conf_server.json", "core_data/conf_outputs.json", "core_data/conf_authentication.json", "core_data/conf_inputs.json", "core_data/conf_web.json", "core_data/hec_inputs.json", "core_data/saved_searches.json", "analysis/platform_hardening.json", "_errors.log"]) {
+    assert.ok(files.has(file), file);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(result.zipPath), secrets, "zip archive");
+
+  const server = JSON.parse(files.get("core_data/conf_server.json"));
+  const stanzaOf = (snapshot, name) => snapshot.entries.find((item) => item.name === name).content;
+  assert.equal(stanzaOf(server, "general").pass4SymmKey, "[REDACTED]");
+  assert.equal(stanzaOf(server, "clustering").pass4SymmKey, "[REDACTED]");
+  assert.equal(stanzaOf(server, "sslConfig").sslKeysfilePassword, "[REDACTED]");
+  assert.equal(stanzaOf(server, "sslConfig").sslVersions, "tls1.2");
+  assert.equal(stanzaOf(server, "proxyConfig").http_proxy, "http://[REDACTED]@proxy.example.com:8080/");
+  const outputs = JSON.parse(files.get("core_data/conf_outputs.json"));
+  assert.equal(stanzaOf(outputs, "httpout").httpEventCollectorToken, "[REDACTED]");
+  assert.equal(stanzaOf(outputs, "httpout").uri, "https://hec.example.com:8088/?[REDACTED]");
+  assert.equal(stanzaOf(outputs, "indexer_discovery:idx").pass4SymmKey, "[REDACTED]");
+  assert.equal(stanzaOf(outputs, "indexer_discovery:idx").manager_uri, "https://cm.example.com:8089", "URLs without userinfo or a query stay verbatim");
+  const authentication = JSON.parse(files.get("core_data/conf_authentication.json"));
+  assert.equal(stanzaOf(authentication, "okta").attributeQuerySoapPassword, "[REDACTED]");
+  assert.equal(stanzaOf(authentication, "okta").idpSSOUrl, "https://idp.example.com/sso");
+  assert.equal(stanzaOf(authentication, "rsa").accessKey, "[REDACTED]");
+  assert.equal(stanzaOf(authentication, "rsa").replayCache, "[REDACTED]", "$1$ ciphertext is redacted by value even under a non-credential key");
+  assert.equal(stanzaOf(authentication, "corp-ldap").bindDNpassword, "[REDACTED]");
+  assert.equal(stanzaOf(authentication, "duo").appSecretKey, "[REDACTED]");
+  assert.equal(stanzaOf(authentication, "splunk_auth").minPasswordLength, 14, "password policy keys stay legible");
+  assert.equal(stanzaOf(authentication, "splunk_auth").passwordHistoryCount, 24);
+  const inputs = JSON.parse(files.get("core_data/conf_inputs.json"));
+  assert.equal(stanzaOf(inputs, "http://app-token").token, "[REDACTED]", "URL-shaped stanza names stay verbatim and their token is redacted");
+  assert.equal(stanzaOf(inputs, "splunktcp-ssl:9997").sslPassword, "[REDACTED]");
+  assert.equal(stanzaOf(inputs, "SSL").serverCert, "/opt/splunk/etc/auth/server.pem");
+  assert.equal(stanzaOf(JSON.parse(files.get("core_data/hec_inputs.json")), "app-token").token, "[REDACTED]");
+  const savedSearches = JSON.parse(files.get("core_data/saved_searches.json"));
+  const errorsSearch = savedSearches.entries.find((item) => item.name === "Errors");
+  assert.equal(errorsSearch.content.search, "[REDACTED]");
+  assert.equal(errorsSearch.content.search_index_scope, "index_bound");
+  assert.deepEqual(errorsSearch.content.action_names, ["webhook", "slack", "pagerduty"]);
+  assert.equal(errorsSearch.content.action_params_dropped, 4);
+  assert.deepEqual(errorsSearch.acl.perms.write, ["admin"]);
+  assert.ok(Object.keys(errorsSearch.content).every((key) => !key.includes(".param.")), "no action parameter survives the projection");
+  const platform = JSON.parse(files.get("analysis/platform_hardening.json"));
+  const s2s = platform.findings.find((item) => item.id === "SPLUNK-PLAT-23");
+  assert.equal(s2s.status, "pass");
+  assert.ok(s2s.evidence.listeners.every((listener) => listener.tlsStanza === undefined), "raw [splunktcp-ssl:<port>] stanza is not evidence");
+  assert.equal(s2s.evidence.listeners[0].tls.requireClientCert, "1");
+  assert.match(files.get("_errors.log"), /non-JSON response body \(\d+ bytes, not recorded\)/);
+
+  const payloads = JSON.stringify([...(await runAllAssessments(api)), await checkSplunkAccess(api)]);
+  for (const secret of secrets) {
+    assert.ok(!payloads.includes(secret), `${secret} appears in an assess or access check payload`);
+  }
+
+  const cloud = { ...SECRET_FIXTURE, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
+  const acs = { "/inputs/http-event-collectors": { "http-event-collectors": [{ spec: { name: "firehose", allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useACK: true }, token: FAKE_SECRETS.acsHecToken }] } };
+  const cloudData = JSON.stringify(await assessSplunkDataProtection(client(cloud, { acs }, { stack: "acme-stack", acsToken: "acs-jwt" }).client));
+  assert.ok(!cloudData.includes(FAKE_SECRETS.acsHecToken));
+  assert.ok(!cloudData.includes("acs-jwt"));
+});
+
+function pagedFetch(fixture, path, page) {
+  const { fetchImpl } = createFetch(fixture);
+  return async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname !== path) return fetchImpl(input, init);
+    return jsonResponse(page(Number(url.searchParams.get("offset") ?? "0"), Number(url.searchParams.get("count") ?? "100")));
+  };
+}
+
+test("rule 10: list() reports a full last page without paging.total, the item cap, and a repeating page as truncated, and the dependent findings state seen versus total", async () => {
+  const rolesPath = "/services/authorization/roles";
+  const roleEntry = (index) => entry(`role-${index}`, { capabilities: ["search"], srchIndexesAllowed: ["main"] });
+
+  const noTotal = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, rolesPath, (offset, count) => ({ entry: Array.from({ length: count }, (_, index) => roleEntry(offset + index)) })), retryDelayMs: 0, pageSize: 3, maxEntries: 9 });
+  const capped = await noTotal.listRoles();
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.totalKnown, false);
+  assert.equal(capped.entries.length, 9);
+  const cappedAccess = await assessSplunkAccessControl(noTotal);
+  for (const id of ["SPLUNK-AC-07", "SPLUNK-AC-08", "SPLUNK-AC-09", "SPLUNK-AC-10", "SPLUNK-AC-12"]) {
+    assert.notEqual(byId(cappedAccess, id).status, "pass", `${id}: ${byId(cappedAccess, id).summary}`);
+  }
+  assert.match(byId(cappedAccess, "SPLUNK-AC-07").summary, /9 roles \(total unknown\)/);
+  assert.equal(byId(cappedAccess, "SPLUNK-AC-07").evidence.total, null);
+  assert.equal(byId(cappedAccess, "SPLUNK-AC-07").evidence.total_known, false);
+
+  const shortLastPage = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, rolesPath, (offset, count) => ({ entry: offset >= 6 ? [roleEntry(6)] : Array.from({ length: count }, (_, index) => roleEntry(offset + index)) })), retryDelayMs: 0, pageSize: 3 });
+  const complete = await shortLastPage.listRoles();
+  assert.equal(complete.truncated, false, "a short page without paging.total ends the walk as complete");
+  assert.equal(complete.totalKnown, false);
+  assert.equal(complete.entries.length, 7);
+
+  const knownTotal = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, rolesPath, (offset, count) => ({ entry: Array.from({ length: count }, (_, index) => roleEntry(offset + index)), paging: { total: 50, offset } })), retryDelayMs: 0, pageSize: 3, maxEntries: 6 });
+  const itemCapped = await knownTotal.listRoles();
+  assert.equal(itemCapped.truncated, true);
+  assert.equal(itemCapped.totalKnown, true);
+  assert.equal(itemCapped.total, 50);
+  assert.match(byId(await assessSplunkAccessControl(knownTotal), "SPLUNK-AC-07").summary, /6 of 50 roles/);
+
+  const repeating = new SplunkApiClient(sampleConfig(), { fetchImpl: pagedFetch(HARDENED, rolesPath, () => ({ entry: [roleEntry(0), roleEntry(1), roleEntry(2)], paging: { total: 50, offset: 0 } })), retryDelayMs: 0, pageSize: 3 });
+  const stuck = await repeating.listRoles();
+  assert.equal(stuck.truncated, true, "a server that ignores offset repeats the page and must not loop or report complete");
+  assert.equal(stuck.entries.length, 3);
+  const stuckAccess = await assessSplunkAccessControl(repeating);
+  assert.notEqual(byId(stuckAccess, "SPLUNK-AC-07").status, "pass");
+  assert.match(byId(stuckAccess, "SPLUNK-AC-07").summary, /3 of 50 roles/);
+});
+
+test("rule 10: acsListAll reports a repeated ACS page as truncated and an unrecognized payload as unreadable, and control 16 never passes on either", async () => {
+  const cloud = { ...HARDENED, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
+  const config = { stack: "acme-stack", acsToken: "acs-jwt" };
+  const tokenSpec = (name) => ({ spec: { name, allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useACK: true } });
+
+  const repeating = { "/inputs/http-event-collectors": { "http-event-collectors": [tokenSpec("a"), tokenSpec("b")] } };
+  const repeatingClient = client(cloud, { acs: repeating, pageSize: 2 }, config).client;
+  const walk = await repeatingClient.acsListAll("/inputs/http-event-collectors", "http-event-collectors");
+  assert.equal(walk.truncated, true);
+  assert.equal(walk.items.length, 2);
+  const repeated = byId(await assessSplunkDataProtection(repeatingClient), "SPLUNK-DP-16");
+  assert.equal(repeated.status, "warn");
+  assert.match(repeated.summary, /2 seen, total unknown/);
+
+  const unrecognized = { "/inputs/http-event-collectors": { collectors: [tokenSpec("a")] } };
+  const unrecognizedClient = client(cloud, { acs: unrecognized }, config).client;
+  await assert.rejects(() => unrecognizedClient.acsListAll("/inputs/http-event-collectors", "http-event-collectors"), /did not include a http-event-collectors list/);
+  const unreadableResult = await assessSplunkDataProtection(unrecognizedClient);
+  const unreadable = byId(unreadableResult, "SPLUNK-DP-16");
+  assert.equal(unreadable.status, "warn", "the readable local HEC view is capped at warn, never pass, when ACS could not be read");
+  assert.match(unreadable.summary, /ACS HEC token inventory \(acs:\/inputs\/http-event-collectors\) could not be read/);
+  assert.ok(unreadableResult.errors.some((item) => /did not include a http-event-collectors list/.test(item)), unreadableResult.errors.join("\n"));
+
+  const nothingLocal = { ...cloud, "/services/data/inputs/http": undefined };
+  delete nothingLocal["/services/data/inputs/http"];
+  const bothUnreadable = byId(await assessSplunkDataProtection(client(nothingLocal, { acs: unrecognized }, config).client), "SPLUNK-DP-16");
+  assert.equal(bothUnreadable.status, "manual");
+  assert.match(bothUnreadable.summary, /acs:\/inputs\/http-event-collectors/);
+});
+
+function forbidding(fixture, forbiddenEndpoints, options = {}, configOverrides = {}) {
+  const { fetchImpl } = createFetch(fixture, options);
+  const forbidden = new Set(forbiddenEndpoints);
+  const wrapped = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const endpoint = url.hostname === "admin.splunk.com" ? `acs:${url.pathname.replace(/^\/[^/]+\/adminconfig\/v2/, "")}` : url.pathname;
+    if (forbidden.has(endpoint)) return jsonResponse({ messages: [{ type: "ERROR", text: "You (user=auditor) do not have permission to perform this operation." }] }, 403);
+    return fetchImpl(input, init);
+  };
+  return new SplunkApiClient(sampleConfig(configOverrides), { fetchImpl: wrapped, retryDelayMs: 0 });
+}
+
+test("rule 1 corollary: each multi-inventory finding drops below pass and names the secondary inventory when that inventory alone returns 403", async () => {
+  const cloud = { ...HARDENED, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
+  const unscheduled = { ...HARDENED, "/servicesNS/-/-/saved/searches": [entry("Errors", { is_scheduled: 0, disabled: 0, search: "index=main error" }, { sharing: "app", owner: "auditor", app: "search", perms: { read: ["*"], write: ["admin"] } })] };
+  const acsHealthy = { "/inputs/http-event-collectors": { "http-event-collectors": [{ spec: { name: "firehose", allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useACK: true } }] } };
+  const scenarios = [
+    { id: "SPLUNK-AUTH-06", area: assessSplunkAuthentication, fixture: HARDENED, secondary: "/services/authentication/users", expected: "warn", names: /subject-to-user check was skipped because the user list could not be read/ },
+    { id: "SPLUNK-DP-15", area: assessSplunkDataProtection, fixture: HARDENED, secondary: "/services/configs/conf-inputs", expected: "warn", names: /inputs\.conf \[SSL\] could not be read/ },
+    { id: "SPLUNK-DP-16", area: assessSplunkDataProtection, fixture: cloud, options: { acs: acsHealthy }, config: { stack: "acme-stack", acsToken: "acs-jwt" }, secondary: "acs:/inputs/http-event-collectors", expected: "warn", names: /ACS HEC token inventory \(acs:\/inputs\/http-event-collectors\) could not be read/ },
+    { id: "SPLUNK-AUD-18", area: assessSplunkAuditMonitoring, fixture: HARDENED, secondary: "/services/authentication/users", expected: "warn", names: /role assignments could not be enumerated because the user list could not be read/, evidence: (item) => item.users_readable === false },
+    { id: "SPLUNK-PLAT-22", area: assessSplunkPlatformHardening, fixture: unscheduled, secondary: "/services/authentication/users", expected: "warn", names: /user list could not be read/ },
+    { id: "SPLUNK-PLAT-23", area: assessSplunkPlatformHardening, fixture: HARDENED, secondary: "/services/server/info", expected: "warn", names: /classified as Splunk Enterprise from the URL heuristic/ },
+    { id: "SPLUNK-DP-15", area: assessSplunkDataProtection, fixture: HARDENED, secondary: "/services/server/info", expected: "warn", names: /classified as Splunk Enterprise from the URL heuristic/ },
+    { id: "SPLUNK-DP-16", area: assessSplunkDataProtection, fixture: HARDENED, secondary: "/services/server/info", expected: "warn", names: /classified as Splunk Enterprise from the URL heuristic/ },
+  ];
+  for (const scenario of scenarios) {
+    const label = `${scenario.id} with ${scenario.secondary} forbidden`;
+    const healthy = await scenario.area(forbidding(scenario.fixture, [], scenario.options, scenario.config));
+    assert.equal(byId(healthy, scenario.id).status, "pass", `${label}: baseline must be pass so the demotion is meaningful`);
+    const result = await scenario.area(forbidding(scenario.fixture, [scenario.secondary], scenario.options, scenario.config));
+    const item = byId(result, scenario.id);
+    assert.equal(item.status, scenario.expected, `${label}: ${item.summary}`);
+    assert.match(item.summary, scenario.names, `${label}: summary names the unreadable inventory`);
+    assert.match(item.summary, /403/, `${label}: summary states the cause`);
+    const evidenceHolds = scenario.evidence ?? ((evidence) => Array.isArray(evidence.caveats) && evidence.caveats.length >= 1);
+    assert.ok(evidenceHolds(item.evidence), `${label}: evidence records the unreadable inventory`);
+  }
+
+  const noUsers = await assessSplunkAuthentication(forbidding(HARDENED, ["/services/authentication/users"]));
+  assert.equal(byId(noUsers, "SPLUNK-AUTH-06").evidence.users_readable, false);
+  assert.match(byId(noUsers, "SPLUNK-AUTH-06").summary, /whether every subject maps to a known user was not checked/);
+  const noUsersAudit = await assessSplunkAuditMonitoring(forbidding(HARDENED, ["/services/authentication/users"]));
+  assert.equal(byId(noUsersAudit, "SPLUNK-AUD-18").evidence.users_with_delete_roles, null);
+  assert.doesNotMatch(byId(noUsersAudit, "SPLUNK-AUD-18").summary, /unassigned admin-like roles/);
+
+  const noServerInfo = forbidding(HARDENED, ["/services/server/info"]);
+  const data = await assessSplunkDataProtection(noServerInfo);
+  const platform = await assessSplunkPlatformHardening(noServerInfo);
+  for (const [result, id] of [[data, "SPLUNK-DP-14"], [platform, "SPLUNK-PLAT-19"]]) {
+    assert.equal(byId(result, id).status, "manual", id);
+    assert.match(byId(result, id).summary, /URL heuristic .*403/, `${id}: manual verdict names the deployment guess`);
+  }
+  const cloudNoServerInfo = forbidding(cloud, ["/services/server/info"], { acs: acsHealthy }, { url: "https://acme.splunkcloud.com:8089", stack: "acme-stack", acsToken: "acs-jwt" });
+  const cloudData = await assessSplunkDataProtection(cloudNoServerInfo);
+  assert.equal(byId(cloudData, "SPLUNK-DP-16").status, "warn");
+  assert.match(byId(cloudData, "SPLUNK-DP-16").summary, /classified as Splunk Cloud from the URL heuristic \(the URL matches \*\.splunkcloud\.com\)/);
+  assert.equal(byId(cloudData, "SPLUNK-DP-16").evidence.source, "acs:/inputs/http-event-collectors");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
