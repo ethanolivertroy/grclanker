@@ -1080,7 +1080,10 @@ export class SalesforceApiClient {
   }
 
   async listCertificates(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    return this.query("SELECT Id, DeveloperName, MasterLabel, ExpirationDate, KeySize, NamespacePrefix, CreatedDate FROM Certificate ORDER BY ExpirationDate", limit);
+    return this.toolingQuery(
+      "SELECT Id, DeveloperName, MasterLabel, ExpirationDate, KeySize, OptionsIsCaSigned, OptionsIsPrivateKeyExportable, OptionsIsUnusable FROM Certificate ORDER BY ExpirationDate",
+      limit,
+    );
   }
 
   async listConnectedApplications(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1828,10 +1831,30 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     const expired = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() < now.getTime(); });
     const expiring = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() >= now.getTime() && daysBetween(date, now) <= warningDays; });
     const weakKeys = certificates.filter((cert) => (asNumber(cert.KeySize) ?? 2048) < 2048);
+    const selfSigned = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === false);
+    const unknownSigning = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === undefined);
+    const exportableKeys = certificates.filter((cert) => asBoolean(cert.OptionsIsPrivateKeyExportable) === true);
+    const pendingChain = certificates.filter((cert) => asBoolean(cert.OptionsIsUnusable) === true);
     const label = (cert: JsonRecord): string => `${asString(cert.DeveloperName) ?? asString(cert.MasterLabel) ?? "certificate"} (${asString(cert.ExpirationDate) ?? "no expiration date"})`;
-    const evidence = { certificates: certificates.length, expired: truncateList(expired.map(label)), expiring_within_days: warningDays, expiring: truncateList(expiring.map(label)), missing_expiration_date: truncateList(undated.map(label)), weak_keys: truncateList(weakKeys.map(label)), truncated: data.certificates.truncated };
-    const status: SalesforceFindingStatus = expired.length > 0 || weakKeys.length > 0 ? "fail" : expiring.length > 0 || undated.length > 0 ? "warn" : withPartialDowngrade("pass", data.certificates);
-    findings.push(finding(17, status, `${certificates.length} certificates: ${expired.length} expired, ${expiring.length} expiring within ${warningDays} days, ${undated.length} without an expiration date (not counted as valid), ${weakKeys.length} with keys under 2048 bits. CA-signed status is not exposed by the query and needs manual confirmation.${partialNote(data.certificates)}`, evidence, certManual));
+    const evidence = {
+      certificates: certificates.length,
+      expired: truncateList(expired.map(label)),
+      expiring_within_days: warningDays,
+      expiring: truncateList(expiring.map(label)),
+      missing_expiration_date: truncateList(undated.map(label)),
+      weak_keys: truncateList(weakKeys.map(label)),
+      self_signed: truncateList(selfSigned.map(label)),
+      signing_status_unknown: truncateList(unknownSigning.map(label)),
+      exportable_private_keys: truncateList(exportableKeys.map(label)),
+      awaiting_signed_chain: truncateList(pendingChain.map(label)),
+      truncated: data.certificates.truncated,
+    };
+    const needsReview = expiring.length > 0 || undated.length > 0 || unknownSigning.length > 0 || exportableKeys.length > 0 || pendingChain.length > 0;
+    const status: SalesforceFindingStatus = expired.length > 0 || weakKeys.length > 0 ? "fail" : needsReview ? "warn" : withPartialDowngrade("pass", data.certificates);
+    const signingNote = unknownSigning.length > 0
+      ? `OptionsIsCaSigned was not returned for ${unknownSigning.length}, so their signing status needs manual confirmation.`
+      : `${selfSigned.length} self-signed and ${certificates.length - selfSigned.length} CA-signed.`;
+    findings.push(finding(17, status, `${certificates.length} certificates: ${expired.length} expired, ${expiring.length} expiring within ${warningDays} days, ${undated.length} without an expiration date (not counted as valid), ${weakKeys.length} with keys under 2048 bits, ${exportableKeys.length} with exportable private keys, ${pendingChain.length} awaiting a signed chain. ${signingNote}${partialNote(data.certificates)}`, evidence, status === "pass" ? undefined : certManual));
   }
 
   return {

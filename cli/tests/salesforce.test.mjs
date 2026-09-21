@@ -177,7 +177,7 @@ function goodDataProtectionData(overrides = {}) {
       { Field: "Contact.SSN__c", SobjectType: "Contact", ParentId: "PS2", PermissionsRead: true, PermissionsEdit: true },
     ]),
     tenantSecrets: okDataset("TenantSecret", [{ Id: "T1", Status: "Active", Type: "Data", Version: 3, CreatedDate: "2026-06-01T00:00:00Z" }]),
-    certificates: okDataset("Certificate", [{ Id: "C1", DeveloperName: "sso_cert", ExpirationDate: "2027-09-01T00:00:00Z", KeySize: 2048 }]),
+    certificates: okDataset("Certificate", [{ Id: "C1", DeveloperName: "sso_cert", ExpirationDate: "2027-09-01T00:00:00Z", KeySize: 2048, OptionsIsCaSigned: true, OptionsIsPrivateKeyExportable: false, OptionsIsUnusable: false }]),
     ...overrides,
   };
 }
@@ -643,6 +643,18 @@ test("assessSalesforceDataProtection passes healthy evidence and fails weak evid
   }), { now: NOW });
   assert.equal(findingById(undatedCert, "SF-17").status, "warn");
   assert.equal(findingById(undatedCert, "SF-16").status, "warn");
+
+  const unknownSigning = assessSalesforceDataProtectionData(goodDataProtectionData({
+    certificates: okDataset("Certificate", [{ Id: "C4", DeveloperName: "nosign", ExpirationDate: "2027-09-01T00:00:00Z", KeySize: 2048 }]),
+  }), { now: NOW });
+  assert.equal(findingById(unknownSigning, "SF-17").status, "warn", "a certificate whose OptionsIsCaSigned flag is absent must not pass (rule 6)");
+  assert.match(findingById(unknownSigning, "SF-17").summary, /OptionsIsCaSigned was not returned/);
+
+  const exportable = assessSalesforceDataProtectionData(goodDataProtectionData({
+    certificates: okDataset("Certificate", [{ Id: "C5", DeveloperName: "exportable", ExpirationDate: "2027-09-01T00:00:00Z", KeySize: 4096, OptionsIsCaSigned: false, OptionsIsPrivateKeyExportable: true, OptionsIsUnusable: false }]),
+  }), { now: NOW });
+  assert.equal(findingById(exportable, "SF-17").status, "warn");
+  assert.match(findingById(exportable, "SF-17").summary, /1 self-signed and 0 CA-signed/);
 });
 
 test("assessSalesforceDataProtectionData renders Shield encryption as manual not-applicable when TenantSecret is unavailable (rule 3)", () => {

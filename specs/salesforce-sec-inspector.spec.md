@@ -420,6 +420,7 @@ Implemented in grclanker as native TypeScript tools (2026-09-21). The Go rewrite
 - `PermissionSet`, `PermissionSetAssignment`, and `FieldPermissions` are queried through the standard REST `query` endpoint because they are standard sObjects
 - MFA enrollment uses the documented `TwoFactorMethodsInfo` object instead of `TwoFactorInfo`; My Domain policy uses the `MyDomainSettings` metadata type (`canOnlyLoginWithMyDomainUrl`, `doesApiLoginRequireOrgDomain`) instead of a `CustomDomain` object
 - Platform Encryption status uses the `TenantSecret` sObject; `EncryptedFieldsInfo` is not queried
+- `Certificate` is a Tooling API object (version 37.0 and later), not a REST sObject, so it is queried through `tooling/query`; its documented `OptionsIsCaSigned`, `OptionsIsPrivateKeyExportable`, and `OptionsIsUnusable` flags feed control 17
 - The interactive authorization code flow is not implemented; a refresh token obtained from that flow (or a `grant_type: authorization_code` credentials file that carries `refresh_token`) is exchanged instead
 - API version defaults to 64.0 and can be overridden with `SF_API_VERSION`
 

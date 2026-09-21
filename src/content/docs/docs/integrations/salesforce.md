@@ -12,7 +12,7 @@ The Salesforce inspector audits one org through the REST API (SOQL), the Tooling
 - `MyDomainSettings` metadata: login policy for `login.salesforce.com` and API logins
 - Users, profiles, permission sets, permission set assignments, and `TwoFactorMethodsInfo` enrollment
 - `FieldPermissions` on fields whose names look sensitive, organization-wide defaults from `Organization`
-- `TenantSecret` (Shield Platform Encryption), `Certificate`
+- `TenantSecret` (Shield Platform Encryption) and the Tooling API `Certificate` object (expiration, key size, CA-signed, exportable private key)
 - `ConnectedApplication`, `OauthToken`, `LoginHistory`, `SetupAuditTrail`, `EventLogFile`
 
 ## Setup and authentication
@@ -80,7 +80,7 @@ Precedence is explicit tool arguments, then environment variables, then the cred
 | 14 | Login forensics | monitoring_integrations | SF-14 | pass when failures <= 10 percent, no source with 10+ failures, no legacy TLS |
 | 15 | Setup change tracking | monitoring_integrations | SF-15 | pass when the trail is complete and no high-risk security changes; warn when changes need review |
 | 16 | Data encryption | data_protection | SF-16 | manual not-applicable when `TenantSecret` is unavailable or forbidden; fail when no active secrets |
-| 17 | Certificate management | data_protection | SF-17 | fail when expired or key < 2048; warn when expiring within 30 days or undated |
+| 17 | Certificate management | data_protection | SF-17 | fail when expired or key < 2048; warn when expiring within 30 days, undated, `OptionsIsCaSigned` absent, private key exportable, or awaiting a signed chain; self-signed versus CA-signed counts are reported |
 | 18 | My Domain enforcement | platform_security | SF-18 | pass when `canOnlyLoginWithMyDomainUrl` and `doesApiLoginRequireOrgDomain` are true |
 | 19 | Clickjack protection | platform_security | SF-19 | pass when all four `enableClickjack*` flags are true |
 | 20 | CSRF protection | platform_security | SF-20 | pass when `enableCSRFOnGet` and `enableCSRFOnPost` are true |
@@ -104,7 +104,7 @@ The script skips with exit code 0 when no credentials are present; otherwise it 
 - Control 6 is always manual; profile login hours are not retrieved.
 - Connected app OAuth scopes, IP relaxation, and per-app policies beyond `OptionsAllowAdminApprovedUsersOnly` and refresh token validity are not exposed by SOQL.
 - Custom object organization-wide defaults and sharing rules are not read; only the standard object defaults on `Organization` are evaluated.
-- `Certificate` does not expose CA-signed status in the query used, so self-signed versus CA-signed remains manual.
+- `Certificate` is a Tooling API object; self-signed certificates are reported but not failed on their own, since Salesforce issues self-signed certificates for JWT connected apps and SAML signing by design.
 - `readMetadata` requires `Modify Metadata Through Metadata API Functions` or `Modify All Data`; without it, controls 2, 3, 5, 18, 19, and 20 render as manual.
 - Shield Event Monitoring and Platform Encryption are add-on licenses; unavailable objects render as manual not-applicable, never pass.
 - The username-password flow is disabled by default in newer orgs and is kept only for legacy compatibility.
@@ -112,7 +112,7 @@ The script skips with exit code 0 when no credentials are present; otherwise it 
 ## Official documentation
 
 - [REST API: Execute a SOQL Query](https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_query.htm) (`nextRecordsUrl`, `done`, `totalSize`)
-- [Tooling API: SecurityHealthCheckRisks](https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_securityhealthcheckrisks.htm) (includes the `SecurityHealthCheck` Score query)
+- [Tooling API: SecurityHealthCheckRisks](https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_securityhealthcheckrisks.htm) (includes the `SecurityHealthCheck` Score query) and [Tooling API: Certificate](https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_certificate.htm)
 - [Metadata API: SecuritySettings](https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_securitysettings.htm)
 - [Metadata API: MyDomainSettings](https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_mydomainsettings.htm)
 - [Metadata API: readMetadata()](https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_readMetadata.htm)
