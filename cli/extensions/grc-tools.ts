@@ -23,6 +23,7 @@ import { readGrclankerSettings } from "../pi/settings.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
 import { registerAwsTools } from "./grc-tools/aws.js";
 import { registerAzureTools } from "./grc-tools/azure.js";
+import { registerBoxTools } from "./grc-tools/box.js";
 import { registerCloudflareTools } from "./grc-tools/cloudflare.js";
 import { registerCmvpTools } from "./grc-tools/cmvp.js";
 import { registerDuoTools } from "./grc-tools/duo.js";
@@ -51,6 +52,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerAnsibleTools,
   registerAwsTools,
   registerAzureTools,
+  registerBoxTools,
   registerCloudflareTools,
   registerCmvpTools,
   registerDuoTools,

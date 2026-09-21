@@ -30,6 +30,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["ansible_", "Ansible AAP"],
   ["aws_", "AWS"],
   ["azure_", "Azure"],
+  ["box_", "Box"],
   ["cloudflare_", "Cloudflare"],
   ["cmvp_", "CMVP"],
   ["duo_", "Duo"],
