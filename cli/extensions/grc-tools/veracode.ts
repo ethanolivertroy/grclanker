@@ -1252,10 +1252,11 @@ function projectDynamicScanConfiguration(analysisId: string, scanId: string, con
   const authentications = asObject(asObject(configuration.auth_configuration)?.authentications) ?? {};
   const crawl = asObject(configuration.crawl_configuration);
   const allowedHosts = asRecords(asObject(configuration.scan_setting)?.allowed_hosts ?? configuration.allowed_hosts);
+  const targetUrl = asString(asObject(configuration.target_url)?.url) ?? asString(configuration.target_url);
   return {
     analysis_id: analysisId,
     scan_id: scanId,
-    target_url: asString(asObject(configuration.target_url)?.url) ?? asString(configuration.target_url) ?? null,
+    target_url: targetUrl === undefined ? null : scrubUrlValue(targetUrl),
     authentication_types: Object.keys(authentications),
     authentication_details: Object.keys(authentications).length > 0 ? "[REDACTED]" : null,
     crawl_disabled: asBoolean(crawl?.disabled) ?? null,
@@ -1303,7 +1304,7 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
       const scanId = asString(scan.scan_id) ?? "";
       const configuration = await surface(() => client.getDynamicScanConfiguration(scanId));
       errors.push(...surfaceErrors(`dynamic scan configuration ${scanId}`, configuration));
-      const label = `${analysisLabel}:${asString(scan.target_url) ?? scanId}`;
+      const label = `${analysisLabel}:${scrubUrlValue(asString(scan.target_url) ?? scanId)}`;
       if (configuration.status === "error") {
         unreadable.push(label);
         continue;

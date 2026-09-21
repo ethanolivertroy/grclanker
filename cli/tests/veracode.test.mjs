@@ -22,6 +22,7 @@ import {
   resolveVeracodeConfiguration,
 } from "../dist/extensions/grc-tools/veracode.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const API_ID = "dbb6f2a2ed0b6890bbd32e949f72c8c8";
@@ -709,6 +710,254 @@ test("false-pass self-check (c): partial inventories downgrade every would-be pa
   }), { now: NOW });
   assert.equal(statusOf(truncatedFindings.findings, 3), "warn");
   assert.match(truncatedFindings.findings[0].summary, /truncated/);
+});
+
+const FAKE_SECRETS = {
+  customFieldToken: "FAKE_CUSTOM_FIELD_TOKEN_1",
+  customFieldJwtPayload: "FAKE_JWT_PAYLOAD_1",
+  repoUserinfoToken: "FAKE_REPO_TOKEN_1",
+  repoQueryToken: "FAKE_REPO_QUERY_TOKEN_1",
+  dastPassword: "FAKE_DAST_PASSWORD_1",
+  loginScript: "FAKE_LOGIN_SCRIPT_BODY_1",
+  clientCertificate: "FAKE_CLIENT_CERTIFICATE_1",
+  certificatePassword: "FAKE_CERT_PASSWORD_1",
+  crawlScript: "FAKE_CRAWL_SCRIPT_BODY_1",
+  configurationSession: "FAKE_SESSION_TOKEN_1",
+  scanListSession: "FAKE_SESSION_TOKEN_2",
+  scanRequestPassword: "FAKE_SCAN_REQUEST_PASSWORD_1",
+  apiSecret: "FAKE_API_SECRET_1",
+};
+
+/** Every collected object that can carry a credential per the vendor API carries a distinctive fake one. */
+function secretFixture() {
+  const fixture = healthyFixture();
+  fixture.applications[0].profile.custom_fields = [
+    { name: "Deploy API Token", value: FAKE_SECRETS.customFieldToken },
+    { name: "ci_session", value: `eyJhbGciOiJIUzI1NiJ9.${FAKE_SECRETS.customFieldJwtPayload}.FAKE_JWT_SIGNATURE_1` },
+  ];
+  fixture.applications[0].profile.git_repo_url = `https://svc:${FAKE_SECRETS.repoUserinfoToken}@git.example.com/org/payments.git`;
+  fixture.applications[1].profile.git_repo_url = `https://git.example.com/org/portal.git?access_token=${FAKE_SECRETS.repoQueryToken}`;
+  fixture.scans = [{
+    scan_id: "scan-1",
+    analysis_id: "an-1",
+    target_url: `https://portal.example.com/?sid=${FAKE_SECRETS.scanListSession}`,
+    scan_config_request: { auth_configuration: { authentications: { AUTO: { username: "svc", password: FAKE_SECRETS.scanRequestPassword } } } },
+  }];
+  fixture.scanConfiguration = {
+    target_url: { url: `https://portal.example.com/login?session=${FAKE_SECRETS.configurationSession}` },
+    auth_configuration: {
+      authentications: {
+        AUTO: { username: "svc", password: FAKE_SECRETS.dastPassword },
+        FORM: { login_script_data: { script_body: FAKE_SECRETS.loginScript } },
+        CERT: { client_certificate: FAKE_SECRETS.clientCertificate, password: FAKE_SECRETS.certificatePassword },
+      },
+    },
+    crawl_configuration: { disabled: true, crawl_script_data: { script_body: FAKE_SECRETS.crawlScript } },
+    scan_setting: { allowed_hosts: [{ url: "https://portal.example.com" }] },
+  };
+  fixture.credentials = { ...fixture.credentials, api_secret: FAKE_SECRETS.apiSecret };
+  return fixture;
+}
+
+test("rule 9: the exported bundle, the zip, the assess payloads, and the access check never carry custom field tokens, repository tokens, DAST credentials, login scripts, or API secrets", async () => {
+  const base = createTempBase("grclanker-veracode-secrets-");
+  const client = mockClient(secretFixture(), { async listSandboxes() { throw forbidden("/appsec/v1/applications/app-1/sandboxes"); } });
+  const secrets = [...Object.values(FAKE_SECRETS), API_SECRET];
+
+  const result = await exportVeracodeAuditBundle(client, sampleConfig(), base, { now: NOW });
+  const files = readBundleFiles(result.outputDir);
+  for (const file of ["core_data/scan-coverage.json", "core_data/access-controls.json", "core_data/access.json", "analysis/findings.json", "analysis/summary.md", "_errors.log"]) {
+    assert.ok(files.has(file), `${file} should exist`);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle files");
+  assertSecretsAbsent(assert, readZipEntries(result.zipPath), secrets, "zip entries");
+
+  const access = await checkVeracodeAccess(client);
+  const payloads = await Promise.all([
+    assessVeracodeScanCoverage(client, { now: NOW }),
+    assessVeracodePolicyCompliance(client, {}),
+    assessVeracodeFindingsHygiene(client, { now: NOW }),
+    assessVeracodeScaPosture(client, {}),
+    assessVeracodeAccessControls(client, { now: NOW }),
+  ]);
+  const toolPayloads = JSON.stringify([access, ...payloads.map((item) => ({ title: item.title, summary: item.summary, findings: item.findings, errors: item.errors }))]);
+  for (const secret of secrets) {
+    assert.ok(!toolPayloads.includes(secret), `${secret} must not appear in the tool payloads`);
+  }
+
+  const fileNamed = (name) => JSON.parse(files.get(name));
+  const scanCoverage = fileNamed("core_data/scan-coverage.json");
+  const [payments, portal] = scanCoverage.applications.items;
+  assert.deepEqual(payments.profile.custom_fields, [
+    { name: "Deploy API Token", value: "[REDACTED]" },
+    { name: "ci_session", value: "[REDACTED]" },
+  ], "credential-named and JWT-shaped custom field values are redacted while the field names stay legible");
+  assert.equal(payments.profile.git_repo_url, "https://[REDACTED]@git.example.com/org/payments.git");
+  assert.equal(portal.profile.git_repo_url, "https://git.example.com/org/portal.git?[REDACTED]");
+  assert.equal(payments.profile.name, "Payments", "non-credential profile fields stay verbatim");
+  const [configuration] = scanCoverage.dynamic_analysis.scan_configurations;
+  assert.deepEqual(configuration, {
+    analysis_id: "an-1",
+    scan_id: "scan-1",
+    target_url: "https://portal.example.com/login?[REDACTED]",
+    authentication_types: ["AUTO", "FORM", "CERT"],
+    authentication_details: "[REDACTED]",
+    crawl_disabled: true,
+    crawl_script_present: true,
+    allowed_host_count: 1,
+  }, "the DAST configuration is projected to verdict fields with the authentication tree redacted");
+  const control13 = payloads[0].findings.find((item) => item.id === "VERACODE-13");
+  assert.equal(control13.status, "fail");
+  assert.deepEqual(control13.evidence.crawl_disabled_scans, ["Portal DAST:https://portal.example.com/?[REDACTED]"], "the scan label scrubs the target URL query string");
+
+  const accessControls = fileNamed("core_data/access-controls.json");
+  const credentialRecord = accessControls.api_credentials_by_user["u-2"];
+  assert.equal(credentialRecord.api_id, "abc123");
+  assert.ok(!("api_secret" in credentialRecord), "API credential records are projected to identifiers and timestamps only");
+  assert.equal(fileNamed("core_data/access.json").surfaces.find((item) => item.name === "api_credentials").count, 1);
+});
+
+test("rule 9: VeracodeApiError keeps only the vendor message from a JSON error body and describes a non-JSON body by size", async () => {
+  const responses = {
+    "/appsec/v1/policies": new Response(JSON.stringify({ message: "role Security Insights required", access_token: "FAKE_BODY_TOKEN_1" }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } }),
+    "/api/authn/v2/users/self": new Response("<html>FAKE_HTML_TOKEN_1</html>", { status: 400, statusText: "Bad Request", headers: { "content-type": "text/html" } }),
+  };
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl: async (input) => responses[new URL(input).pathname] });
+  await assert.rejects(() => client.listPolicies(), (error) => {
+    assert.match(error.message, /403 Forbidden.*role Security Insights required/);
+    assert.ok(!error.message.includes("FAKE_BODY_TOKEN_1"), "only the message field of the error body is kept");
+    return true;
+  });
+  await assert.rejects(() => client.getSelf(), (error) => {
+    assert.match(error.message, /non-JSON response body \(30 bytes, not recorded\)/);
+    assert.ok(!error.message.includes("FAKE_HTML_TOKEN_1"));
+    return true;
+  });
+});
+
+function halPage(embeddedKey, items, page = {}) {
+  return jsonResponse({ _embedded: { [embeddedKey]: items }, ...(Object.keys(page).length > 0 ? { page } : {}) });
+}
+
+test("rule 10: listHal reports a page-cap exit without page metadata, a repeating page, and a total that outruns the items as incomplete, and a short last page as complete", async () => {
+  const requested = [];
+  const endless = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const url = new URL(input);
+    requested.push(Number(url.searchParams.get("page")));
+    const page = Number(url.searchParams.get("page"));
+    return halPage("users", [{ user_id: `u-${page}-a` }, { user_id: `u-${page}-b` }]);
+  } });
+  const capped = await endless.listUsers({ maxPages: 3, pageSize: 2 });
+  assert.equal(capped.complete, false, "a full last page with no page metadata cannot be reported as complete");
+  assert.equal(capped.pagesFetched, 3);
+  assert.equal(capped.items.length, 6);
+  assert.equal(capped.totalElements, undefined, "the total stays unknown on the cap so the note prints an unknown total");
+  assert.equal(capped.totalPages, undefined);
+  assert.deepEqual(requested, [0, 1, 2]);
+
+  const repeating = new VeracodeApiClient(sampleConfig(), { fetchImpl: async () => halPage("applications", [{ guid: "app-1" }, { guid: "app-2" }], { number: 0, size: 2, total_elements: 10, total_pages: 5 }) });
+  const stuck = await repeating.listApplications({ maxPages: 50, pageSize: 2 });
+  assert.equal(stuck.complete, false);
+  assert.equal(stuck.pagesFetched, 2, "the walk stops as soon as the server repeats a page instead of running to the cap");
+  assert.equal(stuck.items.length, 2);
+  assert.match(stuck.notes[0], /returned the same page twice, so pagination stopped after 2 items/);
+
+  const shortLastPage = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const page = Number(new URL(input).searchParams.get("page"));
+    return halPage("roles", page === 0 ? [{ role_id: "r-1" }, { role_id: "r-2" }] : [{ role_id: "r-3" }]);
+  } });
+  const finished = await shortLastPage.listRoles({ maxPages: 50, pageSize: 2 });
+  assert.equal(finished.complete, true, "a short page without metadata is the natural end of the walk");
+  assert.equal(finished.items.length, 3);
+
+  const outrun = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const page = Number(new URL(input).searchParams.get("page"));
+    return halPage("teams", page === 0 ? [{ team_id: "t-1" }] : [], { number: page, size: 1, total_elements: 3, total_pages: 2 });
+  } });
+  const fewer = await outrun.listTeams({ maxPages: 50, pageSize: 1 });
+  assert.equal(fewer.complete, false, "fewer items than total_elements is reported as incomplete");
+  assert.equal(fewer.totalElements, 3);
+});
+
+test("rule 10: a page-capped inventory without a total demotes every dependent finding to warn with an unknown total, and the access check marks the probe count as first page only", async () => {
+  const fixture = healthyFixture();
+  const cappedList = (items) => list(items, { pagesFetched: 3, totalPages: undefined, totalElements: undefined, complete: false });
+  const client = mockClient(fixture, {
+    async listApplications() { return cappedList(fixture.applications); },
+    async listPolicies() { return cappedList(fixture.policies); },
+    async listUsers() { return cappedList(fixture.users); },
+    async listTeams() { return cappedList(fixture.teams); },
+    async listRoles() { return cappedList(fixture.roles); },
+    async listScaWorkspaces() { return cappedList(fixture.workspaces); },
+    async listDynamicAnalyses() { return cappedList(fixture.analyses); },
+    async listDynamicAnalysisScans() { return cappedList(fixture.scans); },
+    async listFindings() { return cappedList(fixture.findings); },
+    async listScaWorkspaceLibraries() { return cappedList(fixture.libraries); },
+  });
+  const findings = await runAllAssessments(client);
+  assert.equal(findings.length, 20);
+  assert.equal(findings.filter((item) => item.status === "pass").length, 0, "no control may pass on a page-capped inventory");
+  for (const number of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 19]) {
+    const item = findings.find((candidate) => candidate.id === `VERACODE-${String(number).padStart(2, "0")}`);
+    assert.equal(item.status, "warn", `${item.id} should warn, got ${item.status}: ${item.summary}`);
+    assert.match(item.summary, /of an unknown total of .* were read \(3\/\? pages\)|truncated/, `${item.id} should state the unknown total: ${item.summary}`);
+  }
+  const roles = findings.find((item) => item.id === "VERACODE-07");
+  assert.match(roles.summary, /Only 2 of an unknown total of roles were read/);
+  assert.equal(roles.evidence.roles_complete, false);
+  const dynamic = findings.find((item) => item.id === "VERACODE-13");
+  assert.match(dynamic.summary, /Only 1 of an unknown total of scans of Portal DAST were read/);
+  assert.deepEqual(dynamic.evidence.scan_coverage, [{ analysis_id: "an-1", scans_inspected: 1, scans_seen: 1, scans_total: null, scan_list_complete: false }]);
+  const falsePositives = findings.find((item) => item.id === "VERACODE-16");
+  assert.match(falsePositives.summary, /2 finding lists were truncated, so the rate was computed over the findings seen \(total unknown or larger\)/);
+  assert.equal(falsePositives.evidence.per_application[0].list_complete, false);
+  const sca = findings.find((item) => item.id === "VERACODE-05");
+  assert.match(sca.summary, /1 library lists were truncated, so libraries_seen is a lower bound/);
+  assert.equal(sca.evidence.library_lists_truncated, 1);
+
+  const access = await checkVeracodeAccess(client);
+  const applications = access.surfaces.find((item) => item.name === "applications");
+  assert.equal(applications.count, 2);
+  assert.equal(applications.countNote, "first page only, total unknown");
+  const healthyAccess = await checkVeracodeAccess(mockClient());
+  assert.equal(healthyAccess.surfaces.find((item) => item.name === "applications").countNote, undefined, "a probe whose page carries the total reports it without a caveat");
+});
+
+test("rule 10: more than ten dynamic scans per analysis are sampled and the sampling is named in the verdict instead of passing silently", async () => {
+  const fixture = healthyFixture();
+  fixture.scans = Array.from({ length: 12 }, (_, index) => ({ scan_id: `scan-${index}`, target_url: `https://portal-${index}.example.com`, analysis_id: "an-1" }));
+  const requestedScans = [];
+  const client = mockClient(fixture, { async getDynamicScanConfiguration(scanId) { requestedScans.push(scanId); return fixture.scanConfiguration; } });
+  const result = await assessVeracodeScanCoverage(client, { now: NOW });
+  const dynamic = result.findings.find((item) => item.id === "VERACODE-13");
+  assert.equal(requestedScans.length, 10, "only the first ten scans of an analysis are inspected");
+  assert.equal(dynamic.status, "warn");
+  assert.match(dynamic.summary, /Only 10 of 12 scans of Portal DAST were sampled, so the verdict reflects a partial view/);
+  assert.deepEqual(dynamic.evidence.scan_coverage, [{ analysis_id: "an-1", scans_inspected: 10, scans_seen: 12, scans_total: 12, scan_list_complete: true }]);
+});
+
+test("rule 1 corollary: unreadable library lists and an unavailable SCA Agent API are named in the SCA verdicts instead of passing silently", async () => {
+  const fixture = healthyFixture();
+  fixture.workspaces = [{ id: "ws-1", name: "Workspace A", projects_count: 1 }, { id: "ws-2", name: "Workspace B", projects_count: 1 }];
+  const libraries = await assessVeracodeScaPosture(mockClient(fixture, {
+    async listScaWorkspaceLibraries(id) {
+      if (id === "ws-2") throw forbidden("/srcclr/v3/workspaces/ws-2/libraries");
+      return list(fixture.libraries);
+    },
+  }), {});
+  const currency = libraries.findings.find((item) => item.id === "VERACODE-05");
+  assert.equal(currency.status, "warn");
+  assert.match(currency.summary, /1 workspace library lists were unreadable, so libraries_seen undercounts the scanned libraries/);
+  assert.equal(currency.evidence.library_lists_unreadable, 1);
+  assert.ok(libraries.errors.some((error) => /sca libraries Workspace B.*403/.test(error)));
+
+  const covered = healthyFixture();
+  for (const app of covered.applications) app.profile.upload_and_scan_sca_enabled = true;
+  const agentless = await assessVeracodeScaPosture(mockClient(covered, { async listScaWorkspaces() { throw forbidden("/srcclr/v3/workspaces"); } }), {});
+  const coverage = agentless.findings.find((item) => item.id === "VERACODE-18");
+  assert.equal(coverage.status, "pass", "upload-and-scan SCA on every sampled application does not depend on the SCA Agent API");
+  assert.match(coverage.summary, /The SCA Agent API was unavailable \(403\), so linked agent projects were not checked; every sampled application is covered by upload-and-scan SCA alone/);
+  assert.equal(coverage.evidence.sca_agent_api_available, false);
 });
 
 test("exportVeracodeAuditBundle writes the layout, logs errors, and never overwrites a prior bundle", async () => {
