@@ -5,7 +5,7 @@ description: Read-only security inspection of Prisma Cloud CSPM tenants and PAN-
 
 The Palo Alto Networks integration audits two product surfaces without ever mutating a tenant or a device:
 
-- **Prisma Cloud CSPM** through the REST API (JWT login with an access key): compliance posture, alert rules and open alerts, policies, cloud accounts and account groups, user roles, and integrations.
+- **Prisma Cloud CSPM** through the REST API (JWT login with an access key): compliance posture, alert rules and open alerts, policies, cloud accounts and account groups, user roles, and tenant integrations (push channels such as Splunk, Amazon SQS, webhooks, and ServiceNow).
 - **PAN-OS firewalls and Panorama** through the XML API (`type=op` show commands and `type=config&action=show`): security and decryption rulebases, zones, security profiles, GlobalProtect, administrators, log forwarding, system settings, HA state, and software versions.
 
 Every finding carries the FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the compliance mapping table in `specs/paloalto-sec-inspector.spec.md`.
@@ -76,13 +76,13 @@ Verdict-safety rules applied to every finding:
 |---|---|---|---|---|
 | 1 | CSPM compliance posture | cloud_posture | PA-01 | `GET /v2/compliance/posture` pass rate against `min_compliance_pass_rate` (default 90%). |
 | 2 | Alert policy coverage | cloud_posture | PA-02 | `GET /v2/alert/rule` enabled versus disabled rules, open critical alerts from `GET /v2/alert`. |
-| 3 | IAM overprivileged access | cloud_posture | PA-03 | IAM policies from `GET /v2/policy` and open alerts with `policyType=iam`; manual when the CIEM module is not visible. |
+| 3 | IAM overprivileged access | cloud_posture | PA-03 | IAM policies from `GET /v2/policy` and open alerts with `policyType=iam`; manual when the CIEM module is not visible. The documented `POST /api/v1/permission` query is not used because it needs a caller-written IAM RQL definition of "overprivileged" (see limitations). |
 | 4 | Cloud account governance | cloud_posture | PA-04 | `GET /cloud` and `GET /cloud/group`: disabled accounts, accounts without groups, error status. |
 | 5 | Network exposure analysis | cloud_posture | PA-05 | Open alerts with `policyType=network` or exposure keywords; fails on critical or high, manual when no enabled network policy exists. |
 | 6 | Encryption at rest | cloud_posture | PA-06 | Enabled encryption policies and open encryption alerts. |
-| 7 | Container image vulnerability | cloud_posture | PA-07 | Compute `GET /policies/vulnerability/images` enabled rules with a block or prevent effect, `GET /stats/vulnerabilities` critical CVE count, `GET /images` scan freshness. Manual when the console is unreachable. |
-| 8 | Host compliance posture | cloud_posture | PA-08 | Compute `GET /policies/compliance/host` and `/container` enabled rules plus `GET /stats/compliance` compliance rate (below 90% fails). |
-| 9 | Runtime protection policies | cloud_posture | PA-09 | Compute `GET /policies/runtime/container` enabled rules; passes only when at least one rule prevents or blocks a process, network, file system, or DNS behavior. |
+| 7 | Container image vulnerability | cloud_posture | PA-07 | Compute `GET /policies/vulnerability/images` enabled rules with a block or prevent effect; critical and high CVE counts summed from the `cves` distribution of each `images`, `registryImages`, `containers`, `hosts`, and `functions` member in the `GET /stats/vulnerabilities` array, combined with `vulnerabilityDistribution` on `GET /images` scan results (the stricter count is used); any critical CVE fails, images without `scanTime` warn, no distribution at all warns. Manual when the console is unreachable. |
+| 8 | Host compliance posture | cloud_posture | PA-08 | Compute `GET /policies/compliance/host` and `/container` enabled rules, `GET /defenders` connected population, and `GET /stats/compliance` where the rate is derived from `rules[]` (or `categories[]`) `failed` versus `total`; below 90% or zero connected Defenders fails, zero recorded evaluations warns. |
+| 9 | Runtime protection policies | cloud_posture | PA-09 | Compute `GET /policies/runtime/container` enabled rules and `GET /defenders`; passes only when at least one rule prevents or blocks a process, network, file system, or DNS behavior and at least one Defender is connected to enforce it. |
 | 10 | Defender deployment coverage | cloud_posture | PA-10 | Compute `GET /defenders`: any Defender without `connected=true` fails; missing `lastModified` or more than two versions warn. |
 | 11 | Registry scanning configuration | cloud_posture | PA-11 | Compute `GET /settings/registry` specifications and `GET /registry` scan results; zero registries is manual, registries without scans fail. |
 | 12 | Firewall security rule audit | firewall_policy | PA-12 | Any/any allow rules fail; shadowed rules, `log-end=no`, or rules without an explicit `log-end` warn; zero rules is manual. |
@@ -93,10 +93,10 @@ Verdict-safety rules applied to every finding:
 | 17 | WildFire analysis | threat_prevention | PA-17 | No WildFire profile fails; profiles not forwarding any application and any file type, or uncovered allow rules, warn. Cloud connectivity needs `show wildfire status`. |
 | 18 | URL filtering enforcement | threat_prevention | PA-18 | Profiles that do not block malware, phishing, and command-and-control fail; disabled credential enforcement or uncovered allow rules warn. |
 | 19 | Admin role and access audit | device_hardening | PA-19 | Superusers above `max_superusers` or password complexity disabled fail; local-password-only admins, excess Prisma Cloud System Admin roles, or a single configured product warn; zero readable admins is manual. |
-| 20 | Logging and SIEM integration | device_hardening | PA-20 | Rules with `log-end=no` or no syslog/Panorama forwarding fail; implicit `log-end`, missing log forwarding profiles, no Prisma Cloud SIEM integration, or a single configured product warn. |
+| 20 | Logging and SIEM integration | device_hardening | PA-20 | Rules with `log-end=no` or no syslog/Panorama forwarding fail; implicit `log-end`, missing log forwarding profiles, no Prisma Cloud SIEM integration (from `GET /api/v1/tenant/{prismaId}/integration`), or a single configured product warn. |
 | 21 | Data loss prevention | threat_prevention | PA-21 | Prisma Cloud data security policies plus PAN-OS data filtering profiles attached to allow rules. |
 | 22 | File blocking policies | threat_prevention | PA-22 | No profile blocking PE or all file types fails; uncovered allow rules warn. |
-| 23 | System hardening | device_hardening | PA-23 | Missing NTP, default SNMP community, telnet or HTTP management fail; missing banner, permitted IPs, DNS, or idle timeout over 15 minutes warn. |
+| 23 | System hardening | device_hardening | PA-23 | Missing NTP, default SNMP community, telnet or HTTP management fail; missing banner, permitted IPs, DNS, or idle timeout over 15 minutes warn. Supplementary `PA-HA-01` (HA state) and `PA-SW-01` (software and content versions) share control 23 and its CM-6/CM-7 mappings; they appear in a separate section of the unified compliance matrix so the matrix keeps one row per numbered control. |
 | 24 | Cloud discovery and shadow IT | cloud_posture | PA-24 | Compute `GET /cloud/discovery`: entries with more `total` than `defended` resources fail; zero entries is manual (discovery credentials not configured). |
 | 25 | CI/CD pipeline security | cloud_posture | PA-25 | Compute `GET /scans` CI results; zero scans fail. Caps at `warn` because the admission control policy has no verified public read endpoint (see limitations). |
 
@@ -111,6 +111,9 @@ The script exits 0 with a skip message when neither product is configured. Other
 ## Limitations
 
 - Prisma Cloud Compute (CWPP) controls 7 to 11 and 24 are automated when the console is reachable. Control 25 caps at `warn`: CI scan results come from the documented `GET /scans` endpoint, but no admission control (OPA) read endpoint could be located on the public pan.dev CWPP reference, so admission rules remain a manual review. The CSPM `GET /meta_info` page is also not published on pan.dev; the PCEE access guide documents copying the console path from the UI, which is what `PRISMA_COMPUTE_URL` carries.
+- Control 3 uses the tenant's IAM policies and open `iam` alerts as the overprivilege signal. The documented `POST /api/v1/permission` endpoint runs a caller-supplied IAM RQL query and returns raw permission rows, which would require this tool to hard-code its own RQL definition of "overprivileged" that cannot be validated without a licensed CIEM tenant; the built-in IAM policies already encode those detections. `GET /api/v1/permission/alert/search` only returns the RQL behind one alert ID.
+- Control 2 reads alert rules from `GET /v2/alert/rule`. `GET /alert/policy` (List Alert Counts By Policy) is documented but only returns open alert counts grouped by policy, not rule configuration.
+- Control 20 reads push integrations from `GET /api/v1/tenant/{prismaId}/integration` with the `prismaId` from the login response; `GET /integration` only lists Okta, Qualys, and Tenable pull integrations and is used as a fallback when no `prismaId` is returned.
 - Shadow detection is heuristic: a rule is reported as shadowed when an earlier enabled rule in the same rulebase already allows any source, destination, and application for the same zones.
 - Software version evaluation flags PAN-OS 9.x and older and missing content versions; end-of-life dates for current releases must be checked against the Palo Alto Networks end-of-life summary.
 - WildFire cloud connectivity, GlobalProtect HIP requirements, admin MFA enforcement, and log retention are reported as review items inside the finding summaries.
@@ -142,5 +145,10 @@ The script exits 0 with a skip message when neither product is configured. Other
 - [Prisma Cloud CSPM API: Get all Cloud Accounts](https://pan.dev/prisma-cloud/api/cspm/get-cloud-accounts/)
 - [Prisma Cloud CSPM API: List Account Groups](https://pan.dev/prisma-cloud/api/cspm/get-account-groups/)
 - [Prisma Cloud CSPM API: List User Roles](https://pan.dev/prisma-cloud/api/cspm/get-user-roles/)
+- [Prisma Cloud CSPM API: List Integrations (tenant scoped)](https://pan.dev/prisma-cloud/api/cspm/get-all-integrations-v-1/)
+- [Prisma Cloud CSPM API: List All Integrations (Okta, Qualys, Tenable pull integrations)](https://pan.dev/prisma-cloud/api/cspm/get-all-integrations/)
+- [Prisma Cloud CSPM API: List Alert Counts By Policy](https://pan.dev/prisma-cloud/api/cspm/get-alerts-grouped/)
+- [Prisma Cloud CSPM API: Get Permissions](https://pan.dev/prisma-cloud/api/cspm/get-permissions-with-post/)
+- [Prisma Cloud CSPM API: Get IAM Query](https://pan.dev/prisma-cloud/api/cspm/get-rql-with-get/)
 - [PAN-OS XML API Request Types and Actions](https://docs.paloaltonetworks.com/pan-os/11-1/pan-os-panorama-api/pan-os-xml-api-request-types)
 - [PAN-OS and Panorama API guide](https://docs.paloaltonetworks.com/pan-os/11-1/pan-os-panorama-api)
