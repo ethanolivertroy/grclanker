@@ -24,6 +24,7 @@ import {
   assessNewrelicDataGovernance,
   assessNewrelicIdentity,
   checkNewrelicAccess,
+  compactCause,
   exportNewrelicAuditBundle,
   projectRecord,
   resolveNewrelicConfiguration,
@@ -2745,6 +2746,524 @@ test("false-pass self-check (c): a partial inventory never yields pass in any as
   assert.equal(findings.find((item) => item.control === 20).status, "warn");
   assert.ok(results.every((result) => result.coverage.length > 0));
   assert.ok(results.every((result) => result.errors.length > 0));
+});
+
+// Rule 1 corollary fixtures: two accounts (111 production, 222 development), two SCIM/SAML authentication domains
+// (Corporate SSO and Contractors), one scripted monitor per account, and every pass-capable finding passing at
+// baseline. Denials throw the same pathed NerdGraph error the client raises for a null field beside an errors entry.
+const COROLLARY_ACCOUNT_IDS = [111, 222];
+const COROLLARY_DOMAIN_USERS = {
+  "domain-1": () => [user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"] }), user("bob", { type: "BASIC", groups: ["g-dev"] })],
+  "domain-2": () => [user("dave", { type: "BASIC", groups: ["g-contractors"] })],
+};
+const COROLLARY_DOMAIN_GROUPS = {
+  "domain-1": () => [orgManagerGroup(), accountGroup("g-dev", [222])],
+  "domain-2": () => [accountGroup("g-contractors", [222])],
+};
+const SECURE_SCRIPT = "const password = $secure.LOGIN_PASSWORD;\n$browser.get('https://example.com/login');";
+
+function corollaryClient(overrides = {}) {
+  return {
+    getResolvedConfig: () => sampleConfig({ accountIds: COROLLARY_ACCOUNT_IDS }),
+    async resolveAccountIds() {
+      return COROLLARY_ACCOUNT_IDS;
+    },
+    async getCurrentUser() {
+      return { id: "u-1", email: "auditor@example.com", name: "Auditor" };
+    },
+    async getOrganization() {
+      return { id: "org-1", name: "Example Org" };
+    },
+    async listAccounts() {
+      return [{ id: 111, name: "Payments Production" }, { id: 222, name: "Payments Development" }];
+    },
+    async listAuthenticationDomains() {
+      return twoDomains();
+    },
+    async listOrganizationAuthenticationDomains() {
+      return twoDomains().map((domain) => ({ ...domain, organizationId: "org-1", authenticationType: "SAML_SSO" }));
+    },
+    async listDomainUsers(domainId) {
+      return COROLLARY_DOMAIN_USERS[domainId]?.() ?? [];
+    },
+    async listDomainGroupGrants(domainId) {
+      return COROLLARY_DOMAIN_GROUPS[domainId]?.() ?? [];
+    },
+    async listRoles(organizationId) {
+      requireOrganizationId(organizationId);
+      return standardRoles();
+    },
+    async listApiKeys() {
+      return [
+        { id: "key-1", name: "ci-deploy", type: "USER", createdAt: secondsAgo(10), userId: "bob", accountId: 111 },
+        { id: "key-2", name: "license-prod", type: "INGEST", ingestType: "LICENSE", createdAt: secondsAgo(20), accountId: 111 },
+        { id: "key-3", name: "license-dev", type: "INGEST", ingestType: "LICENSE", createdAt: secondsAgo(20), accountId: 222 },
+      ];
+    },
+    async listAlertPolicies(accountId) {
+      return [{ id: `policy-${accountId}`, name: `Policy ${accountId}`, incidentPreference: "PER_CONDITION_AND_TARGET", accountId }];
+    },
+    async listNrqlConditions(accountId) {
+      return [{ id: `cond-${accountId}`, name: "Error rate", type: "STATIC", enabled: true, policyId: `policy-${accountId}`, nrql: { query: "SELECT count(*) FROM TransactionError" } }];
+    },
+    async listNotificationDestinations(accountId) {
+      return [{ id: `dest-${accountId}`, name: `Ops ${accountId}`, type: "EMAIL", properties: [{ key: "email", value: "ops@example.com" }] }];
+    },
+    async listNotificationChannels(accountId) {
+      return [{ id: `chan-${accountId}`, name: "Ops email", type: "EMAIL", destinationId: `dest-${accountId}` }];
+    },
+    async listWorkflows(accountId) {
+      return [{
+        id: `wf-${accountId}`,
+        name: `Issues ${accountId}`,
+        workflowEnabled: true,
+        enrichmentsEnabled: false,
+        destinationsEnabled: true,
+        destinationConfigurations: [{ channelId: `chan-${accountId}`, name: "Ops email", type: "EMAIL" }],
+        enrichments: [],
+      }];
+    },
+    async searchEntities(query) {
+      const accountId = Number(/accountId = (\d+)/.exec(query)?.[1]);
+      if (query.includes("WORKLOAD")) {
+        return [{ guid: `wl-${accountId}`, name: `Checkout ${accountId}`, domain: "NR1", type: "WORKLOAD", workloadStatus: { statusValue: "OPERATIONAL" }, accountId }];
+      }
+      if (query.includes("alertSeverity")) {
+        return [{ guid: `app-${accountId}`, name: `checkout-api-${accountId}`, domain: "APM", type: "APPLICATION", entityType: "APM_APPLICATION_ENTITY", reporting: true, alertSeverity: "NOT_ALERTING", accountId }];
+      }
+      if (query.includes("DASHBOARD")) return [{ guid: `dash-${accountId}`, name: `Ops ${accountId}`, domain: "VIZ", type: "DASHBOARD", permissions: "PRIVATE", accountId }];
+      if (query.includes("SECURE_CRED")) return [{ guid: `cred-${accountId}`, name: "LOGIN_PASSWORD", domain: "SYNTH", type: "SECURE_CRED", accountId }];
+      if (query.includes("MONITOR")) return [{ guid: `mon-${accountId}`, name: `Login flow ${accountId}`, domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_BROWSER", accountId }];
+      return [];
+    },
+    async countEntities() {
+      return 2;
+    },
+    async getSyntheticScript() {
+      return SECURE_SCRIPT;
+    },
+    async listEventRetentionRules(accountId) {
+      return [
+        { id: `rule-log-${accountId}`, namespace: "Log", retentionInDays: 90, createdAt: secondsAgo(100), deletedAt: null },
+        { id: `rule-txn-${accountId}`, namespace: "Transaction", retentionInDays: 120, createdAt: secondsAgo(100), deletedAt: null },
+      ];
+    },
+    async listRetentionNamespaces() {
+      return [{ namespace: "Log" }, { namespace: "Transaction" }];
+    },
+    async listObfuscationRules(accountId) {
+      return [{
+        id: `obf-${accountId}`,
+        name: "Mask credentials and PII",
+        description: "Hash passwords, tokens, and email addresses",
+        filter: "SELECT * FROM Log",
+        enabled: true,
+        actions: [{ attributes: ["message"], method: "HASH_SHA256", expression: { id: "expr-1", name: "password token" } }],
+      }];
+    },
+    async listObfuscationExpressions() {
+      return [
+        { id: "expr-1", name: "password token api_key", regex: "(password|token|api_key)=\\S+", description: "Credential values" },
+        { id: "expr-2", name: "email addresses", regex: "[a-z]+@[a-z]+\\.[a-z]+", description: "PII email" },
+      ];
+    },
+    async listPipelineCloudRules() {
+      return [{ id: "rule-guid-1", name: "Drop card numbers", type: "PIPELINE_CLOUD_RULE", nrql: "DELETE cardNumber FROM Log", enabled: true }];
+    },
+    async listNrqlDropRules(accountId) {
+      return [{ id: `drop-${accountId}`, action: "DROP_ATTRIBUTES", nrql: "SELECT ssn FROM Log", accountId }];
+    },
+    async listDashboardLiveUrls() {
+      return [];
+    },
+    async runNrql(_accountId, nrql) {
+      if (nrql.includes("actorType = 'api_key'")) return [{ actorAPIKey: "abc123", actorType: "api_key", actionIdentifier: "alerts.policy.create", timestamp: NOW }];
+      if (nrql.includes("RLIKE")) return [{ matchCount: 0 }];
+      if (nrql.includes("AS logCount FROM Log")) return [{ logCount: 12_000 }];
+      if (nrql.includes("SystemSample")) return [{ agentVersion: "1.60.1", hosts: 2 }];
+      return [];
+    },
+    ...overrides,
+  };
+}
+
+function controlId(number) {
+  return NEWRELIC_CONTROL_CATALOG.find((control) => control.number === number).id;
+}
+
+const COROLLARY_BASELINE_PASS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20].map(controlId);
+const NRQL_LOG_VOLUME = (nrql) => nrql.includes("AS logCount FROM Log");
+const NRQL_API_KEY_ACTORS = (nrql) => nrql.includes("actorType = 'api_key'");
+
+// Every NerdGraph query and NRQL the four collectors run, the client method that carries it, its scoping (per
+// account, per authentication domain, or per monitor), the query path a denial reports, and the pass-capable
+// findings that read it. `match` narrows shared methods (runNrql, searchEntities) to one inventory.
+const COROLLARY_INVENTORIES = [
+  { inventory: "actor.user", method: "getCurrentUser", path: "actor.user", dependents: [10] },
+  { inventory: "actor.organization", method: "getOrganization", path: "actor.organization", dependents: [1, 20] },
+  { inventory: "actor.accounts", method: "listAccounts", path: "actor.accounts", dependents: [4, 5, 7, 8] },
+  { inventory: "userManagement.authenticationDomains", method: "listAuthenticationDomains", path: "actor.organization.userManagement.authenticationDomains", dependents: [1, 2, 3, 4, 7, 8, 19, 20] },
+  { inventory: "customerAdministration.authenticationDomains", method: "listOrganizationAuthenticationDomains", path: "customerAdministration.authenticationDomains", dependents: [1] },
+  { inventory: "userManagement.users", method: "listDomainUsers", scope: "domain", path: "actor.organization.userManagement.authenticationDomains.users", dependents: [2, 3, 4, 7, 8, 19] },
+  { inventory: "authorizationManagement.groups", method: "listDomainGroupGrants", scope: "domain", path: "actor.organization.authorizationManagement.authenticationDomains.groups", dependents: [3, 4, 7, 8, 20] },
+  { inventory: "customerAdministration.roles", method: "listRoles", path: "customerAdministration.roles", dependents: [20] },
+  { inventory: "apiAccess.keySearch", method: "listApiKeys", path: "actor.apiAccess.keySearch", dependents: [4, 5] },
+  { inventory: "NRQL NrAuditEvent actorType api_key", method: "runNrql", scope: "account", match: NRQL_API_KEY_ACTORS, path: "actor.account.nrql", dependents: [] },
+  { inventory: "NRQL NrAuditEvent api_key changes", method: "runNrql", scope: "account", match: (nrql) => nrql.includes("actionIdentifier LIKE 'api_key%'"), path: "actor.account.nrql", dependents: [] },
+  { inventory: "alerts.policiesSearch", method: "listAlertPolicies", scope: "account", path: "actor.account.alerts.policiesSearch", dependents: [9, 10] },
+  { inventory: "alerts.nrqlConditionsSearch", method: "listNrqlConditions", scope: "account", path: "actor.account.alerts.nrqlConditionsSearch", dependents: [9] },
+  { inventory: "aiNotifications.destinations", method: "listNotificationDestinations", scope: "account", path: "actor.account.aiNotifications.destinations", dependents: [10] },
+  { inventory: "aiNotifications.channels", method: "listNotificationChannels", scope: "account", path: "actor.account.aiNotifications.channels", dependents: [10] },
+  { inventory: "aiWorkflows.workflows", method: "listWorkflows", scope: "account", path: "actor.account.aiWorkflows.workflows", dependents: [10] },
+  { inventory: "entitySearch alertable entities", method: "searchEntities", scope: "account", match: (query) => query.includes("alertSeverity"), path: "actor.entitySearch", dependents: [9] },
+  { inventory: "entitySearch workloads", method: "searchEntities", scope: "account", match: (query) => query.includes("WORKLOAD"), path: "actor.entitySearch", dependents: [9] },
+  { inventory: "dataManagement.eventRetentionRules", method: "listEventRetentionRules", scope: "account", path: "actor.account.dataManagement.eventRetentionRules", dependents: [11] },
+  { inventory: "dataManagement.customizableRetention", method: "listRetentionNamespaces", scope: "account", path: "actor.account.dataManagement.customizableRetention", dependents: [11] },
+  { inventory: "logConfigurations.obfuscationRules", method: "listObfuscationRules", scope: "account", path: "actor.account.logConfigurations.obfuscationRules", dependents: [12] },
+  { inventory: "logConfigurations.obfuscationExpressions", method: "listObfuscationExpressions", scope: "account", path: "actor.account.logConfigurations.obfuscationExpressions", dependents: [12] },
+  { inventory: "entityManagement.pipelineCloudRules", method: "listPipelineCloudRules", path: "actor.entityManagement.entitySearch", dependents: [12] },
+  { inventory: "nrqlDropRules.list", method: "listNrqlDropRules", scope: "account", path: "actor.account.nrqlDropRules.list", dependents: [12] },
+  { inventory: "entitySearch dashboards", method: "searchEntities", scope: "account", match: (query) => query.includes("DASHBOARD"), path: "actor.entitySearch", dependents: [14] },
+  { inventory: "dashboard.liveUrls", method: "listDashboardLiveUrls", path: "actor.dashboard.liveUrls", dependents: [14] },
+  { inventory: "entitySearch synthetic monitors", method: "searchEntities", scope: "account", match: (query) => query.includes("MONITOR"), path: "actor.entitySearch", dependents: [13] },
+  { inventory: "entitySearch secure credentials", method: "searchEntities", scope: "account", match: (query) => query.includes("SECURE_CRED"), path: "actor.entitySearch", dependents: [13] },
+  { inventory: "synthetics.script", method: "getSyntheticScript", scope: "monitor", path: "actor.account.synthetics.script", dependents: [13] },
+  { inventory: "NRQL Log volume", method: "runNrql", scope: "account", match: NRQL_LOG_VOLUME, path: "actor.account.nrql", dependents: [12, 15] },
+  { inventory: "NRQL Log secret patterns", method: "runNrql", scope: "account", match: (nrql) => nrql.includes("RLIKE"), path: "actor.account.nrql", dependents: [15] },
+  { inventory: "entitySearch infra hosts", method: "countEntities", scope: "account", path: "actor.entitySearch.count", dependents: [] },
+  { inventory: "NRQL SystemSample agent versions", method: "runNrql", scope: "account", match: (nrql) => nrql.includes("SystemSample"), path: "actor.account.nrql", dependents: [] },
+];
+
+const COROLLARY_SECOND_SCOPE = { account: "222", domain: "domain-2", monitor: "222" };
+const COROLLARY_SCOPE_LABEL = { account: "account 222", domain: "authentication domain Contractors", monitor: "Login flow 222" };
+
+function inventoryScopeId(row, args) {
+  if (row.method === "searchEntities" || row.method === "countEntities") return /accountId = (\d+)/.exec(String(args[0]))?.[1];
+  return String(args[0]);
+}
+
+/** Denies one inventory on the client: every scope (`full`) or the second account, domain, or monitor only (`partial`). */
+function denyInventory(client, row, mode) {
+  const base = client[row.method];
+  return {
+    ...client,
+    async [row.method](...args) {
+      const text = String(row.method === "runNrql" ? args[1] : args[0]);
+      const matches = !row.match || row.match(text);
+      const inScope = mode === "full" || !row.scope || inventoryScopeId(row, args) === COROLLARY_SECOND_SCOPE[row.scope];
+      if (matches && inScope) throw forbidden(row.path);
+      return base.apply(client, args);
+    },
+  };
+}
+
+function denyInventories(client, denials) {
+  return denials.reduce((current, [inventory, mode]) => {
+    const row = COROLLARY_INVENTORIES.find((entry) => entry.inventory === inventory);
+    assert.ok(row, `unknown inventory ${inventory}`);
+    return denyInventory(current, row, mode);
+  }, client);
+}
+
+async function assessCorollary(denials = []) {
+  const client = denyInventories(corollaryClient(), denials);
+  return assessAll({ identity: client, accessControl: client, alerting: client, dataGovernance: client });
+}
+
+function belowPass(item, context) {
+  assert.ok(item.status === "warn" || item.status === "manual", `${item.id} is ${item.status} ${context}: ${item.summary}`);
+}
+
+test("rule 1 corollary: the corollary baseline passes every pass-capable finding with no collection errors", async () => {
+  const { results, findings } = await assessCorollary();
+  assert.deepEqual(passing(findings).sort(), [...COROLLARY_BASELINE_PASS].sort());
+  assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.control).sort((a, b) => a - b), [6, 16, 17, 18]);
+  assert.ok(results.every((result) => result.errors.length === 0 && result.coverage.length === 0), JSON.stringify(results.map((result) => [result.errors, result.coverage])));
+});
+
+test("rule 1 corollary root cause: a fully denied secondary dataset produces a coverage note and caps the verdict at warn", async () => {
+  const { findings } = await assessCorollary([["alerts.policiesSearch", "full"]]);
+  const channels = findings.find((item) => item.control === 10);
+  assert.equal(channels.status, "warn");
+  assert.match(channels.summary, /A dataset this finding depends on was unreadable, so the verdict is limited to warn instead of pass/);
+  assert.match(channels.summary, /Partial view: alert policies: unreadable \(alerts\.policiesSearch: account 111, account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.alerts\.policiesSearch\)\)/);
+  const coverage = findings.find((item) => item.control === 9);
+  assert.equal(coverage.status, "manual", "the primary inventory of NR-09 stays manual, not warn");
+  assert.match(coverage.summary, /Alert policies \(alerts\.policiesSearch\) could not be read/);
+});
+
+test("rule 1 corollary wording: compactCause keeps the dataset, status, and query path of every scope inside the 200 character budget", () => {
+  const chained = "authorizationManagement.groups: authentication domains were not readable (userManagement.authenticationDomains: NerdGraph returned errors: Not authorized (at actor.organization.userManagement.authenticationDomains))";
+  assert.ok(chained.length > 200);
+  const compact = compactCause(chained);
+  assert.ok(compact.length <= 200, `${compact.length}: ${compact}`);
+  assert.match(compact, /^authorizationManagement\.groups: authentication domains were not readable \(userManagement\.authenticationDomains: /);
+  assert.match(compact, /\.\.\.Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)$/);
+
+  const twoAccounts = `alerts.policiesSearch: ${[111, 222].map((id) => `account ${id}: NerdGraph returned errors: Not authorized (at actor.account.alerts.policiesSearch)`).join("; ")}`;
+  assert.ok(twoAccounts.length > 200);
+  assert.equal(compactCause(twoAccounts), "alerts.policiesSearch: account 111, account 222: NerdGraph returned errors: Not authorized (at actor.account.alerts.policiesSearch)");
+
+  const manyMessages = `nrql.Log.volume: ${[1, 2, 3, 4, 5].map((id) => `account ${id}: NerdGraph returned errors: Query ${id} timed out after 60s (at actor.account.nrql)`).join("; ")}`;
+  const merged = compactCause(manyMessages);
+  assert.ok(merged.length <= 200, `${merged.length}: ${merged}`);
+  assert.match(merged, /^nrql\.Log\.volume: account 1: NerdGraph returned errors: Query 1 timed out after 60s \(at actor\.account\.nrql\)/);
+  assert.match(merged, /; \d more scopes failed and are listed in the errors array$/);
+  assert.doesNotMatch(merged, /actor\.account\.n\.\.\./);
+
+  assert.equal(compactCause("short"), "short");
+  const noPath = `apiAccess.keySearch: NerdGraph request failed (403 Forbidden): ${"x".repeat(300)}`;
+  const cut = compactCause(noPath);
+  assert.ok(cut.length <= 200);
+  assert.match(cut, /^apiAccess\.keySearch: NerdGraph request failed \(403 Forbidden\): x+\.\.\.$/);
+});
+
+test("rule 1 corollary hit 1: NR-04 never concludes no admin-owned keys on a partial or unreadable group roster", async () => {
+  const partial = await assessCorollary([["authorizationManagement.groups", "partial"]]);
+  const inventory = partial.findings.find((item) => item.control === 4);
+  assert.equal(inventory.status, "warn");
+  assert.match(inventory.summary, /the admin roster \(userManagement\.users joined to authorizationManagement\.groups\) is incomplete, so the absence of admin-owned keys is not concluded/);
+  assert.match(inventory.summary, /Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
+  assert.equal(inventory.evidence.admin_owned_user_keys, null);
+  assert.equal(inventory.evidence.admin_roster_complete, false);
+  assert.match(inventory.evidence.admin_roster_status, /^incomplete: users complete; groups 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
+  assert.equal(inventory.evidence.key_listing_complete, true);
+
+  const full = await assessCorollary([["authorizationManagement.groups", "full"]]);
+  const unreadable = full.findings.find((item) => item.control === 4);
+  assert.equal(unreadable.status, "manual");
+  assert.match(unreadable.summary, /group role grants were not readable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
+  assert.equal(unreadable.evidence.admin_owned_user_keys, null);
+  assert.match(unreadable.evidence.admin_roster_status, /groups unreadable \(authorizationManagement\.groups: /);
+
+  const flagged = await assessNewrelicAccessControl(denyInventories(corollaryClient({
+    async listApiKeys() {
+      return [
+        { id: "key-admin", name: "alice-cli", type: "USER", createdAt: secondsAgo(10), userId: "alice", accountId: 111 },
+        { id: "key-2", name: "license-prod", type: "INGEST", ingestType: "LICENSE", createdAt: secondsAgo(20), accountId: 111 },
+      ];
+    },
+  }), [["authorizationManagement.groups", "partial"]]), { now: NOW });
+  const adminOwned = findingById(flagged, "NR-04-API-KEY-INVENTORY");
+  assert.equal(adminOwned.status, "warn");
+  assert.match(adminOwned.summary, /1 user keys inherit admin-level permissions from their owners/);
+  assert.deepEqual(adminOwned.evidence.admin_owned_user_keys, ["alice-cli"], "admins visible in the readable domains are still reported");
+});
+
+test("rule 1 corollary hit 2: the NrAuditEvent api_key actor rows are owned by NR-06 and render null with a status when unreadable", async () => {
+  for (const mode of ["full", "partial"]) {
+    const { findings } = await assessCorollary([["NRQL NrAuditEvent actorType api_key", mode]]);
+    const inventory = findings.find((item) => item.control === 4);
+    assert.equal(inventory.status, "pass", `NR-04 no longer lists the audit rows (${mode}): ${inventory.summary}`);
+    assert.equal("audit_events_by_api_keys" in inventory.evidence, false);
+    assert.equal("audit_readable" in inventory.evidence, false);
+    const unused = findings.find((item) => item.control === 6);
+    assert.equal(unused.status, "manual");
+    assert.match(unused.summary, /nrql\.NrAuditEvent\.api_key_actor/);
+    assert.match(unused.summary, /\(at actor\.account\.nrql\)/);
+    if (mode === "full") {
+      assert.equal(unused.evidence.audit_events_by_api_keys, null);
+      assert.equal(unused.evidence.distinct_api_keys_in_audit, null);
+      assert.equal(unused.evidence.audit_readable, false);
+      assert.match(unused.evidence.audit_status, /^unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 111: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\); account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)$/);
+      assert.match(unused.summary, /audit events unreadable: nrql\.NrAuditEvent\.api_key_actor: account 111: .*; account 222: .*\(at actor\.account\.nrql\)/);
+    } else {
+      assert.equal(unused.evidence.audit_events_by_api_keys, 1);
+      assert.match(unused.evidence.audit_status, /^1 scope unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)$/);
+      assert.match(unused.summary, /Partial view: NrAuditEvent api_key actors: 1 scope unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 222: /);
+    }
+  }
+});
+
+test("rule 1 corollary hit 3: NR-09 renders workloads as null with a status and is limited to warn when the workload listing is unreadable", async () => {
+  const full = await assessCorollary([["entitySearch workloads", "full"]]);
+  const coverage = full.findings.find((item) => item.control === 9);
+  assert.equal(coverage.status, "warn");
+  assert.match(coverage.summary, /^2 policies with 2 enabled NRQL conditions cover all 2 reporting alertable entities\. A dataset this finding depends on was unreadable, so the verdict is limited to warn instead of pass\. Partial view: workloads: unreadable \(entitySearch\.workloads: account 111: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\); account 222: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\)\)\.$/);
+  assert.equal(coverage.evidence.workloads, null);
+  assert.equal(coverage.evidence.disrupted_workloads, null);
+  assert.match(coverage.evidence.workloads_status, /^unreadable \(entitySearch\.workloads: account 111: .*; account 222: /);
+  assert.equal(coverage.evidence.reporting_alertable_entities, 2);
+
+  const partial = await assessCorollary([["entitySearch workloads", "partial"]]);
+  const partly = partial.findings.find((item) => item.control === 9);
+  assert.equal(partly.status, "warn");
+  assert.match(partly.summary, /Partial view: workloads: 1 scope unreadable \(entitySearch\.workloads: account 222: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\)\)/);
+  assert.equal(partly.evidence.workloads, 1);
+  assert.deepEqual(partly.evidence.disrupted_workloads, []);
+  assert.match(partly.evidence.workloads_status, /^1 scope unreadable \(entitySearch\.workloads: account 222: /);
+});
+
+test("rule 1 corollary hit 4: NR-10 is limited to warn naming alerts.policiesSearch when the policy listing is unreadable on the pass path", async () => {
+  for (const mode of ["full", "partial"]) {
+    const { findings } = await assessCorollary([["alerts.policiesSearch", mode]]);
+    const channels = findings.find((item) => item.control === 10);
+    assert.equal(channels.status, "warn", `${mode}: ${channels.summary}`);
+    assert.match(channels.summary, /^2 destinations across 1 types receive 2 enabled workflows/);
+    assert.match(channels.summary, /alerts\.policiesSearch/);
+    assert.match(channels.summary, /\(at actor\.account\.alerts\.policiesSearch\)/);
+    if (mode === "full") {
+      assert.equal(channels.evidence.alert_policies, null);
+      assert.match(channels.evidence.alert_policies_status, /^unreadable \(alerts\.policiesSearch: account 111, account 222: /);
+    } else {
+      assert.equal(channels.evidence.alert_policies, 1);
+      assert.match(channels.evidence.alert_policies_status, /^1 scope unreadable \(alerts\.policiesSearch: account 222: /);
+      assert.match(channels.summary, /Partial view: alert policies: 1 scope unreadable \(alerts\.policiesSearch: account 222: /);
+    }
+    assert.equal(channels.evidence.destinations, 2);
+  }
+});
+
+test("rule 1 corollary hit 5: NR-12 is limited to warn naming entityManagement.pipelineCloudRules when Pipeline Control is unreadable", async () => {
+  const { findings } = await assessCorollary([["entityManagement.pipelineCloudRules", "full"]]);
+  const obfuscation = findings.find((item) => item.control === 12);
+  assert.equal(obfuscation.status, "warn");
+  assert.match(obfuscation.summary, /^2 enabled obfuscation rules and 4 expressions cover credential and PII patterns; attribute drop coverage is unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) were not readable\. A dataset this finding depends on was unreadable/);
+  assert.match(obfuscation.summary, /Partial view: Pipeline Control cloud rules: unreadable \(entityManagement\.pipelineCloudRules: NerdGraph returned errors: Not authorized \(at actor\.entityManagement\.entitySearch\)\)\.$/);
+  assert.equal(obfuscation.evidence.pipeline_cloud_rules, null);
+  assert.equal(obfuscation.evidence.attribute_drop_rules, null);
+  assert.equal(obfuscation.evidence.legacy_drop_rules, 2, "the readable drop rules keep their count");
+  assert.match(obfuscation.evidence.pipeline_control_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
+  assert.doesNotMatch(obfuscation.summary, /\d+ pipeline or drop rules also drop sensitive attributes/);
+});
+
+test("rule 1 corollary hit 6: NR-12 is limited to warn naming nrqlDropRules.list and the account when drop rules are unreadable", async () => {
+  const full = await assessCorollary([["nrqlDropRules.list", "full"]]);
+  const obfuscation = full.findings.find((item) => item.control === 12);
+  assert.equal(obfuscation.status, "warn");
+  assert.match(obfuscation.summary, /attribute drop coverage is unverified because NRQL drop rules \(nrqlDropRules\.list\) were not readable/);
+  assert.match(obfuscation.summary, /Partial view: NRQL drop rules: unreadable \(nrqlDropRules\.list: account 111, account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrqlDropRules\.list\)\)/);
+  assert.equal(obfuscation.evidence.legacy_drop_rules, null);
+  assert.equal(obfuscation.evidence.attribute_drop_rules, null);
+  assert.equal(obfuscation.evidence.pipeline_cloud_rules, 1);
+  assert.match(obfuscation.evidence.legacy_drop_rules_status, /^unreadable \(nrqlDropRules\.list: account 111, account 222: /);
+
+  const partial = await assessCorollary([["nrqlDropRules.list", "partial"]]);
+  const partly = partial.findings.find((item) => item.control === 12);
+  assert.equal(partly.status, "warn");
+  assert.match(partly.summary, /2 pipeline or drop rules also drop sensitive attributes \(1 Pipeline Control cloud rules, 1 NRQL drop rules\)\. The inventory was incomplete, so the verdict is limited to warn instead of pass\. Partial view: NRQL drop rules: 1 scope unreadable \(nrqlDropRules\.list: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrqlDropRules\.list\)\)\.$/);
+  assert.equal(partly.evidence.legacy_drop_rules, 1);
+  assert.match(partly.evidence.legacy_drop_rules_status, /^1 scope unreadable \(nrqlDropRules\.list: account 222: /);
+
+  const both = await assessCorollary([["nrqlDropRules.list", "full"], ["entityManagement.pipelineCloudRules", "full"]]);
+  assert.match(both.findings.find((item) => item.control === 12).summary, /unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) and NRQL drop rules \(nrqlDropRules\.list\) were not readable/);
+});
+
+test("rule 1 corollary hit 7: NR-12 renders log volume as null with a status and is limited to warn when the Log count NRQL is unreadable", async () => {
+  const full = await assessCorollary([["NRQL Log volume", "full"]]);
+  const obfuscation = full.findings.find((item) => item.control === 12);
+  assert.equal(obfuscation.status, "warn");
+  assert.match(obfuscation.summary, /Partial view: log volume: unreadable \(nrql\.Log\.volume: account 111: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\); account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)/);
+  assert.equal(obfuscation.evidence.log_events_last_day, null);
+  assert.match(obfuscation.evidence.log_volume_status, /^unreadable \(nrql\.Log\.volume: account 111: .*; account 222: /);
+  const logs = full.findings.find((item) => item.control === 15);
+  assert.equal(logs.status, "manual");
+  assert.match(logs.summary, /the log volume query failed \(nrql\.Log\.volume: account 111: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\); account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)/);
+  assert.equal(logs.evidence.log_events_last_day, null);
+
+  const partial = await assessCorollary([["NRQL Log volume", "partial"]]);
+  const partly = partial.findings.find((item) => item.control === 12);
+  assert.equal(partly.status, "warn");
+  assert.match(partly.summary, /Partial view: log volume: 1 scope unreadable \(nrql\.Log\.volume: account 222: /);
+  assert.equal(partly.evidence.log_events_last_day, 12_000);
+  assert.match(partly.evidence.log_volume_status, /^1 scope unreadable \(nrql\.Log\.volume: account 222: /);
+  const partlyLogs = partial.findings.find((item) => item.control === 15);
+  assert.equal(partlyLogs.status, "warn");
+  assert.match(partlyLogs.summary, /Partial view: log volume: 1 scope unreadable \(nrql\.Log\.volume: account 222: /);
+});
+
+test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when group grants are not fully readable", async () => {
+  const full = await assessCorollary([["authorizationManagement.groups", "full"]]);
+  const roles = full.findings.find((item) => item.control === 20);
+  assert.equal(roles.status, "warn");
+  assert.match(roles.summary, /^No custom roles exist in the catalog \(the customerAdministration\.roles query was readable and complete, and it returned 2 STANDARD roles\), but group grants \(authorizationManagement\.groups\) were not readable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\), so the roles in use were not cross-checked against the catalog\.$/);
+  assert.equal(roles.evidence.custom_roles_in_group_grants, null);
+  assert.equal(roles.evidence.groups_granted_custom_roles, null);
+  assert.match(roles.evidence.group_grants_status, /^unreadable \(authorizationManagement\.groups: /);
+  assert.deepEqual(roles.evidence.custom_roles, []);
+
+  const partial = await assessCorollary([["authorizationManagement.groups", "partial"]]);
+  const partly = partial.findings.find((item) => item.control === 20);
+  assert.equal(partly.status, "warn");
+  assert.match(partly.summary, /the group grant listing \(authorizationManagement\.groups\) is incomplete, so the roles in use were only partly cross-checked against the catalog\. Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)\.$/);
+  assert.deepEqual(partly.evidence.custom_roles_in_group_grants, []);
+  assert.match(partly.evidence.group_grants_status, /^1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
+
+  const chained = await assessCorollary([["userManagement.authenticationDomains", "full"]]);
+  const viaDomains = chained.findings.find((item) => item.control === 20);
+  assert.equal(viaDomains.status, "warn");
+  assert.match(viaDomains.summary, /group grants \(authorizationManagement\.groups\) were not readable \(authorizationManagement\.groups: authentication domains were not readable \(userManagement\.authenticationDomains: .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\)/);
+  assert.equal(viaDomains.evidence.custom_roles_in_group_grants, null);
+  assert.equal(viaDomains.evidence.groups_granted_custom_roles, null);
+});
+
+test("rule 1 corollary sweep: denying any one inventory demotes exactly the findings that read it, fully and per scope", async () => {
+  for (const row of COROLLARY_INVENTORIES) {
+    for (const mode of row.scope ? ["full", "partial"] : ["full"]) {
+      const { findings } = await assessCorollary([[row.inventory, mode]]);
+      const context = `with ${row.inventory} denied (${mode})`;
+      const expectedDemoted = row.dependents.map(controlId);
+      const expectedPass = COROLLARY_BASELINE_PASS.filter((id) => !expectedDemoted.includes(id));
+      assert.deepEqual(passing(findings).sort(), expectedPass.sort(), `pass set ${context}`);
+      assert.deepEqual(findings.filter((item) => item.status === "fail").map((item) => item.id), [], `no false fail ${context}`);
+      for (const id of expectedDemoted) {
+        const item = findingById({ findings }, id);
+        belowPass(item, context);
+        assert.ok(item.summary.includes(row.path), `${id} does not name the query path ${row.path} ${context}: ${item.summary}`);
+        if (mode === "partial") {
+          assert.ok(item.summary.includes(COROLLARY_SCOPE_LABEL[row.scope]), `${id} does not name the denied scope ${context}: ${item.summary}`);
+        }
+      }
+    }
+  }
+});
+
+test("rule 1 corollary bundle check: findings.json never carries NR-04, 09, 10, 12, 20 as pass when their secondary inventories are denied", async () => {
+  const base = createTempBase("grclanker-newrelic-corollary-");
+  const client = denyInventories(corollaryClient(), [
+    ["nrqlDropRules.list", "partial"],
+    ["entitySearch workloads", "full"],
+    ["authorizationManagement.groups", "partial"],
+    ["alerts.policiesSearch", "partial"],
+  ]);
+
+  const result = await exportNewrelicAuditBundle(client, sampleConfig({ accountIds: COROLLARY_ACCOUNT_IDS }), base, { now: NOW });
+
+  assert.equal(result.findingCount, 20);
+  assert.equal(result.errorCount, 4);
+  const errorsLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /^nrqlDropRules\.list: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrqlDropRules\.list\)$/m);
+  assert.match(errorsLog, /^entitySearch\.workloads: account 111: .*; account 222: .*\(at actor\.entitySearch\)$/m);
+  assert.match(errorsLog, /^authorizationManagement\.groups: authentication domain Contractors: .*\(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)$/m);
+  assert.match(errorsLog, /^alerts\.policiesSearch: account 222: .*\(at actor\.account\.alerts\.policiesSearch\)$/m);
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.length, 20);
+  const byControl = (control) => findings.find((item) => item.control === control);
+  for (const [control, dataset] of [[4, "authorizationManagement.groups"], [9, "entitySearch.workloads"], [10, "alerts.policiesSearch"], [12, "nrqlDropRules.list"], [20, "authorizationManagement.groups"]]) {
+    const item = byControl(control);
+    assert.equal(item.status, "warn", `${item.id}: ${item.summary}`);
+    assert.ok(item.summary.includes(dataset), `${item.id} does not name ${dataset}: ${item.summary}`);
+  }
+  assert.equal(byControl(4).evidence.admin_owned_user_keys, null);
+  assert.equal(byControl(9).evidence.workloads, null);
+  assert.equal(byControl(9).evidence.disrupted_workloads, null);
+  assert.match(byControl(9).summary, /alerts\.policiesSearch: account 222/);
+  assert.equal(byControl(10).evidence.alert_policies, 1);
+  assert.equal(byControl(12).evidence.legacy_drop_rules, 1);
+  assert.deepEqual(byControl(20).evidence.custom_roles_in_group_grants, []);
+  assert.deepEqual(
+    findings.filter((item) => item.status === "pass").map((item) => item.control).sort((a, b) => a - b),
+    [1, 2, 5, 11, 13, 14, 15, 19],
+  );
+  assert.deepEqual(findings.filter((item) => item.status === "fail"), []);
+
+  const summaryJson = JSON.parse(readFileSync(join(result.outputDir, "analysis", "alerting.json"), "utf8"));
+  assert.equal(summaryJson.summary.workloads, null);
+  assert.ok(summaryJson.coverage.some((note) => note.startsWith("workloads: unreadable (entitySearch.workloads: ")));
+  const governance = JSON.parse(readFileSync(join(result.outputDir, "analysis", "data_governance.json"), "utf8"));
+  assert.equal(governance.summary.legacy_drop_rules, 1);
+  assert.ok(governance.coverage.some((note) => note.startsWith("NRQL drop rules: 1 scope unreadable (nrqlDropRules.list: account 222: ")));
 });
 
 test("exportNewrelicAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {

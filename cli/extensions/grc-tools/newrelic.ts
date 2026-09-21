@@ -2068,19 +2068,21 @@ export function compactCause(cause: string): string {
   const separator = cause.indexOf(": ");
   const prefix = separator === -1 ? "" : `${cause.slice(0, separator)}: `;
   const groups = mergeScopeFailures((separator === -1 ? cause : cause.slice(separator + 2)).split("; "));
+  // Keep a leading run of scope groups; each step budgets for the suffix that counts the scopes it would leave out.
   const kept: string[] = [];
-  let omitted = 0;
-  for (const group of groups) {
-    const candidate = [...kept, group].join("; ");
-    if (kept.length > 0 && prefix.length + candidate.length > CAUSE_MAX_LENGTH) {
-      omitted += 1;
-      continue;
-    }
-    kept.push(group);
+  for (let index = 0; index < groups.length; index += 1) {
+    const candidate = [...kept, groups[index]].join("; ");
+    const suffixIfKept = omittedScopesSuffix(groups.length - index - 1);
+    if (kept.length > 0 && prefix.length + candidate.length + suffixIfKept.length > CAUSE_MAX_LENGTH) break;
+    kept.push(groups[index]);
   }
-  const body = kept.join("; ");
-  const suffix = omitted > 0 ? `; ${omitted} more scope${omitted === 1 ? "" : "s"} failed and ${omitted === 1 ? "is" : "are"} listed in the errors array` : "";
-  return `${prefix}${truncateAheadOfPath(body, Math.max(CAUSE_MAX_LENGTH - prefix.length - suffix.length, 40))}${suffix}`;
+  const suffix = omittedScopesSuffix(groups.length - kept.length);
+  return `${prefix}${truncateAheadOfPath(kept.join("; "), Math.max(CAUSE_MAX_LENGTH - prefix.length - suffix.length, 40))}${suffix}`;
+}
+
+function omittedScopesSuffix(omitted: number): string {
+  if (omitted <= 0) return "";
+  return `; ${omitted} more scope${omitted === 1 ? "" : "s"} failed and ${omitted === 1 ? "is" : "are"} listed in the errors array`;
 }
 
 function mergeScopeFailures(segments: string[]): string[] {
@@ -2098,13 +2100,24 @@ function mergeScopeFailures(segments: string[]): string[] {
   return merged.map((entry) => (entry.scopes.length > 0 ? `${entry.scopes.join(", ")}: ${entry.message}` : entry.message));
 }
 
+/**
+ * Shortens one long cause to the budget while keeping its tail: the status text and the query path ("Not authorized
+ * (at actor.x.y)") survive and the boilerplate ahead of them is cut. When the status does not fit, the path alone is
+ * kept; a cause without a path is cut at the end.
+ */
 function truncateAheadOfPath(text: string, budget: number): string {
   if (text.length <= budget) return text;
   const pathStart = text.lastIndexOf(" (at ");
-  const path = pathStart === -1 ? "" : text.slice(pathStart);
-  const room = budget - path.length - 3;
-  if (room <= 0) return `${text.slice(0, Math.max(budget - 3, 1))}...`;
-  return `${text.slice(0, room)}...${path}`;
+  if (pathStart !== -1) {
+    const statusStart = text.lastIndexOf(": ", pathStart);
+    const tailStarts = statusStart === -1 ? [pathStart] : [statusStart + 2, pathStart];
+    for (const tailStart of tailStarts) {
+      const tail = text.slice(tailStart);
+      const room = budget - tail.length - 3;
+      if (room > 0) return `${text.slice(0, room)}...${tail}`;
+    }
+  }
+  return `${text.slice(0, Math.max(budget - 3, 1))}...`;
 }
 
 function causeOf(item: Collected<unknown>): string {
@@ -2663,11 +2676,13 @@ export function assessNewrelicIdentityData(
   const findings: NewrelicFinding[] = [];
 
   findings.push(finding(1, limitCoverage(control1(), [...domainCoverage, ...authTypeCoverage]), {
-    authentication_domains: domainProvisioning,
-    authentication_types: domainAuthTypes,
-    password_domains: passwordDomains.map((domain) => domain.name),
-    domains_without_authentication_type: domainsWithoutAuthType.map((domain) => domain.name),
-    unknown_authentication_type_domains: unknownAuthTypeDomains.map((domain) => domain.name),
+    authentication_domains: listUnlessUnreadable(data.authenticationDomains, domainProvisioning),
+    authentication_domain_status: collectionStatus(data.authenticationDomains),
+    authentication_types: listUnlessUnreadable(data.organizationAuthenticationDomains, domainAuthTypes),
+    authentication_type_status: collectionStatus(data.organizationAuthenticationDomains),
+    password_domains: listUnlessUnreadable(data.organizationAuthenticationDomains, passwordDomains.map((domain) => domain.name)),
+    domains_without_authentication_type: domainsReadable && authTypeReadable ? domainsWithoutAuthType.map((domain) => domain.name) : null,
+    unknown_authentication_type_domains: listUnlessUnreadable(data.organizationAuthenticationDomains, unknownAuthTypeDomains.map((domain) => domain.name)),
     authentication_type_readable: authTypeReadable,
     manual_evidence: "Administration > Access Management > Authentication domains > Authentication: SAML SSO or OIDC SSO for each domain.",
   }));
@@ -2675,12 +2690,12 @@ export function assessNewrelicIdentityData(
   findings.push(finding(2, limitCoverage(control2(), userCoverage), {
     users: countUnlessUnreadable(data.users, users.length),
     user_listing_status: collectionStatus(data.users),
-    user_type_counts: userTypeCounts,
+    user_type_counts: usersReadable ? userTypeCounts : null,
     full_platform_percent: usersReadable ? fullPlatformShare : null,
     max_full_platform_percent: maxFullPlatformPercent,
-    inactive_full_platform_users: sample(inactiveFullPlatformUsers.map(userLabel)),
-    undated_full_platform_users: sample(undatedFullPlatformUsers.map(userLabel)),
-    unknown_type_users: sample(unknownTypeUsers.map(userLabel)),
+    inactive_full_platform_users: listUnlessUnreadable(data.users, sample(inactiveFullPlatformUsers.map(userLabel))),
+    undated_full_platform_users: listUnlessUnreadable(data.users, sample(undatedFullPlatformUsers.map(userLabel))),
+    unknown_type_users: listUnlessUnreadable(data.users, sample(unknownTypeUsers.map(userLabel))),
   }));
 
   const adminRosterReadable = usersReadable && grantsReadable;
@@ -2696,9 +2711,10 @@ export function assessNewrelicIdentityData(
   }));
 
   findings.push(finding(18, limitCoverage(control18(), domainCoverage), {
-    authentication_domains: domainProvisioning,
-    manual_provisioning_domains: manualProvisioningDomains.map((domain) => domain.name),
-    unknown_provisioning_domains: unknownProvisioningDomains.map((domain) => domain.name),
+    authentication_domains: listUnlessUnreadable(data.authenticationDomains, domainProvisioning),
+    authentication_domain_status: collectionStatus(data.authenticationDomains),
+    manual_provisioning_domains: listUnlessUnreadable(data.authenticationDomains, manualProvisioningDomains.map((domain) => domain.name)),
+    unknown_provisioning_domains: listUnlessUnreadable(data.authenticationDomains, unknownProvisioningDomains.map((domain) => domain.name)),
     custom_roles_visible: countUnlessUnreadable(data.roles, customRoles.length),
     role_catalog_status: collectionStatus(data.roles),
     manual_evidence: "Administration > Access Management > Authentication domains: Session settings and User upgrade settings for each domain.",
@@ -2708,8 +2724,8 @@ export function assessNewrelicIdentityData(
     inactive_days: inactiveDays,
     inactive_users: countUnlessUnreadable(data.users, inactiveUsers.length),
     user_listing_status: collectionStatus(data.users),
-    inactive_user_sample: sample(inactiveUsers.map(userLabel)),
-    never_active_users: sample(neverActiveUsers.map(userLabel)),
+    inactive_user_sample: listUnlessUnreadable(data.users, sample(inactiveUsers.map(userLabel))),
+    never_active_users: listUnlessUnreadable(data.users, sample(neverActiveUsers.map(userLabel))),
   }));
 
   const allCollected = Object.values(data);
@@ -3148,31 +3164,36 @@ export function assessNewrelicAccessControlData(
     admin_roster_status: adminRosterComplete ? "complete" : `incomplete: users ${collectionStatus(data.users)}; groups ${collectionStatus(data.groupGrants)}`,
     user_keys_without_user_id: countUnlessUnreadable(data.apiKeys, userKeysWithoutOwner.length),
     key_listing_complete: isComplete(data.apiKeys),
+    key_listing_status: collectionStatus(data.apiKeys),
   }));
 
   findings.push(finding(5, limitCoverage(control5(), [...keyCoverage, ...scopeCoverage]), {
     max_key_age_days: maxKeyAgeDays,
-    aged_user_keys: sample(agedUserKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
-    aged_license_keys: sample(agedLicenseKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`)),
-    keys_without_created_at: sample(keysWithoutCreatedAt.map(keyLabel)),
-    keys_without_created_at_total: keysWithoutCreatedAt.length,
+    aged_user_keys: listUnlessUnreadable(data.apiKeys, sample(agedUserKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`))),
+    aged_license_keys: listUnlessUnreadable(data.apiKeys, sample(agedLicenseKeys.map((key) => `${keyLabel(key)} (${keyAgeDays(key, now)} days)`))),
+    keys_without_created_at: listUnlessUnreadable(data.apiKeys, sample(keysWithoutCreatedAt.map(keyLabel))),
+    keys_without_created_at_total: countUnlessUnreadable(data.apiKeys, keysWithoutCreatedAt.length),
     key_listing_complete: isComplete(data.apiKeys),
+    key_listing_status: collectionStatus(data.apiKeys),
   }));
 
+  const keyOwnersReadable = keysReadable && usersReadable;
   findings.push(finding(6, limitCoverage(control6(), [...keyCoverage, ...userCoverage, ...auditCoverage, ...scopeCoverage]), {
-    keys_total: keys.length,
-    user_keys_without_user_id: userKeysWithoutOwner.length,
+    keys_total: countUnlessUnreadable(data.apiKeys, keys.length),
+    user_keys_without_user_id: countUnlessUnreadable(data.apiKeys, userKeysWithoutOwner.length),
     accounts_in_scope: data.accountIds,
     accounts_in_scope_not_visible: unseenScopeAccounts,
     key_listing_complete: isComplete(data.apiKeys),
+    key_listing_status: collectionStatus(data.apiKeys),
+    user_listing_status: collectionStatus(data.users),
     distinct_api_keys_in_audit: countUnlessUnreadable(data.apiKeyAuditEvents, distinctActorKeys.size),
     audit_events_by_api_keys: countUnlessUnreadable(data.apiKeyAuditEvents, data.apiKeyAuditEvents.data.length),
     audit_window_days: data.auditWindowDays,
     audit_readable: auditReadable,
     audit_status: collectionStatus(data.apiKeyAuditEvents),
-    orphaned_user_keys: sample(orphanedUserKeys.map(keyLabel)),
-    inactive_owner_user_keys: sample(inactiveOwnerKeys.map(keyLabel)),
-    undated_owner_user_keys: sample(undatedOwnerKeys.map(keyLabel)),
+    orphaned_user_keys: keyOwnersReadable ? sample(orphanedUserKeys.map(keyLabel)) : null,
+    inactive_owner_user_keys: keyOwnersReadable ? sample(inactiveOwnerKeys.map(keyLabel)) : null,
+    undated_owner_user_keys: keyOwnersReadable ? sample(undatedOwnerKeys.map(keyLabel)) : null,
     manual_evidence: "API keys UI export plus owner confirmation for every key without a documented consumer; NrAuditEvent WHERE actorType = 'api_key' for change activity.",
   }));
 
@@ -3546,31 +3567,37 @@ export function assessNewrelicAlertingData(
 
   // NR-10 reads alert policies on its zero-destination and zero-workflow branches, so the policy listing is part of
   // its coverage and is disclosed with its status even on the pass path.
+  const routingReadable = destinationsReadable && channelsReadable && workflowsReadable;
   findings.push(finding(10, limitCoverage(control10(), [...destinationCoverage, ...channelCoverage, ...workflowCoverage, ...policyCoverage]), {
     destinations: countUnlessUnreadable(data.destinations, destinations.length),
-    destination_types: destinationTypeCounts,
+    destinations_status: collectionStatus(data.destinations),
+    destination_types: destinationsReadable ? destinationTypeCounts : null,
     channels: countUnlessUnreadable(data.channels, channels.length),
+    channels_status: collectionStatus(data.channels),
     workflows: countUnlessUnreadable(data.workflows, workflows.length),
+    workflows_status: collectionStatus(data.workflows),
     enabled_workflows: countUnlessUnreadable(data.workflows, enabledWorkflows.length),
     workflows_without_enabled_flag: countUnlessUnreadable(data.workflows, workflowsWithoutEnabledFlag.length),
     alert_policies: countUnlessUnreadable(data.policies, policies.length),
     alert_policies_status: collectionStatus(data.policies),
     approved_email_domains: [...approvedDomains],
-    personal_email_destinations: sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
-    unapproved_email_destinations: sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
-    destinations_routed_by_enabled_workflows: routedDestinationIds.size,
-    enabled_workflows_without_resolved_destination: sample(unroutedEnabledWorkflows.map((workflow) => asString(workflow.name) ?? asString(workflow.id) ?? "workflow")),
+    current_user_status: data.currentUser.error ? `unreadable (${causeOf(data.currentUser)})` : "readable",
+    personal_email_destinations: listUnlessUnreadable(data.destinations, sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination"))),
+    unapproved_email_destinations: listUnlessUnreadable(data.destinations, sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination"))),
+    destinations_routed_by_enabled_workflows: routingReadable ? routedDestinationIds.size : null,
+    enabled_workflows_without_resolved_destination: routingReadable ? sample(unroutedEnabledWorkflows.map((workflow) => asString(workflow.name) ?? asString(workflow.id) ?? "workflow")) : null,
     destination_active_state: "not read: not among the documented aiNotifications.destinations fields",
-    destinations_without_type: destinationsWithoutType.length,
-    email_destinations_without_address: emailDestinationsWithoutAddress.length,
+    destinations_without_type: countUnlessUnreadable(data.destinations, destinationsWithoutType.length),
+    email_destinations_without_address: countUnlessUnreadable(data.destinations, emailDestinationsWithoutAddress.length),
   }));
 
   findings.push(finding(17, limitCoverage(control17(), [...workflowCoverage, ...channelCoverage, ...destinationCoverage]), {
-    workflows: workflows.length,
-    enabled_workflows: enabledWorkflows.length,
-    enriched_workflows: sample(enrichedWorkflows.map((workflow) => asString(workflow.name) ?? "workflow")),
-    enriched_external_workflows: sample(enrichedExternalWorkflows.map((workflow) => asString(workflow.name) ?? "workflow")),
-    enrichment_queries: sample(enrichmentQueries, 10),
+    workflows: countUnlessUnreadable(data.workflows, workflows.length),
+    workflows_status: collectionStatus(data.workflows),
+    enabled_workflows: countUnlessUnreadable(data.workflows, enabledWorkflows.length),
+    enriched_workflows: listUnlessUnreadable(data.workflows, sample(enrichedWorkflows.map((workflow) => asString(workflow.name) ?? "workflow"))),
+    enriched_external_workflows: listUnlessUnreadable(data.workflows, sample(enrichedExternalWorkflows.map((workflow) => asString(workflow.name) ?? "workflow"))),
+    enrichment_queries: listUnlessUnreadable(data.workflows, sample(enrichmentQueries, 10)),
     manual_evidence: "Alerts > Correlation decisions: list of enabled decisions and the attributes they correlate on.",
   }));
 
@@ -4044,7 +4071,8 @@ export function assessNewrelicDataGovernanceData(
 
   findings.push(finding(13, limitCoverage(control13(), monitorCoverage), {
     monitors: countUnlessUnreadable(data.syntheticMonitors, monitors.length),
-    monitor_types: monitorTypeCounts,
+    monitors_status: collectionStatus(data.syntheticMonitors),
+    monitor_types: monitorsReadable ? monitorTypeCounts : null,
     monitors_without_type: countUnlessUnreadable(data.syntheticMonitors, monitorsWithoutType.length),
     scripted_monitors: countUnlessUnreadable(data.syntheticMonitors, scriptedMonitors.length),
     scripts_sampled: countUnlessUnreadable(data.syntheticScripts, scripts.length),
