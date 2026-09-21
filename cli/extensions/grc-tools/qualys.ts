@@ -165,11 +165,12 @@ export interface QualysListResult {
 
 export type QualysListLike = JsonRecord[] | QualysListResult;
 
+// roles and scopeTags are null, never [], when no surface verified the API user's role.
 export interface QualysViewScope {
   verified: boolean;
   partial: boolean;
-  roles: string[];
-  scopeTags: string[];
+  roles: string[] | null;
+  scopeTags: string[] | null;
   source: "user_search" | "user_list" | "activity_log" | "unverified";
   note: string;
 }
@@ -1598,7 +1599,7 @@ function exportableSurface(source: Collected): QualysRawDataSurface {
 }
 
 function unverifiedScope(note: string): QualysViewScope {
-  return { verified: false, partial: false, roles: [], scopeTags: [], source: "unverified", note };
+  return { verified: false, partial: false, roles: null, scopeTags: null, source: "unverified", note };
 }
 
 function roleGrantsFullView(roles: string[]): boolean {
@@ -1741,16 +1742,24 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   if (status === "manual" && !/Collect manually:/.test(input.summary)) {
     parts.push(`Collect manually: ${input.manualEvidence}`);
   }
-  return finding(input.control, input.severity, status, parts.join(" "), {
-    ...renderRecord(input.evidence),
+  // Bucket counts describe records that were read; once any input was denied or blocked they are unknown too.
+  return finding(input.control, input.severity, status, parts.join(" "), renderRecord({
+    ...input.evidence,
     verdict_basis: input.status,
     manual_evidence: input.manualEvidence,
-    unknown_buckets: Object.fromEntries(buckets),
+    unknown_buckets: withheldFor(input.sources) ?? Object.fromEntries(buckets),
     collection: {
       sources: input.sources.map(describeSource),
-      view_scope: { verified: input.scope.verified, partial: input.scope.partial, roles: input.scope.roles, scope_tags: input.scope.scopeTags, source: input.scope.source },
+      view_scope: {
+        verified: input.scope.verified,
+        partial: input.scope.partial,
+        roles: input.scope.roles,
+        scope_tags: input.scope.scopeTags,
+        source: input.scope.source,
+        status: input.scope.verified ? `verified: ${input.scope.note}` : `unknown: ${input.scope.note}`,
+      },
     },
-  });
+  }));
 }
 
 function unreadableSummary(control: number, sources: Collected[]): string {
