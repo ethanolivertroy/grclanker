@@ -1,0 +1,282 @@
+---
+title: AWS
+description: Read-only AWS security inspector covering IAM, CloudTrail, Security Hub, GuardDuty, Config, Organizations, Identity Center, S3, EBS, RDS, KMS, VPC networking, Audit Manager, and account contacts across the 25 spec controls.
+---
+
+The AWS integration audits one AWS account's own security configuration: how the root user and IAM principals are protected, whether logging and detection services are on, which organization guardrails exist, whether data at rest and in transit is protected by default, and whether the network edge is closed on sensitive ports. It never mutates the account: every request is a `Get`, `List`, `Describe`, or `Lookup` call against the documented AWS service APIs through the AWS SDK for JavaScript v3.
+
+It implements the 25 controls in `specs/aws-sec-inspector.spec.md` and maps every finding to FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS AWS Foundations, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
+
+## What it inspects
+
+| Area | AWS surfaces read |
+|---|---|
+| Identity | STS `GetCallerIdentity`; IAM `GetAccountSummary`, `GetAccountPasswordPolicy`, `ListUsers`, `ListMFADevices`, `ListAccessKeys`, `GetAccessKeyLastUsed`, `GetAccountAuthorizationDetails` (roles), `ListPolicies` (`Scope=Local`), `GetPolicyVersion`; CloudTrail `LookupEvents` (`Username=root`) |
+| Logging and detection | CloudTrail `DescribeTrails`, `GetTrailStatus`, `GetEventSelectors`; Security Hub `DescribeHub`, `GetEnabledStandards`; Config `DescribeConfigurationRecorders`, `DescribeConfigurationRecorderStatus`; GuardDuty `ListDetectors`, `GetDetector` |
+| Organization guardrails | Organizations `DescribeOrganization`, `ListAccounts`, `ListPolicies` (`SERVICE_CONTROL_POLICY`), `ListTargetsForPolicy`; Access Analyzer `ListAnalyzers`, `ListFindings`; Identity Center `ListInstances`; Audit Manager `ListAssessments` (`status=ACTIVE`); Account `GetAlternateContact` (`SECURITY`) |
+| Data protection | S3 Control `GetPublicAccessBlock` (account); S3 `ListBuckets`, `GetPublicAccessBlock`, `GetBucketPolicyStatus`, `GetBucketEncryption`, `GetBucketPolicy`; EC2 `GetEbsEncryptionByDefault` per region; RDS `DescribeDBInstances` per region; KMS `ListKeys`, `DescribeKey`, `GetKeyRotationStatus` per region |
+| Network security | EC2 `DescribeRegions`, `DescribeVpcs`, `DescribeFlowLogs`, `DescribeNetworkAcls`, `DescribeSecurityGroups` per region |
+
+## Setup and authentication
+
+Credentials come from the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-credentials-node.html): explicit environment variables, the shared `~/.aws/credentials` and `~/.aws/config` files (with `AWS_PROFILE` or the `profile` argument selecting a named profile through `fromIni`), web identity tokens, container credentials, and instance metadata, in the order documented in the [AWS SDKs and Tools reference](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html). No credential value is ever written to a finding or a bundle.
+
+### Configuration precedence
+
+Explicit tool arguments win, then environment variables, then SDK defaults.
+
+| Setting | Argument | Environment variables | Default |
+|---|---|---|---|
+| Region | `region` | `AWS_REGION`, `AWS_DEFAULT_REGION` | `us-east-1` |
+| Profile | `profile` | `AWS_PROFILE` | SDK default chain |
+| Account hint | `account_id` | `AWS_ACCOUNT_ID` | none (compared against `sts:GetCallerIdentity`) |
+
+The resolved source chain (for example `arguments-region -> environment-profile`) is reported by `aws_check_access` and recorded in `metadata.json`. `AWS_ROLE_ARN` and `AWS_EXTERNAL_ID` are honored only through the SDK's own `credential_process` and `role_arn` profile settings; the tools do not perform their own `AssumeRole` fan-out across accounts yet (see Limitations).
+
+### Region scope
+
+`aws_assess_identity`, `aws_assess_logging_detection`, and `aws_assess_org_guardrails` read global services and the configured region. `aws_assess_data_protection` and `aws_assess_network_security` are multi-region: they call [EC2 `DescribeRegions`](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html) with the `opt-in-status` filter (`opt-in-not-required`, `opted-in`) and assess every enabled region up to `region_limit` (default 30). Pass `regions` (comma-separated) to pin the scope. When `DescribeRegions` is unreadable the scope falls back to the configured region only, the fallback is recorded in `errors`, and every multi-region finding is capped at `warn` because only part of the estate was seen.
+
+### Required IAM permissions
+
+Attach a read-only policy with the actions below to the audit principal. Action names follow the [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html). `aws_check_access` reports which surfaces return `AccessDenied`, and every unreadable surface renders a `manual` finding rather than a `pass`.
+
+| Service | Actions |
+|---|---|
+| STS | `sts:GetCallerIdentity` |
+| IAM | `iam:GetAccountSummary`, `iam:GetAccountPasswordPolicy`, `iam:ListUsers`, `iam:ListMFADevices`, `iam:ListAccessKeys`, `iam:GetAccessKeyLastUsed`, `iam:GetAccountAuthorizationDetails`, `iam:ListPolicies`, `iam:GetPolicyVersion` |
+| CloudTrail | `cloudtrail:DescribeTrails`, `cloudtrail:GetTrailStatus`, `cloudtrail:GetEventSelectors`, `cloudtrail:LookupEvents` |
+| Security Hub | `securityhub:DescribeHub`, `securityhub:GetEnabledStandards` |
+| Config | `config:DescribeConfigurationRecorders`, `config:DescribeConfigurationRecorderStatus` |
+| GuardDuty | `guardduty:ListDetectors`, `guardduty:GetDetector` |
+| Access Analyzer | `access-analyzer:ListAnalyzers`, `access-analyzer:ListFindings` |
+| Organizations | `organizations:DescribeOrganization`, `organizations:ListAccounts`, `organizations:ListPolicies`, `organizations:ListTargetsForPolicy` |
+| Identity Center | `sso:ListInstances` |
+| EC2 | `ec2:DescribeRegions`, `ec2:GetEbsEncryptionByDefault`, `ec2:DescribeVpcs`, `ec2:DescribeFlowLogs`, `ec2:DescribeNetworkAcls`, `ec2:DescribeSecurityGroups` |
+| S3 | `s3:ListAllMyBuckets`, `s3:GetBucketPublicAccessBlock`, `s3:GetBucketPolicyStatus`, `s3:GetEncryptionConfiguration`, `s3:GetBucketPolicy`, `s3:GetAccountPublicAccessBlock` |
+| RDS | `rds:DescribeDBInstances` |
+| KMS | `kms:ListKeys`, `kms:DescribeKey`, `kms:GetKeyRotationStatus` |
+| Audit Manager | `auditmanager:ListAssessments` |
+| Account | `account:GetAlternateContact` |
+
+The AWS managed policies `SecurityAudit` and `ViewOnlyAccess` together cover most of this list; `account:GetAlternateContact` and `auditmanager:ListAssessments` may need to be added explicitly.
+
+### Client behavior
+
+- Every list operation follows its documented pagination token (`Marker`/`IsTruncated` for IAM, `NextToken` for CloudTrail, EC2, Access Analyzer, Organizations, and Audit Manager, `ContinuationToken` for S3 `ListBuckets`, `Marker` for RDS, `Marker`/`Truncated`/`NextMarker` for KMS) to completion or until the configured `*_limit`, and requests one item beyond the limit so a truncated inventory is distinguishable from a complete one.
+- Per-bucket, per-key, and per-policy reads run with bounded concurrency (8) and per-region reads with concurrency 4.
+- `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, `AuthorizationError`, and HTTP 403 responses are classified as denied; every denied or errored read is appended to the assessment's `errors` list with the operation name and region.
+- Documented "not configured" responses are read as evidence, not errors: `NoSuchPublicAccessBlockConfiguration` (account or bucket block absent), `NoSuchBucketPolicy` (no bucket policy), `ServerSideEncryptionConfigurationNotFoundError` (no default encryption), and `ResourceNotFoundException` from `GetAlternateContact` (no security contact).
+
+## Tools
+
+All tools accept `region`, `profile`, and `account_id`.
+
+### `aws_check_access`
+
+Calls `sts:GetCallerIdentity`, then probes 14 read surfaces with a minimal request each: IAM summary, CloudTrail trails, Security Hub standards, Config recorders, GuardDuty detectors, Access Analyzer analyzers, Organizations, Identity Center instances, EC2 regions, S3 buckets, KMS keys and RDS instances in the configured region, Audit Manager assessments, and the account security contact. Returns `healthy` only when every surface is readable and `limited` otherwise, naming the services to grant. A missing security contact is readable evidence (count 0), not a denial.
+
+### `aws_assess_identity`
+
+Controls 1, 2, 3, 4, 5, 17, and 18. Extra arguments: `user_limit` (500), `stale_days` (90), `role_limit` (500), `max_privileged_roles` (5), `lookback_days` (90, the CloudTrail `LookupEvents` retention), `policy_limit` (1000).
+
+### `aws_assess_logging_detection`
+
+Controls 6, 7, 8, 9, 10, and 19. No extra arguments.
+
+### `aws_assess_org_guardrails`
+
+Controls 15, 16, 23, 24, and 25. Extra argument: `max_findings` (200 Access Analyzer findings per analyzer).
+
+### `aws_assess_data_protection`
+
+Controls 11, 12, 13, and 22. Extra arguments: `regions`, `region_limit` (30), `bucket_limit` (1000), `key_limit` (1000 per region), `instance_limit` (500 per region).
+
+### `aws_assess_network_security`
+
+Controls 14, 20, and 21. Extra arguments: `regions`, `region_limit` (30), `resource_limit` (2000 VPCs, flow logs, NACLs, or security groups per region), `sensitive_ports` (default `21,22,23,445,1433,1521,3306,3389,5432,5900,6379,9200,27017`).
+
+### `aws_export_audit_bundle`
+
+Runs the access check plus all five assessments and writes an evidence bundle under `output_dir` (default `./export/aws`). Accepts every assessment argument listed above. The bundle directory is named `<account-id>-<region>-audit` (suffixed with `-2`, `-3`, and so on if it already exists) and contains:
+
+```text
+README.md
+QUICK_REFERENCE.md
+metadata.json                    (region, profile, account, source chain, limits, counts, controls covered)
+_errors.log                      (only when a surface failed, was denied, or was truncated)
+core_data/access.json            (the access check with every probed surface)
+analysis/findings.json           (all 27 normalized findings)
+analysis/<category>.json         (identity, logging-detection, org-guardrails, data-protection, network-security)
+analysis/summary.json
+compliance/executive_summary.md
+compliance/unified_compliance_matrix.md
+compliance/frameworks/{fedramp,cmmc,soc2,cis,pci-dss,disa-stig,irap,ismap}.md
+```
+
+A zip archive named after the allocated directory (`<account-id>-<region>-audit.zip`, `<account-id>-<region>-audit-2.zip`, and so on) is written next to it, so a rerun never overwrites a prior bundle or its zip. Output paths are resolved with traversal and symlink-parent protection, so `output_dir` values that escape the output root are rejected.
+
+## Findings
+
+Every finding has the shape `{ id, title, severity, status, summary, evidence, mappings[] }`.
+
+- `id` is `AWS-<AREA>-<NN>`. Findings added for controls 4, 11, 12, 13, 14, 18, 20, 21, 22, 24, and 25 carry the spec control number (`AWS-DATA-11`, `AWS-NET-21`); the original identity, logging, and organization findings keep their sequence numbers and map to controls through the coverage table below.
+- `severity` is `critical`, `high`, `medium`, `low`, or `info` and is fixed per finding (except `AWS-ORG-04`, which is `high` when active external-access findings exist and `low` otherwise).
+- `status` is `pass`, `warn`, `fail`, or `manual`. A finding is `manual` when the control cannot be verified through the API, either because the surface was denied or errored or because the inventory is empty in a way that leaves nothing to evaluate; its summary states exactly what evidence a human must collect.
+- `mappings` lists framework references prefixed with the framework label, for example `FedRAMP AC-3` or `CIS AWS 2.1.4`. Findings added for controls 4, 11, 12, 13, 14, 18, 20, 21, 22, 24, and 25 carry the complete row from the spec's compliance table across all eight frameworks; the original identity, logging, and organization findings carry a curated FedRAMP, CMMC, SOC 2, CIS, or PCI-DSS subset. The unified matrix and per-framework reports are built from these mappings.
+
+### Verdict safety rules
+
+Every finding follows the same rules so that a `pass` always rests on data that was actually read:
+
+1. A denied (`AccessDenied`, `UnauthorizedOperation`, 403) or errored surface never yields `pass`. Findings whose only input is denied render `manual` naming the operation; findings with several inputs cap at `warn` and list the unreadable part.
+2. An empty inventory never yields `pass` by default. Each finding states its intent: empty Audit Manager assessments (24) and a missing security contact (25) are `fail`; empty buckets (13), VPCs (14), NACLs (20), security groups (21), customer-managed keys (22), and customer-managed policies (18) are `manual` with the reason and the not-applicable path spelled out.
+3. A service that is not set up (Audit Manager without assessments, Security Hub without a hub, Organizations on a standalone account) renders `manual` or `fail` naming the service, never `pass`.
+4. Items missing a date (root events without `EventTime`, assessments without `creationTime` or `lastUpdated`) never count as fresh and cap the verdict at `warn`.
+5. A partial view (region scope truncated or fallen back to one region, per-bucket or per-key reads denied, one region's list unreadable) flags seen versus total in the evidence and caps the verdict at `warn`.
+6. Every flag the verdict depends on is read explicitly from the documented response field: `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`, `IsPublic`, `EbsEncryptionByDefault`, `StorageEncrypted`, `SSEAlgorithm`, `KeyManager`, `KeyState`, `KeySpec`, `Origin`, `KeyRotationEnabled`, `FlowLogStatus`, `IpProtocol`, `FromPort`, `ToPort`, `IpRanges[].CidrIp`, `Ipv6Ranges[].CidrIpv6`, `Protocol`, `RuleAction`, `Egress`, `CidrBlock`, `Ipv6CidrBlock`, `PortRange.From`, `PortRange.To`. A missing flag is "unknown", never "compliant".
+7. Pagination runs to completion or records truncation: when an inventory hits its `*_limit`, the finding evidence carries `*_truncated: true`, the assessment records it in `errors`, and a would-be `pass` becomes `warn`.
+8. Export reruns never overwrite a prior bundle or zip.
+
+When a `pass` is downgraded under these rules, the summary ends with `Downgraded to warn: ...`.
+
+## Control coverage
+
+| # | Control | Tool | Finding | Status semantics |
+|---|---|---|---|---|
+| 1 | MFA Enforcement | `aws_assess_identity` | `AWS-IAM-01`, `AWS-IAM-02` | `AWS-IAM-01` is `fail` unless `GetAccountSummary` reports `AccountMFAEnabled=1` and `AccountAccessKeysPresent=0`. `AWS-IAM-02` is `fail` when any sampled user has no device in `ListMFADevices`. |
+| 2 | Password Policy | `aws_assess_identity` | `AWS-IAM-03` | `fail` when no policy exists or `MinimumPasswordLength` is below 14 or any of `RequireSymbols`, `RequireNumbers`, `RequireUppercaseCharacters`, `RequireLowercaseCharacters` is not `true`. |
+| 3 | Access Key Rotation | `aws_assess_identity` | `AWS-IAM-04` | `fail` when any key's `GetAccessKeyLastUsed.LastUsedDate` (or `CreateDate` when never used) is older than `stale_days`. |
+| 4 | Root Account Usage | `aws_assess_identity` | `AWS-IAM-01`, `AWS-IAM-07` | `AWS-IAM-07` reads CloudTrail `LookupEvents` with `Username=root` over `lookback_days` in `us-east-1` regardless of the configured region, because root `ConsoleLogin` is a global event delivered only there (evidence records `lookup_region`): `fail` on any `ConsoleLogin` event; `warn` on other root API events; `pass` when none exist. If the `us-east-1` lookup is denied or fails, the configured region is read instead and the verdict caps at `warn` with the reason; `manual` when no lookup can be read. Truncated lookups and events without `EventTime` cap at `warn`. |
+| 5 | Unused Credentials | `aws_assess_identity` | `AWS-IAM-06` | `warn` when users have no password activity within `stale_days` (or no `PasswordLastUsed` and no access keys); otherwise `pass`. |
+| 6 | CloudTrail Enabled | `aws_assess_logging_detection` | `AWS-LOG-01` | `pass` only when at least one trail has `IsMultiRegionTrail=true`, `LogFileValidationEnabled=true`, and `GetTrailStatus.IsLogging=true`; otherwise `fail`. |
+| 7 | CloudTrail Log Integrity | `aws_assess_logging_detection` | `AWS-LOG-01` | Log-file validation is part of `AWS-LOG-01`. The trail bucket's public-access state is not yet checked (see Limitations). |
+| 8 | Security Hub Enabled | `aws_assess_logging_detection` | `AWS-LOG-03` | `fail` when `DescribeHub` fails in the configured region; `warn` when the hub exists but `GetEnabledStandards` is empty; otherwise `pass`. |
+| 9 | GuardDuty Enabled | `aws_assess_logging_detection` | `AWS-LOG-04` | `fail` unless at least one detector reports `Status=ENABLED` in the configured region. Protection-plan features are not yet read (see Limitations). |
+| 10 | Config Enabled | `aws_assess_logging_detection` | `AWS-LOG-05` | `pass` only when a recorder in `DescribeConfigurationRecorders` has `recording=true` in `DescribeConfigurationRecorderStatus`; otherwise `fail`. |
+| 11 | S3 Public Access | `aws_assess_data_protection` | `AWS-DATA-11` | `manual` when the account block (S3 Control) or `ListBuckets` is denied; `fail` when the account block is absent (`NoSuchPublicAccessBlockConfiguration`), or incomplete while any bucket lacks a full bucket-level block or has `IsPublic=true`; `warn` when the account block is incomplete but every bucket blocks individually, or when the account block is full but a bucket policy still evaluates public; `pass` only when all four account flags are `true` and no bucket policy is public. Unreadable buckets and truncation cap at `warn`. |
+| 12 | Encryption at Rest | `aws_assess_data_protection` | `AWS-DATA-12` | `manual` when `GetEbsEncryptionByDefault` is unreadable in every region or `ListBuckets` is denied; `fail` when any region has `EbsEncryptionByDefault=false`, any bucket lacks a `SSEAlgorithm` rule, or any RDS instance has `StorageEncrypted=false`; otherwise `pass`. Unreadable regions, buckets, instances without the flag, truncation, and partial region scope cap at `warn`. EFS is not assessed. |
+| 13 | Encryption in Transit | `aws_assess_data_protection` | `AWS-DATA-13` | `manual` when `ListBuckets` is denied or no buckets exist; `fail` when any bucket has no `Deny` statement with `Bool aws:SecureTransport=false` (policy absent counts as missing); otherwise `pass`. Load balancer and API TLS policies are not assessed. |
+| 14 | VPC Flow Logs | `aws_assess_network_security` | `AWS-NET-14` | `manual` when `DescribeVpcs` is denied everywhere, no VPCs exist, or flow logs are unreadable for every VPC; `fail` when any VPC has no flow log with `FlowLogStatus=ACTIVE` whose `ResourceId` is the VPC; otherwise `pass`. Unverified VPCs, unreadable regions, truncation, and partial scope cap at `warn`. |
+| 15 | Cross-Account Access | `aws_assess_org_guardrails` | `AWS-ORG-03`, `AWS-ORG-04` | `AWS-ORG-03` is `fail` without an analyzer whose `status=ACTIVE`. `AWS-ORG-04` is `warn` when any sampled finding has `status=ACTIVE`; otherwise `pass`. |
+| 16 | SCP Enforcement | `aws_assess_org_guardrails` | `AWS-ORG-01`, `AWS-ORG-02` | `AWS-ORG-01` is `warn` when `DescribeOrganization` is not visible. `AWS-ORG-02` is `warn` with no SCPs, `fail` when SCPs exist but `ListTargetsForPolicy` is empty for all of them, `pass` when at least one is attached. |
+| 17 | Permission Boundaries | `aws_assess_identity` | `AWS-IAM-05` | Roles with `AdministratorAccess` attached or an inline `Action:*`/`Resource:*` statement are privileged; `fail` when more than `max_privileged_roles` lack a `PermissionsBoundary`, `warn` when any lack one, otherwise `pass`. |
+| 18 | Least Privilege | `aws_assess_identity` | `AWS-IAM-08` | Reads every customer-managed policy (`ListPolicies Scope=Local`) and its `DefaultVersionId` document: `manual` when the list is denied or empty (inline policies are not evaluated); `fail` when an attached policy (or one used as a boundary) grants `Allow` with `Action:*` and `Resource:*`; `warn` when only unattached policies do, or when policies grant `service:*` on `Resource:*`; otherwise `pass`. Unreadable versions and truncation cap at `warn`. |
+| 19 | Logging Configuration | `aws_assess_logging_detection` | `AWS-LOG-02` | `warn` when no trail has `DataResources` in `EventSelectors` or any `AdvancedEventSelectors`; otherwise `pass`. |
+| 20 | Network ACLs | `aws_assess_network_security` | `AWS-NET-20` | `manual` when `DescribeNetworkAcls` is denied everywhere or no NACLs exist; `fail` when any inbound (`Egress=false`) `allow` entry from `0.0.0.0/0` or `::/0` covers a sensitive port (or all ports via `Protocol=-1` or no `PortRange`); otherwise `pass`. |
+| 21 | Security Group Rules | `aws_assess_network_security` | `AWS-NET-21` | `manual` when `DescribeSecurityGroups` is denied everywhere or no groups exist; `fail` when any `IpPermissions` entry with `IpRanges[].CidrIp=0.0.0.0/0` or `Ipv6Ranges[].CidrIpv6=::/0` covers a sensitive port (or all ports via `IpProtocol=-1` or a `FromPort`/`ToPort` range containing one); otherwise `pass`. |
+| 22 | KMS Key Rotation | `aws_assess_data_protection` | `AWS-DATA-22` | `manual` when `ListKeys` is denied in every region or no `KeyManager=CUSTOMER` key exists; `fail` when any enabled symmetric (`KeySpec=SYMMETRIC_DEFAULT`, `Origin=AWS_KMS`, `KeyState=Enabled`) customer key has `KeyRotationEnabled=false`; `warn` when customer keys exist but none is eligible for automatic rotation; otherwise `pass`. Unreadable `DescribeKey` or rotation status, per-region list failures, truncation, and partial scope cap at `warn`. |
+| 23 | Identity Center Configuration | `aws_assess_org_guardrails` | `AWS-ORG-05` | `warn` when `ListInstances` returns no instance from the configured region; otherwise `pass`. Permission sets and MFA settings are not evaluated. |
+| 24 | Audit Manager Evidence | `aws_assess_org_guardrails` | `AWS-ORG-06` | `manual` when `ListAssessments` is denied or Audit Manager is not set up in the region; `fail` when no assessment has `status=ACTIVE`; otherwise `pass`. Assessments without `creationTime` and `lastUpdated`, and a truncated list, cap at `warn`. |
+| 25 | Account Contacts | `aws_assess_org_guardrails` | `AWS-ORG-07` | `manual` when `GetAlternateContact` is denied; `fail` when it returns `ResourceNotFoundException` (no `SECURITY` contact); `warn` when the contact lacks `EmailAddress` or `PhoneNumber`; otherwise `pass`. Billing and operations contacts are not assessed. |
+
+Every control becomes `manual` when its only surface is unreadable, and the finding summary names the console page or CLI call to capture.
+
+## API operations and response fields
+
+Every operation and field the tools read is listed here with its official reference, so a reviewer can trace each verdict to documented behavior.
+
+| Service | Operation | Request parameters used | Response fields read | Reference |
+|---|---|---|---|---|
+| STS | `GetCallerIdentity` | none | `Account`, `Arn` | [API_GetCallerIdentity](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html) |
+| IAM | `GetAccountSummary` | none | `SummaryMap.AccountMFAEnabled`, `SummaryMap.AccountAccessKeysPresent` | [API_GetAccountSummary](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountSummary.html) |
+| IAM | `GetAccountPasswordPolicy` | none | `PasswordPolicy.MinimumPasswordLength`, `RequireSymbols`, `RequireNumbers`, `RequireUppercaseCharacters`, `RequireLowercaseCharacters` | [API_GetAccountPasswordPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountPasswordPolicy.html), [API_PasswordPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_PasswordPolicy.html) |
+| IAM | `ListUsers` | `Marker`, `MaxItems` | `Users[].UserName`, `Arn`, `CreateDate`, `PasswordLastUsed`, `IsTruncated`, `Marker` | [API_ListUsers](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListUsers.html), [API_User](https://docs.aws.amazon.com/IAM/latest/APIReference/API_User.html) |
+| IAM | `ListMFADevices` | `UserName` | `MFADevices[].SerialNumber` | [API_ListMFADevices](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListMFADevices.html) |
+| IAM | `ListAccessKeys` | `UserName` | `AccessKeyMetadata[].AccessKeyId`, `CreateDate`, `Status` | [API_ListAccessKeys](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListAccessKeys.html) |
+| IAM | `GetAccessKeyLastUsed` | `AccessKeyId` | `AccessKeyLastUsed.LastUsedDate` | [API_GetAccessKeyLastUsed](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccessKeyLastUsed.html) |
+| IAM | `GetAccountAuthorizationDetails` | `Filter=["Role"]`, `Marker`, `MaxItems` | `RoleDetailList[].RoleName`, `Arn`, `AttachedManagedPolicies[].PolicyName`, `RolePolicyList[].PolicyDocument` (URL-encoded JSON), `PermissionsBoundary`, `IsTruncated`, `Marker` | [API_GetAccountAuthorizationDetails](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountAuthorizationDetails.html), [API_RoleDetail](https://docs.aws.amazon.com/IAM/latest/APIReference/API_RoleDetail.html) |
+| IAM | `ListPolicies` | `Scope=Local`, `OnlyAttached=false`, `Marker`, `MaxItems` | `Policies[].Arn`, `PolicyName`, `DefaultVersionId`, `AttachmentCount`, `PermissionsBoundaryUsageCount`, `IsTruncated`, `Marker` | [API_ListPolicies](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListPolicies.html), [API_Policy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_Policy.html) |
+| IAM | `GetPolicyVersion` | `PolicyArn`, `VersionId` | `PolicyVersion.Document` (URL-encoded JSON; `Statement[].Effect`, `Action`, `Resource`) | [API_GetPolicyVersion](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetPolicyVersion.html), [API_PolicyVersion](https://docs.aws.amazon.com/IAM/latest/APIReference/API_PolicyVersion.html) |
+| CloudTrail | `DescribeTrails` | none | `trailList[].Name`, `TrailARN`, `IsMultiRegionTrail`, `LogFileValidationEnabled` | [API_DescribeTrails](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_DescribeTrails.html), [API_Trail](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_Trail.html) |
+| CloudTrail | `GetTrailStatus` | `Name` | `IsLogging` | [API_GetTrailStatus](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetTrailStatus.html) |
+| CloudTrail | `GetEventSelectors` | `TrailName` | `EventSelectors[].DataResources`, `AdvancedEventSelectors` | [API_GetEventSelectors](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetEventSelectors.html) |
+| CloudTrail | `LookupEvents` (issued against `us-east-1`; configured region only as a capped fallback) | `LookupAttributes=[{AttributeKey=Username, AttributeValue=root}]`, `StartTime`, `EndTime`, `MaxResults=50`, `NextToken` | `Events[].EventName`, `EventTime`, `EventSource`, `Username`, `NextToken` | [API_LookupEvents](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_LookupEvents.html), [API_Event](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_Event.html) |
+| Security Hub | `DescribeHub` | none | `HubArn` | [API_DescribeHub](https://docs.aws.amazon.com/securityhub/1.0/APIReference/API_DescribeHub.html) |
+| Security Hub | `GetEnabledStandards` | none | `StandardsSubscriptions[].StandardsArn`, `StandardsStatus` | [API_GetEnabledStandards](https://docs.aws.amazon.com/securityhub/1.0/APIReference/API_GetEnabledStandards.html) |
+| Config | `DescribeConfigurationRecorders` | none | `ConfigurationRecorders[].name`, `recordingGroup.allSupported` | [API_DescribeConfigurationRecorders](https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeConfigurationRecorders.html) |
+| Config | `DescribeConfigurationRecorderStatus` | none | `ConfigurationRecordersStatus[].name`, `recording` | [API_DescribeConfigurationRecorderStatus](https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeConfigurationRecorderStatus.html) |
+| GuardDuty | `ListDetectors` | none | `DetectorIds` | [API_ListDetectors](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_ListDetectors.html) |
+| GuardDuty | `GetDetector` | `DetectorId` | `Status` | [API_GetDetector](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_GetDetector.html) |
+| Access Analyzer | `ListAnalyzers` | none | `analyzers[].arn`, `status` | [API_ListAnalyzers](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/API_ListAnalyzers.html) |
+| Access Analyzer | `ListFindings` | `analyzerArn`, `maxResults`, `nextToken` | `findings[].id`, `status`, `resource`, `nextToken` | [API_ListFindings](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/API_ListFindings.html) |
+| Organizations | `DescribeOrganization` | none | `Organization.Id` | [API_DescribeOrganization](https://docs.aws.amazon.com/organizations/latest/APIReference/API_DescribeOrganization.html) |
+| Organizations | `ListAccounts` | `NextToken` | `Accounts[].Id`, `NextToken` | [API_ListAccounts](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListAccounts.html) |
+| Organizations | `ListPolicies` | `Filter=SERVICE_CONTROL_POLICY`, `NextToken` | `Policies[].Id`, `Name`, `NextToken` | [API_ListPolicies](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListPolicies.html) |
+| Organizations | `ListTargetsForPolicy` | `PolicyId`, `NextToken` | `Targets[].TargetId`, `Type` | [API_ListTargetsForPolicy](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListTargetsForPolicy.html) |
+| Identity Center | `ListInstances` | none | `Instances[].InstanceArn`, `IdentityStoreId` | [API_ListInstances](https://docs.aws.amazon.com/singlesignon/latest/APIReference/API_ListInstances.html) |
+| Audit Manager | `ListAssessments` | `status=ACTIVE`, `maxResults`, `nextToken` | `assessmentMetadata[].id`, `name`, `status`, `complianceType`, `creationTime`, `lastUpdated`, `nextToken` | [API_ListAssessments](https://docs.aws.amazon.com/audit-manager/latest/APIReference/API_ListAssessments.html), [API_AssessmentMetadataItem](https://docs.aws.amazon.com/audit-manager/latest/APIReference/API_AssessmentMetadataItem.html) |
+| Account | `GetAlternateContact` | `AlternateContactType=SECURITY` | `AlternateContact.Name`, `Title`, `EmailAddress`, `PhoneNumber`; `ResourceNotFoundException` when unset | [API_GetAlternateContact](https://docs.aws.amazon.com/accounts/latest/reference/API_GetAlternateContact.html), [API_AlternateContact](https://docs.aws.amazon.com/accounts/latest/reference/API_AlternateContact.html) |
+| EC2 | `DescribeRegions` | `Filters=[{Name=opt-in-status, Values=[opt-in-not-required, opted-in]}]` | `Regions[].RegionName` | [API_DescribeRegions](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html) |
+| EC2 | `GetEbsEncryptionByDefault` | none (per region) | `EbsEncryptionByDefault`, `SseType` | [API_GetEbsEncryptionByDefault](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_GetEbsEncryptionByDefault.html) |
+| EC2 | `DescribeVpcs` | `MaxResults`, `NextToken` (per region) | `Vpcs[].VpcId`, `IsDefault`, `CidrBlock`, `State`, `NextToken` | [API_DescribeVpcs](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeVpcs.html), [API_Vpc](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_Vpc.html) |
+| EC2 | `DescribeFlowLogs` | `MaxResults`, `NextToken` (per region) | `FlowLogs[].FlowLogId`, `ResourceId`, `FlowLogStatus`, `TrafficType`, `LogDestinationType`, `NextToken` | [API_DescribeFlowLogs](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeFlowLogs.html), [API_FlowLog](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_FlowLog.html) |
+| EC2 | `DescribeNetworkAcls` | `MaxResults`, `NextToken` (per region) | `NetworkAcls[].NetworkAclId`, `VpcId`, `IsDefault`, `Entries[].RuleNumber`, `Protocol`, `RuleAction`, `Egress`, `CidrBlock`, `Ipv6CidrBlock`, `PortRange.From`, `PortRange.To`, `NextToken` | [API_DescribeNetworkAcls](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeNetworkAcls.html), [API_NetworkAcl](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_NetworkAcl.html), [API_NetworkAclEntry](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_NetworkAclEntry.html) |
+| EC2 | `DescribeSecurityGroups` | `MaxResults`, `NextToken` (per region) | `SecurityGroups[].GroupId`, `GroupName`, `VpcId`, `IpPermissions[].IpProtocol`, `FromPort`, `ToPort`, `IpRanges[].CidrIp`, `Ipv6Ranges[].CidrIpv6`, `NextToken` | [API_DescribeSecurityGroups](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeSecurityGroups.html), [API_SecurityGroup](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_SecurityGroup.html), [API_IpPermission](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_IpPermission.html) |
+| S3 Control | `GetPublicAccessBlock` | `AccountId` | `PublicAccessBlockConfiguration.BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`; `NoSuchPublicAccessBlockConfiguration` when unset | [API_control_GetPublicAccessBlock](https://docs.aws.amazon.com/AmazonS3/latest/API/API_control_GetPublicAccessBlock.html) |
+| S3 | `ListBuckets` | `ContinuationToken`, `MaxBuckets` | `Buckets[].Name`, `CreationDate`, `BucketRegion`, `ContinuationToken` | [API_ListBuckets](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html) |
+| S3 | `GetPublicAccessBlock` | `Bucket` | `PublicAccessBlockConfiguration.BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`; `NoSuchPublicAccessBlockConfiguration` when unset | [API_GetPublicAccessBlock](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetPublicAccessBlock.html), [API_PublicAccessBlockConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PublicAccessBlockConfiguration.html) |
+| S3 | `GetBucketPolicyStatus` | `Bucket` | `PolicyStatus.IsPublic`; `NoSuchBucketPolicy` when no policy | [API_GetBucketPolicyStatus](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicyStatus.html) |
+| S3 | `GetBucketEncryption` | `Bucket` | `ServerSideEncryptionConfiguration.Rules[].ApplyServerSideEncryptionByDefault.SSEAlgorithm`, `KMSMasterKeyID`, `BucketKeyEnabled`; `ServerSideEncryptionConfigurationNotFoundError` when unset | [API_GetBucketEncryption](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketEncryption.html), [API_ServerSideEncryptionRule](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ServerSideEncryptionRule.html) |
+| S3 | `GetBucketPolicy` | `Bucket` | `Policy` (plain JSON, not URL-encoded; `Statement[].Effect=Deny`, `Condition.Bool.aws:SecureTransport=false`); `NoSuchBucketPolicy` when no policy | [API_GetBucketPolicy](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicy.html), [aws:SecureTransport](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-securetransport) |
+| RDS | `DescribeDBInstances` | `Marker`, `MaxRecords` (per region) | `DBInstances[].DBInstanceIdentifier`, `Engine`, `StorageEncrypted`, `Marker` | [API_DescribeDBInstances](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DescribeDBInstances.html), [API_DBInstance](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DBInstance.html) |
+| KMS | `ListKeys` | `Marker`, `Limit` (per region) | `Keys[].KeyId`, `KeyArn`, `Truncated`, `NextMarker` | [API_ListKeys](https://docs.aws.amazon.com/kms/latest/APIReference/API_ListKeys.html) |
+| KMS | `DescribeKey` | `KeyId` | `KeyMetadata.KeyManager`, `KeyState`, `KeySpec`, `Origin` | [API_DescribeKey](https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html), [API_KeyMetadata](https://docs.aws.amazon.com/kms/latest/APIReference/API_KeyMetadata.html) |
+| KMS | `GetKeyRotationStatus` | `KeyId` | `KeyRotationEnabled`, `RotationPeriodInDays` | [API_GetKeyRotationStatus](https://docs.aws.amazon.com/kms/latest/APIReference/API_GetKeyRotationStatus.html) |
+
+## Framework mappings
+
+Each finding carries the references below (from the spec's compliance mapping table), and the bundle writes one report per framework under `compliance/frameworks/`.
+
+| Framework | Report file | Example references |
+|---|---|---|
+| FedRAMP (NIST 800-53) | `fedramp.md` | IA-2(1), AC-6(1), AU-2, AU-9, SC-7, SC-12, SC-28 |
+| CMMC 2.0 | `cmmc.md` | AC.L2-3.1.3, IA.L2-3.5.7, AU.L2-3.3.1, SC.L2-3.13.16 |
+| SOC 2 | `soc2.md` | CC6.1, CC6.6, CC6.7, CC7.2 |
+| CIS AWS Foundations | `cis.md` | 1.4, 1.8, 2.1.4, 2.2.1, 3.7, 3.9, 5.1, 5.2 |
+| PCI-DSS 4.0 | `pci-dss.md` | 1.3.1, 3.4.1, 4.1.1, 8.4.2, 10.2.1 |
+| DISA STIG | `disa-stig.md` | SRG-APP-000149, SRG-APP-000231, SRG-APP-000142 |
+| IRAP (ISM) | `irap.md` | ISM-1401, ISM-0580, ISM-0457, ISM-1416 |
+| ISMAP | `ismap.md` | 6.1.1, 7.2.1, 8.1.1, 9.1.1 |
+
+## Live smoke test
+
+```bash
+export AWS_PROFILE="security-audit"      # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+export AWS_REGION="us-east-1"
+export AWS_SMOKE_REGIONS="us-east-1,us-west-2"   # optional: pin the multi-region scope
+npm --prefix cli run test:aws:live
+```
+
+The script prints a skip message and exits 0 when no credential hints are present (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_ROLE_ARN`, web identity or container credential variables, or `~/.aws/credentials` and `~/.aws/config`). Otherwise it runs `aws_check_access` and all five assessments against the real account, prints every surface and finding, reports spec control coverage, and fails if any `manual` finding lacks a summary that says what to collect.
+
+## Limitations and manual controls
+
+- Control 7 checks log-file validation on the trail but not the public-access state of the trail's S3 bucket. Run `aws_assess_data_protection` to see whether account-level Block Public Access covers every bucket, and capture the trail bucket's policy manually.
+- Control 9 checks detector `Status` only; GuardDuty protection plans (S3, EKS, Malware Protection) from `GetDetector.Features` are not yet evaluated.
+- Control 12 does not assess EFS. Control 13 assesses S3 bucket policies only; load balancer and API Gateway TLS policies are not read.
+- Control 18 evaluates customer-managed policies only; inline user, group, and role policies are outside this check (privileged role inline policies are read separately for control 17).
+- Control 23 reports Identity Center instance visibility; permission sets, account assignments, and Identity Center MFA settings are not evaluated.
+- Root sign-in events are global CloudTrail events recorded in `us-east-1`, so `aws_assess_identity` issues the root `LookupEvents` call against `us-east-1` whatever `region` is configured and records the region used in the finding evidence. Grant `cloudtrail:LookupEvents` there; otherwise the finding caps at `warn`. `LookupEvents` keeps 90 days of history.
+- `aws_assess_logging_detection` and `aws_assess_org_guardrails` inspect the configured region only. Security Hub, GuardDuty, and Config are regional; assess each in-scope region separately.
+- Cross-account fan-out through `AssumeRole` (`AWS_ROLE_ARN`, `AWS_EXTERNAL_ID`) is not implemented; run the tools once per account with a profile that assumes the audit role.
+- User, role, policy, bucket, key, instance, VPC, NACL, security group, event, and Access Analyzer finding collection stop at their `*_limit` arguments. When a limit is hit the finding says so, the assessment records it in `errors`, and a would-be `pass` becomes `warn`; raise the limit for very large accounts.
+
+## Official documentation
+
+- [AWS SDK for JavaScript v3 credential providers](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-credentials-node.html) and [standardized credential resolution](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html)
+- [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html)
+- [IAM API Reference](https://docs.aws.amazon.com/IAM/latest/APIReference/Welcome.html) and [STS API Reference](https://docs.aws.amazon.com/STS/latest/APIReference/welcome.html)
+- [CloudTrail API Reference](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/Welcome.html)
+- [Security Hub API Reference](https://docs.aws.amazon.com/securityhub/1.0/APIReference/Welcome.html)
+- [AWS Config API Reference](https://docs.aws.amazon.com/config/latest/APIReference/Welcome.html)
+- [GuardDuty API Reference](https://docs.aws.amazon.com/guardduty/latest/APIReference/Welcome.html)
+- [IAM Access Analyzer API Reference](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/Welcome.html)
+- [Organizations API Reference](https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html)
+- [IAM Identity Center API Reference](https://docs.aws.amazon.com/singlesignon/latest/APIReference/welcome.html)
+- [Audit Manager API Reference](https://docs.aws.amazon.com/audit-manager/latest/APIReference/Welcome.html)
+- [Account Management API Reference](https://docs.aws.amazon.com/accounts/latest/reference/api-reference.html)
+- [EC2 API Reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Welcome.html)
+- [Amazon S3 API Reference](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html) and [Blocking public access to your Amazon S3 storage](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
+- [Amazon RDS API Reference](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/Welcome.html)
+- [AWS KMS API Reference](https://docs.aws.amazon.com/kms/latest/APIReference/Welcome.html) and [Rotating AWS KMS keys](https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html)
