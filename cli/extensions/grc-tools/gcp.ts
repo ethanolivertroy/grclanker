@@ -3441,7 +3441,7 @@ function buildQuickReference(assessments: GcpAssessmentResult[]): string {
     "- `compliance/executive_summary.md`: prioritized readout",
     "- `compliance/unified_compliance_matrix.md`: finding to framework matrix",
     "- `compliance/frameworks/<framework>.md`: one report per framework in the spec mapping table",
-    "- `_errors.log`: present only when some reads failed; every failed read keeps each dependent finding below pass (manual when the primary inventory is unreadable, warn otherwise), names the dataset and endpoint in the summary, and lists it under `evidence.unreadable_inventories`",
+    "- `_errors.log`: present only when some reads failed; every failed read keeps each dependent finding below pass (manual when the primary inventory is unreadable, warn otherwise), names the dataset and endpoint in the summary, lists it under `evidence.unreadable_inventories`, and renders every count or list derived from it as null, never as 0 or []",
     "- `metadata.json`: non-secret run metadata",
     "",
     "## Status Semantics",
