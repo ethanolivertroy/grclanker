@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -15,6 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import {
+  SHOW_ROW_CAP,
   SNOWFLAKE_CONTROLS,
   SNOWFLAKE_FRAMEWORKS,
   SNOWFLAKE_STATEMENTS,
@@ -38,6 +38,7 @@ import {
   resolveSnowflakeConfiguration,
 } from "../dist/extensions/grc-tools/snowflake.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const { privateKey: testPrivateKey, publicKey: testPublicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const TEST_PRIVATE_KEY_PEM = testPrivateKey.export({ type: "pkcs8", format: "pem" });
@@ -1452,6 +1453,154 @@ test("false-pass self-check (c): a role without ACCOUNTADMIN visibility cannot p
   assert.match(findingById(monitoring, "SNOWFLAKE-24").summary, /lacks MANAGE GRANTS/);
 });
 
+const SHOW_CAP_INVENTORIES = [
+  { key: "show_network_policies", statement: "SHOW NETWORK POLICIES", controls: ["SNOWFLAKE-01"], columns: ["created_on", "name", "comment", "entries_in_allowed_ip_list", "entries_in_blocked_ip_list"], row: (index) => ["2025-01-01", index === 0 ? "CORP_POLICY" : `POLICY_${index}`, "", "2", "0"] },
+  { key: "show_integrations", statement: "SHOW INTEGRATIONS", controls: ["SNOWFLAKE-06", "SNOWFLAKE-23"], columns: INTEGRATION_COLUMNS, row: (index) => (index === 0 ? ["OKTA_SAML", "SAML2", "SECURITY", "true", "", "2025-01-01"] : [`STAGE_INT_${index}`, "EXTERNAL_STAGE", "STORAGE", "true", "", "2025-01-01"]) },
+  { key: "show_warehouses", statement: "SHOW WAREHOUSES", controls: ["SNOWFLAKE-24"], columns: WAREHOUSE_COLUMNS, row: (index) => [`WH_${index}`, "SUSPENDED", "STANDARD", "X-Small", "60", "true", "SYSADMIN"] },
+  { key: "show_databases", statement: "SHOW DATABASES", controls: ["SNOWFLAKE-19"], columns: DATABASE_COLUMNS, row: (index) => ["2025-01-01", `DB_${index}`, "STANDARD", "", "SYSADMIN", "7"] },
+  { key: "show_shares", statement: "SHOW SHARES", controls: ["SNOWFLAKE-22"], columns: SHARE_COLUMNS, row: (index) => ["2025-01-01", "INBOUND", "PROVIDER.ACCT", `PROVIDER_SHARE_${index}`, `PROVIDER_DB_${index}`, "", "", "", null, "true"] },
+  { key: "show_replication_groups", statement: "SHOW REPLICATION GROUPS", controls: ["SNOWFLAKE-22"], columns: ["snowflake_region", "created_on", "account_name", "name", "type", "is_primary"], row: (index) => ["AWS_US_WEST_2", "2025-01-01", "MYORG.MYACCOUNT", `RG_${index}`, "REPLICATION", "true"] },
+];
+
+test("rule 10: a SHOW inventory that fills Snowflake's 10,000-row cap is recorded as truncated and its controls never pass", async () => {
+  assert.equal(SHOW_ROW_CAP, 10_000);
+  for (const inventory of SHOW_CAP_INVENTORIES) {
+    const capped = Array.from({ length: SHOW_ROW_CAP }, (_, index) => inventory.row(index));
+    const client = createMockClient((statement) => {
+      if (normalizeStatement(statement) === inventory.statement) return resultSet(statement, inventory.columns, capped);
+      return healthyFixture(statement);
+    }, { role: "ACCOUNTADMIN" });
+    const findings = allFindings(await runAllAssessments(client));
+    for (const id of inventory.controls) {
+      const item = findings.find((candidate) => candidate.id === id);
+      assert.notEqual(item.status, "pass", `${id} passed on a capped ${inventory.key}`);
+      assert.match(item.summary, new RegExp(`Partial inventory: .*${inventory.key} hit the ${SHOW_ROW_CAP}-row limit \\(${SHOW_ROW_CAP} rows seen\\)`), `${id}: ${item.summary}`);
+      assert.match(item.summary, /cannot be pass on a partial result/);
+      assert.match(item.evidence.partial_inventory, new RegExp(inventory.key));
+      assert.ok(item.evidence.statements.some((statement) => statement.key === inventory.key && statement.truncated === true));
+    }
+    const below = Array.from({ length: SHOW_ROW_CAP - 1 }, (_, index) => inventory.row(index));
+    const belowFindings = allFindings(await runAllAssessments(createMockClient((statement) => {
+      if (normalizeStatement(statement) === inventory.statement) return resultSet(statement, inventory.columns, below);
+      return healthyFixture(statement);
+    }, { role: "ACCOUNTADMIN" })));
+    for (const id of inventory.controls) {
+      const item = belowFindings.find((candidate) => candidate.id === id);
+      assert.equal(item.status, "pass", `${id} did not pass one row below the cap: ${item.summary}`);
+    }
+  }
+});
+
+const DENIED_403 = () => new SnowflakeStatementError("Snowflake SQL API request failed (POST /api/v2/statements): HTTP 403 Forbidden", { statusCode: 403 });
+const isSession = (s) => s.startsWith("SELECT CURRENT_ACCOUNT()");
+
+/**
+ * Every finding whose verdict reads two or more collected statements, with
+ * the statement key of each secondary inventory and a matcher for its SQL.
+ */
+const MULTI_INVENTORY_FINDINGS = [
+  { id: "SNOWFLAKE-01", assess: assessSnowflakeNetworkAndAuthentication, secondaries: [
+    { key: "account_network_policy_parameter", matches: (s) => s === "SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT" },
+    { key: "network_policy_references", matches: (s) => s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'NETWORK_POLICY'") },
+  ] },
+  { id: "SNOWFLAKE-04", assess: assessSnowflakeNetworkAndAuthentication, secondaries: [
+    { key: "password_policy_references_1", matches: (s) => s.includes(policyReferencesFunctionCall("GOV", "POLICIES", "STRONG_PW")) },
+  ] },
+  { id: "SNOWFLAKE-25", assess: assessSnowflakeNetworkAndAuthentication, secondaries: [
+    { key: "session_policy_references_1", matches: (s) => s.includes(policyReferencesFunctionCall("GOV", "POLICIES", "SESSION_STRICT")) },
+  ] },
+  { id: "SNOWFLAKE-07", assess: assessSnowflakeAccessControl, secondaries: [
+    { key: "global_privilege_grants", matches: (s) => s.includes("ACCOUNT_USAGE.GRANTS_TO_ROLES") && s.includes("GRANTED_ON = 'ACCOUNT'") },
+  ] },
+  { id: "SNOWFLAKE-11", assess: assessSnowflakeMonitoringAndLifecycle, secondaries: [
+    { key: "failed_logins", matches: (s) => s.includes("ACCOUNT_USAGE.LOGIN_HISTORY") && s.includes("IS_SUCCESS = 'NO'") },
+  ] },
+  { id: "SNOWFLAKE-13", assess: assessSnowflakeMonitoringAndLifecycle, secondaries: [
+    { key: "access_history_probe", matches: (s) => s.includes("ACCOUNT_USAGE.ACCESS_HISTORY"), expect: "warn" },
+  ] },
+  { id: "SNOWFLAKE-24", assess: assessSnowflakeMonitoringAndLifecycle, secondaries: [
+    { key: "session_context", matches: isSession, expect: "warn" },
+  ] },
+  { id: "SNOWFLAKE-14", assess: assessSnowflakeDataProtection, secondaries: [
+    { key: "masking_policy_references", matches: (s) => s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'MASKING_POLICY'") },
+    { key: "tag_references", matches: (s) => s.includes("ACCOUNT_USAGE.TAG_REFERENCES"), expect: "warn" },
+  ] },
+  { id: "SNOWFLAKE-15", assess: assessSnowflakeDataProtection, secondaries: [
+    { key: "row_access_policy_references", matches: (s) => s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'ROW_ACCESS_POLICY'") },
+  ] },
+  { id: "SNOWFLAKE-19", assess: assessSnowflakeDataProtection, secondaries: [
+    { key: "session_context", matches: isSession, expect: "warn" },
+  ] },
+  { id: "SNOWFLAKE-22", assess: assessSnowflakeDataProtection, secondaries: [
+    { key: "show_replication_groups", matches: (s) => s === "SHOW REPLICATION GROUPS", expect: "warn" },
+    { key: "session_context", matches: isSession, expect: "manual" },
+  ] },
+  { id: "SNOWFLAKE-23", assess: assessSnowflakeDataProtection, secondaries: [
+    { key: "session_context", matches: isSession, expect: "warn" },
+  ] },
+];
+
+test("rule 1 corollary: every multi-inventory finding drops below pass and names the inventory when one secondary statement returns 403", async () => {
+  for (const scenario of MULTI_INVENTORY_FINDINGS) {
+    const baseline = findingById(await scenario.assess(createMockClient((statement) => healthyFixture(statement), { role: "ACCOUNTADMIN" })), scenario.id);
+    assert.equal(baseline.status, "pass", `${scenario.id} must pass on the healthy fixture for the demotion to be meaningful`);
+    for (const secondary of scenario.secondaries) {
+      const client = createMockClient((statement) => {
+        if (secondary.matches(normalizeStatement(statement))) throw DENIED_403();
+        return healthyFixture(statement);
+      }, { role: "ACCOUNTADMIN" });
+      const item = findingById(await scenario.assess(client), scenario.id);
+      assert.notEqual(item.status, "pass", `${scenario.id} passed with ${secondary.key} unreadable`);
+      if (secondary.expect) assert.equal(item.status, secondary.expect, `${scenario.id} with ${secondary.key} unreadable: ${item.summary}`);
+      assert.ok(item.summary.includes(secondary.key), `${scenario.id} summary does not name ${secondary.key}: ${item.summary}`);
+      assert.match(item.summary, /denied/i);
+      assert.match(item.summary, /[Cc]ollect manually: /);
+      const recorded = item.evidence.statements.find((statement) => statement.key === secondary.key);
+      assert.equal(recorded?.status, "denied", `${scenario.id} evidence does not record ${secondary.key} as denied`);
+      assert.ok(client.executed.some((statement) => secondary.matches(normalizeStatement(statement))), `${secondary.key} was never queried`);
+    }
+  }
+
+  const tagsDenied = await assessSnowflakeDataProtection(createMockClient((statement) => {
+    if (normalizeStatement(statement).includes("ACCOUNT_USAGE.TAG_REFERENCES")) throw DENIED_403();
+    return healthyFixture(statement);
+  }, { role: "ACCOUNTADMIN" }));
+  const masking = findingById(tagsDenied, "SNOWFLAKE-14");
+  assert.equal(masking.status, "warn");
+  assert.match(masking.summary, /^2 masking policies are assigned through 3 active column or tag references\. Unreadable inventory: tag_references was denied/);
+  assert.match(masking.summary, /classification tag coverage \(TAG_REFERENCES\) was not checked/);
+  assert.deepEqual(masking.evidence.unreadable_inventories, ["tag_references"]);
+  assert.equal(masking.evidence.tag_references_readable, false);
+
+  const replicationDenied = await assessSnowflakeDataProtection(createMockClient((statement) => {
+    if (normalizeStatement(statement) === "SHOW REPLICATION GROUPS") throw DENIED_403();
+    return healthyFixture(statement);
+  }, { role: "ACCOUNTADMIN" }));
+  const shares = findingById(replicationDenied, "SNOWFLAKE-22");
+  assert.equal(shares.status, "warn");
+  assert.match(shares.summary, /SHOW REPLICATION GROUPS\) were not checked/);
+  assert.deepEqual(shares.evidence.unreadable_inventories, ["show_replication_groups"]);
+
+  const sessionDenied = await assessSnowflakeDataProtection(createMockClient((statement) => {
+    if (isSession(normalizeStatement(statement))) throw DENIED_403();
+    return healthyFixture(statement);
+  }, { role: "ACCOUNTADMIN" }));
+  assert.equal(findingById(sessionDenied, "SNOWFLAKE-22").status, "manual");
+  assert.match(findingById(sessionDenied, "SNOWFLAKE-22").summary, /could not be verified as ACCOUNTADMIN/);
+  assert.equal(findingById(sessionDenied, "SNOWFLAKE-19").status, "warn");
+  assert.match(findingById(sessionDenied, "SNOWFLAKE-19").summary, /SHOW DATABASES may be scoped to a role with narrower visibility/);
+  assert.equal(findingById(sessionDenied, "SNOWFLAKE-23").status, "warn");
+
+  const unreadableAndFailing = await assessSnowflakeDataProtection(createMockClient((statement) => {
+    if (normalizeStatement(statement).includes("ACCOUNT_USAGE.TAG_REFERENCES")) throw DENIED_403();
+    if (normalizeStatement(statement).includes("ACCOUNT_USAGE.MASKING_POLICIES")) return resultSet(statement, ["POLICY_COUNT"], [["0"]]);
+    return healthyFixture(statement);
+  }, { role: "ACCOUNTADMIN" }));
+  const failing = findingById(unreadableAndFailing, "SNOWFLAKE-14");
+  assert.equal(failing.status, "fail");
+  assert.match(failing.summary, /Unreadable inventory: tag_references \(denied\)\.$/);
+});
+
 test("edition-gated and out-of-scope controls render as manual with explicit evidence instructions", async () => {
   const result = await assessSnowflakeDataProtection(createMockClient((statement) => healthyFixture(statement)));
   for (const id of ["SNOWFLAKE-20", "SNOWFLAKE-21"]) {
@@ -1469,8 +1618,12 @@ test("edition-gated and out-of-scope controls render as manual with explicit evi
   }));
   const retention = findingById(accessHistoryDenied, "SNOWFLAKE-13");
   assert.equal(retention.status, "warn");
-  assert.match(retention.summary, /ACCESS_HISTORY was not readable \(denied\)/);
+  assert.match(retention.summary, /^Account DATA_RETENTION_TIME_IN_DAYS is 1\. Unreadable inventory: access_history_probe was denied/);
+  assert.match(retention.summary, /ACCESS_HISTORY was not readable/);
   assert.match(retention.summary, /Enterprise Edition/);
+  assert.match(retention.summary, /collect manually: SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS'/);
+  assert.deepEqual(retention.evidence.unreadable_inventories, ["access_history_probe"]);
+  assert.equal(retention.evidence.access_history_readable, false);
 });
 
 test("exportSnowflakeAuditBundle writes core data, analysis, compliance reports, quick reference, and a paired zip", async () => {
@@ -1542,20 +1695,25 @@ test("exportSnowflakeAuditBundle writes core data, analysis, compliance reports,
   const quick = readFileSync(join(result.outputDir, "QUICK_REFERENCE.md"), "utf8");
   assert.match(quick, /not written because every statement completed/);
 
-  const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)]));
-  for (const file of walk(result.outputDir)) {
-    const content = readFileSync(file, "utf8");
-    assert.ok(!content.includes(secretToken), `${file} leaks the bearer token`);
-    assert.ok(!content.includes("BEGIN PRIVATE KEY"), `${file} leaks a private key`);
+  const bundleFiles = readBundleFiles(result.outputDir);
+  assert.equal(bundleFiles.size, result.fileCount);
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, bundleFiles.size);
+  for (const [relativePath, content] of bundleFiles) {
+    assert.equal(zipEntries.get(relativePath.split("\\").join("/")), content, `${relativePath} differs between the directory and the zip`);
   }
+  assertSecretsAbsent(assert, bundleFiles, [secretToken, "BEGIN PRIVATE KEY"], "bundle directory");
+  assertSecretsAbsent(assert, zipEntries, [secretToken, "BEGIN PRIVATE KEY"], "bundle zip");
 });
 
 test("exportSnowflakeAuditBundle records partial collection failures in _errors.log and never overwrites a prior bundle", async () => {
   const base = createTempBase("grclanker-snowflake-export-");
   const config = sampleConfig({ role: "ACCOUNTADMIN" });
+  const echoedBearer = "echoed-bearer-token-value-7890abcdef";
+  const echoedJwt = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJlY2hvZWQtand0In0.c2lnbmF0dXJlLWVjaG9lZC1qd3Q";
   const resolver = (statement) => {
     if (statement === "SHOW SHARES") {
-      throw new SnowflakeStatementError("SQL access control error: Insufficient privileges to operate on account", { statusCode: 422 });
+      throw new SnowflakeStatementError(`SQL access control error: Insufficient privileges to operate on account (request Authorization: Bearer ${echoedBearer}; session ${echoedJwt}; key ${TEST_PRIVATE_KEY_PEM})`, { statusCode: 422 });
     }
     return healthyFixture(statement);
   };
@@ -1565,6 +1723,7 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   const errorLog = readFileSync(join(first.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /\[denied\] show_shares: /);
   assert.match(errorLog, /SHOW SHARES/);
+  assert.match(errorLog, /Bearer \[REDACTED TOKEN\]; session \[REDACTED TOKEN\]; key \[REDACTED PRIVATE KEY\]/);
   const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
   const shares = findings.find((item) => item.id === "SNOWFLAKE-22");
   assert.equal(shares.status, "manual");
@@ -1572,6 +1731,9 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   const metadata = JSON.parse(readFileSync(join(first.outputDir, "metadata.json"), "utf8"));
   assert.ok(metadata.failed_statement_count >= 1);
   assert.match(readFileSync(join(first.outputDir, "QUICK_REFERENCE.md"), "utf8"), /_errors\.log`: statements that were denied/);
+  const echoedSecrets = [echoedBearer, echoedJwt, "BEGIN PRIVATE KEY"];
+  assertSecretsAbsent(assert, readBundleFiles(first.outputDir), echoedSecrets, "partial bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(first.zipPath), echoedSecrets, "partial bundle zip");
 
   const firstMetadata = readFileSync(join(first.outputDir, "metadata.json"), "utf8");
   const second = await exportSnowflakeAuditBundle(createMockClient(resolver, { role: "ACCOUNTADMIN" }), config, base);

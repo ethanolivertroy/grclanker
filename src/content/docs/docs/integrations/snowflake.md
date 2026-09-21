@@ -94,6 +94,10 @@ Every finding carries `id`, `control`, `title`, `severity`, `status`, `summary`,
 
 Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and never counted as active. An empty result only passes when the control's intent makes emptiness compliant and the statement was readable: no direct user grants (10), no `PUBLIC` grants (16), no outbound shares (22), and no enabled API or external access integrations (23), the last two only under `ACCOUNTADMIN` or `SECURITYADMIN`.
 
+Findings that read more than one statement never pass while any of them is unreadable. Required statements (for example `masking_policy_count` plus `masking_policy_references`, or `login_outcomes` plus `failed_logins`) render `manual` when one is denied, fails, or times out. Secondary statements the verdict reads without requiring them (`access_history_probe` for 13, `tag_references` for 14, `show_replication_groups` for 22, and `session_context` for the role-scoped SHOW controls 19, 22, 23, and 24) demote a `pass` to `warn`, or to `manual` for 22 when the active role cannot be verified as `ACCOUNTADMIN`; the summary names the unreadable statement, says what was not checked, and repeats the manual collection step, and `evidence.unreadable_inventories` lists the statement keys.
+
+`SHOW` commands return at most 10,000 rows and no total, so `SHOW NETWORK POLICIES`, `SHOW INTEGRATIONS`, `SHOW WAREHOUSES`, `SHOW DATABASES`, `SHOW SHARES`, and `SHOW REPLICATION GROUPS` are collected with a 10,000-row cap: a result that fills it is recorded as truncated and the dependent findings (1, 6, 19, 22, 23, 24) report `Partial inventory` instead of `pass`.
+
 ## Control coverage
 
 | # | Spec control | Tool | Finding | Status semantics |
@@ -111,7 +115,7 @@ Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and neve
 | 11 | Failed login monitoring | monitoring_and_lifecycle | SNOWFLAKE-11 | fail when a user/IP source exceeds `failed_login_threshold`; manual when `LOGIN_HISTORY` has zero events in the window |
 | 12 | Stale users disabled | monitoring_and_lifecycle | SNOWFLAKE-12 | fail on enabled person users beyond `stale_user_days`; warn when any enabled user has a NULL `LAST_SUCCESS_LOGIN`; manual on zero users |
 | 13 | History and data retention configured | monitoring_and_lifecycle | SNOWFLAKE-13 | fail below `min_retention_days`; warn when `ACCESS_HISTORY` is not readable; manual when the parameter is absent |
-| 14 | Dynamic data masking policies applied | data_protection | SNOWFLAKE-14 | fail on zero masking policies or zero `POLICY_REFERENCES` assignments; warn on non-`ACTIVE` references |
+| 14 | Dynamic data masking policies applied | data_protection | SNOWFLAKE-14 | fail on zero masking policies or zero `POLICY_REFERENCES` assignments; warn on non-`ACTIVE` references or when `TAG_REFERENCES` is not readable (tag-based assignments unchecked) |
 | 15 | Row access policies applied | data_protection | SNOWFLAKE-15 | fail on zero policies or zero assignments |
 | 16 | No PUBLIC grants on sensitive objects | access_control | SNOWFLAKE-16 | pass only when readable and empty; fail on data-object grants; warn on other `PUBLIC` grants |
 | 17 | Storage integration required for stages | data_protection | SNOWFLAKE-17 | pass when both `REQUIRE_STORAGE_INTEGRATION_FOR_STAGE_CREATION` and `_OPERATION` are true; warn when one is; manual when absent |
@@ -119,7 +123,7 @@ Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and neve
 | 19 | Time Travel retention for databases | data_protection | SNOWFLAKE-19 | fail when a customer database has `retention_time` below `min_retention_days`; warn under a custom role; manual on zero databases |
 | 20 | Tri-Secret Secure | data_protection | SNOWFLAKE-20 | always manual: Business Critical feature enabled through Snowflake Support, not exposed in SQL |
 | 21 | Customer-managed keys configured | data_protection | SNOWFLAKE-21 | always manual: `SYSTEM$GET_SNOWFLAKE_PLATFORM_INFO()` returns VPC/VNet IDs only; collect KMS evidence |
-| 22 | Outbound shares reviewed | data_protection | SNOWFLAKE-22 | warn on any `OUTBOUND` share (listing exposure counted, partial inventory noted under non-`ACCOUNTADMIN` roles); pass on zero outbound shares only under `ACCOUNTADMIN`; manual under every other role because `SHOW SHARES` lists only owned shares or returns empty without `IMPORT SHARE` |
+| 22 | Outbound shares reviewed | data_protection | SNOWFLAKE-22 | warn on any `OUTBOUND` share (listing exposure counted, partial inventory noted under non-`ACCOUNTADMIN` roles); pass on zero outbound shares only under a verified `ACCOUNTADMIN` session; warn when `SHOW REPLICATION GROUPS` is not readable; manual under every other role because `SHOW SHARES` lists only owned shares or returns empty without `IMPORT SHARE`, and manual when `session_context` is unreadable so the role cannot be verified |
 | 23 | External functions and API integrations reviewed | data_protection | SNOWFLAKE-23 | warn on enabled `API` or `EXTERNAL_ACCESS` integrations; pass on none only with full visibility |
 | 24 | Warehouse auto-suspend configured | monitoring_and_lifecycle | SNOWFLAKE-24 | fail on `auto_suspend` NULL or 0; warn above `max_auto_suspend_seconds` or under a custom role; manual on zero warehouses |
 | 25 | Session policies configured | network_and_authentication | SNOWFLAKE-25 | discovers policies in `ACCOUNT_USAGE.SESSION_POLICIES`, then runs the `INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => ...)` table function per policy; requires a `REF_ENTITY_DOMAIN = 'ACCOUNT'` row with idle timeouts within `max_session_idle_minutes`; manual when a lookup is denied or a limited role sees no account row |
@@ -145,7 +149,7 @@ The script exits 0 with a skip message when no credentials resolve. With credent
 - `SHOW` commands are role-scoped. Use `ACCOUNTADMIN` or `SECURITYADMIN` for complete inventories; otherwise controls 1, 6, 19, 22, 23, and 24 cap at `warn` or `manual`.
 - Password authentication and browser-based SSO are not supported by the SQL REST API.
 - Replication and failover groups are collected as evidence for control 22 but Standard Edition accounts return an empty inventory; Trust Center findings are not queried in this release.
-- Inventory queries carry a `row_limit` (default 20,000) and a partition cap (50); hitting either marks the statement truncated and downgrades any `pass`.
+- Inventory queries carry a `row_limit` (default 20,000) and a partition cap (50), and `SHOW` commands a fixed 10,000-row cap; hitting any of them marks the statement truncated and downgrades any `pass`.
 
 ## Official documentation
 

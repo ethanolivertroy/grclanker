@@ -920,6 +920,11 @@ const ROLE_USAGE_ROW_LIMIT = 500;
 const FAILED_LOGIN_ROW_LIMIT = 500;
 const TAG_REFERENCE_ROW_LIMIT = 200;
 const MAX_POLICY_REFERENCE_LOOKUPS = 20;
+/**
+ * Snowflake returns at most 10,000 rows from a SHOW command and reports no
+ * total, so a full page is the only signal that the inventory was cut off.
+ */
+export const SHOW_ROW_CAP = 10_000;
 
 function stripStringLiterals(statement: string): string {
   return statement.replace(STRING_LITERAL_PATTERN, "''");
@@ -1154,19 +1159,34 @@ function finding(
 }
 
 /**
- * Wraps a verdict so that failed, denied, or timed-out statements become
- * manual findings and truncated inventories can never pass outright.
+ * A secondary inventory the verdict reads without requiring it: the control
+ * can still be judged when it is unreadable, but never as a pass.
+ */
+interface OptionalStatement {
+  outcome: SnowflakeStatementOutcome;
+  /** What went unchecked because the inventory was unreadable, phrased for the summary. */
+  unchecked: string;
+  /** Verdict replacing pass when the inventory is unreadable; warn unless the inventory is essential. */
+  demoteTo?: "warn" | "manual";
+}
+
+/**
+ * Wraps a verdict so that failed, denied, or timed-out required statements
+ * become manual findings, an unreadable optional inventory demotes a pass to
+ * warn or manual while naming what was not checked, and truncated inventories
+ * can never pass outright.
  */
 function evaluateControl(
   control: number,
   required: SnowflakeStatementOutcome[],
   manualEvidence: string,
   evaluate: () => { status: SnowflakeFindingStatus; summary: string; evidence?: JsonRecord },
-  options: { optional?: SnowflakeStatementOutcome[] } = {},
+  options: { optional?: OptionalStatement[] } = {},
 ): SnowflakeFinding {
+  const optional = options.optional ?? [];
   const problems = required.filter((outcome) => outcome.status !== "ok");
   const statementEvidence = {
-    statements: [...required, ...(options.optional ?? [])].map((outcome) => ({
+    statements: [...required, ...optional.map((entry) => entry.outcome)].map((outcome) => ({
       key: outcome.key,
       status: outcome.status,
       rows: outcome.rows.length,
@@ -1183,15 +1203,33 @@ function evaluateControl(
     );
   }
   const verdict = evaluate();
-  const truncation = truncationNote(required);
-  const evidence = { ...(verdict.evidence ?? {}), ...statementEvidence };
-  if (truncation && verdict.status === "pass") {
-    return finding(control, "warn", `${verdict.summary} Partial inventory: ${truncation}; the verdict cannot be pass on a partial result.`, { ...evidence, partial_inventory: truncation });
+  let status = verdict.status;
+  let summary = verdict.summary;
+  const evidence: JsonRecord = { ...(verdict.evidence ?? {}), ...statementEvidence };
+  const unreadable = optional.filter((entry) => entry.outcome.status !== "ok");
+  if (unreadable.length > 0) {
+    evidence.unreadable_inventories = unreadable.map((entry) => entry.outcome.key);
+    if (status === "pass") {
+      status = unreadable.some((entry) => entry.demoteTo === "manual") ? "manual" : "warn";
+      const notes = unreadable.map((entry) => `${describeOutcomeProblem(entry.outcome)}, so ${entry.unchecked}`).join("; ");
+      summary = `${summary} Unreadable inventory: ${notes}. The verdict cannot be pass while an inventory it reads is unreadable; collect manually: ${manualEvidence}`;
+    } else {
+      summary = `${summary} Unreadable inventory: ${unreadable.map((entry) => `${entry.outcome.key} (${entry.outcome.status})`).join(", ")}.`;
+    }
   }
+  const truncation = truncationNote([...required, ...optional.map((entry) => entry.outcome)]);
   if (truncation) {
-    return finding(control, verdict.status, `${verdict.summary} Partial inventory: ${truncation}.`, { ...evidence, partial_inventory: truncation });
+    evidence.partial_inventory = truncation;
+    if (status === "pass") {
+      return finding(control, "warn", `${summary} Partial inventory: ${truncation}; the verdict cannot be pass on a partial result.`, evidence);
+    }
+    return finding(control, status, `${summary} Partial inventory: ${truncation}.`, evidence);
   }
-  return finding(control, verdict.status, verdict.summary, evidence);
+  return finding(control, status, summary, evidence);
+}
+
+function unverifiedRoleNote(inventory: string): string {
+  return `the active role could not be verified and ${inventory} may be scoped to a role with narrower visibility`;
 }
 
 function partialVisibilityNote(role: string | undefined, subject: string): string {
@@ -1400,14 +1438,14 @@ export async function assessSnowflakeNetworkAndAuthentication(
   const session = await collectSessionContext(client);
   const role = effectiveRole(config, session);
 
-  const showNetworkPolicies = await collectStatement(client, "show_network_policies", SNOWFLAKE_STATEMENTS.showNetworkPolicies);
+  const showNetworkPolicies = await collectStatement(client, "show_network_policies", SNOWFLAKE_STATEMENTS.showNetworkPolicies, SHOW_ROW_CAP);
   const networkParameter = await collectStatement(client, "account_network_policy_parameter", SNOWFLAKE_STATEMENTS.accountNetworkPolicyParameter);
   const networkReferences = await collectStatement(client, "network_policy_references", SNOWFLAKE_STATEMENTS.policyReferences("NETWORK_POLICY", limit), limit);
   const networkPolicies = await collectStatement(client, "network_policies", SNOWFLAKE_STATEMENTS.networkPolicies(limit), limit);
   const users = await collectStatement(client, "users", SNOWFLAKE_STATEMENTS.users(limit), limit);
   const passwordPolicies = await collectStatement(client, "password_policies", SNOWFLAKE_STATEMENTS.passwordPolicies(limit), limit);
   const passwordReferences = await collectPolicyReferencesByName(client, "password_policy_references", passwordPolicies);
-  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations);
+  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations, SHOW_ROW_CAP);
   const sessionPolicies = await collectStatement(client, "session_policies", SNOWFLAKE_STATEMENTS.sessionPolicies(limit), limit);
   const sessionReferences = await collectPolicyReferencesByName(client, "session_policy_references", sessionPolicies);
 
@@ -1811,7 +1849,7 @@ export async function assessSnowflakeMonitoringAndLifecycle(
   const users = await collectStatement(client, "users", SNOWFLAKE_STATEMENTS.users(limit), limit);
   const retention = await collectStatement(client, "data_retention_parameter", SNOWFLAKE_STATEMENTS.dataRetentionParameter);
   const accessHistory = await collectStatement(client, "access_history_probe", SNOWFLAKE_STATEMENTS.accessHistoryProbe);
-  const warehouses = await collectStatement(client, "show_warehouses", SNOWFLAKE_STATEMENTS.showWarehouses);
+  const warehouses = await collectStatement(client, "show_warehouses", SNOWFLAKE_STATEMENTS.showWarehouses, SHOW_ROW_CAP);
 
   const findings: SnowflakeFinding[] = [];
 
@@ -1891,11 +1929,9 @@ export async function assessSnowflakeMonitoringAndLifecycle(
     if (value < minRetentionDays) {
       return { status: "fail", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value}, below the ${minRetentionDays}-day threshold.`, evidence };
     }
-    if (accessHistory.status !== "ok") {
-      return { status: "warn", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value}, but ACCESS_HISTORY was not readable (${accessHistory.status}); object access auditing needs Enterprise Edition and IMPORTED PRIVILEGES.`, evidence };
-    }
-    return { status: "pass", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value} and ACCESS_HISTORY plus QUERY_HISTORY are readable with Snowflake's fixed 365-day retention.`, evidence };
-  }, { optional: [accessHistory] }));
+    const accessHistoryNote = accessHistory.status === "ok" ? " and ACCESS_HISTORY plus QUERY_HISTORY are readable with Snowflake's fixed 365-day retention" : "";
+    return { status: "pass", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value}${accessHistoryNote}.`, evidence };
+  }, { optional: [{ outcome: accessHistory, unchecked: "ACCESS_HISTORY was not readable and object access auditing could not be confirmed (needs Enterprise Edition and IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE)" }] }));
 
   findings.push(evaluateControl(24, [warehouses], `SHOW WAREHOUSES: confirm every warehouse has auto_suspend set to ${maxAutoSuspendSeconds} seconds or less.`, () => {
     const never: string[] = [];
@@ -1921,7 +1957,7 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       return { status: "warn", summary: `${tooLong.length}/${warehouses.rows.length} warehouses auto-suspend after more than ${maxAutoSuspendSeconds} seconds.`, evidence };
     }
     return { status: hasFullVisibility(role) ? "pass" : "warn", summary: `All ${warehouses.rows.length} visible warehouses auto-suspend within ${maxAutoSuspendSeconds} seconds.${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW WAREHOUSES")}`}`, evidence };
-  }));
+  }, { optional: [{ outcome: session.outcome, unchecked: unverifiedRoleNote("SHOW WAREHOUSES") }] }));
 
   return {
     title: "Snowflake monitoring and lifecycle posture",
@@ -1956,10 +1992,10 @@ export async function assessSnowflakeDataProtection(
   const tagReferences = await collectStatement(client, "tag_references", SNOWFLAKE_STATEMENTS.tagReferenceSummary, TAG_REFERENCE_ROW_LIMIT);
   const stageParameters = await collectStatement(client, "stage_parameters", SNOWFLAKE_STATEMENTS.stageParameters);
   const unloadParameters = await collectStatement(client, "unload_parameters", SNOWFLAKE_STATEMENTS.unloadParameters);
-  const databases = await collectStatement(client, "show_databases", SNOWFLAKE_STATEMENTS.showDatabases);
-  const shares = await collectStatement(client, "show_shares", SNOWFLAKE_STATEMENTS.showShares);
-  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations);
-  const replicationGroups = await collectStatement(client, "show_replication_groups", SNOWFLAKE_STATEMENTS.showReplicationGroups);
+  const databases = await collectStatement(client, "show_databases", SNOWFLAKE_STATEMENTS.showDatabases, SHOW_ROW_CAP);
+  const shares = await collectStatement(client, "show_shares", SNOWFLAKE_STATEMENTS.showShares, SHOW_ROW_CAP);
+  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations, SHOW_ROW_CAP);
+  const replicationGroups = await collectStatement(client, "show_replication_groups", SNOWFLAKE_STATEMENTS.showReplicationGroups, SHOW_ROW_CAP);
 
   const findings: SnowflakeFinding[] = [];
   const tagSummary = tagReferences.status === "ok" ? tagReferences.rows.slice(0, 25).map((row) => ({ tag: `${rowValue(row, "TAG_DATABASE")}.${rowValue(row, "TAG_SCHEMA")}.${rowValue(row, "TAG_NAME")}`, references: rowValue(row, "REFERENCE_COUNT") })) : [];
@@ -1979,7 +2015,7 @@ export async function assessSnowflakeDataProtection(
       return { status: "warn", summary: `${maskingReferences.rows.length} masking policy references exist but ${broken} are not ACTIVE (conflicting or mismatched assignments).`, evidence };
     }
     return { status: "pass", summary: `${policies} masking policies are assigned through ${maskingReferences.rows.length} active column or tag references${tagSummary.length > 0 ? ` alongside ${tagSummary.length} classification tags` : ""}.`, evidence };
-  }, { optional: [tagReferences] }));
+  }, { optional: [{ outcome: tagReferences, unchecked: "classification tag coverage (TAG_REFERENCES) was not checked and tag-based masking assignments could not be confirmed" }] }));
 
   findings.push(evaluateControl(15, [rowAccessCount, rowAccessReferences], "Snowsight Data > Governance: confirm row access policies exist and are assigned to sensitive tables (POLICY_REFERENCES WHERE POLICY_KIND = 'ROW_ACCESS_POLICY').", () => {
     const policies = rowNumber(rowAccessCount.rows[0] ?? {}, "POLICY_COUNT") ?? 0;
@@ -2040,7 +2076,7 @@ export async function assessSnowflakeDataProtection(
       return { status: "fail", summary: `${below.length}/${customer.length} customer databases have retention_time below ${minRetentionDays}: ${below.slice(0, 10).join(", ")}.`, evidence };
     }
     return { status: hasFullVisibility(role) ? "pass" : "warn", summary: `All ${customer.length} visible customer databases retain Time Travel for at least ${minRetentionDays} day(s).${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW DATABASES")}`}`, evidence };
-  }));
+  }, { optional: [{ outcome: session.outcome, unchecked: unverifiedRoleNote("SHOW DATABASES") }] }));
 
   findings.push(finding(20, "manual", "Not verifiable through SQL: Tri-Secret Secure is enabled by Snowflake Support for Business Critical (or higher) accounts. Collect the Snowflake Support case or Snowsight Admin > Accounts edition evidence and the composite master key confirmation.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
 
@@ -2063,7 +2099,12 @@ export async function assessSnowflakeDataProtection(
       return { status: "manual", summary: `SHOW SHARES under role ${role ?? "(unknown)"} returned ${shares.rows.length} rows and no OUTBOUND share, but only ${SHARE_INVENTORY_ROLE} lists every outbound share: other roles see only shares they own and roles without IMPORT SHARE receive empty results, so this is indistinguishable from a denied read. Re-run SHOW SHARES as ${SHARE_INVENTORY_ROLE} to confirm the outbound inventory.`, evidence };
     }
     return { status: "pass", summary: `SHOW SHARES was readable under ${SHARE_INVENTORY_ROLE} and lists no OUTBOUND shares (${shares.rows.length} inbound shares seen); for this control an empty outbound inventory is compliant.`, evidence };
-  }, { optional: [replicationGroups] }));
+  }, {
+    optional: [
+      { outcome: replicationGroups, unchecked: "replication groups that copy data to other accounts (SHOW REPLICATION GROUPS) were not checked" },
+      { outcome: session.outcome, unchecked: `the active role could not be verified as ${SHARE_INVENTORY_ROLE}, the only role that lists every outbound share`, demoteTo: "manual" },
+    ],
+  }));
 
   findings.push(evaluateControl(23, [integrations], "SHOW API INTEGRATIONS and SHOW EXTERNAL ACCESS INTEGRATIONS: confirm every enabled integration and external function is approved.", () => {
     const external = integrations.rows.filter((row) => /^(API|EXTERNAL_ACCESS|EXTERNAL ACCESS)$/i.test(rowValue(row, "category") ?? "") || /API|EXTERNAL_ACCESS/i.test(rowValue(row, "type") ?? ""));
@@ -2076,7 +2117,7 @@ export async function assessSnowflakeDataProtection(
       return { status: hasFullVisibility(role) ? "pass" : "warn", summary: `No enabled API or external access integrations were found among ${integrations.rows.length} integrations; for this control an empty inventory is compliant when read with full visibility.${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW INTEGRATIONS")}`}`, evidence };
     }
     return { status: "warn", summary: `${enabled.length} enabled API or external access integrations allow outbound calls: ${enabled.slice(0, 10).map((row) => rowValue(row, "name")).join(", ")}; confirm each is approved.`, evidence };
-  }));
+  }, { optional: [{ outcome: session.outcome, unchecked: unverifiedRoleNote("SHOW INTEGRATIONS") }] }));
 
   return {
     title: "Snowflake data protection posture",
