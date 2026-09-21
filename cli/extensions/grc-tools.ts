@@ -26,6 +26,7 @@ import { registerAzureTools } from "./grc-tools/azure.js";
 import { registerBoxTools } from "./grc-tools/box.js";
 import { registerCloudflareTools } from "./grc-tools/cloudflare.js";
 import { registerCmvpTools } from "./grc-tools/cmvp.js";
+import { registerDatadogTools } from "./grc-tools/datadog.js";
 import { registerDuoTools } from "./grc-tools/duo.js";
 import { registerFedrampTools } from "./grc-tools/fedramp.js";
 import { registerGitHubTools } from "./grc-tools/github.js";
@@ -57,6 +58,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerBoxTools,
   registerCloudflareTools,
   registerCmvpTools,
+  registerDatadogTools,
   registerDuoTools,
   registerFedrampTools,
   registerGcpTools,

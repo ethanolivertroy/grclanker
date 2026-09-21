@@ -34,6 +34,7 @@
     "test:cli": "npm run build && node --test \"tests/*.test.mjs\"",
     "test:agent-sdk:validate": "npm run build && node scripts/agent-sdk-validate-smoke.mjs",
     "test:box:live": "npm run build && node scripts/box-live-smoke.mjs",
+    "test:datadog:live": "npm run build && node scripts/datadog-live-smoke.mjs",
     "test:duo:live": "npm run build && node scripts/duo-live-smoke.mjs",
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
     "test:gws-ops:live": "npm run build && node scripts/gws-ops-live-smoke.mjs",
