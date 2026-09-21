@@ -1210,8 +1210,15 @@ interface ProjectScan<T> {
   apiDisabled: string[];
   unreachable: string[];
   truncated: boolean;
-  /** True when the project inventory itself was unreadable, so no project could be attempted. */
-  blocked: boolean;
+  /** Set when no project could be attempted, naming the upstream project inventory call and why it yielded nothing. */
+  notAttempted?: string;
+}
+
+/** Why a per-project read was never attempted: the project inventory was denied or listed nothing. */
+function scanNotAttempted(context: ProjectContext): string | undefined {
+  if (context.error) return `no project could be enumerated because ${GCP_INVENTORIES.projects.dataset} was unreadable via ${GCP_INVENTORIES.projects.endpoint} (${shortError(context.error)})`;
+  if (context.projectIds.length === 0) return `${GCP_INVENTORIES.projects.dataset} listed no projects in the scope via ${GCP_INVENTORIES.projects.endpoint}`;
+  return undefined;
 }
 
 async function scanProjects<T>(
@@ -1219,7 +1226,7 @@ async function scanProjects<T>(
   inventory: GcpInventory,
   load: (projectId: string) => Promise<T>,
 ): Promise<ProjectScan<T>> {
-  const scan: ProjectScan<T> = { inventory, rows: [], denied: [], apiDisabled: [], unreachable: [], truncated: false, blocked: Boolean(context.error) };
+  const scan: ProjectScan<T> = { inventory, rows: [], denied: [], apiDisabled: [], unreachable: [], truncated: false, notAttempted: scanNotAttempted(context) };
   for (const projectId of context.projectIds) {
     try {
       const data = await load(projectId);
@@ -1242,43 +1249,119 @@ function flattenScan(scan: ProjectScan<GcpListResult>): Array<JsonRecord & { pro
   return scan.rows.flatMap((row) => row.data.items.map((item) => ({ ...item, projectId: row.projectId })));
 }
 
+/** Whether the endpoint answered with an error, or was never called because an upstream inventory yielded nothing. */
+export type UnreadableInventoryStatus = "unreadable" | "not_collected";
+
 /** One dataset the finding depends on that could not be read, with the endpoint a human must query instead. */
 export interface UnreadableInventory {
   dataset: string;
   endpoint: string;
   scope: string;
+  status: UnreadableInventoryStatus;
+  /** The request error for an unreadable dataset; for a dataset that was not collected, the upstream call and its status. */
   error: string;
 }
 
-/** HTTP status text ("403 Forbidden") from a request error, or the start of a non-HTTP error, for summaries. */
+/**
+ * HTTP status text ("403 Forbidden") from the request error itself, optionally behind a
+ * single identifier prefix such as the service account email; a status quoted inside
+ * nested text belongs to another call and is never harvested. Non-HTTP errors keep their start.
+ */
 function shortError(error: string): string {
-  return error.match(/(?:^|: )(\d{3} [A-Za-z][A-Za-z ]*)/)?.[1]?.trim() ?? error.slice(0, 80);
+  return error.match(/^(?:[^\s():]+: )?(\d{3} [A-Za-z][A-Za-z ]*)/)?.[1]?.trim() ?? error.slice(0, 80);
 }
 
 function describeUnreadable(entry: UnreadableInventory): string {
-  return `${entry.dataset} unreadable for ${entry.scope} via ${entry.endpoint} (${shortError(entry.error)})`;
+  switch (entry.status) {
+    case "unreadable":
+      return `${entry.dataset} unreadable for ${entry.scope} via ${entry.endpoint} (${shortError(entry.error)})`;
+    case "not_collected":
+      return `${entry.dataset} not collected for ${entry.scope} (${entry.endpoint} was not called): ${entry.error}`;
+    default: {
+      const exhaustive: never = entry.status;
+      throw new Error(`Unhandled inventory status ${String(exhaustive)}`);
+    }
+  }
+}
+
+function notCollected(inventory: GcpInventory, scope: string, reason: string): UnreadableInventory {
+  return { ...inventory, scope, status: "not_collected", error: reason };
+}
+
+/** Describes every entry, merging datasets whose reads were all skipped for the same upstream reason into one clause. */
+function describeUnreadableAll(entries: UnreadableInventory[]): string {
+  const groups = new Map<string, UnreadableInventory[]>();
+  entries.forEach((entry, index) => {
+    const key = entry.status === "not_collected" ? `${entry.scope}\u0000${entry.error}` : `#${index}`;
+    groups.set(key, [...(groups.get(key) ?? []), entry]);
+  });
+  return [...groups.values()]
+    .map((group) => {
+      const [first] = group;
+      if (group.length === 1) return describeUnreadable(first);
+      const endpoints = [...new Set(group.map((entry) => entry.endpoint))];
+      return `${group.map((entry) => entry.dataset).join(" and ")} not collected for ${first.scope} (${endpoints.join(" and ")} ${endpoints.length > 1 ? "were" : "was"} not called): ${first.error}`;
+    })
+    .join("; ");
 }
 
 function unreadableCollected(inventory: GcpInventory, collected: Collected<unknown>, scope = "the organization scope"): UnreadableInventory[] {
-  return collected.error ? [{ ...inventory, scope, error: collected.error }] : [];
+  return collected.error ? [{ ...inventory, scope, status: "unreadable", error: collected.error }] : [];
 }
 
 function unreadableScans(...scans: ProjectScan<unknown>[]): UnreadableInventory[] {
   return scans.flatMap((scan) => {
+    if (scan.notAttempted) return [notCollected(scan.inventory, "the scope", scan.notAttempted)];
     if (scan.denied.length === 0) return [];
     const attempted = scan.rows.length + scan.denied.length + scan.apiDisabled.length;
     const named = scan.denied.map((entry) => entry.projectId).slice(0, 3);
     return [{
       ...scan.inventory,
       scope: `${scan.denied.length} of ${attempted} projects (${named.join(", ")}${scan.denied.length > named.length ? ", ..." : ""})`,
+      status: "unreadable",
       error: scan.denied[0].error,
     }];
   });
 }
 
-/** False when no project answered the scan because the read was denied or the project inventory upstream was unreadable. */
+/**
+ * False when no project answered the scan: the read was denied everywhere, or no project was
+ * attempted because the project inventory was unreadable or empty. Projects that only reported
+ * the API as disabled still count as answered, since that is a definitive statement about them.
+ */
 function scanReadable(scan: ProjectScan<unknown>): boolean {
-  return !(scan.rows.length === 0 && (scan.denied.length > 0 || scan.blocked));
+  return scan.rows.length > 0 || (scan.denied.length === 0 && scan.apiDisabled.length > 0);
+}
+
+/**
+ * Three-valued OR over collection flags: true when any received list was cut short, null when
+ * any list was never received, false only when every list arrived in full.
+ */
+function anyTruncated(flags: Array<boolean | null>): boolean | null {
+  if (flags.includes(true)) return true;
+  return flags.includes(null) ? null : false;
+}
+
+/** Whether the project inventory was cut short; null when it was never received. */
+function projectsTruncated(context: ProjectContext): boolean | null {
+  return context.error ? null : context.truncated;
+}
+
+function scanTruncation(scan: ProjectScan<unknown>): boolean | null {
+  if (scan.truncated) return true;
+  return scanReadable(scan) ? false : null;
+}
+
+function collectedTruncation(collected: Collected<unknown>): boolean | null {
+  if (collected.truncated) return true;
+  return collected.error ? null : false;
+}
+
+/** Scopes the received lists reported as unreachable; null when a list the finding reads was never received. */
+function unreachableScopesOf(scans: ProjectScan<unknown>[]): string[] | null {
+  const scopes = scans.flatMap((scan) => scan.unreachable);
+  if (scopes.length > 0) return scopes;
+  return scans.every(scanReadable) ? [] : null;
 }
 
 /** A value derived from a scan that no project answered is not a value; render null beside the named status instead. */
@@ -1318,11 +1401,15 @@ interface VerdictInput {
   inventoryError?: UnreadableInventory;
   /** Dependent inventories unreadable in part or in whole; any entry keeps the finding below pass. */
   unreadable?: UnreadableInventory[];
+  /** The count rendered as evidence.seen; defaults to total. Null when total sums a list that was never received. */
+  seen?: number | null;
   deniedProjects?: number;
+  /** Projects the per-project scan could attempt; undefined for findings computed from organization-scoped reads only. */
   scannedProjects?: number;
   apiDisabledProjects?: number;
-  truncated?: boolean;
-  unreachableScopes?: string[];
+  /** Collection status of every list the finding reads: null when one of them was never received. */
+  truncated: boolean | null;
+  unreachableScopes?: string[] | null;
   emptyVerdict: "pass" | "fail" | "manual";
   passSummary: string;
   failSummary: string;
@@ -1353,12 +1440,18 @@ function verdict(input: VerdictInput): GcpFinding {
   const allDenied = (input.deniedProjects ?? 0) > 0 && input.deniedProjects === input.scannedProjects;
   const allDisabled = (input.apiDisabledProjects ?? 0) > 0 && input.apiDisabledProjects === input.scannedProjects;
   const unreadable = [...(input.inventoryError ? [input.inventoryError] : []), ...(input.unreadable ?? [])];
+  /** Per-project scan status is a value only when at least one project was attempted; a scan of nothing reports null. */
+  const perProjectStatus = input.scannedProjects === undefined
+    ? {}
+    : {
+        denied_projects: input.scannedProjects > 0 ? input.deniedProjects ?? 0 : null,
+        unreachable_scopes: input.unreachableScopes === null || input.scannedProjects === 0 ? null : (input.unreachableScopes ?? []).slice(0, 25),
+      };
   const evidence = {
     ...input.evidence,
-    seen: input.total,
-    truncated: input.truncated ?? false,
-    denied_projects: input.deniedProjects ?? 0,
-    unreachable_scopes: (input.unreachableScopes ?? []).slice(0, 25),
+    seen: input.seen === undefined ? input.total : input.seen,
+    truncated: input.truncated,
+    ...perProjectStatus,
     unreadable_inventories: unreadable,
   };
   const base = { id: input.id, title: input.title, severity: input.severity, mappings, controls: input.controls, evidence };
@@ -1476,10 +1569,30 @@ function scanVerdictBase(context: ProjectContext, primary: ProjectScan<unknown>,
     deniedProjects: primary.denied.length,
     scannedProjects: context.projectIds.length,
     apiDisabledProjects: primary.apiDisabled.length,
-    truncated: context.truncated || scans.some((scan) => scan.truncated),
-    unreachableScopes: scans.flatMap((scan) => scan.unreachable),
+    truncated: anyTruncated([projectsTruncated(context), ...scans.map(scanTruncation)]),
+    unreachableScopes: unreachableScopesOf(scans),
     unreadable: unreadableScans(...scans),
   };
+}
+
+/** A marker written in place of a dataset that was denied or never collected, so a snapshot never shows [] for data that was not read. */
+function snapshotMarker(entry: UnreadableInventory): JsonRecord {
+  return { status: entry.status, dataset: entry.dataset, endpoint: entry.endpoint, scope: entry.scope, error: entry.error, data: null };
+}
+
+/** The projected rows of a per-project dataset when any project answered, otherwise the marker naming why nothing was read. */
+function snapshotScan(scan: ProjectScan<unknown>, rows: unknown[]): unknown {
+  return scanReadable(scan) ? rows : snapshotMarker(unreadableScans(scan)[0]);
+}
+
+/** The projected value of an organization-scoped dataset, or the marker naming the failed read. */
+function snapshotCollected(inventory: GcpInventory, collected: Collected<unknown>, value: unknown, scope?: string): unknown {
+  return collected.error ? snapshotMarker(unreadableCollected(inventory, collected, scope)[0]) : value;
+}
+
+/** The sampled project IDs, or the marker for a project inventory that could not be read. */
+function snapshotProjects(context: ProjectContext): unknown {
+  return context.error ? snapshotMarker(context.unreadable[0]) : context.projectIds;
 }
 
 function collectErrors(...groups: Array<Array<{ projectId?: string; error: string } | string | undefined>>): string[] {
@@ -1937,7 +2050,7 @@ export async function assessGcpIdentity(
     inventory: GCP_INVENTORIES.iamPolicies,
     inventoryError: unreadableCollected(GCP_INVENTORIES.iamPolicies, iamPolicies)[0],
     unreadable: context.unreadable,
-    truncated: iamPolicies.truncated || context.truncated,
+    truncated: anyTruncated([projectsTruncated(context), collectedTruncation(iamPolicies)]),
     emptyVerdict: "manual" as const,
     emptySummary: "Cloud Asset Inventory returned no IAM policies for the scope; an org or project always carries at least one binding, so treat this as a denied or empty scope.",
     manualEvidence: "export the IAM policy bindings for the organization, folders, and projects and review privileged roles.",
@@ -1947,19 +2060,27 @@ export async function assessGcpIdentity(
     ? [{
         ...GCP_INVENTORIES.serviceAccountKeys,
         scope: `${keyErrors.length} of ${keyListsAttempted} service accounts (${keyErrorProjects.slice(0, 3).join(", ")}${keyErrorProjects.length > 3 ? ", ..." : ""})`,
+        status: "unreadable",
         error: keyErrors[0].error,
       }]
     : [];
   const keysReadable = keyListsAttempted === 0 || keyErrors.length < keyListsAttempted;
   /** Key lists are values only when the account list they hang off was readable and not every key read failed. */
   const keyList = <T>(value: T): T | null => jointValue([scanReadable(accountScan), keysReadable], value);
+  const keyTruncation: boolean | null = keyInventoryTruncated ? true : keyList(false);
   const accountBase = scanVerdictBase(context, accountScan);
   const keyBase = {
     ...accountBase,
     inventoryError: accountBase.inventoryError ?? (keysReadable ? undefined : keyReadsUnreadable[0]),
-    truncated: context.truncated || keyInventoryTruncated || accountScan.truncated,
+    truncated: anyTruncated([projectsTruncated(context), scanTruncation(accountScan), keyTruncation]),
     unreadable: [...unreadableScans(accountScan), ...(keysReadable ? keyReadsUnreadable : [])],
   };
+  /** Key lists were never requested when no account list arrived, and unreadable when every requested list failed. */
+  const keysUnreadable: UnreadableInventory | undefined = !scanReadable(accountScan)
+    ? notCollected(GCP_INVENTORIES.serviceAccountKeys, "the scope", `no service account could be listed because ${accountScan.notAttempted ?? `${GCP_INVENTORIES.serviceAccounts.dataset} were unreadable via ${GCP_INVENTORIES.serviceAccounts.endpoint} (${shortError(accountScan.denied[0]?.error ?? "")})`}`)
+    : keysReadable
+      ? undefined
+      : keyReadsUnreadable[0];
 
   const findings: GcpFinding[] = [
     verdict({
@@ -2046,7 +2167,7 @@ export async function assessGcpIdentity(
     category: "identity",
     summary: {
       sampled_projects: sampledProjects(context),
-      projects_truncated: context.truncated,
+      projects_truncated: projectsTruncated(context),
       iam_policies: collectedValue(iamPolicies, iamPolicies.data.items.length),
       service_accounts: readableValue(accountScan, serviceAccountCount),
       privileged_bindings: collectedValue(iamPolicies, privilegedBindings.length),
@@ -2060,14 +2181,15 @@ export async function assessGcpIdentity(
     findings,
     errors,
     snapshot: {
-      projects: context.projectIds,
-      iam_policies: iamPolicies.data.items.map(snapshotIamPolicy),
-      service_accounts: accountScan.rows.map((row) => ({
+      projects: snapshotProjects(context),
+      iam_policies: snapshotCollected(GCP_INVENTORIES.iamPolicies, iamPolicies, iamPolicies.data.items.map(snapshotIamPolicy)),
+      service_accounts: snapshotScan(accountScan, accountScan.rows.map((row) => ({
         projectId: row.projectId,
         truncated: row.data.truncated,
         accounts: row.data.items.map((account) => asString(account.email) ?? null),
-      })),
-      user_managed_keys: userManagedKeys,
+      }))),
+      user_managed_keys: keysUnreadable ? snapshotMarker(keysUnreadable) : userManagedKeys,
+      unreadable_inventories: [...context.unreadable, ...unreadableCollected(GCP_INVENTORIES.iamPolicies, iamPolicies), ...unreadableScans(accountScan), ...keyReadsUnreadable],
     },
   };
 }
@@ -2075,12 +2197,21 @@ export async function assessGcpIdentity(
 export async function assessGcpLoggingDetection(
   client: Pick<
     GcpAuditorClient,
-    "listProjectInventory" | "getLoggingSettings" | "listLogSinks" | "listLogBuckets" | "listRecentAdminActivity" | "listRecentDataAccess" | "listSccSources" | "listSccFindings"
+    | "getResolvedConfig"
+    | "listProjectInventory"
+    | "getLoggingSettings"
+    | "listLogSinks"
+    | "listLogBuckets"
+    | "listRecentAdminActivity"
+    | "listRecentDataAccess"
+    | "listSccSources"
+    | "listSccFindings"
   >,
   options: { maxProjects?: number; maxFindings?: number } = {},
 ): Promise<GcpAssessmentResult> {
   const maxProjects = clampNumber(options.maxProjects, DEFAULT_MAX_PROJECTS, 1, 500);
   const maxFindings = clampNumber(options.maxFindings, DEFAULT_MAX_FINDINGS, 1, 5000);
+  const config = client.getResolvedConfig();
   const context = await loadProjectContext(client, maxProjects);
 
   const adminScan = await scanProjects(context, GCP_INVENTORIES.adminActivity, (projectId) => client.listRecentAdminActivity(projectId));
@@ -2088,9 +2219,14 @@ export async function assessGcpLoggingDetection(
   const sinkScan = await scanProjects(context, GCP_INVENTORIES.sinks, (projectId) => client.listLogSinks(projectId));
   const bucketScan = await scanProjects(context, GCP_INVENTORIES.logBuckets, (projectId) => client.listLogBuckets(projectId));
   const settingsScan = await scanProjects(context, GCP_INVENTORIES.loggingSettings, (projectId) => client.getLoggingSettings(projectId));
-  const sccSources = await attempt(() => client.listSccSources(), EMPTY_LIST);
-  const sccFindings = await attempt(() => client.listSccFindings(maxFindings), EMPTY_LIST);
-  const sccFindingCount = sccFindings.error ? null : sccFindings.data.items.length;
+  /** Security Command Center is organization-scoped: without an organization ID neither list is requested. */
+  const sccScoped = Boolean(config.organizationId);
+  const sccSources: Collected<GcpListResult> = sccScoped ? await attempt(() => client.listSccSources(), EMPTY_LIST) : { data: EMPTY_LIST, truncated: false };
+  const sccFindings: Collected<GcpListResult> = sccScoped ? await attempt(() => client.listSccFindings(maxFindings), EMPTY_LIST) : { data: EMPTY_LIST, truncated: false };
+  const sccNotCollected = sccScoped
+    ? []
+    : [GCP_INVENTORIES.sccSources, GCP_INVENTORIES.sccFindings].map((inventory) => notCollected(inventory, "this run", "Security Command Center is organization-scoped and no organization ID was configured"));
+  const sccFindingCount = sccFindings.error || !sccScoped ? null : sccFindings.data.items.length;
   const sccUnreadable = [...unreadableCollected(GCP_INVENTORIES.sccFindings, sccFindings), ...context.unreadable];
   const sccPartialNotes = [
     ...sccUnreadable.map(describeUnreadable),
@@ -2192,7 +2328,23 @@ export async function assessGcpLoggingDetection(
       emptySummary: "No configurable log buckets were listed; every project exposes a _Default bucket, so an empty list indicates a denied read.",
       manualEvidence: "read retentionDays on each project's _Default and custom log buckets.",
     }),
-    sccSources.error
+    !sccScoped
+      ? manualFinding(
+          "GCP-LOG-05",
+          "Security Command Center visibility",
+          "info",
+          [5],
+          `${describeUnreadableAll(sccNotCollected)}. This finding is visibility only and does not score a control.`,
+          "confirm Security Command Center tier and export findings from the console.",
+          {
+            scc_sources: null,
+            sources_truncated: null,
+            scc_findings: null,
+            findings_truncated: null,
+            unreadable_inventories: [...sccNotCollected, ...context.unreadable],
+          },
+        )
+      : sccSources.error
       ? manualFinding(
           "GCP-LOG-05",
           "Security Command Center visibility",
@@ -2200,7 +2352,13 @@ export async function assessGcpLoggingDetection(
           [5],
           `${GCP_INVENTORIES.sccSources.dataset} were not readable via ${GCP_INVENTORIES.sccSources.endpoint} (${sccSources.error}). This finding is visibility only and does not score a control.`,
           "confirm Security Command Center tier and export findings from the console.",
-          { scc_sources: null, scc_findings: sccFindingCount, unreadable_inventories: [...unreadableCollected(GCP_INVENTORIES.sccSources, sccSources), ...sccUnreadable] },
+          {
+            scc_sources: null,
+            sources_truncated: null,
+            scc_findings: sccFindingCount,
+            findings_truncated: collectedTruncation(sccFindings),
+            unreadable_inventories: [...unreadableCollected(GCP_INVENTORIES.sccSources, sccSources), ...sccUnreadable],
+          },
         )
       : {
           id: "GCP-LOG-05",
@@ -2212,9 +2370,9 @@ export async function assessGcpLoggingDetection(
             : `Security Command Center returned no sources for the scope; verify the tier or organization scope. Visibility only.${sccPartialNote}`,
           evidence: {
             scc_sources: sccSources.data.items.length,
-            sources_truncated: sccSources.truncated,
+            sources_truncated: collectedTruncation(sccSources),
             scc_findings: sccFindingCount,
-            findings_truncated: sccFindings.truncated,
+            findings_truncated: collectedTruncation(sccFindings),
             unreadable_inventories: sccUnreadable,
           },
           mappings: controlMappings(5),
@@ -2235,25 +2393,34 @@ export async function assessGcpLoggingDetection(
     category: "logging-detection",
     summary: {
       sampled_projects: sampledProjects(context),
-      projects_truncated: context.truncated,
+      projects_truncated: projectsTruncated(context),
       projects_with_admin_activity: readableValue(adminScan, adminScan.rows.length - projectsWithoutAdmin.length),
       projects_with_data_access: readableValue(dataAccessScan, dataAccessScan.rows.length - projectsWithoutDataAccess.length),
       projects_with_log_sinks: readableValue(sinkScan, sinkScan.rows.length - projectsWithoutSinks.length),
       disabled_log_sinks: readableValue(sinkScan, disabledSinks.length),
       configurable_log_buckets: readableValue(bucketScan, bucketCount),
       short_retention_buckets: readableValue(bucketScan, shortRetention.length),
-      scc_sources: collectedValue(sccSources, sccSources.data.items.length),
+      scc_sources: sccScoped ? collectedValue(sccSources, sccSources.data.items.length) : null,
       scc_findings: sccFindingCount,
       collection_errors: errors.length,
     },
     findings,
     errors,
     snapshot: {
-      projects: context.projectIds,
-      logging_settings: settingsScan.rows.map(snapshotLoggingSettings),
-      sinks: sinkScan.rows.map(snapshotLogSinks),
-      log_buckets: bucketScan.rows.map(snapshotLogBuckets),
-      scc_sources: sccSources.data.items.map(snapshotSccSource),
+      projects: snapshotProjects(context),
+      logging_settings: snapshotScan(settingsScan, settingsScan.rows.map(snapshotLoggingSettings)),
+      sinks: snapshotScan(sinkScan, sinkScan.rows.map(snapshotLogSinks)),
+      log_buckets: snapshotScan(bucketScan, bucketScan.rows.map(snapshotLogBuckets)),
+      scc_sources: sccScoped
+        ? snapshotCollected(GCP_INVENTORIES.sccSources, sccSources, sccSources.data.items.map(snapshotSccSource))
+        : snapshotMarker(sccNotCollected[0]),
+      unreadable_inventories: [
+        ...context.unreadable,
+        ...unreadableScans(settingsScan, sinkScan, bucketScan),
+        ...unreadableCollected(GCP_INVENTORIES.sccSources, sccSources),
+        ...unreadableCollected(GCP_INVENTORIES.sccFindings, sccFindings),
+        ...sccNotCollected,
+      ],
     },
   };
 }
@@ -2317,6 +2484,12 @@ interface OrgPolicyRead {
   unreadable: UnreadableInventory[];
 }
 
+/** The projected effective policy, or the marker naming why the read failed or was not attempted. */
+function snapshotPolicyRead(read: OrgPolicyRead): JsonRecord | null {
+  const entry = read.unreadable[0];
+  return entry ? snapshotMarker(entry) : snapshotOrgPolicy(read.policy.data);
+}
+
 function orgPolicyFinding(
   id: string,
   title: string,
@@ -2330,15 +2503,14 @@ function orgPolicyFinding(
   view: OrgPolicyView,
 ): GcpFinding {
   if (read.policy.error) {
-    return manualFinding(
-      id,
-      title,
-      severity,
-      controls,
-      `${read.unreadable[0] ? describeUnreadable(read.unreadable[0]) : `the effective org policy ${read.constraint} was not readable`}: ${read.policy.error}.`,
-      manualEvidence,
-      { policy: null, unreadable_inventories: [...read.unreadable, ...view.unreadable] },
-    );
+    const entry = read.unreadable[0];
+    /** A not-collected entry already carries the upstream call and its status; only a real request error adds its body. */
+    const reason = entry === undefined
+      ? `the effective org policy ${read.constraint} was not readable: ${read.policy.error}.`
+      : entry.status === "not_collected"
+        ? `${describeUnreadable(entry)}.`
+        : `${describeUnreadable(entry)}: ${read.policy.error}.`;
+    return manualFinding(id, title, severity, controls, reason, manualEvidence, { policy: null, unreadable_inventories: [...read.unreadable, ...view.unreadable] });
   }
   const enabled = interpretOrgPolicyEnabled(read.policy.data);
   return {
@@ -2367,16 +2539,15 @@ export async function assessGcpOrgGuardrails(
   const context = await loadProjectContext(client, maxProjects);
   const targetProjectId = context.projectIds[0] ?? config.projectId;
 
+  /** Without a project the effective policy cannot be computed, so the read is not attempted and names the upstream inventory instead. */
+  const policyNotAttempted = `${scanNotAttempted(context) ?? `${GCP_INVENTORIES.projects.dataset} listed no projects in the scope via ${GCP_INVENTORIES.projects.endpoint}`}, so no project was available to compute the effective policy`;
   const readPolicy = async (constraint: string): Promise<OrgPolicyRead> => {
     const inventory = orgPolicyInventory(constraint);
-    const policy: Collected<JsonRecord | null> = targetProjectId
-      ? await attempt(() => client.getEffectiveOrgPolicy(targetProjectId, constraint), null as JsonRecord | null)
-      : {
-          data: null,
-          error: `no project available to compute the effective policy${context.error ? ` (${GCP_INVENTORIES.projects.dataset} unreadable via ${GCP_INVENTORIES.projects.endpoint}: ${context.error})` : ""}`,
-          truncated: false,
-        };
-    return { constraint, policy, unreadable: unreadableCollected(inventory, policy, targetProjectId ? `the sampled project ${targetProjectId}` : "the scope") };
+    if (!targetProjectId) {
+      return { constraint, policy: { data: null, error: policyNotAttempted, truncated: false }, unreadable: [notCollected(inventory, "the scope", policyNotAttempted)] };
+    }
+    const policy = await attempt(() => client.getEffectiveOrgPolicy(targetProjectId, constraint), null as JsonRecord | null);
+    return { constraint, policy, unreadable: unreadableCollected(inventory, policy, `the sampled project ${targetProjectId}`) };
   };
 
   const [domainPolicy, keyCreationPolicy, keyUploadPolicy, serialPortPolicy, shieldedVmPolicy, osLoginPolicy] = await Promise.all([
@@ -2452,8 +2623,17 @@ export async function assessGcpOrgGuardrails(
   const scanBase = (scan: ProjectScan<unknown>, ...dependent: ProjectScan<unknown>[]) => scanVerdictBase(context, scan, ...dependent);
   const osLoginBase = scanBase(computeProjectScan, instanceScan);
 
+  const organizationNotCollected = notCollected(GCP_INVENTORIES.organization, "this run", "no organization ID was configured");
   const organizationFinding: GcpFinding = !config.organizationId
-    ? manualFinding("GCP-ORG-01", "Organization visibility", "medium", [6], "no organization ID was configured, so organization-level guardrails are outside this run's scope.", "run with GCP_ORGANIZATION_ID set or review organization metadata in the console.", { sampled_projects: sampledProjects(context) })
+    ? manualFinding(
+        "GCP-ORG-01",
+        "Organization visibility",
+        "medium",
+        [6],
+        "no organization ID was configured, so organization-level guardrails are outside this run's scope and the organization was not collected.",
+        "run with GCP_ORGANIZATION_ID set or review organization metadata in the console.",
+        { sampled_projects: sampledProjects(context), projects_truncated: projectsTruncated(context), target_project: targetProjectId ?? null, unreadable_inventories: [organizationNotCollected, ...context.unreadable] },
+      )
     : organization.error
       ? manualFinding("GCP-ORG-01", "Organization visibility", "medium", [6], `${GCP_INVENTORIES.organization.dataset} was not readable via ${GCP_INVENTORIES.organization.endpoint} (${organization.error}).`, "confirm resourcemanager.organizations.get on the audit principal.", { sampled_projects: sampledProjects(context), unreadable_inventories: [...unreadableCollected(GCP_INVENTORIES.organization, organization), ...context.unreadable] })
       : {
@@ -2470,13 +2650,15 @@ export async function assessGcpOrgGuardrails(
             : !asString(organization.data?.name)
               ? `Organization ${config.organizationId} answered without the documented name field; confirm the organization resource manually.`
               : `Organization ${asString(organization.data?.displayName) ?? config.organizationId} was readable and ${context.projectIds.length} projects were sampled${context.truncated ? " (project inventory truncated by the project cap)" : context.projectIds.length === 0 ? " (no projects inventoried)" : ""}.`,
-          evidence: { sampled_projects: sampledProjects(context), projects_truncated: context.truncated, target_project: targetProjectId ?? null, unreadable_inventories: context.unreadable },
+          evidence: { sampled_projects: sampledProjects(context), projects_truncated: projectsTruncated(context), target_project: targetProjectId ?? null, unreadable_inventories: context.unreadable },
           mappings: controlMappings(6),
           controls: [6],
         };
 
   const computeGuardrailsEnforced = interpretOrgPolicyEnabled(serialPortPolicy.policy.data) && interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data);
   const computeGuardrailsUnreadable = [...serialPortPolicy.unreadable, ...shieldedVmPolicy.unreadable];
+  /** A not-collected entry already carries the upstream call and its status; only a real request error adds its body. */
+  const computeGuardrailsReason = `${describeUnreadableAll(computeGuardrailsUnreadable)}${computeGuardrailsUnreadable[0]?.status === "unreadable" ? `: ${computeGuardrailsUnreadable[0].error}` : ""}.`;
 
   const findings: GcpFinding[] = [
     organizationFinding,
@@ -2498,7 +2680,7 @@ export async function assessGcpOrgGuardrails(
           "Serial port and Shielded VM guardrails",
           "medium",
           [12, 23],
-          `${computeGuardrailsUnreadable.map(describeUnreadable).join("; ")}: ${computeGuardrailsUnreadable[0].error}.`,
+          computeGuardrailsReason,
           "review constraints/compute.disableSerialPortAccess and constraints/compute.requireShieldedVm.",
           { serial_port_policy: serialPortPolicy.policy.error ? null : snapshotOrgPolicy(serialPortPolicy.policy.data), shielded_vm_policy: shieldedVmPolicy.policy.error ? null : snapshotOrgPolicy(shieldedVmPolicy.policy.data), unreadable_inventories: [...computeGuardrailsUnreadable, ...policyView.unreadable] },
         )
@@ -2593,8 +2775,8 @@ export async function assessGcpOrgGuardrails(
     category: "org-guardrails",
     summary: {
       sampled_projects: sampledProjects(context),
-      projects_truncated: context.truncated,
-      organization_visible: collectedValue(organization, Boolean(organization.data)),
+      projects_truncated: projectsTruncated(context),
+      organization_visible: config.organizationId ? collectedValue(organization, Boolean(organization.data)) : null,
       target_project: targetProjectId ?? null,
       domain_restricted_sharing: policyEnforced(domainPolicy),
       service_account_key_creation_disabled: policyEnforced(keyCreationPolicy),
@@ -2610,19 +2792,27 @@ export async function assessGcpOrgGuardrails(
     findings,
     errors,
     snapshot: {
-      organization: snapshotOrganization(organization.data),
-      projects: context.projectIds,
+      organization: config.organizationId
+        ? snapshotCollected(GCP_INVENTORIES.organization, organization, snapshotOrganization(organization.data))
+        : snapshotMarker(organizationNotCollected),
+      projects: snapshotProjects(context),
       effective_policies: {
-        allowedPolicyMemberDomains: snapshotOrgPolicy(domainPolicy.policy.data),
-        disableServiceAccountKeyCreation: snapshotOrgPolicy(keyCreationPolicy.policy.data),
-        disableServiceAccountKeyUpload: snapshotOrgPolicy(keyUploadPolicy.policy.data),
-        disableSerialPortAccess: snapshotOrgPolicy(serialPortPolicy.policy.data),
-        requireShieldedVm: snapshotOrgPolicy(shieldedVmPolicy.policy.data),
-        requireOsLogin: snapshotOrgPolicy(osLoginPolicy.policy.data),
+        allowedPolicyMemberDomains: snapshotPolicyRead(domainPolicy),
+        disableServiceAccountKeyCreation: snapshotPolicyRead(keyCreationPolicy),
+        disableServiceAccountKeyUpload: snapshotPolicyRead(keyUploadPolicy),
+        disableSerialPortAccess: snapshotPolicyRead(serialPortPolicy),
+        requireShieldedVm: snapshotPolicyRead(shieldedVmPolicy),
+        requireOsLogin: snapshotPolicyRead(osLoginPolicy),
       },
-      compute_projects: computeProjectScan.rows.map(snapshotComputeProject),
-      instances: instances.map(snapshotGuardrailInstance),
-      binary_authorization: binaryAuthScan.rows.map(snapshotBinaryAuthorization),
+      compute_projects: snapshotScan(computeProjectScan, computeProjectScan.rows.map(snapshotComputeProject)),
+      instances: snapshotScan(instanceScan, instances.map(snapshotGuardrailInstance)),
+      binary_authorization: snapshotScan(binaryAuthScan, binaryAuthScan.rows.map(snapshotBinaryAuthorization)),
+      unreadable_inventories: [
+        ...(config.organizationId ? unreadableCollected(GCP_INVENTORIES.organization, organization) : [organizationNotCollected]),
+        ...context.unreadable,
+        ...policyReads.flatMap((read) => read.unreadable),
+        ...unreadableScans(computeProjectScan, instanceScan, binaryAuthScan),
+      ],
     },
   };
 }
@@ -2673,11 +2863,13 @@ export async function assessGcpDataProtection(
   const perimeterErrors: string[] = [];
   const perimetersUnreadable: UnreadableInventory[] = [];
   let perimetersTruncated = false;
+  let perimetersReceived = 0;
   for (const policy of accessPolicies.data.items) {
     const name = asString(policy.name);
     if (!name) continue;
     const perimeterList = await attempt(() => client.listServicePerimeters(name), EMPTY_LIST);
     if (perimeterList.error) perimeterErrors.push(perimeterList.error);
+    else perimetersReceived += 1;
     perimetersUnreadable.push(...unreadableCollected(GCP_INVENTORIES.servicePerimeters, perimeterList, `access policy ${name}`));
     if (perimeterList.truncated) perimetersTruncated = true;
     perimeters.push(...perimeterList.data.items);
@@ -2753,7 +2945,17 @@ export async function assessGcpDataProtection(
 
   const scanBase = (scan: ProjectScan<unknown>, ...dependent: ProjectScan<unknown>[]) => scanVerdictBase(context, scan, ...dependent);
   const publicBindingsUnreadable = unreadableCollected(GCP_INVENTORIES.publicBindings, publicBindings);
-  const perimetersReadable = !accessPolicies.error && perimetersUnreadable.length === 0;
+  /** Perimeter data is a value only when the organization-scoped lists were requested and every one arrived. */
+  const perimetersReadable = Boolean(config.organizationId) && !accessPolicies.error && perimetersUnreadable.length === 0;
+  const perimeterTruncation: boolean | null = perimetersTruncated ? true : perimetersUnreadable.length > 0 ? null : false;
+  /** Perimeters hang off the access policy list: never requested without one, unreadable when every list failed. */
+  const perimetersMarker: UnreadableInventory | undefined = !config.organizationId
+    ? notCollected(GCP_INVENTORIES.servicePerimeters, "this run", "VPC Service Controls perimeters are organization-scoped and no organization ID was configured")
+    : accessPolicies.error
+      ? notCollected(GCP_INVENTORIES.servicePerimeters, "the organization scope", `no access policy could be listed because ${GCP_INVENTORIES.accessPolicies.dataset} were unreadable via ${GCP_INVENTORIES.accessPolicies.endpoint} (${shortError(accessPolicies.error)})`)
+      : perimetersReadable
+        ? undefined
+        : perimetersUnreadable[0];
   const cmekBucketClause = scanReadable(bucketScan) ? `all ${buckets.length} buckets set encryption.defaultKmsKeyName` : `${GCP_INVENTORIES.buckets.dataset} were unreadable`;
   const cmekDiskClause = scanReadable(diskScan) ? `all ${disks.length} disks set diskEncryptionKey.kmsKeyName` : `${GCP_INVENTORIES.disks.dataset} were unreadable`;
   const cmekFailClauses = [
@@ -2784,7 +2986,8 @@ export async function assessGcpDataProtection(
     verdict({
       ...scanBase(bucketScan),
       inventoryError: publicBindingsUnreadable[0] ?? context.unreadable[0],
-      truncated: publicBindings.truncated || context.truncated || bucketScan.truncated,
+      truncated: anyTruncated([projectsTruncated(context), scanTruncation(bucketScan), collectedTruncation(publicBindings)]),
+      seen: jointValue([scanReadable(bucketScan), !publicBindings.error], buckets.length + publicBindings.data.items.length),
       id: "GCP-DATA-02",
       title: "Public resource exposure",
       severity: "critical",
@@ -2819,7 +3022,7 @@ export async function assessGcpDataProtection(
       inventory: GCP_INVENTORIES.cryptoKeys,
       inventoryError: unreadableCollected(GCP_INVENTORIES.cryptoKeys, cryptoKeys)[0],
       unreadable: context.unreadable,
-      truncated: cryptoKeys.truncated || context.truncated,
+      truncated: anyTruncated([projectsTruncated(context), collectedTruncation(cryptoKeys)]),
       emptyVerdict: "manual",
       passSummary: `All ${rotatingKeys.length} ENCRYPT_DECRYPT keys rotate automatically within ${MAX_KMS_ROTATION_DAYS} days and have a future nextRotationTime.`,
       failSummary: `${rotationViolations.length} of ${rotatingKeys.length} ENCRYPT_DECRYPT keys lack automatic rotation within ${MAX_KMS_ROTATION_DAYS} days.`,
@@ -2839,6 +3042,7 @@ export async function assessGcpDataProtection(
         disks_read: readableValue(diskScan, disks.length),
       },
       total: buckets.length + disks.length,
+      seen: jointValue([scanReadable(bucketScan), scanReadable(diskScan)], buckets.length + disks.length),
       violations: bucketsWithoutCmek.length + disksWithoutCmek.length,
       violationStatus: "warn",
       emptyVerdict: "manual",
@@ -2882,7 +3086,23 @@ export async function assessGcpDataProtection(
       manualEvidence: "list API keys per project and review restrictions.",
     }),
     !config.organizationId
-      ? manualFinding("GCP-DATA-07", "VPC Service Controls perimeters", "medium", [21], "VPC Service Controls perimeters are organization-scoped and no organization ID was configured.", "review Access Context Manager perimeters at the organization.")
+      ? manualFinding(
+          "GCP-DATA-07",
+          "VPC Service Controls perimeters",
+          "medium",
+          [21],
+          "VPC Service Controls perimeters are organization-scoped and no organization ID was configured, so access policies and perimeters were not collected.",
+          "review Access Context Manager perimeters at the organization.",
+          {
+            enforced_perimeters: null,
+            dry_run_only_perimeters: null,
+            access_policies: null,
+            unreadable_inventories: [
+              notCollected(GCP_INVENTORIES.accessPolicies, "this run", "VPC Service Controls perimeters are organization-scoped and no organization ID was configured"),
+              ...(perimetersMarker ? [perimetersMarker] : []),
+            ],
+          },
+        )
       : verdict({
           id: "GCP-DATA-07",
           title: "VPC Service Controls perimeters",
@@ -2900,7 +3120,7 @@ export async function assessGcpDataProtection(
           inventory: GCP_INVENTORIES.accessPolicies,
           inventoryError: unreadableCollected(GCP_INVENTORIES.accessPolicies, accessPolicies)[0] ?? perimetersUnreadable[0],
           unreadable: context.unreadable,
-          truncated: context.truncated || accessPolicies.truncated || perimetersTruncated,
+          truncated: anyTruncated([projectsTruncated(context), collectedTruncation(accessPolicies), perimeterTruncation]),
           emptyVerdict: "fail",
           passSummary: `${enforcedPerimeters.length} enforced service perimeters protect resources with restricted services.`,
           failSummary: `${perimeters.length} perimeters exist but none is enforced with both resources and restricted services.`,
@@ -2921,7 +3141,7 @@ export async function assessGcpDataProtection(
     category: "data-protection",
     summary: {
       sampled_projects: sampledProjects(context),
-      projects_truncated: context.truncated,
+      projects_truncated: projectsTruncated(context),
       buckets: readableValue(bucketScan, buckets.length),
       non_uniform_buckets: readableValue(bucketScan, nonUniformBuckets.length),
       public_bindings: collectedValue(publicBindings, publicResources.length),
@@ -2939,14 +3159,22 @@ export async function assessGcpDataProtection(
     findings,
     errors,
     snapshot: {
-      projects: context.projectIds,
-      buckets: buckets.map(snapshotStorageBucket),
-      public_bindings: publicBindings.data.items.map(snapshotIamPolicy),
-      crypto_keys: cryptoKeys.data.items.map(snapshotCryptoKey),
-      disks: disks.map(snapshotDisk),
-      managed_zones: zones.map(snapshotManagedZone),
-      api_keys: apiKeys.map(snapshotApiKey),
-      service_perimeters: perimeters.map(snapshotServicePerimeter),
+      projects: snapshotProjects(context),
+      buckets: snapshotScan(bucketScan, buckets.map(snapshotStorageBucket)),
+      public_bindings: snapshotCollected(GCP_INVENTORIES.publicBindings, publicBindings, publicBindings.data.items.map(snapshotIamPolicy)),
+      crypto_keys: snapshotCollected(GCP_INVENTORIES.cryptoKeys, cryptoKeys, cryptoKeys.data.items.map(snapshotCryptoKey)),
+      disks: snapshotScan(diskScan, disks.map(snapshotDisk)),
+      managed_zones: snapshotScan(zoneScan, zones.map(snapshotManagedZone)),
+      api_keys: snapshotScan(apiKeyScan, apiKeys.map(snapshotApiKey)),
+      service_perimeters: perimetersMarker && perimetersReceived === 0 ? snapshotMarker(perimetersMarker) : perimeters.map(snapshotServicePerimeter),
+      unreadable_inventories: [
+        ...context.unreadable,
+        ...unreadableScans(bucketScan, diskScan, zoneScan, apiKeyScan),
+        ...publicBindingsUnreadable,
+        ...unreadableCollected(GCP_INVENTORIES.cryptoKeys, cryptoKeys),
+        ...(config.organizationId ? unreadableCollected(GCP_INVENTORIES.accessPolicies, accessPolicies) : []),
+        ...(perimetersMarker ? [perimetersMarker] : []),
+      ],
     },
   };
 }
@@ -3149,6 +3377,11 @@ export async function assessGcpNetworkSecurity(
   const externalIpFailClause = scanReadable(instanceScan)
     ? `${publicInstances.length} of ${instances.length} instances carry external IPv4 or IPv6 access configs`
     : `external IP usage could not be checked because ${GCP_INVENTORIES.instances.dataset} were unreadable`;
+  /** The weak set is complete only when attached policies could be resolved; without the policy list it is a lower bound, not a value. */
+  const weakSetReadable = [scanReadable(proxyScan), scanReadable(sslPolicyScan)];
+  const sslFailSummary = scanReadable(sslPolicyScan)
+    ? `${weakProxies.length} of ${proxies.length} HTTPS target proxies allow TLS below 1.2 or the COMPATIBLE profile (including proxies without an SSL policy).`
+    : `${weakProxies.length} of ${proxies.length} HTTPS target proxies attach no SSL policy (the default policy allows TLS 1.0); attached policies could not be evaluated because ${GCP_INVENTORIES.sslPolicies.dataset} were unreadable.`;
 
   const findings: GcpFinding[] = [
     verdict({
@@ -3212,6 +3445,7 @@ export async function assessGcpNetworkSecurity(
         instances_read: readableValue(instanceScan, instances.length),
       },
       total: subnets.length + instances.length,
+      seen: jointValue([scanReadable(subnetScan), scanReadable(instanceScan)], subnets.length + instances.length),
       violations: subnetsWithoutNat.length + publicInstances.length,
       violationStatus: "warn",
       unknown: subnetsWithUnknownNat.length,
@@ -3229,7 +3463,7 @@ export async function assessGcpNetworkSecurity(
       severity: "high",
       controls: [18],
       evidence: {
-        weak_proxies: readableValue(proxyScan, weakProxies.slice(0, 25)),
+        weak_proxies: jointValue(weakSetReadable, weakProxies.slice(0, 25)),
         unresolved_proxies: readableValue(proxyScan, unresolvedProxies.slice(0, 25)),
         proxies_read: readableValue(proxyScan, proxies.length),
         ssl_policies_read: readableValue(sslPolicyScan, sslPolicies.length),
@@ -3240,7 +3474,7 @@ export async function assessGcpNetworkSecurity(
       unknownSummary: `${unresolvedProxies.length} of ${proxies.length} HTTPS target proxies could not be evaluated: ${unresolvedReasons.join("; ")}.`,
       emptyVerdict: "manual",
       passSummary: `All ${proxies.length} HTTPS target proxies attach an SSL policy with minTlsVersion TLS_1_2 or higher and a MODERN, RESTRICTED, or FIPS_202205 profile.`,
-      failSummary: `${weakProxies.length} of ${proxies.length} HTTPS target proxies allow TLS below 1.2 or the COMPATIBLE profile (including proxies without an SSL policy).`,
+      failSummary: sslFailSummary,
       emptySummary: "No HTTPS target proxies were listed in the sampled projects.",
       manualEvidence: "review sslPolicy on each target HTTPS proxy and the policy's minTlsVersion and profile.",
     }),
@@ -3277,7 +3511,7 @@ export async function assessGcpNetworkSecurity(
     category: "network-security",
     summary: {
       sampled_projects: sampledProjects(context),
-      projects_truncated: context.truncated,
+      projects_truncated: projectsTruncated(context),
       firewalls: readableValue(firewallScan, firewalls.length),
       open_admin_rules: readableValue(firewallScan, openAdminRules.length),
       subnetworks: readableValue(subnetScan, subnets.length),
@@ -3287,7 +3521,7 @@ export async function assessGcpNetworkSecurity(
       subnets_with_unknown_nat: readableValue(subnetScan, subnetsWithUnknownNat.length),
       instances_with_external_ip: readableValue(instanceScan, publicInstances.length),
       https_proxies: readableValue(proxyScan, proxies.length),
-      weak_ssl_proxies: readableValue(proxyScan, weakProxies.length),
+      weak_ssl_proxies: jointValue(weakSetReadable, weakProxies.length),
       external_backends: readableValue(backendScan, externalBackends.length),
       backends_without_cloud_armor: readableValue(backendScan, backendsWithoutArmor.length),
       collection_errors: errors.length,
@@ -3295,14 +3529,18 @@ export async function assessGcpNetworkSecurity(
     findings,
     errors,
     snapshot: {
-      projects: context.projectIds,
-      firewalls: firewalls.map(snapshotFirewall),
-      subnetworks: subnets.map(snapshotSubnetwork),
-      routers: routers.map(snapshotRouter),
-      instances: instances.map(snapshotNetworkInstance),
-      ssl_policies: sslPolicies.map(snapshotSslPolicy),
-      target_https_proxies: proxies.map(snapshotHttpsProxy),
-      backend_services: externalBackends.map(snapshotBackendService),
+      projects: snapshotProjects(context),
+      firewalls: snapshotScan(firewallScan, firewalls.map(snapshotFirewall)),
+      subnetworks: snapshotScan(subnetScan, subnets.map(snapshotSubnetwork)),
+      routers: snapshotScan(routerScan, routers.map(snapshotRouter)),
+      instances: snapshotScan(instanceScan, instances.map(snapshotNetworkInstance)),
+      ssl_policies: snapshotScan(sslPolicyScan, sslPolicies.map(snapshotSslPolicy)),
+      target_https_proxies: snapshotScan(proxyScan, proxies.map(snapshotHttpsProxy)),
+      backend_services: snapshotScan(backendScan, externalBackends.map(snapshotBackendService)),
+      unreadable_inventories: [
+        ...context.unreadable,
+        ...unreadableScans(firewallScan, subnetScan, routerScan, instanceScan, sslPolicyScan, proxyScan, backendScan),
+      ],
     },
   };
 }
