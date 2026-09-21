@@ -29,6 +29,7 @@ import {
   resolveSecureOutputPath,
   runOktaAccessCheck,
 } from "../dist/extensions/grc-tools/okta.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1305,4 +1306,632 @@ test("self-check (d): compliant-org fixtures pass every automatable finding (29 
     assert.equal(result.summary.Fail, 0);
     assert.equal(result.summary.Partial, 0);
   }
+});
+
+const FAKE_SECRETS = {
+  appClientSecret: "FAKE_APP_CLIENT_SECRET_1",
+  swaPassword: "FAKE_SWA_PASSWORD_1",
+  secretHash: "FAKE_SECRET_HASH_1",
+  appNotesSsws: `00${"FAKE_SSWS_SHAPED_1".padEnd(40, "x")}`,
+  jwtPayload: "FAKE_JWT_PAYLOAD_1",
+  acsRelayState: "FAKE_ACS_RELAY_1",
+  idpClientSecret: "FAKE_IDP_CLIENT_SECRET_1",
+  hookPathToken: "FAKE_HOOK_PATH_TOKEN_1",
+  hookQueryToken: "FAKE_HOOK_QUERY_TOKEN_1",
+  hookHeaderValue: "FAKE_HOOK_HEADER_1",
+  hookCustomHeaderValue: "FAKE_HOOK_CUSTOM_HEADER_1",
+  hookAuthValue: "FAKE_HOOK_AUTH_1",
+  hecToken: "FAKE_HEC_TOKEN_1",
+  duoSecretKey: "FAKE_DUO_SECRET_KEY_1",
+  sessionToken: "FAKE_SESSION_TOKEN_1",
+  authnRequestId: "FAKE_AUTHN_REQUEST_1",
+  userPasswordValue: "FAKE_USER_PASSWORD_1",
+  recoveryAnswer: "FAKE_RECOVERY_ANSWER_1",
+  totpSharedSecret: "FAKE_TOTP_SHARED_SECRET_1",
+  sswsToken: "FAKE_SSWS_TOKEN_VALUE_1",
+};
+
+function fakeJwt() {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "RS256" })}.${encode({ sub: FAKE_SECRETS.jwtPayload, aud: "okta" })}.FAKE_JWT_SIGNATURE_1`;
+}
+
+function secretUser(id, login) {
+  const now = new Date().toISOString();
+  return {
+    id,
+    status: "ACTIVE",
+    lastLogin: now,
+    created: "2024-01-01T00:00:00.000Z",
+    profile: { login },
+    credentials: {
+      password: { value: FAKE_SECRETS.userPasswordValue },
+      recovery_question: { question: "first pet", answer: FAKE_SECRETS.recoveryAnswer },
+      provider: { type: "OKTA", name: "OKTA" },
+    },
+  };
+}
+
+/** A compliant org whose every credential-capable record carries a distinctive fake secret. */
+function createSecretFixtureClient() {
+  const sample = createSampleClient();
+  const now = new Date().toISOString();
+  return {
+    ...sample,
+    async listAuthenticators() {
+      return [
+        ...(await sample.listAuthenticators()),
+        {
+          id: "auth-duo",
+          key: "duo",
+          name: "Duo Security",
+          type: "app",
+          status: "ACTIVE",
+          provider: {
+            type: "DUO",
+            configuration: { host: "api-1234.duosecurity.com", integrationKey: "DI-INTEGRATION", secretKey: FAKE_SECRETS.duoSecretKey },
+          },
+        },
+      ];
+    },
+    async listIdps() {
+      return [
+        ...(await sample.listIdps()),
+        {
+          id: "idp-oidc",
+          name: "Upstream OIDC",
+          type: "OIDC",
+          status: "ACTIVE",
+          protocol: {
+            type: "OIDC",
+            credentials: {
+              client: { client_id: "upstream-client", client_secret: FAKE_SECRETS.idpClientSecret },
+              trust: { kid: "kid-2" },
+            },
+          },
+        },
+      ];
+    },
+    async getDefaultAuthorizationServer() {
+      return { id: "default", name: "default", credentials: { signing: { kid: "kid-3", rotationMode: "AUTO" } } };
+    },
+    async listUsersWithRoleAssignments() {
+      return [secretUser("user-1", "admin@example.gov")];
+    },
+    async listUsersWithMeta() {
+      return {
+        items: [secretUser("user-1", "admin@example.gov"), secretUser("user-2", "analyst@example.gov")],
+        truncated: false,
+        pagesFetched: 1,
+      };
+    },
+    async listUserFactors() {
+      return [
+        { id: "factor-1", factorType: "webauthn", provider: "FIDO", status: "ACTIVE", profile: { credentialId: "cred-1" } },
+        {
+          id: "factor-2",
+          factorType: "token:software:totp",
+          provider: "OKTA",
+          status: "ACTIVE",
+          profile: { credentialId: "admin@example.gov" },
+          _embedded: { activation: { sharedSecret: FAKE_SECRETS.totpSharedSecret } },
+        },
+      ];
+    },
+    async listApps() {
+      return [
+        {
+          id: "app-1",
+          name: "oidc_client",
+          label: "Core OIDC",
+          status: "ACTIVE",
+          signOnMode: "OPENID_CONNECT",
+          features: ["PUSH_NEW_USERS", "PUSH_USER_DEACTIVATION"],
+          credentials: {
+            oauthClient: {
+              client_id: "0oa-core-client",
+              client_secret: FAKE_SECRETS.appClientSecret,
+              autoKeyRotation: true,
+              token_endpoint_auth_method: "client_secret_basic",
+            },
+            signing: { kid: "kid-1" },
+            secret_hash: FAKE_SECRETS.secretHash,
+          },
+          settings: {
+            oauthClient: { grant_types: ["authorization_code"], application_type: "web" },
+            notes: { admin: FAKE_SECRETS.appNotesSsws },
+            app: { bearerAssertion: fakeJwt() },
+            signOn: { ssoAcsUrl: `https://acs.example.gov/sso?RelayState=${FAKE_SECRETS.acsRelayState}` },
+          },
+        },
+        {
+          id: "app-2",
+          name: "template_swa",
+          label: "Legacy SWA",
+          status: "ACTIVE",
+          signOnMode: "SHARED_USERNAME_AND_PASSWORD",
+          credentials: {
+            scheme: "SHARED_USERNAME_AND_PASSWORD",
+            userName: "shared-service",
+            password: { value: FAKE_SECRETS.swaPassword },
+          },
+        },
+      ];
+    },
+    async listEventHooks() {
+      return [
+        {
+          id: "hook-1",
+          name: "SIEM Forwarder",
+          status: "ACTIVE",
+          verificationStatus: "VERIFIED",
+          events: { type: "EVENT_TYPE", items: ["user.session.start"] },
+          channel: {
+            type: "HTTP",
+            version: "1.0.0",
+            config: {
+              uri: `https://hooks.example.gov/ingest/${FAKE_SECRETS.hookPathToken}?token=${FAKE_SECRETS.hookQueryToken}`,
+              method: "POST",
+              headers: [
+                { key: "X-Api-Key", value: FAKE_SECRETS.hookHeaderValue },
+                { key: "X-Tenant", value: FAKE_SECRETS.hookCustomHeaderValue },
+              ],
+              authScheme: { type: "HEADER", key: "Authorization", value: FAKE_SECRETS.hookAuthValue },
+            },
+          },
+        },
+      ];
+    },
+    async listLogStreams() {
+      return [
+        {
+          id: "stream-1",
+          name: "Splunk HEC",
+          type: "splunk_cloud_logstreaming",
+          status: "ACTIVE",
+          settings: { host: "acme.splunkcloud.com", edition: "gcp", token: FAKE_SECRETS.hecToken },
+        },
+      ];
+    },
+    async listSystemLogs() {
+      return [
+        {
+          uuid: "event-1",
+          published: now,
+          eventType: "user.session.start",
+          displayMessage: "User login to Okta",
+          severity: "INFO",
+          outcome: { result: "SUCCESS" },
+          actor: { id: "user-1", type: "User", alternateId: "admin@example.gov", displayName: "Admin" },
+          client: { ipAddress: "10.0.0.1", userAgent: { rawUserAgent: "Mozilla/5.0" } },
+          debugContext: {
+            debugData: {
+              url: `/login/sessionCookieRedirect?token=${FAKE_SECRETS.sessionToken}&redirectUrl=%2Fapp`,
+              requestUri: "/api/v1/authn",
+              authnRequestId: FAKE_SECRETS.authnRequestId,
+            },
+          },
+          request: { ipChain: [{ ip: "10.0.0.1" }] },
+        },
+      ];
+    },
+    async getThreatInsight() {
+      return { action: "block", excludeZones: ["zone-1"], lastUpdated: now, _links: { self: { href: "https://tenant.okta.gov/api/v1/threats/configuration" } } };
+    },
+    async getUser(userId) {
+      return secretUser(userId, `${userId}@example.gov`);
+    },
+  };
+}
+
+function secretValues() {
+  return [...Object.values(FAKE_SECRETS), fakeJwt()];
+}
+
+test("rule 9: exportOktaAuditBundle never writes client secrets, passwords, hook credentials, tokens, or debug URLs", async () => {
+  const outputRoot = createTempBase("grclanker-okta-secrets-");
+  const config = createSampleConfig({ token: FAKE_SECRETS.sswsToken });
+  const client = createSecretFixtureClient();
+  const secrets = secretValues();
+
+  const result = await exportOktaAuditBundle(client, config, outputRoot);
+  assert.equal(result.errorCount, 0);
+  const files = readBundleFiles(result.outputDir);
+  for (const expected of [
+    "core_data/apps.json",
+    "core_data/idps.json",
+    "core_data/event_hooks.json",
+    "core_data/log_streams.json",
+    "core_data/authenticators.json",
+    "core_data/system_logs_recent.json",
+    "core_data/users.json",
+    "core_data/privileged_user_factors.json",
+    "analysis/findings.json",
+    "analysis/monitoring.json",
+    "compliance/fedramp/oscal_assessment_results.json",
+    "QUICK_REFERENCE.md",
+  ]) {
+    assert.ok(files.has(expected), `${expected} is written`);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle files");
+  assertSecretsAbsent(assert, readZipEntries(result.zipPath), secrets, "zip entries");
+
+  const results = await runAllAssessments(client, config);
+  const access = await runOktaAccessCheck(
+    {
+      async getJson(pathname) {
+        throw new Error(`Okta API request failed for ${pathname} (403 Forbidden): denied`);
+      },
+    },
+    config,
+  );
+  const payloads = JSON.stringify({ results, access });
+  for (const secret of secrets) {
+    assert.ok(!payloads.includes(secret), `${secret} appears in a tool payload`);
+  }
+  assert.equal(results.monitoring.summary.Fail, 0);
+  assert.equal(statusOf(results.integrations, "OKTA-INTEG-006"), "Pass");
+  assert.match(findingById(results.monitoring, "OKTA-MON-003").evidence[0], /^ThreatInsight action: block; excluded zones: 1$/);
+
+  const apps = JSON.parse(files.get("core_data/apps.json"));
+  assert.equal(apps[0].credentials.oauthClient.client_secret, "[REDACTED]");
+  assert.equal(apps[0].credentials.oauthClient.client_id, "0oa-core-client");
+  assert.equal(apps[0].credentials.secret_hash, "[REDACTED]");
+  assert.equal(apps[0].credentials.signing.kid, "kid-1");
+  assert.equal(apps[0].settings.notes.admin, "[REDACTED]", "SSWS-shaped values are redacted by shape");
+  assert.equal(apps[0].settings.app.bearerAssertion, "[REDACTED]", "JWT-shaped values are redacted by shape");
+  assert.equal(apps[0].settings.signOn.ssoAcsUrl, "https://acs.example.gov/sso?[REDACTED]");
+  assert.deepEqual(apps[0].settings.oauthClient.grant_types, ["authorization_code"]);
+  assert.equal(apps[1].credentials.password, "[REDACTED]");
+  assert.equal(apps[1].credentials.userName, "shared-service");
+
+  const idps = JSON.parse(files.get("core_data/idps.json"));
+  const oidcIdp = idps.find((idp) => idp.id === "idp-oidc");
+  assert.equal(oidcIdp.protocol.credentials.client.client_secret, "[REDACTED]");
+  assert.equal(oidcIdp.protocol.credentials.client.client_id, "upstream-client");
+  assert.equal(oidcIdp.protocol.credentials.trust.kid, "kid-2");
+
+  const [hook] = JSON.parse(files.get("core_data/event_hooks.json"));
+  assert.equal(hook.channel.config.uri, "https://hooks.example.gov");
+  assert.deepEqual(hook.channel.config.headers, [
+    { key: "X-Api-Key", value: "[REDACTED]" },
+    { key: "X-Tenant", value: "[REDACTED]" },
+  ]);
+  assert.deepEqual(hook.channel.config.authScheme, { type: "HEADER", key: "Authorization", value: "[REDACTED]" });
+  assert.deepEqual(hook.events.items, ["user.session.start"]);
+  assert.equal(hook.status, "ACTIVE");
+
+  const [stream] = JSON.parse(files.get("core_data/log_streams.json"));
+  assert.equal(stream.settings.token, "[REDACTED]");
+  assert.equal(stream.settings.host, "acme.splunkcloud.com");
+
+  const duo = JSON.parse(files.get("core_data/authenticators.json")).find((auth) => auth.key === "duo");
+  assert.equal(duo.provider.configuration.secretKey, "[REDACTED]");
+  assert.equal(duo.provider.configuration.integrationKey, "DI-INTEGRATION");
+  assert.equal(duo.key, "duo", "authenticator key names are not treated as credentials");
+
+  const [event] = JSON.parse(files.get("core_data/system_logs_recent.json"));
+  assert.equal(event.eventType, "user.session.start");
+  assert.equal(event.actor.alternateId, "admin@example.gov");
+  assert.equal(event.client.ipAddress, "10.0.0.1");
+  assert.equal("debugContext" in event, false);
+  assert.equal("request" in event, false);
+
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.equal(users[0].credentials.password, "[REDACTED]");
+  assert.equal(users[0].credentials.recovery_question.answer, "[REDACTED]");
+  assert.equal(users[0].credentials.recovery_question.question, "first pet");
+  assert.equal(users[0].profile.login, "admin@example.gov");
+
+  const factors = JSON.parse(files.get("core_data/privileged_user_factors.json"));
+  assert.equal(factors["user-1"][1]._embedded.activation.sharedSecret, "[REDACTED]");
+  assert.equal(factors["user-1"][1].profile.credentialId, "admin@example.gov");
+
+  const passwordPolicies = JSON.parse(files.get("core_data/password_policies.json"));
+  assert.equal(passwordPolicies[0].settings.password.complexity.minLength, 14, "password policy settings survive redaction");
+  assert.equal(statusOf(results.authentication, "OKTA-AUTH-003"), "Pass");
+
+  assert.match(files.get("QUICK_REFERENCE.md"), /\[REDACTED\]/);
+  assert.doesNotMatch(files.get("QUICK_REFERENCE.md"), /contains raw Okta API responses/);
+});
+
+test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodies, and the caller's token", async () => {
+  const token = `00${"FAKE_LIVE_SSWS_TOKEN".padEnd(40, "y")}`;
+  const bodies = {
+    "/api/v1/apps": () =>
+      new Response(`<html>proxy error echoing SSWS ${token} ${"x".repeat(5000)}</html>`, {
+        status: 502,
+        statusText: "Bad Gateway",
+        headers: { "content-type": "text/html" },
+      }),
+    "/api/v1/groups": () =>
+      new Response(JSON.stringify({ errorCode: "E0000006", errorSummary: `Rejected credential ${token}` }), {
+        status: 403,
+        statusText: "Forbidden",
+        headers: { "content-type": "application/json" },
+      }),
+    "/api/v1/zones": () =>
+      new Response(JSON.stringify({ unexpected: token }), {
+        status: 500,
+        statusText: "Internal Server Error",
+        headers: { "content-type": "application/json" },
+      }),
+  };
+  const fetchImpl = async (input) => {
+    const url = new URL(input.toString());
+    return (bodies[url.pathname] ?? bodies["/api/v1/apps"])();
+  };
+  const client = new OktaAuditorClient(
+    { orgUrl: "https://tenant.example.okta.com", authMode: "SSWS", token, scopes: [], sourceChain: ["tests"] },
+    { fetchImpl },
+  );
+
+  await assert.rejects(
+    () => client.listPaginatedWithMeta("https://tenant.example.okta.com/api/v1/apps?limit=200&after=cursor-2"),
+    (error) => {
+      assert.match(error.message, /^Okta API request failed for \/api\/v1\/apps\?limit=200 \(502 Bad Gateway\): non-JSON error body \(\d+ chars\)$/);
+      assert.ok(!error.message.includes("after="));
+      assert.ok(!error.message.includes(token));
+      assert.ok(!error.message.includes("<html>"));
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => client.listGroups(),
+    (error) => {
+      assert.match(error.message, /\(403 Forbidden\): Rejected credential \[REDACTED\]$/);
+      assert.ok(!error.message.includes(token));
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => client.listNetworkZones(),
+    (error) => {
+      assert.match(error.message, /\(500 Internal Server Error\): JSON error body without errorSummary \(\d+ chars\)$/);
+      assert.ok(!error.message.includes(token));
+      return true;
+    },
+  );
+
+  const access = await runOktaAccessCheck(client, createSampleConfig({ token }));
+  assert.equal(access.status, "limited");
+  assert.ok(access.probes.every((probe) => probe.status !== "ok"));
+  assert.ok(!JSON.stringify(access).includes(token), "access check payload never echoes the token");
+  assert.ok(!JSON.stringify(access).includes("<html>"), "access check payload never echoes a raw body");
+});
+
+function pagedFetch({ pageSize = 200, totalPages = Infinity, nextFor, onRequest } = {}) {
+  return async (input) => {
+    const url = new URL(input.toString());
+    onRequest?.(url);
+    if (url.pathname === "/api/v1/threats/configuration") {
+      return new Response(JSON.stringify({ action: "block" }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    const page = Number(url.searchParams.get("after") ?? "0");
+    const items = Array.from({ length: pageSize }, (_, index) => ({
+      id: `${url.pathname}-${page}-${index}`,
+      status: "ACTIVE",
+      published: new Date().toISOString(),
+      eventType: "user.session.start",
+    }));
+    const headers = { "content-type": "application/json" };
+    const next = nextFor ? nextFor(page, url) : page + 1 < totalPages ? String(page + 1) : null;
+    if (next !== null) {
+      const nextUrl = new URL(url);
+      nextUrl.searchParams.set("after", next);
+      headers.link = `<${nextUrl.toString()}>; rel="next"`;
+    }
+    return new Response(JSON.stringify(items), { status: 200, headers });
+  };
+}
+
+function createRealClient(fetchImpl) {
+  return new OktaAuditorClient(
+    { orgUrl: "https://tenant.example.okta.com", authMode: "SSWS", token: "okta-test-token", scopes: [], sourceChain: ["tests"] },
+    { fetchImpl },
+  );
+}
+
+test("rule 10: every list walk reports truncated on the page cap, a repeated cursor, and an empty page with a next link", async () => {
+  const requests = [];
+  const endless = createRealClient(pagedFetch({ pageSize: 3, onRequest: (url) => requests.push(url.pathname) }));
+  const capped = await endless.listApps();
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.pagesFetched, 50);
+  assert.equal(capped.items.length, 150);
+  assert.match(capped.truncationNote, /^GET \/api\/v1\/apps\?limit=200 stopped after 50 pages \(150 items\): the 50-page cap was reached with a Link rel="next" page unread, total unknown\.$/);
+  assert.equal(requests.filter((pathname) => pathname === "/api/v1/apps").length, 50, "the walk stops requesting at the cap");
+
+  const complete = await createRealClient(pagedFetch({ pageSize: 2, totalPages: 3 })).listGroups();
+  assert.equal(complete.truncated, false);
+  assert.equal(complete.items.length, 6);
+  assert.equal(complete.truncationNote, undefined);
+
+  const repeating = await createRealClient(pagedFetch({ pageSize: 2, nextFor: (page) => (page === 0 ? "1" : "1") })).listIdps();
+  assert.equal(repeating.truncated, true);
+  assert.equal(repeating.pagesFetched, 2);
+  assert.match(repeating.truncationNote, /cursor repeated a page already read, total unknown/);
+
+  const emptyWithNext = createRealClient(async (input) => {
+    const url = new URL(input.toString());
+    const page = url.searchParams.get("after");
+    const headers = { "content-type": "application/json" };
+    const nextUrl = new URL(url);
+    nextUrl.searchParams.set("after", page ? `${page}x` : "1");
+    headers.link = `<${nextUrl.toString()}>; rel="next"`;
+    return new Response(JSON.stringify(page ? [] : [{ id: "zone-1", status: "ACTIVE" }]), { status: 200, headers });
+  });
+  const stalled = await emptyWithNext.listNetworkZones();
+  assert.equal(stalled.truncated, true);
+  assert.equal(stalled.items.length, 1);
+  assert.match(stalled.truncationNote, /an empty page still advertised a Link rel="next" cursor, total unknown/);
+});
+
+test("rule 10: listSystemLogs is bounded, capped at five pages, and demotes OKTA-MON-002 to a total-unknown statement", async () => {
+  const requests = [];
+  const client = createRealClient(pagedFetch({ pageSize: 4, onRequest: (url) => requests.push(url) }));
+  const logs = await client.listSystemLogs();
+  assert.equal(logs.truncated, true);
+  assert.equal(logs.pagesFetched, 5);
+  assert.equal(logs.items.length, 20);
+  const first = requests.find((url) => url.pathname === "/api/v1/logs");
+  assert.ok(first.searchParams.get("since"), "since bounds the window");
+  assert.ok(first.searchParams.get("until"), "until turns the polling query into a bounded one");
+  assert.ok(Date.parse(first.searchParams.get("until")) >= Date.parse(first.searchParams.get("since")));
+  assert.equal(first.searchParams.get("limit"), "200");
+  assert.equal(requests.filter((url) => url.pathname === "/api/v1/logs").length, 5);
+  assert.match(logs.truncationNote, /^GET \/api\/v1\/logs\?since=[^&]+&until=[^&]+&limit=200 stopped after 5 pages \(20 items\): the 5-page cap/);
+  assert.ok(!logs.truncationNote.includes("after="));
+
+  const monitoring = await collectOktaMonitoringData(client);
+  assert.equal(monitoring.systemLogs.truncated, true);
+  assert.equal(monitoring.systemLogs.data.length, 20);
+  assert.equal(monitoring.eventHooks.truncated, true, "every other list on the endless server is capped too");
+  const result = assessOktaMonitoring(monitoring, createSampleConfig());
+  const visibility = findingById(result, "OKTA-MON-002");
+  assert.equal(visibility.status, "Partial");
+  assert.match(visibility.summary, /Retrieved at least 20 system log events from the last 30 days \(page-capped sample, total unknown\)/);
+  assert.match(visibility.summary, /stopped after 5 pages \(20 items\)/);
+  assert.ok(visibility.evidence.some((line) => line.startsWith("Partial data: GET /api/v1/logs")));
+  assert.equal(statusOf(result, "OKTA-MON-003"), "Pass", "the single-object ThreatInsight read is not a list and keeps its verdict");
+  for (const id of ["OKTA-MON-001", "OKTA-MON-004", "OKTA-MON-005", "OKTA-MON-006", "OKTA-MON-007"]) {
+    const finding = findingById(result, id);
+    assert.notEqual(finding.status, "Pass", id);
+    assert.match(`${finding.summary}\n${finding.evidence.join("\n")}`, /total unknown/, id);
+  }
+});
+
+test("rule 10: a truncated page returned by any list method demotes every dependent finding through the collectors", async () => {
+  const sample = createSampleClient();
+  const appsNote = 'GET /api/v1/apps?limit=200 stopped after 50 pages (10000 items): the 50-page cap was reached with a Link rel="next" page unread, total unknown.';
+  const rulesNote = 'GET /api/v1/policies/signon-1/rules?limit=200 stopped after 50 pages (10000 items): the 50-page cap was reached with a Link rel="next" page unread, total unknown.';
+  const client = {
+    ...sample,
+    async listApps() {
+      return { items: await sample.listApps(), truncated: true, pagesFetched: 50, truncationNote: appsNote };
+    },
+    async listPolicyRules(policyId) {
+      const items = await sample.listPolicyRules(policyId);
+      return policyId === "signon-1" ? { items, truncated: true, pagesFetched: 50, truncationNote: rulesNote } : items;
+    },
+    async listUserRoles(userId) {
+      return { items: await sample.listUserRoles(userId), truncated: true, pagesFetched: 50 };
+    },
+  };
+
+  const integrations = await collectOktaIntegrationData(client);
+  assert.equal(integrations.apps.truncated, true);
+  assert.equal(integrations.apps.truncationNote, appsNote);
+  assert.equal(integrations.trustedOrigins.truncated, false);
+  const integResult = assessOktaIntegrations(integrations, createSampleConfig());
+  for (const id of ["OKTA-INTEG-003", "OKTA-INTEG-005", "OKTA-INTEG-006"]) {
+    const finding = findingById(integResult, id);
+    assert.equal(finding.status, "Partial", id);
+    assert.match(finding.summary, /Inventory truncated: GET \/api\/v1\/apps.*total unknown/, id);
+    assert.ok(finding.evidence.includes(`Partial data: ${appsNote}`), id);
+  }
+  assert.equal(statusOf(integResult, "OKTA-INTEG-001"), "Pass", "findings that do not read apps keep their verdict");
+  assert.equal(statusOf(integResult, "OKTA-INTEG-002"), "Pass");
+
+  const authentication = await collectOktaAuthenticationData(client);
+  assert.equal(authentication.signOnPolicyRules.truncated, true);
+  assert.match(authentication.signOnPolicyRules.truncationNote, /^signon-1: GET \/api\/v1\/policies\/signon-1\/rules/);
+  const authResult = assessOktaAuthentication(authentication, createSampleConfig());
+  for (const id of ["OKTA-AUTH-002", "OKTA-AUTH-006", "OKTA-AUTH-007"]) {
+    assert.equal(statusOf(authResult, id), "Partial", id);
+    assert.match(findingById(authResult, id).summary, /total unknown/, id);
+  }
+  assert.equal(statusOf(authResult, "OKTA-AUTH-003"), "Pass");
+
+  const admin = await collectOktaAdminAccessData(client);
+  assert.equal(admin.userRoles.truncated, true);
+  assert.match(admin.userRoles.truncationNote, /^user-1: Listing stopped after 50 pages \(1 items\); total unknown\./);
+  const adminResult = assessOktaAdminAccess(admin, createSampleConfig());
+  assert.equal(statusOf(adminResult, "OKTA-ADMIN-001"), "Partial");
+  assert.equal(statusOf(adminResult, "OKTA-ADMIN-002"), "Partial");
+  assert.equal(statusOf(adminResult, "OKTA-ADMIN-005"), "Pass");
+
+  const outputRoot = createTempBase("grclanker-okta-truncated-");
+  const exported = await exportOktaAuditBundle(client, createSampleConfig(), outputRoot);
+  assert.equal(exported.errorCount, 4, "apps, user roles, and the sign-on rules read by two categories are all reported");
+  const errorsLog = readFileSync(join(exported.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /Truncated inventory: GET \/api\/v1\/apps/);
+  assert.match(errorsLog, /Truncated inventory: signon-1: GET \/api\/v1\/policies/);
+  assert.match(errorsLog, /Truncated inventory: user-1: Listing stopped after 50 pages/);
+  const findings = JSON.parse(readFileSync(join(exported.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.find((finding) => finding.id === "OKTA-INTEG-003").status, "Partial");
+});
+
+test("rule 10: collectors keep per-user factor lookups distinct from empty enrollments", async () => {
+  const sample = createSampleClient();
+  const admin = await collectOktaAdminAccessData({
+    ...sample,
+    async listUsersWithRoleAssignments() {
+      const now = new Date().toISOString();
+      return [
+        { id: "user-1", status: "ACTIVE", lastLogin: now, profile: { login: "admin@example.gov" } },
+        { id: "user-2", status: "ACTIVE", lastLogin: now, profile: { login: "second@example.gov" } },
+      ];
+    },
+    async listUserFactors(userId) {
+      if (userId === "user-2") throw forbidden(`/api/v1/users/${userId}/factors`);
+      return sample.listUserFactors("user-1");
+    },
+  });
+  assert.deepEqual(Object.keys(admin.privilegedUserFactors.data), ["user-1"], "a failed lookup leaves no entry rather than an empty enrollment");
+  assert.match(admin.privilegedUserFactors.error, /user-2: .*403 Forbidden/);
+  const finding = findingById(assessOktaAdminAccess(admin, createSampleConfig()), "OKTA-ADMIN-004");
+  assert.equal(finding.status, "Partial");
+  assert.match(finding.summary, /All 1 inspected privileged users have an ACTIVE phishing-resistant factor \(inventory partially read\)/);
+});
+
+test("multi-inventory verdicts name the unreadable secondary source (OKTA-AUTH-002, 008, INTEG-006, MON-008)", () => {
+  const config = createSampleConfig();
+
+  const authentication = createSampleAuthenticationData();
+  authentication.authenticators = dataset([], "Okta API request failed for /api/v1/authenticators (403 Forbidden): Access denied");
+  const authResult = assessOktaAuthentication(authentication, config);
+  const adminMfa = findingById(authResult, "OKTA-AUTH-002");
+  assert.equal(adminMfa.status, "Partial");
+  assert.match(adminMfa.summary, /authenticator list was unreadable/);
+  assert.ok(adminMfa.evidence.includes("Strong authenticators: unknown (authenticator list unreadable)"));
+  assert.ok(adminMfa.evidence.some((line) => /^Authenticator error: .*403 Forbidden/.test(line)));
+
+  const idpUnreadable = createSampleAuthenticationData();
+  idpUnreadable.idps = dataset([], "Okta API request failed for /api/v1/idps (403 Forbidden): Access denied");
+  const certFinding = findingById(assessOktaAuthentication(idpUnreadable, config), "OKTA-AUTH-008");
+  assert.equal(certFinding.status, "Pass", "an ACTIVE certificate authenticator proves the capability on its own");
+  assert.match(certFinding.summary, /one source was unreadable; see evidence/);
+  assert.ok(certFinding.evidence.some((line) => /^IdP data unavailable: .*403 Forbidden/.test(line)));
+
+  const orgFactorsUnreadable = createSampleAuthenticationData();
+  orgFactorsUnreadable.orgFactors = dataset([], "Okta API request failed for /api/v1/org/factors (403 Forbidden): Access denied");
+  const phishing = findingById(assessOktaAuthentication(orgFactorsUnreadable, config), "OKTA-AUTH-001");
+  assert.equal(phishing.status, "Pass");
+  assert.ok(phishing.evidence.some((line) => /^Org factors were unreadable/.test(line)));
+
+  const integrations = createSampleIntegrationData();
+  integrations.groupRules = dataset([], "Okta API request failed for /api/v1/groups/rules (403 Forbidden): Access denied");
+  const deprovisioning = findingById(assessOktaIntegrations(integrations, config), "OKTA-INTEG-006");
+  assert.equal(deprovisioning.status, "Partial");
+  assert.match(deprovisioning.summary, /group rules were unreadable/);
+
+  const zonesUnreadable = createSampleIntegrationData();
+  zonesUnreadable.networkZones = dataset([], "Okta API request failed for /api/v1/zones (403 Forbidden): Access denied");
+  const contextual = findingById(assessOktaIntegrations(zonesUnreadable, config), "OKTA-INTEG-004");
+  assert.ok(contextual.evidence.some((line) => /^Network zones unreadable/.test(line)));
+
+  const monitoring = createSampleMonitoringData();
+  monitoring.orgContacts = {
+    data: [{ contactType: "BILLING", userId: "user-9", userStatus: "ACTIVE", userLogin: "billing@example.gov" }],
+    error: "TECHNICAL: Okta API request failed for /api/v1/org/contacts/TECHNICAL (403 Forbidden): Access denied",
+  };
+  const contact = findingById(assessOktaMonitoring(monitoring, config), "OKTA-MON-008");
+  assert.equal(contact.status, "Partial");
+  assert.match(contact.summary, /technical contact lookup failed/);
+  assert.doesNotMatch(contact.summary, /No technical contact user is assigned/);
+
+  const unassigned = createSampleMonitoringData();
+  unassigned.orgContacts = dataset([{ contactType: "BILLING", userId: "user-9", userStatus: "ACTIVE", userLogin: "billing@example.gov" }]);
+  assert.equal(statusOf(assessOktaMonitoring(unassigned, config), "OKTA-MON-008"), "Fail", "a readable list without TECHNICAL is still a real gap");
 });
