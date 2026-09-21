@@ -144,10 +144,49 @@ const goodTwoFactor = [
   { UserId: "U2", HasSalesforceAuthenticator: true },
 ];
 
+const businessHours = Object.fromEntries(["monday", "tuesday", "wednesday", "thursday", "friday"].flatMap((day) => [[`${day}Start`, "420"], [`${day}End`, "1140"]]));
+
+const goodProfileListing = [
+  { fullName: "Admin", id: "P-admin", type: "Profile", fileName: "profiles/Admin.profile" },
+  { fullName: "Standard", id: "P-std", type: "Profile", fileName: "profiles/Standard.profile" },
+  { fullName: "Integration", id: "P-int", type: "Profile", fileName: "profiles/Integration.profile" },
+];
+
+const goodProfileMetadataRecords = [
+  { fullName: "Admin", custom: "false", loginHours: { ...businessHours }, loginIpRanges: [{ startAddress: "10.0.0.1", endAddress: "10.0.0.254", description: "HQ" }], userPermissions: [{ enabled: "true", name: "ModifyAllData" }] },
+];
+
+function profileMetadataDataset(records = goodProfileMetadataRecords, extra = {}) {
+  const byFullName = new Map(records.map((record) => [record.fullName, record]));
+  const listing = new Map(goodProfileListing.map((item) => [item.id, item.fullName]));
+  const data = goodProfiles
+    .filter((profile) => profile.PermissionsModifyAllData || profile.Name === "System Administrator" || profile.PermissionsViewAllData || profile.PermissionsManageUsers)
+    .map((profile) => {
+      const fullName = listing.get(profile.Id);
+      const record = fullName ? byFullName.get(fullName) : undefined;
+      return { ...(record ?? {}), _profileId: profile.Id, _profileName: profile.Name, _fullName: fullName ?? null, _resolved: record !== undefined };
+    });
+  return okDataset("Profile metadata", data, { seen: data.filter((record) => record._resolved).length, ...extra });
+}
+
+const goodCallerPermissions = {
+  PermissionsApiEnabled: true,
+  PermissionsViewSetup: true,
+  PermissionsViewHealthCheck: true,
+  PermissionsViewAllUsers: true,
+  PermissionsManageUsers: true,
+  PermissionsModifyMetadata: true,
+  PermissionsModifyAllData: true,
+  PermissionsCustomizeApplication: true,
+  PermissionsViewEventLogFiles: true,
+  PermissionsManageEncryptionKeys: true,
+};
+
 function goodIdentityData(overrides = {}) {
   return {
     users: okDataset("User", goodUsers),
     profiles: okDataset("Profile", goodProfiles),
+    profileMetadata: profileMetadataDataset(),
     permissionSets: okDataset("PermissionSet", [{ Id: "PS1", Name: "Reporting", IsOwnedByProfile: false, PermissionsModifyAllData: false }]),
     assignments: okDataset("PermissionSetAssignment", [{ Id: "A1", AssigneeId: "U2", PermissionSetId: "PS1", Assignee: { IsActive: true } }]),
     twoFactorMethods: okDataset("TwoFactorMethodsInfo", goodTwoFactor),
@@ -164,6 +203,8 @@ function goodPlatformData(overrides = {}) {
     healthCheckRisks: okDataset("SecurityHealthCheckRisks", [{ Setting: "Minimum password length", SettingGroup: "Password Policies", RiskType: "MEETS_STANDARD", OrgValue: "14 characters", StandardValue: "8 characters" }]),
     securitySettings: okDataset("SecuritySettings", securitySettingsFixture()),
     myDomainSettings: okDataset("MyDomainSettings", { myDomainName: "acme", canOnlyLoginWithMyDomainUrl: "true", doesApiLoginRequireOrgDomain: "true" }),
+    profiles: okDataset("Profile", goodProfiles),
+    profileMetadata: profileMetadataDataset(),
     instanceUrl: "https://acme.my.salesforce.com",
     ...overrides,
   };
@@ -190,6 +231,7 @@ function goodMonitoringData(overrides = {}) {
   return {
     connectedApplications: okDataset("ConnectedApplication", [{ Id: "CA1", Name: "Auditor", OptionsAllowAdminApprovedUsersOnly: true, RefreshTokenValidityPeriod: 90 }]),
     oauthTokens: okDataset("OauthToken", [{ Id: "OT1", AppName: "Auditor", UserId: "U1", LastUsedDate: "2026-09-20T00:00:00Z", UseCount: 5 }]),
+    callerPermissions: okDataset("UserPermissionAccess", goodCallerPermissions),
     loginHistory: okDataset("LoginHistory", logins),
     setupAuditTrail: okDataset("SetupAuditTrail", [{ Id: "S1", Action: "changedEmail", Section: "Users", CreatedDate: "2026-09-10T00:00:00Z", CreatedBy: { Username: "admin@acme.example" }, Display: "Changed email" }]),
     eventLogFiles: okDataset("EventLogFile", [{ Id: "E1", EventType: "Login", LogDate: "2026-09-20T00:00:00Z" }]),
@@ -214,6 +256,9 @@ function createFullMockClient(overrides = {}) {
     async listHealthCheckRisks() { return queryResult(goodPlatformData().healthCheckRisks.data); },
     async readSecuritySettings() { return securitySettingsFixture(); },
     async readMyDomainSettings() { return goodPlatformData().myDomainSettings.data; },
+    async listProfileMetadata() { return goodProfileListing; },
+    async readProfileMetadata(fullNames) { return goodProfileMetadataRecords.filter((record) => fullNames.includes(record.fullName)); },
+    async getCallerPermissions() { return goodCallerPermissions; },
     async listUsers() { return queryResult(goodUsers); },
     async listProfiles() { return queryResult(goodProfiles); },
     async listPermissionSets() { return queryResult(goodIdentityData().permissionSets.data); },
@@ -240,6 +285,9 @@ function forbiddenClient() {
     listHealthCheckRisks: reject,
     readSecuritySettings: reject,
     readMyDomainSettings: reject,
+    listProfileMetadata: reject,
+    readProfileMetadata: reject,
+    getCallerPermissions: reject,
     listUsers: reject,
     listProfiles: reject,
     listPermissionSets: reject,
@@ -570,7 +618,8 @@ test("assessSalesforceIdentityAccess passes a well-governed org and fails an ove
   const good = await assessSalesforceIdentityAccess(createFullMockClient(), { maxAdmins: 5 });
   assert.deepEqual(good.findings.map((item) => item.control), [4, 6, 7, 9, 10, 13]);
   assert.equal(findingById(good, "SF-04").status, "pass");
-  assert.equal(findingById(good, "SF-06").status, "manual");
+  assert.equal(findingById(good, "SF-06").status, "pass");
+  assert.deepEqual(findingById(good, "SF-06").evidence.profiles_with_login_hours, ["System Administrator"]);
   assert.equal(findingById(good, "SF-07").status, "pass");
   assert.equal(findingById(good, "SF-09").status, "pass");
   assert.equal(findingById(good, "SF-10").status, "pass");
@@ -700,7 +749,7 @@ test("false-pass self-check (a): when every endpoint is forbidden no assess tool
     assert.equal(item.status, "manual", `${item.id} should be manual when forbidden: ${item.summary}`);
     assert.ok(item.manualEvidence, `${item.id} must tell a human what to collect`);
   }
-  assert.ok(findings.filter((item) => item.id !== "SF-06").every((item) => /forbidden|could not be verified|not applicable/i.test(item.summary)));
+  assert.ok(findings.every((item) => /forbidden|could not be verified|not applicable/i.test(item.summary)));
   assert.ok(results.every((result) => result.errors.length > 0));
 });
 
@@ -710,6 +759,9 @@ test("false-pass self-check (b): empty inventories never pass except where empti
     async listHealthCheckRisks() { return queryResult([]); },
     async readSecuritySettings() { return { fullName: "Security" }; },
     async readMyDomainSettings() { return { fullName: "MyDomain" }; },
+    async listProfileMetadata() { return []; },
+    async readProfileMetadata() { return []; },
+    async getCallerPermissions() { return undefined; },
     async listUsers() { return queryResult([]); },
     async listProfiles() { return queryResult([]); },
     async listPermissionSets() { return queryResult([]); },
@@ -735,11 +787,13 @@ test("false-pass self-check (b): empty inventories never pass except where empti
   const passing = findings.filter((item) => item.status === "pass");
   assert.deepEqual(passing.map((item) => item.id), [], "no control may pass when every inventory is empty");
   assert.equal(findingById(results[1], "SF-13").status, "manual");
-  assert.match(findingById(results[1], "SF-13").summary, /Zero users were returned/);
+  assert.match(findingById(results[1], "SF-13").summary, /zero profiles were returned/);
   assert.equal(findingById(results[2], "SF-16").status, "fail");
   assert.equal(findingById(results[3], "SF-14").status, "manual");
   assert.equal(findingById(results[3], "SF-15").status, "manual");
   assert.equal(findingById(results[1], "SF-10").status, "manual");
+  assert.equal(findingById(results[1], "SF-06").status, "manual");
+  assert.equal(findingById(results[0], "SF-05").status, "manual");
   assert.equal(findingById(results[0], "SF-01").status, "manual");
 
   const noGuests = assessSalesforceIdentityData(goodIdentityData({
@@ -771,7 +825,7 @@ test("false-pass self-check (c): partial or truncated inventories never pass (ru
     assessSalesforceDataProtection(client),
     assessSalesforceMonitoringIntegrations(client),
   ]);
-  const inventoryControls = new Set([1, 4, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]);
+  const inventoryControls = new Set([1, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]);
   const findings = results.flatMap((result) => result.findings).filter((item) => inventoryControls.has(item.control));
   assert.equal(findings.length, inventoryControls.size);
   for (const item of findings) {

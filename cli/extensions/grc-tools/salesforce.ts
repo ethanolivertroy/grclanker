@@ -38,6 +38,36 @@ const PRODUCTION_LOGIN_URL = "https://login.salesforce.com";
 const SANDBOX_LOGIN_URL = "https://test.salesforce.com";
 const JWT_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 const METADATA_NAMESPACE = "http://soap.sforce.com/2006/04/metadata";
+const READ_METADATA_BATCH_SIZE = 10;
+const MAX_PROFILE_METADATA_READS = 50;
+const TWO_FACTOR_METHODS_ROW_CAP = 2500;
+const MINUTES_PER_DAY = 1440;
+const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+const PROFILE_ID_KEY = "_profileId";
+const PROFILE_NAME_KEY = "_profileName";
+const PROFILE_FULL_NAME_KEY = "_fullName";
+const PROFILE_RESOLVED_KEY = "_resolved";
+const CORE_PROFILE_PERMISSION_FIELDS = ["PermissionsApiEnabled", "PermissionsModifyAllData", "PermissionsViewAllData", "PermissionsManageUsers"];
+const OPTIONAL_PROFILE_PERMISSION_FIELDS = [
+  "PermissionsApiUserOnly",
+  "PermissionsAuthorApex",
+  "PermissionsCustomizeApplication",
+  "PermissionsViewSetup",
+  "PermissionsManageProfilesPermissionsets",
+  "PermissionsPasswordNeverExpires",
+];
+const CALLER_PERMISSION_FIELDS: Array<[string, string]> = [
+  ["PermissionsApiEnabled", "API Enabled"],
+  ["PermissionsViewSetup", "View Setup and Configuration"],
+  ["PermissionsViewHealthCheck", "View Health Check"],
+  ["PermissionsViewAllUsers", "View All Users"],
+  ["PermissionsManageUsers", "Manage Users"],
+  ["PermissionsModifyMetadata", "Modify Metadata Through Metadata API Functions"],
+  ["PermissionsModifyAllData", "Modify All Data"],
+  ["PermissionsCustomizeApplication", "Customize Application"],
+  ["PermissionsViewEventLogFiles", "View Event Log Files"],
+  ["PermissionsManageEncryptionKeys", "Manage Encryption Keys"],
+];
 
 export type SalesforceAuthMode = "jwt-bearer" | "password" | "refresh-token" | "access-token";
 export type SalesforceSeverity = "critical" | "high" | "medium" | "low" | "info";
@@ -70,6 +100,7 @@ export interface SalesforceQueryResult {
   done: boolean;
   truncated: boolean;
   pages: number;
+  omittedFields?: string[];
 }
 
 export interface SalesforceDataset<T> {
@@ -80,6 +111,7 @@ export interface SalesforceDataset<T> {
   truncated: boolean;
   seen: number;
   total?: number;
+  omittedFields?: string[];
 }
 
 export interface SalesforceAccessSurface {
@@ -744,6 +776,10 @@ function firstRecord(value: unknown): JsonRecord | undefined {
   return asObject(value);
 }
 
+function escapeXml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 export class SalesforceApiClient {
   private readonly config: SalesforceResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -751,6 +787,7 @@ export class SalesforceApiClient {
   private readonly now: () => Date;
   private session?: { accessToken: string; instanceUrl: string };
   private sessionPromise?: Promise<{ accessToken: string; instanceUrl: string }>;
+  private readonly describeCache = new Map<string, Promise<Set<string> | undefined>>();
 
   constructor(
     config: SalesforceResolvedConfig,
@@ -968,19 +1005,17 @@ export class SalesforceApiClient {
     return asObject(await this.getJson(this.dataPath(`/sobjects/${encodeURIComponent(name)}/describe`))) ?? {};
   }
 
-  async readMetadata(metadataType: string, fullNames: string[]): Promise<JsonRecord[]> {
+  private async metadataCall(operation: string, body: string, resultPath: string[], label: string): Promise<JsonRecord[]> {
     const session = await this.getSession();
-    const escape = (value: string): string => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const envelope = [
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
       `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="${METADATA_NAMESPACE}">`,
       "<soapenv:Header><met:SessionHeader><met:sessionId>",
-      escape(session.accessToken),
+      escapeXml(session.accessToken),
       "</met:sessionId></met:SessionHeader></soapenv:Header>",
-      "<soapenv:Body><met:readMetadata>",
-      `<met:type>${escape(metadataType)}</met:type>`,
-      ...fullNames.map((name) => `<met:fullNames>${escape(name)}</met:fullNames>`),
-      "</met:readMetadata></soapenv:Body></soapenv:Envelope>",
+      `<soapenv:Body><met:${operation}>`,
+      body,
+      `</met:${operation}></soapenv:Body></soapenv:Envelope>`,
     ].join("");
     const response = await this.fetchWithRetry(`${session.instanceUrl}/services/Soap/m/${this.config.apiVersion}`, {
       method: "POST",
@@ -994,12 +1029,54 @@ export class SalesforceApiClient {
       const faultCode = asString(fault?.faultcode)?.replace(/^.*:/, "");
       const faultString = asString(fault?.faultstring);
       throw new SalesforceApiError(
-        this.redact(`Salesforce Metadata API readMetadata(${metadataType}) failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${faultString ? `: ${faultString}` : ""}`),
+        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${faultString ? `: ${faultString}` : ""}`),
         { status: response.status, errorCode: faultCode },
       );
     }
-    const result = findXmlNode(parsed, ["Envelope", "Body", "readMetadataResponse", "result", "records"]);
+    const result = findXmlNode(parsed, ["Envelope", "Body", ...resultPath]);
     return asRecords(Array.isArray(result) ? result : result === undefined || result === null ? [] : [result]);
+  }
+
+  async readMetadata(metadataType: string, fullNames: string[]): Promise<JsonRecord[]> {
+    const body = [
+      `<met:type>${escapeXml(metadataType)}</met:type>`,
+      ...fullNames.map((name) => `<met:fullNames>${escapeXml(name)}</met:fullNames>`),
+    ].join("");
+    return this.metadataCall("readMetadata", body, ["readMetadataResponse", "result", "records"], `readMetadata(${metadataType})`);
+  }
+
+  async listMetadata(metadataType: string): Promise<JsonRecord[]> {
+    const body = `<met:queries><met:type>${escapeXml(metadataType)}</met:type></met:queries><met:asOfVersion>${escapeXml(this.config.apiVersion)}</met:asOfVersion>`;
+    return this.metadataCall("listMetadata", body, ["listMetadataResponse", "result"], `listMetadata(${metadataType})`);
+  }
+
+  async listProfileMetadata(): Promise<JsonRecord[]> {
+    return this.listMetadata("Profile");
+  }
+
+  async readProfileMetadata(fullNames: string[]): Promise<JsonRecord[]> {
+    const records: JsonRecord[] = [];
+    for (let index = 0; index < fullNames.length; index += READ_METADATA_BATCH_SIZE) {
+      records.push(...(await this.readMetadata("Profile", fullNames.slice(index, index + READ_METADATA_BATCH_SIZE))));
+    }
+    return records;
+  }
+
+  private async availableFields(objectName: string): Promise<Set<string> | undefined> {
+    const cached = this.describeCache.get(objectName);
+    if (cached) return cached;
+    const pending = this.describeSObject(objectName)
+      .then((describe) => new Set(asRecords(describe.fields).map((field) => asString(field.name) ?? "").filter(Boolean)))
+      .catch(() => undefined);
+    this.describeCache.set(objectName, pending);
+    return pending;
+  }
+
+  private async selectFields(objectName: string, required: string[], optional: string[]): Promise<{ fields: string[]; omitted: string[] }> {
+    const available = await this.availableFields(objectName);
+    if (!available || available.size === 0) return { fields: [...required, ...optional], omitted: [] };
+    const present = optional.filter((field) => available.has(field));
+    return { fields: [...required, ...present], omitted: optional.filter((field) => !available.has(field)) };
   }
 
   async getOrganization(): Promise<JsonRecord | undefined> {
@@ -1040,17 +1117,26 @@ export class SalesforceApiClient {
   }
 
   async listProfiles(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    return this.query(
-      "SELECT Id, Name, UserType, UserLicense.Name, PermissionsApiEnabled, PermissionsApiUserOnly, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsViewSetup, PermissionsManageProfilesPermissionsets, PermissionsPasswordNeverExpires FROM Profile ORDER BY Name",
-      limit,
-    );
+    const { fields, omitted } = await this.selectFields("Profile", CORE_PROFILE_PERMISSION_FIELDS, OPTIONAL_PROFILE_PERMISSION_FIELDS);
+    const result = await this.query(`SELECT Id, Name, UserType, UserLicense.Name, ${fields.join(", ")} FROM Profile ORDER BY Name`, limit);
+    return { ...result, omittedFields: omitted };
   }
 
   async listPermissionSets(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    return this.query(
-      "SELECT Id, Name, Label, IsOwnedByProfile, IsCustom, Type, ProfileId, NamespacePrefix, PermissionsApiEnabled, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsViewSetup, PermissionsManageProfilesPermissionsets, PermissionsPasswordNeverExpires FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Name",
+    const optional = OPTIONAL_PROFILE_PERMISSION_FIELDS.filter((field) => field !== "PermissionsApiUserOnly");
+    const { fields, omitted } = await this.selectFields("PermissionSet", CORE_PROFILE_PERMISSION_FIELDS, optional);
+    const result = await this.query(
+      `SELECT Id, Name, Label, IsOwnedByProfile, IsCustom, Type, ProfileId, NamespacePrefix, ${fields.join(", ")} FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Name`,
       limit,
     );
+    return { ...result, omittedFields: omitted };
+  }
+
+  async getCallerPermissions(): Promise<JsonRecord | undefined> {
+    const { fields } = await this.selectFields("UserPermissionAccess", [], CALLER_PERMISSION_FIELDS.map(([field]) => field));
+    if (fields.length === 0) return undefined;
+    const result = await this.query(`SELECT ${fields.join(", ")} FROM UserPermissionAccess`, 1);
+    return result.records[0];
   }
 
   async listPermissionSetAssignments(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1061,10 +1147,14 @@ export class SalesforceApiClient {
   }
 
   async listTwoFactorMethods(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    return this.query(
-      "SELECT Id, UserId, HasTotp, HasU2F, HasSecurityKey, HasSalesforceAuthenticator, HasBuiltInAuthenticator, HasTempCode, HasUserVerifiedMobileNumber, HasUserVerifiedEmailAddress FROM TwoFactorMethodsInfo",
-      limit,
+    const result = await this.query(
+      "SELECT UserId, ExternalId, HasTotp, HasU2F, HasSecurityKey, HasSalesforceAuthenticator, HasBuiltInAuthenticator, HasTempCode, HasUserVerifiedMobileNumber, HasVerifiedMobileNumber, HasUserVerifiedEmailAddress FROM TwoFactorMethodsInfo",
+      Math.max(limit, TWO_FACTOR_METHODS_ROW_CAP),
     );
+    if (result.records.length >= TWO_FACTOR_METHODS_ROW_CAP) {
+      return { ...result, truncated: true };
+    }
+    return result;
   }
 
   async listSensitiveFieldPermissions(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1088,13 +1178,13 @@ export class SalesforceApiClient {
 
   async listConnectedApplications(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
     return this.query(
-      "SELECT Id, Name, OptionsAllowAdminApprovedUsersOnly, OptionsRefreshTokenValidityMetric, RefreshTokenValidityPeriod, OptionsHasSessionLevelPolicy, OptionsIsInternal, OptionsCodeCredentialGuestEnabled, StartUrl, MobileStartUrl, MobileSessionTimeout, PinLength, CreatedDate, LastModifiedDate FROM ConnectedApplication ORDER BY Name",
+      "SELECT Id, Name, OptionsAllowAdminApprovedUsersOnly, OptionsRefreshTokenValidityMetric, RefreshTokenValidityPeriod, OptionsHasSessionLevelPolicy, StartUrl, MobileStartUrl, MobileSessionTimeout, PinLength FROM ConnectedApplication ORDER BY Name",
       limit,
     );
   }
 
   async listOauthTokens(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    return this.query("SELECT Id, AppName, AppMenuItemId, UserId, User.Username, LastUsedDate, UseCount, CreatedDate FROM OauthToken ORDER BY LastUsedDate DESC NULLS LAST", limit);
+    return this.query("SELECT Id, AppName, AppMenuItemId, UserId, LastUsedDate, UseCount FROM OauthToken ORDER BY LastUsedDate DESC NULLS LAST", limit);
   }
 
   async listLoginHistory(days = DEFAULT_LOGIN_HISTORY_DAYS, limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1130,6 +1220,9 @@ type ReadClient = Pick<
   | "listHealthCheckRisks"
   | "readSecuritySettings"
   | "readMyDomainSettings"
+  | "listProfileMetadata"
+  | "readProfileMetadata"
+  | "getCallerPermissions"
   | "listUsers"
   | "listProfiles"
   | "listPermissionSets"
@@ -1165,6 +1258,7 @@ async function collectRecords(name: string, load: () => Promise<SalesforceQueryR
       truncated: result.truncated,
       seen: result.records.length,
       total: result.totalSize,
+      omittedFields: result.omittedFields,
     };
   } catch (error) {
     return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0 };
@@ -1275,18 +1369,119 @@ function riskLookup(risks: JsonRecord[], pattern: RegExp): JsonRecord | undefine
   return risks.find((risk) => pattern.test(asString(risk.Setting) ?? ""));
 }
 
+function isAdminProfile(profile: JsonRecord): boolean {
+  return asBoolean(profile.PermissionsModifyAllData) === true || asString(profile.Name) === "System Administrator";
+}
+
+function sensitiveProfiles(profiles: JsonRecord[]): JsonRecord[] {
+  return profiles.filter((profile) => isAdminProfile(profile) || hasElevatedPermission(profile).length > 0);
+}
+
+function loginHoursRestricted(record: JsonRecord): boolean {
+  const hours = asObject(record.loginHours);
+  if (!hours) return false;
+  return WEEKDAYS.some((day) => {
+    const start = asNumber(hours[`${day}Start`]);
+    const end = asNumber(hours[`${day}End`]);
+    return start !== undefined && end !== undefined && !(start === 0 && end === MINUTES_PER_DAY);
+  });
+}
+
+function loginIpRangeCount(record: JsonRecord): number {
+  const raw = record.loginIpRanges;
+  return asRecords(Array.isArray(raw) ? raw : raw ? [raw] : []).length;
+}
+
+function profileMetadataLabel(record: JsonRecord): string {
+  return asString(record[PROFILE_NAME_KEY]) ?? asString(record[PROFILE_FULL_NAME_KEY]) ?? asString(record.fullName) ?? "profile";
+}
+
+interface ProfileMetadataView {
+  resolved: JsonRecord[];
+  unresolved: JsonRecord[];
+  complete: boolean;
+}
+
+function profileMetadataView(dataset: SalesforceDataset<JsonRecord[]>): ProfileMetadataView {
+  const resolved = dataset.data.filter((record) => record[PROFILE_RESOLVED_KEY] === true);
+  const unresolved = dataset.data.filter((record) => record[PROFILE_RESOLVED_KEY] !== true);
+  return { resolved, unresolved, complete: resolved.length > 0 && unresolved.length === 0 && !dataset.truncated };
+}
+
+function profileListIssue(profiles: SalesforceDataset<JsonRecord[]>): string | undefined {
+  if (profiles.status !== "ok") return unreadableReason(profiles);
+  if (profiles.data.length === 0) return "zero profiles were returned, which is not possible for a real org and indicates a permission-limited view";
+  if (!profiles.data.some(isAdminProfile)) return "no administrator-class profile (System Administrator or Modify All Data) is visible, so the profile list is a permission-limited view";
+  return undefined;
+}
+
+function profileMetadataIssue(profiles: SalesforceDataset<JsonRecord[]>, profileMetadata: SalesforceDataset<JsonRecord[]>): string | undefined {
+  const listIssue = profileListIssue(profiles);
+  if (listIssue) return listIssue;
+  if (profileMetadata.status !== "ok") return `${unreadableReason(profileMetadata)}; readMetadata(Profile) requires Modify Metadata Through Metadata API Functions or Modify All Data`;
+  if (profileMetadataView(profileMetadata).resolved.length === 0) {
+    return `none of the ${profileMetadata.total ?? 0} sensitive profiles could be resolved through listMetadata(Profile) and readMetadata(Profile)`;
+  }
+  return undefined;
+}
+
+export async function collectProfileMetadata(client: ReadClient, profiles: SalesforceDataset<JsonRecord[]>): Promise<SalesforceDataset<JsonRecord[]>> {
+  const name = "Profile metadata";
+  if (profiles.status !== "ok") {
+    return { name, status: profiles.status, data: [], error: `Profile list was not readable (${profiles.error ?? profiles.status})`, truncated: false, seen: 0 };
+  }
+  const targets = sensitiveProfiles(profiles.data);
+  const selected = targets.slice(0, MAX_PROFILE_METADATA_READS);
+  try {
+    const listing = await client.listProfileMetadata();
+    const fullNameById = new Map<string, string>();
+    for (const item of listing) {
+      const id = asString(item.id);
+      const fullName = asString(item.fullName);
+      if (id && fullName) fullNameById.set(id, fullName);
+    }
+    const resolvedNames = selected.map((profile) => ({ profile, fullName: fullNameById.get(asString(profile.Id) ?? "") }));
+    const fullNames = resolvedNames.map((item) => item.fullName).filter((value): value is string => value !== undefined);
+    const records = fullNames.length > 0 ? await client.readProfileMetadata(fullNames) : [];
+    const byFullName = new Map(records.map((record) => [asString(record.fullName) ?? "", record]));
+    const data = resolvedNames.map(({ profile, fullName }) => {
+      const record = fullName ? byFullName.get(fullName) : undefined;
+      return {
+        ...(record ?? {}),
+        [PROFILE_ID_KEY]: asString(profile.Id) ?? null,
+        [PROFILE_NAME_KEY]: asString(profile.Name) ?? null,
+        [PROFILE_FULL_NAME_KEY]: fullName ?? null,
+        [PROFILE_RESOLVED_KEY]: record !== undefined,
+      };
+    });
+    return {
+      name,
+      status: "ok",
+      data,
+      truncated: profiles.truncated || targets.length > selected.length,
+      seen: data.filter((record) => record[PROFILE_RESOLVED_KEY] === true).length,
+      total: targets.length,
+    };
+  } catch (error) {
+    return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, total: targets.length };
+  }
+}
+
 export interface SalesforcePlatformData {
   organization: SalesforceDataset<JsonRecord | undefined>;
   healthCheck: SalesforceDataset<JsonRecord | undefined>;
   healthCheckRisks: SalesforceDataset<JsonRecord[]>;
   securitySettings: SalesforceDataset<JsonRecord | undefined>;
   myDomainSettings: SalesforceDataset<JsonRecord | undefined>;
+  profiles: SalesforceDataset<JsonRecord[]>;
+  profileMetadata: SalesforceDataset<JsonRecord[]>;
   instanceUrl?: string;
 }
 
 export interface SalesforceIdentityData {
   users: SalesforceDataset<JsonRecord[]>;
   profiles: SalesforceDataset<JsonRecord[]>;
+  profileMetadata: SalesforceDataset<JsonRecord[]>;
   permissionSets: SalesforceDataset<JsonRecord[]>;
   assignments: SalesforceDataset<JsonRecord[]>;
   twoFactorMethods: SalesforceDataset<JsonRecord[]>;
@@ -1304,6 +1499,7 @@ export interface SalesforceDataProtectionData {
 export interface SalesforceMonitoringData {
   connectedApplications: SalesforceDataset<JsonRecord[]>;
   oauthTokens: SalesforceDataset<JsonRecord[]>;
+  callerPermissions: SalesforceDataset<JsonRecord | undefined>;
   loginHistory: SalesforceDataset<JsonRecord[]>;
   setupAuditTrail: SalesforceDataset<JsonRecord[]>;
   eventLogFiles: SalesforceDataset<JsonRecord[]>;
@@ -1313,20 +1509,22 @@ export interface SalesforceMonitoringData {
 
 export async function collectSalesforcePlatformData(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforcePlatformData> {
   const limit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 200_000);
-  const [organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings] = await Promise.all([
+  const [organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings, profiles] = await Promise.all([
     collectRecord("Organization", () => client.getOrganization()),
     collectRecord("SecurityHealthCheck", () => client.getHealthCheck()),
     collectRecords("SecurityHealthCheckRisks", () => client.listHealthCheckRisks(limit)),
     collectRecord("SecuritySettings", () => client.readSecuritySettings()),
     collectRecord("MyDomainSettings", () => client.readMyDomainSettings()),
+    collectRecords("Profile", () => client.listProfiles(limit)),
   ]);
+  const profileMetadata = await collectProfileMetadata(client, profiles);
   let instanceUrl = client.getResolvedConfig().instanceUrl;
   try {
     instanceUrl = (await client.getSession()).instanceUrl;
   } catch {
     instanceUrl = client.getResolvedConfig().instanceUrl;
   }
-  return { organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings, instanceUrl };
+  return { organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings, profiles, profileMetadata, instanceUrl };
 }
 
 export function assessSalesforcePlatformData(data: SalesforcePlatformData): SalesforceAssessmentResult {
@@ -1416,11 +1614,35 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
     const rawRanges = network.ipRanges;
     const ranges = asRecords(Array.isArray(rawRanges) ? rawRanges : rawRanges ? [rawRanges] : []);
     const enforceEveryRequest = metadataBoolean(session.enforceIpRangesEveryRequest);
-    const evidence = { trusted_ip_ranges: ranges.length, ranges: truncateList(ranges.map((range) => `${asString(range.start) ?? "?"}-${asString(range.end) ?? "?"}`)), enforce_ip_ranges_every_request: enforceEveryRequest ?? null };
-    if (ranges.length === 0) {
-      findings.push(finding(5, "warn", "No org-wide trusted IP ranges are defined in SecuritySettings.networkAccess; per-profile login IP ranges are not exposed by readMetadata on SecuritySettings and must be reviewed manually.", evidence, ipManual));
+    const orgWide = `${ranges.length} org-wide trusted IP ranges are defined in SecuritySettings.networkAccess and enforceIpRangesEveryRequest=${enforceEveryRequest ?? "absent"}`;
+    const profileIssue = profileMetadataIssue(data.profiles, data.profileMetadata);
+    const view = profileMetadataView(data.profileMetadata);
+    const withRanges = view.resolved.filter((record) => loginIpRangeCount(record) > 0);
+    const withoutRanges = view.resolved.filter((record) => loginIpRangeCount(record) === 0);
+    const evidence = {
+      trusted_ip_ranges: ranges.length,
+      ranges: truncateList(ranges.map((range) => `${asString(range.start) ?? "?"}-${asString(range.end) ?? "?"}`)),
+      enforce_ip_ranges_every_request: enforceEveryRequest ?? null,
+      sensitive_profiles: data.profileMetadata.total ?? null,
+      sensitive_profiles_read: view.resolved.length,
+      profiles_with_login_ip_ranges: truncateList(withRanges.map((record) => `${profileMetadataLabel(record)} (${loginIpRangeCount(record)})`)),
+      profiles_without_login_ip_ranges: truncateList(withoutRanges.map(profileMetadataLabel)),
+      profiles_unresolved: truncateList(view.unresolved.map(profileMetadataLabel)),
+      profile_metadata_status: data.profileMetadata.status,
+      profile_metadata_truncated: data.profileMetadata.truncated,
+    };
+    if (profileIssue) {
+      findings.push(finding(5, "manual", `${orgWide}; per-profile login IP ranges could not be verified because ${profileIssue}.`, evidence, ipManual));
+    } else if (withRanges.length === 0 && ranges.length === 0) {
+      findings.push(finding(5, "fail", `No login IP restrictions are configured: none of the ${view.resolved.length} sensitive profiles define loginIpRanges and no org-wide trusted IP ranges exist.`, evidence, ipManual));
+    } else if (withoutRanges.length === 0 && view.complete && enforceEveryRequest === true) {
+      findings.push(finding(5, "pass", `All ${view.resolved.length} sensitive profiles define login IP ranges, login IP ranges are enforced on every request, and ${ranges.length} org-wide trusted IP ranges are defined.`, evidence));
     } else {
-      findings.push(finding(5, enforceEveryRequest === true ? "pass" : "warn", `${ranges.length} org-wide trusted IP ranges are defined${enforceEveryRequest === true ? " and login IP ranges are enforced on every request." : ", but enforceIpRangesEveryRequest is not enabled and per-profile ranges still need manual review."}`, evidence, enforceEveryRequest === true ? undefined : ipManual));
+      const gaps: string[] = [];
+      if (withoutRanges.length > 0) gaps.push(`${withoutRanges.length}/${view.resolved.length} sensitive profiles have no login IP ranges`);
+      if (!view.complete) gaps.push(`${view.unresolved.length} sensitive profiles could not be resolved${data.profileMetadata.truncated ? ` and only ${view.resolved.length} of ${data.profileMetadata.total ?? "?"} were read` : ""}`);
+      if (enforceEveryRequest !== true) gaps.push("enforceIpRangesEveryRequest is not enabled");
+      findings.push(finding(5, "warn", `${orgWide}; ${gaps.join("; ")}.`, evidence, ipManual));
     }
   }
 
@@ -1499,7 +1721,7 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
       mfa_health_check_setting: mfaRisk ? `${asString(mfaRisk.Setting)} = ${asString(mfaRisk.OrgValue)}` : null,
     },
     findings: findings.sort((left, right) => left.control - right.control),
-    errors: datasetErrors(data.organization, data.healthCheck, data.healthCheckRisks, data.securitySettings, data.myDomainSettings),
+    errors: datasetErrors(data.organization, data.healthCheck, data.healthCheckRisks, data.securitySettings, data.myDomainSettings, data.profiles, data.profileMetadata),
   };
 }
 
@@ -1535,7 +1757,19 @@ export async function collectSalesforceIdentityData(client: ReadClient, options:
     collectRecord("SecuritySettings", () => client.readSecuritySettings()),
     collectRecords("SecurityHealthCheckRisks", () => client.listHealthCheckRisks(limit)),
   ]);
-  return { users, profiles, permissionSets, assignments, twoFactorMethods, securitySettings, healthCheckRisks };
+  const profileMetadata = await collectProfileMetadata(client, profiles);
+  return { users, profiles, profileMetadata, permissionSets, assignments, twoFactorMethods, securitySettings, healthCheckRisks };
+}
+
+function populationIssue(data: SalesforceIdentityData, admins: JsonRecord[]): string | undefined {
+  const listIssue = profileListIssue(data.profiles);
+  if (listIssue) return listIssue;
+  if (data.users.status !== "ok") return unreadableReason(data.users);
+  if (data.users.data.length === 0) return "zero users were returned; the auditing user cannot see the org population (View All Users is likely missing)";
+  if (admins.length === 0) {
+    return `${data.users.data.length} users were returned but none of the active ones hold an administrator-class profile, which is impossible for a real org and indicates a partial user view (View All Users is likely missing)`;
+  }
+  return undefined;
 }
 
 export function assessSalesforceIdentityData(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
@@ -1548,6 +1782,20 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   const profileById = new Map(profiles.map((profile) => [asString(profile.Id) ?? "", profile]));
   const usersReadable = data.users.status === "ok";
   const profilesReadable = data.profiles.status === "ok";
+  const adminProfiles = profiles.filter(isAdminProfile);
+  const adminProfileIds = new Set(adminProfiles.map((profile) => asString(profile.Id) ?? ""));
+  const admins = activeUsers.filter((user) => adminProfileIds.has(asString(user.ProfileId) ?? ""));
+  const population = populationIssue(data, admins);
+  const populationEvidence = {
+    users_seen: data.users.seen,
+    users_total: data.users.total ?? null,
+    active_users: activeUsers.length,
+    profiles_seen: profiles.length,
+    admin_profiles: truncateList(adminProfiles.map((profile) => asString(profile.Name) ?? "")),
+    active_admins_seen: admins.length,
+  };
+  const populationManual = (control: number, manualEvidence: string): SalesforceFinding =>
+    finding(control, "manual", `${controlDefinition(control).title} cannot be verified from this credential's view because ${population}.`, populationEvidence, manualEvidence);
 
   const mfaManual = "Setup > Identity Verification (Session Settings): confirm 'Require multi-factor authentication (MFA) for all direct UI logins to your org' is enabled; then Setup > Users > (each active user): confirm registered MFA methods.";
   const session = asObject(data.securitySettings.data?.sessionSettings) ?? {};
@@ -1568,39 +1816,63 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     users_without_registered_mfa_method: unenrolled.length,
     sample_users_without_mfa: truncateList(unenrolled.map(userLabel)),
     two_factor_methods_readable: data.twoFactorMethods.status === "ok",
+    two_factor_methods_rows: data.twoFactorMethods.data.length,
+    two_factor_methods_possibly_capped: data.twoFactorMethods.truncated,
     users_truncated: data.users.truncated,
   };
+  const capNote = data.twoFactorMethods.truncated
+    ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.data.length} rows, which is the documented ${TWO_FACTOR_METHODS_ROW_CAP}-row cap with no done=false signal, so enrollment coverage may be incomplete.`
+    : "";
   if (data.securitySettings.status !== "ok" && !mfaRisk) {
     findings.push(finding(4, "manual", `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
   } else if (mfaRequired === false || mfaRiskMeets === false) {
     findings.push(finding(4, "fail", `MFA is not required for all direct UI logins (enableMFADirectUILoginOptIn=${mfaRequired ?? "absent"}${mfaRisk ? `, Health Check: ${asString(mfaRisk.Setting)} = ${asString(mfaRisk.OrgValue)}` : ""}).`, mfaEvidence));
   } else if (mfaRequired === true || mfaRiskMeets === true) {
-    if (!usersReadable || data.twoFactorMethods.status !== "ok") {
-      findings.push(finding(4, "manual", `MFA is required for direct UI logins, but per-user enrollment could not be verified because ${!usersReadable ? unreadableReason(data.users) : unreadableReason(data.twoFactorMethods)}.`, mfaEvidence, mfaManual));
+    if (data.twoFactorMethods.status !== "ok") {
+      findings.push(finding(4, "manual", `MFA is required for direct UI logins, but per-user enrollment could not be verified because ${unreadableReason(data.twoFactorMethods)}; TwoFactorMethodsInfo requires the Manage MFA in API permission.`, { ...mfaEvidence, requires: "Manage MFA in API" }, mfaManual));
+    } else if (population) {
+      findings.push(finding(4, "manual", `MFA is required for direct UI logins, but per-user enrollment cannot be verified because ${population}.`, { ...mfaEvidence, ...populationEvidence }, mfaManual));
     } else if (standardActiveUsers.length === 0) {
       findings.push(finding(4, "manual", "MFA is required for direct UI logins, but zero active standard users were returned, which indicates a partial user view rather than a compliant org.", mfaEvidence, mfaManual));
     } else if (unenrolled.length === 0) {
-      findings.push(finding(4, withPartialDowngrade("pass", data.users), `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}`, mfaEvidence));
+      const status = withPartialDowngrade(withPartialDowngrade("pass", data.users), data.twoFactorMethods);
+      findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
     } else {
-      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).`, mfaEvidence));
+      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).${capNote}`, mfaEvidence));
     }
   } else {
     findings.push(finding(4, "manual", "Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed.", mfaEvidence, mfaManual));
   }
 
-  findings.push(finding(
-    6,
-    "manual",
-    "Login hour restrictions live in Profile metadata (loginHours), which this inspector does not retrieve; verify sensitive profiles in Setup.",
-    { profiles_visible: profiles.length, sensitive_profiles: truncateList(profiles.filter((profile) => hasElevatedPermission(profile).length > 0).map((profile) => asString(profile.Name) ?? "")) },
-    "Setup > Profiles > (System Administrator and other elevated profiles) > Login Hours: record configured hours or the decision not to restrict them.",
-  ));
+  const hoursManual = "Setup > Profiles > (System Administrator and other elevated profiles) > Login Hours: record configured hours or the decision not to restrict them.";
+  const hoursIssue = profileMetadataIssue(data.profiles, data.profileMetadata);
+  if (hoursIssue) {
+    findings.push(finding(6, "manual", `Login hour restrictions could not be verified because ${hoursIssue}.`, { ...populationEvidence, profile_metadata_status: data.profileMetadata.status, profile_metadata_error: data.profileMetadata.error ?? null }, hoursManual));
+  } else {
+    const view = profileMetadataView(data.profileMetadata);
+    const restricted = view.resolved.filter(loginHoursRestricted);
+    const unrestricted = view.resolved.filter((record) => !loginHoursRestricted(record));
+    const evidence = {
+      sensitive_profiles: data.profileMetadata.total ?? null,
+      sensitive_profiles_read: view.resolved.length,
+      profiles_with_login_hours: truncateList(restricted.map(profileMetadataLabel)),
+      profiles_without_login_hours: truncateList(unrestricted.map(profileMetadataLabel)),
+      profiles_unresolved: truncateList(view.unresolved.map(profileMetadataLabel)),
+      profile_metadata_truncated: data.profileMetadata.truncated,
+    };
+    if (unrestricted.length === 0 && view.complete) {
+      findings.push(finding(6, "pass", `All ${view.resolved.length} sensitive profiles (System Administrator and profiles with elevated permissions) restrict login hours.`, evidence));
+    } else if (restricted.length === 0) {
+      findings.push(finding(6, "fail", `None of the ${view.resolved.length} sensitive profiles read restrict login hours (loginHours absent or covering the full day).${view.complete ? "" : ` ${view.unresolved.length} sensitive profiles could not be resolved.`}`, evidence, hoursManual));
+    } else {
+      findings.push(finding(6, "warn", `${restricted.length}/${view.resolved.length} sensitive profiles restrict login hours; ${unrestricted.length} do not${view.complete ? "" : ` and ${view.unresolved.length} could not be resolved`}.`, evidence, hoursManual));
+    }
+  }
 
   const apiManual = "Setup > Profiles: for each profile with API Enabled, confirm the assigned users require API access; record API Only User profiles.";
-  if (!profilesReadable) {
-    findings.push(manualForUnreadable(7, data.profiles, apiManual));
-  } else if (profiles.length === 0) {
-    findings.push(finding(7, "manual", "Zero profiles were returned, which is not possible for a real org and indicates a permission-limited view.", { profiles: 0 }, apiManual));
+  const apiOnlyFlagAvailable = !(data.profiles.omittedFields ?? []).includes("PermissionsApiUserOnly");
+  if (population) {
+    findings.push(populationManual(7, apiManual));
   } else {
     const apiProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiEnabled) === true);
     const apiOnlyProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiUserOnly) === true);
@@ -1610,17 +1882,22 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       profiles: profiles.length,
       api_enabled_profiles: truncateList(apiProfiles.map((profile) => asString(profile.Name) ?? "")),
       api_only_profiles: truncateList(apiOnlyProfiles.map((profile) => asString(profile.Name) ?? "")),
-      active_users_on_api_enabled_profiles: usersReadable ? usersOnApiProfiles.length : null,
+      api_only_flag_available: apiOnlyFlagAvailable,
+      active_users_on_api_enabled_profiles: usersOnApiProfiles.length,
       profiles_truncated: data.profiles.truncated,
+      profile_fields_omitted: data.profiles.omittedFields ?? [],
     };
     const status: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : withPartialDowngrade("pass", data.profiles);
-    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} profiles grant API Enabled${usersReadable ? ` covering ${usersOnApiProfiles.length} active users` : ""}; ${apiOnlyProfiles.length} are API Only User profiles.${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : apiManual));
+    const apiOnlyNote = apiOnlyFlagAvailable ? `${apiOnlyProfiles.length} are API Only User profiles.` : "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified.";
+    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} profiles grant API Enabled covering ${usersOnApiProfiles.length} active users; ${apiOnlyNote}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : apiManual));
   }
 
   const permSetManual = "Setup > Permission Sets: filter by Modify All Data, View All Data, Manage Users, and Author Apex; export the assignment list and confirm each assignee is justified.";
   const permissionSets = data.permissionSets.data;
   if (data.permissionSets.status !== "ok") {
     findings.push(manualForUnreadable(9, data.permissionSets, permSetManual));
+  } else if (population) {
+    findings.push(populationManual(9, permSetManual));
   } else if (permissionSets.length === 0) {
     findings.push(finding(9, "manual", "Zero permission sets were returned; even orgs without custom permission sets expose standard ones, so this indicates a permission-limited view.", { permission_sets: 0 }, permSetManual));
   } else {
@@ -1649,14 +1926,9 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   }
 
   const adminManual = "Setup > Users: filter by System Administrator profile and export the list; confirm each administrator is justified.";
-  if (!profilesReadable || !usersReadable) {
-    findings.push(manualForUnreadable(10, profilesReadable ? data.users : data.profiles, adminManual));
-  } else if (users.length === 0) {
-    findings.push(finding(10, "manual", "Zero users were returned; the auditing user cannot see the org population (View All Users is likely missing).", { users: 0 }, adminManual));
+  if (population) {
+    findings.push(populationManual(10, adminManual));
   } else {
-    const adminProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsModifyAllData) === true || asString(profile.Name) === "System Administrator");
-    const adminProfileIds = new Set(adminProfiles.map((profile) => asString(profile.Id) ?? ""));
-    const admins = activeUsers.filter((user) => adminProfileIds.has(asString(user.ProfileId) ?? ""));
     const now = options.now ?? new Date();
     const staleDays = clampNumber(options.staleLoginDays, DEFAULT_STALE_LOGIN_DAYS, 1, 3650);
     const adminsWithoutLogin = admins.filter((user) => asDate(user.LastLoginDate) === undefined);
@@ -1680,8 +1952,8 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   }
 
   const guestManual = "Setup > Sites and Digital Experiences > (each site) > Public Access Settings: confirm guest profiles have no API access, no View All or Modify All permissions, and object access limited to what the site needs.";
-  if (!usersReadable) {
-    findings.push(manualForUnreadable(13, data.users, guestManual));
+  if (population) {
+    findings.push(populationManual(13, guestManual));
   } else {
     const guests = users.filter((user) => asString(user.UserType) === "Guest");
     const activeGuests = guests.filter((user) => asBoolean(user.IsActive) === true);
@@ -1698,12 +1970,8 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     };
     if (data.users.truncated) {
       findings.push(finding(13, "warn", `Only ${data.users.seen} of ${data.users.total ?? "unknown"} users were read, so guest user coverage is partial; ${activeGuests.length} active guest users were seen.`, evidence, guestManual));
-    } else if (users.length === 0) {
-      findings.push(finding(13, "manual", "Zero users were returned, so guest users cannot be ruled out; the auditing user cannot see the org population (View All Users is likely missing).", evidence, guestManual));
     } else if (activeGuests.length === 0) {
-      findings.push(finding(13, "pass", "No active guest users exist, so no Sites or Experience Cloud public access is exposed through guest profiles (emptiness is compliant for this control).", evidence));
-    } else if (!profilesReadable) {
-      findings.push(finding(13, "manual", `${activeGuests.length} active guest users exist, but their profiles could not be read because ${unreadableReason(data.profiles)}.`, evidence, guestManual));
+      findings.push(finding(13, "pass", `No active guest users exist among the ${users.length} visible users (${admins.length} active administrators seen), so no Sites or Experience Cloud public access is exposed through guest profiles (emptiness is compliant for this control).`, evidence));
     } else if (riskyGuests.length > 0) {
       findings.push(finding(13, "fail", `${riskyGuests.length}/${activeGuests.length} active guest users sit on profiles with API Enabled or elevated data permissions.`, evidence));
     } else {
@@ -1722,10 +1990,13 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       permission_sets: permissionSets.length,
       permission_set_assignments: data.assignments.data.length,
       two_factor_method_rows: data.twoFactorMethods.data.length,
+      two_factor_methods_possibly_capped: data.twoFactorMethods.truncated,
       mfa_required_for_direct_ui_login: mfaRequired ?? null,
+      sensitive_profiles_read: data.profileMetadata.seen,
+      population_view_issue: population ?? null,
     },
     findings: findings.sort((left, right) => left.control - right.control),
-    errors: datasetErrors(data.users, data.profiles, data.permissionSets, data.assignments, data.twoFactorMethods, data.securitySettings, data.healthCheckRisks),
+    errors: datasetErrors(data.users, data.profiles, data.profileMetadata, data.permissionSets, data.assignments, data.twoFactorMethods, data.securitySettings, data.healthCheckRisks),
   };
 }
 
@@ -1830,7 +2101,8 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
     const undated = certificates.filter((cert) => asDate(cert.ExpirationDate) === undefined);
     const expired = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() < now.getTime(); });
     const expiring = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() >= now.getTime() && daysBetween(date, now) <= warningDays; });
-    const weakKeys = certificates.filter((cert) => (asNumber(cert.KeySize) ?? 2048) < 2048);
+    const weakKeys = certificates.filter((cert) => { const size = asNumber(cert.KeySize); return size !== undefined && size < 2048; });
+    const unknownKeySize = certificates.filter((cert) => asNumber(cert.KeySize) === undefined);
     const selfSigned = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === false);
     const unknownSigning = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === undefined);
     const exportableKeys = certificates.filter((cert) => asBoolean(cert.OptionsIsPrivateKeyExportable) === true);
@@ -1843,18 +2115,20 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
       expiring: truncateList(expiring.map(label)),
       missing_expiration_date: truncateList(undated.map(label)),
       weak_keys: truncateList(weakKeys.map(label)),
+      unknown_key_size: truncateList(unknownKeySize.map(label)),
       self_signed: truncateList(selfSigned.map(label)),
       signing_status_unknown: truncateList(unknownSigning.map(label)),
       exportable_private_keys: truncateList(exportableKeys.map(label)),
       awaiting_signed_chain: truncateList(pendingChain.map(label)),
       truncated: data.certificates.truncated,
     };
-    const needsReview = expiring.length > 0 || undated.length > 0 || unknownSigning.length > 0 || exportableKeys.length > 0 || pendingChain.length > 0;
+    const needsReview = expiring.length > 0 || undated.length > 0 || unknownKeySize.length > 0 || unknownSigning.length > 0 || exportableKeys.length > 0 || pendingChain.length > 0;
     const status: SalesforceFindingStatus = expired.length > 0 || weakKeys.length > 0 ? "fail" : needsReview ? "warn" : withPartialDowngrade("pass", data.certificates);
     const signingNote = unknownSigning.length > 0
       ? `OptionsIsCaSigned was not returned for ${unknownSigning.length}, so their signing status needs manual confirmation.`
       : `${selfSigned.length} self-signed and ${certificates.length - selfSigned.length} CA-signed.`;
-    findings.push(finding(17, status, `${certificates.length} certificates: ${expired.length} expired, ${expiring.length} expiring within ${warningDays} days, ${undated.length} without an expiration date (not counted as valid), ${weakKeys.length} with keys under 2048 bits, ${exportableKeys.length} with exportable private keys, ${pendingChain.length} awaiting a signed chain. ${signingNote}${partialNote(data.certificates)}`, evidence, status === "pass" ? undefined : certManual));
+    const keySizeNote = unknownKeySize.length > 0 ? ` KeySize was not returned for ${unknownKeySize.length}, so they are not counted as compliant.` : "";
+    findings.push(finding(17, status, `${certificates.length} certificates: ${expired.length} expired, ${expiring.length} expiring within ${warningDays} days, ${undated.length} without an expiration date (not counted as valid), ${weakKeys.length} with keys under 2048 bits, ${exportableKeys.length} with exportable private keys, ${pendingChain.length} awaiting a signed chain. ${signingNote}${keySizeNote}${partialNote(data.certificates)}`, evidence, status === "pass" ? undefined : certManual));
   }
 
   return {
@@ -1880,14 +2154,20 @@ export async function collectSalesforceMonitoringData(client: ReadClient, option
   const limit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 200_000);
   const loginHistoryDays = clampNumber(options.loginHistoryDays, DEFAULT_LOGIN_HISTORY_DAYS, 1, 180);
   const auditTrailDays = clampNumber(options.auditTrailDays, DEFAULT_AUDIT_TRAIL_DAYS, 1, 180);
-  const [connectedApplications, oauthTokens, loginHistory, setupAuditTrail, eventLogFiles] = await Promise.all([
+  const [connectedApplications, oauthTokens, callerPermissions, loginHistory, setupAuditTrail, eventLogFiles] = await Promise.all([
     collectRecords("ConnectedApplication", () => client.listConnectedApplications(limit)),
     collectRecords("OauthToken", () => client.listOauthTokens(limit)),
+    collectRecord("UserPermissionAccess", () => client.getCallerPermissions()),
     collectRecords("LoginHistory", () => client.listLoginHistory(loginHistoryDays, limit)),
     collectRecords("SetupAuditTrail", () => client.listSetupAuditTrail(auditTrailDays, limit)),
     collectRecords("EventLogFile", () => client.listEventLogFiles(7, 200)),
   ]);
-  return { connectedApplications, oauthTokens, loginHistory, setupAuditTrail, eventLogFiles, loginHistoryDays, auditTrailDays };
+  return { connectedApplications, oauthTokens, callerPermissions, loginHistory, setupAuditTrail, eventLogFiles, loginHistoryDays, auditTrailDays };
+}
+
+function callerPermission(dataset: SalesforceDataset<JsonRecord | undefined>, field: string): boolean | undefined {
+  if (dataset.status !== "ok" || !dataset.data) return undefined;
+  return asBoolean(dataset.data[field]);
 }
 
 export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): SalesforceAssessmentResult {
@@ -1895,15 +2175,20 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
 
   const appManual = "Setup > Apps > Connected Apps > Manage Connected Apps: for each app record Permitted Users, IP Relaxation, Refresh Token Policy, and OAuth scopes; Setup > Connected Apps OAuth Usage: review apps with active tokens.";
   const apps = data.connectedApplications.data;
+  const tokensReadable = data.oauthTokens.status === "ok";
+  const canSeeAllTokens = callerPermission(data.callerPermissions, "PermissionsCustomizeApplication");
+  const tokenViewPartial = tokensReadable && canSeeAllTokens !== true;
+  const tokenViewNote = tokenViewPartial
+    ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${canSeeAllTokens === false ? "false" : "unknown"}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
+    : "";
   if (data.connectedApplications.status !== "ok") {
     findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
   } else if (apps.length === 0) {
-    findings.push(finding(11, "manual", "ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.", { connected_applications: 0, oauth_tokens: data.oauthTokens.status === "ok" ? data.oauthTokens.data.length : null }, appManual));
+    findings.push(finding(11, "manual", `ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.${tokenViewNote}`, { connected_applications: 0, oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null, oauth_tokens_partial_view: tokenViewPartial }, appManual));
   } else {
     const openApps = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === false);
     const unknownPolicy = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === undefined);
     const unboundedRefresh = apps.filter((app) => asNumber(app.RefreshTokenValidityPeriod) === undefined && asBoolean(app.OptionsRefreshTokenValidityMetric) !== true);
-    const tokensReadable = data.oauthTokens.status === "ok";
     const tokensByApp = new Map<string, number>();
     for (const token of data.oauthTokens.data) {
       const key = asString(token.AppName) ?? "unknown";
@@ -1915,15 +2200,17 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       apps_without_policy_flag: truncateList(unknownPolicy.map((app) => asString(app.Name) ?? "")),
       apps_without_refresh_token_limit: truncateList(unboundedRefresh.map((app) => asString(app.Name) ?? "")),
       oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null,
+      oauth_tokens_partial_view: tokenViewPartial,
+      caller_has_customize_application: canSeeAllTokens ?? null,
       tokens_by_app: tokensReadable ? Object.fromEntries([...tokensByApp.entries()].slice(0, 25)) : null,
       truncated: data.connectedApplications.truncated,
     };
     if (unknownPolicy.length === apps.length) {
-      findings.push(finding(11, "manual", `${apps.length} connected apps were returned but none exposed OptionsAllowAdminApprovedUsersOnly, so the pre-authorization policy cannot be confirmed.`, evidence, appManual));
+      findings.push(finding(11, "manual", `${apps.length} connected apps were returned but none exposed OptionsAllowAdminApprovedUsersOnly, so the pre-authorization policy cannot be confirmed.${tokenViewNote}`, evidence, appManual));
     } else if (openApps.length > 0) {
-      findings.push(finding(11, openApps.length > apps.length / 2 ? "fail" : "warn", `${openApps.length}/${apps.length} connected apps allow all users to self-authorize instead of admin pre-approval; ${unboundedRefresh.length} have no refresh token expiry. OAuth scopes are not exposed by SOQL and need manual review.`, evidence, appManual));
+      findings.push(finding(11, openApps.length > apps.length / 2 ? "fail" : "warn", `${openApps.length}/${apps.length} connected apps allow all users to self-authorize instead of admin pre-approval; ${unboundedRefresh.length} have no refresh token expiry. OAuth scopes are not exposed by SOQL and need manual review.${tokenViewNote}`, evidence, appManual));
     } else {
-      findings.push(finding(11, "warn", `All ${apps.length} connected apps with visible policies require admin pre-approval, but OAuth scopes and IP relaxation are not exposed by SOQL and still need manual review.${partialNote(data.connectedApplications)}`, evidence, appManual));
+      findings.push(finding(11, "warn", `All ${apps.length} connected apps with visible policies require admin pre-approval, but OAuth scopes and IP relaxation are not exposed by SOQL and still need manual review.${partialNote(data.connectedApplications)}${tokenViewNote}`, evidence, appManual));
     }
   }
 
@@ -1994,6 +2281,8 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     summary: {
       connected_applications: apps.length,
       oauth_tokens: data.oauthTokens.data.length,
+      oauth_tokens_partial_view: tokenViewPartial,
+      caller_has_customize_application: canSeeAllTokens ?? null,
       login_rows: logins.length,
       login_history_days: data.loginHistoryDays,
       audit_rows: trail.length,
@@ -2002,7 +2291,7 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       event_log_status: data.eventLogFiles.status,
     },
     findings: findings.sort((left, right) => left.control - right.control),
-    errors: datasetErrors(data.connectedApplications, data.oauthTokens, data.loginHistory, data.setupAuditTrail, data.eventLogFiles),
+    errors: datasetErrors(data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles),
   };
 }
 
@@ -2042,6 +2331,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
   }
 
   const organization = await collectRecord("Organization", () => client.getOrganization());
+  const callerPermissions = await collectRecord("UserPermissionAccess", () => client.getCallerPermissions());
   const surfaces: SalesforceAccessSurface[] = [
     {
       name: "oauth_session",
@@ -2058,17 +2348,30 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
     await probeSurface("users", `/services/data/v${version}/query (User)`, "View All Users (Manage Users read)", () => client.listUsers(50), queryCount),
     await probeSurface("profiles", `/services/data/v${version}/query (Profile)`, "View Setup and Configuration", () => client.listProfiles(50), queryCount),
     await probeSurface("permission_sets", `/services/data/v${version}/query (PermissionSet)`, "View Setup and Configuration", () => client.listPermissionSets(50), queryCount),
+    await probeSurface("profile_metadata", `/services/Soap/m/${version} listMetadata(Profile) + readMetadata(Profile)`, "Modify Metadata Through Metadata API Functions or Modify All Data", () => client.listProfileMetadata(), (value) => asRecords(value).length),
+    await probeSurface("two_factor_methods", `/services/data/v${version}/query (TwoFactorMethodsInfo)`, "Manage MFA in API", () => client.listTwoFactorMethods(50), queryCount),
     await probeSurface("login_history", `/services/data/v${version}/query (LoginHistory)`, "Manage Users or View All Users", () => client.listLoginHistory(7, 50), queryCount),
     await probeSurface("setup_audit_trail", `/services/data/v${version}/query (SetupAuditTrail)`, "View Setup and Configuration", () => client.listSetupAuditTrail(30, 50), queryCount),
     await probeSurface("connected_applications", `/services/data/v${version}/query (ConnectedApplication)`, "View Setup and Configuration", () => client.listConnectedApplications(50), queryCount),
+    await probeSurface("oauth_tokens", `/services/data/v${version}/query (OauthToken)`, "Customize Application (without it only the caller's own tokens are returned)", () => client.listOauthTokens(50), queryCount),
     await probeSurface("event_log_files", `/services/data/v${version}/query (EventLogFile)`, "View Event Log Files (Event Monitoring license)", () => client.listEventLogFiles(1, 10), queryCount),
+    { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.seen, error: callerPermissions.error, permissionHint: "API Enabled" },
   ];
 
-  const missingPermissions = [...new Set(surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.permissionHint ?? "").filter(Boolean))];
+  const deniedCallerPermissions = CALLER_PERMISSION_FIELDS
+    .filter(([field]) => callerPermission(callerPermissions, field) === false)
+    .map(([, label]) => label);
+  const missingPermissions = [...new Set([
+    ...surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.permissionHint ?? "").filter(Boolean),
+    ...deniedCallerPermissions,
+  ])];
   const coreNames = new Set(["oauth_session", "organization", "health_check", "security_settings", "users", "profiles", "permission_sets", "setup_audit_trail", "login_history"]);
   const coreReadable = surfaces.filter((surface) => coreNames.has(surface.name) && surface.status === "readable").length;
-  const status: SalesforceAccessCheckResult["status"] = coreReadable === coreNames.size ? "healthy" : "limited";
+  const status: SalesforceAccessCheckResult["status"] = coreReadable === coreNames.size && deniedCallerPermissions.length === 0 ? "healthy" : "limited";
   const org = organization.data;
+  const callerNote = callerPermissions.status === "ok" && callerPermissions.data
+    ? `Caller permissions (UserPermissionAccess): ${CALLER_PERMISSION_FIELDS.map(([field, label]) => `${label}=${String(callerPermission(callerPermissions, field) ?? "unknown")}`).join(", ")}.`
+    : `Caller permissions could not be read from UserPermissionAccess (${callerPermissions.error ?? callerPermissions.status}); OauthToken visibility (Customize Application) and user visibility (View All Users) are unknown.`;
 
   return {
     status,
@@ -2081,11 +2384,12 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
       `Auth mode ${config.authMode} against ${config.loginUrl}${instanceUrl ? `, instance ${instanceUrl}` : ""}, API v${version}.`,
       org ? `Org ${asString(org.Name) ?? asString(org.Id)} (${asString(org.OrganizationType) ?? "unknown edition"}, sandbox=${String(asBoolean(org.IsSandbox) ?? "unknown")}).` : "Organization record was not readable.",
       `${surfaces.filter((surface) => surface.status === "readable").length}/${surfaces.length} Salesforce audit surfaces are readable.`,
+      callerNote,
       ...(missingPermissions.length > 0 ? [`Likely missing permissions: ${missingPermissions.join("; ")}.`] : []),
     ],
     recommendedNextStep: status === "healthy"
       ? "Run salesforce_assess_platform_security, salesforce_assess_identity_access, salesforce_assess_data_protection, salesforce_assess_monitoring_integrations, or salesforce_export_audit_bundle."
-      : "Grant the auditing user View Setup and Configuration, View Health Check, API Enabled, View All Users, and Modify Metadata Through Metadata API Functions, then re-run salesforce_check_access.",
+      : "Grant the auditing user View Setup and Configuration, View Health Check, API Enabled, View All Users, Customize Application, Manage MFA in API, and Modify Metadata Through Metadata API Functions, then re-run salesforce_check_access.",
   };
 }
 
@@ -2203,7 +2507,7 @@ function buildQuickReference(): string {
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw API snapshots (Organization, Health Check, SecuritySettings, users, profiles, permission sets, login history, audit trail, connected apps, certificates, tenant secrets, event log files)",
+    "- `core_data/`: raw API snapshots (Organization, Health Check, SecuritySettings, users, profiles, profile metadata for sensitive profiles, permission sets, caller permissions, login history, audit trail, connected apps, certificates, tenant secrets, event log files)",
     "- `analysis/findings.json`: all normalized findings with framework mappings",
     "- `analysis/<area>.json`: per-area assessment results and collection errors",
     "- `compliance/executive_summary.md`: prioritized summary and manual verification queue",
@@ -2257,6 +2561,7 @@ export async function exportSalesforceAuditBundle(
     ["core_data/my_domain_settings.json", platformData.myDomainSettings],
     ["core_data/users.json", identityData.users],
     ["core_data/profiles.json", identityData.profiles],
+    ["core_data/profile_metadata.json", identityData.profileMetadata],
     ["core_data/permission_sets.json", identityData.permissionSets],
     ["core_data/permission_set_assignments.json", identityData.assignments],
     ["core_data/two_factor_methods_info.json", identityData.twoFactorMethods],
@@ -2265,6 +2570,7 @@ export async function exportSalesforceAuditBundle(
     ["core_data/certificates.json", dataProtection.certificates],
     ["core_data/connected_applications.json", monitoring.connectedApplications],
     ["core_data/oauth_tokens.json", monitoring.oauthTokens],
+    ["core_data/caller_permissions.json", monitoring.callerPermissions],
     ["core_data/login_history.json", monitoring.loginHistory],
     ["core_data/setup_audit_trail.json", monitoring.setupAuditTrail],
     ["core_data/event_log_files.json", monitoring.eventLogFiles],
