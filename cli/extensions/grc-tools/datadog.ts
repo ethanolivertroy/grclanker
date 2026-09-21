@@ -1457,6 +1457,14 @@ function evaluateSamlControl(snapshot: DatadogIdentitySnapshot): { finding: Data
       finding: finding(1, "critical", "fail", "SAML SSO is not enabled for the organization; users authenticate with Datadog passwords.", evidence),
     };
   }
+  if (strictSetting === undefined) {
+    return {
+      strictSaml: false,
+      finding: manualFinding(1, "critical", "SAML SSO is enabled but the organization response did not include the saml_strict_mode setting, so password login enforcement could not be read; the partial settings object does not support pass.", [
+        "Capture Organization Settings > Login Methods showing that password login is disabled (SAML strict mode on).",
+      ], evidence),
+    };
+  }
   if (!strictMode) {
     return {
       strictSaml: false,
@@ -2146,6 +2154,7 @@ function evaluateOrgSettingsControl(snapshot: DatadogDataProtectionSnapshot, min
     indexes_without_retention_value: sample(unknownRetention.map((index) => index.name)),
     org_connections: snapshot.orgConnections.value ? connections.length : null,
     org_connections_readable: Boolean(snapshot.orgConnections.value),
+    org_connections_inventory_truncated: snapshot.orgConnections.truncated ?? false,
     org_connection_sample: sample(connections.map((connection) => ({
       types: asStringArray(attributesOf(connection).connection_types),
       sink_org: asString(getNestedValue(connection, ["relationships", "sink_org", "data", "id"])) ?? null,
@@ -2164,12 +2173,15 @@ function evaluateOrgSettingsControl(snapshot: DatadogDataProtectionSnapshot, min
     return manualFinding(20, "medium", "The log indexes endpoint returned no indexes, so log retention could not be evaluated; the empty inventory is treated as unverifiable rather than compliant.", [consoleEvidence[1]], evidence);
   }
   if (shortRetention.length > 0 || unknownRetention.length > 0 || connections.length > 0 || (autocreateEnabled && autocreateDomains.length === 0)) {
-    return finding(
-      20,
-      "medium",
-      "warn",
-      `${shortRetention.length} log indexes retain data for less than ${minLogRetentionDays} days, ${unknownRetention.length} indexes did not report num_retention_days, ${connections.length} cross-org connections share data with other orgs, and SAML user auto-creation ${autocreateEnabled ? `is enabled for ${autocreateDomains.length} domains` : "is disabled"}.`,
-      evidence,
+    return withVerdictCaveats(
+      finding(
+        20,
+        "medium",
+        "warn",
+        `${shortRetention.length} log indexes retain data for less than ${minLogRetentionDays} days, ${unknownRetention.length} indexes did not report num_retention_days, ${connections.length} cross-org connections share data with other orgs, and SAML user auto-creation ${autocreateEnabled ? `is enabled for ${autocreateDomains.length} domains` : "is disabled"}.`,
+        evidence,
+      ),
+      [truncationCaveat("org_connections", snapshot.orgConnections, "the org connection limit")],
     );
   }
   return finding(20, "medium", "pass", `Widget sharing outside the org is disabled (private_widget_share read as false), all ${indexes.length} log indexes meet the ${minLogRetentionDays}-day retention minimum, and the org connections list was read and is empty.`, evidence);
@@ -2362,7 +2374,14 @@ function evaluateSignalsControl(snapshot: DatadogSecurityMonitoringSnapshot, now
   if (enabledDetectionRules === 0) {
     return manualFinding(9, "high", "No unresolved high or critical signals were returned, but no detection rules are enabled, so the empty signal list reflects the absence of detection rather than timely triage; the empty list is treated as unverifiable rather than compliant.", [signalEvidence], evidence);
   }
-  return finding(9, "high", "pass", `No unresolved high or critical security signals in the last ${lookbackDays} days. The empty result is treated as compliant because ${enabledDetectionRules} enabled detection rules are active, so signals would appear here if they were open.`, evidence);
+  return withVerdictCaveats(
+    finding(9, "high", "pass", `No unresolved high or critical security signals in the last ${lookbackDays} days. The empty result is treated as compliant because ${enabledDetectionRules} enabled detection rules are active, so signals would appear here if they were open.`, evidence),
+    [
+      snapshot.signals.truncated
+        ? `The signal query returned a truncated list of ${snapshot.signals.limit} items that were all archived, so unresolved signals beyond the truncation point (raise signal_limit) cannot be ruled out.`
+        : undefined,
+    ],
+  );
 }
 
 function integrationCspmEnabled(snapshot: { awsIntegrations: SurfaceResult<JsonRecord[]>; gcpIntegrations: SurfaceResult<JsonRecord[]>; azureIntegrations: SurfaceResult<JsonRecord[]> }): { enabled: number; total: number } {
@@ -2430,7 +2449,10 @@ function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPas
     ], evidence);
   }
   if (enabledCloudRules.length === 0 && cspm.enabled === 0) {
-    return finding(12, "high", "fail", `Cloud Security Posture Management is not active: ${cspm.total} cloud integrations are configured but none has CSPM resource collection enabled and no cloud_configuration rules are enabled.`, evidence);
+    return withVerdictCaveats(
+      finding(12, "high", "fail", `Cloud Security Posture Management is not active: ${cspm.total} cloud integrations are configured but none has CSPM resource collection enabled and no cloud_configuration rules are enabled.`, evidence),
+      [truncationCaveat("security_rules", snapshot.rules, "rule_limit")],
+    );
   }
   if (unreadablePosture.length > 0) {
     return manualFinding(12, "high", `CSPM appears active (${enabledCloudRules.length} enabled cloud_configuration rules, ${cspm.enabled} integrations with resource collection), but ${unreadableSurfacesReason(unreadablePosture)}`, [consoleEvidence], evidence);
@@ -2632,7 +2654,7 @@ export async function collectDatadogDataProtectionData(
     loadSurface("log_indexes", () => client.listLogIndexes(), errors),
     loadSurface("log_archives", () => client.listLogArchives(), errors),
     loadSurface("sensitive_data_scanner", () => client.getSensitiveDataScannerConfig(), errors),
-    loadSurface("org_connections", () => client.listOrgConnections(), errors),
+    loadInventory("org_connections", DEFAULT_ORG_CONNECTION_LIMIT, (probeLimit) => client.listOrgConnections(probeLimit), errors),
   ]);
   return { organization, oldestAuditEvents, recentAuditEvents, pipelines, indexes, archives, sensitiveDataScanner, orgConnections, errors };
 }
@@ -2756,10 +2778,17 @@ function evaluateSensitiveDataScannerControl(snapshot: DatadogDataProtectionSnap
       "Open Organization Settings > Sensitive Data Scanner and capture the enabled scanning groups, their products (logs, APM, RUM, events), and the active PII and PCI rules.",
     ]);
   }
-  const included = asRecordArray(snapshot.sensitiveDataScanner.value.included);
+  const configuration = snapshot.sensitiveDataScanner.value;
+  const included = asRecordArray(configuration.included);
   const groups = included.filter((item) => asString(item.type) === "sensitive_data_scanner_group");
   const rules = included.filter((item) => asString(item.type) === "sensitive_data_scanner_rule");
+  const referencedGroupIds = asRecordArray(getNestedValue(configuration, ["data", "relationships", "groups", "data"]))
+    .map((reference) => asString(reference.id))
+    .filter((id): id is string => Boolean(id));
+  const includedGroupIds = new Set(groups.map((group) => asString(group.id)).filter((id): id is string => Boolean(id)));
+  const missingGroupIds = referencedGroupIds.filter((id) => !includedGroupIds.has(id));
   const enabledGroups = groups.filter((group) => asBoolean(attributesOf(group).is_enabled) === true);
+  const unknownStateGroups = groups.filter((group) => asBoolean(attributesOf(group).is_enabled) === undefined);
   const products = new Set(enabledGroups.flatMap((group) => asStringArray(attributesOf(group).product_list).map((product) => product.toLowerCase())));
   const missingProducts = ["logs", "apm", "rum", "events"].filter((product) => !products.has(product));
   const enabledRules = rules.filter((rule) => asBoolean(attributesOf(rule).is_enabled) === true);
@@ -2770,6 +2799,9 @@ function evaluateSensitiveDataScannerControl(snapshot: DatadogDataProtectionSnap
   });
   const evidence = {
     scanning_groups: groups.length,
+    scanning_groups_referenced_by_configuration: referencedGroupIds.length,
+    scanning_groups_missing_from_included: sample(missingGroupIds),
+    scanning_groups_without_is_enabled: sample(unknownStateGroups.map((group) => asString(attributesOf(group).name) ?? asString(group.id) ?? "group")),
     enabled_scanning_groups: enabledGroups.length,
     products_covered: [...products].sort(),
     products_missing: missingProducts,
@@ -2778,16 +2810,31 @@ function evaluateSensitiveDataScannerControl(snapshot: DatadogDataProtectionSnap
     enabled_pii_or_pci_rules: piiRules.length,
     rule_sample: sample(enabledRules.map((rule) => asString(attributesOf(rule).name) ?? "rule")),
   };
+  const consoleEvidence = "Open Organization Settings > Sensitive Data Scanner and capture every scanning group with its enabled state, products (logs, APM, RUM, events), and active PII and PCI rules.";
+  const partialCaveats = [
+    missingGroupIds.length > 0
+      ? `${missingGroupIds.length}/${referencedGroupIds.length} scanning groups referenced by the configuration were not returned in the included payload, so the group inventory is partial.`
+      : undefined,
+    unknownStateGroups.length > 0
+      ? `${unknownStateGroups.length} scanning groups did not report is_enabled and were not counted as active.`
+      : undefined,
+  ];
   if (enabledGroups.length === 0) {
+    if (missingGroupIds.length > 0 || unknownStateGroups.length > 0) {
+      return manualFinding(11, "medium", `No scanning group could be confirmed as enabled: ${partialCaveats.filter(Boolean).join(" ")} The partial configuration is treated as unverifiable rather than compliant.`, [consoleEvidence], evidence);
+    }
     return finding(11, "medium", "fail", `Sensitive Data Scanner has no enabled scanning groups (${groups.length} groups returned). The empty configuration is treated as fail because no redaction is active; if Sensitive Data Scanner is not licensed for this organization, record the control as not applicable with the plan evidence.`, evidence);
   }
   if (enabledRules.length === 0 || piiRules.length === 0) {
-    return finding(11, "medium", "fail", `${enabledGroups.length} scanning groups are enabled but no active PII or PCI detection rules were found.`, evidence);
+    return withVerdictCaveats(finding(11, "medium", "fail", `${enabledGroups.length} scanning groups are enabled but no active PII or PCI detection rules were found.`, evidence), partialCaveats);
   }
   if (missingProducts.length > 0) {
-    return finding(11, "medium", "warn", `Sensitive Data Scanner is active with ${piiRules.length} PII/PCI rules but enabled groups do not cover: ${missingProducts.join(", ")}.`, evidence);
+    return withVerdictCaveats(finding(11, "medium", "warn", `Sensitive Data Scanner is active with ${piiRules.length} PII/PCI rules but enabled groups do not cover: ${missingProducts.join(", ")}.`, evidence), partialCaveats);
   }
-  return finding(11, "medium", "pass", `Sensitive Data Scanner is active across logs, APM, RUM, and events with ${piiRules.length} PII/PCI rules enabled.`, evidence);
+  return withVerdictCaveats(
+    finding(11, "medium", "pass", `Sensitive Data Scanner is active across logs, APM, RUM, and events with ${piiRules.length} PII/PCI rules enabled.`, evidence),
+    partialCaveats,
+  );
 }
 
 export function evaluateDatadogDataProtection(
@@ -2932,19 +2979,18 @@ export async function checkDatadogAccess(client: AccessCheckReader): Promise<Dat
   ];
 
   const validationSurfaces = new Set(["validate", "validate_keys"]);
-  const coreSurfaces = new Set(["organization", "users", "roles", "api_keys", "application_keys", "audit_events", "security_rules"]);
+  const dataSurfaces = surfaces.filter((surface) => !validationSurfaces.has(surface.name));
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
-  const dataSurfacesReadable = surfaces.filter((surface) => !validationSurfaces.has(surface.name) && surface.status === "readable").length;
-  const coreReadable = surfaces.filter((surface) => coreSurfaces.has(surface.name) && surface.status === "readable").length;
+  const dataSurfacesReadable = dataSurfaces.filter((surface) => surface.status === "readable").length;
   const missingPermissions = [...new Set(
-    surfaces
-      .filter((surface) => surface.status === "forbidden" && !validationSurfaces.has(surface.name))
+    dataSurfaces
+      .filter((surface) => surface.status === "forbidden")
       .map((surface) => surface.permission),
   )];
 
   const status: DatadogAccessCheckResult["status"] = !apiKeyValid || dataSurfacesReadable === 0
     ? "failed"
-    : coreReadable === coreSurfaces.size && keyPairValid
+    : keyPairValid && dataSurfacesReadable === dataSurfaces.length
       ? "healthy"
       : "limited";
 
