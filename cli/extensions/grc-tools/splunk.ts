@@ -130,7 +130,11 @@ export interface SplunkListResult {
   entries: SplunkEntry[];
   total: number;
   truncated: boolean;
+  /** False when splunkd omitted paging.total, so `total` is only the number of entries seen. */
+  totalKnown: boolean;
 }
+
+const EMPTY_LIST: SplunkListResult = { entries: [], total: 0, truncated: false, totalKnown: true };
 
 export interface SplunkSearchResult {
   results: JsonRecord[];
@@ -626,18 +630,19 @@ export class SplunkApiClient {
   private async readJson(response: Response, endpoint: string): Promise<JsonRecord> {
     const rawText = await response.text();
     let payload: JsonRecord = {};
+    let nonJsonBytes = 0;
     if (rawText.length > 0) {
       try {
         payload = asObject(JSON.parse(rawText)) ?? {};
       } catch {
-        payload = { raw: rawText.slice(0, 400) };
+        nonJsonBytes = rawText.length;
       }
     }
     if (!response.ok) {
       const messages = asArray(payload.messages)
         .map((item) => asString(asObject(item)?.text))
         .filter((item): item is string => Boolean(item));
-      const detail = messages.join("; ") || asString(payload.message) || asString(payload.raw) || "";
+      const detail = messages.join("; ") || asString(payload.message) || (nonJsonBytes > 0 ? `non-JSON response body (${nonJsonBytes} bytes, not recorded)` : "");
       throw new SplunkApiError(
         this.redact(`Splunk request to ${endpoint} failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
         endpoint,
@@ -704,21 +709,33 @@ export class SplunkApiClient {
     return this.readJson(response, path);
   }
 
+  /**
+   * Pages with count/offset until paging.total is reached. Every early exit
+   * (item cap, a page repeating the previous one because the server ignored
+   * offset, or a full page with no paging.total) is reported as truncated so
+   * consumers demote; `totalKnown` is false whenever splunkd omitted the total.
+   */
   async list(path: string, query: JsonRecord = {}): Promise<SplunkListResult> {
     const entries: SplunkEntry[] = [];
     let offset = 0;
-    let total = 0;
+    let total: number | undefined;
+    let previousPage: string | undefined;
+    const cappedResult = (): SplunkListResult => ({ entries, total: Math.max(total ?? 0, entries.length), truncated: true, totalKnown: total !== undefined });
     for (;;) {
       const payload = await this.getJson(path, { ...query, count: this.pageSize, offset });
       const pageEntries = asArray(payload.entry).map(parseEntry).filter((item): item is SplunkEntry => Boolean(item));
-      const paging = asObject(payload.paging);
-      total = asNumber(paging?.total) ?? Math.max(total, offset + pageEntries.length);
+      total = asNumber(asObject(payload.paging)?.total) ?? total;
+      const pageKey = pageEntries.map((item) => item.name).join("\n");
+      if (pageEntries.length > 0 && pageKey === previousPage) return cappedResult();
+      previousPage = pageKey;
       entries.push(...pageEntries);
       offset += pageEntries.length;
-      if (pageEntries.length === 0 || offset >= total) break;
-      if (entries.length >= this.maxEntries) return { entries, total, truncated: true };
+      if (pageEntries.length === 0) break;
+      if (total !== undefined ? offset >= total : pageEntries.length < this.pageSize) break;
+      if (entries.length >= this.maxEntries) return cappedResult();
     }
-    return { entries, total: Math.max(total, entries.length), truncated: entries.length < total };
+    const known = total !== undefined;
+    return { entries, total: Math.max(total ?? 0, entries.length), truncated: known && entries.length < (total as number), totalKnown: known };
   }
 
   async getEntry(path: string): Promise<SplunkEntry | undefined> {
@@ -818,10 +835,17 @@ export class SplunkApiClient {
     const items: JsonRecord[] = [];
     const keys = [key, key.replace(/-/g, "_"), key.replace(/_/g, "-")];
     let offset = 0;
+    let previousPage: string | undefined;
     for (;;) {
       const payload = await this.acsGet(path, { count: this.pageSize, offset });
       const list = keys.map((candidate) => payload[candidate]).find((value) => Array.isArray(value));
+      if (list === undefined) {
+        throw new SplunkApiError(`ACS response for ${path} did not include a ${key} list (keys: ${Object.keys(payload).join(", ") || "none"}), so the inventory could not be read.`, `acs:${path}`);
+      }
       const page = asArray(list).map(asObject).filter((item): item is JsonRecord => Boolean(item));
+      const pageKey = JSON.stringify(page.map((item) => asString(item.name) ?? asString(asObject(item.spec)?.name) ?? JSON.stringify(item)));
+      if (page.length > 0 && pageKey === previousPage) return { items, truncated: true };
+      previousPage = pageKey;
       items.push(...page);
       if (page.length < this.pageSize) return { items, truncated: false };
       offset += page.length;
@@ -866,9 +890,33 @@ async function collect<T>(load: () => Promise<T>): Promise<Collected<T>> {
 async function collectOptionalConf(client: SplunkInspectorClient, file: string): Promise<Collected<SplunkListResult>> {
   const result = await collect(() => client.getConfStanzas(file));
   if (!result.ok && result.httpStatus === 404) {
-    return { ok: true, value: { entries: [], total: 0, truncated: false } };
+    return { ok: true, value: EMPTY_LIST };
   }
   return result;
+}
+
+/**
+ * Rule 1 corollary: a finding that read a secondary inventory it could not
+ * fully trust (unreadable, or a deployment classification guessed from the
+ * URL) keeps its warn, fail, or manual verdict but never stays at pass; each
+ * caveat is appended to the summary and listed in the evidence.
+ */
+function capWithCaveats(item: SplunkFinding, caveats: string[]): SplunkFinding {
+  const notes = caveats.filter((caveat) => caveat.length > 0);
+  if (notes.length === 0) return item;
+  return {
+    ...item,
+    status: item.status === "pass" ? "warn" : item.status,
+    summary: `${item.summary} ${notes.join(" ")}`,
+    evidence: { ...item.evidence, caveats: [...asArray(item.evidence.caveats), ...notes] },
+  };
+}
+
+function deploymentCaveat(deployment: { info: SplunkDeploymentInfo; collected: Collected<unknown> }): string {
+  if (deployment.collected.ok) return "";
+  const classification = deployment.info.isCloud ? "Splunk Cloud" : "Splunk Enterprise";
+  const basis = deployment.info.source === "url_heuristic" ? "the URL matches *.splunkcloud.com" : "the URL carries no splunkcloud.com marker";
+  return `The deployment was classified as ${classification} from the URL heuristic (${basis}) because /services/server/info could not be read (${unreadableCause(deployment.collected)}); confirm the product type before relying on this verdict.`;
 }
 
 function collectedErrors(items: Array<[string, Collected<unknown>]>): string[] {
@@ -914,7 +962,11 @@ function manualUnreadable(controlNumber: number, endpoint: string, item: { error
 }
 
 function inventoryNote(result: SplunkListResult): JsonRecord {
-  return { seen: result.entries.length, total: result.total, truncated: result.truncated };
+  return { seen: result.entries.length, total: result.totalKnown ? result.total : null, total_known: result.totalKnown, truncated: result.truncated };
+}
+
+function seenVersusTotal(result: SplunkListResult, noun: string): string {
+  return result.totalKnown ? `${result.entries.length} of ${result.total} ${noun}` : `${result.entries.length} ${noun} (total unknown)`;
 }
 
 function partialView(result: SplunkListResult): boolean {
@@ -995,10 +1047,14 @@ function downgradePassOnPartialInventory(
   findings: SplunkFinding[],
   sources: Array<[string, Collected<SplunkListResult> | undefined]>,
 ): SplunkFinding[] {
-  const partialSources = sources.filter(([, item]) => item?.ok && partialView(item.value)).map(([name]) => name);
+  const partialSources: Array<[string, SplunkListResult]> = [];
+  for (const [name, item] of sources) {
+    if (item?.ok && partialView(item.value)) partialSources.push([name, item.value]);
+  }
   if (partialSources.length === 0) return findings;
+  const described = partialSources.map(([name, result]) => `${name} (${seenVersusTotal(result, "entries")})`);
   return findings.map((item) => item.status === "pass"
-    ? { ...item, status: "warn", summary: `${item.summary} Downgraded: the ${partialSources.join(", ")} inventory was only partially retrieved (paging.total exceeded the entries returned).`, evidence: { ...item.evidence, partial_sources: partialSources } }
+    ? { ...item, status: "warn", summary: `${item.summary} Downgraded: the ${described.join(", ")} inventory was only partially retrieved, so the verdict cannot be pass.`, evidence: { ...item.evidence, partial_sources: partialSources.map(([name]) => name) } }
     : item);
 }
 
@@ -1205,10 +1261,13 @@ export async function assessSplunkAuthentication(
       subject_not_in_user_list: orphaned.slice(0, 50),
       users_readable: users.ok,
     };
+    const usersCaveat = users.ok ? "" : `The subject-to-user check was skipped because the user list could not be read (${unreadableCause(users)}); confirm each token subject is a current user.`;
     if (noExpiry.length > 0 || orphaned.length > 0) {
-      findings.push(finding(6, "fail", `${noExpiry.length} tokens never expire and ${orphaned.length} tokens belong to subjects not present in the user list (of ${tokens.value.entries.length} seen).`, evidence));
+      findings.push(capWithCaveats(finding(6, "fail", `${noExpiry.length} tokens never expire and ${orphaned.length} tokens belong to subjects not present in the user list (of ${tokens.value.entries.length} seen).`, evidence), [usersCaveat]));
     } else if (stale.length > 0 || missingDates.length > 0 || partialView(tokens.value)) {
-      findings.push(finding(6, "warn", `${stale.length} tokens are older than ${maxTokenAgeDays} days, ${missingDates.length} lack issue or expiry claims${partialView(tokens.value) ? `, and only ${tokens.value.entries.length} of ${tokens.value.total} tokens were retrieved` : ""}.`, evidence));
+      findings.push(capWithCaveats(finding(6, "warn", `${stale.length} tokens are older than ${maxTokenAgeDays} days, ${missingDates.length} lack issue or expiry claims${partialView(tokens.value) ? `, and only ${seenVersusTotal(tokens.value, "tokens")} were retrieved` : ""}.`, evidence), [usersCaveat]));
+    } else if (!users.ok) {
+      findings.push(capWithCaveats(finding(6, "pass", `All ${tokens.value.entries.length} tokens expire and are newer than ${maxTokenAgeDays} days, but whether every subject maps to a known user was not checked.`, evidence), [usersCaveat]));
     } else {
       findings.push(finding(6, "pass", `All ${tokens.value.entries.length} tokens expire, are newer than ${maxTokenAgeDays} days, and map to known users.`, evidence));
     }
@@ -1239,7 +1298,7 @@ function rolesAssessmentGuard(controlNumber: number, roles: Collected<SplunkList
 }
 
 function partialSuffix(result: SplunkListResult, noun: string): string {
-  return partialView(result) ? ` Only ${result.entries.length} of ${result.total} ${noun} were retrieved, so the verdict is downgraded.` : "";
+  return partialView(result) ? ` Only ${seenVersusTotal(result, noun)} were retrieved before the walk stopped, so the verdict is downgraded.` : "";
 }
 
 function withPartial(status: SplunkFindingStatus, result: SplunkListResult): SplunkFindingStatus {
@@ -1501,6 +1560,7 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     collect(() => client.listIndexes()),
   ]);
   const acsHec = client.hasAcs() && deployment.info.isCloud ? await collect(() => client.acsListAll("/inputs/http-event-collectors", "http-event-collectors")) : undefined;
+  const deploymentNote = deploymentCaveat(deployment);
   const findings: SplunkFinding[] = [];
 
   if (!serverConf.ok) {
@@ -1544,17 +1604,17 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     ? indexes.value.entries.slice(0, 100).map((index) => ({ name: index.name, homePath: asString(index.content.homePath) ?? null, coldPath: asString(index.content.coldPath) ?? null, frozenTimePeriodInSecs: asNumber(index.content.frozenTimePeriodInSecs) ?? null }))
     : null;
   if (deployment.info.isCloud) {
-    findings.push(finding(14, "manual", client.hasAcs()
+    findings.push(capWithCaveats(finding(14, "manual", client.hasAcs()
       ? "Splunk Cloud encrypts indexes at rest by default; the ACS EMEK endpoints (GET /emek/key-policy, GET /emek/waiver, PUT /emek/key) only generate onboarding artifacts and do not report whether Enterprise Managed Encryption Keys are active. Collect the EMEK provisioning record or the Splunk Cloud encryption attestation manually."
-      : "Splunk Cloud encrypts indexes at rest by default, but ACS is not configured, so no cloud-side evidence could be retrieved. Collect the EMEK provisioning record or the Splunk Cloud encryption attestation manually.", { acs_configured: client.hasAcs(), indexes: indexEvidence }));
+      : "Splunk Cloud encrypts indexes at rest by default, but ACS is not configured, so no cloud-side evidence could be retrieved. Collect the EMEK provisioning record or the Splunk Cloud encryption attestation manually.", { acs_configured: client.hasAcs(), indexes: indexEvidence }), [deploymentNote]));
   } else {
-    findings.push(finding(14, "manual", "Splunk Enterprise has no index-level encryption setting; at-rest protection depends on volume or filesystem encryption under homePath and coldPath. Collect the storage encryption evidence for the listed index paths manually.", { indexes_readable: indexes.ok, indexes: indexEvidence }));
+    findings.push(capWithCaveats(finding(14, "manual", "Splunk Enterprise has no index-level encryption setting; at-rest protection depends on volume or filesystem encryption under homePath and coldPath. Collect the storage encryption evidence for the listed index paths manually.", { indexes_readable: indexes.ok, indexes: indexEvidence }), [deploymentNote]));
   }
 
   if (deployment.info.isCloud) {
-    findings.push(finding(15, "manual", "Splunk Cloud enforces TLS between forwarders and its indexers through the Universal Forwarder credentials package; outputs.conf lives on the forwarders, not on this search head. Collect a sample forwarder outputs.conf (useSSL, clientCert, sslRootCAPath) manually.", { deployment: "splunk_cloud" }));
+    findings.push(capWithCaveats(finding(15, "manual", "Splunk Cloud enforces TLS between forwarders and its indexers through the Universal Forwarder credentials package; outputs.conf lives on the forwarders, not on this search head. Collect a sample forwarder outputs.conf (useSSL, clientCert, sslRootCAPath) manually.", { deployment: "splunk_cloud" }), [deploymentNote]));
   } else if (!outputsConf.ok) {
-    findings.push(manualUnreadable(15, "/services/configs/conf-outputs", outputsConf, "outputs.conf [tcpout] and [tcpout:*] useSSL, clientCert, sslRootCAPath and inputs.conf [SSL] serverCert, requireClientCert from the forwarding tier."));
+    findings.push(capWithCaveats(manualUnreadable(15, "/services/configs/conf-outputs", outputsConf, "outputs.conf [tcpout] and [tcpout:*] useSSL, clientCert, sslRootCAPath and inputs.conf [SSL] serverCert, requireClientCert from the forwarding tier."), [deploymentNote]));
   } else {
     const view = evaluateForwarderTls(outputsConf.value);
     const targets = [...view.groups, ...view.servers];
@@ -1570,17 +1630,23 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
       inputs_ssl_serverCert: asString(inputsSsl?.serverCert) ?? null,
       inputs_ssl_requireClientCert: inputsSsl?.requireClientCert ?? null,
     };
+    const inputsCaveat = inputsConf.ok ? "" : `inputs.conf [SSL] could not be read (${unreadableCause(inputsConf)}), so the receiving-side serverCert and requireClientCert were not checked.`;
+    let forwardingFinding: SplunkFinding;
     if (view.groups.length === 0) {
-      findings.push(finding(15, "manual", "This node has no outputs.conf [tcpout:*] target groups, so it does not forward data; collect outputs.conf from the forwarders and inputs.conf [SSL] from the indexers manually.", evidence));
+      forwardingFinding = finding(15, "manual", "This node has no outputs.conf [tcpout:*] target groups, so it does not forward data; collect outputs.conf from the forwarders and inputs.conf [SSL] from the indexers manually.", evidence);
     } else if (plaintext.length > 0) {
-      findings.push(finding(15, "fail", `${plaintext.length} of ${targets.length} forwarding targets do not use TLS: ${describeTargets(plaintext)}.`, evidence));
+      forwardingFinding = finding(15, "fail", `${plaintext.length} of ${targets.length} forwarding targets do not use TLS: ${describeTargets(plaintext)}.`, evidence);
     } else if (inferred.length > 0) {
-      findings.push(finding(15, "warn", `${inferred.length} of ${targets.length} forwarding targets only infer TLS: ${describeTargets(inferred)}. Set useSSL=true explicitly to confirm encryption.`, evidence));
+      forwardingFinding = finding(15, "warn", `${inferred.length} of ${targets.length} forwarding targets only infer TLS: ${describeTargets(inferred)}. Set useSSL=true explicitly to confirm encryption.`, evidence);
     } else {
-      findings.push(finding(15, "pass", `All ${targets.length} forwarding targets set useSSL=true explicitly${inherited > 0 ? ` (${inherited} inherit it from the global [tcpout] stanza)` : ""}.`, evidence));
+      forwardingFinding = finding(15, "pass", `All ${targets.length} forwarding targets set useSSL=true explicitly${inherited > 0 ? ` (${inherited} inherit it from the global [tcpout] stanza)` : ""}.`, evidence);
     }
+    findings.push(capWithCaveats(forwardingFinding, [inputsCaveat, deploymentNote]));
   }
 
+  const acsCaveat = acsHec && !acsHec.ok
+    ? `The ACS HEC token inventory (acs:/inputs/http-event-collectors) could not be read (${unreadableCause(acsHec)}), so this verdict rests on the local /services/data/inputs/http view alone and the Splunk Cloud token settings were not checked.`
+    : "";
   if (acsHec && acsHec.ok) {
     const tokens = acsHec.value.items.map((item) => asObject(item.spec) ?? item);
     const enabled = tokens.filter((token) => asBoolean(token.disabled) !== true);
@@ -1588,17 +1654,19 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     const anyIndex = enabled.filter((token) => asStringList(token.allowedIndexes).length === 0);
     const noSourcetype = enabled.filter((token) => !asString(token.defaultSourcetype));
     const evidence = { source: "acs:/inputs/http-event-collectors", tokens: tokens.length, enabled: enabled.length, truncated: acsHec.value.truncated, no_useACK: noAck.map((token) => asString(token.name)).slice(0, 50), any_index_allowed: anyIndex.map((token) => asString(token.name)).slice(0, 50), no_default_sourcetype: noSourcetype.map((token) => asString(token.name)).slice(0, 50) };
+    let hecFinding: SplunkFinding;
     if (tokens.length === 0) {
-      findings.push(finding(16, "manual", "ACS returned no HEC tokens. Emptiness is treated as unknown: confirm HEC is unused on this stack or that the ACS token can list HEC tokens.", evidence));
+      hecFinding = finding(16, "manual", "ACS returned no HEC tokens. Emptiness is treated as unknown: confirm HEC is unused on this stack or that the ACS token can list HEC tokens.", evidence);
     } else if (anyIndex.length > 0) {
-      findings.push(finding(16, "fail", `${anyIndex.length} enabled HEC tokens have no allowedIndexes restriction (any index accepted); ${noAck.length} lack useACK and ${noSourcetype.length} lack a default sourcetype.`, evidence));
+      hecFinding = finding(16, "fail", `${anyIndex.length} enabled HEC tokens have no allowedIndexes restriction (any index accepted); ${noAck.length} lack useACK and ${noSourcetype.length} lack a default sourcetype.`, evidence);
     } else if (noAck.length > 0 || noSourcetype.length > 0 || acsHec.value.truncated) {
-      findings.push(finding(16, "warn", `All enabled HEC tokens restrict indexes, but ${noAck.length} lack useACK and ${noSourcetype.length} lack a default sourcetype${acsHec.value.truncated ? "; the token list was truncated" : ""}. Splunk Cloud terminates HEC over TLS on port 443.`, evidence));
+      hecFinding = finding(16, "warn", `All enabled HEC tokens restrict indexes, but ${noAck.length} lack useACK and ${noSourcetype.length} lack a default sourcetype${acsHec.value.truncated ? `; the token list was truncated (${tokens.length} seen, total unknown)` : ""}. Splunk Cloud terminates HEC over TLS on port 443.`, evidence);
     } else {
-      findings.push(finding(16, "pass", `All ${enabled.length} enabled HEC tokens restrict indexes, enable useACK, and set a default sourcetype (Splunk Cloud HEC is TLS-only).`, evidence));
+      hecFinding = finding(16, "pass", `All ${enabled.length} enabled HEC tokens restrict indexes, enable useACK, and set a default sourcetype (Splunk Cloud HEC is TLS-only).`, evidence);
     }
+    findings.push(capWithCaveats(hecFinding, [deploymentNote]));
   } else if (!hecInputs.ok) {
-    findings.push(manualUnreadable(16, acsHec ? "acs:/inputs/http-event-collectors and /services/data/inputs/http" : "/services/data/inputs/http", acsHec && !acsHec.ok ? acsHec : hecInputs, "the HEC token inventory with indexes, sourcetype, useACK, disabled flag, and the global [http] enableSSL setting."));
+    findings.push(capWithCaveats(manualUnreadable(16, acsHec ? "acs:/inputs/http-event-collectors and /services/data/inputs/http" : "/services/data/inputs/http", acsHec && !acsHec.ok ? acsHec : hecInputs, "the HEC token inventory with indexes, sourcetype, useACK, disabled flag, and the global [http] enableSSL setting."), [deploymentNote]));
   } else {
     const globalEntry = hecInputs.value.entries.find(hecEntryIsGlobal);
     const tokens = hecInputs.value.entries.filter((entry) => !hecEntryIsGlobal(entry));
@@ -1609,21 +1677,23 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     const anyIndex = enabled.filter((token) => asStringList(token.content.indexes).length === 0);
     const noSourcetype = enabled.filter((token) => !asString(token.content.sourcetype));
     const evidence = { ...inventoryNote(hecInputs.value), global_entry_present: Boolean(globalEntry), hec_disabled: globalEntry?.content.disabled ?? null, enableSSL: globalEntry?.content.enableSSL ?? null, tokens: tokens.length, enabled: enabled.length, no_useACK: noAck.map((token) => token.name).slice(0, 50), any_index_allowed: anyIndex.map((token) => token.name).slice(0, 50), no_sourcetype: noSourcetype.map((token) => token.name).slice(0, 50) };
+    let hecFinding: SplunkFinding;
     if (hecInputs.value.entries.length === 0) {
-      findings.push(finding(16, "manual", "The HEC input list was empty, including the global [http] entry, so neither the disabled flag nor enableSSL could be read. Confirm the credential holds list_inputs and whether HEC is in use.", evidence));
+      hecFinding = finding(16, "manual", "The HEC input list was empty, including the global [http] entry, so neither the disabled flag nor enableSSL could be read. Confirm the credential holds list_inputs and whether HEC is in use.", evidence);
     } else if (!globalEntry) {
-      findings.push(finding(16, "manual", `Unknown: ${tokens.length} HEC tokens were listed but the global [http] entry (disabled, enableSSL) was not returned; collect inputs.conf [http] manually.`, evidence));
+      hecFinding = finding(16, "manual", `Unknown: ${tokens.length} HEC tokens were listed but the global [http] entry (disabled, enableSSL) was not returned; collect inputs.conf [http] manually.`, evidence);
     } else if (hecDisabled === true && tokens.length === 0) {
-      findings.push(finding(16, "pass", "HEC is globally disabled (inputs.conf [http] disabled=1 read explicitly) and no tokens are defined.", evidence));
+      hecFinding = finding(16, "pass", "HEC is globally disabled (inputs.conf [http] disabled=1 read explicitly) and no tokens are defined.", evidence);
     } else if (tokens.length === 0) {
-      findings.push(finding(16, "manual", "HEC is enabled but no tokens were visible. Emptiness is treated as unknown: confirm the credential can list HEC tokens or that HEC is unused.", evidence));
+      hecFinding = finding(16, "manual", "HEC is enabled but no tokens were visible. Emptiness is treated as unknown: confirm the credential can list HEC tokens or that HEC is unused.", evidence);
     } else if (enableSsl === false || anyIndex.length > 0) {
-      findings.push(finding(16, "fail", `${enableSsl === false ? "HEC enableSSL=false; " : ""}${anyIndex.length} enabled tokens accept any index.${partialSuffix(hecInputs.value, "HEC inputs")}`, evidence));
+      hecFinding = finding(16, "fail", `${enableSsl === false ? "HEC enableSSL=false; " : ""}${anyIndex.length} enabled tokens accept any index.${partialSuffix(hecInputs.value, "HEC inputs")}`, evidence);
     } else if (noAck.length > 0 || noSourcetype.length > 0 || enableSsl === undefined || partialView(hecInputs.value)) {
-      findings.push(finding(16, "warn", `${noAck.length} enabled tokens lack useACK and ${noSourcetype.length} lack a sourcetype${enableSsl === undefined ? "; enableSSL absent (documented default true assumed)" : ""}.${partialSuffix(hecInputs.value, "HEC inputs")}`, evidence));
+      hecFinding = finding(16, "warn", `${noAck.length} enabled tokens lack useACK and ${noSourcetype.length} lack a sourcetype${enableSsl === undefined ? "; enableSSL absent (documented default true assumed)" : ""}.${partialSuffix(hecInputs.value, "HEC inputs")}`, evidence);
     } else {
-      findings.push(finding(16, "pass", `HEC enableSSL=true and all ${enabled.length} enabled tokens restrict indexes, enable useACK, and set a sourcetype.`, evidence));
+      hecFinding = finding(16, "pass", `HEC enableSSL=true and all ${enabled.length} enabled tokens restrict indexes, enable useACK, and set a sourcetype.`, evidence);
     }
+    findings.push(capWithCaveats(hecFinding, [acsCaveat, deploymentNote]));
   }
 
   const finalFindings = downgradePassOnPartialInventory(findings, [["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["conf-inputs", inputsConf], ["hec-inputs", hecInputs], ["indexes", indexes]]);
@@ -1723,13 +1793,17 @@ export async function assessSplunkAuditMonitoring(
     const assignedDeleteUsers = deleters.flatMap((item) => item.users ?? []);
     const retentionSeconds = auditIndex ? asNumber(auditIndex.content.frozenTimePeriodInSecs) : undefined;
     const retentionDays = retentionSeconds === undefined ? undefined : Math.floor(retentionSeconds / 86400);
-    const evidence = { ...inventoryNote(roles.value), roles_that_can_delete_audit: deleters.slice(0, 50), users_with_delete_roles: assignedDeleteUsers.slice(0, 100), audit_frozenTimePeriodInSecs: retentionSeconds ?? null, audit_retention_days: retentionDays ?? null, min_retention_days: minRetentionDays };
+    const evidence = { ...inventoryNote(roles.value), roles_that_can_delete_audit: deleters.slice(0, 50), users_readable: users.ok, users_with_delete_roles: users.ok ? assignedDeleteUsers.slice(0, 100) : null, indexes_readable: indexes.ok, audit_frozenTimePeriodInSecs: retentionSeconds ?? null, audit_retention_days: retentionDays ?? null, min_retention_days: minRetentionDays };
+    const concerns: string[] = [];
+    if (users.ok && assignedDeleteUsers.length > 0) concerns.push(`${assignedDeleteUsers.length} users hold roles able to delete _audit events`);
+    if (!users.ok) concerns.push(`role assignments could not be enumerated because the user list could not be read (${unreadableCause(users)}), so whether anyone holds a delete-capable role is unknown`);
+    if (retentionDays === undefined) concerns.push(indexes.ok ? "_audit frozenTimePeriodInSecs was not readable" : `_audit frozenTimePeriodInSecs was not readable because the index list could not be read (${unreadableCause(indexes)})`);
     if (nonAdminDeleters.length > 0) {
       findings.push(finding(18, "fail", `${nonAdminDeleters.length} non-admin roles can delete _audit events (delete_by_keyword with _audit access).${partialSuffix(roles.value, "roles")}`, evidence));
     } else if (retentionDays !== undefined && retentionDays < minRetentionDays) {
       findings.push(finding(18, "fail", `_audit retention is ${retentionDays} days (frozenTimePeriodInSecs=${retentionSeconds}), below the ${minRetentionDays}-day minimum.`, evidence));
-    } else if (assignedDeleteUsers.length > 0 || retentionDays === undefined || partialView(roles.value)) {
-      findings.push(finding(18, "warn", `${assignedDeleteUsers.length} users hold roles able to delete _audit events${retentionDays === undefined ? "; _audit frozenTimePeriodInSecs was not readable" : ""}.${partialSuffix(roles.value, "roles")}`, evidence));
+    } else if (concerns.length > 0 || partialView(roles.value)) {
+      findings.push(finding(18, "warn", `Only admin-like roles can delete _audit events${retentionDays !== undefined ? ` and _audit retention is ${retentionDays} days` : ""}${concerns.length > 0 ? `, but ${concerns.join("; ")}` : ""}.${partialSuffix(roles.value, "roles")}`, evidence));
     } else {
       findings.push(finding(18, "pass", `Only unassigned admin-like roles can delete _audit events and _audit retention is ${retentionDays} days.`, evidence));
     }
@@ -1771,6 +1845,11 @@ interface S2sListener {
   sources: string[];
   tlsStanza?: JsonRecord;
   tls?: S2sTlsSettings;
+}
+
+/** Evidence keeps the resolved TLS settings only; the raw [splunktcp-ssl:<port>] stanza may carry sslPassword or password. */
+function listenerEvidence(listener: S2sListener): JsonRecord {
+  return { port: listener.port, state: listener.state, sources: listener.sources, tls: listener.tls ?? null };
 }
 
 const REQUIRE_CLIENT_CERT_DEFAULT_NOTE = 'documented default: "false" if using self-signed and third-party certificates, "true" if using the default certificates, and the REST view cannot tell which certificates are in use';
@@ -1859,12 +1938,13 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     collect(() => client.listCookedTcpInputs()),
     collect(() => client.getConfStanzas("inputs")),
   ]);
+  const deploymentNote = deploymentCaveat(deployment);
   const findings: SplunkFinding[] = [];
 
   if (!deployment.info.isCloud) {
-    findings.push(finding(19, "manual", "Not applicable through the API: IP allow lists are a Splunk Cloud ACS feature. For Splunk Enterprise, collect firewall or load balancer restrictions for the management, web, HEC, and S2S ports manually.", { deployment: "enterprise", deployment_source: deployment.info.source }));
+    findings.push(capWithCaveats(finding(19, "manual", "Not applicable through the API: IP allow lists are a Splunk Cloud ACS feature. For Splunk Enterprise, collect firewall or load balancer restrictions for the management, web, HEC, and S2S ports manually.", { deployment: "enterprise", deployment_source: deployment.info.source }), [deploymentNote]));
   } else if (!client.hasAcs()) {
-    findings.push(finding(19, "manual", "Splunk Cloud ACS is not configured (SPLUNK_STACK and SPLUNK_ACS_TOKEN), so IP allow lists could not be read. Collect GET /access/{feature}/ipallowlists for search-api, hec, s2s, and search-ui manually.", { acs_configured: false }));
+    findings.push(capWithCaveats(finding(19, "manual", "Splunk Cloud ACS is not configured (SPLUNK_STACK and SPLUNK_ACS_TOKEN), so IP allow lists could not be read. Collect GET /access/{feature}/ipallowlists for search-api, hec, s2s, and search-ui manually.", { acs_configured: false }), [deploymentNote]));
   } else {
     const results = await Promise.all(ACS_ALLOWLIST_FEATURES.map(async (feature) => ({ feature, result: await collect(() => client.acsGet(`/access/${feature}/ipallowlists`)) })));
     const evaluated = results.map(({ feature, result }) => {
@@ -1878,16 +1958,18 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
       }
       return { feature, readable: true, subnets, verdict: "pass" as SplunkFindingStatus, note: `${subnets.length} subnets` };
     });
-    const evidence = { features: evaluated };
+    const evidence = { features: evaluated, deployment_source: deployment.info.source };
+    let allowlistFinding: SplunkFinding;
     if (evaluated.some((item) => item.verdict === "fail")) {
-      findings.push(finding(19, "fail", `IP allow listing is open for ${evaluated.filter((item) => item.verdict === "fail").map((item) => item.feature).join(", ")}.`, evidence));
+      allowlistFinding = finding(19, "fail", `IP allow listing is open for ${evaluated.filter((item) => item.verdict === "fail").map((item) => item.feature).join(", ")}.`, evidence);
     } else if (evaluated.some((item) => item.verdict === "manual")) {
-      findings.push(finding(19, "manual", `Unknown: ${evaluated.filter((item) => item.verdict === "manual").map((item) => `${item.feature} (${item.note})`).join("; ")}; collect the allow lists manually.`, evidence));
+      allowlistFinding = finding(19, "manual", `Unknown: ${evaluated.filter((item) => item.verdict === "manual").map((item) => `${item.feature} (${item.note})`).join("; ")}; collect the allow lists manually.`, evidence);
     } else if (evaluated.some((item) => item.verdict === "warn")) {
-      findings.push(finding(19, "warn", `Allow lists are restricted except: ${evaluated.filter((item) => item.verdict === "warn").map((item) => `${item.feature} (${item.note})`).join("; ")}.`, evidence));
+      allowlistFinding = finding(19, "warn", `Allow lists are restricted except: ${evaluated.filter((item) => item.verdict === "warn").map((item) => `${item.feature} (${item.note})`).join("; ")}.`, evidence);
     } else {
-      findings.push(finding(19, "pass", `All ${evaluated.length} inspected ACS features have explicit IP allow lists.`, evidence));
+      allowlistFinding = finding(19, "pass", `All ${evaluated.length} inspected ACS features have explicit IP allow lists.`, evidence);
     }
+    findings.push(capWithCaveats(allowlistFinding, [deploymentNote]));
   }
 
   if (!apps.ok) {
@@ -1958,7 +2040,8 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     if (risky.length > 0) {
       findings.push(finding(22, "fail", `${risky.length} scheduled searches run as their (admin or unverified) owner across all indexes with no time bound.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
     } else if (scheduled.length === 0) {
-      findings.push(finding(22, withPartial("pass", savedSearches.value), `${savedSearches.value.entries.length} saved searches were inspected and none are scheduled, so no scheduled search runs with elevated scope.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
+      const usersCaveat = users.ok ? "" : `The user list could not be read (${unreadableCause(users)}), so owner roles were not available for verification.`;
+      findings.push(capWithCaveats(finding(22, withPartial("pass", savedSearches.value), `${savedSearches.value.entries.length} saved searches were inspected and none are scheduled, so no scheduled search runs with elevated scope.${partialSuffix(savedSearches.value, "saved searches")}`, evidence), [usersCaveat]));
     } else if (!users.ok || ownerAdmin.length > 0 || partialView(savedSearches.value)) {
       findings.push(finding(22, "warn", `${ownerAdmin.length} of ${scheduled.length} scheduled searches dispatch as an admin owner${users.ok ? "" : " (owner roles could not be verified because users were unreadable)"}; none combine all indexes with an unbounded time range.${partialSuffix(savedSearches.value, "saved searches")}`, evidence));
     } else {
@@ -1969,10 +2052,10 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
   if (deployment.info.isCloud) {
     findings.push(finding(23, "manual", "Splunk Cloud indexers are managed by Splunk; S2S listeners are not exposed through this search head. Collect the s2s IP allow list and Splunk Cloud forwarder TLS attestation manually.", { deployment: "splunk_cloud" }));
   } else if (!cookedInputs.ok) {
-    findings.push(manualUnreadable(23, "/services/data/inputs/tcp/cooked", cookedInputs, "inputs.conf [splunktcp://*] and [splunktcp-ssl:*] receiving stanzas plus the [SSL] stanza serverCert and requireClientCert from each indexer."));
+    findings.push(capWithCaveats(manualUnreadable(23, "/services/data/inputs/tcp/cooked", cookedInputs, "inputs.conf [splunktcp://*] and [splunktcp-ssl:*] receiving stanzas plus the [SSL] stanza serverCert and requireClientCert from each indexer."), [deploymentNote]));
   } else {
     const sslStanza = inputsConf.ok ? stanza(inputsConf.value, "SSL") : undefined;
-    const listeners = s2sListeners(cookedInputs.value, inputsConf.ok ? inputsConf.value : { entries: [], total: 0, truncated: false });
+    const listeners = s2sListeners(cookedInputs.value, inputsConf.ok ? inputsConf.value : EMPTY_LIST);
     for (const listener of listeners) {
       if (listener.state === "tls") listener.tls = resolveS2sTlsSettings(listener, sslStanza);
     }
@@ -1982,28 +2065,30 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     const withoutServerCert = listeners.filter((item) => item.state === "tls" && !item.tls?.serverCert);
     const evidence = {
       ...inventoryNote(cookedInputs.value),
-      listeners,
+      listeners: listeners.map(listenerEvidence),
       inputs_conf_readable: inputsConf.ok,
       ssl_stanza_present: Boolean(sslStanza),
       ssl_stanza: { serverCert: asString(sslStanza?.serverCert) ?? null, requireClientCert: sslStanza?.requireClientCert ?? null, sslVersions: asStringList(sslStanza?.sslVersions) },
       note: "data/inputs/tcp/cooked does not report TLS; encryption is decided from inputs.conf [splunktcp-ssl:*] stanzas, and serverCert and requireClientCert are resolved per port from [splunktcp-ssl:<port>] first, then [SSL]",
     };
     const ports = (items: S2sListener[]): string => items.map((item) => item.port).join(", ");
+    let s2sFinding: SplunkFinding;
     if (listeners.length === 0) {
-      findings.push(finding(23, "manual", "This node has no enabled splunktcp receiving ports, so S2S security must be collected from the indexers manually.", evidence));
+      s2sFinding = finding(23, "manual", "This node has no enabled splunktcp receiving ports, so S2S security must be collected from the indexers manually.", evidence);
     } else if (plaintext.length > 0) {
-      findings.push(finding(23, "fail", `${plaintext.length} of ${listeners.length} enabled S2S listeners are plaintext [splunktcp://] receivers (ports ${ports(plaintext)}).`, evidence));
+      s2sFinding = finding(23, "fail", `${plaintext.length} of ${listeners.length} enabled S2S listeners are plaintext [splunktcp://] receivers (ports ${ports(plaintext)}).`, evidence);
     } else if (!inputsConf.ok) {
-      findings.push(finding(23, "manual", `Unknown: ${listeners.length} enabled splunktcp listeners exist (ports ${ports(listeners)}) but /services/configs/conf-inputs could not be read because ${unreadableCause(inputsConf)}, and the data/inputs/tcp/cooked REST view does not report TLS. Collect inputs.conf [splunktcp-ssl:*] and [SSL] from each indexer manually.`, evidence));
+      s2sFinding = finding(23, "manual", `Unknown: ${listeners.length} enabled splunktcp listeners exist (ports ${ports(listeners)}) but /services/configs/conf-inputs could not be read because ${unreadableCause(inputsConf)}, and the data/inputs/tcp/cooked REST view does not report TLS. Collect inputs.conf [splunktcp-ssl:*] and [SSL] from each indexer manually.`, evidence);
     } else if (unconfirmed.length > 0) {
-      findings.push(finding(23, "manual", `Unknown: ${unconfirmed.length} of ${listeners.length} enabled splunktcp listeners (ports ${ports(unconfirmed)}) have no [splunktcp-ssl:<port>] stanza in the readable inputs.conf, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.`, evidence));
+      s2sFinding = finding(23, "manual", `Unknown: ${unconfirmed.length} of ${listeners.length} enabled splunktcp listeners (ports ${ports(unconfirmed)}) have no [splunktcp-ssl:<port>] stanza in the readable inputs.conf, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.`, evidence);
     } else if (withoutClientCert.length > 0) {
-      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but requireClientCert is not true for ${withoutClientCert.length} of them: ${withoutClientCert.map((item) => describeRequireClientCert(item, sslStanza)).join("; ")}. Forwarders on those ports are not certificate-authenticated.`, evidence));
+      s2sFinding = finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but requireClientCert is not true for ${withoutClientCert.length} of them: ${withoutClientCert.map((item) => describeRequireClientCert(item, sslStanza)).join("; ")}. Forwarders on those ports are not certificate-authenticated.`, evidence);
     } else if (withoutServerCert.length > 0) {
-      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers with requireClientCert=true but serverCert is absent from both [splunktcp-ssl:<port>] and [SSL] for ports ${ports(withoutServerCert)}, so the receiving certificate cannot be confirmed.`, evidence));
+      s2sFinding = finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers with requireClientCert=true but serverCert is absent from both [splunktcp-ssl:<port>] and [SSL] for ports ${ports(withoutServerCert)}, so the receiving certificate cannot be confirmed.`, evidence);
     } else {
-      findings.push(finding(23, "pass", `All ${listeners.length} enabled S2S listeners are [splunktcp-ssl:*] receivers (ports ${ports(listeners)}) with serverCert set and requireClientCert=true, resolved per port from [splunktcp-ssl:<port>] first and [SSL] second.`, evidence));
+      s2sFinding = finding(23, "pass", `All ${listeners.length} enabled S2S listeners are [splunktcp-ssl:*] receivers (ports ${ports(listeners)}) with serverCert set and requireClientCert=true, resolved per port from [splunktcp-ssl:<port>] first and [SSL] second.`, evidence);
     }
+    findings.push(capWithCaveats(s2sFinding, [deploymentNote]));
   }
 
   const finalFindings = downgradePassOnPartialInventory(findings, [["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["conf-inputs", inputsConf]]);
@@ -2221,7 +2306,7 @@ export async function exportSplunkAuditBundle(
     ["conf_inputs", () => client.getConfStanzas("inputs")],
     ["indexes", () => client.listIndexes()],
     ["hec_inputs", () => client.listHecInputs()],
-    ["saved_searches", () => client.listSavedSearches()],
+    ["saved_searches", async () => projectSavedSearchSnapshot(await client.listSavedSearches())],
     ["apps", () => client.listApps()],
     ["kv_collections", () => client.listKvCollections()],
     ["tcp_cooked_inputs", () => client.listCookedTcpInputs()],
@@ -2240,11 +2325,11 @@ export async function exportSplunkAuditBundle(
   }
 
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({ generated_at: new Date().toISOString(), url: config.url, stack: config.stack ?? null, acs_configured: Boolean(config.stack && config.acsToken), source_chain: config.sourceChain, tls_verification: config.verifyTls }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(redactSnapshot(access)));
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactSnapshot(findings)));
   const areaFiles = ["authentication", "access_control", "data_protection", "audit_monitoring", "platform_hardening"];
   for (const [index, assessment] of assessments.entries()) {
-    await writeSecureTextFile(outputDir, `analysis/${areaFiles[index]}.json`, serializeJson(assessment));
+    await writeSecureTextFile(outputDir, `analysis/${areaFiles[index]}.json`, serializeJson(redactSnapshot(assessment)));
   }
   await writeSecureTextFile(outputDir, "analysis/summary.md", [formatAccessCheckText(access), "", ...assessments.map(formatAssessmentText)].join("\n"));
   await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
@@ -2263,15 +2348,102 @@ export async function exportSplunkAuditBundle(
   return { outputDir, zipPath, fileCount: await countFilesRecursively(outputDir), findingCount: findings.length, errorCount: errors.length };
 }
 
+const REDACTED = "[REDACTED]";
+
+/**
+ * Credential-bearing setting names, tested against the lowercased key with
+ * dots, underscores, and hyphens removed so compound and dotted conf keys
+ * match: pass4SymmKey, sslKeysfilePassword, attributeQuerySoapPassword,
+ * bindDNpassword, httpEventCollectorToken, accessKey, appSecretKey,
+ * action.slack.param.webhook_url, action.pagerduty.param.integration_key.
+ * Password policy keys (minPasswordLength, passwordHistoryCount) do not end
+ * in "password" and stay legible.
+ */
+const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|token)$|secret|pass4symmkey|accesskey|apikey|authkey|privatekey|sessionkey|integrationkey|routingkey|webhook|credential/;
+
+/** splunkd stores encrypted settings as $1$ or $7$ ciphertext; a JWT is three base64url segments starting with eyJ. */
+const CIPHERTEXT_OR_JWT_PATTERN = /^\$[17]\$|^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./;
+
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[._-]/g, ""));
+}
+
+/** Keeps scheme, host, port, and path of a URL; userinfo and the query string can carry tokens. */
+function scrubUrlValue(value: string): string {
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    const userinfo = url.username || url.password ? `${REDACTED}@` : "";
+    const query = url.search.length > 1 ? `?${REDACTED}` : "";
+    return `${url.protocol}//${userinfo}${url.host}${url.pathname}${query}`;
+  } catch {
+    return value.replace(/\/\/[^/@]*@/, `//${REDACTED}@`).replace(/\?.*$/, `?${REDACTED}`);
+  }
+}
+
+function redactLeaf(value: string): string {
+  return CIPHERTEXT_OR_JWT_PATTERN.test(value) ? REDACTED : scrubUrlValue(value);
+}
+
+/**
+ * Rule 9 deny list applied to every core_data snapshot: redacts the value of
+ * every credential-named key (including {name, value} and {key, value} pair
+ * shapes), every $1$ or $7$ ciphertext or JWT-shaped string, and the userinfo
+ * and query string of every URL-valued string. Key names are kept so the
+ * evidence stays legible.
+ */
 function redactSnapshot(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSnapshot);
   const object = asObject(value);
-  if (!object) return value;
+  if (!object) return typeof value === "string" ? redactLeaf(value) : value;
+  const pairName = asString(object.name) ?? asString(object.key);
   const output: JsonRecord = {};
   for (const [key, item] of Object.entries(object)) {
-    output[key] = /^(token|password|sslPassword|secretKey|appSecretKey|bindDNpassword|sessionKey|clientSecret)$/i.test(key) ? "[REDACTED]" : redactSnapshot(item);
+    if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
+      output[key] = item === null || item === undefined ? item : REDACTED;
+    } else {
+      output[key] = redactSnapshot(item);
+    }
   }
   return output;
+}
+
+/**
+ * Rule 9 projection for core_data/saved_searches.json: keeps the fields the
+ * verdicts read (SPLUNK-AC-11 sharing and write permissions, SPLUNK-PLAT-22
+ * schedule, dispatchAs, and index scope) and drops the SPL text plus every
+ * action.<name>.param.* value, which carry webhook URLs, API keys, and routing
+ * keys verbatim on GET.
+ */
+function projectSavedSearchSnapshot(result: SplunkListResult): JsonRecord {
+  const entries = result.entries.map((entry) => {
+    const perms = asObject(entry.acl.perms) ?? {};
+    const spl = asString(entry.content.search) ?? "";
+    const actionNames = Object.keys(entry.content)
+      .filter((key) => /^action\.[^.]+$/.test(key) && asBoolean(entry.content[key]) === true)
+      .map((key) => key.slice("action.".length));
+    return {
+      name: entry.name,
+      acl: {
+        app: asString(entry.acl.app) ?? null,
+        owner: asString(entry.acl.owner) ?? null,
+        sharing: asString(entry.acl.sharing) ?? null,
+        perms: { read: asStringList(perms.read), write: asStringList(perms.write) },
+      },
+      content: {
+        is_scheduled: asBoolean(entry.content.is_scheduled) ?? null,
+        disabled: asBoolean(entry.content.disabled) ?? null,
+        dispatchAs: asString(entry.content.dispatchAs) ?? null,
+        "dispatch.earliest_time": asString(entry.content["dispatch.earliest_time"]) ?? null,
+        cron_schedule: asString(entry.content.cron_schedule) ?? null,
+        search: spl.length > 0 ? REDACTED : null,
+        search_index_scope: spl.length === 0 ? null : /index\s*=\s*\*/.test(spl) || !/index\s*=/.test(spl) ? "all_indexes" : "index_bound",
+        action_names: actionNames,
+        action_params_dropped: Object.keys(entry.content).filter((key) => /^action\.[^.]+\.param\./.test(key)).length,
+      },
+    };
+  });
+  return { entries, total: result.total, truncated: result.truncated, totalKnown: result.totalKnown };
 }
 
 type CommonArgs = {
