@@ -3,11 +3,11 @@ slug: "oci-sec-inspector"
 name: "OCI Security Inspector"
 vendor: "Oracle"
 category: "cloud-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/oci-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # OCI Security Inspector - Architecture Specification
@@ -17,6 +17,10 @@ source_repo: "https://github.com/hackIDLE/oci-sec-inspector"
 OCI Security Inspector is a security compliance inspection tool for Oracle Cloud Infrastructure (OCI). It audits IAM policies, networking configurations, Cloud Guard posture, vault key management, audit logging, and bastion access controls across OCI tenancies and compartments. The tool produces structured findings mapped to major compliance frameworks, enabling continuous compliance monitoring for organizations running workloads on OCI.
 
 Written in Go with a hybrid CLI/TUI architecture, it performs read-only inspection of OCI resources using official REST APIs and produces machine-readable JSON and human-readable reports.
+
+### grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/oci.ts` as six native tools (`oci_check_access`, `oci_assess_identity`, `oci_assess_logging_detection`, `oci_assess_tenancy_guardrails`, `oci_assess_compute_and_storage`, `oci_export_audit_bundle`). It keeps the OCI CLI (API-key profile from `~/.oci/config`) as the authenticated transport and implements assessment, verdict-safety, and export natively. Every command, flag, and field is cited to the OCI CLI command reference and the REST API reference in `OCI_SURFACE_DOCS`. The integration guide is `src/content/docs/docs/integrations/oci.md`.
 
 ## 2. APIs & SDKs
 
@@ -335,4 +339,30 @@ GOOS=windows GOARCH=amd64 go build -o bin/oci-sec-inspector-windows-amd64.exe ./
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) on 2026-09-21; the Go/TUI architecture in sections 7-9 remains the original design reference and was not built.
+
+### Shipped
+
+- 21 findings across four assess tools covering controls 1-23: OCI-IAM-01..06, OCI-LOG-01..06 (OCI-LOG-04 is supporting audit-event evidence), OCI-GRD-01..06, OCI-CMP-01..03.
+- Verdict safety: unreadable or denied surfaces (including the documented `NotAuthorizedOrNotFound` response) render `manual`; empty inventories never pass by default; compartment caps, denied compartments, item caps, and undated items withhold `pass`; every enabling flag is read explicitly; the CLI `--all` flag pages to completion; bundle reruns allocate `-2`, `-3` and never overwrite.
+- Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, and `_errors.log` on partial collection.
+- Live smoke script `cli/scripts/oci-live-smoke.mjs` (`npm --prefix cli run test:oci:live`).
+
+### Deviations from this spec (docs win over spec)
+
+- Control 1 expiration: the IAM `PasswordPolicy` datatype exposes no expiration setting, so expiration is a separate always-manual finding (OCI-IAM-06); length and complexity are judged from the documented fields.
+- Control 2 uses the documented `User.isMfaActivated` field instead of enumerating TOTP devices per user.
+- Control 9 uses `ProblemSummary.riskLevel` and `lifecycleDetail=OPEN` (the API has no `severity` field on problems).
+- Control 19 key length is not exposed by `KeySummary`; only the algorithm enum (AES, RSA, ECDSA) is judged and length stays manual.
+- Controls 6, 12, 13, 14, 15, 16, 18, 20, 22, 23: the list APIs have no subtree parameter, so resources are listed per accessible compartment up to `max_compartments`.
+- Control 20: `BucketSummary` omits `publicAccessType`, so each bucket is fetched with `GetBucket` up to `max_buckets`.
+- Control 16: `BastionSummary` omits TTL and CIDR fields, so each bastion is fetched with `GetBastion`.
+- Control 21: `timeExpires` is present on every PAR by API contract; "no expiration" cannot occur and long-lived PARs (more than 30 days out) warn instead.
+- Output formats: SARIF and the JSON/CSV/HTML CLI outputs are out of scope; findings are JSON in `analysis/findings.json`.
+
+### Deferred
+
+- Control 24 budgets and alert rules (`oci budgets budget list`, `oci budgets alert-rule list`).
+- Control 25 OS Management patching: the current API reference index lists only OS Management Hub (`osmh`, `/20220901`); the legacy OS Management Service (`/20190801`) is no longer in the reference and should not be targeted.
+- Auth modes: session token (`security_token_file`), instance principal, resource principal, delegation token.
+- Unfolding controls 3-5 (OCI-IAM-03), 16-17 (OCI-GRD-04), 18-19 (OCI-GRD-05), and 20-21 (OCI-GRD-06) into one finding each; today each folded control is judged and reported as separate evidence buckets inside the shared finding.
