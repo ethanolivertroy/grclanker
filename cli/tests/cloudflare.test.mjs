@@ -154,7 +154,11 @@ function fixtureClient(mode, overrides = {}) {
       return list(`/zones/${zoneId}/firewall/rules`, []);
     },
     async listZoneRulesets(zoneId) {
-      return list(`/zones/${zoneId}/rulesets`, [{ id: "rs-managed", kind: "zone", phase: CLOUDFLARE_RULESET_PHASES.firewallManaged, name: "zone", version: "1" }]);
+      if (zoneId === forbiddenZone) throw forbidden(`/zones/${zoneId}/rulesets`);
+      return list(`/zones/${zoneId}/rulesets`, [
+        { id: "rs-managed", kind: "zone", phase: CLOUDFLARE_RULESET_PHASES.firewallManaged, name: "zone", version: "1" },
+        { id: "rs-ddos", kind: "managed", phase: CLOUDFLARE_RULESET_PHASES.ddosL7, name: "DDoS L7 ruleset", version: "1" },
+      ]);
     },
     async getZoneEntrypointRuleset(zoneId, phase) {
       return single(`/zones/${zoneId}/rulesets/phases/${phase}/entrypoint`, zoneId, compliantEntrypoint(phase));
@@ -180,6 +184,20 @@ function fixtureClient(mode, overrides = {}) {
     },
     async getOriginTlsClientAuthSettings(zoneId) {
       return single(`/zones/${zoneId}/origin_tls_client_auth/settings`, zoneId, { enabled: true });
+    },
+    async listOriginTlsClientAuthHostnames(zoneId) {
+      if (zoneId === forbiddenZone) throw forbidden(`/zones/${zoneId}/origin_tls_client_auth/hostnames`);
+      return list(`/zones/${zoneId}/origin_tls_client_auth/hostnames`, [
+        { cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT },
+      ]);
+    },
+    async getZoneSubscription(zoneId) {
+      return single(`/zones/${zoneId}/subscription`, zoneId, { id: "sub-1", state: "Paid", rate_plan: { id: "cf_pro", public_name: "Pro Website", currency: "USD" } });
+    },
+    async getZeroTrustAccount() {
+      if (mode === "forbidden") throw forbidden("/accounts/acc-123/gateway");
+      if (mode === "empty") return null;
+      return { id: "acc-123", gateway_tag: "gw-tag-1", provider_name: "Cloudflare" };
     },
     async listRateLimits(zoneId) {
       return list(`/zones/${zoneId}/rate_limits`, []);
@@ -325,6 +343,11 @@ test("assessCloudflareZoneSecurity classifies TLS, DNSSEC, WAF, DDoS, and header
     },
     async getOriginTlsClientAuthSettings(zoneId) {
       return { enabled: zoneId === "zone-1" };
+    },
+    async listOriginTlsClientAuthHostnames(zoneId) {
+      return zoneId === "zone-1"
+        ? { items: [{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.good.example", status: "active", updated_at: RECENT }], truncated: false, totalCount: 1 }
+        : { items: [], truncated: false, totalCount: 0 };
     },
   });
 
@@ -502,18 +525,71 @@ test("verdict rule 3: plan-gated products render manual naming the plan", async 
     async getZoneEntrypointRuleset(zoneId, phase) {
       return phase === CLOUDFLARE_RULESET_PHASES.ddosL7 ? null : compliantEntrypoint(phase);
     },
+    async listZoneRulesets(zoneId) {
+      throw forbidden(`/zones/${zoneId}/rulesets`);
+    },
     async listGatewayRules() {
       return [];
+    },
+    async getZeroTrustAccount() {
+      return null;
     },
   });
   const traffic = await assessCloudflareTrafficControls(client);
   assert.equal(byId(traffic, "CF-TRF-03").status, "manual");
   assert.match(byId(traffic, "CF-TRF-03").summary, /Enterprise Bot Management/);
+  assert.match(byId(traffic, "CF-TRF-03").summary, /Current zone plan: Pro Website \(subscription Paid\)/);
   assert.equal(byId(traffic, "CF-TRF-06").status, "manual");
   assert.match(byId(traffic, "CF-TRF-06").summary, /Zero Trust subscription/);
+  assert.match(byId(traffic, "CF-TRF-06").summary, /returned no gateway_tag/);
   const zone = await assessCloudflareZoneSecurity(client);
   assert.equal(byId(zone, "CF-ZONE-07").status, "manual");
   assert.match(byId(zone, "CF-ZONE-07").summary, /Enterprise plan with Advanced DDoS Protection/);
+});
+
+test("review fix 4: documented licensing signals upgrade manual verdicts (gateway_tag, managed ddos_l7 ruleset, subscription plan name)", async () => {
+  const licensed = fixtureClient("compliant", {
+    async listGatewayRules() {
+      return [];
+    },
+  });
+  const traffic = await assessCloudflareTrafficControls(licensed);
+  assert.equal(byId(traffic, "CF-TRF-06").status, "fail");
+  assert.match(byId(traffic, "CF-TRF-06").summary, /gateway_tag gw-tag-1/);
+  assert.equal(byId(traffic, "CF-TRF-06").evidence.gateway_tag, "gw-tag-1");
+
+  const defaults = fixtureClient("compliant", {
+    async getZoneEntrypointRuleset(zoneId, phase) {
+      return phase === CLOUDFLARE_RULESET_PHASES.ddosL7 ? null : compliantEntrypoint(phase);
+    },
+  });
+  const zone = await assessCloudflareZoneSecurity(defaults);
+  assert.equal(byId(zone, "CF-ZONE-07").status, "pass");
+  assert.match(byId(zone, "CF-ZONE-07").evidence.zones[0].detail, /managed ddos_l7 ruleset is listed/);
+
+  const unlisted = fixtureClient("compliant", {
+    async getZoneEntrypointRuleset(zoneId, phase) {
+      return phase === CLOUDFLARE_RULESET_PHASES.ddosL7 ? null : compliantEntrypoint(phase);
+    },
+    async listZoneRulesets() {
+      return [{ id: "rs-managed", kind: "zone", phase: CLOUDFLARE_RULESET_PHASES.firewallManaged, name: "zone", version: "1" }];
+    },
+  });
+  const unlistedZone = await assessCloudflareZoneSecurity(unlisted);
+  assert.equal(byId(unlistedZone, "CF-ZONE-07").status, "manual");
+  assert.match(byId(unlistedZone, "CF-ZONE-07").summary, /does not show a managed ddos_l7 ruleset/);
+
+  const unpriced = fixtureClient("compliant", {
+    async getBotManagement() {
+      return { auto_update_model: true };
+    },
+    async getZoneSubscription(zoneId) {
+      throw forbidden(`/zones/${zoneId}/subscription`);
+    },
+  });
+  const unpricedTraffic = await assessCloudflareTrafficControls(unpriced);
+  assert.equal(byId(unpricedTraffic, "CF-TRF-03").status, "manual");
+  assert.match(byId(unpricedTraffic, "CF-TRF-03").summary, /zones\[\]\.plan is deprecated and is not read/);
 });
 
 test("verdict rule 4: items without dates are never counted valid and cap at warn", async () => {
@@ -673,6 +749,9 @@ test("schema fidelity: client requests documented paths, phases, setting ids, an
   await client.listDnsRecords(zone);
   await client.listCertificatePacks(zone);
   await client.getOriginTlsClientAuthSettings(zone);
+  await client.listOriginTlsClientAuthHostnames(zone);
+  await client.getZoneSubscription(zone);
+  await client.getZeroTrustAccount(account);
   await client.listUserTokens();
   await client.listAccountTokens(account);
   await client.getUserToken("tok-1");
@@ -702,6 +781,9 @@ test("schema fidelity: client requests documented paths, phases, setting ids, an
     "/zones/zone-1/dns_records",
     "/zones/zone-1/ssl/certificate_packs",
     "/zones/zone-1/origin_tls_client_auth/settings",
+    "/zones/zone-1/origin_tls_client_auth/hostnames",
+    "/zones/zone-1/subscription",
+    "/accounts/acc-123/gateway",
     "/user/tokens",
     "/accounts/acc-123/tokens",
     "/user/tokens/tok-1",
@@ -723,10 +805,135 @@ test("schema fidelity: client requests documented paths, phases, setting ids, an
   assert.equal(byPath("/user/tokens").searchParams.get("include_expired"), "true");
   assert.equal(byPath("/user/tokens").searchParams.get("per_page"), "50");
   assert.equal(byPath("/pagerules").searchParams.get("page"), null);
+  assert.equal(byPath("/pagerules").searchParams.get("status"), "active");
+  assert.equal(byPath("/origin_tls_client_auth/hostnames").searchParams.get("per_page"), "1000");
+  assert.equal(byPath("/origin_tls_client_auth/hostnames").searchParams.get("status"), "all");
+  assert.equal(byPath("/origin_tls_client_auth/hostnames").searchParams.get("page"), "1");
+  assert.equal(byPath("/zone-1/subscription").search, "");
+  assert.equal(byPath("/acc-123/gateway").search, "");
   assert.equal(byPath("/gateway/rules").searchParams.get("page"), null);
   assert.equal(byPath("/audit_logs").searchParams.get("since"), "2026-08-22T00:00:00.000Z");
   assert.equal(byPath("/dnssec").search, "");
   assert.equal(byPath("/bot_management").search, "");
+});
+
+test("review fix 1: per-hostname Authenticated Origin Pulls associations are read and judged in CF-ZONE-11", async () => {
+  const disabledAssociation = fixtureClient("compliant", {
+    async listOriginTlsClientAuthHostnames() {
+      return {
+        items: [
+          { cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT },
+          { cert_id: "cert-aop-2", created_at: "2026-01-01T00:00:00Z", enabled: false, hostname: "api.one.example", status: "active", updated_at: RECENT },
+        ],
+        truncated: false,
+        totalCount: 2,
+      };
+    },
+  });
+  const disabledZone = await assessCloudflareZoneSecurity(disabledAssociation);
+  assert.equal(byId(disabledZone, "CF-ZONE-11").status, "warn");
+  assert.match(byId(disabledZone, "CF-ZONE-11").summary, /api\.one\.example: enabled false, status active/);
+
+  const undatedAssociation = fixtureClient("compliant", {
+    async listOriginTlsClientAuthHostnames() {
+      return { items: [{ cert_id: "cert-aop-1", created_at: null, enabled: true, hostname: "app.one.example", status: "active", updated_at: null }], truncated: false, totalCount: 1 };
+    },
+  });
+  assert.equal(byId(await assessCloudflareZoneSecurity(undatedAssociation), "CF-ZONE-11").status, "warn");
+
+  const pendingAssociation = fixtureClient("compliant", {
+    async listOriginTlsClientAuthHostnames() {
+      return { items: [{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "pending_deployment", updated_at: RECENT }], truncated: false, totalCount: 1 };
+    },
+  });
+  assert.equal(byId(await assessCloudflareZoneSecurity(pendingAssociation), "CF-ZONE-11").status, "warn");
+
+  const truncatedAssociations = fixtureClient("compliant", {
+    async listOriginTlsClientAuthHostnames() {
+      return { items: [{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT }], truncated: true, totalCount: 40 };
+    },
+  });
+  const truncatedZone = await assessCloudflareZoneSecurity(truncatedAssociations);
+  assert.equal(byId(truncatedZone, "CF-ZONE-11").status, "warn");
+  assert.match(byId(truncatedZone, "CF-ZONE-11").summary, /1 seen of 40 total/);
+
+  const zoneLevelOff = fixtureClient("compliant", {
+    async getOriginTlsClientAuthSettings() {
+      return { enabled: false };
+    },
+    async getZoneSettings() {
+      return compliantSettings().map((setting) => (setting.id === "tls_client_auth" ? { id: "tls_client_auth", value: "off" } : setting));
+    },
+  });
+  const zoneLevelOffResult = await assessCloudflareZoneSecurity(zoneLevelOff);
+  assert.equal(byId(zoneLevelOffResult, "CF-ZONE-11").status, "warn");
+  assert.match(byId(zoneLevelOffResult, "CF-ZONE-11").summary, /only 1 of 1 per-hostname associations/);
+
+  const hostnamesForbidden = fixtureClient("compliant", {
+    async listOriginTlsClientAuthHostnames(zoneId) {
+      throw forbidden(`/zones/${zoneId}/origin_tls_client_auth/hostnames`);
+    },
+  });
+  const forbiddenZone = await assessCloudflareZoneSecurity(hostnamesForbidden);
+  assert.equal(byId(forbiddenZone, "CF-ZONE-11").status, "manual");
+  assert.match(byId(forbiddenZone, "CF-ZONE-11").summary, /origin_tls_client_auth\/hostnames could not be read/);
+  assert.match(byId(forbiddenZone, "CF-ZONE-11").evidence.per_hostname_source, /per-hostname-authenticated-origin-pull-list-hostname-associations/);
+});
+
+test("review fix 2: the deprecated /rate_limits API is evidence only, read only when http_ratelimit is unreadable, and never passes", async () => {
+  const legacyReads = [];
+  const legacyOnly = fixtureClient("compliant", {
+    async getZoneEntrypointRuleset(zoneId, phase) {
+      if (phase === CLOUDFLARE_RULESET_PHASES.rateLimit) throw forbidden(`/zones/${zoneId}/rulesets/phases/${phase}/entrypoint`);
+      return compliantEntrypoint(phase);
+    },
+    async listRateLimits(zoneId) {
+      legacyReads.push(zoneId);
+      return { items: [{ id: "rl-1", disabled: false, threshold: 100, period: 60 }], truncated: false, totalCount: 1 };
+    },
+  });
+  const legacyResult = await assessCloudflareTrafficControls(legacyOnly);
+  assert.equal(byId(legacyResult, "CF-TRF-01").status, "warn");
+  assert.match(byId(legacyResult, "CF-TRF-01").summary, /deprecated \/rate_limits API shows 1 enabled legacy rate limits as evidence only/);
+  assert.deepEqual(legacyReads, ["zone-1"]);
+
+  const rulesetReadable = fixtureClient("compliant", {
+    async getZoneEntrypointRuleset(zoneId, phase) {
+      return phase === CLOUDFLARE_RULESET_PHASES.rateLimit ? { id: "rs-rl", phase, rules: [] } : compliantEntrypoint(phase);
+    },
+    async listRateLimits() {
+      throw new Error("legacy /rate_limits must not be read when http_ratelimit is readable");
+    },
+  });
+  const rulesetResult = await assessCloudflareTrafficControls(rulesetReadable);
+  assert.equal(byId(rulesetResult, "CF-TRF-01").status, "fail");
+  assert.match(byId(rulesetResult, "CF-TRF-01").summary, /http_ratelimit entry point has no enabled rules/);
+
+  const nothingReadable = fixtureClient("compliant", {
+    async getZoneEntrypointRuleset(zoneId, phase) {
+      if (phase === CLOUDFLARE_RULESET_PHASES.rateLimit) throw forbidden(`/zones/${zoneId}/rulesets/phases/${phase}/entrypoint`);
+      return compliantEntrypoint(phase);
+    },
+    async listRateLimits() {
+      return { items: [], truncated: false, totalCount: 0 };
+    },
+  });
+  const nothingResult = await assessCloudflareTrafficControls(nothingReadable);
+  assert.equal(byId(nothingResult, "CF-TRF-01").status, "manual");
+  assert.match(byId(nothingResult, "CF-TRF-01").summary, /returned no enabled legacy rate limits/);
+});
+
+test("review fix 3: page rules are requested with status=active so disabled rules cannot satisfy CF-TRF-02", async () => {
+  const { calls, fetchImpl } = fakeFetch((url) => {
+    if (url.pathname.endsWith("/pagerules")) {
+      return { payload: { success: true, result: [{ id: "pr-1", status: "active", priority: 1, targets: [{ target: "url", constraint: { operator: "matches", value: "one.example/*" } }], actions: [{ id: "disable_security" }] }] } };
+    }
+    return { payload: { success: true, result: [] } };
+  });
+  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  const rules = await client.listPageRules("zone-1");
+  assert.equal(rules.items.length, 1);
+  assert.equal(calls[0].searchParams.get("status"), "active");
 });
 
 test("self-check (a): every call 403 yields no pass in any assessment", async () => {

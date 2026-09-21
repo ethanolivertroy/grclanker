@@ -30,6 +30,7 @@ const DEFAULT_ZONE_LIMIT = 20;
 const DEFAULT_MEMBER_LIMIT = 200;
 const DEFAULT_TOKEN_LIMIT = 200;
 const DEFAULT_AUDIT_LIMIT = 200;
+const DEFAULT_HOSTNAME_ASSOCIATION_LIMIT = 5000;
 const DEFAULT_DNS_RECORD_LIMIT = 500;
 const DEFAULT_MAX_SUPER_ADMINS = 2;
 const HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
@@ -53,6 +54,9 @@ export const CLOUDFLARE_API_DOCS = {
   universalSslSettings: "https://developers.cloudflare.com/api/resources/ssl/subresources/universal/subresources/settings/methods/get/",
   originTlsClientAuthSettings: "https://developers.cloudflare.com/api/resources/origin_tls_client_auth/subresources/settings/methods/get/",
   originTlsClientAuthHostname: "https://developers.cloudflare.com/api/resources/origin_tls_client_auth/subresources/hostnames/methods/get/",
+  originTlsClientAuthHostnamesList: "https://github.com/cloudflare/api-schemas/blob/main/openapi.json#per-hostname-authenticated-origin-pull-list-hostname-associations",
+  zeroTrustAccountGet: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/gateway/methods/list/",
+  zoneSubscriptionGet: "https://developers.cloudflare.com/api/resources/zones/subresources/subscriptions/methods/get/",
   botManagementGet: "https://developers.cloudflare.com/api/resources/bot_management/methods/get/",
   rateLimitsListLegacy: "https://developers.cloudflare.com/api/resources/rate_limits/methods/list/",
   pageRulesList: "https://developers.cloudflare.com/api/resources/page_rules/methods/list/",
@@ -178,6 +182,9 @@ export interface CloudflareReader {
   listCertificatePacks(zoneId: string): Promise<ListResult>;
   getUniversalSslSettings(zoneId: string): Promise<JsonRecord | null>;
   getOriginTlsClientAuthSettings(zoneId: string): Promise<JsonRecord | null>;
+  listOriginTlsClientAuthHostnames(zoneId: string, limit?: number): Promise<ListResult>;
+  getZoneSubscription(zoneId: string): Promise<JsonRecord | null>;
+  getZeroTrustAccount(accountId: string): Promise<JsonRecord | null>;
   listRateLimits(zoneId: string): Promise<ListResult>;
   listPageRules(zoneId: string): Promise<ListResult>;
   getBotManagement(zoneId: string): Promise<JsonRecord | null>;
@@ -746,12 +753,24 @@ export class CloudflareApiClient implements CloudflareReader {
     return this.getObject(this.zonePath(zoneId, "/origin_tls_client_auth/settings"));
   }
 
+  async listOriginTlsClientAuthHostnames(zoneId: string, limit = DEFAULT_HOSTNAME_ASSOCIATION_LIMIT): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.zonePath(zoneId, "/origin_tls_client_auth/hostnames"), { allow404: true, limit, perPage: 1000, query: { status: "all" } });
+  }
+
+  async getZoneSubscription(zoneId: string): Promise<JsonRecord | null> {
+    return this.getObject(this.zonePath(zoneId, "/subscription"));
+  }
+
+  async getZeroTrustAccount(accountId: string): Promise<JsonRecord | null> {
+    return this.getObject(this.accountPath(accountId, "/gateway"));
+  }
+
   async listRateLimits(zoneId: string): Promise<CloudflarePagedList> {
     return this.listPaginated(this.zonePath(zoneId, "/rate_limits"), { allow404: true, limit: 1000, perPage: 100 });
   }
 
   async listPageRules(zoneId: string): Promise<CloudflarePagedList> {
-    return this.getUnpaginatedList(this.zonePath(zoneId, "/pagerules"));
+    return this.getUnpaginatedList(this.zonePath(zoneId, "/pagerules"), { status: "active" });
   }
 
   async getBotManagement(zoneId: string): Promise<JsonRecord | null> {
@@ -1005,6 +1024,52 @@ function verdict(zone: string, status: CloudflareFindingStatus, detail: string):
   return { zone, status, detail };
 }
 
+function judgeOriginPulls(
+  zone: string,
+  tlsClientAuth: ZoneSettingRead | undefined,
+  originOutcome: ReadOutcome<JsonRecord | null>,
+  hostnamesOutcome: ReadOutcome<CloudflarePagedList>,
+): ZoneVerdict {
+  const settingReadable = Boolean(tlsClientAuth && !tlsClientAuth.error);
+  if (!originOutcome.ok && !settingReadable) {
+    return verdict(zone, "manual", manualReason("/zones/{zone_id}/origin_tls_client_auth/settings and /zones/{zone_id}/settings/tls_client_auth", "SSL and Certificates: Read plus Zone Settings: Read", "the Authenticated Origin Pulls status", originOutcome.error));
+  }
+  const zoneLevelEnabled = originOutcome.ok ? asBoolean(originOutcome.value?.enabled) : undefined;
+  const settingOn = settingReadable ? asString(tlsClientAuth!.value) : undefined;
+  const zoneLevelOn = zoneLevelEnabled === true || settingOn === "on";
+  const zoneLevelOff = !zoneLevelOn && (zoneLevelEnabled === false || settingOn === "off");
+  const zoneSummary = `zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}`;
+  if (!zoneLevelOn && !zoneLevelOff) {
+    return verdict(zone, "manual", "Authenticated Origin Pulls status returned undocumented values; confirm under SSL/TLS > Origin Server.");
+  }
+  if (!hostnamesOutcome.ok) {
+    return verdict(zone, "manual", `Zone-level Authenticated Origin Pulls is ${zoneLevelOn ? "enabled" : "disabled"} (${zoneSummary}), but ${manualReason("/zones/{zone_id}/origin_tls_client_auth/hostnames", "SSL and Certificates: Read", "the per-hostname certificate associations", hostnamesOutcome.error)}`);
+  }
+  const associations = hostnamesOutcome.value.items.filter((item) => asString(item.status) !== "deleted");
+  const active = associations.filter((item) => asBoolean(item.enabled) === true && asString(item.status) === "active");
+  const inactive = associations.filter((item) => !(asBoolean(item.enabled) === true && asString(item.status) === "active"));
+  const undated = active.filter((item) => !asString(item.updated_at) && !asString(item.created_at));
+  const partial = partialInventoryNote("hostname association", hostnamesOutcome.value);
+  const hostnameSummary = associations.length === 0
+    ? "no per-hostname certificate associations"
+    : `${active.length} of ${associations.length} per-hostname associations active and enabled${inactive.length > 0 ? ` (${inactive.map((item) => `${asString(item.hostname) ?? "unknown-hostname"}: enabled ${String(asBoolean(item.enabled) ?? "unread")}, status ${asString(item.status) ?? "unread"}`).join("; ")})` : ""}`;
+  if (zoneLevelOff && active.length === 0) {
+    return verdict(zone, "fail", `Authenticated Origin Pulls disabled (${zoneSummary}) and ${hostnameSummary}.`);
+  }
+  if (zoneLevelOff) {
+    return verdict(zone, "warn", `Zone-level Authenticated Origin Pulls is disabled (${zoneSummary}); only ${hostnameSummary} enforce origin authentication.${partial ? ` ${partial}` : ""}`);
+  }
+  if (inactive.length > 0 || undated.length > 0 || partial) {
+    const reasons = [
+      inactive.length > 0 ? `${inactive.length} associations are disabled or not active` : undefined,
+      undated.length > 0 ? `${undated.length} active associations have no created_at or updated_at` : undefined,
+      partial,
+    ].filter((reason): reason is string => Boolean(reason));
+    return verdict(zone, "warn", `Zone-level Authenticated Origin Pulls enabled (${zoneSummary}); ${hostnameSummary}. ${reasons.join("; ")}.`);
+  }
+  return verdict(zone, "pass", `Authenticated Origin Pulls enabled (${zoneSummary}); ${hostnameSummary}.`);
+}
+
 function settingVerdict(
   zone: string,
   settings: Map<string, ZoneSettingRead>,
@@ -1122,11 +1187,24 @@ function judgeCustomWaf(ruleset: JsonRecord | null): { status: CloudflareFinding
   return { status: "pass", detail: `${mitigating.length} of ${rules.length} enabled custom rules block or challenge.` };
 }
 
-function judgeDdosL7(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+function managedDdosL7Listed(rulesets: ReadOutcome<CloudflarePagedList>): boolean | undefined {
+  if (!rulesets.ok) return undefined;
+  return rulesets.value.items.some((ruleset) => asString(ruleset.kind) === "managed" && asString(ruleset.phase) === CLOUDFLARE_RULESET_PHASES.ddosL7);
+}
+
+function judgeDdosL7(ruleset: JsonRecord | null, managedListed: boolean | undefined): { status: CloudflareFindingStatus; detail: string } {
   if (!ruleset) {
+    if (managedListed === true) {
+      return {
+        status: "pass",
+        detail: "The managed ddos_l7 ruleset is listed for the zone and no override ruleset lowers its sensitivity, so HTTP DDoS Attack Protection runs at Cloudflare's default (high) sensitivity.",
+      };
+    }
     return {
       status: "manual",
-      detail: "No ddos_l7 override ruleset exists; HTTP DDoS Attack Protection runs at Cloudflare defaults. Confirm the default sensitivity is acceptable; per-rule overrides need an Enterprise plan with Advanced DDoS Protection.",
+      detail: managedListed === false
+        ? "No ddos_l7 override exists and the zone ruleset list does not show a managed ddos_l7 ruleset; confirm HTTP DDoS Attack Protection under Security > DDoS."
+        : "No ddos_l7 override exists and the zone ruleset list could not be read (Zone WAF: Read); confirm HTTP DDoS Attack Protection under Security > DDoS. Per-rule overrides need an Enterprise plan with Advanced DDoS Protection.",
     };
   }
   const executes = asRecordArray(ruleset.rules).filter((rule) => ruleAction(rule) === "execute");
@@ -1158,10 +1236,10 @@ function judgeSecurityHeaders(ruleset: JsonRecord | null): { status: CloudflareF
   return { status: "warn", detail: `Missing security headers: ${missing.join(", ")}.` };
 }
 
-function judgeRateLimitRuleset(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } | undefined {
-  if (!ruleset) return undefined;
+function judgeRateLimitRuleset(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+  if (!ruleset) return { status: "fail", detail: "No http_ratelimit entry point ruleset exists, so no rate limiting rules protect the zone." };
   const rules = enabledRules(ruleset).filter((rule) => asObject(rule.ratelimit) !== undefined);
-  if (rules.length === 0) return undefined;
+  if (rules.length === 0) return { status: "fail", detail: "The http_ratelimit entry point has no enabled rules with a ratelimit block." };
   return { status: "pass", detail: `${rules.length} enabled http_ratelimit rules.` };
 }
 
@@ -1205,6 +1283,16 @@ function botManagementJudgement(config: JsonRecord | null): { status: Cloudflare
     return { status: "manual", detail: "Enterprise Bot Management is provisioned; enforcement lives in WAF custom rules using cf.bot_management.score, so confirm those rules manually." };
   }
   return { status: "manual", detail: "Bot management fields fight_mode and sbfm_definitely_automated were absent; confirm the plan includes Bot Fight Mode, Super Bot Fight Mode (Pro or Business), or Bot Management (Enterprise)." };
+}
+
+async function zonePlanNote(client: Partial<Pick<CloudflareReader, "getZoneSubscription">>, zoneId: string): Promise<string> {
+  if (!client.getZoneSubscription) return "";
+  const subscription = await attempt(() => client.getZoneSubscription!(zoneId));
+  if (!subscription.ok) return ` The zone plan could not be named because /zones/{zone_id}/subscription was not readable (${subscription.error}); zones[].plan is deprecated and is not read.`;
+  const planName = asString(asObject(subscription.value?.rate_plan)?.public_name);
+  const state = asString(subscription.value?.state);
+  if (!planName) return " The zone subscription returned no rate_plan.public_name, so the plan is not named here.";
+  return ` Current zone plan: ${planName}${state ? ` (subscription ${state})` : ""}.`;
 }
 
 function collectMemberRoleNames(member: JsonRecord): string[] {
@@ -1583,7 +1671,7 @@ export async function assessCloudflareZoneSecurity(
   client: Pick<
     CloudflareReader,
     "listZones" | "getZoneSettings" | "getDnssec" | "listFirewallRules" | "listZoneRulesets" | "getUniversalSslSettings"
-  > & Partial<Pick<CloudflareReader, "getZoneEntrypointRuleset" | "listDnsRecords" | "listCertificatePacks" | "getOriginTlsClientAuthSettings">>,
+  > & Partial<Pick<CloudflareReader, "getZoneEntrypointRuleset" | "listDnsRecords" | "listCertificatePacks" | "getOriginTlsClientAuthSettings" | "listOriginTlsClientAuthHostnames">>,
   options: AssessmentOptions = {},
 ): Promise<CloudflareAssessmentResult> {
   const zoneLimit = clampNumber(options.zoneLimit, DEFAULT_ZONE_LIMIT, 1, 500);
@@ -1623,7 +1711,7 @@ export async function assessCloudflareZoneSecurity(
       if (!outcome.ok) errors.push(`${name} ${label}: ${outcome.error}`);
     };
 
-    const [settingsOutcome, dnssecOutcome, managedOutcome, customOutcome, ddosOutcome, headersOutcome, universalOutcome, originOutcome, certPacksOutcome, dnsOutcome] = await Promise.all([
+    const [settingsOutcome, dnssecOutcome, managedOutcome, customOutcome, ddosOutcome, headersOutcome, universalOutcome, originOutcome, originHostnamesOutcome, rulesetListOutcome, certPacksOutcome, dnsOutcome] = await Promise.all([
       attempt(() => client.getZoneSettings(zoneId)),
       attempt(() => client.getDnssec(zoneId)),
       entrypoint(zoneId, CLOUDFLARE_RULESET_PHASES.firewallManaged),
@@ -1634,6 +1722,10 @@ export async function assessCloudflareZoneSecurity(
       client.getOriginTlsClientAuthSettings
         ? attempt(() => client.getOriginTlsClientAuthSettings!(zoneId))
         : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "origin TLS client auth reader unavailable" }),
+      client.listOriginTlsClientAuthHostnames
+        ? attemptList(() => client.listOriginTlsClientAuthHostnames!(zoneId))
+        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "origin TLS client auth hostname reader unavailable" }),
+      attemptList(() => client.listZoneRulesets(zoneId)),
       client.listCertificatePacks
         ? attemptList(() => client.listCertificatePacks!(zoneId))
         : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "certificate pack reader unavailable" }),
@@ -1649,6 +1741,8 @@ export async function assessCloudflareZoneSecurity(
     zoneErrors(`/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.responseHeadersTransform}/entrypoint`, headersOutcome);
     zoneErrors("/ssl/universal/settings", universalOutcome);
     zoneErrors("/origin_tls_client_auth/settings", originOutcome);
+    zoneErrors("/origin_tls_client_auth/hostnames", originHostnamesOutcome);
+    zoneErrors("/rulesets", rulesetListOutcome);
     zoneErrors("/ssl/certificate_packs", certPacksOutcome);
     zoneErrors("/dns_records", dnsOutcome);
 
@@ -1663,7 +1757,8 @@ export async function assessCloudflareZoneSecurity(
     }
     managedWaf.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.firewallManaged, managedOutcome, judgeManagedWaf, "Zone WAF: Read"));
     customWaf.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.firewallCustom, customOutcome, judgeCustomWaf, "Zone WAF: Read"));
-    ddos.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.ddosL7, ddosOutcome, judgeDdosL7, "Zone WAF: Read"));
+    const managedDdosListed = managedDdosL7Listed(rulesetListOutcome);
+    ddos.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.ddosL7, ddosOutcome, (ruleset) => judgeDdosL7(ruleset, managedDdosListed), "Zone WAF: Read"));
     securityHeaders.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.responseHeadersTransform, headersOutcome, judgeSecurityHeaders, "Transform Rules: Read"));
 
     strictSsl.push(settingVerdict(name, settings, "ssl", (value) => {
@@ -1733,20 +1828,7 @@ export async function assessCloudflareZoneSecurity(
       else universalSsl.push(verdict(name, "pass", `${activePacks.length} active certificate packs with ${certificates.length} valid certificates.`));
     }
 
-    const tlsClientAuth = settings.get("tls_client_auth");
-    if (!originOutcome.ok && (!tlsClientAuth || tlsClientAuth.error)) {
-      originPulls.push(verdict(name, "manual", manualReason("/zones/{zone_id}/origin_tls_client_auth/settings and /zones/{zone_id}/settings/tls_client_auth", "SSL and Certificates: Read plus Zone Settings: Read", "the Authenticated Origin Pulls status", originOutcome.error)));
-    } else {
-      const zoneLevelEnabled = originOutcome.ok ? asBoolean(originOutcome.value?.enabled) : undefined;
-      const settingOn = tlsClientAuth && !tlsClientAuth.error ? asString(tlsClientAuth.value) : undefined;
-      if (zoneLevelEnabled === true || settingOn === "on") {
-        originPulls.push(verdict(name, "pass", `Authenticated Origin Pulls enabled (zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}). Per-hostname status is not enumerable via the API and stays manual.`));
-      } else if (zoneLevelEnabled === false || settingOn === "off") {
-        originPulls.push(verdict(name, "fail", `Authenticated Origin Pulls disabled (zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}).`));
-      } else {
-        originPulls.push(verdict(name, "manual", "Authenticated Origin Pulls status returned undocumented values; confirm under SSL/TLS > Origin Server."));
-      }
-    }
+    originPulls.push(judgeOriginPulls(name, settings.get("tls_client_auth"), originOutcome, originHostnamesOutcome));
 
     if (!dnsOutcome.ok) {
       dnsExposure.push(verdict(name, "manual", manualReason("/zones/{zone_id}/dns_records", "DNS: Read", "the DNS record export", dnsOutcome.error)));
@@ -1806,8 +1888,8 @@ export async function assessCloudflareZoneSecurity(
     }),
     aggregateZoneVerdicts("CF-ZONE-11", "Authenticated Origin Pulls", "medium", 18, zones, originPulls, {
       ...emptyZones,
-      passDetail: "Every sampled zone enables Authenticated Origin Pulls at the zone level",
-      extraEvidence: { per_hostname_note: "GET /zones/{zone_id}/origin_tls_client_auth/hostnames/{hostname} requires a known hostname and has no list form, so hostname-level enablement is a manual check." },
+      passDetail: "Every sampled zone enables Authenticated Origin Pulls at the zone level and every per-hostname certificate association is active and enabled",
+      extraEvidence: { per_hostname_source: `GET /zones/{zone_id}/origin_tls_client_auth/hostnames (OpenAPI operation per-hostname-authenticated-origin-pull-list-hostname-associations, per_page 1000, status=all): ${CLOUDFLARE_API_DOCS.originTlsClientAuthHostnamesList}` },
     }),
     aggregateZoneVerdicts("CF-ZONE-12", "Browser Integrity Check", "low", 19, zones, browserCheck, {
       ...emptyZones,
@@ -1847,7 +1929,7 @@ export async function assessCloudflareTrafficControls(
   client: Pick<
     CloudflareReader,
     "getResolvedConfig" | "listAccounts" | "listZones" | "listRateLimits" | "listPageRules" | "getBotManagement" | "listAuditLogs" | "listGatewayRules" | "listIpAccessRules"
-  > & Partial<Pick<CloudflareReader, "getZoneEntrypointRuleset">>,
+  > & Partial<Pick<CloudflareReader, "getZoneEntrypointRuleset" | "getZoneSubscription" | "getZeroTrustAccount">>,
   options: AssessmentOptions = {},
 ): Promise<CloudflareAssessmentResult> {
   const config = client.getResolvedConfig();
@@ -1873,52 +1955,59 @@ export async function assessCloudflareTrafficControls(
     const zoneId = asString(zone.id);
     if (!zoneId) continue;
     const name = zoneName(zone);
-    const [rateLimitRuleset, legacyRateLimits, pageRuleOutcome, botOutcome] = await Promise.all([
+    const [rateLimitRuleset, pageRuleOutcome, botOutcome] = await Promise.all([
       client.getZoneEntrypointRuleset
         ? attempt(() => client.getZoneEntrypointRuleset!(zoneId, CLOUDFLARE_RULESET_PHASES.rateLimit))
         : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "entry point ruleset reader unavailable" }),
-      attemptList(() => client.listRateLimits(zoneId)),
       attemptList(() => client.listPageRules(zoneId)),
       attempt(() => client.getBotManagement(zoneId)),
     ]);
     if (!rateLimitRuleset.ok) errors.push(`${name} /rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint: ${rateLimitRuleset.error}`);
-    if (!legacyRateLimits.ok) errors.push(`${name} /rate_limits: ${legacyRateLimits.error}`);
     if (!pageRuleOutcome.ok) errors.push(`${name} /pagerules: ${pageRuleOutcome.error}`);
     if (!botOutcome.ok) errors.push(`${name} /bot_management: ${botOutcome.error}`);
 
-    const rulesetJudgement = rateLimitRuleset.ok ? judgeRateLimitRuleset(rateLimitRuleset.value) : undefined;
-    const legacyEnabled = legacyRateLimits.ok ? legacyRateLimits.value.items.filter((rule) => asBoolean(rule.disabled) !== true) : [];
-    if (rulesetJudgement) rateLimiting.push(verdict(name, rulesetJudgement.status, rulesetJudgement.detail));
-    else if (!rateLimitRuleset.ok && !legacyRateLimits.ok) rateLimiting.push(verdict(name, "manual", manualReason(`/zones/{zone_id}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint`, "Zone WAF: Read", "the rate limiting rule list", rateLimitRuleset.error)));
-    else if (legacyEnabled.length > 0) rateLimiting.push(verdict(name, "pass", `${legacyEnabled.length} enabled legacy rate limits (deprecated /rate_limits API); migrate them to http_ratelimit rules.`));
-    else if (!rateLimitRuleset.ok) rateLimiting.push(verdict(name, "manual", manualReason(`/zones/{zone_id}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint`, "Zone WAF: Read", "the rate limiting rule list", rateLimitRuleset.error)));
-    else rateLimiting.push(verdict(name, "fail", "No enabled rate limiting rules exist in http_ratelimit or the legacy rate limits API."));
+    if (rateLimitRuleset.ok) {
+      const rulesetJudgement = judgeRateLimitRuleset(rateLimitRuleset.value);
+      rateLimiting.push(verdict(name, rulesetJudgement.status, rulesetJudgement.detail));
+    } else {
+      const legacyRateLimits = await attemptList(() => client.listRateLimits(zoneId));
+      if (!legacyRateLimits.ok) errors.push(`${name} /rate_limits: ${legacyRateLimits.error}`);
+      const legacyEnabled = legacyRateLimits.ok ? legacyRateLimits.value.items.filter((rule) => asBoolean(rule.disabled) !== true) : [];
+      const manualDetail = manualReason(`/zones/{zone_id}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint`, "Zone WAF: Read", "the rate limiting rule list", rateLimitRuleset.error);
+      if (legacyEnabled.length > 0) rateLimiting.push(verdict(name, "warn", `The http_ratelimit entry point could not be read (${rateLimitRuleset.error}); the deprecated /rate_limits API shows ${legacyEnabled.length} enabled legacy rate limits as evidence only. Grant Zone WAF: Read and migrate them to http_ratelimit rules.`));
+      else rateLimiting.push(verdict(name, "manual", `${manualDetail}${legacyRateLimits.ok ? " The deprecated /rate_limits API returned no enabled legacy rate limits." : ""}`));
+    }
 
     if (!pageRuleOutcome.ok) pageRules.push(verdict(name, "manual", manualReason("/zones/{zone_id}/pagerules", "Page Rules: Read", "the page rule list", pageRuleOutcome.error)));
     else {
       const risky = pageRuleOutcome.value.items.filter(pageRuleIsRisky);
       if (risky.length > 0) pageRules.push(verdict(name, "fail", `${risky.length} active page rules weaken security (disable_security, security_level essentially_off, ssl off/flexible, or cache_everything on sensitive paths).`));
-      else if (pageRuleOutcome.value.items.length === 0) pageRules.push(verdict(name, "pass", "No page rules exist; emptiness is compliant because no rule can weaken security."));
-      else pageRules.push(verdict(name, "pass", `${pageRuleOutcome.value.items.length} page rules, none security-degrading.`));
+      else if (pageRuleOutcome.value.items.length === 0) pageRules.push(verdict(name, "pass", "No active page rules exist (status=active); emptiness is compliant because no active rule can weaken security."));
+      else pageRules.push(verdict(name, "pass", `${pageRuleOutcome.value.items.length} active page rules, none security-degrading.`));
     }
 
     if (!botOutcome.ok) botControls.push(verdict(name, "manual", manualReason("/zones/{zone_id}/bot_management", "Bot Management: Read", "the Bot Fight Mode or Bot Management settings", botOutcome.error)));
     else {
       const judged = botManagementJudgement(botOutcome.value);
-      botControls.push(verdict(name, judged.status, judged.detail));
+      const planNote = judged.status === "manual" ? await zonePlanNote(client, zoneId) : "";
+      botControls.push(verdict(name, judged.status, `${judged.detail}${planNote}`));
     }
   }
 
-  const [auditOutcome, gatewayOutcome, ipRulesOutcome] = accountId
+  const [auditOutcome, gatewayOutcome, ipRulesOutcome, gatewayAccountOutcome] = accountId
     ? await Promise.all([
       attemptList(() => client.listAuditLogs(accountId, auditLimit)),
       attemptList(() => client.listGatewayRules(accountId)),
       attemptList(() => client.listIpAccessRules(accountId)),
+      client.getZeroTrustAccount
+        ? attempt(() => client.getZeroTrustAccount!(accountId))
+        : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "Zero Trust account reader unavailable" }),
     ])
-    : [undefined, undefined, undefined];
+    : [undefined, undefined, undefined, undefined];
   if (accountId) {
     if (!auditOutcome!.ok) errors.push(`/accounts/${accountId}/audit_logs: ${auditOutcome!.error}`);
     if (!gatewayOutcome!.ok) errors.push(`/accounts/${accountId}/gateway/rules: ${gatewayOutcome!.error}`);
+    if (!gatewayAccountOutcome!.ok) errors.push(`/accounts/${accountId}/gateway: ${gatewayAccountOutcome!.error}`);
     if (!ipRulesOutcome!.ok) errors.push(`/accounts/${accountId}/firewall/access_rules/rules: ${ipRulesOutcome!.error}`);
   }
 
@@ -1994,7 +2083,12 @@ export async function assessCloudflareTrafficControls(
     const filters = new Set(enabled.flatMap((rule) => asArray(rule.filters).map((item) => asString(item) ?? "")));
     const blocking = enabled.filter((rule) => ["block", "isolate", "override", "quarantine"].includes(asString(rule.action) ?? ""));
     if (gatewayRules!.items.length === 0) {
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", "No Gateway rules exist. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.", 24, { account_id: accountId, gateway_rules: 0 }));
+      const gatewayTag = gatewayAccountOutcome!.ok ? asString(gatewayAccountOutcome!.value?.gateway_tag) : undefined;
+      if (gatewayTag) {
+        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `Zero Trust Gateway is provisioned for this account (gateway_tag ${gatewayTag} from /accounts/{account_id}/gateway) but no Gateway DNS or HTTP policies exist.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: gatewayTag }));
+      } else {
+        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `No Gateway rules exist and ${gatewayAccountOutcome!.ok ? "/accounts/{account_id}/gateway returned no gateway_tag" : `/accounts/{account_id}/gateway could not be read (${gatewayAccountOutcome!.error})`}. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: null }));
+      }
     } else if (blocking.length === 0 || !(filters.has("dns") || filters.has("http"))) {
       findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }));
     } else {
