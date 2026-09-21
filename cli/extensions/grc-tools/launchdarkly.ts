@@ -2265,6 +2265,51 @@ function environmentLabel(context: EnvironmentContext): string {
   return `${context.projectKey}/${context.key}`;
 }
 
+type ApprovalWeakness = "bypass_pending_changes" | "self_review" | "declined_changes_applicable" | "tag_scoped_approvals";
+
+interface ApprovalAnalysis {
+  required: boolean;
+  weaknesses: ApprovalWeakness[];
+  settings: JsonRecord;
+}
+
+function analyzeApprovalSettings(value: unknown): ApprovalAnalysis {
+  const raw = asObject(value);
+  const requiredApprovalTags = asStringArray(raw?.requiredApprovalTags);
+  const settings: JsonRecord = {
+    required: asBoolean(raw?.required) === true,
+    bypass_approvals_for_pending_changes: asBoolean(raw?.bypassApprovalsForPendingChanges) === true,
+    can_review_own_request: asBoolean(raw?.canReviewOwnRequest) === true,
+    can_apply_declined_changes: asBoolean(raw?.canApplyDeclinedChanges) === true,
+    min_num_approvals: asNumber(raw?.minNumApprovals) ?? null,
+    required_approval_tags: requiredApprovalTags,
+    service_kind: asString(raw?.serviceKind) ?? null,
+  };
+  const weaknesses: ApprovalWeakness[] = [];
+  if (settings.bypass_approvals_for_pending_changes === true) weaknesses.push("bypass_pending_changes");
+  if (settings.can_review_own_request === true) weaknesses.push("self_review");
+  if (settings.can_apply_declined_changes === true) weaknesses.push("declined_changes_applicable");
+  if (requiredApprovalTags.length > 0) weaknesses.push("tag_scoped_approvals");
+  return { required: settings.required === true, weaknesses, settings };
+}
+
+function approvalWeaknessLabel(weakness: ApprovalWeakness): string {
+  switch (weakness) {
+    case "bypass_pending_changes":
+      return "pending changes can bypass approval";
+    case "self_review":
+      return "requesters can approve their own changes";
+    case "declined_changes_applicable":
+      return "changes can be applied after a single approval even when other reviewers declined";
+    case "tag_scoped_approvals":
+      return "approvals are required only for flags carrying specific tags, so untagged flags skip approval";
+    default: {
+      const exhaustive: never = weakness;
+      return exhaustive;
+    }
+  }
+}
+
 function splitResourceSegments(resource: string): string[] {
   const segments: string[] = [];
   let depth = 0;
@@ -2491,15 +2536,13 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     .filter((entry) => entry.restrictions.length === 0 && !entry.critical)
     .map((entry) => entry.context);
 
-  const approvalsMissing = productionEnvironments.filter((context) =>
-    asBoolean(asObject(context.environment.approvalSettings)?.required) !== true);
-  const approvalsWeak = productionEnvironments.filter((context) => {
-    const settings = asObject(context.environment.approvalSettings);
-    if (!settings || asBoolean(settings.required) !== true) return false;
-    return asBoolean(settings.bypassApprovalsForPendingChanges) === true
-      || asBoolean(settings.canReviewOwnRequest) === true
-      || (asNumber(settings.minNumApprovals) ?? 1) < 1;
-  });
+  const approvalAnalyses = productionEnvironments.map((context) => ({
+    context,
+    approvals: analyzeApprovalSettings(context.environment.approvalSettings),
+  }));
+  const approvalsMissing = approvalAnalyses.filter((entry) => !entry.approvals.required).map((entry) => entry.context);
+  const approvalsWeak = approvalAnalyses.filter((entry) => entry.approvals.required && entry.approvals.weaknesses.length > 0);
+  const approvalWeaknessKinds = [...new Set(approvalsWeak.flatMap((entry) => entry.approvals.weaknesses))];
 
   const secureModeMissing = productionEnvironments.filter((context) => asBoolean(context.environment.secureMode) !== true);
   const ttlZero = productionEnvironments.filter((context) => (asNumber(context.environment.defaultTtl) ?? 0) <= 0);
@@ -2511,14 +2554,15 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     return testProjectPattern.test(haystack);
   });
 
-  const productionSummary = productionEnvironments.map((context) => ({
+  const productionSummary = approvalAnalyses.map(({ context, approvals }) => ({
     environment: environmentLabel(context),
     critical: asBoolean(context.environment.critical) === true,
     secure_mode: asBoolean(context.environment.secureMode) === true,
     confirm_changes: asBoolean(context.environment.confirmChanges) === true,
     require_comments: asBoolean(context.environment.requireComments) === true,
     default_ttl: asNumber(context.environment.defaultTtl) ?? null,
-    approvals_required: asBoolean(asObject(context.environment.approvalSettings)?.required) === true,
+    approvals_required: approvals.required,
+    approval_settings: approvals.settings,
   }));
 
   const noProductionSummary = "No production environments were detected (environments marked critical or matching the production pattern); adjust production_pattern or mark production environments as critical in LaunchDarkly.";
@@ -2560,14 +2604,16 @@ export async function assessLaunchdarklyEnvironmentGovernance(
         : approvalsMissing.length > 0
           ? `${approvalsMissing.length}/${productionEnvironments.length} production environments do not require approvals for flag changes.`
           : approvalsWeak.length > 0
-            ? `All production environments require approvals, but ${approvalsWeak.length} allow bypassing pending changes or self review.`
-            : `All ${productionEnvironments.length} production environments require approvals without bypass or self review.`,
+            ? `All production environments require approvals, but ${approvalsWeak.length} weaken the gate: ${approvalWeaknessKinds.map(approvalWeaknessLabel).join("; ")}.`
+            : `All ${productionEnvironments.length} production environments require approvals on every flag, with no bypass, self review, or declined-change application.`,
       {
         approvals_missing: sample(approvalsMissing.map(environmentLabel)),
-        approvals_weak: sample(approvalsWeak.map((context) => ({
-          environment: environmentLabel(context),
-          settings: asObject(context.environment.approvalSettings),
+        approvals_weak: sample(approvalsWeak.map((entry) => ({
+          environment: environmentLabel(entry.context),
+          weaknesses: entry.approvals.weaknesses,
+          settings: entry.approvals.settings,
         }))),
+        production_environment_settings: sample(productionSummary),
       },
     ),
     sdkKeyFinding(
@@ -2641,6 +2687,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
       critical_only_production_environments: criticalOnlyProduction.length,
       unrestricted_production_environments: unrestrictedProduction.length,
       approvals_missing: approvalsMissing.length,
+      approvals_weak: approvalsWeak.length,
       stale_sdk_keys: staleSdkKeys.length,
       test_like_projects: testProjects.length,
       secure_mode_missing: secureModeMissing.length,

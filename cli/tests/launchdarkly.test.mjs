@@ -1166,6 +1166,94 @@ test("assessLaunchdarklyEnvironmentGovernance marks SDK key rotation manual when
   assert.equal(result.errors.length, 0);
 });
 
+test("assessLaunchdarklyEnvironmentGovernance treats tag-scoped approvals and declined-change application as weak approval gates", async () => {
+  const roles = await healthyClient().listCustomRoles();
+  const approvalSettings = (overrides) => ({
+    approvalSettings: {
+      required: true,
+      bypassApprovalsForPendingChanges: false,
+      canReviewOwnRequest: false,
+      canApplyDeclinedChanges: false,
+      minNumApprovals: 2,
+      requiredApprovalTags: [],
+      serviceKind: "launchdarkly",
+      ...overrides,
+    },
+  });
+  const strictSettings = {
+    required: true,
+    bypass_approvals_for_pending_changes: false,
+    can_review_own_request: false,
+    can_apply_declined_changes: false,
+    min_num_approvals: 2,
+    required_approval_tags: [],
+    service_kind: "launchdarkly",
+  };
+
+  const strict = await assessLaunchdarklyEnvironmentGovernance(governanceClient(roles, approvalSettings({})), { now: NOW });
+  assert.equal(findingStatus(strict, "LD-17"), "pass");
+  assert.match(finding(strict, "LD-17").summary, /require approvals on every flag, with no bypass, self review, or declined-change application/);
+  assert.deepEqual(finding(strict, "LD-17").evidence.approvals_weak, []);
+  assert.deepEqual(finding(strict, "LD-17").evidence.production_environment_settings[0].approval_settings, strictSettings);
+  assert.deepEqual(finding(strict, "LD-23").evidence.production_environment_settings[0].approval_settings, strictSettings);
+  assert.equal(strict.summary.approvals_weak, 0);
+
+  const tagScoped = await assessLaunchdarklyEnvironmentGovernance(
+    governanceClient(roles, approvalSettings({ requiredApprovalTags: ["require-approval"] })),
+    { now: NOW },
+  );
+  assert.equal(findingStatus(tagScoped, "LD-17"), "warn");
+  assert.match(finding(tagScoped, "LD-17").summary, /approvals are required only for flags carrying specific tags, so untagged flags skip approval/);
+  assert.deepEqual(finding(tagScoped, "LD-17").evidence.approvals_weak, [
+    {
+      environment: "web/production",
+      weaknesses: ["tag_scoped_approvals"],
+      settings: { ...strictSettings, required_approval_tags: ["require-approval"] },
+    },
+  ]);
+  assert.deepEqual(
+    finding(tagScoped, "LD-17").evidence.production_environment_settings[0].approval_settings.required_approval_tags,
+    ["require-approval"],
+  );
+  assert.equal(tagScoped.summary.approvals_weak, 1);
+
+  const declinedApplicable = await assessLaunchdarklyEnvironmentGovernance(
+    governanceClient(roles, approvalSettings({ canApplyDeclinedChanges: true })),
+    { now: NOW },
+  );
+  assert.equal(findingStatus(declinedApplicable, "LD-17"), "warn");
+  assert.match(finding(declinedApplicable, "LD-17").summary, /applied after a single approval even when other reviewers declined/);
+  assert.deepEqual(finding(declinedApplicable, "LD-17").evidence.approvals_weak[0].weaknesses, ["declined_changes_applicable"]);
+  assert.equal(finding(declinedApplicable, "LD-17").evidence.production_environment_settings[0].approval_settings.can_apply_declined_changes, true);
+
+  const everythingWeak = await assessLaunchdarklyEnvironmentGovernance(
+    governanceClient(roles, approvalSettings({
+      bypassApprovalsForPendingChanges: true,
+      canReviewOwnRequest: true,
+      canApplyDeclinedChanges: true,
+      requiredApprovalTags: ["prod"],
+    })),
+    { now: NOW },
+  );
+  assert.equal(findingStatus(everythingWeak, "LD-17"), "warn");
+  assert.deepEqual(finding(everythingWeak, "LD-17").evidence.approvals_weak[0].weaknesses, [
+    "bypass_pending_changes",
+    "self_review",
+    "declined_changes_applicable",
+    "tag_scoped_approvals",
+  ]);
+  assert.match(finding(everythingWeak, "LD-17").summary, /pending changes can bypass approval; requesters can approve their own changes; changes can be applied after a single approval/);
+
+  const notRequired = await assessLaunchdarklyEnvironmentGovernance(
+    governanceClient(roles, approvalSettings({ required: false, requiredApprovalTags: ["prod"] })),
+    { now: NOW },
+  );
+  assert.equal(findingStatus(notRequired, "LD-17"), "fail");
+  assert.deepEqual(finding(notRequired, "LD-17").evidence.approvals_missing, ["web/production"]);
+  assert.deepEqual(finding(notRequired, "LD-17").evidence.approvals_weak, []);
+  assert.equal(finding(notRequired, "LD-17").evidence.production_environment_settings[0].approvals_required, false);
+});
+
 test("assessLaunchdarklyEnvironmentGovernance never passes on truncated project, environment, role, or SDK key listings", async () => {
   const base = healthyClient();
   const truncatedProjects = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
