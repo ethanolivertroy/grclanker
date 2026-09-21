@@ -1123,7 +1123,10 @@ test("verdict safety rule 5: partial inventories never pass and report seen vers
   const admins = findings.find((item) => item.id === "CS-16");
   assert.equal(admins.status, "warn");
   assert.equal(admins.evidence.users_without_readable_roles, 1);
-  assert.deepEqual(admins.evidence.partial_inventory, [{ dataset: "users", seen: 2, total: 42 }]);
+  assert.deepEqual(admins.evidence.partial_inventory, [
+    { dataset: "users", seen: 2, total: 42 },
+    { dataset: "roles in the role catalog", seen: 2, total: 42 },
+  ]);
   const alerts = findings.find((item) => item.id === "CS-22");
   assert.deepEqual(alerts.evidence.partial_inventory, [{ dataset: "critical/high alerts", seen: 2, total: 42 }]);
   const apiClients = findings.find((item) => item.id === "CS-18");
@@ -1356,6 +1359,78 @@ test("review fix 2: missing Discover and ZTA pagination totals yield manual or w
   }));
   assert.equal(findingById(belowMissingWithSamples, "CS-25").status, "fail");
   assert.equal(findingById(belowMissingWithSamples, "CS-25").evidence.hosts_below_threshold, 2);
+});
+
+test("review fix 3: role and Identity Protection rule queries compare returned ids against meta.pagination.total", async () => {
+  const entityCalls = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") {
+      return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    }
+    if (url.pathname === "/user-management/queries/roles/v1") {
+      assert.equal(url.searchParams.get("limit"), null, "roles query documents no pagination parameters");
+      return jsonResponse({ resources: ["falcon_administrator", "falcon_analyst"], meta: { pagination: { limit: 2, offset: 0, total: 5 } } });
+    }
+    if (url.pathname === "/user-management/entities/roles/v1") {
+      entityCalls.push(url.searchParams.getAll("ids"));
+      return jsonResponse({ resources: url.searchParams.getAll("ids").map((id) => ({ id, display_name: id })) });
+    }
+    if (url.pathname === "/identity-protection/queries/policy-rules/v1") {
+      return jsonResponse({ resources: ["idp-1"], meta: { pagination: { limit: 1, offset: 0, total: 3 } } });
+    }
+    if (url.pathname === "/identity-protection/entities/policy-rules/v1") {
+      return jsonResponse({ resources: url.searchParams.getAll("ids").map((id) => ({ id, name: `Rule ${id}`, enabled: true })) });
+    }
+    if (url.pathname === "/zero-trust-assessment/queries/assessments/v1") {
+      return jsonResponse({ resources: [], meta: { pagination: { limit: 1, offset: 0 } } });
+    }
+    throw new Error(`unexpected path ${url.pathname}`);
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  const roles = await client.listRoles();
+  assert.equal(roles.items.length, 2);
+  assert.equal(roles.total, 5);
+  assert.equal(roles.truncated, true);
+  assert.deepEqual(entityCalls, [["falcon_administrator", "falcon_analyst"]]);
+
+  const rules = await client.listIdentityProtectionRules();
+  assert.equal(rules.items.length, 1);
+  assert.equal(rules.total, 3);
+  assert.equal(rules.truncated, true);
+
+  assert.equal(await client.countZtaAssessments("score:>=0"), undefined, "a missing total must surface as undefined, not zero");
+
+  const truncatedCatalog = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listRoles: async () => truncatedPage([{ id: "falcon_administrator", display_name: "Falcon Administrator" }], 5),
+  }));
+  for (const id of ["CS-16", "CS-17"]) {
+    const item = findingById(truncatedCatalog, id);
+    assert.equal(item.status, "warn", `${id} should warn on a truncated role catalog: ${item.summary}`);
+    assert.match(item.summary, /only 1 of 5 roles in the role catalog were read/);
+    assert.ok(item.evidence.partial_inventory.some((partial) => partial.dataset === "roles in the role catalog"));
+  }
+  assert.equal(truncatedCatalog.summary.role_catalog_truncated, true);
+  assert.equal(truncatedCatalog.summary.reported_total_roles, 5);
+
+  const truncatedGrants = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listUserRoles: async (uuid) => (uuid === "u-analyst" ? truncatedPage(passingUsers().roles[uuid], 12) : passingUsers().roles[uuid]),
+  }));
+  for (const id of ["CS-16", "CS-17"]) {
+    const item = findingById(truncatedGrants, id);
+    assert.equal(item.status, "warn", `${id} should warn on truncated role grant pages: ${item.summary}`);
+    assert.match(item.summary, /role grant pages were truncated for 1 of \d+ users/);
+    assert.equal(item.evidence.users_with_truncated_role_pages, 1);
+  }
+  assert.equal(truncatedGrants.summary.role_pages_truncated, 1);
+
+  const truncatedRules = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listIdentityProtectionRules: async () => truncatedPage([{ id: "idp-1", name: "Block stale accounts", enabled: true, simulationMode: false, action: "BLOCK" }], 3),
+  }));
+  assert.equal(findingById(truncatedRules, "CS-24").status, "warn");
+  assert.match(findingById(truncatedRules, "CS-24").summary, /only 1 of 3 Identity Protection policy rules were read/);
+  assert.equal(truncatedRules.summary.identity_protection_rules_truncated, true);
 });
 
 test("false-pass self-check (a): every endpoint forbidden yields 25 manual findings and zero passes", async () => {

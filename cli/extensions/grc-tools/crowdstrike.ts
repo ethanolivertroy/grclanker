@@ -1139,6 +1139,14 @@ export class CrowdstrikeApiClient {
     return recordPage(idPage, entities);
   }
 
+  private async listEntitiesBySinglePageQuery(queryPath: string, entityPath: string, query: JsonRecord = {}): Promise<CrowdstrikePage<JsonRecord>> {
+    const payload = await this.getJson(queryPath, query);
+    const ids = asStringArray(asArray(payload.resources));
+    const idPage = pageOf(ids, asNumber(paginationOf(payload).total), false);
+    const entities = await this.getByIds(entityPath, ids);
+    return recordPage(idPage, entities);
+  }
+
   async listPreventionPolicies(limit = DEFAULT_POLICY_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
     return this.listRecords("/policy/combined/prevention/v1", {}, { limit });
   }
@@ -1219,8 +1227,7 @@ export class CrowdstrikeApiClient {
   }
 
   async listRoles(): Promise<CrowdstrikePage<JsonRecord>> {
-    const ids = asStringArray(await this.getResources("/user-management/queries/roles/v1"));
-    return { items: await this.getByIds("/user-management/entities/roles/v1", ids), total: ids.length, truncated: false };
+    return this.listEntitiesBySinglePageQuery("/user-management/queries/roles/v1", "/user-management/entities/roles/v1");
   }
 
   async listApiClients(limit = DEFAULT_USER_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
@@ -1289,8 +1296,7 @@ export class CrowdstrikeApiClient {
   }
 
   async listIdentityProtectionRules(): Promise<CrowdstrikePage<JsonRecord>> {
-    const ids = asStringArray(await this.getResources("/identity-protection/queries/policy-rules/v1"));
-    return { items: await this.getByIds("/identity-protection/entities/policy-rules/v1", ids), total: ids.length, truncated: false };
+    return this.listEntitiesBySinglePageQuery("/identity-protection/queries/policy-rules/v1", "/identity-protection/entities/policy-rules/v1");
   }
 
   async listRtrSessions(filter: string, limit = DEFAULT_SESSION_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
@@ -2686,14 +2692,23 @@ function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginD
   return withUndatedItems(base, undatedPrivileged.length, "admin accounts", "last_login_at");
 }
 
-function withRoleVisibility(item: CrowdstrikeFinding, views: UserView[], roleErrors: string[]): CrowdstrikeFinding {
+function withRoleVisibility(item: CrowdstrikeFinding, views: UserView[], roleErrors: string[], truncatedRolePages: number): CrowdstrikeFinding {
   const unreadable = views.filter((view) => !view.roles_readable).length;
-  if (unreadable === 0) return item;
+  if (unreadable === 0 && truncatedRolePages === 0) return item;
+  const gaps = [
+    unreadable > 0 ? `Role grants could not be read for ${unreadable} of ${views.length} users (${roleErrors.length} role lookups failed)` : undefined,
+    truncatedRolePages > 0 ? `role grant pages were truncated for ${truncatedRolePages} of ${views.length} users` : undefined,
+  ].filter((gap): gap is string => Boolean(gap));
   return {
     ...item,
     status: item.status === "pass" ? "warn" : item.status,
-    summary: `${item.summary} Role grants could not be read for ${unreadable} of ${views.length} users (${roleErrors.length} role lookups failed), so admin and privilege counts are a lower bound and this verdict cannot exceed warn.`,
-    evidence: { ...(item.evidence ?? {}), users_without_readable_roles: unreadable, role_lookup_errors: roleErrors.slice(0, 10) },
+    summary: `${item.summary} ${gaps.join("; ")}, so admin and privilege counts are a lower bound and this verdict cannot exceed warn.`,
+    evidence: {
+      ...(item.evidence ?? {}),
+      users_without_readable_roles: unreadable,
+      users_with_truncated_role_pages: truncatedRolePages,
+      role_lookup_errors: roleErrors.slice(0, 10),
+    },
   };
 }
 
@@ -3014,7 +3029,10 @@ export async function assessCrowdstrikeAccessGovernance(
     if (allRolesFailed) {
       return unreadableFinding(id, "user role grants", roleErrors[0] ?? "role lookups failed", USER_CONSOLE_EVIDENCE);
     }
-    return withPartialInventory(withRoleVisibility(evaluate(), views, roleErrors), [userPartial]);
+    return withPartialInventory(
+      withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
+      [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
+    );
   };
 
   const findings = [
@@ -3039,11 +3057,14 @@ export async function assessCrowdstrikeAccessGovernance(
       role_pages_truncated: rolesTruncated,
       admin_users: views.filter((view) => view.admin_roles.length > 0).length,
       roles_in_catalog: roleCatalog.data.items.length,
+      reported_total_roles: roleCatalog.data.total ?? "unknown",
+      role_catalog_truncated: roleCatalog.data.truncated,
       api_clients: apiClients.data.items.length,
       ioa_exclusions: ioa.data.items.length,
       ml_exclusions: ml.data.items.length,
       sensor_visibility_exclusions: sv.data.items.length,
       identity_protection_rules: identity.error ? "unavailable" : identity.data.items.length,
+      identity_protection_rules_truncated: identity.error ? "unavailable" : identity.data.truncated,
       ...statusCounts(findings),
     },
     findings,
