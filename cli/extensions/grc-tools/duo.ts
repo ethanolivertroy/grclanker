@@ -1260,8 +1260,18 @@ function asBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+/**
+ * Accepts the comma-separated string the Admin API documents for list fields such as
+ * allowed_auth_list and blocked_auth_list, as well as a JSON array of strings.
+ */
 function listStrings(value: unknown): string[] {
-  return asArray(value).map(asString).filter((item): item is string => Boolean(item));
+  if (typeof value === "string") {
+    return value.split(",").map((item) => item.trim()).filter((item) => item.length > 0);
+  }
+  return asArray(value)
+    .map(asString)
+    .filter((item): item is string => Boolean(item))
+    .map((item) => item.trim());
 }
 
 function parseTimestamp(value: unknown): number | null {
@@ -1522,6 +1532,45 @@ function getPolicySections(policy: JsonRecord): JsonRecord {
 
 function getAllowedAuthList(policy: JsonRecord): string[] {
   return listStrings(asRecord(getPolicySections(policy).authentication_methods).allowed_auth_list).map((value) => value.toLowerCase());
+}
+
+/** Authentication Methods section: the telephony method names the Admin API documents. */
+const DOCUMENTED_TELEPHONY_METHODS = ["sms", "phonecall"] as const;
+
+function isTelephonyMethod(method: string): boolean {
+  return method.includes("sms") || method.includes("phone") || method.includes("voice");
+}
+
+interface TelephonyMethodPosture {
+  allowed: string[];
+  blocked: string[];
+  allowedExposed: boolean;
+  blockedExposed: boolean;
+  explicitlyAllowedTelephony: string[];
+  permittedTelephony: string[];
+  blockedTelephony: string[];
+}
+
+/**
+ * Authentication Methods: "An authentication method not included in blocked_auth_list is
+ * allowed, even if not specified [in allowed_auth_list]", and the default allow-list
+ * includes sms. A telephony method therefore counts as permitted unless it is blocked.
+ */
+function telephonyMethodPosture(policy: JsonRecord): TelephonyMethodPosture {
+  const authMethods = asRecord(getPolicySections(policy).authentication_methods);
+  const allowed = getAllowedAuthList(policy);
+  const blocked = listStrings(authMethods.blocked_auth_list).map((value) => value.toLowerCase());
+  const candidates = [...new Set<string>([...DOCUMENTED_TELEPHONY_METHODS, ...allowed.filter(isTelephonyMethod)])];
+  const explicitlyAllowedTelephony = allowed.filter(isTelephonyMethod);
+  return {
+    allowed,
+    blocked,
+    allowedExposed: authMethods.allowed_auth_list !== undefined && authMethods.allowed_auth_list !== null,
+    blockedExposed: authMethods.blocked_auth_list !== undefined && authMethods.blocked_auth_list !== null,
+    explicitlyAllowedTelephony,
+    permittedTelephony: candidates.filter((method) => allowed.includes(method) || !blocked.includes(method)),
+    blockedTelephony: candidates.filter((method) => blocked.includes(method) && !allowed.includes(method)),
+  };
 }
 
 function getBooleanish(record: JsonRecord, key: string): boolean | undefined {
@@ -2038,39 +2087,74 @@ export function assessDuoAuthentication(
     );
   }
 
-  const deprecatedAllowed = allowedFactors.filter((factor) =>
-    factor.includes("sms") || factor.includes("phone") || factor.includes("voice"),
-  );
-  if (allowedFactors.length === 0) {
+  const telephony = telephonyMethodPosture(globalPolicy);
+  const methodListEvidence = [
+    `authentication_methods.allowed_auth_list=${telephony.allowed.join(",") || (telephony.allowedExposed ? "empty" : "absent")}`,
+    `authentication_methods.blocked_auth_list=${telephony.blocked.join(",") || (telephony.blockedExposed ? "empty" : "absent")}`,
+    "Admin API rule: a method not in blocked_auth_list is allowed even when it is not in allowed_auth_list.",
+  ];
+  if (policyUnavailable) {
     findings.push(
       buildFinding(
         "DUO-AUTH-002",
         "Manual",
-        "Authentication method restrictions could not be confirmed from the global policy payload.",
-        policyUnavailable
-          ? policyEvidence
-          : ["The global policy did not expose authentication_methods.allowed_auth_list."],
-        "Review the Authentication Methods policy section manually and verify SMS and phone callback posture.",
+        "Authentication method restrictions could not be read because the global policy was unavailable.",
+        policyEvidence,
+        "Grant the audit principal Grant resource - Read and confirm sms and phonecall appear in authentication_methods.blocked_auth_list.",
       ),
     );
-  } else if (deprecatedAllowed.length === 0) {
+  } else if (!telephony.allowedExposed && !telephony.blockedExposed) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-002",
+        "Manual",
+        "The global policy did not expose authentication_methods.allowed_auth_list or blocked_auth_list.",
+        methodListEvidence,
+        "Review the Authentication Methods policy section manually and verify SMS and phone callback are blocked.",
+      ),
+    );
+  } else if (telephony.explicitlyAllowedTelephony.length > 0) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-002",
+        telephony.blockedTelephony.length === 0 ? "Fail" : "Partial",
+        `Telephony factors are explicitly allowed in the global policy: ${telephony.explicitlyAllowedTelephony.join(", ")}.`,
+        [...methodListEvidence, `permitted_telephony_methods=${telephony.permittedTelephony.join(",")}`],
+        "Remove sms and phonecall from allowed_auth_list and add them to blocked_auth_list, reserving telephony for tightly governed exceptions.",
+      ),
+    );
+  } else if (!telephony.blockedExposed) {
+    findings.push(
+      buildFinding(
+        "DUO-AUTH-002",
+        "Manual",
+        "The global policy did not expose authentication_methods.blocked_auth_list, so sms and phonecall cannot be confirmed blocked.",
+        methodListEvidence,
+        "Confirm in the Authentication Methods policy section that SMS and phone callback are blocked; a method absent from the allow-list is still permitted unless blocked.",
+      ),
+    );
+  } else if (telephony.permittedTelephony.length === 0) {
     findings.push(
       buildFinding(
         "DUO-AUTH-002",
         "Pass",
-        "Deprecated telephony factors are not present in the global allow-list.",
-        [`Allowed factors: ${allowedFactors.join(", ")}`],
-        "Keep SMS and phone callback disabled unless you have a documented break-glass exception.",
+        "SMS and phone callback are blocked by the global policy.",
+        [...methodListEvidence, `blocked_telephony_methods=${telephony.blockedTelephony.join(",")}`],
+        "Keep sms and phonecall in blocked_auth_list unless you have a documented break-glass exception.",
       ),
     );
   } else {
     findings.push(
       buildFinding(
         "DUO-AUTH-002",
-        deprecatedAllowed.length === allowedFactors.length ? "Fail" : "Partial",
-        "Legacy telephony factors are still allowed in the global policy.",
-        [`Allowed factors: ${allowedFactors.join(", ")}`],
-        "Remove SMS and phone callback from standard authentication paths and reserve them only for tightly governed exceptions.",
+        telephony.blockedTelephony.length === 0 ? "Fail" : "Partial",
+        `Telephony factors remain permitted because they are not in blocked_auth_list: ${telephony.permittedTelephony.join(", ")}.`,
+        [
+          ...methodListEvidence,
+          `permitted_telephony_methods=${telephony.permittedTelephony.join(",")}`,
+          `blocked_telephony_methods=${telephony.blockedTelephony.join(",") || "none"}`,
+        ],
+        "Add sms and phonecall to authentication_methods.blocked_auth_list so telephony factors are unavailable outside governed exceptions.",
       ),
     );
   }
@@ -2723,9 +2807,6 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
 }
 
 function osList(value: unknown): string[] {
-  if (typeof value === "string") {
-    return value.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
-  }
   return listStrings(value).map((item) => item.toLowerCase());
 }
 

@@ -53,7 +53,8 @@ function createSampleAuthenticationData() {
         is_global_policy: true,
         sections: {
           authentication_methods: {
-            allowed_auth_list: ["webauthn", "duo-push"],
+            allowed_auth_list: "webauthn-roaming,duo-push",
+            blocked_auth_list: "desktop,duo-passcode,phonecall,sms",
             require_verified_push: true,
             verified_push_digits: 6,
           },
@@ -88,7 +89,8 @@ function createSampleAuthenticationData() {
       is_global_policy: true,
       sections: {
         authentication_methods: {
-          allowed_auth_list: ["webauthn", "duo-push"],
+          allowed_auth_list: "webauthn-roaming,duo-push",
+          blocked_auth_list: "desktop,duo-passcode,phonecall,sms",
           require_verified_push: true,
           verified_push_digits: 6,
         },
@@ -230,7 +232,9 @@ function compliantGlobalPolicy() {
     sections: {
       authentication_policy: { user_auth_behavior: "enforce" },
       authentication_methods: {
-        allowed_auth_list: ["webauthn", "duo-push"],
+        // Admin API documents both lists as comma-separated strings.
+        allowed_auth_list: "duo-push,webauthn-platform,webauthn-roaming,hardware-token",
+        blocked_auth_list: "desktop,duo-passcode,phonecall,sms",
         require_verified_push: true,
         verified_push_digits: 6,
       },
@@ -559,6 +563,63 @@ test("assessDuoAuthentication downgrades incomplete user inventories to Partial 
     assert.equal(finding.status, "Partial", `${id} must not pass on a partial inventory`);
     assert.ok(finding.evidence.some((line) => line.includes("inventory_seen=1 inventory_total=40")), `${id} reports seen and total`);
   }
+});
+
+function withAuthMethods(authenticationMethods) {
+  const data = compliantAuthenticationData();
+  data.globalPolicy.data.sections.authentication_methods = authenticationMethods;
+  data.policies.data[0].sections.authentication_methods = authenticationMethods;
+  return data;
+}
+
+test("assessDuoAuthentication treats telephony as permitted unless blocked_auth_list blocks it", () => {
+  const config = createSampleConfig();
+
+  // Documented defaults: the allow-list includes sms and the block-list omits it.
+  const defaults = withAuthMethods({
+    allowed_auth_list: "bypass,bypass-pwl,duo-push,duo-push-pwl,hardware-token,sms,webauthn-platform,webauthn-platform-pwl,webauthn-roaming,webauthn-roaming-pwl",
+    blocked_auth_list: "desktop,duo-passcode,phonecall",
+    require_verified_push: true,
+    verified_push_digits: 6,
+  });
+  const defaultFinding = findingById(assessDuoAuthentication(defaults, config), "DUO-AUTH-002");
+  assert.equal(defaultFinding.status, "Partial", "sms is explicitly allowed while phonecall is blocked");
+  assert.ok(defaultFinding.evidence.includes("permitted_telephony_methods=sms"));
+  assert.equal(findingById(assessDuoAuthentication(defaults, config), "DUO-AUTH-001").status, "Pass", "string allow-lists still feed the phishing-resistant check");
+
+  // sms is absent from the allow-list but not blocked, so it is still permitted.
+  const notBlocked = withAuthMethods({
+    allowed_auth_list: "duo-push,webauthn-roaming",
+    blocked_auth_list: "desktop,duo-passcode,phonecall",
+    require_verified_push: true,
+  });
+  const notBlockedFinding = findingById(assessDuoAuthentication(notBlocked, config), "DUO-AUTH-002");
+  assert.equal(notBlockedFinding.status, "Partial");
+  assert.match(notBlockedFinding.summary, /not in blocked_auth_list: sms/);
+  assert.ok(notBlockedFinding.evidence.includes("blocked_telephony_methods=phonecall"));
+
+  // Neither telephony method blocked.
+  const neither = withAuthMethods({ allowed_auth_list: "duo-push,webauthn-roaming", blocked_auth_list: "desktop", require_verified_push: true });
+  assert.equal(findingById(assessDuoAuthentication(neither, config), "DUO-AUTH-002").status, "Fail");
+
+  // Both blocked, allow-list provided in the JSON array shape.
+  const arrays = withAuthMethods({
+    allowed_auth_list: ["duo-push", "webauthn-roaming"],
+    blocked_auth_list: ["desktop", "duo-passcode", "phonecall", "sms"],
+    require_verified_push: true,
+  });
+  const arraysFinding = findingById(assessDuoAuthentication(arrays, config), "DUO-AUTH-002");
+  assert.equal(arraysFinding.status, "Pass");
+  assert.ok(arraysFinding.evidence.includes("blocked_telephony_methods=sms,phonecall"));
+
+  // Without blocked_auth_list nothing can be confirmed blocked.
+  const noBlockList = withAuthMethods({ allowed_auth_list: "duo-push,webauthn-roaming", require_verified_push: true });
+  const noBlockListFinding = findingById(assessDuoAuthentication(noBlockList, config), "DUO-AUTH-002");
+  assert.equal(noBlockListFinding.status, "Manual");
+  assert.ok(noBlockListFinding.evidence.includes("authentication_methods.blocked_auth_list=absent"));
+
+  const noLists = withAuthMethods({ require_verified_push: true });
+  assert.equal(findingById(assessDuoAuthentication(noLists, config), "DUO-AUTH-002").status, "Manual");
 });
 
 test("assessDuoAdminAccess evaluates lockout policy and undated administrators", () => {
