@@ -39,29 +39,18 @@ const agentSdkRoot = resolve(cliRoot, "agent-sdk");
 const distAgentDir = resolve(cliRoot, "dist", "agent-sdk", "agent");
 const COMPUTE_TOOL_NAMES = ["bash", "read", "write", "edit", "ls", "find", "grep"];
 const WRITE_MARKER = /_(export|generate|collect|init|import|create|assemble)_/;
-const EXPECTED_WRITE_TOOLS = [
-  "ansible_export_audit_bundle",
+// Registered domain tools when the Agent SDK runtime landed; integrations only add to it.
+const BASELINE_DOMAIN_TOOL_COUNT = 107;
+// Writers that must stay classified as writes whatever else the registry gains.
+const BASELINE_WRITE_TOOLS = [
   "aws_export_audit_bundle",
-  "azure_export_audit_bundle",
-  "cloudflare_export_audit_bundle",
-  "duo_export_audit_bundle",
   "fedramp_generate_ads_bundle",
-  "fedramp_generate_ads_site",
-  "gcp_export_audit_bundle",
-  "github_export_audit_bundle",
-  "gws_export_audit_bundle",
   "gws_ops_collect_evidence_bundle",
-  "oci_export_audit_bundle",
-  "okta_export_audit_bundle",
   "oscal_assemble_ssp",
   "oscal_create_model",
-  "oscal_generate_ssp_markdown",
   "oscal_import_model",
   "oscal_init_workspace",
-  "slack_export_audit_bundle",
   "vanta_export_audit",
-  "webex_export_audit_bundle",
-  "zoom_export_audit_bundle",
 ];
 
 function importAgentEntry(...segments) {
@@ -106,7 +95,8 @@ test("agent sdk registry exposes every domain tool and excludes compute backend 
     .filter((tool) => tool.kind === "domain")
     .map((tool) => tool.name);
 
-  assert.equal(tools.length, 107);
+  assert.equal(tools.length, expected.length);
+  assert.ok(tools.length >= BASELINE_DOMAIN_TOOL_COUNT, `registry shrank below ${BASELINE_DOMAIN_TOOL_COUNT} tools`);
   assert.deepEqual(names, expected);
   assert.equal(new Set(names).size, names.length);
   for (const computeTool of COMPUTE_TOOL_NAMES) {
@@ -191,9 +181,13 @@ test("every registered tool is classified in the expected direction", () => {
   const names = listRegisteredGrcToolNames();
   const undeclared = names.filter((name) => classifyGrcToolEffect(name) === undefined).sort();
   const read = names.filter((name) => classifyGrcToolEffect(name) === "read");
+  const expectedWriteTools = names.filter((name) => WRITE_MARKER.test(name)).sort();
 
-  assert.deepEqual(undeclared, EXPECTED_WRITE_TOOLS);
-  assert.equal(read.length, names.length - EXPECTED_WRITE_TOOLS.length);
+  assert.deepEqual(undeclared, expectedWriteTools);
+  assert.equal(read.length, names.length - expectedWriteTools.length);
+  for (const name of BASELINE_WRITE_TOOLS) {
+    assert.ok(expectedWriteTools.includes(name), `${name} must remain a registered write tool`);
+  }
   for (const name of names) {
     if (WRITE_MARKER.test(name)) {
       assert.equal(classifyGrcToolEffect(name), undefined, `${name} writes and must stay undeclared`);
@@ -451,7 +445,7 @@ test("agent/tools has exactly one generated entry per registered domain tool", a
   const files = await listAgentSdkToolFiles(toolsDir);
   const names = [...listRegisteredGrcToolNames()].sort();
 
-  assert.equal(files.length, 107);
+  assert.equal(files.length, names.length);
   assert.deepEqual(files, names);
   for (const name of names) {
     const source = readFileSync(resolve(toolsDir, `${name}.ts`), "utf8");
@@ -493,8 +487,9 @@ test("agent entry files hand the adapter configs to the mocked Agent SDK define 
 
 test("every generated tool entry registers a server tool for its filename", async () => {
   const before = mockCalls().filter((call) => call.helper === "defineTool").length;
+  const toolNames = [...listRegisteredGrcToolNames()];
 
-  for (const name of listRegisteredGrcToolNames()) {
+  for (const name of toolNames) {
     const tool = (await importAgentEntry("tools", `${name}.js`)).default;
     const registered = getRegisteredGrcTool(name);
 
@@ -510,5 +505,5 @@ test("every generated tool entry registers a server tool for its filename", asyn
   }
 
   const after = mockCalls().filter((call) => call.helper === "defineTool").length;
-  assert.equal(after - before, 107);
+  assert.equal(after - before, toolNames.length);
 });

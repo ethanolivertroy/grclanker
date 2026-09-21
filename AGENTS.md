@@ -30,6 +30,8 @@ Integrations are designed so several can land in parallel with minimal overlap i
 - Add one alphabetical `["<slug>_", "<Display Name>"]` entry to `DOMAIN_GROUPS` in `cli/pi/tool-catalog.ts`; the catalog test fails if a domain tool has no group.
 - Put tests in `cli/tests/<slug>.test.mjs`; `test:cli` picks up every `tests/*.test.mjs`, so do not edit the `test:cli` script.
 - Add the live smoke script as `cli/scripts/<slug>-live-smoke.mjs` plus a `test:<slug>:live` entry in `cli/package.json`.
+- Run `npm --prefix cli run sync:agent-sdk-tools` so every new tool gets its generated entry under `cli/agent-sdk/agent/tools/` (new files only). The Agent SDK and Flue tests derive their tool counts and write-tool list from the registry, so they need no edits; write tools are recognized by the verbs in `cli/agent-sdk/lib/effects.ts`.
+- If a new tool parameter looks like a credential (its name mentions key, token, secret, password, or similar) the Flue redaction test in `cli/tests/flue.test.mjs` fails until the name is either redacted by `cli/flue/redact.ts` or listed as reviewed-safe with a reason.
 - Document the integration in `src/content/docs/docs/integrations/<slug>.md` (frontmatter `title` and `description`); the docs sidebar lists that folder automatically.
 - Regenerate `src/content/docs/docs/tools/catalog.md` with `npm --prefix cli run sync:tool-catalog` only when you are not landing alongside other integration PRs, since every regeneration rewrites the shared counts.
 

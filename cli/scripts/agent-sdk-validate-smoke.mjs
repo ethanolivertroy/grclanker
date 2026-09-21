@@ -28,7 +28,7 @@ function resolveAgentSdkBin() {
  *
  * The child's stdout is a temp file, not a pipe: `agent-sdk info --json`
  * writes with a bare `process.stdout.write` and then calls `process.exit`,
- * so with a pipe only the first 64 KiB survives and the 107-tool payload is
+ * so with a pipe only the first 64 KiB survives and the full tool payload is
  * truncated mid-JSON. Writes to a file descriptor complete synchronously.
  */
 function runAgentSdk(bin, args) {
