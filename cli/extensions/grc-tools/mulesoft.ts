@@ -1311,8 +1311,9 @@ export class MulesoftApiClient {
     return this.listOffset("/exchange/api/v2/assets/search", { limit, pageSize: 100 });
   }
 
+  // retrieveStatistics defaults to false, which leaves workers.recentStatistics (CPU) out of every application record.
   async listCloudhubApplications(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get("/cloudhub/api/v2/applications", {}, this.environmentHeaders(environmentId)));
+    return extractCollection(await this.get("/cloudhub/api/v2/applications", { retrieveStatistics: true }, this.environmentHeaders(environmentId)));
   }
 
   async listCloudhubAlerts(environmentId: string): Promise<JsonRecord[]> {
@@ -2626,6 +2627,9 @@ export async function assessMulesoftRuntimeInfrastructure(
     if (!item.production && (amount > 1 || (weight !== undefined && weight >= 2))) return true;
     return amount >= 4 && cpu !== undefined && cpu < 10;
   });
+  const largeApplicationsWithoutCpu = applicationRecords.filter((item) =>
+    workerAmount(item.application) >= 4 && workerCpu(item.application) === undefined && !oversizedApplications.includes(item),
+  );
 
   const persistentQueueApplications = applicationRecords.filter((item) => usesPersistentQueues(item.application));
   const unencryptedQueueApplications = persistentQueueApplications.filter((item) => !persistentQueuesEncrypted(item.application));
@@ -2729,13 +2733,18 @@ export async function assessMulesoftRuntimeInfrastructure(
             `${item.label}: ${workerAmount(item.application)} x ${asString(getNestedValue(item.application, ["workers", "type", "name"])) ?? "worker"}`,
           )),
           applications_without_worker_data: sample(applicationsWithoutWorkerData.map((item) => item.label)),
+          applications_with_cpu_statistics: applicationRecords.filter((item) => workerCpu(item.application) !== undefined).length,
+          large_applications_without_cpu_statistics: sample(largeApplicationsWithoutCpu.map((item) => item.label)),
         };
         if (applicationRecords.length === 0) return verdict("manual", zeroApplicationsSummary, evidence);
         if (oversizedApplications.length > 0) {
-          return verdict("warn", `${oversizedApplications.length} CloudHub application(s) look over-provisioned (multiple or large workers in non-production, or four or more workers with low CPU).`, evidence);
+          return verdict("warn", `${oversizedApplications.length} CloudHub application(s) look over-provisioned (multiple or large workers in non-production, or four or more workers with CPU under 10 percent from workers.recentStatistics).`, evidence);
         }
         if (applicationsWithoutWorkerData.length > 0) {
           return verdict("warn", `${applicationsWithoutWorkerData.length} CloudHub application(s) did not expose worker sizing data, so their sizing could not be reviewed.`, evidence);
+        }
+        if (largeApplicationsWithoutCpu.length > 0) {
+          return verdict("warn", `${largeApplicationsWithoutCpu.length} CloudHub application(s) run four or more workers but returned no recentStatistics.cpu even with retrieveStatistics=true, so their utilization could not be reviewed and is not counted as right-sized.`, evidence);
         }
         return verdict("pass", `${applicationRecords.length} CloudHub application(s) reviewed with worker sizing data present and no obvious over-provisioning.`, evidence);
       },

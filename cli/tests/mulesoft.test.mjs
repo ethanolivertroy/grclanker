@@ -2153,3 +2153,48 @@ test("review fix 7: listConnectedApplications sends hide_managed=false so manage
   assert.equal(findingById(result, "MULESOFT-IAM-18").evidence.managed_apps_included, true);
   assert.equal(findingById(result, "MULESOFT-IAM-19").evidence.connected_apps_total, 2);
 });
+
+test("review fix 8: CloudHub applications are listed with retrieveStatistics=true and RT-11 uses the returned CPU figures", async () => {
+  const seen = [];
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      (url) => (url.pathname === "/cloudhub/api/v2/applications"
+        ? jsonResponse({ data: [{ domain: "orders-prod", workers: { amount: 4, type: { name: "Medium", weight: 1 }, recentStatistics: { cpu: 3.5 } } }] })
+        : undefined),
+    ], seen),
+  });
+
+  const applications = await client.listCloudhubApplications("env-prod");
+  assert.equal(applications[0].workers.recentStatistics.cpu, 3.5);
+  assert.ok(seen[0].search.includes("retrieveStatistics=true"), seen[0].search);
+
+  const lowCpu = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listCloudhubApplications(environmentId) {
+      if (environmentId !== "env-prod") return [];
+      return [{
+        domain: "orders-prod",
+        muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
+        workers: { amount: 4, type: { name: "Medium", weight: 1 }, recentStatistics: { cpu: 3.5 } },
+        properties: {},
+      }];
+    },
+  }));
+  assert.equal(statusOf(lowCpu, "MULESOFT-RT-11"), "warn");
+  assert.deepEqual(findingById(lowCpu, "MULESOFT-RT-11").evidence.oversized_applications, ["Production: orders-prod: 4 x Medium"]);
+  assert.equal(findingById(lowCpu, "MULESOFT-RT-11").evidence.applications_with_cpu_statistics, 1);
+
+  const noStatistics = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listCloudhubApplications(environmentId) {
+      if (environmentId !== "env-prod") return [];
+      return [{
+        domain: "orders-prod",
+        muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
+        workers: { amount: 4, type: { name: "Medium", weight: 1 } },
+        properties: {},
+      }];
+    },
+  }));
+  assert.equal(statusOf(noStatistics, "MULESOFT-RT-11"), "warn");
+  assert.match(findingById(noStatistics, "MULESOFT-RT-11").summary, /returned no recentStatistics\.cpu even with retrieveStatistics=true/);
+  assert.deepEqual(findingById(noStatistics, "MULESOFT-RT-11").evidence.large_applications_without_cpu_statistics, ["Production: orders-prod"]);
+});
