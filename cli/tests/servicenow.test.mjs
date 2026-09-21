@@ -22,11 +22,14 @@ import {
   listServicenowControls,
   mappingsForControl,
   parseLinkNext,
+  projectAclRow,
+  projectRows,
   redactSecrets,
   resolveSecureOutputPath,
   resolveServicenowConfiguration,
 } from "../dist/extensions/grc-tools/servicenow.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
@@ -118,6 +121,8 @@ function filterRows(rows, query, fixture) {
 function fixtureFetch(fixture, options = {}) {
   const calls = [];
   const forbidden = new Set(options.forbiddenTables ?? []);
+  const forbiddenCounts = new Set(options.forbiddenCounts ?? []);
+  const forbiddenQueries = options.forbiddenQueries ?? [];
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(String(input));
     calls.push({ url, init });
@@ -125,6 +130,10 @@ function fixtureFetch(fixture, options = {}) {
     const statsMatch = url.pathname.match(/^\/api\/now\/stats\/([^/]+)$/);
     const table = tableMatch?.[1] ?? statsMatch?.[1];
     if (options.forbidAll || (table && forbidden.has(table))) return forbiddenResponse();
+    if (statsMatch && forbiddenCounts.has(table)) return forbiddenResponse();
+    if (tableMatch && forbiddenQueries.some((rule) => rule.table === table && (url.searchParams.get("sysparm_query") ?? "").includes(rule.queryIncludes))) {
+      return forbiddenResponse();
+    }
     if (tableMatch) {
       const rows = fixture.tables[table];
       if (rows === undefined) return jsonResponse({ error: { message: `Invalid table ${table}` } }, { status: 400 });
@@ -1267,4 +1276,302 @@ test("ServiceNow tools are registered in the tool catalog under the ServiceNow g
     "servicenow_export_audit_bundle",
   ]);
   assert.ok(tools.every((tool) => tool.group === "ServiceNow"));
+});
+
+const FAKE_SECRETS = ["FAKE_HASH_1", "FAKE_SECRET_TOKEN_1", "FAKE_SECRET_TOKEN_2", "FAKE_PRIVATE_KEY_1", "FAKE_SCRIPT_LITERAL_1"];
+
+/**
+ * The healthy fixture with a distinctive fake secret planted in every column
+ * that can carry one on a real instance (password hashes, client secrets,
+ * bind and mailbox passwords, keystore material, encryption keys, update XML
+ * payloads, script bodies) plus extra columns on the two tables that used to
+ * be read whole. The fake server ignores sysparm_fields, so only client-side
+ * projection keeps these out of the bundle.
+ */
+function secretLadenFixture() {
+  const fixture = healthyFixture();
+  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => ({ ...row, user_password: "FAKE_HASH_1", password_needs_reset: "false" }));
+  fixture.tables.sys_user_has_role = fixture.tables.sys_user_has_role.map((row) => ({ ...row, "user.user_password": "FAKE_HASH_1" }));
+  fixture.tables.sys_properties = [
+    ...fixture.tables.sys_properties.map((row) => ({ ...row, description: `Rotated with FAKE_SECRET_TOKEN_2 on ${row.sys_updated_on}` })),
+    property("my.integration.api_token", "FAKE_SECRET_TOKEN_2"),
+  ];
+  fixture.tables.password_policy = fixture.tables.password_policy.map((row) => ({ ...row, description: "Seeded via FAKE_SECRET_TOKEN_1", lockout_message: "Call the helpdesk quoting FAKE_SECRET_TOKEN_1" }));
+  fixture.tables.multi_factor_criteria = fixture.tables.multi_factor_criteria.map((row) => ({ ...row, description: "Bootstrap secret FAKE_SECRET_TOKEN_1", condition: "gs.getProperty('mfa.seed') == 'FAKE_SECRET_TOKEN_1'" }));
+  fixture.tables.ldap_server_config = [{ sys_id: "ldap-1", name: "Corporate LDAP", active: "true", server_url: "ldaps://ldap.example.com", rdn: "cn=bind,dc=example,dc=com", password: "FAKE_SECRET_TOKEN_1", sys_updated_on: "2026-01-01 00:00:00" }];
+  fixture.tables.sys_certificate = fixture.tables.sys_certificate.map((row) => ({ ...row, key_store_password: "FAKE_SECRET_TOKEN_1", pem_certificate: "-----BEGIN PRIVATE KEY-----\nFAKE_PRIVATE_KEY_1\n-----END PRIVATE KEY-----" }));
+  fixture.tables.oauth_entity = fixture.tables.oauth_entity.map((row) => ({ ...row, client_secret: "FAKE_SECRET_TOKEN_1", redirect_url: "https://app.example.com/callback?state=FAKE_SECRET_TOKEN_1" }));
+  fixture.tables.sys_email_account = fixture.tables.sys_email_account.map((row) => ({ ...row, user_name: "smtp-relay", password: "FAKE_SECRET_TOKEN_1" }));
+  fixture.tables.sys_encryption_context = [{ sys_id: "ctx-1", name: "PII context", type: "AES256", encryption_key: "FAKE_SECRET_TOKEN_1", sys_updated_on: "2026-01-01 00:00:00" }];
+  fixture.tables.sys_update_xml = [{
+    sys_id: "ux-1",
+    name: "sys_properties_abc",
+    type: "System Property",
+    target_name: "my.integration.api_token",
+    action: "INSERT_OR_UPDATE",
+    update_set: "us-open",
+    "update_set.name": "Security tweaks",
+    "update_set.state": "in progress",
+    payload: "<record_update><sys_properties><value>FAKE_SECRET_TOKEN_1</value></sys_properties></record_update>",
+  }];
+  fixture.tables.sys_script = [
+    ...fixture.tables.sys_script,
+    { sys_id: "br-2", name: "Dynamic eval", collection: "incident", active: "true", script: "eval(current.script); var key = 'FAKE_SCRIPT_LITERAL_1';" },
+  ];
+  fixture.tables.sys_security_acl = fixture.tables.sys_security_acl.map((row) => (row.operation === "read"
+    ? { ...row, condition: "gs.getProperty('acl.seed') == 'FAKE_SCRIPT_LITERAL_1'", script: "answer = current.token == 'FAKE_SCRIPT_LITERAL_1';" }
+    : row));
+  fixture.tables.ecc_agent = fixture.tables.ecc_agent.map((row) => ({ ...row, mid_credential: "FAKE_SECRET_TOKEN_1" }));
+  return fixture;
+}
+
+test("ServicenowApiClient projects rows to the requested fields even when the server ignores sysparm_fields (rule 9)", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => ({ ...row, user_password: "FAKE_HASH_1" }));
+  const { fetchImpl, calls } = fixtureFetch(fixture);
+
+  const projected = await createClient(fetchImpl).queryTable("sys_user", { fields: ["sys_id", "user_name"] });
+  assert.equal(projected.rows.length, 4);
+  for (const row of projected.rows) assert.deepEqual(Object.keys(row).sort(), ["sys_id", "user_name"]);
+  assert.equal(calls[0].url.searchParams.get("sysparm_fields"), "sys_id,user_name");
+  assert.equal(JSON.stringify(projected).includes("FAKE_HASH_1"), false);
+
+  const dotted = await createClient(fetchImpl).queryTable("sys_user_has_role", { fields: ["sys_id", "user.user_name", "role.name"] });
+  assert.deepEqual(Object.keys(dotted.rows[0]).sort(), ["role.name", "sys_id", "user.user_name"], "dot-walked columns are kept under their dotted key");
+
+  assert.deepEqual(projectRows([{ a: 1, b: 2 }], ["a"]), [{ a: 1 }]);
+  assert.deepEqual(projectRows([{ a: 1, b: 2 }], undefined), [{ a: 1, b: 2 }], "no fields list means the caller asked for whole rows");
+  assert.deepEqual(projectRows([{ a: 1 }], []), [{ a: 1 }]);
+  assert.deepEqual(
+    projectAclRow({ sys_id: "acl-1", name: "sys_user", operation: "read", condition: "gs.hasRole('admin')", script: "" }),
+    { sys_id: "acl-1", name: "sys_user", operation: "read", has_condition: true, has_script: false },
+  );
+});
+
+test("exportServicenowAuditBundle never writes planted secrets to any bundle file or zip entry (rule 9)", async () => {
+  const base = createTempBase("servicenow-bundle-secrets-");
+  const fixture = secretLadenFixture();
+  const result = await exportServicenowAuditBundle(createClient(fixtureFetch(fixture).fetchImpl), sampleConfig(), base);
+
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.size >= 40, `expected a full bundle, saw ${files.size} files`);
+  assert.ok(files.has("core_data/sys_user.json"));
+  assert.ok(files.has("core_data/sys_security_acl.json"));
+  assert.ok(files.has("core_data/sys_update_xml_sensitive.json"));
+  assert.ok(files.has("core_data/sys_encryption_context.json"));
+  assert.ok(files.has("core_data/ldap_server_config.json"));
+  assert.ok(files.has("core_data/access_check.json"));
+  assertSecretsAbsent(assert, files, FAKE_SECRETS, "bundle directory");
+  assertSecretsAbsent(assert, files, [sampleConfig().password], "bundle directory");
+  const entries = readZipEntries(result.zipPath);
+  assert.equal(entries.size, files.size, "the zip carries every bundle file");
+  assertSecretsAbsent(assert, entries, FAKE_SECRETS, "zip archive");
+
+  const rows = (relativePath) => JSON.parse(files.get(relativePath)).rows;
+  const users = rows("core_data/sys_user.json");
+  assert.equal(users.length, 4);
+  assert.ok(users.every((row) => !("user_password" in row) && !("password_needs_reset" in row) && typeof row.user_name === "string"));
+  assert.ok(rows("core_data/sys_user_has_role_privileged.json").every((row) => !("user.user_password" in row) && row["role.name"] === "admin"));
+  assert.ok(rows("core_data/sys_properties_identity.json").every((row) => !("description" in row) && row.name.startsWith("glide.")));
+  const policies = rows("core_data/password_policy.json");
+  assert.equal(policies.length, 1);
+  assert.deepEqual(Object.keys(policies[0]).sort(), ["maximum_password_length", "minimum_password_length", "name", "require_digit", "require_lowercase", "require_special", "require_uppercase", "sys_id"]);
+  const criteria = rows("core_data/multi_factor_criteria.json");
+  assert.deepEqual(criteria.map((row) => Object.keys(row).sort()), [["active", "name", "roles", "sys_id"], ["active", "name", "sys_id"]]);
+  assert.ok(rows("core_data/ldap_server_config.json").every((row) => !("password" in row) && !("rdn" in row) && !("server_url" in row) && row.name === "Corporate LDAP"));
+  assert.ok(rows("core_data/sys_certificate.json").every((row) => !("key_store_password" in row) && !("pem_certificate" in row) && typeof row.expires === "string"));
+  assert.ok(rows("core_data/oauth_entity.json").every((row) => !("client_secret" in row) && !("redirect_url" in row) && row.client_id === "abc123"));
+  assert.ok(rows("core_data/sys_email_account.json").every((row) => !("password" in row) && !("user_name" in row) && row.connection_security === "SSL/TLS"));
+  assert.ok(rows("core_data/sys_encryption_context.json").every((row) => !("encryption_key" in row) && row.name === "PII context"));
+  const updateXml = rows("core_data/sys_update_xml_sensitive.json");
+  assert.equal(updateXml.length, 1);
+  assert.ok(!("payload" in updateXml[0]) && updateXml[0].target_name === "my.integration.api_token");
+  const evalRules = rows("core_data/sys_script_eval.json");
+  assert.equal(evalRules.length, 1);
+  assert.deepEqual(Object.keys(evalRules[0]).sort(), ["collection", "name", "sys_id"]);
+  const acls = rows("core_data/sys_security_acl.json");
+  assert.ok(acls.length > 0);
+  for (const acl of acls) {
+    assert.ok(!("condition" in acl) && !("script" in acl), `${acl.sys_id} still carries code bodies`);
+    assert.equal(acl.has_condition, acl.operation === "read");
+    assert.equal(acl.has_script, acl.operation === "read");
+  }
+  assert.ok(rows("core_data/ecc_agent.json").every((row) => !("mid_credential" in row) && row.validated === "true"));
+  const accessCheck = JSON.parse(files.get("core_data/access_check.json"));
+  assert.equal(accessCheck.identity, "audit.reader", "the whoami row is projected to user_name and name");
+
+  const findings = new Map(JSON.parse(files.get("analysis/findings.json")).map((item) => [item.id, item]));
+  for (const id of ["SNOW-02", "SNOW-04", "SNOW-06", "SNOW-07", "SNOW-08", "SNOW-11", "SNOW-14"]) {
+    assert.equal(findings.get(id).status, "pass", `${id} must still pass on the projected columns: ${findings.get(id).summary}`);
+  }
+  assert.match(findings.get("SNOW-06").summary, /all 1 password policies meet the threshold/);
+  assert.match(findings.get("SNOW-07").summary, /covers admin and security_admin/);
+  assert.match(findings.get("SNOW-08").summary, /1 active LDAP servers/);
+  assert.equal(findings.get("SNOW-12").status, "fail", "the eval() rule is still detected without its script body");
+  assert.match(findings.get("SNOW-12").summary, /Dynamic eval \(incident\)/);
+});
+
+test("ServicenowApiClient describes non-JSON error bodies by shape and logs only the pathname on timeout (rule 9)", async () => {
+  const gatewayPage = "<html><body>502 upstream; request headers: authorization: Basic FAKE_SECRET_TOKEN_1</body></html>";
+  const gatewayFetch = async () => new Response(gatewayPage, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+  const snapshot = await createClient(gatewayFetch, { maxRetries: 0 }).queryTable("sys_user", { query: "active=true", fields: ["sys_id"] });
+  assert.equal(snapshot.statusCode, 502);
+  assert.match(snapshot.error, /502 Bad Gateway\) for \/api\/now\/table\/sys_user: non-JSON response body \(text\/html, \d+ bytes\)$/);
+  assert.equal(snapshot.error.includes("FAKE_SECRET_TOKEN_1"), false);
+  assert.equal(snapshot.error.includes("<html>"), false);
+
+  const tokenFetch = async (input) => {
+    assert.equal(new URL(String(input)).pathname, "/oauth_token.do");
+    return new Response(gatewayPage, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+  };
+  const oauth = createClient(tokenFetch, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: "client-secret" });
+  const tokenFailure = await oauth.queryTable("sys_user", { fields: ["sys_id"] });
+  assert.match(tokenFailure.error, /OAuth token request failed \(502 Bad Gateway\): non-JSON response body \(text\/html, \d+ bytes\)$/);
+  assert.equal(tokenFailure.error.includes("FAKE_SECRET_TOKEN_1"), false);
+
+  const hangingFetch = (input, init) => new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+  });
+  const timedOut = await createClient(hangingFetch, { timeoutMs: 5 }).queryTable("sys_user", { query: "user_name=alice.admin", fields: ["sys_id"] });
+  assert.match(timedOut.error, /timed out after 5ms: \/api\/now\/table\/sys_user$/);
+  assert.equal(timedOut.error.includes("sysparm_query"), false);
+  assert.equal(timedOut.error.includes("alice.admin"), false);
+});
+
+function overrideTablePage(inner, table, respond) {
+  return async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === `/api/now/table/${table}`) {
+      const response = respond(url);
+      if (response) return response;
+    }
+    return inner.fetchImpl(input, init);
+  };
+}
+
+test("ServicenowApiClient reports an empty page that still carries a Link rel=next as truncated with an unknown total (rule 10)", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_user = Array.from({ length: 6 }, (_, index) => user(`u-${index}`, `user${index}`));
+  const inner = fixtureFetch(fixture, { omitTotalCount: true });
+  const fetchImpl = overrideTablePage(inner, "sys_user", (url) => {
+    if (url.searchParams.get("sysparm_offset") !== "2") return undefined;
+    const next = new URL(url);
+    next.searchParams.set("sysparm_offset", "4");
+    return jsonResponse({ result: [] }, { headers: { Link: `<${next.toString()}>;rel="next"` } });
+  });
+
+  const snapshot = await createClient(fetchImpl, { pageSize: 2 }).queryTable("sys_user", { query: "active=true", fields: ["sys_id", "user_name", "last_login_time"], limit: 100 });
+  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.pages, 2);
+  assert.equal(snapshot.total, undefined);
+  assert.equal(snapshot.truncated, true);
+  assert.equal(snapshot.partial, true);
+  assert.equal(snapshot.truncationReason, "empty page returned with a Link rel=next");
+
+  const review = findingsById(await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }))).get("SNOW-04");
+  assert.equal(review.status, "warn");
+  assert.match(review.summary, /sys_user was truncated at 2 of unknown rows \(empty page returned with a Link rel=next\)/);
+  assert.equal(review.evidence.inputs[0].truncation_reason, "empty page returned with a Link rel=next");
+});
+
+test("ServicenowApiClient stops on a Link rel=next whose offset does not advance and reports truncation without duplicating rows (rule 10)", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_user = Array.from({ length: 6 }, (_, index) => user(`u-${index}`, `user${index}`));
+  const inner = fixtureFetch(fixture);
+  let userCalls = 0;
+  const fetchImpl = overrideTablePage(inner, "sys_user", (url) => {
+    userCalls += 1;
+    return jsonResponse({ result: fixture.tables.sys_user.slice(0, 2) }, { headers: { "X-Total-Count": "6", Link: `<${url.toString()}>;rel="next"` } });
+  });
+
+  const snapshot = await createClient(fetchImpl, { pageSize: 2 }).queryTable("sys_user", { fields: ["sys_id", "user_name"], limit: 100 });
+  assert.equal(userCalls, 1, "the stuck cursor is not re-read");
+  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.total, 6);
+  assert.equal(snapshot.truncated, true);
+  assert.equal(snapshot.truncationReason, "Link rel=next offset did not advance");
+
+  const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }));
+  const review = findingsById(result).get("SNOW-04");
+  assert.equal(review.status, "warn");
+  assert.match(review.summary, /sys_user was truncated at 2 of 6 rows \(Link rel=next offset did not advance\)/);
+  assert.equal(review.evidence.active_users, 2, "seen counts are not inflated by the repeated page");
+  assert.ok(result.errors.some((issue) => /offset did not advance/.test(issue)));
+});
+
+test("ServicenowApiClient marks a non-empty read without X-Total-Count as total unknown so dependent findings cannot pass (rule 10)", async () => {
+  const { fetchImpl } = fixtureFetch(healthyFixture(), { omitTotalCount: true });
+  const snapshot = await createClient(fetchImpl).queryTable("sys_user", { query: "active=true", fields: ["sys_id", "user_name"] });
+  assert.equal(snapshot.rows.length, 4);
+  assert.equal(snapshot.total, undefined);
+  assert.equal(snapshot.totalUnknown, true);
+  assert.equal(snapshot.truncated, false);
+  assert.equal(snapshot.partial, true);
+
+  const results = await runAllAssessments(createClient(fetchImpl));
+  for (const [label, result] of Object.entries(results)) {
+    assertNoPass(result, `total-unknown/${label}`);
+  }
+  const review = findingsById(results.identity).get("SNOW-04");
+  assert.equal(review.status, "warn");
+  assert.match(review.summary, /sys_user returned 4 rows without an X-Total-Count header \(total unknown\)/);
+  assert.equal(review.evidence.inputs[0].total_unknown, true);
+  assert.ok(results.identity.errors.some((issue) => /\(total unknown\)/.test(issue)));
+
+  const withHeader = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(healthyFixture()).fetchImpl))).get("SNOW-04");
+  assert.equal(withHeader.status, "pass");
+  assert.equal(withHeader.evidence.inputs[0].total_unknown, false);
+});
+
+/**
+ * Every finding whose verdict reads two or more collected datasets, with the
+ * dataset treated as primary and each secondary the test forbids in turn.
+ * "count" secondaries are Aggregate API reads; "query" secondaries are a
+ * second query against a table the finding also reads through another query.
+ */
+const MULTI_INVENTORY_FINDINGS = [
+  { id: "SNOW-02", assess: assessServicenowAccessControl, primary: "sys_security_acl", secondaries: [{ table: "sys_security_acl_role" }, { table: "sys_public" }, { count: "sys_security_acl" }] },
+  { id: "SNOW-03", assess: assessServicenowIdentityAccess, primary: "sys_user_role_contains", secondaries: [{ count: "sys_user_role_contains" }] },
+  { id: "SNOW-04", assess: assessServicenowIdentityAccess, primary: "sys_user", secondaries: [{ table: "sys_user_has_role" }] },
+  { id: "SNOW-06", assess: assessServicenowIdentityAccess, primary: "password_policy", secondaries: [{ table: "sys_properties" }] },
+  { id: "SNOW-07", assess: assessServicenowIdentityAccess, primary: "sys_properties", secondaries: [{ table: "sys_user" }, { table: "sys_user_has_role" }, { table: "multi_factor_criteria" }] },
+  { id: "SNOW-08", assess: assessServicenowIdentityAccess, primary: "sso_properties", secondaries: [{ table: "ldap_server_config" }, { table: "sys_properties" }, { table: "sys_certificate" }] },
+  { id: "SNOW-09", assess: assessServicenowOperationsGovernance, primary: "sys_kmf_crypto_module", secondaries: [{ table: "sys_encryption_context" }, { table: "sys_dictionary" }], baseline: "manual" },
+  { id: "SNOW-10", assess: assessServicenowOperationsGovernance, primary: "sys_dictionary", secondaries: [{ count: "sys_audit" }], baseline: "manual" },
+  { id: "SNOW-11", assess: assessServicenowAccessControl, primary: "sys_security_acl", secondaries: [{ table: "sys_security_acl_role" }, { count: "sys_security_acl" }] },
+  { id: "SNOW-12", assess: assessServicenowPlatformHardening, primary: "sys_properties", secondaries: [{ table: "sys_script" }] },
+  { id: "SNOW-14", assess: assessServicenowIdentityAccess, primary: "sys_user", secondaries: [{ table: "sys_user_has_role" }, { table: "oauth_entity" }] },
+  { id: "SNOW-15", assess: assessServicenowOperationsGovernance, primary: "sys_update_set", secondaries: [{ table: "sys_update_xml" }, { count: "sys_update_set" }] },
+  { id: "SNOW-16", assess: assessServicenowPlatformHardening, primary: "sys_properties", secondaries: [{ query: { table: "sys_properties", queryIncludes: "nameLIKEdebug" } }, { query: { table: "sys_properties", queryIncludes: "glide.security.use_csrf_token" } }] },
+  { id: "SNOW-17", assess: assessServicenowPlatformHardening, primary: "sys_properties", secondaries: [{ table: "ip_access" }, { table: "sys_plugins" }] },
+  { id: "SNOW-18", assess: assessServicenowPlatformHardening, primary: "sys_email_account", secondaries: [{ table: "sys_properties" }], baseline: "manual" },
+  { id: "SNOW-19", assess: assessServicenowOperationsGovernance, primary: "ecc_agent", secondaries: [{ table: "sys_properties" }], baseline: "manual" },
+];
+
+test("rule 1 corollary: every multi-inventory finding demotes and names the inventory when one secondary read is forbidden", async () => {
+  let checked = 0;
+  for (const definition of MULTI_INVENTORY_FINDINGS) {
+    const baseline = findingsById(await definition.assess(createClient(fixtureFetch(healthyFixture()).fetchImpl))).get(definition.id);
+    assert.equal(baseline.status, definition.baseline ?? "pass", `${definition.id} baseline: ${baseline.summary}`);
+
+    for (const secondary of definition.secondaries) {
+      const table = secondary.table ?? secondary.count ?? secondary.query.table;
+      const options = secondary.table
+        ? { forbiddenTables: [secondary.table] }
+        : secondary.count
+          ? { forbiddenCounts: [secondary.count] }
+          : { forbiddenQueries: [secondary.query] };
+      const label = `${definition.id} with ${secondary.count ? `count(${table})` : secondary.query ? `${table}[${secondary.query.queryIncludes}]` : table} forbidden`;
+      const result = await definition.assess(createClient(fixtureFetch(healthyFixture(), options).fetchImpl));
+      const item = findingsById(result).get(definition.id);
+
+      assert.notEqual(item.status, "pass", `${label}: ${item.summary}`);
+      assert.ok(["manual", "warn"].includes(item.status), `${label}: expected manual or warn, saw ${item.status}`);
+      assert.ok(item.summary.includes(table), `${label}: summary must name the unreadable inventory: ${item.summary}`);
+      assert.ok(item.manualEvidence, `${label}: must state the evidence a human collects`);
+      assert.ok(result.errors.some((issue) => issue.includes(table) && /403|forbidden/i.test(issue)), `${label}: errors must disclose the forbidden read`);
+      checked += 1;
+    }
+  }
+  assert.equal(checked, 28, "every secondary inventory of every multi-inventory finding was exercised");
 });

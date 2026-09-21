@@ -84,6 +84,10 @@ export interface TableSnapshot {
   total?: number;
   pages: number;
   truncated: boolean;
+  /** Why pagination stopped before the inventory was exhausted; set whenever truncated is true. */
+  truncationReason?: string;
+  /** True when rows came back without an X-Total-Count header, so the population size is unproven. */
+  totalUnknown?: boolean;
   partial: boolean;
   error?: string;
   statusCode?: number;
@@ -692,6 +696,34 @@ export function parseLinkNext(header: string | null | undefined): string | undef
   return undefined;
 }
 
+/**
+ * Error strings land in access_check.json, analysis errors, and _errors.log,
+ * so a non-JSON body (proxy or gateway error page that may echo request
+ * headers) is described by shape only and never quoted.
+ */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  return `non-JSON response body (${response.headers.get("content-type") ?? "unknown content type"}, ${rawText.length} bytes)`;
+}
+
+function requestPathname(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "(unparseable url)";
+  }
+}
+
+/**
+ * Client-side counterpart of sysparm_fields: keep only the requested columns
+ * so a server that ignores the parameter (or a widened schema) cannot land
+ * password, key, or payload columns in the snapshot.
+ */
+export function projectRows(rows: JsonRecord[], fields: string[] | undefined): JsonRecord[] {
+  if (!fields || fields.length === 0) return rows;
+  const keep = new Set(fields);
+  return rows.map((row) => Object.fromEntries(Object.entries(row).filter(([key]) => keep.has(key))));
+}
+
 export interface ServicenowTableQuery {
   query?: string;
   fields?: string[];
@@ -767,7 +799,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       if (controller.signal.aborted) {
-        throw new Error(`ServiceNow request timed out after ${this.config.timeoutMs}ms: ${this.redact(url)}`);
+        throw new Error(`ServiceNow request timed out after ${this.config.timeoutMs}ms: ${requestPathname(url)}`);
       }
       throw new Error(`ServiceNow request failed: ${this.redact(errorMessage(error))}`);
     } finally {
@@ -837,7 +869,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
     try {
       payload = asObject(JSON.parse(rawText)) ?? {};
     } catch {
-      payload = { raw: rawText.slice(0, 240) };
+      payload = { raw: describeNonJsonBody(response, rawText) };
     }
     if (!response.ok) {
       const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? asString(payload.raw);
@@ -890,7 +922,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
         try {
           payload = asObject(JSON.parse(rawText)) ?? {};
         } catch {
-          payload = { raw: rawText.slice(0, 240) };
+          payload = { raw: describeNonJsonBody(response, rawText) };
         }
       }
 
@@ -924,7 +956,9 @@ export class ServicenowApiClient implements ServicenowReadClient {
     const rows: JsonRecord[] = [];
     let total: number | undefined;
     let pages = 0;
-    let truncated = false;
+    let truncationReason: string | undefined;
+    let currentOffset = 0;
+    const visitedUrls = new Set<string>();
     let url: string | undefined = this.buildUrl(`/api/now/table/${encodeURIComponent(table)}`, {
       sysparm_query: options.query,
       sysparm_fields: options.fields?.join(","),
@@ -936,22 +970,35 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
     try {
       while (url) {
+        visitedUrls.add(url);
         const { payload, headers } = await this.requestJson(url);
         pages += 1;
-        const pageRows = asRecordArray(payload.result);
+        const pageRows = projectRows(asRecordArray(payload.result), options.fields);
         rows.push(...pageRows);
         const count = asNumber(headers.get("x-total-count"));
         if (count !== undefined) total = count;
         const next = parseLinkNext(headers.get("link"));
-        if (!next || pageRows.length === 0) break;
+        if (!next) break;
+        // More rows are promised by Link rel=next but this page carried none: a
+        // stuck cursor, so the read is reported truncated instead of complete.
+        if (pageRows.length === 0) {
+          truncationReason = "empty page returned with a Link rel=next";
+          break;
+        }
         if (rows.length >= limit) {
-          truncated = true;
+          truncationReason = "record limit reached";
           break;
         }
         const nextUrl = new URL(next, this.config.instanceUrl);
         const nextOffset = asNumber(nextUrl.searchParams.get("sysparm_offset"));
         if (total !== undefined && nextOffset !== undefined && nextOffset >= total) break;
-        url = nextUrl.toString();
+        const nextUrlText = nextUrl.toString();
+        if (visitedUrls.has(nextUrlText) || nextOffset === undefined || nextOffset <= currentOffset) {
+          truncationReason = "Link rel=next offset did not advance";
+          break;
+        }
+        currentOffset = nextOffset;
+        url = nextUrlText;
       }
     } catch (error) {
       return {
@@ -967,6 +1014,8 @@ export class ServicenowApiClient implements ServicenowReadClient {
       };
     }
 
+    const truncated = truncationReason !== undefined;
+    const totalUnknown = total === undefined && rows.length > 0;
     return {
       table,
       query: options.query,
@@ -974,7 +1023,9 @@ export class ServicenowApiClient implements ServicenowReadClient {
       total,
       pages,
       truncated,
-      partial: truncated || (total !== undefined && total > rows.length),
+      ...(truncationReason ? { truncationReason } : {}),
+      ...(totalUnknown ? { totalUnknown } : {}),
+      partial: truncated || totalUnknown || (total !== undefined && total > rows.length),
     };
   }
 
@@ -1023,13 +1074,16 @@ function normalizeMissingTable(snapshot: TableSnapshot, reason: string): TableSn
 function snapshotPartialNote(snapshot: TableSnapshot): string | undefined {
   if (snapshot.error) return undefined;
   if (snapshot.truncated) {
-    return `${snapshot.table} was truncated at ${snapshot.rows.length} of ${snapshot.total ?? "unknown"} rows (record limit reached)`;
+    return `${snapshot.table} was truncated at ${snapshot.rows.length} of ${snapshot.total ?? "unknown"} rows (${snapshot.truncationReason ?? "record limit reached"})`;
   }
   if (snapshot.total !== undefined && snapshot.total > snapshot.rows.length) {
     return `${snapshot.table} returned ${snapshot.rows.length} of ${snapshot.total} rows (ACL-filtered or hidden rows)`;
   }
   if (visibilityUnproven(snapshot)) {
     return `${snapshot.table} returned 0 rows without an X-Total-Count header (visibility unproven)`;
+  }
+  if (snapshot.totalUnknown) {
+    return `${snapshot.table} returned ${snapshot.rows.length} rows without an X-Total-Count header (total unknown)`;
   }
   return undefined;
 }
@@ -1063,6 +1117,8 @@ function snapshotEvidence(snapshot: TableSnapshot): JsonRecord {
     total_rows: snapshot.total ?? null,
     pages: snapshot.pages,
     truncated: snapshot.truncated,
+    truncation_reason: snapshot.truncationReason ?? null,
+    total_unknown: snapshot.totalUnknown ?? false,
     partial: snapshot.partial,
     error: snapshot.error ?? null,
     status_code: snapshot.statusCode ?? null,
@@ -1297,6 +1353,33 @@ const CERTIFICATE_FIELDS = ["sys_id", "name", "type", "expires", "active", "sys_
 const ACL_FIELDS = ["sys_id", "name", "operation", "type", "active", "admin_overrides", "condition", "script", "advanced", "description"];
 const ACL_ROLE_FIELDS = ["sys_id", "sys_security_acl", "sys_security_acl.name", "sys_user_role", "sys_user_role.name"];
 const PLUGIN_FIELDS = ["sys_id", "name", "source", "active", "version"];
+/**
+ * SNOW-06 reads the policy name, the minimum and maximum length, the
+ * character-class requirements, and the strength preset. Both the
+ * "require_*" flag and the "minimum_*_characters" count spellings are
+ * requested because the Table API ignores unknown names in sysparm_fields;
+ * anything else on the record (description, lockout, history, expiration) is
+ * dropped before the snapshot is stored.
+ */
+const PASSWORD_POLICY_FIELDS = [
+  "sys_id",
+  "name",
+  "active",
+  "sys_updated_on",
+  "minimum_password_length",
+  "maximum_password_length",
+  "password_strength_preset",
+  "require_uppercase",
+  "require_lowercase",
+  "require_digit",
+  "require_special",
+  "minimum_uppercase_characters",
+  "minimum_lowercase_characters",
+  "minimum_numeric_characters",
+  "minimum_special_characters",
+];
+/** SNOW-07 reads the criteria name, active flag, and the Multi-factor Roles list (display value). */
+const MFA_CRITERIA_FIELDS = ["sys_id", "name", "active", "order", "roles", "multi_factor_roles", "sys_updated_on"];
 const MFA_CRITERIA_TABLE = "multi_factor_criteria";
 const CRYPTO_MODULE_TABLE = "sys_kmf_crypto_module";
 const LEGACY_ENCRYPTION_CONTEXT_TABLE = "sys_encryption_context";
@@ -1336,12 +1419,12 @@ export async function collectServicenowIdentityData(
     client.queryTable("sys_user_role_contains", { query: `contains.nameIN${ELEVATED_ROLE_NAMES.join(",")}`, fields: ROLE_CONTAINS_FIELDS, limit: recordLimit }),
     client.countRecords("sys_user_role_contains"),
     client.queryTable("sys_properties", { query: `nameIN${IDENTITY_PROPERTY_QUERY_NAMES.join(",")}`, fields: PROPERTY_FIELDS, limit: recordLimit }),
-    client.queryTable("password_policy", { limit: recordLimit }),
+    client.queryTable("password_policy", { fields: PASSWORD_POLICY_FIELDS, limit: recordLimit }),
     client.queryTable("sso_properties", { fields: ["sys_id", "name", "active", "default", "auto_redirect_idp", "sys_updated_on"], limit: recordLimit }),
     client.queryTable("ldap_server_config", { fields: ["sys_id", "name", "active", "sys_updated_on"], limit: recordLimit }),
     client.queryTable("sys_certificate", { fields: CERTIFICATE_FIELDS, limit: recordLimit }),
     client.queryTable("oauth_entity", { fields: ["sys_id", "name", "type", "active", "client_id", "sys_updated_on"], limit: recordLimit }),
-    client.queryTable(MFA_CRITERIA_TABLE, { displayValue: true, limit: recordLimit }),
+    client.queryTable(MFA_CRITERIA_TABLE, { fields: MFA_CRITERIA_FIELDS, displayValue: true, limit: recordLimit }),
   ]);
   return {
     users,
@@ -2133,12 +2216,23 @@ export function buildSensitiveAclQuery(): string {
   ].join("^NQ");
 }
 
+/**
+ * SNOW-02 and SNOW-11 only ask whether an ACL carries a condition or a
+ * script, so the tenant code bodies are reduced to booleans before the
+ * snapshot is stored or exported.
+ */
+export function projectAclRow(row: JsonRecord): JsonRecord {
+  const { condition, script, ...rest } = row;
+  return { ...rest, has_condition: Boolean(asString(condition)), has_script: Boolean(asString(script)) };
+}
+
 export async function collectServicenowAccessControlData(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
   options: ServicenowAccessControlOptions = {},
 ): Promise<ServicenowAccessControlData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
-  const acls = await client.queryTable("sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
+  const rawAcls = await client.queryTable("sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
+  const acls: TableSnapshot = { ...rawAcls, rows: rawAcls.rows.map(projectAclRow) };
   const aclIds = acls.rows.map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
   const [aclRoles, aclTotal, publicPages] = await Promise.all([
     aclIds.length > 0
@@ -2172,8 +2266,8 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
   const describeAcl = (row: JsonRecord) => {
     const id = rowString(row, "sys_id") ?? "";
     const roles = rolesByAcl.get(id) ?? [];
-    const hasCondition = Boolean(rowString(row, "condition"));
-    const hasScript = Boolean(rowString(row, "script"));
+    const hasCondition = rowBoolean(row, "has_condition") ?? Boolean(rowString(row, "condition"));
+    const hasScript = rowBoolean(row, "has_script") ?? Boolean(rowString(row, "script"));
     return { label: aclLabel(row), name: rowString(row, "name") ?? "", operation: rowString(row, "operation") ?? "", roles, unrestricted: roles.length === 0 && !hasCondition && !hasScript, admin_overrides: rowBoolean(row, "admin_overrides") };
   };
   const described = data.acls.rows.map(describeAcl);
