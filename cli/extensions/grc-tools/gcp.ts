@@ -1276,9 +1276,29 @@ function unreadableScans(...scans: ProjectScan<unknown>[]): UnreadableInventory[
   });
 }
 
+/** False when no project answered the scan because the read was denied or the project inventory upstream was unreadable. */
+function scanReadable(scan: ProjectScan<unknown>): boolean {
+  return !(scan.rows.length === 0 && (scan.denied.length > 0 || scan.blocked));
+}
+
 /** A value derived from a scan that no project answered is not a value; render null beside the named status instead. */
 function readableValue<T>(scan: ProjectScan<unknown>, value: T): T | null {
-  return scan.rows.length === 0 && (scan.denied.length > 0 || scan.blocked) ? null : value;
+  return scanReadable(scan) ? value : null;
+}
+
+/** The same rule for an organization-scoped read: a failed read yields null, never a count or list built from its fallback. */
+function collectedValue<T>(collected: Collected<unknown>, value: T): T | null {
+  return collected.error ? null : value;
+}
+
+/** A value derived from several inventories is a value only when every one of them was readable. */
+function jointValue<T>(readable: boolean[], value: T): T | null {
+  return readable.every(Boolean) ? value : null;
+}
+
+/** The sampled project count, null when the project inventory itself was unreadable. */
+function sampledProjects(context: ProjectContext): number | null {
+  return context.error ? null : context.projectIds.length;
 }
 
 interface VerdictInput {
@@ -1931,6 +1951,8 @@ export async function assessGcpIdentity(
       }]
     : [];
   const keysReadable = keyListsAttempted === 0 || keyErrors.length < keyListsAttempted;
+  /** Key lists are values only when the account list they hang off was readable and not every key read failed. */
+  const keyList = <T>(value: T): T | null => jointValue([scanReadable(accountScan), keysReadable], value);
   const accountBase = scanVerdictBase(context, accountScan);
   const keyBase = {
     ...accountBase,
@@ -1946,7 +1968,7 @@ export async function assessGcpIdentity(
       title: "Privileged IAM bindings",
       severity: "high",
       controls: [2],
-      evidence: { bindings: privilegedBindings.slice(0, 25), policies_scanned: iamPolicies.data.items.length },
+      evidence: { bindings: collectedValue(iamPolicies, privilegedBindings.slice(0, 25)), policies_scanned: collectedValue(iamPolicies, iamPolicies.data.items.length) },
       violations: privilegedBindings.length,
       passSummary: `No owner/editor-style bindings were found across ${iamPolicies.data.items.length} IAM policies.`,
       failSummary: `${privilegedBindings.length} owner/editor-style bindings were found across ${iamPolicies.data.items.length} IAM policies.`,
@@ -1959,7 +1981,7 @@ export async function assessGcpIdentity(
           [1],
           "no service accounts were listed in the sampled projects; every project with Compute or App Engine enabled has default service accounts, so an empty list usually means iam.serviceAccounts.list was not permitted.",
           "list service accounts and user-managed keys per project and verify key age.",
-          { sampled_projects: context.projectIds.length, project_error: context.error ?? null, unreadable_inventories: unreadableScans(accountScan) },
+          { sampled_projects: sampledProjects(context), project_error: context.error ?? null, unreadable_inventories: unreadableScans(accountScan) },
         )
       : verdict({
           ...keyBase,
@@ -1967,7 +1989,7 @@ export async function assessGcpIdentity(
           title: "Service account key rotation",
           severity: "high",
           controls: [1],
-          evidence: { stale_keys: keysReadable ? staleKeys.slice(0, 25) : null, undated_keys: keysReadable ? undatedKeys.slice(0, 25) : null, service_accounts: serviceAccountCount },
+          evidence: { stale_keys: keyList(staleKeys.slice(0, 25)), undated_keys: keyList(undatedKeys.slice(0, 25)), service_accounts: readableValue(accountScan, serviceAccountCount) },
           total: userManagedKeys.length,
           violations: staleKeys.length,
           unknown: undatedKeys.length,
@@ -1983,7 +2005,7 @@ export async function assessGcpIdentity(
       title: "User-managed service account key minimization",
       severity: "medium",
       controls: [1],
-      evidence: { user_managed_keys: keysReadable ? userManagedKeys.slice(0, 25) : null, service_accounts: serviceAccountCount },
+      evidence: { user_managed_keys: keyList(userManagedKeys.slice(0, 25)), service_accounts: readableValue(accountScan, serviceAccountCount) },
       total: serviceAccountCount,
       violations: userManagedKeys.length,
       violationStatus: "warn",
@@ -1999,7 +2021,7 @@ export async function assessGcpIdentity(
       title: "Cross-project service account access",
       severity: "medium",
       controls: [14],
-      evidence: { cross_project_bindings: crossProjectBindings.slice(0, 25) },
+      evidence: { cross_project_bindings: collectedValue(iamPolicies, crossProjectBindings.slice(0, 25)) },
       violations: crossProjectBindings.length,
       violationStatus: "warn",
       passSummary: "No cross-project service account bindings were found in the IAM policy inventory.",
@@ -2011,7 +2033,7 @@ export async function assessGcpIdentity(
       title: "Default service account privilege",
       severity: "high",
       controls: [13],
-      evidence: { privileged_default_service_accounts: privilegedDefaultServiceAccounts.slice(0, 25) },
+      evidence: { privileged_default_service_accounts: collectedValue(iamPolicies, privilegedDefaultServiceAccounts.slice(0, 25)) },
       violations: privilegedDefaultServiceAccounts.length,
       passSummary: "No default service accounts hold owner/editor-style roles in the IAM policy inventory.",
       failSummary: `${privilegedDefaultServiceAccounts.length} default service accounts hold owner/editor-style roles.`,
@@ -2023,16 +2045,16 @@ export async function assessGcpIdentity(
     title: "GCP identity posture",
     category: "identity",
     summary: {
-      sampled_projects: context.projectIds.length,
+      sampled_projects: sampledProjects(context),
       projects_truncated: context.truncated,
-      iam_policies: iamPolicies.data.items.length,
-      service_accounts: serviceAccountCount,
-      privileged_bindings: privilegedBindings.length,
-      stale_service_account_keys: staleKeys.length,
-      undated_service_account_keys: undatedKeys.length,
-      user_managed_service_account_keys: userManagedKeys.length,
-      cross_project_service_accounts: crossProjectBindings.length,
-      privileged_default_service_accounts: privilegedDefaultServiceAccounts.length,
+      iam_policies: collectedValue(iamPolicies, iamPolicies.data.items.length),
+      service_accounts: readableValue(accountScan, serviceAccountCount),
+      privileged_bindings: collectedValue(iamPolicies, privilegedBindings.length),
+      stale_service_account_keys: keyList(staleKeys.length),
+      undated_service_account_keys: keyList(undatedKeys.length),
+      user_managed_service_account_keys: keyList(userManagedKeys.length),
+      cross_project_service_accounts: collectedValue(iamPolicies, crossProjectBindings.length),
+      privileged_default_service_accounts: collectedValue(iamPolicies, privilegedDefaultServiceAccounts.length),
       collection_errors: errors.length,
     },
     findings,
@@ -2114,7 +2136,7 @@ export async function assessGcpLoggingDetection(
       title: "Admin Activity visibility",
       severity: "medium",
       controls: [5],
-      evidence: { projects_without_admin_activity: projectsWithoutAdmin.slice(0, 25), projects_read: adminScan.rows.length },
+      evidence: { projects_without_admin_activity: readableValue(adminScan, projectsWithoutAdmin.slice(0, 25)), projects_read: readableValue(adminScan, adminScan.rows.length) },
       total: adminScan.rows.length,
       violations: projectsWithoutAdmin.length,
       violationStatus: "warn",
@@ -2130,7 +2152,7 @@ export async function assessGcpLoggingDetection(
       title: "Data Access logging coverage",
       severity: "high",
       controls: [5],
-      evidence: { projects_without_data_access: projectsWithoutDataAccess.slice(0, 25), projects_read: dataAccessScan.rows.length },
+      evidence: { projects_without_data_access: readableValue(dataAccessScan, projectsWithoutDataAccess.slice(0, 25)), projects_read: readableValue(dataAccessScan, dataAccessScan.rows.length) },
       total: dataAccessScan.rows.length,
       violations: projectsWithoutDataAccess.length,
       emptyVerdict: "manual",
@@ -2145,7 +2167,7 @@ export async function assessGcpLoggingDetection(
       title: "Log sink coverage",
       severity: "high",
       controls: [5],
-      evidence: { projects_without_sinks: projectsWithoutSinks.slice(0, 25), disabled_sinks: disabledSinks.slice(0, 25), projects_read: sinkScan.rows.length },
+      evidence: { projects_without_sinks: readableValue(sinkScan, projectsWithoutSinks.slice(0, 25)), disabled_sinks: readableValue(sinkScan, disabledSinks.slice(0, 25)), projects_read: readableValue(sinkScan, sinkScan.rows.length) },
       total: sinkScan.rows.length,
       violations: projectsWithoutSinks.length,
       emptyVerdict: "manual",
@@ -2160,7 +2182,7 @@ export async function assessGcpLoggingDetection(
       title: "Log bucket retention",
       severity: "medium",
       controls: [5],
-      evidence: { short_retention_buckets: shortRetention.slice(0, 25), unknown_retention_buckets: unknownRetention.slice(0, 25), buckets_read: bucketCount },
+      evidence: { short_retention_buckets: readableValue(bucketScan, shortRetention.slice(0, 25)), unknown_retention_buckets: readableValue(bucketScan, unknownRetention.slice(0, 25)), buckets_read: readableValue(bucketScan, bucketCount) },
       total: bucketCount,
       violations: shortRetention.length,
       unknown: unknownRetention.length,
@@ -2193,7 +2215,6 @@ export async function assessGcpLoggingDetection(
             sources_truncated: sccSources.truncated,
             scc_findings: sccFindingCount,
             findings_truncated: sccFindings.truncated,
-            findings_error: sccFindings.error ?? null,
             unreadable_inventories: sccUnreadable,
           },
           mappings: controlMappings(5),
@@ -2213,15 +2234,15 @@ export async function assessGcpLoggingDetection(
     title: "GCP logging and detection posture",
     category: "logging-detection",
     summary: {
-      sampled_projects: context.projectIds.length,
+      sampled_projects: sampledProjects(context),
       projects_truncated: context.truncated,
-      projects_with_admin_activity: adminScan.rows.length - projectsWithoutAdmin.length,
-      projects_with_data_access: dataAccessScan.rows.length - projectsWithoutDataAccess.length,
-      projects_with_log_sinks: sinkScan.rows.length - projectsWithoutSinks.length,
-      disabled_log_sinks: disabledSinks.length,
-      configurable_log_buckets: bucketCount,
-      short_retention_buckets: shortRetention.length,
-      scc_sources: sccSources.error ? null : sccSources.data.items.length,
+      projects_with_admin_activity: readableValue(adminScan, adminScan.rows.length - projectsWithoutAdmin.length),
+      projects_with_data_access: readableValue(dataAccessScan, dataAccessScan.rows.length - projectsWithoutDataAccess.length),
+      projects_with_log_sinks: readableValue(sinkScan, sinkScan.rows.length - projectsWithoutSinks.length),
+      disabled_log_sinks: readableValue(sinkScan, disabledSinks.length),
+      configurable_log_buckets: readableValue(bucketScan, bucketCount),
+      short_retention_buckets: readableValue(bucketScan, shortRetention.length),
+      scc_sources: collectedValue(sccSources, sccSources.data.items.length),
       scc_findings: sccFindingCount,
       collection_errors: errors.length,
     },
@@ -2393,6 +2414,12 @@ export async function assessGcpOrgGuardrails(
     : orgOsLoginEnforced
       ? " constraints/compute.requireOsLogin is enforced in the effective policy, which protects newly created projects and blocks future disabling but does not enable OS Login on existing resources."
       : " constraints/compute.requireOsLogin is not enforced in the effective policy, so newly created projects will not default to OS Login.";
+  const namedOverrides = osLoginOverrides.length > 0
+    ? ` (${osLoginOverrides.slice(0, 5).map((entry) => `${entry.projectId}/${entry.instance ?? "?"}`).join(", ")}${osLoginOverrides.length > 5 ? ", ..." : ""})`
+    : "";
+  const instancesUnreadableClause = `instance overrides could not be checked because ${GCP_INVENTORIES.instances.dataset} were unreadable`;
+  const osLoginPassOverrideClause = scanReadable(instanceScan) ? `none of ${instances.length} instances overrides it` : instancesUnreadableClause;
+  const osLoginFailOverrideClause = scanReadable(instanceScan) ? `${osLoginOverrides.length} instances override it${namedOverrides}` : instancesUnreadableClause;
 
   const shieldedViolations: JsonRecord[] = [];
   const shieldedUnknown: JsonRecord[] = [];
@@ -2426,9 +2453,9 @@ export async function assessGcpOrgGuardrails(
   const osLoginBase = scanBase(computeProjectScan, instanceScan);
 
   const organizationFinding: GcpFinding = !config.organizationId
-    ? manualFinding("GCP-ORG-01", "Organization visibility", "medium", [6], "no organization ID was configured, so organization-level guardrails are outside this run's scope.", "run with GCP_ORGANIZATION_ID set or review organization metadata in the console.", { sampled_projects: context.projectIds.length })
+    ? manualFinding("GCP-ORG-01", "Organization visibility", "medium", [6], "no organization ID was configured, so organization-level guardrails are outside this run's scope.", "run with GCP_ORGANIZATION_ID set or review organization metadata in the console.", { sampled_projects: sampledProjects(context) })
     : organization.error
-      ? manualFinding("GCP-ORG-01", "Organization visibility", "medium", [6], `${GCP_INVENTORIES.organization.dataset} was not readable via ${GCP_INVENTORIES.organization.endpoint} (${organization.error}).`, "confirm resourcemanager.organizations.get on the audit principal.", { sampled_projects: context.projectIds.length, unreadable_inventories: [...unreadableCollected(GCP_INVENTORIES.organization, organization), ...context.unreadable] })
+      ? manualFinding("GCP-ORG-01", "Organization visibility", "medium", [6], `${GCP_INVENTORIES.organization.dataset} was not readable via ${GCP_INVENTORIES.organization.endpoint} (${organization.error}).`, "confirm resourcemanager.organizations.get on the audit principal.", { sampled_projects: sampledProjects(context), unreadable_inventories: [...unreadableCollected(GCP_INVENTORIES.organization, organization), ...context.unreadable] })
       : {
           id: "GCP-ORG-01",
           title: "Organization visibility",
@@ -2443,7 +2470,7 @@ export async function assessGcpOrgGuardrails(
             : !asString(organization.data?.name)
               ? `Organization ${config.organizationId} answered without the documented name field; confirm the organization resource manually.`
               : `Organization ${asString(organization.data?.displayName) ?? config.organizationId} was readable and ${context.projectIds.length} projects were sampled${context.truncated ? " (project inventory truncated by the project cap)" : context.projectIds.length === 0 ? " (no projects inventoried)" : ""}.`,
-          evidence: { sampled_projects: context.error ? null : context.projectIds.length, projects_truncated: context.truncated, target_project: targetProjectId ?? null, unreadable_inventories: context.unreadable },
+          evidence: { sampled_projects: sampledProjects(context), projects_truncated: context.truncated, target_project: targetProjectId ?? null, unreadable_inventories: context.unreadable },
           mappings: controlMappings(6),
           controls: [6],
         };
@@ -2503,15 +2530,14 @@ export async function assessGcpOrgGuardrails(
         policy_enforced: osLoginPolicy.policy.error ? null : orgOsLoginEnforced,
         projects_without_os_login: readableValue(computeProjectScan, projectsWithoutOsLogin.slice(0, 25)),
         instance_overrides: readableValue(instanceScan, osLoginOverrides.slice(0, 25)),
-        projects_read: computeProjectScan.rows.length,
+        projects_read: readableValue(computeProjectScan, computeProjectScan.rows.length),
         instances_read: readableValue(instanceScan, instances.length),
-        org_policy_error: osLoginPolicy.policy.error ?? null,
       },
       total: computeProjectScan.rows.length,
       violations: projectsWithoutOsLogin.length + osLoginOverrides.length,
       emptyVerdict: "manual",
-      passSummary: `enable-oslogin=TRUE is set in commonInstanceMetadata for all ${computeProjectScan.rows.length} sampled projects with Compute Engine and none of ${instances.length} instances overrides it.${osLoginPolicyClause}`,
-      failSummary: `${projectsWithoutOsLogin.length} of ${computeProjectScan.rows.length} sampled projects lack enable-oslogin=TRUE in commonInstanceMetadata${projectsWithoutOsLogin.length > 0 ? ` (${projectsWithoutOsLogin.slice(0, 5).join(", ")}${projectsWithoutOsLogin.length > 5 ? ", ..." : ""})` : ""} and ${osLoginOverrides.length} instances override it${osLoginOverrides.length > 0 ? ` (${osLoginOverrides.slice(0, 5).map((entry) => `${entry.projectId}/${entry.instance ?? "?"}`).join(", ")}${osLoginOverrides.length > 5 ? ", ..." : ""})` : ""}.${osLoginPolicyClause}`,
+      passSummary: `enable-oslogin=TRUE is set in commonInstanceMetadata for all ${computeProjectScan.rows.length} sampled projects with Compute Engine and ${osLoginPassOverrideClause}.${osLoginPolicyClause}`,
+      failSummary: `${projectsWithoutOsLogin.length} of ${computeProjectScan.rows.length} sampled projects lack enable-oslogin=TRUE in commonInstanceMetadata${projectsWithoutOsLogin.length > 0 ? ` (${projectsWithoutOsLogin.slice(0, 5).join(", ")}${projectsWithoutOsLogin.length > 5 ? ", ..." : ""})` : ""} and ${osLoginFailOverrideClause}.${osLoginPolicyClause}`,
       emptySummary: "No Compute Engine project metadata was readable.",
       manualEvidence: "check enable-oslogin in project and instance metadata for every existing project, and enforce constraints/compute.requireOsLogin for new ones.",
     }),
@@ -2521,7 +2547,7 @@ export async function assessGcpOrgGuardrails(
       title: "Binary Authorization admission policy",
       severity: "medium",
       controls: [8],
-      evidence: { permissive_rules: binaryAuthViolations.slice(0, 25), dry_run_rules: binaryAuthDryRun.slice(0, 25), projects_read: binaryAuthScan.rows.length },
+      evidence: { permissive_rules: readableValue(binaryAuthScan, binaryAuthViolations.slice(0, 25)), dry_run_rules: readableValue(binaryAuthScan, binaryAuthDryRun.slice(0, 25)), projects_read: readableValue(binaryAuthScan, binaryAuthScan.rows.length) },
       total: binaryAuthScan.rows.length,
       violations: binaryAuthViolations.length,
       unknown: binaryAuthDryRun.length,
@@ -2537,7 +2563,12 @@ export async function assessGcpOrgGuardrails(
       title: "Shielded VM and serial port instance configuration",
       severity: "medium",
       controls: [12, 23],
-      evidence: { shielded_violations: shieldedViolations.slice(0, 25), shielded_unknown: shieldedUnknown.slice(0, 25), serial_port_enabled: serialPortViolations.slice(0, 25), instances_read: instances.length },
+      evidence: {
+        shielded_violations: readableValue(instanceScan, shieldedViolations.slice(0, 25)),
+        shielded_unknown: readableValue(instanceScan, shieldedUnknown.slice(0, 25)),
+        serial_port_enabled: readableValue(instanceScan, serialPortViolations.slice(0, 25)),
+        instances_read: readableValue(instanceScan, instances.length),
+      },
       total: instances.length,
       violations: shieldedViolations.length + serialPortViolations.length,
       unknown: shieldedUnknown.length,
@@ -2561,9 +2592,9 @@ export async function assessGcpOrgGuardrails(
     title: "GCP organization guardrails",
     category: "org-guardrails",
     summary: {
-      sampled_projects: context.projectIds.length,
+      sampled_projects: sampledProjects(context),
       projects_truncated: context.truncated,
-      organization_visible: Boolean(organization.data) && !organization.error,
+      organization_visible: collectedValue(organization, Boolean(organization.data)),
       target_project: targetProjectId ?? null,
       domain_restricted_sharing: policyEnforced(domainPolicy),
       service_account_key_creation_disabled: policyEnforced(keyCreationPolicy),
@@ -2572,8 +2603,8 @@ export async function assessGcpOrgGuardrails(
       shielded_vm_required: policyEnforced(shieldedVmPolicy),
       os_login_required_by_policy: policyEnforced(osLoginPolicy),
       instances: readableValue(instanceScan, instances.length),
-      binary_authorization_projects: binaryAuthScan.rows.length,
-      binary_authorization_api_disabled: binaryAuthScan.apiDisabled.length,
+      binary_authorization_projects: readableValue(binaryAuthScan, binaryAuthScan.rows.length),
+      binary_authorization_api_disabled: readableValue(binaryAuthScan, binaryAuthScan.apiDisabled.length),
       collection_errors: errors.length,
     },
     findings,
@@ -2722,6 +2753,17 @@ export async function assessGcpDataProtection(
 
   const scanBase = (scan: ProjectScan<unknown>, ...dependent: ProjectScan<unknown>[]) => scanVerdictBase(context, scan, ...dependent);
   const publicBindingsUnreadable = unreadableCollected(GCP_INVENTORIES.publicBindings, publicBindings);
+  const perimetersReadable = !accessPolicies.error && perimetersUnreadable.length === 0;
+  const cmekBucketClause = scanReadable(bucketScan) ? `all ${buckets.length} buckets set encryption.defaultKmsKeyName` : `${GCP_INVENTORIES.buckets.dataset} were unreadable`;
+  const cmekDiskClause = scanReadable(diskScan) ? `all ${disks.length} disks set diskEncryptionKey.kmsKeyName` : `${GCP_INVENTORIES.disks.dataset} were unreadable`;
+  const cmekFailClauses = [
+    scanReadable(bucketScan) ? `${bucketsWithoutCmek.length} of ${buckets.length} buckets` : undefined,
+    scanReadable(diskScan) ? `${disksWithoutCmek.length} of ${disks.length} disks` : undefined,
+  ].filter((clause): clause is string => clause !== undefined);
+  const cmekUnreadableClauses: string[] = [
+    ...(scanReadable(bucketScan) ? [] : [GCP_INVENTORIES.buckets.dataset]),
+    ...(scanReadable(diskScan) ? [] : [GCP_INVENTORIES.disks.dataset]),
+  ];
 
   const findings: GcpFinding[] = [
     verdict({
@@ -2730,7 +2772,7 @@ export async function assessGcpDataProtection(
       title: "Uniform bucket-level access",
       severity: "high",
       controls: [15],
-      evidence: { non_uniform_buckets: nonUniformBuckets.slice(0, 25), buckets_read: buckets.length },
+      evidence: { non_uniform_buckets: readableValue(bucketScan, nonUniformBuckets.slice(0, 25)), buckets_read: readableValue(bucketScan, buckets.length) },
       total: buckets.length,
       violations: nonUniformBuckets.length,
       emptyVerdict: "manual",
@@ -2747,11 +2789,16 @@ export async function assessGcpDataProtection(
       title: "Public resource exposure",
       severity: "critical",
       controls: [3],
-      evidence: { public_bindings: publicResources.slice(0, 25), query: PUBLIC_MEMBER_IAM_QUERY, policies_matched: publicBindings.data.items.length, buckets_read: readableValue(bucketScan, buckets.length) },
+      evidence: {
+        public_bindings: collectedValue(publicBindings, publicResources.slice(0, 25)),
+        query: PUBLIC_MEMBER_IAM_QUERY,
+        policies_matched: collectedValue(publicBindings, publicBindings.data.items.length),
+        buckets_read: readableValue(bucketScan, buckets.length),
+      },
       total: buckets.length + publicBindings.data.items.length,
       violations: publicResources.length,
       emptyVerdict: "manual",
-      passSummary: `No IAM binding in the scope grants a role to allUsers or allAuthenticatedUsers (${buckets.length} buckets inventoried).`,
+      passSummary: `No IAM binding in the scope grants a role to allUsers or allAuthenticatedUsers (${scanReadable(bucketScan) ? `${buckets.length} buckets inventoried` : `${GCP_INVENTORIES.buckets.dataset} were unreadable`}).`,
       failSummary: `${publicResources.length} IAM bindings grant roles to allUsers or allAuthenticatedUsers.`,
       emptySummary: "No buckets or public bindings were inventoried, so exposure could not be evaluated.",
       manualEvidence: "search IAM policies for allUsers and allAuthenticatedUsers members across the organization.",
@@ -2761,7 +2808,11 @@ export async function assessGcpDataProtection(
       title: "KMS key rotation",
       severity: "medium",
       controls: [7],
-      evidence: { keys_without_rotation: rotationViolations.slice(0, 25), overdue_rotation: rotationUnknown.slice(0, 25), keys_read: rotatingKeys.length },
+      evidence: {
+        keys_without_rotation: collectedValue(cryptoKeys, rotationViolations.slice(0, 25)),
+        overdue_rotation: collectedValue(cryptoKeys, rotationUnknown.slice(0, 25)),
+        keys_read: collectedValue(cryptoKeys, rotatingKeys.length),
+      },
       total: rotatingKeys.length,
       violations: rotationViolations.length,
       unknown: rotationUnknown.length,
@@ -2791,8 +2842,8 @@ export async function assessGcpDataProtection(
       violations: bucketsWithoutCmek.length + disksWithoutCmek.length,
       violationStatus: "warn",
       emptyVerdict: "manual",
-      passSummary: `All ${buckets.length} buckets set encryption.defaultKmsKeyName and all ${disks.length} disks set diskEncryptionKey.kmsKeyName.`,
-      failSummary: `${bucketsWithoutCmek.length} of ${buckets.length} buckets and ${disksWithoutCmek.length} of ${disks.length} disks rely on Google-managed encryption instead of CMEK.`,
+      passSummary: `${cmekBucketClause.charAt(0).toUpperCase()}${cmekBucketClause.slice(1)} and ${cmekDiskClause}.`,
+      failSummary: `${cmekFailClauses.join(" and ")} rely on Google-managed encryption instead of CMEK${cmekUnreadableClauses.length > 0 ? ` (${cmekUnreadableClauses.join(" and ")} were unreadable)` : ""}.`,
       emptySummary: "No buckets or disks were listed in the sampled projects.",
       manualEvidence: "review default KMS keys on buckets and disk encryption keys.",
     }),
@@ -2802,7 +2853,11 @@ export async function assessGcpDataProtection(
       title: "Cloud DNS DNSSEC",
       severity: "medium",
       controls: [17],
-      evidence: { zones_without_dnssec: dnssecViolations.slice(0, 25), public_zones: publicZones.length, private_zones: zones.length - publicZones.length },
+      evidence: {
+        zones_without_dnssec: readableValue(zoneScan, dnssecViolations.slice(0, 25)),
+        public_zones: readableValue(zoneScan, publicZones.length),
+        private_zones: readableValue(zoneScan, zones.length - publicZones.length),
+      },
       total: publicZones.length,
       violations: dnssecViolations.length,
       emptyVerdict: "manual",
@@ -2817,7 +2872,7 @@ export async function assessGcpDataProtection(
       title: "API key restrictions",
       severity: "medium",
       controls: [20],
-      evidence: { unrestricted_keys: unrestrictedKeys.slice(0, 25), keys_read: apiKeys.length },
+      evidence: { unrestricted_keys: readableValue(apiKeyScan, unrestrictedKeys.slice(0, 25)), keys_read: readableValue(apiKeyScan, apiKeys.length) },
       total: apiKeys.length,
       violations: unrestrictedKeys.length,
       emptyVerdict: "pass",
@@ -2834,9 +2889,9 @@ export async function assessGcpDataProtection(
           severity: "medium",
           controls: [21],
           evidence: {
-            enforced_perimeters: enforcedPerimeters.map((perimeter) => ({ name: asString(perimeter.name), resources: asArray(asObject(perimeter.status)?.resources).length, restrictedServices: asArray(asObject(perimeter.status)?.restrictedServices).length })).slice(0, 25),
-            dry_run_only_perimeters: dryRunOnlyPerimeters.map((perimeter) => asString(perimeter.name)).slice(0, 25),
-            access_policies: accessPolicies.data.items.length,
+            enforced_perimeters: jointValue([perimetersReadable], enforcedPerimeters.map((perimeter) => ({ name: asString(perimeter.name), resources: asArray(asObject(perimeter.status)?.resources).length, restrictedServices: asArray(asObject(perimeter.status)?.restrictedServices).length })).slice(0, 25)),
+            dry_run_only_perimeters: jointValue([perimetersReadable], dryRunOnlyPerimeters.map((perimeter) => asString(perimeter.name)).slice(0, 25)),
+            access_policies: collectedValue(accessPolicies, accessPolicies.data.items.length),
           },
           total: accessPolicies.data.items.length,
           violations: enforcedPerimeters.length === 0 ? 1 : 0,
@@ -2865,20 +2920,20 @@ export async function assessGcpDataProtection(
     title: "GCP data protection posture",
     category: "data-protection",
     summary: {
-      sampled_projects: context.projectIds.length,
+      sampled_projects: sampledProjects(context),
       projects_truncated: context.truncated,
       buckets: readableValue(bucketScan, buckets.length),
       non_uniform_buckets: readableValue(bucketScan, nonUniformBuckets.length),
-      public_bindings: publicBindings.error ? null : publicResources.length,
-      crypto_keys: cryptoKeys.error ? null : rotatingKeys.length,
-      keys_without_rotation: cryptoKeys.error ? null : rotationViolations.length,
+      public_bindings: collectedValue(publicBindings, publicResources.length),
+      crypto_keys: collectedValue(cryptoKeys, rotatingKeys.length),
+      keys_without_rotation: collectedValue(cryptoKeys, rotationViolations.length),
       disks: readableValue(diskScan, disks.length),
-      resources_without_cmek: bucketsWithoutCmek.length + disksWithoutCmek.length,
+      resources_without_cmek: jointValue([scanReadable(bucketScan), scanReadable(diskScan)], bucketsWithoutCmek.length + disksWithoutCmek.length),
       public_dns_zones: readableValue(zoneScan, publicZones.length),
       zones_without_dnssec: readableValue(zoneScan, dnssecViolations.length),
       api_keys: readableValue(apiKeyScan, apiKeys.length),
       unrestricted_api_keys: readableValue(apiKeyScan, unrestrictedKeys.length),
-      enforced_perimeters: accessPolicies.error ? null : enforcedPerimeters.length,
+      enforced_perimeters: jointValue([perimetersReadable], enforcedPerimeters.length),
       collection_errors: errors.length,
     },
     findings,
@@ -3080,6 +3135,20 @@ export async function assessGcpNetworkSecurity(
 
   const scanBase = (scan: ProjectScan<unknown>, ...dependent: ProjectScan<unknown>[]) => scanVerdictBase(context, scan, ...dependent);
   const unresolvedReasons = [...new Set(unresolvedProxies.map((proxy) => asString(proxy.reason)).filter((reason): reason is string => Boolean(reason)))];
+  const natCoverageReadable = [scanReadable(subnetScan), scanReadable(routerScan)];
+  const natUnreadableClause = `Cloud NAT coverage could not be checked because ${scanReadable(subnetScan) ? GCP_INVENTORIES.routers.dataset : GCP_INVENTORIES.subnetworks.dataset} were unreadable`;
+  const natPassClause = natCoverageReadable.every(Boolean)
+    ? "Every eligible subnetwork is covered by a Cloud NAT (sourceSubnetworkIpRangesToNat) in its network and region"
+    : natUnreadableClause;
+  const natFailClause = natCoverageReadable.every(Boolean)
+    ? `${subnetsWithoutNat.length} subnetworks are not covered by a Cloud NAT in their network and region${subnetsWithUnknownNat.length > 0 ? ` (${subnetsWithUnknownNat.length} more could not be evaluated because ${GCP_INVENTORIES.routers.dataset} were unreadable in their project)` : ""}`
+    : natUnreadableClause;
+  const externalIpPassClause = scanReadable(instanceScan)
+    ? `none of ${instances.length} instances has an IPv4 or IPv6 external access config`
+    : `external IP usage could not be checked because ${GCP_INVENTORIES.instances.dataset} were unreadable`;
+  const externalIpFailClause = scanReadable(instanceScan)
+    ? `${publicInstances.length} of ${instances.length} instances carry external IPv4 or IPv6 access configs`
+    : `external IP usage could not be checked because ${GCP_INVENTORIES.instances.dataset} were unreadable`;
 
   const findings: GcpFinding[] = [
     verdict({
@@ -3088,7 +3157,7 @@ export async function assessGcpNetworkSecurity(
       title: "Firewall rules open to the internet on administrative ports",
       severity: "high",
       controls: [4],
-      evidence: { open_admin_rules: openAdminRules.slice(0, 25), firewalls_read: firewalls.length, admin_ports: ADMIN_PORTS },
+      evidence: { open_admin_rules: readableValue(firewallScan, openAdminRules.slice(0, 25)), firewalls_read: readableValue(firewallScan, firewalls.length), admin_ports: ADMIN_PORTS },
       total: firewalls.length,
       violations: openAdminRules.length,
       emptyVerdict: "manual",
@@ -3103,7 +3172,7 @@ export async function assessGcpNetworkSecurity(
       title: "VPC flow logs",
       severity: "medium",
       controls: [9],
-      evidence: { subnets_without_flow_logs: subnetsWithoutFlowLogs.slice(0, 25), subnets_read: subnets.length },
+      evidence: { subnets_without_flow_logs: readableValue(subnetScan, subnetsWithoutFlowLogs.slice(0, 25)), subnets_read: readableValue(subnetScan, subnets.length) },
       total: subnets.length,
       violations: subnetsWithoutFlowLogs.length,
       emptyVerdict: "manual",
@@ -3118,7 +3187,7 @@ export async function assessGcpNetworkSecurity(
       title: "Private Google Access",
       severity: "low",
       controls: [22],
-      evidence: { subnets_without_private_google_access: subnetsWithoutPrivateAccess.slice(0, 25), subnets_read: subnets.length },
+      evidence: { subnets_without_private_google_access: readableValue(subnetScan, subnetsWithoutPrivateAccess.slice(0, 25)), subnets_read: readableValue(subnetScan, subnets.length) },
       total: subnets.length,
       violations: subnetsWithoutPrivateAccess.length,
       violationStatus: "warn",
@@ -3135,9 +3204,10 @@ export async function assessGcpNetworkSecurity(
       severity: "medium",
       controls: [10],
       evidence: {
-        subnets_without_nat: subnetsWithoutNat.slice(0, 25),
-        subnets_with_unknown_nat: subnetsWithUnknownNat.slice(0, 25),
+        subnets_without_nat: jointValue(natCoverageReadable, subnetsWithoutNat.slice(0, 25)),
+        subnets_with_unknown_nat: readableValue(subnetScan, subnetsWithUnknownNat.slice(0, 25)),
         instances_with_external_ip: readableValue(instanceScan, publicInstances.slice(0, 25)),
+        subnets_read: readableValue(subnetScan, subnets.length),
         routers_read: readableValue(routerScan, routers.length),
         instances_read: readableValue(instanceScan, instances.length),
       },
@@ -3147,8 +3217,8 @@ export async function assessGcpNetworkSecurity(
       unknown: subnetsWithUnknownNat.length,
       unknownSummary: `${subnetsWithUnknownNat.length} of ${subnets.length} eligible subnetworks could not be evaluated for Cloud NAT coverage because ${GCP_INVENTORIES.routers.dataset} were unreadable in their project (${GCP_INVENTORIES.routers.endpoint}).`,
       emptyVerdict: "manual",
-      passSummary: `Every eligible subnetwork is covered by a Cloud NAT (sourceSubnetworkIpRangesToNat) in its network and region, and none of ${instances.length} instances has an IPv4 or IPv6 external access config.`,
-      failSummary: `${subnetsWithoutNat.length} subnetworks are not covered by a Cloud NAT in their network and region, and ${publicInstances.length} of ${instances.length} instances carry external IPv4 or IPv6 access configs.`,
+      passSummary: `${natPassClause}, and ${externalIpPassClause}.`,
+      failSummary: `${natFailClause}, and ${externalIpFailClause}.`,
       emptySummary: "No subnetworks or instances were listed in the sampled projects.",
       manualEvidence: "review Cloud Router nats[].sourceSubnetworkIpRangesToNat and subnetworks[] per region, plus instance networkInterfaces[].accessConfigs and ipv6AccessConfigs.",
     }),
@@ -3158,7 +3228,12 @@ export async function assessGcpNetworkSecurity(
       title: "Load balancer SSL policies",
       severity: "high",
       controls: [18],
-      evidence: { weak_proxies: weakProxies.slice(0, 25), unresolved_proxies: unresolvedProxies.slice(0, 25), proxies_read: proxies.length, ssl_policies_read: readableValue(sslPolicyScan, sslPolicies.length) },
+      evidence: {
+        weak_proxies: readableValue(proxyScan, weakProxies.slice(0, 25)),
+        unresolved_proxies: readableValue(proxyScan, unresolvedProxies.slice(0, 25)),
+        proxies_read: readableValue(proxyScan, proxies.length),
+        ssl_policies_read: readableValue(sslPolicyScan, sslPolicies.length),
+      },
       total: proxies.length,
       violations: weakProxies.length,
       unknown: unresolvedProxies.length,
@@ -3175,7 +3250,7 @@ export async function assessGcpNetworkSecurity(
       title: "Cloud Armor on external backend services",
       severity: "medium",
       controls: [19],
-      evidence: { backends_without_security_policy: backendsWithoutArmor.slice(0, 25), external_backends_read: externalBackends.length },
+      evidence: { backends_without_security_policy: readableValue(backendScan, backendsWithoutArmor.slice(0, 25)), external_backends_read: readableValue(backendScan, externalBackends.length) },
       total: externalBackends.length,
       violations: backendsWithoutArmor.length,
       violationStatus: "warn",
@@ -3201,15 +3276,15 @@ export async function assessGcpNetworkSecurity(
     title: "GCP network security posture",
     category: "network-security",
     summary: {
-      sampled_projects: context.projectIds.length,
+      sampled_projects: sampledProjects(context),
       projects_truncated: context.truncated,
       firewalls: readableValue(firewallScan, firewalls.length),
       open_admin_rules: readableValue(firewallScan, openAdminRules.length),
       subnetworks: readableValue(subnetScan, subnets.length),
       subnets_without_flow_logs: readableValue(subnetScan, subnetsWithoutFlowLogs.length),
       subnets_without_private_google_access: readableValue(subnetScan, subnetsWithoutPrivateAccess.length),
-      subnets_without_nat: readableValue(routerScan, subnetsWithoutNat.length),
-      subnets_with_unknown_nat: subnetsWithUnknownNat.length,
+      subnets_without_nat: jointValue(natCoverageReadable, subnetsWithoutNat.length),
+      subnets_with_unknown_nat: readableValue(subnetScan, subnetsWithUnknownNat.length),
       instances_with_external_ip: readableValue(instanceScan, publicInstances.length),
       https_proxies: readableValue(proxyScan, proxies.length),
       weak_ssl_proxies: readableValue(proxyScan, weakProxies.length),
