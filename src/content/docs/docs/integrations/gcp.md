@@ -77,6 +77,8 @@ The projects you inventory must have the relevant APIs enabled: `cloudasset`, `c
 
 `project_limit` (alias `max_projects`, default 20) caps how many projects are inventoried. When the cap truncates the inventory, every dependent finding is downgraded to `warn` with seen and total counts, so a partial view can never pass.
 
+Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way: the per-list item cap was reached, the cursor repeated itself, or the page budget of 250 pages was spent. The summary then reads `N seen, total unknown`.
+
 ## Status semantics
 
 | Status | Meaning |
@@ -138,7 +140,7 @@ Every finding carries the spec mapping table entries for its controls. The expor
   QUICK_REFERENCE.md
   README.md
   metadata.json
-  core_data/            raw snapshots with secrets redacted
+  core_data/            projected snapshots: identifiers plus the documented fields each control reads
   analysis/             findings.json, category_summaries.json, one JSON and markdown per category
   compliance/           executive_summary.md, unified_compliance_matrix.md, frameworks/<framework>.md
   _errors.log           only when collection partially failed
@@ -146,6 +148,8 @@ Every finding carries the spec mapping table entries for its controls. The expor
 ```
 
 Reruns allocate `-2`, `-3`, and so on; the zip name derives from the allocated directory so nothing is overwritten. Output paths are resolved with traversal and symlink-parent protection.
+
+Snapshots and finding evidence never contain whole API resources. Each collected object is projected to its identifiers and the documented fields the verdict reads (for example a Compute instance becomes its name, the resolved `enable-oslogin` and `serial-port-enable` flags, and the three `shieldedInstanceConfig` booleans), so metadata values such as `startup-script` or `ssh-keys`, labels, annotations, descriptions, filters, API key `keyString` values, IAP client secrets, and disk `rawKey` material are never written. A regression test seeds a distinct fake secret into every collected object, exports a bundle, and asserts that none of them appears in any file under the output directory or in any entry of the zip.
 
 ## Live smoke test
 
