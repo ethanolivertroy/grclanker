@@ -79,7 +79,7 @@ The core Splunk REST API is served by the `splunkd` daemon and provides access t
 |----------|--------|---------|
 | `/services/data/inputs/tcp/cooked` | GET | Cooked TCP data inputs (forwarder connections) |
 | `/services/data/inputs/tcp/raw` | GET | Raw TCP data inputs |
-| `/services/data/inputs/tcp/ssl` | GET | SSL-enabled TCP inputs |
+| `/services/data/inputs/tcp/ssl` | GET | SSL-enabled TCP inputs (not used by the implementation: its GET response documents neither `serverCert` nor `requireClientCert`; see the control 23 deviation in section 10) |
 | `/services/data/inputs/udp` | GET | UDP data inputs |
 | `/services/data/inputs/http` | GET | HTTP Event Collector (HEC) token configurations |
 | `/services/data/inputs/http/{name}` | GET | Individual HEC token details |
@@ -509,7 +509,7 @@ splunk-sec-inspector audit
 - Control 3: `/services/admin/Duo-MFA` is checked alongside `/services/admin/Rsa-MFA`, selected by `authentication.conf externalTwoFactorAuthVendor`.
 - Control 12: `run_commands_on_forwarder` is not a documented capability in `authorize.conf`; `edit_forwarders` and `run_debug_commands` are checked in its place, alongside the other elevated capabilities listed in the integration guide.
 - Control 15: `outputs.conf` documents `useSSL = true|false|legacy` with `clientCert` for the forwarder certificate (the spec's `sslCertPath` is deprecated but still accepted) and defines `sslPassword` as the CA certificate password, so the password is never TLS evidence. Settings are resolved through the documented `[tcpout]`, `[tcpout:<group>]`, and `[tcpout-server://...]` levels; an explicit `useSSL=false` fails regardless of certificate settings and `legacy` mode with a `clientCert` caps at `warn`.
-- Control 23: `data/inputs/tcp/cooked` documents no TLS value in its GET response and `data/inputs/tcp/ssl` documents neither `serverCert` nor `requireClientCert`, so S2S encryption is decided from `inputs.conf` `[splunktcp-ssl:<port>]` versus `[splunktcp://...]` stanzas and the `[SSL]` stanza read through `/services/configs/conf-inputs`; listener names are never used as evidence.
+- Control 23: `data/inputs/tcp/cooked` documents no TLS value in its GET response and `data/inputs/tcp/ssl` documents neither `serverCert` nor `requireClientCert`, so S2S encryption is decided from `inputs.conf` `[splunktcp-ssl:<port>]` versus `[splunktcp://...]` stanzas read through `/services/configs/conf-inputs`, with `serverCert` and `requireClientCert` resolved per port from the `[splunktcp-ssl:<port>]` stanza first and the global `[SSL]` stanza second; listener names are never used as evidence, and `data/inputs/tcp/ssl` is not called.
 - Control 13: `server.conf` states that the `sslVersions` default varies by release, so an absent value is reported as unknown and caps the verdict at `warn` rather than assuming `tls1.2`.
 - Control 17: `audit.conf [auditTrail]` has no enabled flag. Its `queueing` setting (default true, and there is no default `audit.conf`) is read through `/services/configs/conf-audit`; a missing file is reported as the assumed default and `queueing=false` caps the verdict at `warn`. `/services/admin/audit` is not used.
 - Control 14: the ACS OpenAPI specification exposes `GET /emek/key-policy`, `GET /emek/waiver`, and `PUT /emek/key`, which generate onboarding artifacts; there is no `/encryption-keys` status endpoint as listed in section 2.2, so the control stays manual.
