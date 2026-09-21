@@ -3,15 +3,18 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   OCI_SURFACE_DOCS,
   OciAuditorClient,
+  REDACTED_MARKER,
   assessOciComputeAndStorage,
   assessOciIdentity,
   assessOciLoggingDetection,
@@ -19,6 +22,10 @@ import {
   checkOciAccess,
   collectAcrossCompartments,
   exportOciAuditBundle,
+  isSensitiveFieldName,
+  projectCompartmentSnapshot,
+  redactSensitiveText,
+  redactSensitiveValues,
   resolveOciConfiguration,
   resolveSecureOutputPath,
   ruleReachesSensitivePort,
@@ -223,6 +230,102 @@ function partialClient() {
     return originalBuckets(namespace, compartmentId);
   };
   return client;
+}
+
+const SECRET_PEM = "-----BEGIN RSA PRIVATE KEY-----\nFAKE_PEM_BODY_1\n-----END RSA PRIVATE KEY-----";
+const SECRET_ERROR = new Error(
+  `Command failed: oci cloud-guard problem list --config-file /tmp/oci/config\nServiceError: 401 NotAuthenticated: Signature FAKE_SIGNATURE_1abcdef key_file=/tmp/oci/FAKE_KEY_PATH_1.pem token=FAKE_ERROR_TOKEN_1 ${SECRET_PEM}`,
+);
+
+/**
+ * Rule 9 fixture: the compliant tenancy with a distinctive FAKE_ marker in
+ * every collected object that can carry credential material (documented
+ * secret-bearing fields plus tags, descriptions, and metadata that must not be
+ * dumped verbatim). Public key material uses the ALLOWED_ prefix because it
+ * may legitimately appear.
+ */
+function secretLadenClient() {
+  const client = compliantClient();
+  const tags = (marker) => ({ freeformTags: { password: `FAKE_TAG_${marker}` }, definedTags: { audit: { token: `FAKE_DEFINED_TAG_${marker}` } } });
+  const withSecrets = (items, marker, extra = {}) => items.map((item, index) => ({ ...item, ...tags(`${marker}_${index}`), description: `FAKE_DESCRIPTION_${marker}_${index}`, ...extra }));
+  const wrapList = (method, marker, extra) => {
+    const original = client[method];
+    client[method] = async (...args) => withSecrets(await original(...args), marker, extra);
+  };
+  wrapList("listCompartments", "COMPARTMENT");
+  wrapList("listUsers", "USER");
+  wrapList("listApiKeys", "API_KEY", { keyValue: "-----BEGIN PUBLIC KEY-----\nFAKE_API_KEY_VALUE_1\n-----END PUBLIC KEY-----" });
+  wrapList("listCustomerSecretKeys", "CSK", { key: "FAKE_CUSTOMER_SECRET_1" });
+  wrapList("listAuthTokens", "AUTH_TOKEN", { token: "FAKE_SECRET_TOKEN_1" });
+  wrapList("listPolicies", "POLICY");
+  wrapList("listAuditEvents", "AUDIT", { data: { request: { headers: { authorization: ["FAKE_AUTH_HEADER_1"] } } } });
+  wrapList("listCloudGuardTargets", "TARGET");
+  wrapList("listResponderRecipes", "RECIPE");
+  wrapList("listEventRules", "RULE", { actions: { actions: [{ actionType: "ONS", topicId: "ocid1.onstopic.oc1..topic", description: "FAKE_ACTION_DESCRIPTION_1" }] } });
+  wrapList("listSecurityLists", "SL");
+  wrapList("listNetworkSecurityGroups", "NSG");
+  wrapList("listBastions", "BASTION");
+  wrapList("listBastionSessions", "SESSION", { keyDetails: { publicKeyContent: "ssh-rsa ALLOWED_PUBLIC_KEY_1" }, sshPrivateKey: "FAKE_PRIVATE_KEY_1" });
+  wrapList("listVaults", "VAULT", { secret: "FAKE_VAULT_SECRET_1" });
+  wrapList("listKeys", "KEY", { keyMaterial: "FAKE_KEY_MATERIAL_1", wrappedImportKey: { wrappedKey: "FAKE_WRAPPED_KEY_1" } });
+  wrapList("listKeyVersions", "KEY_VERSION", { publicKey: "ALLOWED_PUBLIC_KEY_2" });
+  wrapList("listBuckets", "BUCKET", { metadata: { password: "FAKE_BUCKET_METADATA_SECRET_1" } });
+  wrapList("listPreauthenticatedRequests", "PAR", { accessUri: "/p/FAKE_ACCESS_URI_1/n/tenantns/b/logs/o/", fullPath: "https://objectstorage.us-ashburn-1.oraclecloud.com/p/FAKE_ACCESS_URI_1/n/tenantns/b/logs/o/" });
+  wrapList("listInstances", "INSTANCE", { metadata: { user_data: "FAKE_USER_DATA_SECRET_1", ssh_authorized_keys: "ssh-rsa ALLOWED_PUBLIC_KEY_3" }, extendedMetadata: { db_password: "FAKE_EXTENDED_METADATA_SECRET_1" } });
+  wrapList("listVolumes", "VOLUME");
+  wrapList("listBootVolumes", "BOOT_VOLUME");
+  const originalBastion = client.getBastion;
+  client.getBastion = async (...args) => ({ ...(await originalBastion(...args)), ...tags("BASTION_DETAIL"), phoneBookEntry: "FAKE_PHONE_BOOK_1" });
+  const originalBucket = client.getBucket;
+  client.getBucket = async (...args) => ({ ...(await originalBucket(...args)), ...tags("BUCKET_DETAIL"), metadata: { password: "FAKE_BUCKET_DETAIL_SECRET_1" } });
+  const originalAuthPolicy = client.getAuthenticationPolicy;
+  client.getAuthenticationPolicy = async () => ({ ...(await originalAuthPolicy()), networkPolicy: { networkSourceIds: ["FAKE_NETWORK_SOURCE_1"] } });
+  client.listCloudGuardProblems = async () => {
+    throw SECRET_ERROR;
+  };
+  return client;
+}
+
+function listFilesRecursively(root) {
+  const files = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const pathname = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...listFilesRecursively(pathname));
+    else files.push(pathname);
+  }
+  return files;
+}
+
+/** Minimal zip reader (central directory plus raw deflate) so the archive content can be asserted without external tools. */
+function readZipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  let eocdOffset = -1;
+  for (let offset = buffer.length - 22; offset >= 0; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      eocdOffset = offset;
+      break;
+    }
+  }
+  assert.ok(eocdOffset >= 0, "zip end of central directory record not found");
+  const entryCount = buffer.readUInt16LE(eocdOffset + 10);
+  let cursor = buffer.readUInt32LE(eocdOffset + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(cursor), 0x02014b50, "central directory signature");
+    const method = buffer.readUInt16LE(cursor + 10);
+    const compressedSize = buffer.readUInt32LE(cursor + 20);
+    const nameLength = buffer.readUInt16LE(cursor + 28);
+    const extraLength = buffer.readUInt16LE(cursor + 30);
+    const commentLength = buffer.readUInt16LE(cursor + 32);
+    const localHeaderOffset = buffer.readUInt32LE(cursor + 42);
+    const name = buffer.subarray(cursor + 46, cursor + 46 + nameLength).toString("utf8");
+    assert.equal(buffer.readUInt32LE(localHeaderOffset), 0x04034b50, "local header signature");
+    const dataStart = localHeaderOffset + 30 + buffer.readUInt16LE(localHeaderOffset + 26) + buffer.readUInt16LE(localHeaderOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: (method === 8 ? inflateRawSync(data) : data).toString("utf8") });
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
 }
 
 function byId(result, id) {
@@ -639,6 +742,125 @@ test("exportOciAuditBundle records partial collection in _errors.log", async () 
   assert.match(errorsLog, /NotAuthorizedOrNotFound/);
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
   assert.match(summary, /Partial Collection Warnings/);
+});
+
+test("redaction keeps field names, drops credential-bearing values, and scrubs key material from text", () => {
+  for (const name of ["accessUri", "keyValue", "token", "authToken", "key", "secret", "clientSecret", "password", "db_password", "passphrase", "privateKey", "key_file", "keyMaterial", "wrappedKey", "plaintext", "ciphertext", "authorization", "userData", "security_token_file"]) {
+    assert.equal(isSensitiveFieldName(name), true, name);
+  }
+  for (const name of ["passwordPolicy", "password_policy", "kmsKeyId", "keys_seen", "weak_keys", "credentials_seen", "credential_cap_hit", "stale_credentials", "isMfaActivated", "tokens_seen"]) {
+    assert.equal(isSensitiveFieldName(name), false, name);
+  }
+  const redacted = redactSensitiveValues({
+    accessUri: "/p/abc/n/ns/b/bucket/o/",
+    password_policy: { minimumPasswordLength: 14 },
+    nested: { token: "FAKE_SECRET_TOKEN_1", count: 3, enabled: true, items: [{ key: "FAKE_CUSTOMER_SECRET_1", id: "csk-1" }] },
+    note: `see ${SECRET_PEM}`,
+  });
+  assert.deepEqual(redacted, {
+    accessUri: REDACTED_MARKER,
+    password_policy: { minimumPasswordLength: 14 },
+    nested: { token: REDACTED_MARKER, count: 3, enabled: true, items: [{ key: REDACTED_MARKER, id: "csk-1" }] },
+    note: "see [redacted key material]",
+  });
+  const text = redactSensitiveText(SECRET_ERROR.message);
+  assert.doesNotMatch(text, /FAKE_/);
+  assert.match(text, /\[redacted key material\]/);
+  assert.match(text, /token=\[redacted\]/);
+  assert.match(text, /Signature \[redacted\]/);
+  assert.equal(redactSensitiveText("https://objectstorage.example/p/FAKE_ACCESS_URI_1/n/ns/b/logs/o/"), "https://objectstorage.example/p/[redacted]/n/ns/b/logs/o/");
+  assert.deepEqual(projectCompartmentSnapshot({ ...PROD, description: "secret", freeformTags: { password: "x" } }), {
+    id: PROD.id,
+    compartmentId: TENANCY,
+    name: "prod",
+    lifecycleState: "ACTIVE",
+  });
+});
+
+test("rule 9: bundle files, the zip, and tool outputs never carry credential-bearing values", async () => {
+  const outputs = await runAllAssessments(secretLadenClient());
+  const serialized = JSON.stringify(outputs);
+  assert.doesNotMatch(serialized, /FAKE_/, "assessment outputs leaked a fake secret");
+  assert.match(serialized, /\[redacted key material\]/, "collection errors keep a redaction marker");
+
+  const base = createTempBase("grclanker-oci-secrets-");
+  const result = await exportOciAuditBundle(secretLadenClient(), sampleConfig({ configFile: "/tmp/oci/FAKE_CONFIG_DIR/config" }), base);
+  const files = listFilesRecursively(result.outputDir);
+  assert.ok(files.length >= 20);
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    assert.doesNotMatch(content, /FAKE_/, `${relative(result.outputDir, file)} leaked a fake secret`);
+  }
+  const compartments = JSON.parse(readFileSync(join(result.outputDir, "core_data", "compartments.json"), "utf8"));
+  assert.equal(compartments.length, 3);
+  for (const compartment of compartments) {
+    assert.deepEqual(Object.keys(compartment).sort(), ["compartmentId", "id", "lifecycleState", "name"]);
+  }
+  const errorsLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /\[redacted key material\]/);
+  assert.match(errorsLog, /token=\[redacted\]/);
+  assert.match(errorsLog, /key_file=\[redacted\]/);
+  const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
+  assert.equal(metadata.config_file, REDACTED_MARKER);
+
+  const entries = readZipEntries(result.zipPath);
+  const entryNames = entries.map((entry) => entry.name);
+  assert.ok(entryNames.some((name) => name.endsWith("analysis/findings.json")), entryNames.join(","));
+  assert.ok(entryNames.some((name) => name.endsWith("core_data/compartments.json")));
+  assert.ok(entryNames.some((name) => name.endsWith("_errors.log")));
+  assert.equal(entries.filter((entry) => !entry.name.endsWith("/")).length, files.length);
+  for (const entry of entries) {
+    assert.doesNotMatch(entry.content, /FAKE_/, `zip entry ${entry.name} leaked a fake secret`);
+  }
+});
+
+test("rule 10: the policy cap reports seen versus total and withholds pass", async () => {
+  const client = compliantClient();
+  const capped = await assessOciIdentity(client, { maxPolicies: 2 });
+  const policies = byId(capped, "OCI-IAM-04");
+  assert.equal(policies.status, "warn");
+  assert.equal(policies.evidence.policy_cap_hit, true);
+  assert.equal(policies.evidence.policies_seen, 2);
+  assert.equal(policies.evidence.policies_total, 3);
+  assert.match(policies.summary, /Policy cap 2 hit: 2\/3 active policies inspected/);
+
+  const uncapped = await assessOciIdentity(client, { maxPolicies: 3 });
+  assert.equal(byId(uncapped, "OCI-IAM-04").status, "pass");
+  assert.equal(byId(uncapped, "OCI-IAM-04").evidence.policy_cap_hit, false);
+});
+
+test("rule 10: the credential cap stops enumeration and reports users and credentials seen versus total", async () => {
+  const capped = await assessOciIdentity(compliantClient(), { maxKeys: 1 });
+  const rotation = byId(capped, "OCI-IAM-03");
+  assert.equal(rotation.status, "warn");
+  assert.equal(rotation.evidence.credential_cap_hit, true);
+  assert.equal(rotation.evidence.credentials_seen, 1);
+  assert.equal(rotation.evidence.credentials_total, null);
+  assert.equal(rotation.evidence.users_inspected, 1);
+  assert.equal(rotation.evidence.users_total, 2);
+  assert.match(rotation.summary, /Credential cap 1 hit: 1 credentials seen across 1\/2 active users; the total is unknown/);
+
+  const exact = await assessOciIdentity(compliantClient(), { maxKeys: 6 });
+  assert.equal(byId(exact, "OCI-IAM-03").status, "pass");
+  assert.equal(byId(exact, "OCI-IAM-03").evidence.credentials_total, 6);
+});
+
+test("rule 10: the bucket cap reports seen versus total and withholds pass", async () => {
+  const client = compliantClient();
+  client.listBuckets = async (_namespace, compartmentId) => (compartmentId === APPS.id
+    ? [{ name: "logs", namespace: "tenantns", compartmentId: APPS.id }, { name: "backups", namespace: "tenantns", compartmentId: APPS.id }, { name: "media", namespace: "tenantns", compartmentId: APPS.id }]
+    : []);
+  const capped = await assessOciTenancyGuardrails(client, { maxBuckets: 2 });
+  const buckets = byId(capped, "OCI-GRD-06");
+  assert.equal(buckets.status, "warn");
+  assert.equal(buckets.evidence.bucket_cap_hit, true);
+  assert.equal(buckets.evidence.buckets_seen, 2);
+  assert.equal(buckets.evidence.buckets_total, 3);
+  assert.match(buckets.summary, /Bucket cap 2 hit: 2\/3 buckets inspected/);
+
+  const uncapped = await assessOciTenancyGuardrails(client, { maxBuckets: 3 });
+  assert.equal(byId(uncapped, "OCI-GRD-06").status, "pass");
+  assert.equal(byId(uncapped, "OCI-GRD-06").evidence.bucket_cap_hit, false);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
