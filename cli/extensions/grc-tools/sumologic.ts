@@ -417,9 +417,44 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function redactSecret(text: string, secret: string | undefined): string {
-  if (!secret || secret.length < 4) return text;
-  return text.split(secret).join("[REDACTED]");
+const URL_IN_TEXT_PATTERN = /https?:\/\/[^\s"'<>`]+/gi;
+const AUTHORIZATION_SCHEME_PATTERN = /\b(Basic|Bearer|SSWS|Splunk|Token|Digest|Negotiate)\s+(?!\[REDACTED\])[A-Za-z0-9._~+/=-]{8,}/g;
+const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g;
+const SECRET_PAIR_PATTERN =
+  /\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|passphrase|api[_-]?key|access[_-]?key|private[_-]?key|session(?:[_-]?(?:id|key|token))?|cookie|authorization|credential|signature)[A-Za-z0-9_.-]*)(\s*[=:]\s*)(["']?)(?!\[REDACTED\])([^\s"'&;,<>)\]}]+)/gi;
+
+/** Reduces a URL found anywhere in prose to scheme, host, and path. */
+function scrubUrlInText(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@\s]*@)/i, "$1").replace(/[?#][\s\S]*$/, "");
+}
+
+/**
+ * The single redaction pass for error text: configured secrets, URLs with
+ * userinfo or query strings anywhere in the string, authorization scheme
+ * values, JWT-shaped strings, and secret-bearing key-value pairs. Every error
+ * string is routed through here before it is recorded, so a response body or
+ * a vendor message can never carry a credential into a finding or the bundle.
+ */
+export function scrubErrorText(text: string, secrets: Array<string | undefined> = []): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret && secret.length >= 4) scrubbed = scrubbed.split(secret).join("[REDACTED]");
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (url) => scrubUrlInText(url))
+    .replace(AUTHORIZATION_SCHEME_PATTERN, "$1 [REDACTED]")
+    .replace(JWT_IN_TEXT_PATTERN, "[REDACTED]")
+    .replace(SECRET_PAIR_PATTERN, "$1$2$3[REDACTED]");
+}
+
+/** Describes a response body that is not JSON without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
+}
+
+function statusLine(response: Response): string {
+  return `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
 }
 
 export function resolveSumologicBaseUrl(endpointOrDeployment: string): { baseUrl: string; deployment?: string } {
@@ -587,8 +622,16 @@ export class SumologicApiClient implements SumologicReader {
     return url.toString();
   }
 
+  private basicCredential(): string {
+    return Buffer.from(`${this.config.accessId}:${this.config.accessKey}`).toString("base64");
+  }
+
   private authorizationHeader(): string {
-    return `Basic ${Buffer.from(`${this.config.accessId}:${this.config.accessKey}`).toString("base64")}`;
+    return `Basic ${this.basicCredential()}`;
+  }
+
+  private scrubError(error: unknown): string {
+    return scrubErrorText(error instanceof Error ? error.message : String(error), [this.config.accessKey, this.basicCredential()]);
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<unknown> {
@@ -608,26 +651,32 @@ export class SumologicApiClient implements SumologicReader {
         });
       } catch (error) {
         clearTimeout(timeout);
-        const message = redactSecret(error instanceof Error ? error.message : String(error), this.config.accessKey);
         if (attempt < this.maxRetries) {
           await this.sleepImpl(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        throw new Error(`Sumo Logic request to ${path} failed: ${message}`);
+        throw new Error(`Sumo Logic request to ${path} failed: ${this.scrubError(error)}`);
       }
       clearTimeout(timeout);
 
+      // A body that is not JSON (a proxy error page, an HTML sign-in form) is
+      // never copied into an error string: it is described by content type
+      // and size only, because such pages can echo the request credentials.
       const rawText = await response.text();
       let payload: unknown = {};
+      let nonJsonBody: string | undefined;
       if (rawText.length > 0) {
         try {
           payload = JSON.parse(rawText) as unknown;
         } catch {
-          payload = { message: rawText.slice(0, 240) };
+          nonJsonBody = describeNonJsonBody(response, rawText);
         }
       }
 
-      if (response.ok) return payload;
+      if (response.ok) {
+        if (nonJsonBody === undefined) return payload;
+        throw new SumologicApiError(`Sumo Logic request to ${path} returned an unreadable response (${statusLine(response)}: ${nonJsonBody})`, response.status);
+      }
 
       const retryable = response.status === 429 || response.status >= 500;
       if (retryable && attempt < this.maxRetries) {
@@ -635,10 +684,10 @@ export class SumologicApiClient implements SumologicReader {
         continue;
       }
 
-      const { message, code } = sumologicErrorSummary(payload);
-      const detail = redactSecret(message ?? rawText.slice(0, 240), this.config.accessKey);
+      const { message, code } = nonJsonBody === undefined ? sumologicErrorSummary(payload) : {};
+      const detail = nonJsonBody ?? message;
       throw new SumologicApiError(
-        `Sumo Logic request to ${path} failed (${response.status}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`,
+        this.scrubError(`Sumo Logic request to ${path} failed (${statusLine(response)}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`),
         response.status,
         code,
       );
@@ -658,9 +707,11 @@ export class SumologicApiClient implements SumologicReader {
         count: result.count ?? (Array.isArray(result.data) ? result.data.length : 1),
       };
     } catch (error) {
+      // Every dataset error is recorded here and nowhere else, so this is the
+      // one place the redaction pass has to run for findings and the bundle.
       return {
         ok: false,
-        error: redactSecret(error instanceof Error ? error.message : String(error), this.config.accessKey),
+        error: this.scrubError(error),
         httpStatus: error instanceof SumologicApiError ? error.status : undefined,
         complete: false,
         scope: "org",
@@ -862,12 +913,22 @@ function unreadable(number: number, severity: SumologicFinding["severity"], what
 }
 
 function partialNote(collection: SumologicCollection<unknown[]>): string {
-  return collection.complete ? "" : ` Pagination stopped before the last page, so only ${collection.data?.length ?? 0} items were seen and the population is incomplete.`;
+  if (!collection.ok || collection.complete) return "";
+  return ` Pagination stopped before the last page, so only ${collection.data?.length ?? 0} items were seen and the population is incomplete.`;
 }
 
 function withPartialDowngrade(item: SumologicFinding, collection: SumologicCollection<unknown[]>): SumologicFinding {
-  if (collection.complete || item.status !== "pass") return item;
+  if (!collection.ok || collection.complete || item.status !== "pass") return item;
   return { ...item, status: "warn", summary: `${item.summary}${partialNote(collection)}` };
+}
+
+/**
+ * Uniform null rendering: a count or list derived from an unreadable
+ * collection is rendered as null, never as 0 or [], so evidence cannot read
+ * as "nothing found" when nothing could be read.
+ */
+function whenReadable<T>(collection: SumologicCollection<unknown>, value: T): T | null {
+  return collection.ok ? value : null;
 }
 
 /**
@@ -1223,7 +1284,7 @@ export async function assessSumologicIdentity(
     findings.push(finding(2, "high", "manual", "Not applicable: no SAML identity provider is configured, so the SAML bypass allowlist has no effect. Re-run after SSO is configured.", { allowlisted_users: allowlistedUsers.length }));
   } else {
     const inactive = allowlistedUsers.filter((user) => user.isActive === false);
-    const evidence = { allowlisted_users: names(allowlistedUsers, "email"), inactive_allowlisted_users: names(inactive, "email"), threshold: maxAllowlisted, identity_providers_readable: identityProviders.ok };
+    const evidence = { allowlisted_users: names(allowlistedUsers, "email"), inactive_allowlisted_users: names(inactive, "email"), threshold: maxAllowlisted, identity_providers_readable: identityProviders.ok, identity_providers: whenReadable(identityProviders, idps.length) };
     let allowlistFinding: SumologicFinding;
     if (allowlistedUsers.length > maxAllowlisted) {
       allowlistFinding = finding(2, "high", "fail", `${allowlistedUsers.length} users bypass SAML (threshold ${maxAllowlisted}); reduce the allowlist to break-glass accounts only.`, evidence);
@@ -1277,23 +1338,27 @@ export async function assessSumologicIdentity(
   const requireMfa = requireMfaFlag === true;
   const mfaEvidence = {
     require_mfa_policy: passwordPolicy.ok ? flagText(requireMfaFlag) : null,
-    users_seen: userList.length,
-    users_complete: users.complete,
-    active_users: activeUsers.length,
-    active_users_without_mfa: names(activeWithoutMfa, "email"),
-    users_missing_is_active_flag: usersMissingActiveFlag.length,
-    locked_users: names(activity.locked, "email"),
-    active_users_with_recent_login: activity.recentLogin.length,
-    dormant_active_users: names(activity.dormant, "email"),
-    active_users_without_last_login: names(activity.undatedLogin, "email"),
+    users_readable: users.ok,
+    users_seen: whenReadable(users, userList.length),
+    users_complete: whenReadable(users, users.complete),
+    active_users: whenReadable(users, activeUsers.length),
+    active_users_without_mfa: whenReadable(users, names(activeWithoutMfa, "email")),
+    users_missing_is_active_flag: whenReadable(users, usersMissingActiveFlag.length),
+    locked_users: whenReadable(users, names(activity.locked, "email")),
+    active_users_with_recent_login: whenReadable(users, activity.recentLogin.length),
+    dormant_active_users: whenReadable(users, names(activity.dormant, "email")),
+    active_users_without_last_login: whenReadable(users, names(activity.undatedLogin, "email")),
     user_inactive_threshold_days: userInactiveDays,
   };
+  const perUserMfaText = users.ok
+    ? `${activeWithoutMfa.length}/${activeUsers.length} seen active users report MFA disabled`
+    : `per-user MFA status is unknown because the user list could not be read (${unreadableCause(users)})`;
   if (!passwordPolicy.ok && !users.ok) {
     findings.push(unreadable(5, "critical", "the MFA policy and user list", passwordPolicy, "screenshot the Require MFA setting and export the user list with MFA status."));
   } else if (!passwordPolicy.ok) {
-    findings.push(finding(5, "critical", "manual", `The password policy was unreadable, so org-wide MFA enforcement is unknown; ${activeWithoutMfa.length}/${activeUsers.length} seen active users report MFA disabled. Confirm Require MFA in Administration > Security > Password Policy.`, mfaEvidence));
+    findings.push(finding(5, "critical", "manual", `The password policy was unreadable, so org-wide MFA enforcement is unknown; ${perUserMfaText}. Confirm Require MFA in Administration > Security > Password Policy.`, mfaEvidence));
   } else if (!requireMfa) {
-    findings.push(finding(5, "critical", "fail", `The password policy does not require MFA (requireMfa=${flagText(requireMfaFlag)}); ${activeWithoutMfa.length}/${activeUsers.length} seen active users have MFA disabled.`, mfaEvidence));
+    findings.push(finding(5, "critical", "fail", `The password policy does not require MFA (requireMfa=${flagText(requireMfaFlag)}); ${perUserMfaText}.`, mfaEvidence));
   } else if (!users.ok) {
     findings.push(finding(5, "critical", "manual", `Require MFA is enabled, but the user list was unreadable (${users.error ?? "unknown error"}), so per-user coverage cannot be confirmed; export the user list with MFA status.`, mfaEvidence));
   } else if (userList.length === 0) {
@@ -1308,13 +1373,13 @@ export async function assessSumologicIdentity(
     title: "Sumo Logic identity posture",
     area: "identity",
     summary: {
-      identity_providers: idps.length,
-      allowlisted_users: allowlistedUsers.length,
-      users_seen: userList.length,
-      active_users_without_mfa: activeWithoutMfa.length,
-      locked_users: activity.locked.length,
-      dormant_active_users: activity.dormant.length,
-      active_users_without_last_login: activity.undatedLogin.length,
+      identity_providers: whenReadable(identityProviders, idps.length),
+      allowlisted_users: whenReadable(allowlisted, allowlistedUsers.length),
+      users_seen: whenReadable(users, userList.length),
+      active_users_without_mfa: whenReadable(users, activeWithoutMfa.length),
+      locked_users: whenReadable(users, activity.locked.length),
+      dormant_active_users: whenReadable(users, activity.dormant.length),
+      active_users_without_last_login: whenReadable(users, activity.undatedLogin.length),
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -1380,13 +1445,13 @@ export async function assessSumologicAccessControl(
       max_admins: maxAdmins,
       custom_roles_without_filter_predicate: names(unscopedRoles),
       users_readable: users.ok,
-      users_complete: users.complete,
-      locked_users: names(activity.locked, "email"),
-      dormant_active_users: names(activity.dormant, "email"),
-      active_users_without_last_login: names(activity.undatedLogin, "email"),
-      admin_members_seen_in_user_list: adminMembers.length,
-      dormant_admin_members: names(adminActivity.dormant, "email"),
-      admin_members_without_last_login: names(adminActivity.undatedLogin, "email"),
+      users_complete: whenReadable(users, users.complete),
+      locked_users: whenReadable(users, names(activity.locked, "email")),
+      dormant_active_users: whenReadable(users, names(activity.dormant, "email")),
+      active_users_without_last_login: whenReadable(users, names(activity.undatedLogin, "email")),
+      admin_members_seen_in_user_list: whenReadable(users, adminMembers.length),
+      dormant_admin_members: whenReadable(users, names(adminActivity.dormant, "email")),
+      admin_members_without_last_login: whenReadable(users, names(adminActivity.undatedLogin, "email")),
       user_inactive_threshold_days: userInactiveDays,
     };
     const concerns: string[] = [];
@@ -1483,7 +1548,7 @@ export async function assessSumologicAccessControl(
   } else {
     const loginEnabled = status.loginEnabled === true;
     const contentEnabled = status.contentEnabled === true;
-    const evidence = { login_enabled: loginEnabled, content_enabled: contentEnabled, addresses_seen: addresses.length, addresses_readable: allowlistAddresses.ok, cidrs: names(addresses, "cidr") };
+    const evidence = { login_enabled: loginEnabled, content_enabled: contentEnabled, addresses_seen: whenReadable(allowlistAddresses, addresses.length), addresses_readable: allowlistAddresses.ok, cidrs: whenReadable(allowlistAddresses, names(addresses, "cidr")) };
     if (!loginEnabled) {
       findings.push(finding(13, "high", "fail", `Service allowlist login enforcement is disabled (loginEnabled=false${contentEnabled ? ", contentEnabled=true" : ""}), so API and UI access is not restricted by source IP.`, evidence));
     } else if (!allowlistAddresses.ok) {
@@ -1518,11 +1583,11 @@ export async function assessSumologicAccessControl(
     title: "Sumo Logic access control",
     area: "access-control",
     summary: {
-      roles_seen: roleList.length,
-      users_seen: (users.data ?? []).length,
-      access_keys_seen: keys.length,
-      access_key_scope: accessKeys.scope,
-      allowlist_addresses: addresses.length,
+      roles_seen: whenReadable(roles, roleList.length),
+      users_seen: whenReadable(users, userList.length),
+      access_keys_seen: whenReadable(accessKeys, keys.length),
+      access_key_scope: whenReadable(accessKeys, accessKeys.scope),
+      allowlist_addresses: whenReadable(allowlistAddresses, addresses.length),
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -1575,10 +1640,11 @@ export async function assessSumologicDataGovernance(
       audit_policy_enabled: true,
       search_audit_policy_readable: searchAuditPolicy.ok,
       search_audit_enabled: searchAuditPolicy.ok ? searchAuditPolicy.data?.enabled === true : null,
-      audit_index_partitions: names(auditIndexes),
-      active_audit_index_partitions: activeAuditIndexes.length,
-      partitions_seen: partitionList.length,
-      partitions_complete: partitions.complete,
+      partitions_readable: partitions.ok,
+      audit_index_partitions: whenReadable(partitions, names(auditIndexes)),
+      active_audit_index_partitions: whenReadable(partitions, activeAuditIndexes.length),
+      partitions_seen: whenReadable(partitions, partitionList.length),
+      partitions_complete: whenReadable(partitions, partitions.complete),
       plan_type: planType ?? null,
     };
     if (!partitions.ok) {
@@ -1613,14 +1679,14 @@ export async function assessSumologicDataGovernance(
       connections_seen: connectionList.length,
       connections_complete: connections.complete,
       partitions_readable: partitions.ok,
-      partitions_seen: partitionList.length,
-      partitions_complete: partitions.complete,
+      partitions_seen: whenReadable(partitions, partitionList.length),
+      partitions_complete: whenReadable(partitions, partitions.complete),
       scheduled_views_readable: scheduledViews.ok,
-      scheduled_views_seen: scheduledViewList.length,
-      scheduled_views_complete: scheduledViews.complete,
+      scheduled_views_seen: whenReadable(scheduledViews, scheduledViewList.length),
+      scheduled_views_complete: whenReadable(scheduledViews, scheduledViews.complete),
       destinations,
-      partitions_forwarding: names(forwardingPartitions),
-      scheduled_views_forwarding: names(forwardingViews, "indexName"),
+      partitions_forwarding: whenReadable(partitions, names(forwardingPartitions)),
+      scheduled_views_forwarding: whenReadable(scheduledViews, names(forwardingViews, "indexName")),
       approved_destination_domains: approvedDestinations,
       unapproved_destinations: unapproved.map((item) => item.name),
     };
@@ -1707,11 +1773,11 @@ export async function assessSumologicDataGovernance(
     title: "Sumo Logic data governance",
     area: "data-governance",
     summary: {
-      partitions_seen: partitionList.length,
-      active_audit_indexes: activeAuditIndexes.length,
-      connections_seen: connectionList.length,
-      collectors_seen: collectorList.length,
-      ingest_budgets_seen: budgets.length,
+      partitions_seen: whenReadable(partitions, partitionList.length),
+      active_audit_indexes: whenReadable(partitions, activeAuditIndexes.length),
+      connections_seen: whenReadable(connections, connectionList.length),
+      collectors_seen: whenReadable(collectors, collectorList.length),
+      ingest_budgets_seen: whenReadable(ingestBudgets, budgets.length),
       plan_type: planType ?? null,
       unreadable_surfaces: collectErrors(collections).length,
     },
@@ -1761,23 +1827,27 @@ export async function assessSumologicContentSharing(
   const sampleNote = unsampledChildren > 0 ? ` Only ${children.length} of ${allChildren.length} personal-folder items were sampled (content_sample=${sample}); ${unsampledChildren} were not evaluated.` : "";
   const sharingEvidence = {
     data_access_level_enabled: dataAccessPolicy.ok ? dataAccessPolicy.data?.enabled === true : null,
-    personal_folder_items_total: allChildren.length,
-    personal_folder_items_sampled: permissionResults.length,
-    personal_folder_items_unsampled: unsampledChildren,
+    personal_folder_readable: personalFolder.ok,
+    personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+    personal_folder_items_sampled: whenReadable(personalFolder, permissionResults.length),
+    personal_folder_items_unsampled: whenReadable(personalFolder, unsampledChildren),
     content_sample: sample,
-    org_shared_items: names(orgShared.map((entry) => entry.item)),
-    permission_lookups_failed: unreadablePermissions.length,
+    org_shared_items: whenReadable(personalFolder, names(orgShared.map((entry) => entry.item))),
+    permission_lookups_failed: whenReadable(personalFolder, unreadablePermissions.length),
   };
+  const sampledShareText = personalFolder.ok ? `${orgShared.length} sampled item(s) are shared org-wide` : "the personal folder could not be read, so no items were sampled";
   const personalFolderEvidence = "export the key owner's personal folder listing and /v2/content/{id}/permissions for each item to review org-wide shares.";
   const permissionLookupNote = unreadablePermissions.length > 0 ? ` ${unreadablePermissions.length} content permission lookup(s) failed (${unreadablePermissions.slice(0, 5).map((entry) => `${asString(entry.item.name) ?? asString(entry.item.id) ?? "item"}: ${entry.permissions.error ?? "unknown error"}`).join("; ")}), so those items were not checked.` : "";
   let sharingFinding: SumologicFinding;
   if (!dataAccessPolicy.ok) {
     sharingFinding = unreadable(11, "medium", "the data access level policy", dataAccessPolicy, "screenshot Administration > Security > Policies > Data Access Level and review Library sharing for org-wide shares.");
   } else if (dataAccessPolicy.data?.enabled !== true) {
-    sharingFinding = finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${orgShared.length} sampled item(s) are shared org-wide.${sampleNote}${permissionLookupNote}`, sharingEvidence);
+    sharingFinding = finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${sampledShareText}.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (orgShared.length > 0) {
     sharingFinding = finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.${sampleNote}${permissionLookupNote}`, sharingEvidence);
-  } else if (!personalFolder.ok || permissionResults.length === 0 || unreadablePermissions.length > 0) {
+  } else if (!personalFolder.ok) {
+    sharingFinding = finding(11, "medium", "manual", "The Data Access Level policy is enabled, but content permissions could not be sampled because the personal folder could not be read; review Library sharing for org-wide shares manually.", sharingEvidence);
+  } else if (permissionResults.length === 0 || unreadablePermissions.length > 0) {
     sharingFinding = finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (unsampledChildren > 0) {
     sharingFinding = finding(11, "medium", "warn", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide, but the population is incomplete.${sampleNote} Raise content_sample or review the remaining items in the Library before treating this control as satisfied.`, sharingEvidence);
@@ -1789,11 +1859,22 @@ export async function assessSumologicContentSharing(
   const monitorList = monitors.data ?? [];
   const monitorsWithRunAs = monitorList.filter((monitor) => asString(asObject(monitor.runAs)?.runAsId));
   const scheduledContent = children.filter((item) => item.isScheduled === true);
-  const scheduleEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, monitors_with_run_as: monitorsWithRunAs.length, scheduled_searches_in_sampled_folder: names(scheduledContent), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, monitors_readable: monitors.ok, personal_folder_readable: personalFolder.ok };
+  const scheduleEvidence = {
+    monitors_seen: whenReadable(monitors, monitorList.length),
+    monitors_complete: whenReadable(monitors, monitors.complete),
+    monitors_with_run_as: whenReadable(monitors, monitorsWithRunAs.length),
+    scheduled_searches_in_sampled_folder: whenReadable(personalFolder, names(scheduledContent)),
+    personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+    personal_folder_items_sampled: whenReadable(personalFolder, children.length),
+    monitors_readable: monitors.ok,
+    personal_folder_readable: personalFolder.ok,
+  };
   if (!monitors.ok && !personalFolder.ok) {
     findings.push(unreadable(15, "medium", "the monitor and content inventories", monitors, "list scheduled searches and monitors with their owners and runAs identities, and confirm none run under shared administrator accounts."));
   } else {
-    let scheduleFinding = finding(15, "medium", "manual", `Scheduled search role bindings are not exposed by the API: ${monitorList.length} monitor(s) seen (${monitorsWithRunAs.length} with an explicit runAs identity) and ${scheduledContent.length} scheduled search(es) in the sampled folder. A human must confirm each scheduled search and monitor runs under a scoped user, not a shared admin credential.${monitors.ok ? partialNote(monitors) : ""}`, scheduleEvidence);
+    const monitorText = monitors.ok ? `${monitorList.length} monitor(s) seen (${monitorsWithRunAs.length} with an explicit runAs identity)` : "the monitor list could not be read";
+    const scheduledText = personalFolder.ok ? `${scheduledContent.length} scheduled search(es) in the sampled folder` : "the personal folder could not be read so no scheduled searches were sampled";
+    let scheduleFinding = finding(15, "medium", "manual", `Scheduled search role bindings are not exposed by the API: ${monitorText} and ${scheduledText}. A human must confirm each scheduled search and monitor runs under a scoped user, not a shared admin credential.${partialNote(monitors)}`, scheduleEvidence);
     scheduleFinding = withUnreadableDowngrade(scheduleFinding, "monitor list", monitors, "export Alerts > Monitors with each monitor's runAs identity.", "manual");
     scheduleFinding = withUnreadableDowngrade(scheduleFinding, "personal folder", personalFolder, "list the scheduled searches in the key owner's folder with their owners.", "manual");
     findings.push(scheduleFinding);
@@ -1801,22 +1882,37 @@ export async function assessSumologicContentSharing(
 
   const lookupItems = children.filter((item) => /lookup/i.test(asString(item.itemType) ?? ""));
   const lookupOrgShared = orgShared.filter((entry) => /lookup/i.test(asString(entry.item.itemType) ?? ""));
-  const lookupEvidence = { lookup_tables_in_sampled_folder: names(lookupItems), lookup_tables_shared_org_wide: names(lookupOrgShared.map((entry) => entry.item)), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, personal_folder_readable: personalFolder.ok, permission_lookups_failed: unreadablePermissions.length };
+  const lookupEvidence = {
+    lookup_tables_in_sampled_folder: whenReadable(personalFolder, names(lookupItems)),
+    lookup_tables_shared_org_wide: whenReadable(personalFolder, names(lookupOrgShared.map((entry) => entry.item))),
+    personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+    personal_folder_items_sampled: whenReadable(personalFolder, children.length),
+    personal_folder_readable: personalFolder.ok,
+    permission_lookups_failed: whenReadable(personalFolder, unreadablePermissions.length),
+  };
   let lookupFinding: SumologicFinding;
   if (lookupOrgShared.length > 0) {
     lookupFinding = finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.${permissionLookupNote}`, lookupEvidence);
   } else {
-    lookupFinding = finding(18, "medium", "manual", `The API has no lookup table listing endpoint (only /v1/lookupTables/{id}); ${lookupItems.length} lookup table(s) were seen in the sampled folder. A human must inventory lookup tables in the Library, identify those with sensitive data, and export /v2/content/{id}/permissions for each.${permissionLookupNote}`, lookupEvidence);
+    const sampledText = personalFolder.ok ? `${lookupItems.length} lookup table(s) were seen in the sampled folder` : "the personal folder could not be read, so no lookup tables were sampled";
+    lookupFinding = finding(18, "medium", "manual", `The API has no lookup table listing endpoint (only /v1/lookupTables/{id}); ${sampledText}. A human must inventory lookup tables in the Library, identify those with sensitive data, and export /v2/content/{id}/permissions for each.${permissionLookupNote}`, lookupEvidence);
   }
   findings.push(withUnreadableDowngrade(lookupFinding, "personal folder", personalFolder, personalFolderEvidence, "manual"));
 
   const dashboardList = dashboards.data ?? [];
   const publicDashboards = dashboardList.filter((dashboard) => dashboard.isPublic === true);
-  const dashboardEvidence = { share_outside_org_enabled: sharePolicy.ok ? sharePolicy.data?.enabled === true : null, dashboards_seen: dashboardList.length, dashboards_complete: dashboards.complete, public_dashboards: names(publicDashboards, "title") };
+  const dashboardEvidence = {
+    share_outside_org_enabled: sharePolicy.ok ? sharePolicy.data?.enabled === true : null,
+    dashboards_readable: dashboards.ok,
+    dashboards_seen: whenReadable(dashboards, dashboardList.length),
+    dashboards_complete: whenReadable(dashboards, dashboards.complete),
+    public_dashboards: whenReadable(dashboards, names(publicDashboards, "title")),
+  };
   if (!sharePolicy.ok) {
     findings.push(unreadable(19, "medium", "the share-dashboards-outside-organization policy", sharePolicy, "screenshot Administration > Security > Policies > Share Dashboards Outside Organization and list externally shared dashboards."));
   } else if (sharePolicy.data?.enabled === true) {
-    findings.push(finding(19, "medium", "fail", `Sharing dashboards outside the organization is enabled; ${publicDashboards.length}/${dashboardList.length} seen dashboards are flagged public.`, dashboardEvidence));
+    const publicText = dashboards.ok ? `${publicDashboards.length}/${dashboardList.length} seen dashboards are flagged public` : `the dashboard list could not be read (${unreadableCause(dashboards)}), so per-dashboard exposure is unknown`;
+    findings.push(finding(19, "medium", "fail", `Sharing dashboards outside the organization is enabled; ${publicText}.`, dashboardEvidence));
   } else if (sharePolicy.data?.enabled !== false) {
     findings.push(finding(19, "medium", "manual", "The share-dashboards-outside-organization policy response did not include an enabled flag, so the external sharing state is unknown; confirm it in Administration > Security > Policies.", dashboardEvidence));
   } else if (!dashboards.ok) {
@@ -1858,10 +1954,12 @@ export async function assessSumologicContentSharing(
     notifications_seen: notificationCount,
     connection_notifications_seen: connectionNotificationCount,
     users_readable: users.ok,
+    users_seen: whenReadable(users, (users.data ?? []).length),
     connections_readable: connections.ok,
-    org_email_domains: [...orgDomains].slice(0, 25),
-    external_email_recipients: externalRecipients.slice(0, 25),
-    notifications_to_unknown_connections: unknownConnections.slice(0, 25),
+    connections_seen: whenReadable(connections, connectionIds.size),
+    org_email_domains: users.ok || orgDomains.size > 0 ? [...orgDomains].slice(0, 25) : null,
+    external_email_recipients: orgDomains.size > 0 ? externalRecipients.slice(0, 25) : null,
+    notifications_to_unknown_connections: whenReadable(connections, unknownConnections.slice(0, 25)),
     disabled_monitors: names(disabledMonitors),
   };
   if (!monitors.ok) {
@@ -1897,13 +1995,13 @@ export async function assessSumologicContentSharing(
     title: "Sumo Logic content sharing and alerting",
     area: "content-sharing",
     summary: {
-      personal_folder_items_total: allChildren.length,
-      personal_folder_items_sampled: permissionResults.length,
-      personal_folder_items_unsampled: unsampledChildren,
-      org_shared_items: orgShared.length,
-      dashboards_seen: dashboardList.length,
-      monitors_seen: monitorList.length,
-      external_email_recipients: externalRecipients.length,
+      personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+      personal_folder_items_sampled: whenReadable(personalFolder, permissionResults.length),
+      personal_folder_items_unsampled: whenReadable(personalFolder, unsampledChildren),
+      org_shared_items: whenReadable(personalFolder, orgShared.length),
+      dashboards_seen: whenReadable(dashboards, dashboardList.length),
+      monitors_seen: whenReadable(monitors, monitorList.length),
+      external_email_recipients: monitors.ok && orgDomains.size > 0 ? externalRecipients.length : null,
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -2179,7 +2277,7 @@ function createClient(args: AuthArgs): SumologicApiClient {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 const authParams = {

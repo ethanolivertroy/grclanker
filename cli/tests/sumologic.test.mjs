@@ -1018,6 +1018,79 @@ test("rule 9: the exported bundle, the zip, and the assess tool payloads never c
   assert.equal(byId(contentResult, "SUMO-20").status, "pass");
 });
 
+const ERROR_BODY_CANARIES = [
+  "CANARY_BEARER_HTML_1",
+  "CANARY_SESSION_HTML_1",
+  "CANARY_APIKEY_HTML_1",
+  "CANARY_URL_TOKEN_1",
+  "CANARY_HTML_200_1",
+  "CANARY_BEARER_JSON_2",
+  "CANARY_APIKEY_JSON_2",
+  "CANARY_SESSION_JSON_2",
+  "CANARY_JWT_HEADER.CANARY_JWT_PAYLOAD_PART.CANARY_JWT_SIGNATURE",
+];
+
+function errorBodyFetch() {
+  const html = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_HTML_1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_HTML_1; Path=/</p><p>api_key=CANARY_APIKEY_HTML_1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_1 later.</p></body></html>`;
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/api/v1/connections") {
+      return new Response(html, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    if (url.pathname === "/api/v1/roles") {
+      return jsonResponse({
+        errors: [{
+          code: "forbidden",
+          message: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_1 for this key, sent with Authorization: Bearer CANARY_BEARER_JSON_2, api_key=CANARY_APIKEY_JSON_2 (session_id: CANARY_SESSION_JSON_2) and eyJCANARY_JWT_HEADER.CANARY_JWT_PAYLOAD_PART.CANARY_JWT_SIGNATURE",
+        }],
+      }, { status: 403 });
+    }
+    if (url.pathname === "/api/v1/collectors") {
+      return new Response("<html><body>Sign in. session=CANARY_HTML_200_1</body></html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
+    }
+    if (url.pathname === "/api/v1/users") return jsonResponse({ data: healthyData().users });
+    return jsonResponse({ data: [] });
+  };
+}
+
+test("rule 9: error bodies and vendor messages are scrubbed at the record point, so a 502 HTML page or a URL with a token never reaches the bundle, the zip, the assess payloads, or the access check", async () => {
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: errorBodyFetch(), sleepImpl: async () => {}, maxRetries: 1 });
+
+  const connections = await client.listConnections();
+  assert.equal(connections.ok, false);
+  assert.equal(connections.httpStatus, 502);
+  assert.match(connections.error, /^Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/);
+  const roles = await client.listRoles();
+  assert.equal(roles.ok, false);
+  assert.match(roles.error, /failed \(403 forbidden\): Denied while fetching https:\/\/api\.example\.com\/v1\/x for this key, sent with Authorization: \[REDACTED\] \[REDACTED\], api_key=\[REDACTED\] \(session_id: \[REDACTED\]\) and \[REDACTED\]$/);
+  const collectors = await client.listCollectors();
+  assert.equal(collectors.ok, false, "a 200 with a non-JSON body is an unreadable surface, not an empty inventory");
+  assert.match(collectors.error, /returned an unreadable response \(200 OK: non-JSON body \(text\/html, \d+ bytes\)\)/);
+
+  const access = await checkSumologicAccess(client);
+  const connectionSurface = access.surfaces.find((surface) => surface.name === "connections");
+  assert.equal(connectionSurface.status, "not_readable");
+  assert.match(connectionSurface.error, /502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)]]), ERROR_BODY_CANARIES, "access check result");
+
+  const results = await allAssessments(client);
+  const payloads = new Map(results.map((result) => [result.area, JSON.stringify(result)]));
+  assertSecretsAbsent(assert, payloads, ERROR_BODY_CANARIES, "assess tool payload");
+  const governance = results[2];
+  assert.equal(byId(governance, "SUMO-10").status, "manual");
+  assert.match(byId(governance, "SUMO-10").summary, /non-JSON body \(text\/html, \d+ bytes\)/, "the finding carries the status-and-length note instead of the body");
+  assert.match(byId(results[1], "SUMO-06").evidence.endpoint_error, /https:\/\/api\.example\.com\/v1\/x for this key/, "the URL keeps scheme, host, and path so the error stays legible");
+
+  const base = createTempBase("grclanker-sumo-error-bodies-");
+  const exported = await exportSumologicAuditBundle(client, sampleConfig(), base, { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  assert.ok(files.has("_errors.log"));
+  assert.match(files.get("_errors.log"), /connections: Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+  assert.match(files.get("_errors.log"), /collectors: Sumo Logic request to \/v1\/collectors returned an unreadable response \(200 OK: non-JSON body/);
+  assertSecretsAbsent(assert, files, ERROR_BODY_CANARIES, "bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(exported.zipPath), ERROR_BODY_CANARIES, "zip archive");
+});
+
 test("rule 10: token pagination stops on a repeated cursor or an empty page with a next token and reports the inventory incomplete", async () => {
   let repeatedRequests = 0;
   let emptyRequests = 0;
@@ -1084,25 +1157,27 @@ test("rule 10: control 10 names each capped forwarding inventory and never passe
   assert.deepEqual(byId(allCapped, "SUMO-10").evidence.incomplete_inventories, ["connection list", "partition list", "scheduled view list"]);
 });
 
+// `unread` names the evidence fields derived from the denied inventory; each
+// must render null (never 0 or []) when that inventory returns 403.
 const MULTI_INVENTORY_FINDINGS = [
-  { id: "SUMO-02", area: "identity", secondary: "listSamlIdentityProviders", names: /the SAML identity provider list could not be read/ },
-  { id: "SUMO-05", area: "identity", secondary: "listUsers", names: /user list was unreadable/ },
-  { id: "SUMO-06", area: "access", secondary: "listUsers", names: /user list was unreadable/ },
-  { id: "SUMO-07", area: "access", secondary: "getPolicy:accessKeysLifetime", names: /lifetime policy was unreadable/ },
-  { id: "SUMO-13", area: "access", secondary: "listServiceAllowlistAddresses", names: /CIDR list was unreadable/ },
-  { id: "SUMO-14", area: "access", secondary: "getPolicy:userConcurrentSessionsLimit", names: /the concurrent sessions limit policy could not be read/ },
-  { id: "SUMO-09", area: "governance", secondary: "listPartitions", names: /partition list was unreadable/ },
-  { id: "SUMO-09", area: "governance", secondary: "getPolicy:searchAudit", names: /the search audit policy could not be read/ },
-  { id: "SUMO-10", area: "governance", secondary: "listPartitions", names: /the partition list could not be read/, options: { approvedDestinationDomains: ["example.com"] } },
-  { id: "SUMO-10", area: "governance", secondary: "listScheduledViews", names: /the scheduled view list could not be read/, options: { approvedDestinationDomains: ["example.com"] } },
-  { id: "SUMO-11", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/ },
-  { id: "SUMO-11", area: "content", secondary: "getContentPermissions", names: /1 content permission lookup\(s\) failed/ },
-  { id: "SUMO-15", area: "content", secondary: "listMonitors", names: /the monitor list could not be read/, baseline: "manual" },
-  { id: "SUMO-15", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual" },
-  { id: "SUMO-18", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual" },
-  { id: "SUMO-19", area: "content", secondary: "listDashboards", names: /dashboard list was unreadable/ },
-  { id: "SUMO-20", area: "content", secondary: "listUsers", names: /the user list could not be read/, options: { approvedEmailDomains: ["example.com"] } },
-  { id: "SUMO-20", area: "content", secondary: "listConnections", names: /the connection list could not be read/, options: { approvedEmailDomains: ["example.com"] } },
+  { id: "SUMO-02", area: "identity", secondary: "listSamlIdentityProviders", names: /the SAML identity provider list could not be read/, unread: ["identity_providers"] },
+  { id: "SUMO-05", area: "identity", secondary: "listUsers", names: /user list was unreadable/, unread: ["users_seen", "active_users", "active_users_without_mfa", "locked_users", "dormant_active_users"] },
+  { id: "SUMO-06", area: "access", secondary: "listUsers", names: /user list was unreadable/, unread: ["admin_members_seen_in_user_list", "dormant_admin_members", "locked_users"] },
+  { id: "SUMO-07", area: "access", secondary: "getPolicy:accessKeysLifetime", names: /lifetime policy was unreadable/, unread: ["access_keys_lifetime_policy_days"] },
+  { id: "SUMO-13", area: "access", secondary: "listServiceAllowlistAddresses", names: /CIDR list was unreadable/, unread: ["addresses_seen", "cidrs"] },
+  { id: "SUMO-14", area: "access", secondary: "getPolicy:userConcurrentSessionsLimit", names: /the concurrent sessions limit policy could not be read/, unread: ["concurrent_sessions_limit_enabled", "max_concurrent_sessions"] },
+  { id: "SUMO-09", area: "governance", secondary: "listPartitions", names: /partition list was unreadable/, unread: ["partitions_seen", "active_audit_index_partitions", "audit_index_partitions"] },
+  { id: "SUMO-09", area: "governance", secondary: "getPolicy:searchAudit", names: /the search audit policy could not be read/, unread: ["search_audit_enabled"] },
+  { id: "SUMO-10", area: "governance", secondary: "listPartitions", names: /the partition list could not be read/, options: { approvedDestinationDomains: ["example.com"] }, unread: ["partitions_seen", "partitions_forwarding"] },
+  { id: "SUMO-10", area: "governance", secondary: "listScheduledViews", names: /the scheduled view list could not be read/, options: { approvedDestinationDomains: ["example.com"] }, unread: ["scheduled_views_seen", "scheduled_views_forwarding"] },
+  { id: "SUMO-11", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, unread: ["personal_folder_items_total", "personal_folder_items_sampled", "org_shared_items"] },
+  { id: "SUMO-11", area: "content", secondary: "getContentPermissions", names: /1 content permission lookup\(s\) failed/, recorded: { permission_lookups_failed: 1 } },
+  { id: "SUMO-15", area: "content", secondary: "listMonitors", names: /the monitor list could not be read/, baseline: "manual", unread: ["monitors_seen", "monitors_with_run_as"] },
+  { id: "SUMO-15", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual", unread: ["personal_folder_items_total", "scheduled_searches_in_sampled_folder"] },
+  { id: "SUMO-18", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual", unread: ["personal_folder_items_total", "lookup_tables_in_sampled_folder"] },
+  { id: "SUMO-19", area: "content", secondary: "listDashboards", names: /dashboard list was unreadable/, unread: ["dashboards_seen", "public_dashboards"] },
+  { id: "SUMO-20", area: "content", secondary: "listUsers", names: /the user list could not be read/, options: { approvedEmailDomains: ["example.com"] }, unread: ["users_seen"] },
+  { id: "SUMO-20", area: "content", secondary: "listConnections", names: /the connection list could not be read/, options: { approvedEmailDomains: ["example.com"] }, unread: ["connections_seen", "notifications_to_unknown_connections"] },
 ];
 
 async function assessArea(area, reader, options) {
@@ -1138,6 +1213,14 @@ test("rule 1 corollary: every multi-inventory finding drops below pass and names
     assert.notEqual(item.status, "pass", `${label}: must not pass (got ${item.status}: ${item.summary})`);
     assert.match(item.summary, scenario.names, `${label}: summary names the unreadable inventory`);
     assert.match(item.summary, /403|unreadable|could not be read|failed/, `${label}: summary states the cause`);
+    for (const field of scenario.unread ?? []) {
+      assert.ok(field in item.evidence, `${label}: evidence carries ${field}`);
+      assert.equal(item.evidence[field], null, `${label}: ${field} renders null for the unreadable inventory, not ${JSON.stringify(item.evidence[field])}`);
+    }
+    for (const [field, value] of Object.entries(scenario.recorded ?? {})) {
+      assert.equal(item.evidence[field], value, `${label}: ${field} records the failed lookup`);
+    }
+    assert.doesNotMatch(item.summary, /\b0\/0\b|\b0 (?:monitor|dashboard|user|partition|item)s? (?:seen|were seen|returned)/, `${label}: summary does not render a zero count for the unreadable inventory`);
   }
 
   // Spot checks on the verdict each fix settles on.
@@ -1162,6 +1245,30 @@ test("rule 1 corollary: every multi-inventory finding drops below pass and names
   assert.equal(byId(noConcurrent, "SUMO-14").status, "warn");
   assert.doesNotMatch(byId(noConcurrent, "SUMO-14").summary, /policy is not enabled/);
   assert.equal(byId(noConcurrent, "SUMO-14").evidence.concurrent_sessions_limit_enabled, null);
+
+  // Uniform null rendering reaches the assessment summaries too.
+  const noUsersIdentity = await assessSumologicIdentity(readerFrom(healthyData(), { listUsers: async () => forbidden() }), { now: NOW });
+  assert.equal(noUsersIdentity.summary.users_seen, null);
+  assert.equal(noUsersIdentity.summary.active_users_without_mfa, null);
+  assert.equal(noUsersIdentity.summary.identity_providers, 1);
+  const noMfaPolicyUsers = healthyData();
+  noMfaPolicyUsers.passwordPolicy.requireMfa = false;
+  const failNoUsers = await assessSumologicIdentity(readerFrom(noMfaPolicyUsers, { listUsers: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(failNoUsers, "SUMO-05").status, "fail");
+  assert.match(byId(failNoUsers, "SUMO-05").summary, /per-user MFA status is unknown because the user list could not be read/);
+  assert.doesNotMatch(byId(failNoUsers, "SUMO-05").summary, /0\/0/);
+  const noPartitions = await assessSumologicDataGovernance(readerFrom(healthyData(), { listPartitions: async () => forbidden() }), { now: NOW });
+  assert.equal(noPartitions.summary.partitions_seen, null);
+  assert.equal(noPartitions.summary.active_audit_indexes, null);
+  assert.equal(noPartitions.summary.collectors_seen, 2);
+  const noFolder = await assessSumologicContentSharing(readerFrom(healthyData(), { getPersonalFolder: async () => forbidden(), listDashboards: async () => forbidden() }), { now: NOW });
+  assert.equal(noFolder.summary.personal_folder_items_total, null);
+  assert.equal(noFolder.summary.org_shared_items, null);
+  assert.equal(noFolder.summary.dashboards_seen, null);
+  assert.match(byId(noFolder, "SUMO-15").summary, /the personal folder could not be read so no scheduled searches were sampled/);
+  const noKeys = await assessSumologicAccessControl(readerFrom(healthyData(), { listAccessKeys: async () => forbidden() }), { now: NOW });
+  assert.equal(noKeys.summary.access_keys_seen, null);
+  assert.equal(noKeys.summary.access_key_scope, null);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
