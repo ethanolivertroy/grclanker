@@ -251,8 +251,14 @@ export interface ZoomSettingsBundle {
 export interface ZoomGroupPolicy {
   id: string;
   name: string;
+  /** Base GET /groups/{id}/settings merged with the option=meeting_security view; status mirrors the base read. */
   settings: ZoomSurface<JsonRecord>;
+  /** Base GET /groups/{id}/lock_settings merged with the option=meeting_security view; status mirrors the base read. */
   locks: ZoomSurface<JsonRecord>;
+  /** Every settings view read for the group (base, option=meeting_security), kept so a denied view demotes and is disclosed. */
+  settingsSurfaces: ZoomSurface<JsonRecord>[];
+  /** Every lock view read for the group (base, option=meeting_security), kept for disclosure. */
+  lockSurfaces: ZoomSurface<JsonRecord>[];
 }
 
 export interface ZoomSnapshot {
@@ -1184,6 +1190,8 @@ function sanitizeSnapshot(snapshot: ZoomSnapshot, secrets: string[]): ZoomSnapsh
       name: scrubSecretText(policy.name, secrets),
       settings: sanitizeSurface(policy.settings, secrets),
       locks: sanitizeSurface(policy.locks, secrets),
+      settingsSurfaces: policy.settingsSurfaces.map((surface) => sanitizeSurface(surface, secrets)),
+      lockSurfaces: policy.lockSurfaces.map((surface) => sanitizeSurface(surface, secrets)),
     })),
     imGroups: sanitizeSurface(snapshot.imGroups, secrets),
     managedDomains: sanitizeSurface(snapshot.managedDomains, secrets),
@@ -1225,8 +1233,20 @@ async function collectGroupPolicies(
     const lockSurface: ZoomSurface<JsonRecord> = locks.status === "ok"
       ? { ...locks, data: mergeSurfaces([locks, lockMeetingSecurity]) }
       : locks;
-    return { id, name, settings: settingsSurface, locks: lockSurface };
+    return {
+      id,
+      name,
+      settings: settingsSurface,
+      locks: lockSurface,
+      settingsSurfaces: [settings, meetingSecurity],
+      lockSurfaces: [locks, lockMeetingSecurity],
+    };
   }));
+}
+
+/** Every raw surface read for the sampled groups (base and option views), for demotion and error disclosure. */
+function groupPolicySurfaces(snapshot: ZoomSnapshot): ZoomSurface<JsonRecord>[] {
+  return snapshot.groupPolicies.flatMap((policy) => [...policy.settingsSurfaces, ...policy.lockSurfaces]);
 }
 
 function isAdminRole(role: JsonRecord): boolean {
@@ -1320,7 +1340,7 @@ function snapshotSurfaces(snapshot: ZoomSnapshot): ZoomSurface[] {
     snapshot.roles,
     ...Object.values(snapshot.roleMembers),
     snapshot.groups,
-    ...snapshot.groupPolicies.flatMap((policy) => [policy.settings, policy.locks]),
+    ...groupPolicySurfaces(snapshot),
     snapshot.imGroups,
     snapshot.managedDomains,
     snapshot.trustedDomains,
@@ -1383,10 +1403,25 @@ function manualForAbsentKey(path: string, docUrl: string, evidenceToCollect: str
   return `Manual: ${path} was not present in the account settings response (documented at ${docUrl}); an absent key is unknown, not compliant. Confirm ${evidenceToCollect} in the Zoom admin portal.`;
 }
 
-function lockNote(locked: boolean | undefined, path: string): string {
+function lockNote(locked: boolean | undefined, path: string, bundle: ZoomSettingsBundle): string {
   if (locked === true) return `${path} is locked at account level.`;
   if (locked === false) return `${path} is enabled but not locked, so groups and users may change it.`;
-  return `${path} lock state was not visible in lock_settings.`;
+  return `${path} lock state was not visible: ${lockVisibilityCause(bundle)}.`;
+}
+
+/** Names the unreadable lock_settings view when a lock value is missing, or the documented response when every view was readable. */
+function lockVisibilityCause(bundle: ZoomSettingsBundle): string {
+  const unreadable = bundle.lockSurfaces.filter((surface) => surface.status !== "ok");
+  return unreadable.length > 0
+    ? unreadable.map(surfaceCause).join("; ")
+    : "lock_settings was readable but carried no value for this key";
+}
+
+/** Lock text for verdicts that require two locks at once. */
+function pairedLockNote(locks: Array<boolean | undefined>, label: string, bundle: ZoomSettingsBundle): string {
+  if (locks.every((lock) => lock === true)) return `${label} are locked at account level.`;
+  if (locks.some((lock) => lock === undefined)) return `${label} lock state was not fully visible: ${lockVisibilityCause(bundle)}.`;
+  return `${label} are not both locked in lock_settings, so groups may relax them.`;
 }
 
 function loginTypeCodes(user: JsonRecord): number[] | undefined {
@@ -1515,10 +1550,19 @@ export function assessZoomIdentityFromSnapshot(
   const roles = listSurfaceState(snapshot.roles);
   const roleRecords = toRecords(roles.items);
   const adminRoles = roleRecords.filter(isAdminRole);
+  const rolesUnreadable = snapshot.roles.status !== "ok";
+  // The admin role inventory is evidence for every 2FA mode, so an unreadable
+  // GET /roles is named here instead of rendering as an empty admin_roles list.
   const twoFactorEvidence = {
     sign_in_with_two_factor_auth: twoFactor.value ?? null,
     sign_in_with_two_factor_auth_roles: twoFactorRoles,
-    admin_roles: adminRoles.map((role) => ({ id: asString(role.id) ?? null, name: asString(role.name) ?? null })),
+    ...(rolesUnreadable
+      ? { roles_status: snapshot.roles.status, roles_cause: `GET ${surfaceCause(snapshot.roles)}` }
+      : {
+        admin_roles: adminRoles.map((role) => ({ id: asString(role.id) ?? null, name: asString(role.name) ?? null })),
+        roles_truncated: roles.truncated,
+        roles_total_records: roles.total ?? null,
+      }),
   };
   if (securitySurface) {
     findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", manualForSurface(securitySurface, "the Security > Sign in with Two-Factor Authentication setting"), twoFactorEvidence));
@@ -1527,9 +1571,23 @@ export function assessZoomIdentityFromSnapshot(
   } else {
     const mode = asString(twoFactor.value);
     switch (mode) {
-      case "all":
-        findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "pass", "security.sign_in_with_two_factor_auth is `all`: two-factor authentication is required for every user, including admins.", twoFactorEvidence));
+      case "all": {
+        const allSummary = "security.sign_in_with_two_factor_auth is `all`: two-factor authentication is required for every user, including admins.";
+        findings.push(finding(
+          "ZOOM-ID-02",
+          "Two-factor authentication for admins",
+          "critical",
+          [6],
+          rolesUnreadable || roles.truncated ? "warn" : "pass",
+          rolesUnreadable
+            ? `${allSummary} The admin role inventory (GET /roles) that evidences which roles this covers was unreadable: GET ${surfaceCause(snapshot.roles)}. Confirm the admin roles manually.`
+            : roles.truncated
+              ? `${allSummary} ${partialNote(roleRecords.length, roles.total, false)} The admin role inventory in evidence is incomplete.`
+              : `${allSummary} ${adminRoles.length} admin or owner roles were inventoried from GET /roles (total_records matches).`,
+          twoFactorEvidence,
+        ));
         break;
+      }
       case "role": {
         if (snapshot.roles.status !== "ok") {
           findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", `security.sign_in_with_two_factor_auth is \`role\`, but ${surfaceCause(snapshot.roles)}, so admin role coverage cannot be confirmed. Compare the 2FA role list with the admin roles manually.`, twoFactorEvidence));
@@ -1548,7 +1606,7 @@ export function assessZoomIdentityFromSnapshot(
               : roles.truncated
                 ? `${partialNote(roleRecords.length, roles.total, false)} The ${adminRoles.length} admin or owner roles seen appear in sign_in_with_two_factor_auth_roles, but unseen roles were not judged.`
                 : `security.sign_in_with_two_factor_auth is \`role\` and all ${adminRoles.length} admin or owner roles appear in sign_in_with_two_factor_auth_roles (total_records matches).`,
-            { ...twoFactorEvidence, uncovered_admin_roles: uncovered.map((role) => asString(role.name) ?? asString(role.id) ?? "role"), roles_truncated: roles.truncated, roles_total_records: roles.total ?? null },
+            { ...twoFactorEvidence, uncovered_admin_roles: uncovered.map((role) => asString(role.name) ?? asString(role.id) ?? "role") },
           ));
         }
         break;
@@ -1644,7 +1702,7 @@ export function assessZoomIdentityFromSnapshot(
       : adminRoles.length === 0
         ? "Manual: GET /roles returned no role whose name contains admin or owner; every Zoom account has an Owner role, so the view is incomplete."
         : memberDenied
-          ? "Manual: at least one admin role member list (GET /roles/{roleId}/members) was denied or failed; admin count cannot be confirmed."
+          ? `Manual: admin role member lists (GET /roles/{roleId}/members) were unreadable, so the admin count cannot be confirmed: ${surfaceErrors(adminMemberSurfaces).join("; ")}. Collect the admin role membership from the Zoom admin portal.`
           : memberTruncated
             ? `Partial inventory: admin role member pagination stopped at the configured limit; ${adminIds.size} distinct admins were seen of ${declaredTotals > 0 ? `${declaredTotals} declared` : "an unknown total"}.`
             : roles.truncated
@@ -1816,7 +1874,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
         ? manualForAbsentKey(fileTransfer.path, ZOOM_DOCS.accountSettings, "the in-meeting file transfer setting")
         : fileTransfer.value === true
           ? "in_meeting.file_transfer is true: participants can send files through meeting chat."
-          : `in_meeting.file_transfer is false. ${lockNote(fileTransferLocked, "in_meeting.file_transfer")} ${fileTransferGroups.note}`.trim(),
+          : `in_meeting.file_transfer is false. ${lockNote(fileTransferLocked, "in_meeting.file_transfer", bundle)} ${fileTransferGroups.note}`.trim(),
     { file_transfer: fileTransfer.value ?? null, file_transfer_locked: fileTransferLocked ?? null, chat_share_files: readSetting(bundle, "chat.share_files").value ?? null, ...fileTransferGroups.evidence },
   ));
 
@@ -1866,7 +1924,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
               ? "recording.auto_delete_cmr is true but recording.auto_delete_cmr_days was not returned, so the retention period is unknown."
               : retentionDays > maxRetention
                 ? `Cloud recordings auto-delete after ${retentionDays} days, above the ${maxRetention}-day policy threshold.`
-                : `Cloud recordings auto-delete after ${retentionDays} days (documented values 30, 60, 90, 120), within the ${maxRetention}-day threshold. ${lockNote(autoDeleteLocked, "recording.auto_delete_cmr")} ${retentionGroups.note}`.trim(),
+                : `Cloud recordings auto-delete after ${retentionDays} days (documented values 30, 60, 90, 120), within the ${maxRetention}-day threshold. ${lockNote(autoDeleteLocked, "recording.auto_delete_cmr", bundle)} ${retentionGroups.note}`.trim(),
     retentionEvidence,
   ));
 
@@ -2032,7 +2090,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
         : addRestricted === undefined || chatRestricted === undefined
           ? "Manual: the chat contact policies were returned without their enable flag or selected_option, so the restriction cannot be judged."
           : addRestricted && chatRestricted
-            ? `Users cannot add or chat with anyone outside the organization: allow_users_to_add_contacts and allow_users_to_chat_with_others are disabled or scoped to the organization (selected_option 2, 3, or 4). ${contactsLocked ? "Both settings are locked at account level." : "At least one of the two settings is not locked in lock_settings, so groups may relax it."} ${contactsGroups.note}`.trim()
+            ? `Users cannot add or chat with anyone outside the organization: allow_users_to_add_contacts and allow_users_to_chat_with_others are disabled or scoped to the organization (selected_option 2, 3, or 4). ${pairedLockNote([addLocked, chatLocked], "Both contact settings", bundle)} ${contactsGroups.note}`.trim()
             : "allow_users_to_add_contacts or allow_users_to_chat_with_others is enabled with selected_option 1 (anyone, internal and external).",
     { ...contactEvidence, allow_users_to_add_contacts_locked: addLocked ?? null, allow_users_to_chat_with_others_locked: chatLocked ?? null, ...contactsGroups.evidence },
   ));
@@ -2063,7 +2121,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
       shared_im_groups: sharedGroups.length,
     },
     findings,
-    errors: surfaceErrors([...bundle.settingsSurfaces, ...bundle.lockSurfaces, snapshot.trustedDomains, snapshot.imGroups, snapshot.operationLogs, snapshot.phoneSettings]),
+    errors: surfaceErrors([...bundle.settingsSurfaces, ...bundle.lockSurfaces, snapshot.groups, ...groupPolicySurfaces(snapshot), snapshot.trustedDomains, snapshot.imGroups, snapshot.operationLogs, snapshot.phoneSettings]),
   };
 }
 
@@ -2078,8 +2136,25 @@ function groupsRelaxing(snapshot: ZoomSnapshot, path: string, compliantValue: un
     .map((policy) => policy.name);
 }
 
-function groupsUnreadable(snapshot: ZoomSnapshot): string[] {
-  return snapshot.groupPolicies.filter((policy) => policy.settings.status !== "ok").map((policy) => policy.name);
+/**
+ * Groups whose settings could not be fully read: the base
+ * GET /groups/{id}/settings or the option=meeting_security view, which is the
+ * documented per-group source for the meeting_security keys. A denied view
+ * leaves its keys undefined in the merged data, so it must demote here rather
+ * than look compliant. policy.lockSurfaces are retained and disclosed in the
+ * errors arrays but intentionally not inspected here because no verdict reads
+ * group lock state yet.
+ */
+function groupsUnreadable(snapshot: ZoomSnapshot): { group: string; surface: ZoomSurface<JsonRecord> }[] {
+  return snapshot.groupPolicies.flatMap((policy) =>
+    policy.settingsSurfaces
+      .filter((surface) => surface.status !== "ok")
+      .map((surface) => ({ group: policy.name, surface })),
+  );
+}
+
+function unreadableGroupLabel(entry: { group: string; surface: ZoomSurface<JsonRecord> }): string {
+  return `${entry.group}: ${surfaceCause(entry.surface)}`;
 }
 
 function booleanControl(
@@ -2115,7 +2190,7 @@ function booleanControl(
     return finding(id, title, severity, controls, "fail", `${path} is ${String(setting.value)}: ${labels.nonCompliant}`, evidence);
   }
   const status: ZoomFindingStatus = locked === true && !groups.demote ? "pass" : "warn";
-  const summary = [`${path} is ${String(compliantValue)}: ${labels.compliant}`, lockNote(locked, path), groups.note].filter(Boolean).join(" ");
+  const summary = [`${path} is ${String(compliantValue)}: ${labels.compliant}`, lockNote(locked, path, bundle), groups.note].filter(Boolean).join(" ");
   return finding(id, title, severity, controls, status, summary, evidence);
 }
 
@@ -2136,7 +2211,9 @@ function groupOverrideState(snapshot: ZoomSnapshot, relaxed: string[]): { demote
   const notes = [
     relaxed.length > 0 ? `${relaxed.length} sampled groups override it: ${relaxed.slice(0, 5).join(", ")}.` : "",
     listUnreadable ? `Group overrides could not be checked: ${surfaceCause(snapshot.groups)}.` : "",
-    unreadable.length > 0 ? `${unreadable.length} group settings surfaces were unreadable, so group overrides are unproven.` : "",
+    unreadable.length > 0
+      ? `${unreadable.length} group settings surfaces were unreadable, so group overrides are unproven: ${unreadable.slice(0, 5).map(unreadableGroupLabel).join("; ")}.`
+      : "",
     truncated ? groupTruncationNote(snapshot) : "",
   ].filter(Boolean);
   return {
@@ -2145,7 +2222,7 @@ function groupOverrideState(snapshot: ZoomSnapshot, relaxed: string[]): { demote
     evidence: {
       groups_list_status: snapshot.groups.status,
       groups_relaxing: relaxed.slice(0, 25),
-      groups_unreadable: unreadable.slice(0, 25),
+      groups_unreadable: unreadable.slice(0, 25).map(unreadableGroupLabel),
       groups_truncated: truncated,
     },
   };
@@ -2235,11 +2312,11 @@ export function assessZoomMeetingSecurityFromSnapshot(
       : !screenSharing.present
         ? manualForAbsentKey(screenSharing.path, ZOOM_DOCS.accountSettings, "the screen sharing setting")
         : screenSharing.value === false
-          ? `in_meeting.screen_sharing is false: screen sharing is disabled entirely. ${lockNote(sharingLocked, "in_meeting.screen_sharing")} ${shareGroups.note}`.trim()
+          ? `in_meeting.screen_sharing is false: screen sharing is disabled entirely. ${lockNote(sharingLocked, "in_meeting.screen_sharing", bundle)} ${shareGroups.note}`.trim()
           : !whoCanShare.present
             ? manualForAbsentKey(whoCanShare.path, ZOOM_DOCS.accountSettings, "who can share screen")
             : asString(whoCanShare.value) === "host"
-              ? `in_meeting.who_can_share_screen is \`host\`: only hosts can share. ${lockNote(sharingLocked, "in_meeting.screen_sharing")} ${shareGroups.note}`.trim()
+              ? `in_meeting.who_can_share_screen is \`host\`: only hosts can share. ${lockNote(sharingLocked, "in_meeting.screen_sharing", bundle)} ${shareGroups.note}`.trim()
               : asString(whoCanShare.value) === "all"
                 ? "in_meeting.who_can_share_screen is `all`: hosts and attendees can share their screen."
                 : `in_meeting.who_can_share_screen returned an undocumented value (${String(whoCanShare.value)}); documented values are host and all.`,
@@ -2291,7 +2368,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
         : e2ee.value !== true
           ? "meeting_security.end_to_end_encrypted_meetings is false: end-to-end encryption is not available to hosts."
           : asString(encryptionType.value) === "e2ee"
-            ? `End-to-end encryption is enabled and meeting_security.encryption_type is \`e2ee\` (the default for new meetings). ${lockNote(e2eeLocked, e2ee.path)} ${e2eeGroups.note}`.trim()
+            ? `End-to-end encryption is enabled and meeting_security.encryption_type is \`e2ee\` (the default for new meetings). ${lockNote(e2eeLocked, e2ee.path, bundle)} ${e2eeGroups.note}`.trim()
             : `End-to-end encryption is enabled but meeting_security.encryption_type is ${encryptionType.present ? `\`${String(encryptionType.value)}\`` : "not returned"}, so E2EE is available but not the default.`,
     { end_to_end_encrypted_meetings: e2ee.value ?? null, encryption_type: encryptionType.value ?? null, locked: e2eeLocked ?? null, ...e2eeGroups.evidence },
   ));
@@ -2358,7 +2435,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
             personalMeeting.value === false
               ? "schedule_meeting.personal_meeting is false: Personal Meeting IDs are disabled for the account."
               : "PMI is not used for scheduled or instant meetings (use_pmi_for_scheduled_meetings and use_pmi_for_instant_meetings are false).",
-            pmiLocked ? "Both PMI settings are locked at account level." : "The PMI settings are not both locked in lock_settings, so groups may re-enable PMI.",
+            pairedLockNote([pmiScheduledLocked, pmiInstantLocked], "Both PMI settings", bundle),
             pmiGroups.note,
           ].filter(Boolean).join(" "),
     pmiEvidence,
@@ -2412,7 +2489,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
           ? "in_meeting.custom_data_center_regions is false: meeting traffic may route through any Zoom data center region."
           : regionList.length === 0
             ? "in_meeting.custom_data_center_regions is true but in_meeting.data_center_regions is empty or absent, so the allowed regions are unknown."
-            : [`Custom data center regions are enabled and limited to: ${regionList.join(", ")}.`, lockNote(regionsLocked, "in_meeting.custom_data_center_regions"), regionGroups.note].filter(Boolean).join(" "),
+            : [`Custom data center regions are enabled and limited to: ${regionList.join(", ")}.`, lockNote(regionsLocked, "in_meeting.custom_data_center_regions", bundle), regionGroups.note].filter(Boolean).join(" "),
     { custom_data_center_regions: customRegions.value ?? null, data_center_regions: regionList, locked: regionsLocked ?? null, ...regionGroups.evidence },
   ));
 
@@ -2456,7 +2533,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
       groups_unreadable: groupsUnreadable(snapshot).length,
     },
     findings,
-    errors: surfaceErrors([...bundle.settingsSurfaces, ...bundle.lockSurfaces, snapshot.groups, ...snapshot.groupPolicies.flatMap((policy) => [policy.settings, policy.locks])]),
+    errors: surfaceErrors([...bundle.settingsSurfaces, ...bundle.lockSurfaces, snapshot.groups, ...groupPolicySurfaces(snapshot)]),
   };
 }
 
@@ -2804,6 +2881,8 @@ export async function exportZoomAuditBundle(
       name: policy.name,
       settings: projectedSettingsSurface(policy.settings, readPaths),
       lock_settings: projectedSettingsSurface(policy.locks, lockPaths),
+      settings_views: policy.settingsSurfaces.map(describeSurface),
+      lock_views: policy.lockSurfaces.map(describeSurface),
     })),
   }));
   await write("core_data/im_groups.json", serializeJson(projectedListSurface(snapshot.imGroups, BUNDLE_RECORD_FIELDS.im_groups)));
@@ -2857,8 +2936,14 @@ async function checkZoomAccessFromSnapshot(snapshot: ZoomSnapshot, config: ZoomR
     listRoles: async () => unwrap(snapshot.roles),
     listRoleMembers: async (roleId: string) => unwrap(snapshot.roleMembers[roleId] ?? skippedSurface("role_members", `/roles/${roleId}/members`, ZOOM_DOCS.roleMembers)),
     listGroups: async () => unwrap(snapshot.groups),
-    getGroupSettings: async (groupId: string) => unwrap(snapshot.groupPolicies.find((policy) => policy.id === groupId)?.settings ?? skippedSurface("group_settings", `/groups/${groupId}/settings`, ZOOM_DOCS.groupSettings)),
-    getGroupLockSettings: async (groupId: string) => unwrap(snapshot.groupPolicies.find((policy) => policy.id === groupId)?.locks ?? skippedSurface("group_lock_settings", `/groups/${groupId}/lock_settings`, ZOOM_DOCS.groupLockSettings)),
+    getGroupSettings: async (groupId: string, option?: string) => unwrap(
+      snapshot.groupPolicies.find((policy) => policy.id === groupId)?.settingsSurfaces.find((surface) => surface.name === `group_settings:${groupId}${option ? `:${option}` : ""}`)
+        ?? skippedSurface("group_settings", `/groups/${groupId}/settings`, ZOOM_DOCS.groupSettings),
+    ),
+    getGroupLockSettings: async (groupId: string, option?: string) => unwrap(
+      snapshot.groupPolicies.find((policy) => policy.id === groupId)?.lockSurfaces.find((surface) => surface.name === `group_lock_settings:${groupId}${option ? `:${option}` : ""}`)
+        ?? skippedSurface("group_lock_settings", `/groups/${groupId}/lock_settings`, ZOOM_DOCS.groupLockSettings),
+    ),
     listOperationLogs: async () => unwrap(snapshot.operationLogs),
     listImGroups: async () => unwrap(snapshot.imGroups),
     getManagedDomains: async () => unwrap(snapshot.managedDomains),

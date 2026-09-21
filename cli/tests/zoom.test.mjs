@@ -729,7 +729,7 @@ test("verdict safety: a compliant setting that is not locked is warn, and a grou
   const result = await assessZoomMeetingSecurity(client, { now: NOW });
   const password = findingById(result, "ZOOM-MTG-01");
   assert.equal(password.status, "warn");
-  assert.match(password.summary, /not visible in lock_settings/);
+  assert.match(password.summary, /lock state was not visible: lock_settings was readable but carried no value for this key/);
   const local = findingById(result, "ZOOM-MTG-04");
   assert.equal(local.status, "warn");
   assert.match(local.summary, /1 sampled groups override it: Finance/);
@@ -1309,7 +1309,7 @@ test("review fix 4: every group-dependent verdict demotes on a truncated, denied
     {
       name: "every sampled group settings surface denied",
       overrides: { async getGroupSettings() { throw new ZoomApiError("Zoom request failed (403 Forbidden): Invalid access token, does not contain scopes", 403); } },
-      pattern: /1 group settings surfaces were unreadable, so group overrides are unproven/,
+      pattern: /2 group settings surfaces were unreadable, so group overrides are unproven: Finance: \/groups\/group-1\/settings was denied \(403.*Finance: \/groups\/group-1\/settings\?option=meeting_security was denied \(403/,
     },
     {
       name: "GET /groups denied",
@@ -1376,4 +1376,152 @@ test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without 
   assert.equal(access.surfaces.some((surface) => surface.name.includes("recording_authentication")), false, "recording_authentication is documented but not read by any verdict, so it is not probed");
   const lockViews = access.surfaces.filter((surface) => surface.name.startsWith("account_lock_settings:")).map((surface) => surface.name);
   assert.deepEqual(lockViews, ["account_lock_settings:meeting_security"]);
+});
+
+const GROUP_DEPENDENT_IDS = ["ZOOM-COLLAB-02", "ZOOM-COLLAB-03", "ZOOM-COLLAB-07", "ZOOM-MTG-01", "ZOOM-MTG-02", "ZOOM-MTG-03", "ZOOM-MTG-04", "ZOOM-MTG-05", "ZOOM-MTG-06", "ZOOM-MTG-07", "ZOOM-MTG-08", "ZOOM-MTG-09", "ZOOM-MTG-10"];
+
+function denyScoped() {
+  throw new ZoomApiError("Zoom request failed (403 Forbidden): Invalid access token, does not contain scopes", 403);
+}
+
+async function assessEverything(client) {
+  const snapshot = await collectZoomSnapshot(client, { now: NOW });
+  const identity = await assessZoomIdentity(client, { now: NOW });
+  const collaboration = assessZoomCollaborationGovernanceFromSnapshot(snapshot, { now: NOW });
+  const meeting = assessZoomMeetingSecurityFromSnapshot(snapshot);
+  return {
+    snapshot,
+    identity,
+    collaboration,
+    meeting,
+    findings: [...identity.findings, ...collaboration.findings, ...meeting.findings],
+    errors: [...identity.errors, ...collaboration.errors, ...meeting.errors],
+  };
+}
+
+test("round 2 blocking 1: a denied group settings option=meeting_security view demotes every group-dependent verdict, names the endpoint, and lands in the errors arrays and _errors.log", async () => {
+  const client = compliantClient({
+    async getGroupSettings(_groupId, option) {
+      if (option === "meeting_security") denyScoped();
+      return compliantSettings(option);
+    },
+  });
+  const endpoint = "/groups/group-1/settings?option=meeting_security";
+  const result = await assessEverything(client);
+  const policy = result.snapshot.groupPolicies[0];
+  assert.equal(policy.settings.status, "ok", "the base read succeeded, so the merged surface stays ok");
+  assert.deepEqual(policy.settingsSurfaces.map((surface) => [surface.name, surface.status]), [["group_settings:group-1", "ok"], ["group_settings:group-1:meeting_security", "denied"]]);
+  assert.deepEqual(policy.lockSurfaces.map((surface) => surface.status), ["ok", "ok"]);
+
+  for (const id of GROUP_DEPENDENT_IDS) {
+    const item = findingById({ findings: result.findings }, id);
+    assert.equal(item.status, "warn", `${id}: ${item.summary}`);
+    assert.match(item.summary, /1 group settings surfaces were unreadable, so group overrides are unproven: Finance: \/groups\/group-1\/settings\?option=meeting_security was denied \(403/, `${id}: ${item.summary}`);
+    assert.deepEqual(item.evidence.groups_unreadable, [`Finance: ${endpoint} was denied (403; check the app scopes and admin role)`]);
+  }
+  for (const id of ["ZOOM-ID-01", "ZOOM-ID-02", "ZOOM-ID-03", "ZOOM-ID-04", "ZOOM-ID-05", "ZOOM-ID-06", "ZOOM-COLLAB-01", "ZOOM-COLLAB-04", "ZOOM-COLLAB-05", "ZOOM-COLLAB-06"]) {
+    assert.equal(findingById({ findings: result.findings }, id).status, "pass", id);
+  }
+  const expectedError = `group_settings:group-1:meeting_security: ${endpoint} was denied (403; check the app scopes and admin role)`;
+  assert.deepEqual(result.collaboration.errors, [expectedError]);
+  assert.deepEqual(result.meeting.errors, [expectedError]);
+
+  const base = createTempBase("grclanker-zoom-option-view-");
+  const exported = await exportZoomAuditBundle(client, sampleConfig(), base, { now: NOW });
+  const errorsLog = readFileSync(join(exported.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /group_settings:group-1:meeting_security: \/groups\/group-1\/settings\?option=meeting_security was denied \(403/);
+  const groups = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "groups.json"), "utf8"));
+  assert.deepEqual(groups.policies[0].settings_views.map((view) => [view.endpoint, view.status]), [["/groups/group-1/settings", "ok"], [endpoint, "denied"]]);
+
+  const lockViewDenied = await assessEverything(compliantClient({
+    async getGroupLockSettings(_groupId, option) {
+      if (option === "meeting_security") denyScoped();
+      return compliantLocks(option);
+    },
+  }));
+  for (const id of GROUP_DEPENDENT_IDS) {
+    assert.equal(findingById({ findings: lockViewDenied.findings }, id).status, "pass", `${id}: no verdict reads group lock state, so it is disclosed but not demoted`);
+  }
+  assert.deepEqual(lockViewDenied.meeting.errors, ["group_lock_settings:group-1:meeting_security: /groups/group-1/lock_settings?option=meeting_security was denied (403; check the app scopes and admin role)"]);
+});
+
+test("round 2 blocking 2: ZOOM-ID-02 never passes on an emptied admin role inventory when GET /roles is unreadable or truncated", async () => {
+  const denied = await assessZoomIdentity(compliantClient({ async listRoles() { denyScoped(); } }), { now: NOW });
+  const item = findingById(denied, "ZOOM-ID-02");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /security\.sign_in_with_two_factor_auth is `all`/);
+  assert.match(item.summary, /admin role inventory \(GET \/roles\) .* was unreadable: GET \/roles was denied \(403/);
+  assert.equal(item.evidence.admin_roles, undefined, "an unreadable inventory must not render as an empty admin_roles list");
+  assert.equal(item.evidence.roles_status, "denied");
+  assert.match(item.evidence.roles_cause, /^GET \/roles was denied \(403/);
+  assert.ok(denied.errors.some((entry) => entry.startsWith("roles: /roles was denied")));
+
+  const truncated = await assessZoomIdentity(compliantClient({
+    async listRoles() {
+      return list([{ id: "0", name: "Owner", total_members: 1 }, { id: "1", name: "Admin", total_members: 1 }], { truncated: true, totalRecords: 5 });
+    },
+  }), { now: NOW });
+  const partial = findingById(truncated, "ZOOM-ID-02");
+  assert.equal(partial.status, "warn", partial.summary);
+  assert.match(partial.summary, /Partial inventory: 2 seen of 5/);
+  assert.equal(partial.evidence.roles_truncated, true);
+
+  const complete = findingById(await assessZoomIdentity(compliantClient(), { now: NOW }), "ZOOM-ID-02");
+  assert.equal(complete.status, "pass");
+  assert.match(complete.summary, /2 admin or owner roles were inventoried from GET \/roles \(total_records matches\)/);
+  assert.equal(complete.evidence.admin_roles.length, 2);
+});
+
+test("rule 1 corollary sweep: making each surface unreadable in turn demotes exactly the findings that read it, names the endpoint, and discloses it in the errors arrays", async () => {
+  const meetingSecurityOnly = (build) => (option) => {
+    if (option === "meeting_security") denyScoped();
+    return build(option);
+  };
+  const baseOnly = (build) => (option) => {
+    if (option === undefined) denyScoped();
+    return build(option);
+  };
+  const accountSettingsDenied = (view) => (option) => {
+    if (option === view) denyScoped();
+    return compliantSettings(option);
+  };
+  const sweep = [
+    { surface: "GET /users/me", overrides: { async getCurrentUser() { denyScoped(); } }, demoted: [], endpoint: /\/users\/me/, disclosed: false },
+    { surface: "GET /users", overrides: { async listUsers() { denyScoped(); } }, demoted: ["ZOOM-ID-01", "ZOOM-ID-05"], endpoint: /\/users was denied \(403/ },
+    { surface: "GET /roles", overrides: { async listRoles() { denyScoped(); } }, demoted: ["ZOOM-ID-02", "ZOOM-ID-04"], endpoint: /\/roles was denied \(403/ },
+    { surface: "GET /roles/{roleId}/members", overrides: { async listRoleMembers() { denyScoped(); } }, demoted: ["ZOOM-ID-04"], endpoint: /\/roles\/0\/members was denied \(403/ },
+    { surface: "GET /groups", overrides: { async listGroups() { denyScoped(); } }, demoted: GROUP_DEPENDENT_IDS, endpoint: /\/groups was denied \(403/ },
+    { surface: "GET /groups/{groupId}/settings", overrides: { getGroupSettings: async (_id, option) => baseOnly(compliantSettings)(option) }, demoted: GROUP_DEPENDENT_IDS, endpoint: /\/groups\/group-1\/settings was denied \(403/ },
+    { surface: "GET /groups/{groupId}/settings?option=meeting_security", overrides: { getGroupSettings: async (_id, option) => meetingSecurityOnly(compliantSettings)(option) }, demoted: GROUP_DEPENDENT_IDS, endpoint: /\/groups\/group-1\/settings\?option=meeting_security was denied \(403/ },
+    { surface: "GET /groups/{groupId}/lock_settings", overrides: { getGroupLockSettings: async (_id, option) => baseOnly(compliantLocks)(option) }, demoted: [], endpoint: /\/groups\/group-1\/lock_settings was denied \(403/ },
+    { surface: "GET /groups/{groupId}/lock_settings?option=meeting_security", overrides: { getGroupLockSettings: async (_id, option) => meetingSecurityOnly(compliantLocks)(option) }, demoted: [], endpoint: /\/groups\/group-1\/lock_settings\?option=meeting_security was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/settings", overrides: { getAccountSettings: accountSettingsDenied(undefined) }, demoted: ["ZOOM-COLLAB-02", "ZOOM-COLLAB-03", "ZOOM-COLLAB-07", "ZOOM-MTG-01", "ZOOM-MTG-03", "ZOOM-MTG-04", "ZOOM-MTG-07", "ZOOM-MTG-09", "ZOOM-MTG-10"], endpoint: /\/accounts\/acct-123\/settings was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/settings?option=security", overrides: { getAccountSettings: accountSettingsDenied("security") }, demoted: ["ZOOM-ID-02", "ZOOM-ID-06"], endpoint: /\/accounts\/acct-123\/settings\?option=security was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/settings?option=meeting_security", overrides: { getAccountSettings: accountSettingsDenied("meeting_security") }, demoted: ["ZOOM-MTG-02", "ZOOM-MTG-05", "ZOOM-MTG-06"], endpoint: /\/accounts\/acct-123\/settings\?option=meeting_security was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/settings?option=meeting_authentication", overrides: { getAccountSettings: accountSettingsDenied("meeting_authentication") }, demoted: ["ZOOM-MTG-08"], endpoint: /\/accounts\/acct-123\/settings\?option=meeting_authentication was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/lock_settings", overrides: { getAccountLockSettings: async (option) => baseOnly(compliantLocks)(option) }, demoted: ["ZOOM-COLLAB-02", "ZOOM-COLLAB-03", "ZOOM-COLLAB-07", "ZOOM-MTG-01", "ZOOM-MTG-03", "ZOOM-MTG-04", "ZOOM-MTG-07", "ZOOM-MTG-08", "ZOOM-MTG-09"], endpoint: /\/accounts\/acct-123\/lock_settings was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/lock_settings?option=meeting_security", overrides: { getAccountLockSettings: async (option) => meetingSecurityOnly(compliantLocks)(option) }, demoted: ["ZOOM-MTG-02", "ZOOM-MTG-05", "ZOOM-MTG-06"], endpoint: /\/accounts\/acct-123\/lock_settings\?option=meeting_security was denied \(403/ },
+    { surface: "GET /im/groups", overrides: { async listImGroups() { denyScoped(); } }, demoted: ["ZOOM-COLLAB-06"], endpoint: /\/im\/groups was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/managed_domains", overrides: { async getManagedDomains() { denyScoped(); } }, demoted: ["ZOOM-ID-03"], endpoint: /\/accounts\/acct-123\/managed_domains was denied \(403/ },
+    { surface: "GET /accounts/{accountId}/trusted_domains", overrides: { async listTrustedDomains() { denyScoped(); } }, demoted: ["ZOOM-COLLAB-01"], endpoint: /\/accounts\/acct-123\/trusted_domains was denied \(403/ },
+    { surface: "GET /report/operationlogs", overrides: { async listOperationLogs() { denyScoped(); } }, demoted: ["ZOOM-COLLAB-05"], endpoint: /\/report\/operationlogs\?from=2026-08-22&to=2026-09-21 was denied \(403/ },
+    { surface: "GET /phone/account_settings", overrides: { async getPhoneAccountSettings() { denyScoped(); } }, demoted: ["ZOOM-COLLAB-04"], endpoint: /\/phone\/account_settings\?setting_types=auto_call_recording,ad_hoc_call_recording was denied \(403/ },
+  ];
+  const alwaysManual = new Set(["ZOOM-ID-07", "ZOOM-COLLAB-08"]);
+
+  const baseline = await assessEverything(compliantClient());
+  assert.deepEqual(baseline.findings.filter((item) => item.status !== "pass").map((item) => item.id).sort(), [...alwaysManual].sort());
+  assert.deepEqual(baseline.errors, []);
+
+  for (const scenario of sweep) {
+    const result = await assessEverything(compliantClient(scenario.overrides));
+    const demoted = result.findings.filter((item) => item.status !== "pass" && !alwaysManual.has(item.id));
+    assert.deepEqual(demoted.map((item) => item.id).sort(), [...scenario.demoted].sort(), `${scenario.surface}: exactly the findings that read the surface demote`);
+    for (const item of demoted) {
+      assert.match(item.summary, scenario.endpoint, `${scenario.surface} ${item.id}: ${item.summary}`);
+    }
+    if (scenario.disclosed !== false) {
+      assert.ok(result.errors.some((entry) => scenario.endpoint.test(entry)), `${scenario.surface}: the errors arrays name the unreadable endpoint (${result.errors.join(" | ")})`);
+    }
+  }
 });
