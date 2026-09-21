@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   SLACK_EXTERNAL_SHARING_AUDIT_ACTIONS,
   SLACK_FILE_UPLOAD_VERDICTS,
   SLACK_METHODS,
+  SLACK_REDACTION_MARKER,
   SLACK_SECURITY_AUDIT_ACTIONS,
   SLACK_SPEC_CONTROLS,
   SlackApiClient,
@@ -19,6 +21,8 @@ import {
   checkSlackAccess,
   exportSlackAuditBundle,
   isSlackPostingRestricted,
+  redactSecretText,
+  redactSecrets,
   resolveSecureOutputPath,
   resolveSlackConfiguration,
 } from "../dist/extensions/grc-tools/slack.js";
@@ -55,6 +59,40 @@ function makeClient(handler, config = { token: "xoxp-test", scim_token: "scim-te
     return result instanceof Response ? result : jsonResponse(result);
   };
   return new SlackApiClient(resolveSlackConfiguration(config, EMPTY_ENV), { fetchImpl, now: () => NOW, sleep: async () => {} });
+}
+
+function listFilesRecursively(dir) {
+  return readdirSync(dir).flatMap((name) => {
+    const path = join(dir, name);
+    return statSync(path).isDirectory() ? listFilesRecursively(path) : [path];
+  });
+}
+
+/** Minimal ZIP reader (central directory, stored or deflated entries) so the archive is inspected without an unzip dependency. */
+function readZipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  let eocd = buffer.length - 22;
+  while (eocd >= 0 && buffer.readUInt32LE(eocd) !== 0x06054b50) eocd -= 1;
+  assert.ok(eocd >= 0, "end of central directory record not found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "local header signature");
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: method === 8 ? inflateRawSync(data).toString("utf8") : data.toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
 }
 
 function byId(result, id) {
@@ -593,7 +631,7 @@ test("review fix: SLACK-ADMIN-03 never passes on a truncated admin.users.list", 
   };
   const truncated = byId(await assessSlackAdminAccess(makeClient(truncatedUsers), { maxSessionHours: 24, userLimit: 2 }), "SLACK-ADMIN-03");
   assert.equal(truncated.status, "warn");
-  assert.match(truncated.summary, /user inventory is partial \(2 seen of unknown total \(partial view, pagination capped\)\)/);
+  assert.match(truncated.summary, /user inventory is partial \(2 seen of unknown total \(partial view, item limit reached\)\)/);
   assert.equal(truncated.evidence.inventory_complete, false);
   assert.equal(truncated.evidence.active_users_seen, 2);
   assert.equal(truncated.evidence.sampled_users, 2);
@@ -630,6 +668,237 @@ test("review follow-up: SLACK-CHAN-02 warns when the channel search is truncated
   const complete = byId(await assessSlackChannelGovernance(makeClient(compliantFixture)), "SLACK-CHAN-02");
   assert.equal(complete.status, "pass");
   assert.equal(complete.evidence.channels_complete, true);
+});
+
+const FAKE_SECRETS = {
+  userToken: "xoxp-FAKE_SECRET_TOKEN_1",
+  botToken: "xoxb-FAKE_SECRET_TOKEN_2",
+  scimToken: "FAKE_SCIM_SECRET_1",
+  appToken: "xapp-1-FAKE_APP_TOKEN_1",
+  refreshToken: "xoxe-1-FAKE_REFRESH_TOKEN_1",
+  webhook: "https://hooks.slack.com/services/T1/B1/FAKE_WEBHOOK_URL_1",
+  clientSecret: "FAKE_CLIENT_SECRET_1",
+  signingSecret: "FAKE_SIGNING_SECRET_1",
+  password: "FAKE_PASSWORD_1",
+  bareToken: "FAKE_SECRET_TOKEN_3",
+};
+const FAKE_SECRET_MARKERS = ["FAKE_SECRET_TOKEN", "FAKE_SCIM_SECRET", "FAKE_APP_TOKEN", "FAKE_REFRESH_TOKEN", "FAKE_WEBHOOK_URL", "FAKE_CLIENT_SECRET", "FAKE_SIGNING_SECRET", "FAKE_PASSWORD"];
+
+/** The compliant fixture with a credential planted in every collected object that can carry one. */
+const secretLadenFixture = (request) => {
+  const method = request.pathname.replace(/^\/api\//, "");
+  if (method === "admin.barriers.list") return jsonResponse({ ok: false, error: "invalid_auth", token: FAKE_SECRETS.bareToken, hint: `retry with ${FAKE_SECRETS.userToken}` }, 403);
+  const base = compliantFixture(request);
+  if (request.pathname === "/api/auth.test") return { ...base, token: FAKE_SECRETS.bareToken, team: `Acme ${FAKE_SECRETS.botToken}`, url: `https://acme.slack.com/?t=${FAKE_SECRETS.userToken}` };
+  if (request.pathname === "/scim/v2/Users") return { ...base, Resources: base.Resources.map((item) => ({ ...item, password: FAKE_SECRETS.password, "urn:scim:schemas:extension:slack:1.0": { api_token: FAKE_SECRETS.bareToken } })) };
+  if (request.pathname === "/scim/v2/Groups") return { ...base, Resources: base.Resources.map((item) => ({ ...item, displayName: `Engineering ${FAKE_SECRETS.webhook}` })) };
+  if (request.pathname === "/audit/v1/logs") {
+    return { ...base, entries: base.entries.map((entry) => ({
+      ...entry,
+      details: { token: FAKE_SECRETS.bareToken, new_value: FAKE_SECRETS.userToken, reason: `rotated ${FAKE_SECRETS.refreshToken}` },
+      entity: { type: "app", app: { id: "A9", name: "Rotator", client_secret: FAKE_SECRETS.clientSecret, signing_secret: FAKE_SECRETS.signingSecret, incoming_webhook: { url: FAKE_SECRETS.webhook } } },
+      context: { session_id: FAKE_SECRETS.bareToken, ua: `curl Bearer ${FAKE_SECRETS.userToken}` },
+    })) };
+  }
+  if (request.pathname === "/audit/v1/schemas") return { schemas: [{ type: "user", user: {}, example_token: FAKE_SECRETS.bareToken }] };
+  switch (method) {
+    case "users.list":
+      return { ...base, members: base.members.map((member) => ({ ...member, profile: { ...member.profile, api_token: FAKE_SECRETS.bareToken, title: `Owner of ${FAKE_SECRETS.webhook}` } })) };
+    case "admin.users.list":
+      return { ...base, users: base.users.map((user) => ({ ...user, password: FAKE_SECRETS.password, full_name: `Alice ${FAKE_SECRETS.userToken}` })) };
+    case "admin.teams.list":
+      return { ...base, teams: base.teams.map((team) => ({ ...team, name: `Core ${FAKE_SECRETS.appToken}`, signing_secret: FAKE_SECRETS.signingSecret })) };
+    case "admin.teams.settings.info":
+      return { ...base, team: { ...base.team, webhook_url: FAKE_SECRETS.webhook, name: `Core ${FAKE_SECRETS.botToken}`, default_channels: base.team.default_channels } };
+    case "admin.teams.admins.list":
+      return { ...base, admin_ids: [...base.admin_ids, FAKE_SECRETS.userToken] };
+    case "admin.users.session.getSettings":
+      return { ...base, session_settings: base.session_settings.map((item) => ({ ...item, session_token: FAKE_SECRETS.bareToken })) };
+    case "admin.apps.approved.list":
+      return { ...base, approved_apps: base.approved_apps.map((item) => ({ ...item, app: { ...item.app, name: `Marketplace App ${FAKE_SECRETS.webhook}`, client_secret: FAKE_SECRETS.clientSecret, signing_secret: FAKE_SECRETS.signingSecret, incoming_webhook: { url: FAKE_SECRETS.webhook }, app_level_token: FAKE_SECRETS.appToken, refresh_token: FAKE_SECRETS.refreshToken } })) };
+    case "admin.apps.restricted.list":
+      return { ...base, restricted_apps: base.restricted_apps.map((item) => ({ ...item, app: { ...item.app, name: `Blocked App ${FAKE_SECRETS.userToken}`, oauth_client_secret: FAKE_SECRETS.clientSecret } })) };
+    case "admin.conversations.search":
+      return { ...base, conversations: base.conversations.map((item) => ({ ...item, name: `${item.name}-${FAKE_SECRETS.botToken}`, purpose: { value: `Posts via ${FAKE_SECRETS.webhook}` } })) };
+    case "admin.conversations.getConversationPrefs":
+      return { ...base, prefs: { ...base.prefs, webhook: FAKE_SECRETS.webhook } };
+    case "admin.conversations.getCustomRetention":
+      return { ...base, policy_token: FAKE_SECRETS.bareToken };
+    case "admin.emoji.list":
+      return { ...base, emoji: { party: { ...base.emoji.party, uploaded_by: `W1 ${FAKE_SECRETS.userToken}`, url: `https://emoji.slack-edge.com/T1/party/1.png?token=${FAKE_SECRETS.bareToken}` } } };
+    case "team.preferences.list":
+      return { ...base, disable_file_uploads: "type:owner,type:admin", app_level_token: FAKE_SECRETS.appToken, who_can_post_general: `admins ${FAKE_SECRETS.webhook}` };
+    default:
+      return base;
+  }
+};
+
+test("rule 9: redaction keeps field names, replaces credential values, and scrubs Slack token shapes", async () => {
+  const redacted = redactSecrets({
+    token: "abc", token_type: "bot", access_token: "x", client_secret: "y", incoming_webhook: { url: "https://hooks.slack.com/services/A/B/C" }, refresh_token: "r", signing_secret: "s", password: "p",
+    nested: { note: "use xoxb-123456789-abcdef or xapp-1-A-123456789 with Bearer abcdefghijklmnop" }, list: ["xoxp-987654321-zyx", "ok"], count: 3, flag: true, empty: null,
+  }, ["known-secret-value"]);
+  assert.deepEqual(redacted, {
+    token: SLACK_REDACTION_MARKER, token_type: "bot", access_token: SLACK_REDACTION_MARKER, client_secret: SLACK_REDACTION_MARKER, incoming_webhook: SLACK_REDACTION_MARKER, refresh_token: SLACK_REDACTION_MARKER, signing_secret: SLACK_REDACTION_MARKER, password: SLACK_REDACTION_MARKER,
+    nested: { note: `use ${SLACK_REDACTION_MARKER} or ${SLACK_REDACTION_MARKER} with ${SLACK_REDACTION_MARKER}` }, list: [SLACK_REDACTION_MARKER, "ok"], count: 3, flag: true, empty: null,
+  });
+  assert.equal(redactSecretText("token known-secret-value and https://hooks.slack.com/services/T/B/X end", ["known-secret-value"]), `token ${SLACK_REDACTION_MARKER} and ${SLACK_REDACTION_MARKER} end`);
+  assert.equal(redactSecretText("https://files.slack.com/f.png?token=abc123&size=2&Signature=zzz"), `https://files.slack.com/f.png?token=${SLACK_REDACTION_MARKER}&size=2&Signature=${SLACK_REDACTION_MARKER}`);
+
+  const client = makeClient(secretLadenFixture, { token: FAKE_SECRETS.userToken, bot_token: FAKE_SECRETS.botToken, scim_token: FAKE_SECRETS.scimToken, org_id: "E1" });
+  const auth = await client.web("auth.test");
+  assert.equal(auth.token, SLACK_REDACTION_MARKER);
+  assert.equal(auth.team, `Acme ${SLACK_REDACTION_MARKER}`);
+  assert.equal(auth.url, `https://acme.slack.com/?t=${SLACK_REDACTION_MARKER}`);
+  const apps = await client.web("admin.apps.approved.list", { limit: 10 });
+  assert.equal(apps.approved_apps[0].app.client_secret, SLACK_REDACTION_MARKER);
+  assert.equal(apps.approved_apps[0].app.incoming_webhook, SLACK_REDACTION_MARKER);
+  assert.equal(apps.approved_apps[0].scopes[0].token_type, "bot");
+  await assert.rejects(client.web("admin.barriers.list"), (error) => {
+    assert.match(error.message, /HTTP 403/);
+    assert.equal(FAKE_SECRET_MARKERS.some((marker) => error.message.includes(marker)), false, error.message);
+    return true;
+  });
+});
+
+test("rule 9: the audit bundle and its zip never contain planted credentials", async () => {
+  const base = createTempBase("grclanker-slack-secrets-");
+  const client = makeClient(secretLadenFixture, { token: FAKE_SECRETS.userToken, bot_token: FAKE_SECRETS.botToken, scim_token: FAKE_SECRETS.scimToken, org_id: "E1" });
+  const config = resolveSlackConfiguration({ token: FAKE_SECRETS.userToken, bot_token: FAKE_SECRETS.botToken, scim_token: FAKE_SECRETS.scimToken, org_id: "E1" }, EMPTY_ENV);
+  const bundle = await exportSlackAuditBundle(client, config, base);
+  assert.ok(bundle.errorCount > 0, "the planted 403 must be recorded as a collection error");
+  const files = listFilesRecursively(bundle.outputDir);
+  assert.ok(files.length >= 20);
+  assert.ok(files.some((file) => file.endsWith("_errors.log")));
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    for (const marker of FAKE_SECRET_MARKERS) {
+      assert.equal(content.includes(marker), false, `${file} leaks ${marker}`);
+    }
+    for (const secret of Object.values(FAKE_SECRETS)) {
+      assert.equal(content.includes(secret), false, `${file} leaks ${secret}`);
+    }
+  }
+  const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /admin\.barriers\.list.*HTTP 403/);
+  assert.ok(errorsLog.includes(SLACK_REDACTION_MARKER), "redacted error bodies keep a marker");
+  const access = JSON.parse(readFileSync(join(bundle.outputDir, "core_data/access.json"), "utf8"));
+  assert.equal(JSON.stringify(access).includes("FAKE_"), false);
+
+  const entries = readZipEntries(bundle.zipPath).filter((entry) => !entry.name.endsWith("/"));
+  assert.equal(entries.length, files.length);
+  for (const entry of entries) {
+    for (const marker of FAKE_SECRET_MARKERS) {
+      assert.equal(entry.content.includes(marker), false, `zip entry ${entry.name} leaks ${marker}`);
+    }
+  }
+  assert.ok(entries.some((entry) => entry.name.endsWith("_errors.log") && entry.content.includes(SLACK_REDACTION_MARKER)));
+});
+
+test("rule 10: every pagination loop reports truncation on its cap exit and dependent findings do not pass", async () => {
+  const withOverride = (override) => makeClient((request) => override(request) ?? compliantFixture(request));
+  const method = (request) => request.pathname.replace(/^\/api\//, "");
+
+  const userCap = await assessSlackIdentity(withOverride((request) => method(request) === "users.list" ? { ok: true, members: [...compliantUsers, { ...compliantUsers[1], id: "W4", name: "carol" }], response_metadata: { next_cursor: "" } } : undefined), { userLimit: 2 });
+  assert.equal(byId(userCap, "SLACK-ID-01").status, "warn");
+  assert.match(byId(userCap, "SLACK-ID-01").summary, /2 seen of unknown total \(partial view, item limit reached\)/);
+  assert.equal(byId(userCap, "SLACK-ID-01").evidence.inventory_complete, false);
+
+  const stalledCursor = await assessSlackIdentity(withOverride((request) => method(request) === "users.list" && request.params.get("cursor")
+    ? { ok: true, members: [], response_metadata: { next_cursor: "still-more" } }
+    : method(request) === "users.list" ? { ...compliantFixture(request), response_metadata: { next_cursor: "page2" } } : undefined));
+  assert.equal(byId(stalledCursor, "SLACK-ID-01").status, "warn");
+  assert.match(byId(stalledCursor, "SLACK-ID-01").summary, /partial view, cursor returned an empty page/);
+
+  let pageCalls = 0;
+  const pageCap = await assessSlackIdentity(withOverride((request) => {
+    if (method(request) !== "users.list") return undefined;
+    pageCalls += 1;
+    return { ok: true, members: [{ ...compliantUsers[0], id: `W${pageCalls}` }], response_metadata: { next_cursor: `page-${pageCalls + 1}` } };
+  }), { userLimit: 10_000 });
+  assert.equal(pageCalls, 50);
+  assert.equal(byId(pageCap, "SLACK-ID-01").status, "warn");
+  assert.match(byId(pageCap, "SLACK-ID-01").summary, /50 seen of unknown total \(partial view, page cap of 50 reached\)/);
+
+  const scimNoTotal = await assessSlackIdentity(withOverride((request) => request.pathname === "/scim/v2/Users" ? { Resources: compliantFixture(request).Resources } : undefined));
+  assert.notEqual(byId(scimNoTotal, "SLACK-ID-03").status, "pass");
+  assert.match(byId(scimNoTotal, "SLACK-ID-03").summary, /total count missing from the response/);
+  assert.equal(byId(scimNoTotal, "SLACK-ID-03").evidence.inventory_complete, false);
+
+  const scimCap = await assessSlackIdentity(withOverride((request) => request.pathname === "/scim/v2/Users" ? { ...compliantFixture(request), totalResults: 40 } : undefined), { userLimit: 2 });
+  assert.notEqual(byId(scimCap, "SLACK-ID-03").status, "pass");
+  assert.match(byId(scimCap, "SLACK-ID-03").summary, /2 seen of 40 \(partial view, item limit reached\)/);
+
+  const scimStalled = await assessSlackIdentity(withOverride((request) => request.pathname === "/scim/v2/Users" && Number(request.params.get("startIndex")) > 1 ? { totalResults: 40, Resources: [] } : request.pathname === "/scim/v2/Users" ? { ...compliantFixture(request), totalResults: 40 } : undefined));
+  assert.notEqual(byId(scimStalled, "SLACK-ID-03").status, "pass");
+  assert.match(byId(scimStalled, "SLACK-ID-03").summary, /2 seen of 40 \(partial view, cursor returned an empty page\)/);
+
+  const workspaceCap = await assessSlackAdminAccess(withOverride((request) => method(request) === "admin.teams.list"
+    ? { ok: true, teams: [...compliantFixture(request).teams, { id: "T2", name: "Labs", discoverability: "invite_only" }], response_metadata: { next_cursor: "" } }
+    : method(request) === "admin.teams.settings.info" ? { ok: true, team: { id: request.params.get("team_id"), email_domain: "example.com", default_channels: [] } } : undefined), { workspaceLimit: 1 });
+  for (const id of ["SLACK-ADMIN-01", "SLACK-ADMIN-05", "SLACK-ADMIN-07"]) {
+    assert.notEqual(byId(workspaceCap, id).status, "pass", id);
+    assert.match(byId(workspaceCap, id).summary, /1 seen of unknown total \(partial view, item limit reached\)/, id);
+  }
+
+  const orgUserCap = await assessSlackAdminAccess(withOverride((request) => method(request) === "admin.users.list"
+    ? { ...compliantFixture(request), users: [...compliantFixture(request).users, { id: "W7", is_active: true, is_admin: false, is_bot: false, has_sso: true }], response_metadata: { next_cursor: "" } }
+    : undefined), { userLimit: 2 });
+  for (const id of ["SLACK-ADMIN-02", "SLACK-ADMIN-03", "SLACK-ADMIN-08"]) {
+    assert.notEqual(byId(orgUserCap, id).status, "pass", id);
+  }
+  assert.match(byId(orgUserCap, "SLACK-ADMIN-02").summary, /2 seen of unknown total \(partial view, item limit reached\)/);
+  assert.equal(byId(orgUserCap, "SLACK-ADMIN-03").evidence.inventory_complete, false);
+
+  let adminPages = 0;
+  const adminPageCap = await assessSlackAdminAccess(withOverride((request) => {
+    if (method(request) !== "admin.teams.admins.list") return undefined;
+    adminPages += 1;
+    return { ok: true, admin_ids: [`W${adminPages}`], response_metadata: { next_cursor: "more" } };
+  }), { maxWorkspaceAdmins: 500 });
+  assert.equal(adminPages, 50);
+  assert.equal(byId(adminPageCap, "SLACK-ADMIN-01").status, "warn");
+  assert.match(byId(adminPageCap, "SLACK-ADMIN-01").summary, /partial/);
+  assert.equal(byId(adminPageCap, "SLACK-ADMIN-01").evidence.inventory_complete, false);
+
+  let emojiPages = 0;
+  const emojiPageCap = await assessSlackAdminAccess(withOverride((request) => {
+    if (method(request) !== "admin.emoji.list") return undefined;
+    emojiPages += 1;
+    return { ok: true, emoji: { [`e${emojiPages}`]: { url: "u", date_created: 1591720632, uploaded_by: "W1" } }, response_metadata: { next_cursor: "more" } };
+  }));
+  assert.equal(emojiPages, 51);
+  assert.equal(byId(emojiPageCap, "SLACK-ADMIN-08").status, "warn");
+  assert.match(byId(emojiPageCap, "SLACK-ADMIN-08").summary, /partial/);
+  assert.equal(byId(emojiPageCap, "SLACK-ADMIN-08").evidence.inventory_complete, false);
+
+  const appCap = await assessSlackIntegrations(withOverride((request) => method(request) === "admin.apps.approved.list"
+    ? { ...compliantFixture(request), approved_apps: [...compliantFixture(request).approved_apps, { app: { id: "A3", name: "Second", is_app_directory_approved: true, is_internal: false, developer_type: "third_party" }, scopes: [] }], response_metadata: { next_cursor: "" } }
+    : undefined), { appLimit: 1 });
+  assert.equal(byId(appCap, "SLACK-APP-01").status, "warn");
+  assert.match(byId(appCap, "SLACK-APP-01").summary, /1 seen of unknown total \(partial view, item limit reached\)/);
+  assert.equal(byId(appCap, "SLACK-APP-01").evidence.inventory_complete, false);
+
+  const channelCap = await assessSlackChannelGovernance(withOverride((request) => method(request) === "admin.conversations.search" && request.params.get("search_channel_types") !== "external_shared"
+    ? { ...compliantFixture(request), total_count: 9 }
+    : undefined), { channelLimit: 1 });
+  for (const id of ["SLACK-CHAN-02", "SLACK-CHAN-03"]) {
+    assert.notEqual(byId(channelCap, id).status, "pass", id);
+    assert.match(byId(channelCap, id).summary, /1 seen of 9 \(partial view, item limit reached\)/, id);
+  }
+
+  const externalCap = await assessSlackChannelGovernance(withOverride((request) => method(request) === "admin.conversations.search" && request.params.get("search_channel_types") === "external_shared"
+    ? { ok: true, conversations: [], next_cursor: "more", total_count: 3 }
+    : undefined));
+  assert.equal(byId(externalCap, "SLACK-CHAN-01").status, "warn");
+  assert.match(byId(externalCap, "SLACK-CHAN-01").summary, /0 seen of 3 \(partial view, cursor returned an empty page\)/);
+
+  const auditCap = await assessSlackMonitoring(withOverride((request) => request.pathname === "/audit/v1/logs" ? { ...compliantFixture(request), response_metadata: { next_cursor: "more" } } : undefined), { auditLimit: 3 });
+  for (const id of ["SLACK-MON-01", "SLACK-MON-03", "SLACK-MON-05"]) {
+    assert.equal(byId(auditCap, id).status, "warn", id);
+  }
+  assert.match(byId(auditCap, "SLACK-MON-01").summary, /truncated at audit_limit=3/);
+  assert.equal(byId(auditCap, "SLACK-MON-01").evidence.window_complete, false);
 });
 
 test("SLACK_METHODS documents every Web API method the tools call", () => {

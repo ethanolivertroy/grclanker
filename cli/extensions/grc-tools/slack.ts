@@ -500,6 +500,49 @@ function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+export const SLACK_REDACTION_MARKER = "[REDACTED]";
+
+/** Field names whose values are credentials; the name is kept and the value replaced. */
+const SECRET_KEY_PATTERN = /token|secret|password|passwd|webhook|signing|private_key|api_key|apikey|authorization|cookie|credential/i;
+/** Names matching the pattern that describe a credential without carrying one. */
+const SECRET_KEY_ALLOWLIST = new Set(["token_type", "token_kinds", "tokenKinds", "token_format", "token_rotation", "is_token_rotating", "rotating_format", "scim_configured"]);
+/** Slack bot, user, refresh, app-level, and rotating tokens, incoming webhook URLs, and bearer headers. */
+const SECRET_VALUE_PATTERNS: RegExp[] = [
+  /xox[abeprs]-[A-Za-z0-9-]{6,}/g,
+  /xapp-[A-Za-z0-9-]{6,}/g,
+  /https:\/\/hooks\.slack\.com\/[^\s"'<>)]+/g,
+  /Bearer\s+[A-Za-z0-9._-]{8,}/g,
+  /([?&](?:token|access_token|refresh_token|secret|client_secret|signature|sig|api_key|apikey|key)=)[^&\s"'<>)]+/gi,
+];
+
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key) && !SECRET_KEY_ALLOWLIST.has(key);
+}
+
+export function redactSecretText(text: string, knownSecrets: readonly string[] = []): string {
+  let output = text;
+  for (const secret of knownSecrets) {
+    if (secret.length > 0) output = output.split(secret).join(SLACK_REDACTION_MARKER);
+  }
+  for (const pattern of SECRET_VALUE_PATTERNS) {
+    output = output.replace(pattern, (match, prefix: unknown) => (typeof prefix === "string" ? `${prefix}${SLACK_REDACTION_MARKER}` : SLACK_REDACTION_MARKER));
+  }
+  return output;
+}
+
+export function redactSecrets<T>(value: T, knownSecrets: readonly string[] = []): T {
+  if (typeof value === "string") return redactSecretText(value, knownSecrets) as T;
+  if (Array.isArray(value)) return value.map((item) => redactSecrets(item, knownSecrets)) as T;
+  if (value && typeof value === "object") {
+    const output: JsonRecord = {};
+    for (const [key, item] of Object.entries(value as JsonRecord)) {
+      output[key] = isSecretKey(key) && item !== null && item !== undefined ? SLACK_REDACTION_MARKER : redactSecrets(item, knownSecrets);
+    }
+    return output as T;
+  }
+  return value;
+}
+
 function safeDirName(value: string): string {
   const normalized = value
     .toLowerCase()
@@ -604,11 +647,15 @@ export class SlackApiError extends Error {
   }
 }
 
+/** Why a paginated collection stopped before the cursor was exhausted. */
+export type SlackTruncation = "item_cap" | "page_cap" | "stalled_cursor" | "unknown_total";
+
 export interface SlackPage {
   items: JsonRecord[];
   complete: boolean;
   pages: number;
   total?: number;
+  truncation?: SlackTruncation;
 }
 
 export class SlackApiClient {
@@ -647,9 +694,23 @@ export class SlackApiClient {
     }
   }
 
+  knownSecrets(): string[] {
+    return [this.config.token, this.config.botToken, this.config.scimToken].filter((item): item is string => Boolean(item));
+  }
+
+  redactText(text: string): string {
+    return redactSecretText(text, this.knownSecrets());
+  }
+
+  /** Error bodies are echoed into messages, so JSON bodies get field-level redaction before the text scrub. */
+  private redactBody(text: string): string {
+    const json = parseJsonRecord(text);
+    return json ? JSON.stringify(redactSecrets(json, this.knownSecrets())) : this.redactText(text);
+  }
+
   private httpError(label: string, response: Response, text: string): SlackApiError {
     return new SlackApiError(
-      `${label} failed (HTTP ${response.status}) ${text.slice(0, 200)}`,
+      `${label} failed (HTTP ${response.status}) ${this.redactBody(text).slice(0, 200)}`,
       label,
       response.status === 401 || response.status === 403 ? "http_forbidden" : `http_${response.status}`,
       response.status,
@@ -660,9 +721,9 @@ export class SlackApiClient {
     const json = text.length > 0 ? (JSON.parse(text) as JsonRecord) : {};
     if (json.ok === false) {
       const code = asString(json.error) ?? "ok_false";
-      throw new SlackApiError(`${label} failed: ${code}`, label, code, response.status);
+      throw new SlackApiError(`${label} failed: ${this.redactText(code)}`, label, code, response.status);
     }
-    return json;
+    return redactSecrets(json, this.knownSecrets());
   }
 
   private async fetchJson(url: URL, init: RequestInit, label: string): Promise<JsonRecord> {
@@ -789,21 +850,26 @@ export class SlackApiClient {
     let total: number | undefined;
     const items: JsonRecord[] = [];
 
+    let truncation: SlackTruncation | undefined;
     do {
       const page = await this.web(method, { ...query, limit: pageLimit, cursor });
       pages += 1;
       const pageItems = itemKeys.flatMap((key) => (Array.isArray(page[key]) ? page[key] : []))
         .map((item) => asObject(item) ?? (asString(item) ? { id: asString(item) } : undefined))
         .filter((item): item is JsonRecord => Boolean(item));
-      items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
+      const accepted = pageItems.slice(0, Math.max(0, limit - items.length));
+      items.push(...accepted);
       total = asNumber(page.total_count) ?? total;
       cursor = spec?.cursorField === "top_level"
         ? asString(page.next_cursor)
         : asString(asObject(page.response_metadata)?.next_cursor);
-      if (pageItems.length === 0) cursor = undefined;
-    } while (cursor && items.length < limit && pages < MAX_PAGES_PER_LIST);
+      if (accepted.length < pageItems.length) truncation = "item_cap";
+      else if (cursor && pageItems.length === 0) truncation = "stalled_cursor";
+      else if (cursor && items.length >= limit) truncation = "item_cap";
+      else if (cursor && pages >= MAX_PAGES_PER_LIST) truncation = "page_cap";
+    } while (cursor && !truncation);
 
-    return { items, complete: !cursor, pages, total };
+    return { items, complete: truncation === undefined && !cursor, pages, total, truncation };
   }
 
   async paginateScim(
@@ -826,17 +892,35 @@ export class SlackApiClient {
     let total: number | undefined;
     const items: JsonRecord[] = [];
 
-    while (items.length < limit && pages < MAX_PAGES_PER_LIST) {
+    let truncation: SlackTruncation | undefined;
+    for (;;) {
       const page = await this.scim(path, { ...query, startIndex, count: pageLimit });
       pages += 1;
       const resources = asObjectArray(page.Resources);
-      items.push(...resources.slice(0, limit - items.length));
+      const accepted = resources.slice(0, Math.max(0, limit - items.length));
+      items.push(...accepted);
       total = asNumber(page.totalResults) ?? total;
-      if (resources.length === 0 || items.length >= (total ?? resources.length)) break;
+      if (total === undefined) {
+        truncation = "unknown_total";
+        break;
+      }
+      if (accepted.length < resources.length || (items.length >= limit && items.length < total)) {
+        truncation = "item_cap";
+        break;
+      }
+      if (items.length >= total) break;
+      if (resources.length === 0) {
+        truncation = "stalled_cursor";
+        break;
+      }
+      if (pages >= MAX_PAGES_PER_LIST) {
+        truncation = "page_cap";
+        break;
+      }
       startIndex += resources.length;
     }
 
-    return { items, complete: total === undefined ? true : items.length >= total, pages, total };
+    return { items, complete: truncation === undefined, pages, total, truncation };
   }
 
   getNow(): Date {
@@ -864,8 +948,8 @@ export class SlackApiClient {
 }
 
 type ReadResult<T> =
-  | { ok: true; value: T; complete: boolean; total?: number; error?: undefined; code?: undefined }
-  | { ok: false; error: string; code?: string; value?: undefined; complete?: undefined; total?: undefined };
+  | { ok: true; value: T; complete: boolean; total?: number; truncation?: SlackTruncation; error?: undefined; code?: undefined }
+  | { ok: false; error: string; code?: string; value?: undefined; complete?: undefined; total?: undefined; truncation?: undefined };
 
 function surfaceError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -909,7 +993,7 @@ async function readWebList(
 ): Promise<ReadResult<JsonRecord[]>> {
   try {
     const page = await client.collectWeb(method, itemKeys, query, options);
-    return { ok: true, value: page.items, complete: page.complete, total: page.total };
+    return { ok: true, value: page.items, complete: page.complete, total: page.total, truncation: page.truncation };
   } catch (error) {
     return { ok: false, error: surfaceError(error), code: errorCode(error) };
   }
@@ -925,9 +1009,28 @@ function unreadableReason(result: { error: string; code?: string }): string {
   return result.error;
 }
 
-function partialNote(seen: number, complete: boolean, total?: number): string {
+function truncationNote(truncation: SlackTruncation | undefined): string {
+  switch (truncation) {
+    case "item_cap":
+      return "item limit reached";
+    case "page_cap":
+      return `page cap of ${MAX_PAGES_PER_LIST} reached`;
+    case "stalled_cursor":
+      return "cursor returned an empty page";
+    case "unknown_total":
+      return "total count missing from the response";
+    case undefined:
+      return "pagination capped";
+    default: {
+      const exhaustive: never = truncation;
+      return String(exhaustive);
+    }
+  }
+}
+
+function partialNote(seen: number, complete: boolean, total?: number, truncation?: SlackTruncation): string {
   if (complete) return `${seen} seen (complete)`;
-  return `${seen} seen of ${total ?? "unknown total"} (partial view, pagination capped)`;
+  return `${seen} seen of ${total ?? "unknown total"} (partial view, ${truncationNote(truncation)})`;
 }
 
 async function webSurface(
@@ -1097,7 +1200,7 @@ export async function assessSlackIdentity(
   const scimUsers: ReadResult<JsonRecord[]> = options.skipScim || !scimConfig.ok
     ? { ok: false, error: scimConfig.error ?? "SCIM unavailable", code: scimConfig.code }
     : await client.collectScim("/Users", {}, { limit: userLimit })
-      .then((page): ReadResult<JsonRecord[]> => ({ ok: true, value: page.items, complete: page.complete, total: page.total }))
+      .then((page): ReadResult<JsonRecord[]> => ({ ok: true, value: page.items, complete: page.complete, total: page.total, truncation: page.truncation }))
       .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
   if (!options.skipScim && !scimConfig.ok) errors.push(`SCIM /ServiceProviderConfig: ${scimConfig.error}`);
   if (!options.skipScim && scimConfig.ok && !scimUsers.ok) errors.push(`SCIM /Users: ${scimUsers.error}`);
@@ -1108,7 +1211,7 @@ export async function assessSlackIdentity(
     const email = scimUserEmail(user);
     return Boolean(email && deletedSlackEmails.has(email));
   });
-  const usersView = usersResult.ok ? partialNote(users.length, usersResult.complete) : "unreadable";
+  const usersView = usersResult.ok ? partialNote(users.length, usersResult.complete, usersResult.total, usersResult.truncation) : "unreadable";
 
   const findings: SlackFinding[] = [];
   if (!usersResult.ok) {
@@ -1185,7 +1288,7 @@ export async function assessSlackIdentity(
     );
   } else {
     const scimCount = scimUsers.value.length;
-    const scimView = partialNote(scimCount, scimUsers.complete, scimUsers.total);
+    const scimView = partialNote(scimCount, scimUsers.complete, scimUsers.total, scimUsers.truncation);
     findings.push(
       finding(
         "SLACK-ID-03",
@@ -1292,7 +1395,7 @@ export async function assessSlackAdminAccess(
   if (!teamsResult.ok) errors.push(`admin.teams.list: ${teamsResult.error}`);
   const workspaces = (teamsResult.ok ? teamsResult.value : []).map(toWorkspaceRecord).filter((item): item is WorkspaceRecord => Boolean(item));
   const workspacesComplete = teamsResult.ok && teamsResult.complete;
-  const workspaceView = teamsResult.ok ? partialNote(workspaces.length, teamsResult.complete) : "unreadable";
+  const workspaceView = teamsResult.ok ? partialNote(workspaces.length, teamsResult.complete, teamsResult.total, teamsResult.truncation) : "unreadable";
 
   const adminInventory: Array<{ id: string; name: string; admin_ids: string[]; complete: boolean }> = [];
   const adminErrors: string[] = [];
@@ -1322,7 +1425,7 @@ export async function assessSlackAdminAccess(
   if (!orgUsers.ok) errors.push(`admin.users.list: ${orgUsers.error}`);
   const activeOrgUsers = (orgUsers.ok ? orgUsers.value : []).filter((user) => user.is_active !== false && user.is_bot !== true);
   const orgUsersComplete = orgUsers.ok && orgUsers.complete;
-  const orgUsersView = orgUsers.ok ? partialNote(activeOrgUsers.length, orgUsers.complete) : "unreadable";
+  const orgUsersView = orgUsers.ok ? partialNote(activeOrgUsers.length, orgUsers.complete, orgUsers.total, orgUsers.truncation) : "unreadable";
   const ssoKnown = activeOrgUsers.filter((user) => typeof user.has_sso === "boolean");
   const withoutSso = activeOrgUsers.filter((user) => user.has_sso === false);
   const ssoUnknown = activeOrgUsers.length - ssoKnown.length;
@@ -1401,11 +1504,11 @@ export async function assessSlackAdminAccess(
           "high",
           excessiveAdmins.length > 0 ? "fail" : adminsComplete ? "pass" : "warn",
           excessiveAdmins.length > 0
-            ? `${excessiveAdmins.length}/${adminInventory.length} workspaces exceed ${maxWorkspaceAdmins} admins (admin_ids).`
+            ? `${excessiveAdmins.length}/${adminInventory.length} workspaces exceed ${maxWorkspaceAdmins} admins (admin_ids; workspaces: ${workspaceView}).`
             : adminsComplete
               ? `No workspace exceeds ${maxWorkspaceAdmins} admins across ${adminInventory.length} workspaces (${workspaceView}).`
-              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; unreadable admin lists: ${adminErrors.length}).`,
-          { admin_counts: adminInventory.map((item) => ({ id: item.id, name: item.name, count: item.admin_ids.length })), max_workspace_admins: maxWorkspaceAdmins, unreadable_workspaces: adminErrors },
+              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; admin lists truncated: ${adminInventory.filter((item) => !item.complete).length}; unreadable admin lists: ${adminErrors.length}).`,
+          { admin_counts: adminInventory.map((item) => ({ id: item.id, name: item.name, count: item.admin_ids.length, complete: item.complete })), max_workspace_admins: maxWorkspaceAdmins, unreadable_workspaces: adminErrors, inventory_complete: adminsComplete },
         ),
   );
 
@@ -1521,11 +1624,11 @@ export async function assessSlackAdminAccess(
           "high",
           unrestrictedDomains.length > 0 ? "fail" : settingsErrors.length > 0 || !workspacesComplete ? "warn" : "pass",
           unrestrictedDomains.length > 0
-            ? `${unrestrictedDomains.length}/${emailDomains.length} workspaces have an empty team.email_domain, so signup is not restricted to approved domains.`
+            ? `${unrestrictedDomains.length}/${emailDomains.length} workspaces have an empty team.email_domain, so signup is not restricted to approved domains (${workspaceView}).`
             : settingsErrors.length > 0 || !workspacesComplete
-              ? `Every readable workspace restricts signup by email domain, but ${settingsErrors.length} workspaces were unreadable and the workspace view is ${workspacesComplete ? "complete" : "partial"}.`
-              : `All ${emailDomains.length} workspaces restrict signup to approved email domains (team.email_domain populated).`,
-          { email_domains: emailDomains, unreadable_workspaces: settingsErrors },
+              ? `Every readable workspace restricts signup by email domain, but ${settingsErrors.length} workspaces were unreadable and the workspace view is ${workspacesComplete ? "complete" : "partial"} (${workspaceView}).`
+              : `All ${emailDomains.length} workspaces restrict signup to approved email domains (team.email_domain populated; ${workspaceView}).`,
+          { email_domains: emailDomains, unreadable_workspaces: settingsErrors, inventory_complete: workspacesComplete },
         ),
   );
 
@@ -1624,7 +1727,7 @@ export async function assessSlackIntegrations(
 
   const approvedApps = (approvedResult.ok ? approvedResult.value : []).map(toAppRecord);
   const restrictedApps = (restrictedResult.ok ? restrictedResult.value : []).map(toAppRecord);
-  const approvedView = approvedResult.ok ? partialNote(approvedApps.length, approvedResult.complete) : "unreadable";
+  const approvedView = approvedResult.ok ? partialNote(approvedApps.length, approvedResult.complete, approvedResult.total, approvedResult.truncation) : "unreadable";
   const customApps = approvedApps.filter((app) => app.is_internal === true || app.developer_type === "internal");
   const unreviewedApps = approvedApps.filter((app) => app.is_app_directory_approved === false);
   const sensitiveApps = approvedApps.filter((app) => app.sensitive_scopes.length > 0);
@@ -1667,7 +1770,7 @@ export async function assessSlackIntegrations(
         restrictedApps.length === 0 ? "warn" : restrictedResult.complete ? "pass" : "warn",
         restrictedApps.length === 0
           ? "No restricted apps are visible; confirm the admin approval policy is active (emptiness is not treated as compliant)."
-          : `${restrictedApps.length} restricted apps are visible (${partialNote(restrictedApps.length, restrictedResult.complete)}).`,
+          : `${restrictedApps.length} restricted apps are visible (${partialNote(restrictedApps.length, restrictedResult.complete, restrictedResult.total, restrictedResult.truncation)}).`,
         { restricted_app_count: restrictedApps.length, inventory_complete: restrictedResult.complete },
       ),
     !approvedResult.ok
@@ -1701,7 +1804,7 @@ export async function assessSlackIntegrations(
         barriersResult.value.length === 0 ? "warn" : barriersResult.complete ? "pass" : "warn",
         barriersResult.value.length === 0
           ? "No information barriers are configured; confirm whether restricted groups require barriers (emptiness is not treated as compliant)."
-          : `${barriersResult.value.length} information barriers are configured (${partialNote(barriersResult.value.length, barriersResult.complete)}).`,
+          : `${barriersResult.value.length} information barriers are configured (${partialNote(barriersResult.value.length, barriersResult.complete, barriersResult.total, barriersResult.truncation)}).`,
         {
           barrier_count: barriersResult.value.length,
           barriers: barriersResult.value.slice(0, 20).map((barrier) => ({
@@ -1753,7 +1856,7 @@ export async function assessSlackIntegrations(
       "high",
       `Token rotation is an app-level opt-in with no read method listing token age or legacy tokens (${SLACK_DOC_PAGES.tokenRotation}). ${authResult.ok ? `auth.test identity: user ${asString(authResult.value.user_id) ?? "unknown"} on team ${asString(authResult.value.team_id) ?? "unknown"}.` : `auth.test failed: ${authResult.error}.`} Configured token uses the ${client.describeToken().rotating_format ? "rotating (xoxe.) format" : "non-rotating format"}.`,
       "review installed app tokens and legacy token revocation in the app management dashboard.",
-      { citation: SLACK_DOC_PAGES.tokenRotation, token: client.describeToken(), auth: authResult.ok ? { user_id: authResult.value.user_id, team_id: authResult.value.team_id, is_enterprise_install: authResult.value.is_enterprise_install } : null },
+      { citation: SLACK_DOC_PAGES.tokenRotation, token_format: client.describeToken(), auth: authResult.ok ? { user_id: authResult.value.user_id, team_id: authResult.value.team_id, is_enterprise_install: authResult.value.is_enterprise_install } : null },
     ),
   );
 
@@ -1832,7 +1935,7 @@ export async function assessSlackChannelGovernance(
 
   const externalChannels = (externalResult.ok ? externalResult.value : []).map(toChannelRecord).filter((item): item is ChannelRecord => Boolean(item));
   const channels = (channelsResult.ok ? channelsResult.value : []).map(toChannelRecord).filter((item): item is ChannelRecord => Boolean(item));
-  const channelsView = channelsResult.ok ? partialNote(channels.length, channelsResult.complete, channelsResult.total) : "unreadable";
+  const channelsView = channelsResult.ok ? partialNote(channels.length, channelsResult.complete, channelsResult.total, channelsResult.truncation) : "unreadable";
 
   const prefsByChannel: Array<{ channel: ChannelRecord; restricted?: boolean }> = [];
   const prefsErrors: string[] = [];
@@ -1873,10 +1976,10 @@ export async function assessSlackChannelGovernance(
         "high",
         externalChannels.length > 0 ? "warn" : externalResult.complete ? "pass" : "warn",
         externalChannels.length > 0
-          ? `${externalChannels.length} externally shared channels (is_ext_shared) connect to ${new Set(externalChannels.flatMap((item) => item.connected_team_ids)).size} external teams, with ${externalChannels.filter((item) => item.pending_connected_team_ids.length > 0).length} pending invitations (${partialNote(externalChannels.length, externalResult.complete, externalResult.total)}). Review against the Slack Connect policy; the org-level Connect permission toggle is not exposed by the API.`
+          ? `${externalChannels.length} externally shared channels (is_ext_shared) connect to ${new Set(externalChannels.flatMap((item) => item.connected_team_ids)).size} external teams, with ${externalChannels.filter((item) => item.pending_connected_team_ids.length > 0).length} pending invitations (${partialNote(externalChannels.length, externalResult.complete, externalResult.total, externalResult.truncation)}). Review against the Slack Connect policy; the org-level Connect permission toggle is not exposed by the API.`
           : externalResult.complete
             ? "No externally shared channels exist in the complete search (search_channel_types=external_shared); emptiness is compliant by intent for this control."
-            : `No externally shared channel seen, but the search is partial (${partialNote(externalChannels.length, externalResult.complete, externalResult.total)}).`,
+            : `No externally shared channel seen, but the search is partial (${partialNote(externalChannels.length, externalResult.complete, externalResult.total, externalResult.truncation)}).`,
         { external_channels: externalChannels.slice(0, 20).map((item) => ({ id: item.id, name: item.name, connected_team_ids: item.connected_team_ids, pending_connected_team_ids: item.pending_connected_team_ids })), inventory_complete: externalResult.complete },
       ),
     !channelsResult.ok
@@ -2275,9 +2378,12 @@ export async function exportSlackAuditBundle(
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
   const zipPath = `${outputDir}.zip`;
 
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, zipPath }, findings, errors));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  const secrets = client.knownSecrets();
+  const writeBundleFile = (rootDir: string, relativePathname: string, content: string): Promise<void> =>
+    writeSecureTextFile(rootDir, relativePathname, redactSecretText(content, secrets));
+  await writeBundleFile(outputDir, "README.md", buildBundleReadme());
+  await writeBundleFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, zipPath }, findings, errors));
+  await writeBundleFile(outputDir, "metadata.json", serializeJson(redactSecrets({
     target: config.orgId ?? null,
     auth_mode: "bearer-token",
     token_kinds: client.getTokenKinds(),
@@ -2295,21 +2401,21 @@ export async function exportSlackAuditBundle(
       max_session_hours: options.max_session_hours ?? 24,
       min_retention_days: options.min_retention_days ?? DEFAULT_MIN_RETENTION_DAYS,
     },
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  }, secrets)));
+  await writeBundleFile(outputDir, "core_data/access.json", serializeJson(redactSecrets(access, secrets)));
   for (const area of areas) {
-    await writeSecureTextFile(outputDir, `core_data/${area.slug}.json`, serializeJson({ summary: area.result.summary, evidence: area.result.findings.map((item) => ({ id: item.id, evidence: item.evidence ?? null })), errors: area.result.errors }));
-    await writeSecureTextFile(outputDir, `analysis/${area.slug}.json`, serializeJson({ title: area.result.title, summary: area.result.summary, status_counts: statusCounts(area.result.findings) }));
-    await writeSecureTextFile(outputDir, `reports/${area.slug}.md`, formatAssessmentText(area.result));
+    await writeBundleFile(outputDir, `core_data/${area.slug}.json`, serializeJson(redactSecrets({ summary: area.result.summary, evidence: area.result.findings.map((item) => ({ id: item.id, evidence: item.evidence ?? null })), errors: area.result.errors }, secrets)));
+    await writeBundleFile(outputDir, `analysis/${area.slug}.json`, serializeJson(redactSecrets({ title: area.result.title, summary: area.result.summary, status_counts: statusCounts(area.result.findings) }, secrets)));
+    await writeBundleFile(outputDir, `reports/${area.slug}.md`, formatAssessmentText(area.result));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, findings, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
+  await writeBundleFile(outputDir, "analysis/findings.json", serializeJson(redactSecrets(findings, secrets)));
+  await writeBundleFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, findings, generatedAt));
+  await writeBundleFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
   for (const framework of SLACK_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${frameworkSlug(framework)}.md`, buildFrameworkReport(framework, findings));
+    await writeBundleFile(outputDir, `compliance/${frameworkSlug(framework)}.md`, buildFrameworkReport(framework, findings));
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeBundleFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
   await createZipArchive(outputDir, zipPath);
