@@ -4,6 +4,15 @@
  * This module intentionally complements the native GWS compliance tools.
  * It shells out to `gws` when installed, runs a curated set of read-only
  * investigation commands, and packages the resulting evidence for operators.
+ *
+ * Command shapes, flags, exit codes, and environment variables are taken from
+ * the published googleworkspace/cli README
+ * (https://github.com/googleworkspace/cli#readme): `gws <service> <resource>
+ * <method> --params '<json>'`, `--version`, structured exit codes 0-5, and the
+ * GOOGLE_WORKSPACE_CLI_TOKEN > GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE > stored
+ * credential precedence. The `admin-reports` alias is registered in
+ * crates/google-workspace/src/services.rs; the `service:version` form is parsed
+ * by parse_service_and_version in crates/google-workspace-cli/src/main.rs.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
@@ -75,6 +84,8 @@ interface GwsCliCommandRequest {
   executable: GwsCliExecutable;
   args: string[];
   env: NodeJS.ProcessEnv;
+  /** `gws --version` prints plain text; every curated API command must return JSON. */
+  expectJson?: boolean;
 }
 
 interface GwsCliExecution {
@@ -123,6 +134,9 @@ interface GwsOpsActivityResult {
   category: ActivityCategory;
   mode: GwsOpsMode;
   count: number;
+  /** False when the CLI response carried a nextPageToken, so the page is a partial view. */
+  complete: boolean;
+  nextPageToken?: string;
   command: GwsOpsCommandPreview;
   raw?: unknown;
   records?: GwsOpsActivityRecord[];
@@ -279,6 +293,7 @@ function buildGwsCliInstallGuidance(): string {
 
 export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
   const { executable, args, env } = request;
+  const expectJson = request.expectJson !== false;
   const command = buildCommandString(executable.displayExecutable, args);
 
   return await new Promise<GwsCliExecution>((resolvePromise, rejectPromise) => {
@@ -330,6 +345,11 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
         return;
       }
 
+      if (!expectJson) {
+        resolvePromise(execution);
+        return;
+      }
+
       try {
         execution.parsed = parseStructuredOutput(execution.stdout);
       } catch (error) {
@@ -348,6 +368,23 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
     });
   });
 };
+
+/**
+ * The published gws source registers no `alertcenter` service alias
+ * (crates/google-workspace/src/services.rs), so a validation failure on the
+ * Alert Center command is explained instead of surfacing as a bare exit code.
+ */
+function explainAlertCenterFailure(error: unknown): unknown {
+  if (error instanceof GwsCliCommandError && error.kind === "validation") {
+    return new GwsCliCommandError(
+      "validation",
+      `${error.message} The installed gws build rejected the alertcenter:v1beta1 service (exit 3, validation error); the published googleworkspace/cli source registers no alertcenter alias. Use gws_assess_monitoring for native Alert Center API coverage.`,
+      error.command,
+      error.exitCode,
+    );
+  }
+  return error;
+}
 
 function buildRunnerEnv(args: GwsCliContext, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const merged = { ...env };
@@ -370,6 +407,7 @@ async function runGwsVersion(
     executable,
     args: ["--version"],
     env: buildRunnerEnv(args, env),
+    expectJson: false,
   });
   return {
     version: result.stdout.trim() || "unknown",
@@ -474,18 +512,44 @@ async function executePreview(
   return result;
 }
 
-function recordsFromObject(parsed: unknown, keys: string[]): JsonRecord[] {
+/**
+ * `--page-all` emits one JSON object per page (NDJSON); a single invocation
+ * returns one page object. Both shapes normalize to a list of page objects.
+ */
+function pagesFromOutput(parsed: unknown, keys: string[]): JsonRecord[] {
   if (Array.isArray(parsed)) {
-    return parsed.map((item) => asRecord(item));
+    const records = parsed.map((item) => asRecord(item));
+    const looksLikePages = records.length > 0 && records.every((record) => keys.some((key) => Array.isArray(record[key])));
+    return looksLikePages ? records : [{ [keys[0]]: records }];
   }
-  const record = asRecord(parsed);
-  for (const key of keys) {
-    const value = record[key];
-    if (Array.isArray(value)) {
-      return value.map((item) => asRecord(item));
+  return [asRecord(parsed)];
+}
+
+function recordsFromObject(parsed: unknown, keys: string[]): JsonRecord[] {
+  const records: JsonRecord[] = [];
+  for (const page of pagesFromOutput(parsed, keys)) {
+    for (const key of keys) {
+      const value = page[key];
+      if (Array.isArray(value)) {
+        records.push(...value.map((item) => asRecord(item)));
+        break;
+      }
     }
   }
-  return [];
+  return records;
+}
+
+/** The last page's nextPageToken (documented on every list response) marks a partial view. */
+function trailingPageToken(parsed: unknown, keys: string[]): string | undefined {
+  const pages = pagesFromOutput(parsed, keys);
+  const last = pages[pages.length - 1];
+  return last ? asString(last.nextPageToken) : undefined;
+}
+
+function completenessNote(nextPageToken: string | undefined, count: number): string {
+  return nextPageToken
+    ? `Partial view: the CLI response carried a nextPageToken after ${count} record(s); more records exist beyond this page (re-run with a larger max_results or use --page-all).`
+    : `Complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query.`;
 }
 
 function normalizeAlertRecords(parsed: unknown): GwsOpsActivityRecord[] {
@@ -621,7 +685,7 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -638,7 +702,7 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
@@ -749,9 +813,11 @@ export async function investigateGwsAlerts(
       category: "alerts",
       mode,
       count: 0,
+      complete: false,
       command,
       notes: [
         "Dry-run mode only previewed the read-only Alert Center command.",
+        "The published googleworkspace/cli source registers no alertcenter service alias; if the installed build rejects the command (exit 3), use gws_assess_monitoring instead.",
         ...notes,
       ],
       text: [
@@ -763,21 +829,31 @@ export async function investigateGwsAlerts(
     };
   }
 
-  const execution = await executePreview(command, args, runner, env);
+  let execution: GwsCliExecution;
+  try {
+    execution = await executePreview(command, args, runner, env);
+  } catch (error) {
+    throw explainAlertCenterFailure(error);
+  }
   const records = normalizeAlertRecords(execution.parsed);
+  const nextPageToken = trailingPageToken(execution.parsed, ["alerts", "items"]);
+  const allNotes = [
+    ...notes,
+    completenessNote(nextPageToken, records.length),
+    "These records come directly from the Google Workspace CLI Alert Center response.",
+  ];
   return {
     title: "Google Workspace alert investigation",
     category: "alerts",
     mode,
     count: records.length,
+    complete: nextPageToken === undefined,
+    nextPageToken,
     command,
     raw: execution.parsed,
     records,
-    notes: [
-      ...notes,
-      "These records come directly from the Google Workspace CLI Alert Center response.",
-    ],
-    text: renderActivityText("Google Workspace alert investigation", records, notes),
+    notes: allNotes,
+    text: renderActivityText("Google Workspace alert investigation", records, allNotes),
   };
 }
 
@@ -804,6 +880,7 @@ export async function traceGwsAdminActivity(
       category: "admin_activity",
       mode,
       count: 0,
+      complete: false,
       command,
       notes: [
         "Dry-run mode only previewed the read-only Admin Reports command.",
@@ -820,16 +897,20 @@ export async function traceGwsAdminActivity(
 
   const execution = await executePreview(command, args, runner, env);
   const records = normalizeActivityRecords(execution.parsed, "admin");
+  const nextPageToken = trailingPageToken(execution.parsed, ["items"]);
+  const allNotes = [...notes, completenessNote(nextPageToken, records.length)];
   return {
     title: "Google Workspace admin activity trace",
     category: "admin_activity",
     mode,
     count: records.length,
+    complete: nextPageToken === undefined,
+    nextPageToken,
     command,
     raw: execution.parsed,
     records,
-    notes,
-    text: renderActivityText("Google Workspace admin activity trace", records, notes),
+    notes: allNotes,
+    text: renderActivityText("Google Workspace admin activity trace", records, allNotes),
   };
 }
 
@@ -858,6 +939,7 @@ export async function reviewGwsTokenActivity(
       category: "token_activity",
       mode,
       count: 0,
+      complete: false,
       command,
       notes: [
         "Dry-run mode only previewed the read-only Admin Reports token query.",
@@ -874,16 +956,20 @@ export async function reviewGwsTokenActivity(
 
   const execution = await executePreview(command, args, runner, env);
   const records = normalizeActivityRecords(execution.parsed, "token");
+  const nextPageToken = trailingPageToken(execution.parsed, ["items"]);
+  const allNotes = [...notes, completenessNote(nextPageToken, records.length)];
   return {
     title: "Google Workspace token activity review",
     category: "token_activity",
     mode,
     count: records.length,
+    complete: nextPageToken === undefined,
+    nextPageToken,
     command,
     raw: execution.parsed,
     records,
-    notes,
-    text: renderActivityText("Google Workspace token activity review", records, notes),
+    notes: allNotes,
+    text: renderActivityText("Google Workspace token activity review", records, allNotes),
   };
 }
 
@@ -896,6 +982,7 @@ function buildBundleSummary(results: GwsOpsActivityResult[]): string {
       "",
       `- Category: ${result.category}`,
       `- Records: ${result.count}`,
+      `- Complete page: ${result.complete ? "yes" : "no (nextPageToken present)"}`,
       `- Command: ${result.command.command}`,
       "",
       ...result.notes.map((note) => `- ${note}`),
@@ -948,6 +1035,8 @@ export async function collectGwsOperatorEvidenceBundle(
     await writeSecureTextFile(outputDir, `analysis/${result.category}.json`, serializeJson({
       title: result.title,
       count: result.count,
+      complete: result.complete,
+      nextPageToken: result.nextPageToken ?? null,
       notes: result.notes,
       records: result.records ?? [],
     }));

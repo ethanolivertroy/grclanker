@@ -2,9 +2,22 @@
  * Google Workspace GRC assessment tools.
  *
  * Native TypeScript implementation grounded in the official Admin SDK
- * Directory API, Reports API, and Alert Center API. The first slice stays
- * read-only and focuses on service-account-backed domain-wide delegated access
- * so GRC engineers can assess a tenant with one audit principal.
+ * Directory API, Reports API, Alert Center API, and Cloud Identity Policy API
+ * discovery documents. Every request stays read-only and every verdict follows
+ * the verdict-safety rules documented in the integration guide: unreadable or
+ * empty inventories never pass, partial views are flagged, pagination runs to
+ * completion or records truncation, and re-running an export never overwrites
+ * an earlier bundle.
+ *
+ * Endpoint references (all public, unauthenticated):
+ * - users.list: https://developers.google.com/workspace/admin/directory/reference/rest/v1/users/list
+ * - roles.list: https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles/list
+ * - roleAssignments.list: https://developers.google.com/workspace/admin/directory/reference/rest/v1/roleAssignments/list
+ * - tokens.list: https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens/list
+ * - activities.list: https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list
+ * - alerts.list: https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list
+ * - policies.list: https://cloud.google.com/identity/docs/reference/rest/v1/policies/list
+ * - Policy API settings catalog: https://cloud.google.com/identity/docs/concepts/supported-policy-api-settings
  */
 import { createPrivateKey, sign as signData } from "node:crypto";
 import {
@@ -35,17 +48,31 @@ type FrameworkKey =
   | "irap"
   | "ismap"
   | "general";
+type ReportFrameworkKey = Exclude<FrameworkKey, "general">;
 
 const DEFAULT_OUTPUT_DIR = "./export/gws";
 const DEFAULT_LOOKBACK_DAYS = 30;
-const PAGE_SIZE = 200;
-const MAX_USERS = 500;
-const MAX_ACTIVITY_RECORDS = 200;
-const MAX_ALERTS = 100;
-const MAX_TOKEN_USERS = 25;
+/** users.list maxResults maximum is 500 (Directory API reference). */
+const USERS_PAGE_SIZE = 500;
+/** roles.list maxResults maximum is 100 (Directory API reference). */
+const ROLES_PAGE_SIZE = 100;
+/** roleAssignments.list maxResults maximum is 200 (Directory API reference). */
+const ROLE_ASSIGNMENTS_PAGE_SIZE = 200;
+/** activities.list maxResults maximum is 1000 (Reports API reference). */
+const ACTIVITY_PAGE_SIZE = 1000;
+/** alerts.list pageSize has no documented maximum; the server may return fewer. */
+const ALERTS_PAGE_SIZE = 100;
+/** policies.list pageSize maximum is 100 (Cloud Identity reference). */
+const POLICIES_PAGE_SIZE = 100;
+const MAX_USERS = 5000;
+const MAX_ACTIVITY_RECORDS = 5000;
+const MAX_ALERTS = 1000;
+const MAX_POLICIES = 1000;
+const MAX_TOKEN_USERS = 50;
 const MAX_RETRIES = 4;
 const TOKEN_SKEW_MS = 60 * 1000;
 const DORMANT_DAYS = 90;
+/** Every field below is documented on the Directory API User resource. */
 const USERS_FIELDS = [
   "users(id,primaryEmail,isAdmin,isDelegatedAdmin,suspended,archived,lastLoginTime,isEnrolledIn2Sv,isEnforcedIn2Sv,orgUnitPath)",
   "nextPageToken",
@@ -57,6 +84,28 @@ const GWS_READ_SCOPES = [
   "https://www.googleapis.com/auth/admin.reports.audit.readonly",
   "https://www.googleapis.com/auth/apps.alerts",
 ];
+/**
+ * The Policy API scope is requested with its own token so tenants that have not
+ * delegated it keep every other surface working; only GWS-ID-005 turns manual.
+ */
+const GWS_POLICY_SCOPES = ["https://www.googleapis.com/auth/cloud-identity.policies.readonly"];
+/**
+ * Setting types from the Policy API settings catalog
+ * (https://cloud.google.com/identity/docs/concepts/supported-policy-api-settings).
+ */
+const TWO_STEP_ENFORCEMENT_SETTING = "settings/security.two_step_verification_enforcement";
+const TWO_STEP_ENROLLMENT_SETTING = "settings/security.two_step_verification_enrollment";
+const TWO_STEP_FACTOR_SETTING = "settings/security.two_step_verification_enforcement_factor";
+/**
+ * policies.list filter syntax is documented on the method reference page; the
+ * dot is escaped as \\. inside the CEL string literal exactly as the reference
+ * example `setting.type.matches('^settings/gmail\\..*$')` does.
+ */
+const TWO_STEP_POLICY_FILTER_PATTERN = "^settings/security\\\\.two_step_verification.*$";
+/**
+ * Login audit event names from
+ * https://developers.google.com/workspace/admin/reports/v1/appendix/activity/login
+ */
 const SUSPICIOUS_LOGIN_NAMES = new Set([
   "suspicious_login",
   "suspicious_login_less_secure_app",
@@ -67,7 +116,21 @@ const SUSPICIOUS_LOGIN_NAMES = new Set([
   "account_disabled_hijacked",
   "account_disabled_password_leak",
 ]);
+/** Alert metadata.status values documented on the Alert Center Alert resource. */
+const CLOSED_ALERT_STATUS = "closed";
 const HIGH_RISK_SCOPE_PATTERN = /(admin|gmail|drive|cloud-platform|apps\.groups|directory|classroom|vault|spreadsheets|docs)/i;
+const SECRET_KEY_PATTERN = /(password|secret|private_key|access_token|refresh_token|client_secret|hashfunction)/i;
+const FRAMEWORK_REPORTS: Record<ReportFrameworkKey, { title: string; file: string }> = {
+  fedramp: { title: "FedRAMP / NIST 800-53 Compliance Report", file: "compliance/fedramp/fedramp_compliance_report.md" },
+  cmmc: { title: "CMMC 2.0 / NIST 800-171 Compliance Report", file: "compliance/cmmc/cmmc_compliance_report.md" },
+  soc2: { title: "SOC 2 Compliance Report", file: "compliance/soc2/soc2_compliance_report.md" },
+  disa_stig: { title: "DISA STIG Compliance Checklist", file: "compliance/disa_stig/stig_compliance_checklist.md" },
+  irap: { title: "IRAP / ISM Compliance Report", file: "compliance/irap/irap_compliance_report.md" },
+  ismap: { title: "ISMAP / ISO 27001 Compliance Report", file: "compliance/ismap/ismap_compliance_report.md" },
+  pci_dss: { title: "PCI-DSS 4.0.1 Compliance Report", file: "compliance/pci_dss/pci_dss_compliance_report.md" },
+  cis: { title: "CIS Google Workspace Benchmark Report", file: "compliance/cis/cis_compliance_report.md" },
+};
+const REPORT_FRAMEWORK_KEYS = Object.keys(FRAMEWORK_REPORTS) as ReportFrameworkKey[];
 
 type RawConfigArgs = {
   auth_mode?: string;
@@ -171,9 +234,22 @@ export interface GwsAssessmentResult {
   text: string;
 }
 
-interface CollectedDataset<T = unknown> {
+/** A fully paginated listing, or the seen portion when the cap was reached. */
+export interface GwsCollection<T = JsonRecord> {
+  items: T[];
+  truncated: boolean;
+  pages: number;
+}
+
+export interface CollectedDataset<T = unknown> {
   data: T;
   error?: string;
+  errorKind?: GwsEndpointStatus;
+  truncated?: boolean;
+  pages?: number;
+  seen?: number;
+  total?: number;
+  failed?: number;
 }
 
 interface TokenInventoryRecord {
@@ -182,21 +258,22 @@ interface TokenInventoryRecord {
   token: JsonRecord;
 }
 
-interface GwsIdentityData {
+export interface GwsIdentityData {
   users: CollectedDataset<JsonRecord[]>;
   roles: CollectedDataset<JsonRecord[]>;
   roleAssignments: CollectedDataset<JsonRecord[]>;
   loginActivities: CollectedDataset<JsonRecord[]>;
+  twoStepPolicies?: CollectedDataset<JsonRecord[]>;
 }
 
-interface GwsAdminAccessData {
+export interface GwsAdminAccessData {
   users: CollectedDataset<JsonRecord[]>;
   roles: CollectedDataset<JsonRecord[]>;
   roleAssignments: CollectedDataset<JsonRecord[]>;
   adminActivities: CollectedDataset<JsonRecord[]>;
 }
 
-interface GwsIntegrationData {
+export interface GwsIntegrationData {
   users: CollectedDataset<JsonRecord[]>;
   roles: CollectedDataset<JsonRecord[]>;
   roleAssignments: CollectedDataset<JsonRecord[]>;
@@ -204,19 +281,37 @@ interface GwsIntegrationData {
   tokenActivities: CollectedDataset<JsonRecord[]>;
 }
 
-interface GwsMonitoringData {
+export interface GwsMonitoringData {
   loginActivities: CollectedDataset<JsonRecord[]>;
   adminActivities: CollectedDataset<JsonRecord[]>;
   tokenActivities: CollectedDataset<JsonRecord[]>;
   alerts: CollectedDataset<JsonRecord[]>;
 }
 
-interface GwsAuditBundleResult {
+export interface GwsAuditData {
+  identity: GwsIdentityData;
+  adminAccess: GwsAdminAccessData;
+  integrations: GwsIntegrationData;
+  monitoring: GwsMonitoringData;
+}
+
+export interface GwsAuditBundleResult {
   outputDir: string;
   zipPath: string;
   fileCount: number;
   findingCount: number;
   errorCount: number;
+  frameworks: ReportFrameworkKey[];
+}
+
+export interface GwsAuditCollector {
+  collectUsers(): Promise<GwsCollection>;
+  collectRoles(): Promise<GwsCollection>;
+  collectRoleAssignments(): Promise<GwsCollection>;
+  collectActivities(applicationName: "login" | "admin" | "token"): Promise<GwsCollection>;
+  collectAlerts(): Promise<GwsCollection>;
+  collectTwoStepPolicies(): Promise<GwsCollection>;
+  listUserTokens(userKey: string): Promise<JsonRecord[]>;
 }
 
 type FetchImpl = typeof fetch;
@@ -229,9 +324,22 @@ type GwsTokenCacheEntry = {
 
 const tokenCache = new Map<string, GwsTokenCacheEntry>();
 
+export class GwsApiError extends Error {
+  status: number;
+  url: string;
+
+  constructor(status: number, message: string, url: string) {
+    super(message);
+    this.name = "GwsApiError";
+    this.status = status;
+    this.url = url;
+  }
+}
+
 const GWS_ACCESS_PROBES = [
   {
     key: "users",
+    scopes: GWS_READ_SCOPES,
     url: (config: GwsResolvedConfig) =>
       buildAdminUrl("/admin/directory/v1/users", {
         customer: config.customerId,
@@ -241,6 +349,7 @@ const GWS_ACCESS_PROBES = [
   },
   {
     key: "roles",
+    scopes: GWS_READ_SCOPES,
     url: (config: GwsResolvedConfig) =>
       buildAdminUrl(`/admin/directory/v1/customer/${encodeURIComponent(config.customerId)}/roles`, {
         maxResults: 1,
@@ -248,6 +357,7 @@ const GWS_ACCESS_PROBES = [
   },
   {
     key: "role_assignments",
+    scopes: GWS_READ_SCOPES,
     url: (config: GwsResolvedConfig) =>
       buildAdminUrl(`/admin/directory/v1/customer/${encodeURIComponent(config.customerId)}/roleassignments`, {
         maxResults: 1,
@@ -255,6 +365,7 @@ const GWS_ACCESS_PROBES = [
   },
   {
     key: "reports_login",
+    scopes: GWS_READ_SCOPES,
     url: () =>
       buildAdminUrl("/admin/reports/v1/activity/users/all/applications/login", {
         maxResults: 1,
@@ -263,7 +374,17 @@ const GWS_ACCESS_PROBES = [
   },
   {
     key: "alert_center",
+    scopes: GWS_READ_SCOPES,
     url: () => buildAlertsUrl("/v1beta1/alerts", { pageSize: 1 }),
+  },
+  {
+    key: "policies",
+    scopes: GWS_POLICY_SCOPES,
+    url: (config: GwsResolvedConfig) =>
+      buildCloudIdentityUrl("/v1/policies", {
+        pageSize: 1,
+        filter: buildTwoStepPolicyFilter(config.customerId),
+      }),
   },
 ] as const;
 
@@ -334,6 +455,23 @@ const GWS_CHECKS: Record<string, CheckDefinition> = {
       irap: ["ISM-0414"],
       ismap: ["CPS.AC-6"],
       general: ["super admin hardening"],
+    },
+  },
+  "GWS-ID-005": {
+    id: "GWS-ID-005",
+    title: "2-step verification is enforced by organization policy",
+    category: "identity",
+    severity: "high",
+    frameworks: {
+      fedramp: ["IA-2", "IA-2(1)", "CM-6"],
+      cmmc: ["3.5.3"],
+      soc2: ["CC6.1"],
+      cis: ["1.1"],
+      pci_dss: ["8.4.2"],
+      disa_stig: ["SRG-APP-000149"],
+      irap: ["ISM-1504"],
+      ismap: ["CPS.IA-2"],
+      general: ["tenant-wide MFA policy"],
     },
   },
   "GWS-ADMIN-001": {
@@ -576,8 +714,10 @@ const GWS_CHECKS: Record<string, CheckDefinition> = {
   },
 };
 
-function buildAdminUrl(pathname: string, params?: Record<string, string | number | boolean | undefined>): string {
-  const url = new URL(`https://admin.googleapis.com${pathname}`);
+export const GWS_CHECK_IDS = Object.keys(GWS_CHECKS);
+
+function buildUrl(origin: string, pathname: string, params?: Record<string, string | number | boolean | undefined>): string {
+  const url = new URL(`${origin}${pathname}`);
   for (const [key, value] of Object.entries(params ?? {})) {
     if (value === undefined || value === "") continue;
     url.searchParams.set(key, String(value));
@@ -585,13 +725,24 @@ function buildAdminUrl(pathname: string, params?: Record<string, string | number
   return url.toString();
 }
 
+function buildAdminUrl(pathname: string, params?: Record<string, string | number | boolean | undefined>): string {
+  return buildUrl("https://admin.googleapis.com", pathname, params);
+}
+
 function buildAlertsUrl(pathname: string, params?: Record<string, string | number | boolean | undefined>): string {
-  const url = new URL(`https://alertcenter.googleapis.com${pathname}`);
-  for (const [key, value] of Object.entries(params ?? {})) {
-    if (value === undefined || value === "") continue;
-    url.searchParams.set(key, String(value));
-  }
-  return url.toString();
+  return buildUrl("https://alertcenter.googleapis.com", pathname, params);
+}
+
+function buildCloudIdentityUrl(pathname: string, params?: Record<string, string | number | boolean | undefined>): string {
+  return buildUrl("https://cloudidentity.googleapis.com", pathname, params);
+}
+
+/**
+ * Filter clauses follow the policies.list reference: a customer clause plus a
+ * setting.type.matches() regular expression, combined with &&.
+ */
+export function buildTwoStepPolicyFilter(customerId: string): string {
+  return `customer == "customers/${customerId}" && setting.type.matches('${TWO_STEP_POLICY_FILTER_PATTERN}')`;
 }
 
 function asRecord(value: unknown): JsonRecord {
@@ -663,11 +814,25 @@ function tokenCacheKey(config: GwsResolvedConfig, scopes: string[]): string {
   ].join("::");
 }
 
-async function collectDataset<T>(collector: () => Promise<T>): Promise<CollectedDataset<T>> {
+function classifyError(error: unknown): GwsEndpointStatus {
+  if (error instanceof GwsApiError) {
+    if (error.status === 403) return "forbidden";
+    if (error.status === 401) return "unauthorized";
+  }
+  return "error";
+}
+
+async function collectDataset(collector: () => Promise<GwsCollection>): Promise<CollectedDataset<JsonRecord[]>> {
   try {
-    return { data: await collector() };
+    const collection = await collector();
+    return {
+      data: collection.items,
+      truncated: collection.truncated,
+      pages: collection.pages,
+      seen: collection.items.length,
+    };
   } catch (error) {
-    return { data: [] as unknown as T, error: summarizeError(error) };
+    return { data: [], error: summarizeError(error), errorKind: classifyError(error), seen: 0 };
   }
 }
 
@@ -693,31 +858,19 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function normalizeRoleName(role: JsonRecord): string {
-  return asString(role.roleName) ?? asString(role.name) ?? `role-${asString(role.roleId) ?? "unknown"}`;
-}
-
 function isSuperAdminRole(role: JsonRecord | undefined): boolean {
   if (!role) return false;
   if (asBoolean(role.isSuperAdminRole) === true) return true;
   return asArray(role.rolePrivileges).some((privilege) => safeLower(asRecord(privilege).privilegeName) === "super_admin");
 }
 
+/** RoleAssignment.assigneeType is documented as `USER` or `GROUP` (compared case-insensitively). */
 function isGroupAssignment(assignment: JsonRecord): boolean {
   return safeLower(assignment.assigneeType) === "group";
 }
 
 function isUserAssignment(assignment: JsonRecord): boolean {
   return safeLower(assignment.assigneeType) === "user";
-}
-
-function getAssignmentUserIds(assignments: JsonRecord[]): Set<string> {
-  return new Set(
-    assignments
-      .filter((assignment) => isUserAssignment(assignment))
-      .map((assignment) => asString(assignment.assignedTo))
-      .filter((value): value is string => Boolean(value)),
-  );
 }
 
 function getRoleMap(roles: JsonRecord[]): Map<string, JsonRecord> {
@@ -774,6 +927,64 @@ function buildFinding(
   };
 }
 
+function isActiveUser(user: JsonRecord): boolean {
+  return asBoolean(user.suspended) !== true && asBoolean(user.archived) !== true;
+}
+
+function describeCause(dataset: CollectedDataset<unknown>, scopeHint: string): string {
+  switch (dataset.errorKind) {
+    case "forbidden":
+      return `HTTP 403 (missing scope ${scopeHint} in the domain-wide delegation, or the delegated account lacks the admin role for this surface)`;
+    case "unauthorized":
+      return "HTTP 401 (the bearer token was rejected)";
+    case "error":
+    case "ok":
+    case undefined:
+      return "request error";
+    default: {
+      const exhaustive: never = dataset.errorKind;
+      return exhaustive;
+    }
+  }
+}
+
+function unreadableFinding(
+  definitionId: string,
+  endpoint: string,
+  dataset: CollectedDataset<unknown>,
+  scopeHint: string,
+  evidenceToCollect: string,
+): GwsFinding {
+  return buildFinding(
+    definitionId,
+    "Manual",
+    `${endpoint} was not readable, so this control could not be assessed: ${describeCause(dataset, scopeHint)}.`,
+    [`${endpoint} error: ${dataset.error ?? "unknown"}`],
+    `Grant ${scopeHint} to the audit principal and confirm the delegated admin role, then re-run the assessment.`,
+    `Collect manually: ${evidenceToCollect}`,
+  );
+}
+
+function partialViewEvidence(label: string, dataset: CollectedDataset<unknown[]>): string[] {
+  if (!dataset.truncated) return [];
+  return [
+    `${label}: partial view, seen ${dataset.data.length} across ${dataset.pages ?? 0} page(s), more pages exist (total unknown; the listing stopped at the collection cap)`,
+  ];
+}
+
+function withPartialCap(finding: GwsFinding, notes: string[]): GwsFinding {
+  if (notes.length === 0) return finding;
+  const status: GwsFindingStatus = finding.status === "Pass" ? "Partial" : finding.status;
+  return {
+    ...finding,
+    status,
+    summary: finding.status === "Pass"
+      ? `${finding.summary} The verdict is capped at Partial because the credential only saw a partial inventory.`
+      : finding.summary,
+    evidence: [...finding.evidence, ...notes],
+  };
+}
+
 function findingTable(findings: GwsFinding[]): string {
   return formatTable(
     ["Check", "Status", "Severity", "Title"],
@@ -798,8 +1009,8 @@ function buildAssessmentText(
     findingTable(findings),
     "",
     ...findings.map((finding) => [
-      `${finding.id} — ${finding.summary}`,
-      ...finding.evidence.map((line) => `  • ${line}`),
+      `${finding.id}: ${finding.summary}`,
+      ...finding.evidence.map((line) => `  - ${line}`),
       `  Recommendation: ${finding.recommendation}`,
       finding.manualNote ? `  Manual note: ${finding.manualNote}` : "",
     ].filter(Boolean).join("\n")),
@@ -853,12 +1064,25 @@ function buildExportText(config: GwsResolvedConfig, result: GwsAuditBundleResult
     `Zip archive: ${result.zipPath}`,
     `Files written: ${result.fileCount}`,
     `Findings recorded: ${result.findingCount}`,
-    `Collection warnings: ${result.errorCount}`,
+    `Framework reports: ${result.frameworks.join(", ")}`,
+    `Collection warnings: ${result.errorCount}${result.errorCount > 0 ? " (see _errors.log)" : ""}`,
   ].join("\n");
 }
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+export function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === "object") {
+    const output: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) {
+      output[key] = SECRET_KEY_PATTERN.test(key) ? "[REDACTED]" : redactSecrets(entry);
+    }
+    return output;
+  }
+  return value;
 }
 
 function safeDirName(value: string): string {
@@ -873,15 +1097,20 @@ function frameworkMatrixRow(finding: GwsFinding): string {
   return `| ${finding.id} | ${finding.title} | ${finding.status} | ${finding.severity} | ${mappings} |`;
 }
 
-function buildFrameworkReport(title: string, findings: GwsFinding[], key: FrameworkKey): string {
+function buildFrameworkReport(title: string, findings: GwsFinding[], key: ReportFrameworkKey): string {
+  const mapped = findings.filter((finding) => finding.frameworks[key].length > 0);
+  const summary = countByStatus(mapped);
   return [
     `# ${title}`,
     "",
-    "| Check | Title | Status | Severity | Mapping |",
-    "| --- | --- | --- | --- | --- |",
-    ...findings
-      .filter((finding) => finding.frameworks[key].length > 0)
-      .map((finding) => `| ${finding.id} | ${finding.title} | ${finding.status} | ${finding.severity} | ${finding.frameworks[key].join(", ")} |`),
+    `Findings mapped: ${mapped.length}. Pass ${summary.Pass}, Partial ${summary.Partial}, Fail ${summary.Fail}, Manual ${summary.Manual}, Info ${summary.Info}.`,
+    "",
+    "| Check | Title | Status | Severity | Mapping | Summary |",
+    "| --- | --- | --- | --- | --- | --- |",
+    ...mapped.map((finding) =>
+      `| ${finding.id} | ${finding.title} | ${finding.status} | ${finding.severity} | ${finding.frameworks[key].join(", ")} | ${finding.summary.replace(/\|/g, "/")} |`),
+    "",
+    "Manual findings require human evidence before the mapped requirement can be asserted.",
     "",
   ].join("\n");
 }
@@ -897,17 +1126,25 @@ function buildUnifiedMatrix(findings: GwsFinding[]): string {
   ].join("\n");
 }
 
-function buildFrameworkReports(findings: GwsFinding[]): Record<string, string> {
-  return {
-    fedramp: buildFrameworkReport("FedRAMP / NIST 800-53 Report", findings, "fedramp"),
-    cmmc: buildFrameworkReport("CMMC Report", findings, "cmmc"),
-    soc2: buildFrameworkReport("SOC 2 Report", findings, "soc2"),
-    cis: buildFrameworkReport("CIS Google Workspace Benchmark Report", findings, "cis"),
-    pci_dss: buildFrameworkReport("PCI-DSS Report", findings, "pci_dss"),
-    disa_stig: buildFrameworkReport("DISA STIG Report", findings, "disa_stig"),
-    irap: buildFrameworkReport("IRAP Report", findings, "irap"),
-    ismap: buildFrameworkReport("ISMAP Report", findings, "ismap"),
-  };
+function buildQuickReference(frameworks: ReportFrameworkKey[]): string {
+  return [
+    "# Google Workspace Audit Bundle Quick Reference",
+    "",
+    "- `core_data/` contains the raw Google Workspace API payloads collected for this assessment (secret-looking keys redacted).",
+    "- `analysis/` contains `findings.json` plus one JSON summary per assessment category.",
+    "- `compliance/` contains the executive summary, the unified matrix, and one report per framework.",
+    "- `_errors.log` appears only when some reads failed but the bundle still completed.",
+    "- Review Manual findings before asserting framework compliance from the automated output alone.",
+    "",
+    "Recommended reading order:",
+    "1. `compliance/executive_summary.md`",
+    "2. `compliance/unified_compliance_matrix.md`",
+    `3. the framework report matching your engagement (${frameworks.join(", ")})`,
+    "4. `analysis/*.json` for the supporting evidence behind each finding",
+    "",
+    "This bundle is read-only evidence collection. It does not write back to the tenant.",
+    "",
+  ].join("\n");
 }
 
 function collectErrors(...datasets: Array<CollectedDataset<unknown>>): string[] {
@@ -923,12 +1160,27 @@ function parseDate(value: unknown): number | undefined {
   return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
-function countDormantUsers(users: JsonRecord[], cutoffMs: number): number {
-  return users.filter((user) => {
-    if (asBoolean(user.suspended) === true || asBoolean(user.archived) === true) return false;
+interface DormancyBuckets {
+  dormant: number;
+  unknownLastLogin: number;
+}
+
+/**
+ * Users without a parseable lastLoginTime are never counted as fresh; they go
+ * into a separate bucket that caps the verdict at Partial.
+ */
+function bucketDormancy(users: JsonRecord[], cutoffMs: number): DormancyBuckets {
+  let dormant = 0;
+  let unknownLastLogin = 0;
+  for (const user of users) {
     const lastLogin = parseDate(user.lastLoginTime);
-    return !lastLogin || lastLogin < cutoffMs;
-  }).length;
+    if (lastLogin === undefined) {
+      unknownLastLogin += 1;
+    } else if (lastLogin < cutoffMs) {
+      dormant += 1;
+    }
+  }
+  return { dormant, unknownLastLogin };
 }
 
 function extractActivityEventNames(activities: JsonRecord[]): string[] {
@@ -946,20 +1198,24 @@ function countMatchingEvents(activities: JsonRecord[], wanted: Set<string>): num
   return extractActivityEventNames(activities).filter((name) => wanted.has(name)).length;
 }
 
-function getPrivilegedUsers(
-  users: JsonRecord[],
-  roles: JsonRecord[],
-  roleAssignments: JsonRecord[],
-): {
+interface PrivilegedContext {
   privilegedUsers: JsonRecord[];
   superAdmins: JsonRecord[];
   delegatedAdmins: JsonRecord[];
   groupAssignmentCount: number;
-} {
+  unresolvedAssignments: number;
+}
+
+function getPrivilegedUsers(
+  users: JsonRecord[],
+  roles: JsonRecord[],
+  roleAssignments: JsonRecord[],
+): PrivilegedContext {
   const userMap = getUserMap(users);
   const roleMap = getRoleMap(roles);
   const privilegedUserIds = new Set<string>();
   const superAdminUserIds = new Set<string>();
+  let unresolvedAssignments = 0;
 
   for (const user of users) {
     const userId = asString(user.id);
@@ -976,6 +1232,7 @@ function getPrivilegedUsers(
     if (!isUserAssignment(assignment)) continue;
     const userId = asString(assignment.assignedTo);
     if (!userId) continue;
+    if (!userMap.has(userId)) unresolvedAssignments += 1;
     privilegedUserIds.add(userId);
     const role = roleMap.get(asString(assignment.roleId) ?? "");
     if (isSuperAdminRole(role)) {
@@ -997,6 +1254,7 @@ function getPrivilegedUsers(
     superAdmins,
     delegatedAdmins,
     groupAssignmentCount,
+    unresolvedAssignments,
   };
 }
 
@@ -1004,7 +1262,7 @@ function selectUsersForTokenInventory(
   users: JsonRecord[],
   privilegedUsers: JsonRecord[],
 ): JsonRecord[] {
-  const activeUsers = users.filter((user) => asBoolean(user.suspended) !== true && asBoolean(user.archived) !== true);
+  const activeUsers = users.filter(isActiveUser);
   const selected = new Map<string, JsonRecord>();
   for (const user of privilegedUsers) {
     const userId = asString(user.id);
@@ -1018,10 +1276,6 @@ function selectUsersForTokenInventory(
     selected.set(userId, user);
   }
   return Array.from(selected.values()).slice(0, MAX_TOKEN_USERS);
-}
-
-function flattenTokens(records: TokenInventoryRecord[]): JsonRecord[] {
-  return records.map((record) => record.token);
 }
 
 function countHighRiskTokens(records: TokenInventoryRecord[]): number {
@@ -1041,29 +1295,26 @@ function uniqueClientDisplayNames(records: TokenInventoryRecord[]): string[] {
   );
 }
 
-function countOpenAlerts(alerts: JsonRecord[]): number {
-  return alerts.filter((alert) => {
-    const status = safeLower(alert.state) || safeLower(alert.status);
-    return !["closed", "done", "resolved"].includes(status);
-  }).length;
+interface AlertBuckets {
+  open: number;
+  closed: number;
+  unknownStatus: number;
 }
 
-async function buildBundleReadme(rootDir: string): Promise<void> {
-  await writeSecureTextFile(
-    rootDir,
-    "README.md",
-    [
-      "# Google Workspace Audit Bundle Quick Reference",
-      "",
-      "- `core_data/` contains the raw Google Workspace API payloads collected for this assessment.",
-      "- `analysis/` contains normalized findings in JSON and terminal-friendly markdown.",
-      "- `reports/` contains executive and framework-specific markdown reports.",
-      "- `summary.md` is the quickest human-readable starting point.",
-      "",
-      "This bundle is read-only evidence collection. It does not write back to the tenant.",
-      "",
-    ].join("\n"),
-  );
+/** Alert status lives in metadata.status (NOT_STARTED, IN_PROGRESS, CLOSED). */
+function bucketAlerts(alerts: JsonRecord[]): AlertBuckets {
+  const buckets: AlertBuckets = { open: 0, closed: 0, unknownStatus: 0 };
+  for (const alert of alerts) {
+    const status = safeLower(asRecord(alert.metadata).status);
+    if (!status) {
+      buckets.unknownStatus += 1;
+    } else if (status === CLOSED_ALERT_STATUS) {
+      buckets.closed += 1;
+    } else {
+      buckets.open += 1;
+    }
+  }
+  return buckets;
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -1112,10 +1363,10 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
+  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -1132,7 +1383,7 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
@@ -1198,6 +1449,24 @@ function normalizeAssessmentArgs(args: RawConfigArgs): RawConfigArgs {
 
 const normalizeExportArgs = normalizeAssessmentArgs;
 
+export function normalizeFrameworkSelection(value: unknown): ReportFrameworkKey[] {
+  const raw = Array.isArray(value)
+    ? value.map((entry) => String(entry))
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+  const requested = raw.map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+  if (requested.length === 0) return [...REPORT_FRAMEWORK_KEYS];
+  const selected: ReportFrameworkKey[] = [];
+  for (const entry of requested) {
+    if (!REPORT_FRAMEWORK_KEYS.includes(entry as ReportFrameworkKey)) {
+      throw new Error(`Unknown framework "${entry}". Supported values: ${REPORT_FRAMEWORK_KEYS.join(", ")}.`);
+    }
+    if (!selected.includes(entry as ReportFrameworkKey)) selected.push(entry as ReportFrameworkKey);
+  }
+  return selected;
+}
+
 export async function resolveGwsConfiguration(
   args: RawConfigArgs = {},
   env: NodeJS.ProcessEnv = process.env,
@@ -1242,6 +1511,11 @@ export async function resolveGwsConfiguration(
   const merged = overlays.reduce<GwsConfigOverlay>((acc, overlay) => ({ ...acc, ...overlay }), {});
   const authMode = (merged.authMode
     ?? (merged.accessToken ? "access_token" : "service_account")) as GwsAuthMode;
+  if (authMode !== "service_account" && authMode !== "access_token") {
+    throw new Error(
+      `Unsupported Google Workspace auth_mode "${String(merged.authMode)}". Supported values: service_account, access_token. Interactive installed-app OAuth is not shipped yet; obtain a token externally and use access_token.`,
+    );
+  }
   const customerId = merged.customerId ?? "my_customer";
   const lookbackDays = Number.isFinite(merged.lookbackDays)
     ? Math.max(1, Math.min(180, Number(merged.lookbackDays)))
@@ -1282,7 +1556,7 @@ export async function resolveGwsConfiguration(
   };
 }
 
-export class GoogleWorkspaceAuditorClient {
+export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
   constructor(
     private readonly config: GwsResolvedConfig,
     private readonly fetchImpl: FetchImpl = fetch,
@@ -1294,117 +1568,146 @@ export class GoogleWorkspaceAuditorClient {
   }
 
   async probe(url: string, scopes: string[] = GWS_READ_SCOPES): Promise<GwsAccessProbe> {
-    const response = await this.request(url, scopes, { allowFailure: true });
     const pathname = new URL(url).pathname;
-    if (!response.ok) {
+    try {
+      const response = await this.request(url, scopes, { allowFailure: true });
+      if (!response.ok) {
+        return {
+          key: basename(pathname) || pathname,
+          path: pathname,
+          status: response.status === 401 ? "unauthorized" : response.status === 403 ? "forbidden" : "error",
+          detail: `${response.status} ${response.statusText}`,
+        };
+      }
       return {
         key: basename(pathname) || pathname,
         path: pathname,
-        status: response.status === 401 ? "unauthorized" : response.status === 403 ? "forbidden" : "error",
+        status: "ok",
         detail: `${response.status} ${response.statusText}`,
       };
+    } catch (error) {
+      return {
+        key: basename(pathname) || pathname,
+        path: pathname,
+        status: "error",
+        detail: summarizeError(error),
+      };
     }
-    return {
-      key: basename(pathname) || pathname,
-      path: pathname,
-      status: "ok",
-      detail: `${response.status} ${response.statusText}`,
-    };
+  }
+
+  private async paginate(
+    buildPageUrl: (pageToken: string | undefined, remaining: number) => string,
+    itemsKey: string,
+    maxItems: number,
+    scopes: string[] = GWS_READ_SCOPES,
+  ): Promise<GwsCollection> {
+    const items: JsonRecord[] = [];
+    let pageToken: string | undefined;
+    let pages = 0;
+    while (true) {
+      const payload = await this.fetchJson(buildPageUrl(pageToken, maxItems - items.length), scopes);
+      pages += 1;
+      items.push(...asArray(payload[itemsKey]).map(asRecord));
+      pageToken = asString(payload.nextPageToken);
+      if (!pageToken) return { items, truncated: false, pages };
+      if (items.length >= maxItems) return { items: items.slice(0, maxItems), truncated: true, pages };
+    }
+  }
+
+  async collectUsers(): Promise<GwsCollection> {
+    return this.paginate(
+      (pageToken) => buildAdminUrl("/admin/directory/v1/users", {
+        customer: this.config.customerId,
+        maxResults: USERS_PAGE_SIZE,
+        orderBy: "email",
+        sortOrder: "ASCENDING",
+        projection: "basic",
+        showDeleted: "false",
+        fields: USERS_FIELDS,
+        pageToken,
+      }),
+      "users",
+      MAX_USERS,
+    );
   }
 
   async listUsers(): Promise<JsonRecord[]> {
-    const items: JsonRecord[] = [];
-    let pageToken: string | undefined;
-    while (items.length < MAX_USERS) {
-      const payload = await this.fetchJson(
-        buildAdminUrl("/admin/directory/v1/users", {
-          customer: this.config.customerId,
-          maxResults: PAGE_SIZE,
-          orderBy: "email",
-          sortOrder: "ASCENDING",
-          projection: "basic",
-          showDeleted: "false",
-          fields: USERS_FIELDS,
-          pageToken,
-        }),
-      );
-      items.push(...asArray(payload.users).map(asRecord));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken) break;
-    }
-    return items.slice(0, MAX_USERS);
+    return (await this.collectUsers()).items;
+  }
+
+  async collectRoles(): Promise<GwsCollection> {
+    return this.paginate(
+      (pageToken) => buildAdminUrl(`/admin/directory/v1/customer/${encodeURIComponent(this.config.customerId)}/roles`, {
+        maxResults: ROLES_PAGE_SIZE,
+        pageToken,
+      }),
+      "items",
+      Number.POSITIVE_INFINITY,
+    );
   }
 
   async listRoles(): Promise<JsonRecord[]> {
-    const items: JsonRecord[] = [];
-    let pageToken: string | undefined;
-    while (true) {
-      const payload = await this.fetchJson(
-        buildAdminUrl(`/admin/directory/v1/customer/${encodeURIComponent(this.config.customerId)}/roles`, {
-          maxResults: PAGE_SIZE,
-          pageToken,
-        }),
-      );
-      items.push(...asArray(payload.items).map(asRecord));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken) break;
-    }
-    return items;
+    return (await this.collectRoles()).items;
+  }
+
+  async collectRoleAssignments(): Promise<GwsCollection> {
+    return this.paginate(
+      (pageToken) => buildAdminUrl(`/admin/directory/v1/customer/${encodeURIComponent(this.config.customerId)}/roleassignments`, {
+        maxResults: ROLE_ASSIGNMENTS_PAGE_SIZE,
+        pageToken,
+      }),
+      "items",
+      Number.POSITIVE_INFINITY,
+    );
   }
 
   async listRoleAssignments(): Promise<JsonRecord[]> {
-    const items: JsonRecord[] = [];
-    let pageToken: string | undefined;
-    while (true) {
-      const payload = await this.fetchJson(
-        buildAdminUrl(`/admin/directory/v1/customer/${encodeURIComponent(this.config.customerId)}/roleassignments`, {
-          maxResults: PAGE_SIZE,
-          pageToken,
-        }),
-      );
-      items.push(...asArray(payload.items).map(asRecord));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken) break;
-    }
-    return items;
+    return (await this.collectRoleAssignments()).items;
+  }
+
+  async collectActivities(applicationName: "login" | "admin" | "token"): Promise<GwsCollection> {
+    const startTime = new Date(Date.now() - this.config.lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+    return this.paginate(
+      (pageToken, remaining) => buildAdminUrl(`/admin/reports/v1/activity/users/all/applications/${applicationName}`, {
+        startTime,
+        maxResults: Math.max(1, Math.min(ACTIVITY_PAGE_SIZE, remaining)),
+        pageToken,
+      }),
+      "items",
+      MAX_ACTIVITY_RECORDS,
+    );
   }
 
   async listActivities(applicationName: "login" | "admin" | "token"): Promise<JsonRecord[]> {
-    const items: JsonRecord[] = [];
-    let pageToken: string | undefined;
-    const startTime = new Date(Date.now() - this.config.lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+    return (await this.collectActivities(applicationName)).items;
+  }
 
-    while (items.length < MAX_ACTIVITY_RECORDS) {
-      const payload = await this.fetchJson(
-        buildAdminUrl(`/admin/reports/v1/activity/users/all/applications/${applicationName}`, {
-          startTime,
-          maxResults: Math.min(PAGE_SIZE, MAX_ACTIVITY_RECORDS - items.length),
-          pageToken,
-        }),
-      );
-      items.push(...asArray(payload.items).map(asRecord));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken) break;
-    }
-
-    return items.slice(0, MAX_ACTIVITY_RECORDS);
+  async collectAlerts(): Promise<GwsCollection> {
+    return this.paginate(
+      (pageToken, remaining) => buildAlertsUrl("/v1beta1/alerts", {
+        pageSize: Math.max(1, Math.min(ALERTS_PAGE_SIZE, remaining)),
+        pageToken,
+      }),
+      "alerts",
+      MAX_ALERTS,
+    );
   }
 
   async listAlerts(): Promise<JsonRecord[]> {
-    const items: JsonRecord[] = [];
-    let pageToken: string | undefined;
-    while (items.length < MAX_ALERTS) {
-      const payload = await this.fetchJson(
-        buildAlertsUrl("/v1beta1/alerts", {
-          pageSize: Math.min(PAGE_SIZE, MAX_ALERTS - items.length),
-          pageToken,
-        }),
-      );
-      items.push(...asArray(payload.alerts).map(asRecord));
-      pageToken = asString(payload.nextPageToken);
-      if (!pageToken) break;
-    }
-    return items.slice(0, MAX_ALERTS);
+    return (await this.collectAlerts()).items;
+  }
+
+  async collectTwoStepPolicies(): Promise<GwsCollection> {
+    return this.paginate(
+      (pageToken) => buildCloudIdentityUrl("/v1/policies", {
+        pageSize: POLICIES_PAGE_SIZE,
+        filter: buildTwoStepPolicyFilter(this.config.customerId),
+        pageToken,
+      }),
+      "policies",
+      MAX_POLICIES,
+      GWS_POLICY_SCOPES,
+    );
   }
 
   async listUserTokens(userKey: string): Promise<JsonRecord[]> {
@@ -1430,9 +1733,6 @@ export class GoogleWorkspaceAuditorClient {
     });
 
     if (response.ok || options.allowFailure) {
-      if (!response.ok && !options.allowFailure && attempt >= MAX_RETRIES) {
-        throw new Error(await this.readError(response));
-      }
       return response;
     }
 
@@ -1446,7 +1746,7 @@ export class GoogleWorkspaceAuditorClient {
       return this.request(url, scopes, { ...options, attempt: attempt + 1 });
     }
 
-    throw new Error(await this.readError(response));
+    throw new GwsApiError(response.status, await this.readError(response), url);
   }
 
   private async readError(response: Response): Promise<string> {
@@ -1541,7 +1841,7 @@ export async function runGwsAccessCheck(
 ): Promise<GwsAccessCheckResult> {
   const probes = await Promise.all(
     GWS_ACCESS_PROBES.map(async (probe) => {
-      const result = await client.probe(probe.url(config));
+      const result = await client.probe(probe.url(config), [...probe.scopes]);
       return {
         ...result,
         key: probe.key,
@@ -1558,7 +1858,10 @@ export async function runGwsAccessCheck(
     config.authMode === "service_account"
       ? "Service-account auth assumes domain-wide delegation is configured for the supplied admin email."
       : "Access-token mode skips service-account token exchange and uses the provided bearer directly.",
-    "The first slice is intentionally bounded to Directory users and roles, Reports audit activity, Alert Center, and token inventory.",
+    "Surfaces: Directory users and roles, Reports audit activity, Alert Center, per-user token inventory, and Cloud Identity 2-step verification policies.",
+    okKeys.has("policies")
+      ? "The Cloud Identity Policy API is readable, so GWS-ID-005 can be evaluated automatically."
+      : "The Cloud Identity Policy API is not readable (scope cloud-identity.policies.readonly); GWS-ID-005 will render Manual until it is delegated.",
   ];
 
   return {
@@ -1574,41 +1877,17 @@ export async function runGwsAccessCheck(
   };
 }
 
-export async function collectGwsIdentityData(
-  client: GoogleWorkspaceAuditorClient,
-): Promise<GwsIdentityData> {
-  const [users, roles, roleAssignments, loginActivities] = await Promise.all([
-    collectDataset(() => client.listUsers()),
-    collectDataset(() => client.listRoles()),
-    collectDataset(() => client.listRoleAssignments()),
-    collectDataset(() => client.listActivities("login")),
-  ]);
-
-  return { users, roles, roleAssignments, loginActivities };
-}
-
-export async function collectGwsAdminAccessData(
-  client: GoogleWorkspaceAuditorClient,
-): Promise<GwsAdminAccessData> {
-  const [users, roles, roleAssignments, adminActivities] = await Promise.all([
-    collectDataset(() => client.listUsers()),
-    collectDataset(() => client.listRoles()),
-    collectDataset(() => client.listRoleAssignments()),
-    collectDataset(() => client.listActivities("admin")),
-  ]);
-
-  return { users, roles, roleAssignments, adminActivities };
-}
-
 async function collectTokenInventory(
-  client: GoogleWorkspaceAuditorClient,
+  client: Pick<GwsAuditCollector, "listUserTokens">,
   users: JsonRecord[],
+  population: number,
 ): Promise<CollectedDataset<TokenInventoryRecord[]>> {
   const records: TokenInventoryRecord[] = [];
   const errors: string[] = [];
+  let forbidden = 0;
   const collected = await mapWithConcurrency(users, 4, async (user) => {
     const userKey = asString(user.primaryEmail) ?? asString(user.id);
-    if (!userKey) return { records: [] as TokenInventoryRecord[], error: undefined };
+    if (!userKey) return { records: [] as TokenInventoryRecord[], error: undefined, kind: undefined as GwsEndpointStatus | undefined };
     try {
       const tokens = await client.listUserTokens(userKey);
       return {
@@ -1617,11 +1896,14 @@ async function collectTokenInventory(
           primaryEmail: asString(user.primaryEmail) ?? userKey,
           token,
         })),
+        error: undefined,
+        kind: undefined as GwsEndpointStatus | undefined,
       };
     } catch (error) {
       return {
         records: [] as TokenInventoryRecord[],
         error: `${userKey}: ${summarizeError(error)}`,
+        kind: classifyError(error),
       };
     }
   });
@@ -1629,48 +1911,202 @@ async function collectTokenInventory(
   for (const result of collected) {
     records.push(...result.records);
     if (result.error) errors.push(result.error);
+    if (result.kind === "forbidden" || result.kind === "unauthorized") forbidden += 1;
   }
 
   return {
     data: records,
     error: errors.length > 0 ? errors.join("; ") : undefined,
+    errorKind: errors.length > 0 ? (forbidden > 0 ? "forbidden" : "error") : undefined,
+    seen: users.length,
+    total: population,
+    failed: errors.length,
+    truncated: users.length < population,
   };
 }
 
-export async function collectGwsIntegrationData(
-  client: GoogleWorkspaceAuditorClient,
-): Promise<GwsIntegrationData> {
+export async function collectGwsAuditData(client: GwsAuditCollector): Promise<GwsAuditData> {
+  const [users, roles, roleAssignments, loginActivities, adminActivities, tokenActivities, alerts, twoStepPolicies] =
+    await Promise.all([
+      collectDataset(() => client.collectUsers()),
+      collectDataset(() => client.collectRoles()),
+      collectDataset(() => client.collectRoleAssignments()),
+      collectDataset(() => client.collectActivities("login")),
+      collectDataset(() => client.collectActivities("admin")),
+      collectDataset(() => client.collectActivities("token")),
+      collectDataset(() => client.collectAlerts()),
+      collectDataset(() => client.collectTwoStepPolicies()),
+    ]);
+
+  const privilegedContext = getPrivilegedUsers(users.data, roles.data, roleAssignments.data);
+  const tokenUsers = selectUsersForTokenInventory(users.data, privilegedContext.privilegedUsers);
+  const activePopulation = users.data.filter(isActiveUser).length;
+  const tokenInventory = await collectTokenInventory(client, tokenUsers, Math.max(activePopulation, tokenUsers.length));
+
+  return {
+    identity: { users, roles, roleAssignments, loginActivities, twoStepPolicies },
+    adminAccess: { users, roles, roleAssignments, adminActivities },
+    integrations: { users, roles, roleAssignments, tokenInventory, tokenActivities },
+    monitoring: { loginActivities, adminActivities, tokenActivities, alerts },
+  };
+}
+
+export async function collectGwsIdentityData(client: GwsAuditCollector): Promise<GwsIdentityData> {
+  const [users, roles, roleAssignments, loginActivities, twoStepPolicies] = await Promise.all([
+    collectDataset(() => client.collectUsers()),
+    collectDataset(() => client.collectRoles()),
+    collectDataset(() => client.collectRoleAssignments()),
+    collectDataset(() => client.collectActivities("login")),
+    collectDataset(() => client.collectTwoStepPolicies()),
+  ]);
+
+  return { users, roles, roleAssignments, loginActivities, twoStepPolicies };
+}
+
+export async function collectGwsAdminAccessData(client: GwsAuditCollector): Promise<GwsAdminAccessData> {
+  const [users, roles, roleAssignments, adminActivities] = await Promise.all([
+    collectDataset(() => client.collectUsers()),
+    collectDataset(() => client.collectRoles()),
+    collectDataset(() => client.collectRoleAssignments()),
+    collectDataset(() => client.collectActivities("admin")),
+  ]);
+
+  return { users, roles, roleAssignments, adminActivities };
+}
+
+export async function collectGwsIntegrationData(client: GwsAuditCollector): Promise<GwsIntegrationData> {
   const [users, roles, roleAssignments, tokenActivities] = await Promise.all([
-    collectDataset(() => client.listUsers()),
-    collectDataset(() => client.listRoles()),
-    collectDataset(() => client.listRoleAssignments()),
-    collectDataset(() => client.listActivities("token")),
+    collectDataset(() => client.collectUsers()),
+    collectDataset(() => client.collectRoles()),
+    collectDataset(() => client.collectRoleAssignments()),
+    collectDataset(() => client.collectActivities("token")),
   ]);
 
   const privilegedContext = getPrivilegedUsers(users.data, roles.data, roleAssignments.data);
   const tokenUsers = selectUsersForTokenInventory(users.data, privilegedContext.privilegedUsers);
-  const tokenInventory = await collectTokenInventory(client, tokenUsers);
+  const activePopulation = users.data.filter(isActiveUser).length;
+  const tokenInventory = await collectTokenInventory(client, tokenUsers, Math.max(activePopulation, tokenUsers.length));
 
-  return {
-    users,
-    roles,
-    roleAssignments,
-    tokenInventory,
-    tokenActivities,
-  };
+  return { users, roles, roleAssignments, tokenInventory, tokenActivities };
 }
 
-export async function collectGwsMonitoringData(
-  client: GoogleWorkspaceAuditorClient,
-): Promise<GwsMonitoringData> {
+export async function collectGwsMonitoringData(client: GwsAuditCollector): Promise<GwsMonitoringData> {
   const [loginActivities, adminActivities, tokenActivities, alerts] = await Promise.all([
-    collectDataset(() => client.listActivities("login")),
-    collectDataset(() => client.listActivities("admin")),
-    collectDataset(() => client.listActivities("token")),
-    collectDataset(() => client.listAlerts()),
+    collectDataset(() => client.collectActivities("login")),
+    collectDataset(() => client.collectActivities("admin")),
+    collectDataset(() => client.collectActivities("token")),
+    collectDataset(() => client.collectAlerts()),
   ]);
 
   return { loginActivities, adminActivities, tokenActivities, alerts };
+}
+
+const DIRECTORY_SCOPE_HINT = "admin.directory.user.readonly and admin.directory.rolemanagement.readonly";
+const REPORTS_SCOPE_HINT = "admin.reports.audit.readonly";
+const ALERTS_SCOPE_HINT = "apps.alerts";
+const TOKEN_SCOPE_HINT = "admin.directory.user.security";
+const POLICY_SCOPE_HINT = "cloud-identity.policies.readonly";
+
+function directoryUnreadable(
+  users: CollectedDataset<JsonRecord[]>,
+  roles: CollectedDataset<JsonRecord[]>,
+  roleAssignments: CollectedDataset<JsonRecord[]>,
+): { endpoint: string; dataset: CollectedDataset<JsonRecord[]> } | undefined {
+  if (users.error) return { endpoint: "Directory users.list", dataset: users };
+  if (roles.error) return { endpoint: "Directory roles.list", dataset: roles };
+  if (roleAssignments.error) return { endpoint: "Directory roleAssignments.list", dataset: roleAssignments };
+  return undefined;
+}
+
+function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined): GwsFinding {
+  if (!dataset) {
+    return buildFinding(
+      "GWS-ID-005",
+      "Manual",
+      "Cloud Identity Policy API data was not collected in this run, so the organization-level 2-step verification policy could not be evaluated.",
+      ["policies.list was not queried"],
+      "Re-run the identity assessment with the cloud-identity.policies.readonly scope delegated.",
+      "Collect manually: Admin console > Security > Authentication > 2-Step Verification enforcement setting per organizational unit.",
+    );
+  }
+  if (dataset.error) {
+    return unreadableFinding(
+      "GWS-ID-005",
+      "Cloud Identity policies.list",
+      dataset,
+      POLICY_SCOPE_HINT,
+      "Admin console > Security > Authentication > 2-Step Verification enforcement setting per organizational unit.",
+    );
+  }
+
+  const enforcement = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_ENFORCEMENT_SETTING);
+  const enrollment = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_ENROLLMENT_SETTING);
+  const factors = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_FACTOR_SETTING);
+  if (enforcement.length === 0) {
+    return buildFinding(
+      "GWS-ID-005",
+      "Manual",
+      `The Policy API returned ${dataset.data.length} 2-step verification policies but none of type ${TWO_STEP_ENFORCEMENT_SETTING}; emptiness is treated as an unconfirmed policy, not as compliance.`,
+      [`Policies returned: ${dataset.data.length}`],
+      "Confirm the Policy API is enabled for the customer and that the enforcement setting is returned, then re-run.",
+      "Collect manually: Admin console > Security > Authentication > 2-Step Verification > Enforcement for the root organizational unit.",
+    );
+  }
+
+  const now = Date.now();
+  const describeScope = (policy: JsonRecord): string => {
+    const query = asRecord(policy.policyQuery);
+    return asString(query.group) ? `group ${query.group as string}` : `orgUnit ${asString(query.orgUnit) ?? "unknown"}`;
+  };
+  const enforced = enforcement.filter((policy) => {
+    const value = asRecord(asRecord(policy.setting).value);
+    const enforcedFrom = parseDate(value.enforcedFrom);
+    return enforcedFrom !== undefined && enforcedFrom <= now;
+  });
+  const enrollmentDisabled = enrollment.filter((policy) => {
+    const value = asRecord(asRecord(policy.setting).value);
+    return asBoolean(value.allowEnrollment) === false;
+  });
+  const factorSets = Array.from(new Set(factors.map((policy) => {
+    const value = asRecord(asRecord(policy.setting).value);
+    return asString(value.allowedSignInFactorSet) ?? "unspecified";
+  })));
+  const evidence = [
+    `Enforcement policies returned: ${enforcement.length} (${enforcement.map((policy) => `${describeScope(policy)} [${asString(policy.type) ?? "type unknown"}]`).join("; ")})`,
+    `Enforcement policies with enforcedFrom at or before now: ${enforced.length}`,
+    `Enrollment policies with allowEnrollment=false: ${enrollmentDisabled.length}`,
+    `Allowed sign-in factor sets observed: ${factorSets.join(", ") || "none returned"}`,
+    ...partialViewEvidence("Policies", dataset),
+  ];
+
+  if (enforced.length === enforcement.length && enrollmentDisabled.length === 0) {
+    return withPartialCap(
+      buildFinding(
+        "GWS-ID-005",
+        "Pass",
+        "Every returned 2-step verification enforcement policy has an enforcedFrom timestamp in the past and enrollment is allowed everywhere.",
+        evidence,
+        "Keep enforcement on the root organizational unit and prefer passkey or NO_TELEPHONY factor sets for privileged units.",
+      ),
+      partialViewEvidence("Policies", dataset),
+    );
+  }
+  if (enforced.length > 0) {
+    return buildFinding(
+      "GWS-ID-005",
+      "Partial",
+      "2-step verification is enforced for some scopes, but at least one returned policy leaves enforcement unset, in the future, or blocks enrollment.",
+      evidence,
+      "Extend enforcement to every organizational unit and group, and make sure allowEnrollment is not disabled where enforcement applies.",
+    );
+  }
+  return buildFinding(
+    "GWS-ID-005",
+    "Fail",
+    "No returned 2-step verification enforcement policy has an active enforcedFrom timestamp; 2SV is not enforced by policy.",
+    evidence,
+    "Enable 2-Step Verification enforcement for the root organizational unit and set an enforcement date in the past.",
+  );
 }
 
 export function assessGwsIdentity(
@@ -1681,189 +2117,239 @@ export function assessGwsIdentity(
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
   const privileged = getPrivilegedUsers(users, roles, roleAssignments);
-  const activeUsers = users.filter((user) => asBoolean(user.suspended) !== true && asBoolean(user.archived) !== true);
+  const activeUsers = users.filter(isActiveUser);
   const enforcedUsers = activeUsers.filter((user) => asBoolean(user.isEnforcedIn2Sv) === true);
   const enrolledUsers = activeUsers.filter((user) => asBoolean(user.isEnrolledIn2Sv) === true);
   const privilegedEnforced = privileged.privilegedUsers.filter((user) => asBoolean(user.isEnforcedIn2Sv) === true);
   const superAdminEnforced = privileged.superAdmins.filter((user) => asBoolean(user.isEnforcedIn2Sv) === true);
   const dormantCutoff = Date.now() - DORMANT_DAYS * 24 * 60 * 60 * 1000;
-  const dormantUsers = countDormantUsers(activeUsers, dormantCutoff);
+  const dormancy = bucketDormancy(activeUsers, dormantCutoff);
+  const directoryProblem = directoryUnreadable(data.users, data.roles, data.roleAssignments);
+  const userPartial = partialViewEvidence("Users", data.users);
+  const privilegedPartial = privileged.unresolvedAssignments > 0
+    ? [`Role assignments pointing at users outside the collected listing: ${privileged.unresolvedAssignments}`]
+    : [];
 
   const findings: GwsFinding[] = [];
 
-  const privilegedCoverage = privileged.privilegedUsers.length === 0
-    ? 0
-    : privilegedEnforced.length / privileged.privilegedUsers.length;
-  findings.push(
-    privileged.privilegedUsers.length === 0
-      ? buildFinding(
-        "GWS-ID-001",
-        "Manual",
-        "No privileged users were identified from the collected data, so admin MFA posture could not be confirmed.",
-        [
-          `Users collected: ${users.length}`,
-          `Role assignments collected: ${roleAssignments.length}`,
-        ],
-        "Confirm the tenant has delegated or super-admin principals assigned, then re-run the assessment.",
-        "Google Workspace role coverage is required to distinguish normal users from privileged identities.",
-      )
-      : privilegedCoverage >= 1
-      ? buildFinding(
-        "GWS-ID-001",
-        "Pass",
-        "Every privileged user in the collected dataset enforces 2-step verification.",
-        [
-          `Privileged users: ${privileged.privilegedUsers.length}`,
-          `Privileged users enforced in 2SV: ${privilegedEnforced.length}`,
-        ],
-        "Keep delegated-admin reviews in place so newly privileged users stay covered by enforced 2SV.",
-      )
-      : privilegedCoverage >= 0.8
-      ? buildFinding(
-        "GWS-ID-001",
-        "Partial",
-        "Most privileged users enforce 2-step verification, but there are still uncovered admin identities.",
-        [
-          `Privileged users: ${privileged.privilegedUsers.length}`,
-          `Privileged users enforced in 2SV: ${privilegedEnforced.length}`,
-        ],
-        "Require enforced 2-step verification for the remaining privileged users before treating the tenant as strongly hardened.",
-      )
-      : buildFinding(
-        "GWS-ID-001",
-        "Fail",
-        "Too many privileged users lack enforced 2-step verification.",
-        [
-          `Privileged users: ${privileged.privilegedUsers.length}`,
-          `Privileged users enforced in 2SV: ${privilegedEnforced.length}`,
-        ],
-        "Make enforced 2-step verification mandatory for privileged users immediately.",
-      ),
-  );
+  if (directoryProblem) {
+    findings.push(unreadableFinding(
+      "GWS-ID-001",
+      directoryProblem.endpoint,
+      directoryProblem.dataset,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Directory > Users filtered to admins, with each admin's 2-Step Verification enforcement status.",
+    ));
+  } else if (privileged.privilegedUsers.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ID-001",
+      "Manual",
+      "No privileged users were identified, which cannot be a compliant state because every tenant has at least one super admin; treat this as a scoped or incomplete read.",
+      [
+        `Users collected: ${users.length}`,
+        `Role assignments collected: ${roleAssignments.length}`,
+        ...userPartial,
+      ],
+      "Confirm the delegated admin can read every user and role assignment, then re-run the assessment.",
+      "Collect manually: Admin console > Account > Admin roles, listing every assigned administrator.",
+    ));
+  } else {
+    const coverage = privilegedEnforced.length / privileged.privilegedUsers.length;
+    const evidence = [
+      `Privileged users: ${privileged.privilegedUsers.length}`,
+      `Privileged users with isEnforcedIn2Sv=true: ${privilegedEnforced.length}`,
+    ];
+    findings.push(withPartialCap(
+      coverage >= 1
+        ? buildFinding(
+          "GWS-ID-001",
+          "Pass",
+          "Every privileged user in the collected dataset has isEnforcedIn2Sv=true.",
+          evidence,
+          "Keep delegated-admin reviews in place so newly privileged users stay covered by enforced 2SV.",
+        )
+        : coverage >= 0.8
+          ? buildFinding(
+            "GWS-ID-001",
+            "Partial",
+            "Most privileged users enforce 2-step verification, but there are still uncovered admin identities.",
+            evidence,
+            "Require enforced 2-step verification for the remaining privileged users before treating the tenant as strongly hardened.",
+          )
+          : buildFinding(
+            "GWS-ID-001",
+            "Fail",
+            "Too many privileged users lack enforced 2-step verification.",
+            evidence,
+            "Make enforced 2-step verification mandatory for privileged users immediately.",
+          ),
+      [...userPartial, ...privilegedPartial],
+    ));
+  }
 
-  const userCoverage = activeUsers.length === 0 ? 0 : enforcedUsers.length / activeUsers.length;
-  findings.push(
-    activeUsers.length === 0
-      ? buildFinding(
-        "GWS-ID-002",
-        "Manual",
-        "No active users were available in the collected dataset, so broad 2SV coverage could not be assessed.",
-        [`Collected active users: ${activeUsers.length}`],
-        "Verify the delegated admin can read the user directory and re-run the assessment.",
-      )
-      : userCoverage >= 0.98
-      ? buildFinding(
-        "GWS-ID-002",
-        "Pass",
-        "2-step verification enforcement is near-universal across active users.",
-        [
-          `Active users: ${activeUsers.length}`,
-          `Users enforced in 2SV: ${enforcedUsers.length}`,
-          `Users enrolled in 2SV: ${enrolledUsers.length}`,
-        ],
-        "Maintain enrollment and enforcement checks so coverage stays high as users churn.",
-      )
-      : userCoverage >= 0.85
-      ? buildFinding(
-        "GWS-ID-002",
-        "Partial",
-        "2-step verification coverage is substantial but still leaves a meaningful population without enforced protection.",
-        [
-          `Active users: ${activeUsers.length}`,
-          `Users enforced in 2SV: ${enforcedUsers.length}`,
-          `Users enrolled in 2SV: ${enrolledUsers.length}`,
-        ],
-        "Close the remaining MFA enforcement gap, starting with the highest-risk org units and externally reachable users.",
-      )
-      : buildFinding(
-        "GWS-ID-002",
-        "Fail",
-        "Broad 2-step verification coverage is too low for a strong compliance posture.",
-        [
-          `Active users: ${activeUsers.length}`,
-          `Users enforced in 2SV: ${enforcedUsers.length}`,
-          `Users enrolled in 2SV: ${enrolledUsers.length}`,
-        ],
-        "Roll out enforced 2-step verification for the tenant in stages, prioritizing admins and high-risk populations first.",
-      ),
-  );
+  if (data.users.error) {
+    findings.push(unreadableFinding(
+      "GWS-ID-002",
+      "Directory users.list",
+      data.users,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Reporting > User reports > Security, exported with the 2-Step Verification enforcement column.",
+    ));
+  } else if (activeUsers.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ID-002",
+      "Manual",
+      "No active users were returned; an empty directory cannot be compliant because the auditing admin is itself a user, so the read is treated as scoped or incomplete.",
+      [`Users collected: ${users.length}`],
+      "Verify the delegated admin can read the whole user directory and re-run the assessment.",
+      "Collect manually: the Admin console user list with 2-Step Verification enrollment and enforcement columns.",
+    ));
+  } else {
+    const coverage = enforcedUsers.length / activeUsers.length;
+    const evidence = [
+      `Active users: ${activeUsers.length}`,
+      `Users with isEnforcedIn2Sv=true: ${enforcedUsers.length}`,
+      `Users with isEnrolledIn2Sv=true: ${enrolledUsers.length}`,
+    ];
+    findings.push(withPartialCap(
+      coverage >= 0.98
+        ? buildFinding(
+          "GWS-ID-002",
+          "Pass",
+          "2-step verification enforcement is near-universal across active users.",
+          evidence,
+          "Maintain enrollment and enforcement checks so coverage stays high as users churn.",
+        )
+        : coverage >= 0.85
+          ? buildFinding(
+            "GWS-ID-002",
+            "Partial",
+            "2-step verification coverage is substantial but still leaves a meaningful population without enforced protection.",
+            evidence,
+            "Close the remaining MFA enforcement gap, starting with the highest-risk org units and externally reachable users.",
+          )
+          : buildFinding(
+            "GWS-ID-002",
+            "Fail",
+            "Broad 2-step verification coverage is too low for a strong compliance posture.",
+            evidence,
+            "Roll out enforced 2-step verification for the tenant in stages, prioritizing admins and high-risk populations first.",
+          ),
+      userPartial,
+    ));
+  }
 
-  findings.push(
-    dormantUsers === 0
-      ? buildFinding(
-        "GWS-ID-003",
-        "Pass",
-        "No dormant active accounts were detected in the collected dataset.",
-        [
-          `Active users reviewed: ${activeUsers.length}`,
-          `Dormant active users (> ${DORMANT_DAYS} days or unknown last login): ${dormantUsers}`,
-        ],
-        "Keep periodic stale-account reviews in place so unused access does not accumulate.",
-      )
-      : dormantUsers <= Math.max(2, Math.ceil(activeUsers.length * 0.05))
-      ? buildFinding(
-        "GWS-ID-003",
-        "Partial",
-        "A small set of dormant active accounts needs review.",
-        [
-          `Active users reviewed: ${activeUsers.length}`,
-          `Dormant active users (> ${DORMANT_DAYS} days or unknown last login): ${dormantUsers}`,
-        ],
-        "Review dormant accounts and suspend or archive those that are no longer justified.",
-      )
-      : buildFinding(
-        "GWS-ID-003",
-        "Fail",
-        "There are too many dormant active accounts in the tenant.",
-        [
-          `Active users reviewed: ${activeUsers.length}`,
-          `Dormant active users (> ${DORMANT_DAYS} days or unknown last login): ${dormantUsers}`,
-        ],
-        "Perform a tenant-wide stale-account cleanup and tighten the joiner/mover/leaver review cadence.",
-      ),
-  );
+  if (data.users.error) {
+    findings.push(unreadableFinding(
+      "GWS-ID-003",
+      "Directory users.list",
+      data.users,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console user list sorted by last sign-in, identifying active accounts idle for more than 90 days.",
+    ));
+  } else if (activeUsers.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ID-003",
+      "Manual",
+      "No active users were returned, so dormancy could not be evaluated; emptiness is treated as an incomplete read rather than as zero dormant accounts.",
+      [`Users collected: ${users.length}`],
+      "Verify directory read access and re-run the assessment.",
+      "Collect manually: the Admin console user list with the last sign-in column.",
+    ));
+  } else {
+    const evidence = [
+      `Active users reviewed: ${activeUsers.length}`,
+      `Dormant active users (lastLoginTime older than ${DORMANT_DAYS} days): ${dormancy.dormant}`,
+      `Active users with no parseable lastLoginTime (reported separately, never counted as fresh): ${dormancy.unknownLastLogin}`,
+    ];
+    const unknownNotes = dormancy.unknownLastLogin > 0
+      ? [`${dormancy.unknownLastLogin} active user(s) have no lastLoginTime and need a manual freshness check`]
+      : [];
+    findings.push(withPartialCap(
+      dormancy.dormant === 0
+        ? buildFinding(
+          "GWS-ID-003",
+          "Pass",
+          "No dormant active accounts were detected among the users with a known last login.",
+          evidence,
+          "Keep periodic stale-account reviews in place so unused access does not accumulate.",
+        )
+        : dormancy.dormant <= Math.max(2, Math.ceil(activeUsers.length * 0.05))
+          ? buildFinding(
+            "GWS-ID-003",
+            "Partial",
+            "A small set of dormant active accounts needs review.",
+            evidence,
+            "Review dormant accounts and suspend or archive those that are no longer justified.",
+          )
+          : buildFinding(
+            "GWS-ID-003",
+            "Fail",
+            "There are too many dormant active accounts in the tenant.",
+            evidence,
+            "Perform a tenant-wide stale-account cleanup and tighten the joiner/mover/leaver review cadence.",
+          ),
+      [...userPartial, ...unknownNotes],
+    ));
+  }
 
-  findings.push(
-    privileged.superAdmins.length === 0
-      ? buildFinding(
-        "GWS-ID-004",
-        "Manual",
-        "No super-admin accounts were identified from the collected user and role data.",
-        [
-          `Role assignments collected: ${roleAssignments.length}`,
-          `Users with isAdmin=true: ${users.filter((user) => asBoolean(user.isAdmin) === true).length}`,
-        ],
-        "Confirm super-admin coverage manually if the tenant intentionally relies only on delegated roles.",
-      )
-      : superAdminEnforced.length === privileged.superAdmins.length
-      ? buildFinding(
-        "GWS-ID-004",
-        "Pass",
-        "All identified super admins enforce 2-step verification.",
-        [
-          `Super admins: ${privileged.superAdmins.length}`,
-          `Super admins enforced in 2SV: ${superAdminEnforced.length}`,
-        ],
-        "Keep the super-admin roster short and review it regularly.",
-      )
-      : buildFinding(
-        "GWS-ID-004",
-        "Fail",
-        "One or more identified super admins do not enforce 2-step verification.",
-        [
-          `Super admins: ${privileged.superAdmins.length}`,
-          `Super admins enforced in 2SV: ${superAdminEnforced.length}`,
-        ],
-        "Require enforced 2-step verification for every super-admin account immediately.",
-      ),
-  );
+  if (directoryProblem) {
+    findings.push(unreadableFinding(
+      "GWS-ID-004",
+      directoryProblem.endpoint,
+      directoryProblem.dataset,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Account > Admin roles > Super Admin, with each member's 2-Step Verification status.",
+    ));
+  } else if (privileged.superAdmins.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ID-004",
+      "Manual",
+      "No super-admin accounts were identified; every Google Workspace tenant has at least one, so the collected view is incomplete rather than compliant.",
+      [
+        `Role assignments collected: ${roleAssignments.length}`,
+        `Users with isAdmin=true: ${users.filter((user) => asBoolean(user.isAdmin) === true).length}`,
+        ...userPartial,
+      ],
+      "Confirm the audit principal can read super admins (users.list isAdmin and the _SEED_ADMIN_ROLE assignments) and re-run.",
+      "Collect manually: Admin console > Account > Admin roles > Super Admin membership.",
+    ));
+  } else {
+    const evidence = [
+      `Super admins: ${privileged.superAdmins.length}`,
+      `Super admins with isEnforcedIn2Sv=true: ${superAdminEnforced.length}`,
+    ];
+    findings.push(withPartialCap(
+      superAdminEnforced.length === privileged.superAdmins.length
+        ? buildFinding(
+          "GWS-ID-004",
+          "Pass",
+          "All identified super admins have isEnforcedIn2Sv=true.",
+          evidence,
+          "Keep the super-admin roster short and review it regularly.",
+        )
+        : buildFinding(
+          "GWS-ID-004",
+          "Fail",
+          "One or more identified super admins do not enforce 2-step verification.",
+          evidence,
+          "Require enforced 2-step verification for every super-admin account immediately.",
+        ),
+      [...userPartial, ...privilegedPartial],
+    ));
+  }
+
+  findings.push(assessTwoStepPolicy(data.twoStepPolicies));
 
   const snapshotSummary = {
     active_users: activeUsers.length,
+    users_seen_partial_view: data.users.truncated ? "yes" : "no",
     privileged_users: privileged.privilegedUsers.length,
     super_admins: privileged.superAdmins.length,
     users_enforced_in_2sv: enforcedUsers.length,
-    dormant_active_users: dormantUsers,
+    dormant_active_users: dormancy.dormant,
+    users_without_last_login: dormancy.unknownLastLogin,
+    two_step_policies: data.twoStepPolicies?.data.length ?? "not collected",
   };
 
   return {
@@ -1884,129 +2370,219 @@ export function assessGwsAdminAccess(
   const roleAssignments = data.roleAssignments.data;
   const privileged = getPrivilegedUsers(users, roles, roleAssignments);
   const staleCutoff = Date.now() - DORMANT_DAYS * 24 * 60 * 60 * 1000;
-  const suspendedPrivileged = privileged.privilegedUsers.filter((user) =>
-    asBoolean(user.suspended) === true || asBoolean(user.archived) === true);
-  const stalePrivileged = privileged.privilegedUsers.filter((user) => {
-    if (asBoolean(user.suspended) === true || asBoolean(user.archived) === true) return false;
-    const lastLogin = parseDate(user.lastLoginTime);
-    return !lastLogin || lastLogin < staleCutoff;
-  });
+  const suspendedPrivileged = privileged.privilegedUsers.filter((user) => !isActiveUser(user));
+  const stalePrivileged = bucketDormancy(privileged.privilegedUsers.filter(isActiveUser), staleCutoff);
+  const directoryProblem = directoryUnreadable(data.users, data.roles, data.roleAssignments);
+  const partialNotes = [
+    ...partialViewEvidence("Users", data.users),
+    ...(privileged.unresolvedAssignments > 0
+      ? [`Role assignments pointing at users outside the collected listing: ${privileged.unresolvedAssignments}`]
+      : []),
+  ];
 
   const findings: GwsFinding[] = [];
-  findings.push(
-    privileged.superAdmins.length <= 4
-      ? buildFinding(
-        "GWS-ADMIN-001",
-        "Pass",
-        "The tenant keeps the super-admin population constrained.",
-        [`Super admins identified: ${privileged.superAdmins.length}`],
-        "Maintain at least one break-glass administrator, but keep routine admin work delegated whenever possible.",
-      )
-      : privileged.superAdmins.length <= 6
-      ? buildFinding(
-        "GWS-ADMIN-001",
-        "Partial",
-        "The tenant has a moderately broad super-admin population.",
-        [`Super admins identified: ${privileged.superAdmins.length}`],
-        "Reduce routine Super Admin usage by migrating operators to delegated roles where possible.",
-      )
-      : buildFinding(
-        "GWS-ADMIN-001",
-        "Fail",
-        "The super-admin population is broader than a least-privilege posture would usually tolerate.",
-        [`Super admins identified: ${privileged.superAdmins.length}`],
-        "Shrink the super-admin set and move everyday administration into narrower delegated roles.",
-      ),
-  );
 
-  findings.push(
-    suspendedPrivileged.length === 0
-      ? buildFinding(
-        "GWS-ADMIN-002",
-        "Pass",
-        "No suspended or archived privileged accounts were identified.",
-        [`Privileged users reviewed: ${privileged.privilegedUsers.length}`],
-        "Keep deprovisioning reviews tied to privileged-role assignments.",
-      )
-      : buildFinding(
-        "GWS-ADMIN-002",
-        "Fail",
-        "Suspended or archived users still appear in the privileged population.",
-        [
-          `Privileged users reviewed: ${privileged.privilegedUsers.length}`,
-          `Suspended or archived privileged users: ${suspendedPrivileged.length}`,
-        ],
-        "Remove or verify every privileged assignment attached to suspended or archived identities.",
-      ),
-  );
+  if (directoryProblem) {
+    findings.push(unreadableFinding(
+      "GWS-ADMIN-001",
+      directoryProblem.endpoint,
+      directoryProblem.dataset,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Account > Admin roles > Super Admin membership count.",
+    ));
+  } else if (privileged.superAdmins.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ADMIN-001",
+      "Manual",
+      "No super admins were identified; every tenant has at least one, so the collected view is incomplete and the population cannot be judged constrained.",
+      [`Users collected: ${users.length}`, `Role assignments collected: ${roleAssignments.length}`, ...partialNotes],
+      "Confirm directory and role-assignment read access, then re-run.",
+      "Collect manually: Admin console > Account > Admin roles > Super Admin membership.",
+    ));
+  } else {
+    const evidence = [`Super admins identified: ${privileged.superAdmins.length}`];
+    findings.push(withPartialCap(
+      privileged.superAdmins.length <= 4
+        ? buildFinding(
+          "GWS-ADMIN-001",
+          "Pass",
+          "The tenant keeps the super-admin population constrained.",
+          evidence,
+          "Maintain at least one break-glass administrator, but keep routine admin work delegated whenever possible.",
+        )
+        : privileged.superAdmins.length <= 6
+          ? buildFinding(
+            "GWS-ADMIN-001",
+            "Partial",
+            "The tenant has a moderately broad super-admin population.",
+            evidence,
+            "Reduce routine Super Admin usage by migrating operators to delegated roles where possible.",
+          )
+          : buildFinding(
+            "GWS-ADMIN-001",
+            "Fail",
+            "The super-admin population is broader than a least-privilege posture would usually tolerate.",
+            evidence,
+            "Shrink the super-admin set and move everyday administration into narrower delegated roles.",
+          ),
+      partialNotes,
+    ));
+  }
 
-  findings.push(
-    privileged.delegatedAdmins.length > 0
-      ? buildFinding(
-        "GWS-ADMIN-003",
-        "Pass",
-        "The tenant uses delegated or custom admin roles in addition to super-admin access.",
-        [
-          `Delegated admin users identified: ${privileged.delegatedAdmins.length}`,
-          `Total privileged users: ${privileged.privilegedUsers.length}`,
-        ],
-        "Continue using delegated roles to keep Super Admin access exceptional.",
-      )
-      : buildFinding(
-        "GWS-ADMIN-003",
-        "Manual",
-        "The collected data did not show clear delegated-admin usage beyond Super Admin.",
-        [
-          `Delegated admin users identified: ${privileged.delegatedAdmins.length}`,
-          `Total privileged users: ${privileged.privilegedUsers.length}`,
-        ],
-        "Review whether the tenant intentionally uses only Super Admin or whether delegated roles should be expanded.",
-      ),
-  );
+  if (directoryProblem) {
+    findings.push(unreadableFinding(
+      "GWS-ADMIN-002",
+      directoryProblem.endpoint,
+      directoryProblem.dataset,
+      DIRECTORY_SCOPE_HINT,
+      "Admin role membership cross-checked against suspended and archived users.",
+    ));
+  } else if (privileged.privilegedUsers.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ADMIN-002",
+      "Manual",
+      "No privileged users were identified, so the privileged lifecycle could not be checked; emptiness is treated as an incomplete read.",
+      [`Users collected: ${users.length}`, ...partialNotes],
+      "Confirm directory and role-assignment read access, then re-run.",
+      "Collect manually: Admin role membership cross-checked against suspended and archived users.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      suspendedPrivileged.length === 0
+        ? buildFinding(
+          "GWS-ADMIN-002",
+          "Pass",
+          "No suspended or archived privileged accounts were identified among the privileged population.",
+          [`Privileged users reviewed: ${privileged.privilegedUsers.length}`],
+          "Keep deprovisioning reviews tied to privileged-role assignments.",
+        )
+        : buildFinding(
+          "GWS-ADMIN-002",
+          "Fail",
+          "Suspended or archived users still appear in the privileged population.",
+          [
+            `Privileged users reviewed: ${privileged.privilegedUsers.length}`,
+            `Suspended or archived privileged users: ${suspendedPrivileged.length}`,
+          ],
+          "Remove or verify every privileged assignment attached to suspended or archived identities.",
+        ),
+      partialNotes,
+    ));
+  }
 
-  findings.push(
-    data.adminActivities.error
-      ? buildFinding(
-        "GWS-ADMIN-004",
-        "Fail",
-        "Admin audit activity could not be read with the supplied principal.",
-        [`Admin activity error: ${data.adminActivities.error}`],
-        "Grant the Reports audit scope and verify delegated-admin permissions for admin activity visibility.",
-      )
-      : buildFinding(
+  if (directoryProblem) {
+    findings.push(unreadableFinding(
+      "GWS-ADMIN-003",
+      directoryProblem.endpoint,
+      directoryProblem.dataset,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Account > Admin roles, listing delegated and custom role assignments.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      privileged.delegatedAdmins.length > 0
+        ? buildFinding(
+          "GWS-ADMIN-003",
+          "Pass",
+          "The tenant uses delegated or custom admin roles in addition to super-admin access.",
+          [
+            `Delegated admin users identified: ${privileged.delegatedAdmins.length}`,
+            `Total privileged users: ${privileged.privilegedUsers.length}`,
+          ],
+          "Continue using delegated roles to keep Super Admin access exceptional.",
+        )
+        : buildFinding(
+          "GWS-ADMIN-003",
+          "Manual",
+          "The collected data did not show delegated-admin usage beyond Super Admin; an empty delegated set is not treated as compliant.",
+          [
+            `Delegated admin users identified: ${privileged.delegatedAdmins.length}`,
+            `Total privileged users: ${privileged.privilegedUsers.length}`,
+          ],
+          "Review whether the tenant intentionally uses only Super Admin or whether delegated roles should be expanded.",
+          "Collect manually: the documented administrative model and the role assignment list.",
+        ),
+      partialNotes,
+    ));
+  }
+
+  if (data.adminActivities.error) {
+    findings.push(unreadableFinding(
+      "GWS-ADMIN-004",
+      "Reports activities.list (applicationName=admin)",
+      data.adminActivities,
+      REPORTS_SCOPE_HINT,
+      "Admin console > Reporting > Audit and investigation > Admin log events for the review window.",
+    ));
+  } else if (data.adminActivities.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ADMIN-004",
+      "Manual",
+      `The admin audit log returned zero events for the ${config.lookbackDays}-day window; an empty window is treated as unconfirmed observability rather than as a pass.`,
+      ["Admin activities collected: 0"],
+      "Confirm admin audit logging is retained and that the window contains expected administrative changes.",
+      "Collect manually: Admin console > Reporting > Audit and investigation > Admin log events.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-ADMIN-004",
         "Pass",
         "Admin activity telemetry is readable for the configured lookback window.",
-        [`Admin activities collected: ${data.adminActivities.data.length}`],
+        [`Admin activities collected: ${data.adminActivities.data.length} across ${data.adminActivities.pages ?? 1} page(s)`],
         "Use the admin activity stream during periodic privileged-access reviews and incident response.",
       ),
-  );
+      partialViewEvidence("Admin activities", data.adminActivities),
+    ));
+  }
 
-  findings.push(
-    privileged.groupAssignmentCount === 0
-      ? buildFinding(
+  if (data.roleAssignments.error) {
+    findings.push(unreadableFinding(
+      "GWS-ADMIN-005",
+      "Directory roleAssignments.list",
+      data.roleAssignments,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Account > Admin roles, listing group-based assignments.",
+    ));
+  } else if (roleAssignments.length === 0) {
+    findings.push(buildFinding(
+      "GWS-ADMIN-005",
+      "Manual",
+      "No role assignments were returned; every tenant has at least the super-admin assignment, so the empty list is treated as an incomplete read.",
+      ["Role assignments collected: 0"],
+      "Confirm the rolemanagement.readonly scope and re-run.",
+      "Collect manually: Admin console > Account > Admin roles, listing group-based assignments.",
+    ));
+  } else if (privileged.groupAssignmentCount === 0) {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-ADMIN-005",
         "Pass",
-        "No group-based role assignments were detected in the collected dataset.",
-        [`Group role assignments: ${privileged.groupAssignmentCount}`],
+        "No group-based role assignments exist among the returned assignments (assigneeType=GROUP count is zero within a non-empty assignment inventory), which is compliant by intent.",
+        [`Role assignments reviewed: ${roleAssignments.length}`, `Group role assignments: ${privileged.groupAssignmentCount}`],
         "Keep group-based privileged grants documented if they are introduced later.",
-      )
-      : buildFinding(
-        "GWS-ADMIN-005",
-        "Manual",
-        "Group-based role assignments exist and need explicit membership review.",
-        [`Group role assignments: ${privileged.groupAssignmentCount}`],
-        "Review security-group membership and make sure external or stale principals cannot inherit admin access indirectly.",
-        "This first slice does not expand group membership, so the inherited privileged population needs a manual spot check.",
       ),
-  );
+      partialViewEvidence("Role assignments", data.roleAssignments),
+    ));
+  } else {
+    findings.push(buildFinding(
+      "GWS-ADMIN-005",
+      "Manual",
+      "Group-based role assignments exist and need explicit membership review.",
+      [`Group role assignments: ${privileged.groupAssignmentCount}`],
+      "Review security-group membership and make sure external or stale principals cannot inherit admin access indirectly.",
+      "This slice does not expand group membership, so the inherited privileged population needs a manual spot check.",
+    ));
+  }
 
   const snapshotSummary = {
     privileged_users: privileged.privilegedUsers.length,
     super_admins: privileged.superAdmins.length,
     delegated_admins: privileged.delegatedAdmins.length,
-    stale_privileged_users: stalePrivileged.length,
+    stale_privileged_users: stalePrivileged.dormant,
+    privileged_users_without_last_login: stalePrivileged.unknownLastLogin,
     group_role_assignments: privileged.groupAssignmentCount,
+    users_seen_partial_view: data.users.truncated ? "yes" : "no",
   };
 
   return {
@@ -2029,112 +2605,208 @@ export function assessGwsIntegrations(
   const uniqueClients = uniqueClientDisplayNames(allTokens);
   const highRiskTokens = countHighRiskTokens(allTokens);
   const tokenEvents = extractActivityEventNames(data.tokenActivities.data);
+  const sampled = data.tokenInventory.seen ?? 0;
+  const population = data.tokenInventory.total ?? sampled;
+  const failed = data.tokenInventory.failed ?? 0;
+  const directoryProblem = directoryUnreadable(data.users, data.roles, data.roleAssignments);
+  const sampleNotes = [
+    ...(sampled < population ? [`Token inventory sample: seen ${sampled} of ${population} active users (privileged users first)`] : []),
+    ...(failed > 0 ? [`Per-user token reads that failed: ${failed}`] : []),
+    ...partialViewEvidence("Users", data.users),
+  ];
+  const inventoryEvidence = [
+    `Users sampled for token inventory: ${sampled}`,
+    `Token records collected: ${allTokens.length}`,
+  ];
 
   const findings: GwsFinding[] = [];
-  findings.push(
-    data.tokenInventory.error
-      ? buildFinding(
-        "GWS-INTEG-001",
-        "Partial",
-        "Third-party token inventory was only partially readable.",
-        [
-          `Token inventory errors: ${data.tokenInventory.error}`,
-          `Token records collected: ${allTokens.length}`,
-        ],
-        "Grant the admin.directory.user.security scope and verify the delegated admin can enumerate third-party tokens.",
-      )
-      : buildFinding(
+
+  if (data.users.error) {
+    findings.push(unreadableFinding(
+      "GWS-INTEG-001",
+      "Directory users.list",
+      data.users,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Security > API controls > App access control, listing authorized third-party apps.",
+    ));
+  } else if (sampled === 0) {
+    findings.push(buildFinding(
+      "GWS-INTEG-001",
+      "Manual",
+      "No users were available to sample for token inventory, so readability could not be demonstrated.",
+      inventoryEvidence,
+      "Confirm directory read access, then re-run the integrations assessment.",
+      "Collect manually: Admin console > Security > API controls > App access control.",
+    ));
+  } else if (failed === sampled) {
+    findings.push(unreadableFinding(
+      "GWS-INTEG-001",
+      "Directory tokens.list",
+      data.tokenInventory,
+      TOKEN_SCOPE_HINT,
+      "Admin console > Security > API controls > App access control, plus per-user connected apps.",
+    ));
+  } else if (failed > 0) {
+    findings.push(buildFinding(
+      "GWS-INTEG-001",
+      "Partial",
+      "Third-party token inventory was only partially readable.",
+      [...inventoryEvidence, `Token inventory errors: ${data.tokenInventory.error}`, ...sampleNotes],
+      "Grant the admin.directory.user.security scope and verify the delegated admin can enumerate third-party tokens for every user.",
+    ));
+  } else if (allTokens.length === 0) {
+    findings.push(buildFinding(
+      "GWS-INTEG-001",
+      "Manual",
+      `tokens.list responded for all ${sampled} sampled users but returned no tokens; an empty inventory is reported for confirmation rather than treated as a pass.`,
+      [...inventoryEvidence, ...sampleNotes],
+      "Confirm in the Admin console that no third-party apps are authorized, or widen the sample.",
+      "Collect manually: Admin console > Security > API controls > App access control > Configured apps.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-INTEG-001",
         "Pass",
         "Third-party token inventory is readable for the sampled users.",
-        [
-          `Users sampled for token inventory: ${Math.min(MAX_TOKEN_USERS, data.users.data.length)}`,
-          `Token records collected: ${allTokens.length}`,
-        ],
+        inventoryEvidence,
         "Use the token inventory during third-party app reviews and user-access attestations.",
       ),
-  );
+      sampleNotes,
+    ));
+  }
 
-  findings.push(
-    privilegedTokens.length === 0
-      ? buildFinding(
-        "GWS-INTEG-002",
-        "Pass",
-        "No third-party tokens were observed for privileged users in the sampled inventory.",
-        [
-          `Privileged users sampled: ${Math.min(privileged.privilegedUsers.length, MAX_TOKEN_USERS)}`,
-          `Privileged third-party tokens: ${privilegedTokens.length}`,
-        ],
-        "Keep privileged accounts clean of unnecessary third-party OAuth grants.",
-      )
-      : privilegedTokens.length <= 3
-      ? buildFinding(
-        "GWS-INTEG-002",
-        "Partial",
-        "A small number of privileged users still hold third-party OAuth tokens.",
-        [
-          `Privileged third-party tokens: ${privilegedTokens.length}`,
-          `Privileged token clients: ${uniqueClientDisplayNames(privilegedTokens).join(", ") || "none"}`,
-        ],
-        "Review each privileged OAuth grant and remove anything not strictly required for administration or incident response.",
-      )
-      : buildFinding(
-        "GWS-INTEG-002",
-        "Fail",
-        "Privileged-user third-party token exposure is broader than expected.",
-        [
-          `Privileged third-party tokens: ${privilegedTokens.length}`,
-          `Privileged token clients: ${uniqueClientDisplayNames(privilegedTokens).join(", ") || "none"}`,
-        ],
-        "Perform a privileged OAuth cleanup and require explicit approval for any remaining third-party grants.",
-      ),
-  );
+  const privilegedSampled = privileged.privilegedUsers.length <= MAX_TOKEN_USERS;
+  if (directoryProblem) {
+    findings.push(unreadableFinding(
+      "GWS-INTEG-002",
+      directoryProblem.endpoint,
+      directoryProblem.dataset,
+      DIRECTORY_SCOPE_HINT,
+      "Connected third-party apps for each administrator account.",
+    ));
+  } else if (privileged.privilegedUsers.length === 0 || allTokens.length === 0 || failed > 0 && privilegedTokens.length === 0) {
+    findings.push(buildFinding(
+      "GWS-INTEG-002",
+      "Manual",
+      "Privileged OAuth exposure could not be confirmed: the privileged set or the token inventory is empty or partially unreadable, so zero privileged tokens is not treated as a pass.",
+      [
+        `Privileged users identified: ${privileged.privilegedUsers.length}`,
+        `Token records collected: ${allTokens.length}`,
+        `Privileged third-party tokens: ${privilegedTokens.length}`,
+        ...sampleNotes,
+      ],
+      "Restore full directory and token readability, then re-run.",
+      "Collect manually: connected third-party apps for each administrator account.",
+    ));
+  } else {
+    const evidence = [
+      `Privileged users sampled: ${Math.min(privileged.privilegedUsers.length, MAX_TOKEN_USERS)} of ${privileged.privilegedUsers.length}`,
+      `Privileged third-party tokens: ${privilegedTokens.length}`,
+      `Privileged token clients: ${uniqueClientDisplayNames(privilegedTokens).join(", ") || "none"}`,
+    ];
+    const capNotes = [
+      ...(privilegedSampled ? [] : [`Privileged users beyond the ${MAX_TOKEN_USERS}-user token sample were not inspected`]),
+      ...partialViewEvidence("Users", data.users),
+    ];
+    findings.push(withPartialCap(
+      privilegedTokens.length === 0
+        ? buildFinding(
+          "GWS-INTEG-002",
+          "Pass",
+          "No third-party tokens were observed for privileged users within a non-empty token inventory.",
+          evidence,
+          "Keep privileged accounts clean of unnecessary third-party OAuth grants.",
+        )
+        : privilegedTokens.length <= 3
+          ? buildFinding(
+            "GWS-INTEG-002",
+            "Partial",
+            "A small number of privileged users still hold third-party OAuth tokens.",
+            evidence,
+            "Review each privileged OAuth grant and remove anything not strictly required for administration or incident response.",
+          )
+          : buildFinding(
+            "GWS-INTEG-002",
+            "Fail",
+            "Privileged-user third-party token exposure is broader than expected.",
+            evidence,
+            "Perform a privileged OAuth cleanup and require explicit approval for any remaining third-party grants.",
+          ),
+      capNotes,
+    ));
+  }
 
-  findings.push(
-    highRiskTokens === 0
-      ? buildFinding(
-        "GWS-INTEG-003",
-        "Pass",
-        "No clearly high-scope third-party tokens were found in the sampled inventory.",
-        [
-          `Third-party clients observed: ${uniqueClients.length}`,
-          `High-scope token records: ${highRiskTokens}`,
-        ],
-        "Keep reviewing third-party client scopes before approving new apps.",
-      )
-      : highRiskTokens <= 5
-      ? buildFinding(
-        "GWS-INTEG-003",
-        "Partial",
-        "A limited set of third-party tokens carries broad scopes.",
-        [
-          `Third-party clients observed: ${uniqueClients.length}`,
-          `High-scope token records: ${highRiskTokens}`,
-        ],
-        "Review high-scope apps and trim or revoke unnecessary grants, especially those touching admin, Drive, Gmail, or cloud-platform scopes.",
-      )
-      : buildFinding(
-        "GWS-INTEG-003",
-        "Fail",
-        "High-scope third-party OAuth sprawl is too broad in the sampled inventory.",
-        [
-          `Third-party clients observed: ${uniqueClients.length}`,
-          `High-scope token records: ${highRiskTokens}`,
-        ],
-        "Run a focused OAuth app review and clean up broad-scope third-party access before treating the environment as well-controlled.",
-      ),
-  );
+  if (data.users.error) {
+    findings.push(unreadableFinding(
+      "GWS-INTEG-003",
+      "Directory users.list",
+      data.users,
+      DIRECTORY_SCOPE_HINT,
+      "Admin console > Security > API controls > App access control with requested scopes per app.",
+    ));
+  } else if (allTokens.length === 0) {
+    findings.push(buildFinding(
+      "GWS-INTEG-003",
+      "Manual",
+      "The token inventory is empty or unreadable, so high-scope app sprawl could not be measured; emptiness is not treated as a pass.",
+      [`Token records collected: ${allTokens.length}`, ...sampleNotes],
+      "Restore token readability or confirm the tenant has no authorized third-party apps.",
+      "Collect manually: Admin console > Security > API controls > App access control with scopes per app.",
+    ));
+  } else {
+    const evidence = [
+      `Third-party clients observed: ${uniqueClients.length}`,
+      `High-scope token records: ${highRiskTokens}`,
+    ];
+    findings.push(withPartialCap(
+      highRiskTokens === 0
+        ? buildFinding(
+          "GWS-INTEG-003",
+          "Pass",
+          "No high-scope third-party tokens were found in the sampled inventory.",
+          evidence,
+          "Keep reviewing third-party client scopes before approving new apps.",
+        )
+        : highRiskTokens <= 5
+          ? buildFinding(
+            "GWS-INTEG-003",
+            "Partial",
+            "A limited set of third-party tokens carries broad scopes.",
+            evidence,
+            "Review high-scope apps and trim or revoke unnecessary grants, especially those touching admin, Drive, Gmail, or cloud-platform scopes.",
+          )
+          : buildFinding(
+            "GWS-INTEG-003",
+            "Fail",
+            "High-scope third-party OAuth sprawl is too broad in the sampled inventory.",
+            evidence,
+            "Run a focused OAuth app review and clean up broad-scope third-party access before treating the environment as well-controlled.",
+          ),
+      sampleNotes,
+    ));
+  }
 
-  findings.push(
-    data.tokenActivities.error
-      ? buildFinding(
-        "GWS-INTEG-004",
-        "Fail",
-        "Token activity reports were not readable with the supplied principal.",
-        [`Token activity error: ${data.tokenActivities.error}`],
-        "Grant the Reports audit scope and confirm the delegated admin can read token audit activity.",
-      )
-      : buildFinding(
+  if (data.tokenActivities.error) {
+    findings.push(unreadableFinding(
+      "GWS-INTEG-004",
+      "Reports activities.list (applicationName=token)",
+      data.tokenActivities,
+      REPORTS_SCOPE_HINT,
+      "Admin console > Reporting > Audit and investigation > OAuth log events.",
+    ));
+  } else if (data.tokenActivities.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-INTEG-004",
+      "Manual",
+      `The token audit log returned zero events for the ${config.lookbackDays}-day window; an empty window is treated as unconfirmed telemetry rather than as a pass.`,
+      ["Token activity records collected: 0"],
+      "Confirm OAuth log events are retained and that the window should contain authorizations.",
+      "Collect manually: Admin console > Reporting > Audit and investigation > OAuth log events.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-INTEG-004",
         "Pass",
         "Token activity telemetry is readable for the configured lookback window.",
@@ -2144,14 +2816,18 @@ export function assessGwsIntegrations(
         ],
         "Use token-activity reporting to support OAuth app reviews and incident triage.",
       ),
-  );
+      partialViewEvidence("Token activities", data.tokenActivities),
+    ));
+  }
 
   const snapshotSummary = {
-    sampled_users: Math.min(MAX_TOKEN_USERS, data.users.data.length),
+    sampled_users: sampled,
+    active_user_population: population,
     privileged_users: privileged.privilegedUsers.length,
     token_records: allTokens.length,
     privileged_token_records: privilegedTokens.length,
     high_scope_token_records: highRiskTokens,
+    token_read_failures: failed,
     token_activity_records: data.tokenActivities.data.length,
   };
 
@@ -2169,140 +2845,204 @@ export function assessGwsMonitoring(
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
   const suspiciousLogins = countMatchingEvents(data.loginActivities.data, SUSPICIOUS_LOGIN_NAMES);
-  const openAlerts = countOpenAlerts(data.alerts.data);
+  const alerts = bucketAlerts(data.alerts.data);
 
   const findings: GwsFinding[] = [];
-  findings.push(
-    data.alerts.error
-      ? buildFinding(
-        "GWS-MON-001",
-        "Fail",
-        "Alert Center was not readable with the supplied principal.",
-        [`Alert Center error: ${data.alerts.error}`],
-        "Enable the Alert Center API and grant the apps.alerts scope to the delegated service account.",
-      )
-      : buildFinding(
+
+  if (data.alerts.error) {
+    findings.push(unreadableFinding(
+      "GWS-MON-001",
+      "Alert Center alerts.list",
+      data.alerts,
+      ALERTS_SCOPE_HINT,
+      "Admin console > Security > Alert center, confirming the alert list loads for the tenant.",
+    ));
+  } else if (data.alerts.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-MON-001",
+      "Manual",
+      "Alert Center responded but returned zero alerts; an empty list is reported for confirmation rather than treated as proof of a healthy alerting pipeline.",
+      ["Alerts collected: 0"],
+      "Confirm Alert Center is enabled and that system-defined rules are turned on for the tenant.",
+      "Collect manually: Admin console > Security > Alert center and Rules.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-MON-001",
         "Pass",
         "Alert Center is readable for the tenant.",
-        [`Alerts collected: ${data.alerts.data.length}`],
-        "Use Alert Center as one of the tenant’s primary security-monitoring inputs.",
+        [`Alerts collected: ${data.alerts.data.length} across ${data.alerts.pages ?? 1} page(s)`],
+        "Use Alert Center as one of the tenant's primary security-monitoring inputs.",
       ),
-  );
+      partialViewEvidence("Alerts", data.alerts),
+    ));
+  }
 
-  findings.push(
-    suspiciousLogins === 0
-      ? buildFinding(
-        "GWS-MON-002",
-        "Pass",
-        "No suspicious-login events were observed in the current lookback window.",
-        [
-          `Login activity records collected: ${data.loginActivities.data.length}`,
-          `Suspicious login signals: ${suspiciousLogins}`,
-        ],
-        "Keep reviewing login telemetry for spikes or new event types as part of routine monitoring.",
-      )
-      : suspiciousLogins <= 5
-      ? buildFinding(
-        "GWS-MON-002",
-        "Partial",
-        "A small suspicious-login backlog needs review.",
-        [
-          `Login activity records collected: ${data.loginActivities.data.length}`,
-          `Suspicious login signals: ${suspiciousLogins}`,
-        ],
-        "Review the suspicious-login events and make sure they were triaged, blocked, or otherwise resolved.",
-      )
-      : buildFinding(
-        "GWS-MON-002",
-        "Fail",
-        "Suspicious-login volume in the lookback window is too high to ignore.",
-        [
-          `Login activity records collected: ${data.loginActivities.data.length}`,
-          `Suspicious login signals: ${suspiciousLogins}`,
-        ],
-        "Escalate suspicious-login review immediately and confirm the tenant’s response workflow is keeping up.",
-      ),
-  );
+  if (data.loginActivities.error) {
+    findings.push(unreadableFinding(
+      "GWS-MON-002",
+      "Reports activities.list (applicationName=login)",
+      data.loginActivities,
+      REPORTS_SCOPE_HINT,
+      "Admin console > Reporting > Audit and investigation > User log events filtered to suspicious login events.",
+    ));
+  } else if (data.loginActivities.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-MON-002",
+      "Manual",
+      `The login audit log returned zero events for the ${config.lookbackDays}-day window, so the suspicious-login backlog could not be measured; emptiness is not treated as a pass.`,
+      ["Login activity records collected: 0"],
+      "Confirm login audit logging is retained and that users signed in during the window.",
+      "Collect manually: Admin console > Reporting > Audit and investigation > User log events.",
+    ));
+  } else {
+    const evidence = [
+      `Login activity records collected: ${data.loginActivities.data.length}`,
+      `Suspicious login signals: ${suspiciousLogins}`,
+    ];
+    findings.push(withPartialCap(
+      suspiciousLogins === 0
+        ? buildFinding(
+          "GWS-MON-002",
+          "Pass",
+          "No suspicious-login events were observed in the current lookback window.",
+          evidence,
+          "Keep reviewing login telemetry for spikes or new event types as part of routine monitoring.",
+        )
+        : suspiciousLogins <= 5
+          ? buildFinding(
+            "GWS-MON-002",
+            "Partial",
+            "A small suspicious-login backlog needs review.",
+            evidence,
+            "Review the suspicious-login events and make sure they were triaged, blocked, or otherwise resolved.",
+          )
+          : buildFinding(
+            "GWS-MON-002",
+            "Fail",
+            "Suspicious-login volume in the lookback window is too high to ignore.",
+            evidence,
+            "Escalate suspicious-login review immediately and confirm the tenant's response workflow is keeping up.",
+          ),
+      partialViewEvidence("Login activities", data.loginActivities),
+    ));
+  }
 
-  findings.push(
-    data.adminActivities.error
-      ? buildFinding(
-        "GWS-MON-003",
-        "Fail",
-        "Admin audit telemetry was not readable with the supplied principal.",
-        [`Admin activity error: ${data.adminActivities.error}`],
-        "Grant the Reports audit scope and verify the delegated admin can read admin activities.",
-      )
-      : buildFinding(
+  if (data.adminActivities.error) {
+    findings.push(unreadableFinding(
+      "GWS-MON-003",
+      "Reports activities.list (applicationName=admin)",
+      data.adminActivities,
+      REPORTS_SCOPE_HINT,
+      "Admin console > Reporting > Audit and investigation > Admin log events.",
+    ));
+  } else if (data.adminActivities.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-MON-003",
+      "Manual",
+      `The admin audit log returned zero events for the ${config.lookbackDays}-day window; emptiness is not treated as proof of telemetry.`,
+      ["Admin activity records collected: 0"],
+      "Confirm admin audit logging is retained for the tenant.",
+      "Collect manually: Admin console > Reporting > Audit and investigation > Admin log events.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-MON-003",
         "Pass",
         "Admin audit telemetry is readable for the configured lookback window.",
         [`Admin activity records collected: ${data.adminActivities.data.length}`],
         "Use admin activity as a standing control for privileged-change review and investigations.",
       ),
-  );
+      partialViewEvidence("Admin activities", data.adminActivities),
+    ));
+  }
 
-  findings.push(
-    data.tokenActivities.error
-      ? buildFinding(
-        "GWS-MON-004",
-        "Fail",
-        "Token audit telemetry was not readable with the supplied principal.",
-        [`Token activity error: ${data.tokenActivities.error}`],
-        "Grant the Reports audit scope and confirm token activity is accessible for the delegated admin.",
-      )
-      : buildFinding(
+  if (data.tokenActivities.error) {
+    findings.push(unreadableFinding(
+      "GWS-MON-004",
+      "Reports activities.list (applicationName=token)",
+      data.tokenActivities,
+      REPORTS_SCOPE_HINT,
+      "Admin console > Reporting > Audit and investigation > OAuth log events.",
+    ));
+  } else if (data.tokenActivities.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-MON-004",
+      "Manual",
+      `The token audit log returned zero events for the ${config.lookbackDays}-day window; emptiness is not treated as proof of telemetry.`,
+      ["Token activity records collected: 0"],
+      "Confirm OAuth log events are retained for the tenant.",
+      "Collect manually: Admin console > Reporting > Audit and investigation > OAuth log events.",
+    ));
+  } else {
+    findings.push(withPartialCap(
+      buildFinding(
         "GWS-MON-004",
         "Pass",
         "Token audit telemetry is readable for the configured lookback window.",
         [`Token activity records collected: ${data.tokenActivities.data.length}`],
         "Use token activity in third-party app governance and incident response.",
       ),
-  );
+      partialViewEvidence("Token activities", data.tokenActivities),
+    ));
+  }
 
-  findings.push(
-    data.alerts.error
-      ? buildFinding(
-        "GWS-MON-005",
-        "Manual",
-        "Open-alert backlog could not be evaluated because Alert Center data was not available.",
-        [`Alert Center error: ${data.alerts.error}`],
-        "Restore Alert Center access first, then use the backlog signal during monitoring reviews.",
-      )
-      : openAlerts <= 3
-      ? buildFinding(
-        "GWS-MON-005",
-        "Pass",
-        "The open alert backlog is manageable in the current snapshot.",
-        [
-          `Alerts collected: ${data.alerts.data.length}`,
-          `Open alerts: ${openAlerts}`,
-        ],
-        "Keep alert ownership and closure practices explicit so the backlog stays manageable.",
-      )
-      : openAlerts <= 10
-      ? buildFinding(
-        "GWS-MON-005",
-        "Partial",
-        "The open alert backlog is noticeable and should be reviewed.",
-        [
-          `Alerts collected: ${data.alerts.data.length}`,
-          `Open alerts: ${openAlerts}`,
-        ],
-        "Review the alert queue, verify ownership, and close or annotate stale alerts.",
-      )
-      : buildFinding(
-        "GWS-MON-005",
-        "Fail",
-        "The open alert backlog is larger than a healthy review cadence would usually tolerate.",
-        [
-          `Alerts collected: ${data.alerts.data.length}`,
-          `Open alerts: ${openAlerts}`,
-        ],
-        "Run a focused alert-triage sprint and make sure the queue has clear owners and escalation paths.",
-      ),
-  );
+  if (data.alerts.error) {
+    findings.push(unreadableFinding(
+      "GWS-MON-005",
+      "Alert Center alerts.list",
+      data.alerts,
+      ALERTS_SCOPE_HINT,
+      "Admin console > Security > Alert center, counting alerts whose status is not CLOSED.",
+    ));
+  } else if (data.alerts.data.length === 0) {
+    findings.push(buildFinding(
+      "GWS-MON-005",
+      "Manual",
+      "Alert Center returned zero alerts, so the backlog could not be measured; see GWS-MON-001 for the availability check.",
+      ["Alerts collected: 0"],
+      "Confirm Alert Center is populated before relying on the backlog signal.",
+      "Collect manually: Admin console > Security > Alert center.",
+    ));
+  } else {
+    const evidence = [
+      `Alerts collected: ${data.alerts.data.length}`,
+      `Open alerts (metadata.status NOT_STARTED or IN_PROGRESS): ${alerts.open}`,
+      `Closed alerts (metadata.status CLOSED): ${alerts.closed}`,
+      `Alerts without metadata.status (reported separately, never counted as closed): ${alerts.unknownStatus}`,
+    ];
+    const unknownNotes = alerts.unknownStatus > 0
+      ? [`${alerts.unknownStatus} alert(s) carry no metadata.status and need a manual triage check`]
+      : [];
+    findings.push(withPartialCap(
+      alerts.open <= 3
+        ? buildFinding(
+          "GWS-MON-005",
+          "Pass",
+          "The open alert backlog is manageable in the current snapshot.",
+          evidence,
+          "Keep alert ownership and closure practices explicit so the backlog stays manageable.",
+        )
+        : alerts.open <= 10
+          ? buildFinding(
+            "GWS-MON-005",
+            "Partial",
+            "The open alert backlog is noticeable and should be reviewed.",
+            evidence,
+            "Review the alert queue, verify ownership, and close or annotate stale alerts.",
+          )
+          : buildFinding(
+            "GWS-MON-005",
+            "Fail",
+            "The open alert backlog is larger than a healthy review cadence would usually tolerate.",
+            evidence,
+            "Run a focused alert-triage sprint and make sure the queue has clear owners and escalation paths.",
+          ),
+      [...partialViewEvidence("Alerts", data.alerts), ...unknownNotes],
+    ));
+  }
 
   const snapshotSummary = {
     login_activity_records: data.loginActivities.data.length,
@@ -2310,7 +3050,8 @@ export function assessGwsMonitoring(
     admin_activity_records: data.adminActivities.data.length,
     token_activity_records: data.tokenActivities.data.length,
     alerts_collected: data.alerts.data.length,
-    open_alerts: openAlerts,
+    open_alerts: alerts.open,
+    alerts_without_status: alerts.unknownStatus,
   };
 
   return {
@@ -2329,6 +3070,7 @@ function buildExecutiveSummary(
 ): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const summary = countByStatus(findings);
+  const failing = findings.filter((finding) => finding.status === "Fail");
   return [
     "# Google Workspace Audit Executive Summary",
     "",
@@ -2338,6 +3080,7 @@ function buildExecutiveSummary(
     `- Admin email: ${config.adminEmail ?? "not supplied"}`,
     `- Lookback days: ${config.lookbackDays}`,
     `- Source chain: ${config.sourceChain.join(" -> ") || "direct"}`,
+    `- Controls evaluated: ${findings.length} of ${GWS_CHECK_IDS.length}`,
     "",
     "## Findings",
     "",
@@ -2347,9 +3090,15 @@ function buildExecutiveSummary(
     `- Manual: ${summary.Manual}`,
     `- Info: ${summary.Info}`,
     "",
+    "## Highest Priority Findings",
+    "",
+    ...(failing.length === 0
+      ? ["- No failing findings were generated in this assessment set."]
+      : failing.map((finding) => `- ${finding.id} ${finding.title}: ${finding.summary}`)),
+    "",
     errors.length > 0
       ? [
-        "## Collection warnings",
+        "## Partial Collection Warnings",
         "",
         ...errors.map((error) => `- ${error}`),
         "",
@@ -2359,14 +3108,13 @@ function buildExecutiveSummary(
 }
 
 export async function exportGwsAuditBundle(
-  client: GoogleWorkspaceAuditorClient,
+  client: GwsAuditCollector,
   config: GwsResolvedConfig,
   outputRoot: string,
+  frameworks: ReportFrameworkKey[] = [...REPORT_FRAMEWORK_KEYS],
 ): Promise<GwsAuditBundleResult> {
-  const identity = await collectGwsIdentityData(client);
-  const adminAccess = await collectGwsAdminAccessData(client);
-  const integrations = await collectGwsIntegrationData(client);
-  const monitoring = await collectGwsMonitoringData(client);
+  const data = await collectGwsAuditData(client);
+  const { identity, adminAccess, integrations, monitoring } = data;
 
   const assessments = [
     assessGwsIdentity(identity, config),
@@ -2376,37 +3124,57 @@ export async function exportGwsAuditBundle(
   ];
 
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
-  const errors = [
-    ...collectErrors(identity.users, identity.roles, identity.roleAssignments, identity.loginActivities),
-    ...collectErrors(adminAccess.users, adminAccess.roles, adminAccess.roleAssignments, adminAccess.adminActivities),
-    ...collectErrors(integrations.users, integrations.roles, integrations.roleAssignments, integrations.tokenInventory, integrations.tokenActivities),
-    ...collectErrors(monitoring.loginActivities, monitoring.adminActivities, monitoring.tokenActivities, monitoring.alerts),
-  ];
+  const errors = collectErrors(
+    identity.users,
+    identity.roles,
+    identity.roleAssignments,
+    identity.loginActivities,
+    identity.twoStepPolicies ?? { data: [] },
+    adminAccess.adminActivities,
+    integrations.tokenInventory,
+    integrations.tokenActivities,
+    monitoring.alerts,
+  );
 
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, safeName);
 
-  await buildBundleReadme(outputDir);
-  await writeSecureTextFile(outputDir, "summary.md", assessments.map((assessment) => assessment.text).join("\n\n"));
+  const coreDataFiles: Array<[string, CollectedDataset<unknown>]> = [
+    ["core_data/users.json", identity.users],
+    ["core_data/roles.json", identity.roles],
+    ["core_data/role_assignments.json", identity.roleAssignments],
+    ["core_data/login_activities.json", identity.loginActivities],
+    ["core_data/admin_activities.json", adminAccess.adminActivities],
+    ["core_data/token_activities.json", integrations.tokenActivities],
+    ["core_data/token_inventory.json", integrations.tokenInventory],
+    ["core_data/alerts.json", monitoring.alerts],
+    ["core_data/two_step_verification_policies.json", identity.twoStepPolicies ?? { data: [], error: "not collected" }],
+  ];
+  for (const [pathName, dataset] of coreDataFiles) {
+    await writeSecureTextFile(outputDir, pathName, serializeJson(redactSecrets(dataset)));
+  }
+
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(allFindings));
-  await writeSecureTextFile(outputDir, "analysis/unified-matrix.md", buildUnifiedMatrix(allFindings));
-  await writeSecureTextFile(outputDir, "reports/executive-summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "reports/summary.md", assessments.map((assessment) => assessment.text).join("\n\n"));
-
   for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
-    await writeSecureTextFile(outputDir, `reports/${assessment.category}.md`, assessment.text);
+    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+      category: assessment.category,
+      summary: assessment.summary,
+      snapshot_summary: assessment.snapshotSummary,
+      findings: assessment.findings,
+    }));
+    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.md`, assessment.text);
   }
 
-  const frameworkReports = buildFrameworkReports(allFindings);
-  for (const [name, contents] of Object.entries(frameworkReports)) {
-    await writeSecureTextFile(outputDir, `reports/framework-${name}.md`, contents);
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings));
+  for (const framework of frameworks) {
+    const report = FRAMEWORK_REPORTS[framework];
+    await writeSecureTextFile(outputDir, report.file, buildFrameworkReport(report.title, allFindings, framework));
   }
-
-  await writeSecureTextFile(outputDir, "core_data/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "core_data/admin_access.json", serializeJson(adminAccess));
-  await writeSecureTextFile(outputDir, "core_data/integrations.json", serializeJson(integrations));
-  await writeSecureTextFile(outputDir, "core_data/monitoring.json", serializeJson(monitoring));
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(frameworks));
+  if (errors.length > 0) {
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+  }
 
   const zipPath = `${outputDir}.zip`;
   await createZipArchive(outputDir, zipPath);
@@ -2418,6 +3186,7 @@ export async function exportGwsAuditBundle(
     fileCount,
     findingCount: allFindings.length,
     errorCount: errors.length,
+    frameworks,
   };
 }
 
@@ -2471,7 +3240,7 @@ export function registerGwsTools(pi: any): void {
     name: "gws_check_access",
     label: "Check Google Workspace audit access",
     description:
-      "Validate Google Workspace read access for delegated service-account or direct access-token auth and show which security-relevant Admin SDK surfaces are readable.",
+      "Validate Google Workspace read access for delegated service-account or direct access-token auth and show which security-relevant Admin SDK, Alert Center, and Cloud Identity Policy surfaces are readable.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: RawConfigArgs) {
@@ -2493,7 +3262,7 @@ export function registerGwsTools(pi: any): void {
     name: "gws_assess_identity",
     label: "Assess Google Workspace identity posture",
     description:
-      "Review Google Workspace user identity posture, including 2-step verification coverage, privileged-user MFA enforcement, super-admin protection, and dormant-account pressure.",
+      "Review Google Workspace identity posture: 2-step verification coverage, privileged-user MFA enforcement, super-admin protection, dormant accounts, and the organization-level 2SV enforcement policy from the Cloud Identity Policy API.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: RawConfigArgs) {
@@ -2515,7 +3284,7 @@ export function registerGwsTools(pi: any): void {
     name: "gws_assess_admin_access",
     label: "Assess Google Workspace admin access",
     description:
-      "Review Google Workspace privileged-role population, super-admin sprawl, suspended privileged accounts, delegated-admin use, and admin audit visibility.",
+      "Review Google Workspace privileged-role population, super-admin sprawl, suspended privileged accounts, delegated-admin use, admin audit visibility, and group-based grants.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: RawConfigArgs) {
@@ -2581,7 +3350,7 @@ export function registerGwsTools(pi: any): void {
     name: "gws_export_audit_bundle",
     label: "Export Google Workspace audit bundle",
     description:
-      "Collect the focused Google Workspace identity, admin-access, integrations, and monitoring evidence set, then write a zipped multi-framework audit bundle to disk.",
+      "Collect the Google Workspace identity, admin-access, integrations, and monitoring evidence set once, then write core_data/, analysis/, compliance/ (executive summary, unified matrix, per-framework reports), QUICK_REFERENCE.md, _errors.log on partial collection, and a zip archive that never overwrites an earlier bundle.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(
@@ -2589,16 +3358,23 @@ export function registerGwsTools(pi: any): void {
           description: `Optional output root for the Google Workspace audit bundle. Defaults to ${DEFAULT_OUTPUT_DIR}.`,
         }),
       ),
+      frameworks: Type.Optional(
+        Type.Array(Type.String(), {
+          description: `Optional framework report filter. Supported values: ${REPORT_FRAMEWORK_KEYS.join(", ")}. Defaults to every framework.`,
+        }),
+      ),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string }) {
+    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string; frameworks?: string[] }) {
       try {
         const config = await resolveGwsConfiguration(args);
         const client = new GoogleWorkspaceAuditorClient(config);
+        const frameworks = normalizeFrameworkSelection(args.frameworks);
         const result = await exportGwsAuditBundle(
           client,
           config,
           args.output_dir?.trim() || DEFAULT_OUTPUT_DIR,
+          frameworks,
         );
         return textResult(buildExportText(config, result), {
           organization: getDisplayOrganization(config),
@@ -2607,6 +3383,7 @@ export function registerGwsTools(pi: any): void {
           file_count: result.fileCount,
           finding_count: result.findingCount,
           error_count: result.errorCount,
+          frameworks: result.frameworks,
         });
       } catch (error) {
         return errorResult(
