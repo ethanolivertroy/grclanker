@@ -2396,6 +2396,12 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
   assert.match(teamScoping.summary, /verdict cannot exceed warn/);
   assert.equal(teamScoping.evidence.teams_ability, null);
   assert.match(teamScoping.evidence.abilities_status, /abilities list could not be read/);
+  assert.equal(findingById(abilitiesForbidden, 1).evidence.sso_ability, null);
+  assert.equal(findingById(abilitiesForbidden, 1).evidence.abilities, null);
+  assert.equal(findingById(abilitiesForbidden, 24).evidence.analytics_abilities, null);
+  assert.equal(abilitiesForbidden.summary.abilities, null);
+  assert.equal(abilitiesForbidden.summary.sso_ability, null);
+  assert.equal(abilitiesForbidden.summary.users_seen, 4);
 
   const abilitiesEmpty = assessPagerdutyAccessControl({
     scope: accountScope(),
@@ -2425,7 +2431,10 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
     teamMembers: snapshot({}, forbidden("/teams/team-1/members")),
   }, { maxAdmins: 3 });
   assertStatuses(membersForbidden, { 4: "pass" });
-  assert.match(findingById(membersForbidden, 4).summary, /team membership listing failed: PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members/);
+  assert.match(findingById(membersForbidden, 4).summary, /team manager assignments unknown because the team membership listing failed: PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members/);
+  assert.doesNotMatch(findingById(membersForbidden, 4).summary, /0 team manager assignments/);
+  assert.equal(findingById(membersForbidden, 4).evidence.team_manager_assignments, null);
+  assert.equal(findingById(membersForbidden, 4).evidence.teams_seen, 1);
 
   const servicesForbidden = assessPagerdutyIncidentResponse({
     scope: accountScope(),
@@ -2442,6 +2451,15 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
   assert.match(automation.summary, /cannot exceed warn until the service directory is readable/);
   assert.doesNotMatch(automation.summary, /0 services still reference one/);
   assert.equal(automation.evidence.services_readable, false);
+  assert.equal(automation.evidence.services_with_legacy_response_plays, null);
+  assert.equal(automation.evidence.incident_workflows_seen, 1);
+  const routing = findingById(servicesForbidden, 5);
+  assert.equal(routing.evidence.services_seen, null);
+  assert.equal(routing.evidence.active_services, null);
+  assert.equal(routing.evidence.services_without_policy, null);
+  assert.equal(servicesForbidden.summary.services_seen, null);
+  assert.equal(servicesForbidden.summary.active_services, null);
+  assert.equal(servicesForbidden.summary.escalation_policies_seen, 1);
 
   const servicesForbiddenNoAutomation = assessPagerdutyIncidentResponse({
     scope: accountScope(),
@@ -2477,7 +2495,14 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
   assertStatuses(detailsForbidden, { 8: "manual", 9: "manual", 18: "pass" });
   for (const control of [8, 9]) {
     assert.match(findingById(detailsForbidden, control).summary, /Schedule details could not be rendered \(PagerDuty request failed \(403 Forbidden\) for \/schedules\/sched-1/);
+    assert.equal(findingById(detailsForbidden, control).evidence.attached_schedules, null);
   }
+  assert.equal(findingById(detailsForbidden, 8).evidence.schedules_with_gaps, null);
+  assert.equal(findingById(detailsForbidden, 8).evidence.schedules_seen, 1);
+  assert.equal(findingById(detailsForbidden, 9).evidence.single_participant_schedules, null);
+  assert.equal(detailsForbidden.summary.attached_schedules, null);
+  assert.equal(detailsForbidden.summary.schedules_with_gaps, null);
+  assert.equal(detailsForbidden.summary.responders, 4);
 
   const probeForbidden = assessPagerdutyAuditLogging({
     scope: accountScope(),
@@ -2487,4 +2512,152 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
   });
   assertStatuses(probeForbidden, { 11: "pass", 12: "warn" });
   assert.match(findingById(probeForbidden, 12).summary, /retention window could not be probed \(PagerDuty request failed \(403 Forbidden\) for \/audit\/records/);
+  assert.equal(findingById(probeForbidden, 12).evidence.probe_records_returned, null);
+  assert.equal(findingById(probeForbidden, 12).evidence.probe_records_dated_in_window, null);
+  assert.equal(probeForbidden.summary.retention_probe_records, null);
+  assert.equal(probeForbidden.summary.recent_records_returned, 1);
+
+  const recentForbidden = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: list([], forbidden("/audit/records")),
+    retentionProbe: list([auditRecord("a1", "2025-10-01T10:00:00Z")]),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(recentForbidden, { 11: "manual", 13: "manual" });
+  assert.equal(findingById(recentForbidden, 11).evidence.records_returned, null);
+  assert.equal(findingById(recentForbidden, 11).evidence.method_types, null);
+  assert.equal(findingById(recentForbidden, 13).evidence.api_tokens_observed, null);
+  assert.equal(recentForbidden.summary.recent_records_returned, null);
+  assert.equal(recentForbidden.summary.api_tokens_observed, null);
+
+  const extensionsForbidden = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    extensions: list([], forbidden("/extensions")),
+    webhookSubscriptions: list(fixtures.webhookSubscriptions),
+    businessServices: list(fixtures.businessServices),
+    businessServiceDependencies: snapshot({ "bs-1": fixtures.businessServiceDependencies }),
+    changeEvents: list(fixtures.changeEvents),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertNoPass([findingById(extensionsForbidden, 14), findingById(extensionsForbidden, 15)], "extensions forbidden");
+  assert.equal(findingById(extensionsForbidden, 14).evidence.extensions_seen, null);
+  assert.equal(findingById(extensionsForbidden, 14).evidence.insecure_extensions, null);
+  assert.equal(findingById(extensionsForbidden, 14).evidence.subscriptions_seen, 1);
+  assert.equal(findingById(extensionsForbidden, 15).evidence.legacy_webhook_extensions, null);
+  assert.equal(extensionsForbidden.summary.extensions_seen, null);
+  assert.equal(extensionsForbidden.summary.webhook_subscriptions_seen, 1);
+});
+
+const CANARY = {
+  bearer: "CANARYBEARER0123456789abcdefghij",
+  cookie: "CANARYSESSIONCOOKIE9876543210zyxw",
+  apiKey: "CANARYAPIKEY5555aaaabbbbccccdddd",
+  url: "https://api.example.com/v1/x?token=CANARYURLTOKEN1234",
+};
+const CANARY_VALUES = [CANARY.bearer, CANARY.cookie, CANARY.apiKey, "token=CANARYURLTOKEN1234", "CANARYURLTOKEN1234"];
+
+function canaryHtmlResponse() {
+  const body = `<html><head><title>502 Bad Gateway</title></head><body><p>The upstream call carried Authorization: Bearer ${CANARY.bearer} and Cookie: session=${CANARY.cookie}; the header x-api-key: ${CANARY.apiKey} was echoed. Retry later at ${CANARY.url} or contact support.</p></body></html>`;
+  return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function canaryJsonResponse() {
+  return jsonResponse({
+    error: {
+      message: `Upstream rejected the request, see ${CANARY.url} for the failing call`,
+      code: 2010,
+      errors: [`Retry the call at ${CANARY.url} once the gateway recovers`],
+    },
+  }, { status: 403, statusText: "Forbidden" });
+}
+
+function assertCanariesAbsent(text, label) {
+  for (const value of CANARY_VALUES) {
+    assert.ok(!text.includes(value), `${label} leaked canary ${value}`);
+  }
+}
+
+function pagerdutyRouter(failingPath, failure) {
+  const fixtures = healthyFixtures();
+  const page = (key, items) => ({ [key]: items, more: false, total: items.length, limit: items.length, offset: 0 });
+  const routes = [
+    ["/users/me", () => ({ user: { id: "me-1", email: "me@example.com", role: "admin" } })],
+    ["/abilities", () => ({ abilities: fixtures.abilities })],
+    ["/users", () => page("users", fixtures.users)],
+    ["/teams", () => page("teams", fixtures.teams)],
+    ["/teams/team-1/members", () => page("members", fixtures.teamMembers)],
+    ["/services", () => page("services", fixtures.services)],
+    ["/escalation_policies", () => page("escalation_policies", fixtures.escalationPolicies)],
+    ["/schedules", () => page("schedules", fixtures.schedules)],
+    ["/schedules/sched-1", () => ({ schedule: coveredSchedule("sched-1") })],
+    ["/oncalls", () => page("oncalls", fixtures.oncalls)],
+    ["/audit/records", (url) => ({
+      records: [auditRecord("audit-1", new Date(Date.parse(url.searchParams.get("since")) + DAY_MS).toISOString())],
+      next_cursor: null,
+    })],
+    ["/extensions", () => page("extensions", fixtures.extensions)],
+    ["/webhook_subscriptions", () => page("webhook_subscriptions", fixtures.webhookSubscriptions)],
+    ["/business_services", () => page("business_services", fixtures.businessServices)],
+    ["/service_dependencies/business_services/bs-1", () => ({ relationships: fixtures.businessServiceDependencies })],
+    ["/priorities", () => page("priorities", fixtures.priorities)],
+    ["/incident_workflows", () => page("incident_workflows", fixtures.incidentWorkflows)],
+    ["/incident_workflows/triggers", () => ({ triggers: fixtures.incidentWorkflowTriggers, next_cursor: null })],
+    ["/change_events", () => page("change_events", fixtures.changeEvents)],
+  ];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    if (url.pathname === failingPath) return failure();
+    const route = routes.find(([path]) => path === url.pathname);
+    if (!route) throw new Error(`unexpected PagerDuty path ${url.pathname}`);
+    return jsonResponse(route[1](url));
+  };
+  return { fetchImpl, surfaces: routes.map(([path]) => path) };
+}
+
+test("rule 9 error strings: a 502 HTML body or a JSON error embedding a credential URL on any surface never reaches results or the bundle", async () => {
+  const { surfaces } = pagerdutyRouter("", canaryHtmlResponse);
+  assert.equal(surfaces.length, 19);
+  const noteFor = (variant) => (variant === "html"
+    ? /\(502 Bad Gateway\)[^\n]*non-JSON body \(text\/html, \d+ bytes\)/
+    : /\(403 Forbidden\)[^\n]*Upstream rejected the request, see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/);
+
+  for (const failingPath of surfaces) {
+    for (const [variant, failure] of [["html", canaryHtmlResponse], ["json", canaryJsonResponse]]) {
+      const { fetchImpl } = pagerdutyRouter(failingPath, failure);
+      const client = new PagerdutyApiClient(sampleConfig(), { fetchImpl, maxRetries: 0, now: () => NOW });
+      const label = `${failingPath} (${variant})`;
+
+      const access = await checkPagerdutyAccess(client);
+      const assessments = await Promise.all([
+        runPagerdutyAccessControlAssessment(client, { maxAdmins: 3 }),
+        runPagerdutyIncidentResponseAssessment(client),
+        runPagerdutyOncallCoverageAssessment(client),
+        runPagerdutyAuditLoggingAssessment(client),
+        runPagerdutyIntegrationSecurityAssessment(client),
+      ]);
+      const exported = await exportPagerdutyAuditBundle(client, sampleConfig(), createTempBase("grclanker-pagerduty-canary-"), { maxAdmins: 3 });
+
+      assertCanariesAbsent(JSON.stringify(access), `${label} access check`);
+      assertCanariesAbsent(JSON.stringify(assessments), `${label} assessments`);
+      assertCanariesAbsent(JSON.stringify(exported), `${label} export result`);
+      const files = readBundleFiles(exported.outputDir);
+      assertSecretsAbsent(assert, files, CANARY_VALUES, `${label} bundle directory`);
+      assertSecretsAbsent(assert, readZipEntries(exported.zipPath), CANARY_VALUES, `${label} zip archive`);
+
+      const errorStrings = [
+        ...access.surfaces.filter((surface) => surface.endpoint === failingPath).map((surface) => surface.error ?? ""),
+        ...assessments.flatMap((assessment) => assessment.errors),
+        ...(files.get("_errors.log") ?? "").split("\n"),
+      ].filter((text) => text.includes(`for ${failingPath}`));
+      assert.ok(errorStrings.length > 0, `${label} recorded no error string naming the failing surface`);
+      for (const text of errorStrings) {
+        assert.match(text, noteFor(variant), `${label} error string lacks the status note: ${text}`);
+        assert.doesNotMatch(text, /<html|Set-Cookie|x-api-key: CANARY/i, `${label} error string echoed the body: ${text}`);
+      }
+      const probed = access.surfaces.find((surface) => surface.endpoint === failingPath);
+      if (probed) assert.equal(probed.status, "not_readable", `${label} access check still marked the surface readable`);
+      assert.ok(exported.errorCount > 0, `${label} export recorded no collection error`);
+    }
+  }
 });
