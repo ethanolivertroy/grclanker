@@ -646,8 +646,12 @@ test("rule 10: a stalled or endless cursor is recorded as truncation and privile
   const config = createSampleConfig();
   let rolePages = 0;
   let assignmentPages = 0;
+  const runawayCeiling = 1100;
   const fetchImpl = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
+    if (rolePages > runawayCeiling || assignmentPages > runawayCeiling) {
+      throw new Error(`pagination did not stop: ${rolePages} role pages, ${assignmentPages} role-assignment pages`);
+    }
     if (url.pathname.endsWith("/roles")) {
       rolePages += 1;
       return jsonResponse({ items: rolePages === 1 ? createRoles() : [], nextPageToken: "same-cursor" });
