@@ -144,6 +144,34 @@ What ships in `0.0.1`:
 - Dedicated runtime identity and state under `~/.grclanker/agent`
 - A real setup command for local-first or hosted model configuration
 
+## Run Under Flue
+
+grclanker can also run as a [Flue Framework](https://flueframework.com/) agent. The adapter in `cli/flue/` mounts the same 107 domain tools, the shipped system prompt, the `/investigate`, `/audit`, `/assess`, and `/validate` prompts (as Flue skills), and the `auditor` and `verifier` personas (as Flue subagents). Tool schemas are converted from TypeBox JSON Schema to Valibot at the adapter boundary; the tool implementations are untouched.
+
+Bundled runner (built on Flue's `start()` API, no extra install):
+
+```bash
+export ANTHROPIC_API_KEY=...
+grclanker flue run --message "Is BoringCrypto FIPS validated?"
+grclanker flue run --message "Now check KEV exposure" --id fips-review --json
+```
+
+Official Flue CLI (from a repo checkout, in the `cli/` directory after `npm install`, Node 22.19 or newer):
+
+```bash
+npx flue run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
+```
+
+`@flue/cli` is a devDependency of the CLI package on purpose: the CLI must share the project's `@flue/runtime` install. Running a separately downloaded copy (for example `npx @flue/cli run ...` without the local install) loads a second runtime and fails with an internal hook error.
+
+Configuration:
+
+- `GRCLANKER_FLUE_MODEL` sets the `provider/model` specifier. Without it, the `grclanker setup` choice is reused (hosted, or local-first: the Ollama entry from `~/.grclanker/agent/models.json` is registered with Flue through `setProvider()`), otherwise `anthropic/claude-sonnet-4-6`. Hosted provider API keys come from the environment, as in any Flue project.
+- `GRCLANKER_FLUE_SANDBOX=none` disables the local sandbox that provides file and shell tools for the current directory.
+- Conversations persist in `~/.grclanker/flue/conversations.db`, verbatim, raw tool arguments and credentials included (Flue offers no pre-persistence redaction). Pass `--db <path>` or `--db :memory:` to change that; use `:memory:` in CI. `flue run` writes `node_modules/.cache/flue/run.db` instead, which must not end up in a CI cache.
+
+Limitations: the Pi compute backends (`host`, `sandbox-runtime`, Docker, Parallels) do not apply; Flue's own sandbox model is used instead. Flue validates the raw model arguments against each tool's schema (coercing typed values) before the tool's own normalizer runs, and tool output reaches the model as a JSON string. See [`/docs/getting-started/flue-runtime`](https://grclanker.com/docs/getting-started/flue-runtime) for the exact behavior.
+
 ## Skills Only
 
 User-scoped Codex skill:

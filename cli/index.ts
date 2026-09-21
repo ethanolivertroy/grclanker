@@ -47,6 +47,7 @@ Usage:
   grclanker env smoke-test      Validate the selected backend end-to-end
   grclanker env exec -- <cmd>   Run a shell command on the selected backend
   grclanker tools               List bundled GRC and compute tools
+  grclanker flue run -m <text>  Run the same GRC agent under the Flue Framework runtime
   grclanker investigate         Trace crypto status, KEVs, and exploitability
   grclanker audit               Map evidence against a requested framework
   grclanker assess              Produce a posture readout and remediation order
@@ -85,6 +86,14 @@ async function main() {
 
   if (command === "env" && subcommand === "exec") {
     await runComputeExec(process.argv.slice(4));
+    return;
+  }
+
+  if (command === "flue") {
+    // Loaded lazily so the Pi-based CLI path never pays for the Flue runtime.
+    const { runFlueCommand } = await import("./flue/cli.js");
+    const exitCode = await runFlueCommand(process.argv.slice(3));
+    if (exitCode !== 0) process.exit(exitCode);
     return;
   }
 
