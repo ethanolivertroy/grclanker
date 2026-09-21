@@ -7,6 +7,7 @@
  * activity line that echoes a tool input has to go through here first.
  */
 import { Buffer } from "node:buffer";
+import { URLSearchParams } from "node:url";
 
 export const REDACTED_VALUE = "[redacted]";
 
@@ -155,6 +156,7 @@ export function collectSensitiveValues(value: unknown, schema?: unknown): string
   return [...out].sort((left, right) => right.length - left.length);
 }
 
+/** The URI-component form (`encodeURIComponent`): spaces become `%20`, and `~ ! ' ( ) *` stay as they are. */
 function urlEncoded(value: string): string | undefined {
   try {
     return encodeURIComponent(value);
@@ -164,10 +166,20 @@ function urlEncoded(value: string): string | undefined {
 }
 
 /**
+ * The application/x-www-form-urlencoded form `URLSearchParams` produces for a
+ * field value, as in an echoed request body: spaces become `+`, and
+ * `~ ! ' ( )` are percent-encoded (`*` is left alone by both encodings).
+ */
+function formEncoded(value: string): string {
+  return new URLSearchParams({ v: value }).toString().slice("v=".length);
+}
+
+/**
  * The forms a tool might echo a secret in: as is, JSON-escaped (inside a
- * serialized payload), URL-encoded, base64 (with and without padding, and
- * URL-encoded) and base64url, re-flowed onto one line, and each individual
- * line of a multi-line value such as a PEM key.
+ * serialized payload), URL-encoded as a URI component and as a form field,
+ * base64 (with and without padding, and URL-encoded) and base64url, re-flowed
+ * onto one line, and each individual line of a multi-line value such as a PEM
+ * key.
  */
 export function scrubbedFormsOf(value: string): string[] {
   const lines = value
@@ -179,6 +191,7 @@ export function scrubbedFormsOf(value: string): string[] {
   const forms = new Set<string>([
     value,
     JSON.stringify(value).slice(1, -1),
+    formEncoded(value),
     base64,
     base64.replace(/=+$/, ""),
     bytes.toString("base64url"),
@@ -186,6 +199,7 @@ export function scrubbedFormsOf(value: string): string[] {
     lines.join(""),
     ...lines,
   ]);
+  // Base64 output has no spaces or `~ ! ' ( ) *`, so its form-encoded and URI-component forms coincide.
   for (const encoded of [urlEncoded(value), urlEncoded(base64)]) {
     if (encoded !== undefined) forms.add(encoded);
   }
