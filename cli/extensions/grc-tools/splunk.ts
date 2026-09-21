@@ -820,10 +820,12 @@ export class SplunkApiClient {
 
   async acsListAll(path: string, key: string): Promise<{ items: JsonRecord[]; truncated: boolean }> {
     const items: JsonRecord[] = [];
+    const keys = [key, key.replace(/-/g, "_"), key.replace(/_/g, "-")];
     let offset = 0;
     for (;;) {
       const payload = await this.acsGet(path, { count: this.pageSize, offset });
-      const page = asArray(payload[key]).map(asObject).filter((item): item is JsonRecord => Boolean(item));
+      const list = keys.map((candidate) => payload[candidate]).find((value) => Array.isArray(value));
+      const page = asArray(list).map(asObject).filter((item): item is JsonRecord => Boolean(item));
       items.push(...page);
       if (page.length < this.pageSize) return { items, truncated: false };
       offset += page.length;
@@ -864,6 +866,14 @@ async function collect<T>(load: () => Promise<T>): Promise<Collected<T>> {
   } catch (error) {
     return { ok: false, error: errorMessage(error), httpStatus: errorStatus(error) };
   }
+}
+
+async function collectOptionalConf(client: SplunkInspectorClient, file: string): Promise<Collected<SplunkListResult>> {
+  const result = await collect(() => client.getConfStanzas(file));
+  if (!result.ok && result.httpStatus === 404) {
+    return { ok: true, value: { entries: [], total: 0, truncated: false } };
+  }
+  return result;
 }
 
 function collectedErrors(items: Array<[string, Collected<unknown>]>): string[] {
@@ -1429,7 +1439,7 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     : null;
   if (deployment.info.isCloud) {
     findings.push(finding(14, "manual", client.hasAcs()
-      ? "Splunk Cloud encrypts indexes at rest by default; Enterprise Managed Encryption Keys (EMEK) status is provisioned through Splunk support and is not exposed as a read-only ACS inventory endpoint. Collect the EMEK provisioning record or the Splunk Cloud encryption attestation manually."
+      ? "Splunk Cloud encrypts indexes at rest by default; the ACS EMEK endpoints (GET /emek/key-policy, GET /emek/waiver, PUT /emek/key) only generate onboarding artifacts and do not report whether Enterprise Managed Encryption Keys are active. Collect the EMEK provisioning record or the Splunk Cloud encryption attestation manually."
       : "Splunk Cloud encrypts indexes at rest by default, but ACS is not configured, so no cloud-side evidence could be retrieved. Collect the EMEK provisioning record or the Splunk Cloud encryption attestation manually.", { acs_configured: client.hasAcs(), indexes: indexEvidence }));
   } else {
     findings.push(finding(14, "manual", "Splunk Enterprise has no index-level encryption setting; at-rest protection depends on volume or filesystem encryption under homePath and coldPath. Collect the storage encryption evidence for the listed index paths manually.", { indexes_readable: indexes.ok, indexes: indexEvidence }));
@@ -1524,13 +1534,21 @@ export async function assessSplunkAuditMonitoring(
 ): Promise<SplunkAssessmentResult> {
   const runSearches = options.runSearches !== false;
   const minRetentionDays = clampNumber(options.minAuditRetentionDays, DEFAULT_MIN_AUDIT_RETENTION_DAYS, 1, 36_500);
-  const [indexes, roles, users] = await Promise.all([
+  const [indexes, roles, users, auditConf] = await Promise.all([
     collect(() => client.listIndexes()),
     collect(() => client.listRoles()),
     collect(() => client.listUsers()),
+    collectOptionalConf(client, "audit"),
   ]);
   const findings: SplunkFinding[] = [];
   const auditIndex = indexes.ok ? indexes.value.entries.find((index) => index.name === "_audit") : undefined;
+  const auditTrail = auditConf.ok ? stanza(auditConf.value, "auditTrail") : undefined;
+  const queueing = asBoolean(auditTrail?.queueing);
+  const auditTrailNote = !auditConf.ok
+    ? `audit.conf could not be read (${unreadableCause(auditConf)})`
+    : queueing === undefined
+      ? "audit.conf [auditTrail] queueing absent (there is no default audit.conf), documented default true assumed"
+      : `audit.conf [auditTrail] queueing=${String(auditTrail?.queueing)}`;
 
   if (!indexes.ok) {
     findings.push(manualUnreadable(17, "/services/data/indexes", indexes, "the _audit index status (disabled flag, event count) and a sample of index=_audit events covering login, search, and configuration changes."));
@@ -1546,7 +1564,20 @@ export async function assessSplunkAuditMonitoring(
     const hasLogin = actions.some((action) => /login/i.test(action));
     const hasSearch = actions.some((action) => /^search$/i.test(action));
     const hasConfigChange = actions.some((action) => /edit|create|delete|update|change/i.test(action));
-    const evidence = { disabled: auditIndex.content.disabled ?? null, totalEventCount: eventCount ?? null, search_run: runSearches, search_readable: search ? search.ok : null, actions_last_24h: actions.slice(0, 50), covers_login: hasLogin, covers_search: hasSearch, covers_config_change: hasConfigChange };
+    const evidence = {
+      disabled: auditIndex.content.disabled ?? null,
+      totalEventCount: eventCount ?? null,
+      search_run: runSearches,
+      search_readable: search ? search.ok : null,
+      actions_last_24h: actions.slice(0, 50),
+      covers_login: hasLogin,
+      covers_search: hasSearch,
+      covers_config_change: hasConfigChange,
+      audit_conf_readable: auditConf.ok,
+      audit_trail_queueing: auditTrail?.queueing ?? null,
+      audit_trail_logging_format: asString(auditTrail?.logging_format) ?? null,
+      audit_trail_note: auditTrailNote,
+    };
     if (disabled === true) {
       findings.push(finding(17, "fail", "The _audit index is disabled.", evidence));
     } else if (disabled === undefined) {
@@ -1559,8 +1590,12 @@ export async function assessSplunkAuditMonitoring(
       findings.push(finding(17, "fail", "The _audit index is enabled but returned no events in the last 24 hours.", evidence));
     } else if (!hasLogin || !hasSearch) {
       findings.push(finding(17, "warn", `_audit received events in the last 24 hours but coverage is incomplete (login: ${hasLogin}, search: ${hasSearch}, configuration change: ${hasConfigChange}).`, evidence));
+    } else if (!auditConf.ok) {
+      findings.push(finding(17, "warn", `_audit recorded login and search events in the last 24 hours, but ${auditTrailNote}, so the [auditTrail] queueing setting could not be confirmed.`, evidence));
+    } else if (queueing === false) {
+      findings.push(finding(17, "warn", `_audit recorded login and search events in the last 24 hours, but ${auditTrailNote}, so audit events reach the index only through a separate tailing input; confirm that input is monitored.`, evidence));
     } else {
-      findings.push(finding(17, "pass", `_audit is enabled and recorded login, search${hasConfigChange ? ", and configuration change" : ""} events in the last 24 hours.`, evidence));
+      findings.push(finding(17, "pass", `_audit is enabled and recorded login, search${hasConfigChange ? ", and configuration change" : ""} events in the last 24 hours; ${auditTrailNote}.`, evidence));
     }
   }
 
@@ -1588,12 +1623,12 @@ export async function assessSplunkAuditMonitoring(
     }
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["indexes", indexes], ["roles", roles], ["users", users]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [["indexes", indexes], ["roles", roles], ["users", users], ["conf-audit", auditConf]]);
   return {
     title: "Splunk audit and monitoring",
     summary: { url: client.getResolvedConfig().url, audit_index_visible: Boolean(auditIndex), ...summarizeStatuses(finalFindings) },
     findings: finalFindings,
-    errors: collectedErrors([["indexes", indexes], ["roles", roles], ["users", users]]),
+    errors: collectedErrors([["indexes", indexes], ["roles", roles], ["users", users], ["conf-audit", auditConf]]),
   };
 }
 

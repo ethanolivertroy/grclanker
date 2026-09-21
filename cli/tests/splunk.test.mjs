@@ -380,6 +380,14 @@ test("Splunk Cloud with ACS evaluates IP allow lists and HEC through ACS and sco
   assert.match(byId(platform, "SPLUNK-PLAT-19").summary, /hec, search-ui/);
   assert.equal(byId(platform, "SPLUNK-PLAT-23").status, "manual");
 
+  const openApiShape = {
+    ...acs,
+    "/inputs/http-event-collectors": { http_event_collectors: [{ spec: { name: "firehose", allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useAck: true }, token: "secret" }] },
+  };
+  const openApiData = await assessSplunkDataProtection(client(cloud, { acs: openApiShape }, { stack: "acme-stack", acsToken: "acs-jwt" }).client);
+  assert.equal(byId(openApiData, "SPLUNK-DP-16").status, "pass");
+  assert.equal(byId(openApiData, "SPLUNK-DP-16").evidence.tokens, 1);
+
   const noAcs = client(cloud).client;
   const platformNoAcs = await assessSplunkPlatformHardening(noAcs);
   assert.equal(byId(platformNoAcs, "SPLUNK-PLAT-19").status, "manual");
@@ -433,6 +441,33 @@ test("unreadable audit search downgrades an enabled _audit index to warn, and a 
   assert.equal(byId(noEvents, "SPLUNK-AUD-17").status, "fail");
   const skipped = await assessSplunkAuditMonitoring(client(HARDENED).client, { runSearches: false });
   assert.equal(byId(skipped, "SPLUNK-AUD-17").status, "warn");
+});
+
+test("audit.conf [auditTrail] queueing is read explicitly: absent file assumes the documented default, false caps at warn, forbidden caps at warn", async () => {
+  const absent = await assessSplunkAuditMonitoring(client(HARDENED).client);
+  assert.equal(byId(absent, "SPLUNK-AUD-17").status, "pass");
+  assert.match(byId(absent, "SPLUNK-AUD-17").summary, /documented default true assumed/);
+  assert.equal(absent.errors.length, 0);
+
+  const explicit = await assessSplunkAuditMonitoring(client({ ...HARDENED, "/services/configs/conf-audit": [entry("auditTrail", { queueing: "1", logging_format: "both" })] }).client);
+  assert.equal(byId(explicit, "SPLUNK-AUD-17").status, "pass");
+  assert.match(byId(explicit, "SPLUNK-AUD-17").summary, /queueing=1/);
+  assert.doesNotMatch(byId(explicit, "SPLUNK-AUD-17").summary, /assumed/);
+
+  const notQueued = await assessSplunkAuditMonitoring(client({ ...HARDENED, "/services/configs/conf-audit": [entry("auditTrail", { queueing: "0" })] }).client);
+  assert.equal(byId(notQueued, "SPLUNK-AUD-17").status, "warn");
+  assert.match(byId(notQueued, "SPLUNK-AUD-17").summary, /tailing input/);
+
+  const { fetchImpl } = createFetch(HARDENED);
+  const forbiddenFetch = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/services/configs/conf-audit") return jsonResponse({ messages: [{ type: "ERROR", text: "forbidden" }] }, 403);
+    return fetchImpl(input, init);
+  };
+  const forbidden = await assessSplunkAuditMonitoring(new SplunkApiClient(sampleConfig(), { fetchImpl: forbiddenFetch, retryDelayMs: 0 }));
+  assert.equal(byId(forbidden, "SPLUNK-AUD-17").status, "warn");
+  assert.match(byId(forbidden, "SPLUNK-AUD-17").summary, /audit\.conf could not be read/);
+  assert.equal(forbidden.errors.length, 1);
 });
 
 test("exportSplunkAuditBundle writes core_data, analysis, compliance reports, quick reference, errors log, and a paired zip", async () => {
