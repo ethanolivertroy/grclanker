@@ -1533,6 +1533,8 @@ export async function assessZendeskIntegrations(
       findings.push(finding(24, httpsTitle, "high", "fail", `${insecureTargets.length} active targets and ${insecureWebhooks.length} active webhooks deliver to non-https endpoints.${truncationNote("webhook", webhooksSnap)}`, evidence));
     } else if (targetsSnap.status !== "ok" || webhooksSnap.status !== "ok" || isTruncated(webhooksSnap) || unauthenticatedWebhooks.length > 0) {
       findings.push(finding(24, httpsTitle, "high", "warn", `All seen destinations use https, but ${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}.${truncationNote("webhook", webhooksSnap)}`, evidence));
+    } else if (activeTargets.length === 0 && activeWebhooks.length === 0) {
+      findings.push(finding(24, httpsTitle, "high", "pass", "Both the targets and webhooks endpoints were readable and returned zero active destinations (0 targets, 0 webhooks), so there are no external notification endpoints to secure; emptiness is compliant for this control.", evidence));
     } else {
       findings.push(finding(24, httpsTitle, "high", "pass", `${activeTargets.length} active targets (${urlTargets.length} URL-based) and ${activeWebhooks.length} active webhooks were read to completion; every destination uses https and every webhook carries authentication.`, evidence));
     }
@@ -1567,6 +1569,8 @@ export async function assessZendeskIntegrations(
     };
     if (insecure.length > 0) {
       findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
+    } else if (rules.length === 0) {
+      findings.push(manualFinding(25, exfilTitle, "high", "Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.", "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
     } else if (external.length > 0) {
       findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${truncated ? " The rule inventory was truncated." : ""}`, evidence));
     } else if (truncated) {
