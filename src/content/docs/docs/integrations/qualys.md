@@ -75,7 +75,11 @@ A hostname such as `qualysapi.qg2.apps.qualys.com` is accepted in place of the I
 
 ### Rate limits and retries
 
-The client records `X-RateLimit-Limit`, `X-RateLimit-Window-Sec`, `X-RateLimit-Remaining`, `X-RateLimit-ToWait-Sec`, `X-Concurrency-Limit-Limit`, and `X-Concurrency-Limit-Running` from every response. On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times. Passwords, tokens, and basic auth strings are redacted from every error message.
+The client records `X-RateLimit-Limit`, `X-RateLimit-Window-Sec`, `X-RateLimit-Remaining`, `X-RateLimit-ToWait-Sec`, `X-Concurrency-Limit-Limit`, and `X-Concurrency-Limit-Running` from every response. On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times.
+
+### Error messages and secrets
+
+A failed request is reported with its HTTP status and endpoint path, never with the response body. A documented error envelope contributes only its documented fields: `SIMPLE_RETURN` `CODE` and `TEXT`, the `/msp/` `ERROR` number and text, or a QPS `responseCode` and `responseErrorDetails.errorMessage`. Any other body (an HTML gateway page, CSV, unexpected JSON) is described by content type and byte length only, for example `non-XML error body (text/html; 236 bytes)`. Every error string passes through one scrub before it exists: the configured password, token, and basic auth string are removed, and so are embedded URL queries and fragments, `Bearer` and `Basic` values, `Cookie` and `Set-Cookie` values, credential name-value pairs (api key, session, access, refresh, and id tokens, client secret, password), and any 16-character or longer run with a digit or mixed case that a Qualys server echoes in free text. Every bundle file is scrubbed again on write with the same rules minus the long-token rule, so QIDs, asset ids, and tag ids survive as evidence.
 
 ## Tools
 
