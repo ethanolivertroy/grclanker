@@ -47,6 +47,7 @@ import { registerPaloaltoTools } from "./grc-tools/paloalto.js";
 import { registerPagerdutyTools } from "./grc-tools/pagerduty.js";
 import { registerSalesforceTools } from "./grc-tools/salesforce.js";
 import { registerScfTools } from "./grc-tools/scf.js";
+import { registerServicenowTools } from "./grc-tools/servicenow.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
@@ -84,6 +85,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerPagerdutyTools,
   registerSalesforceTools,
   registerScfTools,
+  registerServicenowTools,
   registerSlackTools,
   registerVantaTools,
   registerWebexTools,

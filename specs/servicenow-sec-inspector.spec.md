@@ -3,11 +3,11 @@ slug: "servicenow-sec-inspector"
 name: "ServiceNow Security Inspector"
 vendor: "ServiceNow"
 category: "saas-collaboration"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/servicenow-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # servicenow-sec-inspector
@@ -196,6 +196,19 @@ SERVICENOW_AUTH_METHOD=oauth       # basic, oauth, or mtls
 
 **Gap:** No open-source tool performs comprehensive ServiceNow instance security configuration auditing against multiple compliance frameworks. Existing tools are either built into ServiceNow (requiring license and manual review), commercial SaaS platforms, or focused on web vulnerability scanning rather than platform configuration posture.
 
+### grclanker implementation
+
+The spec is implemented natively in the grclanker CLI (`cli/extensions/grc-tools/servicenow.ts`) as read-only tools over the Table API and Aggregate API:
+
+- `servicenow_check_access`: probes 25 audit tables and reports readable, forbidden, ACL-filtered, and unreadable surfaces
+- `servicenow_assess_identity_access`: controls 3, 4, 6, 7, 8, 14
+- `servicenow_assess_platform_hardening`: controls 1, 5, 12, 13, 16, 17, 18
+- `servicenow_assess_access_control`: controls 2, 11
+- `servicenow_assess_operations_governance`: controls 9, 10, 15, 19, 20
+- `servicenow_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified compliance matrix, per-framework reports, and a paired zip archive
+
+The integration guide lives at `src/content/docs/docs/integrations/servicenow.md`; regression tests at `cli/tests/servicenow.test.mjs`; live smoke at `npm --prefix cli run test:servicenow:live`.
+
 ## 7. Architecture
 
 ```
@@ -360,4 +373,35 @@ goreleaser release --snapshot
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as of 2026-09-21 (TypeScript, `cli/extensions/grc-tools/servicenow.ts`). The standalone Go CLI, Docker image, and goreleaser flow described in sections 7 through 9 were not built; the grclanker tools replace them.
+
+### What shipped
+
+- Six read-only tools (see "grclanker implementation" in section 6) covering all 20 security controls, each finding carrying the eight framework mappings from section 5.
+- Basic auth, OAuth 2.0 client credentials and password grants (with refresh token reuse), and pre-issued bearer tokens; configuration precedence of arguments, then environment variables, then a YAML config file.
+- Table API pagination through `sysparm_offset` and `Link rel="next"` with `X-Total-Count` and Aggregate API counts used to detect ACL-filtered or truncated inventories; 429 and 5xx retry with backoff; credential redaction in errors.
+- Evidence-gated verdicts: forbidden, filtered, errored, empty, or partial inputs never pass; absent system properties are never assumed to hold their defaults; rows without dates are bucketed separately.
+- Audit bundle export with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, eight framework reports), `QUICK_REFERENCE.md`, `_errors.log` on partial collection, and a zip archive paired with a non-overwriting output directory.
+- Regression tests including false-pass self-checks (all endpoints 403, all inventories empty, partial inventories), and a live smoke script.
+
+### Deviations from this spec, following the official documentation
+
+- Control 5: the pass threshold defaults to 60 minutes, the value recommended by the Instance Security Hardening Settings documentation for `glide.ui.session_timeout` (fallback 30 when unset); the 30 minute value suggested above is available through `max_session_timeout_minutes`. `glide.ui.session_timeout.warn` is not evaluated because it is not a documented property; `glide.ui.rotate_sessions` and `glide.ui.user_cookie.max_life_span_in_days` are read instead.
+- Control 6: the `glide.security.password.*` properties listed above do not exist in the documented platform. Enforcement is read from `glide.enable.password_policy`, `glide.apply.password_policy.on_login`, and `glide.login.no_blank_password`, and the rules from the `password_policy` table (Default record).
+- Control 7: `glide.authenticate.multifactor` and `glide.authenticate.multifactor.email.otp.enabled` are read. Enforcement evidence follows the "Role-based multi-factor authentication" hardening page: the Role-based multi-factor authentication record in Multi-factor Criteria (`multi_factor_criteria`) must be Active and its Multi-factor Roles list should cover `admin` and `security_admin`; `sys_user.enable_multifactor_authn` is read as the per-user fallback. The finding is manual only when `multi_factor_criteria` is forbidden or returns no rows. Adaptive authentication MFA policies are not read.
+- Control 9: Column Level Encryption Enterprise stores its encryption modules in the documented Key Management Framework table `sys_kmf_crypto_module`, which is read alongside encrypted dictionary fields. The `sys_encryption_context` table named above is the legacy Column Level Encryption context table; it appears in community sources but not in the current published documentation, so it is still read for older instances and an `Invalid table` response is recorded as "not present" rather than as a read failure.
+- Control 4: `sys_user.locked_out` is evaluated; locked-out active accounts (and locked-out administrators) are listed in the evidence and yield at most warn.
+- Control 10: there is no global `glide.sys.audit_enabled` property. Auditing is per table through the `audit` flag on `sys_dictionary` collection records, so the tool reads those rows for the critical tables and counts recent `sys_audit` rows. Retention is not exposed and renders as manual.
+- Control 12: `glide.script.block.server.globals` is not a documented property; `glide.script.use.sandbox`, `glide.script.allow.ajaxevaluate`, `glide.script.secure.ajaxgliderecord`, and `glide.script.ccsi.ispublic` are read instead, plus active business rules containing `eval(`.
+- Control 16: debug detection queries every `sys_properties` row whose name contains `debug` with value `true` rather than a fixed list, because several names above (for example `glide.war`) are not documented debug flags.
+- Control 17: `glide.ip.access.control` is not a documented property. Following the "Restrict access to specific IP ranges plugin" hardening page, the tool checks that the IP Range Based Authentication plugin (`com.snc.ipauthenticator`) is active in `sys_plugins` and that at least one active IP Address Access Controls (`ip_access`) record exists, then reads `glide.ip.authenticate.strict`. An `Invalid table` response for `ip_access` is treated as the plugin not being activated (fail), not as a read failure.
+- Control 18: TLS on outbound email is read from the documented Email Account field Connection Security (`sys_email_account.connection_security`, choices None, STARTTLS, SSL/TLS), with the legacy `enable_ssl` and `enable_tls` booleans as a fallback on older schemas. None fails, STARTTLS warns (the documentation warns it may expose data), SSL/TLS is compliant, and an account whose value is not returned is reported as unverified rather than as a failure.
+- Control 1: `glide.security.strict_elevate_privilege` is not read (undocumented); the CSRF, strict CSRF validation, MIME type validation, `glide.security.diag_txns_acl`, and strict user image upload properties are read.
+- Authentication: mutual TLS is recognized but rejected because the runtime HTTP client cannot present client certificates.
+- The CMDB, Attachment, Import Set, and Scripted REST APIs listed in section 2 are not used; every read goes through the Table API or Aggregate API.
+
+### What remains
+
+- Instance Security Center hardening score, Instance Scan results, Edge Encryption, DKIM, MID Server mutual authentication and allow lists, adaptive authentication MFA policies, and audit retention are reported as manual evidence; ServiceNow does not expose them through the Table API in a form the tool can verify.
+- Mutual TLS support depends on a client-certificate capable HTTP transport.
+- Live validation against a production instance is limited to the smoke script; wider tenant coverage may surface additional property or table name variations by release.
