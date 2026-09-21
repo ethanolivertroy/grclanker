@@ -2954,6 +2954,351 @@ test("rule 1 corollary sweep: each surface made unreadable in turn demotes exact
   }
 });
 
+// ---------------------------------------------------------------------------------------------
+// Uniform null standard: unreadable or never-collected data renders null beside a status that names the denied
+// read, never 0, [], or {}, even where no verdict depends on it; a readable or complete status only ever
+// describes a call that happened.
+// ---------------------------------------------------------------------------------------------
+
+const DETECTIONS_UNREADABLE = /^unreadable: detections \(\/api\/2\.0\/fo\/asset\/host\/vm\/detection\/\) was not readable \(/;
+const OPTION_PROFILES_UNREADABLE = /^unreadable: option_profiles \(\/api\/2\.0\/fo\/subscription\/option_profile\/vm\/\) was not readable \(/;
+const USER_LIST_UNREADABLE = /^unreadable: user_list \(\/msp\/user_list\.php\) was not readable \(/;
+const KNOWLEDGE_BASE_NOT_CALLED = /^was not called because detections \(\/api\/2\.0\/fo\/asset\/host\/vm\/detection\/\) was not readable \(/;
+const WAS_HISTORY_SEARCH_TEXT = "the unbounded WAS scan history search (webApp.id filtered, no launchedDate bound)";
+
+// Keys whose value is legitimately a list of names even under a full denial: they describe the collection run
+// itself (which sources were truncated), not an inventory.
+const COLLECTION_METADATA_KEYS = new Set(["collection", "truncated_sources"]);
+
+function sourcesOf(findings) {
+  return findings.flatMap((item) => item.evidence.collection.sources);
+}
+
+test("uniform null standard 1: describeSource renders count null without a completeness marker for a denied read, partial when truncated, and complete when fully read", async () => {
+  const denied = findingById(await assessQualysScanCoverage(withForbidden((url) => url.includes("/option_profile/vm/"))), "QUALYS-C03");
+  const profiles = denied.evidence.collection.sources.find((source) => source.name === "option_profiles");
+  assert.deepEqual(profiles, {
+    name: "option_profiles",
+    endpoint: "/api/2.0/fo/subscription/option_profile/vm/",
+    status: "unreadable",
+    count: null,
+    reason: profiles.reason,
+  }, "pre-fix: {status: unreadable, count: 0}");
+  assert.match(profiles.reason, /403/);
+
+  const forbidden = sourcesOf(allFindings(await runAllAssessments(routedClient(forbiddenRouter))));
+  assert.ok(forbidden.length >= 30, `every finding lists its sources, saw ${forbidden.length}`);
+  for (const source of forbidden) {
+    assert.ok(source.status === "unreadable" || source.status === "not_collected", JSON.stringify(source));
+    assert.equal(source.count, null, `${source.name}.count must be null, never 0`);
+    assert.equal("count_status" in source, false, `${source.name} carries no completeness marker`);
+    assert.match(source.reason, /403|forbidden|not readable/i, `${source.name} names the cause`);
+    assert.match(source.endpoint, /^\/(api|qps|msp)\//);
+  }
+
+  const truncatedSources = sourcesOf(allFindings(await runAllAssessments(routedClient(partialRouter)))).filter((source) => source.status === "truncated");
+  assert.ok(truncatedSources.length >= 20, `the partial tenant truncates most reads, saw ${truncatedSources.length}`);
+  for (const source of truncatedSources) {
+    assert.equal(source.count_status, "partial", source.name);
+    assert.equal(typeof source.count, "number", source.name);
+    assert.ok(source.count > 0, `${source.name} reports the records it did see`);
+    assert.equal(typeof source.reason, "string", `${source.name} names why the read is partial`);
+  }
+
+  const compliantSources = sourcesOf(allFindings(await runAllAssessments(routedClient(compliantRouter))));
+  const readableSources = compliantSources.filter((source) => source.status === "readable");
+  assert.equal(compliantSources.length - readableSources.length, 1, "only the never-needed WAS history search is not readable on the compliant tenant");
+  for (const source of readableSources) {
+    assert.equal(source.count_status, "complete", source.name);
+    assert.equal(typeof source.count, "number", source.name);
+    assert.equal(source.reason, undefined, `${source.name} carries no reason when fully read`);
+  }
+});
+
+test("uniform null standard 2: a call that never happened renders not_collected with count null naming the denied upstream read and the skipped call, never readable 0", async () => {
+  const recorder = recordingClient(forbiddenHandler((url) => url.includes("/vm/detection/")));
+  const vuln = await assessQualysVulnerabilityManagement(recorder.client);
+  assert.ok(recorder.requested.has("/api/2.0/fo/asset/host/vm/detection/"));
+  assert.equal(recorder.requested.has("/api/2.0/fo/knowledge_base/vuln/"), false, "the knowledge base is looked up for open QIDs only, so it was never called");
+  const patch = findingById(vuln, "QUALYS-C11");
+  const knowledgeBase = patch.evidence.collection.sources.find((source) => source.name === "knowledge_base");
+  assert.equal(knowledgeBase.status, "not_collected", "pre-fix: readable with count 0 for a call that never happened");
+  assert.equal(knowledgeBase.count, null);
+  assert.equal(knowledgeBase.endpoint, "/api/2.0/fo/knowledge_base/vuln/");
+  assert.match(knowledgeBase.reason, KNOWLEDGE_BASE_NOT_CALLED);
+  assert.equal("count_status" in knowledgeBase, false);
+  assert.equal(patch.status, "manual");
+  assert.match(patch.summary, /Not collected: knowledge_base \(\/api\/2\.0\/fo\/knowledge_base\/vuln\/\) was not called because detections \(\/api\/2\.0\/fo\/asset\/host\/vm\/detection\/\) was not readable/);
+  assert.equal(patch.evidence.knowledge_base_qids, null);
+  assert.match(patch.evidence.knowledge_base_qids_status, /^not_collected: knowledge_base \(\/api\/2\.0\/fo\/knowledge_base\/vuln\/\) was not called because detections/);
+  assert.equal(patch.evidence.patchable_qids, null);
+  for (const key of ["unresolved_qids", "patchable_detections", "overdue_patchable_detections", "overdue_percent"]) {
+    assert.equal(patch.evidence[key], null, key);
+    assert.match(patch.evidence[`${key}_status`], /^unreadable: detections .*; not_collected: knowledge_base/, `${key} names both the denied read and the skipped call`);
+  }
+  assert.equal(patch.evidence.unknown_buckets, null, "bucket counts of records that were never read are unknown, not {}");
+  assert.match(patch.evidence.unknown_buckets_status, DETECTIONS_UNREADABLE);
+
+  // The compliant tenant has open QIDs, so the knowledge base is read and described as such.
+  const compliant = recordingClient(compliantRouter);
+  const read = findingById(await assessQualysVulnerabilityManagement(compliant.client), "QUALYS-C11").evidence.collection.sources.find((source) => source.name === "knowledge_base");
+  assert.ok(compliant.requested.has("/api/2.0/fo/knowledge_base/vuln/"));
+  assert.equal(read.status, "readable");
+  assert.equal(read.count_status, "complete");
+
+  // The unbounded WAS scan history search is never issued once the bounded scan search is denied.
+  const criteria = [];
+  const admin = await assessQualysAdministration(routedClient(async (url, init) => {
+    if (/\/was\/wasscan(\?|$)/.test(url)) {
+      criteria.push(JSON.parse(init.body).ServiceRequest.filters.Criteria.map((item) => item.field));
+      return forbiddenRouter(url);
+    }
+    return compliantRouter(url, init);
+  }));
+  assert.deepEqual(criteria, [["launchedDate", "type"]], "only the bounded scan search was issued");
+  const was = findingById(admin, "QUALYS-C15");
+  const history = was.evidence.collection.sources.find((source) => source.name === "was_scan_history");
+  assert.equal(history.status, "not_collected", "pre-fix: readable with count 0");
+  assert.equal(history.count, null);
+  assert.equal(history.endpoint, "/qps/rest/3.0/search/was/wasscan");
+  assert.equal(history.reason.startsWith(`${WAS_HISTORY_SEARCH_TEXT} was not issued because was_scans (/qps/rest/3.0/search/was/wasscan) was not readable (`), true, history.reason);
+  assert.equal(was.evidence.scan_history_scans, null);
+  assert.match(was.evidence.scan_history_scans_status, /^not_collected: was_scan_history \(\/qps\/rest\/3\.0\/search\/was\/wasscan\) the unbounded WAS scan history search/);
+  assert.match(was.summary, /Not collected: was_scan_history \(\/qps\/rest\/3\.0\/search\/was\/wasscan\) the unbounded WAS scan history search .* was not issued because was_scans/);
+  assert.equal(was.status, "manual");
+});
+
+test("uniform null standard 3: derived lists and maps render null beside a status naming the denied read, never [] or {}", async () => {
+  const scan = await assessQualysScanCoverage(withForbidden((url) => url.includes("/option_profile/vm/")));
+  const profiles = findingById(scan, "QUALYS-C03");
+  for (const key of ["option_profiles", "profiles_without_authentication", "authentication_types"]) {
+    assert.equal(profiles.evidence[key], null, `pre-fix: C03 ${key} rendered ${key === "authentication_types" ? "{}" : "[]"}`);
+    assert.match(profiles.evidence[`${key}_status`], OPTION_PROFILES_UNREADABLE);
+  }
+  const exclusions = findingById(scan, "QUALYS-C16");
+  assert.equal(exclusions.evidence.option_profile_exclusion_lists, null);
+  assert.match(exclusions.evidence.option_profile_exclusion_lists_status, OPTION_PROFILES_UNREADABLE);
+  assert.equal(exclusions.evidence.option_profile_detection_exclusions, null);
+  assert.deepEqual(exclusions.evidence.excluded_entries, [], "a list from the readable, empty excluded host inventory stays a known empty list");
+  assert.equal("excluded_entries_status" in exclusions.evidence, false);
+
+  const admin = await assessQualysAdministration(withForbidden((url) => url.includes("/msp/user_list.php")));
+  const users = findingById(admin, "QUALYS-C13");
+  assert.equal(users.evidence.stale_login_users, null, "pre-fix: [] although LAST_LOGIN_DATE exists only on the User List response");
+  assert.match(users.evidence.stale_login_users_status, USER_LIST_UNREADABLE);
+  for (const key of ["inactive_status_users", "pending_activation_users", "users_with_last_login", "restricted_view_users_without_login"]) {
+    assert.equal(users.evidence[key], null, key);
+    assert.match(users.evidence[`${key}_status`], USER_LIST_UNREADABLE);
+  }
+
+  // With every endpoint denied, no evidence or summary field of any tool renders 0, [], or {}, every null carries
+  // a status naming the read, and the unverified API user scope renders null roles rather than [].
+  const results = await runAllAssessments(routedClient(forbiddenRouter));
+  const findings = allFindings(results);
+  let withheld = 0;
+  const records = [...results.map((result) => ({ label: result.category, record: result.summary })), ...findings.map((item) => ({ label: item.id, record: item.evidence }))];
+  for (const { label, record } of records) {
+    for (const [key, value] of Object.entries(record)) {
+      if (COLLECTION_METADATA_KEYS.has(key)) continue;
+      assert.equal(rendersEmpty(value), false, `${label}.${key} renders ${JSON.stringify(value)} under a full denial`);
+      if (value === null) {
+        withheld += 1;
+        assert.match(record[`${key}_status`] ?? "", UNAVAILABLE_STATUS, `${label}.${key} is null without a status naming the read`);
+      }
+    }
+  }
+  assert.ok(withheld >= 120, `every derived list, map, count, and percentage is withheld with a status, saw ${withheld}`);
+  for (const item of findings) {
+    const scope = item.evidence.collection.view_scope;
+    assert.equal(scope.verified, false);
+    assert.equal(scope.roles, null, `${item.id}: unverified roles are unknown, not []`);
+    assert.equal(scope.scope_tags, null);
+    assert.match(scope.status, /^unknown: API user role not verified: user search failed/);
+    assert.equal(item.evidence.unknown_buckets, null, item.id);
+  }
+});
+
+test("uniform null standard 4: percentages and derived counts render null when an input is unreadable or the denominator is unknown, never 0 beside null siblings", async () => {
+  const vuln = await assessQualysVulnerabilityManagement(withForbidden((url) => url.includes("/vm/detection/")));
+  const sla = findingById(vuln, "QUALYS-C10");
+  assert.equal(sla.evidence.open_detections, null);
+  assert.equal(sla.evidence.sla_compliance_percent, null, "pre-fix: 0 beside open_detections null");
+  assert.match(sla.evidence.sla_compliance_percent_status, DETECTIONS_UNREADABLE);
+  assert.equal(sla.evidence.breaches_by_severity, null, "pre-fix: {critical: 0, high: 0, medium: 0}");
+  assert.match(sla.evidence.breaches_by_severity_status, DETECTIONS_UNREADABLE);
+  for (const key of ["detections_returned", "closed_detections_excluded", "fixed_or_info_excluded", "sla_scoped_detections", "sla_dated_detections", "sla_breaches"]) {
+    assert.equal(sla.evidence[key], null, key);
+    assert.match(sla.evidence[`${key}_status`], DETECTIONS_UNREADABLE);
+  }
+  assert.equal(sla.evidence.hosts, tenant.hosts.length, "counts of the readable host inventory keep their values");
+  assert.deepEqual(sla.evidence.sla_days, { critical: 15, high: 30, medium: 90 }, "configured thresholds are not derived from any read");
+  const patch = findingById(vuln, "QUALYS-C11");
+  assert.equal(patch.evidence.overdue_percent, null);
+  assert.equal(patch.evidence.open_qids, null);
+  const qds = findingById(vuln, "QUALYS-C17");
+  assert.equal(qds.evidence.qds_percent, null);
+  assert.equal(qds.evidence.detections_with_qds, null);
+  assert.match(qds.evidence.qds_percent_status, DETECTIONS_UNREADABLE);
+  for (const key of ["open_detections", "sla_compliance_percent", "sla_breaches", "patchable_detections", "overdue_patchable_detections", "qds_percent"]) {
+    assert.equal(vuln.summary[key], null, `summary.${key}`);
+    assert.match(vuln.summary[`${key}_status`], /^unreadable: detections/, `summary.${key}`);
+  }
+
+  const agents = findingById(await assessQualysAssetInventory(withForbidden((url) => url.includes("/am/hostasset"))), "QUALYS-C07");
+  assert.equal(agents.evidence.agent_coverage_percent, 100, "the coverage ratio reads host TRACKING_METHOD only, so it survives a denied agent search");
+  assert.equal(agents.evidence.hosts, tenant.hosts.length);
+  for (const key of ["cloud_agents", "inactive_agents", "stale_agents", "agents_without_activation_key"]) {
+    assert.equal(agents.evidence[key], null, key);
+    assert.match(agents.evidence[`${key}_status`], /^unreadable: cloud_agents \(\/qps\/rest\/2\.0\/search\/am\/hostasset\) was not readable \(/);
+  }
+  assert.equal(agents.status, "manual");
+  const noHosts = findingById(await assessQualysAssetInventory(withForbidden((url) => url.includes("/asset/host/?"))), "QUALYS-C07");
+  assert.equal(noHosts.evidence.agent_coverage_percent, null, "the ratio's numerator and denominator both come from the denied host inventory");
+  assert.match(noHosts.evidence.agent_coverage_percent_status, /^unreadable: hosts \(\/api\/2\.0\/fo\/asset\/host\/\) was not readable \(/);
+  assert.equal(noHosts.evidence.agent_tracked_hosts, null);
+  assert.equal(noHosts.evidence.cloud_agents, tenant.agents.length, "the readable agent search keeps its count");
+
+  // A ratio over a readable inventory with a zero denominator is undefined, not 0%.
+  const emptyHosts = await assessQualysScanCoverage(routedClient(async (url, init) => (url.includes("/asset/host/?") ? emptyRouter(url) : compliantRouter(url, init))));
+  const auth = findingById(emptyHosts, "QUALYS-C02");
+  assert.equal(auth.evidence.hosts, 0, "the host inventory was read completely and is empty");
+  assert.equal(auth.evidence.authenticated_percent, null, "pre-fix: percent() returned 0 for a zero denominator");
+  assert.equal(auth.evidence.authenticated_percent_status, "unknown: ratio undefined because scanned_hosts is 0");
+  assert.equal(auth.status, "manual");
+  const emptyDetections = await assessQualysVulnerabilityManagement(routedClient(async (url, init) => (url.includes("/vm/detection/") ? emptyRouter(url) : compliantRouter(url, init))));
+  const noDetections = findingById(emptyDetections, "QUALYS-C10");
+  assert.equal(noDetections.status, "pass", "zero detections pass only with a complete read and a non-zero host population");
+  assert.equal(noDetections.evidence.sla_compliance_percent, null);
+  assert.equal(noDetections.evidence.sla_compliance_percent_status, "unknown: ratio undefined because sla_dated_detections is 0");
+  assert.deepEqual(noDetections.evidence.breaches_by_severity, { critical: 0, high: 0, medium: 0 }, "known zeros from a complete, empty detection list");
+  assert.equal(noDetections.evidence.open_detections, 0);
+});
+
+test("uniform null standard 5: C15 prose claims an unbounded or fully read scan history only when that read happened and finished", async () => {
+  // The bounded scan search returns nothing inside the window, so the history search is issued for the web app;
+  // the history variant decides what that second call on the same endpoint returns.
+  const historyRouter = (history) => async (url, init) => {
+    if (/\/was\/wasscan(\?|$)/.test(url)) {
+      const isHistory = JSON.parse(init.body).ServiceRequest.filters.Criteria.some((item) => item.field === "webApp.id");
+      return isHistory ? history(url, init) : jsonResponse(qpsResponse("WasScan", []));
+    }
+    return compliantRouter(url, init);
+  };
+  const oldScan = documentedWasScan({ id: 77, name: "Portal quarterly", launchedDate: daysAgo(60) });
+  const completenessClaim = /per the unbounded scan history|in the fully read scan history/;
+
+  const denied = findingById(await assessQualysAdministration(routedClient(historyRouter(forbiddenRouter))), "QUALYS-C15");
+  assert.equal(denied.status, "manual");
+  assert.match(denied.summary, /0\/1 web applications have a finished vulnerability scan \(WAS scan search launchedDate\) within 30 days; 1 could not be resolved because the unbounded WAS scan history search \(webApp\.id filtered, no launchedDate bound\) on \/qps\/rest\/3\.0\/search\/was\/wasscan was not readable, so the stale and never-scanned counts are unknown/);
+  assert.doesNotMatch(denied.summary, completenessClaim, "pre-fix: the completeness claim and the unreadable clause in one sentence");
+  assert.deepEqual(denied.evidence.unresolved_web_apps, ["Portal"]);
+  assert.equal(denied.evidence.stale_web_apps, null);
+  assert.equal(denied.evidence.never_scanned_web_apps, null);
+  assert.match(denied.evidence.stale_web_apps_status, /^unreadable: was_scan_history \(\/qps\/rest\/3\.0\/search\/was\/wasscan\) was not readable \(/);
+  assert.equal(denied.evidence.collection.sources.find((source) => source.name === "was_scan_history").status, "unreadable");
+
+  const truncated = findingById(await assessQualysAdministration(routedClient(historyRouter(async () => jsonResponse(qpsResponse("WasScan", [oldScan], { hasMoreRecords: "true" }))))), "QUALYS-C15");
+  assert.notEqual(truncated.status, "pass");
+  assert.match(truncated.summary, /1 could not be resolved because the unbounded WAS scan history search \(webApp\.id filtered, no launchedDate bound\) was truncated \(hasMoreRecords was true but no lastId was returned to continue paging\), so the stale and never-scanned counts are unknown/);
+  assert.doesNotMatch(truncated.summary, completenessClaim);
+  assert.equal(truncated.evidence.stale_web_apps, null, "a web app whose only known scan came from a partial history is unresolved, not stale");
+  assert.match(truncated.evidence.stale_web_apps_status, /^unknown: was_scan_history \(\/qps\/rest\/3\.0\/search\/was\/wasscan\) was read partially \(hasMoreRecords was true but no lastId/);
+  assert.equal(truncated.evidence.collection.sources.find((source) => source.name === "was_scan_history").count_status, "partial");
+
+  const complete = findingById(await assessQualysAdministration(routedClient(historyRouter(async () => jsonResponse(qpsResponse("WasScan", [oldScan]))))), "QUALYS-C15");
+  assert.equal(complete.status, "fail");
+  assert.match(complete.summary, /0\/1 web applications have a finished vulnerability scan \(WAS scan search launchedDate\) within 30 days, 1 were last scanned before the window per the unbounded scan history, and 0 have no finished vulnerability scan in the fully read scan history;/);
+  assert.deepEqual(complete.evidence.stale_web_apps, ["Portal"]);
+  assert.deepEqual(complete.evidence.never_scanned_web_apps, []);
+  assert.equal(complete.evidence.scan_history_scans, 1);
+  assert.equal(complete.evidence.collection.sources.find((source) => source.name === "was_scan_history").count_status, "complete");
+
+  const notIssued = findingById(await assessQualysAdministration(routedClient(compliantRouter)), "QUALYS-C15");
+  assert.equal(notIssued.status, "pass");
+  assert.match(notIssued.summary, /within 30 days; the unbounded WAS scan history search \(webApp\.id filtered, no launchedDate bound\) was not issued because every web application resolved a finished scan inside the window; /);
+  assert.doesNotMatch(notIssued.summary, completenessClaim);
+});
+
+test("uniform null standard 6: core_data writes a status marker with null records for a denied or never-collected inventory, never []", async () => {
+  const recorder = recordingClient(forbiddenHandler((url) => url.includes("/vm/detection/") || url.includes("/option_profile/vm/")));
+  const bundle = await exportQualysAuditBundle(recorder.client, recorder.client.getResolvedConfig(), createTempBase("qualys-marker-"));
+  const readCore = (name) => JSON.parse(readFileSync(join(bundle.outputDir, "core_data", name), "utf8"));
+
+  const detections = readCore("vulnerability_management/detections.json");
+  assert.equal(Array.isArray(detections), false, "pre-fix: []");
+  assert.deepEqual(detections, {
+    name: "detections",
+    endpoint: "/api/2.0/fo/asset/host/vm/detection/",
+    status: "unreadable",
+    count: null,
+    reason: detections.reason,
+    records: null,
+  });
+  assert.match(detections.reason, /403/);
+  const knowledgeBase = readCore("vulnerability_management/knowledge_base.json");
+  assert.equal(knowledgeBase.status, "not_collected", "pre-fix: [] for a call that never happened");
+  assert.equal(knowledgeBase.count, null);
+  assert.equal(knowledgeBase.records, null);
+  assert.match(knowledgeBase.reason, KNOWLEDGE_BASE_NOT_CALLED);
+  assert.equal(recorder.requested.has("/api/2.0/fo/knowledge_base/vuln/"), false);
+  const profiles = readCore("scan_coverage/option_profiles.json");
+  assert.equal(profiles.status, "unreadable");
+  assert.equal(profiles.records, null);
+  assert.equal(profiles.endpoint, "/api/2.0/fo/subscription/option_profile/vm/");
+  const access = readCore("access.json");
+  assert.equal(access.surfaces.find((surface) => surface.name === "detections").status, "module_unavailable");
+  assert.equal(access.surfaces.find((surface) => surface.name === "option_profiles").status, "module_unavailable");
+
+  const files = readBundleJson(bundle.outputDir, "core_data").filter((file) => file.name !== "core_data/access.json");
+  assert.ok(files.length >= 27, `one file per collected surface, saw ${files.length}`);
+  const statuses = {};
+  for (const { name, value } of files) {
+    assert.equal(Array.isArray(value), false, `${name} is never a bare array`);
+    assert.match(value.endpoint, /^\/(api|qps|msp)\//, `${name} names its endpoint`);
+    statuses[value.status] = (statuses[value.status] ?? 0) + 1;
+    if (value.status === "readable" || value.status === "truncated") {
+      assert.ok(Array.isArray(value.records), `${name} carries its projected records`);
+      assert.equal(value.records.length, value.count, `${name} count matches its records`);
+    } else {
+      assert.equal(value.records, null, `${name} records are null, not []`);
+      assert.equal(value.count, null, `${name} count is null, not 0`);
+      assert.equal(typeof value.reason, "string", `${name} names the cause`);
+    }
+  }
+  assert.equal(statuses.unreadable, 2, "detections and option_profiles");
+  assert.ok(statuses.not_collected >= 2, "knowledge_base (blocked) and was_scan_history (nothing needed it)");
+
+  const members = readZipMembers(bundle.zipPath);
+  const zipped = JSON.parse(members.find((member) => member.name.endsWith("core_data/vulnerability_management/detections.json")).content);
+  assert.deepEqual(zipped, detections, "the archive carries the same marker as the directory");
+  const readableMember = JSON.parse(members.find((member) => member.name.endsWith("core_data/scan_coverage/scheduled_scans.json")).content);
+  assert.equal(readableMember.status, "readable");
+  assert.equal(readableMember.records.length, tenant.schedules.length);
+});
+
+test("C13 discloses which surface its user population came from: the User List API when readable, the Administration API fallback when /msp/user_list.php is denied, and neither when both are denied", async () => {
+  const fallback = findingById(await assessQualysAdministration(withForbidden((url) => url.includes("/msp/user_list.php"))), "QUALYS-C13");
+  assert.equal(fallback.evidence.active_users, tenant.adminUsers.length, "pre-fix: the Administration API population rendered with no indication of its source");
+  assert.match(fallback.evidence.active_users_status, /^partial: user_list \(\/msp\/user_list\.php\) was not readable \(.*\), so the population is the Administration API user search \(\/qps\/rest\/2\.0\/search\/am\/user\/\), which returns Active users only and hides other Manager and Super User accounts$/);
+  for (const key of ["users_returned", "managers", "shared_emails", "generic_accounts"]) {
+    assert.equal(fallback.evidence[`${key}_status`], fallback.evidence.active_users_status, `${key} discloses the same population source`);
+  }
+  assert.equal(fallback.status, "manual");
+  assert.match(fallback.summary, /the Administration API search returns Active users only, hides other Manager and Super User accounts, and documents no status or last-login field, so inactive-user detection is manual and the manager count is a lower bound/);
+
+  const both = findingById(await assessQualysAdministration(withForbidden((url) => url.includes("/msp/user_list.php") || url.includes("/am/user"))), "QUALYS-C13");
+  assert.equal(both.status, "manual");
+  assert.equal(both.evidence.active_users, null);
+  assert.match(both.evidence.active_users_status, /^unreadable: user_list \(\/msp\/user_list\.php\) was not readable \(.*\); users \(\/qps\/rest\/2\.0\/search\/am\/user\/\) was not readable \(/);
+  assert.equal(both.evidence.managers, null);
+  assert.equal(both.evidence.users_returned, null);
+
+  const primary = findingById(await assessQualysAdministration(routedClient(compliantRouter)), "QUALYS-C13");
+  assert.equal(primary.evidence.active_users, 3);
+  assert.equal(primary.evidence.active_users_status, "readable: USER_STATUS Active users from user_list (/msp/user_list.php)");
+  assert.equal(primary.evidence.managers_status, primary.evidence.active_users_status);
+});
+
 test("all four assessments together cover every one of the 20 spec controls with framework mappings and collection evidence", async () => {
   const results = await runAllAssessments(createFakeClient(healthyFixtures));
   const findings = allFindings(results);
