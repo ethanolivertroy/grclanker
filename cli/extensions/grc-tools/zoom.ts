@@ -46,8 +46,8 @@ const DEFAULT_CONFIG_FILE_NAMES = [".zoom.json", ".grclanker-zoom.json"];
  */
 export const ZOOM_DOCS = {
   oauthServerToServer: "https://developers.zoom.us/docs/internal-apps/s2s-oauth/",
-  pagination: "https://developers.zoom.us/docs/api/rest/pagination/",
-  rateLimits: "https://developers.zoom.us/docs/api/rest/rate-limits/",
+  pagination: "https://developers.zoom.us/docs/api/pagination/",
+  rateLimits: "https://developers.zoom.us/docs/api/rate-limits/",
   scopes: "https://developers.zoom.us/docs/integrations/oauth-scopes-overview/",
   accountSettings: "https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/settings",
   accountLockSettings: "https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/lock_settings",
@@ -62,13 +62,21 @@ export const ZOOM_DOCS = {
   groupSettings: "https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups/{groupId}/settings",
   groupLockSettings: "https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups/{groupId}/lock_settings",
   operationLogs: "https://developers.zoom.us/docs/api/meetings/#tag/reports/GET/report/operationlogs",
-  imGroups: "https://developers.zoom.us/docs/api/team-chat/#tag/im-groups/GET/im/groups",
+  // The Team Chat reference has no stable per-operation anchor; its OpenAPI
+  // document carries GET /im/groups (List IM directory groups) and the
+  // imgroup:read:admin scope.
+  imGroups: "https://developers.zoom.us/docs/api/chat/",
   phoneAccountSettings: "https://developers.zoom.us/docs/api/phone/#tag/accounts/GET/phone/account_settings",
 } as const;
 
-/** Documented `option` query values for GET /accounts/{accountId}/settings. */
+/**
+ * The GET /accounts/{accountId}/settings `option` views this tool reads. The
+ * reference documents four values (meeting_authentication,
+ * recording_authentication, security, meeting_security); the
+ * recording_authentication view is not requested because no verdict reads it.
+ */
 const ACCOUNT_SETTINGS_OPTIONS = ["meeting_authentication", "security", "meeting_security"] as const;
-/** Documented `option` query value for GET /accounts/{accountId}/lock_settings. */
+/** The GET /accounts/{accountId}/lock_settings `option` view this tool reads (the only documented value). */
 const LOCK_SETTINGS_OPTIONS = ["meeting_security"] as const;
 /** Documented `setting_types` values read from GET /phone/account_settings. */
 const PHONE_SETTING_TYPES = "auto_call_recording,ad_hoc_call_recording";
@@ -814,6 +822,12 @@ export class ZoomApiClient {
     return url.toString();
   }
 
+  /**
+   * Defensive fallback: ZOOM_DOCS.rateLimits documents HTTP 429 and asks
+   * clients to wait before retrying but does not name a Retry-After header.
+   * The header is honored when present (delta-seconds or HTTP-date, capped at
+   * MAX_RETRY_AFTER_MS); otherwise the wait defaults to one second.
+   */
   private parseRetryAfter(response: Response): number {
     const header = response.headers.get("retry-after");
     const seconds = asNumber(header);
@@ -872,15 +886,16 @@ export class ZoomApiClient {
       throw new Error("Zoom Server-to-Server OAuth credentials are missing.");
     }
 
-    const tokenUrl = new URL(`${this.config.oauthBaseUrl}/oauth/token`);
-    tokenUrl.searchParams.set("grant_type", "account_credentials");
-    tokenUrl.searchParams.set("account_id", this.config.accountId);
-
-    const payload = await this.fetchJson(tokenUrl.toString(), {
+    // ZOOM_DOCS.oauthServerToServer: POST /oauth/token with Basic client
+    // credentials and a form-encoded body carrying grant_type and account_id.
+    const body = new URLSearchParams({ grant_type: "account_credentials", account_id: this.config.accountId });
+    const payload = await this.fetchJson(`${this.config.oauthBaseUrl}/oauth/token`, {
       method: "POST",
       headers: {
         authorization: `Basic ${encodeBasicAuth(this.config.clientId, this.config.clientSecret)}`,
+        "content-type": "application/x-www-form-urlencoded",
       },
+      body: body.toString(),
     }, { skipAuth: true });
 
     const accessToken = asString(payload.access_token);
@@ -1709,6 +1724,12 @@ export function assessZoomIdentityFromSnapshot(
   };
 }
 
+/**
+ * ZOOM_DOCS.accountSettings describes disclaimer_to_participants as a string
+ * with the example values "All participants" and "Guest only" but documents
+ * no enum, so the match is case-insensitive on those example values and any
+ * other string is reported as unrecognized rather than compliant.
+ */
 function disclaimerVerdict(bundle: ZoomSettingsBundle): { status: ZoomFindingStatus; summary: string; evidence: JsonRecord } {
   const disclaimer = readSetting(bundle, "recording.recording_notification_for_zoom_client.disclaimer_to_participants");
   const askHost = readSetting(bundle, "recording.recording_notification_for_zoom_client.ask_host_to_confirm");
@@ -2946,7 +2967,7 @@ export function registerZoomTools(pi: any): void {
     name: "zoom_check_access",
     label: "Check Zoom audit access",
     description:
-      "Validate Zoom read-only access across account settings and lock settings (all documented option views), users, roles, groups, operation logs, IM groups, managed and trusted domains, and Zoom Phone account settings.",
+      "Validate Zoom read-only access across account settings and lock settings (the default view plus the meeting_authentication, security, and meeting_security option views this tool reads; recording_authentication is not requested because no verdict reads it), users, roles, groups, operation logs, IM groups, managed and trusted domains, and Zoom Phone account settings.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {

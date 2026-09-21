@@ -13,6 +13,7 @@ import { basename, join } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
 import {
+  ZOOM_DOCS,
   ZOOM_FRAMEWORKS,
   ZOOM_SPEC_CONTROLS,
   ZoomApiClient,
@@ -487,6 +488,8 @@ test("ZoomApiClient exchanges Server-to-Server OAuth credentials, paginates with
       params: Object.fromEntries(url.searchParams.entries()),
       method: init.method ?? "GET",
       auth: headerValue(init.headers, "authorization"),
+      contentType: headerValue(init.headers, "content-type"),
+      body: init.body,
     });
 
     if (url.pathname === "/oauth/token") {
@@ -512,8 +515,10 @@ test("ZoomApiClient exchanges Server-to-Server OAuth credentials, paginates with
   assert.equal(users.totalRecords, 2);
   assert.equal(users.pages, 2);
   assert.equal(seen[0].pathname, "/oauth/token");
-  assert.equal(seen[0].params.grant_type, "account_credentials");
-  assert.equal(seen[0].params.account_id, "acct-123");
+  assert.equal(seen[0].method, "POST");
+  assert.equal(seen[0].search, "", "review fix 7: grant_type and account_id travel in the form body, not the query string");
+  assert.equal(seen[0].contentType, "application/x-www-form-urlencoded");
+  assert.deepEqual(Object.fromEntries(new URLSearchParams(seen[0].body).entries()), { grant_type: "account_credentials", account_id: "acct-123" });
   assert.match(seen[0].auth, /^Basic /);
   assert.equal(seen[1].pathname, "/v2/users");
   assert.equal(seen[1].auth, "Bearer oauth-token");
@@ -1334,4 +1339,41 @@ test("review fix 4: every group-dependent verdict demotes on a truncated, denied
     }
     assert.equal(findingById(meeting, "ZOOM-MTG-01").evidence.locked, true, `${scenario.name}: the account lock itself was readable and set`);
   }
+});
+
+test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without Retry-After waits the one-second fallback, and check_access probes exactly the option views the tool reads", async () => {
+  assert.equal(ZOOM_DOCS.pagination, "https://developers.zoom.us/docs/api/pagination/");
+  assert.equal(ZOOM_DOCS.rateLimits, "https://developers.zoom.us/docs/api/rate-limits/");
+  assert.equal(ZOOM_DOCS.imGroups, "https://developers.zoom.us/docs/api/chat/");
+  for (const url of Object.values(ZOOM_DOCS)) {
+    assert.match(url, /^https:\/\/developers\.zoom\.us\/docs\//, url);
+    assert.doesNotMatch(url, /\/docs\/api\/rest\/|\/docs\/api\/team-chat\//, `${url} is a retired path`);
+  }
+
+  const scenarios = [
+    { name: "no header", headers: {}, expected: 1000 },
+    { name: "delta seconds", headers: { "retry-after": "3" }, expected: 3000 },
+    { name: "unparseable", headers: { "retry-after": "soon" }, expected: 1000 },
+    { name: "HTTP-date far in the future is capped", headers: { "retry-after": "Wed, 21 Oct 2099 07:28:00 GMT" }, expected: 30000 },
+  ];
+  for (const scenario of scenarios) {
+    let attempts = 0;
+    const sleeps = [];
+    const fetchImpl = async () => {
+      attempts += 1;
+      if (attempts === 1) return jsonResponse({ code: 429, message: "rate limited" }, { status: 429, headers: scenario.headers });
+      return jsonResponse({ security: { sign_in_with_two_factor_auth: "all" } });
+    };
+    const client = new ZoomApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+    const settings = await client.getAccountSettings("security");
+    assert.deepEqual(sleeps, [scenario.expected], scenario.name);
+    assert.equal(settings.security.sign_in_with_two_factor_auth, "all", scenario.name);
+  }
+
+  const access = await checkZoomAccess(compliantClient());
+  const optionViews = access.surfaces.filter((surface) => surface.name.startsWith("account_settings:")).map((surface) => surface.name).sort();
+  assert.deepEqual(optionViews, ["account_settings:meeting_authentication", "account_settings:meeting_security", "account_settings:security"]);
+  assert.equal(access.surfaces.some((surface) => surface.name.includes("recording_authentication")), false, "recording_authentication is documented but not read by any verdict, so it is not probed");
+  const lockViews = access.surfaces.filter((surface) => surface.name.startsWith("account_lock_settings:")).map((surface) => surface.name);
+  assert.deepEqual(lockViews, ["account_lock_settings:meeting_security"]);
 });
