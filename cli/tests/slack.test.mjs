@@ -975,7 +975,7 @@ async function assessAll(client) {
     await assessSlackChannelGovernance(client),
     await assessSlackMonitoring(client),
   ];
-  return { findings: results.flatMap((result) => result.findings), errors: results.flatMap((result) => result.errors) };
+  return { findings: results.flatMap((result) => result.findings), errors: results.flatMap((result) => result.errors), summaries: results.map((result) => result.summary) };
 }
 
 function passingIds(result) {
@@ -1089,6 +1089,116 @@ test("corollary wording: partial denials name the endpoint and the workspace or 
   assert.match(retentionAll.evidence.short_retention_status, /^unknown: admin\.conversations\.getCustomRetention unreadable for C1/);
 });
 
+const UNAVAILABLE_STATUS = /^(unreadable|not collected|unknown)\b/;
+const COLLECTED_STATUS = /^(complete|partial)\b/;
+const ENDPOINT_MENTION = /\b(admin\.[A-Za-z.]+[A-Za-z]|users\.list|auth\.test|team\.preferences\.list|SCIM \/[A-Za-z]+|Audit Logs \/[a-z]+)/g;
+
+function endpointPath(mention) {
+  if (mention.startsWith("SCIM /")) return `/scim/v2/${mention.slice("SCIM /".length)}`;
+  if (mention.startsWith("Audit Logs /")) return `/audit/v1/${mention.slice("Audit Logs /".length)}`;
+  return `/api/${mention}`;
+}
+
+/** No count or list renders 0, [], or "unknown" beside a status that says the data was unreadable, not collected, or unknown. */
+function assertNoFabricatedValues(value, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    assert.notEqual(entry, "unknown", `${label}: ${path}.${key} is the "unknown" placeholder`);
+    if (typeof entry === "string" && UNAVAILABLE_STATUS.test(entry) && key.endsWith("_status")) {
+      const base = key.slice(0, -"_status".length);
+      if (base in value) assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+    }
+    if (key === "status" && typeof entry === "string" && UNAVAILABLE_STATUS.test(entry)) {
+      for (const [sibling, siblingValue] of Object.entries(value)) {
+        assert.ok(siblingValue !== 0 && !(Array.isArray(siblingValue) && siblingValue.length === 0), `${label}: ${path}.${sibling} renders ${JSON.stringify(siblingValue)} beside status "${entry}"`);
+      }
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+/** A status that says complete or partial may only name endpoints that were actually requested. */
+function assertStatusesMatchRequests(value, requested, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStatusesMatchRequests(item, requested, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && (key.endsWith("_status") || key === "status") && COLLECTED_STATUS.test(entry)) {
+      for (const mention of entry.match(ENDPOINT_MENTION) ?? []) {
+        assert.ok(requested.has(endpointPath(mention)), `${label}: ${path}.${key} says "${entry}" but ${mention} was never requested`);
+      }
+    }
+    assertStatusesMatchRequests(entry, requested, label, `${path}.${key}`);
+  }
+}
+
+function recordingClient(fixture) {
+  const requested = new Set();
+  const client = makeClient((request) => {
+    requested.add(request.pathname);
+    return fixture(request);
+  });
+  return { client, requested };
+}
+
+test("corollary follow-up: a read skipped because its input inventory failed renders null with a not-collected status", async () => {
+  const usersDenied = recordingClient((request) => (methodOf(request) === "admin.users.list" ? webDenied() : compliantFixture(request)));
+  const admin = await assessSlackAdminAccess(usersDenied.client);
+  assert.equal(admin.summary.sessions_sampled, null);
+  assert.match(admin.summary.sessions_status, /^not collected: admin\.users\.list was unreadable \(.*missing_scope\), so admin\.users\.session\.getSettings was not called$/);
+  assert.doesNotMatch(admin.summary.sessions_status, /complete/);
+  assert.ok(!usersDenied.requested.has("/api/admin.users.session.getSettings"), "the session read is never issued without a user inventory");
+  assert.equal(byId(admin, "SLACK-ADMIN-03").status, "manual");
+
+  const teamsDenied = await assessSlackAdminAccess(denyOn(compliantFixture, (request) => methodOf(request) === "admin.teams.list"));
+  assert.equal(teamsDenied.summary.workspace_admins_seen, null);
+  assert.match(teamsDenied.summary.workspace_admins_status, /^not collected: admin\.teams\.list was unreadable \(.*missing_scope\), so admin\.teams\.admins\.list was not called$/);
+  assert.equal(byId(teamsDenied, "SLACK-ADMIN-08").evidence.unreadable_workspaces, null);
+  assert.equal(byId(teamsDenied, "SLACK-ADMIN-08").evidence.workspace_admin_lists_status, teamsDenied.summary.workspace_admins_status);
+
+  const skipped = await assessSlackIdentity(makeClient(compliantFixture), { skipScim: true });
+  assert.equal(skipped.summary.scim_users, null);
+  assert.equal(skipped.summary.scim_users_status, "not collected: SCIM checks were skipped by request, so SCIM /Users was not called");
+  const configDenied = await assessSlackIdentity(denyOn(compliantFixture, (request) => request.pathname === "/scim/v2/ServiceProviderConfig", httpForbidden));
+  assert.equal(configDenied.summary.scim_users, null);
+  assert.match(configDenied.summary.scim_users_status, /^not collected: SCIM \/ServiceProviderConfig was unreadable \(.+\), so SCIM \/Users was not called$/);
+
+  const slackUsersDenied = byId(await assessSlackIdentity(denyOn(compliantFixture, (request) => methodOf(request) === "users.list")), "SLACK-ID-04");
+  assert.equal(slackUsersDenied.status, "manual");
+  assert.equal(slackUsersDenied.evidence.mismatched_users, null);
+  assert.match(slackUsersDenied.evidence.mismatched_users_status, /^not collected: users\.list was unreadable \(.*missing_scope\), so SCIM-active users were not compared with Slack deactivations$/);
+
+  const channelsDenied = await assessSlackChannelGovernance(denyOn(compliantFixture, (request) => methodOf(request) === "admin.conversations.search" && request.params.get("search_channel_types") === "exclude_archived"));
+  assert.equal(channelsDenied.summary.restricted_posting_channels, null);
+  assert.match(channelsDenied.summary.posting_prefs_status, /^not collected: admin\.conversations\.search was unreadable \(.*missing_scope\), so admin\.conversations\.getConversationPrefs was not called$/);
+  assert.equal(channelsDenied.summary.short_retention_channels, null);
+  assert.match(channelsDenied.summary.retention_status, /^not collected: admin\.conversations\.search was unreadable \(.*missing_scope\), so admin\.conversations\.getCustomRetention was not called$/);
+
+  const empty = await assessSlackAdminAccess(makeClient(emptyFixture));
+  assert.equal(empty.summary.sessions_sampled, null);
+  assert.equal(empty.summary.sessions_status, "not collected: admin.users.list returned no active users, so admin.users.session.getSettings was not called");
+  assert.equal(empty.summary.workspace_admins_seen, null);
+  assert.equal(empty.summary.workspace_admins_status, "not collected: admin.teams.list returned no workspaces, so admin.teams.admins.list was not called");
+  const emptyChannels = await assessSlackChannelGovernance(makeClient(emptyFixture));
+  assert.equal(emptyChannels.summary.restricted_posting_channels, null);
+  assert.equal(emptyChannels.summary.posting_prefs_status, "not collected: admin.conversations.search returned no active channels, so admin.conversations.getConversationPrefs was not called");
+
+  const compliant = await assessSlackAdminAccess(makeClient(compliantFixture));
+  assert.equal(compliant.summary.sessions_sampled, 2);
+  assert.equal(compliant.summary.sessions_status, "complete: admin.users.session.getSettings sampled 2 of 2 seen active users");
+  assert.equal(compliant.summary.workspace_admins_seen, 1);
+  assert.equal(compliant.summary.workspace_admins_status, "complete: admin.teams.admins.list readable for 1 of 1 workspaces");
+  const sampled = await assessSlackAdminAccess(makeClient(compliantFixture), { sessionSample: 1 });
+  assert.equal(sampled.summary.sessions_sampled, 1);
+  assert.equal(sampled.summary.sessions_status, "partial: admin.users.session.getSettings sampled 1 of 2 seen active users");
+});
+
 /** Mirrors the reviewer's per-inventory sweep: exactly the dependent findings leave pass and every other baseline pass stays. */
 test("corollary sweep: denying one inventory demotes exactly its dependent findings", async () => {
   const single = compliantFixture;
@@ -1130,8 +1240,12 @@ test("corollary sweep: denying one inventory demotes exactly its dependent findi
 
   const baselines = new Map();
   for (const fixture of [single, multiClean, multi]) {
-    const baseline = await assessAll(makeClient(fixture));
+    const recorder = recordingClient(fixture);
+    const baseline = await assessAll(recorder.client);
     assert.deepEqual(baseline.errors, [], "baseline collects without errors");
+    assertNoFabricatedValues(baseline.summaries, "baseline summaries");
+    assertNoFabricatedValues(baseline.findings.map((item) => item.evidence ?? null), "baseline evidence");
+    assertStatusesMatchRequests(baseline.summaries, recorder.requested, "baseline summaries");
     baselines.set(fixture, passingIds(baseline));
   }
   assert.equal(baselines.get(single).size, 24, "single-workspace baseline passes every automatable finding");
@@ -1141,8 +1255,13 @@ test("corollary sweep: denying one inventory demotes exactly its dependent findi
   for (const [label, fixture, predicate, response, expected] of rows) {
     const baseline = baselines.get(fixture);
     for (const id of expected) assert.ok(baseline.has(id), `${label}: ${id} passes at baseline`);
-    const denied = await assessAll(denyOn(fixture, predicate, response));
+    const recorder = recordingClient((request) => (predicate(request) ? response() : fixture(request)));
+    const denied = await assessAll(recorder.client);
     const statusById = Object.fromEntries(denied.findings.map((item) => [item.id, item.status]));
+    assertNoFabricatedValues(denied.summaries, `${label}: summaries`);
+    assertNoFabricatedValues(denied.findings.map((item) => item.evidence ?? null), `${label}: evidence`);
+    assertStatusesMatchRequests(denied.summaries, recorder.requested, `${label}: summaries`);
+    assertStatusesMatchRequests(denied.findings.map((item) => item.evidence ?? null), recorder.requested, `${label}: evidence`);
     const demoted = [...baseline].filter((id) => statusById[id] !== "pass").sort();
     assert.deepEqual(demoted, [...expected].sort(), `${label}: exactly the dependent findings leave pass`);
     for (const id of demoted) {
@@ -1171,8 +1290,8 @@ test("corollary bundle check: findings.json never carries SLACK-ADMIN-08 as pass
   assert.equal(emoji.evidence.non_admin_uploads, null);
   assert.notEqual(findings.find((item) => item.id === "SLACK-ADMIN-01").status, "pass");
   const adminAccess = JSON.parse(readFileSync(join(bundle.outputDir, "core_data/admin-access.json"), "utf8"));
-  assert.equal(adminAccess.summary.admin_lists_unreadable, 1);
-  assert.equal(adminAccess.summary.admin_lists_readable, 0);
+  assert.equal(adminAccess.summary.workspace_admins_seen, null);
+  assert.match(adminAccess.summary.workspace_admins_status, /^unreadable: admin\.teams\.admins\.list unreadable for T1 \(Core\): /);
 });
 
 test("SLACK_METHODS documents every Web API method the tools call", () => {
