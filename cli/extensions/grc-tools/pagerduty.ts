@@ -48,6 +48,52 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CONFIG_FILE = join(".config", "grclanker", "pagerduty.json");
 const PRIVILEGED_ROLES = new Set(["owner", "admin"]);
 const RESPONDER_ROLES = new Set(["owner", "admin", "user", "limited_user"]);
+const REDACTED = "[REDACTED]";
+const SECRET_KEY_PATTERN = /secret|password|passwd|token|privatekey|authorization|apikey|accesskey|credential|integrationkey|routingkey|signingkey/;
+const SECRET_KEY_EXCEPTIONS = new Set(["truncatedtoken"]);
+const MAX_REDACTION_DEPTH = 32;
+const SERVICE_SNAPSHOT_FIELDS = [
+  "id",
+  "type",
+  "summary",
+  "name",
+  "description",
+  "status",
+  "created_at",
+  "updated_at",
+  "html_url",
+  "escalation_policy",
+  "teams",
+  "incident_urgency_rule",
+  "support_hours",
+  "acknowledgement_timeout",
+  "auto_resolve_timeout",
+  "alert_creation",
+  "response_play",
+  "last_incident_timestamp",
+];
+const INTEGRATION_SNAPSHOT_FIELDS = [
+  "id",
+  "type",
+  "summary",
+  "name",
+  "html_url",
+  "created_at",
+  "vendor",
+  "service",
+  "email_incident_creation",
+  "email_filter_mode",
+  "email_parsing_fallback",
+];
+const INTEGRATION_SECRET_FIELDS = ["integration_key", "integration_email"];
+const USER_SNAPSHOT_FIELDS = ["id", "type", "summary", "name", "email", "role", "created_via_sso", "invitation_sent", "billed", "time_zone", "job_title", "html_url"];
+const CONTACT_METHOD_SNAPSHOT_FIELDS = ["id", "type", "label", "enabled", "blacklisted", "device_type"];
+const NOTIFICATION_RULE_SNAPSHOT_FIELDS = ["id", "type", "urgency", "start_delay_in_minutes"];
+const REFERENCE_FIELDS = ["id", "type", "summary"];
+const WORKFLOW_SNAPSHOT_FIELDS = ["id", "type", "summary", "name", "description", "is_enabled", "created_at", "team"];
+const CHANGE_EVENT_SNAPSHOT_FIELDS = ["id", "type", "summary", "source", "timestamp"];
+const AUDIT_RECORD_SNAPSHOT_FIELDS = ["id", "execution_time", "action"];
+const AUDIT_METHOD_SNAPSHOT_FIELDS = ["type", "truncated_token"];
 const OAUTH_SCOPES = [
   "abilities.read",
   "users.read",
@@ -147,12 +193,13 @@ export interface PagerdutyCollection {
  * "more_flag" trusts the documented `more` boolean. "short_page" is for endpoints such as
  * GET /change_events whose 200 schema declares no `more` or `total`, so a page shorter than
  * the requested limit is the only end signal and a full page means another page must be read.
+ * A response that omits the `more` boolean falls back to the short-page rule in either mode, so a
+ * full final page at the requested limit is recorded as incomplete instead of complete.
  */
 export type PagerdutyListCompletion = "more_flag" | "short_page";
 
-function pageHasMore(payload: JsonRecord, pageLength: number, requestLimit: number, completion: PagerdutyListCompletion): boolean {
-  if (pageLength === 0) return false;
-  if (typeof payload.more === "boolean" || completion === "more_flag") return payload.more === true;
+function pageHasMore(payload: JsonRecord, pageLength: number, requestLimit: number): boolean {
+  if (typeof payload.more === "boolean") return payload.more;
   return pageLength >= requestLimit;
 }
 
@@ -371,6 +418,157 @@ function asNumber(value: unknown): number | undefined {
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
   const parsed = Math.trunc(value ?? fallback);
   return Math.min(Math.max(parsed, min), max);
+}
+
+function isSecretKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[-_\s]/g, "");
+  if (SECRET_KEY_EXCEPTIONS.has(normalized)) return false;
+  return SECRET_KEY_PATTERN.test(normalized);
+}
+
+function redactUrlQuery(text: string): string {
+  if (!/^https?:\/\/[^?]+\?/i.test(text)) return text;
+  return text.replace(/([?&])([^=&#]+)=([^&#]*)/g, (match, separator: string, key: string) => (
+    isSecretKey(key) ? `${separator}${key}=${REDACTED}` : match
+  ));
+}
+
+function isSecretNamedPair(object: JsonRecord): boolean {
+  if (!("value" in object)) return false;
+  const name = asString(object.name) ?? asString(object.key);
+  return name !== undefined && isSecretKey(name);
+}
+
+function redactedValue(entry: unknown): unknown {
+  return entry === null || entry === undefined || typeof entry === "boolean" ? entry : REDACTED;
+}
+
+/**
+ * Deny-list pass applied to every captured snapshot: any key that names a secret, any
+ * {name, value} pair whose name does, and any secret-named query parameter inside a URL string
+ * is replaced with the redaction marker. The allowlist projections below remove the fields the
+ * vendor documents as credential carriers; this pass covers free-form objects such as change
+ * event custom_details and workflow action inputs.
+ */
+export function redactSnapshot(value: unknown, depth = 0): unknown {
+  if (depth > MAX_REDACTION_DEPTH) return REDACTED;
+  if (typeof value === "string") return redactUrlQuery(value);
+  if (Array.isArray(value)) return value.map((item) => redactSnapshot(item, depth + 1));
+  const object = asObject(value);
+  if (!object) return value;
+  const secretPair = isSecretNamedPair(object);
+  const output: JsonRecord = {};
+  for (const [key, entry] of Object.entries(object)) {
+    output[key] = isSecretKey(key) || (secretPair && key === "value") ? redactedValue(entry) : redactSnapshot(entry, depth + 1);
+  }
+  return output;
+}
+
+/**
+ * Webhook destinations carry their secret in the path (Slack and Teams incoming webhooks) or the
+ * query string, so a stored URL keeps only the scheme and host; anything beyond the host is
+ * replaced with the marker so the reduction is visible. The scheme is all PD-14 needs.
+ */
+export function reduceUrl(value: unknown): unknown {
+  const text = asString(value);
+  if (text === undefined) return value;
+  try {
+    const url = new URL(text);
+    const detailed = url.pathname !== "/" || url.search !== "" || url.hash !== "" || url.username !== "" || url.password !== "";
+    return `${url.protocol}//${url.host}${detailed ? `/${REDACTED}` : ""}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+  const output: JsonRecord = {};
+  for (const field of fields) {
+    if (field in record) output[field] = record[field];
+  }
+  return output;
+}
+
+function projectArray(value: unknown, project: (item: JsonRecord) => JsonRecord): unknown {
+  return Array.isArray(value) ? asRecords(value).map(project) : value;
+}
+
+function projectReference(value: unknown): unknown {
+  const record = asObject(value);
+  return record ? pickFields(record, REFERENCE_FIELDS) : value;
+}
+
+function projectIntegration(integration: JsonRecord): JsonRecord {
+  const output = pickFields(integration, INTEGRATION_SNAPSHOT_FIELDS);
+  for (const field of INTEGRATION_SECRET_FIELDS) {
+    if (field in integration) output[field] = REDACTED;
+  }
+  return output;
+}
+
+export function projectService(service: JsonRecord): JsonRecord {
+  const output = pickFields(service, SERVICE_SNAPSHOT_FIELDS);
+  if ("integrations" in service) output.integrations = projectArray(service.integrations, projectIntegration);
+  return output;
+}
+
+export function projectUser(user: JsonRecord): JsonRecord {
+  const output = pickFields(user, USER_SNAPSHOT_FIELDS);
+  if ("teams" in user) output.teams = projectArray(user.teams, (team) => pickFields(team, REFERENCE_FIELDS));
+  if ("contact_methods" in user) {
+    output.contact_methods = projectArray(user.contact_methods, (method) => pickFields(method, CONTACT_METHOD_SNAPSHOT_FIELDS));
+  }
+  if ("notification_rules" in user) {
+    output.notification_rules = projectArray(user.notification_rules, (rule) => {
+      const projected = pickFields(rule, NOTIFICATION_RULE_SNAPSHOT_FIELDS);
+      if ("contact_method" in rule) projected.contact_method = projectReference(rule.contact_method);
+      return projected;
+    });
+  }
+  return output;
+}
+
+export function projectExtension(extension: JsonRecord): JsonRecord {
+  const output: JsonRecord = { ...extension };
+  if ("config" in extension) output.config = REDACTED;
+  if ("endpoint_url" in extension) output.endpoint_url = reduceUrl(extension.endpoint_url);
+  return output;
+}
+
+export function projectWebhookSubscription(subscription: JsonRecord): JsonRecord {
+  const delivery = asObject(subscription.delivery_method);
+  if (!delivery) return subscription;
+  const output: JsonRecord = { ...delivery };
+  if ("url" in delivery) output.url = reduceUrl(delivery.url);
+  if ("custom_headers" in delivery) {
+    output.custom_headers = projectArray(delivery.custom_headers, (header) => ({ name: asString(header.name) ?? "unnamed", value: REDACTED }));
+  }
+  return { ...subscription, delivery_method: output };
+}
+
+export function projectIncidentWorkflow(workflow: JsonRecord): JsonRecord {
+  const output = pickFields(workflow, WORKFLOW_SNAPSHOT_FIELDS);
+  if ("team" in workflow) output.team = projectReference(workflow.team);
+  return output;
+}
+
+export function projectChangeEvent(event: JsonRecord): JsonRecord {
+  const output = pickFields(event, CHANGE_EVENT_SNAPSHOT_FIELDS);
+  if ("services" in event) output.services = projectArray(event.services, (service) => pickFields(service, REFERENCE_FIELDS));
+  return output;
+}
+
+export function projectAuditRecord(record: JsonRecord): JsonRecord {
+  const output = pickFields(record, AUDIT_RECORD_SNAPSHOT_FIELDS);
+  const method = asObject(record.method);
+  if (method) output.method = pickFields(method, AUDIT_METHOD_SNAPSHOT_FIELDS);
+  if ("actors" in record) output.actors = projectArray(record.actors, (actor) => pickFields(actor, REFERENCE_FIELDS));
+  if ("root_resource" in record) output.root_resource = projectReference(record.root_resource);
+  return output;
+}
+
+function projectCollection(collection: PagerdutyCollection, project: (item: JsonRecord) => JsonRecord): PagerdutyCollection {
+  return { ...collection, items: collection.items.map(project) };
 }
 
 function normalizeBaseUrl(rawUrl: string): string {
@@ -648,6 +846,24 @@ function pagerdutyErrorSummary(payload: unknown): string | undefined {
   return parts.length > 0 ? parts.join("; ") : undefined;
 }
 
+/**
+ * A non-JSON error body (a proxy or WAF page) is described by shape only; its text is never
+ * copied into an error string because those strings land in the bundle's error log.
+ */
+function describeOpaqueBody(response: Response, rawText: string): string | undefined {
+  if (rawText.length === 0) return undefined;
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `response body omitted (${contentType}, ${rawText.length} characters)`;
+}
+
+function requestPath(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "the requested path";
+  }
+}
+
 export class PagerdutyRequestError extends Error {
   readonly status: number;
 
@@ -744,7 +960,7 @@ export class PagerdutyApiClient {
       if (!response.ok) {
         throw new PagerdutyRequestError(
           response.status,
-          this.redact(`PagerDuty OAuth token request failed (${response.status}): ${asString(payload.error_description) ?? asString(payload.error) ?? rawText.slice(0, 200)}`),
+          this.redact(`PagerDuty OAuth token request failed (${response.status}): ${asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText) ?? "empty response body"}`),
         );
       }
       const token = asString(payload.access_token);
@@ -799,7 +1015,7 @@ export class PagerdutyApiClient {
       return await this.fetchImpl(url, { method: "GET", headers, signal: controller.signal });
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(`PagerDuty request timed out after ${this.config.timeoutMs}ms: ${this.redact(url)}`);
+        throw new Error(`PagerDuty request timed out after ${this.config.timeoutMs}ms: ${requestPath(url)}`);
       }
       throw new Error(this.redact(errorMessage(error)));
     } finally {
@@ -826,7 +1042,7 @@ export class PagerdutyApiClient {
         }
       }
       if (!response.ok) {
-        const detail = pagerdutyErrorSummary(payload) ?? rawText.slice(0, 240);
+        const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText);
         throw new PagerdutyRequestError(
           response.status,
           this.redact(`PagerDuty request failed (${response.status} ${response.statusText}) for ${path}${detail ? `: ${detail}` : ""}`),
@@ -849,22 +1065,41 @@ export class PagerdutyApiClient {
     let offset = 0;
     let total: number | undefined;
     let more = false;
+    let flagDeclared = true;
+    let stall: string | undefined;
 
     while (items.length < limit && offset < CLASSIC_PAGINATION_CAP) {
       const requestLimit = Math.min(pageSize, limit - items.length, CLASSIC_PAGINATION_CAP - offset);
       const payload = await this.get(path, { ...query, limit: requestLimit, offset, total: true });
       const pageItems = asRecords(payload[collectionKey]);
-      items.push(...pageItems.slice(0, limit - items.length));
+      const room = limit - items.length;
+      items.push(...pageItems.slice(0, room));
       offset += pageItems.length;
       total = asNumber(payload.total) ?? total;
-      more = pageHasMore(payload, pageItems.length, requestLimit, completion);
+      flagDeclared = typeof payload.more === "boolean";
+      more = pageHasMore(payload, pageItems.length, requestLimit) || pageItems.length > room;
+      if (pageItems.length === 0) {
+        if (more) stall = "the API returned an empty page while reporting more results available, so the listing stalled before its end";
+        break;
+      }
       if (!more) break;
     }
 
-    if (!more) return { items, complete: true, total: total ?? items.length };
+    if (stall) return { items, complete: false, total, truncation: stall };
+    if (!more) {
+      if (total !== undefined && total > items.length) {
+        return {
+          items,
+          complete: false,
+          total,
+          truncation: `the API reported no more results after ${items.length} records while declaring a total of ${total}`,
+        };
+      }
+      return { items, complete: true, total: total ?? items.length };
+    }
     const truncation = offset >= CLASSIC_PAGINATION_CAP
       ? `stopped at the ${CLASSIC_PAGINATION_CAP} record pagination ceiling with more results available`
-      : completion === "short_page"
+      : completion === "short_page" || !flagDeclared
         ? `stopped at the requested limit of ${limit} after a full page; the response declares no more flag, so further results may exist`
         : `stopped at the requested limit of ${limit} with more results available`;
     return { items, complete: false, total, truncation };
@@ -879,19 +1114,32 @@ export class PagerdutyApiClient {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, 100_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, DEFAULT_PAGE_SIZE);
     const items: JsonRecord[] = [];
+    const seenCursors = new Set<string>();
     let cursor: string | undefined;
+    let stall: string | undefined;
 
     while (items.length < limit) {
       const payload = await this.get(path, { ...query, limit: Math.min(pageSize, limit - items.length), cursor });
       const pageItems = asRecords(payload[collectionKey]);
       items.push(...pageItems.slice(0, limit - items.length));
-      cursor = asString(payload.next_cursor);
-      if (!cursor || pageItems.length === 0) {
+      const nextCursor = asString(payload.next_cursor);
+      if (!nextCursor) {
         cursor = undefined;
         break;
       }
+      if (pageItems.length === 0) {
+        stall = "the API returned an empty page with a next_cursor still present, so the listing stalled before its end";
+        break;
+      }
+      if (seenCursors.has(nextCursor)) {
+        stall = "the API returned a next_cursor it had already served, so the listing cannot advance past this page";
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
     }
 
+    if (stall) return { items, complete: false, truncation: stall };
     if (!cursor) return { items, complete: true, total: items.length };
     return {
       items,
@@ -1038,9 +1286,13 @@ export type PagerdutyClientSurface = Pick<
   | "listChangeEvents"
 >;
 
+/**
+ * Every snapshot that reaches an assessment, a tool payload, or a core_data file passes through
+ * here, so the deny-list redaction cannot be bypassed by a new caller.
+ */
 async function capture<T>(fallback: T, load: () => Promise<T>): Promise<Snapshot<T>> {
   try {
-    return { data: await load() };
+    return { data: redactSnapshot(await load()) as T };
   } catch (error) {
     return { data: fallback, error: errorMessage(error) };
   }
@@ -1193,6 +1445,7 @@ export interface PagerdutyAccessControlData {
   users: Snapshot<PagerdutyCollection>;
   teams: Snapshot<PagerdutyCollection>;
   teamMembers: Snapshot<Record<string, JsonRecord[]>>;
+  teamMembersTruncated?: string[];
 }
 
 function captureScope(client: PagerdutyClientSurface): Promise<Snapshot<PagerdutyCredentialScope>> {
@@ -1208,19 +1461,24 @@ export async function collectPagerdutyAccessControlData(
   const [scope, abilities, users, teams] = await Promise.all([
     captureScope(client),
     capture<string[]>([], () => client.getAbilities()),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listUsers(userLimit)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listUsers(userLimit), projectUser)),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listTeams(teamLimit)),
   ]);
+  const teamMembersTruncated: string[] = [];
   const teamMembers = await capture<Record<string, JsonRecord[]>>({}, async () => {
     const entries: Record<string, JsonRecord[]> = {};
     for (const team of teams.data.items.slice(0, teamLimit)) {
       const id = asString(team.id);
       if (!id) continue;
-      entries[id] = (await client.listTeamMembers(id)).items;
+      const members = await client.listTeamMembers(id);
+      entries[id] = members.items;
+      if (!members.complete) {
+        teamMembersTruncated.push(`${nameOf(team)}: ${members.items.length} members seen of ${members.total ?? "an unknown total"}`);
+      }
     }
     return entries;
   });
-  return { scope, abilities, users, teams, teamMembers };
+  return { scope, abilities, users, teams, teamMembers, teamMembersTruncated };
 }
 
 const USERS_EMPTY_EVIDENCE = "Zero users were returned even though every PagerDuty account has at least an account owner, so the credential is not seeing the user directory. Export the Users page (with roles) from the web app as evidence.";
@@ -1253,6 +1511,21 @@ export function assessPagerdutyAccessControl(
   const roleNote = usersWithoutRole.length > 0
     ? ` ${usersWithoutRole.length} users have no role field, so their privilege level is unknown and the verdict cannot exceed warn.`
     : "";
+  const abilitiesUnavailable = !abilitiesReadable
+    ? `the abilities list could not be read (${data.abilities.error})`
+    : abilitiesEmpty
+      ? "GET /abilities returned an empty ability list"
+      : undefined;
+  const teamsAbilityKnownAbsent = abilitiesUnavailable === undefined && !teamsAbility;
+  const teamsAbilityNote = abilitiesUnavailable
+    ? ` The "teams" ability could not be confirmed because ${abilitiesUnavailable}, so the verdict cannot exceed warn.`
+    : "";
+  const truncatedTeamMembers = data.teamMembersTruncated ?? [];
+  const teamMembershipSample = [
+    `${teamManagers} team manager assignments sampled`,
+    ...(data.teamMembers.error ? [`team membership listing failed: ${data.teamMembers.error}`] : []),
+    ...(truncatedTeamMembers.length > 0 ? [`member lists were truncated for ${truncatedTeamMembers.length} teams`] : []),
+  ].join("; ");
 
   const userDirectoryStatus = (): PagerdutyFindingStatus | undefined => {
     if (!users.readable || users.empty) return "manual";
@@ -1317,10 +1590,12 @@ export function assessPagerdutyAccessControl(
       userDirectoryStatus()
         ?? (!teams.readable
           ? "manual"
-          : teams.empty || (abilitiesReadable && !abilitiesEmpty && !teamsAbility)
+          : teams.empty || teamsAbilityKnownAbsent
             ? "fail"
             : usersWithoutTeams.length === 0
-              ? "pass"
+              ? abilitiesUnavailable
+                ? "warn"
+                : "pass"
               : usersWithoutTeams.length / users.seen > 0.5
                 ? "fail"
                 : "warn"),
@@ -1328,16 +1603,18 @@ export function assessPagerdutyAccessControl(
         ? userDirectorySummary("Review Teams in the web app and confirm every responder belongs to at least one team.")
         : !teams.readable
           ? unreadable(teams, "Review Teams in the web app and confirm every responder belongs to at least one team.")
-          : teams.empty || (abilitiesReadable && !abilitiesEmpty && !teamsAbility)
-            ? `GET /teams returned ${teams.seen} teams${abilitiesReadable && !teamsAbility ? " and the \"teams\" ability is absent" : ""}, so access is not scoped by team; an empty team list fails this control.`
+          : teams.empty || teamsAbilityKnownAbsent
+            ? `GET /teams returned ${teams.seen} teams${teamsAbilityKnownAbsent ? " and the \"teams\" ability is absent" : ""}, so access is not scoped by team; an empty team list fails this control.`
             : usersWithoutTeams.length === 0
-              ? `${countSeen(teams)} are configured and every one of ${countSeen(users)} belongs to at least one team (${teamManagers} team manager assignments sampled${data.teamMembers.error ? `; team membership listing failed: ${data.teamMembers.error}` : ""}).`
-              : `${usersWithoutTeams.length} of ${countSeen(users)} do not belong to any team.`,
+              ? `${countSeen(teams)} are configured and every one of ${countSeen(users)} belongs to at least one team (${teamMembershipSample}).${teamsAbilityNote}`
+              : `${usersWithoutTeams.length} of ${countSeen(users)} do not belong to any team.${teamsAbilityNote}`,
       {
-        teams_ability: abilitiesReadable ? teamsAbility : null,
+        teams_ability: abilitiesUnavailable ? null : teamsAbility,
+        abilities_status: abilitiesUnavailable ?? "readable",
         teams_seen: teams.seen,
         teams_total: teams.total ?? null,
         team_manager_assignments: teamManagers,
+        team_member_lists_truncated: truncatedTeamMembers,
         users_without_teams: usersWithoutTeams.slice(0, 25).map(userLabel),
       },
       partialNotes(data.scope, users, teams),
@@ -1395,10 +1672,10 @@ export async function collectPagerdutyIncidentResponseData(
   const serviceLimit = clampNumber(options.serviceLimit, DEFAULT_LIST_LIMIT, 1, CLASSIC_PAGINATION_CAP);
   const [scope, services, escalationPolicies, priorities, incidentWorkflows, workflowTriggers] = await Promise.all([
     captureScope(client),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listServices(serviceLimit)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listServices(serviceLimit), projectService)),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listEscalationPolicies()),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listPriorities()),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listIncidentWorkflows()),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listIncidentWorkflows(), projectIncidentWorkflow)),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listIncidentWorkflowTriggers()),
   ]);
   return { scope, services, escalationPolicies, priorities, incidentWorkflows, workflowTriggers };
@@ -1482,6 +1759,12 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
   const automationVerified = enabledWorkflows.length > 0 && enabledTriggers.length > 0 && unresolvedTriggers.length === 0;
   const triggerCounts = `${countSeen(triggers)} (${enabledTriggers.length} enabled, ${disabledTriggers.length} disabled, ${unresolvedTriggers.length} unresolved)`;
   const legacyResponsePlays = services.items.filter((service) => asArray(service.response_play).length > 0 || asObject(service.response_play));
+  const responsePlayCount = services.readable
+    ? `${legacyResponsePlays.length} services still reference one`
+    : `services could not be read (${services.error}), so services still referencing one could not be counted`;
+  const responsePlayReferences = services.readable
+    ? `${legacyResponsePlays.length} services reference deprecated response plays`
+    : `response play references could not be checked because services could not be read (${services.error})`;
   const urgencyModes = active.map(urgencySummary);
   const constantHighOnly = urgencyModes.length > 0 && urgencyModes.every((mode) => mode === "constant:high");
   const missingUrgency = active.filter((service) => !asObject(service.incident_urgency_rule));
@@ -1563,7 +1846,9 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         : !triggers.readable
           ? "manual"
           : automationVerified
-            ? "pass"
+            ? services.readable
+              ? "pass"
+              : "warn"
             : workflows.items.length > 0 || triggers.items.length > 0 || legacyResponsePlays.length > 0
               ? "warn"
               : "fail",
@@ -1574,10 +1859,12 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         : !triggers.readable
           ? unreadable(triggers, "Record which services each Incident Workflow is triggered from in the web app.")
           : automationVerified
-            ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${enabledTriggers.length} enabled triggers (of ${countSeen(triggers)}; ${enabledTriggers.length - triggersVerifiedByParent} verified by is_disabled false, ${triggersVerifiedByParent} by the parent workflow's is_enabled) are configured (response plays are deprecated in the REST API; ${legacyResponsePlays.length} services still reference one).`
+            ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${enabledTriggers.length} enabled triggers (of ${countSeen(triggers)}; ${enabledTriggers.length - triggersVerifiedByParent} verified by is_disabled false, ${triggersVerifiedByParent} by the parent workflow's is_enabled) are configured (response plays are deprecated in the REST API; ${responsePlayCount}).${services.readable ? "" : " The verdict cannot exceed warn until the service directory is readable."}`
             : workflows.items.length > 0 || triggers.items.length > 0 || legacyResponsePlays.length > 0
-              ? `${countSeen(workflows)} (${enabledWorkflows.length} with is_enabled true) and ${triggerCounts} were read, so automated incident response is not verified${unresolvedTriggers.length > 0 ? " because a trigger without the is_disabled flag could not be matched to a returned workflow with an is_enabled value" : ""}; ${legacyResponsePlays.length} services reference deprecated response plays. Confirm workflow and trigger state in Automation > Incident Workflows.`
-              : `The Incident Workflows API is readable and returned zero workflows and zero triggers, and no service references a response play, so no automated incident response is configured; emptiness fails this control.`,
+              ? `${countSeen(workflows)} (${enabledWorkflows.length} with is_enabled true) and ${triggerCounts} were read, so automated incident response is not verified${unresolvedTriggers.length > 0 ? " because a trigger without the is_disabled flag could not be matched to a returned workflow with an is_enabled value" : ""}; ${responsePlayReferences}. Confirm workflow and trigger state in Automation > Incident Workflows.`
+              : services.readable
+                ? `The Incident Workflows API is readable and returned zero workflows and zero triggers, and no service references a response play, so no automated incident response is configured; emptiness fails this control.`
+                : `The Incident Workflows API is readable and returned zero workflows and zero triggers, so no workflow automation is configured; ${responsePlayReferences}. Emptiness fails this control.`,
       {
         incident_workflows_seen: workflows.seen,
         enabled_workflows: enabledWorkflows.length,
@@ -1587,6 +1874,7 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         unresolved_triggers: unresolvedTriggers.slice(0, 25).map((item) => nameOf(item.trigger)),
         triggers_missing_is_disabled_flag: triggersMissingDisabledFlag,
         triggers_verified_by_parent_workflow: triggersVerifiedByParent,
+        services_readable: services.readable,
         services_with_legacy_response_plays: legacyResponsePlays.slice(0, 25).map(nameOf),
       },
       partialNotes(data.scope, workflows, triggers),
@@ -1694,7 +1982,7 @@ export async function collectPagerdutyOncallCoverageData(
     captureScope(client),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listSchedules(scheduleLimit)),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listOncalls(now, daysAhead(now, 1))),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listUsers(userLimit)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listUsers(userLimit), projectUser)),
   ]);
   const scheduleDetails = await capture<JsonRecord[]>([], async () => {
     const details: JsonRecord[] = [];
@@ -1979,8 +2267,8 @@ export async function collectPagerdutyAuditLoggingData(
   const retentionUntil = daysAgo(now, 335);
   const [scope, recentRecords, retentionProbe] = await Promise.all([
     captureScope(client),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listAuditRecords(recentSince, now, auditLimit)),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listAuditRecords(retentionSince, retentionUntil, 25)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listAuditRecords(recentSince, now, auditLimit), projectAuditRecord)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listAuditRecords(retentionSince, retentionUntil, 25), projectAuditRecord)),
   ]);
   return {
     scope,
@@ -2169,11 +2457,11 @@ export async function collectPagerdutyIntegrationSecurityData(
   const since = daysAgo(now, changeEventDays);
   const [scope, services, extensions, webhookSubscriptions, businessServices, changeEvents] = await Promise.all([
     captureScope(client),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listServices(serviceLimit)),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listExtensions()),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listWebhookSubscriptions()),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listServices(serviceLimit), projectService)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listExtensions(), projectExtension)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listWebhookSubscriptions(), projectWebhookSubscription)),
     capture<PagerdutyCollection>(emptyCollection(), () => client.listBusinessServices(businessServiceLimit)),
-    capture<PagerdutyCollection>(emptyCollection(), () => client.listChangeEvents(since, now)),
+    capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listChangeEvents(since, now), projectChangeEvent)),
   ]);
   const businessServiceDependencies = await capture<Record<string, JsonRecord[]>>({}, async () => {
     const entries: Record<string, JsonRecord[]> = {};
@@ -2301,8 +2589,8 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
       {
         extensions_seen: extensions.seen,
         subscriptions_seen: subscriptions.seen,
-        insecure_extensions: insecureExtensions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(item.endpoint_url) ?? "missing"}`),
-        insecure_subscriptions: insecureSubscriptions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(asObject(item.delivery_method)?.url) ?? "missing"}`),
+        insecure_extensions: insecureExtensions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(reduceUrl(item.endpoint_url)) ?? "missing"}`),
+        insecure_subscriptions: insecureSubscriptions.slice(0, 25).map((item) => `${nameOf(item)} -> ${asString(reduceUrl(asObject(item.delivery_method)?.url)) ?? "missing"}`),
         temporarily_disabled_deliveries: disabledDeliveries.slice(0, 25),
       },
       webhookNotes,
@@ -2631,7 +2919,7 @@ function buildQuickReference(): string {
   return [
     "# PagerDuty Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw PagerDuty REST API responses captured during this assessment (credentials are never written).",
+    "- `core_data/` contains PagerDuty REST API snapshots captured during this assessment. Credentials are never written: integration keys and inbound integration emails, extension `config` objects, webhook custom header values, and any secret-named field are replaced with `[REDACTED]`; webhook and extension URLs are reduced to scheme and host; users, services, workflows, change events, and audit records are projected to the fields the findings read.",
     "- `analysis/` contains normalized findings (`findings.json`) and one JSON summary per assessment category.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework.",
     "- `_errors.log` appears only when some reads failed but the bundle still completed.",
