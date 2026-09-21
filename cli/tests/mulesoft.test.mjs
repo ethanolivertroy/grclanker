@@ -1886,3 +1886,114 @@ test("false-pass self-check (c): partial inventories yield no pass in any assess
   assert.equal(allFindings.length, 25);
   assert.deepEqual(allFindings.filter((item) => item.status === "pass").map((item) => item.id), ["MULESOFT-AUD-17"]);
 });
+
+// Review fixes for PR #27 (compliance review of the MuleSoft inspector)
+
+function pagedServer(pathname, items, serverPageCap) {
+  return (url) => {
+    if (url.pathname !== pathname) return undefined;
+    const offset = Number(url.searchParams.get("offset") ?? 0);
+    const requested = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : serverPageCap;
+    const limit = Math.min(requested, serverPageCap);
+    return jsonResponse({ data: items.slice(offset, offset + limit), total: items.length });
+  };
+}
+
+function routedFetch(routes, seen = []) {
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push({ pathname: url.pathname, search: url.search, method: init.method ?? "GET" });
+    for (const route of routes) {
+      const response = route(url, init);
+      if (response) return response;
+    }
+    return jsonResponse({ data: [], total: 0 });
+  };
+}
+
+function manyEnvironments(count, productionIndex) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `env-${index}`,
+    name: index === productionIndex ? "Production" : `Sandbox ${index}`,
+    isProduction: index === productionIndex,
+    type: index === productionIndex ? "production" : "sandbox",
+  }));
+}
+
+test("review fix 1: listEnvironments pages past the Access Management default of 25 and records truncation", async () => {
+  const environments = manyEnvironments(30, 29);
+  const seen = [];
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, environments, 25)], seen),
+  });
+
+  const complete = await client.listEnvironments();
+  assert.equal(complete.items.length, 30);
+  assert.equal(complete.items.at(-1).id, "env-29");
+  assert.equal(complete.total, 30);
+  assert.equal(complete.truncated, false);
+  assert.ok(seen.every((request) => /limit=\d+/.test(request.search) && /offset=\d+/.test(request.search)), "every environments request carries limit and offset");
+  assert.ok(seen.some((request) => request.search.includes("offset=25")), "the second page starts at offset 25");
+
+  const capped = await client.listEnvironments(25);
+  assert.equal(capped.items.length, 25);
+  assert.equal(capped.total, 30);
+  assert.equal(capped.truncated, true);
+});
+
+test("review fix 1: a production environment beyond the 25th is sampled through the real client so API-07 and API-08 fail instead of passing", async () => {
+  const environments = manyEnvironments(30, 29);
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, environments, 25),
+      (url) => (url.pathname.endsWith("/environments/env-29/apis")
+        ? jsonResponse({
+          assets: [{ name: "orders-api", groupId: ORG_ID, assetId: "orders-api", apis: [{ id: 901, instanceLabel: "v1", environmentId: "env-29", activeContractsCount: 2 }] }],
+          total: 1,
+        })
+        : undefined),
+      (url) => (/\/environments\/env-\d+\/apis$/.test(url.pathname) ? jsonResponse({ assets: [], total: 0 }) : undefined),
+      (url) => (url.pathname.endsWith("/apis/901/policies") ? jsonResponse({ policies: [] }) : undefined),
+      (url) => (url.pathname === "/exchange/api/v2/assets/search" ? jsonResponse([]) : undefined),
+    ]),
+  });
+
+  const result = await assessMulesoftApiGateway(client, { environmentLimit: 30 });
+
+  assert.equal(result.summary.environments_visible, 30);
+  assert.deepEqual(result.summary.partial_view, []);
+  assert.equal(statusOf(result, "MULESOFT-API-07"), "fail");
+  assert.equal(findingById(result, "MULESOFT-API-07").evidence.production_without_authentication.length, 1);
+  assert.match(findingById(result, "MULESOFT-API-07").evidence.production_without_authentication[0], /^Production: /);
+  assert.equal(statusOf(result, "MULESOFT-API-08"), "fail");
+});
+
+test("review fix 1: a truncated environment inventory downgrades every environment-scoped control instead of passing", async () => {
+  const truncated = async () => truncatedPage(ENVIRONMENTS, 30);
+  const note = /Partial view: the environment list truncated at 2 of 30 total, so unseen environments \(which may include production\) were not sampled/;
+
+  const identity = await assessMulesoftIdentityAccess(healthyIdentityClient({ listEnvironments: truncated }));
+  assert.equal(statusOf(identity, "MULESOFT-IAM-06"), "warn");
+  assert.match(findingById(identity, "MULESOFT-IAM-06").summary, /Partial view: environment list truncated at 2 of 30 total/);
+
+  const gateway = await assessMulesoftApiGateway(healthyApiGatewayClient({ listEnvironments: truncated }));
+  for (const id of ["MULESOFT-API-07", "MULESOFT-API-08"]) {
+    assert.equal(statusOf(gateway, id), "warn", id);
+    assert.match(findingById(gateway, id).summary, note, id);
+  }
+  assert.deepEqual(gateway.summary.partial_view, [
+    "the environment list truncated at 2 of 30 total, so unseen environments (which may include production) were not sampled",
+  ]);
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({ listEnvironments: truncated }));
+  for (const id of ["MULESOFT-RT-10", "MULESOFT-RT-11", "MULESOFT-RT-12", "MULESOFT-RT-22", "MULESOFT-RT-23"]) {
+    assert.equal(statusOf(runtime, id), "warn", id);
+    assert.match(findingById(runtime, id).summary, note, id);
+  }
+  assert.equal(statusOf(runtime, "MULESOFT-RT-21"), "manual");
+  assert.match(findingById(runtime, "MULESOFT-RT-21").summary, note);
+
+  const audit = await assessMulesoftAuditMonitoring(healthyAuditClient({ listEnvironments: truncated }));
+  assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "warn");
+  assert.match(findingById(audit, "MULESOFT-AUD-24").summary, note);
+});

@@ -58,6 +58,7 @@ const DEFAULT_MAX_ROLES_PER_GROUP = 15;
 const DEFAULT_MAX_CONNECTED_APP_SCOPES = 10;
 const DEFAULT_STALE_CONNECTED_APP_DAYS = 90;
 const DEFAULT_ENVIRONMENT_LIMIT = 10;
+const DEFAULT_ENVIRONMENT_INVENTORY_LIMIT = 1000;
 const DEFAULT_API_LIMIT = 100;
 const DEFAULT_APPLICATION_LIMIT = 200;
 const DEFAULT_VPC_LIMIT = 20;
@@ -1243,8 +1244,8 @@ export class MulesoftApiClient {
     return this.listOffset(this.orgPath(`/rolegroups/${encodeURIComponent(roleGroupId)}/users`), { limit });
   }
 
-  async listEnvironments(): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(this.orgPath("/environments")));
+  async listEnvironments(limit = DEFAULT_ENVIRONMENT_INVENTORY_LIMIT): Promise<MulesoftPage> {
+    return this.listOffset(this.orgPath("/environments"), { limit });
   }
 
   async listConnectedApplications(limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
@@ -1571,7 +1572,7 @@ function hasEnvironmentType(environment: JsonRecord): boolean {
 }
 
 interface EnvironmentSample {
-  source: Collected<JsonRecord[]>;
+  source: Collected<MulesoftPage>;
   all: JsonRecord[];
   sampled: JsonRecord[];
   excludedByFilter: JsonRecord[];
@@ -1590,14 +1591,18 @@ async function sampleEnvironments(
   errors: string[],
 ): Promise<EnvironmentSample> {
   const config = client.getResolvedConfig();
-  const source = await collect<JsonRecord[]>("environments", [], () => client.listEnvironments(), errors);
-  const all = source.value;
+  const source = await collectPage("environments", () => client.listEnvironments(), errors);
+  const all = source.value.items;
   const matching = all.filter((environment) => matchesEnvironmentFilter(environment, config.environmentFilter));
   const excludedByFilter = all.filter((environment) => !matching.includes(environment));
   const sorted = [...matching].sort((left, right) => Number(isProductionEnvironment(right)) - Number(isProductionEnvironment(left)));
   const sampled = sorted.slice(0, limit);
   const excludedByLimit = sorted.slice(limit);
   const partialNotes: string[] = [];
+  const inventoryTruncation = truncationNote("environment", source.value);
+  if (inventoryTruncation) {
+    partialNotes.push(`the ${inventoryTruncation}, so unseen environments (which may include production) were not sampled`);
+  }
   if (excludedByFilter.length > 0) {
     partialNotes.push(`the environment filter excluded ${describeExcludedEnvironments(excludedByFilter)}`);
   }
@@ -1704,7 +1709,7 @@ export async function assessMulesoftIdentityAccess(
   const members = await collectPage("members", () => client.listMembers(userLimit), errors);
   const mfaExemptUsers = await collectPage("mfa_exempt_users", () => client.listMfaExemptUsers(userLimit), errors);
   const roleGroups = await collectPage("role_groups", () => client.listRoleGroups(), errors);
-  const environments = await collect<JsonRecord[]>("environments", [], () => client.listEnvironments(), errors);
+  const environments = await collectPage("environments", () => client.listEnvironments(), errors);
   const connectedApps = await collectPage("connected_applications", () => client.listConnectedApplications(), errors);
 
   const roleGroupDetails: Array<{ roleGroup: JsonRecord; roles: Collected<MulesoftPage>; users?: Collected<MulesoftPage> }> = [];
@@ -1781,7 +1786,7 @@ export async function assessMulesoftIdentityAccess(
     && !ORG_ADMIN_ROLE_PATTERN.test(roleName(item.role)),
   );
 
-  const environmentItems = environments.value;
+  const environmentItems = environments.value.items;
   const productionEnvironments = environmentItems.filter(isProductionEnvironment);
   const sandboxEnvironments = environmentItems.filter((environment) => !isProductionEnvironment(environment));
   const untypedEnvironments = environmentItems.filter((environment) => !hasEnvironmentType(environment));
@@ -1961,7 +1966,7 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       6,
-      { primary: [environments], partial: [scopeNote] },
+      { primary: [environments], partial: [truncationNote("environment", environments.value), scopeNote] },
       "Export Access Management > Environments with each environment's type and confirm production workloads do not share a sandbox environment.",
       () => {
         const evidence = {
