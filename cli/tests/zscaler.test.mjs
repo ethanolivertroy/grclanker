@@ -14,6 +14,9 @@ import {
   assessZpa,
   assessZpaData,
   checkZscalerAccess,
+  collectZiaAccessControlData,
+  collectZiaPolicyData,
+  collectZpaData,
   exportZscalerAuditBundle,
   listZscalerControls,
   mappingsForControl,
@@ -835,4 +838,765 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   assert.match(safe, /reports\/safe\.txt$/);
   assert.ok(!existsSync(safe));
   assert.equal(typeof readFileSync, "function");
+});
+
+// Review regression coverage: HTTP stubs shaped by the Automation Hub OpenAPI (paged ZIA lists honoring page and
+// pageSize, ZPA list/totalPages wrappers, the pageId cursor on emergency access, and GET /network) drive the real
+// clients so every assertion below exercises the exact request the tools send.
+
+const ZPA_CUSTOMER = "216196257331281920";
+const ZPA_V1 = `/mgmtconfig/v1/admin/customers/${ZPA_CUSTOMER}`;
+const ZPA_V2 = `/mgmtconfig/v2/admin/customers/${ZPA_CUSTOMER}`;
+const ZPA_USERCONFIG = `/userconfig/v1/customers/${ZPA_CUSTOMER}`;
+const STALE_EPOCH_MS = String(NOW.getTime() - 45 * 86400 * 1000);
+
+function requestKey(url, init = {}) {
+  const query = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}`).join("&");
+  return `${init.method ?? "GET"} ${url.pathname}${query ? `?${query}` : ""}`;
+}
+
+function pageOf(list, url, defaultPageSize) {
+  const page = Number(url.searchParams.get("page") ?? "1");
+  const pageSize = Number(url.searchParams.get("pageSize") ?? String(defaultPageSize));
+  return list.slice((page - 1) * pageSize, page * pageSize);
+}
+
+function zpaPage(list, url) {
+  const page = Number(url.searchParams.get("page") ?? "1");
+  const pageSize = Number(url.searchParams.get("pagesize") ?? "500");
+  return { totalPages: String(Math.max(1, Math.ceil(list.length / pageSize))), list: list.slice((page - 1) * pageSize, page * pageSize) };
+}
+
+function urlRule(id, overrides = {}) {
+  return { id, name: `Allow business ${id}`, order: id, state: "ENABLED", action: "ALLOW", urlCategories: ["PROFESSIONAL_SERVICES"], ...overrides };
+}
+
+function compliantLocation(id) {
+  return { id, name: `Site ${id}`, authRequired: true, sslScanEnabled: true, ofwEnabled: true };
+}
+
+function ziaCompliantTenant(overrides = {}) {
+  return {
+    adminUsers: [
+      { id: 1, loginName: "sso-admin@example.com", userName: "SSO Admin", disabled: false, isPasswordLoginAllowed: false, adminScope: { Type: "ORGANIZATION", ScopeEntities: [] }, role: { id: 10, name: "Super Admin" } },
+      { id: 2, loginName: "policy-admin@example.com", userName: "Policy Admin", disabled: false, isPasswordLoginAllowed: false, adminScope: { Type: "DEPARTMENT", ScopeEntities: [{ id: 5, name: "IT" }] }, role: { id: 11, name: "Policy Admin" } },
+    ],
+    adminRoles: [{ id: 10, name: "Super Admin", roleType: "ORG_ADMIN" }, { id: 11, name: "Policy Admin", roleType: "ORG_ADMIN" }],
+    authSettings: { samlEnabled: true, orgAuthType: "SAML" },
+    passwordExpiry: { passwordExpirationEnabled: true, passwordExpiryDays: 90 },
+    auditLogReport: { status: "COMPLETE", progressItemsComplete: 10 },
+    nssFeeds: [{ id: 1, name: "SIEM admin audit", feedStatus: "ENABLED", nssLogType: "ADMIN_AUDIT" }],
+    urlFilteringRules: [
+      { id: 1, name: "Block risky", order: 1, state: "ENABLED", action: "BLOCK", urlCategories: ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"] },
+      { id: 2, name: "Isolate uncategorized", order: 2, state: "ENABLED", action: "ISOLATE", urlCategories: ["MISCELLANEOUS_OR_UNKNOWN"] },
+      ...Array.from({ length: 99 }, (_, index) => urlRule(index + 3)),
+    ],
+    firewallRules: [
+      { id: 1, name: "Allow web", order: 1, state: "ENABLED", action: "ALLOW", nwServices: [{ id: 1, name: "HTTP" }], enableFullLogging: true },
+      { id: 2, name: "Block sanctioned countries", order: 2, state: "ENABLED", action: "BLOCK_DROP", destCountries: ["COUNTRY_KP"], enableFullLogging: true },
+      { id: 99, name: "Default Firewall Filtering Rule", order: 3, state: "ENABLED", action: "BLOCK_DROP", defaultRule: true, enableFullLogging: true },
+    ],
+    dnsRules: [{ id: 1, name: "Block malicious DNS", state: "ENABLED", action: "BLOCK" }, { id: 9, name: "Default DNS rule", state: "ENABLED", action: "ALLOW", defaultRule: true }],
+    dlpEngines: [{ id: 1, name: "PCI", predefinedEngineName: "PCI" }],
+    dlpDictionaries: [{ id: 1, name: "Credit Cards", custom: false }],
+    webDlpRules: [{ id: 1, name: "Block card data", state: "ENABLED", action: "BLOCK", dlpEngines: [{ id: 1 }] }],
+    sslInspectionRules: [{ id: 1, name: "Decrypt all", state: "ENABLED", action: { type: "DECRYPT" } }, { id: 2, name: "Bypass banking", state: "ENABLED", action: { type: "DO_NOT_DECRYPT" }, urlCategories: ["FINANCE"] }],
+    sslExemptedUrls: { urls: ["bank.example.com"] },
+    sandboxRules: [{ id: 1, name: "Sandbox block", state: "ENABLED", baRuleAction: "BLOCK", firstTimeEnable: true, firstTimeOperation: "QUARANTINE" }],
+    sandboxSettings: { md5HashValueList: ["d41d8cd98f00b204e9800998ecf8427e"] },
+    advancedThreatSettings: { riskTolerance: 50, malwareSitesBlocked: true, cmdCtlServerBlocked: true, cmdCtlTrafficBlocked: true, knownPhishingSitesBlocked: true, suspectedPhishingSitesBlocked: true, browserExploitsBlocked: true, potentialMaliciousRequestsBlocked: true, dgaDomainsBlocked: true },
+    malwarePolicy: { blockUnscannableFiles: true, blockPasswordProtectedArchiveFiles: true },
+    malwareSettings: { virusBlocked: true, trojanBlocked: true, wormBlocked: true, ransomwareBlocked: true, spywareBlocked: true },
+    securityAllowlist: { whitelistUrls: ["trusted.example.com"] },
+    securityDenylist: { blacklistUrls: ["bad.example.com"] },
+    locations: [compliantLocation(100)],
+    subLocations: { 100: [{ id: 101, name: "HQ Guest", parentId: 100, authRequired: true, sslScanEnabled: true, ofwEnabled: true }] },
+    greTunnels: [{ id: 1, sourceIp: "203.0.113.10" }],
+    vpnCredentials: [{ id: 1, type: "UFQDN", fqdn: "hq@example.com", location: { id: 100, name: "Site 100" } }],
+    bandwidthRules: [{ id: 1, name: "Video cap", state: "ENABLED", minBandwidth: 10, maxBandwidth: 40 }],
+    isolationProfiles: [{ id: "p1", name: "Default isolation", url: "https://isolation.example.com" }],
+    ruleTypeMapping: { WEBMAIL: "Webmail" },
+    cloudAppRules: { WEBMAIL: [{ id: 1, name: "Block personal webmail", state: "ENABLED", ruleType: "WEBMAIL", actions: ["BLOCK_WEBMAIL_SEND"] }] },
+    ...overrides,
+  };
+}
+
+function ziaTenantFetch(tenant, options = {}) {
+  const requests = [];
+  const statusOverrides = options.statusOverrides ?? {};
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push({ key: requestKey(url, init), url, init });
+    const path = url.pathname.replace(/^\/api\/v1/, "");
+    if (path === "/authenticatedSession") {
+      return init.method === "POST"
+        ? jsonResponse({ authType: "ADMIN_LOGIN" }, { headers: { "set-cookie": "JSESSIONID=TENANT; Path=/; Secure; HttpOnly" } })
+        : jsonResponse({});
+    }
+    if (statusOverrides[path]) return jsonResponse({ code: "INVALID_INPUT_ARGUMENT", message: `stub ${statusOverrides[path]}` }, { status: statusOverrides[path] });
+    const subLocation = path.match(/^\/locations\/(\d+)\/sublocations$/);
+    if (subLocation) return jsonResponse(tenant.subLocations[subLocation[1]] ?? []);
+    const cloudApp = path.match(/^\/webApplicationRules\/([A-Z_]+)$/);
+    if (cloudApp) return jsonResponse(tenant.cloudAppRules[cloudApp[1]] ?? []);
+    switch (path) {
+      case "/adminUsers": return jsonResponse(pageOf(tenant.adminUsers, url, 100));
+      case "/adminRoles/lite": return jsonResponse(tenant.adminRoles);
+      case "/authSettings": return jsonResponse(tenant.authSettings);
+      case "/passwordExpiry/settings": return jsonResponse(tenant.passwordExpiry);
+      case "/auditlogEntryReport": return jsonResponse(tenant.auditLogReport);
+      case "/nssFeeds": return jsonResponse(tenant.nssFeeds);
+      case "/urlFilteringRules": return jsonResponse(pageOf(tenant.urlFilteringRules, url, 100));
+      case "/firewallFilteringRules": return jsonResponse(pageOf(tenant.firewallRules, url, 5000));
+      case "/firewallDnsRules": return jsonResponse(tenant.dnsRules);
+      case "/dlpEngines": return jsonResponse(tenant.dlpEngines);
+      case "/dlpDictionaries": return jsonResponse(tenant.dlpDictionaries);
+      case "/webDlpRules": return jsonResponse(tenant.webDlpRules);
+      case "/sslInspectionRules": return jsonResponse(tenant.sslInspectionRules);
+      case "/sslSettings/exemptedUrls": return jsonResponse(tenant.sslExemptedUrls);
+      case "/sandboxRules": return jsonResponse(tenant.sandboxRules);
+      case "/behavioralAnalysisAdvancedSettings": return jsonResponse(tenant.sandboxSettings);
+      case "/cyberThreatProtection/advancedThreatSettings": return jsonResponse(tenant.advancedThreatSettings);
+      case "/cyberThreatProtection/malwarePolicy": return jsonResponse(tenant.malwarePolicy);
+      case "/cyberThreatProtection/malwareSettings": return jsonResponse(tenant.malwareSettings);
+      case "/security": return jsonResponse(tenant.securityAllowlist);
+      case "/security/advanced": return jsonResponse(tenant.securityDenylist);
+      case "/locations": return jsonResponse(pageOf(tenant.locations, url, 100));
+      case "/greTunnels": return jsonResponse(pageOf(tenant.greTunnels, url, 100));
+      case "/vpnCredentials": {
+        const withoutLocationOnly = url.searchParams.get("includeOnlyWithoutLocation") !== "false";
+        return jsonResponse(pageOf(withoutLocationOnly ? tenant.vpnCredentials.filter((credential) => !credential.location) : tenant.vpnCredentials, url, 100));
+      }
+      case "/bandwidthControlRules": return jsonResponse(tenant.bandwidthRules);
+      case "/browserIsolation/profiles": return jsonResponse(tenant.isolationProfiles);
+      case "/webApplicationRules/ruleTypeMapping": return jsonResponse(tenant.ruleTypeMapping);
+      default: return jsonResponse({ code: "RESOURCE_NOT_FOUND", message: `no stub for ${path}` }, { status: 404 });
+    }
+  };
+  return { fetchImpl, requests };
+}
+
+function zpaCompliantTenant(overrides = {}) {
+  const identityCondition = { operator: "AND", operands: [{ objectType: "SCIM_GROUP", lhs: "idp-1", rhs: "group-1" }, { objectType: "POSTURE", lhs: "posture-udid", rhs: "true" }] };
+  return {
+    application: [{ id: "seg-1", name: "HR app", enabled: true, domainNames: ["hr.corp.example.com"], tcpPortRange: [{ from: "443", to: "443" }], segmentGroupId: "sg-1", bypassType: "NEVER" }],
+    segmentGroup: [{ id: "sg-1", name: "Corp apps", enabled: true }],
+    ACCESS_POLICY: [
+      { id: "r-1", name: "HR access", action: "ALLOW", disabled: false, conditions: [identityCondition] },
+      { id: "r-9", name: "Deny all", action: "DENY", disabled: false, conditions: [] },
+    ],
+    TIMEOUT_POLICY: [{ id: "t-1", name: "Default timeout", disabled: false, reauthTimeout: "43200", reauthIdleTimeout: "3600" }],
+    CLIENT_FORWARDING_POLICY: [{ id: "f-1", name: "Forward corp", action: "INTERCEPT", disabled: false, conditions: [{ operands: [{ objectType: "TRUSTED_NETWORK", lhs: "net-1", rhs: "true" }] }] }],
+    ISOLATION_POLICY: [],
+    appConnectorGroup: [{ id: "cg-1", name: "DC East", enabled: true }],
+    connector: [
+      { id: "c-1", name: "connector-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: RECENT_EPOCH_MS },
+      { id: "c-2", name: "connector-2", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: RECENT_EPOCH_MS },
+    ],
+    serviceEdgeGroup: [{ id: "seg-1", name: "Edge group" }],
+    serviceEdge: [{ id: "se-1", name: "edge-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", lastBrokerConnectTime: RECENT_EPOCH_MS }],
+    posture: [{ id: "p-1", name: "Disk encrypted", postureType: "DISK_ENCRYPTION", postureUdid: "posture-udid" }],
+    network: [{ id: "n-1", name: "HQ network", networkId: "net-1" }],
+    idp: [{ id: "idp-1", name: "Okta", enabled: true, ssoType: ["USER", "ADMIN"], scimEnabled: true, signSamlRequest: "1" }],
+    samlAttribute: [{ id: "a-1", name: "Email", idpId: "idp-1" }],
+    scimGroups: { "idp-1": [{ id: 1, name: "HR", idpId: "idp-1" }] },
+    enrollmentCert: [{ id: "ec-1", name: "Connector", validToInEpochSec: FUTURE_EPOCH }, { id: "ec-2", name: "Client", validToInEpochSec: FUTURE_EPOCH }],
+    clientlessCertificate: [{ id: "ba-1", name: "portal cert", validToInEpochSec: FUTURE_EPOCH }],
+    emergencyAccessPages: [
+      { items: [{ userId: "u-1", emailId: "breakglass-1@example.com", userStatus: "DEACTIVATED", lastLoginTime: PAST_EPOCH }], nextPage: "cursor-2" },
+      { items: [
+        { userId: "u-2", emailId: "breakglass-2@example.com", userStatus: "DEACTIVATED", lastLoginTime: PAST_EPOCH },
+        { userId: "u-1", emailId: "breakglass-1@example.com", userStatus: "DEACTIVATED", lastLoginTime: PAST_EPOCH },
+      ] },
+    ],
+    administrators: [{ id: "ad-1", username: "zpa-admin", isEnabled: true, localLoginDisabled: true, twoFactorAuthEnabled: false }],
+    ...overrides,
+  };
+}
+
+function zpaTenantFetch(tenant, options = {}) {
+  const requests = [];
+  const statusOverrides = options.statusOverrides ?? {};
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push({ key: requestKey(url, init), url, init });
+    if (url.pathname === "/signin") return jsonResponse({ token_type: "Bearer", access_token: "zpa-token", expires_in: "3600" });
+    const suffix = url.pathname.replace(`${ZPA_V1}/`, "").replace(`${ZPA_V2}/`, "").replace(`${ZPA_USERCONFIG}/`, "");
+    if (statusOverrides[suffix]) return jsonResponse({ id: "error", reason: `stub ${statusOverrides[suffix]}` }, { status: statusOverrides[suffix] });
+    const policy = suffix.match(/^policySet\/rules\/policyType\/([A-Z_]+)$/);
+    if (policy) return jsonResponse(zpaPage(tenant[policy[1]] ?? [], url));
+    const scim = suffix.match(/^scimgroup\/idpId\/(.+)$/);
+    if (scim) return jsonResponse(zpaPage(tenant.scimGroups[decodeURIComponent(scim[1])] ?? [], url));
+    if (suffix === "emergencyAccess/users") {
+      const pageId = url.searchParams.get("pageId");
+      const index = pageId ? Number(pageId.replace("cursor-", "")) - 1 : 0;
+      return jsonResponse(tenant.emergencyAccessPages[index] ?? { items: [] });
+    }
+    if (suffix === "clientlessCertificate/issued") return jsonResponse(zpaPage(tenant.clientlessCertificate, url));
+    if (suffix === "application" && tenant.applicationTotalPages) {
+      const page = url.searchParams.get("page");
+      return jsonResponse({ totalPages: String(tenant.applicationTotalPages), list: [{ ...tenant.application[0], id: `seg-${page}`, name: `Segment ${page}` }] });
+    }
+    if (Array.isArray(tenant[suffix])) return jsonResponse(zpaPage(tenant[suffix], url));
+    return jsonResponse({ id: "not-found", reason: `no stub for ${url.pathname}` }, { status: 404 });
+  };
+  return { fetchImpl, requests };
+}
+
+const AUTOMATABLE_CONTROL_IDS = [...POLICY_CONTROL_IDS, ...ZPA_CONTROL_IDS, "ZS-07", "ZS-14"].sort();
+
+async function runCompliantTenant(ziaOverrides = {}, zpaOverrides = {}, options = {}) {
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant(ziaOverrides), { statusOverrides: options.ziaStatus });
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant(zpaOverrides), { statusOverrides: options.zpaStatus });
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const zpa = new ZpaApiClient(zpaConfig(), { fetchImpl: zpaStub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const results = {
+    access: await assessZiaAccessControl(zia, options.accessOptions ?? {}),
+    policy: await assessZiaPolicy(zia, options.policyOptions ?? {}),
+    zpa: await assessZpa(zpa, options.zpaOptions ?? {}),
+  };
+  await zia.logout();
+  const findings = [...results.access.findings, ...results.policy.findings, ...results.zpa.findings];
+  return { ...results, findings, ziaRequests: ziaStub.requests, zpaRequests: zpaStub.requests };
+}
+
+test("ZpaApiClient requests GET /mgmtconfig/v2/admin/customers/{customerId}/network for trusted networks (ZS-15)", async () => {
+  const stub = zpaTenantFetch(zpaCompliantTenant());
+  const client = new ZpaApiClient(zpaConfig(), { fetchImpl: stub.fetchImpl, maxRetries: 0 });
+  const networks = await client.listTrustedNetworks();
+  assert.deepEqual(networks.items.map((item) => item.networkId), ["net-1"]);
+  const keys = stub.requests.map((request) => request.key);
+  assert.ok(keys.includes(`GET ${ZPA_V2}/network?page=1&pagesize=500`), keys.join("\n"));
+  assert.ok(keys.every((key) => !key.includes("trustedNetwork")));
+
+  const result = assessZpaData(zpaFixture({ trustedNetworks: { data: [], error: "ZPA GET /network failed (404): not found", statusCode: 404 } }));
+  assert.equal(findingById(result, "ZS-15").status, "manual");
+  assert.match(findingById(result, "ZS-15").summary, /GET \/network could not be read/);
+});
+
+test("ZpaApiClient pages /emergencyAccess/users with the pageId cursor and deduplicates users", async () => {
+  const stub = zpaTenantFetch(zpaCompliantTenant());
+  const client = new ZpaApiClient(zpaConfig(), { fetchImpl: stub.fetchImpl, maxRetries: 0 });
+  const users = await client.listEmergencyAccessUsers();
+  assert.deepEqual(users.items.map((user) => user.userId), ["u-1", "u-2"]);
+  assert.equal(users.truncated, false);
+  assert.equal(users.pagesFetched, 2);
+  const emergencyRequests = stub.requests.filter((request) => request.url.pathname === `${ZPA_V1}/emergencyAccess/users`);
+  assert.deepEqual(emergencyRequests.map((request) => request.key), [
+    `GET ${ZPA_V1}/emergencyAccess/users?pageSize=500`,
+    `GET ${ZPA_V1}/emergencyAccess/users?pageId=cursor-2&pageSize=500`,
+  ]);
+  for (const request of emergencyRequests) {
+    assert.equal(request.url.searchParams.has("page"), false);
+    assert.equal(request.url.searchParams.has("pagesize"), false);
+  }
+});
+
+test("ZpaApiClient stops cursor paging when nextPage repeats and records truncation at the page cap", async () => {
+  let calls = 0;
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/signin") return jsonResponse({ token_type: "Bearer", access_token: "t", expires_in: "3600" });
+    calls += 1;
+    return jsonResponse({ items: [{ userId: `u-${calls}`, emailId: `u-${calls}@example.com` }], nextPage: "same-cursor" });
+  };
+  const client = new ZpaApiClient(zpaConfig(), { fetchImpl, maxRetries: 0 });
+  const users = await client.listEmergencyAccessUsers();
+  assert.equal(calls, 2);
+  assert.equal(users.truncated, false);
+  assert.deepEqual(users.items.map((user) => user.userId), ["u-1", "u-2"]);
+
+  let cursor = 0;
+  const endless = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/signin") return jsonResponse({ token_type: "Bearer", access_token: "t", expires_in: "3600" });
+    cursor += 1;
+    return jsonResponse({ items: [{ userId: `u-${cursor}` }], nextPage: `cursor-${cursor + 1}` });
+  };
+  const capped = await new ZpaApiClient(zpaConfig(), { fetchImpl: endless, maxRetries: 0 }).listEmergencyAccessUsers();
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.pagesFetched, 200);
+  assert.equal(findingById(assessZpaData(zpaFixture({ emergencyAccessUsers: { data: capped.items.map((user) => ({ ...user, userStatus: "DEACTIVATED" })), truncated: true, seen: 200 } })), "ZS-23").status, "warn");
+});
+
+test("ZiaApiClient pages /urlFilteringRules at the documented pageSize of 100 and reads a 101-rule tenant completely", async () => {
+  const stub = ziaTenantFetch(ziaCompliantTenant());
+  const client = new ZiaApiClient(ziaConfig(), { fetchImpl: stub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const rules = await client.listUrlFilteringRules();
+  assert.equal(rules.items.length, 101);
+  assert.equal(rules.truncated, false);
+  assert.equal(rules.pagesFetched, 2);
+  assert.deepEqual(stub.requests.filter((request) => request.url.pathname === "/api/v1/urlFilteringRules").map((request) => request.key), [
+    "GET /api/v1/urlFilteringRules?page=1&pageSize=100",
+    "GET /api/v1/urlFilteringRules?page=2&pageSize=100",
+  ]);
+
+  const firewall = await client.listFirewallFilteringRules();
+  assert.equal(firewall.items.length, 3);
+  assert.equal(stub.requests.at(-1).key, "GET /api/v1/firewallFilteringRules?page=1&pageSize=5000");
+
+  const tunnels = await client.listGreTunnels();
+  assert.equal(tunnels.items.length, 1);
+  assert.equal(stub.requests.at(-1).key, "GET /api/v1/greTunnels?page=1&pageSize=1000");
+
+  const credentials = await client.listVpnCredentials();
+  assert.deepEqual(credentials.items.map((item) => item.fqdn), ["hq@example.com"]);
+  assert.equal(stub.requests.at(-1).key, "GET /api/v1/vpnCredentials?includeOnlyWithoutLocation=false&page=1&pageSize=1000");
+
+  const policy = await assessZiaPolicy(client);
+  assert.equal(findingById(policy, "ZS-01").status, "pass");
+  assert.equal(findingById(policy, "ZS-01").evidence.rule_count, 101);
+  assert.equal(findingById(policy, "ZS-01").evidence.partial_inventory, false);
+  assert.equal(findingById(policy, "ZS-17").status, "pass");
+});
+
+test("ZiaApiClient records truncation when a URL rule read hits the page cap and ZS-01 and ZS-17 downgrade", async () => {
+  const stub = ziaTenantFetch(ziaCompliantTenant({ urlFilteringRules: [
+    { id: 1, name: "Block risky", order: 1, state: "ENABLED", action: "BLOCK", urlCategories: ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"] },
+    { id: 2, name: "Isolate uncategorized", order: 2, state: "ENABLED", action: "ISOLATE", urlCategories: ["MISCELLANEOUS_OR_UNKNOWN"] },
+    ...Array.from({ length: 5001 }, (_, index) => urlRule(index + 3)),
+  ] }));
+  const client = new ZiaApiClient(ziaConfig(), { fetchImpl: stub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const data = await collectZiaPolicyData(client);
+  assert.equal(data.urlFilteringRules.truncated, true);
+  assert.equal(data.urlFilteringRules.seen, 50);
+  assert.equal(data.urlFilteringRules.data.length, 5000);
+  assert.equal(stub.requests.filter((request) => request.url.pathname === "/api/v1/urlFilteringRules").length, 50);
+
+  const result = assessZiaPolicyData(data);
+  assert.equal(findingById(result, "ZS-01").status, "warn");
+  assert.match(findingById(result, "ZS-01").summary, /URL filtering rule inventory is partial \(5000 records over 50 pages\)/);
+  assert.equal(findingById(result, "ZS-17").status, "warn");
+  assert.match(findingById(result, "ZS-17").summary, /inventory is partial/);
+  assert.ok(result.truncated.some((note) => /urlFilteringRules: only 50 pages were read/.test(note)));
+
+  const firewall = assessZiaPolicyData(policyFixture({ firewallRules: { ...policyFixture().firewallRules, truncated: true, seen: 50 } }));
+  assert.equal(findingById(firewall, "ZS-02").status, "warn");
+  assert.match(findingById(firewall, "ZS-02").summary, /firewall rule inventory is partial/);
+});
+
+test("assessZpa: authenticated connectors and service edges with a deleted lastBrokerConnectTime cap ZS-11 and ZS-21 at warn", () => {
+  const undated = ({ lastBrokerConnectTime, ...rest }) => rest;
+  const fixture = zpaFixture();
+  fixture.appConnectors = readable(fixture.appConnectors.data.map(undated));
+  fixture.serviceEdges = readable(fixture.serviceEdges.data.map(undated));
+  const result = assessZpaData(fixture);
+  assert.equal(findingById(result, "ZS-11").status, "warn");
+  assert.match(findingById(result, "ZS-11").summary, /0 of 2 enabled connectors are authenticated with a broker connect time within 30 days; 2 authenticated but with no lastBrokerConnectTime/);
+  assert.deepEqual(findingById(result, "ZS-11").evidence.authenticated_without_connect_time, ["connector-1", "connector-2"]);
+  assert.equal(findingById(result, "ZS-21").status, "warn");
+  assert.match(findingById(result, "ZS-21").summary, /1 authenticated but with no lastBrokerConnectTime/);
+  assert.deepEqual(findingById(result, "ZS-21").evidence.authenticated_without_connect_time, ["edge-1"]);
+});
+
+test("assessZpa: stale_connector_days changes the ZS-11 and ZS-21 verdicts for over-threshold connect times", () => {
+  const stale = (item) => ({ ...item, lastBrokerConnectTime: STALE_EPOCH_MS });
+  const fixture = zpaFixture();
+  fixture.appConnectors = readable(fixture.appConnectors.data.map(stale));
+  fixture.serviceEdges = readable(fixture.serviceEdges.data.map(stale));
+
+  const defaults = assessZpaData(fixture);
+  assert.equal(findingById(defaults, "ZS-11").status, "warn");
+  assert.match(findingById(defaults, "ZS-11").summary, /2 authenticated but with lastBrokerConnectTime older than 30 days/);
+  assert.deepEqual(findingById(defaults, "ZS-11").evidence.stale, ["connector-1", "connector-2"]);
+  assert.equal(findingById(defaults, "ZS-11").evidence.stale_connector_days, 30);
+  assert.equal(findingById(defaults, "ZS-21").status, "warn");
+  assert.match(findingById(defaults, "ZS-21").summary, /older than 30 days/);
+
+  const strict = assessZpaData(fixture, { staleConnectorDays: 7 });
+  assert.equal(findingById(strict, "ZS-11").status, "warn");
+  assert.match(findingById(strict, "ZS-11").summary, /older than 7 days/);
+
+  const relaxed = assessZpaData(fixture, { staleConnectorDays: 60 });
+  assert.equal(findingById(relaxed, "ZS-11").status, "pass");
+  assert.equal(findingById(relaxed, "ZS-11").evidence.stale_connector_days, 60);
+  assert.deepEqual(findingById(relaxed, "ZS-11").evidence.stale, []);
+  assert.equal(findingById(relaxed, "ZS-21").status, "pass");
+
+  const disconnected = assessZpaData(zpaFixture({ serviceEdges: readable([{ id: "se-1", name: "edge-1", enabled: true, controlChannelStatus: "ZPN_STATUS_DISCONNECTED", lastBrokerConnectTime: RECENT_EPOCH_MS }]) }));
+  assert.equal(findingById(disconnected, "ZS-21").status, "fail");
+});
+
+test("assessZiaPolicy: sub-location truncation caps ZS-18 at warn with parents read versus total", async () => {
+  const locations = Array.from({ length: 150 }, (_, index) => compliantLocation(index + 1));
+  const subLocations = locations.slice(0, 100).map((location) => ({ id: location.id + 1000, name: `${location.name} guest`, parentId: location.id, authRequired: true, sslScanEnabled: true, ofwEnabled: true }));
+  const result = assessZiaPolicyData(policyFixture({ locations: readable(locations), subLocations: { data: subLocations, truncated: true, seen: 100, total: 150 } }));
+  assert.equal(findingById(result, "ZS-18").status, "warn");
+  assert.match(findingById(result, "ZS-18").summary, /Sub-locations were read for only 100 of 150 parent locations/);
+  assert.equal(findingById(result, "ZS-18").evidence.sub_location_parents_read, 100);
+  assert.equal(findingById(result, "ZS-18").evidence.sub_location_parents_total, 150);
+  assert.equal(findingById(result, "ZS-18").evidence.partial_inventory, true);
+  assert.ok(result.truncated.some((note) => /sublocations: only 100 of 150 parent locations were read/.test(note)));
+
+  const calls = [];
+  const client = {
+    getResolvedConfig: () => ziaConfig(),
+    getNow: () => NOW,
+    listUrlFilteringRules: async () => ({ items: policyFixture().urlFilteringRules.data, truncated: false, pagesFetched: 1 }),
+    listFirewallFilteringRules: async () => ({ items: policyFixture().firewallRules.data, truncated: false, pagesFetched: 1 }),
+    listFirewallDnsRules: async () => policyFixture().dnsRules.data,
+    listDlpEngines: async () => policyFixture().dlpEngines.data,
+    listDlpDictionaries: async () => policyFixture().dlpDictionaries.data,
+    listWebDlpRules: async () => policyFixture().webDlpRules.data,
+    listSslInspectionRules: async () => policyFixture().sslInspectionRules.data,
+    getSslExemptedUrls: async () => policyFixture().sslExemptedUrls.data,
+    listSandboxRules: async () => policyFixture().sandboxRules.data,
+    getSandboxAdvancedSettings: async () => policyFixture().sandboxSettings.data,
+    getAdvancedThreatSettings: async () => policyFixture().advancedThreatSettings.data,
+    getMalwarePolicy: async () => policyFixture().malwarePolicy.data,
+    getMalwareSettings: async () => policyFixture().malwareSettings.data,
+    getSecurityAllowlist: async () => policyFixture().securityAllowlist.data,
+    getSecurityDenylist: async () => policyFixture().securityDenylist.data,
+    listLocations: async () => ({ items: locations, truncated: false, pagesFetched: 1 }),
+    listSubLocations: async (id) => { calls.push(id); return [{ id: Number(id) + 1000, name: `Site ${id} guest`, parentId: Number(id), authRequired: true, sslScanEnabled: true, ofwEnabled: true }]; },
+    listGreTunnels: async () => ({ items: policyFixture().greTunnels.data, truncated: false, pagesFetched: 1 }),
+    listVpnCredentials: async () => ({ items: policyFixture().vpnCredentials.data, truncated: false, pagesFetched: 1 }),
+    listBandwidthControlRules: async () => policyFixture().bandwidthRules.data,
+    listBrowserIsolationProfiles: async () => policyFixture().isolationProfiles.data,
+    listCloudAppRuleTypes: async () => ["WEBMAIL"],
+    listCloudAppRules: async () => policyFixture().cloudAppRules.data,
+  };
+  const collected = await assessZiaPolicy(client);
+  assert.equal(calls.length, 100);
+  assert.equal(findingById(collected, "ZS-18").status, "warn");
+  assert.match(findingById(collected, "ZS-18").summary, /only 100 of 150 parent locations/);
+  assert.equal(collected.summary.locations, 150);
+  for (const item of collected.findings.filter((entry) => entry.id !== "ZS-18")) {
+    assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+  }
+});
+
+test("assessZiaPolicy: sandbox evidence reads md5HashValueList and records fileHashesToBeBlocked only as legacy evidence", () => {
+  const documented = assessZiaPolicyData(policyFixture());
+  assert.equal(findingById(documented, "ZS-05").status, "pass");
+  assert.equal(findingById(documented, "ZS-05").evidence.blocked_file_hashes, 1);
+  assert.equal(findingById(documented, "ZS-05").evidence.legacy_file_hashes_to_be_blocked, null);
+
+  const legacy = assessZiaPolicyData(policyFixture({ sandboxSettings: readable({ fileHashesToBeBlocked: ["abc", "def"] }) }));
+  assert.equal(findingById(legacy, "ZS-05").evidence.blocked_file_hashes, 0);
+  assert.equal(findingById(legacy, "ZS-05").evidence.legacy_file_hashes_to_be_blocked, 2);
+});
+
+test("assessZiaPolicy: firewall block rules without enableFullLogging in the response never count toward logging", () => {
+  const withoutField = policyFixture().firewallRules.data.map(({ enableFullLogging, ...rule }) => rule);
+  const absent = assessZiaPolicyData(policyFixture({ firewallRules: readable(withoutField) }));
+  assert.equal(findingById(absent, "ZS-02").status, "pass");
+  assert.match(findingById(absent, "ZS-02").summary, /block-rule logging was not evaluated for 2 rule\(s\) because enableFullLogging is absent/);
+  assert.equal(findingById(absent, "ZS-02").evidence.block_rules_with_unknown_logging, 2);
+  assert.equal(findingById(absent, "ZS-02").evidence.block_rules_without_full_logging, 0);
+  assert.match(findingById(absent, "ZS-02").evidence.full_logging_field_source, /zscaler-sdk-go only/);
+
+  const disabled = assessZiaPolicyData(policyFixture({ firewallRules: readable(policyFixture().firewallRules.data.map((rule) => ({ ...rule, enableFullLogging: false }))) }));
+  assert.equal(findingById(disabled, "ZS-02").status, "warn");
+  assert.match(findingById(disabled, "ZS-02").summary, /2 block rule\(s\) have full logging disabled/);
+});
+
+test("assessZiaAccessControl: adminScope.Type is read per the reference and adminScopeType only as legacy evidence", () => {
+  const result = assessZiaAccessControlData(accessControlFixture({
+    adminUsers: readable([
+      { id: 1, loginName: "org@example.com", disabled: false, isPasswordLoginAllowed: false, adminScope: { Type: "ORGANIZATION", ScopeEntities: [] }, role: { id: 10, name: "Super Admin" } },
+      { id: 2, loginName: "dept@example.com", disabled: false, isPasswordLoginAllowed: false, adminScope: { Type: "DEPARTMENT", ScopeEntities: [{ id: 5, name: "IT" }] }, role: { id: 11, name: "Policy Admin" } },
+      { id: 3, loginName: "legacy@example.com", disabled: false, isPasswordLoginAllowed: false, adminScopeType: "ORGANIZATION", role: { id: 11, name: "Policy Admin" } },
+      { id: 4, loginName: "unscoped@example.com", disabled: false, isPasswordLoginAllowed: false, role: { id: 11, name: "Policy Admin" } },
+    ]),
+  }), { maxSuperAdmins: 5 });
+  const rbac = findingById(result, "ZS-07");
+  assert.equal(rbac.status, "pass");
+  assert.equal(rbac.evidence.organization_scoped_admins, 2);
+  assert.equal(rbac.evidence.admins_scoped_via_legacy_field, 1);
+  assert.equal(rbac.evidence.admins_without_scope, 1);
+  assert.match(rbac.evidence.admin_scope_field_source, /adminScope\.Type per the published reference/);
+  assert.match(rbac.summary, /2 are organization-scoped \(1 returned no adminScope and are not counted as scoped\)/);
+});
+
+test("assessZiaAccessControl: a 400 from GET /auditlogEntryReport renders ZS-14 manual naming the statusId requirement", async () => {
+  const stub = ziaTenantFetch(ziaCompliantTenant(), { statusOverrides: { "/auditlogEntryReport": 400 } });
+  const client = new ZiaApiClient(ziaConfig(), { fetchImpl: stub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const data = await collectZiaAccessControlData(client);
+  assert.equal(data.auditLogReport.statusCode, 400);
+  assert.equal(stub.requests.find((request) => request.url.pathname === "/api/v1/auditlogEntryReport").key, "GET /api/v1/auditlogEntryReport");
+
+  const result = assessZiaAccessControlData(data);
+  const audit = findingById(result, "ZS-14");
+  assert.equal(audit.status, "manual");
+  assert.match(audit.summary, /returned 400/);
+  assert.match(audit.summary, /statusId as a required query parameter/);
+  assert.match(audit.summary, /zscaler-sdk-go and zscaler-sdk-python send the same bare GET/);
+  assert.equal(audit.evidence.documented_request_shape, "GET /auditlogEntryReport?statusId={export task id}");
+  assert.equal(audit.evidence.nss_feeds, 1);
+  assert.equal(findingById(result, "ZS-07").status, "pass");
+  assert.ok(result.errors.some((error) => /auditlogEntryReport/.test(error)));
+});
+
+test("assessZpa: ZS-12 states that GET /administrators is documented only by zscaler-sdk-go", () => {
+  const compliant = assessZpaData(zpaFixture());
+  assert.equal(findingById(compliant, "ZS-12").status, "pass");
+  assert.match(findingById(compliant, "ZS-12").summary, /documented only by zscaler-sdk-go, not by the published ZPA API reference/);
+  assert.match(findingById(compliant, "ZS-12").evidence.zpa_administrators_surface, /never the sole basis for pass/);
+
+  const unreadable = assessZpaData(zpaFixture({ administrators: { data: [], error: "ZPA GET /administrators failed (404): not found", statusCode: 404 } }));
+  assert.equal(findingById(unreadable, "ZS-12").status, "warn");
+  assert.match(findingById(unreadable, "ZS-12").summary, /GET \/administrators .*documented only by zscaler-sdk-go/);
+});
+
+test("schema: the real clients send exactly the documented path and query for every ZIA and ZPA endpoint the tools call", async () => {
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant());
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant());
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const zpa = new ZpaApiClient(zpaConfig(), { fetchImpl: zpaStub.fetchImpl, maxRetries: 0 });
+
+  const access = await collectZiaAccessControlData(zia);
+  const policy = await collectZiaPolicyData(zia);
+  const zpaData = await collectZpaData(zpa);
+  await zia.logout();
+  for (const dataset of [...Object.values(access), ...Object.values(policy), ...Object.values(zpaData).filter((value) => value instanceof Date === false)]) {
+    assert.equal(dataset.error, undefined, dataset.error);
+  }
+
+  const expectedZia = [
+    "POST /api/v1/authenticatedSession",
+    "GET /api/v1/adminUsers?includeAdminUsers=true&includeAuditorUsers=true&page=1&pageSize=1000",
+    "GET /api/v1/adminRoles/lite?includeApiRole=true&includeAuditorRole=true&includePartnerRole=true",
+    "GET /api/v1/authSettings",
+    "GET /api/v1/passwordExpiry/settings",
+    "GET /api/v1/auditlogEntryReport",
+    "GET /api/v1/nssFeeds",
+    "GET /api/v1/urlFilteringRules?page=1&pageSize=100",
+    "GET /api/v1/urlFilteringRules?page=2&pageSize=100",
+    "GET /api/v1/firewallFilteringRules?page=1&pageSize=5000",
+    "GET /api/v1/firewallDnsRules",
+    "GET /api/v1/dlpEngines",
+    "GET /api/v1/dlpDictionaries",
+    "GET /api/v1/webDlpRules",
+    "GET /api/v1/sslInspectionRules",
+    "GET /api/v1/sslSettings/exemptedUrls",
+    "GET /api/v1/sandboxRules",
+    "GET /api/v1/behavioralAnalysisAdvancedSettings",
+    "GET /api/v1/cyberThreatProtection/advancedThreatSettings",
+    "GET /api/v1/cyberThreatProtection/malwarePolicy",
+    "GET /api/v1/cyberThreatProtection/malwareSettings",
+    "GET /api/v1/security",
+    "GET /api/v1/security/advanced",
+    "GET /api/v1/locations?page=1&pageSize=1000",
+    "GET /api/v1/locations/100/sublocations",
+    "GET /api/v1/greTunnels?page=1&pageSize=1000",
+    "GET /api/v1/vpnCredentials?includeOnlyWithoutLocation=false&page=1&pageSize=1000",
+    "GET /api/v1/bandwidthControlRules",
+    "GET /api/v1/browserIsolation/profiles",
+    "GET /api/v1/webApplicationRules/ruleTypeMapping",
+    "GET /api/v1/webApplicationRules/WEBMAIL",
+    "DELETE /api/v1/authenticatedSession",
+  ];
+  assert.deepEqual([...new Set(ziaStub.requests.map((request) => request.key))].sort(), [...expectedZia].sort());
+  assert.equal(ziaStub.requests.filter((request) => request.init.method === "POST").length, 1);
+
+  const expectedZpa = [
+    "POST /signin",
+    `GET ${ZPA_V1}/application?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/segmentGroup?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/policySet/rules/policyType/ACCESS_POLICY?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/policySet/rules/policyType/TIMEOUT_POLICY?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/policySet/rules/policyType/CLIENT_FORWARDING_POLICY?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/policySet/rules/policyType/ISOLATION_POLICY?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/appConnectorGroup?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/connector?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/serviceEdgeGroup?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/serviceEdge?page=1&pagesize=500`,
+    `GET ${ZPA_V2}/posture?page=1&pagesize=500`,
+    `GET ${ZPA_V2}/network?page=1&pagesize=500`,
+    `GET ${ZPA_V2}/idp?page=1&pagesize=500`,
+    `GET ${ZPA_V2}/samlAttribute?page=1&pagesize=500`,
+    `GET ${ZPA_USERCONFIG}/scimgroup/idpId/idp-1?page=1&pagesize=500`,
+    `GET ${ZPA_V2}/enrollmentCert?page=1&pagesize=500`,
+    `GET ${ZPA_V2}/clientlessCertificate/issued?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/emergencyAccess/users?pageSize=500`,
+    `GET ${ZPA_V1}/emergencyAccess/users?pageId=cursor-2&pageSize=500`,
+    `GET ${ZPA_V1}/administrators?page=1&pagesize=500`,
+  ];
+  assert.deepEqual([...new Set(zpaStub.requests.map((request) => request.key))].sort(), [...expectedZpa].sort());
+  assert.ok(zpaStub.requests.every((request) => !request.url.pathname.includes("trustedNetwork") && !request.url.pathname.endsWith("/roles")));
+
+  const accessCheck = await checkZscalerAccess({
+    config: { zia: ziaConfig(), zpa: zpaConfig(), oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] },
+    zia: new ZiaApiClient(ziaConfig(), { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW }),
+    zpa: new ZpaApiClient(zpaConfig(), { fetchImpl: zpaStub.fetchImpl, maxRetries: 0 }),
+  });
+  assert.equal(accessCheck.status, "healthy");
+  const known = new Set([...expectedZia, ...expectedZpa]);
+  for (const request of [...ziaStub.requests, ...zpaStub.requests]) {
+    assert.ok(known.has(request.key), `unexpected request ${request.key}`);
+  }
+});
+
+test("self-check (a): every endpoint returning 403 through the real clients yields no pass", async () => {
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant(), { statusOverrides: Object.fromEntries([
+    "/adminUsers", "/adminRoles/lite", "/authSettings", "/passwordExpiry/settings", "/auditlogEntryReport", "/nssFeeds", "/urlFilteringRules", "/firewallFilteringRules",
+    "/firewallDnsRules", "/dlpEngines", "/dlpDictionaries", "/webDlpRules", "/sslInspectionRules", "/sslSettings/exemptedUrls", "/sandboxRules", "/behavioralAnalysisAdvancedSettings",
+    "/cyberThreatProtection/advancedThreatSettings", "/cyberThreatProtection/malwarePolicy", "/cyberThreatProtection/malwareSettings", "/security", "/security/advanced", "/locations",
+    "/greTunnels", "/vpnCredentials", "/bandwidthControlRules", "/browserIsolation/profiles", "/webApplicationRules/ruleTypeMapping",
+  ].map((path) => [path, 403])) });
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant(), { statusOverrides: Object.fromEntries([
+    "application", "segmentGroup", "policySet/rules/policyType/ACCESS_POLICY", "policySet/rules/policyType/TIMEOUT_POLICY", "policySet/rules/policyType/CLIENT_FORWARDING_POLICY",
+    "policySet/rules/policyType/ISOLATION_POLICY", "appConnectorGroup", "connector", "serviceEdgeGroup", "serviceEdge", "posture", "network", "idp", "samlAttribute",
+    "enrollmentCert", "clientlessCertificate/issued", "emergencyAccess/users", "administrators",
+  ].map((path) => [path, 403])) });
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const zpa = new ZpaApiClient(zpaConfig(), { fetchImpl: zpaStub.fetchImpl, maxRetries: 0 });
+  const findings = [
+    ...(await assessZiaAccessControl(zia)).findings,
+    ...(await assessZiaPolicy(zia)).findings,
+    ...(await assessZpa(zpa)).findings,
+  ];
+  assert.equal(findings.length, 25);
+  for (const item of findings) {
+    assert.equal(item.status, "manual", `${item.id}: ${item.summary}`);
+    assert.match(item.summary, /403/);
+  }
+});
+
+test("self-check (b): empty inventories through the real clients pass only where emptiness is compliant", async () => {
+  const emptyZia = ziaCompliantTenant();
+  for (const key of Object.keys(emptyZia)) {
+    if (Array.isArray(emptyZia[key])) emptyZia[key] = [];
+  }
+  emptyZia.subLocations = {};
+  emptyZia.cloudAppRules = {};
+  emptyZia.sslExemptedUrls = { urls: [] };
+  emptyZia.sandboxSettings = {};
+  emptyZia.securityAllowlist = {};
+  emptyZia.securityDenylist = {};
+  emptyZia.advancedThreatSettings = {};
+  emptyZia.malwarePolicy = {};
+  emptyZia.malwareSettings = {};
+  emptyZia.authSettings = {};
+  emptyZia.passwordExpiry = {};
+  emptyZia.auditLogReport = {};
+  emptyZia.ruleTypeMapping = {};
+  const emptyZpa = zpaCompliantTenant();
+  for (const key of Object.keys(emptyZpa)) {
+    if (Array.isArray(emptyZpa[key])) emptyZpa[key] = [];
+  }
+  emptyZpa.scimGroups = {};
+  emptyZpa.emergencyAccessPages = [{ items: [] }];
+
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaTenantFetch(emptyZia).fetchImpl, maxRetries: 0, now: () => NOW });
+  const zpa = new ZpaApiClient(zpaConfig(), { fetchImpl: zpaTenantFetch(emptyZpa).fetchImpl, maxRetries: 0 });
+  const findings = [
+    ...(await assessZiaAccessControl(zia)).findings,
+    ...(await assessZiaPolicy(zia)).findings,
+    ...(await assessZpa(zpa)).findings,
+  ];
+  assert.equal(findings.length, 25);
+  assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id), []);
+  const expected = {
+    "ZS-01": "fail", "ZS-02": "fail", "ZS-03": "fail", "ZS-04": "fail", "ZS-05": "manual", "ZS-06": "manual", "ZS-07": "manual",
+    "ZS-08": "fail", "ZS-09": "fail", "ZS-10": "fail", "ZS-11": "fail", "ZS-12": "fail", "ZS-13": "fail", "ZS-14": "warn", "ZS-15": "manual",
+    "ZS-16": "manual", "ZS-17": "manual", "ZS-18": "manual", "ZS-19": "fail", "ZS-20": "fail", "ZS-21": "manual", "ZS-22": "manual",
+    "ZS-23": "manual", "ZS-24": "manual", "ZS-25": "fail",
+  };
+  for (const item of findings) {
+    assert.equal(item.status, expected[item.id], `${item.id}: ${item.summary}`);
+  }
+});
+
+test("self-check (c): stale connectors, truncated sub-locations, capped rule reads, and unread ZPA pages never pass", async () => {
+  const locations = Array.from({ length: 150 }, (_, index) => compliantLocation(index + 1));
+  const stale = (item) => ({ ...item, lastBrokerConnectTime: STALE_EPOCH_MS });
+  const ziaTenant = ziaCompliantTenant({
+    locations,
+    subLocations: Object.fromEntries(locations.map((location) => [location.id, [{ id: location.id + 1000, name: `${location.name} guest`, parentId: location.id, authRequired: true, sslScanEnabled: true, ofwEnabled: true }]])),
+    urlFilteringRules: [
+      { id: 1, name: "Block risky", order: 1, state: "ENABLED", action: "BLOCK", urlCategories: ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"] },
+      { id: 2, name: "Isolate uncategorized", order: 2, state: "ENABLED", action: "ISOLATE", urlCategories: ["MISCELLANEOUS_OR_UNKNOWN"] },
+      ...Array.from({ length: 5001 }, (_, index) => urlRule(index + 3)),
+    ],
+  });
+  const zpaBase = zpaCompliantTenant();
+  const zpaTenant = zpaCompliantTenant({
+    applicationTotalPages: 400,
+    connector: zpaBase.connector.map(stale),
+    serviceEdge: zpaBase.serviceEdge.map(stale),
+  });
+  const ziaStub = ziaTenantFetch(ziaTenant);
+  const zpaStub = zpaTenantFetch(zpaTenant);
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const zpa = new ZpaApiClient(zpaConfig(), { fetchImpl: zpaStub.fetchImpl, maxRetries: 0, now: () => NOW });
+  const policy = await assessZiaPolicy(zia);
+  const zpaResult = await assessZpa(zpa);
+
+  assert.equal(ziaStub.requests.filter((request) => request.url.pathname.endsWith("/sublocations")).length, 100);
+  assert.equal(ziaStub.requests.filter((request) => request.url.pathname === "/api/v1/urlFilteringRules").length, 50);
+  assert.equal(zpaStub.requests.filter((request) => request.url.pathname === `${ZPA_V1}/application`).length, 200);
+
+  const affected = {
+    "ZS-01": [policy, /URL filtering rule inventory is partial/],
+    "ZS-17": [policy, /URL filtering rule inventory is partial/],
+    "ZS-18": [policy, /Sub-locations were read for only 100 of 150 parent locations/],
+    "ZS-08": [zpaResult, /inventory is partial \(200 records over 200 pages\)/],
+    "ZS-11": [zpaResult, /2 authenticated but with lastBrokerConnectTime older than 30 days/],
+    "ZS-21": [zpaResult, /1 authenticated but with lastBrokerConnectTime older than 30 days/],
+  };
+  for (const [id, [result, pattern]] of Object.entries(affected)) {
+    const item = findingById(result, id);
+    assert.equal(item.status, "warn", `${id}: ${item.summary}`);
+    assert.match(item.summary, pattern);
+  }
+  assert.ok(policy.truncated.some((note) => /sublocations: only 100 of 150 parent locations were read/.test(note)));
+  assert.ok(zpaResult.truncated.some((note) => /application: only 200 of 400 pages were read/.test(note)));
+  const stillPassing = [...policy.findings, ...zpaResult.findings].filter((item) => item.status === "pass").map((item) => item.id).sort();
+  assert.deepEqual(stillPassing, ["ZS-02", "ZS-03", "ZS-04", "ZS-05", "ZS-09", "ZS-10", "ZS-12", "ZS-13", "ZS-15", "ZS-16", "ZS-19", "ZS-20", "ZS-22", "ZS-23", "ZS-24", "ZS-25"]);
+});
+
+test("self-check (c): every paged dataset marked partial caps its dependent controls at warn or below", () => {
+  const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
+  const access = accessControlFixture();
+  access.adminUsers = partial(access.adminUsers);
+  const policy = policyFixture();
+  for (const key of ["urlFilteringRules", "firewallRules", "locations", "subLocations", "greTunnels", "vpnCredentials", "cloudAppRules"]) {
+    policy[key] = partial(policy[key]);
+  }
+  const zpa = zpaFixture();
+  for (const key of Object.keys(zpa)) {
+    if (key !== "now") zpa[key] = partial(zpa[key]);
+  }
+  const findings = [
+    ...assessZiaAccessControlData(access).findings,
+    ...assessZiaPolicyData(policy).findings,
+    ...assessZpaData(zpa).findings,
+  ];
+  const pagedControls = new Set(["ZS-01", "ZS-02", "ZS-06", "ZS-07", "ZS-17", "ZS-18", "ZS-19", ...ZPA_CONTROL_IDS]);
+  for (const item of findings) {
+    if (pagedControls.has(item.id)) {
+      assert.notEqual(item.status, "pass", `${item.id}: ${item.summary}`);
+    }
+  }
+  const byId = (id) => findings.find((item) => item.id === id);
+  assert.equal(byId("ZS-12").status, "warn");
+  assert.match(byId("ZS-12").summary, /IdP inventory is partial/);
+  assert.match(byId("ZS-12").summary, /ZPA administrator inventory is partial/);
+  assert.equal(byId("ZS-15").status, "warn");
+  assert.match(byId("ZS-15").summary, /trusted network inventory is partial/);
+  assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id).sort(), ["ZS-03", "ZS-04", "ZS-05", "ZS-14", "ZS-16", "ZS-20", "ZS-25"]);
+});
+
+test("self-check (d): a compliant tenant served in Automation Hub shapes passes every automatable control, including ZS-15", async () => {
+  const run = await runCompliantTenant();
+  assert.equal(run.findings.length, 25);
+  const passing = run.findings.filter((item) => item.status === "pass").map((item) => item.id).sort();
+  assert.deepEqual(passing, AUTOMATABLE_CONTROL_IDS);
+  assert.equal(passing.length, 24);
+  assert.equal(findingById(run.access, "ZS-06").status, "manual");
+  assert.match(findingById(run.access, "ZS-06").summary, /Per-admin MFA is not exposed by the API/);
+  assert.equal(findingById(run.zpa, "ZS-15").status, "pass");
+  assert.equal(findingById(run.zpa, "ZS-15").evidence.trusted_network_count, 1);
+  assert.deepEqual(findingById(run.zpa, "ZS-15").evidence.rules_referencing_trusted_networks, ["Forward corp"]);
+  assert.equal(findingById(run.zpa, "ZS-23").evidence.emergency_user_count, 2);
+  assert.equal(findingById(run.policy, "ZS-01").evidence.rule_count, 101);
+  assert.equal(findingById(run.policy, "ZS-18").evidence.sub_location_parents_read, 1);
+  assert.equal(findingById(run.access, "ZS-07").evidence.organization_scoped_admins, 1);
+  assert.equal(run.access.errors.length + run.policy.errors.length + run.zpa.errors.length, 0);
+  assert.equal(run.policy.truncated.length + run.zpa.truncated.length, 0);
+  assert.ok(run.zpaRequests.some((request) => request.key === `GET ${ZPA_V2}/network?page=1&pagesize=500`));
+  assert.ok(run.zpaRequests.some((request) => request.key === `GET ${ZPA_V1}/emergencyAccess/users?pageId=cursor-2&pageSize=500`));
+  assert.ok(run.ziaRequests.some((request) => request.key === "GET /api/v1/urlFilteringRules?page=2&pageSize=100"));
+  assert.equal(run.ziaRequests.at(-1).key, "DELETE /api/v1/authenticatedSession");
 });

@@ -2652,6 +2652,7 @@ function assessIdp(data: ZpaData): ZscalerFinding {
     zpa_admins_enabled: admins ? admins.length : null,
     zpa_admins_local_login_without_2fa: truncateList(weakAdmins.map((admin) => asString(admin.username) ?? asString(admin.email) ?? asString(admin.id) ?? "admin")),
     zpa_administrators_surface: `${ZPA_ADMINISTRATORS_PROVENANCE}; it supplements the IdP evidence and is never the sole basis for pass`,
+    partial_inventory: idps.truncated === true || data.administrators.truncated === true,
   };
   if (idps.data.length === 0) {
     return finding(12, "fail", "Empty inventory: zero identity providers are configured, so ZPA cannot authenticate users through SAML.", evidence, evidenceNote);
@@ -2665,10 +2666,12 @@ function assessIdp(data: ZpaData): ZscalerFinding {
   if (admins === undefined) issues.push(`ZPA administrators could not be read from GET /administrators (${unreadableReason(data.administrators)}; ${ZPA_ADMINISTRATORS_PROVENANCE})`);
   if (weakAdmins.length > 0) issues.push(`${weakAdmins.length} enabled ZPA administrator(s) allow local login without two-factor authentication`);
   if (adminIdps.length === 0) issues.push("no IdP is enabled for admin SSO");
+  const partialNote = `${partialSuffix(idps, "IdP")}${partialSuffix(data.administrators, "ZPA administrator")}`;
   if (issues.length > 0) {
-    return finding(12, "warn", `${userIdps.length} enabled user IdP(s) found, but: ${issues.join("; ")}.`, evidence, evidenceNote);
+    return finding(12, "warn", `${userIdps.length} enabled user IdP(s) found, but: ${issues.join("; ")}.${partialNote}`, evidence, evidenceNote);
   }
-  return finding(12, "pass", `${userIdps.length} enabled user IdP(s) with SCIM provisioning and signed SAML requests, ${adminIdps.length} admin SSO IdP(s), and every enabled ZPA administrator has local login disabled or two-factor authentication (administrator state read from GET /administrators, ${ZPA_ADMINISTRATORS_PROVENANCE}).`, evidence);
+  const status = capForPartial(capForPartial("pass", idps), data.administrators);
+  return finding(12, status, `${userIdps.length} enabled user IdP(s) with SCIM provisioning and signed SAML requests, ${adminIdps.length} admin SSO IdP(s), and every enabled ZPA administrator has local login disabled or two-factor authentication (administrator state read from GET /administrators, ${ZPA_ADMINISTRATORS_PROVENANCE}).${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessTimeoutPolicy(data: ZpaData, maxTimeoutHours: number): ZscalerFinding {
@@ -2719,6 +2722,7 @@ function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
     networks: truncateList(networks.data.map(ruleLabel)),
     rules_referencing_trusted_networks: truncateList(referencing.map(ruleLabel)),
     policy_rules_readable: !data.accessRules.error && !data.forwardingRules.error,
+    partial_inventory: networks.truncated === true,
   };
   if (networks.data.length === 0) {
     return finding(15, "manual", "Not configured: zero trusted networks are defined, so on-network detection is not in use; confirm whether the architecture requires it.", evidence, evidenceNote);
@@ -2727,9 +2731,10 @@ function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
     return finding(15, "manual", `${networks.data.length} trusted networks exist but policy rules could not be read, so their enforcement is unverified.`, evidence, evidenceNote);
   }
   if (referencing.length === 0) {
-    return finding(15, "warn", `${networks.data.length} trusted networks are defined but no enabled access or forwarding rule references a TRUSTED_NETWORK condition.`, evidence, evidenceNote);
+    return finding(15, "warn", `${networks.data.length} trusted networks are defined but no enabled access or forwarding rule references a TRUSTED_NETWORK condition.${partialSuffix(networks, "trusted network")}`, evidence, evidenceNote);
   }
-  return finding(15, "pass", `${networks.data.length} trusted networks are referenced by ${referencing.length} enabled policy rule(s).`, evidence);
+  const status = capForPartial("pass", networks);
+  return finding(15, status, `${networks.data.length} trusted networks are referenced by ${referencing.length} enabled policy rule(s).${partialSuffix(networks, "trusted network")}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
