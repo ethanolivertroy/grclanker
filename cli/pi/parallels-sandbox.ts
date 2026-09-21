@@ -6,7 +6,6 @@ import {
   resolveParallelsSourceKind,
   resolveParallelsTemplateName,
 } from "./compute.js";
-import { teardownComputeSessions } from "./compute-sessions.js";
 import type { GrclankerSettings } from "./settings.js";
 
 export type ParallelsSource = {
@@ -69,8 +68,4 @@ export function assertParallelsSourceIsUsable(settings: GrclankerSettings): Para
     assertBaseVmIsSafe(source.sourceName, settings);
   }
   return source;
-}
-
-export async function cleanupParallelsSandboxes(): Promise<void> {
-  await teardownComputeSessions();
 }
