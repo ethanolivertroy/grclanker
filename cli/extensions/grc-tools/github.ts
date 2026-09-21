@@ -16,6 +16,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
+import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
@@ -1064,13 +1065,195 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Error-text scrubbing (rule 9, error-body class). An API error body is tenant- or proxy-controlled
+// text, and the error string built from it travels into the errors array, _errors.log, evidence
+// lines, snapshot statuses, core_data, and the executive summary. Every error string is therefore
+// scrubbed where it is created (GitHubHttpError, summarizeError, the GraphQL error mapping and
+// formatter) and once more when the bundle is written.
+// ---------------------------------------------------------------------------------------------
+
+/** Any scheme-prefixed URL embedded anywhere in a string (not only a whole-value URL). */
+const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+/** W3C XML Signature and Encryption algorithm identifiers (SAML digestMethod, signatureMethod) carry their meaning in the fragment and never a credential. */
+const ALGORITHM_URI_PATTERN = /^https?:\/\/(?:www\.)?w3\.org\//i;
+/** A Cookie or Set-Cookie header echo; the whole value goes, since cookie values span `;` and spaces. */
+const COOKIE_HEADER_PATTERN = /\b(set-cookie|cookie)\s*[=:]\s*[^\r\n"'<>]+/gi;
+/** Words that make the identifier they end a credential name (`client_secret`, `x-api-key`, `JSESSIONID`, `access_token`). */
+const CREDENTIAL_KEY_WORDS = "token|secret|passw(?:or)?d|pwd|passphrase|passcode|session(?:[_-]?id)?|sessid|sid|(?:api|access|secret|private|signing|encryption|client|app|auth)[_-]?key|apikey|authorization|credentials?|cookie|signature|bearer|basic|jwt";
+/**
+ * `key=value`, `key: value`, or `"key":"value"` where the whole identifier ends in a credential word
+ * (so `saml_credential_authorizations = 3` and `secret_scanning = enabled` are left alone); the value
+ * may itself start with Bearer or Basic. The lookbehind keeps path segments such as
+ * `/credential-authorizations:` out of it.
+ */
+const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
+  `(?<![A-Za-z0-9_.\\/-])"?([A-Za-z0-9_.-]*?(?:${CREDENTIAL_KEY_WORDS}))"?(\\s*[=:]\\s*)"?(?:(?:bearer|basic)\\s+)?[^\\s"'&;,<>]+`,
+  "gi",
+);
+/** A standalone `Bearer <value>` or `Basic <value>` whose value is not a plain word, so "Basic authentication" prose survives. */
+const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+(?![A-Za-z][a-z]*(?![A-Za-z0-9._~+/=-]))[A-Za-z0-9._~+/=-]{8,}/gi;
+/** GitHub token shapes: ghp_, gho_, ghu_, ghs_, ghr_, and github_pat_ prefixes. */
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})/g;
+/** In a free-text field, any run of 20 or more token characters is dropped unless it is shaped like an uppercase error code. */
+const LONG_TOKEN_PATTERN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{20,}(?![A-Za-z0-9+/=_-])/g;
+const ERROR_CODE_SHAPE = /^[A-Z][A-Z_]*$/;
+const MAX_FREE_TEXT_LENGTH = 240;
+
+export interface ScrubErrorTextOptions {
+  /** The text is a free-text field of a response body (`message`, GraphQL `errors[].message`): long tokens are dropped and the length is capped too. */
+  freeText?: boolean;
+}
+
+function scrubEmbeddedUrls(text: string): string {
+  return text.replace(EMBEDDED_URL_PATTERN, (url) => {
+    // Sentence punctuation directly after a URL belongs to the surrounding prose, not the query.
+    const trailing = url.match(/[.,;:!]+$/)?.[0] ?? "";
+    const body = url.slice(0, url.length - trailing.length);
+    if (ALGORITHM_URI_PATTERN.test(body)) return url;
+    const cut = body.search(/[?#]/);
+    return `${cut >= 0 ? body.slice(0, cut) : body}${trailing}`;
+  });
+}
+
+function redactLongTokens(segment: string): string {
+  return segment.replace(LONG_TOKEN_PATTERN, (token) => (ERROR_CODE_SHAPE.test(token) ? token : "[REDACTED]"));
+}
+
+// The long-token rule runs between URLs only, so an already query-stripped documentation URL keeps its path.
+function scrubLongTokens(text: string): string {
+  let result = "";
+  let cursor = 0;
+  for (const match of text.matchAll(EMBEDDED_URL_PATTERN)) {
+    const start = match.index ?? 0;
+    result += `${redactLongTokens(text.slice(cursor, start))}${match[0]}`;
+    cursor = start + match[0].length;
+  }
+  return `${result}${redactLongTokens(text.slice(cursor))}`;
+}
+
+/**
+ * The one scrub applied wherever an error string is created and again at the bundle write. It
+ * strips the query and fragment of every embedded URL, Cookie and Set-Cookie header values,
+ * credential name-value pairs (token, secret, password, session id, API key, client secret,
+ * authorization, quoted or not), standalone Bearer and Basic values, and GitHub token shapes.
+ * With `freeText` it also drops any long token and caps the length, for fields that carry
+ * server-written prose. Idempotent.
+ */
+export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}): string {
+  let scrubbed = scrubEmbeddedUrls(text)
+    .replace(COOKIE_HEADER_PATTERN, (_match, header: string) => `${header}: [REDACTED]`)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (_match, key: string, separator: string) => `${key}${separator}[REDACTED]`)
+    .replace(CREDENTIAL_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} [REDACTED]`)
+    .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]");
+  if (options.freeText) {
+    scrubbed = scrubLongTokens(scrubbed);
+    if (scrubbed.length > MAX_FREE_TEXT_LENGTH) {
+      scrubbed = `${scrubbed.slice(0, MAX_FREE_TEXT_LENGTH)} [truncated; ${text.length} characters in the field]`;
+    }
+  }
+  return scrubbed;
+}
+
+/**
+ * Second scrub layer at the bundle write: every string inside a JSON document passes through
+ * scrubErrorText again (keys are left alone, so the structure survives), so an error string that
+ * reached the bundle by a path the creation-time scrub does not cover still carries no URL query,
+ * header value, or token shape.
+ */
+export function scrubBundleStrings(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => scrubBundleStrings(entry));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as JsonRecord).map(([key, entry]) => [key, scrubBundleStrings(entry)]));
+  }
+  return typeof value === "string" ? scrubErrorText(value) : value;
+}
+
+const MAX_CONTENT_TYPE_LENGTH = 64;
+const DOCUMENTED_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
+const GRAPHQL_ERROR_TYPE_PATTERN = /^[A-Z][A-Z_]{0,63}$/;
+
+// Only the media type of a Content-Type header is echoed; the header is server-controlled text too.
+function describeContentType(header: string | null): string {
+  const match = header?.match(/^\s*([A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+)/);
+  return match ? match[1].toLowerCase().slice(0, MAX_CONTENT_TYPE_LENGTH) : "unknown content type";
+}
+
+// A short documented identifier (errors[].code, errors[].field) is echoed only when it is shaped like
+// one; anything else is dropped rather than scrubbed.
+function documentedIdentifier(value: unknown): string | undefined {
+  const text = asString(value);
+  return text && DOCUMENTED_IDENTIFIER_PATTERN.test(text) ? text : undefined;
+}
+
+function documentedUrl(value: unknown): string | undefined {
+  const text = asString(value);
+  return text && /^https?:\/\/\S+$/i.test(text) ? scrubErrorText(text).slice(0, 200) : undefined;
+}
+
+function headerValue(response: Response, name: string): string | null {
+  return typeof response.headers?.get === "function" ? response.headers.get(name) : null;
+}
+
+/**
+ * The detail of a failed response. A non-JSON body (an HTML page from a proxy, outside GitHub's
+ * documented error schema) is never echoed: the canonical reason phrase, the content type, and the
+ * body length stand in for it. A JSON body contributes only the documented fields (message,
+ * documentation_url, errors[].code and .field), each scrubbed, so nothing else it carries can reach
+ * an error string. The HTTP status and the endpoint are added by GitHubHttpError and summarizeError.
+ */
+function describeErrorBody(status: number, payload: unknown, rawText: string, contentType: string | null): string {
+  const reason = STATUS_CODES[status] ?? "HTTP error";
+  if (rawText.length === 0) return `${reason} (empty response body)`;
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  if (payload === undefined) {
+    return `${reason}: non-JSON error body (${describeContentType(contentType)}; ${bytes} bytes)`;
+  }
+  const record = asRecord(payload);
+  const message = asString(record.message);
+  const parts = [
+    message
+      ? scrubErrorText(message, { freeText: true })
+      : `${reason}: JSON error body without a message field (${describeContentType(contentType)}; ${bytes} bytes)`,
+  ];
+  const documentation = documentedUrl(record.documentation_url);
+  if (documentation) parts.push(`documentation: ${documentation}`);
+  const details = asArray(record.errors).flatMap((entry) => {
+    const item = asRecord(entry);
+    const code = documentedIdentifier(item.code);
+    const field = documentedIdentifier(item.field);
+    return code || field ? [`${code ?? "error"}${field ? ` on ${field}` : ""}`] : [];
+  });
+  if (details.length > 0) parts.push(`errors: ${details.join(", ")}`);
+  return parts.join("; ");
+}
+
+// GraphQL errors are kept through their documented fields only: type (a GitHub error code such as
+// FORBIDDEN), message (free text, scrubbed and capped), and path (field names that occur in the
+// query we sent, or list indices; anything else becomes "?").
+function sanitizeGraphqlError(record: JsonRecord, query: string): GitHubGraphqlError {
+  const queryNames = new Set(query.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []);
+  const type = asString(record.type);
+  const path = Array.isArray(record.path)
+    ? record.path.map((part) => (typeof part === "number" ? part : (typeof part === "string" && queryNames.has(part) ? part : "?")))
+    : undefined;
+  return {
+    type: type && GRAPHQL_ERROR_TYPE_PATTERN.test(type) ? type : undefined,
+    message: scrubErrorText(asString(record.message) ?? "GraphQL error without a message", { freeText: true }),
+    path,
+  };
+}
+
 // Every REST failure names the endpoint and HTTP status (rule 1 corollary): the demoted summaries
-// append this string, so the reader can tell which inventory was unreadable and why.
+// append this string, so the reader can tell which inventory was unreadable and why. Every thrown
+// value becomes a surface error string here, so the scrub runs here as well as in GitHubHttpError.
 function summarizeError(error: unknown): string {
   if (error instanceof GitHubHttpError) {
-    return `GitHub request failed (${error.status}) for ${error.method} ${error.path}: ${error.message}`;
+    return scrubErrorText(`GitHub request failed (${error.status}) for ${error.method} ${error.path}: ${error.message}`);
   }
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 // Documented organization endpoints, spelled the way the spec tables spell them, so a demoted
@@ -1199,7 +1382,7 @@ export class GitHubHttpError extends Error {
   path: string;
 
   constructor(status: number, message: string, method: string = "GET", path: string = "unknown") {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "GitHubHttpError";
     this.status = status;
     this.method = method;
@@ -1403,15 +1586,18 @@ export class GitHubAuditorClient {
 
       const text = await response.text();
       const payload = parseJsonSafely(text) as JsonRecord | undefined;
-      if (!response.ok || !payload || !asString(payload.token)) {
-        const detail = asString(asRecord(payload).message) ?? response.statusText ?? text ?? "unknown error";
+      const tokenValue = asString(asRecord(payload).token);
+      if (!response.ok || !tokenValue) {
+        const detail = response.ok
+          ? "the response did not include a token"
+          : describeErrorBody(response.status, payload, text, headerValue(response, "content-type"));
         throw new Error(
           `GitHub App installation token request failed (${response.status}): ${detail}`,
         );
       }
 
-      const token = asString(payload.token)!;
-      const expiresAt = Date.parse(asString(payload.expires_at) ?? "") || (Date.now() + (60 * 60 * 1000));
+      const token = tokenValue;
+      const expiresAt = Date.parse(asString(asRecord(payload).expires_at) ?? "") || (Date.now() + (60 * 60 * 1000));
       installationTokenCache.set(cacheKey, { token, expiresAt });
       return token;
     })();
@@ -1521,8 +1707,8 @@ export class GitHubAuditorClient {
         continue;
       }
 
-      const message = asString(asRecord(payload).message) ?? response.statusText ?? rawText ?? "request failed";
-      throw new GitHubHttpError(response.status, message, method, describeRequestTarget(pathname));
+      const detail = describeErrorBody(response.status, payload, rawText, headerValue(response, "content-type"));
+      throw new GitHubHttpError(response.status, detail, method, describeRequestTarget(pathname));
     }
 
     throw new Error(`GitHub request retries exhausted for ${method} ${describeRequestTarget(pathname)}`);
@@ -1537,14 +1723,7 @@ export class GitHubAuditorClient {
       body: { query, variables },
     });
     const envelope = asRecord(payload);
-    const errors = asArray(envelope.errors).map((entry) => {
-      const record = asRecord(entry);
-      return {
-        type: asString(record.type),
-        message: asString(record.message) ?? "GraphQL error without a message",
-        path: Array.isArray(record.path) ? record.path as Array<string | number> : undefined,
-      };
-    });
+    const errors = asArray(envelope.errors).map((entry) => sanitizeGraphqlError(asRecord(entry), query));
     const data = envelope.data && typeof envelope.data === "object" ? envelope.data as T : null;
     return { data, errors };
   }
@@ -2309,10 +2488,10 @@ function buildExportText(config: GitHubResolvedConfig, result: GitHubAuditBundle
   ].join("\n");
 }
 
-// Every JSON file in the bundle passes through the key-name belt in addition to the collection-time
-// projections, so no write path can bypass redaction.
+// Every JSON file in the bundle passes through the key-name belt and the string scrub in addition
+// to the collection-time projections, so no write path can bypass redaction.
 function serializeJson(value: unknown): string {
-  return `${JSON.stringify(redactSensitiveKeys(value), null, 2)}\n`;
+  return `${JSON.stringify(scrubBundleStrings(redactSensitiveKeys(value)), null, 2)}\n`;
 }
 
 function safeDirName(value: string): string {
@@ -2437,6 +2616,12 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
+}
+
+// Text documents (the error log, the executive summary, the compliance reports) take the second
+// scrub layer on their whole body; JSON documents take it per string through serializeJson.
+async function writeBundleText(rootDir: string, relativePathname: string, content: string): Promise<void> {
+  await writeSecureTextFile(rootDir, relativePathname, scrubErrorText(content));
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
@@ -2739,8 +2924,10 @@ function graphqlErrorsForPath(errors: GitHubGraphqlError[], targetPath: string[]
   });
 }
 
+// The GraphQL error formatter: the messages were scrubbed when the response was mapped, and the
+// joined string is scrubbed again so no caller can pass an unscrubbed error through it.
 function describeGraphqlErrors(errors: GitHubGraphqlError[]): string {
-  return errors.map((error) => `${error.type ?? "ERROR"}: ${error.message}`).join("; ");
+  return scrubErrorText(errors.map((error) => `${error.type ?? "ERROR"}: ${error.message}`).join("; "));
 }
 
 function assessTwoFactor(data: GitHubOrgAccessData): GitHubFinding {
@@ -5077,16 +5264,16 @@ export async function exportGitHubAuditBundle(
 
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(allFindings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings));
+  await writeBundleText(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeBundleText(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings));
 
   const frameworkReports = buildFrameworkReports(allFindings);
   for (const [name, report] of Object.entries(frameworkReports)) {
-    await writeSecureTextFile(outputDir, `compliance/frameworks/${name}.md`, `${report}\n`);
+    await writeBundleText(outputDir, `compliance/frameworks/${name}.md`, `${report}\n`);
   }
 
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeBundleText(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = `${outputDir}.zip`;
