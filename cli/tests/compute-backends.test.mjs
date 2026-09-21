@@ -43,6 +43,7 @@ import {
   parseRunpodWorkerOutput,
 } from "../dist/pi/backends/runpod.js";
 import { activeComputeSessionCount } from "../dist/pi/compute-sessions.js";
+import { shutdownComputeSessions } from "../dist/pi/compute-shutdown.js";
 import {
   buildComputeBackendList,
   extractComputeFlag,
@@ -554,6 +555,57 @@ test("runtime awaits remote teardown on the success path and the throw path", as
     const untouched = createFakeRunner(async () => ({ exitCode: 0 }));
     await withComputeBackendExecution("/repo", settings, async () => undefined, { fetch: fetchMock, runner: untouched.runner });
     assert.equal(untouched.calls.length, 0);
+  });
+});
+
+test("session_shutdown tears down a staged runpod-pod session regardless of the preferred backend", async () => {
+  await withEnv({ RUNPOD_API_KEY: "rpa_podkey_ABCDEFG", RUNPOD_POD_ID: "pod42" }, async () => {
+    const fetchMock = async () => new Response(RUNPOD_POD_JSON, { status: 200 });
+    const { runner, calls } = createFakeRunner(async () => ({ exitCode: 0, stdout: "ok\n" }));
+
+    // The run was started with a per-run --compute override, so settings still prefer host.
+    const execution = resolveComputeBackendExecution(
+      "/repo",
+      { computeBackend: "runpod-pod", computeProfile: "persistent-remote" },
+      { fetch: fetchMock, runner },
+    );
+    const result = await execution.bashOperations.exec("uname -a", "/repo", { onData: () => {} });
+    assert.equal(result.exitCode, 0);
+    assert.equal(activeComputeSessionCount(), 1);
+    assert.ok(!calls.some((call) => call.args.at(-1).startsWith("rm -rf")));
+
+    let sandboxResets = 0;
+    await shutdownComputeSessions({ computeBackend: "host" }, { resetSandboxRuntime: async () => { sandboxResets += 1; } });
+    assert.equal(activeComputeSessionCount(), 0);
+    assert.equal(sandboxResets, 0, "the sandbox reset stays gated on sandbox-runtime");
+    const removal = calls.at(-1);
+    assert.equal(removal.executable, "ssh");
+    assert.match(removal.args.at(-1), /^rm -rf -- '\/workspace\/grclanker-[0-9a-z-]+'$/);
+
+    // A second shutdown is a no-op: the session is already gone.
+    await shutdownComputeSessions({ computeBackend: "host" });
+    assert.equal(calls.filter((call) => call.args.at(-1).startsWith("rm -rf")).length, 1);
+
+    // The sandbox reset runs for sandbox-runtime, and registry teardown still runs when it throws.
+    const second = resolveComputeBackendExecution(
+      "/repo",
+      { computeBackend: "runpod-pod", computeProfile: "persistent-remote" },
+      { fetch: fetchMock, runner },
+    );
+    await second.bashOperations.exec("true", "/repo", { onData: () => {} });
+    assert.equal(activeComputeSessionCount(), 1);
+    await assert.rejects(
+      () => shutdownComputeSessions({ computeBackend: "sandbox-runtime" }, {
+        resetSandboxRuntime: async () => {
+          sandboxResets += 1;
+          throw new Error("reset failed");
+        },
+      }),
+      /reset failed/,
+    );
+    assert.equal(sandboxResets, 1);
+    assert.equal(activeComputeSessionCount(), 0);
+    assert.equal(calls.filter((call) => call.args.at(-1).startsWith("rm -rf")).length, 2);
   });
 });
 
