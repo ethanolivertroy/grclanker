@@ -264,6 +264,33 @@ test("checkAwsAccess reports readable AWS audit surfaces", async () => {
   assert.match(result.recommendedNextStep, /aws_assess_identity/);
 });
 
+test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfaces and reports limited when any is denied", async () => {
+  const healthy = await checkAwsAccess(compliantBundleClient());
+  assert.equal(healthy.status, "healthy");
+  assert.equal(healthy.surfaces.length, 14);
+  for (const name of ["ec2_regions", "s3_buckets", "kms_keys", "rds_instances", "audit_manager", "account_contacts"]) {
+    const probe = healthy.surfaces.find((surface) => surface.name === name);
+    assert.equal(probe?.status, "readable", `${name} should be readable`);
+  }
+  assert.match(healthy.recommendedNextStep, /aws_assess_data_protection/);
+  assert.match(healthy.recommendedNextStep, /aws_assess_network_security/);
+
+  const limited = await checkAwsAccess(compliantBundleClient({
+    async listKmsKeys() {
+      throw accessDenied();
+    },
+    async getSecurityAlternateContact() {
+      return null;
+    },
+  }));
+  assert.equal(limited.status, "limited");
+  assert.equal(limited.surfaces.find((surface) => surface.name === "kms_keys")?.status, "not_readable");
+  assert.equal(limited.surfaces.find((surface) => surface.name === "account_contacts")?.status, "readable", "a missing contact is readable evidence, not a denial");
+  assert.equal(limited.surfaces.find((surface) => surface.name === "account_contacts")?.count, 0);
+  assert.match(limited.recommendedNextStep, /kms/);
+  assert.match(limited.recommendedNextStep, /never pass/);
+});
+
 test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", async () => {
   const client = {
     getNow: () => new Date("2026-04-16T00:00:00.000Z"),

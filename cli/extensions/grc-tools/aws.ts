@@ -1554,14 +1554,41 @@ async function surface(
   }
 }
 
-export async function checkAwsAccess(
-  client: Pick<
-    AwsAuditorClient,
-    "getCallerIdentity" | "getAccountSummary" | "describeTrails" | "getEnabledSecurityHubStandards" | "describeConfigurationRecorders" | "listDetectors" | "listAnalyzers" | "describeOrganization" | "listIdentityCenterInstances" | "getResolvedConfig"
-  >,
-): Promise<AwsAccessCheckResult> {
+export type AwsAccessCheckClient = Pick<
+  AwsAuditorClient,
+  "getCallerIdentity" | "getAccountSummary" | "describeTrails" | "getEnabledSecurityHubStandards" | "describeConfigurationRecorders" | "listDetectors" | "listAnalyzers" | "describeOrganization" | "listIdentityCenterInstances" | "getResolvedConfig"
+> & Partial<Pick<
+  AwsAuditorClient,
+  "describeRegions" | "listBuckets" | "listKmsKeys" | "describeDbInstances" | "listActiveAuditManagerAssessments" | "getSecurityAlternateContact"
+>>;
+
+function pagedCount(value: unknown): number | undefined {
+  const items = asObject(value)?.items;
+  return Array.isArray(items) ? items.length : undefined;
+}
+
+export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsAccessCheckResult> {
   const caller = await client.getCallerIdentity();
   const config = client.getResolvedConfig();
+  const optionalProbes: Array<Promise<AwsAccessSurface>> = [];
+  if (client.describeRegions) {
+    optionalProbes.push(surface("ec2_regions", "ec2", () => client.describeRegions!(), (value) => Array.isArray(value) ? value.length : undefined));
+  }
+  if (client.listBuckets) {
+    optionalProbes.push(surface("s3_buckets", "s3", () => client.listBuckets!(1), pagedCount));
+  }
+  if (client.listKmsKeys) {
+    optionalProbes.push(surface("kms_keys", "kms", () => client.listKmsKeys!(config.region, 1), pagedCount));
+  }
+  if (client.describeDbInstances) {
+    optionalProbes.push(surface("rds_instances", "rds", () => client.describeDbInstances!(config.region, 1), pagedCount));
+  }
+  if (client.listActiveAuditManagerAssessments) {
+    optionalProbes.push(surface("audit_manager", "auditmanager", () => client.listActiveAuditManagerAssessments!(1), pagedCount));
+  }
+  if (client.getSecurityAlternateContact) {
+    optionalProbes.push(surface("account_contacts", "account", () => client.getSecurityAlternateContact!(), (value) => (value ? 1 : 0)));
+  }
   const surfaces = await Promise.all([
     surface("iam_summary", "iam", () => client.getAccountSummary(), () => 1),
     surface("cloudtrail", "cloudtrail", () => client.describeTrails(), (value) => Array.isArray(value) ? value.length : undefined),
@@ -1571,10 +1598,11 @@ export async function checkAwsAccess(
     surface("access_analyzer", "access-analyzer", () => client.listAnalyzers(), (value) => Array.isArray(value) ? value.length : undefined),
     surface("organizations", "organizations", () => client.describeOrganization(), () => 1),
     surface("identity_center", "sso-admin", () => client.listIdentityCenterInstances(), (value) => Array.isArray(value) ? value.length : undefined),
+    ...optionalProbes,
   ]);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
-  const status = readableCount >= 5 ? "healthy" : "limited";
+  const status = readableCount === surfaces.length ? "healthy" : "limited";
   const accountId = asString(caller.Account);
   const notes = [
     `Authenticated via ${describeSourceChain(config)}.`,
@@ -1594,8 +1622,8 @@ export async function checkAwsAccess(
     notes,
     recommendedNextStep:
       status === "healthy"
-        ? "Run aws_assess_identity, aws_assess_logging_detection, aws_assess_org_guardrails, or aws_export_audit_bundle."
-        : "Grant read-only access to IAM, CloudTrail, Security Hub, Config, GuardDuty, Access Analyzer, and Organizations APIs for the audit principal.",
+        ? "Run aws_assess_identity, aws_assess_logging_detection, aws_assess_org_guardrails, aws_assess_data_protection, aws_assess_network_security, or aws_export_audit_bundle."
+        : `Grant read-only access for the audit principal to the surfaces marked not_readable (${surfaces.filter((item) => item.status === "not_readable").map((item) => item.service).join(", ") || "none"}); unreadable surfaces render manual findings, never pass.`,
   };
 }
 
@@ -3376,7 +3404,7 @@ export function registerAwsTools(pi: any): void {
     name: "aws_check_access",
     label: "Check AWS audit access",
     description:
-      "Validate read-only AWS audit access across IAM, CloudTrail, Security Hub, Config, GuardDuty, Access Analyzer, Organizations, and Identity Center surfaces.",
+      "Validate read-only AWS audit access across IAM, CloudTrail, Security Hub, Config, GuardDuty, Access Analyzer, Organizations, Identity Center, EC2, S3, KMS, RDS, Audit Manager, and Account surfaces.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {
@@ -3535,7 +3563,7 @@ export function registerAwsTools(pi: any): void {
     name: "aws_export_audit_bundle",
     label: "Export AWS audit bundle",
     description:
-      "Export an AWS audit package with access checks, identity findings, logging and detection findings, organization guardrails, markdown reports, JSON analysis, and a zip archive.",
+      "Export an AWS audit package with the access check, identity, logging and detection, organization guardrail, data protection, and network security findings, an executive summary, a unified compliance matrix, per-framework reports, JSON analysis, an error log when collection was partial, and a zip archive named after the bundle directory.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
@@ -3543,7 +3571,12 @@ export function registerAwsTools(pi: any): void {
       stale_days: Type.Optional(Type.Number({ description: "Staleness threshold in days for keys and dormant users. Defaults to 90.", default: 90 })),
       role_limit: Type.Optional(Type.Number({ description: "Maximum IAM roles to inspect. Defaults to 500.", default: 500 })),
       max_privileged_roles: Type.Optional(Type.Number({ description: "Maximum tolerated privileged roles without permission boundaries before failing. Defaults to 5.", default: 5 })),
+      lookback_days: Type.Optional(Type.Number({ description: "Days of CloudTrail history to search for root activity (LookupEvents keeps 90 days). Defaults to 90.", default: 90 })),
+      policy_limit: Type.Optional(Type.Number({ description: "Maximum customer-managed IAM policies to inspect before flagging truncation. Defaults to 1000.", default: 1000 })),
       max_findings: Type.Optional(Type.Number({ description: "Maximum Access Analyzer findings to sample. Defaults to 200.", default: 200 })),
+      ...dataProtectionParams,
+      resource_limit: Type.Optional(Type.Number({ description: `Maximum VPCs, flow logs, NACLs, or security groups per region before flagging truncation. Defaults to ${DEFAULT_RESOURCE_LIMIT}.`, default: DEFAULT_RESOURCE_LIMIT })),
+      sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
@@ -3558,6 +3591,7 @@ export function registerAwsTools(pi: any): void {
             `Zip archive: ${result.zipPath}`,
             `Findings: ${result.findingCount}`,
             `Files: ${result.fileCount}`,
+            `Collection errors: ${result.errorCount}${result.errorCount > 0 ? " (see _errors.log)" : ""}`,
           ].join("\n"),
           {
             tool: "aws_export_audit_bundle",
@@ -3565,6 +3599,7 @@ export function registerAwsTools(pi: any): void {
             zip_path: result.zipPath,
             finding_count: result.findingCount,
             file_count: result.fileCount,
+            error_count: result.errorCount,
           },
         );
       } catch (error) {
