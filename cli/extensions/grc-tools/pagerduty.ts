@@ -1415,6 +1415,11 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
   const missingLoops = attachedPolicies.filter((policy) => asNumber(policy.num_loops) === undefined);
   const nonRepeatingPolicies = attachedPolicies.filter((policy) => (asNumber(policy.num_loops) ?? 0) === 0);
   const enabledWorkflows = workflows.items.filter((workflow) => workflow.is_enabled === true);
+  const enabledTriggers = triggers.items.filter((trigger) => trigger.is_disabled === false);
+  const disabledTriggers = triggers.items.filter((trigger) => trigger.is_disabled === true);
+  const triggersMissingDisabledFlag = triggers.items.filter((trigger) => typeof trigger.is_disabled !== "boolean");
+  const automationVerified = enabledWorkflows.length > 0 && enabledTriggers.length > 0 && triggersMissingDisabledFlag.length === 0;
+  const triggerCounts = `${countSeen(triggers)} (${enabledTriggers.length} with is_disabled false, ${disabledTriggers.length} with is_disabled true, ${triggersMissingDisabledFlag.length} without the flag)`;
   const legacyResponsePlays = services.items.filter((service) => asArray(service.response_play).length > 0 || asObject(service.response_play));
   const urgencyModes = active.map(urgencySummary);
   const constantHighOnly = urgencyModes.length > 0 && urgencyModes.every((mode) => mode === "constant:high");
@@ -1496,9 +1501,9 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         ? "manual"
         : !triggers.readable
           ? "manual"
-          : enabledWorkflows.length > 0 && triggers.items.length > 0
+          : automationVerified
             ? "pass"
-            : workflows.items.length > 0 || legacyResponsePlays.length > 0
+            : workflows.items.length > 0 || triggers.items.length > 0 || legacyResponsePlays.length > 0
               ? "warn"
               : "fail",
       !workflows.readable
@@ -1507,15 +1512,18 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
           : unreadable(workflows, "Record the configured Incident Workflows and their service triggers from Automation > Incident Workflows in the web app.")
         : !triggers.readable
           ? unreadable(triggers, "Record which services each Incident Workflow is triggered from in the web app.")
-          : enabledWorkflows.length > 0 && triggers.items.length > 0
-            ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${countSeen(triggers)} are configured (response plays are deprecated in the REST API; ${legacyResponsePlays.length} services still reference one).`
-            : workflows.items.length > 0 || legacyResponsePlays.length > 0
-              ? `${countSeen(workflows)} exist but none is both enabled (is_enabled true) and attached to a trigger (${triggers.seen} triggers); ${legacyResponsePlays.length} services reference deprecated response plays.`
+          : automationVerified
+            ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${enabledTriggers.length} triggers with is_disabled false (of ${countSeen(triggers)}) are configured (response plays are deprecated in the REST API; ${legacyResponsePlays.length} services still reference one).`
+            : workflows.items.length > 0 || triggers.items.length > 0 || legacyResponsePlays.length > 0
+              ? `${countSeen(workflows)} (${enabledWorkflows.length} with is_enabled true) and ${triggerCounts} were read, so automated incident response is not verified${triggersMissingDisabledFlag.length > 0 ? " because a trigger without the is_disabled flag cannot be confirmed as enabled" : ""}; ${legacyResponsePlays.length} services reference deprecated response plays. Confirm workflow and trigger state in Automation > Incident Workflows.`
               : `The Incident Workflows API is readable and returned zero workflows and zero triggers, and no service references a response play, so no automated incident response is configured; emptiness fails this control.`,
       {
         incident_workflows_seen: workflows.seen,
         enabled_workflows: enabledWorkflows.length,
         triggers_seen: triggers.seen,
+        enabled_triggers: enabledTriggers.length,
+        disabled_triggers: disabledTriggers.length,
+        triggers_missing_is_disabled_flag: triggersMissingDisabledFlag.length,
         services_with_legacy_response_plays: legacyResponsePlays.slice(0, 25).map(nameOf),
       },
       partialNotes(data.scope, workflows, triggers),
@@ -1584,6 +1592,8 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
       active_services: active.length,
       escalation_policies_seen: policies.seen,
       incident_workflows_seen: workflows.seen,
+      workflow_triggers_seen: triggers.seen,
+      enabled_workflow_triggers: enabledTriggers.length,
       priorities_seen: priorities.seen,
       ...countByStatus(findings),
     },

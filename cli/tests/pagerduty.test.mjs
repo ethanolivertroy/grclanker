@@ -224,7 +224,13 @@ function healthyFixtures() {
     businessServiceDependencies: [{ supporting_service: { id: "svc-1", type: "technical_service_reference" } }],
     priorities: [{ id: "p1", name: "P1", summary: "P1" }, { id: "p2", name: "P2", summary: "P2" }],
     incidentWorkflows: [{ id: "wf-1", name: "Page leadership", is_enabled: true }],
-    incidentWorkflowTriggers: [{ id: "trig-1", trigger_type: "conditional_trigger", services: [{ id: "svc-1" }] }],
+    incidentWorkflowTriggers: [{
+      id: "trig-1",
+      trigger_type: "conditional",
+      is_disabled: false,
+      workflow: { id: "wf-1", type: "workflow_reference" },
+      services: [{ id: "svc-1" }],
+    }],
     changeEvents: [{ id: "chg-1", summary: "deploy 1.2.3", timestamp: new Date(NOW.getTime() - DAY_MS).toISOString(), services: [{ id: "svc-1" }] }],
   };
 }
@@ -754,7 +760,7 @@ test("assessPagerdutyIncidentResponse passes when services, policies, and automa
     escalationPolicies: list([escalationPolicy("ep-1")]),
     priorities: list([{ id: "p1", name: "P1", summary: "P1" }]),
     incidentWorkflows: list([{ id: "wf-1", name: "Page leadership", is_enabled: true }]),
-    workflowTriggers: list([{ id: "trig-1", services: [{ id: "svc-1" }] }]),
+    workflowTriggers: list([{ id: "trig-1", is_disabled: false, services: [{ id: "svc-1" }] }]),
   });
 
   assert.equal(result.category, "incident_response");
@@ -1352,10 +1358,11 @@ test("verdict rule 5: partial inventories and partially scoped credentials downg
     escalationPolicies: list([escalationPolicy("ep-1")]),
     priorities: list([{ id: "p1", name: "P1" }]),
     incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
-    workflowTriggers: list([{ id: "trig-1" }]),
+    workflowTriggers: list([{ id: "trig-1", is_disabled: false }]),
   });
   assertStatuses(limitedKey, { 5: "warn", 6: "warn", 7: "warn", 10: "warn", 19: "warn", 20: "warn", 22: "warn", 23: "warn" });
   assert.match(findingById(limitedKey, 5).summary, /user-level credential for me@example.com with role user only returns the objects that user can see/);
+  assert.match(findingById(limitedKey, 10).summary, /Downgraded from pass to warn/);
 
   const adminKey = assessPagerdutyIncidentResponse({
     scope: userScope("admin"),
@@ -1363,9 +1370,9 @@ test("verdict rule 5: partial inventories and partially scoped credentials downg
     escalationPolicies: list([escalationPolicy("ep-1")]),
     priorities: list([{ id: "p1", name: "P1" }]),
     incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
-    workflowTriggers: list([{ id: "trig-1" }]),
+    workflowTriggers: list([{ id: "trig-1", is_disabled: false }]),
   });
-  assertStatuses(adminKey, { 5: "pass", 20: "pass" });
+  assertStatuses(adminKey, { 5: "pass", 10: "pass", 20: "pass" });
 
   const unknownScope = assessPagerdutyAuditLogging({
     scope: snapshot({ kind: "unknown", fullVisibility: false }, "PagerDuty request failed (500 Internal Server Error) for /users/me"),
@@ -1382,7 +1389,7 @@ test("verdict rule 5: partial inventories and partially scoped credentials downg
     escalationPolicies: list([escalationPolicy("ep-1")]),
     priorities: list([{ id: "p1", name: "P1" }]),
     incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
-    workflowTriggers: list([{ id: "trig-1" }]),
+    workflowTriggers: list([{ id: "trig-1", is_disabled: false }]),
   });
   assertStatuses(failStaysFail, { 5: "fail" });
 });
@@ -1444,7 +1451,8 @@ test("verdict rule 6: absent or false enabling flags never support pass", () => 
   });
   assertStatuses(escalationFlags, { 6: "warn", 7: "fail", 10: "warn" });
   assert.match(findingById(escalationFlags, 7).summary, /no rules or rules with no notification targets/);
-  assert.match(findingById(escalationFlags, 10).summary, /none is both enabled \(is_enabled true\)/);
+  assert.match(findingById(escalationFlags, 10).summary, /0 with is_enabled true/);
+  assert.match(findingById(escalationFlags, 10).summary, /1 without the flag/);
 
   const roleFlags = assessPagerdutyAccessControl({
     scope: accountScope(),
@@ -1599,6 +1607,49 @@ test("false-pass self-check (c): partial inventories from a user-scoped key yiel
     assert.ok(Array.isArray(item.evidence.partial_view) && item.evidence.partial_view.length > 0, `${item.id} evidence.partial_view`);
   }
   assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.id).sort(), ["PD-01", "PD-13", "PD-24"]);
+});
+
+function incidentResponseWith(triggers, workflows = [{ id: "wf-1", is_enabled: true }]) {
+  return assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list(workflows),
+    workflowTriggers: list(triggers),
+  });
+}
+
+test("review fix 1: PD-10 counts only triggers with is_disabled false and treats a missing flag as unverifiable", () => {
+  const disabledTrigger = incidentResponseWith([{ id: "trig-1", is_disabled: true }]);
+  assertStatuses(disabledTrigger, { 10: "warn" });
+  assert.match(findingById(disabledTrigger, 10).summary, /1 with is_enabled true/);
+  assert.match(findingById(disabledTrigger, 10).summary, /0 with is_disabled false, 1 with is_disabled true, 0 without the flag/);
+  assert.equal(findingById(disabledTrigger, 10).evidence.enabled_triggers, 0);
+  assert.equal(findingById(disabledTrigger, 10).evidence.disabled_triggers, 1);
+
+  const missingFlag = incidentResponseWith([{ id: "trig-1" }]);
+  assertStatuses(missingFlag, { 10: "warn" });
+  assert.match(findingById(missingFlag, 10).summary, /0 with is_disabled false, 0 with is_disabled true, 1 without the flag/);
+  assert.match(findingById(missingFlag, 10).summary, /cannot be confirmed as enabled/);
+  assert.equal(findingById(missingFlag, 10).evidence.triggers_missing_is_disabled_flag, 1);
+
+  const mixed = incidentResponseWith([{ id: "trig-1", is_disabled: false }, { id: "trig-2" }]);
+  assertStatuses(mixed, { 10: "warn" });
+  assert.match(findingById(mixed, 10).summary, /1 with is_disabled false, 0 with is_disabled true, 1 without the flag/);
+
+  const disabledWorkflow = incidentResponseWith([{ id: "trig-1", is_disabled: false }], [{ id: "wf-1", is_enabled: false }]);
+  assertStatuses(disabledWorkflow, { 10: "warn" });
+  assert.match(findingById(disabledWorkflow, 10).summary, /0 with is_enabled true/);
+
+  const verified = incidentResponseWith([{ id: "trig-1", is_disabled: false }, { id: "trig-2", is_disabled: true }]);
+  assertStatuses(verified, { 10: "pass" });
+  assert.match(findingById(verified, 10).summary, /1 incident workflows with is_enabled true \(of 1 incident workflows\) and 1 triggers with is_disabled false \(of 2 incident workflow triggers\)/);
+  assert.equal(findingById(verified, 10).evidence.enabled_triggers, 1);
+  assert.equal(findingById(verified, 10).evidence.disabled_triggers, 1);
+  assert.equal(findingById(verified, 10).evidence.triggers_missing_is_disabled_flag, 0);
+  assert.equal(verified.summary.workflow_triggers_seen, 2);
+  assert.equal(verified.summary.enabled_workflow_triggers, 1);
 });
 
 test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports, and archive", async () => {
