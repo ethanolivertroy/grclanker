@@ -1321,6 +1321,96 @@ test("rule 7: QualysApiClient runs pagination to completion or records truncatio
   assert.match(activity.truncationReason, /truncation_limit 5000/);
 });
 
+test("rule 7: listKnowledgeBase follows the documented WARNING/URL continuation and records the cap when it cannot, so C11 never passes on partial patch data", async () => {
+  // knowledge_base_vuln_list_output.dtd: RESPONSE (DATETIME, (VULN_LIST|ID_SET)?, WARNING?), WARNING (CODE?, TEXT, URL?)
+  const kbPage = (vulns, nextUrl) => xmlResponse(`<?xml version="1.0"?><KNOWLEDGE_BASE_VULN_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><VULN_LIST>${xmlFromRecord("VULN", vulns)}</VULN_LIST>${nextUrl ? `<WARNING><CODE>1980</CODE><TEXT>truncated</TEXT><URL><![CDATA[${nextUrl}]]></URL></WARNING>` : ""}</RESPONSE></KNOWLEDGE_BASE_VULN_LIST_OUTPUT>`);
+  const calls = [];
+  const followed = routedClient(async (url) => {
+    calls.push(url);
+    if (url.includes("id_min=2")) return kbPage([documentedVuln({ QID: "91002", PATCHABLE: "1" })]);
+    return kbPage([documentedVuln({ QID: "91001", PATCHABLE: "1" })], "https://qualysapi.qualys.com/api/2.0/fo/knowledge_base/vuln/?action=list&details=Basic&id_min=2");
+  });
+  const complete = await followed.listKnowledgeBase(["91001", "91002"]);
+  assert.deepEqual(complete.items.map((vuln) => vuln.QID), ["91001", "91002"]);
+  assert.equal(complete.pages, 2);
+  assert.equal(complete.truncated, false, "a followed continuation is a complete read");
+  assert.equal(calls.length, 2);
+
+  // Every page carries a WARNING/URL to the next id_min, so the continuation can never be exhausted.
+  const endlessKbPages = async (url) => {
+    const nextUrl = new URL(url);
+    nextUrl.searchParams.set("id_min", String(Number(nextUrl.searchParams.get("id_min") ?? "0") + 1));
+    return kbPage(tenant.knowledgeBase, nextUrl.toString());
+  };
+  const capped = await routedClient(endlessKbPages).listKnowledgeBase(["91001"]);
+  assert.equal(capped.truncated, true, "an unfollowed WARNING/URL continuation is a partial read (pre-fix: truncated false)");
+  assert.match(capped.truncationReason, /page cap 25 reached with a WARNING\/URL continuation not followed/);
+  assert.equal(capped.pages, 25);
+
+  const partialPatchData = await assessQualysVulnerabilityManagement(routedClient(async (url, init) => {
+    if (url.includes("/knowledge_base/")) return endlessKbPages(url);
+    return compliantRouter(url, init);
+  }));
+  const patchTracking = partialPatchData.findings.find((item) => item.id === "QUALYS-C11");
+  assert.notEqual(patchTracking.status, "pass", "C11 must not pass when the knowledge base read is partial");
+  assert.equal(patchTracking.status, "warn");
+  assert.match(patchTracking.summary, /Partial view: knowledge_base page cap 25 reached with a WARNING\/URL continuation not followed/);
+  assert.equal(patchTracking.evidence.collection.sources.find((source) => source.name === "knowledge_base").status, "truncated");
+});
+
+test("rule 7: searchQps treats a page that fills limitResults without hasMoreRecords as a possible continuation instead of the whole population", async () => {
+  const connectors = (start, count) => Array.from({ length: count }, (_, index) => documentedConnector({ id: start + index, name: `aws-${start + index}` }));
+  const withoutFlag = (items, extra = {}) => {
+    const body = qpsResponse("AwsAssetDataConnector", items, extra);
+    delete body.ServiceResponse.hasMoreRecords;
+    return jsonResponse(body);
+  };
+
+  let orphanCalls = 0;
+  const orphan = routedClient(async () => {
+    orphanCalls += 1;
+    return withoutFlag(connectors(1, 100));
+  });
+  const orphanResult = await orphan.searchConnectors();
+  assert.equal(orphanCalls, 1);
+  assert.equal(orphanResult.items.length, 100);
+  assert.equal(orphanResult.truncated, true, "exactly limitResults records with neither hasMoreRecords nor lastId cannot be the proven whole population (pre-fix: truncated false)");
+  assert.match(orphanResult.truncationReason, /full page was returned without hasMoreRecords or lastId/);
+
+  const continued = routedClient(async (url, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(body.ServiceRequest.preferences.limitResults, 100);
+    const after = (body.ServiceRequest.filters?.Criteria ?? []).find((item) => item.field === "id" && item.operator === "GREATER");
+    if (!after) return withoutFlag(connectors(1, 100), { lastId: 100 });
+    assert.equal(after.value, "100");
+    return withoutFlag(connectors(101, 7));
+  });
+  const continuedResult = await continued.searchConnectors();
+  assert.equal(continuedResult.items.length, 107);
+  assert.equal(continuedResult.pages, 2, "a full page with a lastId continues paging even without the flag");
+  assert.equal(continuedResult.truncated, false);
+
+  let explicitCalls = 0;
+  const explicitEnd = routedClient(async () => {
+    explicitCalls += 1;
+    return jsonResponse(qpsResponse("AwsAssetDataConnector", connectors(1, 100)));
+  });
+  const explicitResult = await explicitEnd.searchConnectors();
+  assert.equal(explicitCalls, 1);
+  assert.equal(explicitResult.truncated, false, "an explicit hasMoreRecords false ends a full page");
+
+  const shortPage = await routedClient(async () => withoutFlag(connectors(1, 3))).searchConnectors();
+  assert.equal(shortPage.truncated, false, "a page below limitResults without the flag is complete");
+
+  const inventory = await assessQualysAssetInventory(routedClient(async (url, init) => {
+    if (url.includes("/am/assetdataconnector")) return withoutFlag(connectors(1, 100));
+    return compliantRouter(url, init);
+  }));
+  const connectorHealth = inventory.findings.find((item) => item.id === "QUALYS-C05");
+  assert.notEqual(connectorHealth.status, "pass");
+  assert.match(connectorHealth.summary, /Partial view: connectors a full page was returned without hasMoreRecords or lastId/);
+});
+
 test("normalizeList accepts plain arrays and list results", () => {
   assert.deepEqual(normalizeList([{ a: 1 }]), { items: [{ a: 1 }], truncated: false, truncationReason: undefined, pages: 1 });
   const list = normalizeList({ items: [{ a: 1 }], truncationReason: "item cap 1 reached", pages: 3 });

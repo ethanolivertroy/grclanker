@@ -987,13 +987,15 @@ export class QualysApiClient {
     const items: JsonRecord[] = [];
     let lastId: string | undefined;
     let hasMore = false;
+    let hasMoreFlag: boolean | undefined;
     let pages = 0;
     while (items.length < limit && pages < maxPages) {
       const activeCriteria = [...criteria];
       if (lastId) activeCriteria.push({ field: "id", operator: "GREATER", value: lastId });
+      const limitResults = Math.min(pageSize, limit - items.length);
       const request: JsonRecord = {
         preferences: {
-          limitResults: Math.min(pageSize, limit - items.length),
+          limitResults,
           ...(options.verbose ? { verbose: true } : {}),
         },
       };
@@ -1007,13 +1009,18 @@ export class QualysApiClient {
         return asObject(values[0]) ?? entry;
       });
       items.push(...data);
-      hasMore = asBoolean(response.hasMoreRecords) ?? false;
+      // A page that fills limitResults without a hasMoreRecords flag cannot prove the population ended, so the
+      // count stands in for the missing flag; only an explicit false ends paging on a full page.
+      hasMoreFlag = asBoolean(response.hasMoreRecords);
+      hasMore = hasMoreFlag ?? data.length >= limitResults;
       lastId = asString(response.lastId);
       if (!hasMore || !lastId || data.length === 0) break;
     }
     let truncationReason: string | undefined;
     if (hasMore && !lastId) {
-      truncationReason = "hasMoreRecords was true but no lastId was returned to continue paging";
+      truncationReason = hasMoreFlag === undefined
+        ? "a full page was returned without hasMoreRecords or lastId, so the population may continue beyond it"
+        : "hasMoreRecords was true but no lastId was returned to continue paging";
     } else if (hasMore && items.length >= limit) {
       truncationReason = `item cap ${limit} reached with hasMoreRecords true`;
     } else if (hasMore && pages >= maxPages) {
@@ -1137,17 +1144,27 @@ export class QualysApiClient {
   async listKnowledgeBase(qids: string[]): Promise<QualysListResult> {
     const unique = uniqueStrings(qids);
     const items: JsonRecord[] = [];
+    const truncationReasons: string[] = [];
     let pages = 0;
     for (let index = 0; index < Math.min(unique.length, KNOWLEDGE_BASE_MAX_QIDS); index += KNOWLEDGE_BASE_QID_BATCH) {
       const batch = unique.slice(index, index + KNOWLEDGE_BASE_QID_BATCH);
-      const document = await this.getXml("/api/2.0/fo/knowledge_base/vuln/", { action: "list", details: "Basic", ids: batch.join(",") });
-      pages += 1;
-      items.push(...xmlRecords(document, "VULN"));
+      // knowledge_base_vuln_list_output.dtd: RESPONSE (DATETIME, (VULN_LIST|ID_SET)?, WARNING?) with
+      // WARNING (CODE?, TEXT, URL?), so every batch follows its WARNING/URL continuation like the other lists
+      // and records the page cap when the continuation cannot be followed.
+      const page = await this.listXml(
+        "/api/2.0/fo/knowledge_base/vuln/",
+        { action: "list", details: "Basic", ids: batch.join(",") },
+        "VULN",
+        { limit: DEFAULT_LIST_LIMIT },
+      );
+      pages += page.pages;
+      items.push(...page.items);
+      if (page.truncationReason) truncationReasons.push(page.truncationReason);
     }
-    const truncationReason = unique.length > KNOWLEDGE_BASE_MAX_QIDS
-      ? `knowledge base lookup capped at ${KNOWLEDGE_BASE_MAX_QIDS} of ${unique.length} QIDs`
-      : undefined;
-    return listResult(items, pages, truncationReason);
+    if (unique.length > KNOWLEDGE_BASE_MAX_QIDS) {
+      truncationReasons.push(`knowledge base lookup capped at ${KNOWLEDGE_BASE_MAX_QIDS} of ${unique.length} QIDs`);
+    }
+    return listResult(items, pages, truncationReasons.length > 0 ? uniqueStrings(truncationReasons).join("; ") : undefined);
   }
 
   async listScheduledReports(): Promise<QualysListResult> {
