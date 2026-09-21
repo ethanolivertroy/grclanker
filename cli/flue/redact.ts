@@ -15,9 +15,11 @@ export const REDACTED_VALUE = "[redacted]";
 // `credentials_file`, `app_private_key_path`) and stay visible.
 const SAFE_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
 
-// Words that name a credential wherever they appear inside a key.
+// Words that name a credential wherever they appear inside a key. The last
+// alternative covers concatenated spellings such as `apikey` or `privatekey`,
+// which the segment rule below cannot see.
 const SENSITIVE_SUBSTRING_PATTERN =
-  /token|secret|passw|passphrase|passcode|credential|authorization|assertion|bearer|hmac|signature|kubeconfig|connection[_-]?string|webhook[_-]?url|session[_-]?id|auth[_-]?header|basic[_-]?auth/i;
+  /token|secret|passw|passphrase|passcode|credential|authorization|assertion|bearer|hmac|signature|kubeconfig|connection[_-]?string|webhook[_-]?url|session[_-]?id|auth[_-]?header|basic[_-]?auth|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)[_-]?keys?/i;
 
 // Short words that only count as whole segments of a key (`api_key`, `pin_code`,
 // `sas_url`, Duo's `ikey` and `skey`), never as substrings (`keyword`, `monkey`).
@@ -163,8 +165,9 @@ function urlEncoded(value: string): string | undefined {
 
 /**
  * The forms a tool might echo a secret in: as is, JSON-escaped (inside a
- * serialized payload), URL-encoded, base64 and base64url, re-flowed onto one
- * line, and each individual line of a multi-line value such as a PEM key.
+ * serialized payload), URL-encoded, base64 (with and without padding, and
+ * URL-encoded) and base64url, re-flowed onto one line, and each individual
+ * line of a multi-line value such as a PEM key.
  */
 export function scrubbedFormsOf(value: string): string[] {
   const lines = value
@@ -172,17 +175,20 @@ export function scrubbedFormsOf(value: string): string[] {
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
   const bytes = Buffer.from(value, "utf8");
+  const base64 = bytes.toString("base64");
   const forms = new Set<string>([
     value,
     JSON.stringify(value).slice(1, -1),
-    bytes.toString("base64"),
+    base64,
+    base64.replace(/=+$/, ""),
     bytes.toString("base64url"),
     lines.join(" "),
     lines.join(""),
     ...lines,
   ]);
-  const encoded = urlEncoded(value);
-  if (encoded !== undefined) forms.add(encoded);
+  for (const encoded of [urlEncoded(value), urlEncoded(base64)]) {
+    if (encoded !== undefined) forms.add(encoded);
+  }
   return [...forms];
 }
 

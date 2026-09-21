@@ -922,6 +922,8 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     "client_key", "service_account_key", "license_key", "licenseKey", "access_key_id", "connection_string", "connectionString",
     "hmac", "hmac_secret", "signature", "cookie", "session_id", "sessionId", "dsn", "jwt", "sas_url", "sas", "kubeconfig",
     "webhook_url", "webhookUrl", "auth_header", "basic_auth", "cert_pem", "x-api-key", "apiKey", "ClientSecret", "accessToken",
+    // Concatenated spellings the old private_?key / api_?key pattern covered, plus a few more of the same shape.
+    "apikey", "APIKEY", "x-apikey", "APIKey", "privatekey", "PRIVATEKEY", "accesskey", "signingkey", "sshkey", "masterkey", "secretkey",
   ]) {
     assert.ok(isSensitiveArgumentKey(key), `${key} is redacted`);
   }
@@ -994,6 +996,20 @@ test("scrubbing recognizes transformed echoes: encodings, reflowed PEM, case cha
   assert.equal(
     scrubSensitiveValues(echo, values),
     `upstream said: raw ${REDACTED_VALUE}; b64 ${REDACTED_VALUE}; b64url ${REDACTED_VALUE}; url ${REDACTED_VALUE}; upper ${REDACTED_VALUE}; lower ${REDACTED_VALUE}`,
+  );
+
+  // Standard base64 with the padding stripped and URL-encoded base64, for a value whose base64 carries +, /, and padding
+  // (base64url would not cover the stripped form there).
+  const awkward = "tok_?>???x";
+  const awkwardBase64 = Buffer.from(awkward, "utf8").toString("base64");
+  assert.match(awkwardBase64, /[+/].*==$/, "the value was chosen so its base64 has + or / and padding");
+  const stripped = awkwardBase64.replace(/=+$/, "");
+  const urlEncodedBase64 = encodeURIComponent(awkwardBase64);
+  assert.notEqual(stripped, Buffer.from(awkward, "utf8").toString("base64url"));
+  assert.match(urlEncodedBase64, /%2B|%2F/);
+  assert.equal(
+    scrubSensitiveValues(`stripped ${stripped}; encoded ${urlEncodedBase64}; padded ${awkwardBase64}`, collectSensitiveValues({ api_token: awkward })),
+    `stripped ${REDACTED_VALUE}; encoded ${REDACTED_VALUE}; padded ${REDACTED_VALUE}`,
   );
 
   // A PEM re-flowed by a tool: newlines turned into spaces, removed, or one body line quoted alone.
