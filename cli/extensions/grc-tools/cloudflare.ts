@@ -1,9 +1,12 @@
 /**
  * Cloudflare security posture tools for grclanker.
  *
- * This first slice stays read-only and focuses on token access validation,
- * account and Zero Trust identity posture, zone TLS and DNS security, traffic
- * controls, and exportable evidence bundles.
+ * Read-only inspection of Cloudflare accounts and zones through the v4 API:
+ * token and member posture, Zero Trust Access, WAF and DDoS rulesets, TLS,
+ * DNS, security headers, traffic controls, and exportable evidence bundles.
+ *
+ * Every endpoint, phase, setting id, and response field read here is
+ * traceable to the page listed in CLOUDFLARE_API_DOCS.
  */
 import {
   createWriteStream,
@@ -13,7 +16,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -27,8 +30,71 @@ const DEFAULT_ZONE_LIMIT = 20;
 const DEFAULT_MEMBER_LIMIT = 200;
 const DEFAULT_TOKEN_LIMIT = 200;
 const DEFAULT_AUDIT_LIMIT = 200;
-const DEFAULT_PAGE_SIZE = 50;
+const DEFAULT_DNS_RECORD_LIMIT = 500;
 const DEFAULT_MAX_SUPER_ADMINS = 2;
+const HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
+const STALE_IP_RULE_DAYS = 365;
+const CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
+const AUDIT_LOG_LOOKBACK_DAYS = 30;
+
+/**
+ * Documentation pages on developers.cloudflare.com/api that every request and
+ * response field in this module is traced to.
+ */
+export const CLOUDFLARE_API_DOCS = {
+  accountsList: "https://developers.cloudflare.com/api/resources/accounts/methods/list/",
+  zonesList: "https://developers.cloudflare.com/api/resources/zones/methods/list/",
+  zoneSettingGet: "https://developers.cloudflare.com/api/resources/zones/subresources/settings/methods/get/",
+  rulesetsList: "https://developers.cloudflare.com/api/resources/rulesets/methods/list/",
+  rulesetPhaseEntrypoint: "https://developers.cloudflare.com/api/resources/rulesets/subresources/phases/methods/get/",
+  dnsRecordsList: "https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/list/",
+  dnssecGet: "https://developers.cloudflare.com/api/resources/dns/subresources/dnssec/methods/get/",
+  certificatePacksList: "https://developers.cloudflare.com/api/resources/ssl/subresources/certificate_packs/methods/list/",
+  universalSslSettings: "https://developers.cloudflare.com/api/resources/ssl/subresources/universal/subresources/settings/methods/get/",
+  originTlsClientAuthSettings: "https://developers.cloudflare.com/api/resources/origin_tls_client_auth/subresources/settings/methods/get/",
+  originTlsClientAuthHostname: "https://developers.cloudflare.com/api/resources/origin_tls_client_auth/subresources/hostnames/methods/get/",
+  botManagementGet: "https://developers.cloudflare.com/api/resources/bot_management/methods/get/",
+  rateLimitsListLegacy: "https://developers.cloudflare.com/api/resources/rate_limits/methods/list/",
+  pageRulesList: "https://developers.cloudflare.com/api/resources/page_rules/methods/list/",
+  firewallRulesListLegacy: "https://developers.cloudflare.com/api/resources/firewall/subresources/rules/methods/list/",
+  accessApplicationsList: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/applications/methods/list/",
+  accessPoliciesList: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/policies/methods/list/",
+  identityProvidersList: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/identity_providers/methods/list/",
+  gatewayRulesList: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/gateway/subresources/rules/methods/list/",
+  auditLogsList: "https://developers.cloudflare.com/api/resources/audit_logs/methods/list/",
+  membersList: "https://developers.cloudflare.com/api/resources/accounts/subresources/members/methods/list/",
+  userTokensList: "https://developers.cloudflare.com/api/resources/user/subresources/tokens/methods/list/",
+  userTokenVerify: "https://developers.cloudflare.com/api/resources/user/subresources/tokens/methods/verify/",
+  userTokenGet: "https://developers.cloudflare.com/api/resources/user/subresources/tokens/methods/get/",
+  accountTokensList: "https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/list/",
+  ipAccessRulesList: "https://developers.cloudflare.com/api/resources/firewall/subresources/access_rules/methods/list/",
+} as const;
+
+export const CLOUDFLARE_RULESET_PHASES = {
+  ddosL7: "ddos_l7",
+  firewallManaged: "http_request_firewall_managed",
+  firewallCustom: "http_request_firewall_custom",
+  rateLimit: "http_ratelimit",
+  responseHeadersTransform: "http_response_headers_transform",
+} as const;
+
+export const CLOUDFLARE_ZONE_SETTING_IDS = [
+  "ssl",
+  "min_tls_version",
+  "always_use_https",
+  "automatic_https_rewrites",
+  "security_header",
+  "browser_check",
+  "email_obfuscation",
+  "tls_client_auth",
+] as const;
+
+const REQUIRED_SECURITY_HEADERS = [
+  "content-security-policy",
+  "x-frame-options",
+  "x-content-type-options",
+  "referrer-policy",
+] as const;
 
 export interface CloudflareResolvedConfig {
   apiToken?: string;
@@ -59,20 +125,24 @@ export interface CloudflareAccessCheckResult {
   recommendedNextStep: string;
 }
 
+export type CloudflareFindingStatus = "pass" | "warn" | "fail" | "manual";
+
 export interface CloudflareFinding {
   id: string;
   title: string;
   severity: "critical" | "high" | "medium" | "low" | "info";
-  status: "pass" | "warn" | "fail";
+  status: CloudflareFindingStatus;
   summary: string;
   evidence?: JsonRecord;
   mappings: string[];
+  specControl?: number;
 }
 
 export interface CloudflareAssessmentResult {
   title: string;
   summary: JsonRecord;
   findings: CloudflareFinding[];
+  errors: string[];
 }
 
 export interface CloudflareAuditBundleResult {
@@ -80,6 +150,44 @@ export interface CloudflareAuditBundleResult {
   zipPath: string;
   fileCount: number;
   findingCount: number;
+  errorCount: number;
+}
+
+export interface CloudflarePagedList {
+  items: JsonRecord[];
+  totalCount?: number;
+  truncated: boolean;
+}
+
+type ListResult = JsonRecord[] | CloudflarePagedList;
+
+export interface CloudflareReader {
+  getResolvedConfig(): CloudflareResolvedConfig;
+  verifyCurrentToken(): Promise<JsonRecord | null>;
+  getUserToken(tokenId: string): Promise<JsonRecord | null>;
+  listAccounts(limit?: number): Promise<ListResult>;
+  listZones(limit?: number): Promise<ListResult>;
+  listUserTokens(limit?: number): Promise<ListResult>;
+  listAccountTokens(accountId: string, limit?: number): Promise<ListResult>;
+  getZoneSettings(zoneId: string): Promise<JsonRecord[]>;
+  listFirewallRules(zoneId: string): Promise<ListResult>;
+  listZoneRulesets(zoneId: string): Promise<ListResult>;
+  getZoneEntrypointRuleset(zoneId: string, phase: string): Promise<JsonRecord | null>;
+  listDnsRecords(zoneId: string, limit?: number): Promise<ListResult>;
+  getDnssec(zoneId: string): Promise<JsonRecord | null>;
+  listCertificatePacks(zoneId: string): Promise<ListResult>;
+  getUniversalSslSettings(zoneId: string): Promise<JsonRecord | null>;
+  getOriginTlsClientAuthSettings(zoneId: string): Promise<JsonRecord | null>;
+  listRateLimits(zoneId: string): Promise<ListResult>;
+  listPageRules(zoneId: string): Promise<ListResult>;
+  getBotManagement(zoneId: string): Promise<JsonRecord | null>;
+  listAccessApplications(accountId: string): Promise<ListResult>;
+  listAccessPolicies(accountId: string): Promise<ListResult>;
+  listIdentityProviders(accountId: string): Promise<ListResult>;
+  listGatewayRules(accountId: string): Promise<ListResult>;
+  listAuditLogs(accountId: string, limit?: number): Promise<ListResult>;
+  listMembers(accountId: string, limit?: number): Promise<ListResult>;
+  listIpAccessRules(accountId: string): Promise<ListResult>;
 }
 
 type CheckAccessArgs = {
@@ -116,6 +224,14 @@ type ExportAuditBundleArgs = CheckAccessArgs & {
   audit_limit?: number;
 };
 
+type AssessmentOptions = {
+  maxSuperAdmins?: number;
+  memberLimit?: number;
+  tokenLimit?: number;
+  zoneLimit?: number;
+  auditLimit?: number;
+};
+
 function asObject(value: unknown): JsonRecord | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as JsonRecord;
@@ -123,6 +239,10 @@ function asObject(value: unknown): JsonRecord | undefined {
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function asRecordArray(value: unknown): JsonRecord[] {
+  return asArray(value).map(asObject).filter((item): item is JsonRecord => Boolean(item));
 }
 
 function asString(value: unknown): string | undefined {
@@ -144,12 +264,14 @@ function asNumber(value: unknown): number | undefined {
 }
 
 function asBoolean(value: unknown): boolean | undefined {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    if (/^(true|1|yes|on|enabled|active)$/i.test(value.trim())) return true;
-    if (/^(false|0|no|off|disabled|inactive)$/i.test(value.trim())) return false;
-  }
-  return undefined;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function asDate(value: unknown): Date | undefined {
+  const text = asString(value);
+  if (!text) return undefined;
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -227,10 +349,10 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
+  for (let attempt = 1; attempt <= 50; attempt += 1) {
+    const suffix = attempt === 1 ? "" : `-${attempt}`;
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -247,7 +369,7 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
@@ -340,36 +462,44 @@ function buildHeaders(config: CloudflareResolvedConfig): Record<string, string> 
 
 function extractResultArray(payload: unknown): JsonRecord[] {
   const object = asObject(payload);
-  const result = asObject(object?.result);
-  if (Array.isArray(object?.result)) {
-    return object.result.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  if (Array.isArray(result?.items)) {
-    return result.items.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  if (Array.isArray(result?.records)) {
-    return result.records.map(asObject).filter((item): item is JsonRecord => Boolean(item));
-  }
-  return [];
+  return Array.isArray(object?.result) ? asRecordArray(object.result) : [];
 }
 
 function extractResultObject(payload: unknown): JsonRecord | undefined {
   const object = asObject(payload);
-  return asObject(object?.result) ?? object;
+  return asObject(object?.result);
 }
 
 function cloudflareErrorSummary(payload: unknown): string | undefined {
   const object = asObject(payload);
-  const errors = asArray(object?.errors)
-    .map((item) => {
-      const record = asObject(item);
-      return asString(record?.message) ?? asString(record?.error);
-    })
+  const errors = asRecordArray(object?.errors)
+    .map((record) => asString(record.message))
     .filter((item): item is string => Boolean(item));
   return errors.length > 0 ? errors.join("; ") : undefined;
 }
 
-export class CloudflareApiClient {
+export class CloudflareApiError extends Error {
+  readonly status: number;
+  readonly path: string;
+
+  constructor(message: string, status: number, path: string) {
+    super(message);
+    this.name = "CloudflareApiError";
+    this.status = status;
+    this.path = path;
+  }
+}
+
+function errorStatus(error: unknown): number | undefined {
+  const record = asObject(error);
+  return asNumber(record?.status) ?? asNumber(record?.statusCode);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class CloudflareApiClient implements CloudflareReader {
   private readonly config: CloudflareResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
@@ -422,7 +552,14 @@ export class CloudflareApiClient {
       });
 
       const rawText = await response.text();
-      const payload = rawText.length > 0 ? JSON.parse(rawText) as JsonRecord : {};
+      let payload: JsonRecord = {};
+      if (rawText.length > 0) {
+        try {
+          payload = asObject(JSON.parse(rawText)) ?? {};
+        } catch {
+          payload = {};
+        }
+      }
 
       if (response.status === 404 && options.allow404) {
         return null;
@@ -430,11 +567,15 @@ export class CloudflareApiClient {
 
       if (!response.ok) {
         const detail = cloudflareErrorSummary(payload) ?? rawText.slice(0, 240);
-        throw new Error(`Cloudflare request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`);
+        throw new CloudflareApiError(
+          `Cloudflare request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+          response.status,
+          path,
+        );
       }
 
       if (payload.success === false) {
-        throw new Error(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${path}.`);
+        throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${path}.`, response.status, path);
       }
 
       return payload;
@@ -443,133 +584,346 @@ export class CloudflareApiClient {
     }
   }
 
+  private async getObject(path: string, allow404 = true): Promise<JsonRecord | null> {
+    const payload = await this.requestJson(path, { allow404 });
+    if (payload === null) return null;
+    return extractResultObject(payload) ?? null;
+  }
+
+  private async getUnpaginatedList(path: string, query: JsonRecord = {}): Promise<CloudflarePagedList> {
+    const payload = await this.requestJson(path, { query, allow404: true });
+    if (payload === null) return { items: [], truncated: false, totalCount: 0 };
+    const items = extractResultArray(payload);
+    return { items, truncated: false, totalCount: items.length };
+  }
+
   private async listPaginated(
     path: string,
     options: {
       query?: JsonRecord;
       allow404?: boolean;
-      limit?: number;
-      perPage?: number;
-    } = {},
-  ): Promise<JsonRecord[]> {
-    const limit = clampNumber(options.limit, DEFAULT_PAGE_SIZE, 1, 5000);
-    const perPage = clampNumber(options.perPage, DEFAULT_PAGE_SIZE, 1, 100);
-    const results: JsonRecord[] = [];
+      limit: number;
+      perPage: number;
+    },
+  ): Promise<CloudflarePagedList> {
+    const limit = clampNumber(options.limit, 50, 1, 100_000);
+    const perPage = options.perPage;
+    const items: JsonRecord[] = [];
+    let totalCount: number | undefined;
+    let truncated = false;
 
-    for (let page = 1; results.length < limit; page += 1) {
+    for (let page = 1; ; page += 1) {
       const payload = await this.requestJson(path, {
-        query: {
-          page,
-          per_page: perPage,
-          ...options.query,
-        },
+        query: { ...options.query, page, per_page: perPage },
         allow404: options.allow404,
       });
+      if (payload === null) return { items: [], truncated: false, totalCount: 0 };
 
-      if (payload === null) return [];
       const pageItems = extractResultArray(payload);
-      results.push(...pageItems.slice(0, limit - results.length));
-
       const resultInfo = asObject(payload.result_info);
+      totalCount = asNumber(resultInfo?.total_count) ?? totalCount;
       const totalPages = asNumber(resultInfo?.total_pages);
-      if (pageItems.length === 0 || (totalPages !== undefined && page >= totalPages) || pageItems.length < perPage) {
+
+      const remaining = limit - items.length;
+      items.push(...pageItems.slice(0, remaining));
+      if (pageItems.length > remaining) {
+        truncated = true;
+        break;
+      }
+
+      const lastPage = pageItems.length === 0
+        || pageItems.length < perPage
+        || (totalPages !== undefined && page >= totalPages);
+      if (lastPage) break;
+      if (items.length >= limit) {
+        truncated = true;
         break;
       }
     }
 
-    return results;
+    if (totalCount !== undefined && totalCount > items.length) truncated = true;
+    return { items, totalCount: totalCount ?? (truncated ? undefined : items.length), truncated };
+  }
+
+  private async listCursorPaginated(path: string, limit: number, perPage: number): Promise<CloudflarePagedList> {
+    const items: JsonRecord[] = [];
+    let cursor: string | undefined;
+    for (let iteration = 0; iteration < 100; iteration += 1) {
+      const payload = await this.requestJson(path, {
+        query: { per_page: perPage, cursor },
+        allow404: true,
+      });
+      if (payload === null) return { items: [], truncated: false, totalCount: 0 };
+      const pageItems = extractResultArray(payload);
+      const remaining = limit - items.length;
+      items.push(...pageItems.slice(0, remaining));
+      if (pageItems.length > remaining) return { items, truncated: true };
+
+      const cursors = asObject(asObject(payload.result_info)?.cursors);
+      cursor = asString(cursors?.after);
+      if (!cursor || pageItems.length === 0) break;
+      if (items.length >= limit) return { items, truncated: true };
+    }
+    return { items, truncated: false, totalCount: items.length };
+  }
+
+  private zonePath(zoneId: string, suffix: string): string {
+    return `/zones/${encodeURIComponent(zoneId)}${suffix}`;
+  }
+
+  private accountPath(accountId: string, suffix: string): string {
+    return `/accounts/${encodeURIComponent(accountId)}${suffix}`;
   }
 
   async verifyCurrentToken(): Promise<JsonRecord | null> {
-    return this.requestJson("/user/tokens/verify", { allow404: true });
+    return this.getObject("/user/tokens/verify");
   }
 
-  async listAccounts(limit = DEFAULT_PAGE_SIZE): Promise<JsonRecord[]> {
-    return this.listPaginated("/accounts", { limit });
+  async getUserToken(tokenId: string): Promise<JsonRecord | null> {
+    return this.getObject(`/user/tokens/${encodeURIComponent(tokenId)}`);
   }
 
-  async listZones(limit = DEFAULT_ZONE_LIMIT): Promise<JsonRecord[]> {
+  async listAccounts(limit = 50): Promise<CloudflarePagedList> {
+    return this.listPaginated("/accounts", { limit, perPage: 50 });
+  }
+
+  async listZones(limit = DEFAULT_ZONE_LIMIT): Promise<CloudflarePagedList> {
     return this.listPaginated("/zones", {
       limit,
+      perPage: 50,
       query: this.config.accountId ? { "account.id": this.config.accountId } : {},
     });
   }
 
-  async listUserTokens(limit = DEFAULT_TOKEN_LIMIT): Promise<JsonRecord[]> {
-    return this.listPaginated("/user/tokens", { limit, allow404: true });
+  async listUserTokens(limit = DEFAULT_TOKEN_LIMIT): Promise<CloudflarePagedList> {
+    return this.listPaginated("/user/tokens", { limit, perPage: 50, allow404: true, query: { include_expired: true } });
+  }
+
+  async listAccountTokens(accountId: string, limit = DEFAULT_TOKEN_LIMIT): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.accountPath(accountId, "/tokens"), { limit, perPage: 50, allow404: true, query: { include_expired: true } });
   }
 
   async getZoneSettings(zoneId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/zones/${encodeURIComponent(zoneId)}/settings`, { allow404: true, perPage: 100, limit: 100 });
+    return Promise.all(CLOUDFLARE_ZONE_SETTING_IDS.map(async (settingId) => {
+      try {
+        const setting = await this.getObject(this.zonePath(zoneId, `/settings/${settingId}`), false);
+        return { id: settingId, value: setting?.value };
+      } catch (error) {
+        return { id: settingId, error: errorMessage(error), status: errorStatus(error) ?? null };
+      }
+    }));
   }
 
-  async listFirewallRules(zoneId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/zones/${encodeURIComponent(zoneId)}/firewall/rules`, { allow404: true, limit: 200 });
+  async listFirewallRules(zoneId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.zonePath(zoneId, "/firewall/rules"), { allow404: true, limit: 500, perPage: 100 });
   }
 
-  async listZoneRulesets(zoneId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/zones/${encodeURIComponent(zoneId)}/rulesets`, { allow404: true, limit: 200 });
+  async listZoneRulesets(zoneId: string): Promise<CloudflarePagedList> {
+    return this.listCursorPaginated(this.zonePath(zoneId, "/rulesets"), 500, 50);
+  }
+
+  async getZoneEntrypointRuleset(zoneId: string, phase: string): Promise<JsonRecord | null> {
+    return this.getObject(this.zonePath(zoneId, `/rulesets/phases/${encodeURIComponent(phase)}/entrypoint`));
+  }
+
+  async listDnsRecords(zoneId: string, limit = DEFAULT_DNS_RECORD_LIMIT): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.zonePath(zoneId, "/dns_records"), { limit, perPage: 100 });
   }
 
   async getDnssec(zoneId: string): Promise<JsonRecord | null> {
-    return this.requestJson(`/zones/${encodeURIComponent(zoneId)}/dnssec`, { allow404: true }).then((payload) => extractResultObject(payload) ?? null);
+    return this.getObject(this.zonePath(zoneId, "/dnssec"));
   }
 
-  async listRateLimits(zoneId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/zones/${encodeURIComponent(zoneId)}/rate_limits`, { allow404: true, limit: 200 });
-  }
-
-  async listPageRules(zoneId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/zones/${encodeURIComponent(zoneId)}/pagerules`, { allow404: true, limit: 200 });
-  }
-
-  async getBotManagement(zoneId: string): Promise<JsonRecord | null> {
-    return this.requestJson(`/zones/${encodeURIComponent(zoneId)}/bot_management`, { allow404: true }).then((payload) => extractResultObject(payload) ?? null);
+  async listCertificatePacks(zoneId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.zonePath(zoneId, "/ssl/certificate_packs"), { allow404: true, limit: 500, perPage: 50, query: { status: "all" } });
   }
 
   async getUniversalSslSettings(zoneId: string): Promise<JsonRecord | null> {
-    return this.requestJson(`/zones/${encodeURIComponent(zoneId)}/ssl/universal/settings`, { allow404: true }).then((payload) => extractResultObject(payload) ?? null);
+    return this.getObject(this.zonePath(zoneId, "/ssl/universal/settings"));
   }
 
-  async listAccessApplications(accountId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/access/apps`, { allow404: true, limit: 200 });
+  async getOriginTlsClientAuthSettings(zoneId: string): Promise<JsonRecord | null> {
+    return this.getObject(this.zonePath(zoneId, "/origin_tls_client_auth/settings"));
   }
 
-  async listAccessPolicies(accountId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/access/policies`, { allow404: true, limit: 200 });
+  async listRateLimits(zoneId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.zonePath(zoneId, "/rate_limits"), { allow404: true, limit: 1000, perPage: 100 });
   }
 
-  async listIdentityProviders(accountId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/access/identity_providers`, { allow404: true, limit: 100 });
+  async listPageRules(zoneId: string): Promise<CloudflarePagedList> {
+    return this.getUnpaginatedList(this.zonePath(zoneId, "/pagerules"));
   }
 
-  async listGatewayRules(accountId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/gateway/rules`, { allow404: true, limit: 200 });
+  async getBotManagement(zoneId: string): Promise<JsonRecord | null> {
+    return this.getObject(this.zonePath(zoneId, "/bot_management"));
   }
 
-  async listAuditLogs(accountId: string, limit = DEFAULT_AUDIT_LIMIT): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/audit_logs`, { allow404: true, limit });
+  async listAccessApplications(accountId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.accountPath(accountId, "/access/apps"), { allow404: true, limit: 500, perPage: 50 });
   }
 
-  async listMembers(accountId: string, limit = DEFAULT_MEMBER_LIMIT): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/members`, { allow404: true, limit });
+  async listAccessPolicies(accountId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.accountPath(accountId, "/access/policies"), { allow404: true, limit: 1000, perPage: 100 });
   }
 
-  async listIpAccessRules(accountId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/accounts/${encodeURIComponent(accountId)}/firewall/access_rules/rules`, { allow404: true, limit: 200 });
+  async listIdentityProviders(accountId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.accountPath(accountId, "/access/identity_providers"), { allow404: true, limit: 200, perPage: 100 });
   }
+
+  async listGatewayRules(accountId: string): Promise<CloudflarePagedList> {
+    return this.getUnpaginatedList(this.accountPath(accountId, "/gateway/rules"));
+  }
+
+  async listAuditLogs(accountId: string, limit = DEFAULT_AUDIT_LIMIT): Promise<CloudflarePagedList> {
+    const since = new Date(this.now().getTime() - AUDIT_LOG_LOOKBACK_DAYS * 86_400_000).toISOString();
+    return this.listPaginated(this.accountPath(accountId, "/audit_logs"), { allow404: true, limit, perPage: 100, query: { since, direction: "desc" } });
+  }
+
+  async listMembers(accountId: string, limit = DEFAULT_MEMBER_LIMIT): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.accountPath(accountId, "/members"), { allow404: true, limit, perPage: 50 });
+  }
+
+  async listIpAccessRules(accountId: string): Promise<CloudflarePagedList> {
+    return this.listPaginated(this.accountPath(accountId, "/firewall/access_rules/rules"), { allow404: true, limit: 1000, perPage: 50 });
+  }
+}
+
+type ReadOutcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string; status?: number };
+
+async function attempt<T>(load: () => Promise<T>): Promise<ReadOutcome<T>> {
+  try {
+    return { ok: true, value: await load() };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error), status: errorStatus(error) };
+  }
+}
+
+function asPaged(value: unknown): CloudflarePagedList {
+  if (Array.isArray(value)) return { items: asRecordArray(value), truncated: false, totalCount: value.length };
+  const record = asObject(value);
+  if (record && Array.isArray(record.items)) {
+    return {
+      items: asRecordArray(record.items),
+      totalCount: asNumber(record.totalCount) ?? asNumber(record.total_count),
+      truncated: asBoolean(record.truncated) ?? false,
+    };
+  }
+  return { items: [], truncated: false, totalCount: 0 };
+}
+
+async function attemptList(load: () => Promise<unknown>): Promise<ReadOutcome<CloudflarePagedList>> {
+  const outcome = await attempt(load);
+  return outcome.ok ? { ok: true, value: asPaged(outcome.value) } : outcome;
+}
+
+function listOrEmpty(outcome: ReadOutcome<CloudflarePagedList>): CloudflarePagedList {
+  return outcome.ok ? outcome.value : { items: [], truncated: false, totalCount: 0 };
+}
+
+const STATUS_RANK: Record<CloudflareFindingStatus, number> = { pass: 0, warn: 1, manual: 2, fail: 3 };
+
+function worstStatus(statuses: CloudflareFindingStatus[]): CloudflareFindingStatus {
+  return statuses.reduce<CloudflareFindingStatus>((worst, current) => (STATUS_RANK[current] > STATUS_RANK[worst] ? current : worst), "pass");
+}
+
+function capStatus(status: CloudflareFindingStatus, cap: CloudflareFindingStatus): CloudflareFindingStatus {
+  return STATUS_RANK[status] < STATUS_RANK[cap] ? cap : status;
+}
+
+function manualReason(endpoint: string, permission: string, evidence: string, error?: string): string {
+  return `Manual review required: ${endpoint} could not be read${error ? ` (${error})` : ""}. Grant ${permission} to the audit token, or collect ${evidence} manually.`;
+}
+
+function partialInventoryNote(label: string, list: CloudflarePagedList): string | undefined {
+  if (!list.truncated) return undefined;
+  const total = list.totalCount === undefined ? "an unknown total" : `${list.totalCount} total`;
+  return `Partial ${label} inventory: ${list.items.length} seen of ${total}; unseen items were not assessed.`;
+}
+
+interface ControlMapping {
+  fedramp: string;
+  cmmc: string;
+  soc2: string;
+  cis: string;
+  pci: string;
+  stig: string;
+  irap: string;
+  ismap: string;
+}
+
+export const CLOUDFLARE_FRAMEWORKS: Array<{ key: keyof ControlMapping; label: string; slug: string }> = [
+  { key: "fedramp", label: "FedRAMP", slug: "fedramp" },
+  { key: "cmmc", label: "CMMC", slug: "cmmc" },
+  { key: "soc2", label: "SOC 2", slug: "soc2" },
+  { key: "cis", label: "CIS", slug: "cis" },
+  { key: "pci", label: "PCI-DSS", slug: "pci_dss" },
+  { key: "stig", label: "STIG", slug: "disa_stig" },
+  { key: "irap", label: "IRAP", slug: "irap" },
+  { key: "ismap", label: "ISMAP", slug: "ismap" },
+];
+
+const SPEC_CONTROL_MAPPINGS: Record<number, ControlMapping> = {
+  1: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.1", pci: "6.6", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  2: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.2", pci: "6.6", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  3: { fedramp: "SC-5", cmmc: "SC.L2-3.13.6", soc2: "CC6.6", cis: "9.3", pci: "6.5.10", stig: "SRG-APP-000246", irap: "ISM-1020", ismap: "CPS-11" },
+  4: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.4", pci: "6.6", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  5: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.1", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
+  6: { fedramp: "SC-8(1)", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.2", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-1369", ismap: "CPS-09" },
+  7: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.3", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
+  8: { fedramp: "SC-20", cmmc: "SC.L2-3.13.15", soc2: "CC6.7", cis: "3.4", pci: "n/a", stig: "SRG-APP-000516", irap: "ISM-1183", ismap: "CPS-09" },
+  9: { fedramp: "AC-3", cmmc: "AC.L2-3.1.2", soc2: "CC6.1", cis: "1.1", pci: "7.2.1", stig: "SRG-APP-000033", irap: "ISM-0432", ismap: "CPS-07" },
+  10: { fedramp: "IA-2", cmmc: "AC.L2-3.1.1", soc2: "CC6.1", cis: "1.2", pci: "8.3.1", stig: "SRG-APP-000148", irap: "ISM-1557", ismap: "CPS-04" },
+  11: { fedramp: "AU-2", cmmc: "AU.L2-3.3.1", soc2: "CC7.2", cis: "8.1", pci: "10.2.1", stig: "SRG-APP-000089", irap: "ISM-0580", ismap: "CPS-10" },
+  12: { fedramp: "AC-6", cmmc: "AC.L2-3.1.5", soc2: "CC6.3", cis: "5.1", pci: "7.2.1", stig: "SRG-APP-000340", irap: "ISM-0432", ismap: "CPS-07" },
+  13: { fedramp: "IA-5(1)", cmmc: "IA.L2-3.5.8", soc2: "CC6.1", cis: "5.2", pci: "8.6.3", stig: "SRG-APP-000175", irap: "ISM-1590", ismap: "CPS-05" },
+  14: { fedramp: "AC-2", cmmc: "AC.L2-3.1.1", soc2: "CC6.3", cis: "6.1", pci: "7.2.2", stig: "SRG-APP-000033", irap: "ISM-0432", ismap: "CPS-07" },
+  15: { fedramp: "CM-6", cmmc: "CM.L2-3.4.2", soc2: "CC8.1", cis: "10.1", pci: "2.2", stig: "SRG-APP-000386", irap: "ISM-0380", ismap: "CPS-12" },
+  16: { fedramp: "SC-5", cmmc: "SC.L2-3.13.6", soc2: "CC6.6", cis: "9.5", pci: "6.5.10", stig: "SRG-APP-000246", irap: "ISM-1020", ismap: "CPS-11" },
+  17: { fedramp: "SC-7(5)", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.6", pci: "1.3.2", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  18: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.5", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
+  19: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.7", pci: "6.6", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  20: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.7", cis: "3.6", pci: "n/a", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  21: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.7", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
+  22: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.8", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
+  23: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.7", cis: "9.8", pci: "6.5.10", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  24: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.9", pci: "1.3.1", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
+  25: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.9", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
+};
+
+function mappingsForControl(specControl: number): string[] {
+  const mapping = SPEC_CONTROL_MAPPINGS[specControl];
+  if (!mapping) return [];
+  return CLOUDFLARE_FRAMEWORKS
+    .filter((framework) => mapping[framework.key] !== "n/a")
+    .map((framework) => `${framework.label} ${mapping[framework.key]}`);
+}
+
+export function frameworkControlFor(finding: CloudflareFinding, frameworkKey: keyof ControlMapping): string {
+  const mapping = finding.specControl ? SPEC_CONTROL_MAPPINGS[finding.specControl] : undefined;
+  return mapping ? mapping[frameworkKey] : "n/a";
 }
 
 function finding(
   id: string,
   title: string,
   severity: CloudflareFinding["severity"],
-  status: CloudflareFinding["status"],
+  status: CloudflareFindingStatus,
   summary: string,
-  mappings: string[],
+  specControl: number | undefined,
   evidence?: JsonRecord,
 ): CloudflareFinding {
-  return { id, title, severity, status, summary, evidence, mappings };
+  return {
+    id,
+    title,
+    severity,
+    status,
+    summary,
+    evidence,
+    mappings: specControl ? mappingsForControl(specControl) : [],
+    specControl,
+  };
 }
 
 function deriveAccountContext(
@@ -586,12 +940,12 @@ function deriveAccountContext(
   }
 
   if (accounts.length === 0) {
-    return { accountId: undefined, note: "No Cloudflare account context was visible; account-scoped checks will stay limited." };
+    return { accountId: undefined, note: "No Cloudflare account context was visible; account-scoped checks stay manual until account_id is set." };
   }
 
   return {
     accountId: undefined,
-    note: "Multiple Cloudflare accounts were visible with no account_id selected; account-scoped checks will stay limited.",
+    note: "Multiple Cloudflare accounts were visible with no account_id selected; account-scoped checks stay manual until account_id is set.",
   };
 }
 
@@ -600,25 +954,15 @@ async function readableSurface(
   scope: CloudflareAccessSurface["scope"],
   endpoint: string,
   load: () => Promise<unknown>,
-  countResolver?: (value: unknown) => number | undefined,
 ): Promise<CloudflareAccessSurface> {
   try {
     const value = await load();
-    return {
-      name,
-      scope,
-      endpoint,
-      status: "readable",
-      count: countResolver?.(value),
-    };
+    const count = Array.isArray(value) || asObject(value)?.items !== undefined
+      ? asPaged(value).items.length
+      : value === null ? 0 : 1;
+    return { name, scope, endpoint, status: "readable", count };
   } catch (error) {
-    return {
-      name,
-      scope,
-      endpoint,
-      status: "not_readable",
-      error: error instanceof Error ? error.message : String(error),
-    };
+    return { name, scope, endpoint, status: "not_readable", error: errorMessage(error) };
   }
 }
 
@@ -628,169 +972,311 @@ function notConfiguredSurface(
   endpoint: string,
   error: string,
 ): CloudflareAccessSurface {
-  return {
-    name,
-    scope,
-    endpoint,
-    status: "not_configured",
-    error,
-  };
+  return { name, scope, endpoint, status: "not_configured", error };
 }
 
 function zoneName(zone: JsonRecord): string {
   return asString(zone.name) ?? asString(zone.id) ?? "unknown-zone";
 }
 
-function settingMap(settings: JsonRecord[]): Map<string, unknown> {
-  return new Map(
-    settings
-      .map((item) => {
-        const id = asString(item.id);
-        return id ? [id, item.value] as const : undefined;
-      })
-      .filter((item): item is readonly [string, unknown] => Boolean(item)),
-  );
+interface ZoneSettingRead {
+  value?: unknown;
+  error?: string;
 }
 
-function isEnabled(value: unknown): boolean {
-  return asBoolean(value) === true || /^(on|active|enabled|strict)$/i.test(asString(value) ?? "");
+function settingMap(settings: JsonRecord[]): Map<string, ZoneSettingRead> {
+  const map = new Map<string, ZoneSettingRead>();
+  for (const item of settings) {
+    const id = asString(item.id);
+    if (!id) continue;
+    const error = asString(item.error);
+    map.set(id, error ? { error } : { value: item.value });
+  }
+  return map;
 }
 
-function isStrictSsl(value: unknown): boolean {
-  return /strict/i.test(asString(value) ?? "");
+interface ZoneVerdict {
+  zone: string;
+  status: CloudflareFindingStatus;
+  detail: string;
 }
 
-function minTlsAtLeast12(value: unknown): boolean {
-  const numeric = asNumber(value);
-  if (numeric !== undefined) return numeric >= 1.2;
-  const text = asString(value);
-  return text ? Number(text) >= 1.2 : false;
+function verdict(zone: string, status: CloudflareFindingStatus, detail: string): ZoneVerdict {
+  return { zone, status, detail };
 }
 
-function hstsEnabled(value: unknown): boolean {
-  const object = asObject(value);
-  const nested = asObject(object?.strict_transport_security);
-  return isEnabled(nested?.enabled ?? nested?.value ?? object?.enabled ?? value);
+function settingVerdict(
+  zone: string,
+  settings: Map<string, ZoneSettingRead>,
+  settingId: string,
+  judge: (value: unknown) => { status: CloudflareFindingStatus; detail: string },
+  permission = "Zone Settings: Read",
+): ZoneVerdict {
+  const read = settings.get(settingId);
+  if (!read) {
+    return verdict(zone, "manual", manualReason(`/zones/{zone_id}/settings/${settingId}`, permission, `the ${settingId} zone setting`, "setting not returned"));
+  }
+  if (read.error) {
+    return verdict(zone, "manual", manualReason(`/zones/{zone_id}/settings/${settingId}`, permission, `the ${settingId} zone setting`, read.error));
+  }
+  const judged = judge(read.value);
+  return verdict(zone, judged.status, judged.detail);
 }
 
-function extractPolicies(value: unknown): unknown[] {
-  const object = asObject(value);
-  if (Array.isArray(object?.policies)) return object.policies;
-  const result = asObject(object?.result);
-  if (Array.isArray(result?.policies)) return result.policies;
-  return [];
+function onOffJudge(label: string): (value: unknown) => { status: CloudflareFindingStatus; detail: string } {
+  return (value) => {
+    const text = asString(value);
+    if (text === "on") return { status: "pass", detail: `${label} is on.` };
+    if (text === "off") return { status: "fail", detail: `${label} is off.` };
+    return { status: "manual", detail: `${label} returned an undocumented value (${String(text ?? "null")}); confirm in the dashboard.` };
+  };
 }
 
-function extractTokenStatus(value: unknown): string | undefined {
-  const object = asObject(value);
-  return asString(object?.status) ?? asString(asObject(object?.result)?.status);
+function aggregateZoneVerdicts(
+  id: string,
+  title: string,
+  severity: CloudflareFinding["severity"],
+  specControl: number | undefined,
+  zones: CloudflarePagedList,
+  verdicts: ZoneVerdict[],
+  options: {
+    emptyStatus: CloudflareFindingStatus;
+    emptyDetail: string;
+    passDetail: string;
+    extraEvidence?: JsonRecord;
+  },
+): CloudflareFinding {
+  const partialNote = partialInventoryNote("zone", zones);
+  if (zones.items.length === 0) {
+    return finding(id, title, severity, options.emptyStatus, `${options.emptyDetail}${partialNote ? ` ${partialNote}` : ""}`, specControl, {
+      zones_seen: 0,
+      zones_total: zones.totalCount ?? null,
+      ...options.extraEvidence,
+    });
+  }
+
+  const nonPassing = verdicts.filter((item) => item.status !== "pass");
+  let status = worstStatus(verdicts.map((item) => item.status));
+  if (partialNote) status = capStatus(status, "warn");
+
+  const counts = {
+    pass: verdicts.filter((item) => item.status === "pass").length,
+    warn: verdicts.filter((item) => item.status === "warn").length,
+    fail: verdicts.filter((item) => item.status === "fail").length,
+    manual: verdicts.filter((item) => item.status === "manual").length,
+  };
+  const summary = nonPassing.length === 0
+    ? `${options.passDetail} (${verdicts.length} zones).${partialNote ? ` ${partialNote}` : ""}`
+    : `${counts.fail} zones failed, ${counts.warn} warned, ${counts.manual} need manual review out of ${verdicts.length} sampled. ${nonPassing.slice(0, 3).map((item) => `${item.zone}: ${item.detail}`).join(" ")}${partialNote ? ` ${partialNote}` : ""}`;
+
+  return finding(id, title, severity, status, summary, specControl, {
+    zones_seen: zones.items.length,
+    zones_total: zones.totalCount ?? null,
+    zone_inventory_truncated: zones.truncated,
+    counts,
+    zones: verdicts.slice(0, 50).map((item) => ({ zone: item.zone, status: item.status, detail: item.detail })),
+    ...options.extraEvidence,
+  });
 }
 
-function collectMemberRoleNames(member: JsonRecord): string[] {
-  const values = [
-    asString(member.role),
-    asString(member.access_role),
-    ...asArray(member.roles).map((item) => asString(asObject(item)?.name) ?? asString(item)),
-  ];
-  return values.filter((item): item is string => Boolean(item));
+function enabledRules(ruleset: JsonRecord | null): JsonRecord[] {
+  return asRecordArray(ruleset?.rules).filter((rule) => asBoolean(rule.enabled) !== false);
+}
+
+function ruleAction(rule: JsonRecord): string {
+  return asString(rule.action)?.toLowerCase() ?? "";
+}
+
+function entrypointVerdict(
+  zone: string,
+  phase: string,
+  outcome: ReadOutcome<JsonRecord | null>,
+  judge: (ruleset: JsonRecord | null) => { status: CloudflareFindingStatus; detail: string },
+  permission: string,
+): ZoneVerdict {
+  if (!outcome.ok) {
+    return verdict(zone, "manual", manualReason(`/zones/{zone_id}/rulesets/phases/${phase}/entrypoint`, permission, `the ${phase} entry point ruleset`, outcome.error));
+  }
+  const judged = judge(outcome.value);
+  return verdict(zone, judged.status, judged.detail);
+}
+
+function judgeManagedWaf(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+  if (!ruleset) return { status: "fail", detail: "No http_request_firewall_managed entry point ruleset exists, so no WAF managed ruleset is deployed." };
+  const executes = enabledRules(ruleset).filter((rule) => ruleAction(rule) === "execute");
+  if (executes.length === 0) {
+    return { status: "fail", detail: "The http_request_firewall_managed entry point has no enabled execute rule deploying a managed ruleset." };
+  }
+  const disabledOverride = executes.some((rule) => asBoolean(asObject(asObject(rule.action_parameters)?.overrides)?.enabled) === false);
+  if (disabledOverride) return { status: "fail", detail: "A managed ruleset execute rule has overrides.enabled false, disabling the managed rules." };
+  const ids = executes.map((rule) => asString(asObject(rule.action_parameters)?.id) ?? "unknown");
+  return { status: "pass", detail: `${executes.length} enabled managed ruleset execute rules (${ids.join(", ")}).` };
+}
+
+function judgeCustomWaf(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+  if (!ruleset) return { status: "fail", detail: "No http_request_firewall_custom entry point ruleset exists, so no custom WAF rules are deployed." };
+  const rules = enabledRules(ruleset);
+  const mitigating = rules.filter((rule) => ["block", "managed_challenge", "js_challenge", "challenge"].includes(ruleAction(rule)));
+  if (rules.length === 0) return { status: "fail", detail: "The http_request_firewall_custom entry point has no enabled rules." };
+  if (mitigating.length === 0) return { status: "warn", detail: `${rules.length} enabled custom rules, none with a block or challenge action.` };
+  return { status: "pass", detail: `${mitigating.length} of ${rules.length} enabled custom rules block or challenge.` };
+}
+
+function judgeDdosL7(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+  if (!ruleset) {
+    return {
+      status: "manual",
+      detail: "No ddos_l7 override ruleset exists; HTTP DDoS Attack Protection runs at Cloudflare defaults. Confirm the default sensitivity is acceptable; per-rule overrides need an Enterprise plan with Advanced DDoS Protection.",
+    };
+  }
+  const executes = asRecordArray(ruleset.rules).filter((rule) => ruleAction(rule) === "execute");
+  if (executes.length === 0) return { status: "manual", detail: "The ddos_l7 entry point has no execute rule; confirm DDoS overrides in the dashboard." };
+  const disabled = executes.filter((rule) => asBoolean(rule.enabled) === false);
+  if (disabled.length === executes.length) return { status: "fail", detail: "Every ddos_l7 override rule is disabled." };
+  const levels = executes
+    .filter((rule) => asBoolean(rule.enabled) !== false)
+    .map((rule) => asString(asObject(asObject(rule.action_parameters)?.overrides)?.sensitivity_level)?.toLowerCase() ?? "default");
+  if (levels.includes("eoff")) return { status: "fail", detail: "HTTP DDoS sensitivity override is essentially off (eoff)." };
+  if (levels.includes("low")) return { status: "warn", detail: "HTTP DDoS sensitivity override is low." };
+  return { status: "pass", detail: `HTTP DDoS override sensitivity is ${[...new Set(levels)].join(", ")}.` };
+}
+
+function judgeSecurityHeaders(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+  if (!ruleset) return { status: "fail", detail: "No http_response_headers_transform entry point ruleset exists, so no security headers are set at the edge." };
+  const setHeaders = new Set<string>();
+  for (const rule of enabledRules(ruleset).filter((item) => ruleAction(item) === "rewrite")) {
+    const headers = asObject(asObject(rule.action_parameters)?.headers) ?? {};
+    for (const [name, spec] of Object.entries(headers)) {
+      const operation = asString(asObject(spec)?.operation)?.toLowerCase();
+      if (operation === "remove") continue;
+      setHeaders.add(name.toLowerCase());
+    }
+  }
+  const missing = REQUIRED_SECURITY_HEADERS.filter((header) => !setHeaders.has(header));
+  if (missing.length === 0) return { status: "pass", detail: "Transform rules set Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, and Referrer-Policy." };
+  if (missing.length === REQUIRED_SECURITY_HEADERS.length) return { status: "fail", detail: "No enabled response header transform rule sets any required security header." };
+  return { status: "warn", detail: `Missing security headers: ${missing.join(", ")}.` };
+}
+
+function judgeRateLimitRuleset(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } | undefined {
+  if (!ruleset) return undefined;
+  const rules = enabledRules(ruleset).filter((rule) => asObject(rule.ratelimit) !== undefined);
+  if (rules.length === 0) return undefined;
+  return { status: "pass", detail: `${rules.length} enabled http_ratelimit rules.` };
 }
 
 function pageRuleIsRisky(rule: JsonRecord): boolean {
-  const targets = JSON.stringify(rule.targets ?? rule.target ?? rule.priority ?? "").toLowerCase();
-  const actions = asArray(rule.actions)
-    .map((item) => {
-      const action = asObject(item);
-      const id = asString(action?.id);
-      const value = asString(action?.value);
-      return id && value ? `${id}:${value}`.toLowerCase() : id?.toLowerCase();
-    })
-    .filter((item): item is string => Boolean(item));
+  if (asString(rule.status) === "disabled") return false;
+  const targets = asRecordArray(rule.targets)
+    .map((target) => asString(asObject(target.constraint)?.value)?.toLowerCase() ?? "")
+    .join(" ");
+  const actions = asRecordArray(rule.actions).map((action) => ({
+    id: asString(action.id)?.toLowerCase() ?? "",
+    value: asString(action.value)?.toLowerCase() ?? "",
+  }));
 
-  return actions.some((item) =>
-    item.includes("disable_security")
-    || item.includes("security_level:essentially_off")
-    || item.includes("always_use_https:off")
-    || ((targets.includes("login") || targets.includes("auth") || targets.includes("admin") || targets.includes("api"))
-      && item.includes("cache_level:cache_everything"))
+  return actions.some((action) =>
+    action.id === "disable_security"
+    || (action.id === "security_level" && action.value === "essentially_off")
+    || (action.id === "ssl" && (action.value === "off" || action.value === "flexible"))
+    || (action.id === "browser_check" && action.value === "off")
+    || (action.id === "email_obfuscation" && action.value === "off")
+    || (action.id === "cache_level" && action.value === "cache_everything"
+      && /(login|auth|admin|api|account|checkout)/.test(targets)),
   );
 }
 
-function rulesetsProvideManagedProtection(rulesets: JsonRecord[]): boolean {
-  return rulesets.some((ruleset) => {
-    const phase = asString(ruleset.phase)?.toLowerCase() ?? "";
-    const kind = asString(ruleset.kind)?.toLowerCase() ?? "";
-    return phase.includes("firewall") || kind.includes("managed");
-  });
+function botManagementJudgement(config: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+  if (!config) {
+    return { status: "manual", detail: "No bot management configuration was returned; confirm the zone plan includes Bot Fight Mode, Super Bot Fight Mode, or Bot Management." };
+  }
+  const fightMode = asBoolean(config.fight_mode);
+  const definitely = asString(config.sbfm_definitely_automated);
+  const likely = asString(config.sbfm_likely_automated);
+  const enterpriseShape = config.auto_update_model !== undefined || config.suppress_session_score !== undefined;
+
+  if (fightMode === true) return { status: "pass", detail: "Bot Fight Mode is enabled." };
+  if (definitely === "block" || definitely === "managed_challenge") {
+    return { status: "pass", detail: `Super Bot Fight Mode acts on definitely automated traffic (${definitely}${likely ? `, likely automated ${likely}` : ""}).` };
+  }
+  if (definitely === "allow") return { status: "fail", detail: "Super Bot Fight Mode allows definitely automated traffic." };
+  if (fightMode === false) return { status: "fail", detail: "Bot Fight Mode is disabled and no Super Bot Fight Mode action is configured." };
+  if (enterpriseShape) {
+    return { status: "manual", detail: "Enterprise Bot Management is provisioned; enforcement lives in WAF custom rules using cf.bot_management.score, so confirm those rules manually." };
+  }
+  return { status: "manual", detail: "Bot management fields fight_mode and sbfm_definitely_automated were absent; confirm the plan includes Bot Fight Mode, Super Bot Fight Mode (Pro or Business), or Bot Management (Enterprise)." };
+}
+
+function collectMemberRoleNames(member: JsonRecord): string[] {
+  return asRecordArray(member.roles)
+    .map((role) => asString(role.name))
+    .filter((item): item is string => Boolean(item));
+}
+
+function daysBetween(from: Date, to: Date): number {
+  return (to.getTime() - from.getTime()) / 86_400_000;
 }
 
 export async function checkCloudflareAccess(
   client: Pick<
-    CloudflareApiClient,
+    CloudflareReader,
     "getResolvedConfig" | "verifyCurrentToken" | "listAccounts" | "listZones" | "getZoneSettings" | "getDnssec" | "listMembers" | "listAccessApplications" | "listAuditLogs"
-  >,
+  > & Partial<Pick<CloudflareReader, "listZoneRulesets">>,
 ): Promise<CloudflareAccessCheckResult> {
   const config = client.getResolvedConfig();
   const [verify, accounts, zones] = await Promise.all([
-    client.verifyCurrentToken().catch(() => null),
-    client.listAccounts(),
-    client.listZones(),
+    attempt(() => client.verifyCurrentToken()),
+    attemptList(() => client.listAccounts()),
+    attemptList(() => client.listZones()),
   ]);
-  const { accountId, note } = deriveAccountContext(config, accounts);
-  const firstZoneId = asString(zones[0]?.id);
+  const accountItems = listOrEmpty(accounts).items;
+  const zoneItems = listOrEmpty(zones).items;
+  const { accountId, note } = deriveAccountContext(config, accountItems);
+  const firstZoneId = asString(zoneItems[0]?.id);
 
   const surfaces: CloudflareAccessSurface[] = [
-    await readableSurface("token_verify", "user", "/user/tokens/verify", () => client.verifyCurrentToken(), () => verify ? 1 : 0),
-    await readableSurface("accounts", "account", "/accounts", () => client.listAccounts(), (value) => Array.isArray(value) ? value.length : undefined),
-    await readableSurface("zones", "zone", "/zones", () => client.listZones(), (value) => Array.isArray(value) ? value.length : undefined),
+    verify.ok
+      ? { name: "token_verify", scope: "user", endpoint: "/user/tokens/verify", status: "readable", count: verify.value ? 1 : 0 }
+      : { name: "token_verify", scope: "user", endpoint: "/user/tokens/verify", status: "not_readable", error: verify.error },
+    accounts.ok
+      ? { name: "accounts", scope: "account", endpoint: "/accounts", status: "readable", count: accountItems.length }
+      : { name: "accounts", scope: "account", endpoint: "/accounts", status: "not_readable", error: accounts.error },
+    zones.ok
+      ? { name: "zones", scope: "zone", endpoint: "/zones", status: "readable", count: zoneItems.length }
+      : { name: "zones", scope: "zone", endpoint: "/zones", status: "not_readable", error: zones.error },
   ];
 
   if (firstZoneId) {
+    const settings = await attempt(() => client.getZoneSettings(firstZoneId));
+    const settingErrors = settings.ok ? settings.value.filter((item) => asString(item.error)).length : 0;
     surfaces.push(
-      await readableSurface(
-        "zone_settings",
-        "zone",
-        `/zones/${firstZoneId}/settings`,
-        () => client.getZoneSettings(firstZoneId),
-        (value) => Array.isArray(value) ? value.length : undefined,
-      ),
-      await readableSurface(
-        "dnssec",
-        "zone",
-        `/zones/${firstZoneId}/dnssec`,
-        () => client.getDnssec(firstZoneId),
-        () => 1,
-      ),
+      settings.ok && settingErrors === 0
+        ? { name: "zone_settings", scope: "zone", endpoint: `/zones/${firstZoneId}/settings/{setting_id}`, status: "readable", count: settings.value.length }
+        : {
+          name: "zone_settings",
+          scope: "zone",
+          endpoint: `/zones/${firstZoneId}/settings/{setting_id}`,
+          status: "not_readable",
+          error: settings.ok ? `${settingErrors} zone settings could not be read` : settings.error,
+        },
+      await readableSurface("dnssec", "zone", `/zones/${firstZoneId}/dnssec`, () => client.getDnssec(firstZoneId)),
     );
+    if (client.listZoneRulesets) {
+      const listZoneRulesets = client.listZoneRulesets.bind(client);
+      surfaces.push(await readableSurface("rulesets", "zone", `/zones/${firstZoneId}/rulesets`, () => listZoneRulesets(firstZoneId)));
+    }
   } else {
     surfaces.push(
-      notConfiguredSurface("zone_settings", "zone", "/zones/{zone_id}/settings", "No visible zones were available."),
+      notConfiguredSurface("zone_settings", "zone", "/zones/{zone_id}/settings/{setting_id}", "No visible zones were available."),
       notConfiguredSurface("dnssec", "zone", "/zones/{zone_id}/dnssec", "No visible zones were available."),
     );
   }
 
   if (accountId) {
     surfaces.push(
-      await readableSurface(
-        "members",
-        "account",
-        `/accounts/${accountId}/members`,
-        () => client.listMembers(accountId),
-        (value) => Array.isArray(value) ? value.length : undefined,
-      ),
-      await readableSurface(
-        "zero_trust_apps",
-        "account",
-        `/accounts/${accountId}/access/apps`,
-        () => client.listAccessApplications(accountId),
-        (value) => Array.isArray(value) ? value.length : undefined,
-      ),
-      await readableSurface(
-        "audit_logs",
-        "account",
-        `/accounts/${accountId}/audit_logs`,
-        () => client.listAuditLogs(accountId),
-        (value) => Array.isArray(value) ? value.length : undefined,
-      ),
+      await readableSurface("members", "account", `/accounts/${accountId}/members`, () => client.listMembers(accountId)),
+      await readableSurface("zero_trust_apps", "account", `/accounts/${accountId}/access/apps`, () => client.listAccessApplications(accountId)),
+      await readableSurface("audit_logs", "account", `/accounts/${accountId}/audit_logs`, () => client.listAuditLogs(accountId)),
     );
   } else {
     surfaces.push(
@@ -822,389 +1308,714 @@ export async function checkCloudflareAccess(
 
 export async function assessCloudflareIdentity(
   client: Pick<
-    CloudflareApiClient,
+    CloudflareReader,
     "getResolvedConfig" | "verifyCurrentToken" | "listAccounts" | "listMembers" | "listAccessApplications" | "listAccessPolicies" | "listIdentityProviders" | "listUserTokens" | "listZones"
-  >,
-  options: {
-    maxSuperAdmins?: number;
-    memberLimit?: number;
-    tokenLimit?: number;
-    zoneLimit?: number;
-  } = {},
+  > & Partial<Pick<CloudflareReader, "getUserToken" | "listAccountTokens">>,
+  options: AssessmentOptions = {},
 ): Promise<CloudflareAssessmentResult> {
   const config = client.getResolvedConfig();
+  const now = new Date();
   const maxSuperAdmins = clampNumber(options.maxSuperAdmins, DEFAULT_MAX_SUPER_ADMINS, 0, 100);
   const memberLimit = clampNumber(options.memberLimit, DEFAULT_MEMBER_LIMIT, 1, 5000);
   const tokenLimit = clampNumber(options.tokenLimit, DEFAULT_TOKEN_LIMIT, 1, 5000);
   const zoneLimit = clampNumber(options.zoneLimit, DEFAULT_ZONE_LIMIT, 1, 500);
+  const errors: string[] = [];
+  const recordError = <T>(label: string, outcome: ReadOutcome<T>): void => {
+    if (!outcome.ok) errors.push(`${label}: ${outcome.error}`);
+  };
 
-  const [verify, accounts, zones, tokens] = await Promise.all([
-    client.verifyCurrentToken().catch(() => null),
-    client.listAccounts(),
-    client.listZones(zoneLimit),
-    client.listUserTokens(tokenLimit).catch(() => []),
+  const [verify, accounts, zones, userTokens] = await Promise.all([
+    attempt(() => client.verifyCurrentToken()),
+    attemptList(() => client.listAccounts()),
+    attemptList(() => client.listZones(zoneLimit)),
+    attemptList(() => client.listUserTokens(tokenLimit)),
   ]);
-  const { accountId, note } = deriveAccountContext(config, accounts);
+  recordError("/user/tokens/verify", verify);
+  recordError("/accounts", accounts);
+  recordError("/zones", zones);
+  recordError("/user/tokens", userTokens);
+  const { accountId, note } = deriveAccountContext(config, listOrEmpty(accounts).items);
 
-  const [members, accessApps, accessPolicies, identityProviders] = accountId
+  const [members, accessApps, accessPolicies, identityProviders, accountTokens] = accountId
     ? await Promise.all([
-      client.listMembers(accountId, memberLimit).catch(() => []),
-      client.listAccessApplications(accountId).catch(() => []),
-      client.listAccessPolicies(accountId).catch(() => []),
-      client.listIdentityProviders(accountId).catch(() => []),
+      attemptList(() => client.listMembers(accountId, memberLimit)),
+      attemptList(() => client.listAccessApplications(accountId)),
+      attemptList(() => client.listAccessPolicies(accountId)),
+      attemptList(() => client.listIdentityProviders(accountId)),
+      client.listAccountTokens
+        ? attemptList(() => client.listAccountTokens!(accountId, tokenLimit))
+        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: true, value: { items: [], truncated: false, totalCount: 0 } }),
     ])
-    : [[], [], [], []];
+    : [undefined, undefined, undefined, undefined, undefined];
+  if (accountId) {
+    recordError(`/accounts/${accountId}/members`, members!);
+    recordError(`/accounts/${accountId}/access/apps`, accessApps!);
+    recordError(`/accounts/${accountId}/access/policies`, accessPolicies!);
+    recordError(`/accounts/${accountId}/access/identity_providers`, identityProviders!);
+    recordError(`/accounts/${accountId}/tokens`, accountTokens!);
+  }
 
-  const verifiedPolicies = extractPolicies(verify);
-  const verifiedStatus = extractTokenStatus(verify)?.toLowerCase();
-  const superAdmins = members.filter((member) =>
+  const verified = verify.ok ? verify.value : null;
+  const verifiedStatus = asString(verified?.status)?.toLowerCase();
+  const verifiedId = asString(verified?.id);
+  const tokenDetails = verifiedId && client.getUserToken
+    ? await attempt(() => client.getUserToken!(verifiedId))
+    : undefined;
+  if (tokenDetails) recordError(`/user/tokens/${verifiedId}`, tokenDetails);
+  const policies = tokenDetails?.ok ? asRecordArray(tokenDetails.value?.policies) : [];
+
+  const findings: CloudflareFinding[] = [];
+
+  findings.push(finding(
+    "CF-IAM-01",
+    "API credential type",
+    "high",
+    config.authMethod === "token" ? "pass" : "fail",
+    config.authMethod === "token"
+      ? "Cloudflare access is using an API token rather than a legacy Global API Key."
+      : "Cloudflare access is using a legacy Global API Key; move to a scoped API token.",
+    12,
+    { auth_method: config.authMethod },
+  ));
+
+  if (config.authMethod !== "token") {
+    findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
+      "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.", 12,
+      { auth_method: config.authMethod }));
+  } else if (!verify.ok) {
+    findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
+      manualReason("/user/tokens/verify", "any valid API token (verify needs no extra permission)", "the token status and permission groups from the dashboard", verify.error), 12,
+      { error: verify.error }));
+  } else if (verifiedStatus !== "active") {
+    findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "fail",
+      `The active API token reported status ${verifiedStatus ?? "unknown"} instead of active.`, 12,
+      { verified_status: verifiedStatus ?? null }));
+  } else if (!tokenDetails || !tokenDetails.ok) {
+    findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
+      manualReason(`/user/tokens/${verifiedId ?? "{token_id}"}`, "User API Tokens: Read", "the token permission groups and resource scope", tokenDetails && !tokenDetails.ok ? tokenDetails.error : "token details unavailable"), 12,
+      { verified_status: verifiedStatus, token_id: verifiedId ?? null }));
+  } else {
+    const broadPolicies = policies.filter((policy) => {
+      const resources = asObject(policy.resources) ?? {};
+      return Object.keys(resources).some((key) => /^com\.cloudflare\.api\.account\.zone\.\*$|^com\.cloudflare\.api\.account\.\*$|^com\.cloudflare\.api\.user\.\*$/.test(key));
+    });
+    const permissionGroups = policies.flatMap((policy) => asRecordArray(policy.permission_groups).map((group) => asString(group.name) ?? asString(group.id) ?? "unknown"));
+    const writeGroups = permissionGroups.filter((name) => /write|edit|admin/i.test(name));
+    const status: CloudflareFindingStatus = policies.length === 0 ? "fail" : writeGroups.length > 0 ? "warn" : "pass";
+    findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", status,
+      policies.length === 0
+        ? "The active token verified as active but exposes no policies; confirm its scope manually."
+        : writeGroups.length > 0
+          ? `The active token is active but carries ${writeGroups.length} write-capable permission groups (${writeGroups.slice(0, 5).join(", ")}); audit tokens should be read-only.`
+          : `The active token is active with ${permissionGroups.length} read-only permission groups across ${policies.length} policies.`,
+      12,
+      { verified_status: verifiedStatus, policies: policies.length, permission_groups: permissionGroups.slice(0, 50), write_capable_groups: writeGroups.slice(0, 50), broad_resource_policies: broadPolicies.length, expires_on: asString(verified?.expires_on) ?? null }));
+  }
+
+  const tokenSources: Array<{ label: string; outcome: ReadOutcome<CloudflarePagedList> | undefined }> = [
+    { label: "/user/tokens", outcome: userTokens },
+    { label: `/accounts/${accountId ?? "{account_id}"}/tokens`, outcome: accountTokens },
+  ];
+  const readableTokenLists = tokenSources.filter((source) => source.outcome?.ok);
+  const failedTokenLists = tokenSources.filter((source) => source.outcome && !source.outcome.ok);
+  const allTokens = readableTokenLists.flatMap((source) => listOrEmpty(source.outcome!).items);
+  const truncatedTokenLists = readableTokenLists.filter((source) => listOrEmpty(source.outcome!).truncated);
+  const activeTokens = allTokens.filter((token) => asString(token.status) === "active");
+  const tokensWithoutExpiry = activeTokens.filter((token) => !asDate(token.expires_on));
+  const expiredButActive = activeTokens.filter((token) => {
+    const expires = asDate(token.expires_on);
+    return expires !== undefined && expires.getTime() < now.getTime();
+  });
+  const unknownStatusTokens = allTokens.filter((token) => !["active", "disabled", "expired"].includes(asString(token.status) ?? ""));
+  const neverUsedTokens = activeTokens.filter((token) => !asDate(token.last_used_on));
+
+  let tokenExpiryStatus: CloudflareFindingStatus;
+  let tokenExpirySummary: string;
+  if (readableTokenLists.length === 0) {
+    tokenExpiryStatus = "manual";
+    tokenExpirySummary = manualReason("/user/tokens and /accounts/{account_id}/tokens", "User API Tokens: Read and Account API Tokens: Read", "the API token inventory with expiry dates", failedTokenLists.map((source) => source.outcome && !source.outcome.ok ? source.outcome.error : "").filter(Boolean).join("; ") || "no token list readable");
+  } else if (allTokens.length === 0) {
+    tokenExpiryStatus = "manual";
+    tokenExpirySummary = "No API tokens were visible to this principal even though it authenticates with one; the inventory is scoped to other users or accounts. Manual review: export the token list from the dashboard (My Profile > API Tokens and Manage Account > API Tokens).";
+  } else if (tokensWithoutExpiry.length > 0 || expiredButActive.length > 0) {
+    tokenExpiryStatus = "fail";
+    tokenExpirySummary = `${tokensWithoutExpiry.length} of ${activeTokens.length} active API tokens have no expires_on date${expiredButActive.length > 0 ? ` and ${expiredButActive.length} report active past their expiry` : ""}.`;
+  } else if (unknownStatusTokens.length > 0 || truncatedTokenLists.length > 0 || failedTokenLists.length > 0) {
+    tokenExpiryStatus = "warn";
+    tokenExpirySummary = `${activeTokens.length} active tokens all carry expiry dates, but ${unknownStatusTokens.length} tokens have an undocumented status${truncatedTokenLists.length > 0 ? `, the token list was truncated (${truncatedTokenLists.map((source) => `${source.label}: ${listOrEmpty(source.outcome!).items.length} seen of ${listOrEmpty(source.outcome!).totalCount ?? "unknown"}`).join("; ")})` : ""}${failedTokenLists.length > 0 ? `, and ${failedTokenLists.map((source) => source.label).join(", ")} could not be read` : ""}.`;
+  } else {
+    tokenExpiryStatus = "pass";
+    tokenExpirySummary = `All ${activeTokens.length} active API tokens carry an expires_on date (${allTokens.length} tokens inventoried).`;
+  }
+  findings.push(finding("CF-IAM-06", "API token expiration", "medium", tokenExpiryStatus, tokenExpirySummary, 13, {
+    tokens_seen: allTokens.length,
+    active_tokens: activeTokens.length,
+    tokens_without_expiry: tokensWithoutExpiry.slice(0, 50).map((token) => asString(token.name) ?? asString(token.id) ?? "unknown"),
+    active_past_expiry: expiredButActive.length,
+    never_used_active_tokens: neverUsedTokens.length,
+    sources: tokenSources.map((source) => ({
+      endpoint: source.label,
+      readable: source.outcome?.ok ?? false,
+      seen: source.outcome?.ok ? source.outcome.value.items.length : 0,
+      total: source.outcome?.ok ? source.outcome.value.totalCount ?? null : null,
+      truncated: source.outcome?.ok ? source.outcome.value.truncated : false,
+    })),
+  }));
+
+  const memberList = members ? listOrEmpty(members) : undefined;
+  const superAdmins = (memberList?.items ?? []).filter((member) =>
     collectMemberRoleNames(member).some((role) => /super/i.test(role) && /admin/i.test(role)),
   );
-  const tokensWithoutExpiry = tokens.filter((token) => !asString(token.expires_on) && !asString(token.expires_at));
-  const tokenCoverageSufficient =
-    config.authMethod === "token"
-    && verifiedStatus === "active"
-    && (verifiedPolicies.length > 0 || tokens.length > 0);
-  const accessCoverageGood = accessApps.length > 0 && accessPolicies.length > 0;
+  const membersWithout2fa = (memberList?.items ?? []).filter((member) => asBoolean(asObject(member.user)?.two_factor_authentication_enabled) === false);
+  const membersPartial = memberList ? partialInventoryNote("member", memberList) : undefined;
+  let memberStatus: CloudflareFindingStatus;
+  let memberSummary: string;
+  if (!accountId) {
+    memberStatus = "manual";
+    memberSummary = `${note} Collect the member list from Manage Account > Members.`;
+  } else if (!members || !members.ok) {
+    memberStatus = "manual";
+    memberSummary = manualReason(`/accounts/${accountId}/members`, "Account Settings: Read", "the account member and role list", members && !members.ok ? members.error : undefined);
+  } else if (memberList!.items.length === 0) {
+    memberStatus = "manual";
+    memberSummary = "The member list returned zero members, which cannot be right for an account with an authenticated principal; confirm the token can list members and review roles manually.";
+  } else if (superAdmins.length > maxSuperAdmins) {
+    memberStatus = "fail";
+    memberSummary = `${superAdmins.length} Super Administrator assignments exceeded the configured threshold of ${maxSuperAdmins}.${membersPartial ? ` ${membersPartial}` : ""}`;
+  } else {
+    memberStatus = membersPartial || membersWithout2fa.length > 0 ? "warn" : "pass";
+    memberSummary = `${superAdmins.length} Super Administrator assignments across ${memberList!.items.length} members, within the threshold of ${maxSuperAdmins}.${membersWithout2fa.length > 0 ? ` ${membersWithout2fa.length} members have two_factor_authentication_enabled false.` : ""}${membersPartial ? ` ${membersPartial}` : ""}`;
+  }
+  findings.push(finding("CF-IAM-03", "Account member privilege concentration", "medium", memberStatus, memberSummary, 14, {
+    account_id: accountId ?? null,
+    super_admins: superAdmins.length,
+    members_seen: memberList?.items.length ?? 0,
+    members_total: memberList?.totalCount ?? null,
+    members_without_2fa: membersWithout2fa.length,
+  }));
 
-  const findings = [
-    finding(
-      "CF-IAM-01",
-      "API credential type",
-      "high",
-      config.authMethod === "token" ? "pass" : "fail",
-      config.authMethod === "token"
-        ? "Cloudflare access is using an API token rather than a legacy Global API Key."
-        : "Cloudflare access is using a legacy Global API Key; move to a scoped API token.",
-      ["FedRAMP AC-6", "SOC 2 CC6.1", "PCI-DSS 7.2.1", "CIS 5.1"],
-      { auth_method: config.authMethod },
-    ),
-    finding(
-      "CF-IAM-02",
-      "Current token verification and scoping",
-      "high",
-      tokenCoverageSufficient ? "pass" : config.authMethod === "global_key" ? "warn" : "fail",
-      tokenCoverageSufficient
-        ? `The active API token verified successfully with ${verifiedPolicies.length || tokens.length} visible policy entries.`
-        : config.authMethod === "global_key"
-          ? "Global API Key auth bypasses token verification; a scoped token is preferred."
-          : "The active API token could not be verified as active and scoped from the available Cloudflare metadata.",
-      ["FedRAMP AC-3", "FedRAMP IA-5", "SOC 2 CC6.2", "CIS 5.2"],
-      { verified_status: verifiedStatus ?? null, verified_policies: verifiedPolicies.length, tokens_without_expiry: tokensWithoutExpiry.length },
-    ),
-    finding(
-      "CF-IAM-03",
-      "Account member privilege concentration",
-      "medium",
-      !accountId ? "warn" : superAdmins.length <= maxSuperAdmins ? "pass" : "warn",
-      !accountId
-        ? note
-        : superAdmins.length <= maxSuperAdmins
-          ? `${superAdmins.length} Super Administrator assignments were visible, within the configured threshold of ${maxSuperAdmins}.`
-          : `${superAdmins.length} Super Administrator assignments exceeded the configured threshold of ${maxSuperAdmins}.`,
-      ["FedRAMP AC-2", "FedRAMP AC-6", "SOC 2 CC6.3", "CIS 6.1"],
-      { account_id: accountId ?? null, super_admins: superAdmins.length, member_count: members.length },
-    ),
-    finding(
-      "CF-IAM-04",
-      "Zero Trust Access app and policy coverage",
-      "high",
-      !accountId ? "warn" : accessCoverageGood ? "pass" : "warn",
-      !accountId
-        ? note
-        : accessCoverageGood
-          ? `${accessApps.length} Access apps and ${accessPolicies.length} Access policies were visible for the sampled account.`
-          : `Zero Trust Access coverage looked thin with ${accessApps.length} apps and ${accessPolicies.length} policies across ${zones.length} sampled zones.`,
-      ["FedRAMP AC-3", "SOC 2 CC6.1", "CMMC 3.1.2", "CIS 1.1"],
-      { access_apps: accessApps.length, access_policies: accessPolicies.length, sampled_zones: zones.length },
-    ),
-    finding(
-      "CF-IAM-05",
-      "Zero Trust identity provider coverage",
-      "medium",
-      !accountId ? "warn" : identityProviders.length > 0 ? "pass" : "warn",
-      !accountId
-        ? note
-        : identityProviders.length > 0
-          ? `${identityProviders.length} Zero Trust identity providers were visible for the sampled account.`
-          : "No Zero Trust identity providers were visible for the sampled account.",
-      ["FedRAMP IA-2", "SOC 2 CC6.1", "PCI-DSS 8.3.1", "CIS 1.2"],
-      { identity_providers: identityProviders.length },
-    ),
-  ];
+  const apps = accessApps ? listOrEmpty(accessApps) : undefined;
+  const reusablePolicies = accessPolicies ? listOrEmpty(accessPolicies) : undefined;
+  const inlinePolicies = (apps?.items ?? []).flatMap((app) => asRecordArray(app.policies));
+  const allPolicies = [...inlinePolicies, ...(reusablePolicies?.items ?? [])];
+  const bypassPolicies = allPolicies.filter((policy) => asString(policy.decision) === "bypass");
+  const appsWithoutPolicies = (apps?.items ?? []).filter((app) => {
+    const type = asString(app.type);
+    return asRecordArray(app.policies).length === 0 && type !== "app_launcher" && type !== "warp" && type !== "biso";
+  });
+  let accessStatus: CloudflareFindingStatus;
+  let accessSummary: string;
+  if (!accountId) {
+    accessStatus = "manual";
+    accessSummary = `${note} Review Zero Trust > Access > Applications manually.`;
+  } else if (!accessApps || !accessApps.ok) {
+    accessStatus = "manual";
+    accessSummary = manualReason(`/accounts/${accountId}/access/apps`, "Access: Apps and Policies: Read", "the Access application and policy inventory", accessApps && !accessApps.ok ? accessApps.error : undefined);
+  } else if (apps!.items.length === 0) {
+    accessStatus = "manual";
+    accessSummary = "No Access applications exist; if the account uses Zero Trust, confirm the Access subscription and app inventory manually. Zero apps cannot be judged compliant by default.";
+  } else if (bypassPolicies.length > 0 || appsWithoutPolicies.length > 0) {
+    accessStatus = "fail";
+    accessSummary = `${bypassPolicies.length} Access policies use decision bypass and ${appsWithoutPolicies.length} applications have no attached policy.`;
+  } else {
+    const partial = partialInventoryNote("Access application", apps!);
+    accessStatus = partial ? "warn" : "pass";
+    accessSummary = `${apps!.items.length} Access applications carry ${allPolicies.length} policies (allow, deny, or non_identity), none with bypass.${partial ? ` ${partial}` : ""}`;
+  }
+  findings.push(finding("CF-IAM-04", "Zero Trust Access app and policy coverage", "high", accessStatus, accessSummary, 9, {
+    access_apps: apps?.items.length ?? 0,
+    access_apps_total: apps?.totalCount ?? null,
+    inline_policies: inlinePolicies.length,
+    reusable_policies: reusablePolicies?.items.length ?? 0,
+    bypass_policies: bypassPolicies.length,
+    apps_without_policies: appsWithoutPolicies.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "unknown"),
+  }));
 
+  const idps = identityProviders ? listOrEmpty(identityProviders) : undefined;
+  const idpTypes = (idps?.items ?? []).map((idp) => asString(idp.type) ?? "unknown");
+  const weakIdpTypes = idpTypes.filter((type) => type === "onetimepin");
+  let idpStatus: CloudflareFindingStatus;
+  let idpSummary: string;
+  if (!accountId) {
+    idpStatus = "manual";
+    idpSummary = `${note} Review Zero Trust > Settings > Authentication manually.`;
+  } else if (!identityProviders || !identityProviders.ok) {
+    idpStatus = "manual";
+    idpSummary = manualReason(`/accounts/${accountId}/access/identity_providers`, "Access: Organizations, Identity Providers, and Groups: Read", "the identity provider list", identityProviders && !identityProviders.ok ? identityProviders.error : undefined);
+  } else if (idps!.items.length === 0) {
+    idpStatus = "fail";
+    idpSummary = "No Zero Trust identity providers are configured, so Access cannot enforce SSO or MFA-backed identity.";
+  } else if (weakIdpTypes.length === idpTypes.length) {
+    idpStatus = "fail";
+    idpSummary = "Only the One-time PIN identity provider is configured; add an SSO or MFA-capable provider.";
+  } else {
+    idpStatus = weakIdpTypes.length > 0 ? "warn" : "pass";
+    idpSummary = `${idpTypes.length} identity providers configured (${[...new Set(idpTypes)].join(", ")})${weakIdpTypes.length > 0 ? "; One-time PIN remains enabled alongside SSO providers" : ""}.`;
+  }
+  findings.push(finding("CF-IAM-05", "Zero Trust identity provider coverage", "medium", idpStatus, idpSummary, 10, {
+    identity_providers: idpTypes.length,
+    identity_provider_types: [...new Set(idpTypes)],
+  }));
+
+  const zoneList = listOrEmpty(zones);
   return {
     title: "Cloudflare identity posture",
     summary: {
       auth_method: config.authMethod,
       account_id: accountId ?? null,
-      visible_accounts: accounts.length,
-      sampled_zones: zones.length,
+      visible_accounts: listOrEmpty(accounts).items.length,
+      sampled_zones: zoneList.items.length,
       super_admins: superAdmins.length,
-      access_apps: accessApps.length,
-      access_policies: accessPolicies.length,
-      identity_providers: identityProviders.length,
+      access_apps: apps?.items.length ?? 0,
+      access_policies: allPolicies.length,
+      identity_providers: idpTypes.length,
+      tokens_seen: allTokens.length,
       tokens_without_expiry: tokensWithoutExpiry.length,
+      manual_findings: findings.filter((item) => item.status === "manual").length,
     },
     findings,
+    errors,
   };
 }
 
 export async function assessCloudflareZoneSecurity(
   client: Pick<
-    CloudflareApiClient,
+    CloudflareReader,
     "listZones" | "getZoneSettings" | "getDnssec" | "listFirewallRules" | "listZoneRulesets" | "getUniversalSslSettings"
-  >,
-  options: {
-    zoneLimit?: number;
-  } = {},
+  > & Partial<Pick<CloudflareReader, "getZoneEntrypointRuleset" | "listDnsRecords" | "listCertificatePacks" | "getOriginTlsClientAuthSettings">>,
+  options: AssessmentOptions = {},
 ): Promise<CloudflareAssessmentResult> {
   const zoneLimit = clampNumber(options.zoneLimit, DEFAULT_ZONE_LIMIT, 1, 500);
-  const zones = await client.listZones(zoneLimit);
+  const now = new Date();
+  const errors: string[] = [];
+  const zonesOutcome = await attemptList(() => client.listZones(zoneLimit));
+  if (!zonesOutcome.ok) errors.push(`/zones: ${zonesOutcome.error}`);
+  const zones = listOrEmpty(zonesOutcome);
 
-  const strictSslGaps: string[] = [];
-  const minTlsGaps: string[] = [];
-  const httpsHstsGaps: string[] = [];
-  const dnssecSslGaps: string[] = [];
-  const managedProtectionGaps: string[] = [];
+  const managedWaf: ZoneVerdict[] = [];
+  const customWaf: ZoneVerdict[] = [];
+  const ddos: ZoneVerdict[] = [];
+  const strictSsl: ZoneVerdict[] = [];
+  const minTls: ZoneVerdict[] = [];
+  const hsts: ZoneVerdict[] = [];
+  const alwaysHttps: ZoneVerdict[] = [];
+  const httpsRewrites: ZoneVerdict[] = [];
+  const dnssec: ZoneVerdict[] = [];
+  const universalSsl: ZoneVerdict[] = [];
+  const originPulls: ZoneVerdict[] = [];
+  const browserCheck: ZoneVerdict[] = [];
+  const emailObfuscation: ZoneVerdict[] = [];
+  const securityHeaders: ZoneVerdict[] = [];
+  const dnsExposure: ZoneVerdict[] = [];
+  let legacyFirewallRulesSeen = 0;
 
-  for (const zone of zones) {
+  const entrypoint = (zoneId: string, phase: string): Promise<ReadOutcome<JsonRecord | null>> =>
+    client.getZoneEntrypointRuleset
+      ? attempt(() => client.getZoneEntrypointRuleset!(zoneId, phase))
+      : Promise.resolve({ ok: false, error: "entry point ruleset reader unavailable" });
+
+  for (const zone of zones.items) {
     const zoneId = asString(zone.id);
     if (!zoneId) continue;
-    const [settings, dnssec, firewallRules, rulesets, universalSsl] = await Promise.all([
-      client.getZoneSettings(zoneId).catch(() => []),
-      client.getDnssec(zoneId).catch(() => null),
-      client.listFirewallRules(zoneId).catch(() => []),
-      client.listZoneRulesets(zoneId).catch(() => []),
-      client.getUniversalSslSettings(zoneId).catch(() => null),
-    ]);
-    const settingsById = settingMap(settings);
     const name = zoneName(zone);
+    const zoneErrors = (label: string, outcome: ReadOutcome<unknown>): void => {
+      if (!outcome.ok) errors.push(`${name} ${label}: ${outcome.error}`);
+    };
 
-    if (!isStrictSsl(settingsById.get("ssl"))) {
-      strictSslGaps.push(name);
-    }
-    if (!minTlsAtLeast12(settingsById.get("min_tls_version"))) {
-      minTlsGaps.push(name);
+    const [settingsOutcome, dnssecOutcome, managedOutcome, customOutcome, ddosOutcome, headersOutcome, universalOutcome, originOutcome, certPacksOutcome, dnsOutcome] = await Promise.all([
+      attempt(() => client.getZoneSettings(zoneId)),
+      attempt(() => client.getDnssec(zoneId)),
+      entrypoint(zoneId, CLOUDFLARE_RULESET_PHASES.firewallManaged),
+      entrypoint(zoneId, CLOUDFLARE_RULESET_PHASES.firewallCustom),
+      entrypoint(zoneId, CLOUDFLARE_RULESET_PHASES.ddosL7),
+      entrypoint(zoneId, CLOUDFLARE_RULESET_PHASES.responseHeadersTransform),
+      attempt(() => client.getUniversalSslSettings(zoneId)),
+      client.getOriginTlsClientAuthSettings
+        ? attempt(() => client.getOriginTlsClientAuthSettings!(zoneId))
+        : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "origin TLS client auth reader unavailable" }),
+      client.listCertificatePacks
+        ? attemptList(() => client.listCertificatePacks!(zoneId))
+        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "certificate pack reader unavailable" }),
+      client.listDnsRecords
+        ? attemptList(() => client.listDnsRecords!(zoneId))
+        : Promise.resolve<ReadOutcome<CloudflarePagedList>>({ ok: false, error: "DNS record reader unavailable" }),
+    ]);
+    zoneErrors("zone settings", settingsOutcome);
+    zoneErrors("/dnssec", dnssecOutcome);
+    zoneErrors(`/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.firewallManaged}/entrypoint`, managedOutcome);
+    zoneErrors(`/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.firewallCustom}/entrypoint`, customOutcome);
+    zoneErrors(`/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.ddosL7}/entrypoint`, ddosOutcome);
+    zoneErrors(`/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.responseHeadersTransform}/entrypoint`, headersOutcome);
+    zoneErrors("/ssl/universal/settings", universalOutcome);
+    zoneErrors("/origin_tls_client_auth/settings", originOutcome);
+    zoneErrors("/ssl/certificate_packs", certPacksOutcome);
+    zoneErrors("/dns_records", dnsOutcome);
+
+    const settings = settingMap(settingsOutcome.ok ? settingsOutcome.value : []);
+    if (!settingsOutcome.ok) {
+      for (const settingId of CLOUDFLARE_ZONE_SETTING_IDS) settings.set(settingId, { error: settingsOutcome.error });
     }
 
-    const httpsOkay = isEnabled(settingsById.get("always_use_https")) && isEnabled(settingsById.get("automatic_https_rewrites"));
-    const hstsOkay = hstsEnabled(settingsById.get("security_header"));
-    if (!(httpsOkay && hstsOkay)) {
-      httpsHstsGaps.push(name);
+    if (!managedOutcome.ok) {
+      const legacy = await attemptList(() => client.listFirewallRules(zoneId));
+      if (legacy.ok) legacyFirewallRulesSeen += legacy.value.items.length;
+    }
+    managedWaf.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.firewallManaged, managedOutcome, judgeManagedWaf, "Zone WAF: Read"));
+    customWaf.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.firewallCustom, customOutcome, judgeCustomWaf, "Zone WAF: Read"));
+    ddos.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.ddosL7, ddosOutcome, judgeDdosL7, "Zone WAF: Read"));
+    securityHeaders.push(entrypointVerdict(name, CLOUDFLARE_RULESET_PHASES.responseHeadersTransform, headersOutcome, judgeSecurityHeaders, "Transform Rules: Read"));
+
+    strictSsl.push(settingVerdict(name, settings, "ssl", (value) => {
+      const mode = asString(value);
+      if (mode === "strict") return { status: "pass", detail: "SSL mode is Full (Strict)." };
+      if (mode === "full" || mode === "origin_pull") return { status: "warn", detail: `SSL mode is ${mode}, which does not validate the origin certificate chain.` };
+      if (mode === "flexible" || mode === "off") return { status: "fail", detail: `SSL mode is ${mode}.` };
+      return { status: "manual", detail: `SSL mode returned an undocumented value (${String(mode ?? "null")}).` };
+    }));
+    minTls.push(settingVerdict(name, settings, "min_tls_version", (value) => {
+      const version = asString(value);
+      if (version === "1.2" || version === "1.3") return { status: "pass", detail: `Minimum TLS version is ${version}.` };
+      if (version === "1.0" || version === "1.1") return { status: "fail", detail: `Minimum TLS version is ${version}.` };
+      return { status: "manual", detail: `min_tls_version returned an undocumented value (${String(version ?? "null")}).` };
+    }));
+    hsts.push(settingVerdict(name, settings, "security_header", (value) => {
+      const sts = asObject(asObject(value)?.strict_transport_security);
+      if (!sts) return { status: "manual", detail: "security_header did not include strict_transport_security; confirm HSTS in SSL/TLS > Edge Certificates." };
+      const enabled = asBoolean(sts.enabled);
+      const maxAge = asNumber(sts.max_age);
+      if (enabled !== true) return { status: "fail", detail: "HSTS is not enabled." };
+      if (maxAge === undefined || maxAge < HSTS_MIN_MAX_AGE_SECONDS) return { status: "fail", detail: `HSTS max_age is ${maxAge ?? "unset"}, below ${HSTS_MIN_MAX_AGE_SECONDS} seconds.` };
+      if (asBoolean(sts.include_subdomains) !== true) return { status: "warn", detail: "HSTS is enabled without include_subdomains." };
+      if (asBoolean(sts.preload) !== true) return { status: "warn", detail: "HSTS is enabled with include_subdomains but without preload." };
+      return { status: "pass", detail: `HSTS enabled with max_age ${maxAge}, include_subdomains, and preload.` };
+    }));
+    alwaysHttps.push(settingVerdict(name, settings, "always_use_https", onOffJudge("Always Use HTTPS")));
+    httpsRewrites.push(settingVerdict(name, settings, "automatic_https_rewrites", onOffJudge("Automatic HTTPS Rewrites")));
+    browserCheck.push(settingVerdict(name, settings, "browser_check", onOffJudge("Browser Integrity Check")));
+    emailObfuscation.push(settingVerdict(name, settings, "email_obfuscation", onOffJudge("Email Address Obfuscation")));
+
+    if (!dnssecOutcome.ok) {
+      dnssec.push(verdict(name, "manual", manualReason("/zones/{zone_id}/dnssec", "DNS: Read", "the DNSSEC status", dnssecOutcome.error)));
+    } else {
+      const status = asString(dnssecOutcome.value?.status);
+      if (status === "active") dnssec.push(verdict(name, "pass", "DNSSEC status is active."));
+      else if (status === "pending" || status === "pending-disabled") dnssec.push(verdict(name, "warn", `DNSSEC status is ${status}; the DS record is not yet live at the registrar.`));
+      else if (status === "disabled" || status === "error") dnssec.push(verdict(name, "fail", `DNSSEC status is ${status}.`));
+      else dnssec.push(verdict(name, "manual", `DNSSEC status returned an undocumented value (${String(status ?? "null")}).`));
     }
 
-    const dnssecActive = /active/i.test(asString(dnssec?.status) ?? "");
-    const universalSslEnabled = isEnabled(universalSsl?.enabled ?? universalSsl?.value ?? universalSsl?.certificate_status);
-    if (!(dnssecActive && universalSslEnabled)) {
-      dnssecSslGaps.push(name);
+    if (!universalOutcome.ok) {
+      universalSsl.push(verdict(name, "manual", manualReason("/zones/{zone_id}/ssl/universal/settings", "SSL and Certificates: Read", "the Universal SSL status and edge certificate list", universalOutcome.error)));
+    } else if (asBoolean(universalOutcome.value?.enabled) !== true) {
+      universalSsl.push(verdict(name, "fail", "Universal SSL is disabled for the zone."));
+    } else if (!certPacksOutcome.ok) {
+      universalSsl.push(verdict(name, "manual", manualReason("/zones/{zone_id}/ssl/certificate_packs", "SSL and Certificates: Read", "the certificate pack status and expiry dates", certPacksOutcome.error)));
+    } else {
+      const packs = certPacksOutcome.value.items;
+      const activePacks = packs.filter((pack) => asString(pack.status) === "active");
+      const certificates = activePacks.flatMap((pack) => asRecordArray(pack.certificates));
+      const undatedCertificates = certificates.filter((certificate) => !asDate(certificate.expires_on));
+      const expiredCertificates = certificates.filter((certificate) => {
+        const expires = asDate(certificate.expires_on);
+        return expires !== undefined && expires.getTime() < now.getTime();
+      });
+      const expiringSoon = certificates.filter((certificate) => {
+        const expires = asDate(certificate.expires_on);
+        return expires !== undefined && expires.getTime() >= now.getTime() && daysBetween(now, expires) <= CERTIFICATE_EXPIRY_WARNING_DAYS;
+      });
+      if (packs.length === 0) universalSsl.push(verdict(name, "fail", "Universal SSL is enabled but no certificate packs exist for the zone."));
+      else if (activePacks.length === 0) universalSsl.push(verdict(name, "fail", `No certificate pack is active (statuses: ${[...new Set(packs.map((pack) => asString(pack.status) ?? "unknown"))].join(", ")}).`));
+      else if (expiredCertificates.length > 0) universalSsl.push(verdict(name, "fail", `${expiredCertificates.length} certificates in active packs are past expires_on.`));
+      else if (undatedCertificates.length > 0 || certificates.length === 0) universalSsl.push(verdict(name, "warn", `${activePacks.length} active certificate packs, but ${certificates.length === 0 ? "no certificate entries" : `${undatedCertificates.length} certificates without expires_on`} were returned, so validity cannot be confirmed.`));
+      else if (expiringSoon.length > 0) universalSsl.push(verdict(name, "warn", `${expiringSoon.length} certificates expire within ${CERTIFICATE_EXPIRY_WARNING_DAYS} days.`));
+      else if (certPacksOutcome.value.truncated) universalSsl.push(verdict(name, "warn", partialInventoryNote("certificate pack", certPacksOutcome.value) ?? "Certificate pack inventory was truncated."));
+      else universalSsl.push(verdict(name, "pass", `${activePacks.length} active certificate packs with ${certificates.length} valid certificates.`));
     }
 
-    if (!(firewallRules.length > 0 || rulesetsProvideManagedProtection(rulesets))) {
-      managedProtectionGaps.push(name);
+    const tlsClientAuth = settings.get("tls_client_auth");
+    if (!originOutcome.ok && (!tlsClientAuth || tlsClientAuth.error)) {
+      originPulls.push(verdict(name, "manual", manualReason("/zones/{zone_id}/origin_tls_client_auth/settings and /zones/{zone_id}/settings/tls_client_auth", "SSL and Certificates: Read plus Zone Settings: Read", "the Authenticated Origin Pulls status", originOutcome.error)));
+    } else {
+      const zoneLevelEnabled = originOutcome.ok ? asBoolean(originOutcome.value?.enabled) : undefined;
+      const settingOn = tlsClientAuth && !tlsClientAuth.error ? asString(tlsClientAuth.value) : undefined;
+      if (zoneLevelEnabled === true || settingOn === "on") {
+        originPulls.push(verdict(name, "pass", `Authenticated Origin Pulls enabled (zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}). Per-hostname status is not enumerable via the API and stays manual.`));
+      } else if (zoneLevelEnabled === false || settingOn === "off") {
+        originPulls.push(verdict(name, "fail", `Authenticated Origin Pulls disabled (zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}).`));
+      } else {
+        originPulls.push(verdict(name, "manual", "Authenticated Origin Pulls status returned undocumented values; confirm under SSL/TLS > Origin Server."));
+      }
+    }
+
+    if (!dnsOutcome.ok) {
+      dnsExposure.push(verdict(name, "manual", manualReason("/zones/{zone_id}/dns_records", "DNS: Read", "the DNS record export", dnsOutcome.error)));
+    } else {
+      const records = dnsOutcome.value.items;
+      const exposed = records.filter((record) => ["A", "AAAA", "CNAME"].includes(asString(record.type) ?? "") && asBoolean(record.proxied) === false && asBoolean(record.proxiable) !== false);
+      const partial = partialInventoryNote("DNS record", dnsOutcome.value);
+      if (records.length === 0) dnsExposure.push(verdict(name, "manual", "No DNS records were returned for the zone; confirm the zone is active and the token has DNS: Read."));
+      else if (exposed.length > 0) dnsExposure.push(verdict(name, "warn", `${exposed.length} of ${records.length} A/AAAA/CNAME records are unproxied and expose origin addresses (${exposed.slice(0, 5).map((record) => asString(record.name) ?? "?").join(", ")}).${partial ? ` ${partial}` : ""}`));
+      else if (partial) dnsExposure.push(verdict(name, "warn", partial));
+      else dnsExposure.push(verdict(name, "pass", `All ${records.length} proxiable records are proxied through Cloudflare.`));
     }
   }
 
+  const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone controls cannot be judged; grant Zone: Read or set account_id." };
   const findings = [
-    finding(
-      "CF-ZONE-01",
-      "Managed edge protection coverage",
-      "high",
-      managedProtectionGaps.length === 0 ? "pass" : "warn",
-      managedProtectionGaps.length === 0
-        ? "All sampled zones showed Cloudflare firewall rules or managed rulesets."
-        : `${managedProtectionGaps.length} sampled zones lacked visible firewall rules or managed rulesets.`,
-      ["FedRAMP SC-7", "SOC 2 CC6.6", "PCI-DSS 6.6", "CIS 9.1"],
-      { zones_without_managed_protection: managedProtectionGaps.slice(0, 25) },
-    ),
-    finding(
-      "CF-ZONE-02",
-      "SSL mode Full (Strict)",
-      "high",
-      strictSslGaps.length === 0 ? "pass" : "fail",
-      strictSslGaps.length === 0
-        ? "All sampled zones enforced Full (Strict) SSL mode."
-        : `${strictSslGaps.length} sampled zones were not enforcing Full (Strict) SSL mode.`,
-      ["FedRAMP SC-8", "SOC 2 CC6.7", "PCI-DSS 4.1", "CIS 3.1"],
-      { zones_without_strict_ssl: strictSslGaps.slice(0, 25) },
-    ),
-    finding(
-      "CF-ZONE-03",
-      "Minimum TLS version",
-      "medium",
-      minTlsGaps.length === 0 ? "pass" : "fail",
-      minTlsGaps.length === 0
-        ? "All sampled zones required TLS 1.2 or newer."
-        : `${minTlsGaps.length} sampled zones allowed a minimum TLS version below 1.2 or did not expose the setting.`,
-      ["FedRAMP SC-8(1)", "SOC 2 CC6.7", "PCI-DSS 4.1", "CIS 3.2"],
-      { zones_below_tls12: minTlsGaps.slice(0, 25) },
-    ),
-    finding(
-      "CF-ZONE-04",
-      "HTTPS and HSTS enforcement",
-      "medium",
-      httpsHstsGaps.length === 0 ? "pass" : "warn",
-      httpsHstsGaps.length === 0
-        ? "All sampled zones enforced Always Use HTTPS, HTTPS rewrites, and HSTS."
-        : `${httpsHstsGaps.length} sampled zones lacked full HTTPS and HSTS enforcement.`,
-      ["FedRAMP SC-8", "SOC 2 CC6.7", "PCI-DSS 4.1", "CIS 3.3"],
-      { zones_missing_https_hsts: httpsHstsGaps.slice(0, 25) },
-    ),
-    finding(
-      "CF-ZONE-05",
-      "DNSSEC and Universal SSL coverage",
-      "medium",
-      dnssecSslGaps.length === 0 ? "pass" : "warn",
-      dnssecSslGaps.length === 0
-        ? "All sampled zones had DNSSEC active and Universal SSL enabled."
-        : `${dnssecSslGaps.length} sampled zones were missing DNSSEC or Universal SSL coverage.`,
-      ["FedRAMP SC-20", "SOC 2 CC6.7", "CMMC 3.13.15", "CIS 3.4"],
-      { zones_missing_dnssec_or_universal_ssl: dnssecSslGaps.slice(0, 25) },
-    ),
+    aggregateZoneVerdicts("CF-ZONE-01", "WAF managed rulesets deployed", "high", 1, zones, managedWaf, {
+      ...emptyZones,
+      passDetail: "Every sampled zone executes an enabled WAF managed ruleset in http_request_firewall_managed",
+      extraEvidence: { legacy_firewall_rules_seen: legacyFirewallRulesSeen, legacy_fallback: "GET /zones/{zone_id}/firewall/rules is deprecated and consulted for evidence only when the rulesets API is unreadable." },
+    }),
+    aggregateZoneVerdicts("CF-ZONE-06", "WAF custom rules with blocking actions", "medium", 2, zones, customWaf, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has enabled custom WAF rules with block or challenge actions",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-07", "HTTP DDoS protection sensitivity", "high", 3, zones, ddos, {
+      ...emptyZones,
+      passDetail: "Every sampled zone keeps HTTP DDoS override sensitivity at default or medium",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-02", "SSL mode Full (Strict)", "high", 5, zones, strictSsl, {
+      ...emptyZones,
+      passDetail: "Every sampled zone enforces Full (Strict) SSL mode",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-03", "Minimum TLS version", "medium", 6, zones, minTls, {
+      ...emptyZones,
+      passDetail: "Every sampled zone requires TLS 1.2 or newer",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-04", "HSTS enforcement", "medium", 7, zones, hsts, {
+      ...emptyZones,
+      passDetail: "Every sampled zone enables HSTS with max_age of at least six months, include_subdomains, and preload",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-08", "Always Use HTTPS", "medium", 21, zones, alwaysHttps, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has Always Use HTTPS on",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-09", "Automatic HTTPS Rewrites", "low", 22, zones, httpsRewrites, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has Automatic HTTPS Rewrites on",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-05", "DNSSEC enabled", "medium", 8, zones, dnssec, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has DNSSEC status active",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-10", "Universal SSL and certificate validity", "medium", 25, zones, universalSsl, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has Universal SSL enabled with active, unexpired certificate packs",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-11", "Authenticated Origin Pulls", "medium", 18, zones, originPulls, {
+      ...emptyZones,
+      passDetail: "Every sampled zone enables Authenticated Origin Pulls at the zone level",
+      extraEvidence: { per_hostname_note: "GET /zones/{zone_id}/origin_tls_client_auth/hostnames/{hostname} requires a known hostname and has no list form, so hostname-level enablement is a manual check." },
+    }),
+    aggregateZoneVerdicts("CF-ZONE-12", "Browser Integrity Check", "low", 19, zones, browserCheck, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has Browser Integrity Check on",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-13", "Email Address Obfuscation", "low", 20, zones, emailObfuscation, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has Email Address Obfuscation on",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-14", "Security headers via transform rules", "medium", 23, zones, securityHeaders, {
+      ...emptyZones,
+      passDetail: "Every sampled zone sets CSP, X-Frame-Options, X-Content-Type-Options, and Referrer-Policy through http_response_headers_transform rules",
+    }),
+    aggregateZoneVerdicts("CF-ZONE-15", "DNS record origin exposure", "low", undefined, zones, dnsExposure, {
+      ...emptyZones,
+      passDetail: "Every sampled zone proxies all proxiable A/AAAA/CNAME records",
+    }),
   ];
 
   return {
     title: "Cloudflare zone security posture",
     summary: {
-      sampled_zones: zones.length,
-      zones_without_managed_protection: managedProtectionGaps.length,
-      zones_without_strict_ssl: strictSslGaps.length,
-      zones_below_tls12: minTlsGaps.length,
-      zones_missing_https_hsts: httpsHstsGaps.length,
-      zones_missing_dnssec_or_universal_ssl: dnssecSslGaps.length,
+      sampled_zones: zones.items.length,
+      zones_total: zones.totalCount ?? null,
+      zone_inventory_truncated: zones.truncated,
+      failing_findings: findings.filter((item) => item.status === "fail").length,
+      warning_findings: findings.filter((item) => item.status === "warn").length,
+      manual_findings: findings.filter((item) => item.status === "manual").length,
+      passing_findings: findings.filter((item) => item.status === "pass").length,
     },
     findings,
+    errors,
   };
 }
 
 export async function assessCloudflareTrafficControls(
   client: Pick<
-    CloudflareApiClient,
+    CloudflareReader,
     "getResolvedConfig" | "listAccounts" | "listZones" | "listRateLimits" | "listPageRules" | "getBotManagement" | "listAuditLogs" | "listGatewayRules" | "listIpAccessRules"
-  >,
-  options: {
-    zoneLimit?: number;
-    auditLimit?: number;
-  } = {},
+  > & Partial<Pick<CloudflareReader, "getZoneEntrypointRuleset">>,
+  options: AssessmentOptions = {},
 ): Promise<CloudflareAssessmentResult> {
   const config = client.getResolvedConfig();
+  const now = new Date();
   const zoneLimit = clampNumber(options.zoneLimit, DEFAULT_ZONE_LIMIT, 1, 500);
   const auditLimit = clampNumber(options.auditLimit, DEFAULT_AUDIT_LIMIT, 1, 5000);
+  const errors: string[] = [];
 
-  const [accounts, zones] = await Promise.all([
-    client.listAccounts(),
-    client.listZones(zoneLimit),
+  const [accountsOutcome, zonesOutcome] = await Promise.all([
+    attemptList(() => client.listAccounts()),
+    attemptList(() => client.listZones(zoneLimit)),
   ]);
-  const { accountId, note } = deriveAccountContext(config, accounts);
+  if (!accountsOutcome.ok) errors.push(`/accounts: ${accountsOutcome.error}`);
+  if (!zonesOutcome.ok) errors.push(`/zones: ${zonesOutcome.error}`);
+  const zones = listOrEmpty(zonesOutcome);
+  const { accountId, note } = deriveAccountContext(config, listOrEmpty(accountsOutcome).items);
 
-  const zonesWithoutRateLimits: string[] = [];
-  const riskyPageRuleZones: string[] = [];
-  const zonesWithoutBotControls: string[] = [];
+  const rateLimiting: ZoneVerdict[] = [];
+  const pageRules: ZoneVerdict[] = [];
+  const botControls: ZoneVerdict[] = [];
 
-  for (const zone of zones) {
+  for (const zone of zones.items) {
     const zoneId = asString(zone.id);
     if (!zoneId) continue;
-    const [rateLimits, pageRules, botManagement] = await Promise.all([
-      client.listRateLimits(zoneId).catch(() => []),
-      client.listPageRules(zoneId).catch(() => []),
-      client.getBotManagement(zoneId).catch(() => null),
-    ]);
     const name = zoneName(zone);
+    const [rateLimitRuleset, legacyRateLimits, pageRuleOutcome, botOutcome] = await Promise.all([
+      client.getZoneEntrypointRuleset
+        ? attempt(() => client.getZoneEntrypointRuleset!(zoneId, CLOUDFLARE_RULESET_PHASES.rateLimit))
+        : Promise.resolve<ReadOutcome<JsonRecord | null>>({ ok: false, error: "entry point ruleset reader unavailable" }),
+      attemptList(() => client.listRateLimits(zoneId)),
+      attemptList(() => client.listPageRules(zoneId)),
+      attempt(() => client.getBotManagement(zoneId)),
+    ]);
+    if (!rateLimitRuleset.ok) errors.push(`${name} /rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint: ${rateLimitRuleset.error}`);
+    if (!legacyRateLimits.ok) errors.push(`${name} /rate_limits: ${legacyRateLimits.error}`);
+    if (!pageRuleOutcome.ok) errors.push(`${name} /pagerules: ${pageRuleOutcome.error}`);
+    if (!botOutcome.ok) errors.push(`${name} /bot_management: ${botOutcome.error}`);
 
-    if (rateLimits.length === 0) {
-      zonesWithoutRateLimits.push(name);
+    const rulesetJudgement = rateLimitRuleset.ok ? judgeRateLimitRuleset(rateLimitRuleset.value) : undefined;
+    const legacyEnabled = legacyRateLimits.ok ? legacyRateLimits.value.items.filter((rule) => asBoolean(rule.disabled) !== true) : [];
+    if (rulesetJudgement) rateLimiting.push(verdict(name, rulesetJudgement.status, rulesetJudgement.detail));
+    else if (!rateLimitRuleset.ok && !legacyRateLimits.ok) rateLimiting.push(verdict(name, "manual", manualReason(`/zones/{zone_id}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint`, "Zone WAF: Read", "the rate limiting rule list", rateLimitRuleset.error)));
+    else if (legacyEnabled.length > 0) rateLimiting.push(verdict(name, "pass", `${legacyEnabled.length} enabled legacy rate limits (deprecated /rate_limits API); migrate them to http_ratelimit rules.`));
+    else if (!rateLimitRuleset.ok) rateLimiting.push(verdict(name, "manual", manualReason(`/zones/{zone_id}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint`, "Zone WAF: Read", "the rate limiting rule list", rateLimitRuleset.error)));
+    else rateLimiting.push(verdict(name, "fail", "No enabled rate limiting rules exist in http_ratelimit or the legacy rate limits API."));
+
+    if (!pageRuleOutcome.ok) pageRules.push(verdict(name, "manual", manualReason("/zones/{zone_id}/pagerules", "Page Rules: Read", "the page rule list", pageRuleOutcome.error)));
+    else {
+      const risky = pageRuleOutcome.value.items.filter(pageRuleIsRisky);
+      if (risky.length > 0) pageRules.push(verdict(name, "fail", `${risky.length} active page rules weaken security (disable_security, security_level essentially_off, ssl off/flexible, or cache_everything on sensitive paths).`));
+      else if (pageRuleOutcome.value.items.length === 0) pageRules.push(verdict(name, "pass", "No page rules exist; emptiness is compliant because no rule can weaken security."));
+      else pageRules.push(verdict(name, "pass", `${pageRuleOutcome.value.items.length} page rules, none security-degrading.`));
     }
-    if (pageRules.some(pageRuleIsRisky)) {
-      riskyPageRuleZones.push(name);
-    }
-    if (!botManagement || !Object.values(botManagement).some((value) => isEnabled(value))) {
-      zonesWithoutBotControls.push(name);
+
+    if (!botOutcome.ok) botControls.push(verdict(name, "manual", manualReason("/zones/{zone_id}/bot_management", "Bot Management: Read", "the Bot Fight Mode or Bot Management settings", botOutcome.error)));
+    else {
+      const judged = botManagementJudgement(botOutcome.value);
+      botControls.push(verdict(name, judged.status, judged.detail));
     }
   }
 
-  const [auditLogs, gatewayRules, ipAccessRules] = accountId
+  const [auditOutcome, gatewayOutcome, ipRulesOutcome] = accountId
     ? await Promise.all([
-      client.listAuditLogs(accountId, auditLimit).catch(() => []),
-      client.listGatewayRules(accountId).catch(() => []),
-      client.listIpAccessRules(accountId).catch(() => []),
+      attemptList(() => client.listAuditLogs(accountId, auditLimit)),
+      attemptList(() => client.listGatewayRules(accountId)),
+      attemptList(() => client.listIpAccessRules(accountId)),
     ])
-    : [[], [], []];
+    : [undefined, undefined, undefined];
+  if (accountId) {
+    if (!auditOutcome!.ok) errors.push(`/accounts/${accountId}/audit_logs: ${auditOutcome!.error}`);
+    if (!gatewayOutcome!.ok) errors.push(`/accounts/${accountId}/gateway/rules: ${gatewayOutcome!.error}`);
+    if (!ipRulesOutcome!.ok) errors.push(`/accounts/${accountId}/firewall/access_rules/rules: ${ipRulesOutcome!.error}`);
+  }
 
-  const findings = [
-    finding(
-      "CF-TRF-01",
-      "Rate limiting coverage",
-      "medium",
-      zonesWithoutRateLimits.length === 0 ? "pass" : "warn",
-      zonesWithoutRateLimits.length === 0
-        ? "All sampled zones exposed at least one rate limiting rule."
-        : `${zonesWithoutRateLimits.length} sampled zones did not expose rate limiting rules.`,
-      ["FedRAMP SC-5", "SOC 2 CC6.6", "PCI-DSS 6.5.10", "CIS 9.5"],
-      { zones_without_rate_limits: zonesWithoutRateLimits.slice(0, 25) },
-    ),
-    finding(
-      "CF-TRF-02",
-      "Page rule security regressions",
-      "medium",
-      riskyPageRuleZones.length === 0 ? "pass" : "warn",
-      riskyPageRuleZones.length === 0
-        ? "No risky page-rule patterns were visible in the sampled zones."
-        : `${riskyPageRuleZones.length} sampled zones had page rules that appeared to weaken security controls.`,
-      ["FedRAMP CM-6", "SOC 2 CC8.1", "PCI-DSS 2.2", "CIS 10.1"],
-      { zones_with_risky_page_rules: riskyPageRuleZones.slice(0, 25) },
-    ),
-    finding(
-      "CF-TRF-03",
-      "Bot and automated traffic controls",
-      "medium",
-      zonesWithoutBotControls.length === 0 ? "pass" : "warn",
-      zonesWithoutBotControls.length === 0
-        ? "All sampled zones exposed bot-management or comparable automated traffic controls."
-        : `${zonesWithoutBotControls.length} sampled zones did not expose bot-management style controls.`,
-      ["FedRAMP SC-7", "SOC 2 CC6.6", "PCI-DSS 6.6", "CIS 9.4"],
-      { zones_without_bot_controls: zonesWithoutBotControls.slice(0, 25) },
-    ),
-    finding(
-      "CF-TRF-04",
-      "Account audit log visibility",
-      "high",
-      !accountId ? "warn" : auditLogs.length > 0 ? "pass" : "warn",
-      !accountId
-        ? note
-        : auditLogs.length > 0
-          ? `${auditLogs.length} audit log events were visible for the sampled account.`
-          : "No account audit log events were visible for the sampled account.",
-      ["FedRAMP AU-2", "FedRAMP AU-6", "SOC 2 CC7.2", "PCI-DSS 10.2.1"],
-      { account_id: accountId ?? null, audit_logs: auditLogs.length },
-    ),
-    finding(
-      "CF-TRF-05",
-      "Gateway and IP access controls",
-      "medium",
-      !accountId ? "warn" : gatewayRules.length > 0 || ipAccessRules.length > 0 ? "pass" : "warn",
-      !accountId
-        ? note
-        : gatewayRules.length > 0 || ipAccessRules.length > 0
-          ? `${gatewayRules.length} Gateway rules and ${ipAccessRules.length} IP access rules were visible for the sampled account.`
-          : "No Gateway rules or IP access rules were visible for the sampled account.",
-      ["FedRAMP SC-7", "SOC 2 CC6.6", "PCI-DSS 1.3.2", "CIS 9.6"],
-      { gateway_rules: gatewayRules.length, ip_access_rules: ipAccessRules.length },
-    ),
+  const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone traffic controls cannot be judged; grant Zone: Read or set account_id." };
+  const findings: CloudflareFinding[] = [
+    aggregateZoneVerdicts("CF-TRF-01", "Rate limiting coverage", "medium", 16, zones, rateLimiting, {
+      ...emptyZones,
+      passDetail: "Every sampled zone has enabled rate limiting rules",
+    }),
+    aggregateZoneVerdicts("CF-TRF-02", "Page rule security regressions", "medium", 15, zones, pageRules, {
+      ...emptyZones,
+      passDetail: "No sampled zone has page rules that weaken security",
+    }),
+    aggregateZoneVerdicts("CF-TRF-03", "Bot and automated traffic controls", "medium", 4, zones, botControls, {
+      ...emptyZones,
+      passDetail: "Every sampled zone enforces Bot Fight Mode or Super Bot Fight Mode",
+    }),
   ];
+
+  const auditLogs = auditOutcome ? listOrEmpty(auditOutcome) : undefined;
+  if (!accountId) {
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", `${note} Export the audit log from Manage Account > Audit Log.`, 11, { account_id: null }));
+  } else if (!auditOutcome!.ok) {
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", manualReason(`/accounts/${accountId}/audit_logs`, "Account Settings: Read", `the last ${AUDIT_LOG_LOOKBACK_DAYS} days of audit log events`, auditOutcome!.error), 11, { account_id: accountId }));
+  } else if (auditLogs!.items.length === 0) {
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "manual", `No audit log events were returned for the last ${AUDIT_LOG_LOOKBACK_DAYS} days; Cloudflare always records account changes, so confirm visibility in Manage Account > Audit Log and check the token scope.`, 11, { account_id: accountId, audit_events: 0 }));
+  } else {
+    const newest = auditLogs!.items.map((event) => asDate(event.when)).filter((item): item is Date => Boolean(item)).sort((a, b) => b.getTime() - a.getTime())[0];
+    const failedActions = auditLogs!.items.filter((event) => asBoolean(asObject(event.action)?.result) === false).length;
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "pass", `${auditLogs!.items.length} audit log events were readable for the last ${AUDIT_LOG_LOOKBACK_DAYS} days${newest ? ` (newest ${newest.toISOString()})` : ""}; ${failedActions} recorded failed actions. Retention beyond the API window is a manual check.`, 11, {
+      account_id: accountId,
+      audit_events: auditLogs!.items.length,
+      newest_event: newest?.toISOString() ?? null,
+      failed_actions: failedActions,
+      truncated: auditLogs!.truncated,
+    }));
+  }
+
+  const ipRules = ipRulesOutcome ? listOrEmpty(ipRulesOutcome) : undefined;
+  if (!accountId) {
+    findings.push(finding("CF-TRF-05", "IP access rules", "medium", "manual", `${note} Review Security > WAF > Tools manually.`, 17, { account_id: null }));
+  } else if (!ipRulesOutcome!.ok) {
+    findings.push(finding("CF-TRF-05", "IP access rules", "medium", "manual", manualReason(`/accounts/${accountId}/firewall/access_rules/rules`, "Account Firewall Access Rules: Read", "the IP access rule list with notes and modified dates", ipRulesOutcome!.error), 17, { account_id: accountId }));
+  } else {
+    const stale = ipRules!.items.filter((rule) => {
+      const modified = asDate(rule.modified_on);
+      return modified === undefined || daysBetween(modified, now) > STALE_IP_RULE_DAYS;
+    });
+    const allowRules = ipRules!.items.filter((rule) => asString(rule.mode) === "whitelist");
+    const undocumented = ipRules!.items.filter((rule) => !asString(rule.notes));
+    const partial = partialInventoryNote("IP access rule", ipRules!);
+    const status: CloudflareFindingStatus = ipRules!.items.length === 0
+      ? "pass"
+      : stale.length > 0 || undocumented.length > 0 || partial
+        ? "warn"
+        : "pass";
+    findings.push(finding("CF-TRF-05", "IP access rules", "medium", status,
+      ipRules!.items.length === 0
+        ? "No account-level IP access rules exist; emptiness is compliant because there are no allowlist entries to go stale."
+        : `${ipRules!.items.length} IP access rules (${allowRules.length} allow, ${stale.length} unmodified for over ${STALE_IP_RULE_DAYS} days or undated, ${undocumented.length} without notes).${partial ? ` ${partial}` : ""}`,
+      17,
+      { account_id: accountId, ip_access_rules: ipRules!.items.length, allow_rules: allowRules.length, stale_rules: stale.length, rules_without_notes: undocumented.length, truncated: ipRules!.truncated }));
+  }
+
+  const gatewayRules = gatewayOutcome ? listOrEmpty(gatewayOutcome) : undefined;
+  if (!accountId) {
+    findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `${note} Review Zero Trust > Gateway > Firewall policies manually.`, 24, { account_id: null }));
+  } else if (!gatewayOutcome!.ok) {
+    findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", manualReason(`/accounts/${accountId}/gateway/rules`, "Zero Trust: Read", "the Gateway DNS and HTTP policy list", gatewayOutcome!.error), 24, { account_id: accountId }));
+  } else {
+    const enabled = gatewayRules!.items.filter((rule) => asBoolean(rule.enabled) !== false);
+    const filters = new Set(enabled.flatMap((rule) => asArray(rule.filters).map((item) => asString(item) ?? "")));
+    const blocking = enabled.filter((rule) => ["block", "isolate", "override", "quarantine"].includes(asString(rule.action) ?? ""));
+    if (gatewayRules!.items.length === 0) {
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", "No Gateway rules exist. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.", 24, { account_id: accountId, gateway_rules: 0 }));
+    } else if (blocking.length === 0 || !(filters.has("dns") || filters.has("http"))) {
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }));
+    } else {
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }));
+    }
+  }
 
   return {
     title: "Cloudflare traffic controls posture",
     summary: {
       account_id: accountId ?? null,
-      sampled_zones: zones.length,
-      zones_without_rate_limits: zonesWithoutRateLimits.length,
-      zones_with_risky_page_rules: riskyPageRuleZones.length,
-      zones_without_bot_controls: zonesWithoutBotControls.length,
-      audit_logs: auditLogs.length,
-      gateway_rules: gatewayRules.length,
-      ip_access_rules: ipAccessRules.length,
+      sampled_zones: zones.items.length,
+      zones_total: zones.totalCount ?? null,
+      audit_events: auditLogs?.items.length ?? 0,
+      gateway_rules: gatewayRules?.items.length ?? 0,
+      ip_access_rules: ipRules?.items.length ?? 0,
+      failing_findings: findings.filter((item) => item.status === "fail").length,
+      warning_findings: findings.filter((item) => item.status === "warn").length,
+      manual_findings: findings.filter((item) => item.status === "manual").length,
+      passing_findings: findings.filter((item) => item.status === "pass").length,
     },
     findings,
+    errors,
   };
 }
 
@@ -1245,49 +2056,120 @@ function formatAssessmentText(result: CloudflareAssessmentResult): string {
     summary,
     "",
     formatTable(["Control", "Severity", "Status", "Title", "Summary"], rows),
+    ...(result.errors.length > 0 ? ["", `Read errors (${result.errors.length}): see _errors.log in exported bundles.`] : []),
   ].join("\n");
 }
 
-function buildExecutiveSummary(config: CloudflareResolvedConfig, assessments: CloudflareAssessmentResult[]): string {
+function statusCounts(findings: CloudflareFinding[]): Record<CloudflareFindingStatus, number> {
+  return {
+    pass: findings.filter((item) => item.status === "pass").length,
+    warn: findings.filter((item) => item.status === "warn").length,
+    fail: findings.filter((item) => item.status === "fail").length,
+    manual: findings.filter((item) => item.status === "manual").length,
+  };
+}
+
+function buildExecutiveSummary(config: CloudflareResolvedConfig, assessments: CloudflareAssessmentResult[], generatedAt: string): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const failCount = findings.filter((item) => item.status === "fail").length;
-  const warnCount = findings.filter((item) => item.status === "warn").length;
-  const passCount = findings.filter((item) => item.status === "pass").length;
+  const counts = statusCounts(findings);
 
   return [
-    "# Cloudflare Audit Bundle",
+    "# Cloudflare Executive Summary",
     "",
     `Auth method: ${config.authMethod}`,
     `Account: ${config.accountId ?? "auto / unspecified"}`,
-    `Generated: ${new Date().toISOString()}`,
+    `Generated: ${generatedAt}`,
     "",
     "## Result Counts",
     "",
-    `- Failed controls: ${failCount}`,
-    `- Warning controls: ${warnCount}`,
-    `- Passing controls: ${passCount}`,
+    `- Failed controls: ${counts.fail}`,
+    `- Warning controls: ${counts.warn}`,
+    `- Manual review controls: ${counts.manual}`,
+    `- Passing controls: ${counts.pass}`,
+    "",
+    "## Status Semantics",
+    "",
+    "- pass: every sampled item met the control with documented evidence",
+    "- warn: partially met, or the inventory was partial so unseen items were not judged",
+    "- fail: at least one sampled item violates the control",
+    "- manual: the API could not prove the control (permission denied, plan not present, or no automatable signal); the summary names the evidence to collect",
     "",
     "## Highest Priority Findings",
     "",
     ...findings
-      .filter((item) => item.status !== "pass")
+      .filter((item) => item.status === "fail" || item.status === "warn")
+      .sort((a, b) => STATUS_RANK[b.status] - STATUS_RANK[a.status])
       .slice(0, 10)
       .map((item) => `- ${item.id} (${item.severity.toUpperCase()} / ${item.status.toUpperCase()}): ${item.summary}`),
+    "",
+    "## Manual Review Queue",
+    "",
+    ...findings
+      .filter((item) => item.status === "manual")
+      .map((item) => `- ${item.id}: ${item.summary}`),
   ].join("\n");
 }
 
-function buildControlMatrix(findings: CloudflareFinding[]): string {
+function buildUnifiedMatrix(findings: CloudflareFinding[]): string {
   const rows = findings.map((item) => [
     item.id,
-    item.severity.toUpperCase(),
+    item.specControl ? String(item.specControl) : "-",
     item.status.toUpperCase(),
     item.title,
-    item.mappings.join(", "),
+    ...CLOUDFLARE_FRAMEWORKS.map((framework) => frameworkControlFor(item, framework.key)),
   ]);
   return [
-    "# Cloudflare Control Matrix",
+    "# Cloudflare Unified Compliance Matrix",
     "",
-    formatTable(["Control", "Severity", "Status", "Title", "Mappings"], rows),
+    formatTable(["Finding", "Spec", "Status", "Title", ...CLOUDFLARE_FRAMEWORKS.map((framework) => framework.label)], rows),
+  ].join("\n");
+}
+
+function buildFrameworkReport(framework: { key: keyof ControlMapping; label: string }, findings: CloudflareFinding[], generatedAt: string): string {
+  const mapped = findings.filter((item) => frameworkControlFor(item, framework.key) !== "n/a");
+  const counts = statusCounts(mapped);
+  const rows = mapped.map((item) => [
+    frameworkControlFor(item, framework.key),
+    item.id,
+    item.status.toUpperCase(),
+    item.title,
+    item.summary.slice(0, 160),
+  ]);
+  return [
+    `# ${framework.label} Compliance Report (Cloudflare)`,
+    "",
+    `Generated: ${generatedAt}`,
+    "",
+    `Mapped findings: ${mapped.length} (pass ${counts.pass}, warn ${counts.warn}, fail ${counts.fail}, manual ${counts.manual})`,
+    "",
+    formatTable([`${framework.label} control`, "Finding", "Status", "Title", "Summary"], rows),
+  ].join("\n");
+}
+
+function buildQuickReference(result: { outputDirName: string; findings: CloudflareFinding[]; errorCount: number }): string {
+  const counts = statusCounts(result.findings);
+  return [
+    "# Quick Reference",
+    "",
+    `Bundle: ${result.outputDirName}`,
+    `Findings: ${result.findings.length} (pass ${counts.pass}, warn ${counts.warn}, fail ${counts.fail}, manual ${counts.manual})`,
+    `Read errors: ${result.errorCount}${result.errorCount > 0 ? " (see _errors.log)" : ""}`,
+    "",
+    "## Start Here",
+    "",
+    "1. `compliance/executive_summary.md` for prioritized failures and the manual review queue",
+    "2. `compliance/unified_compliance_matrix.md` for every finding mapped across frameworks",
+    "3. `compliance/<framework>/` for one report per framework",
+    "4. `analysis/*.json` for the evidence behind each finding",
+    "5. `core_data/*.json` for the raw inventories the findings were judged from",
+    "",
+    "## Tools",
+    "",
+    "- cloudflare_check_access",
+    "- cloudflare_assess_identity",
+    "- cloudflare_assess_zone_security",
+    "- cloudflare_assess_traffic_controls",
+    "- cloudflare_export_audit_bundle",
   ].join("\n");
 }
 
@@ -1299,21 +2181,23 @@ function buildBundleReadme(): string {
     "",
     "## Contents",
     "",
+    "- `QUICK_REFERENCE.md`: where to start",
     "- `summary.md`: combined human-readable assessment output",
-    "- `reports/executive-summary.md`: prioritized audit summary",
-    "- `reports/control-matrix.md`: framework mapping matrix",
-    "- `reports/*.md`: per-assessment markdown reports",
+    "- `compliance/executive_summary.md`: prioritized audit summary and manual review queue",
+    "- `compliance/unified_compliance_matrix.md`: every finding mapped across FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP",
+    "- `compliance/<framework>/*_compliance_report.md`: one report per framework",
     "- `analysis/*.json`: normalized findings and assessment details",
-    "- `core_data/access.json`: accessible Cloudflare audit surface inventory",
+    "- `core_data/*.json`: raw inventories (access surfaces, accounts, zones)",
     "- `metadata.json`: non-secret run metadata",
+    "- `_errors.log`: present only when some reads failed but the bundle still completed",
     "",
-    "Credentials are never written into the bundle.",
+    "Credentials are never written into the bundle. Re-running the export allocates a new directory and zip instead of overwriting.",
   ].join("\n");
 }
 
 export async function exportCloudflareAuditBundle(
   client: Pick<
-    CloudflareApiClient,
+    CloudflareReader,
     | "getResolvedConfig"
     | "verifyCurrentToken"
     | "listAccounts"
@@ -1334,36 +2218,41 @@ export async function exportCloudflareAuditBundle(
     | "getBotManagement"
     | "listGatewayRules"
     | "listIpAccessRules"
-  >,
+  > & Partial<CloudflareReader>,
   config: CloudflareResolvedConfig,
   outputRoot: string,
-  options: {
-    maxSuperAdmins?: number;
-    memberLimit?: number;
-    tokenLimit?: number;
-    zoneLimit?: number;
-    auditLimit?: number;
-  } = {},
+  options: AssessmentOptions = {},
 ): Promise<CloudflareAuditBundleResult> {
+  const generatedAt = new Date().toISOString();
   const access = await checkCloudflareAccess(client);
   const identity = await assessCloudflareIdentity(client, options);
   const zoneSecurity = await assessCloudflareZoneSecurity(client, options);
   const trafficControls = await assessCloudflareTrafficControls(client, options);
   const assessments = [identity, zoneSecurity, trafficControls];
   const findings = assessments.flatMap((assessment) => assessment.findings);
+  const errors = assessments.flatMap((assessment) => assessment.errors.map((item) => `${assessment.title}: ${item}`));
+  const [accounts, zones] = await Promise.all([
+    attemptList(() => client.listAccounts()),
+    attemptList(() => client.listZones(options.zoneLimit)),
+  ]);
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(
     outputRoot,
     `${safeDirName(config.accountId ?? "cloudflare-account")}-audit-bundle`,
   );
+  const outputDirName = basename(outputDir);
 
   await writeSecureTextFile(outputDir, "README.md", `${buildBundleReadme()}\n`);
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDirName, findings, errorCount: errors.length })}\n`);
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
+    generated_at: generatedAt,
     auth_method: config.authMethod,
     account_id: config.accountId ?? null,
     source_chain: config.sourceChain,
+    finding_count: findings.length,
+    error_count: errors.length,
+    status_counts: statusCounts(findings),
   }));
   await writeSecureTextFile(
     outputDir,
@@ -1378,18 +2267,23 @@ export async function exportCloudflareAuditBundle(
       formatAssessmentText(trafficControls),
     ].join("\n"),
   );
-  await writeSecureTextFile(outputDir, "reports/executive-summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
-  await writeSecureTextFile(outputDir, "reports/control-matrix.md", `${buildControlMatrix(findings)}\n`);
-  await writeSecureTextFile(outputDir, "reports/identity.md", `${formatAssessmentText(identity)}\n`);
-  await writeSecureTextFile(outputDir, "reports/zone-security.md", `${formatAssessmentText(zoneSecurity)}\n`);
-  await writeSecureTextFile(outputDir, "reports/traffic-controls.md", `${formatAssessmentText(trafficControls)}\n`);
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, generatedAt)}\n`);
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+  for (const framework of CLOUDFLARE_FRAMEWORKS) {
+    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, `${buildFrameworkReport(framework, findings, generatedAt)}\n`);
+  }
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
   await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
   await writeSecureTextFile(outputDir, "analysis/zone-security.json", serializeJson(zoneSecurity));
   await writeSecureTextFile(outputDir, "analysis/traffic-controls.json", serializeJson(trafficControls));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  await writeSecureTextFile(outputDir, "core_data/accounts.json", serializeJson(accounts.ok ? accounts.value : { error: accounts.error }));
+  await writeSecureTextFile(outputDir, "core_data/zones.json", serializeJson(zones.ok ? zones.value : { error: zones.error }));
+  if (errors.length > 0) {
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.map((item) => `${generatedAt} ${item}`).join("\n")}\n`);
+  }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${safeDirName(config.accountId ?? "cloudflare-account")}-audit-bundle.zip`);
+  const zipPath = resolveSecureOutputPath(outputRoot, `${outputDirName}.zip`);
   await createZipArchive(outputDir, zipPath);
 
   return {
@@ -1397,6 +2291,7 @@ export async function exportCloudflareAuditBundle(
     zipPath,
     fileCount: await countFilesRecursively(outputDir),
     findingCount: findings.length,
+    errorCount: errors.length,
   };
 }
 
@@ -1467,7 +2362,7 @@ export function registerCloudflareTools(pi: any): void {
     name: "cloudflare_check_access",
     label: "Check Cloudflare audit access",
     description:
-      "Validate read-only Cloudflare access across token verification, accounts, zones, zone settings, DNSSEC, members, Zero Trust apps, and audit logs.",
+      "Validate read-only Cloudflare access across token verification, accounts, zones, zone settings, DNSSEC, rulesets, members, Zero Trust apps, and audit logs.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {
@@ -1476,7 +2371,7 @@ export function registerCloudflareTools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "cloudflare_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `Cloudflare access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Cloudflare access check failed: ${errorMessage(error)}`,
           { tool: "cloudflare_check_access" },
         );
       }
@@ -1487,10 +2382,10 @@ export function registerCloudflareTools(pi: any): void {
     name: "cloudflare_assess_identity",
     label: "Assess Cloudflare identity posture",
     description:
-      "Assess Cloudflare authentication method, token verification, member privilege concentration, Zero Trust Access coverage, and identity provider posture.",
+      "Assess Cloudflare authentication method, token verification and scoping, API token expiration, member privilege concentration, Zero Trust Access coverage, and identity provider posture.",
     parameters: Type.Object({
       ...authParams,
-      max_super_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Super Administrator assignments before warning. Defaults to 2.", default: 2 })),
+      max_super_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Super Administrator assignments before failing. Defaults to 2.", default: 2 })),
       member_limit: Type.Optional(Type.Number({ description: "Maximum account members to inspect. Defaults to 200.", default: 200 })),
       token_limit: Type.Optional(Type.Number({ description: "Maximum API tokens to inspect. Defaults to 200.", default: 200 })),
       zone_limit: Type.Optional(Type.Number({ description: "Maximum zones to sample. Defaults to 20.", default: 20 })),
@@ -1507,7 +2402,7 @@ export function registerCloudflareTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "cloudflare_assess_identity", ...result });
       } catch (error) {
         return errorResult(
-          `Cloudflare identity assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Cloudflare identity assessment failed: ${errorMessage(error)}`,
           { tool: "cloudflare_assess_identity" },
         );
       }
@@ -1518,7 +2413,7 @@ export function registerCloudflareTools(pi: any): void {
     name: "cloudflare_assess_zone_security",
     label: "Assess Cloudflare zone security",
     description:
-      "Assess Cloudflare zone security posture across firewall and managed rulesets, strict SSL, minimum TLS, HTTPS and HSTS enforcement, DNSSEC, and Universal SSL.",
+      "Assess Cloudflare zone security across WAF managed and custom rulesets, HTTP DDoS sensitivity, strict SSL, minimum TLS, HSTS, HTTPS enforcement, DNSSEC, Universal SSL certificates, Authenticated Origin Pulls, Browser Integrity Check, email obfuscation, security header transform rules, and DNS origin exposure.",
     parameters: Type.Object({
       ...authParams,
       zone_limit: Type.Optional(Type.Number({ description: "Maximum zones to sample. Defaults to 20.", default: 20 })),
@@ -1532,7 +2427,7 @@ export function registerCloudflareTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "cloudflare_assess_zone_security", ...result });
       } catch (error) {
         return errorResult(
-          `Cloudflare zone security assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Cloudflare zone security assessment failed: ${errorMessage(error)}`,
           { tool: "cloudflare_assess_zone_security" },
         );
       }
@@ -1543,7 +2438,7 @@ export function registerCloudflareTools(pi: any): void {
     name: "cloudflare_assess_traffic_controls",
     label: "Assess Cloudflare traffic controls",
     description:
-      "Assess Cloudflare traffic and edge control posture across rate limiting, page rules, bot management, account audit logs, Gateway rules, and IP access controls.",
+      "Assess Cloudflare traffic and edge control posture across rate limiting rulesets, page rules, bot management, account audit logs, IP access rules, and Gateway policies.",
     parameters: Type.Object({
       ...authParams,
       zone_limit: Type.Optional(Type.Number({ description: "Maximum zones to sample. Defaults to 20.", default: 20 })),
@@ -1559,7 +2454,7 @@ export function registerCloudflareTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "cloudflare_assess_traffic_controls", ...result });
       } catch (error) {
         return errorResult(
-          `Cloudflare traffic control assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Cloudflare traffic control assessment failed: ${errorMessage(error)}`,
           { tool: "cloudflare_assess_traffic_controls" },
         );
       }
@@ -1570,11 +2465,11 @@ export function registerCloudflareTools(pi: any): void {
     name: "cloudflare_export_audit_bundle",
     label: "Export Cloudflare audit bundle",
     description:
-      "Export a Cloudflare audit package with access checks, identity findings, zone security, traffic-control findings, markdown reports, JSON analysis, and a zip archive.",
+      "Export a Cloudflare audit package with access checks, identity, zone security, and traffic-control findings, per-framework compliance reports, JSON analysis, raw core data, an errors log on partial failure, and a zip archive.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
-      max_super_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Super Administrator assignments before warning. Defaults to 2.", default: 2 })),
+      max_super_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Super Administrator assignments before failing. Defaults to 2.", default: 2 })),
       member_limit: Type.Optional(Type.Number({ description: "Maximum account members to inspect. Defaults to 200.", default: 200 })),
       token_limit: Type.Optional(Type.Number({ description: "Maximum API tokens to inspect. Defaults to 200.", default: 200 })),
       zone_limit: Type.Optional(Type.Number({ description: "Maximum zones to sample. Defaults to 20.", default: 20 })),
@@ -1599,6 +2494,7 @@ export function registerCloudflareTools(pi: any): void {
             `Zip archive: ${result.zipPath}`,
             `Findings: ${result.findingCount}`,
             `Files: ${result.fileCount}`,
+            `Read errors: ${result.errorCount}`,
           ].join("\n"),
           {
             tool: "cloudflare_export_audit_bundle",
@@ -1606,11 +2502,12 @@ export function registerCloudflareTools(pi: any): void {
             zip_path: result.zipPath,
             finding_count: result.findingCount,
             file_count: result.fileCount,
+            error_count: result.errorCount,
           },
         );
       } catch (error) {
         return errorResult(
-          `Cloudflare audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Cloudflare audit bundle export failed: ${errorMessage(error)}`,
           { tool: "cloudflare_export_audit_bundle" },
         );
       }
