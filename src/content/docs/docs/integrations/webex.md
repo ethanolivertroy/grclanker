@@ -30,6 +30,8 @@ Configuration precedence: tool arguments, then environment variables, then a con
 
 Refresh flow: when `client_id`, `client_secret`, and `refresh_token` are present and no token is, the client posts `grant_type=refresh_token` to `POST /access_token` (the integration and Service App token flow documented on the [integrations](https://developer.webex.com/docs/integrations) and [Service Apps](https://developer.webex.com/docs/service-apps) pages) and uses the returned `access_token`. Tokens, secrets, passwords, and host PINs are redacted from every bundle file.
 
+Bundle hygiene: `core_data/` never holds a raw response. Each surface is projected to a per-surface allowlist of the documented fields the findings read (the "Fields read" column below plus the identifiers that make a row citable), so an undocumented or newly added property is dropped before anything is written. On top of that, secret-named keys are replaced with `[REDACTED]` and URL-valued fields keep host and path only: the recording `downloadUrl` and `playbackUrl` lose their `RCID` access token, the meeting `webLink` loses its `MTID` join token, webhook `targetUrl` values lose any query string, and `;pwd=` parameters are removed from SIP URIs. The same rules apply to the zip, which is built from the written directory.
+
 Deviation: the spec names `config.toml`; JSON or YAML is accepted instead so no TOML dependency is added.
 
 ## Tools
@@ -100,8 +102,7 @@ The script skips with exit code 0 when no `WEBEX_TOKEN`, refresh credential trio
 - `GET /rooms`, `GET /webhooks`, and `GET /meetings` list only what the authenticated identity can see; findings state this and downgrade to `warn` under a bot token.
 - `GET /people` returns 400 for non-admin tokens without a filter; that renders as manual, not empty.
 - `GET /admin/meeting/config/commonSettings` needs a site administrator with `meeting:admin_config_read`; `GET /guests/count` needs `guest-issuer:read`. A denied guest count is noted in WEBEX-ID-07 without blocking the people-based inventory.
-- Events older than 90 days require Pro Pack for Control Hub.
-- SARIF, CSV, and HTML reporters from the spec are out of scope for this pass.
+- Events older than 90 days require Pro Pack for Control Hub.- SARIF, CSV, and HTML reporters from the spec are out of scope for this pass.
 
 ## Endpoints
 

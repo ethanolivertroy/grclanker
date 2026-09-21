@@ -359,12 +359,37 @@ function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-const SECRET_KEY_PATTERN = /token|secret|password|hostpin|authorization/i;
+const SECRET_KEY_PATTERN = /token|secret|password|passcode|hostpin|hostkey|authorization|accesscode|activationcode|credential/i;
 /** Policy flags from commonSettings.securityOptions that name passwords without holding one. */
 const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword)$/;
+/** Scheme-prefixed URL: everything from the first ? or # carries no evidence value (RCID, MTID, token parameters). */
+const URL_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+/** Credential parameters embedded in SIP and tel URIs, for example ;pwd=1234. */
+const URI_CREDENTIAL_PARAM_PATTERN = /;(pwd|password|pin|passcode|token|secret)=[^;?#\s]*/gi;
 
+/**
+ * Strips credential-bearing parts from a string while keeping host and path:
+ * the query string and fragment of any scheme-prefixed URL (recording
+ * download and playback RCID, meeting join MTID, webhook tokens) and ;pwd=
+ * style parameters inside SIP URIs.
+ */
+export function scrubValue(value: string): string {
+  let output = value;
+  if (URL_SCHEME_PATTERN.test(output)) {
+    const cut = output.search(/[?#]/);
+    if (cut >= 0) output = output.slice(0, cut);
+  }
+  return output.replace(URI_CREDENTIAL_PARAM_PATTERN, "");
+}
+
+/**
+ * Key-name redaction plus value scrubbing. This is the second layer; the
+ * first is the per-surface allowlist in WEBEX_SURFACE_FIELDS, which decides
+ * what reaches the bundle at all.
+ */
 export function redactSecrets(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSecrets);
+  if (typeof value === "string") return scrubValue(value);
   const object = asObject(value);
   if (!object) return value;
   const output: JsonRecord = {};
@@ -373,6 +398,132 @@ export function redactSecrets(value: unknown): unknown {
     output[key] = sensitive && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry);
   }
   return output;
+}
+
+type FieldSpec = true | { readonly [field: string]: FieldSpec };
+type SurfaceSpec = { readonly [field: string]: FieldSpec };
+
+const PERSON_FIELDS: SurfaceSpec = { id: true, displayName: true, emails: true, type: true, roles: true, orgId: true, created: true };
+const ORGANIZATION_FIELDS: SurfaceSpec = { id: true, displayName: true, created: true };
+const SITE_FIELDS: SurfaceSpec = { siteUrl: true, default: true };
+const SECURITY_OPTIONS_FIELDS: SurfaceSpec = {
+  joinBeforeHost: true,
+  audioBeforeHost: true,
+  firstAttendeeAsPresenter: true,
+  unlistAllMeetings: true,
+  requireLoginBeforeAccess: true,
+  allowMobileScreenCapture: true,
+  requireStrongPassword: true,
+  passwordCriteria: {
+    mixedCase: true,
+    minLength: true,
+    minNumeric: true,
+    minAlpha: true,
+    minSpecial: true,
+    disallowDynamicWebText: true,
+    disallowList: true,
+    disallowValues: true,
+  },
+};
+
+/**
+ * Fields written to core_data per collected surface: exactly what the
+ * verdicts and evidence read plus the documented identifiers that make a row
+ * citable. Every other property the API returns is dropped before anything is
+ * written, so an undocumented or newly added field can never reach the bundle
+ * or the zip. `password` and `secret` stay listed so their presence is
+ * recorded as [REDACTED] by redactSecrets; URL-valued fields keep host and
+ * path only. A surface without an entry here cannot be stored (compile error).
+ */
+export const WEBEX_SURFACE_FIELDS = {
+  me: PERSON_FIELDS,
+  organizations: ORGANIZATION_FIELDS,
+  organization: ORGANIZATION_FIELDS,
+  people: PERSON_FIELDS,
+  roles: { id: true, name: true },
+  guest_count: { count: true },
+  licenses: { id: true, name: true, totalUnits: true, consumedUnits: true, subscriptionId: true, siteUrl: true, siteType: true },
+  events: { id: true, resource: true, type: true, actorId: true, actorOrgId: true, orgId: true, created: true },
+  admin_audit_events: {
+    id: true,
+    actorId: true,
+    actorOrgId: true,
+    targetOrgId: true,
+    created: true,
+    data: { eventCategory: true, eventDescription: true, actionText: true, actorEmail: true, actorName: true, adminRoles: true, targetType: true, targetName: true },
+  },
+  admin_recordings: {
+    id: true,
+    meetingId: true,
+    topic: true,
+    createTime: true,
+    timeRecorded: true,
+    hostEmail: true,
+    siteUrl: true,
+    downloadUrl: true,
+    playbackUrl: true,
+    format: true,
+    serviceType: true,
+    durationSeconds: true,
+    sizeBytes: true,
+    status: true,
+  },
+  rooms: { id: true, title: true, type: true, isLocked: true, isPublic: true, classificationId: true, teamId: true, ownerId: true, created: true, lastActivity: true },
+  webhooks: { id: true, name: true, targetUrl: true, resource: true, event: true, secret: true, status: true, ownedBy: true, created: true },
+  meeting_preferences: {
+    personalMeetingRoom: { enabledAutoLock: true, autoLockMinutes: true, notifyHost: true, supportCoHost: true, supportAnyoneAsCoHost: true, allowFirstUserToBeCoHost: true, allowAuthenticatedDevices: true },
+    audio: { defaultAudioType: true, enabledGlobalCallIn: true, enabledTollFree: true, enabledAutoConnection: true },
+    schedulingOptions: { enabledJoinBeforeHost: true, joinBeforeHostMinutes: true, enabledAutoShareRecording: true, enabledWebexAssistantByDefault: true },
+    sites: SITE_FIELDS,
+  },
+  meeting_sites: SITE_FIELDS,
+  meeting_common_settings: { siteUrl: true, securityOptions: SECURITY_OPTIONS_FIELDS },
+  meetings: {
+    id: true,
+    title: true,
+    meetingType: true,
+    state: true,
+    start: true,
+    end: true,
+    hostEmail: true,
+    siteUrl: true,
+    webLink: true,
+    password: true,
+    unlockedMeetingJoinSecurity: true,
+    enabledJoinBeforeHost: true,
+    joinBeforeHostMinutes: true,
+    enableAutomaticLock: true,
+    automaticLockMinutes: true,
+    publicMeeting: true,
+  },
+  hybrid_clusters: { id: true, name: true, orgId: true, resourceGroupId: true },
+  hybrid_connectors: { id: true, orgId: true, hybridClusterId: true, hostname: true, type: true, version: true, status: true, created: true },
+  devices: { id: true, displayName: true, workspaceId: true, personId: true, orgId: true, product: true, type: true, software: true, upgradeChannel: true, connectionStatus: true, managedBy: true, created: true },
+  workspaces: { id: true, displayName: true, type: true, orgId: true, created: true },
+} as const satisfies Record<string, SurfaceSpec>;
+
+export type WebexSurfaceName = keyof typeof WEBEX_SURFACE_FIELDS;
+
+function projectValue(value: unknown, spec: FieldSpec): unknown {
+  if (spec === true) {
+    if (Array.isArray(value)) return value.filter((entry) => entry === null || typeof entry !== "object");
+    return value !== null && typeof value === "object" ? undefined : value;
+  }
+  if (Array.isArray(value)) return value.map((entry) => projectValue(entry, spec)).filter((entry) => entry !== undefined);
+  const object = asObject(value);
+  if (!object) return undefined;
+  const output: JsonRecord = {};
+  for (const [field, fieldSpec] of Object.entries(spec)) {
+    if (!(field in object)) continue;
+    const projected = projectValue(object[field], fieldSpec);
+    if (projected !== undefined) output[field] = projected;
+  }
+  return output;
+}
+
+/** Projects a collected surface to its allowlisted fields, then redacts and scrubs the values. */
+export function projectSurface(name: WebexSurfaceName, data: unknown): unknown {
+  return redactSecrets(projectValue(data, WEBEX_SURFACE_FIELDS[name]));
 }
 
 function safeDirName(value: string): string {
@@ -895,16 +1046,24 @@ function surfaceItems(result: SurfaceResult<JsonRecord[]>): JsonRecord[] {
   return result.ok ? result.data : [];
 }
 
-function surfaceErrors(entries: Record<string, SurfaceResult<unknown>>): string[] {
-  return Object.entries(entries)
-    .filter(([, result]) => !result.ok)
-    .map(([name, result]) => `${name}: ${result.ok ? "" : result.error}`);
+/** Collected surfaces keyed by name; only names with a WEBEX_SURFACE_FIELDS allowlist are storable. */
+type SurfaceSet = Partial<Record<WebexSurfaceName, SurfaceResult<unknown>>>;
+
+function surfaceEntries(entries: SurfaceSet): Array<[WebexSurfaceName, SurfaceResult<unknown>]> {
+  return (Object.entries(entries) as Array<[WebexSurfaceName, SurfaceResult<unknown> | undefined]>)
+    .flatMap(([name, result]) => (result ? [[name, result] as [WebexSurfaceName, SurfaceResult<unknown>]] : []));
 }
 
-function surfaceRaw(entries: Record<string, SurfaceResult<unknown>>): Record<string, unknown> {
+function surfaceErrors(entries: SurfaceSet): string[] {
+  return surfaceEntries(entries)
+    .flatMap(([name, result]) => (result.ok ? [] : [`${name}: ${result.error}`]));
+}
+
+/** core_data content: each surface projected to its allowlist, never the raw response. */
+function surfaceRaw(entries: SurfaceSet): Record<string, unknown> {
   const output: Record<string, unknown> = {};
-  for (const [name, result] of Object.entries(entries)) {
-    output[name] = result.ok ? redactSecrets(result.data) : { error: result.error, status: result.status ?? null };
+  for (const [name, result] of surfaceEntries(entries)) {
+    output[name] = result.ok ? projectSurface(name, result.data) : { error: scrubValue(result.error), status: result.status ?? null };
   }
   return output;
 }
@@ -1326,7 +1485,7 @@ export async function assessWebexIdentity(
     orgId ? collectObject(() => client.getOrganization(orgId)) : Promise.resolve<SurfaceResult<JsonRecord>>({ ok: false, error: note }),
     tokenType === "bot" ? Promise.resolve(botDeniedObject) : collectObject(() => client.getGuestCount()),
   ]);
-  const surfaces = { me, organizations: orgs, people, roles, organization, guest_count: guestCount };
+  const surfaces: SurfaceSet = { me, organizations: orgs, people, roles, organization, guest_count: guestCount };
 
   const roleMap = roleMapFromRoles(surfaceItems(roles));
   const humans = surfaceItems(people).filter((person) => !["bot", "appuser"].includes(asString(person.type) ?? ""));
@@ -1344,7 +1503,7 @@ export async function assessWebexIdentity(
     "critical",
     "manual",
     `Manual: the Organizations API (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created, so SSO enforcement for ${orgLabel} is not readable. Export the Control Hub Organization Settings > Authentication page showing SSO enabled.`,
-    { org_id: orgId ?? null, organization: organization.ok ? redactSecrets(organization.data) : { error: organization.error }, citation: WEBEX_DOCS.organizationGet },
+    { org_id: orgId ?? null, organization: organization.ok ? projectSurface("organization", organization.data) : { error: organization.error }, citation: WEBEX_DOCS.organizationGet },
   );
 
   const mfaReadOnlyNote = `mfaEnabled is documented on /identity/organizations/{orgId}/authenticationConfig only in the PATCH request schema (${WEBEX_DOCS.authenticationConfig}); no GET is published, and this read-only inspector never issues a PATCH, so the org MFA setting cannot be read.`;
@@ -1499,7 +1658,7 @@ export async function assessWebexCollaborationGovernance(
     collectPage(() => client.listWebhooks(webhookLimit)),
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listLicenses(licenseLimit)),
   ]);
-  const surfaces = { me, organizations: orgs, events, admin_audit_events: adminAudit, admin_recordings: recordings, rooms, webhooks, licenses };
+  const surfaces: SurfaceSet = { me, organizations: orgs, events, admin_audit_events: adminAudit, admin_recordings: recordings, rooms, webhooks, licenses };
 
   const externalFinding = finding("WEBEX-COLLAB-01", [4], "External communications policy", "high", "manual",
     `Manual: no documented Webex API endpoint exposes the external communication policy; the Organizations reference (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created. Guest access (control 13) is judged from the site common settings in WEBEX-MTG-03 and inventoried in WEBEX-ID-07. Export Control Hub Messaging settings (external communication allow list).`,
@@ -1560,7 +1719,7 @@ export async function assessWebexCollaborationGovernance(
   } else {
     webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "fail",
       `${insecureWebhooks.length} of ${webhookItems.length} visible webhooks lack an https targetUrl or a secret.${partialNote(webhooks, "webhooks")}`,
-      { insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: asString(item.targetUrl) })), webhooks_seen: webhookItems.length });
+      { insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: scrubValue(asString(item.targetUrl) ?? "") })), webhooks_seen: webhookItems.length });
   }
 
   const licenseItems = surfaceItems(licenses);
@@ -1653,7 +1812,7 @@ export async function assessWebexMeetingHybridSecurity(
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listWorkspaces()),
   ]);
   const siteSettings = await collectSiteSettings(client, tokenType, meetingSites, meetingPreferences);
-  const surfaces = {
+  const surfaces: SurfaceSet = {
     me,
     organizations: orgs,
     meeting_preferences: meetingPreferences,
@@ -1868,7 +2027,7 @@ function buildQuickReference(): string {
   return [
     "# Webex Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Webex API responses with tokens, secrets, and passwords redacted.",
+    "- `core_data/` contains each Webex API surface projected to the documented fields the findings read; tokens, secrets, passwords, and PINs are redacted, and URL query strings (recording RCID, meeting MTID, webhook tokens) are stripped.",
     "- `analysis/` contains normalized findings and per-category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
@@ -2140,7 +2299,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_export_audit_bundle",
     label: "Export Webex audit bundle",
     description:
-      "Export a Webex audit bundle with redacted core_data snapshots, analysis JSON, compliance reports per framework, a quick reference, and a zip archive named after the allocated output directory.",
+      "Export a Webex audit bundle with field-allowlisted, redacted core_data snapshots (URL query strings such as recording RCID and meeting MTID stripped), analysis JSON, compliance reports per framework, a quick reference, and a zip archive named after the allocated output directory.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),

@@ -5,15 +5,18 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inflateRawSync } from "node:zlib";
 
 import {
   WEBEX_DOCS,
+  WEBEX_SURFACE_FIELDS,
   WebexApiClient,
   WebexApiError,
   assessWebexCollaborationGovernance,
@@ -23,9 +26,11 @@ import {
   detectTokenType,
   exportWebexAuditBundle,
   parseLinkHeaderNext,
+  projectSurface,
   redactSecrets,
   resolveSecureOutputPath,
   resolveWebexConfiguration,
+  scrubValue,
 } from "../dist/extensions/grc-tools/webex.js";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -247,6 +252,181 @@ function botClient() {
       return { id: "bot-1", displayName: "Bot", emails: ["bot@webex.bot"], type: "bot" };
     },
   });
+}
+
+/**
+ * Rule 9 fixture: one distinctive fake secret per carrier. Documented carriers
+ * (recording RCID, meeting MTID and hostKey, webhook secret and URL token, host
+ * PIN, SIP ;pwd=) sit next to undocumented extras (guestIssuerKey,
+ * bindCredential, activationCode) that a fail-open redactor would copy through.
+ */
+const FAKE_SECRETS = {
+  access_token: "FAKE-ACCESS-TOKEN-a1b2c3",
+  client_secret: "FAKE-CLIENT-SECRET-d4e5f6",
+  refresh_token: "FAKE-REFRESH-TOKEN-g7h8i9",
+  me_sip_pwd: "FAKE-ME-SIP-PWD-j1k2l3",
+  me_avatar_token: "FAKE-AVATAR-TOKEN-m4n5o6",
+  person_sip_pwd: "FAKE-PERSON-SIP-PWD-p7q8r9",
+  person_guest_issuer_key: "FAKE-GUEST-ISSUER-KEY-s1t2u3",
+  recording_download_rcid: "FAKE-RCID-DOWNLOAD-v4w5x6",
+  recording_playback_rcid: "FAKE-RCID-PLAYBACK-y7z8a9",
+  meeting_mtid: "FAKE-MTID-JOIN-b1c2d3",
+  meeting_password: "FAKE-MEETING-PASSWORD-e4f5g6",
+  meeting_pvs_password: "FAKE-PVS-PASSWORD-h7i8j9",
+  meeting_host_key: "FAKE-HOST-KEY-k1l2m3",
+  meeting_sip_pwd: "FAKE-MEETING-SIP-PWD-n4o5p6",
+  meeting_number: "FAKE-MEETING-NUMBER-q7r8s9",
+  pmr_host_pin: "FAKE-HOST-PIN-t1u2v3",
+  pmr_link_token: "FAKE-PMR-LINK-TOKEN-w4x5y6",
+  pmr_sip_pwd: "FAKE-PMR-SIP-PWD-z7a8b9",
+  pmr_access_code: "FAKE-PMR-ACCESS-CODE-c1d2e3",
+  webhook_secret: "FAKE-WEBHOOK-SECRET-f4g5h6",
+  webhook_url_token: "FAKE-WEBHOOK-URL-TOKEN-i7j8k9",
+  connector_bind_credential: "FAKE-BIND-CREDENTIAL-l1m2n3",
+  device_activation_code: "FAKE-ACTIVATION-CODE-o4p5q6",
+  device_sip_pwd: "FAKE-DEVICE-SIP-PWD-r7s8t9",
+  workspace_sip_pwd: "FAKE-WORKSPACE-SIP-PWD-u1v2w3",
+  room_sip_pwd: "FAKE-ROOM-SIP-PWD-x4y5z6",
+  event_message_text: "FAKE-MESSAGE-TEXT-a7b8c9",
+  event_content_token: "FAKE-CONTENT-TOKEN-d1e2f3",
+};
+
+function secretConfig() {
+  return sampleConfig({
+    token: FAKE_SECRETS.access_token,
+    refresh: { clientId: "cid", clientSecret: FAKE_SECRETS.client_secret, refreshToken: FAKE_SECRETS.refresh_token },
+    sourceChain: ["tests", "args:token", "args:refresh"],
+  });
+}
+
+function secretClient() {
+  return compliantClient({
+    async getMe() {
+      return {
+        id: "me-1", displayName: "Auditor", emails: ["auditor@example.com"], type: "person", roles: ["role-full-admin"],
+        sipAddresses: [{ type: "personal-room", value: `sip:auditor@example.webex.com;pwd=${FAKE_SECRETS.me_sip_pwd}`, primary: true }],
+        avatar: `https://avatar.example.com/auditor.png?token=${FAKE_SECRETS.me_avatar_token}`,
+      };
+    },
+    async listPeople() {
+      return page([
+        {
+          id: "u1", displayName: "Full Admin", emails: ["admin@example.com"], type: "person", roles: ["role-full-admin"], created: "2021-01-01T00:00:00.000Z",
+          sipAddresses: [{ type: "enterprise", value: `sip:admin@example.webex.com;pwd=${FAKE_SECRETS.person_sip_pwd}` }],
+          guestIssuerKey: FAKE_SECRETS.person_guest_issuer_key,
+        },
+        { id: "u2", displayName: "Compliance", emails: ["co@example.com"], type: "person", roles: ["role-compliance"], created: "2021-01-01T00:00:00.000Z" },
+        { id: "b1", displayName: "Approved Bot", emails: ["bot@webex.bot"], type: "bot", created: "2022-01-01T00:00:00.000Z" },
+        { id: "g1", displayName: "Visitor", emails: ["visitor@example.net"], type: "appuser", created: "2026-09-01T00:00:00.000Z" },
+      ]);
+    },
+    async listAdminRecordings() {
+      return page([{
+        id: "rec-1", meetingId: "m-1", topic: "Board", createTime: "2026-09-01T00:00:00.000Z", hostEmail: "admin@example.com", siteUrl: "example.webex.com",
+        downloadUrl: `https://example.webex.com/example/lsr.php?RCID=${FAKE_SECRETS.recording_download_rcid}`,
+        playbackUrl: `https://example.webex.com/example/ldr.php?RCID=${FAKE_SECRETS.recording_playback_rcid}`,
+        format: "MP4", serviceType: "MeetingCenter", durationSeconds: 3600, sizeBytes: 1024, status: "available",
+      }]);
+    },
+    async listMeetings() {
+      return page([{
+        id: "m-1", meetingNumber: FAKE_SECRETS.meeting_number, title: "Weekly", state: "scheduled", siteUrl: "example.webex.com", hostEmail: "admin@example.com",
+        webLink: `https://example.webex.com/example/j.php?MTID=${FAKE_SECRETS.meeting_mtid}`,
+        password: FAKE_SECRETS.meeting_password,
+        phoneAndVideoSystemPassword: FAKE_SECRETS.meeting_pvs_password,
+        hostKey: FAKE_SECRETS.meeting_host_key,
+        sipAddress: `m-1@example.webex.com;pwd=${FAKE_SECRETS.meeting_sip_pwd}`,
+        unlockedMeetingJoinSecurity: "allowJoinWithLobby",
+      }]);
+    },
+    async getMeetingPreferences() {
+      return {
+        personalMeetingRoom: {
+          enabledAutoLock: true, autoLockMinutes: 5, hostPin: FAKE_SECRETS.pmr_host_pin,
+          personalMeetingRoomLink: `https://example.webex.com/meet/auditor?token=${FAKE_SECRETS.pmr_link_token}`,
+          sipAddress: `auditor@example.webex.com;pwd=${FAKE_SECRETS.pmr_sip_pwd}`,
+          telephony: { accessCode: FAKE_SECRETS.pmr_access_code, callInNumbers: [] },
+        },
+        audio: { defaultAudioType: "webexAudio", enabledGlobalCallIn: false },
+        schedulingOptions: { enabledJoinBeforeHost: false },
+        sites: [{ siteUrl: "example.webex.com", default: true }],
+      };
+    },
+    async listWebhooks() {
+      return page([{
+        id: "hook-1", name: "Notifier", resource: "messages", event: "created", status: "active",
+        targetUrl: `https://example.com/hook?token=${FAKE_SECRETS.webhook_url_token}`,
+        secret: FAKE_SECRETS.webhook_secret,
+      }]);
+    },
+    async listHybridConnectors() {
+      return page([{
+        id: "conn-1", orgId: "org-123", hybridClusterId: "cluster-1", hostname: "cal-1.example.com", type: "calendar", version: "1.0", status: "operational",
+        created: "2026-01-01T00:00:00.000Z", bindCredential: FAKE_SECRETS.connector_bind_credential,
+      }]);
+    },
+    async listDevices() {
+      return page([{
+        id: "dev-1", displayName: "Room Kit", workspaceId: "ws-1", software: "RoomOS 11.20", upgradeChannel: "stable", connectionStatus: "connected", managedBy: "CUSTOMER",
+        activationCode: FAKE_SECRETS.device_activation_code,
+        primarySipUrl: `sip:dev@example.webex.com;pwd=${FAKE_SECRETS.device_sip_pwd}`,
+      }]);
+    },
+    async listWorkspaces() {
+      return page([{ id: "ws-1", displayName: "Boardroom", type: "meetingRoom", sipAddress: `ws@example.webex.com;pwd=${FAKE_SECRETS.workspace_sip_pwd}` }]);
+    },
+    async listRooms() {
+      return page([{ id: "room-1", title: "General", type: "group", classificationId: "class-1", sipAddress: `room@example.webex.com;pwd=${FAKE_SECRETS.room_sip_pwd}` }]);
+    },
+    async listEvents() {
+      return page([{
+        id: "ev-1", resource: "messages", type: "created", actorId: "u1", orgId: "org-123", created: "2026-09-01T00:00:00.000Z",
+        data: { text: FAKE_SECRETS.event_message_text, files: [`https://webexapis.com/v1/contents/abc?token=${FAKE_SECRETS.event_content_token}`] },
+      }]);
+    },
+  });
+}
+
+function walkFiles(dir) {
+  const output = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const pathname = join(dir, entry.name);
+    if (entry.isDirectory()) output.push(...walkFiles(pathname));
+    else output.push(pathname);
+  }
+  return output.sort();
+}
+
+/** Minimal zip reader: central directory walk plus raw inflate, no external dependency. */
+function readZipEntries(buffer) {
+  let eocd = -1;
+  for (let offset = buffer.length - 22; offset >= 0; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      eocd = offset;
+      break;
+    }
+  }
+  assert.ok(eocd >= 0, "zip end-of-central-directory record not found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let cursor = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(cursor), 0x02014b50, "central directory header signature");
+    const method = buffer.readUInt16LE(cursor + 10);
+    const compressedSize = buffer.readUInt32LE(cursor + 20);
+    const nameLength = buffer.readUInt16LE(cursor + 28);
+    const extraLength = buffer.readUInt16LE(cursor + 30);
+    const commentLength = buffer.readUInt16LE(cursor + 32);
+    const localOffset = buffer.readUInt32LE(cursor + 42);
+    const name = buffer.subarray(cursor + 46, cursor + 46 + nameLength).toString("utf8");
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "local file header signature");
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    const content = method === 8 ? inflateRawSync(data) : data;
+    entries.push({ name, content: content.toString("utf8") });
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries.filter((entry) => !entry.name.endsWith("/"));
 }
 
 async function allAssessments(client) {
@@ -952,6 +1132,102 @@ test("exportWebexAuditBundle writes the shared layout, redacts secrets, and neve
   assert.ok(existsSync(first.zipPath));
   assert.ok(second.errorCount > 0);
   assert.match(readFileSync(join(second.outputDir, "_errors.log"), "utf8"), /adminAudit/);
+});
+
+test("rule 9: no fake secret from any carrier reaches any bundle file or any zip entry", async () => {
+  const base = createTempBase("grclanker-webex-secrets-");
+  const result = await exportWebexAuditBundle(secretClient(), secretConfig(), base);
+  assert.equal(result.findingCount, FINDING_COUNT);
+  assert.equal(result.errorCount, 0);
+
+  const files = walkFiles(result.outputDir);
+  assert.equal(files.length, result.fileCount);
+  assert.ok(files.length >= 35, `expected a full bundle, saw ${files.length} files`);
+  const secretEntries = Object.entries(FAKE_SECRETS);
+  assert.ok(secretEntries.length >= 28);
+  const leaks = [];
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    for (const [carrier, value] of secretEntries) {
+      if (content.includes(value)) leaks.push(`${carrier} in ${relative(result.outputDir, file)}`);
+    }
+  }
+  assert.deepEqual(leaks, [], `secrets leaked into the bundle directory: ${leaks.join("; ")}`);
+
+  const entries = readZipEntries(readFileSync(result.zipPath));
+  assert.equal(entries.length, files.length, "every written file appears exactly once in the zip");
+  assert.deepEqual(entries.map((entry) => entry.name).sort(), files.map((file) => relative(result.outputDir, file)).sort());
+  const zipLeaks = [];
+  for (const entry of entries) {
+    for (const [carrier, value] of secretEntries) {
+      if (entry.content.includes(value)) zipLeaks.push(`${carrier} in zip:${entry.name}`);
+    }
+  }
+  assert.deepEqual(zipLeaks, [], `secrets leaked into the zip: ${zipLeaks.join("; ")}`);
+
+  const read = (relativePath) => readFileSync(join(result.outputDir, relativePath), "utf8");
+  const recordings = JSON.parse(read("core_data/collaboration-governance/admin_recordings.json"));
+  assert.equal(recordings[0].downloadUrl, "https://example.webex.com/example/lsr.php");
+  assert.equal(recordings[0].playbackUrl, "https://example.webex.com/example/ldr.php");
+  assert.equal(recordings[0].status, "available");
+  const meetings = JSON.parse(read("core_data/meeting-hybrid-security/meetings.json"));
+  assert.equal(meetings[0].webLink, "https://example.webex.com/example/j.php");
+  assert.equal(meetings[0].password, "[REDACTED]");
+  assert.equal(meetings[0].unlockedMeetingJoinSecurity, "allowJoinWithLobby");
+  assert.deepEqual(Object.keys(meetings[0]).filter((key) => ["hostKey", "meetingNumber", "phoneAndVideoSystemPassword", "sipAddress"].includes(key)), []);
+  const webhooks = JSON.parse(read("core_data/collaboration-governance/webhooks.json"));
+  assert.equal(webhooks[0].targetUrl, "https://example.com/hook");
+  assert.equal(webhooks[0].secret, "[REDACTED]");
+  const people = JSON.parse(read("core_data/identity/people.json"));
+  assert.deepEqual(Object.keys(people[0]).sort(), ["created", "displayName", "emails", "id", "roles", "type"]);
+  const preferences = JSON.parse(read("core_data/meeting-hybrid-security/meeting_preferences.json"));
+  assert.deepEqual(Object.keys(preferences.personalMeetingRoom).sort(), ["autoLockMinutes", "enabledAutoLock"]);
+  assert.equal(preferences.sites[0].siteUrl, "example.webex.com");
+  assert.ok(!("activationCode" in JSON.parse(read("core_data/meeting-hybrid-security/devices.json"))[0]));
+  assert.ok(!("bindCredential" in JSON.parse(read("core_data/meeting-hybrid-security/hybrid_connectors.json"))[0]));
+  assert.ok(!("data" in JSON.parse(read("core_data/collaboration-governance/events.json"))[0]));
+  const findings = JSON.parse(read("analysis/findings.json"));
+  assert.equal(findings.find((item) => item.id === "WEBEX-COLLAB-05").status, "pass", "scrubbing the webhook URL query must not change the https verdict");
+  assert.equal(findings.find((item) => item.id === "WEBEX-MTG-02").status, "pass");
+});
+
+test("projectSurface fails closed: unlisted keys are dropped, nested objects need a nested allowlist, values are scrubbed", async () => {
+  assert.equal(scrubValue("https://a.webex.com/x/lsr.php?RCID=abc123#frag"), "https://a.webex.com/x/lsr.php");
+  assert.equal(scrubValue("https://example.com/hook?token=t&x=1"), "https://example.com/hook");
+  assert.equal(scrubValue("sip:u@h.example.com;pwd=1234;transport=tls"), "sip:u@h.example.com;transport=tls");
+  assert.equal(scrubValue("room@example.webex.com;pwd=9999"), "room@example.webex.com");
+  assert.equal(scrubValue("example.webex.com"), "example.webex.com");
+  assert.equal(scrubValue("Is the lobby on?"), "Is the lobby on?");
+  assert.deepEqual(
+    redactSecrets({ webLink: "https://x.webex.com/j.php?MTID=m1", hostKey: "123456", nested: [{ sipAddress: "sip:a@b;pwd=9" }], count: 2 }),
+    { webLink: "https://x.webex.com/j.php", hostKey: "[REDACTED]", nested: [{ sipAddress: "sip:a@b" }], count: 2 },
+  );
+
+  const projectedPeople = projectSurface("people", [{
+    id: "u1", displayName: "A", emails: ["a@example.com"], type: "person", roles: ["r1"], created: "2021-01-01T00:00:00.000Z",
+    guestIssuerKey: "k", sipAddresses: [{ value: "sip:a@b;pwd=1" }], phoneNumbers: [{ value: "+1" }], nickName: "A",
+  }]);
+  assert.deepEqual(projectedPeople, [{ id: "u1", displayName: "A", emails: ["a@example.com"], type: "person", roles: ["r1"], created: "2021-01-01T00:00:00.000Z" }]);
+  assert.deepEqual(projectSurface("roles", [{ id: "r1", name: "Full Administrator", extra: { deep: "x" } }]), [{ id: "r1", name: "Full Administrator" }]);
+  assert.deepEqual(
+    projectSurface("meeting_common_settings", [{
+      siteUrl: "a.webex.com",
+      siteOptions: { allowCustomPersonalRoomURL: true },
+      securityOptions: { joinBeforeHost: false, requireStrongPassword: true, passwordCriteria: { minLength: 8, disallowValues: ["password"], extra: 1 }, unknownFlag: true },
+    }]),
+    [{ siteUrl: "a.webex.com", securityOptions: { joinBeforeHost: false, requireStrongPassword: true, passwordCriteria: { minLength: 8, disallowValues: ["password"] } } }],
+  );
+  assert.deepEqual(projectSurface("guest_count", { count: 3, raw: { body: "3" } }), { count: 3 });
+  assert.deepEqual(projectSurface("organization", "not-an-object"), undefined);
+
+  for (const assessment of await allAssessments(compliantClient())) {
+    for (const name of Object.keys(assessment.rawData)) {
+      assert.ok(name in WEBEX_SURFACE_FIELDS, `${assessment.category} stores surface ${name} without an allowlist`);
+    }
+  }
+  const identity = await assessWebexIdentity(secretClient());
+  assert.ok(!JSON.stringify(identity).includes(FAKE_SECRETS.person_guest_issuer_key));
+  assert.deepEqual(Object.keys(byId(identity.findings, "WEBEX-ID-01").evidence.organization).sort(), ["created", "displayName", "id"]);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
