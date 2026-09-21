@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1140,13 +1141,13 @@ test("OciCommandError never echoes stderr or stdout and parseServiceError keeps 
 
 test("error-body walk: no CLI surface echoes a stderr or stdout canary into findings, summaries, errors, bundle files, the zip, or thrown errors", async () => {
   assert.deepEqual([...CLI_SURFACES].sort(), INVENTORY_SWEEP.map((entry) => entry.method).sort(), "the walk covers every prototype surface and the sweep table has not drifted");
-  const base = createTempBase("grclanker-oci-error-body-");
   const walked = [];
   for (const entry of INVENTORY_SWEEP) {
     for (const shape of ERROR_BODY_SHAPES) {
       const label = `${entry.method} / ${shape.name}`;
       const command = `oci ${entry.command}`;
       const disclosure = shape.disclosure(command);
+      const base = createTempBase("grclanker-oci-error-body-");
       const thrown = [];
       const real = new OciAuditorClient(
         sampleConfig(),
@@ -1198,6 +1199,7 @@ test("error-body walk: no CLI surface echoes a stderr or stdout canary into find
       }
       const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
       assert.ok(errorsLog.includes(disclosure), `${label}: _errors.log discloses the failure`);
+      rmSync(base, { recursive: true, force: true });
       walked.push(label);
     }
   }
