@@ -100,6 +100,10 @@ Every finding carries the spec mapping table values for FedRAMP, CMMC L2, SOC 2,
 - `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, one report per framework
 - `_errors.log`: only when collection partially failed
 
+Secret hygiene: nothing credential-bearing is written. Findings redact sensitive fields at creation (`accessUri`, `keyValue`, `token`, `key`, `secret*`, `*password*`, `privateKey`, `keyMaterial`, `wrappedKey`, `plaintext`, `ciphertext`, `authorization`, `userData`, and similar names keep the field name with a `[redacted]` marker), PEM blocks and `/p/<token>/n/` PAR URIs are scrubbed from every string including CLI error text, `core_data/compartments.json` is projected to `id`, `compartmentId`, `name`, `lifecycleState`, and the config file path is replaced with `[redacted]` in `metadata.json` and `core_data/access.json`. A regression test writes a bundle from fixtures carrying `FAKE_` secrets in every collected object and asserts none appears in any bundle file or zip entry.
+
+Cap exits: every capped loop (`max_compartments`, `max_keys`, `max_policies`, `max_buckets`) records the cap hit, reports seen versus total in the summary and evidence (`credentials_total` is `null` when the credential cap stopped enumeration), and withholds `pass`.
+
 ## Live smoke
 
 ```
