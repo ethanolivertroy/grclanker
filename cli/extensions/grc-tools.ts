@@ -49,6 +49,7 @@ import { registerSalesforceTools } from "./grc-tools/salesforce.js";
 import { registerScfTools } from "./grc-tools/scf.js";
 import { registerServicenowTools } from "./grc-tools/servicenow.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
+import { registerSumologicTools } from "./grc-tools/sumologic.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
@@ -87,6 +88,7 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerScfTools,
   registerServicenowTools,
   registerSlackTools,
+  registerSumologicTools,
   registerVantaTools,
   registerWebexTools,
   registerZoomTools,
