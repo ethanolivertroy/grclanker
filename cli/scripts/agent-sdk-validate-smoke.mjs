@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { listRegisteredGrcToolNames } from "../dist/agent-sdk/lib/registry.js";
 import { BUNDLED_SKILL_NAMES, WORKFLOW_NAMES } from "../dist/agent-sdk/lib/skills.js";
@@ -21,11 +23,27 @@ function resolveAgentSdkBin() {
   }
 }
 
+/**
+ * Run an `agent-sdk` command and return its stdout.
+ *
+ * The child's stdout is a temp file, not a pipe: `agent-sdk info --json`
+ * writes with a bare `process.stdout.write` and then calls `process.exit`,
+ * so with a pipe only the first 64 KiB survives and the 107-tool payload is
+ * truncated mid-JSON. Writes to a file descriptor complete synchronously.
+ */
 function runAgentSdk(bin, args) {
-  return execFileSync(process.execPath, [bin, ...args, "--dir", agentSdkDir], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "inherit"],
-  });
+  const captureDir = mkdtempSync(join(tmpdir(), "grclanker-agent-sdk-smoke-"));
+  const stdoutPath = join(captureDir, "stdout.txt");
+  const stdoutFd = openSync(stdoutPath, "w");
+  try {
+    execFileSync(process.execPath, [bin, ...args, "--dir", agentSdkDir], {
+      stdio: ["ignore", stdoutFd, "inherit"],
+    });
+    return readFileSync(stdoutPath, "utf8");
+  } finally {
+    closeSync(stdoutFd);
+    rmSync(captureDir, { recursive: true, force: true });
+  }
 }
 
 const sdk = resolveAgentSdkBin();
