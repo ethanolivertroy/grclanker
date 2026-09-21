@@ -3,14 +3,15 @@ slug: "newrelic-sec-inspector"
 name: "New Relic Security Inspector"
 vendor: "New Relic"
 category: "monitoring-logging-observability"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/newrelic-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/newrelic-sec-inspector"
 ---
 
-# New Relic Security Inspector — Architecture Specification
+# New Relic Security Inspector: Architecture Specification
 
 ## 1. Overview
 
@@ -113,26 +114,26 @@ Alternatively, configure via `~/.newrelic-sec-inspector/config.yaml` or CLI flag
 
 ## 4. Security Controls
 
-1. **SSO/SAML Enforcement** — Verify SAML identity provider is configured and SSO is enforced on the authentication domain.
-2. **User Type Least Privilege** — Ensure users are assigned the minimum user type (basic, core, full platform) required for their role.
-3. **Admin User Minimization** — Detect excessive number of users with admin or organization manager roles.
-4. **API Key Inventory** — Enumerate all user keys, ingest keys, and browser keys; identify keys with excessive scope.
-5. **API Key Age** — Detect user API keys older than 90 days without rotation.
-6. **Unused API Keys** — Identify API keys with no recent activity (via NrAuditEvent queries).
-7. **Account Access Controls** — Verify users have access only to accounts required for their role.
-8. **Cross-Account Access Restrictions** — Detect users with access to production and non-production accounts simultaneously.
-9. **Alert Policy Coverage** — Ensure critical infrastructure entities have associated alert policies.
-10. **Alert Notification Channels** — Verify alert notifications route to approved destinations (not personal email).
-11. **Data Retention Settings** — Confirm data retention periods meet compliance requirements per data type.
-12. **Log Obfuscation Rules** — Verify obfuscation rules are configured to mask PII, credentials, and sensitive data in logs.
-13. **Synthetic Monitor Security** — Check that synthetic monitor scripts do not contain hardcoded credentials; verify secure credential storage.
-14. **Dashboard Permissions** — Detect dashboards with overly broad sharing (public or org-wide for sensitive data).
-15. **Logs in Context Security** — Verify application logs forwarded to New Relic do not contain plaintext secrets or tokens.
-16. **Infrastructure Agent Configuration** — Check infrastructure agent settings for secure communication (TLS, proxy config).
-17. **Applied Intelligence Sensitivity** — Review incident intelligence settings to prevent sensitive data exposure in correlations.
-18. **Authentication Domain Configuration** — Verify authentication domain settings (provisioning type, user type management).
-19. **Inactive User Accounts** — Detect user accounts that have not logged in within 90 days.
-20. **Custom Role Permissions** — Audit custom roles for overly permissive capability grants.
+1. **SSO/SAML Enforcement**: Verify SAML identity provider is configured and SSO is enforced on the authentication domain.
+2. **User Type Least Privilege**: Ensure users are assigned the minimum user type (basic, core, full platform) required for their role.
+3. **Admin User Minimization**: Detect excessive number of users with admin or organization manager roles.
+4. **API Key Inventory**: Enumerate all user keys, ingest keys, and browser keys; identify keys with excessive scope.
+5. **API Key Age**: Detect user API keys older than 90 days without rotation.
+6. **Unused API Keys**: Identify API keys with no recent activity (via NrAuditEvent queries).
+7. **Account Access Controls**: Verify users have access only to accounts required for their role.
+8. **Cross-Account Access Restrictions**: Detect users with access to production and non-production accounts simultaneously.
+9. **Alert Policy Coverage**: Ensure critical infrastructure entities have associated alert policies.
+10. **Alert Notification Channels**: Verify alert notifications route to approved destinations (not personal email).
+11. **Data Retention Settings**: Confirm data retention periods meet compliance requirements per data type.
+12. **Log Obfuscation Rules**: Verify obfuscation rules are configured to mask PII, credentials, and sensitive data in logs.
+13. **Synthetic Monitor Security**: Check that synthetic monitor scripts do not contain hardcoded credentials; verify secure credential storage.
+14. **Dashboard Permissions**: Detect dashboards with overly broad sharing (public or org-wide for sensitive data).
+15. **Logs in Context Security**: Verify application logs forwarded to New Relic do not contain plaintext secrets or tokens.
+16. **Infrastructure Agent Configuration**: Check infrastructure agent settings for secure communication (TLS, proxy config).
+17. **Applied Intelligence Sensitivity**: Review incident intelligence settings to prevent sensitive data exposure in correlations.
+18. **Authentication Domain Configuration**: Verify authentication domain settings (provisioning type, user type management).
+19. **Inactive User Accounts**: Detect user accounts that have not logged in within 90 days.
+20. **Custom Role Permissions**: Audit custom roles for overly permissive capability grants.
 
 ## 5. Compliance Framework Mappings
 
@@ -236,6 +237,21 @@ newrelic-sec-inspector/
 - **Multi-account support**: Iterates across all accounts in the organization for comprehensive coverage
 - **Region-aware**: Supports both US and EU datacenters with automatic endpoint resolution
 
+### grclanker implementation
+
+The shipped implementation lives in grclanker as native TypeScript rather than the Go layout above: `cli/extensions/grc-tools/newrelic.ts` (client, collectors, assessments, bundle export, tool registration), `cli/tests/newrelic.test.mjs` (mocked coverage), `cli/scripts/newrelic-live-smoke.mjs` (`npm --prefix cli run test:newrelic:live`), and the integration guide at `src/content/docs/docs/integrations/newrelic.md`. It registers six read-only tools:
+
+| Tool | Spec controls |
+|------|---------------|
+| `newrelic_check_access` | Probes actor.user, accounts, organization, user management, authorization management, apiAccess.keySearch, NRQL (NrAuditEvent), entity search, alerts, data management, log configurations, and REST v2 users |
+| `newrelic_assess_identity` | 1, 2, 3, 18, 19 |
+| `newrelic_assess_access_control` | 4, 5, 6, 7, 8, 20 |
+| `newrelic_assess_alerting` | 9, 10, 17 |
+| `newrelic_assess_data_governance` | 11, 12, 13, 14, 15, 16 |
+| `newrelic_export_audit_bundle` | All 20, written as `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip |
+
+Findings are normalized as `{ id, control, title, severity, status, summary, evidence, mappings }` with status `pass`, `warn`, `fail`, or `manual`; every finding carries the eight framework mappings from section 5 for its control. Configuration precedence is tool arguments, then `NEW_RELIC_API_KEY`, `NEW_RELIC_ACCOUNT_ID`, `NEW_RELIC_REGION` (plus `NEW_RELIC_SEC_INSPECTOR_CONFIG`, `NEW_RELIC_TIMEOUT`, `NEW_RELIC_AUDIT_WINDOW_DAYS`), then `~/.newrelic-sec-inspector/config.yaml`.
+
 ## 8. CLI Interface
 
 ```
@@ -324,4 +340,30 @@ make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) on 2026-09-21. See the "grclanker implementation" subsection in section 7 and the integration guide at `src/content/docs/docs/integrations/newrelic.md`.
+
+### What shipped
+
+- Six read-only tools (`newrelic_check_access`, four `newrelic_assess_*` tools, `newrelic_export_audit_bundle`) covering all 20 controls in section 4. Controls that the API cannot establish produce `manual` findings that name the exact UI evidence to collect: 16 (agent transport configuration) always, 20 whenever custom roles exist, 17 unless an enrichment routes to an external destination, 6 for keys without owner signals, and 1 when `authenticationType` is not exposed.
+- Every finding carries the eight framework mappings from section 5 for its control; the bundle writes an executive summary, a unified compliance matrix, and one report per framework.
+- `Api-Key` authentication with a User key, US and EU endpoints, `NEW_RELIC_API_KEY`, `NEW_RELIC_ACCOUNT_ID`, `NEW_RELIC_REGION`, `~/.newrelic-sec-inspector/config.yaml`, and explicit tool arguments with the precedence arguments > environment > config file.
+- NerdGraph cursor pagination, REST v2 `Link` header and `page=` pagination, retry with backoff on 429 and 5xx honoring `Retry-After` and `X-RateLimit-Reset`, request timeouts, and API key redaction in errors.
+- 34 mocked tests in `cli/tests/newrelic.test.mjs` and a live smoke script (`npm --prefix cli run test:newrelic:live`) that skips without credentials.
+
+### Deviations from this spec, following the official documentation
+
+- User enumeration uses `actor.organization.userManagement.authenticationDomains.users` (with `type`, `lastActive`, `email`) as documented in the NerdGraph user management tutorial, not `actor.users.userSearch`. Group access grants come from `organization.authorizationManagement.authenticationDomains.groups.roles` and the role catalog from `organization.authorizationManagement.roles`, as documented in the groups and access grants tutorial.
+- The root fields `alertsPoliciesSearch`, `dashboardSearch`, `logConfigurationsSearch`, and `syntheticMonitorSearch` listed in section 2 are not documented NerdGraph paths. The implementation uses `actor.account.alerts.policiesSearch` and `nrqlConditionsSearch`, `actor.entitySearch` (`type = 'DASHBOARD'`, `domain = 'SYNTH' AND type = 'MONITOR'`, `domain = 'SYNTH' AND type = 'SECURE_CRED'`, `type = 'WORKLOAD'`, `alertSeverity IS NOT NULL`), `actor.account.logConfigurations.obfuscationRules`, `actor.account.synthetics.script`, and `actor.dashboard.liveUrls`.
+- REST API v2 has no `/v2/notification_channels.json`; the legacy endpoint is `/v2/alerts_channels.json`. Notification posture is read from NerdGraph `aiNotifications.destinations`, `aiNotifications.channels`, and `aiWorkflows.workflows` instead. REST v2 is used only for `GET /v2/users.json`, which the documentation limits to the original user model, so it is informational.
+- `NrAuditEvent` only records configuration changes. The implementation queries `WHERE actorType = 'api_key'` and `WHERE actionIdentifier LIKE 'api_key%'` for key activity and reads retention through `actor.account.dataManagement.eventRetentionRules` instead of the `NrdbQuery ... LIKE '%retention%'` query from section 2.
+- `authenticationType` is exposed only by `customerAdministration.authenticationDomains`, which serves multi-tenant organizations. Single-tenant organizations receive a `manual` SSO finding. `provisioningType` (SCIM or manual) is read from `userManagement`.
+- NRQL drop rules reached end of life. Pipeline Control cloud rules (`actor.entityManagement.entitySearch(query: "type = 'PIPELINE_CLOUD_RULE'")`) are collected first and `nrqlDropRules.list` best effort.
+- The permission identifiers in section 3 (`organization.read`, `api_key.read`, and so on) are not New Relic permission names. `newrelic_check_access` probes each read surface instead and recommends a User key from a core or full platform user with the Organization manager and Authentication domain manager roles plus group access to every account in scope.
+- `apiAccess.keySearch` is paginated with `cursor` when the schema accepts it and falls back to a single page otherwise.
+- The REST API v2 documents a limit of 1000 calls per minute per key with `X-RateLimit-*` headers; the client retries 429 responses with the documented headers.
+
+### What remains
+
+- SARIF, CSV, HTML, and TUI output from section 8 are not shipped; findings are available as JSON, Markdown reports, and a zip bundle.
+- Read-only key usage (control 6), custom role capabilities (control 20), correlation decision settings (control 17), session and user upgrade settings (control 18), and infrastructure agent transport settings (control 16) remain UI evidence until NerdGraph exposes them.
+- Live verification against an EU region organization and a multi-tenant organization is pending; both paths are covered by mocked tests only.
