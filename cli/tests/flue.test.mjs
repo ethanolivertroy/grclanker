@@ -79,7 +79,7 @@ delete process.env.GRCLANKER_FLUE_SANDBOX;
 const { Grclanker, prepareGrclankerAgent } = await import("../dist/flue/agent.js");
 
 const AGENT_IDENTITY_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$/;
-const DOMAIN_TOOL_COUNT = 107;
+const DOMAIN_TOOL_COUNT = 219;
 
 // The Pi CLI's own argument validation (pi-ai 0.80.2, the copy the CLI runs),
 // used as the oracle the adapter is compared against.
