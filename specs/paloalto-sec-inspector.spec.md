@@ -3,11 +3,11 @@ slug: "paloalto-sec-inspector"
 name: "Palo Alto Security Inspector"
 vendor: "Palo Alto Networks"
 category: "security-network-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/paloalto-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # paloalto-sec-inspector -- Architecture Specification
@@ -23,6 +23,19 @@ Palo Alto Networks is a leading cybersecurity platform that provides network sec
 3. **PAN-OS Firewalls / Panorama** -- Network security device configuration: security rules, zone segmentation, threat prevention profiles, SSL/TLS decryption, GlobalProtect VPN, WildFire analysis, URL filtering, admin roles, and logging.
 
 The tool produces compliance-mapped audit reports against FedRAMP, CMMC 2.0, SOC 2, CIS Benchmarks, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP frameworks.
+
+### 1.1 grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/paloalto.ts` and registers these read-only tools:
+
+- `paloalto_check_access`: probes every Prisma Cloud and PAN-OS read surface and reports missing permissions
+- `paloalto_assess_cloud_posture`: controls 1-6 through the Prisma Cloud CSPM API, plus manual findings for the Compute controls 7-11, 24, and 25
+- `paloalto_assess_firewall_policy`: controls 12-14 through the PAN-OS XML API
+- `paloalto_assess_threat_prevention`: controls 16-18, 21, and 22
+- `paloalto_assess_device_hardening`: controls 15, 19, 20, and 23, plus HA state and software version findings
+- `paloalto_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified compliance matrix, per-framework reports, and a zip archive
+
+Regression coverage is in `cli/tests/paloalto.test.mjs`; the live smoke script is `npm --prefix cli run test:paloalto:live`; the integration guide is `src/content/docs/docs/integrations/paloalto.md`.
 
 ## 2. APIs & SDKs
 
@@ -412,4 +425,27 @@ paloalto-inspector test-connection \
 
 ## 10. Status
 
-**Not yet implemented. Spec only.**
+**Implemented in grclanker (TypeScript) as native tools; the standalone Python/Go layout in sections 7-9 was not built.**
+
+What shipped:
+
+- Prisma Cloud CSPM client with `POST /login` JWT auth, re-login on `401`, `429`/`5xx` retry with backoff, timeouts, pagination for `GET /v2/alert` (`pageToken`/`nextPageToken`), and secret redaction in errors
+- PAN-OS XML API client with `type=keygen` (credentials in the POST body), `X-PAN-KEY` header auth, a dependency-free XML parser, `type=op` show commands, and `type=config&action=show` subtree collection for firewalls and Panorama
+- All 25 controls emit a finding: controls 1-6 and 12-23 are evaluated from API evidence; controls 7-11, 24, and 25 (Prisma Cloud Compute) are `manual` findings that state the evidence to collect; when only one product is configured the other product's controls also become `manual`
+- Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip archive
+
+Deviations from this spec, following the official documentation:
+
+- Compliance posture uses `GET /v2/compliance/posture` (documented V2 endpoint) rather than `/compliance/posture`
+- Alert rules use `GET /v2/alert/rule`; the `/alert/policy` path in section 2.1 is not a documented endpoint
+- IAM overprivilege is evaluated from IAM-type policies (`GET /v2/policy`) and open `iam` alerts (`GET /v2/alert`) instead of the `/api/v1/permission` and `/iam/query` endpoints, whose documentation pages could not be verified from public sources during implementation
+- Audit log retrieval is documented as `POST /audit/api/v1/log`, not `/audit/redlock`; the implementation does not need audit logs
+- The Prisma Cloud JWT is refreshed by logging in again; `GET /auth_token/extend` is documented and could replace that
+- `GET /integration` is used for the SIEM check in control 20; its reference page could not be fetched during implementation, so a failure on that surface degrades to a warning and is written to `_errors.log`
+- The PAN-OS REST API (section 2.4) is not used; every device read goes through the XML API so one client covers PAN-OS 9.x through 11.x and Panorama
+
+What remains:
+
+- Prisma Cloud Compute (CWPP) API coverage for controls 7-11, 24, and 25
+- WildFire cloud connectivity (`show wildfire status`), GlobalProtect HIP requirements, admin MFA enforcement details, and log retention quotas are surfaced as review notes rather than automated checks
+- Framework-specific output formats such as STIG CKL XML
