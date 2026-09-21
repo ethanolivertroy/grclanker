@@ -17,6 +17,7 @@ import {
   assessSalesforcePlatformSecurity,
   buildJwtAssertion,
   checkSalesforceAccess,
+  collectProfileMetadata,
   decodeJwtClaims,
   exportSalesforceAuditBundle,
   parseSimpleXml,
@@ -834,6 +835,290 @@ test("false-pass self-check (c): partial or truncated inventories never pass (ru
   assert.match(findingById(results[1], "SF-10").summary, /Only 3 of 5003 User records were read/);
 });
 
+const SOAP_ENVELOPE_OPEN = "<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns=\"http://soap.sforce.com/2006/04/metadata\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><soapenv:Body>";
+const SOAP_ENVELOPE_CLOSE = "</soapenv:Body></soapenv:Envelope>";
+const ALL_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+
+test("review fix 1: control 6 reads Profile metadata loginHours and control 5 closes per-profile loginIpRanges through listMetadata and batched readMetadata", async () => {
+  const soapBodies = [];
+  const manyProfiles = Array.from({ length: 12 }, (_, index) => ({ Id: `P-${index}`, Name: `Elevated ${index}`, PermissionsApiEnabled: true, PermissionsModifyAllData: true }));
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.pathname !== "/services/Soap/m/64.0") return jsonResponse({}, { status: 404 });
+    soapBodies.push(init.body);
+    if (init.body.includes("<met:listMetadata>")) {
+      const results = manyProfiles.map((profile) => `<result><fullName>Full_${profile.Id}</fullName><id>${profile.Id}</id><type>Profile</type><fileName>profiles/Full_${profile.Id}.profile</fileName></result>`).join("");
+      return xmlResponse(`${SOAP_ENVELOPE_OPEN}<listMetadataResponse>${results}</listMetadataResponse>${SOAP_ENVELOPE_CLOSE}`);
+    }
+    const names = [...init.body.matchAll(/<met:fullNames>([^<]+)<\/met:fullNames>/g)].map((match) => match[1]);
+    const records = names.map((name) => `<records xsi:type="Profile"><fullName>${name}</fullName><custom>true</custom><loginHours><mondayStart>480</mondayStart><mondayEnd>1080</mondayEnd></loginHours><loginIpRanges><startAddress>10.0.0.1</startAddress><endAddress>10.0.0.9</endAddress></loginIpRanges><userPermissions><enabled>true</enabled><name>ModifyAllData</name></userPermissions></records>`).join("");
+    return xmlResponse(`${SOAP_ENVELOPE_OPEN}<readMetadataResponse><result>${records}</result></readMetadataResponse>${SOAP_ENVELOPE_CLOSE}`);
+  };
+  const client = new SalesforceApiClient(sampleConfig(), { fetchImpl });
+  const dataset = await collectProfileMetadata(client, okDataset("Profile", manyProfiles));
+  assert.equal(dataset.status, "ok");
+  assert.equal(dataset.seen, 12);
+  assert.equal(dataset.total, 12);
+  assert.equal(dataset.truncated, false);
+  assert.match(soapBodies[0], /<met:listMetadata><met:queries><met:type>Profile<\/met:type><\/met:queries><met:asOfVersion>64\.0<\/met:asOfVersion><\/met:listMetadata>/);
+  const readCalls = soapBodies.filter((body) => body.includes("<met:readMetadata>"));
+  assert.equal(readCalls.length, 2, "12 profiles are read in batches of 10");
+  assert.equal((readCalls[0].match(/<met:fullNames>/g) ?? []).length, 10);
+  assert.equal((readCalls[1].match(/<met:fullNames>/g) ?? []).length, 2);
+  assert.match(readCalls[0], /<met:type>Profile<\/met:type><met:fullNames>Full_P-0<\/met:fullNames>/);
+  assert.equal(dataset.data[11]._fullName, "Full_P-11");
+  assert.equal(dataset.data[11]._profileName, "Elevated 11");
+  assert.equal(dataset.data[11]._resolved, true);
+  assert.equal(dataset.data[11].loginHours.mondayStart, "480");
+
+  const good = assessSalesforceIdentityData(goodIdentityData(), { now: NOW });
+  assert.equal(findingById(good, "SF-06").status, "pass");
+  assert.deepEqual(findingById(good, "SF-06").evidence.profiles_without_login_hours, []);
+  const goodPlatform = assessSalesforcePlatformData(goodPlatformData());
+  assert.equal(findingById(goodPlatform, "SF-05").status, "pass");
+  assert.deepEqual(findingById(goodPlatform, "SF-05").evidence.profiles_with_login_ip_ranges, ["System Administrator (1)"]);
+
+  const bare = [{ fullName: "Admin", custom: "false" }];
+  const noHours = assessSalesforceIdentityData(goodIdentityData({ profileMetadata: profileMetadataDataset(bare) }), { now: NOW });
+  assert.equal(findingById(noHours, "SF-06").status, "fail");
+  assert.deepEqual(findingById(noHours, "SF-06").evidence.profiles_without_login_hours, ["System Administrator"]);
+  const noProfileRanges = assessSalesforcePlatformData(goodPlatformData({ profileMetadata: profileMetadataDataset(bare) }));
+  assert.equal(findingById(noProfileRanges, "SF-05").status, "warn", "org-wide ranges without per-profile ranges is a gap, not a pass");
+  assert.match(findingById(noProfileRanges, "SF-05").summary, /1\/1 sensitive profiles have no login IP ranges/);
+  const noRangesAnywhere = securitySettingsFixture();
+  noRangesAnywhere.networkAccess = {};
+  const nothing = assessSalesforcePlatformData(goodPlatformData({ profileMetadata: profileMetadataDataset(bare), securitySettings: okDataset("SecuritySettings", noRangesAnywhere) }));
+  assert.equal(findingById(nothing, "SF-05").status, "fail");
+
+  const allDay = Object.fromEntries(ALL_WEEKDAYS.flatMap((day) => [[`${day}Start`, "0"], [`${day}End`, "1440"]]));
+  const fullDay = assessSalesforceIdentityData(goodIdentityData({ profileMetadata: profileMetadataDataset([{ fullName: "Admin", loginHours: allDay }]) }), { now: NOW });
+  assert.equal(findingById(fullDay, "SF-06").status, "fail", "a full-day window on every day is not a restriction");
+
+  const mixed = okDataset("Profile metadata", [
+    { ...goodProfileMetadataRecords[0], _profileId: "P-admin", _profileName: "System Administrator", _fullName: "Admin", _resolved: true },
+    { _profileId: "P-x", _profileName: "Custom Admin", _fullName: null, _resolved: false },
+  ], { seen: 1 });
+  const partial = assessSalesforceIdentityData(goodIdentityData({ profileMetadata: mixed }), { now: NOW });
+  assert.equal(findingById(partial, "SF-06").status, "warn", "an unresolved sensitive profile never passes");
+  assert.deepEqual(findingById(partial, "SF-06").evidence.profiles_unresolved, ["Custom Admin"]);
+  const partialPlatform = assessSalesforcePlatformData(goodPlatformData({ profileMetadata: mixed }));
+  assert.equal(findingById(partialPlatform, "SF-05").status, "warn");
+
+  const denied = forbiddenDataset("Profile metadata", []);
+  const manual = assessSalesforceIdentityData(goodIdentityData({ profileMetadata: denied }), { now: NOW });
+  assert.equal(findingById(manual, "SF-06").status, "manual");
+  assert.match(findingById(manual, "SF-06").summary, /forbidden.*Modify Metadata Through Metadata API Functions or Modify All Data/);
+  const manualPlatform = assessSalesforcePlatformData(goodPlatformData({ profileMetadata: denied }));
+  assert.equal(findingById(manualPlatform, "SF-05").status, "manual");
+  assert.match(findingById(manualPlatform, "SF-05").summary, /1 org-wide trusted IP ranges are defined.*per-profile login IP ranges could not be verified because/);
+
+  const forbiddenProfiles = await collectProfileMetadata(createFullMockClient({ async listProfileMetadata() { throw forbidden(); } }), okDataset("Profile", goodProfiles));
+  assert.equal(forbiddenProfiles.status, "forbidden");
+  assert.equal(forbiddenProfiles.total, 1);
+});
+
+test("review fix 2: identity verdicts render manual when no administrator-class population is visible (rule 5)", () => {
+  const withoutAdminProfile = goodProfiles.filter((profile) => profile.Id !== "P-admin");
+  const lonely = assessSalesforceIdentityData(goodIdentityData({
+    users: okDataset("User", [goodUsers[1]]),
+    profiles: okDataset("Profile", withoutAdminProfile),
+    profileMetadata: okDataset("Profile metadata", []),
+  }), { now: NOW });
+  for (const id of ["SF-04", "SF-06", "SF-07", "SF-09", "SF-10", "SF-13"]) {
+    const item = findingById(lonely, id);
+    assert.equal(item.status, "manual", `${id} must not pass without a visible System Administrator profile: ${item.summary}`);
+    assert.match(item.summary, /permission-limited view/);
+    assert.ok(item.manualEvidence);
+  }
+  assert.deepEqual(findingById(lonely, "SF-10").evidence.admin_profiles, []);
+
+  const noActiveAdmins = assessSalesforceIdentityData(goodIdentityData({
+    users: okDataset("User", [goodUsers[1], goodUsers[2]]),
+  }), { now: NOW });
+  for (const id of ["SF-04", "SF-07", "SF-09", "SF-10", "SF-13"]) {
+    const item = findingById(noActiveAdmins, id);
+    assert.equal(item.status, "manual", `${id} must not pass when zero active administrators are visible: ${item.summary}`);
+    assert.match(item.summary, /View All Users is likely missing/);
+  }
+  assert.equal(findingById(noActiveAdmins, "SF-10").evidence.active_admins_seen, 0);
+  assert.deepEqual(findingById(noActiveAdmins, "SF-10").evidence.admin_profiles, ["System Administrator"]);
+  assert.equal(findingById(noActiveAdmins, "SF-06").status, "pass", "login hours depend on the profile list, which is complete here");
+  assert.equal(noActiveAdmins.summary.population_view_issue !== null, true);
+
+  const healthy = assessSalesforceIdentityData(goodIdentityData(), { now: NOW });
+  assert.equal(healthy.summary.population_view_issue, null);
+  assert.equal(findingById(healthy, "SF-10").status, "pass");
+});
+
+test("review fixes 3, 5, and 6: SOQL selects only documented fields and probes Permissions* fields through describe", async () => {
+  const queries = [];
+  const describedObjects = [];
+  const describeFields = {
+    Profile: ["Id", "Name", "PermissionsApiEnabled", "PermissionsModifyAllData", "PermissionsViewAllData", "PermissionsManageUsers", "PermissionsAuthorApex"],
+    PermissionSet: ["Id", "Name", "PermissionsApiEnabled", "PermissionsModifyAllData", "PermissionsViewAllData", "PermissionsManageUsers", "PermissionsAuthorApex", "PermissionsCustomizeApplication"],
+    UserPermissionAccess: ["LastCacheUpdate", "PermissionsCustomizeApplication", "PermissionsViewAllUsers"],
+  };
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith("/describe")) {
+      const object = url.pathname.split("/").at(-2);
+      describedObjects.push(object);
+      return jsonResponse({ name: object, fields: (describeFields[object] ?? []).map((name) => ({ name })) });
+    }
+    if (url.pathname === "/services/data/v64.0/query") {
+      queries.push(url.searchParams.get("q"));
+      return jsonResponse({ totalSize: 1, done: true, records: [{ PermissionsCustomizeApplication: false, PermissionsViewAllUsers: true }] });
+    }
+    return jsonResponse({}, { status: 404 });
+  };
+  const fieldsOf = (soql) => soql.replace(/^SELECT\s+/i, "").split(/\s+FROM\s+/i)[0].split(",").map((field) => field.trim());
+  const client = new SalesforceApiClient(sampleConfig(), { fetchImpl });
+
+  const profiles = await client.listProfiles();
+  assert.deepEqual(profiles.omittedFields, ["PermissionsApiUserOnly", "PermissionsCustomizeApplication", "PermissionsViewSetup", "PermissionsManageProfilesPermissionsets", "PermissionsPasswordNeverExpires"]);
+  const profileFields = fieldsOf(queries.at(-1));
+  assert.ok(!profileFields.includes("PermissionsApiUserOnly"));
+  assert.ok(profileFields.includes("PermissionsAuthorApex"));
+  for (const field of ["PermissionsApiEnabled", "PermissionsModifyAllData", "PermissionsViewAllData", "PermissionsManageUsers"]) {
+    assert.ok(profileFields.includes(field), `${field} is always selected`);
+  }
+  await client.listProfiles();
+  assert.equal(describedObjects.filter((object) => object === "Profile").length, 1, "describe results are cached per object");
+
+  const permissionSets = await client.listPermissionSets();
+  assert.deepEqual(permissionSets.omittedFields, ["PermissionsViewSetup", "PermissionsManageProfilesPermissionsets", "PermissionsPasswordNeverExpires"]);
+  assert.ok(fieldsOf(queries.at(-1)).includes("PermissionsCustomizeApplication"));
+  assert.ok(!fieldsOf(queries.at(-1)).includes("PermissionsApiUserOnly"));
+
+  const caller = await client.getCallerPermissions();
+  assert.deepEqual(fieldsOf(queries.at(-1)).sort(), ["PermissionsCustomizeApplication", "PermissionsViewAllUsers"]);
+  assert.match(queries.at(-1), /FROM UserPermissionAccess$/);
+  assert.equal(caller.PermissionsCustomizeApplication, false);
+
+  await client.listOauthTokens();
+  const documentedOauthToken = new Set(["AccessToken", "AppMenuItemId", "AppName", "DeleteToken", "Id", "LastUsedDate", "RequestToken", "UseCount", "UserId"]);
+  for (const field of fieldsOf(queries.at(-1))) assert.ok(documentedOauthToken.has(field), `${field} is not a documented OauthToken field`);
+  assert.ok(!queries.at(-1).includes("CreatedDate"));
+
+  await client.listConnectedApplications();
+  const documentedConnectedApp = new Set(["Id", "Name", "MobileSessionTimeout", "MobileStartUrl", "NamedUserUvidTimeout", "OptionsAllowAdminApprovedUsersOnly", "OptionsAppIssueJwtTokenEnabled", "OptionsHasSessionLevelPolicy", "OptionsRefreshTokenValidityMetric", "OptionsTokenExchangeManageBitEnabled", "PinLength", "RefreshTokenValidityPeriod", "StartUrl", "UvidTimeout"]);
+  for (const field of fieldsOf(queries.at(-1))) assert.ok(documentedConnectedApp.has(field), `${field} is not a documented ConnectedApplication field`);
+  assert.ok(!/CreatedDate|LastModifiedDate|OptionsIsInternal|OptionsCodeCredentialGuestEnabled/.test(queries.at(-1)));
+
+  await client.listTwoFactorMethods();
+  const documentedTwoFactor = new Set(["ExternalId", "HasBuiltInAuthenticator", "HasSalesforceAuthenticator", "HasSecurityKey", "HasTempCode", "HasTotp", "HasU2F", "HasUserVerifiedEmailAddress", "HasUserVerifiedMobileNumber", "HasVerifiedMobileNumber", "UserId"]);
+  const twoFactorFields = fieldsOf(queries.at(-1));
+  for (const field of twoFactorFields) assert.ok(documentedTwoFactor.has(field), `${field} is not a documented TwoFactorMethodsInfo field`);
+  assert.ok(!twoFactorFields.includes("Id"));
+
+  const fallbackQueries = [];
+  const fallback = new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async (input) => {
+      const url = new URL(input);
+      if (url.pathname.endsWith("/describe")) return jsonResponse([{ errorCode: "NOT_FOUND", message: "no describe" }], { status: 404 });
+      fallbackQueries.push(url.searchParams.get("q"));
+      return jsonResponse({ totalSize: 0, done: true, records: [] });
+    },
+  });
+  const fallbackProfiles = await fallback.listProfiles();
+  assert.deepEqual(fallbackProfiles.omittedFields, []);
+  assert.ok(fallbackQueries[0].includes("PermissionsApiUserOnly"), "an unavailable describe falls back to the full documented list");
+
+  const omitted = assessSalesforceIdentityData(goodIdentityData({
+    profiles: okDataset("Profile", goodProfiles.map(({ PermissionsApiUserOnly, ...rest }) => rest), { omittedFields: ["PermissionsApiUserOnly"] }),
+  }), { now: NOW });
+  assert.equal(findingById(omitted, "SF-07").status, "pass");
+  assert.equal(findingById(omitted, "SF-07").evidence.api_only_flag_available, false);
+  assert.match(findingById(omitted, "SF-07").summary, /PermissionsApiUserOnly is not available in this org/);
+  assert.match(findingById(assessSalesforceIdentityData(goodIdentityData(), { now: NOW }), "SF-07").summary, /1 are API Only User profiles/);
+});
+
+test("review fix 4: TwoFactorMethodsInfo names Manage MFA in API and treats the 2500-row cap as a possibly truncated result", async () => {
+  const rows = Array.from({ length: 2500 }, (_, index) => ({ UserId: `U${index}`, HasTotp: true }));
+  let requestedLimitRows = 0;
+  const client = new SalesforceApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(input);
+      if (url.pathname === "/services/data/v64.0/query") {
+        requestedLimitRows = rows.length;
+        return jsonResponse({ totalSize: 2500, done: true, records: rows });
+      }
+      return jsonResponse({}, { status: 404 });
+    },
+  });
+  const capped = await client.listTwoFactorMethods();
+  assert.equal(requestedLimitRows, 2500);
+  assert.equal(capped.records.length, 2500);
+  assert.equal(capped.done, true);
+  assert.equal(capped.truncated, true, "2500 rows with done=true is the documented cap and must read as possibly truncated");
+
+  const cappedFinding = findingById(assessSalesforceIdentityData(goodIdentityData({
+    twoFactorMethods: okDataset("TwoFactorMethodsInfo", goodTwoFactor, { truncated: true }),
+  }), { now: NOW }), "SF-04");
+  assert.equal(cappedFinding.status, "warn");
+  assert.match(cappedFinding.summary, /documented 2500-row cap with no done=false signal/);
+  assert.equal(cappedFinding.evidence.two_factor_methods_possibly_capped, true);
+
+  const denied = findingById(assessSalesforceIdentityData(goodIdentityData({
+    twoFactorMethods: forbiddenDataset("TwoFactorMethodsInfo", []),
+  }), { now: NOW }), "SF-04");
+  assert.equal(denied.status, "manual");
+  assert.match(denied.summary, /requires the Manage MFA in API permission/);
+  assert.equal(denied.evidence.requires, "Manage MFA in API");
+
+  const access = await checkSalesforceAccess(createFullMockClient({ async listTwoFactorMethods() { throw forbidden(); } }));
+  const surface = access.surfaces.find((item) => item.name === "two_factor_methods");
+  assert.equal(surface.status, "not_readable");
+  assert.equal(surface.permissionHint, "Manage MFA in API");
+  assert.ok(access.missingPermissions.includes("Manage MFA in API"));
+});
+
+test("review fix 7: certificates with an unknown KeySize are reported and never counted as compliant", () => {
+  const result = assessSalesforceDataProtectionData(goodDataProtectionData({
+    certificates: okDataset("Certificate", [
+      { Id: "C6", DeveloperName: "nokeysize", ExpirationDate: "2027-09-01T00:00:00Z", KeySize: null, OptionsIsCaSigned: true, OptionsIsPrivateKeyExportable: false, OptionsIsUnusable: false },
+      { Id: "C7", DeveloperName: "strong", ExpirationDate: "2027-09-01T00:00:00Z", KeySize: 4096, OptionsIsCaSigned: true, OptionsIsPrivateKeyExportable: false, OptionsIsUnusable: false },
+    ]),
+  }), { now: NOW });
+  const item = findingById(result, "SF-17");
+  assert.equal(item.status, "warn");
+  assert.deepEqual(item.evidence.unknown_key_size, ["nokeysize (2027-09-01T00:00:00Z)"]);
+  assert.deepEqual(item.evidence.weak_keys, []);
+  assert.match(item.summary, /KeySize was not returned for 1, so they are not counted as compliant/);
+});
+
+test("review fix 8: OauthToken is a partial view without Customize Application and check_access names the permission", async () => {
+  const partial = findingById(assessSalesforceMonitoringData(goodMonitoringData({
+    callerPermissions: okDataset("UserPermissionAccess", { ...goodCallerPermissions, PermissionsCustomizeApplication: false }),
+  })), "SF-11");
+  assert.notEqual(partial.status, "pass");
+  assert.equal(partial.evidence.oauth_tokens_partial_view, true);
+  assert.equal(partial.evidence.caller_has_customize_application, false);
+  assert.match(partial.summary, /only the caller's own tokens without Customize Application \(caller permission: false\)/);
+
+  const unknown = findingById(assessSalesforceMonitoringData(goodMonitoringData({
+    callerPermissions: forbiddenDataset("UserPermissionAccess", undefined),
+  })), "SF-11");
+  assert.equal(unknown.evidence.oauth_tokens_partial_view, true);
+  assert.match(unknown.summary, /caller permission: unknown/);
+
+  const full = assessSalesforceMonitoringData(goodMonitoringData());
+  assert.equal(findingById(full, "SF-11").evidence.oauth_tokens_partial_view, false);
+  assert.equal(full.summary.caller_has_customize_application, true);
+
+  const access = await checkSalesforceAccess(createFullMockClient({
+    async getCallerPermissions() { return { ...goodCallerPermissions, PermissionsCustomizeApplication: false, PermissionsViewAllUsers: false }; },
+  }));
+  assert.equal(access.status, "limited");
+  assert.ok(access.missingPermissions.includes("Customize Application"));
+  assert.ok(access.missingPermissions.includes("View All Users"));
+  assert.ok(access.notes.some((note) => /Customize Application=false/.test(note)));
+  const tokenSurface = access.surfaces.find((surface) => surface.name === "oauth_tokens");
+  assert.equal(tokenSurface.status, "readable");
+  assert.match(tokenSurface.permissionHint, /Customize Application/);
+  assert.ok(access.surfaces.some((surface) => surface.name === "caller_permissions" && surface.status === "readable"));
+});
+
 test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports, quick reference, zip, and _errors.log on partial failure", async () => {
   const base = createTempBase("grclanker-sf-export-");
   const client = createFullMockClient({
@@ -853,6 +1138,8 @@ test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports
     "core_data/organization.json",
     "core_data/security_settings.json",
     "core_data/users.json",
+    "core_data/profile_metadata.json",
+    "core_data/caller_permissions.json",
     "core_data/login_history.json",
     "core_data/setup_audit_trail.json",
     "analysis/findings.json",
