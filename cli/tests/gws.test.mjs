@@ -369,8 +369,17 @@ function secretParameters(carrier) {
   ];
 }
 
-/** Every collected object type carries the planted secret in every carrier the reviewer used: camelCase keys, pair values, blobs, links. */
-function createSecretBearingCollector() {
+/**
+ * The run's own bearer credential in a shape no credential pattern recognizes (no ya29., AIza, GOCSPX-, or JWT form), so when the
+ * server echoes it into a documented free-text field only the known-value scrub inside writeBundleFile can remove it.
+ */
+const RUN_TOKEN = planted("run-bearer-plain-0123456789abcdef");
+
+/**
+ * Every collected object type carries the planted secret in every carrier the reviewer used: camelCase keys, pair values, blobs, links,
+ * plus the run credential echoed into two documented free-text fields (User.orgUnitPath, Alert.source) that projection keeps.
+ */
+function createSecretBearingCollector(runToken = RUN_TOKEN) {
   const withParameters = (item, carrier) => ({
     ...item,
     actor: { ...item.actor, key: planted(`${carrier}-actor-key`) },
@@ -389,6 +398,7 @@ function createSecretBearingCollector() {
   return createFakeCollector({
     collectUsers: async () => collection(createUsers().map((user) => ({
       ...user,
+      orgUnitPath: `/Engineering/${runToken}`,
       privateKey: planted("user-private-key"),
       customSchemas: { hr: { badge: planted("user-benign-key") } },
     }))),
@@ -408,6 +418,7 @@ function createSecretBearingCollector() {
     },
     collectAlerts: async () => collection(createAlerts().map((alert) => ({
       ...alert,
+      source: `Google Operations ${runToken}`,
       etag: planted("alert-etag"),
       securityInvestigationToolLink: `https://admin.google.com/ac/sc/investigation?token=${planted("alert-link-query")}`,
       data: {
@@ -1244,9 +1255,16 @@ test("rule 9: API error bodies reduce to documented status and reason identifier
   assert.deepEqual(describeErrorReasons({ error: "invalid_grant", error_description: "Invalid JWT Signature. token=PLANTED-VALUE-0123456789" }), ["error invalid_grant"]);
   assert.deepEqual(describeErrorReasons({ error: { code: 400, message: "only a free-text message" } }), []);
   assert.deepEqual(describeErrorReasons({ message: "top-level message only" }), []);
+  // Documented identifiers never carry `.`, `-`, or `/`, so dotted, hyphenated, and path-shaped values are dropped even when they look like identifiers.
+  assert.deepEqual(describeErrorReasons({ error: { status: "PLANTED-SECRET_reason_plain_identifier_0123", errors: [{ reason: "ya29.PLANTEDvalue0123" }] } }), []);
+  assert.deepEqual(describeErrorReasons({ error: { status: "1//0gPLANTEDrefresh", errors: [{ reason: "x".repeat(64) }] } }), []);
+  assert.deepEqual(describeErrorReasons({ error: { status: "RESOURCE_EXHAUSTED", errors: [{ reason: "userRateLimitExceeded" }] } }), ["status RESOURCE_EXHAUSTED", "reason userRateLimitExceeded"]);
 
-  const plain = new GoogleWorkspaceAuditorClient(config, async () => new Response("<html>denied PLANTED-VALUE-0123456789</html>", { status: 403, statusText: "Forbidden" }));
+  // The server-supplied reason phrase is never rendered: the fixed RFC 9110 phrase table supplies it, and unknown codes render bare.
+  const plain = new GoogleWorkspaceAuditorClient(config, async () => new Response("<html>denied PLANTED-VALUE-0123456789</html>", { status: 403, statusText: "Forbidden PLANTED-STATUS-TEXT-0123" }));
   await assert.rejects(plain.collectAlerts(), { message: "403 Forbidden" });
+  const teapot = new GoogleWorkspaceAuditorClient(config, async () => new Response("", { status: 418, statusText: "PLANTED-STATUS-TEXT-0123" }));
+  await assert.rejects(teapot.collectAlerts(), { message: "418" });
 });
 
 test("rule 9: snapshot projection keeps only documented fields, dropping alert data payloads and event parameters", () => {
@@ -1285,8 +1303,9 @@ test("rule 9: snapshot projection keeps only documented fields, dropping alert d
 
 test("rule 9 (end to end): a bundle exported from secret-bearing fixtures contains no planted value in any file or zip entry", async () => {
   const base = createTempBase("grclanker-gws-secrets-");
-  const config = createSampleConfig();
-  const secretBearing = createSecretBearingCollector();
+  // The run authenticates with RUN_TOKEN, and the fixtures echo that exact value back in documented fields (negative control for writeBundleFile).
+  const config = createSampleConfig({ accessToken: RUN_TOKEN });
+  const secretBearing = createSecretBearingCollector(RUN_TOKEN);
   // The token activity endpoint fails through the real client so the token-bearing error body travels the production readError path.
   const failingClient = new GoogleWorkspaceAuditorClient(config, async () => new Response(JSON.stringify({
     error: {
@@ -1327,9 +1346,12 @@ test("rule 9 (end to end): a bundle exported from secret-bearing fixtures contai
   }
 
   const users = JSON.parse(readFileSync(join(result.outputDir, "core_data", "users.json"), "utf8"));
-  assert.deepEqual(Object.keys(users.data[0]).sort(), ["archived", "id", "isAdmin", "isDelegatedAdmin", "isEnforcedIn2Sv", "isEnrolledIn2Sv", "lastLoginTime", "primaryEmail", "suspended"]);
+  assert.deepEqual(Object.keys(users.data[0]).sort(), ["archived", "id", "isAdmin", "isDelegatedAdmin", "isEnforcedIn2Sv", "isEnrolledIn2Sv", "lastLoginTime", "orgUnitPath", "primaryEmail", "suspended"]);
+  // Positive control for the writeBundleFile layer: the run credential survives projection and every pattern, so only redactKnownValues removes it.
+  assert.equal(users.data[0].orgUnitPath, "/Engineering/[REDACTED]");
   const alerts = JSON.parse(readFileSync(join(result.outputDir, "core_data", "alerts.json"), "utf8"));
   assert.equal(alerts.data[0].metadata.status, "NOT_STARTED");
+  assert.equal(alerts.data[0].source, "Google Operations [REDACTED]");
   assert.equal("data" in alerts.data[0], false);
   const logins = JSON.parse(readFileSync(join(result.outputDir, "core_data", "login_activities.json"), "utf8"));
   assert.deepEqual(logins.data[0].events, [{ type: "login", name: "login_success" }, { type: "login", name: "suspicious_login" }]);
@@ -1354,6 +1376,211 @@ test("rule 9 (end to end): a bundle exported from secret-bearing fixtures contai
   const tokenActivities = JSON.parse(readFileSync(join(result.outputDir, "core_data", "token_activities.json"), "utf8"));
   assert.equal(tokenActivities.error, projectedError);
   assert.equal(tokenActivities.errorKind, "unauthorized");
+});
+
+test("rule 1 corollary: a failed privileged tokens.list read is named in GWS-INTEG-002 and turns its counts into lower bounds", async () => {
+  const config = createSampleConfig();
+  const tokens = createTokens();
+  const denied = (userKey) => new GwsApiError(
+    403,
+    "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)",
+    `https://admin.googleapis.com/admin/directory/v1/users/${encodeURIComponent(userKey)}/tokens`,
+  );
+  const failedRead = "super@example.com (403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions))";
+
+  // Partial branch: super@example.com is denied while delegated@example.com (also privileged) holds one token.
+  const partial = await collectGwsAuditData(createFakeCollector({
+    listUserTokens: async (userKey) => {
+      if (userKey === "super@example.com") throw denied(userKey);
+      return tokens[userKey] ?? [];
+    },
+  }));
+  assert.equal(partial.integrations.tokenInventory.failed, 1);
+  assert.deepEqual(partial.integrations.tokenInventory.failures, [
+    { userId: "u-super", primaryEmail: "super@example.com", error: "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)" },
+  ]);
+  const partialFindings = assessGwsIntegrations(partial.integrations, config);
+  const exposure = findingById(partialFindings, "GWS-INTEG-002");
+  assert.equal(exposure.status, "Partial");
+  assert.match(exposure.summary, /Directory tokens\.list failed for 1 of the privileged users, so the privileged token count is a lower bound\.$/);
+  assert.ok(exposure.evidence.includes("Privileged users with readable tokens.list: 1 of 2 (tokens.list failed: super@example.com)"), exposure.evidence.join("\n"));
+  assert.ok(exposure.evidence.includes("Privileged third-party tokens: at least 1 (tokens.list failed for 1 privileged user(s))"));
+  assert.ok(exposure.evidence.includes("Privileged token clients: Drive Syncer (client-1)"));
+  assert.ok(exposure.evidence.includes("Per-user token reads that failed: 1 of 4 sampled users"));
+  assert.ok(exposure.evidence.includes("Token inventory errors: super@example.com: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"));
+  assert.ok(exposure.evidence.includes(`Directory tokens.list failed for privileged users: ${failedRead}`));
+  assert.equal(exposure.evidence.some((line) => /^Privileged users sampled: 2 of 2$/.test(line)), false, "the sampled count must not claim both users were read");
+  assert.equal(findingById(partialFindings, "GWS-INTEG-001").status, "Partial");
+
+  // Fail branch: the same denied read while delegated@example.com holds four tokens keeps the lower-bound wording.
+  const broad = await collectGwsAuditData(createFakeCollector({
+    listUserTokens: async (userKey) => {
+      if (userKey === "super@example.com") throw denied(userKey);
+      if (userKey === "delegated@example.com") {
+        return [1, 2, 3, 4].map((index) => ({ ...tokens[userKey][0], clientId: `client-${index}`, displayText: `App ${index}` }));
+      }
+      return tokens[userKey] ?? [];
+    },
+  }));
+  const broadExposure = findingById(assessGwsIntegrations(broad.integrations, config), "GWS-INTEG-002");
+  assert.equal(broadExposure.status, "Fail");
+  assert.match(broadExposure.summary, /so the privileged token count is a lower bound\.$/);
+  assert.ok(broadExposure.evidence.includes("Privileged third-party tokens: at least 4 (tokens.list failed for 1 privileged user(s))"));
+  assert.ok(broadExposure.evidence.includes(`Directory tokens.list failed for privileged users: ${failedRead}`));
+
+  // Manual branch: the denied privileged read with no privileged token in sight names the endpoint and the user in the summary.
+  const quiet = await collectGwsAuditData(createFakeCollector({
+    listUserTokens: async (userKey) => {
+      if (userKey === "super@example.com") throw denied(userKey);
+      return userKey === "user@example.com" ? tokens[userKey] : [];
+    },
+  }));
+  const manual = findingById(assessGwsIntegrations(quiet.integrations, config), "GWS-INTEG-002");
+  assert.equal(manual.status, "Manual");
+  assert.match(manual.summary, /Directory tokens\.list failed for 1 of 4 sampled users including privileged super@example\.com, so zero privileged tokens is not treated as a pass\.$/);
+  assert.ok(manual.evidence.includes(`Directory tokens.list failed for privileged users: ${failedRead}`));
+  assert.ok(manual.evidence.includes("Per-user token reads that failed: 1 of 4 sampled users"));
+
+  // A failure outside the privileged set is still named, but the privileged counts stay exact.
+  const outsider = await collectGwsAuditData(createFakeCollector({
+    listUserTokens: async (userKey) => {
+      if (userKey === "dormant@example.com") throw denied(userKey);
+      return tokens[userKey] ?? [];
+    },
+  }));
+  const outsiderExposure = findingById(assessGwsIntegrations(outsider.integrations, config), "GWS-INTEG-002");
+  assert.equal(outsiderExposure.status, "Partial");
+  assert.ok(outsiderExposure.evidence.includes("Privileged users sampled: 2 of 2"));
+  assert.ok(outsiderExposure.evidence.includes("Privileged third-party tokens: 1"));
+  assert.ok(outsiderExposure.evidence.includes("Token inventory errors: dormant@example.com: 403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"));
+  assert.ok(outsiderExposure.evidence.includes("Directory tokens.list failed only for users outside the privileged set, so the privileged counts are complete"));
+  assert.equal(/lower bound/.test(outsiderExposure.summary), false);
+
+  // A dataset that reports failures without naming users cannot attribute them, so every privileged count is a lower bound.
+  const unattributed = assessGwsIntegrations({
+    users: dataset(createUsers()),
+    roles: dataset(createRoles()),
+    roleAssignments: dataset(createRoleAssignments()),
+    tokenInventory: inventoryDataset(createTokenInventory(), { failed: 1, error: "super@example.com: 403 Forbidden" }),
+    tokenActivities: dataset(createTokenActivities()),
+  }, config);
+  const unattributedExposure = findingById(unattributed, "GWS-INTEG-002");
+  assert.equal(unattributedExposure.status, "Partial");
+  assert.ok(unattributedExposure.evidence.includes("Privileged users with readable tokens.list: at most 2 of 2 (1 tokens.list read(s) failed, users not recorded)"));
+  assert.ok(unattributedExposure.evidence.includes("Directory tokens.list failures were not attributed to users, so every privileged count below is a lower bound"));
+  assert.match(unattributedExposure.summary, /lower bound\.$/);
+});
+
+test("rule 1 corollary: GWS-INTEG-001 and GWS-INTEG-003 cap at Partial and name the endpoint when roles or role assignments are unreadable", async () => {
+  const config = createSampleConfig();
+  const denied = (path) => async () => {
+    throw new GwsApiError(403, "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)", `https://admin.googleapis.com${path}`);
+  };
+  // Calendar-only tokens carry no broad scope, so with a readable directory both GWS-INTEG-001 and GWS-INTEG-003 pass on this fixture.
+  const lowScopeTokens = async (userKey) => (createTokens()[userKey] ?? []).map((token) => ({ ...token, scopes: ["https://www.googleapis.com/auth/calendar"] }));
+  const endpointNote = (endpoint) => `${endpoint} was not readable (403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)), so the privileged-first token sample is not known to cover the privileged users`;
+  const scenarios = [
+    { overrides: { collectRoles: denied("/admin/directory/v1/customer/my_customer/roles") }, reason: "Directory roles.list was not readable" },
+    { overrides: { collectRoleAssignments: denied("/admin/directory/v1/customer/my_customer/roleassignments") }, reason: "Directory roleAssignments.list was not readable" },
+    {
+      overrides: { collectRoles: denied("/roles"), collectRoleAssignments: denied("/roleassignments") },
+      reason: "Directory roles.list and Directory roleAssignments.list were not readable",
+    },
+  ];
+  for (const { overrides, reason } of scenarios) {
+    const integrations = assessGwsIntegrations(
+      (await collectGwsAuditData(createFakeCollector({ listUserTokens: lowScopeTokens, ...overrides }))).integrations,
+      config,
+    );
+    for (const id of ["GWS-INTEG-001", "GWS-INTEG-003"]) {
+      const finding = findingById(integrations, id);
+      assert.equal(finding.status, "Partial", `${id}: ${reason}`);
+      assert.ok(
+        finding.summary.endsWith(`The verdict is capped at Partial because ${reason}, so the privileged-first token sample rests on an unreadable inventory.`),
+        `${id} summary: ${finding.summary}`,
+      );
+      for (const endpoint of reason.replace(/ were not readable| was not readable/, "").split(" and ")) {
+        assert.ok(finding.evidence.includes(endpointNote(endpoint)), `${id} evidence must name ${endpoint}: ${finding.evidence.join("\n")}`);
+      }
+    }
+    assert.equal(findingById(integrations, "GWS-INTEG-002").status, "Manual");
+  }
+
+  // A finding that is already below Pass for its own reason keeps that summary and still names the unreadable endpoint in its evidence.
+  const broadScope = assessGwsIntegrations(
+    (await collectGwsAuditData(createFakeCollector({ collectRoles: denied("/roles") }))).integrations,
+    config,
+  );
+  const sprawl = findingById(broadScope, "GWS-INTEG-003");
+  assert.equal(sprawl.status, "Partial");
+  assert.equal(sprawl.summary, "A limited set of third-party tokens carries broad scopes.");
+  assert.ok(sprawl.evidence.includes(endpointNote("Directory roles.list")));
+
+  // With both listings readable the same low-scope fixture passes both findings, so the demotion is tied to the unreadable inventory alone.
+  const readable = assessGwsIntegrations((await collectGwsAuditData(createFakeCollector({ listUserTokens: lowScopeTokens }))).integrations, config);
+  assert.equal(findingById(readable, "GWS-INTEG-001").status, "Pass");
+  assert.equal(findingById(readable, "GWS-INTEG-003").status, "Pass");
+});
+
+test("rule 9: a service-account token evicted by a 401 mid-run is still scrubbed from the exported bundle", async () => {
+  clearGwsTokenCacheForTests();
+  const base = createTempBase("grclanker-gws-minted-");
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const config = createSampleConfig({
+    authMode: "service_account",
+    accessToken: undefined,
+    adminEmail: "admin@example.com",
+    serviceAccountEmail: "svc@example-project.iam.gserviceaccount.com",
+    serviceAccountPrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  });
+  const state = { minted: [], firstUsers401: true };
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.origin === "https://oauth2.googleapis.com" && url.pathname === "/token") {
+      // Minted in a shape no credential pattern recognizes, so only the known-value layer can scrub an echo of it.
+      const token = `MINTEDTOKEN-${state.minted.length + 1}-abcdefghijklmnopqrstuvwxyz0123456789`;
+      state.minted.push(token);
+      return jsonResponse({ access_token: token, expires_in: 3600, token_type: "Bearer" });
+    }
+    if (url.pathname === "/admin/directory/v1/users") {
+      if (state.firstUsers401) {
+        state.firstUsers401 = false;
+        return jsonResponse({ error: { code: 401, message: "Invalid Credentials", status: "UNAUTHENTICATED" } }, 401);
+      }
+      // The directory echoes the first (now evicted) token into a documented free-text field.
+      return jsonResponse({ users: createUsers().map((user) => ({ ...user, orgUnitPath: `/ou-${state.minted[0]}` })) });
+    }
+    if (url.pathname === "/admin/directory/v1/customer/my_customer/roles") return jsonResponse({ items: createRoles() });
+    if (url.pathname === "/admin/directory/v1/customer/my_customer/roleassignments") return jsonResponse({ items: createRoleAssignments() });
+    if (url.pathname.startsWith("/admin/reports/v1/activity/users/all/applications/")) return jsonResponse({ items: [] });
+    if (url.pathname === "/v1beta1/alerts") return jsonResponse({ alerts: [] });
+    if (url.origin === "https://cloudidentity.googleapis.com" && url.pathname === "/v1/policies") return jsonResponse({ policies: createTwoStepPolicies() });
+    if (/^\/admin\/directory\/v1\/users\/[^/]+\/tokens$/.test(url.pathname)) return jsonResponse({ items: [] });
+    return jsonResponse({ error: { code: 404, message: `unexpected URL ${url}`, status: "NOT_FOUND" } }, 404);
+  };
+
+  const client = new GoogleWorkspaceAuditorClient(config, fetchImpl);
+  const result = await exportGwsAuditBundle(client, config, base);
+  assert.ok(state.minted.length >= 2, `expected the 401 to force a second mint, saw ${state.minted.length}`);
+  assert.equal(result.findingCount, 19);
+
+  const files = listFilesRecursively(result.outputDir);
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    for (const token of state.minted) {
+      assert.equal(content.includes(token), false, `${relative(result.outputDir, file)} leaked minted token ${token}`);
+    }
+  }
+  const entries = readZipEntries(result.zipPath);
+  assert.equal(entries.size, files.length);
+  for (const [name, content] of entries) {
+    for (const token of state.minted) {
+      assert.equal(content.includes(token), false, `zip entry ${name} leaked minted token ${token}`);
+    }
+  }
+  const users = JSON.parse(readFileSync(join(result.outputDir, "core_data", "users.json"), "utf8"));
+  assert.equal(users.data[0].orgUnitPath, "/ou-[REDACTED]");
+  clearGwsTokenCacheForTests();
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

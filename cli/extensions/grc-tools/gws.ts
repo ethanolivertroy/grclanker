@@ -151,8 +151,27 @@ const CREDENTIAL_SHAPE_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: s
 const TEXT_PAIR_PATTERN = /([A-Za-z_][A-Za-z0-9_.-]*)"?\s*[=:]\s*"?([A-Za-z0-9._~+/=-]{8,})/g;
 /** A free-text pair whose normalized key ends in one of these names carries a credential; page tokens are cursors, not secrets. */
 const TEXT_SECRET_KEY_PATTERN = /(token|secret|password|passwd|credential|credentials|apikey|authorization|assertion)$/;
-/** Google API error identifiers (google.rpc.Code names, errors[].reason, ErrorInfo.reason, RFC 6749 error codes) are short identifiers. */
-const ERROR_IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+/**
+ * Google API error identifiers are bare identifiers: google.rpc.Code names and ErrorInfo.reason are UPPER_SNAKE_CASE (ErrorInfo
+ * documents at most 63 characters matching [A-Z][A-Z0-9_]+[A-Z0-9]), errors[].reason is camelCase, RFC 6749 codes are lower_snake.
+ * None of them carry `.`, `-`, or `/`, so excluding those drops every dotted, hyphenated, or path-shaped credential form.
+ */
+const ERROR_IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
+/** RFC 9110 section 15 reason phrases for the statuses Google APIs return; the server-supplied phrase is never rendered. */
+const HTTP_REASON_PHRASES: Record<number, string> = {
+  200: "OK",
+  400: "Bad Request",
+  401: "Unauthorized",
+  403: "Forbidden",
+  404: "Not Found",
+  409: "Conflict",
+  412: "Precondition Failed",
+  429: "Too Many Requests",
+  500: "Internal Server Error",
+  502: "Bad Gateway",
+  503: "Service Unavailable",
+  504: "Gateway Timeout",
+};
 /** Directory API User fields requested through USERS_FIELDS; nothing else is written to core_data. */
 const USER_SNAPSHOT_FIELDS = ["id", "primaryEmail", "isAdmin", "isDelegatedAdmin", "suspended", "archived", "lastLoginTime", "isEnrolledIn2Sv", "isEnforcedIn2Sv", "orgUnitPath"] as const;
 /** Directory API Role resource (https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles). */
@@ -317,6 +336,17 @@ interface TokenInventoryRecord {
   token: JsonRecord;
 }
 
+/** One failed per-user tokens.list read, kept so findings can name the user and the endpoint. */
+interface TokenReadFailure {
+  userId: string;
+  primaryEmail: string;
+  error: string;
+}
+
+interface TokenInventoryDataset extends CollectedDataset<TokenInventoryRecord[]> {
+  failures?: TokenReadFailure[];
+}
+
 export interface GwsIdentityData {
   users: CollectedDataset<JsonRecord[]>;
   roles: CollectedDataset<JsonRecord[]>;
@@ -336,7 +366,7 @@ export interface GwsIntegrationData {
   users: CollectedDataset<JsonRecord[]>;
   roles: CollectedDataset<JsonRecord[]>;
   roleAssignments: CollectedDataset<JsonRecord[]>;
-  tokenInventory: CollectedDataset<TokenInventoryRecord[]>;
+  tokenInventory: TokenInventoryDataset;
   tokenActivities: CollectedDataset<JsonRecord[]>;
 }
 
@@ -382,6 +412,8 @@ type GwsTokenCacheEntry = {
 };
 
 const tokenCache = new Map<string, GwsTokenCacheEntry>();
+/** Every access token minted in this process, kept even after a 401 evicts it from the cache so a late echo is still scrubbed. */
+const mintedTokens = new Set<string>();
 
 export class GwsApiError extends Error {
   status: number;
@@ -878,6 +910,12 @@ function errorIdentifier(value: unknown): string | undefined {
   return text !== undefined && ERROR_IDENTIFIER_PATTERN.test(text) ? text : undefined;
 }
 
+/** `403 Forbidden` from the fixed phrase table, or the bare status code when the code is not in it. */
+function httpStatusLabel(status: number): string {
+  const phrase = HTTP_REASON_PHRASES[status];
+  return phrase ? `${status} ${phrase}` : `${status}`;
+}
+
 /**
  * Closed-vocabulary identifiers from an error body: `error.status` (a google.rpc.Code name), `error.errors[].reason`,
  * `error.details[].reason` (google.rpc.ErrorInfo), or the RFC 6749 `error` code of a token response
@@ -1067,14 +1105,18 @@ function privilegedViewEvidence(data: Pick<GwsIdentityData, "users" | "roles" | 
   ];
 }
 
-function withPartialCap(finding: GwsFinding, notes: string[]): GwsFinding {
+function withPartialCap(
+  finding: GwsFinding,
+  notes: string[],
+  reason = "the credential only saw a partial inventory",
+): GwsFinding {
   if (notes.length === 0) return finding;
   const status: GwsFindingStatus = finding.status === "Pass" ? "Partial" : finding.status;
   return {
     ...finding,
     status,
     summary: finding.status === "Pass"
-      ? `${finding.summary} The verdict is capped at Partial because the credential only saw a partial inventory.`
+      ? `${finding.summary} The verdict is capped at Partial because ${reason}.`
       : finding.summary,
     evidence: [...finding.evidence, ...notes],
   };
@@ -1623,7 +1665,7 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 /** The credential values this run holds (direct bearer, service-account key, minted tokens), so any echo of them is scrubbed. */
 function knownGwsSecretValues(config: GwsResolvedConfig): string[] {
-  const values: Array<string | undefined> = [config.accessToken, config.serviceAccountPrivateKey];
+  const values: Array<string | undefined> = [config.accessToken, config.serviceAccountPrivateKey, ...mintedTokens];
   for (const entry of tokenCache.values()) {
     values.push(entry.token);
   }
@@ -1834,14 +1876,14 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
           key: basename(pathname) || pathname,
           path: pathname,
           status: response.status === 401 ? "unauthorized" : response.status === 403 ? "forbidden" : "error",
-          detail: `${response.status} ${response.statusText}`,
+          detail: httpStatusLabel(response.status),
         };
       }
       return {
         key: basename(pathname) || pathname,
         path: pathname,
         status: "ok",
-        detail: `${response.status} ${response.statusText}`,
+        detail: httpStatusLabel(response.status),
       };
     } catch (error) {
       return {
@@ -2013,7 +2055,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
 
   /** Renders the HTTP status plus documented identifiers only; the body's free-text message is never kept (see describeErrorReasons). */
   private async readError(response: Response): Promise<string> {
-    const base = `${response.status} ${response.statusText}`.trim();
+    const base = httpStatusLabel(response.status);
     let payload: JsonRecord;
     try {
       payload = asRecord(await response.json());
@@ -2045,6 +2087,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
 
     const pending = this.fetchServiceAccountAccessToken(scopes).then((tokenEntry) => {
       tokenCache.set(cacheKey, tokenEntry);
+      mintedTokens.add(tokenEntry.token);
       return tokenEntry.token;
     }).finally(() => {
       const current = tokenCache.get(cacheKey);
@@ -2094,6 +2137,7 @@ function sleep(ms: number): Promise<void> {
 
 export function clearGwsTokenCacheForTests(): void {
   tokenCache.clear();
+  mintedTokens.clear();
 }
 
 export async function runGwsAccessCheck(
@@ -2142,28 +2186,26 @@ async function collectTokenInventory(
   client: Pick<GwsAuditCollector, "listUserTokens">,
   users: JsonRecord[],
   population: number,
-): Promise<CollectedDataset<TokenInventoryRecord[]>> {
+): Promise<TokenInventoryDataset> {
   const records: TokenInventoryRecord[] = [];
-  const errors: string[] = [];
+  const failures: TokenReadFailure[] = [];
   let forbidden = 0;
   const collected = await mapWithConcurrency(users, 4, async (user) => {
     const userKey = asString(user.primaryEmail) ?? asString(user.id);
-    if (!userKey) return { records: [] as TokenInventoryRecord[], error: undefined, kind: undefined as GwsEndpointStatus | undefined };
+    if (!userKey) return { records: [] as TokenInventoryRecord[], failure: undefined as TokenReadFailure | undefined, kind: undefined as GwsEndpointStatus | undefined };
+    const userId = asString(user.id) ?? userKey;
+    const primaryEmail = asString(user.primaryEmail) ?? userKey;
     try {
       const tokens = await client.listUserTokens(userKey);
       return {
-        records: tokens.map((token) => ({
-          userId: asString(user.id) ?? userKey,
-          primaryEmail: asString(user.primaryEmail) ?? userKey,
-          token,
-        })),
-        error: undefined,
+        records: tokens.map((token) => ({ userId, primaryEmail, token })),
+        failure: undefined as TokenReadFailure | undefined,
         kind: undefined as GwsEndpointStatus | undefined,
       };
     } catch (error) {
       return {
         records: [] as TokenInventoryRecord[],
-        error: `${userKey}: ${summarizeError(error)}`,
+        failure: { userId, primaryEmail, error: summarizeError(error) } as TokenReadFailure | undefined,
         kind: classifyError(error),
       };
     }
@@ -2171,17 +2213,18 @@ async function collectTokenInventory(
 
   for (const result of collected) {
     records.push(...result.records);
-    if (result.error) errors.push(result.error);
+    if (result.failure) failures.push(result.failure);
     if (result.kind === "forbidden" || result.kind === "unauthorized") forbidden += 1;
   }
 
   return {
     data: records,
-    error: errors.length > 0 ? errors.join("; ") : undefined,
-    errorKind: errors.length > 0 ? (forbidden > 0 ? "forbidden" : "error") : undefined,
+    error: failures.length > 0 ? failures.map((failure) => `${failure.primaryEmail}: ${failure.error}`).join("; ") : undefined,
+    errorKind: failures.length > 0 ? (forbidden > 0 ? "forbidden" : "error") : undefined,
     seen: users.length,
     total: population,
-    failed: errors.length,
+    failed: failures.length,
+    failures,
     truncated: users.length < population,
   };
 }
@@ -2277,6 +2320,69 @@ function directoryUnreadable(
   if (roles.error) return { endpoint: "Directory roles.list", dataset: roles };
   if (roleAssignments.error) return { endpoint: "Directory roleAssignments.list", dataset: roleAssignments };
   return undefined;
+}
+
+interface TokenSampleDependency {
+  endpoints: string[];
+  notes: string[];
+  /** Summary reason for withPartialCap; undefined when both listings were readable. */
+  capReason?: string;
+}
+
+/**
+ * Roles and role assignments order the token sample privileged-first, so when either listing is unreadable the
+ * sampled users are not known to include the privileged set and every token verdict rests on that unreadable inventory.
+ */
+function tokenSampleDependency(data: Pick<GwsIntegrationData, "roles" | "roleAssignments">): TokenSampleDependency {
+  const unreadable: Array<[endpoint: string, dataset: CollectedDataset<unknown>]> = [
+    ["Directory roles.list", data.roles],
+    ["Directory roleAssignments.list", data.roleAssignments],
+  ];
+  const endpoints: string[] = [];
+  const notes: string[] = [];
+  for (const [endpoint, dataset] of unreadable) {
+    if (!dataset.error) continue;
+    endpoints.push(endpoint);
+    notes.push(`${endpoint} was not readable (${dataset.error}), so the privileged-first token sample is not known to cover the privileged users`);
+  }
+  if (endpoints.length === 0) return { endpoints, notes };
+  const verb = endpoints.length > 1 ? "were" : "was";
+  return {
+    endpoints,
+    notes,
+    capReason: `${endpoints.join(" and ")} ${verb} not readable, so the privileged-first token sample rests on an unreadable inventory`,
+  };
+}
+
+interface TokenReadFailureEvidence {
+  notes: string[];
+  /** Failed reads attributed to privileged users; equals `failed` when the dataset carries no per-user attribution. */
+  privilegedFailed: number;
+  privilegedFailures: TokenReadFailure[];
+  /** False when the dataset reports failures without naming the users, so no count can be trusted as complete. */
+  attributed: boolean;
+}
+
+/** Names every failed per-user tokens.list read for GWS-INTEG-002 and says which of them hit privileged users. */
+function tokenReadFailureEvidence(dataset: TokenInventoryDataset, privilegedIds: Set<string>): TokenReadFailureEvidence {
+  const failed = dataset.failed ?? 0;
+  if (failed === 0) return { notes: [], privilegedFailed: 0, privilegedFailures: [], attributed: true };
+  const sampled = dataset.seen ?? 0;
+  const notes = [
+    `Per-user token reads that failed: ${failed} of ${sampled} sampled users`,
+    `Token inventory errors: ${dataset.error ?? "unknown"}`,
+  ];
+  if (!dataset.failures) {
+    notes.push("Directory tokens.list failures were not attributed to users, so every privileged count below is a lower bound");
+    return { notes, privilegedFailed: failed, privilegedFailures: [], attributed: false };
+  }
+  const privilegedFailures = dataset.failures.filter((failure) => privilegedIds.has(failure.userId));
+  if (privilegedFailures.length > 0) {
+    notes.push(`Directory tokens.list failed for privileged users: ${privilegedFailures.map((failure) => `${failure.primaryEmail} (${failure.error})`).join(", ")}`);
+  } else {
+    notes.push("Directory tokens.list failed only for users outside the privileged set, so the privileged counts are complete");
+  }
+  return { notes, privilegedFailed: privilegedFailures.length, privilegedFailures, attributed: true };
 }
 
 function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined): GwsFinding {
@@ -2871,11 +2977,17 @@ export function assessGwsIntegrations(
   const population = data.tokenInventory.total ?? sampled;
   const failed = data.tokenInventory.failed ?? 0;
   const directoryProblem = directoryUnreadable(data.users, data.roles, data.roleAssignments);
-  const sampleNotes = [
+  const sampleDependency = tokenSampleDependency(data);
+  const sampleCoverageNotes = [
     ...(sampled < population ? [`Token inventory sample: seen ${sampled} of ${population} active users (privileged users first)`] : []),
-    ...(failed > 0 ? [`Per-user token reads that failed: ${failed}`] : []),
     ...partialViewEvidence("Users", data.users),
+    ...sampleDependency.notes,
   ];
+  const sampleNotes = [
+    ...sampleCoverageNotes,
+    ...(failed > 0 ? [`Per-user token reads that failed: ${failed}`] : []),
+  ];
+  const tokenFailures = tokenReadFailureEvidence(data.tokenInventory, privilegedIds);
   const inventoryEvidence = [
     `Users sampled for token inventory: ${sampled}`,
     `Token records collected: ${allTokens.length}`,
@@ -2935,6 +3047,7 @@ export function assessGwsIntegrations(
         "Use the token inventory during third-party app reviews and user-access attestations.",
       ),
       sampleNotes,
+      sampleDependency.capReason,
     ));
   }
 
@@ -2948,28 +3061,53 @@ export function assessGwsIntegrations(
       "Connected third-party apps for each administrator account.",
     ));
   } else if (privileged.privilegedUsers.length === 0 || allTokens.length === 0 || failed > 0 && privilegedTokens.length === 0) {
+    const failedUsers = tokenFailures.privilegedFailures.map((failure) => failure.primaryEmail);
+    const reasons = [
+      ...(privileged.privilegedUsers.length === 0 ? ["no privileged users were identified"] : []),
+      ...(allTokens.length === 0 ? ["the token inventory is empty"] : []),
+      ...(failed > 0
+        ? [`Directory tokens.list failed for ${failed} of ${sampled} sampled users${failedUsers.length > 0 ? ` including privileged ${failedUsers.join(", ")}` : ""}`]
+        : []),
+    ];
     findings.push(buildFinding(
       "GWS-INTEG-002",
       "Manual",
-      "Privileged OAuth exposure could not be confirmed: the privileged set or the token inventory is empty or partially unreadable, so zero privileged tokens is not treated as a pass.",
+      `Privileged OAuth exposure could not be confirmed: ${reasons.join("; ")}, so zero privileged tokens is not treated as a pass.`,
       [
         `Privileged users identified: ${privileged.privilegedUsers.length}`,
         `Token records collected: ${allTokens.length}`,
         `Privileged third-party tokens: ${privilegedTokens.length}`,
-        ...sampleNotes,
+        ...sampleCoverageNotes,
+        ...tokenFailures.notes,
       ],
       "Restore full directory and token readability, then re-run.",
       "Collect manually: connected third-party apps for each administrator account.",
     ));
   } else {
-    const evidence = [
-      `Privileged users sampled: ${Math.min(privileged.privilegedUsers.length, MAX_TOKEN_USERS)} of ${privileged.privilegedUsers.length}`,
-      `Privileged third-party tokens: ${privilegedTokens.length}`,
-      `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
-    ];
+    // A failed privileged tokens.list read means the counts below are lower bounds, and the finding must say so.
+    const privilegedInSample = Math.min(privileged.privilegedUsers.length, MAX_TOKEN_USERS);
+    const privilegedFailed = tokenFailures.privilegedFailed;
+    const readableLine = tokenFailures.attributed
+      ? `Privileged users with readable tokens.list: ${Math.max(privilegedInSample - privilegedFailed, 0)} of ${privileged.privilegedUsers.length} (tokens.list failed: ${tokenFailures.privilegedFailures.map((failure) => failure.primaryEmail).join(", ")})`
+      : `Privileged users with readable tokens.list: at most ${privilegedInSample} of ${privileged.privilegedUsers.length} (${privilegedFailed} tokens.list read(s) failed, users not recorded)`;
+    const evidence = privilegedFailed > 0
+      ? [
+        readableLine,
+        `Privileged third-party tokens: at least ${privilegedTokens.length} (tokens.list failed for ${privilegedFailed} privileged user(s))`,
+        `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
+      ]
+      : [
+        `Privileged users sampled: ${privilegedInSample} of ${privileged.privilegedUsers.length}`,
+        `Privileged third-party tokens: ${privilegedTokens.length}`,
+        `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
+      ];
+    const lowerBoundNote = privilegedFailed > 0
+      ? ` Directory tokens.list failed for ${privilegedFailed} of the privileged users, so the privileged token count is a lower bound.`
+      : "";
     const capNotes = [
       ...(privilegedSampled ? [] : [`Privileged users beyond the ${MAX_TOKEN_USERS}-user token sample were not inspected`]),
       ...privilegedViewEvidence(data),
+      ...tokenFailures.notes,
     ];
     findings.push(withPartialCap(
       privilegedTokens.length === 0
@@ -2984,14 +3122,14 @@ export function assessGwsIntegrations(
           ? buildFinding(
             "GWS-INTEG-002",
             "Partial",
-            "A small number of privileged users still hold third-party OAuth tokens.",
+            `A small number of privileged users still hold third-party OAuth tokens.${lowerBoundNote}`,
             evidence,
             "Review each privileged OAuth grant and remove anything not strictly required for administration or incident response.",
           )
           : buildFinding(
             "GWS-INTEG-002",
             "Fail",
-            "Privileged-user third-party token exposure is broader than expected.",
+            `Privileged-user third-party token exposure is broader than expected.${lowerBoundNote}`,
             evidence,
             "Perform a privileged OAuth cleanup and require explicit approval for any remaining third-party grants.",
           ),
@@ -3046,6 +3184,7 @@ export function assessGwsIntegrations(
             "Run a focused OAuth app review and clean up broad-scope third-party access before treating the environment as well-controlled.",
           ),
       sampleNotes,
+      sampleDependency.capReason,
     ));
   }
 
