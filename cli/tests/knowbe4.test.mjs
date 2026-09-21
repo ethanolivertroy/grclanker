@@ -423,8 +423,8 @@ function mockClient(fixture, options = {}) {
     async getAccountRiskScoreHistory() {
       return guard("getAccountRiskScoreHistory", fixture.riskHistory);
     },
-    async listUsers() {
-      return guard("listUsers", fixture.users);
+    async listUsers(listOptions = {}) {
+      return guard("listUsers", listOptions.limit ? fixture.users.slice(0, listOptions.limit) : fixture.users);
     },
     async listGroups() {
       return guard("listGroups", fixture.groups);
@@ -442,8 +442,8 @@ function mockClient(fixture, options = {}) {
     async listTrainingCampaigns() {
       return guard("listTrainingCampaigns", fixture.trainingCampaigns);
     },
-    async listTrainingEnrollments() {
-      return guard("listTrainingEnrollments", fixture.enrollments);
+    async listTrainingEnrollments(listOptions = {}) {
+      return guard("listTrainingEnrollments", listOptions.limit ? fixture.enrollments.slice(0, listOptions.limit) : fixture.enrollments);
     },
     async listStorePurchases() {
       return guard("listStorePurchases", fixture.storePurchases);
@@ -749,6 +749,9 @@ test("assessKnowbe4PhishingProgram passes a healthy program and enriches the rep
     assert.equal(findingFor(result, control).status, "pass", `control ${control} should pass`);
   }
   assert.equal(findingFor(result, 2).evidence.coverage_pct, 100);
+  assert.equal(findingFor(result, 6).evidence.current_source, "security_tests");
+  assert.equal(findingFor(result, 20).evidence.days_since_latest_test, 6);
+  assert.equal(findingFor(result, 20).evidence.gaps.at(-1).boundary, "now");
   assert.equal(findingFor(result, 19).evidence.report_rate_pct, 60);
   assert.equal(findingFor(result, 19).evidence.phisher.messages_in_window, 2);
   assert.deepEqual(findingFor(result, 19).evidence.phisher.by_category, { THREAT: 1, CLEAN: 1 });
@@ -789,6 +792,91 @@ test("assessKnowbe4PhishingProgram degrades to warn findings when security tests
   assert.ok(result.errors.length > 0);
 });
 
+test("assessKnowbe4PhishingProgram warns instead of passing phish-prone percentage when no test ran in the window", async () => {
+  // A never-tested account: no security tests, and the Reporting API reports 0% for users who were never phished.
+  const fixture = healthyFixture();
+  fixture.securityTests = [];
+  fixture.recipientsByTest = new Map();
+  fixture.phishingCampaigns = [];
+  fixture.users = fixture.users.map((record) => ({ ...record, phish_prone_percentage: 0 }));
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["phishing"], now: NOW });
+  const item = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 6);
+
+  assert.equal(item.status, "warn");
+  assert.match(item.summary, /No phishing security tests ran in the last 90 days/);
+  assert.match(item.summary, /cannot be verified from test results/);
+  assert.match(item.summary, /not used for the verdict/);
+  assert.equal(item.evidence.security_tests_in_window, 0);
+  assert.equal(item.evidence.current_phish_prone_pct, null);
+  assert.equal(item.evidence.current_source, "unverified");
+  assert.equal(item.evidence.user_average_phish_prone_pct, 0);
+
+  // Tests that exist only outside the window do not back a verdict either.
+  const stale = healthyFixture();
+  stale.securityTests = [securityTest(901, daysAgo(200), 0.05)];
+  stale.recipientsByTest = new Map();
+  const staleSnapshot = await collectKnowbe4Snapshot(mockClient(stale), { scopes: ["phishing"], now: NOW });
+  const staleItem = findingFor(assessKnowbe4PhishingProgram(staleSnapshot, { now: NOW }), 6);
+  assert.equal(staleItem.status, "warn");
+  assert.equal(staleItem.evidence.security_tests_in_window, 0);
+  assert.equal(staleItem.evidence.security_tests_all_time, 1);
+
+  // Tests in the window without delivered counts cannot produce a rate and stay inconclusive.
+  const undelivered = healthyFixture();
+  undelivered.securityTests = [securityTest(901, daysAgo(10), null, { delivered_count: 0, scheduled_count: 0 })];
+  undelivered.recipientsByTest = new Map();
+  const undeliveredSnapshot = await collectKnowbe4Snapshot(mockClient(undelivered), { scopes: ["phishing"], now: NOW });
+  const undeliveredItem = findingFor(assessKnowbe4PhishingProgram(undeliveredSnapshot, { now: NOW }), 6);
+  assert.equal(undeliveredItem.status, "warn");
+  assert.match(undeliveredItem.summary, /none reported a phish-prone percentage with delivered counts/);
+  assert.equal(undeliveredItem.evidence.security_tests_in_window, 1);
+});
+
+test("assessKnowbe4PhishingProgram fails schedule regularity when the program stopped running tests", async () => {
+  // A monthly cadence that stopped 200 days ago: consecutive gaps are 30 days, but nothing has run since.
+  const fixture = healthyFixture();
+  fixture.securityTests = [200, 230, 260, 290, 320].map((age, index) => securityTest(900 + index, daysAgo(age), 0.08));
+  fixture.recipientsByTest = new Map();
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["phishing"], now: NOW });
+
+  const item = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW, lookbackDays: 365 }), 20);
+  assert.equal(item.status, "fail");
+  assert.equal(item.evidence.lookback_days, 365);
+  assert.equal(item.evidence.security_tests_in_window, 5);
+  assert.equal(item.evidence.days_since_latest_test, 200);
+  assert.equal(item.evidence.max_gap_days, 200);
+  assert.deepEqual(item.evidence.gaps.filter((gap) => gap.boundary !== "now").map((gap) => gap.days), [30, 30, 30, 30]);
+  assert.ok(item.evidence.gaps_over_threshold.some((gap) => gap.boundary === "now" && gap.days === 200));
+  assert.match(item.summary, /including the 200 days since the most recent test/);
+
+  // The configured lookback is honored instead of a hardcoded year: nothing is inside 90 days, and the gap to now still fails.
+  const defaultWindow = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 20);
+  assert.equal(defaultWindow.status, "fail");
+  assert.equal(defaultWindow.evidence.lookback_days, 90);
+  assert.equal(defaultWindow.evidence.security_tests_in_window, 0);
+  assert.equal(defaultWindow.evidence.days_since_latest_test, 200);
+
+  // The last test before the window anchors the series so the gap into the window is measured too.
+  const gapIntoWindow = healthyFixture();
+  gapIntoWindow.securityTests = [securityTest(901, daysAgo(6), 0.08), securityTest(902, daysAgo(200), 0.08)];
+  gapIntoWindow.recipientsByTest = new Map();
+  const gapSnapshot = await collectKnowbe4Snapshot(mockClient(gapIntoWindow), { scopes: ["phishing"], now: NOW });
+  const gapItem = findingFor(assessKnowbe4PhishingProgram(gapSnapshot, { now: NOW }), 20);
+  assert.equal(gapItem.status, "fail");
+  assert.equal(gapItem.evidence.security_tests_in_window, 1);
+  assert.equal(gapItem.evidence.max_gap_days, 194);
+  assert.equal(gapItem.evidence.days_since_latest_test, 6);
+
+  // A program with no tests at all has no cadence and fails outright.
+  const empty = healthyFixture();
+  empty.securityTests = [];
+  empty.recipientsByTest = new Map();
+  const emptySnapshot = await collectKnowbe4Snapshot(mockClient(empty), { scopes: ["phishing"], now: NOW });
+  const emptyItem = findingFor(assessKnowbe4PhishingProgram(emptySnapshot, { now: NOW }), 20);
+  assert.equal(emptyItem.status, "fail");
+  assert.equal(emptyItem.evidence.security_tests_all_time, 0);
+});
+
 test("assessKnowbe4TrainingProgram passes a well-run training program", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["training"], now: NOW });
@@ -825,6 +913,101 @@ test("assessKnowbe4TrainingProgram fails low completion, late enrollment, missin
   assert.equal(findingFor(autoDetect, 17).status, "warn");
 });
 
+test("assessKnowbe4TrainingProgram warns on modules with no publish date instead of treating them as fresh", async () => {
+  const fixture = healthyFixture();
+  fixture.trainingCampaigns[0].content.push({ store_purchase_id: 3, content_type: "Store Purchase", name: "Undated Module", publish_date: null, retired: false });
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
+  const item = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 11);
+
+  assert.equal(item.status, "warn");
+  assert.match(item.summary, /1 have no publish date/);
+  assert.match(item.summary, /currency cannot be verified/);
+  assert.equal(item.evidence.modules_reviewed, 4);
+  assert.equal(item.evidence.modules_with_publish_date, 3);
+  assert.equal(item.evidence.undated_module_count, 1);
+  assert.deepEqual(item.evidence.undated_modules, [{ campaign: "2026 Annual Security Awareness", module: "Undated Module" }]);
+  assert.deepEqual(item.evidence.stale_modules, []);
+  assert.deepEqual(item.evidence.retired_modules, []);
+
+  // The store catalog's publish date is consulted before a module is declared undated.
+  const catalogued = healthyFixture();
+  catalogued.trainingCampaigns[0].content.push({ store_purchase_id: 3, content_type: "Store Purchase", name: "Catalogued Module", publish_date: null, retired: false });
+  catalogued.storePurchases.push({ store_purchase_id: 3, content_type: "Store Purchase", name: "Catalogued Module", description: "", type: "Training Module", duration: 10, retired: false, retirement_date: null, publish_date: daysAgo(100), publisher: "KnowBe4", purchase_date: daysAgo(90), policy_url: null });
+  const cataloguedSnapshot = await collectKnowbe4Snapshot(mockClient(catalogued), { scopes: ["training"], now: NOW });
+  const cataloguedItem = findingFor(assessKnowbe4TrainingProgram(cataloguedSnapshot, { now: NOW }), 11);
+  assert.equal(cataloguedItem.status, "pass");
+  assert.equal(cataloguedItem.evidence.undated_module_count, 0);
+  assert.equal(cataloguedItem.evidence.modules_with_publish_date, 4);
+});
+
+test("assessKnowbe4TrainingProgram fails required compliance topics that are assigned but have no enrollments", async () => {
+  const fixture = healthyFixture();
+  fixture.enrollments = fixture.enrollments.filter((item) => item.module_name !== "PCI DSS Compliance Basics");
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
+
+  const required = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW, requiredComplianceTopics: ["PCI"] }), 17);
+  assert.equal(required.status, "fail");
+  assert.match(required.summary, /zero training enrollments/);
+  assert.deepEqual(required.evidence.topics_without_enrollments, ["PCI"]);
+  assert.deepEqual(required.evidence.topics[0].assigned_modules, ["PCI DSS Compliance Basics"]);
+  assert.equal(required.evidence.topics[0].enrollments, 0);
+  assert.equal(required.evidence.topics[0].completion_pct, null);
+  assert.equal(required.evidence.enrollments_available, true);
+  assert.equal(required.evidence.enrollment_limit_reached, false);
+
+  // Auto-detected compliance content with no enrollments warns rather than passing.
+  const detected = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 17);
+  assert.equal(detected.status, "warn");
+  assert.match(detected.summary, /zero training enrollments/);
+
+  // When the enrollment list was truncated, zero enrollments is inconclusive and degrades to warn instead of fail.
+  const truncatedSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, enrollmentLimit: 4 });
+  assert.equal(truncatedSnapshot.enrollmentLimit, 4);
+  assert.equal(truncatedSnapshot.enrollmentLimitReached, true);
+  const truncated = findingFor(assessKnowbe4TrainingProgram(truncatedSnapshot, { now: NOW, requiredComplianceTopics: ["PCI"] }), 17);
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /truncated at enrollment_limit/);
+  assert.equal(truncated.evidence.enrollment_limit_reached, true);
+
+  // Unreadable enrollments are also inconclusive rather than a fail.
+  const unreadableClient = mockClient(fixture, { failures: { listTrainingEnrollments: "KnowBe4 request failed (500 Internal Server Error) for /v1/training/enrollments" } });
+  const unreadableSnapshot = await collectKnowbe4Snapshot(unreadableClient, { scopes: ["training"], now: NOW });
+  const unreadable = findingFor(assessKnowbe4TrainingProgram(unreadableSnapshot, { now: NOW, requiredComplianceTopics: ["PCI"] }), 17);
+  assert.equal(unreadable.status, "warn");
+  assert.match(unreadable.summary, /enrollment data is unavailable/);
+  assert.equal(unreadable.evidence.enrollments_available, false);
+});
+
+test("assessKnowbe4TrainingProgram degrades remedial training to warn when tests in the window were not sampled", async () => {
+  const fixture = healthyFixture();
+  // Two of the three tests in the window are sampled; the failure and its remediation sit in the second test.
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, securityTestSampleLimit: 2 });
+  const item = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 10);
+
+  assert.equal(item.status, "warn");
+  assert.match(item.summary, /1 of 3 tests in the window were not sampled/);
+  assert.equal(item.evidence.security_tests_in_window, 3);
+  assert.deepEqual(item.evidence.sampled_security_tests, ["900", "901"]);
+  assert.equal(item.evidence.unsampled_security_tests, 1);
+  assert.equal(item.evidence.remediated_users, 1);
+  assert.equal(item.evidence.remediated_pct, 100);
+
+  // With only the newest test sampled there are no observed failures, which still cannot pass on a partial sample.
+  const thinSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW, securityTestSampleLimit: 1 });
+  const thin = findingFor(assessKnowbe4TrainingProgram(thinSnapshot, { now: NOW }), 10);
+  assert.equal(thin.status, "warn");
+  assert.equal(thin.evidence.failed_users_in_window, 0);
+  assert.equal(thin.evidence.unsampled_security_tests, 2);
+  assert.match(thin.summary, /2 additional tests in the window were not sampled/);
+
+  // A fully sampled window keeps passing and says so.
+  const fullSnapshot = await collectKnowbe4Snapshot(mockClient(fixture), { scopes: ["training"], now: NOW });
+  const full = findingFor(assessKnowbe4TrainingProgram(fullSnapshot, { now: NOW }), 10);
+  assert.equal(full.status, "pass");
+  assert.equal(full.evidence.unsampled_security_tests, 0);
+  assert.equal(full.evidence.sampled_security_tests.length, 3);
+});
+
 test("assessKnowbe4UserRisk passes balanced risk, full group coverage, and active users", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
@@ -856,6 +1039,40 @@ test("assessKnowbe4UserRisk fails high risk, uncovered groups, and inactive user
   assert.equal(findingFor(result, 18).evidence.partial_activity_data, false);
 });
 
+test("collectKnowbe4Snapshot flags user_limit truncation and user-set controls degrade to warn", async () => {
+  const fixture = healthyFixture();
+  const full = await collectKnowbe4Snapshot(mockClient(fixture), { now: NOW });
+  assert.equal(full.userLimit, 5000);
+  assert.equal(full.userLimitReached, false);
+  assert.equal(full.enrollmentLimit, 20000);
+  assert.equal(full.enrollmentLimitReached, false);
+  assert.equal(findingFor(assessKnowbe4PhishingProgram(full, { now: NOW }), 2).evidence.user_limit_reached, false);
+
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture), { now: NOW, userLimit: 5 });
+  assert.equal(snapshot.activeUsers.data.length, 5);
+  assert.equal(snapshot.userLimit, 5);
+  assert.equal(snapshot.userLimitReached, true);
+
+  const phishing = assessKnowbe4PhishingProgram(snapshot, { now: NOW });
+  const training = assessKnowbe4TrainingProgram(snapshot, { now: NOW });
+  const risk = assessKnowbe4UserRisk(snapshot, { now: NOW });
+  for (const [result, control] of [[phishing, 2], [phishing, 9], [training, 4], [risk, 5], [risk, 18]]) {
+    const item = findingFor(result, control);
+    assert.equal(item.status, "warn", `control ${control} should warn when the user list is truncated`);
+    assert.equal(item.evidence.user_limit_reached, true);
+    assert.equal(item.evidence.user_limit, 5);
+    assert.match(item.summary, /truncated at user_limit \(5\)/);
+  }
+  assert.equal(phishing.summary.user_limit_reached, true);
+  assert.equal(training.summary.user_limit_reached, true);
+  assert.equal(risk.summary.user_limit_reached, true);
+  // Controls that do not depend on the user list keep their own verdicts.
+  assert.equal(findingFor(phishing, 1).status, "pass");
+  assert.equal(findingFor(phishing, 20).status, "pass");
+  assert.equal(findingFor(risk, 8).status, "pass");
+  assert.equal(findingFor(phishing, 2).evidence.coverage_pct, 100);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });
@@ -873,9 +1090,27 @@ test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests whi
   }
   assert.deepEqual(result.summary.manual_controls, ["KNOWBE4-13", "KNOWBE4-14", "KNOWBE4-15"]);
 
+});
+
+test("assessKnowbe4AccountGovernance renders scoped-out USB and vishing controls as manual, never pass", async () => {
+  const client = mockClient(healthyFixture());
+  const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });
   const relaxed = assessKnowbe4AccountGovernance(snapshot, { now: NOW, requireUsbTests: false, requireVishingTests: false });
-  assert.equal(findingFor(relaxed, 15).status, "pass");
-  assert.equal(findingFor(relaxed, 16).status, "pass");
+
+  for (const control of [15, 16]) {
+    const item = findingFor(relaxed, control);
+    assert.equal(item.status, "manual", `control ${control} should be manual when scoped out`);
+    assert.match(item.summary, /scoped out by configuration/);
+    assert.match(item.summary, /not satisfied by the API/);
+    assert.match(item.manualEvidence, /risk-acceptance record/);
+    assert.equal(item.evidence.scoped_out_by_configuration, true);
+  }
+  assert.equal(findingFor(relaxed, 15).evidence.require_usb_tests, false);
+  assert.equal(findingFor(relaxed, 16).evidence.require_vishing_tests, false);
+  assert.deepEqual(relaxed.summary.manual_controls, ["KNOWBE4-13", "KNOWBE4-14", "KNOWBE4-15", "KNOWBE4-16"]);
+  assert.ok(!relaxed.findings.some((item) => item.control === 15 && item.status === "pass"));
+  assert.ok(!relaxed.findings.some((item) => item.control === 16 && item.status === "pass"));
+  assert.deepEqual(new Set(relaxed.findings.map((item) => item.status)), new Set(["pass", "manual"]));
 });
 
 test("assessKnowbe4AccountGovernance fails excessive admins and missing callback tests", async () => {

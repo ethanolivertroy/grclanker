@@ -236,6 +236,10 @@ export interface Knowbe4Snapshot {
   securityTests: Knowbe4Collected<JsonRecord[]>;
   securityTestRecipients: Knowbe4Collected<Knowbe4SampledSecurityTest[]>;
   unsampledSecurityTestIds: string[];
+  userLimit: number;
+  userLimitReached: boolean;
+  enrollmentLimit: number;
+  enrollmentLimitReached: boolean;
   callbackSecurityTests: Knowbe4Collected<JsonRecord[]>;
   trainingCampaigns: Knowbe4Collected<JsonRecord[]>;
   trainingEnrollments: Knowbe4Collected<JsonRecord[]>;
@@ -1319,6 +1323,10 @@ export async function collectKnowbe4Snapshot(
     securityTests,
     securityTestRecipients,
     unsampledSecurityTestIds,
+    userLimit,
+    userLimitReached: activeUsers.data.length >= userLimit,
+    enrollmentLimit,
+    enrollmentLimitReached: trainingEnrollments.data.length >= enrollmentLimit,
     callbackSecurityTests,
     trainingCampaigns,
     trainingEnrollments,
@@ -1374,6 +1382,18 @@ function unavailableFinding(number: number, severity: Knowbe4Finding["severity"]
     `Could not evaluate this control because the required KnowBe4 data was not readable: ${error}`,
     { collection_error: error },
   );
+}
+
+// Findings computed over the active user list cannot pass when user_limit truncated that list.
+function withUserCapCaveat(item: Knowbe4Finding, snapshot: Knowbe4Snapshot): Knowbe4Finding {
+  const evidence = { ...(item.evidence ?? {}), user_limit: snapshot.userLimit, user_limit_reached: snapshot.userLimitReached };
+  if (!snapshot.userLimitReached || item.status !== "pass") return { ...item, evidence };
+  return {
+    ...item,
+    status: "warn",
+    summary: `${item.summary} The active user list was truncated at user_limit (${snapshot.userLimit}), so this verdict only covers the users that were loaded.`,
+    evidence,
+  };
 }
 
 function userLabel(user: JsonRecord, redact: boolean): string {
@@ -1616,16 +1636,20 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
   if (snapshot.securityTests.error) return unavailableFinding(6, "high", snapshot.securityTests.error);
   const recent = testsWithin(snapshot.securityTests.data, lookbackDays, now).map((item) => item.test);
   const history = runTests(snapshot.securityTests.data, now).map((item) => item.test).reverse();
-  const current = weightedPhishPronePercent(recent)
-    ?? mean(snapshot.activeUsers.data.map((user) => asNumber(user.phish_prone_percentage)).filter((value): value is number => value !== undefined));
+  const current = weightedPhishPronePercent(recent);
+  // The per-user average is context only: never-tested users report 0%, so it cannot back a passing verdict.
+  const userAverage = mean(snapshot.activeUsers.data.map((user) => asNumber(user.phish_prone_percentage)).filter((value): value is number => value !== undefined));
   const baseline = history.length >= MIN_TREND_TESTS ? weightedPhishPronePercent(history.slice(0, 3)) : undefined;
   const accountRisk = asNumber(snapshot.account.data.current_risk_score);
 
   let status: Knowbe4Finding["status"];
   let summary: string;
-  if (current === undefined) {
+  if (recent.length === 0) {
     status = "warn";
-    summary = "No phish-prone percentage could be derived from recent security tests or user records.";
+    summary = `No phishing security tests ran in the last ${lookbackDays} days, so the current phish-prone percentage cannot be verified from test results${userAverage === undefined ? "" : ` (the per-user average of ${roundTo(userAverage, 2)}% counts never-tested users as 0% and is not used for the verdict)`}.`;
+  } else if (current === undefined) {
+    status = "warn";
+    summary = `${recent.length} phishing security tests ran in the last ${lookbackDays} days but none reported a phish-prone percentage with delivered counts, so the current rate cannot be verified.`;
   } else if (current > maxPhishPronePct) {
     status = "fail";
     summary = `The current phish-prone percentage is ${roundTo(current, 2)}%, above the ${maxPhishPronePct}% policy ceiling.`;
@@ -1639,8 +1663,11 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
 
   return finding(6, "high", status, summary, {
     current_phish_prone_pct: current === undefined ? null : roundTo(current, 2),
+    current_source: current === undefined ? "unverified" : "security_tests",
+    user_average_phish_prone_pct: userAverage === undefined ? null : roundTo(userAverage, 2),
     baseline_phish_prone_pct: baseline ?? null,
     max_phish_prone_pct: maxPhishPronePct,
+    lookback_days: lookbackDays,
     security_tests_in_window: recent.length,
     security_tests_all_time: history.length,
     account_current_risk_score: accountRisk ?? null,
@@ -1819,40 +1846,57 @@ function countBy(records: JsonRecord[], key: string): JsonRecord {
   return counts;
 }
 
-function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, maxScheduleGapDays: number): Knowbe4Finding {
+function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxScheduleGapDays: number): Knowbe4Finding {
   if (snapshot.securityTests.error) return unavailableFinding(20, "medium", snapshot.securityTests.error);
-  const tests = testsWithin(snapshot.securityTests.data, DEFAULT_TRAINING_LOOKBACK_DAYS, now).reverse();
-  if (tests.length < 2) {
-    return finding(20, "medium", "warn", `Only ${tests.length} phishing security tests ran in the last ${DEFAULT_TRAINING_LOOKBACK_DAYS} days; at least two are needed to measure scheduling gaps.`, {
-      security_tests_considered: tests.length,
+  const allTests = runTests(snapshot.securityTests.data, now);
+  if (allTests.length === 0) {
+    return finding(20, "medium", "fail", "No phishing security tests have ever run, so there is no scheduling cadence to evaluate.", {
+      security_tests_in_window: 0,
+      security_tests_all_time: 0,
+      lookback_days: lookbackDays,
       max_schedule_gap_days: maxScheduleGapDays,
     });
   }
-  const gaps: Array<{ from: string; to: string; days: number }> = [];
-  for (let index = 1; index < tests.length; index += 1) {
+  const inWindow = testsWithin(snapshot.securityTests.data, lookbackDays, now).reverse();
+  const cutoff = daysAgo(now, lookbackDays).getTime();
+  // Anchor the series on the last test before the window so the gap into the window is measured too.
+  const priorTest = allTests.find((item) => item.startedAt.getTime() < cutoff);
+  const series = priorTest ? [priorTest, ...inWindow] : inWindow;
+  const gaps: Array<{ from: string; to: string; days: number; boundary?: string }> = [];
+  for (let index = 1; index < series.length; index += 1) {
     gaps.push({
-      from: tests[index - 1].startedAt.toISOString(),
-      to: tests[index].startedAt.toISOString(),
-      days: roundTo(daysBetween(tests[index - 1].startedAt, tests[index].startedAt)),
+      from: series[index - 1].startedAt.toISOString(),
+      to: series[index].startedAt.toISOString(),
+      days: roundTo(daysBetween(series[index - 1].startedAt, series[index].startedAt)),
     });
   }
+  // A program that stopped running tests must not pass on historical gaps alone, so now is the final boundary.
+  const latest = allTests[0];
+  const daysSinceLatest = roundTo(daysBetween(latest.startedAt, now));
+  gaps.push({ from: latest.startedAt.toISOString(), to: now.toISOString(), days: daysSinceLatest, boundary: "now" });
   const maxGap = Math.max(...gaps.map((gap) => gap.days));
   const averageGap = roundTo(mean(gaps.map((gap) => gap.days)) ?? 0);
   const overThreshold = gaps.filter((gap) => gap.days > maxScheduleGapDays);
   const status = overThreshold.length === 0 ? "pass" : "fail";
+  const latestOverdue = daysSinceLatest > maxScheduleGapDays;
 
   return finding(
     20,
     "medium",
     status,
     status === "pass"
-      ? `${tests.length} phishing security tests ran with a maximum gap of ${maxGap} days (policy maximum ${maxScheduleGapDays}); average gap ${averageGap} days.`
-      : `${overThreshold.length} scheduling gaps exceeded ${maxScheduleGapDays} days (largest ${maxGap} days) across ${tests.length} phishing security tests.`,
+      ? `${inWindow.length} phishing security tests ran in the last ${lookbackDays} days with a maximum gap of ${maxGap} days including the ${daysSinceLatest} days since the latest test (policy maximum ${maxScheduleGapDays}); average gap ${averageGap} days.`
+      : `${overThreshold.length} scheduling gaps exceeded ${maxScheduleGapDays} days (largest ${maxGap} days)${latestOverdue ? `, including the ${daysSinceLatest} days since the most recent test` : ""}, across ${inWindow.length} phishing security tests in the last ${lookbackDays} days.`,
     {
-      security_tests_considered: tests.length,
+      security_tests_in_window: inWindow.length,
+      security_tests_all_time: allTests.length,
+      lookback_days: lookbackDays,
+      latest_test_started_at: latest.startedAt.toISOString(),
+      days_since_latest_test: daysSinceLatest,
       max_gap_days: maxGap,
       average_gap_days: averageGap,
       max_schedule_gap_days: maxScheduleGapDays,
+      gaps,
       gaps_over_threshold: overThreshold,
     },
   );
@@ -1874,12 +1918,12 @@ export function assessKnowbe4PhishingProgram(
 
   const findings = [
     assessPhishingFrequency(snapshot, now, maxCampaignGapDays, lookbackDays),
-    assessPhishingCoverage(snapshot, now, lookbackDays, minCoveragePct, redact),
+    withUserCapCaveat(assessPhishingCoverage(snapshot, now, lookbackDays, minCoveragePct, redact), snapshot),
     assessPhishPronePercentage(snapshot, now, lookbackDays, maxPhishPronePct),
     assessFailureTrend(snapshot, now, lookbackDays),
-    assessCampaignTargeting(snapshot, now, lookbackDays, minCoveragePct, requireFullTargeting),
+    withUserCapCaveat(assessCampaignTargeting(snapshot, now, lookbackDays, minCoveragePct, requireFullTargeting), snapshot),
     assessReportRate(snapshot, now, lookbackDays, minReportRatePct),
-    assessScheduleRegularity(snapshot, now, maxScheduleGapDays),
+    assessScheduleRegularity(snapshot, now, lookbackDays, maxScheduleGapDays),
   ];
 
   return {
@@ -1888,6 +1932,7 @@ export function assessKnowbe4PhishingProgram(
     summary: {
       account_name: asString(snapshot.account.data.name) ?? null,
       active_users: snapshot.activeUsers.data.length,
+      user_limit_reached: snapshot.userLimitReached,
       phishing_campaigns: snapshot.phishingCampaigns.data.length,
       security_tests: snapshot.securityTests.data.length,
       security_tests_in_lookback: testsWithin(snapshot.securityTests.data, lookbackDays, now).length,
@@ -2067,6 +2112,7 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
 
 function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, remedialWindowDays: number, redact: boolean): Knowbe4Finding {
   if (snapshot.trainingEnrollments.error) return unavailableFinding(10, "medium", snapshot.trainingEnrollments.error);
+  if (snapshot.securityTests.error) return unavailableFinding(10, "medium", snapshot.securityTests.error);
   const enrollmentsByUser = new Map<string, Date[]>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
     const userId = enrollmentUserId(enrollment);
@@ -2077,8 +2123,11 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     enrollmentsByUser.set(userId, bucket);
   }
 
+  const testsInWindow = testsWithin(snapshot.securityTests.data, lookbackDays, now);
+  const samples = sampledTestsWithin(snapshot, lookbackDays, now);
+  const unsampled = Math.max(0, testsInWindow.length - samples.length);
   const failures = new Map<string, { user: JsonRecord; failedAt: Date }>();
-  for (const sample of sampledTestsWithin(snapshot, lookbackDays, now)) {
+  for (const sample of samples) {
     for (const recipient of sample.recipients) {
       const failedAt = recipientFailureDate(recipient);
       const userId = recipientUserId(recipient);
@@ -2102,17 +2151,23 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
 
   let status: Knowbe4Finding["status"];
   let summary: string;
-  if (snapshot.securityTestRecipients.data.length === 0) {
+  if (samples.length === 0) {
     status = "warn";
-    summary = "No phishing security test recipient results were available, so remedial training follow-up could not be verified.";
+    summary = testsInWindow.length === 0
+      ? `No phishing security tests ran in the last ${lookbackDays} days, so remedial training follow-up could not be verified.`
+      : `None of the ${testsInWindow.length} phishing security tests in the last ${lookbackDays} days had recipient results available, so remedial training follow-up could not be verified.`;
   } else if (evaluable.length === 0) {
-    status = failures.size === 0 ? "pass" : "warn";
+    status = failures.size === 0 && unsampled === 0 ? "pass" : "warn";
     summary = failures.size === 0
-      ? `No users failed the ${snapshot.securityTestRecipients.data.length} sampled phishing security tests, so no remedial training was due.`
+      ? `No users failed the ${samples.length} sampled phishing security tests, so no remedial training was due${unsampled > 0 ? `; ${unsampled} additional tests in the window were not sampled, so failures may be missing` : ""}.`
       : `${failures.size} users failed sampled tests within the last ${remedialWindowDays} days; their remedial enrollment window is still open.`;
+  } else if (remediatedPct !== undefined && remediatedPct >= 90 && unsampled > 0) {
+    // Mirror controls 2 and 18: a clean result on a partial sample cannot pass outright.
+    status = "warn";
+    summary = `${remediated.length} of ${evaluable.length} users who failed a sampled phishing test (${remediatedPct}%) were enrolled in training after the failure, but ${unsampled} of ${testsInWindow.length} tests in the window were not sampled, so unremediated failures may be missing.`;
   } else if (remediatedPct !== undefined && remediatedPct >= 90) {
     status = "pass";
-    summary = `${remediated.length} of ${evaluable.length} users who failed a sampled phishing test (${remediatedPct}%) were enrolled in training after the failure.`;
+    summary = `${remediated.length} of ${evaluable.length} users who failed a sampled phishing test (${remediatedPct}%) were enrolled in training after the failure across all ${samples.length} tests in the window.`;
   } else if (remediatedPct !== undefined && remediatedPct >= 50) {
     status = "warn";
     summary = `Only ${remediated.length} of ${evaluable.length} users who failed a sampled phishing test (${remediatedPct}%) were enrolled in training after the failure.`;
@@ -2122,6 +2177,9 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
   }
 
   return finding(10, "medium", status, summary, {
+    security_tests_in_window: testsInWindow.length,
+    sampled_security_tests: samples.map((sample) => sample.pst_id),
+    unsampled_security_tests: unsampled,
     failed_users_in_window: failures.size,
     failed_users_evaluated: evaluable.length,
     remediated_users: remediated.length,
@@ -2146,14 +2204,20 @@ function storePurchaseId(item: JsonRecord): string | undefined {
 function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxContentAgeDays: number): Knowbe4Finding {
   if (snapshot.trainingCampaigns.error) return unavailableFinding(11, "low", snapshot.trainingCampaigns.error);
   const retiredPurchases = new Set<string>();
+  const catalogPublishDates = new Map<string, Date>();
   for (const purchase of snapshot.storePurchases.data) {
     const id = storePurchaseId(purchase);
-    if (id && asBoolean(purchase.retired) === true) retiredPurchases.add(id);
+    if (!id) continue;
+    if (asBoolean(purchase.retired) === true) retiredPurchases.add(id);
+    const published = toDate(purchase.publish_date);
+    if (published) catalogPublishDates.set(id, published);
   }
   const cutoff = daysAgo(now, maxContentAgeDays).getTime();
   const stale: Array<{ campaign: string; module: string; publish_date: string | null }> = [];
   const retired: Array<{ campaign: string; module: string }> = [];
+  const undated: Array<{ campaign: string; module: string }> = [];
   let reviewed = 0;
+  let dated = 0;
   for (const campaign of snapshot.trainingCampaigns.data) {
     if (campaignCancelled(campaign) || !campaignInWindow(campaign, lookbackDays, now)) continue;
     for (const item of campaignContentItems(campaign)) {
@@ -2165,8 +2229,14 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
         retired.push({ campaign: campaignName(campaign), module: moduleName });
         continue;
       }
-      const published = toDate(item.publish_date);
-      if (published && published.getTime() < cutoff) {
+      const published = toDate(item.publish_date) ?? (id ? catalogPublishDates.get(id) : undefined);
+      if (!published) {
+        // An undated module cannot be shown to be current, so it must not count as fresh.
+        undated.push({ campaign: campaignName(campaign), module: moduleName });
+        continue;
+      }
+      dated += 1;
+      if (published.getTime() < cutoff) {
         stale.push({ campaign: campaignName(campaign), module: moduleName, publish_date: published.toISOString() });
       }
     }
@@ -2180,18 +2250,24 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
   } else if (retired.length > 0) {
     status = "fail";
     summary = `${retired.length} assigned training modules are retired by the publisher and should be replaced.`;
-  } else if (stale.length > 0) {
+  } else if (stale.length > 0 || undated.length > 0) {
     status = "warn";
-    summary = `${stale.length} of ${reviewed} assigned training modules were published more than ${maxContentAgeDays} days ago.`;
+    const parts: string[] = [];
+    if (stale.length > 0) parts.push(`${stale.length} were published more than ${maxContentAgeDays} days ago`);
+    if (undated.length > 0) parts.push(`${undated.length} have no publish date in the Reporting API or store catalog, so their currency cannot be verified`);
+    summary = `Of ${reviewed} assigned training modules, ${parts.join(" and ")}.`;
   } else {
     status = "pass";
-    summary = `All ${reviewed} assigned training modules were published within the last ${maxContentAgeDays} days and none are retired.`;
+    summary = `All ${reviewed} assigned training modules have publish dates within the last ${maxContentAgeDays} days and none are retired.`;
   }
 
   return finding(11, "low", status, summary, {
     modules_reviewed: reviewed,
+    modules_with_publish_date: dated,
     retired_modules: retired.slice(0, SAMPLE_SIZE),
     stale_modules: stale.slice(0, SAMPLE_SIZE),
+    undated_module_count: undated.length,
+    undated_modules: undated.slice(0, SAMPLE_SIZE),
     max_content_age_days: maxContentAgeDays,
     training_lookback_days: lookbackDays,
   });
@@ -2199,8 +2275,9 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
 
 const COMPLIANCE_TOPIC_PATTERN = /\b(hipaa|pci|gdpr|sox|ferpa|ccpa|cpra|glba|cmmc|nist|iso\s?27001|fedramp|privacy|compliance|acceptable use|insider threat)\b/i;
 
-function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, requiredTopics: string[]): Knowbe4Finding {
+function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, requiredTopics: string[], enrollmentLimitReached: boolean): Knowbe4Finding {
   if (snapshot.trainingCampaigns.error) return unavailableFinding(17, "medium", snapshot.trainingCampaigns.error);
+  const enrollmentsUnavailable = Boolean(snapshot.trainingEnrollments.error) || !snapshot.trainingEnrollments.collected;
   const assignedModules = new Map<string, Set<string>>();
   for (const campaign of snapshot.trainingCampaigns.data) {
     if (campaignCancelled(campaign) || !campaignInWindow(campaign, lookbackDays, now)) continue;
@@ -2237,35 +2314,50 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     };
   });
   const missing = topicResults.filter((item) => item.assigned_modules.length === 0);
+  // Assigned but never enrolled means nobody can have completed the topic, so it cannot pass.
+  const unenrolled = topicResults.filter((item) => item.assigned_modules.length > 0 && item.enrollments === 0);
   const lowCompletion = topicResults.filter((item) => item.completion_pct !== null && item.completion_pct < minCompletionPct);
+  const enrollmentDataPartial = enrollmentsUnavailable || enrollmentLimitReached;
+  const topicList = (items: typeof topicResults): string => items.map((item) => item.topic).join(", ");
 
   let status: Knowbe4Finding["status"];
   let summary: string;
   if (missing.length > 0) {
     status = requiredTopics.length > 0 ? "fail" : "warn";
     summary = requiredTopics.length > 0
-      ? `Required compliance topics with no assigned training module in the last ${lookbackDays} days: ${missing.map((item) => item.topic).join(", ")}.`
+      ? `Required compliance topics with no assigned training module in the last ${lookbackDays} days: ${topicList(missing)}.`
       : `No compliance-themed training modules were assigned in the last ${lookbackDays} days; pass required_compliance_topics to assert the modules your policy requires.`;
+  } else if (unenrolled.length > 0 && requiredTopics.length > 0 && !enrollmentDataPartial) {
+    status = "fail";
+    summary = `Required compliance topics are assigned in campaigns but have zero training enrollments, so no user has completed them: ${topicList(unenrolled)}.`;
+  } else if (unenrolled.length > 0) {
+    status = "warn";
+    summary = enrollmentDataPartial
+      ? `Compliance topics are assigned but no enrollments were loaded for ${topicList(unenrolled)}; enrollment data is ${enrollmentsUnavailable ? "unavailable" : "truncated at enrollment_limit"}, so completion could not be verified.`
+      : `Compliance-themed modules are assigned but have zero training enrollments, so nobody has completed them: ${topicList(unenrolled)}.`;
   } else if (lowCompletion.length > 0) {
     status = "warn";
     summary = `Compliance modules are assigned but completion is below ${minCompletionPct}% for: ${lowCompletion.map((item) => `${item.topic} (${item.completion_pct}%)`).join(", ")}.`;
   } else {
     status = "pass";
-    summary = `Compliance training modules are assigned for ${topicResults.map((item) => item.topic).join(", ")} with completion at or above ${minCompletionPct}% where enrollments exist.`;
+    summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)} with completion at or above ${minCompletionPct}%.`;
   }
 
   return finding(17, "medium", status, summary, {
     required_compliance_topics: requiredTopics,
     topics: topicResults,
+    topics_without_enrollments: unenrolled.map((item) => item.topic),
     min_completion_pct: minCompletionPct,
     training_lookback_days: lookbackDays,
+    enrollments_available: !enrollmentsUnavailable,
+    enrollment_limit_reached: enrollmentLimitReached,
     uploaded_policies: snapshot.trainingPolicies.data.length,
   });
 }
 
 export function assessKnowbe4TrainingProgram(
   snapshot: Knowbe4Snapshot,
-  options: Knowbe4AssessmentOptions & { enrollmentLimit?: number } = {},
+  options: Knowbe4AssessmentOptions = {},
 ): Knowbe4AssessmentResult {
   const now = options.now ?? new Date();
   const redact = options.redactPii ?? false;
@@ -2277,15 +2369,14 @@ export function assessKnowbe4TrainingProgram(
   const remedialWindowDays = clampInteger(options.remedialWindowDays, DEFAULT_REMEDIAL_WINDOW_DAYS, 1, 365);
   const maxContentAgeDays = clampInteger(options.maxContentAgeDays, DEFAULT_MAX_CONTENT_AGE_DAYS, 1, 3650);
   const requiredTopics = options.requiredComplianceTopics ?? [];
-  const enrollmentLimit = clampInteger(options.enrollmentLimit, DEFAULT_ENROLLMENT_LIMIT, 1, 1_000_000);
-  const enrollmentLimitReached = snapshot.trainingEnrollments.data.length >= enrollmentLimit;
+  const enrollmentLimitReached = snapshot.enrollmentLimitReached;
 
   const findings = [
     assessTrainingCompletion(snapshot, now, trainingLookbackDays, minCompletionPct, failCompletionPct),
-    assessEnrollmentTimeliness(snapshot, now, trainingLookbackDays, graceDays, enrollmentLimitReached, redact),
+    withUserCapCaveat(assessEnrollmentTimeliness(snapshot, now, trainingLookbackDays, graceDays, enrollmentLimitReached, redact), snapshot),
     assessRemedialTraining(snapshot, now, lookbackDays, remedialWindowDays, redact),
     assessContentCurrency(snapshot, now, trainingLookbackDays, maxContentAgeDays),
-    assessComplianceModules(snapshot, now, trainingLookbackDays, minCompletionPct, requiredTopics),
+    assessComplianceModules(snapshot, now, trainingLookbackDays, minCompletionPct, requiredTopics, enrollmentLimitReached),
   ];
 
   return {
@@ -2297,6 +2388,7 @@ export function assessKnowbe4TrainingProgram(
       training_campaigns: snapshot.trainingCampaigns.data.length,
       training_enrollments: snapshot.trainingEnrollments.data.length,
       enrollment_limit_reached: enrollmentLimitReached,
+      user_limit_reached: snapshot.userLimitReached,
       store_purchases: snapshot.storePurchases.data.length,
       uploaded_policies: snapshot.trainingPolicies.data.length,
       training_lookback_days: trainingLookbackDays,
@@ -2474,7 +2566,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
 
 export function assessKnowbe4UserRisk(
   snapshot: Knowbe4Snapshot,
-  options: Knowbe4AssessmentOptions & { enrollmentLimit?: number } = {},
+  options: Knowbe4AssessmentOptions = {},
 ): Knowbe4AssessmentResult {
   const now = options.now ?? new Date();
   const redact = options.redactPii ?? false;
@@ -2482,13 +2574,12 @@ export function assessKnowbe4UserRisk(
   const inactiveDays = clampInteger(options.inactiveDays, DEFAULT_INACTIVE_DAYS, 1, 3650);
   const maxMeanRiskScore = clampNumber(options.maxMeanRiskScore, DEFAULT_MAX_MEAN_RISK_SCORE, 0, 100);
   const maxStddev = clampNumber(options.maxRiskScoreStddev, DEFAULT_MAX_RISK_STDDEV, 0, 100);
-  const enrollmentLimit = clampInteger(options.enrollmentLimit, DEFAULT_ENROLLMENT_LIMIT, 1, 1_000_000);
-  const enrollmentLimitReached = snapshot.trainingEnrollments.data.length >= enrollmentLimit;
+  const enrollmentLimitReached = snapshot.enrollmentLimitReached;
 
   const findings = [
-    assessRiskDistribution(snapshot, maxMeanRiskScore, maxStddev, redact),
+    withUserCapCaveat(assessRiskDistribution(snapshot, maxMeanRiskScore, maxStddev, redact), snapshot),
     assessGroupCoverage(snapshot, now, lookbackDays),
-    assessInactiveUsers(snapshot, now, inactiveDays, enrollmentLimitReached, redact),
+    withUserCapCaveat(assessInactiveUsers(snapshot, now, inactiveDays, enrollmentLimitReached, redact), snapshot),
   ];
 
   return {
@@ -2498,6 +2589,8 @@ export function assessKnowbe4UserRisk(
       account_name: asString(snapshot.account.data.name) ?? null,
       account_current_risk_score: asNumber(snapshot.account.data.current_risk_score) ?? null,
       active_users: snapshot.activeUsers.data.length,
+      user_limit_reached: snapshot.userLimitReached,
+      enrollment_limit_reached: enrollmentLimitReached,
       active_groups: snapshot.groups.data.length,
       phishing_campaigns: snapshot.phishingCampaigns.data.length,
       training_campaigns: snapshot.trainingCampaigns.data.length,
@@ -2599,9 +2692,20 @@ function assessReportingFrequency(snapshot: Knowbe4Snapshot, now: Date): Knowbe4
 
 function assessUsbTests(now: Date, lookbackDays: number, requireUsbTests: boolean): Knowbe4Finding {
   if (!requireUsbTests) {
-    return finding(15, "low", "pass", "Policy does not require USB drop tests (require_usb_tests is false), so no evidence is needed for this control.", {
-      require_usb_tests: false,
-    });
+    // Scoping a control out by configuration is not evidence that it is met, so it stays a manual item.
+    return finding(
+      15,
+      "low",
+      "manual",
+      "USB drop testing was scoped out by configuration (require_usb_tests is false); this control was not evaluated and is not satisfied by the API. Record the documented risk decision that physical media testing is out of scope, or enable require_usb_tests and evidence the tests.",
+      {
+        require_usb_tests: false,
+        scoped_out_by_configuration: true,
+        lookback_days: lookbackDays,
+        evaluated_at: now.toISOString(),
+      },
+      "Attach the approved policy or risk-acceptance record stating that physical media (USB drop) testing is out of scope for the awareness program. If it is in scope, export the USB Drive Test campaign list from the KnowBe4 console (Phishing, USB Drive Test) with results from the assessment period.",
+    );
   }
   return finding(
     15,
@@ -2621,9 +2725,20 @@ function assessUsbTests(now: Date, lookbackDays: number, requireUsbTests: boolea
 
 function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, requireVishingTests: boolean): Knowbe4Finding {
   if (!requireVishingTests) {
-    return finding(16, "low", "pass", "Policy does not require voice-channel phishing tests (require_vishing_tests is false), so no evidence is needed for this control.", {
-      require_vishing_tests: false,
-    });
+    return finding(
+      16,
+      "low",
+      "manual",
+      "Voice-channel (vishing) testing was scoped out by configuration (require_vishing_tests is false); this control was not evaluated and is not satisfied by the API. Record the documented risk decision that voice-channel testing is out of scope, or enable require_vishing_tests to evaluate callback phishing tests.",
+      {
+        require_vishing_tests: false,
+        scoped_out_by_configuration: true,
+        lookback_days: lookbackDays,
+        evaluated_at: now.toISOString(),
+        callback_tests_all_time: snapshot.callbackSecurityTests.collected ? runTests(snapshot.callbackSecurityTests.data, now).length : null,
+      },
+      "Attach the approved policy or risk-acceptance record stating that voice-channel (vishing) testing is out of scope for the awareness program. If it is in scope, export the Callback Phishing campaign list from the KnowBe4 console (Phishing, Callback Phishing) showing tests started in the assessment period.",
+    );
   }
   if (!snapshot.callbackSecurityTests.collected || snapshot.callbackSecurityTests.error) {
     return finding(
@@ -3110,7 +3225,7 @@ const authParams = {
 
 const scopeParams = {
   lookback_days: Type.Optional(Type.Number({ description: "Analysis window in days for phishing cadence, coverage, report rate, callback tests, and group coverage. Defaults to 90.", default: 90 })),
-  user_limit: Type.Optional(Type.Number({ description: "Maximum active users to load. Defaults to 5000.", default: 5000 })),
+  user_limit: Type.Optional(Type.Number({ description: "Maximum active users to load. Findings computed over the user list degrade to warn with user_limit_reached when the cap is hit. Defaults to 5000.", default: 5000 })),
   security_test_sample_limit: Type.Optional(Type.Number({ description: "Number of most recent phishing security tests whose recipient results are loaded. Defaults to 12.", default: 12 })),
 };
 
@@ -3147,10 +3262,10 @@ const riskParams = {
 
 const governanceParams = {
   lookback_days: Type.Optional(Type.Number({ description: "Analysis window in days for callback phishing tests. Defaults to 90.", default: 90 })),
-  user_limit: Type.Optional(Type.Number({ description: "Maximum active users to load. Defaults to 5000.", default: 5000 })),
+  user_limit: Type.Optional(Type.Number({ description: "Maximum active users to load. Findings computed over the user list degrade to warn with user_limit_reached when the cap is hit. Defaults to 5000.", default: 5000 })),
   max_admin_count: Type.Optional(Type.Number({ description: "Maximum console administrators before control 12 fails. Defaults to 3.", default: 3 })),
-  require_usb_tests: Type.Optional(Type.Boolean({ description: "Whether policy requires USB drop tests (control 15). Set false to mark the control not applicable. Defaults to true.", default: true })),
-  require_vishing_tests: Type.Optional(Type.Boolean({ description: "Whether policy requires voice-channel (callback) phishing tests (control 16). Set false to mark the control not applicable. Defaults to true.", default: true })),
+  require_usb_tests: Type.Optional(Type.Boolean({ description: "Whether policy requires USB drop tests (control 15). Set false to scope the control out; it is then reported as manual with the policy evidence to attach, never as pass. Defaults to true.", default: true })),
+  require_vishing_tests: Type.Optional(Type.Boolean({ description: "Whether policy requires voice-channel (callback) phishing tests (control 16). Set false to scope the control out; it is then reported as manual with the policy evidence to attach, never as pass. Defaults to true.", default: true })),
 };
 
 function assessmentTool(
