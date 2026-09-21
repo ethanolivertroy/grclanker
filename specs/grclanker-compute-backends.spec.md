@@ -432,23 +432,27 @@ Status as of 2026-09-21: implemented for seven of nine kinds, with `vercel-sandb
 
 ### Backend matrix
 
-| Kind | Implemented | Tested | Documented | Notes |
-| --- | --- | --- | --- | --- |
-| `host` | yes | yes (contract shape) | yes | phase 1 behavior unchanged |
-| `sandbox-runtime` | yes | yes (FS policy, contract shape) | yes | phase 1 behavior unchanged |
-| `docker` | yes | yes (injected runner, run-arg shape, computeDefaults) | yes | `deny-all` maps to `--network none`, `ro` maps to a read-only bind mount |
-| `parallels-vm` | yes | yes (injected runner: stage, exec, snapshot, restore, teardown, failure cleanup) | yes | snapshot via `prlctl snapshot`, rollback via `prlctl snapshot-switch` |
-| `modal` | yes (CLI: `modal shell`) | yes (injected runner, flag shape, redaction) | yes | no sync-back or snapshots through the CLI |
-| `runpod-serverless` | yes (HTTP: `/health`, `/run`, `/status`, `/cancel`) | yes (mocked fetch) | yes | requires a worker implementing the grclanker input/output contract |
-| `runpod-pod` | yes (HTTP `GET /pods/{id}` plus SSH/scp) | yes (mocked fetch, injected runner) | yes | REST v1 is deprecated by RunPod; base URL isolated for the v2 move |
-| `vercel-sandbox` | stub | yes (fails fast) | yes (marked not available) | SDK/CLI only, no npm dependency added |
-| `cloudflare-sandbox` | stub | yes (fails fast) | yes (marked not available) | Workers SDK only, no public HTTP lifecycle API |
+| Kind | Implemented | Runtime path | Tested | Documented | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `host` | yes | Pi's native local shell operations; `createHostBackend` is a contract implementation used by tests and `env list` only | yes (contract shape) | yes | phase 1 behavior unchanged |
+| `sandbox-runtime` | yes | contract adapter for bash, grep, find; file tools stay local under the same FS policy | yes (FS policy, contract shape) | yes | bash now runs through the contract runner (`bash -lc` plus the sandbox wrapper) |
+| `docker` | yes | contract adapter | yes (injected runner, run-arg shape byte-identical to phase 1, computeDefaults, daemon-unreachable error) | yes | `deny-all` maps to `--network none`, `ro` maps to a read-only bind mount |
+| `parallels-vm` | yes | contract adapter (replaces the phase 1 `spawnSync` clone path) | yes (injected runner: stage, exec, snapshot, restore, teardown, failure cleanup, mount mode) | yes | snapshot via `prlctl snapshot`, rollback via `prlctl snapshot-switch --id {uuid}`; `env smoke-test` exercises both |
+| `modal` | yes (CLI: `modal shell`) | contract adapter | yes (injected runner, flag shape, shlex-safe command wrapper, redaction) | yes | no sync-back or snapshots through the CLI |
+| `runpod-serverless` | yes (HTTP: `/health`, `/run`, `/status`, `/cancel`) | contract adapter | yes (mocked fetch, typed poll timeout) | yes | requires a worker implementing the grclanker input/output contract; 600000 ms default poll ceiling |
+| `runpod-pod` | yes (HTTP `GET /pods/{id}` plus SSH/scp) | contract adapter | yes (mocked fetch, injected runner, scp-failure cleanup, session-id validation, awaited teardown) | yes | REST v1 is deprecated by RunPod; base URL isolated for the v2 move |
+| `vercel-sandbox` | stub | fails fast | yes (fails fast) | yes (marked not available) | SDK/CLI only, no npm dependency added |
+| `cloudflare-sandbox` | stub | fails fast | yes (fails fast) | yes (marked not available) | Workers SDK only, no public HTTP lifecycle API |
+
+Session lifecycle: `grclanker env smoke-test` and `grclanker env exec` await `teardown` in a `finally` block on success and failure; the agent session tears down every registered backend session on `session_shutdown`; a synchronous `process.on("exit")` hook running each adapter's `teardownSync` is the last resort only.
 
 ### Deviations from this spec
 
 - The contract names the final lifecycle step `teardown` rather than `cleanup`, and `snapshot`/`restore` are required members that throw a typed "not supported" error when `capabilities.snapshot` or `capabilities.restore` is false, instead of being optional.
 - `ExecutionRequest` carries `sessionId`, `onData`, and `signal` so streaming tool output and aborts work through the same contract.
-- Parallels rollback uses `prlctl snapshot-switch --id`, which is the prlctl command for the operation this spec calls `prlctl rollback`. Guest execution still uses `prlctl exec`; the SSH guest path remains unimplemented because `prlctl exec` already covers the tool surface.
+- Parallels rollback uses `prlctl snapshot-switch --id {uuid}`, which is the prlctl command for the operation this spec calls `prlctl rollback`; the id keeps the braced form prlctl prints. Guest execution still uses `prlctl exec`; the SSH guest path remains unimplemented because `prlctl exec` already covers the tool surface.
+- `host` does not run through the contract adapter at runtime. Pi's native local shell operations (shell config, process-tree kill) remain the host path so the default backend's behavior is unchanged; `createHostBackend` exists so the contract is total over the kind union and is exercised by tests.
+- The Modal `--cmd` value is a base64 wrapper rather than the raw command, because the modal client re-splits `--cmd` with `shlex`.
 - Modal is driven through the documented `modal shell` CLI rather than the Sandbox SDK or an HTTP API, because Modal does not document a public HTTP lifecycle API and the project does not add npm dependencies for this.
 - `runpod-pod` never creates or destroys pods. It operates only inside a per-session directory on a pod the operator already owns.
 - `computeProfile` is validated against the selected backend's routing bucket rather than selecting a backend on its own.
@@ -461,6 +465,8 @@ Status as of 2026-09-21: implemented for seven of nine kinds, with `vercel-sandb
 - Moving `runpod-pod` to RunPod REST API v2 before the documented v1 retirement on 2026-11-15.
 - A reference RunPod serverless worker image implementing the grclanker input/output contract.
 - Header text still reads the backend kind; per-session snapshot and artifact manifests are not surfaced in the TUI yet.
+- Routing `host` through the contract adapter (would need the host adapter to reuse Pi's shell config and process-tree kill semantics).
+- Per-tool-call snapshot and rollback inside the agent session for Parallels; today only `env smoke-test` drives `snapshot` and `restore`.
 
 ## Decision Summary
 

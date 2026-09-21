@@ -24,19 +24,23 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 
 ## Backend matrix
 
-| Kind | Bucket | State | Snapshot / restore | GPU | Workspace staging | Artifact sync-back |
-| --- | --- | --- | --- | --- | --- | --- |
-| `host` | host | shipped | no | no | in place | in place |
-| `sandbox-runtime` | sandboxed | shipped | no | no | in place | in place |
-| `docker` | sandboxed | shipped | no | no | bind mount | bind mount |
-| `parallels-vm` | sandboxed | shipped | yes (`prlctl snapshot`, `prlctl snapshot-switch`) | no | shared folder | shared folder |
-| `modal` | gpu-burst | shipped (CLI) | no | yes | `--add-local` copy per command | not available |
-| `runpod-pod` | persistent-remote | shipped | no | yes | `scp` into a per-session directory | `scp` (manual) |
-| `runpod-serverless` | gpu-burst | shipped | no | yes | worker image must contain the workspace | artifact paths reported by the worker |
-| `vercel-sandbox` | sandboxed | stub | no | no | no | no |
-| `cloudflare-sandbox` | sandboxed | stub | no | no | no | no |
+| Kind | Bucket | State | Runtime path | Snapshot / restore | GPU | Workspace staging | Artifact sync-back |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `host` | host | shipped | Pi's native local shell operations (the `createHostBackend` contract adapter is exercised by tests and `env list` only) | no | no | in place | in place |
+| `sandbox-runtime` | sandboxed | shipped | contract adapter for bash, grep, and find; file tools stay local with the same FS policy | no | no | in place | in place |
+| `docker` | sandboxed | shipped | contract adapter (`docker run` args unchanged from phase 1) | no | no | bind mount | bind mount |
+| `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |
+| `modal` | gpu-burst | shipped (CLI) | contract adapter over `modal shell` | no | yes | `--add-local` copy per command | not available |
+| `runpod-pod` | persistent-remote | shipped | contract adapter over the REST API plus `ssh`/`scp` | no | yes | `scp` into a per-session directory | `scp` (manual) |
+| `runpod-serverless` | gpu-burst | shipped | contract adapter over the serverless HTTP API | no | yes | worker image must contain the workspace | artifact paths reported by the worker |
+| `vercel-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
+| `cloudflare-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 
 `grclanker env list` prints the same matrix for your machine, including which backends are detected right now.
+
+### Session lifecycle and teardown
+
+Every backend except `host` stages a session lazily on the first command and owns a teardown. `grclanker env smoke-test` and `grclanker env exec` await that teardown in a `finally` block, on success and on failure, so a RunPod pod session directory or a Parallels clone is removed before the command returns. The interactive agent session tears every active backend session down on `session_shutdown`. As a last resort, a synchronous `process.on("exit")` hook runs each adapter's `teardownSync` (a blocking `ssh rm -rf` for RunPod pods, `prlctl stop --kill` and `prlctl delete` for Parallels); Node cannot await asynchronous work in exit handlers, so this hook is only a fallback for hard exits, not the primary cleanup path.
 
 ## The ExecutionBackend contract
 
@@ -131,7 +135,7 @@ Only the fields for the backend you actually use need to be set.
 
 - `computeProfile`: `local-host`, `isolated-local`, `gpu-burst`, or `persistent-remote`. Each profile maps to one routing bucket; `env list` and `env doctor` warn when the selected backend belongs to a different bucket than the profile. When unset, the profile is derived from the backend.
 - `computeDefaults.networkPolicy`: `"default"`, `"deny-all"`, or `{ "allowDomains": [...] }`. Docker honors `deny-all` with `--network none`. `sandbox-runtime` keeps using its own `sandbox.json` allowlist. Remote providers record the policy but cannot enforce it through their documented surfaces yet.
-- `computeDefaults.workspaceMountMode`: `"rw"` or `"ro"`. Docker appends `:ro` to the bind mount and Parallels attaches the repo share read-only when set to `ro`.
+- `computeDefaults.workspaceMountMode`: `"rw"` or `"ro"`. Docker appends `:ro` to the bind mount and Parallels passes `--mode ro` when it attaches the repo share (`prlctl set <clone> --shf-host-add <share> --path <repo> --mode ro`). Both paths read the same setting, so a read-only workspace means write, edit, and the smoke test's write probe fail inside the sandbox by design.
 
 ## Host
 
@@ -304,7 +308,7 @@ grclanker env exec --backend parallels-vm -- pwd
 
 Parallels is the right option when you want stronger isolation than Docker, or when the target environment needs to look like a full workstation or guest OS, but you still want the session to be disposable.
 
-Snapshot and rollback are available through the contract (`prlctl snapshot <clone> --name <name>` and `prlctl snapshot-switch <clone> --id <id>`). The adapter only rolls back to snapshots it created in the same session, and it still deletes the disposable clone on teardown.
+Snapshot and rollback run through the contract adapter (`prlctl snapshot <clone> --name <name>` and `prlctl snapshot-switch <clone> --id {<uuid>}`). The snapshot id is kept in the braced form that `prlctl` prints, and the adapter only rolls back to snapshots it created in the same session. `grclanker env smoke-test --backend parallels-vm` is the CLI surface that exercises this path today: it snapshots the fresh clone after the bash probe, runs the tool probes, restores the snapshot, and reports `snapshot=ok` and `restore=ok`. The agent session does not yet snapshot per tool call; it still deletes the disposable clone on teardown.
 
 ## Modal
 
@@ -321,7 +325,9 @@ grclanker setup --compute modal
 grclanker env smoke-test --backend modal
 ```
 
-What runs where: each `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` call becomes one `modal shell --no-pty --image <modalImage> --add-local <repo> [--gpu <modalGpu>] --cmd "<command>"` invocation, following the flags documented at [modal.com/docs/reference/cli/shell](https://modal.com/docs/reference/cli/shell). The repo is copied into the container at `/mnt/<repo-name>` for every command.
+What runs where: each `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` call becomes one `modal shell --no-pty --image <modalImage> --add-local <repo> [--gpu <modalGpu>] --cmd "<wrapper>"` invocation, following the flags documented at [modal.com/docs/reference/cli/shell](https://modal.com/docs/reference/cli/shell). The repo is copied into the container at `/mnt/<repo-name>` for every command.
+
+Command quoting: the modal client runs `shlex.split(f'/bin/bash -c "{cmd}"')` on the `--cmd` value, so a raw command containing double quotes would be re-split. grclanker therefore never passes the command itself; it passes a wrapper made only of characters shlex leaves alone (`f=$(mktemp) && printf %s <base64> | base64 -d > $f && bash $f; s=$?; rm -f $f; exit $s`). The real command travels as base64, is decoded into a temp file inside the container, runs with its own stdin, and its exit status is preserved.
 
 Limits:
 
@@ -339,8 +345,10 @@ Requests, in order, with every field taken from [Send API requests](https://docs
 
 - `GET https://api.runpod.ai/v2/{endpointId}/health` for `env doctor` style health checks.
 - `POST https://api.runpod.ai/v2/{endpointId}/run` with `{ "input": { "command", "cwd", "env" }, "policy": { "executionTimeout" } }`. The `authorization: Bearer <RUNPOD_API_KEY>` header follows the documented example.
-- `GET https://api.runpod.ai/v2/{endpointId}/status/{id}` polled until `status` leaves `IN_QUEUE` / `IN_PROGRESS`.
+- `GET https://api.runpod.ai/v2/{endpointId}/status/{id}` polled every 2 seconds until `status` leaves `IN_QUEUE` / `IN_PROGRESS`.
 - `POST https://api.runpod.ai/v2/{endpointId}/cancel/{id}` if grclanker aborts or times out while waiting.
+
+Polling deadline: the loop always has a ceiling. It uses the tool's timeout when one is given, otherwise 600000 ms, which is the default `executionTimeout` RunPod documents for serverless jobs, plus a 60 second grace window so the endpoint can report `TIMED_OUT` itself first. When the deadline passes, the adapter cancels the job and raises an `ExecutionBackendTimeoutError` (message `runpod-serverless timed out after 600s: ...`).
 
 Worker contract: RunPod documents that `input` is defined by your worker, so grclanker defines a small one. Your handler receives `input.command`, `input.cwd`, and `input.env`, runs the command with `bash -lc`, and returns `{ "exitCode": number, "stdout": string, "stderr": string, "artifacts": string[] }` as the job `output`. The worker image must already contain the workspace at `runpodWorkspacePath` (default `/workspace`); serverless jobs cannot receive files.
 
@@ -354,7 +362,7 @@ Credentials: `RUNPOD_API_KEY` and `RUNPOD_POD_ID`, plus an SSH key that the pod 
 
 Requests: `GET https://rest.runpod.io/v1/pods/{podId}` with `Authorization: Bearer <RUNPOD_API_KEY>`, reading `desiredStatus`, `publicIp`, and `portMappings["22"]` as documented at [Find a Pod by ID](https://docs.runpod.io/api-reference/pods/GET/pods/podId). RunPod marks REST API v1 as deprecated with retirement on 2026-11-15 ([API overview](https://docs.runpod.io/api-reference/overview)); the base URL lives in one constant so the v2 move is a one-line change.
 
-What runs where: `stageWorkspace` runs `scp -r <repo>/. root@<publicIp>:<runpodWorkspacePath>/<sessionId>`, every command runs as `ssh -p <port> root@<publicIp> "cd -- <cwd> && <command>"`, and teardown removes the session directory. The pod must expose TCP port 22 publicly.
+What runs where: `stageWorkspace` runs `ssh ... mkdir -p -- <runpodWorkspacePath>/<sessionId>` followed by `scp -r <repo>/. root@<publicIp>:<runpodWorkspacePath>/<sessionId>`; if the copy fails, the adapter removes the directory it just created before raising. Every command runs as `ssh -p <port> root@<publicIp> "cd -- <cwd> && <command>"`, and teardown removes the session directory (`rm -rf -- <runpodWorkspacePath>/<sessionId>`). Session ids are validated at the adapter boundary (letters, digits, `.`, `_`, `-`, no `..`), so no caller can turn the removal into a traversal. The pod must expose TCP port 22 publicly.
 
 Limits: no snapshots through the API, and sync-back means copying the session directory back with `scp` yourself.
 
