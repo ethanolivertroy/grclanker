@@ -3,11 +3,11 @@ slug: "splunk-sec-inspector"
 name: "Splunk Security Inspector"
 vendor: "Splunk"
 category: "monitoring-logging-observability"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/splunk-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # splunk-sec-inspector — Architecture Specification
@@ -19,6 +19,22 @@ source_repo: "https://github.com/hackIDLE/splunk-sec-inspector"
 Misconfigurations in Splunk Cloud — weak authentication, overly permissive roles, unencrypted data transport, disabled audit logging, or insecure HTTP Event Collector (HEC) tokens — can expose sensitive log data, enable unauthorized searches across security-relevant indexes, and undermine the integrity of an organization's security monitoring pipeline. Because Splunk often ingests the most sensitive data in an environment (authentication logs, network flows, endpoint telemetry), a compromised or misconfigured Splunk instance represents an outsized risk.
 
 **splunk-sec-inspector** is an automated compliance inspection tool that connects to a Splunk Cloud instance via its REST API and Admin Config Service (ACS) API, collects security-relevant configuration data, evaluates it against hardened baselines derived from multiple compliance frameworks, and produces actionable reports with framework-specific control mappings.
+
+### 1.1 grclanker implementation
+
+This spec ships as native TypeScript tools in grclanker (`cli/extensions/grc-tools/splunk.ts`) rather than the standalone Go binary described in sections 7 to 9. The tools are read-only against Splunk Enterprise and Splunk Cloud Platform and cover all 23 controls in section 4:
+
+| Tool | Controls |
+|------|----------|
+| `splunk_check_access` | Probes 15 REST and ACS surfaces, reports the authenticated user, capabilities, missing capabilities, and whether ACS is configured |
+| `splunk_assess_authentication` | 1-6 |
+| `splunk_assess_access_control` | 7-12 |
+| `splunk_assess_data_protection` | 13-16 |
+| `splunk_assess_audit_monitoring` | 17-18 |
+| `splunk_assess_platform_hardening` | 19-23 |
+| `splunk_export_audit_bundle` | Raw snapshots, findings, executive summary, unified matrix, per-framework reports, quick reference, error log, and a paired zip |
+
+Setup, capability requirements, per-control status semantics, and official documentation links live in `src/content/docs/docs/integrations/splunk.md`. Regression tests are in `cli/tests/splunk.test.mjs`; `npm --prefix cli run test:splunk:live` runs a credential-gated smoke test.
 
 ## 2. APIs & SDKs
 
@@ -473,4 +489,32 @@ splunk-sec-inspector audit
 
 ## 10. Status
 
-**Not yet implemented. Spec only.**
+**Implemented in grclanker as native TypeScript tools (2026-09-21).** The Go build sequence in section 9 was not followed; the functional scope shipped inside the grclanker CLI instead (see section 1.1).
+
+### What shipped
+
+- Seven read-only tools: `splunk_check_access`, `splunk_assess_authentication`, `splunk_assess_access_control`, `splunk_assess_data_protection`, `splunk_assess_audit_monitoring`, `splunk_assess_platform_hardening`, `splunk_export_audit_bundle`.
+- All 23 controls in section 4 produce a finding with the section 5 framework mappings. Controls that cannot be verified through a read-only API render as `manual` findings that state the evidence to collect: control 5 (concurrent session limits) and control 14 (encryption at rest) are always manual; control 19 is manual on Splunk Enterprise or when ACS is not configured; controls 15 and 23 are manual on Splunk Cloud or on a node that neither forwards nor receives; control 3 is manual for SAML deployments without Splunk-native Duo or RSA.
+- Every auth mode and environment variable in section 3.5, plus `SPLUNK_ACS_BASE_URL`, `SPLUNK_TIMEOUT`, `SPLUNK_CONFIG_FILE`, and a JSON config file at `~/.config/grclanker/splunk.json`. Precedence is explicit arguments, then environment, then config file.
+- REST paging with `output_mode=json`, `count`, and `offset` until `paging.total`; ACS paging with `count` and `offset`; 429 and 5xx retry with backoff; per-request timeouts; TLS verification opt-out scoped to the inspector's own requests (`process.env.NODE_TLS_REJECT_UNAUTHORIZED` is never set); token and session key redaction in errors and raw snapshots.
+- Verdict safety: forbidden or errored endpoints, empty inventories, partial inventories (`paging.total` above the entries returned), out-of-scope controls, and items without dates never yield `pass`. Rerunning the export allocates a new directory and a zip named after it, so prior bundles are never overwritten.
+- Regression tests in `cli/tests/splunk.test.mjs` (mocked REST and ACS, hardened and weak fixtures, the three false-pass fixtures, export bundle layout and path safety, tool registration) and a credential-gated live smoke test (`npm --prefix cli run test:splunk:live`).
+
+### Deviations from this spec (official documentation wins)
+
+- Tokens are listed from `/services/authorization/tokens` (REST API Reference, access endpoints), not `/services/authentication/tokens` as written in section 2.1.
+- Configuration files are read through the documented `/services/configs/conf-{file}` endpoints instead of `/services/properties/*` or `/services/admin/conf-*`.
+- Knowledge objects, lookups, and KV Store collections are read through the `/servicesNS/-/-/...` namespace form so objects owned by any user in any app are visible.
+- Control 4: `sessionTimeout` is a `server.conf [general]` setting, and `tools.sessions.timeout` is the `web.conf` setting; both are read.
+- Control 3: `/services/admin/Duo-MFA` is checked alongside `/services/admin/Rsa-MFA`, selected by `authentication.conf externalTwoFactorAuthVendor`.
+- Control 12: `run_commands_on_forwarder` is not a documented capability in `authorize.conf`; `edit_forwarders` and `run_debug_commands` are checked in its place, alongside the other elevated capabilities listed in the integration guide.
+- Control 15: `outputs.conf` documents `clientCert` for the forwarder certificate; the spec's `sslCertPath` is also accepted.
+- Control 17: `audit.conf [auditTrail]` has no enabled flag. Its `queueing` setting (default true, and there is no default `audit.conf`) is read through `/services/configs/conf-audit`; a missing file is reported as the assumed default and `queueing=false` caps the verdict at `warn`. `/services/admin/audit` is not used.
+- Control 14: the ACS OpenAPI specification exposes `GET /emek/key-policy`, `GET /emek/waiver`, and `PUT /emek/key`, which generate onboarding artifacts; there is no `/encryption-keys` status endpoint as listed in section 2.2, so the control stays manual.
+- ACS HEC responses are accepted with either the documented example key `http-event-collectors` or the OpenAPI schema key `http_event_collectors`, and with either `useAck` or `useACK`.
+
+### What remains
+
+- No Splunk Cloud or Splunk Enterprise instance was available during implementation; the live smoke test has not been run against a real deployment.
+- Enterprise Security correlation search coverage, deployment server client inventory, and version currency are captured as evidence where visible but are not separate verdicts.
+- The STIG CKL/XCCDF export, CSV output, and TUI from sections 7 to 9 are not implemented; the export bundle produces JSON and Markdown.
