@@ -1684,6 +1684,78 @@ test("self-check (d): a compliant tenant built from documented fields passes eve
   }
 });
 
+function readSpecMappingTable() {
+  const spec = readFileSync(resolve(process.cwd(), "specs/github-sec-inspector.spec.md"), "utf8");
+  const rows = new Map();
+  const splitIds = (cell) => cell.split(",").map((entry) => entry.trim()).filter(Boolean);
+  for (const line of spec.split("\n")) {
+    const cells = line.split("|").map((cell) => cell.trim());
+    // | # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+    if (cells.length !== 12 || !/^\d+$/.test(cells[1]) || !/^(?:[A-Z]{2}-\d|SRG)/.test(cells[3])) continue;
+    rows.set(Number(cells[1]), {
+      fedramp: splitIds(cells[3]),
+      cmmc: splitIds(cells[4]),
+      soc2: splitIds(cells[5]),
+      cis: splitIds(cells[6]),
+      pci_dss: splitIds(cells[7]),
+      disa_stig: splitIds(cells[8]),
+      irap: splitIds(cells[9]),
+      ismap: splitIds(cells[10]),
+    });
+  }
+  return rows;
+}
+
+function readSpecCoverageTable() {
+  const spec = readFileSync(resolve(process.cwd(), "specs/github-sec-inspector.spec.md"), "utf8");
+  const coverage = new Map();
+  for (const line of spec.split("\n")) {
+    const cells = line.split("|").map((cell) => cell.trim());
+    // | # | Control | Finding | Verdict semantics |
+    if (cells.length !== 6 || !/^\d+$/.test(cells[1]) || !cells[3].startsWith("GITHUB-")) continue;
+    coverage.set(Number(cells[1]), cells[3].split(",").map((entry) => entry.trim()));
+  }
+  return coverage;
+}
+
+test("every finding carries exactly the framework identifiers of its spec mapping row", async () => {
+  const mappingRows = readSpecMappingTable();
+  const coverage = readSpecCoverageTable();
+  assert.equal(mappingRows.size, 25, "the spec mapping table has 25 rows");
+  assert.equal(coverage.size, 25, "the spec coverage table has 25 rows");
+  const findings = await runAllAssessments(createCompliantClient());
+  const byId = Object.fromEntries(findings.map((finding) => [finding.id, finding]));
+  const stripGeneral = ({ general: _general, ...frameworks }) => frameworks;
+
+  const covered = new Set();
+  for (const [control, ids] of coverage) {
+    for (const id of ids) {
+      assert.ok(byId[id], `${id} from coverage row ${control} is produced by the assessments`);
+      assert.deepEqual(stripGeneral(byId[id].frameworks), mappingRows.get(control), `${id} must carry the control ${control} mapping row`);
+      covered.add(id);
+    }
+  }
+  // Findings without a numbered control: the extras carry the closest row, and the configuration
+  // umbrella carries the union of the three code security rows it underpins.
+  const union = (...controls) => {
+    const merged = {};
+    for (const control of controls) {
+      for (const [framework, ids] of Object.entries(mappingRows.get(control))) {
+        merged[framework] = [...(merged[framework] ?? []), ...ids.filter((id) => !(merged[framework] ?? []).includes(id))];
+      }
+    }
+    return merged;
+  };
+  assert.deepEqual(stripGeneral(byId["GITHUB-ORG-004"].frameworks), mappingRows.get(5));
+  assert.deepEqual(stripGeneral(byId["GITHUB-ORG-005"].frameworks), mappingRows.get(19));
+  assert.deepEqual(stripGeneral(byId["GITHUB-REPO-005"].frameworks), mappingRows.get(13));
+  assert.deepEqual(stripGeneral(byId["GITHUB-CODE-001"].frameworks), union(15, 16, 17));
+  for (const id of ["GITHUB-ORG-004", "GITHUB-ORG-005", "GITHUB-REPO-005", "GITHUB-CODE-001"]) {
+    covered.add(id);
+  }
+  assert.deepEqual(Object.keys(byId).filter((id) => !covered.has(id)), [], "every finding is either in the coverage table or an accounted extra");
+});
+
 function codeSecurityById(data) {
   const result = assessGitHubCodeSecurity(data, SELF_CHECK_CONFIG);
   return Object.fromEntries(result.findings.map((finding) => [finding.id, finding]));

@@ -677,7 +677,7 @@ Authentication: fine-grained or classic PAT (`GITHUB_TOKEN` or `GH_TOKEN`) and G
 | 24 | GitHub App Permissions Audit | GITHUB-INTEG-003 | Fail on admin or write-to-all-repositories permissions; suspended installations reported |
 | 25 | Package Registry Access | GITHUB-INTEG-005 | Manual, cites `GET /orgs/{org}/packages?package_type=` |
 
-Extra findings beyond the numbered controls: GITHUB-ORG-004 (privileged access ratio) and GITHUB-REPO-005 (web commit signoff).
+Extra findings beyond the numbered controls carry the mapping row of the closest control: GITHUB-ORG-004 (privileged access ratio) uses row 5, GITHUB-ORG-005 (audit log visibility) uses row 19, GITHUB-REPO-005 (web commit signoff) uses row 13, and GITHUB-CODE-001 (code security configurations exist) carries the union of rows 15, 16, and 17 because the configurations are the vehicle for all three. Every other finding carries exactly the identifiers of its row in the mapping table above; `cli/tests/github.test.mjs` parses both tables and asserts the equality.
 
 ### Verdict safety
 
