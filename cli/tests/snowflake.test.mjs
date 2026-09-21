@@ -1723,7 +1723,7 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   const errorLog = readFileSync(join(first.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /\[denied\] show_shares: /);
   assert.match(errorLog, /SHOW SHARES/);
-  assert.match(errorLog, /Bearer \[REDACTED TOKEN\]; session \[REDACTED TOKEN\]; key \[REDACTED PRIVATE KEY\]/);
+  assert.match(errorLog, /Authorization: \[REDACTED\] \[REDACTED TOKEN\]; session \[REDACTED TOKEN\]; key \[REDACTED PRIVATE KEY\]/);
   const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
   const shares = findings.find((item) => item.id === "SNOWFLAKE-22");
   assert.equal(shares.status, "manual");
@@ -1746,6 +1746,86 @@ test("exportSnowflakeAuditBundle records partial collection failures in _errors.
   assert.ok(existsSync(second.outputDir));
   assert.ok(existsSync(second.zipPath));
   assert.equal(readFileSync(join(first.outputDir, "metadata.json"), "utf8"), firstMetadata);
+});
+
+const STATEMENT_CANARIES = ["CANARY_BEARER_S1", "CANARY_SESSION_S1", "CANARY_APIKEY_S1", "CANARY_URL_TOKEN_S1"];
+const STATEMENT_HTML_BODY = "<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_S1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_S1; Path=/</p><p>api_key=CANARY_APIKEY_S1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 later.</p></body></html>";
+const STATEMENT_JSON_BODY = {
+  code: "390144",
+  message: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 for this key; Authorization: Bearer CANARY_BEARER_S1; api_key=CANARY_APIKEY_S1; session_id=CANARY_SESSION_S1",
+  sqlState: "08004",
+};
+
+/** Serves healthyFixture result sets through the SQL API wire shape so the real client, error constructor, and record point are exercised. */
+function sqlApiFetch(failing = { statement: undefined, variant: "html" }, executed = []) {
+  return async (_url, init) => {
+    const statement = JSON.parse(init.body).statement;
+    executed.push(statement);
+    if (failing.statement !== undefined && normalizeStatement(statement) === normalizeStatement(failing.statement)) {
+      return failing.variant === "html"
+        ? new Response(STATEMENT_HTML_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } })
+        : jsonResponse(STATEMENT_JSON_BODY, { status: 403, statusText: "Forbidden" });
+    }
+    const result = healthyFixture(statement);
+    return jsonResponse({
+      statementHandle: `handle-${executed.length}`,
+      resultSetMetaData: { numRows: result.rows.length, rowType: result.columns.map((name) => ({ name, type: "text" })), partitionInfo: [{ rowCount: result.rows.length }] },
+      data: result.rows.map((row) => result.columns.map((column) => row[column])),
+    });
+  };
+}
+
+test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSON error embedding a token URL records only a scrubbed error, on every output", async () => {
+  const base = createTempBase("grclanker-snowflake-statement-canaries-");
+  const config = sampleConfig({ maxRetries: 0 });
+
+  const executed = [];
+  const discovery = new SnowflakeSqlClient(config, { fetchImpl: sqlApiFetch(undefined, executed) });
+  const healthyAccess = await checkSnowflakeAccess(discovery);
+  assert.equal(healthyAccess.status, "healthy");
+  await runAllAssessments(discovery);
+  const statements = [...new Map(executed.map((statement) => [normalizeStatement(statement), statement])).values()];
+  assert.ok(statements.length >= 30, `every access check probe and assessment statement is discovered (${statements.length})`);
+
+  for (const [index, statement] of statements.entries()) {
+    for (const variant of ["html", "json"]) {
+      const label = `${normalizeStatement(statement).slice(0, 60)} (${variant})`;
+      const fetchImpl = sqlApiFetch({ statement, variant });
+      const access = await checkSnowflakeAccess(new SnowflakeSqlClient(config, { fetchImpl }));
+      const results = await runAllAssessments(new SnowflakeSqlClient(config, { fetchImpl }));
+      const iterationBase = join(base, `${index}-${variant}`);
+      mkdirSync(iterationBase);
+      const exported = await exportSnowflakeAuditBundle(new SnowflakeSqlClient(config, { fetchImpl }), config, iterationBase);
+      const files = readBundleFiles(exported.outputDir);
+
+      const outputs = new Map([
+        [`${label} check_access`, JSON.stringify(access)],
+        ...results.map((result) => [`${label} assess ${result.area}`, JSON.stringify(result)]),
+        ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
+      ]);
+      assertSecretsAbsent(assert, outputs, STATEMENT_CANARIES, label);
+
+      const failedOutcomes = results.flatMap((result) => result.statements.filter((outcome) => outcome.status !== "ok"));
+      const errorStrings = [
+        ...access.surfaces.filter((surface) => surface.status !== "readable").map((surface) => surface.error),
+        ...failedOutcomes.map((outcome) => outcome.error),
+      ];
+      assert.ok(errorStrings.length >= 1, `${label}: the failing statement is recorded as an error`);
+      for (const text of errorStrings) {
+        if (variant === "html") {
+          assert.match(text, /failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/, `${label}: the error carries the status-and-length note, got ${text}`);
+        } else {
+          assert.match(text, /https:\/\/api\.example\.com\/v1\/x(?![?#])/, `${label}: the URL keeps scheme, host, and path, got ${text}`);
+          assert.match(text, /Authorization: \[REDACTED\]/, `${label}: the authorization value is redacted, got ${text}`);
+        }
+      }
+      for (const outcome of failedOutcomes) {
+        assert.equal(outcome.numRows, null, `${label}: an unread statement has no row count`);
+        assert.equal(outcome.truncated, null, `${label}: an unread statement has no truncation flag`);
+      }
+    }
+  }
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

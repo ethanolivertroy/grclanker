@@ -127,10 +127,11 @@ export interface SnowflakeStatementOutcome {
   status: SnowflakeStatementStatus;
   columns: string[];
   rows: SqlRow[];
-  numRows: number;
-  partitionCount: number;
-  fetchedPartitions: number;
-  truncated: boolean;
+  /** Null when the statement did not complete, so an unread inventory never renders as zero rows. */
+  numRows: number | null;
+  partitionCount: number | null;
+  fetchedPartitions: number | null;
+  truncated: boolean | null;
   rowLimit?: number;
   error?: string;
 }
@@ -391,17 +392,43 @@ function rowNumber(row: SqlRow, ...names: string[]): number | undefined {
   return asNumber(rowValue(row, ...names));
 }
 
+const PRIVATE_KEY_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
+const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g;
+const AUTHORIZATION_SCHEME_PATTERN = /\b(Basic|Bearer|Snowflake|Token|Digest|Negotiate)\s+(?!\[REDACTED)[A-Za-z0-9._~+/=-]{8,}/g;
+const URL_IN_TEXT_PATTERN = /https?:\/\/[^\s"'<>`]+/gi;
+const SECRET_PAIR_PATTERN =
+  /\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|passphrase|api[_-]?key|access[_-]?key|private[_-]?key|session(?:[_-]?(?:id|key|token))?|cookie|authorization|credential|signature)[A-Za-z0-9_.-]*)(\s*[=:]\s*)(["']?)(?!\[REDACTED)([^\s"'&;,<>)\]}]+)/gi;
+
+/** Reduces a URL found anywhere in prose to scheme, host, and path. */
+function scrubUrlInText(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@\s]*@)/i, "$1").replace(/[?#][\s\S]*$/, "");
+}
+
+/**
+ * The single redaction pass for error text: private keys, the configured
+ * secrets, URLs with userinfo or query strings anywhere in the string,
+ * authorization scheme values, JWT-shaped strings, and secret-bearing
+ * key-value pairs. SnowflakeStatementError applies it to every message it is
+ * built with and collectStatement applies it again where errors are recorded.
+ */
 export function redactSecrets(text: string, secrets: Array<string | undefined> = []): string {
-  let output = text
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]")
-    .replace(/eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/g, "[REDACTED TOKEN]")
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/g, "Bearer [REDACTED TOKEN]");
+  let output = text.replace(PRIVATE_KEY_PATTERN, "[REDACTED PRIVATE KEY]");
   for (const secret of secrets) {
     if (secret && secret.length >= 6) {
       output = output.split(secret).join("[REDACTED]");
     }
   }
-  return output;
+  return output
+    .replace(URL_IN_TEXT_PATTERN, (url) => scrubUrlInText(url))
+    .replace(AUTHORIZATION_SCHEME_PATTERN, "$1 [REDACTED TOKEN]")
+    .replace(JWT_IN_TEXT_PATTERN, "[REDACTED TOKEN]")
+    .replace(SECRET_PAIR_PATTERN, "$1$2$3[REDACTED]");
+}
+
+/** Describes a response body that is not JSON without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
 }
 
 export function parseSimpleToml(text: string): Record<string, JsonRecord> {
@@ -688,19 +715,48 @@ export function buildSnowflakeKeyPairJwt(
   return { token: `${header}.${payload}.${signature}`, expiresAt: expiresAt * 1000, issuer, subject: qualifiedUser };
 }
 
+/** What the SQL API returned for one request; a non-JSON body is described, never kept. */
+interface SnowflakeApiResponse {
+  status: number;
+  statusText: string;
+  payload: JsonRecord;
+  headers: Headers;
+  nonJsonBody?: string;
+}
+
 export class SnowflakeStatementError extends Error {
   readonly statusCode?: number;
   readonly sqlCode?: string;
   readonly sqlState?: string;
   readonly kind: "denied" | "error" | "timeout";
 
+  /**
+   * The message and codes are scrubbed here as well as at the record point,
+   * so an error built anywhere in the client never carries a credential even
+   * if a caller stores error.message directly.
+   */
   constructor(message: string, options: { statusCode?: number; sqlCode?: string; sqlState?: string; kind?: "denied" | "error" | "timeout" } = {}) {
-    super(message);
+    super(redactSecrets(message));
     this.name = "SnowflakeStatementError";
     this.statusCode = options.statusCode;
-    this.sqlCode = options.sqlCode;
-    this.sqlState = options.sqlState;
-    this.kind = options.kind ?? classifyErrorMessage(message, options.statusCode);
+    this.sqlCode = options.sqlCode === undefined ? undefined : redactSecrets(options.sqlCode);
+    this.sqlState = options.sqlState === undefined ? undefined : redactSecrets(options.sqlState);
+    this.kind = options.kind ?? classifyErrorMessage(this.message, options.statusCode);
+  }
+
+  /**
+   * Builds the error for a response that cannot be used as a result set: a
+   * body that is not JSON becomes a status-and-length note whatever its
+   * content type, a JSON body contributes only the documented message, code,
+   * and sqlState fields, and the configured secrets are removed before the
+   * pattern pass runs.
+   */
+  static fromResponse(response: SnowflakeApiResponse, secrets: Array<string | undefined>): SnowflakeStatementError {
+    return new SnowflakeStatementError(redactSecrets(extractApiError(response), secrets), {
+      statusCode: response.status,
+      sqlCode: response.nonJsonBody === undefined ? asString(response.payload.code) : undefined,
+      sqlState: response.nonJsonBody === undefined ? asString(response.payload.sqlState) : undefined,
+    });
   }
 }
 
@@ -713,12 +769,17 @@ function classifyErrorMessage(message: string, statusCode?: number): "denied" | 
   return "error";
 }
 
-function extractApiError(payload: JsonRecord, status: number, statusText: string): string {
-  const message = asString(payload.message) ?? asString(payload.error) ?? "";
-  const code = asString(payload.code);
-  const sqlState = asString(payload.sqlState);
+function extractApiError(response: SnowflakeApiResponse): string {
+  const outcome = response.status >= 200 && response.status < 300 ? "returned an unreadable response" : "failed";
+  const statusLine = `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  if (response.nonJsonBody !== undefined) {
+    return `Snowflake SQL API request ${outcome} (${statusLine}): ${response.nonJsonBody}`;
+  }
+  const message = asString(response.payload.message) ?? asString(response.payload.error) ?? "";
+  const code = asString(response.payload.code);
+  const sqlState = asString(response.payload.sqlState);
   const detail = [code ? `code ${code}` : undefined, sqlState ? `sqlState ${sqlState}` : undefined].filter(Boolean).join(", ");
-  return `Snowflake SQL API request failed (${status} ${statusText})${message ? `: ${message}` : ""}${detail ? ` [${detail}]` : ""}`;
+  return `Snowflake SQL API request ${outcome} (${statusLine})${message ? `: ${message}` : ""}${detail ? ` [${detail}]` : ""}`;
 }
 
 export class SnowflakeSqlClient {
@@ -752,15 +813,19 @@ export class SnowflakeSqlClient {
     return this.config.token;
   }
 
+  private configuredSecrets(): Array<string | undefined> {
+    return [this.config.token, this.jwt?.token, this.config.privateKeyPassphrase];
+  }
+
   private redact(message: string): string {
-    return redactSecrets(message, [this.config.token, this.jwt?.token, this.config.privateKeyPassphrase]);
+    return redactSecrets(message, this.configuredSecrets());
   }
 
   private async request(
     method: "GET" | "POST",
     pathname: string,
     body?: JsonRecord,
-  ): Promise<{ status: number; statusText: string; payload: JsonRecord; headers: Headers }> {
+  ): Promise<SnowflakeApiResponse> {
     let attempt = 0;
     for (;;) {
       const controller = new AbortController();
@@ -779,13 +844,18 @@ export class SnowflakeSqlClient {
           body: body ? JSON.stringify(body) : undefined,
           signal: controller.signal,
         });
+        // A body that is not JSON (a proxy error page, an HTML sign-in form) is
+        // never copied into the payload or an error string: it is described by
+        // content type and size only, because such pages can echo credentials.
         const rawText = await response.text();
         let payload: JsonRecord = {};
+        let nonJsonBody: string | undefined;
         if (rawText.length > 0) {
           try {
-            payload = asObject(JSON.parse(rawText)) ?? { data: JSON.parse(rawText) };
+            const parsed: unknown = JSON.parse(rawText);
+            payload = asObject(parsed) ?? { data: parsed };
           } catch {
-            payload = { message: rawText.slice(0, 240) };
+            nonJsonBody = describeNonJsonBody(response, rawText);
           }
         }
         const retryable = response.status === 429 || response.status >= 500;
@@ -794,7 +864,7 @@ export class SnowflakeSqlClient {
           await sleep(this.retryDelay(attempt, response.headers));
           continue;
         }
-        return { status: response.status, statusText: response.statusText, payload, headers: response.headers };
+        return { status: response.status, statusText: response.statusText, payload, headers: response.headers, nonJsonBody };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (controller.signal.aborted) {
@@ -831,35 +901,28 @@ export class SnowflakeSqlClient {
     if (this.config.schema) body.schema = this.config.schema;
 
     const submit = await this.request("POST", `/api/v2/statements?async=true&requestId=${randomUUID()}`, body);
-    let payload = submit.payload;
-    let status = submit.status;
-    let statusText = submit.statusText;
-    let handle = asString(payload.statementHandle);
-    const statusUrl = asString(payload.statementStatusUrl) ?? (handle ? `/api/v2/statements/${handle}` : undefined);
+    let latest = submit;
+    let handle = asString(latest.payload.statementHandle);
+    const statusUrl = asString(latest.payload.statementStatusUrl) ?? (handle ? `/api/v2/statements/${handle}` : undefined);
     const deadline = this.now().getTime() + (options.timeoutSeconds ?? this.config.statementTimeoutSeconds) * 1000 + this.config.timeoutMs;
 
-    while (status === 202 || (status === 429 && handle)) {
+    while (latest.nonJsonBody === undefined && (latest.status === 202 || (latest.status === 429 && handle))) {
       if (!statusUrl) break;
       if (this.now().getTime() > deadline) {
         throw new SnowflakeStatementError(`Snowflake statement ${handle ?? ""} did not complete before the ${this.config.statementTimeoutSeconds}s statement timeout.`, { kind: "timeout" });
       }
       await sleep(this.pollDelay(submit.headers));
-      const poll = await this.request("GET", statusUrl);
-      payload = poll.payload;
-      status = poll.status;
-      statusText = poll.statusText;
-      handle = asString(payload.statementHandle) ?? handle;
+      latest = await this.request("GET", statusUrl);
+      handle = asString(latest.payload.statementHandle) ?? handle;
     }
 
-    if (status !== 200) {
-      throw new SnowflakeStatementError(this.redact(extractApiError(payload, status, statusText)), {
-        statusCode: status,
-        sqlCode: asString(payload.code),
-        sqlState: asString(payload.sqlState),
-      });
+    // A 2xx with a non-JSON body is an unreadable statement, not an empty
+    // result set, so it is reported like any other failed response.
+    if (latest.status !== 200 || latest.nonJsonBody !== undefined) {
+      throw SnowflakeStatementError.fromResponse(latest, this.configuredSecrets());
     }
 
-    return this.materializeResultSet(statement, payload, handle);
+    return this.materializeResultSet(statement, latest.payload, handle);
   }
 
   private pollDelay(headers: Headers): number {
@@ -883,8 +946,8 @@ export class SnowflakeSqlClient {
       const partitionsToFetch = Math.min(partitionCount, this.config.maxPartitions);
       for (let partition = 1; partition < partitionsToFetch; partition += 1) {
         const response = await this.request("GET", `/api/v2/statements/${handle}?partition=${partition}`);
-        if (response.status !== 200) {
-          throw new SnowflakeStatementError(this.redact(extractApiError(response.payload, response.status, response.statusText)), { statusCode: response.status });
+        if (response.status !== 200 || response.nonJsonBody !== undefined) {
+          throw SnowflakeStatementError.fromResponse(response, this.configuredSecrets());
         }
         rawRows.push(...asArray(response.payload.data).map((row) => asArray(row)));
         fetchedPartitions += 1;
@@ -1013,6 +1076,21 @@ function emptyOutcome(key: string, statement: string): SnowflakeStatementOutcome
   return { key, statement, status: "ok", columns: [], rows: [], numRows: 0, partitionCount: 1, fetchedPartitions: 1, truncated: false };
 }
 
+/** The outcome of a statement that did not complete: no row count, no partition count, no truncation flag. */
+function unreadOutcome(key: string, statement: string): SnowflakeStatementOutcome {
+  return { key, statement, status: "error", columns: [], rows: [], numRows: null, partitionCount: null, fetchedPartitions: null, truncated: null };
+}
+
+/** Row count for evidence and summaries: null when the statement was not read. */
+export function rowsSeen(outcome: SnowflakeStatementOutcome): number | null {
+  return outcome.status === "ok" ? outcome.rows.length : null;
+}
+
+function configuredSecretsOf(client: SnowflakeQueryClient): Array<string | undefined> {
+  const config = client.getResolvedConfig();
+  return [config.token, config.privateKeyPassphrase];
+}
+
 export async function collectStatement(
   client: SnowflakeQueryClient,
   key: string,
@@ -1035,12 +1113,15 @@ export async function collectStatement(
       rowLimit,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    // Every statement error is recorded here and nowhere else, so this is the
+    // one place the redaction pass has to run for findings and the bundle,
+    // whichever constructor or throw site built the message.
+    const message = redactSecrets(error instanceof Error ? error.message : String(error), configuredSecretsOf(client));
     const kind = error instanceof SnowflakeStatementError ? error.kind : classifyErrorMessage(message);
     return {
-      ...emptyOutcome(key, statement),
+      ...unreadOutcome(key, statement),
       status: kind,
-      error: redactSecrets(message),
+      error: message,
     };
   }
 }
@@ -1189,8 +1270,8 @@ function evaluateControl(
     statements: [...required, ...optional.map((entry) => entry.outcome)].map((outcome) => ({
       key: outcome.key,
       status: outcome.status,
-      rows: outcome.rows.length,
-      truncated: outcome.truncated,
+      rows: rowsSeen(outcome),
+      truncated: outcome.status === "ok" ? outcome.truncated : null,
       error: outcome.error,
     })),
   };
@@ -1667,8 +1748,8 @@ export async function assessSnowflakeNetworkAndAuthentication(
       account: session.account ?? config.account,
       role: role ?? null,
       full_visibility: hasFullVisibility(role),
-      users_seen: users.rows.length,
-      network_policies_seen: networkPolicies.rows.length,
+      users_seen: rowsSeen(users),
+      network_policies_seen: rowsSeen(networkPolicies),
       ...summarizeStatuses(findings),
     },
     findings,
@@ -1821,7 +1902,7 @@ export async function assessSnowflakeAccessControl(
       role: role ?? null,
       full_visibility: hasFullVisibility(role),
       lookback_days: lookbackDays,
-      role_grants_seen: roleGrants.rows.length,
+      role_grants_seen: rowsSeen(roleGrants),
       ...summarizeStatuses(findings),
     },
     findings,
@@ -1966,8 +2047,8 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       account: session.account ?? config.account,
       role: role ?? null,
       lookback_days: lookbackDays,
-      users_seen: users.rows.length,
-      warehouses_seen: warehouses.rows.length,
+      users_seen: rowsSeen(users),
+      warehouses_seen: rowsSeen(warehouses),
       ...summarizeStatuses(findings),
     },
     findings,
@@ -1998,7 +2079,7 @@ export async function assessSnowflakeDataProtection(
   const replicationGroups = await collectStatement(client, "show_replication_groups", SNOWFLAKE_STATEMENTS.showReplicationGroups, SHOW_ROW_CAP);
 
   const findings: SnowflakeFinding[] = [];
-  const tagSummary = tagReferences.status === "ok" ? tagReferences.rows.slice(0, 25).map((row) => ({ tag: `${rowValue(row, "TAG_DATABASE")}.${rowValue(row, "TAG_SCHEMA")}.${rowValue(row, "TAG_NAME")}`, references: rowValue(row, "REFERENCE_COUNT") })) : [];
+  const tagSummary = tagReferences.status === "ok" ? tagReferences.rows.slice(0, 25).map((row) => ({ tag: `${rowValue(row, "TAG_DATABASE")}.${rowValue(row, "TAG_SCHEMA")}.${rowValue(row, "TAG_NAME")}`, references: rowValue(row, "REFERENCE_COUNT") })) : null;
 
   findings.push(evaluateControl(14, [maskingCount, maskingReferences], "Snowsight Data > Governance: confirm masking policies exist and are assigned to every sensitive column (POLICY_REFERENCES WHERE POLICY_KIND = 'MASKING_POLICY').", () => {
     const policies = rowNumber(maskingCount.rows[0] ?? {}, "POLICY_COUNT") ?? 0;
@@ -2014,7 +2095,7 @@ export async function assessSnowflakeDataProtection(
     if (broken > 0) {
       return { status: "warn", summary: `${maskingReferences.rows.length} masking policy references exist but ${broken} are not ACTIVE (conflicting or mismatched assignments).`, evidence };
     }
-    return { status: "pass", summary: `${policies} masking policies are assigned through ${maskingReferences.rows.length} active column or tag references${tagSummary.length > 0 ? ` alongside ${tagSummary.length} classification tags` : ""}.`, evidence };
+    return { status: "pass", summary: `${policies} masking policies are assigned through ${maskingReferences.rows.length} active column or tag references${tagSummary && tagSummary.length > 0 ? ` alongside ${tagSummary.length} classification tags` : ""}.`, evidence };
   }, { optional: [{ outcome: tagReferences, unchecked: "classification tag coverage (TAG_REFERENCES) was not checked and tag-based masking assignments could not be confirmed" }] }));
 
   findings.push(evaluateControl(15, [rowAccessCount, rowAccessReferences], "Snowsight Data > Governance: confirm row access policies exist and are assigned to sensitive tables (POLICY_REFERENCES WHERE POLICY_KIND = 'ROW_ACCESS_POLICY').", () => {
@@ -2126,8 +2207,8 @@ export async function assessSnowflakeDataProtection(
       account: session.account ?? config.account,
       role: role ?? null,
       full_visibility: hasFullVisibility(role),
-      databases_seen: databases.rows.length,
-      shares_seen: shares.rows.length,
+      databases_seen: rowsSeen(databases),
+      shares_seen: rowsSeen(shares),
       ...summarizeStatuses(findings),
     },
     findings,
