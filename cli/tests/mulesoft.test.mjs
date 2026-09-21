@@ -1107,3 +1107,773 @@ test("MuleSoft tools are registered in the tool catalog under the MuleSoft group
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "control_plane"));
 });
+
+
+function forbidden(label) {
+  return async () => {
+    throw new MulesoftApiError(403, `Anypoint request failed (403 Forbidden) for GET ${label}`);
+  };
+}
+
+function forbidAll(client) {
+  const output = { getResolvedConfig: client.getResolvedConfig };
+  for (const [name, value] of Object.entries(client)) {
+    if (name !== "getResolvedConfig" && typeof value === "function") output[name] = forbidden(name);
+  }
+  return output;
+}
+
+function truncatedPage(items, total) {
+  return { items, total, truncated: true, limit: items.length };
+}
+
+function assertNoPass(result, label) {
+  for (const item of result.findings) {
+    assert.notEqual(item.status, "pass", `${label}: ${item.id} must not pass but reported "${item.summary}"`);
+  }
+}
+
+function assertAllManualNamingCause(result, label) {
+  for (const item of result.findings) {
+    assert.equal(item.status, "manual", `${label}: ${item.id} should be manual, got ${item.status}: ${item.summary}`);
+    assert.match(item.summary, /could not be read/, `${label}: ${item.id} must name the unreadable source`);
+    assert.match(item.summary, /HTTP 403/, `${label}: ${item.id} must name the HTTP cause`);
+  }
+}
+
+function emptyIdentityClient() {
+  return healthyIdentityClient({
+    async getOrganization() {
+      return {};
+    },
+    async getOrganizationHierarchy() {
+      return { subOrganizations: [] };
+    },
+    async listIdentityProviders() {
+      return [];
+    },
+    async getIdentityProviderSettings() {
+      return {};
+    },
+    async listMembers() {
+      return [];
+    },
+    async listRoleGroups() {
+      return [];
+    },
+    async listRoleGroupRoles() {
+      return [];
+    },
+    async listRoleGroupUsers() {
+      return [];
+    },
+    async listEnvironments() {
+      return [];
+    },
+    async listConnectedApplications() {
+      return [];
+    },
+    async listConnectedApplicationScopes() {
+      return [];
+    },
+  });
+}
+
+function emptyApiGatewayClient() {
+  return healthyApiGatewayClient({
+    async listManagedApis() {
+      return [];
+    },
+    async listApiPolicies() {
+      return [];
+    },
+    async listExchangeAssets() {
+      return [];
+    },
+  });
+}
+
+function emptyRuntimeClient() {
+  return healthyRuntimeClient({
+    async listCloudhubApplications() {
+      return [];
+    },
+    async listVpcs() {
+      return [];
+    },
+    async getVpc() {
+      return {};
+    },
+    async listLoadBalancers() {
+      return [];
+    },
+    async listHybridServers() {
+      return [];
+    },
+    async listMqRegions() {
+      return [];
+    },
+    async listMqQueues() {
+      return [];
+    },
+    async listMqClients() {
+      return [];
+    },
+    async listSecretGroups() {
+      return [];
+    },
+  });
+}
+
+function emptyAuditClient() {
+  return healthyAuditClient({
+    async listAuditPlatforms() {
+      return [];
+    },
+    async queryAuditLogs() {
+      return { data: [], total: 0 };
+    },
+    async listCloudhubAlerts() {
+      return [];
+    },
+    async listHybridAlerts() {
+      return [];
+    },
+    async listCloudhubApplications() {
+      return [];
+    },
+  });
+}
+
+function partialIdentityClient() {
+  return healthyIdentityClient({
+    async getOrganizationHierarchy() {
+      return { id: ORG_ID, isRoot: false, subOrganizations: [] };
+    },
+    async listMembers() {
+      return truncatedPage([{ id: "u1", username: "alice" }], 1500);
+    },
+    async listRoleGroups() {
+      return truncatedPage([{ role_group_id: "rg-admin", name: "Organization Administrators", editable: false }], 40);
+    },
+    async listConnectedApplications() {
+      return truncatedPage([{ client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3) }], 12);
+    },
+  });
+}
+
+function partialApiGatewayClient() {
+  return healthyApiGatewayClient({
+    getResolvedConfig: () => sampleConfig({ environmentFilter: ["Sandbox"] }),
+    async listExchangeAssets() {
+      return truncatedPage([{ organizationId: ORG_ID, assetId: "orders-api", name: "Orders API", status: "published", isPublic: false, type: "rest-api" }], 900);
+    },
+  });
+}
+
+function partialRuntimeClient() {
+  return healthyRuntimeClient({
+    async listVpcs() {
+      return Array.from({ length: 21 }, (_, index) => ({ id: `vpc-${index + 1}`, name: `vpc-${index + 1}` }));
+    },
+    async listLoadBalancers() {
+      return Array.from({ length: 11 }, (_, index) => ({
+        id: `lb-${index + 1}`,
+        name: `dlb-${index + 1}`,
+        domain: `dlb-${index + 1}.lb.anypointdns.net`,
+        httpMode: "redirect",
+        tlsv1: false,
+        tlsv13: true,
+        state: "STARTED",
+      }));
+    },
+  });
+}
+
+function partialAuditClient() {
+  return healthyAuditClient({
+    async listEnvironments() {
+      return [
+        ...ENVIRONMENTS,
+        { id: "env-prod-eu", name: "Production EU", isProduction: true, type: "production" },
+      ];
+    },
+    async queryAuditLogs() {
+      return { data: [{ timestamp: new Date().toISOString(), platform: "Access Management", action: "LOGIN", objectType: "User" }], total: 5000 };
+    },
+  });
+}
+
+test("verdict safety rule 1: unreadable, forbidden, or errored endpoints yield manual verdicts that name the cause, never pass", async () => {
+  const identity = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    listConnectedApplications: forbidden("/connectedApplications"),
+    async listIdentityProviders() {
+      throw new Error("socket hang up");
+    },
+  }));
+  for (const id of ["MULESOFT-IAM-18", "MULESOFT-IAM-19"]) {
+    assert.equal(statusOf(identity, id), "manual", id);
+    assert.match(findingById(identity, id).summary, /Could not evaluate: connected_applications could not be read, the credential lacks permission \(HTTP 403\)/);
+    assert.match(findingById(identity, id).summary, /Access Management > Connected Apps/);
+    assert.equal(findingById(identity, id).evidence.unreadable_sources.length, 1);
+  }
+  assert.equal(statusOf(identity, "MULESOFT-IAM-01"), "manual");
+  assert.match(findingById(identity, "MULESOFT-IAM-01").summary, /the read errored: socket hang up/);
+
+  const secondary = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    getIdentityProviderSettings: forbidden("/identityProviderSettings"),
+  }));
+  assert.equal(statusOf(secondary, "MULESOFT-IAM-01"), "manual");
+  assert.match(findingById(secondary, "MULESOFT-IAM-01").summary, /^Could not confirm: identity_provider_settings could not be read/);
+  assert.match(findingById(secondary, "MULESOFT-IAM-01").summary, /Partial evidence: 1 active identity provider/);
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    listLoadBalancers: forbidden("/loadbalancers"),
+    listHybridServers: forbidden("/hybrid/api/v1/servers"),
+    async listMqRegions() {
+      throw new MulesoftApiError(404, "Anypoint request failed (404 Not Found) for GET /mq/admin/api/v1/regions");
+    },
+  }));
+  for (const id of ["MULESOFT-RT-15", "MULESOFT-RT-16", "MULESOFT-RT-23"]) {
+    assert.equal(statusOf(runtime, id), "manual", id);
+    assert.match(findingById(runtime, id).summary, /HTTP 403/);
+  }
+  assert.equal(statusOf(runtime, "MULESOFT-RT-21"), "manual");
+  assert.match(findingById(runtime, "MULESOFT-RT-21").summary, /unavailable on this control plane or plan \(HTTP 404\)/);
+
+  const gateway = await assessMulesoftApiGateway(healthyApiGatewayClient({
+    async listApiPolicies(environmentId, apiId) {
+      if (String(apiId) === "101") throw new MulesoftApiError(403, "Anypoint request failed (403 Forbidden) for GET /policies");
+      return [{ assetId: "client-id-enforcement", disabled: false }, { assetId: "rate-limiting", disabled: false }];
+    },
+  }));
+  for (const id of ["MULESOFT-API-07", "MULESOFT-API-08"]) {
+    assert.equal(statusOf(gateway, id), "manual", id);
+    assert.match(findingById(gateway, id).summary, /api_policies could not be read, the credential lacks permission \(HTTP 403\)/, id);
+    assert.match(findingById(gateway, id).summary, /1 of 2 reads failed/, id);
+  }
+  assert.equal(statusOf(gateway, "MULESOFT-API-09"), "manual");
+  assert.match(findingById(gateway, "MULESOFT-API-09").summary, /^Anypoint Platform does not expose client secret rotation timestamps\. Export the 3 active contract\(s\)/);
+
+  const audit = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    listCloudhubApplications: forbidden("/cloudhub/api/v2/applications"),
+  }));
+  assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "manual");
+  assert.match(findingById(audit, "MULESOFT-AUD-24").summary, /cloudhub_applications could not be read/);
+  assert.equal(statusOf(audit, "MULESOFT-AUD-17"), "pass");
+});
+
+test("verdict safety rule 2: empty inventories never pass and each summary states whether emptiness is fail or manual", async () => {
+  const identity = await assessMulesoftIdentityAccess(emptyIdentityClient());
+  assertNoPass(identity, "identity/empty");
+  assert.equal(statusOf(identity, "MULESOFT-IAM-01"), "fail");
+  assert.match(findingById(identity, "MULESOFT-IAM-01").summary, /Zero providers is treated as fail/);
+  for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05"]) {
+    assert.equal(statusOf(identity, id), "manual", id);
+    assert.match(findingById(identity, id).summary, /Zero role groups is treated as manual/);
+  }
+  assert.equal(statusOf(identity, "MULESOFT-IAM-06"), "manual");
+  assert.match(findingById(identity, "MULESOFT-IAM-06").summary, /Zero environments is treated as manual/);
+  for (const id of ["MULESOFT-IAM-18", "MULESOFT-IAM-19"]) {
+    assert.equal(statusOf(identity, id), "manual", id);
+    assert.match(findingById(identity, id).summary, /Zero apps is treated as manual rather than pass/);
+  }
+
+  const gateway = await assessMulesoftApiGateway(emptyApiGatewayClient());
+  assertNoPass(gateway, "gateway/empty");
+  for (const id of ["MULESOFT-API-07", "MULESOFT-API-08"]) {
+    assert.equal(statusOf(gateway, id), "manual", id);
+    assert.match(findingById(gateway, id).summary, /Zero instances cannot pass a policy-coverage control and is treated as manual/);
+  }
+  assert.equal(statusOf(gateway, "MULESOFT-API-20"), "manual");
+  assert.match(findingById(gateway, "MULESOFT-API-20").summary, /Zero assets is treated as manual/);
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(emptyRuntimeClient());
+  assertNoPass(runtime, "runtime/empty");
+  for (const id of ["MULESOFT-RT-10", "MULESOFT-RT-11", "MULESOFT-RT-12", "MULESOFT-RT-22"]) {
+    assert.match(findingById(runtime, id).summary, /Zero applications is treated as manual/, id);
+  }
+  assert.match(findingById(runtime, "MULESOFT-RT-13").summary, /Zero CloudHub VPCs are visible, which is treated as manual/);
+  assert.match(findingById(runtime, "MULESOFT-RT-23").summary, /Zero hybrid runtime servers/);
+
+  const audit = await assessMulesoftAuditMonitoring(emptyAuditClient());
+  assertNoPass(audit, "audit/empty");
+  assert.equal(statusOf(audit, "MULESOFT-AUD-17"), "fail");
+  assert.match(findingById(audit, "MULESOFT-AUD-17").summary, /Zero events is treated as fail/);
+  assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "fail");
+  assert.match(findingById(audit, "MULESOFT-AUD-24").summary, /no enabled CloudHub or Runtime Manager alerts/);
+
+  const alertsWithoutApplications = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    async listCloudhubApplications() {
+      return [];
+    },
+  }));
+  assert.equal(statusOf(alertsWithoutApplications, "MULESOFT-AUD-24"), "manual");
+  assert.match(findingById(alertsWithoutApplications, "MULESOFT-AUD-24").summary, /zero CloudHub applications are deployed/);
+});
+
+test("verdict safety rule 3: scoped-out, not applicable, or unavailable controls render as manual, never pass", async () => {
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listLoadBalancers() {
+      return [];
+    },
+    async listMqRegions() {
+      return [];
+    },
+    async listHybridServers() {
+      return [];
+    },
+    async listCloudhubApplications(environmentId) {
+      const applications = await healthyRuntimeClient().listCloudhubApplications(environmentId);
+      return applications.map((application) => ({ ...application, persistentQueues: false }));
+    },
+  }));
+  for (const id of ["MULESOFT-RT-15", "MULESOFT-RT-16", "MULESOFT-RT-21", "MULESOFT-RT-23"]) {
+    assert.equal(statusOf(runtime, id), "manual", id);
+    assert.match(findingById(runtime, id).summary, /not applicable/, id);
+  }
+  assert.equal(statusOf(runtime, "MULESOFT-RT-12"), "manual");
+  assert.match(findingById(runtime, "MULESOFT-RT-12").summary, /not applicable and is recorded as manual rather than pass/);
+
+  const govCloud = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    getResolvedConfig: () => sampleConfig({ controlPlane: "gov", baseUrl: "https://gov.anypoint.mulesoft.com" }),
+    async listMqRegions() {
+      throw new MulesoftApiError(404, "Anypoint request failed (404 Not Found) for GET /mq/admin/api/v1/organizations/org-1/environments/env-prod/regions");
+    },
+  }));
+  assert.equal(statusOf(govCloud, "MULESOFT-RT-21"), "manual");
+  assert.match(findingById(govCloud, "MULESOFT-RT-21").summary, /unavailable on this control plane or plan/);
+
+  const scopedOut = await assessMulesoftApiGateway(healthyApiGatewayClient({
+    getResolvedConfig: () => sampleConfig({ environmentFilter: ["Sandbox"] }),
+  }));
+  assert.equal(statusOf(scopedOut, "MULESOFT-API-07"), "manual");
+  assert.match(findingById(scopedOut, "MULESOFT-API-07").summary, /none belong to a production environment \(0 of 1 production environment\(s\) sampled\)/);
+  assert.match(findingById(scopedOut, "MULESOFT-API-07").summary, /Partial view: the environment filter excluded 1 environment\(s\) \(1 production\): Production/);
+
+  const notEntitled = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async getOrganization() {
+      return { id: ORG_ID, name: "Acme", isFederated: true, entitlements: { createSubOrgs: false } };
+    },
+    async getOrganizationHierarchy() {
+      return { id: ORG_ID, isRoot: true, subOrganizations: [] };
+    },
+  }));
+  assert.equal(statusOf(notEntitled, "MULESOFT-IAM-25"), "manual");
+  assert.match(findingById(notEntitled, "MULESOFT-IAM-25").summary, /createSubOrgs entitlement is false, so business groups are not available on this plan \(not applicable\)/);
+});
+
+test("verdict safety rule 4: items missing dates are bucketed separately and never counted as fresh or valid", async () => {
+  const identity = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listConnectedApplications() {
+      return [
+        { client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3) },
+        { client_id: "app-2", client_name: "No Usage", enabled: true, last_used: null, created_at: isoDaysFromNow(-400) },
+      ];
+    },
+  }));
+  assert.equal(statusOf(identity, "MULESOFT-IAM-19"), "warn");
+  assert.match(findingById(identity, "MULESOFT-IAM-19").summary, /1 of 2 connected app\(s\) have no last-used timestamp and are not counted as active/);
+  assert.deepEqual(findingById(identity, "MULESOFT-IAM-19").evidence.apps_without_usage_date, ["No Usage"]);
+  assert.deepEqual(findingById(identity, "MULESOFT-IAM-19").evidence.stale_apps, []);
+  assert.equal(findingById(identity, "MULESOFT-IAM-19").evidence.apps_with_usage_data, 1);
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listLoadBalancers() {
+      return [
+        { id: "lb-1", name: "dated", domain: "dated.lb.anypointdns.net", httpMode: "redirect", tlsv1: false, tlsv13: true },
+        { id: "lb-2", name: "undated", domain: "undated.lb.anypointdns.net", httpMode: "redirect", tlsv1: false, tlsv13: true },
+      ];
+    },
+    async probeCertificate(host) {
+      if (host.startsWith("dated")) return { host, subject: "dated", issuer: "CA", validTo: isoDaysFromNow(300) };
+      return { host, subject: "undated", issuer: "CA" };
+    },
+    async listCloudhubApplications(environmentId) {
+      const applications = await healthyRuntimeClient().listCloudhubApplications(environmentId);
+      return applications.map((application) => ({ ...application, muleVersion: { version: application.muleVersion.version } }));
+    },
+  }));
+  assert.equal(statusOf(runtime, "MULESOFT-RT-16"), "warn");
+  assert.match(findingById(runtime, "MULESOFT-RT-16").summary, /1\/2 dedicated load balancer certificate\(s\) could not be dated/);
+  const undated = findingById(runtime, "MULESOFT-RT-16").evidence.certificates.find((item) => item.load_balancer === "undated");
+  assert.equal(undated.days_remaining, null);
+  assert.match(undated.error, /did not expose a validTo date/);
+  assert.equal(statusOf(runtime, "MULESOFT-RT-10"), "warn");
+  assert.match(findingById(runtime, "MULESOFT-RT-10").summary, /did not expose an end of support date, so they are not counted as supported/);
+  assert.equal(findingById(runtime, "MULESOFT-RT-10").evidence.unknown_support_dates, 2);
+
+  const versionless = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listCloudhubApplications(environmentId) {
+      const applications = await healthyRuntimeClient().listCloudhubApplications(environmentId);
+      return applications.map(({ muleVersion: _muleVersion, ...application }) => application);
+    },
+  }));
+  assert.equal(statusOf(versionless, "MULESOFT-RT-10"), "warn");
+  assert.match(findingById(versionless, "MULESOFT-RT-10").summary, /did not expose a Mule runtime version/);
+});
+
+test("verdict safety rule 5: partial inventories are flagged with seen and total counts instead of passing", async () => {
+  const identity = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listConnectedApplications() {
+      return truncatedPage([{ client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3) }], 40);
+    },
+    async listRoleGroups() {
+      return truncatedPage([
+        { role_group_id: "rg-admin", name: "Organization Administrators", editable: false },
+        { role_group_id: "rg-dev", name: "Developers", editable: true },
+      ], 25);
+    },
+  }));
+  for (const id of ["MULESOFT-IAM-18", "MULESOFT-IAM-19"]) {
+    assert.equal(statusOf(identity, id), "warn", id);
+    assert.match(findingById(identity, id).summary, /^Partial view: connected apps list truncated at 1 of 40 total\./);
+    assert.match(findingById(identity, id).summary, /cannot pass on this sample/);
+  }
+  for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05"]) {
+    assert.equal(statusOf(identity, id), "warn", id);
+    assert.match(findingById(identity, id).summary, /role groups list truncated at 2 of 25 total/);
+  }
+
+  const businessGroup = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async getOrganizationHierarchy() {
+      return { id: "bg-1", isRoot: false, subOrganizations: [] };
+    },
+  }));
+  assert.equal(statusOf(businessGroup, "MULESOFT-IAM-25"), "manual");
+  assert.match(findingById(businessGroup, "MULESOFT-IAM-25").summary, /business group \(isRoot=false\)/);
+  for (const id of ["MULESOFT-IAM-01", "MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05", "MULESOFT-IAM-06", "MULESOFT-IAM-18", "MULESOFT-IAM-19"]) {
+    assert.equal(statusOf(businessGroup, id), "warn", id);
+    assert.match(findingById(businessGroup, id).summary, /Partial view: this organization is a business group \(isRoot=false\)/, id);
+  }
+  assert.equal(statusOf(businessGroup, "MULESOFT-IAM-02"), "manual");
+  assert.match(findingById(businessGroup, "MULESOFT-IAM-02").summary, /Partial view: this organization is a business group/);
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient(), { environmentLimit: 1, applicationLimit: 1 });
+  for (const id of ["MULESOFT-RT-10", "MULESOFT-RT-11", "MULESOFT-RT-12", "MULESOFT-RT-21", "MULESOFT-RT-22", "MULESOFT-RT-23"]) {
+    assert.notEqual(statusOf(runtime, id), "pass", `${id} is environment-scoped and must not pass on a sampled subset of environments`);
+    assert.match(findingById(runtime, id).summary, /environment limit of 1|application limit of 1/, id);
+  }
+  for (const id of ["MULESOFT-RT-13", "MULESOFT-RT-14", "MULESOFT-RT-15", "MULESOFT-RT-16"]) {
+    assert.equal(statusOf(runtime, id), "pass", `${id} reads organization-level VPC and load balancer inventories that an environment limit does not narrow`);
+    assert.equal(findingById(runtime, id).evidence.partial_view, undefined, id);
+  }
+  assert.equal(statusOf(runtime, "MULESOFT-RT-10"), "warn");
+  assert.match(findingById(runtime, "MULESOFT-RT-10").summary, /the environment limit of 1 excluded 1 environment\(s\) \(0 production\): Sandbox/);
+  assert.equal(statusOf(runtime, "MULESOFT-RT-23"), "warn");
+  assert.equal(runtime.summary.environments_visible, 2);
+  assert.equal(runtime.summary.environments_sampled, 1);
+
+  const capped = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient(), { applicationLimit: 1 });
+  assert.equal(statusOf(capped, "MULESOFT-RT-10"), "warn");
+  assert.match(findingById(capped, "MULESOFT-RT-10").summary, /the application limit of 1 left 1 application\(s\) uninspected/);
+  assert.equal(capped.summary.applications_not_inspected, 1);
+
+  const gateway = await assessMulesoftApiGateway(healthyApiGatewayClient({
+    async listManagedApis(environmentId) {
+      const apis = await healthyApiGatewayClient().listManagedApis(environmentId);
+      return truncatedPage(apis, 300);
+    },
+  }));
+  assert.equal(statusOf(gateway, "MULESOFT-API-07"), "warn");
+  assert.match(findingById(gateway, "MULESOFT-API-07").summary, /Production API instance list truncated at 1 of 300 total/);
+  assert.equal(statusOf(gateway, "MULESOFT-API-08"), "warn");
+
+  const audit = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    async listEnvironments() {
+      return [...ENVIRONMENTS, { id: "env-prod-eu", name: "Production EU", isProduction: true, type: "production" }];
+    },
+  }), { environmentLimit: 1 });
+  assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "warn");
+  assert.match(findingById(audit, "MULESOFT-AUD-24").summary, /the environment limit of 1 excluded 2 environment\(s\) \(1 production\)/);
+});
+
+test("verdict safety rule 6: verdicts require the enabling flags to be read and present", async () => {
+  const notFederated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async getOrganization() {
+      return { id: ORG_ID, name: "Acme", entitlements: { createSubOrgs: true } };
+    },
+  }));
+  assert.equal(statusOf(notFederated, "MULESOFT-IAM-01"), "warn");
+  assert.match(findingById(notFederated, "MULESOFT-IAM-01").summary, /isFederated flag is absent/);
+
+  const disabledProvider = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listIdentityProviders() {
+      return [{ provider_id: "idp-1", name: "Okta SAML", type: { name: "saml" }, enabled: false }];
+    },
+  }));
+  assert.equal(statusOf(disabledProvider, "MULESOFT-IAM-01"), "fail");
+  assert.match(findingById(disabledProvider, "MULESOFT-IAM-01").summary, /every one is disabled/);
+
+  const settingsWithoutFlag = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async getIdentityProviderSettings() {
+      return {};
+    },
+  }));
+  assert.equal(statusOf(settingsWithoutFlag, "MULESOFT-IAM-01"), "warn");
+  assert.match(findingById(settingsWithoutFlag, "MULESOFT-IAM-01").summary, /did not expose allow_new_non_sso_users/);
+
+  const exemptWithoutFlag = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listMfaExemptUsers() {
+      return [{ id: "u9", username: "contractor" }];
+    },
+  }));
+  assert.equal(statusOf(exemptWithoutFlag, "MULESOFT-IAM-02"), "warn");
+  assert.match(findingById(exemptWithoutFlag, "MULESOFT-IAM-02").summary, /did not include the mfaVerificationExcluded flag/);
+
+  const noEntitlement = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async getOrganization() {
+      return { id: ORG_ID, name: "Acme", isFederated: true };
+    },
+  }));
+  assert.equal(statusOf(noEntitlement, "MULESOFT-IAM-25"), "warn");
+  assert.match(findingById(noEntitlement, "MULESOFT-IAM-25").summary, /did not expose the entitlements.createSubOrgs flag/);
+
+  const untypedEnvironment = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listEnvironments() {
+      return [...ENVIRONMENTS, { id: "env-x", name: "Integration" }];
+    },
+  }));
+  assert.equal(statusOf(untypedEnvironment, "MULESOFT-IAM-06"), "warn");
+  assert.match(findingById(untypedEnvironment, "MULESOFT-IAM-06").summary, /did not expose an isProduction or type flag/);
+
+  const policyWithoutState = await assessMulesoftApiGateway(healthyApiGatewayClient({
+    async listApiPolicies() {
+      return [{ assetId: "client-id-enforcement" }, { assetId: "rate-limiting" }];
+    },
+  }));
+  for (const id of ["MULESOFT-API-07", "MULESOFT-API-08"]) {
+    assert.equal(statusOf(policyWithoutState, id), "warn", id);
+    assert.match(findingById(policyWithoutState, id).summary, /whose disabled flag was not returned, so its enabled state is unknown/);
+  }
+  const disabledPolicy = await assessMulesoftApiGateway(healthyApiGatewayClient({
+    async listApiPolicies() {
+      return [{ assetId: "client-id-enforcement", disabled: true }, { assetId: "rate-limiting", disabled: false }];
+    },
+  }));
+  assert.equal(statusOf(disabledPolicy, "MULESOFT-API-07"), "fail");
+  assert.equal(statusOf(disabledPolicy, "MULESOFT-API-08"), "pass");
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listLoadBalancers() {
+      return [{ id: "lb-1", name: "flagless", domain: "flagless.lb.anypointdns.net", state: "STARTED" }];
+    },
+    async getVpc() {
+      return { id: "vpc-1", name: "prod-vpc" };
+    },
+    async listCloudhubApplications(environmentId) {
+      const applications = await healthyRuntimeClient().listCloudhubApplications(environmentId);
+      return applications.map(({ persistentQueuesEncrypted: _flag, properties: _properties, ...application }) => application);
+    },
+  }));
+  assert.equal(statusOf(runtime, "MULESOFT-RT-15"), "warn");
+  assert.match(findingById(runtime, "MULESOFT-RT-15").summary, /did not return the tlsv1 or httpMode flags/);
+  assert.equal(statusOf(runtime, "MULESOFT-RT-13"), "manual");
+  assert.match(findingById(runtime, "MULESOFT-RT-13").summary, /did not return a firewallRules list/);
+  assert.equal(statusOf(runtime, "MULESOFT-RT-14"), "manual");
+  assert.equal(statusOf(runtime, "MULESOFT-RT-12"), "fail");
+  assert.equal(statusOf(runtime, "MULESOFT-RT-22"), "warn");
+  assert.match(findingById(runtime, "MULESOFT-RT-22").summary, /did not return a properties object/);
+
+  const audit = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    async listCloudhubAlerts() {
+      return [{ id: "alert-1", name: "CPU", condition: { resources: ["*"] } }];
+    },
+  }));
+  assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "warn");
+  assert.match(findingById(audit, "MULESOFT-AUD-24").summary, /alerts whose enabled flag was not returned/);
+  const unscopedAlert = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    async listCloudhubAlerts() {
+      return [{ id: "alert-1", name: "CPU", enabled: true }];
+    },
+  }));
+  assert.equal(statusOf(unscopedAlert, "MULESOFT-AUD-24"), "warn");
+  assert.deepEqual(findingById(unscopedAlert, "MULESOFT-AUD-24").evidence.production_environments[0].uncovered_applications, ["orders-prod"]);
+});
+
+test("verdict safety rule 7: pagination runs to completion or records truncation", async () => {
+  const population = Array.from({ length: 5 }, (_, index) => ({ id: `u${index + 1}` }));
+  const requests = [];
+  const pagedFetch = (options = {}) => async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const limit = Number(url.searchParams.get("limit"));
+    const offset = Number(url.searchParams.get("offset"));
+    requests.push({ limit, offset });
+    const serverLimit = options.serverPageCap ? Math.min(limit, options.serverPageCap) : limit;
+    const data = population.slice(offset, offset + serverLimit);
+    return jsonResponse(options.withTotal ? { data, total: population.length } : { data });
+  };
+
+  requests.length = 0;
+  const withTotal = await new MulesoftApiClient(sampleConfig(), { fetchImpl: pagedFetch({ withTotal: true }) })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 3, pageSize: 2 });
+  assert.deepEqual(withTotal.items.map((item) => item.id), ["u1", "u2", "u3"]);
+  assert.equal(withTotal.total, 5);
+  assert.equal(withTotal.truncated, true);
+  assert.deepEqual(requests, [{ limit: 2, offset: 0 }, { limit: 1, offset: 2 }]);
+
+  requests.length = 0;
+  const probed = await new MulesoftApiClient(sampleConfig(), { fetchImpl: pagedFetch() })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 4, pageSize: 2 });
+  assert.equal(probed.items.length, 4);
+  assert.equal(probed.total, undefined);
+  assert.equal(probed.truncated, true);
+  assert.deepEqual(requests.at(-1), { limit: 1, offset: 4 });
+
+  requests.length = 0;
+  const complete = await new MulesoftApiClient(sampleConfig(), { fetchImpl: pagedFetch() })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 100, pageSize: 100 });
+  assert.equal(complete.items.length, 5);
+  assert.equal(complete.truncated, false);
+  assert.deepEqual(requests, [{ limit: 100, offset: 0 }, { limit: 95, offset: 5 }]);
+
+  requests.length = 0;
+  const shortPages = await new MulesoftApiClient(sampleConfig(), { fetchImpl: pagedFetch({ serverPageCap: 2 }) })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 100, pageSize: 100 });
+  assert.deepEqual(shortPages.items.map((item) => item.id), ["u1", "u2", "u3", "u4", "u5"]);
+  assert.equal(shortPages.truncated, false);
+  assert.equal(requests.length, 4);
+
+  requests.length = 0;
+  const exactFit = await new MulesoftApiClient(sampleConfig(), { fetchImpl: pagedFetch() })
+    .listOffset("/accounts/api/organizations/org-1/members", { limit: 5, pageSize: 5 });
+  assert.equal(exactFit.items.length, 5);
+  assert.equal(exactFit.truncated, false);
+  assert.deepEqual(requests, [{ limit: 5, offset: 0 }, { limit: 1, offset: 5 }]);
+
+  const apiManagerFetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const offset = Number(url.searchParams.get("offset"));
+    const assets = [
+      { assetId: "orders", name: "Orders", apis: [{ id: 1 }, { id: 2 }] },
+      { assetId: "billing", name: "Billing", apis: [{ id: 3 }] },
+      { assetId: "shipping", name: "Shipping", apis: [{ id: 4 }] },
+    ];
+    return jsonResponse({ total: assets.length, assets: assets.slice(offset, offset + Number(url.searchParams.get("limit"))) });
+  };
+  const apis = await new MulesoftApiClient(sampleConfig(), { fetchImpl: apiManagerFetch }).listManagedApis("env-prod", 2);
+  assert.deepEqual(apis.items.map((api) => api.id), [1, 2]);
+  assert.equal(apis.truncated, true);
+  const allApis = await new MulesoftApiClient(sampleConfig(), { fetchImpl: apiManagerFetch }).listManagedApis("env-prod", 10);
+  assert.equal(allApis.items.length, 4);
+  assert.equal(allApis.truncated, false);
+  assert.equal(allApis.total, 4);
+
+  const result = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listRoleGroupRoles(roleGroupId) {
+      const roles = await healthyIdentityClient().listRoleGroupRoles(roleGroupId);
+      return roleGroupId === "rg-dev" ? truncatedPage(roles, 80) : roles;
+    },
+  }));
+  assert.equal(statusOf(result, "MULESOFT-IAM-04"), "warn");
+  assert.match(findingById(result, "MULESOFT-IAM-04").summary, /role assignments truncated for Developers/);
+  assert.equal(statusOf(result, "MULESOFT-IAM-05"), "warn");
+  assert.equal(result.snapshots.role_groups.find((item) => item.role_group.role_group_id === "rg-dev").roles_truncated, true);
+});
+
+test("verdict safety rule 8: re-running an export never overwrites a prior bundle and keeps directory and archive paired", async () => {
+  const base = createTempBase("grclanker-mulesoft-rerun-");
+  const first = await exportMulesoftAuditBundle(healthyBundleClient(), sampleConfig(), base);
+  const firstZip = readFileSync(first.zipPath);
+  assert.equal(first.zipPath, `${first.outputDir}.zip`);
+
+  const second = await exportMulesoftAuditBundle(healthyBundleClient(), sampleConfig(), base);
+  assert.notEqual(second.outputDir, first.outputDir);
+  assert.equal(second.zipPath, `${second.outputDir}.zip`);
+  assert.match(second.outputDir, /org-1-audit-bundle-2$/);
+  assert.ok(existsSync(first.zipPath));
+  assert.ok(existsSync(second.zipPath));
+  assert.ok(readFileSync(first.zipPath).equals(firstZip), "the first archive must be byte-for-byte unchanged");
+
+  writeFileSync(join(base, "org-1-audit-bundle-3.zip"), "orphan archive from an earlier run");
+  const third = await exportMulesoftAuditBundle(healthyBundleClient(), sampleConfig(), base);
+  assert.match(third.outputDir, /org-1-audit-bundle-4$/);
+  assert.equal(third.zipPath, `${third.outputDir}.zip`);
+  assert.equal(readFileSync(join(base, "org-1-audit-bundle-3.zip"), "utf8"), "orphan archive from an earlier run");
+  assert.deepEqual(
+    readdirSync(base).filter((name) => name.endsWith(".zip")).sort(),
+    ["org-1-audit-bundle-2.zip", "org-1-audit-bundle-3.zip", "org-1-audit-bundle-4.zip", "org-1-audit-bundle.zip"],
+  );
+});
+
+test("false-pass self-check (a): every endpoint forbidden yields no pass for any assess tool", async () => {
+  const identity = await assessMulesoftIdentityAccess(forbidAll(healthyIdentityClient()));
+  assert.equal(identity.findings.length, 9);
+  assertNoPass(identity, "identity/403");
+  assertAllManualNamingCause(identity, "identity/403");
+
+  const gateway = await assessMulesoftApiGateway(forbidAll(healthyApiGatewayClient()));
+  assert.equal(gateway.findings.length, 4);
+  assertNoPass(gateway, "gateway/403");
+  assertAllManualNamingCause(gateway, "gateway/403");
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(forbidAll(healthyRuntimeClient()));
+  assert.equal(runtime.findings.length, 10);
+  assertNoPass(runtime, "runtime/403");
+  assertAllManualNamingCause(runtime, "runtime/403");
+
+  const audit = await assessMulesoftAuditMonitoring(forbidAll(healthyAuditClient()));
+  assert.equal(audit.findings.length, 2);
+  assertNoPass(audit, "audit/403");
+  assertAllManualNamingCause(audit, "audit/403");
+});
+
+test("false-pass self-check (b): every list empty yields no pass, and only IAM-01, AUD-17, and AUD-24 fail on emptiness", async () => {
+  const results = [
+    await assessMulesoftIdentityAccess(emptyIdentityClient()),
+    await assessMulesoftApiGateway(emptyApiGatewayClient()),
+    await assessMulesoftRuntimeInfrastructure(emptyRuntimeClient()),
+    await assessMulesoftAuditMonitoring(emptyAuditClient()),
+  ];
+  const findings = results.flatMap((result) => result.findings);
+  assert.equal(findings.length, 25);
+  for (const result of results) assertNoPass(result, `${result.category}/empty`);
+  assert.deepEqual(
+    findings.filter((item) => item.status === "fail").map((item) => item.id).sort(),
+    ["MULESOFT-AUD-17", "MULESOFT-AUD-24", "MULESOFT-IAM-01"],
+  );
+  assert.ok(findings.filter((item) => item.status === "manual").length === 22);
+  for (const item of findings.filter((item) => item.status === "manual")) {
+    assert.match(item.summary, /manual|not applicable|Confirm|Export|export/, `${item.id} must tell the reader what to collect`);
+  }
+});
+
+test("false-pass self-check (c): partial inventories yield no pass in any assess tool", async () => {
+  const identity = await assessMulesoftIdentityAccess(partialIdentityClient());
+  assertNoPass(identity, "identity/partial");
+  for (const item of identity.findings) {
+    assert.ok(
+      /Partial view|business group|Could not|treated as manual/.test(item.summary),
+      `${item.id} must explain the partial view: ${item.summary}`,
+    );
+  }
+
+  const gateway = await assessMulesoftApiGateway(partialApiGatewayClient());
+  assertNoPass(gateway, "gateway/partial");
+  assert.equal(statusOf(gateway, "MULESOFT-API-20"), "manual");
+  assert.match(findingById(gateway, "MULESOFT-API-20").summary, /Partial view: Exchange asset list truncated at 1 of 900 total/);
+  assert.deepEqual(findingById(gateway, "MULESOFT-API-20").evidence.partial_view, ["Exchange asset list truncated at 1 of 900 total"]);
+  for (const id of ["MULESOFT-API-07", "MULESOFT-API-08"]) {
+    assert.equal(statusOf(gateway, id), "manual", id);
+    assert.match(findingById(gateway, id).summary, /Partial view: the environment filter excluded 1 environment\(s\) \(1 production\): Production/, id);
+  }
+
+  const runtime = await assessMulesoftRuntimeInfrastructure(partialRuntimeClient(), { environmentLimit: 1, applicationLimit: 1 });
+  assertNoPass(runtime, "runtime/partial");
+  assert.match(findingById(runtime, "MULESOFT-RT-13").summary, /VPC list truncated at 20 of 21/);
+  assert.match(findingById(runtime, "MULESOFT-RT-15").summary, /load balancer list truncated at 10 of 11/);
+  assert.deepEqual(runtime.summary.partial_view, [
+    "the environment limit of 1 excluded 1 environment(s) (0 production): Sandbox",
+    "VPC list truncated at 20 of 21",
+    "load balancer list truncated at 10 of 11",
+  ]);
+  assert.equal(runtime.summary.applications_not_inspected, 0);
+
+  const audit = await assessMulesoftAuditMonitoring(partialAuditClient(), { environmentLimit: 1 });
+  assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "warn");
+  assert.match(findingById(audit, "MULESOFT-AUD-24").summary, /Partial view: the environment limit of 1 excluded 2 environment\(s\) \(1 production\)/);
+  assert.equal(statusOf(audit, "MULESOFT-AUD-17"), "pass");
+  assert.equal(findingById(audit, "MULESOFT-AUD-17").evidence.entries_in_window, 5000);
+  assert.equal(findingById(audit, "MULESOFT-AUD-17").evidence.entries_fetched, 1);
+  assert.match(findingById(audit, "MULESOFT-AUD-17").summary, /5000 audit log entries recorded within the last 24 hours \(1 fetched\)/);
+});
