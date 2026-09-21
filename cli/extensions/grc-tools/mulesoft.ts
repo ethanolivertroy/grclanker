@@ -252,13 +252,16 @@ export interface MulesoftAuditBundleResult {
 
 export interface MulesoftCertificateSummary {
   host: string;
+  servername?: string;
   subject?: string;
   issuer?: string;
   validFrom?: string;
   validTo?: string;
+  authorized?: boolean;
+  authorizationError?: string;
 }
 
-export type MulesoftCertificateProbe = (host: string, timeoutMs: number) => Promise<MulesoftCertificateSummary>;
+export type MulesoftCertificateProbe = (host: string, timeoutMs: number, servername?: string) => Promise<MulesoftCertificateSummary>;
 
 export interface MulesoftPage {
   items: JsonRecord[];
@@ -963,17 +966,25 @@ function certificateName(value: unknown): string | undefined {
   return asString(object?.CN) ?? asString(object?.O);
 }
 
-export function defaultCertificateProbe(host: string, timeoutMs: number): Promise<MulesoftCertificateSummary> {
+// rejectUnauthorized stays false so a certificate with an untrusted or incomplete chain can still be read and dated;
+// socket.authorized and authorizationError record whether the chain validated against the auditor's trust store.
+export function defaultCertificateProbe(host: string, timeoutMs: number, servername = host, port = 443): Promise<MulesoftCertificateSummary> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const socket = tlsConnect({ host, port: 443, servername: host, rejectUnauthorized: false }, () => {
+    const socket = tlsConnect({ host, port, servername, rejectUnauthorized: false }, () => {
       const certificate = socket.getPeerCertificate();
+      const rawAuthorizationError: unknown = socket.authorizationError;
       socket.end();
       resolvePromise({
         host,
+        servername,
         subject: certificateName(certificate.subject),
         issuer: certificateName(certificate.issuer),
         validFrom: asString(certificate.valid_from),
         validTo: asString(certificate.valid_to),
+        authorized: socket.authorized === true,
+        authorizationError: rawAuthorizationError
+          ? (rawAuthorizationError instanceof Error ? rawAuthorizationError.message : String(rawAuthorizationError))
+          : undefined,
       });
     });
     socket.setTimeout(timeoutMs, () => {
@@ -1342,8 +1353,8 @@ export class MulesoftApiClient {
     )) ?? {};
   }
 
-  async probeCertificate(host: string): Promise<MulesoftCertificateSummary> {
-    return this.certificateProbe(host, this.config.timeoutMs);
+  async probeCertificate(host: string, servername?: string): Promise<MulesoftCertificateSummary> {
+    return this.certificateProbe(host, this.config.timeoutMs, servername ?? host);
   }
 
   async listHybridServers(environmentId: string): Promise<JsonRecord[]> {
@@ -2549,6 +2560,36 @@ function daysUntil(date: Date, now: number): number {
   return Math.floor((date.getTime() - now) / DAY_MS);
 }
 
+interface CertificateProbeRecord {
+  loadBalancer: JsonRecord;
+  sslEndpoint?: string;
+  servername?: string;
+  certificate?: MulesoftCertificateSummary;
+  error?: string;
+}
+
+interface CertificateProbeTarget {
+  label?: string;
+  servername: string;
+}
+
+// A DLB selects the certificate by SNI, so each sslEndpoints entry is probed with its own name; wildcard names fall back
+// to a concrete SAN and then to the DLB domain, which yields the default SSL endpoint's certificate.
+function certificateProbeTargets(loadBalancer: JsonRecord, host: string): CertificateProbeTarget[] {
+  const endpoints = asRecordArray(loadBalancer.sslEndpoints);
+  if (endpoints.length === 0) return [{ servername: host }];
+  const seen = new Set<string>();
+  const targets: CertificateProbeTarget[] = [];
+  for (const endpoint of endpoints) {
+    const names = [asString(endpoint.publicKeyCN), ...asStringList(endpoint.publicKeySANs)].filter((name): name is string => Boolean(name));
+    const servername = names.find((name) => !name.includes("*")) ?? host;
+    if (seen.has(servername)) continue;
+    seen.add(servername);
+    targets.push({ label: asString(endpoint.publicKeyLabel) ?? asString(endpoint.publicKeyCN) ?? servername, servername });
+  }
+  return targets.length > 0 ? targets : [{ servername: host }];
+}
+
 function serverLabel(server: JsonRecord): string {
   return asString(server.name) ?? asString(server.id) ?? "server";
 }
@@ -2668,19 +2709,22 @@ export async function assessMulesoftRuntimeInfrastructure(
   }
   const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails);
   const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
-  const certificateProbes: Array<{ loadBalancer: JsonRecord; certificate?: MulesoftCertificateSummary; error?: string }> = [];
+  const certificateProbes: CertificateProbeRecord[] = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);
     if (!host) {
       certificateProbes.push({ loadBalancer, error: "Load balancer did not expose a domain to probe." });
       continue;
     }
-    try {
-      certificateProbes.push({ loadBalancer, certificate: await client.probeCertificate(host) });
-    } catch (error) {
-      const message = errorMessage(error);
-      errors.push(`certificate_probe:${host}: ${message}`);
-      certificateProbes.push({ loadBalancer, error: message });
+    for (const target of certificateProbeTargets(loadBalancer, host)) {
+      try {
+        const certificate = await client.probeCertificate(host, target.servername);
+        certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, certificate });
+      } catch (error) {
+        const message = errorMessage(error);
+        errors.push(`certificate_probe:${host}${target.servername === host ? "" : `:${target.servername}`}: ${message}`);
+        certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, error: message });
+      }
     }
   }
 
@@ -2741,11 +2785,15 @@ export async function assessMulesoftRuntimeInfrastructure(
     const validTo = probe.certificate?.validTo ? asDate(probe.certificate.validTo) : undefined;
     return {
       load_balancer: loadBalancerLabel(probe.loadBalancer),
+      ssl_endpoint: probe.sslEndpoint ?? null,
       host: asString(probe.loadBalancer.domain) ?? null,
+      servername: probe.servername ?? null,
       subject: probe.certificate?.subject ?? null,
       issuer: probe.certificate?.issuer ?? null,
       valid_to: validTo ? validTo.toISOString() : null,
       days_remaining: validTo ? daysUntil(validTo, now) : null,
+      authorized: probe.certificate?.authorized ?? null,
+      authorization_error: probe.certificate?.authorizationError ?? null,
       error: probe.error ?? (validTo ? null : "Certificate did not expose a validTo date."),
     };
   });
@@ -2755,6 +2803,9 @@ export async function assessMulesoftRuntimeInfrastructure(
   );
   const probedCertificates = certificateResults.filter((item) => item.days_remaining !== null);
   const undatedCertificates = certificateResults.filter((item) => item.days_remaining === null);
+  const untrustedCertificates = probedCertificates.filter((item) => item.authorized !== true);
+  const describeCertificate = (item: (typeof certificateResults)[number]) =>
+    item.ssl_endpoint ? `${item.load_balancer} (${item.ssl_endpoint})` : item.load_balancer;
 
   const allQueues = mqInventory.flatMap((item) => item.queues.map((queue) => ({ environment: item.environment, region: item.region, queue })));
   const unencryptedQueues = allQueues.filter((item) => asBoolean(item.queue.encrypted) !== true);
@@ -2959,27 +3010,34 @@ export async function assessMulesoftRuntimeInfrastructure(
     evaluate(
       16,
       loadBalancerInputs,
-      "Open Runtime Manager > Load Balancers > certificates and record each certificate's expiry date.",
+      "Open Runtime Manager > Load Balancers > certificates and record each SSL endpoint certificate's expiry date and issuing chain.",
       () => {
         const evidence = {
           certificates: certificateResults,
+          certificates_probed: certificateResults.length,
+          load_balancers: loadBalancers.length,
           fail_days: DEFAULT_CERTIFICATE_FAIL_DAYS,
           warning_days: certificateWarningDays,
+          probe_note: "The TLS probe connects with rejectUnauthorized=false so untrusted chains can still be read; authorized and authorization_error record whether each chain validated against the auditor's trust store.",
         };
         if (loadBalancers.length === 0) return verdict("manual", noLoadBalancerSummary, evidence);
         if (expiringCertificates.length > 0) {
-          return verdict("fail", `${expiringCertificates.length} dedicated load balancer certificate(s) are expired or expire within ${DEFAULT_CERTIFICATE_FAIL_DAYS} days.`, evidence);
+          return verdict("fail", `${expiringCertificates.length} dedicated load balancer certificate(s) are expired or expire within ${DEFAULT_CERTIFICATE_FAIL_DAYS} days (${sample(expiringCertificates.map(describeCertificate)).join(", ")}).`, evidence);
         }
         if (warningCertificates.length > 0) {
-          return verdict("warn", `${warningCertificates.length} dedicated load balancer certificate(s) expire within ${certificateWarningDays} days.`, evidence);
+          return verdict("warn", `${warningCertificates.length} dedicated load balancer certificate(s) expire within ${certificateWarningDays} days (${sample(warningCertificates.map(describeCertificate)).join(", ")}).`, evidence);
         }
         if (probedCertificates.length === 0) {
           return verdict("manual", "None of the load balancer certificates could be dated over TLS. Open Runtime Manager > Load Balancers > certificates and record each certificate expiry date.", evidence);
         }
         if (undatedCertificates.length > 0) {
-          return verdict("warn", `${undatedCertificates.length}/${loadBalancers.length} dedicated load balancer certificate(s) could not be dated (probe failed or no validTo date) and are not counted as valid; record their expiry dates manually.`, evidence);
+          return verdict("warn", `${undatedCertificates.length}/${certificateResults.length} dedicated load balancer certificate(s) could not be dated (probe failed or no validTo date) and are not counted as valid; record their expiry dates manually.`, evidence);
         }
-        return verdict("pass", `All ${probedCertificates.length} dedicated load balancer certificate(s) were probed and remain valid for more than ${certificateWarningDays} days.`, evidence);
+        if (untrustedCertificates.length > 0) {
+          const causes = sample(untrustedCertificates.map((item) => `${describeCertificate(item)}: ${item.authorization_error ?? "chain validation not reported"}`));
+          return verdict("warn", `${untrustedCertificates.length}/${probedCertificates.length} dedicated load balancer certificate(s) are dated but their chain did not validate against the auditor's trust store (${causes.join("; ")}); a self-signed, expired-intermediate, or private-CA chain is not counted as valid, so confirm the chain in Runtime Manager.`, evidence);
+        }
+        return verdict("pass", `All ${probedCertificates.length} dedicated load balancer certificate(s) across ${loadBalancers.length} load balancer(s) were probed, validated against the auditor's trust store, and remain valid for more than ${certificateWarningDays} days.`, evidence);
       },
     ),
     evaluate(

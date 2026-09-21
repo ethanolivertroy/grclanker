@@ -11,6 +11,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { createServer as createTlsServer } from "node:tls";
 
 import {
   MulesoftApiClient,
@@ -20,6 +22,7 @@ import {
   assessMulesoftIdentityAccess,
   assessMulesoftRuntimeInfrastructure,
   checkMulesoftAccess,
+  defaultCertificateProbe,
   exportMulesoftAuditBundle,
   getMulesoftControlCatalog,
   parseSimpleToml,
@@ -212,8 +215,8 @@ function healthyRuntimeClient(overrides = {}) {
         defaultCipherSuite: STRONG_CIPHER_SUITE,
       }];
     },
-    async probeCertificate(host) {
-      return { host, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200) };
+    async probeCertificate(host, servername = host) {
+      return { host, servername, subject: "*.example.com", issuer: "Example CA", validFrom: isoDaysFromNow(-100), validTo: isoDaysFromNow(200), authorized: true };
     },
     async listHybridServers(environmentId) {
       return environmentId === "env-prod" ? [{ id: 1, name: "onprem-1", status: "RUNNING", muleVersion: "4.6.0" }] : [];
@@ -2323,4 +2326,96 @@ test("review fix 4: RT-15 evaluates defaultCipherSuite, failing weak ciphers and
   assert.equal(statusOf(detailForbidden, "MULESOFT-RT-15"), "manual");
   assert.match(findingById(detailForbidden, "MULESOFT-RT-15").summary, /Could not evaluate: load_balancer_details could not be read, the credential lacks permission \(HTTP 403\)/);
   assert.equal(statusOf(detailForbidden, "MULESOFT-RT-16"), "pass", "the certificate control does not depend on the DLB detail read");
+});
+
+function opensslAvailable() {
+  try {
+    execFileSync("openssl", ["version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("review fix 5: defaultCertificateProbe keeps rejectUnauthorized off but records that a self-signed chain did not validate", { skip: !opensslAvailable() && "openssl is not installed" }, async () => {
+  const dir = createTempBase("grclanker-mulesoft-tls-");
+  execFileSync("openssl", [
+    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "45",
+    "-keyout", join(dir, "key.pem"), "-out", join(dir, "cert.pem"), "-subj", "/CN=self-signed.example.test",
+  ], { stdio: "ignore" });
+  const server = createTlsServer({ key: readFileSync(join(dir, "key.pem")), cert: readFileSync(join(dir, "cert.pem")) }, (socket) => socket.end());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const summary = await defaultCertificateProbe("127.0.0.1", 5000, "self-signed.example.test", server.address().port);
+    assert.equal(summary.host, "127.0.0.1");
+    assert.equal(summary.servername, "self-signed.example.test");
+    assert.equal(summary.subject, "self-signed.example.test");
+    assert.equal(summary.authorized, false);
+    assert.match(summary.authorizationError, /SELF_SIGNED/);
+    assert.ok(summary.validTo, "the certificate is still read and dated even though the chain is untrusted");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("review fix 5: RT-16 caps at warn when a dated certificate chain does not validate or validation is not reported", async () => {
+  const untrusted = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async probeCertificate(host, servername = host) {
+      return { host, servername, subject: "prod-dlb.lb.anypointdns.net", issuer: "prod-dlb.lb.anypointdns.net", validTo: isoDaysFromNow(300), authorized: false, authorizationError: "DEPTH_ZERO_SELF_SIGNED_CERT" };
+    },
+  }));
+  assert.equal(statusOf(untrusted, "MULESOFT-RT-16"), "warn");
+  assert.match(findingById(untrusted, "MULESOFT-RT-16").summary, /chain did not validate against the auditor's trust store \(prod-dlb: DEPTH_ZERO_SELF_SIGNED_CERT\)/);
+  const certificate = findingById(untrusted, "MULESOFT-RT-16").evidence.certificates[0];
+  assert.equal(certificate.authorized, false);
+  assert.equal(certificate.authorization_error, "DEPTH_ZERO_SELF_SIGNED_CERT");
+  assert.match(findingById(untrusted, "MULESOFT-RT-16").evidence.probe_note, /rejectUnauthorized=false/);
+
+  const unreported = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async probeCertificate(host) {
+      return { host, subject: "*.example.com", issuer: "Example CA", validTo: isoDaysFromNow(300) };
+    },
+  }));
+  assert.equal(statusOf(unreported, "MULESOFT-RT-16"), "warn");
+  assert.match(findingById(unreported, "MULESOFT-RT-16").summary, /chain validation not reported/);
+
+  const trusted = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient());
+  assert.equal(statusOf(trusted, "MULESOFT-RT-16"), "pass");
+  assert.match(findingById(trusted, "MULESOFT-RT-16").summary, /validated against the auditor's trust store/);
+});
+
+test("optional: RT-16 probes each DLB sslEndpoints certificate by SNI and counts certificates rather than load balancers", async () => {
+  const probes = [];
+  const result = await assessMulesoftRuntimeInfrastructure(healthyRuntimeClient({
+    async listLoadBalancers() {
+      return [{
+        id: "lb-1",
+        name: "prod-dlb",
+        domain: "prod-dlb.lb.anypointdns.net",
+        vpcId: "vpc-1",
+        httpMode: "redirect",
+        tlsv1: false,
+        tlsv13: true,
+        defaultCipherSuite: STRONG_CIPHER_SUITE,
+        sslEndpoints: [
+          { publicKeyLabel: "api-cert", publicKeyCN: "api.example.com", publicKeySANs: ["api.example.com"] },
+          { publicKeyLabel: "wildcard-cert", publicKeyCN: "*.internal.example.com", publicKeySANs: ["*.internal.example.com", "apps.internal.example.com"] },
+          { publicKeyLabel: "duplicate-cert", publicKeyCN: "api.example.com" },
+        ],
+      }];
+    },
+    async probeCertificate(host, servername = host) {
+      probes.push([host, servername]);
+      return { host, servername, subject: servername, issuer: "Example CA", validTo: isoDaysFromNow(servername === "api.example.com" ? 400 : 45), authorized: true };
+    },
+  }));
+
+  assert.deepEqual(probes, [
+    ["prod-dlb.lb.anypointdns.net", "api.example.com"],
+    ["prod-dlb.lb.anypointdns.net", "apps.internal.example.com"],
+  ]);
+  assert.equal(statusOf(result, "MULESOFT-RT-16"), "warn");
+  assert.match(findingById(result, "MULESOFT-RT-16").summary, /1 dedicated load balancer certificate\(s\) expire within 60 days \(prod-dlb \(wildcard-cert\)\)/);
+  assert.equal(findingById(result, "MULESOFT-RT-16").evidence.certificates_probed, 2);
+  assert.deepEqual(findingById(result, "MULESOFT-RT-16").evidence.certificates.map((item) => item.ssl_endpoint), ["api-cert", "wildcard-cert"]);
 });
