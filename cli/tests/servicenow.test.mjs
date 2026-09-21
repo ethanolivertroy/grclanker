@@ -282,7 +282,7 @@ function healthyFixture() {
       sys_public: [],
       sys_script: [{ sys_id: "br-1", name: "Set assignment", collection: "incident", active: "true", script: "current.assigned_to = gs.getUserID();" }],
       ip_access: [{ sys_id: "ip-1", type: "allow", direction: "inbound", active: "true", range_start: "10.0.0.0", range_end: "10.0.255.255", description: "Corporate VPN" }],
-      sys_email_account: [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", enable_tls: "true", server: "smtp.example.com", port: "587" }],
+      sys_email_account: [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", connection_security: "SSL/TLS", authentication: "Password", server: "smtp.example.com", port: "465" }],
       sys_encryption_context: [],
       sys_dictionary: [
         { sys_id: "dict-user", name: "sys_user", internal_type: "collection", audit: "true", attributes: "" },
@@ -350,7 +350,7 @@ function failingFixture() {
   fixture.tables.sys_public = [{ sys_id: "pub-1", page: "custom_status", active: "true" }];
   fixture.tables.sys_script.push({ sys_id: "br-2", name: "Dynamic eval", collection: "incident", active: "true", script: "eval(current.script);" });
   fixture.tables.ip_access = [];
-  fixture.tables.sys_email_account = [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", enable_tls: "false", server: "smtp.example.com", port: "25" }];
+  fixture.tables.sys_email_account = [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", connection_security: "None", server: "smtp.example.com", port: "25" }];
   fixture.tables.sys_dictionary = fixture.tables.sys_dictionary.map((row) => (row.name === "sys_user" ? { ...row, audit: "false" } : row));
   fixture.tables.sys_update_set.push({ sys_id: "us-open", name: "Security tweaks", state: "in progress", application: "global", sys_created_by: "dev" });
   fixture.tables.sys_update_xml = [{ sys_id: "ux-1", name: "sys_security_acl_abc", type: "Access Control", target_name: "sys_user.read", action: "INSERT_OR_UPDATE", update_set: "us-open", "update_set.name": "Security tweaks", "update_set.state": "in progress" }];
@@ -718,7 +718,43 @@ test("assessServicenowPlatformHardening fails weak properties, eval usage, debug
   assert.match(byId.get("SNOW-16").summary, /glide.debug.ui/);
   assert.equal(byId.get("SNOW-17").status, "fail");
   assert.equal(byId.get("SNOW-18").status, "fail");
-  assert.match(byId.get("SNOW-18").summary, /do not enable TLS/);
+  assert.match(byId.get("SNOW-18").summary, /Connection Security = None \(Outbound SMTP\)/);
+});
+
+test("SNOW-18 reads the documented Connection Security field with display values and grades None, STARTTLS, and SSL/TLS", async () => {
+  const healthy = fixtureFetch(healthyFixture());
+  const secure = findingsById(await assessServicenowPlatformHardening(createClient(healthy.fetchImpl))).get("SNOW-18");
+  assert.equal(secure.status, "manual");
+  assert.match(secure.summary, /All 1 active SMTP accounts use Connection Security = SSL\/TLS/);
+  assert.deepEqual(secure.evidence.smtp_accounts_ssl_tls, ["Outbound SMTP"]);
+  const emailCall = healthy.calls.find((call) => call.url.pathname === "/api/now/table/sys_email_account");
+  assert.ok(emailCall.url.searchParams.get("sysparm_fields").split(",").includes("connection_security"));
+  assert.equal(emailCall.url.searchParams.get("sysparm_fields").includes("enable_tls,server"), false, "the undocumented flag is no longer the primary field");
+  assert.equal(emailCall.url.searchParams.get("sysparm_display_value"), "true");
+
+  const starttls = healthyFixture();
+  starttls.tables.sys_email_account = [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", connection_security: "STARTTLS", server: "smtp.example.com", port: "587" }];
+  const opportunistic = findingsById(await assessServicenowPlatformHardening(createClient(fixtureFetch(starttls).fetchImpl))).get("SNOW-18");
+  assert.equal(opportunistic.status, "warn");
+  assert.match(opportunistic.summary, /use STARTTLS \(Outbound SMTP\); ServiceNow warns/);
+
+  const legacy = healthyFixture();
+  legacy.tables.sys_email_account = [{ sys_id: "email-1", name: "Legacy SMTP", type: "SMTP", active: "true", enable_ssl: "true", enable_tls: "false", server: "smtp.example.com", port: "465" }];
+  const legacyFinding = findingsById(await assessServicenowPlatformHardening(createClient(fixtureFetch(legacy).fetchImpl))).get("SNOW-18");
+  assert.equal(legacyFinding.status, "manual");
+  assert.deepEqual(legacyFinding.evidence.smtp_connection_security, [{ name: "Legacy SMTP", connection_security: "enable_ssl=true", level: "ssl_tls", source: "legacy_flags" }]);
+});
+
+test("SNOW-18 treats an absent Connection Security value as unverifiable rather than as a failure (rule 6)", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_email_account = [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", server: "smtp.example.com", port: "587" }];
+  const email = findingsById(await assessServicenowPlatformHardening(createClient(fixtureFetch(fixture).fetchImpl))).get("SNOW-18");
+
+  assert.equal(email.status, "manual");
+  assert.match(email.summary, /Connection Security could not be read for 1\/1 active SMTP accounts \(Outbound SMTP\)/);
+  assert.match(email.summary, /neither assumed secure nor insecure/);
+  assert.deepEqual(email.evidence.smtp_accounts_unverified, ["Outbound SMTP"]);
+  assert.deepEqual(email.evidence.smtp_accounts_none, []);
 });
 
 test("assessServicenowPlatformHardening warns instead of assuming defaults for absent properties (rule 6)", async () => {

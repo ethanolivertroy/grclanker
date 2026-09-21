@@ -1270,7 +1270,7 @@ const PLUGIN_FIELDS = ["sys_id", "name", "source", "active", "version"];
 const IP_ACCESS_TABLE = "ip_access";
 const IP_AUTHENTICATOR_PLUGIN = "com.snc.ipauthenticator";
 const IP_ACCESS_FIELDS = ["sys_id", "type", "direction", "active", "range_start", "range_end", "description", "sys_updated_on"];
-const EMAIL_ACCOUNT_FIELDS = ["sys_id", "name", "type", "active", "enable_tls", "server", "port", "sys_updated_on"];
+const EMAIL_ACCOUNT_FIELDS = ["sys_id", "name", "type", "active", "connection_security", "enable_ssl", "enable_tls", "authentication", "server", "port", "sys_updated_on"];
 
 export interface ServicenowIdentityData {
   users: TableSnapshot;
@@ -1736,7 +1736,7 @@ export async function collectServicenowHardeningData(
     client.queryTable("sys_script", { query: "active=true^scriptLIKEeval(", fields: ["sys_id", "name", "collection", "sys_updated_on"], limit: recordLimit }),
     client.queryTable(IP_ACCESS_TABLE, { fields: IP_ACCESS_FIELDS, limit: recordLimit }),
     client.queryTable("sys_plugins", { query: `source=${IP_AUTHENTICATOR_PLUGIN}`, fields: PLUGIN_FIELDS, limit: recordLimit }),
-    client.queryTable("sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, limit: recordLimit }),
+    client.queryTable("sys_email_account", { fields: EMAIL_ACCOUNT_FIELDS, displayValue: true, limit: recordLimit }),
   ]);
   return {
     properties,
@@ -1747,6 +1747,44 @@ export async function collectServicenowHardeningData(
     emailAccounts,
     maxSessionTimeoutMinutes: clampNumber(options.maxSessionTimeoutMinutes, DEFAULT_MAX_SESSION_TIMEOUT_MINUTES, 1, 1440),
   };
+}
+
+type EmailConnectionSecurity = "ssl_tls" | "starttls" | "none" | "unknown";
+
+interface EmailAccountSecurity {
+  name: string;
+  connection_security: string | null;
+  level: EmailConnectionSecurity;
+  source: "connection_security" | "legacy_flags" | "not_returned";
+}
+
+/**
+ * The documented Email Account field is the Connection Security choice
+ * (None, STARTTLS, SSL/TLS). Older schemas exposed enable_ssl and enable_tls
+ * booleans instead; anything else leaves the transport unverified.
+ */
+function classifyEmailConnectionSecurity(row: JsonRecord): EmailAccountSecurity {
+  const name = rowString(row, "name") ?? rowString(row, "sys_id") ?? "account";
+  const declared = rowString(row, "connection_security");
+  if (declared) {
+    const normalized = declared.toLowerCase();
+    const level: EmailConnectionSecurity = /starttls/.test(normalized)
+      ? "starttls"
+      : /ssl|tls/.test(normalized)
+        ? "ssl_tls"
+        : /none/.test(normalized)
+          ? "none"
+          : "unknown";
+    return { name, connection_security: declared, level, source: "connection_security" };
+  }
+  const ssl = rowBoolean(row, "enable_ssl");
+  const tls = rowBoolean(row, "enable_tls");
+  if (ssl === true) return { name, connection_security: "enable_ssl=true", level: "ssl_tls", source: "legacy_flags" };
+  if (tls === true) return { name, connection_security: "enable_tls=true", level: "starttls", source: "legacy_flags" };
+  if (ssl === false || tls === false) {
+    return { name, connection_security: `enable_ssl=${ssl ?? "absent"}, enable_tls=${tls ?? "absent"}`, level: "none", source: "legacy_flags" };
+  }
+  return { name, connection_security: null, level: "unknown", source: "not_returned" };
 }
 
 export function assessServicenowPlatformHardeningData(data: ServicenowHardeningData): ServicenowAssessmentResult {
@@ -1899,20 +1937,31 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     };
   });
 
-  const email = gatedFinding(18, [data.properties, data.emailAccounts], "Open System Mailboxes > Administration > Email Accounts and Email Properties; record TLS on each SMTP account, glide.smtp.auth, DKIM signing configuration, and notification security headers.", () => {
+  const email = gatedFinding(18, [data.properties, data.emailAccounts], "Open System Mailboxes > Administration > Email Accounts and record the Connection Security choice (SSL/TLS expected) on each active SMTP account; open Email Properties for glide.smtp.auth; record DKIM signing configuration and notification security headers.", () => {
     const smtpAuth = readProperty(data.properties, "glide.smtp.auth");
+    const smtpAuthDisabled = smtpAuth.exists && asBoolean(smtpAuth.value) === false;
     const smtpAccounts = data.emailAccounts.rows.filter((row) => /smtp/i.test(rowString(row, "type") ?? "") && rowBoolean(row, "active") !== false);
-    const withoutTls = smtpAccounts.filter((row) => rowBoolean(row, "enable_tls") !== true).map((row) => rowString(row, "name") ?? "account");
+    const classified = smtpAccounts.map(classifyEmailConnectionSecurity);
+    const byLevel = (level: EmailConnectionSecurity) => classified.filter((item) => item.level === level);
+    const insecure = byLevel("none");
+    const opportunistic = byLevel("starttls");
+    const unverified = byLevel("unknown");
+    const secure = byLevel("ssl_tls");
+    const names = (items: EmailAccountSecurity[]) => items.map((item) => item.name);
     const evidence: JsonRecord = {
       active_smtp_accounts: smtpAccounts.length,
-      smtp_accounts_without_tls: withoutTls,
+      smtp_connection_security: truncateList(classified),
+      smtp_accounts_ssl_tls: names(secure),
+      smtp_accounts_starttls: names(opportunistic),
+      smtp_accounts_none: names(insecure),
+      smtp_accounts_unverified: names(unverified),
       glide_smtp_auth: smtpAuth.exists ? smtpAuth.value : null,
       dkim_verified_via_api: false,
     };
-    if (withoutTls.length > 0 || (smtpAuth.exists && asBoolean(smtpAuth.value) === false)) {
+    if (insecure.length > 0 || smtpAuthDisabled) {
       return {
         status: "fail",
-        summary: `${withoutTls.length}/${smtpAccounts.length} active SMTP accounts do not enable TLS${smtpAuth.exists && asBoolean(smtpAuth.value) === false ? " and glide.smtp.auth=false" : ""}.`,
+        summary: `${insecure.length}/${smtpAccounts.length} active SMTP accounts use Connection Security = None${insecure.length > 0 ? ` (${names(insecure).join(", ")})` : ""}${smtpAuthDisabled ? " and glide.smtp.auth=false" : ""}; ServiceNow warns that None may expose data and recommends SSL/TLS.`,
         evidence,
       };
     }
@@ -1923,9 +1972,23 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
         evidence,
       };
     }
+    if (unverified.length > 0) {
+      return {
+        status: "manual",
+        summary: `Connection Security could not be read for ${unverified.length}/${smtpAccounts.length} active SMTP accounts (${names(unverified).join(", ")}): the connection_security column and the legacy enable_ssl and enable_tls flags were not returned, so the transport is neither assumed secure nor insecure. Confirm each account's Connection Security and DKIM manually.`,
+        evidence,
+      };
+    }
+    if (opportunistic.length > 0) {
+      return {
+        status: "warn",
+        summary: `${opportunistic.length}/${smtpAccounts.length} active SMTP accounts use STARTTLS (${names(opportunistic).join(", ")}); ServiceNow warns that STARTTLS may expose data and recommends SSL/TLS. DKIM signing and notification security headers still require manual confirmation.`,
+        evidence,
+      };
+    }
     return {
       status: "manual",
-      summary: `${smtpAccounts.length} active SMTP accounts enable TLS${smtpAuth.exists ? ` and glide.smtp.auth=${smtpAuth.value}` : ", but glide.smtp.auth has no row"}; DKIM signing and notification security headers are not exposed through the Table API and must be confirmed manually.`,
+      summary: `All ${smtpAccounts.length} active SMTP accounts use Connection Security = SSL/TLS${smtpAuth.exists ? ` and glide.smtp.auth=${smtpAuth.value}` : ", but glide.smtp.auth has no row"}; DKIM signing and notification security headers are not exposed through the Table API and must be confirmed manually.`,
       evidence,
     };
   });

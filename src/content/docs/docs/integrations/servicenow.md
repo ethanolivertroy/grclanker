@@ -92,7 +92,7 @@ Rows without a date (`last_login_time`, `expires`) are bucketed separately and n
 | 15 | Update set management | operations_governance | SNOW-15 | manual unless the update set inventory is proven visible; warn on in-progress sets or pending ACL, role, script, or property changes |
 | 16 | Debug mode verification | platform_hardening | SNOW-16 | fail when any `*debug*` property is true; manual when `sys_properties` visibility is unproven |
 | 17 | IP access restrictions | platform_hardening | SNOW-17 | fail when the IP Range Based Authentication plugin (`com.snc.ipauthenticator`) is inactive or absent from `sys_plugins`, or when no active `ip_access` rule exists (a missing `ip_access` table is treated as the plugin not being activated); warn when the plugin row is not visible or `glide.ip.authenticate.strict` is not true |
-| 18 | Email security | platform_hardening | SNOW-18 | fail when an active SMTP account lacks TLS or `glide.smtp.auth=false`; otherwise manual because DKIM and notification headers are not exposed through the API |
+| 18 | Email security | platform_hardening | SNOW-18 | reads the Connection Security choice (`connection_security`, falling back to the legacy `enable_ssl` and `enable_tls` flags): fail when an active SMTP account uses None or `glide.smtp.auth=false`; warn on STARTTLS (the documentation warns it may expose data); manual when the value is not returned (never assumed) or when every account uses SSL/TLS, because DKIM and notification headers are not exposed through the API |
 | 19 | MID Server security | operations_governance | SNOW-19 | fail on unvalidated MID Servers; warn when `mid.version.override` pins upgrades; manual for mutual authentication and allow lists, or "not applicable as observed" when no MID Server exists |
 | 20 | Plugin inventory and licensing | operations_governance | SNOW-20 | fail when High Security Settings, Contextual Security: Role Management V2, or Security Jump Start is inactive; otherwise manual for necessity review |
 
@@ -131,6 +131,7 @@ The script prints a skip message and exits 0 when no ServiceNow configuration is
 - Anti-CSRF token hardening: https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/anti-csrf-token.html
 - Restrict access to specific IP ranges plugin: https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-restrict-access-to-specific-ip-ranges-plugin.html
 - IP address access control (`ip_access` fields): https://www.servicenow.com/docs/r/platform-security/authentication/t_AccessControl.html
+- Email account Connection Security choices: https://www.servicenow.com/docs/r/platform-administration/t_ConfAltEmailConfServers.html
 - Configuring auditing for a table: https://www.servicenow.com/docs/r/platform-security/t_EnableAuditingForATable.html
 - Sys Audit table: https://www.servicenow.com/docs/r/platform-security/servicenow-ai-platform-security/c_UnderstandingTheSysAuditTable.html
 - Instance security best practices guide: https://www.servicenow.com/content/dam/servicenow-assets/public/en-us/doc-type/resource-center/white-paper/instance-security-best-practice.pdf
