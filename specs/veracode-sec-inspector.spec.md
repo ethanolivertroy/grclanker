@@ -406,6 +406,7 @@ Implemented in grclanker as a TypeScript native tool set (see "grclanker impleme
 - 17 of 20 controls are evaluated from API data: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 19
 - 3 of 20 controls always render as `manual` with the evidence a human must collect: 11 (prescan module coverage lives only in the XML `getprescanresults.do` API), 14 (Pipeline Scan results are not persisted on application profiles), 20 (the Collections API is not in the published REST reference; business-unit grouping is provided as supporting evidence)
 - Verdict safety: forbidden or errored endpoints yield `manual`, empty inventories never pass by default, items without dates are bucketed separately and cap at `warn`, unlicensed SCA or Dynamic Analysis renders as `manual`, and partial views (pagination truncation, the `max_applications` sampling cap, team-scoped visibility) downgrade `pass` to `warn` with seen and total counts
+- Schema fidelity: control 1 judges the latest STATIC entry in `scans[]` (published status and `modified_date`), control 4 judges the strictest `scan_frequency_rules` across every assigned policy per scan type plus the business criticality tier (VERY_HIGH every 7 days, other tiers every 31 days by default), control 16 counts findings carrying an `annotations[].action` FP mitigation, control 18 reads `linked_projects` from the documented `LinkedProjects` response, users are listed with `detailed`, `include_roles`, and `include_teams`, and teams with `all_for_org=true` (a refused flag is recorded and the member-only list is treated as a partial view)
 - Regression tests in `cli/tests/veracode.test.mjs` and a live smoke script that skips cleanly without credentials
 
 ### Deviations from the original spec
@@ -416,7 +417,8 @@ Implemented in grclanker as a TypeScript native tool set (see "grclanker impleme
 - The Collections API listed in section 2 is not called because it is not in the published REST reference.
 - Region `api.veracode.us` (US federal) was added to the documented base URLs.
 - Per-application calls (sandboxes, findings, summary reports, SCA project links) are sampled up to `max_applications` (default 100) and the verdict flags the partial view instead of passing on it.
-- Thresholds are tool arguments (`max_scan_age_days`, `max_fp_rate_percent`, `max_flaw_density_per_kloc`, `sca_cvss_threshold`, `max_admins`, `inactive_days`, `max_credential_age_days`, `max_unrestricted_users`) rather than CLI flags or a YAML file.
+- Thresholds are tool arguments (`max_scan_age_days`, `critical_scan_interval_days`, `standard_scan_interval_days`, `max_fp_rate_percent`, `max_flaw_density_per_kloc`, `sca_cvss_threshold`, `max_admins`, `inactive_days`, `max_credential_age_days`, `max_unrestricted_users`) rather than CLI flags or a YAML file.
+- Control 16 uses the enumerated `annotations[].action` value `FP` as the false positive signal because `finding_status.resolution` is an unenumerated string in the published Findings reference; the resolution value is exported as evidence only.
 - Findings are exported as JSON and Markdown inside the audit bundle; the CSV, HTML, SARIF, and TUI outputs from the Go design were not built.
 
 ### What remains
