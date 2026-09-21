@@ -1967,6 +1967,7 @@ export function assessNewrelicAccessControlData(
   const classifiable = productionIds.size > 0 && nonproductionIds.size > 0;
   const crossEnvironmentUsers = classifiable
     ? access.filter((entry) => {
+      if (entry.admin) return false;
       const ids = [...entry.accountIds];
       const touchesProduction = entry.organizationScoped || ids.some((id) => productionIds.has(id));
       const touchesNonproduction = entry.organizationScoped || ids.some((id) => nonproductionIds.has(id));
@@ -2097,12 +2098,13 @@ export function assessNewrelicAccessControlData(
         : !classifiable
           ? `Account names did not match both the production pattern /${productionPattern.source}/ and the non-production pattern /${nonproductionPattern.source}/. Classify the ${accounts.length} accounts manually or pass production_account_pattern and nonproduction_account_pattern.`
           : crossEnvironmentUsers.length > 0
-            ? `${crossEnvironmentUsers.length} users can reach both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`
-            : `No users hold access to both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`,
+            ? `${crossEnvironmentUsers.length} non-admin users can reach both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`
+            : `No non-admin users hold access to both production (${productionAccounts.length}) and non-production (${nonproductionAccounts.length}) accounts.`,
     {
       production_accounts: sample(productionAccounts.map(accountLabel)),
       nonproduction_accounts: sample(nonproductionAccounts.map(accountLabel)),
       cross_environment_users: sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user))),
+      admin_users_excluded: adminUserIds.size,
       manual_evidence: classifiable ? undefined : "Account inventory with environment classification from Administration > Access Management > Accounts.",
     },
   ));
