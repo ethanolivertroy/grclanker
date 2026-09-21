@@ -238,8 +238,10 @@ function partialClient() {
 }
 
 const SECRET_PEM = "-----BEGIN RSA PRIVATE KEY-----\nFAKE_PEM_BODY_1\n-----END RSA PRIVATE KEY-----";
+/** The documented OCI request-signing Authorization header form (signingrequests.htm), with fake identifiers. */
+const SIGNING_HEADER = 'Signature version="1",keyId="ocid1.tenancy.oc1..FAKE_TENANCY_1/ocid1.user.oc1..FAKE_USER_1/FAKE_FINGERPRINT_1",algorithm="rsa-sha256",headers="(request-target) date host",signature="FAKE_SIGNATURE_BASE64_1=="';
 const SECRET_ERROR = new Error(
-  `Command failed: oci cloud-guard problem list --config-file /tmp/oci/config\nServiceError: 401 NotAuthenticated: Signature FAKE_SIGNATURE_1abcdef key_file=/tmp/oci/FAKE_KEY_PATH_1.pem token=FAKE_ERROR_TOKEN_1 ${SECRET_PEM}`,
+  `Command failed: oci cloud-guard problem list --config-file /tmp/oci/config\nServiceError: 401 NotAuthenticated: Authorization: ${SIGNING_HEADER}\nDebug: keyId="ocid1.tenancy.oc1..FAKE_TENANCY_2/ocid1.user.oc1..FAKE_USER_2/FAKE_FINGERPRINT_2" signature="FAKE_SIGNATURE_BASE64_2==" Bearer FAKE_BEARER_1abcdefgh Signature FAKE_SIGNATURE_BARE_1abcdef key_file=/tmp/oci/FAKE_KEY_PATH_1.pem token=FAKE_ERROR_TOKEN_1 ${SECRET_PEM}`,
 );
 
 /**
@@ -520,7 +522,7 @@ test("compartment cap withholds pass and records truncation", async () => {
   const compute = await assessOciComputeAndStorage(client, { maxCompartments: 1 });
   for (const item of compute.findings) {
     assert.notEqual(item.status, "pass");
-    assert.equal(item.evidence.truncated, true);
+    assert.equal(item.evidence.compartments_truncated, true);
     assert.equal(item.evidence.compartments_seen, 1);
     assert.equal(item.evidence.compartments_total, 3);
   }
@@ -913,7 +915,7 @@ test("exportOciAuditBundle records partial collection in _errors.log", async () 
 });
 
 test("redaction keeps field names, drops credential-bearing values, and scrubs key material from text", () => {
-  for (const name of ["accessUri", "keyValue", "token", "authToken", "key", "secret", "clientSecret", "password", "db_password", "passphrase", "privateKey", "key_file", "keyMaterial", "wrappedKey", "plaintext", "ciphertext", "authorization", "userData", "security_token_file"]) {
+  for (const name of ["accessUri", "keyValue", "token", "authToken", "key", "secret", "clientSecret", "customerSecretKey", "password", "db_password", "passphrase", "privateKey", "key_file", "keyMaterial", "wrappedKey", "plaintext", "plaintextChecksum", "ciphertext", "authorization", "userData", "security_token_file", "requestSignature"]) {
     assert.equal(isSensitiveFieldName(name), true, name);
   }
   for (const name of ["passwordPolicy", "password_policy", "kmsKeyId", "keys_seen", "weak_keys", "credentials_seen", "credential_cap_hit", "stale_credentials", "isMfaActivated", "tokens_seen"]) {
@@ -935,7 +937,12 @@ test("redaction keeps field names, drops credential-bearing values, and scrubs k
   assert.doesNotMatch(text, /FAKE_/);
   assert.match(text, /\[redacted key material\]/);
   assert.match(text, /token=\[redacted\]/);
-  assert.match(text, /Signature \[redacted\]/);
+  assert.match(text, /Authorization: Signature \[redacted\]/);
+  assert.match(text, /Debug: keyId=\[redacted\] signature=\[redacted\] Bearer \[redacted\] Signature \[redacted\]/);
+  assert.doesNotMatch(text, /rsa-sha256|version="1"/, "the parameter list is redacted as a whole");
+  const headerOnly = redactSensitiveText(`Authorization: ${SIGNING_HEADER}`);
+  assert.equal(headerOnly, "Authorization: Signature [redacted]");
+  assert.equal(redactSensitiveText("kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk"), "kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk", "KMS key OCIDs are not signing keyIds");
   assert.equal(redactSensitiveText("https://objectstorage.example/p/FAKE_ACCESS_URI_1/n/ns/b/logs/o/"), "https://objectstorage.example/p/[redacted]/n/ns/b/logs/o/");
   assert.deepEqual(projectCompartmentSnapshot({ ...PROD, description: "secret", freeformTags: { password: "x" } }), {
     id: PROD.id,
@@ -969,6 +976,12 @@ test("rule 9: bundle files, the zip, and tool outputs never carry credential-bea
   assert.match(errorsLog, /token=\[redacted\]/);
   assert.match(errorsLog, /key_file=\[redacted\]/);
   assert.match(errorsLog, /--config-file \[redacted\]/);
+  assert.match(errorsLog, /Authorization: Signature \[redacted\]/);
+  assert.match(errorsLog, /keyId=\[redacted\] signature=\[redacted\]/);
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    assert.doesNotMatch(content, /FAKE_SIGNATURE_BASE64|FAKE_TENANCY_|FAKE_FINGERPRINT_|rsa-sha256/, `${relative(result.outputDir, file)} leaked the signing header`);
+  }
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.config_file, REDACTED_MARKER);
   const access = JSON.parse(readFileSync(join(result.outputDir, "core_data", "access.json"), "utf8"));
@@ -982,6 +995,7 @@ test("rule 9: bundle files, the zip, and tool outputs never carry credential-bea
   assert.equal(entries.filter((entry) => !entry.name.endsWith("/")).length, files.length);
   for (const entry of entries) {
     assert.doesNotMatch(entry.content, /FAKE_/, `zip entry ${entry.name} leaked a fake secret`);
+    assert.doesNotMatch(entry.content, /FAKE_SIGNATURE_BASE64|FAKE_TENANCY_|rsa-sha256/, `zip entry ${entry.name} leaked the signing header`);
   }
 });
 

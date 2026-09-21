@@ -420,6 +420,7 @@ const SENSITIVE_EXACT_KEYS = new Set([
   "password",
   "passwordhash",
   "plaintext",
+  "plaintextchecksum",
   "privatekey",
   "privatekeypem",
   "secret",
@@ -436,15 +437,23 @@ const SENSITIVE_EXACT_KEYS = new Set([
   "wrappedkey",
 ]);
 
-const SENSITIVE_KEY_SUFFIXES = ["accessuri", "keymaterial", "passphrase", "password", "privatekey", "secret", "token", "wrappedkey"];
+const SENSITIVE_KEY_SUFFIXES = ["accessuri", "keymaterial", "passphrase", "password", "privatekey", "secret", "secretkey", "signature", "token", "wrappedkey"];
 
 const SENSITIVE_TEXT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
   { pattern: /-----BEGIN[^-]*-----[\s\S]*?-----END[^-]*-----/g, replacement: "[redacted key material]" },
   { pattern: /-----BEGIN[^-]*-----[\s\S]*/g, replacement: "[redacted key material]" },
   { pattern: /\/p\/[A-Za-z0-9_+/=-]+\/n\//g, replacement: "/p/[redacted]/n/" },
+  /**
+   * OCI request signing always emits the parameter-list form
+   * `Signature version="1",keyId="<tenancy>/<user>/<fingerprint>",algorithm="rsa-sha256",headers="...",signature="<base64>"`
+   * (https://docs.oracle.com/en-us/iaas/Content/API/Concepts/signingrequests.htm); the whole list is
+   * redacted because keyId identifies the tenancy, user, and key fingerprint and signature is the credential.
+   */
+  { pattern: /\bSignature\s+[A-Za-z]+\s*=\s*"[^"]*"(?:\s*,\s*[A-Za-z]+\s*=\s*"[^"]*")*/g, replacement: "Signature [redacted]" },
   { pattern: /\b(Signature|Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1 [redacted]" },
+  { pattern: /\b(signature|keyId)\s*=\s*("[^"]*"|'[^']*'|[^\s,;]+)/gi, replacement: `$1=${REDACTED_MARKER}` },
   { pattern: /--config-file\s+("[^"]*"|'[^']*'|\S+)/g, replacement: `--config-file ${REDACTED_MARKER}` },
-  { pattern: /\b([A-Za-z_-]*(?:token|secret|password|passphrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)["']?\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
+  { pattern: /\b([A-Za-z_-]*(?:token|secret|signature|password|passphrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)["']?\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
 ];
 
 function normalizeFieldName(key: string): string {
@@ -891,7 +900,7 @@ function scopeEvidence<T>(collection: OciScopedCollection<T>): JsonRecord {
     compartments_seen: collection.seenCompartments,
     compartments_total: collection.totalCompartments,
     denied_compartments: collection.deniedCompartments.slice(0, 25),
-    truncated: collection.truncated,
+    compartments_truncated: collection.truncated,
   };
 }
 
