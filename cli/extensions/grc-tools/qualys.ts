@@ -40,7 +40,14 @@ const DEFAULT_MIN_AUTH_SCAN_PERCENT = 80;
 const DEFAULT_MIN_AGENT_COVERAGE_PERCENT = 50;
 const DEFAULT_MAX_MANAGERS = 5;
 const DEFAULT_MAX_RATE_LIMIT_WAIT_MS = 30_000;
+const DEFAULT_LIST_LIMIT = 5000;
+const DEFAULT_TAG_LIMIT = 2000;
 const KNOWLEDGE_BASE_QID_BATCH = 200;
+const KNOWLEDGE_BASE_MAX_QIDS = 2000;
+const STALE_CONNECTOR_DAYS = 7;
+const STALE_AGENT_DAYS = 7;
+const STALE_WAS_AUTH_DAYS = 180;
+const INACTIVE_USER_DAYS = 90;
 const BROAD_EXCLUSION_ADDRESS_COUNT = 256;
 const USER_AGENT_HEADER = "grclanker";
 
@@ -91,6 +98,7 @@ export interface QualysAccessSurface {
   endpoint: string;
   status: "readable" | "not_readable" | "module_unavailable";
   count?: number;
+  truncation?: string;
   error?: string;
 }
 
@@ -101,6 +109,7 @@ export interface QualysAccessCheckResult {
   authMode: QualysAuthMode;
   surfaces: QualysAccessSurface[];
   unavailableModules: string[];
+  viewScope: QualysViewScope;
   rateLimit: JsonRecord;
   notes: string[];
   recommendedNextStep: string;
@@ -144,6 +153,32 @@ export interface QualysAssessmentOptions {
   slaCriticalDays?: number;
   slaHighDays?: number;
   slaMediumDays?: number;
+}
+
+export interface QualysListResult {
+  items: JsonRecord[];
+  truncated: boolean;
+  truncationReason?: string;
+  pages: number;
+}
+
+export type QualysListLike = JsonRecord[] | QualysListResult;
+
+export interface QualysViewScope {
+  verified: boolean;
+  partial: boolean;
+  roles: string[];
+  scopeTags: string[];
+  source: "user_search" | "activity_log" | "unverified";
+  note: string;
+}
+
+export interface QualysSourceStatus {
+  name: string;
+  status: "readable" | "unreadable" | "truncated";
+  count: number;
+  cap?: number;
+  reason?: string;
 }
 
 export interface XmlNode {
@@ -897,34 +932,44 @@ export class QualysApiClient {
     query: JsonRecord,
     elementName: string,
     options: { limit?: number; maxPages?: number } = {},
-  ): Promise<JsonRecord[]> {
+  ): Promise<QualysListResult> {
     const limit = clampNumber(options.limit, DEFAULT_HOST_LIMIT, 1, 1_000_000);
     const maxPages = clampNumber(options.maxPages, DEFAULT_MAX_PAGES, 1, 500);
     const items: JsonRecord[] = [];
     let nextUrl: string | undefined = this.buildUrl(path, query);
     let pages = 0;
+    let dropped = false;
     while (nextUrl && items.length < limit && pages < maxPages) {
       const document: XmlNode = await this.getXml(nextUrl);
       pages += 1;
       const pageItems = xmlRecords(document, elementName);
-      items.push(...pageItems.slice(0, limit - items.length));
+      const room = limit - items.length;
+      if (pageItems.length > room) dropped = true;
+      items.push(...pageItems.slice(0, room));
       const warning = findXmlElement(document, "WARNING");
       nextUrl = warning ? xmlText(findXmlElement(warning, "URL")) : undefined;
       if (pageItems.length === 0) break;
     }
-    return items;
+    let truncationReason: string | undefined;
+    if (dropped || (nextUrl && items.length >= limit)) {
+      truncationReason = `item cap ${limit} reached with more records available`;
+    } else if (nextUrl && pages >= maxPages) {
+      truncationReason = `page cap ${maxPages} reached with a WARNING/URL continuation not followed`;
+    }
+    return listResult(items, pages, truncationReason);
   }
 
   async searchQps(
     path: string,
     criteria: Array<{ field: string; operator: string; value?: string }> = [],
     options: { limit?: number; pageSize?: number; verbose?: boolean; maxPages?: number } = {},
-  ): Promise<JsonRecord[]> {
+  ): Promise<QualysListResult> {
     const limit = clampNumber(options.limit, DEFAULT_HOST_LIMIT, 1, 1_000_000);
     const pageSize = clampNumber(options.pageSize, DEFAULT_QPS_PAGE_SIZE, 1, 1000);
     const maxPages = clampNumber(options.maxPages, DEFAULT_MAX_PAGES, 1, 500);
     const items: JsonRecord[] = [];
     let lastId: string | undefined;
+    let hasMore = false;
     let pages = 0;
     while (items.length < limit && pages < maxPages) {
       const activeCriteria = [...criteria];
@@ -945,33 +990,44 @@ export class QualysApiClient {
         return asObject(values[0]) ?? entry;
       });
       items.push(...data);
-      const hasMore = asBoolean(response.hasMoreRecords) ?? false;
+      hasMore = asBoolean(response.hasMoreRecords) ?? false;
       lastId = asString(response.lastId);
       if (!hasMore || !lastId || data.length === 0) break;
     }
-    return items.slice(0, limit);
+    let truncationReason: string | undefined;
+    if (hasMore && !lastId) {
+      truncationReason = "hasMoreRecords was true but no lastId was returned to continue paging";
+    } else if (hasMore && items.length >= limit) {
+      truncationReason = `item cap ${limit} reached with hasMoreRecords true`;
+    } else if (hasMore && pages >= maxPages) {
+      truncationReason = `page cap ${maxPages} reached with hasMoreRecords true`;
+    } else if (items.length > limit) {
+      truncationReason = `item cap ${limit} reached`;
+    }
+    return listResult(items.slice(0, limit), pages, truncationReason);
   }
 
   private lookbackStart(days?: number): string {
     return isoDaysAgo(clampNumber(days, this.config.lookbackDays, 1, 3650), this.now());
   }
 
-  async listScheduledScans(): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/schedule/scan/", { action: "list", show_notifications: 0 });
-    return xmlRecords(document, "SCHEDULE_SCAN");
+  private async listSingleXml(path: string, query: JsonRecord, elementName: string): Promise<QualysListResult> {
+    return this.listXml(path, query, elementName, { limit: DEFAULT_LIST_LIMIT });
   }
 
-  async listScans(lookbackDays?: number): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/scan/", {
-      action: "list",
-      launched_after_datetime: this.lookbackStart(lookbackDays),
-      show_ags: 1,
-      show_op: 1,
-    });
-    return xmlRecords(document, "SCAN");
+  async listScheduledScans(): Promise<QualysListResult> {
+    return this.listSingleXml("/api/2.0/fo/schedule/scan/", { action: "list", show_notifications: 0 }, "SCHEDULE_SCAN");
   }
 
-  async listHosts(limit = DEFAULT_HOST_LIMIT): Promise<JsonRecord[]> {
+  async listScans(lookbackDays?: number): Promise<QualysListResult> {
+    return this.listSingleXml(
+      "/api/2.0/fo/scan/",
+      { action: "list", launched_after_datetime: this.lookbackStart(lookbackDays), show_ags: 1, show_op: 1 },
+      "SCAN",
+    );
+  }
+
+  async listHosts(limit = DEFAULT_HOST_LIMIT): Promise<QualysListResult> {
     return this.listXml(
       "/api/2.0/fo/asset/host/",
       { action: "list", details: "All", show_tags: 1, truncation_limit: Math.min(limit, 1000) },
@@ -980,52 +1036,53 @@ export class QualysApiClient {
     );
   }
 
-  async listOptionProfiles(): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/subscription/option_profile/", { action: "list" });
-    return xmlRecords(document, "OPTION_PROFILE");
+  async listOptionProfiles(): Promise<QualysListResult> {
+    return this.listSingleXml("/api/2.0/fo/subscription/option_profile/", { action: "list" }, "OPTION_PROFILE");
   }
 
-  async listExcludedIps(): Promise<JsonRecord[]> {
+  async listExcludedIps(): Promise<QualysListResult> {
     const document = await this.getXml("/api/2.0/fo/asset/excluded_ip/", { action: "list" });
     const ipSet = findXmlElement(document, "IP_SET");
-    if (!ipSet) return [];
-    return ipSet.children
-      .filter((child) => child.name === "IP" || child.name === "IP_RANGE")
-      .map((child) => ({ type: child.name === "IP" ? "ip" : "range", value: child.text.trim(), ...child.attributes }));
+    const items = ipSet
+      ? ipSet.children
+        .filter((child) => child.name === "IP" || child.name === "IP_RANGE")
+        .map((child) => ({ type: child.name === "IP" ? "ip" : "range", value: child.text.trim(), ...child.attributes }))
+      : [];
+    return listResult(items, 1, unfollowedWarning(document));
   }
 
-  async listAssetGroups(): Promise<JsonRecord[]> {
+  async listAssetGroups(): Promise<QualysListResult> {
     return this.listXml(
       "/api/2.0/fo/asset/group/",
       { action: "list", show_attributes: "ALL", truncation_limit: 500 },
       "ASSET_GROUP",
-      { limit: 5000 },
+      { limit: DEFAULT_LIST_LIMIT },
     );
   }
 
-  async listAppliances(): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/appliance/", { action: "list", output_mode: "full" });
-    return xmlRecords(document, "APPLIANCE");
+  async listAppliances(): Promise<QualysListResult> {
+    return this.listSingleXml("/api/2.0/fo/appliance/", { action: "list", output_mode: "full" }, "APPLIANCE");
   }
 
-  async listAuthRecordSummary(): Promise<JsonRecord[]> {
+  async listAuthRecordSummary(): Promise<QualysListResult> {
     const document = await this.getXml("/api/2.0/fo/auth/", { action: "list" });
     const container = findXmlElement(document, "AUTH_RECORDS");
-    if (!container) return [];
-    return container.children
-      .filter((child) => child.name.startsWith("AUTH_"))
-      .map((child) => ({
-        type: child.name.replace(/^AUTH_/, "").toLowerCase(),
-        count: findXmlElements(child, "ID").length + findXmlElements(child, "ID_RANGE").length,
-      }));
+    const items = container
+      ? container.children
+        .filter((child) => child.name.startsWith("AUTH_"))
+        .map((child) => ({
+          type: child.name.replace(/^AUTH_/, "").toLowerCase(),
+          count: findXmlElements(child, "ID").length + findXmlElements(child, "ID_RANGE").length,
+        }))
+      : [];
+    return listResult(items, 1, unfollowedWarning(document));
   }
 
-  async listCompliancePolicies(): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/compliance/policy/", { action: "list", details: "Basic" });
-    return xmlRecords(document, "POLICY");
+  async listCompliancePolicies(): Promise<QualysListResult> {
+    return this.listSingleXml("/api/2.0/fo/compliance/policy/", { action: "list", details: "Basic" }, "POLICY");
   }
 
-  async listDetections(limit = DEFAULT_DETECTION_LIMIT): Promise<JsonRecord[]> {
+  async listDetections(limit = DEFAULT_DETECTION_LIMIT): Promise<QualysListResult> {
     const hosts = await this.listXml(
       "/api/2.0/fo/asset/host/vm/detection/",
       {
@@ -1040,49 +1097,60 @@ export class QualysApiClient {
       { limit },
     );
     const detections: JsonRecord[] = [];
-    for (const host of hosts) {
+    let cut = false;
+    for (const host of hosts.items) {
       for (const detection of pathRecords(host, "DETECTION_LIST", "DETECTION")) {
+        if (detections.length >= limit) {
+          cut = true;
+          break;
+        }
         detections.push({ host_id: asString(host.ID), ip: asString(host.IP), ...detection });
-        if (detections.length >= limit) return detections;
       }
+      if (cut) break;
     }
-    return detections;
+    const truncationReason = hosts.truncationReason ?? (cut ? `detection cap ${limit} reached with more detections available` : undefined);
+    return listResult(detections, hosts.pages, truncationReason);
   }
 
-  async listKnowledgeBase(qids: string[]): Promise<JsonRecord[]> {
-    const unique = uniqueStrings(qids).slice(0, KNOWLEDGE_BASE_QID_BATCH);
-    if (unique.length === 0) return [];
-    const document = await this.getXml("/api/2.0/fo/knowledge_base/vuln/", {
-      action: "list",
-      details: "Basic",
-      ids: unique.join(","),
-    });
-    return xmlRecords(document, "VULN");
+  async listKnowledgeBase(qids: string[]): Promise<QualysListResult> {
+    const unique = uniqueStrings(qids);
+    const items: JsonRecord[] = [];
+    let pages = 0;
+    for (let index = 0; index < Math.min(unique.length, KNOWLEDGE_BASE_MAX_QIDS); index += KNOWLEDGE_BASE_QID_BATCH) {
+      const batch = unique.slice(index, index + KNOWLEDGE_BASE_QID_BATCH);
+      const document = await this.getXml("/api/2.0/fo/knowledge_base/vuln/", { action: "list", details: "Basic", ids: batch.join(",") });
+      pages += 1;
+      items.push(...xmlRecords(document, "VULN"));
+    }
+    const truncationReason = unique.length > KNOWLEDGE_BASE_MAX_QIDS
+      ? `knowledge base lookup capped at ${KNOWLEDGE_BASE_MAX_QIDS} of ${unique.length} QIDs`
+      : undefined;
+    return listResult(items, pages, truncationReason);
   }
 
-  async listScheduledReports(): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/schedule/report/", { action: "list" });
-    return xmlRecords(document, "REPORT");
+  async listScheduledReports(): Promise<QualysListResult> {
+    return this.listSingleXml("/api/2.0/fo/schedule/report/", { action: "list", is_active: 1 }, "REPORT");
   }
 
-  async listReports(): Promise<JsonRecord[]> {
-    const document = await this.getXml("/api/2.0/fo/report/", { action: "list" });
-    return xmlRecords(document, "REPORT");
+  async listReports(): Promise<QualysListResult> {
+    return this.listSingleXml("/api/2.0/fo/report/", { action: "list" }, "REPORT");
   }
 
-  async listActivityLog(lookbackDays?: number): Promise<JsonRecord[]> {
+  async listActivityLog(lookbackDays?: number): Promise<QualysListResult> {
     const text = await this.getText("/api/2.0/fo/activity_log/", {
       action: "list",
       since_datetime: this.lookbackStart(lookbackDays),
+      truncation_limit: DEFAULT_LIST_LIMIT,
     });
-    return csvToRecords(text);
+    const items = csvToRecords(text);
+    return listResult(items, 1, items.length >= DEFAULT_LIST_LIMIT ? `activity log truncation_limit ${DEFAULT_LIST_LIMIT} reached` : undefined);
   }
 
-  async searchUsers(): Promise<JsonRecord[]> {
-    return this.searchQps("/qps/rest/2.0/search/am/user/", [], { pageSize: 500 });
+  async searchUsers(): Promise<QualysListResult> {
+    return this.searchQps("/qps/rest/2.0/search/am/user/", [], { pageSize: 500, limit: DEFAULT_LIST_LIMIT });
   }
 
-  async searchCloudAgents(limit = DEFAULT_HOST_LIMIT): Promise<JsonRecord[]> {
+  async searchCloudAgents(limit = DEFAULT_HOST_LIMIT): Promise<QualysListResult> {
     return this.searchQps(
       "/qps/rest/2.0/search/am/hostasset",
       [{ field: "tagName", operator: "EQUALS", value: "Cloud Agent" }],
@@ -1090,36 +1158,61 @@ export class QualysApiClient {
     );
   }
 
-  async searchConnectors(): Promise<JsonRecord[]> {
-    return this.searchQps("/qps/rest/2.0/search/am/assetdataconnector", [], { pageSize: 100 });
+  async searchConnectors(): Promise<QualysListResult> {
+    return this.searchQps("/qps/rest/2.0/search/am/assetdataconnector", [], { pageSize: 100, limit: DEFAULT_LIST_LIMIT });
   }
 
-  async searchTags(limit = 2000): Promise<JsonRecord[]> {
+  async searchTags(limit = DEFAULT_TAG_LIMIT): Promise<QualysListResult> {
     return this.searchQps("/qps/rest/2.0/search/am/tag", [], { limit });
   }
 
-  async searchWebApps(): Promise<JsonRecord[]> {
-    return this.searchQps("/qps/rest/3.0/search/was/webapp", [], { pageSize: 100, verbose: true });
+  async searchWebApps(): Promise<QualysListResult> {
+    return this.searchQps("/qps/rest/3.0/search/was/webapp", [], { pageSize: 100, verbose: true, limit: DEFAULT_LIST_LIMIT });
   }
 
-  async searchWasScans(lookbackDays?: number): Promise<JsonRecord[]> {
+  async searchWasScans(lookbackDays?: number): Promise<QualysListResult> {
     return this.searchQps(
       "/qps/rest/3.0/search/was/wasscan",
       [
         { field: "launchedDate", operator: "GREATER", value: this.lookbackStart(lookbackDays) },
         { field: "type", operator: "EQUALS", value: "VULNERABILITY" },
       ],
-      { pageSize: 100 },
+      { pageSize: 100, limit: DEFAULT_LIST_LIMIT },
     );
   }
 
-  async searchWasAuthRecords(): Promise<JsonRecord[]> {
-    return this.searchQps("/qps/rest/3.0/search/was/webappauthrecord", [], { pageSize: 100 });
+  async searchWasAuthRecords(): Promise<QualysListResult> {
+    return this.searchQps("/qps/rest/3.0/search/was/webappauthrecord", [], { pageSize: 100, limit: DEFAULT_LIST_LIMIT });
   }
 
-  async searchWasSchedules(): Promise<JsonRecord[]> {
-    return this.searchQps("/qps/rest/3.0/search/was/wasscanschedule", [], { pageSize: 100 });
+  async searchWasSchedules(): Promise<QualysListResult> {
+    return this.searchQps("/qps/rest/3.0/search/was/wasscanschedule", [], { pageSize: 100, limit: DEFAULT_LIST_LIMIT });
   }
+}
+
+function listResult(items: JsonRecord[], pages = 1, truncationReason?: string): QualysListResult {
+  return { items, truncated: Boolean(truncationReason), truncationReason, pages };
+}
+
+function unfollowedWarning(document: XmlNode): string | undefined {
+  const warning = findXmlElement(document, "WARNING");
+  const url = warning ? xmlText(findXmlElement(warning, "URL")) : undefined;
+  return url ? "WARNING/URL continuation present and not followed" : undefined;
+}
+
+export function normalizeList(value: unknown): QualysListResult {
+  if (Array.isArray(value)) return listResult(value.filter((item): item is JsonRecord => Boolean(asObject(item))));
+  const record = asObject(value);
+  if (record && Array.isArray(record.items)) {
+    const truncationReason = asString(record.truncationReason);
+    return {
+      items: record.items.filter((item): item is JsonRecord => Boolean(asObject(item))),
+      truncated: asBoolean(record.truncated) === true || Boolean(truncationReason),
+      truncationReason,
+      pages: asNumber(record.pages) ?? 1,
+    };
+  }
+  return listResult([]);
 }
 
 export type QualysDataClient = Pick<
@@ -1149,24 +1242,110 @@ export type QualysDataClient = Pick<
   | "searchWasSchedules"
 >;
 
-interface Collected<T> {
-  data: T;
+interface Collected {
+  name: string;
+  data: JsonRecord[];
   error?: string;
+  moduleUnavailable: boolean;
+  truncated: boolean;
+  truncationReason?: string;
+  cap?: number;
 }
 
-async function collect<T>(
+async function collect(
   name: string,
-  load: () => Promise<T>,
-  fallback: T,
+  load: () => Promise<QualysListLike>,
   errors: string[],
-): Promise<Collected<T>> {
+  cap?: number,
+): Promise<Collected> {
   try {
-    return { data: await load() };
+    const list = normalizeList(await load());
+    let truncationReason = list.truncationReason;
+    if (!truncationReason && cap !== undefined && list.items.length >= cap) {
+      truncationReason = `returned ${list.items.length} records, reaching the ${cap} record cap`;
+    }
+    return { name, data: list.items, moduleUnavailable: false, truncated: Boolean(truncationReason), truncationReason, cap };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     errors.push(`${name}: ${message}`);
-    return { data: fallback, error: message };
+    return { name, data: [], error: message, moduleUnavailable: isModuleUnavailableError(message), truncated: false, cap };
   }
+}
+
+function emptyCollected(name: string): Collected {
+  return { name, data: [], moduleUnavailable: false, truncated: false };
+}
+
+function shortenMessage(message: string, length = 160): string {
+  return message.replace(/\s+/g, " ").trim().slice(0, length);
+}
+
+function describeSource(source: Collected): QualysSourceStatus {
+  if (source.error) {
+    return { name: source.name, status: "unreadable", count: 0, cap: source.cap, reason: shortenMessage(source.error) };
+  }
+  if (source.truncated) {
+    return { name: source.name, status: "truncated", count: source.data.length, cap: source.cap, reason: source.truncationReason };
+  }
+  return { name: source.name, status: "readable", count: source.data.length, cap: source.cap };
+}
+
+function unverifiedScope(note: string): QualysViewScope {
+  return { verified: false, partial: false, roles: [], scopeTags: [], source: "unverified", note };
+}
+
+function roleGrantsFullView(roles: string[]): boolean {
+  return roles.some((role) => /^manager$|super ?user/i.test(role.trim()));
+}
+
+export function resolveViewScope(config: QualysResolvedConfig, users: Collected, activity?: Collected): QualysViewScope {
+  const username = config.username?.trim().toLowerCase();
+  if (!username) {
+    return unverifiedScope("API user role not verified: bearer token authentication does not expose the username.");
+  }
+  const self = users.error
+    ? undefined
+    : users.data.find((user) => (asString(user.username) ?? "").trim().toLowerCase() === username);
+  if (self) {
+    const roles = userRoles(self);
+    const scopeTags = pathRecords(self, "scopeTags", "list")
+      .flatMap((entry) => asRecords(entry.TagData ?? entry))
+      .map((tag) => asString(tag.name))
+      .filter((name): name is string => Boolean(name));
+    const partial = !roleGrantsFullView(roles) || scopeTags.length > 0;
+    return {
+      verified: true,
+      partial,
+      roles,
+      scopeTags,
+      source: "user_search",
+      note: partial
+        ? `API user ${config.username} holds role ${roles.join(", ") || "unknown"}${scopeTags.length > 0 ? ` scoped to tags ${scopeTags.join(", ")}` : ""}, so list endpoints return only the assets and objects that role can see.`
+        : `API user ${config.username} holds the Manager role and sees the whole subscription.`,
+    };
+  }
+  const activityRoles = activity && !activity.error
+    ? uniqueStrings(activity.data
+      .filter((entry) => (asString(entry.user_name) ?? "").trim().toLowerCase() === username)
+      .map((entry) => asString(entry.user_role)))
+    : [];
+  if (activityRoles.length > 0) {
+    const partial = !roleGrantsFullView(activityRoles);
+    return {
+      verified: true,
+      partial,
+      roles: activityRoles,
+      scopeTags: [],
+      source: "activity_log",
+      note: partial
+        ? `Activity log records API user ${config.username} with role ${activityRoles.join(", ")}, so list endpoints return only the assets and objects that role can see.`
+        : `Activity log records API user ${config.username} with the Manager role.`,
+    };
+  }
+  if (users.error) {
+    return unverifiedScope(`API user role not verified: user search failed (${shortenMessage(users.error, 100)}).`);
+  }
+  return unverifiedScope(`API user ${config.username} was not returned by the user search (Managers and Super Users are hidden from it), so role scope was not verified.`);
 }
 
 function finding(
@@ -1188,14 +1367,64 @@ function finding(
   };
 }
 
-function unavailableFinding(control: number, severity: QualysFindingSeverity, error: string, manualEvidence: string): QualysFinding {
-  return finding(
-    control,
-    severity,
-    "manual",
-    `The Qualys API surface needed for this control was not readable (${error.replace(/\s+/g, " ").slice(0, 160)}). Collect manually: ${manualEvidence}`,
-    { collection_error: error, manual_evidence: manualEvidence },
-  );
+interface VerdictInput {
+  control: number;
+  severity: QualysFindingSeverity;
+  status: QualysFindingStatus;
+  summary: string;
+  evidence: JsonRecord;
+  sources: Collected[];
+  scope: QualysViewScope;
+  manualEvidence: string;
+  unknownBuckets?: Record<string, number>;
+}
+
+function guardedFinding(input: VerdictInput): QualysFinding {
+  const unreadable = input.sources.filter((source) => source.error);
+  const truncated = input.sources.filter((source) => !source.error && source.truncated);
+  const buckets = Object.entries(input.unknownBuckets ?? {}).filter(([, count]) => count > 0);
+  const unknownTotal = buckets.reduce((total, [, count]) => total + count, 0);
+  const notes: string[] = [];
+  let status = input.status;
+
+  if (unreadable.length > 0) {
+    const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
+    if (status !== "fail") status = "manual";
+    notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
+  }
+  if (truncated.length > 0) {
+    if (status === "pass") status = "warn";
+    notes.push(`Partial view: ${truncated.map((source) => `${source.name} ${source.truncationReason} (${source.data.length} seen${source.cap ? ` of cap ${source.cap}` : ""})`).join("; ")}.`);
+  }
+  if (unknownTotal > 0) {
+    if (status === "pass") status = "warn";
+    notes.push(`${unknownTotal} records lack the date or flag needed to count as compliant (${buckets.map(([name, count]) => `${name}: ${count}`).join(", ")}) and were not counted as compliant.`);
+  }
+  if (input.scope.partial) {
+    if (status === "pass") status = "warn";
+    notes.push(`Partial view: ${input.scope.note}`);
+  }
+
+  const parts = [input.summary, ...notes];
+  if (status === "manual" && !/Collect manually:/.test(input.summary)) {
+    parts.push(`Collect manually: ${input.manualEvidence}`);
+  }
+  return finding(input.control, input.severity, status, parts.join(" "), {
+    ...input.evidence,
+    verdict_basis: input.status,
+    manual_evidence: input.manualEvidence,
+    unknown_buckets: Object.fromEntries(buckets),
+    collection: {
+      sources: input.sources.map(describeSource),
+      view_scope: { verified: input.scope.verified, partial: input.scope.partial, roles: input.scope.roles, scope_tags: input.scope.scopeTags, source: input.scope.source },
+    },
+  });
+}
+
+function unreadableSummary(control: number, sources: Collected[]): string {
+  const missing = sources.filter((source) => source.error);
+  const unlicensed = missing.some((source) => source.moduleUnavailable);
+  return `${CONTROL_TITLES[control] ?? `Control ${control}`} could not be evaluated: ${missing.map((source) => source.name).join(", ")} ${missing.length === 1 ? "was" : "were"} not readable${unlicensed ? " (module unlicensed, not applicable, or role not permitted)" : ""}.`;
 }
 
 function resolveAssessmentOptions(config: QualysResolvedConfig, options: QualysAssessmentOptions): Required<QualysAssessmentOptions> {
@@ -1213,7 +1442,15 @@ function resolveAssessmentOptions(config: QualysResolvedConfig, options: QualysA
 }
 
 function scheduleIsActive(schedule: JsonRecord): boolean {
-  return asBoolean(schedule.ACTIVE) !== false;
+  return asBoolean(schedule.ACTIVE) === true;
+}
+
+function scheduleActiveFlagMissing(schedule: JsonRecord): boolean {
+  return asBoolean(schedule.ACTIVE) === undefined;
+}
+
+function recordLabel(record: JsonRecord, fallback: string): string {
+  return asString(record.TITLE) ?? asString(record.NAME) ?? asString(record.name) ?? asString(record.ID) ?? asString(record.id) ?? fallback;
 }
 
 function scheduleTargets(schedule: JsonRecord): string[] {
@@ -1305,29 +1542,27 @@ export async function assessQualysScanCoverage(
   const errors: string[] = [];
   const now = new Date();
 
-  const [schedules, scans, hosts, profiles, excluded, groups] = await Promise.all([
-    collect("scheduled_scans", () => client.listScheduledScans(), [] as JsonRecord[], errors),
-    collect("scans", () => client.listScans(settings.lookbackDays), [] as JsonRecord[], errors),
-    collect("hosts", () => client.listHosts(settings.hostLimit), [] as JsonRecord[], errors),
-    collect("option_profiles", () => client.listOptionProfiles(), [] as JsonRecord[], errors),
-    collect("excluded_ips", () => client.listExcludedIps(), [] as JsonRecord[], errors),
-    collect("asset_groups", () => client.listAssetGroups(), [] as JsonRecord[], errors),
+  const [schedules, scans, hosts, profiles, excluded, groups, apiUser] = await Promise.all([
+    collect("scheduled_scans", () => client.listScheduledScans(), errors, DEFAULT_LIST_LIMIT),
+    collect("scans", () => client.listScans(settings.lookbackDays), errors, DEFAULT_LIST_LIMIT),
+    collect("hosts", () => client.listHosts(settings.hostLimit), errors, settings.hostLimit),
+    collect("option_profiles", () => client.listOptionProfiles(), errors, DEFAULT_LIST_LIMIT),
+    collect("excluded_ips", () => client.listExcludedIps(), errors),
+    collect("asset_groups", () => client.listAssetGroups(), errors, DEFAULT_LIST_LIMIT),
+    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
   ]);
+  const scope = resolveViewScope(config, apiUser);
 
   const activeSchedules = schedules.data.filter(scheduleIsActive);
+  const schedulesWithoutActiveFlag = schedules.data.filter(scheduleActiveFlagMissing);
   const scheduledTargets = new Set(activeSchedules.flatMap(scheduleTargets).map((target) => target.toLowerCase()));
   const groupsWithoutSchedule = groups.data
-    .map((group) => asString(group.TITLE) ?? asString(group.ID) ?? "group")
+    .map((group) => recordLabel(group, "group"))
     .filter((title) => !scheduledTargets.has(title.toLowerCase()) && !scheduledTargets.has("all"));
-  const staleHosts = hosts.data.filter((host) => {
-    const age = ageInDays(host.LAST_VULN_SCAN_DATETIME ?? host.LAST_VM_SCANNED_DATE, now);
-    return age === undefined || age > settings.lookbackDays;
-  });
-  const scannedHosts = hosts.data.filter((host) => parseDate(host.LAST_VULN_SCAN_DATETIME ?? host.LAST_VM_SCANNED_DATE));
-  const authScannedHosts = scannedHosts.filter((host) => {
-    const age = ageInDays(host.LAST_VM_AUTH_SCANNED_DATE, now);
-    return age !== undefined && age <= Math.max(settings.lookbackDays, 30);
-  });
+  const hostsWithoutScanDate = hosts.data.filter((host) => !parseDate(hostLastScan(host)));
+  const scannedHosts = hosts.data.filter((host) => parseDate(hostLastScan(host)));
+  const staleScannedHosts = scannedHosts.filter((host) => (ageInDays(hostLastScan(host), now) ?? Number.POSITIVE_INFINITY) > settings.lookbackDays);
+  const authScannedHosts = scannedHosts.filter((host) => hostRecentlyAuthScanned(host, now, settings.lookbackDays));
   const authPercent = percent(authScannedHosts.length, scannedHosts.length);
 
   const profilesWithoutAuth = profiles.data.filter((profile) => optionProfileAuthTypes(profile).length === 0).map(optionProfileName);
@@ -1340,106 +1575,175 @@ export async function assessQualysScanCoverage(
 
   const findings: QualysFinding[] = [];
 
-  findings.push(schedules.error
-    ? unavailableFinding(1, "high", schedules.error, "export the Scans > Schedules list and the asset group list from the Qualys UI and confirm each asset group has an active recurring scan.")
-    : finding(
-      1,
-      "high",
-      activeSchedules.length === 0 ? "fail" : groupsWithoutSchedule.length > 0 || staleHosts.length > 0 ? "warn" : "pass",
-      activeSchedules.length === 0
-        ? "No active scheduled vulnerability scans were found."
-        : `${activeSchedules.length} active schedules cover ${distinctTargets.length} distinct targets; ${groupsWithoutSchedule.length}/${groups.data.length} asset groups are not referenced by an active schedule and ${staleHosts.length}/${hosts.data.length} hosts have no vulnerability scan within ${settings.lookbackDays} days.`,
-      {
-        active_schedules: activeSchedules.length,
-        total_schedules: schedules.data.length,
-        finished_scans_in_lookback: finishedScans.length,
-        asset_groups_without_schedule: groupsWithoutSchedule.slice(0, 50),
-        stale_hosts: staleHosts.length,
-        next_launches: activeSchedules.map(scheduleNextLaunch).filter(Boolean).slice(0, 20),
-      },
-    ));
+  const coverageStatus: QualysFindingStatus = schedules.error
+    ? "manual"
+    : activeSchedules.length === 0
+      ? "fail"
+      : groups.data.length === 0 || hosts.data.length === 0
+        ? "manual"
+        : groupsWithoutSchedule.length > 0 || staleScannedHosts.length > 0 || hostsWithoutScanDate.length > 0
+          ? "warn"
+          : "pass";
+  findings.push(guardedFinding({
+    control: 1,
+    severity: "high",
+    status: coverageStatus,
+    summary: schedules.error
+      ? unreadableSummary(1, [schedules])
+      : activeSchedules.length === 0
+        ? `No active scheduled vulnerability scans were found (${schedules.data.length} schedules returned, ${schedulesWithoutActiveFlag.length} without an ACTIVE flag). Emptiness is a failure for this control because recurring scans are required.`
+        : groups.error || hosts.error
+          ? unreadableSummary(1, [groups, hosts])
+          : groups.data.length === 0
+          ? `${activeSchedules.length} active schedules exist but the asset group list is empty, so coverage of every asset group cannot be confirmed; either no asset groups are defined or the API user cannot see them.`
+          : hosts.data.length === 0
+            ? `${activeSchedules.length} active schedules exist but no host assets were returned, so scan recency cannot be evaluated; either nothing has been scanned or the API user cannot see hosts.`
+            : `${activeSchedules.length} active schedules cover ${distinctTargets.length} distinct targets; ${groupsWithoutSchedule.length}/${groups.data.length} asset groups are not referenced by an active schedule, ${staleScannedHosts.length}/${scannedHosts.length} scanned hosts have no vulnerability scan within ${settings.lookbackDays} days, and ${hostsWithoutScanDate.length}/${hosts.data.length} hosts have no scan date at all.`,
+    evidence: {
+      active_schedules: activeSchedules.length,
+      total_schedules: schedules.data.length,
+      schedules_without_active_flag: schedulesWithoutActiveFlag.length,
+      finished_scans_in_lookback: finishedScans.length,
+      asset_groups: groups.data.length,
+      asset_groups_without_schedule: groupsWithoutSchedule.slice(0, 50),
+      hosts: hosts.data.length,
+      stale_scanned_hosts: staleScannedHosts.length,
+      hosts_without_scan_date: hostsWithoutScanDate.length,
+      next_launches: activeSchedules.map(scheduleNextLaunch).filter(Boolean).slice(0, 20),
+    },
+    sources: [schedules, groups, hosts],
+    scope,
+    manualEvidence: "export Scans > Schedules and Assets > Asset Groups from the Qualys UI and confirm each asset group has an active recurring scan and each host was scanned within the review window.",
+    unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length, schedules_without_active_flag: schedulesWithoutActiveFlag.length },
+  }));
 
-  findings.push(hosts.error
-    ? unavailableFinding(2, "high", hosts.error, "run an Authentication Report in Qualys and record the percentage of hosts with successful authenticated scans.")
-    : finding(
-      2,
-      "high",
-      scannedHosts.length === 0 ? "warn" : authPercent >= settings.minAuthScanPercent ? "pass" : "fail",
-      scannedHosts.length === 0
-        ? "No scanned hosts were returned, so the authenticated scan ratio could not be computed."
-        : `${authScannedHosts.length}/${scannedHosts.length} scanned hosts (${authPercent}%) had a recent authenticated scan; threshold ${settings.minAuthScanPercent}%.`,
-      {
-        scanned_hosts: scannedHosts.length,
-        authenticated_hosts: authScannedHosts.length,
-        authenticated_percent: authPercent,
-        threshold_percent: settings.minAuthScanPercent,
-      },
-    ));
+  const authStatus: QualysFindingStatus = hosts.error
+    ? "manual"
+    : hosts.data.length === 0
+      ? "manual"
+      : scannedHosts.length === 0
+        ? "fail"
+        : authPercent >= settings.minAuthScanPercent
+          ? "pass"
+          : "fail";
+  findings.push(guardedFinding({
+    control: 2,
+    severity: "high",
+    status: authStatus,
+    summary: hosts.error
+      ? unreadableSummary(2, [hosts])
+      : hosts.data.length === 0
+        ? "No host assets were returned, so the authenticated scan ratio cannot be computed; an empty host inventory is treated as unknown, not compliant."
+        : scannedHosts.length === 0
+          ? `${hosts.data.length} hosts were returned but none has a vulnerability scan date, so 0% of hosts have evidence of an authenticated scan.`
+          : `${authScannedHosts.length}/${scannedHosts.length} scanned hosts (${authPercent}%) had an authenticated scan within ${Math.max(settings.lookbackDays, 30)} days against a ${settings.minAuthScanPercent}% threshold; ${hostsWithoutScanDate.length} hosts without a scan date were excluded from the ratio and never counted as authenticated.`,
+    evidence: {
+      hosts: hosts.data.length,
+      scanned_hosts: scannedHosts.length,
+      authenticated_hosts: authScannedHosts.length,
+      authenticated_percent: authPercent,
+      threshold_percent: settings.minAuthScanPercent,
+      hosts_without_scan_date: hostsWithoutScanDate.length,
+    },
+    sources: [hosts],
+    scope,
+    manualEvidence: "run an Authentication Report in Qualys and record the percentage of hosts with successful authenticated scans.",
+    unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length },
+  }));
 
-  findings.push(profiles.error
-    ? unavailableFinding(3, "medium", profiles.error, "export each option profile from Scans > Option Profiles and review authentication, port, and performance settings against internal and external scanning requirements.")
-    : finding(
-      3,
-      "medium",
-      profiles.data.length === 0 ? "fail" : profilesWithoutAuth.length > 0 ? "warn" : "pass",
-      profiles.data.length === 0
-        ? "No option profiles were returned."
-        : `${profiles.data.length} option profiles reviewed; ${profilesWithoutAuth.length} have no authentication types enabled. Confirm internal versus external profile intent manually.`,
-      {
-        option_profiles: profiles.data.map(optionProfileName).slice(0, 50),
-        profiles_without_authentication: profilesWithoutAuth.slice(0, 50),
-      },
-    ));
+  findings.push(guardedFinding({
+    control: 3,
+    severity: "medium",
+    status: profiles.error ? "manual" : profiles.data.length === 0 ? "fail" : "warn",
+    summary: profiles.error
+      ? unreadableSummary(3, [profiles])
+      : profiles.data.length === 0
+        ? "No option profiles were returned; emptiness is a failure for this control because at least one authenticated option profile is required for scanning."
+        : `${profiles.data.length} option profiles reviewed; ${profilesWithoutAuth.length} have no authentication types enabled (SCAN/AUTHENTICATION absent or empty). Port ranges and internal versus external intent are not machine-verifiable, so the verdict is capped at warn until reviewed.`,
+    evidence: {
+      option_profiles: profiles.data.map(optionProfileName).slice(0, 50),
+      profiles_without_authentication: profilesWithoutAuth.slice(0, 50),
+      authentication_types: Object.fromEntries(profiles.data.slice(0, 50).map((profile) => [optionProfileName(profile), optionProfileAuthTypes(profile)])),
+    },
+    sources: [profiles],
+    scope,
+    manualEvidence: "export each option profile from Scans > Option Profiles and review authentication, port, and performance settings against internal and external scanning requirements.",
+  }));
 
-  findings.push(schedules.error
-    ? unavailableFinding(14, "medium", schedules.error, "confirm at least one recurring perimeter scan uses Qualys external scanners against the public IP ranges.")
-    : finding(
-      14,
-      "medium",
-      externalSchedules.length > 0 ? "pass" : activeSchedules.length > 0 ? "warn" : "fail",
-      externalSchedules.length > 0
-        ? `${externalSchedules.length} active schedules run from Qualys external scanners.`
-        : activeSchedules.length > 0
-          ? "Active schedules exist but none appear to use Qualys external scanners for perimeter coverage."
-          : "No active schedules were found, so external perimeter scanning is not configured.",
-      {
-        external_schedules: externalSchedules.map((schedule) => asString(schedule.TITLE) ?? asString(schedule.ID)).slice(0, 50),
-        scanners_in_use: distinctScanners.slice(0, 50),
-      },
-    ));
+  findings.push(guardedFinding({
+    control: 14,
+    severity: "medium",
+    status: schedules.error ? "manual" : activeSchedules.length === 0 ? "fail" : externalSchedules.length > 0 ? "pass" : "warn",
+    summary: schedules.error
+      ? unreadableSummary(14, [schedules])
+      : activeSchedules.length === 0
+        ? "No active schedules were found, so external perimeter scanning is not configured; emptiness is a failure for this control."
+        : externalSchedules.length > 0
+          ? `${externalSchedules.length}/${activeSchedules.length} active schedules have no internal scanner appliance assigned and therefore run from Qualys external scanners.`
+          : `${activeSchedules.length} active schedules all run from internal scanner appliances (${distinctScanners.join(", ")}); none provides perimeter coverage from Qualys external scanners.`,
+    evidence: {
+      active_schedules: activeSchedules.length,
+      external_schedules: externalSchedules.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50),
+      scanners_in_use: distinctScanners.slice(0, 50),
+    },
+    sources: [schedules],
+    scope,
+    manualEvidence: "confirm at least one recurring perimeter scan uses Qualys external scanners against the public IP ranges.",
+  }));
 
-  findings.push(excluded.error
-    ? unavailableFinding(16, "medium", excluded.error, "export Assets > Excluded Hosts and review each excluded IP range and option profile QID exclusion for justification.")
-    : finding(
-      16,
-      "medium",
-      broadExclusions.length > 0 ? "fail" : excluded.data.length > 0 || excludedQidCount > 0 ? "warn" : "pass",
-      broadExclusions.length > 0
+  const exclusionStatus: QualysFindingStatus = excluded.error
+    ? "manual"
+    : broadExclusions.length > 0
+      ? "fail"
+      : excluded.data.length > 0 || excludedQidCount > 0
+        ? "warn"
+        : profiles.data.length === 0
+          ? "manual"
+          : "pass";
+  findings.push(guardedFinding({
+    control: 16,
+    severity: "medium",
+    status: exclusionStatus,
+    summary: excluded.error
+      ? unreadableSummary(16, [excluded])
+      : broadExclusions.length > 0
         ? `${broadExclusions.length} excluded IP ranges span more than ${BROAD_EXCLUSION_ADDRESS_COUNT} addresses.`
         : excluded.data.length > 0 || excludedQidCount > 0
           ? `${excluded.data.length} excluded host entries and ${excludedQidCount} QID exclusions in option profiles require documented justification.`
-          : "No excluded hosts or QID exclusions were found.",
-      {
-        excluded_entries: excluded.data.slice(0, 100),
-        broad_exclusions: broadExclusions.slice(0, 50),
-        option_profile_qid_exclusions: excludedQidCount,
-      },
-    ));
+          : profiles.error
+            ? unreadableSummary(16, [profiles])
+            : profiles.data.length === 0
+            ? "The excluded host list is empty, but no option profiles were returned so QID exclusions could not be evaluated."
+            : `No excluded hosts and no QID exclusions across ${profiles.data.length} option profiles; the excluded host list was read completely, so emptiness is compliant for this control.`,
+    evidence: {
+      excluded_entries: excluded.data.slice(0, 100),
+      broad_exclusions: broadExclusions.slice(0, 50),
+      option_profiles_reviewed: profiles.data.length,
+      option_profile_qid_exclusions: excludedQidCount,
+    },
+    sources: [excluded, profiles],
+    scope,
+    manualEvidence: "export Assets > Excluded Hosts and review each excluded IP range and option profile QID exclusion for justification.",
+  }));
 
-  findings.push(schedules.error
-    ? unavailableFinding(20, "medium", schedules.error, "document which scan schedules cover DMZ, internal, and OT/ICS segments and which scanner appliances serve each segment.")
-    : finding(
-      20,
-      "medium",
-      activeSchedules.length === 0 ? "fail" : distinctTargets.length >= 2 && distinctScanners.length >= 2 ? "pass" : "warn",
-      activeSchedules.length === 0
-        ? "No active schedules exist, so no segment-specific scanning is configured."
-        : `${activeSchedules.length} active schedules target ${distinctTargets.length} distinct targets across ${distinctScanners.length} scanner sources. Map these to DMZ, internal, and OT/ICS segments manually.`,
-      {
-        distinct_targets: distinctTargets.slice(0, 50),
-        distinct_scanners: distinctScanners.slice(0, 50),
-      },
-    ));
+  findings.push(guardedFinding({
+    control: 20,
+    severity: "medium",
+    status: schedules.error ? "manual" : activeSchedules.length === 0 ? "fail" : "warn",
+    summary: schedules.error
+      ? unreadableSummary(20, [schedules])
+      : activeSchedules.length === 0
+        ? "No active schedules exist, so no segment-specific scanning is configured; emptiness is a failure for this control."
+        : `${activeSchedules.length} active schedules target ${distinctTargets.length} distinct targets across ${distinctScanners.length} scanner sources. The API does not label segments, so mapping to DMZ, internal, and OT/ICS is manual and the verdict is capped at warn.`,
+    evidence: {
+      active_schedules: activeSchedules.length,
+      distinct_targets: distinctTargets.slice(0, 50),
+      distinct_scanners: distinctScanners.slice(0, 50),
+    },
+    sources: [schedules],
+    scope,
+    manualEvidence: "document which scan schedules cover DMZ, internal, and OT/ICS segments and which scanner appliances serve each segment.",
+  }));
 
   return {
     category: "scan_coverage",
@@ -1447,14 +1751,17 @@ export async function assessQualysScanCoverage(
     summary: {
       platform: config.platform,
       lookback_days: settings.lookbackDays,
+      view_scope: scope.note,
       active_schedules: activeSchedules.length,
       finished_scans_in_lookback: finishedScans.length,
       hosts: hosts.data.length,
-      stale_hosts: staleHosts.length,
+      hosts_without_scan_date: hostsWithoutScanDate.length,
+      stale_scanned_hosts: staleScannedHosts.length,
       authenticated_percent: authPercent,
       option_profiles: profiles.data.length,
       excluded_entries: excluded.data.length,
       external_schedules: externalSchedules.length,
+      truncated_sources: [schedules, scans, hosts, profiles, excluded, groups].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
     },
     findings,
@@ -1470,8 +1777,21 @@ export async function assessQualysScanCoverage(
   };
 }
 
+function hostLastScan(host: JsonRecord): unknown {
+  return host.LAST_VULN_SCAN_DATETIME ?? host.LAST_VM_SCANNED_DATE;
+}
+
+function hostRecentlyAuthScanned(host: JsonRecord, now: Date, lookbackDays: number): boolean {
+  const age = ageInDays(host.LAST_VM_AUTH_SCANNED_DATE, now);
+  return age !== undefined && age <= Math.max(lookbackDays, 30);
+}
+
 function connectorState(connector: JsonRecord): string {
   return (asString(connector.connectorState) ?? asString(connector.state) ?? "unknown").toUpperCase();
+}
+
+function connectorStateUnknown(connector: JsonRecord): boolean {
+  return connectorState(connector) === "UNKNOWN";
 }
 
 function connectorIsUnhealthy(connector: JsonRecord): boolean {
@@ -1480,6 +1800,10 @@ function connectorIsUnhealthy(connector: JsonRecord): boolean {
 
 function applianceStatus(appliance: JsonRecord): string {
   return (asString(appliance.STATUS) ?? "unknown").toLowerCase();
+}
+
+function applianceStatusUnknown(appliance: JsonRecord): boolean {
+  return applianceStatus(appliance) === "unknown";
 }
 
 function applianceIsOffline(appliance: JsonRecord): boolean {
@@ -1501,8 +1825,19 @@ function agentStatus(agent: JsonRecord): string {
   return (pathString(agent, "agentInfo", "status") ?? "unknown").toUpperCase();
 }
 
+function agentStatusUnknown(agent: JsonRecord): boolean {
+  return agentStatus(agent) === "UNKNOWN";
+}
+
 function agentLastCheckIn(agent: JsonRecord): unknown {
-  return pathValue(agent, "agentInfo", "lastCheckedIn") ?? pathValue(agent, "agentInfo", "lastCheckedIn", "date");
+  const value = pathValue(agent, "agentInfo", "lastCheckedIn");
+  const nested = asObject(value);
+  return nested ? nested.date ?? nested["#text"] : value;
+}
+
+function agentHasActivationKey(agent: JsonRecord): boolean {
+  const key = asObject(pathValue(agent, "agentInfo", "activationKey"));
+  return Boolean(key && (asString(key.activationId) ?? asString(key.title) ?? asString(key.id)));
 }
 
 export async function assessQualysAssetInventory(
@@ -1514,141 +1849,215 @@ export async function assessQualysAssetInventory(
   const errors: string[] = [];
   const now = new Date();
 
-  const [groups, hosts, connectors, appliances, agents, tags] = await Promise.all([
-    collect("asset_groups", () => client.listAssetGroups(), [] as JsonRecord[], errors),
-    collect("hosts", () => client.listHosts(settings.hostLimit), [] as JsonRecord[], errors),
-    collect("connectors", () => client.searchConnectors(), [] as JsonRecord[], errors),
-    collect("appliances", () => client.listAppliances(), [] as JsonRecord[], errors),
-    collect("cloud_agents", () => client.searchCloudAgents(settings.hostLimit), [] as JsonRecord[], errors),
-    collect("tags", () => client.searchTags(), [] as JsonRecord[], errors),
+  const [groups, hosts, connectors, appliances, agents, tags, apiUser] = await Promise.all([
+    collect("asset_groups", () => client.listAssetGroups(), errors, DEFAULT_LIST_LIMIT),
+    collect("hosts", () => client.listHosts(settings.hostLimit), errors, settings.hostLimit),
+    collect("connectors", () => client.searchConnectors(), errors, DEFAULT_LIST_LIMIT),
+    collect("appliances", () => client.listAppliances(), errors, DEFAULT_LIST_LIMIT),
+    collect("cloud_agents", () => client.searchCloudAgents(settings.hostLimit), errors, settings.hostLimit),
+    collect("tags", () => client.searchTags(), errors, DEFAULT_TAG_LIMIT),
+    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
   ]);
+  const scope = resolveViewScope(config, apiUser);
 
-  const emptyGroups = groups.data.filter((group) => !assetGroupHasTargets(group)).map((group) => asString(group.TITLE) ?? asString(group.ID) ?? "group");
-  const neverScannedHosts = hosts.data.filter((host) => !parseDate(host.LAST_VULN_SCAN_DATETIME ?? host.LAST_VM_SCANNED_DATE));
+  const emptyGroups = groups.data.filter((group) => !assetGroupHasTargets(group)).map((group) => recordLabel(group, "group"));
+  const neverScannedHosts = hosts.data.filter((host) => !parseDate(hostLastScan(host)));
   const unhealthyConnectors = connectors.data.filter(connectorIsUnhealthy);
-  const staleConnectors = connectors.data.filter((connector) => (ageInDays(connector.lastSync, now) ?? Number.POSITIVE_INFINITY) > 7);
+  const unknownStateConnectors = connectors.data.filter((connector) => !connectorIsUnhealthy(connector) && connectorStateUnknown(connector));
+  const connectorsWithoutSyncDate = connectors.data.filter((connector) => !connectorIsUnhealthy(connector) && !parseDate(connector.lastSync));
+  const staleConnectors = connectors.data.filter((connector) => (ageInDays(connector.lastSync, now) ?? -1) > STALE_CONNECTOR_DAYS);
   const offlineAppliances = appliances.data.filter(applianceIsOffline);
+  const unknownStatusAppliances = appliances.data.filter(applianceStatusUnknown);
   const outdatedAppliances = appliances.data.filter((appliance) => !applianceIsOffline(appliance) && applianceIsOutdated(appliance));
   const agentHosts = hosts.data.filter(hostIsAgentTracked);
+  const hostsWithoutTrackingMethod = hosts.data.filter((host) => hostTrackingMethod(host) === "");
   const agentPercent = percent(agentHosts.length, hosts.data.length);
   const inactiveAgents = agents.data.filter((agent) => /INACTIVE|UNINSTALL/.test(agentStatus(agent)));
-  const staleAgents = agents.data.filter((agent) => {
-    const age = ageInDays(agentLastCheckIn(agent), now);
-    return age !== undefined && age > 7;
-  });
+  const unknownStatusAgents = agents.data.filter(agentStatusUnknown);
+  const agentsWithoutCheckIn = agents.data.filter((agent) => !parseDate(agentLastCheckIn(agent)));
+  const agentsWithoutActivationKey = agents.data.filter((agent) => !agentHasActivationKey(agent));
+  const staleAgents = agents.data.filter((agent) => (ageInDays(agentLastCheckIn(agent), now) ?? -1) > STALE_AGENT_DAYS);
   const untaggedHosts = hosts.data.filter((host) => hostTags(host).length === 0);
   const untaggedPercent = percent(untaggedHosts.length, hosts.data.length);
   const dynamicTags = tags.data.filter((tag) => Boolean(asString(tag.ruleType)));
 
   const findings: QualysFinding[] = [];
 
-  findings.push(finding(
-    4,
-    "medium",
-    "manual",
-    `Qualys exposes ${groups.data.length} asset groups and ${hosts.data.length} host assets, but the API cannot compare them against the authoritative CMDB or network range register. Collect manually: export the CMDB or IPAM network ranges and reconcile them against the Qualys asset group IP sets; investigate ${emptyGroups.length} asset groups without targets and ${neverScannedHosts.length} hosts that were never scanned.`,
-    {
+  findings.push(guardedFinding({
+    control: 4,
+    severity: "medium",
+    status: "manual",
+    summary: `Qualys exposes ${groups.data.length} asset groups and ${hosts.data.length} host assets, but the API cannot compare them against the authoritative CMDB or network range register, so this control is always manual. Investigate ${emptyGroups.length} asset groups without targets and ${neverScannedHosts.length} hosts that were never scanned.`,
+    evidence: {
       asset_groups: groups.data.length,
       asset_groups_without_targets: emptyGroups.slice(0, 50),
       hosts: hosts.data.length,
       hosts_never_scanned: neverScannedHosts.length,
-      manual_evidence: "CMDB or IPAM range export reconciled against Qualys asset group IP sets.",
-      collection_errors: [groups.error, hosts.error].filter(Boolean),
     },
-  ));
+    sources: [groups, hosts],
+    scope,
+    manualEvidence: "export the CMDB or IPAM network ranges and reconcile them against the Qualys asset group IP sets.",
+  }));
 
-  findings.push(connectors.error
-    ? unavailableFinding(5, "medium", connectors.error, "open the AWS, Azure, and GCP connector lists in the Qualys UI and confirm each connector last synchronized successfully.")
-    : finding(
-      5,
-      "medium",
-      connectors.data.length === 0 ? "warn" : unhealthyConnectors.length > 0 ? "fail" : staleConnectors.length > 0 ? "warn" : "pass",
-      connectors.data.length === 0
-        ? "No cloud asset data connectors are configured."
+  const connectorStatus: QualysFindingStatus = connectors.error
+    ? "manual"
+    : connectors.data.length === 0
+      ? "manual"
+      : unhealthyConnectors.length > 0
+        ? "fail"
+        : staleConnectors.length > 0
+          ? "warn"
+          : "pass";
+  findings.push(guardedFinding({
+    control: 5,
+    severity: "medium",
+    status: connectorStatus,
+    summary: connectors.error
+      ? unreadableSummary(5, [connectors])
+      : connectors.data.length === 0
+        ? "No cloud asset data connectors were returned. This is not applicable if no AWS, Azure, or GCP accounts are in scope; otherwise cloud asset discovery is missing. Emptiness is treated as unknown, not compliant."
         : unhealthyConnectors.length > 0
           ? `${unhealthyConnectors.length}/${connectors.data.length} cloud connectors are disabled or in an error state.`
           : staleConnectors.length > 0
-            ? `${staleConnectors.length}/${connectors.data.length} cloud connectors have not synchronized within 7 days.`
-            : `All ${connectors.data.length} cloud connectors are enabled and synchronized recently.`,
-      {
-        connectors: connectors.data.map((connector) => ({
-          name: asString(connector.name),
-          type: asString(connector.type),
-          state: connectorState(connector),
-          last_sync: asString(connector.lastSync),
-          last_error: asString(connector.lastError),
-        })).slice(0, 100),
-      },
-    ));
+            ? `${staleConnectors.length}/${connectors.data.length} cloud connectors have not synchronized within ${STALE_CONNECTOR_DAYS} days.`
+            : `All ${connectors.data.length} cloud connectors report a healthy state and synchronized within ${STALE_CONNECTOR_DAYS} days.`,
+    evidence: {
+      connectors: connectors.data.map((connector) => ({
+        name: asString(connector.name),
+        type: asString(connector.type),
+        state: connectorState(connector),
+        last_sync: asString(connector.lastSync),
+        last_error: asString(connector.lastError),
+      })).slice(0, 100),
+      unhealthy_connectors: unhealthyConnectors.length,
+      stale_connectors: staleConnectors.length,
+    },
+    sources: [connectors],
+    scope,
+    manualEvidence: "open the AWS, Azure, and GCP connector lists in the Qualys UI and confirm whether cloud accounts are in scope and each connector last synchronized successfully.",
+    unknownBuckets: { connectors_without_state: unknownStateConnectors.length, connectors_without_sync_date: connectorsWithoutSyncDate.length },
+  }));
 
-  findings.push(appliances.error
-    ? unavailableFinding(6, "high", appliances.error, "review Scans > Appliances for offline scanners, missed heartbeats, and outdated software or signature versions.")
-    : finding(
-      6,
-      "high",
-      offlineAppliances.length > 0 ? "fail" : outdatedAppliances.length > 0 ? "warn" : appliances.data.length === 0 ? "warn" : "pass",
-      appliances.data.length === 0
-        ? "No scanner appliances were returned; internal scanning relies on external scanners or agents only."
+  const applianceStatusVerdict: QualysFindingStatus = appliances.error
+    ? "manual"
+    : appliances.data.length === 0
+      ? "manual"
+      : offlineAppliances.length > 0
+        ? "fail"
+        : outdatedAppliances.length > 0
+          ? "warn"
+          : "pass";
+  findings.push(guardedFinding({
+    control: 6,
+    severity: "high",
+    status: applianceStatusVerdict,
+    summary: appliances.error
+      ? unreadableSummary(6, [appliances])
+      : appliances.data.length === 0
+        ? "No scanner appliances were returned. This is not applicable if internal scanning relies only on Qualys external scanners or Cloud Agent; otherwise confirm the API user can see appliances. Emptiness is treated as unknown, not compliant."
         : offlineAppliances.length > 0
           ? `${offlineAppliances.length}/${appliances.data.length} scanner appliances are offline.`
           : outdatedAppliances.length > 0
             ? `${outdatedAppliances.length}/${appliances.data.length} scanner appliances missed heartbeats or run outdated software or signatures.`
-            : `All ${appliances.data.length} scanner appliances are online and current.`,
-      {
-        appliances: appliances.data.map((appliance) => ({
-          name: asString(appliance.NAME),
-          status: applianceStatus(appliance),
-          software_version: asString(appliance.SOFTWARE_VERSION),
-          latest_version: asString(appliance.ML_LATEST),
-          heartbeats_missed: asNumber(appliance.HEARTBEATS_MISSED) ?? 0,
-          last_updated: asString(appliance.LAST_UPDATED_DATE),
-        })).slice(0, 100),
-      },
-    ));
+            : `All ${appliances.data.length} scanner appliances report an online status with current software and signatures.`,
+    evidence: {
+      appliances: appliances.data.map((appliance) => ({
+        name: asString(appliance.NAME),
+        status: applianceStatus(appliance),
+        software_version: asString(appliance.SOFTWARE_VERSION),
+        latest_version: asString(appliance.ML_LATEST),
+        heartbeats_missed: asNumber(appliance.HEARTBEATS_MISSED) ?? 0,
+        last_updated: asString(appliance.LAST_UPDATED_DATE),
+      })).slice(0, 100),
+      offline_appliances: offlineAppliances.length,
+      outdated_appliances: outdatedAppliances.length,
+    },
+    sources: [appliances],
+    scope,
+    manualEvidence: "review Scans > Appliances for offline scanners, missed heartbeats, and outdated software or signature versions.",
+    unknownBuckets: { appliances_without_status: unknownStatusAppliances.length },
+  }));
 
-  findings.push(hosts.error && agents.error
-    ? unavailableFinding(7, "medium", `${hosts.error}; ${agents.error}`, "compare the Cloud Agent inventory against the host inventory and record the agent coverage percentage.")
-    : finding(
-      7,
-      "medium",
-      hosts.data.length === 0 ? "warn" : agentPercent >= settings.minAgentCoveragePercent && inactiveAgents.length === 0 && staleAgents.length === 0 ? "pass" : agentPercent >= settings.minAgentCoveragePercent ? "warn" : "fail",
-      hosts.data.length === 0
-        ? "No host assets were returned, so agent coverage could not be computed."
-        : `${agentHosts.length}/${hosts.data.length} hosts (${agentPercent}%) are tracked by Cloud Agent against a ${settings.minAgentCoveragePercent}% threshold; ${inactiveAgents.length} agents are inactive and ${staleAgents.length} have not checked in for 7 days.`,
-      {
-        agent_tracked_hosts: agentHosts.length,
-        hosts: hosts.data.length,
-        agent_coverage_percent: agentPercent,
-        threshold_percent: settings.minAgentCoveragePercent,
-        cloud_agents: agents.data.length,
-        inactive_agents: inactiveAgents.length,
-        stale_agents: staleAgents.length,
-      },
-    ));
+  const agentCoverageStatus: QualysFindingStatus = hosts.error || agents.error
+    ? "manual"
+    : hosts.data.length === 0
+      ? "manual"
+      : agentPercent >= settings.minAgentCoveragePercent && inactiveAgents.length === 0 && staleAgents.length === 0
+        ? "pass"
+        : agentPercent >= settings.minAgentCoveragePercent
+          ? "warn"
+          : "fail";
+  findings.push(guardedFinding({
+    control: 7,
+    severity: "medium",
+    status: agentCoverageStatus,
+    summary: hosts.error || agents.error
+      ? unreadableSummary(7, [hosts, agents])
+      : hosts.data.length === 0
+        ? "No host assets were returned, so agent coverage cannot be computed; an empty host inventory is treated as unknown, not compliant."
+        : `${agentHosts.length}/${hosts.data.length} hosts (${agentPercent}%) carry TRACKING_METHOD Cloud Agent against a ${settings.minAgentCoveragePercent}% threshold; of ${agents.data.length} agents, ${inactiveAgents.length} report an inactive status and ${staleAgents.length} have not checked in for ${STALE_AGENT_DAYS} days.`,
+    evidence: {
+      agent_tracked_hosts: agentHosts.length,
+      hosts: hosts.data.length,
+      agent_coverage_percent: agentPercent,
+      threshold_percent: settings.minAgentCoveragePercent,
+      cloud_agents: agents.data.length,
+      inactive_agents: inactiveAgents.length,
+      stale_agents: staleAgents.length,
+      agents_without_activation_key: agentsWithoutActivationKey.length,
+    },
+    sources: [hosts, agents],
+    scope,
+    manualEvidence: "compare the Cloud Agent inventory against the host inventory and record the agent coverage percentage, inactive agents, and last check-in dates.",
+    unknownBuckets: {
+      hosts_without_tracking_method: hostsWithoutTrackingMethod.length,
+      agents_without_status: unknownStatusAgents.length,
+      agents_without_checkin_date: agentsWithoutCheckIn.length,
+      agents_without_activation_key: agentsWithoutActivationKey.length,
+    },
+  }));
 
-  findings.push(hosts.error && tags.error
-    ? unavailableFinding(18, "medium", `${hosts.error}; ${tags.error}`, "export the tag tree and confirm every in-scope asset carries a compliance scope tag.")
-    : finding(
-      18,
-      "medium",
-      tags.data.length === 0 ? "fail" : untaggedPercent > 20 ? "fail" : untaggedPercent > 0 ? "warn" : "pass",
-      tags.data.length === 0
-        ? "No asset tags are defined, so compliance scope cannot be identified by tag."
-        : `${tags.data.length} tags exist (${dynamicTags.length} rule-based); ${untaggedHosts.length}/${hosts.data.length} hosts (${untaggedPercent}%) carry no tags.`,
-      {
-        tags: tags.data.length,
-        dynamic_tags: dynamicTags.length,
-        untagged_hosts: untaggedHosts.length,
-        untagged_percent: untaggedPercent,
-        tag_names: tags.data.map((tag) => asString(tag.name)).filter(Boolean).slice(0, 100),
-      },
-    ));
+  const tagStatus: QualysFindingStatus = tags.error || hosts.error
+    ? "manual"
+    : tags.data.length === 0
+      ? "fail"
+      : hosts.data.length === 0
+        ? "manual"
+        : untaggedPercent > 20
+          ? "fail"
+          : untaggedPercent > 0
+            ? "warn"
+            : "pass";
+  findings.push(guardedFinding({
+    control: 18,
+    severity: "medium",
+    status: tagStatus,
+    summary: tags.error || hosts.error
+      ? unreadableSummary(18, [tags, hosts])
+      : tags.data.length === 0
+        ? "No asset tags are defined, so compliance scope cannot be identified by tag; emptiness is a failure for this control."
+        : hosts.data.length === 0
+          ? `${tags.data.length} tags exist but no host assets were returned, so the untagged ratio cannot be computed; treated as unknown, not compliant.`
+          : `${tags.data.length} tags exist (${dynamicTags.length} rule-based); ${untaggedHosts.length}/${hosts.data.length} hosts (${untaggedPercent}%) carry no tags.`,
+    evidence: {
+      tags: tags.data.length,
+      dynamic_tags: dynamicTags.length,
+      hosts: hosts.data.length,
+      untagged_hosts: untaggedHosts.length,
+      untagged_percent: untaggedPercent,
+      tag_names: tags.data.map((tag) => asString(tag.name)).filter(Boolean).slice(0, 100),
+    },
+    sources: [tags, hosts],
+    scope,
+    manualEvidence: "export the tag tree and confirm every in-scope asset carries a compliance scope tag.",
+  }));
 
   return {
     category: "asset_inventory",
     title: "Qualys asset inventory and sensors",
     summary: {
       platform: config.platform,
+      view_scope: scope.note,
       asset_groups: groups.data.length,
       hosts: hosts.data.length,
       hosts_never_scanned: neverScannedHosts.length,
@@ -1660,6 +2069,7 @@ export async function assessQualysAssetInventory(
       cloud_agents: agents.data.length,
       tags: tags.data.length,
       untagged_percent: untaggedPercent,
+      truncated_sources: [groups, hosts, connectors, appliances, agents, tags].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
     },
     findings,
@@ -1695,15 +2105,63 @@ function detectionHasQds(detection: JsonRecord): boolean {
   return detection.QDS !== undefined && asString(detection.QDS) !== undefined;
 }
 
+function detectionStatus(detection: JsonRecord): string | undefined {
+  return asString(detection.STATUS)?.trim().toLowerCase();
+}
+
+function detectionIsOpen(detection: JsonRecord): boolean {
+  const status = detectionStatus(detection);
+  return status === undefined || /^(active|new|re-opened|reopened)$/.test(status);
+}
+
+function detectionIsFixedOrInfo(detection: JsonRecord): boolean {
+  const status = detectionStatus(detection);
+  const type = asString(detection.TYPE)?.trim().toLowerCase();
+  return status === "fixed" || type === "info";
+}
+
+function detectionHasSeverity(detection: JsonRecord): boolean {
+  return asNumber(detection.SEVERITY) !== undefined;
+}
+
+function policyStatus(policy: JsonRecord): "active" | "inactive" | "unknown" {
+  const isActive = asBoolean(policy.IS_ACTIVE);
+  if (isActive === true) return "active";
+  if (isActive === false) return "inactive";
+  const status = asString(policy.STATUS)?.trim().toLowerCase();
+  if (status === "active") return "active";
+  if (status && /inactive|draft|disabled/.test(status)) return "inactive";
+  return "unknown";
+}
+
 function policyIsActive(policy: JsonRecord): boolean {
-  return asBoolean(policy.IS_ACTIVE) !== false && !/inactive|draft/i.test(asString(policy.STATUS) ?? "");
+  return policyStatus(policy) === "active";
+}
+
+function xmlScalarText(value: unknown): string | undefined {
+  const text = asString(value);
+  if (text !== undefined) return text;
+  const record = asObject(value);
+  return record ? asString(record["#text"]) : undefined;
+}
+
+function policyHasHiddenAssetGroups(policy: JsonRecord): boolean {
+  const record = asObject(policy.ASSET_GROUP_IDS);
+  return Boolean(record && asBoolean(record["@has_hidden_data"]) === true);
 }
 
 function policyIsAssigned(policy: JsonRecord): boolean {
-  return asArray(pathValue(policy, "ASSET_GROUP_IDS")).some((value) => Boolean(asString(value)))
-    || asArray(pathValue(policy, "ASSET_TAGS", "TAG_SET_INCLUDE")).length > 0
-    || asArray(pathValue(policy, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_INCLUDE")).length > 0;
+  const groupIds = (xmlScalarText(policy.ASSET_GROUP_IDS) ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  const tagIds = [
+    ...asArray(pathValue(policy, "TAG_SET_INCLUDE", "TAG_ID")),
+    ...asArray(pathValue(policy, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_ID")),
+    ...asArray(pathValue(policy, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_INCLUDE")),
+  ].filter((value) => Boolean(xmlScalarText(value)));
+  return groupIds.length > 0 || tagIds.length > 0 || policyHasHiddenAssetGroups(policy);
 }
+
+const NETWORK_DEVICE_OS_PATTERN = /cisco|nx-os|ios[- ]?xe|junos|juniper|palo alto|pan-os|fortinet|fortios|fortigate|arista|big-ip|f5 |check ?point|gaia|router|switch|firewall|screenos|brocade|huawei/i;
+const NETWORK_AUTH_TYPE_PATTERN = /snmp|cisco|checkpoint|check_point|palo|fortinet|juniper|arista|network|f5|huawei|brocade/i;
 
 export async function assessQualysVulnerabilityManagement(
   client: QualysDataClient,
@@ -1714,34 +2172,48 @@ export async function assessQualysVulnerabilityManagement(
   const errors: string[] = [];
   const now = new Date();
 
-  const [authRecords, hosts, policies, detections] = await Promise.all([
-    collect("auth_records", () => client.listAuthRecordSummary(), [] as JsonRecord[], errors),
-    collect("hosts", () => client.listHosts(settings.hostLimit), [] as JsonRecord[], errors),
-    collect("compliance_policies", () => client.listCompliancePolicies(), [] as JsonRecord[], errors),
-    collect("detections", () => client.listDetections(settings.detectionLimit), [] as JsonRecord[], errors),
+  const [authRecords, hosts, policies, detections, apiUser] = await Promise.all([
+    collect("auth_records", () => client.listAuthRecordSummary(), errors),
+    collect("hosts", () => client.listHosts(settings.hostLimit), errors, settings.hostLimit),
+    collect("compliance_policies", () => client.listCompliancePolicies(), errors, DEFAULT_LIST_LIMIT),
+    collect("detections", () => client.listDetections(settings.detectionLimit), errors, settings.detectionLimit),
+    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
   ]);
-  const openQids = uniqueStrings(detections.data.map((detection) => asString(detection.QID)));
+  const scope = resolveViewScope(config, apiUser);
+
+  const excludedDetections = detections.data.filter(detectionIsFixedOrInfo);
+  const openDetections = detections.data.filter((detection) => !detectionIsFixedOrInfo(detection) && detectionIsOpen(detection));
+  const closedDetections = detections.data.filter((detection) => !detectionIsFixedOrInfo(detection) && !detectionIsOpen(detection));
+  const detectionsWithoutStatus = openDetections.filter((detection) => detectionStatus(detection) === undefined);
+  const detectionsWithoutSeverity = openDetections.filter((detection) => !detectionHasSeverity(detection));
+  const openQids = uniqueStrings(openDetections.map((detection) => asString(detection.QID)));
   const knowledgeBase = openQids.length > 0
-    ? await collect("knowledge_base", () => client.listKnowledgeBase(openQids), [] as JsonRecord[], errors)
-    : { data: [] as JsonRecord[] };
+    ? await collect("knowledge_base", () => client.listKnowledgeBase(openQids), errors)
+    : emptyCollected("knowledge_base");
 
   const authTypes = authRecords.data.filter((record) => (asNumber(record.count) ?? 0) > 0).map((record) => asString(record.type) ?? "");
   const windowsHosts = hosts.data.filter((host) => /windows/i.test(hostOs(host)));
   const unixHosts = hosts.data.filter((host) => /linux|unix|bsd|solaris|aix|hp-ux|esx|mac os|darwin/i.test(hostOs(host)));
+  const networkHosts = hosts.data.filter((host) => NETWORK_DEVICE_OS_PATTERN.test(hostOs(host)));
+  const hostsWithoutOs = hosts.data.filter((host) => hostOs(host).trim() === "");
   const missingAuthTypes: string[] = [];
   if (windowsHosts.length > 0 && !authTypes.some((type) => /windows/.test(type))) missingAuthTypes.push("windows");
   if (unixHosts.length > 0 && !authTypes.some((type) => /unix|linux/.test(type))) missingAuthTypes.push("unix");
+  if (networkHosts.length > 0 && !authTypes.some((type) => NETWORK_AUTH_TYPE_PATTERN.test(type))) missingAuthTypes.push("network device");
+  const scannedHosts = hosts.data.filter((host) => parseDate(hostLastScan(host)));
+  const authScannedHosts = scannedHosts.filter((host) => hostRecentlyAuthScanned(host, now, settings.lookbackDays));
+  const authScannedPercent = percent(authScannedHosts.length, scannedHosts.length);
 
-  const inactivePolicies = policies.data.filter((policy) => !policyIsActive(policy)).map((policy) => asString(policy.TITLE) ?? asString(policy.ID) ?? "policy");
-  const unassignedPolicies = policies.data.filter((policy) => policyIsActive(policy) && !policyIsAssigned(policy)).map((policy) => asString(policy.TITLE) ?? asString(policy.ID) ?? "policy");
+  const inactivePolicies = policies.data.filter((policy) => policyStatus(policy) === "inactive").map((policy) => recordLabel(policy, "policy"));
+  const unknownStatusPolicies = policies.data.filter((policy) => policyStatus(policy) === "unknown").map((policy) => recordLabel(policy, "policy"));
+  const unassignedPolicies = policies.data.filter((policy) => policyIsActive(policy) && !policyIsAssigned(policy)).map((policy) => recordLabel(policy, "policy"));
+  const hiddenAssignmentPolicies = policies.data.filter(policyHasHiddenAssetGroups).map((policy) => recordLabel(policy, "policy"));
 
-  const slaScoped = detections.data.filter((detection) => detectionSlaDays(detection, settings) !== undefined);
-  const slaBreaches = slaScoped.filter((detection) => {
-    const age = detectionAgeDays(detection, now);
-    const sla = detectionSlaDays(detection, settings) ?? 0;
-    return age !== undefined && age > sla;
-  });
-  const slaPercent = slaScoped.length === 0 ? 100 : percent(slaScoped.length - slaBreaches.length, slaScoped.length);
+  const slaScoped = openDetections.filter((detection) => detectionSlaDays(detection, settings) !== undefined);
+  const slaDated = slaScoped.filter((detection) => detectionAgeDays(detection, now) !== undefined);
+  const slaUndated = slaScoped.filter((detection) => detectionAgeDays(detection, now) === undefined);
+  const slaBreaches = slaDated.filter((detection) => (detectionAgeDays(detection, now) ?? 0) > (detectionSlaDays(detection, settings) ?? 0));
+  const slaPercent = slaDated.length === 0 ? 0 : percent(slaDated.length - slaBreaches.length, slaDated.length);
   const breachBySeverity = {
     critical: slaBreaches.filter((detection) => detectionSeverity(detection) >= 5).length,
     high: slaBreaches.filter((detection) => detectionSeverity(detection) === 4).length,
@@ -1750,119 +2222,241 @@ export async function assessQualysVulnerabilityManagement(
 
   const patchableQids = new Set(knowledgeBase.data.filter((vuln) => asBoolean(vuln.PATCHABLE) === true).map((vuln) => asString(vuln.QID)).filter(Boolean));
   const kbQids = new Set(knowledgeBase.data.map((vuln) => asString(vuln.QID)).filter(Boolean));
-  const patchableDetections = detections.data.filter((detection) => patchableQids.has(asString(detection.QID)));
-  const overduePatchable = patchableDetections.filter((detection) => (detectionAgeDays(detection, now) ?? 0) > settings.slaHighDays);
-  const overduePercent = percent(overduePatchable.length, patchableDetections.length);
+  const unresolvedQids = openQids.filter((qid) => !kbQids.has(qid));
+  const patchableDetections = openDetections.filter((detection) => patchableQids.has(asString(detection.QID)));
+  const patchableDated = patchableDetections.filter((detection) => detectionAgeDays(detection, now) !== undefined);
+  const patchableUndated = patchableDetections.filter((detection) => detectionAgeDays(detection, now) === undefined);
+  const overduePatchable = patchableDated.filter((detection) => (detectionAgeDays(detection, now) ?? 0) > settings.slaHighDays);
+  const overduePercent = percent(overduePatchable.length, patchableDated.length);
 
-  const qdsDetections = detections.data.filter(detectionHasQds);
-  const qdsPercent = percent(qdsDetections.length, detections.data.length);
+  const qdsDetections = openDetections.filter(detectionHasQds);
+  const qdsPercent = percent(qdsDetections.length, openDetections.length);
+
+  const detectionsFullyRead = !detections.error && !detections.truncated;
+  const hostPopulationKnown = !hosts.error && hosts.data.length > 0;
 
   const findings: QualysFinding[] = [];
 
-  findings.push(authRecords.error
-    ? unavailableFinding(8, "high", authRecords.error, "review Scans > Authentication for Windows, Unix, and network device records and run an Authentication Report to find failing credentials.")
-    : finding(
-      8,
-      "high",
-      authTypes.length === 0 ? "fail" : missingAuthTypes.length > 0 ? "fail" : "pass",
-      authTypes.length === 0
-        ? "No authentication records exist, so credentialed scanning is not configured."
+  const authRecordStatus: QualysFindingStatus = authRecords.error || hosts.error
+    ? "manual"
+    : authTypes.length === 0
+      ? "fail"
+      : hosts.data.length === 0
+        ? "manual"
         : missingAuthTypes.length > 0
-          ? `Authentication records exist for ${authTypes.join(", ")} but hosts of type ${missingAuthTypes.join(", ")} have no matching record type. Credential failures still require the Authentication Report.`
-          : `Authentication record types present: ${authTypes.join(", ")}. Verify expired or failing credentials with the Authentication Report.`,
-      {
-        auth_record_types: authRecords.data,
-        windows_hosts: windowsHosts.length,
-        unix_hosts: unixHosts.length,
-        missing_auth_types: missingAuthTypes,
-      },
-    ));
+          ? "fail"
+          : scannedHosts.length === 0
+            ? "fail"
+            : authScannedPercent >= settings.minAuthScanPercent
+              ? "pass"
+              : "warn";
+  findings.push(guardedFinding({
+    control: 8,
+    severity: "high",
+    status: authRecordStatus,
+    summary: authRecords.error || hosts.error
+      ? unreadableSummary(8, [authRecords, hosts])
+      : authTypes.length === 0
+        ? "No authentication records with assigned IDs exist, so credentialed scanning is not configured; emptiness is a failure for this control."
+        : hosts.data.length === 0
+          ? `Authentication record types ${authTypes.join(", ")} exist but no host assets were returned, so coverage of Windows, Unix, and network device populations cannot be compared; treated as unknown.`
+          : missingAuthTypes.length > 0
+            ? `Authentication records exist for ${authTypes.join(", ")} but ${missingAuthTypes.join(", ")} hosts (${windowsHosts.length} Windows, ${unixHosts.length} Unix-like, ${networkHosts.length} network devices) have no matching record type.`
+            : scannedHosts.length === 0
+              ? `Authentication record types ${authTypes.join(", ")} cover the host OS mix, but none of the ${hosts.data.length} hosts has a scan date, so there is no evidence the credentials work.`
+              : `Authentication record types ${authTypes.join(", ")} cover the host OS mix (${windowsHosts.length} Windows, ${unixHosts.length} Unix-like, ${networkHosts.length} network devices) and ${authScannedHosts.length}/${scannedHosts.length} scanned hosts (${authScannedPercent}%) had a recent authenticated scan, which is the API evidence that credentials are not expired or failing (threshold ${settings.minAuthScanPercent}%).`,
+    evidence: {
+      auth_record_types: authRecords.data,
+      windows_hosts: windowsHosts.length,
+      unix_hosts: unixHosts.length,
+      network_device_hosts: networkHosts.length,
+      missing_auth_types: missingAuthTypes,
+      authenticated_scan_percent: authScannedPercent,
+    },
+    sources: [authRecords, hosts],
+    scope,
+    manualEvidence: "review Scans > Authentication for Windows, Unix, and network device records and run an Authentication Report to find expired or failing credentials.",
+    unknownBuckets: { hosts_without_os: hostsWithoutOs.length },
+  }));
 
-  findings.push(policies.error
-    ? unavailableFinding(9, "medium", policies.error, "list Policy Compliance policies and confirm each active policy is assigned to asset groups or tags (the PC module may not be subscribed).")
-    : finding(
-      9,
-      "medium",
-      policies.data.length === 0 ? "warn" : unassignedPolicies.length > 0 ? "fail" : inactivePolicies.length > 0 ? "warn" : "pass",
-      policies.data.length === 0
-        ? "No Policy Compliance policies were returned."
+  const policyStatusVerdict: QualysFindingStatus = policies.error
+    ? "manual"
+    : policies.data.length === 0
+      ? "manual"
+      : unassignedPolicies.length > 0
+        ? "fail"
+        : inactivePolicies.length > 0
+          ? "warn"
+          : "pass";
+  findings.push(guardedFinding({
+    control: 9,
+    severity: "medium",
+    status: policyStatusVerdict,
+    summary: policies.error
+      ? unreadableSummary(9, [policies])
+      : policies.data.length === 0
+        ? "The Policy Compliance policy list is empty. This is not applicable if Policy Compliance is not in use; otherwise no compliance policy is assigned to any asset. Emptiness is treated as unknown, not compliant."
         : unassignedPolicies.length > 0
-          ? `${unassignedPolicies.length}/${policies.data.length} active compliance policies have no asset group or tag assignment.`
+          ? `${unassignedPolicies.length}/${policies.data.length} active compliance policies have no ASSET_GROUP_IDS or TAG_SET_INCLUDE assignment.`
           : inactivePolicies.length > 0
-            ? `${inactivePolicies.length}/${policies.data.length} compliance policies are inactive or draft.`
-            : `All ${policies.data.length} compliance policies are active and assigned.`,
-      {
-        policies: policies.data.length,
-        inactive_policies: inactivePolicies.slice(0, 50),
-        unassigned_policies: unassignedPolicies.slice(0, 50),
-      },
-    ));
+            ? `${inactivePolicies.length}/${policies.data.length} compliance policies report an inactive or draft STATUS.`
+            : `All ${policies.data.length} compliance policies report STATUS active and carry an asset group or tag assignment.`,
+    evidence: {
+      policies: policies.data.length,
+      inactive_policies: inactivePolicies.slice(0, 50),
+      unassigned_policies: unassignedPolicies.slice(0, 50),
+      policies_with_hidden_asset_groups: hiddenAssignmentPolicies.slice(0, 50),
+    },
+    sources: [policies],
+    scope,
+    manualEvidence: "list Policy Compliance policies and confirm each active policy is assigned to asset groups or tags, or record that the PC module is not in use.",
+    unknownBuckets: { policies_without_status: unknownStatusPolicies.length, policies_with_hidden_asset_groups: hiddenAssignmentPolicies.length },
+  }));
 
-  findings.push(detections.error
-    ? unavailableFinding(10, "critical", detections.error, "run a VMDR report of open severity 3 to 5 detections with first-found dates and compute SLA adherence against the 15/30/90 day windows.")
-    : finding(
-      10,
-      "critical",
-      slaScoped.length === 0 ? "pass" : slaPercent >= 95 ? "pass" : slaPercent >= 80 ? "warn" : "fail",
-      slaScoped.length === 0
-        ? "No open severity 3 to 5 detections were returned within the sampled scope."
-        : `${slaScoped.length - slaBreaches.length}/${slaScoped.length} sampled open detections (${slaPercent}%) are within SLA (critical ${settings.slaCriticalDays}d, high ${settings.slaHighDays}d, medium ${settings.slaMediumDays}d); ${slaBreaches.length} breaches.`,
-      {
-        sampled_detections: slaScoped.length,
-        sla_breaches: slaBreaches.length,
-        sla_compliance_percent: slaPercent,
-        breaches_by_severity: breachBySeverity,
-        sla_days: { critical: settings.slaCriticalDays, high: settings.slaHighDays, medium: settings.slaMediumDays },
-      },
-    ));
+  const slaStatus: QualysFindingStatus = detections.error || hosts.error
+    ? "manual"
+    : !hostPopulationKnown
+      ? "manual"
+      : slaScoped.length === 0
+        ? detectionsFullyRead ? "pass" : "manual"
+        : slaDated.length === 0
+          ? "warn"
+          : slaPercent >= 95
+            ? "pass"
+            : slaPercent >= 80
+              ? "warn"
+              : "fail";
+  findings.push(guardedFinding({
+    control: 10,
+    severity: "critical",
+    status: slaStatus,
+    summary: detections.error || hosts.error
+      ? unreadableSummary(10, [detections, hosts])
+      : !hostPopulationKnown
+        ? "No host assets were returned, so the absence or presence of open detections cannot be interpreted; treated as unknown, not compliant."
+        : slaScoped.length === 0
+          ? detectionsFullyRead
+            ? `Zero open severity 3 to 5 detections across ${hosts.data.length} hosts with the detection list read completely; emptiness is compliant for this control because the host population is non-zero and no open detection exists to breach an SLA.`
+            : `Zero open severity 3 to 5 detections were returned, but the detection list was not read completely (${detections.truncationReason ?? "truncated"}), so emptiness cannot be trusted.`
+          : slaDated.length === 0
+            ? `${slaScoped.length} open detections were returned but none carries FIRST_FOUND_DATETIME, so SLA age cannot be computed and none is counted as compliant.`
+            : `${slaDated.length - slaBreaches.length}/${slaDated.length} dated open detections (${slaPercent}%) are within SLA (critical ${settings.slaCriticalDays}d, high ${settings.slaHighDays}d, medium ${settings.slaMediumDays}d); ${slaBreaches.length} breaches; ${slaUndated.length} detections without a first-found date were excluded from the compliant count.`,
+    evidence: {
+      hosts: hosts.data.length,
+      detections_returned: detections.data.length,
+      open_detections: openDetections.length,
+      closed_detections_excluded: closedDetections.length,
+      fixed_or_info_excluded: excludedDetections.length,
+      sla_scoped_detections: slaScoped.length,
+      sla_dated_detections: slaDated.length,
+      sla_breaches: slaBreaches.length,
+      sla_compliance_percent: slaPercent,
+      breaches_by_severity: breachBySeverity,
+      sla_days: { critical: settings.slaCriticalDays, high: settings.slaHighDays, medium: settings.slaMediumDays },
+    },
+    sources: [detections, hosts],
+    scope,
+    manualEvidence: "run a VMDR report of open severity 3 to 5 detections with first-found dates and compute SLA adherence against the 15/30/90 day windows.",
+    unknownBuckets: {
+      detections_without_first_found: slaUndated.length,
+      detections_without_severity: detectionsWithoutSeverity.length,
+      detections_without_status: detectionsWithoutStatus.length,
+    },
+  }));
 
-  findings.push(detections.error || (openQids.length > 0 && kbQids.size === 0)
-    ? unavailableFinding(11, "high", detections.error ?? "knowledge base lookup returned no entries", "export the patch report for open detections and record patch availability and patch age.")
-    : finding(
-      11,
-      "high",
-      patchableDetections.length === 0 ? "pass" : overduePercent > 25 ? "fail" : overduePatchable.length > 0 ? "warn" : "pass",
-      patchableDetections.length === 0
-        ? `Patch availability tracking resolved ${kbQids.size} QIDs and none of the sampled open detections have a vendor patch available.`
-        : `${overduePatchable.length}/${patchableDetections.length} sampled patchable detections (${overduePercent}%) have been open longer than ${settings.slaHighDays} days.`,
-      {
-        knowledge_base_qids: kbQids.size,
-        patchable_qids: patchableQids.size,
-        patchable_detections: patchableDetections.length,
-        overdue_patchable_detections: overduePatchable.length,
-        overdue_percent: overduePercent,
-      },
-    ));
+  const knowledgeBaseUnusable = openQids.length > 0 && !knowledgeBase.error && kbQids.size === 0;
+  const patchStatus: QualysFindingStatus = detections.error || hosts.error || knowledgeBase.error || knowledgeBaseUnusable
+    ? "manual"
+    : !hostPopulationKnown
+      ? "manual"
+      : openDetections.length === 0
+        ? detectionsFullyRead ? "pass" : "manual"
+        : patchableDetections.length === 0
+          ? "pass"
+          : patchableDated.length === 0
+            ? "warn"
+            : overduePercent > 25
+              ? "fail"
+              : overduePatchable.length > 0
+                ? "warn"
+                : "pass";
+  findings.push(guardedFinding({
+    control: 11,
+    severity: "high",
+    status: patchStatus,
+    summary: detections.error || hosts.error || knowledgeBase.error
+      ? unreadableSummary(11, [detections, hosts, knowledgeBase])
+      : knowledgeBaseUnusable
+        ? `The knowledge base lookup returned no entries for ${openQids.length} open QIDs, so patch availability cannot be determined.`
+        : !hostPopulationKnown
+          ? "No host assets were returned, so patch tracking cannot be interpreted; treated as unknown, not compliant."
+          : openDetections.length === 0
+            ? detectionsFullyRead
+              ? `Zero open detections across ${hosts.data.length} hosts with the detection list read completely, so there is no patch backlog; emptiness is compliant for this control.`
+              : `Zero open detections were returned but the detection list was not read completely (${detections.truncationReason ?? "truncated"}), so emptiness cannot be trusted.`
+            : patchableDetections.length === 0
+              ? `Patch availability was resolved for ${kbQids.size}/${openQids.length} open QIDs and none of the ${openDetections.length} open detections has a vendor patch available.`
+              : patchableDated.length === 0
+                ? `${patchableDetections.length} patchable detections exist but none carries FIRST_FOUND_DATETIME, so patch age cannot be computed.`
+                : `${overduePatchable.length}/${patchableDated.length} dated patchable detections (${overduePercent}%) have been open longer than ${settings.slaHighDays} days; ${patchableUndated.length} undated patchable detections were excluded from the compliant count.`,
+    evidence: {
+      open_qids: openQids.length,
+      knowledge_base_qids: kbQids.size,
+      unresolved_qids: unresolvedQids.length,
+      patchable_qids: patchableQids.size,
+      patchable_detections: patchableDetections.length,
+      overdue_patchable_detections: overduePatchable.length,
+      overdue_percent: overduePercent,
+    },
+    sources: [detections, hosts, knowledgeBase],
+    scope,
+    manualEvidence: "export the patch report for open detections and record patch availability and patch age.",
+    unknownBuckets: { patchable_detections_without_first_found: patchableUndated.length, qids_without_knowledge_base_entry: unresolvedQids.length },
+  }));
 
-  findings.push(detections.error
-    ? unavailableFinding(17, "medium", detections.error, "confirm the VMDR subscription exposes Qualys Detection Scores and document the triage workflow that uses QDS or CVSS.")
-    : finding(
-      17,
-      "medium",
-      detections.data.length === 0 ? "warn" : qdsPercent >= 90 ? "pass" : qdsPercent > 0 ? "warn" : "fail",
-      detections.data.length === 0
-        ? "No open detections were returned, so QDS availability could not be confirmed."
-        : `${qdsDetections.length}/${detections.data.length} sampled detections (${qdsPercent}%) carry a Qualys Detection Score. Document the triage workflow manually.`,
-      {
-        detections_with_qds: qdsDetections.length,
-        sampled_detections: detections.data.length,
-        qds_percent: qdsPercent,
-      },
-    ));
+  const qdsStatus: QualysFindingStatus = detections.error
+    ? "manual"
+    : openDetections.length === 0
+      ? "manual"
+      : qdsPercent > 0
+        ? "warn"
+        : "fail";
+  findings.push(guardedFinding({
+    control: 17,
+    severity: "medium",
+    status: qdsStatus,
+    summary: detections.error
+      ? unreadableSummary(17, [detections])
+      : openDetections.length === 0
+        ? "No open detections were returned, so QDS availability cannot be confirmed; treated as unknown, not compliant."
+        : `${qdsDetections.length}/${openDetections.length} open detections (${qdsPercent}%) carry a Qualys Detection Score${qdsPercent >= 90 ? ", which confirms QDS is exposed" : ""}. The triage workflow that consumes QDS or CVSS is not machine-verifiable, so the verdict is capped at warn until documented.`,
+    evidence: {
+      detections_with_qds: qdsDetections.length,
+      open_detections: openDetections.length,
+      qds_percent: qdsPercent,
+    },
+    sources: [detections],
+    scope,
+    manualEvidence: "confirm the VMDR subscription exposes Qualys Detection Scores and document the triage workflow that uses QDS or CVSS.",
+  }));
 
   return {
     category: "vulnerability_management",
     title: "Qualys vulnerability and compliance management",
     summary: {
       platform: config.platform,
+      view_scope: scope.note,
       auth_record_types: authTypes,
       compliance_policies: policies.data.length,
-      sampled_detections: detections.data.length,
+      hosts: hosts.data.length,
+      detections_returned: detections.data.length,
+      open_detections: openDetections.length,
       sla_compliance_percent: slaPercent,
       sla_breaches: slaBreaches.length,
       patchable_detections: patchableDetections.length,
       overdue_patchable_detections: overduePatchable.length,
       qds_percent: qdsPercent,
+      truncated_sources: [authRecords, hosts, policies, detections, knowledgeBase].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
     },
     findings,
@@ -1885,7 +2479,7 @@ function userRoles(user: JsonRecord): string[] {
 }
 
 function userIsManager(user: JsonRecord): boolean {
-  return userRoles(user).some((role) => /^manager$|super user|administrator/i.test(role));
+  return userRoles(user).some((role) => /^manager$|super ?user|administrator/i.test(role.trim()));
 }
 
 function userName(user: JsonRecord): string {
@@ -1896,8 +2490,34 @@ function userEmail(user: JsonRecord): string | undefined {
   return (asString(user.emailAddress) ?? pathString(user, "CONTACT_INFO", "EMAIL"))?.toLowerCase();
 }
 
+function userStatus(user: JsonRecord): string | undefined {
+  return (asString(user.userStatus) ?? asString(user.status) ?? asString(user.USER_STATUS))?.trim().toLowerCase();
+}
+
+function userIsDeactivated(user: JsonRecord): boolean {
+  const status = userStatus(user);
+  return status !== undefined && /deactivated|inactive|disabled|deleted/.test(status);
+}
+
+function userLastLogin(user: JsonRecord): unknown {
+  return user.lastLoginDate ?? user.LAST_LOGIN_DATE ?? user.lastLogin;
+}
+
 function reportIsActive(report: JsonRecord): boolean {
-  return asBoolean(report.ACTIVE) !== false;
+  const flag = asBoolean(report.ACTIVE) ?? asBoolean(report.IS_ACTIVE);
+  return flag !== false;
+}
+
+function reportActiveFlagMissing(report: JsonRecord): boolean {
+  return asBoolean(report.ACTIVE) === undefined && asBoolean(report.IS_ACTIVE) === undefined;
+}
+
+function wasScheduleIsActive(schedule: JsonRecord): boolean {
+  return asBoolean(schedule.active) === true || /^active$/i.test(asString(schedule.status) ?? "");
+}
+
+function wasScheduleFlagMissing(schedule: JsonRecord): boolean {
+  return asBoolean(schedule.active) === undefined && asString(schedule.status) === undefined;
 }
 
 function webAppLastScanDate(webApp: JsonRecord, scans: JsonRecord[]): Date | undefined {
@@ -1924,135 +2544,183 @@ export async function assessQualysAdministration(
   const now = new Date();
 
   const [scheduledReports, reports, users, activity, webApps, wasScans, wasAuth, wasSchedules] = await Promise.all([
-    collect("scheduled_reports", () => client.listScheduledReports(), [] as JsonRecord[], errors),
-    collect("reports", () => client.listReports(), [] as JsonRecord[], errors),
-    collect("users", () => client.searchUsers(), [] as JsonRecord[], errors),
-    collect("activity_log", () => client.listActivityLog(settings.lookbackDays), [] as JsonRecord[], errors),
-    collect("was_webapps", () => client.searchWebApps(), [] as JsonRecord[], errors),
-    collect("was_scans", () => client.searchWasScans(settings.lookbackDays), [] as JsonRecord[], errors),
-    collect("was_auth_records", () => client.searchWasAuthRecords(), [] as JsonRecord[], errors),
-    collect("was_schedules", () => client.searchWasSchedules(), [] as JsonRecord[], errors),
+    collect("scheduled_reports", () => client.listScheduledReports(), errors, DEFAULT_LIST_LIMIT),
+    collect("reports", () => client.listReports(), errors, DEFAULT_LIST_LIMIT),
+    collect("users", () => client.searchUsers(), errors, DEFAULT_LIST_LIMIT),
+    collect("activity_log", () => client.listActivityLog(settings.lookbackDays), errors, DEFAULT_LIST_LIMIT),
+    collect("was_webapps", () => client.searchWebApps(), errors, DEFAULT_LIST_LIMIT),
+    collect("was_scans", () => client.searchWasScans(settings.lookbackDays), errors, DEFAULT_LIST_LIMIT),
+    collect("was_auth_records", () => client.searchWasAuthRecords(), errors, DEFAULT_LIST_LIMIT),
+    collect("was_schedules", () => client.searchWasSchedules(), errors, DEFAULT_LIST_LIMIT),
   ]);
+  const scope = resolveViewScope(config, users, activity);
 
   const activeScheduledReports = scheduledReports.data.filter(reportIsActive);
+  const reportsWithoutActiveFlag = scheduledReports.data.filter(reportActiveFlagMissing);
   const recentReports = reports.data.filter((report) => (ageInDays(report.LAUNCH_DATETIME, now) ?? Number.POSITIVE_INFINITY) <= settings.lookbackDays);
 
-  const managers = users.data.filter(userIsManager).map(userName);
+  const activeUsers = users.data.filter((user) => !userIsDeactivated(user));
+  const deactivatedUsers = users.data.filter(userIsDeactivated);
+  const usersWithoutRole = activeUsers.filter((user) => userRoles(user).length === 0).map(userName);
+  const managers = activeUsers.filter(userIsManager).map(userName);
   const emailCounts = new Map<string, number>();
-  for (const user of users.data) {
+  for (const user of activeUsers) {
     const email = userEmail(user);
     if (email) emailCounts.set(email, (emailCounts.get(email) ?? 0) + 1);
   }
   const sharedEmails = [...emailCounts.entries()].filter(([, count]) => count > 1).map(([email]) => email);
-  const genericAccounts = users.data.map(userName).filter((name) => /shared|generic|service|svc|admin\d*$|test/i.test(name));
-  const inactiveUsers = users.data.filter((user) => {
-    const age = ageInDays(user.LAST_LOGIN_DATE ?? user.lastLoginDate, now);
-    return age !== undefined && age > 90;
-  }).map(userName);
+  const genericAccounts = activeUsers.map(userName).filter((name) => /shared|generic|service|svc|admin\d*$|test/i.test(name));
+  const usersWithLastLogin = activeUsers.filter((user) => parseDate(userLastLogin(user)));
+  const usersWithoutLastLogin = activeUsers.filter((user) => !parseDate(userLastLogin(user)));
+  const inactiveUsers = usersWithLastLogin.filter((user) => (ageInDays(userLastLogin(user), now) ?? 0) > INACTIVE_USER_DAYS).map(userName);
 
   const sensitiveActions = activity.data.filter((entry) => SENSITIVE_ACTIVITY_PATTERN.test(`${asString(entry.action) ?? ""} ${asString(entry.module) ?? ""} ${asString(entry.details) ?? ""}`));
 
-  const unscannedWebApps = webApps.data.filter((webApp) => {
+  const neverScannedWebApps = webApps.data.filter((webApp) => !webAppLastScanDate(webApp, wasScans.data)).map((webApp) => recordLabel(webApp, "web app"));
+  const staleWebApps = webApps.data.filter((webApp) => {
     const last = webAppLastScanDate(webApp, wasScans.data);
-    return !last || ageInDays(last, now)! > settings.lookbackDays;
-  }).map((webApp) => asString(webApp.name) ?? asString(webApp.id) ?? "web app");
-  const staleWasAuth = wasAuth.data.filter((record) => (ageInDays(record.updatedDate ?? record.createdDate, now) ?? 0) > 180).map((record) => asString(record.name) ?? asString(record.id) ?? "auth record");
-  const activeWasSchedules = wasSchedules.data.filter((schedule) => asBoolean(schedule.active) !== false);
-  const wasModuleMissing = Boolean(webApps.error && isModuleUnavailableError(webApps.error));
+    return Boolean(last) && (ageInDays(last, now) ?? 0) > settings.lookbackDays;
+  }).map((webApp) => recordLabel(webApp, "web app"));
+  const wasAuthWithoutDate = wasAuth.data.filter((record) => !parseDate(record.updatedDate ?? record.createdDate)).map((record) => recordLabel(record, "auth record"));
+  const staleWasAuth = wasAuth.data.filter((record) => (ageInDays(record.updatedDate ?? record.createdDate, now) ?? -1) > STALE_WAS_AUTH_DAYS).map((record) => recordLabel(record, "auth record"));
+  const activeWasSchedules = wasSchedules.data.filter(wasScheduleIsActive);
+  const wasSchedulesWithoutFlag = wasSchedules.data.filter(wasScheduleFlagMissing);
 
   const findings: QualysFinding[] = [];
 
-  findings.push(scheduledReports.error
-    ? unavailableFinding(12, "medium", scheduledReports.error, "review Reports > Schedules and each schedule's distribution list for appropriate recipients.")
-    : finding(
-      12,
-      "medium",
-      activeScheduledReports.length === 0 ? "fail" : recentReports.length === 0 ? "warn" : "pass",
-      activeScheduledReports.length === 0
-        ? "No active scheduled reports exist, so automated report generation is not configured."
-        : `${activeScheduledReports.length} active scheduled reports and ${recentReports.length} reports generated in the last ${settings.lookbackDays} days. Distribution recipients are not exposed by the API and must be reviewed in the UI.`,
-      {
-        active_scheduled_reports: activeScheduledReports.map((report) => asString(report.TITLE) ?? asString(report.ID)).slice(0, 50),
-        recent_reports: recentReports.length,
-        manual_evidence: "Distribution list recipients per scheduled report.",
-      },
-    ));
+  findings.push(guardedFinding({
+    control: 12,
+    severity: "medium",
+    status: scheduledReports.error || reports.error ? "manual" : activeScheduledReports.length === 0 ? "fail" : "warn",
+    summary: scheduledReports.error || reports.error
+      ? unreadableSummary(12, [scheduledReports, reports])
+      : activeScheduledReports.length === 0
+        ? "No active scheduled reports exist (queried with is_active=1), so automated report generation is not configured; emptiness is a failure for this control."
+        : `${activeScheduledReports.length} active scheduled reports (queried with is_active=1) and ${recentReports.length} reports generated in the last ${settings.lookbackDays} days${recentReports.length === 0 ? ", so schedules exist but produced nothing in the review window" : ""}. Distribution recipients are not exposed by the API, so the verdict is capped at warn until reviewed in the UI.`,
+    evidence: {
+      active_scheduled_reports: activeScheduledReports.map((report) => recordLabel(report, "report")).slice(0, 50),
+      scheduled_reports_without_active_flag: reportsWithoutActiveFlag.length,
+      active_filter: "is_active=1",
+      recent_reports: recentReports.length,
+      reports_returned: reports.data.length,
+    },
+    sources: [scheduledReports, reports],
+    scope,
+    manualEvidence: "review Reports > Schedules and each schedule's distribution list for appropriate recipients.",
+  }));
 
-  findings.push(users.error
-    ? unavailableFinding(13, "high", users.error, "export Users > User Management and review roles, last login dates, and shared accounts.")
-    : finding(
-      13,
-      "high",
-      users.data.length === 0 ? "warn" : managers.length > settings.maxManagers || sharedEmails.length > 0 ? "fail" : genericAccounts.length > 0 || inactiveUsers.length > 0 ? "warn" : "pass",
-      users.data.length === 0
-        ? "No users were returned by the Administration API."
-        : `${users.data.length} active users, ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}), ${sharedEmails.length} email addresses shared by multiple accounts, ${genericAccounts.length} generic-looking account names. Last login is not exposed by the Administration API, so inactive users must be reviewed in the UI.`,
-      {
-        users: users.data.length,
-        managers: managers.slice(0, 50),
-        max_managers: settings.maxManagers,
-        shared_emails: sharedEmails.slice(0, 50),
-        generic_accounts: genericAccounts.slice(0, 50),
-        inactive_users: inactiveUsers.slice(0, 50),
-        manual_evidence: "Users > User Management export with last login dates.",
-      },
-    ));
+  const userStatusVerdict: QualysFindingStatus = users.error
+    ? "manual"
+    : activeUsers.length === 0
+      ? "manual"
+      : managers.length > settings.maxManagers || sharedEmails.length > 0
+        ? "fail"
+        : "manual";
+  findings.push(guardedFinding({
+    control: 13,
+    severity: "high",
+    status: userStatusVerdict,
+    summary: users.error
+      ? unreadableSummary(13, [users])
+      : activeUsers.length === 0
+        ? "The Administration API returned no active users, which cannot be true for a working subscription, so the API user cannot see the user list; treated as unknown, not compliant."
+        : managers.length > settings.maxManagers || sharedEmails.length > 0
+          ? `${activeUsers.length} visible active users include ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}) and ${sharedEmails.length} email addresses shared by multiple accounts.`
+          : `${activeUsers.length} visible active users, ${managers.length} visible Manager or super user accounts (threshold ${settings.maxManagers}), ${sharedEmails.length} shared email addresses, ${genericAccounts.length} generic-looking account names, ${inactiveUsers.length} users with a last login older than ${INACTIVE_USER_DAYS} days. The Administration API returns only Active-status users, hides other Manager and Super User accounts, and does not expose last login, so the manager count is a lower bound and the verdict cannot exceed manual.`,
+    evidence: {
+      users_returned: users.data.length,
+      active_users: activeUsers.length,
+      deactivated_users: deactivatedUsers.length,
+      managers: managers.slice(0, 50),
+      max_managers: settings.maxManagers,
+      shared_emails: sharedEmails.slice(0, 50),
+      generic_accounts: genericAccounts.slice(0, 50),
+      inactive_users: inactiveUsers.slice(0, 50),
+      users_with_last_login: usersWithLastLogin.length,
+      api_contract: "search/am/user returns Active users only and cannot return other Super Users or Managers.",
+    },
+    sources: [users],
+    scope,
+    manualEvidence: "export Users > User Management with roles, status, and last login dates, and reconcile the full Manager list against the approved administrator roster.",
+    unknownBuckets: { users_without_role: usersWithoutRole.length, users_without_last_login: usersWithoutLastLogin.length },
+  }));
 
-  findings.push(webApps.error
-    ? unavailableFinding(15, "medium", webApps.error, wasModuleMissing
-      ? "WAS module is not enabled for this account; confirm whether web applications are in scope and where they are scanned."
-      : "export the WAS web application list with last scan dates and authentication record ages.")
-    : finding(
-      15,
-      "medium",
-      webApps.data.length === 0 ? "warn" : unscannedWebApps.length > 0 ? "fail" : staleWasAuth.length > 0 ? "warn" : "pass",
-      webApps.data.length === 0
-        ? "WAS is enabled but no web applications are inventoried."
-        : `${unscannedWebApps.length}/${webApps.data.length} web applications have no finished vulnerability scan within ${settings.lookbackDays} days; ${staleWasAuth.length} WAS authentication records are older than 180 days; ${activeWasSchedules.length} WAS schedules are active.`,
-      {
-        web_apps: webApps.data.length,
-        unscanned_web_apps: unscannedWebApps.slice(0, 50),
-        stale_auth_records: staleWasAuth.slice(0, 50),
-        active_schedules: activeWasSchedules.length,
-        scans_in_lookback: wasScans.data.length,
-      },
-    ));
+  const wasStatus: QualysFindingStatus = webApps.error || wasScans.error || wasAuth.error
+    ? "manual"
+    : webApps.data.length === 0
+      ? "manual"
+      : neverScannedWebApps.length > 0 || staleWebApps.length > 0
+        ? "fail"
+        : staleWasAuth.length > 0
+          ? "warn"
+          : "pass";
+  findings.push(guardedFinding({
+    control: 15,
+    severity: "medium",
+    status: wasStatus,
+    summary: webApps.error || wasScans.error || wasAuth.error
+      ? `${unreadableSummary(15, [webApps, wasScans, wasAuth])}${webApps.moduleUnavailable ? " The WAS module is not licensed or not enabled for this API user, so this control is not applicable unless web applications are scanned elsewhere." : ""}`
+      : webApps.data.length === 0
+        ? "WAS responded but no web applications are inventoried. This is not applicable if no web applications are in scope; otherwise the WAS inventory is missing. Emptiness is treated as unknown, not compliant."
+        : `${neverScannedWebApps.length}/${webApps.data.length} web applications have never had a finished vulnerability scan and ${staleWebApps.length} have none within ${settings.lookbackDays} days; ${staleWasAuth.length} WAS authentication records are older than ${STALE_WAS_AUTH_DAYS} days; ${activeWasSchedules.length}/${wasSchedules.data.length} WAS schedules report an active flag.`,
+    evidence: {
+      web_apps: webApps.data.length,
+      never_scanned_web_apps: neverScannedWebApps.slice(0, 50),
+      stale_web_apps: staleWebApps.slice(0, 50),
+      stale_auth_records: staleWasAuth.slice(0, 50),
+      active_schedules: activeWasSchedules.length,
+      schedules_returned: wasSchedules.data.length,
+      scans_in_lookback: wasScans.data.length,
+    },
+    sources: [webApps, wasScans, wasAuth, wasSchedules],
+    scope,
+    manualEvidence: "export the WAS web application list with last scan dates and authentication record ages, or record that no web applications are in scope.",
+    unknownBuckets: { was_auth_records_without_date: wasAuthWithoutDate.length, was_schedules_without_active_flag: wasSchedulesWithoutFlag.length },
+  }));
 
-  findings.push(activity.error
-    ? unavailableFinding(19, "medium", activity.error, "export the Activity Log for the review period and document who reviews sensitive administrative actions and how long the log is retained.")
-    : finding(
-      19,
-      "medium",
-      activity.data.length === 0 ? "warn" : sensitiveActions.length > 0 ? "warn" : "pass",
-      activity.data.length === 0
-        ? `The activity log returned no entries for the last ${settings.lookbackDays} days.`
-        : `${activity.data.length} activity log entries in the last ${settings.lookbackDays} days, ${sensitiveActions.length} involve sensitive administrative actions that need reviewer sign-off. Retention and review cadence must be documented manually.`,
-      {
-        entries: activity.data.length,
-        sensitive_actions: sensitiveActions.slice(0, 50).map((entry) => ({
-          date: asString(entry.date),
-          action: asString(entry.action),
-          module: asString(entry.module),
-          user: asString(entry.user_name),
-        })),
-        manual_evidence: "Activity log retention setting and evidence of periodic review.",
-      },
-    ));
+  findings.push(guardedFinding({
+    control: 19,
+    severity: "medium",
+    status: activity.error ? "manual" : activity.data.length === 0 ? "manual" : "warn",
+    summary: activity.error
+      ? unreadableSummary(19, [activity])
+      : activity.data.length === 0
+        ? `The activity log returned no entries for the last ${settings.lookbackDays} days, which cannot be true when this API call itself is logged, so the API user cannot read the log; treated as unknown, not compliant.`
+        : `${activity.data.length} activity log entries in the last ${settings.lookbackDays} days, ${sensitiveActions.length} involve sensitive administrative actions that need reviewer sign-off. Retention and review cadence are not exposed by the API, so the verdict is capped at warn until documented.`,
+    evidence: {
+      entries: activity.data.length,
+      sensitive_actions_count: sensitiveActions.length,
+      sensitive_actions: sensitiveActions.slice(0, 50).map((entry) => ({
+        date: asString(entry.date),
+        action: asString(entry.action),
+        module: asString(entry.module),
+        user: asString(entry.user_name),
+        role: asString(entry.user_role),
+      })),
+    },
+    sources: [activity],
+    scope,
+    manualEvidence: "export the Activity Log for the review period and document who reviews sensitive administrative actions and how long the log is retained.",
+  }));
 
   return {
     category: "administration",
     title: "Qualys administration and reporting hygiene",
     summary: {
       platform: config.platform,
+      view_scope: scope.note,
       active_scheduled_reports: activeScheduledReports.length,
       recent_reports: recentReports.length,
       users: users.data.length,
+      active_users: activeUsers.length,
       managers: managers.length,
       shared_emails: sharedEmails.length,
       activity_entries: activity.data.length,
       sensitive_actions: sensitiveActions.length,
       web_apps: webApps.data.length,
-      unscanned_web_apps: unscannedWebApps.length,
+      never_scanned_web_apps: neverScannedWebApps.length,
+      stale_web_apps: staleWebApps.length,
+      truncated_sources: [scheduledReports, reports, users, activity, webApps, wasScans, wasAuth, wasSchedules].filter((source) => source.truncated).map((source) => source.name),
       collection_errors: errors.length,
     },
     findings,
@@ -2078,7 +2746,15 @@ async function probeSurface(
 ): Promise<QualysAccessSurface> {
   try {
     const value = await load();
-    return { name, module, endpoint, status: "readable", count: Array.isArray(value) ? value.length : undefined };
+    const list = normalizeList(value);
+    return {
+      name,
+      module,
+      endpoint,
+      status: "readable",
+      count: Array.isArray(value) || asObject(value) ? list.items.length : undefined,
+      ...(list.truncated ? { truncation: list.truncationReason } : {}),
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -2093,6 +2769,10 @@ async function probeSurface(
 
 export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<QualysApiClient, "lastRateLimit">>): Promise<QualysAccessCheckResult> {
   const config = client.getResolvedConfig();
+  const scopeErrors: string[] = [];
+  const users = await collect("users", () => client.searchUsers(), scopeErrors, DEFAULT_LIST_LIMIT);
+  const activity = await collect("activity_log", () => client.listActivityLog(7), scopeErrors, DEFAULT_LIST_LIMIT);
+  const viewScope = resolveViewScope(config, users, activity);
   const surfaces: QualysAccessSurface[] = [
     await probeSurface("scheduled_scans", "VM", "/api/2.0/fo/schedule/scan/", () => client.listScheduledScans()),
     await probeSurface("hosts", "VM", "/api/2.0/fo/asset/host/", () => client.listHosts(100)),
@@ -2102,8 +2782,8 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
     await probeSurface("auth_records", "VM", "/api/2.0/fo/auth/", () => client.listAuthRecordSummary()),
     await probeSurface("detections", "VMDR", "/api/2.0/fo/asset/host/vm/detection/", () => client.listDetections(100)),
     await probeSurface("compliance_policies", "PC", "/api/2.0/fo/compliance/policy/", () => client.listCompliancePolicies()),
-    await probeSurface("activity_log", "Administration", "/api/2.0/fo/activity_log/", () => client.listActivityLog(7)),
-    await probeSurface("users", "Administration", "/qps/rest/2.0/search/am/user/", () => client.searchUsers()),
+    await probeSurface("activity_log", "Administration", "/api/2.0/fo/activity_log/", () => (activity.error ? Promise.reject(new Error(activity.error)) : Promise.resolve(activity.data))),
+    await probeSurface("users", "Administration", "/qps/rest/2.0/search/am/user/", () => (users.error ? Promise.reject(new Error(users.error)) : Promise.resolve(users.data))),
     await probeSurface("tags", "Asset Management", "/qps/rest/2.0/search/am/tag", () => client.searchTags(100)),
     await probeSurface("cloud_agents", "Cloud Agent", "/qps/rest/2.0/search/am/hostasset", () => client.searchCloudAgents(100)),
     await probeSurface("connectors", "Asset Management", "/qps/rest/2.0/search/am/assetdataconnector", () => client.searchConnectors()),
@@ -2115,7 +2795,7 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
   const coreReadable = coreSurfaces.filter((surface) => surface.status === "readable").length;
   const unavailableModules = uniqueStrings(surfaces.filter((surface) => surface.status === "module_unavailable").map((surface) => surface.module));
   const anyFailures = surfaces.some((surface) => surface.status !== "readable");
-  const status: QualysAccessCheckResult["status"] = coreReadable < coreSurfaces.length ? "limited" : anyFailures ? "degraded" : "healthy";
+  const status: QualysAccessCheckResult["status"] = coreReadable < coreSurfaces.length ? "limited" : anyFailures || viewScope.partial ? "degraded" : "healthy";
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
 
   return {
@@ -2125,6 +2805,7 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
     authMode: config.authMode,
     surfaces,
     unavailableModules,
+    viewScope,
     rateLimit: client.lastRateLimit ?? {},
     notes: [
       `Using Qualys platform ${config.platform} at ${config.baseUrl} with ${config.authMode} authentication.`,
@@ -2132,6 +2813,7 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
       unavailableModules.length > 0
         ? `Modules or roles not available to this account: ${unavailableModules.join(", ")}. Controls depending on them are reported as manual.`
         : "All probed modules responded.",
+      viewScope.note,
     ],
     recommendedNextStep:
       status === "limited"
@@ -2303,17 +2985,23 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
+const MAX_BUNDLE_SUFFIX = 99;
+
+export function bundleZipPath(outputDir: string): string {
+  return `${outputDir}.zip`;
+}
+
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  for (const suffix of ["", "-2", "-3", "-4", "-5", "-6"]) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+  for (let index = 1; index <= MAX_BUNDLE_SUFFIX; index += 1) {
+    const candidate = resolveSecureOutputPath(root, index === 1 ? preferredName : `${preferredName}-${index}`);
+    if (!existsSync(candidate) && !existsSync(bundleZipPath(candidate))) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
     }
   }
-  throw new Error(`Unable to allocate output directory under ${root}`);
+  throw new Error(`Unable to allocate output directory under ${root}: ${MAX_BUNDLE_SUFFIX} prior bundles already exist`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -2396,7 +3084,7 @@ export async function exportQualysAuditBundle(
     await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
-  const zipPath = `${outputDir}.zip`;
+  const zipPath = bundleZipPath(outputDir);
   await createZipArchive(outputDir, zipPath);
 
   return {
