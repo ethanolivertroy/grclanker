@@ -995,17 +995,82 @@ test("exportDuoAuditBundle writes the expected package and secure paths stay roo
 
   const result = await exportDuoAuditBundle(client, config, outputRoot);
 
+  // The bundle moved from assessments/, frameworks/, summary.md, and README.md to the
+  // shared grclanker layout (core_data/, analysis/, compliance/, QUICK_REFERENCE.md).
   assert.equal(existsSync(result.outputDir), true);
   assert.equal(existsSync(result.zipPath), true);
-  assert.equal(existsSync(join(result.outputDir, "README.md")), true);
-  assert.equal(existsSync(join(result.outputDir, "summary.md")), true);
-  assert.equal(existsSync(join(result.outputDir, "frameworks", "fedramp.md")), true);
-  assert.match(readFileSync(join(result.outputDir, "summary.md"), "utf8"), /Duo authentication assessment/);
+  assert.equal(result.zipPath, `${result.outputDir}.zip`, "zip is named after the allocated directory");
+  for (const relativePath of [
+    "QUICK_REFERENCE.md",
+    "config.json",
+    "core_data/users.json",
+    "core_data/global_policy.json",
+    "core_data/integrations.json",
+    "core_data/collection_status.json",
+    "analysis/authentication.json",
+    "analysis/admin_access.json",
+    "analysis/integrations.json",
+    "analysis/monitoring.json",
+    "analysis/findings.json",
+    "compliance/executive_summary.md",
+    "compliance/unified_compliance_matrix.md",
+    "compliance/fedramp/fedramp_compliance_report.md",
+    "compliance/cmmc/cmmc_compliance_report.md",
+    "compliance/soc2/soc2_compliance_report.md",
+    "compliance/cis/cis_compliance_report.md",
+    "compliance/pci_dss/pci_dss_compliance_report.md",
+    "compliance/disa_stig/stig_compliance_checklist.md",
+    "compliance/irap/irap_compliance_report.md",
+    "compliance/ismap/ismap_compliance_report.md",
+  ]) {
+    assert.equal(existsSync(join(result.outputDir, relativePath)), true, `${relativePath} is written`);
+  }
+  assert.equal(existsSync(join(result.outputDir, "_errors.log")), true, "offline enrollment logs are missing from this client, so _errors.log is written");
+  assert.match(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), /offline_enrollment/);
+  assert.match(readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8"), /Duo authentication assessment/);
   assert.equal(result.findingCount > 0, true);
-  assert.equal(result.fileCount > 5, true);
+  assert.equal(result.errorCount >= 1, true);
+  assert.equal(result.fileCount > 20, true);
+
+  const rerun = await exportDuoAuditBundle(client, config, outputRoot);
+  assert.notEqual(rerun.outputDir, result.outputDir, "re-running never overwrites the prior bundle directory");
+  assert.notEqual(rerun.zipPath, result.zipPath, "re-running never overwrites the prior zip");
+  assert.equal(existsSync(result.zipPath), true);
 
   assert.throws(
     () => resolveSecureOutputPath(outputRoot, "../escape"),
     /outside output root|symlinked output path/,
   );
+});
+
+test("exportDuoAuditBundle omits _errors.log when every read succeeds", async () => {
+  const outputRoot = createTempBase("grclanker-duo-export-clean-");
+  const config = createSampleConfig();
+  const authentication = compliantAuthenticationData();
+  const client = {
+    getSettings: async () => compliantSettings(),
+    listPolicies: async () => authentication.policies.data,
+    getGlobalPolicy: async () => authentication.globalPolicy.data,
+    listUsers: async () => authentication.users.data,
+    listBypassCodes: async () => [],
+    listWebauthnCredentials: async () => authentication.webauthnCredentials.data,
+    getAdminAllowedAuthMethods: async () => authentication.allowedAdminAuthMethods.data,
+    listAuthenticationLogs: async () => compliantMonitoringData().authenticationLogs.data,
+    listOfflineEnrollmentLogs: async () => [],
+    listAdmins: async () => compliantAdminData().admins.data,
+    listActivityLogs: async () => [{ txid: "a-1" }],
+    listIntegrations: async () => compliantIntegrationData().integrations.data,
+    getInfoSummary: async () => ({ edition: "Duo Premier", telephony_credits_remaining: 900 }),
+    getAuthenticationAttempts: async () => ({ authentication_attempts: { ERROR: 0, FAILURE: 0, FRAUD: 0, SUCCESS: 10 } }),
+    listTelephonyLogs: async () => [],
+    listTrustMonitorEvents: async () => [{ sekey: "SE1", state: "closed" }],
+  };
+
+  const result = await exportDuoAuditBundle(client, config, outputRoot);
+  assert.equal(result.errorCount, 0);
+  assert.equal(existsSync(join(result.outputDir, "_errors.log")), false);
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const failed = findings.filter((finding) => finding.status === "Fail" || finding.status === "Partial").map((finding) => finding.id);
+  assert.deepEqual(failed, [], "the fully compliant fixture produces no Fail or Partial findings");
+  assert.equal(findings.filter((finding) => finding.status === "Manual").map((finding) => finding.id).join(","), "DUO-AUTH-011");
 });

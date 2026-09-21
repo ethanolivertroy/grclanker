@@ -3468,13 +3468,83 @@ function frameworkMatrixRow(finding: DuoFinding): string {
 function buildFrameworkReport(title: string, findings: DuoFinding[], key: FrameworkKey): string {
   const scoped = frameworkSummary(findings, key);
   const rows = scoped.map((finding) =>
-    `- ${finding.id} (${finding.status}/${finding.severity}) — ${finding.title}: ${finding.summary}`,
+    `- ${finding.id} (${finding.status}/${finding.severity}) [${finding.frameworks[key].join(", ")}] ${finding.title}: ${finding.summary}`,
   );
   return [
     `# ${title}`,
     "",
     scoped.length > 0 ? rows.join("\n") : "No findings mapped to this framework in the exported bundle.",
     "",
+  ].join("\n");
+}
+
+function buildExecutiveSummary(
+  config: DuoResolvedConfig,
+  assessments: DuoAssessmentResult[],
+  errors: string[],
+): string {
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  const summary = summarizeFindings(findings);
+  const lines = [
+    "# Duo Security Inspector Executive Summary",
+    "",
+    `- Tenant API host: ${config.apiHost}`,
+    `- Generated: ${new Date().toISOString()}`,
+    `- Log lookback window: ${config.lookbackDays} days`,
+    `- Findings: ${findings.length} (Pass ${summary.Pass}, Partial ${summary.Partial}, Fail ${summary.Fail}, Manual ${summary.Manual}, Info ${summary.Info})`,
+    `- Collection warnings: ${errors.length}${errors.length > 0 ? " (see _errors.log)" : ""}`,
+    "",
+    "## Category summaries",
+    "",
+    ...assessments.map((assessment) => {
+      const counts = assessment.summary;
+      return `- ${assessment.category}: Pass ${counts.Pass}, Partial ${counts.Partial}, Fail ${counts.Fail}, Manual ${counts.Manual}`;
+    }),
+    "",
+    "## Findings requiring action",
+    "",
+  ];
+  const actionable = findings.filter((finding) => finding.status === "Fail" || finding.status === "Partial");
+  if (actionable.length === 0) {
+    lines.push("No Fail or Partial findings were recorded.");
+  } else {
+    for (const finding of actionable) {
+      lines.push(`- ${finding.id} (${finding.status}/${finding.severity}) ${finding.title}: ${finding.recommendation}`);
+    }
+  }
+  lines.push("", "## Manual verification required", "");
+  const manual = findings.filter((finding) => finding.status === "Manual");
+  if (manual.length === 0) {
+    lines.push("No findings require manual verification.");
+  } else {
+    for (const finding of manual) {
+      lines.push(`- ${finding.id} ${finding.title}: ${finding.summary}`);
+    }
+  }
+  lines.push("", "## Category detail", "");
+  for (const assessment of assessments) {
+    lines.push(`### ${assessment.category}`, "", "```", assessment.text, "```", "");
+  }
+  return lines.join("\n");
+}
+
+function buildQuickReference(): string {
+  return [
+    "# Duo Audit Bundle Quick Reference",
+    "",
+    "- `core_data/` contains raw Duo Admin API responses used during this assessment.",
+    "- `analysis/` contains normalized findings and category summaries.",
+    "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
+    "- `_errors.log` appears only when some reads fail but the bundle still completes.",
+    "- Review Manual findings before asserting framework compliance from the automated output alone.",
+    "",
+    "Recommended reading order:",
+    "1. `compliance/executive_summary.md`",
+    "2. `compliance/unified_compliance_matrix.md`",
+    "3. framework-specific report matching your engagement",
+    "4. `analysis/*.json` for the supporting evidence behind each finding",
+    "",
+    "This bundle is read-only evidence and analysis output. It does not contain the Duo secret key or write-capable credentials.",
   ].join("\n");
 }
 
@@ -3571,54 +3641,21 @@ async function countFiles(rootDir: string): Promise<number> {
   return count;
 }
 
-function buildFrameworkReports(findings: DuoFinding[]): Record<string, string> {
-  return {
-    fedramp: buildFrameworkReport("FedRAMP Mappings", findings, "fedramp"),
-    cmmc: buildFrameworkReport("CMMC Mappings", findings, "cmmc"),
-    soc2: buildFrameworkReport("SOC 2 Mappings", findings, "soc2"),
-    cis: buildFrameworkReport("CIS Mappings", findings, "cis"),
-    pci_dss: buildFrameworkReport("PCI-DSS Mappings", findings, "pci_dss"),
-    disa_stig: buildFrameworkReport("DISA STIG Mappings", findings, "disa_stig"),
-    irap: buildFrameworkReport("IRAP Mappings", findings, "irap"),
-    ismap: buildFrameworkReport("ISMAP Mappings", findings, "ismap"),
-  };
-}
+const FRAMEWORK_REPORTS: Array<{ key: FrameworkKey; path: string; title: string }> = [
+  { key: "fedramp", path: "compliance/fedramp/fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },
+  { key: "cmmc", path: "compliance/cmmc/cmmc_compliance_report.md", title: "CMMC Compliance Report" },
+  { key: "soc2", path: "compliance/soc2/soc2_compliance_report.md", title: "SOC 2 Compliance Report" },
+  { key: "cis", path: "compliance/cis/cis_compliance_report.md", title: "CIS Controls Compliance Report" },
+  { key: "pci_dss", path: "compliance/pci_dss/pci_dss_compliance_report.md", title: "PCI-DSS Compliance Report" },
+  { key: "disa_stig", path: "compliance/disa_stig/stig_compliance_checklist.md", title: "DISA STIG Compliance Checklist" },
+  { key: "irap", path: "compliance/irap/irap_compliance_report.md", title: "IRAP / ISM Compliance Report" },
+  { key: "ismap", path: "compliance/ismap/ismap_compliance_report.md", title: "ISMAP Compliance Report" },
+];
 
-async function buildBundleReadme(rootDir: string): Promise<void> {
-  await writeText(
-    rootDir,
-    "README.md",
-    [
-      "# Duo Audit Bundle Quick Reference",
-      "",
-      "- `core_data/` contains the raw Duo API payloads collected for this assessment.",
-      "- `assessments/` contains normalized findings in JSON and terminal-friendly markdown.",
-      "- `frameworks/` contains per-framework filtered reports.",
-      "- `summary.md` and `unified-matrix.md` provide the high-level operator view.",
-      "",
-      "This bundle is read-only evidence and analysis output. It does not contain the Duo secret key or write-capable credentials.",
-    ].join("\n"),
-  );
-}
+export type DuoBundleClient = DuoAuthenticationClient & DuoAdminAccessClient & DuoIntegrationClient & DuoMonitoringClient;
 
 export async function exportDuoAuditBundle(
-  client: Pick<
-    DuoAuditorClient,
-    | "getSettings"
-    | "listPolicies"
-    | "getGlobalPolicy"
-    | "listUsers"
-    | "listBypassCodes"
-    | "listWebauthnCredentials"
-    | "getAdminAllowedAuthMethods"
-    | "listAuthenticationLogs"
-    | "listAdmins"
-    | "listActivityLogs"
-    | "listIntegrations"
-    | "getInfoSummary"
-    | "listTelephonyLogs"
-    | "listTrustMonitorEvents"
-  >,
+  client: DuoBundleClient,
   config: DuoResolvedConfig,
   outputRoot: string,
 ): Promise<DuoAuditBundleResult> {
@@ -3635,37 +3672,7 @@ export async function exportDuoAuditBundle(
   ];
 
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const frameworkReports = buildFrameworkReports(findings);
-  const timestamp = new Date().toISOString().replace(/[:]/g, "-");
-  const folderName = sanitizeSegment(`${config.apiHost}_${timestamp}`);
-  const outputDir = resolveSecureOutputPath(outputRoot, folderName);
-  mkdirSync(outputDir, { recursive: true });
-  await chmod(outputDir, 0o755);
-
-  await buildBundleReadme(outputDir);
-  await writeJson(outputDir, "config.json", {
-    api_host: config.apiHost,
-    lookback_days: config.lookbackDays,
-    source_chain: config.sourceChain,
-  });
-
-  await writeJson(outputDir, "core_data/authentication.json", authentication);
-  await writeJson(outputDir, "core_data/admin_access.json", adminAccess);
-  await writeJson(outputDir, "core_data/integrations.json", integrations);
-  await writeJson(outputDir, "core_data/monitoring.json", monitoring);
-  await writeJson(outputDir, "assessments/authentication.json", assessments[0]);
-  await writeJson(outputDir, "assessments/admin_access.json", assessments[1]);
-  await writeJson(outputDir, "assessments/integrations.json", assessments[2]);
-  await writeJson(outputDir, "assessments/monitoring.json", assessments[3]);
-  await writeJson(outputDir, "findings.json", findings);
-  await writeText(outputDir, "summary.md", assessments.map((assessment) => assessment.text).join("\n\n"));
-  await writeText(outputDir, "unified-matrix.md", buildUnifiedMatrix(findings));
-
-  for (const [name, report] of Object.entries(frameworkReports)) {
-    await writeText(outputDir, `frameworks/${name}.md`, report);
-  }
-
-  const errorCount = listErrors([
+  const errors = listErrors([
     authentication.settings,
     authentication.policies,
     authentication.globalPolicy,
@@ -3674,6 +3681,7 @@ export async function exportDuoAuditBundle(
     authentication.webauthnCredentials,
     authentication.allowedAdminAuthMethods,
     authentication.authenticationLogs,
+    authentication.offlineEnrollmentLogs,
     adminAccess.settings,
     adminAccess.admins,
     adminAccess.allowedAdminAuthMethods,
@@ -3682,13 +3690,71 @@ export async function exportDuoAuditBundle(
     integrations.policies,
     integrations.globalPolicy,
     integrations.integrations,
+    integrations.infoSummary,
     monitoring.settings,
     monitoring.infoSummary,
     monitoring.authenticationLogs,
     monitoring.activityLogs,
     monitoring.telephonyLogs,
     monitoring.trustMonitorEvents,
-  ]).length;
+    monitoring.authenticationAttempts,
+  ]);
+
+  const timestamp = new Date().toISOString().replace(/[:]/g, "-");
+  const folderRelative = ensureUniqueRelativePath(outputRoot, sanitizeSegment(`${config.apiHost}_${timestamp}`));
+  const outputDir = resolveSecureOutputPath(outputRoot, folderRelative);
+  mkdirSync(outputDir, { recursive: true });
+  await chmod(outputDir, 0o755);
+
+  await writeText(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  await writeJson(outputDir, "config.json", {
+    api_host: config.apiHost,
+    lookback_days: config.lookbackDays,
+    source_chain: config.sourceChain,
+  });
+
+  const coreData: Array<[string, unknown]> = [
+    ["core_data/settings.json", authentication.settings.data],
+    ["core_data/policies.json", authentication.policies.data],
+    ["core_data/global_policy.json", authentication.globalPolicy.data],
+    ["core_data/users.json", authentication.users.data],
+    ["core_data/bypass_codes.json", authentication.bypassCodes.data],
+    ["core_data/webauthn_credentials.json", authentication.webauthnCredentials.data],
+    ["core_data/admin_allowed_auth_methods.json", authentication.allowedAdminAuthMethods.data],
+    ["core_data/authentication_logs.json", authentication.authenticationLogs.data],
+    ["core_data/offline_enrollment_logs.json", authentication.offlineEnrollmentLogs?.data ?? []],
+    ["core_data/admins.json", adminAccess.admins.data],
+    ["core_data/activity_logs.json", adminAccess.activityLogs.data],
+    ["core_data/integrations.json", integrations.integrations.data],
+    ["core_data/info_summary.json", monitoring.infoSummary.data],
+    ["core_data/telephony_logs.json", monitoring.telephonyLogs.data],
+    ["core_data/trust_monitor_events.json", monitoring.trustMonitorEvents.data],
+    ["core_data/authentication_attempts.json", monitoring.authenticationAttempts?.data ?? null],
+  ];
+  for (const [path, value] of coreData) {
+    await writeJson(outputDir, path, value);
+  }
+  await writeJson(outputDir, "core_data/collection_status.json", {
+    authentication,
+    admin_access: adminAccess,
+    integrations,
+    monitoring,
+  });
+
+  for (const assessment of assessments) {
+    await writeJson(outputDir, `analysis/${assessment.category}.json`, assessment);
+  }
+  await writeJson(outputDir, "analysis/findings.json", findings);
+
+  await writeText(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeText(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  for (const report of FRAMEWORK_REPORTS) {
+    await writeText(outputDir, report.path, buildFrameworkReport(report.title, findings, report.key));
+  }
+
+  if (errors.length > 0) {
+    await writeText(outputDir, "_errors.log", errors.join("\n"));
+  }
 
   const zipRelative = ensureUniqueRelativePath(outputRoot, `${basename(outputDir)}.zip`);
   const zipPath = resolveSecureOutputPath(outputRoot, zipRelative);
@@ -3699,7 +3765,7 @@ export async function exportDuoAuditBundle(
     zipPath,
     fileCount: await countFiles(outputDir),
     findingCount: findings.length,
-    errorCount,
+    errorCount: errors.length,
   };
 }
 
