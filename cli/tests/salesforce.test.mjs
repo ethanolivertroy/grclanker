@@ -1166,6 +1166,59 @@ test("review round 2 fix 1: control 6 requires every weekday to be bounded and n
   assert.match(cappedFinding.summary, /only 1 of 60 sensitive profiles were read/);
 });
 
+test("review round 2 fix 2: OauthToken treats the 2500-row cap as a possibly truncated result in evidence and summary", async () => {
+  const rows = Array.from({ length: 2500 }, (_, index) => ({ Id: null, AppName: "Auditor", AppMenuItemId: "AM1", UserId: `U${index}`, LastUsedDate: "2026-09-20T10:00:00Z", UseCount: 1 }));
+  const queries = [];
+  const clientFor = (records) => new SalesforceApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(input);
+      if (url.pathname === "/services/data/v64.0/query") {
+        queries.push(url.searchParams.get("q"));
+        return jsonResponse({ totalSize: records.length, done: true, records });
+      }
+      return jsonResponse({}, { status: 404 });
+    },
+  });
+  const capped = await clientFor(rows).listOauthTokens();
+  assert.match(queries.at(-1), /^SELECT Id, AppName, AppMenuItemId, UserId, LastUsedDate, UseCount FROM OauthToken/);
+  assert.equal(capped.records.length, 2500);
+  assert.equal(capped.done, true);
+  assert.equal(capped.truncated, true, "2500 rows with done=true is the documented cap and must read as possibly truncated");
+  const below = await clientFor(rows.slice(0, 2499)).listOauthTokens();
+  assert.equal(below.truncated, false);
+  const smallLimit = await clientFor(rows).listOauthTokens(50);
+  assert.equal(smallLimit.truncated, true, "an explicit smaller limit still reads to the cap so the cap can be detected");
+
+  const cappedResult = assessSalesforceMonitoringData(goodMonitoringData({ oauthTokens: okDataset("OauthToken", rows, { truncated: true }) }));
+  const cappedFinding = findingById(cappedResult, "SF-11");
+  assert.notEqual(cappedFinding.status, "pass");
+  assert.equal(cappedFinding.evidence.oauth_tokens, 2500);
+  assert.equal(cappedFinding.evidence.oauth_tokens_possibly_capped, true);
+  assert.equal(cappedFinding.evidence.oauth_tokens_truncated, true);
+  assert.match(cappedFinding.summary, /OauthToken returned 2500 rows, which is the documented 2500-row cap with no done=false signal, so the token count is possibly truncated/);
+  assert.equal(cappedResult.summary.oauth_tokens_possibly_capped, true);
+
+  const noApps = findingById(assessSalesforceMonitoringData(goodMonitoringData({
+    connectedApplications: okDataset("ConnectedApplication", []),
+    oauthTokens: okDataset("OauthToken", rows, { truncated: true }),
+  })), "SF-11");
+  assert.equal(noApps.status, "manual");
+  assert.equal(noApps.evidence.oauth_tokens_possibly_capped, true);
+  assert.match(noApps.summary, /documented 2500-row cap/);
+
+  const partialRead = findingById(assessSalesforceMonitoringData(goodMonitoringData({
+    oauthTokens: okDataset("OauthToken", rows.slice(0, 100), { truncated: true, total: 300 }),
+  })), "SF-11");
+  assert.equal(partialRead.evidence.oauth_tokens_possibly_capped, false);
+  assert.equal(partialRead.evidence.oauth_tokens_truncated, true);
+  assert.match(partialRead.summary, /Only 100 of 300 OauthToken rows were read, so the token count is incomplete/);
+
+  const complete = assessSalesforceMonitoringData(goodMonitoringData());
+  assert.equal(findingById(complete, "SF-11").evidence.oauth_tokens_possibly_capped, false);
+  assert.equal(findingById(complete, "SF-11").evidence.oauth_tokens_truncated, false);
+  assert.doesNotMatch(findingById(complete, "SF-11").summary, /row cap|rows were read/);
+});
+
 test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports, quick reference, zip, and _errors.log on partial failure", async () => {
   const base = createTempBase("grclanker-sf-export-");
   const client = createFullMockClient({

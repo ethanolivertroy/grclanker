@@ -41,6 +41,7 @@ const METADATA_NAMESPACE = "http://soap.sforce.com/2006/04/metadata";
 const READ_METADATA_BATCH_SIZE = 10;
 const MAX_PROFILE_METADATA_READS = 50;
 const TWO_FACTOR_METHODS_ROW_CAP = 2500;
+const OAUTH_TOKEN_ROW_CAP = 2500;
 const MINUTES_PER_DAY = 1440;
 const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 const PROFILE_ID_KEY = "_profileId";
@@ -1146,15 +1147,17 @@ export class SalesforceApiClient {
     );
   }
 
+  private async queryWithRowCap(soql: string, limit: number, rowCap: number): Promise<SalesforceQueryResult> {
+    const result = await this.query(soql, Math.max(limit, rowCap));
+    return result.records.length >= rowCap ? { ...result, truncated: true } : result;
+  }
+
   async listTwoFactorMethods(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    const result = await this.query(
+    return this.queryWithRowCap(
       "SELECT UserId, ExternalId, HasTotp, HasU2F, HasSecurityKey, HasSalesforceAuthenticator, HasBuiltInAuthenticator, HasTempCode, HasUserVerifiedMobileNumber, HasVerifiedMobileNumber, HasUserVerifiedEmailAddress FROM TwoFactorMethodsInfo",
-      Math.max(limit, TWO_FACTOR_METHODS_ROW_CAP),
+      limit,
+      TWO_FACTOR_METHODS_ROW_CAP,
     );
-    if (result.records.length >= TWO_FACTOR_METHODS_ROW_CAP) {
-      return { ...result, truncated: true };
-    }
-    return result;
   }
 
   async listSensitiveFieldPermissions(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1184,7 +1187,11 @@ export class SalesforceApiClient {
   }
 
   async listOauthTokens(limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
-    return this.query("SELECT Id, AppName, AppMenuItemId, UserId, LastUsedDate, UseCount FROM OauthToken ORDER BY LastUsedDate DESC NULLS LAST", limit);
+    return this.queryWithRowCap(
+      "SELECT Id, AppName, AppMenuItemId, UserId, LastUsedDate, UseCount FROM OauthToken ORDER BY LastUsedDate DESC NULLS LAST",
+      limit,
+      OAUTH_TOKEN_ROW_CAP,
+    );
   }
 
   async listLoginHistory(days = DEFAULT_LOGIN_HISTORY_DAYS, limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -2200,13 +2207,26 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
   const tokensReadable = data.oauthTokens.status === "ok";
   const canSeeAllTokens = callerPermission(data.callerPermissions, "PermissionsCustomizeApplication");
   const tokenViewPartial = tokensReadable && canSeeAllTokens !== true;
-  const tokenViewNote = tokenViewPartial
+  const tokensPossiblyCapped = tokensReadable && data.oauthTokens.data.length >= OAUTH_TOKEN_ROW_CAP;
+  const tokensTruncated = tokensReadable && data.oauthTokens.truncated;
+  const tokenCountNote = tokensPossiblyCapped
+    ? ` OauthToken returned ${data.oauthTokens.data.length} rows, which is the documented ${OAUTH_TOKEN_ROW_CAP}-row cap with no done=false signal, so the token count is possibly truncated.`
+    : tokensTruncated
+      ? ` Only ${data.oauthTokens.data.length} of ${data.oauthTokens.total ?? "?"} OauthToken rows were read, so the token count is incomplete.`
+      : "";
+  const tokenViewNote = `${tokenViewPartial
     ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${canSeeAllTokens === false ? "false" : "unknown"}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
-    : "";
+    : ""}${tokenCountNote}`;
+  const tokenEvidence = {
+    oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null,
+    oauth_tokens_partial_view: tokenViewPartial,
+    oauth_tokens_possibly_capped: tokensPossiblyCapped,
+    oauth_tokens_truncated: tokensTruncated,
+  };
   if (data.connectedApplications.status !== "ok") {
     findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
   } else if (apps.length === 0) {
-    findings.push(finding(11, "manual", `ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.${tokenViewNote}`, { connected_applications: 0, oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null, oauth_tokens_partial_view: tokenViewPartial }, appManual));
+    findings.push(finding(11, "manual", `ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.${tokenViewNote}`, { connected_applications: 0, ...tokenEvidence }, appManual));
   } else {
     const openApps = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === false);
     const unknownPolicy = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === undefined);
@@ -2221,8 +2241,7 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       self_authorizing_apps: truncateList(openApps.map((app) => asString(app.Name) ?? "")),
       apps_without_policy_flag: truncateList(unknownPolicy.map((app) => asString(app.Name) ?? "")),
       apps_without_refresh_token_limit: truncateList(unboundedRefresh.map((app) => asString(app.Name) ?? "")),
-      oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null,
-      oauth_tokens_partial_view: tokenViewPartial,
+      ...tokenEvidence,
       caller_has_customize_application: canSeeAllTokens ?? null,
       tokens_by_app: tokensReadable ? Object.fromEntries([...tokensByApp.entries()].slice(0, 25)) : null,
       truncated: data.connectedApplications.truncated,
@@ -2304,6 +2323,7 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       connected_applications: apps.length,
       oauth_tokens: data.oauthTokens.data.length,
       oauth_tokens_partial_view: tokenViewPartial,
+      oauth_tokens_possibly_capped: tokensPossiblyCapped,
       caller_has_customize_application: canSeeAllTokens ?? null,
       login_rows: logins.length,
       login_history_days: data.loginHistoryDays,
