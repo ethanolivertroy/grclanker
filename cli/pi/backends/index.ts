@@ -2,6 +2,7 @@ import {
   assertExhaustive,
   ExecutionBackendNotAvailableError,
   type CommandRunner,
+  type CommandRunnerSync,
   type ExecutionBackend,
   type ExecutionBackendKind,
   type FetchLike,
@@ -29,6 +30,7 @@ import { createRunpodPodBackend, createRunpodServerlessBackend } from "./runpod.
 
 export type ExecutionBackendDependencies = {
   runner?: CommandRunner;
+  syncRunner?: CommandRunnerSync;
   fetch?: FetchLike;
 };
 
@@ -109,7 +111,9 @@ export function createExecutionBackend(
           : resolveParallelsBaseVmName(settings)) ?? "",
         clonePrefix: resolveParallelsClonePrefix(settings),
         workspacePathOverride: resolveParallelsWorkspacePath(settings),
+        mountMode: defaults.workspaceMountMode,
         runner: deps.runner,
+        syncRunner: deps.syncRunner,
       });
     }
     case "modal":
@@ -123,6 +127,7 @@ export function createExecutionBackend(
       return createRunpodPodBackend({
         fetch: deps.fetch,
         runner: deps.runner,
+        syncRunner: deps.syncRunner,
         workspacePath: typeof settings.runpodWorkspacePath === "string" ? settings.runpodWorkspacePath : undefined,
       });
     case "runpod-serverless":

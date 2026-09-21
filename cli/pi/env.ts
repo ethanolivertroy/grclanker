@@ -2,10 +2,9 @@ import { unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { getGrclankerSettingsPath } from "../config/paths.js";
 import {
-  resolveComputeBackendExecution,
+  withComputeBackendExecution,
   type ResolvedComputeBackendExecution,
 } from "./backend-exec.js";
-import { cleanupParallelsSandboxes } from "./parallels-sandbox.js";
 import {
   COMPUTE_BACKEND_KINDS,
   describeNetworkPolicy,
@@ -20,6 +19,7 @@ import {
   resolveComputeDefaults,
   resolveComputeProfile,
   type ComputeBackendKind,
+  type ComputeBackendStatus,
 } from "./compute.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
@@ -84,9 +84,11 @@ export function extractComputeFlag(args: string[]): { compute?: ComputeBackendKi
   return { compute, rest };
 }
 
-export function buildComputeBackendList(settings: GrclankerSettings): ComputeBackendListEntry[] {
+export function buildComputeBackendList(
+  settings: GrclankerSettings,
+  statuses: ComputeBackendStatus[] = detectComputeBackendStatuses(),
+): ComputeBackendListEntry[] {
   const preferred = resolveComputeBackend(settings);
-  const statuses = detectComputeBackendStatuses();
   return COMPUTE_BACKEND_KINDS.map((kind) => {
     const status = statuses.find((entry) => entry.kind === kind);
     const issues = getComputeBackendConfigurationIssues(settings, kind);
@@ -232,27 +234,25 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function getResolvedExecution(
+async function withEnvExecution<T>(
   options: EnvCommandOptions,
-): { settings: GrclankerSettings; execution: ResolvedComputeBackendExecution } {
+  run: (execution: ResolvedComputeBackendExecution) => Promise<T>,
+): Promise<T> {
   const settings = getEffectiveSettings(options);
   ensureBackendIsRunnable(settings);
-  return {
-    settings,
-    execution: resolveComputeBackendExecution(options.cwd, settings),
-  };
+  return withComputeBackendExecution(options.cwd, settings, run);
 }
 
 async function executeOnBackend(
   command: string,
   options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
 ): Promise<{
   backend: ComputeBackendKind;
   label: string;
   summary: string;
   exitCode: number | null;
 }> {
-  const { execution } = getResolvedExecution(options);
   let result: { exitCode: number | null };
   try {
     result = await execution.bashOperations.exec(command, options.cwd, {
@@ -310,8 +310,10 @@ async function removeProbeFile(
   }
 }
 
-async function runBackendToolSmokeTest(options: EnvCommandOptions): Promise<void> {
-  const { execution } = getResolvedExecution(options);
+async function runBackendToolSmokeTest(
+  options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
+): Promise<void> {
   if (
     !execution.readOperations ||
     !execution.writeOperations ||
@@ -356,8 +358,10 @@ async function runBackendToolSmokeTest(options: EnvCommandOptions): Promise<void
   }
 }
 
-async function runBackendSearchSmokeTest(options: EnvCommandOptions): Promise<void> {
-  const { execution } = getResolvedExecution(options);
+async function runBackendSearchSmokeTest(
+  options: EnvCommandOptions,
+  execution: ResolvedComputeBackendExecution,
+): Promise<void> {
   if (!execution.findOperations || !execution.grepOperations) {
     console.log("tool_find=skipped");
     console.log("tool_grep=skipped");
@@ -463,10 +467,15 @@ export async function runComputeSmokeTest(rawArgs: string[]): Promise<void> {
   console.log(`CWD: ${options.cwd}`);
   console.log("");
 
-  try {
-    const result = await executeOnBackend(buildSmokeTestCommand(), options);
-    await runBackendToolSmokeTest(options);
-    await runBackendSearchSmokeTest(options);
+  await withEnvExecution(options, async (execution) => {
+    const result = await executeOnBackend(buildSmokeTestCommand(), options, execution);
+    const snapshotId = await runBackendSnapshotSmokeTest(execution);
+    await runBackendToolSmokeTest(options, execution);
+    await runBackendSearchSmokeTest(options, execution);
+    if (snapshotId && execution.backend) {
+      await execution.backend.restore(execution.sessionId, snapshotId);
+      console.log("restore=ok");
+    }
     console.log("");
     console.log(`Result: ${result.summary}`);
     console.log(`Exit code: ${result.exitCode ?? "null"}`);
@@ -474,11 +483,19 @@ export async function runComputeSmokeTest(rawArgs: string[]): Promise<void> {
     if ((result.exitCode ?? 1) !== 0) {
       throw new GrclankerUserError(`Smoke test failed with exit code ${result.exitCode}.`);
     }
-  } finally {
-    if (backend === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
+  });
+}
+
+async function runBackendSnapshotSmokeTest(
+  execution: ResolvedComputeBackendExecution,
+): Promise<string | undefined> {
+  if (!execution.backend?.capabilities.snapshot || !execution.backend.capabilities.restore) {
+    console.log("snapshot=skipped");
+    return undefined;
   }
+  const snapshotId = await execution.backend.snapshot(execution.sessionId);
+  console.log(`snapshot=ok ${snapshotId}`);
+  return snapshotId;
 }
 
 export async function runComputeExec(rawArgs: string[]): Promise<void> {
@@ -501,14 +518,10 @@ export async function runComputeExec(rawArgs: string[]): Promise<void> {
   console.log(`cwd: ${options.cwd}`);
   console.log(`command: ${command}\n`);
 
-  try {
-    const result = await executeOnBackend(command, options);
+  await withEnvExecution(options, async (execution) => {
+    const result = await executeOnBackend(command, options, execution);
     if ((result.exitCode ?? 1) !== 0) {
       throw new GrclankerUserError(`Command failed with exit code ${result.exitCode}.`);
     }
-  } finally {
-    if (backend === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
-  }
+  });
 }

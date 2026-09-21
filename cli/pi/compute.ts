@@ -58,24 +58,6 @@ export const DEFAULT_COMPUTE_DEFAULTS: ComputeDefaults = {
   networkPolicy: "default",
   workspaceMountMode: "rw",
 };
-export const COMPUTE_BACKEND_KINDS: readonly ComputeBackendKind[] = [
-  "host",
-  "sandbox-runtime",
-  "docker",
-  "parallels-vm",
-  "modal",
-  "runpod-pod",
-  "runpod-serverless",
-  "cloudflare-sandbox",
-  "vercel-sandbox",
-];
-export const COMPUTE_PROFILES: readonly ComputeProfile[] = [
-  "local-host",
-  "isolated-local",
-  "gpu-burst",
-  "persistent-remote",
-];
-
 type ComputeBackendMetadata = {
   label: string;
   summary: string;
@@ -156,6 +138,13 @@ const PROFILE_BUCKETS: Record<ComputeProfile, RoutingBucket> = {
   "gpu-burst": "gpu-burst",
   "persistent-remote": "persistent-remote",
 };
+
+// Derived from the Record keys so a new ExecutionBackendKind or ComputeProfile union member
+// fails compilation until its metadata entry exists; normalization and env list then pick it up.
+export const COMPUTE_BACKEND_KINDS: readonly ComputeBackendKind[] = Object.keys(
+  COMPUTE_BACKEND_OPTIONS,
+) as ComputeBackendKind[];
+export const COMPUTE_PROFILES: readonly ComputeProfile[] = Object.keys(PROFILE_BUCKETS) as ComputeProfile[];
 
 export function isComputeBackendKind(value: unknown): value is ComputeBackendKind {
   return typeof value === "string" && (COMPUTE_BACKEND_KINDS as readonly string[]).includes(value);

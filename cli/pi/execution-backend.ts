@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 export type ExecutionBackendKind =
   | "host"
@@ -73,6 +73,7 @@ export interface ExecutionBackend {
   snapshot(sessionId: string): Promise<string>;
   restore(sessionId: string, snapshotId: string): Promise<void>;
   teardown(sessionId: string): Promise<void>;
+  teardownSync?(sessionId: string): void;
 }
 
 export type CommandRunnerOptions = {
@@ -95,12 +96,24 @@ export type CommandRunner = (
   options?: CommandRunnerOptions,
 ) => Promise<CommandRunnerResult>;
 
+export type CommandRunnerSync = (executable: string, args: string[]) => CommandRunnerResult;
+
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export class ExecutionBackendError extends Error {
   constructor(message: string) {
     super(`Compute backend error: ${message}`);
     this.name = "ExecutionBackendError";
+  }
+}
+
+export class ExecutionBackendTimeoutError extends ExecutionBackendError {
+  readonly timeoutMs: number;
+
+  constructor(kind: ExecutionBackendKind, detail: string, timeoutMs: number) {
+    super(`${kind} timed out after ${Math.round(timeoutMs / 1000)}s: ${detail}`);
+    this.name = "ExecutionBackendTimeoutError";
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -154,6 +167,22 @@ export function normalizeExitCode(exitCode: number | null): number {
   return typeof exitCode === "number" ? exitCode : 1;
 }
 
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export function assertSafeSessionId(sessionId: string): string {
+  const trimmed = sessionId.trim();
+  if (trimmed !== sessionId || !SESSION_ID_PATTERN.test(sessionId) || sessionId.includes("..")) {
+    throw new ExecutionBackendError(
+      `Session id ${JSON.stringify(sessionId)} is not a safe path segment; expected letters, digits, ".", "_" or "-" without "..".`,
+    );
+  }
+  return sessionId;
+}
+
+export function createSessionId(): string {
+  return `grclanker-${process.pid}-${Date.now().toString(36)}`;
+}
+
 export function buildShellCommand(command: string[]): string {
   return command.length === 1 ? command[0]! : command.map(quoteArg).join(" ");
 }
@@ -169,6 +198,7 @@ export function createProcessCommandRunner(): CommandRunner {
         cwd: options.cwd,
         env: options.env ? { ...process.env, ...options.env } : process.env,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
       });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
@@ -176,10 +206,15 @@ export function createProcessCommandRunner(): CommandRunner {
       let timeoutHandle: NodeJS.Timeout | undefined;
 
       const kill = () => {
+        if (!child.pid) return;
         try {
-          child.kill("SIGKILL");
+          process.kill(-child.pid, "SIGKILL");
         } catch {
-          // process already exited
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // process already exited
+          }
         }
       };
 
@@ -224,6 +259,17 @@ export function createProcessCommandRunner(): CommandRunner {
         });
       });
     });
+}
+
+export function createProcessCommandRunnerSync(): CommandRunnerSync {
+  return (executable, args) => {
+    const result = spawnSync(executable, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    return {
+      exitCode: result.status,
+      stdout: typeof result.stdout === "string" ? result.stdout : "",
+      stderr: typeof result.stderr === "string" ? result.stderr : "",
+    };
+  };
 }
 
 export function assertExhaustive(value: never): never {

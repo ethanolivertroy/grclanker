@@ -37,6 +37,21 @@ type ModalSession = {
   remotePath: string;
 };
 
+// The modal client runs `shlex.split(f'/bin/bash -c "{cmd}"')` on the --cmd value
+// (modal/cli/shell.py), so any double quote, backslash, or shell metacharacter in the raw
+// command would be re-split by shlex. The wrapper below contains only [A-Za-z0-9+/=],
+// spaces, and characters shlex treats literally inside double quotes; the real command
+// travels as base64 and is decoded into a temp file so the script keeps its own stdin.
+export function buildModalCommandWrapper(command: string): string {
+  const encoded = Buffer.from(command, "utf8").toString("base64");
+  return `f=$(mktemp) && printf %s ${encoded} | base64 -d > $f && bash $f; s=$?; rm -f $f; exit $s`;
+}
+
+export function decodeModalCommandWrapper(wrapper: string): string | undefined {
+  const match = /printf %s ([A-Za-z0-9+/=]+) \| base64 -d/.exec(wrapper);
+  return match ? Buffer.from(match[1]!, "base64").toString("utf8") : undefined;
+}
+
 export function buildModalShellArgs(input: {
   image: string;
   command: string;
@@ -50,7 +65,7 @@ export function buildModalShellArgs(input: {
   if (input.gpu) args.push("--gpu", input.gpu);
   if (input.environment) args.push("--env", input.environment);
   if (input.region) args.push("--region", input.region);
-  args.push("--cmd", input.command);
+  args.push("--cmd", buildModalCommandWrapper(input.command));
   return args;
 }
 

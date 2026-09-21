@@ -3,15 +3,18 @@ import { basename, resolve } from "node:path";
 import {
   buildShellCommand,
   createProcessCommandRunner,
+  createProcessCommandRunnerSync,
   ExecutionBackendError,
   normalizeExitCode,
   type CommandRunner,
   type CommandRunnerResult,
+  type CommandRunnerSync,
   type ExecutionBackend,
   type ExecutionRequest,
   type ExecutionResult,
   type StagedWorkspace,
   type StageWorkspaceInput,
+  type WorkspaceMountMode,
 } from "../execution-backend.js";
 import { quoteForBash } from "../shell.js";
 
@@ -20,7 +23,9 @@ export type ParallelsBackendOptions = {
   sourceName: string;
   clonePrefix: string;
   workspacePathOverride?: string;
+  mountMode?: WorkspaceMountMode;
   runner?: CommandRunner;
+  syncRunner?: CommandRunnerSync;
   sleep?: (milliseconds: number) => Promise<void>;
   mountTimeoutMs?: number;
 };
@@ -53,17 +58,37 @@ function formatFailure(action: string, result: CommandRunnerResult): ExecutionBa
   return new ExecutionBackendError(`${action}. ${detail || "Check Parallels Desktop and the guest configuration."}`);
 }
 
+// prlctl prints and accepts snapshot ids in braced form ({uuid}); `prlctl snapshot-list` output
+// and the `snapshot-switch <vm> --id <snapshot_id>` examples in the Parallels Desktop
+// command-line reference both use the braces, so the id is kept verbatim.
 export function parseParallelsSnapshotId(output: string): string | undefined {
-  const match = /\{([0-9a-fA-F-]{8,})\}/.exec(output);
-  return match?.[1];
+  const match = /\{[0-9a-fA-F-]{8,}\}/.exec(output);
+  return match?.[0];
 }
 
 export function buildParallelsExecArgs(cloneName: string, cwd: string, command: string): string[] {
   return ["exec", cloneName, "--current-user", "bash", "-lc", `cd -- ${quoteForBash(cwd)} && ${command}`];
 }
 
+export function buildParallelsShareArgs(
+  cloneName: string,
+  shareName: string,
+  localRoot: string,
+  mountMode: WorkspaceMountMode,
+): string[] {
+  return ["set", cloneName, "--shf-host-add", shareName, "--path", localRoot, "--mode", mountMode];
+}
+
+export function buildParallelsDestroyArgs(cloneName: string): string[][] {
+  return [
+    ["stop", cloneName, "--kill"],
+    ["delete", cloneName],
+  ];
+}
+
 export function createParallelsBackend(options: ParallelsBackendOptions): ExecutionBackend {
   const runner = options.runner ?? createProcessCommandRunner();
+  const syncRunner = options.syncRunner ?? createProcessCommandRunnerSync();
   const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((done) => setTimeout(done, milliseconds)));
   const sessions = new Map<string, ParallelsSession>();
 
@@ -102,8 +127,9 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
   }
 
   async function destroyClone(cloneName: string): Promise<void> {
-    await prlctl(["stop", cloneName, "--kill"]);
-    await prlctl(["delete", cloneName]);
+    for (const args of buildParallelsDestroyArgs(cloneName)) {
+      await prlctl(args);
+    }
   }
 
   return {
@@ -140,7 +166,9 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
       try {
         const sharing = await prlctl(["set", cloneName, "--shf-host", "on", "--shf-host-defined", "off", "--shf-host-automount", "on"]);
         if (sharing.exitCode !== 0) throw formatFailure(`Could not configure host folder sharing for "${cloneName}"`, sharing);
-        const share = await prlctl(["set", cloneName, "--shf-host-add", shareName, "--path", localRoot, "--mode", input.mountMode ?? "rw"]);
+        const share = await prlctl(
+          buildParallelsShareArgs(cloneName, shareName, localRoot, input.mountMode ?? options.mountMode ?? "rw"),
+        );
         if (share.exitCode !== 0) throw formatFailure(`Could not attach repo share "${shareName}" to "${cloneName}"`, share);
         await prlctl(["set", cloneName, "--smart-mount", "off"]);
         await prlctl(["set", cloneName, "--shared-clipboard", "off", "--shared-cloud", "off"]);
@@ -201,6 +229,14 @@ export function createParallelsBackend(options: ParallelsBackendOptions): Execut
         await destroyClone(session.cloneName);
       } finally {
         sessions.delete(sessionId);
+      }
+    },
+    teardownSync(sessionId: string): void {
+      const session = sessions.get(sessionId);
+      if (!session) return;
+      sessions.delete(sessionId);
+      for (const args of buildParallelsDestroyArgs(session.cloneName)) {
+        syncRunner("prlctl", args);
       }
     },
   };

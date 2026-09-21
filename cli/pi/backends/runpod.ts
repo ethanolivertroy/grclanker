@@ -1,13 +1,17 @@
 import { resolve } from "node:path";
 import {
+  assertSafeSessionId,
   buildShellCommand,
   createProcessCommandRunner,
+  createProcessCommandRunnerSync,
   ExecutionBackendError,
+  ExecutionBackendTimeoutError,
   ExecutionBackendUnsupportedError,
   normalizeExitCode,
   redactSecrets,
   requireEnv,
   type CommandRunner,
+  type CommandRunnerSync,
   type ExecutionBackend,
   type ExecutionRequest,
   type ExecutionResult,
@@ -32,6 +36,13 @@ export const RUNPOD_REST_BASE_URL = "https://rest.runpod.io/v1";
 
 export const DEFAULT_RUNPOD_WORKSPACE_PATH = "/workspace";
 
+// RunPod documents 600000 ms as the default `executionTimeout` for serverless jobs
+// (https://docs.runpod.io/serverless/endpoints/send-requests, "Execution policies"); the
+// adapter uses the same ceiling when the caller passes no timeoutMs, plus a polling grace
+// window so the endpoint gets to report TIMED_OUT itself before the client gives up.
+export const DEFAULT_RUNPOD_JOB_TIMEOUT_MS = 600_000;
+export const RUNPOD_POLL_GRACE_MS = 60_000;
+
 type RunpodJobStatus = "IN_QUEUE" | "IN_PROGRESS" | "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT";
 
 type RunpodJobResponse = {
@@ -51,13 +62,16 @@ export type RunpodWorkerOutput = {
 export type RunpodServerlessOptions = {
   fetch?: FetchLike;
   sleep?: (milliseconds: number) => Promise<void>;
+  now?: () => number;
   pollIntervalMs?: number;
+  defaultTimeoutMs?: number;
   workspacePath?: string;
 };
 
 export type RunpodPodOptions = {
   fetch?: FetchLike;
   runner?: CommandRunner;
+  syncRunner?: CommandRunnerSync;
   workspacePath?: string;
   sshUser?: string;
 };
@@ -93,7 +107,9 @@ export function parseRunpodWorkerOutput(output: unknown): RunpodWorkerOutput {
 export function createRunpodServerlessBackend(options: RunpodServerlessOptions = {}): ExecutionBackend {
   const fetchImpl: FetchLike = options.fetch ?? ((input, init) => fetch(input, init));
   const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((done) => setTimeout(done, milliseconds)));
+  const now = options.now ?? (() => Date.now());
   const pollIntervalMs = options.pollIntervalMs ?? 2_000;
+  const defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_RUNPOD_JOB_TIMEOUT_MS;
   const workspacePath = options.workspacePath ?? DEFAULT_RUNPOD_WORKSPACE_PATH;
 
   function endpointUrl(path: string): string {
@@ -124,6 +140,7 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {
       const apiKey = requireEnv("RUNPOD_API_KEY");
+      const timeoutMs = request.timeoutMs ?? defaultTimeoutMs;
       const body = {
         input: {
           command: buildShellCommand(request.command),
@@ -145,13 +162,17 @@ export function createRunpodServerlessBackend(options: RunpodServerlessOptions =
         throw new ExecutionBackendError("RunPod /run did not return a job id.");
       }
 
-      const deadline = request.timeoutMs ? Date.now() + request.timeoutMs + 60_000 : undefined;
+      const deadline = now() + timeoutMs + RUNPOD_POLL_GRACE_MS;
       let job = submitted;
       try {
         while (job.status === "IN_QUEUE" || job.status === "IN_PROGRESS" || job.status === undefined) {
           if (request.signal?.aborted) throw new ExecutionBackendError("aborted");
-          if (deadline && Date.now() > deadline) {
-            throw new ExecutionBackendError(`RunPod job ${submitted.id} did not finish within the timeout.`);
+          if (now() > deadline) {
+            throw new ExecutionBackendTimeoutError(
+              "runpod-serverless",
+              `job ${submitted.id} was still ${job.status ?? "pending"}; the adapter cancelled it`,
+              timeoutMs,
+            );
           }
           await sleep(pollIntervalMs);
           job = await readJson<RunpodJobResponse>(
@@ -221,11 +242,17 @@ export function buildPodSshArgs(target: { host: string; port: number; user: stri
   ];
 }
 
+export function buildPodSessionPath(workspacePath: string, sessionId: string): string {
+  return `${workspacePath.replace(/\/+$/, "")}/${assertSafeSessionId(sessionId)}`;
+}
+
 export function createRunpodPodBackend(options: RunpodPodOptions = {}): ExecutionBackend {
   const fetchImpl: FetchLike = options.fetch ?? ((input, init) => fetch(input, init));
   const runner = options.runner ?? createProcessCommandRunner();
+  const syncRunner = options.syncRunner ?? createProcessCommandRunnerSync();
   const workspacePath = options.workspacePath ?? DEFAULT_RUNPOD_WORKSPACE_PATH;
   const sshUser = options.sshUser ?? "root";
+  const stagedSessions = new Set<string>();
   let cachedPod: RunpodPod | undefined;
 
   async function fetchPod(): Promise<RunpodPod> {
@@ -261,13 +288,14 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       resolvePodSshTarget(pod, sshUser);
     },
     async stageWorkspace(input: StageWorkspaceInput): Promise<StagedWorkspace> {
+      const remotePath = buildPodSessionPath(workspacePath, input.sessionId);
       const target = await sshTarget();
       const localRoot = resolve(input.localPath);
-      const remotePath = `${workspacePath}/${input.sessionId}`;
       const prepare = await runner("ssh", buildPodSshArgs(target, `mkdir -p -- ${quoteForBash(remotePath)}`));
       if (prepare.exitCode !== 0) {
         throw new ExecutionBackendError(`Could not prepare ${remotePath} on the pod. ${redactSecrets(prepare.stderr)}`);
       }
+      stagedSessions.add(input.sessionId);
       const copy = await runner("scp", [
         "-o",
         "BatchMode=yes",
@@ -280,6 +308,8 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
         `${target.user}@${target.host}:${remotePath}`,
       ]);
       if (copy.exitCode !== 0) {
+        await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`)).catch(() => undefined);
+        stagedSessions.delete(input.sessionId);
         throw new ExecutionBackendError(`Could not copy the workspace to the pod. ${redactSecrets(copy.stderr)}`);
       }
       return { sessionId: input.sessionId, remotePath, detail: `copied ${localRoot} to ${target.host}:${remotePath} over scp` };
@@ -309,9 +339,20 @@ export function createRunpodPodBackend(options: RunpodPodOptions = {}): Executio
       throw new ExecutionBackendUnsupportedError("runpod-pod", "restore");
     },
     async teardown(sessionId: string) {
+      const remotePath = buildPodSessionPath(workspacePath, sessionId);
+      if (!stagedSessions.has(sessionId)) return;
       const target = await sshTarget();
-      const remotePath = `${workspacePath}/${sessionId}`;
-      await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`));
+      try {
+        await runner("ssh", buildPodSshArgs(target, `rm -rf -- ${quoteForBash(remotePath)}`));
+      } finally {
+        stagedSessions.delete(sessionId);
+      }
+    },
+    teardownSync(sessionId: string) {
+      const remotePath = buildPodSessionPath(workspacePath, sessionId);
+      if (!stagedSessions.has(sessionId) || !cachedPod) return;
+      stagedSessions.delete(sessionId);
+      syncRunner("ssh", buildPodSshArgs(resolvePodSshTarget(cachedPod, sshUser), `rm -rf -- ${quoteForBash(remotePath)}`));
     },
   };
 }
