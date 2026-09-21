@@ -47,6 +47,14 @@ Regional base URLs follow the official documentation: the Reporting API uses `ht
 
 The Reporting API allows four requests per second, a burst of 50 requests per minute, and 2,000 requests per day plus the number of licensed users. The client spaces requests at least 250 ms apart, retries `429` and `503` responses with exponential backoff (honoring `Retry-After` when present), and pages every list endpoint with `page` and `per_page` (500 per page, or 10 for training campaigns as documented). Recipient results are only loaded for the most recent security tests (`security_test_sample_limit`, default 12) to stay within the daily quota on large accounts. PhishER messages are paged with the GraphQL `per`, `page`, and `nextPageKey` arguments of `phisherMessages`, filtered with a Lucene `reported_at` range for the lookback window.
 
+The PhishER argument names come from the public schema that the developer portal's schema browser loads: an unauthenticated introspection query posted to `https://training.knowbe4.com/graphql?scope=phisher` returns `phisherMessages(per: Int, page: Int, all: Boolean, query: String!, sortField: PhisherMessageSortFields, sortDirection: SortDirections, nextPageKey: String)` and `phisherRules(per: Int, page: Int, all: Boolean, query: String!, active: Boolean)`, both returning `nodes` plus a `pagination { page pages per totalCount nextPageKey }` object. The PhishER pagination prose page describes `page` and `per_page` with REST wording; GraphQL validation rejects arguments that are not in the schema, so the client follows the schema. You can reproduce the check with:
+
+```bash
+curl -s -X POST 'https://training.knowbe4.com/graphql?scope=phisher' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ __schema { queryType { fields { name args { name } } } } }"}'
+```
+
 ## Tools
 
 | Tool | Purpose | Notable parameters |

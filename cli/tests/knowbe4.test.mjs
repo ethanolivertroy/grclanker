@@ -673,6 +673,12 @@ test("Knowbe4ApiClient shapes PhishER GraphQL requests and paginates with per, p
   assert.ok(seen.every((item) => item.auth === "Bearer phisher-token"));
   assert.ok(seen.every((item) => item.contentType === "application/json"));
   assert.match(seen[0].operation, /phisherMessages\(query: \$query, per: \$per, page: \$page, nextPageKey: \$nextPageKey/);
+  // Argument names come from the public schema at POST https://training.knowbe4.com/graphql?scope=phisher (introspection, no auth).
+  const schemaArguments = ["per", "page", "all", "query", "sortField", "sortDirection", "nextPageKey"];
+  const usedArguments = [...seen[0].operation.match(/phisherMessages\(([^)]*)\)/)[1].matchAll(/(\w+):/g)].map((match) => match[1]);
+  assert.ok(usedArguments.length > 0);
+  assert.ok(usedArguments.every((name) => schemaArguments.includes(name)), `unknown phisherMessages arguments: ${usedArguments.join(", ")}`);
+  assert.ok(!/per_page/.test(seen[0].operation), "per_page is a Reporting API query parameter, not a PhishER GraphQL argument");
   assert.equal(seen[0].variables.query, "reported_at:[2026-06-23 TO *]");
   assert.equal(seen[0].variables.per, 200);
   assert.equal(seen[0].variables.page, 1);

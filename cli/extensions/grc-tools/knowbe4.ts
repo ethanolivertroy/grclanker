@@ -753,6 +753,10 @@ function knowbe4ErrorDetail(rawText: string): string | undefined {
   return rawText.replace(/\s+/g, " ").slice(0, 200);
 }
 
+// Argument and field names follow the public PhishER schema served to the developer portal's schema browser
+// (introspection of POST https://training.knowbe4.com/graphql?scope=phisher, no auth required):
+// phisherMessages(per: Int, page: Int, all: Boolean, query: String!, sortField, sortDirection, nextPageKey: String).
+// The prose pagination page reuses the REST wording (page and per_page); GraphQL validation rejects unknown arguments, so the schema wins.
 const PHISHER_MESSAGES_QUERY = `query GrclankerPhisherMessages($query: String!, $per: Int, $page: Int, $nextPageKey: String) {
   phisherMessages(query: $query, per: $per, page: $page, nextPageKey: $nextPageKey, sortField: REPORTED_AT, sortDirection: DESCENDING) {
     nodes {
