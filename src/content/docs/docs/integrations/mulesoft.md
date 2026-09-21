@@ -76,7 +76,7 @@ Because Anypoint scopes are environment-specific for most products, grant them f
 
 | Tool | Purpose |
 | --- | --- |
-| `mulesoft_check_access` | Probes 19 read surfaces (Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit log, MQ, Secrets Manager), reports `healthy` or `limited`, and lists missing permissions. |
+| `mulesoft_check_access` | Probes 20 read surfaces (Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit log, MQ, Secrets Manager), reports `healthy` or `limited`, and lists missing permissions. |
 | `mulesoft_assess_identity_access` | Controls 1-6, 18, 19, 25: identity providers, MFA exemptions, admin count, role group least privilege and environment scoping, environment isolation, connected app scopes and staleness, business groups. |
 | `mulesoft_assess_api_gateway` | Controls 7-9, 20: authentication and rate limiting policies on API instances (production first), client credential rotation evidence, Exchange asset governance. |
 | `mulesoft_assess_runtime_infrastructure` | Controls 10-16, 21-23: runtime versions, worker sizing, persistent queue encryption, VPC firewall rules and open ingress, DLB TLS versions and certificate expiry, MQ, Secrets Manager, hybrid servers. |
