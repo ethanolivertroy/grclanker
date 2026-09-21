@@ -663,6 +663,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+function pageSignature(items: JsonRecord[]): string {
+  return JSON.stringify(items.map((item) => item.id ?? JSON.stringify(item)));
+}
+
 function payloadErrorSummary(payload: unknown): string | undefined {
   const object = asObject(payload);
   if (!object) return undefined;
@@ -676,8 +680,30 @@ function parseJsonText(rawText: string): unknown {
   try {
     return JSON.parse(rawText) as unknown;
   } catch {
-    return { raw: rawText.slice(0, 240) };
+    return { nonJsonBodyBytes: rawText.length };
   }
+}
+
+const ECHOED_ERROR_MAX_LENGTH = 160;
+const ECHOED_SECRET_ASSIGNMENT = /([A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|passphrase|credential|community|preshared|key)[A-Za-z0-9_.-]*"?\s*[:=]\s*"?)[^",;\s}]*/gi;
+const ECHOED_LONG_TOKEN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{16,}(?![A-Za-z0-9+/=_-])/g;
+const ERROR_CODE_SHAPE = /^[A-Z][A-Z_.-]*$/;
+
+// Error bodies are tenant-controlled text that ends up in findings, _errors.log, and the bundle, so only the
+// documented error fields are echoed, capped, with credential-shaped content removed: secret-named key/value
+// pairs lose their value, and any token of 16 or more characters is dropped unless it is shaped like an
+// uppercase error code (letters only, such as INVALID_INPUT_ARGUMENT). Configured secrets are removed separately.
+function scrubEchoedText(text: string): string {
+  return text
+    .replace(ECHOED_SECRET_ASSIGNMENT, "$1[REDACTED]")
+    .replace(ECHOED_LONG_TOKEN, (token) => (ERROR_CODE_SHAPE.test(token) ? token : "[REDACTED]"))
+    .slice(0, ECHOED_ERROR_MAX_LENGTH);
+}
+
+function errorDetail(payload: unknown, rawText: string): string | undefined {
+  const summary = payloadErrorSummary(payload);
+  if (summary !== undefined) return scrubEchoedText(summary);
+  return rawText.length > 0 ? `non-JSON response body of ${rawText.length} bytes omitted` : undefined;
 }
 
 /**
@@ -827,7 +853,7 @@ export class ZiaApiClient implements ZiaReadClient {
     });
     const rawText = await response.text();
     if (!response.ok) {
-      const detail = payloadErrorSummary(parseJsonText(rawText)) ?? rawText.slice(0, 240);
+      const detail = errorDetail(parseJsonText(rawText), rawText);
       throw new ZscalerApiError("zia", response.status, this.redact(`ZIA login failed (${response.status})${detail ? `: ${detail}` : ""}`));
     }
     const sessionId = extractSessionCookie(response);
@@ -859,7 +885,7 @@ export class ZiaApiClient implements ZiaReadClient {
     const rawText = await response.text();
     const payload = parseJsonText(rawText);
     if (!response.ok) {
-      const detail = payloadErrorSummary(payload) ?? rawText.slice(0, 240);
+      const detail = errorDetail(payload, rawText);
       throw new ZscalerApiError("zia", response.status, this.redact(`ZIA ${method} ${path} failed (${response.status})${detail ? `: ${detail}` : ""}`));
     }
     return payload;
@@ -1054,10 +1080,16 @@ function datasetErrors(label: string, dataset: CollectedDataset<unknown>): strin
   return dataset.error ? [`${label}: ${dataset.error}`] : [];
 }
 
+function readExtent(dataset: CollectedDataset<unknown>, unit: string): string {
+  const seen = dataset.seen ?? 0;
+  return dataset.total !== undefined
+    ? `only ${seen} of ${dataset.total} ${unit} were read`
+    : `only ${seen} ${unit} were read and the total is unknown`;
+}
+
 function datasetTruncations(label: string, dataset: CollectedDataset<unknown>, unit = "pages"): string[] {
   if (!dataset.truncated) return [];
-  const pages = dataset.total !== undefined ? `${dataset.seen ?? 0} of ${dataset.total} ${unit}` : `${dataset.seen ?? 0} ${unit}`;
-  return [`${label}: only ${pages} were read, so the inventory is partial and absence of a record cannot support a pass`];
+  return [`${label}: ${readExtent(dataset, unit)}, so the inventory is partial and absence of a record cannot support a pass`];
 }
 
 function unreadableReason(dataset: CollectedDataset<unknown>): string {
@@ -1112,7 +1144,11 @@ function notConfiguredFinding(controlNumber: number, product: ZscalerProduct, ma
 }
 
 function partialSuffix(dataset: CollectedDataset<JsonRecord[]>, label: string): string {
-  return dataset.truncated ? ` The ${label} inventory is partial (${dataset.data.length} records over ${dataset.seen ?? 0} pages), so this verdict is capped at warn.` : "";
+  if (!dataset.truncated) return "";
+  const extent = dataset.total !== undefined
+    ? `${dataset.seen ?? 0} of ${dataset.total} pages`
+    : `${dataset.seen ?? 0} pages, total unknown`;
+  return ` The ${label} inventory is partial (${dataset.data.length} records over ${extent}), so this verdict is capped at warn.`;
 }
 
 function capForPartial(status: ZscalerFindingStatus, dataset: CollectedDataset<JsonRecord[]>): ZscalerFindingStatus {
@@ -1621,7 +1657,7 @@ export class ZpaApiClient implements ZpaReadClient {
     const rawText = await response.text();
     const payload = asObject(parseJsonText(rawText)) ?? {};
     if (!response.ok) {
-      const detail = payloadErrorSummary(payload) ?? rawText.slice(0, 240);
+      const detail = errorDetail(payload, rawText);
       throw new ZscalerApiError("zpa", response.status, this.redact(`ZPA signin failed (${response.status})${detail ? `: ${detail}` : ""}`));
     }
     const token = asString(payload.access_token);
@@ -1664,36 +1700,47 @@ export class ZpaApiClient implements ZpaReadClient {
     const rawText = await response.text();
     const payload = parseJsonText(rawText);
     if (!response.ok) {
-      const detail = payloadErrorSummary(payload) ?? rawText.slice(0, 240);
+      const detail = errorDetail(payload, rawText);
       throw new ZscalerApiError("zpa", response.status, this.redact(`ZPA GET ${path} failed (${response.status})${detail ? `: ${detail}` : ""}`));
     }
     return payload;
   }
 
   // Offset paging for the ZPA list endpoints documented with page and pagesize and a list/totalPages wrapper.
+  // A response without totalPages (a bare array or a wrapper that omits it) leaves the total unknown: paging
+  // continues while pages are full and a page identical to the previous one means the server stopped
+  // advancing, so the read is reported truncated with no total rather than as a complete single page.
   async getPaged(path: string, query: JsonRecord = {}): Promise<PagedList> {
     const items: JsonRecord[] = [];
+    let previousSignature: string | undefined;
     let totalPages: number | undefined;
     for (let page = 1; page <= ZPA_MAX_PAGES; page += 1) {
       const payload = await this.get(path, { ...query, page, pagesize: ZPA_PAGE_SIZE });
-      if (Array.isArray(payload)) {
-        return { items: asRecordArray(payload), truncated: false, pagesFetched: 1, totalPages: 1 };
+      const wrapper = Array.isArray(payload) ? undefined : asObject(payload);
+      const pageItems = asRecordArray(Array.isArray(payload) ? payload : wrapper?.list);
+      totalPages = wrapper ? asNumber(wrapper.totalPages) : undefined;
+      const signature = pageSignature(pageItems);
+      if (page > 1 && pageItems.length > 0 && signature === previousSignature) {
+        return { items, truncated: true, pagesFetched: page };
       }
-      const object = asObject(payload) ?? {};
-      items.push(...asRecordArray(object.list));
-      totalPages = asNumber(object.totalPages) ?? 1;
-      if (page >= totalPages) {
-        return { items, truncated: false, pagesFetched: page, totalPages };
+      previousSignature = signature;
+      items.push(...pageItems);
+      if (totalPages !== undefined) {
+        if (page >= totalPages) return { items, truncated: false, pagesFetched: page, totalPages };
+      } else if (pageItems.length < ZPA_PAGE_SIZE) {
+        return { items, truncated: false, pagesFetched: page };
       }
     }
     return { items, truncated: true, pagesFetched: ZPA_MAX_PAGES, totalPages };
   }
 
   // Cursor paging for GET /emergencyAccess/users, the one ZPA surface documented with pageId and pageSize
-  // query parameters and an items/nextPage wrapper instead of list/totalPages.
+  // query parameters and an items/nextPage wrapper instead of list/totalPages. An absent nextPage is the end of
+  // the list; a cursor that repeats or cycles means the server stopped advancing and the total is unknown.
   async getCursorPaged(path: string, query: JsonRecord = {}, idKeys: string[] = ["id"]): Promise<PagedList> {
     const items: JsonRecord[] = [];
     const seen = new Set<string>();
+    const cursors = new Set<string>();
     let pageId: string | undefined;
     for (let page = 1; page <= ZPA_MAX_PAGES; page += 1) {
       const object = asObject(await this.get(path, { ...query, pageSize: ZPA_PAGE_SIZE, pageId })) ?? {};
@@ -1704,9 +1751,13 @@ export class ZpaApiClient implements ZpaReadClient {
         items.push(item);
       }
       const nextPage = asString(object.nextPage);
-      if (!nextPage || nextPage === pageId) {
+      if (!nextPage) {
         return { items, truncated: false, pagesFetched: page };
       }
+      if (nextPage === pageId || cursors.has(nextPage)) {
+        return { items, truncated: true, pagesFetched: page };
+      }
+      cursors.add(nextPage);
       pageId = nextPage;
     }
     return { items, truncated: true, pagesFetched: ZPA_MAX_PAGES };
@@ -2973,15 +3024,40 @@ export async function assessZpa(client: ZpaReadClient | undefined, options: ZpaA
   return assessZpaData(await collectZpaData(client), options);
 }
 
-const SENSITIVE_EXPORT_KEYS = new Set(["authenticationToken", "clientSecret", "preSharedKey", "password", "privateKey", "zrsaencryptedprivatekey", "zrsaencryptedsessionkey", "tmpPassword"]);
+// Exact keys the published ZIA and ZPA schemas document as credentials (kerberosPwd on GET /authSettings,
+// scimSharedSecret on GET .../idp, preSharedKey on VPN credentials, the enrollment certificate key material),
+// plus the documented free-text comment fields on VPN credentials and GRE tunnels, which operators use to
+// store pre-shared keys.
+const SENSITIVE_EXPORT_KEYS = new Set([
+  "authenticationToken", "clientSecret", "preSharedKey", "password", "privateKey", "zrsaencryptedprivatekey",
+  "zrsaencryptedsessionkey", "tmpPassword", "kerberosPwd", "scimSharedSecret", "comment", "comments",
+]);
+// Any other key whose normalized name (lowercase, alphanumerics only) reads like credential material is redacted
+// as well, so a field this module does not know about never ships in cleartext.
+const SENSITIVE_KEY_PATTERN = /password|passwd|pwd|secret|token|passphrase|credential|private|community|preshared|apikey|keymaterial|sharedkey|sessionkey|encryptedkey|signingkey|accesskey|key$/;
+// Normalized names that match the pattern but carry no secret in the published schemas or in this module's
+// evidence objects.
+const BENIGN_SECRET_LIKE_KEYS = new Set([
+  "ispasswordloginallowed", "ispasswordexpired", "passwordexpirationenabled", "passwordexpirydays", "passwordstrength",
+  "passwordloginadmins", "blockpasswordprotectedarchivefiles", "blockpasswordprotectedarchives", "tokentype",
+  "scimsharedsecretexists", "privatekeypresent", "publickey", "privateip", "vpncredentials", "vpncredentialinventorypartial",
+]);
 
-function redactForExport(value: unknown): unknown {
+function isSensitiveExportKey(key: string): boolean {
+  if (SENSITIVE_EXPORT_KEYS.has(key)) return true;
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (BENIGN_SECRET_LIKE_KEYS.has(normalized)) return false;
+  return SENSITIVE_KEY_PATTERN.test(normalized);
+}
+
+export function redactForExport(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactForExport);
   const object = asObject(value);
   if (!object) return value;
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
-    output[key] = SENSITIVE_EXPORT_KEYS.has(key) && entry !== null && entry !== undefined ? "[REDACTED]" : redactForExport(entry);
+    const carriesValue = entry !== null && entry !== undefined && typeof entry !== "boolean";
+    output[key] = isSensitiveExportKey(key) && carriesValue ? "[REDACTED]" : redactForExport(entry);
   }
   return output;
 }
@@ -3118,11 +3194,11 @@ export async function exportZscalerAuditBundle(clients: ZscalerClients, options:
     ...assessments.flatMap((assessment) => assessment.truncated.map((note) => `${assessment.area} partial: ${note}`)),
   ];
 
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
+  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(redactForExport(access)));
   await writeSecureTextFile(outputDir, "core_data/zia_access_control.json", serializeJson(redactForExport(ziaAccessData ?? { configured: false })));
   await writeSecureTextFile(outputDir, "core_data/zia_policy.json", serializeJson(redactForExport(ziaPolicyData ?? { configured: false })));
   await writeSecureTextFile(outputDir, "core_data/zpa.json", serializeJson(redactForExport(zpaData ?? { configured: false })));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactForExport(findings)));
   await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
     generated_at: generatedAt,
     access_status: access.status,

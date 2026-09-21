@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   ZiaApiClient,
@@ -21,6 +22,7 @@ import {
   listZscalerControls,
   mappingsForControl,
   obfuscateZiaApiKey,
+  redactForExport,
   redactSecrets,
   resolveSecureOutputPath,
   resolveZiaBaseUrl,
@@ -1091,7 +1093,7 @@ test("ZpaApiClient pages /emergencyAccess/users with the pageId cursor and dedup
   }
 });
 
-test("ZpaApiClient stops cursor paging when nextPage repeats and records truncation at the page cap", async () => {
+test("ZpaApiClient reports a repeated or cycling nextPage cursor as truncated and ZS-23 stays below pass (rule 10)", async () => {
   let calls = 0;
   const fetchImpl = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
@@ -1102,8 +1104,30 @@ test("ZpaApiClient stops cursor paging when nextPage repeats and records truncat
   const client = new ZpaApiClient(zpaConfig(), { fetchImpl, maxRetries: 0 });
   const users = await client.listEmergencyAccessUsers();
   assert.equal(calls, 2);
-  assert.equal(users.truncated, false);
+  assert.equal(users.truncated, true);
+  assert.equal(users.totalPages, undefined);
   assert.deepEqual(users.items.map((user) => user.userId), ["u-1", "u-2"]);
+
+  let cycle = 0;
+  const cycling = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/signin") return jsonResponse({ token_type: "Bearer", access_token: "t", expires_in: "3600" });
+    cycle += 1;
+    return jsonResponse({ items: [{ userId: `u-${cycle}` }], nextPage: cycle % 2 === 1 ? "cursor-b" : "cursor-a" });
+  };
+  const cycled = await new ZpaApiClient(zpaConfig(), { fetchImpl: cycling, maxRetries: 0 }).listEmergencyAccessUsers();
+  assert.equal(cycled.truncated, true);
+  assert.equal(cycle, 3);
+
+  const stuckTenant = zpaTenantFetch(zpaCompliantTenant({
+    emergencyAccessPages: [{ items: [{ userId: "u-1", emailId: "breakglass-1@example.com", userStatus: "DEACTIVATED", lastLoginTime: PAST_EPOCH }], nextPage: "cursor-1" }],
+  }));
+  const stuck = await assessZpa(new ZpaApiClient(zpaConfig(), { fetchImpl: stuckTenant.fetchImpl, maxRetries: 0, now: () => NOW }));
+  const emergency = findingById(stuck, "ZS-23");
+  assert.equal(emergency.status, "warn");
+  assert.equal(emergency.evidence.partial_inventory, true);
+  assert.match(emergency.summary, /emergency access user inventory is partial \(1 records over 2 pages, total unknown\)/);
+  assert.ok(stuck.truncated.some((note) => /emergencyAccess\/users: only 2 pages were read and the total is unknown/.test(note)), stuck.truncated.join("\n"));
 
   let cursor = 0;
   const endless = async (input) => {
@@ -1164,7 +1188,7 @@ test("ZiaApiClient records truncation when a URL rule read hits the page cap and
 
   const result = assessZiaPolicyData(data);
   assert.equal(findingById(result, "ZS-01").status, "warn");
-  assert.match(findingById(result, "ZS-01").summary, /URL filtering rule inventory is partial \(5000 records over 50 pages\)/);
+  assert.match(findingById(result, "ZS-01").summary, /URL filtering rule inventory is partial \(5000 records over 50 pages, total unknown\)/);
   assert.equal(findingById(result, "ZS-17").status, "warn");
   assert.match(findingById(result, "ZS-17").summary, /inventory is partial/);
   assert.ok(result.truncated.some((note) => /urlFilteringRules: only 50 pages were read/.test(note)));
@@ -1531,7 +1555,7 @@ test("self-check (c): stale connectors, truncated sub-locations, capped rule rea
     "ZS-01": [policy, /URL filtering rule inventory is partial/],
     "ZS-17": [policy, /URL filtering rule inventory is partial/],
     "ZS-18": [policy, /Sub-locations were read for only 100 of 150 parent locations/],
-    "ZS-08": [zpaResult, /inventory is partial \(200 records over 200 pages\)/],
+    "ZS-08": [zpaResult, /inventory is partial \(200 records over 200 of 400 pages\)/],
     "ZS-11": [zpaResult, /2 authenticated but with lastBrokerConnectTime older than 30 days/],
     "ZS-21": [zpaResult, /1 authenticated but with lastBrokerConnectTime older than 30 days/],
   };
@@ -1643,7 +1667,7 @@ test("self-check (c): a single partial dataset caps exactly the controls that re
   zpa.browserAccessCertificates = partial(zpa.browserAccessCertificates);
   const certificates = assessZpaData(zpa).findings.find((item) => item.id === "ZS-24");
   assert.equal(certificates.status, "warn");
-  assert.match(certificates.summary, /browser access certificate inventory is partial \(\d+ records over 200 pages\)/);
+  assert.match(certificates.summary, /browser access certificate inventory is partial \(\d+ records over 200 of 201 pages\)/);
   const idp = zpaFixture();
   idp.samlAttributes = partial(idp.samlAttributes);
   assert.match(assessZpaData(idp).findings.find((item) => item.id === "ZS-12").summary, /SAML attribute inventory is partial/);
