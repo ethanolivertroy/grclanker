@@ -228,7 +228,7 @@ const DUO_ACCESS_PROBES = [
   { key: "integrations", path: "/admin/v3/integrations", params: { limit: 1 } },
 ] as const;
 
-const DUO_CHECKS: Record<string, CheckDefinition> = {
+const DUO_CHECKS = {
   "DUO-AUTH-001": {
     id: "DUO-AUTH-001",
     title: "Phishing-resistant authentication methods",
@@ -688,7 +688,168 @@ const DUO_CHECKS: Record<string, CheckDefinition> = {
       general: ["operator notification path"],
     },
   },
+} satisfies Record<string, CheckDefinition>;
+
+type DuoCheckId = keyof typeof DUO_CHECKS;
+
+interface ManualContext {
+  endpoint: string;
+  permission: string;
+  evidence: string;
+}
+
+/**
+ * Endpoint, Admin API permission, and evidence to collect for every finding. Manual findings that
+ * do not already name these lines receive them so a forbidden or unreadable call always tells the
+ * operator what to grant or export.
+ */
+const DUO_MANUAL_CONTEXT: Record<DuoCheckId, ManualContext> = {
+  "DUO-AUTH-001": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy Authentication Methods section from the Duo Admin Panel.",
+  },
+  "DUO-AUTH-002": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy Authentication Methods section showing allowed and blocked methods.",
+  },
+  "DUO-AUTH-003": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy New User section.",
+  },
+  "DUO-AUTH-004": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy Remembered Devices section.",
+  },
+  "DUO-AUTH-005": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy Trusted Endpoints and device health sections.",
+  },
+  "DUO-AUTH-006": {
+    endpoint: DUO_ENDPOINTS.bypassCodes,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Bypass Codes report from the Duo Admin Panel.",
+  },
+  "DUO-AUTH-007": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy Authentication Policy section.",
+  },
+  "DUO-AUTH-008": {
+    endpoint: DUO_ENDPOINTS.users,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Users report with status and enrollment columns.",
+  },
+  "DUO-AUTH-009": {
+    endpoint: DUO_ENDPOINTS.users,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Users report with the last login column.",
+  },
+  "DUO-AUTH-010": {
+    endpoint: DUO_ENDPOINTS.webauthnCredentials,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the WebAuthn credentials and Users reports.",
+  },
+  "DUO-AUTH-011": {
+    endpoint: `${DUO_ENDPOINTS.globalPolicy} and ${DUO_ENDPOINTS.offlineEnrollmentLogs}`,
+    permission: `${DUO_PERMISSIONS.readResource} and ${DUO_PERMISSIONS.readLog}`,
+    evidence: "Screenshot the Global Policy Offline Access section with enabled platforms, offline days, and reactivation limits.",
+  },
+  "DUO-ADMIN-001": {
+    endpoint: DUO_ENDPOINTS.admins,
+    permission: `${DUO_PERMISSIONS.adminsRead} and ${DUO_PERMISSIONS.readResource}`,
+    evidence: "Export the Administrators list with role, status, and last login.",
+  },
+  "DUO-ADMIN-002": {
+    endpoint: DUO_ENDPOINTS.adminAllowedAuthMethods,
+    permission: DUO_PERMISSIONS.adminsRead,
+    evidence: "Screenshot Administrators > Admin Login Settings authentication methods.",
+  },
+  "DUO-ADMIN-003": {
+    endpoint: DUO_ENDPOINTS.settings,
+    permission: DUO_PERMISSIONS.settings,
+    evidence: "Screenshot Settings > Help Desk bypass code settings.",
+  },
+  "DUO-ADMIN-004": {
+    endpoint: DUO_ENDPOINTS.admins,
+    permission: `${DUO_PERMISSIONS.adminsRead} and ${DUO_PERMISSIONS.readResource}`,
+    evidence: "Export the Administrators list with last login.",
+  },
+  "DUO-ADMIN-005": {
+    endpoint: DUO_ENDPOINTS.settings,
+    permission: DUO_PERMISSIONS.settings,
+    evidence: "Screenshot Settings > User lockout threshold and lockout duration.",
+  },
+  "DUO-INTEGRATIONS-001": {
+    endpoint: DUO_ENDPOINTS.integrations,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Applications list with policy assignments.",
+  },
+  "DUO-INTEGRATIONS-002": {
+    endpoint: DUO_ENDPOINTS.integrations,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Applications list with the prompt type (Universal Prompt status) for each application.",
+  },
+  "DUO-INTEGRATIONS-003": {
+    endpoint: DUO_ENDPOINTS.integrations,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Review each application's Self-service portal setting in the Duo Admin Panel.",
+  },
+  "DUO-INTEGRATIONS-004": {
+    endpoint: DUO_ENDPOINTS.integrations,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Admin API applications with their permission grants.",
+  },
+  "DUO-INTEGRATIONS-005": {
+    endpoint: DUO_ENDPOINTS.integrations,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Applications list with sensitivity level, compliance requirements, and policy.",
+  },
+  "DUO-INTEGRATIONS-006": {
+    endpoint: DUO_ENDPOINTS.globalPolicy,
+    permission: DUO_PERMISSIONS.readResource,
+    evidence: "Export the Global Policy Duo Desktop, Operating Systems, Full Disk Encryption, and Screen Lock sections.",
+  },
+  "DUO-MON-001": {
+    endpoint: DUO_ENDPOINTS.authenticationLogs,
+    permission: DUO_PERMISSIONS.readLog,
+    evidence: "Export the Authentication Log for the review window.",
+  },
+  "DUO-MON-002": {
+    endpoint: DUO_ENDPOINTS.trustMonitorEvents,
+    permission: DUO_PERMISSIONS.readLog,
+    evidence: "Export Trust Monitor security events for the review window.",
+  },
+  "DUO-MON-003": {
+    endpoint: `${DUO_ENDPOINTS.infoSummary} and ${DUO_ENDPOINTS.telephonyLogs}`,
+    permission: `${DUO_PERMISSIONS.readInformation} and ${DUO_PERMISSIONS.readLog}`,
+    evidence: "Screenshot the Billing page telephony credits and export the Telephony Log for the review window.",
+  },
+  "DUO-MON-004": {
+    endpoint: DUO_ENDPOINTS.settings,
+    permission: DUO_PERMISSIONS.settings,
+    evidence: "Screenshot Settings > Notifications in the Duo Admin Panel.",
+  },
+  "DUO-MON-005": {
+    endpoint: `${DUO_ENDPOINTS.authenticationAttempts} and ${DUO_ENDPOINTS.authenticationLogs}`,
+    permission: `${DUO_PERMISSIONS.readInformation} and ${DUO_PERMISSIONS.readLog}`,
+    evidence: "Export the Authentication Summary report and the Authentication Log with access device location.",
+  },
 };
+
+function withManualContext(id: DuoCheckId, evidence: string[]): string[] {
+  const context = DUO_MANUAL_CONTEXT[id];
+  const missing = [
+    evidence.some((line) => line.startsWith("endpoint=")) ? undefined : `endpoint=${context.endpoint}`,
+    evidence.some((line) => line.startsWith("required_permission=")) ? undefined : `required_permission=${context.permission}`,
+    evidence.some((line) => line.startsWith("manual_evidence=")) ? undefined : `manual_evidence=${context.evidence}`,
+  ].filter((line): line is string => Boolean(line));
+  return [...evidence, ...missing];
+}
 
 function compareUnicode(a: string, b: string): number {
   for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
@@ -1456,7 +1617,7 @@ export async function collectDuoMonitoringData(
 }
 
 function buildFinding(
-  id: keyof typeof DUO_CHECKS,
+  id: DuoCheckId,
   status: DuoFindingStatus,
   summary: string,
   evidence: string[],
@@ -1471,7 +1632,7 @@ function buildFinding(
     status,
     severity: options?.severity ?? definition.severity,
     summary,
-    evidence,
+    evidence: status === "Manual" ? withManualContext(id, evidence) : evidence,
     recommendation,
     manualNote: options?.manualNote,
     frameworks: definition.frameworks,
@@ -2792,31 +2953,15 @@ export function assessDuoAdminAccess(
     );
   }
 
-  findings.push(
-    buildFinding(
-      "DUO-MON-004",
-      data.activityLogs.error ? "Manual" : "Pass",
-      data.activityLogs.error
-        ? "Administrative activity logs could not be collected."
-        : "Administrative activity logs are readable to the audit principal.",
-      data.activityLogs.error
-        ? unavailableEvidence(
-            DUO_ENDPOINTS.activityLogs,
-            DUO_PERMISSIONS.readLog,
-            data.activityLogs.error,
-            "Export the Administrator Actions report from the Duo Admin Panel.",
-          )
-        : [`activity_logs_collected=${data.activityLogs.data.length}`],
-      "Keep admin activity logs available to the audit or monitoring workflow so privileged changes are reviewable.",
-    ),
-  );
-
+  // Activity logs are collected into core_data as evidence; DUO-MON-004 belongs to the
+  // monitoring assessment only, so no finding id is emitted twice across tools.
   const snapshotSummary = {
     admins: admins.length,
     owners: ownerCount,
     stale_admins: staleAdmins.length,
     undated_admins: undatedAdmins.length,
     activity_logs_collected: data.activityLogs.data.length,
+    activity_logs_readable: data.activityLogs.error ? `no (${data.activityLogs.error})` : "yes",
   };
 
   return {
@@ -3161,13 +3306,26 @@ export function assessDuoIntegrations(
     );
   }
 
-  if (universalPromptApplicable.length === 0) {
+  if (data.integrations.error) {
+    findings.push(
+      buildFinding(
+        "DUO-INTEGRATIONS-002",
+        "Manual",
+        "Universal Prompt adoption could not be determined because the integration inventory was unavailable.",
+        integrationsEvidence,
+        "Grant the audit principal Grant resource - Read so prompt_v4_enabled and frameless_auth_prompt_enabled can be read per application.",
+      ),
+    );
+  } else if (universalPromptApplicable.length === 0) {
     findings.push(
       buildFinding(
         "DUO-INTEGRATIONS-002",
         "Manual",
         "Universal Prompt adoption could not be determined from the collected integration payloads.",
-        ["No integration records exposed frameless_auth_prompt_enabled or prompt_v4_enabled."],
+        [
+          `integrations_returned=${data.integrations.data.length}`,
+          "No integration record exposed frameless_auth_prompt_enabled or prompt_v4_enabled.",
+        ],
         "Review application prompt posture directly in Duo for the most sensitive integrations.",
       ),
     );
@@ -3447,7 +3605,12 @@ export function assessDuoMonitoring(
         "DUO-MON-001",
         "Manual",
         "Authentication logs could not be collected.",
-        [data.authenticationLogs.error],
+        unavailableEvidence(
+          DUO_ENDPOINTS.authenticationLogs,
+          DUO_PERMISSIONS.readLog,
+          data.authenticationLogs.error,
+          DUO_MANUAL_CONTEXT["DUO-MON-001"].evidence,
+        ),
         "Grant read log permissions and confirm the audit principal can retrieve Duo authentication events.",
       ),
     );
@@ -3502,7 +3665,12 @@ export function assessDuoMonitoring(
         "DUO-MON-002",
         "Manual",
         "Trust Monitor events could not be collected.",
-        [data.trustMonitorEvents.error],
+        unavailableEvidence(
+          DUO_ENDPOINTS.trustMonitorEvents,
+          DUO_PERMISSIONS.readLog,
+          data.trustMonitorEvents.error,
+          DUO_MANUAL_CONTEXT["DUO-MON-002"].evidence,
+        ),
         "Confirm the audit principal has read-log permissions and that Trust Monitor telemetry is available for the tenant edition.",
       ),
     );
@@ -3537,32 +3705,66 @@ export function assessDuoMonitoring(
         "DUO-MON-003",
         "Manual",
         "Telephony monitoring could not be fully assessed.",
-        [data.telephonyLogs.error, data.infoSummary.error].filter((item): item is string => Boolean(item)),
+        [
+          ...(data.infoSummary.error
+            ? unavailableEvidence(
+                DUO_ENDPOINTS.infoSummary,
+                DUO_PERMISSIONS.readInformation,
+                data.infoSummary.error,
+                "Screenshot the Billing page telephony credits.",
+              )
+            : [`telephony_credits_remaining=${creditsRemaining ?? "unknown"}`]),
+          ...(data.telephonyLogs.error
+            ? unavailableEvidence(
+                DUO_ENDPOINTS.telephonyLogs,
+                DUO_PERMISSIONS.readLog,
+                data.telephonyLogs.error,
+                "Export the Telephony Log for the review window.",
+              )
+            : [`telephony_logs=${telephonyLogs.length}`]),
+        ],
         "Confirm read-log and read-information permissions, then review telephony usage and remaining credits.",
       ),
     );
-  } else if ((creditsRemaining ?? 0) < 25 && smsOrPhoneLogs > 0) {
+  } else if (creditsRemaining === undefined) {
+    findings.push(
+      buildFinding(
+        "DUO-MON-003",
+        "Manual",
+        "Remaining telephony credits could not be read, so telephony capacity cannot be confirmed (unknown credits never support Pass).",
+        [
+          `endpoint=${DUO_ENDPOINTS.infoSummary}`,
+          `required_permission=${DUO_PERMISSIONS.readInformation}`,
+          "telephony_credits_remaining=unknown (absent from the Retrieve Summary response)",
+          `telephony_logs=${telephonyLogs.length}`,
+          `telephony_factor_events=${smsOrPhoneLogs}`,
+          "manual_evidence=Screenshot the Billing page telephony credits in the Duo Admin Panel.",
+        ],
+        "Confirm the audit principal has Grant read information and that the account reports telephony_credits_remaining.",
+      ),
+    );
+  } else if (creditsRemaining < 25 && smsOrPhoneLogs > 0) {
     findings.push(
       withInventoryCap(
         buildFinding(
           "DUO-MON-003",
           "Fail",
           "Telephony-backed MFA usage is active while available credits are low.",
-          [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
+          [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining}`],
           "Reduce telephony reliance and replenish credits before low balance creates an authentication bottleneck.",
         ),
         data.telephonyLogs,
         MAX_LOG_RECORDS,
       ),
     );
-  } else if (smsOrPhoneLogs > 0 || (creditsRemaining ?? Number.POSITIVE_INFINITY) < 100) {
+  } else if (smsOrPhoneLogs > 0 || creditsRemaining < 100) {
     findings.push(
       withInventoryCap(
         buildFinding(
           "DUO-MON-003",
           "Partial",
           "Telephony capacity needs periodic review.",
-          [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
+          [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining}`],
           "Keep telephony credits monitored and continue moving users away from SMS and phone callback factors.",
         ),
         data.telephonyLogs,
@@ -3576,7 +3778,7 @@ export function assessDuoMonitoring(
           "DUO-MON-003",
           "Pass",
           "Telephony capacity looks healthy in the sampled window.",
-          [`telephony_logs=${telephonyLogs.length}`, `telephony_credits_remaining=${creditsRemaining ?? "unknown"}`],
+          [`telephony_logs=${telephonyLogs.length}`, `telephony_credits_remaining=${creditsRemaining}`],
           "Continue monitoring telephony usage so low credits or weak-factor fallback do not become a surprise.",
         ),
         data.telephonyLogs,

@@ -38,7 +38,7 @@ Do not grant any write permission. The tools never call a mutating endpoint.
 |---|---|
 | `duo_check_access` | Probes settings, users, policies, admins, authentication logs, and integrations and reports which surfaces the audit principal can read. |
 | `duo_assess_authentication` | Global MFA enforcement mode, phishing-resistant factors, deprecated factors, new user policy, remembered devices, trusted endpoints, bypass codes, enrollment completeness, inactive users, WebAuthn adoption, offline access evidence. |
-| `duo_assess_admin_access` | Owner concentration, administrator MFA methods, help desk bypass governance, stale and never-logged-in administrators, user lockout policy, admin activity log readability. |
+| `duo_assess_admin_access` | Owner concentration, administrator MFA methods, help desk bypass governance, stale and never-logged-in administrators, user lockout policy. Administrator activity logs are collected as evidence (`core_data/activity_logs.json`) rather than graded. |
 | `duo_assess_integrations` | Explicit policy attachment, Universal Prompt adoption, self-service portal governance, Admin API least privilege, critical application coverage, device health depth. |
 | `duo_assess_monitoring` | Authentication log factor hygiene, Trust Monitor coverage, telephony credits and reliance, authentication attempt outcomes and impossible travel, notification settings. |
 | `duo_export_audit_bundle` | Runs all four assessments and writes the shared bundle layout plus a zip archive (defaults to `./export/duo`). |
@@ -58,7 +58,7 @@ Do not grant any write permission. The tools never call a mutating endpoint.
 | `GET /admin/v1/admins/allowed_auth_methods` | Administrators, Retrieve Allowed Authentication Methods | `verified_push_enabled`, `webauthn_enabled`, `sms_enabled`, `voice_enabled` |
 | `GET /admin/v3/integrations` | Integrations, Retrieve Integrations | `type`, `policy_key`, `user_access`, `sensitivity_level`, `compliance_requirements`, `prompt_v4_enabled`, `frameless_auth_prompt_enabled`, `self_service_allowed`, `adminapi_*`; `limit` max 500; v5 signing |
 | `GET /admin/v2/logs/authentication` | Logs, Authentication Logs | `mintime` and `maxtime` in milliseconds, `next_offset` cursor; `result`, `factor`, `timestamp`, `user.key`, `access_device.location.country` |
-| `GET /admin/v2/logs/activity`, `GET /admin/v2/logs/telephony` | Logs | readability and telephony usage |
+| `GET /admin/v2/logs/activity`, `GET /admin/v2/logs/telephony` | Logs | activity log evidence; telephony usage (`type` sms or phone) |
 | `GET /admin/v1/logs/offline_enrollment` | Logs, Offline Enrollment Logs | `mintime` in Unix seconds; `action`, `description.factor` |
 | `GET /admin/v1/trust_monitor/events` | Trust Monitor | `priority_event`, `state` |
 
@@ -83,7 +83,7 @@ Status semantics: `Pass` means the documented setting or population meets the co
 | 13 | Unprotected application detection | DUO-INTEGRATIONS-005 | Automated when applications carry `sensitivity_level` or `compliance_requirements`; Manual otherwise |
 | 14 | Trust Monitor configuration | DUO-MON-002 | Automated where the edition exposes Trust Monitor events |
 | 15 | Authentication log anomalies | DUO-MON-005 (attempt outcomes, impossible travel), DUO-MON-001 (factor hygiene) | Automated; travel analysis needs `access_device.location` (Advantage and Premier) |
-| 16 | Telephony credit monitoring | DUO-MON-003 | Automated |
+| 16 | Telephony credit monitoring | DUO-MON-003 | Automated; Manual when `telephony_credits_remaining` is absent (unknown credits never pass) |
 | 17 | U2F/WebAuthn credential inventory | DUO-AUTH-010 | Automated |
 | 18 | Offline access configuration | DUO-AUTH-011 | Manual: Policy Section Data documents no offline access section; offline enrollment events are collected as evidence |
 | 19 | Self-service portal policy | DUO-INTEGRATIONS-003 | Automated per integration (`self_service_allowed` from `/admin/v3/integrations`); the legacy `global_ssp_policy_enforced` setting is evidence only |

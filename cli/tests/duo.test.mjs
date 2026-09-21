@@ -391,6 +391,20 @@ function assertNoPass(result, label) {
   assert.deepEqual(passed, [], `${label} must not produce Pass findings`);
 }
 
+function assertManualContext(finding) {
+  assert.equal(finding.status, "Manual", `${finding.id} should be Manual`);
+  assert.ok(finding.evidence.some((line) => line.startsWith("endpoint=/admin/")), `${finding.id} names the endpoint`);
+  assert.ok(finding.evidence.some((line) => line.startsWith("required_permission=Grant")), `${finding.id} names the permission`);
+  assert.ok(finding.evidence.some((line) => line.startsWith("manual_evidence=")), `${finding.id} names the evidence to collect`);
+}
+
+function assertEveryManualHasContext(result, label) {
+  for (const finding of result.findings.filter((item) => item.status === "Manual")) {
+    assertManualContext(finding);
+  }
+  return result.findings.filter((item) => item.status === "Manual").length;
+}
+
 test("DuoAuditorClient sends documented paths and second-based windows for info and offline endpoints", async () => {
   const requests = [];
   const fetchImpl = async (input) => {
@@ -496,10 +510,7 @@ test("assessDuoAuthentication never passes when every call is forbidden", () => 
   assertNoPass(result, "forbidden authentication data");
   assert.equal(result.findings.length, 11);
   for (const finding of result.findings) {
-    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
-    assert.ok(finding.evidence.some((line) => line.startsWith("endpoint=/admin/")), `${finding.id} names the endpoint`);
-    assert.ok(finding.evidence.some((line) => line.startsWith("required_permission=Grant")), `${finding.id} names the permission`);
-    assert.ok(finding.evidence.some((line) => line.startsWith("manual_evidence=")), `${finding.id} names the evidence to collect`);
+    assertManualContext(finding);
   }
 });
 
@@ -720,20 +731,22 @@ test("assessDuoAdminAccess evaluates lockout policy and undated administrators",
 
   const forbiddenResult = assessDuoAdminAccess(forbiddenAdminData(), createSampleConfig());
   assertNoPass(forbiddenResult, "forbidden admin data");
+  assert.equal(forbiddenResult.findings.length, 5);
   for (const finding of forbiddenResult.findings) {
-    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
-    assert.ok(finding.evidence.some((line) => line.startsWith("required_permission=Grant")), `${finding.id} names the permission`);
+    assertManualContext(finding);
   }
+  assert.equal(
+    forbiddenResult.findings.some((finding) => finding.id.startsWith("DUO-MON-")),
+    false,
+    "the admin-access assessment no longer emits a monitoring finding id",
+  );
 
   const emptyResult = assessDuoAdminAccess(
     { settings: dataset({}), admins: dataset([]), allowedAdminAuthMethods: dataset({}), activityLogs: dataset([]) },
     createSampleConfig(),
   );
-  assert.deepEqual(
-    emptyResult.findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id),
-    ["DUO-MON-004"],
-    "readable-but-empty activity logs remain the only Pass because the control only asserts readability",
-  );
+  assertNoPass(emptyResult, "empty admin data");
+  assert.equal(emptyResult.snapshotSummary.activity_logs_readable, "yes", "activity log readability is reported as evidence, not as a finding");
 
   const weak = compliantAdminData();
   weak.settings = dataset({ ...compliantSettings(), lockout_threshold: 25 });
@@ -854,8 +867,10 @@ test("assessDuoIntegrations covers critical applications and device health depth
 
   const forbiddenResult = assessDuoIntegrations(forbiddenIntegrationData(), createSampleConfig());
   assertNoPass(forbiddenResult, "forbidden integration data");
+  assert.equal(forbiddenResult.findings.length, 6);
   for (const finding of forbiddenResult.findings) {
-    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
+    assertManualContext(finding);
+    assert.ok(finding.evidence.some((line) => line.startsWith("collection_error=")), `${finding.id} carries the 403 error`);
   }
 
   const emptyResult = assessDuoIntegrations(
@@ -955,10 +970,15 @@ test("assessDuoMonitoring evaluates authentication attempts and impossible trave
 
   const forbiddenResult = assessDuoMonitoring(forbiddenMonitoringData(), createSampleConfig());
   assertNoPass(forbiddenResult, "forbidden monitoring data");
+  assert.equal(forbiddenResult.findings.length, 5);
   for (const finding of forbiddenResult.findings) {
-    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
+    assertManualContext(finding);
+    assert.ok(finding.evidence.some((line) => line.startsWith("collection_error=")), `${finding.id} carries the 403 error`);
   }
   assert.ok(findingById(forbiddenResult, "DUO-MON-005").evidence.includes("required_permission=Grant read information"));
+  const telephonyForbidden = findingById(forbiddenResult, "DUO-MON-003");
+  assert.ok(telephonyForbidden.evidence.includes("endpoint=/admin/v1/info/summary"));
+  assert.ok(telephonyForbidden.evidence.includes("endpoint=/admin/v2/logs/telephony"));
 
   const emptyResult = assessDuoMonitoring(
     {
@@ -972,11 +992,11 @@ test("assessDuoMonitoring evaluates authentication attempts and impossible trave
     },
     createSampleConfig(),
   );
-  assert.deepEqual(
-    emptyResult.findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id),
-    ["DUO-MON-003"],
-    "zero telephony usage with unknown credits is the only compliant-by-intent empty result",
-  );
+  assertNoPass(emptyResult, "empty monitoring data");
+  const unknownCredits = findingById(emptyResult, "DUO-MON-003");
+  assert.equal(unknownCredits.status, "Manual", "unknown telephony credits never support Pass");
+  assert.ok(unknownCredits.evidence.some((line) => line.startsWith("telephony_credits_remaining=unknown")));
+  assertManualContext(unknownCredits);
   assert.equal(findingById(emptyResult, "DUO-MON-005").status, "Partial");
 
   const travel = compliantMonitoringData();
@@ -999,6 +1019,57 @@ test("assessDuoMonitoring evaluates authentication attempts and impossible trave
   const noLocationFinding = findingById(assessDuoMonitoring(noLocation, createSampleConfig()), "DUO-MON-005");
   assert.equal(noLocationFinding.status, "Manual");
   assert.match(noLocationFinding.summary, /Duo Essentials/);
+});
+
+test("every Manual Duo finding names endpoint, permission, and evidence, and finding ids are unique across tools", () => {
+  const config = createSampleConfig();
+
+  // Manual paths that are not 403s: undocumented offline access, edition gating, untagged apps,
+  // missing policy sections, unknown lockout threshold, unknown telephony credits, missing location.
+  const essentials = compliantIntegrationData();
+  essentials.infoSummary = dataset({ edition: "Duo Essentials" });
+  for (const section of ["health_checks", "operating_systems", "full_disk_encryption", "screen_lock"]) {
+    delete essentials.globalPolicy.data.sections[section];
+  }
+  essentials.integrations.data[0].sensitivity_level = null;
+  essentials.integrations.data[0].compliance_requirements = [];
+  delete essentials.integrations.data[0].self_service_allowed;
+  delete essentials.integrations.data[0].prompt_v4_enabled;
+  delete essentials.integrations.data[0].frameless_auth_prompt_enabled;
+
+  const unknownLockout = compliantAdminData();
+  unknownLockout.settings = dataset({ ...compliantSettings(), lockout_threshold: "unknown" });
+
+  const noLocation = compliantMonitoringData();
+  noLocation.infoSummary = dataset({ edition: "Duo Essentials" });
+  noLocation.authenticationLogs = dataset([{ txid: "tx-1", result: "success", factor: "webauthn", timestamp: NOW_SECONDS - 60 }]);
+
+  const results = [
+    assessDuoAuthentication(compliantAuthenticationData(), config),
+    assessDuoAuthentication(emptyAuthenticationData(), config),
+    assessDuoAuthentication(withAuthMethods({ require_verified_push: true }), config),
+    assessDuoAdminAccess(unknownLockout, config),
+    assessDuoIntegrations(essentials, config),
+    assessDuoIntegrations({ settings: dataset({}), policies: dataset([]), globalPolicy: dataset(null), infoSummary: dataset({}), integrations: dataset([]) }, config),
+    assessDuoMonitoring(noLocation, config),
+  ];
+  const manualCount = results.reduce((count, result) => count + assertEveryManualHasContext(result, "non-403 manual paths"), 0);
+  assert.ok(manualCount >= 12, `expected the fixtures to exercise many Manual paths, saw ${manualCount}`);
+  assertManualContext(findingById(results[0], "DUO-AUTH-011"));
+  assertManualContext(findingById(results[4], "DUO-INTEGRATIONS-006"));
+  assertManualContext(findingById(results[4], "DUO-INTEGRATIONS-005"));
+  assertManualContext(findingById(results[4], "DUO-INTEGRATIONS-002"));
+  assertManualContext(findingById(results[6], "DUO-MON-005"));
+  assertManualContext(findingById(results[6], "DUO-MON-003"));
+
+  const allIds = [
+    assessDuoAuthentication(compliantAuthenticationData(), config),
+    assessDuoAdminAccess(compliantAdminData(), config),
+    assessDuoIntegrations(compliantIntegrationData(), config),
+    assessDuoMonitoring(compliantMonitoringData(), config),
+  ].flatMap((result) => result.findings.map((finding) => finding.id));
+  assert.equal(new Set(allIds).size, allIds.length, "no finding id is emitted by more than one tool");
+  assert.equal(allIds.length, 27, "11 authentication, 5 admin-access, 6 integration, and 5 monitoring findings");
 });
 
 test("assessDuoMonitoring caps log-backed findings at Partial when the log sample is incomplete", () => {
