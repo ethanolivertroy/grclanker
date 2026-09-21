@@ -1737,16 +1737,25 @@ test("rule 9: projectCollectionStatus keeps counts, totals, paging outcome, and 
   const projected = projectCollectionStatus({
     users: { data: [{ username: "alice@example.gov" }], total: 40, complete: false },
     settings: { data: { lockout_threshold: 10 } },
-    infoSummary: { data: null, error: forbidden("/admin/v1/info/summary") },
+    infoSummary: { data: null, error: forbidden("/admin/v1/info/summary"), endpoint: "/admin/v1/info/summary", status: 403 },
     telephonyLogs: { data: [], error: forbidden("/admin/v2/logs/telephony") },
     authenticationAttempts: undefined,
   });
   assert.deepEqual(projected, {
     users: { readable: true, records: 1, total: 40, complete: false },
     settings: { readable: true },
-    infoSummary: { readable: false, error: forbidden("/admin/v1/info/summary") },
-    telephonyLogs: { readable: false, records: null, error: forbidden("/admin/v2/logs/telephony") },
-    authenticationAttempts: { readable: false, error: "not collected" },
+    infoSummary: { readable: false, error: forbidden("/admin/v1/info/summary"), status: 403, endpoint: "/admin/v1/info/summary" },
+    // A failure without an observed HTTP response (duck-typed client, transport error) keeps status and endpoint null.
+    telephonyLogs: { readable: false, error: forbidden("/admin/v2/logs/telephony"), status: null, endpoint: null, records: null, total: null, complete: null },
+    authenticationAttempts: {
+      readable: false,
+      records: null,
+      total: null,
+      complete: null,
+      status: null,
+      endpoint: null,
+      error: "not collected: this client does not expose the endpoint, so no request was attempted",
+    },
   });
   assert.equal(JSON.stringify(projected).includes("alice@example.gov"), false);
 });
@@ -1821,7 +1830,15 @@ test("rule 9: the exported bundle and its zip never contain the skey, integratio
   assert.match(status.monitoring.telephonyLogs.error, /\/admin\/v2\/logs\/telephony \(403 Forbidden\): Access denied: Insufficient permissions/);
   assert.equal(JSON.stringify(status).includes("bundle-user@example.gov"), false, "collection_status.json carries no records");
   assert.equal(status.monitoring.telephonyLogs.records, null, "an unread list never reports a record count");
-  assert.equal(files.get("core_data/telephony_logs.json").trim(), "null", "an unread dataset is written as null, not its empty fallback");
+  assert.equal(status.monitoring.telephonyLogs.total, null, "an unread list never reports a total");
+  assert.equal(status.monitoring.telephonyLogs.complete, null, "an unread list never reports a paging outcome");
+  assert.equal(status.monitoring.telephonyLogs.status, 403, "the observed HTTP status is recorded");
+  assert.equal(status.monitoring.telephonyLogs.endpoint, "/admin/v2/logs/telephony", "the observed request path is recorded");
+  const telephonyMarker = JSON.parse(files.get("core_data/telephony_logs.json"));
+  assert.equal(telephonyMarker.collected, false, "an unread dataset is written as a not-collected marker, not its empty fallback");
+  assert.equal(telephonyMarker.status, 403);
+  assert.equal(telephonyMarker.endpoint, "/admin/v2/logs/telephony");
+  assert.match(telephonyMarker.error, /403 Forbidden/);
   assert.equal(result.errorCount, 1);
   assert.match(files.get("_errors.log"), /\/admin\/v2\/logs\/telephony/);
 });
@@ -2206,6 +2223,133 @@ test("rule 1 corollary: every list dataset renders null in the snapshot summary 
     const result = assess(await collect(client, config.lookbackDays), config);
     assert.equal(result.snapshotSummary[field], null, `${surface} denied: ${category} snapshot ${field} is null`);
     assert.match(result.text, new RegExp(`${field.replace(/_/g, " ")}: unread`), `${surface} denied: text renders ${field} as unread`);
+  }
+});
+
+/** core_data file written for each list endpoint, used to check denied-list markers one inventory at a time. */
+const LIST_CORE_DATA_FILES = {
+  "/admin/v1/users": "core_data/users.json",
+  "/admin/v1/bypass_codes": "core_data/bypass_codes.json",
+  "/admin/v1/webauthncredentials": "core_data/webauthn_credentials.json",
+  "/admin/v2/logs/authentication": "core_data/authentication_logs.json",
+  "/admin/v1/logs/offline_enrollment": "core_data/offline_enrollment_logs.json",
+  "/admin/v1/admins": "core_data/admins.json",
+  "/admin/v2/logs/activity": "core_data/activity_logs.json",
+  "/admin/v3/integrations": "core_data/integrations.json",
+  "/admin/v2/policies": "core_data/policies.json",
+  "/admin/v1/trust_monitor/events": "core_data/trust_monitor_events.json",
+  "/admin/v2/logs/telephony": "core_data/telephony_logs.json",
+};
+
+function collectionStatusEntries(status) {
+  return Object.values(status).flatMap((category) => Object.values(category));
+}
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and path while a readable-but-empty list stays []", async () => {
+  const config = createSampleConfig();
+  const outputRoot = createTempBase("grclanker-duo-markers-");
+
+  for (const [surface, file] of Object.entries(LIST_CORE_DATA_FILES)) {
+    const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: () => forbiddenResponse() }) });
+    const exported = await exportDuoAuditBundle(client, config, outputRoot);
+    const files = readBundleFiles(exported.outputDir);
+
+    const marker = JSON.parse(files.get(file));
+    assert.deepEqual(Object.keys(marker).sort(), ["collected", "endpoint", "error", "status"], `${surface}: the denied list is a marker object, not []`);
+    assert.equal(marker.collected, false);
+    assert.equal(marker.status, 403, `${surface}: the marker carries the status the request observed`);
+    assert.equal(marker.endpoint, surface, `${surface}: the marker names the path the request actually used`);
+    assert.match(marker.error, /\(403 Forbidden\): Access denied: Insufficient permissions/);
+
+    // The healthy fixture serves offline enrollment and telephony logs as readable-but-empty lists.
+    const control = surface === "/admin/v2/logs/telephony" ? "core_data/offline_enrollment_logs.json" : "core_data/telephony_logs.json";
+    assert.deepEqual(JSON.parse(files.get(control)), [], `${surface} denied: a readable-but-empty list is still []`);
+
+    const entry = collectionStatusEntries(JSON.parse(files.get("core_data/collection_status.json"))).find((candidate) => candidate.endpoint === surface);
+    assert.ok(entry, `${surface}: collection_status.json names the denied endpoint`);
+    assert.deepEqual(
+      { readable: entry.readable, records: entry.records, total: entry.total, complete: entry.complete, status: entry.status },
+      { readable: false, records: null, total: null, complete: null, status: 403 },
+      `${surface}: count, total, and paging flags stay null for a read that never ran`,
+    );
+  }
+
+  const client = new DuoAuditorClient(config, {
+    fetchImpl: routedFetch({ ...healthyDuoRoutes(), "/admin/v1/info/authentication_attempts": () => forbiddenResponse() }),
+  });
+  const exported = await exportDuoAuditBundle(client, config, outputRoot);
+  const files = readBundleFiles(exported.outputDir);
+  const attemptsMarker = JSON.parse(files.get("core_data/authentication_attempts.json"));
+  assert.equal(attemptsMarker.collected, false, "a denied object dataset is also written as a marker");
+  assert.equal(attemptsMarker.status, 403);
+  assert.equal(attemptsMarker.endpoint, "/admin/v1/info/authentication_attempts");
+  const attemptsStatus = collectionStatusEntries(JSON.parse(files.get("core_data/collection_status.json"))).find(
+    (candidate) => candidate.endpoint === "/admin/v1/info/authentication_attempts",
+  );
+  assert.deepEqual(attemptsStatus, {
+    readable: false,
+    error: attemptsMarker.error,
+    status: 403,
+    endpoint: "/admin/v1/info/authentication_attempts",
+  });
+});
+
+function recordingFetch(routes, log) {
+  return async (input, init) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    const route = routes[requestUrl.pathname];
+    if (!route) throw new Error(`Unexpected request: ${requestUrl.pathname}`);
+    const response = await route();
+    log.push({ method: init?.method ?? "GET", path: requestUrl.pathname, status: response.status });
+    return response;
+  };
+}
+
+function namedEndpoints(text) {
+  return new Set(text.match(/\/admin\/v\d\/[A-Za-z0-9_/-]+/g) ?? []);
+}
+
+function namedStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) (?:[A-Z][A-Za-z]*(?: |\)))/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const config = createSampleConfig();
+  const outputRoot = createTempBase("grclanker-duo-request-log-");
+  const log = [];
+  const routes = {
+    ...healthyDuoRoutes(),
+    "/admin/v1/bypass_codes": () => forbiddenResponse(),
+    "/admin/v2/logs/telephony": () => canaryHtmlResponse(),
+    "/admin/v1/admins/allowed_auth_methods": () => new Response("", { status: 404, statusText: "Not Found" }),
+  };
+  const client = new DuoAuditorClient(config, { fetchImpl: recordingFetch(routes, log) });
+
+  const outputs = [JSON.stringify(await runDuoAccessCheck(client, config))];
+  outputs.push(JSON.stringify(assessDuoAuthentication(await collectDuoAuthenticationData(client, config.lookbackDays), config)));
+  outputs.push(JSON.stringify(assessDuoAdminAccess(await collectDuoAdminAccessData(client, config.lookbackDays), config)));
+  outputs.push(JSON.stringify(assessDuoIntegrations(await collectDuoIntegrationData(client), config)));
+  outputs.push(JSON.stringify(assessDuoMonitoring(await collectDuoMonitoringData(client, config.lookbackDays), config)));
+  const exported = await exportDuoAuditBundle(client, config, outputRoot);
+  outputs.push(...readBundleFiles(exported.outputDir).values());
+
+  const requestedPaths = new Set(log.map((entry) => entry.path));
+  const observedStatuses = new Set(log.map((entry) => entry.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+
+  const text = outputs.join("\n");
+  const endpoints = namedEndpoints(text);
+  const statuses = namedStatusCodes(text);
+  assert.ok(endpoints.size >= 3, "the outputs name the failing endpoints");
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(404), "the outputs name the observed failure statuses");
+  for (const endpoint of endpoints) {
+    assert.ok(requestedPaths.has(endpoint), `endpoint ${endpoint} is named in output but the run never requested it`);
+  }
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
   }
 });
 
