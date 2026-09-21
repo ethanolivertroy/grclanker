@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   ZOOM_FRAMEWORKS,
@@ -17,6 +18,7 @@ import {
   ZoomApiClient,
   ZoomApiError,
   assessZoomCollaborationGovernance,
+  assessZoomCollaborationGovernanceFromSnapshot,
   assessZoomIdentity,
   assessZoomMeetingSecurity,
   checkZoomAccess,
@@ -321,6 +323,108 @@ async function runAllAssessments(client) {
     collaboration: await assessZoomCollaborationGovernance(client, { now: NOW }),
     meeting: await assessZoomMeetingSecurity(client, { now: NOW }),
   };
+}
+
+function range(count, build) {
+  return Array.from({ length: count }, (_, index) => build(index + 1));
+}
+
+/** Serves a collection the way Zoom does: page_size slices and an opaque next_page_token. */
+function paginated(key, items, url, extra = {}) {
+  const pageSize = Number(url.searchParams.get("page_size") ?? 30);
+  const start = Number(url.searchParams.get("next_page_token") || 0);
+  const end = Math.min(start + pageSize, items.length);
+  return jsonResponse({
+    [key]: items.slice(start, end),
+    total_records: items.length,
+    next_page_token: end < items.length ? String(end) : "",
+    ...extra,
+  });
+}
+
+/**
+ * A compliant account served over HTTP so the real ZoomApiClient pagination
+ * loops run. `account` overrides the population per surface; `respond`
+ * overrides whole responses by path suffix.
+ */
+function httpAccountClient(account = {}, respond = {}) {
+  const data = {
+    users: range(2, (n) => ({ id: `user-${n}`, email: `user-${n}@example.com`, status: "active", type: 2, login_types: [101] })),
+    roles: [
+      { id: "0", name: "Owner", total_members: 1 },
+      { id: "1", name: "Admin", total_members: 1 },
+      { id: "2", name: "Member", total_members: 1 },
+    ],
+    members: [{ id: "user-1", email: "user-1@example.com" }],
+    groups: [{ id: "group-1", name: "Finance", total_members: 4 }],
+    logs: [{ action: "Update", category_type: "account", operator: "user-1@example.com", time: "2026-09-20T10:00:00Z" }],
+    imGroups: [{ id: "im-1", name: "Engineering", type: "restricted", total_members: 10, search_by_ma_account: false }],
+    domains: [{ domain: "example.com", status: "verified" }],
+    ...account,
+  };
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const path = url.pathname.replace(/^\/v2/, "");
+    const override = Object.entries(respond).find(([suffix]) => path.endsWith(suffix));
+    if (override) return override[1](url);
+    if (path === "/users/me") return jsonResponse({ id: "user-1", email: "user-1@example.com" });
+    if (path.endsWith("/settings")) return jsonResponse(compliantSettings(url.searchParams.get("option") ?? undefined));
+    if (path.endsWith("/lock_settings")) return jsonResponse(compliantLocks(url.searchParams.get("option") ?? undefined));
+    if (path === "/users") return paginated("users", data.users, url);
+    if (path === "/roles") return jsonResponse({ total_records: data.roles.length, roles: data.roles });
+    if (/^\/roles\/[^/]+\/members$/.test(path)) return paginated("members", data.members, url);
+    if (path === "/groups") return paginated("groups", data.groups, url);
+    if (path === "/report/operationlogs") return paginated("operation_logs", data.logs, url);
+    if (path === "/im/groups") return jsonResponse({ total_records: data.imGroups.length, groups: data.imGroups });
+    if (path.endsWith("/managed_domains")) return jsonResponse({ total_records: data.domains.length, domains: data.domains });
+    if (path.endsWith("/trusted_domains")) return jsonResponse({ trusted_domains: ["partners.example.com"] });
+    if (path === "/phone/account_settings") {
+      return jsonResponse({
+        auto_call_recording: { enable: true, locked: true, locked_by: "account", recording_calls: "both" },
+        ad_hoc_call_recording: { enable: false, locked: true, locked_by: "account" },
+      });
+    }
+    return jsonResponse({ code: 404, message: `unrouted ${path}` }, { status: 404 });
+  };
+  return new ZoomApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+}
+
+/** Minimal store/deflate zip reader (central directory driven) so the archive can be inspected without new dependencies. */
+function readZipEntries(buffer) {
+  let eocd = -1;
+  for (let index = buffer.length - 22; index >= 0; index -= 1) {
+    if (buffer.readUInt32LE(index) === 0x06054b50) {
+      eocd = index;
+      break;
+    }
+  }
+  assert.ok(eocd >= 0, "zip end of central directory not found");
+  const count = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < count; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const raw = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: method === 8 ? inflateRawSync(raw).toString("utf8") : raw.toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+function walkFiles(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? walkFiles(join(dir, entry.name)) : [join(dir, entry.name)],
+  );
 }
 
 test("resolveZoomConfiguration prefers explicit args over environment values", () => {
@@ -864,4 +968,250 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
 
   const safe = resolveSecureOutputPath(base, join("reports", "safe.txt"));
   assert.match(safe, /reports\/safe\.txt$/);
+});
+
+test("rule 10: the users cap reports truncated and the sign-in verdicts state seen versus total", async () => {
+  const client = httpAccountClient({
+    users: range(5, (n) => ({ id: `user-${n}`, email: `user-${n}@example.com`, status: "active", type: 2, login_types: [101] })),
+  });
+  const users = await client.listUsers(2);
+  assert.equal(users.truncated, true);
+  assert.equal(users.totalRecords, 5);
+  assert.equal(users.items.length, 2);
+
+  const identity = await assessZoomIdentity(client, { now: NOW, userLimit: 2 });
+  for (const id of ["ZOOM-ID-01", "ZOOM-ID-05"]) {
+    const item = findingById(identity, id);
+    assert.notEqual(item.status, "pass", `${id}: ${item.summary}`);
+    assert.match(item.summary, /Partial inventory: 2 seen of 5/, `${id}: ${item.summary}`);
+  }
+});
+
+test("rule 10: the group_limit cap reports truncated and every group-dependent verdict demotes with seen versus total", async () => {
+  const client = httpAccountClient({
+    groups: range(3, (n) => ({ id: `group-${n}`, name: `Group ${n}`, total_members: n })),
+  });
+  const groups = await client.listGroups(1);
+  assert.equal(groups.truncated, true);
+  assert.equal(groups.totalRecords, 3);
+
+  const meeting = await assessZoomMeetingSecurity(client, { now: NOW, groupLimit: 1 });
+  const fullSnapshot = await collectZoomSnapshot(client, { now: NOW, groupLimit: 1 });
+  const collaboration = assessZoomCollaborationGovernanceFromSnapshot(fullSnapshot, { now: NOW });
+  for (const id of ["ZOOM-MTG-01", "ZOOM-MTG-02", "ZOOM-MTG-03", "ZOOM-MTG-04", "ZOOM-MTG-05", "ZOOM-MTG-06", "ZOOM-MTG-07", "ZOOM-MTG-08", "ZOOM-MTG-09", "ZOOM-MTG-10"]) {
+    const item = findingById(meeting, id);
+    assert.notEqual(item.status, "pass", `${id}: ${item.summary}`);
+    assert.match(item.summary, /1 groups seen of 3/, `${id}: ${item.summary}`);
+  }
+  for (const id of ["ZOOM-COLLAB-02", "ZOOM-COLLAB-03", "ZOOM-COLLAB-07"]) {
+    const item = findingById(collaboration, id);
+    assert.notEqual(item.status, "pass", `${id}: ${item.summary}`);
+    assert.match(item.summary, /1 groups seen of 3/, `${id}: ${item.summary}`);
+  }
+});
+
+test("rule 10: the role member cap reports truncated and admin concentration states seen versus declared", async () => {
+  const members = range(3001, (n) => ({ id: `admin-${n}`, email: `admin-${n}@example.com` }));
+  const client = httpAccountClient({
+    members,
+    roles: [
+      { id: "0", name: "Owner", total_members: members.length },
+      { id: "2", name: "Member", total_members: 1 },
+    ],
+  });
+  const paged = await client.listRoleMembers("0");
+  assert.equal(paged.truncated, true);
+  assert.equal(paged.items.length, 3000);
+  assert.equal(paged.totalRecords, 3001);
+  assert.equal(paged.pages, 11, "the cap is detected on the item that overflows the limit, which arrives on page 11");
+
+  const identity = await assessZoomIdentity(client, { now: NOW, maxAdmins: 5000 });
+  const item = findingById(identity, "ZOOM-ID-04");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /Partial inventory: .*3000 distinct admins were seen of 3001 declared/);
+  assert.equal(item.evidence.member_lists_truncated, true);
+});
+
+test("rule 10: the operation_log_limit cap reports truncated and the log verdict states seen versus total", async () => {
+  const client = httpAccountClient({
+    logs: range(5, (n) => ({ action: "Update", category_type: "account", operator: "user-1@example.com", time: `2026-09-1${n}T10:00:00Z` })),
+  });
+  const logs = await client.listOperationLogs("2026-08-22", "2026-09-21", 2);
+  assert.equal(logs.truncated, true);
+  assert.equal(logs.totalRecords, 5);
+
+  const collaboration = await assessZoomCollaborationGovernance(client, { now: NOW, operationLogLimit: 2 });
+  const item = findingById(collaboration, "ZOOM-COLLAB-05");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /Partial inventory: 2 seen of 5 \(pagination stopped at the configured limit\)/);
+  assert.equal(item.evidence.total_records, 5);
+});
+
+test("rule 10: IM groups without total_records report an unknown total and the IM verdict does not pass", async () => {
+  const client = httpAccountClient({}, {
+    "/im/groups": () => jsonResponse({ groups: [{ id: "im-1", name: "Engineering", type: "restricted", total_members: 10, search_by_ma_account: false }] }),
+  });
+  const imGroups = await client.listImGroups();
+  assert.equal(imGroups.truncated, true);
+  assert.equal(imGroups.totalRecords, undefined);
+
+  const collaboration = await assessZoomCollaborationGovernance(client, { now: NOW });
+  const item = findingById(collaboration, "ZOOM-COLLAB-06");
+  assert.notEqual(item.status, "pass", item.summary);
+  assert.match(item.summary, /1 IM groups seen of an unknown total/);
+});
+
+test("rule 10: managed domains without total_records report an unknown total and the domain verdict does not pass", async () => {
+  const client = httpAccountClient({}, {
+    "/managed_domains": () => jsonResponse({ domains: [{ domain: "example.com", status: "verified" }] }),
+  });
+  const domains = await client.getManagedDomains();
+  assert.equal(domains.truncated, true);
+  assert.equal(domains.totalRecords, undefined);
+
+  const identity = await assessZoomIdentity(client, { now: NOW });
+  const item = findingById(identity, "ZOOM-ID-03");
+  assert.notEqual(item.status, "pass", item.summary);
+  assert.match(item.summary, /Partial inventory: 1 seen of an unknown total/);
+});
+
+test("rule 10: a role list without total_records reports an unknown total and the role-based verdicts do not pass", async () => {
+  const client = httpAccountClient({}, {
+    "/roles": () => jsonResponse({ roles: [{ id: "0", name: "Owner", total_members: 1 }, { id: "1", name: "Admin", total_members: 1 }] }),
+    "/accounts/acct-123/settings": (url) => {
+      const settings = compliantSettings(url.searchParams.get("option") ?? undefined);
+      if (settings.security) {
+        settings.security = { ...settings.security, sign_in_with_two_factor_auth: "role", sign_in_with_two_factor_auth_roles: ["0", "1"] };
+      }
+      return jsonResponse(settings);
+    },
+  });
+  const roles = await client.listRoles();
+  assert.equal(roles.truncated, true);
+  assert.equal(roles.totalRecords, undefined);
+
+  const identity = await assessZoomIdentity(client, { now: NOW });
+  const twoFactor = findingById(identity, "ZOOM-ID-02");
+  assert.equal(twoFactor.status, "warn", twoFactor.summary);
+  assert.match(twoFactor.summary, /Partial inventory: 2 seen of an unknown total/);
+  const admins = findingById(identity, "ZOOM-ID-04");
+  assert.equal(admins.status, "warn", admins.summary);
+  assert.match(admins.summary, /Partial inventory: 2 seen of an unknown total/);
+});
+
+test("rule 10: a repeated next_page_token and the page cap both exit as truncated instead of looping", async () => {
+  let page = 0;
+  const stuck = new ZoomApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ users: [{ id: `user-${(page += 1)}` }], total_records: 1000, next_page_token: "same-token" }),
+  });
+  const repeated = await stuck.listUsers(10000);
+  assert.equal(repeated.truncated, true);
+  assert.equal(repeated.pages, 2);
+
+  let calls = 0;
+  const endless = new ZoomApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({ users: [{ id: `user-${calls}` }], next_page_token: `token-${calls}` });
+    },
+  });
+  const capped = await endless.listUsers(10000);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.pages, 500);
+  assert.equal(capped.totalRecords, undefined);
+
+  const trusted = await httpAccountClient().listTrustedDomains();
+  assert.equal(trusted.truncated, false, "trusted_domains is a single documented array with no total_records, so it is complete by contract");
+});
+
+test("rule 9: the audit bundle and its zip never contain credential-bearing values from any collected object", async () => {
+  const base = createTempBase("grclanker-zoom-secrets-");
+  const config = sampleConfig({ token: "FAKE_SECRET_TOKEN_1", clientId: "FAKE_CLIENT_ID_2", clientSecret: "FAKE_CLIENT_SECRET_3" });
+  const withSecrets = (settings) => ({
+    ...settings,
+    schedule_meeting: { ...(settings.schedule_meeting ?? {}), pmi_password: "FAKE_PMI_PASSCODE_6" },
+    security: { ...(settings.security ?? {}), sso_certificate: "FAKE_SSO_CERT_7" },
+    in_meeting: { ...(settings.in_meeting ?? {}), stream_api_key: "FAKE_STREAM_KEY_8", unrelated_setting: "FAKE_VERBATIM_CONFIG_9" },
+  });
+  const client = compliantClient({
+    getResolvedConfig: () => config,
+    async getCurrentUser() {
+      return { id: "user-1", email: "auditor@example.com", host_key: "FAKE_HOST_KEY_4", personal_meeting_url: "https://zoom.us/j/1234567890?pwd=FAKE_PMI_PWD_5", pmi: 1234567890 };
+    },
+    async getAccountSettings(option) {
+      return withSecrets(compliantSettings(option));
+    },
+    async getAccountLockSettings(option) {
+      return { ...compliantLocks(option), unrelated_lock: "FAKE_LOCK_VERBATIM_10" };
+    },
+    async listUsers() {
+      return list([
+        { id: "admin-1", email: "admin-1@example.com", status: "active", type: 2, login_types: [101], host_key: "FAKE_USER_HOST_KEY_11", personal_meeting_url: "https://zoom.us/j/1?pwd=FAKE_USER_PWD_12" },
+      ]);
+    },
+    async listRoles() {
+      return list([{ id: "0", name: "Owner", total_members: 1, description: "FAKE_ROLE_DESC_13" }]);
+    },
+    async listRoleMembers() {
+      return list([{ id: "admin-1", email: "admin-1@example.com", host_key: "FAKE_MEMBER_HOST_KEY_14" }]);
+    },
+    async listGroups() {
+      return list([{ id: "group-1", name: "Finance", total_members: 4, description: "FAKE_GROUP_DESC_15" }]);
+    },
+    async getGroupSettings(_groupId, option) {
+      return withSecrets(compliantSettings(option));
+    },
+    async listOperationLogs() {
+      return list([{ action: "Update", category_type: "account", operator: "admin-1@example.com", time: "2026-09-20T10:00:00Z", operation_detail: "Reset host key to FAKE_OPLOG_SECRET_16" }]);
+    },
+    async listImGroups() {
+      return list([{ id: "im-1", name: "Engineering", type: "restricted", total_members: 10, search_by_ma_account: false, description: "FAKE_IM_DESC_17" }]);
+    },
+    async getManagedDomains() {
+      return list([{ domain: "example.com", status: "verified", verification_token: "FAKE_DOMAIN_TOKEN_18" }]);
+    },
+    async listTrustedDomains() {
+      throw new Error("GET https://api.zoom.us/v2/accounts/acct-123/trusted_domains?access_token=FAKE_SECRET_TOKEN_1 failed with Bearer FAKE_SECRET_TOKEN_1 and secret FAKE_CLIENT_SECRET_3");
+    },
+    async getPhoneAccountSettings() {
+      return {
+        auto_call_recording: { enable: true, locked: true, locked_by: "account", recording_calls: "both" },
+        ad_hoc_call_recording: { enable: false, locked: true, locked_by: "account" },
+        recording_api_key: "FAKE_PHONE_KEY_19",
+      };
+    },
+  });
+
+  const snapshot = await collectZoomSnapshot(client, { now: NOW });
+  assert.equal(snapshot.currentUser.data.host_key, "[REDACTED]");
+  assert.equal(snapshot.currentUser.data.personal_meeting_url, "https://zoom.us/j/1234567890?pwd=[REDACTED]");
+  assert.equal(snapshot.settings.settings.schedule_meeting.pmi_password, "[REDACTED]");
+  assert.equal(snapshot.settings.settings.schedule_meeting.require_password_for_scheduling_new_meetings, true);
+  assert.match(snapshot.trustedDomains.error, /access_token=\[REDACTED\] failed with Bearer \[REDACTED\] and secret \[REDACTED\]/);
+
+  const result = await exportZoomAuditBundle(client, config, base, { now: NOW });
+  const files = walkFiles(result.outputDir);
+  assert.ok(files.length >= 25);
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    assert.doesNotMatch(content, /FAKE_/, `${file} leaked a fake secret`);
+  }
+  const entries = readZipEntries(readFileSync(result.zipPath));
+  assert.ok(entries.some((entry) => entry.name.endsWith("core_data/users.json")));
+  for (const entry of entries) {
+    assert.doesNotMatch(entry.content, /FAKE_/, `${entry.name} inside the zip leaked a fake secret`);
+  }
+
+  const users = readFileSync(join(result.outputDir, "core_data", "users.json"), "utf8");
+  assert.doesNotMatch(users, /host_key|personal_meeting_url/);
+  assert.match(users, /"login_types"/);
+  const settings = JSON.parse(readFileSync(join(result.outputDir, "core_data", "account_settings.json"), "utf8"));
+  assert.equal(settings.merged.schedule_meeting.require_password_for_scheduling_new_meetings, true);
+  assert.equal(settings.merged.in_meeting.unrelated_setting, undefined);
+  assert.equal(settings.merged.schedule_meeting.pmi_password, undefined);
+  assert.ok(settings.fields_read.includes("security.sign_in_with_two_factor_auth"));
+  const logs = readFileSync(join(result.outputDir, "core_data", "operation_logs.json"), "utf8");
+  assert.doesNotMatch(logs, /operation_detail/);
+  const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /trusted_domains: .*\[REDACTED\]/);
 });

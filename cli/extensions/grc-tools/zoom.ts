@@ -1727,6 +1727,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
 
   const fileTransfer = readSetting(bundle, "in_meeting.file_transfer");
   const fileTransferLocked = readLock(bundle, "in_meeting.file_transfer");
+  const fileTransferGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "in_meeting.file_transfer", false));
   findings.push(finding(
     "ZOOM-COLLAB-02",
     "In-meeting file transfer restricted",
@@ -1738,7 +1739,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
         ? "manual"
         : fileTransfer.value === true
           ? "fail"
-          : fileTransferLocked === true
+          : fileTransferLocked === true && !fileTransferGroups.demote
             ? "pass"
             : "warn",
     settingsSurface
@@ -1747,8 +1748,8 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
         ? manualForAbsentKey(fileTransfer.path, ZOOM_DOCS.accountSettings, "the in-meeting file transfer setting")
         : fileTransfer.value === true
           ? "in_meeting.file_transfer is true: participants can send files through meeting chat."
-          : `in_meeting.file_transfer is false. ${lockNote(fileTransferLocked, "in_meeting.file_transfer")}`,
-    { file_transfer: fileTransfer.value ?? null, file_transfer_locked: fileTransferLocked ?? null, chat_share_files: readSetting(bundle, "chat.share_files").value ?? null },
+          : `in_meeting.file_transfer is false. ${lockNote(fileTransferLocked, "in_meeting.file_transfer")} ${fileTransferGroups.note}`.trim(),
+    { file_transfer: fileTransfer.value ?? null, file_transfer_locked: fileTransferLocked ?? null, chat_share_files: readSetting(bundle, "chat.share_files").value ?? null, ...fileTransferGroups.evidence },
   ));
 
   const cloudRecording = readSetting(bundle, "recording.cloud_recording");
@@ -1756,12 +1757,14 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const autoDeleteDays = readSetting(bundle, "recording.auto_delete_cmr_days");
   const retentionDays = asNumber(autoDeleteDays.value);
   const autoDeleteLocked = readLock(bundle, "recording.auto_delete_cmr");
+  const retentionGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "recording.auto_delete_cmr", true));
   const retentionEvidence = {
     cloud_recording: cloudRecording.value ?? null,
     auto_delete_cmr: autoDelete.value ?? null,
     auto_delete_cmr_days: retentionDays ?? null,
     auto_delete_cmr_locked: autoDeleteLocked ?? null,
     max_recording_retention_days: maxRetention,
+    ...retentionGroups.evidence,
   };
   findings.push(finding(
     "ZOOM-COLLAB-03",
@@ -1780,7 +1783,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
               ? "warn"
               : retentionDays > maxRetention
                 ? "warn"
-                : autoDeleteLocked === true
+                : autoDeleteLocked === true && !retentionGroups.demote
                   ? "pass"
                   : "warn",
     settingsSurface
@@ -1795,7 +1798,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
               ? "recording.auto_delete_cmr is true but recording.auto_delete_cmr_days was not returned, so the retention period is unknown."
               : retentionDays > maxRetention
                 ? `Cloud recordings auto-delete after ${retentionDays} days, above the ${maxRetention}-day policy threshold.`
-                : `Cloud recordings auto-delete after ${retentionDays} days (documented values 30, 60, 90, 120), within the ${maxRetention}-day threshold. ${lockNote(autoDeleteLocked, "recording.auto_delete_cmr")}`,
+                : `Cloud recordings auto-delete after ${retentionDays} days (documented values 30, 60, 90, 120), within the ${maxRetention}-day threshold. ${lockNote(autoDeleteLocked, "recording.auto_delete_cmr")} ${retentionGroups.note}`.trim(),
     retentionEvidence,
   ));
 
@@ -1847,6 +1850,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     dated_entries: datedLogs.length,
     undated_entries: undatedLogs.length,
     truncated: logs.truncated,
+    total_records: logs.total ?? null,
     newest_entry: newestLog > 0 ? new Date(newestLog).toISOString() : null,
     category_types: [...new Set(logRecords.map((log) => asString(log.category_type)).filter(Boolean))].slice(0, 20),
   };
@@ -1933,6 +1937,12 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const addLocked = readLock(bundle, "chat.allow_users_to_add_contacts");
   const chatLocked = readLock(bundle, "chat.allow_users_to_chat_with_others");
   const contactsLocked = addLocked === true && chatLocked === true;
+  const contactsGroups = groupOverrideState(snapshot, snapshot.groupPolicies
+    .filter((policy) => policy.settings.status === "ok")
+    .filter((policy) =>
+      restricted(asObject(getNestedValue(policy.settings.data, ["chat", "allow_users_to_add_contacts"]))) === false
+      || restricted(asObject(getNestedValue(policy.settings.data, ["chat", "allow_users_to_chat_with_others"]))) === false)
+    .map((policy) => policy.name));
   findings.push(finding(
     "ZOOM-COLLAB-07",
     "External contacts restricted",
@@ -1945,7 +1955,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
         : addRestricted === undefined || chatRestricted === undefined
           ? "manual"
           : addRestricted && chatRestricted
-            ? (contactsLocked ? "pass" : "warn")
+            ? (contactsLocked && !contactsGroups.demote ? "pass" : "warn")
             : "fail",
     settingsSurface
       ? manualForSurface(settingsSurface, "the Team Chat > Allow users to add contacts and chat with others settings")
@@ -1954,9 +1964,9 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
         : addRestricted === undefined || chatRestricted === undefined
           ? "Manual: the chat contact policies were returned without their enable flag or selected_option, so the restriction cannot be judged."
           : addRestricted && chatRestricted
-            ? `Users cannot add or chat with anyone outside the organization: allow_users_to_add_contacts and allow_users_to_chat_with_others are disabled or scoped to the organization (selected_option 2, 3, or 4). ${contactsLocked ? "Both settings are locked at account level." : "At least one of the two settings is not locked in lock_settings, so groups may relax it."}`
+            ? `Users cannot add or chat with anyone outside the organization: allow_users_to_add_contacts and allow_users_to_chat_with_others are disabled or scoped to the organization (selected_option 2, 3, or 4). ${contactsLocked ? "Both settings are locked at account level." : "At least one of the two settings is not locked in lock_settings, so groups may relax it."} ${contactsGroups.note}`.trim()
             : "allow_users_to_add_contacts or allow_users_to_chat_with_others is enabled with selected_option 1 (anyone, internal and external).",
-    { ...contactEvidence, allow_users_to_add_contacts_locked: addLocked ?? null, allow_users_to_chat_with_others_locked: chatLocked ?? null },
+    { ...contactEvidence, allow_users_to_add_contacts_locked: addLocked ?? null, allow_users_to_chat_with_others_locked: chatLocked ?? null, ...contactsGroups.evidence },
   ));
 
   findings.push(finding(
@@ -2052,9 +2062,34 @@ function booleanControl(
   }
   if (groupsTruncated) {
     status = "warn";
-    notes.push("Group inventory was truncated at the configured limit, so unseen groups may override it.");
+    notes.push(groupTruncationNote(snapshot));
   }
   return finding(id, title, severity, controls, status, notes.join(" "), evidence);
+}
+
+function groupInventoryTruncated(snapshot: ZoomSnapshot): boolean {
+  return snapshot.groups.status === "ok" && listSurfaceState(snapshot.groups).truncated;
+}
+
+/** Group overrides, unreadable group surfaces, or a truncated group inventory all block pass. */
+function groupOverrideState(snapshot: ZoomSnapshot, relaxed: string[]): { demote: boolean; note: string; evidence: JsonRecord } {
+  const unreadable = groupsUnreadable(snapshot);
+  const truncated = groupInventoryTruncated(snapshot);
+  const notes = [
+    relaxed.length > 0 ? `${relaxed.length} sampled groups override it: ${relaxed.slice(0, 5).join(", ")}.` : "",
+    unreadable.length > 0 ? `${unreadable.length} group settings surfaces were unreadable, so group overrides are unproven.` : "",
+    truncated ? groupTruncationNote(snapshot) : "",
+  ].filter(Boolean);
+  return {
+    demote: notes.length > 0,
+    note: notes.join(" "),
+    evidence: { groups_relaxing: relaxed.slice(0, 25), groups_unreadable: unreadable.slice(0, 25), groups_truncated: truncated },
+  };
+}
+
+function groupTruncationNote(snapshot: ZoomSnapshot): string {
+  const groups = listSurfaceState(snapshot.groups);
+  return `Group inventory was truncated at the configured limit (${groups.items.length} groups seen of ${groups.total ?? "an unknown total"}), so unseen groups may override it.`;
 }
 
 export function assessZoomMeetingSecurityFromSnapshot(
@@ -2102,11 +2137,16 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const whoCanShare = readSetting(bundle, "in_meeting.who_can_share_screen");
   const screenSurface = settingsUnreadable(bundle);
   const sharingLocked = readLock(bundle, "in_meeting.screen_sharing");
+  const shareGroups = groupOverrideState(snapshot, screenSharing.value === false
+    ? groupsRelaxing(snapshot, "in_meeting.screen_sharing", false)
+    : groupsRelaxing(snapshot, "in_meeting.who_can_share_screen", "host"));
+  const sharePass = sharingLocked === true && !shareGroups.demote ? "pass" : "warn";
   const shareEvidence = {
     screen_sharing: screenSharing.value ?? null,
     who_can_share_screen: whoCanShare.value ?? null,
     screen_sharing_locked: sharingLocked ?? null,
     who_can_share_screen_when_someone_is_sharing: readSetting(bundle, "in_meeting.who_can_share_screen_when_someone_is_sharing").value ?? null,
+    ...shareGroups.evidence,
   };
   findings.push(finding(
     "ZOOM-MTG-03",
@@ -2118,11 +2158,11 @@ export function assessZoomMeetingSecurityFromSnapshot(
       : !screenSharing.present
         ? "manual"
         : screenSharing.value === false
-          ? (sharingLocked === true ? "pass" : "warn")
+          ? sharePass
           : !whoCanShare.present
             ? "manual"
             : asString(whoCanShare.value) === "host"
-              ? (sharingLocked === true ? "pass" : "warn")
+              ? sharePass
               : asString(whoCanShare.value) === "all"
                 ? "fail"
                 : "manual",
@@ -2131,11 +2171,11 @@ export function assessZoomMeetingSecurityFromSnapshot(
       : !screenSharing.present
         ? manualForAbsentKey(screenSharing.path, ZOOM_DOCS.accountSettings, "the screen sharing setting")
         : screenSharing.value === false
-          ? `in_meeting.screen_sharing is false: screen sharing is disabled entirely. ${lockNote(sharingLocked, "in_meeting.screen_sharing")}`
+          ? `in_meeting.screen_sharing is false: screen sharing is disabled entirely. ${lockNote(sharingLocked, "in_meeting.screen_sharing")} ${shareGroups.note}`.trim()
           : !whoCanShare.present
             ? manualForAbsentKey(whoCanShare.path, ZOOM_DOCS.accountSettings, "who can share screen")
             : asString(whoCanShare.value) === "host"
-              ? `in_meeting.who_can_share_screen is \`host\`: only hosts can share. ${lockNote(sharingLocked, "in_meeting.screen_sharing")}`
+              ? `in_meeting.who_can_share_screen is \`host\`: only hosts can share. ${lockNote(sharingLocked, "in_meeting.screen_sharing")} ${shareGroups.note}`.trim()
               : asString(whoCanShare.value) === "all"
                 ? "in_meeting.who_can_share_screen is `all`: hosts and attendees can share their screen."
                 : `in_meeting.who_can_share_screen returned an undocumented value (${String(whoCanShare.value)}); documented values are host and all.`,
@@ -2162,6 +2202,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const encryptionType = readSetting(bundle, "meeting_security.encryption_type");
   const e2eeSurface = settingsUnreadable(bundle, "account_settings:meeting_security");
   const e2eeLocked = readLock(bundle, "meeting_security.end_to_end_encrypted_meetings");
+  const e2eeGroups = groupOverrideState(snapshot, [...new Set([
+    ...groupsRelaxing(snapshot, "meeting_security.end_to_end_encrypted_meetings", true),
+    ...groupsRelaxing(snapshot, "meeting_security.encryption_type", "e2ee"),
+  ])]);
   findings.push(finding(
     "ZOOM-MTG-05",
     "End-to-end encryption available and default",
@@ -2174,7 +2218,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
         : e2ee.value !== true
           ? "fail"
           : asString(encryptionType.value) === "e2ee"
-            ? (e2eeLocked === true ? "pass" : "warn")
+            ? (e2eeLocked === true && !e2eeGroups.demote ? "pass" : "warn")
             : "warn",
     e2eeSurface
       ? manualForSurface(e2eeSurface, "the Security > Allow use of end-to-end encryption setting (option=meeting_security)")
@@ -2183,9 +2227,9 @@ export function assessZoomMeetingSecurityFromSnapshot(
         : e2ee.value !== true
           ? "meeting_security.end_to_end_encrypted_meetings is false: end-to-end encryption is not available to hosts."
           : asString(encryptionType.value) === "e2ee"
-            ? `End-to-end encryption is enabled and meeting_security.encryption_type is \`e2ee\` (the default for new meetings). ${lockNote(e2eeLocked, e2ee.path)}`
+            ? `End-to-end encryption is enabled and meeting_security.encryption_type is \`e2ee\` (the default for new meetings). ${lockNote(e2eeLocked, e2ee.path)} ${e2eeGroups.note}`.trim()
             : `End-to-end encryption is enabled but meeting_security.encryption_type is ${encryptionType.present ? `\`${String(encryptionType.value)}\`` : "not returned"}, so E2EE is available but not the default.`,
-    { end_to_end_encrypted_meetings: e2ee.value ?? null, encryption_type: encryptionType.value ?? null, locked: e2eeLocked ?? null },
+    { end_to_end_encrypted_meetings: e2ee.value ?? null, encryption_type: encryptionType.value ?? null, locked: e2eeLocked ?? null, ...e2eeGroups.evidence },
   ));
 
   findings.push(booleanControl(
@@ -2222,6 +2266,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
     use_pmi_for_scheduled_meetings_locked: pmiScheduledLocked ?? null,
     use_pmi_for_instant_meetings_locked: pmiInstantLocked ?? null,
     groups_relaxing: pmiRelaxedGroups.slice(0, 25),
+    groups_truncated: groupInventoryTruncated(snapshot),
   };
   const pmiCompliant = personalMeeting.value === false || (pmiScheduled.value === false && pmiInstant.value === false);
   findings.push(finding(
@@ -2235,7 +2280,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
         ? "manual"
         : !pmiCompliant
           ? "fail"
-          : pmiLocked && pmiRelaxedGroups.length === 0
+          : pmiLocked && pmiRelaxedGroups.length === 0 && !groupInventoryTruncated(snapshot)
             ? "pass"
             : "warn",
     pmiSurface
@@ -2250,6 +2295,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
               : "PMI is not used for scheduled or instant meetings (use_pmi_for_scheduled_meetings and use_pmi_for_instant_meetings are false).",
             pmiLocked ? "Both PMI settings are locked at account level." : "The PMI settings are not both locked in lock_settings, so groups may re-enable PMI.",
             pmiRelaxedGroups.length > 0 ? `${pmiRelaxedGroups.length} sampled groups override it: ${pmiRelaxedGroups.slice(0, 5).join(", ")}.` : "",
+            groupInventoryTruncated(snapshot) ? groupTruncationNote(snapshot) : "",
           ].filter(Boolean).join(" "),
     pmiEvidence,
   ));
@@ -2291,7 +2337,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
           ? "fail"
           : regionList.length === 0
             ? "warn"
-            : regionsLocked === true && regionRelaxedGroups.length === 0
+            : regionsLocked === true && regionRelaxedGroups.length === 0 && !groupInventoryTruncated(snapshot)
               ? "pass"
               : "warn",
     regionSurface
@@ -2302,8 +2348,8 @@ export function assessZoomMeetingSecurityFromSnapshot(
           ? "in_meeting.custom_data_center_regions is false: meeting traffic may route through any Zoom data center region."
           : regionList.length === 0
             ? "in_meeting.custom_data_center_regions is true but in_meeting.data_center_regions is empty or absent, so the allowed regions are unknown."
-            : `Custom data center regions are enabled and limited to: ${regionList.join(", ")}. ${lockNote(regionsLocked, "in_meeting.custom_data_center_regions")}${regionRelaxedGroups.length > 0 ? ` ${regionRelaxedGroups.length} sampled groups override it: ${regionRelaxedGroups.slice(0, 5).join(", ")}.` : ""}`,
-    { custom_data_center_regions: customRegions.value ?? null, data_center_regions: regionList, locked: regionsLocked ?? null, groups_relaxing: regionRelaxedGroups.slice(0, 25) },
+            : `Custom data center regions are enabled and limited to: ${regionList.join(", ")}. ${lockNote(regionsLocked, "in_meeting.custom_data_center_regions")}${regionRelaxedGroups.length > 0 ? ` ${regionRelaxedGroups.length} sampled groups override it: ${regionRelaxedGroups.slice(0, 5).join(", ")}.` : ""}${groupInventoryTruncated(snapshot) ? ` ${groupTruncationNote(snapshot)}` : ""}`,
+    { custom_data_center_regions: customRegions.value ?? null, data_center_regions: regionList, locked: regionsLocked ?? null, groups_relaxing: regionRelaxedGroups.slice(0, 25), groups_truncated: groupInventoryTruncated(snapshot) },
   ));
 
   const disclaimerSurface = settingsUnreadable(bundle);
@@ -2322,7 +2368,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const disclaimerNotes = [
     disclaimerGroupsRelaxing.length > 0 ? `${disclaimerGroupsRelaxing.length} sampled groups select a different disclaimer option: ${disclaimerGroupsRelaxing.slice(0, 5).join(", ")}.` : "",
     disclaimerGroupsUnreadable.length > 0 ? `${disclaimerGroupsUnreadable.length} group settings surfaces were unreadable, so group overrides are unproven.` : "",
-    disclaimerGroupsTruncated ? "Group inventory was truncated at the configured limit, so unseen groups may override it." : "",
+    disclaimerGroupsTruncated ? groupTruncationNote(snapshot) : "",
   ].filter(Boolean);
   const disclaimerStatus: ZoomFindingStatus = disclaimer.status === "pass" && disclaimerNotes.length > 0 ? "warn" : disclaimer.status;
   findings.push(finding(
