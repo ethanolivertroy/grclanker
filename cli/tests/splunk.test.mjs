@@ -76,7 +76,10 @@ const HARDENED = {
     entry("sslConfig", { enableSplunkdSSL: 1, sslVersions: "tls1.2", requireClientCert: 1, cipherSuite: "ECDHE-RSA-AES256-GCM-SHA384" }),
   ],
   "/services/configs/conf-outputs": [entry("tcpout:primary", { useSSL: "true", clientCert: "/opt/splunk/etc/auth/client.pem" })],
-  "/services/data/inputs/tcp/ssl": [entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem", requireClientCert: 1, sslVersions: "tls1.2" })],
+  "/services/configs/conf-inputs": [
+    entry("splunktcp-ssl:9997", { disabled: 0 }),
+    entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem", requireClientCert: 1, sslVersions: "tls1.2" }),
+  ],
   "/services/data/inputs/http": [
     entry("http", { disabled: 0, enableSSL: 1, port: 8088 }),
     entry("app-token", { disabled: 0, indexes: "main", sourcetype: "app:json", useACK: 1 }),
@@ -95,7 +98,7 @@ const HARDENED = {
     entry("splunk_monitoring_console", { author: "Splunk", label: "MC", version: "9.2.1" }),
   ],
   "/servicesNS/-/-/storage/collections/config": [entry("assets", {}, { sharing: "app", app: "search", perms: { read: ["admin"], write: ["admin"] } })],
-  "/services/data/inputs/tcp/cooked": [entry("9997", { disabled: 0, SSL: 1 })],
+  "/services/data/inputs/tcp/cooked": [entry("9997", { disabled: 0, group: "listenerports" })],
 };
 
 const WEAK = {
@@ -125,6 +128,7 @@ const WEAK = {
     entry("sslConfig", { enableSplunkdSSL: 0, sslVersions: "tls1.0,tls1.2", requireClientCert: 0 }),
   ],
   "/services/configs/conf-outputs": [entry("tcpout:primary", { server: "idx:9997" })],
+  "/services/configs/conf-inputs": [entry("splunktcp://9997", { disabled: 0 }), entry("SSL", { requireClientCert: 0 })],
   "/services/data/inputs/http": [
     entry("http", { disabled: 0, enableSSL: 0 }),
     entry("open-token", { disabled: 0, useACK: 0 }),
@@ -141,7 +145,7 @@ const WEAK = {
     entry("mystery_app", { author: "Unknown Vendor", disabled: 0 }),
   ],
   "/servicesNS/-/-/storage/collections/config": [entry("open", {}, { sharing: "global", app: "search", perms: { read: ["*"], write: ["*"] } })],
-  "/services/data/inputs/tcp/cooked": [entry("9997", { disabled: 0, SSL: 0 })],
+  "/services/data/inputs/tcp/cooked": [entry("9997", { disabled: 0, group: "listenerports" })],
 };
 
 function createFetch(fixture, options = {}) {

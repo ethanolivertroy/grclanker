@@ -942,6 +942,14 @@ function roleAllowedIndexes(role: SplunkEntry): string[] {
   return [...new Set([...asStringList(role.content.srchIndexesAllowed), ...asStringList(role.content.imported_srchIndexesAllowed)])];
 }
 
+function nonAdminRoles(roles: SplunkListResult): SplunkEntry[] {
+  return roles.entries.filter((role) => !isAdminRoleName(role.name));
+}
+
+function rolesWithoutIndexScope(roles: SplunkEntry[]): string[] {
+  return roles.filter((role) => role.content.srchIndexesAllowed === undefined && role.content.imported_srchIndexesAllowed === undefined).map((role) => role.name);
+}
+
 function indexPatternCovers(patterns: string[], indexName: string): boolean {
   return patterns.some((pattern) => {
     if (pattern === indexName || pattern === "*") return true;
@@ -1292,8 +1300,8 @@ export async function assessSplunkAccessControl(
   if (searchGuard) {
     findings.push(searchGuard);
   } else if (roles.ok) {
-    const wildcard = roles.value.entries
-      .filter((role) => !isAdminRoleName(role.name))
+    const nonAdmin = nonAdminRoles(roles.value);
+    const wildcard = nonAdmin
       .map((role) => ({
         role: role.name,
         allowed: roleAllowedIndexes(role),
@@ -1301,12 +1309,14 @@ export async function assessSplunkAccessControl(
         filter: asString(role.content.srchFilter) ?? asString(role.content.imported_srchFilter) ?? null,
       }))
       .filter((item) => item.allowed.some((pattern) => pattern === "*") && !item.filter);
-    const missingAllowed = roles.value.entries.filter((role) => !isAdminRoleName(role.name) && role.content.srchIndexesAllowed === undefined && role.content.imported_srchIndexesAllowed === undefined).map((role) => role.name);
+    const missingAllowed = rolesWithoutIndexScope(nonAdmin);
     const evidence = { ...inventoryNote(roles.value), wildcard_roles: wildcard.slice(0, 50), roles_without_srchIndexesAllowed_field: missingAllowed.slice(0, 50) };
     if (wildcard.length > 0) {
       findings.push(finding(9, "fail", `${wildcard.length} non-admin roles can search every index (srchIndexesAllowed contains * with no srchFilter).${partialSuffix(roles.value, "roles")}`, evidence));
-    } else if (missingAllowed.length === roles.value.entries.filter((role) => !isAdminRoleName(role.name)).length && missingAllowed.length > 0) {
+    } else if (missingAllowed.length === nonAdmin.length && missingAllowed.length > 0) {
       findings.push(finding(9, "manual", "Unknown: no non-admin role exposed the srchIndexesAllowed field, so search restrictions could not be read.", evidence));
+    } else if (missingAllowed.length > 0) {
+      findings.push(finding(9, "warn", `${missingAllowed.length} of ${nonAdmin.length} non-admin roles did not expose srchIndexesAllowed (${missingAllowed.slice(0, 10).join(", ")}), so their search scope is unknown and was not counted as unrestricted; the remaining roles have no unrestricted (*) scope.${partialSuffix(roles.value, "roles")}`, evidence));
     } else {
       findings.push(finding(9, withPartial("pass", roles.value), `No non-admin role has unrestricted (*) index search scope.${partialSuffix(roles.value, "roles")}`, evidence));
     }
@@ -1317,13 +1327,18 @@ export async function assessSplunkAccessControl(
     findings.push(indexGuard);
   } else if (roles.ok) {
     const sensitive = ["_audit", "_internal"];
-    const exposed = roles.value.entries
-      .filter((role) => !isAdminRoleName(role.name))
+    const nonAdmin = nonAdminRoles(roles.value);
+    const exposed = nonAdmin
       .map((role) => ({ role: role.name, allowed: roleAllowedIndexes(role), sensitive: sensitive.filter((index) => indexPatternCovers(roleAllowedIndexes(role), index)) }))
       .filter((item) => item.sensitive.length > 0);
-    const evidence = { ...inventoryNote(roles.value), non_admin_roles_with_internal_index_access: exposed.slice(0, 50) };
+    const missingAllowed = rolesWithoutIndexScope(nonAdmin);
+    const evidence = { ...inventoryNote(roles.value), non_admin_roles_with_internal_index_access: exposed.slice(0, 50), roles_without_srchIndexesAllowed_field: missingAllowed.slice(0, 50) };
     if (exposed.length > 0) {
       findings.push(finding(10, "fail", `${exposed.length} non-admin roles can search _audit or _internal.${partialSuffix(roles.value, "roles")}`, evidence));
+    } else if (missingAllowed.length === nonAdmin.length && missingAllowed.length > 0) {
+      findings.push(finding(10, "manual", "Unknown: no non-admin role exposed the srchIndexesAllowed field, so _audit and _internal access could not be read.", evidence));
+    } else if (missingAllowed.length > 0) {
+      findings.push(finding(10, "warn", `${missingAllowed.length} of ${nonAdmin.length} non-admin roles did not expose srchIndexesAllowed (${missingAllowed.slice(0, 10).join(", ")}), so their _audit and _internal access is unknown and was not counted as granted; no other non-admin role can search those indexes.${partialSuffix(roles.value, "roles")}`, evidence));
     } else {
       findings.push(finding(10, withPartial("pass", roles.value), `Only admin roles can search _audit and _internal across ${roles.value.entries.length} roles.${partialSuffix(roles.value, "roles")}`, evidence));
     }
@@ -1387,13 +1402,106 @@ function hecEntryIsGlobal(entry: SplunkEntry): boolean {
   return entry.name === "http";
 }
 
+type ForwarderTlsMode = "explicit_tls" | "inferred_from_clientCert" | "plaintext" | "unrecognized";
+
+interface ForwarderTargetTls {
+  target: string;
+  useSSL: string | null;
+  useSSL_source: string;
+  clientCert: string | null;
+  clientCert_source: string;
+  sslPassword_present: boolean;
+  mode: ForwarderTlsMode;
+  reason: string;
+}
+
+interface ForwarderTlsView {
+  global: JsonRecord | undefined;
+  groups: ForwarderTargetTls[];
+  servers: ForwarderTargetTls[];
+}
+
+type TcpoutLevels = Array<[source: string, content: JsonRecord | undefined]>;
+
+function tcpoutSetting(key: string, levels: TcpoutLevels): { value: string | undefined; source: string } {
+  for (const [source, content] of levels) {
+    const value = asString(content?.[key]);
+    if (value !== undefined) return { value, source };
+  }
+  return { value: undefined, source: "unset" };
+}
+
+function forwarderTlsMode(useSsl: string | undefined, clientCert: string | undefined): { mode: ForwarderTlsMode; reason: string } {
+  const explicit = useSsl === undefined ? undefined : asBoolean(useSsl);
+  if (explicit === true) return { mode: "explicit_tls", reason: `useSSL=${useSsl}` };
+  if (explicit === false) return { mode: "plaintext", reason: `useSSL=${useSsl} explicitly disables TLS regardless of certificate settings` };
+  const legacyLabel = useSsl === undefined ? "useSSL unset (documented default legacy)" : `useSSL=${useSsl}`;
+  if (useSsl === undefined || useSsl.toLowerCase() === "legacy") {
+    return clientCert
+      ? { mode: "inferred_from_clientCert", reason: `${legacyLabel}: TLS is inferred from clientCert=${clientCert}, whose validity the REST view cannot verify` }
+      : { mode: "plaintext", reason: `${legacyLabel} with no clientCert, so the forwarder does not use TLS` };
+  }
+  return { mode: "unrecognized", reason: `useSSL=${useSsl} is not a documented value (true, false, legacy)` };
+}
+
+function forwarderTlsStatus(mode: ForwarderTlsMode): SplunkFindingStatus {
+  switch (mode) {
+    case "explicit_tls":
+      return "pass";
+    case "inferred_from_clientCert":
+    case "unrecognized":
+      return "warn";
+    case "plaintext":
+      return "fail";
+    default: {
+      const exhaustive: never = mode;
+      throw new Error(`Unhandled forwarder TLS mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function evaluateForwarderTarget(target: string, levels: TcpoutLevels): ForwarderTargetTls {
+  const useSsl = tcpoutSetting("useSSL", levels);
+  const clientCert = tcpoutSetting("clientCert", levels);
+  const certificate = clientCert.value === undefined ? tcpoutSetting("sslCertPath", levels) : clientCert;
+  const password = tcpoutSetting("sslPassword", levels);
+  const { mode, reason } = forwarderTlsMode(useSsl.value, certificate.value);
+  return {
+    target,
+    useSSL: useSsl.value ?? null,
+    useSSL_source: useSsl.source,
+    clientCert: certificate.value ?? null,
+    clientCert_source: certificate.source,
+    sslPassword_present: password.value !== undefined,
+    mode,
+    reason,
+  };
+}
+
+function evaluateForwarderTls(outputs: SplunkListResult): ForwarderTlsView {
+  const global = stanza(outputs, "tcpout");
+  const groupEntries = outputs.entries.filter((entry) => /^tcpout:/.test(entry.name));
+  const serverEntries = outputs.entries.filter((entry) => /^tcpout-server:\/\//.test(entry.name));
+  const groups = groupEntries.map((group) => evaluateForwarderTarget(group.name, [["group", group.content], ["global [tcpout]", global]]));
+  const servers = serverEntries.map((server) => {
+    const address = server.name.replace(/^tcpout-server:\/\//, "");
+    const owner = groupEntries.find((group) => asStringList(group.content.server).includes(address));
+    return evaluateForwarderTarget(server.name, [["server", server.content], ["group", owner?.content], ["global [tcpout]", global]]);
+  });
+  return { global, groups, servers };
+}
+
+function describeTargets(targets: ForwarderTargetTls[]): string {
+  return targets.slice(0, 10).map((item) => `${item.target} (${item.reason})`).join("; ");
+}
+
 export async function assessSplunkDataProtection(client: SplunkInspectorClient): Promise<SplunkAssessmentResult> {
   const deployment = await loadDeployment(client);
-  const [serverConf, webConf, outputsConf, sslInputs, hecInputs, indexes] = await Promise.all([
+  const [serverConf, webConf, outputsConf, inputsConf, hecInputs, indexes] = await Promise.all([
     collect(() => client.getConfStanzas("server")),
     collect(() => client.getConfStanzas("web")),
     collect(() => client.getConfStanzas("outputs")),
-    collect(() => client.listSslTcpInputs()),
+    collect(() => client.getConfStanzas("inputs")),
     collect(() => client.listHecInputs()),
     collect(() => client.listIndexes()),
   ]);
@@ -1412,10 +1520,11 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     const assumed: string[] = [];
     const problems: string[] = [];
     const unknowns: string[] = [];
+    const unknownDefaults: string[] = [];
     if (!ssl) unknowns.push("server.conf [sslConfig] stanza not returned");
     if (splunkdSslRaw === false) problems.push("enableSplunkdSSL=false");
     if (ssl && splunkdSslRaw === undefined) assumed.push("enableSplunkdSSL absent, documented default true assumed");
-    if (sslVersions.length === 0 && ssl) assumed.push("sslVersions absent, documented default tls1.2 assumed");
+    if (sslVersions.length === 0 && ssl) unknownDefaults.push("sslVersions absent and its documented default varies by release (see etc/system/default/server.conf), so the accepted TLS versions are unknown");
     if (sslVersions.length > 0 && tlsVersionsAllowLegacy(sslVersions)) problems.push(`sslVersions=${sslVersions.join(",")} permits TLS below 1.2`);
     if (!webConf.ok) {
       unknowns.push(`web.conf unreadable (${unreadableCause(webConf)})`);
@@ -1424,13 +1533,15 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     } else if (!webSettings) {
       unknowns.push("web.conf [settings] stanza not returned");
     }
-    const evidence = { enableSplunkdSSL: ssl?.enableSplunkdSSL ?? null, sslVersions, cipherSuite: asString(ssl?.cipherSuite) ?? null, requireClientCert: ssl?.requireClientCert ?? null, enableSplunkWebSSL: webSettings?.enableSplunkWebSSL ?? null, web_sslVersions: asStringList(webSettings?.sslVersions), assumed_defaults: assumed, problems, unknowns };
+    const evidence = { enableSplunkdSSL: ssl?.enableSplunkdSSL ?? null, sslVersions, cipherSuite: asString(ssl?.cipherSuite) ?? null, requireClientCert: ssl?.requireClientCert ?? null, enableSplunkWebSSL: webSettings?.enableSplunkWebSSL ?? null, web_sslVersions: asStringList(webSettings?.sslVersions), assumed_defaults: assumed, unknown_defaults: unknownDefaults, problems, unknowns };
     if (problems.length > 0) {
       findings.push(finding(13, "fail", `TLS configuration problems: ${problems.join("; ")}.`, evidence));
     } else if (unknowns.length > 0) {
       findings.push(finding(13, "manual", `Unknown: ${unknowns.join("; ")}${deployment.info.isCloud ? " (Splunk Cloud manages TLS on these ports; record the Splunk Cloud TLS attestation)" : ""}. Collect server.conf [sslConfig] and web.conf [settings] manually.`, evidence));
+    } else if (unknownDefaults.length > 0) {
+      findings.push(finding(13, "warn", `splunkd and Splunk Web use TLS but ${unknownDefaults.join("; ")}${requireClientCert === true ? "; requireClientCert=true" : "; requireClientCert is not enabled"}. Set sslVersions explicitly to tls1.2 or newer.`, evidence));
     } else {
-      findings.push(finding(13, requireClientCert === true ? "pass" : "warn", `splunkd and Splunk Web use TLS with sslVersions ${sslVersions.join(",") || "tls1.2 (default)"}${requireClientCert === true ? " and requireClientCert=true" : "; requireClientCert is not enabled"}${assumed.length > 0 ? `; ${assumed.join("; ")}` : ""}.`, evidence));
+      findings.push(finding(13, requireClientCert === true ? "pass" : "warn", `splunkd and Splunk Web use TLS with sslVersions ${sslVersions.join(",")}${requireClientCert === true ? " and requireClientCert=true" : "; requireClientCert is not enabled"}${assumed.length > 0 ? `; ${assumed.join("; ")}` : ""}.`, evidence));
     }
   }
 
@@ -1448,24 +1559,30 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
   if (deployment.info.isCloud) {
     findings.push(finding(15, "manual", "Splunk Cloud enforces TLS between forwarders and its indexers through the Universal Forwarder credentials package; outputs.conf lives on the forwarders, not on this search head. Collect a sample forwarder outputs.conf (useSSL, clientCert, sslRootCAPath) manually.", { deployment: "splunk_cloud" }));
   } else if (!outputsConf.ok) {
-    findings.push(manualUnreadable(15, "/services/configs/conf-outputs", outputsConf, "outputs.conf [tcpout:*] useSSL, clientCert, sslPassword, sslRootCAPath and inputs.conf [SSL] serverCert from the forwarding tier."));
+    findings.push(manualUnreadable(15, "/services/configs/conf-outputs", outputsConf, "outputs.conf [tcpout] and [tcpout:*] useSSL, clientCert, sslRootCAPath and inputs.conf [SSL] serverCert, requireClientCert from the forwarding tier."));
   } else {
-    const groups = outputsConf.value.entries.filter((entry) => /^tcpout:/.test(entry.name));
-    const sslStanza = sslInputs.ok ? sslInputs.value.entries[0]?.content : undefined;
-    const evaluated = groups.map((group) => {
-      const useSsl = asString(group.content.useSSL);
-      const hasCert = Boolean(asString(group.content.clientCert) ?? asString(group.content.sslCertPath));
-      const hasPassword = Boolean(asString(group.content.sslPassword));
-      return { group: group.name, useSSL: useSsl ?? null, clientCert: hasCert, sslPassword: hasPassword, encrypted: useSsl === "true" || useSsl === "legacy" || hasCert || hasPassword };
-    });
-    const unencrypted = evaluated.filter((item) => !item.encrypted);
-    const evidence = { tcpout_groups: evaluated.slice(0, 50), ssl_input_serverCert: asString(sslStanza?.serverCert) ?? null, ssl_input_requireClientCert: sslStanza?.requireClientCert ?? null, ssl_inputs_readable: sslInputs.ok };
-    if (groups.length === 0) {
-      findings.push(finding(15, "manual", "This node has no outputs.conf tcpout groups, so it does not forward data; collect outputs.conf from the forwarders and inputs.conf [SSL] from the indexers manually.", evidence));
-    } else if (unencrypted.length > 0) {
-      findings.push(finding(15, "fail", `${unencrypted.length} of ${groups.length} tcpout groups have no TLS settings (useSSL, clientCert, or sslPassword).`, evidence));
+    const view = evaluateForwarderTls(outputsConf.value);
+    const targets = [...view.groups, ...view.servers];
+    const plaintext = targets.filter((item) => forwarderTlsStatus(item.mode) === "fail");
+    const inferred = targets.filter((item) => forwarderTlsStatus(item.mode) === "warn");
+    const inherited = targets.filter((item) => item.useSSL_source === "global [tcpout]").length;
+    const inputsSsl = inputsConf.ok ? stanza(inputsConf.value, "SSL") : undefined;
+    const evidence = {
+      global_tcpout: { useSSL: asString(view.global?.useSSL) ?? null, clientCert: asString(view.global?.clientCert) ?? null },
+      targets: targets.slice(0, 50),
+      sslPassword_note: "sslPassword is the CA certificate password and is not treated as TLS evidence",
+      inputs_conf_readable: inputsConf.ok,
+      inputs_ssl_serverCert: asString(inputsSsl?.serverCert) ?? null,
+      inputs_ssl_requireClientCert: inputsSsl?.requireClientCert ?? null,
+    };
+    if (view.groups.length === 0) {
+      findings.push(finding(15, "manual", "This node has no outputs.conf [tcpout:*] target groups, so it does not forward data; collect outputs.conf from the forwarders and inputs.conf [SSL] from the indexers manually.", evidence));
+    } else if (plaintext.length > 0) {
+      findings.push(finding(15, "fail", `${plaintext.length} of ${targets.length} forwarding targets do not use TLS: ${describeTargets(plaintext)}.`, evidence));
+    } else if (inferred.length > 0) {
+      findings.push(finding(15, "warn", `${inferred.length} of ${targets.length} forwarding targets only infer TLS: ${describeTargets(inferred)}. Set useSSL=true explicitly to confirm encryption.`, evidence));
     } else {
-      findings.push(finding(15, "pass", `All ${groups.length} tcpout groups declare TLS settings.`, evidence));
+      findings.push(finding(15, "pass", `All ${targets.length} forwarding targets set useSSL=true explicitly${inherited > 0 ? ` (${inherited} inherit it from the global [tcpout] stanza)` : ""}.`, evidence));
     }
   }
 
@@ -1514,12 +1631,12 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     }
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["tcp-ssl-inputs", sslInputs], ["hec-inputs", hecInputs], ["indexes", indexes]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["conf-inputs", inputsConf], ["hec-inputs", hecInputs], ["indexes", indexes]]);
   return {
     title: "Splunk data protection and encryption",
     summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", acs_configured: client.hasAcs(), ...summarizeStatuses(finalFindings) },
     findings: finalFindings,
-    errors: collectedErrors([["server/info", deployment.collected], ["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["tcp-ssl-inputs", sslInputs], ["hec-inputs", hecInputs], ["indexes", indexes], ...(acsHec ? [["acs-hec", acsHec] as [string, Collected<unknown>]] : [])]),
+    errors: collectedErrors([["server/info", deployment.collected], ["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["conf-inputs", inputsConf], ["hec-inputs", hecInputs], ["indexes", indexes], ...(acsHec ? [["acs-hec", acsHec] as [string, Collected<unknown>]] : [])]),
   };
 }
 
@@ -1640,16 +1757,64 @@ function appProvenance(app: SplunkEntry): "core" | "splunkbase" | "third_party" 
   return "third_party";
 }
 
+type S2sListenerState = "tls" | "plaintext" | "unconfirmed";
+
+interface S2sListener {
+  port: string;
+  state: S2sListenerState;
+  sources: string[];
+}
+
+function listenerPort(name: string): string {
+  const match = /(\d+)\s*$/.exec(name);
+  return match ? match[1] : name;
+}
+
+function s2sListenerStatus(state: S2sListenerState): SplunkFindingStatus {
+  switch (state) {
+    case "tls":
+      return "pass";
+    case "unconfirmed":
+      return "manual";
+    case "plaintext":
+      return "fail";
+    default: {
+      const exhaustive: never = state;
+      throw new Error(`Unhandled S2S listener state ${String(exhaustive)}`);
+    }
+  }
+}
+
+function s2sListeners(cooked: SplunkListResult, inputs: SplunkListResult): S2sListener[] {
+  const byPort = new Map<string, S2sListener>();
+  const record = (name: string, source: string, state: S2sListenerState | undefined): void => {
+    const port = listenerPort(name);
+    const current = byPort.get(port) ?? { port, state: "unconfirmed", sources: [] };
+    current.sources.push(source);
+    if (state === "plaintext" || (state === "tls" && current.state === "unconfirmed")) current.state = state;
+    byPort.set(port, current);
+  };
+  for (const entry of cooked.entries) {
+    if (asBoolean(entry.content.disabled) !== true) record(entry.name, `data/inputs/tcp/cooked ${entry.name}`, undefined);
+  }
+  for (const entry of inputs.entries) {
+    if (asBoolean(entry.content.disabled) === true) continue;
+    if (/^splunktcp-ssl:/.test(entry.name)) record(entry.name, `inputs.conf [${entry.name}]`, "tls");
+    else if (/^splunktcp:/.test(entry.name)) record(entry.name, `inputs.conf [${entry.name}]`, "plaintext");
+  }
+  return [...byPort.values()];
+}
+
 export async function assessSplunkPlatformHardening(client: SplunkInspectorClient): Promise<SplunkAssessmentResult> {
   const deployment = await loadDeployment(client);
-  const [apps, roles, kvCollections, savedSearches, users, cookedInputs, sslInputs] = await Promise.all([
+  const [apps, roles, kvCollections, savedSearches, users, cookedInputs, inputsConf] = await Promise.all([
     collect(() => client.listApps()),
     collect(() => client.listRoles()),
     collect(() => client.listKvCollections()),
     collect(() => client.listSavedSearches()),
     collect(() => client.listUsers()),
     collect(() => client.listCookedTcpInputs()),
-    collect(() => client.listSslTcpInputs()),
+    collect(() => client.getConfStanzas("inputs")),
   ]);
   const findings: SplunkFinding[] = [];
 
@@ -1761,32 +1926,50 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
   if (deployment.info.isCloud) {
     findings.push(finding(23, "manual", "Splunk Cloud indexers are managed by Splunk; S2S listeners are not exposed through this search head. Collect the s2s IP allow list and Splunk Cloud forwarder TLS attestation manually.", { deployment: "splunk_cloud" }));
   } else if (!cookedInputs.ok) {
-    findings.push(manualUnreadable(23, "/services/data/inputs/tcp/cooked", cookedInputs, "splunktcp receiving ports with their SSL flag and inputs.conf [SSL] serverCert and requireClientCert from each indexer."));
-  } else if (cookedInputs.value.entries.length === 0) {
-    findings.push(finding(23, "manual", "This node has no splunktcp receiving ports, so S2S security must be collected from the indexers manually.", inventoryNote(cookedInputs.value)));
+    findings.push(manualUnreadable(23, "/services/data/inputs/tcp/cooked", cookedInputs, "inputs.conf [splunktcp://*] and [splunktcp-ssl:*] receiving stanzas plus the [SSL] stanza serverCert and requireClientCert from each indexer."));
   } else {
-    const sslStanza = sslInputs.ok ? sslInputs.value.entries[0]?.content : undefined;
-    const listeners = cookedInputs.value.entries.filter((input) => asBoolean(input.content.disabled) !== true).map((input) => ({ port: input.name, ssl: asBoolean(input.content.SSL) === true || /ssl/i.test(input.name) }));
-    const plaintext = listeners.filter((item) => !item.ssl);
+    const listeners = s2sListeners(cookedInputs.value, inputsConf.ok ? inputsConf.value : { entries: [], total: 0, truncated: false });
+    const plaintext = listeners.filter((item) => s2sListenerStatus(item.state) === "fail");
+    const unconfirmed = listeners.filter((item) => s2sListenerStatus(item.state) === "manual");
+    const sslStanza = inputsConf.ok ? stanza(inputsConf.value, "SSL") : undefined;
     const requireClientCert = asBoolean(sslStanza?.requireClientCert);
-    const evidence = { ...inventoryNote(cookedInputs.value), listeners, ssl_stanza_readable: sslInputs.ok, serverCert: asString(sslStanza?.serverCert) ?? null, requireClientCert: sslStanza?.requireClientCert ?? null, sslVersions: asStringList(sslStanza?.sslVersions) };
-    if (plaintext.length > 0) {
-      findings.push(finding(23, "fail", `${plaintext.length} of ${listeners.length} enabled splunktcp listeners accept unencrypted S2S traffic (ports ${plaintext.map((item) => item.port).join(", ")}).`, evidence));
-    } else if (listeners.length === 0) {
-      findings.push(finding(23, "manual", "All splunktcp listeners on this node are disabled; collect S2S receiver settings from the active indexers manually.", evidence));
-    } else if (!sslInputs.ok || requireClientCert !== true) {
-      findings.push(finding(23, "warn", `All ${listeners.length} listeners use TLS but requireClientCert is ${sslInputs.ok ? String(sslStanza?.requireClientCert ?? "absent (documented default false)") : "unreadable"}, so forwarders are not certificate-authenticated.`, evidence));
+    const serverCert = asString(sslStanza?.serverCert);
+    const evidence = {
+      ...inventoryNote(cookedInputs.value),
+      listeners,
+      inputs_conf_readable: inputsConf.ok,
+      ssl_stanza_present: Boolean(sslStanza),
+      serverCert: serverCert ?? null,
+      requireClientCert: sslStanza?.requireClientCert ?? null,
+      sslVersions: asStringList(sslStanza?.sslVersions),
+      note: "data/inputs/tcp/cooked does not report TLS; encryption is decided from inputs.conf [splunktcp-ssl:*] stanzas only",
+    };
+    const ports = (items: S2sListener[]): string => items.map((item) => item.port).join(", ");
+    if (listeners.length === 0) {
+      findings.push(finding(23, "manual", "This node has no enabled splunktcp receiving ports, so S2S security must be collected from the indexers manually.", evidence));
+    } else if (plaintext.length > 0) {
+      findings.push(finding(23, "fail", `${plaintext.length} of ${listeners.length} enabled S2S listeners are plaintext [splunktcp://] receivers (ports ${ports(plaintext)}).`, evidence));
+    } else if (!inputsConf.ok) {
+      findings.push(finding(23, "manual", `Unknown: ${listeners.length} enabled splunktcp listeners exist (ports ${ports(listeners)}) but /services/configs/conf-inputs could not be read because ${unreadableCause(inputsConf)}, and the data/inputs/tcp/cooked REST view does not report TLS. Collect inputs.conf [splunktcp-ssl:*] and [SSL] from each indexer manually.`, evidence));
+    } else if (unconfirmed.length > 0) {
+      findings.push(finding(23, "manual", `Unknown: ${unconfirmed.length} of ${listeners.length} enabled splunktcp listeners (ports ${ports(unconfirmed)}) have no [splunktcp-ssl:<port>] stanza in the readable inputs.conf, so the REST view cannot confirm TLS. Collect inputs.conf from each indexer manually.`, evidence));
+    } else if (!sslStanza) {
+      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but inputs.conf returned no [SSL] stanza, so serverCert and requireClientCert are unknown.`, evidence));
+    } else if (requireClientCert !== true) {
+      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers but [SSL] requireClientCert is ${sslStanza.requireClientCert === undefined ? "absent (the documented default varies with the certificate in use)" : String(sslStanza.requireClientCert)}, so forwarders are not certificate-authenticated.`, evidence));
+    } else if (!serverCert) {
+      findings.push(finding(23, "warn", `All ${listeners.length} listeners are [splunktcp-ssl:*] receivers with requireClientCert=true but [SSL] serverCert is absent, so the receiving certificate cannot be confirmed.`, evidence));
     } else {
-      findings.push(finding(23, "pass", `All ${listeners.length} splunktcp listeners use TLS and requireClientCert=true.`, evidence));
+      findings.push(finding(23, "pass", `All ${listeners.length} enabled S2S listeners are [splunktcp-ssl:*] receivers (ports ${ports(listeners)}) with [SSL] serverCert set and requireClientCert=true.`, evidence));
     }
   }
 
-  const finalFindings = downgradePassOnPartialInventory(findings, [["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["tcp-ssl-inputs", sslInputs]]);
+  const finalFindings = downgradePassOnPartialInventory(findings, [["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["conf-inputs", inputsConf]]);
   return {
     title: "Splunk network and platform hardening",
     summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", version: deployment.info.version ?? null, acs_configured: client.hasAcs(), ...summarizeStatuses(finalFindings) },
     findings: finalFindings,
-    errors: collectedErrors([["server/info", deployment.collected], ["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["tcp-ssl-inputs", sslInputs]]),
+    errors: collectedErrors([["server/info", deployment.collected], ["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["conf-inputs", inputsConf]]),
   };
 }
 
@@ -1992,6 +2175,8 @@ export async function exportSplunkAuditBundle(
     ["conf_authentication", () => client.getConfStanzas("authentication")],
     ["conf_server", () => client.getConfStanzas("server")],
     ["conf_web", () => client.getConfStanzas("web")],
+    ["conf_outputs", () => client.getConfStanzas("outputs")],
+    ["conf_inputs", () => client.getConfStanzas("inputs")],
     ["indexes", () => client.listIndexes()],
     ["hec_inputs", () => client.listHecInputs()],
     ["saved_searches", () => client.listSavedSearches()],
