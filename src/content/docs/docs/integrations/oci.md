@@ -104,6 +104,8 @@ Secret hygiene: nothing credential-bearing is written. Findings redact sensitive
 
 Cap exits: every capped loop (`max_compartments`, `max_keys`, `max_policies`, `max_buckets`) records the cap hit, reports seen versus total in the summary and evidence (`credentials_total` is `null` when the credential cap stopped enumeration), and withholds `pass`.
 
+CLI error text: when an `oci` command fails, its stderr and stdout are never echoed into a finding, an errors array, or a bundle file. A documented `ServiceError` block contributes only its `status`, `code`, `opc-request-id`, and scrubbed `message` (for example `oci iam user list exited 1 with ServiceError status=404 code=NotAuthorizedOrNotFound opc-request-id=... message=...`); anything else (an HTML gateway page, a traceback, plain text) is described by the command words, exit code, and byte counts (`oci iam user list exited 1; 236 bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)`). Every error string also passes through `scrubErrorText`, which drops embedded URL queries and fragments, Bearer, Basic, cookie, api key, session, access, refresh, and id token, client secret, password, `Signature`, and `keyId` values, and any unlabeled token of 16 or more characters in free text; OCIDs, `kmsKeyId`, `masterKeyId`, `--key-id`, and `opc-request-id` values stay readable. The same scrub runs a second time when errors are written into the bundle.
+
 ## Live smoke
 
 ```
