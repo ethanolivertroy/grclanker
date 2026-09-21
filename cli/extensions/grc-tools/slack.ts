@@ -1075,6 +1075,16 @@ function partialNote(seen: number, complete: boolean, total?: number, truncation
   return `${seen} seen of ${total ?? "unknown total"} (partial view, ${truncationNote(truncation)})`;
 }
 
+/** A count derived from an unreadable inventory is rendered as null; inventoryStatus carries the reason beside it. */
+function inventoryCount<T>(result: ReadResult<T>, count: number): number | null {
+  return result.ok ? count : null;
+}
+
+function inventoryStatus<T>(result: ReadResult<T>, endpoint: string): string {
+  if (!result.ok) return `unreadable: ${endpoint} ${result.error}`;
+  return result.complete ? `complete: ${endpoint}` : `partial: ${endpoint} ${truncationNote(result.truncation)}`;
+}
+
 async function webSurface(
   client: SlackApiClient,
   name: string,
@@ -1388,12 +1398,14 @@ export async function assessSlackIdentity(
   return {
     title: "Slack identity posture",
     summary: {
-      users_seen: users.length,
+      users_seen: inventoryCount(usersResult, users.length),
+      users_status: inventoryStatus(usersResult, "users.list"),
       users_inventory_complete: usersComplete,
-      active_human_users: activeHumans.length,
-      guests: guests.length,
-      users_without_mfa: withoutMfa.length,
-      scim_users: scimUsers.ok ? scimUsers.value.length : 0,
+      active_human_users: inventoryCount(usersResult, activeHumans.length),
+      guests: inventoryCount(usersResult, guests.length),
+      users_without_mfa: inventoryCount(usersResult, withoutMfa.length),
+      scim_users: inventoryCount(scimUsers, scimUsers.ok ? scimUsers.value.length : 0),
+      scim_users_status: inventoryStatus(scimUsers, "SCIM /Users"),
     },
     findings,
     errors,
@@ -1440,7 +1452,7 @@ export async function assessSlackAdminAccess(
   const workspaceView = teamsResult.ok ? partialNote(workspaces.length, teamsResult.complete, teamsResult.total, teamsResult.truncation) : "unreadable";
 
   const adminInventory: Array<{ id: string; name: string; admin_ids: string[]; complete: boolean }> = [];
-  const adminErrors: string[] = [];
+  const unreadableAdminLists: Array<{ id: string; name: string; error: string }> = [];
   const emailDomains: Array<{ id: string; name: string; email_domain: string }> = [];
   const settingsErrors: string[] = [];
   for (const workspace of workspaces) {
@@ -1449,7 +1461,7 @@ export async function assessSlackAdminAccess(
       const ids = admins.value.map((item) => asString(item.id)).filter((id): id is string => Boolean(id));
       adminInventory.push({ id: workspace.id, name: workspace.name, admin_ids: ids, complete: admins.complete });
     } else {
-      adminErrors.push(`${workspace.id}: ${unreadableReason(admins)}`);
+      unreadableAdminLists.push({ id: workspace.id, name: workspace.name, error: unreadableReason(admins) });
     }
     const settings = await readWeb(client, "admin.teams.settings.info", { team_id: workspace.id });
     if (settings.ok) {
@@ -1461,6 +1473,11 @@ export async function assessSlackAdminAccess(
       settingsErrors.push(`${workspace.id}: ${unreadableReason(settings)}`);
     }
   }
+  const adminErrors = unreadableAdminLists.map((item) => `${item.id}: ${item.error}`);
+  const adminListGap = unreadableAdminLists.length > 0
+    ? `admin.teams.admins.list unreadable for ${unreadableAdminLists.map((item) => `${item.id} (${item.name}): ${item.error}`).join("; ")}`
+    : undefined;
+  const settingsGap = settingsErrors.length > 0 ? `admin.teams.settings.info unreadable or lacking team.email_domain for ${settingsErrors.join("; ")}` : undefined;
   errors.push(...adminErrors.map((item) => `admin.teams.admins.list ${item}`), ...settingsErrors.map((item) => `admin.teams.settings.info ${item}`));
 
   const orgUsers = await readWebList(client, "admin.users.list", ["users"], {}, { limit: userLimit });
@@ -1502,7 +1519,6 @@ export async function assessSlackAdminAccess(
   const emojiEntries = emojiResult.ok ? emojiResult.value : [];
   const emojiComplete = emojiResult.ok && emojiResult.complete;
   const emojiView = emojiResult.ok ? partialNote(emojiEntries.length, emojiResult.complete, undefined, emojiResult.truncation) : "unreadable";
-  const nonAdminUploads = emojiEntries.filter((item) => !item.uploaded_by || !adminUserIds.has(item.uploaded_by));
 
   const analyticsProbe = await readAnalyticsProbe(client);
   if (!analyticsProbe.ok) errors.push(`admin.analytics.getFile: ${analyticsProbe.error}`);
@@ -1510,6 +1526,17 @@ export async function assessSlackAdminAccess(
   const excessiveAdmins = adminInventory.filter((item) => item.admin_ids.length > maxWorkspaceAdmins);
   const truncatedAdminLists = adminInventory.filter((item) => !item.complete).map((item) => `${item.name} (${item.id})`);
   const adminsComplete = workspacesComplete && adminErrors.length === 0 && adminInventory.every((item) => item.complete);
+  const rosterGaps: string[] = [];
+  if (!orgUsers.ok) rosterGaps.push(`admin.users.list unreadable (${orgUsers.error})`);
+  else if (!orgUsers.complete) rosterGaps.push(`admin.users.list partial (${orgUsersView})`);
+  if (!teamsResult.ok) rosterGaps.push(`admin.teams.list unreadable (${teamsResult.error})`);
+  else if (!teamsResult.complete) rosterGaps.push(`admin.teams.list partial (${workspaceView})`);
+  if (adminListGap) rosterGaps.push(adminListGap);
+  if (truncatedAdminLists.length > 0) rosterGaps.push(`admin.teams.admins.list truncated for ${truncatedAdminLists.join(", ")}`);
+  const adminRosterComplete = rosterGaps.length === 0;
+  const uploadsOutsideRoster = emojiEntries.filter((item) => !item.uploaded_by || !adminUserIds.has(item.uploaded_by));
+  const nonAdminUploads = adminRosterComplete ? uploadsOutsideRoster : undefined;
+  const everyAdminListUnreadable = teamsResult.ok && workspaces.length > 0 && adminInventory.length === 0 && unreadableAdminLists.length > 0;
   const openWorkspaces = workspaces.filter((item) => item.discoverability === "open");
   const unknownDiscoverability = workspaces.filter((item) => !item.discoverability);
   const unrestrictedDomains = emailDomains.filter((item) => item.email_domain.length === 0);
@@ -1520,7 +1547,7 @@ export async function assessSlackAdminAccess(
     !teamsResult.ok
       ? manualFinding("SLACK-ADMIN-01", "Workspace admin inventory", 14, "high", `admin.teams.list is not readable: ${unreadableReason(teamsResult)}.`, "export the admin and owner roster for every workspace from the org dashboard.")
       : adminInventory.length === 0
-        ? manualFinding("SLACK-ADMIN-01", "Workspace admin inventory", 14, "high", workspaces.length === 0 ? `admin.teams.list returned no workspaces (${workspaceView}).` : `admin.teams.admins.list is not readable for any workspace: ${adminErrors[0] ?? "unknown"}.`, "export the admin and owner roster for every workspace from the org dashboard.")
+        ? manualFinding("SLACK-ADMIN-01", "Workspace admin inventory", 14, "high", workspaces.length === 0 ? `admin.teams.list returned no workspaces (${workspaceView}).` : `admin.teams.admins.list is not readable for any workspace (${adminErrors.join("; ")}).`, "export the admin and owner roster for every workspace from the org dashboard.", { admin_counts: unreadableAdminLists.map((item) => ({ id: item.id, name: item.name, count: null, status: `unreadable: admin.teams.admins.list ${item.error}` })), unreadable_workspaces: adminErrors })
         : finding(
           "SLACK-ADMIN-01",
           "Workspace admin inventory",
@@ -1531,8 +1558,16 @@ export async function assessSlackAdminAccess(
             ? `${excessiveAdmins.length}/${adminInventory.length} workspaces exceed ${maxWorkspaceAdmins} admins (admin_ids; workspaces: ${workspaceView}${truncatedAdminLists.length > 0 ? `; admin lists truncated for ${truncatedAdminLists.join(", ")}` : ""}).`
             : adminsComplete
               ? `No workspace exceeds ${maxWorkspaceAdmins} admins across ${adminInventory.length} workspaces (${workspaceView}).`
-              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; admin lists truncated: ${truncatedAdminLists.length}${truncatedAdminLists.length > 0 ? ` (${truncatedAdminLists.join(", ")})` : ""}; unreadable admin lists: ${adminErrors.length}).`,
-          { admin_counts: adminInventory.map((item) => ({ id: item.id, name: item.name, count: item.admin_ids.length, complete: item.complete })), max_workspace_admins: maxWorkspaceAdmins, unreadable_workspaces: adminErrors, inventory_complete: adminsComplete },
+              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; admin lists truncated: ${truncatedAdminLists.length}${truncatedAdminLists.length > 0 ? ` (${truncatedAdminLists.join(", ")})` : ""}; ${adminListGap ?? "no unreadable admin lists"}).`,
+          {
+            admin_counts: [
+              ...adminInventory.map((item) => ({ id: item.id, name: item.name, count: item.admin_ids.length, complete: item.complete, status: item.complete ? "complete" : "truncated" })),
+              ...unreadableAdminLists.map((item) => ({ id: item.id, name: item.name, count: null, complete: false, status: `unreadable: admin.teams.admins.list ${item.error}` })),
+            ],
+            max_workspace_admins: maxWorkspaceAdmins,
+            unreadable_workspaces: adminErrors,
+            inventory_complete: adminsComplete,
+          },
         ),
   );
 
@@ -1640,7 +1675,7 @@ export async function assessSlackAdminAccess(
     !teamsResult.ok
       ? manualFinding("SLACK-ADMIN-07", "Email domain restrictions", 16, "high", `admin.teams.list is not readable: ${unreadableReason(teamsResult)}.`, "capture the allowed signup email domains for each workspace.")
       : emailDomains.length === 0
-        ? manualFinding("SLACK-ADMIN-07", "Email domain restrictions", 16, "high", workspaces.length === 0 ? `admin.teams.list returned no workspaces (${workspaceView}).` : `admin.teams.settings.info did not return team.email_domain for any workspace: ${settingsErrors[0] ?? "unknown"}.`, "capture the allowed signup email domains for each workspace.")
+        ? manualFinding("SLACK-ADMIN-07", "Email domain restrictions", 16, "high", workspaces.length === 0 ? `admin.teams.list returned no workspaces (${workspaceView}).` : `admin.teams.settings.info did not return team.email_domain for any workspace (${settingsErrors.join("; ")}).`, "capture the allowed signup email domains for each workspace.", { email_domains: null, email_domains_status: `unreadable: ${settingsGap ?? "admin.teams.settings.info"}`, unreadable_workspaces: settingsErrors })
         : finding(
           "SLACK-ADMIN-07",
           "Email domain restrictions",
@@ -1650,7 +1685,7 @@ export async function assessSlackAdminAccess(
           unrestrictedDomains.length > 0
             ? `${unrestrictedDomains.length}/${emailDomains.length} workspaces have an empty team.email_domain, so signup is not restricted to approved domains (${workspaceView}).`
             : settingsErrors.length > 0 || !workspacesComplete
-              ? `Every readable workspace restricts signup by email domain, but ${settingsErrors.length} workspaces were unreadable and the workspace view is ${workspacesComplete ? "complete" : "partial"} (${workspaceView}).`
+              ? `Every readable workspace restricts signup by email domain, but ${settingsGap ?? "no workspace was unreadable"}${workspacesComplete ? ` (workspaces: ${workspaceView})` : `; the workspace view is partial (${workspaceView})`}.`
               : `All ${emailDomains.length} workspaces restrict signup to approved email domains (team.email_domain populated; ${workspaceView}).`,
           { email_domains: emailDomains, unreadable_workspaces: settingsErrors, inventory_complete: workspacesComplete },
         ),
@@ -1671,21 +1706,43 @@ export async function assessSlackAdminAccess(
           "capture the custom emoji upload permission from the workspace settings.",
           { citation: SLACK_DOC_PAGES.emojiList, emoji_count: 0, inventory_complete: emojiComplete, emoji_truncation: emojiResult.truncation ?? null },
         )
-        : adminUserIds.size === 0
-          ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `No admin or owner identities were readable, so emoji uploaders could not be compared with the admin roster (emoji: ${emojiView}).`, "compare the emoji uploader list with the admin roster.", { emoji_count: emojiEntries.length, inventory_complete: emojiComplete })
-          : finding(
+        : everyAdminListUnreadable
+          ? manualFinding(
             "SLACK-ADMIN-08",
             "Custom emoji governance",
             19,
             "low",
-            nonAdminUploads.length > 0 ? "fail" : emojiComplete && orgUsersComplete ? "pass" : "warn",
-            nonAdminUploads.length > 0
-              ? `${nonAdminUploads.length}/${emojiEntries.length} custom emoji were uploaded by non-admin users; uploads are not restricted to admins (emoji: ${emojiView}).`
-              : emojiComplete && orgUsersComplete
-                ? `All ${emojiEntries.length} custom emoji were uploaded by admins or owners (emoji: ${emojiView}; users: ${orgUsersView}).`
-                : `All ${emojiEntries.length} seen custom emoji were uploaded by admins or owners, but the ${emojiComplete ? "user" : orgUsersComplete ? "emoji" : "emoji and user"} inventory is partial (emoji: ${emojiView}; users: ${orgUsersView}).`,
-            { emoji_count: emojiEntries.length, non_admin_uploads: nonAdminUploads.slice(0, 20).map((item) => item.name), inventory_complete: emojiComplete, emoji_truncation: emojiResult.truncation ?? null, users_inventory_complete: orgUsersComplete },
-          ),
+            `${adminListGap}, so the ${emojiEntries.length} custom emoji uploaders could not be compared with a workspace admin roster (emoji: ${emojiView}; users: ${orgUsersView}).`,
+            "compare the emoji uploader list with the admin roster.",
+            { emoji_count: emojiEntries.length, non_admin_uploads: null, non_admin_uploads_status: `unknown: ${adminListGap}`, uploads_outside_readable_roster: uploadsOutsideRoster.length, unreadable_workspaces: adminErrors, roster_complete: false, inventory_complete: emojiComplete },
+          )
+          : adminUserIds.size === 0
+            ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `No admin or owner identities were readable${rosterGaps.length > 0 ? ` (${rosterGaps.join("; ")})` : ""}, so emoji uploaders could not be compared with the admin roster (emoji: ${emojiView}).`, "compare the emoji uploader list with the admin roster.", { emoji_count: emojiEntries.length, non_admin_uploads: null, non_admin_uploads_status: `unknown: ${rosterGaps.join("; ") || "no admin identities readable"}`, unreadable_workspaces: adminErrors, roster_complete: adminRosterComplete, inventory_complete: emojiComplete })
+            : finding(
+              "SLACK-ADMIN-08",
+              "Custom emoji governance",
+              19,
+              "low",
+              nonAdminUploads && nonAdminUploads.length > 0 ? "fail" : adminRosterComplete && emojiComplete ? "pass" : "warn",
+              nonAdminUploads && nonAdminUploads.length > 0
+                ? `${nonAdminUploads.length}/${emojiEntries.length} custom emoji were uploaded by non-admin users; uploads are not restricted to admins (emoji: ${emojiView}; roster complete).`
+                : adminRosterComplete && emojiComplete
+                  ? `All ${emojiEntries.length} custom emoji were uploaded by admins or owners (emoji: ${emojiView}; users: ${orgUsersView}).`
+                  : !adminRosterComplete
+                    ? `All ${emojiEntries.length} seen custom emoji were checked against an incomplete admin roster (${rosterGaps.join("; ")}); ${uploadsOutsideRoster.length} uploads are by users outside the readable roster and were not classified as non-admin (emoji: ${emojiView}).`
+                    : `All ${emojiEntries.length} seen custom emoji were uploaded by admins or owners, but the emoji inventory is partial (emoji: ${emojiView}; users: ${orgUsersView}).`,
+              {
+                emoji_count: emojiEntries.length,
+                non_admin_uploads: nonAdminUploads ? nonAdminUploads.slice(0, 20).map((item) => item.name) : null,
+                non_admin_uploads_status: adminRosterComplete ? "classified against the complete admin roster" : `unknown: admin roster incomplete (${rosterGaps.join("; ")})`,
+                uploads_outside_readable_roster: uploadsOutsideRoster.length,
+                unreadable_workspaces: adminErrors,
+                roster_complete: adminRosterComplete,
+                inventory_complete: emojiComplete,
+                emoji_truncation: emojiResult.truncation ?? null,
+                users_inventory_complete: orgUsersComplete,
+              },
+            ),
   );
 
   findings.push(
@@ -1705,13 +1762,18 @@ export async function assessSlackAdminAccess(
   return {
     title: "Slack admin access posture",
     summary: {
-      workspaces_seen: workspaces.length,
+      workspaces_seen: inventoryCount(teamsResult, workspaces.length),
+      workspaces_status: inventoryStatus(teamsResult, "admin.teams.list"),
       workspaces_complete: workspacesComplete,
       admin_lists_readable: adminInventory.length,
-      active_org_users: activeOrgUsers.length,
-      users_without_sso: withoutSso.length,
-      sessions_sampled: sessionSettings.length,
-      custom_emoji: emojiEntries.length,
+      admin_lists_unreadable: adminErrors.length,
+      active_org_users: inventoryCount(orgUsers, activeOrgUsers.length),
+      org_users_status: inventoryStatus(orgUsers, "admin.users.list"),
+      users_without_sso: inventoryCount(orgUsers, withoutSso.length),
+      sessions_sampled: sessionError ? null : sessionSettings.length,
+      sessions_status: sessionError ? `unreadable: admin.users.session.getSettings ${sessionError.error}` : "complete: admin.users.session.getSettings",
+      custom_emoji: inventoryCount(emojiResult, emojiEntries.length),
+      custom_emoji_status: inventoryStatus(emojiResult, "admin.emoji.list"),
       analytics_export_readable: analyticsProbe.ok,
     },
     findings,
@@ -1755,7 +1817,7 @@ export async function assessSlackIntegrations(
   const barriersResult = await readWebList(client, "admin.barriers.list", ["barriers"], {}, { limit: 1000 });
   const preferencesResult = await readWeb(client, "team.preferences.list");
   const authResult = await readWeb(client, "auth.test");
-  for (const [label, result] of [["admin.teams.list", teamsResult], ["admin.apps.approved.list", approvedResult], ["admin.apps.restricted.list", restrictedResult], ["admin.barriers.list", barriersResult], ["team.preferences.list", preferencesResult]] as const) {
+  for (const [label, result] of [["admin.teams.list", teamsResult], ["admin.apps.approved.list", approvedResult], ["admin.apps.restricted.list", restrictedResult], ["admin.barriers.list", barriersResult], ["team.preferences.list", preferencesResult], ["auth.test", authResult]] as const) {
     if (!result.ok) errors.push(`${label}: ${result.error}`);
   }
 
@@ -1768,7 +1830,13 @@ export async function assessSlackIntegrations(
   const flaggedApps = new Set([...customApps, ...unreviewedApps, ...sensitiveApps].map((app) => app.name));
   const fileUploadSetting = preferencesResult.ok ? asString(preferencesResult.value.disable_file_uploads) : undefined;
   const fileUploadVerdict = fileUploadSetting ? SLACK_FILE_UPLOAD_VERDICTS[fileUploadSetting] : undefined;
-  const tokenWorkspace = authResult.ok ? asString(authResult.value.team_id) ?? "unknown" : "unknown";
+  const tokenWorkspace = authResult.ok ? asString(authResult.value.team_id) : undefined;
+  const identityGap = !authResult.ok
+    ? `auth.test was not readable (${authResult.error}), so the workspace the preference applies to could not be identified`
+    : !tokenWorkspace
+      ? "auth.test did not return team_id, so the workspace the preference applies to could not be identified"
+      : undefined;
+  const workspaceLabel = tokenWorkspace ? `workspace ${tokenWorkspace}` : "the token's workspace (id unknown)";
   const workspaceScope = !teamsResult.ok
     ? `admin.teams.list is not readable (${teamsResult.error}), so org-wide coverage is unknown`
     : !teamsResult.complete
@@ -1866,18 +1934,19 @@ export async function assessSlackIntegrations(
           "File upload restrictions",
           6,
           "medium",
-          fileUploadVerdict === "pass" && workspaceScope ? "warn" : fileUploadVerdict ?? "warn",
+          fileUploadVerdict === "pass" && (workspaceScope || identityGap) ? "warn" : fileUploadVerdict ?? "warn",
           `${fileUploadVerdict === "pass"
-            ? `disable_file_uploads=${fileUploadSetting}: uploads are ${fileUploadSetting === "disallow_all" ? "disabled for everyone" : "restricted to owners and admins"} in workspace ${tokenWorkspace}`
+            ? `disable_file_uploads=${fileUploadSetting}: uploads are ${fileUploadSetting === "disallow_all" ? "disabled for everyone" : "restricted to owners and admins"} in ${workspaceLabel}`
             : fileUploadVerdict === "warn"
-              ? `disable_file_uploads=${fileUploadSetting}: every regular member of workspace ${tokenWorkspace} can upload files and only guests are excluded; confirm this matches the org's intent`
+              ? `disable_file_uploads=${fileUploadSetting}: every regular member of ${workspaceLabel} can upload files and only guests are excluded; confirm this matches the org's intent`
               : fileUploadVerdict === "fail"
-                ? `disable_file_uploads=${fileUploadSetting}: file uploads are allowed for everyone in workspace ${tokenWorkspace}, including guests`
-                : `disable_file_uploads=${fileUploadSetting} is not one of the documented values (disallow_all, allow_all, type:owner,type:admin, type:regular); review manually`}${workspaceScope ? `; ${workspaceScope}` : ""}. Verdict map: disallow_all and type:owner,type:admin pass, type:regular warns, allow_all fails.`,
+                ? `disable_file_uploads=${fileUploadSetting}: file uploads are allowed for everyone in ${workspaceLabel}, including guests`
+                : `disable_file_uploads=${fileUploadSetting} is not one of the documented values (disallow_all, allow_all, type:owner,type:admin, type:regular); review manually`}${identityGap ? `; ${identityGap}` : ""}${workspaceScope ? `; ${workspaceScope}` : ""}. Verdict map: disallow_all and type:owner,type:admin pass, type:regular warns, allow_all fails.`,
           {
             citation: SLACK_DOC_PAGES.teamPreferencesList,
             disable_file_uploads: fileUploadSetting,
-            workspace_id: tokenWorkspace,
+            workspace_id: tokenWorkspace ?? null,
+            workspace_id_status: !authResult.ok ? `unreadable: auth.test ${authResult.error}` : tokenWorkspace ? "read from auth.test team_id" : "absent: auth.test returned no team_id",
             workspaces_seen: teamsResult.ok ? teamsResult.value.length : null,
             workspace_inventory_complete: teamsResult.ok ? teamsResult.complete : false,
             verdict_map: SLACK_FILE_UPLOAD_VERDICTS,
@@ -1897,13 +1966,17 @@ export async function assessSlackIntegrations(
   return {
     title: "Slack integrations posture",
     summary: {
-      approved_apps: approvedApps.length,
+      approved_apps: inventoryCount(approvedResult, approvedApps.length),
+      approved_apps_status: inventoryStatus(approvedResult, "admin.apps.approved.list"),
       approved_inventory_complete: approvedResult.ok ? approvedResult.complete : false,
-      restricted_apps: restrictedApps.length,
-      custom_apps: customApps.length,
-      sensitive_scope_apps: sensitiveApps.length,
-      information_barriers: barriersResult.ok ? barriersResult.value.length : 0,
+      restricted_apps: inventoryCount(restrictedResult, restrictedApps.length),
+      restricted_apps_status: inventoryStatus(restrictedResult, "admin.apps.restricted.list"),
+      custom_apps: inventoryCount(approvedResult, customApps.length),
+      sensitive_scope_apps: inventoryCount(approvedResult, sensitiveApps.length),
+      information_barriers: inventoryCount(barriersResult, barriersResult.ok ? barriersResult.value.length : 0),
+      information_barriers_status: inventoryStatus(barriersResult, "admin.barriers.list"),
       disable_file_uploads: fileUploadSetting ?? null,
+      disable_file_uploads_status: preferencesResult.ok ? (fileUploadSetting ? "read from team.preferences.list" : "absent: team.preferences.list returned no disable_file_uploads") : `unreadable: team.preferences.list ${preferencesResult.error}`,
     },
     findings,
     errors,
@@ -1973,27 +2046,40 @@ export async function assessSlackChannelGovernance(
 
   const prefsByChannel: Array<{ channel: ChannelRecord; restricted?: boolean }> = [];
   const prefsErrors: string[] = [];
+  const unreadablePrefs: Array<{ channel: ChannelRecord; error: string }> = [];
   const retentionByChannel: Array<{ channel: ChannelRecord; is_policy_enabled?: boolean; duration_days?: number }> = [];
   const retentionErrors: string[] = [];
+  const unreadableRetention: Array<{ channel: ChannelRecord; error: string }> = [];
   for (const channel of channels) {
     const prefs = await readWeb(client, "admin.conversations.getConversationPrefs", { channel_id: channel.id });
     if (prefs.ok) {
       prefsByChannel.push({ channel, restricted: isSlackPostingRestricted(asObject(prefs.value.prefs) ?? {}) });
     } else {
       prefsErrors.push(`${channel.id}: ${unreadableReason(prefs)}`);
+      unreadablePrefs.push({ channel, error: unreadableReason(prefs) });
     }
     const retention = await readWeb(client, "admin.conversations.getCustomRetention", { channel_id: channel.id });
     if (retention.ok) {
       retentionByChannel.push({ channel, is_policy_enabled: asBoolean(retention.value.is_policy_enabled), duration_days: asNumber(retention.value.duration_days) });
     } else {
       retentionErrors.push(`${channel.id}: ${unreadableReason(retention)}`);
+      unreadableRetention.push({ channel, error: unreadableReason(retention) });
     }
   }
   errors.push(...prefsErrors.map((item) => `admin.conversations.getConversationPrefs ${item}`), ...retentionErrors.map((item) => `admin.conversations.getCustomRetention ${item}`));
 
+  const announcementChannels = channels.filter(isAnnouncementChannel);
   const announcementPrefs = prefsByChannel.filter((item) => isAnnouncementChannel(item.channel));
+  const unreadableAnnouncements = unreadablePrefs.filter((item) => isAnnouncementChannel(item.channel));
   const unrestrictedAnnouncements = announcementPrefs.filter((item) => item.restricted === false);
   const unknownAnnouncements = announcementPrefs.filter((item) => item.restricted === undefined);
+  const channelLabel = (channel: ChannelRecord): string => `${channel.id} (#${channel.name})`;
+  const prefsGap = unreadablePrefs.length > 0
+    ? `admin.conversations.getConversationPrefs unreadable for ${unreadablePrefs.map((item) => `${channelLabel(item.channel)}: ${item.error}`).join("; ")}`
+    : undefined;
+  const retentionGap = unreadableRetention.length > 0
+    ? `admin.conversations.getCustomRetention unreadable for ${unreadableRetention.map((item) => `${channelLabel(item.channel)}: ${item.error}`).join("; ")}`
+    : undefined;
   const restrictedChannels = prefsByChannel.filter((item) => item.restricted === true);
   const shortRetention = retentionByChannel.filter((item) => item.is_policy_enabled === true && item.duration_days !== undefined && item.duration_days < minRetentionDays);
   const inheritingDefault = retentionByChannel.filter((item) => item.is_policy_enabled !== true);
@@ -2020,32 +2106,38 @@ export async function assessSlackChannelGovernance(
       ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", `admin.conversations.search is not readable: ${unreadableReason(channelsResult)}.`, "capture posting permissions for #general and org default channels.")
       : channels.length === 0
         ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", `admin.conversations.search returned no active channels (${channelsView}).`, "capture posting permissions for #general and org default channels.")
-        : announcementPrefs.length === 0
-          ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", prefsErrors.length > 0 && prefsByChannel.length === 0 ? `admin.conversations.getConversationPrefs is not readable: ${prefsErrors[0]}.` : `No general, org default, or org mandatory channel was in the ${channels.length} sampled channels (${channelsView}).`, "capture posting permissions for #general and org default channels.", { restricted_channels_seen: restrictedChannels.length })
-          : finding(
-            "SLACK-CHAN-02",
-            "Channel posting restrictions",
-            18,
-            "medium",
-            unrestrictedAnnouncements.length > 0 ? "fail" : unknownAnnouncements.length > 0 || prefsErrors.length > 0 || !channelsComplete ? "warn" : "pass",
-            unrestrictedAnnouncements.length > 0
-              ? `${unrestrictedAnnouncements.length}/${announcementPrefs.length} general or org default channels allow anyone to post (prefs.who_can_post).`
-              : unknownAnnouncements.length > 0 || prefsErrors.length > 0
-                ? `Restricted posting is set on every readable general or org default channel, but ${unknownAnnouncements.length} lacked a who_can_post value and ${prefsErrors.length} channels were unreadable (${channelsView}).`
-                : !channelsComplete
-                  ? `All ${announcementPrefs.length} seen general or org default channels restrict posting to admins or owners, but the channel search is partial (${channelsView}); unseen org default channels were not checked.`
-                  : `All ${announcementPrefs.length} general or org default channels restrict posting to admins or owners; ${restrictedChannels.length}/${prefsByChannel.length} sampled channels restrict posting overall (${channelsView}).`,
-            {
-              announcement_channels: announcementPrefs.map((item) => ({ id: item.channel.id, name: item.channel.name, restricted: item.restricted ?? null })),
-              restricted_channels: restrictedChannels.slice(0, 20).map((item) => item.channel.name),
-              unreadable_channels: prefsErrors.length,
-              channels_complete: channelsComplete,
-            },
-          ),
+        : announcementChannels.length === 0
+          ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", `No general, org default, or org mandatory channel was in the ${channels.length} sampled channels (${channelsView})${prefsGap ? `; ${prefsGap}` : ""}.`, "capture posting permissions for #general and org default channels.", { announcement_channels: [], restricted_channels_seen: prefsByChannel.length > 0 ? restrictedChannels.length : null, unreadable_channels: prefsErrors.length, unreadable_channel_details: prefsErrors })
+          : announcementPrefs.length === 0
+            ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", `admin.conversations.getConversationPrefs is not readable for ${unreadableAnnouncements.length === 1 ? "the announcement channel" : `any of the ${unreadableAnnouncements.length} announcement channels`} ${unreadableAnnouncements.map((item) => `${channelLabel(item.channel)}: ${item.error}`).join("; ")} (${channelsView}).`, "capture posting permissions for #general and org default channels.", { announcement_channels: unreadableAnnouncements.map((item) => ({ id: item.channel.id, name: item.channel.name, restricted: null, status: `unreadable: admin.conversations.getConversationPrefs ${item.error}` })), restricted_channels_seen: prefsByChannel.length > 0 ? restrictedChannels.length : null, unreadable_channels: prefsErrors.length, unreadable_channel_details: prefsErrors })
+            : finding(
+              "SLACK-CHAN-02",
+              "Channel posting restrictions",
+              18,
+              "medium",
+              unrestrictedAnnouncements.length > 0 ? "fail" : unknownAnnouncements.length > 0 || prefsErrors.length > 0 || !channelsComplete ? "warn" : "pass",
+              unrestrictedAnnouncements.length > 0
+                ? `${unrestrictedAnnouncements.length}/${announcementChannels.length} general or org default channels allow anyone to post (prefs.who_can_post)${prefsGap ? `; ${prefsGap}` : ""}.`
+                : unknownAnnouncements.length > 0 || prefsErrors.length > 0
+                  ? `Restricted posting is set on every readable general or org default channel (${announcementPrefs.length}/${announcementChannels.length} readable), but ${unknownAnnouncements.length} lacked a who_can_post value and ${prefsGap ?? "no channel was unreadable"} (${channelsView}).`
+                  : !channelsComplete
+                    ? `All ${announcementPrefs.length} seen general or org default channels restrict posting to admins or owners, but the channel search is partial (${channelsView}); unseen org default channels were not checked.`
+                    : `All ${announcementPrefs.length} general or org default channels restrict posting to admins or owners; ${restrictedChannels.length}/${prefsByChannel.length} sampled channels restrict posting overall (${channelsView}).`,
+              {
+                announcement_channels: [
+                  ...announcementPrefs.map((item) => ({ id: item.channel.id, name: item.channel.name, restricted: item.restricted ?? null, status: item.restricted === undefined ? "read: no who_can_post value" : "read" })),
+                  ...unreadableAnnouncements.map((item) => ({ id: item.channel.id, name: item.channel.name, restricted: null, status: `unreadable: admin.conversations.getConversationPrefs ${item.error}` })),
+                ],
+                restricted_channels: restrictedChannels.slice(0, 20).map((item) => item.channel.name),
+                unreadable_channels: prefsErrors.length,
+                unreadable_channel_details: prefsErrors,
+                channels_complete: channelsComplete,
+              },
+            ),
     !channelsResult.ok
       ? manualFinding("SLACK-CHAN-03", "Channel retention overrides", 12, "medium", `admin.conversations.search is not readable: ${unreadableReason(channelsResult)}.`, "capture the workspace retention defaults and channel overrides from the admin dashboard.")
       : retentionByChannel.length === 0
-        ? manualFinding("SLACK-CHAN-03", "Channel retention overrides", 12, "medium", channels.length === 0 ? `admin.conversations.search returned no active channels (${channelsView}).` : `admin.conversations.getCustomRetention is not readable: ${retentionErrors[0] ?? "unknown"}.`, "capture the workspace retention defaults and channel overrides from the admin dashboard.")
+        ? manualFinding("SLACK-CHAN-03", "Channel retention overrides", 12, "medium", channels.length === 0 ? `admin.conversations.search returned no active channels (${channelsView}).` : `${retentionGap ?? "admin.conversations.getCustomRetention is not readable"} (${channelsView}).`, "capture the workspace retention defaults and channel overrides from the admin dashboard.", { short_retention_channels: null, short_retention_status: `unknown: ${retentionGap ?? "admin.conversations.getCustomRetention unreadable"}`, unreadable_channels: retentionErrors.length, unreadable_channel_details: retentionErrors })
         : finding(
           "SLACK-CHAN-03",
           "Channel retention overrides",
@@ -2053,15 +2145,16 @@ export async function assessSlackChannelGovernance(
           "medium",
           shortRetention.length > 0 ? "fail" : retentionErrors.length > 0 || !channelsComplete ? "warn" : "pass",
           shortRetention.length > 0
-            ? `${shortRetention.length}/${retentionByChannel.length} sampled channels override retention below ${minRetentionDays} days (is_policy_enabled with duration_days).`
+            ? `${shortRetention.length}/${retentionByChannel.length} sampled channels override retention below ${minRetentionDays} days (is_policy_enabled with duration_days)${retentionGap ? `; ${retentionGap}` : ""}.`
             : retentionErrors.length > 0 || !channelsComplete
-              ? `No sampled channel overrides retention below ${minRetentionDays} days, but ${retentionErrors.length} channels were unreadable and the channel view is ${channelsComplete ? "complete" : "partial"} (${channelsView}).`
+              ? `No readable channel overrides retention below ${minRetentionDays} days, but ${retentionGap ?? "no channel was unreadable"}${channelsComplete ? ` (channels: ${channelsView})` : `; the channel view is partial (${channelsView})`}.`
               : `No channel overrides retention below ${minRetentionDays} days across ${retentionByChannel.length} channels; ${inheritingDefault.length} inherit the workspace default, which the API does not expose and must be confirmed in the admin dashboard.`,
           {
             min_retention_days: minRetentionDays,
             short_retention_channels: shortRetention.slice(0, 20).map((item) => ({ id: item.channel.id, name: item.channel.name, duration_days: item.duration_days })),
             inheriting_default: inheritingDefault.length,
             unreadable_channels: retentionErrors.length,
+            unreadable_channel_details: retentionErrors,
           },
         ),
     manualFinding(
@@ -2087,12 +2180,16 @@ export async function assessSlackChannelGovernance(
   return {
     title: "Slack channel governance posture",
     summary: {
-      channels_seen: channels.length,
+      channels_seen: inventoryCount(channelsResult, channels.length),
+      channels_status: inventoryStatus(channelsResult, "admin.conversations.search"),
       channels_total: channelsResult.ok ? channelsResult.total ?? null : null,
       channels_complete: channelsComplete,
-      external_channels: externalChannels.length,
-      restricted_posting_channels: restrictedChannels.length,
-      short_retention_channels: shortRetention.length,
+      external_channels: inventoryCount(externalResult, externalChannels.length),
+      external_channels_status: inventoryStatus(externalResult, "admin.conversations.search (external_shared)"),
+      restricted_posting_channels: channelsResult.ok && (prefsByChannel.length > 0 || prefsErrors.length === 0) ? restrictedChannels.length : null,
+      posting_prefs_status: !channelsResult.ok ? "unreadable: admin.conversations.search" : prefsGap ? `partial: ${prefsGap}` : "complete: admin.conversations.getConversationPrefs",
+      short_retention_channels: channelsResult.ok && (retentionByChannel.length > 0 || retentionErrors.length === 0) ? shortRetention.length : null,
+      retention_status: !channelsResult.ok ? "unreadable: admin.conversations.search" : retentionGap ? `partial: ${retentionGap}` : "complete: admin.conversations.getCustomRetention",
     },
     findings,
     errors,
@@ -2220,11 +2317,12 @@ export async function assessSlackMonitoring(
     title: "Slack monitoring posture",
     summary: {
       days,
-      audit_entries: entries.length,
+      audit_entries: inventoryCount(logsResult, entries.length),
+      audit_status: inventoryStatus(logsResult, "Audit Logs /logs"),
       audit_window_complete: logsResult.ok ? logsResult.complete : false,
       latest_event_age_days: latestAge ?? null,
-      security_events: visibleSecurityEvents.length,
-      external_sharing_events: visibleExternalEvents.length,
+      security_events: inventoryCount(logsResult, visibleSecurityEvents.length),
+      external_sharing_events: inventoryCount(logsResult, visibleExternalEvents.length),
       schemas_readable: schemasResult.ok,
     },
     findings,

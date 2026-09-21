@@ -905,7 +905,8 @@ test("rule 10: every pagination loop reports truncation on its cap exit and depe
     ? { ...compliantFixture(request), response_metadata: { next_cursor: "more" } }
     : undefined), { userLimit: 2 });
   assert.equal(byId(emojiUsersPartial, "SLACK-ADMIN-08").status, "warn");
-  assert.match(byId(emojiUsersPartial, "SLACK-ADMIN-08").summary, /but the user inventory is partial \(emoji: 1 seen \(complete\); users: 2 seen of unknown total \(partial view, item limit reached\)\)/);
+  assert.match(byId(emojiUsersPartial, "SLACK-ADMIN-08").summary, /checked against an incomplete admin roster \(admin\.users\.list partial \(2 seen of unknown total \(partial view, item limit reached\)\)\)/);
+  assert.equal(byId(emojiUsersPartial, "SLACK-ADMIN-08").evidence.non_admin_uploads, null);
 
   const appCap = await assessSlackIntegrations(withOverride((request) => method(request) === "admin.apps.approved.list"
     ? { ...compliantFixture(request), approved_apps: [...compliantFixture(request).approved_apps, { app: { id: "A3", name: "Second", is_app_directory_approved: true, is_internal: false, developer_type: "third_party" }, scopes: [] }], response_metadata: { next_cursor: "" } }
@@ -934,6 +935,244 @@ test("rule 10: every pagination loop reports truncation on its cap exit and depe
   }
   assert.match(byId(auditCap, "SLACK-MON-01").summary, /truncated at audit_limit=3/);
   assert.equal(byId(auditCap, "SLACK-MON-01").evidence.window_complete, false);
+});
+
+const methodOf = (request) => request.pathname.replace(/^\/api\//, "");
+const webDenied = () => jsonResponse({ ok: false, error: "missing_scope" });
+const httpForbidden = () => jsonResponse({ ok: false, error: "not_allowed_token_type" }, 403);
+
+/** Two-workspace profile: T1 (Core) with admin W1 and T2 (Labs) with the workspace-only admin W4; "multi" adds an emoji uploaded by W4. */
+const multiWorkspaceFixture = (variant) => (request) => {
+  const method = methodOf(request);
+  const base = compliantFixture(request);
+  switch (method) {
+    case "admin.teams.list":
+      return { ok: true, teams: [...base.teams, { id: "T2", name: "Labs", discoverability: "invite_only", primary_owner: { user_id: "W4", email: "dana@example.com" }, team_url: "https://labs.slack.com/" }], response_metadata: { next_cursor: "" } };
+    case "admin.teams.admins.list":
+      return { ok: true, admin_ids: request.params.get("team_id") === "T2" ? ["W4"] : ["W1"], response_metadata: { next_cursor: "" } };
+    case "admin.teams.settings.info":
+      return request.params.get("team_id") === "T2"
+        ? { ok: true, team: { id: "T2", name: "Labs", domain: "labs", email_domain: "example.com", icon: {}, enterprise_id: "E1", enterprise_name: "Acme", default_channels: ["C1"] } }
+        : base;
+    case "admin.users.list":
+      return { ...base, users: [...base.users, { id: "W4", email: "dana@example.com", is_admin: false, is_owner: false, is_primary_owner: false, is_restricted: false, is_ultra_restricted: false, is_bot: false, username: "dana", full_name: "Dana", is_active: true, date_created: 1566922090, deactivated_ts: 0, expiration_ts: 0, workspaces: ["T2"], has_2fa: true, has_sso: true }] };
+    case "admin.emoji.list":
+      return variant === "multi"
+        ? { ok: true, emoji: { ...base.emoji, rocket: { url: "https://emoji.slack-edge.com/T2/rocket/1.png", date_created: 1591720632, uploaded_by: "W4" } }, response_metadata: { next_cursor: "" } }
+        : base;
+    default:
+      return base;
+  }
+};
+
+const denyOn = (baseFixture, predicate, response = webDenied) => makeClient((request) => (predicate(request) ? response() : baseFixture(request)));
+
+async function assessAll(client) {
+  const results = [
+    await assessSlackIdentity(client),
+    await assessSlackAdminAccess(client),
+    await assessSlackIntegrations(client),
+    await assessSlackChannelGovernance(client),
+    await assessSlackMonitoring(client),
+  ];
+  return { findings: results.flatMap((result) => result.findings), errors: results.flatMap((result) => result.errors) };
+}
+
+function passingIds(result) {
+  return new Set(result.findings.filter((item) => item.status === "pass").map((item) => item.id));
+}
+
+test("corollary hit 1: SLACK-APP-06 demotes below pass when auth.test is unreadable", async () => {
+  for (const [label, response] of [["ok:false missing_scope", webDenied], ["HTTP 403", httpForbidden]]) {
+    const result = await assessSlackIntegrations(denyOn(compliantFixture, (request) => request.pathname === "/api/auth.test", response));
+    const finding = byId(result, "SLACK-APP-06");
+    assert.equal(finding.status, "warn", label);
+    assert.match(finding.summary, /disable_file_uploads=type:owner,type:admin: uploads are restricted to owners and admins in the token's workspace \(id unknown\); auth\.test was not readable \(.*\), so the workspace the preference applies to could not be identified/, label);
+    assert.doesNotMatch(finding.summary, /workspace unknown/, label);
+    assert.equal(finding.evidence.workspace_id, null, label);
+    assert.match(finding.evidence.workspace_id_status, /^unreadable: auth\.test /, label);
+    assert.ok(result.errors.some((item) => item.startsWith("auth.test: ")), `${label}: errors array names auth.test`);
+  }
+  const readable = byId(await assessSlackIntegrations(makeClient(compliantFixture)), "SLACK-APP-06");
+  assert.equal(readable.status, "pass");
+  assert.equal(readable.evidence.workspace_id, "T1");
+  assert.equal(readable.evidence.workspace_id_status, "read from auth.test team_id");
+});
+
+test("corollary hit 2: SLACK-ADMIN-08 never passes or fails on an incomplete workspace admin roster", async () => {
+  const adminsList = (request) => methodOf(request) === "admin.teams.admins.list";
+  const adminsListForT2 = (request) => adminsList(request) && request.params.get("team_id") === "T2";
+
+  const cleanBaseline = await assessSlackAdminAccess(makeClient(multiWorkspaceFixture("multi-clean")));
+  assert.equal(byId(cleanBaseline, "SLACK-ADMIN-08").status, "pass");
+  assert.equal(byId(cleanBaseline, "SLACK-ADMIN-01").status, "pass");
+  const uploadBaseline = byId(await assessSlackAdminAccess(makeClient(multiWorkspaceFixture("multi"))), "SLACK-ADMIN-08");
+  assert.equal(uploadBaseline.status, "pass", "W4 is in the readable T2 admin roster, so the rocket upload is an admin upload");
+  assert.deepEqual(uploadBaseline.evidence.non_admin_uploads, []);
+  assert.equal(uploadBaseline.evidence.roster_complete, true);
+
+  for (const [label, response] of [["ok:false missing_scope", webDenied], ["HTTP 403", httpForbidden]]) {
+    const everyWorkspace = byId(await assessSlackAdminAccess(denyOn(compliantFixture, adminsList, response)), "SLACK-ADMIN-08");
+    assert.equal(everyWorkspace.status, "manual", label);
+    assert.match(everyWorkspace.summary, /^admin\.teams\.admins\.list unreadable for T1 \(Core\): .+, so the 1 custom emoji uploaders could not be compared with a workspace admin roster/, label);
+    assert.equal(everyWorkspace.evidence.non_admin_uploads, null, label);
+    assert.match(everyWorkspace.evidence.non_admin_uploads_status, /^unknown: admin\.teams\.admins\.list unreadable for T1/, label);
+    assert.equal(everyWorkspace.evidence.unreadable_workspaces.length, 1, label);
+    assert.match(everyWorkspace.evidence.unreadable_workspaces[0], /^T1: /, label);
+    assert.equal(everyWorkspace.evidence.roster_complete, false, label);
+
+    const oneWorkspace = await assessSlackAdminAccess(denyOn(multiWorkspaceFixture("multi-clean"), adminsListForT2, response));
+    const clean = byId(oneWorkspace, "SLACK-ADMIN-08");
+    assert.equal(clean.status, "warn", label);
+    assert.match(clean.summary, /checked against an incomplete admin roster \(admin\.teams\.admins\.list unreadable for T2 \(Labs\): .+\); 0 uploads are by users outside the readable roster/, label);
+    assert.equal(clean.evidence.non_admin_uploads, null, label);
+    assert.match(clean.evidence.non_admin_uploads_status, /^unknown: admin roster incomplete \(admin\.teams\.admins\.list unreadable for T2 \(Labs\)/, label);
+    assert.deepEqual(clean.evidence.unreadable_workspaces.map((item) => item.split(":")[0]), ["T2"], label);
+    assert.equal(clean.evidence.roster_complete, false, label);
+    const adminInventory = byId(oneWorkspace, "SLACK-ADMIN-01");
+    assert.equal(adminInventory.status, "warn", label);
+    assert.match(adminInventory.summary, /admin\.teams\.admins\.list unreadable for T2 \(Labs\): /, label);
+    const deniedCount = adminInventory.evidence.admin_counts.find((item) => item.id === "T2");
+    assert.equal(deniedCount.count, null, label);
+    assert.equal(deniedCount.complete, false, label);
+    assert.match(deniedCount.status, /^unreadable: admin\.teams\.admins\.list /, label);
+    assert.equal(adminInventory.evidence.admin_counts.find((item) => item.id === "T1").count, 1, label);
+
+    const falseFail = byId(await assessSlackAdminAccess(denyOn(multiWorkspaceFixture("multi"), adminsListForT2, response)), "SLACK-ADMIN-08");
+    assert.equal(falseFail.status, "warn", `${label}: W4's upload is not classified as non-admin while T2's roster is unreadable`);
+    assert.match(falseFail.summary, /admin\.teams\.admins\.list unreadable for T2 \(Labs\)/, label);
+    assert.match(falseFail.summary, /1 uploads are by users outside the readable roster and were not classified as non-admin/, label);
+    assert.equal(falseFail.evidence.non_admin_uploads, null, label);
+    assert.equal(falseFail.evidence.uploads_outside_readable_roster, 1, label);
+  }
+});
+
+test("corollary wording: partial denials name the endpoint and the workspace or channel id", async () => {
+  const settingsForT2 = byId(await assessSlackAdminAccess(denyOn(multiWorkspaceFixture("multi-clean"), (request) => methodOf(request) === "admin.teams.settings.info" && request.params.get("team_id") === "T2")), "SLACK-ADMIN-07");
+  assert.equal(settingsForT2.status, "warn");
+  assert.match(settingsForT2.summary, /admin\.teams\.settings\.info unreadable or lacking team\.email_domain for T2: /);
+  assert.deepEqual(settingsForT2.evidence.unreadable_workspaces.map((item) => item.split(":")[0]), ["T2"]);
+
+  const usersDenied = byId(await assessSlackAdminAccess(denyOn(compliantFixture, (request) => methodOf(request) === "admin.users.list")), "SLACK-ADMIN-08");
+  assert.notEqual(usersDenied.status, "pass");
+  assert.match(usersDenied.summary, /admin\.users\.list unreadable \(.+\)/);
+  assert.equal(usersDenied.evidence.non_admin_uploads, null);
+
+  const prefsFor = (channelId) => (request) => methodOf(request) === "admin.conversations.getConversationPrefs" && (channelId === undefined || request.params.get("channel_id") === channelId);
+  const generalDenied = byId(await assessSlackChannelGovernance(denyOn(compliantFixture, prefsFor("C1"))), "SLACK-CHAN-02");
+  assert.equal(generalDenied.status, "manual");
+  assert.match(generalDenied.summary, /^admin\.conversations\.getConversationPrefs is not readable for the announcement channel C1 \(#general\): /);
+  assert.doesNotMatch(generalDenied.summary, /No general, org default/);
+  assert.deepEqual(generalDenied.evidence.announcement_channels.map((item) => [item.id, item.restricted]), [["C1", null]]);
+  assert.match(generalDenied.evidence.announcement_channels[0].status, /^unreadable: admin\.conversations\.getConversationPrefs /);
+
+  const engDenied = byId(await assessSlackChannelGovernance(denyOn(compliantFixture, prefsFor("C2"))), "SLACK-CHAN-02");
+  assert.equal(engDenied.status, "warn");
+  assert.match(engDenied.summary, /Restricted posting is set on every readable general or org default channel \(1\/1 readable\), but 0 lacked a who_can_post value and admin\.conversations\.getConversationPrefs unreadable for C2 \(#eng\): /);
+  assert.deepEqual(engDenied.evidence.unreadable_channel_details.map((item) => item.split(":")[0]), ["C2"]);
+
+  const allPrefsDenied = byId(await assessSlackChannelGovernance(denyOn(compliantFixture, prefsFor(undefined))), "SLACK-CHAN-02");
+  assert.equal(allPrefsDenied.status, "manual");
+  assert.match(allPrefsDenied.summary, /getConversationPrefs is not readable for the announcement channel C1 \(#general\)/);
+  assert.equal(allPrefsDenied.evidence.restricted_channels_seen, null);
+
+  const retentionFor = (channelId) => (request) => methodOf(request) === "admin.conversations.getCustomRetention" && (channelId === undefined || request.params.get("channel_id") === channelId);
+  const retentionEng = byId(await assessSlackChannelGovernance(denyOn(compliantFixture, retentionFor("C2"))), "SLACK-CHAN-03");
+  assert.equal(retentionEng.status, "warn");
+  assert.match(retentionEng.summary, /No readable channel overrides retention below 365 days, but admin\.conversations\.getCustomRetention unreadable for C2 \(#eng\): .+ \(channels: 2 seen \(complete\)\)\.$/);
+  assert.deepEqual(retentionEng.evidence.unreadable_channel_details.map((item) => item.split(":")[0]), ["C2"]);
+
+  const retentionAll = byId(await assessSlackChannelGovernance(denyOn(compliantFixture, retentionFor(undefined))), "SLACK-CHAN-03");
+  assert.equal(retentionAll.status, "manual");
+  assert.match(retentionAll.summary, /^admin\.conversations\.getCustomRetention unreadable for C1 \(#general\): .+; C2 \(#eng\): /);
+  assert.equal(retentionAll.evidence.short_retention_channels, null);
+  assert.match(retentionAll.evidence.short_retention_status, /^unknown: admin\.conversations\.getCustomRetention unreadable for C1/);
+});
+
+/** Mirrors the reviewer's per-inventory sweep: exactly the dependent findings leave pass and every other baseline pass stays. */
+test("corollary sweep: denying one inventory demotes exactly its dependent findings", async () => {
+  const single = compliantFixture;
+  const multiClean = multiWorkspaceFixture("multi-clean");
+  const multi = multiWorkspaceFixture("multi");
+  const web = (name) => (request) => methodOf(request) === name;
+  const forTeam = (name, teamId) => (request) => methodOf(request) === name && request.params.get("team_id") === teamId;
+  const forChannel = (name, channelId) => (request) => methodOf(request) === name && request.params.get("channel_id") === channelId;
+  const rows = [
+    ["auth.test", single, web("auth.test"), webDenied, ["SLACK-APP-06"]],
+    ["users.list", single, web("users.list"), webDenied, ["SLACK-ID-01", "SLACK-ID-02", "SLACK-ID-04", "SLACK-ID-05"]],
+    ["SCIM /ServiceProviderConfig (403)", single, (request) => request.pathname === "/scim/v2/ServiceProviderConfig", httpForbidden, ["SLACK-ID-03", "SLACK-ID-04"]],
+    ["SCIM /Users (403)", single, (request) => request.pathname === "/scim/v2/Users", httpForbidden, ["SLACK-ID-03", "SLACK-ID-04"]],
+    ["admin.teams.list", single, web("admin.teams.list"), webDenied, ["SLACK-ADMIN-01", "SLACK-ADMIN-05", "SLACK-ADMIN-07", "SLACK-ADMIN-08", "SLACK-APP-06"]],
+    ["admin.teams.admins.list (every workspace)", single, web("admin.teams.admins.list"), webDenied, ["SLACK-ADMIN-01", "SLACK-ADMIN-08"]],
+    ["admin.teams.admins.list for T2 only (multi-clean)", multiClean, forTeam("admin.teams.admins.list", "T2"), webDenied, ["SLACK-ADMIN-01", "SLACK-ADMIN-08"]],
+    ["admin.teams.admins.list for T2 only (multi, W4 uploaded an emoji)", multi, forTeam("admin.teams.admins.list", "T2"), webDenied, ["SLACK-ADMIN-01", "SLACK-ADMIN-08"]],
+    ["admin.teams.settings.info (every workspace)", single, web("admin.teams.settings.info"), webDenied, ["SLACK-ADMIN-07"]],
+    ["admin.teams.settings.info for T2 only", multiClean, forTeam("admin.teams.settings.info", "T2"), webDenied, ["SLACK-ADMIN-07"]],
+    ["admin.users.list", single, web("admin.users.list"), webDenied, ["SLACK-ADMIN-02", "SLACK-ADMIN-03", "SLACK-ADMIN-08"]],
+    ["admin.users.session.getSettings", single, web("admin.users.session.getSettings"), webDenied, ["SLACK-ADMIN-03"]],
+    ["admin.emoji.list", single, web("admin.emoji.list"), webDenied, ["SLACK-ADMIN-08"]],
+    ["admin.analytics.getFile", single, web("admin.analytics.getFile"), webDenied, []],
+    ["admin.apps.approved.list", single, web("admin.apps.approved.list"), webDenied, ["SLACK-APP-01", "SLACK-APP-03"]],
+    ["admin.apps.restricted.list", single, web("admin.apps.restricted.list"), webDenied, ["SLACK-APP-02"]],
+    ["admin.barriers.list", single, web("admin.barriers.list"), webDenied, ["SLACK-APP-04"]],
+    ["team.preferences.list", single, web("team.preferences.list"), webDenied, ["SLACK-APP-06"]],
+    ["admin.conversations.search (both calls)", single, web("admin.conversations.search"), webDenied, ["SLACK-CHAN-01", "SLACK-CHAN-02", "SLACK-CHAN-03"]],
+    ["admin.conversations.search external_shared only", single, (request) => web("admin.conversations.search")(request) && request.params.get("search_channel_types") === "external_shared", webDenied, ["SLACK-CHAN-01"]],
+    ["admin.conversations.search exclude_archived only", single, (request) => web("admin.conversations.search")(request) && request.params.get("search_channel_types") === "exclude_archived", webDenied, ["SLACK-CHAN-02", "SLACK-CHAN-03"]],
+    ["admin.conversations.getConversationPrefs (every channel)", single, web("admin.conversations.getConversationPrefs"), webDenied, ["SLACK-CHAN-02"]],
+    ["getConversationPrefs for C1 (#general) only", single, forChannel("admin.conversations.getConversationPrefs", "C1"), webDenied, ["SLACK-CHAN-02"]],
+    ["getConversationPrefs for C2 only", single, forChannel("admin.conversations.getConversationPrefs", "C2"), webDenied, ["SLACK-CHAN-02"]],
+    ["admin.conversations.getCustomRetention (every channel)", single, web("admin.conversations.getCustomRetention"), webDenied, ["SLACK-CHAN-03"]],
+    ["getCustomRetention for C2 only", single, forChannel("admin.conversations.getCustomRetention", "C2"), webDenied, ["SLACK-CHAN-03"]],
+    ["Audit Logs /logs (403)", single, (request) => request.pathname === "/audit/v1/logs", httpForbidden, ["SLACK-MON-01", "SLACK-MON-02", "SLACK-MON-03", "SLACK-MON-05"]],
+    ["Audit Logs /schemas (403)", single, (request) => request.pathname === "/audit/v1/schemas", httpForbidden, ["SLACK-MON-04"]],
+  ];
+
+  const baselines = new Map();
+  for (const fixture of [single, multiClean, multi]) {
+    const baseline = await assessAll(makeClient(fixture));
+    assert.deepEqual(baseline.errors, [], "baseline collects without errors");
+    baselines.set(fixture, passingIds(baseline));
+  }
+  assert.equal(baselines.get(single).size, 24, "single-workspace baseline passes every automatable finding");
+  assert.equal(baselines.get(multiClean).size, 23, "the two-workspace baseline downgrades SLACK-APP-06 to warn because team.preferences.list reads one workspace");
+
+  const table = [];
+  for (const [label, fixture, predicate, response, expected] of rows) {
+    const baseline = baselines.get(fixture);
+    for (const id of expected) assert.ok(baseline.has(id), `${label}: ${id} passes at baseline`);
+    const denied = await assessAll(denyOn(fixture, predicate, response));
+    const statusById = Object.fromEntries(denied.findings.map((item) => [item.id, item.status]));
+    const demoted = [...baseline].filter((id) => statusById[id] !== "pass").sort();
+    assert.deepEqual(demoted, [...expected].sort(), `${label}: exactly the dependent findings leave pass`);
+    for (const id of demoted) {
+      const finding = denied.findings.find((item) => item.id === id);
+      assert.ok(finding.evidence === undefined || !Object.values(finding.evidence).some((value) => value === "unknown"), `${label}: ${id} carries no "unknown" placeholder`);
+    }
+    if (expected.length > 0) assert.ok(denied.errors.length > 0, `${label}: the denial is disclosed in the errors array`);
+    table.push({ label, demoted: demoted.map((id) => `${id}=${statusById[id]}`) });
+  }
+  const falseFailRow = table.find((row) => row.label.startsWith("admin.teams.admins.list for T2 only (multi,"));
+  assert.ok(falseFailRow.demoted.includes("SLACK-ADMIN-08=warn"), "an upload by the denied workspace's admin reads as warn, never fail");
+});
+
+test("corollary bundle check: findings.json never carries SLACK-ADMIN-08 as pass when admin.teams.admins.list is denied", async () => {
+  const base = createTempBase("grclanker-slack-corollary-");
+  const client = denyOn(compliantFixture, (request) => methodOf(request) === "admin.teams.admins.list");
+  const config = resolveSlackConfiguration({ token: "xoxp-test", scim_token: "scim-test", org_id: "E1" }, EMPTY_ENV);
+  const bundle = await exportSlackAuditBundle(client, config, base);
+  assert.ok(bundle.errorCount > 0);
+  const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
+  assert.match(errorsLog, /\[admin-access\] admin\.teams\.admins\.list T1: /);
+  const findings = JSON.parse(readFileSync(join(bundle.outputDir, "analysis/findings.json"), "utf8"));
+  const emoji = findings.find((item) => item.id === "SLACK-ADMIN-08");
+  assert.equal(emoji.status, "manual");
+  assert.match(emoji.summary, /admin\.teams\.admins\.list unreadable for T1 \(Core\)/);
+  assert.equal(emoji.evidence.non_admin_uploads, null);
+  assert.notEqual(findings.find((item) => item.id === "SLACK-ADMIN-01").status, "pass");
+  const adminAccess = JSON.parse(readFileSync(join(bundle.outputDir, "core_data/admin-access.json"), "utf8"));
+  assert.equal(adminAccess.summary.admin_lists_unreadable, 1);
+  assert.equal(adminAccess.summary.admin_lists_readable, 0);
 });
 
 test("SLACK_METHODS documents every Web API method the tools call", () => {
