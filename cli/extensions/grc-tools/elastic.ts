@@ -1115,7 +1115,10 @@ export class ElasticApiClient {
   }
 
   async listFleetServerHosts(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
-    return this.listKibanaPages("/api/fleet/fleet_server_hosts", { perPageParam: "perPage", itemsKey: "items", limit });
+    const cap = clampNumber(limit, DEFAULT_KIBANA_LIMIT, 1, 10_000);
+    const payload = asObject(await this.kibanaGet("/api/fleet/fleet_server_hosts")) ?? {};
+    const hosts = asObjectArray(payload.items);
+    return pagedList(hosts.slice(0, cap), asNumber(payload.total) ?? hosts.length, 1, hosts.length <= cap);
   }
 
   async listDetectionRules(limit = DEFAULT_KIBANA_LIMIT): Promise<ElasticPagedList> {
@@ -1971,20 +1974,32 @@ function roleIndexEntries(roles: JsonRecord): RoleIndexEntry[] {
   return entries;
 }
 
+interface RoleFeatureUsage {
+  native: boolean | undefined;
+  file: boolean | undefined;
+}
+
+function roleFeatureUsage(usage: JsonRecord | undefined, feature: "fls" | "dls"): RoleFeatureUsage {
+  return {
+    native: asBoolean(getNestedValue(usage, ["security", "roles", "native", feature])),
+    file: asBoolean(getNestedValue(usage, ["security", "roles", "file", feature])),
+  };
+}
+
 function evaluateIndexRestriction(
   number: number,
   label: string,
   restricted: RoleIndexEntry[],
   patterns: string[],
   license: ReturnType<typeof licenseState>,
-  usageCount: number | undefined,
+  usageInUse: RoleFeatureUsage,
   problems: string[],
 ): ElasticFinding {
   const supported = licenseSupports(license, LICENSE_RANK.platinum);
   const restrictedRoles = [...new Set(restricted.map((entry) => entry.role))];
   const evidence: JsonRecord = {
     roles_with_restriction: restricted.slice(0, 50).map((entry) => ({ role: entry.role, indices: entry.names })),
-    usage_count: usageCount ?? null,
+    usage_reports_in_use: { native_roles: usageInUse.native ?? null, file_roles: usageInUse.file ?? null },
     license_type: license.type ?? null,
     license_status: license.status ?? null,
     license_supports_feature: supported ?? null,
@@ -2106,7 +2121,7 @@ export function evaluateElasticAccessControl(
     indexEntries.filter((entry) => entry.fieldSecurity && Object.keys(entry.fieldSecurity).length > 0),
     options.sensitiveIndexPatterns ?? [],
     license,
-    asNumber(getNestedValue(usage, ["security", "roles", "native", "fls"])),
+    roleFeatureUsage(usage, "fls"),
     flsProblems,
   ));
   findings.push(evaluateIndexRestriction(
@@ -2115,7 +2130,7 @@ export function evaluateElasticAccessControl(
     indexEntries.filter((entry) => entry.query !== undefined && entry.query !== null && entry.query !== ""),
     options.tenantIndexPatterns ?? [],
     license,
-    asNumber(getNestedValue(usage, ["security", "roles", "native", "dls"])),
+    roleFeatureUsage(usage, "dls"),
     flsProblems,
   ));
 

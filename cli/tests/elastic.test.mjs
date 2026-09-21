@@ -132,7 +132,7 @@ function healthyFixtures(now = Date.now()) {
           file: { enabled: true, available: true, size: 0 },
           saml: { enabled: true, available: true, size: 1 },
         },
-        roles: { native: { size: 4, fls: 1, dls: 1 }, file: { size: 0, fls: 0, dls: 0 } },
+        roles: { native: { size: 4, fls: true, dls: true }, file: { size: 0, fls: false, dls: false } },
         ssl: { http: { enabled: true }, transport: { enabled: true } },
         audit: { enabled: true, outputs: ["logfile"] },
         ipfilter: { http: false, transport: false },
@@ -704,10 +704,10 @@ test("verdict rule 7: pagination runs to completion and a missing total still re
       const body = JSON.parse(init.body);
       return { watches: watches.slice(body.from, body.from + body.size) };
     },
-    "GET /api/fleet/fleet_server_hosts": (url) => {
+    "GET /api/fleet/agent_policies": (url) => {
       const page = Number(url.searchParams.get("page"));
       const perPage = Number(url.searchParams.get("perPage"));
-      const items = Array.from({ length: 250 }, (_, index) => ({ id: `h${index + 1}` }));
+      const items = Array.from({ length: 250 }, (_, index) => ({ id: `p${index + 1}` }));
       return { items: items.slice((page - 1) * perPage, page * perPage), page, perPage };
     },
   });
@@ -719,8 +719,8 @@ test("verdict rule 7: pagination runs to completion and a missing total still re
   const capped = await client.listWatches(200);
   assert.deepEqual({ seen: capped.seen, pages: capped.pages, truncated: capped.truncated }, { seen: 200, pages: 2, truncated: true });
 
-  const hosts = await client.listFleetServerHosts(100);
-  assert.deepEqual({ seen: hosts.seen, pages: hosts.pages, truncated: hosts.truncated }, { seen: 100, pages: 1, truncated: true });
+  const policies = await client.listAgentPolicies(100);
+  assert.deepEqual({ seen: policies.seen, pages: policies.pages, truncated: policies.truncated }, { seen: 100, pages: 1, truncated: true });
 
   const snapshot = await collectElasticSnapshot(client, ["watches"], { watchLimit: 200 });
   assert.deepEqual(snapshot.watches.page, { seen: 200, total: undefined, truncated: true, pages: 2 });
@@ -2018,6 +2018,27 @@ test("review fix 3: xpack.security.audit.enabled honors transient and persistent
   assert.deepEqual(defaultsFinding.evidence.per_node, [{ node: "es-1", node_value: null, effective: false, source: "cluster defaults" }]);
 });
 
+test("review fix 4: FLS and DLS usage flags are read as the documented booleans", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.xpackUsage.security.roles = { native: { size: 4, fls: true, dls: false }, file: { size: 1, fls: false, dls: true } };
+  const result = await assessElasticAccessControl(stubClient(fixtures), { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] });
+  const fls = findingById(result, "ELASTIC-07");
+  const dls = findingById(result, "ELASTIC-08");
+  assert.deepEqual(fls.evidence.usage_reports_in_use, { native_roles: true, file_roles: false });
+  assert.deepEqual(dls.evidence.usage_reports_in_use, { native_roles: false, file_roles: true });
+  assert.equal("usage_count" in fls.evidence, false, "the numeric usage_count field no longer exists");
+  assert.equal("usage_count" in dls.evidence, false);
+
+  const numericShape = healthyFixtures();
+  numericShape.xpackUsage.security.roles = { native: { size: 4, fls: 1, dls: 1 } };
+  const numericResult = await assessElasticAccessControl(stubClient(numericShape));
+  assert.deepEqual(findingById(numericResult, "ELASTIC-07").evidence.usage_reports_in_use, { native_roles: null, file_roles: null }, "non-boolean values are not coerced into a verdict input");
+
+  const missing = healthyFixtures();
+  delete missing.xpackUsage.security.roles;
+  assert.deepEqual(findingById(await assessElasticAccessControl(stubClient(missing)), "ELASTIC-08").evidence.usage_reports_in_use, { native_roles: null, file_roles: null });
+});
+
 test("review fix 5: the default audit include list contains access_granted and matches the documented nine events", async () => {
   const documentedDefault = [
     "access_denied",
@@ -2048,6 +2069,42 @@ test("review fix 5: the default audit include list contains access_granted and m
 
   const explicit = findingById(await assessElasticClusterHardening(stubClient(healthyFixtures())), "ELASTIC-11");
   assert.deepEqual(explicit.evidence.effective_include, ["access_denied", "authentication_failed", "security_config_change", "run_as_denied"], "an explicit include list replaces the default rather than merging with it");
+});
+
+test("review fix 6: listFleetServerHosts sends no query parameters and reads items and total from the response", async () => {
+  const seen = [];
+  const hosts = Array.from({ length: 3 }, (_, index) => ({ id: `host-${index + 1}`, host_urls: [`https://fleet-${index + 1}.example.com:8220`] }));
+  const client = new ElasticApiClient(sampleConfig(), {
+    fetchImpl: createRouter({
+      "GET /api/fleet/fleet_server_hosts": () => ({ items: hosts, total: hosts.length, page: 1, perPage: 20 }),
+    }, seen),
+  });
+
+  const complete = await client.listFleetServerHosts();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].pathname, "/api/fleet/fleet_server_hosts");
+  assert.equal(seen[0].search, "", "GET /api/fleet/fleet_server_hosts documents no query parameters");
+  assert.deepEqual({ seen: complete.seen, total: complete.total, pages: complete.pages, truncated: complete.truncated }, { seen: 3, total: 3, pages: 1, truncated: false });
+  assert.deepEqual(complete.items.map((item) => item.id), ["host-1", "host-2", "host-3"]);
+
+  const capped = await client.listFleetServerHosts(2);
+  assert.equal(seen[1].search, "", "the collection cap is applied client-side, not sent as a parameter");
+  assert.deepEqual({ seen: capped.seen, total: capped.total, truncated: capped.truncated }, { seen: 2, total: 3, truncated: true });
+
+  const serverTotal = new ElasticApiClient(sampleConfig(), {
+    fetchImpl: createRouter({ "GET /api/fleet/fleet_server_hosts": () => ({ items: hosts.slice(0, 2), total: 5, page: 1, perPage: 2 }) }),
+  });
+  const partial = await serverTotal.listFleetServerHosts();
+  assert.deepEqual({ seen: partial.seen, total: partial.total, truncated: partial.truncated }, { seen: 2, total: 5, truncated: true }, "a server total above the returned items records truncation");
+
+  const noTotal = new ElasticApiClient(sampleConfig(), {
+    fetchImpl: createRouter({ "GET /api/fleet/fleet_server_hosts": () => ({ items: hosts }) }),
+  });
+  const inferred = await noTotal.listFleetServerHosts();
+  assert.deepEqual({ seen: inferred.seen, total: inferred.total, truncated: inferred.truncated }, { seen: 3, total: 3, truncated: false });
+
+  const snapshot = await collectElasticSnapshot(client, ["fleet_server_hosts"], { kibanaLimit: 2 });
+  assert.deepEqual(snapshot.fleet_server_hosts.page, { seen: 2, total: 3, truncated: true, pages: 1 });
 });
 
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
