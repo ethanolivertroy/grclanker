@@ -1,0 +1,7 @@
+{
+  "name": "grclanker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Cursor Agent SDK project that exposes the grclanker GRC tools, workflow prompts, and personas. Dependencies resolve from the parent @grclanker/cli package."
+}
