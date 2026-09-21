@@ -2117,3 +2117,39 @@ test("review fix 6: 0.0.0.0/0 ingress on the DLB back-end ports 8091 and 8092 fa
   assert.deepEqual(findingById(listenerOpen, "MULESOFT-RT-14").evidence.open_non_standard_rules, []);
   assert.deepEqual(findingById(listenerOpen, "MULESOFT-RT-14").evidence.open_standard_port_rules, ["prod-vpc: tcp 8081-8082 from 0.0.0.0/0"]);
 });
+
+test("review fix 7: listConnectedApplications sends hide_managed=false so managed apps are inventoried and counted in the total", async () => {
+  const connectedApps = [
+    { client_id: "app-1", client_name: "Auditor", grant_types: ["client_credentials"], enabled: true },
+    { client_id: "app-managed", client_name: "Managed integration", grant_types: ["client_credentials"], enabled: true, managed: true },
+  ];
+  const seen = [];
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      (url) => {
+        if (url.pathname !== `/accounts/api/organizations/${ORG_ID}/connectedApplications`) return undefined;
+        const visible = url.searchParams.get("hide_managed") === "false" ? connectedApps : connectedApps.filter((app) => !app.managed);
+        return jsonResponse({ data: visible, total: visible.length });
+      },
+      (url) => (url.pathname.endsWith("/connectedApplications/app-managed/scopes") ? jsonResponse({ data: [{ scope: "full" }], total: 1 }) : undefined),
+      (url) => (url.pathname.endsWith("/scopes") ? jsonResponse({ data: [{ scope: "profile" }], total: 1 }) : undefined),
+      (url) => (url.pathname === `/accounts/api/organizations/${ORG_ID}/hierarchy` ? jsonResponse({ id: ORG_ID, isRoot: true, subOrganizations: [] }) : undefined),
+      pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, ENVIRONMENTS, 25),
+    ], seen),
+  });
+
+  const page = await client.listConnectedApplications();
+  assert.deepEqual(page.items.map((app) => app.client_id), ["app-1", "app-managed"]);
+  assert.equal(page.total, 2);
+  const request = seen.find((item) => item.pathname.endsWith("/connectedApplications"));
+  assert.ok(request.search.includes("hide_managed=false"), request.search);
+  assert.ok(request.search.includes("includeUsage=true"), request.search);
+
+  const result = await assessMulesoftIdentityAccess(client);
+  assert.equal(statusOf(result, "MULESOFT-IAM-18"), "fail");
+  assert.deepEqual(findingById(result, "MULESOFT-IAM-18").evidence.admin_scoped_apps, ["Managed integration"]);
+  assert.equal(findingById(result, "MULESOFT-IAM-18").evidence.connected_apps, 2);
+  assert.equal(findingById(result, "MULESOFT-IAM-18").evidence.connected_apps_total, 2);
+  assert.equal(findingById(result, "MULESOFT-IAM-18").evidence.managed_apps_included, true);
+  assert.equal(findingById(result, "MULESOFT-IAM-19").evidence.connected_apps_total, 2);
+});

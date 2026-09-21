@@ -1265,8 +1265,9 @@ export class MulesoftApiClient {
     return this.listOffset(this.orgPath("/environments"), { limit });
   }
 
+  // hide_managed defaults to true on the Access Management API and would silently drop managed connected apps from the inventory.
   async listConnectedApplications(limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
-    return this.listOffset(this.orgPath("/connectedApplications"), { query: { includeUsage: true }, limit });
+    return this.listOffset(this.orgPath("/connectedApplications"), { query: { includeUsage: true, hide_managed: false }, limit });
   }
 
   async listConnectedApplicationScopes(clientId: string): Promise<MulesoftPage> {
@@ -2024,6 +2025,8 @@ export async function assessMulesoftIdentityAccess(
       () => {
         const evidence = {
           connected_apps: connectedAppItems.length,
+          connected_apps_total: connectedApps.value.total ?? connectedAppItems.length,
+          managed_apps_included: true,
           service_apps: scopedApps.filter((item) => item.service).length,
           admin_scoped_apps: sample(adminScopedApps),
           admin_scoped_delegated_apps: sample(adminScopedDelegatedApps),
@@ -2052,6 +2055,8 @@ export async function assessMulesoftIdentityAccess(
       () => {
         const evidence = {
           connected_apps: connectedAppItems.length,
+          connected_apps_total: connectedApps.value.total ?? connectedAppItems.length,
+          managed_apps_included: true,
           apps_with_usage_data: appsWithUsageDate.length,
           apps_without_usage_date: sample(appsWithoutUsageDate.map(connectedAppName)),
           stale_apps: sample(staleApps.map(connectedAppName)),
