@@ -136,11 +136,41 @@ export interface SnowflakeStatementOutcome {
   error?: string;
 }
 
+/** What a bundle consumer reads in place of the rows of a statement that did not complete. */
+export interface SnowflakeNotCollectedMarker {
+  collected: false;
+  status: Exclude<SnowflakeStatementStatus, "ok">;
+  statement: string;
+  error: string | null;
+}
+
+/**
+ * The serialized form of a statement outcome: core_data files and the
+ * statements echoed by the assess tools. A statement that did not complete
+ * carries a not-collected marker in place of its rows and null columns, so a
+ * denial can never be mistaken for an empty result set; a readable statement
+ * with no rows keeps [].
+ */
+export interface SnowflakeStatementSnapshot {
+  key: string;
+  statement: string;
+  status: SnowflakeStatementStatus;
+  columns: string[] | null;
+  rows: SqlRow[] | SnowflakeNotCollectedMarker;
+  numRows: number | null;
+  partitionCount: number | null;
+  fetchedPartitions: number | null;
+  truncated: boolean | null;
+  rowLimit?: number;
+  error?: string;
+}
+
 export interface SnowflakeAccessSurface {
   name: string;
   statement: string;
   status: "readable" | "denied" | "error" | "timeout";
-  rowCount?: number;
+  /** Rows seen on a readable surface; null when the statement did not complete. */
+  rowCount: number | null;
   error?: string;
 }
 
@@ -174,7 +204,7 @@ export interface SnowflakeAssessmentResult {
   area: string;
   summary: JsonRecord;
   findings: SnowflakeFinding[];
-  statements: SnowflakeStatementOutcome[];
+  statements: SnowflakeStatementSnapshot[];
 }
 
 export interface SnowflakeAuditBundleResult {
@@ -1086,6 +1116,28 @@ export function rowsSeen(outcome: SnowflakeStatementOutcome): number | null {
   return outcome.status === "ok" ? outcome.rows.length : null;
 }
 
+/**
+ * The single serializer for a statement outcome on every output path: the
+ * rows of a statement that did not complete are replaced by a marker naming
+ * the statement, its outcome, and the error, and its columns become null.
+ */
+export function snapshotStatement(outcome: SnowflakeStatementOutcome): SnowflakeStatementSnapshot {
+  if (outcome.status === "ok") return { ...outcome };
+  return {
+    key: outcome.key,
+    statement: outcome.statement,
+    status: outcome.status,
+    columns: null,
+    rows: { collected: false, status: outcome.status, statement: outcome.statement, error: outcome.error ?? null },
+    numRows: null,
+    partitionCount: null,
+    fetchedPartitions: null,
+    truncated: null,
+    rowLimit: outcome.rowLimit,
+    error: outcome.error,
+  };
+}
+
 function configuredSecretsOf(client: SnowflakeQueryClient): Array<string | undefined> {
   const config = client.getResolvedConfig();
   return [config.token, config.privateKeyPassphrase];
@@ -1191,7 +1243,7 @@ function hasFullVisibility(role: string | undefined): boolean {
   return Boolean(role && FULL_VISIBILITY_ROLES.has(role));
 }
 
-function describeOutcomeProblem(outcome: SnowflakeStatementOutcome): string {
+function describeOutcomeProblem(outcome: Pick<SnowflakeStatementOutcome, "key" | "status" | "error">): string {
   switch (outcome.status) {
     case "ok":
       return "";
@@ -1487,11 +1539,11 @@ function toSurface(name: string, outcome: SnowflakeStatementOutcome): SnowflakeA
     case "ok":
       return { name, statement: outcome.statement, status: "readable", rowCount: outcome.rows.length };
     case "denied":
-      return { name, statement: outcome.statement, status: "denied", error: outcome.error };
+      return { name, statement: outcome.statement, status: "denied", rowCount: null, error: outcome.error };
     case "timeout":
-      return { name, statement: outcome.statement, status: "timeout", error: outcome.error };
+      return { name, statement: outcome.statement, status: "timeout", rowCount: null, error: outcome.error };
     case "error":
-      return { name, statement: outcome.statement, status: "error", error: outcome.error };
+      return { name, statement: outcome.statement, status: "error", rowCount: null, error: outcome.error };
     default: {
       const exhaustive: never = outcome.status;
       return exhaustive;
@@ -1610,7 +1662,7 @@ export async function assessSnowflakeNetworkAndAuthentication(
     return { status: "pass", summary: `All ${passwordHumans.length} enabled person users with passwords report HAS_MFA or EXT_AUTHN_DUO = true.`, evidence };
   }));
 
-  findings.push(evaluateControl(4, [passwordPolicies, ...passwordReferences.outcomes], "Snowsight or SHOW PASSWORD POLICIES plus SELECT * FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>')): confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
+  findings.push(evaluateControl(4, [passwordPolicies, ...passwordReferences.outcomes], "the ACCOUNT_USAGE PASSWORD_POLICIES view and each policy's INFORMATION_SCHEMA POLICY_REFERENCES lookup, or Snowsight Admin > Security: confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
     const accountRefs = passwordReferences.accountLevel;
     const attachedNames = new Set(accountRefs.map((row) => upper(rowValue(row, "POLICY_NAME"))));
     const weak: string[] = [];
@@ -1706,7 +1758,7 @@ export async function assessSnowflakeNetworkAndAuthentication(
     return { status: "pass", summary: `${enabledSaml.length} enabled SAML2 integration(s) found${scim.length > 0 ? ` with ${scim.length} enabled SCIM integration(s)` : "; no enabled SCIM integration was visible"}.`, evidence };
   }));
 
-  findings.push(evaluateControl(25, [sessionPolicies, ...sessionReferences.outcomes], "SHOW SESSION POLICIES plus SELECT * FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>')): confirm an account-level session policy with idle timeouts.", () => {
+  findings.push(evaluateControl(25, [sessionPolicies, ...sessionReferences.outcomes], "the ACCOUNT_USAGE SESSION_POLICIES view and each policy's INFORMATION_SCHEMA POLICY_REFERENCES lookup, or Snowsight Admin > Security: confirm an account-level session policy with idle timeouts.", () => {
     const accountRefs = sessionReferences.accountLevel;
     const attached = new Set(accountRefs.map((row) => upper(rowValue(row, "POLICY_NAME"))));
     const compliantAttached = sessionPolicies.rows.filter((row) => {
@@ -1765,7 +1817,7 @@ export async function assessSnowflakeNetworkAndAuthentication(
       integrations,
       sessionPolicies,
       ...sessionReferences.outcomes,
-    ],
+    ].map(snapshotStatement),
   };
 }
 
@@ -1906,7 +1958,7 @@ export async function assessSnowflakeAccessControl(
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, roleGrants, globalGrants, adminGrants, roleUsage, directGrants, publicGrants],
+    statements: [session.outcome, roleGrants, globalGrants, adminGrants, roleUsage, directGrants, publicGrants].map(snapshotStatement),
   };
 }
 
@@ -2052,7 +2104,7 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, loginOutcomes, failedLogins, users, retention, accessHistory, warehouses],
+    statements: [session.outcome, loginOutcomes, failedLogins, users, retention, accessHistory, warehouses].map(snapshotStatement),
   };
 }
 
@@ -2161,7 +2213,7 @@ export async function assessSnowflakeDataProtection(
 
   findings.push(finding(20, "manual", "Not verifiable through SQL: Tri-Secret Secure is enabled by Snowflake Support for Business Critical (or higher) accounts. Collect the Snowflake Support case or Snowsight Admin > Accounts edition evidence and the composite master key confirmation.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
 
-  findings.push(finding(21, "manual", "Not verifiable through SQL: customer-managed key enrollment is confirmed through Snowflake Support and your cloud KMS. SYSTEM$GET_SNOWFLAKE_PLATFORM_INFO() only returns VPC/VNet IDs, and SYSTEM$GET_CMK_KMS_KEY_POLICY, SYSTEM$GET_CMK_AKV_CONSENT_URL, and SYSTEM$GET_GCP_KMS_CMK_GRANT_ACCESS_CMD return setup templates. Collect the KMS key policy and rotation evidence from AWS KMS, Azure Key Vault, or Google Cloud KMS.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
+  findings.push(finding(21, "manual", "Not verifiable through SQL: customer-managed key enrollment is confirmed through Snowflake Support and your cloud KMS; the platform-info and CMK system functions only return VPC or VNet identifiers and setup templates, so none was run. Collect the KMS key policy and rotation evidence from AWS KMS, Azure Key Vault, or Google Cloud KMS.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
 
   findings.push(evaluateControl(22, [shares], "SHOW SHARES as ACCOUNTADMIN: review every OUTBOUND share, its consumer accounts (to column), and any listing_global_name exposure.", () => {
     const outbound = shares.rows.filter((row) => upper(rowValue(row, "kind")) === "OUTBOUND");
@@ -2212,7 +2264,7 @@ export async function assessSnowflakeDataProtection(
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, maskingCount, maskingReferences, rowAccessCount, rowAccessReferences, tagReferences, stageParameters, unloadParameters, databases, shares, integrations, replicationGroups],
+    statements: [session.outcome, maskingCount, maskingReferences, rowAccessCount, rowAccessReferences, tagReferences, stageParameters, unloadParameters, databases, shares, integrations, replicationGroups].map(snapshotStatement),
   };
 }
 

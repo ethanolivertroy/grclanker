@@ -1151,7 +1151,8 @@ test("assessSnowflakeDataProtection passes on a governed fixture while Tri-Secre
   });
   assert.match(findingById(result, "SNOWFLAKE-20").summary, /Not verifiable through SQL/);
   assert.match(findingById(result, "SNOWFLAKE-20").summary, /Business Critical/);
-  assert.match(findingById(result, "SNOWFLAKE-21").summary, /SYSTEM\$GET_SNOWFLAKE_PLATFORM_INFO/);
+  assert.match(findingById(result, "SNOWFLAKE-21").summary, /platform-info and CMK system functions only return VPC or VNet identifiers and setup templates, so none was run/);
+  assert.doesNotMatch(findingById(result, "SNOWFLAKE-21").summary, /SYSTEM\$/, "the summary names no system function the run did not execute");
   assert.equal(findingById(result, "SNOWFLAKE-14").evidence.masking_references, 3);
   assert.equal(findingById(result, "SNOWFLAKE-14").evidence.tag_classification_summary.length, 2);
   assert.match(findingById(result, "SNOWFLAKE-22").summary, /empty outbound inventory is compliant/);
@@ -1826,6 +1827,146 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
       }
     }
   }
+});
+
+/** A mock client that also records the outcome of every statement it served. */
+function recordingClient(resolver, configOverrides = {}) {
+  const log = [];
+  const client = createMockClient(async (statement) => {
+    const normalized = normalizeStatement(statement);
+    try {
+      const result = await resolver(statement);
+      log.push({ statement: normalized, status: "ok", rows: result.rows.length });
+      return result;
+    } catch (error) {
+      log.push({ statement: normalized, status: error instanceof SnowflakeStatementError ? error.kind : "error", error: error.message });
+      throw error;
+    }
+  }, configOverrides);
+  return { client, log };
+}
+
+/** The leading run of SQL keyword tokens after each SHOW in prose, so "SHOW WAREHOUSES returned zero" yields "SHOW WAREHOUSES". */
+function mentionedShowStatements(text) {
+  const mentions = [];
+  for (const match of text.matchAll(/\bSHOW\b[^\n]*/g)) {
+    const kept = [];
+    for (const token of match[0].split(/\s+/)) {
+      const clean = token.replace(/[.,;:)\]"\\]+$/, "");
+      if (!/^[A-Z_%$*'()]+$/.test(clean)) break;
+      kept.push(clean);
+      if (clean !== token) break;
+    }
+    if (kept.length > 1) mentions.push(kept.join(" "));
+  }
+  return mentions;
+}
+
+function* statementBearingObjects(value) {
+  if (Array.isArray(value)) {
+    for (const item of value) yield* statementBearingObjects(item);
+  } else if (value && typeof value === "object") {
+    if (typeof value.statement === "string" && typeof value.status === "string") yield value;
+    for (const item of Object.values(value)) yield* statementBearingObjects(item);
+  }
+}
+
+/**
+ * Every statement named with an outcome anywhere in the outputs (core_data
+ * files, access surfaces, statement snapshots, not-collected markers) must be
+ * one the client executed with that outcome, and every SHOW command named in
+ * prose must be one the run executed.
+ */
+function assertOutputsNameOnlyExecutedStatements(outputs, log, label) {
+  const executed = new Map();
+  for (const entry of log) executed.set(entry.statement, entry.status);
+  for (const [name, text] of outputs) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = undefined;
+    }
+    if (parsed !== undefined) {
+      for (const object of statementBearingObjects(parsed)) {
+        const status = executed.get(normalizeStatement(object.statement));
+        assert.ok(status !== undefined, `${label} ${name}: names a statement the run never executed: ${object.statement}`);
+        const claimsOk = object.status === "ok" || object.status === "readable";
+        assert.equal(claimsOk, status === "ok", `${label} ${name}: claims ${object.status} for a statement the run observed as ${status}: ${object.statement}`);
+        if (!claimsOk) assert.equal(object.status, status, `${label} ${name}: claims ${object.status} but the run observed ${status}`);
+      }
+    }
+    for (const mention of mentionedShowStatements(text)) {
+      assert.ok([...executed.keys()].some((statement) => statement.startsWith(mention)), `${label} ${name}: names ${mention} but the run executed no such statement`);
+    }
+  }
+}
+
+function snowflakeOutputs(access, results, exported) {
+  return new Map([
+    ["check_access", JSON.stringify(access)],
+    ...results.map((result) => [`assess ${result.area}`, JSON.stringify(result)]),
+    ...[...readBundleFiles(exported.outputDir)].map(([name, content]) => [`bundle ${name}`, content]),
+  ]);
+}
+
+const SNOWFLAKE_DENIABLE_STATEMENTS = [
+  ["show_network_policies", "show_network_policies", (s) => s === "SHOW NETWORK POLICIES"],
+  ["show_warehouses", "show_warehouses", (s) => s === "SHOW WAREHOUSES"],
+  ["show_databases", "show_databases", (s) => s === "SHOW DATABASES"],
+  ["show_shares", "show_shares", (s) => s === "SHOW SHARES"],
+  ["show_replication_groups", "show_replication_groups", (s) => s === "SHOW REPLICATION GROUPS"],
+  ["tag_references", "account_usage_tag_references", (s) => s.includes("ACCOUNT_USAGE.TAG_REFERENCES")],
+  ["users", "account_usage_users", (s) => s.includes("ACCOUNT_USAGE.USERS")],
+];
+
+test("collection status: a denied statement is written to core_data and the assess payload with a not-collected marker in place of its rows and null counts, a readable empty result stays [], and every statement named in any output was executed", async () => {
+  const base = createTempBase("grclanker-snowflake-denied-markers-");
+  const config = sampleConfig({ role: "ACCOUNTADMIN" });
+
+  for (const [key, surfaceName, matches] of SNOWFLAKE_DENIABLE_STATEMENTS) {
+    const { client, log } = recordingClient((statement) => {
+      if (matches(normalizeStatement(statement))) throw DENIED_403();
+      return healthyFixture(statement);
+    }, { role: "ACCOUNTADMIN" });
+    const access = await checkSnowflakeAccess(client);
+    const results = await runAllAssessments(client);
+    const exported = await exportSnowflakeAuditBundle(client, config, join(base, key));
+
+    const file = JSON.parse(readFileSync(join(exported.outputDir, "core_data", `${key}.json`), "utf8"));
+    assert.equal(file.status, "denied", `${key}: recorded as denied`);
+    assert.equal(file.columns, null, `${key}: columns are null, not [], when the statement did not complete`);
+    assert.ok(!Array.isArray(file.rows), `${key}: rows are never an array for a statement that did not complete`);
+    assert.deepEqual(file.rows, { collected: false, status: "denied", statement: file.statement, error: file.error });
+    assert.match(file.rows.error, /HTTP 403 Forbidden/);
+    for (const counter of ["numRows", "partitionCount", "fetchedPartitions", "truncated"]) {
+      assert.equal(file[counter], null, `${key}: ${counter} is null when the statement did not complete`);
+    }
+
+    const echoed = results.flatMap((result) => result.statements).find((statement) => statement.key === key);
+    assert.deepEqual(echoed.rows, file.rows, `${key}: the assess payload carries the same marker`);
+    assert.equal(echoed.columns, null);
+
+    const surface = access.surfaces.find((item) => item.name === surfaceName);
+    assert.equal(surface.status, "denied");
+    assert.equal(surface.rowCount, null, `${key}: access check rowCount is null when the probe did not complete`);
+
+    assertOutputsNameOnlyExecutedStatements(snowflakeOutputs(access, results, exported), log, `${key} denied`);
+  }
+
+  const { client, log } = recordingClient((statement) => (normalizeStatement(statement) === "SHOW SHARES" ? emptyFixture(statement) : healthyFixture(statement)), { role: "ACCOUNTADMIN" });
+  const access = await checkSnowflakeAccess(client);
+  const results = await runAllAssessments(client);
+  const exported = await exportSnowflakeAuditBundle(client, config, join(base, "empty"));
+  const shares = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "show_shares.json"), "utf8"));
+  assert.equal(shares.status, "ok");
+  assert.deepEqual(shares.rows, [], "a readable empty result set stays []");
+  assert.ok(Array.isArray(shares.columns));
+  assert.equal(shares.numRows, 0);
+  assert.equal(shares.truncated, false);
+  assert.equal(access.surfaces.find((item) => item.name === "show_shares").rowCount, 0);
+  for (const surface of access.surfaces) assert.equal(typeof surface.rowCount, "number", `${surface.name}: readable surfaces carry a numeric rowCount`);
+  assertOutputsNameOnlyExecutedStatements(snowflakeOutputs(access, results, exported), log, "healthy with an empty SHOW SHARES");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
