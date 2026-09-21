@@ -1549,8 +1549,9 @@ export async function assessCloudflareIdentity(
     idpStatus = "fail";
     idpSummary = "Only the One-time PIN identity provider is configured; add an SSO or MFA-capable provider.";
   } else {
-    idpStatus = weakIdpTypes.length > 0 ? "warn" : "pass";
-    idpSummary = `${idpTypes.length} identity providers configured (${[...new Set(idpTypes)].join(", ")})${weakIdpTypes.length > 0 ? "; One-time PIN remains enabled alongside SSO providers" : ""}.`;
+    const partial = partialInventoryNote("identity provider", idps!);
+    idpStatus = weakIdpTypes.length > 0 || partial ? "warn" : "pass";
+    idpSummary = `${idpTypes.length} identity providers configured (${[...new Set(idpTypes)].join(", ")})${weakIdpTypes.length > 0 ? "; One-time PIN remains enabled alongside SSO providers" : ""}.${partial ? ` ${partial}` : ""}`;
   }
   findings.push(finding("CF-IAM-05", "Zero Trust identity provider coverage", "medium", idpStatus, idpSummary, 10, {
     identity_providers: idpTypes.length,
@@ -1947,7 +1948,8 @@ export async function assessCloudflareTrafficControls(
   } else {
     const newest = auditLogs!.items.map((event) => asDate(event.when)).filter((item): item is Date => Boolean(item)).sort((a, b) => b.getTime() - a.getTime())[0];
     const failedActions = auditLogs!.items.filter((event) => asBoolean(asObject(event.action)?.result) === false).length;
-    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", "pass", `${auditLogs!.items.length} audit log events were readable for the last ${AUDIT_LOG_LOOKBACK_DAYS} days${newest ? ` (newest ${newest.toISOString()})` : ""}; ${failedActions} recorded failed actions. Retention beyond the API window is a manual check.`, 11, {
+    const partial = partialInventoryNote("audit event", auditLogs!);
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", partial ? "warn" : "pass", `${auditLogs!.items.length} audit log events were readable for the last ${AUDIT_LOG_LOOKBACK_DAYS} days${newest ? ` (newest ${newest.toISOString()})` : ""}; ${failedActions} recorded failed actions. Retention beyond the API window is a manual check.${partial ? ` ${partial}` : ""}`, 11, {
       account_id: accountId,
       audit_events: auditLogs!.items.length,
       newest_event: newest?.toISOString() ?? null,
@@ -1996,7 +1998,8 @@ export async function assessCloudflareTrafficControls(
     } else if (blocking.length === 0 || !(filters.has("dns") || filters.has("http"))) {
       findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }));
     } else {
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }));
+      const partial = partialInventoryNote("Gateway rule", gatewayRules!);
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }));
     }
   }
 
