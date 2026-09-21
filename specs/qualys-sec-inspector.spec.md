@@ -22,7 +22,7 @@ A security compliance inspection tool for the **Qualys Cloud Platform** that aud
 
 The shipped implementation is native TypeScript inside grclanker (`cli/extensions/grc-tools/qualys.ts`) rather than the standalone Go binary sketched in sections 7 to 9. It registers six read-only tools:
 
-- `qualys_check_access`: probes 14 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS and reports missing modules or roles
+- `qualys_check_access`: probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS and reports missing modules or roles
 - `qualys_assess_scan_coverage`: controls 1, 2, 3, 14, 16, 20
 - `qualys_assess_asset_inventory`: controls 4, 5, 6, 7, 18
 - `qualys_assess_vulnerability_management`: controls 8, 9, 10, 11, 17
@@ -383,13 +383,15 @@ goreleaser release --snapshot
 
 ### Deviations from this spec (official documentation wins)
 
-- Option profiles are listed from `/api/2.0/fo/subscription/option_profile/?action=list`, where the VM/PC API user guide documents the option profile list action. The `/api/2.0/fo/scan/option_profile/` path from section 2 is not used.
-- Users are read from the Administration API `POST /qps/rest/2.0/search/am/user/`. Neither `GET /api/2.0/fo/user/` nor the `/msp/` User API from section 2 is used; the `/msp/` paths belong to the API v1 user guide and are not needed for role auditing.
+- Option profiles are listed from `/api/2.0/fo/subscription/option_profile/vm/?action=list`, where the VM/PC API user guide ("Option Profiles for VM") documents the list action; the parent `/api/2.0/fo/subscription/option_profile/` path documents `action=export` and `action=import` only, and the `/api/2.0/fo/scan/option_profile/` path from section 2 is not used. Output follows `option_profile_info.dtd`.
+- Users are read from two documented surfaces. The VM/PC User List API `GET /msp/user_list.php` (section 2's User API, output `user_list_output.dtd`) is the primary source for `USER_STATUS`, `USER_ROLE`, `LAST_LOGIN_DATE` (returned to Manager and Unit Manager callers only), and `CONTACT_INFO/EMAIL`, and is probed by `qualys_check_access`. The Administration API `POST /qps/rest/2.0/search/am/user/` (`user.xsd`: `id`, `username`, name fields, `title`, `emailAddress`, `roleList`, `scopeTags`; Active users only, other Managers hidden) supplies the `roleList` and `scopeTags` cross-check and the API user's view scope. Control 13 reads both and demotes when either is unreadable; `GET /api/2.0/fo/user/` is not used.
 - Cloud connectors are read from the Asset Management and Tagging API `POST /qps/rest/2.0/search/am/assetdataconnector`, which returns AWS, Azure, and GCP connectors with their state and last sync. The CloudView `/cloudview-api/rest/v1/...` connector endpoints in section 2 are not used.
 - Web applications are searched only through the WAS API `POST /qps/rest/3.0/search/was/webapp`, the version documented in the WAS API user guide. The `/qps/rest/2.0/search/was/webapp` path listed under QPS in section 2 is not used.
 - The OAuth token request goes to the platform API gateway (`https://gateway.<platform>/auth`, for example `https://gateway.qg1.apps.qualys.com/auth`) as documented on the platform identification page, not to `https://qualysapi.qualys.com/auth` as written in section 3.
 - The platform table gained US Platform 4, US Gov Platform 1, EU Platform 3, UK Platform 1, and KSA Platform 1 plus the per-platform gateway hosts from the platform identification page. `QUALYS_PLATFORM` accepts a platform ID (`US1`, `EU2`, ...), the API server hostname from section 3, or a full https URL.
 - Additional documented endpoints used that section 2 does not list: `/api/2.0/fo/asset/host/vm/detection/` (open detections with `LAST_FOUND_DATETIME`, `FIRST_FOUND_DATETIME`, and QDS), `/api/2.0/fo/knowledge_base/vuln/` (patch availability), `/api/2.0/fo/asset/excluded_ip/` (exclusion list), and `/api/2.0/fo/schedule/report/` (scheduled reports).
+- Web application scan dates come from the WAS scan search `POST /qps/rest/3.0/search/was/wasscan` (`wasscan.xsd` `launchedDate`), first bounded to the lookback window and then, for web apps still unresolved, unbounded by `webApp.id`; `webapp.xsd` `lastScan` carries `id` and `name` only, so no date is read from the web app record.
+- The audit bundle's `core_data/<category>/<name>.json` files hold a per-record field projection of each collected surface (identifiers, names, statuses, dates, counts, and the documented fields the verdicts read), not the verbatim API response. Option profile configuration, authentication record values, connector ARNs and external IDs, agent activation IDs, report distribution settings, and notification recipients are never written.
 
 ### What remains
 

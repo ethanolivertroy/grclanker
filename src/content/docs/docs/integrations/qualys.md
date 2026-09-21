@@ -83,7 +83,27 @@ All tools accept the same connection arguments (`username`, `password`, `token`,
 
 ### `qualys_check_access`
 
-Probes 14 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS and reports each as `readable`, `not_readable`, or `module_unavailable`. Overall status is `healthy` (everything readable), `degraded` (core VM/VMDR readable, some optional modules missing), or `limited` (core VM/VMDR surfaces not readable). The response lists unavailable modules and the last observed rate limit headers.
+Probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS and reports each as `readable`, `not_readable`, or `module_unavailable`. Overall status is `healthy` (everything readable), `degraded` (core VM/VMDR readable, some optional modules missing), or `limited` (core VM/VMDR surfaces not readable). The response lists unavailable modules, the API user's view scope, and the last observed rate limit headers.
+
+| Surface | Module | Endpoint |
+|---------|--------|----------|
+| `scheduled_scans` | VM | `GET /api/2.0/fo/schedule/scan/?action=list` |
+| `hosts` | VM | `GET /api/2.0/fo/asset/host/?action=list&details=All&show_tags=1` |
+| `asset_groups` | VM | `GET /api/2.0/fo/asset/group/?action=list` |
+| `option_profiles` | VM | `GET /api/2.0/fo/subscription/option_profile/vm/?action=list` |
+| `appliances` | VM | `GET /api/2.0/fo/appliance/?action=list&output_mode=full` |
+| `auth_records` | VM | `GET /api/2.0/fo/auth/?action=list` |
+| `detections` | VMDR | `GET /api/2.0/fo/asset/host/vm/detection/?action=list` |
+| `compliance_policies` | PC | `GET /api/2.0/fo/compliance/policy/?action=list` |
+| `activity_log` | Administration | `GET /api/2.0/fo/activity_log/?action=list` (CSV) |
+| `users` | Administration | `POST /qps/rest/2.0/search/am/user/` |
+| `user_list` | Administration | `GET /msp/user_list.php` (`user_list_output.dtd`) |
+| `tags` | Asset Management | `POST /qps/rest/2.0/search/am/tag` |
+| `cloud_agents` | Cloud Agent | `POST /qps/rest/2.0/search/am/hostasset` |
+| `connectors` | Asset Management | `POST /qps/rest/2.0/search/am/assetdataconnector` |
+| `was_webapps` | WAS | `POST /qps/rest/3.0/search/was/webapp` |
+
+The assessments additionally read `GET /api/2.0/fo/scan/?action=list` (finished scans), `GET /api/2.0/fo/asset/excluded_ip/?action=list`, `GET /api/2.0/fo/knowledge_base/vuln/?action=list&details=Basic`, `GET /api/2.0/fo/schedule/report/?action=list&is_active=1`, `GET /api/2.0/fo/report/?action=list`, `POST /qps/rest/3.0/search/was/wasscan` (scan dates, bounded to the lookback window and then unbounded by `webApp.id` for web apps still unresolved), `POST /qps/rest/3.0/search/was/webappauthrecord`, and `POST /qps/rest/3.0/search/was/wasscanschedule`. Every XML list follows its `WARNING/URL` continuation and every QPS search pages with `hasMoreRecords` and `lastId`; a page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
 
 ### `qualys_assess_scan_coverage`
 
@@ -106,7 +126,7 @@ Controls 12, 13, 15, 19: active scheduled reports and recent report output, user
 Runs the access check and all four assessments, then writes `export/qualys/qualys-<platform>-audit-bundle/` (a numeric suffix is appended when the directory exists) containing:
 
 - `QUICK_REFERENCE.md` and `metadata.json`
-- `core_data/access.json` and `core_data/<category>/<dataset>.json` raw API snapshots
+- `core_data/access.json` and `core_data/<category>/<dataset>.json`, a per-record projection of each collected surface (identifiers, names, statuses, dates, counts, and the documented fields the verdicts read); option profile configuration, authentication record values, connector ARNs and external IDs, agent activation IDs, report distribution settings, and notification recipients are never written
 - `analysis/findings.json` plus one `analysis/<category>.json` summary per assessment
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework under `compliance/fedramp/`, `compliance/cmmc/`, `compliance/soc2/`, `compliance/cis/`, `compliance/pci_dss/`, `compliance/disa_stig/`, `compliance/irap/`, and `compliance/ismap/`
 - `_errors.log` when any collection step failed
@@ -168,9 +188,10 @@ The script skips with exit code 0 when no credentials are present. With `QUALYS_
 - Controls 12 and 19 pass or warn on API evidence but still require a human to confirm report recipients, log retention, and review cadence.
 - Controls 9 and 15 become `manual` when the PC or WAS module is not subscribed; controls 5, 7, and 18 fall back to `manual` when the Asset Management or Cloud Agent QPS endpoints are not licensed for the account.
 - Cloud connectors are read from the Asset Management `assetdataconnector` search, which returns AWS, Azure, and GCP connectors together. The CloudView API listed in the spec is not used.
-- Users are read from the Administration API (`/qps/rest/2.0/search/am/user/`). The legacy `/msp/user_list.php` endpoint is not used.
+- Users are read from two documented surfaces. The VM/PC User List API (`GET /msp/user_list.php`, `user_list_output.dtd`) supplies `USER_STATUS`, `USER_ROLE`, `CONTACT_INFO/EMAIL`, and `LAST_LOGIN_DATE`, the last of which Qualys returns only to Manager and Unit Manager callers, so a lower-privileged API user demotes control 13 to `warn` with the affected users in `users_without_last_login`. The Administration API (`POST /qps/rest/2.0/search/am/user/`) supplies `roleList` and `scopeTags` and establishes the API user's view scope; it returns Active users only and hides other Managers, so it is never used for status. Control 13 reads both and demotes when either is unreadable. Under the documented Restricted view, `USER_LOGIN` and `USER_ID` are hidden for users outside the caller's business unit; those rows are labeled by `CONTACT_INFO/EMAIL`, counted in `restricted_view_users_without_login`, and disclosed because generic-account and shared-email checks under-report for them.
+- Any finding that reads more than one inventory demotes when any of them is unreadable (401, 403, or a `SIMPLE_RETURN` error), names the dataset and endpoint in its summary, and renders every count taken from that inventory as `null` rather than `0`.
 - Host and detection sampling is capped by `host_limit` and `detection_limit` (default 5000 each, up to 25 pages per list). Very large subscriptions should raise these limits or scope with asset groups.
-- Option profile exclusion counts are derived from any `EXCLUDE*` element in the exported profile XML; QID exclusion semantics vary by profile type.
+- Option profile exclusion counts are the `VULNERABILITY_DETECTION/DETECTION_EXCLUDE` custom search lists in `option_profile_info.dtd`; QID exclusion semantics vary by profile type.
 - The integration is read-only. It never launches scans, changes schedules, or edits users, tags, or policies.
 
 ## Official documentation
