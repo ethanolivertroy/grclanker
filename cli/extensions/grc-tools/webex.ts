@@ -1378,20 +1378,20 @@ export async function assessWebexIdentity(
 
   let concentrationFinding: WebexFinding;
   if (!people.ok || !roles.ok) {
-    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium", "manual",
+    concentrationFinding = finding("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium", "manual",
       deniedSummary("people and roles", "/people and /roles", (!people.ok ? people : roles) as { error: string; status?: number }, "the Control Hub administrator list"),
       { token_type: tokenType });
   } else if (surfaceItems(people).length === 0) {
-    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium", "manual",
+    concentrationFinding = finding("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium", "manual",
       "Manual: GET /people returned zero people; an empty population cannot demonstrate bounded admin counts.",
       { people_seen: 0 });
   } else if (adminUsers.length === 0) {
-    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium", "warn",
+    concentrationFinding = finding("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium", "warn",
       `No administrators were visible among ${humans.length} people; every org has at least one Full Administrator, so the role data is incomplete.${peoplePartial}`,
       { admin_users: 0, people_seen: humans.length, people_truncated: people.truncated });
   } else {
     const within = adminUsers.length <= maxAdmins;
-    concentrationFinding = finding("WEBEX-ID-04", [2, 25], "Administrative privilege concentration", "medium",
+    concentrationFinding = finding("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium",
       within ? (people.truncated ? "warn" : "pass") : "warn",
       `${adminUsers.length} of ${humans.length} people hold administrator roles (threshold ${maxAdmins}).${peoplePartial}`,
       { admin_users: adminUsers.slice(0, 50).map(personLabel), admin_count: adminUsers.length, max_admins: maxAdmins, people_seen: humans.length, people_truncated: people.truncated });

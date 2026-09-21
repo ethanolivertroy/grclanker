@@ -79,7 +79,7 @@ Site-level findings (WEBEX-MTG-02, WEBEX-MTG-03, WEBEX-MTG-06) read `GET /admin/
 | 22 SRTP calling encryption | meeting-hybrid | WEBEX-MTG-01 | manual, folded: no calling SRTP setting in the public API |
 | 23 Virtual background | meeting-hybrid | WEBEX-MTG-07 | manual: no field in common settings, meeting preferences, or session types |
 | 24 License utilization | collaboration | WEBEX-COLLAB-06 | pass/warn from `totalUnits` and `consumedUnits` |
-| 25 Admin audit logging | collaboration | WEBEX-COLLAB-07 | pass/warn from `/adminAudit/events` over 30 days |
+| 25 Admin audit logging | collaboration, identity | WEBEX-COLLAB-07, WEBEX-ID-04 | audit pass/warn from `/adminAudit/events` over 30 days; admin concentration pass/warn from `/people` roles against `max_admins` (evidence for the role review, not an MFA verdict) |
 
 Automatable controls: 3, 9, 10, 13, 14, 15, 16, 19 (inventory), 20, 24, 25. All 25 controls have a finding; 22 findings in total.
 

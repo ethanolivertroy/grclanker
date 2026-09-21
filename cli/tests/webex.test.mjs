@@ -618,6 +618,8 @@ test("fixture (d): a compliant organization passes every automatable control, in
   for (const control of [3, 9, 10, 13, 14, 15, 16, 19, 20, 24, 25]) {
     assert.ok(passingControls.has(control), `control ${control} should pass on the compliant fixture`);
   }
+  assert.deepEqual([...passingControls].sort((a, b) => a - b), [3, 9, 10, 13, 14, 15, 16, 19, 20, 24, 25]);
+  assert.ok(!passingControls.has(2), "control 2 (admin MFA) stays manual by coordinator ruling and must never roll up as pass");
   for (const assessment of assessments) {
     assert.deepEqual(assessment.errors, []);
   }
@@ -803,6 +805,11 @@ test("WEBEX-ID-02 states that mfaEnabled is documented only on the PATCH authent
   const denied = byId((await assessWebexIdentity(forbiddenClient())).findings, "WEBEX-ID-02");
   assert.equal(denied.status, "manual");
   assert.match(denied.summary, /mfaEnabled is documented .* only in the PATCH request schema/);
+
+  const taggedControl2 = identity.findings.filter((item) => item.control.includes(2));
+  assert.deepEqual(taggedControl2.map((item) => item.id), ["WEBEX-ID-02"], "only the MFA finding carries control 2");
+  assert.ok(taggedControl2.every((item) => item.status === "manual"));
+  assert.deepEqual(byId(identity.findings, "WEBEX-ID-04").control, [25], "admin concentration is evidence for control 25, not an MFA verdict");
 });
 
 test("WEBEX-MTG-05 collects upgradeChannel evidence alongside software versions", async () => {
