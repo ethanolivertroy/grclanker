@@ -34,6 +34,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["cloudflare_", "Cloudflare"],
   ["cmvp_", "CMVP"],
   ["datadog_", "Datadog"],
+  ["crowdstrike_", "CrowdStrike"],
   ["duo_", "Duo"],
   ["elastic_", "Elastic"],
   ["fedramp_", "FedRAMP"],

@@ -35,6 +35,7 @@
     "test:agent-sdk:validate": "npm run build && node scripts/agent-sdk-validate-smoke.mjs",
     "test:box:live": "npm run build && node scripts/box-live-smoke.mjs",
     "test:datadog:live": "npm run build && node scripts/datadog-live-smoke.mjs",
+    "test:crowdstrike:live": "npm run build && node scripts/crowdstrike-live-smoke.mjs",
     "test:duo:live": "npm run build && node scripts/duo-live-smoke.mjs",
     "test:elastic:live": "npm run build && node scripts/elastic-live-smoke.mjs",
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
