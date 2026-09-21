@@ -2230,6 +2230,52 @@ test("review fix 8: CloudHub applications are listed with retrieveStatistics=tru
   assert.deepEqual(findingById(noStatistics, "MULESOFT-RT-11").evidence.large_applications_without_cpu_statistics, ["Production: orders-prod"]);
 });
 
+test("review fix 9: IAM-19 warns as the documented expected outcome when the published connected apps schema carries no last-used data, and still reads tenant-supplied timestamps", async () => {
+  // Mirrors the published listOrganizationConnectedApplications response: no last_used, lastUsed, last_used_at, or usage fields even with includeUsage=true.
+  const publishedSchemaApps = [
+    { client_id: "app-1", client_name: "Auditor", grant_types: ["client_credentials"], enabled: true, owner_org_id: ORG_ID, redirect_uris: [], audience: "internal" },
+    { client_id: "app-2", client_name: "CI deployer", grant_types: ["client_credentials"], enabled: true, owner_org_id: ORG_ID, redirect_uris: [], audience: "internal" },
+  ];
+  const seen = [];
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      (url) => (url.pathname === `/accounts/api/organizations/${ORG_ID}/connectedApplications` ? jsonResponse({ data: publishedSchemaApps, total: 2 }) : undefined),
+      (url) => (url.pathname.endsWith("/scopes") ? jsonResponse({ data: [{ scope: "read:audit_logs" }], total: 1 }) : undefined),
+      rootHierarchyRoute(),
+      pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, ENVIRONMENTS, 25),
+    ], seen),
+  });
+
+  const result = await assessMulesoftIdentityAccess(client);
+  const finding = findingById(result, "MULESOFT-IAM-19");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /2 of 2 connected app\(s\) have no last-used timestamp and are not counted as active/);
+  assert.match(finding.summary, /published organization connected apps schema does not include last-used data even with includeUsage=true/);
+  assert.match(finding.summary, /this warning is the expected outcome on Anypoint Platform/);
+  assert.match(finding.summary, /record the last-used dates manually/);
+  assert.equal(finding.evidence.apps_with_usage_data, 0);
+  assert.deepEqual(finding.evidence.apps_without_usage_date, ["Auditor", "CI deployer"]);
+  assert.match(finding.evidence.usage_data_source, /includeUsage=true; not part of the published schema, so absence is expected/);
+  assert.ok(seen.find((item) => item.pathname.endsWith("/connectedApplications")).search.includes("includeUsage=true"));
+  assert.equal(seen.some((item) => item.pathname.includes("/connectedApplications/authorizations")), false, "the per-user authorizations view is not read");
+
+  // A tenant that does return a last-used variant is still honoured: staleness is judged on the timestamp, not on its absence.
+  const dated = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listConnectedApplications() {
+      return [
+        { client_id: "app-1", client_name: "Auditor", enabled: true, last_used: isoDaysFromNow(-3) },
+        { client_id: "app-2", client_name: "Legacy", enabled: true, last_used_at: isoDaysFromNow(-120) },
+      ];
+    },
+  }));
+  assert.equal(statusOf(dated, "MULESOFT-IAM-19"), "warn");
+  assert.match(findingById(dated, "MULESOFT-IAM-19").summary, /^1 connected app\(s\) unused for more than 90 days/);
+  assert.doesNotMatch(findingById(dated, "MULESOFT-IAM-19").summary, /expected outcome/);
+  assert.deepEqual(findingById(dated, "MULESOFT-IAM-19").evidence.stale_apps, ["Legacy"]);
+  assert.equal(findingById(dated, "MULESOFT-IAM-19").evidence.apps_with_usage_data, 2);
+  assert.equal(statusOf(await assessMulesoftIdentityAccess(healthyIdentityClient()), "MULESOFT-IAM-19"), "pass");
+});
+
 test("review fix 10: a business-group-scoped credential flags the partial view on runtime, gateway, and audit findings too", async () => {
   const businessGroup = async () => ({ id: ORG_ID, isRoot: false, parentId: "root-org", subOrganizations: [] });
   const note = /Partial view: this organization is a business group \(isRoot=false\), so root-level settings and sibling business groups are outside the view/;

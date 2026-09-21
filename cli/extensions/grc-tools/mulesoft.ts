@@ -2105,6 +2105,7 @@ export async function assessMulesoftIdentityAccess(
           managed_apps_included: true,
           apps_with_usage_data: appsWithUsageDate.length,
           apps_without_usage_date: sample(appsWithoutUsageDate.map(connectedAppName)),
+          usage_data_source: "last_used, lastUsed, last_used_at, or usage.* on GET /organizations/{orgId}/connectedApplications?includeUsage=true; not part of the published schema, so absence is expected",
           stale_apps: sample(staleApps.map(connectedAppName)),
           disabled_apps: sample(disabledApps.map(connectedAppName)),
           stale_days: staleDays,
@@ -2116,7 +2117,7 @@ export async function assessMulesoftIdentityAccess(
           return verdict("warn", `${staleApps.length} connected app(s) unused for more than ${staleDays} days and ${disabledApps.length} disabled app(s) should be reviewed for removal.`, evidence);
         }
         if (appsWithoutUsageDate.length > 0) {
-          return verdict("warn", `${appsWithoutUsageDate.length} of ${connectedAppItems.length} connected app(s) have no last-used timestamp and are not counted as active; review them manually.`, evidence);
+          return verdict("warn", `${appsWithoutUsageDate.length} of ${connectedAppItems.length} connected app(s) have no last-used timestamp and are not counted as active. The published organization connected apps schema does not include last-used data even with includeUsage=true (Anypoint shows it only in the per-user authorizations view), so this warning is the expected outcome on Anypoint Platform: review each app's usage in Access Management > Connected Apps and record the last-used dates manually.`, evidence);
         }
         return verdict("pass", `All ${connectedAppItems.length} connected app(s) have a last-used timestamp within the last ${staleDays} days.`, evidence);
       },
