@@ -113,6 +113,13 @@ const DEFAULT_INSTANCE_LIMIT = 500;
 const DEFAULT_RESOURCE_LIMIT = 2000;
 const DEFAULT_POLICY_LIMIT = 1000;
 const DEFAULT_EVENT_LIMIT = 500;
+const DEFAULT_ACCOUNT_LIMIT = 1000;
+const DEFAULT_TARGET_LIMIT = 1000;
+const DEFAULT_ANALYZER_LIMIT = 100;
+const DEFAULT_STANDARD_LIMIT = 100;
+const DEFAULT_DETECTOR_LIMIT = 50;
+/** Upper bound on pages walked per list call; a token that never stops advancing is reported as truncation. */
+const MAX_PAGES_PER_LIST = 1000;
 const DEFAULT_ROOT_LOOKBACK_DAYS = 90;
 /** Global service events such as root ConsoleLogin are delivered to CloudTrail in us-east-1 only. */
 export const ROOT_EVENT_REGION = "us-east-1";
@@ -468,6 +475,44 @@ export async function attemptAwsRead<T>(
     errors.push(message);
     return { error: message, denied };
   }
+}
+
+interface AwsPage<T> {
+  items: T[];
+  nextToken?: string;
+}
+
+/**
+ * Walk a token-paginated AWS list to completion or `limit`. The walk also stops, and reports
+ * `truncated: true`, when the service hands back the token it was just given (a stalled cursor
+ * would otherwise loop forever) or when the page budget is spent, so no caller mistakes a
+ * cut-short walk for a complete inventory.
+ */
+export async function paginateAwsList<T>(
+  limit: number,
+  fetchPage: (token: string | undefined, remaining: number) => Promise<AwsPage<T>>,
+): Promise<AwsPagedList<T>> {
+  const items: T[] = [];
+  let token: string | undefined;
+  for (let page = 0; page < MAX_PAGES_PER_LIST; page += 1) {
+    const result = await fetchPage(token, Math.max(1, limit - items.length + 1));
+    items.push(...result.items);
+    if (items.length > limit) {
+      items.length = limit;
+      return { items, truncated: true };
+    }
+    const nextToken = asString(result.nextToken);
+    if (!nextToken) return { items, truncated: false };
+    if (nextToken === token) return { items, truncated: true };
+    token = nextToken;
+  }
+  return { items, truncated: true };
+}
+
+/** Access key ids are credential identifiers; keep only the prefix and suffix so findings stay traceable without echoing them. */
+export function maskAccessKeyId(accessKeyId: string): string {
+  if (accessKeyId.length <= 8) return "****";
+  return `${accessKeyId.slice(0, 4)}****${accessKeyId.slice(-4)}`;
 }
 
 async function mapWithConcurrency<T, R>(
@@ -827,28 +872,19 @@ export class AwsAuditorClient {
 
   /** IAM ListPolicies with Scope Local (customer managed), paginated to completion up to limit. */
   async listCustomerManagedPolicies(limit = DEFAULT_POLICY_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const policies: JsonRecord[] = [];
-    let marker: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (marker) => {
       const result = await this.iam.send(new ListIamPoliciesCommand({ Scope: "Local", OnlyAttached: false, Marker: marker, MaxItems: 100 }));
-      for (const policy of result.Policies ?? []) {
-        policies.push({
+      return {
+        items: (result.Policies ?? []).map((policy) => ({
           PolicyName: policy.PolicyName,
           Arn: policy.Arn,
           DefaultVersionId: policy.DefaultVersionId,
           AttachmentCount: policy.AttachmentCount,
           PermissionsBoundaryUsageCount: policy.PermissionsBoundaryUsageCount,
-        });
-      }
-      marker = result.IsTruncated ? result.Marker : undefined;
-      if (policies.length > limit) {
-        truncated = true;
-        policies.length = limit;
-        break;
-      }
-    } while (marker);
-    return { items: policies, truncated };
+        })),
+        nextToken: result.IsTruncated ? result.Marker : undefined,
+      };
+    });
   }
 
   /** IAM GetPolicyVersion; the Document is URL-encoded JSON per the API reference. */
@@ -862,10 +898,7 @@ export class AwsAuditorClient {
    * The lookup is regional; callers pass us-east-1 to see global sign-in events regardless of the configured region.
    */
   async lookupRootEvents(region: string, startTime: Date, endTime: Date, limit = DEFAULT_EVENT_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const events: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.cloudTrailFor(region).send(new LookupEventsCommand({
         LookupAttributes: [{ AttributeKey: "Username", AttributeValue: "root" }],
         StartTime: startTime,
@@ -873,51 +906,36 @@ export class AwsAuditorClient {
         MaxResults: 50,
         NextToken: nextToken,
       }));
-      for (const event of result.Events ?? []) {
-        events.push({
+      return {
+        items: (result.Events ?? []).map((event) => ({
           EventId: event.EventId,
           EventName: event.EventName,
           EventTime: event.EventTime,
           EventSource: event.EventSource,
           Username: event.Username,
           ReadOnly: event.ReadOnly,
-        });
-      }
-      nextToken = result.NextToken;
-      if (events.length > limit) {
-        truncated = true;
-        events.length = limit;
-        break;
-      }
-    } while (nextToken);
-    return { items: events, truncated };
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
   /** Audit Manager ListAssessments with status ACTIVE. */
   async listActiveAuditManagerAssessments(limit = DEFAULT_MAX_FINDINGS): Promise<AwsPagedList<JsonRecord>> {
-    const assessments: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.auditManager.send(new ListAssessmentsCommand({ status: "ACTIVE", maxResults: 100, nextToken }));
-      for (const assessment of result.assessmentMetadata ?? []) {
-        assessments.push({
+      return {
+        items: (result.assessmentMetadata ?? []).map((assessment) => ({
           id: assessment.id,
           name: assessment.name,
           status: assessment.status,
           complianceType: assessment.complianceType,
           creationTime: assessment.creationTime,
           lastUpdated: assessment.lastUpdated,
-        });
-      }
-      nextToken = result.nextToken;
-      if (assessments.length > limit) {
-        truncated = true;
-        assessments.length = limit;
-        break;
-      }
-    } while (nextToken);
-    return { items: assessments, truncated };
+        })),
+        nextToken: result.nextToken,
+      };
+    });
   }
 
   /** Account GetAlternateContact SECURITY; null when ResourceNotFoundException (no contact set). */
@@ -1000,25 +1018,16 @@ export class AwsAuditorClient {
   }
 
   async listBuckets(limit = DEFAULT_BUCKET_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const buckets: JsonRecord[] = [];
-    let continuationToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (continuationToken, remaining) => {
       const result = await this.s3.send(new ListBucketsCommand({
         ContinuationToken: continuationToken,
-        MaxBuckets: Math.min(1000, Math.max(1, limit - buckets.length + 1)),
+        MaxBuckets: Math.min(1000, remaining),
       }));
-      for (const bucket of result.Buckets ?? []) {
-        buckets.push({ Name: bucket.Name, CreationDate: bucket.CreationDate, BucketRegion: bucket.BucketRegion });
-      }
-      continuationToken = result.ContinuationToken;
-      if (buckets.length > limit) {
-        truncated = true;
-        buckets.length = limit;
-        break;
-      }
-    } while (continuationToken);
-    return { items: buckets, truncated };
+      return {
+        items: (result.Buckets ?? []).map((bucket) => ({ Name: bucket.Name, CreationDate: bucket.CreationDate, BucketRegion: bucket.BucketRegion })),
+        nextToken: result.ContinuationToken,
+      };
+    });
   }
 
   /** S3 GetPublicAccessBlock for one bucket; null when NoSuchPublicAccessBlockConfiguration. */
@@ -1077,32 +1086,20 @@ export class AwsAuditorClient {
   }
 
   async describeVpcs(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const vpcs: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.ec2For(region).send(new DescribeVpcsCommand({ NextToken: nextToken, MaxResults: 1000 }));
-      for (const vpc of result.Vpcs ?? []) {
-        vpcs.push({ VpcId: vpc.VpcId, IsDefault: vpc.IsDefault, CidrBlock: vpc.CidrBlock, State: vpc.State });
-      }
-      nextToken = result.NextToken;
-      if (vpcs.length > limit) {
-        truncated = true;
-        vpcs.length = limit;
-        break;
-      }
-    } while (nextToken);
-    return { items: vpcs, truncated };
+      return {
+        items: (result.Vpcs ?? []).map((vpc) => ({ VpcId: vpc.VpcId, IsDefault: vpc.IsDefault, CidrBlock: vpc.CidrBlock, State: vpc.State })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
   async describeFlowLogs(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const flowLogs: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.ec2For(region).send(new DescribeFlowLogsCommand({ NextToken: nextToken, MaxResults: 1000 }));
-      for (const flowLog of result.FlowLogs ?? []) {
-        flowLogs.push({
+      return {
+        items: (result.FlowLogs ?? []).map((flowLog) => ({
           FlowLogId: flowLog.FlowLogId,
           ResourceId: flowLog.ResourceId,
           FlowLogStatus: flowLog.FlowLogStatus,
@@ -1110,26 +1107,17 @@ export class AwsAuditorClient {
           LogDestinationType: flowLog.LogDestinationType,
           LogDestination: flowLog.LogDestination,
           LogGroupName: flowLog.LogGroupName,
-        });
-      }
-      nextToken = result.NextToken;
-      if (flowLogs.length > limit) {
-        truncated = true;
-        flowLogs.length = limit;
-        break;
-      }
-    } while (nextToken);
-    return { items: flowLogs, truncated };
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
   async describeNetworkAcls(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const acls: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.ec2For(region).send(new DescribeNetworkAclsCommand({ NextToken: nextToken, MaxResults: 1000 }));
-      for (const acl of result.NetworkAcls ?? []) {
-        acls.push({
+      return {
+        items: (result.NetworkAcls ?? []).map((acl) => ({
           NetworkAclId: acl.NetworkAclId,
           VpcId: acl.VpcId,
           IsDefault: acl.IsDefault,
@@ -1142,26 +1130,17 @@ export class AwsAuditorClient {
             Ipv6CidrBlock: entry.Ipv6CidrBlock,
             PortRange: entry.PortRange ? { From: entry.PortRange.From, To: entry.PortRange.To } : undefined,
           })),
-        });
-      }
-      nextToken = result.NextToken;
-      if (acls.length > limit) {
-        truncated = true;
-        acls.length = limit;
-        break;
-      }
-    } while (nextToken);
-    return { items: acls, truncated };
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
   async describeSecurityGroups(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const groups: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.ec2For(region).send(new DescribeSecurityGroupsCommand({ NextToken: nextToken, MaxResults: 1000 }));
-      for (const group of result.SecurityGroups ?? []) {
-        groups.push({
+      return {
+        items: (result.SecurityGroups ?? []).map((group) => ({
           GroupId: group.GroupId,
           GroupName: group.GroupName,
           VpcId: group.VpcId,
@@ -1172,60 +1151,36 @@ export class AwsAuditorClient {
             IpRanges: (permission.IpRanges ?? []).map((range) => ({ CidrIp: range.CidrIp, Description: range.Description })),
             Ipv6Ranges: (permission.Ipv6Ranges ?? []).map((range) => ({ CidrIpv6: range.CidrIpv6, Description: range.Description })),
           })),
-        });
-      }
-      nextToken = result.NextToken;
-      if (groups.length > limit) {
-        truncated = true;
-        groups.length = limit;
-        break;
-      }
-    } while (nextToken);
-    return { items: groups, truncated };
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
   async describeDbInstances(region: string, limit = DEFAULT_INSTANCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const instances: JsonRecord[] = [];
-    let marker: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (marker) => {
       const result = await this.rdsFor(region).send(new DescribeDBInstancesCommand({ Marker: marker, MaxRecords: 100 }));
-      for (const instance of result.DBInstances ?? []) {
-        instances.push({
+      return {
+        items: (result.DBInstances ?? []).map((instance) => ({
           DBInstanceIdentifier: instance.DBInstanceIdentifier,
           DBInstanceArn: instance.DBInstanceArn,
           Engine: instance.Engine,
           StorageEncrypted: instance.StorageEncrypted,
           KmsKeyId: instance.KmsKeyId,
-        });
-      }
-      marker = result.Marker;
-      if (instances.length > limit) {
-        truncated = true;
-        instances.length = limit;
-        break;
-      }
-    } while (marker);
-    return { items: instances, truncated };
+        })),
+        nextToken: result.Marker,
+      };
+    });
   }
 
   async listKmsKeys(region: string, limit = DEFAULT_KEY_LIMIT): Promise<AwsPagedList<JsonRecord>> {
-    const keys: JsonRecord[] = [];
-    let marker: string | undefined;
-    let truncated = false;
-    do {
+    return paginateAwsList(limit, async (marker) => {
       const result = await this.kmsFor(region).send(new ListKeysCommand({ Marker: marker, Limit: 1000 }));
-      for (const key of result.Keys ?? []) {
-        keys.push({ KeyId: key.KeyId, KeyArn: key.KeyArn });
-      }
-      marker = result.Truncated ? result.NextMarker : undefined;
-      if (keys.length > limit) {
-        truncated = true;
-        keys.length = limit;
-        break;
-      }
-    } while (marker);
-    return { items: keys, truncated };
+      return {
+        items: (result.Keys ?? []).map((key) => ({ KeyId: key.KeyId, KeyArn: key.KeyArn })),
+        nextToken: result.Truncated ? result.NextMarker : undefined,
+      };
+    });
   }
 
   async describeKmsKey(region: string, keyId: string): Promise<JsonRecord> {
@@ -1283,23 +1238,19 @@ export class AwsAuditorClient {
     }
   }
 
-  async listIamUsers(limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
-    const users: JsonRecord[] = [];
-    let marker: string | undefined;
-    while (users.length < limit) {
-      const result = await this.iam.send(new ListUsersCommand({ Marker: marker, MaxItems: Math.min(100, limit - users.length) }));
-      for (const user of result.Users ?? []) {
-        users.push({
+  async listIamUsers(limit = DEFAULT_USER_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (marker, remaining) => {
+      const result = await this.iam.send(new ListUsersCommand({ Marker: marker, MaxItems: Math.min(100, remaining) }));
+      return {
+        items: (result.Users ?? []).map((user) => ({
           UserName: user.UserName,
           Arn: user.Arn,
           CreateDate: user.CreateDate,
           PasswordLastUsed: user.PasswordLastUsed,
-        });
-      }
-      if (!result.IsTruncated || !result.Marker) break;
-      marker = result.Marker;
-    }
-    return users;
+        })),
+        nextToken: result.IsTruncated ? result.Marker : undefined,
+      };
+    });
   }
 
   async listMfaDevices(userName: string): Promise<JsonRecord[]> {
@@ -1325,28 +1276,24 @@ export class AwsAuditorClient {
     return asObject(result.AccessKeyLastUsed) ?? null;
   }
 
-  async getAccountAuthorizationDetails(limit = DEFAULT_ROLE_LIMIT): Promise<JsonRecord[]> {
-    const roles: JsonRecord[] = [];
-    let marker: string | undefined;
-    while (roles.length < limit) {
+  async getAccountAuthorizationDetails(limit = DEFAULT_ROLE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (marker, remaining) => {
       const result = await this.iam.send(new GetAccountAuthorizationDetailsCommand({
         Filter: ["Role"],
         Marker: marker,
-        MaxItems: Math.min(100, limit - roles.length),
+        MaxItems: Math.min(100, remaining),
       }));
-      for (const role of result.RoleDetailList ?? []) {
-        roles.push({
+      return {
+        items: (result.RoleDetailList ?? []).map((role) => ({
           RoleName: role.RoleName,
           Arn: role.Arn,
           PermissionsBoundary: role.PermissionsBoundary,
           AttachedManagedPolicies: role.AttachedManagedPolicies,
           RolePolicyList: role.RolePolicyList,
-        });
-      }
-      if (!result.IsTruncated || !result.Marker) break;
-      marker = result.Marker;
-    }
-    return roles;
+        })),
+        nextToken: result.IsTruncated ? result.Marker : undefined,
+      };
+    });
   }
 
   async describeTrails(): Promise<JsonRecord[]> {
@@ -1378,6 +1325,10 @@ export class AwsAuditorClient {
     };
   }
 
+  /**
+   * Security Hub DescribeHub; null when the hub is not enabled in the region (InvalidAccessException or
+   * ResourceNotFoundException per the API reference). Denials and other failures propagate to the caller.
+   */
   async describeSecurityHub(): Promise<JsonRecord | null> {
     try {
       const result = await this.securityHub.send(new DescribeHubCommand({}));
@@ -1386,26 +1337,24 @@ export class AwsAuditorClient {
         AutoEnableControls: result.AutoEnableControls,
         SubscribedAt: result.SubscribedAt,
       };
-    } catch {
-      return null;
+    } catch (error) {
+      if (isErrorCode(error, "InvalidAccessException", "ResourceNotFoundException")) return null;
+      throw error;
     }
   }
 
-  async getEnabledSecurityHubStandards(): Promise<JsonRecord[]> {
-    const standards: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    do {
+  async getEnabledSecurityHubStandards(limit = DEFAULT_STANDARD_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.securityHub.send(new GetEnabledStandardsCommand({ MaxResults: 100, NextToken: nextToken }));
-      for (const standard of result.StandardsSubscriptions ?? []) {
-        standards.push({
+      return {
+        items: (result.StandardsSubscriptions ?? []).map((standard) => ({
           StandardsArn: standard.StandardsArn,
           StandardsStatus: standard.StandardsStatus,
           StandardsSubscriptionArn: standard.StandardsSubscriptionArn,
-        });
-      }
-      nextToken = result.NextToken;
-    } while (nextToken);
-    return standards;
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
   async describeConfigurationRecorders(): Promise<JsonRecord[]> {
@@ -1428,9 +1377,11 @@ export class AwsAuditorClient {
     }));
   }
 
-  async listDetectors(): Promise<string[]> {
-    const result = await this.guardDuty.send(new ListDetectorsCommand({}));
-    return result.DetectorIds ?? [];
+  async listDetectors(limit = DEFAULT_DETECTOR_LIMIT): Promise<AwsPagedList<string>> {
+    return paginateAwsList(limit, async (nextToken) => {
+      const result = await this.guardDuty.send(new ListDetectorsCommand({ MaxResults: 50, NextToken: nextToken }));
+      return { items: result.DetectorIds ?? [], nextToken: result.NextToken };
+    });
   }
 
   async getDetector(detectorId: string): Promise<JsonRecord> {
@@ -1443,49 +1394,46 @@ export class AwsAuditorClient {
     };
   }
 
-  async listAnalyzers(): Promise<JsonRecord[]> {
-    const analyzers: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    do {
+  async listAnalyzers(limit = DEFAULT_ANALYZER_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.accessAnalyzer.send(new ListAnalyzersCommand({ nextToken, maxResults: 100 }));
-      for (const analyzer of result.analyzers ?? []) {
-        analyzers.push({
+      return {
+        items: (result.analyzers ?? []).map((analyzer) => ({
           arn: analyzer.arn,
           name: analyzer.name,
           type: analyzer.type,
           status: analyzer.status,
-        });
-      }
-      nextToken = result.nextToken;
-    } while (nextToken);
-    return analyzers;
+        })),
+        nextToken: result.nextToken,
+      };
+    });
   }
 
-  async listAccessAnalyzerFindings(analyzerArn: string, limit = DEFAULT_MAX_FINDINGS): Promise<JsonRecord[]> {
-    const findings: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    while (findings.length < limit) {
+  async listAccessAnalyzerFindings(analyzerArn: string, limit = DEFAULT_MAX_FINDINGS): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken, remaining) => {
       const result = await this.accessAnalyzer.send(new ListFindingsCommand({
         analyzerArn,
-        maxResults: Math.min(100, limit - findings.length),
+        maxResults: Math.min(100, remaining),
         nextToken,
       }));
-      for (const finding of result.findings ?? []) {
-        findings.push({
+      return {
+        items: (result.findings ?? []).map((finding) => ({
           id: finding.id,
           status: finding.status,
           resourceType: finding.resourceType,
           resource: finding.resource,
           principal: finding.principal,
           condition: finding.condition,
-        });
-      }
-      if (!result.nextToken) break;
-      nextToken = result.nextToken;
-    }
-    return findings;
+        })),
+        nextToken: result.nextToken,
+      };
+    });
   }
 
+  /**
+   * Organizations DescribeOrganization; null when the account is not part of an organization
+   * (AWSOrganizationsNotInUseException). Denials and other failures propagate to the caller.
+   */
   async describeOrganization(): Promise<JsonRecord | null> {
     try {
       const result = await this.organizations.send(new DescribeOrganizationCommand({}));
@@ -1494,80 +1442,73 @@ export class AwsAuditorClient {
         FeatureSet: result.Organization?.FeatureSet,
         ManagementAccountId: result.Organization?.MasterAccountId,
       };
-    } catch {
-      return null;
+    } catch (error) {
+      if (isErrorCode(error, "AWSOrganizationsNotInUseException")) return null;
+      throw error;
     }
   }
 
-  async listAccounts(limit = 1000): Promise<JsonRecord[]> {
-    const accounts: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    while (accounts.length < limit) {
-      const result = await this.organizations.send(new ListAccountsCommand({ NextToken: nextToken, MaxResults: Math.min(20, limit - accounts.length) }));
-      for (const account of result.Accounts ?? []) {
-        accounts.push({
+  async listAccounts(limit = DEFAULT_ACCOUNT_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken, remaining) => {
+      const result = await this.organizations.send(new ListAccountsCommand({ NextToken: nextToken, MaxResults: Math.min(20, remaining) }));
+      return {
+        items: (result.Accounts ?? []).map((account) => ({
           Id: account.Id,
           Name: account.Name,
           Status: account.Status,
-        });
-      }
-      if (!result.NextToken) break;
-      nextToken = result.NextToken;
-    }
-    return accounts;
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
-  async listScps(): Promise<JsonRecord[]> {
-    const policies: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    do {
+  async listScps(limit = DEFAULT_POLICY_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.organizations.send(new ListPoliciesCommand({
         Filter: "SERVICE_CONTROL_POLICY",
         NextToken: nextToken,
         MaxResults: 20,
       }));
-      for (const policy of result.Policies ?? []) {
-        policies.push({
+      return {
+        items: (result.Policies ?? []).map((policy) => ({
           Id: policy.Id,
           Name: policy.Name,
           AwsManaged: policy.AwsManaged,
-        });
-      }
-      nextToken = result.NextToken;
-    } while (nextToken);
-    return policies;
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
-  async listPolicyTargets(policyId: string): Promise<JsonRecord[]> {
-    const targets: JsonRecord[] = [];
-    let nextToken: string | undefined;
-    do {
+  async listPolicyTargets(policyId: string, limit = DEFAULT_TARGET_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken) => {
       const result = await this.organizations.send(new ListTargetsForPolicyCommand({
         PolicyId: policyId,
         NextToken: nextToken,
       }));
-      for (const target of result.Targets ?? []) {
-        targets.push({
+      return {
+        items: (result.Targets ?? []).map((target) => ({
           TargetId: target.TargetId,
           Name: target.Name,
           Type: target.Type,
-        });
-      }
-      nextToken = result.NextToken;
-    } while (nextToken);
-    return targets;
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 
-  async listIdentityCenterInstances(): Promise<JsonRecord[]> {
-    try {
-      const result = await this.ssoAdmin.send(new ListInstancesCommand({}));
-      return (result.Instances ?? []).map((instance) => ({
-        InstanceArn: instance.InstanceArn,
-        IdentityStoreId: instance.IdentityStoreId,
-      }));
-    } catch {
-      return [];
-    }
+  /** Identity Center ListInstances; an empty list means no instance is visible, while denials propagate to the caller. */
+  async listIdentityCenterInstances(limit = DEFAULT_ANALYZER_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    return paginateAwsList(limit, async (nextToken) => {
+      const result = await this.ssoAdmin.send(new ListInstancesCommand({ MaxResults: 100, NextToken: nextToken }));
+      return {
+        items: (result.Instances ?? []).map((instance) => ({
+          InstanceArn: instance.InstanceArn,
+          IdentityStoreId: instance.IdentityStoreId,
+        })),
+        nextToken: result.NextToken,
+      };
+    });
   }
 }
 
@@ -1633,12 +1574,12 @@ export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsA
   const surfaces = await Promise.all([
     surface("iam_summary", "iam", () => client.getAccountSummary(), () => 1),
     surface("cloudtrail", "cloudtrail", () => client.describeTrails(), (value) => Array.isArray(value) ? value.length : undefined),
-    surface("security_hub", "securityhub", () => client.getEnabledSecurityHubStandards(), (value) => Array.isArray(value) ? value.length : undefined),
+    surface("security_hub", "securityhub", () => client.getEnabledSecurityHubStandards(), pagedCount),
     surface("config", "config", () => client.describeConfigurationRecorders(), (value) => Array.isArray(value) ? value.length : undefined),
-    surface("guardduty", "guardduty", () => client.listDetectors(), (value) => Array.isArray(value) ? value.length : undefined),
-    surface("access_analyzer", "access-analyzer", () => client.listAnalyzers(), (value) => Array.isArray(value) ? value.length : undefined),
-    surface("organizations", "organizations", () => client.describeOrganization(), () => 1),
-    surface("identity_center", "sso-admin", () => client.listIdentityCenterInstances(), (value) => Array.isArray(value) ? value.length : undefined),
+    surface("guardduty", "guardduty", () => client.listDetectors(), pagedCount),
+    surface("access_analyzer", "access-analyzer", () => client.listAnalyzers(), pagedCount),
+    surface("organizations", "organizations", () => client.describeOrganization(), (value) => (value ? 1 : 0)),
+    surface("identity_center", "sso-admin", () => client.listIdentityCenterInstances(), pagedCount),
     ...optionalProbes,
   ]);
 
@@ -1763,7 +1704,7 @@ export async function assessAwsIdentity(
   const lookbackStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
   const region = typeof client.getResolvedConfig === "function" ? client.getResolvedConfig().region : DEFAULT_REGION;
 
-  const [summary, passwordPolicy, users, roles, rootActivity, customerPolicies] = await Promise.all([
+  const [summary, passwordPolicy, userList, roleList, rootActivity, customerPolicies] = await Promise.all([
     client.getAccountSummary(),
     client.getPasswordPolicy(),
     client.listIamUsers(userLimit),
@@ -1772,6 +1713,12 @@ export async function assessAwsIdentity(
     attemptAwsRead("iam:ListPolicies Scope=Local", () => client.listCustomerManagedPolicies(policyLimit), errors),
   ]);
   const rootEvents = rootActivity.result;
+  const users = userList.items;
+  const roles = roleList.items;
+  if (userList.truncated) errors.push(`iam:ListUsers: inventory truncated at user_limit ${userLimit}; user verdicts cover the first ${userLimit} users only.`);
+  if (roleList.truncated) errors.push(`iam:GetAccountAuthorizationDetails Filter=Role: inventory truncated at role_limit ${roleLimit}; role verdicts cover the first ${roleLimit} roles only.`);
+  const userCaps = userList.truncated ? [`user inventory truncated at ${userLimit}`] : [];
+  const roleCaps = roleList.truncated ? [`role inventory truncated at ${roleLimit}`] : [];
 
   const policyRows = await mapWithConcurrency(customerPolicies.value?.items ?? [], DEFAULT_CONCURRENCY, async (policy) => {
     const arn = asString(policy.Arn) ?? "";
@@ -1822,6 +1769,35 @@ export async function assessAwsIdentity(
   const privilegedRoles = roles.filter(hasAdministratorPolicy);
   const rolesWithoutBoundaries = privilegedRoles.filter((role) => !role.PermissionsBoundary);
 
+  const mfaVerdict = withCap(
+    usersWithoutMfa.length > 0 ? "fail" : "pass",
+    usersWithoutMfa.length > 0
+      ? `${usersWithoutMfa.length}/${users.length} IAM users are missing MFA.`
+      : `All ${users.length} sampled IAM users have MFA devices.`,
+    userCaps,
+  );
+  const keyRotationVerdict = withCap(
+    staleAccessKeys.length > 0 ? "fail" : "pass",
+    staleAccessKeys.length > 0
+      ? `${staleAccessKeys.length} access keys are older than ${staleDays} days or unused beyond that threshold.`
+      : `No sampled access key exceeded the ${staleDays}-day staleness threshold.`,
+    userCaps,
+  );
+  const boundaryVerdict = withCap(
+    rolesWithoutBoundaries.length > maxPrivilegedRoles ? "fail" : rolesWithoutBoundaries.length > 0 ? "warn" : "pass",
+    rolesWithoutBoundaries.length > 0
+      ? `${rolesWithoutBoundaries.length}/${privilegedRoles.length} privileged roles lack permission boundaries.`
+      : `No sampled privileged role lacked a permission boundary (${roles.length} roles read).`,
+    roleCaps,
+  );
+  const dormantVerdict = withCap(
+    dormantUsers.length > 0 ? "warn" : "pass",
+    dormantUsers.length > 0
+      ? `${dormantUsers.length} IAM users appear dormant beyond ${staleDays} days or without recent password activity.`
+      : "No dormant IAM users were detected from the sampled password activity.",
+    userCaps,
+  );
+
   const findings = [
     finding(
       "AWS-IAM-01",
@@ -1838,12 +1814,10 @@ export async function assessAwsIdentity(
       "AWS-IAM-02",
       "IAM user MFA coverage",
       "high",
-      usersWithoutMfa.length > 0 ? "fail" : "pass",
-      usersWithoutMfa.length > 0
-        ? `${usersWithoutMfa.length}/${users.length} IAM users are missing MFA.`
-        : "All sampled IAM users have MFA devices.",
+      mfaVerdict.status,
+      mfaVerdict.summary,
       ["FedRAMP IA-2(1)", "FedRAMP IA-2(2)", "CMMC 3.5.3", "PCI-DSS 8.4.2"],
-      { user_count: users.length, users_without_mfa: usersWithoutMfa.slice(0, 25) },
+      { user_count: users.length, users_without_mfa: usersWithoutMfa.slice(0, 25), user_inventory_truncated: userList.truncated },
     ),
     finding(
       "AWS-IAM-03",
@@ -1872,38 +1846,37 @@ export async function assessAwsIdentity(
       "AWS-IAM-04",
       "Access key rotation",
       "high",
-      staleAccessKeys.length > 0 ? "fail" : "pass",
-      staleAccessKeys.length > 0
-        ? `${staleAccessKeys.length} access keys are older than ${staleDays} days or unused beyond that threshold.`
-        : `No sampled access key exceeded the ${staleDays}-day staleness threshold.`,
+      keyRotationVerdict.status,
+      keyRotationVerdict.summary,
       ["FedRAMP IA-5(1)", "FedRAMP AC-2(3)", "CMMC 3.5.8", "CIS AWS 1.12"],
-      { stale_access_keys: staleAccessKeys.slice(0, 25) },
+      {
+        stale_access_keys: staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays })),
+        user_inventory_truncated: userList.truncated,
+      },
     ),
     finding(
       "AWS-IAM-05",
       "Privileged role boundaries",
       "medium",
-      rolesWithoutBoundaries.length > maxPrivilegedRoles ? "fail" : rolesWithoutBoundaries.length > 0 ? "warn" : "pass",
-      rolesWithoutBoundaries.length > 0
-        ? `${rolesWithoutBoundaries.length}/${privilegedRoles.length} privileged roles lack permission boundaries.`
-        : "No sampled privileged role lacked a permission boundary.",
+      boundaryVerdict.status,
+      boundaryVerdict.summary,
       ["FedRAMP AC-6(1)", "FedRAMP AC-6(2)", "CMMC 3.1.5", "CIS AWS 1.16"],
       {
+        roles_read: roles.length,
         privileged_roles: privilegedRoles.length,
         roles_without_boundaries: rolesWithoutBoundaries.slice(0, 25).map((role) => role.RoleName ?? role.Arn),
         max_privileged_roles: maxPrivilegedRoles,
+        role_inventory_truncated: roleList.truncated,
       },
     ),
     finding(
       "AWS-IAM-06",
       "Dormant IAM users",
       "low",
-      dormantUsers.length > 0 ? "warn" : "pass",
-      dormantUsers.length > 0
-        ? `${dormantUsers.length} IAM users appear dormant beyond ${staleDays} days or without recent password activity.`
-        : "No dormant IAM users were detected from the sampled password activity.",
+      dormantVerdict.status,
+      dormantVerdict.summary,
       ["FedRAMP AC-2(3)", "CMMC 3.1.12", "SOC 2 CC6.2", "CIS AWS 1.12"],
-      { dormant_users: dormantUsers.slice(0, 25) },
+      { dormant_users: dormantUsers.slice(0, 25), user_inventory_truncated: userList.truncated },
     ),
   ];
 
@@ -2007,8 +1980,11 @@ export async function assessAwsIdentity(
     title: "AWS identity posture",
     summary: {
       users: users.length,
+      user_inventory_truncated: userList.truncated,
       users_without_mfa: usersWithoutMfa.length,
       stale_access_keys: staleAccessKeys.length,
+      roles: roles.length,
+      role_inventory_truncated: roleList.truncated,
       privileged_roles: privilegedRoles.length,
       roles_without_boundaries: rolesWithoutBoundaries.length,
       dormant_users: dormantUsers.length,
@@ -2032,110 +2008,241 @@ function hasAnyDataEvents(selectors: JsonRecord): boolean {
   }) || advanced.length > 0;
 }
 
-export async function assessAwsLoggingDetection(
-  client: Pick<
-    AwsAuditorClient,
-    "describeTrails" | "getTrailStatus" | "getEventSelectors" | "describeSecurityHub" | "getEnabledSecurityHubStandards" | "describeConfigurationRecorders" | "describeConfigurationRecorderStatus" | "listDetectors" | "getDetector"
-  >,
-): Promise<AwsAssessmentResult> {
-  const [trails, hub, standards, recorders, recorderStatuses, detectorIds] = await Promise.all([
-    client.describeTrails(),
-    client.describeSecurityHub(),
-    client.getEnabledSecurityHubStandards().catch(() => []),
-    client.describeConfigurationRecorders().catch(() => []),
-    client.describeConfigurationRecorderStatus().catch(() => []),
-    client.listDetectors().catch(() => []),
+export type AwsLoggingDetectionClient = Pick<
+  AwsAuditorClient,
+  "describeTrails" | "getTrailStatus" | "getEventSelectors" | "describeSecurityHub" | "getEnabledSecurityHubStandards" | "describeConfigurationRecorders" | "describeConfigurationRecorderStatus" | "listDetectors" | "getDetector"
+>;
+
+export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClient): Promise<AwsAssessmentResult> {
+  const errors: string[] = [];
+  const [trailList, hub, recorders, recorderStatuses, detectorIds] = await Promise.all([
+    attemptAwsRead("cloudtrail:DescribeTrails", () => client.describeTrails(), errors),
+    attemptAwsRead("securityhub:DescribeHub", () => client.describeSecurityHub(), errors),
+    attemptAwsRead("config:DescribeConfigurationRecorders", () => client.describeConfigurationRecorders(), errors),
+    attemptAwsRead("config:DescribeConfigurationRecorderStatus", () => client.describeConfigurationRecorderStatus(), errors),
+    attemptAwsRead("guardduty:ListDetectors", () => client.listDetectors(), errors),
   ]);
+  // Standards are only meaningful once the hub is known to be enabled; GetEnabledStandards fails on a disabled hub.
+  const standards: AwsSurfaceResult<AwsPagedList<JsonRecord>> | undefined = hub.value
+    ? await attemptAwsRead("securityhub:GetEnabledStandards", () => client.getEnabledSecurityHubStandards(), errors)
+    : undefined;
 
-  const trailDetails = await Promise.all(trails.map(async (trail) => {
+  const trails = trailList.value ?? [];
+  const trailDetails = await mapWithConcurrency(trails, DEFAULT_CONCURRENCY, async (trail) => {
     const nameOrArn = asString(trail.TrailARN) ?? asString(trail.Name) ?? "";
-    const status = nameOrArn ? await client.getTrailStatus(nameOrArn).catch(() => ({})) : {};
-    const selectors = nameOrArn ? await client.getEventSelectors(nameOrArn).catch(() => ({})) : {};
+    const label = asString(trail.Name) ?? nameOrArn;
+    const missing: AwsSurfaceResult<JsonRecord> = { error: "trail has neither Name nor TrailARN" };
+    const [status, selectors] = nameOrArn
+      ? await Promise.all([
+          attemptAwsRead(`cloudtrail:GetTrailStatus ${label}`, () => client.getTrailStatus(nameOrArn), errors),
+          attemptAwsRead(`cloudtrail:GetEventSelectors ${label}`, () => client.getEventSelectors(nameOrArn), errors),
+        ])
+      : [missing, missing];
     return {
-      Name: asString(trail.Name),
-      TrailARN: asString(trail.TrailARN),
-      IsMultiRegionTrail: trail.IsMultiRegionTrail === true,
-      LogFileValidationEnabled: trail.LogFileValidationEnabled === true,
-      status: asObject(status) ?? {},
-      selectors: asObject(selectors) ?? {},
-    } as JsonRecord;
-  }));
-
-  const goodTrails = trailDetails.filter((trail) =>
-    trail.IsMultiRegionTrail === true
-    && trail.LogFileValidationEnabled === true
-    && asObject(trail.status)?.IsLogging === true,
-  );
-  const trailsWithDataEvents = trailDetails.filter((trail) => hasAnyDataEvents(asObject(trail.selectors) ?? {}));
-
-  const configHealthy = recorders.some((recorder) => {
-    const name = asString(recorder.name);
-    const status = recorderStatuses.find((item) => asString(item.name) === name);
-    return status?.recording === true;
+      name: label,
+      trailArn: asString(trail.TrailARN),
+      isMultiRegion: trail.IsMultiRegionTrail === true,
+      validation: trail.LogFileValidationEnabled === true,
+      isLogging: boolFlag(status.value, "IsLogging"),
+      statusError: status.error,
+      hasDataEvents: selectors.value ? hasAnyDataEvents(selectors.value) : undefined,
+      selectorsError: selectors.error,
+    };
   });
 
-  const detectors = await Promise.all(detectorIds.map((detectorId) =>
-    client.getDetector(detectorId).catch(() => ({} as JsonRecord)),
-  ));
-  const enabledDetectors = detectors.filter((detector) => asString(detector.Status) === "ENABLED");
+  // Controls 6 and 7: a multi-region trail with log-file validation whose GetTrailStatus reports IsLogging=true.
+  const goodTrails = trailDetails.filter((trail) => trail.isMultiRegion && trail.validation && trail.isLogging === true);
+  const unverifiedTrails = trailDetails.filter((trail) => trail.isMultiRegion && trail.validation && trail.isLogging === undefined);
+  const statusUnreadable = trailDetails.filter((trail) => trail.statusError);
+  let trailStatus: AwsFinding["status"];
+  let trailSummary: string;
+  if (trailList.error) {
+    trailStatus = "manual";
+    trailSummary = `CloudTrail trails could not be listed (${trailList.error}); verify in the CloudTrail console that a multi-region trail with log-file validation is logging.`;
+  } else if (goodTrails.length > 0) {
+    trailStatus = "pass";
+    trailSummary = `${goodTrails.length} of ${trails.length} CloudTrail trail(s) are multi-region, logging, and log-file validation enabled.`;
+  } else if (unverifiedTrails.length > 0) {
+    trailStatus = "manual";
+    trailSummary = `${unverifiedTrails.length} multi-region trail(s) with log-file validation exist, but logging state could not be read (${unverifiedTrails[0].statusError ?? "IsLogging missing from GetTrailStatus"}); confirm IsLogging in the CloudTrail console.`;
+  } else {
+    trailStatus = "fail";
+    trailSummary = `No multi-region CloudTrail trail with active logging and log-file validation was detected among ${trails.length} trail(s).`;
+  }
+  const trailCaps: string[] = [];
+  if (statusUnreadable.length > 0) trailCaps.push(`GetTrailStatus unreadable for ${statusUnreadable.length} trail(s) (${statusUnreadable.map((trail) => trail.name).join(", ")})`);
+  const trailVerdict = withCap(trailStatus, trailSummary, trailCaps);
+
+  // Control 19: data events or advanced event selectors on at least one trail.
+  const trailsWithDataEvents = trailDetails.filter((trail) => trail.hasDataEvents === true);
+  const selectorsUnreadable = trailDetails.filter((trail) => trail.selectorsError);
+  let dataEventStatus: AwsFinding["status"];
+  let dataEventSummary: string;
+  if (trailList.error) {
+    dataEventStatus = "manual";
+    dataEventSummary = `CloudTrail trails could not be listed (${trailList.error}); verify data event selectors in the CloudTrail console.`;
+  } else if (trailsWithDataEvents.length > 0) {
+    dataEventStatus = "pass";
+    dataEventSummary = `${trailsWithDataEvents.length} of ${trails.length} trail(s) capture data events or advanced event selectors.`;
+  } else if (selectorsUnreadable.length > 0) {
+    dataEventStatus = "manual";
+    dataEventSummary = `Event selectors could not be read for ${selectorsUnreadable.length} of ${trails.length} trail(s) (${selectorsUnreadable[0].selectorsError}); data event coverage is unverified.`;
+  } else {
+    dataEventStatus = "warn";
+    dataEventSummary = `No CloudTrail data event coverage was detected across ${trails.length} trail(s).`;
+  }
+  const dataEventCaps: string[] = [];
+  if (selectorsUnreadable.length > 0) dataEventCaps.push(`GetEventSelectors unreadable for ${selectorsUnreadable.length} trail(s) (${selectorsUnreadable.map((trail) => trail.name).join(", ")})`);
+  const dataEventVerdict = withCap(dataEventStatus, dataEventSummary, dataEventCaps);
+
+  // Control 8: Security Hub enabled with at least one standards subscription.
+  const standardList = standards?.value?.items ?? [];
+  let hubStatus: AwsFinding["status"];
+  let hubSummary: string;
+  if (hub.error) {
+    hubStatus = "manual";
+    hubSummary = `Security Hub could not be described (${hub.error}); verify Security Hub enablement and standards in the console for the configured region.`;
+  } else if (!hub.value) {
+    hubStatus = "fail";
+    hubSummary = "Security Hub is not enabled in the configured region (DescribeHub reported the hub as not subscribed).";
+  } else if (standards?.error) {
+    hubStatus = "warn";
+    hubSummary = `Security Hub is enabled, but enabled standards could not be listed (${standards.error}); verify standards subscriptions in the console.`;
+  } else if (standardList.length === 0) {
+    hubStatus = "warn";
+    hubSummary = "Security Hub is enabled but no standards subscription is enabled.";
+  } else {
+    hubStatus = "pass";
+    hubSummary = `Security Hub is enabled with ${standardList.length} enabled standard subscription(s).`;
+  }
+  const hubCaps: string[] = [];
+  if (standards?.value?.truncated) hubCaps.push(`standards list truncated at ${DEFAULT_STANDARD_LIMIT}`);
+  const hubVerdict = withCap(hubStatus, hubSummary, hubCaps);
+
+  // Control 9: at least one GuardDuty detector with Status=ENABLED.
+  const detectorList = detectorIds.value?.items ?? [];
+  const detectors = await mapWithConcurrency(detectorList, DEFAULT_CONCURRENCY, async (detectorId) => ({
+    id: detectorId,
+    detail: await attemptAwsRead(`guardduty:GetDetector ${detectorId}`, () => client.getDetector(detectorId), errors),
+  }));
+  const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === "ENABLED");
+  const unreadableDetectors = detectors.filter((detector) => detector.detail.error);
+  let detectorStatus: AwsFinding["status"];
+  let detectorSummary: string;
+  if (detectorIds.error) {
+    detectorStatus = "manual";
+    detectorSummary = `GuardDuty detectors could not be listed (${detectorIds.error}); verify GuardDuty enablement in the console for the configured region.`;
+  } else if (enabledDetectors.length > 0) {
+    detectorStatus = "pass";
+    detectorSummary = `${enabledDetectors.length} of ${detectorList.length} GuardDuty detector(s) are enabled.`;
+  } else if (unreadableDetectors.length > 0) {
+    detectorStatus = "manual";
+    detectorSummary = `${detectorList.length} GuardDuty detector(s) exist, but GetDetector could not be read for ${unreadableDetectors.length} of them (${unreadableDetectors[0].detail.error}); enablement is unverified.`;
+  } else {
+    detectorStatus = "fail";
+    detectorSummary = detectorList.length === 0
+      ? "No GuardDuty detector exists in the configured region."
+      : `${detectorList.length} GuardDuty detector(s) exist but none reports Status=ENABLED.`;
+  }
+  const detectorCaps: string[] = [];
+  if (unreadableDetectors.length > 0) detectorCaps.push(`GetDetector unreadable for ${unreadableDetectors.length} detector(s)`);
+  if (detectorIds.value?.truncated) detectorCaps.push(`detector list truncated at ${DEFAULT_DETECTOR_LIMIT}`);
+  const detectorVerdict = withCap(detectorStatus, detectorSummary, detectorCaps);
+
+  // Control 10: a configuration recorder whose status reports recording=true.
+  const recorderList = recorders.value ?? [];
+  const statusList = recorderStatuses.value ?? [];
+  const recordingRecorders = recorderList.filter((recorder) => {
+    const name = asString(recorder.name);
+    return statusList.some((item) => asString(item.name) === name && item.recording === true);
+  });
+  let configStatus: AwsFinding["status"];
+  let configSummary: string;
+  if (recorders.error) {
+    configStatus = "manual";
+    configSummary = `AWS Config recorders could not be listed (${recorders.error}); verify the configuration recorder in the AWS Config console for the configured region.`;
+  } else if (recorderList.length === 0) {
+    configStatus = "fail";
+    configSummary = "No AWS Config configuration recorder exists in the configured region.";
+  } else if (recorderStatuses.error) {
+    configStatus = "manual";
+    configSummary = `${recorderList.length} configuration recorder(s) exist, but recording state could not be read (${recorderStatuses.error}); confirm recording=true in the AWS Config console.`;
+  } else if (recordingRecorders.length > 0) {
+    configStatus = "pass";
+    configSummary = `${recordingRecorders.length} of ${recorderList.length} configuration recorder(s) report recording=true.`;
+  } else {
+    configStatus = "fail";
+    configSummary = `${recorderList.length} configuration recorder(s) exist but none reports recording=true.`;
+  }
 
   const findings = [
     finding(
       "AWS-LOG-01",
       "Multi-region CloudTrail with validation",
       "critical",
-      goodTrails.length > 0 ? "pass" : "fail",
-      goodTrails.length > 0
-        ? `${goodTrails.length} CloudTrail trail(s) are multi-region, logging, and log-file validation enabled.`
-        : "No multi-region CloudTrail trail with active logging and log-file validation was detected.",
+      trailVerdict.status,
+      trailVerdict.summary,
       ["FedRAMP AU-2", "FedRAMP AU-9", "CMMC 3.3.1", "CIS AWS 3.1"],
-      { trails: trailDetails.map((trail) => ({ name: trail.Name, is_multi_region: trail.IsMultiRegionTrail, validation: trail.LogFileValidationEnabled, is_logging: asObject(trail.status)?.IsLogging })) },
+      {
+        trails_readable: !trailList.error,
+        trails: trailDetails.map((trail) => ({ name: trail.name, is_multi_region: trail.isMultiRegion, validation: trail.validation, is_logging: trail.isLogging ?? null, status_error: trail.statusError ?? null })),
+      },
     ),
     finding(
       "AWS-LOG-02",
       "CloudTrail data events",
       "medium",
-      trailsWithDataEvents.length > 0 ? "pass" : "warn",
-      trailsWithDataEvents.length > 0
-        ? `${trailsWithDataEvents.length} trail(s) capture data events or advanced event selectors.`
-        : "No CloudTrail data event coverage was detected.",
+      dataEventVerdict.status,
+      dataEventVerdict.summary,
       ["FedRAMP AU-12", "CMMC 3.3.1", "SOC 2 CC7.2", "CIS AWS 3.3"],
-      { data_event_trails: trailsWithDataEvents.map((trail) => trail.Name ?? trail.TrailARN) },
+      {
+        trails_readable: !trailList.error,
+        data_event_trails: trailsWithDataEvents.map((trail) => trail.name),
+        selectors_unreadable: selectorsUnreadable.map((trail) => trail.name),
+      },
     ),
     finding(
       "AWS-LOG-03",
       "Security Hub enablement",
       "high",
-      hub && standards.length > 0 ? "pass" : hub ? "warn" : "fail",
-      hub
-        ? `${standards.length} enabled Security Hub standard subscription(s) were visible.`
-        : "Security Hub does not appear enabled in the configured region.",
+      hubVerdict.status,
+      hubVerdict.summary,
       ["FedRAMP CA-7", "FedRAMP SI-4", "SOC 2 CC7.1", "PCI-DSS 11.5.1"],
-      { hub_enabled: Boolean(hub), standard_count: standards.length },
+      {
+        hub_readable: !hub.error,
+        hub_enabled: Boolean(hub.value),
+        standards_readable: standards ? !standards.error : null,
+        standard_count: standardList.length,
+        standards_truncated: standards?.value?.truncated ?? false,
+      },
     ),
     finding(
       "AWS-LOG-04",
       "GuardDuty detectors",
       "high",
-      enabledDetectors.length > 0 ? "pass" : "fail",
-      enabledDetectors.length > 0
-        ? `${enabledDetectors.length} GuardDuty detector(s) are enabled.`
-        : "No enabled GuardDuty detector was detected.",
+      detectorVerdict.status,
+      detectorVerdict.summary,
       ["FedRAMP SI-4", "FedRAMP IR-4", "SOC 2 CC7.2", "CIS AWS 1.1"],
-      { detector_count: detectorIds.length, enabled_detectors: enabledDetectors.length },
+      {
+        detectors_readable: !detectorIds.error,
+        detector_count: detectorList.length,
+        enabled_detectors: enabledDetectors.length,
+        detectors_unreadable: unreadableDetectors.map((detector) => detector.id),
+        detector_list_truncated: detectorIds.value?.truncated ?? false,
+      },
     ),
     finding(
       "AWS-LOG-05",
       "AWS Config recording",
       "high",
-      configHealthy ? "pass" : "fail",
-      configHealthy
-        ? `${recorders.length} configuration recorder(s) were visible with active recording.`
-        : "No active AWS Config recorder was detected.",
+      configStatus,
+      configSummary,
       ["FedRAMP CM-2", "FedRAMP CM-6", "SOC 2 CC7.1", "CIS AWS 3.5"],
       {
-        recorders: recorders.map((recorder) => ({ name: recorder.name, all_supported: asObject(recorder.recordingGroup)?.allSupported })),
-        recorder_statuses: recorderStatuses,
+        recorders_readable: !recorders.error,
+        recorder_status_readable: !recorderStatuses.error,
+        recorders: recorderList.map((recorder) => ({ name: recorder.name, all_supported: asObject(recorder.recordingGroup)?.allSupported })),
+        recorder_statuses: statusList.map((status) => ({ name: status.name, recording: status.recording, last_status: status.lastStatus })),
       },
     ),
   ];
@@ -2145,12 +2252,16 @@ export async function assessAwsLoggingDetection(
     summary: {
       trails: trailDetails.length,
       compliant_trails: goodTrails.length,
-      security_hub_standards: standards.length,
-      guardduty_detectors: detectorIds.length,
+      security_hub_enabled: Boolean(hub.value),
+      security_hub_standards: standardList.length,
+      guardduty_detectors: detectorList.length,
       enabled_guardduty_detectors: enabledDetectors.length,
-      config_recorders: recorders.length,
+      config_recorders: recorderList.length,
+      recording_config_recorders: recordingRecorders.length,
+      collection_errors: errors.length,
     },
     findings,
+    errors,
   };
 }
 
@@ -2173,90 +2284,232 @@ export async function assessAwsOrgGuardrails(
 ): Promise<AwsAssessmentResult> {
   const errors: string[] = [];
   const maxFindings = clampNumber(options.maxFindings, DEFAULT_MAX_FINDINGS, 1, 5000);
-  const [organization, accounts, scps, analyzers, identityCenterInstances, auditAssessments, securityContact] = await Promise.all([
-    client.describeOrganization().catch(() => null),
-    client.listAccounts().catch(() => []),
-    client.listScps().catch(() => []),
-    client.listAnalyzers().catch(() => []),
-    client.listIdentityCenterInstances().catch(() => []),
+  const [organization, analyzers, identityCenterInstances, auditAssessments, securityContact] = await Promise.all([
+    attemptAwsRead("organizations:DescribeOrganization", () => client.describeOrganization(), errors),
+    attemptAwsRead("access-analyzer:ListAnalyzers", () => client.listAnalyzers(), errors),
+    attemptAwsRead("sso:ListInstances", () => client.listIdentityCenterInstances(), errors),
     attemptAwsRead("auditmanager:ListAssessments status=ACTIVE", () => client.listActiveAuditManagerAssessments(), errors),
     attemptAwsRead("account:GetAlternateContact SECURITY", () => client.getSecurityAlternateContact(), errors),
   ]);
+  // A standalone account (DescribeOrganization returned AWSOrganizationsNotInUseException) has no accounts or SCPs to
+  // list; when the describe was denied the lists are still attempted because they are governed by separate IAM actions.
+  const standalone = !organization.error && organization.value === null;
+  const [accounts, scps] = standalone
+    ? [undefined, undefined]
+    : await Promise.all([
+        attemptAwsRead("organizations:ListAccounts", () => client.listAccounts(), errors),
+        attemptAwsRead("organizations:ListPolicies Filter=SERVICE_CONTROL_POLICY", () => client.listScps(), errors),
+      ]);
 
-  const scpTargets = await Promise.all(scps.map(async (policy) => ({
-    policyId: asString(policy.Id) ?? "",
-    name: asString(policy.Name) ?? asString(policy.Id) ?? "policy",
-    targets: await client.listPolicyTargets(asString(policy.Id) ?? "").catch(() => []),
-  })));
-  const attachedScps = scpTargets.filter((policy) => policy.targets.length > 0);
-
-  const activeAnalyzers = analyzers.filter((analyzer) => asString(analyzer.status) === "ACTIVE");
-  const findingLists = await Promise.all(activeAnalyzers.map(async (analyzer) => ({
-    analyzerArn: asString(analyzer.arn) ?? "",
-    findings: await client.listAccessAnalyzerFindings(asString(analyzer.arn) ?? "", maxFindings).catch(() => []),
-  })));
-  const activeExternalFindings = findingLists.flatMap((item) => item.findings).filter((finding) => {
-    const status = asString(finding.status)?.toUpperCase();
-    return !status || status === "ACTIVE";
+  const accountList = accounts?.value?.items ?? [];
+  const scpList = scps?.value?.items ?? [];
+  const scpTargets = await mapWithConcurrency(scpList, DEFAULT_CONCURRENCY, async (policy) => {
+    const policyId = asString(policy.Id) ?? "";
+    const name = asString(policy.Name) ?? (policyId || "policy");
+    return {
+      policyId,
+      name,
+      targets: await attemptAwsRead(`organizations:ListTargetsForPolicy ${name}`, () => client.listPolicyTargets(policyId), errors),
+    };
   });
+  const attachedScps = scpTargets.filter((policy) => (policy.targets.value?.items.length ?? 0) > 0);
+  const unreadableScps = scpTargets.filter((policy) => policy.targets.error);
+  const truncatedScpTargets = scpTargets.filter((policy) => policy.targets.value?.truncated);
+
+  const analyzerList = analyzers.value?.items ?? [];
+  const activeAnalyzers = analyzerList.filter((analyzer) => asString(analyzer.status) === "ACTIVE");
+  const findingLists = await mapWithConcurrency(activeAnalyzers, DEFAULT_CONCURRENCY, async (analyzer) => {
+    const analyzerArn = asString(analyzer.arn) ?? "";
+    const name = asString(analyzer.name) ?? analyzerArn;
+    return {
+      analyzerArn,
+      name,
+      findings: await attemptAwsRead(`access-analyzer:ListFindings ${name}`, () => client.listAccessAnalyzerFindings(analyzerArn, maxFindings), errors),
+    };
+  });
+  const readableFindingLists = findingLists.filter((item) => !item.findings.error);
+  const unreadableFindingLists = findingLists.filter((item) => item.findings.error);
+  const truncatedFindingLists = findingLists.filter((item) => item.findings.value?.truncated);
+  const activeExternalFindings: JsonRecord[] = readableFindingLists
+    .flatMap((item) => (item.findings.value?.items ?? []).map((entry): JsonRecord => ({ ...entry, analyzer: item.name })))
+    .filter((entry) => {
+      const status = asString(entry.status)?.toUpperCase();
+      return !status || status === "ACTIVE";
+    });
+  const identityCenterList = identityCenterInstances.value?.items ?? [];
+
+  // Control 16 (visibility): the organization itself plus its member account list.
+  const organizationId = asString(organization.value?.Id) ?? "unknown";
+  let orgStatus: AwsFinding["status"];
+  let orgSummary: string;
+  if (organization.error) {
+    orgStatus = "manual";
+    orgSummary = `AWS Organizations could not be described (${organization.error}); verify organization membership and guardrails in the Organizations console.`;
+  } else if (standalone) {
+    orgStatus = "warn";
+    orgSummary = "AWS Organizations is not in use for this account (DescribeOrganization returned AWSOrganizationsNotInUseException); it is a standalone account without organization guardrails.";
+  } else if (accounts?.error) {
+    orgStatus = "pass";
+    orgSummary = `AWS Organizations ${organizationId} is visible, but its member accounts could not be listed.`;
+  } else {
+    orgStatus = "pass";
+    orgSummary = `AWS Organizations ${organizationId} is visible with ${accountList.length} account(s).`;
+  }
+  const orgCaps: string[] = [];
+  if (accounts?.error) orgCaps.push(`member accounts unreadable (${accounts.error})`);
+  if (accounts?.value?.truncated) orgCaps.push(`account list truncated at ${DEFAULT_ACCOUNT_LIMIT}`);
+  const orgVerdict = withCap(orgStatus, orgSummary, orgCaps);
+
+  // Control 16 (enforcement): SCPs attached to at least one root, OU, or account.
+  let scpStatus: AwsFinding["status"];
+  let scpSummary: string;
+  if (standalone) {
+    scpStatus = "warn";
+    scpSummary = "The account is not part of an AWS Organization, so no service control policy applies to it; record the control as not applicable or bring the account under an organization with SCPs.";
+  } else if (scps?.error) {
+    scpStatus = "manual";
+    scpSummary = `Service control policies could not be listed (${scps.error}); verify SCP attachments in the Organizations console.`;
+  } else if (scpList.length === 0) {
+    scpStatus = "warn";
+    scpSummary = "No service control policies exist in the organization.";
+  } else if (attachedScps.length > 0) {
+    scpStatus = "pass";
+    scpSummary = `${attachedScps.length}/${scpList.length} SCPs are attached to at least one root, OU, or account.`;
+  } else if (unreadableScps.length > 0) {
+    scpStatus = "manual";
+    scpSummary = `${scpList.length} SCP(s) exist, but targets could not be read for ${unreadableScps.length} of them (${unreadableScps[0].targets.error}); attachment is unverified.`;
+  } else {
+    scpStatus = "fail";
+    scpSummary = `${scpList.length} SCP(s) exist but none is attached to a root, OU, or account.`;
+  }
+  const scpCaps: string[] = [];
+  if (unreadableScps.length > 0) scpCaps.push(`ListTargetsForPolicy unreadable for ${unreadableScps.length} SCP(s) (${unreadableScps.map((policy) => policy.name).join(", ")})`);
+  if (scps?.value?.truncated) scpCaps.push(`SCP list truncated at ${DEFAULT_POLICY_LIMIT}`);
+  if (truncatedScpTargets.length > 0) scpCaps.push(`target list truncated for ${truncatedScpTargets.length} SCP(s)`);
+  const scpVerdict = withCap(scpStatus, scpSummary, scpCaps);
+
+  // Control 15 (enablement): an analyzer with status ACTIVE.
+  let analyzerStatus: AwsFinding["status"];
+  let analyzerSummary: string;
+  if (analyzers.error) {
+    analyzerStatus = "manual";
+    analyzerSummary = `IAM Access Analyzer analyzers could not be listed (${analyzers.error}); verify analyzer enablement in the IAM Access Analyzer console.`;
+  } else if (activeAnalyzers.length > 0) {
+    analyzerStatus = "pass";
+    analyzerSummary = `${activeAnalyzers.length} of ${analyzerList.length} Access Analyzer instance(s) are ACTIVE.`;
+  } else {
+    analyzerStatus = "fail";
+    analyzerSummary = `No active IAM Access Analyzer instance was detected (${analyzerList.length} analyzer(s) visible, none ACTIVE).`;
+  }
+  const analyzerCaps: string[] = [];
+  if (analyzers.value?.truncated) analyzerCaps.push(`analyzer list truncated at ${DEFAULT_ANALYZER_LIMIT}`);
+  const analyzerVerdict = withCap(analyzerStatus, analyzerSummary, analyzerCaps);
+
+  // Control 15 (findings): active external-access findings across every readable ACTIVE analyzer.
+  let externalStatus: AwsFinding["status"];
+  let externalSummary: string;
+  if (analyzers.error) {
+    externalStatus = "manual";
+    externalSummary = `IAM Access Analyzer analyzers could not be listed (${analyzers.error}), so external access findings could not be sampled; review findings in the IAM Access Analyzer console.`;
+  } else if (activeAnalyzers.length === 0) {
+    externalStatus = "manual";
+    externalSummary = "No ACTIVE Access Analyzer instance was available to sample (see AWS-ORG-03), so external access findings could not be read; enable an analyzer or review cross-account access manually.";
+  } else if (readableFindingLists.length === 0) {
+    externalStatus = "manual";
+    externalSummary = `Findings could not be read for any of the ${activeAnalyzers.length} active analyzer(s) (${unreadableFindingLists[0]?.findings.error ?? "unknown error"}); review findings in the IAM Access Analyzer console.`;
+  } else if (activeExternalFindings.length > 0) {
+    externalStatus = "warn";
+    externalSummary = `${activeExternalFindings.length} active Access Analyzer finding(s) across ${readableFindingLists.length} analyzer(s) indicate external or cross-account access to review.`;
+  } else {
+    externalStatus = "pass";
+    externalSummary = `No active Access Analyzer findings were visible in the ${readableFindingLists.length} sampled analyzer(s).`;
+  }
+  const externalCaps: string[] = [];
+  if (unreadableFindingLists.length > 0) externalCaps.push(`ListFindings unreadable for ${unreadableFindingLists.length} analyzer(s) (${unreadableFindingLists.map((item) => item.name).join(", ")})`);
+  if (truncatedFindingLists.length > 0) externalCaps.push(`findings truncated at ${maxFindings} for ${truncatedFindingLists.map((item) => item.name).join(", ")}`);
+  const externalVerdict = withCap(externalStatus, externalSummary, externalCaps);
+
+  // Control 23: an IAM Identity Center instance visible from the configured region.
+  let identityCenterStatus: AwsFinding["status"];
+  let identityCenterSummary: string;
+  if (identityCenterInstances.error) {
+    identityCenterStatus = "manual";
+    identityCenterSummary = `IAM Identity Center instances could not be listed (${identityCenterInstances.error}); verify in the IAM Identity Center console.`;
+  } else if (identityCenterList.length > 0) {
+    identityCenterStatus = "pass";
+    identityCenterSummary = `${identityCenterList.length} IAM Identity Center instance(s) were visible.`;
+  } else {
+    identityCenterStatus = "warn";
+    identityCenterSummary = "No IAM Identity Center instance was visible from the configured region and credentials.";
+  }
+  const identityCenterCaps: string[] = [];
+  if (identityCenterInstances.value?.truncated) identityCenterCaps.push(`instance list truncated at ${DEFAULT_ANALYZER_LIMIT}`);
+  const identityCenterVerdict = withCap(identityCenterStatus, identityCenterSummary, identityCenterCaps);
 
   const findings = [
     finding(
       "AWS-ORG-01",
       "Organizations visibility",
       "medium",
-      organization ? "pass" : "warn",
-      organization
-        ? `AWS Organizations is visible with ${accounts.length} account(s).`
-        : "AWS Organizations data was not visible; this may be a standalone account or missing permissions.",
+      orgVerdict.status,
+      orgVerdict.summary,
       ["FedRAMP PM-2", "SOC 2 CC2.1", "CIS AWS 1.1"],
-      { organization: organization ?? {}, accounts: accounts.length },
+      {
+        organization_readable: !organization.error,
+        organization: organization.value ?? {},
+        accounts_readable: accounts ? !accounts.error : null,
+        accounts: accountList.length,
+        account_list_truncated: accounts?.value?.truncated ?? false,
+      },
     ),
     finding(
       "AWS-ORG-02",
       "Service control policies",
       "high",
-      scps.length === 0 ? "warn" : attachedScps.length > 0 ? "pass" : "fail",
-      scps.length === 0
-        ? "No service control policies were visible."
-        : attachedScps.length > 0
-          ? `${attachedScps.length}/${scps.length} SCPs are attached to at least one target.`
-          : "SCPs exist but none appeared attached to accounts or OUs.",
+      scpVerdict.status,
+      scpVerdict.summary,
       ["FedRAMP AC-3", "FedRAMP CM-7", "SOC 2 CC6.8", "CIS AWS 1.20"],
-      { scp_count: scps.length, attached_scp_count: attachedScps.length, sample: attachedScps.slice(0, 20) },
+      {
+        scps_readable: scps ? !scps.error : null,
+        scp_count: scpList.length,
+        attached_scp_count: attachedScps.length,
+        scps_targets_unreadable: unreadableScps.map((policy) => policy.name),
+        sample: attachedScps.slice(0, 20).map((policy) => ({ policyId: policy.policyId, name: policy.name, targets: policy.targets.value?.items ?? [] })),
+      },
     ),
     finding(
       "AWS-ORG-03",
       "Access Analyzer enablement",
       "high",
-      activeAnalyzers.length > 0 ? "pass" : "fail",
-      activeAnalyzers.length > 0
-        ? `${activeAnalyzers.length} active Access Analyzer instance(s) were visible.`
-        : "No active IAM Access Analyzer instance was detected.",
+      analyzerVerdict.status,
+      analyzerVerdict.summary,
       ["FedRAMP AC-3", "FedRAMP AC-6", "SOC 2 CC6.3", "CIS AWS 1.16"],
-      { analyzers: analyzers },
+      { analyzers_readable: !analyzers.error, analyzers: analyzerList, analyzer_list_truncated: analyzers.value?.truncated ?? false },
     ),
     finding(
       "AWS-ORG-04",
       "External access findings",
       activeExternalFindings.length > 0 ? "high" : "low",
-      activeExternalFindings.length > 0 ? "warn" : "pass",
-      activeExternalFindings.length > 0
-        ? `${activeExternalFindings.length} active Access Analyzer finding(s) indicate external or cross-account access to review.`
-        : "No active Access Analyzer findings were visible in the sampled analyzers.",
+      externalVerdict.status,
+      externalVerdict.summary,
       ["FedRAMP AC-3", "FedRAMP AC-4", "SOC 2 CC6.6", "CIS AWS 1.16"],
-      { active_finding_count: activeExternalFindings.length, sample: activeExternalFindings.slice(0, 20) },
+      {
+        analyzers_readable: !analyzers.error,
+        analyzers_sampled: readableFindingLists.map((item) => item.name),
+        analyzers_findings_unreadable: unreadableFindingLists.map((item) => item.name),
+        analyzers_findings_truncated: truncatedFindingLists.map((item) => item.name),
+        active_finding_count: activeExternalFindings.length,
+        sample: activeExternalFindings.slice(0, 20),
+      },
     ),
     finding(
       "AWS-ORG-05",
       "Identity Center visibility",
       "low",
-      identityCenterInstances.length > 0 ? "pass" : "warn",
-      identityCenterInstances.length > 0
-        ? `${identityCenterInstances.length} IAM Identity Center instance(s) were visible.`
-        : "No IAM Identity Center instance was visible from the configured region and credentials.",
+      identityCenterVerdict.status,
+      identityCenterVerdict.summary,
       ["FedRAMP AC-2", "FedRAMP IA-2", "SOC 2 CC6.2", "PCI-DSS 8.4.2"],
-      { identity_center_instances: identityCenterInstances.length },
+      { instances_readable: !identityCenterInstances.error, identity_center_instances: identityCenterList.length },
     ),
   ];
 
@@ -2321,8 +2574,8 @@ export async function assessAwsOrgGuardrails(
     buildAwsMappings(25),
     {
       security_contact_configured: securityContact.value !== null && securityContact.value !== undefined,
-      name: asString(contact?.Name) ?? null,
-      title: asString(contact?.Title) ?? null,
+      has_name: Boolean(asString(contact?.Name)),
+      has_title: Boolean(asString(contact?.Title)),
       email_domain: contactEmail?.includes("@") ? contactEmail.slice(contactEmail.indexOf("@")) : null,
       has_phone: Boolean(contactPhone),
       billing_and_operations_contacts: "not assessed",
@@ -2332,12 +2585,14 @@ export async function assessAwsOrgGuardrails(
   return {
     title: "AWS organization guardrails",
     summary: {
-      accounts: accounts.length,
-      scps: scps.length,
+      organization_visible: Boolean(organization.value),
+      accounts: accountList.length,
+      scps: scpList.length,
       attached_scps: attachedScps.length,
-      analyzers: analyzers.length,
+      analyzers: analyzerList.length,
+      active_analyzers: activeAnalyzers.length,
       active_external_findings: activeExternalFindings.length,
-      identity_center_instances: identityCenterInstances.length,
+      identity_center_instances: identityCenterList.length,
       audit_manager_active_assessments: activeAssessments.length,
       security_contact_configured: securityContact.value !== null && securityContact.value !== undefined,
       collection_errors: errors.length,
@@ -2402,7 +2657,21 @@ function scopeEvidence(scope: AwsRegionScope): JsonRecord {
     regions: scope.regions,
     partial: scope.partial,
     source: scope.source,
+    scope_error: scope.error ?? null,
   };
+}
+
+/** Cap reason for a partial region scope; names the DescribeRegions failure when the scope fell back to one region. */
+function scopeCap(scope: AwsRegionScope): string | undefined {
+  if (!scope.partial) return undefined;
+  if (scope.source === "configured-region-fallback") {
+    return `only ${scope.regions[0]} was assessed because the enabled-region list could not be read (${scope.error})`;
+  }
+  return `only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`;
+}
+
+function regionList(results: Array<{ region: string }>): string {
+  return results.map((result) => result.region).join(", ");
 }
 
 function withCap(status: AwsFinding["status"], summary: string, reasons: string[]): { status: AwsFinding["status"]; summary: string } {
@@ -2519,7 +2788,7 @@ export async function assessAwsDataProtection(
     publicAccessSummary = `Account-level Block Public Access is fully enabled (${flagText}) and none of the ${buckets.length} bucket policies evaluates as public.`;
   }
   const publicAccessCaps: string[] = [];
-  if (unreadablePublicAccessBuckets.length > 0) publicAccessCaps.push(`${unreadablePublicAccessBuckets.length} bucket(s) could not be read`);
+  if (unreadablePublicAccessBuckets.length > 0) publicAccessCaps.push(`${unreadablePublicAccessBuckets.length} bucket(s) could not be read (s3:GetPublicAccessBlock or s3:GetBucketPolicyStatus)`);
   if (bucketsTruncated) publicAccessCaps.push(`bucket inventory truncated at ${bucketLimit}`);
   const publicAccessVerdict = withCap(publicAccessStatus, publicAccessSummary, publicAccessCaps);
 
@@ -2561,13 +2830,14 @@ export async function assessAwsDataProtection(
     encryptionSummary = `EBS encryption by default is enabled in all ${ebsRows.length - ebsUnknown.length} readable region(s), all ${buckets.length} buckets have default server-side encryption, and all ${rdsInstances.length} RDS instances report StorageEncrypted=true. EFS is not assessed by this check.`;
   }
   const encryptionCaps: string[] = [];
-  if (ebsUnknown.length > 0) encryptionCaps.push(`EBS flag unreadable in ${ebsUnknown.length} region(s)`);
-  if (rdsErrors.length > 0) encryptionCaps.push(`RDS unreadable in ${rdsErrors.length} region(s)`);
+  const scopeReason = scopeCap(scope);
+  if (ebsUnknown.length > 0) encryptionCaps.push(`ec2:GetEbsEncryptionByDefault unreadable in ${ebsUnknown.length} region(s) (${regionList(ebsUnknown)})`);
+  if (rdsErrors.length > 0) encryptionCaps.push(`rds:DescribeDBInstances unreadable in ${rdsErrors.length} region(s) (${regionList(rdsErrors)})`);
   if (rdsUnknown.length > 0) encryptionCaps.push(`${rdsUnknown.length} RDS instance(s) without a StorageEncrypted flag`);
-  if (rdsTruncated.length > 0) encryptionCaps.push(`RDS inventory truncated in ${rdsTruncated.length} region(s)`);
-  if (bucketEncryptionUnreadable.length > 0) encryptionCaps.push(`${bucketEncryptionUnreadable.length} bucket encryption configuration(s) unreadable`);
+  if (rdsTruncated.length > 0) encryptionCaps.push(`RDS inventory truncated in ${rdsTruncated.length} region(s) (${regionList(rdsTruncated)})`);
+  if (bucketEncryptionUnreadable.length > 0) encryptionCaps.push(`s3:GetBucketEncryption unreadable for ${bucketEncryptionUnreadable.length} bucket(s)`);
   if (bucketsTruncated) encryptionCaps.push(`bucket inventory truncated at ${bucketLimit}`);
-  if (scope.partial) encryptionCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  if (scopeReason) encryptionCaps.push(scopeReason);
   const encryptionVerdict = withCap(encryptionStatus, encryptionSummary, encryptionCaps);
 
   // Control 13: TLS-only bucket policies (aws:SecureTransport deny). GetBucketPolicy returns plain JSON, not URL-encoded.
@@ -2599,7 +2869,7 @@ export async function assessAwsDataProtection(
     transitSummary = `All ${buckets.length} buckets carry a Deny statement for aws:SecureTransport=false. Load balancer and API endpoint TLS policies are not assessed by this tool.`;
   }
   const transitCaps: string[] = [];
-  if (transitUnreadable.length > 0) transitCaps.push(`${transitUnreadable.length} bucket polic${transitUnreadable.length === 1 ? "y" : "ies"} unreadable`);
+  if (transitUnreadable.length > 0) transitCaps.push(`s3:GetBucketPolicy unreadable for ${transitUnreadable.length} bucket polic${transitUnreadable.length === 1 ? "y" : "ies"}`);
   if (bucketsTruncated) transitCaps.push(`bucket inventory truncated at ${bucketLimit}`);
   const transitVerdict = withCap(transitStatus, transitSummary, transitCaps);
 
@@ -2626,6 +2896,9 @@ export async function assessAwsDataProtection(
   } else if (customerKeys.length === 0 && managerUnknown.length === 0) {
     kmsStatus = "manual";
     kmsSummary = `No customer-managed KMS keys (KeyManager=CUSTOMER) were found among ${keyRows.length} key(s) in ${scope.regionsSeen} region(s). Record the control as not applicable only if workloads intentionally rely on AWS-managed keys.`;
+  } else if (customerKeys.length === 0) {
+    kmsStatus = "manual";
+    kmsSummary = `No customer-managed KMS key could be confirmed: KeyManager could not be read for ${managerUnknown.length} of ${keyRows.length} key(s) (${managerUnknown[0]?.metadata.error ?? "kms:DescribeKey returned no KeyManager"}); verify customer-managed key rotation in the KMS console.`;
   } else if (eligibleKeys.length === 0) {
     kmsStatus = "warn";
     kmsSummary = `${customerKeys.length} customer-managed key(s) exist but none is an enabled symmetric AWS_KMS-origin key, so automatic rotation cannot apply; verify manual rotation for asymmetric, HMAC, imported, or disabled keys.`;
@@ -2634,11 +2907,11 @@ export async function assessAwsDataProtection(
     kmsSummary = `All ${eligibleKeys.length} enabled symmetric customer-managed keys report KeyRotationEnabled=true across ${scope.regionsSeen} region(s); ${ineligibleCustomerKeys.length} customer key(s) are out of scope for automatic rotation.`;
   }
   const kmsCaps: string[] = [];
-  if (rotationUnknown.length > 0) kmsCaps.push(`${rotationUnknown.length} rotation status(es) unreadable`);
-  if (managerUnknown.length > 0) kmsCaps.push(`${managerUnknown.length} key(s) without a readable KeyManager`);
-  if (kmsListErrors.length > 0) kmsCaps.push(`ListKeys unreadable in ${kmsListErrors.length} region(s)`);
-  if (kmsTruncated.length > 0) kmsCaps.push(`key inventory truncated in ${kmsTruncated.length} region(s)`);
-  if (scope.partial) kmsCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  if (rotationUnknown.length > 0) kmsCaps.push(`kms:GetKeyRotationStatus unreadable for ${rotationUnknown.length} key(s)`);
+  if (managerUnknown.length > 0) kmsCaps.push(`kms:DescribeKey returned no readable KeyManager for ${managerUnknown.length} key(s)`);
+  if (kmsListErrors.length > 0) kmsCaps.push(`kms:ListKeys unreadable in ${kmsListErrors.length} region(s) (${regionList(kmsListErrors)})`);
+  if (kmsTruncated.length > 0) kmsCaps.push(`key inventory truncated in ${kmsTruncated.length} region(s) (${regionList(kmsTruncated)})`);
+  if (scopeReason) kmsCaps.push(scopeReason);
   const kmsVerdict = withCap(kmsStatus, kmsSummary, kmsCaps);
 
   const findings = [
@@ -2897,10 +3170,17 @@ export async function assessAwsNetworkSecurity(
     flowLogSummary = `All ${vpcRows.length} VPCs across ${scope.regionsSeen} region(s) have at least one flow log with FlowLogStatus=ACTIVE.`;
   }
   const flowLogCaps: string[] = [];
-  if (vpcsUnverified.length > 0) flowLogCaps.push(`${vpcsUnverified.length} VPC(s) could not be verified`);
-  if (vpcRegionErrors.length > 0) flowLogCaps.push(`DescribeVpcs unreadable in ${vpcRegionErrors.length} region(s)`);
-  if (vpcTruncated.length > 0) flowLogCaps.push(`VPC or flow log inventory truncated in ${vpcTruncated.length} region(s)`);
-  if (scope.partial) flowLogCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  const scopeReason = scopeCap(scope);
+  if (vpcsUnverified.length > 0) {
+    const reasons = [
+      ...(flowLogRegionErrors.length > 0 ? [`ec2:DescribeFlowLogs unreadable in ${regionList(flowLogRegionErrors)}`] : []),
+      ...(vpcRows.some((row) => row.active_flow_logs === 0 && row.status_unknown > 0) ? ["FlowLogStatus missing from some flow logs"] : []),
+    ];
+    flowLogCaps.push(`${vpcsUnverified.length} VPC(s) could not be verified (${reasons.join("; ")})`);
+  }
+  if (vpcRegionErrors.length > 0) flowLogCaps.push(`ec2:DescribeVpcs unreadable in ${vpcRegionErrors.length} region(s) (${regionList(vpcRegionErrors)})`);
+  if (vpcTruncated.length > 0) flowLogCaps.push(`VPC or flow log inventory truncated in ${vpcTruncated.length} region(s) (${regionList(vpcTruncated)})`);
+  if (scopeReason) flowLogCaps.push(scopeReason);
   const flowLogVerdict = withCap(flowLogStatus, flowLogSummary, flowLogCaps);
 
   // Control 20: network ACL inbound rules open to the world on sensitive ports.
@@ -2932,9 +3212,9 @@ export async function assessAwsNetworkSecurity(
     aclSummary = `None of the ${aclRows.length} network ACLs across ${scope.regionsSeen} region(s) allows inbound ${ANY_IPV4} or ${ANY_IPV6} traffic to sensitive ports (${sensitivePorts.join(", ")}).`;
   }
   const aclCaps: string[] = [];
-  if (aclRegionErrors.length > 0) aclCaps.push(`DescribeNetworkAcls unreadable in ${aclRegionErrors.length} region(s)`);
-  if (aclTruncated.length > 0) aclCaps.push(`NACL inventory truncated in ${aclTruncated.length} region(s)`);
-  if (scope.partial) aclCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  if (aclRegionErrors.length > 0) aclCaps.push(`ec2:DescribeNetworkAcls unreadable in ${aclRegionErrors.length} region(s) (${regionList(aclRegionErrors)})`);
+  if (aclTruncated.length > 0) aclCaps.push(`NACL inventory truncated in ${aclTruncated.length} region(s) (${regionList(aclTruncated)})`);
+  if (scopeReason) aclCaps.push(scopeReason);
   const aclVerdict = withCap(aclStatus, aclSummary, aclCaps);
 
   // Control 21: security group inbound rules open to the world on sensitive ports.
@@ -2966,9 +3246,9 @@ export async function assessAwsNetworkSecurity(
     groupSummary = `None of the ${groupRows.length} security groups across ${scope.regionsSeen} region(s) allows inbound ${ANY_IPV4} or ${ANY_IPV6} traffic to sensitive ports (${sensitivePorts.join(", ")}).`;
   }
   const groupCaps: string[] = [];
-  if (groupRegionErrors.length > 0) groupCaps.push(`DescribeSecurityGroups unreadable in ${groupRegionErrors.length} region(s)`);
-  if (groupTruncated.length > 0) groupCaps.push(`security group inventory truncated in ${groupTruncated.length} region(s)`);
-  if (scope.partial) groupCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  if (groupRegionErrors.length > 0) groupCaps.push(`ec2:DescribeSecurityGroups unreadable in ${groupRegionErrors.length} region(s) (${regionList(groupRegionErrors)})`);
+  if (groupTruncated.length > 0) groupCaps.push(`security group inventory truncated in ${groupTruncated.length} region(s) (${regionList(groupTruncated)})`);
+  if (scopeReason) groupCaps.push(scopeReason);
   const groupVerdict = withCap(groupStatus, groupSummary, groupCaps);
 
   const findings = [
