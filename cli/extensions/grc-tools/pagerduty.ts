@@ -1857,10 +1857,10 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
             : oncallUsers.length === 0
               ? `${oncalls.seen} on-call entries reference ${unresolvedOncallUsers.length} users that are not in the ${countSeen(users)} returned, so their contact methods could not be read; review them in the web app.`
               : oncallWithoutContact.length > 0
-                ? `${oncallWithoutContact.length} of ${oncallUsers.length} current on-call users have no contact method with enabled true and blacklisted false.`
+                ? `${oncallWithoutContact.length} of ${oncallUsers.length} current on-call users have no usable contact method: every method they have is blacklisted or disabled, or they have none.`
                 : oncallEmailOnly.length > 0 || oncallUnverifiable.length > 0 || unresolvedOncallUsers.length > 0
                   ? `${oncallEmailOnly.length} of ${oncallUsers.length} current on-call users rely on email only, ${oncallUnverifiable.length} have phone, SMS, or push methods whose enabled or blacklisted flags are absent, and ${unresolvedOncallUsers.length} on-call users were outside the returned user set; the REST API does not expose phone verification, so confirm in the web app.`
-                  : `All ${oncallUsers.length} current on-call users have a phone, SMS, or push contact method with enabled true and blacklisted false.`,
+                  : `All ${oncallUsers.length} current on-call users have a phone or SMS method with enabled true and blacklisted false, or a push method with blacklisted false (the push contact method schema has no enabled flag).`,
       {
         current_oncall_users: oncallUsers.length,
         oncall_entries_seen: oncalls.seen,

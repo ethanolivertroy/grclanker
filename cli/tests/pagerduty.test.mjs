@@ -1671,6 +1671,61 @@ test("review fix 2: audit_limit tool parameter, DEFAULT_AUDIT_LIMIT, and the int
   assert.doesNotMatch(guide, /audit_limit[^\n]*default 500/);
 });
 
+test("review fix 3: PD-18 summaries describe push methods by the blacklisted flag only", () => {
+  const pushOnly = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([coveredSchedule("sched-1")]),
+    oncalls: list([{ user: { id: "user-1" }, schedule: { id: "sched-1" } }]),
+    users: list([
+      user("user-1", {
+        contact_methods: [
+          { id: "user-1-push", type: "push_notification_contact_method", device_type: "ios", blacklisted: false },
+          { id: "user-1-email", type: "email_contact_method", enabled: true },
+        ],
+        notification_rules: [{ id: "user-1-rule-high", urgency: "high", contact_method: { id: "user-1-push" } }],
+      }),
+      user("user-2"),
+    ]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(pushOnly, { 18: "pass" });
+  const passSummary = findingById(pushOnly, 18).summary;
+  assert.match(passSummary, /push method with blacklisted false \(the push contact method schema has no enabled flag\)/);
+  assert.match(passSummary, /phone or SMS method with enabled true and blacklisted false/);
+  assert.doesNotMatch(passSummary, /push contact method with enabled true/);
+
+  const pushMissingFlag = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([coveredSchedule("sched-1")]),
+    oncalls: list([{ user: { id: "user-1" }, schedule: { id: "sched-1" } }]),
+    users: list([
+      user("user-1", {
+        contact_methods: [{ id: "user-1-push", type: "push_notification_contact_method", device_type: "android" }],
+      }),
+      user("user-2"),
+    ]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(pushMissingFlag, { 18: "warn" });
+  assert.deepEqual(findingById(pushMissingFlag, 18).evidence.oncall_unverifiable_methods, ["user-1@example.com"]);
+
+  const blockedOnly = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([coveredSchedule("sched-1")]),
+    oncalls: list([{ user: { id: "user-1" }, schedule: { id: "sched-1" } }]),
+    users: list([
+      user("user-1", { contact_methods: [{ id: "user-1-push", type: "push_notification_contact_method", blacklisted: true }] }),
+      user("user-2"),
+    ]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(blockedOnly, { 18: "fail" });
+  assert.match(findingById(blockedOnly, 18).summary, /no usable contact method: every method they have is blacklisted or disabled, or they have none/);
+});
+
 test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports, and archive", async () => {
   const base = createTempBase("grclanker-pagerduty-export-");
   const result = await exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), base, { maxAdmins: 3 });
