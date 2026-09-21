@@ -44,6 +44,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["oscal_", "OSCAL"],
   ["scf_", "SCF"],
   ["slack_", "Slack"],
+  ["splunk_", "Splunk"],
   ["vanta_", "Vanta"],
   ["webex_", "Webex"],
   ["zoom_", "Zoom"],
