@@ -48,7 +48,7 @@ box:
 
 ### JWT (server authentication)
 
-Point `BOX_JWT_CONFIG_PATH` at the config JSON (`boxAppSettings.clientID`, `clientSecret`, `appAuth.publicKeyID`, `appAuth.privateKey`, `appAuth.passphrase`, and `enterpriseID`). grclanker signs the assertion with `node:crypto` (`alg` RS512 by default, `kid` set to the public key ID, `aud` `https://api.box.com/oauth2/token`, `box_sub_type` `enterprise` or `user`, 45 second expiry) and posts it to the token endpoint with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`. No SDK is required.
+Point `BOX_JWT_CONFIG_PATH` at the config JSON (`boxAppSettings.clientID`, `clientSecret`, `appAuth.publicKeyID`, `appAuth.privateKey`, `appAuth.passphrase`, and `enterpriseID`). grclanker signs the assertion with `node:crypto` (`alg` RS512 by default, `kid` set to the public key ID, `aud` set to the token URL (`https://api.box.com/oauth2/token` unless `BOX_TOKEN_URL` overrides it), `box_sub_type` `enterprise` or `user`, 45 second expiry) and posts it to the token endpoint with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`. No SDK is required.
 
 ### Client Credentials Grant
 

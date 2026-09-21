@@ -547,6 +547,32 @@ test("BoxApiClient signs a JWT assertion, exchanges it for a token, and calls th
   });
   assert.equal(decodeSegment(direct.split(".")[0]).alg, "RS256");
   assert.equal(decodeSegment(direct.split(".")[1]).box_sub_type, "user");
+  assert.equal(decodeSegment(direct.split(".")[1]).aud, "https://api.box.com/oauth2/token");
+});
+
+test("BoxApiClient uses the configured token URL as the JWT audience", async () => {
+  const base = createTempBase("grclanker-box-jwt-aud-");
+  const { pathname } = generateJwtConfig(base);
+  const tokenUrl = "https://api.box.example/oauth2/token";
+  const config = resolveBoxConfiguration({}, { BOX_JWT_CONFIG_PATH: pathname, BOX_TOKEN_URL: tokenUrl }, { homeDir: base });
+  assert.equal(config.tokenUrl, tokenUrl);
+  const seen = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push({ url, body: init.body });
+    if (url.pathname === "/oauth2/token") {
+      return jsonResponse({ access_token: "jwt-access-token", expires_in: 3600, token_type: "bearer" });
+    }
+    return jsonResponse({ id: "service-1", type: "user" });
+  };
+
+  const client = new BoxApiClient(config, { fetchImpl, now: () => NOW });
+  await client.getCurrentUser();
+
+  assert.equal(seen[0].url.toString(), tokenUrl);
+  const claims = decodeSegment(new URLSearchParams(seen[0].body).get("assertion").split(".")[1]);
+  assert.equal(claims.aud, tokenUrl);
+  assert.equal(claims.iss, "jwt-client-id");
 });
 
 test("BoxApiClient exchanges Client Credentials Grant and paginates users with markers", async () => {

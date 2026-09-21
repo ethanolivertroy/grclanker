@@ -1095,6 +1095,7 @@ export class BoxApiClient implements BoxReadClient {
           subjectId: this.config.subjectId,
           subjectType: this.config.subjectType,
           credentials: this.config.jwt,
+          audience: this.config.tokenUrl,
           now: this.now(),
         }));
         body.set("client_id", this.config.clientId);
