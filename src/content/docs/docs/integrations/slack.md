@@ -70,7 +70,7 @@ Empty inventories never pass by default. The only exceptions, stated in the find
 | 24 Workspace analytics access | admin_access | `SLACK-ADMIN-09` | manual: `admin.analytics.getFile` is a capability probe only; a `200` with `Content-type: application/gzip` is a successful probe (the file is never downloaded) and an `ok:false` JSON body is the failure path. |
 | 25 Token rotation and revocation | integrations | `SLACK-APP-07` | manual with `auth.test` identity and token format evidence. |
 
-Coverage: 25 of 25 spec controls are represented; 16 are automated and 9 are manual by design.
+Coverage: 25 of 25 spec controls are represented; 17 are automated and 8 are manual by design (controls 4, 5, 11, 13, 20, 21, 24, 25).
 
 ## Framework mappings
 

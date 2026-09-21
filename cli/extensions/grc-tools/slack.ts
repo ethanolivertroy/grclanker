@@ -1449,15 +1449,17 @@ export async function assessSlackAdminAccess(
             "Session duration limits",
             3,
             "high",
-            overlongSessions.length > 0 ? "fail" : noSettingsApplied.length > 0 || sessionUserIds.length < activeOrgUsers.length ? "warn" : "pass",
+            overlongSessions.length > 0 ? "fail" : noSettingsApplied.length > 0 || sessionUserIds.length < activeOrgUsers.length || !orgUsersComplete ? "warn" : "pass",
             overlongSessions.length > 0
-              ? `${overlongSessions.length}/${durations.length} sampled users have a session duration above ${maxSessionHours} hours.`
+              ? `${overlongSessions.length}/${durations.length} sampled users have a session duration above ${maxSessionHours} hours (${orgUsersView}).`
               : noSettingsApplied.length > 0
-                ? `All ${durations.length} users with settings are at or below ${maxSessionHours} hours, but ${noSettingsApplied.length} sampled users inherit an org default that the API does not expose.`
+                ? `All ${durations.length} users with settings are at or below ${maxSessionHours} hours, but ${noSettingsApplied.length} sampled users inherit an org default that the API does not expose (${orgUsersView}).`
                 : sessionUserIds.length < activeOrgUsers.length
-                  ? `All ${durations.length} sampled users are at or below ${maxSessionHours} hours, but only ${sessionUserIds.length}/${activeOrgUsers.length} active users were sampled.`
-                  : `All ${durations.length} active users have a session duration at or below ${maxSessionHours} hours.`,
-            { sampled_users: sessionUserIds.length, sessions_with_settings: durations.length, no_settings_applied: noSettingsApplied.length, overlong: overlongSessions.slice(0, 20), max_session_hours: maxSessionHours },
+                  ? `All ${durations.length} sampled users are at or below ${maxSessionHours} hours, but only ${sessionUserIds.length}/${activeOrgUsers.length} seen active users were sampled (${orgUsersView}).`
+                  : !orgUsersComplete
+                    ? `All ${durations.length} seen active users are at or below ${maxSessionHours} hours but the user inventory is partial (${orgUsersView}); unseen users were not sampled.`
+                    : `All ${durations.length} active users have a session duration at or below ${maxSessionHours} hours (${orgUsersView}).`,
+            { sampled_users: sessionUserIds.length, active_users_seen: activeOrgUsers.length, inventory_complete: orgUsersComplete, sessions_with_settings: durations.length, no_settings_applied: noSettingsApplied.length, overlong: overlongSessions.slice(0, 20), max_session_hours: maxSessionHours },
           ),
   );
 
@@ -1888,16 +1890,19 @@ export async function assessSlackChannelGovernance(
             "Channel posting restrictions",
             18,
             "medium",
-            unrestrictedAnnouncements.length > 0 ? "fail" : unknownAnnouncements.length > 0 || prefsErrors.length > 0 ? "warn" : "pass",
+            unrestrictedAnnouncements.length > 0 ? "fail" : unknownAnnouncements.length > 0 || prefsErrors.length > 0 || !channelsComplete ? "warn" : "pass",
             unrestrictedAnnouncements.length > 0
               ? `${unrestrictedAnnouncements.length}/${announcementPrefs.length} general or org default channels allow anyone to post (prefs.who_can_post).`
               : unknownAnnouncements.length > 0 || prefsErrors.length > 0
-                ? `Restricted posting is set on every readable general or org default channel, but ${unknownAnnouncements.length} lacked a who_can_post value and ${prefsErrors.length} channels were unreadable.`
-                : `All ${announcementPrefs.length} general or org default channels restrict posting to admins or owners; ${restrictedChannels.length}/${prefsByChannel.length} sampled channels restrict posting overall (${channelsView}).`,
+                ? `Restricted posting is set on every readable general or org default channel, but ${unknownAnnouncements.length} lacked a who_can_post value and ${prefsErrors.length} channels were unreadable (${channelsView}).`
+                : !channelsComplete
+                  ? `All ${announcementPrefs.length} seen general or org default channels restrict posting to admins or owners, but the channel search is partial (${channelsView}); unseen org default channels were not checked.`
+                  : `All ${announcementPrefs.length} general or org default channels restrict posting to admins or owners; ${restrictedChannels.length}/${prefsByChannel.length} sampled channels restrict posting overall (${channelsView}).`,
             {
               announcement_channels: announcementPrefs.map((item) => ({ id: item.channel.id, name: item.channel.name, restricted: item.restricted ?? null })),
               restricted_channels: restrictedChannels.slice(0, 20).map((item) => item.channel.name),
               unreadable_channels: prefsErrors.length,
+              channels_complete: channelsComplete,
             },
           ),
     !channelsResult.ok

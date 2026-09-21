@@ -133,12 +133,11 @@ const compliantFixture = ({ pathname, params }) => {
         { id: "W1", email: "alice@example.com", is_admin: true, is_owner: false, is_primary_owner: true, is_restricted: false, is_ultra_restricted: false, is_bot: false, username: "alice", full_name: "Alice", is_active: true, date_created: 1566922090, deactivated_ts: 0, expiration_ts: 0, workspaces: ["T1"], has_2fa: true, has_sso: true },
         { id: "W2", email: "bob@example.com", is_admin: false, is_owner: false, is_primary_owner: false, is_restricted: false, is_ultra_restricted: false, is_bot: false, username: "bob", full_name: "Bob", is_active: true, date_created: 1566922090, deactivated_ts: 0, expiration_ts: 0, workspaces: ["T1"], has_2fa: true, has_sso: true },
       ], response_metadata: { next_cursor: "" } };
-    case "admin.users.session.getSettings":
-      assert.equal(params.get("user_ids"), "W1,W2");
-      return { ok: true, session_settings: [
-        { user_id: "W1", desktop_app_browser_quit: true, duration: 43200 },
-        { user_id: "W2", desktop_app_browser_quit: true, duration: 43200 },
-      ], no_settings_applied: [] };
+    case "admin.users.session.getSettings": {
+      const userIds = (params.get("user_ids") ?? "").split(",").filter(Boolean);
+      assert.ok(userIds.length > 0 && userIds.length <= 100, "user_ids must carry 1 to 100 ids");
+      return { ok: true, session_settings: userIds.map((userId) => ({ user_id: userId, desktop_app_browser_quit: true, duration: 43200 })), no_settings_applied: [] };
+    }
     case "admin.apps.approved.list":
       return { ok: true, approved_apps: [{ app: { id: "A1", name: "Marketplace App", is_app_directory_approved: true, is_internal: false, developer_type: "third_party" }, scopes: [{ name: "chat:write", description: "", is_sensitive: false, token_type: "bot" }], date_updated: 1574296707, last_resolved_by: { actor_id: "W1", actor_type: "user" } }], response_metadata: { next_cursor: "" } };
     case "admin.apps.restricted.list":
@@ -355,7 +354,12 @@ test("fixture (c): partial inventories and not_allowed_token_type never pass", a
   assert.equal(all.filter((item) => item.status === "pass").length, 0, JSON.stringify(statuses({ findings: all })));
   assert.match(byId(results[0], "SLACK-ID-01").summary, /partial/);
   assert.notEqual(byId(results[1], "SLACK-ADMIN-01").status, "pass");
+  assert.equal(byId(results[1], "SLACK-ADMIN-02").status, "warn");
+  assert.equal(byId(results[1], "SLACK-ADMIN-03").status, "warn");
+  assert.match(byId(results[1], "SLACK-ADMIN-03").summary, /user inventory is partial/);
+  assert.equal(byId(results[1], "SLACK-ADMIN-03").evidence.inventory_complete, false);
   assert.match(byId(results[1], "SLACK-ADMIN-05").summary, /partial/);
+  assert.equal(byId(results[3], "SLACK-CHAN-02").status, "manual");
   assert.match(byId(results[2], "SLACK-APP-01").summary, /partial view/);
   assert.equal(byId(results[3], "SLACK-CHAN-01").status, "manual");
   assert.match(byId(results[3], "SLACK-CHAN-01").summary, /not_allowed_token_type.*org-level user token/);
@@ -580,6 +584,52 @@ test("review fix 6: who_can_post accepts the documented singular and plural type
       : compliantFixture(request));
     assert.equal(byId(await assessSlackChannelGovernance(client), "SLACK-CHAN-02").status, "pass", type);
   }
+});
+
+test("review fix: SLACK-ADMIN-03 never passes on a truncated admin.users.list", async () => {
+  const truncatedUsers = (request) => {
+    if (request.pathname === "/api/admin.users.list") return { ...compliantFixture(request), response_metadata: { next_cursor: "dXNlcjpVMEc5V0ZYTlo=" } };
+    return compliantFixture(request);
+  };
+  const truncated = byId(await assessSlackAdminAccess(makeClient(truncatedUsers), { maxSessionHours: 24, userLimit: 2 }), "SLACK-ADMIN-03");
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /user inventory is partial \(2 seen of unknown total \(partial view, pagination capped\)\)/);
+  assert.equal(truncated.evidence.inventory_complete, false);
+  assert.equal(truncated.evidence.active_users_seen, 2);
+  assert.equal(truncated.evidence.sampled_users, 2);
+  assert.equal(truncated.evidence.sessions_with_settings, 2);
+
+  const capped = byId(await assessSlackAdminAccess(makeClient(truncatedUsers), { maxSessionHours: 24, userLimit: 1 }), "SLACK-ADMIN-03");
+  assert.equal(capped.status, "warn");
+  assert.equal(capped.evidence.inventory_complete, false);
+
+  const complete = byId(await assessSlackAdminAccess(makeClient(compliantFixture), { maxSessionHours: 24 }), "SLACK-ADMIN-03");
+  assert.equal(complete.status, "pass");
+  assert.equal(complete.evidence.inventory_complete, true);
+  assert.match(complete.summary, /All 2 active users have a session duration at or below 24 hours \(2 seen \(complete\)\)/);
+
+  const overlongTruncated = byId(await assessSlackAdminAccess(makeClient((request) => {
+    if (request.pathname === "/api/admin.users.session.getSettings") return { ok: true, session_settings: [{ user_id: "W1", desktop_app_browser_quit: true, duration: 43200 }, { user_id: "W2", desktop_app_browser_quit: true, duration: 172800 }], no_settings_applied: [] };
+    return truncatedUsers(request);
+  }), { maxSessionHours: 24, userLimit: 2 }), "SLACK-ADMIN-03");
+  assert.equal(overlongTruncated.status, "fail");
+  assert.equal(overlongTruncated.evidence.inventory_complete, false);
+});
+
+test("review follow-up: SLACK-CHAN-02 warns when the channel search is truncated", async () => {
+  const truncatedChannels = makeClient((request) => {
+    if (request.pathname === "/api/admin.conversations.search" && request.params.get("search_channel_types") !== "external_shared") {
+      return { ...compliantFixture(request), next_cursor: "more" };
+    }
+    return compliantFixture(request);
+  });
+  const item = byId(await assessSlackChannelGovernance(truncatedChannels, { channelLimit: 2 }), "SLACK-CHAN-02");
+  assert.equal(item.status, "warn");
+  assert.match(item.summary, /channel search is partial/);
+  assert.equal(item.evidence.channels_complete, false);
+  const complete = byId(await assessSlackChannelGovernance(makeClient(compliantFixture)), "SLACK-CHAN-02");
+  assert.equal(complete.status, "pass");
+  assert.equal(complete.evidence.channels_complete, true);
 });
 
 test("SLACK_METHODS documents every Web API method the tools call", () => {
