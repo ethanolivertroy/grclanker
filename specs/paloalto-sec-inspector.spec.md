@@ -29,7 +29,7 @@ The tool produces compliance-mapped audit reports against FedRAMP, CMMC 2.0, SOC
 The shipped implementation lives in `cli/extensions/grc-tools/paloalto.ts` and registers these read-only tools:
 
 - `paloalto_check_access`: probes every Prisma Cloud and PAN-OS read surface and reports missing permissions
-- `paloalto_assess_cloud_posture`: controls 1-6 through the Prisma Cloud CSPM API, plus manual findings for the Compute controls 7-11, 24, and 25
+- `paloalto_assess_cloud_posture`: controls 1-6 through the Prisma Cloud CSPM API and controls 7-11, 24, and 25 through the Prisma Cloud Compute API (manual findings when the Compute console is not configured or reachable)
 - `paloalto_assess_firewall_policy`: controls 12-14 through the PAN-OS XML API
 - `paloalto_assess_threat_prevention`: controls 16-18, 21, and 22
 - `paloalto_assess_device_hardening`: controls 15, 19, 20, and 23, plus HA state and software version findings
@@ -431,7 +431,10 @@ What shipped:
 
 - Prisma Cloud CSPM client with `POST /login` JWT auth, re-login on `401`, `429`/`5xx` retry with backoff, timeouts, pagination for `GET /v2/alert` (`pageToken`/`nextPageToken`), and secret redaction in errors
 - PAN-OS XML API client with `type=keygen` (credentials in the POST body), `X-PAN-KEY` header auth, a dependency-free XML parser, `type=op` show commands, and `type=config&action=show` subtree collection for firewalls and Panorama
-- All 25 controls emit a finding: controls 1-6 and 12-23 are evaluated from API evidence; controls 7-11, 24, and 25 (Prisma Cloud Compute) are `manual` findings that state the evidence to collect; when only one product is configured the other product's controls also become `manual`
+- Prisma Cloud Compute client: console located through `PRISMA_COMPUTE_URL` or the CSPM `GET /meta_info` field `twistlockUrl`, authenticated with `POST /api/v1/authenticate` (access key credentials, Bearer token) with fallback to the CSPM JWT in `x-redlock-auth`; `limit`/`offset` paging with recorded truncation; read endpoints `/defenders`, `/policies/runtime/container`, `/policies/compliance/container`, `/policies/compliance/host`, `/policies/vulnerability/images`, `/settings/registry`, `/registry`, `/images`, `/stats/vulnerabilities`, `/stats/compliance`, `/cloud/discovery`, `/scans`
+- All 25 controls emit a finding: controls 1-6, 7-11, 24, and 12-23 are evaluated from API evidence; control 25 evaluates CI scan results but caps at `warn` because admission control has no verified public read endpoint; when a product or the Compute console is not configured its controls become `manual` findings naming the missing credential or URL
+- Verdict-safety rules are enforced by an evidence gate on every finding: unreadable or forbidden evidence forces `manual`, empty inventories are `fail` or `manual` per control intent (stated in the summary), scoped-out or unlicensed controls are `manual`, undated items cap at `warn`, partial inventories (unreachable device, truncated alert or Compute page) cap at `warn` with seen and total counts, enabling flags must be read as true, alert pagination runs to completion or records truncation, and export reruns never overwrite a prior bundle
+- TLS verification opt-out (`PANOS_VERIFY_TLS=false`) is scoped to the PAN-OS clients through a dedicated `node:https` transport; `NODE_TLS_REJECT_UNAUTHORIZED` is never set
 - Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip archive
 
 Deviations from this spec, following the official documentation:
@@ -443,9 +446,13 @@ Deviations from this spec, following the official documentation:
 - The Prisma Cloud JWT is refreshed by logging in again; `GET /auth_token/extend` is documented and could replace that
 - `GET /integration` is used for the SIEM check in control 20; its reference page could not be fetched during implementation, so a failure on that surface degrades to a warning and is written to `_errors.log`
 - The PAN-OS REST API (section 2.4) is not used; every device read goes through the XML API so one client covers PAN-OS 9.x through 11.x and Panorama
+- Compute endpoints are called under `/api/v1/` (the documented paths carry a version segment such as `/api/v34.04/`); `/audits/runtime/container`, `/defenders/summary`, `/compliance`, and `/hosts` from section 4 are not needed because the policy and stats endpoints carry the verdict evidence
+- Control 8 uses `GET /stats/compliance` (documented) for the compliance rate instead of a per-host `/compliance` listing
+- Control 25: the admission control policy read endpoint could not be located on the public pan.dev CWPP reference (https://pan.dev/prisma-cloud/api/cwpp/), so admission rules stay a manual review inside the finding and the verdict caps at `warn`
+- The CSPM `GET /meta_info` reference page is not published on pan.dev; the PCEE access guide (https://pan.dev/prisma-cloud/api/cwpp/access-api-saas/) documents copying the console path from Compute > Manage > System > Utilities, which `PRISMA_COMPUTE_URL` carries
 
 What remains:
 
-- Prisma Cloud Compute (CWPP) API coverage for controls 7-11, 24, and 25
+- Admission control (OPA) evidence for control 25 once a public read endpoint is documented
 - WildFire cloud connectivity (`show wildfire status`), GlobalProtect HIP requirements, admin MFA enforcement details, and log retention quotas are surfaced as review notes rather than automated checks
 - Framework-specific output formats such as STIG CKL XML
