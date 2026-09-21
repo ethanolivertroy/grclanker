@@ -1594,6 +1594,482 @@ test("rule 9: a service-account token evicted by a 401 mid-run is still scrubbed
   clearGwsTokenCacheForTests();
 });
 
+const ENDPOINT = {
+  users: "Directory users.list",
+  roles: "Directory roles.list",
+  roleAssignments: "Directory roleAssignments.list",
+  tokens: "Directory tokens.list",
+  alerts: "Alert Center alerts.list",
+  policies: "Cloud Identity policies.list",
+  activities: (applicationName) => `Reports activities.list (applicationName=${applicationName})`,
+};
+const FORBIDDEN_TEXT = "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)";
+const UNAVAILABLE_STATUS = /^(unreadable|not collected|unknown)\b/;
+const COLLECTED_STATUS = /^(complete|partial)\b/;
+const ENDPOINT_MENTION = /\b(Directory (?:users|roles|roleAssignments|tokens)\.list|Reports activities\.list \(applicationName=(?:login|admin|token)\)|Alert Center alerts\.list|Cloud Identity policies\.list)/g;
+/** An evidence line is `Label: value`; the value is a count, `at least N (...)`, or a status word naming the failed read. */
+const EVIDENCE_LINE = /^([^:]+): (.*)$/;
+
+/** Wraps the fake collector so every endpoint it is asked to read is recorded, the way the Slack fixture records requests. */
+function recordingCollector(overrides = {}) {
+  const requested = new Set();
+  const inner = createFakeCollector(overrides);
+  const record = (endpoint, call) => async (...args) => {
+    requested.add(typeof endpoint === "function" ? endpoint(...args) : endpoint);
+    return call(...args);
+  };
+  return {
+    requested,
+    collector: {
+      collectUsers: record(ENDPOINT.users, inner.collectUsers),
+      collectRoles: record(ENDPOINT.roles, inner.collectRoles),
+      collectRoleAssignments: record(ENDPOINT.roleAssignments, inner.collectRoleAssignments),
+      collectActivities: record(ENDPOINT.activities, inner.collectActivities),
+      collectAlerts: record(ENDPOINT.alerts, inner.collectAlerts),
+      collectTwoStepPolicies: record(ENDPOINT.policies, inner.collectTwoStepPolicies),
+      listUserTokens: record(ENDPOINT.tokens, inner.listUserTokens),
+    },
+  };
+}
+
+/**
+ * No count or list renders 0, [], or "unknown" beside a status that says the data was unreadable, not collected, or unknown.
+ * Objects follow the `<key>` plus `<key>_status` and nested `status` conventions; evidence lines are checked as `Label: value`.
+ */
+function assertNoFabricatedValues(value, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    return;
+  }
+  if (typeof value === "string") {
+    const line = EVIDENCE_LINE.exec(value);
+    if (!line) return;
+    assert.notEqual(line[2], "unknown", `${label}: ${path} "${value}" is the "unknown" placeholder`);
+    if (/\b(unreadable|not collected|unknown)\b/.test(line[2])) {
+      assert.doesNotMatch(line[2], /^(\d+|\[\]|no|none|yes)\b/, `${label}: ${path} "${value}" renders a value beside an unavailable status`);
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    assert.notEqual(entry, "unknown", `${label}: ${path}.${key} is the "unknown" placeholder`);
+    if (typeof entry === "string" && UNAVAILABLE_STATUS.test(entry) && key.endsWith("_status")) {
+      const base = key.slice(0, -"_status".length);
+      if (base in value) assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+    }
+    if (key === "status" && typeof entry === "string" && UNAVAILABLE_STATUS.test(entry)) {
+      for (const [sibling, siblingValue] of Object.entries(value)) {
+        assert.ok(siblingValue !== 0 && !(Array.isArray(siblingValue) && siblingValue.length === 0), `${label}: ${path}.${sibling} renders ${JSON.stringify(siblingValue)} beside status "${entry}"`);
+      }
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+/** A status that says complete or partial (or an `at least N` evidence line) may only name endpoints that were actually requested. */
+function assertStatusesMatchRequests(value, requested, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStatusesMatchRequests(item, requested, label, `${path}[${index}]`));
+    return;
+  }
+  if (typeof value === "string") {
+    const line = EVIDENCE_LINE.exec(value);
+    if (line && (COLLECTED_STATUS.test(line[2]) || /^at least \d+/.test(line[2]))) {
+      for (const mention of line[2].match(ENDPOINT_MENTION) ?? []) {
+        assert.ok(requested.has(mention), `${label}: ${path} "${value}" names ${mention}, which was never requested`);
+      }
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && (key.endsWith("_status") || key === "status") && COLLECTED_STATUS.test(entry)) {
+      for (const mention of entry.match(ENDPOINT_MENTION) ?? []) {
+        assert.ok(requested.has(mention), `${label}: ${path}.${key} says "${entry}" but ${mention} was never requested`);
+      }
+    }
+    assertStatusesMatchRequests(entry, requested, label, `${path}.${key}`);
+  }
+}
+
+/** Evidence labels whose count is derived from each inventory; when that inventory failed, none of them may render an exact number. */
+const DIRECTORY_LABELS = [
+  "Privileged users", "Privileged users with isEnforcedIn2Sv=true", "Super admins", "Super admins with isEnforcedIn2Sv=true", "Super admins identified",
+  "Privileged users reviewed", "Suspended or archived privileged users", "Delegated admin users identified", "Total privileged users", "Privileged users identified",
+];
+const TOKEN_LABELS = ["Token records collected", "Privileged third-party tokens", "Third-party clients observed", "High-scope token records"];
+const EVIDENCE_LABELS_BY_SOURCE = {
+  users: [
+    "Users collected", "Active users", "Active users reviewed", "Users with isEnforcedIn2Sv=true", "Users with isEnrolledIn2Sv=true", "Users with isAdmin=true",
+    "Active users with no parseable lastLoginTime (reported separately, never counted as fresh)", "Users sampled for token inventory", ...DIRECTORY_LABELS, ...TOKEN_LABELS,
+  ],
+  roles: DIRECTORY_LABELS,
+  roleAssignments: ["Role assignments collected", "Role assignments reviewed", "Group role assignments", ...DIRECTORY_LABELS],
+  login: ["Login activity records collected", "Suspicious login signals"],
+  admin: ["Admin activities collected", "Admin activity records collected"],
+  token: ["Token activity records collected"],
+  alerts: ["Alerts collected", "Open alerts (metadata.status NOT_STARTED or IN_PROGRESS)", "Closed alerts (metadata.status CLOSED)", "Alerts without metadata.status (reported separately, never counted as closed)"],
+  policies: ["Policies returned", "Enforcement policies returned", "Enforcement policies with enforcedFrom at or before now", "Enrollment policies with allowEnrollment=false"],
+  tokens: TOKEN_LABELS,
+};
+
+/** Every evidence line whose label depends on the failed inventory reads `at least N (...)`, `unreadable (...)`, or `not collected (...)`, never a bare number. */
+function assertDependentLinesAreBounded(findings, source, label) {
+  const labels = new Set(EVIDENCE_LABELS_BY_SOURCE[source]);
+  for (const finding of findings) {
+    for (const line of finding.evidence) {
+      const match = EVIDENCE_LINE.exec(line);
+      if (!match || !labels.has(match[1])) continue;
+      assert.doesNotMatch(match[2], /^\d+(\s|$)/, `${label}: ${finding.id} renders "${line}" while ${source} failed`);
+      assert.match(match[2], /^(at least \d+ \(|unreadable \(|not collected \()/, `${label}: ${finding.id} "${line}" must be a bound or a status naming the failed read`);
+    }
+  }
+}
+
+/** The snapshot fields the reviewer's field-by-endpoint table found rendered as 0 or `no`; each must now be null with a status naming the read. */
+const NULL_SNAPSHOT_FIELDS_BY_SOURCE = {
+  users: {
+    identity: ["active_users", "privileged_users", "super_admins", "users_enforced_in_2sv", "dormant_active_users", "users_without_last_login"],
+    admin_access: ["privileged_users", "super_admins", "delegated_admins", "stale_privileged_users", "privileged_users_without_last_login"],
+    integrations: ["sampled_users", "active_user_population", "privileged_users", "token_records", "privileged_token_records", "high_scope_token_records", "token_read_failures"],
+  },
+  roles: {
+    identity: ["privileged_users", "super_admins"],
+    admin_access: ["privileged_users", "super_admins", "delegated_admins", "stale_privileged_users", "privileged_users_without_last_login"],
+    integrations: ["privileged_users", "privileged_token_records"],
+  },
+  roleAssignments: {
+    identity: ["privileged_users", "super_admins"],
+    admin_access: ["privileged_users", "super_admins", "delegated_admins", "stale_privileged_users", "privileged_users_without_last_login", "group_role_assignments"],
+    integrations: ["privileged_users", "privileged_token_records"],
+  },
+  login: { monitoring: ["login_activity_records", "suspicious_login_signals"] },
+  admin: { monitoring: ["admin_activity_records"] },
+  token: { integrations: ["token_activity_records"], monitoring: ["token_activity_records"] },
+  alerts: { monitoring: ["alerts_collected", "open_alerts", "alerts_without_status"] },
+  policies: { identity: ["two_step_policies"] },
+  tokens: { integrations: ["token_records", "privileged_token_records", "high_scope_token_records"] },
+};
+
+function denialError(kind, endpoint) {
+  switch (kind) {
+    case "403":
+      return new GwsApiError(403, FORBIDDEN_TEXT, `https://admin.googleapis.com/${endpoint}`);
+    case "401":
+      return new GwsApiError(401, "401 Unauthorized (status UNAUTHENTICATED, reason authError)", `https://admin.googleapis.com/${endpoint}`);
+    case "error":
+      return new Error("socket hang up");
+    default:
+      throw new Error(`unknown denial kind ${kind}`);
+  }
+}
+
+/** Collector overrides that deny one surface with one failure kind; the token rows deny every user, the privileged user, or the token holder. */
+function denyOverrides(source, kind) {
+  const fail = () => { throw denialError(kind, source); };
+  const tokens = createTokens();
+  switch (source) {
+    case "users": return { collectUsers: fail };
+    case "roles": return { collectRoles: fail };
+    case "roleAssignments": return { collectRoleAssignments: fail };
+    case "alerts": return { collectAlerts: fail };
+    case "policies": return { collectTwoStepPolicies: fail };
+    case "login":
+    case "admin":
+    case "token":
+      return { collectActivities: async (applicationName) => (applicationName === source ? fail() : createFakeCollector().collectActivities(applicationName)) };
+    case "tokens": return { listUserTokens: fail };
+    case "tokens-super": return { listUserTokens: async (userKey) => (userKey === "super@example.com" ? fail() : tokens[userKey] ?? []) };
+    case "tokens-user": return { listUserTokens: async (userKey) => (userKey === "user@example.com" ? fail() : tokens[userKey] ?? []) };
+    default: throw new Error(`unknown source ${source}`);
+  }
+}
+
+function snapshotByCategory(assessments) {
+  return Object.fromEntries(assessments.map((assessment) => [assessment.category, assessment]));
+}
+
+test("null standard: every snapshot count derived from a denied inventory renders null with a status naming the endpoint, and the partial-view flag reads from the collection status", async () => {
+  const config = createSampleConfig();
+  const endpointFor = { users: ENDPOINT.users, roles: ENDPOINT.roles, roleAssignments: ENDPOINT.roleAssignments, login: ENDPOINT.activities("login"), admin: ENDPOINT.activities("admin"), token: ENDPOINT.activities("token"), alerts: ENDPOINT.alerts, policies: ENDPOINT.policies, tokens: ENDPOINT.tokens };
+
+  for (const [source, expectations] of Object.entries(NULL_SNAPSHOT_FIELDS_BY_SOURCE)) {
+    const byCategory = snapshotByCategory(assessAll(await collectGwsAuditData(createFakeCollector(denyOverrides(source, "403"))), config));
+    for (const [category, fields] of Object.entries(expectations)) {
+      const { snapshotSummary, text } = byCategory[category];
+      for (const field of fields) {
+        const status = snapshotSummary[`${field}_status`];
+        assert.equal(snapshotSummary[field], null, `${source} denied: ${category}.${field} = ${JSON.stringify(snapshotSummary[field])} (${status})`);
+        assert.match(status, UNAVAILABLE_STATUS, `${source} denied: ${category}.${field}_status = ${status}`);
+        assert.ok(status.includes(endpointFor[source]), `${source} denied: ${category}.${field}_status must name ${endpointFor[source]}: ${status}`);
+        assert.ok(status.includes(source === "tokens" ? "failed for all 4 sampled users" : FORBIDDEN_TEXT), `${source} denied: ${category}.${field}_status must carry the projected error: ${status}`);
+        assert.match(text, new RegExp(`^- ${field}: (unreadable|not collected)$`, "m"), `${source} denied: ${category} text must render ${field} as its status word`);
+      }
+    }
+    if (source === "users") {
+      for (const category of ["identity", "admin_access"]) {
+        assert.match(byCategory[category].snapshotSummary.users_seen_partial_view, /^unreadable \(Directory users\.list \(403 Forbidden/, category);
+        assert.doesNotMatch(byCategory[category].text, /^- users_seen_partial_view: no$/m, category);
+      }
+      // Reads that were never attempted because users.list failed say so instead of claiming an empty sample.
+      assert.match(byCategory.integrations.snapshotSummary.sampled_users_status, /^not collected: Directory tokens\.list was not called because Directory users\.list was unreadable \(403 Forbidden/);
+      assert.match(byCategory.integrations.snapshotSummary.token_read_failures_status, /^not collected: Directory tokens\.list was not called because/);
+    }
+  }
+
+  // A tokens.list read that failed for one sampled user turns every token count into a lower bound naming that user.
+  for (const [source, email] of [["tokens-super", "super@example.com"], ["tokens-user", "user@example.com"]]) {
+    const { snapshotSummary, text } = snapshotByCategory(assessAll(await collectGwsAuditData(createFakeCollector(denyOverrides(source, "403"))), config)).integrations;
+    for (const field of ["token_records", "privileged_token_records", "high_scope_token_records"]) {
+      assert.equal(typeof snapshotSummary[field], "number", `${source}: ${field}`);
+      assert.match(snapshotSummary[`${field}_status`], new RegExp(`^partial: at least ${snapshotSummary[field]}; Directory tokens\\.list failed for 1 of 4 sampled users \\(${email.replace(".", "\\.")}: 403 Forbidden`), `${source}: ${field}_status`);
+      assert.match(text, new RegExp(`^- ${field}: at least ${snapshotSummary[field]}$`, "m"), `${source}: ${field} text`);
+    }
+    assert.equal(snapshotSummary.token_read_failures, 1, source);
+    assert.match(snapshotSummary.token_read_failures_status, /^complete: Directory tokens\.list was attempted for 4 sampled user\(s\) of 4 active users$/, source);
+  }
+
+  // The readable baseline keeps exact counts, a complete status on every field, and `no` for the partial-view flag.
+  // A status key is `<field>_status` for a field that exists; `alerts_without_status` is itself a count.
+  const baseline = snapshotByCategory(assessAll(await collectGwsAuditData(createFakeCollector()), config));
+  for (const [category, assessment] of Object.entries(baseline)) {
+    for (const [key, value] of Object.entries(assessment.snapshotSummary)) {
+      const isStatusKey = key.endsWith("_status") && key.slice(0, -"_status".length) in assessment.snapshotSummary;
+      if (isStatusKey) assert.match(value, /^complete: /, `${category}.${key}`);
+      else if (key === "users_seen_partial_view") assert.equal(value, "no", `${category}.${key}`);
+      else assert.equal(typeof value, "number", `${category}.${key} = ${JSON.stringify(value)}`);
+    }
+  }
+  assert.equal(baseline.monitoring.snapshotSummary.alerts_without_status, 0);
+  assert.match(baseline.monitoring.snapshotSummary.alerts_without_status_status, /^complete: Alert Center alerts\.list returned/);
+  assert.equal(baseline.identity.snapshotSummary.active_users, 4);
+  assert.equal(baseline.identity.snapshotSummary.active_users_status, "complete: Directory users.list returned 4 record(s) across 1 page(s)");
+  // A truncated users.list keeps its count as a lower bound and flags the partial view from the collection status.
+  const truncated = snapshotByCategory(assessAll(await collectGwsAuditData(createFakeCollector({ collectUsers: async () => collection(createUsers(), { truncated: true, pages: 3 }) })), config));
+  assert.equal(truncated.identity.snapshotSummary.users_seen_partial_view, "yes");
+  assert.match(truncated.identity.snapshotSummary.active_users_status, /^partial: at least 4; Directory users\.list stopped at the collection cap after 3 page\(s\) with 4 seen, more pages exist$/);
+  assert.match(truncated.identity.text, /^- active_users: at least 4$/m);
+});
+
+test("null standard: a denied core_data dataset writes a {status, endpoint, error} marker with null data, seen, pages, and truncated", async () => {
+  const config = createSampleConfig();
+  const readCore = (result, name) => JSON.parse(readFileSync(join(result.outputDir, "core_data", name), "utf8"));
+
+  const usersDenied = await exportGwsAuditBundle(createFakeCollector(denyOverrides("users", "403")), config, createTempBase("grclanker-gws-core-users-"));
+  const users = readCore(usersDenied, "users.json");
+  assert.deepEqual(users, {
+    status: `unreadable: Directory users.list (${FORBIDDEN_TEXT})`,
+    endpoint: ENDPOINT.users,
+    error: FORBIDDEN_TEXT,
+    errorKind: "forbidden",
+    data: null,
+    seen: null,
+    pages: null,
+    truncated: null,
+  });
+  // The token sample is drawn from users.list, so it is recorded as never collected rather than as an empty inventory.
+  const neverSampled = readCore(usersDenied, "token_inventory.json");
+  assert.match(neverSampled.status, /^not collected: Directory tokens\.list was not called because Directory users\.list was unreadable \(403 Forbidden/);
+  assert.equal(neverSampled.endpoint, ENDPOINT.tokens);
+  for (const field of ["data", "seen", "total", "failed", "failures", "readable_users", "truncated", "error", "errorKind"]) {
+    assert.equal(neverSampled[field], null, `token_inventory.json ${field}`);
+  }
+  const zipUsers = JSON.parse(readZipEntries(usersDenied.zipPath).get("core_data/users.json"));
+  assert.equal(zipUsers.data, null);
+  assert.equal(zipUsers.status, users.status);
+
+  // Every dataset file carries the same marker shape when its own read is denied.
+  const allDenied = await exportGwsAuditBundle(createFakeCollector({
+    collectUsers: denyOverrides("users", "403").collectUsers,
+    collectRoles: denyOverrides("roles", "401").collectRoles,
+    collectRoleAssignments: denyOverrides("roleAssignments", "error").collectRoleAssignments,
+    collectActivities: async () => { throw denialError("403", "activities"); },
+    collectAlerts: denyOverrides("alerts", "403").collectAlerts,
+    collectTwoStepPolicies: denyOverrides("policies", "401").collectTwoStepPolicies,
+  }), config, createTempBase("grclanker-gws-core-all-"));
+  const expectedEndpoints = {
+    "users.json": ENDPOINT.users,
+    "roles.json": ENDPOINT.roles,
+    "role_assignments.json": ENDPOINT.roleAssignments,
+    "login_activities.json": ENDPOINT.activities("login"),
+    "admin_activities.json": ENDPOINT.activities("admin"),
+    "token_activities.json": ENDPOINT.activities("token"),
+    "alerts.json": ENDPOINT.alerts,
+    "two_step_verification_policies.json": ENDPOINT.policies,
+  };
+  for (const [name, endpoint] of Object.entries(expectedEndpoints)) {
+    const file = readCore(allDenied, name);
+    assert.equal(file.endpoint, endpoint, name);
+    assert.match(file.status, new RegExp(`^unreadable: ${endpoint.replace(/[.()]/g, "\\$&")} \\(`), name);
+    assert.ok(typeof file.error === "string" && file.error.length > 0, `${name} keeps the projected error`);
+    assert.equal(file.data, null, name);
+    assert.equal(file.seen, null, name);
+    assert.equal(file.truncated, null, name);
+    assertNoFabricatedValues(file, `core_data/${name}`);
+  }
+  assert.equal(readCore(allDenied, "role_assignments.json").error, "socket hang up");
+  assert.equal(readCore(allDenied, "roles.json").errorKind, "unauthorized");
+
+  // token_inventory.json: null data when every read failed, and truncated is null whenever any read failed.
+  const tokensDenied = await exportGwsAuditBundle(createFakeCollector(denyOverrides("tokens", "403")), config, createTempBase("grclanker-gws-core-tokens-"));
+  const unreadable = readCore(tokensDenied, "token_inventory.json");
+  assert.match(unreadable.status, /^unreadable: Directory tokens\.list failed for all 4 sampled users \(super@example\.com: 403 Forbidden/);
+  assert.equal(unreadable.data, null);
+  assert.equal(unreadable.truncated, null);
+  assert.equal(unreadable.readable_users, "0 of 4");
+  assert.equal(unreadable.failed, 4);
+  assert.equal(unreadable.failures.length, 4);
+  assertNoFabricatedValues(unreadable, "core_data/token_inventory.json (all denied)");
+
+  const oneDenied = await exportGwsAuditBundle(createFakeCollector(denyOverrides("tokens-user", "403")), config, createTempBase("grclanker-gws-core-one-"));
+  const partial = readCore(oneDenied, "token_inventory.json");
+  assert.match(partial.status, /^partial: Directory tokens\.list failed for 1 of 4 sampled users \(user@example\.com: 403 Forbidden/);
+  assert.equal(partial.truncated, null, "the sample cap no longer describes completeness once a read failed");
+  assert.equal(partial.readable_users, "3 of 4");
+  assert.equal(partial.data.length, 1, "the readable users' tokens are kept");
+  assert.deepEqual(partial.failures.map((failure) => failure.primaryEmail), ["user@example.com"]);
+
+  // A fully readable run keeps its records, a complete status, and a boolean truncated flag.
+  const readable = await exportGwsAuditBundle(createFakeCollector(), config, createTempBase("grclanker-gws-core-readable-"));
+  const complete = readCore(readable, "users.json");
+  assert.equal(complete.status, "complete: Directory users.list returned 4 record(s) across 1 page(s)");
+  assert.equal(complete.data.length, 4);
+  assert.equal(complete.seen, 4);
+  assert.equal(complete.truncated, false);
+  const completeTokens = readCore(readable, "token_inventory.json");
+  assert.equal(completeTokens.status, "complete: Directory tokens.list read for all 4 sampled user(s)");
+  assert.equal(completeTokens.truncated, false);
+  assert.equal(completeTokens.readable_users, "4 of 4");
+});
+
+test("null standard: GWS-INTEG-001, 002, and 003 token counts render at least N naming the failed reads, or unreadable when no read succeeded", async () => {
+  const config = createSampleConfig();
+  const integrationsFor = async (source) => assessGwsIntegrations((await collectGwsAuditData(createFakeCollector(denyOverrides(source, "403")))).integrations, config);
+  const lines = (finding, label) => finding.evidence.filter((line) => line.startsWith(`${label}: `));
+
+  // Every sampled read failed: the counts are unknown, and the status names the endpoint and every failed user.
+  const allDenied = await integrationsFor("tokens");
+  for (const id of ["GWS-INTEG-001", "GWS-INTEG-002", "GWS-INTEG-003"]) {
+    const finding = findingById(allDenied, id);
+    assert.equal(finding.status, "Manual", id);
+    assert.equal(finding.evidence.some((line) => /^(Token records collected|Privileged third-party tokens|High-scope token records|Third-party clients observed): \d+$/.test(line)), false, `${id}: ${finding.evidence.join("\n")}`);
+  }
+  const allDeniedStatus = /^unreadable \(Directory tokens\.list failed for all 4 sampled users \(super@example\.com: 403 Forbidden.*dormant@example\.com: 403 Forbidden.*\)\)$/;
+  assert.match(findingById(allDenied, "GWS-INTEG-002").evidence.find((line) => line.startsWith("Token records collected: ")).slice("Token records collected: ".length), allDeniedStatus);
+  assert.match(findingById(allDenied, "GWS-INTEG-002").evidence.find((line) => line.startsWith("Privileged third-party tokens: ")).slice("Privileged third-party tokens: ".length), allDeniedStatus);
+  assert.match(findingById(allDenied, "GWS-INTEG-003").evidence.find((line) => line.startsWith("Token records collected: ")).slice("Token records collected: ".length), allDeniedStatus);
+  assert.match(findingById(allDenied, "GWS-INTEG-002").summary, /the token inventory is unreadable; Directory tokens\.list failed for 4 of 4 sampled users including privileged super@example\.com, delegated@example\.com/);
+  assert.equal(findingById(allDenied, "GWS-INTEG-001").summary.startsWith("Directory tokens.list was not readable"), true);
+
+  // Only the token holder's read failed: every token count is a lower bound that names that user and the endpoint.
+  const holderDenied = await integrationsFor("tokens-user");
+  const bound = (count) => `at least ${count} (Directory tokens.list failed for 1 of 4 sampled users (user@example.com: ${FORBIDDEN_TEXT}))`;
+  assert.equal(findingById(holderDenied, "GWS-INTEG-001").status, "Partial");
+  assert.deepEqual(lines(findingById(holderDenied, "GWS-INTEG-001"), "Token records collected"), [`Token records collected: ${bound(1)}`]);
+  assert.equal(findingById(holderDenied, "GWS-INTEG-002").status, "Partial");
+  assert.deepEqual(lines(findingById(holderDenied, "GWS-INTEG-002"), "Privileged third-party tokens"), [`Privileged third-party tokens: ${bound(1)}`]);
+  assert.equal(findingById(holderDenied, "GWS-INTEG-003").status, "Partial");
+  assert.deepEqual(lines(findingById(holderDenied, "GWS-INTEG-003"), "High-scope token records"), [`High-scope token records: ${bound(1)}`]);
+  assert.deepEqual(lines(findingById(holderDenied, "GWS-INTEG-003"), "Third-party clients observed"), [`Third-party clients observed: ${bound(1)}`]);
+
+  // Only the privileged user's read failed: the same lower-bound wording names super@example.com on every token line.
+  const privilegedDenied = await integrationsFor("tokens-super");
+  const privilegedBound = (count) => `at least ${count} (Directory tokens.list failed for 1 of 4 sampled users (super@example.com: ${FORBIDDEN_TEXT}))`;
+  assert.deepEqual(lines(findingById(privilegedDenied, "GWS-INTEG-001"), "Token records collected"), [`Token records collected: ${privilegedBound(2)}`]);
+  assert.deepEqual(lines(findingById(privilegedDenied, "GWS-INTEG-002"), "Privileged third-party tokens"), [`Privileged third-party tokens: ${privilegedBound(1)}`]);
+  assert.deepEqual(lines(findingById(privilegedDenied, "GWS-INTEG-003"), "High-scope token records"), [`High-scope token records: ${privilegedBound(1)}`]);
+  for (const assessment of [holderDenied, privilegedDenied]) {
+    assertDependentLinesAreBounded(assessment.findings.filter((finding) => finding.id !== "GWS-INTEG-004"), "tokens", "one tokens.list read denied");
+  }
+
+  // With every read successful the same labels render exact counts.
+  const readable = assessGwsIntegrations((await collectGwsAuditData(createFakeCollector())).integrations, config);
+  assert.deepEqual(lines(findingById(readable, "GWS-INTEG-001"), "Token records collected"), ["Token records collected: 2"]);
+  assert.deepEqual(lines(findingById(readable, "GWS-INTEG-002"), "Privileged third-party tokens"), ["Privileged third-party tokens: 1"]);
+});
+
+/**
+ * The reviewer's 34-scenario matrix: eleven surfaces (eight inventories, tokens.list for every user, for the privileged user, and for the
+ * token holder) by three failure kinds, plus the never-collected Policy API dataset. Every finding line, snapshot field, and core_data
+ * file is checked with the two generic guards, and evidence lines derived from the failed read must be bounds, never exact counts.
+ */
+test("null standard sweep: 34 denial scenarios render no fabricated value and no status naming an unrequested endpoint", async () => {
+  const config = createSampleConfig();
+  // Each export gets its own base: the bundle allocator only tries nine suffixes under one root.
+  const freshBase = () => createTempBase("grclanker-gws-sweep-");
+  const coreDataFiles = (result) => listFilesRecursively(join(result.outputDir, "core_data")).map((file) => [relative(result.outputDir, file), JSON.parse(readFileSync(file, "utf8"))]);
+  const checkAll = (label, assessments, requested, coreData) => {
+    const findings = assessments.flatMap((assessment) => assessment.findings);
+    assertNoFabricatedValues(assessments.map((assessment) => assessment.snapshotSummary), `${label}: snapshots`);
+    assertNoFabricatedValues(findings.map((finding) => finding.evidence), `${label}: evidence`);
+    assertStatusesMatchRequests(assessments.map((assessment) => assessment.snapshotSummary), requested, `${label}: snapshots`);
+    assertStatusesMatchRequests(findings.map((finding) => finding.evidence), requested, `${label}: evidence`);
+    for (const [name, file] of coreData) {
+      assertNoFabricatedValues(file, `${label}: ${name}`);
+      assertStatusesMatchRequests(file, requested, `${label}: ${name}`);
+    }
+    return findings;
+  };
+
+  const baseline = recordingCollector();
+  const baselineData = await collectGwsAuditData(baseline.collector);
+  const baselineAssessments = assessAll(baselineData, config);
+  const baselineBundle = await exportGwsAuditBundle(baseline.collector, config, freshBase());
+  const baselineFindings = checkAll("baseline", baselineAssessments, baseline.requested, coreDataFiles(baselineBundle));
+  assert.equal(baselineFindings.length, 19);
+  assert.equal(baseline.requested.size, 9, "every endpoint is requested on the baseline");
+  for (const [name, file] of coreDataFiles(baselineBundle)) assert.match(file.status, /^complete: /, name);
+
+  const sources = ["users", "roles", "roleAssignments", "login", "admin", "token", "alerts", "policies", "tokens", "tokens-super", "tokens-user"];
+  let scenarios = 0;
+  for (const source of sources) {
+    for (const kind of ["403", "401", "error"]) {
+      const label = `${source} (${kind})`;
+      const recorder = recordingCollector(denyOverrides(source, kind));
+      const data = await collectGwsAuditData(recorder.collector);
+      const assessments = assessAll(data, config);
+      const bundle = await exportGwsAuditBundle(recorder.collector, config, freshBase());
+      const findings = checkAll(label, assessments, recorder.requested, coreDataFiles(bundle));
+      assertDependentLinesAreBounded(findings, source.startsWith("tokens") ? "tokens" : source, label);
+      const expected = NULL_SNAPSHOT_FIELDS_BY_SOURCE[source.startsWith("tokens") ? "tokens" : source];
+      const byCategory = snapshotByCategory(assessments);
+      for (const [category, fields] of Object.entries(expected)) {
+        for (const field of fields) {
+          if (source.startsWith("tokens-")) {
+            assert.match(byCategory[category].snapshotSummary[`${field}_status`], /^partial: at least \d+; Directory tokens\.list failed for 1 of 4 sampled users/, `${label}: ${category}.${field}_status`);
+          } else {
+            assert.equal(byCategory[category].snapshotSummary[field], null, `${label}: ${category}.${field}`);
+          }
+        }
+      }
+      if (source === "users") {
+        assert.equal(recorder.requested.has(ENDPOINT.tokens), false, `${label}: tokens.list is never requested without a user inventory`);
+        for (const category of ["identity", "admin_access"]) {
+          assert.match(byCategory[category].snapshotSummary.users_seen_partial_view, /^unreadable \(Directory users\.list \(/, `${label}: ${category}.users_seen_partial_view`);
+        }
+      }
+      scenarios += 1;
+    }
+  }
+
+  // The 34th scenario: the Policy API dataset was never part of the run.
+  const withoutPolicies = assessGwsIdentity({ ...baselineData.identity, twoStepPolicies: undefined }, config);
+  assertNoFabricatedValues([withoutPolicies.snapshotSummary], "policy dataset undefined: snapshot");
+  assertNoFabricatedValues(withoutPolicies.findings.map((finding) => finding.evidence), "policy dataset undefined: evidence");
+  assert.equal(withoutPolicies.snapshotSummary.two_step_policies, null);
+  assert.equal(withoutPolicies.snapshotSummary.two_step_policies_status, "not collected: Cloud Identity policies.list was not queried in this run");
+  assert.equal(findingById(withoutPolicies, "GWS-ID-005").status, "Manual");
+  scenarios += 1;
+  assert.equal(scenarios, 34);
+
+  // The guards bite: a snapshot in the old shape (0 beside an unreadable status) and a complete status naming an unrequested read both fail.
+  assert.throws(() => assertNoFabricatedValues([{ active_users: 0, active_users_status: `unreadable: ${ENDPOINT.users} (403)` }], "old shape"), /active_users must be null beside status/);
+  assert.throws(() => assertNoFabricatedValues([{ status: `unreadable: ${ENDPOINT.users} (403)`, data: [], seen: 0 }], "old core_data shape"), /renders \[\] beside status/);
+  assert.throws(() => assertNoFabricatedValues([["Token records collected: 0 (unreadable Directory tokens.list)"]], "old line shape"), /renders a value beside an unavailable status/);
+  assert.throws(() => assertStatusesMatchRequests([{ sampled_users_status: `complete: ${ENDPOINT.tokens} was attempted for 4 sampled user(s)` }], new Set([ENDPOINT.users]), "unrequested"), /was never requested/);
+  assert.throws(() => assertDependentLinesAreBounded([{ id: "X", evidence: ["Token records collected: 0"] }], "tokens", "bare zero"), /renders "Token records collected: 0" while tokens failed/);
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-gws-paths-");
   const outside = createTempBase("grclanker-gws-outside-");
