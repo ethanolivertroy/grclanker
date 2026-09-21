@@ -331,6 +331,17 @@ function epochToDate(value: unknown): Date | undefined {
   return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
+function isoDateToDate(value: unknown): Date | undefined {
+  const text = asString(value);
+  if (text === undefined || asNumber(text) !== undefined) return undefined;
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function certificateValidTo(item: JsonRecord): Date | undefined {
+  return epochToDate(item.validToInEpochSec) ?? isoDateToDate(item.validTo);
+}
+
 function daysBetween(later: Date, earlier: Date): number {
   return Math.floor((later.getTime() - earlier.getTime()) / 86_400_000);
 }
@@ -1160,6 +1171,46 @@ function capForPartialAll(status: ZscalerFindingStatus, datasets: CollectedDatas
   return status === "pass" && datasets.some((dataset) => dataset.truncated) ? "warn" : status;
 }
 
+interface InventoryDependency {
+  inventory: string;
+  endpoint: string;
+  dataset: CollectedDataset<unknown>;
+}
+
+function dependsOn(inventory: string, endpoint: string, dataset: CollectedDataset<unknown>): InventoryDependency {
+  return { inventory, endpoint, dataset };
+}
+
+function unreadableCause({ endpoint, dataset }: InventoryDependency): string {
+  return dataset.statusCode !== undefined
+    ? `${endpoint} returned ${dataset.statusCode}`
+    : `${endpoint} failed: ${dataset.error ?? "unknown error"}`;
+}
+
+function capForUnreadableAll(item: ZscalerFinding, dependencies: InventoryDependency[], manualEvidence: string): ZscalerFinding {
+  const unreadable = dependencies.filter((dependency) => dependency.dataset.error !== undefined);
+  const evidence: JsonRecord = {
+    ...(item.evidence ?? {}),
+    unreadable_inventories: unreadable.map((dependency) => ({
+      inventory: dependency.inventory,
+      endpoint: dependency.endpoint,
+      status_code: dependency.dataset.statusCode ?? null,
+      error: dependency.dataset.error ?? null,
+    })),
+  };
+  if (unreadable.length === 0) return { ...item, evidence };
+  const status: ZscalerFindingStatus = item.status === "pass" ? "warn" : item.status;
+  const causes = unreadable.map((dependency) => `${dependency.inventory} inventory could not be read (${unreadableCause(dependency)})`);
+  const consequence = status === "warn" ? ", so this verdict is capped at warn" : "";
+  return {
+    ...item,
+    status,
+    summary: `${item.summary} The ${causes.join(" and the ")}${consequence}.`,
+    evidence,
+    manualEvidence: item.manualEvidence ?? manualEvidence,
+  };
+}
+
 function isEnabledState(record: JsonRecord): boolean {
   return asString(record.state)?.toUpperCase() === "ENABLED";
 }
@@ -1222,7 +1273,7 @@ export function assessZiaAccessControlData(
   options: { maxSuperAdmins?: number } = {},
 ): ZscalerAssessmentResult {
   const maxSuperAdmins = clampNumber(options.maxSuperAdmins, DEFAULT_MAX_SUPER_ADMINS, 0, 500);
-  const findings: ZscalerFinding[] = [];
+  const verdicts: ZscalerFinding[] = [];
   const admins = data.adminUsers.data;
   const enabledAdmins = admins.filter((admin) => asBoolean(admin.disabled) !== true);
   const passwordLoginAdmins = enabledAdmins.filter((admin) => asBoolean(admin.isPasswordLoginAllowed) === true);
@@ -1230,14 +1281,14 @@ export function assessZiaAccessControlData(
 
   const mfaEvidence = "Collect a screenshot of Administration > Administrator Management showing the administrator authentication settings (SAML SSO for administrators and enforced multi-factor authentication), since the ZIA API does not expose per-administrator MFA state.";
   if (data.adminUsers.error) {
-    findings.push(unreadableFinding(6, "GET /adminUsers", data.adminUsers, mfaEvidence));
+    verdicts.push(unreadableFinding(6, "GET /adminUsers", data.adminUsers, mfaEvidence));
   } else if (admins.length === 0) {
-    findings.push(finding(6, "manual", `Empty inventory: GET /adminUsers returned zero administrators, which is not possible for a live tenant, so the credential is probably scoped. ${mfaEvidence}`, { admin_count: 0 }, mfaEvidence));
+    verdicts.push(finding(6, "manual", `Empty inventory: GET /adminUsers returned zero administrators, which is not possible for a live tenant, so the credential is probably scoped. ${mfaEvidence}`, { admin_count: 0 }, mfaEvidence));
   } else {
     const summary = passwordLoginAdmins.length > 0
       ? `${passwordLoginAdmins.length} of ${enabledAdmins.length} enabled administrators allow password login (isPasswordLoginAllowed=true), a local sign-in path that bypasses IdP MFA. Per-admin MFA is not exposed by the API, so the verdict is capped at warn.`
       : `All ${enabledAdmins.length} enabled administrators have password login disabled (SSO only). Per-admin MFA is not exposed by the API, so this remains manual until portal evidence is attached.`;
-    findings.push(finding(6, passwordLoginAdmins.length > 0 ? "warn" : "manual", summary + partialSuffix(data.adminUsers, "administrator"), {
+    verdicts.push(finding(6, passwordLoginAdmins.length > 0 ? "warn" : "manual", summary + partialSuffix(data.adminUsers, "administrator"), {
       enabled_admins: enabledAdmins.length,
       password_login_admins: truncateList(passwordLoginAdmins.map(adminLabel)),
       end_user_saml_enabled: samlEnabled ?? null,
@@ -1247,11 +1298,11 @@ export function assessZiaAccessControlData(
 
   const rbacEvidence = "Export Administration > Role Management and Administrator Management, confirm each administrator maps to a least-privilege role, and list Cloud Service API keys with their owners (the API key inventory is not part of the verified read surface).";
   if (data.adminUsers.error) {
-    findings.push(unreadableFinding(7, "GET /adminUsers", data.adminUsers, rbacEvidence));
+    verdicts.push(unreadableFinding(7, "GET /adminUsers", data.adminUsers, rbacEvidence));
   } else if (data.adminRoles.error) {
-    findings.push(unreadableFinding(7, "GET /adminRoles/lite", data.adminRoles, rbacEvidence));
+    verdicts.push(unreadableFinding(7, "GET /adminRoles/lite", data.adminRoles, rbacEvidence));
   } else if (admins.length === 0 || data.adminRoles.data.length === 0) {
-    findings.push(finding(7, "manual", `Empty inventory: ${admins.length} administrators and ${data.adminRoles.data.length} roles were returned, so the role assignment picture is incomplete. ${rbacEvidence}`, { admin_count: admins.length, role_count: data.adminRoles.data.length }, rbacEvidence));
+    verdicts.push(finding(7, "manual", `Empty inventory: ${admins.length} administrators and ${data.adminRoles.data.length} roles were returned, so the role assignment picture is incomplete. ${rbacEvidence}`, { admin_count: admins.length, role_count: data.adminRoles.data.length }, rbacEvidence));
   } else {
     const superRoleIds = new Set(data.adminRoles.data.filter(isSuperAdminRole).map((role) => asString(role.id)).filter((id): id is string => Boolean(id)));
     const superAdmins = enabledAdmins.filter((admin) => {
@@ -1276,7 +1327,7 @@ export function assessZiaAccessControlData(
       status = "warn";
       summary = `Every one of the ${enabledAdmins.length} enabled administrators holds a Super Admin role; no least-privilege roles are in use.`;
     }
-    findings.push(finding(7, capForPartial(status, data.adminUsers), summary + partialSuffix(data.adminUsers, "administrator"), {
+    verdicts.push(finding(7, capForPartial(status, data.adminUsers), summary + partialSuffix(data.adminUsers, "administrator"), {
       enabled_admins: enabledAdmins.length,
       disabled_admins: disabledAdmins,
       super_admins: truncateList(superAdmins.map(adminLabel)),
@@ -1293,7 +1344,7 @@ export function assessZiaAccessControlData(
 
   const auditEvidence = "Confirm in Analytics > Insights > Audit Logs that administrator actions are recorded, and document the NSS or Cloud NSS feed (Administration > Nanolog Streaming Service) that exports admin audit logs plus the SIEM retention period.";
   if (data.auditLogReport.statusCode === 400) {
-    findings.push(finding(14, "manual", `Verdict unknown: GET /auditlogEntryReport returned 400 (${data.auditLogReport.error ?? "bad request"}); ${AUDIT_REPORT_STATUS_ID_NOTE}. The tenant enforces the documented statusId requirement, so audit log reachability cannot be verified through the API. ${auditEvidence}`, {
+    verdicts.push(finding(14, "manual", `Verdict unknown: GET /auditlogEntryReport returned 400 (${data.auditLogReport.error ?? "bad request"}); ${AUDIT_REPORT_STATUS_ID_NOTE}. The tenant enforces the documented statusId requirement, so audit log reachability cannot be verified through the API. ${auditEvidence}`, {
       status_code: 400,
       error: data.auditLogReport.error ?? null,
       documented_request_shape: "GET /auditlogEntryReport?statusId={export task id}",
@@ -1301,22 +1352,22 @@ export function assessZiaAccessControlData(
       nss_feeds: data.nssFeeds.error ? null : data.nssFeeds.data.length,
     }, auditEvidence));
   } else if (data.auditLogReport.error) {
-    findings.push(unreadableFinding(14, "GET /auditlogEntryReport", data.auditLogReport, auditEvidence));
+    verdicts.push(unreadableFinding(14, "GET /auditlogEntryReport", data.auditLogReport, auditEvidence));
   } else {
     const feeds = data.nssFeeds.data;
     const enabledFeeds = feeds.filter((feed) => (asString(feed.feedStatus) ?? "").toUpperCase() === "ENABLED");
     const adminAuditFeeds = enabledFeeds.filter((feed) => /ADMIN_AUDIT|AUDIT/i.test(asString(feed.nssLogType) ?? ""));
     if (data.nssFeeds.error) {
-      findings.push(finding(14, "manual", `The audit log report interface is reachable (GET /auditlogEntryReport status ${asString(data.auditLogReport.data.status) ?? "unknown"}), but GET /nssFeeds could not be read because ${unreadableReason(data.nssFeeds)}, so log export configuration is unverified. ${auditEvidence}`, { audit_report_status: asString(data.auditLogReport.data.status) ?? null }, auditEvidence));
+      verdicts.push(finding(14, "manual", `The audit log report interface is reachable (GET /auditlogEntryReport status ${asString(data.auditLogReport.data.status) ?? "unknown"}), but the NSS feed inventory could not be read, so log export configuration is unverified. ${auditEvidence}`, { audit_report_status: asString(data.auditLogReport.data.status) ?? null }, auditEvidence));
     } else if (adminAuditFeeds.length > 0) {
-      findings.push(finding(14, "pass", `Admin audit logging is reachable and ${adminAuditFeeds.length} enabled NSS feed(s) export admin audit logs (${adminAuditFeeds.map(ruleLabel).join(", ")}). Retention is enforced by the receiving SIEM and must be documented separately.`, {
+      verdicts.push(finding(14, "pass", `Admin audit logging is reachable and ${adminAuditFeeds.length} enabled NSS feed(s) export admin audit logs (${adminAuditFeeds.map(ruleLabel).join(", ")}). Retention is enforced by the receiving SIEM and must be documented separately.`, {
         audit_report_status: asString(data.auditLogReport.data.status) ?? null,
         nss_feeds: feeds.length,
         enabled_feeds: enabledFeeds.length,
         admin_audit_feeds: truncateList(adminAuditFeeds.map((feed) => ({ name: ruleLabel(feed), nssLogType: asString(feed.nssLogType) ?? null, feedStatus: asString(feed.feedStatus) ?? null }))),
       }));
     } else {
-      findings.push(finding(14, feeds.length === 0 ? "warn" : "fail", feeds.length === 0
+      verdicts.push(finding(14, feeds.length === 0 ? "warn" : "fail", feeds.length === 0
         ? "Admin audit logging is reachable, but zero NSS feeds are configured, so audit logs are only retained inside the Zscaler portal window and are not exported for long-term retention."
         : `${feeds.length} NSS feed(s) exist but none that is enabled exports admin audit logs (nssLogType ADMIN_AUDIT).`, {
         audit_report_status: asString(data.auditLogReport.data.status) ?? null,
@@ -1324,6 +1375,16 @@ export function assessZiaAccessControlData(
       }, auditEvidence));
     }
   }
+
+  const secondaryInventories: Partial<Record<number, [InventoryDependency[], string]>> = {
+    6: [[dependsOn("authentication settings", "GET /authSettings", data.authSettings)], mfaEvidence],
+    7: [[dependsOn("password expiry settings", "GET /passwordExpiry/settings", data.passwordExpiry)], rbacEvidence],
+    14: [[dependsOn("NSS feed", "GET /nssFeeds", data.nssFeeds)], auditEvidence],
+  };
+  const findings = verdicts.map((item) => {
+    const entry = secondaryInventories[item.control];
+    return entry ? capForUnreadableAll(item, entry[0], entry[1]) : item;
+  });
 
   const errors = [
     ...datasetErrors("adminUsers", data.adminUsers),
@@ -2055,6 +2116,10 @@ function assessFirewall(data: ZiaPolicyData): ZscalerFinding {
 
 function assessDlp(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Export Policy > Data Loss Prevention showing enabled DLP engines, dictionaries, and web DLP rules with their actions.";
+  return capForUnreadableAll(dlpVerdict(data, evidenceNote), [dependsOn("DLP dictionary", "GET /dlpDictionaries", data.dlpDictionaries)], evidenceNote);
+}
+
+function dlpVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   if (data.webDlpRules.error) return unreadableFinding(3, "GET /webDlpRules", data.webDlpRules, evidenceNote);
   if (data.dlpEngines.error) return unreadableFinding(3, "GET /dlpEngines", data.dlpEngines, evidenceNote);
   const rules = data.webDlpRules.data;
@@ -2090,6 +2155,13 @@ function assessDlp(data: ZiaPolicyData): ZscalerFinding {
 
 function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): ZscalerFinding {
   const evidenceNote = "Export Policy > SSL Inspection showing enabled DECRYPT rules, the exempted URL list, and per-location SSL scanning state.";
+  return capForUnreadableAll(sslInspectionVerdict(data, maxExemptions, evidenceNote), [
+    dependsOn("SSL exemption list", "GET /sslSettings/exemptedUrls", data.sslExemptedUrls),
+    dependsOn("location", "GET /locations", data.locations),
+  ], evidenceNote);
+}
+
+function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, evidenceNote: string): ZscalerFinding {
   const rules = data.sslInspectionRules;
   if (rules.error) return unreadableFinding(4, "GET /sslInspectionRules", rules, evidenceNote);
   const exempted = data.sslExemptedUrls.error ? undefined : asStringList(data.sslExemptedUrls.data.urls);
@@ -2119,7 +2191,7 @@ function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): Zscale
     return finding(4, "fail", `${blanketBypass.length} enabled DO_NOT_DECRYPT rule(s) apply to all traffic with no category, application, location, or user scope: ${blanketBypass.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
   }
   if (exempted === undefined) {
-    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but GET /sslSettings/exemptedUrls could not be read (${unreadableReason(data.sslExemptedUrls)}), so exemption hygiene is unverified.`, evidence, evidenceNote);
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but the exempted URL list could not be read, so exemption hygiene is unverified.`, evidence, evidenceNote);
   }
   if (exempted.length > maxExemptions) {
     return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but ${exempted.length} URLs are exempted from inspection (threshold ${maxExemptions}).`, evidence, evidenceNote);
@@ -2133,6 +2205,10 @@ function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): Zscale
 
 function assessSandbox(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Confirm the Cloud Sandbox subscription under Administration > Company Profile > Subscriptions and export Policy > Sandbox showing enabled rules with Block or Quarantine actions.";
+  return capForUnreadableAll(sandboxVerdict(data, evidenceNote), [dependsOn("sandbox advanced settings", "GET /behavioralAnalysisAdvancedSettings", data.sandboxSettings)], evidenceNote);
+}
+
+function sandboxVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   const rules = data.sandboxRules;
   if (rules.error) return unreadableFinding(5, "GET /sandboxRules", rules, `${evidenceNote} A 4xx here can also mean Cloud Sandbox is not licensed.`);
   const active = enabledRules(rules.data);
@@ -2206,6 +2282,14 @@ function locationLabel(location: JsonRecord): string {
 
 function assessLocations(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Export Administration > Location Management showing per-location authentication, SSL inspection, firewall enablement, and the GRE tunnel or IPSec VPN credentials that carry each site.";
+  return capForUnreadableAll(locationsVerdict(data, evidenceNote), [
+    dependsOn("sub-location", "GET /locations/{locationId}/sublocations", data.subLocations),
+    dependsOn("GRE tunnel", "GET /greTunnels", data.greTunnels),
+    dependsOn("VPN credential", "GET /vpnCredentials", data.vpnCredentials),
+  ], evidenceNote);
+}
+
+function locationsVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   const locations = data.locations;
   if (locations.error) return unreadableFinding(18, "GET /locations", locations, evidenceNote);
   const subLocations = data.subLocations;
@@ -2220,7 +2304,7 @@ function assessLocations(data: ZiaPolicyData): ZscalerFinding {
   const subLocationSuffix = subLocations.truncated
     ? ` Sub-locations were read for only ${subLocationParentsRead} of ${subLocationParentsTotal} parent locations, so the sub-location inventory is partial and this verdict is capped at warn.`
     : subLocations.error
-      ? ` Sub-locations could not be read for every parent (${subLocations.error}), so the sub-location inventory is partial and this verdict is capped at warn.`
+      ? " Sub-locations could not be read for every parent, so the sub-location inventory is partial and this verdict is capped at warn."
       : "";
   const tunnelSuffix = `${partialSuffix(data.greTunnels, "GRE tunnel")}${partialSuffix(data.vpnCredentials, "VPN credential")}`;
   const evidence = {
@@ -2285,6 +2369,10 @@ function assessCloudAppControl(data: ZiaPolicyData): ZscalerFinding {
 
 function assessDnsSecurity(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Export Policy > Firewall Control > DNS Control showing enabled block or redirect rules and the Advanced Threat Protection DGA domain setting.";
+  return capForUnreadableAll(dnsSecurityVerdict(data, evidenceNote), [dependsOn("advanced threat protection settings", "GET /cyberThreatProtection/advancedThreatSettings", data.advancedThreatSettings)], evidenceNote);
+}
+
+function dnsSecurityVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   const rules = data.dnsRules;
   if (rules.error) return unreadableFinding(20, "GET /firewallDnsRules", rules, evidenceNote);
   const active = enabledRules(rules.data);
@@ -2313,6 +2401,14 @@ function assessDnsSecurity(data: ZiaPolicyData): ZscalerFinding {
 
 function assessSecurityBaseline(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Export Policy > Malware Protection and Policy > Advanced Threat Protection showing every blocked category and the unscannable file handling.";
+  return capForUnreadableAll(securityBaselineVerdict(data, evidenceNote), [
+    dependsOn("malware policy", "GET /cyberThreatProtection/malwarePolicy", data.malwarePolicy),
+    dependsOn("security allowlist", "GET /security", data.securityAllowlist),
+    dependsOn("security denylist", "GET /security/advanced", data.securityDenylist),
+  ], evidenceNote);
+}
+
+function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   if (data.advancedThreatSettings.error) return unreadableFinding(25, "GET /cyberThreatProtection/advancedThreatSettings", data.advancedThreatSettings, evidenceNote);
   if (data.malwareSettings.error) return unreadableFinding(25, "GET /cyberThreatProtection/malwareSettings", data.malwareSettings, evidenceNote);
   const atp = data.advancedThreatSettings.data;
@@ -2516,6 +2612,10 @@ function hasWildcardDomain(segment: JsonRecord): boolean {
 
 function assessSegmentation(data: ZpaData): ZscalerFinding {
   const evidenceNote = "Export Administration > Application Segments and Segment Groups showing domain and port scoping for every enabled segment.";
+  return capForUnreadableAll(segmentationVerdict(data, evidenceNote), [dependsOn("segment group", "GET /segmentGroup", data.segmentGroups)], evidenceNote);
+}
+
+function segmentationVerdict(data: ZpaData, evidenceNote: string): ZscalerFinding {
   const segments = data.applicationSegments;
   if (segments.error) return unreadableFinding(8, "GET /application", segments, evidenceNote);
   const enabled = segments.data.filter((segment) => asBoolean(segment.enabled) === true);
@@ -2656,6 +2756,10 @@ function connectorHealthIssues(health: ConnectorHealth, staleDays: number): stri
 
 function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
   const evidenceNote = "Export Administration > App Connectors showing control channel status per connector and the connector count per App Connector Group.";
+  return capForUnreadableAll(connectorsVerdict(data, staleDays, evidenceNote), [dependsOn("connector group", "GET /appConnectorGroup", data.appConnectorGroups)], evidenceNote);
+}
+
+function connectorsVerdict(data: ZpaData, staleDays: number, evidenceNote: string): ZscalerFinding {
   const connectors = data.appConnectors;
   if (connectors.error) return unreadableFinding(11, "GET /connector", connectors, evidenceNote);
   const enabled = connectors.data.filter((item) => asBoolean(item.enabled) !== false);
@@ -2698,6 +2802,14 @@ function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
 
 function assessIdp(data: ZpaData): ZscalerFinding {
   const evidenceNote = "Export Administration > IdP Configuration (SSO type, SCIM sync, SAML request signing) and Administration > Administrators showing local login and two-factor settings for ZPA admins.";
+  return capForUnreadableAll(idpVerdict(data, evidenceNote), [
+    dependsOn("ZPA administrator", "GET /administrators", data.administrators),
+    dependsOn("SAML attribute", "GET /samlAttribute", data.samlAttributes),
+    dependsOn("SCIM group", "GET /scimgroup/idpId/{idpId}", data.scimGroups),
+  ], evidenceNote);
+}
+
+function idpVerdict(data: ZpaData, evidenceNote: string): ZscalerFinding {
   const idps = data.idpControllers;
   if (idps.error) return unreadableFinding(12, "GET /idp", idps, evidenceNote);
   const enabled = idps.data.filter((idp) => asBoolean(idp.enabled) === true);
@@ -2730,7 +2842,7 @@ function assessIdp(data: ZpaData): ZscalerFinding {
   const issues: string[] = [];
   if (scimIdps.length === 0) issues.push("no user IdP has SCIM provisioning enabled");
   if (unsignedIdps.length > 0) issues.push(`${unsignedIdps.length} user IdP(s) do not sign SAML requests`);
-  if (admins === undefined) issues.push(`ZPA administrators could not be read from GET /administrators (${unreadableReason(data.administrators)}; ${ZPA_ADMINISTRATORS_PROVENANCE})`);
+  if (admins === undefined) issues.push(`ZPA administrators could not be read from GET /administrators (${ZPA_ADMINISTRATORS_PROVENANCE})`);
   if (weakAdmins.length > 0) issues.push(`${weakAdmins.length} enabled ZPA administrator(s) allow local login without two-factor authentication`);
   if (adminIdps.length === 0) issues.push("no IdP is enabled for admin SSO");
   const partialNote = `${partialSuffix(idps, "IdP")}${partialSuffix(data.administrators, "ZPA administrator")}${partialSuffix(data.samlAttributes, "SAML attribute")}${partialSuffix(data.scimGroups, "SCIM group")}`;
@@ -2778,6 +2890,13 @@ function assessTimeoutPolicy(data: ZpaData, maxTimeoutHours: number): ZscalerFin
 
 function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
   const evidenceNote = "Export Administration > Trusted Networks and identify the access or forwarding rules that reference them; if no on-premises detection is required, document that decision.";
+  return capForUnreadableAll(trustedNetworksVerdict(data, evidenceNote), [
+    dependsOn("access rule", "GET /policySet/rules/policyType/ACCESS_POLICY", data.accessRules),
+    dependsOn("forwarding rule", "GET /policySet/rules/policyType/CLIENT_FORWARDING_POLICY", data.forwardingRules),
+  ], evidenceNote);
+}
+
+function trustedNetworksVerdict(data: ZpaData, evidenceNote: string): ZscalerFinding {
   const networks = data.trustedNetworks;
   if (networks.error) return unreadableFinding(15, "GET /network", networks, evidenceNote);
   const referencing = [
@@ -2807,6 +2926,10 @@ function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
 
 function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
   const evidenceNote = "If Private Service Edges are deployed, export Administration > Service Edges with control channel status; otherwise document reliance on Zscaler-hosted public service edges.";
+  return capForUnreadableAll(serviceEdgesVerdict(data, staleDays, evidenceNote), [dependsOn("service edge group", "GET /serviceEdgeGroup", data.serviceEdgeGroups)], evidenceNote);
+}
+
+function serviceEdgesVerdict(data: ZpaData, staleDays: number, evidenceNote: string): ZscalerFinding {
   const edges = data.serviceEdges;
   if (edges.error) return unreadableFinding(21, "GET /serviceEdge", edges, evidenceNote);
   const enabled = edges.data.filter((item) => asBoolean(item.enabled) !== false);
@@ -2894,7 +3017,7 @@ function certificateExpiry(items: JsonRecord[], now: Date, warnDays: number): { 
   const undated: string[] = [];
   let healthy = 0;
   for (const item of items) {
-    const validTo = epochToDate(item.validToInEpochSec);
+    const validTo = certificateValidTo(item);
     const label = ruleLabel(item);
     if (!validTo) {
       undated.push(label);
@@ -2911,6 +3034,10 @@ function certificateExpiry(items: JsonRecord[], now: Date, warnDays: number): { 
 
 function assessCertificates(data: ZpaData, warnDays: number): ZscalerFinding {
   const evidenceNote = "Export Administration > Enrollment Certificates and Browser Access Certificates with validity dates, and confirm the ZIA intermediate CA certificate expiry under Policy > SSL Inspection (not part of the verified read surface).";
+  return capForUnreadableAll(certificatesVerdict(data, warnDays, evidenceNote), [dependsOn("browser access certificate", "GET /clientlessCertificate/issued", data.browserAccessCertificates)], evidenceNote);
+}
+
+function certificatesVerdict(data: ZpaData, warnDays: number, evidenceNote: string): ZscalerFinding {
   const enrollment = data.enrollmentCertificates;
   if (enrollment.error) return unreadableFinding(24, "GET /enrollmentCert", enrollment, evidenceNote);
   const enrollmentExpiry = certificateExpiry(enrollment.data, data.now, warnDays);
@@ -2941,8 +3068,8 @@ function assessCertificates(data: ZpaData, warnDays: number): ZscalerFinding {
   if (expiring.length > 0 || undated.length > 0 || data.browserAccessCertificates.error) {
     const issues: string[] = [];
     if (expiring.length > 0) issues.push(`${expiring.length} expire within ${warnDays} days`);
-    if (undated.length > 0) issues.push(`${undated.length} have no validToInEpochSec and cannot be counted as valid`);
-    if (data.browserAccessCertificates.error) issues.push(`browser access certificates could not be read (${unreadableReason(data.browserAccessCertificates)})`);
+    if (undated.length > 0) issues.push(`${undated.length} have no validToInEpochSec or validTo and cannot be counted as valid`);
+    if (data.browserAccessCertificates.error) issues.push("browser access certificates could not be read");
     return finding(24, "warn", `${enrollmentExpiry.healthy + baExpiry.healthy} certificates are valid beyond ${warnDays} days, but ${issues.join("; ")}.${partialNote}`, evidence, evidenceNote);
   }
   const status = capForPartialAll("pass", [enrollment, data.browserAccessCertificates]);
