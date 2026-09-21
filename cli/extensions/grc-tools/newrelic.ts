@@ -489,7 +489,8 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    const pairedZip = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
+    if (!existsSync(candidate) && !existsSync(pairedZip)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -1608,7 +1609,7 @@ async function collectScoped(
   decorate: (item: JsonRecord, scopeId: string) => JsonRecord,
   limit = Number.POSITIVE_INFINITY,
 ): Promise<PagedList> {
-  if (scopes.length === 0) throw new Error("no scopes were available to query");
+  if (scopes.length === 0) return { items: [], complete: true, totalCount: 0, note: "no scopes were available to query" };
   const items: JsonRecord[] = [];
   const failures: string[] = [];
   const notes: string[] = [];
@@ -3063,7 +3064,10 @@ export function assessNewrelicDataGovernanceData(
     if (!retentionReadable) return unreadableVerdict("Data retention rules (dataManagement.eventRetentionRules)", data.retentionRules, retentionEvidence);
     if (shortRetentionRules.length > 0) return verdict("fail", `${shortRetentionRules.length}/${retentionRules.length} active retention rules keep data for less than ${minRetentionDays} days.`);
     if (retentionRules.length === 0) {
-      return manualVerdict(`No active custom retention rules exist across ${accountCount} accounts, so New Relic default retention applies to ${namespacesReadable ? `all ${data.retentionNamespaces.data.length}` : "every"} customizable namespace and the API does not expose default values; emptiness is unknown rather than compliant. Confirm in Administration > Data management > Data retention that each namespace meets ${minRetentionDays} days.`);
+      const namespaceScope = namespacesReadable && data.retentionNamespaces.data.length > 0
+        ? `all ${data.retentionNamespaces.data.length} customizable namespaces`
+        : "every customizable namespace";
+      return manualVerdict(`No active custom retention rules exist across ${accountCount} accounts, so New Relic default retention applies to ${namespaceScope} and the API does not expose default values; emptiness is unknown rather than compliant. Confirm in Administration > Data management > Data retention that each namespace meets ${minRetentionDays} days.`);
     }
     if (rulesWithoutRetentionDays.length > 0) {
       return verdict("warn", `${rulesWithoutRetentionDays.length}/${retentionRules.length} active retention rules expose no retentionInDays value and cannot be counted as compliant; the remaining rules keep data for at least ${minRetentionDays} days.`);
