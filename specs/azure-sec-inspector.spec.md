@@ -3,10 +3,10 @@ slug: "azure-sec-inspector"
 name: "Azure Security Inspector"
 vendor: "Microsoft"
 category: "cloud-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/azure-sec-inspector"
 ---
 
@@ -163,6 +163,10 @@ Why it matters: Azure and Microsoft 365 share a single identity plane (Entra ID)
 - **azure-mgmt-monitor** — Diagnostic settings, alerts
 - **azure-mgmt-resource** — Resource group and subscription management
 - **azure-cli** — `az security`, `az ad`, `az policy`, `az network nsg`
+
+### grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/azure.ts` and calls Microsoft Graph v1.0 and Azure Resource Manager REST endpoints directly with `fetch`; no SDKs are used. Tools: `azure_check_access`, `azure_assess_identity` (AZURE-ID-01 to 13), `azure_assess_monitoring` (AZURE-MON-01 to 07), `azure_assess_subscription_guardrails` (AZURE-SUB-01 to 05), `azure_assess_data_protection` (AZURE-DP-01 to 08), `azure_assess_network_and_policy` (AZURE-NP-01 to 03), and `azure_export_audit_bundle`. Every endpoint, API version, and field is traceable to a learn.microsoft.com page cited in `AZURE_ENDPOINT_DOCS` and `AZURE_ARM_API_VERSIONS`; the table above lists the original reference design and includes endpoints the implementation does not call (for example `mailboxSettings`, which exposes no forwarding property). Authentication supports explicit tokens, `az` CLI tokens, and the OAuth 2.0 client credentials grant with `AZURE_AUTHORITY_HOST` for US Government and China clouds; certificate credentials and managed identity are documented but not implemented. See `src/content/docs/docs/integrations/azure.md` for the control coverage table and status semantics.
 
 ## 3. Authentication
 
@@ -506,4 +510,15 @@ azure-sec-inspector diff ./reports/2026-03-01 ./reports/2026-03-24
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as of 2026-09-21 (TypeScript, `cli/extensions/grc-tools/azure.ts`).
+
+Shipped:
+
+- 36 findings covering all 25 controls across five assessment tools plus an access check and an evidence bundle exporter (`core_data/`, `analysis/`, `compliance/` with executive summary, unified matrix, and one report per framework, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, zip per allocated directory).
+- Verdict safety: 401/403 or errored calls render manual with the endpoint, missing permission, and evidence to collect; empty inventories never pass by default; missing licenses (Entra ID P2, Intune, Purview) render manual; items without dates cap at warn; partial inventories report seen and total counts and cap at warn; pagination follows `@odata.nextLink` and `nextLink` to completion or records truncation; reruns never overwrite a prior bundle.
+- Client credentials flow, sovereign cloud endpoints, live smoke script (`npm --prefix cli run test:azure:live`), and regression tests including four self-check fixtures (all 403, all empty, partial inventory, fully compliant tenant).
+
+Remaining manual controls and gaps:
+
+- Control 10 (DLP policies), transport rules and mailbox-level forwarding in control 20, Teams guest access in control 21, NSG flow logs in control 24, and Entra log export in control 19 are not exposed through Graph v1.0 or ARM and render manual with the evidence to collect.
+- Certificate credentials, managed identity, multi-subscription aggregation, OSCAL and STIG CKL export, and snapshot diff are not implemented.

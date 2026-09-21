@@ -1125,7 +1125,7 @@ export async function checkAzureAccess(
     notes,
     recommendedNextStep:
       status === "healthy"
-        ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle."
+        ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, or azure_export_audit_bundle."
         : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
   };
 }
@@ -2223,6 +2223,19 @@ function normalizeDataProtectionArgs(args: unknown): DataProtectionArgs {
   };
 }
 
+function normalizeGuardrailArgs(args: unknown): SubscriptionArgs & DataProtectionArgs {
+  return { ...normalizeSubscriptionArgs(args), ...normalizeDataProtectionArgs(args) };
+}
+
+export function mergeAssessments(title: string, assessments: AzureAssessmentResult[]): AzureAssessmentResult {
+  return {
+    title,
+    summary: Object.assign({}, ...assessments.map((assessment) => assessment.summary)),
+    findings: assessments.flatMap((assessment) => assessment.findings),
+    errors: assessments.flatMap((assessment) => assessment.errors),
+  };
+}
+
 function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   const value = asObject(args) ?? {};
   return {
@@ -2312,59 +2325,24 @@ export function registerAzureTools(pi: any): void {
 
   pi.registerTool({
     name: "azure_assess_subscription_guardrails",
-    label: "Assess Azure subscription guardrails",
+    label: "Assess Azure subscription and tenant guardrails",
     description:
-      "Assess Azure subscription guardrails across RBAC sprawl, security contacts, Network Watcher coverage, and privileged service principals.",
-    parameters: Type.Object({ ...authParams, max_assignments: maxAssignmentsParam }),
-    prepareArguments: normalizeSubscriptionArgs,
-    async execute(_toolCallId: string, args: SubscriptionArgs) {
+      "Assess Azure subscription guardrails (RBAC sprawl, security contacts, Network Watcher, privileged service principals), network and policy posture (NSG admin-port exposure, Azure Policy enforcement and compliance), and data and endpoint protection (Intune compliance, DLP and sensitivity labels, Key Vault, storage, inbox forwarding, SharePoint sharing).",
+    parameters: Type.Object({ ...authParams, max_assignments: maxAssignmentsParam, max_mailboxes: maxMailboxesParam }),
+    prepareArguments: normalizeGuardrailArgs,
+    async execute(_toolCallId: string, args: SubscriptionArgs & DataProtectionArgs) {
       try {
-        const result = await assessAzureSubscriptionGuardrails(createClient(args), { maxAssignments: args.max_assignments });
+        const client = createClient(args);
+        const result = mergeAssessments("Azure subscription and tenant guardrails", [
+          await assessAzureSubscriptionGuardrails(client, { maxAssignments: args.max_assignments }),
+          await assessAzureNetworkAndPolicy(client),
+          await assessAzureDataProtection(client, { maxMailboxes: args.max_mailboxes }),
+        ]);
         return textResult(formatAssessmentText(result), { tool: "azure_assess_subscription_guardrails", ...result });
       } catch (error) {
         return errorResult(
           `Azure subscription guardrail assessment failed: ${error instanceof Error ? error.message : String(error)}`,
           { tool: "azure_assess_subscription_guardrails" },
-        );
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "azure_assess_data_protection",
-    label: "Assess Azure data and endpoint protection",
-    description:
-      "Assess Intune device compliance, DLP and sensitivity labels, Key Vault protection, storage account transport and public access, inbox forwarding rules, and SharePoint external sharing.",
-    parameters: Type.Object({ ...authParams, max_mailboxes: maxMailboxesParam }),
-    prepareArguments: normalizeDataProtectionArgs,
-    async execute(_toolCallId: string, args: DataProtectionArgs) {
-      try {
-        const result = await assessAzureDataProtection(createClient(args), { maxMailboxes: args.max_mailboxes });
-        return textResult(formatAssessmentText(result), { tool: "azure_assess_data_protection", ...result });
-      } catch (error) {
-        return errorResult(
-          `Azure data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "azure_assess_data_protection" },
-        );
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "azure_assess_network_and_policy",
-    label: "Assess Azure network and policy posture",
-    description:
-      "Assess NSG exposure of admin ports to any source, Azure Policy assignment enforcement, and Azure Policy compliance state.",
-    parameters: Type.Object(authParams),
-    prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
-      try {
-        const result = await assessAzureNetworkAndPolicy(createClient(args));
-        return textResult(formatAssessmentText(result), { tool: "azure_assess_network_and_policy", ...result });
-      } catch (error) {
-        return errorResult(
-          `Azure network and policy assessment failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "azure_assess_network_and_policy" },
         );
       }
     },

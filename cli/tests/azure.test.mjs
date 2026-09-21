@@ -319,7 +319,7 @@ test("checkAzureAccess reports readable audit surfaces", async () => {
   assert.equal(result.status, "healthy");
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 8);
   assert.equal(result.surfaces.find((surface) => surface.name === "defender_pricings").count, 1);
-  assert.match(result.recommendedNextStep, /azure_assess_data_protection/);
+  assert.match(result.recommendedNextStep, /azure_assess_subscription_guardrails/);
 });
 
 test("assessAzureIdentity flags weak auth baseline and privileged role sprawl", async () => {
