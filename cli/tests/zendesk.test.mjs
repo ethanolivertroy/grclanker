@@ -104,6 +104,98 @@ function healthySettings(overrides = {}) {
   };
 }
 
+function healthySecuritySettings(overrides = {}) {
+  const { agent = {}, agentPassword = {}, endUser = {}, ip = {}, ...top } = overrides;
+  return {
+    admins_can_set_user_passwords: false,
+    agent_session_timeout: 480,
+    end_user_session_timeout: 480,
+    maximum_session_duration: 720,
+    maximum_session_duration_enabled: true,
+    mobile_app_access: true,
+    mobile_app_session_timeout: 300,
+    two_factor_last_update: daysAgo(120),
+    authentication: {
+      agent: {
+        security_policy_id: 350,
+        security_policy_name: "recommended",
+        google_login: false,
+        office_365_login: false,
+        zendesk_login: false,
+        remote_login: true,
+        enforce_sso: true,
+        sso_auto_redirect: false,
+        primary_external_auth: null,
+        two_factor_enforce: true,
+        remote_bypass: 1,
+        remote_bypass_name: "owner",
+        office_365_enforce_tid: false,
+        office_365_allowed_tids: "",
+        password: {
+          password_history_length: null,
+          password_length: 12,
+          password_complexity: 2,
+          password_in_mixed_case: true,
+          failed_attempts_allowed: 5,
+          max_sequence: 3,
+          disallow_local_part_from_email: true,
+          password_duration: null,
+          ...agentPassword,
+        },
+        ...agent,
+      },
+      end_user: {
+        security_policy_id: 350,
+        security_policy_name: "recommended",
+        google_login: false,
+        office_365_login: false,
+        facebook_login: false,
+        zendesk_login: false,
+        remote_login: true,
+        enforce_sso: true,
+        sso_auto_redirect: false,
+        primary_external_auth: null,
+        ...endUser,
+      },
+    },
+    ip: {
+      ip_ranges: "203.0.113.0/24 198.51.100.7",
+      ip_restriction_enabled: true,
+      enable_agent_ip_restrictions: true,
+      ...ip,
+    },
+    ...top,
+  };
+}
+
+function deletionSchedule(overrides = {}) {
+  return {
+    id: overrides.id ?? 1,
+    title: overrides.title ?? "Delete closed tickets after 3 years",
+    object: overrides.object ?? "zen:ticket",
+    active: overrides.active ?? true,
+    default: overrides.default ?? false,
+    conditions: overrides.conditions ?? { all: [{ field: "duration_since_last_update", operator: "greater_than", value: "P3Y" }], any: [] },
+    created_at: daysAgo(400),
+    updated_at: daysAgo(30),
+    url: `https://acme.zendesk.com/api/v2/deletion_schedules/${overrides.id ?? 1}`,
+  };
+}
+
+function tokenEvent(overrides = {}) {
+  return {
+    id: overrides.id ?? 1,
+    action: overrides.action ?? "create",
+    actor_id: 1,
+    actor_name: overrides.actor_name ?? "Auditor",
+    change_description: overrides.change_description ?? "API token created",
+    created_at: "created_at" in overrides ? overrides.created_at : daysAgo(10),
+    source_id: overrides.source_id ?? 500,
+    source_label: overrides.source_label ?? "Reporting integration",
+    source_type: "apitoken",
+  };
+}
+
 function healthyClient(overrides = {}) {
   return {
     getResolvedConfig: () => sampleConfig(),
@@ -112,6 +204,18 @@ function healthyClient(overrides = {}) {
     },
     async getAccountSettings() {
       return healthySettings();
+    },
+    async getSecuritySettings() {
+      return healthySecuritySettings();
+    },
+    async listDeletionSchedules() {
+      return list([
+        deletionSchedule({ id: 1 }),
+        deletionSchedule({ id: 2, title: "Purge inactive end users", object: "zen:user", conditions: { all: [{ field: "duration_since_last_login", operator: "greater_than", value: "P2Y" }], any: [] } }),
+      ]);
+    },
+    async listApiTokenAuditLogs() {
+      return list([]);
     },
     async listTeamMembers() {
       return list([
@@ -219,6 +323,8 @@ const LIST_METHODS = [
   "listGroups",
   "listGroupMemberships",
   "listRecentAuditLogs",
+  "listApiTokenAuditLogs",
+  "listDeletionSchedules",
   "listOAuthClients",
   "listOAuthTokens",
   "listAppInstallations",
@@ -234,7 +340,7 @@ const LIST_METHODS = [
 
 function forbiddenClient() {
   const overrides = {};
-  for (const method of [...LIST_METHODS, "getAccountSettings", "getOldestAuditLog"]) {
+  for (const method of [...LIST_METHODS, "getAccountSettings", "getSecuritySettings", "getOldestAuditLog"]) {
     overrides[method] = forbidden(method);
   }
   return healthyClient(overrides);
@@ -401,6 +507,112 @@ test("ZendeskApiClient follows cursor pagination to completion and records trunc
   assert.equal(groups.truncated, true, "reaching max_items with more pages must be recorded as truncated");
 });
 
+test("ZendeskApiClient follows links.next when has_more is absent and requests boundary indicators", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith("/users")) {
+      if (parsed.searchParams.get("page[after]") === "cursor-2") {
+        return jsonResponse({ users: [{ id: 3 }], meta: { after_cursor: null, before_cursor: "b" }, links: { next: null, prev: "https://acme.zendesk.com/api/v2/users?page%5Bbefore%5D=b" } });
+      }
+      return jsonResponse({
+        users: [{ id: 1 }, { id: 2 }],
+        meta: { after_cursor: "cursor-2", before_cursor: null },
+        links: { next: "https://acme.zendesk.com/api/v2/users?page%5Bsize%5D=100&page%5Bafter%5D=cursor-2&role%5B%5D=agent&role%5B%5D=admin", prev: null },
+      });
+    }
+    if (parsed.pathname.endsWith("/groups")) {
+      if (parsed.searchParams.get("page") === "2") {
+        return jsonResponse({ groups: [{ id: 30 }], next_page: null, previous_page: "https://acme.zendesk.com/api/v2/groups?page=1", count: 3 });
+      }
+      return jsonResponse({ groups: [{ id: 10 }, { id: 20 }], next_page: "https://acme.zendesk.com/api/v2/groups?page=2", previous_page: null, count: 3 });
+    }
+    return jsonResponse({});
+  };
+  const client = new ZendeskApiClient(sampleConfig(), { fetchImpl });
+
+  const users = await client.listTeamMembers();
+  assert.equal(users.items.length, 3, "page two must be read even though meta.has_more was never sent");
+  assert.equal(users.pages, 2);
+  assert.equal(users.truncated, false);
+  assert.equal(new URL(calls[0]).searchParams.get("include_boundary_indicators"), "true", "List Users documents include_boundary_indicators");
+
+  const groups = await client.listGroups();
+  assert.equal(groups.items.length, 3, "an offset-shaped next_page must be treated as a continuation");
+  assert.equal(groups.pages, 2);
+  assert.equal(groups.truncated, false);
+  const groupCalls = calls.filter((url) => new URL(url).pathname.endsWith("/groups"));
+  assert.equal(new URL(groupCalls[0]).searchParams.get("include_boundary_indicators"), "true", "List Groups documents include_boundary_indicators");
+});
+
+test("ZendeskApiClient pages offset-only endpoints such as targets to completion", async () => {
+  const calls = [];
+  const targets = Array.from({ length: 130 }, (_, index) => ({ id: index + 1, type: "url_target", active: true, target_url: `https://hooks.example.com/${index + 1}` }));
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    const parsed = new URL(url);
+    const page = Number(parsed.searchParams.get("page") ?? "1");
+    const perPage = Number(parsed.searchParams.get("per_page") ?? "100");
+    const slice = targets.slice((page - 1) * perPage, page * perPage);
+    const hasNext = page * perPage < targets.length;
+    return jsonResponse({
+      targets: slice,
+      next_page: hasNext ? `https://acme.zendesk.com/api/v2/targets?page=${page + 1}&per_page=${perPage}` : null,
+      previous_page: page > 1 ? `https://acme.zendesk.com/api/v2/targets?page=${page - 1}&per_page=${perPage}` : null,
+      count: targets.length,
+    });
+  };
+  const client = new ZendeskApiClient(sampleConfig(), { fetchImpl });
+
+  const result = await client.listTargets();
+  assert.equal(result.items.length, 130, "130 targets across two pages must all be read");
+  assert.equal(result.pages, 2);
+  assert.equal(result.truncated, false);
+  assert.equal(new URL(calls[0]).searchParams.get("per_page"), "100");
+  assert.equal(new Set(result.items.map((item) => item.id)).size, 130);
+
+  const capped = await new ZendeskApiClient(sampleConfig(), { fetchImpl }).listTargets(100);
+  assert.equal(capped.items.length, 100);
+  assert.equal(capped.truncated, true, "stopping at max_items with a next_page must be recorded as truncated");
+
+  const silentPages = [];
+  const silentClient = new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url) => {
+      const page = Number(new URL(url).searchParams.get("page") ?? "1");
+      silentPages.push(page);
+      const slice = targets.slice((page - 1) * 100, page * 100);
+      return jsonResponse({ targets: slice });
+    },
+  });
+  const silent = await silentClient.listTargets();
+  assert.equal(silent.items.length, 130, "a full page without next_page must trigger an explicit page=2 request");
+  assert.deepEqual(silentPages, [1, 2]);
+  assert.equal(silent.truncated, false);
+
+  const repeating = await new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ targets: targets.slice(0, 100) }),
+  }).listTargets();
+  assert.equal(repeating.items.length, 100, "an endpoint that ignores page must not duplicate items");
+  assert.equal(repeating.pages, 2);
+
+  for (const [method, key] of [["listSharingAgreements", "sharing_agreements"], ["listAppInstallations", "installations"], ["listOwnedApps", "apps"], ["listCustomRoles", "custom_roles"], ["listDeletionSchedules", "deletion_schedules"]]) {
+    const seenPages = [];
+    const paged = new ZendeskApiClient(sampleConfig(), {
+      fetchImpl: async (url) => {
+        const page = Number(new URL(url).searchParams.get("page") ?? "1");
+        seenPages.push(page);
+        return jsonResponse(page === 1
+          ? { [key]: Array.from({ length: 100 }, (_, index) => ({ id: index + 1 })), next_page: `https://acme.zendesk.com/api/v2/x?page=2`, previous_page: null }
+          : { [key]: [{ id: 101 }], next_page: null, previous_page: "https://acme.zendesk.com/api/v2/x?page=1" });
+      },
+    });
+    const outcome = await paged[method]();
+    assert.equal(outcome.items.length, 101, `${method} must follow offset pagination`);
+    assert.deepEqual(seenPages, [1, 2]);
+  }
+});
+
 test("ZendeskApiClient follows offset pagination until next_page is null", async () => {
   const calls = [];
   const fetchImpl = async (url) => {
@@ -460,9 +672,11 @@ test("checkZendeskAccess reports healthy when every surface is readable by an ad
   assert.equal(result.status, "healthy");
   assert.equal(result.currentUserRole, "admin");
   assert.equal(result.authMode, "api_token");
-  assert.equal(result.surfaces.length, 18);
+  assert.equal(result.surfaces.length, 20);
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   assert.deepEqual(result.missingPermissions, []);
+  assert.equal(result.surfaces.find((surface) => surface.name === "security_settings").endpoint, "/api/v2/security_settings");
+  assert.equal(result.surfaces.find((surface) => surface.name === "deletion_schedules").endpoint, "/api/v2/deletion_schedules");
   assert.match(result.recommendedNextStep, /zendesk_assess_authentication/);
 });
 
@@ -471,7 +685,9 @@ test("checkZendeskAccess reports limited access and names admin-only surfaces fo
     async getCurrentUser() {
       return { id: 3, email: "agent@example.com", role: "agent" };
     },
+    getSecuritySettings: forbidden("/security_settings"),
     listCustomRoles: forbidden("/custom_roles"),
+    listDeletionSchedules: forbidden("/deletion_schedules"),
     listRecentAuditLogs: forbidden("/audit_logs"),
     listOAuthClients: forbidden("/oauth/clients"),
     listOAuthTokens: forbidden("/oauth/tokens"),
@@ -483,7 +699,9 @@ test("checkZendeskAccess reports limited access and names admin-only surfaces fo
   const result = await checkZendeskAccess(client);
   assert.equal(result.status, "limited");
   assert.equal(result.currentUserRole, "agent");
-  assert.equal(result.missingPermissions.length, 5);
+  assert.equal(result.missingPermissions.length, 7);
+  assert.ok(result.missingPermissions.some((item) => /security_settings requires an admin credential \(\/api\/v2\/security_settings\)/.test(item)));
+  assert.ok(result.missingPermissions.some((item) => /deletion_schedules requires an admin credential/.test(item)));
   assert.ok(result.missingPermissions.some((item) => /oauth_clients requires an admin credential/.test(item)));
   assert.ok(result.missingPermissions.some((item) => /audit_logs requires an Enterprise admin credential/.test(item)));
   assert.equal(result.surfaces.find((surface) => surface.name === "owned_apps").status, "not_found");
@@ -491,21 +709,187 @@ test("checkZendeskAccess reports limited access and names admin-only surfaces fo
   assert.match(result.recommendedNextStep, /admin API token or OAuth token/);
 });
 
-test("assessZendeskAuthentication passes 2FA only on complete documented flags and keeps API-hidden controls manual", async () => {
+test("assessZendeskAuthentication passes controls 1-5 and 21 from documented security settings on a compliant tenant", async () => {
   const result = await assessZendeskAuthentication(healthyClient(), { now: () => NOW });
   assert.equal(result.findings.length, 6);
-  assert.equal(findingById(result, "ZD-02").status, "pass");
-  for (const id of ["ZD-01", "ZD-03", "ZD-04", "ZD-05", "ZD-21"]) {
-    const item = findingById(result, id);
-    assert.equal(item.status, "manual", `${id} is not exposed by the published API`);
-    assert.match(item.summary, /Manual evidence: capture Admin Center/);
+  for (const id of ["ZD-01", "ZD-02", "ZD-03", "ZD-04", "ZD-05", "ZD-21"]) {
+    assert.equal(findingById(result, id).status, "pass", `${id} should pass on the compliant security settings fixture`);
   }
-  assert.ok(findingById(result, "ZD-01").mappings.some((mapping) => mapping.startsWith("FedRAMP IA-2")));
+  const sso = findingById(result, "ZD-01");
+  assert.match(sso.summary, /enforce_sso=true and zendesk_login=false/);
+  assert.match(sso.summary, /remote_login \(SAML or JWT\)/);
+  assert.match(sso.summary, /limited to owner/);
+  assert.equal(sso.evidence.remote_bypass, 1);
+  assert.equal(sso.evidence.sso_auto_redirect, false);
+  assert.match(findingById(result, "ZD-02").summary, /two_factor_enforce=true and all 4 active team members/);
+  const password = findingById(result, "ZD-03");
+  assert.match(password.summary, /security_policy_name=recommended \(security_policy_id 350\)/);
+  assert.equal(password.evidence.password.password_length, 12);
+  const ip = findingById(result, "ZD-04");
+  assert.match(ip.summary, /ip_restriction_enabled=true with 2 allowed IP range\(s\)/);
+  assert.match(ip.summary, /customers are exempt \(enable_agent_ip_restrictions=true\)/);
+  assert.deepEqual(ip.evidence.ip_ranges, ["203.0.113.0/24", "198.51.100.7"]);
+  const session = findingById(result, "ZD-05");
+  assert.match(session.summary, /agent_session_timeout=480 minutes/);
+  assert.match(session.summary, /mobile_app_session_timeout=300 minutes/);
+  assert.match(session.summary, /maximum session duration of 720 minutes/);
+  assert.match(session.summary, /End user sessions expire after 480 minutes/);
+  const endUser = findingById(result, "ZD-21");
+  assert.match(endUser.summary, /authentication\.end_user\.enforce_sso=true/);
+  assert.match(endUser.summary, /Anybody can submit tickets/, "the anonymous submission portion stays a manual check");
+  assert.ok(sso.mappings.some((mapping) => mapping.startsWith("FedRAMP IA-2")));
   assert.equal(result.summary.current_user_role, "admin");
+  assert.equal(result.snapshots.security_settings.authentication.agent.enforce_sso, true);
 });
 
-test("assessZendeskAuthentication fails 2FA when any active team member reports the flag false", async () => {
+test("assessZendeskAuthentication fails SSO, password, IP, session, and end-user controls on non-compliant security settings", async () => {
   const client = healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({
+        agent: { enforce_sso: false, zendesk_login: true, remote_login: true, security_policy_name: "low", security_policy_id: 100 },
+        endUser: { enforce_sso: false, zendesk_login: false, remote_login: false, google_login: false, office_365_login: false, facebook_login: false },
+        ip: { ip_restriction_enabled: false, ip_ranges: null },
+        agent_session_timeout: 10080,
+        maximum_session_duration_enabled: false,
+      });
+    },
+  });
+  const result = await assessZendeskAuthentication(client, { now: () => NOW });
+  const sso = findingById(result, "ZD-01");
+  assert.equal(sso.status, "fail");
+  assert.match(sso.summary, /enforce_sso=false: remote_login \(SAML or JWT\) is enabled but not enforced/);
+  const password = findingById(result, "ZD-03");
+  assert.equal(password.status, "fail");
+  assert.match(password.summary, /security_policy_name=low/);
+  const ip = findingById(result, "ZD-04");
+  assert.equal(ip.status, "fail");
+  assert.match(ip.summary, /ip_restriction_enabled=false/);
+  const session = findingById(result, "ZD-05");
+  assert.equal(session.status, "fail");
+  assert.match(session.summary, /agent_session_timeout=10080 minutes exceeds the 480-minute threshold/);
+  assert.match(session.summary, /No maximum session duration is enforced/);
+  const endUser = findingById(result, "ZD-21");
+  assert.equal(endUser.status, "fail");
+  assert.match(endUser.summary, /no SSO method is enabled, so end users have no way to sign in/);
+});
+
+test("assessZendeskAuthentication warns on partially compliant security settings and honors the session threshold option", async () => {
+  const result = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({
+        agent: { enforce_sso: true, zendesk_login: true, remote_login: true, google_login: true, sso_auto_redirect: false, security_policy_name: "custom", security_policy_id: 400 },
+        agentPassword: { password_length: 8, password_complexity: 1, password_history_length: 3 },
+        endUser: { enforce_sso: false, zendesk_login: true, remote_login: false, security_policy_name: "medium", security_policy_id: 200 },
+        ip: { ip_restriction_enabled: true, ip_ranges: "" },
+        agent_session_timeout: 720,
+      });
+    },
+  }), { now: () => NOW });
+  const sso = findingById(result, "ZD-01");
+  assert.equal(sso.status, "warn");
+  assert.match(sso.summary, /zendesk_login=true, so email and password sign-in still appears enabled/);
+  assert.match(sso.summary, /sso_auto_redirect=false, so team members choose/);
+  const password = findingById(result, "ZD-03");
+  assert.equal(password.status, "warn");
+  assert.match(password.summary, /password_length=8 \(baseline 12\)/);
+  assert.match(password.summary, /password_complexity=1/);
+  assert.match(password.summary, /password_history_length=3/);
+  assert.equal(findingById(result, "ZD-04").status, "warn");
+  assert.match(findingById(result, "ZD-04").summary, /ip_ranges is empty/);
+  assert.equal(findingById(result, "ZD-05").status, "warn");
+  const endUser = findingById(result, "ZD-21");
+  assert.equal(endUser.status, "warn");
+  assert.match(endUser.summary, /medium password security level; raise the end user password level/);
+
+  const relaxed = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ agent_session_timeout: 720 });
+    },
+  }), { now: () => NOW, sessionTimeoutMinutes: 720 });
+  assert.equal(findingById(relaxed, "ZD-05").status, "pass");
+
+  const highPolicy = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ agent: { security_policy_name: "high", security_policy_id: 300 } });
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(highPolicy, "ZD-03").status, "warn");
+  assert.match(findingById(highPolicy, "ZD-03").summary, /lower requirements than Recommended/);
+
+  const customStrong = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ agent: { security_policy_name: "custom", security_policy_id: 400 } });
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(customStrong, "ZD-03").status, "pass");
+  assert.match(findingById(customStrong, "ZD-03").summary, /meet the baseline/);
+
+  const passwordEndUsers = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ endUser: { enforce_sso: false, remote_login: false, zendesk_login: true, security_policy_name: "recommended" } });
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(passwordEndUsers, "ZD-21").status, "pass");
+  assert.match(findingById(passwordEndUsers, "ZD-21").summary, /zendesk_login=true under the recommended password security level/);
+});
+
+test("assessZendeskAuthentication renders security-settings controls manual when the endpoint is forbidden or fields are absent", async () => {
+  const forbiddenSecurity = await assessZendeskAuthentication(healthyClient({ getSecuritySettings: forbidden("/security_settings") }), { now: () => NOW });
+  for (const id of ["ZD-01", "ZD-02", "ZD-03", "ZD-04", "ZD-05", "ZD-21"]) {
+    const item = findingById(forbiddenSecurity, id);
+    assert.equal(item.status, "manual", `${id} must be manual when /security_settings is forbidden`);
+    assert.match(item.summary, /Security settings \(\/security_settings, admin only\) returned 403/);
+    assert.match(item.summary, /Manual evidence: capture/);
+  }
+  assert.match(findingById(forbiddenSecurity, "ZD-02").summary, /4\/4 seen team members report two_factor_auth_enabled=true, but the account-level requirement could not be verified/);
+
+  const absentFields = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return { authentication: { agent: {}, end_user: {} }, ip: {} };
+    },
+  }), { now: () => NOW });
+  for (const id of ["ZD-01", "ZD-02", "ZD-03", "ZD-04", "ZD-05", "ZD-21"]) {
+    assert.equal(findingById(absentFields, id).status, "manual", `${id} must not pass when the documented flag is absent`);
+  }
+  assert.match(findingById(absentFields, "ZD-01").summary, /did not include enforce_sso and zendesk_login/);
+  assert.match(findingById(absentFields, "ZD-04").summary, /ip_restriction_enabled was absent/);
+  assert.match(findingById(absentFields, "ZD-05").summary, /agent_session_timeout was absent/);
+});
+
+test("assessZendeskAuthentication never passes 2FA when account enforcement is off even if every user flag is on", async () => {
+  const enforcementOff = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ agent: { two_factor_enforce: false, enforce_sso: false, zendesk_login: true, remote_login: false } });
+    },
+  }), { now: () => NOW });
+  const item = findingById(enforcementOff, "ZD-02");
+  assert.equal(item.status, "fail");
+  assert.match(item.summary, /two_factor_enforce=false: the account does not require 2FA/);
+  assert.match(item.summary, /4\/4 seen team members report two_factor_auth_enabled=true/);
+  assert.equal(item.evidence.two_factor_enforce, false);
+
+  const ssoOnly = await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ agent: { two_factor_enforce: false } });
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(ssoOnly, "ZD-02").status, "manual");
+  assert.match(findingById(ssoOnly, "ZD-02").summary, /depends on the identity provider/);
+
+  const notEnrolled = await assessZendeskAuthentication(healthyClient({
+    async listTeamMembers() {
+      return list([teamMember({ id: 1, role: "admin" }), teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false })]);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(notEnrolled, "ZD-02").status, "warn");
+  assert.match(findingById(notEnrolled, "ZD-02").summary, /1 team members report two_factor_auth_enabled=false \(not yet enrolled\)/);
+});
+
+test("assessZendeskAuthentication fails 2FA when enforcement is off and an active team member reports the flag false", async () => {
+  const client = healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings({ agent: { two_factor_enforce: false, enforce_sso: false, zendesk_login: true } });
+    },
     async listTeamMembers() {
       return list([teamMember({ id: 1, role: "admin" }), teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false })]);
     },
@@ -513,8 +897,16 @@ test("assessZendeskAuthentication fails 2FA when any active team member reports 
   const result = await assessZendeskAuthentication(client, { now: () => NOW });
   const item = findingById(result, "ZD-02");
   assert.equal(item.status, "fail");
-  assert.match(item.summary, /1\/2 active team members report two_factor_auth_enabled=false/);
+  assert.match(item.summary, /1\/2 seen team members report two_factor_auth_enabled=true and 1 report it disabled/);
   assert.deepEqual(item.evidence.without_two_factor, ["user-2@example.com"]);
+
+  const forbiddenSecurity = await assessZendeskAuthentication(healthyClient({
+    getSecuritySettings: forbidden("/security_settings"),
+    async listTeamMembers() {
+      return list([teamMember({ id: 1, role: "admin" }), teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false })]);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(forbiddenSecurity, "ZD-02").status, "fail", "a user without 2FA fails even when enforcement cannot be read");
 });
 
 test("assessZendeskAuthentication downgrades when the 2FA flag is missing or the inventory is truncated", async () => {
@@ -613,8 +1005,76 @@ test("assessZendeskAccessControl renders manual for forbidden inventories and En
       return healthySettings({ api: { api_token_access: true } });
     },
   }), { now: () => NOW });
-  assert.equal(findingById(tokenAccessOn, "ZD-13").status, "manual");
+  assert.equal(findingById(tokenAccessOn, "ZD-13").status, "warn");
   assert.match(findingById(tokenAccessOn, "ZD-13").summary, /api_token_access=true/);
+  assert.match(findingById(tokenAccessOn, "ZD-13").summary, /authenticated with an API token, so the audit history does not cover every token/);
+});
+
+test("assessZendeskAccessControl enumerates API token events from the audit log for control 13", async () => {
+  const tokenSettings = async () => healthySettings({ api: { api_token_access: true } });
+  const oauthConfig = () => sampleConfig({ authMode: "oauth", email: undefined, apiToken: undefined, oauthToken: "oauth-secret" });
+  const events = [
+    tokenEvent({ id: 9, action: "destroy", source_id: 501, source_label: "Legacy sync", created_at: daysAgo(5), change_description: "API token deleted" }),
+    tokenEvent({ id: 8, action: "create", source_id: 502, source_label: "Data warehouse", created_at: daysAgo(200), actor_name: "Ops Admin" }),
+    tokenEvent({ id: 7, action: "create", source_id: 501, source_label: "Legacy sync", created_at: daysAgo(300) }),
+    tokenEvent({ id: 6, action: "create", source_id: 500, source_label: "Reporting integration", created_at: daysAgo(10) }),
+    tokenEvent({ id: 5, action: "create", source_id: 499, source_label: "Undated token", created_at: null }),
+  ];
+
+  const outstanding = await assessZendeskAccessControl(healthyClient({
+    getResolvedConfig: oauthConfig,
+    getAccountSettings: tokenSettings,
+    async listApiTokenAuditLogs() {
+      return list(events);
+    },
+  }), { now: () => NOW });
+  const item = findingById(outstanding, "ZD-13");
+  assert.equal(item.status, "manual", "outstanding tokens require a human review");
+  assert.match(item.summary, /filter\[source_type\]=apitoken\) recorded 4 token creation and 1 deletion events/);
+  assert.match(item.summary, /leaving 3 outstanding token\(s\)/);
+  assert.match(item.summary, /1 were created more than 90 days ago and 1 have no creation date/);
+  assert.equal(item.evidence.tokens_outstanding, 3);
+  assert.deepEqual(item.evidence.outstanding_tokens.map((token) => token.label), ["Data warehouse", "Reporting integration", "Undated token"]);
+  assert.equal(item.evidence.outstanding_tokens[2].age_days, null, "undated tokens are never counted as fresh");
+  assert.equal(item.evidence.tokens_outstanding_over_stale_days, 1);
+
+  const oauthClean = await assessZendeskAccessControl(healthyClient({
+    getResolvedConfig: oauthConfig,
+    getAccountSettings: tokenSettings,
+    async listApiTokenAuditLogs() {
+      return list([events[0], events[2]]);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(oauthClean, "ZD-13").status, "warn");
+  assert.match(findingById(oauthClean, "ZD-13").summary, /leaving 0 outstanding token\(s\)\. The audit log records events rather than an inventory/);
+
+  const truncatedHistory = await assessZendeskAccessControl(healthyClient({
+    getResolvedConfig: oauthConfig,
+    getAccountSettings: tokenSettings,
+    async listApiTokenAuditLogs() {
+      return list([events[0], events[2]], true);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(truncatedHistory, "ZD-13").status, "warn");
+  assert.match(findingById(truncatedHistory, "ZD-13").summary, /history truncated/);
+
+  const noAuditLog = await assessZendeskAccessControl(healthyClient({
+    getAccountSettings: tokenSettings,
+    async listApiTokenAuditLogs() {
+      throw new ZendeskApiError("Zendesk request failed for /audit_logs (404 Not Found)", 404);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(noAuditLog, "ZD-13").status, "manual");
+  assert.match(findingById(noAuditLog, "ZD-13").summary, /Audit log token events \(\/audit_logs\?filter\[source_type\]=apitoken, Enterprise plan and admin role\) returned 404/);
+
+  const disabled = await assessZendeskAccessControl(healthyClient({
+    async listApiTokenAuditLogs() {
+      return list(events);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(disabled, "ZD-13").status, "pass");
+  assert.match(findingById(disabled, "ZD-13").summary, /api_token_access=false, so API tokens cannot be used/);
+  assert.equal(findingById(disabled, "ZD-13").evidence.tokens_outstanding, 3);
 });
 
 test("assessZendeskAccessControl treats empty team, admin, and group inventories as partial views", async () => {
@@ -644,8 +1104,13 @@ test("assessZendeskDataProtection passes audit logging, retention, attachments, 
   assert.equal(findingById(result, "ZD-10").status, "pass");
   assert.match(findingById(result, "ZD-10").summary, /400 days old/);
   assert.equal(findingById(result, "ZD-11").status, "manual");
-  assert.equal(findingById(result, "ZD-12").status, "manual");
-  assert.match(findingById(result, "ZD-12").summary, /1\/1 custom roles allow ticket redaction/);
+  assert.match(findingById(result, "ZD-11").summary, /Neither the published Account Settings reference nor the Security Settings reference/);
+  const deletion = findingById(result, "ZD-12");
+  assert.equal(deletion.status, "pass");
+  assert.match(deletion.summary, /2 active deletion schedule\(s\) read to completion \(1 for zen:ticket, 1 for zen:user; 0 default\)/);
+  assert.match(deletion.summary, /1\/1 custom roles allow ticket redaction/);
+  assert.deepEqual(deletion.evidence.active_by_object, { "zen:ticket": 1, "zen:user": 1, "zen:attachment": 0, "zen:bot_only_conversation": 0, other: 0 });
+  assert.deepEqual(deletion.evidence.schedules[0].conditions_all, ["duration_since_last_update greater_than P3Y"]);
   assert.equal(findingById(result, "ZD-18").status, "pass");
   assert.equal(findingById(result, "ZD-19").status, "manual");
   assert.match(findingById(result, "ZD-19").summary, /attachment_size=50 MB/);
@@ -707,6 +1172,50 @@ test("assessZendeskDataProtection renders audit log plan limits, absent flags, a
   }), { now: () => NOW });
   assert.equal(findingById(absentFlag, "ZD-18").status, "manual");
   assert.match(findingById(absentFlag, "ZD-18").summary, /private_attachments was absent/);
+});
+
+test("assessZendeskDataProtection evaluates deletion schedules by object and never passes on empty, inactive, or forbidden schedules", async () => {
+  const none = await assessZendeskDataProtection(healthyClient({ async listDeletionSchedules() { return list([]); } }), { now: () => NOW });
+  assert.equal(findingById(none, "ZD-12").status, "fail");
+  assert.match(findingById(none, "ZD-12").summary, /readable and returned zero schedules, so no automated retention or deletion policy is configured/);
+
+  const inactive = await assessZendeskDataProtection(healthyClient({
+    async listDeletionSchedules() {
+      return list([deletionSchedule({ id: 1, active: false })]);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(inactive, "ZD-12").status, "fail");
+  assert.match(findingById(inactive, "ZD-12").summary, /1 deletion schedule\(s\) exist but none is active/);
+
+  const usersOnly = await assessZendeskDataProtection(healthyClient({
+    async listDeletionSchedules() {
+      return list([deletionSchedule({ id: 3, object: "zen:user", default: true })]);
+    },
+  }), { now: () => NOW });
+  const users = findingById(usersOnly, "ZD-12");
+  assert.equal(users.status, "warn");
+  assert.match(users.summary, /1 active deletion schedule\(s\) \(1 for zen:user; 1 default\) but none targets zen:ticket/);
+
+  const unconditioned = await assessZendeskDataProtection(healthyClient({
+    async listDeletionSchedules() {
+      return list([deletionSchedule({ id: 4, conditions: { all: [], any: [] } })]);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(unconditioned, "ZD-12").status, "warn");
+  assert.match(findingById(unconditioned, "ZD-12").summary, /1 active schedule\(s\) have no conditions/);
+
+  const truncated = await assessZendeskDataProtection(healthyClient({
+    async listDeletionSchedules() {
+      return list([deletionSchedule({ id: 1 })], true);
+    },
+  }), { now: () => NOW });
+  assert.equal(findingById(truncated, "ZD-12").status, "warn");
+  assert.match(findingById(truncated, "ZD-12").summary, /schedule inventory was truncated/);
+
+  const forbiddenSchedules = await assessZendeskDataProtection(healthyClient({ listDeletionSchedules: forbidden("/deletion_schedules") }), { now: () => NOW });
+  assert.equal(findingById(forbiddenSchedules, "ZD-12").status, "manual");
+  assert.match(findingById(forbiddenSchedules, "ZD-12").summary, /Deletion schedules \(\/deletion_schedules, admin only\) returned 403/);
+  assert.match(findingById(forbiddenSchedules, "ZD-12").summary, /Manual evidence: capture Admin Center > Objects and rules > Tickets > Deletion schedules/);
 });
 
 test("assessZendeskDataProtection warns when retention is short or the suspended inventory is truncated", async () => {
@@ -840,7 +1349,7 @@ test("self-check (b): when every list is empty only intent-compliant controls pa
   const results = await runAllAssessments(emptyClient());
   const statuses = statusMap(results);
   assert.equal(statuses.size, 25);
-  const expectedPass = new Set(["ZD-13", "ZD-14", "ZD-15", "ZD-16", "ZD-17", "ZD-18", "ZD-20", "ZD-23", "ZD-24"]);
+  const expectedPass = new Set(["ZD-01", "ZD-03", "ZD-04", "ZD-05", "ZD-13", "ZD-14", "ZD-15", "ZD-16", "ZD-17", "ZD-18", "ZD-20", "ZD-21", "ZD-23", "ZD-24"]);
   for (const [id, status] of statuses) {
     if (expectedPass.has(id)) {
       assert.equal(status, "pass", `${id} passes on emptiness or an explicit documented flag`);
@@ -848,9 +1357,28 @@ test("self-check (b): when every list is empty only intent-compliant controls pa
       assert.notEqual(status, "pass", `${id} must not pass on an empty inventory`);
     }
   }
+  assert.equal(statuses.get("ZD-12"), "fail", "zero deletion schedules means no retention policy is configured");
+  assert.equal(statuses.get("ZD-02"), "manual", "zero team members is a partial view even when enforcement is on");
   const passing = results.flatMap((result) => result.findings).filter((item) => item.status === "pass");
   for (const item of passing) {
-    assert.match(item.summary, /zero|empty|=false|=true/i, `${item.id} must state why emptiness or the flag value is compliant`);
+    assert.match(item.summary, /zero|empty|=false|=true|=recommended|=\d+ minutes/i, `${item.id} must state why emptiness or the flag value is compliant`);
+  }
+});
+
+test("self-check (d): a compliant tenant built from documented fields passes every automatable control", async () => {
+  const results = await runAllAssessments(healthyClient());
+  const statuses = statusMap(results);
+  assert.equal(statuses.size, 25);
+  const expectedManual = new Set(["ZD-11", "ZD-19"]);
+  for (const [id, status] of statuses) {
+    if (expectedManual.has(id)) {
+      assert.equal(status, "manual", `${id} has no documented API field and stays manual`);
+    } else {
+      assert.equal(status, "pass", `${id} must pass on the compliant fixture`);
+    }
+  }
+  for (const id of ["ZD-01", "ZD-03", "ZD-04", "ZD-05", "ZD-12", "ZD-21"]) {
+    assert.equal(statuses.get(id), "pass", `${id} is now verified from security settings or deletion schedules`);
   }
 });
 
@@ -917,8 +1445,11 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
     "QUICK_REFERENCE.md",
     "core_data/access_check.json",
     "core_data/account_settings.json",
+    "core_data/security_settings.json",
     "core_data/team_members.json",
     "core_data/oauth_clients.json",
+    "core_data/api_token_audit_logs.json",
+    "core_data/deletion_schedules.json",
     "core_data/webhooks.json",
     "analysis/findings.json",
     "analysis/authentication.json",

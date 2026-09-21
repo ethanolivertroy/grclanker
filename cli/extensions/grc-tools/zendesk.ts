@@ -36,6 +36,9 @@ const DEFAULT_SUSPENDED_TICKET_AGE_DAYS = 30;
 const DEFAULT_STALE_DAYS = 90;
 const DEFAULT_RETENTION_DAYS = 365;
 const DEFAULT_AUDIT_LOG_SAMPLE = 100;
+const DEFAULT_SESSION_TIMEOUT_MINUTES = 480;
+const SECURITY_SETTINGS_SOURCE = "Security settings (/security_settings, admin only)";
+const DELETION_SCHEDULE_OBJECTS = ["zen:ticket", "zen:user", "zen:attachment", "zen:bot_only_conversation"];
 const DAY_MS = 86_400_000;
 
 export type ZendeskAuthMode = "api_token" | "oauth";
@@ -121,6 +124,7 @@ export interface ZendeskAssessmentOptions {
   suspendedTicketAgeDays?: number;
   staleDays?: number;
   retentionDays?: number;
+  sessionTimeoutMinutes?: number;
   maxItems?: number;
   now?: () => Date;
 }
@@ -140,6 +144,7 @@ type AssessArgs = AuthArgs & {
   suspended_ticket_age_days?: number;
   stale_days?: number;
   retention_days?: number;
+  session_timeout_minutes?: number;
   max_items?: number;
 };
 
@@ -510,12 +515,18 @@ export class ZendeskApiClient {
     path: string,
     collectionKey: string,
     query: JsonRecord = {},
-    options: { pageSize?: number; maxItems?: number } = {},
+    options: { pageSize?: number; maxItems?: number; boundaryIndicators?: boolean } = {},
   ): Promise<ZendeskListResult> {
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, 100);
     const maxItems = clampNumber(options.maxItems, DEFAULT_MAX_ITEMS, 1, 100_000);
+    const baseQuery: JsonRecord = {
+      ...query,
+      "page[size]": pageSize,
+      ...(options.boundaryIndicators ? { include_boundary_indicators: "true" } : {}),
+    };
     const items: JsonRecord[] = [];
-    let nextUrl: string | undefined = this.buildUrl(path, { ...query, "page[size]": pageSize });
+    const seen = new Set<string>();
+    let nextUrl: string | undefined = this.buildUrl(path, baseQuery);
     let pages = 0;
     let truncated = false;
 
@@ -523,21 +534,23 @@ export class ZendeskApiClient {
       const payload: JsonRecord = await this.get(nextUrl);
       pages += 1;
       const pageItems = asRecordArray(payload[collectionKey]);
-      items.push(...pageItems);
+      const added = appendUnique(items, seen, pageItems);
       const meta = asObject(payload.meta);
-      const hasMore = asBoolean(meta?.has_more) === true;
-      const links = asObject(payload.links);
-      const linkNext = asString(links?.next);
+      const hasMore = asBoolean(meta?.has_more);
       const afterCursor = asString(meta?.after_cursor);
-      if (!hasMore || pageItems.length === 0) break;
+      const continuation = asString(asObject(payload.links)?.next)
+        ?? (afterCursor ? this.buildUrl(path, { ...baseQuery, "page[after]": afterCursor }) : undefined)
+        ?? asString(payload.next_page);
+      if (pageItems.length === 0 || added === 0 || hasMore === false) break;
+      if (!continuation) {
+        truncated = hasMore === true;
+        break;
+      }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
         break;
       }
-      nextUrl = linkNext ?? (afterCursor ? this.buildUrl(path, { ...query, "page[size]": pageSize, "page[after]": afterCursor }) : undefined);
-      if (!nextUrl) {
-        truncated = true;
-      }
+      nextUrl = continuation;
     }
 
     return { items, truncated, pages };
@@ -552,6 +565,7 @@ export class ZendeskApiClient {
     const perPage = clampNumber(options.perPage, DEFAULT_PAGE_SIZE, 1, 100);
     const maxItems = clampNumber(options.maxItems, DEFAULT_MAX_ITEMS, 1, 10_000);
     const items: JsonRecord[] = [];
+    const seen = new Set<string>();
     let nextUrl: string | undefined = this.buildUrl(path, { ...query, per_page: perPage });
     let pages = 0;
     let truncated = false;
@@ -560,22 +574,19 @@ export class ZendeskApiClient {
       const payload: JsonRecord = await this.get(nextUrl);
       pages += 1;
       const pageItems = asRecordArray(payload[collectionKey]);
-      items.push(...pageItems);
-      const nextPage = asString(payload.next_page);
-      if (!nextPage || pageItems.length === 0) break;
+      const added = appendUnique(items, seen, pageItems);
+      if (pageItems.length === 0 || added === 0 || payload.next_page === null) break;
+      const continuation = asString(payload.next_page)
+        ?? (pageItems.length >= perPage ? this.buildUrl(path, { ...query, per_page: perPage, page: pages + 1 }) : undefined);
+      if (!continuation) break;
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
         break;
       }
-      nextUrl = nextPage;
+      nextUrl = continuation;
     }
 
     return { items, truncated, pages };
-  }
-
-  async listUnpaginated(path: string, collectionKey: string, query: JsonRecord = {}): Promise<ZendeskListResult> {
-    const payload = await this.get(path, query);
-    return { items: asRecordArray(payload[collectionKey]), truncated: false, pages: 1 };
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
@@ -588,17 +599,22 @@ export class ZendeskApiClient {
     return asObject(payload.settings) ?? {};
   }
 
-  async listTeamMembers(maxItems?: number): Promise<ZendeskListResult> {
-    const url = `${this.buildUrl("/users")}?role[]=agent&role[]=admin`;
-    return this.listCursor(url, "users", {}, { maxItems });
+  async getSecuritySettings(): Promise<JsonRecord> {
+    const payload = await this.get("/security_settings");
+    return asObject(payload.security_settings) ?? {};
   }
 
-  async listCustomRoles(): Promise<ZendeskListResult> {
-    return this.listUnpaginated("/custom_roles", "custom_roles");
+  async listTeamMembers(maxItems?: number): Promise<ZendeskListResult> {
+    const url = `${this.buildUrl("/users")}?role[]=agent&role[]=admin`;
+    return this.listCursor(url, "users", {}, { maxItems, boundaryIndicators: true });
+  }
+
+  async listCustomRoles(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listOffset("/custom_roles", "custom_roles", {}, { maxItems });
   }
 
   async listGroups(maxItems?: number): Promise<ZendeskListResult> {
-    return this.listCursor("/groups", "groups", {}, { maxItems });
+    return this.listCursor("/groups", "groups", {}, { maxItems, boundaryIndicators: true });
   }
 
   async listGroupMemberships(maxItems?: number): Promise<ZendeskListResult> {
@@ -614,6 +630,14 @@ export class ZendeskApiClient {
     return asRecordArray(payload.audit_logs)[0];
   }
 
+  async listApiTokenAuditLogs(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listCursor("/audit_logs", "audit_logs", { "filter[source_type]": "apitoken", sort: "-created_at" }, { maxItems });
+  }
+
+  async listDeletionSchedules(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listOffset("/deletion_schedules", "deletion_schedules", {}, { maxItems });
+  }
+
   async listOAuthClients(maxItems?: number): Promise<ZendeskListResult> {
     return this.listCursor("/oauth/clients", "clients", {}, { maxItems });
   }
@@ -622,12 +646,12 @@ export class ZendeskApiClient {
     return this.listCursor("/oauth/tokens", "tokens", { all: "true" }, { maxItems });
   }
 
-  async listAppInstallations(): Promise<ZendeskListResult> {
-    return this.listUnpaginated("/apps/installations", "installations");
+  async listAppInstallations(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listOffset("/apps/installations", "installations", {}, { maxItems });
   }
 
-  async listOwnedApps(): Promise<ZendeskListResult> {
-    return this.listUnpaginated("/apps/owned", "apps");
+  async listOwnedApps(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listOffset("/apps/owned", "apps", {}, { maxItems });
   }
 
   async listBrands(maxItems?: number): Promise<ZendeskListResult> {
@@ -638,8 +662,8 @@ export class ZendeskApiClient {
     return this.listCursor("/webhooks", "webhooks", {}, { maxItems });
   }
 
-  async listTargets(): Promise<ZendeskListResult> {
-    return this.listUnpaginated("/targets", "targets");
+  async listTargets(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listOffset("/targets", "targets", {}, { maxItems });
   }
 
   async listTriggers(maxItems?: number): Promise<ZendeskListResult> {
@@ -650,8 +674,8 @@ export class ZendeskApiClient {
     return this.listCursor("/automations", "automations", {}, { maxItems });
   }
 
-  async listSharingAgreements(): Promise<ZendeskListResult> {
-    return this.listUnpaginated("/sharing_agreements", "sharing_agreements");
+  async listSharingAgreements(maxItems?: number): Promise<ZendeskListResult> {
+    return this.listOffset("/sharing_agreements", "sharing_agreements", {}, { maxItems });
   }
 
   async listSuspendedTickets(maxItems?: number): Promise<ZendeskListResult> {
@@ -659,17 +683,39 @@ export class ZendeskApiClient {
   }
 }
 
+function itemIdentity(item: JsonRecord): string | undefined {
+  const id = item.id ?? item.identifier ?? item.url;
+  return id === undefined || id === null ? undefined : String(id);
+}
+
+function appendUnique(target: JsonRecord[], seen: Set<string>, incoming: JsonRecord[]): number {
+  let added = 0;
+  for (const item of incoming) {
+    const key = itemIdentity(item);
+    if (key !== undefined) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    target.push(item);
+    added += 1;
+  }
+  return added;
+}
+
 export type ZendeskReadClient = Pick<
   ZendeskApiClient,
   | "getResolvedConfig"
   | "getCurrentUser"
   | "getAccountSettings"
+  | "getSecuritySettings"
   | "listTeamMembers"
   | "listCustomRoles"
   | "listGroups"
   | "listGroupMemberships"
   | "listRecentAuditLogs"
   | "getOldestAuditLog"
+  | "listApiTokenAuditLogs"
+  | "listDeletionSchedules"
   | "listOAuthClients"
   | "listOAuthTokens"
   | "listAppInstallations"
@@ -850,8 +896,10 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
   }> = [
     { name: "current_user", endpoint: "/api/v2/users/me", requiredRole: "agent", load: () => client.getCurrentUser(), count: () => 1 },
     { name: "account_settings", endpoint: "/api/v2/account/settings", requiredRole: "agent", load: () => client.getAccountSettings(), count: () => 1 },
+    { name: "security_settings", endpoint: "/api/v2/security_settings", requiredRole: "admin", load: () => client.getSecuritySettings(), count: () => 1 },
     { name: "team_members", endpoint: "/api/v2/users?role[]=agent&role[]=admin", requiredRole: "agent", load: () => client.listTeamMembers(200) },
     { name: "custom_roles", endpoint: "/api/v2/custom_roles", requiredRole: "admin-enterprise", load: () => client.listCustomRoles() },
+    { name: "deletion_schedules", endpoint: "/api/v2/deletion_schedules", requiredRole: "admin", load: () => client.listDeletionSchedules() },
     { name: "groups", endpoint: "/api/v2/groups", requiredRole: "agent", load: () => client.listGroups(200) },
     { name: "group_memberships", endpoint: "/api/v2/group_memberships", requiredRole: "agent", load: () => client.listGroupMemberships(200) },
     { name: "audit_logs", endpoint: "/api/v2/audit_logs", requiredRole: "admin-enterprise", load: () => client.listRecentAuditLogs(1) },
@@ -903,7 +951,7 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       `Authenticated as ${currentUser.status === "ok" ? `${userLabel(currentUser.data ?? {})} (role: ${currentUserRole ?? "unknown"})` : "an unknown principal (current user lookup failed)"}.`,
       `${readableCount}/${surfaces.length} Zendesk audit surfaces are readable.`,
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
-      ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only inventories (OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
+      ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
     recommendedNextStep: status === "healthy"
       ? "Run zendesk_assess_authentication, zendesk_assess_access_control, zendesk_assess_data_protection, zendesk_assess_integrations, or zendesk_export_audit_bundle."
@@ -917,6 +965,7 @@ function resolveOptions(options: ZendeskAssessmentOptions): Required<Omit<Zendes
     suspendedTicketAgeDays: clampNumber(options.suspendedTicketAgeDays, DEFAULT_SUSPENDED_TICKET_AGE_DAYS, 1, 3650),
     staleDays: clampNumber(options.staleDays, DEFAULT_STALE_DAYS, 1, 3650),
     retentionDays: clampNumber(options.retentionDays, DEFAULT_RETENTION_DAYS, 1, 36_500),
+    sessionTimeoutMinutes: clampNumber(options.sessionTimeoutMinutes, DEFAULT_SESSION_TIMEOUT_MINUTES, 1, 20_160),
     maxItems: clampNumber(options.maxItems, DEFAULT_MAX_ITEMS, 1, 100_000),
     now: options.now ?? (() => new Date()),
   };
@@ -954,6 +1003,295 @@ function finalizeFindings(findings: ZendeskFinding[], currentUser: ZendeskSnapsh
   return [...capped].sort((left, right) => left.control - right.control);
 }
 
+function ssoMethods(auth: JsonRecord): string[] {
+  const methods: string[] = [];
+  if (asBoolean(auth.remote_login) === true) methods.push("remote_login (SAML or JWT)");
+  if (asBoolean(auth.google_login) === true) methods.push("google_login");
+  if (asBoolean(auth.office_365_login) === true) methods.push("office_365_login");
+  if (asBoolean(auth.facebook_login) === true) methods.push("facebook_login");
+  return methods;
+}
+
+function authenticationEvidence(auth: JsonRecord): JsonRecord {
+  return {
+    security_policy_id: asNumber(auth.security_policy_id) ?? null,
+    security_policy_name: asString(auth.security_policy_name) ?? null,
+    zendesk_login: asBoolean(auth.zendesk_login) ?? null,
+    enforce_sso: asBoolean(auth.enforce_sso) ?? null,
+    remote_login: asBoolean(auth.remote_login) ?? null,
+    google_login: asBoolean(auth.google_login) ?? null,
+    office_365_login: asBoolean(auth.office_365_login) ?? null,
+    sso_auto_redirect: asBoolean(auth.sso_auto_redirect) ?? null,
+    primary_external_auth: asString(auth.primary_external_auth) ?? null,
+  };
+}
+
+function assessSsoEnforcement(securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, adminCenterAuth: string): ZendeskFinding {
+  const title = "SSO enforcement enabled";
+  const instruction = `capture ${adminCenterAuth} showing single sign-on enabled and Zendesk password sign-in disabled for team members.`;
+  if (securitySnap.status !== "ok") {
+    return manualFinding(1, title, "critical", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+  }
+  const enforceSso = asBoolean(agentAuth.enforce_sso);
+  const zendeskLogin = asBoolean(agentAuth.zendesk_login);
+  const methods = ssoMethods(agentAuth);
+  const bypassName = asString(agentAuth.remote_bypass_name) ?? (asNumber(agentAuth.remote_bypass) === 1 ? "owner" : asNumber(agentAuth.remote_bypass) === 2 ? "admins" : "unknown");
+  const evidence: JsonRecord = {
+    ...authenticationEvidence(agentAuth),
+    remote_bypass: asNumber(agentAuth.remote_bypass) ?? null,
+    remote_bypass_name: bypassName,
+    two_factor_enforce: asBoolean(agentAuth.two_factor_enforce) ?? null,
+  };
+  if (enforceSso === undefined || zendeskLogin === undefined) {
+    return manualFinding(1, title, "critical", "security_settings.authentication.agent did not include enforce_sso and zendesk_login.", instruction, evidence);
+  }
+  const redirectNote = methods.length > 1
+    ? (asBoolean(agentAuth.sso_auto_redirect) === true
+      ? ` sso_auto_redirect=true sends team members to ${asString(agentAuth.primary_external_auth) ?? "the primary SSO method"}.`
+      : " sso_auto_redirect=false, so team members choose among the active SSO methods.")
+    : "";
+  if (enforceSso && zendeskLogin === false && methods.length > 0) {
+    return finding(1, title, "critical", "pass", `authentication.agent.enforce_sso=true and zendesk_login=false: team members must sign in through ${methods.join(", ")}. One-time SSO bypass links are limited to ${bypassName} (remote_bypass).${redirectNote}`, evidence);
+  }
+  if (enforceSso) {
+    return finding(1, title, "critical", "warn", methods.length === 0
+      ? "authentication.agent.enforce_sso=true but no SSO method (remote_login, google_login, office_365_login) is enabled for team members; confirm how team members sign in."
+      : `authentication.agent.enforce_sso=true but zendesk_login=true, so email and password sign-in still appears enabled alongside ${methods.join(", ")}.${redirectNote}`, evidence);
+  }
+  return finding(1, title, "critical", "fail", methods.length > 0
+    ? `authentication.agent.enforce_sso=false: ${methods.join(", ")} ${methods.length === 1 ? "is" : "are"} enabled but not enforced, so team members can still sign in with a Zendesk password (zendesk_login=${zendeskLogin}).`
+    : `authentication.agent.enforce_sso=false and no SSO method is enabled; team members sign in with Zendesk passwords only (zendesk_login=${zendeskLogin}).`, evidence);
+}
+
+function assessAgentTwoFactor(
+  securitySnap: ZendeskSnapshot<JsonRecord>,
+  agentAuth: JsonRecord,
+  teamSnap: ZendeskSnapshot<ZendeskListResult>,
+  teamMembers: JsonRecord[],
+  adminCenterAuth: string,
+): ZendeskFinding {
+  const title = "Two-factor authentication required for agents";
+  const requirementInstruction = `capture ${adminCenterAuth} showing two-factor authentication required for team members.`;
+  const enforce = securitySnap.status === "ok" ? asBoolean(agentAuth.two_factor_enforce) : undefined;
+  const enforceSso = securitySnap.status === "ok" ? asBoolean(agentAuth.enforce_sso) : undefined;
+  const enforcementText = securitySnap.status === "ok"
+    ? `security_settings.authentication.agent.two_factor_enforce=${enforce ?? "absent"}.`
+    : snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap);
+  if (teamSnap.status !== "ok") {
+    return manualFinding(2, title, "critical", `${snapshotCause("Team member list (/users?role[]=agent&role[]=admin)", teamSnap)} ${enforcementText}`, `export the team member list from Admin Center > People > Team > Team members and ${requirementInstruction}`, { two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
+  }
+  if (teamMembers.length === 0) {
+    return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population. ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: 0, two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
+  }
+  const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
+  const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
+  const truncated = isTruncated(teamSnap);
+  const enrolled = teamMembers.length - withoutTwoFactor.length - unknownTwoFactor.length;
+  const perUser = `${enrolled}/${teamMembers.length} seen team members report two_factor_auth_enabled=true`;
+  const evidence: JsonRecord = {
+    two_factor_enforce: enforce ?? null,
+    enforce_sso: enforceSso ?? null,
+    security_settings_status: securitySnap.status,
+    seen_team_members: teamMembers.length,
+    inventory_truncated: truncated,
+    without_two_factor: withoutTwoFactor.slice(0, 50).map(userLabel),
+    two_factor_flag_missing: unknownTwoFactor.slice(0, 50).map(userLabel),
+  };
+  if (securitySnap.status !== "ok") {
+    return withoutTwoFactor.length > 0
+      ? finding(2, title, "critical", "fail", `${withoutTwoFactor.length}/${teamMembers.length} active team members report two_factor_auth_enabled=false. ${enforcementText}${truncationNote("team member", teamSnap)}`, evidence)
+      : manualFinding(2, title, "critical", `${perUser}, but the account-level requirement could not be verified: ${enforcementText}`, requirementInstruction, evidence);
+  }
+  if (enforce === undefined) {
+    return manualFinding(2, title, "critical", `${perUser}, but security_settings.authentication.agent.two_factor_enforce was absent from the response.`, requirementInstruction, evidence);
+  }
+  if (!enforce) {
+    if (enforceSso === true) {
+      return manualFinding(2, title, "critical", `two_factor_enforce=false while enforce_sso=true, so Zendesk-native 2FA is not required and multi-factor authentication depends on the identity provider (${perUser}).`, "capture the identity provider's MFA policy that covers every Zendesk team member.", evidence);
+    }
+    return finding(2, title, "critical", "fail", `security_settings.authentication.agent.two_factor_enforce=false: the account does not require 2FA, so per-user enrollment is optional even though ${perUser}${withoutTwoFactor.length > 0 ? ` and ${withoutTwoFactor.length} report it disabled` : ""}.${truncationNote("team member", teamSnap)}`, evidence);
+  }
+  if (withoutTwoFactor.length > 0 || unknownTwoFactor.length > 0 || truncated) {
+    return finding(2, title, "critical", "warn", `two_factor_enforce=true, but ${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
+  }
+  return finding(2, title, "critical", "pass", `security_settings.authentication.agent.two_factor_enforce=true and all ${teamMembers.length} active team members report two_factor_auth_enabled=true; the inventory was read to completion.`, evidence);
+}
+
+function customPasswordGaps(password: JsonRecord): string[] {
+  const gaps: string[] = [];
+  const length = asNumber(password.password_length);
+  if (length === undefined || length < 12) gaps.push(`password_length=${length ?? "absent"} (baseline 12)`);
+  const complexity = asNumber(password.password_complexity);
+  if (complexity === undefined || complexity < 2) gaps.push(`password_complexity=${complexity ?? "absent"} (baseline 2, numbers and special characters)`);
+  if (asBoolean(password.password_in_mixed_case) !== true) gaps.push("password_in_mixed_case=false");
+  const attempts = asNumber(password.failed_attempts_allowed);
+  if (attempts === undefined || attempts > 10) gaps.push(`failed_attempts_allowed=${attempts ?? "absent"} (baseline at most 10)`);
+  if (asBoolean(password.disallow_local_part_from_email) !== true) gaps.push("disallow_local_part_from_email=false");
+  const history = password.password_history_length;
+  if (history !== null && history !== undefined && (asNumber(history) ?? 0) < 5) gaps.push(`password_history_length=${asNumber(history)} (baseline 5; null means unlimited)`);
+  return gaps;
+}
+
+function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, agentPassword: JsonRecord): ZendeskFinding {
+  const title = "Password policy meets complexity requirements";
+  const instruction = "capture Admin Center > Account > Security > Team member authentication > Password level (Recommended, High, Medium, Low, or Custom) and the custom policy details.";
+  if (securitySnap.status !== "ok") {
+    return manualFinding(3, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+  }
+  const policyName = asString(agentAuth.security_policy_name)?.toLowerCase();
+  const evidence: JsonRecord = {
+    ...authenticationEvidence(agentAuth),
+    password: {
+      password_length: asNumber(agentPassword.password_length) ?? null,
+      password_complexity: asNumber(agentPassword.password_complexity) ?? null,
+      password_in_mixed_case: asBoolean(agentPassword.password_in_mixed_case) ?? null,
+      password_history_length: asNumber(agentPassword.password_history_length) ?? null,
+      password_duration: asNumber(agentPassword.password_duration) ?? null,
+      failed_attempts_allowed: asNumber(agentPassword.failed_attempts_allowed) ?? null,
+      max_sequence: asNumber(agentPassword.max_sequence) ?? null,
+      disallow_local_part_from_email: asBoolean(agentPassword.disallow_local_part_from_email) ?? null,
+    },
+  };
+  if (!policyName) {
+    return manualFinding(3, title, "high", "security_settings.authentication.agent.security_policy_name was absent from the response.", instruction, evidence);
+  }
+  const ssoNote = asBoolean(agentAuth.enforce_sso) === true && asBoolean(agentAuth.zendesk_login) === false
+    ? " SSO is enforced, so this policy governs only bypass and recovery sign-ins."
+    : "";
+  const label = `authentication.agent.security_policy_name=${policyName} (security_policy_id ${asNumber(agentAuth.security_policy_id) ?? "absent"})`;
+  if (policyName === "recommended") {
+    return finding(3, title, "high", "pass", `${label}, the level Zendesk documents as its strongest preset.${ssoNote}`, evidence);
+  }
+  if (policyName === "custom") {
+    const gaps = customPasswordGaps(agentPassword);
+    return gaps.length === 0
+      ? finding(3, title, "high", "pass", `${label} and the documented policy fields meet the baseline (12+ characters, numbers and special characters, mixed case, lockout after at most 10 failed attempts, email local part disallowed, history of at least 5 or unlimited).${ssoNote}`, evidence)
+      : finding(3, title, "high", "warn", `${label} but ${gaps.length} policy fields fall short of the baseline: ${gaps.join("; ")}.${ssoNote}`, evidence);
+  }
+  if (policyName === "high") {
+    return finding(3, title, "high", "warn", `${label}; Zendesk documents High as having lower requirements than Recommended, so confirm it satisfies the password length your frameworks require (PCI-DSS 8.3.6 expects 12 characters).${ssoNote}`, evidence);
+  }
+  return finding(3, title, "high", "fail", `${label}, below Zendesk's recommended preset; raise it to Recommended or a custom policy that meets the baseline.${ssoNote}`, evidence);
+}
+
+function assessIpRestrictions(securitySnap: ZendeskSnapshot<JsonRecord>, ipSettings: JsonRecord): ZendeskFinding {
+  const title = "IP restrictions configured for agent access";
+  const instruction = "capture Admin Center > Account > Security > Advanced > IP restrictions showing the allowed ranges and whether customers are exempt.";
+  if (securitySnap.status !== "ok") {
+    return manualFinding(4, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+  }
+  const enabled = asBoolean(ipSettings.ip_restriction_enabled);
+  const ranges = (asString(ipSettings.ip_ranges) ?? "").split(/\s+/).filter(Boolean);
+  const agentsOnly = asBoolean(ipSettings.enable_agent_ip_restrictions);
+  const evidence: JsonRecord = {
+    ip_restriction_enabled: enabled ?? null,
+    ip_ranges: ranges,
+    ip_range_count: ranges.length,
+    enable_agent_ip_restrictions: agentsOnly ?? null,
+  };
+  if (enabled === undefined) {
+    return manualFinding(4, title, "high", "security_settings.ip.ip_restriction_enabled was absent from the response.", instruction, evidence);
+  }
+  if (enabled && ranges.length > 0) {
+    const scope = agentsOnly === true
+      ? "restrictions apply to team members only and customers are exempt (enable_agent_ip_restrictions=true)"
+      : "restrictions apply to team members and end users (enable_agent_ip_restrictions=false)";
+    return finding(4, title, "high", "pass", `security_settings.ip.ip_restriction_enabled=true with ${ranges.length} allowed IP range(s); ${scope}.`, evidence);
+  }
+  if (enabled) {
+    return finding(4, title, "high", "warn", "security_settings.ip.ip_restriction_enabled=true but ip_ranges is empty, so no allowlist is applied.", evidence);
+  }
+  return finding(4, title, "high", "fail", "security_settings.ip.ip_restriction_enabled=false: team members can sign in from any network. If agents work from unmanaged networks, document the compensating control (for example SSO with device or conditional access policies).", evidence);
+}
+
+function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, security: JsonRecord, thresholdMinutes: number): ZendeskFinding {
+  const title = "Session timeout configured and reasonable";
+  const instruction = "capture Admin Center > Account > Security > Advanced > Authentication showing the team member, end user, and mobile app session expiration values.";
+  if (securitySnap.status !== "ok") {
+    return manualFinding(5, title, "medium", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+  }
+  const agentTimeout = asNumber(security.agent_session_timeout);
+  const endUserTimeout = asNumber(security.end_user_session_timeout);
+  const maxDurationEnabled = asBoolean(security.maximum_session_duration_enabled);
+  const maxDuration = asNumber(security.maximum_session_duration);
+  const mobileAccess = asBoolean(security.mobile_app_access);
+  const mobileTimeout = asNumber(security.mobile_app_session_timeout);
+  const evidence: JsonRecord = {
+    agent_session_timeout: agentTimeout ?? null,
+    end_user_session_timeout: endUserTimeout ?? null,
+    maximum_session_duration_enabled: maxDurationEnabled ?? null,
+    maximum_session_duration: maxDuration ?? null,
+    mobile_app_access: mobileAccess ?? null,
+    mobile_app_session_timeout: mobileTimeout ?? null,
+    threshold_minutes: thresholdMinutes,
+  };
+  if (agentTimeout === undefined) {
+    return manualFinding(5, title, "medium", "security_settings.agent_session_timeout was absent from the response.", instruction, evidence);
+  }
+  const issues: string[] = [];
+  if (agentTimeout <= 0) issues.push("agent_session_timeout=0, so team member sessions never expire from inactivity");
+  else if (agentTimeout > thresholdMinutes) issues.push(`agent_session_timeout=${agentTimeout} minutes exceeds the ${thresholdMinutes}-minute threshold`);
+  if (mobileAccess !== false && mobileTimeout !== undefined) {
+    if (mobileTimeout <= 0) issues.push("mobile_app_session_timeout=0, so mobile app sessions never expire from inactivity");
+    else if (mobileTimeout > thresholdMinutes) issues.push(`mobile_app_session_timeout=${mobileTimeout} minutes exceeds the ${thresholdMinutes}-minute threshold`);
+  }
+  const maxNote = maxDurationEnabled === true && maxDuration !== undefined && maxDuration > 0
+    ? ` A maximum session duration of ${maxDuration} minutes is enforced (maximum_session_duration_enabled=true).`
+    : " No maximum session duration is enforced (maximum_session_duration_enabled is not true), so only inactivity ends team member sessions.";
+  const endUserNote = endUserTimeout !== undefined ? ` End user sessions expire after ${endUserTimeout} minutes of inactivity.` : "";
+  if (issues.length === 0) {
+    const mobileNote = mobileAccess !== false && mobileTimeout !== undefined ? ` and mobile_app_session_timeout=${mobileTimeout} minutes` : "";
+    return finding(5, title, "medium", "pass", `security_settings.agent_session_timeout=${agentTimeout} minutes${mobileNote} of inactivity are within the ${thresholdMinutes}-minute threshold.${maxNote}${endUserNote}`, evidence);
+  }
+  const severe = agentTimeout <= 0 || agentTimeout > thresholdMinutes * 3;
+  return finding(5, title, "medium", severe ? "fail" : "warn", `${issues.join("; ")}.${maxNote}${endUserNote}`, evidence);
+}
+
+function assessEndUserAuthentication(
+  securitySnap: ZendeskSnapshot<JsonRecord>,
+  endUserAuth: JsonRecord,
+  settingsSnap: ZendeskSnapshot<JsonRecord>,
+  apiSettings: JsonRecord,
+): ZendeskFinding {
+  const title = "End-user authentication required (no anonymous tickets)";
+  const anonymousInstruction = "capture Admin Center > People > Configuration > End users showing that 'Anybody can submit tickets' is disabled (or that sign-in is required), which the API does not expose.";
+  const passwordApiAccess = settingsSnap.status === "ok" ? asBoolean(apiSettings.api_password_access_end_users) : undefined;
+  const apiNote = passwordApiAccess === true ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended." : "";
+  const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, security_settings_status: securitySnap.status };
+  if (securitySnap.status !== "ok") {
+    return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
+  }
+  const zendeskLogin = asBoolean(endUserAuth.zendesk_login);
+  const enforceSso = asBoolean(endUserAuth.enforce_sso);
+  const methods = ssoMethods(endUserAuth);
+  const policyName = asString(endUserAuth.security_policy_name)?.toLowerCase();
+  const evidence: JsonRecord = {
+    ...authenticationEvidence(endUserAuth),
+    facebook_login: asBoolean(endUserAuth.facebook_login) ?? null,
+    ...baseEvidence,
+  };
+  if (zendeskLogin === undefined || enforceSso === undefined) {
+    return manualFinding(21, title, "high", "security_settings.authentication.end_user did not include zendesk_login and enforce_sso.", `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, evidence);
+  }
+  const manualPortion = ` The anonymous submission setting is a separate manual check: ${anonymousInstruction}`;
+  if (enforceSso && methods.length > 0) {
+    return finding(21, title, "high", "pass", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence);
+  }
+  if (enforceSso) {
+    return finding(21, title, "high", "warn", `authentication.end_user.enforce_sso=true but no SSO method is enabled for end users; confirm how end users sign in.${apiNote}${manualPortion}`, evidence);
+  }
+  if (zendeskLogin) {
+    const social = methods.length > 0 ? ` Additional sign-in methods: ${methods.join(", ")}.` : "";
+    return policyName === "recommended" || policyName === "high"
+      ? finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence)
+      : finding(21, title, "high", "warn", `authentication.end_user.zendesk_login=true under the ${policyName ?? "unknown"} password security level; raise the end user password level to Recommended or High.${social}${apiNote}${manualPortion}`, evidence);
+  }
+  if (methods.length > 0) {
+    return finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence);
+  }
+  return finding(21, title, "high", "fail", `authentication.end_user.zendesk_login=false, enforce_sso=false, and no SSO method is enabled, so end users have no way to sign in and every end user interaction is anonymous.${apiNote}${manualPortion}`, evidence);
+}
+
 export async function assessZendeskAuthentication(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
@@ -962,82 +1300,32 @@ export async function assessZendeskAuthentication(
   const resolved = resolveOptions(options);
   const currentUserSnap = await snapshot(() => client.getCurrentUser());
   const settingsSnap = await snapshot(() => client.getAccountSettings());
+  const securitySnap = await snapshot(() => client.getSecuritySettings());
   const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
-  const settings = settingsSnap.data ?? {};
-  const activeFeatures = asObject(settings.active_features) ?? {};
-  const apiSettings = asObject(settings.api) ?? {};
-  const settingsEvidence: JsonRecord = {
-    settings_readable: settingsSnap.status === "ok",
-    end_user_social_logins: {
-      google_login: asBoolean(activeFeatures.google_login) ?? null,
-      facebook_login: asBoolean(activeFeatures.facebook_login) ?? null,
-      twitter_login: asBoolean(activeFeatures.twitter_login) ?? null,
-    },
-    google_apps_connected: asBoolean(asObject(settings.google_apps)?.has_google_apps) ?? null,
-  };
+  const apiSettings = asObject(settingsSnap.data?.api) ?? {};
+  const security = securitySnap.data ?? {};
+  const authentication = asObject(security.authentication) ?? {};
+  const agentAuth = asObject(authentication.agent) ?? {};
+  const endUserAuth = asObject(authentication.end_user) ?? {};
+  const agentPassword = asObject(agentAuth.password) ?? {};
+  const ipSettings = asObject(security.ip) ?? {};
   const teamMembers = listSnapshotItems(teamSnap).filter(isActiveTeamMember);
   const adminCenterAuth = "Admin Center > Account > Security > Team member authentication (and End user authentication)";
 
-  const findings: ZendeskFinding[] = [];
-
-  findings.push(manualFinding(
-    1,
-    "SSO enforcement enabled",
-    "critical",
-    settingsSnap.status === "ok"
-      ? "The published Account Settings reference exposes no SSO enforcement field, so SSO cannot be verified through the API."
-      : `${snapshotCause("Account settings", settingsSnap)} SSO enforcement is not exposed by the published API in any case.`,
-    `capture ${adminCenterAuth} showing SAML or JWT single sign-on enabled and Zendesk password sign-in disabled for team members.`,
-    settingsEvidence,
-  ));
-
-  const twoFactorTitle = "Two-factor authentication required for agents";
-  if (teamSnap.status !== "ok") {
-    findings.push(manualFinding(2, twoFactorTitle, "critical", snapshotCause("Team member list (/users?role[]=agent&role[]=admin)", teamSnap), `export the team member list from Admin Center > People > Team > Team members and capture ${adminCenterAuth} showing two-factor authentication required.`));
-  } else if (teamMembers.length === 0) {
-    findings.push(manualFinding(2, twoFactorTitle, "critical", "Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population.", `use an admin credential and capture ${adminCenterAuth} showing two-factor authentication required.`, { seen_team_members: 0 }));
-  } else {
-    const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
-    const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
-    const truncated = isTruncated(teamSnap);
-    const evidence: JsonRecord = {
-      seen_team_members: teamMembers.length,
-      inventory_truncated: truncated,
-      without_two_factor: withoutTwoFactor.slice(0, 50).map(userLabel),
-      two_factor_flag_missing: unknownTwoFactor.slice(0, 50).map(userLabel),
-    };
-    if (withoutTwoFactor.length > 0) {
-      findings.push(finding(2, twoFactorTitle, "critical", "fail", `${withoutTwoFactor.length}/${teamMembers.length} active team members report two_factor_auth_enabled=false.${truncationNote("team member", teamSnap)}`, evidence));
-    } else if (unknownTwoFactor.length > 0 || truncated) {
-      findings.push(finding(2, twoFactorTitle, "critical", "warn", `${teamMembers.length - unknownTwoFactor.length}/${teamMembers.length} seen team members report two_factor_auth_enabled=true; ${unknownTwoFactor.length} did not expose the flag.${truncationNote("team member", teamSnap)} Confirm the account-level requirement in ${adminCenterAuth}.`, evidence));
-    } else {
-      findings.push(finding(2, twoFactorTitle, "critical", "pass", `All ${teamMembers.length} active team members report two_factor_auth_enabled=true and the inventory was read to completion. Confirm the account-level requirement toggle in ${adminCenterAuth} for audit evidence.`, evidence));
-    }
-  }
-
-  findings.push(manualFinding(3, "Password policy meets complexity requirements", "high", "The published Account Settings reference exposes no password level or policy field.", "capture Admin Center > Account > Security > Team member authentication > Password level (Recommended, High, or Custom) and the custom policy details.", { settings_readable: settingsSnap.status === "ok" }));
-  findings.push(manualFinding(4, "IP restrictions configured for agent access", "high", "The published Account Settings reference exposes no IP restriction field.", "capture Admin Center > Account > Security > Advanced > IP restrictions showing the allowed ranges and whether customers are exempt.", { settings_readable: settingsSnap.status === "ok" }));
-  findings.push(manualFinding(5, "Session timeout configured and reasonable", "medium", "The published Account Settings reference exposes no session expiration field.", "capture Admin Center > Account > Security > Advanced > Authentication showing the team member and end user session expiration values.", { settings_readable: settingsSnap.status === "ok" }));
-
-  const endUserTitle = "End-user authentication required (no anonymous tickets)";
-  if (settingsSnap.status !== "ok") {
-    findings.push(manualFinding(21, endUserTitle, "high", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Account > Security > End user authentication and Admin Center > People > Configuration > End users (require sign-in, anybody can submit tickets)."));
-  } else {
-    const passwordApiAccess = asBoolean(apiSettings.api_password_access_end_users);
-    findings.push(manualFinding(
-      21,
-      endUserTitle,
-      "high",
-      `The end user sign-in requirement is not exposed by the published Account Settings reference.${passwordApiAccess === true ? " Note: api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended." : passwordApiAccess === false ? " api.api_password_access_end_users=false (end users cannot call the API with a password)." : ""}`,
-      "capture Admin Center > People > Configuration > End users showing 'Require sign-in' (or that 'Anybody can submit tickets' is disabled) and the end user authentication methods.",
-      { ...settingsEvidence, api_password_access_end_users: passwordApiAccess ?? null },
-    ));
-  }
+  const findings: ZendeskFinding[] = [
+    assessSsoEnforcement(securitySnap, agentAuth, adminCenterAuth),
+    assessAgentTwoFactor(securitySnap, agentAuth, teamSnap, teamMembers, adminCenterAuth),
+    assessPasswordPolicy(securitySnap, agentAuth, agentPassword),
+    assessIpRestrictions(securitySnap, ipSettings),
+    assessSessionTimeout(securitySnap, security, resolved.sessionTimeoutMinutes),
+    assessEndUserAuthentication(securitySnap, endUserAuth, settingsSnap, apiSettings),
+  ];
 
   const finalFindings = finalizeFindings(findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
     ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
+    ["security_settings", securitySnap],
     ["team_members", teamSnap],
   ];
   return {
@@ -1055,6 +1343,108 @@ export async function assessZendeskAuthentication(
   };
 }
 
+interface ApiTokenEventSummary {
+  created: number;
+  destroyed: number;
+  outstanding: JsonRecord[];
+  outstandingOverStale: number;
+  outstandingUndated: number;
+  newestEvent?: string;
+}
+
+function summarizeApiTokenEvents(events: JsonRecord[], staleDays: number, now: Date): ApiTokenEventSummary {
+  const destroyedKeys = new Set<string>();
+  const outstanding: JsonRecord[] = [];
+  let created = 0;
+  let destroyed = 0;
+  for (const event of events) {
+    const action = asString(event.action);
+    const key = asString(event.source_id) ?? asString(event.source_label) ?? asString(event.id) ?? "";
+    if (action === "destroy") {
+      destroyed += 1;
+      destroyedKeys.add(key);
+    } else if (action === "create") {
+      created += 1;
+      if (destroyedKeys.has(key)) continue;
+      const age = ageInDays(event.created_at, now);
+      outstanding.push({
+        source_id: asString(event.source_id) ?? null,
+        label: asString(event.source_label) ?? null,
+        created_at: asString(event.created_at) ?? null,
+        age_days: age ?? null,
+        created_by: asString(event.actor_name) ?? null,
+        change_description: asString(event.change_description) ?? null,
+      });
+    }
+  }
+  return {
+    created,
+    destroyed,
+    outstanding,
+    outstandingOverStale: outstanding.filter((token) => typeof token.age_days === "number" && token.age_days > staleDays).length,
+    outstandingUndated: outstanding.filter((token) => token.age_days === null).length,
+    newestEvent: asString(events[0]?.created_at),
+  };
+}
+
+function assessApiTokens(
+  settingsSnap: ZendeskSnapshot<JsonRecord>,
+  tokenLogsSnap: ZendeskSnapshot<ZendeskListResult>,
+  config: ZendeskResolvedConfig,
+  staleDays: number,
+  now: Date,
+): ZendeskFinding {
+  const title = "API tokens are minimal and reviewed";
+  const instruction = "capture Admin Center > Apps and integrations > APIs > API tokens showing each token, its description, creation date, and owner.";
+  const retirement = "Zendesk is retiring API tokens (unused tokens deactivated from July 28, 2026; all tokens stop working April 30, 2027).";
+  const apiTokenAccess = asBoolean(asObject(settingsSnap.data?.api)?.api_token_access);
+  const events = listSnapshotItems(tokenLogsSnap);
+  const summary = summarizeApiTokenEvents(events, staleDays, now);
+  const evidence: JsonRecord = {
+    api_token_access: apiTokenAccess ?? null,
+    auth_mode: config.authMode,
+    token_audit_log_status: tokenLogsSnap.status,
+    token_events_read: events.length,
+    token_events_truncated: isTruncated(tokenLogsSnap),
+    tokens_created: summary.created,
+    tokens_destroyed: summary.destroyed,
+    tokens_outstanding: summary.outstanding.length,
+    tokens_outstanding_over_stale_days: summary.outstandingOverStale,
+    tokens_outstanding_undated: summary.outstandingUndated,
+    outstanding_tokens: summary.outstanding.slice(0, 50),
+    newest_token_event: summary.newestEvent ?? null,
+  };
+  const auditText = tokenLogsSnap.status === "ok"
+    ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events${isTruncated(tokenLogsSnap) ? " (history truncated)" : ""}, leaving ${summary.outstanding.length} outstanding token(s).`
+    : snapshotCause("Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)", tokenLogsSnap);
+  if (settingsSnap.status !== "ok") {
+    return manualFinding(13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
+  }
+  if (apiTokenAccess === false) {
+    return finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence);
+  }
+  const accessText = `settings.api.api_token_access=${apiTokenAccess === true ? "true" : "absent"}, so API tokens can authenticate to this account.`;
+  if (tokenLogsSnap.status !== "ok") {
+    return manualFinding(13, title, "high", `${accessText} ${auditText} ${retirement}`, instruction, evidence);
+  }
+  if (summary.outstanding.length === 0) {
+    const caveat = config.authMode === "api_token"
+      ? " This assessment itself authenticated with an API token, so the audit history does not cover every token."
+      : isTruncated(tokenLogsSnap)
+        ? " The token event history was truncated, so older tokens may be missing."
+        : " The audit log records events rather than an inventory, so confirm the token list in Admin Center.";
+    return finding(13, title, "high", "warn", `${accessText} ${auditText}${caveat} ${retirement}`, evidence);
+  }
+  return manualFinding(
+    13,
+    title,
+    "high",
+    `${accessText} ${auditText} ${summary.outstandingOverStale} were created more than ${staleDays} days ago and ${summary.outstandingUndated} have no creation date. ${retirement}`,
+    "review each outstanding token in Admin Center > Apps and integrations > APIs > API tokens, confirm its owner and purpose, delete unused tokens, and record the OAuth migration plan.",
+    evidence,
+  );
+}
+
 export async function assessZendeskAccessControl(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
@@ -1070,6 +1460,7 @@ export async function assessZendeskAccessControl(
   const membershipsSnap = await snapshot(() => client.listGroupMemberships(resolved.maxItems));
   const clientsSnap = await snapshot(() => client.listOAuthClients(resolved.maxItems));
   const tokensSnap = await snapshot(() => client.listOAuthTokens(resolved.maxItems));
+  const tokenLogsSnap = await snapshot(() => client.listApiTokenAuditLogs(resolved.maxItems));
 
   const teamMembers = listSnapshotItems(teamSnap).filter(isActiveTeamMember);
   const admins = teamMembers.filter((user) => asString(user.role) === "admin");
@@ -1157,16 +1548,7 @@ export async function assessZendeskAccessControl(
     }
   }
 
-  const apiTokenTitle = "API tokens are minimal and reviewed";
-  const apiTokenAccess = asBoolean(asObject(settingsSnap.data?.api)?.api_token_access);
-  const apiTokenEvidence: JsonRecord = { api_token_access: apiTokenAccess ?? null, auth_mode: config.authMode };
-  if (settingsSnap.status !== "ok") {
-    findings.push(manualFinding(13, apiTokenTitle, "high", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Apps and integrations > APIs > API tokens showing each token, its description, creation date, and owner."));
-  } else if (apiTokenAccess === false) {
-    findings.push(finding(13, apiTokenTitle, "high", "pass", "settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account.", apiTokenEvidence));
-  } else {
-    findings.push(manualFinding(13, apiTokenTitle, "high", `settings.api.api_token_access=${apiTokenAccess === true ? "true" : "absent"}; the API token inventory is not part of the published API reference, and Zendesk is retiring API tokens (unused tokens deactivated from July 28, 2026; all tokens stop working April 30, 2027).`, "capture Admin Center > Apps and integrations > APIs > API tokens, confirm each token has an owner and purpose, delete unused tokens, and record the migration plan to OAuth.", apiTokenEvidence));
-  }
+  findings.push(assessApiTokens(settingsSnap, tokenLogsSnap, config, resolved.staleDays, now));
 
   const oauthTitle = "OAuth application permissions are scoped";
   if (clientsSnap.status !== "ok") {
@@ -1214,6 +1596,7 @@ export async function assessZendeskAccessControl(
     ["group_memberships", membershipsSnap],
     ["oauth_clients", clientsSnap],
     ["oauth_tokens", tokensSnap],
+    ["api_token_audit_logs", tokenLogsSnap],
   ];
   return {
     category: "access-control",
@@ -1234,6 +1617,91 @@ export async function assessZendeskAccessControl(
   };
 }
 
+function describeConditions(list: unknown): string[] {
+  return asRecordArray(list).map((condition) => {
+    const value = condition.value;
+    const rendered = asString(value) ?? (value === undefined || value === null ? "" : JSON.stringify(value));
+    return `${asString(condition.field) ?? "?"} ${asString(condition.operator) ?? "?"} ${rendered}`.trim();
+  });
+}
+
+function summarizeDeletionSchedule(schedule: JsonRecord): JsonRecord {
+  const conditions = asObject(schedule.conditions) ?? {};
+  return {
+    id: asString(schedule.id) ?? null,
+    title: asString(schedule.title) ?? null,
+    object: asString(schedule.object) ?? null,
+    active: asBoolean(schedule.active) ?? null,
+    default: asBoolean(schedule.default) ?? null,
+    conditions_all: describeConditions(conditions.all),
+    conditions_any: describeConditions(conditions.any),
+    updated_at: asString(schedule.updated_at) ?? null,
+  };
+}
+
+function scheduleHasConditions(schedule: JsonRecord): boolean {
+  const conditions = asObject(schedule.conditions) ?? {};
+  return asRecordArray(conditions.all).length > 0 || asRecordArray(conditions.any).length > 0;
+}
+
+function assessDeletionPolicies(
+  deletionSnap: ZendeskSnapshot<ZendeskListResult>,
+  settingsSnap: ZendeskSnapshot<JsonRecord>,
+  tickets: JsonRecord,
+  rolesSnap: ZendeskSnapshot<ZendeskListResult>,
+): ZendeskFinding {
+  const title = "Data deletion/redaction policies configured";
+  const instruction = "capture Admin Center > Objects and rules > Tickets > Deletion schedules (Account > Security > Deletion schedules on older layouts) showing the active schedules and the redaction policy.";
+  const customRoles = listSnapshotItems(rolesSnap);
+  const redactionRoles = customRoles.filter((role) => asBoolean(asObject(role.configuration)?.ticket_redaction) === true).length;
+  const deletionScheduleRoles = customRoles.filter((role) => asString(asObject(role.configuration)?.manage_deletion_schedules) === "all").length;
+  const agentTicketDeletion = asBoolean(tickets.agent_ticket_deletion);
+  const context = `${settingsSnap.status === "ok" ? ` settings.tickets.agent_ticket_deletion=${agentTicketDeletion ?? "absent"}${agentTicketDeletion === true ? " (agents can delete tickets; review whether that is intended)" : ""}.` : ""}${rolesSnap.status === "ok" ? ` ${redactionRoles}/${customRoles.length} custom roles allow ticket redaction and ${deletionScheduleRoles} can manage deletion schedules.` : ""}`;
+  const baseEvidence: JsonRecord = {
+    deletion_schedules_status: deletionSnap.status,
+    agent_ticket_deletion: agentTicketDeletion ?? null,
+    custom_roles_with_ticket_redaction: redactionRoles,
+    custom_roles_managing_deletion_schedules: deletionScheduleRoles,
+    custom_roles_status: rolesSnap.status,
+  };
+  if (deletionSnap.status !== "ok") {
+    return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
+  }
+  const schedules = listSnapshotItems(deletionSnap);
+  const active = schedules.filter((schedule) => asBoolean(schedule.active) === true);
+  const activeByObject = Object.fromEntries(DELETION_SCHEDULE_OBJECTS.map((object) => [object, active.filter((schedule) => asString(schedule.object) === object).length]));
+  const otherActive = active.filter((schedule) => !DELETION_SCHEDULE_OBJECTS.includes(asString(schedule.object) ?? "")).length;
+  const activeWithoutConditions = active.filter((schedule) => !scheduleHasConditions(schedule)).length;
+  const defaults = schedules.filter((schedule) => asBoolean(schedule.default) === true).length;
+  const evidence: JsonRecord = {
+    ...baseEvidence,
+    deletion_schedules: schedules.length,
+    active_deletion_schedules: active.length,
+    active_by_object: { ...activeByObject, other: otherActive },
+    active_without_conditions: activeWithoutConditions,
+    default_schedules: defaults,
+    inventory_truncated: isTruncated(deletionSnap),
+    schedules: schedules.slice(0, 25).map(summarizeDeletionSchedule),
+  };
+  if (schedules.length === 0) {
+    return finding(12, title, "high", "fail", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
+  }
+  if (active.length === 0) {
+    return finding(12, title, "high", "fail", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
+  }
+  const byObjectText = Object.entries(activeByObject).filter(([, count]) => count > 0).map(([object, count]) => `${count} for ${object}`).concat(otherActive > 0 ? [`${otherActive} for custom objects`] : []).join(", ");
+  const ticketSchedules = activeByObject["zen:ticket"] ?? 0;
+  if (ticketSchedules === 0 || activeWithoutConditions > 0 || isTruncated(deletionSnap)) {
+    const gaps = [
+      ...(ticketSchedules === 0 ? ["none targets zen:ticket, so ticket data has no automated retention limit"] : []),
+      ...(activeWithoutConditions > 0 ? [`${activeWithoutConditions} active schedule(s) have no conditions`] : []),
+      ...(isTruncated(deletionSnap) ? ["the schedule inventory was truncated"] : []),
+    ];
+    return finding(12, title, "high", "warn", `${active.length} active deletion schedule(s) (${byObjectText}; ${defaults} default) but ${gaps.join(" and ")}.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence);
+  }
+  return finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence);
+}
+
 export async function assessZendeskDataProtection(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
@@ -1248,6 +1716,7 @@ export async function assessZendeskDataProtection(
     ? await snapshot(() => client.getOldestAuditLog())
     : { status: auditSnap.status, data: undefined, error: auditSnap.error, httpStatus: auditSnap.httpStatus };
   const rolesSnap = await snapshot(() => client.listCustomRoles());
+  const deletionSnap = await snapshot(() => client.listDeletionSchedules(resolved.maxItems));
   const suspendedSnap = await snapshot(() => client.listSuspendedTickets(resolved.maxItems));
   const settings = settingsSnap.data ?? {};
   const tickets = asObject(settings.tickets) ?? {};
@@ -1285,21 +1754,9 @@ export async function assessZendeskDataProtection(
     }
   }
 
-  findings.push(manualFinding(11, "HIPAA compliance mode enabled (if applicable)", "critical", "HIPAA and Advanced Data Privacy and Protection settings are not exposed by the published Account Settings reference.", "capture Admin Center > Account > Security > Advanced showing the HIPAA-enabled configuration (or the executed BAA) if the account processes PHI; otherwise record not applicable.", { settings_readable: settingsSnap.status === "ok" }));
+  findings.push(manualFinding(11, "HIPAA compliance mode enabled (if applicable)", "critical", "Neither the published Account Settings reference nor the Security Settings reference exposes a HIPAA or Advanced Data Privacy and Protection field.", "capture Admin Center > Account > Security > Advanced showing the HIPAA-enabled configuration (or the executed BAA) if the account processes PHI; otherwise record not applicable.", { settings_readable: settingsSnap.status === "ok" }));
 
-  const deletionTitle = "Data deletion/redaction policies configured";
-  const customRoles = listSnapshotItems(rolesSnap);
-  const redactionRoles = customRoles.filter((role) => asBoolean(asObject(role.configuration)?.ticket_redaction) === true).length;
-  const deletionScheduleRoles = customRoles.filter((role) => asString(asObject(role.configuration)?.manage_deletion_schedules) === "all").length;
-  const agentTicketDeletion = asBoolean(tickets.agent_ticket_deletion);
-  findings.push(manualFinding(
-    12,
-    deletionTitle,
-    "high",
-    `Deletion schedules and retention policies are not exposed by the published API.${settingsSnap.status === "ok" ? ` settings.tickets.agent_ticket_deletion=${agentTicketDeletion ?? "absent"}${agentTicketDeletion === true ? " (agents can delete tickets; review whether that is intended)" : ""}.` : ` ${snapshotCause("Account settings", settingsSnap)}`}${rolesSnap.status === "ok" ? ` ${redactionRoles}/${customRoles.length} custom roles allow ticket redaction and ${deletionScheduleRoles} can manage deletion schedules.` : ""}`,
-    "capture Admin Center > Account > Security > Deletion schedules (or Objects and rules > Tickets > Deletion schedules) showing the active schedules and the redaction policy.",
-    { settings_readable: settingsSnap.status === "ok", agent_ticket_deletion: agentTicketDeletion ?? null, custom_roles_with_ticket_redaction: redactionRoles, custom_roles_managing_deletion_schedules: deletionScheduleRoles, custom_roles_status: rolesSnap.status },
-  ));
+  findings.push(assessDeletionPolicies(deletionSnap, settingsSnap, tickets, rolesSnap));
 
   const cdnTitle = "CDN security (attachment hosting) configured";
   const privateAttachments = asBoolean(tickets.private_attachments);
@@ -1363,6 +1820,7 @@ export async function assessZendeskDataProtection(
     ["audit_logs_recent", auditSnap],
     ["audit_log_oldest", oldestSnap],
     ["custom_roles", rolesSnap],
+    ["deletion_schedules", deletionSnap],
     ["suspended_tickets", suspendedSnap],
   ];
   return {
@@ -1869,6 +2327,7 @@ function normalizeAssessArgs(args: unknown): AssessArgs {
     suspended_ticket_age_days: asNumber(value.suspended_ticket_age_days),
     stale_days: asNumber(value.stale_days),
     retention_days: asNumber(value.retention_days),
+    session_timeout_minutes: asNumber(value.session_timeout_minutes),
     max_items: asNumber(value.max_items),
   };
 }
@@ -1887,6 +2346,7 @@ function toOptions(args: AssessArgs): ZendeskAssessmentOptions {
     suspendedTicketAgeDays: args.suspended_ticket_age_days,
     staleDays: args.stale_days,
     retentionDays: args.retention_days,
+    sessionTimeoutMinutes: args.session_timeout_minutes,
     maxItems: args.max_items,
   };
 }
@@ -1911,6 +2371,7 @@ const assessParams = {
   suspended_ticket_age_days: Type.Optional(Type.Number({ description: "Suspended tickets older than this many days are flagged. Defaults to 30.", default: 30 })),
   stale_days: Type.Optional(Type.Number({ description: "Days without sign-in or token use before an admin or token counts as dormant. Defaults to 90.", default: 90 })),
   retention_days: Type.Optional(Type.Number({ description: "Required audit log retention in days. Defaults to 365.", default: 365 })),
+  session_timeout_minutes: Type.Optional(Type.Number({ description: "Maximum acceptable team member inactivity timeout in minutes for control 5. Defaults to 480.", default: 480 })),
   max_items: Type.Optional(Type.Number({ description: "Maximum items to page through per inventory before recording truncation. Defaults to 2000.", default: 2000 })),
 };
 
@@ -1960,7 +2421,7 @@ export function registerZendeskTools(pi: any): void {
     pi,
     "zendesk_assess_authentication",
     "Assess Zendesk authentication",
-    "Assess Zendesk authentication controls (spec controls 1-5 and 21): SSO enforcement, agent two-factor coverage from documented user flags, password policy, IP restrictions, session expiration, and end-user authentication. Settings that the published API does not expose are returned as manual findings naming the Admin Center evidence.",
+    "Assess Zendesk authentication controls (spec controls 1-5 and 21) from the admin-only Security Settings endpoint plus documented user flags: SSO enforcement, account-level two-factor enforcement and per-agent enrollment, team member password policy, IP restrictions, session expiration, and end-user authentication methods. Forbidden endpoints render as manual findings naming the Admin Center evidence.",
     (client, options) => assessZendeskAuthentication(client, options),
   );
 
@@ -1968,7 +2429,7 @@ export function registerZendeskTools(pi: any): void {
     pi,
     "zendesk_assess_access_control",
     "Assess Zendesk access control",
-    "Assess Zendesk access control (spec controls 6-8, 13, 14): least-privilege custom roles, admin count and dormant admins, group segmentation, API token exposure, and OAuth client scope and token hygiene, with partial or truncated inventories downgraded instead of passing.",
+    "Assess Zendesk access control (spec controls 6-8, 13, 14): least-privilege custom roles, admin count and dormant admins, group segmentation, API token exposure with token creation and deletion events enumerated from the audit log, and OAuth client scope and token hygiene, with partial or truncated inventories downgraded instead of passing.",
     (client, options) => assessZendeskAccessControl(client, options),
   );
 
@@ -1976,7 +2437,7 @@ export function registerZendeskTools(pi: any): void {
     pi,
     "zendesk_assess_data_protection",
     "Assess Zendesk data protection",
-    "Assess Zendesk audit logging and data protection (spec controls 9-12, 18-20): audit log availability and retention (Enterprise), HIPAA mode, deletion and redaction policies, authenticated attachment downloads, attachment limits, and suspended ticket backlog age.",
+    "Assess Zendesk audit logging and data protection (spec controls 9-12, 18-20): audit log availability and retention (Enterprise), HIPAA mode, active deletion schedules by object plus redaction permissions, authenticated attachment downloads, attachment limits, and suspended ticket backlog age.",
     (client, options) => assessZendeskDataProtection(client, options),
   );
 
