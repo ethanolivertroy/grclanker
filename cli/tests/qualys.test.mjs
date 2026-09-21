@@ -1550,7 +1550,9 @@ test("docs fidelity 5: user status, role, and last login come from /msp/user_lis
   const fallback = findingById(undocumented, "QUALYS-C13");
   assert.notEqual(fallback.status, "pass");
   assert.equal(fallback.evidence.status_source, "not available");
-  assert.equal(fallback.evidence.inactive_status_users, 0, "userStatus and lastLoginDate are not documented on search/am/user and are never read");
+  assert.equal(fallback.evidence.inactive_status_users, null, "userStatus and lastLoginDate are not documented on search/am/user and are never read, so the count is unknown without the User List API");
+  assert.equal(fallback.evidence.users_with_last_login, null);
+  assert.equal(fallback.evidence.administration_api_users, 1);
   assert.deepEqual(fallback.evidence.stale_login_users, []);
   assert.match(fallback.summary, /documents no status or last-login field, so inactive-user detection is manual/);
 });
@@ -2664,7 +2666,149 @@ test("false-pass self-check (d): a fully compliant tenant built strictly from do
   assert.deepEqual(findingById(vuln, "QUALYS-C08").evidence.auth_record_types, [{ type: "unix", count: 253 }, { type: "windows", count: 2 }]);
   assert.equal(findingById(vuln, "QUALYS-C10").evidence.sla_compliance_percent, 100);
   assert.equal(findingById(admin, "QUALYS-C13").evidence.active_users, 3);
+  assert.equal(findingById(admin, "QUALYS-C13").evidence.administration_api_users, 3);
   assert.equal(findingById(admin, "QUALYS-C15").evidence.recently_scanned_web_apps, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rule 1 corollary: a finding that reads more than one inventory demotes when any of them is unreadable,
+// names the dataset and endpoint in its summary, and renders counts taken from it as null, never 0.
+// ---------------------------------------------------------------------------------------------
+
+function withForbidden(matches) {
+  return routedClient(async (url, init) => (matches(url) ? forbiddenRouter(url) : compliantRouter(url, init)));
+}
+
+test("rule 1 corollary: C01 demotes and names /api/2.0/fo/scan/ when the scan list is forbidden instead of passing with finished_scans_in_lookback 0", async () => {
+  const result = await assessQualysScanCoverage(withForbidden((url) => url.includes("/fo/scan/")));
+  const coverage = findingById(result, "QUALYS-C01");
+  assert.notEqual(coverage.status, "pass", "pre-fix: pass with finished_scans_in_lookback 0 and scans absent from sources");
+  assert.equal(coverage.status, "manual");
+  assert.match(coverage.summary, /Required evidence was not readable: scans[^:]*: .*\/api\/2\.0\/fo\/scan\//);
+  assert.equal(coverage.evidence.finished_scans_in_lookback, null, "a count from an unreadable inventory renders as null");
+  assert.equal(coverage.evidence.active_schedules, 2, "counts from readable inventories keep their values");
+  const scans = coverage.evidence.collection.sources.find((source) => source.name === "scans");
+  assert.equal(scans.status, "unreadable");
+  assert.match(scans.reason, /\/api\/2\.0\/fo\/scan\//);
+  assert.equal(result.summary.finished_scans_in_lookback, null);
+  assert.equal(result.errors.length, 1);
+  for (const item of result.findings.filter((entry) => entry.id !== "QUALYS-C01")) {
+    assert.equal(item.evidence.collection.sources.some((source) => source.name === "scans"), false, `${item.id} does not read the scan list`);
+  }
+});
+
+test("rule 1 corollary: C13 demotes and names /qps/rest/2.0/search/am/user/ when the Administration API search is forbidden even though the User List API answered", async () => {
+  const result = await assessQualysAdministration(withForbidden((url) => url.includes("/am/user")));
+  const users = findingById(result, "QUALYS-C13");
+  assert.notEqual(users.status, "pass", "pre-fix: pass because sources dropped users whenever the User List API was readable");
+  assert.equal(users.status, "manual");
+  assert.match(users.summary, /Administration API user search \(\/qps\/rest\/2\.0\/search\/am\/user\/\) was not readable/);
+  assert.match(users.summary, /Required evidence was not readable: users[^:]*: .*\/qps\/rest\/2\.0\/search\/am\/user\//);
+  assert.equal(users.evidence.administration_api_users, null);
+  assert.equal(users.evidence.user_list_users, 3);
+  assert.equal(users.evidence.active_users, 3, "status, role, and last login still come from the readable User List API");
+  assert.deepEqual(users.evidence.collection.sources.map((source) => [source.name, source.status]), [["user_list", "readable"], ["users", "unreadable"]]);
+  assert.equal(users.evidence.collection.view_scope.source, "user_list", "the role scope falls back to the User List API without becoming partial");
+  assert.equal(users.evidence.collection.view_scope.partial, false);
+
+  const reversed = findingById(await assessQualysAdministration(withForbidden((url) => url.includes("/msp/user_list.php"))), "QUALYS-C13");
+  assert.equal(reversed.status, "manual");
+  assert.match(reversed.summary, /\/msp\/user_list\.php/);
+  assert.equal(reversed.evidence.user_list_users, null);
+  assert.equal(reversed.evidence.administration_api_users, 3);
+  assert.equal(reversed.evidence.status_source, "not available");
+});
+
+test("C13 discloses User List rows returned without USER_LOGIN under the documented Restricted view instead of naming them user", async () => {
+  // user_list_output.dtd: USER_LOGIN? and USER_ID? are optional; the guide's Restricted view hides both for users
+  // outside the caller's business unit while CONTACT_INFO stays required.
+  const hidden = legacyUser({ login: "hidden_manager", id: "1009", role: "Manager", email: "ops-shared@example.com" });
+  delete hidden.USER_LOGIN;
+  delete hidden.USER_ID;
+  const result = await assessQualysAdministration(routedClient(async (url, init) => {
+    if (url.includes("/msp/user_list.php")) return xmlResponse(userListXml([...tenant.legacyUsers, hidden]));
+    return compliantRouter(url, init);
+  }));
+  const users = findingById(result, "QUALYS-C13");
+  assert.equal(users.status, "warn");
+  assert.match(users.summary, /1 users were returned without a USER_LOGIN \(the Restricted view hides logins outside the caller's business unit\), so generic_accounts and shared_emails under-report for them/);
+  assert.equal(users.evidence.restricted_view_users_without_login, 1);
+  assert.deepEqual(users.evidence.unknown_buckets, { users_without_login_in_restricted_view: 1 });
+  assert.ok(users.evidence.managers.includes("ops-shared@example.com"), "the documented CONTACT_INFO/EMAIL labels the row before any placeholder");
+  assert.equal(users.evidence.managers.includes("user"), false);
+});
+
+// Each surface a finding reads, the endpoint that serves it, and every finding that lists it in sources.
+const SWEEP_SURFACES = [
+  { surface: "scheduled_scans", endpoint: "/api/2.0/fo/schedule/scan/", matches: (url) => url.includes("/schedule/scan/"), dependents: ["QUALYS-C01", "QUALYS-C14", "QUALYS-C20"] },
+  { surface: "scans", endpoint: "/api/2.0/fo/scan/", matches: (url) => url.includes("/fo/scan/"), dependents: ["QUALYS-C01"] },
+  { surface: "hosts", endpoint: "/api/2.0/fo/asset/host/", matches: (url) => url.includes("/asset/host/?"), dependents: ["QUALYS-C01", "QUALYS-C02", "QUALYS-C04", "QUALYS-C07", "QUALYS-C08", "QUALYS-C10", "QUALYS-C11", "QUALYS-C18"] },
+  { surface: "option_profiles", endpoint: "/api/2.0/fo/subscription/option_profile/vm/", matches: (url) => url.includes("/option_profile/vm/"), dependents: ["QUALYS-C03", "QUALYS-C16"] },
+  { surface: "excluded_ips", endpoint: "/api/2.0/fo/asset/excluded_ip/", matches: (url) => url.includes("/excluded_ip/"), dependents: ["QUALYS-C16"] },
+  { surface: "asset_groups", endpoint: "/api/2.0/fo/asset/group/", matches: (url) => url.includes("/asset/group/"), dependents: ["QUALYS-C01", "QUALYS-C04"] },
+  { surface: "connectors", endpoint: "/qps/rest/2.0/search/am/assetdataconnector", matches: (url) => url.includes("/am/assetdataconnector"), dependents: ["QUALYS-C05"] },
+  { surface: "appliances", endpoint: "/api/2.0/fo/appliance/", matches: (url) => url.includes("/appliance/"), dependents: ["QUALYS-C06"] },
+  { surface: "cloud_agents", endpoint: "/qps/rest/2.0/search/am/hostasset", matches: (url) => url.includes("/am/hostasset"), dependents: ["QUALYS-C07"] },
+  { surface: "tags", endpoint: "/qps/rest/2.0/search/am/tag", matches: (url) => url.includes("/am/tag"), dependents: ["QUALYS-C18"] },
+  { surface: "auth_records", endpoint: "/api/2.0/fo/auth/", matches: (url) => url.includes("/fo/auth/"), dependents: ["QUALYS-C08"] },
+  { surface: "compliance_policies", endpoint: "/api/2.0/fo/compliance/policy/", matches: (url) => url.includes("/compliance/policy/"), dependents: ["QUALYS-C09"] },
+  { surface: "detections", endpoint: "/api/2.0/fo/asset/host/vm/detection/", matches: (url) => url.includes("/vm/detection/"), dependents: ["QUALYS-C10", "QUALYS-C11", "QUALYS-C17"] },
+  { surface: "knowledge_base", endpoint: "/api/2.0/fo/knowledge_base/vuln/", matches: (url) => url.includes("/knowledge_base/"), dependents: ["QUALYS-C11"] },
+  { surface: "scheduled_reports", endpoint: "/api/2.0/fo/schedule/report/", matches: (url) => url.includes("/schedule/report/"), dependents: ["QUALYS-C12"] },
+  { surface: "reports", endpoint: "/api/2.0/fo/report/", matches: (url) => url.includes("/fo/report/"), dependents: ["QUALYS-C12"] },
+  { surface: "users", endpoint: "/qps/rest/2.0/search/am/user/", matches: (url) => url.includes("/am/user"), dependents: ["QUALYS-C13"] },
+  { surface: "user_list", endpoint: "/msp/user_list.php", matches: (url) => url.includes("/msp/user_list.php"), dependents: ["QUALYS-C13"] },
+  { surface: "activity_log", endpoint: "/api/2.0/fo/activity_log/", matches: (url) => url.includes("/activity_log/"), dependents: ["QUALYS-C19"] },
+  { surface: "was_webapps", endpoint: "/qps/rest/3.0/search/was/webapp", matches: (url) => /\/was\/webapp(\?|$)/.test(url), dependents: ["QUALYS-C15"] },
+  { surface: "was_scans", endpoint: "/qps/rest/3.0/search/was/wasscan", matches: (url) => /\/was\/wasscan(\?|$)/.test(url), dependents: ["QUALYS-C15"] },
+  { surface: "was_auth_records", endpoint: "/qps/rest/3.0/search/was/webappauthrecord", matches: (url) => url.includes("/was/webappauthrecord"), dependents: ["QUALYS-C15"] },
+  { surface: "was_schedules", endpoint: "/qps/rest/3.0/search/was/wasscanschedule", matches: (url) => url.includes("/was/wasscanschedule"), dependents: ["QUALYS-C15"] },
+];
+
+test("rule 1 corollary sweep: each surface made unreadable in turn demotes exactly its dependents below pass and names the endpoint", async () => {
+  const baseline = new Map(allFindings(await runAllAssessments(routedClient(compliantRouter))).map((item) => [item.id, item.status]));
+  assert.equal(baseline.size, 20);
+  const table = [];
+  for (const { surface, endpoint, matches, dependents } of SWEEP_SURFACES) {
+    const findings = allFindings(await runAllAssessments(withForbidden(matches)));
+    assert.equal(findings.length, 20, surface);
+    const demoted = findings.filter((item) => item.evidence.collection.sources.some((source) => source.status === "unreadable")).map((item) => item.id).sort();
+    assert.deepEqual(demoted, [...dependents].sort(), `${surface}: exactly the dependents record the unreadable source`);
+    for (const item of findings) {
+      if (dependents.includes(item.id)) {
+        assert.notEqual(item.status, "pass", `${surface}: ${item.id} must not pass while ${endpoint} is unreadable`);
+        assert.ok(item.summary.includes(endpoint), `${surface}: ${item.id} summary must name ${endpoint}: ${item.summary}`);
+        assert.ok(item.summary.includes("not readable"), `${surface}: ${item.id} summary must disclose the unreadable dataset`);
+        const unreadable = item.evidence.collection.sources.filter((source) => source.status === "unreadable");
+        assert.ok(unreadable.some((source) => source.reason.includes(endpoint)), `${surface}: ${item.id} collection.sources must carry the endpoint`);
+        for (const source of unreadable) {
+          assert.equal(source.count, 0);
+        }
+        // Every plain count of the unreadable surface renders as null, never as 0 (list-valued evidence such as
+        // C03 option_profiles names is not a count).
+        // C13 users_returned is the population from whichever user surface answered, so the two user surfaces
+        // are judged on their own count keys.
+        const countKeys = surface === "users"
+          ? ["administration_api_users"]
+          : surface === "user_list"
+            ? ["user_list_users", "inactive_status_users", "pending_activation_users", "users_with_last_login"]
+            : [surface, `${surface}_returned`, ...(surface === "scans" ? ["finished_scans_in_lookback"] : [])];
+        for (const key of countKeys) {
+          if (!(key in item.evidence) || Array.isArray(item.evidence[key])) continue;
+          assert.equal(item.evidence[key], null, `${surface}: ${item.id} evidence.${key} must be null, got ${JSON.stringify(item.evidence[key])}`);
+        }
+      } else {
+        assert.equal(item.status, baseline.get(item.id), `${surface}: ${item.id} does not read ${endpoint} and must keep its compliant verdict`);
+        assert.equal(item.evidence.collection.view_scope.partial, false, `${surface}: ${item.id} view scope stays full`);
+      }
+    }
+    const statuses = findings.filter((item) => dependents.includes(item.id)).map((item) => `${item.id}=${item.status}`).join(", ");
+    table.push(`| ${surface} | ${endpoint} | ${statuses} |`);
+  }
+  assert.equal(table.length, SWEEP_SURFACES.length);
+  if (process.env.QUALYS_SWEEP_TABLE) {
+    console.log(["| surface | endpoint | dependents after 403 |", "| --- | --- | --- |", ...table].join("\n"));
+  }
 });
 
 test("all four assessments together cover every one of the 20 spec controls with framework mappings and collection evidence", async () => {
