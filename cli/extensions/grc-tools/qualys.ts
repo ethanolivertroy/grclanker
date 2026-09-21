@@ -169,7 +169,7 @@ export interface QualysViewScope {
   partial: boolean;
   roles: string[];
   scopeTags: string[];
-  source: "user_search" | "activity_log" | "unverified";
+  source: "user_search" | "user_list" | "activity_log" | "unverified";
   note: string;
 }
 
@@ -1163,7 +1163,26 @@ export class QualysApiClient {
   }
 
   async searchUsers(): Promise<QualysListResult> {
+    // Administration API search/am/user (user.xsd): id, username, firstName, lastName, emailAddress, title,
+    // scopeTags, roleList. Active users only; no status or last-login field exists on this response.
     return this.searchQps("/qps/rest/2.0/search/am/user/", [], { pageSize: 500, limit: DEFAULT_LIST_LIMIT });
+  }
+
+  async listUsers(): Promise<QualysListResult> {
+    // VM/PC API user guide "User List" (/msp/user_list.php, user_list_output.dtd): USER carries USER_LOGIN,
+    // USER_STATUS, CREATION_DATE, LAST_LOGIN_DATE (Manager and Unit Manager callers only), USER_ROLE,
+    // BUSINESS_UNIT, and CONTACT_INFO/EMAIL. Errors arrive as USER_LIST_OUTPUT/ERROR with a number attribute.
+    const document = await this.getXml("/msp/user_list.php", {});
+    const output = findXmlElement(document, "USER_LIST_OUTPUT");
+    const error = output?.children.find((child) => child.name === "ERROR");
+    if (error) {
+      const number = error.attributes.number;
+      throw new Error(redactSecrets(`Qualys request failed for /msp/user_list.php: error${number ? ` ${number}` : ""}: ${error.text.trim()}`, this.config));
+    }
+    if (!output) {
+      throw new Error("Qualys request for /msp/user_list.php did not return USER_LIST_OUTPUT.");
+    }
+    return listResult(xmlRecords(output, "USER"), 1);
   }
 
   async searchCloudAgents(limit = DEFAULT_HOST_LIMIT): Promise<QualysListResult> {
@@ -1248,6 +1267,7 @@ export type QualysDataClient = Pick<
   | "listScheduledReports"
   | "listReports"
   | "listActivityLog"
+  | "listUsers"
   | "searchUsers"
   | "searchCloudAgents"
   | "searchConnectors"
@@ -1296,6 +1316,20 @@ function shortenMessage(message: string, length = 160): string {
   return message.replace(/\s+/g, " ").trim().slice(0, length);
 }
 
+interface ApiUserContext {
+  users: Collected;
+  legacyUsers: Collected;
+}
+
+// Both user surfaces are read with their own error sink: they only establish the API user's role and scope.
+async function collectApiUserContext(client: QualysDataClient): Promise<ApiUserContext> {
+  const [users, legacyUsers] = await Promise.all([
+    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
+    collect("api_user_list", () => client.listUsers(), [], DEFAULT_LIST_LIMIT),
+  ]);
+  return { users, legacyUsers };
+}
+
 function describeSource(source: Collected): QualysSourceStatus {
   if (source.error) {
     return { name: source.name, status: "unreadable", count: 0, cap: source.cap, reason: shortenMessage(source.error) };
@@ -1314,7 +1348,7 @@ function roleGrantsFullView(roles: string[]): boolean {
   return roles.some((role) => /^manager$|super ?user/i.test(role.trim()));
 }
 
-export function resolveViewScope(config: QualysResolvedConfig, users: Collected, activity?: Collected): QualysViewScope {
+export function resolveViewScope(config: QualysResolvedConfig, users: Collected, activity?: Collected, legacyUsers?: Collected): QualysViewScope {
   const username = config.username?.trim().toLowerCase();
   if (!username) {
     return unverifiedScope("API user role not verified: bearer token authentication does not expose the username.");
@@ -1338,6 +1372,25 @@ export function resolveViewScope(config: QualysResolvedConfig, users: Collected,
       note: partial
         ? `API user ${config.username} holds role ${roles.join(", ") || "unknown"}${scopeTags.length > 0 ? ` scoped to tags ${scopeTags.join(", ")}` : ""}, so list endpoints return only the assets and objects that role can see.`
         : `API user ${config.username} holds the Manager role and sees the whole subscription.`,
+    };
+  }
+  // user_list_output.dtd: USER_LOGIN? and USER_ROLE? are documented on /msp/user_list.php, and a Manager
+  // caller sees every user in the subscription including itself.
+  const legacySelf = legacyUsers && !legacyUsers.error
+    ? legacyUsers.data.find((user) => (xmlScalarText(user.USER_LOGIN) ?? "").trim().toLowerCase() === username)
+    : undefined;
+  const legacyRole = legacySelf ? xmlScalarText(legacySelf.USER_ROLE)?.trim() : undefined;
+  if (legacyRole) {
+    const partial = !roleGrantsFullView([legacyRole]);
+    return {
+      verified: true,
+      partial,
+      roles: [legacyRole],
+      scopeTags: [],
+      source: "user_list",
+      note: partial
+        ? `The User List API records API user ${config.username} with role ${legacyRole}, so list endpoints return only the assets and objects that role can see.`
+        : `The User List API records API user ${config.username} with the Manager role and sees the whole subscription.`,
     };
   }
   const activityRoles = activity && !activity.error
@@ -1572,9 +1625,9 @@ export async function assessQualysScanCoverage(
     collect("option_profiles", () => client.listOptionProfiles(), errors, DEFAULT_LIST_LIMIT),
     collect("excluded_ips", () => client.listExcludedIps(), errors),
     collect("asset_groups", () => client.listAssetGroups(), errors, DEFAULT_LIST_LIMIT),
-    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
+    collectApiUserContext(client),
   ]);
-  const scope = resolveViewScope(config, apiUser);
+  const scope = resolveViewScope(config, apiUser.users, undefined, apiUser.legacyUsers);
 
   const activeSchedules = schedules.data.filter(scheduleIsActive);
   const schedulesWithoutActiveFlag = schedules.data.filter(scheduleActiveFlagMissing);
@@ -1890,9 +1943,9 @@ export async function assessQualysAssetInventory(
     collect("appliances", () => client.listAppliances(), errors, DEFAULT_LIST_LIMIT),
     collect("cloud_agents", () => client.searchCloudAgents(settings.hostLimit), errors, settings.hostLimit),
     collect("tags", () => client.searchTags(), errors, DEFAULT_TAG_LIMIT),
-    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
+    collectApiUserContext(client),
   ]);
-  const scope = resolveViewScope(config, apiUser);
+  const scope = resolveViewScope(config, apiUser.users, undefined, apiUser.legacyUsers);
 
   const emptyGroups = groups.data.filter((group) => !assetGroupHasTargets(group)).map((group) => recordLabel(group, "group"));
   const neverScannedHosts = hosts.data.filter((host) => !parseDate(hostLastScan(host)));
@@ -2208,9 +2261,9 @@ export async function assessQualysVulnerabilityManagement(
     collect("hosts", () => client.listHosts(settings.hostLimit), errors, settings.hostLimit),
     collect("compliance_policies", () => client.listCompliancePolicies(), errors, DEFAULT_LIST_LIMIT),
     collect("detections", () => client.listDetections(settings.detectionLimit), errors, settings.detectionLimit),
-    collect("api_user", () => client.searchUsers(), [], DEFAULT_LIST_LIMIT),
+    collectApiUserContext(client),
   ]);
-  const scope = resolveViewScope(config, apiUser);
+  const scope = resolveViewScope(config, apiUser.users, undefined, apiUser.legacyUsers);
 
   const excludedDetections = detections.data.filter(detectionIsFixedOrInfo);
   const openDetections = detections.data.filter((detection) => !detectionIsFixedOrInfo(detection) && detectionIsOpen(detection));
@@ -2521,17 +2574,23 @@ function userEmail(user: JsonRecord): string | undefined {
   return (asString(user.emailAddress) ?? pathString(user, "CONTACT_INFO", "EMAIL"))?.toLowerCase();
 }
 
-function userStatus(user: JsonRecord): string | undefined {
-  return (asString(user.userStatus) ?? asString(user.status) ?? asString(user.USER_STATUS))?.trim().toLowerCase();
+// user_list_output.dtd: USER_STATUS (#PCDATA) is required; the guide documents Active, Inactive, and Pending Activation.
+function legacyUserStatus(user: JsonRecord): string | undefined {
+  const status = xmlScalarText(user.USER_STATUS)?.trim().toLowerCase();
+  return status ? status : undefined;
 }
 
-function userIsDeactivated(user: JsonRecord): boolean {
-  const status = userStatus(user);
-  return status !== undefined && /deactivated|inactive|disabled|deleted/.test(status);
+function legacyUserIsActive(user: JsonRecord): boolean {
+  return legacyUserStatus(user) === "active";
 }
 
-function userLastLogin(user: JsonRecord): unknown {
-  return user.lastLoginDate ?? user.LAST_LOGIN_DATE ?? user.lastLogin;
+function legacyUserStatusMissing(user: JsonRecord): boolean {
+  return legacyUserStatus(user) === undefined;
+}
+
+// user_list_output.dtd: LAST_LOGIN_DATE? is present only when the caller is a Manager or Unit Manager.
+function legacyUserLastLogin(user: JsonRecord): unknown {
+  return xmlScalarText(user.LAST_LOGIN_DATE);
 }
 
 function reportIsActive(report: JsonRecord): boolean {
@@ -2574,24 +2633,32 @@ export async function assessQualysAdministration(
   const errors: string[] = [];
   const now = new Date();
 
-  const [scheduledReports, reports, users, activity, webApps, wasScans, wasAuth, wasSchedules] = await Promise.all([
+  const [scheduledReports, reports, users, userList, activity, webApps, wasScans, wasAuth, wasSchedules] = await Promise.all([
     collect("scheduled_reports", () => client.listScheduledReports(), errors, DEFAULT_LIST_LIMIT),
     collect("reports", () => client.listReports(), errors, DEFAULT_LIST_LIMIT),
     collect("users", () => client.searchUsers(), errors, DEFAULT_LIST_LIMIT),
+    collect("user_list", () => client.listUsers(), errors, DEFAULT_LIST_LIMIT),
     collect("activity_log", () => client.listActivityLog(settings.lookbackDays), errors, DEFAULT_LIST_LIMIT),
     collect("was_webapps", () => client.searchWebApps(), errors, DEFAULT_LIST_LIMIT),
     collect("was_scans", () => client.searchWasScans(settings.lookbackDays), errors, DEFAULT_LIST_LIMIT),
     collect("was_auth_records", () => client.searchWasAuthRecords(), errors, DEFAULT_LIST_LIMIT),
     collect("was_schedules", () => client.searchWasSchedules(), errors, DEFAULT_LIST_LIMIT),
   ]);
-  const scope = resolveViewScope(config, users, activity);
+  const scope = resolveViewScope(config, users, activity, userList);
 
   const activeScheduledReports = scheduledReports.data.filter(reportIsActive);
   const reportsWithoutActiveFlag = scheduledReports.data.filter(reportActiveFlagMissing);
   const recentReports = reports.data.filter((report) => (ageInDays(report.LAUNCH_DATETIME, now) ?? Number.POSITIVE_INFINITY) <= settings.lookbackDays);
 
-  const activeUsers = users.data.filter((user) => !userIsDeactivated(user));
-  const deactivatedUsers = users.data.filter(userIsDeactivated);
+  // Status, role, email, and last login come from the documented User List API (user_list_output.dtd).
+  // The Administration API search returns Active users only and hides other Managers, so it is only the
+  // fallback for a lower-bound manager count when the User List API is not readable.
+  const userListReadable = !userList.error;
+  const userPopulation = userListReadable ? userList.data : users.data;
+  const activeUsers = userListReadable ? userList.data.filter(legacyUserIsActive) : users.data;
+  const inactiveStatusUsers = userListReadable ? userList.data.filter((user) => legacyUserStatus(user) === "inactive") : [];
+  const pendingUsers = userListReadable ? userList.data.filter((user) => legacyUserStatus(user) === "pending activation") : [];
+  const usersWithoutStatus = userListReadable ? userList.data.filter(legacyUserStatusMissing) : [];
   const usersWithoutRole = activeUsers.filter((user) => userRoles(user).length === 0).map(userName);
   const managers = activeUsers.filter(userIsManager).map(userName);
   const emailCounts = new Map<string, number>();
@@ -2601,9 +2668,9 @@ export async function assessQualysAdministration(
   }
   const sharedEmails = [...emailCounts.entries()].filter(([, count]) => count > 1).map(([email]) => email);
   const genericAccounts = activeUsers.map(userName).filter((name) => /shared|generic|service|svc|admin\d*$|test/i.test(name));
-  const usersWithLastLogin = activeUsers.filter((user) => parseDate(userLastLogin(user)));
-  const usersWithoutLastLogin = activeUsers.filter((user) => !parseDate(userLastLogin(user)));
-  const inactiveUsers = usersWithLastLogin.filter((user) => (ageInDays(userLastLogin(user), now) ?? 0) > INACTIVE_USER_DAYS).map(userName);
+  const usersWithLastLogin = userListReadable ? activeUsers.filter((user) => parseDate(legacyUserLastLogin(user))) : [];
+  const usersWithoutLastLogin = userListReadable ? activeUsers.filter((user) => !parseDate(legacyUserLastLogin(user))) : [];
+  const staleLoginUsers = usersWithLastLogin.filter((user) => (ageInDays(legacyUserLastLogin(user), now) ?? 0) > INACTIVE_USER_DAYS).map(userName);
 
   const sensitiveActions = activity.data.filter((entry) => SENSITIVE_ACTIVITY_PATTERN.test(`${asString(entry.action) ?? ""} ${asString(entry.module) ?? ""} ${asString(entry.details) ?? ""}`));
 
@@ -2640,40 +2707,60 @@ export async function assessQualysAdministration(
     manualEvidence: "review Reports > Schedules and each schedule's distribution list for appropriate recipients.",
   }));
 
-  const userStatusVerdict: QualysFindingStatus = users.error
+  const bothUserSourcesUnreadable = Boolean(userList.error && users.error);
+  const excessiveManagers = managers.length > settings.maxManagers;
+  const userStatusVerdict: QualysFindingStatus = bothUserSourcesUnreadable
     ? "manual"
-    : activeUsers.length === 0
-      ? "manual"
-      : managers.length > settings.maxManagers || sharedEmails.length > 0
-        ? "fail"
-        : "manual";
+    : excessiveManagers || sharedEmails.length > 0
+      ? "fail"
+      : !userListReadable
+        ? "manual"
+        : activeUsers.length === 0
+          ? "manual"
+          : staleLoginUsers.length > 0 || genericAccounts.length > 0 || pendingUsers.length > 0
+            ? "warn"
+            : "pass";
+  const userListUnreadableNote = userList.error
+    ? ` Status and last login checks require the VM/PC User List API (/msp/user_list.php, user_list_output.dtd), which was not readable (${shortenMessage(userList.error, 120)}); the Administration API search returns Active users only, hides other Manager and Super User accounts, and documents no status or last-login field, so inactive-user detection is manual and the manager count is a lower bound.`
+    : "";
   findings.push(guardedFinding({
     control: 13,
     severity: "high",
     status: userStatusVerdict,
-    summary: users.error
-      ? unreadableSummary(13, [users])
-      : activeUsers.length === 0
-        ? "The Administration API returned no active users, which cannot be true for a working subscription, so the API user cannot see the user list; treated as unknown, not compliant."
-        : managers.length > settings.maxManagers || sharedEmails.length > 0
-          ? `${activeUsers.length} visible active users include ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}) and ${sharedEmails.length} email addresses shared by multiple accounts.`
-          : `${activeUsers.length} visible active users, ${managers.length} visible Manager or super user accounts (threshold ${settings.maxManagers}), ${sharedEmails.length} shared email addresses, ${genericAccounts.length} generic-looking account names, ${inactiveUsers.length} users with a last login older than ${INACTIVE_USER_DAYS} days. The Administration API returns only Active-status users, hides other Manager and Super User accounts, and does not expose last login, so the manager count is a lower bound and the verdict cannot exceed manual.`,
+    summary: bothUserSourcesUnreadable
+      ? unreadableSummary(13, [userList, users])
+      : excessiveManagers || sharedEmails.length > 0
+        ? `${activeUsers.length} active users include ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}) and ${sharedEmails.length} email addresses shared by multiple accounts.${userListUnreadableNote}`
+        : !userListReadable
+          ? `${activeUsers.length} users visible through the Administration API search, ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}), ${sharedEmails.length} shared email addresses, ${genericAccounts.length} generic-looking account names.${userListUnreadableNote}`
+          : activeUsers.length === 0
+            ? `The User List API returned ${userList.data.length} users but none with USER_STATUS Active, which cannot be true for a working subscription, so the API user cannot see the user population; treated as unknown, not compliant.`
+            : `${activeUsers.length} Active users (USER_STATUS) of ${userList.data.length} returned by the User List API, ${inactiveStatusUsers.length} Inactive, ${pendingUsers.length} Pending Activation; ${managers.length} Manager or super user accounts (threshold ${settings.maxManagers}), ${sharedEmails.length} shared email addresses, ${genericAccounts.length} generic-looking account names, ${staleLoginUsers.length} Active users whose LAST_LOGIN_DATE is older than ${INACTIVE_USER_DAYS} days, and ${usersWithoutLastLogin.length} Active users without a LAST_LOGIN_DATE (never counted as recently active).`,
     evidence: {
-      users_returned: users.data.length,
+      users_returned: userPopulation.length,
+      user_list_users: userList.error ? undefined : userList.data.length,
+      administration_api_users: users.error ? undefined : users.data.length,
       active_users: activeUsers.length,
-      deactivated_users: deactivatedUsers.length,
+      inactive_status_users: inactiveStatusUsers.length,
+      pending_activation_users: pendingUsers.length,
       managers: managers.slice(0, 50),
       max_managers: settings.maxManagers,
       shared_emails: sharedEmails.slice(0, 50),
       generic_accounts: genericAccounts.slice(0, 50),
-      inactive_users: inactiveUsers.slice(0, 50),
+      stale_login_users: staleLoginUsers.slice(0, 50),
+      inactive_user_days: INACTIVE_USER_DAYS,
       users_with_last_login: usersWithLastLogin.length,
-      api_contract: "search/am/user returns Active users only and cannot return other Super Users or Managers.",
+      status_source: userListReadable ? "/msp/user_list.php USER_STATUS, USER_ROLE, LAST_LOGIN_DATE" : "not available",
+      api_contract: "search/am/user returns Active users only, hides other Super Users and Managers, and documents no status or last-login field; /msp/user_list.php documents USER_STATUS and LAST_LOGIN_DATE (Manager and Unit Manager callers).",
     },
-    sources: [users],
+    sources: userListReadable ? [userList] : [userList, users],
     scope,
     manualEvidence: "export Users > User Management with roles, status, and last login dates, and reconcile the full Manager list against the approved administrator roster.",
-    unknownBuckets: { users_without_role: usersWithoutRole.length, users_without_last_login: usersWithoutLastLogin.length },
+    unknownBuckets: {
+      users_without_role: usersWithoutRole.length,
+      users_without_status: usersWithoutStatus.length,
+      users_without_last_login: usersWithoutLastLogin.length,
+    },
   }));
 
   const wasStatus: QualysFindingStatus = webApps.error || wasScans.error || wasAuth.error
@@ -2802,8 +2889,9 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
   const config = client.getResolvedConfig();
   const scopeErrors: string[] = [];
   const users = await collect("users", () => client.searchUsers(), scopeErrors, DEFAULT_LIST_LIMIT);
+  const userList = await collect("user_list", () => client.listUsers(), scopeErrors, DEFAULT_LIST_LIMIT);
   const activity = await collect("activity_log", () => client.listActivityLog(7), scopeErrors, DEFAULT_LIST_LIMIT);
-  const viewScope = resolveViewScope(config, users, activity);
+  const viewScope = resolveViewScope(config, users, activity, userList);
   const surfaces: QualysAccessSurface[] = [
     await probeSurface("scheduled_scans", "VM", "/api/2.0/fo/schedule/scan/", () => client.listScheduledScans()),
     await probeSurface("hosts", "VM", "/api/2.0/fo/asset/host/", () => client.listHosts(100)),
@@ -2815,6 +2903,7 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
     await probeSurface("compliance_policies", "PC", "/api/2.0/fo/compliance/policy/", () => client.listCompliancePolicies()),
     await probeSurface("activity_log", "Administration", "/api/2.0/fo/activity_log/", () => (activity.error ? Promise.reject(new Error(activity.error)) : Promise.resolve(activity.data))),
     await probeSurface("users", "Administration", "/qps/rest/2.0/search/am/user/", () => (users.error ? Promise.reject(new Error(users.error)) : Promise.resolve(users.data))),
+    await probeSurface("user_list", "Administration", "/msp/user_list.php", () => (userList.error ? Promise.reject(new Error(userList.error)) : Promise.resolve(userList.data))),
     await probeSurface("tags", "Asset Management", "/qps/rest/2.0/search/am/tag", () => client.searchTags(100)),
     await probeSurface("cloud_agents", "Cloud Agent", "/qps/rest/2.0/search/am/hostasset", () => client.searchCloudAgents(100)),
     await probeSurface("connectors", "Asset Management", "/qps/rest/2.0/search/am/assetdataconnector", () => client.searchConnectors()),
