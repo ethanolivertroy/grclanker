@@ -1028,7 +1028,18 @@ function snapshotPartialNote(snapshot: TableSnapshot): string | undefined {
   if (snapshot.total !== undefined && snapshot.total > snapshot.rows.length) {
     return `${snapshot.table} returned ${snapshot.rows.length} of ${snapshot.total} rows (ACL-filtered or hidden rows)`;
   }
+  if (visibilityUnproven(snapshot)) {
+    return `${snapshot.table} returned 0 rows without an X-Total-Count header (visibility unproven)`;
+  }
   return undefined;
+}
+
+/**
+ * A response with no rows and no X-Total-Count header cannot be told apart
+ * from an ACL-filtered read, so it never supports a pass on its own.
+ */
+function visibilityUnproven(snapshot: TableSnapshot): boolean {
+  return !snapshot.error && !snapshot.unavailable && snapshot.pages > 0 && snapshot.rows.length === 0 && snapshot.total === undefined;
 }
 
 function snapshotErrors(label: string, snapshot: TableSnapshot): string[] {
@@ -1422,6 +1433,13 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         status: "manual",
         summary: `The sys_user_role_contains inventory could not be proven visible (aggregate count ${visibilityProof ?? "unavailable"}${data.roleInheritanceTotal.error ? `, ${data.roleInheritanceTotal.error}` : ""}), so an empty admin-inheritance result cannot be trusted.`,
         evidence: { inheriting_roles: truncateList(inheriting), role_contains_total: visibilityProof ?? null },
+      };
+    }
+    if (visibilityUnproven(data.roleInheritance)) {
+      return {
+        status: "manual",
+        summary: `The admin-inheritance query returned no rows and no X-Total-Count header, so the empty result cannot be distinguished from ACL-filtered rows even though sys_user_role_contains holds ${visibilityProof} rows in aggregate.`,
+        evidence: { inheriting_roles: [], role_contains_total: visibilityProof, x_total_count_present: false },
       };
     }
     if (inheriting.length === 0) {
@@ -2428,6 +2446,13 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
         status: "manual",
         summary: `The sys_update_set inventory could not be proven visible (aggregate count ${proven ?? "unavailable"}); the Default update set always exists, so an empty in-progress list cannot be trusted.`,
         evidence,
+      };
+    }
+    if (visibilityUnproven(data.updateSetsInProgress)) {
+      return {
+        status: "manual",
+        summary: `The in-progress update set query returned no rows and no X-Total-Count header, so the empty result cannot be distinguished from ACL-filtered rows even though sys_update_set holds ${proven} rows in aggregate.`,
+        evidence: { ...evidence, x_total_count_present: false },
       };
     }
     if (sensitive.length > 0) {

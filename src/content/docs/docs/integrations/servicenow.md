@@ -112,7 +112,7 @@ The script prints a skip message and exits 0 when no ServiceNow configuration is
 
 ## Limitations and manual controls
 
-- ServiceNow ACLs can hide rows without returning 403, and `X-Total-Count` is computed before ACL evaluation. The client compares the total against the rows returned and treats a mismatch as a partial view; `sysparm_no_count` is never sent so the header stays available.
+- ServiceNow ACLs can hide rows without returning 403, and `X-Total-Count` is computed before ACL evaluation. The client compares the total against the rows returned and treats a mismatch as a partial view; `sysparm_no_count` is never sent so the header stays available. A response with zero rows and no `X-Total-Count` header is reported as "visibility unproven" and never supports a pass, even when an Aggregate API count for the table is above zero.
 - `sysparm_limit` is applied before ACL evaluation, so a page can legitimately return fewer rows than requested. Pagination follows `Link rel="next"` to completion or records truncation at `record_limit` and downgrades the verdict.
 - Rate limiting (429 with `Retry-After`) and 5xx responses are retried with backoff up to `max_retries`.
 - Instance Security Center hardening scores, Instance Scan results, Edge Encryption, DKIM configuration, MID Server mutual authentication, and audit retention are not read; the corresponding findings state the evidence to collect.

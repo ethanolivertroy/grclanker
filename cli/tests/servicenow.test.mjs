@@ -133,7 +133,7 @@ function fixtureFetch(fixture, options = {}) {
       const limit = Number(url.searchParams.get("sysparm_limit") ?? "500");
       const offset = Number(url.searchParams.get("sysparm_offset") ?? "0");
       const page = matched.slice(offset, offset + limit);
-      const headers = { "X-Total-Count": String(matched.length + (options.inflateTotal ?? 0)) };
+      const headers = options.omitTotalCount ? {} : { "X-Total-Count": String(matched.length + (options.inflateTotal ?? 0)) };
       if (offset + limit < matched.length) {
         const nextUrl = new URL(url);
         nextUrl.searchParams.set("sysparm_offset", String(offset + limit));
@@ -1054,6 +1054,37 @@ test("self-check (c): partial inventories with X-Total-Count above the returned 
   const review = findings.find((item) => item.id === "SNOW-04");
   assert.equal(review.status, "warn");
   assert.match(review.summary, /returned 4 of 7 rows/);
+});
+
+test("self-check (c): zero rows without an X-Total-Count header never pass on an aggregate count alone (rule 5)", async () => {
+  const { fetchImpl } = fixtureFetch(healthyFixture(), { omitTotalCount: true });
+  const results = await runAllAssessments(createClient(fetchImpl));
+  const findings = Object.values(results).flatMap((result) => result.findings);
+  const byId = new Map(findings.map((item) => [item.id, item]));
+
+  const roleHierarchy = byId.get("SNOW-03");
+  assert.equal(roleHierarchy.status, "manual");
+  assert.match(roleHierarchy.summary, /no rows and no X-Total-Count header/);
+  assert.match(roleHierarchy.summary, /holds 2 rows in aggregate/);
+  assert.equal(roleHierarchy.evidence.x_total_count_present, false);
+
+  const updateSets = byId.get("SNOW-15");
+  assert.equal(updateSets.status, "manual");
+  assert.match(updateSets.summary, /no rows and no X-Total-Count header/);
+  assert.match(updateSets.summary, /holds 1 rows in aggregate/);
+
+  const debug = byId.get("SNOW-16");
+  assert.notEqual(debug.status, "pass");
+  assert.match(debug.summary, /returned 0 rows without an X-Total-Count header \(visibility unproven\)/);
+  for (const item of findings) {
+    if (/\(visibility unproven\)/.test(item.summary)) assert.notEqual(item.status, "pass", `${item.id} passed on an unproven empty read`);
+  }
+
+  const withHeader = await runAllAssessments(createClient(fixtureFetch(healthyFixture()).fetchImpl));
+  const healthyById = new Map(Object.values(withHeader).flatMap((result) => result.findings).map((item) => [item.id, item.status]));
+  assert.equal(healthyById.get("SNOW-03"), "pass");
+  assert.equal(healthyById.get("SNOW-15"), "pass");
+  assert.equal(healthyById.get("SNOW-16"), "pass");
 });
 
 test("self-check (c): a truncated first page with an unfollowed Link rel=next never passes (rule 7)", async () => {
