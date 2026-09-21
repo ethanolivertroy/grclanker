@@ -262,6 +262,40 @@ function createActionsData() {
   };
 }
 
+function createIntegrationsData(overrides = {}) {
+  return {
+    org: dataset({ login: "example-org", deploy_keys_enabled_for_repositories: true }),
+    hooks: dataset([
+      { id: 100, active: true, config: { url: "https://siem.example.test/github", content_type: "json", insecure_ssl: "0", secret: "********" } },
+    ]),
+    appInstallations: dataset([
+      {
+        id: 99,
+        app_slug: "compliance-bot",
+        repository_selection: "selected",
+        permissions: { metadata: "read", contents: "read", security_events: "read" },
+        suspended_at: null,
+        created_at: "2025-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      },
+    ]),
+    credentialAuthorizations: dataset([{ login: "alice", credential_type: "OAuth app token", credential_authorized_at: "2026-01-01T00:00:00Z" }]),
+    repositories: dataset([
+      { full_name: "example-org/app-one", name: "app-one", default_branch: "main", owner: { login: "example-org" } },
+      { full_name: "example-org/app-two", name: "app-two", default_branch: "main", owner: { login: "example-org" } },
+    ]),
+    repoHooks: dataset({
+      "example-org/app-one": { items: [{ id: 5, config: { url: "https://ci.example.test/hook", insecure_ssl: "0", secret: "********" } }] },
+      "example-org/app-two": { items: [] },
+    }),
+    deployKeys: dataset({
+      "example-org/app-one": { items: [{ id: 1, title: "reader", read_only: true, created_at: "2026-06-01T00:00:00Z", last_used: "2026-09-01T00:00:00Z" }] },
+      "example-org/app-two": { items: [] },
+    }),
+    ...overrides,
+  };
+}
+
 function createCodeSecurityData() {
   return {
     org: dataset({
@@ -831,6 +865,137 @@ test("collectGitHubRepoProtectionData reads branch rules per repository and reco
   assert.ok(requests.includes("/repos/example-org/app-two/rules/branches/release%2F2026?per_page=100"));
 });
 
+test("integrations findings classify webhook, deploy key, and app installation posture", () => {
+  const config = createSampleConfig();
+  const now = Date.parse("2026-09-21T00:00:00Z");
+  const healthy = assessGitHubIntegrations(createIntegrationsData(), config, now);
+  assert.equal(healthy.findings.length, 4);
+  assert.equal(findingStatus(healthy, "GITHUB-INTEG-001"), "Pass");
+  assert.equal(findingStatus(healthy, "GITHUB-INTEG-002"), "Pass");
+  assert.equal(findingStatus(healthy, "GITHUB-INTEG-003"), "Pass");
+  assert.equal(findingStatus(healthy, "GITHUB-INTEG-004"), "Manual");
+  assert.match(healthy.findings.find((entry) => entry.id === "GITHUB-INTEG-004").evidence.join("\n"), /organization-full \(REST\) and Organization \(GraphQL\) carry no field/);
+
+  const weak = assessGitHubIntegrations(createIntegrationsData({
+    hooks: dataset([
+      { id: 100, active: true, config: { url: "http://siem.example.test/github", insecure_ssl: "1", content_type: "json" } },
+    ]),
+    repoHooks: dataset({
+      "example-org/app-one": { items: [{ id: 5, config: { url: "https://ci.example.test/hook", insecure_ssl: 1, secret: "********" } }] },
+      "example-org/app-two": { items: [] },
+    }),
+    deployKeys: dataset({
+      "example-org/app-one": { items: [{ id: 1, title: "writer", read_only: false, created_at: "2026-06-01T00:00:00Z" }] },
+      "example-org/app-two": { items: [{ id: 2, title: "ancient", read_only: true, created_at: "2024-01-01T00:00:00Z" }] },
+    }),
+    appInstallations: dataset([
+      { id: 1, app_slug: "everything-bot", repository_selection: "all", permissions: { contents: "write", administration: "write" }, suspended_at: null, updated_at: "2026-01-01T00:00:00Z" },
+      { id: 2, app_slug: "root-bot", repository_selection: "selected", permissions: { organization_administration: "admin" }, suspended_at: null, updated_at: "2026-01-01T00:00:00Z" },
+    ]),
+  }), config, now);
+  assert.equal(findingStatus(weak, "GITHUB-INTEG-001"), "Fail");
+  assert.match(weak.findings.find((entry) => entry.id === "GITHUB-INTEG-001").summary, /2 webhook\(s\)/);
+  assert.equal(findingStatus(weak, "GITHUB-INTEG-002"), "Fail");
+  assert.match(weak.findings.find((entry) => entry.id === "GITHUB-INTEG-002").summary, /1 write-capable and 1 stale/);
+  assert.equal(findingStatus(weak, "GITHUB-INTEG-003"), "Fail");
+  assert.match(weak.findings.find((entry) => entry.id === "GITHUB-INTEG-003").summary, /2 of 2 GitHub App installation\(s\)/);
+
+  const undatedAndSuspended = assessGitHubIntegrations(createIntegrationsData({
+    deployKeys: dataset({
+      "example-org/app-one": { items: [{ id: 1, title: "mystery", read_only: true, created_at: null }] },
+      "example-org/app-two": { items: [] },
+    }),
+    appInstallations: dataset([
+      { id: 3, app_slug: "sleepy-bot", repository_selection: "selected", permissions: { metadata: "read" }, suspended_at: "2026-02-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+    ]),
+  }), config, now);
+  assert.equal(findingStatus(undatedAndSuspended, "GITHUB-INTEG-002"), "Partial");
+  assert.equal(findingStatus(undatedAndSuspended, "GITHUB-INTEG-003"), "Partial");
+
+  const keysDisabledByPolicy = assessGitHubIntegrations(createIntegrationsData({
+    org: dataset({ login: "example-org", deploy_keys_enabled_for_repositories: false }),
+    repositories: dataset([], "GitHub request failed (403): forbidden"),
+    deployKeys: dataset({}),
+    repoHooks: dataset({}),
+  }), config, now);
+  assert.equal(findingStatus(keysDisabledByPolicy, "GITHUB-INTEG-002"), "Pass");
+  assert.equal(findingStatus(keysDisabledByPolicy, "GITHUB-INTEG-001"), "Partial");
+});
+
+test("integrations findings never pass on unreadable or partially readable inventories", () => {
+  const config = createSampleConfig();
+  const now = Date.parse("2026-09-21T00:00:00Z");
+  const forbidden = assessGitHubIntegrations(createIntegrationsData({
+    org: dataset(null, "GitHub request failed (403): forbidden"),
+    hooks: dataset([], "GitHub request failed (403): forbidden"),
+    appInstallations: dataset([], "GitHub request failed (403): forbidden"),
+    credentialAuthorizations: dataset([], "GitHub request failed (403): forbidden"),
+    repositories: dataset([], "GitHub request failed (403): forbidden"),
+    repoHooks: dataset({}),
+    deployKeys: dataset({}),
+  }), config, now);
+  for (const finding of forbidden.findings) {
+    assert.equal(finding.status, "Manual", `${finding.id} should be manual when everything is forbidden`);
+  }
+
+  const partialRepos = assessGitHubIntegrations(createIntegrationsData({
+    repoHooks: dataset({
+      "example-org/app-one": { items: [] },
+      "example-org/app-two": { items: null, error: "GitHub request failed (403): admin required" },
+    }),
+    deployKeys: dataset({
+      "example-org/app-one": { items: [] },
+      "example-org/app-two": { items: null, error: "GitHub request failed (403): admin required" },
+    }),
+  }), config, now);
+  assert.equal(findingStatus(partialRepos, "GITHUB-INTEG-001"), "Partial");
+  assert.equal(findingStatus(partialRepos, "GITHUB-INTEG-002"), "Partial");
+
+  const empty = assessGitHubIntegrations(createIntegrationsData({
+    hooks: dataset([]),
+    appInstallations: dataset([]),
+    repoHooks: dataset({ "example-org/app-one": { items: [] }, "example-org/app-two": { items: [] } }),
+    deployKeys: dataset({ "example-org/app-one": { items: [] }, "example-org/app-two": { items: [] } }),
+  }), config, now);
+  for (const id of ["GITHUB-INTEG-001", "GITHUB-INTEG-002", "GITHUB-INTEG-003"]) {
+    assert.equal(findingStatus(empty, id), "Pass");
+    assert.match(empty.findings.find((entry) => entry.id === id).summary, /empty inventory is compliant/);
+  }
+});
+
+test("collectGitHubIntegrationsData fans out repository hooks and deploy keys with per-repo error capture", async () => {
+  const requests = [];
+  const client = new GitHubAuditorClient(createSampleConfig({ apiBaseUrl: "https://api.github.test" }), async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push(url.pathname);
+    const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    if (url.pathname === "/orgs/example-org") return json({ login: "example-org", deploy_keys_enabled_for_repositories: true });
+    if (url.pathname === "/orgs/example-org/hooks") return json([{ id: 1, config: { url: "https://a.example.test", insecure_ssl: "0", secret: "********" } }]);
+    if (url.pathname === "/orgs/example-org/installations") return json({ total_count: 1, installations: [{ id: 9, app_slug: "bot", permissions: { metadata: "read" }, repository_selection: "selected" }] });
+    if (url.pathname === "/orgs/example-org/credential-authorizations") return json({ message: "Not Found" }, 404);
+    if (url.pathname === "/orgs/example-org/repos") {
+      return json([
+        { full_name: "example-org/app-one", name: "app-one", owner: { login: "example-org" } },
+        { full_name: "example-org/app-two", name: "app-two", owner: { login: "example-org" } },
+      ]);
+    }
+    if (url.pathname === "/repos/example-org/app-one/hooks") return json([]);
+    if (url.pathname === "/repos/example-org/app-two/hooks") return json({ message: "Must have admin rights" }, 403);
+    if (url.pathname === "/repos/example-org/app-one/keys") return json([{ id: 1, read_only: true, created_at: "2026-01-01T00:00:00Z" }]);
+    if (url.pathname === "/repos/example-org/app-two/keys") return json([]);
+    throw new Error(`Unexpected request: ${url}`);
+  });
+
+  const data = await collectGitHubIntegrationsData(client);
+  assert.equal(data.appInstallations.data.length, 1);
+  assert.match(data.credentialAuthorizations.error, /404/);
+  assert.deepEqual(data.repoHooks.data["example-org/app-one"].items, []);
+  assert.equal(data.repoHooks.data["example-org/app-two"].items, null);
+  assert.match(data.repoHooks.data["example-org/app-two"].error, /403/);
+  assert.equal(data.deployKeys.data["example-org/app-one"].items.length, 1);
+  assert.ok(requests.includes("/repos/example-org/app-two/keys"));
+});
+
 test("runGitHubAccessCheck reports healthy and limited surfaces", async () => {
   const config = createSampleConfig();
   const healthy = await runGitHubAccessCheck(
@@ -937,6 +1102,12 @@ test("exportGitHubAuditBundle writes evidence and respects secure output roots",
       async listCodeSecurityConfigurations() {
         return createCodeSecurityData().codeSecurityConfigurations.data;
       },
+      async listRepoHooks(_owner, repo) {
+        return createIntegrationsData().repoHooks.data[`example-org/${repo}`]?.items ?? [];
+      },
+      async listDeployKeys(_owner, repo) {
+        return createIntegrationsData().deployKeys.data[`example-org/${repo}`]?.items ?? [];
+      },
     },
     config,
     outputRoot,
@@ -945,6 +1116,8 @@ test("exportGitHubAuditBundle writes evidence and respects secure output roots",
   assert.ok(existsSync(join(result.outputDir, "README.md")));
   assert.ok(existsSync(join(result.outputDir, "analysis", "org_access.json")));
   assert.ok(existsSync(join(result.outputDir, "analysis", "repo_protection.json")));
+  assert.ok(existsSync(join(result.outputDir, "analysis", "integrations.json")));
+  assert.ok(existsSync(join(result.outputDir, "core_data", "integrations.json")));
   assert.ok(existsSync(join(result.outputDir, "compliance", "executive_summary.md")));
   assert.ok(existsSync(result.zipPath));
   assert.ok(result.findingCount > 0);

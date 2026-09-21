@@ -193,7 +193,7 @@ interface FrameworkMap {
 interface CheckDefinition {
   id: string;
   title: string;
-  category: "org_access" | "repo_protection" | "actions_security" | "code_security";
+  category: "org_access" | "repo_protection" | "actions_security" | "code_security" | "integrations";
   severity: GitHubSeverity;
   frameworks: FrameworkMap;
 }
@@ -296,6 +296,21 @@ interface GitHubCodeSecurityData {
   org: CollectedDataset<JsonRecord | null>;
   repositories: CollectedDataset<JsonRecord[]>;
   codeSecurityConfigurations: CollectedDataset<JsonRecord[]>;
+}
+
+export interface GitHubRepoListEntry {
+  items: JsonRecord[] | null;
+  error?: string;
+}
+
+interface GitHubIntegrationsData {
+  org: CollectedDataset<JsonRecord | null>;
+  hooks: CollectedDataset<JsonRecord[]>;
+  appInstallations: CollectedDataset<JsonRecord[]>;
+  credentialAuthorizations: CollectedDataset<JsonRecord[]>;
+  repositories: CollectedDataset<JsonRecord[]>;
+  repoHooks: CollectedDataset<Record<string, GitHubRepoListEntry>>;
+  deployKeys: CollectedDataset<Record<string, GitHubRepoListEntry>>;
 }
 
 interface GitHubAuditBundleResult {
@@ -699,6 +714,74 @@ const GITHUB_CHECKS: Record<string, CheckDefinition> = {
       irap: ["ISM-1835"],
       ismap: ["CPS.CM-7"],
       general: ["limit where Actions runs"],
+    },
+  },
+  "GITHUB-INTEG-001": {
+    id: "GITHUB-INTEG-001",
+    title: "Webhooks use HTTPS, TLS verification, and a shared secret",
+    category: "integrations",
+    severity: "high",
+    frameworks: {
+      fedramp: ["SC-8", "SI-4"],
+      cmmc: ["SC.L2-3.13.8"],
+      soc2: ["CC6.7"],
+      cis: ["4.1.2"],
+      pci_dss: ["4.2.1"],
+      disa_stig: ["SRG-APP-000439"],
+      irap: ["ISM-1139"],
+      ismap: ["5.5.2"],
+      general: ["webhook transport security"],
+    },
+  },
+  "GITHUB-INTEG-002": {
+    id: "GITHUB-INTEG-002",
+    title: "Deploy keys are read-only and rotated",
+    category: "integrations",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["IA-5", "SC-12"],
+      cmmc: ["IA.L2-3.5.10"],
+      soc2: ["CC6.1", "CC6.6"],
+      cis: ["5.2.1"],
+      pci_dss: ["8.6.3"],
+      disa_stig: ["SRG-APP-000175"],
+      irap: ["ISM-1590"],
+      ismap: ["5.6.3"],
+      general: ["machine credential hygiene"],
+    },
+  },
+  "GITHUB-INTEG-003": {
+    id: "GITHUB-INTEG-003",
+    title: "GitHub App installations hold least-privilege permissions",
+    category: "integrations",
+    severity: "high",
+    frameworks: {
+      fedramp: ["AC-6(10)", "CM-11"],
+      cmmc: ["AC.L2-3.1.7"],
+      soc2: ["CC6.3", "CC6.8"],
+      cis: ["5.2.2"],
+      pci_dss: ["6.3.2"],
+      disa_stig: ["SRG-APP-000342"],
+      irap: ["ISM-1490"],
+      ismap: ["5.6.4"],
+      general: ["third-party app least privilege"],
+    },
+  },
+  "GITHUB-INTEG-004": {
+    id: "GITHUB-INTEG-004",
+    title: "OAuth application access is restricted",
+    category: "integrations",
+    severity: "high",
+    frameworks: {
+      fedramp: ["AC-3", "AC-6"],
+      cmmc: ["AC.L2-3.1.5"],
+      soc2: ["CC6.6", "CC6.8"],
+      cis: ["1.4.1"],
+      pci_dss: ["6.3.2"],
+      disa_stig: ["SRG-APP-000386"],
+      irap: ["ISM-1490"],
+      ismap: ["5.2.5"],
+      general: ["third-party OAuth governance"],
     },
   },
   "GITHUB-CODE-001": {
@@ -1485,6 +1568,14 @@ export class GitHubAuditorClient {
 
   async listBranchRules(owner: string, repo: string, branch: string): Promise<JsonRecord[]> {
     return this.paginate(`/repos/${owner}/${repo}/rules/branches/${encodeURIComponent(branch)}?per_page=${PAGE_SIZE}`);
+  }
+
+  async listRepoHooks(owner: string, repo: string): Promise<JsonRecord[]> {
+    return this.paginate(`/repos/${owner}/${repo}/hooks?per_page=${PAGE_SIZE}`);
+  }
+
+  async listDeployKeys(owner: string, repo: string): Promise<JsonRecord[]> {
+    return this.paginate(`/repos/${owner}/${repo}/keys?per_page=${PAGE_SIZE}`);
   }
 
   async getOrgActionsPermissions(): Promise<JsonRecord> {
@@ -2525,6 +2616,385 @@ export async function collectGitHubCodeSecurityData(
   };
 }
 
+async function collectPerRepo(
+  repos: JsonRecord[],
+  fetchItems: (owner: string, name: string) => Promise<JsonRecord[]>,
+): Promise<Record<string, GitHubRepoListEntry>> {
+  const entries = await mapWithConcurrency(repos, 6, async (repo) => {
+    const owner = asString(asRecord(repo.owner).login) ?? "";
+    const name = asString(repo.name) ?? "";
+    const key = repoKey(repo);
+    try {
+      return [key, { items: await fetchItems(owner, name) }] as const;
+    } catch (error) {
+      return [key, { items: null, error: summarizeError(error) }] as const;
+    }
+  });
+  return Object.fromEntries(entries);
+}
+
+export async function collectGitHubIntegrationsData(
+  client: Pick<
+    GitHubAuditorClient,
+    | "getOrganization"
+    | "listHooks"
+    | "listInstallations"
+    | "listCredentialAuthorizations"
+    | "listRepositories"
+    | "listRepoHooks"
+    | "listDeployKeys"
+  >,
+): Promise<GitHubIntegrationsData> {
+  const org = await collectDataset<JsonRecord | null>(null, () => client.getOrganization());
+  const hooks = await collectDataset<JsonRecord[]>([], () => client.listHooks());
+  const appInstallations = await collectDataset<JsonRecord[]>([], () => client.listInstallations());
+  const credentialAuthorizations = await collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations());
+  const repositories = await collectDataset<JsonRecord[]>([], () => client.listRepositories());
+  const eligibleRepos = repositories.data.filter((repo) => !isArchivedRepo(repo));
+  const repoHooks = await collectDataset<Record<string, GitHubRepoListEntry>>({}, () =>
+    collectPerRepo(eligibleRepos, (owner, name) => client.listRepoHooks(owner, name)));
+  const deployKeys = await collectDataset<Record<string, GitHubRepoListEntry>>({}, () =>
+    collectPerRepo(eligibleRepos, (owner, name) => client.listDeployKeys(owner, name)));
+
+  return {
+    org,
+    hooks,
+    appInstallations,
+    credentialAuthorizations,
+    repositories,
+    repoHooks,
+    deployKeys,
+  };
+}
+
+interface WebhookIssue {
+  location: string;
+  problems: string[];
+}
+
+// Webhook config fields follow the REST org-hook and webhook-config schemas: config.url,
+// config.insecure_ssl ("0" or "1", string or number), and config.secret (returned masked when set).
+function inspectWebhook(location: string, hook: JsonRecord): WebhookIssue | null {
+  const config = asRecord(hook.config);
+  const url = asString(config.url) ?? "";
+  const insecureSsl = config.insecure_ssl;
+  const problems: string[] = [];
+  if (!/^https:\/\//i.test(url)) {
+    problems.push(`url is not https (${url || "missing"})`);
+  }
+  if (insecureSsl === "1" || insecureSsl === 1) {
+    problems.push("insecure_ssl=1 disables TLS certificate verification");
+  }
+  if (!asString(config.secret)) {
+    problems.push("no secret configured, so deliveries cannot be authenticated");
+  }
+  return problems.length > 0 ? { location, problems } : null;
+}
+
+function assessWebhookSecurity(data: GitHubIntegrationsData): GitHubFinding {
+  const recommendation = "Point every webhook at an HTTPS endpoint, keep insecure_ssl at 0, and configure a delivery secret so receivers can validate X-Hub-Signature-256.";
+  if (data.hooks.error) {
+    return buildFinding(
+      "GITHUB-INTEG-001",
+      "Manual",
+      "The organization webhook list was not readable, so webhook security is unverified.",
+      [`org hooks error = ${data.hooks.error}`],
+      recommendation,
+      "Organization webhooks require admin:org_hook (or an app with organization webhooks read). Rerun with such a principal or review Settings > Webhooks manually.",
+    );
+  }
+  const orgHooks = data.hooks.data;
+  const repoEntries = Object.entries(data.repoHooks.data);
+  const repoHooksUnreadable = repoEntries.filter(([, entry]) => entry.items === null);
+  const repoHookCount = repoEntries.reduce((total, [, entry]) => total + (entry.items?.length ?? 0), 0);
+  const issues: WebhookIssue[] = [];
+  for (const hook of orgHooks) {
+    const issue = inspectWebhook(`org hook ${asString(hook.id) ?? asNumber(hook.id) ?? "?"}`, hook);
+    if (issue) issues.push(issue);
+  }
+  for (const [repo, entry] of repoEntries) {
+    for (const hook of entry.items ?? []) {
+      const issue = inspectWebhook(`${repo} hook ${asString(hook.id) ?? asNumber(hook.id) ?? "?"}`, hook);
+      if (issue) issues.push(issue);
+    }
+  }
+  const evidence = [
+    `org_webhooks = ${orgHooks.length}`,
+    data.repositories.error
+      ? `repository webhooks not enumerated: ${data.repositories.error}`
+      : `repo_webhooks = ${repoHookCount} across ${repoEntries.length - repoHooksUnreadable.length} readable repositories${repoHooksUnreadable.length > 0 ? ` (${repoHooksUnreadable.length} repositories unreadable)` : ""}`,
+    `webhooks_with_issues = ${issues.length}`,
+    ...issues.slice(0, 10).map((issue) => `${issue.location}: ${issue.problems.join("; ")}`),
+  ];
+  if (issues.length > 0) {
+    return buildFinding(
+      "GITHUB-INTEG-001",
+      "Fail",
+      `${issues.length} webhook(s) use plain HTTP, disable TLS verification, or lack a secret.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (data.repositories.error || repoHooksUnreadable.length > 0 || data.repoHooks.error) {
+    return buildFinding(
+      "GITHUB-INTEG-001",
+      "Partial",
+      "Every readable webhook is secure, but repository webhooks were only partially enumerated.",
+      [...evidence, ...(data.repoHooks.error ? [`repo hooks error = ${data.repoHooks.error}`] : [])],
+      recommendation,
+      "Repository webhooks require admin access on each repository; review the unreadable repositories manually.",
+    );
+  }
+  if (orgHooks.length + repoHookCount === 0) {
+    return buildFinding(
+      "GITHUB-INTEG-001",
+      "Pass",
+      "No organization or repository webhooks exist; an empty inventory is compliant because there is no webhook delivery path to secure.",
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-INTEG-001",
+    "Pass",
+    `All ${orgHooks.length + repoHookCount} webhook(s) use HTTPS with TLS verification and a configured secret.`,
+    evidence,
+    recommendation,
+  );
+}
+
+// Deploy key fields follow the REST deploy-key schema: read_only, created_at, last_used, title.
+function assessDeployKeys(data: GitHubIntegrationsData, now: number): GitHubFinding {
+  const recommendation = "Remove write-capable deploy keys in favor of GitHub Apps or fine-grained tokens, and rotate or delete deploy keys older than a year.";
+  const org = data.org.data ? asRecord(data.org.data) : null;
+  const deployKeysEnabled = asBoolean(org?.deploy_keys_enabled_for_repositories);
+  if (deployKeysEnabled === false) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Pass",
+      "Deploy keys are disabled for repositories at the organization level, so no repository can carry one.",
+      ["deploy_keys_enabled_for_repositories = false"],
+      recommendation,
+    );
+  }
+  if (data.repositories.error) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Manual",
+      "The repository list was not readable, so deploy keys could not be enumerated.",
+      [`repositories error = ${data.repositories.error}`, `deploy_keys_enabled_for_repositories = ${String(deployKeysEnabled)}`],
+      recommendation,
+      "Rerun with a principal that can list repositories and read deploy keys (repository administration read).",
+    );
+  }
+  const entries = Object.entries(data.deployKeys.data);
+  const unreadable = entries.filter(([, entry]) => entry.items === null);
+  const allKeys = entries.flatMap(([repo, entry]) => (entry.items ?? []).map((key) => ({ repo, key })));
+  const writeKeys = allKeys.filter(({ key }) => asBoolean(key.read_only) === false);
+  const staleCutoff = now - (365 * 24 * 60 * 60 * 1000);
+  const undated = allKeys.filter(({ key }) => !asString(key.created_at) || Number.isNaN(Date.parse(asString(key.created_at) ?? "")));
+  const stale = allKeys.filter(({ key }) => {
+    const created = Date.parse(asString(key.created_at) ?? "");
+    return Number.isFinite(created) && created < staleCutoff;
+  });
+  const evidence = [
+    `deploy_keys_enabled_for_repositories = ${String(deployKeysEnabled)}`,
+    `deploy_keys = ${allKeys.length} across ${entries.length - unreadable.length} readable repositories${unreadable.length > 0 ? ` (${unreadable.length} repositories unreadable)` : ""}`,
+    `write_capable_keys = ${writeKeys.length}`,
+    `keys_older_than_365_days = ${stale.length}`,
+    `keys_without_created_at = ${undated.length}`,
+    ...writeKeys.slice(0, 10).map(({ repo, key }) => `${repo}: write key "${asString(key.title) ?? "untitled"}" created ${asString(key.created_at) ?? "unknown"}`),
+    ...stale.slice(0, 10).map(({ repo, key }) => `${repo}: stale key "${asString(key.title) ?? "untitled"}" created ${asString(key.created_at) ?? "unknown"}, last_used ${asString(key.last_used) ?? "unknown"}`),
+  ];
+  if (data.deployKeys.error) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Manual",
+      "Deploy key enumeration failed before any repository could be read.",
+      [...evidence, `deploy keys error = ${data.deployKeys.error}`],
+      recommendation,
+      "Review Settings > Deploy keys on each repository manually.",
+    );
+  }
+  if (writeKeys.length > 0 || stale.length > 0) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Fail",
+      `${writeKeys.length} write-capable and ${stale.length} stale deploy key(s) were found.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (unreadable.length > 0 || undated.length > 0) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Partial",
+      `No write-capable or stale deploy keys were found, but ${unreadable.length} repositories were unreadable and ${undated.length} key(s) carry no creation date.`,
+      evidence,
+      recommendation,
+      "Review the unreadable repositories and undated keys manually.",
+    );
+  }
+  if (allKeys.length === 0) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Pass",
+      `No deploy keys exist across ${entries.length} active repositories; an empty inventory is compliant because there is no key to rotate or over-scope.`,
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-INTEG-002",
+    "Pass",
+    `All ${allKeys.length} deploy key(s) are read-only and newer than 365 days.`,
+    evidence,
+    recommendation,
+  );
+}
+
+const BROAD_APP_PERMISSIONS = new Set([
+  "administration",
+  "organization_administration",
+  "members",
+  "organization_hooks",
+  "organization_personal_access_tokens",
+  "organization_secrets",
+  "secrets",
+  "actions",
+  "workflows",
+  "contents",
+]);
+
+// Installation fields follow the REST installation and app-permissions schemas: permissions map
+// (read, write, or admin per permission), repository_selection (all or selected), suspended_at,
+// app_slug, created_at, updated_at.
+function assessAppInstallations(data: GitHubIntegrationsData): GitHubFinding {
+  const recommendation = "Grant GitHub Apps the minimum permissions, scope installations to selected repositories, and uninstall suspended or unused apps.";
+  if (data.appInstallations.error) {
+    return buildFinding(
+      "GITHUB-INTEG-003",
+      "Manual",
+      "The GitHub App installation list was not readable, so app permissions are unverified.",
+      [`installations error = ${data.appInstallations.error}`],
+      recommendation,
+      "Listing installations requires admin:read:org (or an app with organization administration read). Review Settings > GitHub Apps manually.",
+    );
+  }
+  const installations = data.appInstallations.data;
+  const excessive: string[] = [];
+  const suspended: string[] = [];
+  const undated: string[] = [];
+  for (const installation of installations) {
+    const slug = asString(installation.app_slug) ?? `installation ${asNumber(installation.id) ?? "?"}`;
+    const permissions = asRecord(installation.permissions);
+    const allRepos = safeLower(installation.repository_selection) === "all";
+    const adminPermissions = Object.entries(permissions).filter(([, level]) => safeLower(level) === "admin").map(([name]) => name);
+    const broadWrite = Object.entries(permissions)
+      .filter(([name, level]) => BROAD_APP_PERMISSIONS.has(name) && safeLower(level) === "write")
+      .map(([name]) => name);
+    const orgAdminWrite = broadWrite.filter((name) => name === "organization_administration" || name === "administration" || name === "members");
+    if (adminPermissions.length > 0 || orgAdminWrite.length > 0 || (allRepos && broadWrite.length > 0)) {
+      excessive.push(`${slug}: repository_selection=${asString(installation.repository_selection) ?? "unknown"}, admin=[${adminPermissions.join(",")}], write=[${broadWrite.join(",")}]`);
+    }
+    if (asString(installation.suspended_at)) {
+      suspended.push(`${slug} suspended_at ${asString(installation.suspended_at)}`);
+    }
+    if (!asString(installation.updated_at)) {
+      undated.push(slug);
+    }
+  }
+  const evidence = [
+    `app_installations = ${installations.length}`,
+    `installations_with_excessive_permissions = ${excessive.length}`,
+    `suspended_installations = ${suspended.length}`,
+    `installations_without_updated_at = ${undated.length}`,
+    "Note: the installation schema has no last-used field, so inactivity beyond suspension must be judged from the audit log.",
+    ...excessive.slice(0, 10),
+    ...suspended.slice(0, 5),
+  ];
+  if (excessive.length > 0) {
+    return buildFinding(
+      "GITHUB-INTEG-003",
+      "Fail",
+      `${excessive.length} of ${installations.length} GitHub App installation(s) hold admin permissions, organization or repository administration write, or broad write across all repositories.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (suspended.length > 0 || undated.length > 0) {
+    return buildFinding(
+      "GITHUB-INTEG-003",
+      "Partial",
+      `No installation is over-permissioned, but ${suspended.length} suspended and ${undated.length} undated installation(s) need review.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (installations.length === 0) {
+    return buildFinding(
+      "GITHUB-INTEG-003",
+      "Pass",
+      "No GitHub Apps are installed on the organization; an empty inventory is compliant because no third-party app holds access.",
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-INTEG-003",
+    "Pass",
+    `All ${installations.length} GitHub App installation(s) stay within least-privilege permissions.`,
+    evidence,
+    recommendation,
+  );
+}
+
+function assessOAuthRestrictions(data: GitHubIntegrationsData): GitHubFinding {
+  const authorizations = data.credentialAuthorizations;
+  const oauthAuthorizations = authorizations.data.filter((entry) => safeLower(entry.credential_type)?.includes("oauth"));
+  return buildFinding(
+    "GITHUB-INTEG-004",
+    "Manual",
+    "The OAuth application access restriction setting is not exposed by the REST organization schema or the GraphQL Organization type, so it must be confirmed in the organization settings UI.",
+    [
+      "Reference checked: organization-full (REST) and Organization (GraphQL) carry no field for third-party OAuth application access policy.",
+      authorizations.error
+        ? `credential_authorizations unreadable (GitHub Enterprise Cloud SAML orgs only): ${authorizations.error}`
+        : `saml_credential_authorizations = ${authorizations.data.length} (oauth ${oauthAuthorizations.length})`,
+      ...oauthAuthorizations.slice(0, 10).map((entry) => `${asString(entry.login) ?? "?"}: ${asString(entry.credential_type) ?? "?"} authorized ${asString(entry.credential_authorized_at) ?? "unknown"}`),
+    ],
+    "Enable 'Restrict access via third-party applications' under Settings > Third-party Access and review every approved OAuth app.",
+    "Capture a screenshot of Settings > Third-party Access showing the access policy and the approved application list.",
+  );
+}
+
+export function assessGitHubIntegrations(
+  data: GitHubIntegrationsData,
+  config: GitHubResolvedConfig,
+  now: number = Date.now(),
+): GitHubAssessmentResult {
+  const findings: GitHubFinding[] = [
+    assessWebhookSecurity(data),
+    assessDeployKeys(data, now),
+    assessAppInstallations(data),
+    assessOAuthRestrictions(data),
+  ];
+  const deployKeyEntries = Object.values(data.deployKeys.data);
+  return {
+    category: "integrations",
+    findings,
+    summary: countByStatus(findings),
+    snapshotSummary: {
+      org_webhooks: datasetSnapshotCount(data.hooks),
+      repo_webhooks: data.repoHooks.error ? "error" : Object.values(data.repoHooks.data).reduce((total, entry) => total + (entry.items?.length ?? 0), 0),
+      deploy_keys: data.deployKeys.error ? "error" : deployKeyEntries.reduce((total, entry) => total + (entry.items?.length ?? 0), 0),
+      app_installations: datasetSnapshotCount(data.appInstallations),
+      credential_authorizations: datasetSnapshotCount(data.credentialAuthorizations),
+    },
+    text: buildAssessmentText("GitHub integrations assessment", config.organization, findings),
+  };
+}
+
 export function assessGitHubOrgAccess(
   data: GitHubOrgAccessData,
   config: GitHubResolvedConfig,
@@ -3141,6 +3611,8 @@ export async function exportGitHubAuditBundle(
     | "listRunnerGroups"
     | "listRunners"
     | "listCodeSecurityConfigurations"
+    | "listRepoHooks"
+    | "listDeployKeys"
   >,
   config: GitHubResolvedConfig,
   outputRoot: string,
@@ -3149,12 +3621,14 @@ export async function exportGitHubAuditBundle(
   const repoProtection = await collectGitHubRepoProtectionData(client);
   const actions = await collectGitHubActionsData(client);
   const codeSecurity = await collectGitHubCodeSecurityData(client);
+  const integrations = await collectGitHubIntegrationsData(client);
 
   const assessments = [
     assessGitHubOrgAccess(orgAccess, config),
     assessGitHubRepoProtection(repoProtection, config),
     assessGitHubActionsSecurity(actions, config),
     assessGitHubCodeSecurity(codeSecurity, config),
+    assessGitHubIntegrations(integrations, config),
   ];
 
   const errors = [
@@ -3162,6 +3636,7 @@ export async function exportGitHubAuditBundle(
     ...listErrors(Object.values(repoProtection)),
     ...listErrors(Object.values(actions)),
     ...listErrors(Object.values(codeSecurity)),
+    ...listErrors(Object.values(integrations)),
   ];
 
   const outputDir = await nextAvailableAuditDir(
@@ -3183,6 +3658,7 @@ export async function exportGitHubAuditBundle(
     ["core_data/repo_protection.json", repoProtection],
     ["core_data/actions_security.json", actions],
     ["core_data/code_security.json", codeSecurity],
+    ["core_data/integrations.json", integrations],
   ];
 
   for (const [pathName, value] of coreDataFiles) {
@@ -3390,6 +3866,28 @@ export function registerGitHubTools(pi: any): void {
         return errorResult(
           `GitHub code-security assessment failed: ${summarizeError(error)}`,
           { tool: "github_assess_code_security" },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "github_assess_integrations",
+    label: "Assess GitHub integrations",
+    description:
+      "Review organization and repository webhook security (HTTPS, TLS verification, secrets), deploy key hygiene, GitHub App installation permissions, and OAuth application access evidence.",
+    parameters: Type.Object(authParams),
+    prepareArguments: normalizeAssessmentArgs,
+    async execute(_toolCallId: string, args: RawConfigArgs) {
+      try {
+        const config = await resolveGitHubConfiguration(args);
+        const client = new GitHubAuditorClient(config);
+        const data = await collectGitHubIntegrationsData(client);
+        return renderAssessmentToolResult(assessGitHubIntegrations(data, config));
+      } catch (error) {
+        return errorResult(
+          `GitHub integrations assessment failed: ${summarizeError(error)}`,
+          { tool: "github_assess_integrations" },
         );
       }
     },
