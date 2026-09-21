@@ -6,6 +6,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1577,8 +1579,20 @@ test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a
   assert.equal(configuration.security.is_multi_factor_auth_required.value, true);
   assert.equal(configuration.shield.shield_rules.length, 2);
 
+  const firstZipSize = statSync(result.zipPath).size;
   const second = await exportBoxAuditBundle(createStubClient(hardenedFixture()), sampleConfig(), base);
   assert.match(second.outputDir, /123456-audit-bundle-2$/);
+  assert.match(second.zipPath, /123456-audit-bundle-2\.zip$/);
+  assert.notEqual(second.zipPath, result.zipPath, "a rerun must not overwrite the previous archive");
+  assert.ok(existsSync(result.zipPath));
+  assert.ok(existsSync(second.zipPath));
+  assert.equal(statSync(result.zipPath).size, firstZipSize, "the first archive is untouched by the rerun");
+
+  rmSync(result.outputDir, { recursive: true, force: true });
+  const third = await exportBoxAuditBundle(createStubClient(hardenedFixture()), sampleConfig(), base);
+  assert.match(third.outputDir, /123456-audit-bundle-3$/, "a kept archive reserves its suffix even after its directory is removed");
+  assert.match(third.zipPath, /123456-audit-bundle-3\.zip$/);
+  assert.ok(existsSync(result.zipPath));
 });
 
 test("exportBoxAuditBundle records partial collection failures in _errors.log", async () => {

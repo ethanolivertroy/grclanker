@@ -105,7 +105,7 @@ Every tool accepts the auth arguments (`auth_method`, `jwt_config_path`, `jwt_pa
 <enterprise_id>-audit-bundle.zip
 ```
 
-Output paths are resolved inside the output root with traversal and symlinked-parent protection, and files are written with `0600` permissions. Credentials are never written into the bundle.
+Output paths are resolved inside the output root with traversal and symlinked-parent protection, and files are written with `0600` permissions. Credentials are never written into the bundle. A rerun never overwrites an earlier export: the directory takes the next free `-2`, `-3` suffix (a suffix is also considered taken when only its zip remains), and the zip is named after the directory that was actually allocated.
 
 ## Control coverage
 

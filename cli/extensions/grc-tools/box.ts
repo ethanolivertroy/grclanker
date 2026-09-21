@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml } from "yaml";
@@ -535,7 +535,7 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -3137,7 +3137,7 @@ export async function exportBoxAuditBundle(
     await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${safeDirName(enterpriseId ?? "box-enterprise")}-audit-bundle.zip`);
+  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
   await createZipArchive(outputDir, zipPath);
 
   return {
