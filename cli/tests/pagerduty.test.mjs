@@ -20,6 +20,7 @@ import {
   assessPagerdutyIntegrationSecurity,
   assessPagerdutyOncallCoverage,
   checkPagerdutyAccess,
+  collectionOf,
   exportPagerdutyAuditBundle,
   findingId,
   resolvePagerdutyConfiguration,
@@ -35,6 +36,15 @@ import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const EMPTY_ENV = { PAGERDUTY_CONFIG_FILE: "/nonexistent/pagerduty.json" };
+const DAY_MS = 24 * 60 * 60 * 1000;
+const COVERAGE_UNTIL = new Date(NOW.getTime() + 30 * DAY_MS);
+const COVERAGE_WINDOW = { since: NOW.toISOString(), until: COVERAGE_UNTIL.toISOString(), days: 30 };
+const AUDIT_WINDOWS = {
+  recent: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
+  retention: { since: "2025-09-21T00:00:00.000Z", until: "2025-10-21T00:00:00.000Z" },
+};
+const CHANGE_WINDOW = { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() };
+const ALL_CONTROLS = PAGERDUTY_CONTROLS.map((item) => item.control);
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -75,6 +85,35 @@ function snapshot(data, error) {
   return error ? { data, error } : { data };
 }
 
+function list(items, error) {
+  return snapshot(collectionOf(items), error);
+}
+
+function partialList(items, total = 2500) {
+  return snapshot(collectionOf(items, {
+    complete: false,
+    total,
+    truncation: `stopped at the requested limit of ${items.length} with more results available`,
+  }));
+}
+
+function accountScope() {
+  return snapshot({ kind: "account", fullVisibility: true, note: "account-level REST API key" });
+}
+
+function userScope(role = "user") {
+  return snapshot({
+    kind: "user",
+    userId: "me-1",
+    email: "me@example.com",
+    role,
+    fullVisibility: role === "owner" || role === "admin",
+    note: role === "owner" || role === "admin"
+      ? `user-level credential for me@example.com with role ${role}`
+      : `user-level credential for me@example.com with role ${role} only returns the objects that user can see`,
+  });
+}
+
 function findingById(result, controlNumber) {
   return result.findings.find((item) => item.id === findingId(controlNumber));
 }
@@ -85,6 +124,11 @@ function assertStatuses(result, expected) {
     assert.ok(item, `finding ${findingId(Number(controlNumber))} missing`);
     assert.equal(item.status, status, `${item.id} expected ${status} but was ${item.status}: ${item.summary}`);
   }
+}
+
+function assertNoPass(findings, label) {
+  const passing = findings.filter((item) => item.status === "pass").map((item) => `${item.id}: ${item.summary}`);
+  assert.deepEqual(passing, [], `${label} must not produce pass verdicts`);
 }
 
 function user(id, overrides = {}) {
@@ -137,7 +181,6 @@ function escalationPolicy(id, overrides = {}) {
 }
 
 function coveredSchedule(id, overrides = {}) {
-  const until = new Date(NOW.getTime() + 30 * 24 * 60 * 60 * 1000);
   return {
     id,
     name: `Schedule ${id}`,
@@ -148,83 +191,105 @@ function coveredSchedule(id, overrides = {}) {
     final_schedule: {
       rendered_coverage_percentage: 100,
       rendered_schedule_entries: [
-        { start: NOW.toISOString(), end: until.toISOString(), user: { id: "user-1" } },
+        { start: NOW.toISOString(), end: COVERAGE_UNTIL.toISOString(), user: { id: "user-1" } },
       ],
     },
     ...overrides,
   };
 }
 
-function healthyClient(overrides = {}) {
-  const since = new Date(NOW.getTime() - 5 * 24 * 60 * 60 * 1000);
+function auditRecord(id, executionTime, overrides = {}) {
+  return {
+    id,
+    execution_time: executionTime,
+    method: { type: "api_token", truncated_token: "abcd" },
+    actors: [{ id: "owner-1", type: "user_reference" }],
+    ...overrides,
+  };
+}
+
+function healthyFixtures() {
+  return {
+    abilities: ["sso", "teams", "advanced_analytics", "audit_trail"],
+    users: [user("owner-1", { role: "owner" }), user("admin-1", { role: "admin" }), user("user-1"), user("user-2")],
+    teams: [{ id: "team-1", name: "Platform", summary: "Platform" }],
+    teamMembers: [{ user: { id: "owner-1" }, role: "manager" }, { user: { id: "user-1" }, role: "responder" }],
+    services: [service("svc-1"), service("svc-2", { incident_urgency_rule: { type: "constant", urgency: "high" } })],
+    escalationPolicies: [escalationPolicy("ep-1")],
+    schedules: [{ id: "sched-1", name: "Primary", summary: "Primary" }],
+    oncalls: [{ user: { id: "user-1" }, schedule: { id: "sched-1" }, escalation_level: 1 }],
+    extensions: [{ id: "ext-1", summary: "Slack", endpoint_url: "https://hooks.example.com/slack", extension_schema: { summary: "Slack V2" } }],
+    webhookSubscriptions: [{ id: "wh-1", description: "SIEM", active: true, delivery_method: { type: "http_delivery_method", url: "https://siem.example.com/pd" } }],
+    businessServices: [{ id: "bs-1", name: "Checkout", summary: "Checkout" }],
+    businessServiceDependencies: [{ supporting_service: { id: "svc-1", type: "technical_service_reference" } }],
+    priorities: [{ id: "p1", name: "P1", summary: "P1" }, { id: "p2", name: "P2", summary: "P2" }],
+    incidentWorkflows: [{ id: "wf-1", name: "Page leadership", is_enabled: true }],
+    incidentWorkflowTriggers: [{ id: "trig-1", trigger_type: "conditional_trigger", services: [{ id: "svc-1" }] }],
+    changeEvents: [{ id: "chg-1", summary: "deploy 1.2.3", timestamp: new Date(NOW.getTime() - DAY_MS).toISOString(), services: [{ id: "svc-1" }] }],
+  };
+}
+
+function healthyClient(overrides = {}, wrap = (items) => collectionOf(items)) {
+  const fixtures = healthyFixtures();
   return {
     getResolvedConfig: () => sampleConfig(),
     getNow: () => NOW,
     async getAbilities() {
-      return ["sso", "teams", "advanced_analytics", "audit_trail"];
+      return fixtures.abilities;
+    },
+    async getCredentialScope() {
+      return { kind: "account", fullVisibility: true, note: "account-level REST API key" };
     },
     async listUsers() {
-      return [
-        user("owner-1", { role: "owner" }),
-        user("admin-1", { role: "admin" }),
-        user("user-1"),
-        user("user-2"),
-      ];
+      return wrap(fixtures.users);
     },
     async listTeams() {
-      return [{ id: "team-1", name: "Platform", summary: "Platform" }];
+      return wrap(fixtures.teams);
     },
     async listTeamMembers() {
-      return [{ user: { id: "owner-1" }, role: "manager" }, { user: { id: "user-1" }, role: "responder" }];
+      return wrap(fixtures.teamMembers);
     },
     async listServices() {
-      return [service("svc-1"), service("svc-2", { incident_urgency_rule: { type: "constant", urgency: "high" } })];
+      return wrap(fixtures.services);
     },
     async listEscalationPolicies() {
-      return [escalationPolicy("ep-1")];
+      return wrap(fixtures.escalationPolicies);
     },
     async listSchedules() {
-      return [{ id: "sched-1", name: "Primary", summary: "Primary" }];
+      return wrap(fixtures.schedules);
     },
     async getSchedule() {
       return coveredSchedule("sched-1");
     },
     async listOncalls() {
-      return [{ user: { id: "user-1" }, schedule: { id: "sched-1" }, escalation_level: 1 }];
+      return wrap(fixtures.oncalls);
     },
-    async listAuditRecords() {
-      return [
-        {
-          id: "audit-1",
-          execution_time: since.toISOString(),
-          method: { type: "api_token", truncated_token: "abcd" },
-          actors: [{ id: "owner-1", type: "user_reference" }],
-        },
-      ];
+    async listAuditRecords(since) {
+      return wrap([auditRecord("audit-1", new Date(since.getTime() + DAY_MS).toISOString())]);
     },
     async listExtensions() {
-      return [{ id: "ext-1", summary: "Slack", endpoint_url: "https://hooks.example.com/slack", extension_schema: { summary: "Slack V2" } }];
+      return wrap(fixtures.extensions);
     },
     async listWebhookSubscriptions() {
-      return [{ id: "wh-1", description: "SIEM", active: true, delivery_method: { type: "http_delivery_method", url: "https://siem.example.com/pd" } }];
+      return wrap(fixtures.webhookSubscriptions);
     },
     async listBusinessServices() {
-      return [{ id: "bs-1", name: "Checkout", summary: "Checkout" }];
+      return wrap(fixtures.businessServices);
     },
     async getBusinessServiceDependencies() {
-      return [{ supporting_service: { id: "svc-1", type: "technical_service_reference" } }];
+      return fixtures.businessServiceDependencies;
     },
     async listPriorities() {
-      return [{ id: "p1", name: "P1", summary: "P1" }, { id: "p2", name: "P2", summary: "P2" }];
+      return wrap(fixtures.priorities);
     },
     async listIncidentWorkflows() {
-      return [{ id: "wf-1", name: "Page leadership", is_enabled: true }];
+      return wrap(fixtures.incidentWorkflows);
     },
     async listIncidentWorkflowTriggers() {
-      return [{ id: "trig-1", trigger_type: "conditional_trigger", services: [{ id: "svc-1" }] }];
+      return wrap(fixtures.incidentWorkflowTriggers);
     },
     async listChangeEvents() {
-      return [{ id: "chg-1", summary: "deploy 1.2.3", services: [{ id: "svc-1" }] }];
+      return wrap(fixtures.changeEvents);
     },
     ...overrides,
   };
@@ -236,9 +301,94 @@ function failing(message) {
   };
 }
 
+function forbiddenClient() {
+  const deny = (path) => failing(`PagerDuty request failed (403 Forbidden) for ${path}: Access Denied`);
+  return {
+    getResolvedConfig: () => sampleConfig(),
+    getNow: () => NOW,
+    getAbilities: deny("/abilities"),
+    getCredentialScope: deny("/users/me"),
+    listUsers: deny("/users"),
+    listTeams: deny("/teams"),
+    listTeamMembers: deny("/teams/{id}/members"),
+    listServices: deny("/services"),
+    listEscalationPolicies: deny("/escalation_policies"),
+    listSchedules: deny("/schedules"),
+    getSchedule: deny("/schedules/{id}"),
+    listOncalls: deny("/oncalls"),
+    listAuditRecords: deny("/audit/records"),
+    listExtensions: deny("/extensions"),
+    listWebhookSubscriptions: deny("/webhook_subscriptions"),
+    listBusinessServices: deny("/business_services"),
+    getBusinessServiceDependencies: deny("/service_dependencies/business_services/{id}"),
+    listPriorities: deny("/priorities"),
+    listIncidentWorkflows: deny("/incident_workflows"),
+    listIncidentWorkflowTriggers: deny("/incident_workflows/triggers"),
+    listChangeEvents: deny("/change_events"),
+  };
+}
+
+function emptyClient() {
+  const empty = async () => collectionOf([]);
+  return healthyClient({
+    getAbilities: async () => [],
+    listUsers: empty,
+    listTeams: empty,
+    listTeamMembers: empty,
+    listServices: empty,
+    listEscalationPolicies: empty,
+    listSchedules: empty,
+    listOncalls: empty,
+    listAuditRecords: empty,
+    listExtensions: empty,
+    listWebhookSubscriptions: empty,
+    listBusinessServices: empty,
+    getBusinessServiceDependencies: async () => [],
+    listPriorities: empty,
+    listIncidentWorkflows: empty,
+    listIncidentWorkflowTriggers: empty,
+    listChangeEvents: empty,
+  });
+}
+
+function partialClient() {
+  return healthyClient(
+    {
+      async getCredentialScope() {
+        return {
+          kind: "user",
+          userId: "me-1",
+          email: "me@example.com",
+          role: "user",
+          fullVisibility: false,
+          note: "user-level credential for me@example.com with role user only returns the objects that user can see",
+        };
+      },
+    },
+    (items) => collectionOf(items, {
+      complete: false,
+      total: 2500,
+      truncation: `stopped at the requested limit of ${items.length} with more results available`,
+    }),
+  );
+}
+
+async function runAllAssessments(client) {
+  const results = await Promise.all([
+    runPagerdutyAccessControlAssessment(client, { maxAdmins: 3 }),
+    runPagerdutyIncidentResponseAssessment(client),
+    runPagerdutyOncallCoverageAssessment(client, { coverageDays: 30 }),
+    runPagerdutyAuditLoggingAssessment(client),
+    runPagerdutyIntegrationSecurityAssessment(client),
+  ]);
+  const findings = results.flatMap((result) => result.findings);
+  assert.equal(findings.length, 25);
+  return { results, findings };
+}
+
 test("PAGERDUTY_CONTROLS defines all 25 spec controls with eight framework mappings each", () => {
   assert.equal(PAGERDUTY_CONTROLS.length, 25);
-  const numbers = PAGERDUTY_CONTROLS.map((item) => item.control).sort((left, right) => left - right);
+  const numbers = [...ALL_CONTROLS].sort((left, right) => left - right);
   assert.deepEqual(numbers, Array.from({ length: 25 }, (_, index) => index + 1));
   for (const item of PAGERDUTY_CONTROLS) {
     assert.equal(Object.keys(item.mappings).length, 8, `control ${item.control} mappings`);
@@ -326,7 +476,7 @@ test("resolvePagerdutyConfiguration selects OAuth auth modes and reads config fi
   assert.throws(() => resolvePagerdutyConfiguration({}, EMPTY_ENV), /PagerDuty credentials are required/);
 });
 
-test("PagerdutyApiClient sends the versioned Accept header, Token auth, and follows classic pagination", async () => {
+test("PagerdutyApiClient sends the versioned Accept header, Token auth, and follows classic pagination to completion", async () => {
   const seen = [];
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
@@ -339,20 +489,24 @@ test("PagerdutyApiClient sends the versioned Accept header, Token auth, and foll
     });
     const offset = Number(url.searchParams.get("offset") ?? "0");
     if (offset === 0) {
-      return jsonResponse({ users: [{ id: "user-1" }], limit: 1, offset: 0, more: true });
+      return jsonResponse({ users: [{ id: "user-1" }], limit: 1, offset: 0, more: true, total: 2 });
     }
-    return jsonResponse({ users: [{ id: "user-2" }], limit: 1, offset: 1, more: false });
+    return jsonResponse({ users: [{ id: "user-2" }], limit: 1, offset: 1, more: false, total: 2 });
   };
 
   const client = new PagerdutyApiClient(sampleConfig(), { fetchImpl });
   const users = await client.listUsers(5);
 
-  assert.deepEqual(users.map((item) => item.id), ["user-1", "user-2"]);
+  assert.deepEqual(users.items.map((item) => item.id), ["user-1", "user-2"]);
+  assert.equal(users.complete, true);
+  assert.equal(users.total, 2);
+  assert.equal(users.truncation, undefined);
   assert.equal(seen.length, 2);
   assert.equal(seen[0].pathname, "/users");
   assert.equal(seen[0].accept, "application/vnd.pagerduty+json;version=2");
   assert.equal(seen[0].auth, "Token token=pd-secret-token");
   assert.equal(seen[0].params.offset, "0");
+  assert.equal(seen[0].params.total, "true");
   assert.equal(seen[1].params.offset, "1");
   assert.ok(seen[0].includes.includes("contact_methods"));
   assert.ok(seen[0].includes.includes("notification_rules"));
@@ -372,7 +526,8 @@ test("PagerdutyApiClient follows cursor pagination for audit records and honors 
   const client = new PagerdutyApiClient(sampleConfig({ region: "eu", baseUrl: "https://api.eu.pagerduty.com" }), { fetchImpl });
   const records = await client.listAuditRecords(new Date("2026-09-01T00:00:00Z"), NOW, 10);
 
-  assert.deepEqual(records.map((item) => item.id), ["rec-1", "rec-2"]);
+  assert.deepEqual(records.items.map((item) => item.id), ["rec-1", "rec-2"]);
+  assert.equal(records.complete, true);
   assert.equal(seen[0].host, "api.eu.pagerduty.com");
   assert.equal(seen[0].pathname, "/audit/records");
   assert.equal(seen[0].cursor, null);
@@ -445,13 +600,51 @@ test("PagerdutyApiClient exchanges Scoped OAuth client credentials before callin
   const client = new PagerdutyApiClient(config, { fetchImpl, now: () => NOW });
   const teams = await client.listTeams(5);
 
-  assert.deepEqual(teams.map((item) => item.id), ["team-1"]);
+  assert.deepEqual(teams.items.map((item) => item.id), ["team-1"]);
   assert.equal(seen[0].pathname, "/oauth/token");
   assert.equal(seen[0].method, "POST");
   assert.match(String(seen[0].body), /grant_type=client_credentials/);
   assert.match(String(seen[0].body), /as_account-eu\.acme/);
   assert.equal(seen[1].host, "api.eu.pagerduty.com");
   assert.equal(seen[1].auth, "Bearer oauth-access");
+
+  const scope = await client.getCredentialScope();
+  assert.equal(scope.kind, "account");
+  assert.equal(scope.fullVisibility, true);
+  assert.equal(seen.filter((request) => request.pathname === "/users/me").length, 0);
+});
+
+test("PagerdutyApiClient classifies credential scope from GET /users/me", async () => {
+  const accountKey = new PagerdutyApiClient(sampleConfig(), {
+    maxRetries: 0,
+    fetchImpl: async () =>
+      jsonResponse({ error: { message: "Requested users/me but the request was not authenticated as a user.", code: 2002 } }, { status: 400, statusText: "Bad Request" }),
+  });
+  const account = await accountKey.getCredentialScope();
+  assert.equal(account.kind, "account");
+  assert.equal(account.fullVisibility, true);
+
+  const limitedKey = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ user: { id: "me-1", email: "me@example.com", role: "user" } }),
+  });
+  const limited = await limitedKey.getCredentialScope();
+  assert.equal(limited.kind, "user");
+  assert.equal(limited.role, "user");
+  assert.equal(limited.fullVisibility, false);
+  assert.match(limited.note, /only returns the objects that user can see/);
+
+  const adminKey = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ user: { id: "me-2", email: "admin@example.com", role: "admin" } }),
+  });
+  const admin = await adminKey.getCredentialScope();
+  assert.equal(admin.kind, "user");
+  assert.equal(admin.fullVisibility, true);
+
+  const broken = new PagerdutyApiClient(sampleConfig(), {
+    maxRetries: 0,
+    fetchImpl: async () => jsonResponse({ error: { message: "nope" } }, { status: 403, statusText: "Forbidden" }),
+  });
+  await assert.rejects(broken.getCredentialScope(), /403 Forbidden/);
 });
 
 test("checkPagerdutyAccess reports healthy when every read surface responds", async () => {
@@ -462,10 +655,11 @@ test("checkPagerdutyAccess reports healthy when every read surface responds", as
   assert.equal(result.surfaces.length, 14);
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   assert.deepEqual(result.missingPermissions, []);
+  assert.ok(result.notes.some((note) => note.startsWith("Credential scope: account-level")));
   assert.match(result.recommendedNextStep, /pagerduty_export_audit_bundle/);
 });
 
-test("checkPagerdutyAccess reports limited access and missing permissions", async () => {
+test("checkPagerdutyAccess reports limited access, missing permissions, and partial credential scope", async () => {
   const result = await checkPagerdutyAccess(healthyClient({
     listUsers: failing("PagerDuty request failed (403 Forbidden) for /users: Access Denied"),
     listAuditRecords: failing("PagerDuty request failed (402 Payment Required) for /audit/records"),
@@ -479,13 +673,18 @@ test("checkPagerdutyAccess reports limited access and missing permissions", asyn
   assert.ok(result.missingPermissions.some((item) => item.startsWith("/audit/records: audit_records.read")));
   assert.match(result.recommendedNextStep, /read-only account-level REST API key/);
   assert.ok(result.notes.some((note) => note.startsWith("Missing read access")));
+
+  const limitedScope = await checkPagerdutyAccess(partialClient());
+  assert.equal(limitedScope.status, "limited");
+  assert.ok(limitedScope.notes.some((note) => /partial visibility/.test(note)));
 });
 
 test("assessPagerdutyAccessControl passes on a well governed tenant", () => {
   const result = assessPagerdutyAccessControl({
+    scope: accountScope(),
     abilities: snapshot(["sso", "teams", "advanced_analytics"]),
-    users: snapshot([user("owner-1", { role: "owner" }), user("admin-1", { role: "admin" }), user("user-1"), user("user-2", { role: "read_only_user" })]),
-    teams: snapshot([{ id: "team-1", name: "Platform" }]),
+    users: list([user("owner-1", { role: "owner" }), user("admin-1", { role: "admin" }), user("user-1"), user("user-2", { role: "read_only_user" })]),
+    teams: list([{ id: "team-1", name: "Platform" }]),
     teamMembers: snapshot({ "team-1": [{ user: { id: "owner-1" }, role: "manager" }] }),
   }, { maxAdmins: 3 });
 
@@ -493,6 +692,7 @@ test("assessPagerdutyAccessControl passes on a well governed tenant", () => {
   assert.equal(result.findings.length, 5);
   assertStatuses(result, { 1: "manual", 2: "pass", 3: "pass", 4: "pass", 24: "manual" });
   assert.match(findingById(result, 1).summary, /Account Settings > Single Sign-On/);
+  assert.match(findingById(result, 2).summary, /2 of 4 users hold owner or admin roles/);
   assert.match(findingById(result, 24).summary, /Analytics/);
   assert.deepEqual(result.errors, []);
   for (const item of result.findings) {
@@ -514,28 +714,31 @@ test("assessPagerdutyAccessControl passes on a well governed tenant", () => {
 
 test("assessPagerdutyAccessControl fails without SSO, with excess admins, and without teams", () => {
   const result = assessPagerdutyAccessControl({
+    scope: accountScope(),
     abilities: snapshot(["advanced_analytics"]),
-    users: snapshot([
+    users: list([
       user("owner-1", { role: "owner", created_via_sso: false, teams: [] }),
       user("owner-2", { role: "owner", created_via_sso: false, teams: [] }),
       user("admin-1", { role: "admin", created_via_sso: false, teams: [] }),
       user("admin-2", { role: "admin", created_via_sso: false, teams: [] }),
     ]),
-    teams: snapshot([]),
+    teams: list([]),
     teamMembers: snapshot({}),
   }, { maxAdmins: 2 });
 
   assertStatuses(result, { 1: "fail", 2: "fail", 3: "fail", 4: "fail", 24: "manual" });
   assert.deepEqual(findingById(result, 3).evidence.owners, ["owner-1@example.com", "owner-2@example.com"]);
+  assert.match(findingById(result, 4).summary, /empty team list fails this control/);
   assert.equal(result.summary.fail, 4);
   assert.equal(result.summary.manual, 1);
 });
 
 test("assessPagerdutyAccessControl falls back to manual findings when users cannot be read", () => {
   const result = assessPagerdutyAccessControl({
+    scope: accountScope(),
     abilities: snapshot([], "PagerDuty request failed (403 Forbidden) for /abilities"),
-    users: snapshot([], "PagerDuty request failed (403 Forbidden) for /users"),
-    teams: snapshot([]),
+    users: list([], "PagerDuty request failed (403 Forbidden) for /users"),
+    teams: list([]),
     teamMembers: snapshot({}),
   });
 
@@ -546,11 +749,12 @@ test("assessPagerdutyAccessControl falls back to manual findings when users cann
 
 test("assessPagerdutyIncidentResponse passes when services, policies, and automation are configured", () => {
   const result = assessPagerdutyIncidentResponse({
-    services: snapshot([service("svc-1"), service("svc-2", { incident_urgency_rule: { type: "constant", urgency: "high" } })]),
-    escalationPolicies: snapshot([escalationPolicy("ep-1")]),
-    priorities: snapshot([{ id: "p1", name: "P1", summary: "P1" }]),
-    incidentWorkflows: snapshot([{ id: "wf-1", name: "Page leadership", is_enabled: true }]),
-    workflowTriggers: snapshot([{ id: "trig-1", services: [{ id: "svc-1" }] }]),
+    scope: accountScope(),
+    services: list([service("svc-1"), service("svc-2", { incident_urgency_rule: { type: "constant", urgency: "high" } })]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1", summary: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", name: "Page leadership", is_enabled: true }]),
+    workflowTriggers: list([{ id: "trig-1", services: [{ id: "svc-1" }] }]),
   });
 
   assert.equal(result.category, "incident_response");
@@ -560,7 +764,8 @@ test("assessPagerdutyIncidentResponse passes when services, policies, and automa
 
 test("assessPagerdutyIncidentResponse flags missing policies, single levels, and disabled timeouts", () => {
   const result = assessPagerdutyIncidentResponse({
-    services: snapshot([
+    scope: accountScope(),
+    services: list([
       service("svc-1", {
         escalation_policy: undefined,
         incident_urgency_rule: undefined,
@@ -569,26 +774,29 @@ test("assessPagerdutyIncidentResponse flags missing policies, single levels, and
       }),
       service("svc-disabled", { status: "disabled", escalation_policy: undefined }),
     ]),
-    escalationPolicies: snapshot([
+    escalationPolicies: list([
       escalationPolicy("ep-single", { num_loops: 0, escalation_rules: [{ escalation_delay_in_minutes: 30, targets: [] }] }),
     ]),
-    priorities: snapshot([]),
-    incidentWorkflows: snapshot([]),
-    workflowTriggers: snapshot([]),
+    priorities: list([]),
+    incidentWorkflows: list([]),
+    workflowTriggers: list([]),
   });
 
   assertStatuses(result, { 5: "fail", 6: "warn", 7: "fail", 10: "fail", 19: "fail", 20: "fail", 22: "warn", 23: "warn" });
   assert.deepEqual(findingById(result, 5).evidence.services_without_policy, ["Service svc-1"]);
   assert.equal(findingById(result, 5).evidence.disabled_services, 1);
+  assert.match(findingById(result, 10).summary, /emptiness fails this control/);
+  assert.match(findingById(result, 20).summary, /emptiness fails this control/);
 });
 
 test("assessPagerdutyIncidentResponse warns on constant high urgency and non repeating policies", () => {
   const result = assessPagerdutyIncidentResponse({
-    services: snapshot([service("svc-1", { incident_urgency_rule: { type: "constant", urgency: "high" } })]),
-    escalationPolicies: snapshot([escalationPolicy("ep-1", { num_loops: 0 })]),
-    priorities: snapshot([{ id: "p1", name: "P1" }]),
-    incidentWorkflows: snapshot([{ id: "wf-1", is_enabled: false }]),
-    workflowTriggers: snapshot([]),
+    scope: accountScope(),
+    services: list([service("svc-1", { incident_urgency_rule: { type: "constant", urgency: "high" } })]),
+    escalationPolicies: list([escalationPolicy("ep-1", { num_loops: 0 })]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: false }]),
+    workflowTriggers: list([]),
   });
 
   assertStatuses(result, { 7: "warn", 10: "warn", 19: "warn" });
@@ -597,26 +805,29 @@ test("assessPagerdutyIncidentResponse warns on constant high urgency and non rep
 
 test("assessPagerdutyIncidentResponse becomes manual when services cannot be read", () => {
   const result = assessPagerdutyIncidentResponse({
-    services: snapshot([], "PagerDuty request failed (403 Forbidden) for /services"),
-    escalationPolicies: snapshot([], "PagerDuty request failed (403 Forbidden) for /escalation_policies"),
-    priorities: snapshot([], "PagerDuty request failed (403 Forbidden) for /priorities"),
-    incidentWorkflows: snapshot([], "PagerDuty request failed (403 Forbidden) for /incident_workflows"),
-    workflowTriggers: snapshot([]),
+    scope: accountScope(),
+    services: list([], "PagerDuty request failed (403 Forbidden) for /services"),
+    escalationPolicies: list([], "PagerDuty request failed (403 Forbidden) for /escalation_policies"),
+    priorities: list([], "PagerDuty request failed (403 Forbidden) for /priorities"),
+    incidentWorkflows: list([], "PagerDuty request failed (403 Forbidden) for /incident_workflows"),
+    workflowTriggers: list([]),
   });
 
   assertStatuses(result, { 5: "manual", 6: "manual", 7: "manual", 10: "manual", 19: "manual", 20: "manual", 22: "manual", 23: "manual" });
   assert.equal(result.errors.length, 4);
 });
 
-test("scheduleCoverageGaps detects uncovered windows in rendered schedule entries", () => {
-  const until = new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000);
-  const dayOne = new Date(NOW.getTime() + 24 * 60 * 60 * 1000);
-  const dayTwo = new Date(NOW.getTime() + 2 * 24 * 60 * 60 * 1000);
+test("scheduleCoverageGaps detects uncovered windows and buckets entries missing dates", () => {
+  const until = new Date(NOW.getTime() + 3 * DAY_MS);
+  const dayOne = new Date(NOW.getTime() + DAY_MS);
+  const dayTwo = new Date(NOW.getTime() + 2 * DAY_MS);
 
   const covered = scheduleCoverageGaps({
     final_schedule: { rendered_schedule_entries: [{ start: NOW.toISOString(), end: until.toISOString() }] },
   }, NOW, until);
-  assert.deepEqual(covered, []);
+  assert.deepEqual(covered.gaps, []);
+  assert.equal(covered.entriesMissingDates, 0);
+  assert.equal(covered.entries, 1);
 
   const gapped = scheduleCoverageGaps({
     final_schedule: {
@@ -626,35 +837,42 @@ test("scheduleCoverageGaps detects uncovered windows in rendered schedule entrie
       ],
     },
   }, NOW, until);
-  assert.equal(gapped.length, 1);
-  assert.equal(new Date(gapped[0].start).getTime(), dayOne.getTime());
-  assert.equal(new Date(gapped[0].end).getTime(), dayTwo.getTime());
+  assert.equal(gapped.gaps.length, 1);
+  assert.equal(new Date(gapped.gaps[0].start).getTime(), dayOne.getTime());
+  assert.equal(new Date(gapped.gaps[0].end).getTime(), dayTwo.getTime());
 
   const empty = scheduleCoverageGaps({ final_schedule: { rendered_schedule_entries: [] } }, NOW, until);
-  assert.equal(empty.length, 1);
+  assert.equal(empty.gaps.length, 1);
+
+  const undated = scheduleCoverageGaps({
+    final_schedule: { rendered_schedule_entries: [{ start: NOW.toISOString(), end: null }] },
+  }, NOW, until);
+  assert.equal(undated.entriesMissingDates, 1);
+  assert.equal(undated.gaps.length, 1, "an entry without an end never counts as coverage");
 });
 
 test("assessPagerdutyOncallCoverage passes with continuous coverage and verified responders", () => {
-  const until = new Date(NOW.getTime() + 30 * 24 * 60 * 60 * 1000);
   const result = assessPagerdutyOncallCoverage({
-    schedules: snapshot([{ id: "sched-1" }]),
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
     scheduleDetails: snapshot([coveredSchedule("sched-1")]),
-    oncalls: snapshot([{ user: { id: "user-1" }, schedule: { id: "sched-1" } }]),
-    users: snapshot([user("user-1"), user("user-2"), user("ro-1", { role: "read_only_user", notification_rules: [] })]),
-    coverageWindow: { since: NOW.toISOString(), until: until.toISOString(), days: 30 },
+    oncalls: list([{ user: { id: "user-1" }, schedule: { id: "sched-1" } }]),
+    users: list([user("user-1"), user("user-2"), user("ro-1", { role: "read_only_user", notification_rules: [] })]),
+    coverageWindow: COVERAGE_WINDOW,
   });
 
   assert.equal(result.category, "oncall_coverage");
   assert.equal(result.findings.length, 4);
   assertStatuses(result, { 8: "pass", 9: "pass", 17: "pass", 18: "pass" });
-  assert.equal(result.summary.sampled_responders, 2);
+  assert.equal(result.summary.responders, 2);
+  assert.match(findingById(result, 18).summary, /enabled true and blacklisted false/);
 });
 
 test("assessPagerdutyOncallCoverage fails on gaps, single participants, and missing contact methods", () => {
-  const until = new Date(NOW.getTime() + 30 * 24 * 60 * 60 * 1000);
-  const midpoint = new Date(NOW.getTime() + 15 * 24 * 60 * 60 * 1000);
+  const midpoint = new Date(NOW.getTime() + 15 * DAY_MS);
   const result = assessPagerdutyOncallCoverage({
-    schedules: snapshot([{ id: "sched-1" }]),
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
     scheduleDetails: snapshot([
       coveredSchedule("sched-1", {
         users: [{ id: "user-1" }],
@@ -665,14 +883,14 @@ test("assessPagerdutyOncallCoverage fails on gaps, single participants, and miss
         },
       }),
     ]),
-    oncalls: snapshot([{ user: { id: "user-1" } }, { user: { id: "user-2" } }]),
-    users: snapshot([
+    oncalls: list([{ user: { id: "user-1" } }, { user: { id: "user-2" } }]),
+    users: list([
       user("user-1", { contact_methods: [], notification_rules: [] }),
-      user("user-2", { contact_methods: [{ type: "email_contact_method" }], notification_rules: [{ urgency: "low" }] }),
+      user("user-2", { contact_methods: [{ type: "email_contact_method", enabled: true }], notification_rules: [{ urgency: "low" }] }),
       user("user-3", { notification_rules: [] }),
       user("user-4", { notification_rules: [] }),
     ]),
-    coverageWindow: { since: NOW.toISOString(), until: until.toISOString(), days: 30 },
+    coverageWindow: COVERAGE_WINDOW,
   });
 
   assertStatuses(result, { 8: "fail", 9: "fail", 17: "fail", 18: "fail" });
@@ -683,44 +901,43 @@ test("assessPagerdutyOncallCoverage fails on gaps, single participants, and miss
 });
 
 test("assessPagerdutyOncallCoverage warns on email-only responders and manual when unreadable", () => {
-  const until = new Date(NOW.getTime() + 30 * 24 * 60 * 60 * 1000);
   const warned = assessPagerdutyOncallCoverage({
-    schedules: snapshot([{ id: "sched-1" }]),
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
     scheduleDetails: snapshot([coveredSchedule("sched-1")]),
-    oncalls: snapshot([{ user: { id: "user-1" } }]),
-    users: snapshot([
+    oncalls: list([{ user: { id: "user-1" } }]),
+    users: list([
       user("user-1", { contact_methods: [{ type: "email_contact_method", enabled: true }], notification_rules: [{ urgency: "low" }] }),
       user("user-2"),
       user("user-3"),
       user("user-4"),
       user("user-5"),
     ]),
-    coverageWindow: { since: NOW.toISOString(), until: until.toISOString(), days: 30 },
+    coverageWindow: COVERAGE_WINDOW,
   });
   assertStatuses(warned, { 17: "warn", 18: "warn" });
 
   const manual = assessPagerdutyOncallCoverage({
-    schedules: snapshot([], "PagerDuty request failed (403 Forbidden) for /schedules"),
+    scope: accountScope(),
+    schedules: list([], "PagerDuty request failed (403 Forbidden) for /schedules"),
     scheduleDetails: snapshot([]),
-    oncalls: snapshot([], "PagerDuty request failed (403 Forbidden) for /oncalls"),
-    users: snapshot([], "PagerDuty request failed (403 Forbidden) for /users"),
-    coverageWindow: { since: NOW.toISOString(), until: until.toISOString(), days: 30 },
+    oncalls: list([], "PagerDuty request failed (403 Forbidden) for /oncalls"),
+    users: list([], "PagerDuty request failed (403 Forbidden) for /users"),
+    coverageWindow: COVERAGE_WINDOW,
   });
   assertStatuses(manual, { 8: "manual", 9: "manual", 17: "manual", 18: "manual" });
   assert.equal(manual.errors.length, 3);
 });
 
-test("assessPagerdutyAuditLogging passes with recent records and a retention probe", () => {
+test("assessPagerdutyAuditLogging passes with dated recent records and a dated retention probe", () => {
   const result = assessPagerdutyAuditLogging({
-    recentRecords: snapshot([
-      { id: "a1", execution_time: "2026-09-20T10:00:00Z", method: { type: "api_token", truncated_token: "abcd" }, actors: [{ id: "user-1" }] },
-      { id: "a2", execution_time: "2026-09-19T10:00:00Z", method: { type: "browser" }, actors: [{ id: "user-2" }] },
+    scope: accountScope(),
+    recentRecords: list([
+      auditRecord("a1", "2026-09-20T10:00:00Z", { actors: [{ id: "user-1" }] }),
+      auditRecord("a2", "2026-09-19T10:00:00Z", { method: { type: "browser" }, actors: [{ id: "user-2" }] }),
     ]),
-    retentionProbe: snapshot([{ id: "old-1" }]),
-    windows: {
-      recent: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
-      retention: { since: "2025-09-21T00:00:00.000Z", until: "2025-10-21T00:00:00.000Z" },
-    },
+    retentionProbe: list([auditRecord("old-1", "2025-10-01T00:00:00Z")]),
+    windows: AUDIT_WINDOWS,
   });
 
   assert.equal(result.category, "audit_logging");
@@ -731,37 +948,37 @@ test("assessPagerdutyAuditLogging passes with recent records and a retention pro
   assert.match(findingById(result, 13).summary, /Integrations > API Access Keys/);
 });
 
-test("assessPagerdutyAuditLogging fails on 402 plan errors and warns on empty retention probes", () => {
-  const windows = {
-    recent: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
-    retention: { since: "2025-09-21T00:00:00.000Z", until: "2025-10-21T00:00:00.000Z" },
-  };
-
+test("assessPagerdutyAuditLogging goes manual on 402 plan errors and warns on empty retention probes", () => {
   const noPlan = assessPagerdutyAuditLogging({
-    recentRecords: snapshot([], "PagerDuty request failed (402 Payment Required) for /audit/records: Audit Trail not enabled"),
-    retentionProbe: snapshot([], "PagerDuty request failed (402 Payment Required) for /audit/records"),
-    windows,
+    scope: accountScope(),
+    recentRecords: list([], "PagerDuty request failed (402 Payment Required) for /audit/records: Audit Trail not enabled"),
+    retentionProbe: list([], "PagerDuty request failed (402 Payment Required) for /audit/records"),
+    windows: AUDIT_WINDOWS,
   });
-  assertStatuses(noPlan, { 11: "fail", 12: "manual", 13: "manual" });
+  assertStatuses(noPlan, { 11: "manual", 12: "manual", 13: "manual" });
+  assert.match(findingById(noPlan, 11).summary, /not included in this account's plan/);
 
   const forbidden = assessPagerdutyAuditLogging({
-    recentRecords: snapshot([], "PagerDuty request failed (403 Forbidden) for /audit/records"),
-    retentionProbe: snapshot([]),
-    windows,
+    scope: accountScope(),
+    recentRecords: list([], "PagerDuty request failed (403 Forbidden) for /audit/records"),
+    retentionProbe: list([]),
+    windows: AUDIT_WINDOWS,
   });
   assertStatuses(forbidden, { 11: "manual", 12: "manual", 13: "manual" });
 
   const quiet = assessPagerdutyAuditLogging({
-    recentRecords: snapshot([]),
-    retentionProbe: snapshot([]),
-    windows,
+    scope: accountScope(),
+    recentRecords: list([]),
+    retentionProbe: list([]),
+    windows: AUDIT_WINDOWS,
   });
   assertStatuses(quiet, { 11: "warn", 12: "warn", 13: "manual" });
 
   const longRetention = assessPagerdutyAuditLogging({
-    recentRecords: snapshot([{ id: "a1", method: { type: "browser" } }]),
-    retentionProbe: snapshot([{ id: "old-1" }]),
-    windows,
+    scope: accountScope(),
+    recentRecords: list([auditRecord("a1", "2026-09-20T10:00:00Z", { method: { type: "browser" } })]),
+    retentionProbe: list([auditRecord("old-1", "2025-10-01T00:00:00Z")]),
+    windows: AUDIT_WINDOWS,
   }, { minRetentionDays: 730 });
   assertStatuses(longRetention, { 11: "pass", 12: "manual" });
   assert.match(findingById(longRetention, 12).summary, /SIEM or archive/);
@@ -769,24 +986,27 @@ test("assessPagerdutyAuditLogging fails on 402 plan errors and warns on empty re
 
 test("assessPagerdutyIntegrationSecurity passes with https endpoints and mapped dependencies", () => {
   const result = assessPagerdutyIntegrationSecurity({
-    services: snapshot([service("svc-1")]),
-    extensions: snapshot([{ id: "ext-1", summary: "Slack", endpoint_url: "https://hooks.example.com/slack", extension_schema: { summary: "Slack V2" } }]),
-    webhookSubscriptions: snapshot([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
-    businessServices: snapshot([{ id: "bs-1", name: "Checkout" }]),
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([{ id: "ext-1", summary: "Slack", endpoint_url: "https://hooks.example.com/slack", extension_schema: { summary: "Slack V2" } }]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([{ id: "bs-1", name: "Checkout" }]),
     businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }] }),
-    changeEvents: snapshot([{ id: "chg-1", services: [{ id: "svc-1" }] }]),
-    changeWindow: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
   });
 
   assert.equal(result.category, "integration_security");
   assert.equal(result.findings.length, 5);
   assertStatuses(result, { 14: "pass", 15: "pass", 16: "pass", 21: "pass", 25: "pass" });
   assert.match(findingById(result, 15).summary, /X-PagerDuty-Signature/);
+  assert.match(findingById(result, 15).summary, /1 extensions were read/);
 });
 
 test("assessPagerdutyIntegrationSecurity flags http webhooks, legacy integrations, and missing dependencies", () => {
   const result = assessPagerdutyIntegrationSecurity({
-    services: snapshot([
+    scope: accountScope(),
+    services: list([
       service("svc-1", {
         integrations: [
           { id: "int-1", summary: "Nagios", type: "nagios_inbound_integration" },
@@ -794,14 +1014,14 @@ test("assessPagerdutyIntegrationSecurity flags http webhooks, legacy integration
         ],
       }),
     ]),
-    extensions: snapshot([
+    extensions: list([
       { id: "ext-1", summary: "Legacy webhook", endpoint_url: "http://hooks.example.com/legacy", extension_schema: { summary: "Generic V2 Webhook" } },
     ]),
-    webhookSubscriptions: snapshot([{ id: "wh-1", active: true, delivery_method: { url: "http://siem.example.com/pd" } }]),
-    businessServices: snapshot([]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "http://siem.example.com/pd" } }]),
+    businessServices: list([]),
     businessServiceDependencies: snapshot({}),
-    changeEvents: snapshot([]),
-    changeWindow: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
+    changeEvents: list([]),
+    changeWindow: CHANGE_WINDOW,
   });
 
   assertStatuses(result, { 14: "fail", 15: "warn", 16: "warn", 21: "fail", 25: "fail" });
@@ -809,50 +1029,576 @@ test("assessPagerdutyIntegrationSecurity flags http webhooks, legacy integration
   assert.equal(findingById(result, 14).evidence.insecure_subscriptions.length, 1);
   assert.equal(findingById(result, 16).evidence.legacy_integrations.length, 1);
   assert.equal(findingById(result, 16).evidence.unfiltered_email_integrations.length, 1);
+  assert.match(findingById(result, 21).summary, /emptiness fails this control/);
+  assert.match(findingById(result, 25).summary, /emptiness fails this control/);
 });
 
 test("assessPagerdutyIntegrationSecurity warns on unmapped business services and idle change events", () => {
   const warned = assessPagerdutyIntegrationSecurity({
-    services: snapshot([service("svc-1")]),
-    extensions: snapshot([]),
-    webhookSubscriptions: snapshot([]),
-    businessServices: snapshot([{ id: "bs-1", name: "Checkout" }, { id: "bs-2", name: "Search" }]),
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([]),
+    webhookSubscriptions: list([]),
+    businessServices: list([{ id: "bs-1", name: "Checkout" }, { id: "bs-2", name: "Search" }]),
     businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }], "bs-2": [] }),
-    changeEvents: snapshot([]),
-    changeWindow: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
+    changeEvents: list([]),
+    changeWindow: CHANGE_WINDOW,
   });
-  assertStatuses(warned, { 21: "warn", 25: "warn" });
+  assertStatuses(warned, { 14: "manual", 15: "manual", 21: "warn", 25: "warn" });
   assert.deepEqual(findingById(warned, 21).evidence.unmapped_business_services, ["Search"]);
 
   const manual = assessPagerdutyIntegrationSecurity({
-    services: snapshot([], "PagerDuty request failed (403 Forbidden) for /services"),
-    extensions: snapshot([], "PagerDuty request failed (403 Forbidden) for /extensions"),
-    webhookSubscriptions: snapshot([]),
-    businessServices: snapshot([], "PagerDuty request failed (403 Forbidden) for /business_services"),
+    scope: accountScope(),
+    services: list([], "PagerDuty request failed (403 Forbidden) for /services"),
+    extensions: list([], "PagerDuty request failed (403 Forbidden) for /extensions"),
+    webhookSubscriptions: list([]),
+    businessServices: list([], "PagerDuty request failed (403 Forbidden) for /business_services"),
     businessServiceDependencies: snapshot({}),
-    changeEvents: snapshot([], "PagerDuty request failed (403 Forbidden) for /change_events"),
-    changeWindow: { since: "2026-08-22T00:00:00.000Z", until: NOW.toISOString() },
+    changeEvents: list([], "PagerDuty request failed (403 Forbidden) for /change_events"),
+    changeWindow: CHANGE_WINDOW,
   });
   assertStatuses(manual, { 14: "manual", 15: "manual", 16: "manual", 21: "manual", 25: "manual" });
   assert.equal(manual.errors.length, 4);
 });
 
 test("run*Assessment helpers collect from the client and together cover all 25 controls", async () => {
-  const client = healthyClient();
-  const results = await Promise.all([
-    runPagerdutyAccessControlAssessment(client, { maxAdmins: 3 }),
-    runPagerdutyIncidentResponseAssessment(client),
-    runPagerdutyOncallCoverageAssessment(client, { coverageDays: 30 }),
-    runPagerdutyAuditLoggingAssessment(client),
-    runPagerdutyIntegrationSecurityAssessment(client),
-  ]);
+  const { results, findings } = await runAllAssessments(healthyClient());
 
-  const ids = results.flatMap((result) => result.findings.map((item) => item.id)).sort();
-  assert.equal(ids.length, 25);
+  const ids = findings.map((item) => item.id).sort();
   assert.deepEqual(ids, PAGERDUTY_CONTROLS.map((item) => findingId(item.control)).sort());
   assert.deepEqual(results.flatMap((result) => result.errors), []);
-  const manualIds = results.flatMap((result) => result.findings.filter((item) => item.status === "manual").map((item) => item.id));
+  const manualIds = findings.filter((item) => item.status === "manual").map((item) => item.id);
   assert.deepEqual(manualIds.sort(), ["PD-01", "PD-13", "PD-24"]);
+  assert.deepEqual(findings.filter((item) => item.status === "warn" || item.status === "fail"), []);
+});
+
+test("verdict rule 1: forbidden or errored endpoints yield manual verdicts that name the cause and the evidence to collect", () => {
+  const forbidden = "PagerDuty request failed (403 Forbidden) for /users: Access Denied";
+  const result = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams"]),
+    users: list([], forbidden),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(result, { 2: "manual", 3: "manual", 4: "manual" });
+  for (const control of [2, 3, 4]) {
+    assert.match(findingById(result, control).summary, /users could not be read \(PagerDuty request failed \(403 Forbidden\)/);
+    assert.match(findingById(result, control).summary, /Users page|Teams/);
+  }
+
+  const teamsForbidden = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams"]),
+    users: list([user("owner-1", { role: "owner" }), user("user-1")]),
+    teams: list([], "PagerDuty request failed (403 Forbidden) for /teams"),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(teamsForbidden, { 2: "pass", 4: "manual" });
+  assert.match(findingById(teamsForbidden, 4).summary, /teams could not be read/);
+
+  const triggersDown = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
+    workflowTriggers: list([], "PagerDuty request failed (500 Internal Server Error) for /incident_workflows/triggers"),
+  });
+  assertStatuses(triggersDown, { 10: "manual" });
+  assert.match(findingById(triggersDown, 10).summary, /incident workflow triggers could not be read \(PagerDuty request failed \(500/);
+
+  const oncallsDown = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([coveredSchedule("sched-1")]),
+    oncalls: list([], "PagerDuty request failed (401 Unauthorized) for /oncalls"),
+    users: list([user("user-1"), user("user-2")]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(oncallsDown, { 8: "pass", 17: "pass", 18: "manual" });
+  assert.match(findingById(oncallsDown, 18).summary, /on-call entries could not be read \(PagerDuty request failed \(401/);
+});
+
+test("verdict rule 2: empty inventories never pass by default and each summary states why", () => {
+  const noUsers = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams"]),
+    users: list([]),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(noUsers, { 2: "manual", 3: "manual", 4: "manual" });
+  assert.match(findingById(noUsers, 2).summary, /Zero users were returned/);
+
+  const emptyAbilities = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot([]),
+    users: list([user("owner-1", { role: "owner" })]),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(emptyAbilities, { 1: "manual" });
+  assert.match(findingById(emptyAbilities, 1).summary, /empty ability list/);
+
+  const noServices = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([]),
+    escalationPolicies: list([]),
+    priorities: list([]),
+    incidentWorkflows: list([]),
+    workflowTriggers: list([]),
+  });
+  assertStatuses(noServices, { 5: "manual", 6: "manual", 7: "manual", 10: "fail", 19: "manual", 20: "fail", 22: "manual", 23: "manual" });
+  assert.match(findingById(noServices, 5).summary, /zero services/);
+  assert.match(findingById(noServices, 6).summary, /zero policies/);
+
+  const unattachedPolicies = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1", { services: [] })]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
+    workflowTriggers: list([{ id: "trig-1" }]),
+  });
+  assertStatuses(unattachedPolicies, { 6: "manual", 7: "manual" });
+  assert.match(findingById(unattachedPolicies, 6).summary, /none is attached to a service/);
+
+  const noSchedules = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([]),
+    scheduleDetails: snapshot([]),
+    oncalls: list([]),
+    users: list([]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(noSchedules, { 8: "manual", 9: "manual", 17: "manual", 18: "manual" });
+  assert.match(findingById(noSchedules, 8).summary, /zero schedules/);
+
+  const nobodyOnCall = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([coveredSchedule("sched-1")]),
+    oncalls: list([]),
+    users: list([user("user-1"), user("user-2")]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(nobodyOnCall, { 18: "manual" });
+  assert.match(findingById(nobodyOnCall, 18).summary, /no one on call right now/);
+
+  const noWebhooks = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([]),
+    extensions: list([]),
+    webhookSubscriptions: list([]),
+    businessServices: list([]),
+    businessServiceDependencies: snapshot({}),
+    changeEvents: list([]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(noWebhooks, { 14: "manual", 15: "manual", 16: "manual", 21: "fail", 25: "manual" });
+  assert.match(findingById(noWebhooks, 15).summary, /not applicable until a webhook exists/);
+  assert.match(findingById(noWebhooks, 21).summary, /emptiness fails this control/);
+
+  const zeroLegacyExtensions = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([{ id: "bs-1" }]),
+    businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }] }),
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(zeroLegacyExtensions, { 15: "pass" });
+  assert.match(findingById(zeroLegacyExtensions, 15).summary, /^0 extensions were read and none is a legacy generic webhook; 1 of 1 webhook subscriptions have active true/);
+
+  const extensionsUnreadable = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([], "PagerDuty request failed (403 Forbidden) for /extensions"),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([{ id: "bs-1" }]),
+    businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }] }),
+    changeEvents: list([]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(extensionsUnreadable, { 14: "manual", 15: "manual" });
+});
+
+test("verdict rule 3: out-of-scope controls and plan-gated features render manual with a plan or not applicable summary", () => {
+  const audit = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: list([], "PagerDuty request failed (402 Payment Required) for /audit/records: Audit Trail is not available on your plan"),
+    retentionProbe: list([], "PagerDuty request failed (402 Payment Required) for /audit/records"),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(audit, { 11: "manual", 12: "manual" });
+  assert.match(findingById(audit, 11).summary, /plan/);
+  assert.match(findingById(audit, 12).summary, /plan/);
+
+  const workflows = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([], "PagerDuty request failed (402 Payment Required) for /priorities"),
+    incidentWorkflows: list([], "PagerDuty request failed (402 Payment Required) for /incident_workflows"),
+    workflowTriggers: list([]),
+  });
+  assertStatuses(workflows, { 10: "manual", 20: "manual" });
+  assert.match(findingById(workflows, 10).summary, /not available on this account's plan/);
+  assert.match(findingById(workflows, 10).summary, /not applicable/);
+  assert.match(findingById(workflows, 20).summary, /plan/);
+
+  const business = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([{ id: "ext-1", endpoint_url: "https://hooks.example.com", extension_schema: { summary: "Slack V2" } }]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([], "PagerDuty request failed (402 Payment Required) for /business_services"),
+    businessServiceDependencies: snapshot({}),
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(business, { 21: "manual" });
+  assert.match(findingById(business, 21).summary, /not available on this account's plan/);
+
+  const analytics = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams", "advanced_analytics"]),
+    users: list([user("owner-1", { role: "owner" })]),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(analytics, { 1: "manual", 24: "manual" });
+  assert.match(findingById(analytics, 24).summary, /outside the API's scope/);
+});
+
+test("verdict rule 4: items missing dates are bucketed separately and cap the verdict at warn", () => {
+  const undatedSchedule = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([
+      coveredSchedule("sched-1", {
+        final_schedule: {
+          rendered_schedule_entries: [
+            { start: NOW.toISOString(), end: COVERAGE_UNTIL.toISOString(), user: { id: "user-1" } },
+            { start: NOW.toISOString(), end: null, user: { id: "user-2" } },
+          ],
+        },
+      }),
+    ]),
+    oncalls: list([{ user: { id: "user-1" } }]),
+    users: list([user("user-1"), user("user-2")]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(undatedSchedule, { 8: "warn" });
+  assert.deepEqual(findingById(undatedSchedule, 8).evidence.schedules_with_undated_entries, [{ schedule: "Schedule sched-1", entries_missing_dates: 1 }]);
+
+  const onlyUndatedSchedule = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([
+      coveredSchedule("sched-1", {
+        final_schedule: { rendered_schedule_entries: [{ start: null, end: null, user: { id: "user-1" } }] },
+      }),
+    ]),
+    oncalls: list([{ user: { id: "user-1" } }]),
+    users: list([user("user-1"), user("user-2")]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assert.notEqual(findingById(onlyUndatedSchedule, 8).status, "pass");
+
+  const undatedAudit = assessPagerdutyAuditLogging({
+    scope: accountScope(),
+    recentRecords: list([auditRecord("a1", null), auditRecord("a2", undefined)]),
+    retentionProbe: list([auditRecord("old-1", null)]),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(undatedAudit, { 11: "warn", 12: "warn" });
+  assert.equal(findingById(undatedAudit, 11).evidence.records_missing_execution_time, 2);
+  assert.equal(findingById(undatedAudit, 11).evidence.records_dated_in_window, 0);
+  assert.equal(findingById(undatedAudit, 12).evidence.probe_records_missing_execution_time, 1);
+
+  const undatedChangeEvents = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([{ id: "ext-1", endpoint_url: "https://hooks.example.com", extension_schema: { summary: "Slack V2" } }]),
+    webhookSubscriptions: list([{ id: "wh-1", active: true, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([{ id: "bs-1" }]),
+    businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }] }),
+    changeEvents: list([{ id: "chg-1", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(undatedChangeEvents, { 25: "warn" });
+  assert.equal(findingById(undatedChangeEvents, 25).evidence.change_events_missing_timestamp, 1);
+});
+
+test("verdict rule 5: partial inventories and partially scoped credentials downgrade pass to warn with seen and total counts", () => {
+  const truncatedUsers = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams"]),
+    users: partialList([user("owner-1", { role: "owner" }), user("user-1")]),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(truncatedUsers, { 2: "warn", 3: "warn", 4: "warn" });
+  assert.match(findingById(truncatedUsers, 2).summary, /Downgraded from pass to warn because the inventory is partial: users: 2 of 2500 seen \(stopped at the requested limit/);
+  assert.deepEqual(findingById(truncatedUsers, 2).evidence.partial_view, ["users: 2 of 2500 seen (stopped at the requested limit of 2 with more results available)"]);
+
+  const limitedKey = assessPagerdutyIncidentResponse({
+    scope: userScope("user"),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
+    workflowTriggers: list([{ id: "trig-1" }]),
+  });
+  assertStatuses(limitedKey, { 5: "warn", 6: "warn", 7: "warn", 10: "warn", 19: "warn", 20: "warn", 22: "warn", 23: "warn" });
+  assert.match(findingById(limitedKey, 5).summary, /user-level credential for me@example.com with role user only returns the objects that user can see/);
+
+  const adminKey = assessPagerdutyIncidentResponse({
+    scope: userScope("admin"),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
+    workflowTriggers: list([{ id: "trig-1" }]),
+  });
+  assertStatuses(adminKey, { 5: "pass", 20: "pass" });
+
+  const unknownScope = assessPagerdutyAuditLogging({
+    scope: snapshot({ kind: "unknown", fullVisibility: false }, "PagerDuty request failed (500 Internal Server Error) for /users/me"),
+    recentRecords: list([auditRecord("a1", "2026-09-20T10:00:00Z")]),
+    retentionProbe: list([auditRecord("old-1", "2025-10-01T00:00:00Z")]),
+    windows: AUDIT_WINDOWS,
+  });
+  assertStatuses(unknownScope, { 11: "warn", 12: "warn" });
+  assert.match(findingById(unknownScope, 11).summary, /credential scope could not be determined/);
+
+  const failStaysFail = assessPagerdutyIncidentResponse({
+    scope: userScope("user"),
+    services: partialList([service("svc-1", { escalation_policy: undefined })]),
+    escalationPolicies: list([escalationPolicy("ep-1")]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1", is_enabled: true }]),
+    workflowTriggers: list([{ id: "trig-1" }]),
+  });
+  assertStatuses(failStaysFail, { 5: "fail" });
+});
+
+test("verdict rule 6: absent or false enabling flags never support pass", () => {
+  const flags = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1", { integrations: undefined })]),
+    extensions: list([{ id: "ext-1", endpoint_url: "https://hooks.example.com" }]),
+    webhookSubscriptions: list([{ id: "wh-1", delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([{ id: "bs-1" }]),
+    businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }] }),
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(flags, { 14: "pass", 15: "warn", 16: "warn" });
+  assert.match(findingById(flags, 15).summary, /no extension_schema summary/);
+  assert.equal(findingById(flags, 15).evidence.subscriptions_missing_active_flag, 1);
+  assert.match(findingById(flags, 16).summary, /did not return the integrations expansion/);
+
+  const inactiveSubscription = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    extensions: list([{ id: "ext-1", endpoint_url: "https://hooks.example.com", extension_schema: { summary: "Slack V2" } }]),
+    webhookSubscriptions: list([{ id: "wh-1", active: false, delivery_method: { url: "https://siem.example.com/pd" } }]),
+    businessServices: list([{ id: "bs-1" }]),
+    businessServiceDependencies: snapshot({ "bs-1": [{ supporting_service: { id: "svc-1" } }] }),
+    changeEvents: list([{ id: "chg-1", timestamp: "2026-09-15T00:00:00Z", services: [{ id: "svc-1" }] }]),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assertStatuses(inactiveSubscription, { 15: "warn" });
+  assert.match(findingById(inactiveSubscription, 15).summary, /zero with active true/);
+
+  const contactFlags = assessPagerdutyOncallCoverage({
+    scope: accountScope(),
+    schedules: list([{ id: "sched-1" }]),
+    scheduleDetails: snapshot([coveredSchedule("sched-1")]),
+    oncalls: list([{ user: { id: "user-1" } }, { user: { id: "user-2" } }]),
+    users: list([
+      user("user-1", { contact_methods: [{ type: "phone_contact_method" }] }),
+      user("user-2", { contact_methods: [{ type: "phone_contact_method", enabled: true, blacklisted: true }, { type: "email_contact_method", enabled: true }] }),
+    ]),
+    coverageWindow: COVERAGE_WINDOW,
+  });
+  assertStatuses(contactFlags, { 18: "warn" });
+  assert.deepEqual(findingById(contactFlags, 18).evidence.oncall_unverifiable_methods, ["user-1@example.com"]);
+  assert.deepEqual(findingById(contactFlags, 18).evidence.oncall_email_only, ["user-2@example.com"]);
+
+  const escalationFlags = assessPagerdutyIncidentResponse({
+    scope: accountScope(),
+    services: list([service("svc-1")]),
+    escalationPolicies: list([
+      escalationPolicy("ep-1", { num_loops: undefined }),
+      escalationPolicy("ep-2", { escalation_rules: undefined }),
+    ]),
+    priorities: list([{ id: "p1", name: "P1" }]),
+    incidentWorkflows: list([{ id: "wf-1" }]),
+    workflowTriggers: list([{ id: "trig-1" }]),
+  });
+  assertStatuses(escalationFlags, { 6: "warn", 7: "fail", 10: "warn" });
+  assert.match(findingById(escalationFlags, 7).summary, /no rules or rules with no notification targets/);
+  assert.match(findingById(escalationFlags, 10).summary, /none is both enabled \(is_enabled true\)/);
+
+  const roleFlags = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso"]),
+    users: list([user("owner-1", { role: "owner" }), user("mystery-1", { role: undefined })]),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assertStatuses(roleFlags, { 2: "warn", 3: "warn", 4: "fail" });
+  assert.match(findingById(roleFlags, 2).summary, /1 users have no role field/);
+  assert.match(findingById(roleFlags, 4).summary, /"teams" ability is absent/);
+});
+
+test("verdict rule 7: pagination runs to completion or records truncation with totals", async () => {
+  const truncatedFetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const limit = Number(url.searchParams.get("limit") ?? "100");
+    const users = Array.from({ length: limit }, (_, index) => ({ id: `user-${offset + index}` }));
+    return jsonResponse({ users, limit, offset, more: true, total: 2500 });
+  };
+  const client = new PagerdutyApiClient(sampleConfig(), { fetchImpl: truncatedFetch });
+
+  const truncated = await client.listUsers(150);
+  assert.equal(truncated.items.length, 150);
+  assert.equal(truncated.complete, false);
+  assert.equal(truncated.total, 2500);
+  assert.match(truncated.truncation, /stopped at the requested limit of 150 with more results available/);
+
+  const ceiling = await client.listUsers(10000);
+  assert.equal(ceiling.items.length, 10000);
+  assert.equal(ceiling.complete, false);
+  assert.match(ceiling.truncation, /10000 record pagination ceiling/);
+
+  let cursorCalls = 0;
+  const cursorClient = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      cursorCalls += 1;
+      return jsonResponse({ records: [{ id: `rec-${cursorCalls}` }], next_cursor: `cursor-${cursorCalls + 1}` });
+    },
+  });
+  const cursorTruncated = await cursorClient.listAuditRecords(new Date("2026-09-01T00:00:00Z"), NOW, 3);
+  assert.equal(cursorTruncated.items.length, 3);
+  assert.equal(cursorTruncated.complete, false);
+  assert.match(cursorTruncated.truncation, /next_cursor still available/);
+
+  const paged = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      const page = [[{ id: "a" }], [{ id: "b" }], [{ id: "c" }]][offset] ?? [];
+      return jsonResponse({ services: page, more: offset < 2, total: 3 });
+    },
+  });
+  const complete = await paged.list("/services", "services", {}, { limit: 10, pageSize: 1 });
+  assert.deepEqual(complete.items.map((item) => item.id), ["a", "b", "c"]);
+  assert.equal(complete.complete, true);
+  assert.equal(complete.total, 3);
+
+  const assessment = assessPagerdutyAccessControl({
+    scope: accountScope(),
+    abilities: snapshot(["sso", "teams"]),
+    users: snapshot(truncated),
+    teams: list([{ id: "team-1" }]),
+    teamMembers: snapshot({}),
+  });
+  assert.notEqual(findingById(assessment, 3).status, "pass");
+  assert.match(findingById(assessment, 3).evidence.partial_view[0], /users: 150 of 2500 seen/);
+});
+
+test("verdict rule 8: re-running an export allocates a paired directory and zip instead of overwriting", async () => {
+  const base = createTempBase("grclanker-pagerduty-rerun-");
+  const first = await exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), base, { maxAdmins: 3 });
+  const firstZipBytes = readFileSync(first.zipPath);
+  const second = await exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), base, { maxAdmins: 3 });
+
+  assert.match(first.outputDir, /pagerduty-us-audit-bundle$/);
+  assert.match(first.zipPath, /pagerduty-us-audit-bundle\.zip$/);
+  assert.match(second.outputDir, /pagerduty-us-audit-bundle-2$/);
+  assert.match(second.zipPath, /pagerduty-us-audit-bundle-2\.zip$/);
+  assert.notEqual(first.zipPath, second.zipPath);
+  assert.ok(existsSync(first.zipPath));
+  assert.ok(existsSync(second.zipPath));
+  assert.deepEqual(readFileSync(first.zipPath), firstZipBytes, "the first archive must not be rewritten");
+
+  const third = await exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), base, { maxAdmins: 3 });
+  assert.match(third.zipPath, /pagerduty-us-audit-bundle-3\.zip$/);
+  assert.equal(readdirSync(base).filter((name) => name.endsWith(".zip")).length, 3);
+
+  const orphanBase = createTempBase("grclanker-pagerduty-orphan-zip-");
+  writeFileSync(join(orphanBase, "pagerduty-us-audit-bundle.zip"), "existing archive");
+  const skipped = await exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), orphanBase, { maxAdmins: 3 });
+  assert.match(skipped.outputDir, /pagerduty-us-audit-bundle-2$/);
+  assert.match(skipped.zipPath, /pagerduty-us-audit-bundle-2\.zip$/);
+  assert.equal(readFileSync(join(orphanBase, "pagerduty-us-audit-bundle.zip"), "utf8"), "existing archive");
+});
+
+test("false-pass self-check (a): every endpoint forbidden yields 25 manual findings and zero passes", async () => {
+  const { results, findings } = await runAllAssessments(forbiddenClient());
+  assertNoPass(findings, "forbidden fixture");
+  assert.equal(findings.filter((item) => item.status === "manual").length, 25);
+  for (const item of findings) {
+    assert.match(item.summary, /could not be read|has no endpoint|never exposes/, `${item.id} must name the cause: ${item.summary}`);
+  }
+  assert.ok(results.every((result) => result.errors.length > 0));
+});
+
+test("false-pass self-check (b): every list empty yields zero passes, with emptiness stated as fail or manual per control", async () => {
+  const { findings } = await runAllAssessments(emptyClient());
+  assertNoPass(findings, "empty fixture");
+  const byId = Object.fromEntries(findings.map((item) => [item.id, item.status]));
+  assert.deepEqual(byId, {
+    "PD-01": "manual",
+    "PD-02": "manual",
+    "PD-03": "manual",
+    "PD-04": "manual",
+    "PD-05": "manual",
+    "PD-06": "manual",
+    "PD-07": "manual",
+    "PD-08": "manual",
+    "PD-09": "manual",
+    "PD-10": "fail",
+    "PD-11": "warn",
+    "PD-12": "warn",
+    "PD-13": "manual",
+    "PD-14": "manual",
+    "PD-15": "manual",
+    "PD-16": "manual",
+    "PD-17": "manual",
+    "PD-18": "manual",
+    "PD-19": "manual",
+    "PD-20": "fail",
+    "PD-21": "fail",
+    "PD-22": "manual",
+    "PD-23": "manual",
+    "PD-24": "manual",
+    "PD-25": "manual",
+  });
+  for (const id of ["PD-10", "PD-20", "PD-21"]) {
+    assert.match(findings.find((item) => item.id === id).summary, /emptiness fails this control/);
+  }
+});
+
+test("false-pass self-check (c): partial inventories from a user-scoped key yield zero passes", async () => {
+  const { findings } = await runAllAssessments(partialClient());
+  assertNoPass(findings, "partial fixture");
+  const downgraded = findings.filter((item) => item.status === "warn");
+  assert.ok(downgraded.length >= 20, `expected most findings to be downgraded to warn, saw ${downgraded.length}`);
+  for (const item of downgraded) {
+    assert.match(item.summary, /Downgraded from pass to warn because the inventory is partial/, item.id);
+    assert.match(item.summary, /of 2500 seen|user-level credential/, item.id);
+    assert.ok(Array.isArray(item.evidence.partial_view) && item.evidence.partial_view.length > 0, `${item.id} evidence.partial_view`);
+  }
+  assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.id).sort(), ["PD-01", "PD-13", "PD-24"]);
 });
 
 test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports, and archive", async () => {
@@ -864,10 +1610,11 @@ test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports,
   assert.match(result.zipPath, /pagerduty-us-audit-bundle\.zip$/);
   assert.equal(result.findingCount, 25);
   assert.equal(result.errorCount, 0);
-  assert.ok(result.fileCount >= 36, `expected at least 36 files, saw ${result.fileCount}`);
+  assert.ok(result.fileCount >= 37, `expected at least 37 files, saw ${result.fileCount}`);
 
   const expectedFiles = [
     "core_data/access_check.json",
+    "core_data/credential_scope.json",
     "core_data/abilities.json",
     "core_data/users.json",
     "core_data/teams.json",
@@ -907,6 +1654,9 @@ test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports,
 
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
   assert.equal(findings.length, 25);
+  const users = JSON.parse(readFileSync(join(result.outputDir, "core_data", "users.json"), "utf8"));
+  assert.equal(users.complete, true);
+  assert.equal(users.items.length, 4);
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "analysis", "metadata.json"), "utf8"));
   assert.equal(metadata.region, "us");
   assert.equal(metadata.controls_total, 25);
@@ -938,7 +1688,9 @@ test("exportPagerdutyAuditBundle records partial collection failures in _errors.
 
   const second = await exportPagerdutyAuditBundle(client, sampleConfig({ region: "eu", baseUrl: "https://api.eu.pagerduty.com" }), base);
   assert.match(second.outputDir, /pagerduty-eu-audit-bundle-2$/);
+  assert.match(second.zipPath, /pagerduty-eu-audit-bundle-2\.zip$/);
   assert.ok(readdirSync(base).includes("pagerduty-eu-audit-bundle.zip"));
+  assert.ok(readdirSync(base).includes("pagerduty-eu-audit-bundle-2.zip"));
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
