@@ -1454,7 +1454,7 @@ test("verdict rule 6: absent or false enabling flags never support pass", () => 
   assertStatuses(escalationFlags, { 6: "warn", 7: "fail", 10: "warn" });
   assert.match(findingById(escalationFlags, 7).summary, /no rules or rules with no notification targets/);
   assert.match(findingById(escalationFlags, 10).summary, /0 with is_enabled true/);
-  assert.match(findingById(escalationFlags, 10).summary, /1 without the flag/);
+  assert.match(findingById(escalationFlags, 10).summary, /0 enabled, 0 disabled, 1 unresolved/);
 
   const roleFlags = assessPagerdutyAccessControl({
     scope: accountScope(),
@@ -1622,23 +1622,24 @@ function incidentResponseWith(triggers, workflows = [{ id: "wf-1", is_enabled: t
   });
 }
 
-test("review fix 1: PD-10 counts only triggers with is_disabled false and treats a missing flag as unverifiable", () => {
+test("review fix 1: PD-10 rejects is_disabled true and treats a trigger with no resolvable state as unverifiable", () => {
   const disabledTrigger = incidentResponseWith([{ id: "trig-1", is_disabled: true }]);
   assertStatuses(disabledTrigger, { 10: "warn" });
   assert.match(findingById(disabledTrigger, 10).summary, /1 with is_enabled true/);
-  assert.match(findingById(disabledTrigger, 10).summary, /0 with is_disabled false, 1 with is_disabled true, 0 without the flag/);
+  assert.match(findingById(disabledTrigger, 10).summary, /0 enabled, 1 disabled, 0 unresolved/);
   assert.equal(findingById(disabledTrigger, 10).evidence.enabled_triggers, 0);
   assert.equal(findingById(disabledTrigger, 10).evidence.disabled_triggers, 1);
 
   const missingFlag = incidentResponseWith([{ id: "trig-1" }]);
   assertStatuses(missingFlag, { 10: "warn" });
-  assert.match(findingById(missingFlag, 10).summary, /0 with is_disabled false, 0 with is_disabled true, 1 without the flag/);
-  assert.match(findingById(missingFlag, 10).summary, /cannot be confirmed as enabled/);
+  assert.match(findingById(missingFlag, 10).summary, /0 enabled, 0 disabled, 1 unresolved/);
+  assert.match(findingById(missingFlag, 10).summary, /could not be matched to a returned workflow with an is_enabled value/);
   assert.equal(findingById(missingFlag, 10).evidence.triggers_missing_is_disabled_flag, 1);
+  assert.deepEqual(findingById(missingFlag, 10).evidence.unresolved_triggers, ["trig-1"]);
 
   const mixed = incidentResponseWith([{ id: "trig-1", is_disabled: false }, { id: "trig-2" }]);
   assertStatuses(mixed, { 10: "warn" });
-  assert.match(findingById(mixed, 10).summary, /1 with is_disabled false, 0 with is_disabled true, 1 without the flag/);
+  assert.match(findingById(mixed, 10).summary, /1 enabled, 0 disabled, 1 unresolved/);
 
   const disabledWorkflow = incidentResponseWith([{ id: "trig-1", is_disabled: false }], [{ id: "wf-1", is_enabled: false }]);
   assertStatuses(disabledWorkflow, { 10: "warn" });
@@ -1646,12 +1647,63 @@ test("review fix 1: PD-10 counts only triggers with is_disabled false and treats
 
   const verified = incidentResponseWith([{ id: "trig-1", is_disabled: false }, { id: "trig-2", is_disabled: true }]);
   assertStatuses(verified, { 10: "pass" });
-  assert.match(findingById(verified, 10).summary, /1 incident workflows with is_enabled true \(of 1 incident workflows\) and 1 triggers with is_disabled false \(of 2 incident workflow triggers\)/);
+  assert.match(findingById(verified, 10).summary, /1 incident workflows with is_enabled true \(of 1 incident workflows\) and 1 enabled triggers \(of 2 incident workflow triggers; 1 verified by is_disabled false, 0 by the parent workflow's is_enabled\)/);
   assert.equal(findingById(verified, 10).evidence.enabled_triggers, 1);
   assert.equal(findingById(verified, 10).evidence.disabled_triggers, 1);
+  assert.deepEqual(findingById(verified, 10).evidence.unresolved_triggers, []);
   assert.equal(findingById(verified, 10).evidence.triggers_missing_is_disabled_flag, 0);
   assert.equal(verified.summary.workflow_triggers_seen, 2);
   assert.equal(verified.summary.enabled_workflow_triggers, 1);
+});
+
+test("review fix 5: PD-10 resolves a trigger without is_disabled through its parent workflow's is_enabled", async () => {
+  const workflows = [{ id: "wf-1", is_enabled: true }, { id: "wf-2", is_enabled: true }];
+  const reference = (id) => ({ id, type: "workflow_reference" });
+
+  const documentedPayload = incidentResponseWith(
+    [{ id: "trig-1", workflow: reference("wf-1") }, { id: "trig-2", workflow: reference("wf-2") }],
+    workflows,
+  );
+  assertStatuses(documentedPayload, { 10: "pass" });
+  assert.match(findingById(documentedPayload, 10).summary, /2 enabled triggers \(of 2 incident workflow triggers; 0 verified by is_disabled false, 2 by the parent workflow's is_enabled\)/);
+  assert.equal(findingById(documentedPayload, 10).evidence.triggers_missing_is_disabled_flag, 2);
+  assert.equal(findingById(documentedPayload, 10).evidence.triggers_verified_by_parent_workflow, 2);
+  assert.deepEqual(findingById(documentedPayload, 10).evidence.unresolved_triggers, []);
+
+  const unresolvableParent = incidentResponseWith(
+    [{ id: "trig-1", workflow: reference("wf-1") }, { id: "trig-9", summary: "Orphan trigger", workflow: reference("wf-missing") }],
+    workflows,
+  );
+  assertStatuses(unresolvableParent, { 10: "warn" });
+  assert.match(findingById(unresolvableParent, 10).summary, /1 enabled, 0 disabled, 1 unresolved/);
+  assert.match(findingById(unresolvableParent, 10).summary, /could not be matched to a returned workflow with an is_enabled value/);
+  assert.deepEqual(findingById(unresolvableParent, 10).evidence.unresolved_triggers, ["Orphan trigger"]);
+
+  const parentWithoutFlag = incidentResponseWith([{ id: "trig-1", workflow: reference("wf-1") }], [{ id: "wf-1" }]);
+  assertStatuses(parentWithoutFlag, { 10: "warn" });
+  assert.match(findingById(parentWithoutFlag, 10).summary, /0 enabled, 0 disabled, 1 unresolved/);
+
+  const disabledParent = incidentResponseWith(
+    [{ id: "trig-1", workflow: reference("wf-1") }, { id: "trig-2", is_disabled: false, workflow: reference("wf-1") }],
+    [{ id: "wf-1", is_enabled: false }, { id: "wf-2", is_enabled: true }],
+  );
+  assertStatuses(disabledParent, { 10: "warn" });
+  assert.match(findingById(disabledParent, 10).summary, /0 enabled, 2 disabled, 0 unresolved/);
+
+  const explicitTrueStillRejected = incidentResponseWith([{ id: "trig-1", is_disabled: true, workflow: reference("wf-1") }], workflows);
+  assertStatuses(explicitTrueStillRejected, { 10: "warn" });
+  assert.match(findingById(explicitTrueStillRejected, 10).summary, /0 enabled, 1 disabled, 0 unresolved/);
+
+  const fixtures = healthyFixtures();
+  const documentedClient = healthyClient({
+    async listIncidentWorkflowTriggers() {
+      return collectionOf([{ id: "trig-1", trigger_type: "conditional", workflow: reference("wf-1"), services: [{ id: "svc-1" }] }]);
+    },
+  });
+  const { findings } = await runAllAssessments(documentedClient);
+  assert.equal(findings.filter((item) => item.status === "pass").length, 22, "a payload that omits is_disabled still reaches every automatable pass");
+  assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.id).sort(), ["PD-01", "PD-13", "PD-24"]);
+  assert.equal(fixtures.incidentWorkflows[0].is_enabled, true);
 });
 
 test("review fix 2: audit_limit tool parameter, DEFAULT_AUDIT_LIMIT, and the integration guide agree", () => {

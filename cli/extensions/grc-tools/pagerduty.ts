@@ -1422,6 +1422,32 @@ function urgencySummary(service: JsonRecord): string {
   return `${type}:${asString(rule.urgency) ?? "unknown"}`;
 }
 
+type WorkflowTriggerState = "enabled" | "disabled" | "unresolved";
+type WorkflowTriggerSource = "is_disabled" | "workflow.is_enabled";
+
+interface WorkflowTriggerClass {
+  trigger: JsonRecord;
+  state: WorkflowTriggerState;
+  source?: WorkflowTriggerSource;
+}
+
+/**
+ * The trigger `is_disabled` boolean is optional and deprecated in the OpenAPI reference, documented as
+ * inherited from the owning workflow's `is_enabled`. An explicit `is_disabled: true` is always rejected
+ * while the field is served. Otherwise the parent workflow referenced by `trigger.workflow.id` is the
+ * source of truth when it was returned with an `is_enabled` value; an explicit `is_disabled: false` is
+ * accepted only when no parent is available to contradict it. A trigger with neither is unresolved.
+ */
+function classifyWorkflowTrigger(trigger: JsonRecord, workflowsById: Map<string, JsonRecord>): WorkflowTriggerClass {
+  if (trigger.is_disabled === true) return { trigger, state: "disabled", source: "is_disabled" };
+  const parent = workflowsById.get(referenceId(trigger.workflow) ?? "");
+  if (parent && typeof parent.is_enabled === "boolean") {
+    return { trigger, state: parent.is_enabled ? "enabled" : "disabled", source: "workflow.is_enabled" };
+  }
+  if (trigger.is_disabled === false) return { trigger, state: "enabled", source: "is_disabled" };
+  return { trigger, state: "unresolved" };
+}
+
 export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseData): PagerdutyAssessmentResult {
   const services = inventory("services", data.services);
   const policies = inventory("escalation policies", data.escalationPolicies);
@@ -1442,11 +1468,19 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
   const missingLoops = attachedPolicies.filter((policy) => asNumber(policy.num_loops) === undefined);
   const nonRepeatingPolicies = attachedPolicies.filter((policy) => (asNumber(policy.num_loops) ?? 0) === 0);
   const enabledWorkflows = workflows.items.filter((workflow) => workflow.is_enabled === true);
-  const enabledTriggers = triggers.items.filter((trigger) => trigger.is_disabled === false);
-  const disabledTriggers = triggers.items.filter((trigger) => trigger.is_disabled === true);
-  const triggersMissingDisabledFlag = triggers.items.filter((trigger) => typeof trigger.is_disabled !== "boolean");
-  const automationVerified = enabledWorkflows.length > 0 && enabledTriggers.length > 0 && triggersMissingDisabledFlag.length === 0;
-  const triggerCounts = `${countSeen(triggers)} (${enabledTriggers.length} with is_disabled false, ${disabledTriggers.length} with is_disabled true, ${triggersMissingDisabledFlag.length} without the flag)`;
+  const workflowsById = new Map<string, JsonRecord>();
+  for (const workflow of workflows.items) {
+    const id = asString(workflow.id);
+    if (id) workflowsById.set(id, workflow);
+  }
+  const triggerClasses = triggers.items.map((trigger) => classifyWorkflowTrigger(trigger, workflowsById));
+  const enabledTriggers = triggerClasses.filter((item) => item.state === "enabled");
+  const disabledTriggers = triggerClasses.filter((item) => item.state === "disabled");
+  const unresolvedTriggers = triggerClasses.filter((item) => item.state === "unresolved");
+  const triggersVerifiedByParent = enabledTriggers.filter((item) => item.source === "workflow.is_enabled").length;
+  const triggersMissingDisabledFlag = triggers.items.filter((trigger) => typeof trigger.is_disabled !== "boolean").length;
+  const automationVerified = enabledWorkflows.length > 0 && enabledTriggers.length > 0 && unresolvedTriggers.length === 0;
+  const triggerCounts = `${countSeen(triggers)} (${enabledTriggers.length} enabled, ${disabledTriggers.length} disabled, ${unresolvedTriggers.length} unresolved)`;
   const legacyResponsePlays = services.items.filter((service) => asArray(service.response_play).length > 0 || asObject(service.response_play));
   const urgencyModes = active.map(urgencySummary);
   const constantHighOnly = urgencyModes.length > 0 && urgencyModes.every((mode) => mode === "constant:high");
@@ -1540,9 +1574,9 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         : !triggers.readable
           ? unreadable(triggers, "Record which services each Incident Workflow is triggered from in the web app.")
           : automationVerified
-            ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${enabledTriggers.length} triggers with is_disabled false (of ${countSeen(triggers)}) are configured (response plays are deprecated in the REST API; ${legacyResponsePlays.length} services still reference one).`
+            ? `${enabledWorkflows.length} incident workflows with is_enabled true (of ${countSeen(workflows)}) and ${enabledTriggers.length} enabled triggers (of ${countSeen(triggers)}; ${enabledTriggers.length - triggersVerifiedByParent} verified by is_disabled false, ${triggersVerifiedByParent} by the parent workflow's is_enabled) are configured (response plays are deprecated in the REST API; ${legacyResponsePlays.length} services still reference one).`
             : workflows.items.length > 0 || triggers.items.length > 0 || legacyResponsePlays.length > 0
-              ? `${countSeen(workflows)} (${enabledWorkflows.length} with is_enabled true) and ${triggerCounts} were read, so automated incident response is not verified${triggersMissingDisabledFlag.length > 0 ? " because a trigger without the is_disabled flag cannot be confirmed as enabled" : ""}; ${legacyResponsePlays.length} services reference deprecated response plays. Confirm workflow and trigger state in Automation > Incident Workflows.`
+              ? `${countSeen(workflows)} (${enabledWorkflows.length} with is_enabled true) and ${triggerCounts} were read, so automated incident response is not verified${unresolvedTriggers.length > 0 ? " because a trigger without the is_disabled flag could not be matched to a returned workflow with an is_enabled value" : ""}; ${legacyResponsePlays.length} services reference deprecated response plays. Confirm workflow and trigger state in Automation > Incident Workflows.`
               : `The Incident Workflows API is readable and returned zero workflows and zero triggers, and no service references a response play, so no automated incident response is configured; emptiness fails this control.`,
       {
         incident_workflows_seen: workflows.seen,
@@ -1550,7 +1584,9 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
         triggers_seen: triggers.seen,
         enabled_triggers: enabledTriggers.length,
         disabled_triggers: disabledTriggers.length,
-        triggers_missing_is_disabled_flag: triggersMissingDisabledFlag.length,
+        unresolved_triggers: unresolvedTriggers.slice(0, 25).map((item) => nameOf(item.trigger)),
+        triggers_missing_is_disabled_flag: triggersMissingDisabledFlag,
+        triggers_verified_by_parent_workflow: triggersVerifiedByParent,
         services_with_legacy_response_plays: legacyResponsePlays.slice(0, 25).map(nameOf),
       },
       partialNotes(data.scope, workflows, triggers),
