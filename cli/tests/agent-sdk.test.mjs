@@ -325,7 +325,9 @@ test("agent instructions compose SYSTEM.md with the Agent SDK runtime note", () 
   assert.ok(markdown.startsWith(systemPrompt));
   assert.match(markdown, /## Cursor Agent SDK Runtime/);
   assert.match(markdown, /`investigate`, `audit`, `assess`, and `validate`/);
-  assert.match(markdown, /`auditor` and `verifier` personas are available as subagents/);
+  assert.match(markdown, /Delegate to the `auditor` subagent once evidence is gathered/);
+  assert.match(markdown, /Delegate to the `verifier` subagent before reporting findings/);
+  assert.match(markdown, /resolve relative paths against the working directory of the `agent-sdk` process/);
 });
 
 test("workflow prompts and the bundled skill map onto skill configs", () => {

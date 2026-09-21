@@ -50,6 +50,12 @@ The Agent SDK default model applies unless `GRCLANKER_AGENT_SDK_MODEL` names a C
 
 Session state, traces, and eval batches land in `cli/agent-sdk/.agent-serve/`, which is gitignored.
 
+## Where exported files land
+
+Server tools run inside the `agent-sdk` process, so a relative `output_dir`, `workspace_dir`, or `zip_path` resolves against that process's working directory (`cli/` when you use the npm scripts), not against the model's session workspace under `~/.cache/agent-serve/agent-sdk/`. The defaults are the same as in the CLI: exporters write under `./export/<domain>/` and the OSCAL tools use `./oscal-workspace/`. Every writer returns the absolute paths it created, and the runtime note tells the model to pass an absolute path when files must land in its workspace. Both directories are gitignored.
+
+`agent-sdk info --json` writes its 107-tool payload with an unawaited stdout write, so pipe it to a file rather than another process (`npm --prefix cli run -s agent-sdk:info -- --json > /tmp/info.json`); a pipe truncates the output at 64 KiB. The `test:agent-sdk:validate` script captures it through a file descriptor for this reason.
+
 ## Keep the tool entries in sync
 
 The Agent SDK derives tool names from filenames, so `cli/agent-sdk/agent/tools/` holds one generated entry per domain tool. After adding or renaming a tool in `cli/extensions/grc-tools/`, regenerate them:
@@ -65,4 +71,4 @@ npm --prefix cli run sync:agent-sdk-tools
 - Source checkout only: the published `@grclanker/cli` package and the release bundles do not include the Agent SDK project or `@cursor/july`.
 - `@cursor/july` is early alpha and pinned to an exact version in `cli/package.json`; expect to bump it deliberately.
 - Turns run on the local Cursor harness (`runtime: "local"`). The cloud runtime is not configured because in-process server tools only run on local turns.
-- `agent-sdk` requires Node 22.13 or newer and must run under Node, not Bun.
+- Node 22.19 or newer, the CLI package's `engines` floor, and never Bun. `@cursor/july` itself accepts 22.13, but the grclanker tools it loads require 22.19.
