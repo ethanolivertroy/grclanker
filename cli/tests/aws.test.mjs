@@ -15,15 +15,18 @@ import {
   assessAwsDataProtection,
   assessAwsIdentity,
   assessAwsLoggingDetection,
+  assessAwsNetworkSecurity,
   assessAwsOrgGuardrails,
   buildAwsMappings,
   checkAwsAccess,
   exportAwsAuditBundle,
   isAwsAccessDenied,
+  permissiveNaclEntries,
   resolveAwsConfiguration,
   resolveRegionScope,
   resolveSecureOutputPath,
   statementDeniesInsecureTransport,
+  unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
 
 function createTempBase(prefix) {
@@ -117,6 +120,54 @@ function compliantDataProtectionClient(overrides = {}) {
     },
     async getKeyRotationStatus() {
       return { KeyRotationEnabled: true, RotationPeriodInDays: 365 };
+    },
+    ...overrides,
+  };
+}
+
+/** Fixture (d) for network security: locked-down NACLs and security groups with flow logs on every VPC. */
+function compliantNetworkClient(overrides = {}) {
+  return {
+    getResolvedConfig: () => sampleConfig(),
+    async describeRegions() {
+      return ["us-east-1", "us-west-2"];
+    },
+    async describeVpcs(region) {
+      return { items: [{ VpcId: `vpc-${region}`, IsDefault: false, CidrBlock: "10.0.0.0/16" }], truncated: false };
+    },
+    async describeFlowLogs(region) {
+      return { items: [{ FlowLogId: `fl-${region}`, ResourceId: `vpc-${region}`, FlowLogStatus: "ACTIVE", TrafficType: "ALL", LogDestinationType: "s3" }], truncated: false };
+    },
+    async describeNetworkAcls(region) {
+      return {
+        items: [{
+          NetworkAclId: `acl-${region}`,
+          VpcId: `vpc-${region}`,
+          IsDefault: true,
+          Entries: [
+            { RuleNumber: 100, Protocol: "6", RuleAction: "allow", Egress: false, CidrBlock: "10.0.0.0/8", PortRange: { From: 22, To: 22 } },
+            { RuleNumber: 110, Protocol: "6", RuleAction: "allow", Egress: false, CidrBlock: "0.0.0.0/0", PortRange: { From: 443, To: 443 } },
+            { RuleNumber: 120, Protocol: "6", RuleAction: "deny", Egress: false, CidrBlock: "0.0.0.0/0", PortRange: { From: 22, To: 22 } },
+            { RuleNumber: 100, Protocol: "-1", RuleAction: "allow", Egress: true, CidrBlock: "0.0.0.0/0" },
+            { RuleNumber: 32767, Protocol: "-1", RuleAction: "deny", Egress: false, CidrBlock: "0.0.0.0/0" },
+          ],
+        }],
+        truncated: false,
+      };
+    },
+    async describeSecurityGroups(region) {
+      return {
+        items: [{
+          GroupId: `sg-${region}`,
+          GroupName: "web",
+          VpcId: `vpc-${region}`,
+          IpPermissions: [
+            { IpProtocol: "tcp", FromPort: 443, ToPort: 443, IpRanges: [{ CidrIp: "0.0.0.0/0" }], Ipv6Ranges: [{ CidrIpv6: "::/0" }] },
+            { IpProtocol: "tcp", FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: "203.0.113.0/24" }], Ipv6Ranges: [] },
+          ],
+        }],
+        truncated: false,
+      };
     },
     ...overrides,
   };
@@ -696,4 +747,190 @@ test("assessAwsDataProtection warns when customer keys exist but none can auto-r
   assert.equal(publicAccess.status, "warn");
   assert.match(publicAccess.summary, /restricted by RestrictPublicBuckets/);
   assert.equal(result.summary.regions_total, 1);
+});
+
+test("permissiveNaclEntries and unrestrictedSecurityGroupRules read protocol, ports, and world sources", () => {
+  const ports = [22, 3389];
+  const acl = {
+    Entries: [
+      { RuleNumber: 100, Protocol: "-1", RuleAction: "allow", Egress: false, CidrBlock: "0.0.0.0/0" },
+      { RuleNumber: 110, Protocol: "6", RuleAction: "allow", Egress: false, Ipv6CidrBlock: "::/0", PortRange: { From: 3000, To: 4000 } },
+      { RuleNumber: 120, Protocol: "17", RuleAction: "allow", Egress: false, CidrBlock: "0.0.0.0/0" },
+      { RuleNumber: 130, Protocol: "6", RuleAction: "allow", Egress: false, CidrBlock: "0.0.0.0/0", PortRange: { From: 80, To: 80 } },
+      { RuleNumber: 140, Protocol: "6", RuleAction: "allow", Egress: true, CidrBlock: "0.0.0.0/0", PortRange: { From: 22, To: 22 } },
+      { RuleNumber: 150, Protocol: "1", RuleAction: "allow", Egress: false, CidrBlock: "0.0.0.0/0" },
+    ],
+  };
+  const permissive = permissiveNaclEntries(acl, ports);
+  assert.deepEqual(permissive.map((entry) => entry.RuleNumber), [100, 110, 120]);
+  assert.equal(permissive[0].exposed_ports, "all");
+  assert.deepEqual(permissive[1].exposed_ports, [3389]);
+  assert.deepEqual(permissive[2].exposed_ports, [22, 3389]);
+
+  const group = {
+    IpPermissions: [
+      { IpProtocol: "-1", IpRanges: [{ CidrIp: "0.0.0.0/0" }], Ipv6Ranges: [] },
+      { IpProtocol: "tcp", FromPort: 3389, ToPort: 3389, IpRanges: [], Ipv6Ranges: [{ CidrIpv6: "::/0" }] },
+      { IpProtocol: "tcp", FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: "10.0.0.0/8" }], Ipv6Ranges: [] },
+      { IpProtocol: "tcp", FromPort: 443, ToPort: 443, IpRanges: [{ CidrIp: "0.0.0.0/0" }], Ipv6Ranges: [] },
+      { IpProtocol: "icmp", FromPort: -1, ToPort: -1, IpRanges: [{ CidrIp: "0.0.0.0/0" }], Ipv6Ranges: [] },
+    ],
+  };
+  const unrestricted = unrestrictedSecurityGroupRules(group, ports);
+  assert.equal(unrestricted.length, 2);
+  assert.deepEqual(unrestricted[0].sources, ["0.0.0.0/0"]);
+  assert.equal(unrestricted[0].exposed_ports, "all");
+  assert.deepEqual(unrestricted[1].sources, ["::/0"]);
+  assert.deepEqual(unrestricted[1].exposed_ports, [3389]);
+});
+
+test("assessAwsNetworkSecurity fixture (d): compliant account passes every network control", async () => {
+  const result = await assessAwsNetworkSecurity(compliantNetworkClient());
+  assert.deepEqual(statusMap(result), {
+    "AWS-NET-14": "pass",
+    "AWS-NET-20": "pass",
+    "AWS-NET-21": "pass",
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.summary.vpcs, 2);
+  assert.equal(result.summary.network_acls, 2);
+  assert.equal(result.summary.security_groups, 2);
+  assert.ok(findingById(result, "AWS-NET-21").mappings.includes("CIS AWS 5.2"));
+  assert.ok(findingById(result, "AWS-NET-14").mappings.includes("FedRAMP AU-12"));
+});
+
+test("assessAwsNetworkSecurity fails on missing flow logs, open NACLs, and open security groups", async () => {
+  const client = compliantNetworkClient({
+    async describeVpcs(region) {
+      return { items: [{ VpcId: `vpc-${region}`, IsDefault: true }, { VpcId: `vpc-${region}-b`, IsDefault: false }], truncated: false };
+    },
+    async describeFlowLogs(region) {
+      return {
+        items: [
+          { FlowLogId: "fl-1", ResourceId: `vpc-${region}`, FlowLogStatus: "ACTIVE" },
+          { FlowLogId: "fl-2", ResourceId: `vpc-${region}-b`, FlowLogStatus: "INACTIVE" },
+        ],
+        truncated: false,
+      };
+    },
+    async describeNetworkAcls(region) {
+      return {
+        items: [{
+          NetworkAclId: `acl-${region}`,
+          VpcId: `vpc-${region}`,
+          IsDefault: true,
+          Entries: [{ RuleNumber: 100, Protocol: "-1", RuleAction: "allow", Egress: false, CidrBlock: "0.0.0.0/0" }],
+        }],
+        truncated: false,
+      };
+    },
+    async describeSecurityGroups(region) {
+      return {
+        items: [{
+          GroupId: `sg-${region}`,
+          GroupName: "bastion",
+          IpPermissions: [{ IpProtocol: "tcp", FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: "0.0.0.0/0" }], Ipv6Ranges: [] }],
+        }],
+        truncated: false,
+      };
+    },
+  });
+  const result = await assessAwsNetworkSecurity(client, { sensitivePorts: [22, 3389] });
+  assert.deepEqual(statusMap(result), {
+    "AWS-NET-14": "fail",
+    "AWS-NET-20": "fail",
+    "AWS-NET-21": "fail",
+  });
+  const flowLogs = findingById(result, "AWS-NET-14");
+  assert.match(flowLogs.summary, /2\/4 VPCs/);
+  assert.deepEqual(flowLogs.evidence.vpcs_without_active_flow_logs.map((row) => row.vpc_id), ["vpc-us-east-1-b", "vpc-us-west-2-b"]);
+  const acls = findingById(result, "AWS-NET-20");
+  assert.match(acls.summary, /2 of them are default NACLs/);
+  assert.equal(acls.evidence.permissive_network_acls[0].entries[0].exposed_ports, "all");
+  const groups = findingById(result, "AWS-NET-21");
+  assert.deepEqual(groups.evidence.sensitive_ports, [22, 3389]);
+  assert.deepEqual(groups.evidence.unrestricted_security_groups[0].rules[0].exposed_ports, [22]);
+});
+
+test("assessAwsNetworkSecurity never passes when every surface is AccessDenied", async () => {
+  const deny = async () => {
+    throw accessDenied("UnauthorizedOperation");
+  };
+  const result = await assessAwsNetworkSecurity({
+    getResolvedConfig: () => sampleConfig(),
+    describeRegions: deny,
+    describeVpcs: deny,
+    describeFlowLogs: deny,
+    describeNetworkAcls: deny,
+    describeSecurityGroups: deny,
+  });
+  for (const item of result.findings) {
+    assert.equal(item.status, "manual", `${item.id} must be manual, saw ${item.status}`);
+    assert.match(item.summary, /could not be listed/);
+  }
+  assert.equal(result.summary.regions_seen, 1);
+  assert.ok(result.errors.some((line) => line.startsWith("ec2:DescribeVpcs us-east-1: AccessDenied")));
+  assert.ok(result.errors.some((line) => line.startsWith("ec2:DescribeSecurityGroups us-east-1: AccessDenied")));
+});
+
+test("assessAwsNetworkSecurity treats empty inventories as manual with the reason stated", async () => {
+  const empty = async () => ({ items: [], truncated: false });
+  const result = await assessAwsNetworkSecurity(compliantNetworkClient({
+    describeVpcs: empty,
+    describeFlowLogs: empty,
+    describeNetworkAcls: empty,
+    describeSecurityGroups: empty,
+  }));
+  assert.deepEqual(statusMap(result), {
+    "AWS-NET-14": "manual",
+    "AWS-NET-20": "manual",
+    "AWS-NET-21": "manual",
+  });
+  assert.match(findingById(result, "AWS-NET-14").summary, /No VPCs were found in 2 region/);
+  assert.match(findingById(result, "AWS-NET-20").summary, /Every VPC has a default NACL/);
+  assert.match(findingById(result, "AWS-NET-21").summary, /Every VPC has a default security group/);
+});
+
+test("assessAwsNetworkSecurity caps partial regions, unreadable flow logs, and truncation at warn", async () => {
+  const client = compliantNetworkClient({
+    async describeRegions() {
+      return ["us-east-1", "us-west-2", "eu-west-1"];
+    },
+    async describeVpcs(region) {
+      return {
+        items: [{ VpcId: `vpc-${region}` }, { VpcId: `vpc-${region}-b` }],
+        truncated: region === "us-west-2",
+      };
+    },
+    async describeFlowLogs(region) {
+      if (region === "us-west-2") throw accessDenied("UnauthorizedOperation");
+      return {
+        items: [
+          { ResourceId: `vpc-${region}`, FlowLogStatus: "ACTIVE" },
+          { ResourceId: `vpc-${region}-b`, FlowLogStatus: "ACTIVE" },
+        ],
+        truncated: false,
+      };
+    },
+    async describeNetworkAcls(region) {
+      if (region === "us-west-2") throw accessDenied("UnauthorizedOperation");
+      return { items: [{ NetworkAclId: `acl-${region}`, Entries: [] }], truncated: false };
+    },
+    async describeSecurityGroups(region) {
+      return { items: [{ GroupId: `sg-${region}`, IpPermissions: [] }], truncated: region === "us-east-1" };
+    },
+  });
+  const result = await assessAwsNetworkSecurity(client, { regionLimit: 2 });
+  assert.deepEqual(statusMap(result), {
+    "AWS-NET-14": "warn",
+    "AWS-NET-20": "warn",
+    "AWS-NET-21": "warn",
+  });
+  assert.match(findingById(result, "AWS-NET-14").summary, /2 VPC\(s\) could not be verified/);
+  assert.match(findingById(result, "AWS-NET-14").summary, /only 2 of 3 regions assessed/);
+  assert.match(findingById(result, "AWS-NET-20").summary, /DescribeNetworkAcls unreadable in 1 region/);
+  assert.match(findingById(result, "AWS-NET-21").summary, /security group inventory truncated in 1 region/);
+  assert.equal(result.summary.regions_seen, 2);
+  assert.equal(result.summary.regions_total, 3);
+  assert.ok(result.errors.some((line) => /ec2:DescribeVpcs us-west-2: inventory truncated/.test(line)));
 });

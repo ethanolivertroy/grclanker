@@ -23,7 +23,11 @@ import {
 } from "@aws-sdk/client-config-service";
 import { fromIni } from "@aws-sdk/credential-providers";
 import {
+  DescribeFlowLogsCommand,
+  DescribeNetworkAclsCommand,
   DescribeRegionsCommand,
+  DescribeSecurityGroupsCommand,
+  DescribeVpcsCommand,
   EC2Client,
   GetEbsEncryptionByDefaultCommand,
 } from "@aws-sdk/client-ec2";
@@ -101,7 +105,11 @@ const DEFAULT_REGION_LIMIT = 30;
 const DEFAULT_BUCKET_LIMIT = 1000;
 const DEFAULT_KEY_LIMIT = 1000;
 const DEFAULT_INSTANCE_LIMIT = 500;
+const DEFAULT_RESOURCE_LIMIT = 2000;
 const DEFAULT_CONCURRENCY = 8;
+const DEFAULT_SENSITIVE_PORTS = [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017];
+const ANY_IPV4 = "0.0.0.0/0";
+const ANY_IPV6 = "::/0";
 const REQUIRED_PUBLIC_ACCESS_FLAGS = [
   "BlockPublicAcls",
   "IgnorePublicAcls",
@@ -889,6 +897,114 @@ export class AwsAuditorClient {
   async getEbsEncryptionByDefault(region: string): Promise<JsonRecord> {
     const result = await this.ec2For(region).send(new GetEbsEncryptionByDefaultCommand({}));
     return { EbsEncryptionByDefault: result.EbsEncryptionByDefault, SseType: result.SseType };
+  }
+
+  async describeVpcs(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const vpcs: JsonRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.ec2For(region).send(new DescribeVpcsCommand({ NextToken: nextToken, MaxResults: 1000 }));
+      for (const vpc of result.Vpcs ?? []) {
+        vpcs.push({ VpcId: vpc.VpcId, IsDefault: vpc.IsDefault, CidrBlock: vpc.CidrBlock, State: vpc.State });
+      }
+      nextToken = result.NextToken;
+      if (vpcs.length > limit) {
+        truncated = true;
+        vpcs.length = limit;
+        break;
+      }
+    } while (nextToken);
+    return { items: vpcs, truncated };
+  }
+
+  async describeFlowLogs(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const flowLogs: JsonRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.ec2For(region).send(new DescribeFlowLogsCommand({ NextToken: nextToken, MaxResults: 1000 }));
+      for (const flowLog of result.FlowLogs ?? []) {
+        flowLogs.push({
+          FlowLogId: flowLog.FlowLogId,
+          ResourceId: flowLog.ResourceId,
+          FlowLogStatus: flowLog.FlowLogStatus,
+          TrafficType: flowLog.TrafficType,
+          LogDestinationType: flowLog.LogDestinationType,
+          LogDestination: flowLog.LogDestination,
+          LogGroupName: flowLog.LogGroupName,
+        });
+      }
+      nextToken = result.NextToken;
+      if (flowLogs.length > limit) {
+        truncated = true;
+        flowLogs.length = limit;
+        break;
+      }
+    } while (nextToken);
+    return { items: flowLogs, truncated };
+  }
+
+  async describeNetworkAcls(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const acls: JsonRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.ec2For(region).send(new DescribeNetworkAclsCommand({ NextToken: nextToken, MaxResults: 1000 }));
+      for (const acl of result.NetworkAcls ?? []) {
+        acls.push({
+          NetworkAclId: acl.NetworkAclId,
+          VpcId: acl.VpcId,
+          IsDefault: acl.IsDefault,
+          Entries: (acl.Entries ?? []).map((entry) => ({
+            RuleNumber: entry.RuleNumber,
+            Protocol: entry.Protocol,
+            RuleAction: entry.RuleAction,
+            Egress: entry.Egress,
+            CidrBlock: entry.CidrBlock,
+            Ipv6CidrBlock: entry.Ipv6CidrBlock,
+            PortRange: entry.PortRange ? { From: entry.PortRange.From, To: entry.PortRange.To } : undefined,
+          })),
+        });
+      }
+      nextToken = result.NextToken;
+      if (acls.length > limit) {
+        truncated = true;
+        acls.length = limit;
+        break;
+      }
+    } while (nextToken);
+    return { items: acls, truncated };
+  }
+
+  async describeSecurityGroups(region: string, limit = DEFAULT_RESOURCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const groups: JsonRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.ec2For(region).send(new DescribeSecurityGroupsCommand({ NextToken: nextToken, MaxResults: 1000 }));
+      for (const group of result.SecurityGroups ?? []) {
+        groups.push({
+          GroupId: group.GroupId,
+          GroupName: group.GroupName,
+          VpcId: group.VpcId,
+          IpPermissions: (group.IpPermissions ?? []).map((permission) => ({
+            IpProtocol: permission.IpProtocol,
+            FromPort: permission.FromPort,
+            ToPort: permission.ToPort,
+            IpRanges: (permission.IpRanges ?? []).map((range) => ({ CidrIp: range.CidrIp, Description: range.Description })),
+            Ipv6Ranges: (permission.Ipv6Ranges ?? []).map((range) => ({ CidrIpv6: range.CidrIpv6, Description: range.Description })),
+          })),
+        });
+      }
+      nextToken = result.NextToken;
+      if (groups.length > limit) {
+        truncated = true;
+        groups.length = limit;
+        break;
+      }
+    } while (nextToken);
+    return { items: groups, truncated };
   }
 
   async describeDbInstances(region: string, limit = DEFAULT_INSTANCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
@@ -2140,6 +2256,300 @@ export async function assessAwsDataProtection(
   };
 }
 
+function parsePortList(value: unknown): number[] | undefined {
+  const raw = Array.isArray(value) ? value : asString(value)?.split(/[\s,]+/);
+  if (!raw) return undefined;
+  const ports = raw
+    .map((item) => asNumber(item))
+    .filter((port): port is number => port !== undefined && Number.isInteger(port) && port >= 0 && port <= 65535);
+  return ports.length > 0 ? [...new Set(ports)] : undefined;
+}
+
+function protocolCoversPorts(protocol: string | undefined): "all" | "ports" | "none" {
+  if (protocol === undefined) return "none";
+  if (protocol === "-1" || protocol.toLowerCase() === "all") return "all";
+  if (protocol === "6" || protocol === "17" || /^(tcp|udp)$/i.test(protocol)) return "ports";
+  return "none";
+}
+
+function rangeCoversSensitivePort(from: number | undefined, to: number | undefined, sensitivePorts: number[]): number[] {
+  if (from === undefined || to === undefined) return sensitivePorts;
+  return sensitivePorts.filter((port) => port >= from && port <= to);
+}
+
+/** Inbound NACL entries that allow any IPv4 or IPv6 source to reach a sensitive port or every port. */
+export function permissiveNaclEntries(acl: JsonRecord, sensitivePorts: number[]): JsonRecord[] {
+  const entries = Array.isArray(acl.Entries) ? acl.Entries.map(asObject).filter((entry): entry is JsonRecord => Boolean(entry)) : [];
+  const permissive: JsonRecord[] = [];
+  for (const entry of entries) {
+    if (entry.Egress !== false) continue;
+    if (asString(entry.RuleAction)?.toLowerCase() !== "allow") continue;
+    const anySource = asString(entry.CidrBlock) === ANY_IPV4 || asString(entry.Ipv6CidrBlock) === ANY_IPV6;
+    if (!anySource) continue;
+    const coverage = protocolCoversPorts(asString(entry.Protocol));
+    if (coverage === "none") continue;
+    const portRange = asObject(entry.PortRange);
+    const exposedPorts = coverage === "all"
+      ? sensitivePorts
+      : rangeCoversSensitivePort(asNumber(portRange?.From), asNumber(portRange?.To), sensitivePorts);
+    if (exposedPorts.length === 0) continue;
+    permissive.push({
+      RuleNumber: entry.RuleNumber,
+      Protocol: entry.Protocol,
+      CidrBlock: entry.CidrBlock,
+      Ipv6CidrBlock: entry.Ipv6CidrBlock,
+      PortRange: portRange ?? null,
+      exposed_ports: coverage === "all" ? "all" : exposedPorts,
+    });
+  }
+  return permissive;
+}
+
+/** Inbound security group permissions open to 0.0.0.0/0 or ::/0 on a sensitive port or every port. */
+export function unrestrictedSecurityGroupRules(group: JsonRecord, sensitivePorts: number[]): JsonRecord[] {
+  const permissions = Array.isArray(group.IpPermissions) ? group.IpPermissions.map(asObject).filter((item): item is JsonRecord => Boolean(item)) : [];
+  const unrestricted: JsonRecord[] = [];
+  for (const permission of permissions) {
+    const ipv4 = (Array.isArray(permission.IpRanges) ? permission.IpRanges : []).some((range) => asString(asObject(range)?.CidrIp) === ANY_IPV4);
+    const ipv6 = (Array.isArray(permission.Ipv6Ranges) ? permission.Ipv6Ranges : []).some((range) => asString(asObject(range)?.CidrIpv6) === ANY_IPV6);
+    if (!ipv4 && !ipv6) continue;
+    const coverage = protocolCoversPorts(asString(permission.IpProtocol));
+    if (coverage === "none") continue;
+    const exposedPorts = coverage === "all"
+      ? sensitivePorts
+      : rangeCoversSensitivePort(asNumber(permission.FromPort), asNumber(permission.ToPort), sensitivePorts);
+    if (exposedPorts.length === 0) continue;
+    unrestricted.push({
+      IpProtocol: permission.IpProtocol,
+      FromPort: permission.FromPort ?? null,
+      ToPort: permission.ToPort ?? null,
+      sources: [...(ipv4 ? [ANY_IPV4] : []), ...(ipv6 ? [ANY_IPV6] : [])],
+      exposed_ports: coverage === "all" ? "all" : exposedPorts,
+    });
+  }
+  return unrestricted;
+}
+
+export interface AwsNetworkSecurityOptions extends AwsScopeOptions {
+  resourceLimit?: number;
+  sensitivePorts?: number[];
+}
+
+export type AwsNetworkSecurityClient = Pick<
+  AwsAuditorClient,
+  "getResolvedConfig" | "describeRegions" | "describeVpcs" | "describeFlowLogs" | "describeNetworkAcls" | "describeSecurityGroups"
+>;
+
+export async function assessAwsNetworkSecurity(
+  client: AwsNetworkSecurityClient,
+  options: AwsNetworkSecurityOptions = {},
+): Promise<AwsAssessmentResult> {
+  const errors: string[] = [];
+  const resourceLimit = clampNumber(options.resourceLimit, DEFAULT_RESOURCE_LIMIT, 1, 20000);
+  const sensitivePorts = options.sensitivePorts && options.sensitivePorts.length > 0 ? options.sensitivePorts : DEFAULT_SENSITIVE_PORTS;
+  const scope = await resolveAssessmentScope(client, options, errors);
+
+  const regionResults = await mapWithConcurrency(scope.regions, 4, async (region) => {
+    const [vpcs, flowLogs, acls, groups] = await Promise.all([
+      attemptAwsRead(`ec2:DescribeVpcs ${region}`, () => client.describeVpcs(region, resourceLimit), errors),
+      attemptAwsRead(`ec2:DescribeFlowLogs ${region}`, () => client.describeFlowLogs(region, resourceLimit), errors),
+      attemptAwsRead(`ec2:DescribeNetworkAcls ${region}`, () => client.describeNetworkAcls(region, resourceLimit), errors),
+      attemptAwsRead(`ec2:DescribeSecurityGroups ${region}`, () => client.describeSecurityGroups(region, resourceLimit), errors),
+    ]);
+    for (const [label, list] of [["DescribeVpcs", vpcs], ["DescribeFlowLogs", flowLogs], ["DescribeNetworkAcls", acls], ["DescribeSecurityGroups", groups]] as const) {
+      if (list.value?.truncated) errors.push(`ec2:${label} ${region}: inventory truncated at resource_limit ${resourceLimit}.`);
+    }
+    return { region, vpcs, flowLogs, acls, groups };
+  });
+
+  // Control 14: every VPC has an ACTIVE flow log.
+  const vpcRows = regionResults.flatMap((result) => {
+    const vpcs = result.vpcs.value?.items ?? [];
+    const flowLogs = result.flowLogs.value?.items ?? [];
+    return vpcs.map((vpc) => {
+      const vpcId = asString(vpc.VpcId) ?? "";
+      const matching = flowLogs.filter((flowLog) => asString(flowLog.ResourceId) === vpcId);
+      const active = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === "ACTIVE");
+      const statusUnknown = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === undefined);
+      return {
+        region: result.region,
+        vpc_id: vpcId,
+        is_default: vpc.IsDefault === true,
+        flow_logs: matching.length,
+        active_flow_logs: active.length,
+        traffic_types: active.map((flowLog) => asString(flowLog.TrafficType) ?? "unknown"),
+        flow_logs_unreadable: result.flowLogs.error !== undefined,
+        status_unknown: statusUnknown.length,
+      };
+    });
+  });
+  const vpcRegionErrors = regionResults.filter((result) => result.vpcs.error);
+  const flowLogRegionErrors = regionResults.filter((result) => result.flowLogs.error && !result.vpcs.error);
+  const vpcsAllUnreadable = regionResults.length > 0 && vpcRegionErrors.length === regionResults.length;
+  const vpcsWithoutFlowLogs = vpcRows.filter((row) => row.active_flow_logs === 0 && !row.flow_logs_unreadable);
+  const vpcsUnverified = vpcRows.filter((row) => row.flow_logs_unreadable || (row.active_flow_logs === 0 && row.status_unknown > 0));
+  const vpcTruncated = regionResults.filter((result) => result.vpcs.value?.truncated || result.flowLogs.value?.truncated);
+
+  let flowLogStatus: AwsFinding["status"];
+  let flowLogSummary: string;
+  if (vpcsAllUnreadable) {
+    flowLogStatus = "manual";
+    flowLogSummary = `VPCs could not be listed in any of ${regionResults.length} region(s) (${vpcRegionErrors[0]?.vpcs.error ?? "unknown error"}); verify VPC Flow Logs in the console.`;
+  } else if (vpcsWithoutFlowLogs.length > 0) {
+    flowLogStatus = "fail";
+    flowLogSummary = `${vpcsWithoutFlowLogs.length}/${vpcRows.length} VPCs across ${scope.regionsSeen} region(s) have no flow log with FlowLogStatus=ACTIVE.`;
+  } else if (vpcRows.length === 0) {
+    flowLogStatus = "manual";
+    flowLogSummary = `No VPCs were found in ${scope.regionsSeen} region(s), so there is nothing to log. Confirm the region scope and record the control as not applicable if the account runs no VPC workloads.`;
+  } else if (vpcsUnverified.length === vpcRows.length) {
+    flowLogStatus = "manual";
+    flowLogSummary = `Flow logs could not be read for any of the ${vpcRows.length} VPCs (${flowLogRegionErrors[0]?.flowLogs.error ?? "FlowLogStatus missing"}); verify VPC Flow Logs in the console.`;
+  } else {
+    flowLogStatus = "pass";
+    flowLogSummary = `All ${vpcRows.length} VPCs across ${scope.regionsSeen} region(s) have at least one flow log with FlowLogStatus=ACTIVE.`;
+  }
+  const flowLogCaps: string[] = [];
+  if (vpcsUnverified.length > 0) flowLogCaps.push(`${vpcsUnverified.length} VPC(s) could not be verified`);
+  if (vpcRegionErrors.length > 0) flowLogCaps.push(`DescribeVpcs unreadable in ${vpcRegionErrors.length} region(s)`);
+  if (vpcTruncated.length > 0) flowLogCaps.push(`VPC or flow log inventory truncated in ${vpcTruncated.length} region(s)`);
+  if (scope.partial) flowLogCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  const flowLogVerdict = withCap(flowLogStatus, flowLogSummary, flowLogCaps);
+
+  // Control 20: network ACL inbound rules open to the world on sensitive ports.
+  const aclRows = regionResults.flatMap((result) => (result.acls.value?.items ?? []).map((acl) => ({
+    region: result.region,
+    network_acl_id: asString(acl.NetworkAclId) ?? "",
+    vpc_id: asString(acl.VpcId),
+    is_default: acl.IsDefault === true,
+    permissive_entries: permissiveNaclEntries(acl, sensitivePorts),
+  })));
+  const aclRegionErrors = regionResults.filter((result) => result.acls.error);
+  const aclsAllUnreadable = regionResults.length > 0 && aclRegionErrors.length === regionResults.length;
+  const permissiveAcls = aclRows.filter((row) => row.permissive_entries.length > 0);
+  const aclTruncated = regionResults.filter((result) => result.acls.value?.truncated);
+
+  let aclStatus: AwsFinding["status"];
+  let aclSummary: string;
+  if (aclsAllUnreadable) {
+    aclStatus = "manual";
+    aclSummary = `Network ACLs could not be listed in any of ${regionResults.length} region(s) (${aclRegionErrors[0]?.acls.error ?? "unknown error"}); review NACL inbound rules in the console.`;
+  } else if (permissiveAcls.length > 0) {
+    aclStatus = "fail";
+    aclSummary = `${permissiveAcls.length}/${aclRows.length} network ACLs allow inbound traffic from ${ANY_IPV4} or ${ANY_IPV6} to sensitive ports (${sensitivePorts.join(", ")}) or to every port; ${permissiveAcls.filter((row) => row.is_default).length} of them are default NACLs.`;
+  } else if (aclRows.length === 0) {
+    aclStatus = "manual";
+    aclSummary = `No network ACLs were found in ${scope.regionsSeen} region(s). Every VPC has a default NACL, so confirm the region scope and VPC inventory.`;
+  } else {
+    aclStatus = "pass";
+    aclSummary = `None of the ${aclRows.length} network ACLs across ${scope.regionsSeen} region(s) allows inbound ${ANY_IPV4} or ${ANY_IPV6} traffic to sensitive ports (${sensitivePorts.join(", ")}).`;
+  }
+  const aclCaps: string[] = [];
+  if (aclRegionErrors.length > 0) aclCaps.push(`DescribeNetworkAcls unreadable in ${aclRegionErrors.length} region(s)`);
+  if (aclTruncated.length > 0) aclCaps.push(`NACL inventory truncated in ${aclTruncated.length} region(s)`);
+  if (scope.partial) aclCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  const aclVerdict = withCap(aclStatus, aclSummary, aclCaps);
+
+  // Control 21: security group inbound rules open to the world on sensitive ports.
+  const groupRows = regionResults.flatMap((result) => (result.groups.value?.items ?? []).map((group) => ({
+    region: result.region,
+    group_id: asString(group.GroupId) ?? "",
+    group_name: asString(group.GroupName),
+    vpc_id: asString(group.VpcId),
+    unrestricted_rules: unrestrictedSecurityGroupRules(group, sensitivePorts),
+  })));
+  const groupRegionErrors = regionResults.filter((result) => result.groups.error);
+  const groupsAllUnreadable = regionResults.length > 0 && groupRegionErrors.length === regionResults.length;
+  const unrestrictedGroups = groupRows.filter((row) => row.unrestricted_rules.length > 0);
+  const groupTruncated = regionResults.filter((result) => result.groups.value?.truncated);
+
+  let groupStatus: AwsFinding["status"];
+  let groupSummary: string;
+  if (groupsAllUnreadable) {
+    groupStatus = "manual";
+    groupSummary = `Security groups could not be listed in any of ${regionResults.length} region(s) (${groupRegionErrors[0]?.groups.error ?? "unknown error"}); review inbound rules in the console.`;
+  } else if (unrestrictedGroups.length > 0) {
+    groupStatus = "fail";
+    groupSummary = `${unrestrictedGroups.length}/${groupRows.length} security groups allow inbound ${ANY_IPV4} or ${ANY_IPV6} traffic to sensitive ports (${sensitivePorts.join(", ")}) or to every port.`;
+  } else if (groupRows.length === 0) {
+    groupStatus = "manual";
+    groupSummary = `No security groups were found in ${scope.regionsSeen} region(s). Every VPC has a default security group, so confirm the region scope and VPC inventory.`;
+  } else {
+    groupStatus = "pass";
+    groupSummary = `None of the ${groupRows.length} security groups across ${scope.regionsSeen} region(s) allows inbound ${ANY_IPV4} or ${ANY_IPV6} traffic to sensitive ports (${sensitivePorts.join(", ")}).`;
+  }
+  const groupCaps: string[] = [];
+  if (groupRegionErrors.length > 0) groupCaps.push(`DescribeSecurityGroups unreadable in ${groupRegionErrors.length} region(s)`);
+  if (groupTruncated.length > 0) groupCaps.push(`security group inventory truncated in ${groupTruncated.length} region(s)`);
+  if (scope.partial) groupCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  const groupVerdict = withCap(groupStatus, groupSummary, groupCaps);
+
+  const findings = [
+    finding(
+      "AWS-NET-14",
+      "VPC Flow Logs coverage",
+      "medium",
+      flowLogVerdict.status,
+      flowLogVerdict.summary,
+      buildAwsMappings(14),
+      {
+        ...scopeEvidence(scope),
+        vpcs: vpcRows.length,
+        vpcs_without_active_flow_logs: sample(vpcsWithoutFlowLogs.map((row) => ({ region: row.region, vpc_id: row.vpc_id, is_default: row.is_default, flow_logs: row.flow_logs }))),
+        vpcs_unverified: sample(vpcsUnverified.map((row) => ({ region: row.region, vpc_id: row.vpc_id }))),
+        regions_with_vpc_errors: vpcRegionErrors.map((result) => result.region),
+        regions_with_flow_log_errors: flowLogRegionErrors.map((result) => result.region),
+      },
+    ),
+    finding(
+      "AWS-NET-20",
+      "Network ACL inbound exposure",
+      "medium",
+      aclVerdict.status,
+      aclVerdict.summary,
+      buildAwsMappings(20),
+      {
+        ...scopeEvidence(scope),
+        sensitive_ports: sensitivePorts,
+        network_acls: aclRows.length,
+        permissive_network_acls: sample(permissiveAcls.map((row) => ({ region: row.region, network_acl_id: row.network_acl_id, vpc_id: row.vpc_id, is_default: row.is_default, entries: row.permissive_entries.slice(0, 5) }))),
+        regions_with_errors: aclRegionErrors.map((result) => result.region),
+      },
+    ),
+    finding(
+      "AWS-NET-21",
+      "Security group inbound exposure",
+      "high",
+      groupVerdict.status,
+      groupVerdict.summary,
+      buildAwsMappings(21),
+      {
+        ...scopeEvidence(scope),
+        sensitive_ports: sensitivePorts,
+        security_groups: groupRows.length,
+        unrestricted_security_groups: sample(unrestrictedGroups.map((row) => ({ region: row.region, group_id: row.group_id, group_name: row.group_name, vpc_id: row.vpc_id, rules: row.unrestricted_rules.slice(0, 5) }))),
+        regions_with_errors: groupRegionErrors.map((result) => result.region),
+      },
+    ),
+  ];
+
+  return {
+    title: "AWS network security posture",
+    summary: {
+      regions_seen: scope.regionsSeen,
+      regions_total: scope.regionsTotal,
+      vpcs: vpcRows.length,
+      vpcs_without_active_flow_logs: vpcsWithoutFlowLogs.length,
+      network_acls: aclRows.length,
+      permissive_network_acls: permissiveAcls.length,
+      security_groups: groupRows.length,
+      unrestricted_security_groups: unrestrictedGroups.length,
+      collection_errors: errors.length,
+    },
+    findings,
+    errors,
+  };
+}
+
 function formatAccessCheckText(result: AwsAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
@@ -2369,6 +2779,20 @@ function normalizeDataProtectionArgs(args: unknown): DataProtectionArgs {
   };
 }
 
+type NetworkSecurityArgs = ScopeArgs & {
+  resource_limit?: number;
+  sensitive_ports?: number[];
+};
+
+function normalizeNetworkSecurityArgs(args: unknown): NetworkSecurityArgs {
+  const value = asObject(args) ?? {};
+  return {
+    ...normalizeScopeArgs(args),
+    resource_limit: asNumber(value.resource_limit),
+    sensitive_ports: parsePortList(value.sensitive_ports),
+  };
+}
+
 const scopeParams = {
   regions: Type.Optional(Type.String({ description: "Comma-separated regions to assess. Defaults to every enabled region from EC2 DescribeRegions, falling back to the configured region." })),
   region_limit: Type.Optional(Type.Number({ description: `Maximum regions to assess before flagging a partial scope. Defaults to ${DEFAULT_REGION_LIMIT}.`, default: DEFAULT_REGION_LIMIT })),
@@ -2525,6 +2949,36 @@ export function registerAwsTools(pi: any): void {
         return errorResult(
           `AWS data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
           { tool: "aws_assess_data_protection" },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "aws_assess_network_security",
+    label: "Assess AWS network security",
+    description:
+      "Assess AWS network security posture per region: VPC Flow Logs coverage (DescribeFlowLogs versus DescribeVpcs), network ACL inbound rules open to 0.0.0.0/0 or ::/0 on sensitive ports, and security group inbound rules open to the world on sensitive ports.",
+    parameters: Type.Object({
+      ...authParams,
+      ...scopeParams,
+      resource_limit: Type.Optional(Type.Number({ description: `Maximum VPCs, flow logs, NACLs, or security groups per region before flagging truncation. Defaults to ${DEFAULT_RESOURCE_LIMIT}.`, default: DEFAULT_RESOURCE_LIMIT })),
+      sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
+    }),
+    prepareArguments: normalizeNetworkSecurityArgs,
+    async execute(_toolCallId: string, args: NetworkSecurityArgs) {
+      try {
+        const result = await assessAwsNetworkSecurity(createClient(args), {
+          regions: args.regions,
+          regionLimit: args.region_limit,
+          resourceLimit: args.resource_limit,
+          sensitivePorts: args.sensitive_ports,
+        });
+        return textResult(formatAssessmentText(result), { tool: "aws_assess_network_security", ...result });
+      } catch (error) {
+        return errorResult(
+          `AWS network security assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "aws_assess_network_security" },
         );
       }
     },
