@@ -21,10 +21,12 @@ import {
   assessZendeskIntegrations,
   checkZendeskAccess,
   exportZendeskAuditBundle,
+  redactCredentialProperties,
   resolveSecureOutputPath,
   resolveZendeskConfiguration,
 } from "../dist/extensions/grc-tools/zendesk.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1485,6 +1487,153 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
   assert.ok(existsSync(first.zipPath) && existsSync(second.zipPath));
   assert.equal(readdirSync(base).filter((name) => name.endsWith(".zip")).length, 2);
   assert.equal(readdirSync(base).filter((name) => !name.endsWith(".zip")).length, 2);
+});
+
+// Fake credential values Zendesk list endpoints can return verbatim; none may reach a bundle.
+const FAKE_ZENDESK_SECRETS = {
+  fullToken: "zd-full-token-fake-0123456789abcdefghijklmnopqrstuvwxyz",
+  tokenPrefix: "zdtok-fake1",
+  refreshToken: "zd-refresh-token-fake-0123456789abcdef",
+  clientSecret: "zd-client-secret-fake-0123456789abcdef",
+  webhookBearer: "zd-webhook-bearer-fake-0123456789",
+  webhookApiKeyValue: "zd-webhook-api-key-value-fake",
+  signingSecret: "zd-signing-secret-fake-0123456789",
+  targetPassword: "zd-target-password-fake",
+  targetToken: "zd-target-token-fake-0123456789",
+  appApiKey: "zd-app-setting-api-key-fake",
+};
+
+function secretBearingClient(overrides = {}) {
+  return healthyClient({
+    async listOAuthClients() {
+      return list([
+        { id: 1, name: "Reporting", identifier: "reporting", kind: "confidential", scope: "read", redirect_uri: ["https://reports.example.com/callback"], secret: FAKE_ZENDESK_SECRETS.clientSecret },
+      ]);
+    },
+    async listOAuthTokens() {
+      return list([
+        { id: 1, user_id: 7, client_id: 1, scopes: ["read"], expires_at: daysAgo(-30), used_at: daysAgo(1), created_at: daysAgo(40), token: FAKE_ZENDESK_SECRETS.tokenPrefix, full_token: FAKE_ZENDESK_SECRETS.fullToken, refresh_token: FAKE_ZENDESK_SECRETS.refreshToken, url: "https://acme.zendesk.com/api/v2/oauth/tokens/1.json" },
+      ]);
+    },
+    async listWebhooks() {
+      return list([
+        { id: "wh1", name: "Pager", status: "active", endpoint: "https://hooks.example.com/zendesk", authentication: { type: "bearer_token", add_position: "header", data: { token: FAKE_ZENDESK_SECRETS.webhookBearer } } },
+        { id: "wh2", name: "SIEM", status: "active", endpoint: "https://siem.example.com/ingest", authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: FAKE_ZENDESK_SECRETS.webhookApiKeyValue } }, signing_secret: { algorithm: "SHA256", secret: FAKE_ZENDESK_SECRETS.signingSecret } },
+      ]);
+    },
+    async listTargets() {
+      return list([
+        { id: 5, title: "Legacy URL target", type: "url_target", active: true, target_url: "https://legacy.example.com/hook", method: "post", username: "svc-zendesk", password: FAKE_ZENDESK_SECRETS.targetPassword },
+        { id: 6, title: "Chat room", type: "campfire_target", active: true, token: FAKE_ZENDESK_SECRETS.targetToken, room: "ops" },
+      ]);
+    },
+    async listAppInstallations() {
+      return list([
+        { id: 900, app_id: 42, product: "support", enabled: true, settings: { name: "Ticket enricher", title: "Ticket enricher", api_key: FAKE_ZENDESK_SECRETS.appApiKey } },
+      ]);
+    },
+    ...overrides,
+  });
+}
+
+test("redactCredentialProperties replaces credential strings and keeps identifiers, dates, and settings objects", () => {
+  const token = redactCredentialProperties({ id: 1, client_id: 2, scopes: ["read"], expires_at: "2027-01-01T00:00:00Z", created_at: "2026-01-01T00:00:00Z", token: "prefix", full_token: "full", refresh_token: "refresh", used_at: null });
+  assert.deepEqual(token, { id: 1, client_id: 2, scopes: ["read"], expires_at: "2027-01-01T00:00:00Z", created_at: "2026-01-01T00:00:00Z", token: "[REDACTED]", full_token: "[REDACTED]", refresh_token: "[REDACTED]", used_at: null });
+
+  const listResult = redactCredentialProperties({ items: [{ id: 1, secret: "s3cret", identifier: "reporting" }, { id: 2, secret: null }], truncated: false, pages: 1 });
+  assert.deepEqual(listResult, { items: [{ id: 1, secret: "[REDACTED]", identifier: "reporting" }, { id: 2, secret: null }], truncated: false, pages: 1 });
+
+  const webhook = redactCredentialProperties({
+    id: "wh2",
+    authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: "the-key" } },
+    signing_secret: { algorithm: "SHA256", secret: "signing" },
+  });
+  assert.deepEqual(webhook, {
+    id: "wh2",
+    authentication: { type: "api_key", add_position: "header", data: { name: "X-Api-Key", value: "[REDACTED]" } },
+    signing_secret: { algorithm: "SHA256", secret: "[REDACTED]" },
+  });
+  const basicAuth = redactCredentialProperties({ authentication: { type: "basic_auth", data: { username: "svc", password: "pw" } } });
+  assert.deepEqual(basicAuth, { authentication: { type: "basic_auth", data: { username: "svc", password: "[REDACTED]" } } });
+
+  const security = redactCredentialProperties(healthySecuritySettings());
+  assert.deepEqual(security, healthySecuritySettings(), "the password policy object under authentication.agent.password is not a credential");
+  assert.equal(redactCredentialProperties("plain"), "plain");
+  assert.equal(redactCredentialProperties(undefined), undefined);
+  assert.deepEqual(redactCredentialProperties({ token: "" }), { token: "" }, "empty strings are not replaced with a marker");
+});
+
+test("assessZendeskAccessControl never retains OAuth token values in its snapshots, evidence, or verdicts", async () => {
+  const result = await assessZendeskAccessControl(secretBearingClient(), { now: () => NOW });
+  const text = JSON.stringify(result);
+  for (const secret of [FAKE_ZENDESK_SECRETS.fullToken, FAKE_ZENDESK_SECRETS.tokenPrefix, FAKE_ZENDESK_SECRETS.refreshToken, FAKE_ZENDESK_SECRETS.clientSecret]) {
+    assert.ok(!text.includes(secret), `${secret} leaked into the assessment result`);
+  }
+  const [token] = result.snapshots.oauth_tokens.items;
+  assert.equal(token.token, "[REDACTED]");
+  assert.equal(token.full_token, "[REDACTED]");
+  assert.equal(token.refresh_token, "[REDACTED]");
+  assert.equal(token.id, 1);
+  assert.equal(token.client_id, 1);
+  assert.deepEqual(token.scopes, ["read"]);
+  assert.equal(token.expires_at, daysAgo(-30));
+  assert.equal(token.created_at, daysAgo(40));
+  assert.equal(result.snapshots.oauth_clients.items[0].secret, "[REDACTED]");
+  assert.equal(result.snapshots.oauth_clients.items[0].identifier, "reporting");
+  const oauth = result.findings.find((item) => item.id === "ZD-14");
+  assert.equal(oauth.status, "pass", oauth.summary);
+  assert.equal(oauth.evidence.oauth_tokens, 1);
+  assert.equal(oauth.evidence.tokens_without_expiry, 0);
+});
+
+test("exportZendeskAuditBundle never writes OAuth tokens, client secrets, or webhook and target credentials into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-zendesk-export-secrets-");
+  const secrets = Object.values(FAKE_ZENDESK_SECRETS);
+  const result = await exportZendeskAuditBundle(secretBearingClient(), sampleConfig(), base, { now: () => NOW });
+  assert.equal(result.errorCount, 0);
+
+  const files = readBundleFiles(result.outputDir);
+  for (const relativePath of ["core_data/oauth_tokens.json", "core_data/oauth_clients.json", "core_data/webhooks.json", "core_data/targets.json", "core_data/app_installations.json", "analysis/access-control.json", "analysis/integrations.json"]) {
+    assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assert.ok(zipEntries.has("core_data/oauth_tokens.json"));
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const tokens = JSON.parse(files.get(join("core_data", "oauth_tokens.json")));
+  assert.deepEqual(tokens.items[0], {
+    id: 1,
+    user_id: 7,
+    client_id: 1,
+    scopes: ["read"],
+    expires_at: daysAgo(-30),
+    used_at: daysAgo(1),
+    created_at: daysAgo(40),
+    token: "[REDACTED]",
+    full_token: "[REDACTED]",
+    refresh_token: "[REDACTED]",
+    url: "https://acme.zendesk.com/api/v2/oauth/tokens/1.json",
+  });
+  const analysis = JSON.parse(files.get(join("analysis", "access-control.json")));
+  assert.equal(analysis.snapshots.oauth_tokens.items[0].full_token, "[REDACTED]");
+  assert.equal(analysis.snapshots.oauth_clients.items[0].secret, "[REDACTED]");
+  const webhooks = JSON.parse(files.get(join("core_data", "webhooks.json")));
+  assert.equal(webhooks.items[0].authentication.data.token, "[REDACTED]");
+  assert.equal(webhooks.items[1].authentication.data.name, "X-Api-Key");
+  assert.equal(webhooks.items[1].authentication.data.value, "[REDACTED]");
+  assert.equal(webhooks.items[1].signing_secret.secret, "[REDACTED]");
+  const targets = JSON.parse(files.get(join("core_data", "targets.json")));
+  assert.equal(targets.items[0].username, "svc-zendesk");
+  assert.equal(targets.items[0].password, "[REDACTED]");
+  assert.equal(targets.items[1].token, "[REDACTED]");
+  assert.equal(JSON.parse(files.get(join("core_data", "app_installations.json"))).items[0].settings.api_key, "[REDACTED]");
+
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  assert.equal(findings.find((item) => item.id === "ZD-14").status, "pass");
+  assert.equal(findings.find((item) => item.id === "ZD-24").status, "pass", "webhooks keep their authentication objects after redaction");
+  assert.match(files.get("QUICK_REFERENCE.md"), /replaced with \[REDACTED\]/);
 });
 
 test("exportZendeskAuditBundle records partial collection failures in _errors.log", async () => {
