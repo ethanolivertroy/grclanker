@@ -652,6 +652,11 @@ function parseLinkNext(linkHeader: string | null): string | undefined {
   return undefined;
 }
 
+function isUnknownCursorArgumentError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /cursor/i.test(message) && /unknown argument|not defined|does not accept|undefined argument/i.test(message);
+}
+
 function nerdgraphErrorSummary(errors: unknown): string {
   return asRecords(errors)
     .map((error) => {
@@ -707,15 +712,24 @@ const QUERY_ROLES = `query($cursor: String) {
     roles(cursor: $cursor) { nextCursor totalCount roles { id name displayName scope type } }
   } } }
 }`;
+const API_KEY_FIELDS = `keys {
+        id name notes type createdAt
+        ... on ApiAccessIngestKey { accountId ingestType }
+        ... on ApiAccessUserKey { accountId userId }
+      }`;
 const QUERY_API_KEYS = `query($query: ApiAccessKeySearchQuery!, $cursor: String) {
   actor { apiAccess {
     keySearch(query: $query, cursor: $cursor) {
       nextCursor count
-      keys {
-        id name notes type createdAt
-        ... on ApiAccessIngestKey { accountId ingestType }
-        ... on ApiAccessUserKey { accountId userId }
-      }
+      ${API_KEY_FIELDS}
+    }
+  } }
+}`;
+const QUERY_API_KEYS_SINGLE_PAGE = `query($query: ApiAccessKeySearchQuery!) {
+  actor { apiAccess {
+    keySearch(query: $query) {
+      count
+      ${API_KEY_FIELDS}
     }
   } }
 }`;
@@ -822,7 +836,7 @@ const QUERY_SYNTHETIC_SCRIPT = `query($accountId: Int!, $monitorGuid: EntityGuid
   actor { account(id: $accountId) { synthetics { script(monitorGuid: $monitorGuid) { text } } } }
 }`;
 const QUERY_DASHBOARD_LIVE_URLS = `{
-  actor { dashboard { liveUrls(filter: { type: DASHBOARD }) { liveUrls { uuid type createdAt } } } }
+  actor { dashboard { liveUrls { liveUrls { title type createdAt } errors { description } } } }
 }`;
 
 export class NewrelicApiClient {
@@ -1076,13 +1090,14 @@ export class NewrelicApiClient {
 
   async listApiKeys(types: Array<"USER" | "INGEST">, accountIds?: number[], limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
     const scope = accountIds && accountIds.length > 0 ? { accountIds } : undefined;
-    return this.paginate(
-      QUERY_API_KEYS,
-      { query: scope ? { types, scope } : { types } },
-      ["actor", "apiAccess", "keySearch"],
-      "keys",
-      limit,
-    );
+    const variables = { query: scope ? { types, scope } : { types } };
+    try {
+      return await this.paginate(QUERY_API_KEYS, variables, ["actor", "apiAccess", "keySearch"], "keys", limit);
+    } catch (error) {
+      if (!isUnknownCursorArgumentError(error)) throw error;
+      const data = await this.nerdgraph(QUERY_API_KEYS_SINGLE_PAGE, variables);
+      return asRecords(asObject(getNestedValue(data, ["actor", "apiAccess", "keySearch"]))?.keys).slice(0, limit);
+    }
   }
 
   async runNrql(accountId: number, nrql: string): Promise<JsonRecord[]> {
@@ -1167,7 +1182,12 @@ export class NewrelicApiClient {
 
   async listDashboardLiveUrls(): Promise<JsonRecord[]> {
     const data = await this.nerdgraph(QUERY_DASHBOARD_LIVE_URLS);
-    return asRecords(getNestedValue(data, ["actor", "dashboard", "liveUrls", "liveUrls"]));
+    const result = asObject(getNestedValue(data, ["actor", "dashboard", "liveUrls"]));
+    const errors = asRecords(result?.errors);
+    if (errors.length > 0) {
+      throw new Error(`Dashboard live URL listing failed: ${errors.map((error) => asString(error.description) ?? "unknown error").join("; ")}`);
+    }
+    return asRecords(result?.liveUrls);
   }
 
   async listRestUsers(limit = DEFAULT_PAGE_LIMIT): Promise<JsonRecord[]> {
@@ -2638,6 +2658,13 @@ export function assessNewrelicDataGovernanceData(
 
   const publicReadWriteDashboards = dashboards.filter((dashboard) => (asString(dashboard.permissions) ?? "").toUpperCase() === "PUBLIC_READ_WRITE");
   const privateDashboards = dashboards.filter((dashboard) => (asString(dashboard.permissions) ?? "").toUpperCase() === "PRIVATE");
+  const liveUrlSnapshots = liveUrls.map((liveUrl) => ({
+    title: asString(liveUrl.title) ?? "",
+    type: asString(liveUrl.type)?.toUpperCase() ?? "UNKNOWN",
+    createdAt: liveUrl.createdAt ?? null,
+  }));
+  const dashboardLiveUrls = liveUrlSnapshots.filter((liveUrl) => liveUrl.type === "DASHBOARD");
+  const widgetLiveUrls = liveUrlSnapshots.filter((liveUrl) => liveUrl.type === "WIDGET");
 
   const reportingHosts = sumField(data.infraHosts.data, "reportingHosts");
   const agentVersions = data.infraAgentVersions.data
@@ -2740,7 +2767,7 @@ export function assessNewrelicDataGovernanceData(
     data.dashboards.error
       ? "Dashboards were not readable. Review dashboard permissions and public sharing links in the Dashboards UI manually."
       : liveUrls.length > 0
-        ? `${liveUrls.length} dashboards are shared through public live URLs that anyone with the link can open; ${publicReadWriteDashboards.length}/${dashboards.length} dashboards also allow every account user to edit.`
+        ? `${dashboardLiveUrls.length} dashboards and ${widgetLiveUrls.length} widgets are shared through public live URLs that anyone with the link can open; ${publicReadWriteDashboards.length}/${dashboards.length} dashboards also allow every account user to edit.`
         : publicReadWriteDashboards.length > 0
           ? `${publicReadWriteDashboards.length}/${dashboards.length} dashboards grant edit access to everyone in the account (PUBLIC_READ_WRITE) and no public live URLs are visible to this user.`
           : `${dashboards.length} dashboards use read-only or private permissions and no public live URLs are visible to this user.`,
@@ -2749,7 +2776,9 @@ export function assessNewrelicDataGovernanceData(
       public_read_write_dashboards: sample(publicReadWriteDashboards.map((dashboard) => asString(dashboard.name) ?? "dashboard")),
       private_dashboards: privateDashboards.length,
       public_live_urls: liveUrls.length,
-      live_url_visibility_note: "liveUrls only lists public links visible to the authenticated user.",
+      public_dashboard_live_urls: sample(dashboardLiveUrls.map((liveUrl) => liveUrl.title || "untitled dashboard")),
+      public_widget_live_urls: widgetLiveUrls.length,
+      live_url_visibility_note: "liveUrls only lists public links visible to the authenticated user; link values are intentionally not collected.",
     },
   ));
 
@@ -2835,7 +2864,7 @@ export function assessNewrelicDataGovernanceData(
       "core_data/pipeline_cloud_rules.json": cloudRules,
       "core_data/nrql_drop_rules.json": dropRules,
       "core_data/dashboards.json": dashboards,
-      "core_data/dashboard_live_urls.json": liveUrls,
+      "core_data/dashboard_live_urls.json": liveUrlSnapshots,
       "core_data/synthetic_monitors.json": monitors,
       "core_data/secure_credentials.json": secureCredentials,
       "core_data/synthetic_script_scan.json": scripts,

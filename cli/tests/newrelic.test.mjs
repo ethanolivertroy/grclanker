@@ -564,6 +564,58 @@ test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header
   assert.equal(seen[1].page, "2");
 });
 
+test("NewrelicApiClient paginates keySearch with a cursor and scopes it to account IDs", async () => {
+  const seen = [];
+  const fetchImpl = async (_input, init = {}) => {
+    const body = JSON.parse(init.body);
+    seen.push(body);
+    const page = body.variables.cursor
+      ? { nextCursor: null, count: 2, keys: [{ id: "key-2", name: "ingest", type: "INGEST", ingestType: "LICENSE", accountId: 111 }] }
+      : { nextCursor: "keys-2", count: 2, keys: [{ id: "key-1", name: "user", type: "USER", userId: 5, accountId: 111 }] };
+    return jsonResponse({ data: { actor: { apiAccess: { keySearch: page } } } });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+  const keys = await client.listApiKeys(["USER", "INGEST"], [111]);
+
+  assert.deepEqual(keys.map((key) => key.id), ["key-1", "key-2"]);
+  assert.deepEqual(seen[0].variables.query, { types: ["USER", "INGEST"], scope: { accountIds: [111] } });
+  assert.match(seen[0].query, /keySearch\(query: \$query, cursor: \$cursor\)/);
+  assert.equal(seen[1].variables.cursor, "keys-2");
+});
+
+test("NewrelicApiClient falls back to a single-page keySearch when the cursor argument is rejected", async () => {
+  const seen = [];
+  const fetchImpl = async (_input, init = {}) => {
+    const body = JSON.parse(init.body);
+    seen.push(body.query);
+    if (body.query.includes("cursor: $cursor")) {
+      return jsonResponse({ errors: [{ message: 'Unknown argument "cursor" on field "ApiAccessActorStitchedFields.keySearch".' }] });
+    }
+    return jsonResponse({ data: { actor: { apiAccess: { keySearch: { count: 1, keys: [{ id: "key-1", name: "user", type: "USER" }] } } } } });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+  const keys = await client.listApiKeys(["USER"]);
+
+  assert.deepEqual(keys.map((key) => key.id), ["key-1"]);
+  assert.equal(seen.length, 2);
+  assert.doesNotMatch(seen[1], /cursor/);
+});
+
+test("NewrelicApiClient surfaces dashboard live URL errors and omits link values", async () => {
+  const fetchImpl = async (_input, init = {}) => {
+    const body = JSON.parse(init.body);
+    assert.doesNotMatch(body.query, /\burl\b|uuid/);
+    return jsonResponse({ data: { actor: { dashboard: { liveUrls: { liveUrls: [{ title: "Ops", type: "DASHBOARD", createdAt: NOW }], errors: null } } } } });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+  assert.deepEqual(await client.listDashboardLiveUrls(), [{ title: "Ops", type: "DASHBOARD", createdAt: NOW }]);
+
+  const failing = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ data: { actor: { dashboard: { liveUrls: { liveUrls: [], errors: [{ description: "Live URL listing is not permitted" }] } } } } }),
+  });
+  await assert.rejects(failing.listDashboardLiveUrls(), /Live URL listing is not permitted/);
+});
+
 test("NewrelicApiClient discovers account IDs from actor.accounts when none are configured", async () => {
   let calls = 0;
   const fetchImpl = async () => {
@@ -973,7 +1025,10 @@ test("assessNewrelicDataGovernance fails short retention, missing obfuscation, h
       return [];
     },
     async listDashboardLiveUrls() {
-      return [{ uuid: "live-1", type: "DASHBOARD", createdAt: NOW }];
+      return [
+        { title: "Everyone edits", type: "DASHBOARD", createdAt: NOW },
+        { title: "", type: "WIDGET", createdAt: NOW },
+      ];
     },
     async runNrql(_accountId, nrql) {
       if (nrql.includes("RLIKE")) return [{ matchCount: 6 }];
@@ -993,7 +1048,10 @@ test("assessNewrelicDataGovernance fails short retention, missing obfuscation, h
   assert.equal(findingStatus(result, "NR-13-SYNTHETIC-MONITOR-SECURITY"), "fail");
   assert.match(findingById(result, "NR-13-SYNTHETIC-MONITOR-SECURITY").summary, /credential assignment, New Relic user key/);
   assert.equal(findingStatus(result, "NR-14-DASHBOARD-PERMISSIONS"), "fail");
-  assert.equal(findingById(result, "NR-14-DASHBOARD-PERMISSIONS").evidence.public_live_urls, 1);
+  assert.equal(findingById(result, "NR-14-DASHBOARD-PERMISSIONS").evidence.public_live_urls, 2);
+  assert.deepEqual(findingById(result, "NR-14-DASHBOARD-PERMISSIONS").evidence.public_dashboard_live_urls, ["Everyone edits"]);
+  assert.equal(findingById(result, "NR-14-DASHBOARD-PERMISSIONS").evidence.public_widget_live_urls, 1);
+  assert.match(findingById(result, "NR-14-DASHBOARD-PERMISSIONS").summary, /1 dashboards and 1 widgets are shared through public live URLs/);
   assert.deepEqual(findingById(result, "NR-14-DASHBOARD-PERMISSIONS").evidence.public_read_write_dashboards, ["Everyone edits"]);
   assert.equal(findingStatus(result, "NR-15-LOGS-IN-CONTEXT-SECURITY"), "fail");
   assert.equal(findingById(result, "NR-15-LOGS-IN-CONTEXT-SECURITY").evidence.secret_pattern_matches, 6);
