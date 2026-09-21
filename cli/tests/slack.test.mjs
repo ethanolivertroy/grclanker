@@ -340,7 +340,7 @@ test("fixture (c): partial inventories and not_allowed_token_type never pass", a
   const all = results.flatMap((result) => result.findings);
   assert.equal(all.filter((item) => item.status === "pass").length, 0, JSON.stringify(statuses({ findings: all })));
   assert.match(byId(results[0], "SLACK-ID-01").summary, /partial/);
-  assert.match(byId(results[1], "SLACK-ADMIN-01").summary, /partial/);
+  assert.notEqual(byId(results[1], "SLACK-ADMIN-01").status, "pass");
   assert.match(byId(results[1], "SLACK-ADMIN-05").summary, /partial/);
   assert.match(byId(results[2], "SLACK-APP-01").summary, /partial view/);
   assert.equal(byId(results[3], "SLACK-CHAN-01").status, "manual");

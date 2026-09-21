@@ -3,11 +3,11 @@ slug: "slack-sec-inspector"
 name: "Slack Security Inspector"
 vendor: "Slack"
 category: "saas-collaboration"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/slack-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # slack-sec-inspector
@@ -15,6 +15,10 @@ source_repo: "https://github.com/hackIDLE/slack-sec-inspector"
 ## 1. Overview
 
 A security compliance inspection tool for **Slack Enterprise Grid** that audits workspace and organization-level security configurations against industry compliance frameworks. The tool connects to Slack's management and audit APIs to evaluate SSO enforcement, MFA policies, data loss prevention settings, external sharing controls, app management, session policies, and audit log configurations. Results are output as structured compliance reports mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP controls.
+
+### grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/slack.ts` as six native tools plus an exporter: `slack_check_access`, `slack_assess_identity`, `slack_assess_admin_access`, `slack_assess_integrations`, `slack_assess_channel_governance`, `slack_assess_monitoring`, and `slack_export_audit_bundle`. Every method, argument, and response field is listed in the `SLACK_METHODS` table with its reference page, and the integration guide (`src/content/docs/docs/integrations/slack.md`) maps each of the 25 controls to a finding id.
 
 ## 2. APIs & SDKs
 
@@ -31,35 +35,35 @@ A security compliance inspection tool for **Slack Enterprise Grid** that audits 
 ### Key API Methods
 
 **Admin API (admin.* methods):**
-- `admin.teams.settings.info` — Workspace-level security settings
-- `admin.teams.settings.setDiscoverability` — Control workspace discoverability
-- `admin.users.session.list` / `admin.users.session.invalidate` — Session management
-- `admin.users.session.setSettings` — Session duration and idle timeout policies
-- `admin.conversations.setConversationPrefs` — Channel posting restrictions
-- `admin.conversations.restrictAccess.addGroup` — IDP group channel restrictions
-- `admin.apps.approve` / `admin.apps.restrict` — App management
-- `admin.apps.approved.list` / `admin.apps.restricted.list` — App audit
-- `admin.emoji.add` / `admin.emoji.list` — Custom emoji management
-- `admin.teams.admins.list` — Admin role enumeration
-- `admin.users.list` — User management with deactivation status
-- `admin.usergroups.addTeams` — IDP group workspace assignment
-- `admin.barriers.create` / `admin.barriers.list` — Information barriers
+- `admin.teams.settings.info` - Workspace-level security settings
+- `admin.teams.settings.setDiscoverability` - Control workspace discoverability
+- `admin.users.session.list` / `admin.users.session.invalidate` - Session management
+- `admin.users.session.setSettings` - Session duration and idle timeout policies
+- `admin.conversations.setConversationPrefs` - Channel posting restrictions
+- `admin.conversations.restrictAccess.addGroup` - IDP group channel restrictions
+- `admin.apps.approve` / `admin.apps.restrict` - App management
+- `admin.apps.approved.list` / `admin.apps.restricted.list` - App audit
+- `admin.emoji.add` / `admin.emoji.list` - Custom emoji management
+- `admin.teams.admins.list` - Admin role enumeration
+- `admin.users.list` - User management with deactivation status
+- `admin.usergroups.addTeams` - IDP group workspace assignment
+- `admin.barriers.create` / `admin.barriers.list` - Information barriers
 
 **SCIM API:**
-- `GET /Users` — List provisioned users with attributes
-- `GET /Groups` — List provisioned groups
-- `PATCH /Users/{id}` — Update user provisioning attributes
-- `GET /ServiceProviderConfig` — SCIM endpoint capabilities
+- `GET /Users` - List provisioned users with attributes
+- `GET /Groups` - List provisioned groups
+- `PATCH /Users/{id}` - Update user provisioning attributes
+- `GET /ServiceProviderConfig` - SCIM endpoint capabilities
 
 **Audit Logs API:**
-- `GET /audit/v1/logs` — Retrieve audit events with action-based filtering
-- `GET /audit/v1/schemas` — Available audit event schemas
+- `GET /audit/v1/logs` - Retrieve audit events with action-based filtering
+- `GET /audit/v1/schemas` - Available audit event schemas
 - Supported actions: `user_login`, `user_logout`, `file_downloaded`, `app_installed`, `role_change_to_admin`, `pref_sso_setting_changed`, `pref_two_factor_auth_changed`, etc.
 
 **Discovery API:**
-- `discovery.enterprise.info` — Organization-level DLP settings
-- `discovery.conversations.list` — Enumerate conversations for DLP scanning
-- `discovery.conversations.history` — Retrieve message content for DLP
+- `discovery.enterprise.info` - Organization-level DLP settings
+- `discovery.conversations.list` - Enumerate conversations for DLP scanning
+- `discovery.conversations.history` - Retrieve message content for DLP
 
 ### SDKs
 
@@ -85,17 +89,17 @@ A security compliance inspection tool for **Slack Enterprise Grid** that audits 
 
 For a comprehensive security audit, the following scopes are required on an **org-level user token**:
 
-- `admin.teams:read` — Read workspace settings
-- `admin.users:read` — List users and session info
-- `admin.users.session:read` — Read session settings
-- `admin.conversations:read` — Read conversation preferences
-- `admin.apps:read` — Read approved/restricted apps
-- `admin.barriers:read` — Read information barriers
-- `admin.roles:read` — Read admin role assignments
-- `auditlogs:read` — Read audit log events (Enterprise Grid)
-- `discovery:read` — Read DLP/eDiscovery data (Enterprise Grid)
-- `users:read` — Basic user enumeration
-- `team:read` — Workspace info
+- `admin.teams:read` - Read workspace settings
+- `admin.users:read` - List users and session info
+- `admin.users.session:read` - Read session settings
+- `admin.conversations:read` - Read conversation preferences
+- `admin.apps:read` - Read approved/restricted apps
+- `admin.barriers:read` - Read information barriers
+- `admin.roles:read` - Read admin role assignments
+- `auditlogs:read` - Read audit log events (Enterprise Grid)
+- `discovery:read` - Read DLP/eDiscovery data (Enterprise Grid)
+- `users:read` - Basic user enumeration
+- `team:read` - Workspace info
 
 ### SCIM Authentication
 
@@ -111,31 +115,31 @@ SLACK_ORG_ID=E0123456789
 
 ## 4. Security Controls
 
-1. **SSO enforcement** — Verify SAML SSO is required for all users (not optional) via org-level authentication policy
-2. **Two-factor authentication** — Confirm 2FA is mandated org-wide; enumerate users without 2FA enrolled
-3. **Session duration limits** — Validate maximum session duration is set (recommended: 24h or less)
-4. **Session idle timeout** — Ensure idle session timeout is configured (recommended: 30 minutes or less)
-5. **Mobile session controls** — Verify mobile app session duration and jailbreak/root detection policies
-6. **File upload restrictions** — Check whether file uploads are restricted by type or disabled for external channels
-7. **External sharing controls** — Audit whether Slack Connect (external organizations) channels are permitted and which workspaces allow them
-8. **Information barriers** — Verify information barriers are configured between restricted groups (e.g., compliance walls)
-9. **App management policy** — Confirm app installation requires admin approval; enumerate approved and restricted apps
-10. **Custom app restrictions** — Verify that only approved custom integrations and bots are permitted
-11. **DLP policy configuration** — Check that Discovery API is enabled and DLP scanning is active for sensitive content patterns
-12. **Channel retention policies** — Audit message and file retention settings per workspace; verify compliance-required retention periods
-13. **Audit log streaming** — Confirm audit logs are being streamed to an external SIEM (Amazon S3, Splunk, etc.)
-14. **Admin role inventory** — Enumerate all org admins, workspace admins, and owners; flag excessive admin privileges
-15. **Guest account controls** — Audit single-channel and multi-channel guest accounts; verify guest expiration policies
-16. **Email domain restrictions** — Verify workspace signup is restricted to approved email domains
-17. **Workspace discoverability** — Ensure workspace discoverability is set appropriately (not open to all org members if sensitive)
-18. **Channel posting restrictions** — Audit channels where posting is restricted to admins or specific groups
-19. **Custom emoji restrictions** — Verify whether custom emoji uploads are restricted to admins
-20. **External email ingestion** — Check whether email-to-channel forwarding is enabled and restricted
-21. **Link previews and URL unfurling** — Audit whether link previews expose sensitive content in channels
-22. **SCIM provisioning status** — Verify SCIM provisioning is active and user lifecycle management is automated
-23. **Deactivated user audit** — Enumerate deactivated users and verify timely deprovisioning matches HR/IdP records
-24. **Workspace analytics access** — Verify analytics export access is restricted to authorized admins
-25. **Token rotation and revocation** — Audit API token age and ensure legacy tokens are revoked
+1. **SSO enforcement** - Verify SAML SSO is required for all users (not optional) via org-level authentication policy
+2. **Two-factor authentication** - Confirm 2FA is mandated org-wide; enumerate users without 2FA enrolled
+3. **Session duration limits** - Validate maximum session duration is set (recommended: 24h or less)
+4. **Session idle timeout** - Ensure idle session timeout is configured (recommended: 30 minutes or less)
+5. **Mobile session controls** - Verify mobile app session duration and jailbreak/root detection policies
+6. **File upload restrictions** - Check whether file uploads are restricted by type or disabled for external channels
+7. **External sharing controls** - Audit whether Slack Connect (external organizations) channels are permitted and which workspaces allow them
+8. **Information barriers** - Verify information barriers are configured between restricted groups (e.g., compliance walls)
+9. **App management policy** - Confirm app installation requires admin approval; enumerate approved and restricted apps
+10. **Custom app restrictions** - Verify that only approved custom integrations and bots are permitted
+11. **DLP policy configuration** - Check that Discovery API is enabled and DLP scanning is active for sensitive content patterns
+12. **Channel retention policies** - Audit message and file retention settings per workspace; verify compliance-required retention periods
+13. **Audit log streaming** - Confirm audit logs are being streamed to an external SIEM (Amazon S3, Splunk, etc.)
+14. **Admin role inventory** - Enumerate all org admins, workspace admins, and owners; flag excessive admin privileges
+15. **Guest account controls** - Audit single-channel and multi-channel guest accounts; verify guest expiration policies
+16. **Email domain restrictions** - Verify workspace signup is restricted to approved email domains
+17. **Workspace discoverability** - Ensure workspace discoverability is set appropriately (not open to all org members if sensitive)
+18. **Channel posting restrictions** - Audit channels where posting is restricted to admins or specific groups
+19. **Custom emoji restrictions** - Verify whether custom emoji uploads are restricted to admins
+20. **External email ingestion** - Check whether email-to-channel forwarding is enabled and restricted
+21. **Link previews and URL unfurling** - Audit whether link previews expose sensitive content in channels
+22. **SCIM provisioning status** - Verify SCIM provisioning is active and user lifecycle management is automated
+23. **Deactivated user audit** - Enumerate deactivated users and verify timely deprovisioning matches HR/IdP records
+24. **Workspace analytics access** - Verify analytics export access is restricted to authorized admins
+25. **Token rotation and revocation** - Audit API token age and ensure legacy tokens are revoked
 
 ## 5. Compliance Framework Mappings
 
@@ -145,27 +149,27 @@ SLACK_ORG_ID=E0123456789
 | 2 | Two-factor authentication | IA-2(6) | 3.5.3 | CC6.1 | 16.3 | 8.4.2 | SRG-APP-000150 | ISM-1504 | CPS.AT-2 |
 | 3 | Session duration limits | AC-12 | 3.1.10 | CC6.1 | 16.4 | 8.2.8 | SRG-APP-000295 | ISM-1164 | CPS.AC-7 |
 | 4 | Session idle timeout | AC-11 | 3.1.11 | CC6.1 | 16.5 | 8.2.8 | SRG-APP-000190 | ISM-1164 | CPS.AC-7 |
-| 5 | Mobile session controls | AC-19 | 3.1.18 | CC6.7 | — | 8.2.8 | SRG-APP-000394 | ISM-1082 | CPS.MP-1 |
-| 6 | File upload restrictions | SC-7 | 3.13.6 | CC6.6 | — | 1.3.2 | SRG-APP-000001 | ISM-0331 | CPS.SC-7 |
-| 7 | External sharing controls | AC-21 | 3.1.20 | CC6.6 | — | 7.1.2 | SRG-APP-000378 | ISM-0661 | CPS.AC-4 |
-| 8 | Information barriers | AC-4 | 3.1.3 | CC6.6 | — | 7.1.1 | SRG-APP-000039 | ISM-1528 | CPS.AC-4 |
+| 5 | Mobile session controls | AC-19 | 3.1.18 | CC6.7 | - | 8.2.8 | SRG-APP-000394 | ISM-1082 | CPS.MP-1 |
+| 6 | File upload restrictions | SC-7 | 3.13.6 | CC6.6 | - | 1.3.2 | SRG-APP-000001 | ISM-0331 | CPS.SC-7 |
+| 7 | External sharing controls | AC-21 | 3.1.20 | CC6.6 | - | 7.1.2 | SRG-APP-000378 | ISM-0661 | CPS.AC-4 |
+| 8 | Information barriers | AC-4 | 3.1.3 | CC6.6 | - | 7.1.1 | SRG-APP-000039 | ISM-1528 | CPS.AC-4 |
 | 9 | App management policy | CM-7 | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000141 | ISM-1624 | CPS.CM-7 |
 | 10 | Custom app restrictions | CM-7(4) | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000386 | ISM-1624 | CPS.CM-7 |
-| 11 | DLP policy configuration | SC-7(8) | 3.13.6 | CC6.7 | — | — | SRG-APP-000400 | ISM-0261 | CPS.SC-7 |
-| 12 | Channel retention policies | AU-11 | 3.3.1 | CC7.2 | — | 10.7.1 | SRG-APP-000515 | ISM-0859 | CPS.AU-11 |
+| 11 | DLP policy configuration | SC-7(8) | 3.13.6 | CC6.7 | - | - | SRG-APP-000400 | ISM-0261 | CPS.SC-7 |
+| 12 | Channel retention policies | AU-11 | 3.3.1 | CC7.2 | - | 10.7.1 | SRG-APP-000515 | ISM-0859 | CPS.AU-11 |
 | 13 | Audit log streaming | AU-6(3) | 3.3.5 | CC7.2 | 8.2 | 10.5.1 | SRG-APP-000516 | ISM-0580 | CPS.AU-6 |
 | 14 | Admin role inventory | AC-6(5) | 3.1.5 | CC6.3 | 16.8 | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
 | 15 | Guest account controls | AC-2(2) | 3.1.1 | CC6.2 | 16.7 | 7.1.2 | SRG-APP-000024 | ISM-0415 | CPS.AC-2 |
-| 16 | Email domain restrictions | IA-5 | 3.5.7 | CC6.1 | — | 8.3.1 | SRG-APP-000173 | ISM-1557 | CPS.IA-5 |
-| 17 | Workspace discoverability | AC-3 | 3.1.1 | CC6.1 | — | 7.1.1 | SRG-APP-000033 | ISM-0432 | CPS.AC-3 |
-| 18 | Channel posting restrictions | AC-3(7) | 3.1.2 | CC6.1 | — | 7.1.1 | SRG-APP-000033 | ISM-0405 | CPS.AC-3 |
-| 19 | Custom emoji restrictions | CM-5 | 3.4.5 | CC8.1 | — | — | SRG-APP-000380 | ISM-1624 | CPS.CM-5 |
-| 20 | External email ingestion | SC-7(4) | 3.13.6 | CC6.6 | — | 1.3.2 | SRG-APP-000001 | ISM-0264 | CPS.SC-7 |
-| 21 | Link previews and URL unfurling | SC-7 | 3.13.1 | CC6.6 | — | — | SRG-APP-000001 | ISM-0260 | CPS.SC-7 |
-| 22 | SCIM provisioning status | AC-2(1) | 3.1.1 | CC6.2 | — | 7.1.1 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
+| 16 | Email domain restrictions | IA-5 | 3.5.7 | CC6.1 | - | 8.3.1 | SRG-APP-000173 | ISM-1557 | CPS.IA-5 |
+| 17 | Workspace discoverability | AC-3 | 3.1.1 | CC6.1 | - | 7.1.1 | SRG-APP-000033 | ISM-0432 | CPS.AC-3 |
+| 18 | Channel posting restrictions | AC-3(7) | 3.1.2 | CC6.1 | - | 7.1.1 | SRG-APP-000033 | ISM-0405 | CPS.AC-3 |
+| 19 | Custom emoji restrictions | CM-5 | 3.4.5 | CC8.1 | - | - | SRG-APP-000380 | ISM-1624 | CPS.CM-5 |
+| 20 | External email ingestion | SC-7(4) | 3.13.6 | CC6.6 | - | 1.3.2 | SRG-APP-000001 | ISM-0264 | CPS.SC-7 |
+| 21 | Link previews and URL unfurling | SC-7 | 3.13.1 | CC6.6 | - | - | SRG-APP-000001 | ISM-0260 | CPS.SC-7 |
+| 22 | SCIM provisioning status | AC-2(1) | 3.1.1 | CC6.2 | - | 7.1.1 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
 | 23 | Deactivated user audit | AC-2(3) | 3.1.12 | CC6.2 | 16.9 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
-| 24 | Workspace analytics access | AC-6(9) | 3.1.7 | CC6.3 | — | 7.1.2 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
-| 25 | Token rotation and revocation | IA-5(1) | 3.5.10 | CC6.1 | — | 8.6.3 | SRG-APP-000175 | ISM-1557 | CPS.IA-5 |
+| 24 | Workspace analytics access | AC-6(9) | 3.1.7 | CC6.3 | - | 7.1.2 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
+| 25 | Token rotation and revocation | IA-5(1) | 3.5.10 | CC6.1 | - | 8.6.3 | SRG-APP-000175 | ISM-1557 | CPS.IA-5 |
 
 ## 6. Existing Tools
 
@@ -341,4 +345,19 @@ goreleaser release --snapshot
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) on 2026-09-21. 25 of 25 controls are represented by findings: 16 are automated from documented read methods and 9 are manual by design because no public reference page exposes the setting (controls 4, 5, 6, 11, 13, 20, 21, 24, 25). Verdicts follow eight safety rules: unreadable or forbidden methods render manual with the cause, empty inventories never pass by default, plan or scope gaps render manual naming the plan, undated items are bucketed, partial inventories are flagged with seen and total counts, enabling flags must be read, pagination runs to completion or downgrades the verdict, and export reruns allocate `-2`, `-3` directories.
+
+### Deviations from this spec
+
+- `admin.teams.settings.info` documents only `id`, `name`, `domain`, `email_domain`, `icon`, `enterprise_id`, `enterprise_name`, and `default_channels`; SSO, session, idle, discoverability, and file settings listed in section 2 are not readable there. Discoverability is read from `admin.teams.list`, SSO coverage from `admin.users.list` `has_sso`, and session duration from `admin.users.session.getSettings`.
+- `admin.teams.admins.list` returns `admin_ids`, and the app inventories return `approved_apps` and `restricted_apps` with nested `app` objects; the implementation follows the documented shapes.
+- `admin.enterprise.info` is not a documented method and is no longer called.
+- The configuration file is not defined by this spec; the implementation reads `SLACK_CONFIG_FILE` or `~/.config/grclanker/slack.json` with `user_token`, `bot_token`, `scim_token`, and `org_id`.
+- `SLACK_BOT_TOKEN` is accepted for the two methods whose reference pages list bot tokens (`auth.test`, `users.list`).
+- The Go architecture, TUI, `--controls`, CSV, HTML, and SARIF outputs in sections 7 and 8 are not part of the CLI surface; results are Markdown and JSON in the export bundle.
+
+### Remaining work
+
+- IDP group channel restrictions via `admin.conversations.restrictAccess.listGroups`.
+- Guest expiration dates via `admin.users.list only_guests=true`.
+- Discovery API DLP content checks (`discovery.conversations.*`), which require a Discovery-approved app.
