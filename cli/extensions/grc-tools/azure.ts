@@ -33,6 +33,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const STALE_GUEST_DAYS = 90;
 const MIN_RETENTION_DAYS = 90;
 const LONG_LIVED_CREDENTIAL_DAYS = 730;
+const SECURITY_DEFAULTS_ENDPOINT = "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy";
+const MESSAGE_RULES_ENDPOINT = "GET /v1.0/users/{id}/mailFolders/inbox/messageRules";
+const MAILBOX_RULES_PERMISSION = "MailboxSettings.Read (application)";
 
 /**
  * Cloud endpoint sets. Public and US Government hosts:
@@ -229,6 +232,8 @@ export interface AzureAccessSurface {
   service: string;
   status: "readable" | "not_readable";
   count?: number;
+  /** True when the probe stopped at its page cap, so `count` is a floor rather than the inventory size. */
+  truncated?: boolean;
   error?: string;
 }
 
@@ -758,19 +763,23 @@ function roleDefinitionIdTail(value: string | undefined): string | undefined {
   return value?.split("/").at(-1)?.toLowerCase();
 }
 
+type SurfaceSummary = { count?: number; truncated?: boolean };
+
 async function surface(
   name: string,
   service: string,
   load: () => Promise<unknown>,
-  countResolver?: (value: unknown) => number | undefined,
+  summarize?: (value: unknown) => SurfaceSummary,
 ): Promise<AzureAccessSurface> {
   try {
     const value = await load();
+    const summary = summarize?.(value) ?? {};
     return {
       name,
       service,
       status: "readable",
-      count: countResolver?.(value),
+      count: summary.count,
+      ...(summary.truncated ? { truncated: true } : {}),
     };
   } catch (error) {
     return {
@@ -782,10 +791,76 @@ async function surface(
   }
 }
 
-function pageCount(value: unknown): number | undefined {
-  if (Array.isArray(value)) return value.length;
+/** Keeps the page's truncated flag next to its count so a capped probe is never reported as the full inventory. */
+function pageSummary(value: unknown): SurfaceSummary {
+  if (Array.isArray(value)) return { count: value.length };
   const page = asObject(value);
-  return page && Array.isArray(page.items) ? page.items.length : undefined;
+  if (!page || !Array.isArray(page.items)) return {};
+  return { count: page.items.length, truncated: page.truncated === true };
+}
+
+/**
+ * Reduces an error response body to its documented error envelope so bundle logs never
+ * echo raw payloads: Graph and ARM return `{ error: { code, message } }`, the token
+ * endpoint returns `{ error, error_description }`. Non-JSON bodies are dropped entirely.
+ * https://learn.microsoft.com/en-us/graph/errors and
+ * https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+ */
+export function describeErrorBody(text: string): string {
+  if (!text.trim()) return "";
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return "non-JSON error body omitted";
+  }
+  const record = asObject(payload);
+  if (!record) return "non-JSON error body omitted";
+  const envelope = asObject(record.error);
+  if (envelope) {
+    const code = asString(envelope.code);
+    const message = asString(envelope.message)?.replace(/\s+/g, " ").slice(0, 160);
+    return [code, message].filter(Boolean).join(": ") || "error body without code or message";
+  }
+  const oauthError = asString(record.error);
+  if (oauthError) {
+    const description = asString(record.error_description)?.replace(/\s+/g, " ").slice(0, 160);
+    return description ? `${oauthError}: ${description}` : oauthError;
+  }
+  return "error body without code or message";
+}
+
+/**
+ * Drops every secret-bearing credential property before a service principal or
+ * application record is kept. Graph list responses carry passwordCredential.hint
+ * (the first characters of the secret) and keyCredential.key; the findings only
+ * read the schedule fields.
+ * https://learn.microsoft.com/en-us/graph/api/resources/passwordcredential and
+ * https://learn.microsoft.com/en-us/graph/api/resources/keycredential
+ */
+export function projectCredentialCarrier(record: JsonRecord): JsonRecord {
+  const { passwordCredentials, keyCredentials, ...rest } = record;
+  return {
+    ...rest,
+    passwordCredentials: asRecords(passwordCredentials).map((credential) => ({
+      keyId: credential.keyId ?? null,
+      displayName: credential.displayName ?? null,
+      startDateTime: credential.startDateTime ?? null,
+      endDateTime: credential.endDateTime ?? null,
+    })),
+    keyCredentials: asRecords(keyCredentials).map((credential) => ({
+      keyId: credential.keyId ?? null,
+      displayName: credential.displayName ?? null,
+      type: credential.type ?? null,
+      usage: credential.usage ?? null,
+      startDateTime: credential.startDateTime ?? null,
+      endDateTime: credential.endDateTime ?? null,
+    })),
+  };
+}
+
+function projectPage(page: AzurePage, project: (record: JsonRecord) => JsonRecord): AzurePage {
+  return { ...page, items: page.items.map(project) };
 }
 
 export class AzureAuditorClient {
@@ -842,7 +917,8 @@ export class AzureAuditorClient {
     });
     const text = await response.text().catch(() => "");
     if (!response.ok) {
-      throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`, url, response.status);
+      const detail = describeErrorBody(text);
+      throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
     const payload = asObject(JSON.parse(text)) ?? {};
     const token = asString(payload.access_token);
@@ -865,42 +941,63 @@ export class AzureAuditorClient {
     });
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw new AzureApiError(`${response.status} ${response.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`, url, response.status);
+      const detail = describeErrorBody(text);
+      throw new AzureApiError(`${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
     const text = await response.text();
     return text.trim().length > 0 ? (JSON.parse(text) as JsonRecord) : {};
   }
 
-  /** Graph paging via @odata.nextLink, https://learn.microsoft.com/en-us/graph/paging */
-  private async collectGraph(path: string, limit = 5000, headers: Record<string, string> = {}): Promise<AzurePage> {
+  /**
+   * Shared next-link walk for Graph and ARM. Every early exit reports `truncated: true`:
+   * the item cap, a next link that repeats the page just fetched, and an empty page that
+   * still advertises a next link (both would otherwise loop forever).
+   */
+  private async collectPages(
+    firstUrl: string,
+    limit: number,
+    fetchPage: (url: string) => Promise<JsonRecord>,
+    nextLinkOf: (response: JsonRecord) => string | undefined,
+    totalOf?: (response: JsonRecord) => number | undefined,
+  ): Promise<AzurePage> {
     const items: JsonRecord[] = [];
     let total: number | undefined;
-    let nextUrl: string | undefined = path.startsWith("http") ? path : `${this.cloud.graphBaseUrl}${path}`;
+    let nextUrl: string | undefined = firstUrl;
     while (nextUrl) {
-      const response = await this.requestJson(nextUrl, "graph", { headers });
-      total ??= asNumber(response["@odata.count"]);
-      items.push(...asRecords(response.value));
-      nextUrl = asString(response["@odata.nextLink"]);
-      if (nextUrl && items.length >= limit) {
+      const currentUrl: string = nextUrl;
+      const response = await fetchPage(currentUrl);
+      if (totalOf) total ??= totalOf(response);
+      const pageItems = asRecords(response.value);
+      items.push(...pageItems);
+      nextUrl = nextLinkOf(response);
+      if (!nextUrl) break;
+      const stalled = nextUrl === currentUrl || pageItems.length === 0;
+      if (stalled || items.length >= limit) {
         return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total };
       }
     }
     return { items, truncated: false, seen: items.length, total: total ?? items.length };
   }
 
+  /** Graph paging via @odata.nextLink, https://learn.microsoft.com/en-us/graph/paging */
+  private async collectGraph(path: string, limit = 5000, headers: Record<string, string> = {}): Promise<AzurePage> {
+    return this.collectPages(
+      path.startsWith("http") ? path : `${this.cloud.graphBaseUrl}${path}`,
+      limit,
+      (url) => this.requestJson(url, "graph", { headers }),
+      (response) => asString(response["@odata.nextLink"]),
+      (response) => asNumber(response["@odata.count"]),
+    );
+  }
+
   /** ARM paging via nextLink, https://learn.microsoft.com/en-us/rest/api/azure/ */
   private async collectArm(path: string, limit = 5000): Promise<AzurePage> {
-    const items: JsonRecord[] = [];
-    let nextUrl: string | undefined = path.startsWith("http") ? path : `${this.cloud.managementBaseUrl}${path}`;
-    while (nextUrl) {
-      const response = await this.requestJson(nextUrl, "management");
-      items.push(...asRecords(response.value));
-      nextUrl = asString(response.nextLink);
-      if (nextUrl && items.length >= limit) {
-        return { items: items.slice(0, limit), truncated: true, seen: Math.min(items.length, limit), total: undefined };
-      }
-    }
-    return { items, truncated: false, seen: items.length, total: items.length };
+    return this.collectPages(
+      path.startsWith("http") ? path : `${this.cloud.managementBaseUrl}${path}`,
+      limit,
+      (url) => this.requestJson(url, "management"),
+      (response) => asString(response.nextLink),
+    );
   }
 
   private graph(path: string): string {
@@ -941,11 +1038,13 @@ export class AzureAuditorClient {
   }
 
   async listServicePrincipals(): Promise<AzurePage> {
-    return this.collectGraph("/v1.0/servicePrincipals?$top=100&$select=id,displayName,appId,passwordCredentials,keyCredentials");
+    const page = await this.collectGraph("/v1.0/servicePrincipals?$top=100&$select=id,displayName,appId,passwordCredentials,keyCredentials");
+    return projectPage(page, projectCredentialCarrier);
   }
 
   async listApplications(): Promise<AzurePage> {
-    return this.collectGraph("/v1.0/applications?$top=999&$select=id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials&$expand=owners($select=id)");
+    const page = await this.collectGraph("/v1.0/applications?$top=999&$select=id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials&$expand=owners($select=id)");
+    return projectPage(page, projectCredentialCarrier);
   }
 
   async listOAuth2PermissionGrants(): Promise<AzurePage> {
@@ -1131,21 +1230,25 @@ export async function checkAzureAccess(
 ): Promise<AzureAccessCheckResult> {
   const config = client.getResolvedConfig();
   const surfaces = await Promise.all([
-    surface("organization", "graph", () => client.getOrganization(), () => 1),
-    surface("conditional_access", "graph", () => client.listConditionalAccessPolicies(), pageCount),
-    surface("directory_roles", "graph", () => client.listDirectoryRoles(), pageCount),
-    surface("secure_scores", "graph", () => client.listSecureScores(), pageCount),
-    surface("defender_pricings", "arm", () => client.listDefenderPricings(), pageCount),
-    surface("role_assignments", "arm", () => client.listRoleAssignments(25), pageCount),
-    surface("diagnostic_settings", "arm", () => client.listDiagnosticSettings(), pageCount),
-    surface("security_contacts", "arm", () => client.listSecurityContacts(), pageCount),
+    surface("organization", "graph", () => client.getOrganization(), () => ({ count: 1 })),
+    surface("conditional_access", "graph", () => client.listConditionalAccessPolicies(), pageSummary),
+    surface("directory_roles", "graph", () => client.listDirectoryRoles(), pageSummary),
+    surface("secure_scores", "graph", () => client.listSecureScores(), pageSummary),
+    surface("defender_pricings", "arm", () => client.listDefenderPricings(), pageSummary),
+    surface("role_assignments", "arm", () => client.listRoleAssignments(25), pageSummary),
+    surface("diagnostic_settings", "arm", () => client.listDiagnosticSettings(), pageSummary),
+    surface("security_contacts", "arm", () => client.listSecurityContacts(), pageSummary),
   ]);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
   const status = readableCount >= 6 ? "healthy" : "limited";
+  const truncatedSurfaces = surfaces.filter((item) => item.truncated).map((item) => item.name);
   const notes = [
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} Azure audit surfaces are readable.`,
+    ...(truncatedSurfaces.length > 0
+      ? [`Probe counts for ${truncatedSurfaces.join(", ")} stopped at the probe page cap and are lower bounds, not inventory sizes.`]
+      : []),
   ];
 
   return {
@@ -1242,22 +1345,40 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     findings.push(manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", "GET /v1.0/identity/conditionalAccess/policies", "Policy.Read.All", "the Conditional Access policy export from the Entra admin center", policies, AZURE_ENDPOINT_DOCS.conditionalAccess, errors));
     findings.push(manualForError("AZURE-ID-02", 4, "Legacy authentication blocking", "high", "GET /v1.0/identity/conditionalAccess/policies", "Policy.Read.All", "the Conditional Access policies that block legacy clients", policies, AZURE_ENDPOINT_DOCS.conditionalAccess, errors));
   } else {
+    // Security defaults are a secondary read: an enabled MFA or block policy satisfies the control on its own,
+    // but when no such policy exists the verdict rests entirely on the defaults, so an unreadable read is manual, not fail.
+    const defaultsFailure = securityDefaults.ok ? undefined : describeFailure(securityDefaults);
+    const defaultsNote = defaultsFailure ? ` Security defaults could not be read (${SECURITY_DEFAULTS_ENDPOINT} returned ${defaultsFailure}).` : "";
+    const defaultsEvidence = { security_defaults_enabled: securityDefaultsEnabled, security_defaults_readable: securityDefaults.ok, security_defaults_error: defaultsFailure ?? null };
+    if (defaultsFailure) errors.push(`AZURE-ID-01 ${SECURITY_DEFAULTS_ENDPOINT}: ${defaultsFailure}`);
+    const policyEvidence = { total_policies: policies.value.items.length, enabled_policies: enabled.length, report_only_policies: reportOnly.length, mfa_policies: mfaPolicies.length, ...defaultsEvidence, ...pageEvidence(policies.value) };
     const baseline = mfaPolicies.length > 0 || securityDefaultsEnabled;
-    findings.push(finding("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high",
-      baseline ? capForPartial("pass", policies.value) : "fail",
-      baseline
-        ? `Strong authentication baseline is present via ${mfaPolicies.length} enabled MFA Conditional Access policies${securityDefaultsEnabled ? " and security defaults" : ""}.${reportOnly.length > 0 ? ` ${reportOnly.length} policies are report-only and were not counted.` : ""}${partialNote(policies.value, "Conditional Access policies")}`
-        : policies.value.items.length === 0
-          ? "Zero Conditional Access policies were returned and security defaults are off; empty inventory fails this control by intent."
-          : `No enabled MFA Conditional Access policy or security defaults baseline was found (${reportOnly.length} report-only policies do not enforce).`,
-      { total_policies: policies.value.items.length, enabled_policies: enabled.length, report_only_policies: reportOnly.length, mfa_policies: mfaPolicies.length, security_defaults_enabled: securityDefaultsEnabled, security_defaults_readable: securityDefaults.ok, ...pageEvidence(policies.value) }));
+    if (!baseline && !securityDefaults.ok) {
+      const manual = manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", SECURITY_DEFAULTS_ENDPOINT, "Policy.Read.All", "the security defaults setting from the Entra admin center together with the Conditional Access policy export", securityDefaults, AZURE_ENDPOINT_DOCS.securityDefaults, errors);
+      findings.push({ ...manual, summary: `No enabled MFA Conditional Access policy was found and ${manual.summary}`, evidence: { ...manual.evidence, ...policyEvidence } });
+    } else {
+      findings.push(finding("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high",
+        baseline ? capForPartial("pass", policies.value) : "fail",
+        baseline
+          ? `Strong authentication baseline is present via ${mfaPolicies.length} enabled MFA Conditional Access policies${securityDefaultsEnabled ? " and security defaults" : ""}.${reportOnly.length > 0 ? ` ${reportOnly.length} policies are report-only and were not counted.` : ""}${partialNote(policies.value, "Conditional Access policies")}${defaultsNote}`
+          : policies.value.items.length === 0
+            ? "Zero Conditional Access policies were returned and security defaults are off; empty inventory fails this control by intent."
+            : `No enabled MFA Conditional Access policy or security defaults baseline was found (${reportOnly.length} report-only policies do not enforce).`,
+        policyEvidence));
+    }
     const legacyBlocked = legacyAuthPolicies.length > 0 || securityDefaultsEnabled;
-    findings.push(finding("AZURE-ID-02", 4, "Legacy authentication blocking", "high",
-      legacyBlocked ? capForPartial("pass", policies.value) : "fail",
-      legacyBlocked
-        ? `Legacy authentication is blocked via ${legacyAuthPolicies.length} enabled Conditional Access block policies targeting exchangeActiveSync/other clients${securityDefaultsEnabled ? " and security defaults" : ""}.${partialNote(policies.value, "Conditional Access policies")}`
-        : "No enabled Conditional Access policy blocks exchangeActiveSync/other client app types and security defaults are off.",
-      { legacy_auth_block_policies: legacyAuthPolicies.length, security_defaults_enabled: securityDefaultsEnabled, ...pageEvidence(policies.value) }));
+    const legacyEvidence = { legacy_auth_block_policies: legacyAuthPolicies.length, ...defaultsEvidence, ...pageEvidence(policies.value) };
+    if (!legacyBlocked && !securityDefaults.ok) {
+      const manual = manualForError("AZURE-ID-02", 4, "Legacy authentication blocking", "high", SECURITY_DEFAULTS_ENDPOINT, "Policy.Read.All", "the security defaults setting from the Entra admin center together with the Conditional Access policies that block legacy clients", securityDefaults, AZURE_ENDPOINT_DOCS.securityDefaults, errors);
+      findings.push({ ...manual, summary: `No enabled Conditional Access policy blocks exchangeActiveSync/other client app types and ${manual.summary}`, evidence: { ...manual.evidence, ...legacyEvidence } });
+    } else {
+      findings.push(finding("AZURE-ID-02", 4, "Legacy authentication blocking", "high",
+        legacyBlocked ? capForPartial("pass", policies.value) : "fail",
+        legacyBlocked
+          ? `Legacy authentication is blocked via ${legacyAuthPolicies.length} enabled Conditional Access block policies targeting exchangeActiveSync/other clients${securityDefaultsEnabled ? " and security defaults" : ""}.${partialNote(policies.value, "Conditional Access policies")}${defaultsNote}`
+          : "No enabled Conditional Access policy blocks exchangeActiveSync/other client app types and security defaults are off.",
+        legacyEvidence));
+    }
   }
 
   if (!registrations.ok) {
@@ -1532,24 +1653,24 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
     findings.push(manualForError("AZURE-MON-04", 16, "Defender for Cloud plan coverage", "high", "GET Microsoft.Security/pricings", "Security Reader on the subscription", "the Defender for Cloud environment settings page", defenderPricings, AZURE_ENDPOINT_DOCS.defenderPricings, errors));
   } else {
     findings.push(finding("AZURE-MON-04", 16, "Defender for Cloud plan coverage", "high",
-      totalPlans === 0 ? "manual" : standardPlans.length === totalPlans ? "pass" : standardPlans.length > 0 ? "warn" : "fail",
+      totalPlans === 0 ? "manual" : standardPlans.length === totalPlans ? capForPartial("pass", defenderPricings.value) : standardPlans.length > 0 ? "warn" : "fail",
       totalPlans > 0
-        ? `${standardPlans.length}/${totalPlans} Defender for Cloud plans are on the Standard pricingTier.`
+        ? `${standardPlans.length}/${totalPlans} Defender for Cloud plans are on the Standard pricingTier.${partialNote(defenderPricings.value, "Defender plans")}`
         : "Zero Defender pricing records were returned; the API always lists every plan, so confirm access manually.",
-      { standard_plans: standardPlans.length, total_plans: totalPlans, alerts_visible: alerts.ok ? alerts.value.seen : null, alerts_error: alerts.ok ? null : describeFailure(alerts) }));
+      { standard_plans: standardPlans.length, total_plans: totalPlans, alerts_visible: alerts.ok ? alerts.value.seen : null, alerts_error: alerts.ok ? null : describeFailure(alerts), ...pageEvidence(defenderPricings.value) }));
   }
 
   const effectiveSettings = diagnosticSettings.ok ? diagnosticSettings.value.items.filter((setting) => diagnosticSettingHasEnabledLog(setting) && diagnosticSettingDestination(setting)) : [];
   if (!diagnosticSettings.ok) {
     findings.push(manualForError("AZURE-MON-05", 15, "Subscription diagnostic settings", "high", "GET Microsoft.Insights/diagnosticSettings", "Reader (Monitoring Reader) on the subscription", "the Activity log diagnostic settings page", diagnosticSettings, AZURE_ENDPOINT_DOCS.diagnosticSettings, errors));
   } else {
-    findings.push(finding("AZURE-MON-05", 15, "Subscription diagnostic settings", "high", effectiveSettings.length > 0 ? "pass" : "fail",
+    findings.push(finding("AZURE-MON-05", 15, "Subscription diagnostic settings", "high", effectiveSettings.length > 0 ? capForPartial("pass", diagnosticSettings.value) : "fail",
       effectiveSettings.length > 0
-        ? `${effectiveSettings.length}/${diagnosticSettings.value.items.length} subscription diagnostic settings have enabled log categories and a destination.`
+        ? `${effectiveSettings.length}/${diagnosticSettings.value.items.length} subscription diagnostic settings have enabled log categories and a destination.${partialNote(diagnosticSettings.value, "diagnostic settings")}`
         : diagnosticSettings.value.items.length === 0
           ? "Zero subscription diagnostic settings exist; Activity Log is not exported (empty inventory fails by intent)."
           : `${diagnosticSettings.value.items.length} diagnostic settings exist but none has an enabled log category with a destination.`,
-      { diagnostic_settings: diagnosticSettings.value.items.length, effective_settings: effectiveSettings.length }));
+      { diagnostic_settings: diagnosticSettings.value.items.length, effective_settings: effectiveSettings.length, ...pageEvidence(diagnosticSettings.value) }));
   }
 
   if (!diagnosticSettings.ok) {
@@ -1823,15 +1944,22 @@ export async function assessAzureDataProtection(
   } else {
     const forwardingRules: JsonRecord[] = [];
     let mailboxesRead = 0;
-    let mailboxesUnreadable = 0;
+    let mailboxesDenied = 0;
+    let mailboxesErrored = 0;
     let permissionFailure: { error: string; status?: number } | undefined;
+    let otherFailure: { error: string; status?: number } | undefined;
     for (const user of members.value.items) {
       const userId = asString(user.id);
       if (!userId) continue;
       const rules = await attemptPage(() => client.listInboxMessageRules(userId));
       if (!rules.ok) {
-        mailboxesUnreadable += 1;
-        if (rules.status === 401 || rules.status === 403) permissionFailure = rules;
+        if (rules.status === 401 || rules.status === 403) {
+          mailboxesDenied += 1;
+          permissionFailure = rules;
+        } else {
+          mailboxesErrored += 1;
+          otherFailure = rules;
+        }
         continue;
       }
       mailboxesRead += 1;
@@ -1843,18 +1971,37 @@ export async function assessAzureDataProtection(
         }
       }
     }
+    const mailboxesUnreadable = mailboxesDenied + mailboxesErrored;
     if (permissionFailure && mailboxesRead === 0) {
-      findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", "GET /v1.0/users/{id}/mailFolders/inbox/messageRules", "MailboxSettings.Read (application)", "the inbox rule export for every mailbox", permissionFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
+      findings.push(manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", permissionFailure, AZURE_ENDPOINT_DOCS.messageRules, errors));
     } else {
+      // A denied subset is a permission gap on those mailboxes, not a licensing quirk; only non-permission
+      // errors (typically 404 for users without an Exchange mailbox) are described that way.
+      if (permissionFailure) errors.push(`AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(permissionFailure)} on ${mailboxesDenied} of ${mailboxesRead + mailboxesUnreadable} mailboxes`);
+      const unreadableNotes = [
+        mailboxesDenied > 0 && permissionFailure ? `${mailboxesDenied} denied with ${describeFailure(permissionFailure)}, so ${MAILBOX_RULES_PERMISSION} is missing for those mailboxes and their rules were not inspected` : "",
+        mailboxesErrored > 0 && otherFailure ? `${mailboxesErrored} returned a non-permission error (${describeFailure(otherFailure)}; commonly users without an Exchange mailbox)` : "",
+      ].filter(Boolean);
       const partial = members.value.truncated || mailboxesUnreadable > 0;
       const status: AzureFindingStatus = members.value.items.length === 0
         ? "manual"
         : forwardingRules.length > 0 ? "fail" : partial ? "warn" : "pass";
+      const unreadableSummary = mailboxesUnreadable > 0
+        ? ` (${mailboxesUnreadable} unreadable: ${unreadableNotes.join("; ")}${status === "warn" ? "; verdict capped at warn" : ""})`
+        : "";
       findings.push(finding("AZURE-DP-06", 20, "Inbox forwarding rules", "high", status,
         members.value.items.length === 0
           ? "Zero enabled member users were returned; confirm User.Read.All before treating mailboxes as clean."
-          : `${forwardingRules.length} enabled inbox rules forward or redirect mail across ${mailboxesRead} readable mailboxes (${mailboxesUnreadable} unreadable, likely without an Exchange mailbox).${partialNote(members.value, "member users")}`,
-        { mailboxes_read: mailboxesRead, mailboxes_unreadable: mailboxesUnreadable, forwarding_rules: forwardingRules.slice(0, 25), ...pageEvidence(members.value) }));
+          : `${forwardingRules.length} enabled inbox rules forward or redirect mail across ${mailboxesRead} readable mailboxes${unreadableSummary}.${partialNote(members.value, "member users")}`,
+        {
+          mailboxes_read: mailboxesRead,
+          mailboxes_unreadable: mailboxesUnreadable,
+          mailboxes_permission_denied: mailboxesDenied,
+          mailboxes_other_errors: mailboxesErrored,
+          permission_failure: permissionFailure ? { endpoint: MESSAGE_RULES_ENDPOINT, http_status: permissionFailure.status ?? null, required_access: MAILBOX_RULES_PERMISSION, error: permissionFailure.error.slice(0, 300) } : null,
+          forwarding_rules: forwardingRules.slice(0, 25),
+          ...pageEvidence(members.value),
+        }));
     }
   }
 
@@ -2083,7 +2230,7 @@ function formatAccessCheckText(result: AzureAccessCheckResult): string {
     surfaceItem.name,
     surfaceItem.service,
     surfaceItem.status,
-    surfaceItem.count === undefined ? "-" : String(surfaceItem.count),
+    surfaceItem.count === undefined ? "-" : `${surfaceItem.count}${surfaceItem.truncated ? "+ (capped)" : ""}`,
     surfaceItem.error ? surfaceItem.error.replace(/\s+/g, " ").slice(0, 80) : "",
   ]);
   return [
@@ -2216,7 +2363,7 @@ function buildQuickReference(result: { assessments: AzureAssessmentResult[]; err
     "- `compliance/executive_summary.md`: prioritized summary",
     "- `compliance/unified_compliance_matrix.md`: finding to framework matrix",
     "- `compliance/<framework>.md`: one report per framework in the spec mapping table",
-    "- `_errors.log`: present only when an API call failed and a finding was rendered manual",
+    "- `_errors.log`: present only when an API call failed; each entry names the finding that rendered manual or recorded the failure in its evidence",
     "",
     "## Status semantics",
     "",
@@ -2245,9 +2392,11 @@ function buildBundleReadme(): string {
     "- `compliance/`: executive summary, unified compliance matrix, per-framework reports",
     "- `analysis/`: normalized findings and assessment details as JSON",
     "- `core_data/`: accessible Azure audit surface inventory and non-secret run metadata",
-    "- `_errors.log`: API failures that produced manual findings (only on partial failure)",
+    "- `_errors.log`: API failures recorded during the run, each named in the affected finding (only on partial failure)",
     "",
-    "Resolved access tokens and client secrets are never written to this bundle.",
+    "Resolved access tokens and client secrets are never written to this bundle. Service principal and app registration",
+    "credentials are reduced to their schedule fields (keyId, start, end, type) before they are kept, and API error bodies are",
+    "reduced to their documented error code and message.",
   ].join("\n");
 }
 

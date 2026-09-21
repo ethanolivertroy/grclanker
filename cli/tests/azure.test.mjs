@@ -20,15 +20,18 @@ import {
   assessAzureNetworkAndPolicy,
   assessAzureSubscriptionGuardrails,
   checkAzureAccess,
+  describeErrorBody,
   exportAzureAuditBundle,
   isExposedAdminRule,
   parseNetworkWatcherId,
+  projectCredentialCarrier,
   resolveAzureCloud,
   resolveAzureConfiguration,
   resolveSecureOutputPath,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
 const ASSESSORS = [
@@ -76,11 +79,9 @@ function sampleConfig(overrides = {}) {
   };
 }
 
+/** A real AzureApiError so attempt() sees status 403 the way requestJson produces it. */
 function forbidden() {
-  const error = new Error("403 Forbidden: Insufficient privileges");
-  error.name = "AzureApiError";
-  error.status = 403;
-  return error;
+  return new azureModule.AzureApiError("403 Forbidden: Insufficient privileges", "https://graph.microsoft.com/v1.0/denied", 403);
 }
 
 function clientWith(overrides = {}, base = {}) {
@@ -260,7 +261,7 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
 });
 
 // Prototype members that do not issue a Graph or ARM request; every other client method must appear in the URL assertions below.
-const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectGraph", "collectArm", "graph", "arm"]);
+const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
 
 test("AzureAuditorClient sends the documented request URL and API version for every request method", async () => {
   const requests = [];
@@ -370,6 +371,110 @@ test("pagination follows @odata.nextLink and nextLink to completion and records 
   assert.equal(toPage([{ id: 1 }]).truncated, false);
 });
 
+test("rule 10: a next link that repeats or arrives with an empty page exits as truncated instead of looping", async () => {
+  const graphCalls = [];
+  const repeating = new AzureAuditorClient(sampleConfig(), {
+    fetchImpl: async (url) => {
+      graphCalls.push(url);
+      // The server keeps handing back the same page URL; without a guard this walk never ends.
+      return new Response(JSON.stringify({ value: [{ id: `sku-${graphCalls.length}` }], "@odata.nextLink": "https://graph.microsoft.com/v1.0/subscribedSkus?$skiptoken=same" }), { status: 200 });
+    },
+    now: () => NOW,
+  });
+  const repeated = await repeating.listSubscribedSkus();
+  assert.equal(graphCalls.length, 2, "the first page follows the link once, the repeat stops the walk");
+  assert.equal(repeated.truncated, true);
+  assert.equal(repeated.seen, 2);
+  assert.deepEqual(repeated.items.map((item) => item.id), ["sku-1", "sku-2"]);
+
+  const armCalls = [];
+  const emptyPages = new AzureAuditorClient(sampleConfig(), {
+    fetchImpl: async (url) => {
+      armCalls.push(url);
+      if (armCalls.length === 1) return new Response(JSON.stringify({ value: [{ id: "kv-1" }], nextLink: "https://management.azure.com/next?page=2" }), { status: 200 });
+      // Each later page is empty but still advertises a fresh next link.
+      return new Response(JSON.stringify({ value: [], nextLink: `https://management.azure.com/next?page=${armCalls.length + 1}` }), { status: 200 });
+    },
+    now: () => NOW,
+  });
+  const empty = await emptyPages.listKeyVaults();
+  assert.equal(armCalls.length, 2);
+  assert.equal(empty.truncated, true);
+  assert.deepEqual(empty.items.map((item) => item.id), ["kv-1"]);
+
+  // A truncated walk from either guard still demotes the consuming verdict through capForPartial.
+  const guardrails = await assessAzureSubscriptionGuardrails({
+    listRoleAssignments: async () => repeated,
+    listRoleDefinitions: async () => [],
+    listSecurityContacts: async () => [{ properties: { emails: "soc@example.com" } }],
+    listNetworkWatchers: async () => [],
+  });
+  assert.equal(guardrails.findings.find((item) => item.id === "AZURE-SUB-01").status, "warn");
+});
+
+test("rule 9: API error bodies are reduced to the documented error envelope before they reach messages, evidence, or logs", async () => {
+  assert.equal(describeErrorBody(""), "");
+  assert.equal(describeErrorBody(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation.", innerError: { "request-id": "req-1", date: "2026-04-16" } } })), "Authorization_RequestDenied: Insufficient privileges to complete the operation.");
+  assert.equal(describeErrorBody(JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided.", trace_id: "trace-1", correlation_id: "corr-1" })), "invalid_client: AADSTS7000215: Invalid client secret provided.");
+  assert.equal(describeErrorBody("<html>Bad gateway, request Authorization: Bearer leaked-token</html>"), "non-JSON error body omitted");
+  assert.equal(describeErrorBody(JSON.stringify({ unexpected: "shape", token: "leaked-token" })), "error body without code or message");
+
+  const leakedMarker = "LEAKED-REQUEST-CONTEXT";
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/oauth2/v2.0/token")) {
+      return new Response(JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided.", trace_id: leakedMarker }), { status: 401, statusText: "Unauthorized" });
+    }
+    return new Response(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation.", innerError: { echo: leakedMarker } } }), { status: 403, statusText: "Forbidden" });
+  };
+  const tokenClient = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  await assert.rejects(tokenClient.listSubscribedSkus(), (error) => {
+    assert.equal(error.name, "AzureApiError");
+    assert.equal(error.status, 403);
+    assert.equal(error.message, "403 Forbidden: Authorization_RequestDenied: Insufficient privileges to complete the operation.");
+    assert.ok(!error.message.includes(leakedMarker));
+    return true;
+  });
+  const credentialConfig = resolveAzureConfiguration(
+    {},
+    { AZURE_TENANT_ID: "tenant-1", AZURE_SUBSCRIPTION_ID: "sub-1", AZURE_CLIENT_ID: "client-1", AZURE_CLIENT_SECRET: "secret-value-1" },
+    () => undefined,
+  );
+  await assert.rejects(new AzureAuditorClient(credentialConfig, { fetchImpl, now: () => NOW }).getOrganization(), (error) => {
+    assert.equal(error.message, "Token request failed: 401 Unauthorized: invalid_client: AADSTS7000215: Invalid client secret provided.");
+    assert.ok(!error.message.includes(leakedMarker));
+    assert.ok(!error.message.includes("secret-value-1"));
+    return true;
+  });
+});
+
+test("rule 9: service principal and application credential records keep only schedule fields at collection time", async () => {
+  const rawCredential = { keyId: "k1", displayName: "automation", hint: "Abc", secretText: "FAKE-SECRET-TEXT", customKeyIdentifier: "Y3Vz", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2026-12-01T00:00:00Z" };
+  const rawKey = { keyId: "k2", displayName: "cert", type: "AsymmetricX509Cert", usage: "Verify", key: "FAKE-KEY-BLOB", customKeyIdentifier: "dGh1bWI=", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2027-01-01T00:00:00Z" };
+  const projected = projectCredentialCarrier({ id: "sp-1", displayName: "App", appId: "app-1", passwordCredentials: [rawCredential], keyCredentials: [rawKey] });
+  assert.deepEqual(projected, {
+    id: "sp-1",
+    displayName: "App",
+    appId: "app-1",
+    passwordCredentials: [{ keyId: "k1", displayName: "automation", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2026-12-01T00:00:00Z" }],
+    keyCredentials: [{ keyId: "k2", displayName: "cert", type: "AsymmetricX509Cert", usage: "Verify", startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2027-01-01T00:00:00Z" }],
+  });
+  assert.deepEqual(projectCredentialCarrier({ id: "sp-2" }), { id: "sp-2", passwordCredentials: [], keyCredentials: [] });
+
+  const fetchImpl = async () => new Response(JSON.stringify({ value: [{ id: "sp-1", displayName: "App", appId: "app-1", passwordCredentials: [rawCredential], keyCredentials: [rawKey] }] }), { status: 200 });
+  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  for (const page of [await client.listServicePrincipals(), await client.listApplications()]) {
+    const serialized = JSON.stringify(page);
+    for (const secret of ["Abc", "FAKE-SECRET-TEXT", "FAKE-KEY-BLOB", "hint", "secretText", "customKeyIdentifier"]) {
+      assert.ok(!serialized.includes(secret), `${secret} survived collection`);
+    }
+    assert.equal(page.items[0].passwordCredentials[0].endDateTime, "2026-12-01T00:00:00Z");
+  }
+  // The projected shape still drives the credential hygiene verdicts.
+  const identity = await assessAzureIdentity(clientWith({ ...compliantClient(), listServicePrincipals: () => client.listServicePrincipals(), listApplications: () => client.listApplications() }));
+  assert.equal(identity.findings.find((item) => item.id === "AZURE-ID-05").status, "pass");
+  assert.equal(identity.findings.find((item) => item.id === "AZURE-ID-12").status, "pass");
+});
+
 test("checkAzureAccess reports readable audit surfaces", async () => {
   const client = clientWith({
     async getOrganization() { return { id: "org-1" }; },
@@ -386,8 +491,53 @@ test("checkAzureAccess reports readable audit surfaces", async () => {
   assert.equal(result.status, "healthy");
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 8);
   assert.equal(result.surfaces.find((surface) => surface.name === "defender_pricings").count, 1);
+  assert.equal(result.surfaces.find((surface) => surface.name === "defender_pricings").truncated, undefined);
+  assert.ok(result.notes.every((note) => !note.includes("probe page cap")));
   assert.match(result.recommendedNextStep, /azure_assess_subscription_guardrails/);
   assert.match(result.recommendedNextStep, /azure_assess_data_protection, azure_assess_network_and_policy/);
+});
+
+test("rule 10: checkAzureAccess keeps the truncated flag on a capped probe so its count reads as a floor", async () => {
+  let requestedLimit;
+  const client = clientWith({
+    ...compliantClient(),
+    async listRoleAssignments(limit) {
+      requestedLimit = limit;
+      return { items: Array.from({ length: limit }, (_, index) => ({ id: `assignment-${index}` })), truncated: true, seen: limit, total: undefined };
+    },
+  });
+  const result = await checkAzureAccess(client);
+  assert.equal(requestedLimit, 25);
+  const assignments = result.surfaces.find((surface) => surface.name === "role_assignments");
+  assert.equal(assignments.status, "readable");
+  assert.equal(assignments.count, 25);
+  assert.equal(assignments.truncated, true);
+  assert.ok(result.notes.some((note) => /role_assignments stopped at the probe page cap and are lower bounds/.test(note)));
+  assert.equal(result.surfaces.find((surface) => surface.name === "security_contacts").truncated, undefined);
+});
+
+test("rule 10: AZURE-MON-04 and AZURE-MON-05 cap at warn on a truncated pricing or diagnostic settings page", async () => {
+  const baseline = statusesById(await assessAzureMonitoring(compliantClient()));
+  assert.equal(baseline["AZURE-MON-04"], "pass");
+  assert.equal(baseline["AZURE-MON-05"], "pass");
+
+  const truncated = clientWith({
+    ...compliantClient(),
+    async listDefenderPricings() { return { items: [{ name: "VirtualMachines", properties: { pricingTier: "Standard" } }], truncated: true, seen: 1 }; },
+    async listDiagnosticSettings() { return { items: [{ id: "diag-1", properties: { workspaceId: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law", logs: [{ category: "Administrative", enabled: true }] } }], truncated: true, seen: 1, total: 3 }; },
+  });
+  const result = await assessAzureMonitoring(truncated);
+  const pricing = result.findings.find((item) => item.id === "AZURE-MON-04");
+  assert.equal(pricing.status, "warn");
+  assert.match(pricing.summary, /1\/1 Defender for Cloud plans are on the Standard pricingTier\. Inventory of Defender plans is partial \(1 seen of unknown total\); verdict capped at warn\./);
+  assert.equal(pricing.evidence.truncated, true);
+  const diagnostics = result.findings.find((item) => item.id === "AZURE-MON-05");
+  assert.equal(diagnostics.status, "warn");
+  assert.match(diagnostics.summary, /Inventory of diagnostic settings is partial \(1 seen of 3 total\); verdict capped at warn\./);
+  assert.deepEqual({ seen: diagnostics.evidence.seen, total: diagnostics.evidence.total, truncated: diagnostics.evidence.truncated }, { seen: 1, total: 3, truncated: true });
+  // A non-compliant page is still fail or warn on its own merits, never masked by the cap.
+  const mixed = clientWith({ ...compliantClient(), async listDefenderPricings() { return { items: [{ properties: { pricingTier: "Standard" } }, { properties: { pricingTier: "Free" } }], truncated: true, seen: 2 }; } });
+  assert.equal((await assessAzureMonitoring(mixed)).findings.find((item) => item.id === "AZURE-MON-04").status, "warn");
 });
 
 test("assessAzureIdentity flags weak auth baseline and privileged role sprawl", async () => {
@@ -686,6 +836,143 @@ test("AZURE-DP-03 reads the beta sensitivity label endpoint and states the beta 
   assert.equal(manual.evidence.endpoint, "GET /beta/security/informationProtection/sensitivityLabels");
 });
 
+/**
+ * Rule 1 corollary: every verdict that reads more than one inventory is denied one secondary at a time while the
+ * primary and everything else stay healthy. The named findings must render manual (naming the endpoint) or the
+ * stated status, and no other finding may move off the compliant baseline.
+ */
+const SECONDARY_DENIALS = [
+  { method: "getSecurityDefaultsPolicy", assessor: assessAzureIdentity, expect: { "AZURE-ID-01": "pass", "AZURE-ID-02": "pass" }, note: /Security defaults could not be read \(GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\)/ },
+  { method: "listDirectoryRoleMembers", assessor: assessAzureIdentity, expect: { "AZURE-ID-04": "manual" }, endpoint: "GET /v1.0/directoryRoles/{id}/members" },
+  { method: "listRoleEligibilitySchedules", assessor: assessAzureIdentity, expect: { "AZURE-ID-06": "manual" }, endpoint: "GET /v1.0/roleManagement/directory/roleEligibilitySchedules" },
+  { method: "listRoleAssignmentSchedules", assessor: assessAzureIdentity, expect: { "AZURE-ID-06": "manual" }, endpoint: "GET /v1.0/roleManagement/directory/roleAssignmentSchedules" },
+  { method: "listSubscribedSkus", assessor: assessAzureIdentity, expect: { "AZURE-ID-09": "manual", "AZURE-ID-10": "manual" }, endpoint: "GET /v1.0/subscribedSkus" },
+  { method: "listRiskDetections", assessor: assessAzureIdentity, expect: { "AZURE-ID-11": "manual" }, endpoint: "GET /v1.0/identityProtection/riskDetections" },
+  { method: "listSecurityAlerts", assessor: assessAzureMonitoring, expect: { "AZURE-MON-04": "pass" }, evidence: (item) => assert.equal(item.evidence.alerts_error, "403 Forbidden") },
+  { method: "listLogAnalyticsWorkspaces", assessor: assessAzureMonitoring, expect: { "AZURE-MON-06": "manual" }, endpoint: "GET Microsoft.OperationalInsights/workspaces" },
+  { method: "listRoleDefinitions", assessor: assessAzureSubscriptionGuardrails, expect: { "AZURE-SUB-01": "manual", "AZURE-SUB-02": "manual", "AZURE-SUB-05": "manual" }, endpoint: "GET Microsoft.Authorization/roleDefinitions" },
+  { method: "listSubscribedSkus", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, endpoint: "GET /v1.0/subscribedSkus" },
+  { method: "listDeviceCompliancePolicies", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, endpoint: "GET /v1.0/deviceManagement/deviceCompliancePolicies" },
+  { method: "listManagedDevices", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, endpoint: "GET /v1.0/deviceManagement/managedDevices" },
+  { method: "listInboxMessageRules", assessor: assessAzureDataProtection, expect: { "AZURE-DP-06": "manual" }, endpoint: "GET /v1.0/users/{id}/mailFolders/inbox/messageRules" },
+  { method: "listNetworkWatchers", assessor: assessAzureNetworkAndPolicy, expect: { "AZURE-NP-04": "manual" }, endpoint: "GET Microsoft.Network/networkWatchers" },
+  { method: "listFlowLogs", assessor: assessAzureNetworkAndPolicy, expect: { "AZURE-NP-04": "manual" }, endpoint: "GET Microsoft.Network/networkWatchers/{networkWatcherName}/flowLogs" },
+];
+
+test("rule 1 corollary: denying one secondary read at a time never passes the dependent finding silently and never moves unrelated findings", async () => {
+  const baselines = new Map();
+  for (const assessor of new Set(SECONDARY_DENIALS.map((scenario) => scenario.assessor))) {
+    baselines.set(assessor, statusesById(await assessor(compliantClient())));
+  }
+
+  for (const scenario of SECONDARY_DENIALS) {
+    const label = `${scenario.method} -> ${Object.keys(scenario.expect).join(",")}`;
+    const client = clientWith({ ...compliantClient(), [scenario.method]: async () => { throw forbidden(); } });
+    const result = await scenario.assessor(client);
+    const statuses = statusesById(result);
+    const baseline = baselines.get(scenario.assessor);
+    for (const [id, status] of Object.entries(scenario.expect)) {
+      const item = result.findings.find((entry) => entry.id === id);
+      assert.equal(item.status, status, `${label}: ${id} was ${item.status}: ${item.summary}`);
+      if (status === "manual") {
+        assert.match(item.summary, /403 Forbidden/, `${label}: ${id}`);
+        assert.ok(item.evidence.required_access, `${label}: ${id} names the access to grant`);
+        if (scenario.endpoint) assert.equal(item.evidence.endpoint, scenario.endpoint, `${label}: ${id}`);
+        assert.ok(result.errors.some((error) => error.startsWith(`${id} `) && error.includes("403 Forbidden")), `${label}: ${id} recorded in errors`);
+      }
+      if (scenario.note) assert.match(item.summary, scenario.note, `${label}: ${id}`);
+      scenario.evidence?.(item);
+    }
+    for (const [id, status] of Object.entries(baseline)) {
+      if (id in scenario.expect) continue;
+      assert.equal(statuses[id], status, `${label}: unrelated ${id} moved from ${status} to ${statuses[id]}`);
+    }
+  }
+});
+
+test("rule 1 corollary: AZURE-ID-01 and AZURE-ID-02 never call security defaults off when the read failed", async () => {
+  const defaultsDenied = clientWith({ ...compliantClient(), getSecurityDefaultsPolicy: async () => { throw forbidden(); } });
+  const withPolicies = await assessAzureIdentity(defaultsDenied);
+  for (const id of ["AZURE-ID-01", "AZURE-ID-02"]) {
+    const item = withPolicies.findings.find((entry) => entry.id === id);
+    assert.equal(item.status, "pass", id);
+    assert.doesNotMatch(item.summary, /security defaults are off/, id);
+    assert.match(item.summary, /Security defaults could not be read \(GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\)\./, id);
+    assert.equal(item.evidence.security_defaults_readable, false, id);
+    assert.equal(item.evidence.security_defaults_enabled, false, id);
+    assert.equal(item.evidence.security_defaults_error, "403 Forbidden", id);
+  }
+  assert.deepEqual(withPolicies.errors, ["AZURE-ID-01 GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy: 403 Forbidden"]);
+
+  // With no qualifying Conditional Access policy the verdict rests on the unreadable read: manual, not a false fail.
+  const noPolicies = clientWith({ ...compliantClient(), getSecurityDefaultsPolicy: async () => { throw forbidden(); }, listConditionalAccessPolicies: async () => [] });
+  const unknown = await assessAzureIdentity(noPolicies);
+  const mfa = unknown.findings.find((entry) => entry.id === "AZURE-ID-01");
+  assert.equal(mfa.status, "manual");
+  assert.match(mfa.summary, /^No enabled MFA Conditional Access policy was found and GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\. Grant Policy\.Read\.All/);
+  assert.doesNotMatch(mfa.summary, /security defaults are off/);
+  assert.equal(mfa.evidence.endpoint, "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy");
+  assert.equal(mfa.evidence.total_policies, 0);
+  assert.equal(mfa.evidence.security_defaults_readable, false);
+  const legacy = unknown.findings.find((entry) => entry.id === "AZURE-ID-02");
+  assert.equal(legacy.status, "manual");
+  assert.match(legacy.summary, /^No enabled Conditional Access policy blocks exchangeActiveSync\/other client app types and GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\./);
+  assert.doesNotMatch(legacy.summary, /security defaults are off/);
+
+  // A readable "off" answer with no policies still fails with the original wording.
+  const off = clientWith({ ...compliantClient(), listConditionalAccessPolicies: async () => [] });
+  const offResult = await assessAzureIdentity(off);
+  assert.equal(offResult.findings.find((entry) => entry.id === "AZURE-ID-01").status, "fail");
+  assert.match(offResult.findings.find((entry) => entry.id === "AZURE-ID-01").summary, /security defaults are off/);
+  assert.match(offResult.findings.find((entry) => entry.id === "AZURE-ID-02").summary, /security defaults are off/);
+  assert.equal(offResult.errors.length, 0);
+});
+
+test("rule 1 corollary: AZURE-DP-06 reports denied mailboxes as a MailboxSettings.Read gap, separately from mailboxes without Exchange", async () => {
+  const users = [
+    { id: "u-ok", userPrincipalName: "alice@example.com" },
+    { id: "u-denied", userPrincipalName: "bob@example.com" },
+    { id: "u-nomailbox", userPrincipalName: "svc@example.com" },
+  ];
+  const notFound = () => new azureModule.AzureApiError("404 Not Found: MailboxNotEnabledForRESTAPI", "https://graph.microsoft.com/v1.0/users/u-nomailbox/mailFolders/inbox/messageRules", 404);
+  const client = clientWith({
+    ...compliantClient(),
+    listMemberUsers: async () => users,
+    listInboxMessageRules: async (userId) => {
+      if (userId === "u-denied") throw forbidden();
+      if (userId === "u-nomailbox") throw notFound();
+      return [{ id: "rule-1", displayName: "Archive", isEnabled: true, actions: { moveToFolder: "archive" } }];
+    },
+  });
+  const result = await assessAzureDataProtection(client);
+  const rules = result.findings.find((item) => item.id === "AZURE-DP-06");
+  assert.equal(rules.status, "warn");
+  assert.doesNotMatch(rules.summary, /likely without an Exchange mailbox/);
+  assert.match(rules.summary, /0 enabled inbox rules forward or redirect mail across 1 readable mailboxes \(2 unreadable: 1 denied with 403 Forbidden, so MailboxSettings\.Read \(application\) is missing for those mailboxes and their rules were not inspected; 1 returned a non-permission error \(404 Not Found: MailboxNotEnabledForRESTAPI; commonly users without an Exchange mailbox\); verdict capped at warn\)\./);
+  assert.equal(rules.evidence.mailboxes_read, 1);
+  assert.equal(rules.evidence.mailboxes_unreadable, 2);
+  assert.equal(rules.evidence.mailboxes_permission_denied, 1);
+  assert.equal(rules.evidence.mailboxes_other_errors, 1);
+  assert.deepEqual(rules.evidence.permission_failure, { endpoint: "GET /v1.0/users/{id}/mailFolders/inbox/messageRules", http_status: 403, required_access: "MailboxSettings.Read (application)", error: "403 Forbidden: Insufficient privileges" });
+  assert.deepEqual(result.errors, ["AZURE-DP-06 GET /v1.0/users/{id}/mailFolders/inbox/messageRules: 403 Forbidden on 1 of 3 mailboxes"]);
+
+  // Only non-permission failures keep the "no Exchange mailbox" explanation and nothing is written to errors.
+  const onlyMissing = clientWith({ ...compliantClient(), listMemberUsers: async () => users.slice(0, 1).concat(users.slice(2)), listInboxMessageRules: async (userId) => { if (userId === "u-nomailbox") throw notFound(); return []; } });
+  const missingResult = await assessAzureDataProtection(onlyMissing);
+  const missing = missingResult.findings.find((item) => item.id === "AZURE-DP-06");
+  assert.equal(missing.status, "warn");
+  assert.match(missing.summary, /\(1 unreadable: 1 returned a non-permission error \(404 Not Found: MailboxNotEnabledForRESTAPI; commonly users without an Exchange mailbox\); verdict capped at warn\)/);
+  assert.equal(missing.evidence.permission_failure, null);
+  assert.equal(missingResult.errors.length, 0);
+
+  // Forwarding rules found alongside a denied subset still fail, and the denial stays named without the warn cap text.
+  const leaking = clientWith({ ...compliantClient(), listMemberUsers: async () => users.slice(0, 2), listInboxMessageRules: async (userId) => { if (userId === "u-denied") throw forbidden(); return [{ displayName: "Leak", isEnabled: true, actions: { forwardTo: [{ emailAddress: { address: "ext@example.net" } }] } }]; } });
+  const leak = (await assessAzureDataProtection(leaking)).findings.find((item) => item.id === "AZURE-DP-06");
+  assert.equal(leak.status, "fail");
+  assert.match(leak.summary, /1 denied with 403 Forbidden, so MailboxSettings\.Read \(application\) is missing/);
+  assert.doesNotMatch(leak.summary, /verdict capped at warn/);
+});
+
 test("azure_assess_data_protection and azure_assess_network_and_policy are registered under the Azure group", () => {
   const tools = getRegisteredToolSummaries();
   const azureTools = tools.filter((tool) => tool.group === "Azure").map((tool) => tool.name).sort();
@@ -773,6 +1060,76 @@ test("exportAzureAuditBundle writes the shared layout, compliance reports, and a
   assert.ok(Array.isArray(findingsJson));
   assert.equal(findingsJson.length, result.findingCount);
   assert.doesNotMatch(readFileSync(join(result.outputDir, "core_data", "metadata.json"), "utf8"), /graph-token|arm-token/);
+});
+
+const FAKE_AZURE_SECRETS = {
+  clientSecret: "FAKE-CLIENT-SECRET-g7h8i9",
+  graphToken: "FAKE-GRAPH-TOKEN-a1b2c3",
+  managementToken: "FAKE-ARM-TOKEN-d4e5f6",
+  passwordHint: "FAKEHINT9",
+  secretText: "FAKE-SECRET-TEXT-j0k1l2",
+  keyBlob: "FAKE-KEY-BLOB-m3n4o5",
+  errorEcho: "FAKE-ERROR-ECHO-p6q7r8",
+};
+
+/** Routes a real AzureAuditorClient through Graph and ARM responses that carry every fake secret above. */
+function secretBearingFetch() {
+  const credentialCarrier = {
+    id: "sp-1",
+    appId: "app-1",
+    displayName: "Automation",
+    owners: [{ id: "user-1" }],
+    passwordCredentials: [{ keyId: "k1", hint: FAKE_AZURE_SECRETS.passwordHint, secretText: FAKE_AZURE_SECRETS.secretText, startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2026-12-01T00:00:00Z" }],
+    keyCredentials: [{ keyId: "k2", type: "AsymmetricX509Cert", usage: "Verify", key: FAKE_AZURE_SECRETS.keyBlob, startDateTime: "2026-01-01T00:00:00Z", endDateTime: "2027-01-01T00:00:00Z" }],
+  };
+  return async (url, init = {}) => {
+    if (url.endsWith("/oauth2/v2.0/token")) {
+      const scope = new URLSearchParams(init.body).get("scope");
+      return new Response(JSON.stringify({ token_type: "Bearer", expires_in: 3599, access_token: scope.startsWith("https://graph") ? FAKE_AZURE_SECRETS.graphToken : FAKE_AZURE_SECRETS.managementToken }), { status: 200 });
+    }
+    if (url.includes("/v1.0/organization")) return new Response(JSON.stringify({ value: [{ id: "org-1", displayName: "Contoso" }] }), { status: 200 });
+    if (url.includes("/v1.0/servicePrincipals") || url.includes("/v1.0/applications")) return new Response(JSON.stringify({ value: [credentialCarrier] }), { status: 200 });
+    if (url.includes("/v1.0/identity/conditionalAccess/policies")) return new Response(JSON.stringify({ value: [CA_MFA, CA_LEGACY] }), { status: 200 });
+    if (url.includes("/policies/identitySecurityDefaultsEnforcementPolicy")) return new Response(JSON.stringify({ isEnabled: false }), { status: 200 });
+    if (url.includes("Microsoft.KeyVault/vaults")) {
+      return new Response(JSON.stringify({ error: { code: "AuthorizationFailed", message: "The client does not have authorization to perform action 'Microsoft.KeyVault/vaults/read'.", innerError: { echo: FAKE_AZURE_SECRETS.errorEcho } } }), { status: 403, statusText: "Forbidden" });
+    }
+    return new Response(JSON.stringify({ value: [] }), { status: 200 });
+  };
+}
+
+test("rule 9: the exported bundle and its zip never contain tokens, the client secret, credential hints, key blobs, or raw error bodies", async () => {
+  const config = resolveAzureConfiguration(
+    {},
+    { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: FAKE_AZURE_SECRETS.clientSecret },
+    () => undefined,
+  );
+  const client = new AzureAuditorClient(config, { fetchImpl: secretBearingFetch(), now: () => NOW });
+  const base = createTempBase("grclanker-azure-secrets-");
+  const result = await exportAzureAuditBundle(client, config, base);
+
+  const files = readBundleFiles(result.outputDir);
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.ok(files.size >= 20, `bundle wrote ${files.size} files`);
+  assert.equal(zipEntries.size, files.size, "every bundle file is in the archive");
+  assertSecretsAbsent(assert, files, Object.values(FAKE_AZURE_SECRETS), "bundle file");
+  assertSecretsAbsent(assert, zipEntries, Object.values(FAKE_AZURE_SECRETS), "zip entry");
+  for (const [name, text] of files) {
+    assert.ok(!/"(hint|secretText|key|customKeyIdentifier)"\s*:/.test(text), `${name} carries a raw credential property`);
+  }
+
+  // The credential-bearing records were collected and judged, so the scan covered the live path rather than an empty fixture.
+  const identity = JSON.parse(files.get("analysis/identity.json"));
+  const hygiene = identity.findings.find((item) => item.id === "AZURE-ID-05");
+  assert.equal(hygiene.status, "pass");
+  assert.equal(hygiene.evidence.seen, 1);
+  const errorsLog = files.get("_errors.log");
+  assert.match(errorsLog, /AZURE-DP-04 GET Microsoft\.KeyVault\/vaults: 403 Forbidden/);
+  const dataProtection = JSON.parse(files.get("analysis/data-protection.json"));
+  const vaults = dataProtection.findings.find((item) => item.id === "AZURE-DP-04");
+  assert.equal(vaults.status, "manual");
+  assert.equal(vaults.evidence.error, "403 Forbidden: AuthorizationFailed: The client does not have authorization to perform action 'Microsoft.KeyVault/vaults/read'.");
+  assert.doesNotMatch(files.get("core_data/metadata.json"), /client-123.*secret|access_token/i);
 });
 
 test("verdict safety 8: re-running the export never overwrites a prior bundle and logs errors on partial failure", async () => {
