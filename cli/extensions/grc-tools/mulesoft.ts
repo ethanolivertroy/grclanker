@@ -73,7 +73,9 @@ const MAX_EVIDENCE_SAMPLES = 25;
 const MAX_ORG_WIDE_ENVIRONMENT_ROLES = 5;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CONFIG_FILE_SEGMENTS = [".config", "mulesoft-sec-inspector", "config.toml"];
-const CLOUDHUB_STANDARD_INGRESS_PORTS = new Set([8081, 8082, 8091, 8092]);
+// Only 8081 (http.port) and 8082 (https.port) are exposed externally by the shared load balancer. 8091 and 8092 are the
+// dedicated load balancer back-end ports whose default rules are scoped to the local VPC CIDR, so open ingress on them fails.
+const CLOUDHUB_STANDARD_INGRESS_PORTS = new Set([8081, 8082]);
 
 const CONTROL_PLANE_BASE_URLS: Record<Exclude<MulesoftControlPlane, "custom">, string> = {
   us: "https://anypoint.mulesoft.com",
@@ -2792,13 +2794,13 @@ export async function assessMulesoftRuntimeInfrastructure(
         };
         if (vpcs.length === 0) return verdict("manual", noVpcSummary, evidence);
         if (openNonStandardRules.length > 0) {
-          return verdict("fail", `${openNonStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on ports other than the CloudHub HTTP listener ports.`, evidence);
+          return verdict("fail", `${openNonStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on ports other than the externally exposed CloudHub listener ports 8081 and 8082 (8091 and 8092 are DLB back-end ports that must stay scoped to the VPC).`, evidence);
         }
         if (vpcsWithoutRules.length > 0) {
           return verdict("manual", `${vpcsWithoutRules.length}/${vpcs.length} VPC(s) did not return a firewallRules list, so open ingress cannot be ruled out.`, evidence);
         }
         if (openStandardRules.length > 0) {
-          return verdict("warn", `${openStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on CloudHub HTTP listener ports; confirm the applications are intended to be internet-facing.`, evidence);
+          return verdict("warn", `${openStandardRules.length} VPC firewall rule(s) allow 0.0.0.0/0 ingress on the CloudHub listener ports 8081 or 8082; confirm the applications are intended to be internet-facing.`, evidence);
         }
         return verdict("pass", `No firewall rule across ${vpcs.length} VPC(s) with ${firewallRules.length} rule(s) allows 0.0.0.0/0 ingress.`, evidence);
       },

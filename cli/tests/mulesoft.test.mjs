@@ -2090,3 +2090,30 @@ test("review fix 3: truncated VPC and load balancer pages downgrade RT-13 throug
   }
   assert.deepEqual(result.summary.partial_view, ["VPC list truncated at 1 of 30 total", "load balancer list truncated at 1 of 15 total"]);
 });
+
+test("review fix 6: 0.0.0.0/0 ingress on the DLB back-end ports 8091 and 8092 fails RT-14 while 8081 and 8082 only warn", async () => {
+  const withRules = (firewallRules) => healthyRuntimeClient({
+    async getVpc() {
+      return { id: "vpc-1", name: "prod-vpc", firewallRules };
+    },
+  });
+
+  const backEndOpen = await assessMulesoftRuntimeInfrastructure(withRules([
+    { cidrBlock: "0.0.0.0/0", protocol: "tcp", fromPort: 8091, toPort: 8091 },
+    { cidrBlock: "0.0.0.0/0", protocol: "tcp", fromPort: 8092, toPort: 8092 },
+  ]));
+  assert.equal(statusOf(backEndOpen, "MULESOFT-RT-14"), "fail");
+  assert.match(findingById(backEndOpen, "MULESOFT-RT-14").summary, /8091 and 8092 are DLB back-end ports/);
+  assert.deepEqual(findingById(backEndOpen, "MULESOFT-RT-14").evidence.open_non_standard_rules, [
+    "prod-vpc: tcp 8091 from 0.0.0.0/0",
+    "prod-vpc: tcp 8092 from 0.0.0.0/0",
+  ]);
+
+  const listenerOpen = await assessMulesoftRuntimeInfrastructure(withRules([
+    { cidrBlock: "0.0.0.0/0", protocol: "tcp", fromPort: 8081, toPort: 8082 },
+    { cidrBlock: "10.0.0.0/16", protocol: "tcp", fromPort: 8091, toPort: 8092 },
+  ]));
+  assert.equal(statusOf(listenerOpen, "MULESOFT-RT-14"), "warn");
+  assert.deepEqual(findingById(listenerOpen, "MULESOFT-RT-14").evidence.open_non_standard_rules, []);
+  assert.deepEqual(findingById(listenerOpen, "MULESOFT-RT-14").evidence.open_standard_port_rules, ["prod-vpc: tcp 8081-8082 from 0.0.0.0/0"]);
+});
