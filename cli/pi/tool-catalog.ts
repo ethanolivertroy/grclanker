@@ -22,23 +22,27 @@ export interface RegisteredToolParameter {
 
 const COMPUTE_TOOL_NAMES = new Set(["bash", "read", "write", "edit", "ls", "find", "grep"]);
 
+/**
+ * Tool name prefix to display group. Keep this list alphabetical by prefix;
+ * the longest matching prefix wins, so ordering never affects resolution.
+ */
 const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["ansible_", "Ansible AAP"],
   ["aws_", "AWS"],
   ["azure_", "Azure"],
   ["cloudflare_", "Cloudflare"],
-  ["fedramp_", "FedRAMP"],
   ["cmvp_", "CMVP"],
-  ["kevs_", "KEV / EPSS"],
-  ["scf_", "SCF"],
-  ["oscal_", "OSCAL"],
+  ["duo_", "Duo"],
+  ["fedramp_", "FedRAMP"],
   ["gcp_", "GCP"],
-  ["gws_ops_", "Google Workspace Operator"],
-  ["gws_", "Google Workspace"],
   ["github_", "GitHub"],
+  ["gws_", "Google Workspace"],
+  ["gws_ops_", "Google Workspace Operator"],
+  ["kevs_", "KEV / EPSS"],
   ["oci_", "OCI"],
   ["okta_", "Okta"],
-  ["duo_", "Duo"],
+  ["oscal_", "OSCAL"],
+  ["scf_", "SCF"],
   ["slack_", "Slack"],
   ["vanta_", "Vanta"],
   ["webex_", "Webex"],
@@ -50,7 +54,11 @@ export function resolveToolGroup(name: string): { group: string; kind: Registere
     return { group: "Compute Backend", kind: "compute" };
   }
 
-  const match = DOMAIN_GROUPS.find(([prefix]) => name.startsWith(prefix));
+  let match: [prefix: string, label: string] | undefined;
+  for (const candidate of DOMAIN_GROUPS) {
+    if (!name.startsWith(candidate[0])) continue;
+    if (!match || candidate[0].length > match[0].length) match = candidate;
+  }
   return { group: match?.[1] ?? "Other Domain Tools", kind: "domain" };
 }
 
