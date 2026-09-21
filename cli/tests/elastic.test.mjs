@@ -148,6 +148,7 @@ function healthyFixtures(now = Date.now()) {
       defaults: { "cluster.name": "audit-cluster", "xpack.security.enabled": "true" },
     },
     nodeSettings: {
+      _nodes: { total: 1, successful: 1, failed: 0 },
       cluster_name: "audit-cluster",
       nodes: {
         "node-1": {
@@ -234,6 +235,7 @@ function healthyFixtures(now = Date.now()) {
         _sort: [now - 10 * DAY_MS, "ci-reader"],
       },
     ],
+    ilmStatus: { operation_mode: "RUNNING" },
     ilmPolicies: {
       "logs-retention": {
         version: 1,
@@ -247,8 +249,17 @@ function healthyFixtures(now = Date.now()) {
         in_use_by: { indices: ["logs-000001"], data_streams: [], composable_templates: [] },
       },
     },
+    slmStatus: { operation_mode: "RUNNING" },
     slmPolicies: {
-      nightly: { version: 1, name: "<nightly-{now/d}>", schedule: "0 30 1 * * ?", repository: "backups", policy: { indices: ["*"] } },
+      nightly: {
+        version: 1,
+        name: "<nightly-{now/d}>",
+        schedule: "0 30 1 * * ?",
+        repository: "backups",
+        policy: { indices: ["*"] },
+        last_success: { snapshot_name: "nightly-2026.09.20", time: now - DAY_MS },
+        next_execution_millis: now + DAY_MS,
+      },
     },
     snapshotRepositories: {
       backups: { type: "gcs", settings: { bucket: "es-backups" } },
@@ -322,7 +333,9 @@ function stubClient(fixtures, overrides = {}, configOverrides = {}) {
     listRoles: async () => fixtures.roles,
     listRoleMappings: async () => fixtures.roleMappings,
     listApiKeys: async () => fixtures.apiKeys,
+    getIlmStatus: async () => fixtures.ilmStatus,
     listIlmPolicies: async () => fixtures.ilmPolicies,
+    getSlmStatus: async () => fixtures.slmStatus,
     listSlmPolicies: async () => fixtures.slmPolicies,
     listSnapshotRepositories: async () => fixtures.snapshotRepositories,
     listWatches: async () => fixtures.watches,
@@ -368,7 +381,9 @@ function healthyRoutes(fixtures) {
     "GET /_security/role": fixtures.roles,
     "GET /_security/role_mapping": fixtures.roleMappings,
     "POST /_security/_query/api_key": { total: fixtures.apiKeys.length, count: fixtures.apiKeys.length, api_keys: fixtures.apiKeys },
+    "GET /_ilm/status": fixtures.ilmStatus,
     "GET /_ilm/policy": fixtures.ilmPolicies,
+    "GET /_slm/status": fixtures.slmStatus,
     "GET /_slm/policy": fixtures.slmPolicies,
     "GET /_snapshot/_all": fixtures.snapshotRepositories,
     "POST /_watcher/_query/watches": { count: fixtures.watches.length, watches: fixtures.watches },
@@ -637,42 +652,79 @@ test("ElasticApiClient paginates API keys with search_after, Watcher with from/s
   const client = new ElasticApiClient(sampleConfig(), { fetchImpl });
 
   const limitedKeys = await client.listApiKeys(2);
-  assert.deepEqual(limitedKeys.map((key) => key.id), ["k1", "k2"], "limit caps the number of API keys returned");
+  assert.deepEqual(limitedKeys.items.map((key) => key.id), ["k1", "k2"], "limit caps the number of API keys returned");
+  assert.deepEqual({ seen: limitedKeys.seen, total: limitedKeys.total, truncated: limitedKeys.truncated, pages: limitedKeys.pages }, { seen: 2, total: 150, truncated: true, pages: 1 });
   assert.equal(seen[0].search, "?with_limited_by=true");
   assert.equal(seen[0].body.size, 2);
   assert.deepEqual(seen[0].body.sort, [{ creation: { order: "asc" } }, { name: { order: "asc" } }]);
   assert.equal(seen.length, 1);
 
   const allKeys = await client.listApiKeys(200);
-  assert.equal(allKeys.length, 150);
-  assert.equal(allKeys[149].id, "k150");
+  assert.equal(allKeys.items.length, 150);
+  assert.equal(allKeys.items[149].id, "k150");
+  assert.deepEqual({ seen: allKeys.seen, total: allKeys.total, truncated: allKeys.truncated, pages: allKeys.pages }, { seen: 150, total: 150, truncated: false, pages: 2 });
   assert.equal(seen.length, 3);
   assert.equal(seen[1].body.search_after, undefined);
   assert.deepEqual(seen[2].body.search_after, [100, "k100"]);
 
   const allWatches = await client.listWatches(500);
-  assert.equal(allWatches.length, 150);
+  assert.equal(allWatches.items.length, 150);
+  assert.equal(allWatches.truncated, false);
   assert.deepEqual(seen.slice(3).map((entry) => entry.body.from), [0, 100]);
 
   const limitedRules = await client.listDetectionRules(2);
-  assert.deepEqual(limitedRules.map((rule) => rule.id), ["r1", "r2"]);
+  assert.deepEqual(limitedRules.items.map((rule) => rule.id), ["r1", "r2"]);
+  assert.equal(limitedRules.truncated, true);
   assert.equal(seen[5].search, "?page=1&per_page=2");
 
   const allRules = await client.listDetectionRules(1000);
-  assert.equal(allRules.length, 150);
+  assert.equal(allRules.items.length, 150);
+  assert.equal(allRules.truncated, false);
   assert.deepEqual(seen.slice(6).map((entry) => entry.search), ["?page=1&per_page=100", "?page=2&per_page=100"]);
 
   const alertingRules = await client.listAlertingRules(120);
-  assert.equal(alertingRules.length, 120);
+  assert.equal(alertingRules.items.length, 120);
+  assert.deepEqual({ seen: alertingRules.seen, total: alertingRules.total, truncated: alertingRules.truncated }, { seen: 120, total: 150, truncated: true });
   assert.deepEqual(seen.slice(8).map((entry) => entry.search), ["?page=1&per_page=100", "?page=2&per_page=100"]);
 
   const policies = await client.listAgentPolicies(150);
-  assert.equal(policies.length, 150);
+  assert.equal(policies.items.length, 150);
+  assert.equal(policies.truncated, false);
   assert.deepEqual(seen.slice(10).map((entry) => entry.search), ["?page=1&perPage=100", "?page=2&perPage=100"]);
 
   const enrollment = await client.listEnrollmentApiKeys(10);
-  assert.equal(enrollment[0].api_key, "[REDACTED]");
+  assert.equal(enrollment.items[0].api_key, "[REDACTED]");
   assert.equal(seen[12].search, "?page=1&perPage=10");
+});
+
+test("verdict rule 7: pagination runs to completion and a missing total still records truncation when the cap is hit", async () => {
+  const watches = Array.from({ length: 230 }, (_, index) => ({ _id: `w${index + 1}` }));
+  const fetchImpl = createRouter({
+    "POST /_watcher/_query/watches": (_url, init) => {
+      const body = JSON.parse(init.body);
+      return { watches: watches.slice(body.from, body.from + body.size) };
+    },
+    "GET /api/fleet/fleet_server_hosts": (url) => {
+      const page = Number(url.searchParams.get("page"));
+      const perPage = Number(url.searchParams.get("perPage"));
+      const items = Array.from({ length: 250 }, (_, index) => ({ id: `h${index + 1}` }));
+      return { items: items.slice((page - 1) * perPage, page * perPage), page, perPage };
+    },
+  });
+  const client = new ElasticApiClient(sampleConfig(), { fetchImpl });
+
+  const complete = await client.listWatches(500);
+  assert.deepEqual({ seen: complete.seen, pages: complete.pages, truncated: complete.truncated, total: complete.total }, { seen: 230, pages: 3, truncated: false, total: undefined });
+
+  const capped = await client.listWatches(200);
+  assert.deepEqual({ seen: capped.seen, pages: capped.pages, truncated: capped.truncated }, { seen: 200, pages: 2, truncated: true });
+
+  const hosts = await client.listFleetServerHosts(100);
+  assert.deepEqual({ seen: hosts.seen, pages: hosts.pages, truncated: hosts.truncated }, { seen: 100, pages: 1, truncated: true });
+
+  const snapshot = await collectElasticSnapshot(client, ["watches"], { watchLimit: 200 });
+  assert.deepEqual(snapshot.watches.page, { seen: 200, total: undefined, truncated: true, pages: 2 });
+  assert.equal(snapshot.watches.data.length, 200);
 });
 
 test("ElasticApiClient retries 429 and 5xx responses with backoff and honors Retry-After", async () => {
@@ -861,7 +913,8 @@ test("assessElasticIdentity fails on native-only realms, anonymous superuser, an
   const result = await assessElasticIdentity(stubClient(fixtures), { maxApiKeyAgeDays: 90 });
 
   assert.equal(findingById(result, "ELASTIC-01").status, "fail");
-  assert.equal(findingById(result, "ELASTIC-13").status, "warn");
+  assert.equal(findingById(result, "ELASTIC-13").status, "manual");
+  assert.match(findingById(result, "ELASTIC-13").summary, /Not applicable/);
   assert.equal(findingById(result, "ELASTIC-14").status, "fail");
   assert.deepEqual(findingById(result, "ELASTIC-14").evidence.anonymous_roles, ["superuser"]);
   const keys = findingById(result, "ELASTIC-09");
@@ -944,7 +997,20 @@ test("assessElasticAccessControl fails on excess superusers, broad custom roles,
   assert.equal(findingById(result, "ELASTIC-08").status, "fail");
 
   const unreadable = await assessElasticAccessControl(stubClient(fixtures, { listRoles: forbidden("roles forbidden") }));
-  assert.ok(unreadable.findings.every((item) => item.status === "manual"));
+  const rbacUnreadable = findingById(unreadable, "ELASTIC-06");
+  assert.equal(rbacUnreadable.status, "fail", "observed superuser excess still fails when roles are unreadable");
+  assert.match(rbacUnreadable.summary, /Additional sources were unreadable or partial: roles \(GET \/_security\/role\): roles forbidden/);
+  assert.equal(findingById(unreadable, "ELASTIC-07").status, "manual");
+  assert.equal(findingById(unreadable, "ELASTIC-08").status, "manual");
+
+  const patternsUnreadable = await assessElasticAccessControl(
+    stubClient(healthyFixtures(), { listRoles: forbidden("roles forbidden") }),
+    { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] },
+  );
+  for (const id of ["ELASTIC-06", "ELASTIC-07", "ELASTIC-08"]) {
+    assert.equal(findingById(patternsUnreadable, id).status, "manual", `${id} must not fail or pass on absent role data`);
+  }
+  assert.match(findingById(patternsUnreadable, "ELASTIC-07").summary, /could not be evaluated/);
 });
 
 test("assessElasticTransportSecurity passes with TLS on both layers, modern protocols, and valid certificates", async () => {
@@ -953,11 +1019,12 @@ test("assessElasticTransportSecurity passes with TLS on both layers, modern prot
   assert.equal(result.area, "transport_security");
   assert.deepEqual(result.findings.map((item) => item.id), ["ELASTIC-02", "ELASTIC-03", "ELASTIC-04", "ELASTIC-05"]);
   assert.equal(findingById(result, "ELASTIC-02").status, "pass");
-  assert.equal(findingById(result, "ELASTIC-02").evidence.verification_mode, "certificate");
+  assert.deepEqual(findingById(result, "ELASTIC-02").evidence.verification_mode_per_node, [{ node: "es-1", value: "certificate" }]);
   assert.equal(findingById(result, "ELASTIC-03").status, "pass");
   assert.equal(findingById(result, "ELASTIC-03").evidence.elasticsearch_url_scheme, "https");
   assert.equal(findingById(result, "ELASTIC-04").status, "pass");
   assert.equal(findingById(result, "ELASTIC-05").status, "pass");
+  assert.match(findingById(result, "ELASTIC-05").summary, /single-node cluster, so the inventory is complete/);
   assert.equal(result.summary.transport_tls, true);
   assert.ok(findingById(result, "ELASTIC-04").mappings.includes("FedRAMP SC-8(1)"));
 });
@@ -997,7 +1064,9 @@ test("assessElasticTransportSecurity fails on disabled TLS, weak protocols, plai
 });
 
 test("assessElasticClusterHardening passes on a hardened cluster and keeps audit forwarding manual", async () => {
-  const result = await assessElasticClusterHardening(stubClient(healthyFixtures()));
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+  const result = await assessElasticClusterHardening(stubClient(fixtures));
 
   assert.equal(result.area, "cluster_hardening");
   assert.deepEqual(
@@ -1069,8 +1138,9 @@ test("assessElasticClusterHardening warns on partial hardening and turns unreada
   assert.equal(findingById(result, "ELASTIC-18").status, "manual");
   assert.match(findingById(result, "ELASTIC-18").summary, /local:fs/);
   assert.equal(findingById(result, "ELASTIC-19").status, "warn");
-  assert.equal(findingById(result, "ELASTIC-20").status, "pass");
+  assert.equal(findingById(result, "ELASTIC-20").status, "manual", "a licensed but unreadable Watcher never yields pass");
   assert.equal(findingById(result, "ELASTIC-20").evidence.watcher_unreadable, "watcher forbidden");
+  assert.match(findingById(result, "ELASTIC-20").summary, /watcher forbidden/);
   assert.equal(findingById(result, "ELASTIC-22").status, "warn");
   assert.equal(findingById(result, "ELASTIC-23").status, "warn");
 
@@ -1142,7 +1212,7 @@ test("assessElasticKibana emits manual findings when Kibana is not configured or
 
 test("the five assessment areas together cover all 23 spec controls with every framework mapping", async () => {
   const fixtures = healthyFixtures();
-  assert.equal(ELASTIC_ALL_DATASETS.length, 27);
+  assert.equal(ELASTIC_ALL_DATASETS.length, 30);
   const snapshot = await collectElasticSnapshot(stubClient(fixtures), ELASTIC_ALL_DATASETS);
   const areas = ["identity", "access_control", "transport_security", "cluster_hardening", "kibana"];
   const findings = areas.flatMap((area) => evaluateElasticArea(area, snapshot, {}, { elasticsearchUrl: "https://es.example.com:9200" }).findings);
@@ -1201,8 +1271,11 @@ test("exportElasticAuditBundle writes the full layout and zip without leaking cr
   for (const relativePath of expectedFiles) {
     assert.ok(existsSync(join(result.outputDir, relativePath)), `missing ${relativePath}`);
   }
-  assert.equal(readdirSync(join(result.outputDir, "core_data")).length, 27);
+  assert.equal(readdirSync(join(result.outputDir, "core_data")).length, 30);
   assert.equal(existsSync(join(result.outputDir, "_errors.log")), false);
+  assert.equal(result.zipPath, `${result.outputDir}.zip`, "the archive name is derived from the allocated directory");
+  const apiKeysRaw = JSON.parse(readFileSync(join(result.outputDir, "core_data", "api_keys.json"), "utf8"));
+  assert.deepEqual(apiKeysRaw.page, { seen: 1, total: 1, truncated: false, pages: 1 });
   assert.ok(result.fileCount >= expectedFiles.length);
 
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
@@ -1259,8 +1332,28 @@ test("exportElasticAuditBundle records partial failures in _errors.log and still
   const summary = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
   assert.match(summary, /Collection errors: 2 \(see _errors.log\)/);
 
+  const firstZipBefore = readFileSync(result.zipPath);
   const second = await exportElasticAuditBundle(client, config, base);
   assert.notEqual(second.outputDir, result.outputDir, "repeat exports allocate a fresh directory");
+  assert.notEqual(second.zipPath, result.zipPath, "verdict rule 8: repeat exports never reuse the archive name");
+  assert.equal(second.zipPath, `${second.outputDir}.zip`, "directory and archive stay paired");
+  assert.ok(second.outputDir.endsWith("es.example.com-audit-bundle-2"));
+  assert.ok(existsSync(result.zipPath) && existsSync(second.zipPath));
+  assert.ok(firstZipBefore.equals(readFileSync(result.zipPath)), "the prior archive is left untouched");
+});
+
+test("verdict rule 8: a stray archive blocks reuse of its paired directory name", async () => {
+  const fixtures = healthyFixtures();
+  const config = sampleConfig({ kibanaUrl: undefined });
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(fixtures)) });
+  const base = createTempBase("elastic-bundle-stray-");
+  writeFileSync(join(base, "es.example.com-audit-bundle.zip"), "prior archive", "utf8");
+
+  const result = await exportElasticAuditBundle(client, config, base);
+
+  assert.ok(result.outputDir.endsWith("es.example.com-audit-bundle-2"), result.outputDir);
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
+  assert.equal(readFileSync(join(base, "es.example.com-audit-bundle.zip"), "utf8"), "prior archive");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
