@@ -11,6 +11,8 @@ import {
   assessZiaAccessControlData,
   assessZiaPolicy,
   assessZiaPolicyData,
+  assessZpa,
+  assessZpaData,
   checkZscalerAccess,
   listZscalerControls,
   mappingsForControl,
@@ -534,6 +536,164 @@ test("assessZiaPolicy collects through the client, follows sub-locations, and re
   assert.ok(missing.findings.every((item) => item.status === "manual" && /Not configured: ZIA/.test(item.summary)));
 });
 
+const FUTURE_EPOCH = String(Math.floor(NOW.getTime() / 1000) + 400 * 86400);
+const PAST_EPOCH = String(Math.floor(NOW.getTime() / 1000) - 5 * 86400);
+const RECENT_EPOCH_MS = String(NOW.getTime() - 3600 * 1000);
+
+function zpaFixture(overrides = {}) {
+  const identityCondition = { operator: "AND", operands: [{ objectType: "SCIM_GROUP", lhs: "idp-1", rhs: "group-1" }, { objectType: "POSTURE", lhs: "posture-udid", rhs: "true" }] };
+  return {
+    applicationSegments: readable([
+      { id: "seg-1", name: "HR app", enabled: true, domainNames: ["hr.corp.example.com"], tcpPortRange: [{ from: "443", to: "443" }], segmentGroupId: "sg-1", bypassType: "NEVER" },
+    ]),
+    segmentGroups: readable([{ id: "sg-1", name: "Corp apps", enabled: true }]),
+    accessRules: readable([
+      { id: "r-1", name: "HR access", action: "ALLOW", disabled: false, conditions: [identityCondition] },
+      { id: "r-9", name: "Deny all", action: "DENY", disabled: false, conditions: [] },
+    ]),
+    timeoutRules: readable([{ id: "t-1", name: "Default timeout", disabled: false, reauthTimeout: "43200", reauthIdleTimeout: "3600" }]),
+    forwardingRules: readable([{ id: "f-1", name: "Forward corp", action: "INTERCEPT", disabled: false, conditions: [{ operands: [{ objectType: "TRUSTED_NETWORK", lhs: "net-1", rhs: "true" }] }] }]),
+    isolationRules: readable([]),
+    appConnectorGroups: readable([{ id: "cg-1", name: "DC East", enabled: true }]),
+    appConnectors: readable([
+      { id: "c-1", name: "connector-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: RECENT_EPOCH_MS },
+      { id: "c-2", name: "connector-2", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: RECENT_EPOCH_MS },
+    ]),
+    serviceEdgeGroups: readable([{ id: "seg-1", name: "Edge group" }]),
+    serviceEdges: readable([{ id: "se-1", name: "edge-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", lastBrokerConnectTime: RECENT_EPOCH_MS }]),
+    postureProfiles: readable([{ id: "p-1", name: "Disk encrypted", postureType: "DISK_ENCRYPTION", postureUdid: "posture-udid" }]),
+    trustedNetworks: readable([{ id: "n-1", name: "HQ network", networkId: "net-1" }]),
+    idpControllers: readable([{ id: "idp-1", name: "Okta", enabled: true, ssoType: ["USER", "ADMIN"], scimEnabled: true, signSamlRequest: "1" }]),
+    samlAttributes: readable([{ id: "a-1", name: "Email", idpId: "idp-1" }]),
+    scimGroups: readable([{ id: 1, name: "HR", idpId: "idp-1" }]),
+    enrollmentCertificates: readable([{ id: "ec-1", name: "Connector", validToInEpochSec: FUTURE_EPOCH }, { id: "ec-2", name: "Client", validToInEpochSec: FUTURE_EPOCH }]),
+    browserAccessCertificates: readable([{ id: "ba-1", name: "portal cert", validToInEpochSec: FUTURE_EPOCH }]),
+    emergencyAccessUsers: readable([{ userId: "u-1", emailId: "breakglass@example.com", userStatus: "DEACTIVATED", lastLoginTime: PAST_EPOCH }]),
+    administrators: readable([{ id: "ad-1", username: "zpa-admin", isEnabled: true, localLoginDisabled: true, twoFactorAuthEnabled: false }]),
+    now: NOW,
+    ...overrides,
+  };
+}
+
+const ZPA_CONTROL_IDS = ["ZS-08", "ZS-09", "ZS-10", "ZS-11", "ZS-12", "ZS-13", "ZS-15", "ZS-21", "ZS-22", "ZS-23", "ZS-24"];
+
+test("assessZpa: compliant tenant passes every automatable ZPA control", () => {
+  const result = assessZpaData(zpaFixture());
+  assert.deepEqual(result.findings.map((item) => item.id), ZPA_CONTROL_IDS);
+  for (const item of result.findings) {
+    assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+    assert.equal(item.mappings.length, 8);
+  }
+});
+
+test("assessZpa: broad segments, unconditional allows, stale connectors, and expired certificates fail", () => {
+  const result = assessZpaData(zpaFixture({
+    applicationSegments: readable([{ id: "seg-1", name: "Everything", enabled: true, domainNames: ["*"], tcpPortRanges: ["1", "65535"], segmentGroupId: "sg-1" }]),
+    accessRules: readable([{ id: "r-1", name: "Allow all", action: "ALLOW", disabled: false, conditions: [] }]),
+    appConnectors: readable([{ id: "c-1", name: "connector-1", enabled: true, controlChannelStatus: "ZPN_STATUS_DISCONNECTED", appConnectorGroupName: "DC East" }]),
+    idpControllers: readable([{ id: "idp-1", name: "Okta", enabled: true, ssoType: ["USER"], scimEnabled: false, signSamlRequest: "0" }]),
+    timeoutRules: readable([{ id: "t-1", name: "Never", disabled: false, reauthTimeout: "-1" }]),
+    forwardingRules: readable([{ id: "f-1", name: "Bypass all", action: "BYPASS", disabled: false, conditions: [] }]),
+    emergencyAccessUsers: readable([{ userId: "u-1", emailId: "breakglass@example.com", userStatus: "ACTIVATED" }]),
+    enrollmentCertificates: readable([{ id: "ec-1", name: "Connector", validToInEpochSec: PAST_EPOCH }]),
+    administrators: readable([{ id: "ad-1", username: "zpa-admin", isEnabled: true, localLoginDisabled: false, twoFactorAuthEnabled: false }]),
+  }));
+  assert.equal(findingById(result, "ZS-08").status, "fail");
+  assert.match(findingById(result, "ZS-08").summary, /wildcard domain with the full 1-65535 port range/);
+  assert.equal(findingById(result, "ZS-09").status, "fail");
+  assert.equal(findingById(result, "ZS-10").status, "fail");
+  assert.equal(findingById(result, "ZS-11").status, "fail");
+  assert.equal(findingById(result, "ZS-12").status, "warn");
+  assert.match(findingById(result, "ZS-12").summary, /local login without two-factor/);
+  assert.equal(findingById(result, "ZS-13").status, "fail");
+  assert.equal(findingById(result, "ZS-15").status, "warn");
+  assert.equal(findingById(result, "ZS-22").status, "fail");
+  assert.equal(findingById(result, "ZS-23").status, "warn");
+  assert.equal(findingById(result, "ZS-24").status, "fail");
+});
+
+test("assessZpa: 403 everywhere yields manual findings only", () => {
+  const fixture = zpaFixture();
+  for (const key of Object.keys(fixture)) {
+    if (key === "now") continue;
+    fixture[key] = { data: [], error: "ZPA GET failed (403): forbidden", statusCode: 403 };
+  }
+  const result = assessZpaData(fixture);
+  assert.equal(result.findings.length, ZPA_CONTROL_IDS.length);
+  for (const item of result.findings) {
+    assert.equal(item.status, "manual", `${item.id}: ${item.summary}`);
+    assert.match(item.summary, /403/);
+  }
+});
+
+test("assessZpa: empty inventories fail or render manual, never pass", () => {
+  const fixture = zpaFixture();
+  for (const key of Object.keys(fixture)) {
+    if (key === "now") continue;
+    fixture[key] = readable([]);
+  }
+  const result = assessZpaData(fixture);
+  const expected = { "ZS-08": "fail", "ZS-09": "fail", "ZS-10": "fail", "ZS-11": "fail", "ZS-12": "fail", "ZS-13": "fail", "ZS-15": "manual", "ZS-21": "manual", "ZS-22": "manual", "ZS-23": "manual", "ZS-24": "manual" };
+  for (const [id, status] of Object.entries(expected)) {
+    assert.equal(findingById(result, id).status, status, `${id}: ${findingById(result, id).summary}`);
+  }
+});
+
+test("assessZpa: partial pagination and undated records cap verdicts at warn", () => {
+  const fixture = zpaFixture();
+  fixture.applicationSegments = { ...fixture.applicationSegments, truncated: true, seen: 200, total: 250 };
+  fixture.accessRules = { ...fixture.accessRules, truncated: true, seen: 200, total: 201 };
+  fixture.appConnectors = readable([
+    { id: "c-1", name: "connector-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: RECENT_EPOCH_MS },
+    { id: "c-2", name: "connector-2", enabled: true, controlChannelStatus: "ZPN_STATUS_UNKNOWN", appConnectorGroupName: "DC East" },
+  ]);
+  fixture.enrollmentCertificates = readable([{ id: "ec-1", name: "Connector", validToInEpochSec: FUTURE_EPOCH }, { id: "ec-2", name: "Undated" }]);
+  const result = assessZpaData(fixture);
+  assert.equal(findingById(result, "ZS-08").status, "warn");
+  assert.match(findingById(result, "ZS-08").summary, /inventory is partial/);
+  assert.equal(findingById(result, "ZS-09").status, "warn");
+  assert.equal(findingById(result, "ZS-10").status, "warn");
+  assert.equal(findingById(result, "ZS-11").status, "warn");
+  assert.match(findingById(result, "ZS-11").summary, /no lastBrokerConnectTime/);
+  assert.equal(findingById(result, "ZS-24").status, "warn");
+  assert.match(findingById(result, "ZS-24").summary, /no validToInEpochSec/);
+  assert.ok(result.findings.every((item) => item.status !== "pass" || !["ZS-08", "ZS-09", "ZS-10", "ZS-11", "ZS-24"].includes(item.id)));
+  assert.ok(result.truncated.some((note) => /200 of 250 pages/.test(note)));
+});
+
+test("assessZpa collects SCIM groups per SCIM-enabled IdP and renders not-configured without ZPA", async () => {
+  const paged = (items) => ({ items, truncated: false, pagesFetched: 1, totalPages: 1 });
+  const scimCalls = [];
+  const client = {
+    getResolvedConfig: () => zpaConfig(),
+    getNow: () => NOW,
+    listApplicationSegments: async () => paged([]),
+    listSegmentGroups: async () => paged([]),
+    listPolicyRules: async () => paged([]),
+    listAppConnectorGroups: async () => paged([]),
+    listAppConnectors: async () => paged([]),
+    listServiceEdgeGroups: async () => paged([]),
+    listServiceEdges: async () => paged([]),
+    listPostureProfiles: async () => paged([]),
+    listTrustedNetworks: async () => paged([]),
+    listIdpControllers: async () => paged([{ id: "idp-1", name: "Okta", enabled: true, scimEnabled: true, ssoType: ["USER"] }, { id: "idp-2", name: "Legacy", enabled: false, scimEnabled: false }]),
+    listSamlAttributes: async () => paged([]),
+    listScimGroups: async (idpId) => { scimCalls.push(idpId); return paged([{ id: 1, name: "HR" }]); },
+    listEnrollmentCertificates: async () => paged([]),
+    listBrowserAccessCertificates: async () => paged([]),
+    listEmergencyAccessUsers: async () => paged([]),
+    listAdministrators: async () => paged([]),
+  };
+  const result = await assessZpa(client);
+  assert.deepEqual(scimCalls, ["idp-1"]);
+  assert.equal(findingById(result, "ZS-12").evidence.scim_groups, 1);
+  assert.ok(result.findings.every((item) => item.status !== "pass"));
+
+  const missing = await assessZpa(undefined);
+  assert.equal(missing.findings.length, ZPA_CONTROL_IDS.length);
+  assert.ok(missing.findings.every((item) => item.status === "manual" && /ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, ZPA_CUSTOMER_ID/.test(item.summary)));
+});
+
 test("control catalog covers all 25 spec controls with eight framework mappings each", () => {
   const controls = listZscalerControls();
   assert.equal(controls.length, 25);
@@ -547,6 +707,7 @@ test("zscaler tools are registered in the tool catalog under the Zscaler group",
   assert.ok(names.includes("zscaler_check_access"));
   assert.ok(names.includes("zscaler_assess_zia_access_control"));
   assert.ok(names.includes("zscaler_assess_zia_policy"));
+  assert.ok(names.includes("zscaler_assess_zpa"));
   for (const tool of tools) {
     assert.equal(tool.group, "Zscaler");
     assert.equal(tool.kind, "domain");

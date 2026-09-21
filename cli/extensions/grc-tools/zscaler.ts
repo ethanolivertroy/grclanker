@@ -2246,7 +2246,569 @@ export async function assessZiaPolicy(client: ZiaReadClient | undefined, options
   return assessZiaPolicyData(await collectZiaPolicyData(client), options);
 }
 
-// ZPA_ASSESSMENT_PLACEHOLDER
+const ZPA_CONNECTED_STATUS = "ZPN_STATUS_AUTHENTICATED";
+const IDENTITY_OPERAND_TYPES = ["SCIM_GROUP", "SCIM", "SAML", "IDP", "POSTURE", "TRUSTED_NETWORK", "CLIENT_TYPE", "MACHINE_GRP", "PLATFORM", "COUNTRY_CODE", "RISK_FACTOR_TYPE", "CHROME_ENTERPRISE", "BRANCH_CONNECTOR_GROUP", "EDGE_CONNECTOR_GROUP", "USER_PORTAL", "CONSOLE"];
+
+export interface ZpaData {
+  applicationSegments: CollectedDataset<JsonRecord[]>;
+  segmentGroups: CollectedDataset<JsonRecord[]>;
+  accessRules: CollectedDataset<JsonRecord[]>;
+  timeoutRules: CollectedDataset<JsonRecord[]>;
+  forwardingRules: CollectedDataset<JsonRecord[]>;
+  isolationRules: CollectedDataset<JsonRecord[]>;
+  appConnectorGroups: CollectedDataset<JsonRecord[]>;
+  appConnectors: CollectedDataset<JsonRecord[]>;
+  serviceEdgeGroups: CollectedDataset<JsonRecord[]>;
+  serviceEdges: CollectedDataset<JsonRecord[]>;
+  postureProfiles: CollectedDataset<JsonRecord[]>;
+  trustedNetworks: CollectedDataset<JsonRecord[]>;
+  idpControllers: CollectedDataset<JsonRecord[]>;
+  samlAttributes: CollectedDataset<JsonRecord[]>;
+  scimGroups: CollectedDataset<JsonRecord[]>;
+  enrollmentCertificates: CollectedDataset<JsonRecord[]>;
+  browserAccessCertificates: CollectedDataset<JsonRecord[]>;
+  emergencyAccessUsers: CollectedDataset<JsonRecord[]>;
+  administrators: CollectedDataset<JsonRecord[]>;
+  now: Date;
+}
+
+async function collectScimGroups(client: ZpaReadClient, idps: CollectedDataset<JsonRecord[]>): Promise<CollectedDataset<JsonRecord[]>> {
+  if (idps.error) {
+    return { data: [], error: `skipped because IdP controllers were unreadable: ${idps.error}`, statusCode: idps.statusCode };
+  }
+  const items: JsonRecord[] = [];
+  const errors: string[] = [];
+  let truncated = false;
+  for (const idp of idps.data.filter((item) => asBoolean(item.scimEnabled) === true)) {
+    const idpId = asString(idp.id);
+    if (!idpId) continue;
+    try {
+      const page = await client.listScimGroups(idpId);
+      items.push(...page.items.map((group) => ({ ...group, idpId })));
+      truncated = truncated || page.truncated;
+    } catch (error) {
+      errors.push(`${idpId}: ${errorMessage(error)}`);
+    }
+  }
+  return { data: items, error: errors.length > 0 ? errors.join("; ") : undefined, truncated };
+}
+
+export async function collectZpaData(client: ZpaReadClient): Promise<ZpaData> {
+  const idpControllers = await collectPaged("zpa", () => client.listIdpControllers());
+  return {
+    applicationSegments: await collectPaged("zpa", () => client.listApplicationSegments()),
+    segmentGroups: await collectPaged("zpa", () => client.listSegmentGroups()),
+    accessRules: await collectPaged("zpa", () => client.listPolicyRules("ACCESS_POLICY")),
+    timeoutRules: await collectPaged("zpa", () => client.listPolicyRules("TIMEOUT_POLICY")),
+    forwardingRules: await collectPaged("zpa", () => client.listPolicyRules("CLIENT_FORWARDING_POLICY")),
+    isolationRules: await collectPaged("zpa", () => client.listPolicyRules("ISOLATION_POLICY")),
+    appConnectorGroups: await collectPaged("zpa", () => client.listAppConnectorGroups()),
+    appConnectors: await collectPaged("zpa", () => client.listAppConnectors()),
+    serviceEdgeGroups: await collectPaged("zpa", () => client.listServiceEdgeGroups()),
+    serviceEdges: await collectPaged("zpa", () => client.listServiceEdges()),
+    postureProfiles: await collectPaged("zpa", () => client.listPostureProfiles()),
+    trustedNetworks: await collectPaged("zpa", () => client.listTrustedNetworks()),
+    idpControllers,
+    samlAttributes: await collectPaged("zpa", () => client.listSamlAttributes()),
+    scimGroups: await collectScimGroups(client, idpControllers),
+    enrollmentCertificates: await collectPaged("zpa", () => client.listEnrollmentCertificates()),
+    browserAccessCertificates: await collectPaged("zpa", () => client.listBrowserAccessCertificates()),
+    emergencyAccessUsers: await collectPaged("zpa", () => client.listEmergencyAccessUsers()),
+    administrators: await collectPaged("zpa", () => client.listAdministrators()),
+    now: client.getNow(),
+  };
+}
+
+function zpaRuleEnabled(rule: JsonRecord): boolean {
+  return asBoolean(rule.disabled) !== true;
+}
+
+function ruleOperandTypes(rule: JsonRecord): string[] {
+  return asRecordArray(rule.conditions).flatMap((condition) => asRecordArray(condition.operands).map((operand) => (asString(operand.objectType) ?? "").toUpperCase()));
+}
+
+function ruleUsesOperand(rules: JsonRecord[], objectType: string): JsonRecord[] {
+  return rules.filter((rule) => ruleOperandTypes(rule).includes(objectType));
+}
+
+function isFullPortRange(segment: JsonRecord): boolean {
+  const pairs = [...asRecordArray(segment.tcpPortRange), ...asRecordArray(segment.udpPortRange)];
+  if (pairs.some((pair) => asNumber(pair.from) === 1 && asNumber(pair.to) === 65535)) return true;
+  const flat = [...asStringList(segment.tcpPortRanges), ...asStringList(segment.udpPortRanges)];
+  for (let index = 0; index + 1 < flat.length; index += 2) {
+    if (asNumber(flat[index]) === 1 && asNumber(flat[index + 1]) === 65535) return true;
+  }
+  return false;
+}
+
+function hasWildcardDomain(segment: JsonRecord): boolean {
+  return asStringList(segment.domainNames).some((domain) => domain === "*" || /^\*\.[a-z0-9-]+$/i.test(domain));
+}
+
+function assessSegmentation(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Administration > Application Segments and Segment Groups showing domain and port scoping for every enabled segment.";
+  const segments = data.applicationSegments;
+  if (segments.error) return unreadableFinding(8, "GET /application", segments, evidenceNote);
+  const enabled = segments.data.filter((segment) => asBoolean(segment.enabled) === true);
+  const wildcard = enabled.filter(hasWildcardDomain);
+  const fullRange = enabled.filter(isFullPortRange);
+  const bothBroad = enabled.filter((segment) => hasWildcardDomain(segment) && isFullPortRange(segment));
+  const bypassAlways = enabled.filter((segment) => (asString(segment.bypassType) ?? "").toUpperCase() === "ALWAYS");
+  const ungrouped = enabled.filter((segment) => !asString(segment.segmentGroupId));
+  const evidence = {
+    segment_count: segments.data.length,
+    enabled_segments: enabled.length,
+    segment_groups: data.segmentGroups.error ? null : data.segmentGroups.data.length,
+    wildcard_domain_segments: truncateList(wildcard.map(ruleLabel)),
+    full_port_range_segments: truncateList(fullRange.map(ruleLabel)),
+    bypass_always_segments: truncateList(bypassAlways.map(ruleLabel)),
+    ungrouped_segments: ungrouped.length,
+    partial_inventory: segments.truncated === true,
+  };
+  if (segments.data.length === 0) {
+    return finding(8, "fail", "Empty inventory: zero application segments are defined, so ZPA is not brokering access to any private application.", evidence, evidenceNote);
+  }
+  if (enabled.length === 0) {
+    return finding(8, "fail", `${segments.data.length} application segments exist but none is enabled.`, evidence, evidenceNote);
+  }
+  if (bothBroad.length > 0) {
+    return finding(8, "fail", `${bothBroad.length} enabled segment(s) combine a wildcard domain with the full 1-65535 port range, which is flat network access rather than segmentation: ${bothBroad.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  const issues: string[] = [];
+  if (wildcard.length > 0) issues.push(`${wildcard.length} use wildcard domains`);
+  if (fullRange.length > 0) issues.push(`${fullRange.length} expose the full port range`);
+  if (bypassAlways.length > 0) issues.push(`${bypassAlways.length} have bypassType ALWAYS`);
+  if (issues.length > 0) {
+    return finding(8, "warn", `${enabled.length} enabled segments: ${issues.join(", ")}.${partialSuffix(segments, "application segment")}`, evidence, evidenceNote);
+  }
+  return finding(8, capForPartial("pass", segments), `${enabled.length} enabled application segments are scoped to explicit domains and ports with no ZPA bypass.${partialSuffix(segments, "application segment")}`, evidence);
+}
+
+function assessAccessPolicies(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Policy > Access Policy showing each enabled ALLOW rule's criteria (SCIM groups, SAML attributes, posture, trusted network, client type).";
+  const rules = data.accessRules;
+  if (rules.error) return unreadableFinding(9, "GET /policySet/rules/policyType/ACCESS_POLICY", rules, evidenceNote);
+  const enabled = rules.data.filter(zpaRuleEnabled);
+  const allow = enabled.filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "ALLOW");
+  const unconditional = allow.filter((rule) => asRecordArray(rule.conditions).length === 0);
+  const noIdentity = allow.filter((rule) => asRecordArray(rule.conditions).length > 0 && !ruleOperandTypes(rule).some((type) => IDENTITY_OPERAND_TYPES.includes(type)));
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: enabled.length,
+    allow_rules: allow.length,
+    deny_rules: enabled.length - allow.length,
+    unconditional_allow_rules: truncateList(unconditional.map(ruleLabel)),
+    allow_rules_without_identity_criteria: truncateList(noIdentity.map(ruleLabel)),
+    partial_inventory: rules.truncated === true,
+    rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), action: asString(rule.action) ?? null, disabled: asBoolean(rule.disabled) ?? false, operands: ruleOperandTypes(rule) }))),
+  };
+  if (rules.data.length === 0) {
+    return finding(9, "fail", "Empty inventory: zero access policy rules exist, so no user can be granted least-privilege access and ZPA is effectively unused.", evidence, evidenceNote);
+  }
+  if (allow.length === 0) {
+    return finding(9, "warn", `${enabled.length} enabled access rules exist but none allows access, so either ZPA is unused or the inventory is incomplete.`, evidence, evidenceNote);
+  }
+  if (unconditional.length > 0) {
+    return finding(9, "fail", `${unconditional.length} enabled ALLOW rule(s) have no conditions and grant every authenticated user access: ${unconditional.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  if (noIdentity.length > 0) {
+    return finding(9, "warn", `${noIdentity.length} enabled ALLOW rule(s) match only applications with no identity, posture, or network criteria: ${noIdentity.map(ruleLabel).join(", ")}.${partialSuffix(rules, "access rule")}`, evidence, evidenceNote);
+  }
+  return finding(9, capForPartial("pass", rules), `All ${allow.length} enabled ALLOW rules carry identity, posture, or network criteria.${partialSuffix(rules, "access rule")}`, evidence);
+}
+
+function assessPosture(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Administration > Posture Profiles and show which access rules reference them under Policy > Access Policy.";
+  const profiles = data.postureProfiles;
+  if (profiles.error) return unreadableFinding(10, "GET /posture", profiles, evidenceNote);
+  if (data.accessRules.error) return unreadableFinding(10, "GET /policySet/rules/policyType/ACCESS_POLICY", data.accessRules, evidenceNote);
+  const allow = data.accessRules.data.filter((rule) => zpaRuleEnabled(rule) && (asString(rule.action) ?? "").toUpperCase() === "ALLOW");
+  const postureRules = ruleUsesOperand(allow, "POSTURE");
+  const evidence = {
+    profile_count: profiles.data.length,
+    profiles: truncateList(profiles.data.map((profile) => ({ name: asString(profile.name) ?? null, postureType: asString(profile.postureType) ?? null }))),
+    allow_rules: allow.length,
+    allow_rules_with_posture: postureRules.length,
+    partial_inventory: profiles.truncated === true || data.accessRules.truncated === true,
+  };
+  if (profiles.data.length === 0) {
+    return finding(10, "fail", "Empty inventory: zero posture profiles are defined, so device posture is never evaluated before access.", evidence, evidenceNote);
+  }
+  if (allow.length === 0) {
+    return finding(10, "warn", `${profiles.data.length} posture profiles exist but no enabled ALLOW access rule exists to enforce them.`, evidence, evidenceNote);
+  }
+  if (postureRules.length === 0) {
+    return finding(10, "fail", `${profiles.data.length} posture profiles exist but none of the ${allow.length} enabled ALLOW rules uses a POSTURE condition.`, evidence, evidenceNote);
+  }
+  if (postureRules.length < allow.length) {
+    return finding(10, "warn", `${postureRules.length} of ${allow.length} enabled ALLOW rules enforce posture; the remaining ${allow.length - postureRules.length} grant access without a device check.`, evidence, evidenceNote);
+  }
+  return finding(10, profiles.truncated || data.accessRules.truncated ? "warn" : "pass", `All ${allow.length} enabled ALLOW rules enforce one of ${profiles.data.length} posture profiles.${partialSuffix(data.accessRules, "access rule")}`, evidence);
+}
+
+function connectorHealth(items: JsonRecord[], now: Date, staleDays: number): { connected: JsonRecord[]; disconnected: JsonRecord[]; undated: JsonRecord[] } {
+  const connected: JsonRecord[] = [];
+  const disconnected: JsonRecord[] = [];
+  const undated: JsonRecord[] = [];
+  for (const item of items) {
+    const status = (asString(item.controlChannelStatus) ?? "").toUpperCase();
+    const lastConnect = epochToDate(item.lastBrokerConnectTime);
+    if (status === ZPA_CONNECTED_STATUS) {
+      connected.push(item);
+    } else if (!lastConnect) {
+      undated.push(item);
+    } else if (daysBetween(now, lastConnect) > staleDays) {
+      disconnected.push(item);
+    } else {
+      disconnected.push(item);
+    }
+  }
+  return { connected, disconnected, undated };
+}
+
+function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
+  const evidenceNote = "Export Administration > App Connectors showing control channel status per connector and the connector count per App Connector Group.";
+  const connectors = data.appConnectors;
+  if (connectors.error) return unreadableFinding(11, "GET /connector", connectors, evidenceNote);
+  const enabled = connectors.data.filter((item) => asBoolean(item.enabled) !== false);
+  const health = connectorHealth(enabled, data.now, staleDays);
+  const perGroup = new Map<string, number>();
+  for (const connector of health.connected) {
+    const group = asString(connector.appConnectorGroupName) ?? asString(connector.appConnectorGroupId) ?? "ungrouped";
+    perGroup.set(group, (perGroup.get(group) ?? 0) + 1);
+  }
+  const groups = data.appConnectorGroups.error ? [] : data.appConnectorGroups.data.filter((group) => asBoolean(group.enabled) !== false);
+  const singleConnectorGroups = groups.filter((group) => (perGroup.get(asString(group.name) ?? asString(group.id) ?? "") ?? 0) < 2).map(ruleLabel);
+  const evidence = {
+    connector_count: connectors.data.length,
+    enabled_connectors: enabled.length,
+    connected: health.connected.length,
+    disconnected: truncateList(health.disconnected.map(ruleLabel)),
+    never_connected_or_undated: truncateList(health.undated.map(ruleLabel)),
+    connector_groups: data.appConnectorGroups.error ? null : groups.length,
+    groups_without_redundancy: truncateList(singleConnectorGroups),
+    partial_inventory: connectors.truncated === true,
+  };
+  if (connectors.data.length === 0) {
+    return finding(11, "fail", "Empty inventory: zero app connectors are enrolled, so no private application can be reached through ZPA.", evidence, evidenceNote);
+  }
+  if (health.connected.length === 0) {
+    return finding(11, "fail", `None of the ${enabled.length} enabled connectors reports controlChannelStatus ${ZPA_CONNECTED_STATUS}.`, evidence, evidenceNote);
+  }
+  const issues: string[] = [];
+  if (health.disconnected.length > 0) issues.push(`${health.disconnected.length} disconnected`);
+  if (health.undated.length > 0) issues.push(`${health.undated.length} with no lastBrokerConnectTime (treated as unhealthy, not fresh)`);
+  if (singleConnectorGroups.length > 0) issues.push(`${singleConnectorGroups.length} group(s) with fewer than two connected connectors`);
+  if (issues.length > 0) {
+    return finding(11, "warn", `${health.connected.length} of ${enabled.length} enabled connectors are connected; ${issues.join(", ")}.${partialSuffix(connectors, "connector")}`, evidence, evidenceNote);
+  }
+  return finding(11, capForPartial("pass", connectors), `All ${health.connected.length} enabled connectors are connected and every enabled connector group has at least two connected connectors.${partialSuffix(connectors, "connector")}`, evidence);
+}
+
+function assessIdp(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Administration > IdP Configuration (SSO type, SCIM sync, SAML request signing) and Administration > Administrators showing local login and two-factor settings for ZPA admins.";
+  const idps = data.idpControllers;
+  if (idps.error) return unreadableFinding(12, "GET /idp", idps, evidenceNote);
+  const enabled = idps.data.filter((idp) => asBoolean(idp.enabled) === true);
+  const userIdps = enabled.filter((idp) => asStringList(idp.ssoType).some((type) => type.toUpperCase() === "USER"));
+  const adminIdps = enabled.filter((idp) => asStringList(idp.ssoType).some((type) => type.toUpperCase() === "ADMIN"));
+  const scimIdps = userIdps.filter((idp) => asBoolean(idp.scimEnabled) === true);
+  const unsignedIdps = userIdps.filter((idp) => asBoolean(idp.signSamlRequest) !== true);
+  const admins = data.administrators.error ? undefined : data.administrators.data.filter((admin) => asBoolean(admin.isEnabled) !== false);
+  const weakAdmins = (admins ?? []).filter((admin) => asBoolean(admin.localLoginDisabled) !== true && asBoolean(admin.twoFactorAuthEnabled) !== true);
+  const evidence = {
+    idp_count: idps.data.length,
+    enabled_idps: enabled.length,
+    user_sso_idps: userIdps.map(ruleLabel),
+    admin_sso_idps: adminIdps.map(ruleLabel),
+    scim_enabled_idps: scimIdps.map(ruleLabel),
+    idps_without_signed_saml_requests: unsignedIdps.map(ruleLabel),
+    scim_groups: data.scimGroups.error ? null : data.scimGroups.data.length,
+    saml_attributes: data.samlAttributes.error ? null : data.samlAttributes.data.length,
+    zpa_admins_enabled: admins ? admins.length : null,
+    zpa_admins_local_login_without_2fa: truncateList(weakAdmins.map((admin) => asString(admin.username) ?? asString(admin.email) ?? asString(admin.id) ?? "admin")),
+  };
+  if (idps.data.length === 0) {
+    return finding(12, "fail", "Empty inventory: zero identity providers are configured, so ZPA cannot authenticate users through SAML.", evidence, evidenceNote);
+  }
+  if (userIdps.length === 0) {
+    return finding(12, "fail", `${idps.data.length} IdP(s) exist but none is enabled for user SSO (ssoType USER).`, evidence, evidenceNote);
+  }
+  const issues: string[] = [];
+  if (scimIdps.length === 0) issues.push("no user IdP has SCIM provisioning enabled");
+  if (unsignedIdps.length > 0) issues.push(`${unsignedIdps.length} user IdP(s) do not sign SAML requests`);
+  if (admins === undefined) issues.push(`ZPA administrators could not be read (${unreadableReason(data.administrators)})`);
+  if (weakAdmins.length > 0) issues.push(`${weakAdmins.length} enabled ZPA administrator(s) allow local login without two-factor authentication`);
+  if (adminIdps.length === 0) issues.push("no IdP is enabled for admin SSO");
+  if (issues.length > 0) {
+    return finding(12, "warn", `${userIdps.length} enabled user IdP(s) found, but: ${issues.join("; ")}.`, evidence, evidenceNote);
+  }
+  return finding(12, "pass", `${userIdps.length} enabled user IdP(s) with SCIM provisioning and signed SAML requests, ${adminIdps.length} admin SSO IdP(s), and every enabled ZPA administrator has local login disabled or two-factor authentication.`, evidence);
+}
+
+function assessTimeoutPolicy(data: ZpaData, maxTimeoutHours: number): ZscalerFinding {
+  const evidenceNote = "Export Policy > Timeout Policy showing reauthentication timeout and idle timeout per rule.";
+  const rules = data.timeoutRules;
+  if (rules.error) return unreadableFinding(13, "GET /policySet/rules/policyType/TIMEOUT_POLICY", rules, evidenceNote);
+  const enabled = rules.data.filter(zpaRuleEnabled);
+  const maxSeconds = maxTimeoutHours * 3600;
+  const excessive = enabled.filter((rule) => {
+    const timeout = asNumber(rule.reauthTimeout);
+    return timeout !== undefined && (timeout <= 0 || timeout > maxSeconds);
+  });
+  const undated = enabled.filter((rule) => asNumber(rule.reauthTimeout) === undefined);
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: enabled.length,
+    max_allowed_hours: maxTimeoutHours,
+    rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), reauthTimeout: asNumber(rule.reauthTimeout) ?? null, reauthIdleTimeout: asNumber(rule.reauthIdleTimeout) ?? null, disabled: asBoolean(rule.disabled) ?? false }))),
+    excessive_rules: truncateList(excessive.map(ruleLabel)),
+    rules_without_timeout_value: truncateList(undated.map(ruleLabel)),
+    partial_inventory: rules.truncated === true,
+  };
+  if (rules.data.length === 0) {
+    return finding(13, "fail", "Empty inventory: zero timeout policy rules exist, so user sessions are never forced to reauthenticate.", evidence, evidenceNote);
+  }
+  if (enabled.length === 0) {
+    return finding(13, "fail", `${rules.data.length} timeout rules exist but all are disabled.`, evidence, evidenceNote);
+  }
+  if (excessive.length > 0) {
+    return finding(13, "fail", `${excessive.length} enabled timeout rule(s) never expire or exceed ${maxTimeoutHours} hours: ${excessive.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  if (undated.length > 0) {
+    return finding(13, "warn", `${undated.length} enabled timeout rule(s) have no reauthTimeout value and cannot be counted as compliant: ${undated.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  return finding(13, capForPartial("pass", rules), `All ${enabled.length} enabled timeout rules reauthenticate within ${maxTimeoutHours} hours.${partialSuffix(rules, "timeout rule")}`, evidence);
+}
+
+function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Administration > Trusted Networks and identify the access or forwarding rules that reference them; if no on-premises detection is required, document that decision.";
+  const networks = data.trustedNetworks;
+  if (networks.error) return unreadableFinding(15, "GET /trustedNetwork", networks, evidenceNote);
+  const referencing = [
+    ...(data.accessRules.error ? [] : ruleUsesOperand(data.accessRules.data.filter(zpaRuleEnabled), "TRUSTED_NETWORK")),
+    ...(data.forwardingRules.error ? [] : ruleUsesOperand(data.forwardingRules.data.filter(zpaRuleEnabled), "TRUSTED_NETWORK")),
+  ];
+  const evidence = {
+    trusted_network_count: networks.data.length,
+    networks: truncateList(networks.data.map(ruleLabel)),
+    rules_referencing_trusted_networks: truncateList(referencing.map(ruleLabel)),
+    policy_rules_readable: !data.accessRules.error && !data.forwardingRules.error,
+  };
+  if (networks.data.length === 0) {
+    return finding(15, "manual", "Not configured: zero trusted networks are defined, so on-network detection is not in use; confirm whether the architecture requires it.", evidence, evidenceNote);
+  }
+  if (data.accessRules.error && data.forwardingRules.error) {
+    return finding(15, "manual", `${networks.data.length} trusted networks exist but policy rules could not be read, so their enforcement is unverified.`, evidence, evidenceNote);
+  }
+  if (referencing.length === 0) {
+    return finding(15, "warn", `${networks.data.length} trusted networks are defined but no enabled access or forwarding rule references a TRUSTED_NETWORK condition.`, evidence, evidenceNote);
+  }
+  return finding(15, "pass", `${networks.data.length} trusted networks are referenced by ${referencing.length} enabled policy rule(s).`, evidence);
+}
+
+function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
+  const evidenceNote = "If Private Service Edges are deployed, export Administration > Service Edges with control channel status; otherwise document reliance on Zscaler-hosted public service edges.";
+  const edges = data.serviceEdges;
+  if (edges.error) return unreadableFinding(21, "GET /serviceEdge", edges, evidenceNote);
+  const enabled = edges.data.filter((item) => asBoolean(item.enabled) !== false);
+  const health = connectorHealth(enabled, data.now, staleDays);
+  const evidence = {
+    service_edge_count: edges.data.length,
+    enabled: enabled.length,
+    connected: health.connected.length,
+    disconnected: truncateList(health.disconnected.map(ruleLabel)),
+    undated: truncateList(health.undated.map(ruleLabel)),
+    service_edge_groups: data.serviceEdgeGroups.error ? null : data.serviceEdgeGroups.data.length,
+  };
+  if (edges.data.length === 0) {
+    return finding(21, "manual", "Not applicable or not configured: zero private service edges are enrolled, so the tenant relies on Zscaler public service edges; document that decision.", evidence, evidenceNote);
+  }
+  if (health.disconnected.length + health.undated.length > 0) {
+    return finding(21, "warn", `${health.connected.length} of ${enabled.length} enabled private service edges are connected; ${health.disconnected.length} disconnected and ${health.undated.length} without a connect timestamp.`, evidence, evidenceNote);
+  }
+  return finding(21, capForPartial("pass", edges), `All ${health.connected.length} enabled private service edges are connected.`, evidence);
+}
+
+function assessForwardingPolicy(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Policy > Client Forwarding Policy and justify every BYPASS rule; confirm the default action forwards traffic through ZPA.";
+  const rules = data.forwardingRules;
+  if (rules.error) return unreadableFinding(22, "GET /policySet/rules/policyType/CLIENT_FORWARDING_POLICY", rules, evidenceNote);
+  const enabled = rules.data.filter(zpaRuleEnabled);
+  const bypass = enabled.filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "BYPASS");
+  const unconditionalBypass = bypass.filter((rule) => asRecordArray(rule.conditions).length === 0);
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: enabled.length,
+    bypass_rules: truncateList(bypass.map(ruleLabel)),
+    unconditional_bypass_rules: truncateList(unconditionalBypass.map(ruleLabel)),
+    rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), action: asString(rule.action) ?? null, disabled: asBoolean(rule.disabled) ?? false, operands: ruleOperandTypes(rule) }))),
+  };
+  if (rules.data.length === 0) {
+    return finding(22, "manual", "Empty inventory: zero client forwarding rules exist, so the platform default applies; confirm in the portal that the default forwards all application traffic through ZPA.", evidence, evidenceNote);
+  }
+  if (unconditionalBypass.length > 0) {
+    return finding(22, "fail", `${unconditionalBypass.length} enabled BYPASS rule(s) have no conditions and send all matching traffic around ZPA: ${unconditionalBypass.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  if (bypass.length > 0) {
+    return finding(22, "warn", `${bypass.length} enabled BYPASS rule(s) exist and need documented justification: ${bypass.map(ruleLabel).join(", ")}.`, evidence, evidenceNote);
+  }
+  return finding(22, capForPartial("pass", rules), `${enabled.length} enabled forwarding rules and none bypasses ZPA.${partialSuffix(rules, "forwarding rule")}`, evidence);
+}
+
+function assessEmergencyAccess(data: ZpaData): ZscalerFinding {
+  const evidenceNote = "Export Administration > Emergency Access showing each break-glass user, activation state, and last login, plus the procedure that governs activation.";
+  const users = data.emergencyAccessUsers;
+  if (users.error) return unreadableFinding(23, "GET /emergencyAccess/users", users, evidenceNote);
+  const active = users.data.filter((user) => /ACTIV/i.test(asString(user.userStatus) ?? "") && !/DEACTIV|INACTIV/i.test(asString(user.userStatus) ?? ""));
+  const undated = users.data.filter((user) => !epochToDate(user.lastLoginTime));
+  const evidence = {
+    emergency_user_count: users.data.length,
+    active_users: truncateList(active.map((user) => asString(user.emailId) ?? asString(user.userId) ?? "user")),
+    users_without_last_login: undated.length,
+    users: truncateList(users.data.map((user) => ({ email: asString(user.emailId) ?? null, status: asString(user.userStatus) ?? null, lastLoginTime: asString(user.lastLoginTime) ?? null }))),
+  };
+  if (users.data.length === 0) {
+    return finding(23, "manual", "Not configured: zero emergency access users exist; confirm the documented break-glass procedure covers ZPA outages without them.", evidence, evidenceNote);
+  }
+  if (active.length > 0) {
+    return finding(23, "warn", `${active.length} of ${users.data.length} emergency access users are currently active and should be deactivated when the incident closes: ${active.map((user) => asString(user.emailId) ?? "user").join(", ")}.`, evidence, evidenceNote);
+  }
+  return finding(23, capForPartial("pass", users), `${users.data.length} emergency access users are defined and none is currently active (${undated.length} have never logged in).`, evidence);
+}
+
+function certificateExpiry(items: JsonRecord[], now: Date, warnDays: number): { expired: string[]; expiring: string[]; undated: string[]; healthy: number } {
+  const expired: string[] = [];
+  const expiring: string[] = [];
+  const undated: string[] = [];
+  let healthy = 0;
+  for (const item of items) {
+    const validTo = epochToDate(item.validToInEpochSec);
+    const label = ruleLabel(item);
+    if (!validTo) {
+      undated.push(label);
+    } else if (validTo.getTime() <= now.getTime()) {
+      expired.push(label);
+    } else if (daysBetween(validTo, now) <= warnDays) {
+      expiring.push(label);
+    } else {
+      healthy += 1;
+    }
+  }
+  return { expired, expiring, undated, healthy };
+}
+
+function assessCertificates(data: ZpaData, warnDays: number): ZscalerFinding {
+  const evidenceNote = "Export Administration > Enrollment Certificates and Browser Access Certificates with validity dates, and confirm the ZIA intermediate CA certificate expiry under Policy > SSL Inspection (not part of the verified read surface).";
+  const enrollment = data.enrollmentCertificates;
+  if (enrollment.error) return unreadableFinding(24, "GET /enrollmentCert", enrollment, evidenceNote);
+  const enrollmentExpiry = certificateExpiry(enrollment.data, data.now, warnDays);
+  const baItems = data.browserAccessCertificates.error ? [] : data.browserAccessCertificates.data;
+  const baExpiry = certificateExpiry(baItems, data.now, warnDays);
+  const evidence = {
+    enrollment_certificates: enrollment.data.length,
+    enrollment_expired: enrollmentExpiry.expired,
+    enrollment_expiring_within_days: enrollmentExpiry.expiring,
+    enrollment_without_validity: enrollmentExpiry.undated,
+    browser_access_certificates: data.browserAccessCertificates.error ? null : baItems.length,
+    browser_access_expired: baExpiry.expired,
+    browser_access_expiring_within_days: baExpiry.expiring,
+    browser_access_without_validity: baExpiry.undated,
+    warn_days: warnDays,
+  };
+  if (enrollment.data.length === 0) {
+    return finding(24, "manual", "Empty inventory: zero enrollment certificates were returned although every ZPA tenant has Zscaler-managed enrollment certificates, so the credential is probably scoped.", evidence, evidenceNote);
+  }
+  const expired = [...enrollmentExpiry.expired, ...baExpiry.expired];
+  const expiring = [...enrollmentExpiry.expiring, ...baExpiry.expiring];
+  const undated = [...enrollmentExpiry.undated, ...baExpiry.undated];
+  if (expired.length > 0) {
+    return finding(24, "fail", `${expired.length} certificate(s) have expired: ${expired.join(", ")}.`, evidence, evidenceNote);
+  }
+  if (expiring.length > 0 || undated.length > 0 || data.browserAccessCertificates.error) {
+    const issues: string[] = [];
+    if (expiring.length > 0) issues.push(`${expiring.length} expire within ${warnDays} days`);
+    if (undated.length > 0) issues.push(`${undated.length} have no validToInEpochSec and cannot be counted as valid`);
+    if (data.browserAccessCertificates.error) issues.push(`browser access certificates could not be read (${unreadableReason(data.browserAccessCertificates)})`);
+    return finding(24, "warn", `${enrollmentExpiry.healthy + baExpiry.healthy} certificates are valid beyond ${warnDays} days, but ${issues.join("; ")}.`, evidence, evidenceNote);
+  }
+  return finding(24, capForPartial("pass", enrollment), `All ${enrollmentExpiry.healthy} enrollment and ${baExpiry.healthy} browser access certificates are valid for more than ${warnDays} days.`, evidence);
+}
+
+export interface ZpaAssessmentOptions {
+  certExpiryWarnDays?: number;
+  staleConnectorDays?: number;
+  maxTimeoutHours?: number;
+}
+
+export function assessZpaData(data: ZpaData, options: ZpaAssessmentOptions = {}): ZscalerAssessmentResult {
+  const warnDays = clampNumber(options.certExpiryWarnDays, DEFAULT_CERT_EXPIRY_WARN_DAYS, 1, 3650);
+  const staleDays = clampNumber(options.staleConnectorDays, DEFAULT_STALE_CONNECTOR_DAYS, 1, 3650);
+  const maxTimeoutHours = clampNumber(options.maxTimeoutHours, DEFAULT_MAX_TIMEOUT_HOURS, 1, 8760);
+  const findings = [
+    assessSegmentation(data),
+    assessAccessPolicies(data),
+    assessPosture(data),
+    assessConnectors(data, staleDays),
+    assessIdp(data),
+    assessTimeoutPolicy(data, maxTimeoutHours),
+    assessTrustedNetworks(data),
+    assessServiceEdges(data, staleDays),
+    assessForwardingPolicy(data),
+    assessEmergencyAccess(data),
+    assessCertificates(data, warnDays),
+  ];
+  const datasets: Array<[string, CollectedDataset<unknown>]> = [
+    ["application", data.applicationSegments],
+    ["segmentGroup", data.segmentGroups],
+    ["policySet/rules/policyType/ACCESS_POLICY", data.accessRules],
+    ["policySet/rules/policyType/TIMEOUT_POLICY", data.timeoutRules],
+    ["policySet/rules/policyType/CLIENT_FORWARDING_POLICY", data.forwardingRules],
+    ["policySet/rules/policyType/ISOLATION_POLICY", data.isolationRules],
+    ["appConnectorGroup", data.appConnectorGroups],
+    ["connector", data.appConnectors],
+    ["serviceEdgeGroup", data.serviceEdgeGroups],
+    ["serviceEdge", data.serviceEdges],
+    ["posture", data.postureProfiles],
+    ["trustedNetwork", data.trustedNetworks],
+    ["idp", data.idpControllers],
+    ["samlAttribute", data.samlAttributes],
+    ["scimgroup", data.scimGroups],
+    ["enrollmentCert", data.enrollmentCertificates],
+    ["clientlessCertificate/issued", data.browserAccessCertificates],
+    ["emergencyAccess/users", data.emergencyAccessUsers],
+    ["administrators", data.administrators],
+  ];
+  return {
+    title: "Zscaler ZPA zero trust access",
+    area: "zpa",
+    summary: {
+      application_segments: data.applicationSegments.data.length,
+      segment_groups: data.segmentGroups.data.length,
+      access_rules: data.accessRules.data.length,
+      timeout_rules: data.timeoutRules.data.length,
+      forwarding_rules: data.forwardingRules.data.length,
+      isolation_rules: data.isolationRules.data.length,
+      app_connectors: data.appConnectors.data.length,
+      service_edges: data.serviceEdges.data.length,
+      posture_profiles: data.postureProfiles.data.length,
+      trusted_networks: data.trustedNetworks.data.length,
+      idps: data.idpControllers.data.length,
+      administrators: data.administrators.data.length,
+      status_counts: summarizeFindingStatuses(findings),
+    },
+    findings,
+    errors: datasets.flatMap(([label, dataset]) => datasetErrors(label, dataset)),
+    truncated: datasets.flatMap(([label, dataset]) => datasetTruncations(label, dataset)),
+  };
+}
+
+export async function assessZpa(client: ZpaReadClient | undefined, options: ZpaAssessmentOptions = {}): Promise<ZscalerAssessmentResult> {
+  if (!client) {
+    return notConfiguredAssessment("zpa", "Zscaler ZPA zero trust access", "zpa", [8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24]);
+  }
+  return assessZpaData(await collectZpaData(client), options);
+}
 
 // EXPORT_PLACEHOLDER
 
@@ -2415,6 +2977,32 @@ export function registerZscalerTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zia_policy", ...result });
       } catch (error) {
         return errorResult(`ZIA policy assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zia_policy" });
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "zscaler_assess_zpa",
+    label: "Assess ZPA zero trust access",
+    description:
+      "Assess ZPA posture (spec controls 8-13, 15, 21-24): application segmentation, access policy criteria, posture enforcement, app connector health and redundancy, IdP/SAML/SCIM and admin login hardening, timeout policy, trusted networks, private service edges, client forwarding bypasses, emergency access, and certificate expiry. Renders manual when ZPA credentials are absent.",
+    parameters: Type.Object({
+      ...authParams,
+      cert_expiry_warn_days: Type.Optional(Type.Number({ description: "Warn when a certificate expires within this many days. Defaults to 30.", default: 30 })),
+      stale_connector_days: Type.Optional(Type.Number({ description: "Days since last broker connect before a connector is reported stale. Defaults to 30.", default: 30 })),
+      max_timeout_hours: Type.Optional(Type.Number({ description: "Maximum acceptable reauthentication timeout in hours. Defaults to 24.", default: 24 })),
+    }),
+    prepareArguments: normalizeZpaArgs,
+    async execute(_toolCallId: string, args: ZpaArgs) {
+      try {
+        const result = await withClients(args, (clients) => assessZpa(clients.zpa, {
+          certExpiryWarnDays: args.cert_expiry_warn_days,
+          staleConnectorDays: args.stale_connector_days,
+          maxTimeoutHours: args.max_timeout_hours,
+        }));
+        return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zpa", ...result });
+      } catch (error) {
+        return errorResult(`ZPA assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zpa" });
       }
     },
   });
