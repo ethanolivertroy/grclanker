@@ -125,6 +125,7 @@ The script prints a skip message and exits 0 when no ServiceNow configuration is
 - OAuth client credentials grant workflow: https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html
 - OAuth Application User for client credentials: https://www.servicenow.com/docs/r/platform-security/authentication/add-oauth-application-user.html
 - MFA system properties: https://www.servicenow.com/docs/r/platform-security/authentication/mfa-properties.html
+- Email OTP for multi-factor authentication (`glide.authenticate.multifactor.email.otp.enabled`): https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-enable-email-otp-for-multi-factor-authentication.html
 - Password policy properties: https://www.servicenow.com/docs/r/platform-security/authentication/password-policy-properties.html
 - High Security Settings: https://www.servicenow.com/docs/r/platform-security/exploring-high-security-settings.html
 - Session activity timeout hardening: https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-session-activity-timeout.html

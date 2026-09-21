@@ -1244,7 +1244,7 @@ const SESSION_PROPERTY_NAMES = ["glide.ui.session_timeout", "glide.ui.rotate_ses
 const IP_PROPERTY_NAMES = ["glide.ip.authenticate.strict"];
 const EMAIL_PROPERTY_NAMES = ["glide.smtp.auth", "glide.email.email_with_no_target_visible_to_all"];
 const PASSWORD_PROPERTY_NAMES = ["glide.enable.password_policy", "glide.apply.password_policy.on_login", "glide.login.no_blank_password"];
-const MFA_PROPERTY_NAMES = ["glide.authenticate.multifactor", "glide.authenticate.multifactor.email.otp.enable"];
+const MFA_PROPERTY_NAMES = ["glide.authenticate.multifactor", "glide.authenticate.multifactor.email.otp.enabled"];
 const SSO_PROPERTY_NAMES = ["glide.authenticate.multisso.enabled", "glide.authenticate.sso.redirect.idp", "glide.sso.acr.enabled"];
 const MID_PROPERTY_NAMES = ["mid.version.override"];
 
@@ -1545,7 +1545,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
 
   const mfa = gatedFinding(7, [data.properties, data.users, data.privilegedAssignments], "Open System Properties > Multi-factor Authentication (glide.authenticate.multifactor) and Multi-factor Authentication > Policies, then confirm every admin user or role requires MFA.", () => {
     const enabled = readProperty(data.properties, "glide.authenticate.multifactor");
-    const emailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enable");
+    const emailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enabled");
     const admins = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? ""));
     const adminsWithoutFlag = admins.filter((user) => rowBoolean(user, "enable_multifactor_authn") !== true).map(userLabel);
     const evidence: JsonRecord = {

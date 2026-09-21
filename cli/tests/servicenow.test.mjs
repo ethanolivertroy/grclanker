@@ -227,7 +227,7 @@ function healthyProperties() {
     property("glide.apply.password_policy.on_login", "true"),
     property("glide.login.no_blank_password", "true"),
     property("glide.authenticate.multifactor", "true"),
-    property("glide.authenticate.multifactor.email.otp.enable", "false"),
+    property("glide.authenticate.multifactor.email.otp.enabled", "false"),
     property("glide.authenticate.multisso.enabled", "true"),
     property("glide.authenticate.sso.redirect.idp", "sso-okta"),
     property("glide.sso.acr.enabled", "true"),
@@ -692,6 +692,21 @@ test("assessServicenowIdentityAccess treats an absent MFA property as disabled, 
 
   assert.equal(mfa.status, "fail");
   assert.match(mfa.summary, /no sys_properties row; the documented default is false/);
+});
+
+test("SNOW-07 warns on the documented email OTP property glide.authenticate.multifactor.email.otp.enabled", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_properties = fixture.tables.sys_properties.map((row) => (row.name === "glide.authenticate.multifactor.email.otp.enabled" ? { ...row, value: "true" } : row));
+  const { fetchImpl, calls } = fixtureFetch(fixture);
+  const mfa = findingsById(await assessServicenowIdentityAccess(createClient(fetchImpl))).get("SNOW-07");
+
+  assert.equal(mfa.status, "warn");
+  assert.match(mfa.summary, /email OTP is enabled as a factor/);
+  assert.equal(mfa.evidence.email_otp_enabled, "true");
+  const propertyCall = calls.find((call) => call.url.pathname === "/api/now/table/sys_properties");
+  const requested = propertyCall.url.searchParams.get("sysparm_query").replace("nameIN", "").split(",");
+  assert.ok(requested.includes("glide.authenticate.multifactor.email.otp.enabled"));
+  assert.equal(requested.includes("glide.authenticate.multifactor.email.otp.enable"), false);
 });
 
 test("assessServicenowPlatformHardening passes a hardened fixture and keeps email security manual", async () => {
