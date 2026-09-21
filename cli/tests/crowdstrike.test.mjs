@@ -89,6 +89,55 @@ function findingById(result, id) {
   return item;
 }
 
+function page(items, overrides = {}) {
+  return { items, total: items.length, truncated: false, ...overrides };
+}
+
+function truncatedPage(items, total = items.length * 10) {
+  return { items, total, truncated: true };
+}
+
+function forbidden(path) {
+  return async () => {
+    throw new CrowdstrikeHttpError(`CrowdStrike request failed for ${path} (403): access denied`, 403, path);
+  };
+}
+
+const PAGED_METHODS = [
+  "listPreventionPolicies",
+  "listResponsePolicies",
+  "listRtrSessions",
+  "listAlerts",
+  "listHosts",
+  "listDeviceControlPolicies",
+  "listFirewallPolicies",
+  "listFirewallRuleGroups",
+  "listFirewallRules",
+  "listSensorUpdatePolicies",
+  "listHostGroups",
+  "listUserUuids",
+  "listUserRoles",
+  "listRoles",
+  "listApiClients",
+  "listDiscoverHosts",
+  "listZtaAssessments",
+  "listIoaExclusions",
+  "listMlExclusions",
+  "listSensorVisibilityExclusions",
+  "listIdentityProtectionRules",
+];
+
+function autoPaged(fn) {
+  return async (...args) => {
+    const result = await fn(...args);
+    return Array.isArray(result) ? page(result) : result;
+  };
+}
+
+function statusMap(assessments) {
+  return Object.fromEntries(assessments.flatMap((assessment) => assessment.findings.map((item) => [item.id, item.status])));
+}
+
 function toggleSettings(ids, enabled) {
   return ids.map((id) => ({ id, type: "toggle", value: { enabled } }));
 }
@@ -108,11 +157,13 @@ function preventionPolicy(overrides = {}) {
     tamperEnabled = true,
     detectOnWrite = true,
     quarantineOnWrite = true,
+    groups = [{ id: "hg-1", name: "Workstations" }],
+    sliders,
   } = overrides;
   const categories = [
     {
       name: "Machine Learning",
-      settings: [
+      settings: sliders ?? [
         { id: "CloudAntiMalware", type: "mlslider", value: { detection, prevention } },
         { id: "OnSensorMLSlider", type: "mlslider", value: { detection, prevention } },
         { id: "AdwarePUP", type: "mlslider", value: { detection: "MODERATE", prevention: "MODERATE" } },
@@ -142,7 +193,7 @@ function preventionPolicy(overrides = {}) {
       settings: toggleSettings(["ScriptBasedExecutionMonitoring", "InterpreterProtection", "EngineProtectionV2"], scriptEnabled),
     });
   }
-  return { id, name, platform_name: platform, enabled, prevention_settings: categories };
+  return { id, name, platform_name: platform, enabled, groups, prevention_settings: categories };
 }
 
 function passingPreventionPolicies() {
@@ -154,12 +205,13 @@ function passingPreventionPolicies() {
 }
 
 function responsePolicy(overrides = {}) {
-  const { rtr = true, customScripts = false, enabled = true } = overrides;
+  const { rtr = true, customScripts = false, enabled = true, groups = [{ id: "hg-1" }] } = overrides;
   return {
     id: "resp-1",
     name: "Default Response",
     platform_name: "Windows",
     enabled,
+    groups,
     settings: [
       {
         name: "Real Time Response",
@@ -175,7 +227,7 @@ function responsePolicy(overrides = {}) {
 
 function passingDeviceControl() {
   return {
-    policies: [{ id: "dc-1", name: "USB Lockdown", platform_name: "Windows", enabled: true }],
+    policies: [{ id: "dc-1", name: "USB Lockdown", platform_name: "Windows", enabled: true, groups: [{ id: "hg-1" }] }],
     details: [
       {
         id: "dc-1",
@@ -241,6 +293,18 @@ function passingUsers() {
   };
 }
 
+function sensorUpdatePolicy(overrides = {}) {
+  return {
+    id: "su-1",
+    name: "Auto N-1",
+    platform_name: "Windows",
+    enabled: true,
+    groups: [{ id: "hg-1" }],
+    settings: { build: "17306|n-1|tagged", uninstall_protection: "ENABLED", stage: "prod" },
+    ...overrides,
+  };
+}
+
 function createFakeClient(overrides = {}) {
   const prevention = passingPreventionPolicies();
   const deviceControl = passingDeviceControl();
@@ -248,7 +312,7 @@ function createFakeClient(overrides = {}) {
   const users = passingUsers();
   const hosts = [host(), host({ device_id: "aid-2", hostname: "ws-02" }), host({ device_id: "aid-3", hostname: "srv-01", platform_name: "Linux" })];
 
-  return {
+  const client = {
     getResolvedConfig: () => sampleConfig(),
     getJson: async () => ({ resources: ["x"], meta: { pagination: { total: 1 } } }),
     postJson: async () => ({ resources: ["x"], meta: { pagination: { total: 1 } } }),
@@ -269,9 +333,7 @@ function createFakeClient(overrides = {}) {
     getFirewallPolicyContainers: async () => firewall.containers,
     listFirewallRuleGroups: async () => firewall.ruleGroups,
     listFirewallRules: async () => firewall.rules,
-    listSensorUpdatePolicies: async () => [
-      { id: "su-1", name: "Auto N-1", platform_name: "Windows", enabled: true, settings: { build: "17306|n-1|tagged", uninstall_protection: "ENABLED", stage: "prod" } },
-    ],
+    listSensorUpdatePolicies: async () => [sensorUpdatePolicy()],
     listSensorUpdateBuilds: async () => [
       { build: "17407|n|tagged", sensor_version: "7.22.17407", platform: "windows", stage: "prod" },
       { build: "17306|n-1|tagged", sensor_version: "7.21.17306", platform: "windows", stage: "prod" },
@@ -293,6 +355,71 @@ function createFakeClient(overrides = {}) {
     listIdentityProtectionRules: async () => [{ id: "idp-1", name: "Block stale accounts", enabled: true, simulationMode: false, action: "BLOCK", trigger: "AUTHENTICATION" }],
     ...overrides,
   };
+  for (const name of PAGED_METHODS) {
+    client[name] = autoPaged(client[name]);
+  }
+  return client;
+}
+
+function createForbiddenClient() {
+  const client = { getResolvedConfig: () => sampleConfig() };
+  for (const name of Object.keys(createFakeClient())) {
+    if (name === "getResolvedConfig") continue;
+    client[name] = forbidden(`/${name}`);
+  }
+  return client;
+}
+
+function createEmptyClient() {
+  return createFakeClient({
+    listPreventionPolicies: async () => [],
+    listResponsePolicies: async () => [],
+    listRtrSessions: async () => [],
+    listAlerts: async () => [],
+    listHosts: async () => [],
+    listDeviceControlPolicies: async () => [],
+    getDeviceControlPoliciesV2: async () => [],
+    listFirewallPolicies: async () => [],
+    getFirewallPolicyContainers: async () => [],
+    listFirewallRuleGroups: async () => [],
+    listFirewallRules: async () => [],
+    listSensorUpdatePolicies: async () => [],
+    listSensorUpdateBuilds: async () => [],
+    listHostGroups: async () => [],
+    countDiscoverHosts: async () => 0,
+    listDiscoverHosts: async () => [],
+    countZtaAssessments: async () => 0,
+    listZtaAssessments: async () => [],
+    listUserUuids: async () => [],
+    getUsers: async () => [],
+    listUserRoles: async () => [],
+    listRoles: async () => [],
+    listApiClients: async () => [],
+    listIoaExclusions: async () => [],
+    listMlExclusions: async () => [],
+    listSensorVisibilityExclusions: async () => [],
+    listIdentityProtectionRules: async () => [],
+  });
+}
+
+function createPartialClient() {
+  const complete = createFakeClient();
+  const overrides = {};
+  for (const name of PAGED_METHODS) {
+    overrides[name] = async (...args) => {
+      const result = await complete[name](...args);
+      return truncatedPage(result.items, result.items.length + 40);
+    };
+  }
+  return createFakeClient({
+    ...overrides,
+    listUserRoles: async (uuid) => {
+      if (uuid === "u-analyst") throw new CrowdstrikeHttpError("CrowdStrike request failed for /user-management/combined/user-roles/v2 (403)", 403, "/user-management/combined/user-roles/v2");
+      return complete.listUserRoles(uuid);
+    },
+    countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? 1 : 99),
+    countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? 1 : 100),
+  });
 }
 
 test("resolveCrowdstrikeConfiguration prefers explicit args over environment and config file values", () => {
@@ -389,7 +516,9 @@ test("CrowdstrikeApiClient exchanges OAuth2 client credentials and paginates off
   const client = new CrowdstrikeApiClient(sampleConfig({ memberCid: "child-cid" }), { fetchImpl });
   const policies = await client.listOffset("/policy/combined/prevention/v1", {}, { limit: 10, pageSize: 2 });
 
-  assert.deepEqual(policies.map((policy) => policy.id), ["p-1", "p-2", "p-3"]);
+  assert.deepEqual(policies.items.map((policy) => policy.id), ["p-1", "p-2", "p-3"]);
+  assert.equal(policies.total, 3);
+  assert.equal(policies.truncated, false);
   assert.equal(seen[0].pathname, "/oauth2/token");
   assert.equal(seen[0].method, "POST");
   const tokenBody = new URLSearchParams(seen[0].body);
@@ -431,13 +560,66 @@ test("CrowdstrikeApiClient follows after cursors, opaque offset tokens, and POST
 
   const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
   const discovered = await client.listDiscoverHosts("entity_type:'unmanaged'", 10);
-  assert.deepEqual(discovered.map((item) => item.id), ["d-1", "d-2"]);
+  assert.deepEqual(discovered.items.map((item) => item.id), ["d-1", "d-2"]);
+  assert.equal(discovered.truncated, false);
 
   const hosts = await client.listHosts(10);
-  assert.deepEqual(hosts.map((item) => item.device_id), ["h-1", "h-2"]);
+  assert.deepEqual(hosts.items.map((item) => item.device_id), ["h-1", "h-2"]);
+  assert.equal(hosts.truncated, false);
 
   const alerts = await client.listAlerts("severity:>=70", 10);
-  assert.deepEqual(alerts.map((item) => item.composite_id), ["a-1", "a-2"]);
+  assert.deepEqual(alerts.items.map((item) => item.composite_id), ["a-1", "a-2"]);
+  assert.equal(alerts.truncated, false);
+});
+
+test("CrowdstrikeApiClient records truncation instead of treating a first page as the whole population", async () => {
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") {
+      return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    }
+    if (url.pathname === "/policy/combined/prevention/v1") {
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      const limit = Number(url.searchParams.get("limit"));
+      const ids = Array.from({ length: 7 }, (_, index) => ({ id: `p-${index + 1}` })).slice(offset, offset + limit);
+      return jsonResponse({ resources: ids, meta: { pagination: { offset: offset + ids.length, limit, total: 7 } } });
+    }
+    if (url.pathname === "/discover/combined/hosts/v1") {
+      const after = url.searchParams.get("after");
+      const index = after ? Number(after.replace("cursor-", "")) : 0;
+      const nextAfter = index + 1 < 3 ? `cursor-${index + 1}` : undefined;
+      return jsonResponse({ resources: [{ id: `d-${index + 1}` }], meta: { pagination: { after: nextAfter, total: 3 } } });
+    }
+    if (url.pathname === "/alerts/combined/alerts/v1") {
+      const body = JSON.parse(init.body);
+      const index = body.after ? Number(body.after.replace("alert-", "")) : 0;
+      return jsonResponse({ resources: [{ composite_id: `a-${index + 1}` }], meta: { pagination: { after: `alert-${index + 1}` } } });
+    }
+    throw new Error(`unexpected path ${url.pathname}`);
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  const truncatedOffset = await client.listOffset("/policy/combined/prevention/v1", {}, { limit: 4, pageSize: 2 });
+  assert.equal(truncatedOffset.items.length, 4);
+  assert.equal(truncatedOffset.total, 7);
+  assert.equal(truncatedOffset.truncated, true);
+
+  const completeOffset = await client.listOffset("/policy/combined/prevention/v1", {}, { limit: 50, pageSize: 2 });
+  assert.equal(completeOffset.items.length, 7);
+  assert.equal(completeOffset.truncated, false);
+
+  const truncatedAfter = await client.listDiscoverHosts("entity_type:'unmanaged'", 2);
+  assert.equal(truncatedAfter.items.length, 2);
+  assert.equal(truncatedAfter.total, 3);
+  assert.equal(truncatedAfter.truncated, true);
+
+  const completeAfter = await client.listDiscoverHosts("entity_type:'unmanaged'", 10);
+  assert.equal(completeAfter.items.length, 3);
+  assert.equal(completeAfter.truncated, false);
+
+  const truncatedAlerts = await client.listAlerts("severity:>=70", 2);
+  assert.equal(truncatedAlerts.items.length, 2);
+  assert.equal(truncatedAlerts.truncated, true);
 });
 
 test("CrowdstrikeApiClient retries 429 and 5xx responses honoring X-RateLimit-RetryAfter and refreshes expired tokens", async () => {
@@ -474,7 +656,7 @@ test("CrowdstrikeApiClient retries 429 and 5xx responses honoring X-RateLimit-Re
   });
   const policies = await client.listPreventionPolicies();
 
-  assert.deepEqual(policies.map((policy) => policy.id), ["p-1"]);
+  assert.deepEqual(policies.items.map((policy) => policy.id), ["p-1"]);
   assert.equal(sleeps.length, 2);
   assert.ok(sleeps[0] >= 1000 && sleeps[0] <= 2500, `expected retry-after delay near 2s, saw ${sleeps[0]}`);
   assert.equal(sleeps[1], 500);
@@ -690,8 +872,8 @@ test("assessCrowdstrikeSensorCoverage passes auto-updating sensors with complete
 test("assessCrowdstrikeSensorCoverage fails disabled updates, stale sensors, unmanaged assets, and low ZTA scores", async () => {
   const client = createFakeClient({
     listSensorUpdatePolicies: async () => [
-      { id: "su-off", name: "Updates Off", platform_name: "Windows", enabled: true, settings: { build: "", uninstall_protection: "DISABLED" } },
-      { id: "su-old", name: "Pinned Old", platform_name: "Windows", enabled: true, settings: { build: "16000", uninstall_protection: "ENABLED" } },
+      sensorUpdatePolicy({ id: "su-off", name: "Updates Off", settings: { build: "", uninstall_protection: "DISABLED" } }),
+      sensorUpdatePolicy({ id: "su-old", name: "Pinned Old", settings: { build: "16000", uninstall_protection: "ENABLED" } }),
     ],
     listHosts: async () => [
       host({ last_seen: isoDaysAgo(30), groups: [] }),
@@ -774,6 +956,306 @@ test("assessCrowdstrikeAccessGovernance fails excessive admins, write-heavy API 
   assert.equal(findingById(unlicensed, "CS-24").status, "manual");
   assert.equal(findingById(unlicensed, "CS-16").status, "manual");
   assert.equal(findingById(unlicensed, "CS-17").status, "manual");
+});
+
+test("verdict safety rule 1: unreadable dependencies yield manual with cause and console evidence, never pass", async () => {
+  const deviceDetails = await assessCrowdstrikeDeviceFirewall(createFakeClient({
+    getDeviceControlPoliciesV2: forbidden("/policy/entities/device-control/v2"),
+    getFirewallPolicyContainers: async () => { throw new Error("socket hang up"); },
+  }));
+  for (const id of ["CS-08", "CS-09", "CS-10", "CS-11"]) {
+    const item = findingById(deviceDetails, id);
+    assert.equal(item.status, "manual", `${id} should be manual`);
+    assert.match(item.summary, /Verdict: manual \(unknown\)/);
+    assert.match(item.summary, /Collect manually:/);
+  }
+  assert.match(findingById(deviceDetails, "CS-08").summary, /device control policy details read failed \(.*403/);
+  assert.match(findingById(deviceDetails, "CS-10").summary, /firewall policy containers read failed \(.*socket hang up/);
+
+  const ruleGroupsOnly = await assessCrowdstrikeDeviceFirewall(createFakeClient({ listFirewallRuleGroups: forbidden("/fwmgr/queries/rule-groups/v1") }));
+  assert.equal(findingById(ruleGroupsOnly, "CS-10").status, "manual");
+  assert.equal(findingById(ruleGroupsOnly, "CS-11").status, "pass");
+  const rulesOnly = await assessCrowdstrikeDeviceFirewall(createFakeClient({ listFirewallRules: forbidden("/fwmgr/queries/rules/v1") }));
+  assert.equal(findingById(rulesOnly, "CS-10").status, "pass");
+  assert.equal(findingById(rulesOnly, "CS-11").status, "manual");
+
+  const coverage = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    listHostGroups: forbidden("/devices/combined/host-groups/v1"),
+    countDiscoverHosts: async (filter) => {
+      if (filter.includes("managed'") && !filter.includes("unmanaged")) throw new Error("gateway timeout");
+      return 0;
+    },
+    countZtaAssessments: async (filter) => {
+      if (filter.startsWith("score:<")) throw new CrowdstrikeHttpError("CrowdStrike request failed for /zero-trust-assessment/queries/assessments/v1 (500)", 500, "/zero-trust-assessment/queries/assessments/v1");
+      return 25;
+    },
+  }));
+  assert.equal(findingById(coverage, "CS-13").status, "pass");
+  assert.equal(findingById(coverage, "CS-14").status, "manual");
+  assert.match(findingById(coverage, "CS-14").summary, /host groups read failed/);
+  assert.equal(findingById(coverage, "CS-15").status, "manual");
+  assert.match(findingById(coverage, "CS-15").summary, /managed asset count read failed/);
+  assert.equal(findingById(coverage, "CS-25").status, "manual");
+  assert.match(findingById(coverage, "CS-25").summary, /below-threshold scores read failed/);
+
+  const allRolesForbidden = await assessCrowdstrikeAccessGovernance(createFakeClient({ listUserRoles: forbidden("/user-management/combined/user-roles/v2") }));
+  assert.equal(findingById(allRolesForbidden, "CS-16").status, "manual");
+  assert.equal(findingById(allRolesForbidden, "CS-17").status, "manual");
+  assert.match(findingById(allRolesForbidden, "CS-16").summary, /user role grants read failed/);
+
+  const someRolesForbidden = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listUserRoles: async (uuid) => {
+      if (uuid === "u-analyst") throw new CrowdstrikeHttpError("CrowdStrike request failed for /user-management/combined/user-roles/v2 (403)", 403, "/user-management/combined/user-roles/v2");
+      return passingUsers().roles[uuid];
+    },
+  }));
+  assert.equal(findingById(someRolesForbidden, "CS-16").status, "warn");
+  assert.equal(findingById(someRolesForbidden, "CS-17").status, "warn");
+  assert.equal(findingById(someRolesForbidden, "CS-16").evidence.users_without_readable_roles, 1);
+  assert.match(findingById(someRolesForbidden, "CS-16").summary, /lower bound/);
+  assert.equal(someRolesForbidden.summary.role_lookups_failed, 1);
+});
+
+test("verdict safety rule 2: empty inventories pass only where emptiness is compliant and say so", async () => {
+  const statuses = statusMap(await runAllCrowdstrikeAssessments(createEmptyClient()));
+  const expected = {
+    "CS-01": "fail", "CS-02": "fail", "CS-03": "fail", "CS-04": "fail", "CS-05": "fail",
+    "CS-06": "fail", "CS-07": "manual", "CS-08": "fail", "CS-09": "fail", "CS-10": "fail",
+    "CS-11": "fail", "CS-12": "fail", "CS-13": "fail", "CS-14": "fail", "CS-15": "manual",
+    "CS-16": "manual", "CS-17": "manual", "CS-18": "manual", "CS-19": "pass", "CS-20": "pass",
+    "CS-21": "pass", "CS-22": "pass", "CS-23": "pass", "CS-24": "fail", "CS-25": "manual",
+  };
+  assert.deepEqual(statuses, expected);
+
+  const assessments = await runAllCrowdstrikeAssessments(createEmptyClient());
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  const byId = (id) => findings.find((item) => item.id === id);
+  assert.match(byId("CS-01").summary, /returned zero policies; with no prevention policy defined this control fails/);
+  assert.match(byId("CS-13").summary, /emptiness fails this control/);
+  assert.match(byId("CS-16").summary, /returned zero users/);
+  assert.match(byId("CS-18").summary, /returned zero clients/);
+  assert.match(byId("CS-19").summary, /emptiness is compliant for this control/);
+  assert.match(byId("CS-22").summary, /alerts endpoint was readable .* last 30 days \(window stated\)/);
+  assert.match(byId("CS-23").summary, /Hosts API was readable .* emptiness is compliant/);
+  assert.match(byId("CS-24").summary, /emptiness fails this control/);
+  assert.match(byId("CS-15").summary, /zero managed and zero unmanaged assets/);
+  assert.match(byId("CS-25").summary, /zero scored hosts/);
+});
+
+test("verdict safety rule 3: unlicensed Discover, Identity Protection, and ZTA render as manual not applicable", async () => {
+  const coverage = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    countDiscoverHosts: forbidden("/discover/queries/hosts/v1"),
+    countZtaAssessments: async () => { throw new CrowdstrikeHttpError("CrowdStrike request failed for /zero-trust-assessment/queries/assessments/v1 (404)", 404, "/zero-trust-assessment/queries/assessments/v1"); },
+  }));
+  const governance = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listIdentityProtectionRules: forbidden("/identity-protection/queries/policy-rules/v1"),
+  }));
+  for (const item of [findingById(coverage, "CS-15"), findingById(coverage, "CS-25"), findingById(governance, "CS-24")]) {
+    assert.equal(item.status, "manual", `${item.id} should be manual`);
+    assert.match(item.summary, /unlicensed or not applicable/);
+    assert.match(item.summary, /Collect manually:/);
+    assert.equal(item.evidence.not_applicable, true);
+  }
+});
+
+test("verdict safety rule 4: undated records are bucketed separately and cap the verdict at warn", async () => {
+  const coverage = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    listHosts: async (_limit, filter) => (filter ? [] : [host(), host({ device_id: "aid-2", hostname: "ws-02", last_seen: null }), host({ device_id: "aid-3", hostname: "ws-03", last_seen: undefined })]),
+  }));
+  const deployment = findingById(coverage, "CS-13");
+  assert.equal(deployment.status, "warn");
+  assert.equal(deployment.evidence.hosts_without_last_seen, 2);
+  assert.equal(deployment.evidence.active_hosts, 1);
+  assert.equal(deployment.evidence.stale_hosts, 0);
+  assert.deepEqual(deployment.evidence.undated_items, { label: "hosts", field: "last_seen", count: 2 });
+  assert.match(deployment.summary, /2 hosts have no last_seen timestamp/);
+
+  const governance = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    getUsers: async () => [
+      { uuid: "u-admin", uid: "alice@example.com", status: "active" },
+      { uuid: "u-analyst", uid: "bob@example.com", status: "active", last_login_at: isoDaysAgo(1) },
+    ],
+  }));
+  const leastPrivilege = findingById(governance, "CS-17");
+  assert.equal(leastPrivilege.status, "warn");
+  assert.deepEqual(leastPrivilege.evidence.admins_without_login_date, ["alice@example.com"]);
+  assert.equal(leastPrivilege.evidence.stale_privileged.length, 0);
+
+  const response = await assessCrowdstrikeResponseReadiness(createFakeClient({
+    listAlerts: async () => [
+      { composite_id: "a-1", severity: 90, severity_name: "Critical", status: "closed", seconds_to_resolved: 600 },
+      { composite_id: "a-2", severity: 70, severity_name: "High", status: "closed", created_timestamp: isoHoursAgo(30), updated_timestamp: isoHoursAgo(26) },
+    ],
+    listHosts: async () => [host({ hostname: "contained-01", status: "contained", modified_timestamp: null })],
+  }));
+  const sla = findingById(response, "CS-22");
+  assert.equal(sla.status, "warn");
+  assert.equal(sla.evidence.alerts_with_created_timestamp, 1);
+  assert.equal(sla.evidence.undated_items.count, 1);
+  const containment = findingById(response, "CS-23");
+  assert.equal(containment.status, "warn");
+  assert.equal(containment.evidence.undated_items.count, 1);
+});
+
+test("verdict safety rule 5: partial inventories never pass and report seen versus total counts", async () => {
+  const assessments = await runAllCrowdstrikeAssessments(createPartialClient());
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  assert.equal(findings.length, 25);
+  for (const item of findings) {
+    assert.notEqual(item.status, "pass", `${item.id} passed on a partial inventory: ${item.summary}`);
+  }
+  const deployment = findings.find((item) => item.id === "CS-13");
+  assert.equal(deployment.status, "warn");
+  assert.deepEqual(deployment.evidence.partial_inventory, [{ dataset: "hosts", seen: 3, total: 43 }]);
+  assert.match(deployment.summary, /Partial inventory: only 3 of 43 hosts were read/);
+  const admins = findings.find((item) => item.id === "CS-16");
+  assert.equal(admins.status, "warn");
+  assert.equal(admins.evidence.users_without_readable_roles, 1);
+  assert.deepEqual(admins.evidence.partial_inventory, [{ dataset: "users", seen: 2, total: 42 }]);
+  const alerts = findings.find((item) => item.id === "CS-22");
+  assert.deepEqual(alerts.evidence.partial_inventory, [{ dataset: "critical/high alerts", seen: 2, total: 42 }]);
+  const apiClients = findings.find((item) => item.id === "CS-18");
+  assert.equal(apiClients.evidence.reported_total_api_clients, 41);
+  const sensorCoverage = assessments.find((assessment) => assessment.category === "sensor_coverage");
+  assert.equal(sensorCoverage.summary.hosts_truncated, true);
+  assert.equal(sensorCoverage.summary.reported_total_hosts, 43);
+});
+
+test("verdict safety rule 6: disabled, unassigned, or incomplete enabling flags never support pass", async () => {
+  const disabledOnly = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [preventionPolicy({ enabled: false })],
+  }));
+  assert.equal(findingById(disabledOnly, "CS-01").status, "fail");
+  assert.match(findingById(disabledOnly, "CS-01").summary, /None of the 1 prevention policies is both enabled and assigned/);
+
+  const unassigned = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [preventionPolicy({ groups: [] })],
+  }));
+  for (const id of ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"]) {
+    assert.equal(findingById(unassigned, id).status, "fail", `${id} should fail without host group assignment`);
+  }
+  assert.match(findingById(unassigned, "CS-04").summary, /1 enabled but unassigned/);
+  assert.deepEqual(findingById(unassigned, "CS-04").evidence.enabled_but_unassigned_policies, ["Windows Hardened (Windows)"]);
+
+  const platformDefault = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [
+      preventionPolicy({ name: "platform_default", groups: [] }),
+      preventionPolicy({ id: "prev-mac", name: "platform_default", platform: "Mac", groups: [], includeExploit: false, includeScript: false }),
+      preventionPolicy({ id: "prev-linux", name: "platform_default", platform: "Linux", groups: [], includeExploit: false, includeScript: false }),
+    ],
+  }));
+  assert.equal(findingById(platformDefault, "CS-04").status, "pass");
+
+  const mixed = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [
+      preventionPolicy({ id: "strong-unassigned", name: "Strong but unassigned", groups: [] }),
+      preventionPolicy({ id: "weak-assigned", name: "Weak assigned", detection: "CAUTIOUS", prevention: "CAUTIOUS" }),
+    ],
+  }));
+  assert.equal(findingById(mixed, "CS-01").status, "fail");
+  assert.equal(findingById(mixed, "CS-01").evidence.policies.length, 1);
+
+  const incompleteSlider = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [preventionPolicy({
+      sliders: [
+        { id: "CloudAntiMalware", type: "mlslider", value: { detection: "AGGRESSIVE" } },
+        { id: "OnSensorMLSlider", type: "mlslider", value: { detection: "AGGRESSIVE", prevention: "AGGRESSIVE" } },
+      ],
+    })],
+  }));
+  assert.equal(findingById(incompleteSlider, "CS-01").status, "warn");
+  assert.equal(findingById(incompleteSlider, "CS-01").evidence.policies[0].sliders_complete, false);
+
+  const missingSlider = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [preventionPolicy({
+      sliders: [{ id: "OnSensorMLSlider", type: "mlslider", value: { detection: "EXTRA_AGGRESSIVE", prevention: "EXTRA_AGGRESSIVE" } }],
+    })],
+  }));
+  assert.equal(findingById(missingSlider, "CS-01").status, "warn");
+
+  const unknownGroups = await assessCrowdstrikeDeviceFirewall(createFakeClient({
+    listFirewallRuleGroups: async () => [],
+  }));
+  assert.equal(findingById(unknownGroups, "CS-10").status, "warn");
+  assert.equal(findingById(unknownGroups, "CS-10").evidence.policies[0].unknown_rule_groups, 1);
+  assert.equal(findingById(unknownGroups, "CS-10").evidence.policies[0].active_rule_groups, 0);
+
+  const unassignedResponse = await assessCrowdstrikeResponseReadiness(createFakeClient({
+    listResponsePolicies: async () => [responsePolicy({ groups: [] })],
+  }));
+  assert.equal(findingById(unassignedResponse, "CS-06").status, "fail");
+  const unassignedSensor = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    listSensorUpdatePolicies: async () => [sensorUpdatePolicy({ groups: [] })],
+  }));
+  assert.equal(findingById(unassignedSensor, "CS-12").status, "fail");
+  const unassignedDevice = await assessCrowdstrikeDeviceFirewall(createFakeClient({
+    listDeviceControlPolicies: async () => [{ id: "dc-1", name: "USB Lockdown", platform_name: "Windows", enabled: true, groups: [] }],
+  }));
+  assert.equal(findingById(unassignedDevice, "CS-08").status, "fail");
+  assert.equal(findingById(unassignedDevice, "CS-09").status, "fail");
+});
+
+test("verdict safety rule 7: truncated pages downgrade the assessments that depend on them", async () => {
+  const result = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listIoaExclusions: async () => truncatedPage([{ id: "ioa-1", name: "Backup agent", ifn_regex: "C:\\\\Program Files\\\\Backup\\\\agent\\.exe", applied_globally: false, groups: [{ id: "hg-1" }] }], 600),
+    listApiClients: async () => truncatedPage([{ id: "api-1", name: "grclanker audit", scopes: ["hosts:read"] }], 501),
+  }));
+  const ioa = findingById(result, "CS-19");
+  assert.equal(ioa.status, "warn");
+  assert.match(ioa.summary, /only 1 of 600 IOA exclusions were read/);
+  assert.equal(findingById(result, "CS-18").status, "warn");
+  assert.equal(findingById(result, "CS-20").status, "pass");
+
+  const prevention = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => ({ items: passingPreventionPolicies(), total: undefined, truncated: true }),
+  }));
+  for (const item of prevention.findings) {
+    assert.equal(item.status, "warn", `${item.id} should be capped at warn on a truncated policy page`);
+    assert.match(item.summary, /3 of an unknown total of prevention policies/);
+  }
+  assert.equal(prevention.summary.policies_truncated, true);
+});
+
+test("verdict safety rule 8: re-running an export pairs each bundle directory with its own zip", async () => {
+  const base = createTempBase("grclanker-cs-rerun-");
+  const first = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), base);
+  const firstBytes = readFileSync(first.zipPath);
+  const second = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), base);
+  const third = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), base);
+
+  assert.match(first.zipPath, /us-1-audit-bundle\.zip$/);
+  assert.match(second.zipPath, /us-1-audit-bundle-2\.zip$/);
+  assert.match(third.zipPath, /us-1-audit-bundle-3\.zip$/);
+  assert.equal(second.zipPath, `${second.outputDir}.zip`);
+  assert.equal(third.zipPath, `${third.outputDir}.zip`);
+  assert.ok(existsSync(first.zipPath) && existsSync(second.zipPath) && existsSync(third.zipPath));
+  assert.ok(firstBytes.length > 0);
+  assert.deepEqual(readFileSync(first.zipPath), firstBytes);
+  const zips = readdirSync(base).filter((entry) => entry.endsWith(".zip")).sort();
+  assert.deepEqual(zips, ["us-1-audit-bundle-2.zip", "us-1-audit-bundle-3.zip", "us-1-audit-bundle.zip"]);
+});
+
+test("false-pass self-check (a): every endpoint forbidden yields 25 manual findings and zero passes", async () => {
+  const assessments = await runAllCrowdstrikeAssessments(createForbiddenClient());
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  assert.deepEqual(findings.map((item) => item.id).sort(), ALL_CONTROL_IDS);
+  for (const item of findings) {
+    assert.equal(item.status, "manual", `${item.id} should be manual when its endpoints are forbidden: ${item.summary}`);
+    assert.match(item.summary, /Collect manually:/);
+  }
+  assert.ok(assessments.every((assessment) => assessment.errors.length > 0));
+});
+
+test("false-pass self-check (b): empty inventories pass only for exclusion hygiene, alert response, and containment", async () => {
+  const statuses = statusMap(await runAllCrowdstrikeAssessments(createEmptyClient()));
+  const passing = Object.entries(statuses).filter(([, status]) => status === "pass").map(([id]) => id).sort();
+  assert.deepEqual(passing, ["CS-19", "CS-20", "CS-21", "CS-22", "CS-23"]);
+});
+
+test("false-pass self-check (c): partial inventories never produce a pass", async () => {
+  const statuses = statusMap(await runAllCrowdstrikeAssessments(createPartialClient()));
+  assert.equal(Object.keys(statuses).length, 25);
+  assert.deepEqual(Object.values(statuses).filter((status) => status === "pass"), []);
 });
 
 test("the five assessments cover every spec control exactly once with framework mappings", async () => {
