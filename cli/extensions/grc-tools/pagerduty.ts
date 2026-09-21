@@ -142,6 +142,20 @@ export interface PagerdutyCollection {
   truncation?: string;
 }
 
+/**
+ * How a classic (limit/offset) listing decides that the collection is exhausted.
+ * "more_flag" trusts the documented `more` boolean. "short_page" is for endpoints such as
+ * GET /change_events whose 200 schema declares no `more` or `total`, so a page shorter than
+ * the requested limit is the only end signal and a full page means another page must be read.
+ */
+export type PagerdutyListCompletion = "more_flag" | "short_page";
+
+function pageHasMore(payload: JsonRecord, pageLength: number, requestLimit: number, completion: PagerdutyListCompletion): boolean {
+  if (pageLength === 0) return false;
+  if (typeof payload.more === "boolean" || completion === "more_flag") return payload.more === true;
+  return pageLength >= requestLimit;
+}
+
 export interface PagerdutyCredentialScope {
   kind: "account" | "user" | "unknown";
   userId?: string;
@@ -275,6 +289,7 @@ interface InventoryView {
   error?: string;
   readable: boolean;
   empty: boolean;
+  complete: boolean;
   seen: number;
   total?: number;
   partial?: string;
@@ -283,8 +298,11 @@ interface InventoryView {
 function inventory(label: string, snapshot: Snapshot<PagerdutyCollection>): InventoryView {
   const collection = snapshot.data;
   const readable = !snapshot.error;
+  const truncation = collection.truncation ?? "collection incomplete";
   const partial = readable && !collection.complete
-    ? `${label}: ${collection.items.length} of ${collection.total ?? "an unknown total of"} seen (${collection.truncation ?? "collection incomplete"})`
+    ? collection.total !== undefined
+      ? `${label}: ${collection.items.length} of ${collection.total} seen (${truncation})`
+      : `${label}: ${collection.items.length} seen of an unknown total (${truncation})`
     : undefined;
   return {
     label,
@@ -292,6 +310,7 @@ function inventory(label: string, snapshot: Snapshot<PagerdutyCollection>): Inve
     error: snapshot.error,
     readable,
     empty: readable && collection.items.length === 0,
+    complete: readable && collection.complete,
     seen: collection.items.length,
     total: collection.total,
     partial,
@@ -821,10 +840,11 @@ export class PagerdutyApiClient {
     path: string,
     collectionKey: string,
     query: JsonRecord = {},
-    options: { limit?: number; pageSize?: number } = {},
+    options: { limit?: number; pageSize?: number; completion?: PagerdutyListCompletion } = {},
   ): Promise<PagerdutyCollection> {
     const limit = clampNumber(options.limit, DEFAULT_LIST_LIMIT, 1, CLASSIC_PAGINATION_CAP);
     const pageSize = clampNumber(options.pageSize, DEFAULT_PAGE_SIZE, 1, DEFAULT_PAGE_SIZE);
+    const completion = options.completion ?? "more_flag";
     const items: JsonRecord[] = [];
     let offset = 0;
     let total: number | undefined;
@@ -837,14 +857,16 @@ export class PagerdutyApiClient {
       items.push(...pageItems.slice(0, limit - items.length));
       offset += pageItems.length;
       total = asNumber(payload.total) ?? total;
-      more = payload.more === true && pageItems.length > 0;
+      more = pageHasMore(payload, pageItems.length, requestLimit, completion);
       if (!more) break;
     }
 
     if (!more) return { items, complete: true, total: total ?? items.length };
     const truncation = offset >= CLASSIC_PAGINATION_CAP
       ? `stopped at the ${CLASSIC_PAGINATION_CAP} record pagination ceiling with more results available`
-      : `stopped at the requested limit of ${limit} with more results available`;
+      : completion === "short_page"
+        ? `stopped at the requested limit of ${limit} after a full page; the response declares no more flag, so further results may exist`
+        : `stopped at the requested limit of ${limit} with more results available`;
     return { items, complete: false, total, truncation };
   }
 
@@ -982,7 +1004,12 @@ export class PagerdutyApiClient {
   }
 
   async listChangeEvents(since: Date, until: Date, limit = DEFAULT_LIST_LIMIT): Promise<PagerdutyCollection> {
-    return this.list("/change_events", "change_events", { since: isoDate(since), until: isoDate(until) }, { limit });
+    return this.list(
+      "/change_events",
+      "change_events",
+      { since: isoDate(since), until: isoDate(until) },
+      { limit, completion: "short_page" },
+    );
   }
 }
 
@@ -2142,6 +2169,9 @@ const LEGACY_INTEGRATION_TYPES = new Set([
   "sql_monitor_inbound_integration",
 ]);
 
+const CHANGE_EVENTS_PAGINATION_NOTE =
+  "GET /change_events declares no more or total field, so offset pages are read until a page shorter than the requested limit; a full final page at the requested limit is recorded as incomplete.";
+
 type ExtensionClass = "generic_webhook" | "other" | "unclassified";
 
 function classifyExtension(extension: JsonRecord): ExtensionClass {
@@ -2347,6 +2377,8 @@ export function assessPagerdutyIntegrationSecurity(data: PagerdutyIntegrationSec
       {
         change_window: data.changeWindow,
         change_events_returned: changeEvents.seen,
+        change_events_complete: changeEvents.complete,
+        change_events_pagination: CHANGE_EVENTS_PAGINATION_NOTE,
         change_events_dated_in_window: changeEventsDated.dated.length,
         change_events_missing_timestamp: changeEventsDated.undated,
         services_with_change_events: servicesWithChangeEvents.size,

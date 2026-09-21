@@ -1726,6 +1726,84 @@ test("review fix 3: PD-18 summaries describe push methods by the blacklisted fla
   assert.match(findingById(blockedOnly, 18).summary, /no usable contact method: every method they have is blacklisted or disabled, or they have none/);
 });
 
+test("review fix 4: listChangeEvents pages past a full first page without a more flag and records completeness", async () => {
+  const events = Array.from({ length: 250 }, (_, index) => ({ id: `chg-${index}`, timestamp: NOW.toISOString(), services: [{ id: "svc-1" }] }));
+  let dataset = events;
+  const requests = [];
+  const changeEventsFetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const limit = Number(url.searchParams.get("limit") ?? "100");
+    requests.push({ offset, limit });
+    return jsonResponse({ change_events: dataset.slice(offset, offset + limit) });
+  };
+  const client = new PagerdutyApiClient(sampleConfig(), { fetchImpl: changeEventsFetch });
+
+  const complete = await client.listChangeEvents(new Date("2026-08-22T00:00:00Z"), NOW, 1000);
+  assert.equal(complete.items.length, 250);
+  assert.equal(complete.complete, true);
+  assert.equal(complete.total, 250);
+  assert.deepEqual(requests.map((request) => request.offset), [0, 100, 200], "a short third page ends the collection");
+
+  requests.length = 0;
+  dataset = events.slice(0, 200);
+  const pageBoundary = await client.listChangeEvents(new Date("2026-08-22T00:00:00Z"), NOW, 1000);
+  assert.equal(pageBoundary.items.length, 200);
+  assert.equal(pageBoundary.complete, true);
+  assert.deepEqual(requests.map((request) => request.offset), [0, 100, 200], "an empty page after two full pages ends the collection");
+
+  requests.length = 0;
+  dataset = events;
+  const truncated = await client.listChangeEvents(new Date("2026-08-22T00:00:00Z"), NOW, 100);
+  assert.equal(truncated.items.length, 100);
+  assert.equal(truncated.complete, false);
+  assert.equal(truncated.total, undefined);
+  assert.match(truncated.truncation, /stopped at the requested limit of 100 after a full page; the response declares no more flag/);
+  assert.deepEqual(requests.map((request) => request.offset), [0]);
+
+  const declaredFlag = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      return jsonResponse({ change_events: events.slice(0, limit), more: false, total: limit });
+    },
+  });
+  const honored = await declaredFlag.listChangeEvents(new Date("2026-08-22T00:00:00Z"), NOW, 100);
+  assert.equal(honored.items.length, 100);
+  assert.equal(honored.complete, true, "a declared more:false ends the collection even when the page is full");
+
+  const fixtures = healthyFixtures();
+  const assessment = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    extensions: list(fixtures.extensions),
+    webhookSubscriptions: list(fixtures.webhookSubscriptions),
+    businessServices: list(fixtures.businessServices),
+    businessServiceDependencies: snapshot({ "bs-1": fixtures.businessServiceDependencies }),
+    changeEvents: snapshot(truncated),
+    changeWindow: CHANGE_WINDOW,
+  });
+  const changeTracking = findingById(assessment, 25);
+  assert.equal(changeTracking.status, "warn");
+  assert.equal(changeTracking.evidence.change_events_complete, false);
+  assert.match(changeTracking.evidence.change_events_pagination, /declares no more or total field/);
+  assert.match(changeTracking.evidence.partial_view[0], /change events: 100 seen of an unknown total \(stopped at the requested limit of 100 after a full page/);
+  assert.match(changeTracking.summary, /Downgraded from pass to warn because the inventory is partial/);
+
+  const completeAssessment = assessPagerdutyIntegrationSecurity({
+    scope: accountScope(),
+    services: list(fixtures.services),
+    extensions: list(fixtures.extensions),
+    webhookSubscriptions: list(fixtures.webhookSubscriptions),
+    businessServices: list(fixtures.businessServices),
+    businessServiceDependencies: snapshot({ "bs-1": fixtures.businessServiceDependencies }),
+    changeEvents: snapshot(complete),
+    changeWindow: CHANGE_WINDOW,
+  });
+  assert.equal(findingById(completeAssessment, 25).status, "pass");
+  assert.equal(findingById(completeAssessment, 25).evidence.change_events_complete, true);
+});
+
 test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports, and archive", async () => {
   const base = createTempBase("grclanker-pagerduty-export-");
   const result = await exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), base, { maxAdmins: 3 });
