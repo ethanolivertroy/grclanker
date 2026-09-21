@@ -42,7 +42,54 @@ import { registerVantaTools } from "./grc-tools/vanta.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
 
-const DOMAIN_TOOL_COUNT = 107;
+/**
+ * Domain tool registrars, kept alphabetical by integration. Add a new
+ * integration by importing its `registerXxxTools` above and inserting it here
+ * in alphabetical order; the domain tool count is derived from this list.
+ */
+const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
+  registerAnsibleTools,
+  registerAwsTools,
+  registerAzureTools,
+  registerCloudflareTools,
+  registerCmvpTools,
+  registerDuoTools,
+  registerFedrampTools,
+  registerGcpTools,
+  registerGitHubTools,
+  registerGwsOperatorTools,
+  registerGwsTools,
+  registerKevsTools,
+  registerOciTools,
+  registerOktaTools,
+  registerOscalTools,
+  registerScfTools,
+  registerSlackTools,
+  registerVantaTools,
+  registerWebexTools,
+  registerZoomTools,
+];
+
+function registerDomainTools(pi: ExtensionAPI): number {
+  let count = 0;
+  const counting = new Proxy(pi, {
+    get(target, property) {
+      if (property === "registerTool") {
+        return (tool: Parameters<ExtensionAPI["registerTool"]>[0]) => {
+          count += 1;
+          return target.registerTool(tool);
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  for (const register of DOMAIN_TOOL_REGISTRARS) {
+    register(counting);
+  }
+  return count;
+}
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [
@@ -195,31 +242,12 @@ export default function grcTools(pi: ExtensionAPI): void {
     return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${note}` };
   });
 
-  registerAnsibleTools(pi);
-  registerAwsTools(pi);
-  registerAzureTools(pi);
-  registerCloudflareTools(pi);
-  registerCmvpTools(pi);
-  registerDuoTools(pi);
-  registerFedrampTools(pi);
-  registerGitHubTools(pi);
-  registerGcpTools(pi);
-  registerGwsOperatorTools(pi);
-  registerGwsTools(pi);
-  registerKevsTools(pi);
-  registerOciTools(pi);
-  registerOktaTools(pi);
-  registerOscalTools(pi);
-  registerScfTools(pi);
-  registerSlackTools(pi);
-  registerVantaTools(pi);
-  registerWebexTools(pi);
-  registerZoomTools(pi);
+  const domainToolCount = registerDomainTools(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
     ctx.ui.setTitle?.("grclanker");
-    ctx.ui.setStatus?.("grclanker", `${DOMAIN_TOOL_COUNT} domain tools ready`);
+    ctx.ui.setStatus?.("grclanker", `${domainToolCount} domain tools ready`);
     ctx.ui.setWorkingMessage?.("Correlating evidence...");
     ctx.ui.setHiddenThinkingLabel?.("GRC analysis");
     const settings = getSettings();
