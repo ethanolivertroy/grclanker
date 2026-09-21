@@ -107,7 +107,6 @@ Organizations deploying Zscaler in regulated environments must verify that URL f
 | Cloud Connector Groups | `/cloudConnectorGroup`, `/cloudConnectorGroup/{id}` | GET |
 | Emergency Access | `/emergencyAccess`, `/emergencyAccess/{id}` | GET/POST/PUT/DELETE |
 | Admin Users (ZPA) | `/admin/users`, `/admin/users/{id}` | GET/POST/PUT/DELETE |
-| Admin Roles (ZPA) | `/admin/roles`, `/admin/roles/{id}` | GET |
 | Audit Logs (ZPA) | `/auditlogEntryReport` | POST |
 
 ### 2.3 Zscaler Digital Experience (ZDX) API
@@ -204,7 +203,7 @@ Zscaler is migrating to a unified OAuth2 framework called OneAPI. The `zscaler-s
 | 4 | SSL Inspection Coverage | Verify SSL inspection is enabled for all required traffic categories; audit exemptions list for unnecessary entries | ZIA: `/sslSettings`, `/sslSettings/exemptedUrls` |
 | 5 | Cloud Sandbox Analysis | Confirm advanced threat protection sandbox is enabled; verify file types forwarded for analysis; check sandbox policy settings | ZIA: `/behavioralAnalysisAdvancedSettings`, `/securitySettings` |
 | 6 | Admin MFA Enforcement | Verify all admin accounts have MFA enabled; check for local-only auth bypasses | ZIA: `/adminUsers`; ZPA: `/admin/users` |
-| 7 | RBAC & Admin Role Audit | Audit admin roles for least privilege; identify superadmin accounts; verify separation of duties between ZIA and ZPA admin roles | ZIA: `/adminUsers`, `/adminRoles/lite`; ZPA: `/admin/users`, `/admin/roles` |
+| 7 | RBAC & Admin Role Audit | Audit admin roles for least privilege; identify superadmin accounts; verify separation of duties between ZIA and ZPA admin roles | ZIA: `/adminUsers`, `/adminRoles/lite`; ZPA: `/admin/users` |
 | 8 | Application Segmentation | Verify application segments follow least privilege (no wildcard domains, specific ports); confirm segment grouping is logical | ZPA: `/application`, `/segmentGroup` |
 | 9 | Zero Trust Access Policies | Audit access policy rules for overly permissive conditions; verify policies require identity + posture + context | ZPA: `/policySet/rules` |
 | 10 | Posture Profile Enforcement | Confirm posture profiles check OS version, disk encryption, firewall, AV status; verify profiles are attached to access policies | ZPA: `/posture`, `/policySet/rules` |
@@ -441,7 +440,7 @@ zscaler-inspector test-connection \
 
 All 25 controls produce findings. Controls that the published API cannot verify render as `manual` findings that name the portal evidence to collect: control 6 (per-admin MFA is not exposed by the ZIA API; password-login bypasses are reported), the ZIA half of control 13 (admin session timeout is not exposed), and the ZIA CA chain half of control 24. ZIA uses the legacy API key obfuscation plus `POST /api/v1/authenticatedSession` session login and `DELETE` logout; ZPA uses `POST /signin` client credentials with bearer tokens. Verdicts never pass on unreadable, empty, unconfigured, undated, or partial evidence.
 
-Every endpoint, query parameter, and response field the implementation reads was verified against the OpenAPI documents published on the Zscaler Automation Hub (`https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/...` and `.../zpa/...`); the per-endpoint citations are in the integration guide's endpoint table. Where the Automation Hub is silent, the surface is marked SDK-documented below and the dependent finding says so.
+Every endpoint, query parameter, and response field the implementation reads was verified against the OpenAPI documents published on the Zscaler Automation Hub (`https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/...` and `.../zpa/...`); the per-endpoint citations are in the integration guide's endpoint table. Where the Automation Hub is silent, the surface is marked SDK-documented below and the dependent finding says so. Note that the ZPA enrollment certificate list operation (`GET /mgmtconfig/v2/admin/customers/{customerId}/enrollmentCert`, control 24) is published under the Automation Hub signing-certificate category (`zpa/signing-certificate/get-all-signing-cert`: `search`, `page`, `pagesize` with a documented maximum of 500 and a `list`/`totalPages` wrapper), not under enrollment-certificates, which documents only the by-id operation.
 
 Pagination contracts as implemented:
 
@@ -468,14 +467,13 @@ Pagination contracts as implemented:
 - ZPA emergency access users are read from `/emergencyAccess/users` (sections 2.2 and 4 list `/emergencyAccess`).
 - ZPA browser access certificates are read from `/mgmtconfig/v2/.../clientlessCertificate/issued` (section 2.2 lists `/clientlessCertificate`).
 - ZPA trusted networks are read from `/mgmtconfig/v2/admin/customers/{customerId}/network` (this spec originally listed `/trustedNetwork`, which does not exist; sections 2.2 and 4 were corrected).
-- ZPA admin roles (`/admin/roles` in section 2.2, `/roles` in the SDKs) are not read: neither path appears in the published ZPA reference, so ZPA role assignments are not assessed (see Not yet implemented).
+- ZPA admin roles are not read: this spec originally listed `/admin/roles` (removed from sections 2.2 and 4) and the SDKs use `/roles`, but neither path appears in the published ZPA reference, so ZPA role assignments are not assessed (see Not yet implemented).
 
 ### Surfaces and fields documented only by the official SDKs
 
 The published Automation Hub reference does not document the following; each is treated as supplementary evidence and never the sole basis for `pass`:
 
 - ZPA `GET /mgmtconfig/v1/admin/customers/{customerId}/administrators` (control 12): documented only by `zscaler-sdk-go` (`zscaler/zpa/services/administrator_controller/administrator_controller.go`); the finding states this and caps at `warn` when the surface is unreadable.
-- ZPA `GET /mgmtconfig/v2/admin/customers/{customerId}/enrollmentCert` list (control 24): the reference documents only the by-id operation; the list path is documented by `zscaler-sdk-go` (`zscaler/zpa/services/enrollmentcert/zpa_enrollmentcert.go`) and the Automation Hub Python SDK collection page `AllEnrollmentCerts`.
 - `enableFullLogging` on firewall filtering rules (control 2): `zscaler-sdk-go` only (`filteringrules.go`); its absence never supports `pass`.
 - `adminScopeType` on `/adminUsers` (control 7): the reference exposes `adminScope` with a `Type` member, which is what is read; the flattened SDK key is accepted only as legacy evidence.
 - `fileHashesToBeBlocked` on `/behavioralAnalysisAdvancedSettings` (control 5): the reference documents `md5HashValueList`, which is what is read; the legacy key is recorded only as evidence.
