@@ -602,7 +602,7 @@ test("review fix 5: control 23 decides TLS from inputs.conf [splunktcp-ssl:*] an
 
   const noRequire = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem" })]);
   assert.equal(byId(noRequire, "SPLUNK-PLAT-23").status, "warn");
-  assert.match(byId(noRequire, "SPLUNK-PLAT-23").summary, /documented default varies with the certificate in use/);
+  assert.match(byId(noRequire, "SPLUNK-PLAT-23").summary, /requireClientCert absent from both \[splunktcp-ssl:9997\] and \[SSL\]/);
 
   const noCert = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("SSL", { requireClientCert: 1 })]);
   assert.equal(byId(noCert, "SPLUNK-PLAT-23").status, "warn");
@@ -610,15 +610,86 @@ test("review fix 5: control 23 decides TLS from inputs.conf [splunktcp-ssl:*] an
 
   const missingSsl = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 })]);
   assert.equal(byId(missingSsl, "SPLUNK-PLAT-23").status, "warn");
-  assert.match(byId(missingSsl, "SPLUNK-PLAT-23").summary, /no \[SSL\] stanza/);
+  assert.match(byId(missingSsl, "SPLUNK-PLAT-23").summary, /absent from both \[splunktcp-ssl:9997\] and \[SSL\]/);
+  assert.equal(byId(missingSsl, "SPLUNK-PLAT-23").evidence.ssl_stanza_present, false);
 
   const hardened = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), HARDENED_SSL_STANZA]);
   assert.equal(byId(hardened, "SPLUNK-PLAT-23").status, "pass");
-  assert.match(byId(hardened, "SPLUNK-PLAT-23").summary, /\[splunktcp-ssl:\*\] receivers \(ports 9997\) with \[SSL\] serverCert set and requireClientCert=true/);
+  assert.match(byId(hardened, "SPLUNK-PLAT-23").summary, /\[splunktcp-ssl:\*\] receivers \(ports 9997\) with serverCert set and requireClientCert=true/);
 
   const confOnly = await platformWithReceivers([], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("splunktcp://9996", { disabled: 1 }), HARDENED_SSL_STANZA]);
   assert.equal(byId(confOnly, "SPLUNK-PLAT-23").status, "pass");
   assert.equal(byId(confOnly, "SPLUNK-PLAT-23").evidence.listeners.length, 1);
+});
+
+test("review fix 8: control 23 resolves serverCert and requireClientCert per port from [splunktcp-ssl:<port>] before [SSL]", async () => {
+  const portOverridesGlobal = await platformWithReceivers(
+    [entry("9997", { disabled: 0 })],
+    [entry("splunktcp-ssl:9997", { disabled: 0, requireClientCert: 0 }), HARDENED_SSL_STANZA],
+  );
+  const overridden = byId(portOverridesGlobal, "SPLUNK-PLAT-23");
+  assert.equal(overridden.status, "warn");
+  assert.match(overridden.summary, /port 9997 requireClientCert=0 from \[splunktcp-ssl:9997\], overriding \[SSL\] requireClientCert=1/);
+  assert.doesNotMatch(overridden.summary, /requireClientCert=true/);
+  const overriddenListener = overridden.evidence.listeners.find((item) => item.port === "9997");
+  assert.equal(overriddenListener.tls.requireClientCert, "0");
+  assert.equal(overriddenListener.tls.requireClientCert_source, "[splunktcp-ssl:9997]");
+  assert.equal(overriddenListener.tls.serverCert_source, "[SSL]");
+
+  const perPortOnly = await platformWithReceivers(
+    [entry("9997", { disabled: 0 })],
+    [entry("splunktcp-ssl:9997", { disabled: 0, serverCert: "/opt/splunk/etc/auth/port9997.pem", requireClientCert: "true", sslVersions: "tls1.2" })],
+  );
+  const perPort = byId(perPortOnly, "SPLUNK-PLAT-23");
+  assert.equal(perPort.status, "pass");
+  assert.match(perPort.summary, /resolved per port from \[splunktcp-ssl:<port>\] first and \[SSL\] second/);
+  assert.equal(perPort.evidence.ssl_stanza_present, false);
+  const perPortListener = perPort.evidence.listeners[0];
+  assert.equal(perPortListener.tls.serverCert, "/opt/splunk/etc/auth/port9997.pem");
+  assert.equal(perPortListener.tls.serverCert_source, "[splunktcp-ssl:9997]");
+  assert.equal(perPortListener.tls.requireClientCert_source, "[splunktcp-ssl:9997]");
+
+  const mixed = await platformWithReceivers(
+    [entry("9997", { disabled: 0 }), entry("9998", { disabled: 0 })],
+    [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("splunktcp-ssl:9998", { disabled: 0, requireClientCert: "false" }), HARDENED_SSL_STANZA],
+  );
+  const mixedFinding = byId(mixed, "SPLUNK-PLAT-23");
+  assert.equal(mixedFinding.status, "warn");
+  assert.match(mixedFinding.summary, /not true for 1 of them: port 9998 requireClientCert=false from \[splunktcp-ssl:9998\], overriding \[SSL\] requireClientCert=1/);
+  assert.doesNotMatch(mixedFinding.summary, /port 9997/);
+
+  const perPortCertOnly = await platformWithReceivers(
+    [entry("9997", { disabled: 0 })],
+    [entry("splunktcp-ssl:9997", { disabled: 0, serverCert: "/opt/splunk/etc/auth/port9997.pem" }), entry("SSL", { requireClientCert: 1 })],
+  );
+  assert.equal(byId(perPortCertOnly, "SPLUNK-PLAT-23").status, "pass");
+});
+
+test("review fix 9: an absent requireClientCert quotes the documented defaults and stays unknown at warn", async () => {
+  const absent = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem" })]);
+  const finding = byId(absent, "SPLUNK-PLAT-23");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /documented default: "false" if using self-signed and third-party certificates, "true" if using the default certificates, and the REST view cannot tell which certificates are in use/);
+  assert.doesNotMatch(finding.summary, /varies with the certificate in use/);
+  assert.equal(finding.evidence.listeners[0].tls.requireClientCert, null);
+  assert.equal(finding.evidence.listeners[0].tls.requireClientCert_source, "unset");
+
+  const explicitFalse = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem", requireClientCert: 0 })]);
+  assert.equal(byId(explicitFalse, "SPLUNK-PLAT-23").status, "warn");
+  assert.match(byId(explicitFalse, "SPLUNK-PLAT-23").summary, /port 9997 requireClientCert=0 from \[SSL\]/);
+  assert.doesNotMatch(byId(explicitFalse, "SPLUNK-PLAT-23").summary, /documented default/);
+});
+
+test("review fix 10: data/inputs/tcp/ssl is no longer exposed or requested", async () => {
+  assert.equal(typeof SplunkApiClient.prototype.listSslTcpInputs, "undefined");
+  const { client: api, seen } = client(HARDENED);
+  await runAllAssessments(api);
+  await checkSplunkAccess(api);
+  const base = createTempBase("grclanker-splunk-no-tcp-ssl-");
+  await exportSplunkAuditBundle(api, sampleConfig(), base);
+  assert.ok(seen.length > 0);
+  assert.ok(seen.every((request) => request.pathname !== "/services/data/inputs/tcp/ssl"), "data/inputs/tcp/ssl was requested");
+  assert.ok(seen.some((request) => request.pathname === "/services/configs/conf-inputs"));
 });
 
 test("review fix 6: an absent sslVersions is an unknown default and caps control 13 at warn", async () => {
