@@ -1500,6 +1500,16 @@ function isExemptFromLoginVerification(user: JsonRecord): boolean {
   return asBoolean(user.is_exempt_from_login_verification) === true;
 }
 
+function userInventoryGap(users: JsonRecord[]): string | undefined {
+  if (users.length === 0) {
+    return "the user list was readable but returned zero managed users; a Box enterprise always has at least the primary admin, so the inventory is empty and nothing was assessed";
+  }
+  if (!users.some(isAdminUser)) {
+    return `the ${users.length}-user inventory contains no admin account; a Box enterprise always has a primary admin, so the listing is incomplete or the audit principal cannot see admin accounts`;
+  }
+  return undefined;
+}
+
 function eventActorId(event: JsonRecord): string | undefined {
   return asString(asObject(event.created_by)?.id);
 }
@@ -1681,6 +1691,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const exemptPrivileged = privileged.filter(isExemptFromLoginVerification);
   const exemptUsers = users.filter((user) => !isPrivilegedUser(user) && isExemptFromLoginVerification(user));
   const activeUsers = users.filter(isActiveHumanUser);
+  const inventoryGap = usersReadable ? userInventoryGap(users) : undefined;
+  const inventoryEvidence = { sampled_users: users.length, admin_users: admins.length, inventory_gap: inventoryGap ?? null };
+  const inventoryManualEvidence = "Admin Console > Users & Groups: export the full managed user list (including the primary admin) and confirm the count matches the API inventory before relying on user-level findings.";
 
   const findings: BoxFinding[] = [];
 
@@ -1722,6 +1735,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     unused_settings: mfaUnused,
     privileged_users: privileged.length,
     exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)),
+    inventory_gap: inventoryGap ?? null,
   };
   const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
   findings.push(
@@ -1734,9 +1748,11 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
           : hasUnusedSettings(mfaUnused)
             ? finding(2, "warn", unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the ${privileged.length} admin or co-admin accounts (${exemptPrivileged.length} flagged exempt from login verification)`), adminMfaEvidence, adminMfaManualEvidence)
             : mfaRequired === true
-            ? exemptPrivileged.length === 0
-              ? finding(2, "pass", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, adminMfaEvidence)
-              : finding(2, "fail", `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, adminMfaEvidence)
+            ? exemptPrivileged.length > 0
+              ? finding(2, "fail", `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, adminMfaEvidence)
+              : inventoryGap
+                ? finding(2, "warn", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""}, but admin exemptions could not be assessed because ${inventoryGap}.`, adminMfaEvidence, inventoryManualEvidence)
+                : finding(2, "pass", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, adminMfaEvidence)
             : mfaRequired === undefined
               ? finding(2, "warn", `Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so admin MFA enforcement cannot be confirmed from the API; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
               : ssoRequired === true
@@ -1752,6 +1768,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     unused_settings: mfaUnused,
     sampled_users: users.length,
     exempt_users: truncateList(exemptUsers.map(userLabel)),
+    inventory_gap: inventoryGap ?? null,
   };
   const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
   findings.push(
@@ -1764,9 +1781,11 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
           : hasUnusedSettings(mfaUnused)
             ? finding(3, "warn", unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the sampled ${users.length} users (${exemptUsers.length} flagged exempt from login verification)`), userMfaEvidence, userMfaManualEvidence)
             : mfaRequired === true
-            ? exemptUsers.length === 0
-              ? finding(3, "pass", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, userMfaEvidence)
-              : finding(3, "warn", `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, userMfaEvidence)
+            ? exemptUsers.length > 0
+              ? finding(3, "warn", `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, userMfaEvidence)
+              : inventoryGap
+                ? finding(3, "warn", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""}, but per-user exemptions could not be assessed because ${inventoryGap}.`, userMfaEvidence, inventoryManualEvidence)
+                : finding(3, "pass", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, userMfaEvidence)
             : mfaRequired === undefined
               ? finding(3, "warn", "Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so MFA enforcement cannot be confirmed from the API.", userMfaEvidence, userMfaManualEvidence)
               : ssoRequired === true
@@ -1775,20 +1794,31 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   );
 
   const adminRoleChanges = events.filter((event) => eventType(event) === "CHANGE_ADMIN_ROLE");
+  const adminCountEvidence = {
+    admins: truncateList(admins.map(userLabel)),
+    coadmins: truncateList(coAdmins.map(userLabel)),
+    max_admins: maxAdmins,
+    admin_role_change_events: adminRoleChanges.length,
+    ...inventoryEvidence,
+  };
   findings.push(
     !usersReadable
       ? finding(17, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, { users_error: data.users.error ?? null }, "Admin Console > Users & Groups: filter by Admin and Co-Admin roles, export the list, and confirm each assignment is justified.")
-      : privileged.length <= maxAdmins
-        ? finding(17, "pass", `${admins.length} admin and ${coAdmins.length} co-admin accounts fall within the configured threshold of ${maxAdmins}.`, { admins: truncateList(admins.map(userLabel)), coadmins: truncateList(coAdmins.map(userLabel)), max_admins: maxAdmins, admin_role_change_events: adminRoleChanges.length })
-        : finding(17, "warn", `${privileged.length} admin or co-admin accounts exceed the configured threshold of ${maxAdmins}.`, { admins: truncateList(admins.map(userLabel)), coadmins: truncateList(coAdmins.map(userLabel)), max_admins: maxAdmins, admin_role_change_events: adminRoleChanges.length }),
+      : privileged.length > maxAdmins
+        ? finding(17, "warn", `${privileged.length} admin or co-admin accounts exceed the configured threshold of ${maxAdmins}.`, adminCountEvidence)
+        : inventoryGap
+          ? finding(17, "warn", `Admin and co-admin counts could not be assessed because ${inventoryGap}.`, adminCountEvidence, inventoryManualEvidence)
+          : finding(17, "pass", `${admins.length} admin and ${coAdmins.length} co-admin accounts fall within the configured threshold of ${maxAdmins}.`, adminCountEvidence),
   );
 
   findings.push(
     !usersReadable
       ? finding(18, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, undefined, "Admin Console > Users & Groups: open each co-admin and review the co-admin permission set under Edit User Access Permissions.")
-      : coAdmins.length === 0
-        ? finding(18, "pass", "No co-admin accounts exist, so there are no delegated permission sets to scope.", { coadmins: 0 })
-        : finding(18, "manual", `${coAdmins.length} co-admin accounts exist; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { coadmins: truncateList(coAdmins.map(userLabel)) }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin."),
+      : coAdmins.length > 0
+        ? finding(18, "manual", `${coAdmins.length} co-admin accounts exist; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { coadmins: truncateList(coAdmins.map(userLabel)), ...inventoryEvidence }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin.")
+        : inventoryGap
+          ? finding(18, "warn", `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { coadmins: 0, ...inventoryEvidence }, inventoryManualEvidence)
+          : finding(18, "pass", "No co-admin accounts exist, so there are no delegated permission sets to scope.", { coadmins: 0, ...inventoryEvidence }),
   );
 
   const passwordMinLength = configNumber(configuration, "security", "password_min_length");
@@ -1915,17 +1945,23 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     activity_events: activityEvents.length,
     failed_login_events: failedLogins.length,
     event_limit: data.eventLimit,
+    ...inventoryEvidence,
   };
+  const inactivityManualEvidence = `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`;
   findings.push(
     !usersReadable || !eventsReadable
-      ? finding(24, "manual", `Inactive users could not be derived because ${!usersReadable ? `users were unreadable (${unreadableReason(data.users)})` : `enterprise events were unreadable (${unreadableReason(data.events)})`}.`, { lookback_days: data.lookbackDays }, `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`)
-      : eventsTruncated
-        ? finding(24, "warn", `The ${data.eventLimit}-event sample window filled up, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence)
-        : inactiveCandidates.length === 0
-          ? finding(24, "pass", `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
-          : inactiveRatio > 0.25
-            ? finding(24, "fail", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence)
-            : finding(24, "warn", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence),
+      ? finding(24, "manual", `Inactive users could not be derived because ${!usersReadable ? `users were unreadable (${unreadableReason(data.users)})` : `enterprise events were unreadable (${unreadableReason(data.events)})`}.`, { lookback_days: data.lookbackDays }, inactivityManualEvidence)
+      : inventoryGap
+        ? finding(24, "warn", `Inactive users could not be assessed because ${inventoryGap}.`, inactivityEvidence, inventoryManualEvidence)
+        : activeUsers.length === 0
+          ? finding(24, "warn", `None of the ${users.length} sampled users are active managed users (only deactivated or platform-only app users were returned), so there was no activity to assess.`, inactivityEvidence, inactivityManualEvidence)
+          : eventsTruncated
+            ? finding(24, "warn", `The ${data.eventLimit}-event sample window filled up, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence)
+            : inactiveCandidates.length === 0
+              ? finding(24, "pass", `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
+              : inactiveRatio > 0.25
+                ? finding(24, "fail", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence)
+                : finding(24, "warn", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence),
   );
 
   return {

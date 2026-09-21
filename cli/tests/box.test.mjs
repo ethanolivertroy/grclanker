@@ -926,6 +926,56 @@ test("assessBoxIdentityAccess does not count failed logins as user activity", as
   assert.equal(findingById(recovered, "BOX-24").evidence.failed_login_events, 3);
 });
 
+test("assessBoxIdentityAccess warns instead of passing on an empty user inventory", async () => {
+  const empty = await assessBoxIdentityAccess(createStubClient({ ...hardenedFixture(), users: [], events: [] }));
+  assertStatuses(empty, {
+    "BOX-01": "pass",
+    "BOX-02": "warn",
+    "BOX-03": "warn",
+    "BOX-17": "warn",
+    "BOX-18": "warn",
+    "BOX-21": "pass",
+    "BOX-24": "warn",
+  });
+  assert.deepEqual(empty.errors, []);
+  for (const id of ["BOX-02", "BOX-03", "BOX-17", "BOX-18", "BOX-24"]) {
+    const entry = findingById(empty, id);
+    assert.match(entry.summary, /returned zero managed users/, id);
+    assert.match(entry.summary, /at least the primary admin/, id);
+    assert.match(entry.evidence.inventory_gap, /inventory is empty/, id);
+    assert.match(entry.manualEvidence, /Users & Groups/, id);
+  }
+  assert.match(findingById(empty, "BOX-02").summary, /^Multi-factor authentication is required for managed users \(totp\), but admin exemptions could not be assessed/);
+  assert.match(findingById(empty, "BOX-03").summary, /per-user exemptions could not be assessed/);
+  assert.equal(findingById(empty, "BOX-17").evidence.sampled_users, 0);
+  assert.equal(findingById(empty, "BOX-18").evidence.coadmins, 0);
+  assert.equal(findingById(empty, "BOX-24").evidence.active_users, 0);
+  assert.equal(empty.summary.admins, 0);
+
+  const noAdmin = await assessBoxIdentityAccess(createStubClient({
+    ...hardenedFixture(),
+    users: [user("member-1"), user("member-2")],
+    events: [loginEvent("member-1"), loginEvent("member-2", "DOWNLOAD")],
+  }));
+  assertStatuses(noAdmin, { "BOX-02": "warn", "BOX-03": "warn", "BOX-17": "warn", "BOX-18": "warn", "BOX-24": "warn" });
+  assert.match(findingById(noAdmin, "BOX-17").summary, /2-user inventory contains no admin account/);
+  assert.equal(findingById(noAdmin, "BOX-17").evidence.admin_users, 0);
+
+  const exemptStillFails = await assessBoxIdentityAccess(createStubClient({
+    ...hardenedFixture(),
+    users: [user("coadmin-1", { role: "coadmin", is_exempt_from_login_verification: true })],
+  }));
+  assertStatuses(exemptStillFails, { "BOX-02": "fail", "BOX-18": "manual" });
+
+  const onlyAppUsers = await assessBoxIdentityAccess(createStubClient({
+    ...hardenedFixture(),
+    users: [user("admin-1", { role: "admin", status: "inactive" }), user("app-user", { is_platform_access_only: true })],
+    events: [],
+  }));
+  assertStatuses(onlyAppUsers, { "BOX-02": "pass", "BOX-17": "pass", "BOX-18": "pass", "BOX-24": "warn" });
+  assert.match(findingById(onlyAppUsers, "BOX-24").summary, /None of the 2 sampled users are active managed users/);
+});
+
 test("assessBoxIdentityAccess treats null configuration categories as absent data instead of failing", async () => {
   const result = await assessBoxIdentityAccess(createStubClient({
     ...hardenedFixture(),
