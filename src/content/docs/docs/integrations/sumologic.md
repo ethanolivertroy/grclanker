@@ -26,7 +26,7 @@ export SUMOLOGIC_ENDPOINT="us2"   # deployment code or full API URL
 
 Configuration precedence is explicit tool arguments, then environment variables (`SUMOLOGIC_ACCESS_ID`, `SUMOLOGIC_ACCESS_KEY`, `SUMOLOGIC_ENDPOINT` or `SUMOLOGIC_DEPLOYMENT`, `SUMOLOGIC_TIMEOUT`), then a YAML config file at `SUMOLOGIC_CONFIG_FILE` or `~/.sumologic-sec-inspector/config.yaml` with `access_id`, `access_key`, and `endpoint` keys.
 
-Requests use HTTP Basic authentication (`Authorization: Basic base64(accessId:accessKey)`). The client follows `token` continuation cursors on paginated endpoints, uses `limit`/`offset` for the Collector Management and monitor search APIs, retries 429 and 5xx responses with backoff (honoring `Retry-After` when present), enforces a request timeout, and redacts the access key from error messages.
+Requests use HTTP Basic authentication (`Authorization: Basic base64(accessId:accessKey)`). The client follows `token` continuation cursors on paginated endpoints (page size 1000 where the OpenAPI allows it, 100 for `/v2/dashboards` whose `limit` maximum is 100), uses `limit`/`offset` for the Collector Management and monitor search APIs, retries 429 and 5xx responses with backoff (honoring `Retry-After` when present), enforces a request timeout, and redacts the access key from error messages.
 
 ### Deployments
 
@@ -51,7 +51,7 @@ A full URL such as `https://api.eu.sumologic.com` is normalized to end in `/api`
 
 | Tool | Purpose |
 |---|---|
-| `sumologic_check_access` | Probe 17 read surfaces and report unreadable ones with the likely missing role capability. |
+| `sumologic_check_access` | Probe 18 read surfaces (including `/v1/serviceAllowlist/addresses`) and report unreadable ones with the likely missing role capability. |
 | `sumologic_assess_identity` | Controls 1 to 5: SAML SSO, SAML allowlist, password strength, password expiration, MFA. |
 | `sumologic_assess_access_control` | Controls 6, 7, 8, 13, 14: RBAC, key rotation, inactive keys, service allowlist, session timeout. |
 | `sumologic_assess_data_governance` | Controls 9, 10, 12, 16, 17: audit index, data forwarding, collectors, ingest budgets, retention. |
@@ -77,13 +77,13 @@ Unreadable endpoints, empty inventories, capability-limited views, and unfollowe
 | 2 | SAML Allowlisted Users Minimized | identity | SUMO-02 | `fail` above `max_allowlisted_users`; `warn` on inactive allowlisted users; `pass` at or below threshold (zero is compliant); `manual` when no IdP exists |
 | 3 | Password Policy Strength | identity | SUMO-03 | `fail` below `min_password_length` or without lockout; `warn` when complexity or weak-password rejection is incomplete |
 | 4 | Password Expiration Policy | identity | SUMO-04 | `fail` when disabled or above `max_password_age_days` |
-| 5 | MFA Enforcement | identity | SUMO-05 | `fail` when `requireMfa` is false; `warn` when active users report `isMfaEnabled=false` or the user list is incomplete |
-| 6 | Role-Based Access Control | access control | SUMO-06 | `fail` when admin-capability role members exceed `max_admins`; `warn` on custom roles with admin capabilities; `manual` on zero roles |
-| 7 | Access Key Rotation | access control | SUMO-07 | `fail` on enabled keys older than `key_max_age_days`; `warn` on keys without `createdAt`; `manual` on personal-only scope or zero keys |
+| 5 | MFA Enforcement | identity | SUMO-05 | `fail` when `requireMfa` is false or absent; `warn` when active users report `isMfaEnabled=false` or the user list is incomplete; evidence lists locked users, dormant users, and users without a `lastLoginTimestamp` (never counted as active) |
+| 6 | Role-Based Access Control | access control | SUMO-06 | `fail` when admin-capability role members exceed `max_admins`; `warn` on custom roles with admin capabilities, custom roles without a `filterPredicate`, admin members dormant beyond `user_inactive_days` or without a `lastLoginTimestamp`, or an unreadable user list; `manual` on zero roles |
+| 7 | Access Key Rotation | access control | SUMO-07 | `fail` on enabled keys older than `key_max_age_days`; `warn` on keys without `createdAt` or when the access key lifetime policy is `0` (never expire), absent, or unreadable; `manual` on personal-only scope or zero keys; every summary states the lifetime policy value |
 | 8 | Inactive Access Keys | access control | SUMO-08 | `fail` on keys idle beyond `key_inactive_days`; `warn` on keys without `lastUsed`; `manual` on personal-only scope or zero keys |
 | 9 | Audit Index Enabled | data governance | SUMO-09 | `fail` when the audit policy is not enabled; `manual` when no active AuditIndex partition is visible (plan limitation); `warn` when search audit is off |
 | 10 | Data Forwarding Destinations Reviewed | data governance | SUMO-10 | `pass` on zero destinations or when all match `approved_destination_domains`; `fail` on unapproved hosts; otherwise `manual` |
-| 11 | Content Sharing Permissions | content sharing | SUMO-11 | `fail` when the Data Access Level policy is off; `warn` on org-wide shares in the sampled folder; `manual` when permissions cannot be sampled |
+| 11 | Content Sharing Permissions | content sharing | SUMO-11 | `fail` when the Data Access Level policy is off; `warn` on org-wide shares in the sampled folder or when the personal folder holds more items than `content_sample` (total, sampled, and unsampled counts are recorded); `manual` when permissions cannot be sampled; `pass` only when every folder item was evaluated |
 | 12 | Collector Management | data governance | SUMO-12 | `fail` on installed collectors offline beyond `collector_offline_days` or without last-seen; `warn` on offline or mixed versions; `manual` on zero collectors |
 | 13 | Service Allowlist Configured | access control | SUMO-13 | `fail` when `loginEnabled` is false or zero CIDRs; `warn` when content allowlisting is off |
 | 14 | Session Timeout Policy | access control | SUMO-14 | `fail` above `max_session_timeout_minutes`; `warn` when the concurrent sessions limit is off |
@@ -111,7 +111,8 @@ The script skips with exit code 0 when `SUMOLOGIC_ACCESS_ID` or `SUMOLOGIC_ACCES
 - SAML lockdown (require SAML sign-in) has enable and disable endpoints but no status GET, so control 1 cannot pass automatically.
 - Scheduled search role bindings (control 15) and lookup table inventories (control 18) are not exposed by list endpoints; the findings state the evidence to collect.
 - Audit event flow is not proven by configuration alone; run `_index=sumologic_audit_events` for the last 24 hours as supporting evidence for control 9.
-- Content permission sampling covers the key owner's personal folder; Admin Recommended and Global folders require asynchronous job endpoints that this integration does not call.
+- Content permission sampling covers the key owner's personal folder up to `content_sample` items (default 25); when the folder holds more, control 11 reports the unsampled remainder and yields at most `warn`. Admin Recommended and Global folders require asynchronous job endpoints that this integration does not call.
+- The access key lifetime policy (`accessKeysLifetimeInDays`, one of `0`, `30`, `45`, `60`, `90`, `180`, `365`) is read for control 7; `0` means keys never expire and caps the verdict at `warn` even when every key is young.
 - Partition retention `-1` means the account default, which the API does not resolve; those partitions are reported separately and yield at most `warn`.
 - A key without `manageAccessKeys` sees only its own keys via `/v1/accessKeys/personal`; controls 7 and 8 then render as `manual` with the seen count.
 

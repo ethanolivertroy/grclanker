@@ -22,7 +22,7 @@ Written in Go with a hybrid CLI/TUI architecture, it supports both automated pip
 
 The shipped implementation lives in `cli/extensions/grc-tools/sumologic.ts` as native grclanker tools (TypeScript, read-only Management API access with basic auth):
 
-- `sumologic_check_access`: probes 17 read surfaces and reports missing role capabilities
+- `sumologic_check_access`: probes 18 read surfaces and reports missing role capabilities
 - `sumologic_assess_identity`: controls 1 to 5
 - `sumologic_assess_access_control`: controls 6, 7, 8, 13, 14
 - `sumologic_assess_data_governance`: controls 9, 10, 12, 16, 17
@@ -319,9 +319,10 @@ Implemented in grclanker as six native TypeScript tools (see "grclanker implemen
 ### Shipped
 
 - Basic-auth Management API client with `token` cursor pagination, `limit`/`offset` pagination for collectors and monitor search, 429 and 5xx retry with backoff honoring `Retry-After`, request timeouts, and access key redaction.
-- Deployment mapping for every deployment documented in the official OpenAPI definition and endpoint table: au, ca, ch, de, esc, eu, fed, in, jp, kr, us1, us2.
+- Deployment mapping for the union of the two official deployment tables: the OpenAPI definition (which lists IN but not ESC) and the current help-docs endpoint table (which lists ESC and has dropped IN). Supported codes: au, ca, ch, de, esc, eu, fed, in, jp, kr, us1, us2.
 - Configuration precedence: explicit arguments, then `SUMOLOGIC_ACCESS_ID` / `SUMOLOGIC_ACCESS_KEY` / `SUMOLOGIC_ENDPOINT` (or `SUMOLOGIC_DEPLOYMENT`), then `~/.sumologic-sec-inspector/config.yaml` (or `SUMOLOGIC_CONFIG_FILE`).
 - All 20 controls emit a finding with the section 5 framework mappings. Controls 1, 15, and 18 are `manual` by design (see deviations); every other control can reach `pass` only with complete, readable evidence.
+- Verdict safety: unreadable endpoints, empty inventories, capability-limited views, unfollowed cursors, and personal-folder samples smaller than the folder never yield `pass`. Control 6 also downgrades on custom roles without a `filterPredicate` and on admin members who are dormant or have no `lastLoginTimestamp`; control 7 downgrades when `accessKeysLifetimeInDays` is `0`, absent, or unreadable and always states the policy value.
 - Mocked regression tests in `cli/tests/sumologic.test.mjs`, including false-pass self-checks for all-403, all-empty, and partial-inventory fixtures, and a live smoke script (`npm --prefix cli run test:sumologic:live`).
 
 ### Deviations from this spec, following the official documentation
@@ -329,7 +330,7 @@ Implemented in grclanker as six native TypeScript tools (see "grclanker implemen
 - Endpoints: content folders are served at `/v2/content/folders/personal` (not `/v1`), monitors are listed through `/v1/monitors/search` (there is no plain `/v1/monitors` list), ingest budgets use `/v2/ingestBudgets`, and the audit index is read from `/v1/policies/audit` plus `/v1/partitions?viewTypes=AuditIndex` (there is no `/v1/account/audit`). Lookup tables have no list endpoint (`/v1/lookupTables` only supports create), so control 18 is manual.
 - Capabilities: the official capability names differ from the table in section 3. Users and roles require `manageUsersAndRoles`; org-wide access keys require `manageAccessKeys`; policies require `manageOrgSettings`; the audit index is a partition read (`viewPartitions`) plus a policy read rather than `viewAuditLog`.
 - SAML enforcement: `/v1/saml/lockdown/enable` and `/disable` exist, but there is no status GET, so control 1 reports `manual` (or `warn` on debug mode or a missing certificate) once an identity provider exists and `fail` on zero providers.
-- Deployments: the official endpoint table adds CH and ESC beyond the list in section 2; both are supported.
+- Deployments: the deployment list is the union of the OpenAPI table (lists IN, not ESC) and the current help-docs table (lists ESC, dropped IN); CH and ESC are supported beyond the list in section 2, and IN is retained because the OpenAPI still documents it.
 - Data forwarding review (control 10) and monitor alert routing (control 20) accept optional approved domain lists; without them, non-empty destination inventories are reported as `manual` because approval is a human decision.
 
 ### Remaining
