@@ -30,6 +30,13 @@ const DEFAULT_STALE_DAYS = 90;
 const DEFAULT_MAX_KEYS = 200;
 const DEFAULT_MAX_FINDINGS = 200;
 const DEFAULT_MAX_ASSETS = 2000;
+/** Pages fetched per list before the cursor is abandoned and the list is recorded as truncated. */
+export const GCP_MAX_LIST_PAGES = 250;
+const MAX_SERVICE_ACCOUNTS = 5000;
+const MAX_LOGGING_RESOURCES = 5000;
+const MAX_SCC_SOURCES = 1000;
+const MAX_ACCESS_POLICIES = 1000;
+const MAX_SERVICE_PERIMETERS = 5000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const MAX_KMS_ROTATION_DAYS = 365;
 const MIN_LOG_RETENTION_DAYS = 90;
@@ -813,17 +820,21 @@ export class GcpAuditorClient {
     const items: JsonRecord[] = [];
     const unreachable = new Set<string>();
     let pageToken: string | undefined;
+    let pages = 0;
     let truncated = false;
-    do {
+    for (;;) {
       const response = await this.requestJson(buildUrl(pageToken));
+      pages += 1;
       items.push(...collect(response));
       for (const scope of collectUnreachable?.(response) ?? []) unreachable.add(scope);
-      pageToken = asString(response.nextPageToken);
-      if (pageToken && items.length >= limit) {
+      const nextPageToken = asString(response.nextPageToken);
+      if (!nextPageToken) break;
+      if (items.length >= limit || nextPageToken === pageToken || pages >= GCP_MAX_LIST_PAGES) {
         truncated = true;
         break;
       }
-    } while (pageToken);
+      pageToken = nextPageToken;
+    }
     if (unreachable.size === 0) return { items, truncated };
     return { items, truncated: true, unreachable: [...unreachable] };
   }
@@ -917,13 +928,12 @@ export class GcpAuditorClient {
   }
 
   /** GCP_DOCS.serviceAccountsList: pageSize max 100, response accounts[] and nextPageToken. */
-  async listServiceAccounts(projectId: string): Promise<JsonRecord[]> {
-    const result = await this.paginate(
+  async listServiceAccounts(projectId: string, limit = MAX_SERVICE_ACCOUNTS): Promise<GcpListResult> {
+    return this.paginate(
       (pageToken) => `https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts${buildQuery({ pageSize: 100, pageToken })}`,
       (response) => asObjectArray(response.accounts),
-      5000,
+      limit,
     );
-    return result.items;
   }
 
   /** GCP_DOCS.serviceAccountKeysList: keyTypes filter, response keys[] with validAfterTime. */
@@ -941,23 +951,21 @@ export class GcpAuditorClient {
   }
 
   /** GCP_DOCS.sinksList: response sinks[] and nextPageToken. */
-  async listLogSinks(projectId: string): Promise<JsonRecord[]> {
-    const result = await this.paginate(
+  async listLogSinks(projectId: string, limit = MAX_LOGGING_RESOURCES): Promise<GcpListResult> {
+    return this.paginate(
       (pageToken) => `https://logging.googleapis.com/v2/projects/${projectId}/sinks${buildQuery({ pageSize: 100, pageToken })}`,
       (response) => asObjectArray(response.sinks),
-      5000,
+      limit,
     );
-    return result.items;
   }
 
   /** GCP_DOCS.logBucketsList: parent projects/{p}/locations/-; response buckets[] with retentionDays. */
-  async listLogBuckets(projectId: string): Promise<JsonRecord[]> {
-    const result = await this.paginate(
+  async listLogBuckets(projectId: string, limit = MAX_LOGGING_RESOURCES): Promise<GcpListResult> {
+    return this.paginate(
       (pageToken) => `https://logging.googleapis.com/v2/projects/${projectId}/locations/-/buckets${buildQuery({ pageSize: 100, pageToken })}`,
       (response) => asObjectArray(response.buckets),
-      5000,
+      limit,
     );
-    return result.items;
   }
 
   /** GCP_DOCS.entriesList: POST entries:list with resourceNames, filter, orderBy, pageSize; response entries[]. */
@@ -983,14 +991,13 @@ export class GcpAuditorClient {
   }
 
   /** GCP_DOCS.sccSources: response sources[] and nextPageToken. */
-  async listSccSources(): Promise<JsonRecord[]> {
-    if (!this.config.organizationId) return [];
-    const result = await this.paginate(
+  async listSccSources(limit = MAX_SCC_SOURCES): Promise<GcpListResult> {
+    if (!this.config.organizationId) return { items: [], truncated: false };
+    return this.paginate(
       (pageToken) => `https://securitycenter.googleapis.com/v1/organizations/${this.config.organizationId}/sources${buildQuery({ pageSize: 100, pageToken })}`,
       (response) => asObjectArray(response.sources),
-      1000,
+      limit,
     );
-    return result.items;
   }
 
   /** GCP_DOCS.sccFindings: response listFindingsResults[] and nextPageToken. */
@@ -1100,24 +1107,22 @@ export class GcpAuditorClient {
   }
 
   /** GCP_DOCS.accessPoliciesList: GET accessPolicies?parent=organizations/{org}; response accessPolicies[]. */
-  async listAccessPolicies(): Promise<JsonRecord[]> {
-    if (!this.config.organizationId) return [];
-    const result = await this.paginate(
+  async listAccessPolicies(limit = MAX_ACCESS_POLICIES): Promise<GcpListResult> {
+    if (!this.config.organizationId) return { items: [], truncated: false };
+    return this.paginate(
       (pageToken) => `https://accesscontextmanager.googleapis.com/v1/accessPolicies${buildQuery({ parent: `organizations/${this.config.organizationId}`, pageToken })}`,
       (response) => asObjectArray(response.accessPolicies),
-      1000,
+      limit,
     );
-    return result.items;
   }
 
   /** GCP_DOCS.servicePerimetersList: GET {accessPolicies/id}/servicePerimeters; response servicePerimeters[]. */
-  async listServicePerimeters(accessPolicyName: string): Promise<JsonRecord[]> {
-    const result = await this.paginate(
+  async listServicePerimeters(accessPolicyName: string, limit = MAX_SERVICE_PERIMETERS): Promise<GcpListResult> {
+    return this.paginate(
       (pageToken) => `https://accesscontextmanager.googleapis.com/v1/${accessPolicyName}/servicePerimeters${buildQuery({ pageToken })}`,
       (response) => asObjectArray(response.servicePerimeters),
-      5000,
+      limit,
     );
-    return result.items;
   }
 
   /** GCP_DOCS.binaryAuthorizationPolicy: GET projects/{p}/policy; response defaultAdmissionRule. */
@@ -1218,7 +1223,7 @@ function partialNote(input: PartialViewInput): string {
   if (unreachable.length > 0) {
     notes.push(`${unreachable.length} unreachable scopes not enumerated (${unreachable.slice(0, 5).join(", ")}${unreachable.length > 5 ? ", ..." : ""})`);
   }
-  if (input.truncated) notes.push(`inventory incomplete at ${input.total} items`);
+  if (input.truncated) notes.push(`${input.total} seen, total unknown (inventory incomplete)`);
   return notes.length > 0 ? ` Partial view: ${notes.join("; ")}.` : "";
 }
 
@@ -1375,8 +1380,8 @@ export async function checkGcpAccess(
     }, (value) => (Array.isArray(value) ? value.length : undefined)),
     surface("iam_policies", "cloudasset", () => client.searchAllIamPolicies(20), (value) => asObject(value)?.items ? asArray(asObject(value)?.items).length : undefined),
     surface("logging_settings", "logging", () => client.getLoggingSettings(requireProject()), () => 1),
-    surface("log_sinks", "logging", () => client.listLogSinks(requireProject()), (value) => (Array.isArray(value) ? value.length : undefined)),
-    surface("security_command_center", "securitycenter", () => client.listSccSources(), (value) => (Array.isArray(value) ? value.length : undefined)),
+    surface("log_sinks", "logging", () => client.listLogSinks(requireProject()), (value) => asArray(asObject(value)?.items).length),
+    surface("security_command_center", "securitycenter", () => client.listSccSources(), (value) => asArray(asObject(value)?.items).length),
     surface("org_policy", "cloudresourcemanager", () => client.getEffectiveOrgPolicy(requireProject(), "constraints/iam.disableServiceAccountKeyCreation"), () => 1),
     surface("compute_firewalls", "compute", () => client.listFirewalls(requireProject(), 500), (value) => asArray(asObject(value)?.items).length),
     surface("storage_buckets", "storage", () => client.listStorageBuckets(requireProject(), 1000), (value) => asArray(asObject(value)?.items).length),
@@ -1404,6 +1409,297 @@ export async function checkGcpAccess(
   };
 }
 
+/*
+ * Snapshot projections. Bundles and finding evidence never carry whole API
+ * resources: metadata items, labels, annotations, descriptions, filters, key
+ * material, and any other free-form value stay out, and each projection keeps
+ * only the documented fields the verdicts read plus resource identifiers.
+ */
+
+function snapshotIamPolicy(result: JsonRecord): JsonRecord {
+  return {
+    resource: asString(result.resource) ?? null,
+    assetType: asString(result.assetType) ?? null,
+    project: asString(result.project) ?? null,
+    bindings: parsePolicyBindings(result.policy).map((binding) => ({
+      role: asString(binding.role) ?? null,
+      members: asArray(binding.members).map(asString).filter((member): member is string => Boolean(member)),
+    })),
+  };
+}
+
+function snapshotOrganization(organization: JsonRecord | null | undefined): JsonRecord | null {
+  if (!organization) return null;
+  return {
+    name: asString(organization.name) ?? null,
+    displayName: asString(organization.displayName) ?? null,
+    lifecycleState: asString(organization.lifecycleState) ?? null,
+  };
+}
+
+function snapshotOrgPolicy(policyResponse: JsonRecord | null | undefined): JsonRecord | null {
+  if (!policyResponse) return null;
+  const policy = asObject(policyResponse.policy) ?? policyResponse;
+  const booleanPolicy = asObject(policy.booleanPolicy);
+  const listPolicy = asObject(policy.listPolicy);
+  return {
+    constraint: asString(policy.constraint) ?? null,
+    enforced: interpretOrgPolicyEnabled(policyResponse),
+    booleanPolicy: booleanPolicy ? { enforced: booleanPolicy.enforced === true } : null,
+    listPolicy: listPolicy
+      ? {
+          allValues: asString(listPolicy.allValues) ?? null,
+          allowedValues: asArray(listPolicy.allowedValues).length,
+          deniedValues: asArray(listPolicy.deniedValues).length,
+        }
+      : null,
+    restoreDefault: Boolean(asObject(policy.restoreDefault)),
+  };
+}
+
+function snapshotShieldedConfig(config: JsonRecord | undefined): JsonRecord | null {
+  if (!config) return null;
+  return {
+    enableSecureBoot: config.enableSecureBoot === true,
+    enableVtpm: config.enableVtpm === true,
+    enableIntegrityMonitoring: config.enableIntegrityMonitoring === true,
+  };
+}
+
+function resolvedMetadataFlag(metadata: unknown, key: string): boolean | null {
+  const value = metadataValue(metadata, key);
+  return value === undefined ? null : isTruthyMetadata(value);
+}
+
+function snapshotComputeProject(row: ProjectScanRow<JsonRecord>): JsonRecord {
+  return {
+    projectId: row.projectId,
+    name: asString(row.data.name) ?? null,
+    enable_oslogin: resolvedMetadataFlag(row.data.commonInstanceMetadata, "enable-oslogin"),
+  };
+}
+
+function snapshotGuardrailInstance(instance: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: instance.projectId,
+    name: asString(instance.name) ?? null,
+    enable_oslogin: resolvedMetadataFlag(instance.metadata, "enable-oslogin"),
+    serial_port_enable: resolvedMetadataFlag(instance.metadata, "serial-port-enable"),
+    shieldedInstanceConfig: snapshotShieldedConfig(asObject(instance.shieldedInstanceConfig)),
+  };
+}
+
+function snapshotBinaryAuthorization(row: ProjectScanRow<JsonRecord>): JsonRecord {
+  return {
+    projectId: row.projectId,
+    name: asString(row.data.name) ?? null,
+    rules: binaryAuthorizationRules(row.data).map(({ scope, rule }) => ({
+      rule: scope,
+      evaluationMode: asString(rule?.evaluationMode) ?? null,
+      enforcementMode: asString(rule?.enforcementMode) ?? null,
+    })),
+  };
+}
+
+function snapshotLoggingSettings(row: ProjectScanRow<JsonRecord>): JsonRecord {
+  return { projectId: row.projectId, name: asString(row.data.name) ?? null };
+}
+
+function snapshotLogSinks(row: ProjectScanRow<GcpListResult>): JsonRecord {
+  return {
+    projectId: row.projectId,
+    truncated: row.data.truncated,
+    sinks: row.data.items.map((sink) => ({
+      name: asString(sink.name) ?? null,
+      destination: asString(sink.destination) ?? null,
+      disabled: sink.disabled === true,
+    })),
+  };
+}
+
+function snapshotLogBuckets(row: ProjectScanRow<GcpListResult>): JsonRecord {
+  return {
+    projectId: row.projectId,
+    truncated: row.data.truncated,
+    buckets: row.data.items.map((bucket) => ({
+      name: asString(bucket.name) ?? null,
+      retentionDays: asNumber(bucket.retentionDays) ?? null,
+    })),
+  };
+}
+
+function snapshotSccSource(source: JsonRecord): JsonRecord {
+  return { name: asString(source.name) ?? null, displayName: asString(source.displayName) ?? null };
+}
+
+function snapshotStorageBucket(bucket: JsonRecord & { projectId: string }): JsonRecord {
+  const iamConfiguration = asObject(bucket.iamConfiguration);
+  return {
+    projectId: bucket.projectId,
+    name: asString(bucket.name) ?? null,
+    uniformBucketLevelAccess: asObject(iamConfiguration?.uniformBucketLevelAccess)?.enabled === true,
+    publicAccessPrevention: asString(iamConfiguration?.publicAccessPrevention) ?? null,
+    defaultKmsKeyName: asString(asObject(bucket.encryption)?.defaultKmsKeyName) ?? null,
+  };
+}
+
+function snapshotCryptoKey(key: JsonRecord): JsonRecord {
+  return {
+    name: asString(key.name) ?? null,
+    purpose: asString(key.purpose) ?? null,
+    rotationPeriod: asString(key.rotationPeriod) ?? null,
+    nextRotationTime: asString(key.nextRotationTime) ?? null,
+    primaryState: asString(asObject(key.primary)?.state) ?? null,
+  };
+}
+
+function snapshotDisk(disk: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: disk.projectId,
+    name: asString(disk.name) ?? null,
+    kmsKeyName: asString(asObject(disk.diskEncryptionKey)?.kmsKeyName) ?? null,
+  };
+}
+
+function snapshotManagedZone(zone: JsonRecord & { projectId: string }): JsonRecord {
+  const dnssec = asObject(zone.dnssecConfig);
+  return {
+    projectId: zone.projectId,
+    name: asString(zone.name) ?? null,
+    dnsName: asString(zone.dnsName) ?? null,
+    visibility: asString(zone.visibility) ?? null,
+    dnssecState: asString(dnssec?.state) ?? null,
+    defaultKeySpecs: asObjectArray(dnssec?.defaultKeySpecs).map((spec) => ({
+      keyType: asString(spec.keyType) ?? null,
+      algorithm: asString(spec.algorithm) ?? null,
+    })),
+  };
+}
+
+/** API keys keep name, displayName, and the documented restriction sub-objects; keyString is never copied. */
+function snapshotApiKey(key: JsonRecord & { projectId: string }): JsonRecord {
+  const restrictions = asObject(key.restrictions);
+  return {
+    projectId: key.projectId,
+    name: asString(key.name) ?? null,
+    displayName: asString(key.displayName) ?? null,
+    restrictions: {
+      apiTargets: asObjectArray(restrictions?.apiTargets).map((target) => ({
+        service: asString(target.service) ?? null,
+        methods: asArray(target.methods).map(asString).filter((method): method is string => Boolean(method)),
+      })),
+      browserKeyRestrictions: asObject(restrictions?.browserKeyRestrictions)
+        ? { allowedReferrers: asArray(asObject(restrictions?.browserKeyRestrictions)?.allowedReferrers).length }
+        : null,
+      serverKeyRestrictions: asObject(restrictions?.serverKeyRestrictions)
+        ? { allowedIps: asArray(asObject(restrictions?.serverKeyRestrictions)?.allowedIps).length }
+        : null,
+      androidKeyRestrictions: asObject(restrictions?.androidKeyRestrictions)
+        ? { allowedApplications: asArray(asObject(restrictions?.androidKeyRestrictions)?.allowedApplications).length }
+        : null,
+      iosKeyRestrictions: asObject(restrictions?.iosKeyRestrictions)
+        ? { allowedBundleIds: asArray(asObject(restrictions?.iosKeyRestrictions)?.allowedBundleIds).length }
+        : null,
+    },
+  };
+}
+
+function snapshotServicePerimeter(perimeter: JsonRecord): JsonRecord {
+  const status = asObject(perimeter.status);
+  return {
+    name: asString(perimeter.name) ?? null,
+    perimeterType: asString(perimeter.perimeterType) ?? null,
+    status: status
+      ? { resources: asArray(status.resources).length, restrictedServices: asArray(status.restrictedServices).length }
+      : null,
+    dryRunSpec: Boolean(asObject(perimeter.spec)),
+  };
+}
+
+function snapshotFirewall(rule: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: rule.projectId,
+    name: asString(rule.name) ?? null,
+    network: asString(rule.network) ?? null,
+    direction: asString(rule.direction) ?? null,
+    disabled: rule.disabled === true,
+    priority: asNumber(rule.priority) ?? null,
+    sourceRanges: asArray(rule.sourceRanges).map(asString).filter((range): range is string => Boolean(range)),
+    allowed: asObjectArray(rule.allowed).map((entry) => ({
+      IPProtocol: asString(entry.IPProtocol) ?? null,
+      ports: asArray(entry.ports).map(asString).filter((port): port is string => Boolean(port)),
+    })),
+  };
+}
+
+function snapshotSubnetwork(subnet: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: subnet.projectId,
+    name: asString(subnet.name) ?? null,
+    region: lastSegment(subnet.region) ?? null,
+    network: lastSegment(subnet.network) ?? null,
+    purpose: asString(subnet.purpose) ?? null,
+    flowLogsEnabled: flowLogsEnabled(subnet),
+    privateIpGoogleAccess: subnet.privateIpGoogleAccess === true,
+  };
+}
+
+function snapshotRouter(router: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: router.projectId,
+    name: asString(router.name) ?? null,
+    region: lastSegment(router.region) ?? null,
+    network: lastSegment(router.network) ?? null,
+    nats: asObjectArray(router.nats).map((nat) => ({
+      name: asString(nat.name) ?? null,
+      sourceSubnetworkIpRangesToNat: asString(nat.sourceSubnetworkIpRangesToNat) ?? null,
+      subnetworks: asObjectArray(nat.subnetworks).map((entry) => computeResourcePath(entry.name) ?? null),
+    })),
+  };
+}
+
+function snapshotNetworkInstance(instance: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: instance.projectId,
+    name: asString(instance.name) ?? null,
+    networkInterfaces: asObjectArray(instance.networkInterfaces).map((nic) => ({
+      network: lastSegment(nic.network) ?? null,
+      subnetwork: lastSegment(nic.subnetwork) ?? null,
+      accessConfigs: asObjectArray(nic.accessConfigs).length,
+      ipv6AccessConfigs: asObjectArray(nic.ipv6AccessConfigs).length,
+    })),
+  };
+}
+
+function snapshotSslPolicy(policy: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: policy.projectId,
+    path: sslPolicyPath(policy) ?? null,
+    name: asString(policy.name) ?? null,
+    minTlsVersion: asString(policy.minTlsVersion) ?? null,
+    profile: asString(policy.profile) ?? null,
+  };
+}
+
+function snapshotHttpsProxy(proxy: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: proxy.projectId,
+    name: asString(proxy.name) ?? null,
+    region: lastSegment(proxy.region) ?? null,
+    sslPolicy: attachedSslPolicyPath(proxy) ?? null,
+  };
+}
+
+function snapshotBackendService(backend: JsonRecord & { projectId: string }): JsonRecord {
+  return {
+    projectId: backend.projectId,
+    name: asString(backend.name) ?? null,
+    loadBalancingScheme: asString(backend.loadBalancingScheme) ?? null,
+    protocol: asString(backend.protocol) ?? null,
+    securityPolicy: computeResourcePath(backend.securityPolicy) ?? null,
+  };
+}
+
 export async function assessGcpIdentity(
   client: Pick<
     GcpAuditorClient,
@@ -1428,7 +1724,7 @@ export async function assessGcpIdentity(
   let keyInventoryTruncated = false;
 
   for (const row of accountScan.rows) {
-    for (const serviceAccount of row.data) {
+    for (const serviceAccount of row.data.items) {
       serviceAccountCount += 1;
       const email = asString(serviceAccount.email);
       if (!email) continue;
@@ -1489,7 +1785,7 @@ export async function assessGcpIdentity(
   const keyBase = {
     deniedProjects: accountScan.denied.length + keyErrors.length,
     scannedProjects: context.projectIds.length,
-    truncated: context.truncated || keyInventoryTruncated,
+    truncated: context.truncated || keyInventoryTruncated || accountScan.truncated,
   };
 
   const findings: GcpFinding[] = [
@@ -1594,8 +1890,12 @@ export async function assessGcpIdentity(
     errors,
     snapshot: {
       projects: context.projectIds,
-      iam_policies: iamPolicies.data.items,
-      service_accounts: accountScan.rows.map((row) => ({ projectId: row.projectId, accounts: row.data.map((account) => asString(account.email)) })),
+      iam_policies: iamPolicies.data.items.map(snapshotIamPolicy),
+      service_accounts: accountScan.rows.map((row) => ({
+        projectId: row.projectId,
+        truncated: row.data.truncated,
+        accounts: row.data.items.map((account) => asString(account.email) ?? null),
+      })),
       user_managed_keys: userManagedKeys,
     },
   };
@@ -1617,18 +1917,18 @@ export async function assessGcpLoggingDetection(
   const sinkScan = await scanProjects(context.projectIds, (projectId) => client.listLogSinks(projectId));
   const bucketScan = await scanProjects(context.projectIds, (projectId) => client.listLogBuckets(projectId));
   const settingsScan = await scanProjects(context.projectIds, (projectId) => client.getLoggingSettings(projectId));
-  const sccSources = await attempt(() => client.listSccSources(), [] as JsonRecord[]);
+  const sccSources = await attempt(() => client.listSccSources(), EMPTY_LIST);
   const sccFindings = await attempt(() => client.listSccFindings(maxFindings), EMPTY_LIST);
 
   const projectsWithoutAdmin = adminScan.rows.filter((row) => row.data.length === 0).map((row) => row.projectId);
   const projectsWithoutDataAccess = dataAccessScan.rows.filter((row) => row.data.length === 0).map((row) => row.projectId);
-  const projectsWithoutSinks = sinkScan.rows.filter((row) => row.data.length === 0).map((row) => row.projectId);
+  const projectsWithoutSinks = sinkScan.rows.filter((row) => row.data.items.length === 0).map((row) => row.projectId);
 
   const shortRetention: JsonRecord[] = [];
   const unknownRetention: JsonRecord[] = [];
   let bucketCount = 0;
   for (const row of bucketScan.rows) {
-    for (const bucket of row.data) {
+    for (const bucket of row.data.items) {
       const name = asString(bucket.name) ?? "";
       if (name.endsWith("/buckets/_Required")) continue;
       bucketCount += 1;
@@ -1643,7 +1943,8 @@ export async function assessGcpLoggingDetection(
     deniedProjects: scan.denied.length,
     scannedProjects: context.projectIds.length,
     apiDisabledProjects: scan.apiDisabled.length,
-    truncated: context.truncated,
+    truncated: context.truncated || scan.truncated,
+    unreachableScopes: scan.unreachable,
   });
 
   const findings: GcpFinding[] = [
@@ -1723,11 +2024,11 @@ export async function assessGcpLoggingDetection(
           id: "GCP-LOG-05",
           title: "Security Command Center visibility",
           severity: "info",
-          status: sccSources.data.length > 0 && !context.truncated ? "pass" : "warn",
-          summary: sccSources.data.length > 0
-            ? `Security Command Center returned ${sccSources.data.length} sources and ${sccFindings.data.items.length}${sccFindings.truncated ? "+" : ""} findings. Visibility only; findings are not scored as controls.`
+          status: sccSources.data.items.length > 0 && !context.truncated && !sccSources.truncated ? "pass" : "warn",
+          summary: sccSources.data.items.length > 0
+            ? `Security Command Center returned ${sccSources.data.items.length}${sccSources.truncated ? "+" : ""} sources and ${sccFindings.data.items.length}${sccFindings.truncated ? "+" : ""} findings. Visibility only; findings are not scored as controls.${sccSources.truncated ? " Partial view: the source list was truncated." : ""}`
             : "Security Command Center returned no sources for the scope; verify the tier or organization scope. Visibility only.",
-          evidence: { scc_sources: sccSources.data.length, scc_findings: sccFindings.data.items.length, findings_truncated: sccFindings.truncated, findings_error: sccFindings.error ?? null },
+          evidence: { scc_sources: sccSources.data.items.length, sources_truncated: sccSources.truncated, scc_findings: sccFindings.data.items.length, findings_truncated: sccFindings.truncated, findings_error: sccFindings.error ?? null },
           mappings: controlMappings(5),
           controls: [5],
         },
@@ -1752,7 +2053,7 @@ export async function assessGcpLoggingDetection(
       projects_with_log_sinks: sinkScan.rows.length - projectsWithoutSinks.length,
       configurable_log_buckets: bucketCount,
       short_retention_buckets: shortRetention.length,
-      scc_sources: sccSources.data.length,
+      scc_sources: sccSources.data.items.length,
       scc_findings: sccFindings.data.items.length,
       collection_errors: errors.length,
     },
@@ -1760,10 +2061,10 @@ export async function assessGcpLoggingDetection(
     errors,
     snapshot: {
       projects: context.projectIds,
-      logging_settings: settingsScan.rows,
-      sinks: sinkScan.rows,
-      log_buckets: bucketScan.rows,
-      scc_sources: sccSources.data,
+      logging_settings: settingsScan.rows.map(snapshotLoggingSettings),
+      sinks: sinkScan.rows.map(snapshotLogSinks),
+      log_buckets: bucketScan.rows.map(snapshotLogBuckets),
+      scc_sources: sccSources.data.items.map(snapshotSccSource),
     },
   };
 }
@@ -1823,7 +2124,7 @@ function orgPolicyFinding(
     summary: enabled
       ? `${passSummary}${partial ? " Partial view: the project inventory was truncated, so other projects may resolve a different effective policy." : ""}`
       : failSummary,
-    evidence: { policy: policy.data ?? null, partial },
+    evidence: { policy: snapshotOrgPolicy(policy.data), partial },
     mappings: controlMappings(...controls),
     controls,
   };
@@ -1881,7 +2182,7 @@ export async function assessGcpOrgGuardrails(
     const record = { projectId: instance.projectId, instance: asString(instance.name) };
     if (!shielded) shieldedUnknown.push(record);
     else if (shielded.enableSecureBoot !== true || shielded.enableVtpm !== true || shielded.enableIntegrityMonitoring !== true) {
-      shieldedViolations.push({ ...record, shieldedInstanceConfig: shielded });
+      shieldedViolations.push({ ...record, shieldedInstanceConfig: snapshotShieldedConfig(shielded) });
     }
     if (isTruthyMetadata(metadataValue(instance.metadata, "serial-port-enable"))) serialPortViolations.push(record);
   }
@@ -1961,7 +2262,7 @@ export async function assessGcpOrgGuardrails(
           summary: interpretOrgPolicyEnabled(serialPortPolicy.data) && interpretOrgPolicyEnabled(shieldedVmPolicy.data)
             ? "constraints/compute.disableSerialPortAccess and constraints/compute.requireShieldedVm are both enforced."
             : `Compute hardening guardrails missing: ${[!interpretOrgPolicyEnabled(serialPortPolicy.data) && "compute.disableSerialPortAccess", !interpretOrgPolicyEnabled(shieldedVmPolicy.data) && "compute.requireShieldedVm"].filter(Boolean).join(", ")}.`,
-          evidence: { serial_port_policy: serialPortPolicy.data ?? null, shielded_vm_policy: shieldedVmPolicy.data ?? null },
+          evidence: { serial_port_policy: snapshotOrgPolicy(serialPortPolicy.data), shielded_vm_policy: snapshotOrgPolicy(shieldedVmPolicy.data) },
           mappings: controlMappings(12, 23),
           controls: [12, 23],
         },
@@ -1974,7 +2275,7 @@ export async function assessGcpOrgGuardrails(
           summary: osLoginOverrides.length > 0
             ? `constraints/compute.requireOsLogin is enforced but ${osLoginOverrides.length} instances carry an enable-oslogin metadata override that is not TRUE.`
             : `constraints/compute.requireOsLogin is enforced in the effective policy and no instance overrides enable-oslogin.${partialNote({ ...scanBase(instanceScan), total: instances.length })}`,
-          evidence: { policy: osLoginPolicy.data ?? null, instance_overrides: osLoginOverrides.slice(0, 25), unreachable_scopes: instanceScan.unreachable.slice(0, 25) },
+          evidence: { policy: snapshotOrgPolicy(osLoginPolicy.data), instance_overrides: osLoginOverrides.slice(0, 25), unreachable_scopes: instanceScan.unreachable.slice(0, 25) },
           mappings: controlMappings(11),
           controls: [11],
         }
@@ -2055,19 +2356,19 @@ export async function assessGcpOrgGuardrails(
     findings,
     errors,
     snapshot: {
-      organization: organization.data,
+      organization: snapshotOrganization(organization.data),
       projects: context.projectIds,
       effective_policies: {
-        allowedPolicyMemberDomains: domainPolicy.data,
-        disableServiceAccountKeyCreation: keyCreationPolicy.data,
-        disableServiceAccountKeyUpload: keyUploadPolicy.data,
-        disableSerialPortAccess: serialPortPolicy.data,
-        requireShieldedVm: shieldedVmPolicy.data,
-        requireOsLogin: osLoginPolicy.data,
+        allowedPolicyMemberDomains: snapshotOrgPolicy(domainPolicy.data),
+        disableServiceAccountKeyCreation: snapshotOrgPolicy(keyCreationPolicy.data),
+        disableServiceAccountKeyUpload: snapshotOrgPolicy(keyUploadPolicy.data),
+        disableSerialPortAccess: snapshotOrgPolicy(serialPortPolicy.data),
+        requireShieldedVm: snapshotOrgPolicy(shieldedVmPolicy.data),
+        requireOsLogin: snapshotOrgPolicy(osLoginPolicy.data),
       },
-      compute_projects: computeProjectScan.rows,
-      instances,
-      binary_authorization: binaryAuthScan.rows,
+      compute_projects: computeProjectScan.rows.map(snapshotComputeProject),
+      instances: instances.map(snapshotGuardrailInstance),
+      binary_authorization: binaryAuthScan.rows.map(snapshotBinaryAuthorization),
     },
   };
 }
@@ -2111,17 +2412,19 @@ export async function assessGcpDataProtection(
   const diskScan = await scanProjects(context.projectIds, (projectId) => client.listDisks(projectId, maxAssets));
   const zoneScan = await scanProjects(context.projectIds, (projectId) => client.listManagedZones(projectId, maxAssets));
   const apiKeyScan = await scanProjects(context.projectIds, (projectId) => client.listApiKeys(projectId, maxAssets));
-  const accessPolicies = config.organizationId
-    ? await attempt(() => client.listAccessPolicies(), [] as JsonRecord[])
-    : { data: [] as JsonRecord[], truncated: false };
+  const accessPolicies: Collected<GcpListResult> = config.organizationId
+    ? await attempt(() => client.listAccessPolicies(), EMPTY_LIST)
+    : { data: EMPTY_LIST, truncated: false };
   const perimeters: JsonRecord[] = [];
   const perimeterErrors: string[] = [];
-  for (const policy of accessPolicies.data) {
+  let perimetersTruncated = false;
+  for (const policy of accessPolicies.data.items) {
     const name = asString(policy.name);
     if (!name) continue;
-    const perimeterList = await attempt(() => client.listServicePerimeters(name), [] as JsonRecord[]);
+    const perimeterList = await attempt(() => client.listServicePerimeters(name), EMPTY_LIST);
     if (perimeterList.error) perimeterErrors.push(perimeterList.error);
-    perimeters.push(...perimeterList.data);
+    if (perimeterList.truncated) perimetersTruncated = true;
+    perimeters.push(...perimeterList.data.items);
   }
 
   const buckets = flattenScan(bucketScan);
@@ -2311,14 +2614,14 @@ export async function assessGcpDataProtection(
           evidence: {
             enforced_perimeters: enforcedPerimeters.map((perimeter) => ({ name: asString(perimeter.name), resources: asArray(asObject(perimeter.status)?.resources).length, restrictedServices: asArray(asObject(perimeter.status)?.restrictedServices).length })).slice(0, 25),
             dry_run_only_perimeters: dryRunOnlyPerimeters.map((perimeter) => asString(perimeter.name)).slice(0, 25),
-            access_policies: accessPolicies.data.length,
+            access_policies: accessPolicies.data.items.length,
           },
-          total: accessPolicies.data.length,
+          total: accessPolicies.data.items.length,
           violations: enforcedPerimeters.length === 0 ? 1 : 0,
           violationStatus: "warn",
           unknown: dryRunOnlyPerimeters.length,
           inventoryError: accessPolicies.error ?? perimeterErrors[0],
-          truncated: context.truncated,
+          truncated: context.truncated || accessPolicies.truncated || perimetersTruncated,
           emptyVerdict: "fail",
           passSummary: `${enforcedPerimeters.length} enforced service perimeters protect resources with restricted services.`,
           failSummary: `${perimeters.length} perimeters exist but none is enforced with both resources and restricted services.`,
@@ -2358,13 +2661,13 @@ export async function assessGcpDataProtection(
     errors,
     snapshot: {
       projects: context.projectIds,
-      buckets,
-      public_bindings: publicBindings.data.items,
-      crypto_keys: cryptoKeys.data.items,
-      disks,
-      managed_zones: zones,
-      api_keys: apiKeys,
-      service_perimeters: perimeters,
+      buckets: buckets.map(snapshotStorageBucket),
+      public_bindings: publicBindings.data.items.map(snapshotIamPolicy),
+      crypto_keys: cryptoKeys.data.items.map(snapshotCryptoKey),
+      disks: disks.map(snapshotDisk),
+      managed_zones: zones.map(snapshotManagedZone),
+      api_keys: apiKeys.map(snapshotApiKey),
+      service_perimeters: perimeters.map(snapshotServicePerimeter),
     },
   };
 }
@@ -2677,13 +2980,13 @@ export async function assessGcpNetworkSecurity(
     errors,
     snapshot: {
       projects: context.projectIds,
-      firewalls,
-      subnetworks: subnets,
-      routers,
-      instances: instances.map((instance) => ({ projectId: instance.projectId, name: instance.name, networkInterfaces: instance.networkInterfaces })),
-      ssl_policies: sslPolicies,
-      target_https_proxies: proxies,
-      backend_services: externalBackends,
+      firewalls: firewalls.map(snapshotFirewall),
+      subnetworks: subnets.map(snapshotSubnetwork),
+      routers: routers.map(snapshotRouter),
+      instances: instances.map(snapshotNetworkInstance),
+      ssl_policies: sslPolicies.map(snapshotSslPolicy),
+      target_https_proxies: proxies.map(snapshotHttpsProxy),
+      backend_services: externalBackends.map(snapshotBackendService),
     },
   };
 }
@@ -2815,7 +3118,7 @@ function buildQuickReference(assessments: GcpAssessmentResult[]): string {
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw API snapshots per assessment with secrets redacted",
+    "- `core_data/`: projected API snapshots per assessment (only the identifiers and documented fields each control reads; metadata values, labels, key material, and other free-form values are never written)",
     "- `analysis/findings.json`: every finding with status, evidence, spec control numbers, and framework mappings",
     "- `analysis/<category>.json`: per-assessment summary, findings, and collection errors",
     "- `analysis/category_summaries.json`: status counts per category",
@@ -2884,19 +3187,19 @@ export async function exportGcpAuditBundle(
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(redactSecrets(access)));
   for (const assessment of assessments) {
     await writeSecureTextFile(outputDir, `core_data/${assessment.category}.json`, serializeJson(redactSecrets(assessment.snapshot)));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(redactSecrets({
       title: assessment.title,
       category: assessment.category,
       summary: assessment.summary,
       findings: assessment.findings,
       errors: assessment.errors,
-    }));
+    })));
     await writeSecureTextFile(outputDir, `analysis/${assessment.category}.md`, formatAssessmentText(assessment));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/category_summaries.json", serializeJson(
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactSecrets(findings)));
+  await writeSecureTextFile(outputDir, "analysis/category_summaries.json", serializeJson(redactSecrets(
     assessments.map((assessment) => ({ category: assessment.category, title: assessment.title, counts: countStatuses(assessment.findings), summary: assessment.summary })),
-  ));
+  )));
   await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
   await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const framework of GCP_FRAMEWORKS) {

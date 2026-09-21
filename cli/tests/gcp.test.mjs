@@ -4,15 +4,18 @@ import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   readFileSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   GCP_FRAMEWORKS,
+  GCP_MAX_LIST_PAGES,
   GcpAuditorClient,
   PUBLIC_MEMBER_IAM_QUERY,
   assessGcpDataProtection,
@@ -389,7 +392,7 @@ test("self-check (c): partial inventories (project cap, denied project) never pa
   assert.equal(uniform.evidence.seen, 1);
   assert.equal(assessments[0].summary.projects_truncated, true);
   const flowLogs = assessments[4].findings.find((item) => item.id === "GCP-NET-02");
-  assert.match(flowLogs.summary, /1 of 2 projects denied; 1 unreachable scopes not enumerated \(prod-audit: zones\/europe-west1-b\); inventory incomplete/);
+  assert.match(flowLogs.summary, /1 of 2 projects denied; 1 unreachable scopes not enumerated \(prod-audit: zones\/europe-west1-b\); 1 seen, total unknown \(inventory incomplete\)/);
 });
 
 test("self-check (d): a fully compliant organization passes every automatable control", async () => {
@@ -654,6 +657,258 @@ test("GCP-NET-06 treats H2C backend services as HTTP(S) backends", async () => {
   assert.deepEqual(finding.evidence.backends_without_security_policy.map((backend) => backend.backendService), ["grpc-web"]);
 });
 
+test("paginate records truncation when the cursor repeats or the page budget is reached", async () => {
+  const fixedTokenUrls = [];
+  const fixedToken = createClient(async (url) => {
+    fixedTokenUrls.push(url);
+    return jsonResponse({ items: [], nextPageToken: "stuck" });
+  });
+  const stuck = await fixedToken.listFirewalls("prod-audit");
+  assert.deepEqual(stuck.items, []);
+  assert.equal(stuck.truncated, true, "a cursor that stops advancing must be reported as truncation");
+  assert.equal(fixedTokenUrls.length, 2, "the repeated token is fetched once and then abandoned");
+
+  let advancing = 0;
+  const advancingToken = createClient(async () => {
+    advancing += 1;
+    return jsonResponse({ items: [], nextPageToken: `page-${advancing}` });
+  });
+  const budgeted = await advancingToken.listFirewalls("prod-audit");
+  assert.equal(budgeted.truncated, true, "an endless advancing cursor with empty pages must stop at the page budget");
+  assert.equal(advancing, GCP_MAX_LIST_PAGES);
+
+  let capped = 0;
+  const cappedClient = createClient(async () => {
+    capped += 1;
+    return jsonResponse({ accounts: Array.from({ length: 100 }, (_, index) => ({ email: `sa-${capped}-${index}@prod-audit.iam.gserviceaccount.com` })), nextPageToken: `page-${capped}` });
+  });
+  const accounts = await cappedClient.listServiceAccounts("prod-audit", 250);
+  assert.equal(accounts.items.length, 300);
+  assert.equal(accounts.truncated, true, "a cap exit must report truncated");
+  assert.equal(capped, 3);
+});
+
+test("every capped list threads truncation into the verdicts (never-ending sink, bucket, account, source, and perimeter pages)", async () => {
+  let bucketPage = 0;
+  const client = createClient(async (url, init) => {
+    const parsed = new URL(url);
+    const path = parsed.pathname;
+    if (path.endsWith("/sinks")) return jsonResponse({ sinks: [{ name: "audit-sink" }], nextPageToken: "stuck" });
+    if (path.endsWith("/buckets") && parsed.hostname === "logging.googleapis.com") {
+      bucketPage += 1;
+      return jsonResponse({
+        buckets: Array.from({ length: 100 }, (_, index) => ({ name: `projects/prod-audit/locations/global/buckets/custom-${bucketPage}-${index}`, retentionDays: 400 })),
+        nextPageToken: `page-${bucketPage}`,
+      });
+    }
+    if (path.endsWith("/serviceAccounts")) return jsonResponse({ ...COMPLIANT.serviceAccounts, nextPageToken: "stuck" });
+    if (path.endsWith("/sources")) return jsonResponse({ ...COMPLIANT.sccSources, nextPageToken: "stuck" });
+    if (path === "/v1/accessPolicies") return jsonResponse({ ...COMPLIANT.accessPolicies, nextPageToken: "stuck" });
+    if (path.endsWith("/servicePerimeters")) return jsonResponse({ ...COMPLIANT.servicePerimeters, nextPageToken: "stuck" });
+    return jsonResponse(routeCompliant(url, init));
+  });
+  const assessments = await runAllAssessments(client);
+  const all = statuses(assessments);
+  for (const id of ["GCP-LOG-03", "GCP-LOG-04", "GCP-LOG-05", "GCP-IAM-02", "GCP-IAM-03", "GCP-DATA-07"]) {
+    assert.equal(all[id], "warn", `${id} must not pass when its list was cut off by the cap or a stuck cursor`);
+  }
+  const retention = assessments[1].findings.find((item) => item.id === "GCP-LOG-04");
+  assert.equal(retention.evidence.truncated, true);
+  assert.equal(retention.evidence.seen, 5000);
+  assert.match(retention.summary, /Partial view: 5000 seen, total unknown \(inventory incomplete\)/);
+  const sinks = assessments[1].findings.find((item) => item.id === "GCP-LOG-03");
+  assert.match(sinks.summary, /1 seen, total unknown/);
+  assert.equal(assessments[1].snapshot.sinks[0].truncated, true);
+  assert.equal(assessments[1].snapshot.log_buckets[0].buckets.length, 5000);
+  assert.equal(bucketPage, 50, "the bucket cap of 5000 stops after 50 pages of 100");
+});
+
+test("org guardrail snapshots and evidence never pass metadata values through", async () => {
+  const secret = "SEEDED-STARTUP-SCRIPT-4c1d2e";
+  const seeded = {
+    ...COMPLIANT,
+    computeProject: {
+      name: "prod-audit",
+      commonInstanceMetadata: { items: [{ key: "enable-oslogin", value: "TRUE" }, { key: "ssh-keys", value: `admin:ssh-rsa ${secret}` }, { key: "db-password", value: secret }] },
+    },
+    instances: structuredClone(COMPLIANT.instances),
+  };
+  seeded.instances.items["zones/us-central1-a"].instances[0].metadata = { items: [{ key: "startup-script", value: secret }, { key: "serial-port-enable", value: "0" }] };
+  seeded.instances.items["zones/us-central1-a"].instances[0].labels = { owner: secret };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, seeded)));
+  const result = await assessGcpOrgGuardrails(client);
+  assert.ok(!JSON.stringify(result).includes(secret), "no metadata value may reach the assessment result");
+  assert.deepEqual(result.snapshot.compute_projects, [{ projectId: "prod-audit", name: "prod-audit", enable_oslogin: true }]);
+  assert.deepEqual(result.snapshot.instances, [{
+    projectId: "prod-audit",
+    name: "vm-1",
+    enable_oslogin: null,
+    serial_port_enable: false,
+    shieldedInstanceConfig: { enableSecureBoot: true, enableVtpm: true, enableIntegrityMonitoring: true },
+  }]);
+  assert.deepEqual(Object.keys(result.snapshot.effective_policies.requireOsLogin), ["constraint", "enforced", "booleanPolicy", "listPolicy", "restoreDefault"]);
+  assert.equal(statuses([result])["GCP-ORG-08"], "pass");
+});
+
+test("API key snapshots keep name, displayName, and restrictions but never keyString", async () => {
+  const keyString = "AIzaSEEDED-KEYSTRING-7b2c9d";
+  const seeded = {
+    ...COMPLIANT,
+    apiKeys: { keys: [{ ...COMPLIANT.apiKeys.keys[0], keyString, uid: "uid-1", etag: "etag-1", annotations: { note: keyString } }] },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, seeded)));
+  const result = await assessGcpDataProtection(client);
+  assert.ok(!JSON.stringify(result).includes(keyString));
+  assert.deepEqual(result.snapshot.api_keys, [{
+    projectId: "prod-audit",
+    name: "projects/111/locations/global/keys/abc",
+    displayName: "maps",
+    restrictions: {
+      apiTargets: [{ service: "maps.googleapis.com", methods: [] }],
+      browserKeyRestrictions: null,
+      serverKeyRestrictions: { allowedIps: 1 },
+      androidKeyRestrictions: null,
+      iosKeyRestrictions: null,
+    },
+  }]);
+  assert.equal(statuses([result])["GCP-DATA-06"], "pass");
+});
+
+function seededSecret(label) {
+  return `SEEDED-${label}-a9f3e1c7`;
+}
+
+function seededFixture() {
+  const secrets = {};
+  const seed = (label) => {
+    secrets[label] = seededSecret(label);
+    return secrets[label];
+  };
+  const data = structuredClone(COMPLIANT);
+  data.organization.description = seed("organization");
+  data.projects.results[0].labels = { owner: seed("project-label") };
+  data.projects.results[0].additionalAttributes = { projectId: seed("project-attribute") };
+  data.iamPolicies.results[0].policy.bindings[0].condition = { expression: seed("iam-condition"), title: "cond" };
+  data.publicPolicies = {
+    results: [{
+      resource: "//storage.googleapis.com/shared-bucket",
+      assetType: "storage.googleapis.com/Bucket",
+      policy: { bindings: [{ role: "roles/storage.objectViewer", members: ["allUsers"], condition: { description: seed("public-condition") } }] },
+    }],
+  };
+  data.serviceAccounts.accounts[0].description = seed("service-account");
+  data.keys = { keys: [{ name: "projects/prod-audit/serviceAccounts/svc/keys/1", validAfterTime: "2026-09-01T00:00:00Z", privateKeyData: seed("service-account-key") }] };
+  data.entries.entries[0].textPayload = seed("log-entry");
+  data.sinks.sinks[0].filter = seed("sink-filter");
+  data.sinks.sinks[0].writerIdentity = seed("sink-writer");
+  data.logBuckets.buckets[0].description = seed("log-bucket");
+  data.settings.kmsServiceAccountId = seed("logging-settings");
+  data.sccSources.sources[0].description = seed("scc-source");
+  data.sccFindings = { listFindingsResults: [{ finding: { name: "organizations/123456789012/sources/1/findings/f1", sourceProperties: { detail: seed("scc-finding") } } }] };
+  data.booleanPolicy.etag = seed("boolean-policy");
+  data.listPolicy.listPolicy.allowedValues.push(seed("list-policy"));
+  data.computeProject.commonInstanceMetadata.items.push({ key: "ssh-keys", value: seed("project-ssh-keys") }, { key: "db-password", value: seed("project-metadata") });
+  const instance = data.instances.items["zones/us-central1-a"].instances[0];
+  instance.metadata = { items: [{ key: "startup-script", value: seed("instance-startup-script") }] };
+  instance.labels = { env: seed("instance-label") };
+  instance.description = seed("instance-description");
+  data.binaryAuthorization.description = seed("binary-authorization");
+  data.buckets.items[0].labels = { team: seed("bucket-label") };
+  data.buckets.items[0].website = { mainPageSuffix: seed("bucket-website") };
+  data.cryptoKeys.assets[0].resource.data.labels = { purpose: seed("crypto-key-label") };
+  data.disks.items["zones/us-central1-a"].disks[0].diskEncryptionKey.rawKey = seed("disk-raw-key");
+  data.disks.items["zones/us-central1-a"].disks[0].description = seed("disk-description");
+  data.managedZones.managedZones[0].description = seed("managed-zone");
+  data.apiKeys.keys[0].keyString = seed("api-key-string");
+  data.accessPolicies.accessPolicies[0].title = seed("access-policy");
+  data.servicePerimeters.servicePerimeters[0].title = seed("perimeter-title");
+  data.servicePerimeters.servicePerimeters[0].description = seed("perimeter-description");
+  data.firewalls.items[0].description = seed("firewall");
+  const subnet = data.subnetworks.items["regions/us-central1"].subnetworks[0];
+  subnet.description = seed("subnetwork");
+  subnet.logConfig.filterExpr = seed("subnetwork-filter");
+  data.routers.items["regions/us-central1"].routers[0].description = seed("router");
+  data.sslPolicies.items.global.sslPolicies[0].description = seed("ssl-policy");
+  data.sslPolicies.items.global.sslPolicies[0].customFeatures = [seed("ssl-custom-feature")];
+  data.targetHttpsProxies.items.global.targetHttpsProxies[0].description = seed("https-proxy");
+  const backend = data.backendServices.items.global.backendServices[0];
+  backend.description = seed("backend-service");
+  backend.iap = { enabled: true, oauth2ClientId: "client-id", oauth2ClientSecret: seed("backend-iap-secret"), oauth2ClientSecretSha256: seed("backend-iap-sha") };
+  return { data, secrets };
+}
+
+function walkFiles(root) {
+  const files = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const pathname = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...walkFiles(pathname));
+    else files.push(pathname);
+  }
+  return files;
+}
+
+function readZipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  const endOfCentralDirectory = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(endOfCentralDirectory >= 0, "zip end of central directory record missing");
+  const entryCount = buffer.readUInt16LE(endOfCentralDirectory + 10);
+  let offset = buffer.readUInt32LE(endOfCentralDirectory + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "local file header signature");
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: method === 8 ? inflateRawSync(data).toString("utf8") : data.toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+test("exportGcpAuditBundle never writes a seeded secret to any bundle file or zip entry", async () => {
+  const { data, secrets } = seededFixture();
+  const seededValues = Object.values(secrets);
+  assert.ok(seededValues.length >= 40);
+  const base = createTempBase("grclanker-gcp-hygiene-");
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data)));
+  const result = await exportGcpAuditBundle(client, sampleConfig({ accessToken: seededSecret("access-token") }), base, { max_projects: 5 });
+  assert.equal(result.errorCount, 0);
+
+  const files = walkFiles(result.outputDir).map((pathname) => ({ name: relative(result.outputDir, pathname), content: readFileSync(pathname, "utf8") }));
+  assert.ok(files.some((file) => file.name === "core_data/org-guardrails.json"));
+  assert.ok(files.some((file) => file.name === "analysis/findings.json"));
+  const zipEntries = readZipEntries(result.zipPath).filter((entry) => !entry.name.endsWith("/"));
+  assert.equal(zipEntries.length, files.length, "every bundle file must be present in the zip");
+  for (const file of files) {
+    const entry = zipEntries.find((candidate) => candidate.name === file.name);
+    assert.ok(entry, `${file.name} missing from zip`);
+    assert.equal(entry.content, file.content, `${file.name} differs between directory and zip`);
+  }
+
+  const leaks = [];
+  for (const { name, content } of [...files, ...zipEntries]) {
+    for (const [label, value] of Object.entries(secrets)) {
+      if (content.includes(value)) leaks.push(`${label} -> ${name}`);
+    }
+    if (content.includes(seededSecret("access-token"))) leaks.push(`access-token -> ${name}`);
+  }
+  assert.deepEqual(leaks, [], "seeded secrets reached the bundle");
+
+  const everything = files.map((file) => file.content).join("\n");
+  assert.ok(everything.includes("prod-bucket"), "bundle content must still carry resource identifiers");
+  assert.ok(everything.includes("public-zone"));
+  const quickReference = files.find((file) => file.name === "QUICK_REFERENCE.md").content;
+  assert.match(quickReference, /projected API snapshots/);
+  assert.ok(!quickReference.includes("raw API snapshots"));
+});
+
 test("assessGcpIdentity flags stale keys, undated keys, and privileged default service accounts", async () => {
   const client = {
     getNow: () => NOW,
@@ -661,7 +916,7 @@ test("assessGcpIdentity flags stale keys, undated keys, and privileged default s
       return { projects: [{ name: "//cloudresourcemanager.googleapis.com/projects/prod-audit" }], truncated: false };
     },
     async listServiceAccounts() {
-      return [{ email: "svc@prod-audit.iam.gserviceaccount.com" }, { email: "other@prod-audit.iam.gserviceaccount.com" }];
+      return { items: [{ email: "svc@prod-audit.iam.gserviceaccount.com" }, { email: "other@prod-audit.iam.gserviceaccount.com" }], truncated: false };
     },
     async listServiceAccountKeys(_projectId, email) {
       return email.startsWith("svc") ? [{ name: "keys/1", validAfterTime: "2025-01-01T00:00:00Z" }] : [{ name: "keys/2" }];
