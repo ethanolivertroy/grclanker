@@ -1838,7 +1838,7 @@ test("false-pass self-check (b): every list empty yields no pass, and only IAM-0
   }
 });
 
-test("false-pass self-check (c): partial inventories yield no pass in any assess tool", async () => {
+test("false-pass self-check (c): partial inventories yield no pass in any assess tool, except AUD-17 whose organization-wide audit count is not narrowed by the fixture", async () => {
   const identity = await assessMulesoftIdentityAccess(partialIdentityClient());
   assertNoPass(identity, "identity/partial");
   for (const item of identity.findings) {
@@ -1872,8 +1872,17 @@ test("false-pass self-check (c): partial inventories yield no pass in any assess
   const audit = await assessMulesoftAuditMonitoring(partialAuditClient(), { environmentLimit: 1 });
   assert.equal(statusOf(audit, "MULESOFT-AUD-24"), "warn");
   assert.match(findingById(audit, "MULESOFT-AUD-24").summary, /Partial view: the environment limit of 1 excluded 2 environment\(s\) \(1 production\)/);
-  assert.equal(statusOf(audit, "MULESOFT-AUD-17"), "pass");
+  assert.equal(
+    statusOf(audit, "MULESOFT-AUD-17"),
+    "pass",
+    "AUD-17 decides on the organization-wide, server-reported count of entries in the lookback window; the environment limit does not scope the audit query and the capped sample is reported, not relied on",
+  );
   assert.equal(findingById(audit, "MULESOFT-AUD-17").evidence.entries_in_window, 5000);
   assert.equal(findingById(audit, "MULESOFT-AUD-17").evidence.entries_fetched, 1);
   assert.match(findingById(audit, "MULESOFT-AUD-17").summary, /5000 audit log entries recorded within the last 24 hours \(1 fetched\)/);
+  assert.equal(findingById(audit, "MULESOFT-AUD-17").evidence.partial_view, undefined);
+
+  const allFindings = [identity, gateway, runtime, audit].flatMap((result) => result.findings);
+  assert.equal(allFindings.length, 25);
+  assert.deepEqual(allFindings.filter((item) => item.status === "pass").map((item) => item.id), ["MULESOFT-AUD-17"]);
 });
