@@ -1714,7 +1714,11 @@ test("self-check (b): empty inventories pass only where the control intent makes
   assert.equal(byId["GITHUB-CODE-005"].status, "Fail");
   assert.equal(byId["GITHUB-ORG-004"].status, "Manual");
   assert.equal(byId["GITHUB-ORG-005"].status, "Info");
-  assert.equal(byId["GITHUB-ORG-006"].status, "Fail");
+  // ownerInfo is the owner-only enterprise object; a null without providers is the denied shape,
+  // not an enterprise with no identity provider, so ORG-006 reads it as unreadable like ORG-007 does.
+  assert.equal(byId["GITHUB-ORG-006"].status, "Manual");
+  assert.match(byId["GITHUB-ORG-006"].summary, /enterprise\.ownerInfo for example-enterprise was not readable: ownerInfo returned null without a GraphQL error/);
+  assert.equal(byId["GITHUB-ORG-007"].status, "Manual");
   assert.equal(byId["GITHUB-REPO-001"].status, "Fail");
   for (const id of ["GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
     assert.equal(byId[id].status, "Info", `${id} should be Info on an empty repository inventory`);
