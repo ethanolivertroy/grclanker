@@ -826,9 +826,115 @@ test("assessBoxIdentityAccess falls back to manual findings when the API refuses
     listUsers: forbidden("manage_managed_users scope missing"),
     listEnterpriseEvents: forbidden(),
   }));
-  assertStatuses(noUsers, { "BOX-17": "manual", "BOX-18": "manual", "BOX-24": "manual" });
+  assertStatuses(noUsers, {
+    "BOX-01": "pass",
+    "BOX-02": "manual",
+    "BOX-03": "manual",
+    "BOX-17": "manual",
+    "BOX-18": "manual",
+    "BOX-21": "pass",
+    "BOX-24": "manual",
+  });
+  assert.match(findingById(noUsers, "BOX-02").summary, /Enterprise users could not be listed because the audit principal lacks the scope or admin role/);
+  assert.match(findingById(noUsers, "BOX-02").summary, /enterprise MFA is required \(totp\)/);
+  assert.match(findingById(noUsers, "BOX-02").manualEvidence, /Exempt from 2-step verification/);
+  assert.equal(findingById(noUsers, "BOX-02").evidence.is_multi_factor_auth_required, true);
+  assert.match(findingById(noUsers, "BOX-02").evidence.users_error, /403 Forbidden/);
+  assert.match(findingById(noUsers, "BOX-03").summary, /per-user exemptions from login verification cannot be verified/);
+  assert.match(findingById(noUsers, "BOX-03").manualEvidence, /2-Step Verification/);
   assert.ok(noUsers.errors.some((entry) => entry.startsWith("users: ")));
   assert.ok(noUsers.errors.some((entry) => entry.startsWith("enterprise_events: ")));
+
+  const nothingReadable = await assessBoxIdentityAccess(createStubClient(hardenedFixture(), {
+    getEnterpriseConfiguration: forbidden(),
+    listUsers: forbidden(),
+  }));
+  assertStatuses(nothingReadable, { "BOX-02": "manual", "BOX-03": "manual" });
+  assert.match(findingById(nothingReadable, "BOX-02").summary, /^Neither enterprise MFA settings/);
+  assert.match(findingById(nothingReadable, "BOX-03").summary, /^Neither enterprise MFA settings/);
+});
+
+test("assessBoxIdentityAccess treats null configuration categories as absent data instead of failing", async () => {
+  const result = await assessBoxIdentityAccess(createStubClient({
+    ...hardenedFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", security: null, user_settings: null },
+  }));
+  assertStatuses(result, {
+    "BOX-01": "manual",
+    "BOX-02": "manual",
+    "BOX-03": "manual",
+    "BOX-17": "pass",
+    "BOX-21": "manual",
+    "BOX-22": "manual",
+    "BOX-24": "pass",
+  });
+  for (const id of ["BOX-01", "BOX-02", "BOX-03", "BOX-21", "BOX-22"]) {
+    const found = findingById(result, id);
+    assert.notEqual(found.status, "fail", `${id} must not fail on a null category`);
+    assert.match(found.summary, /category was returned as null/, `${id} should explain the null category`);
+    assert.doesNotMatch(found.summary, /not required|do not expose/i, `${id} must not assert a negative posture from absent data`);
+  }
+  assert.match(findingById(result, "BOX-01").summary, /user_settings category/);
+  assert.match(findingById(result, "BOX-02").summary, /security category/);
+  assert.equal(findingById(result, "BOX-01").evidence.is_enterprise_sso_required, null);
+  assert.equal(result.summary.sso_required, null);
+  assert.equal(result.summary.mfa_required, null);
+  assert.deepEqual(result.errors, []);
+
+  const missingKeys = await assessBoxIdentityAccess(createStubClient({
+    ...hardenedFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", security: {}, user_settings: {} },
+  }));
+  assertStatuses(missingKeys, { "BOX-01": "warn", "BOX-02": "warn", "BOX-03": "warn", "BOX-21": "warn", "BOX-22": "warn" });
+  assert.match(findingById(missingKeys, "BOX-01").summary, /did not expose is_enterprise_sso_required/);
+  assert.match(findingById(missingKeys, "BOX-02").summary, /did not expose is_multi_factor_auth_required/);
+  assert.match(findingById(missingKeys, "BOX-01").manualEvidence, /Configure Single Sign On/);
+});
+
+test("assessBoxSharingCollaboration and assessBoxShieldMonitoring treat null categories as absent data", async () => {
+  const sharing = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", security: null, content_and_sharing: null, user_settings: null },
+  }));
+  assertStatuses(sharing, { "BOX-04": "warn", "BOX-05": "pass", "BOX-06": "manual", "BOX-07": "manual", "BOX-08": "manual", "BOX-09": "manual", "BOX-20": "pass" });
+  assert.match(findingById(sharing, "BOX-04").summary, /content_and_sharing category was returned as null/);
+  assert.match(findingById(sharing, "BOX-06").summary, /content_and_sharing category was returned as null/);
+  assert.deepEqual(sharing.errors, []);
+
+  const noAllowlist = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", content_and_sharing: null },
+    allowlistEntries: [],
+  }));
+  assertStatuses(noAllowlist, { "BOX-04": "manual" });
+
+  const missingExpiration = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", content_and_sharing: { shared_link_default_access: item("collaborators") } },
+  }));
+  assertStatuses(missingExpiration, { "BOX-07": "warn" });
+  assert.match(findingById(missingExpiration, "BOX-07").summary, /did not expose is_shared_links_expiration_enabled/);
+
+  const shield = await assessBoxShieldMonitoring(createStubClient({
+    ...hardenedFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", shield: null },
+  }));
+  assertStatuses(shield, { "BOX-14": "manual", "BOX-15": "pass", "BOX-16": "pass", "BOX-25": "pass" });
+  assert.match(findingById(shield, "BOX-14").summary, /shield category was returned as null/);
+  assert.equal(findingById(shield, "BOX-25").evidence.anomaly_detection_rules, null);
+
+  const quietShield = await assessBoxShieldMonitoring(createStubClient({
+    ...weakFixture(),
+    configuration: { id: "123456", type: "enterprise_configuration", shield: null },
+  }));
+  assertStatuses(quietShield, { "BOX-14": "manual", "BOX-25": "warn" });
+  assert.match(findingById(quietShield, "BOX-25").summary, /Shield rule configuration could not be read/);
+
+  const noEvents = await assessBoxShieldMonitoring(createStubClient(weakFixture(), {
+    listEnterpriseEvents: forbidden("admin_logs requires report permissions"),
+  }));
+  assertStatuses(noEvents, { "BOX-14": "fail", "BOX-16": "manual", "BOX-25": "warn" });
+  assert.match(findingById(noEvents, "BOX-25").summary, /event stream could not be read/);
 });
 
 test("assessBoxSharingCollaboration passes with restricted collaboration, links, watermarking, and terms", async () => {

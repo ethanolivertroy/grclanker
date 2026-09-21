@@ -108,24 +108,24 @@ Output paths are resolved inside the output root with traversal and symlinked-pa
 
 ## Control coverage
 
-Status semantics: `pass` means the API evidence satisfies the control, `warn` means partial or threshold-adjacent evidence, `fail` means the API evidence contradicts the control, and `manual` means the API cannot prove the control and the finding lists the Admin Console evidence to collect.
+Status semantics: `pass` means the API evidence satisfies the control, `warn` means partial or threshold-adjacent evidence, `fail` means the API evidence contradicts the control, and `manual` means the API cannot prove the control and the finding lists the Admin Console evidence to collect. Absent data never produces `fail`: a configuration category that Box returns as `null` (the `2025.0` schema allows `security`, `content_and_sharing`, `user_settings`, and `shield` to be null) or an unreadable user list yields `manual` or `warn` with the reason, and a setting that is missing from a readable category yields `warn`.
 
 | # | Control | Tool | Finding | Status semantics |
 | --- | --- | --- | --- | --- |
-| 1 | SSO enforcement | identity_access | BOX-01 | pass when `is_enterprise_sso_required` is true and not in testing; warn in testing mode; fail otherwise; manual if configuration is unreadable |
-| 2 | 2FA for admins | identity_access | BOX-02 | pass when MFA is required and no admin or co-admin is `is_exempt_from_login_verification`; fail on exempt admins or MFA not required; warn when only SSO enforces MFA |
-| 3 | 2FA for all users | identity_access | BOX-03 | pass when MFA is required with no exempt users; warn on exemptions or SSO-only MFA; fail when neither MFA nor SSO is required |
+| 1 | SSO enforcement | identity_access | BOX-01 | pass when `is_enterprise_sso_required` is true and not in testing; warn in testing mode or when the flag is not exposed; fail when it is false; manual when `user_settings` is unreadable or null |
+| 2 | 2FA for admins | identity_access | BOX-02 | pass when MFA is required and no admin or co-admin is `is_exempt_from_login_verification`; fail on exempt admins or MFA explicitly not required; warn when only SSO enforces MFA or the flag is not exposed; manual when users or `security` are unreadable |
+| 3 | 2FA for all users | identity_access | BOX-03 | pass when MFA is required with no exempt users; warn on exemptions, SSO-only MFA, or an unexposed flag; fail when MFA is explicitly not required without required SSO; manual when users or `security` are unreadable |
 | 4 | External collaboration restrictions | sharing_collaboration | BOX-04 | pass for `limit_collaboration_to_users_within_enterprise` or allowlisted domains; fail for `enable_external_collaboration` |
 | 5 | Collaboration allowlist audit | sharing_collaboration | BOX-05 | fail on public email domains; warn on entries older than `stale_allowlist_days` or exempt users; pass otherwise |
 | 6 | Sharing link policies | sharing_collaboration | BOX-06 | fail when `shared_link_default_access` is open; warn when open links remain selectable; pass for company or collaborator defaults |
-| 7 | Shared link expiration | sharing_collaboration | BOX-07 | pass when `is_shared_links_expiration_enabled`; warn when only public links expire; fail otherwise |
+| 7 | Shared link expiration | sharing_collaboration | BOX-07 | pass when `is_shared_links_expiration_enabled`; warn when only public links expire or the flag is not exposed; fail when it is false |
 | 8 | Shared link password policy | sharing_collaboration | BOX-08 | manual: the API does not expose the open shared link password requirement |
 | 9 | Watermarking enabled | sharing_collaboration | BOX-09 | pass or fail on `is_watermarking_enterprise_feature_enabled`; warn when the flag is absent |
 | 10 | Device trust and pins | data_governance | BOX-10 | warn when no device pins exist; manual otherwise because the device trust policy is not exposed |
 | 11 | Classification labels | data_governance | BOX-11 | pass when the security classification template defines labels; fail when none exist |
 | 12 | Retention policies | data_governance | BOX-12 | pass when active policies have assignments; warn when unassigned; fail when none exist; manual without Governance access |
 | 13 | Legal hold policies | data_governance | BOX-13 | pass when active holds have assignments; warn when unassigned or none exist; manual without Governance access |
-| 14 | Shield smart access policies | shield_monitoring | BOX-14 | pass when Shield rules exist in the `shield` configuration category; fail when none; manual without Shield access |
+| 14 | Shield smart access policies | shield_monitoring | BOX-14 | pass when Shield rules exist in the `shield` configuration category; fail when the category is readable but empty; manual without Shield access or when the category is null |
 | 15 | Shield information barriers | shield_monitoring | BOX-15 | pass when enabled barriers have segments; warn when disabled, unsegmented, or absent |
 | 16 | Enterprise event streaming | shield_monitoring | BOX-16 | pass when `admin_logs` returns events in the window; warn when empty; manual when unreadable |
 | 17 | Admin role minimization | identity_access | BOX-17 | pass when admin plus co-admin count is at or below `max_admins`; warn above |
@@ -136,7 +136,7 @@ Status semantics: `pass` means the API evidence satisfies the control, `warn` me
 | 22 | Session duration limits | identity_access | BOX-22 | pass when `session_duration` (and any custom duration) is at or below `max_session_hours`; fail above or when unlimited |
 | 23 | IP allowlisting | identity_access | BOX-23 | manual: reports Shield IP lists, enterprise IP restrictions are not exposed |
 | 24 | Inactive user detection | identity_access | BOX-24 | pass when every active managed user has activity events in `lookback_days`; warn or fail on inactive users; warn when the event sample is truncated |
-| 25 | Content access monitoring | shield_monitoring | BOX-25 | pass when anomaly rules or Shield alerts exist; warn when only raw download events exist; fail when neither is present |
+| 25 | Content access monitoring | shield_monitoring | BOX-25 | pass when anomaly rules or Shield alerts exist; warn when only raw download events exist or when Shield rules or the event stream are unreadable; fail when both are readable and neither signal is present |
 
 ## Framework mappings
 

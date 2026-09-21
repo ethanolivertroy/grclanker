@@ -1405,6 +1405,18 @@ function configNumber(configuration: JsonRecord | undefined, category: string, k
   return asNumber(configValue(configuration, category, key));
 }
 
+function categoryReadable(dataset: CollectedDataset<JsonRecord>, category: string): boolean {
+  return !dataset.error && configCategory(dataset.data, category) !== undefined;
+}
+
+function categoryUnreadableReason(dataset: CollectedDataset<JsonRecord>, category: string): string {
+  if (dataset.error) return unreadableReason(dataset);
+  if (dataset.data[category] === null) {
+    return `the ${category} category was returned as null, so Box did not expose these settings for this enterprise`;
+  }
+  return `the ${category} category was missing from the enterprise configuration response`;
+}
+
 function unreadableReason(dataset: CollectedDataset<unknown>): string {
   if (!dataset.error) return "the response did not include the expected data";
   if (dataset.statusCode === 403) return "the audit principal lacks the scope or admin role to read it";
@@ -1599,7 +1611,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const minPasswordLength = clampNumber(options.minPasswordLength, DEFAULT_MIN_PASSWORD_LENGTH, 4, 128);
   const maxSessionHours = clampNumber(options.maxSessionHours, DEFAULT_MAX_SESSION_HOURS, 1, 24 * 365);
   const configuration = data.configuration.error ? undefined : data.configuration.data;
-  const configReadable = configuration !== undefined && Object.keys(configuration).length > 0;
+  const userSettingsReadable = categoryReadable(data.configuration, "user_settings");
+  const securityReadable = categoryReadable(data.configuration, "security");
   const usersReadable = !data.users.error;
   const users = data.users.data;
   const events = data.events.data;
@@ -1617,40 +1630,71 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
 
   const findings: BoxFinding[] = [];
 
+  const ssoEvidence = { is_enterprise_sso_required: ssoRequired ?? null, is_enterprise_sso_in_testing: ssoTesting ?? null };
+  const ssoManualEvidence = "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.";
   findings.push(
-    !configReadable
-      ? finding(1, "manual", `Enterprise SSO configuration could not be read because ${unreadableReason(data.configuration)}.`, { config_error: data.configuration.error ?? null }, "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.")
+    !userSettingsReadable
+      ? finding(1, "manual", `Enterprise SSO configuration could not be read because ${categoryUnreadableReason(data.configuration, "user_settings")}.`, { ...ssoEvidence, config_error: data.configuration.error ?? null }, ssoManualEvidence)
       : ssoRequired === true && ssoTesting !== true
-        ? finding(1, "pass", "Enterprise settings expose SSO as required for all users and not in testing mode.", { is_enterprise_sso_required: ssoRequired, is_enterprise_sso_in_testing: ssoTesting ?? null })
+        ? finding(1, "pass", "Enterprise settings expose SSO as required for all users and not in testing mode.", ssoEvidence)
         : ssoRequired === true
-          ? finding(1, "warn", "SSO is marked required but the enterprise is still in SSO testing mode, so users can bypass the identity provider.", { is_enterprise_sso_required: ssoRequired, is_enterprise_sso_in_testing: ssoTesting })
-          : finding(1, "fail", "Enterprise settings do not expose SSO as required, so Box passwords remain a valid sign-in path.", { is_enterprise_sso_required: ssoRequired ?? null, is_enterprise_sso_in_testing: ssoTesting ?? null }),
+          ? finding(1, "warn", "SSO is marked required but the enterprise is still in SSO testing mode, so users can bypass the identity provider.", ssoEvidence)
+          : ssoRequired === false
+            ? finding(1, "fail", "Enterprise settings report SSO as not required, so Box passwords remain a valid sign-in path.", ssoEvidence)
+            : finding(1, "warn", "Enterprise user settings were readable but did not expose is_enterprise_sso_required, so SSO enforcement cannot be confirmed from the API.", ssoEvidence, ssoManualEvidence),
   );
 
+  const mfaState = mfaRequired === true ? "required" : mfaRequired === false ? "not required" : "not exposed";
+  const adminMfaEvidence = {
+    is_multi_factor_auth_required: mfaRequired ?? null,
+    multi_factor_auth_type: mfaType ?? null,
+    is_enterprise_sso_required: ssoRequired ?? null,
+    privileged_users: privileged.length,
+    exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)),
+  };
+  const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
   findings.push(
-    !configReadable && !usersReadable
+    !securityReadable && !usersReadable
       ? adminMfaUnreadableFinding(data)
-      : mfaRequired === true && exemptPrivileged.length === 0
-        ? finding(2, "pass", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, { is_multi_factor_auth_required: true, multi_factor_auth_type: mfaType ?? null, privileged_users: privileged.length })
-        : mfaRequired === true
-          ? finding(2, "fail", `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, { exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)), privileged_users: privileged.length })
-          : !configReadable
-            ? finding(2, "manual", `Enterprise MFA settings could not be read because ${unreadableReason(data.configuration)}; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, { exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)), privileged_users: privileged.length }, "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.")
-            : ssoRequired === true
-              ? finding(2, "warn", "Box-native MFA is not required; admin MFA depends entirely on the identity provider enforced through required SSO.", { is_multi_factor_auth_required: mfaRequired ?? null, is_enterprise_sso_required: true, privileged_users: privileged.length }, "Confirm the SSO identity provider enforces phishing-resistant MFA for every Box admin and co-admin.")
-              : finding(2, "fail", `Multi-factor authentication is not required for managed users, leaving ${privileged.length} admin or co-admin accounts without an enforced second factor.`, { is_multi_factor_auth_required: mfaRequired ?? null, is_enterprise_sso_required: ssoRequired ?? null, privileged_users: privileged.length }),
+      : !usersReadable
+        ? finding(2, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so admin and co-admin exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}${mfaType ? ` (${mfaType})` : ""}.`, { ...adminMfaEvidence, users_error: data.users.error ?? null }, adminMfaManualEvidence)
+        : !securityReadable
+          ? finding(2, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
+          : mfaRequired === true
+            ? exemptPrivileged.length === 0
+              ? finding(2, "pass", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, adminMfaEvidence)
+              : finding(2, "fail", `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, adminMfaEvidence)
+            : mfaRequired === undefined
+              ? finding(2, "warn", `Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so admin MFA enforcement cannot be confirmed from the API; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
+              : ssoRequired === true
+                ? finding(2, "warn", "Box-native MFA is not required; admin MFA depends entirely on the identity provider enforced through required SSO.", adminMfaEvidence, "Confirm the SSO identity provider enforces phishing-resistant MFA for every Box admin and co-admin.")
+                : finding(2, "fail", `Multi-factor authentication is not required for managed users, leaving ${privileged.length} admin or co-admin accounts without an enforced second factor.`, adminMfaEvidence),
   );
 
+  const userMfaEvidence = {
+    is_multi_factor_auth_required: mfaRequired ?? null,
+    multi_factor_auth_type: mfaType ?? null,
+    is_enterprise_sso_required: ssoRequired ?? null,
+    sampled_users: users.length,
+    exempt_users: truncateList(exemptUsers.map(userLabel)),
+  };
+  const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
   findings.push(
-    !configReadable
-      ? finding(3, "manual", `Enterprise MFA settings could not be read because ${unreadableReason(data.configuration)}.`, { exempt_users: exemptUsers.length }, "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.")
-      : mfaRequired === true && exemptUsers.length === 0
-        ? finding(3, "pass", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, { is_multi_factor_auth_required: true, sampled_users: users.length })
-        : mfaRequired === true
-          ? finding(3, "warn", `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, { exempt_users: truncateList(exemptUsers.map(userLabel)), sampled_users: users.length })
-          : ssoRequired === true
-            ? finding(3, "warn", "Box-native MFA is not required for all users; MFA coverage depends on the identity provider enforced through required SSO.", { is_multi_factor_auth_required: mfaRequired ?? null, is_enterprise_sso_required: true }, "Confirm the SSO identity provider enforces MFA for every Box user population, including service and app users that sign in with passwords.")
-            : finding(3, "fail", "Multi-factor authentication is not required enterprise-wide and SSO is not required, so password-only sign-in is possible.", { is_multi_factor_auth_required: mfaRequired ?? null, is_enterprise_sso_required: ssoRequired ?? null }),
+    !securityReadable && !usersReadable
+      ? finding(3, "manual", `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
+      : !usersReadable
+        ? finding(3, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so per-user exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}${mfaType ? ` (${mfaType})` : ""}.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
+        : !securityReadable
+          ? finding(3, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, userMfaEvidence, userMfaManualEvidence)
+          : mfaRequired === true
+            ? exemptUsers.length === 0
+              ? finding(3, "pass", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, userMfaEvidence)
+              : finding(3, "warn", `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, userMfaEvidence)
+            : mfaRequired === undefined
+              ? finding(3, "warn", "Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so MFA enforcement cannot be confirmed from the API.", userMfaEvidence, userMfaManualEvidence)
+              : ssoRequired === true
+                ? finding(3, "warn", "Box-native MFA is not required for all users; MFA coverage depends on the identity provider enforced through required SSO.", userMfaEvidence, "Confirm the SSO identity provider enforces MFA for every Box user population, including service and app users that sign in with passwords.")
+                : finding(3, "fail", `Multi-factor authentication is not required enterprise-wide and ${ssoRequired === false ? "SSO is not required, so password-only sign-in is possible" : "SSO enforcement could not be read, so password-only sign-in may be possible"}.`, userMfaEvidence),
   );
 
   const adminRoleChanges = events.filter((event) => eventType(event) === "CHANGE_ADMIN_ROLE");
@@ -1691,8 +1735,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   };
   const complexityCount = [passwordUppercase, passwordNumeric, passwordSpecial].filter((value) => (value ?? 0) > 0).length;
   findings.push(
-    !configReadable
-      ? finding(21, "manual", `Enterprise password settings could not be read because ${unreadableReason(data.configuration)}.`, undefined, "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.")
+    !securityReadable
+      ? finding(21, "manual", `Enterprise password settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.")
       : passwordMinLength === undefined
         ? finding(21, "warn", "Enterprise password settings were readable but did not expose a minimum password length.", passwordEvidence)
         : passwordMinLength >= minPasswordLength && weakPasswordPrevention === true && complexityCount >= 2
@@ -1715,8 +1759,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     max_session_hours: maxSessionHours,
   };
   findings.push(
-    !configReadable
-      ? finding(22, "manual", `Enterprise session settings could not be read because ${unreadableReason(data.configuration)}.`, undefined, "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.")
+    !securityReadable
+      ? finding(22, "manual", `Enterprise session settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.")
       : sessionDuration === undefined
         ? finding(22, "warn", "Enterprise session settings were readable but did not expose a session duration value.", sessionEvidence)
         : sessionHours === undefined
@@ -1796,8 +1840,8 @@ function adminMfaUnreadableFinding(data: BoxIdentityData): BoxFinding {
   return finding(
     2,
     "manual",
-    `Neither enterprise MFA settings (${unreadableReason(data.configuration)}) nor enterprise users (${unreadableReason(data.users)}) could be read.`,
-    undefined,
+    `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`,
+    { config_error: data.configuration.error ?? null, users_error: data.users.error ?? null },
     "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required, then review each admin and co-admin for the 'Exempt from 2-step verification' option.",
   );
 }
@@ -1839,7 +1883,8 @@ export async function collectBoxSharingData(
 export function assessBoxSharingCollaborationData(data: BoxSharingData, options: BoxSharingOptions = {}): BoxAssessmentResult {
   const staleDays = clampNumber(options.staleAllowlistDays, DEFAULT_STALE_ALLOWLIST_DAYS, 1, 3650);
   const configuration = data.configuration.error ? undefined : data.configuration.data;
-  const configReadable = configuration !== undefined && Object.keys(configuration).length > 0;
+  const configReadable = categoryReadable(data.configuration, "content_and_sharing");
+  const configUnreadableReason = categoryUnreadableReason(data.configuration, "content_and_sharing");
   const allowlistReadable = !data.allowlistEntries.error;
   const entries = data.allowlistEntries.data;
   const exemptTargets = data.exemptTargets.data;
@@ -1859,8 +1904,8 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   findings.push(
     !configReadable
       ? allowlistReadable && entries.length > 0
-        ? finding(4, "warn", `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${unreadableReason(data.configuration)}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
-        : finding(4, "manual", `External collaboration settings could not be read because ${unreadableReason(data.configuration)}.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.")
+        ? finding(4, "warn", `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${configUnreadableReason}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
+        : finding(4, "manual", `External collaboration settings could not be read because ${configUnreadableReason}.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.")
       : externalStatus === "limit_collaboration_to_users_within_enterprise"
         ? finding(4, "pass", "External collaboration is limited to users within the enterprise.", externalEvidence)
         : externalStatus === "limit_collaboration_to_allowlisted_domains"
@@ -1907,7 +1952,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   };
   findings.push(
     !configReadable
-      ? finding(6, "manual", `Shared link settings could not be read because ${unreadableReason(data.configuration)}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.")
+      ? finding(6, "manual", `Shared link settings could not be read because ${configUnreadableReason}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.")
       : accessLevelIsOpen(sharedLinkDefault)
         ? finding(6, "fail", `The default shared link access level "${sharedLinkDefault}" creates public links.`, linkEvidence)
         : accessLevelIsRestricted(sharedLinkDefault)
@@ -1930,12 +1975,14 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   };
   findings.push(
     !configReadable
-      ? finding(7, "manual", `Shared link expiration settings could not be read because ${unreadableReason(data.configuration)}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.")
+      ? finding(7, "manual", `Shared link expiration settings could not be read because ${configUnreadableReason}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.")
       : expirationEnabled === true
         ? finding(7, "pass", `Shared links expire automatically after ${expirationDays ?? "a configured number of"} days.`, expirationEvidence)
         : publicExpirationEnabled === true
           ? finding(7, "warn", `Only public shared links expire automatically (${publicExpirationDays ?? "configured"} days); company and collaborator links have no mandatory expiration.`, expirationEvidence)
-          : finding(7, "fail", "Shared links do not have a mandatory expiration configured.", expirationEvidence),
+          : expirationEnabled === false
+            ? finding(7, "fail", "Shared links do not have a mandatory expiration configured.", expirationEvidence)
+            : finding(7, "warn", "Enterprise settings did not expose is_shared_links_expiration_enabled, so shared link expiration cannot be confirmed from the API.", expirationEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count."),
   );
 
   findings.push(
@@ -1944,7 +1991,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       "manual",
       configReadable
         ? "The enterprise configuration API does not expose whether passwords are required for open shared links."
-        : `Shared link settings could not be read (${unreadableReason(data.configuration)}) and the API does not expose shared link password requirements.`,
+        : `Shared link settings could not be read (${configUnreadableReason}) and the API does not expose shared link password requirements.`,
       { is_strong_password_for_ext_collab_enabled: configBool(configuration, "security", "is_strong_password_for_ext_collab_enabled") ?? null, shared_link_default_access: sharedLinkDefault ?? null },
       "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm 'Require password for open shared links' (or equivalent) is enabled and record the password strength setting.",
     ),
@@ -1961,7 +2008,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   };
   findings.push(
     !configReadable
-      ? finding(9, "manual", `Watermarking settings could not be read because ${unreadableReason(data.configuration)}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.")
+      ? finding(9, "manual", `Watermarking settings could not be read because ${configUnreadableReason}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.")
       : watermarkingEnabled === true
         ? finding(9, "pass", "Watermarking is enabled as an enterprise feature; confirm sensitive folders and classifications apply it.", watermarkEvidence, "Spot check sensitive folders for the watermark setting and confirm classification policies apply watermarks where required.")
         : watermarkingEnabled === false
@@ -2252,8 +2299,11 @@ export async function collectBoxShieldData(
 
 export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmentResult {
   const configuration = data.configuration.error ? undefined : data.configuration.data;
+  const shieldReadable = categoryReadable(data.configuration, "shield");
+  const shieldUnreadableReason = categoryUnreadableReason(data.configuration, "shield");
   const shieldRules = asRecordArray(configCategory(configuration, "shield")?.shield_rules);
   const events = data.events.data;
+  const eventsReadable = !data.events.error;
   const eventCounts = countEventTypes(events);
   const findings: BoxFinding[] = [];
 
@@ -2265,8 +2315,8 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     shield_events: Object.fromEntries(Object.entries(eventCounts).filter(([type]) => type.startsWith("SHIELD_"))),
   };
   findings.push(
-    data.configuration.error
-      ? finding(14, "manual", `Shield rule configuration could not be read because ${unreadableReason(data.configuration)}; Box Shield licensing and the manage_enterprise_properties scope are required.`, ruleEvidence, "Admin Console > Shield > Access Policies and Threat Detection Rules: record each policy, its scope (classification, user, group), and the enabled anomaly detectors.")
+    !shieldReadable
+      ? finding(14, "manual", `Shield rule configuration could not be read because ${shieldUnreadableReason}; Box Shield licensing and the manage_enterprise_properties scope are required.`, ruleEvidence, "Admin Console > Shield > Access Policies and Threat Detection Rules: record each policy, its scope (classification, user, group), and the enabled anomaly detectors.")
       : shieldRules.length > 0
         ? finding(14, "pass", `${shieldRules.length} Shield rules are configured across ${Object.keys(ruleCategories).length} categories.`, ruleEvidence)
         : finding(14, "fail", "No Shield smart access or threat detection rules are configured.", ruleEvidence),
@@ -2315,17 +2365,24 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const monitoringEvidence = {
     anomaly_events: anomalyEvents.length,
     content_access_events: accessEvents.length,
-    anomaly_detection_rules: anomalyRules.length,
+    anomaly_detection_rules: shieldReadable ? anomalyRules.length : null,
+    shield_rules_error: shieldReadable ? null : shieldUnreadableReason,
+    events_error: data.events.error ?? null,
     lookback_days: data.lookbackDays,
   };
+  const monitoringManualEvidence = "Admin Console > Shield > Threat Detection: confirm anomalous download, session, and location detection rules are enabled and alerts route to the security team.";
   findings.push(
-    data.events.error && data.configuration.error
-      ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, "Admin Console > Shield > Threat Detection: confirm anomalous download, session, and location detection rules are enabled and alerts route to the security team.")
+    !eventsReadable && !shieldReadable
+      ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
       : anomalyRules.length > 0 || anomalyEvents.length > 0
         ? finding(25, "pass", `${anomalyRules.length} Shield anomaly detection rules and ${anomalyEvents.length} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
-        : accessEvents.length > 0
-          ? finding(25, "warn", `${accessEvents.length} download and preview events are recorded, but no Shield anomaly rules or alerts were observed, so detection depends on external analytics.`, monitoringEvidence, "Confirm the SIEM applies anomaly detection to Box download and preview events, or enable Shield threat detection rules.")
-          : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
+        : !shieldReadable
+          ? finding(25, "warn", `Shield rule configuration could not be read because ${shieldUnreadableReason}, and no Shield alert or block events were observed among ${accessEvents.length} download and preview events; detection may depend on external analytics.`, monitoringEvidence, monitoringManualEvidence)
+          : !eventsReadable
+            ? finding(25, "warn", `No Shield anomaly detection rules exist and the enterprise event stream could not be read (${unreadableReason(data.events)}), so content access monitoring cannot be confirmed from the API.`, monitoringEvidence, monitoringManualEvidence)
+            : accessEvents.length > 0
+              ? finding(25, "warn", `${accessEvents.length} download and preview events are recorded, but no Shield anomaly rules or alerts were observed, so detection depends on external analytics.`, monitoringEvidence, "Confirm the SIEM applies anomaly detection to Box download and preview events, or enable Shield threat detection rules.")
+              : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
   );
 
   return {
