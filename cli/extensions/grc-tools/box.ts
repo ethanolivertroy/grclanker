@@ -1711,7 +1711,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const mfaUnused = unusedSettings(mfaSettings, ["is_multi_factor_auth_required"]);
   const mfaState = hasUnusedSettings(mfaUnused)
     ? "reported but not in use (is_used false)"
-    : mfaRequired === true ? "required" : mfaRequired === false ? "not required" : "not exposed";
+    : mfaRequired === true
+      ? `required${mfaType ? ` (${mfaType})` : ""}`
+      : mfaRequired === false ? "not required" : "not exposed";
   const adminMfaEvidence = {
     is_multi_factor_auth_required: mfaRequired ?? null,
     multi_factor_auth_type: mfaType ?? null,
@@ -1726,7 +1728,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     !securityReadable && !usersReadable
       ? adminMfaUnreadableFinding(data)
       : !usersReadable
-        ? finding(2, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so admin and co-admin exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}${mfaType ? ` (${mfaType})` : ""}.`, { ...adminMfaEvidence, users_error: data.users.error ?? null }, adminMfaManualEvidence)
+        ? finding(2, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so admin and co-admin exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}.`, { ...adminMfaEvidence, users_error: data.users.error ?? null }, adminMfaManualEvidence)
         : !securityReadable
           ? finding(2, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
           : hasUnusedSettings(mfaUnused)
@@ -1756,7 +1758,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     !securityReadable && !usersReadable
       ? finding(3, "manual", `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
       : !usersReadable
-        ? finding(3, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so per-user exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}${mfaType ? ` (${mfaType})` : ""}.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
+        ? finding(3, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so per-user exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
         : !securityReadable
           ? finding(3, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, userMfaEvidence, userMfaManualEvidence)
           : hasUnusedSettings(mfaUnused)
