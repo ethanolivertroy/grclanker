@@ -263,7 +263,7 @@ test("SplunkApiClient logs in for a session key when only username and password 
   assert.equal(seen[0].method, "POST");
   assert.match(String(seen[0].body), /username=svc/);
   assert.equal(seen[1].auth, "Splunk session-key-abc");
-  assert.equal(api.redact("Authorization: Splunk session-key-abc password pw-secret"), "Authorization: Splunk [REDACTED] password [REDACTED]");
+  assert.equal(api.redact("Authorization: Splunk session-key-abc password pw-secret"), "Authorization: [REDACTED] [REDACTED] password [REDACTED]");
 });
 
 test("SplunkApiClient calls ACS with the ACS bearer token and retries 429 responses", async () => {
@@ -898,7 +898,7 @@ test("rule 9: the exported bundle, the zip, the assess payloads, and the access 
   assert.equal(s2s.status, "pass");
   assert.ok(s2s.evidence.listeners.every((listener) => listener.tlsStanza === undefined), "raw [splunktcp-ssl:<port>] stanza is not evidence");
   assert.equal(s2s.evidence.listeners[0].tls.requireClientCert, "1");
-  assert.match(files.get("_errors.log"), /non-JSON response body \(\d+ bytes, not recorded\)/);
+  assert.match(files.get("_errors.log"), /failed \(400\): non-JSON body \(text\/html, \d+ bytes\)/);
 
   const payloads = JSON.stringify([...(await runAllAssessments(api)), await checkSplunkAccess(api)]);
   for (const secret of secrets) {
@@ -1048,6 +1048,97 @@ test("rule 1 corollary: each multi-inventory finding drops below pass and names 
   assert.equal(byId(cloudData, "SPLUNK-DP-16").status, "warn");
   assert.match(byId(cloudData, "SPLUNK-DP-16").summary, /classified as Splunk Cloud from the URL heuristic \(the URL matches \*\.splunkcloud\.com\)/);
   assert.equal(byId(cloudData, "SPLUNK-DP-16").evidence.source, "acs:/inputs/http-event-collectors");
+});
+
+const SURFACE_CANARIES = ["CANARY_BEARER_S1", "CANARY_SESSION_S1", "CANARY_APIKEY_S1", "CANARY_URL_TOKEN_S1"];
+const SURFACE_HTML_BODY = "<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_S1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_S1; Path=/</p><p>api_key=CANARY_APIKEY_S1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 later.</p></body></html>";
+const SURFACE_JSON_BODY = {
+  messages: [{ type: "ERROR", text: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 for this key; Authorization: Bearer CANARY_BEARER_S1; api_key=CANARY_APIKEY_S1; session_id=CANARY_SESSION_S1" }],
+};
+
+function endpointOf(url) {
+  return url.hostname === "admin.splunk.com" ? `acs:${url.pathname.replace(/^\/[^/]+\/adminconfig\/v2/, "")}` : url.pathname;
+}
+
+/** Like forbidding(), but the failing endpoint answers with a 502 HTML page or a 403 JSON body that both carry the canaries; records every endpoint requested. */
+function failingWith(fixture, endpoint, variant, options = {}, configOverrides = {}) {
+  const { fetchImpl } = createFetch(fixture, options);
+  const seen = [];
+  const wrapped = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const target = endpointOf(url);
+    seen.push(target);
+    if (endpoint !== undefined && target === endpoint) {
+      return variant === "html"
+        ? new Response(SURFACE_HTML_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } })
+        : new Response(JSON.stringify(SURFACE_JSON_BODY), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+    }
+    return fetchImpl(input, init);
+  };
+  return { client: new SplunkApiClient(sampleConfig(configOverrides), { fetchImpl: wrapped, retryDelayMs: 0, retryAttempts: 1 }), seen };
+}
+
+test("rule 9: every Splunk surface that fails with a 502 HTML page or a JSON error embedding a token URL records only a scrubbed error, on every output", async () => {
+  const cloud = { ...HARDENED, "/services/server/info": [entry("server-info", { version: "9.3.2411", product_type: "splunk_cloud", instance_type: "cloud" })] };
+  const acs = {
+    "/inputs/http-event-collectors": { "http-event-collectors": [{ spec: { name: "firehose", allowedIndexes: ["main"], defaultSourcetype: "aws:firehose", disabled: false, useACK: true } }] },
+    "/access/search-api/ipallowlists": { subnets: ["10.0.0.0/8"] },
+    "/access/hec/ipallowlists": { subnets: ["10.0.0.0/8"] },
+    "/access/s2s/ipallowlists": { subnets: ["10.0.0.0/8"] },
+    "/access/search-ui/ipallowlists": { subnets: ["10.0.0.0/8"] },
+  };
+  const acsConfig = { url: "https://acme.splunkcloud.com:8089", stack: "acme-stack", acsToken: "acs-jwt-token-value" };
+  const base = createTempBase("grclanker-splunk-surface-canaries-");
+
+  const discovery = failingWith(cloud, undefined, "html", { acs }, acsConfig);
+  const healthyAccess = await checkSplunkAccess(discovery.client);
+  assert.equal(healthyAccess.surfaces.filter((surface) => surface.status === "not_readable").length, 0, "the healthy fixture serves every probe");
+  await runAllAssessments(discovery.client);
+  const endpoints = [...new Set(discovery.seen)].filter((endpoint) => endpoint !== "/services/auth/login");
+  assert.ok(endpoints.length >= 18, `every access check probe, collector, ACS path, and the audit search are discovered (${endpoints.length})`);
+
+  for (const endpoint of endpoints) {
+    for (const variant of ["html", "json"]) {
+      const label = `${endpoint} (${variant})`;
+      const access = await checkSplunkAccess(failingWith(cloud, endpoint, variant, { acs }, acsConfig).client);
+      const results = await runAllAssessments(failingWith(cloud, endpoint, variant, { acs }, acsConfig).client);
+      const exported = await exportSplunkAuditBundle(failingWith(cloud, endpoint, variant, { acs }, acsConfig).client, sampleConfig(acsConfig), base);
+      const files = readBundleFiles(exported.outputDir);
+
+      const outputs = new Map([
+        [`${label} check_access`, JSON.stringify(access)],
+        ...results.map((result) => [`${label} assess ${result.title}`, JSON.stringify(result)]),
+        ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
+      ]);
+      assertSecretsAbsent(assert, outputs, SURFACE_CANARIES, label);
+
+      // Wherever the error lands (access surface, errors array, a finding
+      // summary quoting the cause, _errors.log), every string derived from
+      // the 502 carries the status-and-length note and every string derived
+      // from the JSON message keeps only scheme, host, and path of the URL.
+      // The markdown tables truncate columns by design, so the note count is
+      // taken over the structured outputs and the error log.
+      const serialized = [...outputs.values()].join("\n");
+      const structured = [...outputs].filter(([name]) => !name.endsWith(".md")).map(([, content]) => content).join("\n");
+      if (variant === "html") {
+        const statusMentions = structured.match(/502 Bad Gateway\)/g) ?? [];
+        const noted = structured.match(/502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/g) ?? [];
+        assert.ok(noted.length >= 1, `${label}: the failing surface is recorded with the status-and-length note`);
+        assert.equal(statusMentions.length, noted.length, `${label}: every error string derived from the 502 carries the note`);
+      } else {
+        assert.match(serialized, /\(403/, `${label}: the failing surface is recorded as denied`);
+        for (const mention of serialized.match(/https:\/\/api\.example\.com[^\s"\\)]*/g) ?? []) {
+          assert.equal(mention, "https://api.example.com/v1/x", `${label}: the URL keeps scheme, host, and path only`);
+        }
+        assert.doesNotMatch(serialized, /Authorization: Bearer (?!\[REDACTED\])/, `${label}: no authorization value survives`);
+      }
+    }
+  }
+
+  const noContext = await checkSplunkAccess(failingWith(cloud, "/services/authentication/current-context", "json", { acs }, acsConfig).client);
+  assert.equal(noContext.capabilities, null, "an unread capability list renders null, not []");
+  assert.match(noContext.notes[1], /an unread capability list/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

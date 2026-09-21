@@ -94,7 +94,8 @@ export interface SplunkAccessCheckResult {
   url: string;
   deployment: SplunkDeploymentInfo;
   authenticatedAs?: string;
-  capabilities: string[];
+  /** Null when current-context was unreadable, so an unread capability list never renders as empty. */
+  capabilities: string[] | null;
   missingCapabilities: string[];
   acsConfigured: boolean;
   surfaces: SplunkAccessSurface[];
@@ -302,6 +303,57 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const URL_IN_TEXT_PATTERN = /https?:\/\/[^\s"'<>`]+/gi;
+const AUTHORIZATION_SCHEME_PATTERN = /\b(Basic|Bearer|Splunk|Token|Digest|Negotiate)\s+(?!\[REDACTED\])[A-Za-z0-9._~+/=-]{8,}/g;
+const JWT_IN_TEXT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g;
+const SECRET_PAIR_PATTERN =
+  /\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|passphrase|api[_-]?key|access[_-]?key|private[_-]?key|session(?:[_-]?(?:id|key|token))?|cookie|authorization|credential|signature)[A-Za-z0-9_.-]*)(["']?\s*[=:]\s*)(["']?)(?!\[REDACTED\])([^\s"'&;,<>)\]}]+)/gi;
+
+/** Reduces a URL found anywhere in prose to scheme, host, and path. */
+function scrubUrlInText(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@\s]*@)/i, "$1").replace(/[?#][\s\S]*$/, "");
+}
+
+/**
+ * The single redaction pass for error text: configured secrets, URLs with
+ * userinfo or query strings anywhere in the string, authorization scheme
+ * values, JWT-shaped strings, and secret-bearing key-value pairs.
+ * SplunkApiError applies it to every message it is built with, and collect()
+ * and readableSurface() apply it again where errors are recorded.
+ */
+export function scrubErrorText(text: string, secrets: Array<string | undefined> = []): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    if (secret && secret.length >= 4) scrubbed = scrubbed.split(secret).join("[REDACTED]");
+  }
+  return scrubbed
+    .replace(URL_IN_TEXT_PATTERN, (url) => scrubUrlInText(url))
+    .replace(AUTHORIZATION_SCHEME_PATTERN, "$1 [REDACTED]")
+    .replace(JWT_IN_TEXT_PATTERN, "[REDACTED]")
+    .replace(SECRET_PAIR_PATTERN, "$1$2$3[REDACTED]");
+}
+
+/** Describes a response body that is not JSON without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
+}
+
+interface ParsedResponseBody {
+  payload: JsonRecord;
+  /** Set when the body was not a JSON object; the text itself is never kept. */
+  nonJsonBody?: string;
+}
+
+function parseResponseBody(response: Response, rawText: string): ParsedResponseBody {
+  if (rawText.length === 0) return { payload: {} };
+  try {
+    return { payload: asObject(JSON.parse(rawText)) ?? {} };
+  } catch {
+    return { payload: {}, nonJsonBody: describeNonJsonBody(response, rawText) };
+  }
+}
+
 function errorStatus(error: unknown): number | undefined {
   const status = asNumber(asObject(error)?.status ?? asObject(error)?.httpStatus);
   return status;
@@ -470,11 +522,36 @@ export class SplunkApiError extends Error {
   readonly status?: number;
   readonly endpoint: string;
 
+  /**
+   * The message is scrubbed here as well as at the record point, so an error
+   * built anywhere in the client never carries a credential even if a caller
+   * stores error.message directly.
+   */
   constructor(message: string, endpoint: string, status?: number) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "SplunkApiError";
     this.status = status;
     this.endpoint = endpoint;
+  }
+
+  /**
+   * Builds the error for a response that cannot be used: a body that is not
+   * JSON becomes a status-and-length note whatever its content type, a JSON
+   * body contributes only splunkd's documented messages[].text (or message)
+   * field, and the configured secrets are removed before the pattern pass.
+   */
+  static fromResponse(endpoint: string, response: Response, body: ParsedResponseBody, secrets: Array<string | undefined>): SplunkApiError {
+    const messages = asArray(body.payload.messages)
+      .map((item) => asString(asObject(item)?.text))
+      .filter((item): item is string => Boolean(item));
+    const detail = body.nonJsonBody ?? (messages.join("; ") || asString(body.payload.message) || "");
+    const outcome = response.ok ? "returned an unreadable response" : "failed";
+    const statusLine = `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+    return new SplunkApiError(
+      scrubErrorText(`Splunk request to ${endpoint} ${outcome} (${statusLine})${detail ? `: ${detail}` : ""}`, secrets),
+      endpoint,
+      response.status,
+    );
   }
 }
 
@@ -582,14 +659,12 @@ export class SplunkApiClient {
     return Boolean(this.config.stack && this.config.acsToken);
   }
 
+  private configuredSecrets(): Array<string | undefined> {
+    return [this.config.token, this.config.password, this.config.acsToken, this.sessionKey];
+  }
+
   redact(text: string): string {
-    let output = text;
-    for (const secret of [this.config.token, this.config.password, this.config.acsToken, this.sessionKey]) {
-      if (secret && secret.length >= 4) output = output.split(secret).join("[REDACTED]");
-    }
-    return output
-      .replace(/(Authorization:\s*(?:Bearer|Splunk)\s+)\S+/gi, "$1[REDACTED]")
-      .replace(/("?sessionKey"?\s*[:=]\s*"?)[^"\s,}]+/gi, "$1[REDACTED]");
+    return scrubErrorText(text, this.configuredSecrets());
   }
 
   private buildUrl(base: string, path: string, query: JsonRecord): string {
@@ -628,28 +703,15 @@ export class SplunkApiClient {
   }
 
   private async readJson(response: Response, endpoint: string): Promise<JsonRecord> {
-    const rawText = await response.text();
-    let payload: JsonRecord = {};
-    let nonJsonBytes = 0;
-    if (rawText.length > 0) {
-      try {
-        payload = asObject(JSON.parse(rawText)) ?? {};
-      } catch {
-        nonJsonBytes = rawText.length;
-      }
+    // A body that is not JSON (a proxy error page, an HTML sign-in form) is
+    // never copied into an error string: SplunkApiError.fromResponse
+    // describes it by content type and size only, and a 2xx non-JSON body is
+    // an unreadable surface rather than an empty inventory.
+    const body = parseResponseBody(response, await response.text());
+    if (!response.ok || body.nonJsonBody !== undefined) {
+      throw SplunkApiError.fromResponse(endpoint, response, body, this.configuredSecrets());
     }
-    if (!response.ok) {
-      const messages = asArray(payload.messages)
-        .map((item) => asString(asObject(item)?.text))
-        .filter((item): item is string => Boolean(item));
-      const detail = messages.join("; ") || asString(payload.message) || (nonJsonBytes > 0 ? `non-JSON response body (${nonJsonBytes} bytes, not recorded)` : "");
-      throw new SplunkApiError(
-        this.redact(`Splunk request to ${endpoint} failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
-        endpoint,
-        response.status,
-      );
-    }
-    return payload;
+    return body.payload;
   }
 
   private async login(): Promise<string> {
@@ -879,16 +941,27 @@ export type SplunkInspectorClient = Pick<
   | "acsListAll"
 >;
 
-async function collect<T>(load: () => Promise<T>): Promise<Collected<T>> {
+function configuredSecretsOf(client: SplunkInspectorClient): Array<string | undefined> {
+  const config = client.getResolvedConfig();
+  return [config.token, config.password, config.acsToken];
+}
+
+/**
+ * Every dataset error is recorded here (and in readableSurface for the access
+ * check) and nowhere else, so this is where the redaction pass has to run
+ * for findings and the bundle, whichever constructor or throw site built the
+ * message.
+ */
+async function collect<T>(client: SplunkInspectorClient, load: () => Promise<T>): Promise<Collected<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
-    return { ok: false, error: errorMessage(error), httpStatus: errorStatus(error) };
+    return { ok: false, error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)), httpStatus: errorStatus(error) };
   }
 }
 
 async function collectOptionalConf(client: SplunkInspectorClient, file: string): Promise<Collected<SplunkListResult>> {
-  const result = await collect(() => client.getConfStanzas(file));
+  const result = await collect(client, () => client.getConfStanzas(file));
   if (!result.ok && result.httpStatus === 404) {
     return { ok: true, value: EMPTY_LIST };
   }
@@ -1068,7 +1141,7 @@ function summarizeStatuses(findings: SplunkFinding[]): JsonRecord {
 }
 
 async function loadDeployment(client: SplunkInspectorClient): Promise<{ info: SplunkDeploymentInfo; collected: Collected<SplunkEntry | undefined> }> {
-  const collected = await collect(() => client.getServerInfo());
+  const collected = await collect(client, () => client.getServerInfo());
   return { info: deploymentInfoFrom(collected.ok ? collected.value : undefined, client.getResolvedConfig().url), collected };
 }
 
@@ -1085,12 +1158,12 @@ export async function assessSplunkAuthentication(
   const maxSessionMinutes = clampNumber(options.maxSessionMinutes, DEFAULT_MAX_SESSION_MINUTES, 1, 100_000);
   const deployment = await loadDeployment(client);
   const [authConf, webConf, serverConf, users, tokens, roles] = await Promise.all([
-    collect(() => client.getConfStanzas("authentication")),
-    collect(() => client.getConfStanzas("web")),
-    collect(() => client.getConfStanzas("server")),
-    collect(() => client.listUsers()),
-    collect(() => client.listTokens()),
-    collect(() => client.listRoles()),
+    collect(client, () => client.getConfStanzas("authentication")),
+    collect(client, () => client.getConfStanzas("web")),
+    collect(client, () => client.getConfStanzas("server")),
+    collect(client, () => client.listUsers()),
+    collect(client, () => client.listTokens()),
+    collect(client, () => client.listRoles()),
   ]);
   const findings: SplunkFinding[] = [];
 
@@ -1102,7 +1175,7 @@ export async function assessSplunkAuthentication(
   } else if (!authStanza || !authType) {
     findings.push(finding(1, "manual", "Unknown: authentication.conf was readable but the [authentication] stanza or its authType setting was absent; the documented default authType is Splunk (local), so confirm the effective authentication scheme manually.", inventoryNote(authConf.value)));
   } else if (authType === "SAML" || authType === "LDAP") {
-    const providers = authType === "SAML" ? await collect(() => client.listSamlProviders()) : await collect(() => client.listLdapProviders());
+    const providers = authType === "SAML" ? await collect(client, () => client.listSamlProviders()) : await collect(client, () => client.listLdapProviders());
     const settingsNames = asStringList(authStanza.authSettings);
     const providerStanzas = settingsNames.map((name) => stanza(authConf.value, name)).filter((item): item is JsonRecord => Boolean(item));
     const disabledProviders = providerStanzas.filter((item) => asBoolean(item.disabled) === true);
@@ -1111,7 +1184,7 @@ export async function assessSplunkAuthentication(
       auth_type: authType,
       auth_settings: settingsNames,
       provider_endpoint_readable: providers.ok,
-      provider_entries: providers.ok ? providers.value.entries.map((entry) => entry.name) : [],
+      provider_entries: providers.ok ? providers.value.entries.map((entry) => entry.name) : null,
       provider_stanzas_in_conf: providerStanzas.length,
       disabled_provider_stanzas: disabledProviders.length,
       local_splunk_users: users.ok ? localUsers.map((user) => user.name).slice(0, 50) : null,
@@ -1174,8 +1247,8 @@ export async function assessSplunkAuthentication(
     findings.push(manualUnreadable(3, "/services/configs/conf-authentication", authConf, "authentication.conf externalTwoFactorAuthVendor and the Duo or RSA stanza, or the SAML IdP MFA policy."));
   } else if (mfaVendor && /duo|rsa/i.test(mfaVendor)) {
     const vendorEndpoint = /duo/i.test(mfaVendor) ? "Duo-MFA" : "Rsa-MFA";
-    const mfa = await collect(() => client.listMfaProviders(vendorEndpoint));
-    const evidence = { vendor: mfaVendor, endpoint: `/services/admin/${vendorEndpoint}`, entries: mfa.ok ? mfa.value.entries.map((entry) => entry.name) : [] };
+    const mfa = await collect(client, () => client.listMfaProviders(vendorEndpoint));
+    const evidence = { vendor: mfaVendor, endpoint: `/services/admin/${vendorEndpoint}`, entries: mfa.ok ? mfa.value.entries.map((entry) => entry.name) : null };
     if (mfa.ok && mfa.value.entries.length > 0) {
       findings.push(finding(3, "pass", `externalTwoFactorAuthVendor=${mfaVendor} and the ${vendorEndpoint} configuration is present.`, evidence));
     } else if (mfa.ok) {
@@ -1258,12 +1331,13 @@ export async function assessSplunkAuthentication(
       older_than_days: maxTokenAgeDays,
       stale: stale.slice(0, 50),
       missing_dates: missingDates.slice(0, 50),
-      subject_not_in_user_list: orphaned.slice(0, 50),
+      subject_not_in_user_list: users.ok ? orphaned.slice(0, 50) : null,
       users_readable: users.ok,
     };
     const usersCaveat = users.ok ? "" : `The subject-to-user check was skipped because the user list could not be read (${unreadableCause(users)}); confirm each token subject is a current user.`;
+    const orphanedText = users.ok ? `${orphaned.length} tokens belong to subjects not present in the user list` : "the subject-to-user check was skipped because the user list was unreadable";
     if (noExpiry.length > 0 || orphaned.length > 0) {
-      findings.push(capWithCaveats(finding(6, "fail", `${noExpiry.length} tokens never expire and ${orphaned.length} tokens belong to subjects not present in the user list (of ${tokens.value.entries.length} seen).`, evidence), [usersCaveat]));
+      findings.push(capWithCaveats(finding(6, "fail", `${noExpiry.length} tokens never expire and ${orphanedText} (of ${tokens.value.entries.length} seen).`, evidence), [usersCaveat]));
     } else if (stale.length > 0 || missingDates.length > 0 || partialView(tokens.value)) {
       findings.push(capWithCaveats(finding(6, "warn", `${stale.length} tokens are older than ${maxTokenAgeDays} days, ${missingDates.length} lack issue or expiry claims${partialView(tokens.value) ? `, and only ${seenVersusTotal(tokens.value, "tokens")} were retrieved` : ""}.`, evidence), [usersCaveat]));
     } else if (!users.ok) {
@@ -1311,10 +1385,10 @@ export async function assessSplunkAccessControl(
 ): Promise<SplunkAssessmentResult> {
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10_000);
   const [roles, users, savedSearches, lookups] = await Promise.all([
-    collect(() => client.listRoles()),
-    collect(() => client.listUsers()),
-    collect(() => client.listSavedSearches()),
-    collect(() => client.listLookupTableFiles()),
+    collect(client, () => client.listRoles()),
+    collect(client, () => client.listUsers()),
+    collect(client, () => client.listSavedSearches()),
+    collect(client, () => client.listLookupTableFiles()),
   ]);
   const findings: SplunkFinding[] = [];
 
@@ -1552,14 +1626,14 @@ function describeTargets(targets: ForwarderTargetTls[]): string {
 export async function assessSplunkDataProtection(client: SplunkInspectorClient): Promise<SplunkAssessmentResult> {
   const deployment = await loadDeployment(client);
   const [serverConf, webConf, outputsConf, inputsConf, hecInputs, indexes] = await Promise.all([
-    collect(() => client.getConfStanzas("server")),
-    collect(() => client.getConfStanzas("web")),
-    collect(() => client.getConfStanzas("outputs")),
-    collect(() => client.getConfStanzas("inputs")),
-    collect(() => client.listHecInputs()),
-    collect(() => client.listIndexes()),
+    collect(client, () => client.getConfStanzas("server")),
+    collect(client, () => client.getConfStanzas("web")),
+    collect(client, () => client.getConfStanzas("outputs")),
+    collect(client, () => client.getConfStanzas("inputs")),
+    collect(client, () => client.listHecInputs()),
+    collect(client, () => client.listIndexes()),
   ]);
-  const acsHec = client.hasAcs() && deployment.info.isCloud ? await collect(() => client.acsListAll("/inputs/http-event-collectors", "http-event-collectors")) : undefined;
+  const acsHec = client.hasAcs() && deployment.info.isCloud ? await collect(client, () => client.acsListAll("/inputs/http-event-collectors", "http-event-collectors")) : undefined;
   const deploymentNote = deploymentCaveat(deployment);
   const findings: SplunkFinding[] = [];
 
@@ -1717,9 +1791,9 @@ export async function assessSplunkAuditMonitoring(
   const runSearches = options.runSearches !== false;
   const minRetentionDays = clampNumber(options.minAuditRetentionDays, DEFAULT_MIN_AUDIT_RETENTION_DAYS, 1, 36_500);
   const [indexes, roles, users, auditConf] = await Promise.all([
-    collect(() => client.listIndexes()),
-    collect(() => client.listRoles()),
-    collect(() => client.listUsers()),
+    collect(client, () => client.listIndexes()),
+    collect(client, () => client.listRoles()),
+    collect(client, () => client.listUsers()),
     collectOptionalConf(client, "audit"),
   ]);
   const findings: SplunkFinding[] = [];
@@ -1741,7 +1815,7 @@ export async function assessSplunkAuditMonitoring(
   } else {
     const disabled = asBoolean(auditIndex.content.disabled);
     const eventCount = asNumber(auditIndex.content.totalEventCount);
-    const search = runSearches ? await collect(() => client.runOneshotSearch("index=_audit | stats count by action", "-24h")) : undefined;
+    const search = runSearches ? await collect(client, () => client.runOneshotSearch("index=_audit | stats count by action", "-24h")) : undefined;
     const actions = search?.ok ? search.value.results.map((row) => asString(row.action) ?? "").filter(Boolean) : [];
     const hasLogin = actions.some((action) => /login/i.test(action));
     const hasSearch = actions.some((action) => /^search$/i.test(action));
@@ -1751,7 +1825,7 @@ export async function assessSplunkAuditMonitoring(
       totalEventCount: eventCount ?? null,
       search_run: runSearches,
       search_readable: search ? search.ok : null,
-      actions_last_24h: actions.slice(0, 50),
+      actions_last_24h: search?.ok ? actions.slice(0, 50) : null,
       covers_login: hasLogin,
       covers_search: hasSearch,
       covers_config_change: hasConfigChange,
@@ -1930,13 +2004,13 @@ function s2sListeners(cooked: SplunkListResult, inputs: SplunkListResult): S2sLi
 export async function assessSplunkPlatformHardening(client: SplunkInspectorClient): Promise<SplunkAssessmentResult> {
   const deployment = await loadDeployment(client);
   const [apps, roles, kvCollections, savedSearches, users, cookedInputs, inputsConf] = await Promise.all([
-    collect(() => client.listApps()),
-    collect(() => client.listRoles()),
-    collect(() => client.listKvCollections()),
-    collect(() => client.listSavedSearches()),
-    collect(() => client.listUsers()),
-    collect(() => client.listCookedTcpInputs()),
-    collect(() => client.getConfStanzas("inputs")),
+    collect(client, () => client.listApps()),
+    collect(client, () => client.listRoles()),
+    collect(client, () => client.listKvCollections()),
+    collect(client, () => client.listSavedSearches()),
+    collect(client, () => client.listUsers()),
+    collect(client, () => client.listCookedTcpInputs()),
+    collect(client, () => client.getConfStanzas("inputs")),
   ]);
   const deploymentNote = deploymentCaveat(deployment);
   const findings: SplunkFinding[] = [];
@@ -1946,9 +2020,9 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
   } else if (!client.hasAcs()) {
     findings.push(capWithCaveats(finding(19, "manual", "Splunk Cloud ACS is not configured (SPLUNK_STACK and SPLUNK_ACS_TOKEN), so IP allow lists could not be read. Collect GET /access/{feature}/ipallowlists for search-api, hec, s2s, and search-ui manually.", { acs_configured: false }), [deploymentNote]));
   } else {
-    const results = await Promise.all(ACS_ALLOWLIST_FEATURES.map(async (feature) => ({ feature, result: await collect(() => client.acsGet(`/access/${feature}/ipallowlists`)) })));
+    const results = await Promise.all(ACS_ALLOWLIST_FEATURES.map(async (feature) => ({ feature, result: await collect(client, () => client.acsGet(`/access/${feature}/ipallowlists`)) })));
     const evaluated = results.map(({ feature, result }) => {
-      if (!result.ok) return { feature, readable: false, subnets: [] as string[], verdict: "manual" as SplunkFindingStatus, note: unreadableCause(result) };
+      if (!result.ok) return { feature, readable: false, subnets: null as string[] | null, verdict: "manual" as SplunkFindingStatus, note: unreadableCause(result) };
       const subnets = asStringList(result.value.subnets);
       if (subnets.some((subnet) => /^(0\.0\.0\.0\/0|::\/0)$/.test(subnet))) return { feature, readable: true, subnets, verdict: "fail" as SplunkFindingStatus, note: "allow list contains 0.0.0.0/0" };
       if (subnets.length === 0) {
@@ -2111,6 +2185,7 @@ const REQUIRED_CAPABILITIES: Array<{ capability: string; purpose: string }> = [
 ];
 
 async function readableSurface(
+  client: SplunkInspectorClient,
   name: string,
   endpoint: string,
   load: () => Promise<unknown>,
@@ -2121,40 +2196,40 @@ async function readableSurface(
     const entries = Array.isArray(list?.entries) ? list?.entries : undefined;
     return { name, endpoint, status: "readable", count: entries ? entries.length : value === undefined ? 0 : 1, total: asNumber(list?.total) };
   } catch (error) {
-    return { name, endpoint, status: "not_readable", error: errorMessage(error) };
+    return { name, endpoint, status: "not_readable", error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)) };
   }
 }
 
 export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<SplunkAccessCheckResult> {
   const config = client.getResolvedConfig();
   const deployment = await loadDeployment(client);
-  const context = await collect(() => client.getCurrentContext());
-  const capabilities = context.ok ? asStringList(context.value?.content.capabilities) : [];
+  const context = await collect(client, () => client.getCurrentContext());
+  const capabilities = context.ok ? asStringList(context.value?.content.capabilities) : null;
   const authenticatedAs = context.ok ? asString(context.value?.content.username) ?? context.value?.name : undefined;
 
   const surfaces: SplunkAccessSurface[] = [
     { name: "server_info", endpoint: "/services/server/info", status: deployment.collected.ok ? "readable" : "not_readable", count: deployment.collected.ok ? 1 : undefined, error: deployment.collected.ok ? undefined : deployment.collected.error },
     { name: "current_context", endpoint: "/services/authentication/current-context", status: context.ok ? "readable" : "not_readable", count: context.ok ? 1 : undefined, error: context.ok ? undefined : context.error },
-    await readableSurface("users", "/services/authentication/users", () => client.listUsers()),
-    await readableSurface("roles", "/services/authorization/roles", () => client.listRoles()),
-    await readableSurface("tokens", "/services/authorization/tokens", () => client.listTokens()),
-    await readableSurface("conf_authentication", "/services/configs/conf-authentication", () => client.getConfStanzas("authentication")),
-    await readableSurface("conf_server", "/services/configs/conf-server", () => client.getConfStanzas("server")),
-    await readableSurface("conf_web", "/services/configs/conf-web", () => client.getConfStanzas("web")),
-    await readableSurface("indexes", "/services/data/indexes", () => client.listIndexes()),
-    await readableSurface("hec_inputs", "/services/data/inputs/http", () => client.listHecInputs()),
-    await readableSurface("tcp_cooked_inputs", "/services/data/inputs/tcp/cooked", () => client.listCookedTcpInputs()),
-    await readableSurface("saved_searches", "/servicesNS/-/-/saved/searches", () => client.listSavedSearches()),
-    await readableSurface("apps", "/services/apps/local", () => client.listApps()),
-    await readableSurface("kv_collections", "/servicesNS/-/-/storage/collections/config", () => client.listKvCollections()),
+    await readableSurface(client, "users", "/services/authentication/users", () => client.listUsers()),
+    await readableSurface(client, "roles", "/services/authorization/roles", () => client.listRoles()),
+    await readableSurface(client, "tokens", "/services/authorization/tokens", () => client.listTokens()),
+    await readableSurface(client, "conf_authentication", "/services/configs/conf-authentication", () => client.getConfStanzas("authentication")),
+    await readableSurface(client, "conf_server", "/services/configs/conf-server", () => client.getConfStanzas("server")),
+    await readableSurface(client, "conf_web", "/services/configs/conf-web", () => client.getConfStanzas("web")),
+    await readableSurface(client, "indexes", "/services/data/indexes", () => client.listIndexes()),
+    await readableSurface(client, "hec_inputs", "/services/data/inputs/http", () => client.listHecInputs()),
+    await readableSurface(client, "tcp_cooked_inputs", "/services/data/inputs/tcp/cooked", () => client.listCookedTcpInputs()),
+    await readableSurface(client, "saved_searches", "/servicesNS/-/-/saved/searches", () => client.listSavedSearches()),
+    await readableSurface(client, "apps", "/services/apps/local", () => client.listApps()),
+    await readableSurface(client, "kv_collections", "/servicesNS/-/-/storage/collections/config", () => client.listKvCollections()),
     client.hasAcs()
-      ? await readableSurface("acs_ip_allowlist", "acs:/access/search-api/ipallowlists", () => client.acsGet("/access/search-api/ipallowlists"))
+      ? await readableSurface(client, "acs_ip_allowlist", "acs:/access/search-api/ipallowlists", () => client.acsGet("/access/search-api/ipallowlists"))
       : { name: "acs_ip_allowlist", endpoint: "acs:/access/search-api/ipallowlists", status: "not_configured" },
   ];
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const coreReadable = surfaces.filter((surface) => ["server_info", "users", "roles", "conf_authentication", "conf_server", "indexes"].includes(surface.name)).every((surface) => surface.status === "readable");
-  const missingCapabilities = context.ok
+  const missingCapabilities = capabilities
     ? REQUIRED_CAPABILITIES.filter((item) => !capabilities.includes(item.capability) && !capabilities.includes("admin_all_objects")).map((item) => `${item.capability} (${item.purpose})`)
     : REQUIRED_CAPABILITIES.map((item) => `${item.capability} (${item.purpose}; capability list unreadable)`);
   const status = coreReadable && readableCount >= 11 ? "healthy" : "limited";
@@ -2170,7 +2245,7 @@ export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<
     surfaces,
     notes: [
       `Splunk ${deployment.info.isCloud ? "Cloud Platform" : "Enterprise"}${deployment.info.version ? ` ${deployment.info.version}` : ""} at ${config.url} (auth: ${config.token ? "bearer token" : "session key"}, TLS verification ${config.verifyTls ? "on" : "OFF"}).`,
-      `Authenticated as ${authenticatedAs ?? "unknown (current-context unreadable)"} with ${capabilities.length} capabilities.`,
+      `Authenticated as ${authenticatedAs ?? "unknown (current-context unreadable)"} with ${capabilities ? `${capabilities.length} capabilities` : "an unread capability list"}.`,
       `${readableCount}/${surfaces.length} audit surfaces are readable; ACS ${client.hasAcs() ? "configured" : "not configured"}.`,
     ],
     recommendedNextStep: status === "healthy"
@@ -2316,7 +2391,7 @@ export async function exportSplunkAuditBundle(
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(new URL(config.url).host)}-splunk-audit`);
 
   for (const [name, load] of rawSnapshots) {
-    const snapshot = await collect(load);
+    const snapshot = await collect(client, load);
     if (snapshot.ok) {
       await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(redactSnapshot(snapshot.value)));
     } else {
@@ -2528,7 +2603,7 @@ function runTool<T>(toolName: string, failurePrefix: string, run: () => Promise<
       const result = await run();
       return textResult(result.text, { tool: toolName, ...result.details });
     } catch (error) {
-      return errorResult(`${failurePrefix}: ${errorMessage(error)}`, { tool: toolName });
+      return errorResult(`${failurePrefix}: ${scrubErrorText(errorMessage(error))}`, { tool: toolName });
     }
   };
 }
