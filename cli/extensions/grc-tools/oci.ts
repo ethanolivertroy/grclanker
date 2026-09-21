@@ -452,7 +452,7 @@ const SENSITIVE_TEXT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> =
    * redacted because keyId identifies the tenancy, user, and key fingerprint and signature is the credential.
    */
   { pattern: /\bSignature\s+[A-Za-z]+\s*=\s*"[^"]*"(?:\s*,\s*[A-Za-z]+\s*=\s*"[^"]*")*/g, replacement: "Signature [redacted]" },
-  { pattern: /\b(Signature|Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1 [redacted]" },
+  { pattern: /\b(Signature|Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replacement: "$1 [redacted]" },
   /**
    * Standalone signing parameters in assignment or JSON-colon form:
    * `keyId="..."`, `"keyId": "..."`, `signingKeyId=...`, `signature=...`.
@@ -461,8 +461,86 @@ const SENSITIVE_TEXT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> =
    */
   { pattern: /(?<![A-Za-z0-9_-])((?:signing_?)?keyId|[A-Za-z_-]*signature)["']?\s*[=:]\s*("[^"]*"|'[^']*'|[^\s,;]+)/gi, replacement: `$1=${REDACTED_MARKER}` },
   { pattern: /--config-file\s+("[^"]*"|'[^']*'|\S+)/g, replacement: `--config-file ${REDACTED_MARKER}` },
-  { pattern: /\b([A-Za-z_-]*(?:token|secret|signature|pass_?word|pass_?phrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)["']?\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
 ];
+
+/**
+ * Any scheme-prefixed URL embedded anywhere in a string. The replacer keeps
+ * the host and path and drops the query string (pre-authenticated request
+ * parameters, `access_token=`, signed-URL parameters) and any fragment that
+ * carries parameters (`#access_token=...`); route-only fragments such as the
+ * REST reference's `#/en/identity/...` citations stay readable.
+ */
+const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+
+/**
+ * Names whose assigned value in free text is a credential: `Set-Cookie: ...`,
+ * `X-Api-Key: ...`, `session_id=...`, `"access_token": "..."`, `client_secret=`,
+ * `password=`, `Authorization: ...`. `kmsKeyId`, `masterKeyId`, and `--key-id`
+ * are KMS key OCIDs that verdicts read, so bare `key` is deliberately absent;
+ * `session` matches only the id/token/key/cookie forms and the exact word so
+ * that summary counters such as `long_running_sessions: 3` are untouched.
+ */
+const CREDENTIAL_KEY_WORDS = [
+  "token",
+  "secret",
+  "signature",
+  "pass_?word",
+  "passwd",
+  "pass_?phrase",
+  "key_?file",
+  "access_?uri",
+  "private_?key",
+  "api[_-]?key",
+  "cookie",
+  "authorization",
+  "session[_-]?(?:id|token|key|cookie)",
+  "sessid",
+  "(?<![A-Za-z_-])session(?![A-Za-z_-])",
+].join("|");
+const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
+  `\\b([A-Za-z_-]*(?:${CREDENTIAL_KEY_WORDS})[A-Za-z_-]*)["']?\\s*[=:]\\s*(?:(?:Bearer|Basic|Signature)\\s+)?("[^"]*"|'[^']*'|[^\\s,;]+)`,
+  "gi",
+);
+
+/**
+ * Free-text error fields (ServiceError.message, spawn failures) can carry an
+ * unlabeled credential, so scrubErrorText additionally drops every run of 16
+ * or more token characters that contains a digit or base64 marker. OCIDs, CLI
+ * flags, PascalCase error codes such as NotAuthorizedOrNotFound, and the
+ * documented opc-request-id correlation id (validated to its charset by
+ * parseServiceError) are kept because verdict summaries name them.
+ */
+const LONG_TOKEN_PATTERN = /\bocid1\.[A-Za-z0-9._-]+|(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{16,}(?![A-Za-z0-9+/=_-])/g;
+const OPC_REQUEST_ID_LABEL = "opc-request-id=";
+
+function scrubEmbeddedUrl(url: string): string {
+  const trailing = url.match(/[.,;:!)]+$/)?.[0] ?? "";
+  const body = url.slice(0, url.length - trailing.length);
+  const queryStart = body.indexOf("?");
+  const fragmentStart = body.indexOf("#");
+  const cut = Math.min(...[queryStart, fragmentStart].filter((index) => index >= 0));
+  if (!Number.isFinite(cut)) return url;
+  const fragment = fragmentStart >= 0 ? body.slice(fragmentStart) : "";
+  const keptFragment = fragment && !fragment.includes("=") ? fragment : fragment ? `#${REDACTED_MARKER}` : "";
+  const query = queryStart >= 0 && (fragmentStart < 0 || queryStart < fragmentStart) ? `?${REDACTED_MARKER}` : "";
+  return `${body.slice(0, cut)}${query}${keptFragment}${trailing}`;
+}
+
+/**
+ * A bare `token: user` describes a token type rather than holding one, so the
+ * exact key `token` keeps a short lowercase word; every other credential key,
+ * and every token-shaped value, is redacted.
+ */
+function redactCredentialAssignment(match: string, key: string, value: string): string {
+  if (key.toLowerCase() === "token" && /^["']?[a-z]{1,11}["']?$/.test(value)) return match;
+  return `${key}=${REDACTED_MARKER}`;
+}
+
+function redactLongToken(match: string, offset: number, text: string): string {
+  if (match.startsWith("ocid1.") || match.startsWith("-") || !/[0-9+/=]/.test(match)) return match;
+  if (text.slice(0, offset).endsWith(OPC_REQUEST_ID_LABEL)) return match;
+  return REDACTED_MARKER;
+}
 
 function normalizeFieldName(key: string): string {
   return key.toLowerCase().replace(/[_-]/g, "");
@@ -474,12 +552,29 @@ export function isSensitiveFieldName(key: string): boolean {
   return SENSITIVE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
 }
 
+/**
+ * Credential-shape scrub for every string that reaches a finding, an evidence
+ * value, or a bundle file: embedded URL parameters, key material, PAR URIs,
+ * OCI signing headers, Bearer/Basic values, and credential assignments.
+ * Idempotent; resource names and OCIDs stay readable.
+ */
 export function redactSensitiveText(text: string): string {
-  let result = text;
+  let result = text.replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl);
   for (const { pattern, replacement } of SENSITIVE_TEXT_PATTERNS) {
     result = result.replace(pattern, replacement);
   }
-  return result;
+  return result.replace(CREDENTIAL_ASSIGNMENT_PATTERN, redactCredentialAssignment);
+}
+
+/**
+ * The one scrub for error strings, applied where they are created: the
+ * OciCommandError constructor (every CLI failure) and errorMessage (every
+ * other thrown value a collector records), then again on the errors written
+ * into the bundle. Adds the long-token rule to redactSensitiveText because an
+ * error message is free text that may quote an unlabeled credential.
+ */
+export function scrubErrorText(text: string): string {
+  return redactSensitiveText(text).replace(LONG_TOKEN_PATTERN, redactLongToken);
 }
 
 /**
@@ -504,9 +599,10 @@ export function redactSensitiveValues<T>(value: T): T {
   return value;
 }
 
+/** Every thrown value becomes a collector error string here, so scrubErrorText runs on all of them. */
 function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return redactSensitiveText(message).slice(0, 1000);
+  return scrubErrorText(message).slice(0, 1000);
 }
 
 function finding(
@@ -618,6 +714,38 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
+/**
+ * Bundle sinks. Every markdown or log file passes through redactSensitiveText
+ * as a whole and every JSON document through the field-aware
+ * redactSensitiveValues before serialization (a whole-text scrub would break
+ * JSON around keys such as "token"). Together with scrubAssessmentForBundle
+ * this is the second redaction layer; the first runs where each string is
+ * created.
+ */
+async function writeBundleText(rootDir: string, relativePathname: string, content: string): Promise<void> {
+  await writeSecureTextFile(rootDir, relativePathname, redactSensitiveText(content));
+}
+
+async function writeBundleJson(rootDir: string, relativePathname: string, value: unknown): Promise<void> {
+  await writeSecureTextFile(rootDir, relativePathname, serializeJson(redactSensitiveValues(value)));
+}
+
+/**
+ * Re-runs the creation-time scrubs at the bundle sink: scrubErrorText on every
+ * collector error string and the field-aware redaction on every finding, so a
+ * string that bypassed errorMessage upstream still cannot reach a bundle file
+ * or the zip. Both scrubs are idempotent. Summaries keep resource and
+ * compartment names, so they take redactSensitiveText rather than the
+ * long-token rule.
+ */
+function scrubAssessmentForBundle(result: OciAssessmentResult): OciAssessmentResult {
+  return {
+    ...result,
+    findings: result.findings.map((item) => redactSensitiveValues({ ...item, summary: redactSensitiveText(item.summary) })),
+    errors: result.errors.map(scrubErrorText),
+  };
+}
+
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
     const output = createWriteStream(zipPath, { mode: 0o600 });
@@ -650,9 +778,177 @@ export const OCI_COMMAND_RUNNER_OPTIONS: ExecFileSyncOptionsWithStringEncoding =
   maxBuffer: DEFAULT_COMMAND_MAX_BUFFER_BYTES,
 };
 
-function defaultCommandRunner(args: string[]): string {
-  return execFileSync("oci", args, OCI_COMMAND_RUNNER_OPTIONS).trim();
+/** Global options that precede the command words in every invocation (OCI_SURFACE_DOCS-cited commands follow them). */
+const OCI_GLOBAL_OPTIONS_WITH_VALUE = new Set(["--config-file", "--profile", "--region", "--output", "--auth", "--endpoint"]);
+
+/** The positional command words of an invocation, for example `iam user list`, without global options or per-command flags. */
+export function ociCommandWords(args: string[]): string[] {
+  const words: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (OCI_GLOBAL_OPTIONS_WITH_VALUE.has(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--")) break;
+    words.push(arg);
+  }
+  return words;
 }
+
+/**
+ * The documented fields of the `ServiceError:` block the CLI prints on a
+ * service failure: `status`, `code`, `message`, and `opc-request-id`
+ * (https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/clitroubleshooting.htm#Service_Errors,
+ * https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm, block
+ * shape shown at https://docs.oracle.com/en-us/iaas/Content/ContEng/known-issues/conteng-known-issues.htm;
+ * the underlying exception is oci.exceptions.ServiceError(status, code, headers, message) at
+ * https://docs.oracle.com/en-us/iaas/tools/python/latest/api/exceptions.html).
+ * Every other field the block carries is dropped.
+ */
+export interface OciServiceErrorFields {
+  status?: number;
+  code?: string;
+  message?: string;
+  opcRequestId?: string;
+}
+
+const SERVICE_ERROR_CODE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const OPC_REQUEST_ID_PATTERN = /^[A-Za-z0-9/_.-]{1,200}$/;
+const SERVICE_ERROR_MESSAGE_MAX_LENGTH = 500;
+
+/**
+ * Extracts the documented fields from a `ServiceError:` block in CLI stderr.
+ * Returns undefined for anything else (HTML gateway pages, tracebacks, plain
+ * text), so the caller emits a descriptor instead of echoing the body.
+ */
+export function parseServiceError(stderr: string): OciServiceErrorFields | undefined {
+  const start = stderr.indexOf("ServiceError:");
+  if (start < 0) return undefined;
+  const braceStart = stderr.indexOf("{", start);
+  const braceEnd = stderr.lastIndexOf("}");
+  if (braceStart < 0 || braceEnd < braceStart) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stderr.slice(braceStart, braceEnd + 1));
+  } catch {
+    return undefined;
+  }
+  const record = asObject(parsed);
+  if (!record) return undefined;
+  const code = asString(record.code);
+  const requestId = asString(record["opc-request-id"]);
+  return {
+    status: asNumber(record.status),
+    code: code && SERVICE_ERROR_CODE_PATTERN.test(code) ? code : undefined,
+    message: asString(record.message)?.slice(0, SERVICE_ERROR_MESSAGE_MAX_LENGTH),
+    opcRequestId: requestId && OPC_REQUEST_ID_PATTERN.test(requestId) ? requestId : undefined,
+  };
+}
+
+export interface OciCommandFailure {
+  args: string[];
+  exitCode: number | null;
+  signal?: string;
+  systemCode?: string;
+  stderr: string;
+  stdout: string;
+  /** Set when the CLI exited 0 but printed something other than JSON. */
+  unparseableStdout?: boolean;
+}
+
+function describeCommandFailure(command: string, failure: OciCommandFailure, serviceError: OciServiceErrorFields | undefined): string {
+  const stderrBytes = Buffer.byteLength(failure.stderr, "utf8");
+  const stdoutBytes = Buffer.byteLength(failure.stdout, "utf8");
+  if (failure.unparseableStdout) {
+    return `${command} exited 0 but printed ${stdoutBytes} bytes of non-JSON stdout (withheld)`;
+  }
+  const exit = failure.exitCode === null
+    ? `did not exit normally${failure.signal ? ` (${failure.signal})` : ""}${failure.systemCode ? ` (${failure.systemCode})` : ""}`
+    : `exited ${failure.exitCode}`;
+  if (serviceError) {
+    const fields = [
+      serviceError.status !== undefined ? `status=${serviceError.status}` : undefined,
+      serviceError.code ? `code=${serviceError.code}` : undefined,
+      serviceError.opcRequestId ? `${OPC_REQUEST_ID_LABEL}${serviceError.opcRequestId}` : undefined,
+      serviceError.message ? `message=${serviceError.message}` : undefined,
+    ].filter((field): field is string => field !== undefined);
+    return `${command} ${exit} with ServiceError ${fields.join(" ")}`;
+  }
+  return `${command} ${exit}; ${stderrBytes} bytes of stderr and ${stdoutBytes} bytes of stdout withheld (no documented ServiceError block)`;
+}
+
+/**
+ * The error every CLI failure becomes. The message never echoes stderr or
+ * stdout: a documented ServiceError block contributes only its status, code,
+ * opc-request-id, and scrubbed message; anything else is described by the
+ * command words, exit code, and byte counts. Node's own execFileSync message
+ * (`Command failed: oci <argv>\n<stderr>`) is discarded.
+ */
+export class OciCommandError extends Error {
+  readonly command: string;
+  readonly exitCode: number | null;
+  readonly stderrBytes: number;
+  readonly stdoutBytes: number;
+  readonly serviceError: OciServiceErrorFields | undefined;
+
+  constructor(failure: OciCommandFailure) {
+    const command = `oci ${ociCommandWords(failure.args).join(" ")}`;
+    const serviceError = failure.unparseableStdout ? undefined : parseServiceError(failure.stderr);
+    super(scrubErrorText(describeCommandFailure(command, failure, serviceError)));
+    this.name = "OciCommandError";
+    this.command = command;
+    this.exitCode = failure.exitCode;
+    this.stderrBytes = Buffer.byteLength(failure.stderr, "utf8");
+    this.stdoutBytes = Buffer.byteLength(failure.stdout, "utf8");
+    this.serviceError = serviceError
+      ? { ...serviceError, message: serviceError.message === undefined ? undefined : scrubErrorText(serviceError.message) }
+      : undefined;
+  }
+
+  static fromExecFailure(args: string[], error: unknown): OciCommandError {
+    const shape = (error && typeof error === "object" ? error : {}) as {
+      status?: unknown;
+      signal?: unknown;
+      code?: unknown;
+      stdout?: unknown;
+      stderr?: unknown;
+    };
+    return new OciCommandError({
+      args,
+      exitCode: typeof shape.status === "number" ? shape.status : null,
+      signal: typeof shape.signal === "string" ? shape.signal : undefined,
+      systemCode: typeof shape.code === "string" ? shape.code : undefined,
+      stderr: bufferOrStringToText(shape.stderr),
+      stdout: bufferOrStringToText(shape.stdout),
+    });
+  }
+}
+
+function bufferOrStringToText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return "";
+}
+
+type ExecFileSyncLike = (file: string, args: string[], options: ExecFileSyncOptionsWithStringEncoding) => string;
+
+/**
+ * Wraps execFileSync so that a failing `oci` invocation surfaces as an
+ * OciCommandError. Exported with an injectable exec so tests drive the real
+ * error construction with execFileSync-shaped failures.
+ */
+export function createOciCommandRunner(exec: ExecFileSyncLike = execFileSync): OciCommandRunner {
+  return (args) => {
+    try {
+      return exec("oci", args, OCI_COMMAND_RUNNER_OPTIONS).trim();
+    } catch (error) {
+      throw OciCommandError.fromExecFailure(args, error);
+    }
+  };
+}
+
+const defaultCommandRunner = createOciCommandRunner();
 
 function parseIniSections(contents: string): Record<string, Record<string, string>> {
   const sections: Record<string, Record<string, string>> = {};
@@ -992,9 +1288,16 @@ export class OciAuditorClient {
     ];
   }
 
+  /** Non-JSON stdout (a gateway page passed through on exit 0) is never echoed; only its size is reported. */
   private runJson(args: string[]): JsonRecord {
-    const output = this.commandRunner([...this.buildBaseArgs(), ...args]);
-    return output.trim().length > 0 ? (JSON.parse(output) as JsonRecord) : {};
+    const fullArgs = [...this.buildBaseArgs(), ...args];
+    const output = this.commandRunner(fullArgs);
+    if (output.trim().length === 0) return {};
+    try {
+      return JSON.parse(output) as JsonRecord;
+    } catch {
+      throw new OciCommandError({ args: fullArgs, exitCode: 0, stderr: "", stdout: output, unparseableStdout: true });
+    }
   }
 
   /** OCI_SURFACE_DOCS.compartments; --all follows opc-next-page to completion. */
@@ -2703,10 +3006,10 @@ export async function exportOciAuditBundle(
   });
   const compartments = await collect(() => client.listCompartments());
 
-  const assessments = [identity, loggingDetection, tenancyGuardrails, computeStorage];
+  const assessments = [identity, loggingDetection, tenancyGuardrails, computeStorage].map(scrubAssessmentForBundle);
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
-  if (compartments.error) errors.push(compartments.error);
+  if (compartments.error) errors.push(scrubErrorText(compartments.error));
   const targetName = safeDirName(`${config.tenancyOcid}-${config.region}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
 
@@ -2715,6 +3018,7 @@ export async function exportOciAuditBundle(
   const bundleAccess: OciAccessCheckResult = {
     ...access,
     notes: access.notes.map((note) => note.replace(/^Using OCI config .* profile /, `Using OCI config ${REDACTED_MARKER} profile `)),
+    surfaces: access.surfaces.map((item) => (item.error === undefined ? item : { ...item, error: scrubErrorText(item.error) })),
   };
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
     config_file: REDACTED_MARKER,
