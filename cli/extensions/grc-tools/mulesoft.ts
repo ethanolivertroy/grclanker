@@ -1369,6 +1369,10 @@ export class MulesoftApiClient {
     return extractCollection(await this.get(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/platforms`));
   }
 
+  async getAuditRetentionSettings(): Promise<JsonRecord[]> {
+    return extractCollection(await this.get(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/retentionSettings`));
+  }
+
   async queryAuditLogs(query: { startDate: string; endDate?: string; limit?: number; offset?: number }): Promise<JsonRecord> {
     const payload = await this.post(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/query`, {
       startDate: query.startDate,
@@ -1448,6 +1452,7 @@ type AuditClient = Pick<
   | "getOrganizationHierarchy"
   | "listEnvironments"
   | "listAuditPlatforms"
+  | "getAuditRetentionSettings"
   | "queryAuditLogs"
   | "listCloudhubAlerts"
   | "listHybridAlerts"
@@ -3183,6 +3188,61 @@ function auditEntrySummary(entry: JsonRecord): JsonRecord {
   };
 }
 
+interface AuditRetentionEntry {
+  retention_period_days: number | null;
+  effective_from: string | null;
+}
+
+interface AuditRetentionSummary {
+  currentPeriodDays: number | null;
+  scheduledChange: AuditRetentionEntry | null;
+  entries: AuditRetentionEntry[];
+}
+
+// GET /audit/v2/organizations/{orgId}/retentionSettings returns every retention entry, including a
+// scheduled future change (effectiveFrom at least seven days ahead). The entry in force is the latest
+// one whose effectiveFrom is null or already past; a future entry is reported as a scheduled change.
+function summarizeAuditRetention(entries: JsonRecord[], now: number): AuditRetentionSummary {
+  const normalized: AuditRetentionEntry[] = entries.map((entry) => ({
+    retention_period_days: asNumber(entry.retentionPeriod) ?? null,
+    effective_from: asString(entry.effectiveFrom) ?? null,
+  }));
+  const effectiveTime = (entry: AuditRetentionEntry): number | undefined =>
+    entry.effective_from === null ? Number.NEGATIVE_INFINITY : asDate(entry.effective_from)?.getTime();
+  const inForce = normalized
+    .filter((entry) => entry.retention_period_days !== null)
+    .filter((entry) => {
+      const time = effectiveTime(entry);
+      return time !== undefined && time <= now;
+    })
+    .sort((left, right) => (effectiveTime(right) ?? 0) - (effectiveTime(left) ?? 0));
+  const scheduled = normalized
+    .filter((entry) => entry.retention_period_days !== null)
+    .filter((entry) => {
+      const time = effectiveTime(entry);
+      return time !== undefined && time > now;
+    })
+    .sort((left, right) => (effectiveTime(left) ?? 0) - (effectiveTime(right) ?? 0));
+  return {
+    currentPeriodDays: inForce[0]?.retention_period_days ?? null,
+    scheduledChange: scheduled[0] ?? null,
+    entries: normalized,
+  };
+}
+
+function auditRetentionNote(retention: AuditRetentionSummary, source: Collected<JsonRecord[]>): string {
+  if (source.error) {
+    return ` Retention settings could not be read (${source.error}); confirm the audit log retention period in Access Management > Settings of the root organization.`;
+  }
+  if (retention.currentPeriodDays === null) {
+    return " Retention settings returned no retention period; confirm it in Access Management > Settings of the root organization.";
+  }
+  const scheduled = retention.scheduledChange
+    ? `, changing to ${retention.scheduledChange.retention_period_days} days from ${retention.scheduledChange.effective_from}`
+    : "";
+  return ` Audit log retention is ${retention.currentPeriodDays} days${scheduled}.`;
+}
+
 interface AlertCoverage {
   environment: string;
   cloudhubAlerts: Collected<JsonRecord[]>;
@@ -3206,6 +3266,8 @@ export async function assessMulesoftAuditMonitoring(
 
   const scope = await collectOrganizationScope(client, errors);
   const platforms = await collect<JsonRecord[]>("audit_platforms", [], () => client.listAuditPlatforms(), errors);
+  const retentionSettings = await collect<JsonRecord[]>("audit_retention_settings", [], () => client.getAuditRetentionSettings(), errors);
+  const retention = summarizeAuditRetention(retentionSettings.value, now);
   const startDate = new Date(now - lookbackHours * 60 * 60 * 1000).toISOString();
   const endDate = new Date(now).toISOString();
   const recentQuery = await collect<JsonRecord>("audit_query", {}, () => client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT }), errors);
@@ -3291,16 +3353,22 @@ export async function assessMulesoftAuditMonitoring(
           fallback_lookback_days: AUDIT_FALLBACK_LOOKBACK_DAYS,
           platforms: platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"),
           platforms_error: platforms.error ?? null,
+          retention_period_days: retention.currentPeriodDays,
+          retention_scheduled_change: retention.scheduledChange,
+          retention_entries: retention.entries,
+          retention_settings_error: retentionSettings.error ?? null,
+          retention_settings_source: "GET /audit/v2/organizations/{orgId}/retentionSettings; evidence only, the verdict does not depend on it",
           recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
         };
+        const retentionNote = auditRetentionNote(retention, retentionSettings);
         if (recentEntries.length > 0) {
           const fetchedNote = entriesInWindow > recentEntries.length ? ` (${recentEntries.length} fetched)` : "";
-          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote} across ${platforms.value.length} platform(s).`, evidence);
+          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote} across ${platforms.value.length} platform(s).${retentionNote}`, evidence);
         }
         if (fallbackEntries.length > 0) {
-          return verdict("warn", `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.`, evidence);
+          return verdict("warn", `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.${retentionNote}`, evidence);
         }
-        return verdict("fail", `Audit logging returned zero entries in the last ${AUDIT_FALLBACK_LOOKBACK_DAYS} days. Zero events is treated as fail: either the platform is not recording activity or the credential cannot see the entries; export Access Management > Audit Log to confirm.`, evidence);
+        return verdict("fail", `Audit logging returned zero entries in the last ${AUDIT_FALLBACK_LOOKBACK_DAYS} days. Zero events is treated as fail: either the platform is not recording activity or the credential cannot see the entries; export Access Management > Audit Log to confirm.${retentionNote}`, evidence);
       },
     ),
     evaluate(
@@ -3353,6 +3421,7 @@ export async function assessMulesoftAuditMonitoring(
       audit_platforms: platforms.value.length,
       audit_entries_in_window: recentTotal ?? recentEntries.length,
       audit_lookback_hours: lookbackHours,
+      audit_retention_period_days: retention.currentPeriodDays,
       environments_visible: environments.all.length,
       production_environments: productionEnvironments.length,
       production_applications: totalProductionApplications,
@@ -3364,6 +3433,7 @@ export async function assessMulesoftAuditMonitoring(
     findings,
     snapshots: {
       audit_platforms: redactSnapshot(platforms.value),
+      audit_retention_settings: redactSnapshot(retentionSettings.value),
       audit_log_recent: redactSnapshot(recentEntries),
       alerts: redactSnapshot(alertCoverage.map((item) => ({
         environment: item.environment,

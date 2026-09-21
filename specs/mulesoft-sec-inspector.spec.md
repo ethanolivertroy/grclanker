@@ -62,6 +62,7 @@ Finding ids follow `MULESOFT-IAM-nn`, `MULESOFT-API-nn`, `MULESOFT-RT-nn`, and `
 | `/armui/api/v1/organizations/{orgId}/environments/{envId}/serverGroups` | GET | List server groups and clusters |
 | `/audit/v2/organizations/{orgId}/query` | POST | Query audit log entries with filters |
 | `/audit/v2/organizations/{orgId}/platforms` | GET | Get available audit log platforms |
+| `/audit/v2/organizations/{orgId}/retentionSettings` | GET | Get audit log retention period entries (evidence for control 17) |
 | `/mq/admin/api/v1/organizations/{orgId}/environments/{envId}/regions` | GET | List MQ regions and access config |
 | `/mq/admin/api/v1/organizations/{orgId}/environments/{envId}/regions/{regionId}/queues` | GET | List message queues |
 | `/secrets/api/v1/organizations/{orgId}/environments/{envId}/secretGroups` | GET | List Secrets Manager groups |

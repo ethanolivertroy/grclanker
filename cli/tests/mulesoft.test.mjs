@@ -249,6 +249,9 @@ function healthyAuditClient(overrides = {}) {
     async listAuditPlatforms() {
       return [{ name: "Access Management" }, { name: "API Manager" }];
     },
+    async getAuditRetentionSettings() {
+      return [{ retentionPeriod: 2190, effectiveFrom: null }];
+    },
     async queryAuditLogs() {
       return { data: [{ timestamp: new Date().toISOString(), platform: "Access Management", action: "LOGIN", objectType: "User" }], total: 42 };
     },
@@ -1040,6 +1043,7 @@ test("exportMulesoftAuditBundle writes core data, analysis, compliance reports, 
     join("core_data", "vpcs.json"),
     join("core_data", "load_balancers.json"),
     join("core_data", "audit_log_recent.json"),
+    join("core_data", "audit_retention_settings.json"),
     join("analysis", "identity_access.json"),
     join("analysis", "api_gateway.json"),
     join("analysis", "runtime_infrastructure.json"),
@@ -2464,4 +2468,70 @@ test("optional: RT-16 probes each DLB sslEndpoints certificate by SNI and counts
   assert.match(findingById(result, "MULESOFT-RT-16").summary, /1 dedicated load balancer certificate\(s\) expire within 60 days \(prod-dlb \(wildcard-cert\)\)/);
   assert.equal(findingById(result, "MULESOFT-RT-16").evidence.certificates_probed, 2);
   assert.deepEqual(findingById(result, "MULESOFT-RT-16").evidence.certificates.map((item) => item.ssl_endpoint), ["api-cert", "wildcard-cert"]);
+});
+
+test("optional: AUD-17 records the audit log retention period as evidence without letting it change the verdict", async () => {
+  const scheduledFrom = isoDaysFromNow(10);
+  const seen = [];
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      (url) => (url.pathname === `/audit/v2/organizations/${ORG_ID}/retentionSettings`
+        ? jsonResponse({ data: [{ retentionPeriod: 2190, effectiveFrom: null }, { retentionPeriod: 365, effectiveFrom: scheduledFrom }] })
+        : undefined),
+      (url) => (url.pathname === `/audit/v2/organizations/${ORG_ID}/platforms` ? jsonResponse({ data: [{ name: "Access Management" }] }) : undefined),
+      (url, init) => (url.pathname === `/audit/v2/organizations/${ORG_ID}/query` && init.method === "POST"
+        ? jsonResponse({ data: [{ timestamp: new Date().toISOString(), platform: "Access Management", action: "LOGIN", objectType: "User" }], total: 7 })
+        : undefined),
+      rootHierarchyRoute(),
+      pagedServer(`/accounts/api/organizations/${ORG_ID}/environments`, ENVIRONMENTS, 25),
+    ], seen),
+  });
+
+  assert.deepEqual(await client.getAuditRetentionSettings(), [{ retentionPeriod: 2190, effectiveFrom: null }, { retentionPeriod: 365, effectiveFrom: scheduledFrom }]);
+  assert.ok(seen.some((item) => item.pathname === `/audit/v2/organizations/${ORG_ID}/retentionSettings` && item.method === "GET"), "the documented camelCase retentionSettings path is requested");
+
+  const scheduled = await assessMulesoftAuditMonitoring(client);
+  const finding = findingById(scheduled, "MULESOFT-AUD-17");
+  assert.equal(finding.status, "pass");
+  assert.match(finding.summary, /7 audit log entries recorded within the last 24 hours/);
+  assert.match(finding.summary, new RegExp(`Audit log retention is 2190 days, changing to 365 days from ${scheduledFrom.replace(/[.]/g, "\\.")}\\.$`));
+  assert.equal(finding.evidence.retention_period_days, 2190);
+  assert.deepEqual(finding.evidence.retention_scheduled_change, { retention_period_days: 365, effective_from: scheduledFrom });
+  assert.equal(finding.evidence.retention_entries.length, 2);
+  assert.equal(finding.evidence.retention_settings_error, null);
+  assert.match(finding.evidence.retention_settings_source, /evidence only, the verdict does not depend on it/);
+
+  // An entry whose effectiveFrom has passed supersedes the open-ended default.
+  const superseded = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    async getAuditRetentionSettings() {
+      return [{ retentionPeriod: 2190, effectiveFrom: null }, { retentionPeriod: 365, effectiveFrom: isoDaysFromNow(-30) }];
+    },
+  }));
+  assert.equal(findingById(superseded, "MULESOFT-AUD-17").evidence.retention_period_days, 365);
+  assert.equal(findingById(superseded, "MULESOFT-AUD-17").evidence.retention_scheduled_change, null);
+  assert.match(findingById(superseded, "MULESOFT-AUD-17").summary, /Audit log retention is 365 days\.$/);
+
+  // The retention read is evidence only: a forbidden read is recorded and named but does not downgrade the audit verdict.
+  const forbiddenRetention = await assessMulesoftAuditMonitoring(healthyAuditClient({ getAuditRetentionSettings: forbidden("/audit/v2/organizations/org-1/retentionSettings") }));
+  assert.equal(statusOf(forbiddenRetention, "MULESOFT-AUD-17"), "pass");
+  assert.match(findingById(forbiddenRetention, "MULESOFT-AUD-17").summary, /42 audit log entries recorded within the last 24 hours/);
+  assert.match(findingById(forbiddenRetention, "MULESOFT-AUD-17").summary, /Retention settings could not be read \(Anypoint request failed \(403 Forbidden\)[^)]*\); confirm the audit log retention period in Access Management > Settings of the root organization/);
+  assert.equal(findingById(forbiddenRetention, "MULESOFT-AUD-17").evidence.retention_period_days, null);
+  assert.match(findingById(forbiddenRetention, "MULESOFT-AUD-17").evidence.retention_settings_error, /403 Forbidden/);
+  assert.equal(findingById(forbiddenRetention, "MULESOFT-AUD-17").evidence.unreadable_sources, undefined);
+  assert.ok(forbiddenRetention.errors.some((error) => error.startsWith("audit_retention_settings:")));
+
+  const noRetention = await assessMulesoftAuditMonitoring(healthyAuditClient({
+    async getAuditRetentionSettings() {
+      return [];
+    },
+  }));
+  assert.equal(statusOf(noRetention, "MULESOFT-AUD-17"), "pass");
+  assert.equal(findingById(noRetention, "MULESOFT-AUD-17").evidence.retention_period_days, null);
+  assert.match(findingById(noRetention, "MULESOFT-AUD-17").summary, /Retention settings returned no retention period/);
+
+  // The all-403 fixture still yields manual for the audit query itself, with the retention read named alongside it.
+  const allForbidden = await assessMulesoftAuditMonitoring(forbidAll(healthyAuditClient()));
+  assert.equal(statusOf(allForbidden, "MULESOFT-AUD-17"), "manual");
+  assert.ok(allForbidden.errors.some((error) => error.startsWith("audit_retention_settings:")));
 });
