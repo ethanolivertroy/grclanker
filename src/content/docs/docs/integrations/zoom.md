@@ -122,7 +122,8 @@ The script prints a skip message and exits 0 when no Zoom credentials or config 
 - Control 13 (vanity URL): the account settings reference exposes no account vanity URL field; only per-user personal meeting room URLs (`vanity_url` on `GET /users/{userId}`) are documented. Review the account profile in the admin portal.
 - Zoom Phone (control 19): `GET /phone/account_settings` requires a Zoom Phone license; without it the finding is manual and names the requirement.
 - Managed and trusted domains use master-account granular scopes (`account:read:managed_domains:master`, `account:read:trusted_domains:master`); a sub-account credential renders those findings manual.
-- Group override detection samples up to `group_limit` groups; when the group inventory is truncated the affected findings downgrade to warn and say so.
+- Group override detection samples up to `group_limit` groups and reads two views per group (`GET /groups/{groupId}/settings` and `?option=meeting_security`). When the group inventory is truncated, `GET /groups` is unreadable, or any sampled group's settings view is denied, all 13 group-dependent findings (ZOOM-MTG-01 to 10, ZOOM-COLLAB-02, 03, 07) downgrade to warn and name the group and endpoint; the unreadable view is also listed in the assessment `errors` array and in `_errors.log`. Group lock views are collected and disclosed but do not demote because no verdict reads group lock state yet.
+- A finding that depends on more than one inventory demotes when any of them is unreadable: ZOOM-ID-02 warns and names `GET /roles` when the admin role inventory behind its evidence is denied or truncated, even when `sign_in_with_two_factor_auth` is `all`. Lock notes name the exact `lock_settings` view that was denied.
 - User-level OAuth flows, JWT apps, and SARIF, CSV, and HTML reporters are out of scope for this integration.
 
 ## Endpoints
