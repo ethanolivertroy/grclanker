@@ -1211,7 +1211,7 @@ type IdentityClient = Pick<
 
 type AccessControlClient = Pick<
   LaunchdarklyApiClient,
-  "getResolvedConfig" | "listCustomRoles" | "listTokens" | "listMembers"
+  "getResolvedConfig" | "getCallerIdentity" | "listCustomRoles" | "listTokens" | "listMembers"
 >;
 
 type EnvironmentGovernanceClient = Pick<
@@ -1711,6 +1711,70 @@ function tokenHasCustomScope(token: JsonRecord): boolean {
   return asStringArray(token.customRoleIds).length > 0 || asRecordArray(token.inlineRole).length > 0;
 }
 
+const ADMIN_BASE_ROLES = new Set(["admin", "owner"]);
+const BASE_ROLE_RANK: Record<string, number> = { no_access: 0, reader: 1, writer: 2, admin: 3, owner: 4 };
+
+function baseRoleRank(role: string): number | undefined {
+  return BASE_ROLE_RANK[role];
+}
+
+function knownMemberBaseRole(member: JsonRecord | undefined): string | undefined {
+  const role = member ? memberBaseRole(member) : "";
+  return role === "" ? undefined : role;
+}
+
+interface TokenInventory {
+  scope: "full" | "partial" | "unknown";
+  reason: string;
+  callerToken?: JsonRecord;
+  callerTokenRole?: string;
+  callerMemberRole?: string;
+  visibleMemberIds: number;
+}
+
+function resolveTokenInventory(
+  tokens: JsonRecord[],
+  members: JsonRecord[],
+  caller: LaunchdarklyCallerIdentity,
+  callerReadable: boolean,
+): TokenInventory {
+  const callerToken = caller.tokenId ? tokens.find((token) => asString(token._id) === caller.tokenId) : undefined;
+  const callerTokenRole = callerToken ? tokenRole(callerToken) : undefined;
+  const callerMemberRole = knownMemberBaseRole(caller.memberId ? members.find((member) => asString(member._id) === caller.memberId) : undefined);
+  const personalMemberIds = new Set(tokens
+    .filter((token) => asBoolean(token.serviceToken) !== true)
+    .map((token) => asString(token.memberId))
+    .filter((memberId): memberId is string => Boolean(memberId)));
+  const base = { callerToken, callerTokenRole, callerMemberRole, visibleMemberIds: personalMemberIds.size };
+
+  if (callerToken && callerTokenRole !== undefined) {
+    if (tokenHasCustomScope(callerToken)) {
+      return { ...base, scope: "partial", reason: "The assessment token is scoped by custom roles or an inline policy, so showAll returned only the caller's own personal tokens." };
+    }
+    if (!ADMIN_BASE_ROLES.has(callerTokenRole)) {
+      return { ...base, scope: "partial", reason: `The assessment token has the ${callerTokenRole || "unknown"} base role; showAll returns other members' personal tokens only for Admin or Owner tokens.` };
+    }
+    if (asBoolean(callerToken.serviceToken) !== true && callerMemberRole !== undefined && !ADMIN_BASE_ROLES.has(callerMemberRole)) {
+      return { ...base, scope: "partial", reason: `The assessment token carries the ${callerTokenRole} base role but its member holds the ${callerMemberRole} role, which caps the token below Admin.` };
+    }
+    return { ...base, scope: "full", reason: `The assessment token has the ${callerTokenRole} base role, so showAll returned every member's personal tokens.` };
+  }
+
+  const otherMembers = caller.memberId ? [...personalMemberIds].filter((memberId) => memberId !== caller.memberId) : [];
+  if (otherMembers.length > 0 || personalMemberIds.size > 1) {
+    return { ...base, scope: "full", reason: `Personal tokens from ${Math.max(otherMembers.length, personalMemberIds.size - 1)} other members are visible, which only Admin or Owner tokens can list.` };
+  }
+  if (!callerReadable) {
+    return { ...base, scope: "unknown", reason: "The caller identity could not be read and every visible personal token belongs to a single member, so the listing may contain only the caller's own tokens." };
+  }
+  return { ...base, scope: "unknown", reason: "The assessment token was not present in the listing and every visible personal token belongs to the caller, so the listing may contain only the caller's own tokens." };
+}
+
+function tokenInventoryCaveat(inventory: TokenInventory): string {
+  const prefix = inventory.scope === "partial" ? "Partial token inventory:" : "Token inventory completeness is unknown:";
+  return `${prefix} ${inventory.reason} Rerun with an Admin or Owner token for a complete inventory.`;
+}
+
 export async function assessLaunchdarklyAccessControl(
   client: AccessControlClient,
   options: LaunchdarklyAccessControlOptions = {},
@@ -1723,13 +1787,37 @@ export async function assessLaunchdarklyAccessControl(
   const staleTokenDays = clampNumber(options.staleTokenDays, DEFAULT_STALE_TOKEN_DAYS, 1, 3650);
 
   const tokenErrors: string[] = [];
-  const [roles, tokens, members] = await Promise.all([
+  const callerErrors: string[] = [];
+  const [roles, tokens, members, callerPayload] = await Promise.all([
     collect(errors, "custom_roles", () => client.listCustomRoles(roleLimit), [] as JsonRecord[]),
     collect(tokenErrors, "access_tokens", () => client.listTokens(tokenLimit), [] as JsonRecord[]),
     collect(errors, "members", () => client.listMembers(DEFAULT_MEMBER_LIMIT), [] as JsonRecord[]),
+    collect(callerErrors, "caller_identity", () => client.getCallerIdentity(), {} as JsonRecord),
   ]);
-  errors.push(...tokenErrors);
+  errors.push(...tokenErrors, ...callerErrors);
   const tokensReadable = tokenErrors.length === 0;
+  const callerIdentity = parseCallerIdentity(callerPayload);
+  const inventory = resolveTokenInventory(tokens, members, callerIdentity, callerErrors.length === 0);
+  const inventoryEvidence: JsonRecord = {
+    scope: inventory.scope,
+    reason: inventory.reason,
+    caller_token_role: inventory.callerTokenRole ?? null,
+    caller_member_role: inventory.callerMemberRole ?? null,
+    visible_tokens: tokens.length,
+    visible_personal_token_members: inventory.visibleMemberIds,
+  };
+  const degradeForInventory = tokensReadable && tokens.length > 0 && inventory.scope !== "full";
+  const tokenFinding = (
+    control: number,
+    status: LaunchdarklyFindingStatus,
+    summary: string,
+    evidence: JsonRecord,
+  ): LaunchdarklyFinding => buildFinding(
+    control,
+    degradeForInventory && status === "pass" ? "warn" : status,
+    degradeForInventory ? `${summary} ${tokenInventoryCaveat(inventory)}` : summary,
+    { ...evidence, token_inventory: inventoryEvidence },
+  );
 
   const roleAnalyses = roles.map((role) => {
     const statements = parseStatements(role.policy);
@@ -1754,20 +1842,42 @@ export async function assessLaunchdarklyAccessControl(
 
   const serviceTokens = tokens.filter((token) => asBoolean(token.serviceToken) === true);
   const personalTokens = tokens.filter((token) => asBoolean(token.serviceToken) !== true);
+  const assessmentServiceToken = inventory.callerToken && asBoolean(inventory.callerToken.serviceToken) === true
+    ? inventory.callerToken
+    : undefined;
   const overScopedServiceTokens = serviceTokens.filter((token) =>
-    !tokenHasCustomScope(token) && ["owner", "admin"].includes(tokenRole(token)));
+    !tokenHasCustomScope(token) && ADMIN_BASE_ROLES.has(tokenRole(token)));
+  const overScopedOtherServiceTokens = overScopedServiceTokens.filter((token) => token !== assessmentServiceToken);
+  const assessmentTokenOverScoped = overScopedServiceTokens.length !== overScopedOtherServiceTokens.length;
   const writerServiceTokens = serviceTokens.filter((token) =>
     !tokenHasCustomScope(token) && tokenRole(token) === "writer");
   const wildcardInlineTokens = serviceTokens.filter((token) => parseStatements(token.inlineRole).some(statementUsesWildcardActions));
+  const serviceTokenIssues = [
+    overScopedOtherServiceTokens.length > 0 ? `${overScopedOtherServiceTokens.length} use the Owner or Admin base role` : undefined,
+    wildcardInlineTokens.length > 0 ? `${wildcardInlineTokens.length} use wildcard inline policies` : undefined,
+    assessmentTokenOverScoped && assessmentServiceToken
+      ? `the assessment token ${tokenLabel(assessmentServiceToken)} uses the ${tokenRole(assessmentServiceToken)} base role that LaunchDarkly requires for a complete token inventory, so keep it expiring, rotated, and dedicated to auditing`
+      : undefined,
+    writerServiceTokens.length > 0 ? `${writerServiceTokens.length} use the broad Writer base role instead of a custom role or inline policy` : undefined,
+  ].filter((issue): issue is string => Boolean(issue));
 
-  const memberIds = new Set(members.map((member) => asString(member._id)).filter((id): id is string => Boolean(id)));
-  const orphanedPersonalTokens = memberIds.size > 0
+  const membersById = new Map(members
+    .map((member) => [asString(member._id), member] as const)
+    .filter((entry): entry is readonly [string, JsonRecord] => Boolean(entry[0])));
+  const orphanedPersonalTokens = membersById.size > 0
     ? personalTokens.filter((token) => {
       const memberId = asString(token.memberId);
-      return !memberId || !memberIds.has(memberId);
+      return !memberId || !membersById.has(memberId);
     })
     : [];
-  const adminPersonalTokens = personalTokens.filter((token) => !tokenHasCustomScope(token) && ["owner", "admin"].includes(tokenRole(token)));
+  const overScopedPersonalTokens = personalTokens.flatMap((token) => {
+    if (tokenHasCustomScope(token)) return [];
+    const memberRole = knownMemberBaseRole(membersById.get(asString(token.memberId) ?? ""));
+    const tokenRank = baseRoleRank(tokenRole(token));
+    const memberRank = memberRole === undefined ? undefined : baseRoleRank(memberRole);
+    if (tokenRank === undefined || memberRank === undefined || tokenRank <= memberRank) return [];
+    return [{ token: tokenLabel(token), token_role: tokenRole(token), member_role: memberRole }];
+  });
 
   const findings: LaunchdarklyFinding[] = [
     buildFinding(
@@ -1804,27 +1914,27 @@ export async function assessLaunchdarklyAccessControl(
         reader_base_permission_roles: sample(readerBaseRoles.map((role) => role.key)),
       },
     ),
-    buildFinding(
+    tokenFinding(
       8,
       tokens.length === 0 ? "warn" : tokensWithoutExpiry.length === 0 ? "pass" : "fail",
       tokens.length === 0
         ? "No access tokens were readable (use an Admin token so showAll returns every member's personal tokens)."
         : tokensWithoutExpiry.length === 0
-          ? `All ${tokens.length} access tokens have an expiry configured.`
-          : `${tokensWithoutExpiry.length}/${tokens.length} access tokens have no expiry configured.`,
+          ? `All ${tokens.length} visible access tokens have an expiry configured.`
+          : `${tokensWithoutExpiry.length}/${tokens.length} visible access tokens have no expiry configured.`,
       {
         tokens: tokens.length,
         tokens_without_expiry: sample(tokensWithoutExpiry.map(tokenLabel)),
       },
     ),
-    buildFinding(
+    tokenFinding(
       9,
       tokens.length === 0 ? "warn" : staleTokens.length === 0 ? "pass" : "fail",
       tokens.length === 0
         ? "No access tokens were readable, so token staleness could not be evaluated."
         : staleTokens.length === 0
-          ? `All ${tokens.length} access tokens were used (or created) within the last ${staleTokenDays} days.`
-          : `${staleTokens.length}/${tokens.length} access tokens have not been used in more than ${staleTokenDays} days.`,
+          ? `All ${tokens.length} visible access tokens were used (or created) within the last ${staleTokenDays} days.`
+          : `${staleTokens.length}/${tokens.length} visible access tokens have not been used in more than ${staleTokenDays} days.`,
       {
         stale_token_days: staleTokenDays,
         stale_tokens: sample(staleTokens.map((token) => ({
@@ -1835,47 +1945,48 @@ export async function assessLaunchdarklyAccessControl(
         }))),
       },
     ),
-    buildFinding(
+    tokenFinding(
       10,
       !tokensReadable
         ? "warn"
         : serviceTokens.length === 0
           ? "pass"
-          : overScopedServiceTokens.length > 0 || wildcardInlineTokens.length > 0
+          : overScopedOtherServiceTokens.length > 0 || wildcardInlineTokens.length > 0
             ? "fail"
-            : writerServiceTokens.length > 0 ? "warn" : "pass",
+            : assessmentTokenOverScoped || writerServiceTokens.length > 0 ? "warn" : "pass",
       !tokensReadable
         ? "Access tokens could not be read, so service token scoping could not be evaluated."
         : serviceTokens.length === 0
-          ? "No service tokens exist."
-          : overScopedServiceTokens.length > 0 || wildcardInlineTokens.length > 0
-            ? `${overScopedServiceTokens.length} service tokens use the Owner or Admin base role and ${wildcardInlineTokens.length} use wildcard inline policies.`
-            : writerServiceTokens.length > 0
-              ? `${writerServiceTokens.length}/${serviceTokens.length} service tokens use the broad Writer base role instead of a custom role or inline policy.`
-              : `All ${serviceTokens.length} service tokens use Reader, custom role, or scoped inline policy permissions.`,
+          ? "No service tokens are visible."
+          : serviceTokenIssues.length > 0
+            ? `Of ${serviceTokens.length} visible service tokens, ${serviceTokenIssues.join("; ")}.`
+            : `All ${serviceTokens.length} visible service tokens use Reader, custom role, or scoped inline policy permissions.`,
       {
         service_tokens: serviceTokens.length,
-        owner_or_admin_service_tokens: sample(overScopedServiceTokens.map(tokenLabel)),
+        owner_or_admin_service_tokens: sample(overScopedOtherServiceTokens.map(tokenLabel)),
+        assessment_service_token: assessmentServiceToken
+          ? { token: tokenLabel(assessmentServiceToken), role: tokenRole(assessmentServiceToken), over_scoped: assessmentTokenOverScoped }
+          : null,
         writer_service_tokens: sample(writerServiceTokens.map(tokenLabel)),
         wildcard_inline_policy_tokens: sample(wildcardInlineTokens.map(tokenLabel)),
       },
     ),
-    buildFinding(
+    tokenFinding(
       11,
       !tokensReadable
         ? "warn"
-        : orphanedPersonalTokens.length > 0 ? "fail" : adminPersonalTokens.length > 0 ? "warn" : "pass",
+        : orphanedPersonalTokens.length > 0 ? "fail" : overScopedPersonalTokens.length > 0 ? "warn" : "pass",
       !tokensReadable
         ? "Access tokens could not be read, so personal token scope could not be evaluated."
         : orphanedPersonalTokens.length > 0
-          ? `${orphanedPersonalTokens.length} personal tokens are not tied to a current account member.`
-          : adminPersonalTokens.length > 0
-            ? `${adminPersonalTokens.length}/${personalTokens.length} personal tokens carry Owner or Admin base role scope; personal tokens should be limited to the member's day to day scope.`
-            : `All ${personalTokens.length} personal tokens are tied to current members and avoid Owner or Admin base role scope.`,
+          ? `${orphanedPersonalTokens.length} visible personal tokens are not tied to a current account member.`
+          : overScopedPersonalTokens.length > 0
+            ? `${overScopedPersonalTokens.length}/${personalTokens.length} visible personal tokens carry a base role above their member's own role; personal tokens must stay within the member's scope.`
+            : `All ${personalTokens.length} visible personal tokens are tied to current members and stay within each member's base role scope.`,
       {
         personal_tokens: personalTokens.length,
         orphaned_personal_tokens: sample(orphanedPersonalTokens.map(tokenLabel)),
-        owner_or_admin_personal_tokens: sample(adminPersonalTokens.map(tokenLabel)),
+        over_scoped_personal_tokens: sample(overScopedPersonalTokens),
       },
     ),
   ];
@@ -1889,6 +2000,7 @@ export async function assessLaunchdarklyAccessControl(
       wildcard_roles: wildcardRoles.length,
       sensitive_roles: sensitiveRoles.length,
       tokens: tokens.length,
+      token_inventory_scope: inventory.scope,
       service_tokens: serviceTokens.length,
       personal_tokens: personalTokens.length,
       tokens_without_expiry: tokensWithoutExpiry.length,

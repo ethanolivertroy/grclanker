@@ -90,8 +90,7 @@ function healthyClient(overrides = {}) {
         memberId: "m1",
         tokenId: "tok-1",
         tokenName: "grc-audit",
-        tokenKind: "service",
-        serviceToken: true,
+        serviceToken: false,
       };
     },
     async listMembers() {
@@ -191,6 +190,16 @@ function healthyClient(overrides = {}) {
     },
     async listTokens() {
       return [
+        {
+          _id: "tok-1",
+          name: "grc-audit",
+          role: "admin",
+          serviceToken: false,
+          memberId: "m1",
+          expiry: FUTURE_MS,
+          lastUsed: RECENT_MS,
+          creationDate: RECENT_MS,
+        },
         {
           _id: "t1",
           name: "ci-service",
@@ -502,7 +511,7 @@ test("checkLaunchdarklyAccess reports healthy when every audit surface is readab
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 12);
   assert.equal(result.callerIdentity.accountId, "acct-123");
   assert.match(result.recommendedNextStep, /launchdarkly_assess_identity/);
-  assert.ok(result.notes.some((note) => note.includes("service token")));
+  assert.ok(result.notes.some((note) => note.includes("personal token, member m1")));
 });
 
 test("checkLaunchdarklyAccess reports limited access and captures per-surface errors", async () => {
@@ -610,13 +619,149 @@ test("assessLaunchdarklyIdentity reports domain policy as manual when no allowed
   assert.match(finding(result, "LD-24").summary, /LAUNCHDARKLY_ALLOWED_DOMAINS/);
 });
 
-test("assessLaunchdarklyAccessControl passes least-privilege roles and well-managed tokens", async () => {
+test("assessLaunchdarklyAccessControl passes least-privilege roles and well-managed tokens with an Admin caller", async () => {
   const result = await assessLaunchdarklyAccessControl(healthyClient(), { now: NOW });
 
   assert.deepEqual(result.findings.map((item) => item.control), [4, 5, 8, 9, 10, 11]);
   for (const id of ["LD-04", "LD-05", "LD-08", "LD-09", "LD-10", "LD-11"]) {
     assert.equal(findingStatus(result, id), "pass", `${id} should pass`);
   }
+  assert.equal(result.summary.token_inventory_scope, "full");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    const inventory = finding(result, id).evidence.token_inventory;
+    assert.equal(inventory.scope, "full", `${id} should record a full inventory`);
+    assert.equal(inventory.caller_token_role, "admin");
+    assert.equal(inventory.caller_member_role, "owner");
+    assert.doesNotMatch(finding(result, id).summary, /Rerun with an Admin or Owner token/);
+  }
+  assert.equal(result.errors.length, 0);
+});
+
+function readerCallerClient(tokens, overrides = {}) {
+  return healthyClient({
+    async getCallerIdentity() {
+      return { accountId: "acct-123", memberId: "m2", tokenId: "reader-1", tokenName: "dev-audit", serviceToken: false };
+    },
+    async listTokens() {
+      return tokens;
+    },
+    ...overrides,
+  });
+}
+
+const READER_OWN_TOKENS = [
+  { _id: "reader-1", name: "dev-audit", role: "reader", serviceToken: false, memberId: "m2", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+  { _id: "reader-2", name: "dev-scripts", role: "writer", serviceToken: false, memberId: "m2", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS },
+];
+
+test("assessLaunchdarklyAccessControl never passes token controls on a Reader caller's partial inventory", async () => {
+  const result = await assessLaunchdarklyAccessControl(readerCallerClient(READER_OWN_TOKENS), { now: NOW });
+
+  assert.equal(result.summary.token_inventory_scope, "partial");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.equal(findingStatus(result, id), "warn", `${id} must not pass on a partial inventory`);
+    assert.match(finding(result, id).summary, /Partial token inventory: The assessment token has the reader base role/);
+    assert.match(finding(result, id).summary, /Rerun with an Admin or Owner token for a complete inventory/);
+    assert.equal(finding(result, id).evidence.token_inventory.scope, "partial");
+    assert.equal(finding(result, id).evidence.token_inventory.caller_token_role, "reader");
+  }
+  assert.equal(findingStatus(result, "LD-04"), "pass");
+
+  const failing = await assessLaunchdarklyAccessControl(readerCallerClient([
+    { ...READER_OWN_TOKENS[0], expiry: undefined, lastUsed: OLD_MS },
+  ]), { now: NOW, staleTokenDays: 90 });
+  assert.equal(findingStatus(failing, "LD-08"), "fail");
+  assert.equal(findingStatus(failing, "LD-09"), "fail");
+  assert.match(finding(failing, "LD-08").summary, /Partial token inventory/);
+
+  const customScoped = await assessLaunchdarklyAccessControl(readerCallerClient([
+    { ...READER_OWN_TOKENS[0], role: "admin", customRoleIds: ["release-manager"] },
+  ]), { now: NOW });
+  assert.equal(findingStatus(customScoped, "LD-08"), "warn");
+  assert.match(finding(customScoped, "LD-08").summary, /scoped by custom roles or an inline policy/);
+
+  const cappedByMember = await assessLaunchdarklyAccessControl(readerCallerClient([
+    { ...READER_OWN_TOKENS[0], role: "admin" },
+  ]), { now: NOW });
+  assert.equal(findingStatus(cappedByMember, "LD-08"), "warn");
+  assert.match(finding(cappedByMember, "LD-08").summary, /member holds the writer role, which caps the token below Admin/);
+});
+
+test("assessLaunchdarklyAccessControl infers inventory completeness when the caller token is not listed", async () => {
+  const otherMembersVisible = await assessLaunchdarklyAccessControl(healthyClient({
+    async getCallerIdentity() {
+      return { accountId: "acct-123", memberId: "m1", tokenId: "not-listed", serviceToken: false };
+    },
+  }), { now: NOW });
+  assert.equal(otherMembersVisible.summary.token_inventory_scope, "full");
+  assert.match(finding(otherMembersVisible, "LD-08").evidence.token_inventory.reason, /Personal tokens from 1 other members are visible/);
+  assert.equal(findingStatus(otherMembersVisible, "LD-08"), "pass");
+
+  const onlyOwnTokens = await assessLaunchdarklyAccessControl(readerCallerClient(READER_OWN_TOKENS, {
+    async getCallerIdentity() {
+      return { accountId: "acct-123", memberId: "m2", tokenId: "not-listed", serviceToken: false };
+    },
+  }), { now: NOW });
+  assert.equal(onlyOwnTokens.summary.token_inventory_scope, "unknown");
+  for (const id of ["LD-08", "LD-09", "LD-10", "LD-11"]) {
+    assert.equal(findingStatus(onlyOwnTokens, id), "warn", `${id} must not pass on an unknown inventory`);
+    assert.match(finding(onlyOwnTokens, id).summary, /Token inventory completeness is unknown/);
+  }
+
+  const identityUnreadable = await assessLaunchdarklyAccessControl(readerCallerClient(READER_OWN_TOKENS, {
+    async getCallerIdentity() {
+      throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/caller-identity");
+    },
+  }), { now: NOW });
+  assert.equal(identityUnreadable.summary.token_inventory_scope, "unknown");
+  assert.equal(findingStatus(identityUnreadable, "LD-08"), "warn");
+  assert.match(finding(identityUnreadable, "LD-08").summary, /caller identity could not be read/);
+  assert.ok(identityUnreadable.errors.some((error) => error.startsWith("caller_identity:")));
+});
+
+test("assessLaunchdarklyAccessControl discloses an Admin assessment service token and scopes personal tokens to member roles", async () => {
+  const serviceCaller = {
+    async getCallerIdentity() {
+      return { accountId: "acct-123", memberId: "m1", tokenId: "svc-audit", tokenName: "grc-audit-service", serviceToken: true };
+    },
+  };
+  const auditServiceToken = { _id: "svc-audit", name: "grc-audit-service", role: "admin", serviceToken: true, memberId: "m1", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS };
+  const devToken = { _id: "dev-1", name: "dev-personal", role: "writer", serviceToken: false, memberId: "m2", expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS };
+
+  const disclosed = await assessLaunchdarklyAccessControl(healthyClient({
+    ...serviceCaller,
+    async listTokens() {
+      return [auditServiceToken, devToken];
+    },
+  }), { now: NOW });
+  assert.equal(disclosed.summary.token_inventory_scope, "full");
+  assert.equal(findingStatus(disclosed, "LD-08"), "pass");
+  assert.equal(findingStatus(disclosed, "LD-09"), "pass");
+  assert.equal(findingStatus(disclosed, "LD-11"), "pass");
+  assert.equal(findingStatus(disclosed, "LD-10"), "warn");
+  assert.match(finding(disclosed, "LD-10").summary, /the assessment token grc-audit-service uses the admin base role that LaunchDarkly requires for a complete token inventory/);
+  assert.deepEqual(finding(disclosed, "LD-10").evidence.assessment_service_token, { token: "grc-audit-service", role: "admin", over_scoped: true });
+  assert.deepEqual(finding(disclosed, "LD-10").evidence.owner_or_admin_service_tokens, []);
+
+  const otherAdminService = await assessLaunchdarklyAccessControl(healthyClient({
+    ...serviceCaller,
+    async listTokens() {
+      return [auditServiceToken, devToken, { _id: "svc-legacy", name: "legacy-deploy", role: "owner", serviceToken: true, expiry: FUTURE_MS, lastUsed: RECENT_MS, creationDate: RECENT_MS }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(otherAdminService, "LD-10"), "fail");
+  assert.deepEqual(finding(otherAdminService, "LD-10").evidence.owner_or_admin_service_tokens, ["legacy-deploy"]);
+
+  const overScopedPersonal = await assessLaunchdarklyAccessControl(healthyClient({
+    ...serviceCaller,
+    async listTokens() {
+      return [auditServiceToken, { ...devToken, role: "admin" }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(overScopedPersonal, "LD-11"), "warn");
+  assert.deepEqual(finding(overScopedPersonal, "LD-11").evidence.over_scoped_personal_tokens, [
+    { token: "dev-personal", token_role: "admin", member_role: "writer" },
+  ]);
 });
 
 test("assessLaunchdarklyAccessControl flags wildcard roles, sensitive grants, missing expiry, stale and over-scoped tokens", async () => {
