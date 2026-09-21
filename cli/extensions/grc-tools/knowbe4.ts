@@ -39,6 +39,7 @@ const DEFAULT_RETRY_BASE_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
 const DEFAULT_USER_LIMIT = 5_000;
 const DEFAULT_ENROLLMENT_LIMIT = 20_000;
+const DEFAULT_LIST_LIMIT = 20_000;
 const DEFAULT_SECURITY_TEST_SAMPLE_LIMIT = 12;
 const DEFAULT_PHISHER_MESSAGE_LIMIT = 1_000;
 const DEFAULT_LOOKBACK_DAYS = 90;
@@ -215,6 +216,21 @@ export interface Knowbe4Collected<T> {
   data: T;
   collected: boolean;
   error?: string;
+  /** The read stopped at a cap while the API could still hold more records. */
+  truncated?: boolean;
+  /** Server-reported total when the API exposes one (PhishER pagination). */
+  total?: number;
+  /** The cap applied to the read. */
+  limit?: number;
+}
+
+/** A paginated Reporting API or PhishER listing together with how the pagination loop ended. */
+export interface Knowbe4Listing {
+  items: JsonRecord[];
+  truncated: boolean;
+  limit: number;
+  pages: number;
+  total?: number;
 }
 
 export interface Knowbe4SampledSecurityTest {
@@ -223,6 +239,38 @@ export interface Knowbe4SampledSecurityTest {
   name?: string;
   started_at?: string;
   recipients: JsonRecord[];
+  recipients_truncated?: boolean;
+}
+
+export type Knowbe4InventoryName =
+  | "account"
+  | "account_risk_score_history"
+  | "users"
+  | "groups"
+  | "phishing_campaigns"
+  | "security_tests"
+  | "security_test_recipients"
+  | "callback_security_tests"
+  | "training_campaigns"
+  | "training_enrollments"
+  | "store_purchases"
+  | "training_policies"
+  | "phisher_messages";
+
+export interface Knowbe4InventoryGap {
+  inventory: Knowbe4InventoryName;
+  endpoint: string;
+  error: string;
+  not_checked: string;
+  collect_manually: string;
+}
+
+export interface Knowbe4TruncatedInventory {
+  inventory: Knowbe4InventoryName;
+  seen: number;
+  total: number | null;
+  limit: number | null;
+  argument: string | null;
 }
 
 export interface Knowbe4Snapshot {
@@ -510,6 +558,85 @@ export function redactKnowbe4Pii(value: unknown): unknown {
   return redacted;
 }
 
+const REDACTED = "[REDACTED]";
+const CREDENTIAL_LAST_SEGMENTS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "authorization",
+  "credential", "credentials", "bearer",
+]);
+const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "private", "secret", "signing", "access", "shared", "session", "master", "client", "auth", "service"]);
+const URL_KEY_SEGMENTS = new Set(["url", "urls", "uri", "endpoint", "link", "href"]);
+const CREDENTIAL_QUERY_PATTERN = /token|secret|password|key|signature|sig|credential|auth/i;
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+// Free-form buckets on the user record that the assessments never read and that could carry anything an admin typed.
+const USER_FREE_FORM_KEYS = new Set(["comment", "custom_field_1", "custom_field_2", "custom_field_3", "custom_field_4", "custom_date_1", "custom_date_2"]);
+
+function keySegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment.length > 0);
+}
+
+function isCredentialKey(name: string): boolean {
+  const segments = keySegments(name);
+  const last = segments[segments.length - 1];
+  if (!last) return false;
+  if (CREDENTIAL_LAST_SEGMENTS.has(last)) return true;
+  if (last === "key" || last === "keys") return segments.slice(0, -1).some((segment) => CREDENTIAL_KEY_QUALIFIERS.has(segment));
+  return false;
+}
+
+function isUrlKey(name: string): boolean {
+  return keySegments(name).some((segment) => URL_KEY_SEGMENTS.has(segment));
+}
+
+/** Reduces an absolute URL to scheme plus host so path segments and query strings cannot carry a signed token. */
+function reduceUrl(value: string): string {
+  if (!ABSOLUTE_URL_PATTERN.test(value)) return CREDENTIAL_QUERY_PATTERN.test(value) ? REDACTED : value;
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+/**
+ * Defense-in-depth pass over everything written to core_data/: the value under any credential-shaped key becomes
+ * [REDACTED] whether it is a string, a list, or a nested object (the key survives so an auditor can see the field
+ * existed), URL-shaped keys keep only scheme and host, and {name, value} pairs whose name is credential-shaped lose
+ * their value. Booleans, numbers, and nulls pass through, and other nested values recurse.
+ */
+export function redactCredentialValues(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactCredentialValues);
+  const record = asObject(value);
+  if (!record) return value;
+  const pairName = asString(record.name);
+  const redacted: JsonRecord = {};
+  for (const [key, entry] of Object.entries(record)) {
+    const credential = isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName));
+    if (credential && (typeof entry === "string" || (typeof entry === "object" && entry !== null))) {
+      redacted[key] = REDACTED;
+    } else if (typeof entry === "string") {
+      redacted[key] = isUrlKey(key) ? reduceUrl(entry) : entry;
+    } else {
+      redacted[key] = redactCredentialValues(entry);
+    }
+  }
+  return redacted;
+}
+
+/** Drops the free-form user fields (comment, custom fields and dates) at collection time; nothing downstream reads them. */
+export function projectKnowbe4User(user: JsonRecord): JsonRecord {
+  return Object.fromEntries(Object.entries(user).filter(([key]) => !USER_FREE_FORM_KEYS.has(key)));
+}
+
+function projectRecipient(recipient: JsonRecord): JsonRecord {
+  const embedded = asObject(recipient.user);
+  return embedded ? { ...recipient, user: projectKnowbe4User(embedded) } : recipient;
+}
+
 function safeDirName(value: string): string {
   const normalized = value
     .toLowerCase()
@@ -737,7 +864,9 @@ function retryDelayMs(retryAfter: string | null, attempt: number): number {
   return Math.min(DEFAULT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
 }
 
-function knowbe4ErrorDetail(rawText: string): string | undefined {
+// Structured error fields are quoted; anything else is described by type and size, never echoed, because an HTML
+// or text error page can reflect the request (including its Authorization header) back at us.
+function knowbe4ErrorDetail(rawText: string, contentType: string | null): string | undefined {
   if (rawText.length === 0) return undefined;
   try {
     const payload = asObject(JSON.parse(rawText));
@@ -746,11 +875,16 @@ function knowbe4ErrorDetail(rawText: string): string | undefined {
       asString(payload?.error),
       ...asRecordArray(payload?.errors).map((item) => asString(item.message)),
     ].filter((item): item is string => Boolean(item));
-    if (detail.length > 0) return detail.join("; ");
+    if (detail.length > 0) return detail.join("; ").replace(/\s+/g, " ").slice(0, 300);
   } catch {
-    // fall through to the raw snippet
+    // not JSON: described below
   }
-  return rawText.replace(/\s+/g, " ").slice(0, 200);
+  const type = contentType ? contentType.split(";")[0].trim() : "unknown content type";
+  return `non-JSON ${type} response body (${Buffer.byteLength(rawText, "utf8")} bytes, not echoed)`;
+}
+
+function emptyListing(limit: number): Knowbe4Listing {
+  return { items: [], truncated: false, limit, pages: 0 };
 }
 
 // Argument and field names follow the public PhishER schema served to the developer portal's schema browser
@@ -895,7 +1029,7 @@ export class Knowbe4ApiClient {
         continue;
       }
       if (!response.ok) {
-        const detail = knowbe4ErrorDetail(rawText);
+        const detail = knowbe4ErrorDetail(rawText, response.headers.get("content-type"));
         throw new Error(this.redact(
           `KnowBe4 request failed (${response.status} ${response.statusText}) for ${label}${detail ? `: ${detail}` : ""}`,
         ));
@@ -913,68 +1047,85 @@ export class Knowbe4ApiClient {
     return this.request(this.buildUrl(path, query), { method: "GET" }, this.config.apiToken, path);
   }
 
+  /**
+   * Walks page/per_page pagination up to limit items. The Reporting API returns bare arrays with no total, so the
+   * only completion signal is a short page: the listing is reported truncated whenever the loop stopped at the cap
+   * while the last page was still full (more pages may exist) or while items were dropped from it.
+   */
   async list(
     path: string,
     query: JsonRecord = {},
     options: { limit?: number; pageSize?: number } = {},
-  ): Promise<JsonRecord[]> {
-    const limit = clampInteger(options.limit, DEFAULT_ENROLLMENT_LIMIT, 1, 1_000_000);
+  ): Promise<Knowbe4Listing> {
+    const limit = clampInteger(options.limit, DEFAULT_LIST_LIMIT, 1, 1_000_000);
     const pageSize = clampInteger(options.pageSize, DEFAULT_PAGE_SIZE, 1, DEFAULT_PAGE_SIZE);
     const items: JsonRecord[] = [];
+    let truncated = false;
+    let pages = 0;
 
-    for (let page = 1; items.length < limit; page += 1) {
+    for (let page = 1; ; page += 1) {
       const payload = await this.get(path, { ...query, page, per_page: pageSize });
+      pages += 1;
       const pageItems = asRecordArray(payload);
-      items.push(...pageItems.slice(0, limit - items.length));
+      const room = limit - items.length;
+      items.push(...pageItems.slice(0, room));
+      if (pageItems.length > room) {
+        truncated = true;
+        break;
+      }
       if (pageItems.length < pageSize) break;
+      if (items.length >= limit) {
+        truncated = true;
+        break;
+      }
     }
 
-    return items;
+    return { items, truncated, limit, pages };
   }
 
   async probe(path: string, query: JsonRecord = {}): Promise<JsonRecord[]> {
-    return this.list(path, query, { limit: 1, pageSize: 1 });
+    return (await this.list(path, query, { limit: 1, pageSize: 1 })).items;
   }
 
   async getAccount(): Promise<JsonRecord> {
     return asObject(await this.get("/v1/account")) ?? {};
   }
 
-  async getAccountRiskScoreHistory(full = true): Promise<JsonRecord[]> {
+  async getAccountRiskScoreHistory(full = true): Promise<Knowbe4Listing> {
     return this.list("/v1/account/risk_score_history", full ? { full: "true" } : {});
   }
 
-  async listUsers(options: { status?: "active" | "archived"; groupId?: string; limit?: number } = {}): Promise<JsonRecord[]> {
+  async listUsers(options: { status?: "active" | "archived"; groupId?: string; limit?: number } = {}): Promise<Knowbe4Listing> {
     return this.list("/v1/users", { status: options.status ?? "active", group_id: options.groupId }, { limit: options.limit ?? DEFAULT_USER_LIMIT });
   }
 
-  async listGroups(options: { status?: "active" | "archived"; limit?: number } = {}): Promise<JsonRecord[]> {
+  async listGroups(options: { status?: "active" | "archived"; limit?: number } = {}): Promise<Knowbe4Listing> {
     return this.list("/v1/groups", { status: options.status ?? "active" }, { limit: options.limit });
   }
 
-  async listGroupMembers(groupId: string, limit?: number): Promise<JsonRecord[]> {
+  async listGroupMembers(groupId: string, limit?: number): Promise<Knowbe4Listing> {
     return this.list(`/v1/groups/${encodeURIComponent(groupId)}/members`, {}, { limit });
   }
 
-  async listPhishingCampaigns(limit?: number): Promise<JsonRecord[]> {
+  async listPhishingCampaigns(limit?: number): Promise<Knowbe4Listing> {
     return this.list("/v1/phishing/campaigns", {}, { limit });
   }
 
-  async listSecurityTests(options: { campaignType?: "callback"; limit?: number } = {}): Promise<JsonRecord[]> {
+  async listSecurityTests(options: { campaignType?: "callback"; limit?: number } = {}): Promise<Knowbe4Listing> {
     return this.list("/v1/phishing/security_tests", { campaign_type: options.campaignType }, { limit: options.limit });
   }
 
-  async listSecurityTestRecipients(pstId: string, limit?: number): Promise<JsonRecord[]> {
+  async listSecurityTestRecipients(pstId: string, limit?: number): Promise<Knowbe4Listing> {
     return this.list(`/v1/phishing/security_tests/${encodeURIComponent(pstId)}/recipients`, {}, { limit });
   }
 
-  async listTrainingCampaigns(limit?: number): Promise<JsonRecord[]> {
+  async listTrainingCampaigns(limit?: number): Promise<Knowbe4Listing> {
     return this.list("/v1/training/campaigns", {}, { limit, pageSize: TRAINING_CAMPAIGN_PAGE_SIZE });
   }
 
   async listTrainingEnrollments(
     options: { campaignId?: string; userId?: string; storePurchaseId?: string; excludeArchivedUsers?: boolean; limit?: number } = {},
-  ): Promise<JsonRecord[]> {
+  ): Promise<Knowbe4Listing> {
     return this.list("/v1/training/enrollments", {
       campaign_id: options.campaignId,
       user_id: options.userId,
@@ -985,11 +1136,11 @@ export class Knowbe4ApiClient {
     }, { limit: options.limit ?? DEFAULT_ENROLLMENT_LIMIT });
   }
 
-  async listStorePurchases(limit?: number): Promise<JsonRecord[]> {
+  async listStorePurchases(limit?: number): Promise<Knowbe4Listing> {
     return this.list("/v1/training/store_purchases", {}, { limit });
   }
 
-  async listTrainingPolicies(limit?: number): Promise<JsonRecord[]> {
+  async listTrainingPolicies(limit?: number): Promise<Knowbe4Listing> {
     return this.list("/v1/training/policies", {}, { limit });
   }
 
@@ -1015,29 +1166,66 @@ export class Knowbe4ApiClient {
     return asObject(payload.data) ?? {};
   }
 
-  async listPhisherMessages(options: { query?: string; limit?: number } = {}): Promise<JsonRecord[]> {
-    const limit = clampInteger(options.limit, DEFAULT_PHISHER_MESSAGE_LIMIT, 1, 100_000);
+  /**
+   * Walks a PhishER connection (nodes plus pagination { page, pages, totalCount, nextPageKey }) up to limit items.
+   * The listing is truncated when the cap stopped the loop short of totalCount (or with pages still remaining), when
+   * the server keeps returning the same nextPageKey, or when an empty page arrives while totalCount says more exist.
+   */
+  private async listPhisherConnection(
+    query: string,
+    field: string,
+    variables: JsonRecord,
+    limit: number,
+    withNextPageKey: boolean,
+  ): Promise<Knowbe4Listing> {
     const per = Math.min(PHISHER_PAGE_SIZE, limit);
     const items: JsonRecord[] = [];
     let nextPageKey: string | undefined;
+    let total: number | undefined;
+    let truncated = false;
+    let pages = 0;
 
-    for (let page = 1; items.length < limit; page += 1) {
-      const data = await this.graphql(PHISHER_MESSAGES_QUERY, {
-        query: options.query ?? "",
+    for (let page = 1; ; page += 1) {
+      const data = await this.graphql(query, {
+        ...variables,
         per,
         page,
-        nextPageKey,
+        ...(withNextPageKey ? { nextPageKey } : {}),
       });
-      const connection = asObject(data.phisherMessages) ?? {};
+      pages += 1;
+      const connection = asObject(data[field]) ?? {};
       const nodes = asRecordArray(connection.nodes);
-      items.push(...nodes.slice(0, limit - items.length));
       const pagination = asObject(connection.pagination) ?? {};
+      total = asNumber(pagination.totalCount) ?? total;
       const totalPages = asNumber(pagination.pages);
-      nextPageKey = asString(pagination.nextPageKey);
-      if (nodes.length === 0 || (totalPages !== undefined && page >= totalPages && !nextPageKey)) break;
+      const previousKey = nextPageKey;
+      nextPageKey = withNextPageKey ? asString(pagination.nextPageKey) || undefined : undefined;
+      const room = limit - items.length;
+      items.push(...nodes.slice(0, room));
+      if (nodes.length > room) {
+        truncated = true;
+        break;
+      }
+      if (nodes.length === 0) break;
+      const lastPage = totalPages !== undefined && page >= totalPages && !nextPageKey;
+      if (lastPage) break;
+      if (nextPageKey !== undefined && nextPageKey === previousKey) {
+        truncated = true;
+        break;
+      }
+      if (items.length >= limit) {
+        truncated = true;
+        break;
+      }
     }
 
-    return items;
+    if (total !== undefined) truncated = truncated || total > items.length;
+    return { items, truncated, limit, pages, total };
+  }
+
+  async listPhisherMessages(options: { query?: string; limit?: number } = {}): Promise<Knowbe4Listing> {
+    const limit = clampInteger(options.limit, DEFAULT_PHISHER_MESSAGE_LIMIT, 1, 100_000);
+    return this.listPhisherConnection(PHISHER_MESSAGES_QUERY, "phisherMessages", { query: options.query ?? "" }, limit, true);
   }
 
   async countPhisherMessages(query = ""): Promise<number | undefined> {
@@ -1045,26 +1233,9 @@ export class Knowbe4ApiClient {
     return asNumber(asObject(asObject(data.phisherMessages)?.pagination)?.totalCount);
   }
 
-  async listPhisherRules(options: { query?: string; active?: boolean; limit?: number } = {}): Promise<JsonRecord[]> {
+  async listPhisherRules(options: { query?: string; active?: boolean; limit?: number } = {}): Promise<Knowbe4Listing> {
     const limit = clampInteger(options.limit, 500, 1, 10_000);
-    const per = Math.min(PHISHER_PAGE_SIZE, limit);
-    const items: JsonRecord[] = [];
-
-    for (let page = 1; items.length < limit; page += 1) {
-      const data = await this.graphql(PHISHER_RULES_QUERY, {
-        query: options.query ?? "",
-        per,
-        page,
-        active: options.active,
-      });
-      const connection = asObject(data.phisherRules) ?? {};
-      const nodes = asRecordArray(connection.nodes);
-      items.push(...nodes.slice(0, limit - items.length));
-      const totalPages = asNumber(asObject(connection.pagination)?.pages);
-      if (nodes.length === 0 || (totalPages !== undefined && page >= totalPages)) break;
-    }
-
-    return items;
+    return this.listPhisherConnection(PHISHER_RULES_QUERY, "phisherRules", { query: options.query ?? "", active: options.active }, limit, false);
   }
 }
 
@@ -1203,6 +1374,140 @@ async function collectSurface<T>(
   }
 }
 
+/**
+ * Accepts either a Knowbe4Listing from the API client or a bare array (older callers and test doubles). A bare array
+ * has no pagination signal, so it is treated as truncated only when it filled the cap.
+ */
+function toListing(value: unknown, limit: number): Knowbe4Listing {
+  if (Array.isArray(value)) {
+    return { items: asRecordArray(value), truncated: value.length >= limit, limit, pages: 1 };
+  }
+  const record = asObject(value);
+  if (record && Array.isArray(record.items)) {
+    return {
+      items: asRecordArray(record.items),
+      truncated: asBoolean(record.truncated) ?? false,
+      limit: asNumber(record.limit) ?? limit,
+      pages: asNumber(record.pages) ?? 1,
+      total: asNumber(record.total),
+    };
+  }
+  return emptyListing(limit);
+}
+
+async function collectListing(
+  label: Knowbe4InventoryName,
+  errors: string[],
+  limit: number,
+  load: () => Promise<unknown>,
+  project: (item: JsonRecord) => JsonRecord = (item) => item,
+): Promise<Knowbe4Collected<JsonRecord[]>> {
+  try {
+    const listing = toListing(await load(), limit);
+    return { data: listing.items.map(project), collected: true, truncated: listing.truncated, total: listing.total, limit: listing.limit };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    errors.push(`${label}: ${message}`);
+    return { data: [], collected: true, error: message, limit };
+  }
+}
+
+const INVENTORY_ENDPOINTS: Record<Knowbe4InventoryName, string> = {
+  account: "GET /v1/account",
+  account_risk_score_history: "GET /v1/account/risk_score_history?full=true",
+  users: "GET /v1/users?status=active",
+  groups: "GET /v1/groups?status=active",
+  phishing_campaigns: "GET /v1/phishing/campaigns",
+  security_tests: "GET /v1/phishing/security_tests",
+  security_test_recipients: "GET /v1/phishing/security_tests/{pst_id}/recipients",
+  callback_security_tests: "GET /v1/phishing/security_tests?campaign_type=callback",
+  training_campaigns: "GET /v1/training/campaigns",
+  training_enrollments: "GET /v1/training/enrollments",
+  store_purchases: "GET /v1/training/store_purchases",
+  training_policies: "GET /v1/training/policies",
+  phisher_messages: "PhishER GraphQL phisherMessages",
+};
+
+// Console evidence that stands in for an inventory the API would not return.
+const INVENTORY_MANUAL_EVIDENCE: Record<Knowbe4InventoryName, string> = {
+  account: "the Account Settings page showing the account name, allowed domains, and console admin list",
+  account_risk_score_history: "the organization Risk Score history chart (Dashboard > Risk Score)",
+  users: "the active user export (Users > Download CSV) with join dates, last sign-in, and current risk scores",
+  groups: "the groups list (Users > Groups) with member counts",
+  phishing_campaigns: "the phishing campaign list (Phishing > Campaigns) with target groups, status, and last run dates",
+  security_tests: "the phishing security test list (Phishing > Reports > Security Tests) with start dates, delivered, and reported counts",
+  security_test_recipients: "the recipient results export of each security test in the window (Phishing > Security Test > Recipients > Download CSV)",
+  callback_security_tests: "the Callback Phishing campaign list (Phishing > Callback Phishing) with test start dates",
+  training_campaigns: "the training campaign list (Training > Campaigns) with content, start and end dates, and completion percentages",
+  training_enrollments: "the training enrollment report (Training > Reports > Enrollments > Download CSV)",
+  store_purchases: "the ModStore purchased content list (Training > Library) with publish dates and retirement status",
+  training_policies: "the uploaded policies list (Training > Library > Policies)",
+  phisher_messages: "the PhishER inbox export (PhishER > Inbox) for the assessment window",
+};
+
+const INVENTORY_LIMIT_ARGUMENTS: Partial<Record<Knowbe4InventoryName, string>> = {
+  users: "user_limit",
+  training_enrollments: "enrollment_limit",
+  phisher_messages: "phisher_message_limit",
+};
+
+function inventoryCollection(snapshot: Knowbe4Snapshot, name: Knowbe4InventoryName): Knowbe4Collected<unknown> {
+  switch (name) {
+    case "account":
+      return snapshot.account;
+    case "account_risk_score_history":
+      return snapshot.accountRiskHistory;
+    case "users":
+      return snapshot.activeUsers;
+    case "groups":
+      return snapshot.groups;
+    case "phishing_campaigns":
+      return snapshot.phishingCampaigns;
+    case "security_tests":
+      return snapshot.securityTests;
+    case "security_test_recipients":
+      return snapshot.securityTestRecipients;
+    case "callback_security_tests":
+      return snapshot.callbackSecurityTests;
+    case "training_campaigns":
+      return snapshot.trainingCampaigns;
+    case "training_enrollments":
+      return snapshot.trainingEnrollments;
+    case "store_purchases":
+      return snapshot.storePurchases;
+    case "training_policies":
+      return snapshot.trainingPolicies;
+    case "phisher_messages":
+      return snapshot.phisherMessages;
+    default: {
+      const exhaustive: never = name;
+      throw new Error(`Unhandled KnowBe4 inventory: ${String(exhaustive)}`);
+    }
+  }
+}
+
+export const KNOWBE4_INVENTORIES: Knowbe4InventoryName[] = Object.keys(INVENTORY_ENDPOINTS) as Knowbe4InventoryName[];
+
+/** One row per inventory describing how the read ended, for core_data/collection_status.json and the summaries. */
+export function knowbe4CollectionStatus(snapshot: Knowbe4Snapshot): JsonRecord[] {
+  return KNOWBE4_INVENTORIES.map((name) => {
+    const collection = inventoryCollection(snapshot, name);
+    const seen = Array.isArray(collection.data) ? collection.data.length : collection.error ? 0 : 1;
+    return {
+      inventory: name,
+      endpoint: INVENTORY_ENDPOINTS[name],
+      collected: collection.collected,
+      readable: collection.collected ? !collection.error : null,
+      error: collection.error ?? null,
+      truncated: collection.collected && !collection.error ? Boolean(collection.truncated) : null,
+      seen: collection.collected ? seen : null,
+      total: collection.total ?? null,
+      limit: collection.limit ?? null,
+      limit_argument: INVENTORY_LIMIT_ARGUMENTS[name] ?? null,
+    };
+  });
+}
+
 function recordId(record: JsonRecord): string | undefined {
   return asString(record.id);
 }
@@ -1250,16 +1555,16 @@ export async function collectKnowbe4Snapshot(
 
   const account = await collectSurface("account", {}, errors, () => client.getAccount());
   const accountRiskHistory = needs("phishing", "risk")
-    ? await collectSurface("account_risk_score_history", [], errors, () => client.getAccountRiskScoreHistory(true))
+    ? await collectListing("account_risk_score_history", errors, DEFAULT_LIST_LIMIT, () => client.getAccountRiskScoreHistory(true))
     : skipped<JsonRecord[]>([]);
-  const activeUsers = await collectSurface("users", [], errors, () => client.listUsers({ status: "active", limit: userLimit }));
+  const activeUsers = await collectListing("users", errors, userLimit, () => client.listUsers({ status: "active", limit: userLimit }), projectKnowbe4User);
   const groups = needs("phishing", "risk")
-    ? await collectSurface("groups", [], errors, () => client.listGroups({ status: "active" }))
+    ? await collectListing("groups", errors, DEFAULT_LIST_LIMIT, () => client.listGroups({ status: "active" }))
     : skipped<JsonRecord[]>([]);
   const phishingCampaigns = needs("phishing", "risk", "governance")
-    ? await collectSurface("phishing_campaigns", [], errors, () => client.listPhishingCampaigns())
+    ? await collectListing("phishing_campaigns", errors, DEFAULT_LIST_LIMIT, () => client.listPhishingCampaigns())
     : skipped<JsonRecord[]>([]);
-  const securityTests = await collectSurface("security_tests", [], errors, () => client.listSecurityTests());
+  const securityTests = await collectListing("security_tests", errors, DEFAULT_LIST_LIMIT, () => client.listSecurityTests());
 
   let securityTestRecipients: Knowbe4Collected<Knowbe4SampledSecurityTest[]> = skipped([]);
   const unsampledSecurityTestIds: string[] = [];
@@ -1273,16 +1578,20 @@ export async function collectKnowbe4Snapshot(
     }
     const samples: Knowbe4SampledSecurityTest[] = [];
     const recipientErrors: string[] = [];
+    let recipientsTruncated = false;
     for (const item of sampled) {
       const id = testId(item.test);
       if (!id) continue;
       try {
+        const listing = toListing(await client.listSecurityTestRecipients(id), DEFAULT_LIST_LIMIT);
+        recipientsTruncated = recipientsTruncated || listing.truncated;
         samples.push({
           pst_id: id,
           campaign_id: asString(item.test.campaign_id),
           name: testName(item.test),
           started_at: item.startedAt.toISOString(),
-          recipients: await client.listSecurityTestRecipients(id),
+          recipients: listing.items.map(projectRecipient),
+          ...(listing.truncated ? { recipients_truncated: true } : {}),
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1291,26 +1600,30 @@ export async function collectKnowbe4Snapshot(
       }
     }
     errors.push(...recipientErrors);
-    securityTestRecipients = collected(samples, recipientErrors.length > 0 ? recipientErrors.join("; ") : undefined);
+    securityTestRecipients = {
+      ...collected(samples, recipientErrors.length > 0 ? recipientErrors.join("; ") : undefined),
+      truncated: recipientsTruncated,
+      limit: DEFAULT_LIST_LIMIT,
+    };
   }
 
   const callbackSecurityTests = needs("governance")
-    ? await collectSurface("callback_security_tests", [], errors, () => client.listSecurityTests({ campaignType: "callback" }))
+    ? await collectListing("callback_security_tests", errors, DEFAULT_LIST_LIMIT, () => client.listSecurityTests({ campaignType: "callback" }))
     : skipped<JsonRecord[]>([]);
   const trainingCampaigns = needs("training", "risk", "governance")
-    ? await collectSurface("training_campaigns", [], errors, () => client.listTrainingCampaigns())
+    ? await collectListing("training_campaigns", errors, DEFAULT_LIST_LIMIT, () => client.listTrainingCampaigns())
     : skipped<JsonRecord[]>([]);
   const trainingEnrollments = needs("training", "risk")
-    ? await collectSurface("training_enrollments", [], errors, () => client.listTrainingEnrollments({ limit: enrollmentLimit }))
+    ? await collectListing("training_enrollments", errors, enrollmentLimit, () => client.listTrainingEnrollments({ limit: enrollmentLimit }))
     : skipped<JsonRecord[]>([]);
   const storePurchases = needs("training")
-    ? await collectSurface("store_purchases", [], errors, () => client.listStorePurchases())
+    ? await collectListing("store_purchases", errors, DEFAULT_LIST_LIMIT, () => client.listStorePurchases())
     : skipped<JsonRecord[]>([]);
   const trainingPolicies = needs("training")
-    ? await collectSurface("training_policies", [], errors, () => client.listTrainingPolicies())
+    ? await collectListing("training_policies", errors, DEFAULT_LIST_LIMIT, () => client.listTrainingPolicies())
     : skipped<JsonRecord[]>([]);
   const phisherMessages = needs("phishing") && client.hasPhisherCredentials()
-    ? await collectSurface("phisher_messages", [], errors, () => client.listPhisherMessages({
+    ? await collectListing("phisher_messages", errors, phisherMessageLimit, () => client.listPhisherMessages({
       query: `reported_at:[${isoDay(daysAgo(now, lookbackDays))} TO *]`,
       limit: phisherMessageLimit,
     }))
@@ -1328,9 +1641,9 @@ export async function collectKnowbe4Snapshot(
     securityTestRecipients,
     unsampledSecurityTestIds,
     userLimit,
-    userLimitReached: activeUsers.data.length >= userLimit,
+    userLimitReached: Boolean(activeUsers.truncated),
     enrollmentLimit,
-    enrollmentLimitReached: trainingEnrollments.data.length >= enrollmentLimit,
+    enrollmentLimitReached: Boolean(trainingEnrollments.truncated),
     callbackSecurityTests,
     trainingCampaigns,
     trainingEnrollments,
@@ -1378,14 +1691,101 @@ function finding(
   };
 }
 
-function unavailableFinding(number: number, severity: Knowbe4Finding["severity"], error: string): Knowbe4Finding {
+function inventoryGap(inventory: Knowbe4InventoryName, error: string, notChecked: string): Knowbe4InventoryGap {
+  return {
+    inventory,
+    endpoint: INVENTORY_ENDPOINTS[inventory],
+    error,
+    not_checked: notChecked,
+    collect_manually: INVENTORY_MANUAL_EVIDENCE[inventory],
+  };
+}
+
+function inventoryGapCaveat(gap: Knowbe4InventoryGap): string {
+  return `Unreadable inventory: ${gap.inventory} (${gap.endpoint}: ${gap.error}), so ${gap.not_checked}. Collect manually: ${gap.collect_manually}.`;
+}
+
+// An inventory the control cannot be judged without was not readable: the API cannot prove the control, so the
+// finding is manual and names both the inventory and the console evidence that stands in for it.
+function unavailableFinding(number: number, severity: Knowbe4Finding["severity"], inventory: Knowbe4InventoryName, error: string): Knowbe4Finding {
+  const definition = controlById(number);
+  const gap = inventoryGap(inventory, error, `${definition.title.toLowerCase()} could not be evaluated from the API`);
   return finding(
     number,
     severity,
-    "warn",
-    `Could not evaluate this control because the required KnowBe4 data was not readable: ${error}`,
-    { collection_error: error },
+    "manual",
+    inventoryGapCaveat(gap),
+    { collection_error: error, unreadable_inventories: [gap] },
+    `Collect ${gap.collect_manually}.`,
   );
+}
+
+interface Knowbe4InventoryRead {
+  inventory: Knowbe4InventoryName;
+  /** What the finding could not check because the inventory was unreadable. */
+  notChecked: string;
+  /** An unreadable essential inventory makes the finding manual; otherwise it is warn. */
+  essential?: boolean;
+  /** Whether the verdict (not only the evidence) depends on the inventory; truncation only demotes verdict reads. */
+  verdict?: boolean;
+}
+
+function truncationCaveat(item: Knowbe4TruncatedInventory): string {
+  const cap = `${item.argument ?? "the collection cap"} (${item.limit ?? "unknown"})`;
+  const raise = item.argument ? `; raise ${item.argument} to cover the full inventory` : "";
+  return `Truncated listing: ${item.inventory} (${item.seen} of ${item.total ?? "unknown"} loaded, truncated at ${cap}), so this verdict only covers the records that were loaded${raise}.`;
+}
+
+/**
+ * Rule 1 corollary and rule 10 gate for every finding that reads collected inventories: a passing verdict never
+ * survives an unreadable inventory (manual when the inventory is essential, warn otherwise) or a truncated verdict
+ * inventory, and the summary names the inventory, what was not checked, and the console evidence to collect.
+ */
+function withInventoryCaveats(item: Knowbe4Finding, snapshot: Knowbe4Snapshot, reads: Knowbe4InventoryRead[]): Knowbe4Finding {
+  const gaps: Knowbe4InventoryGap[] = [];
+  const truncated: Knowbe4TruncatedInventory[] = [];
+  const truncatedVerdictReads: Knowbe4TruncatedInventory[] = [];
+  let essentialGap = false;
+  for (const read of reads) {
+    const collection = inventoryCollection(snapshot, read.inventory);
+    if (!collection.collected) continue;
+    if (collection.error) {
+      gaps.push(inventoryGap(read.inventory, collection.error, read.notChecked));
+      essentialGap = essentialGap || Boolean(read.essential);
+    } else if (collection.truncated) {
+      const entry: Knowbe4TruncatedInventory = {
+        inventory: read.inventory,
+        seen: Array.isArray(collection.data) ? collection.data.length : 1,
+        total: collection.total ?? null,
+        limit: collection.limit ?? null,
+        argument: INVENTORY_LIMIT_ARGUMENTS[read.inventory] ?? null,
+      };
+      truncated.push(entry);
+      if (read.verdict ?? true) truncatedVerdictReads.push(entry);
+    }
+  }
+  const verdictTruncated = truncatedVerdictReads.length > 0;
+
+  const existingGaps = asRecordArray(item.evidence?.unreadable_inventories);
+  const evidence: JsonRecord = {
+    ...(item.evidence ?? {}),
+    ...(reads.some((read) => read.inventory === "users") ? { user_limit: snapshot.userLimit, user_limit_reached: snapshot.userLimitReached } : {}),
+    ...(gaps.length > 0 || existingGaps.length > 0 ? { unreadable_inventories: [...existingGaps, ...gaps] } : {}),
+    ...(truncated.length > 0 ? { truncated_inventories: truncated } : {}),
+  };
+  if (gaps.length === 0 && truncated.length === 0) return { ...item, evidence };
+
+  let status = item.status;
+  if (status === "pass") {
+    if (gaps.length > 0) status = essentialGap ? "manual" : "warn";
+    else if (verdictTruncated) status = "warn";
+  }
+  const parts = [item.summary, ...gaps.map(inventoryGapCaveat)];
+  if (item.status === "pass" && verdictTruncated) parts.push(...truncatedVerdictReads.map(truncationCaveat));
+  const manualEvidence = status === "manual"
+    ? item.manualEvidence ?? `Collect ${gaps.map((gap) => gap.collect_manually).join("; ")}.`
+    : item.manualEvidence;
+  return { ...item, status, summary: parts.join(" "), evidence, manualEvidence };
 }
 
 // An empty user list is a data-access condition, not a clean population: anonymized KnowBe4 accounts cannot
@@ -1398,18 +1798,6 @@ function emptyUserListFinding(number: number, severity: Knowbe4Finding["severity
     `The Reporting API returned no active users, so ${subject} cannot be evaluated. Anonymized KnowBe4 accounts cannot retrieve user data through the API; confirm the account's anonymization setting and the API key before treating this control as met.`,
     { active_users: 0, user_list_empty: true, ...evidence },
   );
-}
-
-// Findings computed over the active user list cannot pass when user_limit truncated that list.
-function withUserCapCaveat(item: Knowbe4Finding, snapshot: Knowbe4Snapshot): Knowbe4Finding {
-  const evidence = { ...(item.evidence ?? {}), user_limit: snapshot.userLimit, user_limit_reached: snapshot.userLimitReached };
-  if (!snapshot.userLimitReached || item.status !== "pass") return { ...item, evidence };
-  return {
-    ...item,
-    status: "warn",
-    summary: `${item.summary} The active user list was truncated at user_limit (${snapshot.userLimit}), so this verdict only covers the users that were loaded.`,
-    evidence,
-  };
 }
 
 function userLabel(user: JsonRecord, redact: boolean): string {
@@ -1569,14 +1957,14 @@ function frameworkReportPath(key: Knowbe4FrameworkKey): string {
 }
 
 function assessPhishingFrequency(snapshot: Knowbe4Snapshot, now: Date, maxGapDays: number, lookbackDays: number): Knowbe4Finding {
-  if (snapshot.securityTests.error) return unavailableFinding(1, "high", snapshot.securityTests.error);
+  if (snapshot.securityTests.error) return unavailableFinding(1, "high", "security_tests", snapshot.securityTests.error);
   const tests = runTests(snapshot.securityTests.data, now);
   const latest = tests[0];
   const daysSince = latest ? roundTo(daysBetween(latest.startedAt, now)) : undefined;
   const inLookback = testsWithin(snapshot.securityTests.data, lookbackDays, now).length;
   const status = !latest ? "fail" : daysSince !== undefined && daysSince <= maxGapDays ? "pass" : "fail";
 
-  return finding(
+  return withInventoryCaveats(finding(
     1,
     "high",
     status,
@@ -1594,22 +1982,30 @@ function assessPhishingFrequency(snapshot: Knowbe4Snapshot, now: Date, maxGapDay
       security_tests_in_lookback: inLookback,
       lookback_days: lookbackDays,
     },
-  );
+  ), snapshot, [{ inventory: "security_tests", notChecked: "the latest test date is unknown", essential: true }]);
 }
 
+const SECURITY_TEST_READ: Knowbe4InventoryRead = { inventory: "security_tests", notChecked: "security test results were not available", essential: true };
+const USERS_READ: Knowbe4InventoryRead = { inventory: "users", notChecked: "the active user population was not available", essential: true };
+
 function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCoveragePct: number, redact: boolean): Knowbe4Finding {
-  if (snapshot.securityTests.error) return unavailableFinding(2, "high", snapshot.securityTests.error);
-  if (snapshot.activeUsers.error) return unavailableFinding(2, "high", snapshot.activeUsers.error);
+  const reads: Knowbe4InventoryRead[] = [
+    SECURITY_TEST_READ,
+    USERS_READ,
+    { inventory: "security_test_recipients", notChecked: "recipients of the security tests whose results failed to load were not counted toward coverage" },
+  ];
+  if (snapshot.securityTests.error) return unavailableFinding(2, "high", "security_tests", snapshot.securityTests.error);
+  if (snapshot.activeUsers.error) return unavailableFinding(2, "high", "users", snapshot.activeUsers.error);
   const active = activeUserIds(snapshot);
   const testsInWindow = testsWithin(snapshot.securityTests.data, lookbackDays, now);
   // With no tests the fail below stands on the test data alone; only a measured coverage needs a user population.
   if (testsInWindow.length > 0 && snapshot.activeUsers.data.length === 0) {
-    return emptyUserListFinding(2, "high", "phishing simulation coverage", {
+    return withInventoryCaveats(emptyUserListFinding(2, "high", "phishing simulation coverage", {
       tested_users: 0,
       coverage_pct: null,
       min_coverage_pct: minCoveragePct,
       security_tests_in_window: testsInWindow.length,
-    });
+    }), snapshot, reads);
   }
   const samples = sampledTestsWithin(snapshot, lookbackDays, now);
   const tested = new Set<string>();
@@ -1645,7 +2041,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     summary = `Only ${coverage ?? 0}% of ${active.size} active users were tested in the last ${lookbackDays} days (policy minimum ${minCoveragePct}%).`;
   }
 
-  return finding(2, "high", status, summary, {
+  return withInventoryCaveats(finding(2, "high", status, summary, {
     active_users: active.size,
     tested_users: tested.size,
     coverage_pct: coverage ?? null,
@@ -1654,11 +2050,11 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     sampled_security_tests: samples.map((sample) => sample.pst_id),
     unsampled_security_tests: unsampled,
     untested_user_sample: sampleLabels(untested, redact),
-  });
+  }), snapshot, reads);
 }
 
 function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxPhishPronePct: number): Knowbe4Finding {
-  if (snapshot.securityTests.error) return unavailableFinding(6, "high", snapshot.securityTests.error);
+  if (snapshot.securityTests.error) return unavailableFinding(6, "high", "security_tests", snapshot.securityTests.error);
   const recent = testsWithin(snapshot.securityTests.data, lookbackDays, now).map((item) => item.test);
   const history = runTests(snapshot.securityTests.data, now).map((item) => item.test).reverse();
   const current = weightedPhishPronePercent(recent);
@@ -1686,7 +2082,7 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
     summary = `The current phish-prone percentage is ${roundTo(current, 2)}%, within the ${maxPhishPronePct}% ceiling${baseline !== undefined ? ` and at or below the ${baseline}% baseline` : ""}.`;
   }
 
-  return finding(6, "high", status, summary, {
+  return withInventoryCaveats(finding(6, "high", status, summary, {
     current_phish_prone_pct: current === undefined ? null : roundTo(current, 2),
     current_source: current === undefined ? "unverified" : "security_tests",
     user_average_phish_prone_pct: userAverage === undefined ? null : roundTo(userAverage, 2),
@@ -1696,11 +2092,15 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
     security_tests_in_window: recent.length,
     security_tests_all_time: history.length,
     account_current_risk_score: accountRisk ?? null,
-  });
+  }), snapshot, [
+    SECURITY_TEST_READ,
+    { inventory: "users", notChecked: "the per-user phish-prone average was not computed", verdict: false },
+    { inventory: "account", notChecked: "the account risk score was not attached", verdict: false },
+  ]);
 }
 
 function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number): Knowbe4Finding {
-  if (snapshot.securityTests.error) return unavailableFinding(7, "medium", snapshot.securityTests.error);
+  if (snapshot.securityTests.error) return unavailableFinding(7, "medium", "security_tests", snapshot.securityTests.error);
   const windowDays = lookbackDays * 2;
   const tests = testsWithin(snapshot.securityTests.data, windowDays, now)
     .reverse()
@@ -1710,12 +2110,16 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     .map((point) => ({ score: asNumber(point.risk_score), date: asString(point.date) }))
     .filter((point): point is { score: number; date: string | undefined } => point.score !== undefined);
 
+  const reads: Knowbe4InventoryRead[] = [
+    SECURITY_TEST_READ,
+    { inventory: "account_risk_score_history", notChecked: "the organization risk score history was not attached", verdict: false },
+  ];
   if (tests.length < MIN_TREND_TESTS) {
-    return finding(7, "medium", "warn", `Only ${tests.length} phishing security tests with results ran in the last ${windowDays} days; at least ${MIN_TREND_TESTS} are needed to evaluate a trend.`, {
+    return withInventoryCaveats(finding(7, "medium", "warn", `Only ${tests.length} phishing security tests with results ran in the last ${windowDays} days; at least ${MIN_TREND_TESTS} are needed to evaluate a trend.`, {
       security_tests_considered: tests.length,
       window_days: windowDays,
       risk_score_history_points: riskHistory.length,
-    });
+    }), snapshot, reads);
   }
 
   const midpoint = Math.floor(tests.length / 2);
@@ -1724,7 +2128,7 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   const delta = roundTo(later - earlier, 2);
   const status = delta > TREND_FAIL_DELTA_PCT ? "fail" : delta > TREND_WARN_DELTA_PCT ? "warn" : "pass";
 
-  return finding(
+  return withInventoryCaveats(finding(
     7,
     "medium",
     status,
@@ -1741,11 +2145,11 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
       account_risk_score_first: riskHistory[0] ?? null,
       account_risk_score_last: riskHistory[riskHistory.length - 1] ?? null,
     },
-  );
+  ), snapshot, reads);
 }
 
 function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCoveragePct: number, requireFullTargeting: boolean): Knowbe4Finding {
-  if (snapshot.phishingCampaigns.error) return unavailableFinding(9, "medium", snapshot.phishingCampaigns.error);
+  if (snapshot.phishingCampaigns.error) return unavailableFinding(9, "medium", "phishing_campaigns", snapshot.phishingCampaigns.error);
   const cutoff = daysAgo(now, lookbackDays).getTime();
   const recentCampaignIds = new Set(
     testsWithin(snapshot.securityTests.data, lookbackDays, now)
@@ -1763,6 +2167,12 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
   });
   const fullCampaigns = activeCampaigns.filter(campaignTargetsAllUsers);
   const partialCampaigns = activeCampaigns.filter((campaign) => !campaignTargetsAllUsers(campaign));
+  // Without an All Users campaign the verdict is a coverage estimate over users and group member counts, so those
+  // inventories become essential: an unreadable one leaves the estimate undefined and the control unprovable.
+  if (partialCampaigns.length > 0 && fullCampaigns.length === 0) {
+    if (snapshot.activeUsers.error) return unavailableFinding(9, "medium", "users", snapshot.activeUsers.error);
+    if (snapshot.groups.error) return unavailableFinding(9, "medium", "groups", snapshot.groups.error);
+  }
   const activeUsers = activeUserIds(snapshot).size;
   const memberCounts = new Map<string, number>();
   for (const group of snapshot.groups.data) {
@@ -1800,7 +2210,7 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     summary = `Active phishing campaigns target an estimated ${estimatedCoverage ?? 0}% of active users, below the ${minCoveragePct}% policy minimum.`;
   }
 
-  return finding(9, "medium", status, summary, {
+  return withInventoryCaveats(finding(9, "medium", status, summary, {
     active_campaigns: activeCampaigns.length,
     full_targeting_campaigns: fullCampaigns.map(campaignName),
     partial_targeting_campaigns: partialCampaigns.slice(0, SAMPLE_SIZE).map((campaign) => ({
@@ -1811,11 +2221,16 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     min_coverage_pct: minCoveragePct,
     require_full_targeting: requireFullTargeting,
     active_users: activeUsers,
-  });
+  }), snapshot, [
+    { inventory: "phishing_campaigns", notChecked: "the campaign target groups were not available", essential: true },
+    { inventory: "security_tests", notChecked: "campaigns were classed as active from their status and last run alone, not from the tests that actually ran" },
+    { inventory: "users", notChecked: "the active user count behind the coverage estimate was not available" },
+    { inventory: "groups", notChecked: "group member counts behind the coverage estimate were not available" },
+  ]);
 }
 
 function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minReportRatePct: number): Knowbe4Finding {
-  if (snapshot.securityTests.error) return unavailableFinding(19, "medium", snapshot.securityTests.error);
+  if (snapshot.securityTests.error) return unavailableFinding(19, "medium", "security_tests", snapshot.securityTests.error);
   const recent = testsWithin(snapshot.securityTests.data, lookbackDays, now).map((item) => item.test);
   let delivered = 0;
   let reported = 0;
@@ -1830,6 +2245,9 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
       status: phisher.error ? "error" : "collected",
       error: phisher.error ?? null,
       messages_in_window: phisher.data.length,
+      messages_total: phisher.total ?? null,
+      truncated: Boolean(phisher.truncated),
+      message_limit: phisher.limit ?? null,
       by_category: countBy(phisher.data, "category"),
       by_action_status: countBy(phisher.data, "actionStatus"),
       unique_reporters: new Set(phisher.data.map((message) => asString(message.reportedBy)).filter(Boolean)).size,
@@ -1851,15 +2269,25 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     status = "fail";
     summary = `Only ${reportRate ?? 0}% of ${delivered} delivered simulated phishing emails were reported, far below the ${minReportRatePct}% policy minimum.`;
   }
+  if (phisher.collected && !phisher.error) {
+    const loaded = phisher.truncated
+      ? ` (${phisher.data.length} of ${phisher.total ?? "unknown"} loaded, truncated at phisher_message_limit (${phisher.limit ?? "unknown"}))`
+      : "";
+    summary += ` PhishER inbox: ${phisher.data.length} user-reported messages in the window${loaded}.`;
+  }
 
-  return finding(19, "medium", status, summary, {
+  return withInventoryCaveats(finding(19, "medium", status, summary, {
     delivered_count: delivered,
     reported_count: reported,
     report_rate_pct: reportRate ?? null,
     min_report_rate_pct: minReportRatePct,
     security_tests_in_window: recent.length,
     phisher: phisherEvidence,
-  });
+  }), snapshot, [
+    SECURITY_TEST_READ,
+    // PhishER enrichment is context: the rate itself comes from the security test counters, so the inbox only demotes when unreadable.
+    { inventory: "phisher_messages", notChecked: "PhishER inbox categories and reporter counts were not cross-checked against the report rate", verdict: false },
+  ]);
 }
 
 function countBy(records: JsonRecord[], key: string): JsonRecord {
@@ -1872,15 +2300,15 @@ function countBy(records: JsonRecord[], key: string): JsonRecord {
 }
 
 function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxScheduleGapDays: number): Knowbe4Finding {
-  if (snapshot.securityTests.error) return unavailableFinding(20, "medium", snapshot.securityTests.error);
+  if (snapshot.securityTests.error) return unavailableFinding(20, "medium", "security_tests", snapshot.securityTests.error);
   const allTests = runTests(snapshot.securityTests.data, now);
   if (allTests.length === 0) {
-    return finding(20, "medium", "fail", "No phishing security tests have ever run, so there is no scheduling cadence to evaluate.", {
+    return withInventoryCaveats(finding(20, "medium", "fail", "No phishing security tests have ever run, so there is no scheduling cadence to evaluate.", {
       security_tests_in_window: 0,
       security_tests_all_time: 0,
       lookback_days: lookbackDays,
       max_schedule_gap_days: maxScheduleGapDays,
-    });
+    }), snapshot, [SECURITY_TEST_READ]);
   }
   const inWindow = testsWithin(snapshot.securityTests.data, lookbackDays, now).reverse();
   const cutoff = daysAgo(now, lookbackDays).getTime();
@@ -1905,7 +2333,7 @@ function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookback
   const status = overThreshold.length === 0 ? "pass" : "fail";
   const latestOverdue = daysSinceLatest > maxScheduleGapDays;
 
-  return finding(
+  return withInventoryCaveats(finding(
     20,
     "medium",
     status,
@@ -1924,7 +2352,7 @@ function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookback
       gaps,
       gaps_over_threshold: overThreshold,
     },
-  );
+  ), snapshot, [SECURITY_TEST_READ]);
 }
 
 export function assessKnowbe4PhishingProgram(
@@ -1943,10 +2371,10 @@ export function assessKnowbe4PhishingProgram(
 
   const findings = [
     assessPhishingFrequency(snapshot, now, maxCampaignGapDays, lookbackDays),
-    withUserCapCaveat(assessPhishingCoverage(snapshot, now, lookbackDays, minCoveragePct, redact), snapshot),
+    assessPhishingCoverage(snapshot, now, lookbackDays, minCoveragePct, redact),
     assessPhishPronePercentage(snapshot, now, lookbackDays, maxPhishPronePct),
     assessFailureTrend(snapshot, now, lookbackDays),
-    withUserCapCaveat(assessCampaignTargeting(snapshot, now, lookbackDays, minCoveragePct, requireFullTargeting), snapshot),
+    assessCampaignTargeting(snapshot, now, lookbackDays, minCoveragePct, requireFullTargeting),
     assessReportRate(snapshot, now, lookbackDays, minReportRatePct),
     assessScheduleRegularity(snapshot, now, lookbackDays, maxScheduleGapDays),
   ];
@@ -2023,7 +2451,7 @@ function completionFromEnrollments(enrollments: JsonRecord[]): number | undefine
 }
 
 function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, failCompletionPct: number, enrollmentLimitReached: boolean): Knowbe4Finding {
-  if (snapshot.trainingCampaigns.error) return unavailableFinding(3, "high", snapshot.trainingCampaigns.error);
+  if (snapshot.trainingCampaigns.error) return unavailableFinding(3, "high", "training_campaigns", snapshot.trainingCampaigns.error);
   const enrollmentsByCampaign = new Map<string, JsonRecord[]>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
     const id = enrollmentCampaignId(enrollment);
@@ -2089,7 +2517,7 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
     summary = `All ${evaluated.length} completed training campaigns in the last ${lookbackDays} days met the ${minCompletionPct}% completion target.`;
   }
 
-  return finding(3, "high", status, summary, {
+  return withInventoryCaveats(finding(3, "high", status, summary, {
     campaigns_evaluated: evaluated,
     campaigns_with_truncated_enrollments: truncated,
     campaigns_without_measurable_completion: unmeasured,
@@ -2097,19 +2525,27 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
     min_completion_pct: minCompletionPct,
     fail_completion_pct: failCompletionPct,
     training_lookback_days: lookbackDays,
-  });
+  }), snapshot, [
+    TRAINING_CAMPAIGN_READ,
+    // Enrollments only back the -1 sentinel fallback, which handles its own truncation above; an unreadable list still demotes.
+    { inventory: "training_enrollments", notChecked: "campaigns reporting the -1 completion sentinel could not be measured from enrollments", verdict: false },
+  ]);
 }
 
+const TRAINING_CAMPAIGN_READ: Knowbe4InventoryRead = { inventory: "training_campaigns", notChecked: "training campaign content, dates, and completion were not available", essential: true };
+const ENROLLMENT_READ: Knowbe4InventoryRead = { inventory: "training_enrollments", notChecked: "training enrollments were not available", essential: true };
+
 function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, graceDays: number, enrollmentLimitReached: boolean, redact: boolean): Knowbe4Finding {
-  if (snapshot.activeUsers.error) return unavailableFinding(4, "medium", snapshot.activeUsers.error);
-  if (snapshot.trainingEnrollments.error) return unavailableFinding(4, "medium", snapshot.trainingEnrollments.error);
+  const reads: Knowbe4InventoryRead[] = [USERS_READ, ENROLLMENT_READ];
+  if (snapshot.activeUsers.error) return unavailableFinding(4, "medium", "users", snapshot.activeUsers.error);
+  if (snapshot.trainingEnrollments.error) return unavailableFinding(4, "medium", "training_enrollments", snapshot.trainingEnrollments.error);
   if (snapshot.activeUsers.data.length === 0) {
-    return emptyUserListFinding(4, "medium", "training enrollment timeliness for new users", {
+    return withInventoryCaveats(emptyUserListFinding(4, "medium", "training enrollment timeliness for new users", {
       new_users_evaluated: 0,
       enrollment_grace_days: graceDays,
       training_lookback_days: lookbackDays,
       enrollment_limit_reached: enrollmentLimitReached,
-    });
+    }), snapshot, reads);
   }
   const earliestEnrollment = new Map<string, Date>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
@@ -2151,7 +2587,7 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     summary = `${late.length} of ${newUsers.length} recently joined users (${latePct}%) had no training enrollment within ${graceDays} days of joining.`;
   }
 
-  return finding(4, "medium", status, summary, {
+  return withInventoryCaveats(finding(4, "medium", status, summary, {
     new_users_evaluated: newUsers.length,
     late_or_missing_enrollments: late.length,
     late_pct: latePct ?? null,
@@ -2159,12 +2595,12 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     training_lookback_days: lookbackDays,
     enrollment_limit_reached: enrollmentLimitReached,
     late_user_sample: sampleLabels(late, redact),
-  });
+  }), snapshot, reads);
 }
 
 function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, remedialWindowDays: number, redact: boolean): Knowbe4Finding {
-  if (snapshot.trainingEnrollments.error) return unavailableFinding(10, "medium", snapshot.trainingEnrollments.error);
-  if (snapshot.securityTests.error) return unavailableFinding(10, "medium", snapshot.securityTests.error);
+  if (snapshot.securityTests.error) return unavailableFinding(10, "medium", "security_tests", snapshot.securityTests.error);
+  if (snapshot.trainingEnrollments.error) return unavailableFinding(10, "medium", "training_enrollments", snapshot.trainingEnrollments.error);
   const enrollmentsByUser = new Map<string, Date[]>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
     const userId = enrollmentUserId(enrollment);
@@ -2228,7 +2664,7 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     summary = `${unremediated.length} of ${evaluable.length} users who failed a sampled phishing test have no training enrollment after the failure.`;
   }
 
-  return finding(10, "medium", status, summary, {
+  return withInventoryCaveats(finding(10, "medium", status, summary, {
     security_tests_in_window: testsInWindow.length,
     sampled_security_tests: samples.map((sample) => sample.pst_id),
     unsampled_security_tests: unsampled,
@@ -2242,7 +2678,12 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
       user: userLabel(item.user, redact),
       failed_at: item.failedAt.toISOString(),
     })),
-  });
+  }), snapshot, [
+    SECURITY_TEST_READ,
+    ENROLLMENT_READ,
+    { inventory: "security_test_recipients", notChecked: "failures in the security tests whose recipient results did not load were not evaluated for remediation" },
+    { inventory: "training_campaigns", notChecked: "auto-enroll remedial campaigns were not listed", verdict: false },
+  ]);
 }
 
 function campaignContentItems(campaign: JsonRecord): JsonRecord[] {
@@ -2254,7 +2695,7 @@ function storePurchaseId(item: JsonRecord): string | undefined {
 }
 
 function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxContentAgeDays: number): Knowbe4Finding {
-  if (snapshot.trainingCampaigns.error) return unavailableFinding(11, "low", snapshot.trainingCampaigns.error);
+  if (snapshot.trainingCampaigns.error) return unavailableFinding(11, "low", "training_campaigns", snapshot.trainingCampaigns.error);
   const retiredPurchases = new Set<string>();
   const catalogPublishDates = new Map<string, Date>();
   for (const purchase of snapshot.storePurchases.data) {
@@ -2313,7 +2754,7 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
     summary = `All ${reviewed} assigned training modules have publish dates within the last ${maxContentAgeDays} days and none are retired.`;
   }
 
-  return finding(11, "low", status, summary, {
+  return withInventoryCaveats(finding(11, "low", status, summary, {
     modules_reviewed: reviewed,
     modules_with_publish_date: dated,
     retired_modules: retired.slice(0, SAMPLE_SIZE),
@@ -2322,13 +2763,16 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
     undated_modules: undated.slice(0, SAMPLE_SIZE),
     max_content_age_days: maxContentAgeDays,
     training_lookback_days: lookbackDays,
-  });
+  }), snapshot, [
+    TRAINING_CAMPAIGN_READ,
+    { inventory: "store_purchases", notChecked: "assigned modules were not cross-checked against the ModStore catalog for retirement and publish dates" },
+  ]);
 }
 
 const COMPLIANCE_TOPIC_PATTERN = /\b(hipaa|pci|gdpr|sox|ferpa|ccpa|cpra|glba|cmmc|nist|iso\s?27001|fedramp|privacy|compliance|acceptable use|insider threat)\b/i;
 
 function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, requiredTopics: string[], enrollmentLimitReached: boolean): Knowbe4Finding {
-  if (snapshot.trainingCampaigns.error) return unavailableFinding(17, "medium", snapshot.trainingCampaigns.error);
+  if (snapshot.trainingCampaigns.error) return unavailableFinding(17, "medium", "training_campaigns", snapshot.trainingCampaigns.error);
   const enrollmentsUnavailable = Boolean(snapshot.trainingEnrollments.error) || !snapshot.trainingEnrollments.collected;
   const assignedModules = new Map<string, Set<string>>();
   for (const campaign of snapshot.trainingCampaigns.data) {
@@ -2399,7 +2843,7 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)} with completion at or above ${minCompletionPct}%.`;
   }
 
-  return finding(17, "medium", status, summary, {
+  return withInventoryCaveats(finding(17, "medium", status, summary, {
     required_compliance_topics: requiredTopics,
     topics: topicResults,
     topics_without_enrollments: unenrolled.map((item) => item.topic),
@@ -2409,7 +2853,12 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     enrollment_limit_reached: enrollmentLimitReached,
     completion_data_partial: enrollmentDataPartial,
     uploaded_policies: snapshot.trainingPolicies.data.length,
-  });
+  }), snapshot, [
+    TRAINING_CAMPAIGN_READ,
+    // Completion over enrollments never passes while the list is unreadable or truncated (handled above), so the gate only annotates.
+    { inventory: "training_enrollments", notChecked: "completion of the assigned compliance modules could not be measured" },
+    { inventory: "training_policies", notChecked: "uploaded policy documents were not counted alongside the compliance modules", verdict: false },
+  ]);
 }
 
 export function assessKnowbe4TrainingProgram(
@@ -2430,7 +2879,7 @@ export function assessKnowbe4TrainingProgram(
 
   const findings = [
     assessTrainingCompletion(snapshot, now, trainingLookbackDays, minCompletionPct, failCompletionPct, enrollmentLimitReached),
-    withUserCapCaveat(assessEnrollmentTimeliness(snapshot, now, trainingLookbackDays, graceDays, enrollmentLimitReached, redact), snapshot),
+    assessEnrollmentTimeliness(snapshot, now, trainingLookbackDays, graceDays, enrollmentLimitReached, redact),
     assessRemedialTraining(snapshot, now, lookbackDays, remedialWindowDays, redact),
     assessContentCurrency(snapshot, now, trainingLookbackDays, maxContentAgeDays),
     assessComplianceModules(snapshot, now, trainingLookbackDays, minCompletionPct, requiredTopics, enrollmentLimitReached),
@@ -2455,15 +2904,21 @@ export function assessKnowbe4TrainingProgram(
   };
 }
 
+const RISK_DISTRIBUTION_READS: Knowbe4InventoryRead[] = [
+  USERS_READ,
+  { inventory: "account", notChecked: "the organization risk score was not attached for comparison", verdict: false },
+  { inventory: "account_risk_score_history", notChecked: "the organization risk score trend was not attached", verdict: false },
+];
+
 function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: number, maxStddev: number, redact: boolean): Knowbe4Finding {
-  if (snapshot.activeUsers.error) return unavailableFinding(5, "medium", snapshot.activeUsers.error);
+  if (snapshot.activeUsers.error) return unavailableFinding(5, "medium", "users", snapshot.activeUsers.error);
   if (snapshot.activeUsers.data.length === 0) {
-    return emptyUserListFinding(5, "medium", "the user risk score distribution", {
+    return withInventoryCaveats(emptyUserListFinding(5, "medium", "the user risk score distribution", {
       users_scored: 0,
       max_mean_risk_score: maxMeanRiskScore,
       max_risk_score_stddev: maxStddev,
       account_current_risk_score: asNumber(snapshot.account.data.current_risk_score) ?? null,
-    });
+    }), snapshot, RISK_DISTRIBUTION_READS);
   }
   const scored = snapshot.activeUsers.data
     .map((user) => ({ user, score: asNumber(user.current_risk_score) }))
@@ -2492,7 +2947,7 @@ function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: num
     summary = `The mean user risk score is ${roundTo(average)} with a standard deviation of ${roundTo(deviation)} across ${scores.length} active users.`;
   }
 
-  return finding(5, "medium", status, summary, {
+  return withInventoryCaveats(finding(5, "medium", status, summary, {
     users_scored: scores.length,
     mean_risk_score: average === undefined ? null : roundTo(average),
     stddev_risk_score: deviation === undefined ? null : roundTo(deviation),
@@ -2503,7 +2958,7 @@ function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: num
     account_risk_history_first: history[0] ?? null,
     account_risk_history_last: history[history.length - 1] ?? null,
     highest_risk_users: highest.map((item) => ({ user: userLabel(item.user, redact), risk_score: item.score })),
-  });
+  }), snapshot, RISK_DISTRIBUTION_READS);
 }
 
 function phishingCampaignInWindow(campaign: JsonRecord, days: number, now: Date): boolean {
@@ -2516,10 +2971,16 @@ function phishingCampaignInWindow(campaign: JsonRecord, days: number, now: Date)
   });
 }
 
+const GROUP_COVERAGE_READS: Knowbe4InventoryRead[] = [
+  { inventory: "groups", notChecked: "the active group list was not available", essential: true },
+  { inventory: "phishing_campaigns", notChecked: "phishing campaign target groups were not available", essential: true },
+  TRAINING_CAMPAIGN_READ,
+];
+
 function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number): Knowbe4Finding {
-  if (snapshot.groups.error) return unavailableFinding(8, "medium", snapshot.groups.error);
-  if (snapshot.phishingCampaigns.error) return unavailableFinding(8, "medium", snapshot.phishingCampaigns.error);
-  if (snapshot.trainingCampaigns.error) return unavailableFinding(8, "medium", snapshot.trainingCampaigns.error);
+  if (snapshot.groups.error) return unavailableFinding(8, "medium", "groups", snapshot.groups.error);
+  if (snapshot.phishingCampaigns.error) return unavailableFinding(8, "medium", "phishing_campaigns", snapshot.phishingCampaigns.error);
+  if (snapshot.trainingCampaigns.error) return unavailableFinding(8, "medium", "training_campaigns", snapshot.trainingCampaigns.error);
   const groups = snapshot.groups.data.filter((group) => (asNumber(group.member_count) ?? 1) > 0);
   const phishingCampaigns = snapshot.phishingCampaigns.data.filter((campaign) => phishingCampaignInWindow(campaign, lookbackDays, now));
   const trainingCampaigns = snapshot.trainingCampaigns.data.filter((campaign) => !campaignCancelled(campaign) && campaignInWindow(campaign, lookbackDays, now));
@@ -2557,7 +3018,7 @@ function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays:
     summary = `${missingPhishing.length} groups lacked a phishing campaign and ${missingTraining.length} groups lacked a training campaign in the last ${lookbackDays} days.`;
   }
 
-  return finding(8, "medium", status, summary, {
+  return withInventoryCaveats(finding(8, "medium", status, summary, {
     active_groups: groups.length,
     phishing_campaigns_in_window: phishingCampaigns.length,
     training_campaigns_in_window: trainingCampaigns.length,
@@ -2566,17 +3027,26 @@ function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays:
     groups_missing_phishing: missingPhishing.slice(0, SAMPLE_SIZE).map(describe),
     groups_missing_training: missingTraining.slice(0, SAMPLE_SIZE).map(describe),
     lookback_days: lookbackDays,
-  });
+  }), snapshot, GROUP_COVERAGE_READS);
 }
 
+// Activity signals are cross-checks on the user list: sign-in dates alone can still judge the control, so a missing
+// signal source demotes to warn while an unreadable user list is manual.
+const INACTIVE_USER_READS: Knowbe4InventoryRead[] = [
+  USERS_READ,
+  { inventory: "security_tests", notChecked: "phishing participation could not be used as an activity signal" },
+  { inventory: "security_test_recipients", notChecked: "deliveries in the security tests whose recipient results did not load were not counted as activity" },
+  { inventory: "training_enrollments", notChecked: "training activity could not be used as an activity signal" },
+];
+
 function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays: number, enrollmentLimitReached: boolean, redact: boolean): Knowbe4Finding {
-  if (snapshot.activeUsers.error) return unavailableFinding(18, "medium", snapshot.activeUsers.error);
+  if (snapshot.activeUsers.error) return unavailableFinding(18, "medium", "users", snapshot.activeUsers.error);
   if (snapshot.activeUsers.data.length === 0) {
-    return emptyUserListFinding(18, "medium", "inactive user cleanup", {
+    return withInventoryCaveats(emptyUserListFinding(18, "medium", "inactive user cleanup", {
       users_evaluated: 0,
       inactive_users: 0,
       inactive_days: inactiveDays,
-    });
+    }), snapshot, INACTIVE_USER_READS);
   }
   const cutoff = daysAgo(now, inactiveDays).getTime();
   const activeSignals = new Set<string>();
@@ -2625,7 +3095,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     summary = `${inactive.length} of ${candidates.length} active users (${inactivePct}%) have not participated in any campaign or signed in for ${inactiveDays}+ days and should be reviewed for archival.`;
   }
 
-  return finding(18, "medium", status, summary, {
+  return withInventoryCaveats(finding(18, "medium", status, summary, {
     users_evaluated: candidates.length,
     inactive_users: inactive.length,
     inactive_pct: inactivePct ?? null,
@@ -2633,7 +3103,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     partial_activity_data: partialData,
     unsampled_security_tests: snapshot.unsampledSecurityTestIds.length,
     inactive_user_sample: sampleLabels(inactive, redact),
-  });
+  }), snapshot, INACTIVE_USER_READS);
 }
 
 export function assessKnowbe4UserRisk(
@@ -2649,9 +3119,9 @@ export function assessKnowbe4UserRisk(
   const enrollmentLimitReached = snapshot.enrollmentLimitReached;
 
   const findings = [
-    withUserCapCaveat(assessRiskDistribution(snapshot, maxMeanRiskScore, maxStddev, redact), snapshot),
+    assessRiskDistribution(snapshot, maxMeanRiskScore, maxStddev, redact),
     assessGroupCoverage(snapshot, now, lookbackDays),
-    withUserCapCaveat(assessInactiveUsers(snapshot, now, inactiveDays, enrollmentLimitReached, redact), snapshot),
+    assessInactiveUsers(snapshot, now, inactiveDays, enrollmentLimitReached, redact),
   ];
 
   return {
@@ -2684,7 +3154,7 @@ function accountDomains(snapshot: Knowbe4Snapshot): string[] {
 }
 
 function assessAdminRoles(snapshot: Knowbe4Snapshot, maxAdminCount: number, redact: boolean): Knowbe4Finding {
-  if (snapshot.account.error) return unavailableFinding(12, "high", snapshot.account.error);
+  if (snapshot.account.error) return unavailableFinding(12, "high", "account", snapshot.account.error);
   const admins = asRecordArray(snapshot.account.data.admins);
   const allowedDomains = new Set(accountDomains(snapshot).map((domain) => domain.toLowerCase()));
   const externalAdmins = allowedDomains.size > 0
@@ -2830,7 +3300,7 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   const allTime = runTests(snapshot.callbackSecurityTests.data, now);
   const status = recent.length > 0 ? "pass" : "fail";
 
-  return finding(
+  return withInventoryCaveats(finding(
     16,
     "low",
     status,
@@ -2846,7 +3316,7 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
       lookback_days: lookbackDays,
       evaluation_note: "Vishing is evaluated through KnowBe4 callback phishing tests, the voice-channel simulation the Reporting API exposes via campaign_type=callback.",
     },
-  );
+  ), snapshot, [{ inventory: "callback_security_tests", notChecked: "callback test dates were not available", essential: true }]);
 }
 
 export function assessKnowbe4AccountGovernance(
@@ -3048,11 +3518,13 @@ function buildQuickReference(): string {
   return [
     "# KnowBe4 Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw KnowBe4 Reporting API (and PhishER GraphQL) responses used during this assessment.",
+    "- `core_data/` contains the KnowBe4 Reporting API (and PhishER GraphQL) responses used during this assessment. User records drop free-form comment and custom fields at collection time; credential-shaped values are replaced with [REDACTED] and URLs are reduced to scheme and host before writing.",
+    "- `core_data/collection_status.json` records, per inventory, whether the read succeeded, how it ended (truncated at a cap or complete), how many records were loaded, and the server total when the API exposes one.",
     "- `analysis/` contains normalized findings, per-area assessment summaries, and the 20-control coverage map.",
     "- `compliance/` contains the executive summary, unified matrix, and one report per mapped framework.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
     "- Manual findings list the exact console evidence a human must collect; review them before asserting compliance.",
+    "- A finding whose inventories were unreadable or truncated says so in its summary (`Unreadable inventory:` / `Truncated listing:`) and never reports pass on the missing records.",
     "",
     "Recommended reading order:",
     "1. `compliance/executive_summary.md`",
@@ -3099,7 +3571,8 @@ export async function exportKnowbe4AuditBundle(
     assessKnowbe4AccountGovernance(snapshot, assessmentOptions),
   ];
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const redact = (value: unknown): unknown => (config.redactPii ? redactKnowbe4Pii(value) : value);
+  // Credential-shaped values and token-bearing URLs never leave the process regardless of the PII setting.
+  const redact = (value: unknown): unknown => redactCredentialValues(config.redactPii ? redactKnowbe4Pii(value) : value);
 
   ensurePrivateDir(outputRoot);
   const accountName = asString(snapshot.account.data.name) ?? `knowbe4-${config.region}`;
@@ -3119,6 +3592,7 @@ export async function exportKnowbe4AuditBundle(
 
   const coreDataFiles: Array<[string, unknown]> = [
     ["core_data/access.json", access],
+    ["core_data/collection_status.json", knowbe4CollectionStatus(snapshot)],
     ["core_data/account.json", snapshot.account.data],
     ["core_data/account_risk_score_history.json", snapshot.accountRiskHistory.data],
     ["core_data/users_active.json", snapshot.activeUsers.data],
