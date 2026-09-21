@@ -937,12 +937,7 @@ test("redaction keeps field names, drops credential-bearing values, and scrubs k
   assert.doesNotMatch(text, /FAKE_/);
   assert.match(text, /\[redacted key material\]/);
   assert.match(text, /token=\[redacted\]/);
-  assert.match(text, /Authorization: Signature \[redacted\]/);
-  assert.match(text, /Debug: keyId=\[redacted\] signature=\[redacted\] Bearer \[redacted\] Signature \[redacted\]/);
-  assert.doesNotMatch(text, /rsa-sha256|version="1"/, "the parameter list is redacted as a whole");
-  const headerOnly = redactSensitiveText(`Authorization: ${SIGNING_HEADER}`);
-  assert.equal(headerOnly, "Authorization: Signature [redacted]");
-  assert.equal(redactSensitiveText("kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk"), "kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk", "KMS key OCIDs are not signing keyIds");
+  assert.match(text, /Signature \[redacted\]/);
   assert.equal(redactSensitiveText("https://objectstorage.example/p/FAKE_ACCESS_URI_1/n/ns/b/logs/o/"), "https://objectstorage.example/p/[redacted]/n/ns/b/logs/o/");
   assert.deepEqual(projectCompartmentSnapshot({ ...PROD, description: "secret", freeformTags: { password: "x" } }), {
     id: PROD.id,
@@ -950,6 +945,22 @@ test("redaction keeps field names, drops credential-bearing values, and scrubs k
     name: "prod",
     lifecycleState: "ACTIVE",
   });
+});
+
+test("OCI request-signing header values never survive text redaction", () => {
+  const headerOnly = redactSensitiveText(`Authorization: ${SIGNING_HEADER}`);
+  assert.equal(headerOnly, "Authorization: Signature [redacted]");
+  const spaced = redactSensitiveText('Signature version = "1", keyId = "ocid1.tenancy.oc1..FAKE_T/ocid1.user.oc1..FAKE_U/FAKE_FP", signature = "FAKE_SIG=="');
+  assert.equal(spaced, "Signature [redacted]");
+  const standalone = redactSensitiveText('keyId="ocid1.tenancy.oc1..FAKE_T/ocid1.user.oc1..FAKE_U/FAKE_FP" signature="FAKE_SIG==" request_signature=FAKE_SIG_2');
+  assert.equal(standalone, "keyId=[redacted] signature=[redacted] request_signature=[redacted]");
+  const bare = redactSensitiveText("Signature FAKE_SIGNATURE_BARE_1abcdef Bearer FAKE_BEARER_1abcdefgh");
+  assert.equal(bare, "Signature [redacted] Bearer [redacted]");
+  const text = redactSensitiveText(SECRET_ERROR.message);
+  assert.doesNotMatch(text, /FAKE_|rsa-sha256|version="1"/, "the parameter list is redacted as a whole");
+  assert.match(text, /Authorization: Signature \[redacted\]/);
+  assert.match(text, /Debug: keyId=\[redacted\] signature=\[redacted\] Bearer \[redacted\] Signature \[redacted\]/);
+  assert.equal(redactSensitiveText("kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk"), "kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk", "KMS key OCIDs are not signing keyIds");
 });
 
 test("rule 9: bundle files, the zip, and tool outputs never carry credential-bearing values", async () => {
