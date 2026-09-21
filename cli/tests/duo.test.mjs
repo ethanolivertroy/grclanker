@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash, createHmac } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -836,6 +837,96 @@ test("resolveDuoConfiguration prefers explicit args over environment values", ()
   assert.equal(overridden.skey, "arg-skey");
   assert.equal(overridden.lookbackDays, 45);
   assert.deepEqual(overridden.sourceChain, ["environment", "arguments"]);
+});
+
+function sha512Hex(value) {
+  return createHash("sha512").update(value).digest("hex");
+}
+
+function expectedAuthorization(config, canonicalLines) {
+  const signature = createHmac("sha512", config.skey).update(canonicalLines.join("\n")).digest("hex");
+  return `Basic ${Buffer.from(`${config.ikey}:${signature}`).toString("base64")}`;
+}
+
+test("DuoAuditorClient signs the Policies v2 API with the documented v5 canonical string", async () => {
+  const config = createSampleConfig();
+  const captured = [];
+  const fetchImpl = async (input, init = {}) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    captured.push({
+      path: requestUrl.pathname,
+      query: requestUrl.search.replace(/^\?/, ""),
+      method: init.method,
+      date: init.headers.Date,
+      authorization: init.headers.Authorization,
+      contentType: init.headers["Content-Type"],
+    });
+    if (requestUrl.pathname === "/admin/v2/policies/global") {
+      return new Response(JSON.stringify({ stat: "OK", response: compliantGlobalPolicy() }), { status: 200 });
+    }
+    if (requestUrl.pathname === "/admin/v2/policies") {
+      return new Response(
+        JSON.stringify({ stat: "OK", response: [compliantGlobalPolicy()], metadata: { total_objects: 1 } }),
+        { status: 200 },
+      );
+    }
+    if (requestUrl.pathname === "/admin/v1/settings") {
+      return new Response(JSON.stringify({ stat: "OK", response: compliantSettings() }), { status: 200 });
+    }
+    throw new Error(`Unexpected request: ${requestUrl.pathname}`);
+  };
+
+  const client = new DuoAuditorClient(config, { fetchImpl });
+  await client.getGlobalPolicy();
+  await client.listPolicies();
+  await client.getSettings();
+
+  const emptyHash = sha512Hex("");
+  const globalPolicyRequest = captured.find((request) => request.path === "/admin/v2/policies/global");
+  assert.equal(globalPolicyRequest.method, "GET");
+  assert.equal(globalPolicyRequest.query, "", "the global policy read sends no query parameters");
+  assert.equal(globalPolicyRequest.contentType, undefined, "GET requests carry no body and no Content-Type");
+  assert.equal(
+    globalPolicyRequest.authorization,
+    expectedAuthorization(config, [
+      globalPolicyRequest.date,
+      "GET",
+      config.apiHost,
+      "/admin/v2/policies/global",
+      "",
+      emptyHash,
+      emptyHash,
+    ]),
+    "v5: date, method, host, path, blank query line, SHA-512 of the empty body, SHA-512 of no X-Duo headers",
+  );
+  assert.notEqual(
+    globalPolicyRequest.authorization,
+    expectedAuthorization(config, [globalPolicyRequest.date, "GET", config.apiHost, "/admin/v2/policies/global", ""]),
+    "the legacy five-line v2 canonical string must not be used for the Policies v2 API",
+  );
+
+  const policiesRequest = captured.find((request) => request.path === "/admin/v2/policies");
+  assert.equal(policiesRequest.query, "limit=100&offset=0");
+  assert.equal(
+    policiesRequest.authorization,
+    expectedAuthorization(config, [
+      policiesRequest.date,
+      "GET",
+      config.apiHost,
+      "/admin/v2/policies",
+      "limit=100&offset=0",
+      emptyHash,
+      emptyHash,
+    ]),
+    "paged policy reads keep the sorted query string on line five of the v5 canonical string",
+  );
+
+  const settingsRequest = captured.find((request) => request.path === "/admin/v1/settings");
+  assert.equal(
+    settingsRequest.authorization,
+    expectedAuthorization(config, [settingsRequest.date, "GET", config.apiHost, "/admin/v1/settings", ""]),
+    "endpoints without a v5-only note keep the v2 canonical string",
+  );
 });
 
 test("DuoAuditorClient handles v2/v5 signing, retries, and pagination", async () => {

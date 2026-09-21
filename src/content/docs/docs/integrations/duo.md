@@ -18,7 +18,7 @@ export DUO_API_HOST=api-XXXXXXXX.duosecurity.com
 export DUO_LOOKBACK_DAYS=30   # optional, 1 to 180
 ```
 
-Each tool also accepts `api_host`, `ikey`, `skey`, and `lookback_days` arguments that override the environment. Requests are signed with HMAC-SHA512 using the documented v2 canonical string for `/admin/v1` and `/admin/v2` endpoints and the v5 canonical string for `/admin/v3/integrations`.
+Each tool also accepts `api_host`, `ikey`, `skey`, and `lookback_days` arguments that override the environment. Requests are signed with HMAC-SHA512. The endpoints the reference marks as v5-only (`/admin/v2/policies` and `/admin/v2/policies/global` in the Policies section, `/admin/v3/integrations` in the Integrations section) use the seven-line v5 canonical string: date, method, host, path, sorted query string, SHA-512 of the request body (the empty string for GET), and SHA-512 of the additional `X-Duo-*` headers (none are sent). Every other `/admin/v1` and `/admin/v2` endpoint keeps the legacy v2 canonical string.
 
 Grant the Admin API application these read-only permissions:
 

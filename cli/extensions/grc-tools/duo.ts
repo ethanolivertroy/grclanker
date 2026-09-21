@@ -895,8 +895,20 @@ function compactParams(params: DuoRequestParams): Record<string, string | string
   }, {});
 }
 
+/**
+ * Admin API reference sections that state "requires v5 signing. It does not support v2 signing":
+ * Integrations v3, Integrations (Legacy v2), Retrieve Secret Key, Policies v2, and Passport v2.
+ */
+const V5_ONLY_PATH_PATTERNS: readonly RegExp[] = [
+  /^\/admin\/v3\//,
+  /^\/admin\/v2\/integrations(\/|$)/,
+  /^\/admin\/v1\/integrations\/[^/]+\/skey$/,
+  /^\/admin\/v2\/policies(\/|$)/,
+  /^\/admin\/v2\/passport(\/|$)/,
+];
+
 function isV5Path(path: string): boolean {
-  return path.startsWith("/admin/v3/");
+  return V5_ONLY_PATH_PATTERNS.some((pattern) => pattern.test(path));
 }
 
 function sleep(ms: number): Promise<void> {
