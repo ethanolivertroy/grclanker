@@ -30,6 +30,7 @@ import {
   redactSecrets,
   resolveSecureOutputPath,
   resolveWebexConfiguration,
+  scrubErrorText,
   scrubValue,
 } from "../dist/extensions/grc-tools/webex.js";
 
@@ -1040,7 +1041,11 @@ test("corollary hit 1: WEBEX-ID-07 caps at warn when GET /guests/count is denied
   const identity = await assessWebexIdentity(denying(["getGuestCount"]));
   const guests = byId(identity.findings, "WEBEX-ID-07");
   assert.equal(guests.status, "warn");
-  assert.match(guests.summary, /^1 guest accounts .* were inventoried among 5 people\. GET \/guests\/count was not readable \(Webex request failed \(403 Forbidden\) for \/guests\/count; scope guest-issuer:read\), so the guest-issuer count could not be reconciled\./);
+  assert.match(
+    guests.summary,
+    /^1 guest accounts .* were inventoried among 5 people\. GET \/guests\/count was not readable \(403; scope guest-issuer:read\), so the guest-issuer count could not be reconciled with the people-based inventory\. Reconcile the list/,
+    "the note follows the same <endpoint> was not readable (<status>; scope <scope>), so <consequence> template as every other finding",
+  );
   assert.equal(guests.evidence.guest_count_api, null);
   assert.deepEqual(guests.evidence.guest_count_api_status, unreadable("/guests/count"));
   assert.equal(guests.evidence.guest_count_people, 1, "the people-derived count stays a real value because GET /people was readable");
@@ -1204,18 +1209,62 @@ const COROLLARY_SWEEP = [
   { inventory: "/workspaces", deny: ["listWorkspaces"], demotes: [] },
 ];
 
-test("corollary sweep: denying one inventory demotes exactly its dependent findings and names it, every other pass stays pass", async () => {
+/** Every leaf of a JSON value as [dotted path, value]; an empty array is itself a leaf so a fabricated [] is visible. */
+function leafEntries(value, path = []) {
+  if (Array.isArray(value)) {
+    return value.length === 0 ? [[path.join("."), value]] : value.flatMap((item, index) => leafEntries(item, [...path, String(index)]));
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).flatMap(([key, entry]) => leafEntries(entry, [...path, key]));
+  }
+  return [[path.join("."), value]];
+}
+
+/** Every summary and evidence leaf of a run, keyed so a baseline and a denied run line up. */
+function renderedLeaves(assessments) {
+  return [
+    ...assessments.flatMap((assessment) => leafEntries(assessment.summary, [`SUMMARY(${assessment.category})`])),
+    ...findingsOf(assessments).flatMap((item) => leafEntries(item.evidence, [item.id])),
+  ];
+}
+
+/**
+ * Keys the reviewer cleared as true counts under denial: the per-category finding tallies count
+ * findings, not tenant data, and sites_evaluated counts successful reads beside sites_denied.
+ */
+const CLEARED_ZERO_KEYS = new Set(["pass", "warn", "fail", "manual", "sites_evaluated"]);
+
+/**
+ * Uniform null-rendering standard: a leaf that is 0 or [] in the denied run but was a different
+ * value (or absent) in the baseline was derived from the denied inventory and must be null.
+ */
+function fabricatedZeros(baselineAssessments, deniedAssessments) {
+  const baseline = new Map(renderedLeaves(baselineAssessments));
+  return renderedLeaves(deniedAssessments)
+    .filter(([, value]) => value === 0 || (Array.isArray(value) && value.length === 0))
+    .filter(([path]) => !CLEARED_ZERO_KEYS.has(path.split(".").at(-1)))
+    .filter(([path, value]) => {
+      const before = baseline.get(path);
+      return Array.isArray(value) ? !(Array.isArray(before) && before.length === 0) : before !== 0;
+    })
+    .map(([path, value]) => `${path}=${JSON.stringify(value)}`);
+}
+
+test("corollary sweep: denying one inventory demotes exactly its dependent findings and names it, every other pass stays pass, and no summary or evidence leaf renders a fabricated 0 or []", async () => {
   const swept = new Set(COROLLARY_SWEEP.flatMap((row) => row.deny ?? ["getMeetingCommonSettings"]));
   assert.deepEqual([...swept].sort(), [...CLIENT_METHODS].sort(), "every surface the collectors read is swept");
+  let leavesChecked = 0;
   for (const row of COROLLARY_SWEEP) {
     const config = sampleConfig(row.config ?? {});
     const configured = { getResolvedConfig: () => config };
-    const baseline = findingsOf(await allAssessments(twoSiteClient(configured)));
+    const baselineAssessments = await allAssessments(twoSiteClient(configured));
+    const baseline = findingsOf(baselineAssessments);
     const baselinePass = baseline.filter((item) => item.status === "pass").map((item) => item.id).sort();
     assert.deepEqual(baselinePass, [...AUTOMATABLE].sort(), `${row.inventory}: the baseline must pass every automatable finding`);
 
     const client = row.denySite ? denyingSite(row.denySite, configured) : denying(row.deny, configured);
-    const findings = findingsOf(await allAssessments(client));
+    const deniedAssessments = await allAssessments(client);
+    const findings = findingsOf(deniedAssessments);
     const demoted = baselinePass.filter((id) => byId(findings, id).status !== "pass");
     assert.deepEqual(demoted, [...row.demotes].sort(), `${row.inventory}: exactly the dependent findings drop below pass`);
     for (const id of row.demotes) {
@@ -1226,8 +1275,51 @@ test("corollary sweep: denying one inventory demotes exactly its dependent findi
     for (const item of findings) {
       assert.ok(["pass", "warn", "fail", "manual"].includes(item.status));
       if (item.status === "manual") assert.match(item.summary, /^Manual:/, `${row.inventory}: ${item.id}`);
+      assert.doesNotMatch(item.summary, /\b(?:the |among |across |, )0 (?:administrators|admins|people|bots|guests|spaces|webhooks|meetings|recordings|events|licenses|clusters|connectors|devices|workspaces|sites)\b/, `${row.inventory}: ${item.id} asserts no digit-zero population in prose`);
     }
+    const fabricated = fabricatedZeros(baselineAssessments, deniedAssessments);
+    assert.deepEqual(fabricated, [], `${row.inventory}: every count or list derived from the denied inventory renders null, not 0 or []`);
+    leavesChecked += renderedLeaves(deniedAssessments).length;
   }
+  assert.ok(leavesChecked > 5000, `the generalized assertion walked ${leavesChecked} leaves`);
+});
+
+test("corollary item 6: WEBEX-ID-02 takes the denied path when GET /roles alone is denied, rendering the administrator fields null and asserting no count", async () => {
+  const baseline = byId((await assessWebexIdentity(twoSiteClient())).findings, "WEBEX-ID-02");
+  assert.deepEqual(baseline.evidence.admin_users, ["Full Admin"]);
+  assert.equal(baseline.evidence.admin_count, 1);
+  assert.match(baseline.summary, /the 1 administrators found are listed as evidence only/);
+
+  const identity = await assessWebexIdentity(denying(["listRoles"]));
+  const item = byId(identity.findings, "WEBEX-ID-02");
+  assert.equal(item.status, "manual");
+  assert.equal(item.evidence.admin_users, null, "admin_users derives from /people and /roles together, so a denied /roles renders null, not []");
+  assert.equal(item.evidence.admin_count, null, "admin_count renders null, not 0");
+  assert.equal(item.evidence.denied_endpoint, "GET /roles");
+  assert.deepEqual(item.evidence.inventory_status.roles, unreadable("/roles"));
+  assert.deepEqual(item.evidence.inventory_status.people, { readable: true, truncated: false });
+  assert.match(item.summary, /^Manual: \/roles returned 403; the token lacks the scope or admin role for roles\. Collect the Control Hub admin list with MFA status for each administrator\. No administrator count is asserted because the list is derived from GET \/people and GET \/roles together\. mfaEnabled is documented/);
+  assert.doesNotMatch(item.summary, /\b0\b/, "no digit-zero administrator count anywhere in the summary");
+  assert.doesNotMatch(item.summary, /\d+ administrators/);
+  assert.equal(identity.summary.admin_users, null, "the category summary and the finding now agree on null for the same quantity");
+  for (const id of ["WEBEX-ID-03", "WEBEX-ID-04"]) {
+    assert.equal(byId(identity.findings, id).status, "manual", `${id} already took the denied path for /roles`);
+  }
+  assert.equal(byId(identity.findings, "WEBEX-ID-05").status, "pass", "the bot inventory reads only /people");
+  assert.equal(byId(identity.findings, "WEBEX-ID-07").status, "pass", "the guest inventory reads only /people and /guests/count");
+
+  const peopleDenied = await assessWebexIdentity(denying(["listPeople"]));
+  const mfa = byId(peopleDenied.findings, "WEBEX-ID-02");
+  assert.equal(mfa.evidence.admin_users, null);
+  assert.equal(mfa.evidence.admin_count, null);
+  assert.equal(mfa.evidence.denied_endpoint, "GET /people");
+  assert.match(mfa.summary, /^Manual: \/people returned 403/);
+  const botApproval = byId(peopleDenied.findings, "WEBEX-ID-06");
+  assert.equal(botApproval.evidence.bot_count, null);
+  assert.deepEqual(botApproval.evidence.people_status, unreadable("/people"));
+  assert.match(botApproval.summary, /reconcile it with the bot inventory in WEBEX-ID-05, which could not be built because GET \/people was not readable, so no bot count is asserted here\.$/);
+  assert.doesNotMatch(botApproval.summary, /\b0 inventoried bots/);
+  assert.match(byId((await assessWebexIdentity(twoSiteClient())).findings, "WEBEX-ID-06").summary, /reconcile it with the 1 inventoried bots\.$/);
 });
 
 test("corollary bundle check: findings.json never carries ID-07, MTG-02, or MTG-06 as pass when /meetings, /guests/count, and /meetingPreferences are denied", async () => {
@@ -1473,6 +1565,208 @@ test("rule 9: no fake secret from any carrier reaches any bundle file or any zip
   const findings = JSON.parse(read("analysis/findings.json"));
   assert.equal(findings.find((item) => item.id === "WEBEX-COLLAB-05").status, "pass", "scrubbing the webhook URL query must not change the https verdict");
   assert.equal(findings.find((item) => item.id === "WEBEX-MTG-02").status, "pass");
+});
+
+/** Rule 9 error path: one canary per carrier that only an error response can bring into the bundle. */
+const ERROR_CANARIES = {
+  json_message_url_token: "FAKE-ERROR-URL-TOKEN-c1a2n3",
+  json_description_url_token: "FAKE-ERROR-DESC-TOKEN-d4e5f6",
+  html_bearer: "FAKE-ERROR-BEARER-a4r5y6",
+  html_session: "FAKE-ERROR-SESSION-s7e8s9",
+  html_api_key: "FAKE-ERROR-API-KEY-k1e2y3",
+  refresh_html_bearer: "FAKE-REFRESH-BEARER-r1e2f3",
+  network_url_token: "FAKE-NETWORK-URL-TOKEN-n4e5t6",
+  network_bearer: "FAKE-NETWORK-BEARER-b7e8a9",
+};
+
+function deniedJsonBody() {
+  return {
+    message: `Access denied; sign in at https://idbroker.webex.com/idb/oauth2/v1/authorize?token=${ERROR_CANARIES.json_message_url_token}&state=1 to continue`,
+    errors: [{ description: `Forbidden: see https://idbroker.webex.com/idb/oauth2/v1/authorize?token=${ERROR_CANARIES.json_description_url_token}` }],
+    trackingId: "ROUTER_12345",
+  };
+}
+
+function gatewayHtmlBody() {
+  return [
+    "<html><head><title>502 Bad Gateway</title></head><body><pre>",
+    `upstream request: bearer=${ERROR_CANARIES.html_bearer}; Authorization: Bearer ${ERROR_CANARIES.html_bearer}`,
+    `Set-Cookie: session=${ERROR_CANARIES.html_session}; Path=/`,
+    `X-Api-Key: ${ERROR_CANARIES.html_api_key}`,
+    "</pre></body></html>",
+  ].join("\n");
+}
+
+/** Routes /rooms to a 403 JSON error with tokenised URLs and /webhooks to a 502 HTML gateway page. */
+async function errorPathRouter(input) {
+  const pathname = new URL(typeof input === "string" ? input : input.toString()).pathname;
+  if (pathname.endsWith("/rooms")) return jsonResponse(deniedJsonBody(), { status: 403, statusText: "Forbidden" });
+  if (pathname.endsWith("/webhooks")) return textResponse(gatewayHtmlBody(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+  throw new Error(`unexpected fetch ${pathname}`);
+}
+
+/** The secret-carrying fixture with two surfaces served through the real client and its real error path. */
+function errorPathClient() {
+  const real = new WebexApiClient(secretConfig(), { fetchImpl: errorPathRouter });
+  return {
+    ...secretClient(),
+    listRooms: (limit) => real.listRooms(limit),
+    listWebhooks: (limit) => real.listWebhooks(limit),
+  };
+}
+
+test("scrubErrorText is the one scrub for error strings: unanchored URL queries, credential-shaped fragments, idempotent, and applied by the WebexApiError constructor", () => {
+  assert.equal(scrubValue("see https://idbroker.webex.com/authorize?token=abc&x=1 to continue"), "see https://idbroker.webex.com/authorize to continue", "scrubValue strips the query of a URL embedded mid-string");
+  assert.equal(scrubValue("a https://h/x?q=1#f and b https://h/y#frag."), "a https://h/x and b https://h/y.", "every embedded URL is scrubbed and sentence punctuation survives");
+  assert.equal(scrubValue("see https://h/x?token=abc; then https://h/y?token=def, done"), "see https://h/x; then https://h/y, done");
+  assert.equal(scrubValue("prefix https://h/x?q=1 sip:u@h;pwd=9;transport=tls"), "prefix https://h/x sip:u@h;transport=tls");
+
+  assert.equal(scrubErrorText("Authorization: Bearer abc123def456ghi"), "Authorization=[REDACTED]");
+  assert.equal(scrubErrorText("upstream bearer=FAKE-1234 failed"), "upstream bearer=[REDACTED] failed");
+  assert.equal(scrubErrorText("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig expired"), "Bearer [REDACTED] expired");
+  assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie=[REDACTED]; Path=/", "a credential-named header takes its whole value");
+  assert.equal(scrubErrorText("cookie session=s7e8s9; Path=/"), "cookie session=[REDACTED]; Path=/");
+  assert.equal(scrubErrorText("JSESSIONID=abc123; sid: 42"), "JSESSIONID=[REDACTED]; sid=[REDACTED]");
+  assert.equal(scrubErrorText("X-Api-Key: k1e2y3 rejected"), "X-Api-Key=[REDACTED] rejected");
+  assert.equal(scrubErrorText('body {"access_token":"tok123","expires_in":3600}'), 'body {"access_token=[REDACTED]","expires_in":3600}');
+  assert.equal(scrubErrorText("client_secret=s3cr3t&grant_type=refresh_token&refresh_token=r7"), "client_secret=[REDACTED]&grant_type=refresh_token&refresh_token=[REDACTED]");
+  assert.equal(scrubErrorText("password: hunter2, pwd=x1, passcode=9, api_key=k, apikey=k2, credential=c, signature=s"), "password=[REDACTED], pwd=[REDACTED], passcode=[REDACTED], api_key=[REDACTED], apikey=[REDACTED], credential=[REDACTED], signature=[REDACTED]");
+  assert.equal(scrubErrorText("Webex request failed (403 Forbidden) for /people: see https://idbroker.webex.com/authorize?token=abc to continue"), "Webex request failed (403 Forbidden) for /people: see https://idbroker.webex.com/authorize to continue");
+
+  const plain = [
+    "Webex request failed (403 Forbidden) for /admin/meeting/config/commonSettings",
+    "GET /guests/count was not readable (403; scope guest-issuer:read), so the guest-issuer count could not be reconciled with the people-based inventory.",
+    "Webex request failed (502 Bad Gateway) for /webhooks: non-JSON error body (text/html; charset=utf-8; 291 bytes)",
+    "the token lacks the scope or admin role for people; scope spark-admin:people_read or meeting:admin_schedule_read",
+    "Bot tokens cannot read admin surfaces; use an admin, integration, or Service App token.",
+  ];
+  for (const message of plain) assert.equal(scrubErrorText(message), message, `plain operational text is left alone: ${message}`);
+  for (const message of ["Authorization: Bearer abc123def456ghi", "session=abc; bearer=FAKE-1234", "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"]) {
+    assert.equal(scrubErrorText(scrubErrorText(message)), scrubErrorText(message), `idempotent: ${message}`);
+  }
+
+  const error = new WebexApiError("Webex request failed (401 Unauthorized) for /people: Authorization: Bearer abc123def456ghi at https://h/x?token=t", 401, "/people");
+  assert.equal(error.message, "Webex request failed (401 Unauthorized) for /people: Authorization=[REDACTED] at https://h/x", "the constructor scrubs, so no consumer can receive an unscrubbed API error");
+  assert.equal(error.status, 401);
+  assert.equal(error.endpoint, "/people");
+});
+
+test("fetchJson never places a response body in an error string: non-JSON bodies become status, endpoint, content type and length; JSON messages are scrubbed", async () => {
+  const gateway = new WebexApiClient(sampleConfig(), { fetchImpl: errorPathRouter });
+  const htmlBytes = Buffer.byteLength(gatewayHtmlBody(), "utf8");
+  await assert.rejects(() => gateway.listWebhooks(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.status, 502);
+    assert.equal(error.endpoint, "/v1/webhooks");
+    assert.equal(error.message, `Webex request failed (502 Bad Gateway) for /v1/webhooks: non-JSON error body (text/html; charset=utf-8; ${htmlBytes} bytes)`);
+    for (const canary of Object.values(ERROR_CANARIES)) assert.ok(!error.message.includes(canary));
+    assert.ok(!error.message.includes("<html>"));
+    return true;
+  });
+  await assert.rejects(() => gateway.listRooms(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.status, 403);
+    assert.equal(
+      error.message,
+      "Webex request failed (403 Forbidden) for /v1/rooms: Forbidden: see https://idbroker.webex.com/idb/oauth2/v1/authorize; Access denied; sign in at https://idbroker.webex.com/idb/oauth2/v1/authorize to continue",
+      "the documented message fields are kept with their URL queries stripped",
+    );
+    return true;
+  });
+
+  const bareJson = new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ access_token: "leaked-if-copied", trackingId: "T1" }, { status: 500, statusText: "Internal Server Error" }) });
+  await assert.rejects(() => bareJson.listRoles(), (error) => {
+    assert.equal(error.message, `Webex request failed (500 Internal Server Error) for /v1/roles: JSON error body without a message field (${Buffer.byteLength(JSON.stringify({ access_token: "leaked-if-copied", trackingId: "T1" }))} bytes)`);
+    return true;
+  });
+  const emptyBody = new WebexApiClient(sampleConfig(), { fetchImpl: async () => new Response(null, { status: 404, statusText: "Not Found" }) });
+  await assert.rejects(() => emptyBody.listRoles(), (error) => error instanceof WebexApiError && error.message === "Webex request failed (404 Not Found) for /v1/roles");
+  const unknownType = new WebexApiClient(sampleConfig(), { fetchImpl: async () => new Response("<b>nope</b>", { status: 503, statusText: "Service Unavailable" }) });
+  await assert.rejects(() => unknownType.listRoles(), (error) => /non-JSON error body \(text\/plain;charset=UTF-8; 11 bytes\)$/.test(error.message) || /non-JSON error body \(.*; 11 bytes\)$/.test(error.message));
+
+  const refreshConfig = sampleConfig({ token: undefined, refresh: { clientId: "cid", clientSecret: "csecret", refreshToken: "rtoken" } });
+  const refreshBody = `<html>Bearer ${ERROR_CANARIES.refresh_html_bearer}</html>`;
+  const refreshHtml = new WebexApiClient(refreshConfig, {
+    fetchImpl: async () => textResponse(refreshBody, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }),
+  });
+  await assert.rejects(() => refreshHtml.listRoles(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.endpoint, "/access_token");
+    assert.equal(error.message, `Webex token refresh failed (502): non-JSON error body (text/html; ${Buffer.byteLength(refreshBody, "utf8")} bytes)`);
+    assert.ok(!error.message.includes(ERROR_CANARIES.refresh_html_bearer));
+    return true;
+  });
+  const refreshOkHtml = new WebexApiClient(refreshConfig, { fetchImpl: async () => textResponse("<html>not json</html>", { headers: { "content-type": "text/html" } }) });
+  await assert.rejects(() => refreshOkHtml.listRoles(), (error) => error instanceof WebexApiError && error.message === "Webex token refresh returned non-JSON error body (text/html; 21 bytes) with status 200");
+  const refreshDenied = new WebexApiClient(refreshConfig, {
+    fetchImpl: async () => jsonResponse({ error: "invalid_grant", error_description: `refresh_token=${FAKE_SECRETS.refresh_token} is expired; sign in at https://idbroker.webex.com/x?token=abc` }, { status: 400, statusText: "Bad Request" }),
+  });
+  await assert.rejects(() => refreshDenied.listRoles(), (error) => error.message === "Webex token refresh failed (400): refresh_token=[REDACTED] is expired; sign in at https://idbroker.webex.com/x; invalid_grant");
+
+  const networkFailure = compliantClient({
+    async listRoles() {
+      throw new Error(`connect ECONNREFUSED https://webexapis.com/v1/roles?token=${ERROR_CANARIES.network_url_token} with Authorization: Bearer ${ERROR_CANARIES.network_bearer}`);
+    },
+  });
+  const identity = await assessWebexIdentity(networkFailure);
+  const rolesError = identity.errors.find((item) => item.startsWith("roles: "));
+  assert.equal(rolesError, "roles: connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization=[REDACTED]", "non-API errors are scrubbed where they become surface errors");
+  assert.deepEqual(identity.summary.inventory_status.roles, { readable: false, status: null, error: "connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization=[REDACTED]" });
+  assert.equal(byId(identity.findings, "WEBEX-ID-02").evidence.admin_count, null);
+  const rendered = JSON.stringify(identity);
+  for (const canary of [ERROR_CANARIES.network_url_token, ERROR_CANARIES.network_bearer]) assert.ok(!rendered.includes(canary), `${canary} must not reach any assessment field`);
+});
+
+test("rule 9 error path: a JSON error with tokenised URLs and a 502 HTML page with bearer, session, and API key canaries reach no bundle file and no zip entry", async () => {
+  const rawJson = JSON.stringify(deniedJsonBody());
+  const rawHtml = gatewayHtmlBody();
+  const errorCanaries = Object.entries(ERROR_CANARIES).filter(([carrier]) => carrier.startsWith("json_") || carrier.startsWith("html_"));
+  assert.equal(errorCanaries.length, 5);
+  for (const [carrier, value] of errorCanaries) {
+    assert.ok((carrier.startsWith("json_") ? rawJson : rawHtml).includes(value), `negative control: the raw response really carries ${carrier}`);
+  }
+
+  const base = createTempBase("grclanker-webex-error-canaries-");
+  const result = await exportWebexAuditBundle(errorPathClient(), secretConfig(), base);
+  assert.equal(result.findingCount, FINDING_COUNT);
+  assert.equal(result.errorCount, 2, "rooms and webhooks failed and nothing else");
+
+  const files = walkFiles(result.outputDir);
+  assert.equal(files.length, result.fileCount);
+  const entries = readZipEntries(readFileSync(result.zipPath));
+  assert.equal(entries.length, files.length);
+  const secretEntries = [...Object.entries(FAKE_SECRETS), ...Object.entries(ERROR_CANARIES)];
+  const leaks = [];
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    for (const [carrier, value] of secretEntries) if (content.includes(value)) leaks.push(`${carrier} in ${relative(result.outputDir, file)}`);
+  }
+  for (const entry of entries) {
+    for (const [carrier, value] of secretEntries) if (entry.content.includes(value)) leaks.push(`${carrier} in zip:${entry.name}`);
+  }
+  assert.deepEqual(leaks, []);
+
+  const read = (relativePath) => readFileSync(join(result.outputDir, relativePath), "utf8");
+  const errors = read("_errors.log");
+  const htmlBytes = Buffer.byteLength(rawHtml, "utf8");
+  assert.match(errors, /collaboration-governance: rooms: Webex request failed \(403 Forbidden\) for \/v1\/rooms: Forbidden: see https:\/\/idbroker\.webex\.com\/idb\/oauth2\/v1\/authorize; Access denied; sign in at https:\/\/idbroker\.webex\.com\/idb\/oauth2\/v1\/authorize to continue/, "negative control: the scrubbed error did travel to _errors.log");
+  assert.match(errors, new RegExp(`collaboration-governance: webhooks: Webex request failed \\(502 Bad Gateway\\) for /v1/webhooks: non-JSON error body \\(text/html; charset=utf-8; ${htmlBytes} bytes\\)`));
+  assert.ok(!errors.includes("<html>") && !errors.includes("Set-Cookie"));
+  const access = JSON.parse(read("core_data/access.json"));
+  const roomsSurface = access.surfaces.find((item) => item.name === "rooms");
+  const webhooksSurface = access.surfaces.find((item) => item.name === "webhooks");
+  assert.equal(roomsSurface.status, "not_readable");
+  assert.match(roomsSurface.error, /^Webex request failed \(403 Forbidden\) for \/v1\/rooms: Forbidden: see https:\/\/idbroker\.webex\.com\/idb\/oauth2\/v1\/authorize; /);
+  assert.equal(webhooksSurface.error, `Webex request failed (502 Bad Gateway) for /v1/webhooks: non-JSON error body (text/html; charset=utf-8; ${htmlBytes} bytes)`);
+  const rooms = JSON.parse(read("core_data/collaboration-governance/rooms.json"));
+  assert.equal(rooms.status, 403);
+  assert.match(rooms.error, /^Webex request failed \(403 Forbidden\) for \/v1\/rooms: /);
+  const findings = JSON.parse(read("analysis/findings.json"));
+  assert.equal(byId(findings, "WEBEX-COLLAB-04").status, "manual");
+  assert.match(byId(findings, "WEBEX-COLLAB-04").summary, /^Manual: \/rooms returned 403/);
+  assert.equal(byId(findings, "WEBEX-COLLAB-05").status, "manual");
+  assert.match(byId(findings, "WEBEX-COLLAB-05").summary, /^Manual: \/webhooks could not be read \(Webex request failed \(502 Bad Gateway\) for \/v1\/webhooks: non-JSON error body/);
+  assert.equal(byId(findings, "WEBEX-MTG-02").status, "pass", "the unrelated surfaces keep their complete-inventory verdicts");
 });
 
 test("projectSurface fails closed: unlisted keys are dropped, nested objects need a nested allowlist, values are scrubbed", async () => {

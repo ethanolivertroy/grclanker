@@ -233,7 +233,7 @@ export class WebexApiError extends Error {
   readonly endpoint: string;
 
   constructor(message: string, status: number, endpoint: string) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "WebexApiError";
     this.status = status;
     this.endpoint = endpoint;
@@ -364,24 +364,55 @@ function serializeJson(value: unknown): string {
 const SECRET_KEY_PATTERN = /token|secret|password|passcode|hostpin|hostkey|authorization|accesscode|activationcode|credential/i;
 /** Policy flags from commonSettings.securityOptions that name passwords without holding one. */
 const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword)$/;
-/** Scheme-prefixed URL: everything from the first ? or # carries no evidence value (RCID, MTID, token parameters). */
-const URL_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+/**
+ * Any scheme-prefixed URL embedded anywhere in a string (not only a whole-value URL):
+ * everything from its first ? or # carries no evidence value (RCID, MTID, token parameters).
+ */
+const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 /** Credential parameters embedded in SIP and tel URIs, for example ;pwd=1234. */
 const URI_CREDENTIAL_PARAM_PATTERN = /;(pwd|password|pin|passcode|token|secret)=[^;?#\s]*/gi;
+/** Key names whose assigned value in free text is treated as a credential. */
+const CREDENTIAL_KEY_WORDS = "token|secret|passw(?:or)?d|pwd|pin|passcode|session|sid|api[_-]?key|apikey|key|bearer|basic|authorization|auth|cookie|credential|access[_-]?key|signature";
+/** `key=value`, `key: value`, or `"key":"value"` where the key names a credential; the value may itself start with Bearer or Basic. */
+const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
+  `\\b"?([A-Za-z0-9_.-]*(?:${CREDENTIAL_KEY_WORDS})[A-Za-z0-9_.-]*)"?\\s*[=:]\\s*"?(?:(?:bearer|basic)\\s+)?[^\\s"'&;,<>]+`,
+  "gi",
+);
+/** A standalone `Bearer <value>` or `Basic <value>` authorization value. */
+const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 /**
  * Strips credential-bearing parts from a string while keeping host and path:
- * the query string and fragment of any scheme-prefixed URL (recording
- * download and playback RCID, meeting join MTID, webhook tokens) and ;pwd=
- * style parameters inside SIP URIs.
+ * the query string and fragment of every scheme-prefixed URL found anywhere in
+ * the text (recording download and playback RCID, meeting join MTID, webhook
+ * tokens, sign-in links quoted inside error messages) and ;pwd= style
+ * parameters inside SIP URIs.
  */
 export function scrubValue(value: string): string {
-  let output = value;
-  if (URL_SCHEME_PATTERN.test(output)) {
-    const cut = output.search(/[?#]/);
-    if (cut >= 0) output = output.slice(0, cut);
-  }
-  return output.replace(URI_CREDENTIAL_PARAM_PATTERN, "");
+  return value
+    .replace(EMBEDDED_URL_PATTERN, (url) => {
+      // Sentence punctuation directly after a URL belongs to the surrounding prose, not the query.
+      const trailing = url.match(/[.,;:!]+$/)?.[0] ?? "";
+      const body = url.slice(0, url.length - trailing.length);
+      const cut = body.search(/[?#]/);
+      return `${cut >= 0 ? body.slice(0, cut) : body}${trailing}`;
+    })
+    .replace(URI_CREDENTIAL_PARAM_PATTERN, "");
+}
+
+/**
+ * The one scrub applied where error strings are created: the WebexApiError
+ * constructor (every API failure) and errorMessage (every other thrown value
+ * turned into a surface error). Besides scrubValue it redacts credential-shaped
+ * fragments such as `Bearer <value>`, `session=<value>`, `X-Api-Key: <value>`,
+ * or `"access_token":"<value>"`, so no downstream consumer (errors array,
+ * _errors.log, access.json, inventory status, finding summaries, reports)
+ * ever receives an unscrubbed error string. Idempotent.
+ */
+export function scrubErrorText(message: string): string {
+  return scrubValue(message)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (_match, key: string) => `${key}=[REDACTED]`)
+    .replace(CREDENTIAL_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} [REDACTED]`);
 }
 
 /**
@@ -649,6 +680,30 @@ function webexErrorSummary(payload: unknown): string | undefined {
   return messages.length > 0 ? messages.join("; ") : undefined;
 }
 
+/** A response body parsed as a JSON object; {} for an empty or non-object JSON body, undefined when the body is not JSON at all. */
+function parseJsonObject(rawText: string): JsonRecord | undefined {
+  if (rawText.length === 0) return {};
+  try {
+    return asObject(JSON.parse(rawText)) ?? {};
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What an error response contributes to its error string: the documented
+ * message fields of a JSON body (scrubbed with the rest of the string by the
+ * WebexApiError constructor), never a raw body. A non-JSON body, such as an
+ * HTML gateway page, is described only by content type and length so that
+ * nothing it carries can reach the bundle.
+ */
+function describeErrorBody(payload: JsonRecord | undefined, rawText: string, contentType: string | null): string | undefined {
+  if (rawText.length === 0) return undefined;
+  const bytes = Buffer.byteLength(rawText, "utf8");
+  if (payload === undefined) return `non-JSON error body (${contentType ?? "unknown content type"}; ${bytes} bytes)`;
+  return webexErrorSummary(payload) ?? `JSON error body without a message field (${bytes} bytes)`;
+}
+
 function loadConfigFile(pathname: string): JsonRecord {
   const raw = readFileSync(pathname, "utf8");
   const parsed = pathname.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw);
@@ -792,10 +847,14 @@ export class WebexApiClient {
       body: body.toString(),
     });
     const rawText = await response.text();
-    const payload = rawText.length > 0 ? JSON.parse(rawText) as JsonRecord : {};
+    const payload = parseJsonObject(rawText);
     if (!response.ok) {
+      const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
+      throw new WebexApiError(`Webex token refresh failed (${response.status})${detail ? `: ${detail}` : ""}`, response.status, "/access_token");
+    }
+    if (payload === undefined) {
       throw new WebexApiError(
-        `Webex token refresh failed (${response.status})${webexErrorSummary(payload) ? `: ${webexErrorSummary(payload)}` : ""}`,
+        `Webex token refresh returned ${describeErrorBody(undefined, rawText, response.headers.get("content-type"))} with status ${response.status}`,
         response.status,
         "/access_token",
       );
@@ -833,15 +892,10 @@ export class WebexApiClient {
       }
 
       const rawText = await response.text();
-      let payload: JsonRecord = {};
-      try {
-        payload = rawText.length > 0 ? asObject(JSON.parse(rawText)) ?? {} : {};
-      } catch {
-        payload = {};
-      }
+      const payload = parseJsonObject(rawText);
 
       if (!response.ok) {
-        const detail = webexErrorSummary(payload) ?? rawText.slice(0, 240);
+        const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
         throw new WebexApiError(
           `Webex request failed (${response.status} ${response.statusText}) for ${endpoint}${detail ? `: ${detail}` : ""}`,
           response.status,
@@ -850,7 +904,7 @@ export class WebexApiClient {
       }
 
       return {
-        payload,
+        payload: payload ?? {},
         rawText,
         nextUrl: parseLinkHeaderNext(response.headers.get("link")),
       };
@@ -1031,8 +1085,9 @@ function errorStatus(error: unknown): number | undefined {
   return status;
 }
 
+/** Every thrown value becomes a surface error string here, so this is the second and last point where scrubErrorText must run. */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 async function collectPage(load: () => Promise<WebexPage>): Promise<SurfaceResult<JsonRecord[]>> {
@@ -1587,13 +1642,28 @@ export async function assessWebexIdentity(
   );
 
   const mfaReadOnlyNote = `mfaEnabled is documented on /identity/organizations/{orgId}/authenticationConfig only in the PATCH request schema (${WEBEX_DOCS.authenticationConfig}); no GET is published, and this read-only inspector never issues a PATCH, so the org MFA setting cannot be read.`;
-  const adminMfaFinding = !people.ok
-    ? finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
-      `${deniedSummary("people", "/people", people, "the Control Hub admin list with MFA status for each administrator")} ${mfaReadOnlyNote}`,
-      { citation: WEBEX_DOCS.authenticationConfig, people_citation: WEBEX_DOCS.peopleList, token_type: tokenType })
-    : finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
+  // The administrator list is derived from /people and /roles together, so either denial takes the denied path (as ID-03 and ID-04 do).
+  let adminMfaFinding: WebexFinding;
+  if (!people.ok || !roles.ok) {
+    const deniedSurface = !people.ok ? "people" : "roles";
+    const deniedEndpoint = !people.ok ? "/people" : "/roles";
+    adminMfaFinding = finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
+      `${deniedSummary(deniedSurface, deniedEndpoint, (!people.ok ? people : roles) as { error: string; status?: number }, "the Control Hub admin list with MFA status for each administrator")} No administrator count is asserted because the list is derived from GET /people and GET /roles together. ${mfaReadOnlyNote}`,
+      {
+        admin_users: null,
+        admin_count: null,
+        denied_endpoint: `GET ${deniedEndpoint}`,
+        inventory_status: { people: inventoryStatus(people), roles: inventoryStatus(roles) },
+        citation: WEBEX_DOCS.authenticationConfig,
+        people_citation: WEBEX_DOCS.peopleList,
+        roles_citation: WEBEX_DOCS.rolesList,
+        token_type: tokenType,
+      });
+  } else {
+    adminMfaFinding = finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
       `Manual: ${mfaReadOnlyNote} The People API (${WEBEX_DOCS.peopleList}) exposes roles but no MFA attribute, so the ${adminUsers.length} administrators found are listed as evidence only. Confirm MFA enforcement in Control Hub Organization Settings > Authentication for each listed admin.${peoplePartial}`,
       { admin_users: adminUsers.slice(0, 50).map(personLabel), admin_count: adminUsers.length, people_seen: surfaceItems(people).length, people_truncated: people.truncated, citation: WEBEX_DOCS.authenticationConfig, people_citation: WEBEX_DOCS.peopleList });
+  }
 
   let complianceFinding: WebexFinding;
   if (!people.ok || !roles.ok) {
@@ -1657,16 +1727,25 @@ export async function assessWebexIdentity(
       });
   }
 
+  const botInventoryPhrase = people.ok
+    ? `the ${bots.length} inventoried bots`
+    : "the bot inventory in WEBEX-ID-05, which could not be built because GET /people was not readable, so no bot count is asserted here";
   const botApprovalFinding = finding("WEBEX-ID-06", [19], "Bot approval state", "medium", "manual",
-    `Manual: bot approval is managed in Control Hub (Management > Apps) and the bots guide (${WEBEX_DOCS.bots}) documents no API field for approval state. Export the Control Hub bot management page and reconcile it with the ${bots.length} inventoried bots.`,
-    { bot_count: people.ok ? bots.length : null, citation: WEBEX_DOCS.bots });
+    `Manual: bot approval is managed in Control Hub (Management > Apps) and the bots guide (${WEBEX_DOCS.bots}) documents no API field for approval state. Export the Control Hub bot management page and reconcile it with ${botInventoryPhrase}.`,
+    { bot_count: countIfReadable(bots.length, people), people_status: inventoryStatus(people), citation: WEBEX_DOCS.bots });
 
   const guestCountValue = guestCount.ok ? asNumber(guestCount.data.count) : undefined;
+  const guestCountInventory: SecondaryInventory = {
+    endpoint: "GET /guests/count",
+    scope: "guest-issuer:read",
+    result: guestCount,
+    consequence: "the guest-issuer count could not be reconciled with the people-based inventory",
+  };
   const guestCountNote = guestCount.ok
     ? guestCountValue === undefined
-      ? "GET /guests/count answered without a numeric body."
-      : `GET /guests/count reports ${guestCountValue} guest-issuer guests.`
-    : `GET /guests/count was not readable (${guestCount.error}; scope guest-issuer:read), so the guest-issuer count could not be reconciled.`;
+      ? " GET /guests/count answered without a numeric body."
+      : ` GET /guests/count reports ${guestCountValue} guest-issuer guests.`
+    : unreadableNote([guestCountInventory]);
   const guestEvidence = {
     guests: people.ok ? guests.slice(0, 100).map((guest) => ({ id: asString(guest.id), display_name: asString(guest.displayName), created: asString(guest.created) })) : null,
     guest_count_people: countIfReadable(guests.length, people),
@@ -1681,15 +1760,16 @@ export async function assessWebexIdentity(
   let guestInventoryFinding: WebexFinding;
   if (!people.ok) {
     guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", "manual",
-      `${deniedSummary("people", "/people", people, "the Control Hub guest user list")} ${guestCountNote}`,
+      `${deniedSummary("people", "/people", people, "the Control Hub guest user list")}${guestCountNote}`,
       { ...guestEvidence, token_type: tokenType });
   } else if (surfaceItems(people).length === 0) {
     guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", "manual",
-      `Manual: GET /people returned zero people, so no guest inventory could be built. ${guestCountNote}`,
+      `Manual: GET /people returned zero people, so no guest inventory could be built.${guestCountNote}`,
       guestEvidence);
   } else {
-    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", people.truncated || !guestCount.ok ? "warn" : "pass",
-      `${guests.length} guest accounts (Person.type = appuser, documented as a guest user) were inventoried among ${surfaceItems(people).length} people. ${guestCountNote} Reconcile the list with the guest access policy assessed in WEBEX-MTG-03.${peoplePartial}`,
+    const guestCapped = capForUnreadable(people.truncated ? "warn" : "pass", [guestCountInventory]);
+    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", guestCapped.status,
+      `${guests.length} guest accounts (Person.type = appuser, documented as a guest user) were inventoried among ${surfaceItems(people).length} people.${guestCountNote} Reconcile the list with the guest access policy assessed in WEBEX-MTG-03.${peoplePartial}`,
       guestEvidence);
   }
 
