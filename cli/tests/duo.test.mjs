@@ -622,6 +622,72 @@ test("assessDuoAuthentication treats telephony as permitted unless blocked_auth_
   assert.equal(findingById(assessDuoAuthentication(noLists, config), "DUO-AUTH-002").status, "Manual");
 });
 
+function bypassCode(id, extra = {}) {
+  // Documented Retrieve Bypass Codes response shape.
+  return {
+    admin_email: "janesmith@example.gov",
+    bypass_code_id: id,
+    created: NOW_SECONDS - 2 * 60 * 60,
+    expiration: NOW_SECONDS + 60 * 60,
+    reuse_count: 1,
+    user: { user_id: `DU-${id}`, username: `${id.toLowerCase()}@example.gov`, status: "active" },
+    ...extra,
+  };
+}
+
+test("assessDuoAuthentication audits bypass codes with the documented created, expiration, and reuse_count fields", () => {
+  const config = createSampleConfig();
+
+  const fresh = compliantAuthenticationData();
+  fresh.bypassCodes = { data: [bypassCode("DB1")], total: 1, complete: true };
+  const freshFinding = findingById(assessDuoAuthentication(fresh, config), "DUO-AUTH-006");
+  assert.equal(freshFinding.status, "Partial", "active but fresh, limited codes are Partial rather than Pass");
+  assert.ok(freshFinding.evidence.includes("codes_older_than_24_hours=0"));
+  assert.ok(freshFinding.evidence.includes("codes_with_unlimited_uses=0"));
+
+  const stale = compliantAuthenticationData();
+  stale.bypassCodes = dataset([bypassCode("DB2", { created: NOW_SECONDS - 30 * 60 * 60, expiration: NOW_SECONDS + 10 * 60 * 60 })]);
+  const staleFinding = findingById(assessDuoAuthentication(stale, config), "DUO-AUTH-006");
+  assert.equal(staleFinding.status, "Fail");
+  assert.ok(staleFinding.evidence.includes("codes_older_than_24_hours=1"));
+  assert.ok(staleFinding.evidence.some((line) => line.startsWith("stale_bypass_code=DB2 user=db2@example.gov")));
+
+  const unlimitedUses = compliantAuthenticationData();
+  unlimitedUses.bypassCodes = dataset([bypassCode("DB3", { reuse_count: null })]);
+  const unlimitedFinding = findingById(assessDuoAuthentication(unlimitedUses, config), "DUO-AUTH-006");
+  assert.equal(unlimitedFinding.status, "Fail");
+  assert.ok(unlimitedFinding.evidence.includes("codes_with_unlimited_uses=1"));
+  assert.ok(unlimitedFinding.evidence.some((line) => line.startsWith("unlimited_bypass_code=DB3") && line.includes("reuse_count=null")));
+
+  const neverExpires = compliantAuthenticationData();
+  neverExpires.bypassCodes = dataset([bypassCode("DB4", { expiration: null })]);
+  const neverExpiresFinding = findingById(assessDuoAuthentication(neverExpires, config), "DUO-AUTH-006");
+  assert.equal(neverExpiresFinding.status, "Fail");
+  assert.ok(neverExpiresFinding.evidence.includes("codes_without_expiration=1"));
+
+  const undated = compliantAuthenticationData();
+  undated.bypassCodes = dataset([bypassCode("DB5", { created: null })]);
+  const undatedFinding = findingById(assessDuoAuthentication(undated, config), "DUO-AUTH-006");
+  assert.equal(undatedFinding.status, "Partial");
+  assert.ok(undatedFinding.evidence.includes("codes_undated=1"));
+
+  const expired = compliantAuthenticationData();
+  expired.bypassCodes = dataset([bypassCode("DB6", { created: NOW_SECONDS - 3 * DAY_SECONDS, expiration: NOW_SECONDS - DAY_SECONDS })]);
+  const expiredFinding = findingById(assessDuoAuthentication(expired, config), "DUO-AUTH-006");
+  assert.equal(expiredFinding.status, "Partial", "codes already expired by date are reported but not flagged as stale");
+  assert.ok(expiredFinding.evidence.includes("codes_expired=1"));
+
+  const partialInventory = compliantAuthenticationData();
+  partialInventory.bypassCodes = { data: [], total: 12, complete: false };
+  const partialFinding = findingById(assessDuoAuthentication(partialInventory, config), "DUO-AUTH-006");
+  assert.equal(partialFinding.status, "Partial", "an empty page of an incomplete inventory cannot pass");
+  assert.ok(partialFinding.evidence.some((line) => line.includes("inventory_seen=0 inventory_total=12")));
+
+  const forbiddenResult = findingById(assessDuoAuthentication(forbiddenAuthenticationData(), config), "DUO-AUTH-006");
+  assert.equal(forbiddenResult.status, "Manual");
+  assert.ok(forbiddenResult.evidence.includes("endpoint=/admin/v1/bypass_codes"));
+});
+
 test("assessDuoAdminAccess evaluates lockout policy and undated administrators", () => {
   const compliant = assessDuoAdminAccess(compliantAdminData(), createSampleConfig());
   for (const id of ["DUO-ADMIN-001", "DUO-ADMIN-002", "DUO-ADMIN-003", "DUO-ADMIN-004", "DUO-ADMIN-005"]) {

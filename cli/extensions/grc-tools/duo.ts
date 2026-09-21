@@ -1675,6 +1675,67 @@ function withInventoryCap(
   };
 }
 
+const BYPASS_CODE_MAX_AGE_HOURS = 24;
+
+interface BypassCodeSample {
+  id: string;
+  user: string;
+  created: string;
+  ageHours: number;
+  reuseCount: string;
+  expiration: string;
+}
+
+interface BypassCodeReview {
+  stale: BypassCodeSample[];
+  unlimited: BypassCodeSample[];
+  unlimitedUses: number;
+  neverExpire: number;
+  undated: number;
+  expired: number;
+}
+
+function formatUnixSeconds(value: unknown): string {
+  const timestamp = parseTimestamp(value);
+  return timestamp === null ? "unknown" : new Date(timestamp).toISOString();
+}
+
+/**
+ * Retrieve Bypass Codes response fields: created (creation timestamp), expiration (null when
+ * the code never expires on a date), reuse_count (null when uses are unlimited).
+ */
+function reviewBypassCodes(codes: JsonRecord[]): BypassCodeReview {
+  const review: BypassCodeReview = { stale: [], unlimited: [], unlimitedUses: 0, neverExpire: 0, undated: 0, expired: 0 };
+  const now = Date.now();
+  for (const code of codes) {
+    const created = parseTimestamp(code.created);
+    const expiration = parseTimestamp(code.expiration);
+    if (expiration !== null && expiration <= now) {
+      review.expired += 1;
+      continue;
+    }
+    const sample: BypassCodeSample = {
+      id: asString(code.bypass_code_id) ?? "unknown",
+      user: userLabel(asRecord(code.user)),
+      created: formatUnixSeconds(code.created),
+      ageHours: created === null ? -1 : Math.floor((now - created) / (60 * 60 * 1000)),
+      reuseCount: code.reuse_count === null ? "null" : String(asNumber(code.reuse_count) ?? "unknown"),
+      expiration: code.expiration === null ? "null" : formatUnixSeconds(code.expiration),
+    };
+    if (created === null) {
+      review.undated += 1;
+    } else if (now - created > BYPASS_CODE_MAX_AGE_HOURS * 60 * 60 * 1000) {
+      review.stale.push(sample);
+    }
+    const unlimitedUses = code.reuse_count === null;
+    const neverExpires = code.expiration === null;
+    if (unlimitedUses) review.unlimitedUses += 1;
+    if (neverExpires) review.neverExpire += 1;
+    if (unlimitedUses || neverExpires) review.unlimited.push(sample);
+  }
+  return review;
+}
+
 function userStatus(user: JsonRecord): string {
   return asString(user.status)?.toLowerCase() ?? "unknown";
 }
@@ -2313,11 +2374,24 @@ export function assessDuoAuthentication(
   const bypassCount = data.bypassCodes.data.length;
   const helpdeskBypass = asString(asRecord(data.settings.data).helpdesk_bypass)?.toLowerCase();
   const helpdeskBypassExpiration = asNumber(asRecord(data.settings.data).helpdesk_bypass_expiration);
-  const unlimitedLikeCodes = data.bypassCodes.data.filter((code) => {
-    const remainingUses = asNumber(code.remaining_uses);
-    const validSecs = asNumber(code.valid_secs);
-    return remainingUses === 0 || validSecs === 0;
-  }).length;
+  const bypassReview = reviewBypassCodes(data.bypassCodes.data);
+  const bypassEvidence = [
+    `active_bypass_codes=${bypassCount}`,
+    `codes_older_than_24_hours=${bypassReview.stale.length}`,
+    `codes_with_unlimited_uses=${bypassReview.unlimitedUses}`,
+    `codes_without_expiration=${bypassReview.neverExpire}`,
+    `codes_undated=${bypassReview.undated}`,
+    `codes_expired=${bypassReview.expired}`,
+    `helpdesk_bypass=${helpdeskBypass ?? "unknown"}`,
+    `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`,
+    ...bypassReview.stale.slice(0, 5).map((code) =>
+      `stale_bypass_code=${code.id} user=${code.user} created=${code.created} age_hours=${code.ageHours}`,
+    ),
+    ...bypassReview.unlimited.slice(0, 5).map((code) =>
+      `unlimited_bypass_code=${code.id} user=${code.user} reuse_count=${code.reuseCount} expiration=${code.expiration}`,
+    ),
+  ];
+  const flaggedBypassCodes = bypassReview.stale.length + bypassReview.unlimited.length;
 
   if (data.bypassCodes.error) {
     findings.push(
@@ -2347,33 +2421,47 @@ export function assessDuoAuthentication(
         data.bypassCodes,
       ),
     );
-  } else if (helpdeskBypass === "allow" || unlimitedLikeCodes > 0 || (helpdeskBypass === "limit" && (helpdeskBypassExpiration ?? 0) <= 0)) {
+  } else if (flaggedBypassCodes > 0 || helpdeskBypass === "allow" || (helpdeskBypass === "limit" && (helpdeskBypassExpiration ?? 0) <= 0)) {
     findings.push(
-      buildFinding(
-        "DUO-AUTH-006",
-        "Fail",
-        "Bypass code issuance is active without strong expiration controls.",
-        [
-          `active_bypass_codes=${bypassCount}`,
-          `helpdesk_bypass=${helpdeskBypass ?? "unknown"}`,
-          `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`,
-          unlimitedLikeCodes > 0 ? `codes_with_zero_limits=${unlimitedLikeCodes}` : undefined,
-        ].filter((item): item is string => Boolean(item)),
-        "Constrain bypass-code creation to expiring, break-glass workflows and remove unrestricted help-desk issuance.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-AUTH-006",
+          "Fail",
+          flaggedBypassCodes > 0
+            ? `${bypassReview.stale.length} bypass code(s) are older than 24 hours and ${bypassReview.unlimited.length} have unlimited uses or no expiration.`
+            : "Bypass codes are active while help desk issuance has no expiration limit.",
+          bypassEvidence,
+          "Revoke bypass codes older than 24 hours, issue only single-use codes with an expiration, and limit help desk issuance.",
+        ),
+        data.bypassCodes,
+      ),
+    );
+  } else if (bypassReview.undated > 0) {
+    findings.push(
+      withInventoryCap(
+        buildFinding(
+          "DUO-AUTH-006",
+          "Partial",
+          `${bypassReview.undated} bypass code(s) have no created timestamp, so their age cannot be confirmed (Partial, not Pass).`,
+          bypassEvidence,
+          "Review the undated bypass codes in the Duo Admin Panel and revoke any older than 24 hours.",
+        ),
+        data.bypassCodes,
       ),
     );
   } else {
     findings.push(
-      buildFinding(
-        "DUO-AUTH-006",
-        "Partial",
-        "Bypass codes are in use, but the account shows at least some expiration controls.",
-        [
-          `active_bypass_codes=${bypassCount}`,
-          `helpdesk_bypass=${helpdeskBypass ?? "unknown"}`,
-          `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`,
-        ],
-        "Review active bypass code usage and keep creation tightly governed.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-AUTH-006",
+          "Partial",
+          bypassCount === bypassReview.expired
+            ? `${bypassCount} bypass code(s) were returned but every one has passed its expiration timestamp (Partial until they are deleted).`
+            : `${bypassCount - bypassReview.expired} active bypass code(s) were created within 24 hours and carry a reuse limit and expiration.`,
+          bypassEvidence,
+          "Confirm each active code maps to an approved break-glass request and revoke it once used.",
+        ),
+        data.bypassCodes,
       ),
     );
   }
