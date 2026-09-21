@@ -347,6 +347,9 @@ function percent(part: number, total: number): number {
 }
 
 function parseDate(value: unknown): Date | undefined {
+  // Resolved dates (for example the newest WAS scan launchedDate) arrive as Date instances, everything
+  // read from an API response arrives as text; both must age the same way.
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? undefined : value;
   const text = asString(value);
   if (!text) return undefined;
   const parsed = new Date(text);
