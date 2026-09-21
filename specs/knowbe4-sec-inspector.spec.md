@@ -367,7 +367,8 @@ Implemented in grclanker on 2026-09-21 as six read-only tools (see "grclanker im
 - Configuration precedence exactly as in section 3: tool arguments, then `KNOWBE4_API_TOKEN` / `KNOWBE4_REGION` (plus `KNOWBE4_BASE_URL`, `KNOWBE4_PHISHER_API_TOKEN`, `KNOWBE4_PHISHER_GRAPHQL_URL`, `KNOWBE4_CONFIG_FILE`, `KNOWBE4_TIMEOUT`, `KNOWBE4_REDACT_PII`), then `~/.knowbe4-inspector/config.yaml`; all five regions; PII redaction through `redact_pii`.
 - Bearer-token Reporting API client with client-side throttling, `429`/`503` retry with backoff that honors `Retry-After`, timeouts, and token redaction in error messages.
 - Optional PhishER GraphQL enrichment of the report-rate control (`phisherMessages` filtered by `reported_at`).
-- Seventeen controls evaluated automatically (1 through 12 and 16 through 20). Controls 13, 14, and 15 are emitted as `manual` findings that state the console evidence to collect.
+- Seventeen controls evaluated automatically (1 through 12 and 16 through 20). Controls 13, 14, and 15 are emitted as `manual` findings that state the console evidence to collect. Controls 15 and 16 also render as `manual` (never `pass`) when they are scoped out with `require_usb_tests: false` or `require_vishing_tests: false`.
+- Missing-data guardrails: a verdict never passes on absent evidence. No security test in the window, undated training modules, required compliance topics with zero enrollments, unsampled tests in the window, a truncated user list (`user_limit_reached`), or a stopped test cadence (measured to now) all yield `warn` or `fail` with the reason in the evidence.
 - Evidence bundle with raw snapshots, normalized findings, a 20-control coverage map, an executive summary, a unified compliance matrix, and one report per framework in section 5.
 
 ### Deviations from this spec (official documentation wins)
