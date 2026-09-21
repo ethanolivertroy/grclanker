@@ -3,11 +3,11 @@ slug: "crowdstrike-sec-inspector"
 name: "CrowdStrike Security Inspector"
 vendor: "CrowdStrike"
 category: "security-network-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/crowdstrike-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # crowdstrike-sec-inspector
@@ -412,6 +412,49 @@ crowdstrike-inspector audit --all \
 
 ## 10. Status
 
-**Not yet implemented. Spec only.**
+**Implemented in grclanker as a native TypeScript tool family (2026-09-21).**
 
-This document defines the architecture, security controls, compliance mappings, and build plan for `crowdstrike-sec-inspector`. No code has been written yet.
+The standalone Go CLI described in Sections 7 through 9 was not built. The controls, authentication model, regional endpoints, and compliance mappings in this spec ship as read-only grclanker tools in `cli/extensions/grc-tools/crowdstrike.ts`, with mocked tests in `cli/tests/crowdstrike.test.mjs`, a live smoke script in `cli/scripts/crowdstrike-live-smoke.mjs` (`npm --prefix cli run test:crowdstrike:live`), and an integration guide at `src/content/docs/docs/integrations/crowdstrike.md`.
+
+### grclanker implementation
+
+- `crowdstrike_check_access`: probes 19 Falcon read surfaces and reports missing API client scopes
+- `crowdstrike_assess_prevention_policies`: CS-01 through CS-05
+- `crowdstrike_assess_response_readiness`: CS-06, CS-07, CS-22, CS-23
+- `crowdstrike_assess_device_firewall`: CS-08 through CS-11
+- `crowdstrike_assess_sensor_coverage`: CS-12 through CS-15 and CS-25
+- `crowdstrike_assess_access_governance`: CS-16 through CS-21 and CS-24
+- `crowdstrike_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified matrix, one report per framework in Section 5, quick reference, error log, and zip archive
+
+Findings are normalized as `{id, title, severity, status, summary, evidence, mappings}` with status `pass`, `warn`, `fail`, or `manual`, and every finding carries the Section 5 mappings for its control. Authentication supports `CS_CLIENT_ID`, `CS_CLIENT_SECRET`, `CS_BASE_URL`, `CS_MEMBER_CID`, a `CS_CLOUD` alias for the regional endpoints (plus `us-gov-2`), explicit tool arguments, and an optional JSON config file (`CS_CONFIG_FILE` or `~/.crowdstrike/config.json`), in that precedence order (arguments, environment, file).
+
+### What shipped
+
+- All 25 controls produce a finding. 24 are evaluated from API evidence; CS-07 is always `manual` because no Falcon API endpoint exposes the RTR session timeout or concurrent session limit (RTR audit sessions are still analyzed and raise `warn` for long or concurrent sessions).
+- CS-15, CS-24, and CS-25 fall back to `manual` findings with console evidence instructions when Falcon Discover, Identity Protection, or Zero Trust Assessment return 403 or 404 (unlicensed module or missing scope).
+- OAuth2 client credentials with token caching and single refresh on 401, offset and `after` cursor pagination, 429 and 5xx retries honoring `X-RateLimit-RetryAfter` and `Retry-After`, request timeouts, and secret redaction in errors.
+- Eight framework reports (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP) in every audit bundle.
+
+### Evidenced deviations from this spec
+
+Endpoint paths, parameters, and setting identifiers were verified against the public CrowdStrike API reference (developer.crowdstrike.com/api-reference/collections) and the public falconpy, gofalcon, and terraform-provider-crowdstrike repositories. Where the spec text differs from the API, the implementation follows the API:
+
+- CS-01: the API has no `MLSliderDetectionLevels` or `MLSliderPreventionLevels` settings. ML levels are per-slider `mlslider` settings with `detection` and `prevention` values; the implementation evaluates `CloudAntiMalware` and `OnSensorMLSlider` and reports `AdwarePUP` and the Office, user-initiated, and end-user scan sliders as evidence.
+- CS-02: `ExploitMitigation` is a settings category, not a setting. The implementation evaluates the individual toggles (`ForceASLR`, `ForceDEP`, `HeapSprayPreallocation`, `NullPageAllocation`, `SEHOverwriteProtection`, plus extended mitigations such as `ProcessHollowing` and `ChopperWebshell`). Stack pivot and ROP are not separately exposed.
+- CS-03: the setting identifiers are `InterpreterProtection` and `EngineProtectionV2`, not `InterpreterOnly` and `EngineFull`.
+- CS-04: the setting identifier is `SensorTamperingProtection`, not `SensorTamperProtection`.
+- CS-05: on-write detection is `DetectOnWrite` plus `QuarantineOnWrite` (with package-on-write and script visibility toggles as evidence), not a single `OnWriteDetection` setting.
+- CS-06: the response policy setting is `CustomScripts` (with `RealTimeFunctionality` for RTR itself), not `CustomScriptsAllowed`.
+- CS-09: the Device Control API exposes USB classes, Bluetooth classes, and a PCIe enforcement mode. Thunderbolt is evaluated through `pcie_enforcement_mode` and SD cards through the `MASS_STORAGE` class because there are no dedicated Thunderbolt or SD card classes.
+- CS-18: API clients live in the `api-clients` collection (`/api-clients/queries/api-clients/v1`, `/api-clients/entities/api-clients/v1`), not User Management.
+- CS-22: the Detections API is legacy; the implementation reads the Alerts API (`POST /alerts/combined/alerts/v1`) and treats severity 90 and above as critical (24 hour SLA) and 70 and above as high (72 hour SLA).
+- CS-23: the Hosts API does not expose when containment started, so containment age uses the host record `modified_timestamp` as a proxy and the finding asks for incident references.
+- CS-24: the Identity Protection GraphQL endpoint requires a write scope, so the implementation uses the read-only policy-rules REST endpoints and parses `enabled`, `simulationMode`, and `action` defensively.
+- Regional endpoints: `us-gov-2` (`https://api.us-gov-2.crowdstrike.mil`) is supported in addition to the four clouds listed in Section 3.
+
+### What remains
+
+- Policy precedence analysis (Section 1 and Phase 7) is not implemented; precedence is reported through `precedence` values in raw snapshots only.
+- Multi-tenant Flight Control iteration is not implemented; run the tools once per `CS_MEMBER_CID`.
+- Trend tracking for CS-15 (unmanaged asset count over time) is not implemented; each run reports the current count.
+- The `crowdstrike-sec-inspector` CLI surface in Section 8 is replaced by grclanker tool invocations and the audit bundle exporter.
