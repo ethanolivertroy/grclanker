@@ -721,13 +721,21 @@ test("false-pass self-check (b): empty inventories never pass except where empti
   const findings = results.flatMap((result) => result.findings);
   assert.equal(findings.length, 20);
   const passing = findings.filter((item) => item.status === "pass");
-  assert.deepEqual(passing.map((item) => item.id), ["SF-13"], "only guest-user access may pass on an empty inventory");
-  assert.match(findingById(results[1], "SF-13").summary, /emptiness is compliant/);
+  assert.deepEqual(passing.map((item) => item.id), [], "no control may pass when every inventory is empty");
+  assert.equal(findingById(results[1], "SF-13").status, "manual");
+  assert.match(findingById(results[1], "SF-13").summary, /Zero users were returned/);
   assert.equal(findingById(results[2], "SF-16").status, "fail");
   assert.equal(findingById(results[3], "SF-14").status, "manual");
   assert.equal(findingById(results[3], "SF-15").status, "manual");
   assert.equal(findingById(results[1], "SF-10").status, "manual");
   assert.equal(findingById(results[0], "SF-01").status, "manual");
+
+  const noGuests = assessSalesforceIdentityData(goodIdentityData({
+    users: okDataset("User", goodUsers.filter((user) => user.UserType !== "Guest")),
+  }));
+  const guestFinding = findingById(noGuests, "SF-13");
+  assert.equal(guestFinding.status, "pass", "zero guest users inside a visible population is the only compliant emptiness");
+  assert.match(guestFinding.summary, /emptiness is compliant/);
 });
 
 test("false-pass self-check (c): partial or truncated inventories never pass (rules 5 and 7)", async () => {

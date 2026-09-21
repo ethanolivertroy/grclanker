@@ -76,7 +76,7 @@ Precedence is explicit tool arguments, then environment variables, then the cred
 | 10 | Profile permissions | identity_access | SF-10 | pass when active admins <= threshold, none stale, none undated |
 | 11 | Connected app OAuth | monitoring_integrations | SF-11 | warn at best: scopes are not exposed by SOQL; fail when most apps allow self-authorization |
 | 12 | Sharing settings | data_protection | SF-12 | warn at best: custom object defaults are not read; fail when 3+ standard objects are public |
-| 13 | Guest user access | identity_access | SF-13 | pass when zero active guest users with a complete user list; fail when guests have API or elevated permissions |
+| 13 | Guest user access | identity_access | SF-13 | pass when a complete, non-empty user list contains zero active guest users; manual when zero users are visible; fail when guests have API or elevated permissions |
 | 14 | Login forensics | monitoring_integrations | SF-14 | pass when failures <= 10 percent, no source with 10+ failures, no legacy TLS |
 | 15 | Setup change tracking | monitoring_integrations | SF-15 | pass when the trail is complete and no high-risk security changes; warn when changes need review |
 | 16 | Data encryption | data_protection | SF-16 | manual not-applicable when `TenantSecret` is unavailable or forbidden; fail when no active secrets |
@@ -85,7 +85,7 @@ Precedence is explicit tool arguments, then environment variables, then the cred
 | 19 | Clickjack protection | platform_security | SF-19 | pass when all four `enableClickjack*` flags are true |
 | 20 | CSRF protection | platform_security | SF-20 | pass when `enableCSRFOnGet` and `enableCSRFOnPost` are true |
 
-Verdict rules that apply to every finding: unreadable, forbidden, or errored data yields `manual` with the cause and the Setup evidence to collect; empty inventories never pass unless emptiness is compliant (only control 13); partial or truncated inventories downgrade `pass` to `warn` with seen and total counts; items missing a date are reported separately and never counted as current.
+Verdict rules that apply to every finding: unreadable, forbidden, or errored data yields `manual` with the cause and the Setup evidence to collect; empty inventories never pass unless emptiness is compliant (only control 13, and only when the user list itself is non-empty); partial or truncated inventories downgrade `pass` to `warn` with seen and total counts; items missing a date are reported separately and never counted as current.
 
 ## Framework mappings
 

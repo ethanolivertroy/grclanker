@@ -1695,6 +1695,8 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     };
     if (data.users.truncated) {
       findings.push(finding(13, "warn", `Only ${data.users.seen} of ${data.users.total ?? "unknown"} users were read, so guest user coverage is partial; ${activeGuests.length} active guest users were seen.`, evidence, guestManual));
+    } else if (users.length === 0) {
+      findings.push(finding(13, "manual", "Zero users were returned, so guest users cannot be ruled out; the auditing user cannot see the org population (View All Users is likely missing).", evidence, guestManual));
     } else if (activeGuests.length === 0) {
       findings.push(finding(13, "pass", "No active guest users exist, so no Sites or Experience Cloud public access is exposed through guest profiles (emptiness is compliant for this control).", evidence));
     } else if (!profilesReadable) {
