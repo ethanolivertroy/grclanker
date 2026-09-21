@@ -723,6 +723,46 @@ test("every capped list threads truncation into the verdicts (never-ending sink,
   assert.equal(bucketPage, 50, "the bucket cap of 5000 stops after 50 pages of 100");
 });
 
+test("GCP-LOG-03 counts only enabled sinks toward coverage and names disabled sinks", async () => {
+  const enabledClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
+  const enabled = (await assessGcpLoggingDetection(enabledClient)).findings.find((item) => item.id === "GCP-LOG-03");
+  assert.equal(enabled.status, "pass");
+  assert.deepEqual(enabled.evidence.projects_without_sinks, []);
+  assert.deepEqual(enabled.evidence.disabled_sinks, []);
+  assert.match(enabled.summary, /at least one enabled log sink\./);
+
+  const disabledSink = { name: "audit-sink", destination: "storage.googleapis.com/audit-archive", disabled: true };
+  const disabledClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, { ...COMPLIANT, sinks: { sinks: [disabledSink] } })));
+  const result = await assessGcpLoggingDetection(disabledClient);
+  const disabled = result.findings.find((item) => item.id === "GCP-LOG-03");
+  assert.equal(disabled.status, "fail", "a project whose only sink is disabled exports nothing and must not pass");
+  assert.deepEqual(disabled.evidence.projects_without_sinks, ["prod-audit"]);
+  assert.deepEqual(disabled.evidence.disabled_sinks, [{ projectId: "prod-audit", sink: "audit-sink", destination: "storage.googleapis.com/audit-archive" }]);
+  assert.match(disabled.summary, /1 of 1 sampled projects have no enabled log sink \(1 sinks are disabled and export nothing\)/);
+  assert.equal(result.summary.projects_with_log_sinks, 0);
+  assert.equal(result.summary.disabled_log_sinks, 1);
+  assert.deepEqual(result.snapshot.sinks[0].sinks, [{ name: "audit-sink", destination: "storage.googleapis.com/audit-archive", disabled: true }]);
+
+  const mixedClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, { ...COMPLIANT, sinks: { sinks: [disabledSink, { name: "org-sink", disabled: false }] } })));
+  const mixed = (await assessGcpLoggingDetection(mixedClient)).findings.find((item) => item.id === "GCP-LOG-03");
+  assert.equal(mixed.status, "pass");
+  assert.match(mixed.summary, /\(1 disabled sinks were not counted\)/);
+  assert.equal(mixed.evidence.disabled_sinks.length, 1);
+});
+
+test("GCP-NET-05 CUSTOM profiles carry the documented customFeatures cipher list for manual review", async () => {
+  const seeded = {
+    ...COMPLIANT,
+    sslPolicies: { items: { global: { sslPolicies: [{ name: "strict", minTlsVersion: "TLS_1_2", profile: "CUSTOM", customFeatures: ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"] }] } } },
+  };
+  const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, seeded)));
+  const result = await assessGcpNetworkSecurity(client);
+  const finding = result.findings.find((item) => item.id === "GCP-NET-05");
+  assert.equal(finding.status, "warn");
+  assert.deepEqual(finding.evidence.unresolved_proxies[0].customFeatures, ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]);
+  assert.deepEqual(result.snapshot.ssl_policies[0].customFeatures, ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]);
+});
+
 test("org guardrail snapshots and evidence never pass metadata values through", async () => {
   const secret = "SEEDED-STARTUP-SCRIPT-4c1d2e";
   const seeded = {
@@ -747,6 +787,8 @@ test("org guardrail snapshots and evidence never pass metadata values through", 
     shieldedInstanceConfig: { enableSecureBoot: true, enableVtpm: true, enableIntegrityMonitoring: true },
   }]);
   assert.deepEqual(Object.keys(result.snapshot.effective_policies.requireOsLogin), ["constraint", "enforced", "booleanPolicy", "listPolicy", "restoreDefault"]);
+  assert.deepEqual(result.snapshot.effective_policies.allowedPolicyMemberDomains.listPolicy, { allValues: null, allowedValues: ["C0abc123"], deniedValues: [] });
+  assert.deepEqual(result.findings.find((item) => item.id === "GCP-ORG-02").evidence.policy.listPolicy.allowedValues, ["C0abc123"]);
   assert.equal(statuses([result])["GCP-ORG-08"], "pass");
 });
 
@@ -806,7 +848,7 @@ function seededFixture() {
   data.sccSources.sources[0].description = seed("scc-source");
   data.sccFindings = { listFindingsResults: [{ finding: { name: "organizations/123456789012/sources/1/findings/f1", sourceProperties: { detail: seed("scc-finding") } } }] };
   data.booleanPolicy.etag = seed("boolean-policy");
-  data.listPolicy.listPolicy.allowedValues.push(seed("list-policy"));
+  data.listPolicy.etag = seed("list-policy");
   data.computeProject.commonInstanceMetadata.items.push({ key: "ssh-keys", value: seed("project-ssh-keys") }, { key: "db-password", value: seed("project-metadata") });
   const instance = data.instances.items["zones/us-central1-a"].instances[0];
   instance.metadata = { items: [{ key: "startup-script", value: seed("instance-startup-script") }] };
@@ -829,7 +871,7 @@ function seededFixture() {
   subnet.logConfig.filterExpr = seed("subnetwork-filter");
   data.routers.items["regions/us-central1"].routers[0].description = seed("router");
   data.sslPolicies.items.global.sslPolicies[0].description = seed("ssl-policy");
-  data.sslPolicies.items.global.sslPolicies[0].customFeatures = [seed("ssl-custom-feature")];
+  data.sslPolicies.items.global.sslPolicies[0].fingerprint = seed("ssl-policy-fingerprint");
   data.targetHttpsProxies.items.global.targetHttpsProxies[0].description = seed("https-proxy");
   const backend = data.backendServices.items.global.backendServices[0];
   backend.description = seed("backend-service");

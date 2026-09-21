@@ -1449,12 +1449,17 @@ function snapshotOrgPolicy(policyResponse: JsonRecord | null | undefined): JsonR
     listPolicy: listPolicy
       ? {
           allValues: asString(listPolicy.allValues) ?? null,
-          allowedValues: asArray(listPolicy.allowedValues).length,
-          deniedValues: asArray(listPolicy.deniedValues).length,
+          allowedValues: stringList(listPolicy.allowedValues),
+          deniedValues: stringList(listPolicy.deniedValues),
         }
       : null,
     restoreDefault: Boolean(asObject(policy.restoreDefault)),
   };
+}
+
+/** Documented string[] constraint values such as directory customer IDs or cipher names; never credentials. */
+function stringList(value: unknown): string[] {
+  return asArray(value).map(asString).filter((entry): entry is string => Boolean(entry));
 }
 
 function snapshotShieldedConfig(config: JsonRecord | undefined): JsonRecord | null {
@@ -1505,6 +1510,11 @@ function snapshotLoggingSettings(row: ProjectScanRow<JsonRecord>): JsonRecord {
   return { projectId: row.projectId, name: asString(row.data.name) ?? null };
 }
 
+/** GCP_DOCS.sinksList: LogSink.disabled true means the sink exports no log entries, so it never counts toward coverage. */
+function sinkDisabled(sink: JsonRecord): boolean {
+  return sink.disabled === true;
+}
+
 function snapshotLogSinks(row: ProjectScanRow<GcpListResult>): JsonRecord {
   return {
     projectId: row.projectId,
@@ -1512,7 +1522,7 @@ function snapshotLogSinks(row: ProjectScanRow<GcpListResult>): JsonRecord {
     sinks: row.data.items.map((sink) => ({
       name: asString(sink.name) ?? null,
       destination: asString(sink.destination) ?? null,
-      disabled: sink.disabled === true,
+      disabled: sinkDisabled(sink),
     })),
   };
 }
@@ -1678,6 +1688,7 @@ function snapshotSslPolicy(policy: JsonRecord & { projectId: string }): JsonReco
     name: asString(policy.name) ?? null,
     minTlsVersion: asString(policy.minTlsVersion) ?? null,
     profile: asString(policy.profile) ?? null,
+    customFeatures: stringList(policy.customFeatures),
   };
 }
 
@@ -1922,7 +1933,16 @@ export async function assessGcpLoggingDetection(
 
   const projectsWithoutAdmin = adminScan.rows.filter((row) => row.data.length === 0).map((row) => row.projectId);
   const projectsWithoutDataAccess = dataAccessScan.rows.filter((row) => row.data.length === 0).map((row) => row.projectId);
-  const projectsWithoutSinks = sinkScan.rows.filter((row) => row.data.items.length === 0).map((row) => row.projectId);
+  const disabledSinks: JsonRecord[] = [];
+  const projectsWithoutSinks: string[] = [];
+  for (const row of sinkScan.rows) {
+    let enabledSinks = 0;
+    for (const sink of row.data.items) {
+      if (sinkDisabled(sink)) disabledSinks.push({ projectId: row.projectId, sink: asString(sink.name) ?? null, destination: asString(sink.destination) ?? null });
+      else enabledSinks += 1;
+    }
+    if (enabledSinks === 0) projectsWithoutSinks.push(row.projectId);
+  }
 
   const shortRetention: JsonRecord[] = [];
   const unknownRetention: JsonRecord[] = [];
@@ -1985,14 +2005,14 @@ export async function assessGcpLoggingDetection(
       title: "Log sink coverage",
       severity: "high",
       controls: [5],
-      evidence: { projects_without_sinks: projectsWithoutSinks.slice(0, 25), projects_read: sinkScan.rows.length },
+      evidence: { projects_without_sinks: projectsWithoutSinks.slice(0, 25), disabled_sinks: disabledSinks.slice(0, 25), projects_read: sinkScan.rows.length },
       total: sinkScan.rows.length,
       violations: projectsWithoutSinks.length,
       emptyVerdict: "manual",
-      passSummary: `Every one of ${sinkScan.rows.length} sampled projects has at least one log sink.`,
-      failSummary: `${projectsWithoutSinks.length} of ${sinkScan.rows.length} sampled projects have no configured log sink.`,
+      passSummary: `Every one of ${sinkScan.rows.length} sampled projects has at least one enabled log sink${disabledSinks.length > 0 ? ` (${disabledSinks.length} disabled sinks were not counted)` : ""}.`,
+      failSummary: `${projectsWithoutSinks.length} of ${sinkScan.rows.length} sampled projects have no enabled log sink${disabledSinks.length > 0 ? ` (${disabledSinks.length} sinks are disabled and export nothing)` : ""}.`,
       emptySummary: "No projects were available for log sink sampling.",
-      manualEvidence: "list log sinks per project and at the organization level.",
+      manualEvidence: "list log sinks per project and at the organization level and confirm each sink's disabled flag is not set.",
     }),
     verdict({
       ...scanBase(bucketScan),
@@ -2051,6 +2071,7 @@ export async function assessGcpLoggingDetection(
       projects_with_admin_activity: adminScan.rows.length - projectsWithoutAdmin.length,
       projects_with_data_access: dataAccessScan.rows.length - projectsWithoutDataAccess.length,
       projects_with_log_sinks: sinkScan.rows.length - projectsWithoutSinks.length,
+      disabled_log_sinks: disabledSinks.length,
       configurable_log_buckets: bucketCount,
       short_retention_buckets: shortRetention.length,
       scc_sources: sccSources.data.items.length,
@@ -2830,7 +2851,7 @@ export async function assessGcpNetworkSecurity(
     const profile = asString(policy.profile);
     if (minTls !== "TLS_1_2" && minTls !== "TLS_1_3") weakProxies.push({ ...record, minTlsVersion: minTls ?? null, reason: "minTlsVersion below TLS_1_2" });
     else if (profile === "COMPATIBLE") weakProxies.push({ ...record, profile, reason: "COMPATIBLE profile permits weak cipher suites" });
-    else if (profile === "CUSTOM") unresolvedProxies.push({ ...record, profile, reason: "CUSTOM profile requires manual cipher review" });
+    else if (profile === "CUSTOM") unresolvedProxies.push({ ...record, profile, customFeatures: stringList(policy.customFeatures), reason: "CUSTOM profile requires manual cipher review" });
   }
 
   const externalBackends = flattenScan(backendScan).filter((backend) => {
