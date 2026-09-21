@@ -20,7 +20,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets } from "./gws.js";
+import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets, scrubText } from "./gws.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -36,13 +36,24 @@ const GWS_BIN_ENV_KEYS = ["GRCLANKER_GWS_BIN"] as const;
 const CAPTURE_PROJECTION_NOTE =
   "The stored capture is projected to the documented Reports API activity fields (id, actor, ipAddress, events[].type and name); event parameters are not stored and credential-like values are redacted. Re-run the recorded command for parameter detail.";
 
+/**
+ * The one scrub every CLI-produced string passes through before it can become an error message, a tool result, or a
+ * log line: the inspector's text scrubber removes credential shapes (bearer and OAuth tokens, `key=value` pairs whose
+ * key names a credential, URL query strings), then every value held by the CLI's own environment is replaced wherever
+ * it appears. Applied where the error is built, so no consumer can receive the unscrubbed text.
+ */
+export function scrubCliText(text: string, knownSecrets: string[] = []): string {
+  return redactKnownValues(scrubText(text), knownSecrets) as string;
+}
+
 export class GwsCliCommandError extends Error {
   kind: GwsCliErrorKind;
   command: string;
   exitCode?: number;
 
-  constructor(kind: GwsCliErrorKind, message: string, command: string, exitCode?: number) {
-    super(message);
+  /** The message is scrubbed at construction, so `error.message` is already safe for every consumer. */
+  constructor(kind: GwsCliErrorKind, message: string, command: string, exitCode?: number, knownSecrets: string[] = []) {
+    super(scrubCliText(message, knownSecrets));
     this.name = "GwsCliCommandError";
     this.kind = kind;
     this.command = command;
@@ -230,6 +241,15 @@ function formatErrorMessage(result: GwsCliExecution): string {
   return parts[0] ?? "gws returned a non-zero exit code without additional output.";
 }
 
+/**
+ * A JSON parse failure is described without the parser's own message, which quotes the first characters of stdout and
+ * so could repeat the start of whatever the CLI printed there.
+ */
+function describeParseFailure(error: unknown, stdout: string): string {
+  const name = error instanceof Error ? error.name : "Error";
+  return `gws returned success, but grclanker could not parse the output as structured JSON (${name} while reading ${stdout.length} character(s) of stdout; the output is not repeated here).`;
+}
+
 function findExecutableOnPath(command: string): string | undefined {
   const locator = process.platform === "win32" ? "where" : "which";
   const result = spawnSync(locator, [command], { encoding: "utf8" });
@@ -302,6 +322,7 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
   const { executable, args, env } = request;
   const expectJson = request.expectJson !== false;
   const command = buildCommandString(executable.displayExecutable, args);
+  const knownSecrets = knownSecretValues(env);
 
   return await new Promise<GwsCliExecution>((resolvePromise, rejectPromise) => {
     const child = spawn(executable.executable, args, {
@@ -336,7 +357,7 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
         args,
         command,
         stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        stderr: scrubCliText(stderr.trim(), knownSecrets),
         exitCode: exitCode ?? 1,
       };
 
@@ -347,6 +368,7 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
             formatErrorMessage(execution),
             command,
             execution.exitCode,
+            knownSecrets,
           ),
         );
         return;
@@ -363,9 +385,10 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
         rejectPromise(
           new GwsCliCommandError(
             "internal",
-            `gws returned success, but grclanker could not parse the output as structured JSON: ${summarizeError(error)}`,
+            describeParseFailure(error, execution.stdout),
             command,
             execution.exitCode,
+            knownSecrets,
           ),
         );
         return;
@@ -544,9 +567,10 @@ async function executePreview(
     } catch (error) {
       throw new GwsCliCommandError(
         "internal",
-        `gws returned success, but grclanker could not parse the output as structured JSON: ${summarizeError(error)}`,
+        describeParseFailure(error, result.stdout),
         result.command,
         result.exitCode,
+        knownSecretValues(env),
       );
     }
   }
@@ -1146,6 +1170,17 @@ function renderActivityToolResult(result: GwsOpsActivityResult) {
   });
 }
 
+/** Every tool error result is built here so the CLI's stderr, or any other error text, is scrubbed before the agent sees it. */
+function renderToolError(prefix: string, error: unknown, tool: string) {
+  return errorResult(
+    scrubCliText(`${prefix}: ${summarizeError(error)}`, knownSecretValues(process.env)),
+    {
+      tool,
+      kind: error instanceof GwsCliCommandError ? error.kind : "internal",
+    },
+  );
+}
+
 function normalizeBaseArgs(args: Record<string, unknown>): GwsOpsBaseArgs {
   return {
     gwsBin: asString(args.gws_bin),
@@ -1275,13 +1310,7 @@ export function registerGwsOperatorTools(pi: any): void {
           notes: result.notes,
         });
       } catch (error) {
-        return errorResult(
-          `Google Workspace CLI bridge check failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_check_cli",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace CLI bridge check failed", error, "gws_ops_check_cli");
       }
     },
   });
@@ -1305,13 +1334,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderActivityToolResult(await investigateGwsAlerts(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace alert investigation failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_investigate_alerts",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace alert investigation failed", error, "gws_ops_investigate_alerts");
       }
     },
   });
@@ -1327,13 +1350,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderActivityToolResult(await traceGwsAdminActivity(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace admin activity trace failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_trace_admin_activity",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace admin activity trace failed", error, "gws_ops_trace_admin_activity");
       }
     },
   });
@@ -1349,13 +1366,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderActivityToolResult(await reviewGwsTokenActivity(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace token activity review failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_review_tokens",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace token activity review failed", error, "gws_ops_review_tokens");
       }
     },
   });
@@ -1383,13 +1394,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderBundleResult(await collectGwsOperatorEvidenceBundle(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace operator evidence collection failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_collect_evidence_bundle",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace operator evidence collection failed", error, "gws_ops_collect_evidence_bundle");
       }
     },
   });

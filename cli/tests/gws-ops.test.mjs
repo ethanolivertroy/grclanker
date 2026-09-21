@@ -19,6 +19,7 @@ import {
   collectGwsOperatorEvidenceBundle,
   defaultGwsCliRunner,
   investigateGwsAlerts,
+  registerGwsOperatorTools,
   resolveGwsCliExecutable,
   reviewGwsTokenActivity,
   traceGwsAdminActivity,
@@ -642,6 +643,84 @@ test("rule 9 (end to end): the evidence bundle and tool results never carry a pl
   const rawAlerts = JSON.parse(readFileSync(join(result.outputDir, "raw", "alerts.json"), "utf8"));
   assert.deepEqual(rawAlerts.raw.alerts[0].metadata, { alertId: "a-1", status: "NOT_STARTED", severity: "HIGH", assignee: "secops@example.com" });
   assert.match(readFileSync(join(result.outputDir, "README.md"), "utf8"), /projected to the documented Reports API and Alert Center fields/);
+});
+
+/** Registers the bridge tools against a stand-in host and returns them keyed by name, applying prepareArguments the way the host does. */
+function registeredTools() {
+  const tools = new Map();
+  registerGwsOperatorTools({ registerTool: (definition) => tools.set(definition.name, definition) });
+  return {
+    run: async (name, rawArgs) => {
+      const definition = tools.get(name);
+      assert.ok(definition, `tool ${name} is registered`);
+      return definition.execute("call-1", definition.prepareArguments(rawArgs));
+    },
+  };
+}
+
+test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown message, tool result, or probe carries a planted credential", async () => {
+  const base = createTempBase("grclanker-gws-ops-stderr-");
+  const envToken = "PLANTEDr4-env-token-value-0123";
+  const bearer = "ya29.PLANTEDr4bearer0123456789";
+  const pair = "access_token=PLANTEDr4pair0123456789";
+  const leak = /PLANTED/;
+  const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: envToken };
+  // The CLI stand-in echoes its own credential from the environment plus the two documented token shapes into stderr and exits 2 (auth).
+  const stderrLine = `Error: token $GOOGLE_WORKSPACE_CLI_TOKEN rejected; retry with Bearer ${bearer} or ${pair}`;
+  const denied = createScriptedBinary(base, `if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "${stderrLine}" 1>&2\nexit 2`);
+
+  // The thrown error is the surface the live smoke script logs.
+  await assert.rejects(
+    () => traceGwsAdminActivity({ gwsBin: denied }, defaultGwsCliRunner, env),
+    (error) => {
+      assert.ok(error instanceof GwsCliCommandError);
+      assert.equal(error.kind, "auth");
+      assert.doesNotMatch(error.message, leak, `thrown message leaked: ${error.message}`);
+      assert.equal(error.message, "Error: token [REDACTED] rejected; retry with Bearer [REDACTED] or access_token=[REDACTED]");
+      return true;
+    },
+  );
+
+  // The registered tools read the real environment, so the planted token is placed there for the duration of the calls.
+  const previous = process.env.GOOGLE_WORKSPACE_CLI_TOKEN;
+  process.env.GOOGLE_WORKSPACE_CLI_TOKEN = envToken;
+  try {
+    const tools = registeredTools();
+    for (const name of ["gws_ops_investigate_alerts", "gws_ops_trace_admin_activity", "gws_ops_review_tokens", "gws_ops_collect_evidence_bundle", "gws_ops_check_cli"]) {
+      const result = await tools.run(name, { gws_bin: denied, output_dir: join(base, "export") });
+      assert.equal(result.isError, true, name);
+      assert.equal(result.details.kind, "auth", name);
+      assert.doesNotMatch(JSON.stringify(result), leak, `${name} tool result leaked: ${JSON.stringify(result)}`);
+      assert.match(result.content[0].text, /Bearer \[REDACTED\] or access_token=\[REDACTED\]/, name);
+    }
+
+    // The validation branch re-wraps the message for the missing alertcenter alias; the rewrapped text stays scrubbed.
+    const rejected = createScriptedBinary(createTempBase("grclanker-gws-ops-stderr-exit3-"), `echo "Unknown service 'alertcenter' (${pair})" 1>&2\nexit 3`);
+    const alias = await tools.run("gws_ops_investigate_alerts", { gws_bin: rejected });
+    assert.equal(alias.details.kind, "validation");
+    assert.doesNotMatch(JSON.stringify(alias), leak);
+    assert.match(alias.content[0].text, /registers no alertcenter alias/);
+
+    // A parse failure never repeats the CLI's stdout, even its first characters.
+    const garbage = createScriptedBinary(createTempBase("grclanker-gws-ops-stderr-parse-"), `echo "$GOOGLE_WORKSPACE_CLI_TOKEN ${bearer} is not json"`);
+    const parse = await tools.run("gws_ops_trace_admin_activity", { gws_bin: garbage });
+    assert.equal(parse.details.kind, "internal");
+    assert.doesNotMatch(JSON.stringify(parse), leak, `parse failure leaked: ${parse.content[0].text}`);
+    assert.match(parse.content[0].text, /could not parse the output as structured JSON \(SyntaxError while reading \d+ character\(s\) of stdout; the output is not repeated here\)/);
+  } finally {
+    if (previous === undefined) delete process.env.GOOGLE_WORKSPACE_CLI_TOKEN;
+    else process.env.GOOGLE_WORKSPACE_CLI_TOKEN = previous;
+  }
+
+  // A successful probe keeps its stderr (warnings) but scrubbed, since checkGwsCliAccess returns the execution to callers.
+  const noisy = createScriptedBinary(
+    createTempBase("grclanker-gws-ops-stderr-warn-"),
+    `if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "Warning: refreshed with $GOOGLE_WORKSPACE_CLI_TOKEN and Bearer ${bearer}" 1>&2\necho '{"items":[]}'`,
+  );
+  const check = await checkGwsCliAccess({ gwsBin: noisy }, defaultGwsCliRunner, env);
+  assert.equal(check.status, "ready");
+  assert.equal(check.probe.stderr, "Warning: refreshed with [REDACTED] and Bearer [REDACTED]");
+  assert.doesNotMatch(JSON.stringify(check), leak);
 });
 
 test("verdict rule 8: re-running the evidence bundle allocates -2 and never overwrites the earlier bundle or zip", async () => {
