@@ -72,7 +72,7 @@ const OKTA_AUTH_PROBE_PATHS = [
   { key: "policies", path: "/api/v1/policies?type=OKTA_SIGN_ON&limit=1" },
   { key: "logs", path: "/api/v1/logs?limit=1" },
   { key: "roles", path: "/api/v1/iam/assignees/users?limit=1" },
-  { key: "api_tokens", path: "/api/v1/api-tokens?limit=1" },
+  { key: "api_tokens", path: "/api/v1/api-tokens" },
 ];
 const ADMIN_GROUP_NAME_PATTERN = /(admin|administrator|privileged|help.?desk|security|access)/i;
 const STRONG_AUTHENTICATOR_PATTERN = /(okta_verify|fastpass|webauthn|fido2|smart[_ -]?card|certificate|piv|cac)/i;
@@ -1276,7 +1276,7 @@ export class OktaAuditorClient {
   }
 
   async listAuthenticators(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/authenticators?limit=${PAGE_LIMIT}`);
+    return this.listPaginated("/api/v1/authenticators");
   }
 
   async listUsers(): Promise<JsonRecord[]> {
@@ -1377,7 +1377,7 @@ export class OktaAuditorClient {
   }
 
   async listApiTokens(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/api-tokens?limit=${PAGE_LIMIT}`);
+    return this.listPaginated("/api/v1/api-tokens");
   }
 
   async listDeviceAssurancePolicies(): Promise<JsonRecord[]> {

@@ -648,7 +648,7 @@ test("Okta assessments generate mapped findings across authentication, admin, in
     {
       async getJson(pathname) {
         if (pathname.includes("api-tokens")) {
-          throw new Error("Okta API request failed for /api/v1/api-tokens?limit=1 (403 Forbidden)");
+          throw new Error("Okta API request failed for /api/v1/api-tokens (403 Forbidden)");
         }
         return [];
       },
@@ -838,6 +838,63 @@ test("OKTA-ADMIN-006 names a 404 or 403 on the third-party admin surface instead
   assert.match(bothForbidden.summary, /403 Forbidden.*Okta Support access.*404 Not Found.*third-party admin setting/);
 });
 
+test("OktaAuditorClient requests the published org-setting paths and does not swallow 404s", async () => {
+  const requested = [];
+  const fetchImpl = async (input) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    requested.push(`${requestUrl.pathname}${requestUrl.search}`);
+    if (requestUrl.pathname === "/api/v1/org/orgSettings/thirdPartyAdminSetting") {
+      return new Response(JSON.stringify({ thirdPartyAdmin: false }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (requestUrl.pathname === "/api/v1/org/privacy/oktaSupport") {
+      return new Response(JSON.stringify({ errorCode: "E0000007", errorSummary: "Not found" }), {
+        status: 404,
+        statusText: "Not Found",
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const client = new OktaAuditorClient(
+    {
+      orgUrl: "https://tenant.example.okta.com",
+      authMode: "SSWS",
+      token: "ssws-token",
+      scopes: [],
+      sourceChain: ["tests"],
+    },
+    { fetchImpl },
+  );
+
+  assert.deepEqual(await client.getThirdPartyAdminSetting(), { thirdPartyAdmin: false });
+  await assert.rejects(() => client.getOktaSupportSettings(), /\/api\/v1\/org\/privacy\/oktaSupport \(404 Not Found\)/);
+  await client.listApiTokens();
+  await client.listAuthenticators();
+
+  assert.ok(requested.includes("/api/v1/org/orgSettings/thirdPartyAdminSetting"));
+  assert.equal(requested.some((path) => path.startsWith("/api/v1/org/settings/thirdPartyAdminSetting")), false);
+  assert.ok(requested.includes("/api/v1/api-tokens"), "api-tokens is requested without a limit parameter");
+  assert.ok(requested.includes("/api/v1/authenticators"), "authenticators is requested without a limit parameter");
+  assert.equal(requested.some((path) => /\/api\/v1\/(api-tokens|authenticators)\?/.test(path)), false);
+
+  const probed = [];
+  await runOktaAccessCheck(
+    {
+      async getJson(pathname) {
+        probed.push(pathname);
+        return [];
+      },
+    },
+    createSampleConfig(),
+  );
+  assert.ok(probed.includes("/api/v1/api-tokens"));
+});
 
 test("rule 1: forbidden or errored endpoints yield manual findings that name the cause", () => {
   const config = createSampleConfig();
