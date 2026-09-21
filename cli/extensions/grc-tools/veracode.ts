@@ -165,6 +165,7 @@ export interface HalListResult {
   totalPages?: number;
   totalElements?: number;
   complete: boolean;
+  notes?: string[];
 }
 
 type Surface<T> =
@@ -678,11 +679,23 @@ export class VeracodeApiClient {
   }
 
   async listUsers(options: { maxPages?: number } = {}): Promise<HalListResult> {
-    return this.listHal("/api/authn/v2/users", "users", { detailed: "true" }, options);
+    return this.listHal("/api/authn/v2/users", "users", { detailed: "true", include_roles: "true", include_teams: "true" }, options);
   }
 
   async listTeams(options: { maxPages?: number } = {}): Promise<HalListResult> {
-    return this.listHal("/api/authn/v2/teams", "teams", {}, options);
+    try {
+      return await this.listHal("/api/authn/v2/teams", "teams", { all_for_org: "true" }, options);
+    } catch (error) {
+      if (!(error instanceof VeracodeApiError) || (error.statusCode !== 400 && error.statusCode !== 403)) throw error;
+      const memberTeams = await this.listHal("/api/authn/v2/teams", "teams", {}, options);
+      return {
+        ...memberTeams,
+        notes: [
+          ...(memberTeams.notes ?? []),
+          `all_for_org=true was refused (${error.statusCode}), so only teams the API user is a member of were listed and the team inventory is a partial view.`,
+        ],
+      };
+    }
   }
 
   async listRoles(options: { maxPages?: number } = {}): Promise<HalListResult> {
@@ -1632,6 +1645,7 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   const uncovered: string[] = [];
   const unreadable: string[] = [];
   const rawProjects: JsonRecord = {};
+  const linkedProjectsByApplication: JsonRecord = {};
   for (const app of sampled) {
     const guid = applicationGuid(app) ?? "";
     if (asBoolean(asObject(app.profile)?.upload_and_scan_sca_enabled) === true) {
@@ -1649,12 +1663,17 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
       continue;
     }
     rawProjects[guid] = projects.value;
-    const linked = extractEmbedded(projects.value, "projects");
+    const linked = asRecords(projects.value.linked_projects);
+    linkedProjectsByApplication[applicationName(app)] = linked.slice(0, 20).map((project) => ({
+      name: asString(project.name) ?? asString(project.id) ?? null,
+      workspace: asString(asObject(project.workspace)?.name) ?? null,
+      last_scan_date: asString(project.last_scan_date) ?? null,
+    }));
     if (linked.length > 0) covered.push(applicationName(app));
     else uncovered.push(applicationName(app));
   }
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} linked project lists were unreadable.` : undefined];
-  const evidence = { applications_sampled: sampled.length, covered_applications: covered.length, uncovered_applications: uncovered.slice(0, 50), unreadable_applications: unreadable.slice(0, 50), sca_agent_api_available: !scaBlocker };
+  const evidence = { applications_sampled: sampled.length, covered_applications: covered.length, uncovered_applications: uncovered.slice(0, 50), unreadable_applications: unreadable.slice(0, 50), linked_projects_by_application: linkedProjectsByApplication, sca_agent_api_available: !scaBlocker };
   if (scaBlocker && covered.length === 0) {
     return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw: {}, errors };
   }
@@ -1664,7 +1683,7 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   if (covered.length === 0) {
     return { finding: manualFinding(18, "medium", "No application could be evaluated for SCA coverage.", ["Map each application to an SCA workspace."], evidence), raw: { sca_projects_by_application: rawProjects }, errors };
   }
-  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project.`, ...caveats), evidence), raw: { sca_projects_by_application: rawProjects }, errors };
+  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`All ${covered.length} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, ...caveats), evidence), raw: { sca_projects_by_application: rawProjects }, errors };
 }
 
 export async function assessVeracodeScaPosture(
@@ -1753,10 +1772,14 @@ function evaluateTeamAccess(snapshot: IdentitySnapshot, maxUnrestricted: number)
   const unrestrictedRoles = new Set(snapshot.roles.value.items.filter((role) => asBoolean(role.ignore_team_restrictions) === true).map((role) => asString(role.role_name) ?? ""));
   const unrestrictedUsers = snapshot.users.value.items.filter((user) => isActiveHuman(user) && userRoleNames(user).some((role) => unrestrictedRoles.has(role))).map(userLabel);
   const appsWithoutTeams = snapshot.applications.status === "ok" ? snapshot.applications.value.items.filter((app) => applicationTeams(app).length === 0).map(applicationName) : [];
-  const caveats = [partialInventoryNote(snapshot.users.value, "users"), partialInventoryNote(snapshot.teams.value, "teams"), snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so application team assignment was not verified."];
-  const evidence = { users_seen: snapshot.users.value.items.length, teams_seen: snapshot.teams.value.items.length, team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: appsWithoutTeams.slice(0, 50), max_unrestricted_users: maxUnrestricted };
+  const teamScopeNotes = snapshot.teams.value.notes ?? [];
+  const caveats = [partialInventoryNote(snapshot.users.value, "users"), partialInventoryNote(snapshot.teams.value, "teams"), ...teamScopeNotes, snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so application team assignment was not verified."];
+  const evidence = { users_seen: snapshot.users.value.items.length, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: appsWithoutTeams.slice(0, 50), max_unrestricted_users: maxUnrestricted };
+  if (snapshot.teams.value.items.length === 0 && teamScopeNotes.length > 0) {
+    return manualFinding(7, "high", joinNotes("The organization-wide team list was refused and the API user is a member of no teams, so team scoping could not be verified.", ...teamScopeNotes), manualEvidence, evidence);
+  }
   if (snapshot.teams.value.items.length === 0) {
-    return finding(7, "high", "fail", joinNotes("No teams exist, so every user with application visibility sees the whole portfolio and team-based least privilege is not in place.", ...caveats), evidence);
+    return finding(7, "high", "fail", joinNotes("No teams exist (all_for_org=true was accepted), so every user with application visibility sees the whole portfolio and team-based least privilege is not in place.", ...caveats), evidence);
   }
   if (unrestrictedUsers.length > maxUnrestricted) {
     return finding(7, "high", "fail", joinNotes(`${unrestrictedUsers.length} active users hold roles that ignore team restrictions (all-application access), exceeding the threshold of ${maxUnrestricted}.`, ...caveats), evidence);
@@ -1923,12 +1946,22 @@ function severityRank(severity: VeracodeFinding["severity"]): number {
 
 export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeAccessCheckResult> {
   const config = client.getResolvedConfig();
+  const probeNotes: string[] = [];
   const probes: Array<{ name: string; endpoint: string; requiredRole: string; load: () => Promise<number> }> = [
     { name: "self", endpoint: "/api/authn/v2/users/self", requiredRole: "any API user", load: async () => (await client.getSelf() ? 1 : 0) },
     { name: "applications", endpoint: "/appsec/v1/applications", requiredRole: "Security Insights or Reviewer", load: async () => (await client.listApplications({ maxPages: 1 })).items.length },
     { name: "policies", endpoint: "/appsec/v1/policies", requiredRole: "Security Insights or Reviewer", load: async () => (await client.listPolicies({ maxPages: 1 })).items.length },
     { name: "users", endpoint: "/api/authn/v2/users", requiredRole: "Administrator", load: async () => (await client.listUsers({ maxPages: 1 })).items.length },
-    { name: "teams", endpoint: "/api/authn/v2/teams", requiredRole: "Administrator", load: async () => (await client.listTeams({ maxPages: 1 })).items.length },
+    {
+      name: "teams",
+      endpoint: "/api/authn/v2/teams?all_for_org=true",
+      requiredRole: "Administrator",
+      load: async () => {
+        const teams = await client.listTeams({ maxPages: 1 });
+        probeNotes.push(...(teams.notes ?? []));
+        return teams.items.length;
+      },
+    },
     { name: "roles", endpoint: "/api/authn/v2/roles", requiredRole: "Administrator", load: async () => (await client.listRoles({ maxPages: 1 })).items.length },
     { name: "api_credentials", endpoint: "/api/authn/v2/api_credentials", requiredRole: "any API user", load: async () => (await client.getSelfApiCredentials() ? 1 : 0) },
     { name: "sca_workspaces", endpoint: "/srcclr/v3/workspaces", requiredRole: "Workspace Administrator or Workspace Editor (SCA license)", load: async () => (await client.listScaWorkspaces({ maxPages: 1 })).items.length },
@@ -1960,6 +1993,7 @@ export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeA
       `Using Veracode API base ${config.baseUrl} (region ${config.region}, credentials from ${config.sourceChain.join(" -> ")}).`,
       principal ? `Authenticated as ${principal}${roles.length > 0 ? ` with roles ${roles.join(", ")}` : ""}.` : "The principal could not be read from /api/authn/v2/users/self.",
       `${readableCore}/${coreSurfaces.size} core audit surfaces are readable.`,
+      ...probeNotes,
       ...(optionalUnavailable.length > 0 ? [`Optional license-gated surfaces not readable: ${optionalUnavailable.join(", ")} (their controls will render as manual).`] : []),
     ],
     recommendedNextStep: status === "healthy"

@@ -124,7 +124,7 @@ function healthyFixture() {
     vulnerabilityIssues: [],
     licenseIssues: [],
     libraries: [{ id: "lib-1", name: "lodash", version: "4.17.21", latest_version: "4.17.21" }],
-    scaProjects: { _embedded: { projects: [{ id: "proj-1", name: "portal" }] } },
+    scaProjects: { application: { guid: "app-2", name: "Portal" }, linked_projects: [{ id: "proj-1", site_id: "12345", name: "portal", last_scan_date: daysAgo(4), languages: ["JAVA"], workspace: { id: "ws-1", site_id: "lDDIW5l", name: "Workspace A" } }] },
     analyses: [{ analysis_id: "an-1", name: "Portal DAST", latest_occurrence_status: { status_type: "FINISHED_RESULTS_AVAILABLE" } }],
     scans: [{ scan_id: "scan-1", target_url: "https://portal.example.com", analysis_id: "an-1" }],
     scanConfiguration: { target_url: { url: "https://portal.example.com" }, auth_configuration: { authentications: { FORM: { username: "svc" } } }, crawl_configuration: { disabled: false } },
@@ -202,7 +202,7 @@ function emptyClient() {
     summaryReport: {},
     workspaces: [],
     libraries: [],
-    scaProjects: { _embedded: { projects: [] } },
+    scaProjects: { application: { guid: "app-2", name: "Portal" }, linked_projects: [] },
     analyses: [],
     scans: [],
     users: [],
@@ -441,7 +441,7 @@ test("assessVeracodeScaPosture fails on high CVSS and HIGH risk licenses and tre
   fixture.vulnerabilityIssues = [{ id: "i1", issue_type: "vulnerability", severity: 9.8, library: { name: "log4j" }, vulnerability: { cve: "CVE-2021-44228", cvss3_score: 10 } }];
   fixture.licenseIssues = [{ id: "i2", issue_type: "license", license: { name: "GPL-3.0", risk: "HIGH" }, library: { name: "gpl-lib" } }];
   fixture.applications[1].profile.upload_and_scan_sca_enabled = false;
-  fixture.scaProjects = { _embedded: { projects: [] } };
+  fixture.scaProjects = { application: { guid: "app-2", name: "Portal" }, linked_projects: [] };
   const result = await assessVeracodeScaPosture(mockClient(fixture));
   assert.equal(statusOf(result.findings, 5), "fail");
   assert.equal(statusOf(result.findings, 6), "fail");
@@ -451,6 +451,77 @@ test("assessVeracodeScaPosture fails on high CVSS and HIGH risk licenses and tre
   assert.equal(statusOf(unlicensed.findings, 5), "manual");
   assert.equal(statusOf(unlicensed.findings, 6), "manual");
   assert.match(unlicensed.findings[0].summary, /unlicensed|not applicable/);
+});
+
+test("assessVeracodeScaPosture reads linked_projects from the documented LinkedProjects shape for agent-only tenants", async () => {
+  const fixture = healthyFixture();
+  for (const app of fixture.applications) app.profile.upload_and_scan_sca_enabled = false;
+  const result = await assessVeracodeScaPosture(mockClient(fixture));
+  assert.equal(statusOf(result.findings, 18), "pass");
+  const evidence = result.findings.find((item) => item.id === "VERACODE-18").evidence;
+  assert.equal(evidence.covered_applications, 2);
+  assert.deepEqual(evidence.linked_projects_by_application.Portal, [{ name: "portal", workspace: "Workspace A", last_scan_date: fixture.scaProjects.linked_projects[0].last_scan_date }]);
+
+  const undocumented = await assessVeracodeScaPosture(mockClient(fixture, { async getScaApplicationProjects() { return { _embedded: { projects: [{ id: "proj-1", name: "portal" }] } }; } }));
+  assert.equal(statusOf(undocumented.findings, 18), "warn");
+  assert.match(undocumented.findings.find((item) => item.id === "VERACODE-18").summary, /neither upload-and-scan SCA enabled nor a linked SCA agent project/);
+});
+
+test("VeracodeApiClient requests users with include_roles and include_teams and teams with all_for_org, recording a refused flag", async () => {
+  const requests = [];
+  const client = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    if (url.pathname === "/api/authn/v2/users") {
+      return jsonResponse({ _embedded: { users: [{ user_id: "u-1", roles: [{ role_name: "Administrator" }], teams: [{ team_id: "t1" }] }] }, page: { number: 0, size: 100, total_elements: 1, total_pages: 1 } });
+    }
+    if (url.pathname === "/api/authn/v2/teams" && url.searchParams.get("all_for_org") === "true") {
+      return jsonResponse({ message: "all_for_org is not permitted for this user" }, { status: 403 });
+    }
+    return jsonResponse({ _embedded: { teams: [{ team_id: "t1", team_name: "Team A" }] }, page: { number: 0, size: 100, total_elements: 1, total_pages: 1 } });
+  }, sleep: async () => {} });
+
+  const users = await client.listUsers();
+  const usersUrl = requests.find((url) => url.pathname === "/api/authn/v2/users");
+  assert.equal(usersUrl.searchParams.get("detailed"), "true");
+  assert.equal(usersUrl.searchParams.get("include_roles"), "true");
+  assert.equal(usersUrl.searchParams.get("include_teams"), "true");
+  assert.deepEqual(users.items[0].roles.map((role) => role.role_name), ["Administrator"]);
+  assert.equal(users.items[0].teams.length, 1);
+
+  const teams = await client.listTeams();
+  const teamRequests = requests.filter((url) => url.pathname === "/api/authn/v2/teams");
+  assert.equal(teamRequests.length, 2);
+  assert.equal(teamRequests[0].searchParams.get("all_for_org"), "true");
+  assert.equal(teamRequests[1].searchParams.has("all_for_org"), false);
+  assert.equal(teams.items.length, 1);
+  assert.match(teams.notes[0], /all_for_org=true was refused \(403\)/);
+
+  const accepted = await new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const url = new URL(input);
+    assert.equal(url.searchParams.get("all_for_org"), "true");
+    return jsonResponse({ _embedded: { teams: [{ team_id: "t1" }, { team_id: "t2" }] }, page: { number: 0, size: 100, total_elements: 2, total_pages: 1 } });
+  } }).listTeams();
+  assert.equal(accepted.notes, undefined);
+  assert.equal(accepted.items.length, 2);
+
+  await assert.rejects(() => new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl: async () => jsonResponse({ message: "boom" }, { status: 500 }), sleep: async () => {} }).listTeams(), (error) => error.statusCode === 500);
+});
+
+test("assessVeracodeAccessControls never passes control 7 on a member-only team list", async () => {
+  const note = "all_for_org=true was refused (403), so only teams the API user is a member of were listed and the team inventory is a partial view.";
+  const memberOnly = await assessVeracodeAccessControls(mockClient(healthyFixture(), { async listTeams() { return list(healthyFixture().teams, { notes: [note] }); } }), { now: NOW });
+  assert.equal(statusOf(memberOnly.findings, 7), "warn");
+  const finding7 = memberOnly.findings.find((item) => item.id === "VERACODE-07");
+  assert.match(finding7.summary, /all_for_org=true was refused/);
+  assert.equal(finding7.evidence.teams_scope, "member_only");
+
+  const noMembership = await assessVeracodeAccessControls(mockClient(healthyFixture(), { async listTeams() { return list([], { notes: [note] }); } }), { now: NOW });
+  assert.equal(statusOf(noMembership.findings, 7), "manual");
+  assert.match(noMembership.findings.find((item) => item.id === "VERACODE-07").summary, /could not be verified/);
+
+  const access = await checkVeracodeAccess(mockClient(healthyFixture(), { async listTeams() { return list(healthyFixture().teams, { notes: [note] }); } }));
+  assert.ok(access.notes.some((item) => /all_for_org=true was refused/.test(item)));
 });
 
 test("assessVeracodeAccessControls fails on admin sprawl, inactive users, and aged credentials and warns on missing dates", async () => {
