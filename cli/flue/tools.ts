@@ -73,9 +73,8 @@ export function toFlueToolResult(toolName: string, result: PiBridgeToolResult): 
 }
 
 export function toFlueTool(tool: PiBridgeableTool): FlueToolDefinition {
-  // The input schema runs the Pi `prepareArguments` shim and TypeBox-style
-  // coercion before validation, so `data` arrives exactly as Pi's loop would
-  // hand it to `execute`.
+  // The input schema runs the Pi `prepareArguments` shim before validation,
+  // so `data` arrives exactly as Pi's loop would hand it to `execute`.
   const input = jsonSchemaToToolInput(tool.parameters, tool.name, tool.prepareArguments);
   return defineTool({
     name: tool.name,

@@ -1,17 +1,14 @@
 /**
  * JSON Schema to Valibot conversion for the Flue adapter boundary.
  *
- * grclanker's native tools declare their parameters as TypeBox JSON Schema and
- * Pi validates calls with `prepareArguments` first, then TypeBox
- * `Value.Convert` (lenient coercion) and `Value.Check`. Flue's `defineTool()`
+ * grclanker's native tools declare their parameters as TypeBox JSON Schema,
+ * and Pi's tool loop runs each tool's `prepareArguments` shim and then checks
+ * the result against that schema without coercion. Flue's `defineTool()`
  * requires a Valibot top-level object schema and renders the model-facing JSON
- * Schema from it with `@valibot/to-json-schema`.
- *
- * Each converted node therefore carries a `convert` step that reproduces
- * TypeBox's coercion rules and a validating schema that renders exactly like
- * the source (a `v.pipe(v.unknown(), v.transform(convert), strict)` pipe
- * renders as its strict member), so the model sees the same schema it sees
- * under Pi while arguments are accepted and normalized the same way.
+ * Schema back out of it with `@valibot/to-json-schema`. This module bridges
+ * the two without touching the tool definitions: the converted schema renders
+ * like the source, and the tool input pipe runs the shim before validation
+ * exactly as Pi does.
  */
 import type { ToolInputSchema } from "@flue/runtime";
 import * as v from "valibot";
@@ -19,15 +16,6 @@ import * as v from "valibot";
 export type JsonSchemaObject = Record<string, unknown>;
 
 export type PrepareToolArguments = (args: unknown) => unknown;
-
-interface ConvertedNode {
-  /** TypeBox `Value.Convert` equivalent for this node; idempotent on converted values. */
-  convert: (value: unknown) => unknown;
-  /** Validating schema that coerces on parse and renders like the source schema. */
-  schema: v.GenericSchema;
-  /** The same validation without coercion, used for union member matching. */
-  strict: v.GenericSchema;
-}
 
 const JSON_SCHEMA_TYPES = ["string", "number", "integer", "boolean", "null", "array", "object"] as const;
 
@@ -58,132 +46,17 @@ function isJsonSchemaType(value: unknown): value is JsonSchemaType {
   return typeof value === "string" && (JSON_SCHEMA_TYPES as readonly string[]).includes(value);
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function convertConst(value: unknown): v.GenericSchema {
+  if (value === null) return v.null();
+  return isLiteralValue(value) ? v.literal(value) : v.unknown();
 }
 
-// TypeBox `Value.Convert` rules (value/convert/convert.mjs), reproduced verbatim
-// so a call that Pi accepts is accepted here with the same normalized value.
-
-function isStringNumeric(value: unknown): value is string {
-  return typeof value === "string" && !Number.isNaN(Number(value)) && !Number.isNaN(parseFloat(value));
-}
-
-function isValueTrue(value: unknown): boolean {
-  return (
-    value === true ||
-    value === 1 ||
-    (typeof value === "bigint" && value === BigInt(1)) ||
-    (typeof value === "string" && (value.toLowerCase() === "true" || value === "1"))
-  );
-}
-
-function isValueFalse(value: unknown): boolean {
-  return (
-    value === false ||
-    (typeof value === "number" && (value === 0 || Object.is(value, -0))) ||
-    (typeof value === "bigint" && value === BigInt(0)) ||
-    (typeof value === "string" && (value.toLowerCase() === "false" || value === "0" || value === "-0"))
-  );
-}
-
-function tryConvertString(value: unknown): unknown {
-  if (typeof value === "symbol" && value.description !== undefined) return value.description.toString();
-  return typeof value === "bigint" || typeof value === "boolean" || typeof value === "number" ? value.toString() : value;
-}
-
-function tryConvertNumber(value: unknown): unknown {
-  if (isStringNumeric(value)) return parseFloat(value);
-  if (isValueTrue(value)) return 1;
-  if (isValueFalse(value)) return 0;
-  return value;
-}
-
-function tryConvertInteger(value: unknown): unknown {
-  // TypeBox calls parseInt without a radix, so hex-looking strings ("0x10") parse as hex there too.
-  if (isStringNumeric(value)) return Number.parseInt(value);
-  if (typeof value === "number") return Math.trunc(value);
-  if (isValueTrue(value)) return 1;
-  if (isValueFalse(value)) return 0;
-  return value;
-}
-
-function tryConvertBoolean(value: unknown): unknown {
-  if (isValueTrue(value)) return true;
-  if (isValueFalse(value)) return false;
-  return value;
-}
-
-function tryConvertNull(value: unknown): unknown {
-  return typeof value === "string" && value.toLowerCase() === "null" ? null : value;
-}
-
-function tryConvertLiteral(target: LiteralValue): (value: unknown) => unknown {
-  return (value) => {
-    const converted =
-      typeof target === "string"
-        ? tryConvertString(value)
-        : typeof target === "number"
-          ? tryConvertNumber(value)
-          : tryConvertBoolean(value);
-    return converted === target ? target : value;
-  };
-}
-
-function cloneJson(value: unknown): unknown {
-  return value === undefined ? undefined : structuredClone(value);
-}
-
-/** Wrap a strict schema so parsing coerces first; renders identically to `strict`. */
-function coercing(convert: (value: unknown) => unknown, strict: v.GenericSchema): v.GenericSchema {
-  return v.pipe(v.unknown(), v.transform(convert), strict);
-}
-
-function leafNode(convert: (value: unknown) => unknown, strict: v.GenericSchema): ConvertedNode {
-  return { convert, strict, schema: coercing(convert, strict) };
-}
-
-function unknownNode(): ConvertedNode {
-  const schema = v.unknown();
-  return { convert: (value) => value, strict: schema, schema };
-}
-
-function convertConst(value: unknown): ConvertedNode {
-  if (value === null) return leafNode(tryConvertNull, v.null());
-  if (!isLiteralValue(value)) return unknownNode();
-  return leafNode(tryConvertLiteral(value), v.literal(value));
-}
-
-function convertStringPicklist(options: string[]): ConvertedNode {
-  const strict = v.picklist(options);
-  const convert = (value: unknown): unknown => {
-    if (typeof value === "string" && options.includes(value)) return value;
-    const converted = tryConvertString(value);
-    return typeof converted === "string" && options.includes(converted) ? converted : value;
-  };
-  return leafNode(convert, strict);
-}
-
-/** TypeBox `FromUnion`: keep a value that already matches, else the first variant that matches after conversion. */
-function convertUnion(variants: ConvertedNode[]): ConvertedNode {
-  const strict = v.union(variants.map((variant) => variant.strict));
-  const convert = (value: unknown): unknown => {
-    if (variants.some((variant) => v.is(variant.strict, value))) return value;
-    for (const variant of variants) {
-      const converted = variant.convert(cloneJson(value));
-      if (v.is(variant.strict, converted)) return converted;
-    }
-    return value;
-  };
-  return leafNode(convert, strict);
-}
-
-function convertEnum(values: unknown[]): ConvertedNode {
+function convertEnum(values: unknown[]): v.GenericSchema {
   const strings = values.filter((value): value is string => typeof value === "string");
   if (strings.length === values.length && strings.length > 0) {
-    return convertStringPicklist(strings);
+    return v.picklist(strings);
   }
-  return convertUnion(values.map(convertConst));
+  return v.union(values.map(convertConst));
 }
 
 function collectVariants(node: JsonSchemaObject): JsonSchemaObject[] | undefined {
@@ -192,92 +65,65 @@ function collectVariants(node: JsonSchemaObject): JsonSchemaObject[] | undefined
   return objects && objects.length > 0 ? objects : undefined;
 }
 
-function convertVariants(variants: JsonSchemaObject[]): ConvertedNode {
+function convertVariants(variants: JsonSchemaObject[]): v.GenericSchema {
   const constants = variants.map((variant) => variant.const);
   if (constants.every((value): value is string => typeof value === "string")) {
-    return convertStringPicklist(constants);
+    return v.picklist(constants);
   }
-  return convertUnion(variants.map((variant) => convertNode(variant)));
+  return v.union(variants.map((variant) => jsonSchemaToValibot(variant)));
 }
 
-function convertString(node: JsonSchemaObject): ConvertedNode {
-  let strict: v.GenericSchema<string, string> = v.string();
+function convertString(node: JsonSchemaObject): v.GenericSchema {
+  let schema: v.GenericSchema<string, string> = v.string();
   const minLength = asFiniteNumber(node.minLength);
   const maxLength = asFiniteNumber(node.maxLength);
-  if (minLength !== undefined) strict = v.pipe(strict, v.minLength(minLength));
-  if (maxLength !== undefined) strict = v.pipe(strict, v.maxLength(maxLength));
-  if (typeof node.pattern === "string") strict = v.pipe(strict, v.regex(new RegExp(node.pattern)));
-  return leafNode(tryConvertString, strict);
+  if (minLength !== undefined) schema = v.pipe(schema, v.minLength(minLength));
+  if (maxLength !== undefined) schema = v.pipe(schema, v.maxLength(maxLength));
+  if (typeof node.pattern === "string") schema = v.pipe(schema, v.regex(new RegExp(node.pattern)));
+  return schema;
 }
 
-function convertNumber(node: JsonSchemaObject, integer: boolean): ConvertedNode {
-  let strict: v.GenericSchema<number, number> = integer ? v.pipe(v.number(), v.integer()) : v.number();
+function convertNumber(node: JsonSchemaObject, integer: boolean): v.GenericSchema {
+  let schema: v.GenericSchema<number, number> = integer ? v.pipe(v.number(), v.integer()) : v.number();
   const minimum = asFiniteNumber(node.minimum);
   const maximum = asFiniteNumber(node.maximum);
   const exclusiveMinimum = asFiniteNumber(node.exclusiveMinimum);
   const exclusiveMaximum = asFiniteNumber(node.exclusiveMaximum);
   const multipleOf = asFiniteNumber(node.multipleOf);
-  if (minimum !== undefined) strict = v.pipe(strict, v.minValue(minimum));
-  if (maximum !== undefined) strict = v.pipe(strict, v.maxValue(maximum));
-  if (exclusiveMinimum !== undefined) strict = v.pipe(strict, v.gtValue(exclusiveMinimum));
-  if (exclusiveMaximum !== undefined) strict = v.pipe(strict, v.ltValue(exclusiveMaximum));
-  if (multipleOf !== undefined) strict = v.pipe(strict, v.multipleOf(multipleOf));
-  return leafNode(integer ? tryConvertInteger : tryConvertNumber, strict);
+  if (minimum !== undefined) schema = v.pipe(schema, v.minValue(minimum));
+  if (maximum !== undefined) schema = v.pipe(schema, v.maxValue(maximum));
+  if (exclusiveMinimum !== undefined) schema = v.pipe(schema, v.gtValue(exclusiveMinimum));
+  if (exclusiveMaximum !== undefined) schema = v.pipe(schema, v.ltValue(exclusiveMaximum));
+  if (multipleOf !== undefined) schema = v.pipe(schema, v.multipleOf(multipleOf));
+  return schema;
 }
 
-function convertArray(node: JsonSchemaObject): ConvertedNode {
-  const item = convertNode(asSchemaObject(node.items));
-  let strict: v.GenericSchema<unknown[], unknown[]> = v.array(item.strict);
+function convertArray(node: JsonSchemaObject): v.GenericSchema {
+  let schema: v.GenericSchema<unknown[], unknown[]> = v.array(jsonSchemaToValibot(node.items));
   const minItems = asFiniteNumber(node.minItems);
   const maxItems = asFiniteNumber(node.maxItems);
-  if (minItems !== undefined) strict = v.pipe(strict, v.minLength(minItems));
-  if (maxItems !== undefined) strict = v.pipe(strict, v.maxLength(maxItems));
-  // TypeBox wraps a lone value into a one-element array before converting items.
-  const convert = (value: unknown): unknown => (Array.isArray(value) ? value : [value]).map(item.convert);
-  return leafNode(convert, strict);
+  if (minItems !== undefined) schema = v.pipe(schema, v.minLength(minItems));
+  if (maxItems !== undefined) schema = v.pipe(schema, v.maxLength(maxItems));
+  return schema;
 }
 
-function convertObject(node: JsonSchemaObject): ConvertedNode {
+function convertObject(node: JsonSchemaObject): v.GenericSchema {
   const properties = asSchemaObject(node.properties) ?? {};
   const required = new Set(asStringArray(node.required));
-  const nodes = new Map<string, ConvertedNode>();
   const entries: v.ObjectEntries = {};
-  const strictEntries: v.ObjectEntries = {};
 
   for (const [key, property] of Object.entries(properties)) {
-    const converted = convertNode(asSchemaObject(property));
-    nodes.set(key, converted);
-    entries[key] = required.has(key) ? converted.schema : v.optional(converted.schema);
-    strictEntries[key] = required.has(key) ? converted.strict : v.optional(converted.strict);
+    const converted = jsonSchemaToValibot(property);
+    entries[key] = required.has(key) ? converted : v.optional(converted);
   }
 
   const additional = node.additionalProperties;
+  if (additional === false) return v.strictObject(entries);
   const additionalSchema = asSchemaObject(additional);
-  const rest = additionalSchema ? convertNode(additionalSchema) : undefined;
-
-  const buildObject = (objectEntries: v.ObjectEntries, restSchema: v.GenericSchema | undefined): v.GenericSchema => {
-    if (additional === false) return v.strictObject(objectEntries);
-    if (restSchema) return v.objectWithRest(objectEntries, restSchema);
-    // TypeBox objects allow unknown keys by default. Keeping them mirrors Pi,
-    // where extra keys reach the tool untouched.
-    return v.looseObject(objectEntries);
-  };
-
-  // TypeBox `FromObject` converts only the declared properties that are present.
-  const convert = (value: unknown): unknown => {
-    if (!isPlainObject(value)) return value;
-    const result: Record<string, unknown> = { ...value };
-    for (const [key, property] of nodes) {
-      if (key in result) result[key] = property.convert(result[key]);
-    }
-    return result;
-  };
-
-  return {
-    convert,
-    schema: buildObject(entries, rest?.schema),
-    strict: buildObject(strictEntries, rest?.strict),
-  };
+  if (additionalSchema) return v.objectWithRest(entries, jsonSchemaToValibot(additionalSchema));
+  // TypeBox objects allow unknown keys by default. Keeping them mirrors Pi,
+  // where extra keys reach the tool untouched.
+  return v.looseObject(entries);
 }
 
 function resolveType(node: JsonSchemaObject): JsonSchemaType | undefined {
@@ -286,9 +132,9 @@ function resolveType(node: JsonSchemaObject): JsonSchemaType | undefined {
   return undefined;
 }
 
-function convertTyped(node: JsonSchemaObject): ConvertedNode {
+function convertTyped(node: JsonSchemaObject): v.GenericSchema {
   const type = resolveType(node);
-  if (type === undefined) return unknownNode();
+  if (type === undefined) return v.unknown();
 
   switch (type) {
     case "string":
@@ -298,9 +144,9 @@ function convertTyped(node: JsonSchemaObject): ConvertedNode {
     case "integer":
       return convertNumber(node, true);
     case "boolean":
-      return leafNode(tryConvertBoolean, v.boolean());
+      return v.boolean();
     case "null":
-      return leafNode(tryConvertNull, v.null());
+      return v.null();
     case "array":
       return convertArray(node);
     case "object":
@@ -310,6 +156,23 @@ function convertTyped(node: JsonSchemaObject): ConvertedNode {
       throw new Error(`Unhandled JSON Schema type: ${String(exhaustive)}`);
     }
   }
+}
+
+function convertNode(node: JsonSchemaObject): v.GenericSchema {
+  if ("const" in node) return convertConst(node.const);
+  if (Array.isArray(node.enum)) return convertEnum(node.enum);
+
+  const variants = collectVariants(node);
+  if (variants) return convertVariants(variants);
+
+  if (Array.isArray(node.type)) {
+    const types = node.type.filter(isJsonSchemaType);
+    if (types.length > 0) {
+      return v.union(types.map((type) => convertTyped({ ...node, type })));
+    }
+  }
+
+  return convertTyped(node);
 }
 
 function withAnnotations(node: JsonSchemaObject, schema: v.GenericSchema): v.GenericSchema {
@@ -332,41 +195,15 @@ function withAnnotations(node: JsonSchemaObject, schema: v.GenericSchema): v.Gen
   return annotated;
 }
 
-function convertNode(node: JsonSchemaObject | undefined): ConvertedNode {
-  if (!node) return unknownNode();
-
-  const converted = convertUnannotated(node);
-  return {
-    convert: converted.convert,
-    schema: withAnnotations(node, converted.schema),
-    strict: withAnnotations(node, converted.strict),
-  };
-}
-
-function convertUnannotated(node: JsonSchemaObject): ConvertedNode {
-  if ("const" in node) return convertConst(node.const);
-  if (Array.isArray(node.enum)) return convertEnum(node.enum);
-
-  const variants = collectVariants(node);
-  if (variants) return convertVariants(variants);
-
-  if (Array.isArray(node.type)) {
-    const types = node.type.filter(isJsonSchemaType);
-    if (types.length > 0) {
-      return convertUnion(types.map((type) => convertTyped({ ...node, type })));
-    }
-  }
-
-  return convertTyped(node);
-}
-
 /**
- * Convert one JSON Schema node into a Valibot schema that coerces like TypeBox
- * `Value.Convert` and renders like the source. Unsupported constructs degrade
- * to `v.unknown()` rather than failing, so a tool always stays mountable.
+ * Convert one JSON Schema node into an equivalent Valibot schema. Unknown or
+ * unsupported constructs degrade to `v.unknown()` rather than failing, so a
+ * tool always stays mountable.
  */
 export function jsonSchemaToValibot(schema: unknown): v.GenericSchema {
-  return convertNode(asSchemaObject(schema)).schema;
+  const node = asSchemaObject(schema);
+  if (!node) return v.unknown();
+  return withAnnotations(node, convertNode(node));
 }
 
 function prepareArgumentsStep(toolName: string, prepare: PrepareToolArguments) {
@@ -387,9 +224,9 @@ function prepareArgumentsStep(toolName: string, prepare: PrepareToolArguments) {
  * `defineTool()` requires. When the Pi tool declares `prepareArguments`, the
  * shim runs before validation exactly as in Pi's tool loop: the leading
  * `v.looseObject({})` only asserts that the model sent an object, the
- * normalized value is then validated (and coerced) by the converted schema,
- * and the whole pipe still renders as the converted schema for the model.
- * Throws when the source is not an object schema.
+ * normalized value is then validated by the converted schema, and the whole
+ * pipe still renders as the converted schema for the model. Throws when the
+ * source is not an object schema.
  */
 export function jsonSchemaToToolInput(
   schema: unknown,

@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
 import * as v from "valibot";
 import { init, setProvider, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
 import { start } from "@flue/runtime/node";
@@ -71,12 +70,11 @@ const { Grclanker, prepareGrclankerAgent } = await import("../dist/flue/agent.js
 const AGENT_IDENTITY_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$/;
 const DOMAIN_TOOL_COUNT = 107;
 
-/** The validating schema type at the end of a coercing pipe (`pipe(unknown, transform, strict)`). */
-function validatingType(schema) {
-  if (!Array.isArray(schema.pipe)) return schema.type;
-  const inner = schema.pipe.filter((item) => item.kind === "schema").at(-1);
-  return inner === schema ? schema.type : validatingType(inner);
-}
+// The Pi CLI's own argument validation (pi-ai 0.80.2, the copy the CLI runs),
+// used as the oracle the adapter is compared against.
+const { validateToolArguments: piCliValidate } = await import(
+  pathToFileURL(resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"))), "utils/validation.js")).href
+);
 
 function createRecordingHooks() {
   const calls = { models: [], tools: [], skills: [], subagents: [], sandboxes: [] };
@@ -156,17 +154,16 @@ test("schema conversion mirrors TypeBox tool parameters in Valibot", () => {
 
   assert.equal(v.safeParse(schema, {}).success, false, "required keys stay required");
   assert.equal(v.safeParse(schema, { query: "x", limit: 0 }).success, false, "minimum is enforced");
-  assert.equal(v.safeParse(schema, { query: "x", count: "x" }).success, false, "non-numeric integers are rejected");
+  assert.equal(v.safeParse(schema, { query: "x", count: 1.5 }).success, false, "integer is enforced");
   assert.equal(v.safeParse(schema, { query: "x", mode: "nope" }).success, false, "literal unions become picklists");
-  assert.equal(v.safeParse(schema, { query: "x", refresh: "yes" }).success, false, "non-boolean strings are rejected");
+  assert.equal(v.safeParse(schema, { query: "x", size: true }).success, false, "mixed unions stay unions");
 
-  // TypeBox `Value.Convert` coercions Pi applies before checking.
-  const coerced = v.safeParse(schema, { query: 4282, limit: "5", count: 1.5, ids: "CVE-2024-1", refresh: "true", size: true });
-  assert.ok(coerced.success);
-  assert.deepEqual(coerced.output, { query: "4282", limit: 5, count: 1, ids: ["CVE-2024-1"], refresh: true, size: "true" });
-  assert.deepEqual(v.safeParse(schema, { query: "x", size: 3 }).output.size, 3, "a value matching a later union member is kept as is");
-  assert.deepEqual(v.safeParse(schema, { query: "x", size: "3" }).output.size, "3", "a value matching the first union member is kept as is");
-  assert.deepEqual(v.safeParse(schema, { query: "x", count: "0x10" }).output.count, 16, "integer strings parse like TypeBox's radix-less parseInt");
+  // The Pi CLI checks strictly after prepareArguments (no type coercion), and so does the adapter.
+  for (const [key, value] of [["query", 4282], ["limit", "5"], ["refresh", "true"], ["ids", "CVE-2024-1"], ["count", "0x10"]]) {
+    assert.equal(v.safeParse(schema, { query: "x", [key]: value }).success, false, `${key}: ${JSON.stringify(value)} is not coerced`);
+  }
+  assert.equal(v.safeParse(schema, { query: "x", size: 3 }).output.size, 3);
+  assert.equal(v.safeParse(schema, { query: "x", size: "3" }).output.size, "3");
 
   const defaults = v.safeParse(schema, { query: "x" });
   assert.ok(defaults.success);
@@ -194,21 +191,21 @@ test("schema conversion handles strict objects, enums, nullables, and unknown co
   assert.equal(v.safeParse(rest, { any: "no" }).success, false);
 
   const picklist = jsonSchemaToValibot({ type: "string", enum: ["json", "yaml"] });
-  assert.equal(validatingType(picklist), "picklist");
+  assert.equal(picklist.type, "picklist");
   assert.equal(v.safeParse(picklist, "yaml").output, "yaml");
   assert.equal(v.safeParse(picklist, "xml").success, false);
 
   const nullable = jsonSchemaToValibot({ type: ["string", "null"] });
-  assert.equal(validatingType(nullable), "union");
+  assert.equal(nullable.type, "union");
   assert.equal(v.safeParse(nullable, null).success, true);
   assert.equal(v.safeParse(nullable, "x").success, true);
-  assert.equal(v.safeParse(nullable, 1).output, "1", "TypeBox converts a number to string for a string member");
-  assert.equal(v.safeParse(nullable, {}).success, false);
+  assert.equal(v.safeParse(nullable, 1).success, false);
 
   assert.equal(jsonSchemaToValibot(undefined).type, "unknown");
   assert.equal(jsonSchemaToValibot({ type: "mystery" }).type, "unknown");
-  assert.equal(validatingType(jsonSchemaToValibot({ const: "fixed" })), "literal");
-  assert.equal(v.safeParse(jsonSchemaToValibot({ const: 7 }), "7").output, 7, "literal targets coerce like TypeBox");
+  assert.equal(jsonSchemaToValibot({ const: "fixed" }).type, "literal");
+  assert.equal(v.safeParse(jsonSchemaToValibot({ const: 7 }), 7).success, true);
+  assert.equal(v.safeParse(jsonSchemaToValibot({ const: 7 }), "7").success, false);
 
   assert.throws(() => jsonSchemaToToolInput(Type.String(), "bad"), /must be a JSON Schema object/);
 });
@@ -221,13 +218,13 @@ test("tool input schemas run prepareArguments before validation and still render
   assert.equal(withShim.type, "loose_object", "the pipe keeps Flue's top-level object type");
   assert.ok(isToolInputObjectSchema(withShim));
 
-  const aliased = v.safeParse(withShim, { cve: "CVE-2024-3400", limit: "5" });
+  const aliased = v.safeParse(withShim, { cve: "CVE-2024-3400", limit: 5 });
   assert.ok(aliased.success);
   assert.deepEqual(aliased.output, { query: "CVE-2024-3400", limit: 5 }, "the shim's own return value is what gets validated");
   assert.equal(v.safeParse(withoutShim, { cve: "CVE-2024-3400" }).success, false, "without the shim the alias is not enough");
 
-  const failing = v.safeParse(withShim, { query: 5, limit: "abc" });
-  assert.equal(failing.success, false);
+  const failing = v.safeParse(withShim, { cve: "CVE-2024-3400", limit: "5" });
+  assert.equal(failing.success, false, "validation after the shim is as strict as the Pi CLI's");
   assert.deepEqual(
     failing.issues.map((issue) => issue.path?.map((segment) => segment.key).join(".")),
     ["limit"],
@@ -242,7 +239,7 @@ test("tool input schemas run prepareArguments before validation and still render
   assert.match(thrown.issues[0].message, /kevs_probe could not normalize its arguments: shim exploded/);
 });
 
-/** Pi's tool loop: `prepareArguments` (a throw becomes an error result), then TypeBox `Value.Convert` and `Value.Check`. */
+/** The Pi CLI's tool loop: `prepareArguments` (a throw becomes an error result), then pi-ai's `validateToolArguments`. */
 function piVerdict(tool, raw) {
   let prepared;
   try {
@@ -250,11 +247,12 @@ function piVerdict(tool, raw) {
   } catch {
     return { ok: false, threw: true };
   }
-  const args = structuredClone(prepared);
-  Value.Convert(tool.parameters, args);
-  if (Value.Check(tool.parameters, args)) return { ok: true, args: JSON.parse(JSON.stringify(args)) };
-  const errors = [...Value.Errors(tool.parameters, args)];
-  return { ok: false, undefinedKeyOnly: errors.length > 0 && errors.every((error) => error.value === undefined) };
+  try {
+    const args = piCliValidate({ name: tool.name, parameters: tool.parameters }, { id: "probe", name: tool.name, arguments: prepared });
+    return { ok: true, args: JSON.parse(JSON.stringify(args)) };
+  } catch {
+    return { ok: false };
+  }
 }
 
 // Flue mounts custom tools as Pi `AgentTool`s, so its Pi loop validates the raw
@@ -338,19 +336,15 @@ function sampleValue(property) {
 
 const PROBE_VALUES = ["true", "false", "1", "0", 1, 0, null, true, {}, [], "bogus", 5, 1.5, "1e3", " 7 ", "", "null", -1, "0x10", "yes"];
 
-// These two normalizers emit `component_definitions: undefined`, which TypeBox
-// `Value.Convert` turns into `[undefined]`, so Pi rejects the call whenever the
-// optional field is omitted. Flue's `optional()` skips undefined instead.
-const PI_UNDEFINED_KEY_BUG_TOOLS = new Set(["oscal_generate_ssp_markdown", "oscal_assemble_ssp"]);
-
-test("the adapter stage normalizes exactly like Pi's prepareArguments plus TypeBox for every domain tool", () => {
+test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI loop for every domain tool", () => {
   const piTools = collectGrclankerDomainTools();
   const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
   const mismatches = [];
   const gateReasons = new Map();
-  const piBugCases = new Set();
+  const lenientWithoutCoercion = [];
   let compared = 0;
   let gated = 0;
+  let lenient = 0;
 
   for (const piTool of piTools) {
     const flueTool = flueTools.get(piTool.name);
@@ -371,16 +365,15 @@ test("the adapter stage normalizes exactly like Pi's prepareArguments plus TypeB
 
     for (const input of inputs) {
       compared += 1;
-      // Without the gate, the adapter stage must equal Pi's own loop on the same payload.
+      // The adapter stage on its own must equal the Pi CLI's loop on the same payload.
       const direct = adapterVerdict(flueTool, input);
       const pi = piVerdict(piTool, input);
-      const piBug = !pi.ok && pi.undefinedKeyOnly && direct.ok && PI_UNDEFINED_KEY_BUG_TOOLS.has(piTool.name);
-      if (piBug) piBugCases.add(piTool.name);
-      else if (!(pi.ok === direct.ok && (!pi.ok || canonical(pi.args) === canonical(direct.args)))) {
+      if (!(pi.ok === direct.ok && (!pi.ok || canonical(pi.args) === canonical(direct.args)))) {
         mismatches.push({ stage: "adapter", tool: piTool.name, input, pi, flue: direct });
       }
 
-      // Through the real stack, whatever Flue's gate hands over must be normalized like Pi would normalize it.
+      // Through the real stack, whatever Flue's gate hands over must be handled like the Pi CLI would handle it,
+      // and any payload Flue accepts that the Pi CLI rejects must be explained by the gate's own coercion.
       const gate = flueGate(flueTool, input);
       if (!gate.ok) {
         gated += 1;
@@ -389,69 +382,83 @@ test("the adapter stage normalizes exactly like Pi's prepareArguments plus TypeB
       }
       const runtime = adapterVerdict(flueTool, gate.args);
       const piOnGated = piVerdict(piTool, gate.args);
-      const gatedBug = !piOnGated.ok && piOnGated.undefinedKeyOnly && runtime.ok && PI_UNDEFINED_KEY_BUG_TOOLS.has(piTool.name);
-      if (!gatedBug && !(piOnGated.ok === runtime.ok && (!piOnGated.ok || canonical(piOnGated.args) === canonical(runtime.args)))) {
+      if (!(piOnGated.ok === runtime.ok && (!piOnGated.ok || canonical(piOnGated.args) === canonical(runtime.args)))) {
         mismatches.push({ stage: "runtime", tool: piTool.name, input, gated: gate.args, pi: piOnGated, flue: runtime });
+      }
+      if (runtime.ok && !pi.ok) {
+        lenient += 1;
+        if (canonical(gate.args) === canonical(input)) lenientWithoutCoercion.push({ tool: piTool.name, input });
       }
     }
   }
 
   assert.ok(compared > 10000, `expected a broad probe matrix, compared ${compared}`);
   assert.ok(gated > 0 && gated < compared / 2, `the gate should reject a minority of probes (rejected ${gated} of ${compared})`);
-  assert.deepEqual(mismatches.slice(0, 10), [], `${mismatches.length} verdicts differ between Pi and Flue`);
-  assert.deepEqual([...piBugCases].sort(), [...PI_UNDEFINED_KEY_BUG_TOOLS].sort());
+  assert.deepEqual(mismatches.slice(0, 10), [], `${mismatches.length} verdicts differ between the Pi CLI and the adapter`);
+  assert.ok(lenient > 0, "the gate's coercion admits some payloads the Pi CLI rejects");
+  assert.deepEqual(lenientWithoutCoercion, [], "Flue is more permissive than the Pi CLI only where the gate coerced a value");
   assert.deepEqual(
     [...gateReasons.keys()].sort(),
     ["array", "enum", "integer", "range", "required", "type"],
-    "payloads Pi accepts are turned away by the gate only for the documented reasons",
+    "payloads the Pi CLI accepts are turned away by the gate only for the documented reasons",
   );
 });
 
-test("reviewer probe cases: Flue's gate is the only place Pi-accepted payloads are turned away", () => {
+test("reviewer probe cases: the gate is the only difference from the Pi CLI, in both directions", () => {
   const piTools = collectGrclankerDomainTools();
   const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
-  // `pass` means accepted with Pi's exact arguments; `coerced` means accepted after the
-  // gate's own coercion changed a value before the normalizer saw it; the rest name the
-  // gate rejection reason (see the Flue runtime docs page, Limitations).
+  // `pi` is the Pi CLI verdict on the raw payload. For Flue, `pass` means accepted with the
+  // Pi CLI's exact arguments, `coerced` means accepted after the gate's own coercion changed a
+  // value the normalizer then saw, `lenient` means accepted although the Pi CLI rejects it (gate
+  // coercion again), and the rest name the gate rejection reason (docs page, Limitations).
   const cases = [
-    ["kevs_search", { query: "CVE-2024-3400", limit: "5" }, "pass"],
-    ["kevs_search", { cve: "CVE-2024-3400" }, "required"],
-    ["kevs_search", {}, "required"],
-    ["kevs_recent", { days: "7" }, "pass"],
-    ["kevs_recent", { days: null }, "coerced"],
-    ["kevs_get_epss", { cve_ids: "CVE-2024-3400" }, "array"],
-    ["kevs_get_epss", { cve_ids: [1] }, "coerced"],
-    ["kevs_get_epss", {}, "required"],
-    ["cmvp_get_module", { cert_number: 4282 }, "pass"],
-    ["cmvp_get_module", { certificate: "4282" }, "required"],
-    ["cmvp_get_module", {}, "required"],
-    ["fedramp_search_frmr", { query: "CDS", section: "bogus" }, "enum"],
-    ["fedramp_search_frmr", { query: "CDS", limit: "5" }, "pass"],
-    ["fedramp_search_frmr", { section: "any" }, "required"],
-    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp", name: "n", format: "xml" }, "enum"],
-    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp" }, "required"],
-    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp", name: "n", include_optional_fields: "true" }, "pass"],
-    ["github_check_access", { installation_id: true }, "coerced"],
-    ["github_check_access", { lookback_days: "1" }, "pass"],
-    ["okta_check_access", { scopes: "okta.users.read" }, "array"],
-    ["okta_check_access", { scopes: [1] }, "coerced"],
-    ["gws_export_audit_bundle", { lookback_days: "1" }, "pass"],
-    ["gws_export_audit_bundle", { lookback_days: 1.5 }, "integer"],
-    ["aws_export_audit_bundle", { user_limit: "10" }, "pass"],
+    ["kevs_search", { query: "CVE-2024-3400", limit: "5" }, "accept", "pass"],
+    ["kevs_search", { cve: "CVE-2024-3400" }, "accept", "required"],
+    ["kevs_search", {}, "accept", "required"],
+    ["kevs_recent", { days: "7" }, "accept", "pass"],
+    ["kevs_recent", { days: null }, "accept", "coerced"],
+    ["kevs_get_epss", { cve_ids: "CVE-2024-3400" }, "accept", "array"],
+    ["kevs_get_epss", { cve_ids: [1] }, "accept", "pass"],
+    ["kevs_get_epss", {}, "accept", "required"],
+    ["cmvp_get_module", { cert_number: 4282 }, "accept", "pass"],
+    ["cmvp_get_module", { certificate: "4282" }, "accept", "required"],
+    ["cmvp_get_module", {}, "accept", "required"],
+    ["fedramp_search_frmr", { query: "CDS", section: "bogus" }, "accept", "enum"],
+    ["fedramp_search_frmr", { query: "CDS", limit: "5" }, "accept", "pass"],
+    ["fedramp_search_frmr", { section: "any" }, "accept", "required"],
+    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp", name: "n", format: "xml" }, "accept", "enum"],
+    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp" }, "accept", "required"],
+    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp", name: "n", include_optional_fields: "true" }, "accept", "pass"],
+    ["github_check_access", { installation_id: true }, "accept", "coerced"],
+    ["github_check_access", { lookback_days: "1" }, "accept", "pass"],
+    ["okta_check_access", { scopes: "okta.users.read" }, "accept", "array"],
+    ["okta_check_access", { scopes: [1] }, "accept", "coerced"],
+    ["gws_export_audit_bundle", { lookback_days: "1" }, "reject", "lenient"],
+    ["gws_export_audit_bundle", { lookback_days: 1.5 }, "reject", "integer"],
+    ["aws_export_audit_bundle", { user_limit: "10" }, "accept", "pass"],
+    ["oscal_generate_ssp_markdown", { workspace_dir: "w", profile: "p", output: "o" }, "accept", "pass"],
+    ["oscal_assemble_ssp", { workspace_dir: "w", markdown: "m", output: "o" }, "accept", "pass"],
   ];
 
-  for (const [name, input, expected] of cases) {
+  for (const [name, input, piExpected, flueExpected] of cases) {
     const label = `${name} ${JSON.stringify(input)}`;
     const pi = piVerdict(piTools.find((tool) => tool.name === name), input);
     const flue = flueVerdict(flueTools.get(name), input);
-    assert.ok(pi.ok, `${label} passes Pi's own loop`);
-    if (expected === "pass") {
-      assert.ok(flue.ok, `${label} should pass Flue`);
-      assert.equal(canonical(flue.args), canonical(pi.args), `${label} normalizes identically`);
-    } else if (expected === "coerced") {
-      assert.ok(flue.ok, `${label} should pass Flue after gate coercion`);
-    } else {
-      assert.deepEqual({ ok: flue.ok, stage: flue.stage, reason: flue.reason }, { ok: false, stage: "gate", reason: expected }, label);
+    assert.equal(pi.ok, piExpected === "accept", `${label}: Pi CLI verdict`);
+    switch (flueExpected) {
+      case "pass":
+        assert.ok(flue.ok, `${label} should pass Flue`);
+        assert.equal(canonical(flue.args), canonical(pi.args), `${label} normalizes identically`);
+        break;
+      case "coerced":
+        assert.ok(flue.ok, `${label} should pass Flue after gate coercion`);
+        assert.notEqual(canonical(flue.args), canonical(pi.args), `${label} reaches the tool with gate-coerced values`);
+        break;
+      case "lenient":
+        assert.ok(flue.ok, `${label} is admitted by the gate's coercion although the Pi CLI rejects it`);
+        break;
+      default:
+        assert.deepEqual({ ok: flue.ok, stage: flue.stage, reason: flue.reason }, { ok: false, stage: "gate", reason: flueExpected }, label);
     }
   }
 
@@ -498,8 +505,8 @@ test("bridged tools validate through the shim, execute once, and return Flue env
   const flueTool = toFlueTool(tool);
   const signal = new AbortController().signal;
 
-  // Flue parses `input` (which runs prepareArguments and coercion) before calling `run`.
-  const data = v.parse(flueTool.input, { cve: "CVE-2024-3400", limit: "5" });
+  // Flue parses `input` (which runs prepareArguments first) before calling `run`.
+  const data = v.parse(flueTool.input, { cve: "CVE-2024-3400", limit: 5 });
   assert.deepEqual(data, { query: "CVE-2024-3400", limit: 5 });
 
   const result = await flueTool.run(fakeRunContext(data, { toolCallId: "call-42", signal }));
@@ -959,8 +966,8 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
   faux.setResponses([
     (context) => {
       recordContext(context);
-      // The extra alias key and the numeric string prove the Pi `prepareArguments` shim
-      // (which rebuilds the object) and coercion run inside Flue's validation.
+      // The extra alias key proves the Pi `prepareArguments` shim (which rebuilds the object)
+      // runs inside Flue's validation; the numeric string is coerced by Flue's gate first.
       return fauxAssistantMessage([fauxToolCall("kevs_probe", { query: "CVE-2024-3400", cve: "alias", limit: "5" })], {
         stopReason: "toolUse",
       });
