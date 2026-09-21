@@ -1,36 +1,132 @@
 /**
  * Slack Enterprise Grid audit tools for grclanker.
  *
- * This native TypeScript surface is grounded in the slack-sec-inspector spec
- * and starts with read-only Slack Web API, SCIM, and Audit Logs checks.
+ * Read-only Slack Web API, Admin API, SCIM, Audit Logs, and Discovery checks
+ * grounded in specs/slack-sec-inspector.spec.md. Every method, argument, and
+ * response field used here is listed in SLACK_METHODS with the public
+ * documentation page it was verified against.
  */
 import {
   createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
-const DEFAULT_PAGE_LIMIT = 200;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_USER_LIMIT = 1000;
 const DEFAULT_WORKSPACE_LIMIT = 50;
 const DEFAULT_APP_LIMIT = 500;
 const DEFAULT_AUDIT_LIMIT = 200;
+const DEFAULT_CHANNEL_LIMIT = 40;
+const DEFAULT_SESSION_SAMPLE = 100;
 const DEFAULT_LOOKBACK_DAYS = 30;
+const DEFAULT_MIN_RETENTION_DAYS = 365;
 const DEFAULT_OUTPUT_DIR = "./export/slack";
+const DEFAULT_CONFIG_FILE = join(homedir(), ".config", "grclanker", "slack.json");
+const MAX_RATE_LIMIT_RETRIES = 2;
+const MAX_PAGES_PER_LIST = 50;
+const MAX_RETRY_AFTER_SECONDS = 60;
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
+type HttpVerb = "GET" | "POST";
+type TokenKind = "user" | "bot";
+
+interface SlackMethodSpec {
+  verb: HttpVerb;
+  docs: string;
+  tokens: TokenKind[];
+  limitMax?: number;
+  cursorField: "response_metadata" | "top_level";
+}
+
+/**
+ * Web API methods used by this tool family. Verb, token types, limit maxima,
+ * cursor location, and the response fields read elsewhere in this file were
+ * verified against the linked public reference pages.
+ */
+export const SLACK_METHODS: Record<string, SlackMethodSpec> = {
+  "auth.test": { verb: "POST", docs: "https://api.slack.com/methods/auth.test", tokens: ["user", "bot"], cursorField: "response_metadata" },
+  "users.list": { verb: "GET", docs: "https://api.slack.com/methods/users.list", tokens: ["user", "bot"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.teams.list": { verb: "POST", docs: "https://api.slack.com/methods/admin.teams.list", tokens: ["user"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.teams.settings.info": { verb: "POST", docs: "https://api.slack.com/methods/admin.teams.settings.info", tokens: ["user"], cursorField: "response_metadata" },
+  "admin.teams.admins.list": { verb: "GET", docs: "https://api.slack.com/methods/admin.teams.admins.list", tokens: ["user"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.users.list": { verb: "POST", docs: "https://api.slack.com/methods/admin.users.list", tokens: ["user"], limitMax: 100, cursorField: "response_metadata" },
+  "admin.users.session.getSettings": { verb: "POST", docs: "https://api.slack.com/methods/admin.users.session.getSettings", tokens: ["user"], cursorField: "response_metadata" },
+  "admin.apps.approved.list": { verb: "GET", docs: "https://api.slack.com/methods/admin.apps.approved.list", tokens: ["user"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.apps.restricted.list": { verb: "GET", docs: "https://api.slack.com/methods/admin.apps.restricted.list", tokens: ["user"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.barriers.list": { verb: "GET", docs: "https://api.slack.com/methods/admin.barriers.list", tokens: ["user"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.conversations.search": { verb: "POST", docs: "https://api.slack.com/methods/admin.conversations.search", tokens: ["user"], limitMax: 20, cursorField: "top_level" },
+  "admin.conversations.getConversationPrefs": { verb: "POST", docs: "https://api.slack.com/methods/admin.conversations.getConversationPrefs", tokens: ["user"], cursorField: "response_metadata" },
+  "admin.conversations.getCustomRetention": { verb: "POST", docs: "https://api.slack.com/methods/admin.conversations.getCustomRetention", tokens: ["user"], cursorField: "response_metadata" },
+  "admin.emoji.list": { verb: "GET", docs: "https://api.slack.com/methods/admin.emoji.list", tokens: ["user"], limitMax: 1000, cursorField: "response_metadata" },
+  "admin.analytics.getFile": { verb: "GET", docs: "https://api.slack.com/methods/admin.analytics.getFile", tokens: ["user"], cursorField: "response_metadata" },
+  "discovery.enterprise.info": { verb: "GET", docs: "https://docs.slack.dev/admins/discovery-api/", tokens: ["user"], cursorField: "response_metadata" },
+};
+
+export const SLACK_DOC_PAGES = {
+  auditLogs: "https://docs.slack.dev/admins/audit-logs-api/",
+  scim: "https://docs.slack.dev/admins/scim-api/",
+  tokenRotation: "https://docs.slack.dev/authentication/using-token-rotation/",
+  sessionSetSettings: "https://api.slack.com/methods/admin.users.session.setSettings",
+  teamSettingsInfo: "https://api.slack.com/methods/admin.teams.settings.info",
+  conversationsSearch: "https://api.slack.com/methods/admin.conversations.search",
+  emojiList: "https://api.slack.com/methods/admin.emoji.list",
+  analyticsGetFile: "https://api.slack.com/methods/admin.analytics.getFile",
+  discovery: "https://docs.slack.dev/admins/discovery-api/",
+};
+
+type FrameworkName = "FedRAMP" | "CMMC" | "SOC 2" | "CIS" | "PCI-DSS" | "STIG" | "IRAP" | "ISMAP";
+
+export const SLACK_FRAMEWORKS: FrameworkName[] = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
+
+interface SpecControl {
+  number: number;
+  name: string;
+  refs: Array<string | null>;
+}
+
+/** Spec section 4 control names and section 5 framework mappings, in table order. */
+export const SLACK_SPEC_CONTROLS: SpecControl[] = [
+  { number: 1, name: "SSO enforcement", refs: ["IA-2(1)", "3.5.3", "CC6.1", "16.2", "8.4.1", "SRG-APP-000149", "ISM-1546", "CPS.AT-1"] },
+  { number: 2, name: "Two-factor authentication", refs: ["IA-2(6)", "3.5.3", "CC6.1", "16.3", "8.4.2", "SRG-APP-000150", "ISM-1504", "CPS.AT-2"] },
+  { number: 3, name: "Session duration limits", refs: ["AC-12", "3.1.10", "CC6.1", "16.4", "8.2.8", "SRG-APP-000295", "ISM-1164", "CPS.AC-7"] },
+  { number: 4, name: "Session idle timeout", refs: ["AC-11", "3.1.11", "CC6.1", "16.5", "8.2.8", "SRG-APP-000190", "ISM-1164", "CPS.AC-7"] },
+  { number: 5, name: "Mobile session controls", refs: ["AC-19", "3.1.18", "CC6.7", null, "8.2.8", "SRG-APP-000394", "ISM-1082", "CPS.MP-1"] },
+  { number: 6, name: "File upload restrictions", refs: ["SC-7", "3.13.6", "CC6.6", null, "1.3.2", "SRG-APP-000001", "ISM-0331", "CPS.SC-7"] },
+  { number: 7, name: "External sharing controls", refs: ["AC-21", "3.1.20", "CC6.6", null, "7.1.2", "SRG-APP-000378", "ISM-0661", "CPS.AC-4"] },
+  { number: 8, name: "Information barriers", refs: ["AC-4", "3.1.3", "CC6.6", null, "7.1.1", "SRG-APP-000039", "ISM-1528", "CPS.AC-4"] },
+  { number: 9, name: "App management policy", refs: ["CM-7", "3.4.8", "CC6.8", "2.7", "6.3.2", "SRG-APP-000141", "ISM-1624", "CPS.CM-7"] },
+  { number: 10, name: "Custom app restrictions", refs: ["CM-7(4)", "3.4.8", "CC6.8", "2.7", "6.3.2", "SRG-APP-000386", "ISM-1624", "CPS.CM-7"] },
+  { number: 11, name: "DLP policy configuration", refs: ["SC-7(8)", "3.13.6", "CC6.7", null, null, "SRG-APP-000400", "ISM-0261", "CPS.SC-7"] },
+  { number: 12, name: "Channel retention policies", refs: ["AU-11", "3.3.1", "CC7.2", null, "10.7.1", "SRG-APP-000515", "ISM-0859", "CPS.AU-11"] },
+  { number: 13, name: "Audit log streaming", refs: ["AU-6(3)", "3.3.5", "CC7.2", "8.2", "10.5.1", "SRG-APP-000516", "ISM-0580", "CPS.AU-6"] },
+  { number: 14, name: "Admin role inventory", refs: ["AC-6(5)", "3.1.5", "CC6.3", "16.8", "7.1.1", "SRG-APP-000340", "ISM-1507", "CPS.AC-6"] },
+  { number: 15, name: "Guest account controls", refs: ["AC-2(2)", "3.1.1", "CC6.2", "16.7", "7.1.2", "SRG-APP-000024", "ISM-0415", "CPS.AC-2"] },
+  { number: 16, name: "Email domain restrictions", refs: ["IA-5", "3.5.7", "CC6.1", null, "8.3.1", "SRG-APP-000173", "ISM-1557", "CPS.IA-5"] },
+  { number: 17, name: "Workspace discoverability", refs: ["AC-3", "3.1.1", "CC6.1", null, "7.1.1", "SRG-APP-000033", "ISM-0432", "CPS.AC-3"] },
+  { number: 18, name: "Channel posting restrictions", refs: ["AC-3(7)", "3.1.2", "CC6.1", null, "7.1.1", "SRG-APP-000033", "ISM-0405", "CPS.AC-3"] },
+  { number: 19, name: "Custom emoji restrictions", refs: ["CM-5", "3.4.5", "CC8.1", null, null, "SRG-APP-000380", "ISM-1624", "CPS.CM-5"] },
+  { number: 20, name: "External email ingestion", refs: ["SC-7(4)", "3.13.6", "CC6.6", null, "1.3.2", "SRG-APP-000001", "ISM-0264", "CPS.SC-7"] },
+  { number: 21, name: "Link previews and URL unfurling", refs: ["SC-7", "3.13.1", "CC6.6", null, null, "SRG-APP-000001", "ISM-0260", "CPS.SC-7"] },
+  { number: 22, name: "SCIM provisioning status", refs: ["AC-2(1)", "3.1.1", "CC6.2", null, "7.1.1", "SRG-APP-000023", "ISM-1594", "CPS.AC-2"] },
+  { number: 23, name: "Deactivated user audit", refs: ["AC-2(3)", "3.1.12", "CC6.2", "16.9", "8.1.4", "SRG-APP-000025", "ISM-1591", "CPS.AC-2"] },
+  { number: 24, name: "Workspace analytics access", refs: ["AC-6(9)", "3.1.7", "CC6.3", null, "7.1.2", "SRG-APP-000343", "ISM-0988", "CPS.AC-6"] },
+  { number: 25, name: "Token rotation and revocation", refs: ["IA-5(1)", "3.5.10", "CC6.1", null, "8.6.3", "SRG-APP-000175", "ISM-1557", "CPS.IA-5"] },
+];
 
 export interface SlackConfiguration {
-  token: string;
+  token?: string;
+  botToken?: string;
   scimToken?: string;
   orgId?: string;
   webApiBaseUrl: string;
@@ -43,6 +139,7 @@ export interface SlackConfiguration {
 interface SlackApiClientOptions {
   fetchImpl?: FetchImpl;
   now?: () => Date;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface SlackAccessSurface {
@@ -57,17 +154,20 @@ export interface SlackAccessSurface {
 export interface SlackAccessCheckResult {
   status: "healthy" | "limited";
   auth?: JsonRecord;
-  enterprise?: JsonRecord;
+  tokenKinds: TokenKind[];
   surfaces: SlackAccessSurface[];
   notes: string[];
   recommendedNextStep: string;
 }
 
+export type SlackFindingStatus = "pass" | "warn" | "fail" | "manual";
+
 export interface SlackFinding {
   id: string;
   title: string;
+  control: number;
   severity: "critical" | "high" | "medium" | "low" | "info";
-  status: "pass" | "warn" | "fail";
+  status: SlackFindingStatus;
   summary: string;
   evidence?: JsonRecord;
   mappings: string[];
@@ -77,6 +177,7 @@ export interface SlackAssessmentResult {
   title: string;
   summary: JsonRecord;
   findings: SlackFinding[];
+  errors: string[];
 }
 
 export interface SlackAuditBundleResult {
@@ -84,10 +185,12 @@ export interface SlackAuditBundleResult {
   zipPath: string;
   fileCount: number;
   findingCount: number;
+  errorCount: number;
 }
 
 type CheckAccessArgs = {
   token?: string;
+  bot_token?: string;
   scim_token?: string;
   org_id?: string;
   web_api_base_url?: string;
@@ -103,9 +206,10 @@ type IdentityArgs = CheckAccessArgs & {
 
 type AdminAccessArgs = CheckAccessArgs & {
   workspace_limit?: number;
+  user_limit?: number;
   max_workspace_admins?: number;
   max_session_hours?: number;
-  max_idle_minutes?: number;
+  session_sample?: number;
 };
 
 type IntegrationsArgs = CheckAccessArgs & {
@@ -117,16 +221,22 @@ type MonitoringArgs = CheckAccessArgs & {
   audit_limit?: number;
 };
 
+type ChannelGovernanceArgs = CheckAccessArgs & {
+  channel_limit?: number;
+  min_retention_days?: number;
+};
+
 type ExportAuditBundleArgs = CheckAccessArgs & {
   output_dir?: string;
   user_limit?: number;
   workspace_limit?: number;
   app_limit?: number;
   audit_limit?: number;
+  channel_limit?: number;
   days?: number;
   max_workspace_admins?: number;
   max_session_hours?: number;
-  max_idle_minutes?: number;
+  min_retention_days?: number;
   skip_scim?: boolean;
 };
 
@@ -140,11 +250,7 @@ function asString(value: unknown): string | undefined {
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : undefined;
   }
-
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return String(value);
-  }
-
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return undefined;
 }
 
@@ -166,6 +272,16 @@ function asBoolean(value: unknown): boolean | undefined {
   return undefined;
 }
 
+function asStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(asString).filter((item): item is string => Boolean(item));
+  const single = asString(value);
+  return single ? single.split(",").map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function asObjectArray(value: unknown): JsonRecord[] {
+  return Array.isArray(value) ? value.filter((item): item is JsonRecord => Boolean(asObject(item))) : [];
+}
+
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
   const parsed = Math.trunc(value ?? fallback);
   return Math.min(Math.max(parsed, min), max);
@@ -183,34 +299,85 @@ function parseTimeoutSeconds(value: number | undefined): number {
   return clampNumber(value, DEFAULT_TIMEOUT_MS / 1000, 1, 300) * 1000;
 }
 
+function readConfigFile(env: NodeJS.ProcessEnv): { values: JsonRecord; path?: string } {
+  const configured = asString(env.SLACK_CONFIG_FILE);
+  const candidate = configured ?? DEFAULT_CONFIG_FILE;
+  if (!existsSync(candidate)) {
+    if (configured) throw new Error(`SLACK_CONFIG_FILE does not exist: ${configured}`);
+    return { values: {} };
+  }
+  try {
+    const parsed = asObject(JSON.parse(readFileSync(candidate, "utf8")));
+    return { values: parsed ?? {}, path: candidate };
+  } catch (error) {
+    throw new Error(`Unable to parse Slack config file ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function pickSource(
+  label: string,
+  argValue: string | undefined,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+  sourceChain: string[],
+): string | undefined {
+  if (argValue) {
+    sourceChain.push(`arguments-${label}`);
+    return argValue;
+  }
+  if (envValue) {
+    sourceChain.push(`environment-${label}`);
+    return envValue;
+  }
+  if (fileValue) {
+    sourceChain.push(`config-file-${label}`);
+    return fileValue;
+  }
+  return undefined;
+}
+
 export function resolveSlackConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): SlackConfiguration {
   const sourceChain: string[] = [];
-  const token = asString(input.token)
-    ?? asString(input.user_token)
-    ?? asString(env.SLACK_USER_TOKEN)
-    ?? asString(env.SLACK_TOKEN);
-
-  if (!token) {
-    throw new Error("SLACK_USER_TOKEN or a token argument is required.");
+  const file = readConfigFile(env);
+  const token = pickSource(
+    "token",
+    asString(input.token) ?? asString(input.user_token),
+    asString(env.SLACK_USER_TOKEN) ?? asString(env.SLACK_TOKEN),
+    asString(file.values.user_token) ?? asString(file.values.token),
+    sourceChain,
+  );
+  const botToken = pickSource(
+    "bot-token",
+    asString(input.bot_token),
+    asString(env.SLACK_BOT_TOKEN),
+    asString(file.values.bot_token),
+    sourceChain,
+  );
+  if (!token && !botToken) {
+    throw new Error("SLACK_USER_TOKEN (or SLACK_BOT_TOKEN for bot-capable methods), a token argument, or a config file entry is required.");
   }
-  sourceChain.push(asString(input.token) || asString(input.user_token) ? "arguments-token" : "environment-token");
-
-  const scimToken = asString(input.scim_token)
-    ?? asString(input.scimToken)
-    ?? asString(env.SLACK_SCIM_TOKEN);
-  if (scimToken) sourceChain.push(asString(input.scim_token) || asString(input.scimToken) ? "arguments-scim" : "environment-scim");
-
-  const orgId = asString(input.org_id)
-    ?? asString(input.enterprise_id)
-    ?? asString(env.SLACK_ORG_ID)
-    ?? asString(env.SLACK_ENTERPRISE_ID);
-  if (orgId) sourceChain.push(asString(input.org_id) || asString(input.enterprise_id) ? "arguments-org" : "environment-org");
+  const scimToken = pickSource(
+    "scim",
+    asString(input.scim_token) ?? asString(input.scimToken),
+    asString(env.SLACK_SCIM_TOKEN),
+    asString(file.values.scim_token),
+    sourceChain,
+  );
+  const orgId = pickSource(
+    "org",
+    asString(input.org_id) ?? asString(input.enterprise_id),
+    asString(env.SLACK_ORG_ID) ?? asString(env.SLACK_ENTERPRISE_ID),
+    asString(file.values.org_id),
+    sourceChain,
+  );
+  if (file.path) sourceChain.push("config-file");
 
   return {
     token,
+    botToken,
     scimToken,
     orgId,
     webApiBaseUrl: normalizeBaseUrl(
@@ -227,71 +394,22 @@ export function resolveSlackConfiguration(
   };
 }
 
-function appendQuery(url: URL, query: JsonRecord): URL {
+function encodeParams(query: JsonRecord): URLSearchParams {
+  const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
     if (value === undefined || value === null || value === "") continue;
-    url.searchParams.set(key, String(value));
+    params.set(key, Array.isArray(value) ? value.map(String).join(",") : String(value));
   }
-  return url;
-}
-
-function extractArray(value: unknown, keys: string[]): JsonRecord[] {
-  const object = asObject(value);
-  if (!object) return [];
-
-  for (const key of keys) {
-    const nested = object[key];
-    if (Array.isArray(nested)) {
-      return nested.filter((item): item is JsonRecord => Boolean(asObject(item)));
-    }
-  }
-
-  const resources = object.Resources;
-  if (Array.isArray(resources)) {
-    return resources.filter((item): item is JsonRecord => Boolean(asObject(item)));
-  }
-
-  return [];
-}
-
-function extractCount(value: unknown, keys: string[]): number {
-  const object = asObject(value);
-  if (!object) return 0;
-  for (const key of ["totalResults", "total_results", "count", "total"]) {
-    const count = asNumber(object[key]);
-    if (count !== undefined) return count;
-  }
-  for (const key of keys) {
-    const value = object[key];
-    if (Array.isArray(value)) return value.length;
-  }
-  return extractArray(value, keys).length;
-}
-
-function extractNestedObject(value: unknown, keys: string[]): JsonRecord | undefined {
-  const object = asObject(value);
-  if (!object) return undefined;
-  for (const key of keys) {
-    const nested = asObject(object[key]);
-    if (nested) return nested;
-  }
-  return object;
+  return params;
 }
 
 function extractTimestamp(value: unknown): string | undefined {
-  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) return value;
-  if (typeof value === "number" && Number.isFinite(value)) {
+  if (typeof value === "string" && value.trim().length > 0 && !Number.isNaN(Date.parse(value))) return value;
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
     const timestamp = value > 10_000_000_000 ? value : value * 1000;
     return new Date(timestamp).toISOString();
   }
-  const object = asObject(value);
-  if (!object) return undefined;
-  return (
-    extractTimestamp(object.date_create)
-    ?? extractTimestamp(object.created)
-    ?? extractTimestamp(object.timestamp)
-    ?? extractTimestamp(object.date)
-  );
+  return undefined;
 }
 
 function daysBetween(later: Date, earlierIso?: string): number | undefined {
@@ -301,20 +419,36 @@ function daysBetween(later: Date, earlierIso?: string): number | undefined {
   return (later.getTime() - earlier.getTime()) / (24 * 60 * 60 * 1000);
 }
 
+function mappingsFor(control: number): string[] {
+  const spec = SLACK_SPEC_CONTROLS.find((item) => item.number === control);
+  if (!spec) return [];
+  return spec.refs
+    .map((ref, index) => (ref ? `${SLACK_FRAMEWORKS[index]} ${ref}` : undefined))
+    .filter((item): item is string => Boolean(item));
+}
+
 function finding(
   id: string,
   title: string,
+  control: number,
   severity: SlackFinding["severity"],
-  status: SlackFinding["status"],
+  status: SlackFindingStatus,
   summary: string,
-  mappings: string[],
   evidence?: JsonRecord,
 ): SlackFinding {
-  return { id, title, severity, status, summary, mappings, evidence };
+  return { id, title, control, severity, status, summary, mappings: mappingsFor(control), evidence };
 }
 
-function formatPercent(value: number): string {
-  return `${value.toFixed(1)}%`;
+function manualFinding(
+  id: string,
+  title: string,
+  control: number,
+  severity: SlackFinding["severity"],
+  reason: string,
+  evidenceToCollect: string,
+  evidence: JsonRecord = {},
+): SlackFinding {
+  return finding(id, title, control, severity, "manual", `${reason} Manual evidence: ${evidenceToCollect}`, evidence);
 }
 
 function serializeJson(value: unknown): string {
@@ -345,11 +479,7 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   const realBase = realpathSync(baseDir);
   const resolvedTarget = resolve(realBase, targetDir);
   const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
+  if (relativeTarget === ".." || relativeTarget.startsWith("..")) {
     throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
   }
 
@@ -367,8 +497,7 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   const parent = dirname(resolvedTarget);
   ensurePrivateDir(parent);
   const realParent = realpathSync(parent);
-  const stat = lstatSync(realParent);
-  if (stat.isSymbolicLink()) {
+  if (lstatSync(realParent).isSymbolicLink()) {
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
 
@@ -377,10 +506,10 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
+  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -399,7 +528,6 @@ async function createZipArchive(sourceDir: string, zipPath: string): Promise<voi
   await new Promise<void>((resolvePromise, rejectPromise) => {
     const output = createWriteStream(zipPath, { mode: 0o600 });
     const archive = new ZipArchive({ zlib: { level: 9 } });
-
     output.on("close", () => resolvePromise());
     output.on("error", rejectPromise);
     archive.on("error", rejectPromise);
@@ -414,18 +542,34 @@ async function countFilesRecursively(pathname: string): Promise<number> {
   let count = 0;
   for (const entry of entries) {
     const fullPath = join(pathname, entry.name);
-    if (entry.isDirectory()) {
-      count += await countFilesRecursively(fullPath);
-    } else {
-      count += 1;
-    }
+    count += entry.isDirectory() ? await countFilesRecursively(fullPath) : 1;
   }
   return count;
+}
+
+export class SlackApiError extends Error {
+  constructor(
+    message: string,
+    readonly method: string,
+    readonly code?: string,
+    readonly httpStatus?: number,
+  ) {
+    super(message);
+    this.name = "SlackApiError";
+  }
+}
+
+export interface SlackPage {
+  items: JsonRecord[];
+  complete: boolean;
+  pages: number;
+  total?: number;
 }
 
 export class SlackApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(
     private readonly config: SlackConfiguration,
@@ -433,6 +577,7 @@ export class SlackApiClient {
   ) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
+    this.sleep = options.sleep ?? ((ms: number) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
   }
 
   private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
@@ -446,35 +591,74 @@ export class SlackApiClient {
   }
 
   private async fetchJson(url: URL, init: RequestInit, label: string): Promise<JsonRecord> {
-    const response = await this.fetchWithTimeout(url.toString(), init);
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`${label} failed (${response.status} ${response.statusText}) ${text.slice(0, 200)}`);
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await this.fetchWithTimeout(url.toString(), init);
+      if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+        const retryAfter = clampNumber(asNumber(response.headers.get("retry-after")), 1, 1, MAX_RETRY_AFTER_SECONDS);
+        await this.sleep(retryAfter * 1000);
+        continue;
+      }
+      const text = await response.text();
+      if (!response.ok) {
+        throw new SlackApiError(
+          `${label} failed (HTTP ${response.status}) ${text.slice(0, 200)}`,
+          label,
+          response.status === 401 || response.status === 403 ? "http_forbidden" : `http_${response.status}`,
+          response.status,
+        );
+      }
+      const json = text.length > 0 ? (JSON.parse(text) as JsonRecord) : {};
+      if (json.ok === false) {
+        const code = asString(json.error) ?? "ok_false";
+        throw new SlackApiError(`${label} failed: ${code}`, label, code, response.status);
+      }
+      return json;
     }
-    const json = text.length > 0 ? JSON.parse(text) as JsonRecord : {};
-    if (json.ok === false) {
-      throw new Error(`${label} failed: ${asString(json.error) ?? "ok=false"}`);
-    }
-    return json;
+  }
+
+  private tokenFor(method: string): string {
+    const spec = SLACK_METHODS[method];
+    const allowsBot = spec?.tokens.includes("bot") ?? false;
+    if (this.config.token) return this.config.token;
+    if (allowsBot && this.config.botToken) return this.config.botToken;
+    throw new SlackApiError(
+      `Slack Web API ${method} requires a user token (not_allowed_token_type); only a bot token is configured.`,
+      method,
+      "not_allowed_token_type",
+    );
   }
 
   async web(method: string, query: JsonRecord = {}): Promise<JsonRecord> {
-    const url = appendQuery(new URL(`${this.config.webApiBaseUrl}/${method}`), query);
+    const spec = SLACK_METHODS[method];
+    const token = this.tokenFor(method);
+    const label = `Slack Web API ${method}`;
+    const params = encodeParams(query);
+    if (spec?.verb === "POST") {
+      return this.fetchJson(new URL(`${this.config.webApiBaseUrl}/${method}`), {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+          authorization: `Bearer ${token}`,
+        },
+        body: params.toString(),
+      }, label);
+    }
+    const url = new URL(`${this.config.webApiBaseUrl}/${method}`);
+    url.search = params.toString();
     return this.fetchJson(url, {
       method: "GET",
-      headers: {
-        accept: "application/json",
-        authorization: `Bearer ${this.config.token}`,
-      },
-    }, `Slack Web API ${method}`);
+      headers: { accept: "application/json", authorization: `Bearer ${token}` },
+    }, label);
   }
 
   async scim(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
     if (!this.config.scimToken) {
-      throw new Error("SLACK_SCIM_TOKEN is required for Slack SCIM checks.");
+      throw new SlackApiError("SLACK_SCIM_TOKEN is required for Slack SCIM checks.", `SCIM ${path}`, "not_configured");
     }
     const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-    const url = appendQuery(new URL(`${this.config.scimBaseUrl}${normalizedPath}`), query);
+    const url = new URL(`${this.config.scimBaseUrl}${normalizedPath}`);
+    url.search = encodeParams(query).toString();
     return this.fetchJson(url, {
       method: "GET",
       headers: {
@@ -485,14 +669,15 @@ export class SlackApiClient {
   }
 
   async audit(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
+    if (!this.config.token) {
+      throw new SlackApiError("The Audit Logs API requires an org-level user token.", `Audit Logs ${path}`, "not_allowed_token_type");
+    }
     const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-    const url = appendQuery(new URL(`${this.config.auditBaseUrl}${normalizedPath}`), query);
+    const url = new URL(`${this.config.auditBaseUrl}${normalizedPath}`);
+    url.search = encodeParams(query).toString();
     return this.fetchJson(url, {
       method: "GET",
-      headers: {
-        accept: "application/json",
-        authorization: `Bearer ${this.config.token}`,
-      },
+      headers: { accept: "application/json", authorization: `Bearer ${this.config.token}` },
     }, `Slack Audit Logs ${normalizedPath}`);
   }
 
@@ -502,19 +687,38 @@ export class SlackApiClient {
     query: JsonRecord = {},
     options: { limit?: number; pageLimit?: number } = {},
   ): Promise<JsonRecord[]> {
+    return (await this.collectWeb(method, itemKeys, query, options)).items;
+  }
+
+  async collectWeb(
+    method: string,
+    itemKeys: string[],
+    query: JsonRecord = {},
+    options: { limit?: number; pageLimit?: number } = {},
+  ): Promise<SlackPage> {
+    const spec = SLACK_METHODS[method];
     const limit = options.limit ?? Number.POSITIVE_INFINITY;
-    const pageLimit = clampNumber(options.pageLimit, DEFAULT_PAGE_LIMIT, 1, 1000);
+    const pageLimit = clampNumber(options.pageLimit, Math.min(spec?.limitMax ?? 200, 200), 1, spec?.limitMax ?? 1000);
     let cursor: string | undefined;
+    let pages = 0;
+    let total: number | undefined;
     const items: JsonRecord[] = [];
 
     do {
       const page = await this.web(method, { ...query, limit: pageLimit, cursor });
-      items.push(...extractArray(page, itemKeys).slice(0, limit - items.length));
-      const metadata = asObject(page.response_metadata);
-      cursor = asString(metadata?.next_cursor);
-    } while (cursor && items.length < limit);
+      pages += 1;
+      const pageItems = itemKeys.flatMap((key) => (Array.isArray(page[key]) ? page[key] : []))
+        .map((item) => asObject(item) ?? (asString(item) ? { id: asString(item) } : undefined))
+        .filter((item): item is JsonRecord => Boolean(item));
+      items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
+      total = asNumber(page.total_count) ?? total;
+      cursor = spec?.cursorField === "top_level"
+        ? asString(page.next_cursor)
+        : asString(asObject(page.response_metadata)?.next_cursor);
+      if (pageItems.length === 0) cursor = undefined;
+    } while (cursor && items.length < limit && pages < MAX_PAGES_PER_LIST);
 
-    return items;
+    return { items, complete: !cursor, pages, total };
   }
 
   async paginateScim(
@@ -522,21 +726,32 @@ export class SlackApiClient {
     query: JsonRecord = {},
     options: { limit?: number; pageLimit?: number } = {},
   ): Promise<JsonRecord[]> {
+    return (await this.collectScim(path, query, options)).items;
+  }
+
+  async collectScim(
+    path: string,
+    query: JsonRecord = {},
+    options: { limit?: number; pageLimit?: number } = {},
+  ): Promise<SlackPage> {
     const limit = options.limit ?? Number.POSITIVE_INFINITY;
-    const pageLimit = clampNumber(options.pageLimit, DEFAULT_PAGE_LIMIT, 1, 1000);
+    const pageLimit = clampNumber(options.pageLimit, 100, 1, 1000);
     let startIndex = asNumber(query.startIndex) ?? 1;
+    let pages = 0;
+    let total: number | undefined;
     const items: JsonRecord[] = [];
 
-    while (items.length < limit) {
+    while (items.length < limit && pages < MAX_PAGES_PER_LIST) {
       const page = await this.scim(path, { ...query, startIndex, count: pageLimit });
-      const resources = extractArray(page, ["Resources"]);
+      pages += 1;
+      const resources = asObjectArray(page.Resources);
       items.push(...resources.slice(0, limit - items.length));
-      const total = asNumber(page.totalResults) ?? resources.length;
-      if (resources.length === 0 || items.length >= total) break;
+      total = asNumber(page.totalResults) ?? total;
+      if (resources.length === 0 || items.length >= (total ?? resources.length)) break;
       startIndex += resources.length;
     }
 
-    return items;
+    return { items, complete: total === undefined ? true : items.length >= total, pages, total };
   }
 
   getNow(): Date {
@@ -546,38 +761,96 @@ export class SlackApiClient {
   getOrgQuery(): JsonRecord {
     return this.config.orgId ? { enterprise_id: this.config.orgId } : {};
   }
+
+  getTokenKinds(): TokenKind[] {
+    const kinds: TokenKind[] = [];
+    if (this.config.token) kinds.push("user");
+    if (this.config.botToken) kinds.push("bot");
+    return kinds;
+  }
+
+  describeToken(): JsonRecord {
+    const token = this.config.token ?? this.config.botToken ?? "";
+    return {
+      prefix: token.replace(/^(xoxe\.)?(xox[a-z])-.*$/, "$1$2") || "unknown",
+      rotating_format: token.startsWith("xoxe."),
+    };
+  }
 }
+
+type ReadResult<T> =
+  | { ok: true; value: T; complete: boolean; total?: number; error?: undefined; code?: undefined }
+  | { ok: false; error: string; code?: string; value?: undefined; complete?: undefined; total?: undefined };
 
 function surfaceError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function errorCode(error: unknown): string | undefined {
+  return error instanceof SlackApiError ? error.code : undefined;
+}
+
+async function readWeb(client: SlackApiClient, method: string, query: JsonRecord = {}): Promise<ReadResult<JsonRecord>> {
+  try {
+    return { ok: true, value: await client.web(method, query), complete: true };
+  } catch (error) {
+    return { ok: false, error: surfaceError(error), code: errorCode(error) };
+  }
+}
+
+async function readWebList(
+  client: SlackApiClient,
+  method: string,
+  itemKeys: string[],
+  query: JsonRecord = {},
+  options: { limit?: number; pageLimit?: number } = {},
+): Promise<ReadResult<JsonRecord[]>> {
+  try {
+    const page = await client.collectWeb(method, itemKeys, query, options);
+    return { ok: true, value: page.items, complete: page.complete, total: page.total };
+  } catch (error) {
+    return { ok: false, error: surfaceError(error), code: errorCode(error) };
+  }
+}
+
+function unreadableReason(result: { error: string; code?: string }): string {
+  const code = result.code;
+  if (code === "not_allowed_token_type") return `${result.error} (requires an org-level user token)`;
+  if (code === "missing_scope") return `${result.error} (grant the documented scope)`;
+  if (code === "not_an_enterprise" || code === "feature_not_enabled" || code === "enterprise_is_restricted") {
+    return `${result.error} (requires an Enterprise Grid plan with the Admin API feature)`;
+  }
+  return result.error;
+}
+
+function partialNote(seen: number, complete: boolean, total?: number): string {
+  if (complete) return `${seen} seen (complete)`;
+  return `${seen} seen of ${total ?? "unknown total"} (partial view, pagination capped)`;
+}
+
 async function webSurface(
-  client: Pick<SlackApiClient, "web" | "getOrgQuery">,
+  client: SlackApiClient,
   name: string,
   method: string,
   itemKeys: string[] = [],
   query: JsonRecord = {},
 ): Promise<SlackAccessSurface> {
   try {
-    const result = await client.web(method, { ...client.getOrgQuery(), ...query, limit: 1 });
+    const spec = SLACK_METHODS[method];
+    const result = await client.web(method, spec?.limitMax ? { ...query, limit: 1 } : query);
     return {
       name,
       api: "web",
       endpoint: method,
       status: "readable",
-      count: itemKeys.length > 0 ? extractCount(result, itemKeys) : 1,
+      count: itemKeys.length > 0 ? itemKeys.reduce((sum, key) => sum + asObjectArray(result[key]).length, 0) : 1,
     };
   } catch (error) {
     return { name, api: "web", endpoint: method, status: "not_readable", error: surfaceError(error) };
   }
 }
 
-async function scimSurface(
-  client: Pick<SlackApiClient, "scim">,
-  name: string,
-  path: string,
-): Promise<SlackAccessSurface> {
+async function scimSurface(client: SlackApiClient, name: string, path: string): Promise<SlackAccessSurface> {
   try {
     const result = await client.scim(path, path === "/ServiceProviderConfig" ? {} : { count: 1 });
     return {
@@ -585,18 +858,15 @@ async function scimSurface(
       api: "scim",
       endpoint: path,
       status: "readable",
-      count: path === "/ServiceProviderConfig" ? 1 : extractCount(result, ["Resources"]),
+      count: path === "/ServiceProviderConfig" ? 1 : asNumber(result.totalResults) ?? asObjectArray(result.Resources).length,
     };
   } catch (error) {
-    return { name, api: "scim", endpoint: path, status: "not_readable", error: surfaceError(error) };
+    const status = errorCode(error) === "not_configured" ? "not_configured" : "not_readable";
+    return { name, api: "scim", endpoint: path, status, error: surfaceError(error) };
   }
 }
 
-async function auditSurface(
-  client: Pick<SlackApiClient, "audit">,
-  name: string,
-  path: string,
-): Promise<SlackAccessSurface> {
+async function auditSurface(client: SlackApiClient, name: string, path: string): Promise<SlackAccessSurface> {
   try {
     const result = await client.audit(path, path === "/logs" ? { limit: 1 } : {});
     return {
@@ -604,7 +874,7 @@ async function auditSurface(
       api: "audit",
       endpoint: path,
       status: "readable",
-      count: extractCount(result, ["entries", "schemas", "logs"]),
+      count: asObjectArray(result.entries).length + asObjectArray(result.schemas).length,
     };
   } catch (error) {
     return { name, api: "audit", endpoint: path, status: "not_readable", error: surfaceError(error) };
@@ -613,15 +883,17 @@ async function auditSurface(
 
 export async function checkSlackAccess(client: SlackApiClient): Promise<SlackAccessCheckResult> {
   const auth = await client.web("auth.test");
-  const enterprise = await client.web("admin.enterprise.info", client.getOrgQuery()).catch(() => undefined);
+  const orgQuery = client.getOrgQuery();
   const surfaces = await Promise.all([
     webSurface(client, "auth", "auth.test"),
     webSurface(client, "workspaces", "admin.teams.list", ["teams"]),
-    webSurface(client, "users", "users.list", ["members"]),
+    webSurface(client, "users", "users.list", ["members"], asString(auth.team_id) ? { team_id: auth.team_id } : {}),
     webSurface(client, "admin_users", "admin.users.list", ["users"]),
-    webSurface(client, "approved_apps", "admin.apps.approved.list", ["apps"]),
-    webSurface(client, "restricted_apps", "admin.apps.restricted.list", ["apps"]),
+    webSurface(client, "approved_apps", "admin.apps.approved.list", ["approved_apps"], orgQuery),
+    webSurface(client, "restricted_apps", "admin.apps.restricted.list", ["restricted_apps"], orgQuery),
     webSurface(client, "information_barriers", "admin.barriers.list", ["barriers"]),
+    webSurface(client, "channels", "admin.conversations.search", ["conversations"], { total_count_only: true }),
+    webSurface(client, "emoji", "admin.emoji.list"),
     webSurface(client, "discovery", "discovery.enterprise.info"),
     auditSurface(client, "audit_logs", "/logs"),
     auditSurface(client, "audit_schemas", "/schemas"),
@@ -631,28 +903,38 @@ export async function checkSlackAccess(client: SlackApiClient): Promise<SlackAcc
   ]);
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
-  const status = readableCount >= 7 && surfaces.some((surface) => surface.name === "audit_logs" && surface.status === "readable")
-    ? "healthy"
-    : "limited";
+  const auditReadable = surfaces.some((surface) => surface.name === "audit_logs" && surface.status === "readable");
+  const status = readableCount >= 9 && auditReadable ? "healthy" : "limited";
   const team = asString(auth.team) ?? asString(auth.team_id) ?? "Slack tenant";
   const notes = [
-    `Authenticated to ${team}${asString(auth.user) ? ` as ${auth.user}` : ""}.`,
+    `Authenticated to ${team}${asString(auth.user) ? ` as ${auth.user}` : ""}${auth.is_enterprise_install === true ? " (enterprise install)" : ""}.`,
     `${readableCount}/${surfaces.length} Slack audit surfaces are readable.`,
     surfaces.some((surface) => surface.api === "scim" && surface.status === "readable")
       ? "SCIM checks are available."
       : "SCIM checks are not available; set SLACK_SCIM_TOKEN to enable provisioning coverage.",
+    client.getTokenKinds().includes("user")
+      ? "A user token is configured; Admin API methods can be attempted."
+      : "Only a bot token is configured; admin.*, Audit Logs, and Discovery methods require an org-level user token.",
   ];
 
   return {
     status,
-    auth,
-    enterprise,
+    auth: {
+      url: auth.url,
+      team: auth.team,
+      team_id: auth.team_id,
+      user: auth.user,
+      user_id: auth.user_id,
+      enterprise_id: auth.enterprise_id,
+      is_enterprise_install: auth.is_enterprise_install,
+    },
+    tokenKinds: client.getTokenKinds(),
     surfaces,
     notes,
     recommendedNextStep:
       status === "healthy"
-        ? "Run slack_assess_identity, slack_assess_admin_access, slack_assess_integrations, and slack_assess_monitoring."
-        : "Grant a read-only Enterprise Grid admin token with admin.*, auditlogs:read, users:read, team:read, and optional SCIM read access.",
+        ? "Run slack_assess_identity, slack_assess_admin_access, slack_assess_integrations, slack_assess_channel_governance, and slack_assess_monitoring."
+        : "Grant a read-only org-level Enterprise Grid user token with admin.teams:read, admin.users:read, admin.apps:read, admin.barriers:read, admin.conversations:read, auditlogs:read, users:read, and optional SCIM read access.",
   };
 }
 
@@ -660,490 +942,914 @@ function isHumanUser(user: JsonRecord): boolean {
   return user.is_bot !== true && user.is_app_user !== true;
 }
 
-function isActiveSlackUser(user: JsonRecord): boolean {
-  return isHumanUser(user) && user.deleted !== true && user.is_deleted !== true;
+function isDeletedUser(user: JsonRecord): boolean {
+  return user.deleted === true;
 }
 
 function isGuestUser(user: JsonRecord): boolean {
-  return user.is_restricted === true || user.is_ultra_restricted === true || asString(user.user_type) === "guest";
+  return user.is_restricted === true || user.is_ultra_restricted === true;
 }
 
 function userEmail(user: JsonRecord): string | undefined {
-  const profile = asObject(user.profile);
-  return asString(user.email) ?? asString(profile?.email);
+  return asString(asObject(user.profile)?.email)?.toLowerCase();
 }
 
 function scimUserEmail(user: JsonRecord): string | undefined {
-  const emails = Array.isArray(user.emails) ? user.emails : [];
-  const primary = emails.map(asObject).find((email) => email?.primary === true);
-  return asString(user.userName) ?? asString(primary?.value);
+  const primary = asObjectArray(user.emails).find((email) => email.primary === true);
+  return (asString(user.userName) ?? asString(primary?.value))?.toLowerCase();
+}
+
+function userLabel(user: JsonRecord): string {
+  return asString(user.name) ?? asString(user.username) ?? asString(user.id) ?? "unknown";
+}
+
+async function resolveTeamId(client: SlackApiClient): Promise<string | undefined> {
+  const auth = await readWeb(client, "auth.test");
+  return auth.ok ? asString(auth.value.team_id) : undefined;
 }
 
 export async function assessSlackIdentity(
-  client: Pick<SlackApiClient, "paginateWeb" | "paginateScim" | "scim">,
+  client: SlackApiClient,
   options: { userLimit?: number; skipScim?: boolean } = {},
 ): Promise<SlackAssessmentResult> {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20_000);
-  const users = await client.paginateWeb("users.list", ["members"], {}, { limit: userLimit });
+  const errors: string[] = [];
+  const teamId = await resolveTeamId(client);
+  const usersResult = await readWebList(client, "users.list", ["members"], teamId ? { team_id: teamId } : {}, { limit: userLimit });
+  if (!usersResult.ok) errors.push(`users.list: ${usersResult.error}`);
+  const users = usersResult.ok ? usersResult.value : [];
+  const usersComplete = usersResult.ok && usersResult.complete;
   const humans = users.filter(isHumanUser);
-  const activeHumans = humans.filter(isActiveSlackUser);
+  const activeHumans = humans.filter((user) => !isDeletedUser(user));
   const knownMfa = activeHumans.filter((user) => typeof user.has_2fa === "boolean");
+  const unknownMfa = activeHumans.length - knownMfa.length;
   const withoutMfa = activeHumans.filter((user) => user.has_2fa === false);
   const guests = activeHumans.filter(isGuestUser);
-  const deactivated = humans.filter((user) => user.deleted === true || user.is_deleted === true);
+  const deactivated = humans.filter(isDeletedUser);
 
-  const scimAvailable = !options.skipScim;
-  const scimConfig = scimAvailable ? await client.scim("/ServiceProviderConfig").catch(() => undefined) : undefined;
-  const scimUsers = scimAvailable
-    ? await client.paginateScim("/Users", {}, { limit: userLimit }).catch(() => [])
-    : [];
+  const scimConfig: ReadResult<JsonRecord> = options.skipScim
+    ? { ok: false, error: "SCIM checks were skipped by request.", code: "skipped" }
+    : await client.scim("/ServiceProviderConfig")
+      .then((value): ReadResult<JsonRecord> => ({ ok: true, value, complete: true }))
+      .catch((error): ReadResult<JsonRecord> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+  const scimUsers: ReadResult<JsonRecord[]> = options.skipScim || !scimConfig.ok
+    ? { ok: false, error: scimConfig.error ?? "SCIM unavailable", code: scimConfig.code }
+    : await client.collectScim("/Users", {}, { limit: userLimit })
+      .then((page): ReadResult<JsonRecord[]> => ({ ok: true, value: page.items, complete: page.complete, total: page.total }))
+      .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+  if (!options.skipScim && !scimConfig.ok) errors.push(`SCIM /ServiceProviderConfig: ${scimConfig.error}`);
+  if (!options.skipScim && scimConfig.ok && !scimUsers.ok) errors.push(`SCIM /Users: ${scimUsers.error}`);
+
   const deletedSlackEmails = new Set(deactivated.map(userEmail).filter((email): email is string => Boolean(email)));
-  const scimActiveDeletedInSlack = scimUsers.filter((user) => {
+  const scimActiveDeletedInSlack = (scimUsers.ok ? scimUsers.value : []).filter((user) => {
     if (user.active === false) return false;
     const email = scimUserEmail(user);
     return Boolean(email && deletedSlackEmails.has(email));
   });
-  const mfaCoverage = activeHumans.length === 0 ? 0 : (knownMfa.length / activeHumans.length) * 100;
+  const usersView = usersResult.ok ? partialNote(users.length, usersResult.complete) : "unreadable";
 
-  const findings = [
-    finding(
-      "SLACK-ID-01",
-      "MFA enrollment",
-      "critical",
-      knownMfa.length === 0 ? "warn" : withoutMfa.length > 0 ? "fail" : "pass",
-      knownMfa.length === 0
-        ? "Slack did not expose MFA enrollment on the sampled users."
-        : withoutMfa.length > 0
-          ? `${withoutMfa.length}/${activeHumans.length} active human users do not show MFA enrollment.`
-          : "Every sampled active human user with MFA visibility is enrolled.",
-      ["FedRAMP IA-2(6)", "CMMC 3.5.3", "SOC 2 CC6.1", "CIS 16.3"],
-      {
-        active_human_users: activeHumans.length,
-        known_mfa_users: knownMfa.length,
-        mfa_visibility_rate: mfaCoverage,
-        users_without_mfa: withoutMfa.slice(0, 20).map((user) => user.name ?? user.id),
-      },
-    ),
-    finding(
-      "SLACK-ID-02",
-      "Guest account inventory",
-      "medium",
-      guests.length > 0 ? "warn" : "pass",
-      guests.length > 0
-        ? `${guests.length}/${activeHumans.length} active human users are guests. Verify expiration and channel scope.`
-        : "No active guest users were present in the sampled user inventory.",
-      ["FedRAMP AC-2(2)", "CMMC 3.1.1", "SOC 2 CC6.2", "CIS 16.7"],
-      { guest_count: guests.length, sample: guests.slice(0, 20).map((user) => user.name ?? user.id) },
-    ),
-    finding(
-      "SLACK-ID-03",
-      "SCIM provisioning coverage",
-      "high",
-      options.skipScim ? "warn" : scimConfig && scimUsers.length > 0 ? "pass" : "fail",
-      options.skipScim
-        ? "SCIM checks were skipped by request."
-        : scimConfig && scimUsers.length > 0
-          ? `SCIM is readable and returned ${scimUsers.length} provisioned users.`
-          : "SCIM user provisioning data was not readable.",
-      ["FedRAMP AC-2(1)", "CMMC 3.1.1", "SOC 2 CC6.2", "ISMAP CPS.AC-2"],
-      { scim_users: scimUsers.length, service_provider_config_readable: Boolean(scimConfig) },
-    ),
-    finding(
-      "SLACK-ID-04",
-      "User lifecycle alignment",
-      "high",
-      !scimConfig ? "warn" : scimActiveDeletedInSlack.length > 0 ? "fail" : "pass",
-      !scimConfig
-        ? "SCIM lifecycle alignment could not be tested because SCIM was unreadable."
-        : scimActiveDeletedInSlack.length > 0
-          ? `${scimActiveDeletedInSlack.length} SCIM-active users appear deactivated in Slack.`
-          : "No SCIM-active user matched a deactivated Slack user in the sample.",
-      ["FedRAMP AC-2(3)", "CMMC 3.1.12", "SOC 2 CC6.2", "PCI-DSS 8.1.4"],
-      { count: scimActiveDeletedInSlack.length },
-    ),
-    finding(
-      "SLACK-ID-05",
-      "Deactivated user visibility",
-      "info",
-      "pass",
-      `${deactivated.length} deactivated human users are visible for lifecycle review.`,
-      ["FedRAMP AC-2", "SOC 2 CC6.2"],
-      { deactivated_users: deactivated.length },
-    ),
-  ];
+  const findings: SlackFinding[] = [];
+  if (!usersResult.ok) {
+    const reason = `users.list is not readable: ${unreadableReason(usersResult)}.`;
+    findings.push(
+      manualFinding("SLACK-ID-01", "MFA enrollment", 2, "critical", reason, "export the member list with 2FA status from the admin dashboard."),
+      manualFinding("SLACK-ID-02", "Guest account inventory", 15, "medium", reason, "export guest accounts and expiration dates from the admin dashboard."),
+    );
+  } else {
+    findings.push(
+      finding(
+        "SLACK-ID-01",
+        "MFA enrollment",
+        2,
+        "critical",
+        activeHumans.length === 0
+          ? "warn"
+          : withoutMfa.length > 0
+            ? "fail"
+            : unknownMfa > 0 || !usersComplete
+              ? "warn"
+              : "pass",
+        activeHumans.length === 0
+          ? `users.list returned no active human users (${usersView}); an empty inventory is not treated as compliant.`
+          : withoutMfa.length > 0
+            ? `${withoutMfa.length}/${activeHumans.length} active human users have has_2fa=false (${usersView}).`
+            : unknownMfa > 0
+              ? `${unknownMfa}/${activeHumans.length} active human users did not expose has_2fa; they are reported separately and do not count as enrolled (${usersView}).`
+              : !usersComplete
+                ? `Every seen active human user has has_2fa=true but the inventory is partial (${usersView}).`
+                : `All ${activeHumans.length} active human users have has_2fa=true (${usersView}).`,
+        {
+          active_human_users: activeHumans.length,
+          known_mfa_users: knownMfa.length,
+          unknown_mfa_users: unknownMfa,
+          users_without_mfa: withoutMfa.slice(0, 20).map(userLabel),
+          inventory_complete: usersComplete,
+        },
+      ),
+      finding(
+        "SLACK-ID-02",
+        "Guest account inventory",
+        15,
+        "medium",
+        guests.length > 0 ? "warn" : usersComplete && activeHumans.length > 0 ? "pass" : "warn",
+        guests.length > 0
+          ? `${guests.length}/${activeHumans.length} active human users are guests (is_restricted or is_ultra_restricted). Verify expiration and channel scope (${usersView}).`
+          : usersComplete && activeHumans.length > 0
+            ? `No active guest users in the complete inventory of ${activeHumans.length} active human users; emptiness is compliant by intent for this control.`
+            : `No guests seen but the inventory is ${activeHumans.length === 0 ? "empty" : "partial"} (${usersView}); not treated as compliant.`,
+        { guest_count: guests.length, sample: guests.slice(0, 20).map(userLabel), inventory_complete: usersComplete },
+      ),
+    );
+  }
+
+  if (options.skipScim) {
+    findings.push(
+      manualFinding("SLACK-ID-03", "SCIM provisioning coverage", 22, "high", "SCIM checks were skipped by request.", "confirm SCIM provisioning is active in the identity provider and Slack admin dashboard."),
+      manualFinding("SLACK-ID-04", "User lifecycle alignment", 23, "high", "SCIM checks were skipped by request.", "reconcile IdP deprovisioning records against Slack deactivations."),
+    );
+  } else if (!scimConfig.ok) {
+    const reason = scimConfig.code === "not_configured"
+      ? "SLACK_SCIM_TOKEN is not configured, so SCIM /ServiceProviderConfig was not called."
+      : `SCIM /ServiceProviderConfig is not readable: ${unreadableReason(scimConfig)} (Business+ or Enterprise plan required).`;
+    findings.push(
+      manualFinding("SLACK-ID-03", "SCIM provisioning coverage", 22, "high", reason, "confirm SCIM provisioning is active in the identity provider and Slack admin dashboard."),
+      manualFinding("SLACK-ID-04", "User lifecycle alignment", 23, "high", reason, "reconcile IdP deprovisioning records against Slack deactivations."),
+    );
+  } else if (!scimUsers.ok) {
+    const reason = `SCIM /Users is not readable: ${unreadableReason(scimUsers)}.`;
+    findings.push(
+      manualFinding("SLACK-ID-03", "SCIM provisioning coverage", 22, "high", reason, "export the SCIM user list from the identity provider."),
+      manualFinding("SLACK-ID-04", "User lifecycle alignment", 23, "high", reason, "reconcile IdP deprovisioning records against Slack deactivations."),
+    );
+  } else {
+    const scimCount = scimUsers.value.length;
+    const scimView = partialNote(scimCount, scimUsers.complete, scimUsers.total);
+    findings.push(
+      finding(
+        "SLACK-ID-03",
+        "SCIM provisioning coverage",
+        22,
+        "high",
+        scimCount === 0 ? "fail" : scimUsers.complete ? "pass" : "warn",
+        scimCount === 0
+          ? "SCIM is readable but /Users returned zero provisioned users; provisioning does not appear active."
+          : `SCIM /ServiceProviderConfig is readable and /Users returned provisioned users (${scimView}).`,
+        { scim_users: scimCount, scim_total: scimUsers.total, inventory_complete: scimUsers.complete },
+      ),
+      finding(
+        "SLACK-ID-04",
+        "User lifecycle alignment",
+        23,
+        "high",
+        !usersResult.ok
+          ? "manual"
+          : scimActiveDeletedInSlack.length > 0
+            ? "fail"
+            : usersComplete && scimUsers.complete && scimCount > 0
+              ? "pass"
+              : "warn",
+        !usersResult.ok
+          ? `users.list is not readable (${unreadableReason(usersResult)}), so SCIM-active users could not be compared with Slack deactivations. Manual evidence: reconcile IdP records against the Slack member export.`
+          : scimActiveDeletedInSlack.length > 0
+            ? `${scimActiveDeletedInSlack.length} SCIM-active users are deactivated in Slack; reconcile IdP and Slack lifecycle state.`
+            : usersComplete && scimUsers.complete && scimCount > 0
+              ? `No SCIM-active user matched a deactivated Slack user across ${scimCount} SCIM users and ${deactivated.length} deactivated Slack users.`
+              : `No mismatch seen, but the comparison used a partial or empty inventory (Slack: ${usersView}; SCIM: ${scimView}).`,
+        { mismatched_users: scimActiveDeletedInSlack.slice(0, 20).map((user) => asString(user.userName) ?? asString(user.id)) },
+      ),
+    );
+  }
+
+  findings.push(
+    !usersResult.ok
+      ? manualFinding("SLACK-ID-05", "Deactivated user visibility", 23, "info", `users.list is not readable: ${unreadableReason(usersResult)}.`, "export deactivated members from the admin dashboard.")
+      : finding(
+        "SLACK-ID-05",
+        "Deactivated user visibility",
+        23,
+        "info",
+        usersComplete && humans.length > 0 ? "pass" : "warn",
+        usersComplete && humans.length > 0
+          ? `${deactivated.length} deactivated human users are visible for lifecycle review (complete inventory of ${humans.length} human users).`
+          : humans.length === 0
+            ? `users.list returned no human users (${usersView}); an empty inventory is not treated as compliant.`
+            : `${deactivated.length} deactivated human users seen, but the inventory is partial (${usersView}).`,
+        { deactivated_users: deactivated.length, inventory_complete: usersComplete },
+      ),
+  );
 
   return {
     title: "Slack identity posture",
     summary: {
-      users_sampled: users.length,
+      users_seen: users.length,
+      users_inventory_complete: usersComplete,
       active_human_users: activeHumans.length,
       guests: guests.length,
       users_without_mfa: withoutMfa.length,
-      scim_users: scimUsers.length,
+      scim_users: scimUsers.ok ? scimUsers.value.length : 0,
     },
     findings,
+    errors,
   };
 }
 
-async function listWorkspaces(
-  client: Pick<SlackApiClient, "paginateWeb" | "web" | "getOrgQuery">,
-  limit: number,
-): Promise<JsonRecord[]> {
-  const workspaces = await client.paginateWeb(
-    "admin.teams.list",
-    ["teams"],
-    client.getOrgQuery(),
-    { limit },
-  ).catch(() => []);
-  if (workspaces.length > 0) return workspaces;
-
-  const auth = await client.web("auth.test").catch(() => undefined);
-  const teamId = asString(auth?.team_id);
-  return teamId ? [{ id: teamId, name: asString(auth?.team) ?? teamId }] : [];
+interface WorkspaceRecord {
+  id: string;
+  name: string;
+  discoverability?: string;
 }
 
-function extractBoolSetting(settings: JsonRecord, keys: string[]): boolean | undefined {
-  for (const key of keys) {
-    const direct = asBoolean(settings[key]);
-    if (direct !== undefined) return direct;
-  }
-
-  for (const value of Object.values(settings)) {
-    const object = asObject(value);
-    if (!object) continue;
-    const nested = extractBoolSetting(object, keys);
-    if (nested !== undefined) return nested;
-  }
-
-  return undefined;
+function toWorkspaceRecord(team: JsonRecord): WorkspaceRecord | undefined {
+  const id = asString(team.id);
+  if (!id) return undefined;
+  return { id, name: asString(team.name) ?? id, discoverability: asString(team.discoverability)?.toLowerCase() };
 }
 
-function extractNumericSetting(settings: JsonRecord, keys: string[]): number | undefined {
-  for (const key of keys) {
-    const direct = asNumber(settings[key]);
-    if (direct !== undefined) return direct;
-  }
-
-  for (const value of Object.values(settings)) {
-    const object = asObject(value);
-    if (!object) continue;
-    const nested = extractNumericSetting(object, keys);
-    if (nested !== undefined) return nested;
-  }
-
-  return undefined;
-}
-
-function extractDiscoverability(settings: JsonRecord): string | undefined {
-  const direct = asString(settings.discoverability) ?? asString(settings.default_joinability);
-  if (direct) return direct.toLowerCase();
-  for (const value of Object.values(settings)) {
-    const object = asObject(value);
-    if (!object) continue;
-    const nested = extractDiscoverability(object);
-    if (nested) return nested;
-  }
-  return undefined;
+function isAdminOrOwner(user: JsonRecord): boolean {
+  return user.is_admin === true || user.is_owner === true || user.is_primary_owner === true;
 }
 
 export async function assessSlackAdminAccess(
-  client: Pick<SlackApiClient, "paginateWeb" | "web" | "getOrgQuery">,
+  client: SlackApiClient,
   options: {
     workspaceLimit?: number;
+    userLimit?: number;
     maxWorkspaceAdmins?: number;
     maxSessionHours?: number;
-    maxIdleMinutes?: number;
+    sessionSample?: number;
   } = {},
 ): Promise<SlackAssessmentResult> {
   const workspaceLimit = clampNumber(options.workspaceLimit, DEFAULT_WORKSPACE_LIMIT, 1, 500);
+  const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20_000);
   const maxWorkspaceAdmins = clampNumber(options.maxWorkspaceAdmins, 5, 1, 100);
   const maxSessionHours = clampNumber(options.maxSessionHours, 24, 1, 720);
-  const maxIdleMinutes = clampNumber(options.maxIdleMinutes, 30, 1, 1440);
-  const workspaces = await listWorkspaces(client, workspaceLimit);
-  const workspaceSettings: Array<{ id: string; name: string; settings: JsonRecord }> = [];
-  const adminCounts: Array<{ id: string; name: string; count: number }> = [];
+  const sessionSample = clampNumber(options.sessionSample, DEFAULT_SESSION_SAMPLE, 1, 500);
+  const errors: string[] = [];
 
+  const teamsResult = await readWebList(client, "admin.teams.list", ["teams"], {}, { limit: workspaceLimit });
+  if (!teamsResult.ok) errors.push(`admin.teams.list: ${teamsResult.error}`);
+  const workspaces = (teamsResult.ok ? teamsResult.value : []).map(toWorkspaceRecord).filter((item): item is WorkspaceRecord => Boolean(item));
+  const workspacesComplete = teamsResult.ok && teamsResult.complete;
+  const workspaceView = teamsResult.ok ? partialNote(workspaces.length, teamsResult.complete) : "unreadable";
+
+  const adminInventory: Array<{ id: string; name: string; admin_ids: string[]; complete: boolean }> = [];
+  const adminErrors: string[] = [];
+  const emailDomains: Array<{ id: string; name: string; email_domain: string }> = [];
+  const settingsErrors: string[] = [];
   for (const workspace of workspaces) {
-    const id = asString(workspace.id) ?? asString(workspace.team_id);
-    if (!id) continue;
-    const name = asString(workspace.name) ?? id;
-    const settings = await client.web("admin.teams.settings.info", { team_id: id }).catch(() => undefined);
-    if (settings) {
-      workspaceSettings.push({ id, name, settings: extractNestedObject(settings, ["team", "settings"]) ?? settings });
+    const admins = await readWebList(client, "admin.teams.admins.list", ["admin_ids"], { team_id: workspace.id }, { limit: 5000 });
+    if (admins.ok) {
+      const ids = admins.value.map((item) => asString(item.id)).filter((id): id is string => Boolean(id));
+      adminInventory.push({ id: workspace.id, name: workspace.name, admin_ids: ids, complete: admins.complete });
+    } else {
+      adminErrors.push(`${workspace.id}: ${unreadableReason(admins)}`);
     }
-    const admins = await client.web("admin.teams.admins.list", { team_id: id }).catch(() => undefined);
-    adminCounts.push({ id, name, count: extractCount(admins, ["admins", "users"]) });
+    const settings = await readWeb(client, "admin.teams.settings.info", { team_id: workspace.id });
+    if (settings.ok) {
+      const team = asObject(settings.value.team);
+      const emailDomain = typeof team?.email_domain === "string" ? team.email_domain.trim() : undefined;
+      if (emailDomain !== undefined) emailDomains.push({ id: workspace.id, name: workspace.name, email_domain: emailDomain });
+      else settingsErrors.push(`${workspace.id}: team.email_domain absent from admin.teams.settings.info response`);
+    } else {
+      settingsErrors.push(`${workspace.id}: ${unreadableReason(settings)}`);
+    }
   }
+  errors.push(...adminErrors.map((item) => `admin.teams.admins.list ${item}`), ...settingsErrors.map((item) => `admin.teams.settings.info ${item}`));
 
-  const excessiveAdmins = adminCounts.filter((item) => item.count > maxWorkspaceAdmins);
-  const ssoSignals = workspaceSettings
-    .map((item) => ({ ...item, required: extractBoolSetting(item.settings, [
-      "sso_required",
-      "require_sso",
-      "requires_sso",
-      "enterprise_login_required",
-      "saml_required",
-      "saml_enabled",
-    ]) }))
-    .filter((item) => item.required !== undefined);
-  const missingSso = ssoSignals.filter((item) => item.required === false);
+  const orgUsers = await readWebList(client, "admin.users.list", ["users"], {}, { limit: userLimit });
+  if (!orgUsers.ok) errors.push(`admin.users.list: ${orgUsers.error}`);
+  const activeOrgUsers = (orgUsers.ok ? orgUsers.value : []).filter((user) => user.is_active !== false && user.is_bot !== true);
+  const orgUsersComplete = orgUsers.ok && orgUsers.complete;
+  const orgUsersView = orgUsers.ok ? partialNote(activeOrgUsers.length, orgUsers.complete) : "unreadable";
+  const ssoKnown = activeOrgUsers.filter((user) => typeof user.has_sso === "boolean");
+  const withoutSso = activeOrgUsers.filter((user) => user.has_sso === false);
+  const ssoUnknown = activeOrgUsers.length - ssoKnown.length;
+  const adminUserIds = new Set([
+    ...activeOrgUsers.filter(isAdminOrOwner).map((user) => asString(user.id)).filter((id): id is string => Boolean(id)),
+    ...adminInventory.flatMap((item) => item.admin_ids),
+  ]);
 
-  const sessionSignals = workspaceSettings.map((item) => {
-    const sessionMinutes = extractNumericSetting(item.settings, [
-      "session_duration_minutes",
-      "session_timeout_minutes",
-      "session_duration",
-      "max_session_duration_minutes",
-    ]);
-    const sessionHours = extractNumericSetting(item.settings, [
-      "session_duration_hours",
-      "session_timeout_hours",
-      "max_session_duration_hours",
-    ]);
-    const idleMinutes = extractNumericSetting(item.settings, [
-      "idle_timeout_minutes",
-      "session_idle_timeout_minutes",
-      "idle_session_timeout_minutes",
-    ]);
-    return {
-      ...item,
-      session_hours: sessionHours ?? (sessionMinutes === undefined ? undefined : sessionMinutes / 60),
-      idle_minutes: idleMinutes,
-    };
-  });
-  const sessionKnown = sessionSignals.filter((item) => item.session_hours !== undefined);
-  const idleKnown = sessionSignals.filter((item) => item.idle_minutes !== undefined);
-  const overlongSessions = sessionKnown.filter((item) => (item.session_hours ?? 0) > maxSessionHours);
-  const overlongIdle = idleKnown.filter((item) => (item.idle_minutes ?? 0) > maxIdleMinutes);
-  const openDiscoverability = workspaceSettings.filter((item) => {
-    const discoverability = extractDiscoverability(item.settings);
-    return discoverability === "open" || discoverability === "all" || discoverability === "public";
-  });
+  const sessionUserIds = activeOrgUsers.map((user) => asString(user.id)).filter((id): id is string => Boolean(id)).slice(0, sessionSample);
+  const sessionSettings: JsonRecord[] = [];
+  const noSettingsApplied: string[] = [];
+  let sessionError: { error: string; code?: string } | undefined;
+  for (let index = 0; index < sessionUserIds.length; index += 100) {
+    const batch = sessionUserIds.slice(index, index + 100);
+    const result = await readWeb(client, "admin.users.session.getSettings", { user_ids: batch });
+    if (!result.ok) {
+      sessionError = { error: result.error, code: result.code };
+      errors.push(`admin.users.session.getSettings: ${result.error}`);
+      break;
+    }
+    sessionSettings.push(...asObjectArray(result.value.session_settings));
+    noSettingsApplied.push(...asStringArray(result.value.no_settings_applied));
+  }
+  const durations = sessionSettings
+    .map((item) => ({ user_id: asString(item.user_id), duration_hours: (asNumber(item.duration) ?? Number.NaN) / 3600, desktop_app_browser_quit: item.desktop_app_browser_quit }))
+    .filter((item) => Number.isFinite(item.duration_hours));
+  const overlongSessions = durations.filter((item) => item.duration_hours > maxSessionHours);
+  const browserQuitKnown = sessionSettings.filter((item) => typeof item.desktop_app_browser_quit === "boolean");
 
-  const findings = [
-    finding(
-      "SLACK-ADMIN-01",
-      "Workspace admin inventory",
-      "high",
-      adminCounts.length === 0 ? "warn" : excessiveAdmins.length > 0 ? "fail" : "pass",
-      adminCounts.length === 0
-        ? "Workspace admin assignments were not readable."
-        : excessiveAdmins.length > 0
-          ? `${excessiveAdmins.length} workspaces exceed ${maxWorkspaceAdmins} admins.`
-          : `No sampled workspace exceeded ${maxWorkspaceAdmins} admins.`,
-      ["FedRAMP AC-6(5)", "CMMC 3.1.5", "SOC 2 CC6.3", "CIS 16.8"],
-      { admin_counts: adminCounts, max_workspace_admins: maxWorkspaceAdmins },
-    ),
-    finding(
-      "SLACK-ADMIN-02",
-      "SSO enforcement",
-      "critical",
-      ssoSignals.length === 0 ? "warn" : missingSso.length > 0 ? "fail" : "pass",
-      ssoSignals.length === 0
-        ? "Workspace settings did not expose a recognizable SSO enforcement signal."
-        : missingSso.length > 0
-          ? `${missingSso.length}/${ssoSignals.length} workspaces do not show SSO enforcement.`
-          : "Sampled workspaces show SSO enforcement.",
-      ["FedRAMP IA-2(1)", "CMMC 3.5.3", "SOC 2 CC6.1", "CIS 16.2"],
-      { signals: ssoSignals.map((item) => ({ id: item.id, name: item.name, required: item.required })) },
-    ),
-    finding(
-      "SLACK-ADMIN-03",
-      "Session duration limits",
-      "high",
-      sessionKnown.length === 0 ? "warn" : overlongSessions.length > 0 ? "fail" : "pass",
-      sessionKnown.length === 0
-        ? "Workspace settings did not expose a recognizable session-duration signal."
-        : overlongSessions.length > 0
-          ? `${overlongSessions.length}/${sessionKnown.length} workspaces exceed ${maxSessionHours} session hours.`
-          : `Sampled workspaces are at or below ${maxSessionHours} session hours.`,
-      ["FedRAMP AC-12", "CMMC 3.1.10", "SOC 2 CC6.1", "CIS 16.4"],
-      { session_signals: sessionKnown.map((item) => ({ id: item.id, name: item.name, session_hours: item.session_hours })) },
-    ),
-    finding(
+  const emojiResult = await readWebList(client, "admin.emoji.list", [], {}, { limit: 1 });
+  const emojiEntries: Array<{ name: string; uploaded_by?: string; date_created?: string }> = [];
+  let emojiComplete = false;
+  if (emojiResult.ok) {
+    try {
+      let cursor: string | undefined;
+      let pages = 0;
+      do {
+        const page = await client.web("admin.emoji.list", { limit: 1000, cursor });
+        pages += 1;
+        const emoji = asObject(page.emoji) ?? {};
+        for (const [name, value] of Object.entries(emoji)) {
+          const record = asObject(value);
+          emojiEntries.push({ name, uploaded_by: asString(record?.uploaded_by), date_created: extractTimestamp(record?.date_created) });
+        }
+        cursor = asString(asObject(page.response_metadata)?.next_cursor);
+      } while (cursor && pages < MAX_PAGES_PER_LIST);
+      emojiComplete = !cursor;
+    } catch (error) {
+      errors.push(`admin.emoji.list: ${surfaceError(error)}`);
+    }
+  } else {
+    errors.push(`admin.emoji.list: ${emojiResult.error}`);
+  }
+  const nonAdminUploads = emojiEntries.filter((item) => !item.uploaded_by || !adminUserIds.has(item.uploaded_by));
+
+  const analyticsProbe = await readWeb(client, "admin.analytics.getFile", { type: "public_channel", metadata_only: true });
+
+  const excessiveAdmins = adminInventory.filter((item) => item.admin_ids.length > maxWorkspaceAdmins);
+  const adminsComplete = workspacesComplete && adminErrors.length === 0 && adminInventory.every((item) => item.complete);
+  const openWorkspaces = workspaces.filter((item) => item.discoverability === "open");
+  const unknownDiscoverability = workspaces.filter((item) => !item.discoverability);
+  const unrestrictedDomains = emailDomains.filter((item) => item.email_domain.length === 0);
+
+  const findings: SlackFinding[] = [];
+
+  findings.push(
+    !teamsResult.ok
+      ? manualFinding("SLACK-ADMIN-01", "Workspace admin inventory", 14, "high", `admin.teams.list is not readable: ${unreadableReason(teamsResult)}.`, "export the admin and owner roster for every workspace from the org dashboard.")
+      : adminInventory.length === 0
+        ? manualFinding("SLACK-ADMIN-01", "Workspace admin inventory", 14, "high", workspaces.length === 0 ? `admin.teams.list returned no workspaces (${workspaceView}).` : `admin.teams.admins.list is not readable for any workspace: ${adminErrors[0] ?? "unknown"}.`, "export the admin and owner roster for every workspace from the org dashboard.")
+        : finding(
+          "SLACK-ADMIN-01",
+          "Workspace admin inventory",
+          14,
+          "high",
+          excessiveAdmins.length > 0 ? "fail" : adminsComplete ? "pass" : "warn",
+          excessiveAdmins.length > 0
+            ? `${excessiveAdmins.length}/${adminInventory.length} workspaces exceed ${maxWorkspaceAdmins} admins (admin_ids).`
+            : adminsComplete
+              ? `No workspace exceeds ${maxWorkspaceAdmins} admins across ${adminInventory.length} workspaces (${workspaceView}).`
+              : `No seen workspace exceeds ${maxWorkspaceAdmins} admins, but the view is partial (workspaces: ${workspaceView}; unreadable admin lists: ${adminErrors.length}).`,
+          { admin_counts: adminInventory.map((item) => ({ id: item.id, name: item.name, count: item.admin_ids.length })), max_workspace_admins: maxWorkspaceAdmins, unreadable_workspaces: adminErrors },
+        ),
+  );
+
+  findings.push(
+    !orgUsers.ok
+      ? manualFinding("SLACK-ADMIN-02", "SSO enforcement", 1, "critical", `admin.users.list is not readable: ${unreadableReason(orgUsers)}.`, "confirm the org authentication policy requires SAML SSO and export member SSO status.")
+      : finding(
+        "SLACK-ADMIN-02",
+        "SSO enforcement",
+        1,
+        "critical",
+        activeOrgUsers.length === 0
+          ? "warn"
+          : withoutSso.length > 0
+            ? "fail"
+            : ssoUnknown > 0 || !orgUsersComplete
+              ? "warn"
+              : "pass",
+        activeOrgUsers.length === 0
+          ? `admin.users.list returned no active users (${orgUsersView}); an empty inventory is not treated as compliant.`
+          : withoutSso.length > 0
+            ? `${withoutSso.length}/${activeOrgUsers.length} active users have has_sso=false; SAML SSO is not enforced for them (${orgUsersView}).`
+            : ssoUnknown > 0
+              ? `${ssoUnknown}/${activeOrgUsers.length} active users did not expose has_sso and are reported separately (${orgUsersView}).`
+              : !orgUsersComplete
+                ? `Every seen active user has has_sso=true but the inventory is partial (${orgUsersView}).`
+                : `All ${activeOrgUsers.length} active users have has_sso=true (${orgUsersView}). The org-level SSO requirement toggle is not exposed by admin.teams.settings.info; confirm it in the admin dashboard when a policy artifact is required.`,
+        { active_users: activeOrgUsers.length, users_without_sso: withoutSso.slice(0, 20).map(userLabel), unknown_sso_users: ssoUnknown, inventory_complete: orgUsersComplete },
+      ),
+  );
+
+  findings.push(
+    sessionError
+      ? manualFinding("SLACK-ADMIN-03", "Session duration limits", 3, "high", `admin.users.session.getSettings is not readable: ${unreadableReason(sessionError)}.`, "capture the org session duration setting from the admin dashboard.")
+      : !orgUsers.ok || sessionUserIds.length === 0
+        ? manualFinding("SLACK-ADMIN-03", "Session duration limits", 3, "high", `No active users were available to sample session settings (admin.users.list: ${orgUsers.ok ? orgUsersView : unreadableReason(orgUsers)}).`, "capture the org session duration setting from the admin dashboard.")
+        : durations.length === 0
+          ? manualFinding("SLACK-ADMIN-03", "Session duration limits", 3, "high", `All ${sessionUserIds.length} sampled users are in no_settings_applied; the org default session duration is not exposed by the API.`, "capture the org session duration setting from the admin dashboard.", { sampled_users: sessionUserIds.length, no_settings_applied: noSettingsApplied.length })
+          : finding(
+            "SLACK-ADMIN-03",
+            "Session duration limits",
+            3,
+            "high",
+            overlongSessions.length > 0 ? "fail" : noSettingsApplied.length > 0 || sessionUserIds.length < activeOrgUsers.length ? "warn" : "pass",
+            overlongSessions.length > 0
+              ? `${overlongSessions.length}/${durations.length} sampled users have a session duration above ${maxSessionHours} hours.`
+              : noSettingsApplied.length > 0
+                ? `All ${durations.length} users with settings are at or below ${maxSessionHours} hours, but ${noSettingsApplied.length} sampled users inherit an org default that the API does not expose.`
+                : sessionUserIds.length < activeOrgUsers.length
+                  ? `All ${durations.length} sampled users are at or below ${maxSessionHours} hours, but only ${sessionUserIds.length}/${activeOrgUsers.length} active users were sampled.`
+                  : `All ${durations.length} active users have a session duration at or below ${maxSessionHours} hours.`,
+            { sampled_users: sessionUserIds.length, sessions_with_settings: durations.length, no_settings_applied: noSettingsApplied.length, overlong: overlongSessions.slice(0, 20), max_session_hours: maxSessionHours },
+          ),
+  );
+
+  findings.push(
+    manualFinding(
       "SLACK-ADMIN-04",
-      "Idle timeout",
+      "Session idle timeout",
+      4,
       "medium",
-      idleKnown.length === 0 ? "warn" : overlongIdle.length > 0 ? "fail" : "pass",
-      idleKnown.length === 0
-        ? "Workspace settings did not expose a recognizable idle-timeout signal."
-        : overlongIdle.length > 0
-          ? `${overlongIdle.length}/${idleKnown.length} workspaces exceed ${maxIdleMinutes} idle minutes.`
-          : `Sampled workspaces are at or below ${maxIdleMinutes} idle minutes.`,
-      ["FedRAMP AC-11", "CMMC 3.1.11", "SOC 2 CC6.1", "CIS 16.5"],
-      { idle_signals: idleKnown.map((item) => ({ id: item.id, name: item.name, idle_minutes: item.idle_minutes })) },
+      `Slack exposes no idle-timeout setting: admin.users.session.getSettings and setSettings document only duration and desktop_app_browser_quit (${SLACK_DOC_PAGES.sessionSetSettings}).`,
+      "record the idle-timeout compensating control (IdP session policy or device lock) in the control narrative.",
+      { citation: SLACK_DOC_PAGES.sessionSetSettings },
     ),
-    finding(
-      "SLACK-ADMIN-05",
-      "Workspace discoverability",
+  );
+
+  findings.push(
+    !teamsResult.ok
+      ? manualFinding("SLACK-ADMIN-05", "Workspace discoverability", 17, "medium", `admin.teams.list is not readable: ${unreadableReason(teamsResult)}.`, "capture each workspace's discoverability setting from the org dashboard.")
+      : workspaces.length === 0
+        ? manualFinding("SLACK-ADMIN-05", "Workspace discoverability", 17, "medium", `admin.teams.list returned no workspaces (${workspaceView}).`, "capture each workspace's discoverability setting from the org dashboard.")
+        : finding(
+          "SLACK-ADMIN-05",
+          "Workspace discoverability",
+          17,
+          "medium",
+          openWorkspaces.length > 0 ? "fail" : unknownDiscoverability.length > 0 || !workspacesComplete ? "warn" : "pass",
+          openWorkspaces.length > 0
+            ? `${openWorkspaces.length}/${workspaces.length} workspaces have discoverability=open (${workspaceView}).`
+            : unknownDiscoverability.length > 0
+              ? `${unknownDiscoverability.length}/${workspaces.length} workspaces did not expose discoverability and are reported separately (${workspaceView}).`
+              : !workspacesComplete
+                ? `No seen workspace is open, but the inventory is partial (${workspaceView}).`
+                : `No workspace has discoverability=open across ${workspaces.length} workspaces (${workspaceView}).`,
+          { workspaces: workspaces.map((item) => ({ id: item.id, name: item.name, discoverability: item.discoverability ?? null })) },
+        ),
+  );
+
+  findings.push(
+    manualFinding(
+      "SLACK-ADMIN-06",
+      "Mobile session controls",
+      5,
       "medium",
-      openDiscoverability.length > 0 ? "warn" : "pass",
-      openDiscoverability.length > 0
-        ? `${openDiscoverability.length} workspaces appear broadly discoverable.`
-        : "No sampled workspace exposed an open discoverability setting.",
-      ["FedRAMP AC-3", "CMMC 3.1.1", "SOC 2 CC6.1", "ISMAP CPS.AC-3"],
-      { open_workspaces: openDiscoverability.map((item) => ({ id: item.id, name: item.name })) },
+      `Mobile-specific session and jailbreak controls are not exposed by the API; admin.users.session.getSettings documents only duration and desktop_app_browser_quit (${SLACK_DOC_PAGES.sessionSetSettings}).`,
+      "capture the mobile session duration and Slack for EMM settings from the admin dashboard.",
+      { citation: SLACK_DOC_PAGES.sessionSetSettings, sampled_sessions: sessionSettings.length, desktop_app_browser_quit_enabled: browserQuitKnown.filter((item) => item.desktop_app_browser_quit === true).length },
     ),
-  ];
+  );
+
+  findings.push(
+    !teamsResult.ok
+      ? manualFinding("SLACK-ADMIN-07", "Email domain restrictions", 16, "high", `admin.teams.list is not readable: ${unreadableReason(teamsResult)}.`, "capture the allowed signup email domains for each workspace.")
+      : emailDomains.length === 0
+        ? manualFinding("SLACK-ADMIN-07", "Email domain restrictions", 16, "high", workspaces.length === 0 ? `admin.teams.list returned no workspaces (${workspaceView}).` : `admin.teams.settings.info did not return team.email_domain for any workspace: ${settingsErrors[0] ?? "unknown"}.`, "capture the allowed signup email domains for each workspace.")
+        : finding(
+          "SLACK-ADMIN-07",
+          "Email domain restrictions",
+          16,
+          "high",
+          unrestrictedDomains.length > 0 ? "fail" : settingsErrors.length > 0 || !workspacesComplete ? "warn" : "pass",
+          unrestrictedDomains.length > 0
+            ? `${unrestrictedDomains.length}/${emailDomains.length} workspaces have an empty team.email_domain, so signup is not restricted to approved domains.`
+            : settingsErrors.length > 0 || !workspacesComplete
+              ? `Every readable workspace restricts signup by email domain, but ${settingsErrors.length} workspaces were unreadable and the workspace view is ${workspacesComplete ? "complete" : "partial"}.`
+              : `All ${emailDomains.length} workspaces restrict signup to approved email domains (team.email_domain populated).`,
+          { email_domains: emailDomains, unreadable_workspaces: settingsErrors },
+        ),
+  );
+
+  findings.push(
+    !emojiResult.ok
+      ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `admin.emoji.list is not readable: ${unreadableReason(emojiResult)}.`, "capture the custom emoji upload permission from the workspace settings.")
+      : emojiEntries.length === 0
+        ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", `admin.emoji.list returned no custom emoji; the upload permission setting is not exposed by the API (${SLACK_DOC_PAGES.emojiList}).`, "capture the custom emoji upload permission from the workspace settings.", { citation: SLACK_DOC_PAGES.emojiList })
+        : adminUserIds.size === 0
+          ? manualFinding("SLACK-ADMIN-08", "Custom emoji governance", 19, "low", "No admin or owner identities were readable, so emoji uploaders could not be compared with the admin roster.", "compare the emoji uploader list with the admin roster.", { emoji_count: emojiEntries.length })
+          : finding(
+            "SLACK-ADMIN-08",
+            "Custom emoji governance",
+            19,
+            "low",
+            nonAdminUploads.length > 0 ? "fail" : emojiComplete && orgUsersComplete ? "pass" : "warn",
+            nonAdminUploads.length > 0
+              ? `${nonAdminUploads.length}/${emojiEntries.length} custom emoji were uploaded by non-admin users; uploads are not restricted to admins.`
+              : emojiComplete && orgUsersComplete
+                ? `All ${emojiEntries.length} custom emoji were uploaded by admins or owners (complete inventory).`
+                : `All seen custom emoji were uploaded by admins, but the emoji or user inventory is partial.`,
+            { emoji_count: emojiEntries.length, non_admin_uploads: nonAdminUploads.slice(0, 20).map((item) => item.name), inventory_complete: emojiComplete },
+          ),
+  );
+
+  findings.push(
+    manualFinding(
+      "SLACK-ADMIN-09",
+      "Workspace analytics access",
+      24,
+      "low",
+      analyticsProbe.ok
+        ? `This token can export analytics (admin.analytics.getFile metadata probe succeeded); the API does not list which admins hold analytics access (${SLACK_DOC_PAGES.analyticsGetFile}).`
+        : `admin.analytics.getFile metadata probe failed: ${unreadableReason(analyticsProbe)}; the API does not list which admins hold analytics access (${SLACK_DOC_PAGES.analyticsGetFile}).`,
+      "review the analytics dashboard access roles in the admin dashboard.",
+      { citation: SLACK_DOC_PAGES.analyticsGetFile, analytics_export_readable: analyticsProbe.ok },
+    ),
+  );
 
   return {
     title: "Slack admin access posture",
     summary: {
-      workspaces: workspaces.length,
-      workspace_settings_readable: workspaceSettings.length,
-      admin_surfaces_readable: adminCounts.length,
-      excessive_admin_workspaces: excessiveAdmins.length,
+      workspaces_seen: workspaces.length,
+      workspaces_complete: workspacesComplete,
+      admin_lists_readable: adminInventory.length,
+      active_org_users: activeOrgUsers.length,
+      users_without_sso: withoutSso.length,
+      sessions_sampled: sessionSettings.length,
+      custom_emoji: emojiEntries.length,
+      analytics_export_readable: analyticsProbe.ok,
     },
     findings,
+    errors,
   };
 }
 
-function isCustomOrUnreviewedApp(app: JsonRecord): boolean {
-  const type = asString(app.app_type) ?? asString(app.type);
-  return app.is_custom === true
-    || app.is_workflow_app === true
-    || type === "custom"
-    || app.is_app_directory_approved === false;
+interface AppRecord {
+  id?: string;
+  name: string;
+  is_internal?: boolean;
+  is_app_directory_approved?: boolean;
+  developer_type?: string;
+  sensitive_scopes: string[];
+}
+
+function toAppRecord(entry: JsonRecord): AppRecord {
+  const app = asObject(entry.app) ?? {};
+  const scopes = asObjectArray(entry.scopes);
+  return {
+    id: asString(app.id),
+    name: asString(app.name) ?? asString(app.id) ?? "unknown",
+    is_internal: asBoolean(app.is_internal),
+    is_app_directory_approved: asBoolean(app.is_app_directory_approved),
+    developer_type: asString(app.developer_type),
+    sensitive_scopes: scopes.filter((scope) => scope.is_sensitive === true).map((scope) => asString(scope.name) ?? "unknown"),
+  };
 }
 
 export async function assessSlackIntegrations(
-  client: Pick<SlackApiClient, "paginateWeb" | "web" | "getOrgQuery">,
+  client: SlackApiClient,
   options: { appLimit?: number } = {},
 ): Promise<SlackAssessmentResult> {
   const appLimit = clampNumber(options.appLimit, DEFAULT_APP_LIMIT, 1, 5000);
   const orgQuery = client.getOrgQuery();
-  const approvedResult = await client.paginateWeb("admin.apps.approved.list", ["apps"], orgQuery, { limit: appLimit })
-    .then((items) => ({ readable: true, items, error: undefined as string | undefined }))
-    .catch((error) => ({ readable: false, items: [] as JsonRecord[], error: surfaceError(error) }));
-  const restrictedResult = await client.paginateWeb("admin.apps.restricted.list", ["apps"], orgQuery, { limit: appLimit })
-    .then((items) => ({ readable: true, items, error: undefined as string | undefined }))
-    .catch((error) => ({ readable: false, items: [] as JsonRecord[], error: surfaceError(error) }));
-  const barriersResult = await client.paginateWeb("admin.barriers.list", ["barriers"], orgQuery, { limit: 200 })
-    .then((items) => ({ readable: true, items, error: undefined as string | undefined }))
-    .catch((error) => ({ readable: false, items: [] as JsonRecord[], error: surfaceError(error) }));
-  const discoveryResult = await client.web("discovery.enterprise.info", orgQuery)
-    .then((value) => ({ readable: true, value, error: undefined as string | undefined }))
-    .catch((error) => ({ readable: false, error: surfaceError(error) }));
+  const errors: string[] = [];
+  const approvedResult = await readWebList(client, "admin.apps.approved.list", ["approved_apps"], orgQuery, { limit: appLimit });
+  const restrictedResult = await readWebList(client, "admin.apps.restricted.list", ["restricted_apps"], orgQuery, { limit: appLimit });
+  const barriersResult = await readWebList(client, "admin.barriers.list", ["barriers"], {}, { limit: 1000 });
+  const discoveryResult = await readWeb(client, "discovery.enterprise.info");
+  const authResult = await readWeb(client, "auth.test");
+  for (const [label, result] of [["admin.apps.approved.list", approvedResult], ["admin.apps.restricted.list", restrictedResult], ["admin.barriers.list", barriersResult], ["discovery.enterprise.info", discoveryResult]] as const) {
+    if (!result.ok) errors.push(`${label}: ${result.error}`);
+  }
 
-  const approvedApps = approvedResult.items;
-  const restrictedApps = restrictedResult.items;
-  const customApps = approvedApps.filter(isCustomOrUnreviewedApp);
-  const broadScopeApps = approvedApps.filter((app) => {
-    const scopes = Array.isArray(app.scopes) ? app.scopes.map(String) : [];
-    return scopes.some((scope) => /admin|files:read|channels:history|groups:history|users:read\.email/i.test(scope));
-  });
+  const approvedApps = (approvedResult.ok ? approvedResult.value : []).map(toAppRecord);
+  const restrictedApps = (restrictedResult.ok ? restrictedResult.value : []).map(toAppRecord);
+  const approvedView = approvedResult.ok ? partialNote(approvedApps.length, approvedResult.complete) : "unreadable";
+  const customApps = approvedApps.filter((app) => app.is_internal === true || app.developer_type === "internal");
+  const unreviewedApps = approvedApps.filter((app) => app.is_app_directory_approved === false);
+  const sensitiveApps = approvedApps.filter((app) => app.sensitive_scopes.length > 0);
+  const flaggedApps = new Set([...customApps, ...unreviewedApps, ...sensitiveApps].map((app) => app.name));
 
-  const findings = [
-    finding(
-      "SLACK-APP-01",
-      "Approved app inventory",
-      "high",
-      approvedResult.readable ? "pass" : "fail",
-      approvedResult.readable
-        ? `${approvedApps.length} approved apps are visible for review.`
-        : `Approved app inventory is not readable: ${approvedResult.error}`,
-      ["FedRAMP CM-7", "CMMC 3.4.8", "SOC 2 CC6.8", "CIS 2.7"],
-      { approved_app_count: approvedApps.length },
-    ),
-    finding(
-      "SLACK-APP-02",
-      "Restricted app policy",
-      "medium",
-      !restrictedResult.readable ? "warn" : restrictedApps.length === 0 ? "warn" : "pass",
-      !restrictedResult.readable
-        ? `Restricted app inventory is not readable: ${restrictedResult.error}`
-        : restrictedApps.length === 0
-          ? "No restricted apps were visible; confirm admin approval policy is active."
-          : `${restrictedApps.length} restricted apps are visible.`,
-      ["FedRAMP CM-7", "SOC 2 CC6.8", "PCI-DSS 6.3.2"],
-      { restricted_app_count: restrictedApps.length },
-    ),
-    finding(
-      "SLACK-APP-03",
-      "Custom and broad-scope apps",
-      customApps.length > 0 || broadScopeApps.length > 0 ? "high" : "medium",
-      customApps.length > 0 || broadScopeApps.length > 0 ? "warn" : "pass",
-      customApps.length > 0 || broadScopeApps.length > 0
-        ? `${customApps.length} custom/unreviewed apps and ${broadScopeApps.length} broad-scope apps need review.`
-        : "No custom/unreviewed or broad-scope approved apps were detected in the sample.",
-      ["FedRAMP CM-7(4)", "CMMC 3.4.8", "SOC 2 CC6.8", "ISMAP CPS.CM-7"],
-      {
-        custom_apps: customApps.slice(0, 20).map((app) => app.name ?? app.id),
-        broad_scope_apps: broadScopeApps.slice(0, 20).map((app) => app.name ?? app.id),
-      },
-    ),
-    finding(
-      "SLACK-APP-04",
-      "Information barriers",
-      "high",
-      !barriersResult.readable ? "warn" : barriersResult.items.length === 0 ? "warn" : "pass",
-      !barriersResult.readable
-        ? `Information barriers are not readable: ${barriersResult.error}`
-        : barriersResult.items.length === 0
-          ? "No information barriers were visible."
-          : `${barriersResult.items.length} information barriers are configured.`,
-      ["FedRAMP AC-4", "CMMC 3.1.3", "SOC 2 CC6.6", "ISMAP CPS.AC-4"],
-      { barrier_count: barriersResult.items.length },
-    ),
-    finding(
+  const findings: SlackFinding[] = [];
+  findings.push(
+    !approvedResult.ok
+      ? manualFinding("SLACK-APP-01", "Approved app inventory", 9, "high", `admin.apps.approved.list is not readable: ${unreadableReason(approvedResult)}.`, "export the approved app list from the org app management dashboard.")
+      : finding(
+        "SLACK-APP-01",
+        "Approved app inventory",
+        9,
+        "high",
+        approvedApps.length === 0 ? "warn" : approvedResult.complete ? "pass" : "warn",
+        approvedApps.length === 0
+          ? "admin.apps.approved.list returned no approved apps; an empty inventory is not treated as compliant because it can also mean app approval is not enabled."
+          : approvedResult.complete
+            ? `${approvedApps.length} approved apps are visible for review (${approvedView}).`
+            : `Approved apps are readable but the inventory is partial (${approvedView}).`,
+        { approved_app_count: approvedApps.length, inventory_complete: approvedResult.complete },
+      ),
+    !restrictedResult.ok
+      ? manualFinding("SLACK-APP-02", "Restricted app policy", 9, "medium", `admin.apps.restricted.list is not readable: ${unreadableReason(restrictedResult)}.`, "confirm app approval is required and export the restricted app list.")
+      : finding(
+        "SLACK-APP-02",
+        "Restricted app policy",
+        9,
+        "medium",
+        restrictedApps.length === 0 ? "warn" : restrictedResult.complete ? "pass" : "warn",
+        restrictedApps.length === 0
+          ? "No restricted apps are visible; confirm the admin approval policy is active (emptiness is not treated as compliant)."
+          : `${restrictedApps.length} restricted apps are visible (${partialNote(restrictedApps.length, restrictedResult.complete)}).`,
+        { restricted_app_count: restrictedApps.length, inventory_complete: restrictedResult.complete },
+      ),
+    !approvedResult.ok
+      ? manualFinding("SLACK-APP-03", "Custom and sensitive-scope apps", 10, "high", `admin.apps.approved.list is not readable: ${unreadableReason(approvedResult)}.`, "review internal apps and sensitive scopes in the app management dashboard.")
+      : approvedApps.length === 0
+        ? finding("SLACK-APP-03", "Custom and sensitive-scope apps", 10, "medium", "warn", "No approved apps were returned, so no custom or sensitive-scope apps could be evaluated (empty inventory is not compliant by default).", { approved_app_count: 0 })
+        : finding(
+          "SLACK-APP-03",
+          "Custom and sensitive-scope apps",
+          10,
+          flaggedApps.size > 0 ? "high" : "medium",
+          flaggedApps.size > 0 ? "warn" : approvedResult.complete ? "pass" : "warn",
+          flaggedApps.size > 0
+            ? `${customApps.length} internal apps, ${unreviewedApps.length} apps not approved in the Slack Marketplace, and ${sensitiveApps.length} apps with is_sensitive scopes need review (${approvedView}).`
+            : approvedResult.complete
+              ? `No approved app is internal, unreviewed, or granted is_sensitive scopes across ${approvedApps.length} apps.`
+              : `No flagged app seen, but the inventory is partial (${approvedView}).`,
+          {
+            custom_apps: customApps.slice(0, 20).map((app) => app.name),
+            unreviewed_apps: unreviewedApps.slice(0, 20).map((app) => app.name),
+            sensitive_scope_apps: sensitiveApps.slice(0, 20).map((app) => ({ name: app.name, scopes: app.sensitive_scopes })),
+          },
+        ),
+    !barriersResult.ok
+      ? manualFinding("SLACK-APP-04", "Information barriers", 8, "high", `admin.barriers.list is not readable: ${unreadableReason(barriersResult)}.`, "export the information barrier configuration from the org dashboard.")
+      : finding(
+        "SLACK-APP-04",
+        "Information barriers",
+        8,
+        "high",
+        barriersResult.value.length === 0 ? "warn" : barriersResult.complete ? "pass" : "warn",
+        barriersResult.value.length === 0
+          ? "No information barriers are configured; confirm whether restricted groups require barriers (emptiness is not treated as compliant)."
+          : `${barriersResult.value.length} information barriers are configured (${partialNote(barriersResult.value.length, barriersResult.complete)}).`,
+        {
+          barrier_count: barriersResult.value.length,
+          barriers: barriersResult.value.slice(0, 20).map((barrier) => ({
+            id: barrier.id,
+            primary_usergroup: asObject(barrier.primary_usergroup)?.name,
+            restricted_subjects: asStringArray(barrier.restricted_subjects),
+          })),
+        },
+      ),
+    manualFinding(
       "SLACK-APP-05",
       "DLP and Discovery visibility",
+      11,
       "medium",
-      discoveryResult.readable ? "pass" : "warn",
-      discoveryResult.readable
-        ? "Discovery API enterprise information is readable for DLP/eDiscovery posture review."
-        : `Discovery API enterprise information is not readable: ${discoveryResult.error}`,
-      ["FedRAMP SC-7(8)", "CMMC 3.13.6", "SOC 2 CC6.7", "IRAP ISM-0261"],
-      { discovery_readable: discoveryResult.readable },
+      discoveryResult.ok
+        ? `discovery.enterprise.info is readable, so the Discovery API entitlement is active, but DLP scanning status is enforced by the connected DLP partner and is not exposed by the Discovery API (${SLACK_DOC_PAGES.discovery}).`
+        : `discovery.enterprise.info is not readable: ${unreadableReason(discoveryResult)} (Discovery API entitlement and an approved Discovery app are required; ${SLACK_DOC_PAGES.discovery}).`,
+      "collect the DLP partner policy export and the Discovery API entitlement confirmation.",
+      { citation: SLACK_DOC_PAGES.discovery, discovery_readable: discoveryResult.ok },
     ),
-  ];
+    manualFinding(
+      "SLACK-APP-06",
+      "File upload restrictions",
+      6,
+      "medium",
+      `admin.teams.settings.info documents no file upload or file type restriction fields (${SLACK_DOC_PAGES.teamSettingsInfo}), so upload restrictions cannot be read.`,
+      "capture the file upload and Slack Connect file sharing settings from the admin dashboard.",
+      { citation: SLACK_DOC_PAGES.teamSettingsInfo },
+    ),
+    manualFinding(
+      "SLACK-APP-07",
+      "Token rotation and revocation",
+      25,
+      "high",
+      `Token rotation is an app-level opt-in with no read method listing token age or legacy tokens (${SLACK_DOC_PAGES.tokenRotation}). ${authResult.ok ? `auth.test identity: user ${asString(authResult.value.user_id) ?? "unknown"} on team ${asString(authResult.value.team_id) ?? "unknown"}.` : `auth.test failed: ${authResult.error}.`} Configured token uses the ${client.describeToken().rotating_format ? "rotating (xoxe.) format" : "non-rotating format"}.`,
+      "review installed app tokens and legacy token revocation in the app management dashboard.",
+      { citation: SLACK_DOC_PAGES.tokenRotation, token: client.describeToken(), auth: authResult.ok ? { user_id: authResult.value.user_id, team_id: authResult.value.team_id, is_enterprise_install: authResult.value.is_enterprise_install } : null },
+    ),
+  );
 
   return {
     title: "Slack integrations posture",
     summary: {
       approved_apps: approvedApps.length,
+      approved_inventory_complete: approvedResult.ok ? approvedResult.complete : false,
       restricted_apps: restrictedApps.length,
-      custom_or_unreviewed_apps: customApps.length,
-      broad_scope_apps: broadScopeApps.length,
-      information_barriers: barriersResult.items.length,
-      discovery_readable: discoveryResult.readable,
+      custom_apps: customApps.length,
+      sensitive_scope_apps: sensitiveApps.length,
+      information_barriers: barriersResult.ok ? barriersResult.value.length : 0,
+      discovery_readable: discoveryResult.ok,
     },
     findings,
+    errors,
   };
 }
 
-function auditEntries(value: unknown): JsonRecord[] {
-  return extractArray(value, ["entries", "logs"]);
+interface ChannelRecord {
+  id: string;
+  name: string;
+  is_private?: boolean;
+  is_general?: boolean;
+  is_org_default?: boolean;
+  is_org_mandatory?: boolean;
+  is_ext_shared?: boolean;
+  connected_team_ids: string[];
+  pending_connected_team_ids: string[];
 }
 
-function auditSchemas(value: unknown): JsonRecord[] {
-  return extractArray(value, ["schemas"]);
+function toChannelRecord(conversation: JsonRecord): ChannelRecord | undefined {
+  const id = asString(conversation.id);
+  if (!id) return undefined;
+  return {
+    id,
+    name: asString(conversation.name) ?? id,
+    is_private: asBoolean(conversation.is_private),
+    is_general: asBoolean(conversation.is_general),
+    is_org_default: asBoolean(conversation.is_org_default),
+    is_org_mandatory: asBoolean(conversation.is_org_mandatory),
+    is_ext_shared: asBoolean(conversation.is_ext_shared),
+    connected_team_ids: asStringArray(conversation.connected_team_ids),
+    pending_connected_team_ids: asStringArray(conversation.pending_connected_team_ids),
+  };
 }
 
-function auditAction(entry: JsonRecord): string | undefined {
-  return asString(entry.action) ?? asString(entry.event_type) ?? asString(entry.type);
+function isAnnouncementChannel(channel: ChannelRecord): boolean {
+  return channel.is_general === true || channel.is_org_default === true || channel.is_org_mandatory === true;
+}
+
+function postingRestricted(prefs: JsonRecord): boolean | undefined {
+  const whoCanPost = asObject(prefs.who_can_post);
+  if (!whoCanPost) return undefined;
+  const types = asStringArray(whoCanPost.type).map((item) => item.toLowerCase());
+  const users = asStringArray(whoCanPost.user);
+  if (types.length === 0 && users.length === 0) return undefined;
+  return types.every((type) => type === "admin" || type === "owner") && (types.length > 0 || users.length > 0);
+}
+
+export async function assessSlackChannelGovernance(
+  client: SlackApiClient,
+  options: { channelLimit?: number; minRetentionDays?: number } = {},
+): Promise<SlackAssessmentResult> {
+  const channelLimit = clampNumber(options.channelLimit, DEFAULT_CHANNEL_LIMIT, 1, 400);
+  const minRetentionDays = clampNumber(options.minRetentionDays, DEFAULT_MIN_RETENTION_DAYS, 1, 36_500);
+  const errors: string[] = [];
+
+  const externalResult = await readWebList(client, "admin.conversations.search", ["conversations"], { search_channel_types: ["external_shared"] }, { limit: channelLimit });
+  const channelsResult = await readWebList(client, "admin.conversations.search", ["conversations"], { search_channel_types: ["exclude_archived"], sort: "member_count", sort_dir: "desc" }, { limit: channelLimit });
+  if (!externalResult.ok) errors.push(`admin.conversations.search external_shared: ${externalResult.error}`);
+  if (!channelsResult.ok) errors.push(`admin.conversations.search: ${channelsResult.error}`);
+
+  const externalChannels = (externalResult.ok ? externalResult.value : []).map(toChannelRecord).filter((item): item is ChannelRecord => Boolean(item));
+  const channels = (channelsResult.ok ? channelsResult.value : []).map(toChannelRecord).filter((item): item is ChannelRecord => Boolean(item));
+  const channelsView = channelsResult.ok ? partialNote(channels.length, channelsResult.complete, channelsResult.total) : "unreadable";
+
+  const prefsByChannel: Array<{ channel: ChannelRecord; restricted?: boolean }> = [];
+  const prefsErrors: string[] = [];
+  const retentionByChannel: Array<{ channel: ChannelRecord; is_policy_enabled?: boolean; duration_days?: number }> = [];
+  const retentionErrors: string[] = [];
+  for (const channel of channels) {
+    const prefs = await readWeb(client, "admin.conversations.getConversationPrefs", { channel_id: channel.id });
+    if (prefs.ok) {
+      prefsByChannel.push({ channel, restricted: postingRestricted(asObject(prefs.value.prefs) ?? {}) });
+    } else {
+      prefsErrors.push(`${channel.id}: ${unreadableReason(prefs)}`);
+    }
+    const retention = await readWeb(client, "admin.conversations.getCustomRetention", { channel_id: channel.id });
+    if (retention.ok) {
+      retentionByChannel.push({ channel, is_policy_enabled: asBoolean(retention.value.is_policy_enabled), duration_days: asNumber(retention.value.duration_days) });
+    } else {
+      retentionErrors.push(`${channel.id}: ${unreadableReason(retention)}`);
+    }
+  }
+  errors.push(...prefsErrors.map((item) => `admin.conversations.getConversationPrefs ${item}`), ...retentionErrors.map((item) => `admin.conversations.getCustomRetention ${item}`));
+
+  const announcementPrefs = prefsByChannel.filter((item) => isAnnouncementChannel(item.channel));
+  const unrestrictedAnnouncements = announcementPrefs.filter((item) => item.restricted === false);
+  const unknownAnnouncements = announcementPrefs.filter((item) => item.restricted === undefined);
+  const restrictedChannels = prefsByChannel.filter((item) => item.restricted === true);
+  const shortRetention = retentionByChannel.filter((item) => item.is_policy_enabled === true && item.duration_days !== undefined && item.duration_days < minRetentionDays);
+  const inheritingDefault = retentionByChannel.filter((item) => item.is_policy_enabled !== true);
+  const channelsComplete = channelsResult.ok && channelsResult.complete;
+
+  const findings: SlackFinding[] = [];
+  findings.push(
+    !externalResult.ok
+      ? manualFinding("SLACK-CHAN-01", "Slack Connect exposure", 7, "high", `admin.conversations.search (external_shared) is not readable: ${unreadableReason(externalResult)}.`, "export the Slack Connect channel list and the org Slack Connect permission settings.")
+      : finding(
+        "SLACK-CHAN-01",
+        "Slack Connect exposure",
+        7,
+        "high",
+        externalChannels.length > 0 ? "warn" : externalResult.complete ? "pass" : "warn",
+        externalChannels.length > 0
+          ? `${externalChannels.length} externally shared channels (is_ext_shared) connect to ${new Set(externalChannels.flatMap((item) => item.connected_team_ids)).size} external teams, with ${externalChannels.filter((item) => item.pending_connected_team_ids.length > 0).length} pending invitations (${partialNote(externalChannels.length, externalResult.complete, externalResult.total)}). Review against the Slack Connect policy; the org-level Connect permission toggle is not exposed by the API.`
+          : externalResult.complete
+            ? "No externally shared channels exist in the complete search (search_channel_types=external_shared); emptiness is compliant by intent for this control."
+            : `No externally shared channel seen, but the search is partial (${partialNote(externalChannels.length, externalResult.complete, externalResult.total)}).`,
+        { external_channels: externalChannels.slice(0, 20).map((item) => ({ id: item.id, name: item.name, connected_team_ids: item.connected_team_ids, pending_connected_team_ids: item.pending_connected_team_ids })), inventory_complete: externalResult.complete },
+      ),
+    !channelsResult.ok
+      ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", `admin.conversations.search is not readable: ${unreadableReason(channelsResult)}.`, "capture posting permissions for #general and org default channels.")
+      : channels.length === 0
+        ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", `admin.conversations.search returned no active channels (${channelsView}).`, "capture posting permissions for #general and org default channels.")
+        : announcementPrefs.length === 0
+          ? manualFinding("SLACK-CHAN-02", "Channel posting restrictions", 18, "medium", prefsErrors.length > 0 && prefsByChannel.length === 0 ? `admin.conversations.getConversationPrefs is not readable: ${prefsErrors[0]}.` : `No general, org default, or org mandatory channel was in the ${channels.length} sampled channels (${channelsView}).`, "capture posting permissions for #general and org default channels.", { restricted_channels_seen: restrictedChannels.length })
+          : finding(
+            "SLACK-CHAN-02",
+            "Channel posting restrictions",
+            18,
+            "medium",
+            unrestrictedAnnouncements.length > 0 ? "fail" : unknownAnnouncements.length > 0 || prefsErrors.length > 0 ? "warn" : "pass",
+            unrestrictedAnnouncements.length > 0
+              ? `${unrestrictedAnnouncements.length}/${announcementPrefs.length} general or org default channels allow anyone to post (prefs.who_can_post).`
+              : unknownAnnouncements.length > 0 || prefsErrors.length > 0
+                ? `Restricted posting is set on every readable general or org default channel, but ${unknownAnnouncements.length} lacked a who_can_post value and ${prefsErrors.length} channels were unreadable.`
+                : `All ${announcementPrefs.length} general or org default channels restrict posting to admins or owners; ${restrictedChannels.length}/${prefsByChannel.length} sampled channels restrict posting overall (${channelsView}).`,
+            {
+              announcement_channels: announcementPrefs.map((item) => ({ id: item.channel.id, name: item.channel.name, restricted: item.restricted ?? null })),
+              restricted_channels: restrictedChannels.slice(0, 20).map((item) => item.channel.name),
+              unreadable_channels: prefsErrors.length,
+            },
+          ),
+    !channelsResult.ok
+      ? manualFinding("SLACK-CHAN-03", "Channel retention overrides", 12, "medium", `admin.conversations.search is not readable: ${unreadableReason(channelsResult)}.`, "capture the workspace retention defaults and channel overrides from the admin dashboard.")
+      : retentionByChannel.length === 0
+        ? manualFinding("SLACK-CHAN-03", "Channel retention overrides", 12, "medium", channels.length === 0 ? `admin.conversations.search returned no active channels (${channelsView}).` : `admin.conversations.getCustomRetention is not readable: ${retentionErrors[0] ?? "unknown"}.`, "capture the workspace retention defaults and channel overrides from the admin dashboard.")
+        : finding(
+          "SLACK-CHAN-03",
+          "Channel retention overrides",
+          12,
+          "medium",
+          shortRetention.length > 0 ? "fail" : retentionErrors.length > 0 || !channelsComplete ? "warn" : "pass",
+          shortRetention.length > 0
+            ? `${shortRetention.length}/${retentionByChannel.length} sampled channels override retention below ${minRetentionDays} days (is_policy_enabled with duration_days).`
+            : retentionErrors.length > 0 || !channelsComplete
+              ? `No sampled channel overrides retention below ${minRetentionDays} days, but ${retentionErrors.length} channels were unreadable and the channel view is ${channelsComplete ? "complete" : "partial"} (${channelsView}).`
+              : `No channel overrides retention below ${minRetentionDays} days across ${retentionByChannel.length} channels; ${inheritingDefault.length} inherit the workspace default, which the API does not expose and must be confirmed in the admin dashboard.`,
+          {
+            min_retention_days: minRetentionDays,
+            short_retention_channels: shortRetention.slice(0, 20).map((item) => ({ id: item.channel.id, name: item.channel.name, duration_days: item.duration_days })),
+            inheriting_default: inheritingDefault.length,
+            unreadable_channels: retentionErrors.length,
+          },
+        ),
+    manualFinding(
+      "SLACK-CHAN-04",
+      "External email ingestion",
+      20,
+      "medium",
+      `The admin.conversations.search response documents no channel email address field and no admin method exposes the email-to-channel setting (${SLACK_DOC_PAGES.conversationsSearch}).`,
+      "capture the 'Send emails to channels' permission from the workspace settings.",
+      { citation: SLACK_DOC_PAGES.conversationsSearch },
+    ),
+    manualFinding(
+      "SLACK-CHAN-05",
+      "Link previews and URL unfurling",
+      21,
+      "medium",
+      `admin.teams.settings.info documents no link preview or unfurl setting (${SLACK_DOC_PAGES.teamSettingsInfo}).`,
+      "capture the link preview settings from the workspace messages and media settings.",
+      { citation: SLACK_DOC_PAGES.teamSettingsInfo },
+    ),
+  );
+
+  return {
+    title: "Slack channel governance posture",
+    summary: {
+      channels_seen: channels.length,
+      channels_total: channelsResult.ok ? channelsResult.total ?? null : null,
+      channels_complete: channelsComplete,
+      external_channels: externalChannels.length,
+      restricted_posting_channels: restrictedChannels.length,
+      short_retention_channels: shortRetention.length,
+    },
+    findings,
+    errors,
+  };
 }
 
 export async function assessSlackMonitoring(
-  client: Pick<SlackApiClient, "audit" | "getNow">,
+  client: SlackApiClient,
   options: { days?: number; auditLimit?: number } = {},
 ): Promise<SlackAssessmentResult> {
   const now = client.getNow();
   const days = clampNumber(options.days, DEFAULT_LOOKBACK_DAYS, 1, 365);
-  const auditLimit = clampNumber(options.auditLimit, DEFAULT_AUDIT_LIMIT, 1, 5000);
+  const auditLimit = clampNumber(options.auditLimit, DEFAULT_AUDIT_LIMIT, 1, 9999);
   const oldest = Math.floor((now.getTime() - days * 24 * 60 * 60 * 1000) / 1000);
+  const errors: string[] = [];
   const logsResult = await client.audit("/logs", { limit: auditLimit, oldest })
-    .then((value) => ({ readable: true, entries: auditEntries(value), error: undefined as string | undefined }))
-    .catch((error) => ({ readable: false, entries: [] as JsonRecord[], error: surfaceError(error) }));
+    .then((value): ReadResult<JsonRecord[]> => ({
+      ok: true,
+      value: asObjectArray(value.entries),
+      complete: !asString(asObject(value.response_metadata)?.next_cursor),
+    }))
+    .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
   const schemasResult = await client.audit("/schemas")
-    .then((value) => ({ readable: true, schemas: auditSchemas(value), error: undefined as string | undefined }))
-    .catch((error) => ({ readable: false, schemas: [] as JsonRecord[], error: surfaceError(error) }));
+    .then((value): ReadResult<JsonRecord[]> => ({ ok: true, value: asObjectArray(value.schemas), complete: true }))
+    .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+  if (!logsResult.ok) errors.push(`Audit Logs /logs: ${logsResult.error}`);
+  if (!schemasResult.ok) errors.push(`Audit Logs /schemas: ${schemasResult.error}`);
 
-  const entries = logsResult.entries;
-  const latestAge = entries
-    .map((entry) => daysBetween(now, extractTimestamp(entry)))
-    .filter((age): age is number => age !== undefined)
-    .sort((left, right) => left - right)[0];
+  const entries = logsResult.ok ? logsResult.value : [];
+  const entryAges = entries.map((entry) => daysBetween(now, extractTimestamp(entry.date_create)));
+  const undatedEntries = entryAges.filter((age) => age === undefined).length;
+  const latestAge = entryAges.filter((age): age is number => age !== undefined).sort((left, right) => left - right)[0];
   const securityActions = new Set([
     "user_login",
     "user_logout",
@@ -1160,88 +1866,109 @@ export async function assessSlackMonitoring(
     "channel_unshared",
     "file_shared_externally",
     "slack_connect_channel_created",
-    "user_joined_channel",
   ]);
-  const visibleSecurityEvents = entries.filter((entry) => {
-    const action = auditAction(entry);
-    return Boolean(action && securityActions.has(action));
-  });
-  const visibleExternalEvents = entries.filter((entry) => {
-    const action = auditAction(entry);
-    return Boolean(action && externalActions.has(action));
-  });
+  const visibleSecurityEvents = entries.filter((entry) => securityActions.has(asString(entry.action) ?? ""));
+  const visibleExternalEvents = entries.filter((entry) => externalActions.has(asString(entry.action) ?? ""));
+  const logsView = logsResult.ok ? `${entries.length} entries in the last ${days} days${logsResult.complete ? "" : " (window truncated at the sample limit)"}` : "unreadable";
 
-  const findings = [
-    finding(
-      "SLACK-MON-01",
-      "Audit Logs API access",
-      "critical",
-      !logsResult.readable || entries.length === 0 ? "fail" : "pass",
-      !logsResult.readable
-        ? `Audit Logs API is not readable: ${logsResult.error}`
-        : entries.length === 0
-          ? `Audit Logs API returned no entries in the last ${days} days.`
-          : `Audit Logs API returned ${entries.length} entries in the sampled window.`,
-      ["FedRAMP AU-2", "FedRAMP AU-6", "SOC 2 CC7.2", "CIS 8.2"],
-      { entries: entries.length, days },
-    ),
-    finding(
-      "SLACK-MON-02",
-      "Audit log recency",
+  const findings: SlackFinding[] = [];
+  if (!logsResult.ok) {
+    const reason = `Audit Logs API /logs is not readable: ${unreadableReason(logsResult)} (requires an Enterprise Grid org-level token with auditlogs:read).`;
+    findings.push(
+      manualFinding("SLACK-MON-01", "Audit Logs API access", 13, "critical", reason, "export audit log evidence from the org dashboard or SIEM."),
+      manualFinding("SLACK-MON-02", "Audit log recency", 13, "high", reason, "confirm audit log ingestion recency in the SIEM."),
+      manualFinding("SLACK-MON-03", "Security event visibility", 13, "medium", reason, "confirm security administration events are collected in the SIEM."),
+      manualFinding("SLACK-MON-05", "External sharing monitoring", 7, "medium", reason, "confirm Slack Connect and external sharing events are monitored."),
+    );
+  } else {
+    findings.push(
+      finding(
+        "SLACK-MON-01",
+        "Audit Logs API access",
+        13,
+        "critical",
+        entries.length === 0 ? "fail" : logsResult.complete ? "pass" : "warn",
+        entries.length === 0
+          ? `Audit Logs API is readable but returned no entries in the last ${days} days; an active org should produce events, so emptiness is treated as a failure.`
+          : logsResult.complete
+            ? `Audit Logs API is readable (${logsView}).`
+            : `Audit Logs API is readable but the window was truncated at audit_limit=${auditLimit} (${logsView}); raise audit_limit to read the full window.`,
+        { entries: entries.length, days, window_complete: logsResult.complete },
+      ),
+      finding(
+        "SLACK-MON-02",
+        "Audit log recency",
+        13,
+        "high",
+        latestAge === undefined ? "warn" : latestAge > 1 ? "fail" : logsResult.complete ? "pass" : "warn",
+        latestAge === undefined
+          ? `No entry carried a parseable date_create (${undatedEntries} undated entries are reported separately).`
+          : `Latest parseable audit event is ${latestAge.toFixed(2)} days old; ${undatedEntries} undated entries were excluded from the recency calculation${logsResult.complete ? "" : "; the window was truncated so ordering is not guaranteed"}.`,
+        { latest_event_age_days: latestAge ?? null, undated_entries: undatedEntries },
+      ),
+      finding(
+        "SLACK-MON-03",
+        "Security event visibility",
+        13,
+        "medium",
+        visibleSecurityEvents.length === 0 || !logsResult.complete ? "warn" : "pass",
+        visibleSecurityEvents.length === 0
+          ? `No common security administration action appeared in the sampled entries (${logsView}); emptiness is not treated as compliant.`
+          : `${visibleSecurityEvents.length} security administration events were visible (${logsView}).`,
+        { security_event_count: visibleSecurityEvents.length },
+      ),
+      finding(
+        "SLACK-MON-05",
+        "External sharing monitoring",
+        7,
+        "medium",
+        visibleExternalEvents.length === 0 || !logsResult.complete ? "warn" : "pass",
+        visibleExternalEvents.length === 0
+          ? `No Slack Connect or external sharing action appeared in the sampled entries (${logsView}); confirm monitoring coverage rather than treating emptiness as compliant.`
+          : `${visibleExternalEvents.length} external sharing events were visible (${logsView}).`,
+        { external_event_count: visibleExternalEvents.length },
+      ),
+    );
+  }
+  findings.push(
+    !schemasResult.ok
+      ? manualFinding("SLACK-MON-04", "Audit schema visibility", 13, "low", `Audit Logs API /schemas is not readable: ${unreadableReason(schemasResult)}.`, "reference the published audit event schema documentation.")
+      : finding(
+        "SLACK-MON-04",
+        "Audit schema visibility",
+        13,
+        "low",
+        schemasResult.value.length === 0 ? "warn" : "pass",
+        schemasResult.value.length === 0
+          ? "Audit Logs API /schemas returned no schemas."
+          : `${schemasResult.value.length} audit event schemas are readable.`,
+        { schemas: schemasResult.value.length },
+      ),
+    manualFinding(
+      "SLACK-MON-06",
+      "Audit log SIEM streaming",
+      13,
       "high",
-      latestAge === undefined ? "warn" : latestAge > 1 ? "fail" : "pass",
-      latestAge === undefined
-        ? "No parseable audit event timestamp was available."
-        : `Latest parseable audit event is ${latestAge.toFixed(2)} days old.`,
-      ["FedRAMP AU-6(3)", "CMMC 3.3.5", "SOC 2 CC7.2", "PCI-DSS 10.5.1"],
-      { latest_event_age_days: latestAge },
+      `The Audit Logs API is pull-based and documents no method that reports SIEM streaming or export destinations (${SLACK_DOC_PAGES.auditLogs}).`,
+      "collect the SIEM ingestion configuration and a recent ingestion timestamp for Slack audit events.",
+      { citation: SLACK_DOC_PAGES.auditLogs, audit_api_readable: logsResult.ok },
     ),
-    finding(
-      "SLACK-MON-03",
-      "Security event visibility",
-      "medium",
-      visibleSecurityEvents.length === 0 ? "warn" : "pass",
-      visibleSecurityEvents.length === 0
-        ? "No common security administration events were present in the sampled audit log entries."
-        : `${visibleSecurityEvents.length} common security administration events were visible.`,
-      ["FedRAMP SI-4", "FedRAMP AU-6", "SOC 2 CC7.2"],
-      { security_event_count: visibleSecurityEvents.length },
-    ),
-    finding(
-      "SLACK-MON-04",
-      "Audit schema visibility",
-      "low",
-      schemasResult.readable ? "pass" : "warn",
-      schemasResult.readable
-        ? `${schemasResult.schemas.length} audit event schemas are readable.`
-        : `Audit event schemas are not readable: ${schemasResult.error}`,
-      ["FedRAMP AU-2", "SOC 2 CC7.2"],
-      { schemas: schemasResult.schemas.length },
-    ),
-    finding(
-      "SLACK-MON-05",
-      "External sharing monitoring",
-      "medium",
-      visibleExternalEvents.length === 0 ? "warn" : "pass",
-      visibleExternalEvents.length === 0
-        ? "No Slack Connect or external sharing events appeared in the sampled audit logs."
-        : `${visibleExternalEvents.length} external sharing events were visible.`,
-      ["FedRAMP AC-21", "CMMC 3.1.20", "SOC 2 CC6.6", "IRAP ISM-0661"],
-      { external_event_count: visibleExternalEvents.length },
-    ),
-  ];
+  );
+  findings.sort((left, right) => left.id.localeCompare(right.id));
 
   return {
     title: "Slack monitoring posture",
     summary: {
       days,
       audit_entries: entries.length,
-      latest_event_age_days: latestAge,
+      audit_window_complete: logsResult.ok ? logsResult.complete : false,
+      latest_event_age_days: latestAge ?? null,
       security_events: visibleSecurityEvents.length,
       external_sharing_events: visibleExternalEvents.length,
-      schemas_readable: schemasResult.readable,
+      schemas_readable: schemasResult.ok,
     },
     findings,
+    errors,
   };
 }
 
@@ -1267,6 +1994,7 @@ function formatAccessCheckText(result: SlackAccessCheckResult): string {
 function formatAssessmentText(result: SlackAssessmentResult): string {
   const rows = result.findings.map((item) => [
     item.id,
+    String(item.control),
     item.severity.toUpperCase(),
     item.status.toUpperCase(),
     item.title,
@@ -1281,56 +2009,106 @@ function formatAssessmentText(result: SlackAssessmentResult): string {
     "Summary:",
     summary,
     "",
-    formatTable(["Control", "Severity", "Status", "Title", "Summary"], rows),
+    formatTable(["Finding", "Spec", "Severity", "Status", "Title", "Summary"], rows),
+    ...(result.errors.length > 0 ? ["", `Collection errors (${result.errors.length}):`, ...result.errors.map((item) => `- ${item}`)] : []),
   ].join("\n");
 }
 
-function buildExecutiveSummary(
-  config: SlackConfiguration,
-  assessments: SlackAssessmentResult[],
-): string {
-  const findings = assessments.flatMap((assessment) => assessment.findings);
-  const failCount = findings.filter((item) => item.status === "fail").length;
-  const warnCount = findings.filter((item) => item.status === "warn").length;
-  const passCount = findings.filter((item) => item.status === "pass").length;
-  const criticalCount = findings.filter((item) => item.severity === "critical").length;
-  const highCount = findings.filter((item) => item.severity === "high").length;
+function statusCounts(findings: SlackFinding[]): Record<SlackFindingStatus, number> {
+  const counts: Record<SlackFindingStatus, number> = { pass: 0, warn: 0, fail: 0, manual: 0 };
+  for (const item of findings) counts[item.status] += 1;
+  return counts;
+}
 
+function buildExecutiveSummary(config: SlackConfiguration, findings: SlackFinding[], generatedAt: string): string {
+  const counts = statusCounts(findings);
+  const coveredControls = new Set(findings.map((item) => item.control));
   return [
-    "# Slack Audit Bundle",
+    "# Slack Security Inspector Executive Summary",
     "",
-    `Target: ${config.orgId ?? "Slack Enterprise Grid / workspace token"}`,
-    `Generated: ${new Date().toISOString()}`,
+    `Target: ${config.orgId ?? "Slack workspace token scope"}`,
+    `Generated: ${generatedAt}`,
     "",
     "## Result Counts",
     "",
-    `- Failed controls: ${failCount}`,
-    `- Warning controls: ${warnCount}`,
-    `- Passing controls: ${passCount}`,
-    `- Critical-severity controls: ${criticalCount}`,
-    `- High-severity controls: ${highCount}`,
+    `- Failed findings: ${counts.fail}`,
+    `- Warning findings: ${counts.warn}`,
+    `- Passing findings: ${counts.pass}`,
+    `- Manual findings: ${counts.manual}`,
+    `- Spec controls covered: ${coveredControls.size} of ${SLACK_SPEC_CONTROLS.length}`,
     "",
     "## Highest Priority Findings",
     "",
     ...findings
-      .filter((item) => item.status !== "pass")
+      .filter((item) => item.status === "fail" || item.status === "warn")
       .slice(0, 10)
       .map((item) => `- ${item.id} (${item.severity.toUpperCase()} / ${item.status.toUpperCase()}): ${item.summary}`),
+    "",
+    "## Manual Findings",
+    "",
+    ...findings.filter((item) => item.status === "manual").map((item) => `- ${item.id}: ${item.summary}`),
   ].join("\n");
 }
 
-function buildControlMatrix(findings: SlackFinding[]): string {
-  const rows = findings.map((item) => [
-    item.id,
-    item.severity.toUpperCase(),
-    item.status.toUpperCase(),
-    item.title,
-    item.mappings.join(", "),
-  ]);
+function buildUnifiedComplianceMatrix(findings: SlackFinding[]): string {
+  const rows = findings.map((item) => {
+    const spec = SLACK_SPEC_CONTROLS.find((control) => control.number === item.control);
+    return [
+      item.id,
+      `${item.control}. ${spec?.name ?? "unknown"}`,
+      item.status.toUpperCase(),
+      ...(spec?.refs.map((ref) => ref ?? "-") ?? SLACK_FRAMEWORKS.map(() => "-")),
+    ];
+  });
   return [
-    "# Slack Control Matrix",
+    "# Unified Compliance Matrix",
     "",
-    formatTable(["Control", "Severity", "Status", "Title", "Mappings"], rows),
+    formatTable(["Finding", "Spec control", "Status", ...SLACK_FRAMEWORKS], rows),
+  ].join("\n");
+}
+
+function frameworkSlug(framework: FrameworkName): string {
+  return framework.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
+
+function buildFrameworkReport(framework: FrameworkName, findings: SlackFinding[]): string {
+  const index = SLACK_FRAMEWORKS.indexOf(framework);
+  const rows = findings
+    .map((item) => ({ item, ref: SLACK_SPEC_CONTROLS.find((control) => control.number === item.control)?.refs[index] ?? null }))
+    .filter((entry) => entry.ref !== null)
+    .map((entry) => [entry.ref ?? "-", entry.item.id, entry.item.status.toUpperCase(), entry.item.title, entry.item.summary]);
+  return [
+    `# ${framework} Report`,
+    "",
+    rows.length === 0 ? `No spec control maps to ${framework}.` : formatTable([`${framework} reference`, "Finding", "Status", "Title", "Summary"], rows),
+  ].join("\n");
+}
+
+function buildQuickReference(result: { outputDir: string; zipPath: string }, findings: SlackFinding[], errors: string[]): string {
+  const counts = statusCounts(findings);
+  return [
+    "# Quick Reference",
+    "",
+    `- Bundle directory: ${result.outputDir}`,
+    `- Archive: ${result.zipPath}`,
+    `- Findings: ${findings.length} (pass ${counts.pass}, warn ${counts.warn}, fail ${counts.fail}, manual ${counts.manual})`,
+    `- Collection errors: ${errors.length}${errors.length > 0 ? " (see _errors.log)" : ""}`,
+    "",
+    "## Layout",
+    "",
+    "- `core_data/`: raw access check and per-area collection snapshots (tokens are never written)",
+    "- `analysis/findings.json`: every finding with status, evidence, and framework mappings",
+    "- `analysis/<area>.json`: per-area summaries",
+    "- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, one report per framework",
+    "- `reports/<area>.md`: human-readable per-area tables",
+    "- `_errors.log`: present only when collection partially failed",
+    "",
+    "## Status Semantics",
+    "",
+    "- pass: documented evidence read completely and compliant",
+    "- warn: compliant on the seen data but partial, empty, or needing review",
+    "- fail: documented evidence shows a gap",
+    "- manual: the API cannot prove the control; the summary names the cause and the evidence to collect",
   ].join("\n");
 }
 
@@ -1338,19 +2116,9 @@ function buildBundleReadme(): string {
   return [
     "# Slack Evidence Bundle",
     "",
-    "This bundle was generated by grclanker's native Slack Enterprise Grid tools.",
+    "Generated by grclanker's native Slack Enterprise Grid tools. See QUICK_REFERENCE.md for the layout and status semantics.",
     "",
-    "## Contents",
-    "",
-    "- `summary.md`: combined human-readable assessment output",
-    "- `reports/executive-summary.md`: prioritized audit summary",
-    "- `reports/control-matrix.md`: framework mapping matrix",
-    "- `reports/*.md`: per-assessment markdown reports",
-    "- `analysis/*.json`: normalized findings and assessment details",
-    "- `core_data/access.json`: accessible Slack audit surface inventory",
-    "- `metadata.json`: non-secret run metadata",
-    "",
-    "Slack tokens are not written to this bundle. Use environment variables for tenant credentials when possible.",
+    "Slack tokens are never written to this bundle.",
   ].join("\n");
 }
 
@@ -1361,77 +2129,77 @@ export async function exportSlackAuditBundle(
   options: ExportAuditBundleArgs = {},
 ): Promise<SlackAuditBundleResult> {
   const access = await checkSlackAccess(client);
-  const identity = await assessSlackIdentity(client, {
-    userLimit: options.user_limit,
-    skipScim: options.skip_scim,
-  });
-  const adminAccess = await assessSlackAdminAccess(client, {
-    workspaceLimit: options.workspace_limit,
-    maxWorkspaceAdmins: options.max_workspace_admins,
-    maxSessionHours: options.max_session_hours,
-    maxIdleMinutes: options.max_idle_minutes,
-  });
-  const integrations = await assessSlackIntegrations(client, {
-    appLimit: options.app_limit,
-  });
-  const monitoring = await assessSlackMonitoring(client, {
-    days: options.days,
-    auditLimit: options.audit_limit,
-  });
+  const areas: Array<{ slug: string; result: SlackAssessmentResult }> = [
+    { slug: "identity", result: await assessSlackIdentity(client, { userLimit: options.user_limit, skipScim: options.skip_scim }) },
+    {
+      slug: "admin-access",
+      result: await assessSlackAdminAccess(client, {
+        workspaceLimit: options.workspace_limit,
+        userLimit: options.user_limit,
+        maxWorkspaceAdmins: options.max_workspace_admins,
+        maxSessionHours: options.max_session_hours,
+      }),
+    },
+    { slug: "integrations", result: await assessSlackIntegrations(client, { appLimit: options.app_limit }) },
+    { slug: "channel-governance", result: await assessSlackChannelGovernance(client, { channelLimit: options.channel_limit, minRetentionDays: options.min_retention_days }) },
+    { slug: "monitoring", result: await assessSlackMonitoring(client, { days: options.days, auditLimit: options.audit_limit }) },
+  ];
 
-  const assessments = [identity, adminAccess, integrations, monitoring];
-  const findings = assessments.flatMap((assessment) => assessment.findings);
+  const findings = areas.flatMap((area) => area.result.findings);
+  const errors = areas.flatMap((area) => area.result.errors.map((item) => `[${area.slug}] ${item}`));
+  const generatedAt = client.getNow().toISOString();
   const targetName = safeDirName(`${config.orgId ?? "slack"}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
+  const zipPath = `${outputDir}.zip`;
 
   await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, zipPath }, findings, errors));
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
     target: config.orgId ?? null,
     auth_mode: "bearer-token",
+    token_kinds: client.getTokenKinds(),
     scim_configured: Boolean(config.scimToken),
     source_chain: config.sourceChain,
-    generated_at: new Date().toISOString(),
+    generated_at: generatedAt,
     options: {
       user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
       workspace_limit: options.workspace_limit ?? DEFAULT_WORKSPACE_LIMIT,
       app_limit: options.app_limit ?? DEFAULT_APP_LIMIT,
       audit_limit: options.audit_limit ?? DEFAULT_AUDIT_LIMIT,
+      channel_limit: options.channel_limit ?? DEFAULT_CHANNEL_LIMIT,
       days: options.days ?? DEFAULT_LOOKBACK_DAYS,
       max_workspace_admins: options.max_workspace_admins ?? 5,
       max_session_hours: options.max_session_hours ?? 24,
-      max_idle_minutes: options.max_idle_minutes ?? 30,
+      min_retention_days: options.min_retention_days ?? DEFAULT_MIN_RETENTION_DAYS,
     },
   }));
-  await writeSecureTextFile(outputDir, "summary.md", assessments.map(formatAssessmentText).join("\n\n"));
-  await writeSecureTextFile(outputDir, "reports/executive-summary.md", buildExecutiveSummary(config, assessments));
-  await writeSecureTextFile(outputDir, "reports/control-matrix.md", buildControlMatrix(findings));
-  await writeSecureTextFile(outputDir, "reports/identity.md", formatAssessmentText(identity));
-  await writeSecureTextFile(outputDir, "reports/admin-access.md", formatAssessmentText(adminAccess));
-  await writeSecureTextFile(outputDir, "reports/integrations.md", formatAssessmentText(integrations));
-  await writeSecureTextFile(outputDir, "reports/monitoring.md", formatAssessmentText(monitoring));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/admin-access.json", serializeJson(adminAccess));
-  await writeSecureTextFile(outputDir, "analysis/integrations.json", serializeJson(integrations));
-  await writeSecureTextFile(outputDir, "analysis/monitoring.json", serializeJson(monitoring));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  for (const area of areas) {
+    await writeSecureTextFile(outputDir, `core_data/${area.slug}.json`, serializeJson({ summary: area.result.summary, evidence: area.result.findings.map((item) => ({ id: item.id, evidence: item.evidence ?? null })), errors: area.result.errors }));
+    await writeSecureTextFile(outputDir, `analysis/${area.slug}.json`, serializeJson({ title: area.result.title, summary: area.result.summary, status_counts: statusCounts(area.result.findings) }));
+    await writeSecureTextFile(outputDir, `reports/${area.slug}.md`, formatAssessmentText(area.result));
+  }
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, findings, generatedAt));
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
+  for (const framework of SLACK_FRAMEWORKS) {
+    await writeSecureTextFile(outputDir, `compliance/${frameworkSlug(framework)}.md`, buildFrameworkReport(framework, findings));
+  }
+  if (errors.length > 0) {
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+  }
 
-  const zipPath = `${outputDir}.zip`;
   await createZipArchive(outputDir, zipPath);
   const fileCount = await countFilesRecursively(outputDir);
 
-  return {
-    outputDir,
-    zipPath,
-    fileCount,
-    findingCount: findings.length,
-  };
+  return { outputDir, zipPath, fileCount, findingCount: findings.length, errorCount: errors.length };
 }
 
 function normalizeCheckAccessArgs(args: unknown): CheckAccessArgs {
   const value = asObject(args) ?? {};
   return {
     token: asString(value.token) ?? asString(value.user_token),
+    bot_token: asString(value.bot_token),
     scim_token: asString(value.scim_token) ?? asString(value.scimToken),
     org_id: asString(value.org_id) ?? asString(value.enterprise_id),
     web_api_base_url: asString(value.web_api_base_url),
@@ -1443,11 +2211,7 @@ function normalizeCheckAccessArgs(args: unknown): CheckAccessArgs {
 
 function normalizeIdentityArgs(args: unknown): IdentityArgs {
   const value = asObject(args) ?? {};
-  return {
-    ...normalizeCheckAccessArgs(args),
-    user_limit: asNumber(value.user_limit),
-    skip_scim: asBoolean(value.skip_scim),
-  };
+  return { ...normalizeCheckAccessArgs(args), user_limit: asNumber(value.user_limit), skip_scim: asBoolean(value.skip_scim) };
 }
 
 function normalizeAdminAccessArgs(args: unknown): AdminAccessArgs {
@@ -1455,27 +2219,26 @@ function normalizeAdminAccessArgs(args: unknown): AdminAccessArgs {
   return {
     ...normalizeCheckAccessArgs(args),
     workspace_limit: asNumber(value.workspace_limit),
+    user_limit: asNumber(value.user_limit),
     max_workspace_admins: asNumber(value.max_workspace_admins),
     max_session_hours: asNumber(value.max_session_hours),
-    max_idle_minutes: asNumber(value.max_idle_minutes),
+    session_sample: asNumber(value.session_sample),
   };
 }
 
 function normalizeIntegrationsArgs(args: unknown): IntegrationsArgs {
   const value = asObject(args) ?? {};
-  return {
-    ...normalizeCheckAccessArgs(args),
-    app_limit: asNumber(value.app_limit),
-  };
+  return { ...normalizeCheckAccessArgs(args), app_limit: asNumber(value.app_limit) };
 }
 
 function normalizeMonitoringArgs(args: unknown): MonitoringArgs {
   const value = asObject(args) ?? {};
-  return {
-    ...normalizeCheckAccessArgs(args),
-    days: asNumber(value.days),
-    audit_limit: asNumber(value.audit_limit),
-  };
+  return { ...normalizeCheckAccessArgs(args), days: asNumber(value.days), audit_limit: asNumber(value.audit_limit) };
+}
+
+function normalizeChannelGovernanceArgs(args: unknown): ChannelGovernanceArgs {
+  const value = asObject(args) ?? {};
+  return { ...normalizeCheckAccessArgs(args), channel_limit: asNumber(value.channel_limit), min_retention_days: asNumber(value.min_retention_days) };
 }
 
 function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
@@ -1487,10 +2250,11 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
     workspace_limit: asNumber(value.workspace_limit),
     app_limit: asNumber(value.app_limit),
     audit_limit: asNumber(value.audit_limit),
+    channel_limit: asNumber(value.channel_limit),
     days: asNumber(value.days),
     max_workspace_admins: asNumber(value.max_workspace_admins),
     max_session_hours: asNumber(value.max_session_hours),
-    max_idle_minutes: asNumber(value.max_idle_minutes),
+    min_retention_days: asNumber(value.min_retention_days),
     skip_scim: asBoolean(value.skip_scim),
   };
 }
@@ -1499,160 +2263,188 @@ function createClient(args: CheckAccessArgs): SlackApiClient {
   return new SlackApiClient(resolveSlackConfiguration(args as JsonRecord));
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 const authParams = {
-  token: Type.Optional(Type.String({ description: "Slack org-level user token. Defaults to SLACK_USER_TOKEN." })),
+  token: Type.Optional(Type.String({ description: "Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file." })),
+  bot_token: Type.Optional(Type.String({ description: "Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN." })),
   scim_token: Type.Optional(Type.String({ description: "Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN." })),
   org_id: Type.Optional(Type.String({ description: "Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "Request timeout in seconds. Defaults to 30.", default: 30 })),
 };
 
-export function registerSlackTools(pi: any): void {
+type ToolName =
+  | "slack_check_access"
+  | "slack_assess_identity"
+  | "slack_assess_admin_access"
+  | "slack_assess_integrations"
+  | "slack_assess_channel_governance"
+  | "slack_assess_monitoring";
+
+async function runAssessment(tool: ToolName, args: unknown): Promise<unknown> {
+  switch (tool) {
+    case "slack_check_access": {
+      const result = await checkSlackAccess(createClient(args as CheckAccessArgs));
+      return textResult(formatAccessCheckText(result), { tool, ...result });
+    }
+    case "slack_assess_identity": {
+      const typed = args as IdentityArgs;
+      const result = await assessSlackIdentity(createClient(typed), { userLimit: typed.user_limit, skipScim: typed.skip_scim });
+      return textResult(formatAssessmentText(result), { tool, ...result });
+    }
+    case "slack_assess_admin_access": {
+      const typed = args as AdminAccessArgs;
+      const result = await assessSlackAdminAccess(createClient(typed), {
+        workspaceLimit: typed.workspace_limit,
+        userLimit: typed.user_limit,
+        maxWorkspaceAdmins: typed.max_workspace_admins,
+        maxSessionHours: typed.max_session_hours,
+        sessionSample: typed.session_sample,
+      });
+      return textResult(formatAssessmentText(result), { tool, ...result });
+    }
+    case "slack_assess_integrations": {
+      const typed = args as IntegrationsArgs;
+      const result = await assessSlackIntegrations(createClient(typed), { appLimit: typed.app_limit });
+      return textResult(formatAssessmentText(result), { tool, ...result });
+    }
+    case "slack_assess_channel_governance": {
+      const typed = args as ChannelGovernanceArgs;
+      const result = await assessSlackChannelGovernance(createClient(typed), { channelLimit: typed.channel_limit, minRetentionDays: typed.min_retention_days });
+      return textResult(formatAssessmentText(result), { tool, ...result });
+    }
+    case "slack_assess_monitoring": {
+      const typed = args as MonitoringArgs;
+      const result = await assessSlackMonitoring(createClient(typed), { days: typed.days, auditLimit: typed.audit_limit });
+      return textResult(formatAssessmentText(result), { tool, ...result });
+    }
+    default: {
+      const exhaustive: never = tool;
+      throw new Error(`Unhandled Slack tool ${String(exhaustive)}`);
+    }
+  }
+}
+
+function registerAssessment(
+  pi: any,
+  tool: ToolName,
+  label: string,
+  description: string,
+  parameters: unknown,
+  prepareArguments: (args: unknown) => unknown,
+): void {
   pi.registerTool({
-    name: "slack_check_access",
-    label: "Check Slack audit access",
-    description:
-      "Validate read-only Slack Enterprise Grid API access and show which Web API, SCIM, Audit Logs, app, admin, and Discovery surfaces are readable.",
-    parameters: Type.Object(authParams),
-    prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    name: tool,
+    label,
+    description,
+    parameters,
+    prepareArguments,
+    async execute(_toolCallId: string, args: unknown) {
       try {
-        const result = await checkSlackAccess(createClient(args));
-        return textResult(formatAccessCheckText(result), { tool: "slack_check_access", ...result });
+        return await runAssessment(tool, args);
       } catch (error) {
-        return errorResult(
-          `Slack access check failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "slack_check_access" },
-        );
+        return errorResult(`${label} failed: ${describeError(error)}`, { tool });
       }
     },
   });
+}
 
-  pi.registerTool({
-    name: "slack_assess_identity",
-    label: "Assess Slack identity posture",
-    description:
-      "Assess Slack users, MFA enrollment visibility, guest inventory, SCIM provisioning coverage, and user lifecycle alignment.",
-    parameters: Type.Object({
+export function registerSlackTools(pi: any): void {
+  registerAssessment(
+    pi,
+    "slack_check_access",
+    "Check Slack audit access",
+    "Validate read-only Slack Enterprise Grid API access and show which Web API, Admin API, SCIM, Audit Logs, and Discovery surfaces are readable with the configured user, bot, and SCIM tokens.",
+    Type.Object(authParams),
+    normalizeCheckAccessArgs,
+  );
+
+  registerAssessment(
+    pi,
+    "slack_assess_identity",
+    "Assess Slack identity posture",
+    "Assess Slack MFA enrollment (has_2fa), guest inventory, SCIM provisioning coverage, user lifecycle alignment, and deactivated user visibility.",
+    Type.Object({
       ...authParams,
-      user_limit: Type.Optional(Type.Number({ description: "Maximum users to sample. Defaults to 1000.", default: 1000 })),
+      user_limit: Type.Optional(Type.Number({ description: "Maximum users to read. Defaults to 1000.", default: 1000 })),
       skip_scim: Type.Optional(Type.Boolean({ description: "Skip SCIM provisioning checks. Defaults to false.", default: false })),
     }),
-    prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
-      try {
-        const result = await assessSlackIdentity(createClient(args), {
-          userLimit: args.user_limit,
-          skipScim: args.skip_scim,
-        });
-        return textResult(formatAssessmentText(result), { tool: "slack_assess_identity", ...result });
-      } catch (error) {
-        return errorResult(
-          `Slack identity assessment failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "slack_assess_identity" },
-        );
-      }
-    },
-  });
+    normalizeIdentityArgs,
+  );
 
-  pi.registerTool({
-    name: "slack_assess_admin_access",
-    label: "Assess Slack admin access",
-    description:
-      "Assess Slack workspace admin inventory, SSO enforcement signals, session duration, idle timeout, and workspace discoverability.",
-    parameters: Type.Object({
+  registerAssessment(
+    pi,
+    "slack_assess_admin_access",
+    "Assess Slack admin access",
+    "Assess Slack workspace admin inventory, SSO coverage (has_sso), session duration, idle timeout, discoverability, mobile session controls, email domain restrictions, custom emoji governance, and analytics access.",
+    Type.Object({
       ...authParams,
-      workspace_limit: Type.Optional(Type.Number({ description: "Maximum workspaces to sample. Defaults to 50.", default: 50 })),
+      workspace_limit: Type.Optional(Type.Number({ description: "Maximum workspaces to read. Defaults to 50.", default: 50 })),
+      user_limit: Type.Optional(Type.Number({ description: "Maximum org users to read from admin.users.list. Defaults to 1000.", default: 1000 })),
       max_workspace_admins: Type.Optional(Type.Number({ description: "Maximum expected admins per workspace. Defaults to 5.", default: 5 })),
       max_session_hours: Type.Optional(Type.Number({ description: "Maximum acceptable session duration in hours. Defaults to 24.", default: 24 })),
-      max_idle_minutes: Type.Optional(Type.Number({ description: "Maximum acceptable idle timeout in minutes. Defaults to 30.", default: 30 })),
+      session_sample: Type.Optional(Type.Number({ description: "Maximum users whose session settings are sampled. Defaults to 100.", default: 100 })),
     }),
-    prepareArguments: normalizeAdminAccessArgs,
-    async execute(_toolCallId: string, args: AdminAccessArgs) {
-      try {
-        const result = await assessSlackAdminAccess(createClient(args), {
-          workspaceLimit: args.workspace_limit,
-          maxWorkspaceAdmins: args.max_workspace_admins,
-          maxSessionHours: args.max_session_hours,
-          maxIdleMinutes: args.max_idle_minutes,
-        });
-        return textResult(formatAssessmentText(result), { tool: "slack_assess_admin_access", ...result });
-      } catch (error) {
-        return errorResult(
-          `Slack admin access assessment failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "slack_assess_admin_access" },
-        );
-      }
-    },
-  });
+    normalizeAdminAccessArgs,
+  );
 
-  pi.registerTool({
-    name: "slack_assess_integrations",
-    label: "Assess Slack integrations",
-    description:
-      "Assess Slack approved/restricted app inventory, custom and broad-scope apps, information barriers, and Discovery API visibility.",
-    parameters: Type.Object({
+  registerAssessment(
+    pi,
+    "slack_assess_integrations",
+    "Assess Slack integrations",
+    "Assess Slack approved and restricted app inventories, internal and sensitive-scope apps, information barriers, Discovery API visibility, file upload restrictions, and token rotation.",
+    Type.Object({
       ...authParams,
-      app_limit: Type.Optional(Type.Number({ description: "Maximum approved/restricted apps to sample. Defaults to 500.", default: 500 })),
+      app_limit: Type.Optional(Type.Number({ description: "Maximum approved/restricted apps to read. Defaults to 500.", default: 500 })),
     }),
-    prepareArguments: normalizeIntegrationsArgs,
-    async execute(_toolCallId: string, args: IntegrationsArgs) {
-      try {
-        const result = await assessSlackIntegrations(createClient(args), {
-          appLimit: args.app_limit,
-        });
-        return textResult(formatAssessmentText(result), { tool: "slack_assess_integrations", ...result });
-      } catch (error) {
-        return errorResult(
-          `Slack integrations assessment failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "slack_assess_integrations" },
-        );
-      }
-    },
-  });
+    normalizeIntegrationsArgs,
+  );
 
-  pi.registerTool({
-    name: "slack_assess_monitoring",
-    label: "Assess Slack monitoring",
-    description:
-      "Assess Slack Audit Logs API access, event recency, security administration events, schema visibility, and external sharing monitoring.",
-    parameters: Type.Object({
+  registerAssessment(
+    pi,
+    "slack_assess_channel_governance",
+    "Assess Slack channel governance",
+    "Assess Slack Connect exposure, posting restrictions on general and org default channels, channel retention overrides, external email ingestion, and link preview settings.",
+    Type.Object({
+      ...authParams,
+      channel_limit: Type.Optional(Type.Number({ description: "Maximum active channels to sample for prefs and retention. Defaults to 40.", default: 40 })),
+      min_retention_days: Type.Optional(Type.Number({ description: "Minimum acceptable custom retention in days. Defaults to 365.", default: 365 })),
+    }),
+    normalizeChannelGovernanceArgs,
+  );
+
+  registerAssessment(
+    pi,
+    "slack_assess_monitoring",
+    "Assess Slack monitoring",
+    "Assess Slack Audit Logs API access, event recency, security administration events, schema visibility, external sharing monitoring, and SIEM streaming evidence.",
+    Type.Object({
       ...authParams,
       days: Type.Optional(Type.Number({ description: "Audit log lookback window in days. Defaults to 30.", default: 30 })),
-      audit_limit: Type.Optional(Type.Number({ description: "Maximum audit events to sample. Defaults to 200.", default: 200 })),
+      audit_limit: Type.Optional(Type.Number({ description: "Maximum audit events to read (1-9999). Defaults to 200.", default: 200 })),
     }),
-    prepareArguments: normalizeMonitoringArgs,
-    async execute(_toolCallId: string, args: MonitoringArgs) {
-      try {
-        const result = await assessSlackMonitoring(createClient(args), {
-          days: args.days,
-          auditLimit: args.audit_limit,
-        });
-        return textResult(formatAssessmentText(result), { tool: "slack_assess_monitoring", ...result });
-      } catch (error) {
-        return errorResult(
-          `Slack monitoring assessment failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "slack_assess_monitoring" },
-        );
-      }
-    },
-  });
+    normalizeMonitoringArgs,
+  );
 
   pi.registerTool({
     name: "slack_export_audit_bundle",
     label: "Export Slack audit bundle",
     description:
-      "Export a Slack audit package with access checks, identity, admin-access, integrations, monitoring findings, markdown reports, JSON analysis, and a zip archive.",
+      "Export a Slack audit bundle with core_data snapshots, analysis JSON, per-framework compliance reports, QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive named after the allocated directory.",
     parameters: Type.Object({
       ...authParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
-      user_limit: Type.Optional(Type.Number({ description: "Maximum users to sample. Defaults to 1000.", default: 1000 })),
-      workspace_limit: Type.Optional(Type.Number({ description: "Maximum workspaces to sample. Defaults to 50.", default: 50 })),
-      app_limit: Type.Optional(Type.Number({ description: "Maximum approved/restricted apps to sample. Defaults to 500.", default: 500 })),
-      audit_limit: Type.Optional(Type.Number({ description: "Maximum audit events to sample. Defaults to 200.", default: 200 })),
+      user_limit: Type.Optional(Type.Number({ description: "Maximum users to read. Defaults to 1000.", default: 1000 })),
+      workspace_limit: Type.Optional(Type.Number({ description: "Maximum workspaces to read. Defaults to 50.", default: 50 })),
+      app_limit: Type.Optional(Type.Number({ description: "Maximum approved/restricted apps to read. Defaults to 500.", default: 500 })),
+      audit_limit: Type.Optional(Type.Number({ description: "Maximum audit events to read. Defaults to 200.", default: 200 })),
+      channel_limit: Type.Optional(Type.Number({ description: "Maximum channels to sample. Defaults to 40.", default: 40 })),
       days: Type.Optional(Type.Number({ description: "Audit log lookback window in days. Defaults to 30.", default: 30 })),
       max_workspace_admins: Type.Optional(Type.Number({ description: "Maximum expected admins per workspace. Defaults to 5.", default: 5 })),
       max_session_hours: Type.Optional(Type.Number({ description: "Maximum acceptable session duration in hours. Defaults to 24.", default: 24 })),
-      max_idle_minutes: Type.Optional(Type.Number({ description: "Maximum acceptable idle timeout in minutes. Defaults to 30.", default: 30 })),
+      min_retention_days: Type.Optional(Type.Number({ description: "Minimum acceptable custom retention in days. Defaults to 365.", default: 365 })),
       skip_scim: Type.Optional(Type.Boolean({ description: "Skip SCIM provisioning checks. Defaults to false.", default: false })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
@@ -1668,6 +2460,7 @@ export function registerSlackTools(pi: any): void {
             `Zip archive: ${result.zipPath}`,
             `Findings: ${result.findingCount}`,
             `Files: ${result.fileCount}`,
+            `Collection errors: ${result.errorCount}`,
           ].join("\n"),
           {
             tool: "slack_export_audit_bundle",
@@ -1675,13 +2468,11 @@ export function registerSlackTools(pi: any): void {
             zip_path: result.zipPath,
             finding_count: result.findingCount,
             file_count: result.fileCount,
+            error_count: result.errorCount,
           },
         );
       } catch (error) {
-        return errorResult(
-          `Slack audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
-          { tool: "slack_export_audit_bundle" },
-        );
+        return errorResult(`Slack audit bundle export failed: ${describeError(error)}`, { tool: "slack_export_audit_bundle" });
       }
     },
   });
