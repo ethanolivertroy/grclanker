@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
   API_KEY_DOCUMENTED_ONLY_NOTE,
   NEWRELIC_CONTROL_CATALOG,
+  NEWRELIC_NERDGRAPH_SELECTIONS,
   NewrelicApiClient,
   assessNewrelicAccessControl,
   assessNewrelicAlerting,
@@ -1414,6 +1415,114 @@ test("NewrelicApiClient falls back to a single workflows page when the cursor ar
   const firstPage = await truncated.listWorkflows(111);
   assert.equal(firstPage.complete, false);
   assert.match(firstPage.note, /aiWorkflows\.workflows rejected the cursor argument, so only the first page was read \(1 of 5 workflows\)/);
+});
+
+// Every identifier that may appear in a NerdGraph selection. Each entry is traceable to the docs.newrelic.com page or
+// the schema type cited above the matching QUERY_* constant in newrelic.ts; anything else fails the allowlist.
+const DOCUMENTED_SELECTION_TOKENS = new Set([
+  "actor", "on", "query", "user", "organization", "accounts", "id", "name", "email",
+  "userManagement", "authorizationManagement", "authenticationDomains", "nextCursor", "totalCount", "count",
+  "provisioningType", "authenticationType", "organizationId", "users", "lastActive", "type", "displayName", "groups",
+  "roles", "accountId", "scope",
+  "apiAccess", "keySearch", "keys", "createdAt", "ApiAccessIngestKey", "ingestType", "ApiAccessUserKey", "userId",
+  "account", "nrql", "results",
+  "entitySearch", "entities", "guid", "entityType", "domain", "reporting", "tags", "key", "values",
+  "AlertableEntityOutline", "alertSeverity", "DashboardEntityOutline", "permissions", "SyntheticMonitorEntityOutline",
+  "monitorType", "WorkloadEntityOutline", "workloadStatus", "statusValue",
+  "alerts", "policiesSearch", "policies", "incidentPreference", "nrqlConditionsSearch", "nrqlConditions", "enabled",
+  "policyId",
+  "aiNotifications", "destinations", "properties", "value", "error", "details", "channels", "destinationId",
+  "aiWorkflows", "workflows", "workflowEnabled", "enrichmentsEnabled", "destinationsEnabled",
+  "destinationConfigurations", "channelId", "notificationTriggers", "enrichments", "configurations",
+  "AiWorkflowsNrqlConfiguration",
+  "dataManagement", "eventRetentionRules", "namespace", "retentionInDays", "createdById", "deletedAt", "deletedById",
+  "customizableRetention", "eventNamespaces",
+  "logConfigurations", "obfuscationRules", "description", "filter", "updatedAt", "actions", "attributes", "method",
+  "expression", "obfuscationExpressions", "regex",
+  "entityManagement", "EntityManagementPipelineCloudRuleEntity",
+  "nrqlDropRules", "list", "rules", "action", "createdBy", "reason",
+  "synthetics", "script", "text",
+  "dashboard", "liveUrls", "title", "errors",
+]);
+
+// Fields the compliance review found in no public New Relic documentation; they must never be requested again.
+const UNDOCUMENTED_FIELDS = [
+  "emailVerificationState", "timeZone", "dashboardParentGuid", "owner", "monitoredUrl", "period", "monitorId",
+  "secureCredentialId", "SecureCredentialEntityOutline", "notes", "active", "status", "isUserAuthenticated", "lastSent",
+  "displayValue", "product", "url", "uuid", "roleId",
+];
+
+function selectionTokens(selection) {
+  const withoutArguments = selection.replace(/\([^()]*\)/g, " ");
+  return withoutArguments.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+}
+
+test("every NerdGraph selection stays on the documented field allowlist", () => {
+  assert.ok(Object.keys(NEWRELIC_NERDGRAPH_SELECTIONS).length >= 28);
+  for (const [purpose, selection] of Object.entries(NEWRELIC_NERDGRAPH_SELECTIONS)) {
+    const unexpected = [...new Set(selectionTokens(selection))].filter((token) => !DOCUMENTED_SELECTION_TOKENS.has(token));
+    assert.deepEqual(unexpected, [], `${purpose} selects undocumented identifiers: ${unexpected.join(", ")}`);
+    for (const field of UNDOCUMENTED_FIELDS) {
+      assert.doesNotMatch(selection, new RegExp(`\\b${field}\\b`), `${purpose} still requests ${field}`);
+    }
+  }
+  assert.match(NEWRELIC_NERDGRAPH_SELECTIONS.entitySearch, /\.\.\. on DashboardEntityOutline \{ permissions \}/);
+  assert.match(NEWRELIC_NERDGRAPH_SELECTIONS.entitySearch, /\.\.\. on SyntheticMonitorEntityOutline \{ monitorType \}/);
+  assert.match(NEWRELIC_NERDGRAPH_SELECTIONS.domainUsers, /users \{\s+id name email lastActive\s+type \{ id displayName \}/);
+  assert.match(NEWRELIC_NERDGRAPH_SELECTIONS.alertPolicies, /policies \{ id name incidentPreference \}/);
+  assert.match(NEWRELIC_NERDGRAPH_SELECTIONS.obfuscationRules, /expression \{ name \}/);
+  assert.match(NEWRELIC_NERDGRAPH_SELECTIONS.pipelineCloudRules, /entities \{\s+id type\s+\.\.\. on EntityManagementPipelineCloudRuleEntity \{ id name nrql description enabled \}/);
+  assert.doesNotMatch(NEWRELIC_NERDGRAPH_SELECTIONS.domainGroupGrants, /authorizationManagement \{\s*roles/);
+});
+
+test("NewrelicApiClient falls back to the documented group grant shape when the domain filter or cursor is rejected", async () => {
+  const seen = [];
+  const documentedShape = {
+    data: {
+      actor: {
+        organization: {
+          authorizationManagement: {
+            authenticationDomains: {
+              authenticationDomains: [
+                { id: "domain-1", groups: { groups: [{ id: "g-admin", displayName: "Admins", roles: { roles: [{ id: "grant-1", name: "Organization manager", displayName: "Organization manager", type: "STANDARD", organizationId: "org-1" }] } }] } },
+                { id: "domain-2", groups: { groups: [{ id: "g-read", displayName: "Readers", roles: { roles: [] } }] } },
+              ],
+            },
+          },
+        },
+      },
+    },
+  };
+  const client = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      const body = JSON.parse(init.body);
+      seen.push(body.query);
+      if (body.query.includes("id: $domainId")) {
+        return jsonResponse({ errors: [{ message: 'Unknown argument "id" on field "AuthorizationManagementOrganizationStitchedFields.authenticationDomains".' }] });
+      }
+      return jsonResponse(documentedShape);
+    },
+  });
+
+  const grants = await client.listDomainGroupGrants("domain-1");
+  assert.equal(seen.length, 2);
+  assert.doesNotMatch(seen[1], /cursor|\$domainId|nextCursor|totalCount/);
+  assert.match(seen[1], /authenticationDomains \{ authenticationDomains \{\s+id\s+groups \{\s+groups \{\s+id displayName\s+roles \{ roles \{ id name displayName type accountId organizationId \} \}/);
+  assert.deepEqual(grants.items.map((group) => group.id), ["g-admin"]);
+  assert.deepEqual(grants.items[0].roles.map((role) => role.name), ["Organization manager"]);
+  assert.equal(grants.items[0].rolesReadable, true);
+  assert.equal(grants.complete, false);
+  assert.match(grants.note, /documented unpaginated shape was read \(1 groups on one page, completeness unknown\)/);
+
+  const missing = await client.listDomainGroupGrants("domain-9");
+  assert.deepEqual(missing.items, []);
+  assert.equal(missing.complete, false);
+  assert.match(missing.note, /did not include domain domain-9 \(2 domains returned\)/);
+
+  const denied = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ errors: [{ message: "Not authorized to query authorizationManagement" }] }),
+  });
+  await assert.rejects(() => denied.listDomainGroupGrants("domain-1"), /Not authorized/);
 });
 
 test("assessNewrelicAlerting fails uncovered critical entities and personal email destinations, and warns on enriched external workflows", async () => {

@@ -679,12 +679,6 @@ function parseLinkNext(linkHeader: string | null): string | undefined {
 }
 
 /**
- * NerdGraph reports a selection that does not match the schema with validation errors such as
- * `Cannot query field "nextCursor" on type "ApiAccessKeySearchResult"`, `Unknown argument "cursor" on field ...`,
- * `Unknown field`, or `Argument "query" has invalid value`. Authorization failures use different wording and must
- * not match, so they keep propagating as unreadable surfaces.
- */
-/**
  * aiNotifications.destinations and aiNotifications.channels document a per-account `error { details }` object beside
  * the entities list. A non-null error makes the account unreadable instead of an empty inventory.
  */
@@ -695,6 +689,12 @@ function notificationPageError(pageObject: JsonRecord): string | undefined {
   return details ?? JSON.stringify(error);
 }
 
+/**
+ * NerdGraph reports a selection that does not match the schema with validation errors such as
+ * `Cannot query field "nextCursor" on type "ApiAccessKeySearchResult"`, `Unknown argument "cursor" on field ...`,
+ * `Unknown field`, or `Argument "query" has invalid value`. Authorization failures use different wording and must
+ * not match, so they keep propagating as unreadable surfaces.
+ */
 function isSchemaMismatchError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /cannot query field|unknown argument|unknown field|has invalid value|is not defined|does not accept|undefined argument|undefined field|does not exist on type|field .* doesn't exist/i.test(message);
@@ -710,9 +710,36 @@ function nerdgraphErrorSummary(errors: unknown): string {
     .join("; ");
 }
 
+/*
+ * NerdGraph selections. Every field requested below is traceable either to a public docs.newrelic.com page (cited as
+ * "Documented", paths relative to docs.newrelic.com/docs/) or to the public NerdGraph schema (cited as "Schema
+ * reference", using the type names shown in the GraphiQL explorer and mirrored by the generated types in
+ * github.com/newrelic/newrelic-client-go pkg/<package>/types.go). Fields that are neither documented nor read by a
+ * verdict are not requested, because one unknown field fails the whole document and every control that reads it.
+ * The full selection set is exported as NEWRELIC_NERDGRAPH_SELECTIONS so tests can hold it to that allowlist.
+ */
+
+/**
+ * Caller identity, organization, and account inventory.
+ * Documented: apis/nerdgraph/examples/manage-live-dashboard-urls-via-api queries actor.user { name }; the user and
+ *   group tutorials query under actor.organization; accounts/accounts-billing/account-structure/multi-tenancy/
+ *   delegated-administration filters collections by organization id.
+ * Schema reference: User { email id name } (pkg/users), Organization { id name } (pkg/organization),
+ *   AccountOutline { id name } (pkg/accounts).
+ */
 const QUERY_CURRENT_USER = "{ actor { user { id email name } } }";
 const QUERY_ORGANIZATION = "{ actor { organization { id name } } }";
 const QUERY_ACCOUNTS = "{ actor { accounts { id name } } }";
+/**
+ * Authentication domains and their users.
+ * Documented: apis/nerdgraph/examples/nerdgraph-manage-users ("Pagination"):
+ *   userManagement.authenticationDomains(cursor) { nextCursor totalCount authenticationDomains { id name } } and
+ *   authenticationDomains(id) { authenticationDomains { users(cursor) { nextCursor totalCount users { id name email
+ *   lastActive type { displayName id } } } } }; apis/nerdgraph/examples/nerdgraph-manage-groups documents
+ *   users { groups { groups { displayName } } } and groups { groups { displayName id } }.
+ * Schema reference: UserManagementAuthenticationDomain.provisioningType (pkg/usermanagement), read by control 19.
+ * emailVerificationState and timeZone are not requested because no verdict reads them.
+ */
 const QUERY_AUTHENTICATION_DOMAINS = `query($cursor: String) {
   actor { organization { userManagement {
     authenticationDomains(cursor: $cursor) {
@@ -724,11 +751,11 @@ const QUERY_AUTHENTICATION_DOMAINS = `query($cursor: String) {
 const QUERY_DOMAIN_USERS = `query($domainId: [ID!], $cursor: String) {
   actor { organization { userManagement {
     authenticationDomains(id: $domainId) { authenticationDomains {
-      id name provisioningType
+      id
       users(cursor: $cursor) {
         nextCursor totalCount
         users {
-          id name email lastActive emailVerificationState timeZone
+          id name email lastActive
           type { id displayName }
           groups { groups { id displayName } }
         }
@@ -736,16 +763,37 @@ const QUERY_DOMAIN_USERS = `query($domainId: [ID!], $cursor: String) {
     } }
   } } }
 }`;
+/**
+ * Group role grants.
+ * Documented: apis/nerdgraph/examples/nerdgraph-manage-groups ("Query existing roles"):
+ *   authorizationManagement.authenticationDomains { authenticationDomains { groups { groups { roles { roles
+ *   { accountId displayName id name organizationId type } } } } } }, and groups { groups { displayName id } }.
+ * The `id` filter on authenticationDomains and the cursor pagination on groups (nextCursor totalCount) mirror the
+ *   documented userManagement shape for the same collections. The authorizationManagement tutorial shows only the
+ *   nested shape, so when NerdGraph rejects either argument QUERY_DOMAIN_GROUP_GRANTS_DOCUMENTED reads that shape as
+ *   one page, filters it to the requested domain, and reports the listing as incomplete.
+ */
+const GROUP_GRANT_FIELDS = `groups {
+          id displayName
+          roles { roles { id name displayName type accountId organizationId } }
+        }`;
 const QUERY_DOMAIN_GROUP_GRANTS = `query($domainId: [ID!], $cursor: String) {
   actor { organization { authorizationManagement {
     authenticationDomains(id: $domainId) { authenticationDomains {
-      id name
+      id
       groups(cursor: $cursor) {
         nextCursor totalCount
-        groups {
-          id displayName
-          roles { roles { id name displayName type accountId organizationId } }
-        }
+        ${GROUP_GRANT_FIELDS}
+      }
+    } }
+  } } }
+}`;
+const QUERY_DOMAIN_GROUP_GRANTS_DOCUMENTED = `{
+  actor { organization { authorizationManagement {
+    authenticationDomains { authenticationDomains {
+      id
+      groups {
+        ${GROUP_GRANT_FIELDS}
       }
     } }
   } } }
@@ -822,9 +870,27 @@ const QUERY_API_KEYS_DOCUMENTED = `query($query: ApiAccessKeySearchQuery!) {
   } }
 }`;
 export const API_KEY_DOCUMENTED_ONLY_NOTE = "keySearch rejected the schema-cited fields, so only the documented fields (id, name, type, ingestType) were read on a single page; createdAt, userId, accountId, and pagination are unavailable and completeness is unknown";
+/**
+ * NRQL (NrAuditEvent and usage queries).
+ * Documented: apis/nerdgraph/examples/nerdgraph-nrql-tutorial: actor.account(id).nrql(query) { results }.
+ */
 const QUERY_NRQL = `query($accountId: Int!, $nrql: Nrql!) {
   actor { account(id: $accountId) { nrql(query: $nrql) { results } } }
 }`;
+/**
+ * Entity search (alert coverage, dashboards, synthetic monitors, secure credentials, workloads).
+ * Documented: apis/nerdgraph/examples/nerdgraph-entities-api-tutorial: entitySearch(query) { count results(cursor)
+ *   { nextCursor entities { name entityType guid domain reporting ... on AlertableEntityOutline { alertSeverity } } } };
+ *   apis/nerdgraph/examples/synthetics-api/query-synthetics-data: ... on SyntheticMonitorEntityOutline { guid name
+ *   accountId monitorType tags { key values } } and ... on SecureCredentialEntityOutline { accountId guid name tags };
+ *   apis/nerdgraph/examples/nerdgraph-workloads-api-tutorials: workloadStatus { statusValue } on WorkloadEntity;
+ *   apis/nerdgraph/examples/nerdgraph-dashboards: permissions on DashboardEntity.
+ * Schema reference (pkg/entities): EntityOutline.type; DashboardEntityOutline.permissions;
+ *   WorkloadEntityOutline.workloadStatus { statusValue }.
+ * Not requested because no verdict reads them: dashboardParentGuid, createdAt, updatedAt, owner { email userId }
+ *   (dashboards), monitoredUrl, period, monitorId (monitors), and the SecureCredentialEntityOutline fields
+ *   secureCredentialId, updatedAt, description; secure credentials are counted through the shared outline fields.
+ */
 const QUERY_ENTITY_SEARCH = `query($query: String!, $cursor: String) {
   actor { entitySearch(query: $query) {
     count
@@ -834,17 +900,25 @@ const QUERY_ENTITY_SEARCH = `query($query: String!, $cursor: String) {
         guid name entityType domain type accountId reporting
         tags { key values }
         ... on AlertableEntityOutline { alertSeverity }
-        ... on DashboardEntityOutline { permissions dashboardParentGuid createdAt updatedAt owner { email userId } }
-        ... on SyntheticMonitorEntityOutline { monitorType monitoredUrl period monitorId }
-        ... on SecureCredentialEntityOutline { secureCredentialId updatedAt description }
+        ... on DashboardEntityOutline { permissions }
+        ... on SyntheticMonitorEntityOutline { monitorType }
         ... on WorkloadEntityOutline { workloadStatus { statusValue } }
       }
     }
   } }
 }`;
+/**
+ * Alert policies and NRQL conditions.
+ * Documented: apis/nerdgraph/examples/nerdgraph-api-alerts-policies ("Paginating through policies"):
+ *   alerts.policiesSearch(cursor) { nextCursor policies { id name incidentPreference } totalCount };
+ *   apis/nerdgraph/examples/nerdgraph-api-nrql-condition-alerts ("List and filter NRQL conditions" and "Get all the
+ *   conditions for a policy"): nrqlConditionsSearch(cursor) { nextCursor totalCount nrqlConditions { id name type
+ *   enabled nrql { query } policyId } }.
+ * The policy accountId field is not requested; the account is recorded from the queried account instead.
+ */
 const QUERY_ALERT_POLICIES = `query($accountId: Int!, $cursor: String) {
   actor { account(id: $accountId) { alerts {
-    policiesSearch(cursor: $cursor) { nextCursor totalCount policies { id name incidentPreference accountId } }
+    policiesSearch(cursor: $cursor) { nextCursor totalCount policies { id name incidentPreference } }
   } } }
 }`;
 const QUERY_NRQL_CONDITIONS = `query($accountId: Int!, $cursor: String) {
@@ -911,6 +985,12 @@ const QUERY_WORKFLOWS = `query($accountId: Int!, $cursor: String) {
   } } }
 }`;
 const QUERY_WORKFLOWS_SINGLE_PAGE = QUERY_WORKFLOWS.replace("query($accountId: Int!, $cursor: String)", "query($accountId: Int!)").replace("workflows(filters: {}, cursor: $cursor)", "workflows(filters: {})");
+/**
+ * Data retention rules and customizable namespaces.
+ * Documented: data-apis/manage-data/manage-data-retention ("List active rules on an account" and "List the
+ *   customizable retention event namespaces"): dataManagement.eventRetentionRules { id deletedAt deletedById createdAt
+ *   createdById retentionInDays namespace } and customizableRetention { eventNamespaces { namespace } }.
+ */
 const QUERY_RETENTION_RULES = `query($accountId: Int!) {
   actor { account(id: $accountId) { dataManagement {
     eventRetentionRules { id namespace retentionInDays createdAt createdById deletedAt deletedById }
@@ -921,11 +1001,19 @@ const QUERY_RETENTION_NAMESPACES = `query($accountId: Int!) {
     customizableRetention { eventNamespaces { namespace } }
   } } }
 }`;
+/**
+ * Log obfuscation rules and expressions.
+ * Documented: logs/ui-data/obfuscation-ui ("Read an obfuscation rule" and "Read an obfuscation expression", the
+ *   populated GraphiQL links): logConfigurations.obfuscationRules { id name description filter enabled actions
+ *   { attributes expression { name } method } createdAt updatedAt } and obfuscationExpressions { id name regex
+ *   description createdAt updatedAt }. The expression id inside an action is not requested; the documented read
+ *   selects only its name.
+ */
 const QUERY_OBFUSCATION_RULES = `query($accountId: Int!) {
   actor { account(id: $accountId) { logConfigurations {
     obfuscationRules {
       id name description filter enabled createdAt updatedAt
-      actions { attributes method expression { id name } }
+      actions { attributes method expression { name } }
     }
   } } }
 }`;
@@ -934,22 +1022,41 @@ const QUERY_OBFUSCATION_EXPRESSIONS = `query($accountId: Int!) {
     obfuscationExpressions { id name regex description createdAt updatedAt }
   } } }
 }`;
+/**
+ * Pipeline Control cloud rules.
+ * Documented: new-relic-control/pipeline-control/cloud-rules/api-reference ("List all cloud rules"):
+ *   entityManagement.entitySearch(query: "type = 'PIPELINE_CLOUD_RULE'") { entities { id type
+ *   ... on EntityManagementPipelineCloudRuleEntity { id name nrql enabled } } }; the "Get a single cloud rule"
+ *   example adds description on the same type.
+ * Schema reference (pkg/pipelinecontrol): EntityManagementEntitySearchResult.nextCursor, read only to report that
+ *   more pages exist.
+ */
 const QUERY_PIPELINE_CLOUD_RULES = `{
   actor { entityManagement {
     entitySearch(query: "type = 'PIPELINE_CLOUD_RULE'") {
       nextCursor
       entities {
-        id name type
-        ... on EntityManagementPipelineCloudRuleEntity { nrql description enabled }
+        id type
+        ... on EntityManagementPipelineCloudRuleEntity { id name nrql description enabled }
       }
     }
   } }
 }`;
+/**
+ * NRQL drop rules.
+ * Documented: data-apis/manage-data/drop-data-using-nerdgraph ("returns the drop rules set on an account"):
+ *   nrqlDropRules.list { rules { id nrql accountId action createdBy createdAt description } error { reason description } }.
+ */
 const QUERY_NRQL_DROP_RULES = `query($accountId: Int!) {
   actor { account(id: $accountId) { nrqlDropRules {
     list { rules { id nrql accountId action createdBy createdAt description } error { reason description } }
   } } }
 }`;
+/**
+ * Scripted monitor source.
+ * Documented: apis/nerdgraph/examples/synthetics-api/query-synthetics-data ("Query monitor script"):
+ *   account(id).synthetics.script(monitorGuid) { text }.
+ */
 const QUERY_SYNTHETIC_SCRIPT = `query($accountId: Int!, $monitorGuid: EntityGuid!) {
   actor { account(id: $accountId) { synthetics { script(monitorGuid: $monitorGuid) { text } } } }
 }`;
@@ -965,6 +1072,38 @@ const QUERY_SYNTHETIC_SCRIPT = `query($accountId: Int!, $monitorGuid: EntityGuid
 const QUERY_DASHBOARD_LIVE_URLS = `{
   actor { dashboard { liveUrls { liveUrls { title type createdAt } errors { description } } } }
 }`;
+
+/** Every NerdGraph selection the inspector can send, keyed by purpose, so tests can hold it to the documented allowlist. */
+export const NEWRELIC_NERDGRAPH_SELECTIONS: Readonly<Record<string, string>> = Object.freeze({
+  currentUser: QUERY_CURRENT_USER,
+  organization: QUERY_ORGANIZATION,
+  accounts: QUERY_ACCOUNTS,
+  authenticationDomains: QUERY_AUTHENTICATION_DOMAINS,
+  domainUsers: QUERY_DOMAIN_USERS,
+  domainGroupGrants: QUERY_DOMAIN_GROUP_GRANTS,
+  domainGroupGrantsDocumented: QUERY_DOMAIN_GROUP_GRANTS_DOCUMENTED,
+  roleCatalogFields: `${ROLE_FIELDS} ${ROLE_COLLECTION_FIELDS}`,
+  organizationAuthenticationDomainFields: `${AUTHENTICATION_DOMAIN_FIELDS} ${AUTHENTICATION_DOMAIN_COLLECTION_FIELDS}`,
+  apiKeys: QUERY_API_KEYS,
+  apiKeysSinglePage: QUERY_API_KEYS_SINGLE_PAGE,
+  apiKeysDocumented: QUERY_API_KEYS_DOCUMENTED,
+  nrql: QUERY_NRQL,
+  entitySearch: QUERY_ENTITY_SEARCH,
+  alertPolicies: QUERY_ALERT_POLICIES,
+  nrqlConditions: QUERY_NRQL_CONDITIONS,
+  destinations: QUERY_DESTINATIONS,
+  channels: QUERY_CHANNELS,
+  workflows: QUERY_WORKFLOWS,
+  workflowsSinglePage: QUERY_WORKFLOWS_SINGLE_PAGE,
+  retentionRules: QUERY_RETENTION_RULES,
+  retentionNamespaces: QUERY_RETENTION_NAMESPACES,
+  obfuscationRules: QUERY_OBFUSCATION_RULES,
+  obfuscationExpressions: QUERY_OBFUSCATION_EXPRESSIONS,
+  pipelineCloudRules: QUERY_PIPELINE_CLOUD_RULES,
+  nrqlDropRules: QUERY_NRQL_DROP_RULES,
+  syntheticScript: QUERY_SYNTHETIC_SCRIPT,
+  dashboardLiveUrls: QUERY_DASHBOARD_LIVE_URLS,
+});
 
 export class NewrelicApiClient {
   private readonly config: NewrelicResolvedConfig;
@@ -1257,13 +1396,19 @@ export class NewrelicApiClient {
   }
 
   async listDomainGroupGrants(domainId: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
-    const groups = await this.paginate(
-      QUERY_DOMAIN_GROUP_GRANTS,
-      { domainId: [domainId] },
-      ["actor", "organization", "authorizationManagement", "authenticationDomains", "authenticationDomains", 0, "groups"],
-      "groups",
-      limit,
-    );
+    let groups: PagedList;
+    try {
+      groups = await this.paginate(
+        QUERY_DOMAIN_GROUP_GRANTS,
+        { domainId: [domainId] },
+        ["actor", "organization", "authorizationManagement", "authenticationDomains", "authenticationDomains", 0, "groups"],
+        "groups",
+        limit,
+      );
+    } catch (error) {
+      if (!isSchemaMismatchError(error)) throw error;
+      groups = await this.listDomainGroupGrantsDocumented(domainId, limit);
+    }
     return {
       ...groups,
       items: groups.items.map((group) => {
@@ -1275,6 +1420,24 @@ export class NewrelicApiClient {
           rolesReadable: roleContainer !== undefined,
         };
       }),
+    };
+  }
+
+  /**
+   * Reads the documented (unfiltered, unpaginated) authorizationManagement shape and keeps the groups of one domain.
+   * Without nextCursor the listing cannot be proven complete, so it is always reported as incomplete.
+   */
+  private async listDomainGroupGrantsDocumented(domainId: string, limit: number): Promise<PagedList> {
+    const data = await this.nerdgraph(QUERY_DOMAIN_GROUP_GRANTS_DOCUMENTED);
+    const domains = asRecords(getNestedValue(data, ["actor", "organization", "authorizationManagement", "authenticationDomains", "authenticationDomains"]));
+    const domain = domains.find((candidate) => asString(candidate.id) === domainId);
+    const items = asRecords(asObject(domain?.groups)?.groups).slice(0, limit);
+    return {
+      items,
+      complete: false,
+      note: domain
+        ? `authorizationManagement.authenticationDomains rejected the domain filter or cursor argument, so the documented unpaginated shape was read (${items.length} groups on one page, completeness unknown)`
+        : `authorizationManagement.authenticationDomains rejected the domain filter or cursor argument and the documented unpaginated shape did not include domain ${domainId} (${domains.length} domains returned)`,
     };
   }
 
