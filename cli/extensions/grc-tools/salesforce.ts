@@ -1377,14 +1377,26 @@ function sensitiveProfiles(profiles: JsonRecord[]): JsonRecord[] {
   return profiles.filter((profile) => isAdminProfile(profile) || hasElevatedPermission(profile).length > 0);
 }
 
-function loginHoursRestricted(record: JsonRecord): boolean {
-  const hours = asObject(record.loginHours);
-  if (!hours) return false;
-  return WEEKDAYS.some((day) => {
+interface LoginHoursView {
+  bounded: string[];
+  unbounded: string[];
+}
+
+function loginHoursView(record: JsonRecord): LoginHoursView {
+  const hours = asObject(record.loginHours) ?? {};
+  const bounded: string[] = [];
+  const unbounded: string[] = [];
+  for (const day of WEEKDAYS) {
     const start = asNumber(hours[`${day}Start`]);
     const end = asNumber(hours[`${day}End`]);
-    return start !== undefined && end !== undefined && !(start === 0 && end === MINUTES_PER_DAY);
-  });
+    const restricted = start !== undefined && end !== undefined && !(start === 0 && end === MINUTES_PER_DAY);
+    (restricted ? bounded : unbounded).push(day);
+  }
+  return { bounded, unbounded };
+}
+
+function loginHoursLabel(record: JsonRecord): string {
+  return `${profileMetadataLabel(record)} (unbounded: ${loginHoursView(record).unbounded.join(", ")})`;
 }
 
 function loginIpRangeCount(record: JsonRecord): number {
@@ -1850,22 +1862,32 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     findings.push(finding(6, "manual", `Login hour restrictions could not be verified because ${hoursIssue}.`, { ...populationEvidence, profile_metadata_status: data.profileMetadata.status, profile_metadata_error: data.profileMetadata.error ?? null }, hoursManual));
   } else {
     const view = profileMetadataView(data.profileMetadata);
-    const restricted = view.resolved.filter(loginHoursRestricted);
-    const unrestricted = view.resolved.filter((record) => !loginHoursRestricted(record));
+    const restricted = view.resolved.filter((record) => loginHoursView(record).unbounded.length === 0);
+    const partiallyRestricted = view.resolved.filter((record) => {
+      const hours = loginHoursView(record);
+      return hours.bounded.length > 0 && hours.unbounded.length > 0;
+    });
+    const unrestricted = view.resolved.filter((record) => loginHoursView(record).bounded.length === 0);
     const evidence = {
       sensitive_profiles: data.profileMetadata.total ?? null,
       sensitive_profiles_read: view.resolved.length,
       profiles_with_login_hours: truncateList(restricted.map(profileMetadataLabel)),
+      profiles_with_partial_login_hours: truncateList(partiallyRestricted.map(loginHoursLabel)),
       profiles_without_login_hours: truncateList(unrestricted.map(profileMetadataLabel)),
       profiles_unresolved: truncateList(view.unresolved.map(profileMetadataLabel)),
       profile_metadata_truncated: data.profileMetadata.truncated,
     };
-    if (unrestricted.length === 0 && view.complete) {
-      findings.push(finding(6, "pass", `All ${view.resolved.length} sensitive profiles (System Administrator and profiles with elevated permissions) restrict login hours.`, evidence));
-    } else if (restricted.length === 0) {
-      findings.push(finding(6, "fail", `None of the ${view.resolved.length} sensitive profiles read restrict login hours (loginHours absent or covering the full day).${view.complete ? "" : ` ${view.unresolved.length} sensitive profiles could not be resolved.`}`, evidence, hoursManual));
+    if (restricted.length === view.resolved.length && view.complete) {
+      findings.push(finding(6, "pass", `All ${view.resolved.length} sensitive profiles (System Administrator and profiles with elevated permissions) restrict login hours on every day of the week.`, evidence));
+    } else if (restricted.length === 0 && partiallyRestricted.length === 0) {
+      findings.push(finding(6, "fail", `None of the ${view.resolved.length} sensitive profiles read restrict login hours (loginHours absent or covering the full day on every day).${view.complete ? "" : ` ${view.unresolved.length} sensitive profiles could not be resolved.`}`, evidence, hoursManual));
     } else {
-      findings.push(finding(6, "warn", `${restricted.length}/${view.resolved.length} sensitive profiles restrict login hours; ${unrestricted.length} do not${view.complete ? "" : ` and ${view.unresolved.length} could not be resolved`}.`, evidence, hoursManual));
+      const gaps: string[] = [];
+      if (partiallyRestricted.length > 0) gaps.push(`${partiallyRestricted.length} restrict only some days and leave the others open: ${partiallyRestricted.map(loginHoursLabel).join("; ")}`);
+      if (unrestricted.length > 0) gaps.push(`${unrestricted.length} restrict no day`);
+      if (view.unresolved.length > 0) gaps.push(`${view.unresolved.length} could not be resolved`);
+      if (data.profileMetadata.truncated) gaps.push(`only ${view.resolved.length} of ${data.profileMetadata.total ?? "?"} sensitive profiles were read`);
+      findings.push(finding(6, "warn", `${restricted.length}/${view.resolved.length} sensitive profiles restrict login hours on every day of the week; ${gaps.join("; ")}.`, evidence, hoursManual));
     }
   }
 

@@ -145,7 +145,10 @@ const goodTwoFactor = [
   { UserId: "U2", HasSalesforceAuthenticator: true },
 ];
 
-const businessHours = Object.fromEntries(["monday", "tuesday", "wednesday", "thursday", "friday"].flatMap((day) => [[`${day}Start`, "420"], [`${day}End`, "1140"]]));
+const businessHours = Object.fromEntries([
+  ...["monday", "tuesday", "wednesday", "thursday", "friday"].flatMap((day) => [[`${day}Start`, "420"], [`${day}End`, "1140"]]),
+  ...["saturday", "sunday"].flatMap((day) => [[`${day}Start`, "0"], [`${day}End`, "0"]]),
+]);
 
 const goodProfileListing = [
   { fullName: "Admin", id: "P-admin", type: "Profile", fileName: "profiles/Admin.profile" },
@@ -1117,6 +1120,50 @@ test("review fix 8: OauthToken is a partial view without Customize Application a
   assert.equal(tokenSurface.status, "readable");
   assert.match(tokenSurface.permissionHint, /Customize Application/);
   assert.ok(access.surfaces.some((surface) => surface.name === "caller_permissions" && surface.status === "readable"));
+});
+
+test("review round 2 fix 1: control 6 requires every weekday to be bounded and never passes a profile that restricts a single day", () => {
+  const adminRecord = (loginHours) => ({ fullName: "Admin", custom: "false", loginHours, loginIpRanges: goodProfileMetadataRecords[0].loginIpRanges });
+  const hoursFor = (days, start, end) => Object.fromEntries(days.flatMap((day) => [[`${day}Start`, start], [`${day}End`, end]]));
+  const weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"];
+  const sf06 = (loginHours) => findingById(assessSalesforceIdentityData(goodIdentityData({ profileMetadata: profileMetadataDataset([adminRecord(loginHours)]) }), { now: NOW }), "SF-06");
+
+  const saturdayOnly = sf06({ saturdayStart: "0", saturdayEnd: "60" });
+  assert.equal(saturdayOnly.status, "warn", "bounding Saturday alone leaves every other day open and must not pass");
+  assert.deepEqual(saturdayOnly.evidence.profiles_with_login_hours, []);
+  assert.deepEqual(saturdayOnly.evidence.profiles_with_partial_login_hours, ["System Administrator (unbounded: monday, tuesday, wednesday, thursday, friday, sunday)"]);
+  assert.deepEqual(saturdayOnly.evidence.profiles_without_login_hours, []);
+  assert.match(saturdayOnly.summary, /0\/1 sensitive profiles restrict login hours on every day of the week; 1 restrict only some days and leave the others open: System Administrator \(unbounded: monday, tuesday, wednesday, thursday, friday, sunday\)/);
+
+  const weekdaysOnly = sf06(hoursFor(weekdays, "420", "1140"));
+  assert.equal(weekdaysOnly.status, "warn", "unspecified weekend days are unrestricted");
+  assert.match(weekdaysOnly.summary, /unbounded: saturday, sunday/);
+
+  const fullDayWeekend = sf06({ ...hoursFor(weekdays, "420", "1140"), ...hoursFor(["saturday", "sunday"], "0", "1440") });
+  assert.equal(fullDayWeekend.status, "warn", "a full-day window is not a restriction");
+  assert.match(fullDayWeekend.summary, /unbounded: saturday, sunday/);
+
+  assert.equal(sf06({ ...hoursFor(weekdays, "420", "1140"), ...hoursFor(["saturday", "sunday"], "0", "0") }).status, "pass", "blocked weekend days (start equals end) are bounded");
+  assert.equal(sf06(hoursFor(ALL_WEEKDAYS, "480", "1080")).status, "pass");
+  assert.equal(sf06(hoursFor(ALL_WEEKDAYS, "0", "1440")).status, "fail");
+  assert.equal(sf06(undefined).status, "fail");
+
+  const population = okDataset("Profile metadata", [
+    { ...adminRecord(hoursFor(ALL_WEEKDAYS, "480", "1080")), _profileId: "P-admin", _profileName: "System Administrator", _fullName: "Admin", _resolved: true },
+    { ...adminRecord({ mondayStart: "480", mondayEnd: "1080" }), fullName: "Ops", _profileId: "P-ops", _profileName: "Ops Admin", _fullName: "Ops", _resolved: true },
+    { ...adminRecord(undefined), fullName: "Sec", _profileId: "P-sec", _profileName: "Security Admin", _fullName: "Sec", _resolved: true },
+  ]);
+  const mixed = findingById(assessSalesforceIdentityData(goodIdentityData({ profileMetadata: population }), { now: NOW }), "SF-06");
+  assert.equal(mixed.status, "warn");
+  assert.deepEqual(mixed.evidence.profiles_with_login_hours, ["System Administrator"]);
+  assert.deepEqual(mixed.evidence.profiles_with_partial_login_hours, ["Ops Admin (unbounded: tuesday, wednesday, thursday, friday, saturday, sunday)"]);
+  assert.deepEqual(mixed.evidence.profiles_without_login_hours, ["Security Admin"]);
+  assert.match(mixed.summary, /^1\/3 sensitive profiles restrict login hours on every day of the week; 1 restrict only some days and leave the others open: Ops Admin \(unbounded: tuesday, wednesday, thursday, friday, saturday, sunday\); 1 restrict no day\.$/);
+
+  const capped = okDataset("Profile metadata", [population.data[0]], { truncated: true, total: 60 });
+  const cappedFinding = findingById(assessSalesforceIdentityData(goodIdentityData({ profileMetadata: capped }), { now: NOW }), "SF-06");
+  assert.equal(cappedFinding.status, "warn", "a truncated sensitive profile read never passes");
+  assert.match(cappedFinding.summary, /only 1 of 60 sensitive profiles were read/);
 });
 
 test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports, quick reference, zip, and _errors.log on partial failure", async () => {
