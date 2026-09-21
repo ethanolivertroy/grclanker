@@ -211,11 +211,17 @@ export interface GitHubFinding {
   frameworks: FrameworkMap;
 }
 
+// Every metric in a snapshot summary is a `<name>` value paired with a `<name>_status` string. The
+// status starts with `complete:` or `partial:` (naming the endpoints that were read), or with
+// `unreadable:`, `not collected:`, or `unknown:` (naming the denied or skipped endpoint), in which
+// case the value is null: unreadable or never-collected data never renders as 0 or [].
+export type GitHubSnapshotSummary = Record<string, number | string | null>;
+
 export interface GitHubAssessmentResult {
   category: CheckDefinition["category"];
   findings: GitHubFinding[];
   summary: Record<GitHubFindingStatus, number>;
-  snapshotSummary: Record<string, number | string>;
+  snapshotSummary: GitHubSnapshotSummary;
   text: string;
 }
 
@@ -1077,6 +1083,7 @@ const ORG_ENDPOINTS = {
   outsideCollaborators: "GET /orgs/{org}/outside_collaborators",
   invitations: "GET /orgs/{org}/invitations",
   organizationRoles: "GET /orgs/{org}/organization-roles",
+  credentialAuthorizations: "GET /orgs/{org}/credential-authorizations",
   auditLog: "GET /orgs/{org}/audit-log",
   hooks: "GET /orgs/{org}/hooks",
   installations: "GET /orgs/{org}/installations",
@@ -1089,6 +1096,15 @@ const ORG_ENDPOINTS = {
   runners: "GET /orgs/{org}/actions/runners",
   codeSecurityConfigurations: "GET /orgs/{org}/code-security/configurations",
   codeSecurityDefaults: "GET /orgs/{org}/code-security/configurations/defaults",
+} as const;
+
+// Per-repository endpoints spelled as templates; the fan-out collectors call them once per active
+// repository, so a summary status names the template and lists the repositories that failed.
+const REPO_ENDPOINTS = {
+  branchRules: "GET /repos/{owner}/{repo}/rules/branches/{branch}",
+  branchProtection: "GET /repos/{owner}/{repo}/branches/{branch}/protection",
+  hooks: "GET /repos/{owner}/{repo}/hooks",
+  keys: "GET /repos/{owner}/{repo}/keys",
 } as const;
 
 // A count or list derived from an unreadable inventory renders as null plus the endpoint and the
@@ -1944,7 +1960,9 @@ const ORGANIZATION_FIELDS = [
 const SIMPLE_USER_FIELDS = ["login", "id", "type", "site_admin"] as const;
 const INVITATION_FIELDS = ["id", "login", "role", "created_at", "failed_at", "failed_reason", "invitation_source", "team_count"] as const;
 const ORGANIZATION_ROLE_FIELDS = ["id", "name", "description", "base_role", "source", "permissions", "created_at", "updated_at"] as const;
-// token_last_eight and fingerprint are credential fragments and never persist.
+// token_last_eight and fingerprint are credential fragments and never persist; the free-text
+// authorized_credential_title and authorized_credential_note labels are read by no verdict and
+// are dropped too, since operators paste secrets into them.
 const CREDENTIAL_AUTHORIZATION_FIELDS = [
   "login",
   "credential_id",
@@ -1952,8 +1970,6 @@ const CREDENTIAL_AUTHORIZATION_FIELDS = [
   "credential_authorized_at",
   "credential_accessed_at",
   "authorized_credential_id",
-  "authorized_credential_title",
-  "authorized_credential_note",
   "authorized_credential_expires_at",
   "scopes",
 ] as const;
@@ -2542,12 +2558,77 @@ function countFilesInResult(entries: Array<string | { name: string }>): number {
   return entries.length;
 }
 
-function datasetSnapshotCount(dataset: CollectedDataset<unknown>): number | string {
-  if (dataset.error) return "error";
-  if (Array.isArray(dataset.data)) return dataset.data.length;
-  if (dataset.data && typeof dataset.data === "object") return Object.keys(dataset.data as JsonRecord).length;
-  if (dataset.data === null || dataset.data === undefined) return 0;
-  return 1;
+function summaryMetric(name: string, value: number | string | null, status: string): GitHubSnapshotSummary {
+  return { [name]: value, [`${name}_status`]: status };
+}
+
+function unreadableStatus(endpoint: string, error: string | undefined): string {
+  return `unreadable: ${endpoint} (${error ?? "no data returned"})`;
+}
+
+function notCollectedAfterRepos(reposError: string | undefined, skipped: string): string {
+  return reposError
+    ? `not collected: ${ORG_ENDPOINTS.repos} was unreadable (${reposError}), so ${skipped} was not called`
+    : `not collected: ${ORG_ENDPOINTS.repos} listed no active repositories, so ${skipped} was not called`;
+}
+
+// A list read from one documented endpoint: the count when it answered, null plus the failure
+// (which carries the HTTP status) when it did not.
+function listMetric(name: string, dataset: CollectedDataset<JsonRecord[]>, endpoint: string): GitHubSnapshotSummary {
+  if (dataset.error) return summaryMetric(name, null, unreadableStatus(endpoint, dataset.error));
+  return summaryMetric(name, dataset.data.length, `complete: ${endpoint} returned ${dataset.data.length} record(s)`);
+}
+
+// A per-repository fan-out (hooks, deploy keys): entries carrying an error are excluded from the
+// count and listed in the status; when no repository answered the count is null, not 0.
+function perRepoMetric(
+  name: string,
+  repositories: CollectedDataset<JsonRecord[]>,
+  fanOut: CollectedDataset<Record<string, GitHubRepoListEntry>>,
+  endpointSuffix: "hooks" | "keys",
+): GitHubSnapshotSummary {
+  const endpoint = REPO_ENDPOINTS[endpointSuffix];
+  if (repositories.error) return summaryMetric(name, null, notCollectedAfterRepos(repositories.error, endpoint));
+  if (fanOut.error) return summaryMetric(name, null, unreadableStatus(endpoint, fanOut.error));
+  const entries = Object.entries(fanOut.data);
+  if (entries.length === 0) return summaryMetric(name, null, notCollectedAfterRepos(undefined, endpoint));
+  const unreadable = entries.filter(([, entry]) => entry.error !== undefined || entry.items === null);
+  const readable = entries.filter(([, entry]) => entry.error === undefined && entry.items !== null);
+  if (readable.length === 0) {
+    return summaryMetric(name, null, `unreadable: ${endpoint} for all ${entries.length} repositories (${describeUnreadableRepos(unreadable, endpointSuffix, 10)})`);
+  }
+  const total = readable.reduce((sum, [, entry]) => sum + (entry.items?.length ?? 0), 0);
+  if (unreadable.length > 0) {
+    return summaryMetric(name, total, `partial: ${endpoint} readable for ${readable.length} of ${entries.length} repositories; unreadable: ${describeUnreadableRepos(unreadable, endpointSuffix, 10)}`);
+  }
+  return summaryMetric(name, total, `complete: ${endpoint} readable for all ${entries.length} repositories`);
+}
+
+interface GraphqlConnectionState {
+  collected: number;
+  totalCount: number | null;
+  truncated: boolean;
+  errors: GitHubGraphqlError[];
+}
+
+// A paginated GraphQL connection: null when it was denied (errors and nothing collected) or
+// truncated before anything arrived; partial when errors or truncation left records unfetched.
+function connectionMetric(name: string, field: string, state: GraphqlConnectionState): GitHubSnapshotSummary {
+  const described = describeGraphqlErrors(state.errors);
+  if (state.errors.length > 0 && state.collected === 0) {
+    return summaryMetric(name, null, `unreadable: GraphQL ${field} (${described})`);
+  }
+  if (state.truncated && state.collected === 0) {
+    return summaryMetric(name, null, `not collected: GraphQL ${field} returned no nodes before the connection was truncated (totalCount ${state.totalCount ?? "unknown"})`);
+  }
+  if (state.truncated || state.errors.length > 0) {
+    const parts = [
+      state.truncated ? `truncated at ${state.collected} of ${state.totalCount ?? "an unknown total"}` : null,
+      state.errors.length > 0 ? `errors: ${described}` : null,
+    ].filter((part): part is string => part !== null);
+    return summaryMetric(name, state.collected, `partial: GraphQL ${field} ${parts.join("; ")}`);
+  }
+  return summaryMetric(name, state.collected, `complete: GraphQL ${field} returned ${state.collected} of ${state.totalCount ?? state.collected} node(s)`);
 }
 
 export async function runGitHubAccessCheck(
@@ -2841,13 +2922,28 @@ function assessSamlSso(data: GitHubOrgAccessData): GitHubFinding {
   const unlinkedMembers = members.data
     .map((member) => asString(member.login) ?? "")
     .filter((login) => login.length > 0 && !linkedLogins.has(login.toLowerCase()));
+  // An externalIdentities connection that was truncated or carried errors is an incomplete
+  // inventory: the linked count is null, and no member is named as unlinked on the strength of
+  // identities that were never fetched (rule 1 corollary).
+  const identitiesField = "GraphQL organization.samlIdentityProvider.externalIdentities";
+  const identitiesIncomplete = snapshot.externalIdentitiesTruncated || providerErrors.length > 0
+    ? [
+      providerErrors.length > 0 ? `errors: ${describeGraphqlErrors(providerErrors)}` : null,
+      snapshot.externalIdentitiesTruncated ? `truncated at ${snapshot.externalIdentities.length} of ${snapshot.externalIdentitiesTotalCount ?? "an unknown total"}` : null,
+    ].filter((part): part is string => part !== null).join("; ")
+    : null;
+  const membersEvidence = (): string => {
+    if (members.error) return `${nullEvidence("members", ORG_ENDPOINTS.members, members.error)}; members_without_saml_identity = null`;
+    if (identitiesIncomplete) return `members = ${memberCount}; members_without_saml_identity = null (not derived: ${identitiesField} incomplete, ${identitiesIncomplete})`;
+    return `members = ${memberCount}, members_without_saml_identity = ${unlinkedMembers.length}${unlinkedMembers.length > 0 ? ` (${unlinkedMembers.slice(0, 10).join(", ")}${unlinkedMembers.length > 10 ? ", ..." : ""})` : ""}`;
+  };
   const evidence = [
     `samlIdentityProvider.ssoUrl = ${snapshot.samlIdentityProvider.ssoUrl ?? "null"}`,
     `samlIdentityProvider.issuer = ${snapshot.samlIdentityProvider.issuer ?? "null"}`,
-    `external_identities_linked_to_members = ${linked.length} (totalCount ${snapshot.externalIdentitiesTotalCount ?? "unknown"}${snapshot.externalIdentitiesTruncated ? ", truncated" : ""})`,
-    members.error
-      ? `${nullEvidence("members", ORG_ENDPOINTS.members, members.error)}; members_without_saml_identity = null`
-      : `members = ${memberCount}, members_without_saml_identity = ${unlinkedMembers.length}${unlinkedMembers.length > 0 ? ` (${unlinkedMembers.slice(0, 10).join(", ")}${unlinkedMembers.length > 10 ? ", ..." : ""})` : ""}`,
+    identitiesIncomplete
+      ? `external_identities_linked_to_members = null (${identitiesField} incomplete: ${identitiesIncomplete})`
+      : `external_identities_linked_to_members = ${linked.length} (totalCount ${snapshot.externalIdentitiesTotalCount ?? snapshot.externalIdentities.length})`,
+    membersEvidence(),
     "Note: the public GraphQL schema exposes SAML configuration and identity links, not a separate 'require SSO' flag; complete linkage is the observable proxy.",
   ];
 
@@ -3730,17 +3826,16 @@ export function assessGitHubIntegrations(
     assessOAuthRestrictions(data),
     assessPackageRegistryAccess(),
   ];
-  const deployKeyEntries = Object.values(data.deployKeys.data);
   return {
     category: "integrations",
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      org_webhooks: datasetSnapshotCount(data.hooks),
-      repo_webhooks: data.repoHooks.error ? "error" : Object.values(data.repoHooks.data).reduce((total, entry) => total + (entry.items?.length ?? 0), 0),
-      deploy_keys: data.deployKeys.error ? "error" : deployKeyEntries.reduce((total, entry) => total + (entry.items?.length ?? 0), 0),
-      app_installations: datasetSnapshotCount(data.appInstallations),
-      credential_authorizations: datasetSnapshotCount(data.credentialAuthorizations),
+      ...listMetric("org_webhooks", data.hooks, ORG_ENDPOINTS.hooks),
+      ...perRepoMetric("repo_webhooks", data.repositories, data.repoHooks, "hooks"),
+      ...perRepoMetric("deploy_keys", data.repositories, data.deployKeys, "keys"),
+      ...listMetric("app_installations", data.appInstallations, ORG_ENDPOINTS.installations),
+      ...listMetric("credential_authorizations", data.credentialAuthorizations, ORG_ENDPOINTS.credentialAuthorizations),
     },
     text: buildAssessmentText("GitHub integrations assessment", config.organization, findings),
   };
@@ -3883,19 +3978,63 @@ export function assessGitHubOrgAccess(
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      members: datasetSnapshotCount(data.members),
-      admin_members: datasetSnapshotCount(data.adminMembers),
-      members_without_2fa: datasetSnapshotCount(data.twoFactorDisabledMembers),
-      outside_collaborators: datasetSnapshotCount(data.outsideCollaborators),
-      invitations: datasetSnapshotCount(data.invitations),
-      audit_events: data.auditLog.error ? "error" : data.auditLog.data.events.length,
-      hooks: datasetSnapshotCount(data.hooks),
-      saml_external_identities: data.samlIdentity.error ? "error" : (data.samlIdentity.data?.externalIdentities.length ?? 0),
-      ip_allow_list_entries: data.ipAllowList.error ? "error" : (data.ipAllowList.data?.entries.length ?? 0),
+      ...listMetric("members", data.members, ORG_ENDPOINTS.members),
+      ...listMetric("admin_members", data.adminMembers, ORG_ENDPOINTS.adminMembers),
+      ...listMetric("members_without_2fa", data.twoFactorDisabledMembers, ORG_ENDPOINTS.twoFactorDisabledMembers),
+      ...listMetric("outside_collaborators", data.outsideCollaborators, ORG_ENDPOINTS.outsideCollaborators),
+      ...listMetric("invitations", data.invitations, ORG_ENDPOINTS.invitations),
+      ...auditEventsMetric(data.auditLog),
+      ...listMetric("hooks", data.hooks, ORG_ENDPOINTS.hooks),
+      ...samlExternalIdentitiesMetric(data.samlIdentity),
+      ...ipAllowListEntriesMetric(data.ipAllowList),
       enterprise: config.enterprise ?? "not configured",
     },
     text: buildAssessmentText("GitHub org access assessment", config.organization, findings),
   };
+}
+
+function auditEventsMetric(dataset: CollectedDataset<GitHubAuditLogSnapshot>): GitHubSnapshotSummary {
+  if (dataset.error) return summaryMetric("audit_events", null, unreadableStatus(ORG_ENDPOINTS.auditLog, dataset.error));
+  const log = dataset.data;
+  return summaryMetric(
+    "audit_events",
+    log.events.length,
+    log.truncated
+      ? `partial: ${ORG_ENDPOINTS.auditLog} capped at ${log.limit} event(s) within the ${log.phrase} window`
+      : `complete: ${ORG_ENDPOINTS.auditLog} returned ${log.events.length} event(s) within the ${log.phrase} window`,
+  );
+}
+
+function samlExternalIdentitiesMetric(dataset: CollectedDataset<GitHubSamlIdentitySnapshot | null>): GitHubSnapshotSummary {
+  const name = "saml_external_identities";
+  if (dataset.error) return summaryMetric(name, null, unreadableStatus("GraphQL organization.samlIdentityProvider", dataset.error));
+  const snapshot = dataset.data;
+  if (!snapshot) return summaryMetric(name, null, "not collected: GraphQL organization.samlIdentityProvider was not queried");
+  const providerErrors = graphqlErrorsForPath(snapshot.errors, ["organization", "samlIdentityProvider"]);
+  if (!snapshot.samlIdentityProvider) {
+    return providerErrors.length > 0
+      ? summaryMetric(name, null, `unreadable: GraphQL organization.samlIdentityProvider (${describeGraphqlErrors(providerErrors)})`)
+      : summaryMetric(name, 0, "complete: GraphQL organization.samlIdentityProvider is null (no organization-level SAML provider, so no externalIdentities connection exists)");
+  }
+  return connectionMetric(name, "organization.samlIdentityProvider.externalIdentities", {
+    collected: snapshot.externalIdentities.length,
+    totalCount: snapshot.externalIdentitiesTotalCount,
+    truncated: snapshot.externalIdentitiesTruncated,
+    errors: providerErrors,
+  });
+}
+
+function ipAllowListEntriesMetric(dataset: CollectedDataset<GitHubIpAllowListSnapshot | null>): GitHubSnapshotSummary {
+  const name = "ip_allow_list_entries";
+  if (dataset.error) return summaryMetric(name, null, unreadableStatus("GraphQL organization.ipAllowListEntries", dataset.error));
+  const snapshot = dataset.data;
+  if (!snapshot) return summaryMetric(name, null, "not collected: GraphQL organization.ipAllowListEntries was not queried");
+  return connectionMetric(name, "organization.ipAllowListEntries", {
+    collected: snapshot.entries.length,
+    totalCount: snapshot.entriesTotalCount,
+    truncated: snapshot.entriesTruncated,
+    errors: graphqlErrorsForPath(snapshot.errors, ["organization", "ipAllowListEntries"]),
+  });
 }
 
 interface RepoProtectionPosture {
@@ -4297,20 +4436,60 @@ export function assessGitHubRepoProtection(
     ),
   ];
 
+  // Summary metrics derived from the per-repository reads: null with the reason when the
+  // repository list was unreadable (the reads were never issued) or when no repository could be
+  // fully evaluated; counted over the evaluated repositories otherwise, with the gaps named.
+  const perRepoReads = `${REPO_ENDPOINTS.branchRules} and ${REPO_ENDPOINTS.branchProtection}`;
+  const evaluatedMetric = (name: string, count: number, completeStatus: string, partialStatus: string): GitHubSnapshotSummary => {
+    if (repositoriesUnreadable) return summaryMetric(name, null, notCollectedAfterRepos(data.repositories.error, perRepoReads));
+    if (repoCount === 0) return summaryMetric(name, null, notCollectedAfterRepos(undefined, perRepoReads));
+    if (noneEvaluated) {
+      return summaryMetric(name, null, `unreadable: ${perRepoReads} could not both be read for any of the ${repoCount} active repositories; ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`);
+    }
+    if (unevaluated.length > 0) return summaryMetric(name, count, `partial: ${partialStatus}; ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`);
+    return summaryMetric(name, count, `complete: ${completeStatus}`);
+  };
+  const countedMetric = (name: string, count: number): GitHubSnapshotSummary => evaluatedMetric(
+    name,
+    count,
+    `counted across all ${repoCount} active repositories (${perRepoReads} read for each)`,
+    `counted across ${evaluated.length} of ${repoCount} active repositories`,
+  );
+  const notEvaluableMetric = (): GitHubSnapshotSummary => {
+    if (repositoriesUnreadable) return summaryMetric("repos_not_evaluable", null, notCollectedAfterRepos(data.repositories.error, perRepoReads));
+    if (repoCount === 0) return summaryMetric("repos_not_evaluable", null, notCollectedAfterRepos(undefined, perRepoReads));
+    return summaryMetric(
+      "repos_not_evaluable",
+      unevaluated.length,
+      unevaluated.length === 0
+        ? `complete: ${perRepoReads} read for every one of the ${repoCount} active repositories`
+        : `complete: ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)} (${repoCount} active)`,
+    );
+  };
+
   return {
     category: "repo_protection",
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      active_repositories: repositoriesUnreadable ? "error" : repoCount,
-      active_org_rulesets: data.orgRulesets.error ? "error" : orgRulesets.length,
-      evaluated_repositories: evaluated.length,
-      protected_repositories: protectedCount,
-      review_required_repositories: reviewCount,
-      status_check_required_repositories: statusCheckCount,
-      signed_commit_repositories: signedCount,
-      bypass_restricted_repositories: bypassRestrictedCount,
-      repos_not_evaluable: unevaluated.length,
+      ...(repositoriesUnreadable
+        ? summaryMetric("active_repositories", null, unreadableStatus(ORG_ENDPOINTS.repos, data.repositories.error))
+        : summaryMetric("active_repositories", repoCount, `complete: ${ORG_ENDPOINTS.repos} listed ${data.repositories.data.length} repositories, ${repoCount} active`)),
+      ...(data.orgRulesets.error
+        ? summaryMetric("active_org_rulesets", null, unreadableStatus(ORG_ENDPOINTS.rulesets, data.orgRulesets.error))
+        : summaryMetric("active_org_rulesets", orgRulesets.length, `complete: ${ORG_ENDPOINTS.rulesets} listed ${data.orgRulesets.data.length} rulesets, ${orgRulesets.length} active`)),
+      ...evaluatedMetric(
+        "evaluated_repositories",
+        evaluated.length,
+        `all ${repoCount} active repositories fully evaluated (${perRepoReads} read for each)`,
+        `${evaluated.length} of ${repoCount} active repositories fully evaluated`,
+      ),
+      ...countedMetric("protected_repositories", protectedCount),
+      ...countedMetric("review_required_repositories", reviewCount),
+      ...countedMetric("status_check_required_repositories", statusCheckCount),
+      ...countedMetric("signed_commit_repositories", signedCount),
+      ...countedMetric("bypass_restricted_repositories", bypassRestrictedCount),
+      ...notEvaluableMetric(),
     },
     text: buildAssessmentText("GitHub repository protection assessment", config.organization, findings),
   };
@@ -4377,10 +4556,25 @@ export function assessGitHubActionsSecurity(
   // allowed_actions and enabled_repositories come from the actions-organization-permissions
   // schema; the selected-actions schema carries only github_owned_allowed, verified_allowed, and
   // patterns_allowed, so it is a secondary inventory consulted when the policy is `selected`.
-  const enabledRepositories = safeLower(actionsPermissions && asRecord(actionsPermissions).enabled_repositories) ?? "unknown";
-  const allowedActions = safeLower(actionsPermissions && asRecord(actionsPermissions).allowed_actions) ?? "unknown";
-  const defaultWorkflowPermissions = safeLower(workflowPermissions && asRecord(workflowPermissions).default_workflow_permissions) ?? "unknown";
+  // The verdict logic keeps an internal "unknown" sentinel for a missing field; the rendered
+  // evidence and the snapshot summary never print it (a missing or unreadable setting is null
+  // plus the endpoint and reason).
+  const enabledRepositoriesValue = safeLower(actionsPermissions && asRecord(actionsPermissions).enabled_repositories);
+  const allowedActionsValue = safeLower(actionsPermissions && asRecord(actionsPermissions).allowed_actions);
+  const defaultWorkflowPermissionsValue = safeLower(workflowPermissions && asRecord(workflowPermissions).default_workflow_permissions);
+  const enabledRepositories = enabledRepositoriesValue ?? "unknown";
+  const allowedActions = allowedActionsValue ?? "unknown";
+  const defaultWorkflowPermissions = defaultWorkflowPermissionsValue ?? "unknown";
   const canApprove = asBoolean(workflowPermissions && asRecord(workflowPermissions).can_approve_pull_request_reviews);
+  const settingEvidence = (field: string, dataset: CollectedDataset<JsonRecord | null>, endpoint: string, value: string | undefined): string => {
+    if (dataset.error) return nullEvidence(field, endpoint, dataset.error);
+    return value === undefined ? `${field} = null (${endpoint} did not return ${field})` : `${field} = ${value}`;
+  };
+  const settingMetric = (name: string, dataset: CollectedDataset<JsonRecord | null>, endpoint: string, value: string | undefined): GitHubSnapshotSummary => {
+    if (dataset.error) return summaryMetric(name, null, unreadableStatus(endpoint, dataset.error));
+    if (value === undefined) return summaryMetric(name, null, `unknown: ${endpoint} did not return ${name}`);
+    return summaryMetric(name, value, `complete: ${endpoint}`);
+  };
   const runnerCount = data.runners.data.length;
   const runnerGroupCount = data.runnerGroups.data.length;
   const openRunnerGroups = data.runnerGroups.data.filter((group) => {
@@ -4428,9 +4622,7 @@ export function assessGitHubActionsSecurity(
           ? "Allowed GitHub Actions policy permits all external actions."
           : permissionsUnreadable("allowed_actions")),
       [
-        data.actionsPermissions.error
-          ? nullEvidence("allowed_actions", ORG_ENDPOINTS.actionsPermissions, data.actionsPermissions.error)
-          : `allowed_actions = ${allowedActions}`,
+        settingEvidence("allowed_actions", data.actionsPermissions, ORG_ENDPOINTS.actionsPermissions, allowedActionsValue),
         selectedActionsEvidence(),
       ],
       "Restrict Actions to selected and trusted sources rather than allowing arbitrary third-party workflow code.",
@@ -4444,11 +4636,7 @@ export function assessGitHubActionsSecurity(
         : (defaultWorkflowPermissions === "write"
           ? "Default workflow token permissions are write-enabled."
           : workflowUnreadable("default_workflow_permissions")),
-      [
-        data.workflowPermissions.error
-          ? nullEvidence("default_workflow_permissions", ORG_ENDPOINTS.workflowPermissions, data.workflowPermissions.error)
-          : `default_workflow_permissions = ${defaultWorkflowPermissions}`,
-      ],
+      [settingEvidence("default_workflow_permissions", data.workflowPermissions, ORG_ENDPOINTS.workflowPermissions, defaultWorkflowPermissionsValue)],
       "Set the default workflow token permission level to read and grant write access only where needed per workflow.",
     ),
     buildFinding(
@@ -4475,11 +4663,7 @@ export function assessGitHubActionsSecurity(
         : (enabledRepositories === "all"
           ? "GitHub Actions is enabled for all repositories in the organization."
           : permissionsUnreadable("enabled_repositories")),
-      [
-        data.actionsPermissions.error
-          ? nullEvidence("enabled_repositories", ORG_ENDPOINTS.actionsPermissions, data.actionsPermissions.error)
-          : `enabled_repositories = ${enabledRepositories}`,
-      ],
+      [settingEvidence("enabled_repositories", data.actionsPermissions, ORG_ENDPOINTS.actionsPermissions, enabledRepositoriesValue)],
       "Use selected-repository enablement when you need tighter CI change control or a phased rollout.",
     ),
   ];
@@ -4489,11 +4673,11 @@ export function assessGitHubActionsSecurity(
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      runner_groups: datasetSnapshotCount(data.runnerGroups),
-      runners: datasetSnapshotCount(data.runners),
-      enabled_repositories: enabledRepositories,
-      allowed_actions: allowedActions,
-      default_workflow_permissions: defaultWorkflowPermissions,
+      ...listMetric("runner_groups", data.runnerGroups, ORG_ENDPOINTS.runnerGroups),
+      ...listMetric("runners", data.runners, ORG_ENDPOINTS.runners),
+      ...settingMetric("enabled_repositories", data.actionsPermissions, ORG_ENDPOINTS.actionsPermissions, enabledRepositoriesValue),
+      ...settingMetric("allowed_actions", data.actionsPermissions, ORG_ENDPOINTS.actionsPermissions, allowedActionsValue),
+      ...settingMetric("default_workflow_permissions", data.workflowPermissions, ORG_ENDPOINTS.workflowPermissions, defaultWorkflowPermissionsValue),
     },
     text: buildAssessmentText("GitHub Actions security assessment", config.organization, findings),
   };
@@ -4502,13 +4686,14 @@ export function assessGitHubActionsSecurity(
 // Deferred automation: per-repository security policy presence is exposed by GraphQL
 // Repository.isSecurityPolicyEnabled and Repository.securityPolicyUrl; the sweep is not yet wired.
 function assessSecurityPolicyPresence(data: GitHubCodeSecurityData): GitHubFinding {
-  const repoCount = data.repositories.error ? "unknown" : String(data.repositories.data.length);
   return buildFinding(
     "GITHUB-CODE-006",
     "Manual",
     "Security policy (SECURITY.md) presence is not yet enumerated per repository, so the control is unverified.",
     [
-      `repositories_in_scope = ${repoCount}`,
+      data.repositories.error
+        ? nullEvidence("repositories_in_scope", ORG_ENDPOINTS.repos, data.repositories.error)
+        : `repositories_in_scope = ${data.repositories.data.length}`,
       "Deferred collector: GraphQL Repository.isSecurityPolicyEnabled and Repository.securityPolicyUrl per active repository.",
     ],
     "Publish a SECURITY.md (or an organization-level .github/SECURITY.md) so vulnerability reporting instructions are available for every repository.",
@@ -4782,9 +4967,13 @@ export function assessGitHubCodeSecurity(
     findings,
     summary: countByStatus(findings),
     snapshotSummary: {
-      code_security_configurations: configsDataset.error ? "error" : configs.length,
-      default_configurations: defaultsDataset.error ? "error" : defaultEntries.length,
-      repositories: datasetSnapshotCount(data.repositories),
+      ...(configsDataset.error
+        ? summaryMetric("code_security_configurations", null, unreadableStatus(ORG_ENDPOINTS.codeSecurityConfigurations, configsDataset.error))
+        : summaryMetric("code_security_configurations", configs.length, `complete: ${ORG_ENDPOINTS.codeSecurityConfigurations} returned ${configs.length} configuration(s)`)),
+      ...(defaultsDataset.error
+        ? summaryMetric("default_configurations", null, unreadableStatus(ORG_ENDPOINTS.codeSecurityDefaults, defaultsDataset.error))
+        : summaryMetric("default_configurations", defaultEntries.length, `complete: ${ORG_ENDPOINTS.codeSecurityDefaults} returned ${defaultEntries.length} default assignment(s)`)),
+      ...listMetric("repositories", data.repositories, ORG_ENDPOINTS.repos),
       secret_scanning_default: secretScanning.status,
       push_protection_default: pushProtection.status,
       dependabot_default: `${dependabotAlerts.status}/${dependabotUpdates.status}`,

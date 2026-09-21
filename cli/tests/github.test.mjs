@@ -864,7 +864,7 @@ test("GraphQL paging reports truncated when hasNextPage is true without an endCu
   const result = assessGitHubOrgAccess(createTruncationOrgData(saml, ipAllowList), createSampleConfig());
   const byId = Object.fromEntries(result.findings.map((finding) => [finding.id, finding]));
   assert.equal(byId["GITHUB-ORG-006"].status, "Partial");
-  assert.match(byId["GITHUB-ORG-006"].evidence.join("\n"), /totalCount 7000, truncated/);
+  assert.match(byId["GITHUB-ORG-006"].evidence.join("\n"), /external_identities_linked_to_members = null \(GraphQL organization\.samlIdentityProvider\.externalIdentities incomplete: truncated at 1 of 7000\)/);
   assert.equal(byId["GITHUB-ORG-008"].status, "Partial");
   assert.match(byId["GITHUB-ORG-008"].evidence.join("\n"), /ip_allow_list_entries = 1 \(active 1, totalCount 7000, truncated\)/);
 });
