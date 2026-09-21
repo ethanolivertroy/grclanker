@@ -104,6 +104,10 @@ export async function launchCli(
   process.env.PI_SKIP_VERSION_CHECK ??= "1";
   process.chdir(workingDir);
 
+  // Deliberately inline: pi resolves its agent directory from GRCLANKER_CODING_AGENT_DIR, honors
+  // PI_SKIP_VERSION_CHECK, and treats the process cwd as the project root as soon as its module
+  // graph and `main` start, so the environment and working directory above must be in place
+  // before the package is loaded. A top-level import would evaluate it first.
   const { main } = await import("@earendil-works/pi-coding-agent");
   await main(args);
 }
