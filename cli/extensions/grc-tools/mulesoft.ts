@@ -1474,6 +1474,14 @@ function scopeName(scope: JsonRecord): string {
   return asString(scope.scope) ?? asString(scope.name) ?? "scope";
 }
 
+function connectedAppScopeNames(app: JsonRecord, contextScopes: JsonRecord[]): string[] {
+  return [...new Set([...asStringList(app.scopes), ...contextScopes.map(scopeName)])];
+}
+
+function isServiceConnectedApp(app: JsonRecord): boolean {
+  return asStringList(app.grant_types).some((grant) => grant === "client_credentials");
+}
+
 export async function assessMulesoftIdentityAccess(
   client: IdentityClient,
   options: MulesoftIdentityAccessOptions = {},
@@ -1557,12 +1565,17 @@ export async function assessMulesoftIdentityAccess(
     return (PRODUCTION_NAME_PATTERN.test(name) && !production) || (NON_PRODUCTION_NAME_PATTERN.test(name) && production);
   });
 
-  const adminScopedApps = connectedAppScopes
-    .filter((item) => item.scopes.some((scope) => ADMIN_SCOPE_PATTERN.test(scopeName(scope))))
-    .map((item) => connectedAppName(item.app));
-  const broadScopedApps = connectedAppScopes
+  const scopedApps = connectedAppScopes.map((item) => ({
+    name: connectedAppName(item.app),
+    service: isServiceConnectedApp(item.app),
+    scopes: connectedAppScopeNames(item.app, item.scopes),
+  }));
+  const adminScoped = scopedApps.filter((item) => item.scopes.some((scope) => ADMIN_SCOPE_PATTERN.test(scope)));
+  const adminScopedApps = adminScoped.filter((item) => item.service).map((item) => item.name);
+  const adminScopedDelegatedApps = adminScoped.filter((item) => !item.service).map((item) => item.name);
+  const broadScopedApps = scopedApps
     .filter((item) => item.scopes.length > maxConnectedAppScopes)
-    .map((item) => ({ app: connectedAppName(item.app), scopes: item.scopes.length }));
+    .map((item) => ({ app: item.name, scopes: item.scopes.length }));
 
   const now = Date.now();
   const staleThreshold = now - staleDays * DAY_MS;
@@ -1668,17 +1681,27 @@ export async function assessMulesoftIdentityAccess(
     ),
     finding(
       18,
-      connectedApps.length === 0 ? "pass" : adminScopedApps.length > 0 ? "fail" : broadScopedApps.length > 0 ? "warn" : "pass",
+      connectedApps.length === 0
+        ? "pass"
+        : adminScopedApps.length > 0
+          ? "fail"
+          : adminScopedDelegatedApps.length > 0 || broadScopedApps.length > 0
+            ? "warn"
+            : "pass",
       connectedApps.length === 0
         ? "No connected apps are registered in this organization."
         : adminScopedApps.length > 0
-          ? `${adminScopedApps.length} connected app(s) hold administrative or full-access scopes.`
-          : broadScopedApps.length > 0
-            ? `${broadScopedApps.length} connected app(s) hold more than ${maxConnectedAppScopes} scopes.`
-            : `${connectedApps.length} connected app(s) reviewed with no administrative scopes.`,
+          ? `${adminScopedApps.length} client credentials connected app(s) hold administrative or full-access scopes.`
+          : adminScopedDelegatedApps.length > 0
+            ? `${adminScopedDelegatedApps.length} user-delegated connected app(s) request the full or administrative scope; confirm each one needs the acting user's complete permissions.`
+            : broadScopedApps.length > 0
+              ? `${broadScopedApps.length} connected app(s) hold more than ${maxConnectedAppScopes} scopes.`
+              : `${connectedApps.length} connected app(s) reviewed with no administrative scopes.`,
       {
         connected_apps: connectedApps.length,
+        service_apps: scopedApps.filter((item) => item.service).length,
         admin_scoped_apps: sample(adminScopedApps),
+        admin_scoped_delegated_apps: sample(adminScopedDelegatedApps),
         broad_scoped_apps: sample(broadScopedApps),
         max_connected_app_scopes: maxConnectedAppScopes,
       },

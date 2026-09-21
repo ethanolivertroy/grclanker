@@ -674,12 +674,12 @@ test("assessMulesoftIdentityAccess fails weak identity and privilege posture", a
     },
     async listConnectedApplications() {
       return [
-        { client_id: "app-1", client_name: "Legacy Sync", enabled: true, last_used: isoDaysFromNow(-200) },
-        { client_id: "app-2", client_name: "Disabled Tool", enabled: false, last_used: isoDaysFromNow(-5) },
+        { client_id: "app-1", client_name: "Legacy Sync", grant_types: ["client_credentials"], enabled: true, last_used: isoDaysFromNow(-200) },
+        { client_id: "app-2", client_name: "Disabled Tool", grant_types: ["authorization_code"], scopes: ["full", "profile"], enabled: false, last_used: isoDaysFromNow(-5) },
       ];
     },
     async listConnectedApplicationScopes(clientId) {
-      return clientId === "app-1" ? [{ scope: "full" }] : [{ scope: "profile" }];
+      return clientId === "app-1" ? [{ scope: "full" }] : [];
     },
     async getOrganizationHierarchy() {
       return { id: ORG_ID, isRoot: true, subOrganizations: [] };
@@ -698,6 +698,7 @@ test("assessMulesoftIdentityAccess fails weak identity and privilege posture", a
   assert.equal(statusOf(result, "MULESOFT-IAM-06"), "fail");
   assert.equal(statusOf(result, "MULESOFT-IAM-18"), "fail");
   assert.deepEqual(findingById(result, "MULESOFT-IAM-18").evidence.admin_scoped_apps, ["Legacy Sync"]);
+  assert.deepEqual(findingById(result, "MULESOFT-IAM-18").evidence.admin_scoped_delegated_apps, ["Disabled Tool"]);
   assert.equal(statusOf(result, "MULESOFT-IAM-19"), "warn");
   assert.deepEqual(findingById(result, "MULESOFT-IAM-19").evidence.stale_apps, ["Legacy Sync"]);
   assert.equal(statusOf(result, "MULESOFT-IAM-25"), "manual");
@@ -711,6 +712,12 @@ test("assessMulesoftIdentityAccess degrades to warnings and errors when reads fa
     async listIdentityProviders() {
       throw new Error("timeout");
     },
+    async listConnectedApplications() {
+      return [{ client_id: "studio", client_name: "Anypoint Studio", grant_types: ["authorization_code"], scopes: ["full", "offline_access"], enabled: true, last_used: isoDaysFromNow(-1) }];
+    },
+    async listConnectedApplicationScopes() {
+      return [];
+    },
   });
 
   const result = await assessMulesoftIdentityAccess(client);
@@ -718,6 +725,8 @@ test("assessMulesoftIdentityAccess degrades to warnings and errors when reads fa
   assert.equal(statusOf(result, "MULESOFT-IAM-01"), "fail");
   assert.equal(statusOf(result, "MULESOFT-IAM-03"), "warn");
   assert.equal(statusOf(result, "MULESOFT-IAM-04"), "warn");
+  assert.equal(statusOf(result, "MULESOFT-IAM-18"), "warn");
+  assert.match(findingById(result, "MULESOFT-IAM-18").summary, /user-delegated/);
   assert.ok(result.errors.some((error) => error.startsWith("role_groups:")));
   assert.ok(result.errors.some((error) => error.startsWith("identity_providers:")));
 });
