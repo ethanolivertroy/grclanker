@@ -17,7 +17,9 @@ The Slack tool family inspects a Slack Enterprise Grid organization (or a single
 
 Required user-token scopes: `admin.teams:read`, `admin.users:read`, `admin.apps:read`, `admin.barriers:read`, `admin.conversations:read`, `admin.analytics:read` (optional probe), `auditlogs:read`, `users:read`, and `team.preferences:read`. The Admin API and Audit Logs API require an Enterprise Grid plan; an `ok:false` response of `not_allowed_token_type`, `missing_scope`, `not_an_enterprise`, or `feature_not_enabled` is rendered as a manual finding that names the cause, never as an empty or passing result.
 
-Rate limits: the client honors `429` responses by sleeping for the `Retry-After` value (capped at 60 seconds) and retrying twice. Pagination follows `response_metadata.next_cursor` (or the top-level `next_cursor` on `admin.conversations.search`) up to each method's documented `limit` maximum and records truncation when a cap is hit.
+Rate limits: the client honors `429` responses by sleeping for the `Retry-After` value (capped at 60 seconds) and retrying twice. Pagination follows `response_metadata.next_cursor` (or the top-level `next_cursor` on `admin.conversations.search`) up to each method's documented `limit` maximum. Every early exit is recorded as truncation and demotes the dependent verdict to `warn`: an item cap (`user_limit`, `workspace_limit`, `app_limit`, `channel_limit`, or a page that carried more items than the cap allowed), the page cap of 50 requests per list, a cursor that returns an empty page, a missing SCIM `totalResults`, or an audit log page that ends with a `next_cursor`. The finding summary states seen versus total and the reason, for example `2 seen of unknown total (partial view, item limit reached)`.
+
+Credential hygiene: every Web API, SCIM, and Audit Logs response is redacted when it is parsed, before any verdict logic or bundle file sees it. Fields named like credentials (`token`, `secret`, `password`, `webhook`, `signing`, `private_key`, `api_key`, `authorization`, `cookie`, `credential`) keep their name and receive the value `[REDACTED]`; Slack token shapes (`xoxb-`, `xoxp-`, `xoxe-`, `xapp-`), `hooks.slack.com` webhook URLs, `Bearer` headers, and credential query parameters are replaced inside any string, including HTTP error bodies. `token_type` and `token_kinds` are kept because they describe a token without carrying one.
 
 ## Tools
 
@@ -80,7 +82,7 @@ Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and IS
 
 `slack_export_audit_bundle` allocates `export/slack/<org>-audit`, then `-2`, `-3` on reruns, and never overwrites a prior bundle. The zip is named after the allocated directory. Layout:
 
-- `core_data/`: `access.json` plus per-area snapshots (tokens are never written)
+- `core_data/`: `access.json` plus per-area snapshots (redacted at collection time; the configured tokens and any credential-shaped value are replaced with `[REDACTED]` again when each file is written, so the zip inherits the redaction)
 - `analysis/findings.json` and per-area summaries
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and `fedramp.md`, `cmmc.md`, `soc-2.md`, `cis.md`, `pci-dss.md`, `stig.md`, `irap.md`, `ismap.md`
 - `reports/<area>.md`, `QUICK_REFERENCE.md`, `README.md`, `metadata.json`
