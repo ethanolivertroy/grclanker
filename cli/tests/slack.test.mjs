@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inflateRawSync } from "node:zlib";
@@ -21,6 +21,7 @@ import {
   checkSlackAccess,
   exportSlackAuditBundle,
   isSlackPostingRestricted,
+  redactErrorText,
   redactSecretText,
   redactSecrets,
   resolveSecureOutputPath,
@@ -1375,4 +1376,192 @@ test("exportSlackAuditBundle writes _errors.log when collection partially failed
   const log = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
   assert.match(log, /\[integrations\] admin\.barriers\.list: .*missing_scope/);
   mkdirSync(join(base, "unused"));
+});
+
+test("redactErrorText scrubs embedded URLs, bearer headers, session cookies and ids, API keys, and HTML error pages", () => {
+  const cases = [
+    ["redirect to https://example.invalid/cb?access_token=CANARY-URLTOKEN-1&state=x failed", /\?access_token=\[REDACTED\]&state=x/],
+    ["Authorization: Bearer CANARY-BEARER-1", /^Authorization: \[REDACTED\]$/],
+    ["Authorization: Basic Q0FOQVJZLUJBU0lDLTE=", /^Authorization: \[REDACTED\]$/],
+    ["Cookie: d=CANARY-SESSION-1; b=CANARY-SESSION-2", /^Cookie: \[REDACTED\]$/],
+    ["Set-Cookie: sid=CANARY-SESSION-3; Path=/; HttpOnly", /^Set-Cookie: \[REDACTED\]$/],
+    ["session_id=CANARY-SESSION-4", /^session_id=\[REDACTED\]$/],
+    ['"sessionId": "CANARY-SESSION-5"', /^"sessionId": "\[REDACTED\]"$/],
+    ["X-Api-Key: CANARY-APIKEY-1", /^X-Api-Key: \[REDACTED\]$/],
+    ['{"api_key":"CANARY-APIKEY-2","error":"invalid_auth"}', /^\{"api_key":"\[REDACTED\]","error":"invalid_auth"\}$/],
+    ["client_secret=CANARY-CLIENTSECRET-1&grant_type=refresh", /^client_secret=\[REDACTED\]&grant_type=refresh$/],
+    ["<html><body><h1>502 Bad Gateway</h1><pre>Authorization: Bearer CANARY-BEARER-2; Cookie: d=CANARY-SESSION-6; X-Api-Key: CANARY-APIKEY-3</pre></body></html>", /<pre>Authorization: \[REDACTED\]; Cookie: \[REDACTED\]<\/pre>/],
+  ];
+  for (const [input, expected] of cases) {
+    const output = redactErrorText(input);
+    assert.doesNotMatch(output, /CANARY-/, input);
+    assert.match(output, expected, input);
+  }
+  assert.equal(redactErrorText("token FAKE_SECRET_TOKEN_9 leaked", ["FAKE_SECRET_TOKEN_9"]), "token [REDACTED] leaked");
+  for (const benign of [
+    "Session idle timeout: 30 minutes",
+    "token: user, rotating (xoxe.) format",
+    "All 2 active users have a session duration at or below 24 hours",
+    "api_key_count: 3",
+    "Slack Web API users.list failed: missing_scope",
+    "complete: admin.users.session.getSettings sampled 2 of 2 seen active users",
+    "Cookies are not read by this tool",
+  ]) {
+    assert.equal(redactErrorText(benign), benign);
+  }
+});
+
+test("non-JSON response bodies are described, never quoted, and every error string is scrubbed at creation", async () => {
+  const page = "<html><body><h1>502 Bad Gateway</h1><pre>Cookie: d=CANARY-SESSION-7; X-Api-Key: CANARY-APIKEY-4</pre></body></html>";
+  const html = (status) => new Response(page, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+  const gateway = makeClient(() => html(502));
+  await assert.rejects(gateway.web("users.list"), (error) => {
+    assert.equal(error.name, "SlackApiError");
+    assert.equal(error.message, `Slack Web API users.list failed (HTTP 502) non-JSON text/html body (${page.length} characters) withheld`);
+    assert.equal(error.code, "http_502");
+    return true;
+  });
+  const okHtml = makeClient(() => html(200));
+  await assert.rejects(okHtml.web("users.list"), (error) => {
+    assert.equal(error.message, `Slack Web API users.list failed (HTTP 200) non-JSON text/html body (${page.length} characters) withheld`);
+    assert.equal(error.code, "non_json_body");
+    return true;
+  });
+  await assert.rejects(okHtml.scim("/Users"), /Slack SCIM \/Users failed \(HTTP 200\) non-JSON text\/html body/);
+  await assert.rejects(okHtml.audit("/logs"), /Slack Audit Logs \/logs failed \(HTTP 200\) non-JSON text\/html body/);
+  await assert.rejects(gateway.probeAnalyticsExport(), /admin\.analytics\.getFile failed \(HTTP 502\) non-JSON text\/html body/);
+  const untyped = makeClient(() => new Response(new TextEncoder().encode("upstream request timeout"), { status: 504 }));
+  await assert.rejects(untyped.web("users.list"), /failed \(HTTP 504\) non-JSON unknown content type body \(24 characters\) withheld$/);
+
+  const tokenised = "https://example.invalid/cb?access_token=CANARY-URLTOKEN-2&state=x";
+  const jsonForbidden = makeClient(() => jsonResponse({ ok: false, error: `invalid_auth: see ${tokenised}`, response_metadata: { messages: [`redirect ${tokenised}`] } }, 403));
+  await assert.rejects(jsonForbidden.web("users.list"), (error) => {
+    assert.doesNotMatch(error.message, /CANARY-/);
+    assert.match(error.message, /failed \(HTTP 403\) \{"ok":false,"error":"invalid_auth: see https:\/\/example\.invalid\/cb\?access_token=\[REDACTED\]&state=x"/);
+    return true;
+  });
+  const okFalse = makeClient(() => ({ ok: false, error: `invalid_auth: see ${tokenised}` }));
+  await assert.rejects(okFalse.web("users.list"), (error) => {
+    assert.doesNotMatch(error.message, /CANARY-/);
+    assert.doesNotMatch(error.code, /CANARY-/);
+    assert.match(error.code, /access_token=\[REDACTED\]/);
+    return true;
+  });
+  const scimDetail = makeClient(() => jsonResponse({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], detail: `forbidden, see ${tokenised}`, status: "403" }, 403));
+  await assert.rejects(scimDetail.scim("/Users"), (error) => {
+    assert.doesNotMatch(error.message, /CANARY-/);
+    assert.match(error.message, /"detail":"forbidden, see https:\/\/example\.invalid\/cb\?access_token=\[REDACTED\]&state=x"/);
+    return true;
+  });
+
+  const base = createTempBase("grclanker-slack-config-error-");
+  const configPath = join(base, "slack.json");
+  writeFileSync(configPath, '{ "token": "xoxp-CANARY-CONFIG-1", ');
+  assert.throws(() => resolveSlackConfiguration({}, { SLACK_CONFIG_FILE: configPath }), (error) => {
+    assert.doesNotMatch(error.message, /CANARY-/);
+    assert.match(error.message, /Unable to parse Slack config file .*: the file is not valid JSON \(parser detail withheld because it can quote the file\)/);
+    return true;
+  });
+});
+
+/** Every surface the collectors call, the same list as the reviewer's canary sweep: 16 Web API methods, 3 SCIM paths, 2 Audit Logs paths. */
+const ERROR_SURFACES = [
+  ...Object.keys(SLACK_METHODS).map((name) => ({ label: `web:${name}`, family: "web", predicate: (request) => methodOf(request) === name })),
+  ...["/ServiceProviderConfig", "/Users", "/Groups"].map((path) => ({ label: `scim:${path}`, family: "scim", predicate: (request) => request.pathname === `/scim/v2${path}` })),
+  ...["/logs", "/schemas"].map((path) => ({ label: `audit:${path}`, family: "audit", predicate: (request) => request.pathname === `/audit/v1${path}` })),
+];
+
+const canaryUrl = (slug) => `https://example.invalid/callback?access_token=CANARY-URLTOKEN-${slug}&state=x`;
+
+/** A: 502 HTML gateway page carrying bearer, session, and API key canaries inside the first 200 characters. */
+const htmlGatewayError = (slug) => () => new Response(
+  `<html><body><h1>502 Bad Gateway</h1><pre>Authorization: Bearer CANARY-BEARER-${slug}; Cookie: d=CANARY-SESSION-${slug}; X-Api-Key: CANARY-APIKEY-${slug}</pre></body></html>`,
+  { status: 502, headers: { "content-type": "text/html; charset=utf-8" } },
+);
+
+/** B: 403 JSON error whose error, response_metadata.messages, or SCIM detail embeds a tokenised URL. */
+const tokenisedJsonError = (slug, family) => () => {
+  if (family === "scim") return jsonResponse({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], detail: `forbidden, see ${canaryUrl(slug)}`, status: "403" }, 403);
+  if (family === "audit") return jsonResponse({ ok: false, error: `forbidden, see ${canaryUrl(slug)}` }, 403);
+  return jsonResponse({ ok: false, error: `invalid_auth: see ${canaryUrl(slug)}`, response_metadata: { messages: [`[ERROR] redirect ${canaryUrl(slug)}`] } }, 403);
+};
+
+/** C: the Web API's normal error mode, HTTP 200 ok:false with the tokenised URL (SCIM and Audit: 401 JSON). */
+const tokenisedOkFalse = (slug, family) => () => {
+  if (family === "web") return jsonResponse({ ok: false, error: `invalid_auth: see ${canaryUrl(slug)}`, response_metadata: { messages: [`[ERROR] redirect ${canaryUrl(slug)}`] } }, 200);
+  if (family === "scim") return jsonResponse({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], detail: `unauthorized, see ${canaryUrl(slug)}`, status: "401" }, 401);
+  return jsonResponse({ ok: false, error: `unauthorized, see ${canaryUrl(slug)}` }, 401);
+};
+
+function assertNoCanary(value, label) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const hit = text.match(/CANARY-[A-Z]+-[a-z0-9.-]+/);
+  assert.equal(hit, null, `${label} leaks ${hit?.[0]}`);
+}
+
+test("rule 9 error bodies: a failing surface's HTML page or tokenised JSON error never reaches a finding, summary, errors array, bundle file, zip entry, or the thrown export error", async () => {
+  assert.equal(ERROR_SURFACES.length, 21, "the surface list matches the reviewer's sweep");
+  const config = resolveSlackConfiguration({ token: "xoxp-test", scim_token: "scim-test", org_id: "E1" }, EMPTY_ENV);
+  const shapes = [
+    ["A:502-html", (slug) => htmlGatewayError(slug), /non-JSON text\/html body \(\d+ characters\) withheld/],
+    ["B:403-json-url", (slug, family) => tokenisedJsonError(slug, family), /access_token=\[REDACTED\]&state=x/],
+    ["C:ok-false-url", (slug, family) => tokenisedOkFalse(slug, family), /access_token=\[REDACTED\]&state=x/],
+  ];
+  const table = [];
+  for (const surface of ERROR_SURFACES) {
+    for (const [shape, build, disclosure] of shapes) {
+      const slug = `${surface.label}-${shape}`.toLowerCase().replace(/[^a-z0-9.]+/g, "-");
+      const run = `${surface.label} ${shape}`;
+      const response = build(slug, surface.family);
+      const client = makeClient((request) => (surface.predicate(request) ? response() : compliantFixture(request)));
+      const collected = [];
+
+      let accessThrew = false;
+      try {
+        collected.push(JSON.stringify(await checkSlackAccess(client)));
+      } catch (error) {
+        accessThrew = true;
+        collected.push(error.message);
+      }
+      const all = await assessAll(client);
+      collected.push(JSON.stringify(all.findings), JSON.stringify(all.summaries), JSON.stringify(all.errors));
+
+      const base = createTempBase("grclanker-slack-error-canary-");
+      let files = 0;
+      let entries = 0;
+      let exportThrew = false;
+      try {
+        const bundle = await exportSlackAuditBundle(client, config, base);
+        if (surface.label === "scim:/Groups") {
+          assert.match(readFileSync(join(bundle.outputDir, "core_data/access.json"), "utf8"), disclosure, `${run}: only the access check reads /Groups, so its surface entry carries the failure`);
+        } else {
+          assert.ok(bundle.errorCount > 0, `${run}: the failure is recorded as a collection error`);
+        }
+        const paths = listFilesRecursively(bundle.outputDir);
+        files = paths.length;
+        for (const file of paths) assertNoCanary(readFileSync(file, "utf8"), `${run}: ${file.slice(bundle.outputDir.length + 1)}`);
+        const zipEntries = readZipEntries(bundle.zipPath).filter((entry) => !entry.name.endsWith("/"));
+        entries = zipEntries.length;
+        assert.equal(entries, files, `${run}: every bundle file is in the zip`);
+        for (const entry of zipEntries) assertNoCanary(entry.content, `${run}: zip ${entry.name}`);
+        if (existsSync(join(bundle.outputDir, "_errors.log"))) collected.push(readFileSync(join(bundle.outputDir, "_errors.log"), "utf8"));
+      } catch (error) {
+        if (error instanceof assert.AssertionError) throw error;
+        exportThrew = true;
+        collected.push(error.message);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+      assert.equal(exportThrew, surface.label === "web:auth.test", `${run}: only an unreadable auth.test aborts the export`);
+      assert.equal(accessThrew, surface.label === "web:auth.test", `${run}: only an unreadable auth.test aborts the access check`);
+
+      const everything = collected.join("\n");
+      assertNoCanary(everything, `${run}: in-memory findings, summaries, errors, access surfaces, thrown errors, and _errors.log`);
+      assert.match(everything, disclosure, `${run}: the failure is disclosed with the scrubbed shape`);
+      if (shape === "A:502-html") assert.match(everything, /HTTP 502/, `${run}: the HTTP status is disclosed`);
+      table.push({ surface: surface.label, shape, files, entries, exportThrew });
+    }
+  }
+  assert.equal(table.length, 63);
+  assert.equal(table.filter((row) => !row.exportThrew && row.files >= 20).length, 60, "every export other than the auth.test runs wrote a full bundle");
 });

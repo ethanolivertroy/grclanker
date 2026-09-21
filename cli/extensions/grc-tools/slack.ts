@@ -355,7 +355,8 @@ function readConfigFile(env: NodeJS.ProcessEnv): { values: JsonRecord; path?: st
     const parsed = asObject(JSON.parse(readFileSync(candidate, "utf8")));
     return { values: parsed ?? {}, path: candidate };
   } catch (error) {
-    throw new Error(`Unable to parse Slack config file ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+    const reason = error instanceof SyntaxError ? "the file is not valid JSON (parser detail withheld because it can quote the file)" : redactErrorText(error instanceof Error ? error.message : String(error));
+    throw new Error(`Unable to parse Slack config file ${candidate}: ${reason}`);
   }
 }
 
@@ -537,6 +538,31 @@ export function redactSecretText(text: string, knownSecrets: readonly string[] =
   return output;
 }
 
+/**
+ * Header- and assignment-style credentials as they appear in proxy error pages, gateway responses, and logs (a
+ * cookie or authorization header, an API key header, a session id, a quoted JSON credential): the name is kept and
+ * the value replaced. Bare "token" is deliberately absent so ordinary prose such as "token: user" is preserved.
+ */
+const CREDENTIAL_ASSIGNMENT_PATTERNS: RegExp[] = [
+  /((?:set-)?cookie\s*[:=]\s*)[^\r\n<>"']+/gi,
+  /(authorization\s*[:=]\s*)[^\r\n<>"',;]+/gi,
+  /(\b(?:x-)?(?:api[_-]?key|apikey|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?(?:id|token|key)|sessionid|jsessionid|phpsessid|client[_-]?secret|secret[_-]?key|password|passwd)["']?\s*[:=]\s*["']?)[^\s"'<>;&,]+/gi,
+];
+
+/**
+ * The single scrub every error string passes through at the point it is created (SlackApiError, surfaceError,
+ * describeError) and again at the bundle sink: configured tokens, Slack token shapes, webhook and credential URLs,
+ * bearer headers, and header- or assignment-style credentials. Non-JSON response bodies never reach an error string
+ * in the first place (SlackApiClient.httpError describes them instead); this guards everything that does.
+ */
+export function redactErrorText(text: string, knownSecrets: readonly string[] = []): string {
+  let output = redactSecretText(text, knownSecrets);
+  for (const pattern of CREDENTIAL_ASSIGNMENT_PATTERNS) {
+    output = output.replace(pattern, (match, prefix: unknown) => (typeof prefix === "string" ? `${prefix}${SLACK_REDACTION_MARKER}` : SLACK_REDACTION_MARKER));
+  }
+  return output;
+}
+
 export function redactSecrets<T>(value: T, knownSecrets: readonly string[] = []): T {
   if (typeof value === "string") return redactSecretText(value, knownSecrets) as T;
   if (Array.isArray(value)) return value.map((item) => redactSecrets(item, knownSecrets)) as T;
@@ -642,16 +668,25 @@ async function countFilesRecursively(pathname: string): Promise<number> {
   return count;
 }
 
+/** Every message and error code is scrubbed here, so no consumer can receive an unscrubbed string. */
 export class SlackApiError extends Error {
-  constructor(
-    message: string,
-    readonly method: string,
-    readonly code?: string,
-    readonly httpStatus?: number,
-  ) {
-    super(message);
+  readonly method: string;
+  readonly code?: string;
+  readonly httpStatus?: number;
+
+  constructor(message: string, method: string, code?: string, httpStatus?: number) {
+    super(redactErrorText(message));
     this.name = "SlackApiError";
+    this.method = method;
+    this.code = code === undefined ? undefined : redactErrorText(code);
+    this.httpStatus = httpStatus;
   }
+}
+
+/** Describes a response body that is not a JSON object without quoting any of it. */
+function withheldBody(response: Response, text: string): string {
+  const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim() || "unknown content type";
+  return `non-JSON ${contentType} body (${text.length} characters) withheld`;
 }
 
 /** Why a paginated collection stopped before the cursor was exhausted. */
@@ -709,15 +744,19 @@ export class SlackApiClient {
     return redactSecretText(text, this.knownSecrets());
   }
 
-  /** Error bodies are echoed into messages, so JSON bodies get field-level redaction before the text scrub. */
-  private redactBody(text: string): string {
+  /**
+   * A JSON error body (error, response_metadata.messages, SCIM detail) is echoed after field-level and text
+   * redaction; any other body (an HTML error page from a proxy or gateway, plain text) is never placed in an error
+   * string, only described by content type and length. The SlackApiError constructor scrubs the result again.
+   */
+  private describeBody(response: Response, text: string): string {
     const json = parseJsonRecord(text);
-    return json ? JSON.stringify(redactSecrets(json, this.knownSecrets())) : this.redactText(text);
+    return json ? this.redactText(JSON.stringify(redactSecrets(json, this.knownSecrets()))).slice(0, 200) : withheldBody(response, text);
   }
 
   private httpError(label: string, response: Response, text: string): SlackApiError {
     return new SlackApiError(
-      `${label} failed (HTTP ${response.status}) ${this.redactBody(text).slice(0, 200)}`,
+      `${label} failed (HTTP ${response.status}) ${this.describeBody(response, text)}`,
       label,
       response.status === 401 || response.status === 403 ? "http_forbidden" : `http_${response.status}`,
       response.status,
@@ -725,7 +764,11 @@ export class SlackApiClient {
   }
 
   private parseOkJson(label: string, response: Response, text: string): JsonRecord {
-    const json = text.length > 0 ? (JSON.parse(text) as JsonRecord) : {};
+    if (text.trim().length === 0) return {};
+    const json = parseJsonRecord(text);
+    if (!json) {
+      throw new SlackApiError(`${label} failed (HTTP ${response.status}) ${withheldBody(response, text)}`, label, "non_json_body", response.status);
+    }
     if (json.ok === false) {
       const code = asString(json.error) ?? "ok_false";
       throw new SlackApiError(`${label} failed: ${this.redactText(code)}`, label, code, response.status);
@@ -959,7 +1002,7 @@ type ReadResult<T> =
   | { ok: false; error: string; code?: string; value?: undefined; complete?: undefined; total?: undefined; truncation?: undefined };
 
 function surfaceError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
 function parseJsonRecord(text: string): JsonRecord | undefined {
@@ -2563,7 +2606,7 @@ export async function exportSlackAuditBundle(
 
   const secrets = client.knownSecrets();
   const writeBundleFile = (rootDir: string, relativePathname: string, content: string): Promise<void> =>
-    writeSecureTextFile(rootDir, relativePathname, redactSecretText(content, secrets));
+    writeSecureTextFile(rootDir, relativePathname, redactErrorText(content, secrets));
   await writeBundleFile(outputDir, "README.md", buildBundleReadme());
   await writeBundleFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, zipPath }, findings, errors));
   await writeBundleFile(outputDir, "metadata.json", serializeJson(redactSecrets({
@@ -2676,7 +2719,7 @@ function createClient(args: CheckAccessArgs): SlackApiClient {
 }
 
 function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
 const authParams = {
