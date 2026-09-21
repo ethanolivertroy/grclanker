@@ -11,7 +11,7 @@
  * - REST: https://docs.oracle.com/en-us/iaas/api/ (spec index at /en-us/iaas/api/specs/index.json)
  * The per-surface citations live next to each client method below.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import {
   createWriteStream,
   existsSync,
@@ -39,9 +39,20 @@ const DEFAULT_MAX_POLICIES = 500;
 const DEFAULT_MAX_COMPARTMENTS = 25;
 const DEFAULT_MAX_BUCKETS = 100;
 const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
+const DEFAULT_COMMAND_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 const AUDIT_RETENTION_REQUIRED_DAYS = 365;
 const KEY_ROTATION_MAX_DAYS = 365;
 const BASTION_MAX_TTL_SECONDS = 10_800;
+/**
+ * KeyShape.length is documented in bytes (AES 16, 24, 32; RSA 256, 384, 512;
+ * ECDSA 32, 48, 66). Spec control 19 requires AES-256 or RSA-4096, so the
+ * floors are 32 and 512 bytes. ECDSA is not named by the control text, so any
+ * documented curveId (NIST_P256, NIST_P384, NIST_P521, all FIPS 186-4 curves)
+ * is accepted and a missing or undocumented curve is weak.
+ */
+const KEY_MIN_LENGTH_BYTES = { AES: 32, RSA: 512 } as const;
+const ECDSA_ACCEPTED_CURVES = ["NIST_P256", "NIST_P384", "NIST_P521"] as const;
+const ECDSA_RULE = "ECDSA keys pass on any documented KeyShape.curveId (NIST_P256, NIST_P384, NIST_P521); spec control 19 names only the AES-256 and RSA-4096 floors.";
 const BASTION_SESSION_MAX_HOURS = 8;
 const PAR_LONG_LIVED_DAYS = 30;
 const SENSITIVE_PORTS = [22, 3389, 1433, 3306, 5432];
@@ -146,7 +157,7 @@ export const OCI_SURFACE_DOCS = {
   networkSecurityGroupRules: {
     cli: "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/nsg/rules/list.html",
     rest: "https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/SecurityRule/ListNetworkSecurityGroupSecurityRules",
-    fields: ["id", "direction", "source", "protocol", "tcpOptions.destinationPortRange.min", "tcpOptions.destinationPortRange.max"],
+    fields: ["id", "direction", "source", "protocol", "isValid", "tcpOptions.destinationPortRange.min", "tcpOptions.destinationPortRange.max"],
   },
   internetGateways: {
     cli: "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/internet-gateway/list.html",
@@ -177,6 +188,11 @@ export const OCI_SURFACE_DOCS = {
     cli: "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/kms/management/key/list.html",
     rest: "https://docs.oracle.com/en-us/iaas/api/#/en/key/release/KeySummary/ListKeys",
     fields: ["id", "displayName", "algorithm", "lifecycleState", "protectionMode"],
+  },
+  keyDetail: {
+    cli: "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/kms/management/key/get.html",
+    rest: "https://docs.oracle.com/en-us/iaas/api/#/en/key/release/Key/GetKey",
+    fields: ["keyShape.algorithm", "keyShape.length", "keyShape.curveId", "lifecycleState"],
   },
   keyVersions: {
     cli: "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/kms/management/key-version/list.html",
@@ -297,6 +313,7 @@ type LoggingArgs = ScopeArgs & {
 
 type GuardrailArgs = ScopeArgs & {
   max_buckets?: number;
+  max_keys?: number;
 };
 
 type ExportAuditBundleArgs = IdentityArgs & GuardrailArgs & {
@@ -609,12 +626,15 @@ async function countFilesRecursively(pathname: string): Promise<number> {
   return count;
 }
 
+export const OCI_COMMAND_RUNNER_OPTIONS: ExecFileSyncOptionsWithStringEncoding = {
+  encoding: "utf8",
+  stdio: ["ignore", "pipe", "pipe"],
+  timeout: DEFAULT_COMMAND_TIMEOUT_MS,
+  maxBuffer: DEFAULT_COMMAND_MAX_BUFFER_BYTES,
+};
+
 function defaultCommandRunner(args: string[]): string {
-  return execFileSync("oci", args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: DEFAULT_COMMAND_TIMEOUT_MS,
-  }).trim();
+  return execFileSync("oci", args, OCI_COMMAND_RUNNER_OPTIONS).trim();
 }
 
 function parseIniSections(contents: string): Record<string, Record<string, string>> {
@@ -1163,6 +1183,19 @@ export class OciAuditorClient {
       "--compartment-id", compartmentId,
       "--all",
     ]));
+  }
+
+  /** OCI_SURFACE_DOCS.keyDetail; keyShape (algorithm, length in bytes, curveId) exists only on the Key datatype returned by GetKey. */
+  async getKey(vault: JsonRecord, keyOcid: string): Promise<JsonRecord | null> {
+    const managementEndpoint = asString(vault.managementEndpoint);
+    if (!managementEndpoint) {
+      throw new Error(`Vault ${asString(vault.id) ?? "unknown"} did not expose managementEndpoint.`);
+    }
+    return asObject(this.runJson([
+      "kms", "management", "key", "get",
+      "--endpoint", managementEndpoint,
+      "--key-id", keyOcid,
+    ]).data) ?? null;
   }
 
   /** OCI_SURFACE_DOCS.keyVersions */
@@ -1807,8 +1840,8 @@ export async function assessOciLoggingDetection(
       "medium",
       eventStatus,
       eventSummary,
-      ["FedRAMP AU-2", "FedRAMP AU-6", "CMMC L2 3.3.1", "SOC 2 CC7.2"],
-      { audit_events: auditEvents.items.length, dated_audit_events: datedEvents.length, lookback_days: lookbackDays },
+      [],
+      { audit_events: auditEvents.items.length, dated_audit_events: datedEvents.length, lookback_days: lookbackDays, role: "supporting evidence for control 11; not a spec control, so no framework mappings" },
     ),
     finding(
       "OCI-LOG-05",
@@ -1839,9 +1872,45 @@ export async function assessOciLoggingDetection(
   };
 }
 
+type KeyAlgorithm = "AES" | "RSA" | "ECDSA" | "UNKNOWN";
+
+function keyAlgorithmOf(value: unknown): KeyAlgorithm {
+  const text = upper(value);
+  return text === "AES" || text === "RSA" || text === "ECDSA" ? text : "UNKNOWN";
+}
+
+/**
+ * Judges a documented KeyShape (algorithm, length in bytes, curveId) against
+ * spec control 19. Returns undefined when the key meets the floors.
+ */
+export function judgeKeyShape(shape: JsonRecord): { algorithm?: string; lengthBytes?: number; curveId?: string; reason: string } | undefined {
+  const algorithm = keyAlgorithmOf(shape.algorithm);
+  const lengthBytes = asNumber(shape.length);
+  const curveId = asString(shape.curveId);
+  const detail = { algorithm: asString(shape.algorithm), lengthBytes, curveId };
+  switch (algorithm) {
+    case "AES":
+      if (lengthBytes === undefined) return { ...detail, reason: "keyShape.length missing for an AES key" };
+      return lengthBytes < KEY_MIN_LENGTH_BYTES.AES ? { ...detail, reason: `AES-${lengthBytes * 8} is below the AES-256 floor` } : undefined;
+    case "RSA":
+      if (lengthBytes === undefined) return { ...detail, reason: "keyShape.length missing for an RSA key" };
+      return lengthBytes < KEY_MIN_LENGTH_BYTES.RSA ? { ...detail, reason: `RSA-${lengthBytes * 8} is below the RSA-4096 floor` } : undefined;
+    case "ECDSA":
+      return curveId && (ECDSA_ACCEPTED_CURVES as readonly string[]).includes(curveId)
+        ? undefined
+        : { ...detail, reason: "ECDSA curveId missing or outside the documented NIST_P256/NIST_P384/NIST_P521 enum" };
+    case "UNKNOWN":
+      return { ...detail, reason: "algorithm outside the documented AES/RSA/ECDSA enum or missing" };
+    default: {
+      const exhaustive: never = algorithm;
+      return exhaustive;
+    }
+  }
+}
+
 export type OciGuardrailClient = Pick<
   OciAuditorClient,
-  "getNow" | "listCompartments" | "listSecurityLists" | "listNetworkSecurityGroups" | "listNetworkSecurityGroupRules" | "listInternetGateways" | "listBastions" | "getBastion" | "listBastionSessions" | "listVaults" | "listKeys" | "listKeyVersions" | "getObjectStorageNamespace" | "listBuckets" | "getBucket" | "listPreauthenticatedRequests"
+  "getNow" | "listCompartments" | "listSecurityLists" | "listNetworkSecurityGroups" | "listNetworkSecurityGroupRules" | "listInternetGateways" | "listBastions" | "getBastion" | "listBastionSessions" | "listVaults" | "listKeys" | "getKey" | "listKeyVersions" | "getObjectStorageNamespace" | "listBuckets" | "getBucket" | "listPreauthenticatedRequests"
 >;
 
 export async function assessOciTenancyGuardrails(
@@ -1849,11 +1918,13 @@ export async function assessOciTenancyGuardrails(
   options: {
     maxCompartments?: number;
     maxBuckets?: number;
+    maxKeys?: number;
   } = {},
 ): Promise<OciAssessmentResult> {
   const now = client.getNow();
   const maxCompartments = clampNumber(options.maxCompartments, DEFAULT_MAX_COMPARTMENTS, 1, 500);
   const maxBuckets = clampNumber(options.maxBuckets, DEFAULT_MAX_BUCKETS, 1, 5000);
+  const maxKeys = clampNumber(options.maxKeys, DEFAULT_MAX_KEYS, 1, 5000);
   const errors: string[] = [];
   const compartments = await loadCompartmentScope(client);
   if (compartments.error) errors.push(compartments.error);
@@ -1881,8 +1952,10 @@ export async function assessOciTenancyGuardrails(
         ? `${permissiveSecurityLists.length}/${securityLists.items.length} security lists allow 0.0.0.0/0 or ::/0 ingress to a sensitive port (22, 3389, 1433, 3306, 5432).${partialNote(securityLists)}`
         : `None of the ${securityLists.items.length} security lists allow world ingress to a sensitive port.${partialNote(securityLists)}`;
 
-  const permissiveNsgRules: Array<{ nsgId: string; ruleId?: string; source?: string }> = [];
+  const permissiveNsgRules: Array<{ nsgId: string; ruleId?: string; source?: string; isValid?: boolean }> = [];
   let nsgRuleErrors = 0;
+  let nsgRulesSeen = 0;
+  let nsgInvalidRules = 0;
   for (const nsg of nsgs.items) {
     const nsgId = asString(nsg.id);
     if (!nsgId) continue;
@@ -1893,8 +1966,11 @@ export async function assessOciTenancyGuardrails(
       continue;
     }
     for (const rule of rules.items) {
+      nsgRulesSeen += 1;
+      const isValid = asBoolean(rule.isValid);
+      if (isValid === false) nsgInvalidRules += 1;
       if (upper(rule.direction) === "INGRESS" && cidrIsWorld(rule.source) && ruleReachesSensitivePort(rule)) {
-        permissiveNsgRules.push({ nsgId, ruleId: asString(rule.id), source: asString(rule.source) });
+        permissiveNsgRules.push({ nsgId, ruleId: asString(rule.id), source: asString(rule.source), isValid });
       }
     }
   }
@@ -1925,6 +2001,7 @@ export async function assessOciTenancyGuardrails(
         : `${internetGateways.items.length} internet gateways exist but none has isEnabled=true.${partialNote(internetGateways)}`;
 
   const weakBastions: Array<{ bastionId: string; maxSessionTtlInSeconds?: number; clientCidrBlockAllowList?: unknown[] }> = [];
+  const exposedBastions: Array<{ bastionId: string; maxSessionTtlInSeconds?: number; clientCidrBlockAllowList?: unknown[] }> = [];
   const longRunningSessions: Array<{ bastionId: string; sessionId?: string; ageHours?: number; sessionTtlInSeconds?: number }> = [];
   const undatedSessions: Array<{ bastionId: string; sessionId?: string }> = [];
   let bastionDetailErrors = 0;
@@ -1942,7 +2019,11 @@ export async function assessOciTenancyGuardrails(
     } else {
       const ttl = asNumber(bastion.maxSessionTtlInSeconds);
       const allowList = asArray(bastion.clientCidrBlockAllowList);
-      if (ttl === undefined || ttl > BASTION_MAX_TTL_SECONDS || allowList.length === 0 || allowList.some(cidrIsWorld)) {
+      const worldOpen = allowList.some(cidrIsWorld);
+      const ttlTooLong = ttl !== undefined && ttl > BASTION_MAX_TTL_SECONDS;
+      if (worldOpen && ttlTooLong) {
+        exposedBastions.push({ bastionId, maxSessionTtlInSeconds: ttl, clientCidrBlockAllowList: allowList.slice(0, 10) });
+      } else if (ttl === undefined || ttlTooLong || allowList.length === 0 || worldOpen) {
         weakBastions.push({ bastionId, maxSessionTtlInSeconds: ttl, clientCidrBlockAllowList: allowList.slice(0, 10) });
       }
     }
@@ -1962,7 +2043,7 @@ export async function assessOciTenancyGuardrails(
       }
     }
   }
-  const bastionComputed: OciFindingStatus = longRunningSessions.length > 0
+  const bastionComputed: OciFindingStatus = longRunningSessions.length > 0 || exposedBastions.length > 0
     ? "fail"
     : weakBastions.length > 0 || bastionDetailErrors > 0 || undatedSessions.length > 0
       ? "warn"
@@ -1972,12 +2053,16 @@ export async function assessOciTenancyGuardrails(
     ? unreadableSummary("bastions", bastions, "bastion TTL, CIDR allow lists, and active sessions")
     : bastions.items.length === 0
       ? `Manual: no bastions exist in the ${bastions.seenCompartments} inspected compartments; verify how administrative access reaches private hosts.${partialNote(bastions)}`
-      : `${weakBastions.length} bastions have TTL above ${BASTION_MAX_TTL_SECONDS}s or an empty/world CIDR allow list, ${longRunningSessions.length} ACTIVE sessions exceed ${BASTION_SESSION_MAX_HOURS}h, ${undatedSessions.length} sessions lack timeCreated, ${bastionDetailErrors} detail reads failed.${partialNote(bastions)}`;
+      : `${exposedBastions.length} bastions combine a world CIDR allow list (0.0.0.0/0 or ::/0) with TTL above ${BASTION_MAX_TTL_SECONDS}s (fail), ${weakBastions.length} bastions have TTL above ${BASTION_MAX_TTL_SECONDS}s or an empty/world CIDR allow list, ${longRunningSessions.length} ACTIVE sessions exceed ${BASTION_SESSION_MAX_HOURS}h, ${undatedSessions.length} sessions lack timeCreated, ${bastionDetailErrors} detail reads failed.${partialNote(bastions)}`;
 
-  const weakKeys: Array<{ vault?: string; key_name?: string; algorithm?: string; daysSinceRotation?: number; reason: string }> = [];
+  const weakKeys: Array<{ vault?: string; key_name?: string; algorithm?: string; lengthBytes?: number; curveId?: string; daysSinceRotation?: number; reason: string }> = [];
   const undatedKeys: Array<{ vault?: string; key_name?: string }> = [];
+  let keysTotal = 0;
   let keysSeen = 0;
+  let keysJudged = 0;
+  let keyCapHit = false;
   let keyReadErrors = 0;
+  let keyDetailErrors = 0;
   for (const vault of vaults.items.filter(isActiveLifecycle)) {
     const keys = await collect(() => client.listKeys(vault));
     if (!keys.ok) {
@@ -1985,17 +2070,33 @@ export async function assessOciTenancyGuardrails(
       errors.push(`kms key list for vault ${asString(vault.id) ?? "unknown"}: ${keys.error}`);
       continue;
     }
-    for (const key of keys.items.filter((item) => upper(item.lifecycleState) === "ENABLED")) {
+    const enabledKeys = keys.items.filter((item) => upper(item.lifecycleState) === "ENABLED");
+    keysTotal += enabledKeys.length;
+    for (const key of enabledKeys) {
+      if (keysSeen >= maxKeys) {
+        keyCapHit = true;
+        break;
+      }
       keysSeen += 1;
       const keyId = asString(key.id);
-      const algorithm = upper(key.algorithm);
       const label = { vault: asString(vault.displayName) ?? asString(vault.id), key_name: asString(key.displayName) ?? keyId };
-      if (algorithm !== "AES" && algorithm !== "RSA" && algorithm !== "ECDSA") {
-        weakKeys.push({ ...label, algorithm: algorithm || undefined, reason: "algorithm outside the documented AES/RSA/ECDSA enum or missing" });
-      }
       if (!keyId) {
-        undatedKeys.push(label);
+        keyDetailErrors += 1;
+        errors.push(`kms key get skipped: a KeySummary in vault ${label.vault ?? "unknown"} had no id.`);
         continue;
+      }
+      const detail = await collect(async () => {
+        const record = await client.getKey(vault, keyId);
+        return record ? [record] : [];
+      });
+      const shape = asObject(detail.items[0]?.keyShape);
+      if (!detail.ok || !shape) {
+        keyDetailErrors += 1;
+        errors.push(`kms key get for ${keyId}: ${detail.error ?? "response did not include keyShape"}`);
+      } else {
+        keysJudged += 1;
+        const verdict = judgeKeyShape(shape);
+        if (verdict) weakKeys.push({ ...label, ...verdict });
       }
       const versions = await collect(() => client.listKeyVersions(vault, keyId));
       if (!versions.ok) {
@@ -2014,17 +2115,35 @@ export async function assessOciTenancyGuardrails(
       if (rotationDays === undefined) {
         undatedKeys.push(label);
       } else if (rotationDays > KEY_ROTATION_MAX_DAYS) {
-        weakKeys.push({ ...label, algorithm, daysSinceRotation: Number(rotationDays.toFixed(1)), reason: `newest enabled key version older than ${KEY_ROTATION_MAX_DAYS} days` });
+        weakKeys.push({ ...label, algorithm: asString(shape?.algorithm), daysSinceRotation: Number(rotationDays.toFixed(1)), reason: `newest enabled key version older than ${KEY_ROTATION_MAX_DAYS} days` });
       }
     }
   }
-  const keyComputed: OciFindingStatus = weakKeys.length > 0 ? "fail" : keyReadErrors > 0 || undatedKeys.length > 0 || keysSeen === 0 ? "warn" : "pass";
+  if (keyCapHit) keyCapHit = keysSeen < keysTotal;
+  const keyCapNote = keyCapHit ? ` Key cap ${maxKeys} hit: ${keysSeen}/${keysTotal} ENABLED keys inspected; a pass verdict is withheld.` : "";
+  let keyComputed: OciFindingStatus;
+  if (weakKeys.length > 0) {
+    keyComputed = "fail";
+  } else if (keysTotal === 0 || keysJudged === 0) {
+    keyComputed = "manual";
+  } else if (keyDetailErrors > 0 || keyReadErrors > 0 || keyCapHit || undatedKeys.length > 0) {
+    keyComputed = "warn";
+  } else {
+    keyComputed = "pass";
+  }
   const keyStatus = scopedStatus(vaults, keyComputed, "manual");
-  const keySummary = !vaults.readable
-    ? unreadableSummary("vaults", vaults, "vault key algorithms and key version history")
-    : vaults.items.length === 0
-      ? `Manual: no vaults exist in the ${vaults.seenCompartments} inspected compartments; customer-managed key hygiene cannot be judged.${partialNote(vaults)}`
-      : `${keysSeen} ENABLED keys inspected: ${weakKeys.length} weak by algorithm or rotation age, ${undatedKeys.length} without a dated enabled version, ${keyReadErrors} key or version reads failed. Key length is not exposed by KeySummary and stays manual.${partialNote(vaults)}`;
+  let keySummary: string;
+  if (!vaults.readable) {
+    keySummary = unreadableSummary("vaults", vaults, "vault key shapes (algorithm, length, curve) and key version history");
+  } else if (vaults.items.length === 0) {
+    keySummary = `Manual: no vaults exist in the ${vaults.seenCompartments} inspected compartments; customer-managed key hygiene cannot be judged.${partialNote(vaults)}`;
+  } else if (keysTotal === 0) {
+    keySummary = `Manual: ${vaults.items.length} vaults exist but no ENABLED keys were listed${keyReadErrors > 0 ? ` and ${keyReadErrors} key list reads failed` : ""}; confirm customer-managed keys are in use.${partialNote(vaults)}`;
+  } else if (keysJudged === 0) {
+    keySummary = `Manual: none of the ${keysSeen} ENABLED keys could be read with kms key get (${keyDetailErrors} reads failed: ${errors.find((entry) => entry.startsWith("kms key get")) ?? "no keyShape returned"}); grant the read keys permission or collect keyShape.length and curveId manually.${partialNote(vaults)}`;
+  } else {
+    keySummary = `${keysJudged}/${keysTotal} ENABLED keys judged from Key.keyShape: ${weakKeys.length} weak (AES below ${KEY_MIN_LENGTH_BYTES.AES * 8} bits, RSA below ${KEY_MIN_LENGTH_BYTES.RSA * 8} bits, ECDSA outside the documented curves, or newest enabled version older than ${KEY_ROTATION_MAX_DAYS} days), ${undatedKeys.length} without a dated enabled version, ${keyDetailErrors} key get reads failed, ${keyReadErrors} key or version list reads failed. ${ECDSA_RULE}${keyCapNote}${partialNote(vaults)}`;
+  }
 
   const publicBuckets: Array<{ bucket: string; publicAccessType?: string }> = [];
   const longLivedPars: Array<{ bucket: string; id?: string; expires?: string; daysUntilExpiry?: number }> = [];
@@ -2110,7 +2229,7 @@ export async function assessOciTenancyGuardrails(
       nsgStatus,
       nsgSummary,
       ["FedRAMP SC-7", "CMMC L2 3.13.1", "SOC 2 CC6.6", "CIS OCI 2.2", "PCI-DSS 1.3.2", "STIG SRG-APP-000142", "IRAP ISM-1416", "ISMAP NW-01"],
-      { ...scopeEvidence(nsgs), permissive_nsg_rules: permissiveNsgRules.slice(0, 25), nsg_rule_errors: nsgRuleErrors },
+      { ...scopeEvidence(nsgs), nsg_rules_seen: nsgRulesSeen, nsg_rules_is_valid_false: nsgInvalidRules, permissive_nsg_rules: permissiveNsgRules.slice(0, 25), nsg_rule_errors: nsgRuleErrors },
     ),
     finding(
       "OCI-GRD-03",
@@ -2128,7 +2247,7 @@ export async function assessOciTenancyGuardrails(
       bastionStatus,
       bastionSummary,
       ["FedRAMP AC-17", "FedRAMP AC-17(1)", "CMMC L2 3.1.12", "SOC 2 CC6.1", "SOC 2 CC6.2", "CIS OCI 2.8", "CIS OCI 2.9", "PCI-DSS 8.6.1", "STIG SRG-APP-000190", "IRAP ISM-1506", "ISMAP AC-03"],
-      { ...scopeEvidence(bastions), weak_bastions: weakBastions.slice(0, 25), long_running_sessions: longRunningSessions.slice(0, 25), undated_sessions: undatedSessions.slice(0, 25), detail_errors: bastionDetailErrors },
+      { ...scopeEvidence(bastions), exposed_bastions: exposedBastions.slice(0, 25), weak_bastions: weakBastions.slice(0, 25), long_running_sessions: longRunningSessions.slice(0, 25), undated_sessions: undatedSessions.slice(0, 25), detail_errors: bastionDetailErrors },
     ),
     finding(
       "OCI-GRD-05",
@@ -2137,7 +2256,21 @@ export async function assessOciTenancyGuardrails(
       keyStatus,
       keySummary,
       ["FedRAMP SC-12(1)", "FedRAMP SC-13", "CMMC L2 3.13.10", "CMMC L2 3.13.11", "SOC 2 CC6.1", "CIS OCI 4.1", "CIS OCI 4.2", "PCI-DSS 3.6.4", "PCI-DSS 3.6.1", "STIG SRG-APP-000514", "IRAP ISM-0490", "IRAP ISM-0457", "ISMAP CR-01", "ISMAP CR-02"],
-      { ...scopeEvidence(vaults), keys_seen: keysSeen, weak_keys: weakKeys.slice(0, 25), undated_keys: undatedKeys.slice(0, 25), key_read_errors: keyReadErrors },
+      {
+        ...scopeEvidence(vaults),
+        keys_total: keysTotal,
+        keys_seen: keysSeen,
+        keys_judged: keysJudged,
+        key_cap: maxKeys,
+        key_cap_hit: keyCapHit,
+        key_detail_errors: keyDetailErrors,
+        key_read_errors: keyReadErrors,
+        length_floor_bytes: { ...KEY_MIN_LENGTH_BYTES },
+        ecdsa_accepted_curves: [...ECDSA_ACCEPTED_CURVES],
+        weak_keys: weakKeys.slice(0, 25),
+        undated_keys: undatedKeys.slice(0, 25),
+        source: OCI_SURFACE_DOCS.keyDetail.rest,
+      },
     ),
     finding(
       "OCI-GRD-06",
@@ -2158,6 +2291,7 @@ export async function assessOciTenancyGuardrails(
       permissive_security_lists: permissiveSecurityLists.length,
       permissive_nsg_rules: permissiveNsgRules.length,
       enabled_internet_gateways: enabledGateways.length,
+      exposed_bastions: exposedBastions.length,
       weak_bastions: weakBastions.length,
       long_running_sessions: longRunningSessions.length,
       weak_vault_keys: weakKeys.length,
@@ -2476,6 +2610,7 @@ export async function exportOciAuditBundle(
   const tenancyGuardrails = await assessOciTenancyGuardrails(client, {
     maxCompartments: options.max_compartments,
     maxBuckets: options.max_buckets,
+    maxKeys: options.max_keys,
   });
   const computeStorage = await assessOciComputeAndStorage(client, {
     maxCompartments: options.max_compartments,
@@ -2583,6 +2718,7 @@ function normalizeGuardrailArgs(args: unknown): GuardrailArgs {
   return {
     ...normalizeScopeArgs(args),
     max_buckets: asNumber(value.max_buckets),
+    max_keys: asNumber(value.max_keys),
   };
 }
 
@@ -2698,6 +2834,7 @@ export function registerOciTools(pi: any): void {
     parameters: Type.Object({
       ...scopeParams,
       max_buckets: Type.Optional(Type.Number({ description: `Maximum buckets to fetch for public access and PAR checks. Defaults to ${DEFAULT_MAX_BUCKETS}.`, default: DEFAULT_MAX_BUCKETS })),
+      max_keys: Type.Optional(Type.Number({ description: `Maximum ENABLED vault keys to fetch with kms key get across all vaults. Defaults to ${DEFAULT_MAX_KEYS}; hitting the cap withholds pass.`, default: DEFAULT_MAX_KEYS })),
     }),
     prepareArguments: normalizeGuardrailArgs,
     async execute(_toolCallId: string, args: GuardrailArgs) {
@@ -2705,6 +2842,7 @@ export function registerOciTools(pi: any): void {
         const result = await assessOciTenancyGuardrails(createClient(args), {
           maxCompartments: args.max_compartments,
           maxBuckets: args.max_buckets,
+          maxKeys: args.max_keys,
         });
         return textResult(formatAssessmentText(result), { tool: "oci_assess_tenancy_guardrails", ...result });
       } catch (error) {
@@ -2747,7 +2885,7 @@ export function registerOciTools(pi: any): void {
       ...scopeParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
       stale_days: Type.Optional(Type.Number({ description: "Credential staleness threshold in days. Defaults to 90.", default: 90 })),
-      max_keys: Type.Optional(Type.Number({ description: "Maximum API/secret credentials to inspect. Defaults to 200.", default: 200 })),
+      max_keys: Type.Optional(Type.Number({ description: "Maximum API/secret credentials to inspect and, for the guardrail assessment, maximum ENABLED vault keys fetched with kms key get. Defaults to 200; hitting either cap withholds pass.", default: 200 })),
       max_policies: Type.Optional(Type.Number({ description: "Maximum IAM policies to inspect for broad statements. Defaults to 500.", default: 500 })),
       max_buckets: Type.Optional(Type.Number({ description: `Maximum buckets to fetch. Defaults to ${DEFAULT_MAX_BUCKETS}.`, default: DEFAULT_MAX_BUCKETS })),
       lookback_days: Type.Optional(Type.Number({ description: "Audit event lookback window in days. Defaults to 7.", default: 7 })),

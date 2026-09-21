@@ -12,6 +12,7 @@ import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
 import {
+  OCI_COMMAND_RUNNER_OPTIONS,
   OCI_SURFACE_DOCS,
   OciAuditorClient,
   REDACTED_MARKER,
@@ -23,6 +24,7 @@ import {
   collectAcrossCompartments,
   exportOciAuditBundle,
   isSensitiveFieldName,
+  judgeKeyShape,
   projectCompartmentSnapshot,
   redactSensitiveText,
   redactSensitiveValues,
@@ -154,6 +156,9 @@ function compliantClient() {
     async listKeys() {
       return [{ id: "key-1", displayName: "data", algorithm: "AES", lifecycleState: "ENABLED", protectionMode: "HSM", timeCreated: "2024-01-01T00:00:00.000Z" }];
     },
+    async getKey(_vault, keyId) {
+      return { id: keyId, displayName: "data", lifecycleState: "ENABLED", vaultId: "vault-1", compartmentId: PROD.id, currentKeyVersion: "kv-2", timeCreated: "2024-01-01T00:00:00.000Z", keyShape: { algorithm: "AES", length: 32 } };
+    },
     async listKeyVersions() {
       return [
         { id: "kv-1", lifecycleState: "ENABLED", timeCreated: "2024-01-01T00:00:00.000Z" },
@@ -199,7 +204,7 @@ function deniedClient() {
 /** Fixture (b): every list is empty and every single-object read returns null. */
 function emptyClient() {
   const client = compliantClient();
-  const singles = new Set(["getAuthenticationPolicy", "getAuditConfiguration", "getCloudGuardConfiguration", "getBastion", "getBucket"]);
+  const singles = new Set(["getAuthenticationPolicy", "getAuditConfiguration", "getCloudGuardConfiguration", "getBastion", "getBucket", "getKey"]);
   for (const key of Object.keys(client)) {
     if (key === "getResolvedConfig" || key === "getNow") continue;
     if (key === "getObjectStorageNamespace") {
@@ -276,6 +281,8 @@ function secretLadenClient() {
   wrapList("listBootVolumes", "BOOT_VOLUME");
   const originalBastion = client.getBastion;
   client.getBastion = async (...args) => ({ ...(await originalBastion(...args)), ...tags("BASTION_DETAIL"), phoneBookEntry: "FAKE_PHONE_BOOK_1" });
+  const originalKey = client.getKey;
+  client.getKey = async (...args) => ({ ...(await originalKey(...args)), ...tags("KEY_DETAIL"), keyMaterial: "FAKE_KEY_MATERIAL_2", wrappedImportKey: { wrappedKey: "FAKE_WRAPPED_KEY_2" } });
   const originalBucket = client.getBucket;
   client.getBucket = async (...args) => ({ ...(await originalBucket(...args)), ...tags("BUCKET_DETAIL"), metadata: { password: "FAKE_BUCKET_DETAIL_SECRET_1" } });
   const originalAuthPolicy = client.getAuthenticationPolicy;
@@ -387,6 +394,7 @@ test("OciAuditorClient sends documented CLI commands and flags", async () => {
   await client.listNetworkSecurityGroupRules("nsg-1");
   await client.listKeys({ id: "vault-1", compartmentId: "c1", managementEndpoint: "https://kms.example" });
   await client.listKeyVersions({ id: "vault-1", managementEndpoint: "https://kms.example" }, "key-1");
+  await client.getKey({ id: "vault-1", managementEndpoint: "https://kms.example" }, "key-1");
   await client.listBootVolumes("c1", "AD-1");
   await client.listInstances("c1");
   await client.listVolumes("c1");
@@ -399,15 +407,19 @@ test("OciAuditorClient sends documented CLI commands and flags", async () => {
   assert.deepEqual(calls[2], ["network", "nsg", "rules", "list", "--nsg-id", "nsg-1", "--direction", "INGRESS", "--all"]);
   assert.deepEqual(calls[3], ["kms", "management", "key", "list", "--endpoint", "https://kms.example", "--compartment-id", "c1", "--all"]);
   assert.deepEqual(calls[4], ["kms", "management", "key-version", "list", "--endpoint", "https://kms.example", "--key-id", "key-1", "--all"]);
-  assert.deepEqual(calls[5], ["bv", "boot-volume", "list", "--compartment-id", "c1", "--availability-domain", "AD-1", "--all"]);
-  assert.deepEqual(calls[6], ["compute", "instance", "list", "--compartment-id", "c1", "--all"]);
-  assert.deepEqual(calls[7], ["bv", "volume", "list", "--compartment-id", "c1", "--all"]);
-  assert.deepEqual(calls[8], ["os", "bucket", "get", "--namespace-name", "ns", "--bucket-name", "bucket"]);
-  assert.deepEqual(calls[9], ["bastion", "bastion", "get", "--bastion-id", "bastion-1"]);
-  assert.deepEqual(calls[10], ["cloud-guard", "problem", "list", "--compartment-id", TENANCY, "--compartment-id-in-subtree", "true", "--access-level", "ACCESSIBLE", "--lifecycle-detail", "OPEN", "--all"]);
+  assert.deepEqual(calls[5], ["kms", "management", "key", "get", "--endpoint", "https://kms.example", "--key-id", "key-1"]);
+  assert.deepEqual(calls[6], ["bv", "boot-volume", "list", "--compartment-id", "c1", "--availability-domain", "AD-1", "--all"]);
+  assert.deepEqual(calls[7], ["compute", "instance", "list", "--compartment-id", "c1", "--all"]);
+  assert.deepEqual(calls[8], ["bv", "volume", "list", "--compartment-id", "c1", "--all"]);
+  assert.deepEqual(calls[9], ["os", "bucket", "get", "--namespace-name", "ns", "--bucket-name", "bucket"]);
+  assert.deepEqual(calls[10], ["bastion", "bastion", "get", "--bastion-id", "bastion-1"]);
+  assert.deepEqual(calls[11], ["cloud-guard", "problem", "list", "--compartment-id", TENANCY, "--compartment-id-in-subtree", "true", "--access-level", "ACCESSIBLE", "--lifecycle-detail", "OPEN", "--all"]);
   for (const args of calls) {
     assert.ok(!args.includes("--query"), "no --query projection is used");
   }
+  assert.equal(OCI_COMMAND_RUNNER_OPTIONS.timeout, 15_000);
+  assert.ok(OCI_COMMAND_RUNNER_OPTIONS.maxBuffer >= 64 * 1024 * 1024, "maxBuffer is raised next to the timeout");
+  assert.equal(OCI_COMMAND_RUNNER_OPTIONS.encoding, "utf8");
   for (const [name, doc] of Object.entries(OCI_SURFACE_DOCS)) {
     assert.match(doc.cli, /^https:\/\/docs\.oracle\.com\/en-us\/iaas\/tools\/oci-cli\//, `${name} cites the CLI reference`);
     assert.match(doc.rest, /^https:\/\/docs\.oracle\.com\/en-us\/iaas\/api\//, `${name} cites the REST reference`);
@@ -640,7 +652,8 @@ test("assessOciTenancyGuardrails flags exposed network paths, bastions, keys, an
   assert.equal(byId(result, "OCI-GRD-03").status, "warn");
   assert.equal(byId(result, "OCI-GRD-04").status, "fail");
   assert.equal(byId(result, "OCI-GRD-05").status, "fail");
-  assert.match(byId(result, "OCI-GRD-05").summary, /1 weak by algorithm or rotation age/);
+  assert.match(byId(result, "OCI-GRD-05").summary, /1\/1 ENABLED keys judged from Key.keyShape: 1 weak/);
+  assert.equal(byId(result, "OCI-GRD-05").evidence.weak_keys[0].reason, "newest enabled key version older than 365 days");
   assert.equal(byId(result, "OCI-GRD-06").status, "fail");
   assert.equal(byId(result, "OCI-GRD-06").evidence.long_lived_pars.length, 1);
 });
