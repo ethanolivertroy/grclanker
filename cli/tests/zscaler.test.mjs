@@ -1698,3 +1698,385 @@ test("self-check (d): a compliant tenant served in Automation Hub shapes passes 
   assert.ok(run.ziaRequests.some((request) => request.key === "GET /api/v1/urlFilteringRules?page=2&pageSize=100"));
   assert.equal(run.ziaRequests.at(-1).key, "DELETE /api/v1/authenticatedSession");
 });
+
+// Rule 9 (bundle secret hygiene) and rule 10 (truncation on every cap exit) regression coverage.
+
+test("redactForExport redacts documented and credential-shaped keys and keeps the benign fields the verdicts read", () => {
+  const redacted = redactForExport({
+    kerberosPwd: "bind-pw",
+    scimSharedSecret: "scim",
+    snmpCommunity: "public",
+    provisioningKey: "prov",
+    passwordHash: "hash",
+    tunnelKey: "tunnel",
+    bind_password: "bind",
+    "api-key": "api",
+    sharedSecret: "shared",
+    accessToken: "token",
+    passphrase: "phrase",
+    credentialBlob: "blob",
+    privateCertificate: "pem",
+    comments: "psk is hunter2",
+    comment: "psk is hunter2",
+    numericPin: 1234,
+    apiToken: 9876,
+    isPasswordLoginAllowed: false,
+    passwordExpiryDays: 90,
+    passwordExpirationEnabled: true,
+    publicKey: "ssh-rsa AAAA",
+    privateIp: "10.0.0.5",
+    tokenType: "Bearer",
+    scimSharedSecretExists: true,
+    privateKeyPresent: true,
+    password_login_admins: ["a@example.com"],
+    vpn_credentials: 3,
+    vpnCredentials: { data: [{ id: 1, preSharedKey: "psk", fqdn: "hq@example.com" }] },
+    nested: [{ password: "n", name: "keep" }],
+    md5HashValueList: ["d41d8cd98f00b204e9800998ecf8427e"],
+    emptyToken: "",
+  });
+  for (const key of ["kerberosPwd", "scimSharedSecret", "snmpCommunity", "provisioningKey", "passwordHash", "tunnelKey", "bind_password", "api-key", "sharedSecret", "accessToken", "passphrase", "credentialBlob", "privateCertificate", "comments", "comment", "apiToken"]) {
+    assert.equal(redacted[key], "[REDACTED]", key);
+  }
+  assert.equal(redacted.numericPin, 1234);
+  assert.equal(redacted.emptyToken, "[REDACTED]");
+  assert.equal(redacted.isPasswordLoginAllowed, false);
+  assert.equal(redacted.passwordExpiryDays, 90);
+  assert.equal(redacted.passwordExpirationEnabled, true);
+  assert.equal(redacted.publicKey, "ssh-rsa AAAA");
+  assert.equal(redacted.privateIp, "10.0.0.5");
+  assert.equal(redacted.tokenType, "Bearer");
+  assert.equal(redacted.scimSharedSecretExists, true);
+  assert.equal(redacted.privateKeyPresent, true);
+  assert.deepEqual(redacted.password_login_admins, ["a@example.com"]);
+  assert.equal(redacted.vpn_credentials, 3);
+  assert.deepEqual(redacted.vpnCredentials, { data: [{ id: 1, preSharedKey: "[REDACTED]", fqdn: "hq@example.com" }] });
+  assert.deepEqual(redacted.nested, [{ password: "[REDACTED]", name: "keep" }]);
+  assert.deepEqual(redacted.md5HashValueList, ["d41d8cd98f00b204e9800998ecf8427e"]);
+});
+
+test("ZIA and ZPA clients never echo raw response bodies and scrub credential-shaped tokens from documented error fields", async () => {
+  const longMessage = Array.from({ length: 60 }, (_, index) => `word${index % 10}`).join(" ");
+  const ziaFetch = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const path = url.pathname.replace(/^\/api\/v1/, "");
+    if (path === "/authenticatedSession") {
+      return init.method === "POST" ? jsonResponse({ authType: "ADMIN_LOGIN" }, { headers: { "set-cookie": "JSESSIONID=SESSION; Path=/" } }) : jsonResponse({});
+    }
+    if (path === "/adminUsers") return new Response("<html>CANARYrawBody0001</html>", { status: 500, headers: { "content-type": "text/html" } });
+    if (path === "/adminRoles/lite") {
+      return jsonResponse({ code: "AUTHENTICATION_FAILED", message: `apiKey=CANARYkeyValue0002 rejected for CANARYlongToken0003 "password": "CANARYquoted0004" by INVALID_INPUT_ARGUMENT` }, { status: 401 });
+    }
+    if (path === "/authSettings") return jsonResponse({ message: longMessage }, { status: 403 });
+    return jsonResponse({});
+  };
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetch, maxRetries: 0 });
+  await assert.rejects(() => zia.listAdminUsers(), (error) => {
+    assert.match(error.message, /^ZIA GET \/adminUsers failed \(500\): non-JSON response body of \d+ bytes omitted$/);
+    return true;
+  });
+  await assert.rejects(() => zia.listAdminRoles(), (error) => {
+    assert.match(error.message, /^ZIA GET \/adminRoles\/lite failed \(401\): /);
+    assert.match(error.message, /apiKey=\[REDACTED\]/);
+    assert.match(error.message, /"password": "\[REDACTED\]"/);
+    assert.match(error.message, /INVALID_INPUT_ARGUMENT/);
+    assert.match(error.message, /AUTHENTICATION_FAILED/);
+    assert.ok(!error.message.includes("CANARY"), error.message);
+    return true;
+  });
+  await assert.rejects(() => zia.getAuthSettings(), (error) => {
+    assert.ok(error.message.length <= "ZIA GET /authSettings failed (403): ".length + 160, error.message);
+    return true;
+  });
+
+  const zpaFetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/signin") return jsonResponse({ id: "err", reason: "client_secret=CANARYsecret0005 invalid for CANARYcustomer0006" }, { status: 401 });
+    return jsonResponse({});
+  };
+  await assert.rejects(() => new ZpaApiClient(zpaConfig(), { fetchImpl: zpaFetch, maxRetries: 0 }).listApplicationSegments(), (error) => {
+    assert.match(error.message, /^ZPA signin failed \(401\): client_secret=\[REDACTED\] invalid for \[REDACTED\]$/);
+    return true;
+  });
+});
+
+function walkFiles(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? walkFiles(join(dir, entry.name)) : [join(dir, entry.name)]));
+}
+
+function zipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  let eocd = buffer.length - 22;
+  while (eocd >= 0 && buffer.readUInt32LE(eocd) !== 0x06054b50) eocd -= 1;
+  assert.ok(eocd >= 0, "zip end of central directory record not found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header expected");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "local file header expected");
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: (method === 8 ? inflateRawSync(compressed) : compressed).toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+const CANARIES = {
+  ziaApiKey: "CANARYziaApiKey0001ABCDEFGHIJKLMNOP",
+  ziaPassword: "CANARYziaPassword0002",
+  zpaClientSecret: "CANARYzpaClientSecret0003",
+  sessionCookie: "CANARYsessionCookie0004",
+  accessToken: "CANARYaccessToken0005",
+  adminPassword: "CANARYadminPassword0006",
+  adminTmpPassword: "CANARYadminTmpPassword0007",
+  kerberosPwd: "CANARYkerberosPwd0008",
+  nssToken: "CANARYnssToken0009",
+  preSharedKey: "CANARYpreSharedKey0010",
+  vpnComments: "CANARYvpnComments0011",
+  greComment: "CANARYgreComment0012",
+  snmpCommunity: "CANARYsnmpCommunity0013",
+  provisioningKey: "CANARYprovisioningKey0014",
+  passwordHash: "CANARYpasswordHash0015",
+  tunnelKey: "CANARYtunnelKey0016",
+  sandboxToken: "CANARYsandboxApiToken0017",
+  sharedSecret: "CANARYsharedSecret0018",
+  passphrase: "CANARYpassphrase0019",
+  credentialBlob: "CANARYcredentialBlob0020",
+  ziaErrorEcho: "CANARYerrorBodyEcho0021",
+  ziaRawBody: "CANARYrawBody0022",
+  scimSharedSecret: "CANARYscimSharedSecret0023",
+  zrsaPrivateKey: "CANARYzrsaPrivateKey0024",
+  zrsaSessionKey: "CANARYzrsaSessionKey0025",
+  enrollmentPrivateKey: "CANARYenrollmentPrivateKey0026",
+  browserAccessPrivateKey: "CANARYbaPrivateKey0027",
+  zpaAdminPassword: "CANARYzpaAdminPassword0028",
+  zpaAdminTmpPassword: "CANARYzpaAdminTmpPassword0029",
+  zpaAdminSessionToken: "CANARYzpaAdminSessionToken0030",
+  connectorProvisioningKey: "CANARYconnectorProvisioningKey0031",
+  zpaErrorEcho: "CANARYzpaErrorEcho0032",
+};
+
+function canaryZiaTenant() {
+  const tenant = ziaCompliantTenant();
+  tenant.adminUsers[0].password = CANARIES.adminPassword;
+  tenant.adminUsers[0].tmpPassword = CANARIES.adminTmpPassword;
+  tenant.adminUsers[1].passwordHash = CANARIES.passwordHash;
+  tenant.authSettings.kerberosPwd = CANARIES.kerberosPwd;
+  tenant.nssFeeds[0].authenticationToken = CANARIES.nssToken;
+  tenant.vpnCredentials[0].preSharedKey = CANARIES.preSharedKey;
+  tenant.vpnCredentials[0].comments = CANARIES.vpnComments;
+  tenant.greTunnels[0].comment = CANARIES.greComment;
+  tenant.greTunnels[0].tunnelKey = CANARIES.tunnelKey;
+  tenant.locations[0].snmpCommunity = CANARIES.snmpCommunity;
+  tenant.locations[0].passphrase = CANARIES.passphrase;
+  tenant.isolationProfiles[0].provisioningKey = CANARIES.provisioningKey;
+  tenant.sandboxSettings.sandboxApiToken = CANARIES.sandboxToken;
+  tenant.dlpDictionaries[0].sharedSecret = CANARIES.sharedSecret;
+  tenant.urlFilteringRules[0].credentialBlob = CANARIES.credentialBlob;
+  return tenant;
+}
+
+function canaryZpaTenant() {
+  const tenant = zpaCompliantTenant();
+  tenant.idp[0].scimSharedSecret = CANARIES.scimSharedSecret;
+  tenant.enrollmentCert[0].zrsaencryptedprivatekey = CANARIES.zrsaPrivateKey;
+  tenant.enrollmentCert[0].zrsaencryptedsessionkey = CANARIES.zrsaSessionKey;
+  tenant.enrollmentCert[1].privateKey = CANARIES.enrollmentPrivateKey;
+  tenant.clientlessCertificate[0].privateKey = CANARIES.browserAccessPrivateKey;
+  tenant.administrators[0].password = CANARIES.zpaAdminPassword;
+  tenant.administrators[0].tmpPassword = CANARIES.zpaAdminTmpPassword;
+  tenant.administrators[0].sessionToken = CANARIES.zpaAdminSessionToken;
+  tenant.appConnectorGroup[0].provisioningKey = CANARIES.connectorProvisioningKey;
+  tenant.connector[0].privateIp = "10.0.0.5";
+  tenant.connector[0].publicKey = "PUBLIC-KEY-MATERIAL-STAYS";
+  return tenant;
+}
+
+test("exportZscalerAuditBundle leaks no canary from any credential carrier into any bundle file or zip entry (rule 9)", async () => {
+  const base = createTempBase("grclanker-zscaler-canary-");
+  const ziaStub = ziaTenantFetch(canaryZiaTenant());
+  const zpaStub = zpaTenantFetch(canaryZpaTenant());
+  const ziaFetch = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const path = url.pathname.replace(/^\/api\/v1/, "");
+    if (path === "/authenticatedSession" && init.method === "POST") {
+      return jsonResponse({ authType: "ADMIN_LOGIN" }, { headers: { "set-cookie": `JSESSIONID=${CANARIES.sessionCookie}; Path=/; Secure; HttpOnly` } });
+    }
+    if (path === "/auditlogEntryReport") return jsonResponse({ code: "AUTHENTICATION_FAILED", message: `session ${CANARIES.ziaErrorEcho} rejected` }, { status: 401 });
+    if (path === "/bandwidthControlRules") return new Response(`<html>${CANARIES.ziaRawBody}</html>`, { status: 500, headers: { "content-type": "text/html" } });
+    return ziaStub.fetchImpl(input, init);
+  };
+  const zpaFetch = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/signin") return jsonResponse({ token_type: "Bearer", access_token: CANARIES.accessToken, expires_in: "3600" });
+    if (url.pathname === `${ZPA_V2}/posture`) return jsonResponse({ id: "err", reason: `${CANARIES.zpaErrorEcho} forbidden` }, { status: 403 });
+    return zpaStub.fetchImpl(input, init);
+  };
+  const ziaCanaryConfig = { ...ziaConfig(), apiKey: CANARIES.ziaApiKey, password: CANARIES.ziaPassword };
+  const zpaCanaryConfig = { ...zpaConfig(), clientSecret: CANARIES.zpaClientSecret };
+  const config = { zia: ziaCanaryConfig, zpa: zpaCanaryConfig, oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] };
+  const zia = new ZiaApiClient(ziaCanaryConfig, { fetchImpl: ziaFetch, maxRetries: 0, now: () => NOW });
+  const zpa = new ZpaApiClient(zpaCanaryConfig, { fetchImpl: zpaFetch, maxRetries: 0, now: () => NOW });
+  const result = await exportZscalerAuditBundle({ config, zia, zpa }, { outputDir: base });
+
+  const files = walkFiles(result.outputDir);
+  assert.ok(files.length >= 20, `only ${files.length} files written`);
+  assert.equal(files.length, result.fileCount);
+  const leaks = [];
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    for (const [carrier, canary] of Object.entries(CANARIES)) {
+      if (content.includes(canary)) leaks.push(`${relative(result.outputDir, file)}: ${carrier}`);
+    }
+    assert.ok(!/JSESSIONID=(?!\[REDACTED\])/.test(content), `${file} carries a session cookie`);
+  }
+  assert.deepEqual(leaks, []);
+
+  const entries = zipEntries(result.zipPath).filter((entry) => !entry.name.endsWith("/"));
+  assert.equal(entries.length, files.length);
+  const zipLeaks = [];
+  for (const entry of entries) {
+    for (const [carrier, canary] of Object.entries(CANARIES)) {
+      if (entry.content.includes(canary)) zipLeaks.push(`${entry.name}: ${carrier}`);
+    }
+  }
+  assert.deepEqual(zipLeaks, []);
+
+  const ziaAccess = JSON.parse(readFileSync(join(result.outputDir, "core_data/zia_access_control.json"), "utf8"));
+  assert.equal(ziaAccess.authSettings.data.kerberosPwd, "[REDACTED]");
+  assert.equal(ziaAccess.authSettings.data.samlEnabled, true);
+  assert.equal(ziaAccess.adminUsers.data[0].isPasswordLoginAllowed, false);
+  assert.equal(ziaAccess.passwordExpiry.data.passwordExpiryDays, 90);
+  assert.match(ziaAccess.auditLogReport.error, /failed \(401\): session \[REDACTED\] rejected; AUTHENTICATION_FAILED$/);
+  const ziaPolicy = JSON.parse(readFileSync(join(result.outputDir, "core_data/zia_policy.json"), "utf8"));
+  assert.equal(ziaPolicy.vpnCredentials.data[0].preSharedKey, "[REDACTED]");
+  assert.equal(ziaPolicy.vpnCredentials.data[0].comments, "[REDACTED]");
+  assert.equal(ziaPolicy.vpnCredentials.data[0].fqdn, "hq@example.com");
+  assert.equal(ziaPolicy.greTunnels.data[0].comment, "[REDACTED]");
+  assert.equal(ziaPolicy.greTunnels.data[0].sourceIp, "203.0.113.10");
+  assert.match(ziaPolicy.bandwidthRules.error, /failed \(500\): non-JSON response body of \d+ bytes omitted/);
+  const zpaData = JSON.parse(readFileSync(join(result.outputDir, "core_data/zpa.json"), "utf8"));
+  assert.equal(zpaData.idpControllers.data[0].scimSharedSecret, "[REDACTED]");
+  assert.equal(zpaData.idpControllers.data[0].scimEnabled, true);
+  assert.equal(zpaData.appConnectors.data[0].privateIp, "10.0.0.5");
+  assert.equal(zpaData.appConnectors.data[0].publicKey, "PUBLIC-KEY-MATERIAL-STAYS");
+  assert.match(zpaData.postureProfiles.error, /failed \(403\): \[REDACTED\] forbidden$/);
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
+  assert.equal(findings.length, 25);
+  assert.deepEqual(findings.find((item) => item.id === "ZS-06").evidence.password_login_admins, []);
+  const auditFinding = findings.find((item) => item.id === "ZS-14");
+  assert.equal(auditFinding.status, "manual");
+  assert.match(auditFinding.summary, /returned 401/);
+  assert.match(auditFinding.evidence.error, /session \[REDACTED\] rejected/);
+  assert.equal(findings.find((item) => item.id === "ZS-10").status, "manual");
+  const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /auditlogEntryReport/);
+  assert.match(errorLog, /posture/);
+  assert.match(errorLog, /bandwidthControlRules/);
+  const accessCheck = readFileSync(join(result.outputDir, "core_data/access_check.json"), "utf8");
+  assert.match(accessCheck, /\[REDACTED\] forbidden/);
+  assert.match(accessCheck, /session \[REDACTED\] rejected/);
+  assert.equal(result.errorCount, errorLog.trimEnd().split("\n").length);
+});
+
+function zpaFetchIntercepting(tenant, interceptor) {
+  const stub = zpaTenantFetch(tenant);
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const suffix = url.pathname.replace(`${ZPA_V1}/`, "").replace(`${ZPA_V2}/`, "");
+    const intercepted = url.pathname === "/signin" ? undefined : interceptor(suffix, url);
+    if (!intercepted) return stub.fetchImpl(input, init);
+    requests.push({ key: requestKey(url, init), url, init });
+    return intercepted;
+  };
+  return { fetchImpl, requests };
+}
+
+function segment(id) {
+  return { id: `seg-${id}`, name: `Segment ${id}`, enabled: true, domainNames: [`app-${id}.corp.example.com`], tcpPortRange: [{ from: "443", to: "443" }], segmentGroupId: "sg-1", bypassType: "NEVER" };
+}
+
+test("ZpaApiClient treats a missing totalPages as an unknown total: full pages keep paging, a repeated page is truncated, and ZS-08 stays below pass (rule 10)", async () => {
+  const segments = Array.from({ length: 1200 }, (_, index) => segment(index + 1));
+  const untotaled = zpaFetchIntercepting(zpaCompliantTenant(), (suffix, url) => {
+    if (suffix !== "application") return undefined;
+    const page = Number(url.searchParams.get("page") ?? "1");
+    return jsonResponse({ list: segments.slice((page - 1) * 500, page * 500) });
+  });
+  const complete = await assessZpa(new ZpaApiClient(zpaConfig(), { fetchImpl: untotaled.fetchImpl, maxRetries: 0, now: () => NOW }));
+  assert.equal(untotaled.requests.filter((request) => request.url.pathname === `${ZPA_V1}/application`).length, 3);
+  assert.equal(findingById(complete, "ZS-08").status, "pass");
+  assert.equal(findingById(complete, "ZS-08").evidence.segment_count ?? findingById(complete, "ZS-08").evidence.enabled_segments ?? 1200, 1200);
+  assert.equal(complete.truncated.length, 0);
+
+  const stuck = zpaFetchIntercepting(zpaCompliantTenant(), (suffix) => (suffix === "application" ? jsonResponse({ list: segments.slice(0, 500) }) : undefined));
+  const client = new ZpaApiClient(zpaConfig(), { fetchImpl: stuck.fetchImpl, maxRetries: 0, now: () => NOW });
+  const paged = await client.listApplicationSegments();
+  assert.equal(paged.items.length, 500);
+  assert.equal(paged.truncated, true);
+  assert.equal(paged.totalPages, undefined);
+  assert.equal(paged.pagesFetched, 2);
+  const partial = await assessZpa(client);
+  const finding = findingById(partial, "ZS-08");
+  assert.equal(finding.status, "warn");
+  assert.equal(finding.evidence.partial_inventory, true);
+  assert.match(finding.summary, /application segment inventory is partial \(500 records over 2 pages, total unknown\)/);
+  assert.ok(partial.truncated.some((note) => /^application: only 2 pages were read and the total is unknown/.test(note)), partial.truncated.join("\n"));
+
+  let served = 0;
+  const endless = zpaFetchIntercepting(zpaCompliantTenant(), (suffix, url) => {
+    if (suffix !== "application") return undefined;
+    served += 1;
+    const page = Number(url.searchParams.get("page") ?? "1");
+    return jsonResponse({ list: Array.from({ length: 500 }, (_, index) => segment(page * 1000 + index)) });
+  });
+  const capped = await new ZpaApiClient(zpaConfig(), { fetchImpl: endless.fetchImpl, maxRetries: 0, now: () => NOW }).listApplicationSegments();
+  assert.equal(served, 200);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.totalPages, undefined);
+  assert.equal(capped.items.length, 100000);
+});
+
+test("ZpaApiClient pages a bare array until a short page and reports a repeating full array as truncated, capping ZS-08 and ZS-12 (rule 10)", async () => {
+  const groups = Array.from({ length: 500 }, (_, index) => ({ id: `sg-${index + 1}`, name: `Group ${index + 1}`, enabled: true }));
+  const bare = zpaFetchIntercepting(zpaCompliantTenant(), (suffix, url) => {
+    if (suffix !== "segmentGroup") return undefined;
+    return jsonResponse(Number(url.searchParams.get("page") ?? "1") === 1 ? groups : []);
+  });
+  const client = new ZpaApiClient(zpaConfig(), { fetchImpl: bare.fetchImpl, maxRetries: 0, now: () => NOW });
+  const paged = await client.listSegmentGroups();
+  assert.equal(paged.items.length, 500);
+  assert.equal(paged.truncated, false);
+  assert.equal(paged.pagesFetched, 2);
+  assert.deepEqual(bare.requests.filter((request) => request.url.pathname === `${ZPA_V1}/segmentGroup`).map((request) => request.key), [
+    `GET ${ZPA_V1}/segmentGroup?page=1&pagesize=500`,
+    `GET ${ZPA_V1}/segmentGroup?page=2&pagesize=500`,
+  ]);
+  const short = await client.listTrustedNetworks();
+  assert.equal(short.truncated, false);
+  assert.equal(short.pagesFetched, 1);
+
+  const repeating = zpaFetchIntercepting(zpaCompliantTenant(), (suffix) => {
+    if (suffix === "segmentGroup") return jsonResponse(groups);
+    if (suffix === "idp") return jsonResponse(Array.from({ length: 500 }, (_, index) => ({ id: `idp-${index + 1}`, name: `IdP ${index + 1}`, enabled: true, ssoType: ["USER"], scimEnabled: true, signSamlRequest: "1" })));
+    return undefined;
+  });
+  const result = await assessZpa(new ZpaApiClient(zpaConfig(), { fetchImpl: repeating.fetchImpl, maxRetries: 0, now: () => NOW }));
+  for (const id of ["ZS-08", "ZS-12"]) {
+    const item = findingById(result, id);
+    assert.notEqual(item.status, "pass", id);
+    assert.equal(item.evidence.partial_inventory, true, id);
+  }
+  assert.ok(result.truncated.some((note) => /^segmentGroup: only 2 pages were read and the total is unknown/.test(note)), result.truncated.join("\n"));
+  assert.ok(result.truncated.some((note) => /^idp: only 2 pages were read and the total is unknown/.test(note)), result.truncated.join("\n"));
+});

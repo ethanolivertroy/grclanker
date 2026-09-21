@@ -3038,8 +3038,8 @@ const SENSITIVE_KEY_PATTERN = /password|passwd|pwd|secret|token|passphrase|crede
 // Normalized names that match the pattern but carry no secret in the published schemas or in this module's
 // evidence objects.
 const BENIGN_SECRET_LIKE_KEYS = new Set([
-  "ispasswordloginallowed", "ispasswordexpired", "passwordexpirationenabled", "passwordexpirydays", "passwordstrength",
-  "passwordloginadmins", "blockpasswordprotectedarchivefiles", "blockpasswordprotectedarchives", "tokentype",
+  "ispasswordloginallowed", "ispasswordexpired", "passwordexpirationenabled", "passwordexpirydays", "passwordexpiry",
+  "passwordstrength", "passwordloginadmins", "blockpasswordprotectedarchivefiles", "blockpasswordprotectedarchives", "tokentype",
   "scimsharedsecretexists", "privatekeypresent", "publickey", "privateip", "vpncredentials", "vpncredentialinventorypartial",
 ]);
 
