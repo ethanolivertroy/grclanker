@@ -1384,13 +1384,54 @@ function finding(
   };
 }
 
+interface ConfigSetting {
+  value: unknown;
+  isUsed: boolean | undefined;
+}
+
+type ConfigSettings = Record<string, ConfigSetting | undefined>;
+
 function configCategory(configuration: JsonRecord | undefined, category: string): JsonRecord | undefined {
   return asObject(configuration?.[category]);
 }
 
-function configValue(configuration: JsonRecord | undefined, category: string, key: string): unknown {
+function configSetting(configuration: JsonRecord | undefined, category: string, key: string): ConfigSetting | undefined {
   const item = asObject(configCategory(configuration, category)?.[key]);
-  return item?.value;
+  if (!item) return undefined;
+  return { value: item.value, isUsed: asBoolean(item.is_used) };
+}
+
+function configSettings(configuration: JsonRecord | undefined, category: string, keys: string[]): ConfigSettings {
+  return Object.fromEntries(keys.map((key) => [key, configSetting(configuration, category, key)]));
+}
+
+function configValue(configuration: JsonRecord | undefined, category: string, key: string): unknown {
+  const setting = configSetting(configuration, category, key);
+  return setting?.isUsed === false ? undefined : setting?.value;
+}
+
+function isUsedStates(settings: ConfigSettings): Record<string, boolean | null> {
+  return Object.fromEntries(Object.entries(settings).map(([key, setting]) => [key, setting?.isUsed ?? null]));
+}
+
+function unusedSettings(settings: ConfigSettings, keys: string[] = Object.keys(settings)): JsonRecord {
+  const unused: JsonRecord = {};
+  for (const key of keys) {
+    const setting = settings[key];
+    if (setting?.isUsed === false) unused[key] = setting.value ?? null;
+  }
+  return unused;
+}
+
+function hasUnusedSettings(unused: JsonRecord): boolean {
+  return Object.keys(unused).length > 0;
+}
+
+function unusedSettingsSummary(unused: JsonRecord, consequence: string): string {
+  const described = Object.entries(unused)
+    .map(([key, value]) => `${key} (reported value ${JSON.stringify(value)})`)
+    .join(", ");
+  return `Box reports ${described} as not in use for this enterprise (is_used false), so ${consequence}.`;
 }
 
 function configBool(configuration: JsonRecord | undefined, category: string, key: string): boolean | undefined {
@@ -1630,12 +1671,21 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
 
   const findings: BoxFinding[] = [];
 
-  const ssoEvidence = { is_enterprise_sso_required: ssoRequired ?? null, is_enterprise_sso_in_testing: ssoTesting ?? null };
+  const ssoSettings = configSettings(configuration, "user_settings", ["is_enterprise_sso_required", "is_enterprise_sso_in_testing"]);
+  const ssoUnused = unusedSettings(ssoSettings, ["is_enterprise_sso_required"]);
+  const ssoEvidence = {
+    is_enterprise_sso_required: ssoRequired ?? null,
+    is_enterprise_sso_in_testing: ssoTesting ?? null,
+    is_used: isUsedStates(ssoSettings),
+    unused_settings: ssoUnused,
+  };
   const ssoManualEvidence = "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.";
   findings.push(
     !userSettingsReadable
       ? finding(1, "manual", `Enterprise SSO configuration could not be read because ${categoryUnreadableReason(data.configuration, "user_settings")}.`, { ...ssoEvidence, config_error: data.configuration.error ?? null }, ssoManualEvidence)
-      : ssoRequired === true && ssoTesting !== true
+      : hasUnusedSettings(ssoUnused)
+        ? finding(1, "warn", unusedSettingsSummary(ssoUnused, "SSO cannot be treated as enforced"), ssoEvidence, ssoManualEvidence)
+        : ssoRequired === true && ssoTesting !== true
         ? finding(1, "pass", "Enterprise settings expose SSO as required for all users and not in testing mode.", ssoEvidence)
         : ssoRequired === true
           ? finding(1, "warn", "SSO is marked required but the enterprise is still in SSO testing mode, so users can bypass the identity provider.", ssoEvidence)
@@ -1644,11 +1694,17 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
             : finding(1, "warn", "Enterprise user settings were readable but did not expose is_enterprise_sso_required, so SSO enforcement cannot be confirmed from the API.", ssoEvidence, ssoManualEvidence),
   );
 
-  const mfaState = mfaRequired === true ? "required" : mfaRequired === false ? "not required" : "not exposed";
+  const mfaSettings = configSettings(configuration, "security", ["is_multi_factor_auth_required", "multi_factor_auth_type"]);
+  const mfaUnused = unusedSettings(mfaSettings, ["is_multi_factor_auth_required"]);
+  const mfaState = hasUnusedSettings(mfaUnused)
+    ? "reported but not in use (is_used false)"
+    : mfaRequired === true ? "required" : mfaRequired === false ? "not required" : "not exposed";
   const adminMfaEvidence = {
     is_multi_factor_auth_required: mfaRequired ?? null,
     multi_factor_auth_type: mfaType ?? null,
     is_enterprise_sso_required: ssoRequired ?? null,
+    is_used: isUsedStates(mfaSettings),
+    unused_settings: mfaUnused,
     privileged_users: privileged.length,
     exempt_privileged_users: truncateList(exemptPrivileged.map(userLabel)),
   };
@@ -1660,7 +1716,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
         ? finding(2, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so admin and co-admin exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}${mfaType ? ` (${mfaType})` : ""}.`, { ...adminMfaEvidence, users_error: data.users.error ?? null }, adminMfaManualEvidence)
         : !securityReadable
           ? finding(2, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
-          : mfaRequired === true
+          : hasUnusedSettings(mfaUnused)
+            ? finding(2, "warn", unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the ${privileged.length} admin or co-admin accounts (${exemptPrivileged.length} flagged exempt from login verification)`), adminMfaEvidence, adminMfaManualEvidence)
+            : mfaRequired === true
             ? exemptPrivileged.length === 0
               ? finding(2, "pass", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, adminMfaEvidence)
               : finding(2, "fail", `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, adminMfaEvidence)
@@ -1675,6 +1733,8 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     is_multi_factor_auth_required: mfaRequired ?? null,
     multi_factor_auth_type: mfaType ?? null,
     is_enterprise_sso_required: ssoRequired ?? null,
+    is_used: isUsedStates(mfaSettings),
+    unused_settings: mfaUnused,
     sampled_users: users.length,
     exempt_users: truncateList(exemptUsers.map(userLabel)),
   };
@@ -1686,7 +1746,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
         ? finding(3, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so per-user exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}${mfaType ? ` (${mfaType})` : ""}.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
         : !securityReadable
           ? finding(3, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, userMfaEvidence, userMfaManualEvidence)
-          : mfaRequired === true
+          : hasUnusedSettings(mfaUnused)
+            ? finding(3, "warn", unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the sampled ${users.length} users (${exemptUsers.length} flagged exempt from login verification)`), userMfaEvidence, userMfaManualEvidence)
+            : mfaRequired === true
             ? exemptUsers.length === 0
               ? finding(3, "pass", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, userMfaEvidence)
               : finding(3, "warn", `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, userMfaEvidence)
@@ -1722,6 +1784,17 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const passwordLeakDetection = configBool(configuration, "security", "is_password_leak_detection_enabled");
   const passwordResetFrequency = configString(configuration, "security", "password_reset_frequency");
   const passwordReuseLimit = configString(configuration, "security", "previous_password_reuse_limit");
+  const passwordSettings = configSettings(configuration, "security", [
+    "password_min_length",
+    "password_min_uppercase_characters",
+    "password_min_numeric_characters",
+    "password_min_special_characters",
+    "is_weak_password_prevention_enabled",
+    "is_password_leak_detection_enabled",
+    "password_reset_frequency",
+    "previous_password_reuse_limit",
+  ]);
+  const passwordUnused = unusedSettings(passwordSettings, ["password_min_length"]);
   const passwordEvidence = {
     password_min_length: passwordMinLength ?? null,
     password_min_uppercase_characters: passwordUppercase ?? null,
@@ -1731,14 +1804,19 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     is_password_leak_detection_enabled: passwordLeakDetection ?? null,
     password_reset_frequency: passwordResetFrequency ?? null,
     previous_password_reuse_limit: passwordReuseLimit ?? null,
+    is_used: isUsedStates(passwordSettings),
+    unused_settings: unusedSettings(passwordSettings),
     required_min_length: minPasswordLength,
   };
+  const passwordManualEvidence = "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.";
   const complexityCount = [passwordUppercase, passwordNumeric, passwordSpecial].filter((value) => (value ?? 0) > 0).length;
   findings.push(
     !securityReadable
-      ? finding(21, "manual", `Enterprise password settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.")
-      : passwordMinLength === undefined
-        ? finding(21, "warn", "Enterprise password settings were readable but did not expose a minimum password length.", passwordEvidence)
+      ? finding(21, "manual", `Enterprise password settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, passwordManualEvidence)
+      : hasUnusedSettings(passwordUnused)
+        ? finding(21, "warn", unusedSettingsSummary(passwordUnused, "the enterprise password policy cannot be treated as enforced"), passwordEvidence, passwordManualEvidence)
+        : passwordMinLength === undefined
+          ? finding(21, "warn", "Enterprise password settings were readable but did not expose a minimum password length.", passwordEvidence, passwordManualEvidence)
         : passwordMinLength >= minPasswordLength && weakPasswordPrevention === true && complexityCount >= 2
           ? finding(21, "pass", `Passwords require at least ${passwordMinLength} characters with ${complexityCount} character-class rules and weak password prevention enabled.`, passwordEvidence)
           : passwordMinLength >= 8
@@ -1751,18 +1829,25 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const customSessionEnabled = configBool(configuration, "security", "is_custom_session_duration_enabled");
   const customSessionValue = configString(configuration, "security", "custom_session_duration_value");
   const customSessionHours = parseDurationHours(customSessionValue);
+  const sessionSettings = configSettings(configuration, "security", ["session_duration", "is_custom_session_duration_enabled", "custom_session_duration_value"]);
+  const sessionUnused = unusedSettings(sessionSettings, ["session_duration"]);
   const sessionEvidence = {
     session_duration: sessionDuration ?? null,
     session_hours: sessionHours === undefined || !Number.isFinite(sessionHours) ? null : sessionHours,
     is_custom_session_duration_enabled: customSessionEnabled ?? null,
     custom_session_duration_value: customSessionValue ?? null,
+    is_used: isUsedStates(sessionSettings),
+    unused_settings: unusedSettings(sessionSettings),
     max_session_hours: maxSessionHours,
   };
+  const sessionManualEvidence = "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.";
   findings.push(
     !securityReadable
-      ? finding(22, "manual", `Enterprise session settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.")
-      : sessionDuration === undefined
-        ? finding(22, "warn", "Enterprise session settings were readable but did not expose a session duration value.", sessionEvidence)
+      ? finding(22, "manual", `Enterprise session settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, sessionManualEvidence)
+      : hasUnusedSettings(sessionUnused)
+        ? finding(22, "warn", unusedSettingsSummary(sessionUnused, "the session duration cannot be treated as enforced"), sessionEvidence, sessionManualEvidence)
+        : sessionDuration === undefined
+          ? finding(22, "warn", "Enterprise session settings were readable but did not expose a session duration value.", sessionEvidence, sessionManualEvidence)
         : sessionHours === undefined
           ? finding(22, "warn", `Session duration "${sessionDuration}" could not be interpreted; confirm it is at or below ${maxSessionHours} hours.`, sessionEvidence)
           : sessionHours <= maxSessionHours && (customSessionEnabled !== true || (customSessionHours !== undefined && customSessionHours <= maxSessionHours))
@@ -1895,18 +1980,25 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const allowlistUsers = asRecordArray(configValue(configuration, "content_and_sharing", "external_collaboration_allowlist_users"));
   const findings: BoxFinding[] = [];
 
+  const externalSettings = configSettings(configuration, "content_and_sharing", ["external_collaboration_status", "collaboration_restrictions", "external_collaboration_allowlist_users"]);
+  const externalUnused = unusedSettings(externalSettings, ["external_collaboration_status"]);
   const externalEvidence = {
     external_collaboration_status: externalStatus ?? null,
     collaboration_restrictions: collaborationRestrictions,
     allowlist_entries: entries.length,
     allowlist_exempt_users: exemptTargets.length + allowlistUsers.length,
+    is_used: isUsedStates(externalSettings),
+    unused_settings: externalUnused,
   };
+  const externalManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.";
   findings.push(
     !configReadable
       ? allowlistReadable && entries.length > 0
         ? finding(4, "warn", `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${configUnreadableReason}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
-        : finding(4, "manual", `External collaboration settings could not be read because ${configUnreadableReason}.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.")
-      : externalStatus === "limit_collaboration_to_users_within_enterprise"
+        : finding(4, "manual", `External collaboration settings could not be read because ${configUnreadableReason}.`, externalEvidence, externalManualEvidence)
+      : hasUnusedSettings(externalUnused)
+        ? finding(4, "warn", unusedSettingsSummary(externalUnused, `the external collaboration mode cannot be treated as enforced (${entries.length} allowlist entries visible)`), externalEvidence, externalManualEvidence)
+        : externalStatus === "limit_collaboration_to_users_within_enterprise"
         ? finding(4, "pass", "External collaboration is limited to users within the enterprise.", externalEvidence)
         : externalStatus === "limit_collaboration_to_allowlisted_domains"
           ? entries.length > 0 || !allowlistReadable
@@ -1945,15 +2037,22 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
 
   const sharedLinkDefault = configString(configuration, "content_and_sharing", "shared_link_default_access");
   const sharedLinkAllowed = configString(configuration, "content_and_sharing", "shared_link_access");
+  const linkSettings = configSettings(configuration, "content_and_sharing", ["shared_link_default_access", "shared_link_access", "shared_link_company_definition"]);
+  const linkUnused = unusedSettings(linkSettings, ["shared_link_default_access", "shared_link_access"]);
   const linkEvidence = {
     shared_link_default_access: sharedLinkDefault ?? null,
     shared_link_access: sharedLinkAllowed ?? null,
     shared_link_company_definition: configString(configuration, "content_and_sharing", "shared_link_company_definition") ?? null,
+    is_used: isUsedStates(linkSettings),
+    unused_settings: linkUnused,
   };
+  const linkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.";
   findings.push(
     !configReadable
-      ? finding(6, "manual", `Shared link settings could not be read because ${configUnreadableReason}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.")
-      : accessLevelIsOpen(sharedLinkDefault)
+      ? finding(6, "manual", `Shared link settings could not be read because ${configUnreadableReason}.`, undefined, linkManualEvidence)
+      : hasUnusedSettings(linkUnused)
+        ? finding(6, "warn", unusedSettingsSummary(linkUnused, "the shared link access policy cannot be treated as enforced"), linkEvidence, linkManualEvidence)
+        : accessLevelIsOpen(sharedLinkDefault)
         ? finding(6, "fail", `The default shared link access level "${sharedLinkDefault}" creates public links.`, linkEvidence)
         : accessLevelIsRestricted(sharedLinkDefault)
           ? accessLevelIsOpen(sharedLinkAllowed)
@@ -1966,23 +2065,36 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const expirationDays = configNumber(configuration, "content_and_sharing", "shared_links_expiration_days");
   const publicExpirationEnabled = configBool(configuration, "content_and_sharing", "is_public_shared_links_expiration_enabled");
   const publicExpirationDays = configNumber(configuration, "content_and_sharing", "public_shared_links_expiration_days");
+  const expirationSettings = configSettings(configuration, "content_and_sharing", [
+    "is_shared_links_expiration_enabled",
+    "shared_links_expiration_days",
+    "is_public_shared_links_expiration_enabled",
+    "public_shared_links_expiration_days",
+    "shared_expiration_target",
+  ]);
+  const expirationUnused = unusedSettings(expirationSettings, ["is_shared_links_expiration_enabled"]);
   const expirationEvidence = {
     is_shared_links_expiration_enabled: expirationEnabled ?? null,
     shared_links_expiration_days: expirationDays ?? null,
     is_public_shared_links_expiration_enabled: publicExpirationEnabled ?? null,
     public_shared_links_expiration_days: publicExpirationDays ?? null,
     shared_expiration_target: configString(configuration, "content_and_sharing", "shared_expiration_target") ?? null,
+    is_used: isUsedStates(expirationSettings),
+    unused_settings: unusedSettings(expirationSettings),
   };
+  const expirationManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.";
   findings.push(
     !configReadable
-      ? finding(7, "manual", `Shared link expiration settings could not be read because ${configUnreadableReason}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.")
-      : expirationEnabled === true
+      ? finding(7, "manual", `Shared link expiration settings could not be read because ${configUnreadableReason}.`, undefined, expirationManualEvidence)
+      : hasUnusedSettings(expirationUnused)
+        ? finding(7, "warn", unusedSettingsSummary(expirationUnused, "shared link expiration cannot be treated as enforced"), expirationEvidence, expirationManualEvidence)
+        : expirationEnabled === true
         ? finding(7, "pass", `Shared links expire automatically after ${expirationDays ?? "a configured number of"} days.`, expirationEvidence)
         : publicExpirationEnabled === true
           ? finding(7, "warn", `Only public shared links expire automatically (${publicExpirationDays ?? "configured"} days); company and collaborator links have no mandatory expiration.`, expirationEvidence)
           : expirationEnabled === false
             ? finding(7, "fail", "Shared links do not have a mandatory expiration configured.", expirationEvidence)
-            : finding(7, "warn", "Enterprise settings did not expose is_shared_links_expiration_enabled, so shared link expiration cannot be confirmed from the API.", expirationEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count."),
+            : finding(7, "warn", "Enterprise settings did not expose is_shared_links_expiration_enabled, so shared link expiration cannot be confirmed from the API.", expirationEvidence, expirationManualEvidence),
   );
 
   findings.push(
@@ -2002,14 +2114,21 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     .concat(asRecordArray(configCategory(configuration, "content_and_sharing")?.enterprise_feature_settings))
     .map((item) => asObject(item.value) ?? item)
     .filter((setting) => /watermark/i.test(asString(asObject(setting.feature)?.id) ?? ""));
+  const watermarkSettings = configSettings(configuration, "content_and_sharing", ["is_watermarking_enterprise_feature_enabled"]);
+  const watermarkUnused = unusedSettings(watermarkSettings);
   const watermarkEvidence = {
     is_watermarking_enterprise_feature_enabled: watermarkingEnabled ?? null,
     watermark_feature_states: watermarkFeatures.map((setting) => asString(setting.state) ?? "unknown"),
+    is_used: isUsedStates(watermarkSettings),
+    unused_settings: watermarkUnused,
   };
+  const watermarkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.";
   findings.push(
     !configReadable
-      ? finding(9, "manual", `Watermarking settings could not be read because ${configUnreadableReason}.`, undefined, "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.")
-      : watermarkingEnabled === true
+      ? finding(9, "manual", `Watermarking settings could not be read because ${configUnreadableReason}.`, undefined, watermarkManualEvidence)
+      : hasUnusedSettings(watermarkUnused)
+        ? finding(9, "warn", unusedSettingsSummary(watermarkUnused, "watermarking cannot be treated as an enforced enterprise feature"), watermarkEvidence, watermarkManualEvidence)
+        : watermarkingEnabled === true
         ? finding(9, "pass", "Watermarking is enabled as an enterprise feature; confirm sensitive folders and classifications apply it.", watermarkEvidence, "Spot check sensitive folders for the watermark setting and confirm classification policies apply watermarks where required.")
         : watermarkingEnabled === false
           ? finding(9, "fail", "Watermarking is not enabled as an enterprise feature.", watermarkEvidence)

@@ -891,6 +891,64 @@ test("assessBoxIdentityAccess treats null configuration categories as absent dat
   assert.match(findingById(missingKeys, "BOX-01").manualEvidence, /Configure Single Sign On/);
 });
 
+test("configuration items marked is_used false never support a pass verdict", async () => {
+  const configuration = hardenedConfiguration();
+  configuration.user_settings.is_enterprise_sso_required = { is_used: false, value: true };
+  configuration.security.is_multi_factor_auth_required = { is_used: false, value: true };
+  configuration.security.password_min_length = { is_used: false, value: 14 };
+  configuration.security.session_duration = { is_used: false, value: "12 hours" };
+  configuration.content_and_sharing.external_collaboration_status = { is_used: false, value: "limit_collaboration_to_users_within_enterprise" };
+  configuration.content_and_sharing.shared_link_access = { is_used: false, value: "company" };
+  configuration.content_and_sharing.is_shared_links_expiration_enabled = { is_used: false, value: true };
+  configuration.content_and_sharing.is_watermarking_enterprise_feature_enabled = { is_used: false, value: true };
+
+  const identity = await assessBoxIdentityAccess(createStubClient({ ...hardenedFixture(), configuration }));
+  assertStatuses(identity, { "BOX-01": "warn", "BOX-02": "warn", "BOX-03": "warn", "BOX-21": "warn", "BOX-22": "warn" });
+  for (const id of ["BOX-01", "BOX-02", "BOX-03", "BOX-21", "BOX-22"]) {
+    const found = findingById(identity, id);
+    assert.match(found.summary, /not in use for this enterprise \(is_used false\)/, `${id} should explain the is_used state`);
+    assert.ok(found.manualEvidence, `${id} should point at the Admin Console evidence`);
+  }
+  const sso = findingById(identity, "BOX-01");
+  assert.match(sso.summary, /is_enterprise_sso_required \(reported value true\)/);
+  assert.equal(sso.evidence.is_enterprise_sso_required, null);
+  assert.deepEqual(sso.evidence.is_used, { is_enterprise_sso_required: false, is_enterprise_sso_in_testing: true });
+  assert.deepEqual(sso.evidence.unused_settings, { is_enterprise_sso_required: true });
+  const adminMfa = findingById(identity, "BOX-02");
+  assert.equal(adminMfa.evidence.is_used.is_multi_factor_auth_required, false);
+  assert.deepEqual(adminMfa.evidence.unused_settings, { is_multi_factor_auth_required: true });
+  assert.equal(findingById(identity, "BOX-21").evidence.password_min_length, null);
+  assert.deepEqual(findingById(identity, "BOX-22").evidence.unused_settings, { session_duration: "12 hours" });
+  assert.equal(identity.summary.sso_required, null);
+  assert.equal(identity.summary.mfa_required, null);
+
+  const sharing = await assessBoxSharingCollaboration(createStubClient({ ...hardenedFixture(), configuration }));
+  assertStatuses(sharing, { "BOX-04": "warn", "BOX-05": "pass", "BOX-06": "warn", "BOX-07": "warn", "BOX-09": "warn" });
+  for (const id of ["BOX-04", "BOX-06", "BOX-07", "BOX-09"]) {
+    assert.match(findingById(sharing, id).summary, /is_used false/, `${id} should explain the is_used state`);
+  }
+  assert.deepEqual(findingById(sharing, "BOX-06").evidence.unused_settings, { shared_link_access: "company" });
+  assert.equal(findingById(sharing, "BOX-06").evidence.is_used.shared_link_default_access, true);
+  assert.equal(sharing.summary.external_collaboration_status, null);
+
+  const noUsers = await assessBoxIdentityAccess(createStubClient({ ...hardenedFixture(), configuration }, { listUsers: forbidden() }));
+  assertStatuses(noUsers, { "BOX-02": "manual", "BOX-03": "manual" });
+  assert.match(findingById(noUsers, "BOX-02").summary, /enterprise MFA is reported but not in use \(is_used false\)/);
+
+  const hardened = await assessBoxIdentityAccess(createStubClient(hardenedFixture()));
+  assert.deepEqual(findingById(hardened, "BOX-01").evidence.is_used, { is_enterprise_sso_required: true, is_enterprise_sso_in_testing: true });
+  assert.deepEqual(findingById(hardened, "BOX-01").evidence.unused_settings, {});
+
+  const unusedSecondary = hardenedConfiguration();
+  unusedSecondary.user_settings.is_enterprise_sso_in_testing = { is_used: false, value: true };
+  unusedSecondary.security.is_custom_session_duration_enabled = { is_used: false, value: true };
+  unusedSecondary.security.custom_session_duration_value = { is_used: false, value: "30 days" };
+  const secondary = await assessBoxIdentityAccess(createStubClient({ ...hardenedFixture(), configuration: unusedSecondary }));
+  assertStatuses(secondary, { "BOX-01": "pass", "BOX-22": "pass" });
+  assert.equal(findingById(secondary, "BOX-01").evidence.is_enterprise_sso_in_testing, null);
+  assert.deepEqual(findingById(secondary, "BOX-22").evidence.unused_settings, { is_custom_session_duration_enabled: true, custom_session_duration_value: "30 days" });
+});
+
 test("assessBoxSharingCollaboration and assessBoxShieldMonitoring treat null categories as absent data", async () => {
   const sharing = await assessBoxSharingCollaboration(createStubClient({
     ...hardenedFixture(),
