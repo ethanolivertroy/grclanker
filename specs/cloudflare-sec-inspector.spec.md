@@ -3,10 +3,10 @@ slug: "cloudflare-sec-inspector"
 name: "Cloudflare Security Inspector"
 vendor: "Cloudflare"
 category: "security-network-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/cloudflare-sec-inspector"
 ---
 
@@ -333,6 +333,21 @@ make docker      # Build Docker image
 make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
 ```
 
+### grclanker implementation
+
+The shipped implementation is TypeScript inside the grclanker CLI rather than the Go layout above:
+
+- `cli/extensions/grc-tools/cloudflare.ts`: `cloudflare_check_access`, `cloudflare_assess_identity`, `cloudflare_assess_zone_security`, `cloudflare_assess_traffic_controls`, `cloudflare_export_audit_bundle`
+- `cli/tests/cloudflare.test.mjs`: mocked coverage, verdict-safety regressions, request-path assertions, and the four false-pass self-check fixtures
+- `cli/scripts/cloudflare-live-smoke.mjs` with `npm --prefix cli run test:cloudflare:live`
+- `src/content/docs/docs/integrations/cloudflare.md`: integration guide with the control coverage and endpoint tables
+
+WAF, DDoS, rate limiting, and security header controls are judged through the rulesets API (`GET /zones/{zone_id}/rulesets/phases/{phase}/entrypoint` for `http_request_firewall_managed`, `http_request_firewall_custom`, `ddos_l7`, `http_ratelimit`, and `http_response_headers_transform`). The deprecated `firewall/rules` and `rate_limits` endpoints are consulted only as fallback evidence, and `firewall/waf/packages` is not used. Zone settings are read individually through `GET /zones/{zone_id}/settings/{setting_id}` because the get-all form is deprecated. Findings use four statuses: pass, warn, fail, and manual.
+
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as of 2026-09-21.
+
+Shipped: 25 of 25 spec controls have a finding. Controls 1, 2, 5 through 10, 12 through 17, 19 through 23, and 25 are automated from documented fields. Controls 3 (DDoS), 4 (Enterprise Bot Management), 11 (retention), 18 (per-hostname origin pulls), and 24 (Gateway licensing) automate the documented signal and fall back to a manual finding that names the plan or the evidence to collect when the API cannot prove the control. The export bundle writes `core_data/`, `analysis/`, `compliance/` with one report per framework in the mapping table, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip named after the allocated directory.
+
+Remaining: SARIF, CSV, and HTML reporters and the interactive TUI from the original Go design are not part of the grclanker tools. Per-hostname Authenticated Origin Pulls enumeration, DDoS L3/L4 (Magic Transit) posture, and audit log retention settings stay manual because the API exposes no list or setting for them.
