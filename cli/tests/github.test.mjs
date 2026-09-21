@@ -2318,26 +2318,43 @@ function sweepGraphqlBody(key, variant) {
 }
 
 // GraphQL denial styles: an HTTP 403, `data: null` with errors, the requested field null with a
-// pathed error, or the root object (organization / enterprise) null with a pathed error.
+// pathed error, the root object (organization / enterprise) null with a pathed error, or (SAML
+// only) the provider readable but its externalIdentities connection null with a pathed error.
 function sweepGraphqlDenied(key, style) {
   const field = key === "graphql:saml" ? "samlIdentityProvider" : (key === "graphql:ip_allow_list" ? "ipAllowListEntries" : "ownerInfo");
   const root = key === "graphql:enterprise" ? "enterprise" : "organization";
   const rootBody = key === "graphql:enterprise"
     ? { slug: "example-ent" }
     : { login: "example-org", requiresTwoFactorAuthentication: true, ipAllowListEnabledSetting: "ENABLED", ipAllowListForInstalledAppsEnabledSetting: "ENABLED" };
+  const forbidden = (path) => [{ type: "FORBIDDEN", message: "Resource not accessible by integration", path }];
   switch (style) {
     case "http403":
       return jsonResponse({ message: "Resource not accessible by integration" }, {}, 403);
     case "data_null":
-      return jsonResponse({ data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration", path: [root, field] }] });
+      return jsonResponse({ data: null, errors: forbidden([root, field]) });
     case "field_null":
-      return jsonResponse({ data: { [root]: { ...rootBody, [field]: null } }, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration", path: [root, field] }] });
+      return jsonResponse({ data: { [root]: { ...rootBody, [field]: null } }, errors: forbidden([root, field]) });
+    case "connection_null": {
+      if (key !== "graphql:saml") return jsonResponse({ data: { [root]: { ...rootBody, [field]: null } }, errors: forbidden([root, field]) });
+      const organization = sweepSamlOrganization("A");
+      organization.samlIdentityProvider.externalIdentities = null;
+      return jsonResponse({ data: { organization }, errors: forbidden(["organization", "samlIdentityProvider", "externalIdentities"]) });
+    }
     case "root_null":
       return jsonResponse({ data: { [root]: null }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to ${root === "enterprise" ? "an Enterprise" : "an Organization"} with the login of 'example-org'.`, path: [root] }] });
     default:
       throw new Error(`Unknown GraphQL denial style ${style}`);
   }
 }
+
+// How a GraphQL query is named in summary statuses; a status mention of a deeper field (for
+// example organization.samlIdentityProvider.externalIdentities) counts as requested when the query
+// that carries it ran.
+const SWEEP_GRAPHQL_MENTIONS = {
+  "graphql:saml": "GraphQL organization.samlIdentityProvider",
+  "graphql:ip_allow_list": "GraphQL organization.ipAllowListEntries",
+  "graphql:enterprise": "GraphQL enterprise.ownerInfo",
+};
 
 function sweepRestBody(surface, variant) {
   switch (surface) {
@@ -2389,9 +2406,13 @@ function sweepGraphqlFirstPage(key, variant) {
   return body;
 }
 
+// Every REST request is recorded as `METHOD path?query` (per_page dropped) and every GraphQL query
+// as its summary mention, so a summary status that claims a complete or partial read can be
+// checked against what the client actually asked for.
 function createSweepFetch({ variant = "A", deny = [], graphqlStyle = "http403", restStatus = 403 } = {}) {
   const denied = new Set(deny);
   const requests = [];
+  const requested = new Set();
   const deniedTargets = {};
   const calls = {};
   const fetchImpl = async (input, init = {}) => {
@@ -2400,6 +2421,7 @@ function createSweepFetch({ variant = "A", deny = [], graphqlStyle = "http403", 
     requests.push(key);
     calls[key] = (calls[key] ?? 0) + 1;
     if (key.startsWith("graphql:")) {
+      requested.add(SWEEP_GRAPHQL_MENTIONS[key]);
       if (!denied.has(key)) return jsonResponse(sweepGraphqlBody(key, variant));
       deniedTargets[key] = "POST /graphql";
       if (graphqlStyle === "page2_http403") {
@@ -2407,20 +2429,22 @@ function createSweepFetch({ variant = "A", deny = [], graphqlStyle = "http403", 
       }
       return sweepGraphqlDenied(key, graphqlStyle);
     }
+    const params = [...url.searchParams.entries()].filter(([name]) => name !== "per_page").map(([name, value]) => `${name}=${value}`);
+    const target = `${init.method ?? "GET"} ${url.pathname}${params.length > 0 ? `?${params.join("&")}` : ""}`;
+    requested.add(target);
     if (denied.has(key)) {
-      const params = [...url.searchParams.entries()].filter(([name]) => name !== "per_page").map(([name, value]) => `${name}=${value}`);
-      deniedTargets[key] = `GET ${url.pathname}${params.length > 0 ? `?${params.join("&")}` : ""}`;
+      deniedTargets[key] = target;
       return jsonResponse({ message: restStatus === 401 ? "Bad credentials" : "Resource not accessible by integration" }, {}, restStatus);
     }
     const body = sweepRestBody(key.split(":")[0], variant);
     if (body === null) return jsonResponse({ message: "Branch not protected" }, {}, 404);
     return jsonResponse(body);
   };
-  return { fetchImpl, requests, deniedTargets };
+  return { fetchImpl, requests, requested, deniedTargets };
 }
 
 async function runSweepScenario(options = {}) {
-  const { fetchImpl, deniedTargets } = createSweepFetch(options);
+  const { fetchImpl, requested, deniedTargets } = createSweepFetch(options);
   const client = new GitHubAuditorClient(SWEEP_CONFIG, fetchImpl);
   const [orgAccess, repoProtection, actions, codeSecurity, integrations] = await Promise.all([
     collectGitHubOrgAccessData(client, SWEEP_CONFIG),
@@ -2429,14 +2453,16 @@ async function runSweepScenario(options = {}) {
     collectGitHubCodeSecurityData(client),
     collectGitHubIntegrationsData(client),
   ]);
-  const findings = [
+  const assessments = [
     assessGitHubOrgAccess(orgAccess, SWEEP_CONFIG),
     assessGitHubRepoProtection(repoProtection, SWEEP_CONFIG),
     assessGitHubActionsSecurity(actions, SWEEP_CONFIG),
     assessGitHubCodeSecurity(codeSecurity, SWEEP_CONFIG),
     assessGitHubIntegrations(integrations, SWEEP_CONFIG),
-  ].flatMap((assessment) => assessment.findings);
-  return { findings, byId: Object.fromEntries(findings.map((finding) => [finding.id, finding])), deniedTargets };
+  ];
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  const summaries = Object.fromEntries(assessments.map((assessment) => [assessment.category, assessment.snapshotSummary]));
+  return { findings, byId: Object.fromEntries(findings.map((finding) => [finding.id, finding])), summaries, requested, deniedTargets };
 }
 
 const SWEEP_BASELINE_MANUAL = ["GITHUB-CODE-006", "GITHUB-INTEG-004", "GITHUB-INTEG-005", "GITHUB-ORG-011"];
@@ -2681,6 +2707,19 @@ test("corollary wording: ORG-006 returns Manual naming enterprise.ownerInfo when
 // names the findings that must drop below Pass in each variant (A: org SAML plus classic
 // protection; B: enterprise OIDC plus rulesets only). `names` must appear in every demoted
 // summary, `nullish` in the evidence of at least one demoted finding, and `forbidden` in none.
+// Snapshot summary metrics derived from the per-repository protection reads; every one is null
+// when the repository list is unreadable or no repository could be fully evaluated.
+const EVALUATED_REPO_METRICS = [
+  "evaluated_repositories",
+  "protected_repositories",
+  "review_required_repositories",
+  "status_check_required_repositories",
+  "signed_commit_repositories",
+  "bypass_restricted_repositories",
+];
+
+// Each row also names the snapshot summary metrics the denial must render null (`summaryNull`),
+// leave partial with a count (`summaryPartial`), or pin to a value (`summaryValues`).
 const CORROLLARY_SWEEP_ROWS = [
   {
     label: "GET /orgs/{org} (org profile)",
@@ -2698,6 +2737,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/members\)/,
     nullish: /members = null \(GET \/orgs\/\{org\}\/members unreadable/,
     forbidden: /members = 0|members_without_saml_identity = 0|member\(s\) enumerated/,
+    summaryNull: ["members"],
   },
   {
     label: "GET /orgs/{org}/members?role=admin",
@@ -2706,6 +2746,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/members\?role=admin\)/,
     nullish: /admin_members = null/,
     forbidden: /admin_members = 0/,
+    summaryNull: ["admin_members"],
   },
   {
     label: "GET /orgs/{org}/members?filter=2fa_disabled",
@@ -2714,6 +2755,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/members\?filter=2fa_disabled\)/,
     nullish: /members_without_2fa = null/,
     forbidden: /members_without_2fa = 0/,
+    summaryNull: ["members_without_2fa"],
   },
   {
     label: "GET /orgs/{org}/outside_collaborators",
@@ -2722,6 +2764,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/outside_collaborators\)/,
     nullish: /outside_collaborators = null/,
     forbidden: /outside_collaborators = 0/,
+    summaryNull: ["outside_collaborators"],
   },
   {
     label: "GET /orgs/{org}/invitations",
@@ -2730,6 +2773,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/invitations\)/,
     nullish: /pending_invitations = null/,
     forbidden: /pending_invitations = 0/,
+    summaryNull: ["invitations"],
   },
   {
     label: "GET /orgs/{org}/organization-roles",
@@ -2746,6 +2790,7 @@ const CORROLLARY_SWEEP_ROWS = [
     check: ["GITHUB-INTEG-004"],
     nullish: /saml_credential_authorizations = null \(GET \/orgs\/\{org\}\/credential-authorizations unreadable/,
     forbidden: /saml_credential_authorizations = 0/,
+    summaryNull: ["credential_authorizations"],
   },
   {
     label: "GET /orgs/{org}/audit-log",
@@ -2754,6 +2799,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/audit-log\)/,
     nullish: /audit_events_last_\d+_days = null/,
     forbidden: /audit_events_last_\d+_days = 0/,
+    summaryNull: ["audit_events"],
   },
   {
     label: "GET /orgs/{org}/hooks",
@@ -2762,6 +2808,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/hooks\)/,
     nullish: /org_webhooks = null/,
     forbidden: /org_webhooks = 0/,
+    summaryNull: ["hooks", "org_webhooks"],
   },
   {
     label: "GET /orgs/{org}/installations",
@@ -2770,6 +2817,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/installations\)/,
     nullish: /app_installations = null/,
     forbidden: /app_installations = 0/,
+    summaryNull: ["app_installations"],
   },
   {
     label: "GET /orgs/{org}/repos",
@@ -2778,6 +2826,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/repos\)/,
     nullish: /(active_repositories|repo_webhooks|repositories) = null \(GET \/orgs\/\{org\}\/repos unreadable/,
     forbidden: /= 0\/|deploy_keys = 0|repo_webhooks = 0|across 0 readable/,
+    summaryNull: ["active_repositories", ...EVALUATED_REPO_METRICS, "repos_not_evaluable", "repo_webhooks", "deploy_keys", "repositories"],
   },
   {
     label: "GET /orgs/{org}/rulesets",
@@ -2786,6 +2835,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/rulesets\)/,
     nullish: /org_rulesets = null \(GET \/orgs\/\{org\}\/rulesets unreadable/,
     forbidden: /org_rulesets = 0/,
+    summaryNull: ["active_org_rulesets"],
   },
   {
     label: "GET /repos/{o}/{r}/rules/branches/{b} every repo",
@@ -2794,6 +2844,8 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/repos\/example-org\/(alpha|beta)\/rules\/branches\/main\)/,
     nullish: /= null \(no repository could be fully evaluated: 2 active, 2 not fully evaluated\)/,
     forbidden: /= 0\/[02]/,
+    summaryNull: EVALUATED_REPO_METRICS,
+    summaryValues: { repos_not_evaluable: 2 },
   },
   {
     label: "GET /repos/{o}/{r}/rules/branches/{b} for beta only",
@@ -2802,6 +2854,8 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /example-org\/beta: branch rules \(GET \/repos\/example-org\/beta\/rules\/branches\/main\)/,
     nullish: /repositories_not_fully_evaluated = 1/,
     forbidden: /= [012]\/2\b/,
+    summaryPartial: EVALUATED_REPO_METRICS,
+    summaryValues: { evaluated_repositories: 1, repos_not_evaluable: 1 },
   },
   {
     label: "GET /repos/{o}/{r}/rulesets every repo (collected, never read)",
@@ -2820,6 +2874,8 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/repos\/example-org\/(alpha|beta)\/branches\/main\/protection\)/,
     nullish: /= null \(no repository could be fully evaluated: 2 active, 2 not fully evaluated\)/,
     forbidden: /= 0\/[02]/,
+    summaryNull: EVALUATED_REPO_METRICS,
+    summaryValues: { repos_not_evaluable: 2 },
   },
   {
     label: "GET /repos/{o}/{r}/branches/{b}/protection for beta only",
@@ -2828,6 +2884,8 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /example-org\/beta: classic branch protection \(GET \/repos\/example-org\/beta\/branches\/main\/protection\)/,
     nullish: /repositories_not_fully_evaluated = 1/,
     forbidden: /= [012]\/2\b/,
+    summaryPartial: EVALUATED_REPO_METRICS,
+    summaryValues: { evaluated_repositories: 1, repos_not_evaluable: 1 },
   },
   {
     label: "GET /repos/{o}/{r}/hooks every repo",
@@ -2836,6 +2894,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/repos\/example-org\/(alpha|beta)\/hooks/,
     nullish: /repo_webhooks = null \(GET \/repos\/\{owner\}\/\{repo\}\/hooks unreadable for all 2 repositories/,
     forbidden: /repo_webhooks = 0|across 0 readable/,
+    summaryNull: ["repo_webhooks"],
   },
   {
     label: "GET /repos/{o}/{r}/hooks for beta only",
@@ -2844,6 +2903,8 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /example-org\/beta \(GET \/repos\/example-org\/beta\/hooks: GitHub request failed \((403|401)\)/,
     nullish: /1 repositories unreadable: example-org\/beta \(GET \/repos\/example-org\/beta\/hooks/,
     forbidden: /across 0 readable/,
+    summaryPartial: ["repo_webhooks"],
+    summaryValues: { repo_webhooks: 1 },
   },
   {
     label: "GET /repos/{o}/{r}/keys every repo",
@@ -2852,6 +2913,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/repos\/example-org\/(alpha|beta)\/keys/,
     nullish: /deploy_keys = null \(GET \/repos\/\{owner\}\/\{repo\}\/keys unreadable for all 2 repositories/,
     forbidden: /deploy_keys = 0|write_capable_keys = 0|keys_older_than_365_days = 0|across 0 readable/,
+    summaryNull: ["deploy_keys"],
   },
   {
     label: "GET /repos/{o}/{r}/keys for beta only",
@@ -2860,6 +2922,8 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /example-org\/beta \(GET \/repos\/example-org\/beta\/keys: GitHub request failed \((403|401)\)/,
     nullish: /1 repositories unreadable: example-org\/beta \(GET \/repos\/example-org\/beta\/keys/,
     forbidden: /across 0 readable/,
+    summaryPartial: ["deploy_keys"],
+    summaryValues: { deploy_keys: 1 },
   },
   {
     label: "GET /orgs/{org}/actions/permissions",
@@ -2868,6 +2932,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/actions\/permissions\)/,
     nullish: /allowed_actions = null|enabled_repositories = null/,
     forbidden: /allowed_actions = unknown|enabled_repositories = unknown/,
+    summaryNull: ["enabled_repositories", "allowed_actions"],
   },
   {
     label: "GET /orgs/{org}/actions/permissions/selected-actions",
@@ -2884,6 +2949,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/actions\/permissions\/workflow\)/,
     nullish: /default_workflow_permissions = null|can_approve_pull_request_reviews = null/,
     forbidden: /= unknown|= undefined/,
+    summaryNull: ["default_workflow_permissions"],
   },
   {
     label: "GET /orgs/{org}/actions/runner-groups",
@@ -2892,6 +2958,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/actions\/runner-groups\)/,
     nullish: /runner_groups = null/,
     forbidden: /runner_groups = 0|open_runner_groups = 0/,
+    summaryNull: ["runner_groups"],
   },
   {
     label: "GET /orgs/{org}/actions/runners",
@@ -2900,6 +2967,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/actions\/runners\)/,
     nullish: /self_hosted_runners = null/,
     forbidden: /self_hosted_runners = 0/,
+    summaryNull: ["runners"],
   },
   {
     label: "GET /orgs/{org}/code-security/configurations",
@@ -2908,6 +2976,7 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/code-security\/configurations\)/,
     nullish: /code_security_configurations = null/,
     forbidden: /code_security_configurations = 0/,
+    summaryNull: ["code_security_configurations"],
   },
   {
     label: "GET /orgs/{org}/code-security/configurations/defaults",
@@ -2916,15 +2985,19 @@ const CORROLLARY_SWEEP_ROWS = [
     names: /GET \/orgs\/\{org\}\/code-security\/configurations\/defaults\)/,
     nullish: /default_configurations = null/,
     forbidden: /default_configurations = 0|0 default assignment/,
+    summaryNull: ["default_configurations"],
   },
-  ...["http403", "data_null", "field_null", "root_null", "page2_http403"].map((style) => ({
+  ...["http403", "data_null", "field_null", "connection_null", "root_null", "page2_http403"].map((style) => ({
     label: `GraphQL organization.samlIdentityProvider (${style})`,
     deny: ["graphql:saml"],
     graphqlStyle: style,
     expect: ["GITHUB-ORG-006"],
     expectB: style === "page2_http403" ? [] : ["GITHUB-ORG-006"],
     names: /samlIdentityProvider/,
-    forbidden: /members_without_saml_identity = 0|external_identities_linked_to_members = 0|enterprise example-ent carries/,
+    forbidden: /members_without_saml_identity = 0|external_identities_linked_to_members = 0|enterprise example-ent carries|members_without_saml_identity = \d/,
+    // In variant B the org has no SAML provider, so page 2 is never requested and nothing is denied.
+    summaryNull: ["saml_external_identities"],
+    summaryNullB: style === "page2_http403" ? [] : ["saml_external_identities"],
   })),
   ...["http403", "data_null", "field_null", "root_null", "page2_http403"].map((style) => ({
     label: `GraphQL organization.ipAllowList* (${style})`,
@@ -2933,6 +3006,7 @@ const CORROLLARY_SWEEP_ROWS = [
     expect: ["GITHUB-ORG-008"],
     names: /ipAllowList(EnabledSetting|Entries)/,
     forbidden: /ip_allow_list_entries = 0/,
+    summaryNull: ["ip_allow_list_entries"],
   })),
   ...["http403", "data_null", "field_null", "root_null"].map((style) => ({
     label: `GraphQL enterprise.ownerInfo (${style})`,
@@ -2950,6 +3024,7 @@ const GRAPHQL_STATUS_PATTERNS = {
   page2_http403: /\(403\)/,
   data_null: /FORBIDDEN/,
   field_null: /FORBIDDEN/,
+  connection_null: /FORBIDDEN/,
   root_null: /NOT_FOUND/,
 };
 
@@ -2997,3 +3072,300 @@ for (const row of CORROLLARY_SWEEP_ROWS) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Snapshot summary sweep (round 3). Every metric in snapshot_summary is a value paired with a
+// `<name>_status`; the two generic guards below follow the Slack branch pattern, and the third
+// (every metric carries a status) is what makes a restored bare count fail the sweep.
+// ---------------------------------------------------------------------------------------------
+
+const SUMMARY_UNAVAILABLE = /^(error|unreadable|not collected|unknown)\b/;
+const SUMMARY_COLLECTED = /^(complete|partial)\b/;
+const SUMMARY_ENDPOINT_MENTION = /\b(?:GET|POST|PUT|PATCH|DELETE) \/[^\s(),;:]+|\bGraphQL [A-Za-z][A-Za-z0-9_.]*[A-Za-z0-9_]/g;
+// Summary entries that are labels or verdict statuses rather than collected counts.
+const SUMMARY_LABEL_KEYS = new Set(["enterprise", "secret_scanning_default", "push_protection_default", "dependabot_default", "code_scanning_default_setup"]);
+const PLACEHOLDER_EVIDENCE = /= (unknown|error|undefined)\b/;
+
+/**
+ * No count renders 0, [], "error", or "unknown" beside a status that says the data was unreadable,
+ * not collected, or unknown; every status uses the complete / partial / unreadable / not collected
+ * / unknown vocabulary; and every metric carries a status companion.
+ */
+function assertNoFabricatedValues(value, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoFabricatedValues(item, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    assert.ok(entry !== "unknown" && entry !== "error", `${label}: ${path}.${key} is the "${entry}" placeholder`);
+    if (key.endsWith("_status")) {
+      assert.equal(typeof entry, "string", `${label}: ${path}.${key} must be a status string`);
+      const base = key.slice(0, -"_status".length);
+      assert.ok(base in value, `${label}: ${path}.${key} has no ${base} metric`);
+      if (SUMMARY_UNAVAILABLE.test(entry)) {
+        assert.equal(value[base], null, `${label}: ${path}.${base} must be null beside status "${entry}"`);
+      } else {
+        assert.match(entry, SUMMARY_COLLECTED, `${label}: ${path}.${key} "${entry}" must start with complete, partial, unreadable, not collected, or unknown`);
+        assert.notEqual(value[base], null, `${label}: ${path}.${base} is null beside status "${entry}"`);
+      }
+    } else if (!SUMMARY_LABEL_KEYS.has(key)) {
+      assert.ok(`${key}_status` in value, `${label}: ${path}.${key} = ${JSON.stringify(entry)} has no ${key}_status companion`);
+    }
+    if (key === "status" && typeof entry === "string" && SUMMARY_UNAVAILABLE.test(entry)) {
+      for (const [sibling, siblingValue] of Object.entries(value)) {
+        assert.ok(siblingValue !== 0 && !(Array.isArray(siblingValue) && siblingValue.length === 0), `${label}: ${path}.${sibling} renders ${JSON.stringify(siblingValue)} beside status "${entry}"`);
+      }
+    }
+    assertNoFabricatedValues(entry, label, `${path}.${key}`);
+  }
+}
+
+// A REST mention is a template such as `GET /orgs/{org}/members?role=admin`; it was requested when
+// a recorded request has the same method, a path matching the template, and every template query
+// parameter. A GraphQL mention was requested when the query carrying that field (or a parent) ran.
+function endpointWasRequested(mention, requested) {
+  if (mention.startsWith("GraphQL ")) {
+    return [...requested].some((entry) => entry === mention || mention.startsWith(`${entry}.`));
+  }
+  const [method, rest] = mention.split(" ");
+  const [templatePath, templateQuery = ""] = rest.split("?");
+  const pathPattern = new RegExp(`^${templatePath.replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\{[^}]+\}/g, "[^/?]+")}$`);
+  const requiredParams = templateQuery.length > 0 ? templateQuery.split("&") : [];
+  return [...requested].some((entry) => {
+    const [entryMethod, entryRest] = entry.split(" ");
+    if (entryMethod !== method || entryRest === undefined) return false;
+    const [entryPath, entryQuery = ""] = entryRest.split("?");
+    if (!pathPattern.test(entryPath)) return false;
+    const entryParams = new Set(entryQuery.length > 0 ? entryQuery.split("&") : []);
+    return requiredParams.every((param) => entryParams.has(param));
+  });
+}
+
+/** A status that says complete or partial may only name endpoints that were actually requested. */
+function assertStatusesMatchRequests(value, requested, label, path = "") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStatusesMatchRequests(item, requested, label, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && (key.endsWith("_status") || key === "status") && SUMMARY_COLLECTED.test(entry)) {
+      const mentions = entry.match(SUMMARY_ENDPOINT_MENTION) ?? [];
+      assert.ok(mentions.length > 0, `${label}: ${path}.${key} says "${entry}" without naming an endpoint`);
+      for (const mention of mentions) {
+        assert.ok(endpointWasRequested(mention, requested), `${label}: ${path}.${key} says "${entry}" but ${mention} was never requested`);
+      }
+    }
+    assertStatusesMatchRequests(entry, requested, label, `${path}.${key}`);
+  }
+}
+
+function assertNoPlaceholderEvidence(findings, label) {
+  for (const finding of findings) {
+    for (const line of finding.evidence) {
+      assert.doesNotMatch(line, PLACEHOLDER_EVIDENCE, `${label}: ${finding.id} evidence "${line}" carries a placeholder value`);
+    }
+  }
+}
+
+function summaryMetricOf(summaries, name) {
+  const category = Object.keys(summaries).find((key) => name in summaries[key]);
+  assert.ok(category, `no snapshot summary carries ${name}`);
+  return { value: summaries[category][name], status: summaries[category][`${name}_status`], category };
+}
+
+function assertSummaryGuards(scenario, label) {
+  const summaryList = Object.values(scenario.summaries);
+  assertNoFabricatedValues(summaryList, `${label}: summaries`);
+  assertStatusesMatchRequests(summaryList, scenario.requested, `${label}: summaries`);
+  assertNoPlaceholderEvidence(scenario.findings, label);
+}
+
+test("snapshot summary baseline: every metric is a count with a complete status in both variants", async () => {
+  for (const variant of ["A", "B"]) {
+    const scenario = await runSweepScenario({ variant });
+    const label = `variant ${variant}`;
+    assertSummaryGuards(scenario, label);
+    for (const [category, summary] of Object.entries(scenario.summaries)) {
+      for (const [key, entry] of Object.entries(summary)) {
+        if (key.endsWith("_status")) assert.match(entry, /^complete: /, `${label}: ${category}.${key}`);
+      }
+    }
+    const { org_access, repo_protection, actions_security, code_security, integrations } = scenario.summaries;
+    assert.equal(org_access.members, 3);
+    assert.equal(org_access.members_status, "complete: GET /orgs/{org}/members returned 3 record(s)");
+    assert.equal(org_access.audit_events, 1);
+    assert.match(org_access.audit_events_status, /^complete: GET \/orgs\/\{org\}\/audit-log returned 1 event\(s\) within the created:>=\d{4}-\d{2}-\d{2} window$/);
+    assert.equal(org_access.ip_allow_list_entries, 1);
+    assert.equal(org_access.ip_allow_list_entries_status, "complete: GraphQL organization.ipAllowListEntries returned 1 of 1 node(s)");
+    if (variant === "A") {
+      assert.equal(org_access.saml_external_identities, 3);
+      assert.equal(org_access.saml_external_identities_status, "complete: GraphQL organization.samlIdentityProvider.externalIdentities returned 3 of 3 node(s)");
+    } else {
+      assert.equal(org_access.saml_external_identities, 0);
+      assert.equal(org_access.saml_external_identities_status, "complete: GraphQL organization.samlIdentityProvider is null (no organization-level SAML provider, so no externalIdentities connection exists)");
+    }
+    assert.equal(repo_protection.active_repositories, 2);
+    assert.equal(repo_protection.evaluated_repositories, 2);
+    assert.equal(repo_protection.evaluated_repositories_status, "complete: all 2 active repositories fully evaluated (GET /repos/{owner}/{repo}/rules/branches/{branch} and GET /repos/{owner}/{repo}/branches/{branch}/protection read for each)");
+    assert.equal(repo_protection.protected_repositories, 2);
+    assert.equal(repo_protection.repos_not_evaluable, 0);
+    assert.equal(repo_protection.repos_not_evaluable_status, "complete: GET /repos/{owner}/{repo}/rules/branches/{branch} and GET /repos/{owner}/{repo}/branches/{branch}/protection read for every one of the 2 active repositories");
+    assert.equal(actions_security.enabled_repositories, "selected");
+    assert.equal(actions_security.allowed_actions, "selected");
+    assert.equal(actions_security.default_workflow_permissions, "read");
+    assert.equal(actions_security.default_workflow_permissions_status, "complete: GET /orgs/{org}/actions/permissions/workflow");
+    assert.equal(code_security.default_configurations, 2);
+    assert.equal(code_security.repositories, 2);
+    assert.equal(integrations.repo_webhooks, 2);
+    assert.equal(integrations.repo_webhooks_status, "complete: GET /repos/{owner}/{repo}/hooks readable for all 2 repositories");
+    assert.equal(integrations.deploy_keys, 2);
+    assert.equal(integrations.credential_authorizations, 1);
+  }
+});
+
+// One row per denied inventory (fully and per repository) across all five categories: the generic
+// guards hold, the denied inventory's metrics are null with a status naming the endpoint and HTTP
+// status (or GraphQL error type), and per-repository partial reads keep a count with a partial status.
+async function assertSummarySweepRow(row, variant, restStatus) {
+  const context = `summary ${row.label} [variant ${variant}${row.graphqlStyle ? "" : `, ${restStatus}`}]`;
+  const scenario = await runSweepScenario({ variant, deny: row.deny, graphqlStyle: row.graphqlStyle, restStatus });
+  assertSummaryGuards(scenario, context);
+  const statusPattern = row.graphqlStyle ? GRAPHQL_STATUS_PATTERNS[row.graphqlStyle] : new RegExp(`\\(${restStatus}\\)`);
+  const expectedNull = variant === "B" && row.summaryNullB ? row.summaryNullB : (row.summaryNull ?? []);
+  for (const name of expectedNull) {
+    const metric = summaryMetricOf(scenario.summaries, name);
+    assert.equal(metric.value, null, `${context}: ${metric.category}.${name} renders null`);
+    assert.match(metric.status, SUMMARY_UNAVAILABLE, `${context}: ${metric.category}.${name}_status`);
+    assert.match(metric.status, statusPattern, `${context}: ${metric.category}.${name}_status names the status`);
+  }
+  for (const name of row.summaryPartial ?? []) {
+    const metric = summaryMetricOf(scenario.summaries, name);
+    assert.equal(typeof metric.value, "number", `${context}: ${metric.category}.${name} keeps a count`);
+    assert.match(metric.status, /^partial: /, `${context}: ${metric.category}.${name}_status`);
+    assert.match(metric.status, statusPattern, `${context}: ${metric.category}.${name}_status names the status`);
+    assert.match(metric.status, /example-org\/beta/, `${context}: ${metric.category}.${name}_status names the denied repository`);
+  }
+  for (const [name, expected] of Object.entries(row.summaryValues ?? {})) {
+    assert.equal(summaryMetricOf(scenario.summaries, name).value, expected, `${context}: ${name}`);
+  }
+  return scenario;
+}
+
+for (const row of CORROLLARY_SWEEP_ROWS) {
+  test(`snapshot summary sweep: ${row.label}`, async () => {
+    for (const variant of ["A", "B"]) {
+      if (row.graphqlStyle) {
+        await assertSummarySweepRow(row, variant, 403);
+      } else {
+        for (const restStatus of [403, 401]) {
+          await assertSummarySweepRow(row, variant, restStatus);
+        }
+      }
+    }
+  });
+}
+
+test("summary item 1: repo_protection metrics are null under a denied repository list and when no repository is evaluable", async () => {
+  const perRepoReads = "GET /repos/{owner}/{repo}/rules/branches/{branch} and GET /repos/{owner}/{repo}/branches/{branch}/protection";
+  const listDenied = (await runSweepScenario({ deny: ["repos"] })).summaries.repo_protection;
+  assert.equal(listDenied.active_repositories, null);
+  assert.match(listDenied.active_repositories_status, /^unreadable: GET \/orgs\/\{org\}\/repos \(GitHub request failed \(403\) for GET \/orgs\/example-org\/repos\?type=all: Resource not accessible by integration\)$/);
+  for (const name of [...EVALUATED_REPO_METRICS, "repos_not_evaluable"]) {
+    assert.equal(listDenied[name], null, name);
+    assert.equal(
+      listDenied[`${name}_status`],
+      `not collected: GET /orgs/{org}/repos was unreadable (GitHub request failed (403) for GET /orgs/example-org/repos?type=all: Resource not accessible by integration), so ${perRepoReads} were not called`,
+      `${name}_status`,
+    );
+  }
+
+  const everyRepoDenied = (await runSweepScenario({ deny: ["branch_rules:alpha", "branch_rules:beta", "branch_protection:alpha", "branch_protection:beta"] })).summaries.repo_protection;
+  assert.equal(everyRepoDenied.active_repositories, 2);
+  for (const name of EVALUATED_REPO_METRICS) {
+    assert.equal(everyRepoDenied[name], null, name);
+    assert.match(everyRepoDenied[`${name}_status`], /^unreadable: GET \/repos\/\{owner\}\/\{repo\}\/rules\/branches\/\{branch\} and GET \/repos\/\{owner\}\/\{repo\}\/branches\/\{branch\}\/protection could not both be read for any of the 2 active repositories; 2 could not be fully evaluated: example-org\/alpha: branch rules \(GET \/repos\/example-org\/alpha\/rules\/branches\/main\) unreadable: GitHub request failed \(403\)/, `${name}_status`);
+    assert.match(everyRepoDenied[`${name}_status`], /classic branch protection \(GET \/repos\/example-org\/alpha\/branches\/main\/protection\) unreadable: GitHub request failed \(403\)/, `${name}_status`);
+  }
+  assert.equal(everyRepoDenied.repos_not_evaluable, 2);
+  assert.match(everyRepoDenied.repos_not_evaluable_status, /^complete: 2 could not be fully evaluated: example-org\/alpha: .* \| example-org\/beta: .* \(2 active\)$/);
+
+  const oneDenied = (await runSweepScenario({ deny: ["branch_protection:beta"] })).summaries.repo_protection;
+  assert.equal(oneDenied.evaluated_repositories, 1);
+  assert.match(oneDenied.evaluated_repositories_status, /^partial: 1 of 2 active repositories fully evaluated; 1 could not be fully evaluated: example-org\/beta: classic branch protection \(GET \/repos\/example-org\/beta\/branches\/main\/protection\) unreadable: GitHub request failed \(403\)/);
+  assert.equal(oneDenied.protected_repositories, 1);
+  assert.match(oneDenied.protected_repositories_status, /^partial: counted across 1 of 2 active repositories; 1 could not be fully evaluated: example-org\/beta/);
+  assert.equal(oneDenied.repos_not_evaluable, 1);
+  assert.match(oneDenied.repos_not_evaluable_status, /^complete: 1 could not be fully evaluated: example-org\/beta: classic branch protection/);
+});
+
+test("summary item 2: integrations fan-out counts exclude denied repositories and are null when none answered", async () => {
+  const allDenied = (await runSweepScenario({ deny: ["repo_hooks:alpha", "repo_hooks:beta", "deploy_keys:alpha", "deploy_keys:beta"] })).summaries.integrations;
+  assert.equal(allDenied.repo_webhooks, null);
+  assert.match(allDenied.repo_webhooks_status, /^unreadable: GET \/repos\/\{owner\}\/\{repo\}\/hooks for all 2 repositories \(example-org\/alpha \(GET \/repos\/example-org\/alpha\/hooks: GitHub request failed \(403\) for GET \/repos\/example-org\/alpha\/hooks: Resource not accessible by integration\); example-org\/beta \(GET \/repos\/example-org\/beta\/hooks: GitHub request failed \(403\)/);
+  assert.equal(allDenied.deploy_keys, null);
+  assert.match(allDenied.deploy_keys_status, /^unreadable: GET \/repos\/\{owner\}\/\{repo\}\/keys for all 2 repositories \(example-org\/alpha \(GET \/repos\/example-org\/alpha\/keys: GitHub request failed \(403\)/);
+  assert.equal(allDenied.org_webhooks, 1, "the org hook list is unaffected");
+
+  const betaDenied = (await runSweepScenario({ deny: ["repo_hooks:beta", "deploy_keys:beta"] })).summaries.integrations;
+  assert.equal(betaDenied.repo_webhooks, 1);
+  assert.equal(betaDenied.repo_webhooks_status, "partial: GET /repos/{owner}/{repo}/hooks readable for 1 of 2 repositories; unreadable: example-org/beta (GET /repos/example-org/beta/hooks: GitHub request failed (403) for GET /repos/example-org/beta/hooks: Resource not accessible by integration)");
+  assert.equal(betaDenied.deploy_keys, 1);
+  assert.equal(betaDenied.deploy_keys_status, "partial: GET /repos/{owner}/{repo}/keys readable for 1 of 2 repositories; unreadable: example-org/beta (GET /repos/example-org/beta/keys: GitHub request failed (403) for GET /repos/example-org/beta/keys: Resource not accessible by integration)");
+
+  const reposDenied = (await runSweepScenario({ deny: ["repos"] })).summaries.integrations;
+  assert.equal(reposDenied.repo_webhooks, null);
+  assert.equal(reposDenied.repo_webhooks_status, "not collected: GET /orgs/{org}/repos was unreadable (GitHub request failed (403) for GET /orgs/example-org/repos?type=all: Resource not accessible by integration), so GET /repos/{owner}/{repo}/hooks was not called");
+  assert.equal(reposDenied.deploy_keys, null);
+  assert.match(reposDenied.deploy_keys_status, /^not collected: GET \/orgs\/\{org\}\/repos was unreadable .*, so GET \/repos\/\{owner\}\/\{repo\}\/keys was not called$/);
+});
+
+test("summary item 3: GraphQL connections denied by a FORBIDDEN partial error or never collected render null", async () => {
+  const samlDenied = (await runSweepScenario({ deny: ["graphql:saml"], graphqlStyle: "connection_null" })).summaries.org_access;
+  assert.equal(samlDenied.saml_external_identities, null);
+  assert.equal(samlDenied.saml_external_identities_status, "unreadable: GraphQL organization.samlIdentityProvider.externalIdentities (FORBIDDEN: Resource not accessible by integration)");
+
+  const providerDenied = (await runSweepScenario({ deny: ["graphql:saml"], graphqlStyle: "field_null" })).summaries.org_access;
+  assert.equal(providerDenied.saml_external_identities, null);
+  assert.equal(providerDenied.saml_external_identities_status, "unreadable: GraphQL organization.samlIdentityProvider (FORBIDDEN: Resource not accessible by integration)");
+
+  const ipDenied = (await runSweepScenario({ deny: ["graphql:ip_allow_list"], graphqlStyle: "field_null" })).summaries.org_access;
+  assert.equal(ipDenied.ip_allow_list_entries, null);
+  assert.equal(ipDenied.ip_allow_list_entries_status, "unreadable: GraphQL organization.ipAllowListEntries (FORBIDDEN: Resource not accessible by integration)");
+
+  const neverCollected = assessGitHubOrgAccess(createTruncationOrgData(null, null), createSampleConfig()).snapshotSummary;
+  assert.equal(neverCollected.saml_external_identities, null);
+  assert.equal(neverCollected.saml_external_identities_status, "not collected: GraphQL organization.samlIdentityProvider was not queried");
+  assert.equal(neverCollected.ip_allow_list_entries, null);
+  assert.equal(neverCollected.ip_allow_list_entries_status, "not collected: GraphQL organization.ipAllowListEntries was not queried");
+  assertNoFabricatedValues([neverCollected], "never collected summary");
+});
+
+test("summary item 4: ORG-006 renders null identity counts and names no unlinked member when externalIdentities is denied or truncated", async () => {
+  const denied = await runSweepScenario({ deny: ["graphql:saml"], graphqlStyle: "connection_null" });
+  const forbidden = denied.byId["GITHUB-ORG-006"];
+  assert.equal(forbidden.status, "Partial");
+  assert.match(forbidden.summary, /GraphQL returned partial errors on organization\.samlIdentityProvider \(FORBIDDEN: Resource not accessible by integration\)/);
+  const forbiddenEvidence = forbidden.evidence.join("\n");
+  assert.match(forbiddenEvidence, /^external_identities_linked_to_members = null \(GraphQL organization\.samlIdentityProvider\.externalIdentities incomplete: errors: FORBIDDEN: Resource not accessible by integration\)$/m);
+  assert.match(forbiddenEvidence, /^members = 3; members_without_saml_identity = null \(not derived: GraphQL organization\.samlIdentityProvider\.externalIdentities incomplete, errors: FORBIDDEN/m);
+  assert.doesNotMatch(forbiddenEvidence, /members_without_saml_identity = \d|alice|bob|carol/);
+  assert.equal(denied.summaries.org_access.saml_external_identities, null);
+
+  const endless = (page) => ({ hasNextPage: true, endCursor: `cursor-${page}` });
+  const { fetchImpl } = createGraphqlPagingFetch({ samlPageInfo: endless, ipPageInfo: () => ({ hasNextPage: false, endCursor: null }), ipTotal: 1 });
+  const client = new GitHubAuditorClient(createGraphqlConfig(), fetchImpl);
+  const saml = await client.getSamlIdentitySnapshot();
+  assert.equal(saml.externalIdentitiesTruncated, true);
+  const truncated = assessGitHubOrgAccess(createTruncationOrgData(saml, await client.getIpAllowListSnapshot()), createSampleConfig());
+  const capped = truncated.findings.find((finding) => finding.id === "GITHUB-ORG-006");
+  assert.equal(capped.status, "Partial");
+  const cappedEvidence = capped.evidence.join("\n");
+  assert.match(cappedEvidence, /^external_identities_linked_to_members = null \(GraphQL organization\.samlIdentityProvider\.externalIdentities incomplete: truncated at 50 of 7000\)$/m);
+  assert.match(cappedEvidence, /^members = 2; members_without_saml_identity = null \(not derived: GraphQL organization\.samlIdentityProvider\.externalIdentities incomplete, truncated at 50 of 7000\)$/m);
+  assert.doesNotMatch(cappedEvidence, /members_without_saml_identity = \d|user1|user2/);
+  assert.equal(truncated.snapshotSummary.saml_external_identities, 50);
+  assert.equal(truncated.snapshotSummary.saml_external_identities_status, "partial: GraphQL organization.samlIdentityProvider.externalIdentities truncated at 50 of 7000");
+  assertNoFabricatedValues([truncated.snapshotSummary], "truncated summary");
+});

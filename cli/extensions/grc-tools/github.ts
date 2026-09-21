@@ -2566,10 +2566,11 @@ function unreadableStatus(endpoint: string, error: string | undefined): string {
   return `unreadable: ${endpoint} (${error ?? "no data returned"})`;
 }
 
-function notCollectedAfterRepos(reposError: string | undefined, skipped: string): string {
+function notCollectedAfterRepos(reposError: string | undefined, skipped: string, plural: boolean = false): string {
+  const verb = plural ? "were" : "was";
   return reposError
-    ? `not collected: ${ORG_ENDPOINTS.repos} was unreadable (${reposError}), so ${skipped} was not called`
-    : `not collected: ${ORG_ENDPOINTS.repos} listed no active repositories, so ${skipped} was not called`;
+    ? `not collected: ${ORG_ENDPOINTS.repos} was unreadable (${reposError}), so ${skipped} ${verb} not called`
+    : `not collected: ${ORG_ENDPOINTS.repos} listed no active repositories, so ${skipped} ${verb} not called`;
 }
 
 // A list read from one documented endpoint: the count when it answered, null plus the failure
@@ -4441,8 +4442,8 @@ export function assessGitHubRepoProtection(
   // fully evaluated; counted over the evaluated repositories otherwise, with the gaps named.
   const perRepoReads = `${REPO_ENDPOINTS.branchRules} and ${REPO_ENDPOINTS.branchProtection}`;
   const evaluatedMetric = (name: string, count: number, completeStatus: string, partialStatus: string): GitHubSnapshotSummary => {
-    if (repositoriesUnreadable) return summaryMetric(name, null, notCollectedAfterRepos(data.repositories.error, perRepoReads));
-    if (repoCount === 0) return summaryMetric(name, null, notCollectedAfterRepos(undefined, perRepoReads));
+    if (repositoriesUnreadable) return summaryMetric(name, null, notCollectedAfterRepos(data.repositories.error, perRepoReads, true));
+    if (repoCount === 0) return summaryMetric(name, null, notCollectedAfterRepos(undefined, perRepoReads, true));
     if (noneEvaluated) {
       return summaryMetric(name, null, `unreadable: ${perRepoReads} could not both be read for any of the ${repoCount} active repositories; ${unevaluatedNote(unevaluated, UNEVALUATED_SUMMARY_LIMIT)}`);
     }
@@ -4456,8 +4457,8 @@ export function assessGitHubRepoProtection(
     `counted across ${evaluated.length} of ${repoCount} active repositories`,
   );
   const notEvaluableMetric = (): GitHubSnapshotSummary => {
-    if (repositoriesUnreadable) return summaryMetric("repos_not_evaluable", null, notCollectedAfterRepos(data.repositories.error, perRepoReads));
-    if (repoCount === 0) return summaryMetric("repos_not_evaluable", null, notCollectedAfterRepos(undefined, perRepoReads));
+    if (repositoriesUnreadable) return summaryMetric("repos_not_evaluable", null, notCollectedAfterRepos(data.repositories.error, perRepoReads, true));
+    if (repoCount === 0) return summaryMetric("repos_not_evaluable", null, notCollectedAfterRepos(undefined, perRepoReads, true));
     return summaryMetric(
       "repos_not_evaluable",
       unevaluated.length,
