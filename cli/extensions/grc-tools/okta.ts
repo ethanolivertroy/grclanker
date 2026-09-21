@@ -42,8 +42,12 @@ const DEFAULT_RATE_LIMIT_RETRIES = 4;
 const DAYS_90_MS = 90 * 24 * 60 * 60 * 1000;
 const DAYS_30_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_USER_PAGES = 50;
+const MAX_LIST_PAGES = 50;
+const MAX_SYSTEM_LOG_PAGES = 5;
 const MAX_PRIVILEGED_FACTOR_LOOKUPS = 50;
 const MAX_PRIVILEGED_GROUP_LOOKUPS = 25;
+const MIN_REDACTABLE_SECRET_LENGTH = 8;
+const REDACTED = "[REDACTED]";
 const FEDERAL_ORG_HOST_PATTERN = /\.(okta-gov\.com|okta\.gov|okta\.mil)$/i;
 const RESTRICTED_AUTHENTICATOR_KEYS = new Set(["phone_number", "security_question", "okta_email"]);
 const OSCAL_VERSION = "1.1.2";
@@ -190,7 +194,11 @@ interface PaginatedList {
   items: JsonRecord[];
   truncated: boolean;
   pagesFetched: number;
+  truncationNote?: string;
 }
+
+/** Collectors accept a bare array from lightweight test clients or the metadata-carrying page from OktaAuditorClient. */
+type ListResult = JsonRecord[] | PaginatedList;
 
 interface OktaAuthenticationData {
   signOnPolicies: CollectedDataset<JsonRecord[]>;
@@ -783,6 +791,171 @@ function parseLinkHeaderNext(linkHeader: string | null): string | null {
   return match?.[1] ?? null;
 }
 
+/**
+ * Rule 9 deny list for every record kept in memory or written to core_data:
+ * matched on the lowercased key with dots, underscores, and hyphens removed,
+ * so client_secret, clientSecret, secret_hash, sharedSecret, secretKey (Duo),
+ * settings.token (log streams), and recovery_question.answer all match while
+ * authenticator `key`, `tokenWindow`, and `credentialId` stay legible.
+ */
+const CREDENTIAL_KEY_PATTERN =
+  /(password|passwd|passphrase|secret|token|apikey|privatekey|secretkey|secrethash|clientassertion|authorization|answer)$/;
+const JWT_PATTERN = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./;
+const SSWS_TOKEN_PATTERN = /^00[A-Za-z0-9_-]{40}$/;
+
+function normalizeKeyName(key: string): string {
+  return key.toLowerCase().replace(/[._-]/g, "");
+}
+
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(normalizeKeyName(key));
+}
+
+/** Password policies carry settings.password.{complexity, age, lockout}, which the verdicts read; every other password member is a credential. */
+function isPasswordPolicySettings(key: string, value: unknown): boolean {
+  if (!/^(password|passwd)$/.test(normalizeKeyName(key))) return false;
+  const record = asRecord(value);
+  return "complexity" in record || "age" in record || "lockout" in record;
+}
+
+/** Rewrites only URLs whose userinfo or query string could carry a token (webhook URIs, System Log request URLs with sessionToken). */
+function scrubUrlValue(value: string): string {
+  const match = /^[a-z][a-z0-9+.-]*:\/\/(.*)$/i.exec(value);
+  if (!match || !/[@?]/.test(match[1])) return value;
+  try {
+    const url = new URL(value);
+    const userinfo = url.username || url.password ? `${REDACTED}@` : "";
+    const query = url.search.length > 1 ? `?${REDACTED}` : "";
+    return `${url.protocol}//${userinfo}${url.host}${url.pathname}${query}`;
+  } catch {
+    return value.replace(/\/\/[^/@]*@/, `//${REDACTED}@`).replace(/\?.*$/, `?${REDACTED}`);
+  }
+}
+
+function redactString(value: string): string {
+  return JWT_PATTERN.test(value) || SSWS_TOKEN_PATTERN.test(value) ? REDACTED : scrubUrlValue(value);
+}
+
+/**
+ * Applied to every collected record and again to every JSON document written
+ * into the bundle: redacts the value of every credential-named key (including
+ * {key, value} and {name, value} pair shapes), every JWT or SSWS token shaped
+ * string, and the userinfo and query string of every URL, keeping key names so
+ * the evidence stays legible.
+ */
+function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  if (typeof value === "string") return redactString(value);
+  if (!value || typeof value !== "object") return value;
+  const record = value as JsonRecord;
+  const pairName = asString(record.name) ?? asString(record.key);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(record)) {
+    const credentialPair = key === "value" && pairName !== undefined && isCredentialKey(pairName);
+    if ((isCredentialKey(key) && !isPasswordPolicySettings(key, item)) || credentialPair) {
+      output[key] = item === null || item === undefined ? item : REDACTED;
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
+function redactRecord(record: JsonRecord): JsonRecord {
+  return asRecord(redactSnapshot(record));
+}
+
+function redactRecordMap(map: Record<string, JsonRecord[]>): Record<string, JsonRecord[]> {
+  return Object.fromEntries(Object.entries(map).map(([key, items]) => [key, items.map(redactRecord)]));
+}
+
+function urlOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+/**
+ * Event hooks keep id, name, status, events, and channel type and version;
+ * the destination URI drops to scheme and host because SIEM and workflow
+ * receivers embed tokens in the path or query, and every header value and the
+ * authScheme value are replaced since operators put shared secrets there.
+ */
+function projectEventHook(hook: JsonRecord): JsonRecord {
+  const channel = asRecord(hook.channel);
+  const config = asRecord(channel.config);
+  const authScheme = asRecord(config.authScheme);
+  const headers = asArray(config.headers).map((entry) => asRecord(entry));
+  const projectedConfig: JsonRecord = {
+    uri: urlOrigin(asString(config.uri)) ?? null,
+    method: config.method ?? null,
+    headers: headers.map((header) => ({
+      key: header.key ?? null,
+      value: header.value === undefined || header.value === null ? header.value ?? null : REDACTED,
+    })),
+  };
+  if (Object.keys(authScheme).length > 0) {
+    projectedConfig.authScheme = {
+      type: authScheme.type ?? null,
+      key: authScheme.key ?? null,
+      ...("value" in authScheme ? { value: REDACTED } : {}),
+    };
+  }
+  return {
+    ...hook,
+    channel: { ...channel, config: projectedConfig },
+  };
+}
+
+/**
+ * System Log events keep the fields OKTA-MON-002 reads plus the actor and
+ * client identity; debugContext.debugData (request URLs that can carry a
+ * one-time sessionToken), request, target, and securityContext are dropped.
+ */
+function projectSystemLogEvent(event: JsonRecord): JsonRecord {
+  const actor = asRecord(event.actor);
+  const client = asRecord(event.client);
+  const outcome = asRecord(event.outcome);
+  return {
+    uuid: event.uuid ?? null,
+    published: event.published ?? null,
+    eventType: event.eventType ?? null,
+    displayMessage: event.displayMessage ?? null,
+    severity: event.severity ?? null,
+    outcome: { result: outcome.result ?? null, reason: outcome.reason ?? null },
+    actor: {
+      id: actor.id ?? null,
+      type: actor.type ?? null,
+      alternateId: actor.alternateId ?? null,
+      displayName: actor.displayName ?? null,
+    },
+    client: { ipAddress: client.ipAddress ?? null },
+  };
+}
+
+/** Error text names the request path and query without the opaque `after` cursor of follow-up pages. */
+function describeRequestTarget(config: OktaResolvedConfig, pathOrUrl: string): string {
+  try {
+    const url = new URL(makeUrl(config, pathOrUrl));
+    url.searchParams.delete("after");
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return pathOrUrl;
+  }
+}
+
+function redactKnownSecrets(text: string, secrets: Array<string | undefined>): string {
+  return secrets.reduce<string>(
+    (output, secret) =>
+      secret && secret.length >= MIN_REDACTABLE_SECRET_LENGTH ? output.split(secret).join(REDACTED) : output,
+    text,
+  );
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
@@ -1064,6 +1237,7 @@ function makeUrl(config: OktaResolvedConfig, pathOrUrl: string): string {
   return `${config.orgUrl}${pathOrUrl}`;
 }
 
+/** Keeps only the vendor's error summary fields; a body without them is described by size so a token echoed by a proxy never lands in an error string. */
 async function readErrorDetail(response: Response): Promise<string> {
   const text = await response.text();
   if (!text) return "";
@@ -1075,9 +1249,9 @@ async function readErrorDetail(response: Response): Promise<string> {
       asString(parsed.error_description) ??
       asString(parsed.errorSummary) ??
       (summaries.length > 0 ? summaries.join("; ") : undefined);
-    return detail ?? text;
+    return detail ?? `JSON error body without errorSummary (${text.length} chars)`;
   } catch {
-    return text;
+    return `non-JSON error body (${text.length} chars)`;
   }
 }
 
@@ -1216,11 +1390,18 @@ export class OktaAuditorClient {
     if (!response.ok) {
       const detail = await readErrorDetail(response);
       throw new Error(
-        `Okta API request failed for ${pathOrUrl} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+        this.redactSecrets(
+          `Okta API request failed for ${describeRequestTarget(this.config, pathOrUrl)} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+        ),
       );
     }
 
     return response;
+  }
+
+  private redactSecrets(text: string): string {
+    const cached = tokenCache.get(buildTokenCacheKey(this.config));
+    return redactKnownSecrets(text, [this.config.token, cached?.token]);
   }
 
   async getJson<T>(pathOrUrl: string): Promise<T> {
@@ -1239,48 +1420,66 @@ export class OktaAuditorClient {
     }
   }
 
-  async listPaginatedWithMeta(pathOrUrl: string, maxPages?: number): Promise<PaginatedList> {
+  /**
+   * Walks Link rel="next" pages up to maxPages. Every early exit (page cap, a
+   * next URL already visited, or an empty page that still advertises a next
+   * link) returns truncated: true with a note stating pages and items seen and
+   * that the total is unknown, so the partial-inventory demotion applies.
+   */
+  async listPaginatedWithMeta(pathOrUrl: string, maxPages: number = MAX_LIST_PAGES): Promise<PaginatedList> {
     const items: JsonRecord[] = [];
+    const visited = new Set<string>();
+    const target = describeRequestTarget(this.config, pathOrUrl);
     let nextUrl: string | null = pathOrUrl;
     let pagesFetched = 0;
 
+    const truncatedList = (reason: string): PaginatedList => ({
+      items,
+      truncated: true,
+      pagesFetched,
+      truncationNote: `GET ${target} stopped after ${pagesFetched} pages (${items.length} items): ${reason}, total unknown.`,
+    });
+
     while (nextUrl) {
-      if (maxPages !== undefined && pagesFetched >= maxPages) {
-        return { items, truncated: true, pagesFetched };
+      if (pagesFetched >= maxPages) {
+        return truncatedList(`the ${maxPages}-page cap was reached with a Link rel="next" page unread`);
       }
+      visited.add(makeUrl(this.config, nextUrl));
       const response = await this.request(nextUrl);
       const payload = (await response.json()) as unknown;
-      if (Array.isArray(payload)) {
-        items.push(...payload.map((entry) => asRecord(entry)));
-      } else {
-        throw new Error(`Expected array response from ${pathOrUrl}`);
+      if (!Array.isArray(payload)) {
+        throw new Error(`Expected array response from ${target}`);
       }
+      items.push(...payload.map((entry) => asRecord(entry)));
       pagesFetched += 1;
-      nextUrl = parseLinkHeaderNext(response.headers.get("link"));
+      const next = parseLinkHeaderNext(response.headers.get("link"));
+      if (!next) break;
+      if (visited.has(makeUrl(this.config, next))) {
+        return truncatedList('the Link rel="next" cursor repeated a page already read');
+      }
+      if (payload.length === 0) {
+        return truncatedList('an empty page still advertised a Link rel="next" cursor');
+      }
+      nextUrl = next;
     }
 
     return { items, truncated: false, pagesFetched };
   }
 
-  async listPaginated(pathOrUrl: string): Promise<JsonRecord[]> {
-    const page = await this.listPaginatedWithMeta(pathOrUrl);
-    return page.items;
+  async listPolicies(type: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/policies?type=${encodeURIComponent(type)}&limit=${PAGE_LIMIT}`);
   }
 
-  async listPolicies(type: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/policies?type=${encodeURIComponent(type)}&limit=${PAGE_LIMIT}`);
+  async listPolicyRules(policyId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/policies/${encodeURIComponent(policyId)}/rules?limit=${PAGE_LIMIT}`);
   }
 
-  async listPolicyRules(policyId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/policies/${encodeURIComponent(policyId)}/rules?limit=${PAGE_LIMIT}`);
+  async listAuthenticators(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta("/api/v1/authenticators");
   }
 
-  async listAuthenticators(): Promise<JsonRecord[]> {
-    return this.listPaginated("/api/v1/authenticators");
-  }
-
-  async listUsers(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/users?limit=${PAGE_LIMIT}`);
+  async listUsers(): Promise<PaginatedList> {
+    return this.listUsersWithMeta();
   }
 
   async listUsersWithMeta(): Promise<PaginatedList> {
@@ -1291,16 +1490,16 @@ export class OktaAuditorClient {
     return this.tryGetJson<JsonRecord>(`/api/v1/users/${encodeURIComponent(userId)}`);
   }
 
-  async listUserFactors(userId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/users/${encodeURIComponent(userId)}/factors`);
+  async listUserFactors(userId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/users/${encodeURIComponent(userId)}/factors`);
   }
 
-  async listGroupRules(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups/rules?limit=${PAGE_LIMIT}`);
+  async listGroupRules(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups/rules?limit=${PAGE_LIMIT}`);
   }
 
-  async listOrgContacts(): Promise<JsonRecord[]> {
-    return this.listPaginated("/api/v1/org/contacts");
+  async listOrgContacts(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta("/api/v1/org/contacts");
   }
 
   async getOrgContactUser(contactType: string): Promise<JsonRecord | null> {
@@ -1315,92 +1514,126 @@ export class OktaAuditorClient {
     return this.getJson<JsonRecord>("/api/v1/org/orgSettings/thirdPartyAdminSetting");
   }
 
-  async listGroups(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups?limit=${PAGE_LIMIT}`);
+  async listGroups(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups?limit=${PAGE_LIMIT}`);
   }
 
-  async listGroupUsers(groupId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups/${encodeURIComponent(groupId)}/users?limit=${PAGE_LIMIT}`);
+  async listGroupUsers(groupId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups/${encodeURIComponent(groupId)}/users?limit=${PAGE_LIMIT}`);
   }
 
-  async listGroupRoles(groupId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups/${encodeURIComponent(groupId)}/roles?limit=${PAGE_LIMIT}`);
+  async listGroupRoles(groupId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups/${encodeURIComponent(groupId)}/roles?limit=${PAGE_LIMIT}`);
   }
 
-  async listApps(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/apps?limit=${PAGE_LIMIT}`);
+  async listApps(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/apps?limit=${PAGE_LIMIT}`);
   }
 
-  async listIdps(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/idps?limit=${PAGE_LIMIT}`);
+  async listIdps(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/idps?limit=${PAGE_LIMIT}`);
   }
 
-  async listTrustedOrigins(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/trustedOrigins?limit=${PAGE_LIMIT}`);
+  async listTrustedOrigins(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/trustedOrigins?limit=${PAGE_LIMIT}`);
   }
 
-  async listNetworkZones(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/zones?limit=${PAGE_LIMIT}`);
+  async listNetworkZones(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/zones?limit=${PAGE_LIMIT}`);
   }
 
-  async listAuthorizationServers(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/authorizationServers?limit=${PAGE_LIMIT}`);
+  async listAuthorizationServers(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/authorizationServers?limit=${PAGE_LIMIT}`);
   }
 
   async getDefaultAuthorizationServer(): Promise<JsonRecord | null> {
     return this.tryGetJson<JsonRecord>("/api/v1/authorizationServers/default");
   }
 
-  async listOrgFactors(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/org/factors?limit=${PAGE_LIMIT}`);
+  async listOrgFactors(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/org/factors?limit=${PAGE_LIMIT}`);
   }
 
-  async listEventHooks(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/eventHooks?limit=${PAGE_LIMIT}`);
+  async listEventHooks(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/eventHooks?limit=${PAGE_LIMIT}`);
   }
 
-  async listLogStreams(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/logStreams?limit=${PAGE_LIMIT}`);
+  async listLogStreams(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/logStreams?limit=${PAGE_LIMIT}`);
   }
 
-  async listSystemLogs(): Promise<JsonRecord[]> {
+  /**
+   * A bounded query (since and until) so the System Log API returns a finite
+   * window instead of a polling stream, capped at MAX_SYSTEM_LOG_PAGES because
+   * OKTA-MON-002 only needs a recent sample; the cap exit reports truncated.
+   */
+  async listSystemLogs(): Promise<PaginatedList> {
     const since = encodeURIComponent(daysAgoIso(LOOKBACK_DAYS));
-    return this.listPaginated(`/api/v1/logs?since=${since}&limit=${PAGE_LIMIT}`);
+    const until = encodeURIComponent(new Date().toISOString());
+    return this.listPaginatedWithMeta(
+      `/api/v1/logs?since=${since}&until=${until}&limit=${PAGE_LIMIT}`,
+      MAX_SYSTEM_LOG_PAGES,
+    );
   }
 
-  async listBehaviors(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/behaviors?limit=${PAGE_LIMIT}`);
+  async listBehaviors(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/behaviors?limit=${PAGE_LIMIT}`);
   }
 
   async getThreatInsight(): Promise<JsonRecord | null> {
     return this.tryGetJson<JsonRecord>("/api/v1/threats/configuration");
   }
 
-  async listApiTokens(): Promise<JsonRecord[]> {
-    return this.listPaginated("/api/v1/api-tokens");
+  async listApiTokens(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta("/api/v1/api-tokens");
   }
 
-  async listDeviceAssurancePolicies(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/device-assurances?limit=${PAGE_LIMIT}`);
+  async listDeviceAssurancePolicies(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/device-assurances?limit=${PAGE_LIMIT}`);
   }
 
-  async listUsersWithRoleAssignments(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/iam/assignees/users?limit=${PAGE_LIMIT}`);
+  async listUsersWithRoleAssignments(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/iam/assignees/users?limit=${PAGE_LIMIT}`);
   }
 
-  async listUserRoles(userId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/users/${encodeURIComponent(userId)}/roles?limit=${PAGE_LIMIT}`);
+  async listUserRoles(userId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/users/${encodeURIComponent(userId)}/roles?limit=${PAGE_LIMIT}`);
   }
 }
 
+function toPaginatedList(result: ListResult): PaginatedList {
+  return Array.isArray(result) ? { items: result, truncated: false, pagesFetched: 1 } : result;
+}
+
+function truncationNoteOf(page: PaginatedList): string | undefined {
+  if (!page.truncated) return undefined;
+  return page.truncationNote ?? `Listing stopped after ${page.pagesFetched} pages (${page.items.length} items); total unknown.`;
+}
+
+function joinNotes(notes: Array<string | undefined>): string | undefined {
+  const present = notes.filter((note): note is string => Boolean(note));
+  return present.length > 0 ? present.join(" | ") : undefined;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Every list lands here: records are redacted (or projected) before they are kept, and a page-capped walk forwards truncated plus its note. */
 async function collectArrayDataset(
-  fetcher: () => Promise<JsonRecord[]>,
+  fetcher: () => Promise<ListResult>,
+  project: (record: JsonRecord) => JsonRecord = redactRecord,
 ): Promise<CollectedDataset<JsonRecord[]>> {
   try {
-    const data = await fetcher();
-    return { data };
+    const page = toPaginatedList(await fetcher());
+    const truncationNote = truncationNoteOf(page);
+    return {
+      data: page.items.map(project),
+      truncated: page.truncated,
+      truncationNote,
+    };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return { data: [], error: errorText(error) };
   }
 }
 
@@ -1410,34 +1643,53 @@ async function collectObjectDataset<T>(
 ): Promise<CollectedDataset<T>> {
   try {
     const data = await fetcher();
-    return { data };
+    return { data: redactSnapshot(data) as T };
   } catch (error) {
-    return { data: fallback, error: error instanceof Error ? error.message : String(error) };
+    return { data: fallback, error: errorText(error) };
   }
 }
 
-async function collectPolicyRuleMap(
-  client: Pick<OktaAuditorClient, "listPolicyRules">,
-  policies: JsonRecord[],
+/**
+ * Per-parent list loops (rules per policy, roles per user, members per group,
+ * factors per user): each child list is normalized, redacted, and its
+ * truncation note kept so the consumer can demote.
+ */
+async function collectRecordMap(
+  parents: JsonRecord[],
+  fetcher: (parentId: string) => Promise<ListResult>,
+  onError: "empty" | "omit" = "empty",
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
   const data: Record<string, JsonRecord[]> = {};
   const errors: string[] = [];
+  const notes: string[] = [];
 
-  for (const policy of policies) {
-    const policyId = asString(policy.id);
-    if (!policyId) continue;
+  for (const parent of parents) {
+    const parentId = asString(parent.id);
+    if (!parentId) continue;
     try {
-      data[policyId] = await client.listPolicyRules(policyId);
+      const page = toPaginatedList(await fetcher(parentId));
+      data[parentId] = page.items.map(redactRecord);
+      const note = truncationNoteOf(page);
+      if (note) notes.push(`${parentId}: ${note}`);
     } catch (error) {
-      errors.push(`${policyId}: ${error instanceof Error ? error.message : String(error)}`);
-      data[policyId] = [];
+      errors.push(`${parentId}: ${errorText(error)}`);
+      if (onError === "empty") data[parentId] = [];
     }
   }
 
   return {
     data,
     error: errors.length > 0 ? errors.join("; ") : undefined,
+    truncated: notes.length > 0,
+    truncationNote: joinNotes(notes),
   };
+}
+
+async function collectPolicyRuleMap(
+  client: Pick<OktaAuditorClient, "listPolicyRules">,
+  policies: JsonRecord[],
+): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
+  return collectRecordMap(policies, (policyId) => client.listPolicyRules(policyId));
 }
 
 export async function collectOktaAuthenticationData(
@@ -1505,16 +1757,17 @@ async function collectUsersDataset(
     };
   }
   try {
-    const page = await client.listUsersWithMeta();
+    const page = toPaginatedList(await client.listUsersWithMeta());
     return {
-      data: page.items,
+      data: page.items.map(redactRecord),
       truncated: page.truncated,
       truncationNote: page.truncated
-        ? `User listing stopped after ${page.pagesFetched} pages (${page.items.length} users); a Link rel="next" page remained unread.`
+        ? page.truncationNote ??
+          `User listing stopped after ${page.pagesFetched} pages (${page.items.length} users); a Link rel="next" page remained unread, total unknown.`
         : undefined,
     };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return { data: [], error: errorText(error) };
   }
 }
 
@@ -1522,29 +1775,22 @@ async function collectPrivilegedUserFactors(
   client: OktaAdminAccessClient,
   privilegedUsers: JsonRecord[],
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
-  const data: Record<string, JsonRecord[]> = {};
   if (!client.listUserFactors) {
-    return { data, error: "Per-user factor listing is not available on this client." };
+    return { data: {}, error: "Per-user factor listing is not available on this client." };
   }
-  const errors: string[] = [];
   const scoped = privilegedUsers.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
-  for (const user of scoped) {
-    const userId = asString(user.id);
-    if (!userId) continue;
-    try {
-      data[userId] = await client.listUserFactors(userId);
-    } catch (error) {
-      errors.push(`${userId}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
+  const factors = await collectRecordMap(scoped, (userId) => client.listUserFactors!(userId), "omit");
   const truncated = privilegedUsers.length > scoped.length;
   return {
-    data,
-    error: errors.length > 0 ? errors.join("; ") : undefined,
-    truncated,
-    truncationNote: truncated
-      ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.length} privileged users.`
-      : undefined,
+    data: factors.data,
+    error: factors.error,
+    truncated: truncated || factors.truncated,
+    truncationNote: joinNotes([
+      truncated
+        ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.length} privileged users.`
+        : undefined,
+      factors.truncationNote,
+    ]),
   };
 }
 
@@ -1552,19 +1798,7 @@ export async function collectOktaAdminAccessData(
   client: OktaAdminAccessClient,
 ): Promise<OktaAdminAccessData> {
   const usersWithRoleAssignments = await collectArrayDataset(() => client.listUsersWithRoleAssignments());
-  const userRoles: Record<string, JsonRecord[]> = {};
-  const userRoleErrors: string[] = [];
-
-  for (const user of usersWithRoleAssignments.data) {
-    const userId = asString(user.id);
-    if (!userId) continue;
-    try {
-      userRoles[userId] = await client.listUserRoles(userId);
-    } catch (error) {
-      userRoleErrors.push(`${userId}: ${error instanceof Error ? error.message : String(error)}`);
-      userRoles[userId] = [];
-    }
-  }
+  const userRoles = await collectRecordMap(usersWithRoleAssignments.data, (userId) => client.listUserRoles(userId));
 
   const groups = await collectArrayDataset(() => client.listGroups());
   const privilegedGroups = groups.data.filter((group) =>
@@ -1573,28 +1807,10 @@ export async function collectOktaAdminAccessData(
     ),
   );
 
-  const privilegedGroupRoles: Record<string, JsonRecord[]> = {};
-  const privilegedGroupMembers: Record<string, JsonRecord[]> = {};
-  const groupRoleErrors: string[] = [];
-  const groupMemberErrors: string[] = [];
   const groupsTruncated = privilegedGroups.length > MAX_PRIVILEGED_GROUP_LOOKUPS;
-
-  for (const group of privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS)) {
-    const groupId = asString(group.id);
-    if (!groupId) continue;
-    try {
-      privilegedGroupRoles[groupId] = await client.listGroupRoles(groupId);
-    } catch (error) {
-      groupRoleErrors.push(`${groupId}: ${error instanceof Error ? error.message : String(error)}`);
-      privilegedGroupRoles[groupId] = [];
-    }
-    try {
-      privilegedGroupMembers[groupId] = await client.listGroupUsers(groupId);
-    } catch (error) {
-      groupMemberErrors.push(`${groupId}: ${error instanceof Error ? error.message : String(error)}`);
-      privilegedGroupMembers[groupId] = [];
-    }
-  }
+  const expandedGroups = privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS);
+  const privilegedGroupRoles = await collectRecordMap(expandedGroups, (groupId) => client.listGroupRoles(groupId));
+  const privilegedGroupMembers = await collectRecordMap(expandedGroups, (groupId) => client.listGroupUsers(groupId));
 
   const users = await collectUsersDataset(client);
   const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments.data);
@@ -1607,26 +1823,20 @@ export async function collectOktaAdminAccessData(
 
   return {
     usersWithRoleAssignments,
-    userRoles: {
-      data: userRoles,
-      error: userRoleErrors.length > 0 ? userRoleErrors.join("; ") : undefined,
-    },
+    userRoles,
     groups,
     privilegedGroups: {
       data: privilegedGroups,
-      truncated: groupsTruncated,
-      truncationNote: groupsTruncated
-        ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
-        : undefined,
+      truncated: groupsTruncated || groups.truncated,
+      truncationNote: joinNotes([
+        groupsTruncated
+          ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
+          : undefined,
+        groups.truncationNote,
+      ]),
     },
-    privilegedGroupRoles: {
-      data: privilegedGroupRoles,
-      error: groupRoleErrors.length > 0 ? groupRoleErrors.join("; ") : undefined,
-    },
-    privilegedGroupMembers: {
-      data: privilegedGroupMembers,
-      error: groupMemberErrors.length > 0 ? groupMemberErrors.join("; ") : undefined,
-    },
+    privilegedGroupRoles,
+    privilegedGroupMembers,
     users,
     privilegedUserFactors,
     oktaSupportAccess,
@@ -1687,10 +1897,10 @@ async function collectOrgContacts(
     return { data: [], error: "Org contact listing is not available on this client." };
   }
   try {
-    const contactTypes = await client.listOrgContacts();
+    const contactTypes = toPaginatedList(await client.listOrgContacts());
     const resolved: JsonRecord[] = [];
     const errors: string[] = [];
-    for (const contact of contactTypes) {
+    for (const contact of contactTypes.items) {
       const contactType = asString(contact.contactType);
       if (!contactType) continue;
       try {
@@ -1704,12 +1914,17 @@ async function collectOrgContacts(
           userLogin: user ? asString(asRecord(user.profile).login) ?? null : null,
         });
       } catch (error) {
-        errors.push(`${contactType}: ${error instanceof Error ? error.message : String(error)}`);
+        errors.push(`${contactType}: ${errorText(error)}`);
       }
     }
-    return { data: resolved, error: errors.length > 0 ? errors.join("; ") : undefined };
+    return {
+      data: resolved,
+      error: errors.length > 0 ? errors.join("; ") : undefined,
+      truncated: contactTypes.truncated,
+      truncationNote: truncationNoteOf(contactTypes),
+    };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return { data: [], error: errorText(error) };
   }
 }
 
@@ -1717,9 +1932,15 @@ export async function collectOktaMonitoringData(
   client: OktaMonitoringClient,
 ): Promise<OktaMonitoringData> {
   return {
-    eventHooks: await collectArrayDataset(() => client.listEventHooks()),
+    eventHooks: await collectArrayDataset(
+      () => client.listEventHooks(),
+      (hook) => redactRecord(projectEventHook(hook)),
+    ),
     logStreams: await collectArrayDataset(() => client.listLogStreams()),
-    systemLogs: await collectArrayDataset(() => client.listSystemLogs()),
+    systemLogs: await collectArrayDataset(
+      () => client.listSystemLogs(),
+      (event) => redactRecord(projectSystemLogEvent(event)),
+    ),
     behaviors: await collectArrayDataset(() => client.listBehaviors()),
     threatInsight: await collectObjectDataset(() => client.getThreatInsight(), null),
     apiTokens: await collectArrayDataset(() => client.listApiTokens()),
@@ -1984,6 +2205,74 @@ function capAtPartial(status: OktaFindingStatus): OktaFindingStatus {
   return status === "Pass" ? "Partial" : status;
 }
 
+const AUTHENTICATION_FINDING_SOURCES: Record<string, Array<keyof OktaAuthenticationData>> = {
+  "OKTA-AUTH-001": ["authenticators", "orgFactors"],
+  "OKTA-AUTH-002": ["signOnPolicies", "signOnPolicyRules", "accessPolicies", "accessPolicyRules", "authenticators", "mfaPolicies"],
+  "OKTA-AUTH-003": ["passwordPolicies"],
+  "OKTA-AUTH-004": ["passwordPolicies"],
+  "OKTA-AUTH-005": ["passwordPolicies"],
+  "OKTA-AUTH-006": ["signOnPolicies", "signOnPolicyRules"],
+  "OKTA-AUTH-007": ["signOnPolicies", "signOnPolicyRules"],
+  "OKTA-AUTH-008": ["idps", "authenticators"],
+  "OKTA-AUTH-009": ["authenticators", "orgFactors"],
+};
+
+const ADMIN_ACCESS_FINDING_SOURCES: Record<string, Array<keyof OktaAdminAccessData>> = {
+  "OKTA-ADMIN-001": ["usersWithRoleAssignments", "userRoles"],
+  "OKTA-ADMIN-002": ["usersWithRoleAssignments", "userRoles"],
+  "OKTA-ADMIN-003": ["groups", "privilegedGroups", "privilegedGroupRoles", "privilegedGroupMembers"],
+  "OKTA-ADMIN-004": ["usersWithRoleAssignments", "privilegedUserFactors"],
+  "OKTA-ADMIN-005": ["users"],
+};
+
+const INTEGRATION_FINDING_SOURCES: Record<string, Array<keyof OktaIntegrationData>> = {
+  "OKTA-INTEG-001": ["trustedOrigins"],
+  "OKTA-INTEG-002": ["networkZones"],
+  "OKTA-INTEG-003": ["apps"],
+  "OKTA-INTEG-004": ["signOnPolicies", "signOnPolicyRules", "accessPolicies", "accessPolicyRules", "networkZones"],
+  "OKTA-INTEG-005": ["apps"],
+  "OKTA-INTEG-006": ["apps", "groupRules"],
+};
+
+const MONITORING_FINDING_SOURCES: Record<string, Array<keyof OktaMonitoringData>> = {
+  "OKTA-MON-001": ["eventHooks", "logStreams"],
+  "OKTA-MON-002": ["systemLogs"],
+  "OKTA-MON-004": ["behaviors"],
+  "OKTA-MON-005": ["apiTokens"],
+  "OKTA-MON-006": ["deviceAssurance"],
+  "OKTA-MON-007": ["apiTokens"],
+  "OKTA-MON-008": ["orgContacts"],
+};
+
+/**
+ * Rule 5 and rule 10: a finding whose evidence comes from a page-capped,
+ * sampled, or cursor-stalled inventory never stays at Pass. The status caps at
+ * Partial and the truncation note (pages and items seen, total unknown) is
+ * appended to the summary and evidence unless the finding already states it.
+ */
+function applyTruncationDemotions<TData extends { [K in keyof TData]: CollectedDataset<unknown> }>(
+  findings: OktaFinding[],
+  data: TData,
+  sources: Record<string, Array<keyof TData>>,
+): OktaFinding[] {
+  return findings.map((finding) => {
+    const notes = (sources[finding.id] ?? [])
+      .map((key): CollectedDataset<unknown> => data[key])
+      .filter((dataset) => dataset.truncated)
+      .map((dataset) => dataset.truncationNote ?? "an inventory this finding reads was truncated, total unknown");
+    if (notes.length === 0) return finding;
+    const unstated = notes.filter((note) => !finding.evidence.some((line) => line.includes(note)));
+    const status = capAtPartial(finding.status);
+    if (status === finding.status && unstated.length === 0) return finding;
+    return {
+      ...finding,
+      status,
+      summary: unstated.length > 0 ? `${finding.summary} Inventory truncated: ${unstated.join(" | ")}` : finding.summary,
+      evidence: [...finding.evidence, ...unstated.map((note) => `Partial data: ${note}`)],
+    };
+  });
+}
+
 function ruleRequiresMfa(rule: JsonRecord): boolean {
   const actions = asRecord(rule.actions);
   if (asRecord(actions.signon).requireFactor === true) return true;
@@ -2087,7 +2376,10 @@ export function assessOktaAuthentication(
         "OKTA-AUTH-001",
         "Pass",
         `${phishingResistantAuthenticators.length} phishing-resistant authenticators are ACTIVE (${strongAuthenticators.length} strong authenticators total).`,
-        strongAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
+        [
+          ...strongAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
+          ...(data.orgFactors.error ? [`Org factors were unreadable (not consulted because authenticators were returned): ${data.orgFactors.error}`] : []),
+        ],
         "Keep phishing-resistant authenticators enabled and verify enrollment policy coverage.",
       ),
     );
@@ -2159,12 +2451,15 @@ export function assessOktaAuthentication(
         "Partial",
         adminMfaRules.length === 0
           ? "Admin or dashboard policies exist, but no ACTIVE rule under them explicitly requires MFA."
-          : "Admin MFA rules exist, but strong authenticators or complete policy data were missing.",
+          : data.authenticators.error
+            ? "Admin MFA rules exist, but the authenticator list was unreadable, so strong authenticator coverage could not be confirmed."
+            : "Admin MFA rules exist, but strong authenticators or complete policy data were missing.",
         [
           ...adminPolicies.map((policy) => `Policy: ${asString(policy.name)} (${asString(policy.status)})`),
           `ACTIVE rules under admin policies: ${adminRules.length}`,
           `Rules requiring MFA: ${adminMfaRules.length}`,
-          `Strong authenticators: ${strongAuthenticators.length}`,
+          `Strong authenticators: ${data.authenticators.error ? "unknown (authenticator list unreadable)" : strongAuthenticators.length}`,
+          ...(data.authenticators.error ? [`Authenticator error: ${data.authenticators.error}`] : []),
           ...(policyErrors.length > 0 ? [`Partial policy data: ${policyErrors.join(" | ")}`] : []),
         ],
         "Ensure at least one ACTIVE rule on the Okta Admin Console and Dashboard policies requires MFA (requireFactor or factorMode 2FA).",
@@ -2388,10 +2683,12 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-008",
         "Pass",
-        `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries.`,
+        `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries${data.idps.error || data.authenticators.error ? " (one source was unreadable; see evidence)" : ""}.`,
         [
           ...certIdps.map((idp) => `IdP: ${recordName(idp)} (${asString(idp.status)})`),
           ...certAuthenticators.map((auth) => `Authenticator: ${authenticatorLabel(auth)}`),
+          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
+          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
         ],
         "Keep certificate-based and smart-card options documented for scoped federal or DoD use cases.",
       ),
@@ -2539,14 +2836,15 @@ export function assessOktaAuthentication(
     ]).length,
   };
 
+  const demoted = applyTruncationDemotions(findings, data, AUTHENTICATION_FINDING_SOURCES);
   return {
     category: "authentication",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta authentication assessment",
       hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -2927,14 +3225,15 @@ export function assessOktaAdminAccess(
     ]).length,
   };
 
+  const demoted = applyTruncationDemotions(findings, data, ADMIN_ACCESS_FINDING_SOURCES);
   return {
     category: "admin_access",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta admin-access assessment",
       new URL(config.orgUrl).hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -3119,6 +3418,7 @@ export function assessOktaIntegrations(
             ? riskAwareRules.map((rule) => recordName(rule))
             : ["No ACTIVE sign-on or access rules with risk, device, or network conditions were returned."]),
           ...policyErrors.map((error) => `Partial policy data: ${error}`),
+          ...(data.networkZones.error ? [`Network zones unreadable (custom zone count unknown): ${data.networkZones.error}`] : []),
         ],
         "Use contextual access rules that incorporate risk, device, or network conditions for higher assurance scenarios.",
       ),
@@ -3181,15 +3481,16 @@ export function assessOktaIntegrations(
       ),
     );
   } else {
-    const status: OktaFindingStatus =
+    const baseStatus: OktaFindingStatus =
       deactivationApps.length > 0 ? "Pass" : provisioningApps.length > 0 ? "Fail" : "Partial";
+    const status = data.groupRules.error ? capAtPartial(baseStatus) : baseStatus;
     findings.push(
       buildFinding(
         "OKTA-INTEG-006",
         status,
-        status === "Pass"
-          ? `${deactivationApps.length} ACTIVE apps push user deactivation downstream (${provisioningApps.length} apps have provisioning features).`
-          : status === "Fail"
+        baseStatus === "Pass"
+          ? `${deactivationApps.length} ACTIVE apps push user deactivation downstream (${provisioningApps.length} apps have provisioning features)${data.groupRules.error ? "; group rules were unreadable, so rule-driven assignment automation could not be confirmed" : ""}.`
+          : baseStatus === "Fail"
             ? `${provisioningApps.length} ACTIVE apps have provisioning features but none push user deactivation.`
             : "No ACTIVE app exposes provisioning features; deprovisioning automation could not be observed through the Management API.",
         [
@@ -3230,14 +3531,15 @@ export function assessOktaIntegrations(
     ]).length,
   };
 
+  const demoted = applyTruncationDemotions(findings, data, INTEGRATION_FINDING_SOURCES);
   return {
     category: "integrations",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta integration assessment",
       new URL(config.orgUrl).hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -3318,18 +3620,27 @@ export function assessOktaMonitoring(
       ),
     );
   } else {
+    const events = data.systemLogs.data;
+    const logsTruncated = Boolean(data.systemLogs.truncated);
+    const logsNote = data.systemLogs.truncationNote ?? "the System Log walk stopped before the window was exhausted, total unknown.";
+    const baseStatus: OktaFindingStatus = events.length > 0 ? "Pass" : "Partial";
     findings.push(
       buildFinding(
         "OKTA-MON-002",
-        data.systemLogs.data.length > 0 ? "Pass" : "Partial",
-        data.systemLogs.data.length > 0
-          ? `Retrieved ${data.systemLogs.data.length} system log events from the last ${LOOKBACK_DAYS} days.`
+        logsTruncated ? capAtPartial(baseStatus) : baseStatus,
+        events.length > 0
+          ? logsTruncated
+            ? `Retrieved at least ${events.length} system log events from the last ${LOOKBACK_DAYS} days (page-capped sample, total unknown): ${logsNote}`
+            : `Retrieved ${events.length} system log events from the last ${LOOKBACK_DAYS} days.`
           : "System log access succeeded but no recent events were returned, which is unexpected for an active org.",
-        data.systemLogs.data.slice(0, 5).map((entry) => {
-          const published = asString(entry.published) ?? "unknown";
-          const eventType = asString(entry.eventType) ?? "unknown";
-          return `${published}: ${eventType}`;
-        }),
+        [
+          ...events.slice(0, 5).map((entry) => {
+            const published = asString(entry.published) ?? "unknown";
+            const eventType = asString(entry.eventType) ?? "unknown";
+            return `${published}: ${eventType}`;
+          }),
+          ...(logsTruncated ? [`Partial data: ${logsNote}`] : []),
+        ],
         "Ensure the System Log API remains readable and that audit records are retained or forwarded to a downstream store.",
       ),
     );
@@ -3362,7 +3673,10 @@ export function assessOktaMonitoring(
         "OKTA-MON-003",
         threatStatus,
         `ThreatInsight mode: ${insightMode}.`,
-        [JSON.stringify(data.threatInsight.data)],
+        [
+          `ThreatInsight action: ${insightMode}; excluded zones: ${asArray(data.threatInsight.data.excludeZones).length}`,
+          ...(asString(data.threatInsight.data.lastUpdated) ? [`Last updated: ${asString(data.threatInsight.data.lastUpdated)}`] : []),
+        ],
         "Use Okta ThreatInsight in at least audit mode, and prefer block mode when the deployment model supports it.",
       ),
     );
@@ -3554,24 +3868,30 @@ export function assessOktaMonitoring(
   } else {
     const technicalStatus = (asString(technicalContact?.userStatus) ?? "").toUpperCase();
     const technicalUserId = asString(technicalContact?.userId);
-    const baseStatus: OktaFindingStatus = !technicalContact || !technicalUserId
-      ? "Fail"
-      : technicalStatus === "ACTIVE"
-        ? "Pass"
-        : technicalStatus === ""
-          ? "Partial"
-          : "Fail";
+    // A failed TECHNICAL lookup drops the contact from the resolved list, which is a permission gap, not a missing assignment.
+    const technicalLookupFailed = !technicalContact && /\bTECHNICAL\b/.test(data.orgContacts.error ?? "");
+    const baseStatus: OktaFindingStatus = technicalLookupFailed
+      ? "Partial"
+      : !technicalContact || !technicalUserId
+        ? "Fail"
+        : technicalStatus === "ACTIVE"
+          ? "Pass"
+          : technicalStatus === ""
+            ? "Partial"
+            : "Fail";
     findings.push(
       buildFinding(
         "OKTA-MON-008",
         data.orgContacts.error ? capAtPartial(baseStatus) : baseStatus,
         baseStatus === "Pass"
           ? "The technical contact resolves to an ACTIVE Okta user."
-          : baseStatus === "Partial"
-            ? "A technical contact is assigned, but the contact user's status could not be read."
-            : technicalContact && technicalUserId
-              ? `The technical contact user is ${technicalStatus || "unknown"}, so security notifications may not reach an active administrator.`
-              : "No technical contact user is assigned for the org.",
+          : technicalLookupFailed
+            ? "The technical contact lookup failed, so the assignment could not be verified (see the contact resolution error in evidence)."
+            : baseStatus === "Partial"
+              ? "A technical contact is assigned, but the contact user's status could not be read."
+              : technicalContact && technicalUserId
+                ? `The technical contact user is ${technicalStatus || "unknown"}, so security notifications may not reach an active administrator.`
+                : "No technical contact user is assigned for the org.",
         [
           ...contacts.map(
             (contact) =>
@@ -3626,14 +3946,15 @@ export function assessOktaMonitoring(
     ]).length,
   };
 
+  const demoted = applyTruncationDemotions(findings, data, MONITORING_FINDING_SOURCES);
   return {
     category: "monitoring",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta monitoring assessment",
       new URL(config.orgUrl).hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -3699,8 +4020,9 @@ export async function runOktaAccessCheck(
   };
 }
 
+/** Every JSON document in the bundle passes through the rule 9 scrubber once more, so a value that bypassed collection-time redaction still never lands on disk. */
 function serializeJson(value: unknown): string {
-  return JSON.stringify(value, null, 2);
+  return JSON.stringify(redactSnapshot(value), null, 2);
 }
 
 function markdownEscapePipes(value: string): string {
@@ -3817,7 +4139,7 @@ function buildQuickReference(): string {
   return [
     "# Okta Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Okta API responses used during this assessment.",
+    "- `core_data/` contains the Okta API responses used during this assessment with credential-bearing fields (client secrets, passwords, header values, tokens) replaced by [REDACTED], event hook URIs reduced to scheme and host, and System Log events projected to identity and outcome fields.",
     "- `analysis/` contains normalized findings and category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `compliance/fedramp/oscal_assessment_results.json` is an OSCAL 1.1.2 assessment-results document keyed by NIST SP 800-53 objective ids.",
@@ -4069,7 +4391,12 @@ export async function exportOktaAuditBundle(
     ...listErrors(Object.values(adminAccess)),
     ...listErrors(Object.values(integrations)),
     ...listErrors(Object.values(monitoring)),
-    ...listTruncations(Object.values(adminAccess)).map((note) => `Truncated inventory: ${note}`),
+    ...listTruncations([
+      ...Object.values(authentication),
+      ...Object.values(adminAccess),
+      ...Object.values(integrations),
+      ...Object.values(monitoring),
+    ]).map((note) => `Truncated inventory: ${note}`),
   ];
 
   const outputDir = await nextAvailableAuditDir(

@@ -636,7 +636,8 @@ test("OktaAuditorClient handles OAuth token refresh, rate limits, and pagination
   );
 
   const policies = await client.listPolicies("OKTA_SIGN_ON");
-  assert.equal(policies.length, 2);
+  assert.equal(policies.items.length, 2);
+  assert.equal(policies.truncated, false);
   assert.equal(state.tokenRequests, 2);
   clearOktaTokenCacheForTests();
 });
