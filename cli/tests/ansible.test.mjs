@@ -1468,14 +1468,14 @@ test("rule 1 corollary: multi-inventory findings never pass when a secondary inv
     { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/credentials/", names: /Vault credential usage could not be read \(credentials: /, expected: "warn" },
     { control: 18, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /variable sources \(inventories\) could not be read/, expected: "manual" },
     { control: 21, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/organizations/1/admins/", names: /admins list of 1 organizations \(Default\) could not be read/, expected: "manual" },
-    { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /inventories list could not be read/, expected: "warn" },
+    { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/inventories/", names: /inventories list could not be read/, expected: "warn", partialView: /^inventories: unreadable \(inventories \(\/api\/v2\/inventories\/\): / },
     { control: 22, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/teams/1/roles/", names: /roles of 1 teams could not be read/, expected: "manual" },
     { control: 23, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/users/2/roles/", names: /roles of 1 users could not be read/, expected: "manual" },
     { control: 24, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/teams/", names: /teams list could not be read/, expected: "warn" },
     { control: 24, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/users/3/roles/", names: /1 user or team role lists could not be read/, expected: "warn" },
     { control: 26, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/settings/system/", names: /system settings could not be read/, expected: "warn" },
     { control: 26, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/settings/logging/", names: /logging settings could not be read/, expected: "warn" },
-    { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/notifications/", names: /notification delivery history could not be read/, expected: "warn" },
+    { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/notifications/", names: /notification delivery history could not be read/, expected: "warn", partialView: /^notifications: unreadable \(notifications \(\/api\/v2\/notifications\/\): / },
     { control: 27, assess: assessAnsiblePlatformSecurity, forbidden: "/api/v2/job_templates/", names: /job templates list could not be read/, expected: "manual" },
     { control: 28, assess: assessAnsibleJobHealth, forbidden: "/api/v2/instance_groups/", names: /instance groups could not be read/, expected: "manual" },
     { control: 28, assess: assessAnsibleJobHealth, forbidden: "/api/v2/settings/jobs/", names: /job settings could not be read/, expected: "manual" },
@@ -1487,10 +1487,29 @@ test("rule 1 corollary: multi-inventory findings never pass when a secondary inv
     assert.notEqual(finding.status, "pass", `control ${testCase.control} passed with ${testCase.forbidden} forbidden: ${finding.summary}`);
     if (testCase.expected) assert.equal(finding.status, testCase.expected, `control ${testCase.control} with ${testCase.forbidden} forbidden: ${finding.summary}`);
     assert.match(finding.summary, testCase.names, `control ${testCase.control} with ${testCase.forbidden} forbidden`);
+    if (testCase.partialView) {
+      assert.ok(finding.evidence.partial_view.some((note) => testCase.partialView.test(note)), `control ${testCase.control}: partial_view names the unreadable inventory: ${JSON.stringify(finding.evidence.partial_view)}`);
+    }
     assert.ok(result.errors.some((error) => error.includes(testCase.forbidden)), `control ${testCase.control}: errors array names ${testCase.forbidden}`);
   }
   const healthy = await runAllAssessments(createMockClient());
   assert.equal(healthy.flatMap((result) => result.findings).filter((item) => item.status !== "pass").length, 0, "the healthy fixture still passes every control");
+});
+
+test("rule 1 corollary: partialNotes caps any pass built on an unreadable view at warn without a per-control branch", async () => {
+  const forbiddenNotifications = await assessAnsiblePlatformSecurity(createMockClient({ forbiddenPaths: ["/api/v2/notifications/"] }));
+  const notifications = byControl(forbiddenNotifications, 27);
+  assert.equal(notifications.status, "warn");
+  assert.ok(notifications.evidence.partial_view.some((note) => /^notifications: unreadable \(/.test(note)), JSON.stringify(notifications.evidence.partial_view));
+  assert.equal(notifications.evidence.notifications_readable, false);
+
+  const forbiddenInventories = await assessAnsiblePlatformSecurity(createMockClient({ forbiddenPaths: ["/api/v2/inventories/"] }));
+  const teams = byControl(forbiddenInventories, 22);
+  assert.equal(teams.status, "warn");
+  assert.equal(teams.evidence.inventories_readable, false);
+  assert.equal(teams.evidence.total_inventories, undefined);
+  assert.ok(teams.evidence.partial_view.some((note) => /^inventories: unreadable \(/.test(note)), JSON.stringify(teams.evidence.partial_view));
+  assert.doesNotMatch(teams.summary, /on every inventory\./);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

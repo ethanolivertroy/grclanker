@@ -1255,7 +1255,12 @@ function scopeNotes(scope: Snapshot<AnsibleScope>): string[] {
 }
 
 function partialNotes(scope: Snapshot<AnsibleScope>, ...views: InventoryView[]): string[] {
-  return [...scopeNotes(scope), ...views.map((view) => view.partial).filter((note): note is string => Boolean(note))];
+  return [
+    ...scopeNotes(scope),
+    ...views
+      .map((view) => (view.readable ? view.partial : `${view.label}: unreadable (${view.error ?? "unknown error"})`))
+      .filter((note): note is string => Boolean(note)),
+  ];
 }
 
 function finding(
@@ -1275,7 +1280,7 @@ function finding(
     severity: severityOverride ?? definition.severity,
     status: downgraded ? "warn" : status,
     summary: downgraded
-      ? `${summary} Downgraded from pass to warn because the inventory is partial: ${partialView.join("; ")}.`
+      ? `${summary} Downgraded from pass to warn because the inventory is partial or unreadable: ${partialView.join("; ")}.`
       : summary,
     evidence: partialView.length > 0 ? { ...(evidence ?? {}), partial_view: partialView } : evidence,
     mappings: mappingsFor(definition),
@@ -2520,7 +2525,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
             ? `None of the ${teams.seen} teams holds the Admin role on an organization, but ${inventoryScopeNote}.`
             : `None of the ${teams.seen} teams holds the Admin role on an organization or on every inventory.`,
       { org_admin_teams: orgAdminTeams, inventory_admin_teams: inventoryAdminTeams, unreadable, total_inventories: totalInventories, inventories_readable: inventories.readable },
-      usersPartial,
+      partialNotes(data.scope, users, teams, inventories),
     ));
   }
 
@@ -2694,7 +2699,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
         failed_notifications: failedNotifications,
         notifications_readable: notifications.readable,
       },
-      [...partialNotes(data.scope, notificationTemplates, templates), ...(criticalProbeNote ? [criticalProbeNote] : [])],
+      [...partialNotes(data.scope, notificationTemplates, templates, notifications), ...(criticalProbeNote ? [criticalProbeNote] : [])],
     ));
   }
 
