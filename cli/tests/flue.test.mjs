@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { URLSearchParams, fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 import * as v from "valibot";
 import { init, setProvider, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
@@ -1012,6 +1012,23 @@ test("scrubbing recognizes transformed echoes: encodings, reflowed PEM, case cha
     `stripped ${REDACTED_VALUE}; encoded ${REDACTED_VALUE}; padded ${REDACTED_VALUE}`,
   );
 
+  // A form-encoded request body echoes the value the way URLSearchParams writes it (space to +, and ~ ! ' ( ) * percent-encoded),
+  // which differs from encodeURIComponent; both spellings must be scrubbed.
+  const spaced = "abcd efgh~!'()*end";
+  const formEncoded = new URLSearchParams({ v: spaced }).toString().slice(2);
+  const componentEncoded = encodeURIComponent(spaced);
+  assert.equal(formEncoded, "abcd+efgh%7E%21%27%28%29*end");
+  assert.equal(componentEncoded, "abcd%20efgh~!'()*end");
+  assert.ok(scrubbedFormsOf(spaced).includes(formEncoded) && scrubbedFormsOf(spaced).includes(componentEncoded));
+  const spacedValues = collectSensitiveValues({ client_secret: spaced });
+  assert.equal(
+    scrubSensitiveValues(`body client_secret=${formEncoded}&grant_type=client_credentials; query ?secret=${componentEncoded}`, spacedValues),
+    `body client_secret=${REDACTED_VALUE}&grant_type=client_credentials; query ?secret=${REDACTED_VALUE}`,
+  );
+  const plainSpace = collectSensitiveValues({ client_secret: "abcd efgh" });
+  assert.equal(scrubSensitiveValues("client_secret=abcd+efgh rejected", plainSpace), `client_secret=${REDACTED_VALUE} rejected`, "the Codex P2 case");
+  assert.equal(scrubSensitiveValues("client_secret=abcd%20efgh rejected", plainSpace), `client_secret=${REDACTED_VALUE} rejected`);
+
   // A PEM re-flowed by a tool: newlines turned into spaces, removed, or one body line quoted alone.
   const body1 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
   const body2 = "MzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu";
@@ -1039,15 +1056,18 @@ test("scrubbing recognizes transformed echoes: encodings, reflowed PEM, case cha
 
   // The formatter applies all of it to a tool-authored error that echoes the input in transformed forms.
   const format = createFlueActivityFormatter();
-  format({ type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t1", toolName: "probe", input: { api_token: token, passcode: "4711" }, position: { batch: 1, index: 0 } });
+  format({ type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t1", toolName: "probe", input: { api_token: token, passcode: "4711", client_secret: spaced }, position: { batch: 1, index: 0 } });
   const line = format({
     type: "tool-output-error",
     conversationId: "c",
     toolCallId: "t1",
-    errorText: `rejected ${base64} / ${urlEncoded} / ${token.toUpperCase()} / passcode 4711`,
+    errorText: `rejected ${base64} / ${urlEncoded} / ${token.toUpperCase()} / passcode 4711 / body client_secret=${formEncoded}`,
     position: { batch: 2, index: 0 },
   });
-  assert.equal(line, `<- probe error: rejected ${REDACTED_VALUE} / ${REDACTED_VALUE} / ${REDACTED_VALUE} / passcode ${REDACTED_VALUE}`);
+  assert.equal(
+    line,
+    `<- probe error: rejected ${REDACTED_VALUE} / ${REDACTED_VALUE} / ${REDACTED_VALUE} / passcode ${REDACTED_VALUE} / body client_secret=${REDACTED_VALUE}`,
+  );
 });
 
 test("regression: gate validation errors for shipped credential tools never put the secret on stderr", () => {
