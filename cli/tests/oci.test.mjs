@@ -680,6 +680,160 @@ test("guardrail sub-reads that fail or lack dates downgrade to warn instead of p
   assert.equal(byId(capped, "OCI-GRD-06").evidence.bucket_cap_hit, true);
 });
 
+test("judgeKeyShape applies the AES-256 and RSA-4096 byte floors and the documented ECDSA curves", () => {
+  assert.equal(judgeKeyShape({ algorithm: "AES", length: 32 }), undefined);
+  assert.equal(judgeKeyShape({ algorithm: "RSA", length: 512 }), undefined);
+  assert.equal(judgeKeyShape({ algorithm: "ECDSA", length: 32, curveId: "NIST_P256" }), undefined);
+  assert.equal(judgeKeyShape({ algorithm: "ECDSA", length: 66, curveId: "NIST_P521" }), undefined);
+  assert.match(judgeKeyShape({ algorithm: "AES", length: 16 }).reason, /AES-128 is below the AES-256 floor/);
+  assert.match(judgeKeyShape({ algorithm: "AES", length: 24 }).reason, /AES-192 is below the AES-256 floor/);
+  assert.match(judgeKeyShape({ algorithm: "RSA", length: 256 }).reason, /RSA-2048 is below the RSA-4096 floor/);
+  assert.match(judgeKeyShape({ algorithm: "RSA", length: 384 }).reason, /RSA-3072 is below the RSA-4096 floor/);
+  assert.match(judgeKeyShape({ algorithm: "RSA" }).reason, /keyShape.length missing/);
+  assert.match(judgeKeyShape({ algorithm: "ECDSA", length: 32 }).reason, /curveId missing or outside/);
+  assert.match(judgeKeyShape({ algorithm: "ECDSA", length: 32, curveId: "SECP256K1" }).reason, /curveId missing or outside/);
+  assert.match(judgeKeyShape({ algorithm: "DES", length: 8 }).reason, /outside the documented AES\/RSA\/ECDSA enum/);
+  assert.match(judgeKeyShape({}).reason, /outside the documented AES\/RSA\/ECDSA enum/);
+});
+
+test("control 19: an RSA-2048 key fails OCI-GRD-05 while documented strong shapes pass", async () => {
+  const rsa2048 = compliantClient();
+  rsa2048.listKeys = async () => [{ id: "key-rsa", displayName: "signing", algorithm: "RSA", lifecycleState: "ENABLED" }];
+  rsa2048.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm: "RSA", length: 256 } });
+  const weak = await assessOciTenancyGuardrails(rsa2048);
+  const finding = byId(weak, "OCI-GRD-05");
+  assert.equal(finding.status, "fail");
+  assert.equal(finding.evidence.keys_judged, 1);
+  assert.equal(finding.evidence.weak_keys[0].lengthBytes, 256);
+  assert.match(finding.evidence.weak_keys[0].reason, /RSA-2048 is below the RSA-4096 floor/);
+  assert.match(finding.summary, /1\/1 ENABLED keys judged from Key.keyShape: 1 weak/);
+  assert.match(finding.summary, /ECDSA keys pass on any documented KeyShape.curveId/);
+  assert.equal(finding.evidence.source, OCI_SURFACE_DOCS.keyDetail.rest);
+  assert.deepEqual(finding.evidence.length_floor_bytes, { AES: 32, RSA: 512 });
+
+  const aes128 = compliantClient();
+  aes128.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm: "AES", length: 16 } });
+  assert.equal(byId(await assessOciTenancyGuardrails(aes128), "OCI-GRD-05").status, "fail");
+
+  const missingLength = compliantClient();
+  missingLength.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm: "AES" } });
+  assert.equal(byId(await assessOciTenancyGuardrails(missingLength), "OCI-GRD-05").status, "fail");
+
+  for (const shape of [{ algorithm: "RSA", length: 512 }, { algorithm: "ECDSA", length: 48, curveId: "NIST_P384" }, { algorithm: "ECDSA", length: 32, curveId: "NIST_P256" }]) {
+    const strong = compliantClient();
+    strong.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: shape });
+    const passing = byId(await assessOciTenancyGuardrails(strong), "OCI-GRD-05");
+    assert.equal(passing.status, "pass", JSON.stringify(shape));
+    assert.equal(passing.evidence.weak_keys.length, 0);
+  }
+
+  const noCurve = compliantClient();
+  noCurve.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm: "ECDSA", length: 32 } });
+  assert.equal(byId(await assessOciTenancyGuardrails(noCurve), "OCI-GRD-05").status, "fail");
+});
+
+test("control 19: a denied or shapeless key get never passes and names the cause", async () => {
+  const denied = compliantClient();
+  denied.getKey = async () => {
+    throw DENIED_ERROR;
+  };
+  const single = byId(await assessOciTenancyGuardrails(denied), "OCI-GRD-05");
+  assert.equal(single.status, "manual");
+  assert.match(single.summary, /none of the 1 ENABLED keys could be read with kms key get/);
+  assert.match(single.summary, /NotAuthorizedOrNotFound/);
+  assert.equal(single.evidence.key_detail_errors, 1);
+  assert.equal(single.evidence.keys_judged, 0);
+
+  const partial = compliantClient();
+  partial.listKeys = async () => [
+    { id: "key-1", displayName: "data", algorithm: "AES", lifecycleState: "ENABLED" },
+    { id: "key-2", displayName: "backup", algorithm: "AES", lifecycleState: "ENABLED" },
+  ];
+  partial.getKey = async (_vault, keyId) => {
+    if (keyId === "key-2") throw DENIED_ERROR;
+    return { id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm: "AES", length: 32 } };
+  };
+  const mixed = byId(await assessOciTenancyGuardrails(partial), "OCI-GRD-05");
+  assert.equal(mixed.status, "warn");
+  assert.equal(mixed.evidence.keys_total, 2);
+  assert.equal(mixed.evidence.keys_judged, 1);
+  assert.equal(mixed.evidence.key_detail_errors, 1);
+  assert.match(mixed.summary, /1\/2 ENABLED keys judged from Key.keyShape/);
+  assert.match(mixed.summary, /1 key get reads failed/);
+
+  const shapeless = compliantClient();
+  shapeless.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED" });
+  const noShape = byId(await assessOciTenancyGuardrails(shapeless), "OCI-GRD-05");
+  assert.equal(noShape.status, "manual");
+  assert.match(noShape.summary, /response did not include keyShape/);
+});
+
+test("rule 10: the vault key cap reports seen versus total and withholds pass", async () => {
+  const client = compliantClient();
+  client.listKeys = async () => [
+    { id: "key-1", displayName: "data", algorithm: "AES", lifecycleState: "ENABLED" },
+    { id: "key-2", displayName: "backup", algorithm: "AES", lifecycleState: "ENABLED" },
+    { id: "key-3", displayName: "retired", algorithm: "AES", lifecycleState: "DISABLED" },
+  ];
+  const capped = byId(await assessOciTenancyGuardrails(client, { maxKeys: 1 }), "OCI-GRD-05");
+  assert.equal(capped.status, "warn");
+  assert.equal(capped.evidence.key_cap_hit, true);
+  assert.equal(capped.evidence.key_cap, 1);
+  assert.equal(capped.evidence.keys_seen, 1);
+  assert.equal(capped.evidence.keys_total, 2);
+  assert.match(capped.summary, /Key cap 1 hit: 1\/2 ENABLED keys inspected; a pass verdict is withheld/);
+
+  const exact = byId(await assessOciTenancyGuardrails(client, { maxKeys: 2 }), "OCI-GRD-05");
+  assert.equal(exact.status, "pass");
+  assert.equal(exact.evidence.key_cap_hit, false);
+  assert.equal(exact.evidence.keys_judged, 2);
+});
+
+test("bastions that combine a world allow list with a long TTL fail instead of warn", async () => {
+  const exposed = compliantClient();
+  exposed.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 86400, clientCidrBlockAllowList: ["0.0.0.0/0"] });
+  const failing = byId(await assessOciTenancyGuardrails(exposed), "OCI-GRD-04");
+  assert.equal(failing.status, "fail");
+  assert.equal(failing.evidence.exposed_bastions.length, 1);
+  assert.equal(failing.evidence.weak_bastions.length, 0);
+  assert.match(failing.summary, /1 bastions combine a world CIDR allow list/);
+
+  const worldOnly = compliantClient();
+  worldOnly.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 3600, clientCidrBlockAllowList: ["::/0"] });
+  const warning = byId(await assessOciTenancyGuardrails(worldOnly), "OCI-GRD-04");
+  assert.equal(warning.status, "warn");
+  assert.equal(warning.evidence.exposed_bastions.length, 0);
+  assert.equal(warning.evidence.weak_bastions.length, 1);
+
+  const longTtlOnly = compliantClient();
+  longTtlOnly.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: 86400, clientCidrBlockAllowList: ["203.0.113.0/24"] });
+  assert.equal(byId(await assessOciTenancyGuardrails(longTtlOnly), "OCI-GRD-04").status, "warn");
+});
+
+test("NSG rule evidence carries the documented SecurityRule.isValid flag", async () => {
+  const client = compliantClient();
+  client.listNetworkSecurityGroupRules = async () => [
+    { id: "sr-1", direction: "INGRESS", protocol: "6", source: "0.0.0.0/0", sourceType: "CIDR_BLOCK", isValid: false, tcpOptions: { destinationPortRange: { min: 22, max: 22 } } },
+    { id: "sr-2", direction: "INGRESS", protocol: "6", source: "10.0.0.0/8", sourceType: "CIDR_BLOCK", isValid: true, tcpOptions: { destinationPortRange: { min: 443, max: 443 } } },
+  ];
+  const finding = byId(await assessOciTenancyGuardrails(client), "OCI-GRD-02");
+  assert.equal(finding.status, "fail");
+  assert.equal(finding.evidence.nsg_rules_seen, 2);
+  assert.equal(finding.evidence.nsg_rules_is_valid_false, 1);
+  assert.equal(finding.evidence.permissive_nsg_rules[0].isValid, false);
+  assert.ok(OCI_SURFACE_DOCS.networkSecurityGroupRules.fields.includes("isValid"));
+});
+
+test("OCI-LOG-04 reads as supporting evidence without framework mappings", async () => {
+  const result = await assessOciLoggingDetection(compliantClient());
+  const finding = byId(result, "OCI-LOG-04");
+  assert.deepEqual(finding.mappings, []);
+  assert.match(finding.evidence.role, /supporting evidence for control 11/);
+  for (const item of result.findings.filter((entry) => entry.id !== "OCI-LOG-04")) {
+    assert.ok(item.mappings.length >= 8, `${item.id} carries the full framework mapping row`);
+  }
+});
+
 test("ruleReachesSensitivePort follows protocol and destination port range semantics", () => {
   assert.equal(ruleReachesSensitivePort({ protocol: "6", tcpOptions: { destinationPortRange: { min: 22, max: 22 } } }), true);
   assert.equal(ruleReachesSensitivePort({ protocol: "6", tcpOptions: { destinationPortRange: { min: 1, max: 65535 } } }), true);
