@@ -451,8 +451,8 @@ test("assessVeracodeFindingsHygiene fails on aged flaws, unreviewed mitigations,
   const fixture = healthyFixture();
   fixture.findings = [
     { issue_id: 1, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: "NONE", first_found_date: daysAgo(45) }, finding_details: { severity: 5 }, annotations: [] },
-    { issue_id: 2, finding_status: { status: "OPEN", resolution: "PROPOSED_FALSE_POSITIVE", resolution_status: "PROPOSED" }, finding_details: { severity: 4 }, annotations: [{ action: "FP", comment: "" }] },
-    { issue_id: 3, finding_status: { status: "CLOSED", resolution: "POTENTIAL_FALSE_POSITIVE", resolution_status: "APPROVED" }, finding_details: { severity: 3 }, annotations: [{ action: "FP", comment: "Encoded input" }] },
+    { issue_id: 2, finding_status: { status: "OPEN", resolution_status: "PROPOSED" }, finding_details: { severity: 4 }, annotations: [{ action: "FP", comment: "" }] },
+    { issue_id: 3, finding_status: { status: "CLOSED", resolution_status: "APPROVED" }, finding_details: { severity: 3 }, annotations: [{ action: "FP", comment: "Encoded input" }, { action: "APPROVED", comment: "Reviewed" }] },
   ];
   fixture.summaryReport = { static_analysis: { modules: { module: [{ loc: 1000, numflawssev5: 3, numflawssev4: 2 }] } } };
   const result = await assessVeracodeFindingsHygiene(mockClient(fixture), { now: NOW });
@@ -467,6 +467,27 @@ test("assessVeracodeFindingsHygiene fails on aged flaws, unreviewed mitigations,
   const missingResult = await assessVeracodeFindingsHygiene(mockClient(missing), { now: NOW });
   assert.equal(statusOf(missingResult.findings, 3), "warn");
   assert.equal(statusOf(missingResult.findings, 17), "manual");
+});
+
+test("assessVeracodeFindingsHygiene counts false positives from FP annotations and keeps resolution as evidence only", async () => {
+  const fixture = healthyFixture();
+  fixture.findings = [
+    { issue_id: 1, finding_status: { status: "OPEN", resolution: "POTENTIAL_FALSE_POSITIVE", resolution_status: "NONE", first_found_date: daysAgo(2) }, finding_details: { severity: 3 }, annotations: [] },
+    { issue_id: 2, finding_status: { status: "OPEN", resolution: "POTENTIAL_FALSE_POSITIVE", resolution_status: "NONE", first_found_date: daysAgo(2) }, finding_details: { severity: 3 }, annotations: [{ action: "COMMENT", comment: "triage note" }] },
+  ];
+  const withoutFp = await assessVeracodeFindingsHygiene(mockClient(fixture), { now: NOW });
+  assert.equal(statusOf(withoutFp.findings, 16), "pass");
+  const evidence = withoutFp.findings.find((item) => item.id === "VERACODE-16").evidence;
+  assert.equal(evidence.per_application[0].fp_annotated_findings, 0);
+  assert.deepEqual(evidence.per_application[0].resolution_values, { POTENTIAL_FALSE_POSITIVE: 2 });
+  assert.match(evidence.signal, /annotations\[\]\.action FP/);
+
+  fixture.findings[0].annotations = [{ action: "FP", comment: "Not exploitable", created: daysAgo(1) }, { action: "APPROVED", comment: "Agreed", created: daysAgo(1) }];
+  const withFp = await assessVeracodeFindingsHygiene(mockClient(fixture), { now: NOW });
+  assert.equal(statusOf(withFp.findings, 16), "warn");
+  const fpEvidence = withFp.findings.find((item) => item.id === "VERACODE-16").evidence;
+  assert.equal(fpEvidence.applications_exceeding[0].rate_percent, 50);
+  assert.equal(fpEvidence.per_application[0].fp_approved_findings, 1);
 });
 
 test("assessVeracodeScaPosture fails on high CVSS and HIGH risk licenses and treats unlicensed SCA as manual", async () => {

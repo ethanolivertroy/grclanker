@@ -1475,32 +1475,58 @@ function evaluateMitigationWorkflow(samples: ApplicationFindingsSample[], invent
   return finding(12, "high", limitedStatus("pass", caveats), joinNotes(`No proposed-but-unreviewed mitigations and no unjustified mitigation annotations across ${findingsSeen} findings (${mitigationsSeen} mitigation annotations read with include_annot=TRUE).`, ...caveats), evidence);
 }
 
+function hasAnnotationAction(item: JsonRecord, action: string): boolean {
+  return asRecords(item.annotations).some((annotation) => asString(annotation.action)?.toUpperCase() === action);
+}
+
+function countValues(values: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
+  return counts;
+}
+
 function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], inventory: HalListResult, maxRatePercent: number): VeracodeFinding {
   const readable = samples.filter((sample) => sample.findings.status === "ok");
   const unreadable = samples.filter((sample) => sample.findings.status === "error");
-  const manualEvidence = ["Export findings by resolution per application and compute the potential false positive ratio."];
+  const manualEvidence = ["Export findings with their mitigation annotations per application and compute the share carrying a false positive (FP) mitigation."];
   if (readable.length === 0) {
     return manualFinding(16, "medium", unreadable.length > 0 ? unreadableReason("findings", unreadable[0].findings) : "No application findings were sampled.", manualEvidence);
   }
-  const exceeding: Array<{ application: string; rate_percent: number; findings: number }> = [];
+  const exceeding: Array<{ application: string; rate_percent: number; findings: number; fp_annotated_findings: number }> = [];
+  const perApplication: Array<{ application: string; findings: number; fp_annotated_findings: number; fp_approved_findings: number; resolution_values: Record<string, number> }> = [];
   let evaluated = 0;
   for (const sample of readable) {
     const list = (sample.findings as { value: HalListResult }).value;
     if (list.items.length === 0) continue;
     evaluated += 1;
-    const falsePositives = list.items.filter((item) => asString(findingStatus(item).resolution)?.toUpperCase() === "POTENTIAL_FALSE_POSITIVE").length;
-    const rate = (falsePositives / list.items.length) * 100;
-    if (rate > maxRatePercent) exceeding.push({ application: sample.application, rate_percent: Number(rate.toFixed(1)), findings: list.items.length });
+    const fpFindings = list.items.filter((item) => hasAnnotationAction(item, "FP"));
+    const fpApproved = fpFindings.filter((item) => hasAnnotationAction(item, "APPROVED")).length;
+    perApplication.push({
+      application: sample.application,
+      findings: list.items.length,
+      fp_annotated_findings: fpFindings.length,
+      fp_approved_findings: fpApproved,
+      resolution_values: countValues(list.items.map((item) => asString(findingStatus(item).resolution) ?? "absent")),
+    });
+    const rate = (fpFindings.length / list.items.length) * 100;
+    if (rate > maxRatePercent) exceeding.push({ application: sample.application, rate_percent: Number(rate.toFixed(1)), findings: list.items.length, fp_annotated_findings: fpFindings.length });
   }
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} application finding lists were unreadable.` : undefined];
-  const evidence = { applications_sampled: samples.length, applications_with_findings: evaluated, applications_exceeding: exceeding.slice(0, 50), max_rate_percent: maxRatePercent };
+  const evidence = {
+    applications_sampled: samples.length,
+    applications_with_findings: evaluated,
+    applications_exceeding: exceeding.slice(0, 50),
+    max_rate_percent: maxRatePercent,
+    signal: "annotations[].action FP (include_annot=TRUE); finding_status.resolution is recorded as evidence only",
+    per_application: perApplication.slice(0, 50),
+  };
   if (evaluated === 0) {
     return manualFinding(16, "medium", "No sampled application returned findings, so a false positive rate cannot be computed; the empty population is treated as unverifiable rather than compliant.", manualEvidence, evidence);
   }
   if (exceeding.length > 0) {
-    return finding(16, "medium", "warn", joinNotes(`${exceeding.length}/${evaluated} applications exceed a ${maxRatePercent} percent potential false positive rate, which may indicate scan tuning issues.`, ...caveats), evidence);
+    return finding(16, "medium", "warn", joinNotes(`${exceeding.length}/${evaluated} applications exceed a ${maxRatePercent} percent false positive rate (findings carrying an FP mitigation annotation), which may indicate scan tuning issues.`, ...caveats), evidence);
   }
-  return finding(16, "medium", limitedStatus("pass", caveats), joinNotes(`All ${evaluated} applications with findings stay at or below a ${maxRatePercent} percent potential false positive rate.`, ...caveats), evidence);
+  return finding(16, "medium", limitedStatus("pass", caveats), joinNotes(`All ${evaluated} applications with findings stay at or below a ${maxRatePercent} percent false positive rate (findings carrying an FP mitigation annotation read with include_annot=TRUE).`, ...caveats), evidence);
 }
 
 function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: HalListResult, maxDensity: number): VeracodeFinding {
