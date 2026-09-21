@@ -613,6 +613,62 @@ export function xmlToJson(node: XmlNode): unknown {
   return output;
 }
 
+export const XML_REDACTION_MARKER = "[REDACTED]";
+
+// PAN-OS stores secrets as leaf elements whose names end in one of these words:
+// phash (admin password hashes), bind-password, secret and shared-secret (RADIUS,
+// TACACS+, LDAP), pre-shared-key and key (IKE, IPSec, HA encryption), private-key
+// (certificates), passphrase, authpwd and privpwd (SNMPv3), snmp-community-string,
+// api-key and token (integrations). Names are matched on their last hyphenated
+// segment, so password-complexity, key-usage, and credential-enforcement are kept.
+const CREDENTIAL_XML_NAME_PATTERN = /(?:^|-)(?:password|passwd|pwd|passphrase|phash|hash|secret|key|token|community|community-string|credential|credentials|authpwd|privpwd)$/;
+const NON_CREDENTIAL_XML_NAMES = new Set(["public-key"]);
+
+export function isCredentialXmlName(name: string): boolean {
+  const normalized = name.trim().toLowerCase().replace(/_/g, "-");
+  if (NON_CREDENTIAL_XML_NAMES.has(normalized)) return false;
+  return CREDENTIAL_XML_NAME_PATTERN.test(normalized);
+}
+
+function redactXmlAttributes(attributes: Record<string, string>): Record<string, string> {
+  const output: Record<string, string> = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    output[key] = isCredentialXmlName(key) && value.length > 0 ? XML_REDACTION_MARKER : value;
+  }
+  return output;
+}
+
+/**
+ * Returns a deep copy of an XML tree with every credential-bearing node
+ * collapsed to XML_REDACTION_MARKER (the whole subtree, so a container such as
+ * pre-shared-key never leaks a differently named child). The source tree is not
+ * mutated: assessments keep reading raw values in memory, only what is written
+ * to disk is redacted.
+ */
+export function redactXmlCredentials(node: XmlNode): XmlNode {
+  if (isCredentialXmlName(node.name)) {
+    const hasValue = node.text.trim().length > 0 || node.children.length > 0;
+    return { name: node.name, attributes: redactXmlAttributes(node.attributes), children: [], text: hasValue ? XML_REDACTION_MARKER : "" };
+  }
+  return {
+    name: node.name,
+    attributes: redactXmlAttributes(node.attributes),
+    children: node.children.map(redactXmlCredentials),
+    text: node.text,
+  };
+}
+
+/** The core_data/ representation of a PAN-OS device snapshot, with credentials redacted. */
+export function panosSnapshotToJson(snapshot: PanosDeviceSnapshot): JsonRecord {
+  return {
+    host: snapshot.host,
+    platform: snapshot.platform,
+    system_info: snapshot.systemInfo,
+    ha_state: snapshot.haState ? xmlToJson(redactXmlCredentials(snapshot.haState)) : null,
+    config: snapshot.config.map((tree) => xmlToJson(redactXmlCredentials(tree))),
+  };
+}
+
 function readConfigFile(pathname: string | undefined): JsonRecord {
   const candidate = pathname ?? DEFAULT_CONFIG_FILE;
   if (!existsSync(candidate)) {
@@ -2948,7 +3004,7 @@ function buildQuickReference(result: PaloaltoAccessCheckResult, assessments: Pal
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw API snapshots (Prisma Cloud JSON, PAN-OS system info and configuration as JSON)",
+    `- \`core_data/\`: raw API snapshots (Prisma Cloud JSON, PAN-OS system info and configuration as JSON with credential-bearing nodes replaced by ${XML_REDACTION_MARKER})`,
     "- `analysis/findings.json`: normalized findings with framework mappings",
     "- `analysis/<area>.json`: per-assessment summaries",
     "- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, one report per framework",
@@ -2959,6 +3015,7 @@ function buildQuickReference(result: PaloaltoAccessCheckResult, assessments: Pal
     ...assessments.map((item) => `- ${item.title}: ${item.summary.pass} pass, ${item.summary.warn} warn, ${item.summary.fail} fail, ${item.summary.manual} manual`),
     "",
     "Credentials, API keys, and JWTs are never written into the bundle.",
+    `PAN-OS configuration nodes that carry password hashes, shared secrets, keys, passphrases, tokens, or SNMP community strings are replaced with ${XML_REDACTION_MARKER} before core_data/ is written.`,
   ].join("\n");
 }
 
@@ -3000,13 +3057,7 @@ export async function exportPaloaltoAuditBundle(
     await writeSecureTextFile(outputDir, "core_data/prisma_cloud.json", serializeJson(raw));
   }
   for (const snapshot of deviceSnapshots) {
-    await writeSecureTextFile(outputDir, `core_data/panos_${safeDirName(snapshot.host)}.json`, serializeJson({
-      host: snapshot.host,
-      platform: snapshot.platform,
-      system_info: snapshot.systemInfo,
-      ha_state: snapshot.haState ? xmlToJson(snapshot.haState) : null,
-      config: snapshot.config.map(xmlToJson),
-    }));
+    await writeSecureTextFile(outputDir, `core_data/panos_${safeDirName(snapshot.host)}.json`, serializeJson(panosSnapshotToJson(snapshot)));
   }
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
   const analysisNames = ["cloud_posture", "firewall_policy", "threat_prevention", "device_hardening"];
