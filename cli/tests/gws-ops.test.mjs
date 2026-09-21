@@ -1,19 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import {
   GwsCliCommandError,
   checkGwsCliAccess,
   collectGwsOperatorEvidenceBundle,
+  defaultGwsCliRunner,
   investigateGwsAlerts,
   resolveGwsCliExecutable,
   reviewGwsTokenActivity,
@@ -30,102 +33,106 @@ function createFakeBinary(base, name = "gws") {
   return pathname;
 }
 
+/** A real executable stand-in for gws so defaultGwsCliRunner is exercised end to end. */
+function createScriptedBinary(base, script) {
+  const pathname = join(base, "gws");
+  writeFileSync(pathname, `#!/bin/sh\n${script}\n`);
+  chmodSync(pathname, 0o755);
+  return pathname;
+}
+
 function parseParams(args) {
   const paramsIndex = args.indexOf("--params");
   if (paramsIndex === -1) return {};
   return JSON.parse(args[paramsIndex + 1]);
 }
 
-function createRunner() {
-  return async ({ executable, args }) => {
+function execution(executable, args, stdout) {
+  return {
+    executable: executable.executable,
+    displayExecutable: executable.displayExecutable,
+    args,
+    command: [executable.displayExecutable, ...args].join(" "),
+    stdout,
+    stderr: "",
+    exitCode: 0,
+  };
+}
+
+/** Alert Center alerts carry status and severity under metadata, per the Alert resource reference. */
+function alertsPayload(overrides = {}) {
+  return {
+    alerts: [
+      {
+        alertId: "a-1",
+        type: "Suspicious login",
+        source: "Google Operations",
+        createTime: "2030-01-01T00:00:00Z",
+        metadata: { alertId: "a-1", status: "NOT_STARTED", severity: "HIGH", assignee: "secops@example.com" },
+      },
+      {
+        alertId: "a-2",
+        type: "Password spray",
+        source: "Google Operations",
+        createTime: "2030-01-02T00:00:00Z",
+        metadata: { alertId: "a-2", status: "CLOSED", severity: "MEDIUM" },
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function adminPayload(overrides = {}) {
+  return {
+    items: [
+      {
+        id: { time: "2030-01-01T12:00:00Z", uniqueQualifier: "u1", applicationName: "admin", customerId: "C0123abcd" },
+        actor: { email: "admin@example.com", profileId: "100", callerType: "USER" },
+        ipAddress: "203.0.113.1",
+        events: [{ type: "APPLICATION_SETTINGS", name: "CHANGE_APPLICATION_SETTING" }],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function tokenPayload(overrides = {}) {
+  return {
+    items: [
+      {
+        id: { time: "2030-01-01T12:05:00Z", uniqueQualifier: "u2", applicationName: "token", customerId: "C0123abcd" },
+        actor: {
+          email: "user@example.com",
+          applicationInfo: { applicationName: "Drive Syncer", oAuthClientId: "client-1" },
+        },
+        events: [{ type: "auth", name: "authorize" }, { type: "auth", name: "request" }],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function createRunner(options = {}) {
+  const seen = options.seen ?? [];
+  return async (request) => {
+    const { executable, args } = request;
+    seen.push(request);
     const command = [executable.displayExecutable, ...args].join(" ");
     if (args[0] === "--version") {
-      return {
-        executable: executable.executable,
-        displayExecutable: executable.displayExecutable,
-        args,
-        command,
-        stdout: "gws 0.22.5",
-        stderr: "",
-        exitCode: 0,
-      };
+      return execution(executable, args, "gws 0.22.5");
     }
 
     if (args[0] === "alertcenter:v1beta1") {
-      return {
-        executable: executable.executable,
-        displayExecutable: executable.displayExecutable,
-        args,
-        command,
-        stdout: JSON.stringify({
-          alerts: [
-            {
-              alertId: "a-1",
-              type: "Suspicious login",
-              severity: "high",
-              state: "open",
-              source: "Google Operations",
-              createTime: "2030-01-01T00:00:00Z",
-            },
-            {
-              alertId: "a-2",
-              type: "Password spray",
-              severity: "medium",
-              state: "closed",
-              source: "Google Operations",
-              createTime: "2030-01-02T00:00:00Z",
-            },
-          ],
-        }),
-        stderr: "",
-        exitCode: 0,
-      };
+      return execution(executable, args, JSON.stringify(options.alerts ?? alertsPayload()));
     }
 
     if (args[0] === "admin-reports") {
-      const params = parseParams(args);
-      const applicationName = params.applicationName;
+      const applicationName = parseParams(args).applicationName;
       if (applicationName === "admin") {
-        return {
-          executable: executable.executable,
-          displayExecutable: executable.displayExecutable,
-          args,
-          command,
-          stdout: JSON.stringify({
-            items: [
-              {
-                id: { time: "2030-01-01T12:00:00Z", uniqueQualifier: "u1" },
-                actor: { email: "admin@example.com", ipAddress: "203.0.113.1" },
-                events: [{ name: "CHANGE_APPLICATION_SETTING" }],
-              },
-            ],
-          }),
-          stderr: "",
-          exitCode: 0,
-        };
+        return execution(executable, args, typeof options.admin === "string" ? options.admin : JSON.stringify(options.admin ?? adminPayload()));
       }
-
       if (applicationName === "token") {
-        return {
-          executable: executable.executable,
-          displayExecutable: executable.displayExecutable,
-          args,
-          command,
-          stdout: JSON.stringify({
-            items: [
-              {
-                id: { time: "2030-01-01T12:05:00Z", uniqueQualifier: "u2" },
-                actor: {
-                  email: "user@example.com",
-                  applicationInfo: { applicationName: "Drive Syncer" },
-                },
-                events: [{ name: "authorize" }, { name: "request" }],
-              },
-            ],
-          }),
-          stderr: "",
-          exitCode: 0,
-        };
+        return execution(executable, args, JSON.stringify(options.token ?? tokenPayload()));
       }
     }
 
@@ -141,6 +148,82 @@ test("resolveGwsCliExecutable prefers explicit binary path", () => {
   assert.equal(resolved.executable, fake);
   assert.equal(resolved.installed, true);
   assert.equal(resolved.source, "argument");
+});
+
+test("resolveGwsCliExecutable falls back to GRCLANKER_GWS_BIN before PATH", () => {
+  const base = createTempBase("grclanker-gws-ops-envbin-");
+  const fake = createFakeBinary(base);
+  const argBinary = createFakeBinary(base, "gws-arg");
+
+  const fromEnv = resolveGwsCliExecutable({}, { GRCLANKER_GWS_BIN: fake, PATH: "/nonexistent" });
+  assert.equal(fromEnv.executable, fake);
+  assert.equal(fromEnv.source, "environment");
+  assert.equal(fromEnv.installed, true);
+
+  const argWins = resolveGwsCliExecutable({ gwsBin: argBinary }, { GRCLANKER_GWS_BIN: fake });
+  assert.equal(argWins.executable, argBinary);
+  assert.equal(argWins.source, "argument");
+
+  const missing = resolveGwsCliExecutable({}, { GRCLANKER_GWS_BIN: join(base, "does-not-exist") });
+  assert.equal(missing.installed, false);
+  assert.equal(missing.source, "environment");
+});
+
+test("credential precedence: config_dir maps to GOOGLE_WORKSPACE_CLI_CONFIG_DIR and GOOGLE_WORKSPACE_CLI_* values are inherited untouched", async () => {
+  const base = createTempBase("grclanker-gws-ops-env-");
+  const fake = createFakeBinary(base);
+  const seen = [];
+  const inherited = {
+    PATH: "/usr/bin",
+    GOOGLE_WORKSPACE_CLI_TOKEN: "ya29.inherited-token",
+    GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE: "/secrets/service-account.json",
+    GOOGLE_WORKSPACE_CLI_CONFIG_DIR: "/home/operator/.config/gws",
+    UNRELATED: "keep",
+  };
+
+  await traceGwsAdminActivity({ gwsBin: fake, configDir: join(base, "override-config") }, createRunner({ seen }), inherited);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].executable.executable, fake);
+  assert.equal(seen[0].env.GOOGLE_WORKSPACE_CLI_CONFIG_DIR, join(base, "override-config"));
+  assert.equal(seen[0].env.GOOGLE_WORKSPACE_CLI_TOKEN, "ya29.inherited-token");
+  assert.equal(seen[0].env.GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE, "/secrets/service-account.json");
+  assert.equal(seen[0].env.UNRELATED, "keep");
+  assert.equal(inherited.GOOGLE_WORKSPACE_CLI_CONFIG_DIR, "/home/operator/.config/gws");
+
+  seen.length = 0;
+  await reviewGwsTokenActivity({ gwsBin: fake }, createRunner({ seen }), inherited);
+  assert.equal(seen[0].env.GOOGLE_WORKSPACE_CLI_CONFIG_DIR, "/home/operator/.config/gws");
+  assert.equal(seen[0].env.GOOGLE_WORKSPACE_CLI_TOKEN, "ya29.inherited-token");
+
+  seen.length = 0;
+  await checkGwsCliAccess({ gwsBin: fake, configDir: "  " }, createRunner({ seen }), inherited);
+  assert.equal(seen[0].args[0], "--version");
+  assert.equal(seen[0].expectJson, false);
+  assert.equal(seen[0].env.GOOGLE_WORKSPACE_CLI_CONFIG_DIR, "/home/operator/.config/gws");
+});
+
+test("curated commands match the published gws CLI shape: <service> <resource> <method> --params <json>", async () => {
+  const base = createTempBase("grclanker-gws-ops-shape-");
+  const fake = createFakeBinary(base);
+  const before = Date.now();
+
+  const alerts = await investigateGwsAlerts({ gwsBin: fake, max_results: 25, filter: "createTime >= \"2030-01-01T00:00:00Z\"" }, createRunner());
+  assert.deepEqual(alerts.command.args.slice(0, 4), ["alertcenter:v1beta1", "alerts", "list", "--params"]);
+  assert.deepEqual(JSON.parse(alerts.command.args[4]), { pageSize: 25, filter: "createTime >= \"2030-01-01T00:00:00Z\"" });
+
+  const admin = await traceGwsAdminActivity({ gwsBin: fake, lookback_days: 10, max_results: 500 }, createRunner());
+  assert.deepEqual(admin.command.args.slice(0, 4), ["admin-reports", "activities", "list", "--params"]);
+  const adminParams = JSON.parse(admin.command.args[4]);
+  assert.equal(adminParams.userKey, "all");
+  assert.equal(adminParams.applicationName, "admin");
+  assert.equal(adminParams.maxResults, 250);
+  assert.ok(Math.abs(before - 10 * 24 * 60 * 60 * 1000 - Date.parse(adminParams.startTime)) < 5000);
+
+  const token = await reviewGwsTokenActivity({ gwsBin: fake }, createRunner());
+  const tokenParams = JSON.parse(token.command.args[4]);
+  assert.equal(tokenParams.applicationName, "token");
+  assert.equal(tokenParams.maxResults, 50);
+  assert.match(token.command.command, /^\S+ admin-reports activities list --params '\{"userKey":"all","applicationName":"token"/);
 });
 
 test("checkGwsCliAccess previews the probe command in dry-run mode", async () => {
@@ -159,15 +242,7 @@ test("checkGwsCliAccess maps auth failures cleanly", async () => {
   const runner = async ({ executable, args }) => {
     const command = [executable.displayExecutable, ...args].join(" ");
     if (args[0] === "--version") {
-      return {
-        executable: executable.executable,
-        displayExecutable: executable.displayExecutable,
-        args,
-        command,
-        stdout: "gws 0.22.5",
-        stderr: "",
-        exitCode: 0,
-      };
+      return execution(executable, args, "gws 0.22.5");
     }
     throw new GwsCliCommandError("auth", "Credentials missing", command, 2);
   };
@@ -178,14 +253,111 @@ test("checkGwsCliAccess maps auth failures cleanly", async () => {
   );
 });
 
-test("investigateGwsAlerts parses alert records from gws output", async () => {
+test("verdict rule 1: a failing CLI invocation is an explicit error mapped from the documented exit codes", async () => {
+  const base = createTempBase("grclanker-gws-ops-exit-");
+  const fake = createScriptedBinary(base, 'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "Error: credentials missing, expired, or invalid" 1>&2\nexit 2');
+
+  await assert.rejects(
+    () => traceGwsAdminActivity({ gwsBin: fake }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError
+      && error.kind === "auth"
+      && error.exitCode === 2
+      && /credentials missing/.test(error.message)
+      && /admin-reports activities list/.test(error.command),
+  );
+
+  const apiFailure = createScriptedBinary(createTempBase("grclanker-gws-ops-exit1-"), 'echo "{\\"error\\":{\\"code\\":403}}"\nexit 1');
+  await assert.rejects(
+    () => reviewGwsTokenActivity({ gwsBin: apiFailure }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError && error.kind === "api" && error.exitCode === 1,
+  );
+
+  const discoveryFailure = createScriptedBinary(createTempBase("grclanker-gws-ops-exit4-"), "exit 4");
+  await assert.rejects(
+    () => reviewGwsTokenActivity({ gwsBin: discoveryFailure }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError && error.kind === "discovery" && /non-zero exit code without additional output/.test(error.message),
+  );
+
+  await assert.rejects(
+    () => traceGwsAdminActivity({ gwsBin: join(base, "missing-gws") }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError && error.kind === "missing" && /not installed or not on PATH/.test(error.message),
+  );
+});
+
+test("verdict rule 1: a successful but non-JSON CLI response is an explicit error, while --version may be plain text", async () => {
+  const base = createTempBase("grclanker-gws-ops-nonjson-");
+  const fake = createScriptedBinary(base, 'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "Fetching discovery document..."\necho "done"');
+
+  await assert.rejects(
+    () => traceGwsAdminActivity({ gwsBin: fake }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError
+      && error.kind === "internal"
+      && /could not parse the output as structured JSON/.test(error.message),
+  );
+
+  const preview = await checkGwsCliAccess({ gwsBin: fake, dry_run: true }, defaultGwsCliRunner);
+  assert.equal(preview.version, "gws 0.22.5");
+
+  await assert.rejects(
+    () => checkGwsCliAccess({ gwsBin: fake }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError && /could not parse the output as structured JSON/.test(error.message),
+  );
+
+  const runnerFake = createFakeBinary(createTempBase("grclanker-gws-ops-nonjson-runner-"));
+  await assert.rejects(
+    () => traceGwsAdminActivity({ gwsBin: runnerFake }, createRunner({ admin: "not json at all" })),
+    (error) => error instanceof GwsCliCommandError && /could not parse the output as structured JSON/.test(error.message),
+  );
+});
+
+test("defaultGwsCliRunner parses a real JSON response and forwards the environment", async () => {
+  const base = createTempBase("grclanker-gws-ops-realjson-");
+  const fake = createScriptedBinary(
+    base,
+    'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi\necho "{\\"items\\":[{\\"id\\":{\\"time\\":\\"2030-01-01T12:00:00Z\\",\\"uniqueQualifier\\":\\"u1\\"},\\"actor\\":{\\"email\\":\\"$GOOGLE_WORKSPACE_CLI_CONFIG_DIR\\"},\\"events\\":[{\\"name\\":\\"CHANGE_APPLICATION_SETTING\\"}]}]}"',
+  );
+
+  const result = await traceGwsAdminActivity({ gwsBin: fake, configDir: "/tmp/cfg-from-arg" }, defaultGwsCliRunner, { PATH: process.env.PATH });
+  assert.equal(result.count, 1);
+  assert.equal(result.complete, true);
+  assert.equal(result.records[0].actor, "/tmp/cfg-from-arg");
+});
+
+test("investigateGwsAlerts parses alert records from documented Alert Center fields", async () => {
   const base = createTempBase("grclanker-gws-ops-alerts-");
   const fake = createFakeBinary(base);
 
   const result = await investigateGwsAlerts({ gwsBin: fake, max_results: 25 }, createRunner());
   assert.equal(result.count, 2);
+  assert.equal(result.complete, true);
+  assert.equal(result.nextPageToken, undefined);
   assert.equal(result.records[0].id, "a-1");
+  assert.equal(result.records[0].status, "NOT_STARTED");
+  assert.equal(result.records[0].severity, "HIGH");
+  assert.equal(result.records[0].actor, "secops@example.com");
+  assert.equal(result.records[1].status, "CLOSED");
   assert.match(result.command.command, /alertcenter:v1beta1 alerts list/);
+  assert.ok(result.notes.some((note) => /^Complete: the CLI response carried no nextPageToken/.test(note)));
+});
+
+test("investigateGwsAlerts explains the missing alertcenter alias when gws exits with a validation error", async () => {
+  const base = createTempBase("grclanker-gws-ops-alias-");
+  const fake = createScriptedBinary(base, "echo \"Unknown service 'alertcenter'. Known services: drive, gmail, admin-reports\" 1>&2\nexit 3");
+
+  await assert.rejects(
+    () => investigateGwsAlerts({ gwsBin: fake }, defaultGwsCliRunner),
+    (error) => error instanceof GwsCliCommandError
+      && error.kind === "validation"
+      && error.exitCode === 3
+      && /registers no alertcenter alias/.test(error.message)
+      && /gws_assess_monitoring/.test(error.message)
+      && /Unknown service 'alertcenter'/.test(error.message),
+  );
+
+  const preview = await investigateGwsAlerts({ gwsBin: fake, dry_run: true }, defaultGwsCliRunner);
+  assert.equal(preview.mode, "dry_run");
+  assert.equal(preview.complete, false);
+  assert.ok(preview.notes.some((note) => /registers no alertcenter service alias/.test(note)));
 });
 
 test("traceGwsAdminActivity normalizes activity records", async () => {
@@ -194,8 +366,48 @@ test("traceGwsAdminActivity normalizes activity records", async () => {
 
   const result = await traceGwsAdminActivity({ gwsBin: fake, lookback_days: 10 }, createRunner());
   assert.equal(result.count, 1);
+  assert.equal(result.complete, true);
   assert.equal(result.records[0].actor, "admin@example.com");
+  assert.equal(result.records[0].detail, "203.0.113.1");
   assert.equal(result.records[0].eventNames[0], "CHANGE_APPLICATION_SETTING");
+});
+
+test("verdict rule 7: a response carrying nextPageToken is recorded as a partial view", async () => {
+  const base = createTempBase("grclanker-gws-ops-truncated-");
+  const fake = createFakeBinary(base);
+
+  const admin = await traceGwsAdminActivity({ gwsBin: fake }, createRunner({ admin: adminPayload({ nextPageToken: "CAoQ1" }) }));
+  assert.equal(admin.count, 1);
+  assert.equal(admin.complete, false);
+  assert.equal(admin.nextPageToken, "CAoQ1");
+  assert.ok(admin.notes.some((note) => /^Partial view: the CLI response carried a nextPageToken after 1 record\(s\)/.test(note)));
+
+  const alerts = await investigateGwsAlerts({ gwsBin: fake }, createRunner({ alerts: alertsPayload({ nextPageToken: "next-alerts" }) }));
+  assert.equal(alerts.complete, false);
+  assert.equal(alerts.nextPageToken, "next-alerts");
+
+  const token = await reviewGwsTokenActivity({ gwsBin: fake }, createRunner({ token: tokenPayload({ nextPageToken: "tok" }) }));
+  assert.equal(token.complete, false);
+  assert.equal(token.nextPageToken, "tok");
+});
+
+test("verdict rule 7: --page-all NDJSON pages aggregate and completeness follows the last page", async () => {
+  const base = createTempBase("grclanker-gws-ops-ndjson-");
+  const fake = createFakeBinary(base);
+  const page = (qualifier, nextPageToken) => JSON.stringify({
+    items: [{ id: { time: "2030-01-01T12:00:00Z", uniqueQualifier: qualifier }, actor: { email: "admin@example.com" }, events: [{ name: "ADD_USER" }] }],
+    ...(nextPageToken ? { nextPageToken } : {}),
+  });
+
+  const complete = await traceGwsAdminActivity({ gwsBin: fake }, createRunner({ admin: `${page("p1", "t1")}\n${page("p2", "t2")}\n${page("p3")}` }));
+  assert.equal(complete.count, 3);
+  assert.equal(complete.complete, true);
+  assert.deepEqual(complete.records.map((record) => record.id), ["p1", "p2", "p3"]);
+
+  const truncated = await traceGwsAdminActivity({ gwsBin: fake }, createRunner({ admin: `${page("p1", "t1")}\n${page("p2", "t2")}` }));
+  assert.equal(truncated.count, 2);
+  assert.equal(truncated.complete, false);
+  assert.equal(truncated.nextPageToken, "t2");
 });
 
 test("reviewGwsTokenActivity highlights token telemetry without inventory cloning", async () => {
@@ -208,7 +420,7 @@ test("reviewGwsTokenActivity highlights token telemetry without inventory clonin
   assert.match(result.notes.join(" "), /not a full tenant-wide token inventory/i);
 });
 
-test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, and a zip", async () => {
+test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, completeness flags, and a zip", async () => {
   const base = createTempBase("grclanker-gws-ops-bundle-");
   const fake = createFakeBinary(base);
   const outputRoot = join(base, "export");
@@ -220,18 +432,61 @@ test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, and a zip
       max_results: 10,
       lookback_days: 7,
     },
-    createRunner(),
+    createRunner({ token: tokenPayload({ nextPageToken: "more-tokens" }) }),
   );
 
   assert.ok("outputDir" in result);
+  assert.equal(basename(result.outputDir), "gws-operator-evidence");
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
   assert.equal(result.commandCount, 3);
   assert.equal(result.recordCount, 4);
+  assert.deepEqual(result.categories, { alerts: 2, admin_activity: 1, token_activity: 1 });
   assert.equal(existsSync(join(result.outputDir, "README.md")), true);
   assert.equal(existsSync(join(result.outputDir, "summary.md")), true);
   assert.equal(existsSync(join(result.outputDir, "analysis", "alerts.json")), true);
   assert.equal(existsSync(join(result.outputDir, "raw", "token_activity.json")), true);
   assert.equal(existsSync(result.zipPath), true);
   assert.match(readFileSync(join(result.outputDir, "commands.json"), "utf8"), /admin-reports/);
+
+  const tokenAnalysis = JSON.parse(readFileSync(join(result.outputDir, "analysis", "token_activity.json"), "utf8"));
+  assert.equal(tokenAnalysis.complete, false);
+  assert.equal(tokenAnalysis.nextPageToken, "more-tokens");
+  const adminAnalysis = JSON.parse(readFileSync(join(result.outputDir, "analysis", "admin_activity.json"), "utf8"));
+  assert.equal(adminAnalysis.complete, true);
+  assert.equal(adminAnalysis.nextPageToken, null);
+  const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
+  assert.match(summary, /Complete page: no \(nextPageToken present\)/);
+  assert.match(summary, /Complete page: yes/);
+});
+
+test("verdict rule 8: re-running the evidence bundle allocates -2 and never overwrites the earlier bundle or zip", async () => {
+  const base = createTempBase("grclanker-gws-ops-rerun-");
+  const fake = createFakeBinary(base);
+  const outputRoot = join(base, "export");
+
+  const first = await collectGwsOperatorEvidenceBundle({ gwsBin: fake, output_dir: outputRoot }, createRunner());
+  const firstZip = readFileSync(first.zipPath);
+  const second = await collectGwsOperatorEvidenceBundle({ gwsBin: fake, output_dir: outputRoot }, createRunner());
+  const third = await collectGwsOperatorEvidenceBundle({ gwsBin: fake, output_dir: outputRoot }, createRunner());
+
+  assert.equal(basename(second.outputDir), "gws-operator-evidence-2");
+  assert.equal(basename(third.outputDir), "gws-operator-evidence-3");
+  assert.equal(second.zipPath, `${second.outputDir}.zip`);
+  assert.ok(existsSync(first.zipPath));
+  assert.ok(existsSync(second.zipPath));
+  assert.ok(existsSync(third.zipPath));
+  assert.deepEqual(readFileSync(first.zipPath), firstZip);
+  assert.deepEqual(
+    readdirSync(outputRoot).sort(),
+    [
+      "gws-operator-evidence",
+      "gws-operator-evidence-2",
+      "gws-operator-evidence-2.zip",
+      "gws-operator-evidence-3",
+      "gws-operator-evidence-3.zip",
+      "gws-operator-evidence.zip",
+    ],
+  );
 });
 
 test("collectGwsOperatorEvidenceBundle previews commands in dry-run mode", async () => {

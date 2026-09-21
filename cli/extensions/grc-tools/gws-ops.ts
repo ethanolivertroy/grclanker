@@ -186,21 +186,25 @@ function buildCommandString(executable: string, args: string[]): string {
   return [executable, ...args].map(shellEscape).join(" ");
 }
 
+/**
+ * A single invocation prints one JSON document; `--page-all` prints one JSON
+ * object per line (NDJSON, per the README pagination table). Try the whole
+ * document first, then fall back to line-wise parsing.
+ */
 function parseStructuredOutput(stdout: string): unknown {
   const trimmed = stdout.trim();
   if (!trimmed) return undefined;
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+  try {
     return JSON.parse(trimmed) as unknown;
+  } catch (documentError) {
+    const lines = trimmed
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length < 2) throw documentError;
+    const parsed = lines.map((line) => JSON.parse(line) as unknown);
+    return parsed;
   }
-
-  const lines = trimmed
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length === 0) return undefined;
-
-  const parsed = lines.map((line) => JSON.parse(line) as unknown);
-  return parsed.length === 1 ? parsed[0] : parsed;
 }
 
 function mapExitCodeToKind(exitCode: number): GwsCliErrorKind {
@@ -552,20 +556,34 @@ function completenessNote(nextPageToken: string | undefined, count: number): str
     : `Complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query.`;
 }
 
+/**
+ * Alert fields per the Alert Center Alert resource
+ * (https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts):
+ * alertId, createTime, updateTime, type, source, and metadata.{status,severity,assignee}.
+ */
 function normalizeAlertRecords(parsed: unknown): GwsOpsActivityRecord[] {
-  return recordsFromObject(parsed, ["alerts", "items"]).map((alert) => ({
-    id: asString(alert.alertId) ?? asString(alert.name),
-    timestamp: asString(alert.createTime) ?? asString(alert.updateTime),
-    detail: asString(alert.type) ?? asString(alert.alertSubtype),
-    severity: asString(alert.severity),
-    status: asString(alert.state) ?? asString(alert.status),
-    source: asString(alert.source),
-    actor: asString(asRecord(alert.metadata).assignee) ?? asString(asRecord(alert.assignee).email),
-    application: "alertcenter",
-    eventNames: asString(alert.type) ? [alert.type as string] : [],
-  }));
+  return recordsFromObject(parsed, ["alerts"]).map((alert) => {
+    const metadata = asRecord(alert.metadata);
+    return {
+      id: asString(alert.alertId),
+      timestamp: asString(alert.createTime) ?? asString(alert.updateTime),
+      detail: asString(alert.type),
+      severity: asString(metadata.severity),
+      status: asString(metadata.status),
+      source: asString(alert.source),
+      actor: asString(metadata.assignee),
+      application: "alertcenter",
+      eventNames: asString(alert.type) ? [alert.type as string] : [],
+    };
+  });
 }
 
+/**
+ * Activity fields per the Reports API Activity resource
+ * (https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list):
+ * id.{time,uniqueQualifier}, actor.{email,callerType,applicationInfo.applicationName},
+ * events[].name, and the top-level ipAddress.
+ */
 function normalizeActivityRecords(parsed: unknown, applicationName: "admin" | "token"): GwsOpsActivityRecord[] {
   return recordsFromObject(parsed, ["items"]).map((item) => {
     const id = asRecord(item.id);
@@ -578,7 +596,7 @@ function normalizeActivityRecords(parsed: unknown, applicationName: "admin" | "t
       actor: asString(actor.email) ?? asString(actor.callerType),
       application: asString(applicationInfo.applicationName) ?? applicationName,
       eventNames: events,
-      detail: asString(actor.ipAddress),
+      detail: asString(item.ipAddress),
     };
   });
 }
@@ -836,7 +854,7 @@ export async function investigateGwsAlerts(
     throw explainAlertCenterFailure(error);
   }
   const records = normalizeAlertRecords(execution.parsed);
-  const nextPageToken = trailingPageToken(execution.parsed, ["alerts", "items"]);
+  const nextPageToken = trailingPageToken(execution.parsed, ["alerts"]);
   const allNotes = [
     ...notes,
     completenessNote(nextPageToken, records.length),
@@ -1069,6 +1087,8 @@ function renderActivityToolResult(result: GwsOpsActivityResult) {
     category: result.category,
     mode: result.mode,
     count: result.count,
+    complete: result.complete,
+    next_page_token: result.nextPageToken ?? null,
     command: result.command.command,
     records: result.records ?? [],
     notes: result.notes,
