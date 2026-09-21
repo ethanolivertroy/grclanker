@@ -23,10 +23,34 @@ import {
 } from "@aws-sdk/client-config-service";
 import { fromIni } from "@aws-sdk/credential-providers";
 import {
+  DescribeRegionsCommand,
+  EC2Client,
+  GetEbsEncryptionByDefaultCommand,
+} from "@aws-sdk/client-ec2";
+import {
   GuardDutyClient,
   GetDetectorCommand,
   ListDetectorsCommand,
 } from "@aws-sdk/client-guardduty";
+import {
+  DescribeKeyCommand,
+  GetKeyRotationStatusCommand,
+  KMSClient,
+  ListKeysCommand,
+} from "@aws-sdk/client-kms";
+import { DescribeDBInstancesCommand, RDSClient } from "@aws-sdk/client-rds";
+import {
+  GetBucketEncryptionCommand,
+  GetBucketPolicyCommand,
+  GetBucketPolicyStatusCommand,
+  GetPublicAccessBlockCommand,
+  ListBucketsCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import {
+  GetPublicAccessBlockCommand as GetAccountPublicAccessBlockCommand,
+  S3ControlClient,
+} from "@aws-sdk/client-s3-control";
 import {
   GetAccountAuthorizationDetailsCommand,
   GetAccountPasswordPolicyCommand,
@@ -73,6 +97,139 @@ const DEFAULT_ROLE_LIMIT = 500;
 const DEFAULT_STALE_DAYS = 90;
 const DEFAULT_MAX_PRIVILEGED_ROLES = 5;
 const DEFAULT_MAX_FINDINGS = 200;
+const DEFAULT_REGION_LIMIT = 30;
+const DEFAULT_BUCKET_LIMIT = 1000;
+const DEFAULT_KEY_LIMIT = 1000;
+const DEFAULT_INSTANCE_LIMIT = 500;
+const DEFAULT_CONCURRENCY = 8;
+const REQUIRED_PUBLIC_ACCESS_FLAGS = [
+  "BlockPublicAcls",
+  "IgnorePublicAcls",
+  "BlockPublicPolicy",
+  "RestrictPublicBuckets",
+] as const;
+
+export type AwsFrameworkKey =
+  | "fedramp"
+  | "cmmc"
+  | "soc2"
+  | "cis"
+  | "pci_dss"
+  | "disa_stig"
+  | "irap"
+  | "ismap";
+
+export interface AwsFrameworkDescriptor {
+  key: AwsFrameworkKey;
+  label: string;
+  file: string;
+}
+
+/** Framework labels double as mapping prefixes, matching the existing "CIS AWS 1.4" style. */
+export const AWS_FRAMEWORKS: ReadonlyArray<AwsFrameworkDescriptor> = [
+  { key: "fedramp", label: "FedRAMP", file: "fedramp" },
+  { key: "cmmc", label: "CMMC", file: "cmmc" },
+  { key: "soc2", label: "SOC 2", file: "soc2" },
+  { key: "cis", label: "CIS AWS", file: "cis" },
+  { key: "pci_dss", label: "PCI-DSS", file: "pci-dss" },
+  { key: "disa_stig", label: "DISA STIG", file: "disa-stig" },
+  { key: "irap", label: "IRAP", file: "irap" },
+  { key: "ismap", label: "ISMAP", file: "ismap" },
+];
+
+export interface AwsControlDescriptor {
+  title: string;
+  frameworks: Record<AwsFrameworkKey, string[]>;
+}
+
+function control(
+  title: string,
+  fedramp: string[],
+  cmmc: string[],
+  soc2: string[],
+  cis: string[],
+  pciDss: string[],
+  disaStig: string[],
+  irap: string[],
+  ismap: string[],
+): AwsControlDescriptor {
+  return {
+    title,
+    frameworks: { fedramp, cmmc, soc2, cis, pci_dss: pciDss, disa_stig: disaStig, irap, ismap },
+  };
+}
+
+/** Section 5 of specs/aws-sec-inspector.spec.md, one row per numbered control. */
+export const AWS_CONTROL_CATALOG: Record<number, AwsControlDescriptor> = {
+  1: control("MFA Enforcement", ["IA-2(1)", "IA-2(2)"], ["AC.L2-3.1.1"], ["CC6.1", "CC6.6"], ["1.5", "1.6", "1.10"], ["8.4.2"], ["SRG-APP-000149"], ["ISM-1401"], ["7.2.1"]),
+  2: control("Password Policy", ["IA-5(1)"], ["IA.L2-3.5.7"], ["CC6.1"], ["1.8", "1.9"], ["8.3.6"], ["SRG-APP-000166"], ["ISM-0421"], ["7.2.2"]),
+  3: control("Access Key Rotation", ["IA-5(1)"], ["IA.L2-3.5.8"], ["CC6.1", "CC6.2"], ["1.12", "1.14"], ["8.6.3"], ["SRG-APP-000175"], ["ISM-1590"], ["7.2.3"]),
+  4: control("Root Account Usage", ["AC-6(1)", "AC-6(5)"], ["AC.L2-3.1.5"], ["CC6.1", "CC6.3"], ["1.4", "1.7"], ["8.6.1"], ["SRG-APP-000340"], ["ISM-1507"], ["7.1.1"]),
+  5: control("Unused Credentials", ["AC-2(3)"], ["AC.L2-3.1.12"], ["CC6.2"], ["1.12"], ["8.1.4"], ["SRG-APP-000163"], ["ISM-1404"], ["7.2.4"]),
+  6: control("CloudTrail Enabled", ["AU-2", "AU-3", "AU-12"], ["AU.L2-3.3.1"], ["CC7.2", "CC7.3"], ["3.1", "3.2"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.1"]),
+  7: control("CloudTrail Log Integrity", ["AU-9", "AU-10"], ["AU.L2-3.3.8"], ["CC7.2"], ["3.4", "3.7"], ["10.3.2"], ["SRG-APP-000125"], ["ISM-0859"], ["8.1.2"]),
+  8: control("Security Hub Enabled", ["CA-7", "SI-4"], ["CA.L2-3.12.3"], ["CC7.1", "CC7.2"], [], ["11.5.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.1"]),
+  9: control("GuardDuty Enabled", ["SI-4", "IR-4"], ["SI.L2-3.14.6"], ["CC7.2", "CC7.3"], [], ["11.5.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.2"]),
+  10: control("Config Enabled", ["CM-2", "CM-6", "CM-8"], ["CM.L2-3.4.1"], ["CC7.1"], ["3.5"], ["10.2.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.3"]),
+  11: control("S3 Public Access", ["AC-3", "AC-4"], ["AC.L2-3.1.3"], ["CC6.1", "CC6.6"], ["2.1.4"], ["1.3.1"], ["SRG-APP-000516"], ["ISM-0263"], ["6.1.1"]),
+  12: control("Encryption at Rest", ["SC-28"], ["SC.L2-3.13.16"], ["CC6.1", "CC6.7"], ["2.2.1"], ["3.4.1"], ["SRG-APP-000231"], ["ISM-0457"], ["6.2.1"]),
+  13: control("Encryption in Transit", ["SC-8", "SC-23"], ["SC.L2-3.13.8"], ["CC6.1", "CC6.7"], [], ["4.1.1"], ["SRG-APP-000014"], ["ISM-0469"], ["6.2.2"]),
+  14: control("VPC Flow Logs", ["AU-12", "SI-4"], ["AU.L2-3.3.1"], ["CC7.2"], ["3.9"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.3"]),
+  15: control("Cross-Account Access", ["AC-3", "AC-6"], ["AC.L2-3.1.2"], ["CC6.1", "CC6.3"], ["1.16"], ["7.2.1"], ["SRG-APP-000033"], ["ISM-1380"], ["7.1.2"]),
+  16: control("SCP Enforcement", ["AC-3", "CM-7"], ["AC.L2-3.1.7"], ["CC6.1", "CC6.8"], [], ["7.2.1"], ["SRG-APP-000246"], ["ISM-1380"], ["7.1.3"]),
+  17: control("Permission Boundaries", ["AC-6(1)", "AC-6(2)"], ["AC.L2-3.1.5"], ["CC6.3"], [], ["7.2.2"], ["SRG-APP-000340"], ["ISM-1380"], ["7.1.4"]),
+  18: control("Least Privilege", ["AC-6"], ["AC.L2-3.1.5"], ["CC6.1", "CC6.3"], ["1.16"], ["7.2.2"], ["SRG-APP-000342"], ["ISM-1380"], ["7.1.5"]),
+  19: control("Logging Configuration", ["AU-2", "AU-3", "AU-6"], ["AU.L2-3.3.1"], ["CC7.2", "CC7.3"], ["3.1", "3.3", "3.5"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.4"]),
+  20: control("Network ACLs", ["AC-4", "SC-7"], ["SC.L2-3.13.1"], ["CC6.1", "CC6.6"], ["5.1"], ["1.3.1"], ["SRG-APP-000142"], ["ISM-1416"], ["6.1.2"]),
+  21: control("Security Group Rules", ["AC-4", "SC-7"], ["SC.L2-3.13.1"], ["CC6.1", "CC6.6"], ["5.2", "5.3"], ["1.3.2"], ["SRG-APP-000142"], ["ISM-1416"], ["6.1.3"]),
+  22: control("KMS Key Rotation", ["SC-12", "SC-28"], ["SC.L2-3.13.10"], ["CC6.1", "CC6.7"], ["3.8"], ["3.6.4"], ["SRG-APP-000231"], ["ISM-0457"], ["6.2.3"]),
+  23: control("Identity Center Configuration", ["AC-2", "IA-2"], ["AC.L2-3.1.1"], ["CC6.1", "CC6.2"], [], ["8.4.2"], ["SRG-APP-000149"], ["ISM-1401"], ["7.2.5"]),
+  24: control("Audit Manager Evidence", ["CA-2", "CA-7"], ["CA.L2-3.12.1"], ["CC4.1"], [], ["12.4.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.3.1"]),
+  25: control("Account Contacts", ["IR-6", "PM-2"], ["IR.L2-3.6.2"], ["CC7.4"], ["1.1", "1.2"], ["12.10.5"], ["SRG-APP-000516"], ["ISM-0072"], ["9.1.1"]),
+};
+
+/** Spec control numbers covered by each finding id, used for coverage and framework reports. */
+export const AWS_FINDING_CONTROLS: Record<string, number[]> = {
+  "AWS-IAM-01": [1, 4],
+  "AWS-IAM-02": [1],
+  "AWS-IAM-03": [2],
+  "AWS-IAM-04": [3],
+  "AWS-IAM-05": [17],
+  "AWS-IAM-06": [5],
+  "AWS-IAM-07": [4],
+  "AWS-IAM-08": [18],
+  "AWS-LOG-01": [6, 7],
+  "AWS-LOG-02": [19],
+  "AWS-LOG-03": [8],
+  "AWS-LOG-04": [9],
+  "AWS-LOG-05": [10],
+  "AWS-ORG-01": [16],
+  "AWS-ORG-02": [16],
+  "AWS-ORG-03": [15],
+  "AWS-ORG-04": [15],
+  "AWS-ORG-05": [23],
+  "AWS-ORG-06": [24],
+  "AWS-ORG-07": [25],
+  "AWS-DATA-11": [11],
+  "AWS-DATA-12": [12],
+  "AWS-DATA-13": [13],
+  "AWS-DATA-22": [22],
+  "AWS-NET-14": [14],
+  "AWS-NET-20": [20],
+  "AWS-NET-21": [21],
+};
+
+export function buildAwsMappings(controlNumber: number): string[] {
+  const descriptor = AWS_CONTROL_CATALOG[controlNumber];
+  if (!descriptor) return [];
+  const mappings: string[] = [];
+  for (const framework of AWS_FRAMEWORKS) {
+    for (const reference of descriptor.frameworks[framework.key]) {
+      mappings.push(`${framework.label} ${reference}`);
+    }
+  }
+  return mappings;
+}
 
 export interface AwsResolvedConfig {
   region: string;
@@ -102,7 +259,7 @@ export interface AwsFinding {
   id: string;
   title: string;
   severity: "critical" | "high" | "medium" | "low" | "info";
-  status: "pass" | "warn" | "fail";
+  status: "pass" | "warn" | "fail" | "manual";
   summary: string;
   evidence?: JsonRecord;
   mappings: string[];
@@ -112,6 +269,28 @@ export interface AwsAssessmentResult {
   title: string;
   summary: JsonRecord;
   findings: AwsFinding[];
+  errors?: string[];
+}
+
+/** Outcome of one API read; a denied or errored surface never contributes to a pass. */
+export interface AwsSurfaceResult<T> {
+  value?: T;
+  error?: string;
+  denied?: boolean;
+}
+
+export interface AwsRegionScope {
+  regions: string[];
+  regionsTotal: number;
+  regionsSeen: number;
+  partial: boolean;
+  source: "arguments" | "describe-regions" | "configured-region-fallback";
+  error?: string;
+}
+
+export interface AwsPagedList<T> {
+  items: T[];
+  truncated: boolean;
 }
 
 export interface AwsAuditBundleResult {
@@ -214,6 +393,157 @@ function finding(
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function errorCode(error: unknown): string {
+  const object = asObject(error);
+  return asString(object?.name) ?? asString(object?.Code) ?? asString(object?.code) ?? "";
+}
+
+function errorHttpStatus(error: unknown): number | undefined {
+  const metadata = asObject(asObject(error)?.$metadata);
+  return asNumber(metadata?.httpStatusCode);
+}
+
+export function isAwsAccessDenied(error: unknown): boolean {
+  const code = errorCode(error);
+  if (/AccessDenied|Unauthorized|Forbidden|AuthorizationError|NotAuthorized|AuthFailure|InvalidClientTokenId|ExpiredToken/i.test(code)) {
+    return true;
+  }
+  return errorHttpStatus(error) === 403;
+}
+
+function isErrorCode(error: unknown, ...codes: string[]): boolean {
+  const code = errorCode(error);
+  return codes.some((candidate) => candidate === code);
+}
+
+function describeError(error: unknown): string {
+  const code = errorCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return code && !message.startsWith(code) ? `${code}: ${message}` : message;
+}
+
+/** Run one read and classify the outcome instead of throwing. */
+export async function attemptAwsRead<T>(
+  label: string,
+  loader: () => Promise<T>,
+  errors: string[],
+): Promise<AwsSurfaceResult<T>> {
+  try {
+    return { value: await loader() };
+  } catch (error) {
+    const denied = isAwsAccessDenied(error);
+    const message = `${label}: ${denied ? "AccessDenied" : "error"} (${describeError(error)})`;
+    errors.push(message);
+    return { error: message, denied };
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function parseRegionList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const regions = value.map(asString).filter((item): item is string => Boolean(item));
+    return regions.length > 0 ? regions : undefined;
+  }
+  const text = asString(value);
+  if (!text) return undefined;
+  const regions = text.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+  return regions.length > 0 ? [...new Set(regions)] : undefined;
+}
+
+function boolFlag(record: JsonRecord | undefined, key: string): boolean | undefined {
+  const value = record?.[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function publicAccessFlags(configuration: JsonRecord | undefined): Record<string, boolean | undefined> {
+  const flags: Record<string, boolean | undefined> = {};
+  for (const key of REQUIRED_PUBLIC_ACCESS_FLAGS) {
+    flags[key] = boolFlag(configuration, key);
+  }
+  return flags;
+}
+
+function allPublicAccessFlagsTrue(flags: Record<string, boolean | undefined>): boolean {
+  return REQUIRED_PUBLIC_ACCESS_FLAGS.every((key) => flags[key] === true);
+}
+
+function conditionValues(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).toLowerCase());
+  if (value === undefined || value === null) return [];
+  return [String(value).toLowerCase()];
+}
+
+/** True when a statement denies requests where aws:SecureTransport is false (TLS-only bucket policy). */
+export function statementDeniesInsecureTransport(statement: JsonRecord): boolean {
+  if (asString(statement.Effect)?.toLowerCase() !== "deny") return false;
+  const condition = asObject(statement.Condition);
+  if (!condition) return false;
+  for (const [operator, operands] of Object.entries(condition)) {
+    if (!/^bool(ifexists)?$/i.test(operator)) continue;
+    const operandRecord = asObject(operands);
+    if (!operandRecord) continue;
+    for (const [key, value] of Object.entries(operandRecord)) {
+      if (key.toLowerCase() === "aws:securetransport" && conditionValues(value).includes("false")) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function resolveRegionScope(
+  requested: string[] | undefined,
+  described: AwsSurfaceResult<string[]>,
+  fallbackRegion: string,
+  regionLimit: number,
+): AwsRegionScope {
+  if (requested && requested.length > 0) {
+    const regions = requested.slice(0, regionLimit);
+    return {
+      regions,
+      regionsTotal: requested.length,
+      regionsSeen: regions.length,
+      partial: regions.length < requested.length,
+      source: "arguments",
+    };
+  }
+  if (described.value && described.value.length > 0) {
+    const regions = described.value.slice(0, regionLimit);
+    return {
+      regions,
+      regionsTotal: described.value.length,
+      regionsSeen: regions.length,
+      partial: regions.length < described.value.length,
+      source: "describe-regions",
+    };
+  }
+  return {
+    regions: [fallbackRegion],
+    regionsTotal: 1,
+    regionsSeen: 1,
+    partial: true,
+    source: "configured-region-fallback",
+    error: described.error ?? "DescribeRegions returned no enabled regions",
+  };
 }
 
 function safeDirName(value: string): string {
@@ -406,6 +736,12 @@ export class AwsAuditorClient {
   private readonly organizations: OrganizationsClient;
   private readonly accessAnalyzer: AccessAnalyzerClient;
   private readonly ssoAdmin: SSOAdminClient;
+  private readonly s3: S3Client;
+  private readonly s3Control: S3ControlClient;
+  private readonly credentials: ReturnType<typeof fromIni> | undefined;
+  private readonly ec2Clients = new Map<string, EC2Client>();
+  private readonly rdsClients = new Map<string, RDSClient>();
+  private readonly kmsClients = new Map<string, KMSClient>();
   private readonly now: () => Date;
 
   constructor(
@@ -414,6 +750,7 @@ export class AwsAuditorClient {
   ) {
     const credentials = config.profile ? fromIni({ profile: config.profile }) : undefined;
     const clientConfig = { region: config.region, credentials };
+    this.credentials = credentials;
     this.sts = new STSClient(clientConfig);
     this.iam = new IAMClient(clientConfig);
     this.cloudTrail = new CloudTrailClient(clientConfig);
@@ -423,7 +760,203 @@ export class AwsAuditorClient {
     this.organizations = new OrganizationsClient(clientConfig);
     this.accessAnalyzer = new AccessAnalyzerClient(clientConfig);
     this.ssoAdmin = new SSOAdminClient(clientConfig);
+    this.s3 = new S3Client({ ...clientConfig, followRegionRedirects: true });
+    this.s3Control = new S3ControlClient(clientConfig);
     this.now = options.now ?? (() => new Date());
+  }
+
+  private ec2For(region: string): EC2Client {
+    let client = this.ec2Clients.get(region);
+    if (!client) {
+      client = new EC2Client({ region, credentials: this.credentials });
+      this.ec2Clients.set(region, client);
+    }
+    return client;
+  }
+
+  private rdsFor(region: string): RDSClient {
+    let client = this.rdsClients.get(region);
+    if (!client) {
+      client = new RDSClient({ region, credentials: this.credentials });
+      this.rdsClients.set(region, client);
+    }
+    return client;
+  }
+
+  private kmsFor(region: string): KMSClient {
+    let client = this.kmsClients.get(region);
+    if (!client) {
+      client = new KMSClient({ region, credentials: this.credentials });
+      this.kmsClients.set(region, client);
+    }
+    return client;
+  }
+
+  /** Enabled regions via EC2 DescribeRegions (opt-in-status opted-in or opt-in-not-required). */
+  async describeRegions(): Promise<string[]> {
+    const result = await this.ec2For(this.config.region).send(new DescribeRegionsCommand({
+      Filters: [{ Name: "opt-in-status", Values: ["opt-in-not-required", "opted-in"] }],
+    }));
+    return (result.Regions ?? [])
+      .map((region) => asString(region.RegionName))
+      .filter((name): name is string => Boolean(name))
+      .sort();
+  }
+
+  /** S3 Control GetPublicAccessBlock; null when NoSuchPublicAccessBlockConfiguration. */
+  async getAccountPublicAccessBlock(accountId: string): Promise<JsonRecord | null> {
+    try {
+      const result = await this.s3Control.send(new GetAccountPublicAccessBlockCommand({ AccountId: accountId }));
+      return asObject(result.PublicAccessBlockConfiguration) ?? {};
+    } catch (error) {
+      if (isErrorCode(error, "NoSuchPublicAccessBlockConfiguration")) return null;
+      throw error;
+    }
+  }
+
+  async listBuckets(limit = DEFAULT_BUCKET_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const buckets: JsonRecord[] = [];
+    let continuationToken: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.s3.send(new ListBucketsCommand({
+        ContinuationToken: continuationToken,
+        MaxBuckets: Math.min(1000, Math.max(1, limit - buckets.length + 1)),
+      }));
+      for (const bucket of result.Buckets ?? []) {
+        buckets.push({ Name: bucket.Name, CreationDate: bucket.CreationDate, BucketRegion: bucket.BucketRegion });
+      }
+      continuationToken = result.ContinuationToken;
+      if (buckets.length > limit) {
+        truncated = true;
+        buckets.length = limit;
+        break;
+      }
+    } while (continuationToken);
+    return { items: buckets, truncated };
+  }
+
+  /** S3 GetPublicAccessBlock for one bucket; null when NoSuchPublicAccessBlockConfiguration. */
+  async getBucketPublicAccessBlock(bucket: string): Promise<JsonRecord | null> {
+    try {
+      const result = await this.s3.send(new GetPublicAccessBlockCommand({ Bucket: bucket }));
+      return asObject(result.PublicAccessBlockConfiguration) ?? {};
+    } catch (error) {
+      if (isErrorCode(error, "NoSuchPublicAccessBlockConfiguration")) return null;
+      throw error;
+    }
+  }
+
+  /** S3 GetBucketPolicyStatus; null when the bucket has no policy (NoSuchBucketPolicy). */
+  async getBucketPolicyStatus(bucket: string): Promise<JsonRecord | null> {
+    try {
+      const result = await this.s3.send(new GetBucketPolicyStatusCommand({ Bucket: bucket }));
+      return { IsPublic: result.PolicyStatus?.IsPublic };
+    } catch (error) {
+      if (isErrorCode(error, "NoSuchBucketPolicy")) return null;
+      throw error;
+    }
+  }
+
+  /** S3 GetBucketEncryption; null when ServerSideEncryptionConfigurationNotFoundError. */
+  async getBucketEncryption(bucket: string): Promise<JsonRecord | null> {
+    try {
+      const result = await this.s3.send(new GetBucketEncryptionCommand({ Bucket: bucket }));
+      return {
+        Rules: (result.ServerSideEncryptionConfiguration?.Rules ?? []).map((rule) => ({
+          SSEAlgorithm: rule.ApplyServerSideEncryptionByDefault?.SSEAlgorithm,
+          KMSMasterKeyID: rule.ApplyServerSideEncryptionByDefault?.KMSMasterKeyID,
+          BucketKeyEnabled: rule.BucketKeyEnabled,
+        })),
+      };
+    } catch (error) {
+      if (isErrorCode(error, "ServerSideEncryptionConfigurationNotFoundError")) return null;
+      throw error;
+    }
+  }
+
+  /** S3 GetBucketPolicy document; null when NoSuchBucketPolicy. */
+  async getBucketPolicy(bucket: string): Promise<string | null> {
+    try {
+      const result = await this.s3.send(new GetBucketPolicyCommand({ Bucket: bucket }));
+      return result.Policy ?? null;
+    } catch (error) {
+      if (isErrorCode(error, "NoSuchBucketPolicy")) return null;
+      throw error;
+    }
+  }
+
+  async getEbsEncryptionByDefault(region: string): Promise<JsonRecord> {
+    const result = await this.ec2For(region).send(new GetEbsEncryptionByDefaultCommand({}));
+    return { EbsEncryptionByDefault: result.EbsEncryptionByDefault, SseType: result.SseType };
+  }
+
+  async describeDbInstances(region: string, limit = DEFAULT_INSTANCE_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const instances: JsonRecord[] = [];
+    let marker: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.rdsFor(region).send(new DescribeDBInstancesCommand({ Marker: marker, MaxRecords: 100 }));
+      for (const instance of result.DBInstances ?? []) {
+        instances.push({
+          DBInstanceIdentifier: instance.DBInstanceIdentifier,
+          DBInstanceArn: instance.DBInstanceArn,
+          Engine: instance.Engine,
+          StorageEncrypted: instance.StorageEncrypted,
+          KmsKeyId: instance.KmsKeyId,
+        });
+      }
+      marker = result.Marker;
+      if (instances.length > limit) {
+        truncated = true;
+        instances.length = limit;
+        break;
+      }
+    } while (marker);
+    return { items: instances, truncated };
+  }
+
+  async listKmsKeys(region: string, limit = DEFAULT_KEY_LIMIT): Promise<AwsPagedList<JsonRecord>> {
+    const keys: JsonRecord[] = [];
+    let marker: string | undefined;
+    let truncated = false;
+    do {
+      const result = await this.kmsFor(region).send(new ListKeysCommand({ Marker: marker, Limit: 1000 }));
+      for (const key of result.Keys ?? []) {
+        keys.push({ KeyId: key.KeyId, KeyArn: key.KeyArn });
+      }
+      marker = result.Truncated ? result.NextMarker : undefined;
+      if (keys.length > limit) {
+        truncated = true;
+        keys.length = limit;
+        break;
+      }
+    } while (marker);
+    return { items: keys, truncated };
+  }
+
+  async describeKmsKey(region: string, keyId: string): Promise<JsonRecord> {
+    const result = await this.kmsFor(region).send(new DescribeKeyCommand({ KeyId: keyId }));
+    const metadata = result.KeyMetadata;
+    return {
+      KeyId: metadata?.KeyId,
+      Arn: metadata?.Arn,
+      KeyManager: metadata?.KeyManager,
+      KeyState: metadata?.KeyState,
+      KeySpec: metadata?.KeySpec,
+      KeyUsage: metadata?.KeyUsage,
+      Origin: metadata?.Origin,
+      MultiRegion: metadata?.MultiRegion,
+    };
+  }
+
+  async getKeyRotationStatus(region: string, keyId: string): Promise<JsonRecord> {
+    const result = await this.kmsFor(region).send(new GetKeyRotationStatusCommand({ KeyId: keyId }));
+    return {
+      KeyRotationEnabled: result.KeyRotationEnabled,
+      RotationPeriodInDays: result.RotationPeriodInDays,
+      NextRotationDate: result.NextRotationDate,
+    };
   }
 
   getNow(): Date {
@@ -1210,6 +1743,403 @@ export async function assessAwsOrgGuardrails(
   };
 }
 
+export interface AwsScopeOptions {
+  regions?: string[];
+  regionLimit?: number;
+}
+
+export interface AwsDataProtectionOptions extends AwsScopeOptions {
+  bucketLimit?: number;
+  keyLimit?: number;
+  instanceLimit?: number;
+}
+
+export type AwsDataProtectionClient = Pick<
+  AwsAuditorClient,
+  | "getResolvedConfig"
+  | "getCallerIdentity"
+  | "describeRegions"
+  | "getAccountPublicAccessBlock"
+  | "listBuckets"
+  | "getBucketPublicAccessBlock"
+  | "getBucketPolicyStatus"
+  | "getBucketEncryption"
+  | "getBucketPolicy"
+  | "getEbsEncryptionByDefault"
+  | "describeDbInstances"
+  | "listKmsKeys"
+  | "describeKmsKey"
+  | "getKeyRotationStatus"
+>;
+
+async function resolveAssessmentScope(
+  client: Pick<AwsAuditorClient, "getResolvedConfig" | "describeRegions">,
+  options: AwsScopeOptions,
+  errors: string[],
+): Promise<AwsRegionScope> {
+  const regionLimit = clampNumber(options.regionLimit, DEFAULT_REGION_LIMIT, 1, 100);
+  const requested = options.regions && options.regions.length > 0 ? options.regions : undefined;
+  const described: AwsSurfaceResult<string[]> = requested
+    ? {}
+    : await attemptAwsRead("ec2:DescribeRegions", () => client.describeRegions(), errors);
+  const scope = resolveRegionScope(requested, described, client.getResolvedConfig().region, regionLimit);
+  if (scope.source === "configured-region-fallback") {
+    errors.push(`Region scope fell back to ${scope.regions[0]} only: ${scope.error}`);
+  } else if (scope.partial) {
+    errors.push(`Region scope truncated to ${scope.regionsSeen} of ${scope.regionsTotal} regions by region_limit.`);
+  }
+  return scope;
+}
+
+function scopeEvidence(scope: AwsRegionScope): JsonRecord {
+  return {
+    regions_seen: scope.regionsSeen,
+    regions_total: scope.regionsTotal,
+    regions: scope.regions,
+    partial: scope.partial,
+    source: scope.source,
+  };
+}
+
+function withCap(status: AwsFinding["status"], summary: string, reasons: string[]): { status: AwsFinding["status"]; summary: string } {
+  if (status !== "pass" || reasons.length === 0) return { status, summary };
+  return { status: "warn", summary: `${summary} Downgraded to warn: ${reasons.join("; ")}.` };
+}
+
+function sample<T>(items: T[], limit = 25): T[] {
+  return items.slice(0, limit);
+}
+
+export async function assessAwsDataProtection(
+  client: AwsDataProtectionClient,
+  options: AwsDataProtectionOptions = {},
+): Promise<AwsAssessmentResult> {
+  const errors: string[] = [];
+  const bucketLimit = clampNumber(options.bucketLimit, DEFAULT_BUCKET_LIMIT, 1, 10000);
+  const keyLimit = clampNumber(options.keyLimit, DEFAULT_KEY_LIMIT, 1, 10000);
+  const instanceLimit = clampNumber(options.instanceLimit, DEFAULT_INSTANCE_LIMIT, 1, 10000);
+  const config = client.getResolvedConfig();
+  const scope = await resolveAssessmentScope(client, options, errors);
+
+  const identity = await attemptAwsRead("sts:GetCallerIdentity", () => client.getCallerIdentity(), errors);
+  const accountId = asString(identity.value?.Account) ?? config.accountId;
+  const accountBlock: AwsSurfaceResult<JsonRecord | null> = accountId
+    ? await attemptAwsRead("s3control:GetPublicAccessBlock", () => client.getAccountPublicAccessBlock(accountId), errors)
+    : { error: "s3control:GetPublicAccessBlock: skipped because the account id could not be determined" };
+  if (!accountId) errors.push(accountBlock.error ?? "account id unknown");
+
+  const bucketList = await attemptAwsRead("s3:ListBuckets", () => client.listBuckets(bucketLimit), errors);
+  const buckets = bucketList.value?.items ?? [];
+  const bucketsTruncated = bucketList.value?.truncated === true;
+  if (bucketsTruncated) errors.push(`s3:ListBuckets: inventory truncated at bucket_limit ${bucketLimit}; verdicts cover the first ${bucketLimit} buckets only.`);
+
+  const bucketDetails = await mapWithConcurrency(buckets, DEFAULT_CONCURRENCY, async (bucket) => {
+    const name = asString(bucket.Name) ?? "";
+    const [publicAccessBlock, policyStatus, encryption, policy] = await Promise.all([
+      attemptAwsRead(`s3:GetPublicAccessBlock ${name}`, () => client.getBucketPublicAccessBlock(name), errors),
+      attemptAwsRead(`s3:GetBucketPolicyStatus ${name}`, () => client.getBucketPolicyStatus(name), errors),
+      attemptAwsRead(`s3:GetBucketEncryption ${name}`, () => client.getBucketEncryption(name), errors),
+      attemptAwsRead(`s3:GetBucketPolicy ${name}`, () => client.getBucketPolicy(name), errors),
+    ]);
+    return { name, region: asString(bucket.BucketRegion), publicAccessBlock, policyStatus, encryption, policy };
+  });
+
+  const regionResults = await mapWithConcurrency(scope.regions, 4, async (region) => {
+    const [ebs, rds, kmsKeys] = await Promise.all([
+      attemptAwsRead(`ec2:GetEbsEncryptionByDefault ${region}`, () => client.getEbsEncryptionByDefault(region), errors),
+      attemptAwsRead(`rds:DescribeDBInstances ${region}`, () => client.describeDbInstances(region, instanceLimit), errors),
+      attemptAwsRead(`kms:ListKeys ${region}`, () => client.listKmsKeys(region, keyLimit), errors),
+    ]);
+    if (rds.value?.truncated) errors.push(`rds:DescribeDBInstances ${region}: inventory truncated at instance_limit ${instanceLimit}.`);
+    if (kmsKeys.value?.truncated) errors.push(`kms:ListKeys ${region}: inventory truncated at key_limit ${keyLimit}.`);
+    const keys = await mapWithConcurrency(kmsKeys.value?.items ?? [], DEFAULT_CONCURRENCY, async (key) => {
+      const keyId = asString(key.KeyId) ?? asString(key.KeyArn) ?? "";
+      const metadata = await attemptAwsRead(`kms:DescribeKey ${region}/${keyId}`, () => client.describeKmsKey(region, keyId), errors);
+      const manager = asString(metadata.value?.KeyManager);
+      const eligible = manager === "CUSTOMER"
+        && asString(metadata.value?.KeyState) === "Enabled"
+        && asString(metadata.value?.KeySpec) === "SYMMETRIC_DEFAULT"
+        && asString(metadata.value?.Origin) === "AWS_KMS";
+      const rotation = eligible
+        ? await attemptAwsRead(`kms:GetKeyRotationStatus ${region}/${keyId}`, () => client.getKeyRotationStatus(region, keyId), errors)
+        : undefined;
+      return { region, keyId, manager, metadata, eligible, rotation };
+    });
+    return { region, ebs, rds, kmsKeys, keys };
+  });
+
+  // Control 11: S3 Block Public Access (account plus bucket).
+  const accountFlags = publicAccessFlags(accountBlock.value ?? undefined);
+  const accountConfigured = accountBlock.value !== null && accountBlock.value !== undefined;
+  const accountFull = accountConfigured && allPublicAccessFlagsTrue(accountFlags);
+  const publicAccessRows = bucketDetails.map((bucket) => {
+    const flags = publicAccessFlags(bucket.publicAccessBlock.value ?? undefined);
+    return {
+      name: bucket.name,
+      block_configured: bucket.publicAccessBlock.value !== null && bucket.publicAccessBlock.value !== undefined,
+      flags,
+      bucket_full: bucket.publicAccessBlock.value ? allPublicAccessFlagsTrue(flags) : false,
+      is_public: boolFlag(bucket.policyStatus.value ?? undefined, "IsPublic"),
+      unreadable: Boolean(bucket.publicAccessBlock.error || bucket.policyStatus.error),
+    };
+  });
+  const publicPolicyBuckets = publicAccessRows.filter((row) => row.is_public === true);
+  const uncoveredBuckets = publicAccessRows.filter((row) => !accountFull && !row.bucket_full && !row.unreadable);
+  const unreadablePublicAccessBuckets = publicAccessRows.filter((row) => row.unreadable);
+  const flagText = REQUIRED_PUBLIC_ACCESS_FLAGS.map((key) => `${key}=${accountFlags[key] ?? "unset"}`).join(", ");
+
+  let publicAccessStatus: AwsFinding["status"];
+  let publicAccessSummary: string;
+  if (accountBlock.error) {
+    publicAccessStatus = "manual";
+    publicAccessSummary = `Account-level S3 Block Public Access could not be read (${accountBlock.error}). Capture the S3 console Block Public Access settings for account ${accountId ?? "unknown"} and every bucket manually.`;
+  } else if (bucketList.error) {
+    publicAccessStatus = "manual";
+    publicAccessSummary = `Account-level flags: ${flagText}. The bucket inventory could not be read (${bucketList.error}), so bucket-level exposure is unverified.`;
+  } else if (!accountConfigured) {
+    publicAccessStatus = "fail";
+    publicAccessSummary = `Account-level S3 Block Public Access is not configured (S3 Control returned NoSuchPublicAccessBlockConfiguration); ${uncoveredBuckets.length}/${buckets.length} buckets lack a full bucket-level block and ${publicPolicyBuckets.length} have public bucket policies.`;
+  } else if (!accountFull) {
+    if (uncoveredBuckets.length > 0 || publicPolicyBuckets.length > 0) {
+      publicAccessStatus = "fail";
+      publicAccessSummary = `Account-level Block Public Access is incomplete (${flagText}); ${uncoveredBuckets.length}/${buckets.length} buckets lack a full bucket-level block and ${publicPolicyBuckets.length} have public bucket policies.`;
+    } else {
+      publicAccessStatus = "warn";
+      publicAccessSummary = `Account-level Block Public Access is incomplete (${flagText}), but all ${buckets.length} buckets block public access individually and no bucket policy is public.`;
+    }
+  } else if (publicPolicyBuckets.length > 0) {
+    publicAccessStatus = "warn";
+    publicAccessSummary = `Account-level Block Public Access is fully enabled, but ${publicPolicyBuckets.length} bucket polic${publicPolicyBuckets.length === 1 ? "y" : "ies"} still evaluate as public (restricted by RestrictPublicBuckets) and should be removed.`;
+  } else {
+    publicAccessStatus = "pass";
+    publicAccessSummary = `Account-level Block Public Access is fully enabled (${flagText}) and none of the ${buckets.length} bucket policies evaluates as public.`;
+  }
+  const publicAccessCaps: string[] = [];
+  if (unreadablePublicAccessBuckets.length > 0) publicAccessCaps.push(`${unreadablePublicAccessBuckets.length} bucket(s) could not be read`);
+  if (bucketsTruncated) publicAccessCaps.push(`bucket inventory truncated at ${bucketLimit}`);
+  const publicAccessVerdict = withCap(publicAccessStatus, publicAccessSummary, publicAccessCaps);
+
+  // Control 12: encryption at rest defaults (EBS per region, S3 per bucket, RDS per instance).
+  const ebsRows = regionResults.map((result) => ({
+    region: result.region,
+    EbsEncryptionByDefault: boolFlag(result.ebs.value, "EbsEncryptionByDefault"),
+    error: result.ebs.error,
+  }));
+  const ebsOff = ebsRows.filter((row) => row.EbsEncryptionByDefault === false);
+  const ebsUnknown = ebsRows.filter((row) => row.EbsEncryptionByDefault === undefined);
+  const rdsInstances: Array<JsonRecord & { region: string }> = regionResults.flatMap((result) =>
+    (result.rds.value?.items ?? []).map((instance) => ({ ...instance, region: result.region })),
+  );
+  const rdsUnencrypted = rdsInstances.filter((instance) => instance.StorageEncrypted === false);
+  const rdsUnknown = rdsInstances.filter((instance) => typeof instance.StorageEncrypted !== "boolean");
+  const rdsErrors = regionResults.filter((result) => result.rds.error);
+  const rdsTruncated = regionResults.filter((result) => result.rds.value?.truncated === true);
+  const bucketsWithoutSse = bucketDetails.filter((bucket) => {
+    if (bucket.encryption.error) return false;
+    const rules = Array.isArray(bucket.encryption.value?.Rules) ? bucket.encryption.value.Rules : [];
+    return bucket.encryption.value === null || rules.length === 0 || rules.every((rule) => !asString(asObject(rule)?.SSEAlgorithm));
+  });
+  const bucketEncryptionUnreadable = bucketDetails.filter((bucket) => bucket.encryption.error);
+
+  let encryptionStatus: AwsFinding["status"];
+  let encryptionSummary: string;
+  if (ebsRows.length > 0 && ebsUnknown.length === ebsRows.length) {
+    encryptionStatus = "manual";
+    encryptionSummary = `EBS default encryption could not be read in any of ${ebsRows.length} region(s) (${ebsRows[0].error ?? "flag missing"}); verify EBS, S3, and RDS encryption defaults in the console.`;
+  } else if (bucketList.error) {
+    encryptionStatus = "manual";
+    encryptionSummary = `EBS default encryption is disabled in ${ebsOff.length}/${ebsRows.length} region(s) and ${rdsUnencrypted.length}/${rdsInstances.length} RDS instances are unencrypted, but the S3 bucket inventory could not be read (${bucketList.error}).`;
+  } else if (ebsOff.length > 0 || rdsUnencrypted.length > 0 || bucketsWithoutSse.length > 0) {
+    encryptionStatus = "fail";
+    encryptionSummary = `EBS default encryption disabled in ${ebsOff.length}/${ebsRows.length} region(s); ${bucketsWithoutSse.length}/${buckets.length} buckets lack default server-side encryption; ${rdsUnencrypted.length}/${rdsInstances.length} RDS instances have StorageEncrypted=false.`;
+  } else {
+    encryptionStatus = "pass";
+    encryptionSummary = `EBS encryption by default is enabled in all ${ebsRows.length - ebsUnknown.length} readable region(s), all ${buckets.length} buckets have default server-side encryption, and all ${rdsInstances.length} RDS instances report StorageEncrypted=true. EFS is not assessed by this check.`;
+  }
+  const encryptionCaps: string[] = [];
+  if (ebsUnknown.length > 0) encryptionCaps.push(`EBS flag unreadable in ${ebsUnknown.length} region(s)`);
+  if (rdsErrors.length > 0) encryptionCaps.push(`RDS unreadable in ${rdsErrors.length} region(s)`);
+  if (rdsUnknown.length > 0) encryptionCaps.push(`${rdsUnknown.length} RDS instance(s) without a StorageEncrypted flag`);
+  if (rdsTruncated.length > 0) encryptionCaps.push(`RDS inventory truncated in ${rdsTruncated.length} region(s)`);
+  if (bucketEncryptionUnreadable.length > 0) encryptionCaps.push(`${bucketEncryptionUnreadable.length} bucket encryption configuration(s) unreadable`);
+  if (bucketsTruncated) encryptionCaps.push(`bucket inventory truncated at ${bucketLimit}`);
+  if (scope.partial) encryptionCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  const encryptionVerdict = withCap(encryptionStatus, encryptionSummary, encryptionCaps);
+
+  // Control 13: TLS-only bucket policies (aws:SecureTransport deny).
+  const transitRows = bucketDetails.map((bucket) => {
+    const statements = bucket.policy.value ? normalizeStatements(bucket.policy.value) : [];
+    return {
+      name: bucket.name,
+      has_policy: typeof bucket.policy.value === "string",
+      enforces_tls: statements.some(statementDeniesInsecureTransport),
+      unreadable: Boolean(bucket.policy.error),
+    };
+  });
+  const transitMissing = transitRows.filter((row) => !row.enforces_tls && !row.unreadable);
+  const transitUnreadable = transitRows.filter((row) => row.unreadable);
+
+  let transitStatus: AwsFinding["status"];
+  let transitSummary: string;
+  if (bucketList.error) {
+    transitStatus = "manual";
+    transitSummary = `The S3 bucket inventory could not be read (${bucketList.error}); TLS-only bucket policies and load balancer TLS policies must be verified manually.`;
+  } else if (buckets.length === 0) {
+    transitStatus = "manual";
+    transitSummary = "No S3 buckets exist to evaluate for aws:SecureTransport deny statements. Load balancer and API endpoint TLS policies are not assessed by this tool; verify them manually.";
+  } else if (transitMissing.length > 0) {
+    transitStatus = "fail";
+    transitSummary = `${transitMissing.length}/${buckets.length} buckets have no policy statement denying requests with aws:SecureTransport=false. Load balancer and API endpoint TLS policies are not assessed by this tool.`;
+  } else {
+    transitStatus = "pass";
+    transitSummary = `All ${buckets.length} buckets carry a Deny statement for aws:SecureTransport=false. Load balancer and API endpoint TLS policies are not assessed by this tool.`;
+  }
+  const transitCaps: string[] = [];
+  if (transitUnreadable.length > 0) transitCaps.push(`${transitUnreadable.length} bucket polic${transitUnreadable.length === 1 ? "y" : "ies"} unreadable`);
+  if (bucketsTruncated) transitCaps.push(`bucket inventory truncated at ${bucketLimit}`);
+  const transitVerdict = withCap(transitStatus, transitSummary, transitCaps);
+
+  // Control 22: customer-managed KMS key rotation.
+  const keyRows = regionResults.flatMap((result) => result.keys);
+  const kmsListErrors = regionResults.filter((result) => result.kmsKeys.error);
+  const kmsListsAllFailed = regionResults.length > 0 && kmsListErrors.length === regionResults.length;
+  const customerKeys = keyRows.filter((key) => key.manager === "CUSTOMER");
+  const managerUnknown = keyRows.filter((key) => key.manager === undefined);
+  const eligibleKeys = keyRows.filter((key) => key.eligible);
+  const notRotating = eligibleKeys.filter((key) => boolFlag(key.rotation?.value, "KeyRotationEnabled") === false);
+  const rotationUnknown = eligibleKeys.filter((key) => boolFlag(key.rotation?.value, "KeyRotationEnabled") === undefined);
+  const ineligibleCustomerKeys = customerKeys.filter((key) => !key.eligible);
+  const kmsTruncated = regionResults.filter((result) => result.kmsKeys.value?.truncated === true);
+
+  let kmsStatus: AwsFinding["status"];
+  let kmsSummary: string;
+  if (kmsListsAllFailed) {
+    kmsStatus = "manual";
+    kmsSummary = `KMS keys could not be listed in any of ${regionResults.length} region(s) (${kmsListErrors[0]?.kmsKeys.error ?? "unknown error"}); verify customer-managed key rotation in the KMS console.`;
+  } else if (notRotating.length > 0) {
+    kmsStatus = "fail";
+    kmsSummary = `${notRotating.length}/${eligibleKeys.length} enabled symmetric customer-managed keys have KeyRotationEnabled=false across ${scope.regionsSeen} region(s).`;
+  } else if (customerKeys.length === 0 && managerUnknown.length === 0) {
+    kmsStatus = "manual";
+    kmsSummary = `No customer-managed KMS keys (KeyManager=CUSTOMER) were found among ${keyRows.length} key(s) in ${scope.regionsSeen} region(s). Record the control as not applicable only if workloads intentionally rely on AWS-managed keys.`;
+  } else if (eligibleKeys.length === 0) {
+    kmsStatus = "warn";
+    kmsSummary = `${customerKeys.length} customer-managed key(s) exist but none is an enabled symmetric AWS_KMS-origin key, so automatic rotation cannot apply; verify manual rotation for asymmetric, HMAC, imported, or disabled keys.`;
+  } else {
+    kmsStatus = "pass";
+    kmsSummary = `All ${eligibleKeys.length} enabled symmetric customer-managed keys report KeyRotationEnabled=true across ${scope.regionsSeen} region(s); ${ineligibleCustomerKeys.length} customer key(s) are out of scope for automatic rotation.`;
+  }
+  const kmsCaps: string[] = [];
+  if (rotationUnknown.length > 0) kmsCaps.push(`${rotationUnknown.length} rotation status(es) unreadable`);
+  if (managerUnknown.length > 0) kmsCaps.push(`${managerUnknown.length} key(s) without a readable KeyManager`);
+  if (kmsListErrors.length > 0) kmsCaps.push(`ListKeys unreadable in ${kmsListErrors.length} region(s)`);
+  if (kmsTruncated.length > 0) kmsCaps.push(`key inventory truncated in ${kmsTruncated.length} region(s)`);
+  if (scope.partial) kmsCaps.push(`only ${scope.regionsSeen} of ${scope.regionsTotal} regions assessed`);
+  const kmsVerdict = withCap(kmsStatus, kmsSummary, kmsCaps);
+
+  const findings = [
+    finding(
+      "AWS-DATA-11",
+      "S3 Block Public Access",
+      "critical",
+      publicAccessVerdict.status,
+      publicAccessVerdict.summary,
+      buildAwsMappings(11),
+      {
+        account_id: accountId ?? null,
+        account_block_configured: accountConfigured,
+        account_flags: accountFlags,
+        buckets: buckets.length,
+        buckets_without_full_block: sample(uncoveredBuckets.map((row) => ({ name: row.name, flags: row.flags }))),
+        buckets_with_public_policy: sample(publicPolicyBuckets.map((row) => row.name)),
+        buckets_unreadable: sample(unreadablePublicAccessBuckets.map((row) => row.name)),
+        bucket_inventory_truncated: bucketsTruncated,
+      },
+    ),
+    finding(
+      "AWS-DATA-12",
+      "Encryption at rest defaults (EBS, S3, RDS)",
+      "high",
+      encryptionVerdict.status,
+      encryptionVerdict.summary,
+      buildAwsMappings(12),
+      {
+        ...scopeEvidence(scope),
+        ebs_by_region: ebsRows,
+        rds_instances: rdsInstances.length,
+        rds_unencrypted: sample(rdsUnencrypted.map((instance) => ({ region: instance.region, id: instance.DBInstanceIdentifier, engine: instance.Engine }))),
+        rds_without_flag: sample(rdsUnknown.map((instance) => instance.DBInstanceIdentifier)),
+        buckets: buckets.length,
+        buckets_without_default_encryption: sample(bucketsWithoutSse.map((bucket) => bucket.name)),
+        buckets_encryption_unreadable: sample(bucketEncryptionUnreadable.map((bucket) => bucket.name)),
+        efs: "not assessed",
+      },
+    ),
+    finding(
+      "AWS-DATA-13",
+      "S3 TLS-only bucket policies (encryption in transit)",
+      "high",
+      transitVerdict.status,
+      transitVerdict.summary,
+      buildAwsMappings(13),
+      {
+        buckets: buckets.length,
+        buckets_without_tls_deny: sample(transitMissing.map((row) => ({ name: row.name, has_policy: row.has_policy }))),
+        buckets_policy_unreadable: sample(transitUnreadable.map((row) => row.name)),
+        bucket_inventory_truncated: bucketsTruncated,
+        load_balancer_tls: "not assessed",
+      },
+    ),
+    finding(
+      "AWS-DATA-22",
+      "KMS customer-managed key rotation",
+      "medium",
+      kmsVerdict.status,
+      kmsVerdict.summary,
+      buildAwsMappings(22),
+      {
+        ...scopeEvidence(scope),
+        keys: keyRows.length,
+        customer_managed_keys: customerKeys.length,
+        eligible_keys: eligibleKeys.length,
+        keys_not_rotating: sample(notRotating.map((key) => ({ region: key.region, key_id: key.keyId }))),
+        keys_rotation_unreadable: sample(rotationUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
+        keys_manager_unreadable: sample(managerUnknown.map((key) => ({ region: key.region, key_id: key.keyId }))),
+        ineligible_customer_keys: sample(ineligibleCustomerKeys.map((key) => ({
+          region: key.region,
+          key_id: key.keyId,
+          key_state: key.metadata.value?.KeyState,
+          key_spec: key.metadata.value?.KeySpec,
+          origin: key.metadata.value?.Origin,
+        }))),
+        regions_with_list_errors: kmsListErrors.map((result) => result.region),
+      },
+    ),
+  ];
+
+  return {
+    title: "AWS data protection posture",
+    summary: {
+      account_id: accountId ?? "unknown",
+      regions_seen: scope.regionsSeen,
+      regions_total: scope.regionsTotal,
+      buckets: buckets.length,
+      buckets_without_full_block: uncoveredBuckets.length,
+      buckets_with_public_policy: publicPolicyBuckets.length,
+      buckets_without_default_encryption: bucketsWithoutSse.length,
+      buckets_without_tls_deny: transitMissing.length,
+      ebs_regions_without_default_encryption: ebsOff.length,
+      rds_instances: rdsInstances.length,
+      rds_unencrypted: rdsUnencrypted.length,
+      customer_managed_keys: customerKeys.length,
+      keys_not_rotating: notRotating.length,
+      collection_errors: errors.length,
+    },
+    findings,
+    errors,
+  };
+}
+
 function formatAccessCheckText(result: AwsAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
     surface.name,
@@ -1409,6 +2339,48 @@ function normalizeOrgGuardrailArgs(args: unknown): OrgGuardrailArgs {
   };
 }
 
+type ScopeArgs = CheckAccessArgs & {
+  regions?: string[];
+  region_limit?: number;
+};
+
+type DataProtectionArgs = ScopeArgs & {
+  bucket_limit?: number;
+  key_limit?: number;
+  instance_limit?: number;
+};
+
+function normalizeScopeArgs(args: unknown): ScopeArgs {
+  const value = asObject(args) ?? {};
+  return {
+    ...normalizeCheckAccessArgs(args),
+    regions: parseRegionList(value.regions),
+    region_limit: asNumber(value.region_limit),
+  };
+}
+
+function normalizeDataProtectionArgs(args: unknown): DataProtectionArgs {
+  const value = asObject(args) ?? {};
+  return {
+    ...normalizeScopeArgs(args),
+    bucket_limit: asNumber(value.bucket_limit),
+    key_limit: asNumber(value.key_limit),
+    instance_limit: asNumber(value.instance_limit),
+  };
+}
+
+const scopeParams = {
+  regions: Type.Optional(Type.String({ description: "Comma-separated regions to assess. Defaults to every enabled region from EC2 DescribeRegions, falling back to the configured region." })),
+  region_limit: Type.Optional(Type.Number({ description: `Maximum regions to assess before flagging a partial scope. Defaults to ${DEFAULT_REGION_LIMIT}.`, default: DEFAULT_REGION_LIMIT })),
+};
+
+const dataProtectionParams = {
+  ...scopeParams,
+  bucket_limit: Type.Optional(Type.Number({ description: `Maximum S3 buckets to inspect before flagging truncation. Defaults to ${DEFAULT_BUCKET_LIMIT}.`, default: DEFAULT_BUCKET_LIMIT })),
+  key_limit: Type.Optional(Type.Number({ description: `Maximum KMS keys per region before flagging truncation. Defaults to ${DEFAULT_KEY_LIMIT}.`, default: DEFAULT_KEY_LIMIT })),
+  instance_limit: Type.Optional(Type.Number({ description: `Maximum RDS instances per region before flagging truncation. Defaults to ${DEFAULT_INSTANCE_LIMIT}.`, default: DEFAULT_INSTANCE_LIMIT })),
+};
+
 function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   const value = asObject(args) ?? {};
   return {
@@ -1524,6 +2496,35 @@ export function registerAwsTools(pi: any): void {
         return errorResult(
           `AWS organization guardrail assessment failed: ${error instanceof Error ? error.message : String(error)}`,
           { tool: "aws_assess_org_guardrails" },
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "aws_assess_data_protection",
+    label: "Assess AWS data protection",
+    description:
+      "Assess AWS data protection posture: account and bucket S3 Block Public Access, EBS default encryption per region, S3 default encryption, RDS storage encryption, TLS-only bucket policies (aws:SecureTransport), and customer-managed KMS key rotation.",
+    parameters: Type.Object({
+      ...authParams,
+      ...dataProtectionParams,
+    }),
+    prepareArguments: normalizeDataProtectionArgs,
+    async execute(_toolCallId: string, args: DataProtectionArgs) {
+      try {
+        const result = await assessAwsDataProtection(createClient(args), {
+          regions: args.regions,
+          regionLimit: args.region_limit,
+          bucketLimit: args.bucket_limit,
+          keyLimit: args.key_limit,
+          instanceLimit: args.instance_limit,
+        });
+        return textResult(formatAssessmentText(result), { tool: "aws_assess_data_protection", ...result });
+      } catch (error) {
+        return errorResult(
+          `AWS data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          { tool: "aws_assess_data_protection" },
         );
       }
     },
