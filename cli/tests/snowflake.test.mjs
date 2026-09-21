@@ -17,6 +17,7 @@ import { basename, join } from "node:path";
 import {
   SNOWFLAKE_CONTROLS,
   SNOWFLAKE_FRAMEWORKS,
+  SNOWFLAKE_STATEMENTS,
   SnowflakeSqlClient,
   SnowflakeStatementError,
   assertReadOnlyStatement,
@@ -26,6 +27,7 @@ import {
   assessSnowflakeNetworkAndAuthentication,
   buildSnowflakeKeyPairJwt,
   checkSnowflakeAccess,
+  classifyUserType,
   collectStatement,
   computePublicKeyFingerprint,
   exportSnowflakeAuditBundle,
@@ -177,6 +179,27 @@ function policyReference(kind, name, domain, entity, column = null, status = "AC
   return ["GOV", "POLICIES", name, kind, domain === "ACCOUNT" || domain === "USER" ? null : "SALES", domain === "ACCOUNT" || domain === "USER" ? null : "PUBLIC", entity, domain, column, null, status];
 }
 
+const POLICY_REFERENCE_FUNCTION_COLUMNS = POLICY_REFERENCE_COLUMNS.slice(0, 8);
+
+function policyFunctionReference(kind, name, domain, entity) {
+  return policyReference(kind, name, domain, entity).slice(0, 8);
+}
+
+function policyReferencesFunctionCall(database, schema, name) {
+  return `${database}.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '${database}.${schema}.${name}')`;
+}
+
+const UNSUPPORTED_ACCOUNT_USAGE_POLICY_KINDS = ["'PASSWORD_POLICY'", "'SESSION_POLICY'", "'AUTHENTICATION_POLICY'"];
+
+function rejectUndocumentedAccountUsageKinds(statement) {
+  if (!statement.includes("ACCOUNT_USAGE.POLICY_REFERENCES")) return;
+  for (const kind of UNSUPPORTED_ACCOUNT_USAGE_POLICY_KINDS) {
+    if (statement.includes(kind)) {
+      throw new Error(`ACCOUNT_USAGE.POLICY_REFERENCES does not support ${kind}; use the INFORMATION_SCHEMA.POLICY_REFERENCES table function (statement: ${statement})`);
+    }
+  }
+}
+
 const PARAMETER_COLUMNS = ["key", "value", "default", "level", "description", "type"];
 const INTEGRATION_COLUMNS = ["name", "type", "category", "enabled", "comment", "created_on"];
 const WAREHOUSE_COLUMNS = ["name", "state", "type", "size", "auto_suspend", "auto_resume", "owner"];
@@ -220,6 +243,7 @@ function healthyFixture(statement, options = {}) {
   const role = options.role ?? "ACCOUNTADMIN";
   const s = normalizeStatement(statement);
   const rs = (columns, values) => resultSet(statement, columns, values);
+  rejectUndocumentedAccountUsageKinds(s);
 
   if (s.startsWith("SELECT CURRENT_ACCOUNT()")) return rs(SESSION_COLUMNS, sessionContextRows(role));
   if (s === "SHOW NETWORK POLICIES") return rs(["created_on", "name", "comment", "entries_in_allowed_ip_list", "entries_in_blocked_ip_list"], [["2025-01-01 00:00:00", "CORP_POLICY", "corporate egress", "2", "0"]]);
@@ -251,8 +275,8 @@ function healthyFixture(statement, options = {}) {
 
   if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("COUNT(*)")) return rs(["REFERENCE_COUNT"], [["7"]]);
   if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'NETWORK_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, [policyReference("NETWORK_POLICY", "SVC_POLICY", "USER", "SVC_ETL")]);
-  if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'PASSWORD_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, [policyReference("PASSWORD_POLICY", "STRONG_PW", "ACCOUNT", "MYORG-MYACCOUNT")]);
-  if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'SESSION_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, [policyReference("SESSION_POLICY", "SESSION_STRICT", "ACCOUNT", "MYORG-MYACCOUNT")]);
+  if (s.includes(policyReferencesFunctionCall("GOV", "POLICIES", "STRONG_PW"))) return rs(POLICY_REFERENCE_FUNCTION_COLUMNS, [policyFunctionReference("PASSWORD_POLICY", "STRONG_PW", "ACCOUNT", "MYORG-MYACCOUNT"), policyFunctionReference("PASSWORD_POLICY", "STRONG_PW", "USER", "BOB")]);
+  if (s.includes(policyReferencesFunctionCall("GOV", "POLICIES", "SESSION_STRICT"))) return rs(POLICY_REFERENCE_FUNCTION_COLUMNS, [policyFunctionReference("SESSION_POLICY", "SESSION_STRICT", "ACCOUNT", "MYORG-MYACCOUNT")]);
   if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'MASKING_POLICY'")) {
     return rs(POLICY_REFERENCE_COLUMNS, [
       policyReference("MASKING_POLICY", "MASK_SSN", "TABLE", "CUSTOMERS", "SSN"),
@@ -302,6 +326,7 @@ function healthyFixture(statement, options = {}) {
 function failingFixture(statement) {
   const s = normalizeStatement(statement);
   const rs = (columns, values) => resultSet(statement, columns, values);
+  rejectUndocumentedAccountUsageKinds(s);
 
   if (s.startsWith("SELECT CURRENT_ACCOUNT()")) return rs(SESSION_COLUMNS, sessionContextRows("ACCOUNTADMIN"));
   if (s === "SHOW NETWORK POLICIES") return rs(["created_on", "name", "comment", "entries_in_allowed_ip_list", "entries_in_blocked_ip_list"], [["2025-01-01", "OPEN_POLICY", "", "1", "0"]]);
@@ -332,8 +357,8 @@ function failingFixture(statement) {
   if (s === "SHOW REPLICATION GROUPS") return rs(["snowflake_region", "created_on", "account_name", "name", "type", "is_primary"], []);
 
   if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'NETWORK_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, []);
-  if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'PASSWORD_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, []);
-  if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'SESSION_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, []);
+  if (s.includes(policyReferencesFunctionCall("GOV", "POLICIES", "WEAK_PW"))) return rs(POLICY_REFERENCE_FUNCTION_COLUMNS, [policyFunctionReference("PASSWORD_POLICY", "WEAK_PW", "USER", "NO_MFA_USER")]);
+  if (s.includes(policyReferencesFunctionCall("GOV", "POLICIES", "LOOSE_SESSION"))) return rs(POLICY_REFERENCE_FUNCTION_COLUMNS, []);
   if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'MASKING_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, []);
   if (s.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && s.includes("'ROW_ACCESS_POLICY'")) return rs(POLICY_REFERENCE_COLUMNS, []);
   if (s.includes("ACCOUNT_USAGE.NETWORK_POLICIES")) return rs(NETWORK_POLICY_COLUMNS, [["OPEN_POLICY", "SECURITYADMIN", "['0.0.0.0/0']", "[]", "2025-01-01", "2025-01-01"]]);
@@ -379,6 +404,7 @@ function createMockClient(resolver, configOverrides = {}) {
     executed,
     getResolvedConfig: () => sampleConfig(configOverrides),
     async execute(statement) {
+      assertReadOnlyStatement(statement);
       executed.push(statement);
       const result = await resolver(statement);
       return result;
@@ -693,7 +719,11 @@ test("SnowflakeSqlClient submits async statements, polls, and fetches every part
   assert.equal(body.timeout, 30);
   assert.equal(body.role, "AUDIT_ROLE");
   assert.equal(body.warehouse, "AUDIT_WH");
-  assert.deepEqual(body.resultSetMetaData, { format: "jsonv2" });
+  assert.equal("resultSetMetaData" in body, false, "resultSetMetaData is a response object and must not be sent in the request");
+  const documentedRequestFields = new Set(["statement", "timeout", "database", "schema", "warehouse", "role", "bindings", "parameters"]);
+  for (const field of Object.keys(body)) {
+    assert.ok(documentedRequestFields.has(field), `request body field ${field} is not in the documented SQL API request schema`);
+  }
   assert.equal(calls.length, 4);
   assert.equal(calls[1].init.method, "GET");
   assert.equal(calls[3].url, "https://myorg-myaccount.snowflakecomputing.com/api/v2/statements/handle-1?partition=1");
@@ -798,6 +828,37 @@ test("SnowflakeSqlClient refuses statements that are not read-only", async () =>
   assert.doesNotThrow(() => assertReadOnlyStatement("DESCRIBE NETWORK POLICY p"));
 });
 
+test("assertReadOnlyStatement rejects chained or embedded write statements while accepting every built-in statement", () => {
+  assert.throws(() => assertReadOnlyStatement("SELECT 1; DROP TABLE t"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SELECT 1;DROP TABLE t"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SELECT 1; GRANT ROLE ACCOUNTADMIN TO USER mallory"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SELECT 1;"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) UNION ALL SELECT 1 FROM t WHERE 1 = 1 AND CALL proc()"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SHOW USERS; ALTER USER x SET DISABLED = TRUE"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SELECT 1; USE ROLE ACCOUNTADMIN"), /non read-only/);
+  assert.throws(() => assertReadOnlyStatement("SELECT ';' ; DROP TABLE t"), /non read-only/);
+
+  assert.doesNotThrow(() => assertReadOnlyStatement("SELECT * FROM t WHERE note = 'drop; grant'"));
+  assert.doesNotThrow(() => assertReadOnlyStatement("SELECT * FROM t WHERE note = 'it''s; fine'"));
+  assert.doesNotThrow(() => assertReadOnlyStatement("SELECT CREATED_ON, DELETED_ON, GRANT_OPTION, ALLOWED_IP_LIST, PASSWORD_LAST_SET_TIME FROM t"));
+
+  const sampleArgs = { limit: 500, lookbackDays: 30, policy: { database: "GOV", schema: "POLICIES", name: "STRONG_PW" } };
+  const builtIn = Object.entries(SNOWFLAKE_STATEMENTS).map(([name, value]) => {
+    if (typeof value === "string") return [name, value];
+    if (name === "policyReferences") return [name, value("MASKING_POLICY", sampleArgs.limit)];
+    if (name === "policyReferencesByName") return [name, value(sampleArgs.policy)];
+    if (name === "roleUsageByQueries" || name === "failedLogins" || name === "loginOutcomes") return [name, value(sampleArgs.lookbackDays)];
+    return [name, value(sampleArgs.limit)];
+  });
+  assert.ok(builtIn.length >= 25);
+  for (const [name, statement] of builtIn) {
+    assert.doesNotThrow(() => assertReadOnlyStatement(statement), `built-in statement ${name} must pass the read-only guard`);
+    assert.equal(typeof statement, "string");
+  }
+  assert.match(SNOWFLAKE_STATEMENTS.roleUsageByQueries(30), /'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'COPY'/);
+});
+
 test("checkSnowflakeAccess reports a healthy account with full visibility", async () => {
   const client = createMockClient((statement) => healthyFixture(statement), { role: "ACCOUNTADMIN" });
   const result = await checkSnowflakeAccess(client);
@@ -884,7 +945,7 @@ test("assessSnowflakeNetworkAndAuthentication fails on permissive network, missi
   assert.match(findingById(result, "SNOWFLAKE-04").summary, /none attached at ACCOUNT level/);
   assert.match(findingById(result, "SNOWFLAKE-05").summary, /lack an RSA public key/);
   assert.match(findingById(result, "SNOWFLAKE-06").summary, /none reports enabled = true/);
-  assert.match(findingById(result, "SNOWFLAKE-25").summary, /none is attached at ACCOUNT level/);
+  assert.match(findingById(result, "SNOWFLAKE-25").summary, /none attached at ACCOUNT level/);
 });
 
 test("assessSnowflakeNetworkAndAuthentication never passes when enabling flags are absent or false", async () => {
@@ -914,12 +975,90 @@ test("assessSnowflakeNetworkAndAuthentication never passes when enabling flags a
   assert.match(network.summary, /none is activated at ACCOUNT level/);
 
   const passwordPolicyUnattached = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => {
-    if (statement.includes("POLICY_REFERENCES") && statement.includes("'PASSWORD_POLICY'")) {
-      return resultSet(statement, POLICY_REFERENCE_COLUMNS, [policyReference("PASSWORD_POLICY", "STRONG_PW", "USER", "ALICE")]);
+    if (statement.includes(policyReferencesFunctionCall("GOV", "POLICIES", "STRONG_PW"))) {
+      return resultSet(statement, POLICY_REFERENCE_FUNCTION_COLUMNS, [policyFunctionReference("PASSWORD_POLICY", "STRONG_PW", "USER", "ALICE")]);
     }
     return healthyFixture(statement);
   }));
   assert.equal(findingById(passwordPolicyUnattached, "SNOWFLAKE-04").status, "fail");
+});
+
+test("controls 4 and 25 read policy assignments through the INFORMATION_SCHEMA.POLICY_REFERENCES table function, never the ACCOUNT_USAGE view", async () => {
+  const client = createMockClient((statement) => healthyFixture(statement));
+  const result = await assessSnowflakeNetworkAndAuthentication(client);
+
+  const passwordLookup = client.executed.filter((statement) => statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES") && statement.includes("STRONG_PW"));
+  assert.equal(passwordLookup.length, 1);
+  assert.equal(passwordLookup[0], "SELECT POLICY_DB, POLICY_SCHEMA, POLICY_NAME, POLICY_KIND, REF_DATABASE_NAME, REF_SCHEMA_NAME, REF_ENTITY_NAME, REF_ENTITY_DOMAIN FROM TABLE(GOV.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => 'GOV.POLICIES.STRONG_PW'))");
+  const sessionLookup = client.executed.filter((statement) => statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES") && statement.includes("SESSION_STRICT"));
+  assert.equal(sessionLookup.length, 1);
+  assert.ok(client.executed.every((statement) => !(statement.includes("ACCOUNT_USAGE.POLICY_REFERENCES") && /'(PASSWORD|SESSION)_POLICY'/.test(statement))));
+
+  const control4 = findingById(result, "SNOWFLAKE-04");
+  assert.equal(control4.status, "pass");
+  assert.equal(control4.evidence.reference_lookups, 1);
+  assert.equal(control4.evidence.account_level_attachments, 1);
+  assert.deepEqual(control4.evidence.account_level_policies, ["STRONG_PW"]);
+  assert.match(control4.summary, /POLICY_REFERENCES lookups/);
+  const control25 = findingById(result, "SNOWFLAKE-25");
+  assert.equal(control25.status, "pass");
+  assert.deepEqual(control25.evidence.account_level_policies, ["SESSION_STRICT"]);
+  assert.ok(result.statements.some((outcome) => outcome.key === "password_policy_references_1"));
+  assert.ok(result.statements.some((outcome) => outcome.key === "session_policy_references_1"));
+
+  const lookupDenied = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => {
+    if (statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES")) {
+      throw new SnowflakeStatementError("SQL access control error: Insufficient privileges to operate on password policy 'STRONG_PW'", { statusCode: 422 });
+    }
+    return healthyFixture(statement);
+  }));
+  assert.equal(findingById(lookupDenied, "SNOWFLAKE-04").status, "manual");
+  assert.match(findingById(lookupDenied, "SNOWFLAKE-04").summary, /denied/i);
+  assert.equal(findingById(lookupDenied, "SNOWFLAKE-25").status, "manual");
+
+  const limitedRoleNoAccountRow = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => {
+    if (statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES")) {
+      return resultSet(statement, POLICY_REFERENCE_FUNCTION_COLUMNS, []);
+    }
+    return healthyFixture(statement, { role: "AUDIT_ROLE" });
+  }, { role: "AUDIT_ROLE" }));
+  assert.equal(findingById(limitedRoleNoAccountRow, "SNOWFLAKE-04").status, "manual");
+  assert.match(findingById(limitedRoleNoAccountRow, "SNOWFLAKE-04").summary, /APPLY PASSWORD POLICY/);
+  assert.equal(findingById(limitedRoleNoAccountRow, "SNOWFLAKE-25").status, "manual");
+
+  const quotedPolicyNames = createMockClient((statement) => {
+    if (statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES")) {
+      return resultSet(statement, POLICY_REFERENCE_FUNCTION_COLUMNS, [policyFunctionReference("PASSWORD_POLICY", "Mixed Case", "ACCOUNT", "MYORG-MYACCOUNT")]);
+    }
+    if (normalizeStatement(statement).includes("ACCOUNT_USAGE.PASSWORD_POLICIES") && !statement.includes("COUNT(*)")) {
+      return resultSet(statement, PASSWORD_POLICY_COLUMNS, [["Mixed Case", "gov-db", "POLICIES", "SECURITYADMIN", "14", "256", "1", "1", "1", "1", "0", "90", "5", "30", "12"]]);
+    }
+    return healthyFixture(statement);
+  });
+  await assessSnowflakeNetworkAndAuthentication(quotedPolicyNames);
+  const quotedLookup = quotedPolicyNames.executed.find((statement) => statement.includes("Mixed Case"));
+  assert.equal(quotedLookup, "SELECT POLICY_DB, POLICY_SCHEMA, POLICY_NAME, POLICY_KIND, REF_DATABASE_NAME, REF_SCHEMA_NAME, REF_ENTITY_NAME, REF_ENTITY_DOMAIN FROM TABLE(\"gov-db\".INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '\"gov-db\".POLICIES.\"Mixed Case\"'))");
+});
+
+test("control 4 records unchecked policies when the lookup cap is exceeded and never passes on them", async () => {
+  const manyPolicies = Array.from({ length: 22 }, (_, index) => [`PW_${index + 1}`, "GOV", "POLICIES", "SECURITYADMIN", "14", "256", "1", "1", "1", "1", "0", "90", "5", "30", "12"]);
+  const client = createMockClient((statement) => {
+    if (normalizeStatement(statement).includes("ACCOUNT_USAGE.PASSWORD_POLICIES") && !statement.includes("COUNT(*)")) {
+      return resultSet(statement, PASSWORD_POLICY_COLUMNS, manyPolicies);
+    }
+    if (statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES") && statement.includes("PW_")) {
+      const attached = statement.includes("'GOV.POLICIES.PW_1'");
+      return resultSet(statement, POLICY_REFERENCE_FUNCTION_COLUMNS, attached ? [policyFunctionReference("PASSWORD_POLICY", "PW_1", "ACCOUNT", "MYORG-MYACCOUNT")] : []);
+    }
+    return healthyFixture(statement);
+  });
+  const result = await assessSnowflakeNetworkAndAuthentication(client);
+  const control4 = findingById(result, "SNOWFLAKE-04");
+  assert.equal(control4.status, "warn");
+  assert.equal(control4.evidence.reference_lookups, 20);
+  assert.equal(control4.evidence.unchecked_policies.length, 2);
+  assert.match(control4.summary, /2 of 22 policies were not checked/);
+  assert.equal(client.executed.filter((statement) => statement.includes("INFORMATION_SCHEMA.POLICY_REFERENCES") && statement.includes("PW_")).length, 20);
 });
 
 test("assessSnowflakeAccessControl passes on a least-privilege fixture and explains compliant empties", async () => {
@@ -1036,6 +1175,129 @@ test("assessSnowflakeDataProtection fails on missing masking, open stages, zero 
   assert.equal(shares.evidence.listing_backed_shares, 1);
   assert.match(shares.summary, /1 OUTBOUND shares/);
   assert.match(findingById(result, "SNOWFLAKE-23").summary, /LAMBDA_API/);
+});
+
+test("control 22 passes on an empty outbound inventory only under ACCOUNTADMIN and renders manual for every other role", async () => {
+  const emptyShares = (role) => createMockClient((statement) => {
+    if (normalizeStatement(statement) === "SHOW SHARES") return resultSet(statement, SHARE_COLUMNS, []);
+    return healthyFixture(statement, { role });
+  }, { role });
+
+  const securityAdminEmpty = await assessSnowflakeDataProtection(emptyShares("SECURITYADMIN"));
+  const securityAdminFinding = findingById(securityAdminEmpty, "SNOWFLAKE-22");
+  assert.equal(securityAdminFinding.status, "manual");
+  assert.match(securityAdminFinding.summary, /SECURITYADMIN/);
+  assert.match(securityAdminFinding.summary, /IMPORT SHARE/);
+  assert.match(securityAdminFinding.summary, /indistinguishable from a denied read/);
+  assert.equal(securityAdminFinding.evidence.shares_seen, 0);
+
+  const securityAdminInboundOnly = await assessSnowflakeDataProtection(createMockClient((statement) => healthyFixture(statement, { role: "SECURITYADMIN" }), { role: "SECURITYADMIN" }));
+  assert.equal(findingById(securityAdminInboundOnly, "SNOWFLAKE-22").status, "manual");
+  assert.equal(findingById(securityAdminInboundOnly, "SNOWFLAKE-22").evidence.shares_seen, 1);
+
+  const customRoleEmpty = await assessSnowflakeDataProtection(emptyShares("SHARE_ADMIN"));
+  assert.equal(findingById(customRoleEmpty, "SNOWFLAKE-22").status, "manual");
+
+  const accountAdminEmpty = await assessSnowflakeDataProtection(emptyShares("ACCOUNTADMIN"));
+  assert.equal(findingById(accountAdminEmpty, "SNOWFLAKE-22").status, "pass");
+  assert.match(findingById(accountAdminEmpty, "SNOWFLAKE-22").summary, /readable under ACCOUNTADMIN/);
+
+  const securityAdminOutbound = await assessSnowflakeDataProtection(createMockClient((statement) => {
+    if (normalizeStatement(statement) === "SHOW SHARES") return failingFixture(statement);
+    return healthyFixture(statement, { role: "SECURITYADMIN" });
+  }, { role: "SECURITYADMIN" }));
+  const outboundFinding = findingById(securityAdminOutbound, "SNOWFLAKE-22");
+  assert.equal(outboundFinding.status, "warn");
+  assert.match(outboundFinding.summary, /inventory is partial; re-run as ACCOUNTADMIN/);
+});
+
+test("SERVICE_AGENT users are classified as service-class and every documented TYPE is assessed or surfaced", async () => {
+  assert.equal(classifyUserType("PERSON"), "person");
+  assert.equal(classifyUserType(null), "person");
+  assert.equal(classifyUserType("NULL"), "person");
+  assert.equal(classifyUserType("SERVICE"), "service");
+  assert.equal(classifyUserType("SERVICE_AGENT"), "service");
+  assert.equal(classifyUserType("LEGACY_SERVICE"), "service");
+  assert.equal(classifyUserType("service_agent"), "service");
+  assert.equal(classifyUserType("SNOWFLAKE_SERVICE"), "snowflake_managed");
+  assert.equal(classifyUserType("FUTURE_TYPE"), "unrecognized");
+
+  const agentWithoutKey = userRow({ NAME: "AGENT_NO_KEY", LOGIN_NAME: "AGENT_NO_KEY", TYPE: "SERVICE_AGENT", HAS_PASSWORD: "false", HAS_MFA: "false", HAS_RSA_PUBLIC_KEY: "false", HAS_WORKLOAD_IDENTITY: "false", HAS_PAT: "true", LAST_SUCCESS_LOGIN: isoDaysAgo(1) });
+  const agentWithKey = userRow({ NAME: "AGENT_KEYED", LOGIN_NAME: "AGENT_KEYED", TYPE: "SERVICE_AGENT", HAS_PASSWORD: "false", HAS_MFA: "false", HAS_RSA_PUBLIC_KEY: "true", LAST_SUCCESS_LOGIN: isoDaysAgo(1) });
+  const managed = userRow({ NAME: "SPCS_SVC", LOGIN_NAME: "SPCS_SVC", TYPE: "SNOWFLAKE_SERVICE", HAS_PASSWORD: "false", HAS_MFA: "false", HAS_RSA_PUBLIC_KEY: "false", LAST_SUCCESS_LOGIN: isoDaysAgo(1) });
+  const usersFixture = (rows) => (statement) => {
+    if (normalizeStatement(statement).includes("ACCOUNT_USAGE.USERS") && !statement.includes("COUNT(*)")) return resultSet(statement, USER_COLUMNS, rows);
+    return healthyFixture(statement);
+  };
+
+  const failing = await assessSnowflakeNetworkAndAuthentication(createMockClient(usersFixture([...HEALTHY_USERS, agentWithoutKey, managed])));
+  const control5 = findingById(failing, "SNOWFLAKE-05");
+  assert.equal(control5.status, "fail");
+  assert.deepEqual(control5.evidence.service_users_without_key_pair, ["AGENT_NO_KEY"]);
+  assert.deepEqual(control5.evidence.service_users_by_type, { SERVICE: 1, SERVICE_AGENT: 1 });
+  assert.deepEqual(control5.evidence.snowflake_managed_service_users, ["SPCS_SVC"]);
+  assert.equal(control5.evidence.user_classes.service, 2);
+  assert.equal(control5.evidence.user_classes.snowflake_managed, 1);
+  const control3 = findingById(failing, "SNOWFLAKE-03");
+  assert.equal(control3.status, "pass");
+  assert.equal(control3.evidence.enabled_human_users, 2, "SERVICE_AGENT users are not counted as person users for MFA");
+
+  const passing = await assessSnowflakeNetworkAndAuthentication(createMockClient(usersFixture([...HEALTHY_USERS, agentWithKey, managed])));
+  const keyed = findingById(passing, "SNOWFLAKE-05");
+  assert.equal(keyed.status, "pass");
+  assert.match(keyed.summary, /SERVICE, SERVICE_AGENT, LEGACY_SERVICE/);
+  assert.match(keyed.summary, /1 SNOWFLAKE_SERVICE users are Snowflake managed/);
+
+  const unrecognized = userRow({ NAME: "MYSTERY", LOGIN_NAME: "MYSTERY", TYPE: "FUTURE_TYPE", HAS_PASSWORD: "false", HAS_MFA: "false", HAS_RSA_PUBLIC_KEY: "false", LAST_SUCCESS_LOGIN: isoDaysAgo(1) });
+  const surfaced = await assessSnowflakeNetworkAndAuthentication(createMockClient(usersFixture([...HEALTHY_USERS, unrecognized])));
+  for (const id of ["SNOWFLAKE-03", "SNOWFLAKE-05"]) {
+    const item = findingById(surfaced, id);
+    assert.equal(item.status, "warn", `${id} must not pass while a user has an unrecognized TYPE`);
+    assert.match(item.summary, /unrecognized TYPE \(FUTURE_TYPE\)/);
+    assert.deepEqual(item.evidence.user_classes.unrecognized_types, ["FUTURE_TYPE"]);
+  }
+  const lifecycle = await assessSnowflakeMonitoringAndLifecycle(createMockClient(usersFixture([...HEALTHY_USERS, unrecognized])));
+  assert.equal(findingById(lifecycle, "SNOWFLAKE-12").status, "warn");
+  assert.match(findingById(lifecycle, "SNOWFLAKE-12").summary, /unrecognized TYPE/);
+
+  const staleAgent = userRow({ NAME: "OLD_AGENT", LOGIN_NAME: "OLD_AGENT", TYPE: "SERVICE_AGENT", HAS_PASSWORD: "false", HAS_MFA: "false", HAS_RSA_PUBLIC_KEY: "true", LAST_SUCCESS_LOGIN: isoDaysAgo(400) });
+  const staleLifecycle = await assessSnowflakeMonitoringAndLifecycle(createMockClient(usersFixture([...HEALTHY_USERS, staleAgent])));
+  const staleFinding = findingById(staleLifecycle, "SNOWFLAKE-12");
+  assert.equal(staleFinding.status, "warn");
+  assert.deepEqual(staleFinding.evidence.stale_service_class_users, ["OLD_AGENT"]);
+});
+
+test("control 9 records the QUERY_HISTORY row limit so a truncated role list cannot pass", async () => {
+  const roleUsage = SNOWFLAKE_STATEMENTS.roleUsageByQueries(30);
+  assert.match(roleUsage, /LIMIT 500$/);
+  const client = createMockClient((statement) => {
+    const normalized = normalizeStatement(statement);
+    if (normalized.includes("ACCOUNT_USAGE.QUERY_HISTORY") && normalized.includes("GROUP BY ROLE_NAME")) {
+      const rows = Array.from({ length: 500 }, (_, index) => [`ROLE_${index}`, String(1000 - index), "1"]);
+      return resultSet(statement, ["ROLE_NAME", "QUERY_COUNT", "USER_COUNT"], rows);
+    }
+    return healthyFixture(statement);
+  });
+  const result = await assessSnowflakeAccessControl(client);
+  const control9 = findingById(result, "SNOWFLAKE-09");
+  assert.equal(control9.status, "warn");
+  assert.match(control9.summary, /hit the 500-row limit \(500 rows seen\)/);
+  assert.match(control9.summary, /cannot be pass on a partial result/);
+  const outcome = result.statements.find((statement) => statement.key === "role_usage_by_queries");
+  assert.equal(outcome.rowLimit, 500);
+  assert.equal(outcome.truncated, true);
+
+  const monitoring = await assessSnowflakeMonitoringAndLifecycle(createMockClient((statement) => {
+    const normalized = normalizeStatement(statement);
+    if (normalized.includes("ACCOUNT_USAGE.LOGIN_HISTORY") && normalized.includes("IS_SUCCESS = 'NO'")) {
+      const rows = Array.from({ length: 500 }, (_, index) => [`USER_${index}`, `10.0.0.${index % 250}`, "JDBC_DRIVER", "2", "INCORRECT_USERNAME_PASSWORD"]);
+      return resultSet(statement, ["USER_NAME", "CLIENT_IP", "REPORTED_CLIENT_TYPE", "FAILURE_COUNT", "LAST_ERROR"], rows);
+    }
+    return healthyFixture(statement);
+  }));
+  const control11 = findingById(monitoring, "SNOWFLAKE-11");
+  assert.notEqual(control11.status, "pass");
+  assert.match(control11.summary, /hit the 500-row limit/);
 });
 
 test("all four assessments together cover every one of the 25 spec controls exactly once", async () => {
@@ -1182,7 +1444,8 @@ test("false-pass self-check (c): a role without ACCOUNTADMIN visibility cannot p
 
   const populated = await assessSnowflakeDataProtection(createMockClient((statement) => healthyFixture(statement, { role: "AUDIT_ROLE" }), { role: "AUDIT_ROLE" }));
   assert.equal(findingById(populated, "SNOWFLAKE-19").status, "warn");
-  assert.equal(findingById(populated, "SNOWFLAKE-22").status, "warn");
+  assert.equal(findingById(populated, "SNOWFLAKE-22").status, "manual");
+  assert.match(findingById(populated, "SNOWFLAKE-22").summary, /Re-run SHOW SHARES as ACCOUNTADMIN/);
   assert.equal(findingById(populated, "SNOWFLAKE-23").status, "warn");
   const monitoring = await assessSnowflakeMonitoringAndLifecycle(createMockClient((statement) => healthyFixture(statement, { role: "AUDIT_ROLE" }), { role: "AUDIT_ROLE" }));
   assert.equal(findingById(monitoring, "SNOWFLAKE-24").status, "warn");

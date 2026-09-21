@@ -53,7 +53,10 @@ const JWT_REFRESH_SKEW_SECONDS = 60;
 const FULL_VISIBILITY_ROLES = new Set(["ACCOUNTADMIN", "SECURITYADMIN"]);
 const SYSTEM_ROLES = new Set(["ACCOUNTADMIN", "SECURITYADMIN", "SYSADMIN", "USERADMIN", "ORGADMIN", "PUBLIC", "GLOBALORGADMIN"]);
 const PRIVILEGED_SYSTEM_ROLES = new Set(["ACCOUNTADMIN", "SECURITYADMIN"]);
-const SERVICE_USER_TYPES = new Set(["SERVICE", "LEGACY_SERVICE"]);
+const PERSON_USER_TYPES = new Set(["", "NULL", "PERSON"]);
+const SERVICE_USER_TYPES = new Set(["SERVICE", "SERVICE_AGENT", "LEGACY_SERVICE"]);
+const SNOWFLAKE_MANAGED_USER_TYPES = new Set(["SNOWFLAKE_SERVICE"]);
+const SHARE_INVENTORY_ROLE = "ACCOUNTADMIN";
 const SENSITIVE_OBJECT_DOMAINS = new Set([
   "TABLE",
   "VIEW",
@@ -821,7 +824,6 @@ export class SnowflakeSqlClient {
     const body: JsonRecord = {
       statement,
       timeout: options.timeoutSeconds ?? this.config.statementTimeoutSeconds,
-      resultSetMetaData: { format: "jsonv2" },
     };
     if (this.config.role) body.role = this.config.role;
     if (this.config.warehouse) body.warehouse = this.config.warehouse;
@@ -912,16 +914,29 @@ export class SnowflakeSqlClient {
 }
 
 const READ_ONLY_PREFIXES = ["SHOW ", "DESCRIBE ", "DESC ", "SELECT ", "WITH ", "EXPLAIN "];
-const FORBIDDEN_STATEMENT_PATTERN = /\b(CREATE|ALTER|DROP|GRANT|REVOKE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|COPY|PUT|GET|REMOVE|CALL|USE|UNDROP|EXECUTE)\b/i;
+const FORBIDDEN_STATEMENT_PATTERN = /\b(CREATE|ALTER|DROP|GRANT|REVOKE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|COPY|PUT|GET|REMOVE|CALL|USE|UNDROP|EXECUTE|BEGIN|COMMIT|ROLLBACK|SET|UNSET|LIST)\b/i;
+const STRING_LITERAL_PATTERN = /'(?:[^']|'')*'/g;
+const ROLE_USAGE_ROW_LIMIT = 500;
+const FAILED_LOGIN_ROW_LIMIT = 500;
+const TAG_REFERENCE_ROW_LIMIT = 200;
+const MAX_POLICY_REFERENCE_LOOKUPS = 20;
+
+function stripStringLiterals(statement: string): string {
+  return statement.replace(STRING_LITERAL_PATTERN, "''");
+}
 
 export function assertReadOnlyStatement(statement: string): void {
   const normalized = statement.trim().replace(/\s+/g, " ").toUpperCase();
+  const refusal = `Refusing to execute a non read-only Snowflake statement: ${statement.slice(0, 80)}`;
   if (!READ_ONLY_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
-    throw new Error(`Refusing to execute a non read-only Snowflake statement: ${statement.slice(0, 80)}`);
+    throw new Error(refusal);
   }
-  const firstWord = normalized.split(" ")[0];
-  if (FORBIDDEN_STATEMENT_PATTERN.test(firstWord)) {
-    throw new Error(`Refusing to execute a non read-only Snowflake statement: ${statement.slice(0, 80)}`);
+  const withoutLiterals = stripStringLiterals(normalized);
+  if (withoutLiterals.includes(";")) {
+    throw new Error(refusal);
+  }
+  if (FORBIDDEN_STATEMENT_PATTERN.test(withoutLiterals)) {
+    throw new Error(refusal);
   }
 }
 
@@ -929,12 +944,41 @@ function accountUsageView(view: string): string {
   return `SNOWFLAKE.ACCOUNT_USAGE.${view}`;
 }
 
+type AccountUsagePolicyKind = "NETWORK_POLICY" | "MASKING_POLICY" | "ROW_ACCESS_POLICY";
+
+function quoteIdentifier(identifier: string): string {
+  return /^[A-Z_][A-Z0-9_$]*$/.test(identifier) ? identifier : `"${identifier.replace(/"/g, "\"\"")}"`;
+}
+
+function escapeStringLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+export interface QualifiedPolicyName {
+  database: string;
+  schema: string;
+  name: string;
+}
+
+export function qualifiedPolicyName(row: SqlRow): QualifiedPolicyName | undefined {
+  const database = rowValue(row, "DATABASE");
+  const schema = rowValue(row, "SCHEMA");
+  const name = rowValue(row, "NAME");
+  if (!database || !schema || !name) return undefined;
+  return { database, schema, name };
+}
+
+function formatQualifiedPolicyName(policy: QualifiedPolicyName): string {
+  return `${quoteIdentifier(policy.database)}.${quoteIdentifier(policy.schema)}.${quoteIdentifier(policy.name)}`;
+}
+
 export const SNOWFLAKE_STATEMENTS = {
   sessionContext: "SELECT CURRENT_ACCOUNT() AS ACCOUNT_NAME, CURRENT_USER() AS USER_NAME, CURRENT_ROLE() AS ROLE_NAME, CURRENT_WAREHOUSE() AS WAREHOUSE_NAME, CURRENT_REGION() AS REGION_NAME, CURRENT_VERSION() AS VERSION",
   showNetworkPolicies: "SHOW NETWORK POLICIES",
   accountNetworkPolicyParameter: "SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT",
   networkPolicies: (limit: number) => `SELECT NAME, OWNER, ALLOWED_IP_LIST, BLOCKED_IP_LIST, CREATED, LAST_ALTERED FROM ${accountUsageView("NETWORK_POLICIES")} WHERE DELETED IS NULL LIMIT ${limit}`,
-  policyReferences: (kind: string, limit: number) => `SELECT POLICY_DB, POLICY_SCHEMA, POLICY_NAME, POLICY_KIND, REF_DATABASE_NAME, REF_SCHEMA_NAME, REF_ENTITY_NAME, REF_ENTITY_DOMAIN, REF_COLUMN_NAME, TAG_NAME, POLICY_STATUS FROM ${accountUsageView("POLICY_REFERENCES")} WHERE POLICY_KIND = '${kind}' LIMIT ${limit}`,
+  policyReferences: (kind: AccountUsagePolicyKind, limit: number) => `SELECT POLICY_DB, POLICY_SCHEMA, POLICY_NAME, POLICY_KIND, REF_DATABASE_NAME, REF_SCHEMA_NAME, REF_ENTITY_NAME, REF_ENTITY_DOMAIN, REF_COLUMN_NAME, TAG_NAME, POLICY_STATUS FROM ${accountUsageView("POLICY_REFERENCES")} WHERE POLICY_KIND = '${kind}' LIMIT ${limit}`,
+  policyReferencesByName: (policy: QualifiedPolicyName) => `SELECT POLICY_DB, POLICY_SCHEMA, POLICY_NAME, POLICY_KIND, REF_DATABASE_NAME, REF_SCHEMA_NAME, REF_ENTITY_NAME, REF_ENTITY_DOMAIN FROM TABLE(${quoteIdentifier(policy.database)}.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '${escapeStringLiteral(formatQualifiedPolicyName(policy))}'))`,
   users: (limit: number) => `SELECT NAME, LOGIN_NAME, TYPE, DISABLED, HAS_PASSWORD, HAS_MFA, EXT_AUTHN_DUO, HAS_RSA_PUBLIC_KEY, HAS_PAT, HAS_WORKLOAD_IDENTITY, LAST_SUCCESS_LOGIN, PASSWORD_LAST_SET_TIME, CREATED_ON, DEFAULT_ROLE, OWNER FROM ${accountUsageView("USERS")} WHERE DELETED_ON IS NULL LIMIT ${limit}`,
   passwordPolicies: (limit: number) => `SELECT NAME, DATABASE, SCHEMA, OWNER, PASSWORD_MIN_LENGTH, PASSWORD_MAX_LENGTH, PASSWORD_MIN_UPPER_CASE_CHARS, PASSWORD_MIN_LOWER_CASE_CHARS, PASSWORD_MIN_NUMERIC_CHARS, PASSWORD_MIN_SPECIAL_CHARS, PASSWORD_MIN_AGE_DAYS, PASSWORD_MAX_AGE_DAYS, PASSWORD_MAX_RETRIES, PASSWORD_LOCKOUT_TIME_MINS, PASSWORD_HISTORY FROM ${accountUsageView("PASSWORD_POLICIES")} WHERE DELETED IS NULL LIMIT ${limit}`,
   sessionPolicies: (limit: number) => `SELECT NAME, DATABASE, SCHEMA, OWNER, SESSION_IDLE_TIMEOUT_MINS, SESSION_UI_IDLE_TIMEOUT_MINS, SESSION_MAX_LIFESPAN_MINS, SESSION_UI_MAX_LIFESPAN_MINS FROM ${accountUsageView("SESSION_POLICIES")} WHERE DELETED IS NULL LIMIT ${limit}`,
@@ -942,17 +986,17 @@ export const SNOWFLAKE_STATEMENTS = {
   roleGrants: (limit: number) => `SELECT PRIVILEGE, GRANTED_ON, NAME, TABLE_CATALOG, TABLE_SCHEMA, GRANTED_TO, GRANTEE_NAME, GRANT_OPTION, GRANTED_BY FROM ${accountUsageView("GRANTS_TO_ROLES")} WHERE DELETED_ON IS NULL AND GRANTED_ON = 'ROLE' AND GRANTED_TO IN ('ROLE', 'ACCOUNT ROLE') LIMIT ${limit}`,
   globalPrivilegeGrants: (limit: number) => `SELECT PRIVILEGE, GRANTED_ON, NAME, GRANTED_TO, GRANTEE_NAME, GRANT_OPTION FROM ${accountUsageView("GRANTS_TO_ROLES")} WHERE DELETED_ON IS NULL AND GRANTED_ON = 'ACCOUNT' AND GRANTED_TO IN ('ROLE', 'ACCOUNT ROLE') LIMIT ${limit}`,
   adminRoleGrantsToUsers: (limit: number) => `SELECT ROLE, GRANTEE_NAME, GRANTED_BY, CREATED_ON FROM ${accountUsageView("GRANTS_TO_USERS")} WHERE DELETED_ON IS NULL AND ROLE IN ('ACCOUNTADMIN', 'SECURITYADMIN') LIMIT ${limit}`,
-  roleUsageByQueries: (lookbackDays: number) => `SELECT ROLE_NAME, COUNT(*) AS QUERY_COUNT, COUNT(DISTINCT USER_NAME) AS USER_COUNT FROM ${accountUsageView("QUERY_HISTORY")} WHERE START_TIME >= DATEADD(day, -${lookbackDays}, CURRENT_TIMESTAMP()) AND QUERY_TYPE IN (${ROUTINE_QUERY_TYPES.map((type) => `'${type}'`).join(", ")}) GROUP BY ROLE_NAME ORDER BY QUERY_COUNT DESC LIMIT 500`,
+  roleUsageByQueries: (lookbackDays: number) => `SELECT ROLE_NAME, COUNT(*) AS QUERY_COUNT, COUNT(DISTINCT USER_NAME) AS USER_COUNT FROM ${accountUsageView("QUERY_HISTORY")} WHERE START_TIME >= DATEADD(day, -${lookbackDays}, CURRENT_TIMESTAMP()) AND QUERY_TYPE IN (${ROUTINE_QUERY_TYPES.map((type) => `'${type}'`).join(", ")}) GROUP BY ROLE_NAME ORDER BY QUERY_COUNT DESC LIMIT ${ROLE_USAGE_ROW_LIMIT}`,
   directUserGrants: (limit: number) => `SELECT PRIVILEGE, GRANTED_ON, NAME, TABLE_CATALOG, TABLE_SCHEMA, GRANTEE_NAME FROM ${accountUsageView("GRANTS_TO_ROLES")} WHERE DELETED_ON IS NULL AND GRANTED_TO = 'USER' AND GRANTED_ON <> 'ROLE' LIMIT ${limit}`,
   publicGrants: (limit: number) => `SELECT PRIVILEGE, GRANTED_ON, NAME, TABLE_CATALOG, TABLE_SCHEMA, GRANTED_BY FROM ${accountUsageView("GRANTS_TO_ROLES")} WHERE DELETED_ON IS NULL AND GRANTEE_NAME = 'PUBLIC' AND GRANTED_TO IN ('ROLE', 'ACCOUNT ROLE') LIMIT ${limit}`,
   loginOutcomes: (lookbackDays: number) => `SELECT IS_SUCCESS, COUNT(*) AS EVENT_COUNT FROM ${accountUsageView("LOGIN_HISTORY")} WHERE EVENT_TIMESTAMP >= DATEADD(day, -${lookbackDays}, CURRENT_TIMESTAMP()) GROUP BY IS_SUCCESS`,
-  failedLogins: (lookbackDays: number) => `SELECT USER_NAME, CLIENT_IP, REPORTED_CLIENT_TYPE, COUNT(*) AS FAILURE_COUNT, MAX(ERROR_MESSAGE) AS LAST_ERROR FROM ${accountUsageView("LOGIN_HISTORY")} WHERE EVENT_TIMESTAMP >= DATEADD(day, -${lookbackDays}, CURRENT_TIMESTAMP()) AND IS_SUCCESS = 'NO' GROUP BY USER_NAME, CLIENT_IP, REPORTED_CLIENT_TYPE ORDER BY FAILURE_COUNT DESC LIMIT 500`,
+  failedLogins: (lookbackDays: number) => `SELECT USER_NAME, CLIENT_IP, REPORTED_CLIENT_TYPE, COUNT(*) AS FAILURE_COUNT, MAX(ERROR_MESSAGE) AS LAST_ERROR FROM ${accountUsageView("LOGIN_HISTORY")} WHERE EVENT_TIMESTAMP >= DATEADD(day, -${lookbackDays}, CURRENT_TIMESTAMP()) AND IS_SUCCESS = 'NO' GROUP BY USER_NAME, CLIENT_IP, REPORTED_CLIENT_TYPE ORDER BY FAILURE_COUNT DESC LIMIT ${FAILED_LOGIN_ROW_LIMIT}`,
   accessHistoryProbe: `SELECT COUNT(*) AS EVENT_COUNT FROM ${accountUsageView("ACCESS_HISTORY")} WHERE QUERY_START_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())`,
   dataRetentionParameter: "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN ACCOUNT",
   showWarehouses: "SHOW WAREHOUSES",
   maskingPolicyCount: `SELECT COUNT(*) AS POLICY_COUNT FROM ${accountUsageView("MASKING_POLICIES")} WHERE DELETED IS NULL`,
   rowAccessPolicyCount: `SELECT COUNT(*) AS POLICY_COUNT FROM ${accountUsageView("ROW_ACCESS_POLICIES")} WHERE DELETED IS NULL`,
-  tagReferenceSummary: `SELECT TAG_DATABASE, TAG_SCHEMA, TAG_NAME, COUNT(*) AS REFERENCE_COUNT FROM ${accountUsageView("TAG_REFERENCES")} GROUP BY TAG_DATABASE, TAG_SCHEMA, TAG_NAME ORDER BY REFERENCE_COUNT DESC LIMIT 200`,
+  tagReferenceSummary: `SELECT TAG_DATABASE, TAG_SCHEMA, TAG_NAME, COUNT(*) AS REFERENCE_COUNT FROM ${accountUsageView("TAG_REFERENCES")} GROUP BY TAG_DATABASE, TAG_SCHEMA, TAG_NAME ORDER BY REFERENCE_COUNT DESC LIMIT ${TAG_REFERENCE_ROW_LIMIT}`,
   stageParameters: "SHOW PARAMETERS LIKE 'REQUIRE_STORAGE_INTEGRATION_FOR_STAGE_%' IN ACCOUNT",
   unloadParameters: "SHOW PARAMETERS LIKE 'PREVENT_UNLOAD_TO_%' IN ACCOUNT",
   showDatabases: "SHOW DATABASES",
@@ -994,6 +1038,49 @@ export async function collectStatement(
       error: redactSecrets(message),
     };
   }
+}
+
+export interface PolicyReferenceLookups {
+  outcomes: SnowflakeStatementOutcome[];
+  unchecked: string[];
+  accountLevel: SqlRow[];
+}
+
+export async function collectPolicyReferencesByName(
+  client: SnowflakeQueryClient,
+  keyPrefix: string,
+  policies: SnowflakeStatementOutcome,
+): Promise<PolicyReferenceLookups> {
+  const lookups: PolicyReferenceLookups = { outcomes: [], unchecked: [], accountLevel: [] };
+  if (policies.status !== "ok") return lookups;
+  for (const [index, row] of policies.rows.entries()) {
+    const policy = qualifiedPolicyName(row);
+    if (!policy) {
+      lookups.unchecked.push(rowValue(row, "NAME") ?? `(row ${index + 1} without a fully qualified name)`);
+      continue;
+    }
+    const qualified = formatQualifiedPolicyName(policy);
+    if (lookups.outcomes.length >= MAX_POLICY_REFERENCE_LOOKUPS) {
+      lookups.unchecked.push(qualified);
+      continue;
+    }
+    const outcome = await collectStatement(client, `${keyPrefix}_${index + 1}`, SNOWFLAKE_STATEMENTS.policyReferencesByName(policy));
+    lookups.outcomes.push(outcome);
+    for (const reference of outcome.rows) {
+      if (upper(rowValue(reference, "REF_ENTITY_DOMAIN")) === "ACCOUNT") lookups.accountLevel.push(reference);
+    }
+  }
+  return lookups;
+}
+
+function policyReferenceEvidence(lookups: PolicyReferenceLookups): JsonRecord {
+  return {
+    reference_lookups: lookups.outcomes.length,
+    reference_lookup_failures: lookups.outcomes.filter((outcome) => outcome.status !== "ok").length,
+    account_level_attachments: lookups.accountLevel.length,
+    account_level_policies: lookups.accountLevel.map((row) => rowValue(row, "POLICY_NAME")).filter((name): name is string => Boolean(name)),
+    unchecked_policies: lookups.unchecked,
+  };
 }
 
 async function collectSessionContext(client: SnowflakeQueryClient): Promise<SessionContext> {
@@ -1111,13 +1198,77 @@ function partialVisibilityNote(role: string | undefined, subject: string): strin
   return `The active role ${role ?? "(unknown)"} lacks MANAGE GRANTS, so ${subject} may list only objects granted to that role.`;
 }
 
+export type SnowflakeUserClass = "person" | "service" | "snowflake_managed" | "unrecognized";
+
+export function classifyUserType(type: string | null | undefined): SnowflakeUserClass {
+  const normalized = upper(type);
+  if (PERSON_USER_TYPES.has(normalized)) return "person";
+  if (SERVICE_USER_TYPES.has(normalized)) return "service";
+  if (SNOWFLAKE_MANAGED_USER_TYPES.has(normalized)) return "snowflake_managed";
+  return "unrecognized";
+}
+
+function classifyUser(row: SqlRow): SnowflakeUserClass {
+  return classifyUserType(rowValue(row, "TYPE"));
+}
+
 function isHumanUser(row: SqlRow): boolean {
-  const type = upper(rowValue(row, "TYPE"));
-  return type === "" || type === "PERSON" || type === "NULL";
+  return classifyUser(row) === "person";
 }
 
 function isServiceUser(row: SqlRow): boolean {
-  return SERVICE_USER_TYPES.has(upper(rowValue(row, "TYPE")));
+  return classifyUser(row) === "service";
+}
+
+interface UserClassSummary {
+  person: number;
+  service: number;
+  snowflake_managed: number;
+  unrecognized: number;
+  unrecognized_types: string[];
+}
+
+function summarizeUserClasses(rows: SqlRow[]): UserClassSummary {
+  const summary: UserClassSummary = { person: 0, service: 0, snowflake_managed: 0, unrecognized: 0, unrecognized_types: [] };
+  for (const row of rows) {
+    const userClass = classifyUser(row);
+    switch (userClass) {
+      case "person":
+        summary.person += 1;
+        break;
+      case "service":
+        summary.service += 1;
+        break;
+      case "snowflake_managed":
+        summary.snowflake_managed += 1;
+        break;
+      case "unrecognized": {
+        summary.unrecognized += 1;
+        const type = upper(rowValue(row, "TYPE")) || "(blank)";
+        if (!summary.unrecognized_types.includes(type)) summary.unrecognized_types.push(type);
+        break;
+      }
+      default: {
+        const exhaustive: never = userClass;
+        throw new Error(`Unhandled user class: ${String(exhaustive)}`);
+      }
+    }
+  }
+  return summary;
+}
+
+function countBy(rows: SqlRow[], keyOf: (row: SqlRow) => string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    const key = keyOf(row) || "(blank)";
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function unrecognizedUserNote(summary: UserClassSummary): string | undefined {
+  if (summary.unrecognized === 0) return undefined;
+  return `${summary.unrecognized} users carry an unrecognized TYPE (${summary.unrecognized_types.join(", ")}) and were not classified; review them manually`;
 }
 
 function isDisabledUser(row: SqlRow): boolean {
@@ -1255,10 +1406,10 @@ export async function assessSnowflakeNetworkAndAuthentication(
   const networkPolicies = await collectStatement(client, "network_policies", SNOWFLAKE_STATEMENTS.networkPolicies(limit), limit);
   const users = await collectStatement(client, "users", SNOWFLAKE_STATEMENTS.users(limit), limit);
   const passwordPolicies = await collectStatement(client, "password_policies", SNOWFLAKE_STATEMENTS.passwordPolicies(limit), limit);
-  const passwordReferences = await collectStatement(client, "password_policy_references", SNOWFLAKE_STATEMENTS.policyReferences("PASSWORD_POLICY", limit), limit);
+  const passwordReferences = await collectPolicyReferencesByName(client, "password_policy_references", passwordPolicies);
   const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations);
   const sessionPolicies = await collectStatement(client, "session_policies", SNOWFLAKE_STATEMENTS.sessionPolicies(limit), limit);
-  const sessionReferences = await collectStatement(client, "session_policy_references", SNOWFLAKE_STATEMENTS.policyReferences("SESSION_POLICY", limit), limit);
+  const sessionReferences = await collectPolicyReferencesByName(client, "session_policy_references", sessionPolicies);
 
   const findings: SnowflakeFinding[] = [];
 
@@ -1312,6 +1463,7 @@ export async function assessSnowflakeNetworkAndAuthentication(
   }));
 
   findings.push(evaluateControl(3, [users], "Snowsight Admin > Users & Roles: confirm MFA enrollment (HAS_MFA) for every enabled person user with a password, or an authentication policy with MFA_ENROLLMENT = REQUIRED.", () => {
+    const userClasses = summarizeUserClasses(users.rows);
     const humans = users.rows.filter((row) => isHumanUser(row) && !isDisabledUser(row));
     const passwordHumans = humans.filter((row) => rowBoolean(row, "HAS_PASSWORD") === true);
     const withoutMfa = passwordHumans.filter((row) => rowBoolean(row, "HAS_MFA") !== true && rowBoolean(row, "EXT_AUTHN_DUO") !== true);
@@ -1321,21 +1473,26 @@ export async function assessSnowflakeNetworkAndAuthentication(
       password_human_users: passwordHumans.length,
       users_without_mfa: withoutMfa.slice(0, 50).map(userName),
       users_with_unknown_mfa_flags: unknownFlags.length,
+      user_classes: userClasses,
     };
+    const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
       return { status: "manual", summary: "USERS returned zero rows; MFA coverage cannot be established from an empty inventory (check ACCOUNT_USAGE latency and IMPORTED PRIVILEGES).", evidence };
-    }
-    if (passwordHumans.length === 0) {
-      return { status: "pass", summary: `No enabled person users hold a password (${humans.length} enabled person users rely on SSO, key pair, or other factors), so password MFA enforcement is not applicable and no unprotected password login exists.`, evidence };
     }
     if (withoutMfa.length > 0) {
       return { status: "fail", summary: `${withoutMfa.length}/${passwordHumans.length} enabled person users with passwords have neither HAS_MFA nor EXT_AUTHN_DUO set: ${withoutMfa.slice(0, 10).map(userName).join(", ")}.`, evidence };
     }
+    if (unrecognized) {
+      return { status: "warn", summary: `Every classified person user with a password reports MFA, but ${unrecognized}.`, evidence };
+    }
+    if (passwordHumans.length === 0) {
+      return { status: "pass", summary: `No enabled person users hold a password (${humans.length} enabled person users rely on SSO, key pair, or other factors; ${userClasses.service} service-class users are assessed under control 5), so password MFA enforcement is not applicable and no unprotected password login exists.`, evidence };
+    }
     return { status: "pass", summary: `All ${passwordHumans.length} enabled person users with passwords report HAS_MFA or EXT_AUTHN_DUO = true.`, evidence };
   }));
 
-  findings.push(evaluateControl(4, [passwordPolicies, passwordReferences], "Snowsight or SHOW PASSWORD POLICIES plus DESCRIBE PASSWORD POLICY: confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
-    const accountRefs = passwordReferences.rows.filter((row) => upper(rowValue(row, "REF_ENTITY_DOMAIN")) === "ACCOUNT");
+  findings.push(evaluateControl(4, [passwordPolicies, ...passwordReferences.outcomes], "Snowsight or SHOW PASSWORD POLICIES plus SELECT * FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>')): confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
+    const accountRefs = passwordReferences.accountLevel;
     const attachedNames = new Set(accountRefs.map((row) => upper(rowValue(row, "POLICY_NAME"))));
     const weak: string[] = [];
     let strongAttached = 0;
@@ -1355,41 +1512,59 @@ export async function assessSnowflakeNetworkAndAuthentication(
     }
     const evidence = {
       policy_count: passwordPolicies.rows.length,
-      account_level_attachments: accountRefs.map((row) => rowValue(row, "POLICY_NAME")),
+      ...policyReferenceEvidence(passwordReferences),
       weak_policies: weak,
       min_password_length_threshold: minPasswordLength,
     };
     if (passwordPolicies.rows.length === 0) {
       return { status: "fail", summary: "PASSWORD_POLICIES returned zero policies, so only Snowflake defaults apply; an empty inventory fails this control.", evidence };
     }
+    if (accountRefs.length === 0 && passwordReferences.unchecked.length > 0) {
+      return { status: "manual", summary: `${passwordPolicies.rows.length} password policies exist and no ACCOUNT-level attachment was found among the ${passwordReferences.outcomes.length} checked, but ${passwordReferences.unchecked.length} policies were not checked (lookup cap ${MAX_POLICY_REFERENCE_LOOKUPS} or missing qualified name); run POLICY_REFERENCES for the unchecked policies.`, evidence };
+    }
+    if (accountRefs.length === 0 && !hasFullVisibility(role)) {
+      return { status: "manual", summary: `${passwordPolicies.rows.length} password policies exist but INFORMATION_SCHEMA.POLICY_REFERENCES returned no ACCOUNT-level attachment under role ${role ?? "(unknown)"}, which may lack APPLY PASSWORD POLICY visibility; confirm the account assignment as ACCOUNTADMIN.`, evidence };
+    }
     if (accountRefs.length === 0) {
-      return { status: "fail", summary: `${passwordPolicies.rows.length} password policies exist but POLICY_REFERENCES shows none attached at ACCOUNT level.`, evidence };
+      return { status: "fail", summary: `${passwordPolicies.rows.length} password policies exist but INFORMATION_SCHEMA.POLICY_REFERENCES shows none attached at ACCOUNT level.`, evidence };
     }
     if (strongAttached === 0) {
       return { status: "warn", summary: `Account-level password policy is attached but does not meet the threshold (min length ${minPasswordLength}, one of each character class, retries <= 10): ${weak.join(", ")}.`, evidence };
     }
-    return { status: "pass", summary: `An account-level password policy is attached and meets complexity thresholds (${accountRefs.length} account attachments, ${passwordPolicies.rows.length} policies).`, evidence };
+    if (passwordReferences.unchecked.length > 0) {
+      return { status: "warn", summary: `An account-level password policy is attached and meets complexity thresholds, but ${passwordReferences.unchecked.length} of ${passwordPolicies.rows.length} policies were not checked for additional attachments.`, evidence };
+    }
+    return { status: "pass", summary: `An account-level password policy is attached and meets complexity thresholds (${accountRefs.length} account attachments across ${passwordReferences.outcomes.length} POLICY_REFERENCES lookups, ${passwordPolicies.rows.length} policies).`, evidence };
   }));
 
-  findings.push(evaluateControl(5, [users], "Snowsight Admin > Users & Roles: confirm service users (TYPE = SERVICE or LEGACY_SERVICE) have RSA public keys and no passwords.", () => {
+  findings.push(evaluateControl(5, [users], "Snowsight Admin > Users & Roles: confirm service-class users (TYPE = SERVICE, SERVICE_AGENT, or LEGACY_SERVICE) have RSA public keys or workload identity and no passwords.", () => {
+    const userClasses = summarizeUserClasses(users.rows);
     const serviceUsers = users.rows.filter((row) => isServiceUser(row) && !isDisabledUser(row));
+    const managedUsers = users.rows.filter((row) => classifyUser(row) === "snowflake_managed" && !isDisabledUser(row));
     const withoutKey = serviceUsers.filter((row) => rowBoolean(row, "HAS_RSA_PUBLIC_KEY") !== true && rowBoolean(row, "HAS_WORKLOAD_IDENTITY") !== true);
     const withPassword = serviceUsers.filter((row) => rowBoolean(row, "HAS_PASSWORD") === true);
     const evidence = {
       service_users: serviceUsers.length,
+      service_users_by_type: countBy(serviceUsers, (row) => upper(rowValue(row, "TYPE"))),
+      snowflake_managed_service_users: managedUsers.slice(0, 50).map(userName),
       service_users_without_key_pair: withoutKey.slice(0, 50).map(userName),
       service_users_with_password: withPassword.slice(0, 50).map(userName),
+      user_classes: userClasses,
     };
+    const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
       return { status: "manual", summary: "USERS returned zero rows; service account authentication cannot be assessed from an empty inventory.", evidence };
     }
     if (serviceUsers.length === 0) {
-      return { status: "manual", summary: `None of the ${users.rows.length} users are typed SERVICE or LEGACY_SERVICE; classify automation accounts with TYPE = SERVICE and confirm each uses key-pair or workload identity authentication.`, evidence };
+      return { status: "manual", summary: `None of the ${users.rows.length} users are typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE (${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed); classify automation accounts with TYPE = SERVICE and confirm each uses key-pair or workload identity authentication.${unrecognized ? ` ${unrecognized}.` : ""}`, evidence };
     }
     if (withoutKey.length > 0 || withPassword.length > 0) {
-      return { status: "fail", summary: `${withoutKey.length}/${serviceUsers.length} service users lack an RSA public key or workload identity and ${withPassword.length} still hold a password.`, evidence };
+      return { status: "fail", summary: `${withoutKey.length}/${serviceUsers.length} service-class users lack an RSA public key or workload identity and ${withPassword.length} still hold a password.`, evidence };
     }
-    return { status: "pass", summary: `All ${serviceUsers.length} enabled service users authenticate with key pairs or workload identity and hold no password.`, evidence };
+    if (unrecognized) {
+      return { status: "warn", summary: `All ${serviceUsers.length} enabled service-class users authenticate with key pairs or workload identity, but ${unrecognized}.`, evidence };
+    }
+    return { status: "pass", summary: `All ${serviceUsers.length} enabled service-class users (SERVICE, SERVICE_AGENT, LEGACY_SERVICE) authenticate with key pairs or workload identity and hold no password${managedUsers.length > 0 ? `; ${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed and listed in evidence` : ""}.`, evidence };
   }));
 
   findings.push(evaluateControl(6, [integrations], "SHOW SECURITY INTEGRATIONS in Snowsight: confirm an enabled SAML2 (or External OAuth) security integration and SCIM provisioning.", () => {
@@ -1412,8 +1587,8 @@ export async function assessSnowflakeNetworkAndAuthentication(
     return { status: "pass", summary: `${enabledSaml.length} enabled SAML2 integration(s) found${scim.length > 0 ? ` with ${scim.length} enabled SCIM integration(s)` : "; no enabled SCIM integration was visible"}.`, evidence };
   }));
 
-  findings.push(evaluateControl(25, [sessionPolicies, sessionReferences], "SHOW SESSION POLICIES and POLICY_REFERENCES: confirm an account-level session policy with idle timeouts.", () => {
-    const accountRefs = sessionReferences.rows.filter((row) => upper(rowValue(row, "REF_ENTITY_DOMAIN")) === "ACCOUNT");
+  findings.push(evaluateControl(25, [sessionPolicies, ...sessionReferences.outcomes], "SHOW SESSION POLICIES plus SELECT * FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>')): confirm an account-level session policy with idle timeouts.", () => {
+    const accountRefs = sessionReferences.accountLevel;
     const attached = new Set(accountRefs.map((row) => upper(rowValue(row, "POLICY_NAME"))));
     const compliantAttached = sessionPolicies.rows.filter((row) => {
       const idle = rowNumber(row, "SESSION_IDLE_TIMEOUT_MINS");
@@ -1422,20 +1597,29 @@ export async function assessSnowflakeNetworkAndAuthentication(
     });
     const evidence = {
       policy_count: sessionPolicies.rows.length,
-      account_level_attachments: accountRefs.map((row) => rowValue(row, "POLICY_NAME")),
+      ...policyReferenceEvidence(sessionReferences),
       max_session_idle_minutes: maxSessionIdleMinutes,
       policies: sessionPolicies.rows.slice(0, 25).map((row) => ({ name: rowValue(row, "NAME"), idle: rowValue(row, "SESSION_IDLE_TIMEOUT_MINS"), ui_idle: rowValue(row, "SESSION_UI_IDLE_TIMEOUT_MINS") })),
     };
     if (sessionPolicies.rows.length === 0) {
       return { status: "fail", summary: "SESSION_POLICIES returned zero policies, so default 4-hour idle timeouts apply; an empty inventory fails this control.", evidence };
     }
+    if (accountRefs.length === 0 && sessionReferences.unchecked.length > 0) {
+      return { status: "manual", summary: `${sessionPolicies.rows.length} session policies exist and no ACCOUNT-level attachment was found among the ${sessionReferences.outcomes.length} checked, but ${sessionReferences.unchecked.length} policies were not checked (lookup cap ${MAX_POLICY_REFERENCE_LOOKUPS} or missing qualified name); run POLICY_REFERENCES for the unchecked policies.`, evidence };
+    }
+    if (accountRefs.length === 0 && !hasFullVisibility(role)) {
+      return { status: "manual", summary: `${sessionPolicies.rows.length} session policies exist but INFORMATION_SCHEMA.POLICY_REFERENCES returned no ACCOUNT-level attachment under role ${role ?? "(unknown)"}, which may lack APPLY SESSION POLICY visibility; confirm the account assignment as ACCOUNTADMIN.`, evidence };
+    }
     if (accountRefs.length === 0) {
-      return { status: "fail", summary: `${sessionPolicies.rows.length} session policies exist but none is attached at ACCOUNT level.`, evidence };
+      return { status: "fail", summary: `${sessionPolicies.rows.length} session policies exist but INFORMATION_SCHEMA.POLICY_REFERENCES shows none attached at ACCOUNT level.`, evidence };
     }
     if (compliantAttached.length === 0) {
       return { status: "warn", summary: `An account-level session policy is attached but its idle timeout exceeds ${maxSessionIdleMinutes} minutes or is unset.`, evidence };
     }
-    return { status: "pass", summary: `Account-level session policy enforces idle timeouts within ${maxSessionIdleMinutes} minutes.`, evidence };
+    if (sessionReferences.unchecked.length > 0) {
+      return { status: "warn", summary: `Account-level session policy enforces idle timeouts within ${maxSessionIdleMinutes} minutes, but ${sessionReferences.unchecked.length} of ${sessionPolicies.rows.length} policies were not checked for attachments.`, evidence };
+    }
+    return { status: "pass", summary: `Account-level session policy enforces idle timeouts within ${maxSessionIdleMinutes} minutes (${accountRefs.length} account attachments across ${sessionReferences.outcomes.length} POLICY_REFERENCES lookups).`, evidence };
   }));
 
   return {
@@ -1450,7 +1634,19 @@ export async function assessSnowflakeNetworkAndAuthentication(
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, showNetworkPolicies, networkParameter, networkReferences, networkPolicies, users, passwordPolicies, passwordReferences, integrations, sessionPolicies, sessionReferences],
+    statements: [
+      session.outcome,
+      showNetworkPolicies,
+      networkParameter,
+      networkReferences,
+      networkPolicies,
+      users,
+      passwordPolicies,
+      ...passwordReferences.outcomes,
+      integrations,
+      sessionPolicies,
+      ...sessionReferences.outcomes,
+    ],
   };
 }
 
@@ -1468,7 +1664,7 @@ export async function assessSnowflakeAccessControl(
   const roleGrants = await collectStatement(client, "role_hierarchy_grants", SNOWFLAKE_STATEMENTS.roleGrants(limit), limit);
   const globalGrants = await collectStatement(client, "global_privilege_grants", SNOWFLAKE_STATEMENTS.globalPrivilegeGrants(limit), limit);
   const adminGrants = await collectStatement(client, "admin_role_grants_to_users", SNOWFLAKE_STATEMENTS.adminRoleGrantsToUsers(limit), limit);
-  const roleUsage = await collectStatement(client, "role_usage_by_queries", SNOWFLAKE_STATEMENTS.roleUsageByQueries(lookbackDays));
+  const roleUsage = await collectStatement(client, "role_usage_by_queries", SNOWFLAKE_STATEMENTS.roleUsageByQueries(lookbackDays), ROLE_USAGE_ROW_LIMIT);
   const directGrants = await collectStatement(client, "direct_user_grants", SNOWFLAKE_STATEMENTS.directUserGrants(limit), limit);
   const publicGrants = await collectStatement(client, "public_grants", SNOWFLAKE_STATEMENTS.publicGrants(limit), limit);
 
@@ -1611,7 +1807,7 @@ export async function assessSnowflakeMonitoringAndLifecycle(
   const role = effectiveRole(config, session);
 
   const loginOutcomes = await collectStatement(client, "login_outcomes", SNOWFLAKE_STATEMENTS.loginOutcomes(lookbackDays));
-  const failedLogins = await collectStatement(client, "failed_logins", SNOWFLAKE_STATEMENTS.failedLogins(lookbackDays));
+  const failedLogins = await collectStatement(client, "failed_logins", SNOWFLAKE_STATEMENTS.failedLogins(lookbackDays), FAILED_LOGIN_ROW_LIMIT);
   const users = await collectStatement(client, "users", SNOWFLAKE_STATEMENTS.users(limit), limit);
   const retention = await collectStatement(client, "data_retention_parameter", SNOWFLAKE_STATEMENTS.dataRetentionParameter);
   const accessHistory = await collectStatement(client, "access_history_probe", SNOWFLAKE_STATEMENTS.accessHistoryProbe);
@@ -1640,7 +1836,13 @@ export async function assessSnowflakeMonitoringAndLifecycle(
   }));
 
   findings.push(evaluateControl(12, [users], `Review enabled users whose LAST_SUCCESS_LOGIN is older than ${staleUserDays} days or NULL and disable or remove them.`, () => {
+    const userClasses = summarizeUserClasses(users.rows);
     const humans = users.rows.filter((row) => isHumanUser(row) && !isDisabledUser(row));
+    const staleServiceUsers = users.rows.filter((row) => {
+      if (!isServiceUser(row) || isDisabledUser(row)) return false;
+      const lastLogin = parseSnowflakeTimestamp(rowValue(row, "LAST_SUCCESS_LOGIN"));
+      return lastLogin !== undefined && daysSince(lastLogin, now) > staleUserDays;
+    });
     const stale: string[] = [];
     const neverOrUnknown: string[] = [];
     for (const row of humans) {
@@ -1651,7 +1853,16 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       }
       if (daysSince(lastLogin, now) > staleUserDays) stale.push(userName(row));
     }
-    const evidence = { enabled_human_users: humans.length, stale_user_days: staleUserDays, stale_users: stale.slice(0, 50), users_without_login_timestamp: neverOrUnknown.slice(0, 50), users_without_login_timestamp_count: neverOrUnknown.length };
+    const evidence = {
+      enabled_human_users: humans.length,
+      stale_user_days: staleUserDays,
+      stale_users: stale.slice(0, 50),
+      users_without_login_timestamp: neverOrUnknown.slice(0, 50),
+      users_without_login_timestamp_count: neverOrUnknown.length,
+      stale_service_class_users: staleServiceUsers.slice(0, 50).map(userName),
+      user_classes: userClasses,
+    };
+    const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
       return { status: "manual", summary: "USERS returned zero rows; stale-user review cannot be performed on an empty inventory.", evidence };
     }
@@ -1661,7 +1872,13 @@ export async function assessSnowflakeMonitoringAndLifecycle(
     if (neverOrUnknown.length > 0) {
       return { status: "warn", summary: `No enabled person user exceeded ${staleUserDays} days since login, but ${neverOrUnknown.length}/${humans.length} have a NULL LAST_SUCCESS_LOGIN (never logged in or outside the one-year retention) and must be reviewed.`, evidence };
     }
-    return { status: "pass", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days.`, evidence };
+    if (unrecognized) {
+      return { status: "warn", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days, but ${unrecognized}.`, evidence };
+    }
+    if (staleServiceUsers.length > 0) {
+      return { status: "warn", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days, but ${staleServiceUsers.length} enabled service-class users have not authenticated in that window and should be reviewed for decommissioning.`, evidence };
+    }
+    return { status: "pass", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days (${userClasses.service} service-class users showed no stale logins).`, evidence };
   }));
 
   findings.push(evaluateControl(13, [retention], "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN ACCOUNT and confirm ACCESS_HISTORY/QUERY_HISTORY (365-day fixed retention) are exported to long-term storage if longer retention is required.", () => {
@@ -1736,7 +1953,7 @@ export async function assessSnowflakeDataProtection(
   const maskingReferences = await collectStatement(client, "masking_policy_references", SNOWFLAKE_STATEMENTS.policyReferences("MASKING_POLICY", limit), limit);
   const rowAccessCount = await collectStatement(client, "row_access_policy_count", SNOWFLAKE_STATEMENTS.rowAccessPolicyCount);
   const rowAccessReferences = await collectStatement(client, "row_access_policy_references", SNOWFLAKE_STATEMENTS.policyReferences("ROW_ACCESS_POLICY", limit), limit);
-  const tagReferences = await collectStatement(client, "tag_references", SNOWFLAKE_STATEMENTS.tagReferenceSummary);
+  const tagReferences = await collectStatement(client, "tag_references", SNOWFLAKE_STATEMENTS.tagReferenceSummary, TAG_REFERENCE_ROW_LIMIT);
   const stageParameters = await collectStatement(client, "stage_parameters", SNOWFLAKE_STATEMENTS.stageParameters);
   const unloadParameters = await collectStatement(client, "unload_parameters", SNOWFLAKE_STATEMENTS.unloadParameters);
   const databases = await collectStatement(client, "show_databases", SNOWFLAKE_STATEMENTS.showDatabases);
@@ -1838,16 +2055,14 @@ export async function assessSnowflakeDataProtection(
       listing_backed_shares: listings.length,
       replication_groups_visible: replicationGroups.status === "ok" ? replicationGroups.rows.length : null,
     };
-    if (shares.rows.length === 0 && !hasFullVisibility(role)) {
-      return { status: "manual", summary: `SHOW SHARES returned zero rows under role ${role ?? "(unknown)"}; Snowflake returns empty results without the IMPORT SHARE privilege, so re-run as ACCOUNTADMIN to confirm there are no outbound shares.`, evidence };
+    const fullShareInventory = role === SHARE_INVENTORY_ROLE;
+    if (outbound.length > 0) {
+      return { status: "warn", summary: `${outbound.length} OUTBOUND shares expose data to other accounts${listings.length > 0 ? ` and ${listings.length} are attached to marketplace or private listings` : ""}; confirm each consumer is approved.${fullShareInventory ? "" : ` Only shares owned by role ${role ?? "(unknown)"} are listed, so the inventory is partial; re-run as ${SHARE_INVENTORY_ROLE}.`}`, evidence };
     }
-    if (outbound.length === 0 && !hasFullVisibility(role)) {
-      return { status: "warn", summary: `SHOW SHARES under role ${role ?? "(unknown)"} lists ${shares.rows.length} shares and no OUTBOUND share, but the role lacks ACCOUNTADMIN visibility so outbound shares may be hidden; confirm as ACCOUNTADMIN.`, evidence };
+    if (!fullShareInventory) {
+      return { status: "manual", summary: `SHOW SHARES under role ${role ?? "(unknown)"} returned ${shares.rows.length} rows and no OUTBOUND share, but only ${SHARE_INVENTORY_ROLE} lists every outbound share: other roles see only shares they own and roles without IMPORT SHARE receive empty results, so this is indistinguishable from a denied read. Re-run SHOW SHARES as ${SHARE_INVENTORY_ROLE} to confirm the outbound inventory.`, evidence };
     }
-    if (outbound.length === 0) {
-      return { status: "pass", summary: `SHOW SHARES was readable under ${role} and lists no OUTBOUND shares (${shares.rows.length} inbound shares seen); for this control an empty outbound inventory is compliant.`, evidence };
-    }
-    return { status: "warn", summary: `${outbound.length} OUTBOUND shares expose data to other accounts${listings.length > 0 ? ` and ${listings.length} are attached to marketplace or private listings` : ""}; confirm each consumer is approved.`, evidence };
+    return { status: "pass", summary: `SHOW SHARES was readable under ${SHARE_INVENTORY_ROLE} and lists no OUTBOUND shares (${shares.rows.length} inbound shares seen); for this control an empty outbound inventory is compliant.`, evidence };
   }, { optional: [replicationGroups] }));
 
   findings.push(evaluateControl(23, [integrations], "SHOW API INTEGRATIONS and SHOW EXTERNAL ACCESS INTEGRATIONS: confirm every enabled integration and external function is approved.", () => {
