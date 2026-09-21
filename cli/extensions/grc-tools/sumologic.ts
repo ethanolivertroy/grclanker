@@ -103,7 +103,7 @@ const ADMIN_CAPABILITIES = new Set([
   "manageSupportAccountAccess",
   "manageAuditDataFeed",
   "changeEmail",
-]);
+].map((capability) => capability.toLowerCase()));
 
 export interface SumologicResolvedConfig {
   accessId: string;
@@ -1184,7 +1184,10 @@ export async function assessSumologicAccessControl(
       threshold_days: keyMaxAge,
     };
     const scopeNote = accessKeys.scope === "personal" ? " Only the caller's personal keys were visible (manageAccessKeys missing), so the org-wide population is unknown." : "";
-    if (accessKeys.scope === "personal") {
+    if (keys.length === 0) {
+      findings.push(finding(7, "high", "manual", "Zero access keys were returned even though the calling key must appear in the inventory, so the view is partial; export Administration > Security > Access Keys manually.", rotationEvidence));
+      findings.push(finding(8, "medium", "manual", "Zero access keys were returned even though the calling key must appear in the inventory, so the view is partial; export the key list with last-used dates manually.", { ...keyEvidenceBase }));
+    } else if (accessKeys.scope === "personal") {
       findings.push(finding(7, "high", "manual", `Partial view: ${keys.length} personal access key(s) seen, ${staleKeys.length} older than ${keyMaxAge} days.${scopeNote} Grant manageAccessKeys or export the org-wide key list.`, rotationEvidence));
       findings.push(finding(8, "medium", "manual", `Partial view: ${keys.length} personal access key(s) seen.${scopeNote} Grant manageAccessKeys or export the org-wide key list with last-used dates.`, { ...keyEvidenceBase }));
     } else {
@@ -1328,7 +1331,7 @@ export async function assessSumologicDataGovernance(
     const destinations = connectionList.map((connection) => ({ name: asString(connection.name) ?? asString(connection.id) ?? "connection", type: asString(connection.type) ?? "unknown", host: hostOf(asString(connection.url) ?? asString(asObject(connection.defaultPayload)?.url)) ?? null }));
     const unapproved = approvedDestinations.length > 0 ? destinations.filter((item) => !item.host || !domainMatches(item.host, approvedDestinations)) : [];
     const evidence = { connections_seen: connectionList.length, connections_complete: connections.complete, destinations, partitions_forwarding: names(forwardingPartitions), scheduled_views_forwarding: names(forwardingViews, "indexName"), approved_destination_domains: approvedDestinations, unapproved_destinations: unapproved.map((item) => item.name) };
-    if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok) {
+    if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok && partitionList.length > 0) {
       findings.push(withPartialDowngrade(finding(10, "medium", "pass", "Zero outbound connections and zero data forwarding destinations are configured (endpoints readable), so no external destination review is pending; emptiness is compliant for this control.", evidence), connections));
     } else if (approvedDestinations.length > 0 && unapproved.length > 0) {
       findings.push(finding(10, "medium", "fail", `${unapproved.length}/${connectionList.length} connections point outside the approved destination domains (${unapproved.map((item) => item.name).join(", ")}).${partialNote(connections)}`, evidence));
@@ -1491,8 +1494,12 @@ export async function assessSumologicContentSharing(
     findings.push(unreadable(19, "medium", "the share-dashboards-outside-organization policy", sharePolicy, "screenshot Administration > Security > Policies > Share Dashboards Outside Organization and list externally shared dashboards."));
   } else if (sharePolicy.data?.enabled === true) {
     findings.push(finding(19, "medium", "fail", `Sharing dashboards outside the organization is enabled; ${publicDashboards.length}/${dashboardList.length} seen dashboards are flagged public.`, dashboardEvidence));
+  } else if (sharePolicy.data?.enabled !== false) {
+    findings.push(finding(19, "medium", "manual", "The share-dashboards-outside-organization policy response did not include an enabled flag, so the external sharing state is unknown; confirm it in Administration > Security > Policies.", dashboardEvidence));
   } else if (!dashboards.ok) {
     findings.push(finding(19, "medium", "manual", `External dashboard sharing is disabled at the policy level, but the dashboard list was unreadable (${dashboards.error ?? "unknown error"}); review dashboard sharing in the Library manually.`, dashboardEvidence));
+  } else if (dashboardList.length === 0) {
+    findings.push(finding(19, "medium", "manual", "External dashboard sharing is disabled at the policy level, but zero dashboards were viewable by the key owner, so per-dashboard sharing could not be sampled; review Library dashboards manually.", dashboardEvidence));
   } else if (publicDashboards.length > 0) {
     findings.push(finding(19, "medium", "warn", `External sharing is disabled, but ${publicDashboards.length} dashboard(s) carry isPublic=true (${names(publicDashboards, "title").join(", ")}).${partialNote(dashboards)}`, dashboardEvidence));
   } else {
