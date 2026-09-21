@@ -17,14 +17,28 @@ import {
   assessDuoMonitoring,
   collectDuoAuthenticationData,
   exportDuoAuditBundle,
+  collectDuoAdminAccessData,
+  collectDuoIntegrationData,
+  collectDuoMonitoringData,
   projectCollectionStatus,
   redactBypassCodeRecords,
+  redactErrorText,
   redactIntegrationRecords,
   resolveDuoConfiguration,
   resolveSecureOutputPath,
   runDuoAccessCheck,
 } from "../dist/extensions/grc-tools/duo.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  CANARY,
+  HTML_BODY_NOTE,
+  REDACTED_CANARY_URL,
+  assertNoCanaries,
+  assertNoCanariesInFiles,
+  assertRedactionCases,
+  htmlCanaryBody,
+  jsonCanaryMessage,
+} from "./helpers/error-canaries.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1731,63 +1745,59 @@ test("rule 9: projectCollectionStatus keeps counts, totals, paging outcome, and 
     users: { readable: true, records: 1, total: 40, complete: false },
     settings: { readable: true },
     infoSummary: { readable: false, error: forbidden("/admin/v1/info/summary") },
-    telephonyLogs: { readable: false, records: 0, error: forbidden("/admin/v2/logs/telephony") },
+    telephonyLogs: { readable: false, records: null, error: forbidden("/admin/v2/logs/telephony") },
     authenticationAttempts: { readable: false, error: "not collected" },
   });
   assert.equal(JSON.stringify(projected).includes("alice@example.gov"), false);
 });
 
+const INTEGRATION_SECRET = "sk-integration-plaintext-9f8e7d6c";
+const BYPASS_CODE_VALUE = "402938475661";
+
+/** Every documented endpoint the client reads, answered healthily; each key is one surface. */
+function healthyDuoRoutes() {
+  const policy = compliantGlobalPolicy();
+  return {
+    "/admin/v1/settings": () => okEnvelope(compliantSettings()),
+    "/admin/v2/policies": () => okEnvelope([policy], { total_objects: 1 }),
+    "/admin/v2/policies/global": () => okEnvelope(policy),
+    "/admin/v1/users": () => okEnvelope([compliantUser("DU1", { username: "bundle-user@example.gov" })], { total_objects: 1 }),
+    "/admin/v1/bypass_codes": () =>
+      okEnvelope(
+        [{ bypass_code_id: "B1", code: BYPASS_CODE_VALUE, created: NOW_SECONDS - 3600, expiration: NOW_SECONDS + 3600, reuse_count: 1, user: { user_id: "DU1" } }],
+        { total_objects: 1 },
+      ),
+    "/admin/v1/webauthncredentials": () => okEnvelope([{ webauthnkey: "WK-DU1", uv_capable: true, user: { user_id: "DU1" } }], { total_objects: 1 }),
+    "/admin/v1/admins/allowed_auth_methods": () => okEnvelope({ webauthn_enabled: true, verified_push_enabled: true, sms_enabled: false, voice_enabled: false }),
+    "/admin/v2/logs/authentication": () => okEnvelope({ items: [locatedAuthEvent("tx-1", "DU1", "United States", 30)], metadata: {} }),
+    "/admin/v1/logs/offline_enrollment": () => okEnvelope([]),
+    "/admin/v1/admins": () => okEnvelope(compliantAdminData().admins.data, { total_objects: 2 }),
+    "/admin/v2/logs/activity": () => okEnvelope({ items: [{ txid: "a-1", action: "admin_login" }], metadata: {} }),
+    "/admin/v3/integrations": () =>
+      okEnvelope(
+        compliantIntegrationData().integrations.data.map((integration) => ({ ...integration, secret_key: INTEGRATION_SECRET })),
+        { total_objects: 2 },
+      ),
+    "/admin/v1/info/summary": () => okEnvelope({ edition: "Duo Premier", telephony_credits_remaining: 900 }),
+    "/admin/v2/logs/telephony": () => okEnvelope({ items: [], metadata: {} }),
+    "/admin/v1/trust_monitor/events": () => okEnvelope({ events: [{ sekey: "SE1", priority_event: false, state: "closed" }], metadata: {} }),
+    "/admin/v1/info/authentication_attempts": () => okEnvelope({ authentication_attempts: { ERROR: 0, FAILURE: 2, FRAUD: 0, SUCCESS: 98 } }),
+  };
+}
+
+function routedFetch(routes) {
+  return async (input) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    const route = routes[requestUrl.pathname];
+    if (!route) throw new Error(`Unexpected request: ${requestUrl.pathname}`);
+    return route();
+  };
+}
+
 test("rule 9: the exported bundle and its zip never contain the skey, integration secrets, or bypass code values, and collection_status.json is a projection", async () => {
-  const INTEGRATION_SECRET = "sk-integration-plaintext-9f8e7d6c";
-  const BYPASS_CODE_VALUE = "402938475661";
   const outputRoot = createTempBase("grclanker-duo-redaction-");
   const config = createSampleConfig();
-  const policy = compliantGlobalPolicy();
-  const fetchImpl = async (input) => {
-    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
-    switch (requestUrl.pathname) {
-      case "/admin/v1/settings":
-        return okEnvelope(compliantSettings());
-      case "/admin/v2/policies":
-        return okEnvelope([policy], { total_objects: 1 });
-      case "/admin/v2/policies/global":
-        return okEnvelope(policy);
-      case "/admin/v1/users":
-        return okEnvelope([compliantUser("DU1", { username: "bundle-user@example.gov" })], { total_objects: 1 });
-      case "/admin/v1/bypass_codes":
-        return okEnvelope(
-          [{ bypass_code_id: "B1", code: BYPASS_CODE_VALUE, created: NOW_SECONDS - 3600, expiration: NOW_SECONDS + 3600, reuse_count: 1, user: { user_id: "DU1" } }],
-          { total_objects: 1 },
-        );
-      case "/admin/v1/webauthncredentials":
-        return okEnvelope([{ webauthnkey: "WK-DU1", uv_capable: true, user: { user_id: "DU1" } }], { total_objects: 1 });
-      case "/admin/v1/admins/allowed_auth_methods":
-        return okEnvelope({ webauthn_enabled: true, verified_push_enabled: true, sms_enabled: false, voice_enabled: false });
-      case "/admin/v2/logs/authentication":
-        return okEnvelope({ items: [locatedAuthEvent("tx-1", "DU1", "United States", 30)], metadata: {} });
-      case "/admin/v1/logs/offline_enrollment":
-        return okEnvelope([]);
-      case "/admin/v1/admins":
-        return okEnvelope(compliantAdminData().admins.data, { total_objects: 2 });
-      case "/admin/v2/logs/activity":
-        return okEnvelope({ items: [{ txid: "a-1", action: "admin_login" }], metadata: {} });
-      case "/admin/v3/integrations":
-        return okEnvelope(
-          compliantIntegrationData().integrations.data.map((integration) => ({ ...integration, secret_key: INTEGRATION_SECRET })),
-          { total_objects: 2 },
-        );
-      case "/admin/v1/info/summary":
-        return okEnvelope({ edition: "Duo Premier", telephony_credits_remaining: 900 });
-      case "/admin/v2/logs/telephony":
-        return forbiddenResponse();
-      case "/admin/v1/trust_monitor/events":
-        return okEnvelope({ events: [{ sekey: "SE1", priority_event: false, state: "closed" }], metadata: {} });
-      case "/admin/v1/info/authentication_attempts":
-        return okEnvelope({ authentication_attempts: { ERROR: 0, FAILURE: 2, FRAUD: 0, SUCCESS: 98 } });
-      default:
-        throw new Error(`Unexpected request: ${requestUrl.pathname}`);
-    }
-  };
+  const fetchImpl = routedFetch({ ...healthyDuoRoutes(), "/admin/v2/logs/telephony": () => forbiddenResponse() });
   const client = new DuoAuditorClient(config, { fetchImpl });
 
   const result = await exportDuoAuditBundle(client, config, outputRoot);
@@ -1810,8 +1820,90 @@ test("rule 9: the exported bundle and its zip never contain the skey, integratio
   assert.equal(status.monitoring.telephonyLogs.readable, false);
   assert.match(status.monitoring.telephonyLogs.error, /\/admin\/v2\/logs\/telephony \(403 Forbidden\): Access denied: Insufficient permissions/);
   assert.equal(JSON.stringify(status).includes("bundle-user@example.gov"), false, "collection_status.json carries no records");
+  assert.equal(status.monitoring.telephonyLogs.records, null, "an unread list never reports a record count");
+  assert.equal(files.get("core_data/telephony_logs.json").trim(), "null", "an unread dataset is written as null, not its empty fallback");
   assert.equal(result.errorCount, 1);
   assert.match(files.get("_errors.log"), /\/admin\/v2\/logs\/telephony/);
+});
+
+test("rule 9: redactErrorText scrubs every credential shape anywhere in an error string and leaves prose alone", () => {
+  assertRedactionCases(assert, redactErrorText);
+  assert.equal(redactErrorText(`skey ${createSampleConfig().skey} echoed`), "skey [REDACTED] echoed", "the configured skey is scrubbed wherever it appears");
+});
+
+const DUO_ACCESS_PROBE_PATHS = new Set([
+  "/admin/v1/settings",
+  "/admin/v1/users",
+  "/admin/v2/policies",
+  "/admin/v1/admins",
+  "/admin/v2/logs/authentication",
+  "/admin/v3/integrations",
+]);
+
+function canaryHtmlResponse() {
+  return new Response(htmlCanaryBody(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function canaryJsonResponse() {
+  return new Response(
+    JSON.stringify({ stat: "FAIL", code: 40301, message: jsonCanaryMessage(), message_detail: `token=${CANARY.urlToken}` }),
+    { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } },
+  );
+}
+
+test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
+  const config = createSampleConfig();
+  const outputRoot = createTempBase("grclanker-duo-canary-");
+  const surfaces = Object.keys(healthyDuoRoutes());
+  assert.ok(surfaces.length >= 16, "every documented endpoint is a surface");
+
+  for (const surface of surfaces) {
+    for (const [variant, response, expectedNote] of [
+      ["html", canaryHtmlResponse, HTML_BODY_NOTE],
+      ["json", canaryJsonResponse, REDACTED_CANARY_URL],
+    ]) {
+      const label = `${surface} (${variant})`;
+      const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: response }) });
+
+      const access = await runDuoAccessCheck(client, config);
+      assertNoCanaries(assert, access, `${label} check_access`);
+      if (DUO_ACCESS_PROBE_PATHS.has(surface)) {
+        const probe = access.probes.find((entry) => entry.path === surface);
+        assert.ok(probe && probe.status !== "ok", `${label}: the probe for the failing surface is not ok`);
+        assert.match(probe.detail, expectedNote, `${label}: probe detail carries the expected note`);
+      }
+
+      const datasets = [
+        await collectDuoAuthenticationData(client, config.lookbackDays),
+        await collectDuoAdminAccessData(client, config.lookbackDays),
+        await collectDuoIntegrationData(client),
+        await collectDuoMonitoringData(client, config.lookbackDays),
+      ];
+      const assessments = [
+        assessDuoAuthentication(datasets[0], config),
+        assessDuoAdminAccess(datasets[1], config),
+        assessDuoIntegrations(datasets[2], config),
+        assessDuoMonitoring(datasets[3], config),
+      ];
+      const recordedErrors = datasets.flatMap((data) => Object.values(data).flatMap((dataset) => (dataset?.error ? [dataset.error] : [])));
+      assert.ok(recordedErrors.length > 0, `${label}: the failing surface records an error`);
+      for (const error of recordedErrors) {
+        assertNoCanaries(assert, error, `${label} dataset error`);
+        assert.match(error, expectedNote, `${label}: dataset error carries the expected note`);
+      }
+      for (const assessment of assessments) {
+        assertNoCanaries(assert, assessment, `${label} ${assessment.category} assessment`);
+      }
+
+      const exported = await exportDuoAuditBundle(client, config, outputRoot);
+      const files = readBundleFiles(exported.outputDir);
+      assertNoCanariesInFiles(assert, files, `${label} bundle`);
+      assertNoCanariesInFiles(assert, readZipEntries(exported.zipPath), `${label} zip`);
+      assert.ok(exported.errorCount > 0, `${label}: the export records the failed read`);
+      assert.match(files.get("_errors.log"), expectedNote, `${label}: _errors.log carries the expected note`);
+      if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\): non-JSON body \(text\/html/);
+    }
+  }
 });
 
 function statusesOf(result) {
@@ -2045,6 +2137,21 @@ const SECONDARY_DENIALS = [
   },
 ];
 
+/** Snapshot summary fields that are derived from each list dataset; all must read as unread when that list is denied. */
+const SNAPSHOT_FIELDS_BY_DATASET = {
+  users: ["users"],
+  bypassCodes: ["active_bypass_codes"],
+  webauthnCredentials: ["webauthn_credentials"],
+  authenticationLogs: ["auth_logs_collected"],
+  offlineEnrollmentLogs: ["offline_enrollment_events"],
+  admins: ["admins", "owners", "stale_admins", "undated_admins"],
+  activityLogs: ["activity_logs_collected"],
+  integrations: ["protected_integrations", "adminapi_integrations", "overprivileged_adminapi_integrations"],
+  policies: ["policies"],
+  trustMonitorEvents: ["trust_monitor_events"],
+  telephonyLogs: ["telephony_logs"],
+};
+
 test("rule 1 corollary: denying one secondary read at a time never passes a dependent finding silently and never moves unrelated findings", () => {
   const config = createSampleConfig();
   for (const denial of SECONDARY_DENIALS) {
@@ -2063,7 +2170,42 @@ test("rule 1 corollary: denying one secondary read at a time never passes a depe
     for (const finding of result.findings.filter((item) => item.status === "Manual")) {
       assertManualContext(finding);
     }
+    for (const field of SNAPSHOT_FIELDS_BY_DATASET[denial.key] ?? []) {
+      if (!(field in result.snapshotSummary)) continue;
+      assert.equal(result.snapshotSummary[field], null, `${label}: snapshot ${field} must be null, not a count derived from the empty fallback`);
+      assert.match(result.text, new RegExp(`${field.replace(/_/g, " ")}: unread`), `${label}: the text summary renders ${field} as unread`);
+    }
     denial.snapshot?.(result);
+  }
+});
+
+test("rule 1 corollary: every list dataset renders null in the snapshot summary and null in core_data when it is denied", async () => {
+  const config = createSampleConfig();
+  const assessors = {
+    authentication: [collectDuoAuthenticationData, assessDuoAuthentication],
+    admin_access: [collectDuoAdminAccessData, assessDuoAdminAccess],
+    integrations: [collectDuoIntegrationData, assessDuoIntegrations],
+    monitoring: [collectDuoMonitoringData, assessDuoMonitoring],
+  };
+  const listSurfaces = {
+    "/admin/v1/users": ["authentication", "users"],
+    "/admin/v1/bypass_codes": ["authentication", "active_bypass_codes"],
+    "/admin/v1/webauthncredentials": ["authentication", "webauthn_credentials"],
+    "/admin/v2/logs/authentication": ["authentication", "auth_logs_collected"],
+    "/admin/v1/logs/offline_enrollment": ["authentication", "offline_enrollment_events"],
+    "/admin/v1/admins": ["admin_access", "admins"],
+    "/admin/v2/logs/activity": ["admin_access", "activity_logs_collected"],
+    "/admin/v3/integrations": ["integrations", "protected_integrations"],
+    "/admin/v2/policies": ["integrations", "policies"],
+    "/admin/v1/trust_monitor/events": ["monitoring", "trust_monitor_events"],
+    "/admin/v2/logs/telephony": ["monitoring", "telephony_logs"],
+  };
+  for (const [surface, [category, field]] of Object.entries(listSurfaces)) {
+    const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: () => forbiddenResponse() }) });
+    const [collect, assess] = assessors[category];
+    const result = assess(await collect(client, config.lookbackDays), config);
+    assert.equal(result.snapshotSummary[field], null, `${surface} denied: ${category} snapshot ${field} is null`);
+    assert.match(result.text, new RegExp(`${field.replace(/_/g, " ")}: unread`), `${surface} denied: text renders ${field} as unread`);
   }
 });
 
