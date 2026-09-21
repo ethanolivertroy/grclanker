@@ -127,7 +127,7 @@ Status semantics: `pass` means the API evidence satisfies the control, `warn` me
 | 13 | Legal hold policies | data_governance | BOX-13 | pass when active holds have assignments; warn when unassigned or none exist; manual without Governance access |
 | 14 | Shield smart access policies | shield_monitoring | BOX-14 | pass when Shield rules exist in the `shield` configuration category; fail when the category is readable but empty; manual without Shield access or when the category is null |
 | 15 | Shield information barriers | shield_monitoring | BOX-15 | pass when enabled barriers have segments; warn when disabled, unsegmented, or absent |
-| 16 | Enterprise event streaming | shield_monitoring | BOX-16 | pass when `admin_logs` returns events in the window; warn when empty; manual when unreadable |
+| 16 | Enterprise event streaming | shield_monitoring | BOX-16 | pass when `admin_logs` returns events in the window, stated explicitly as verifying stream readability only (`siem_consumption_verified: false`) with SIEM consumption left to the listed manual evidence; warn when empty; manual when unreadable |
 | 17 | Admin role minimization | identity_access | BOX-17 | pass when admin plus co-admin count is at or below `max_admins`; warn above |
 | 18 | Co-admin permission scoping | identity_access | BOX-18 | pass when no co-admins exist; manual otherwise because co-admin permission sets are not exposed |
 | 19 | App approval process | sharing_collaboration | BOX-19 | manual: reports app authorization events and integration Shield lists, approval policy must be confirmed in the Admin Console |
@@ -156,7 +156,7 @@ The script exits 0 with a skip message when no Box credentials are present. With
 - Inactive user detection correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar) because the user object has no last login field. `FAILED_LOGIN` events are recorded in the evidence (`failed_login_events`, `inactive_candidates_with_failed_logins`) but do not make an account active, so a user who only receives credential-stuffing attempts still counts as inactive. Raise `event_limit` for large enterprises; a truncated sample is reported as `warn`.
 - Enterprise configuration, Shield lists, and Shield rules come from the versioned `2025.0` endpoints and require Manage enterprise properties. Retention and legal hold endpoints require Box Governance, Shield endpoints require Box Shield; missing licenses surface as `manual` findings with the reason.
 - Box's published rate limit is 1000 API requests per minute per user; the client honors `retry-after` on 429 and applies exponential backoff on 5xx.
-- Watermarking, classification application, and SIEM consumption of the event stream are verified at the enterprise level; sampled folder reviews remain a human step and are listed in `manualEvidence`.
+- Watermarking and classification are verified at the enterprise feature level; sampled folder reviews remain a human step and are listed in `manualEvidence`. The event stream check (BOX-16) verifies only that `admin_logs` is active and readable; whether a SIEM consumes it is not exposed by the API and stays in `manualEvidence`.
 
 ## Official documentation
 

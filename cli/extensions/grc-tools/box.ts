@@ -2502,13 +2502,16 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     event_types: eventCounts,
     lookback_days: data.lookbackDays,
     events_error: data.events.error ?? null,
+    verified_scope: "admin_logs stream readability only",
+    siem_consumption_verified: false,
   };
+  const streamManualEvidence = "Admin Console > Reports and Box Shield > SIEM integrations, or the Events API consumer configuration: record which SIEM or log pipeline polls the enterprise event stream (service account and stream_position checkpoint), confirm it is receiving events, and record how alerting is configured.";
   findings.push(
-    data.events.error
-      ? finding(16, "manual", `The enterprise event stream could not be read because ${unreadableReason(data.events)}; the admin_logs stream requires an admin or co-admin with report permissions or the manage_enterprise_properties scope.`, streamEvidence, "Admin Console > Reports and Box Shield > SIEM integrations: confirm enterprise events are exported to the SIEM and record the integration or Events API consumer.")
+    !eventsReadable
+      ? finding(16, "manual", `The enterprise event stream could not be read because ${unreadableReason(data.events)}; the admin_logs stream requires an admin or co-admin with report permissions or the manage_enterprise_properties scope.`, streamEvidence, streamManualEvidence)
       : events.length > 0
-        ? finding(16, "pass", `The enterprise admin_logs event stream is readable and returned ${events.length} monitoring events in the last ${data.lookbackDays} days; confirm a SIEM consumes it.`, streamEvidence, "Record which SIEM or log pipeline polls the enterprise event stream and how alerting is configured.")
-        : finding(16, "warn", `The enterprise event stream is readable but returned no monitoring events in the last ${data.lookbackDays} days.`, streamEvidence),
+        ? finding(16, "pass", `Verified only that the enterprise admin_logs event stream is active and readable (${events.length} monitoring events in the last ${data.lookbackDays} days); the Box API does not expose whether a SIEM consumes the stream, so SIEM consumption still requires the manual evidence listed.`, streamEvidence, streamManualEvidence)
+        : finding(16, "warn", `The enterprise event stream is readable but returned no monitoring events in the last ${data.lookbackDays} days, and the Box API does not expose whether a SIEM consumes the stream.`, streamEvidence, streamManualEvidence),
   );
 
   const anomalyEvents = events.filter((event) => /^(SHIELD_ALERT|CONTENT_WORKFLOW_ABNORMAL_DOWNLOAD_ACTIVITY|SHIELD_DOWNLOAD_BLOCKED|SHIELD_SHARED_LINK_ACCESS_BLOCKED|FILE_MARKED_MALICIOUS)$/.test(eventType(event)));

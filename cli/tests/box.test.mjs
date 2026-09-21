@@ -1188,6 +1188,14 @@ test("assessBoxShieldMonitoring passes with Shield rules, barriers, streamed eve
   assert.equal(findingById(result, "BOX-25").evidence.anomaly_events, 1);
   assert.equal(result.summary.sampled_events, 2);
   assert.deepEqual(result.errors, []);
+
+  const streaming = findingById(result, "BOX-16");
+  assert.match(streaming.summary, /^Verified only that the enterprise admin_logs event stream is active and readable/);
+  assert.match(streaming.summary, /SIEM consumption still requires the manual evidence/);
+  assert.match(streaming.manualEvidence, /SIEM/);
+  assert.match(streaming.manualEvidence, /stream_position/);
+  assert.equal(streaming.evidence.siem_consumption_verified, false);
+  assert.equal(streaming.evidence.verified_scope, "admin_logs stream readability only");
 });
 
 test("assessBoxShieldMonitoring fails when Shield rules and monitoring signals are absent", async () => {
@@ -1199,6 +1207,8 @@ test("assessBoxShieldMonitoring fails when Shield rules and monitoring signals a
     "BOX-25": "fail",
   });
   assertMappings(result);
+  assert.match(findingById(result, "BOX-16").summary, /returned no monitoring events/);
+  assert.match(findingById(result, "BOX-16").manualEvidence, /SIEM/);
 
   const unreadable = await assessBoxShieldMonitoring(createStubClient(weakFixture(), {
     getEnterpriseConfiguration: forbidden("Shield not licensed"),
