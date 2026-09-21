@@ -3,13 +3,16 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { generateKeyPairSync } from "node:crypto";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   GitHubAuditorClient,
@@ -27,6 +30,7 @@ import {
   collectGitHubOrgAccessData,
   collectGitHubRepoProtectionData,
   exportGitHubAuditBundle,
+  redactSensitiveKeys,
   resolveGitHubConfiguration,
   resolveSecureOutputPath,
   runGitHubAccessCheck,
@@ -1860,6 +1864,220 @@ test("self-check (f): enforced defaults for every visibility pass without the de
   for (const id of ["GITHUB-CODE-002", "GITHUB-CODE-003", "GITHUB-CODE-004", "GITHUB-CODE-005"]) {
     assert.equal(split[id].status, "Pass", `${id} should pass when public and private_and_internal defaults are both enforced`);
   }
+});
+
+const CANARIES = {
+  pat: "ghp_FAKE_PAT_CANARY_00",
+  auditHookSecret: "FAKE_AUDIT_HOOK_SECRET_01",
+  auditHookSecretWas: "FAKE_AUDIT_HOOK_SECRET_WAS_02",
+  auditDataToken: "FAKE_AUDIT_DATA_TOKEN_03",
+  auditDataNested: "FAKE_AUDIT_DATA_NESTED_04",
+  auditOpenSshKey: "AAAAC3NzaC1lZDI1NTE5FAKE_OPENSSH_PUBLIC_KEY_05",
+  tokenLastEight: "FAKE_TOKEN_LAST_EIGHT_06",
+  credentialFingerprint: "FAKE_CREDENTIAL_FINGERPRINT_07",
+  orgHookSecret: "FAKE_ORG_HOOK_SECRET_08",
+  repoHookSecret: "FAKE_REPO_HOOK_SECRET_09",
+  deployKeyMaterial: "AAAAC3NzaC1lZDI1NTE5FAKE_DEPLOY_KEY_MATERIAL_10",
+  undocumentedOrgBag: "FAKE_UNDOCUMENTED_ORG_FIELD_11",
+  invitationEmail: "canary-invitee@FAKE_INVITATION_EMAIL_12.test",
+  runnerExtra: "FAKE_RUNNER_EXTRA_13",
+};
+
+function createCanaryFetch() {
+  const configuration = createCodeSecurityConfiguration();
+  const routes = [
+    [/^\/orgs\/example-org$/, { ...SELF_CHECK_ORG, undocumented_bag: { anything: CANARIES.undocumentedOrgBag } }],
+    [/^\/orgs\/example-org\/members$/, (url) => (url.searchParams.get("filter") === "2fa_disabled" ? [] : [{ login: "alice", id: 1 }, { login: "bob", id: 2 }])],
+    [/^\/orgs\/example-org\/outside_collaborators$/, []],
+    [/^\/orgs\/example-org\/invitations$/, [{ id: 7, login: "invitee", email: CANARIES.invitationEmail, role: "direct_member", created_at: "2026-09-01T00:00:00Z" }]],
+    [/^\/orgs\/example-org\/organization-roles$/, { total_count: 1, roles: [{ id: 1, name: "all_repo_read" }] }],
+    [/^\/orgs\/example-org\/credential-authorizations$/, [{
+      login: "alice",
+      credential_id: 1,
+      credential_type: "personal access token",
+      token_last_eight: CANARIES.tokenLastEight,
+      fingerprint: CANARIES.credentialFingerprint,
+      credential_authorized_at: "2026-01-01T00:00:00Z",
+      scopes: ["repo", "read:org"],
+    }]],
+    [/^\/orgs\/example-org\/audit-log$/, [
+      {
+        "@timestamp": 1758400000000,
+        action: "hook.create",
+        actor: "alice",
+        org: "example-org",
+        hook_id: 100,
+        config: [{ url: "https://siem.example.test/github", secret: CANARIES.auditHookSecret, content_type: "json" }],
+        config_was: [{ url: "https://old.example.test/github", secret: CANARIES.auditHookSecretWas }],
+        data: { token: CANARIES.auditDataToken, nested: { free_form: CANARIES.auditDataNested } },
+      },
+      { "@timestamp": 1758400001000, action: "public_key.create", actor: "bob", openssh_public_key: `ssh-ed25519 ${CANARIES.auditOpenSshKey}` },
+    ]],
+    [/^\/orgs\/example-org\/hooks$/, [{ id: 100, name: "web", active: true, events: ["push"], config: { url: "https://siem.example.test/github", content_type: "json", insecure_ssl: "0", secret: CANARIES.orgHookSecret } }]],
+    [/^\/orgs\/example-org\/installations$/, { total_count: 1, installations: [{ id: 99, app_slug: "compliance-bot", repository_selection: "selected", permissions: { metadata: "read" }, suspended_at: null, created_at: "2025-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", account: { login: "example-org" } }] }],
+    [/^\/orgs\/example-org\/repos$/, SELF_CHECK_REPOS],
+    [/^\/orgs\/example-org\/rulesets$/, [{ id: 1, enforcement: "active", target: "branch", rules: SELF_CHECK_RULES.map((rule) => ({ type: rule.type })) }]],
+    [/^\/repos\/example-org\/[^/]+\/rulesets$/, []],
+    [/^\/repos\/example-org\/[^/]+\/branches\/[^/]+\/protection$/, SELF_CHECK_PROTECTION],
+    [/^\/repos\/example-org\/[^/]+\/rules\/branches\/[^/]+$/, SELF_CHECK_RULES],
+    [/^\/repos\/example-org\/[^/]+\/hooks$/, [{ id: 5, name: "web", active: true, config: { url: "https://ci.example.test/hook", insecure_ssl: "0", secret: CANARIES.repoHookSecret } }]],
+    [/^\/repos\/example-org\/[^/]+\/keys$/, [{ id: 1, title: "reader", key: `ssh-ed25519 ${CANARIES.deployKeyMaterial}`, read_only: true, verified: true, created_at: "2026-06-01T00:00:00Z", last_used: "2026-09-01T00:00:00Z" }]],
+    [/^\/orgs\/example-org\/actions\/permissions$/, { enabled_repositories: "selected", allowed_actions: "selected" }],
+    [/^\/orgs\/example-org\/actions\/permissions\/selected-actions$/, { github_owned_allowed: true, verified_allowed: false, patterns_allowed: ["example-org/*"] }],
+    [/^\/orgs\/example-org\/actions\/permissions\/workflow$/, { default_workflow_permissions: "read", can_approve_pull_request_reviews: false }],
+    [/^\/orgs\/example-org\/actions\/runner-groups$/, { total_count: 1, runner_groups: [{ id: 1, name: "prod", visibility: "selected", allows_public_repositories: false, restricted_to_workflows: true, runners_url: `https://api.github.com/${CANARIES.runnerExtra}` }] }],
+    [/^\/orgs\/example-org\/actions\/runners$/, { total_count: 1, runners: [{ id: 1, name: "runner-1", os: "linux", status: "online", labels: [{ id: 1, name: "self-hosted", type: "read-only" }] }] }],
+    [/^\/orgs\/example-org\/code-security\/configurations$/, [configuration]],
+    [/^\/orgs\/example-org\/code-security\/configurations\/defaults$/, [{ default_for_new_repos: "all", configuration }]],
+  ];
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push(url.pathname);
+    assert.equal(init.headers.Authorization, `Bearer ${CANARIES.pat}`);
+    if (url.pathname === "/graphql") {
+      const body = JSON.parse(init.body);
+      if (body.query.includes("GrclankerOrganizationSaml")) {
+        return jsonResponse({ data: { organization: { requiresTwoFactorAuthentication: true, samlIdentityProvider: {
+          ssoUrl: "https://idp.example.test/sso", issuer: "https://idp.example.test", digestMethod: null, signatureMethod: null,
+          externalIdentities: { totalCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+            { guid: "1", samlIdentity: { nameId: "alice@example.test" }, scimIdentity: null, user: { login: "alice" } },
+            { guid: "2", samlIdentity: { nameId: "bob@example.test" }, scimIdentity: null, user: { login: "bob" } },
+          ] } } } } });
+      }
+      if (body.query.includes("GrclankerOrganizationIpAllowList")) {
+        return jsonResponse({ data: { organization: { ipAllowListEnabledSetting: "ENABLED", ipAllowListForInstalledAppsEnabledSetting: "ENABLED",
+          ipAllowListEntries: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ allowListValue: "203.0.113.0/24", isActive: true, name: "HQ", createdAt: "2025-01-01T00:00:00Z" }] } } } });
+      }
+      if (body.query.includes("GrclankerEnterpriseIdentity")) {
+        return jsonResponse({ data: { enterprise: { slug: "example-enterprise", ownerInfo: { oidcProvider: { providerType: "AAD", tenantId: "tenant" }, samlIdentityProvider: null } } } });
+      }
+      throw new Error(`Unexpected GraphQL query: ${body.query.slice(0, 40)}`);
+    }
+    for (const [pattern, payload] of routes) {
+      if (pattern.test(url.pathname)) {
+        return jsonResponse(typeof payload === "function" ? payload(url) : payload);
+      }
+    }
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  };
+  return { fetchImpl, requests };
+}
+
+function walkFiles(root) {
+  const files = [];
+  const visit = (dir) => {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        visit(full);
+      } else {
+        files.push(full);
+      }
+    }
+  };
+  visit(root);
+  return files;
+}
+
+// Minimal zip reader (central directory + raw deflate) so the extracted archive is inspected
+// without a shell dependency; archiver writes data descriptors, so sizes come from the directory.
+function readZipEntries(buffer) {
+  let eocd = -1;
+  for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 65557); offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      eocd = offset;
+      break;
+    }
+  }
+  assert.notEqual(eocd, -1, "zip end of central directory record found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory entry signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    assert.equal(buffer.readUInt32LE(localOffset), 0x04034b50, "local file header signature");
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.push({ name, content: (method === 8 ? inflateRawSync(data) : data).toString("utf8") });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+test("rule 9: no credential-bearing value from any documented carrier reaches the bundle directory or the zip", async () => {
+  const outputRoot = createTempBase("grclanker-github-canary-");
+  const config = { ...SELF_CHECK_CONFIG, apiToken: CANARIES.pat, graphqlUrl: "https://api.github.com/graphql", enterprise: "example-enterprise" };
+  const { fetchImpl, requests } = createCanaryFetch();
+  const client = new GitHubAuditorClient(config, fetchImpl);
+  const result = await exportGitHubAuditBundle(client, config, outputRoot);
+  assert.ok(requests.includes("/orgs/example-org/audit-log"));
+  assert.ok(requests.includes("/repos/example-org/app-one/keys"));
+
+  const files = walkFiles(result.outputDir);
+  assert.ok(files.some((file) => file.endsWith(join("core_data", "org_access.json"))));
+  assert.ok(files.some((file) => file.endsWith(join("core_data", "integrations.json"))));
+  assert.ok(!files.some((file) => file.endsWith("_errors.log")), "the canary tenant collects cleanly, so no carrier was skipped by an error");
+  const carriers = [
+    ...files.filter((file) => !file.endsWith(".zip")).map((file) => ({ name: relative(result.outputDir, file), content: readFileSync(file, "utf8") })),
+    ...readZipEntries(readFileSync(result.zipPath)).map((entry) => ({ name: `zip:${entry.name}`, content: entry.content })),
+  ];
+  assert.ok(carriers.some((carrier) => carrier.name.startsWith("zip:")), "the zip contains entries");
+  assert.ok(carriers.some((carrier) => carrier.name.startsWith("zip:") && carrier.name.includes("core_data/org_access.json")));
+  const leaks = [];
+  for (const carrier of carriers) {
+    for (const [label, canary] of Object.entries(CANARIES)) {
+      if (carrier.content.includes(canary)) {
+        leaks.push(`${label} -> ${carrier.name}`);
+      }
+    }
+  }
+  assert.deepEqual(leaks, [], "no canary may appear in any bundle file or zip entry");
+  assert.ok(carriers.find((carrier) => carrier.name === "zip:analysis/findings.json" || carrier.name.endsWith("/analysis/findings.json"))?.content.includes("GITHUB-ORG-001"), "zip entries decode to their content");
+
+  // Presence markers survive so the verdicts and the evidence stay legible without the values.
+  const orgAccess = JSON.parse(readFileSync(join(result.outputDir, "core_data", "org_access.json"), "utf8"));
+  assert.equal(orgAccess.hooks.data[0].config.secret, "[redacted]");
+  assert.equal(orgAccess.hooks.data[0].config.url, "https://siem.example.test/github");
+  assert.deepEqual(Object.keys(orgAccess.auditLog.data.events[0]).sort(), ["@timestamp", "action", "actor", "org"]);
+  assert.equal(orgAccess.credentialAuthorizations.data[0].token_last_eight, undefined);
+  assert.equal(orgAccess.credentialAuthorizations.data[0].credential_type, "personal access token");
+  assert.equal(orgAccess.org.data.undocumented_bag, undefined);
+  assert.equal(orgAccess.invitations.data[0].email, undefined);
+  const integrations = JSON.parse(readFileSync(join(result.outputDir, "core_data", "integrations.json"), "utf8"));
+  const keyEntry = integrations.deployKeys.data["example-org/app-one"].items[0];
+  assert.equal(keyEntry.key, undefined);
+  assert.equal(keyEntry.read_only, true);
+  assert.equal(integrations.repoHooks.data["example-org/app-one"].items[0].config.secret, "[redacted]");
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  const byId = Object.fromEntries(findings.map((finding) => [finding.id, finding]));
+  assert.equal(byId["GITHUB-INTEG-001"].status, "Pass", "webhook secrets still count as present after redaction");
+  assert.equal(byId["GITHUB-INTEG-002"].status, "Pass");
+  assert.equal(byId["GITHUB-ORG-005"].status, "Pass");
+});
+
+test("redactSensitiveKeys masks credential-named keys at any depth and leaves look-alike names alone", () => {
+  const redacted = redactSensitiveKeys({
+    secret: "value",
+    nested: [{ Token: "t", "token_last_eight": "abc", access_token: "x", secret_scanning_default: "Pass", token_scopes: ["repo"] }],
+    empty_secret: "",
+    password: null,
+    openssh_public_key: "ssh-ed25519 AAA",
+  });
+  assert.deepEqual(redacted, {
+    secret: "[redacted]",
+    nested: [{ Token: "[redacted]", token_last_eight: "[redacted]", access_token: "[redacted]", secret_scanning_default: "Pass", token_scopes: ["repo"] }],
+    empty_secret: "",
+    password: null,
+    openssh_public_key: "[redacted]",
+  });
 });
 
 test("exportGitHubAuditBundle records collector failures and never overwrites a prior bundle", async () => {

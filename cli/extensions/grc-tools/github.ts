@@ -1459,15 +1459,15 @@ export class GitHubAuditorClient {
 
   async getOrganization(): Promise<JsonRecord> {
     const { payload } = await this.requestJson<JsonRecord>(`/orgs/${this.config.organization}`);
-    return asRecord(payload);
+    return projectOrganization(asRecord(payload));
   }
 
   async listMembers(role: "all" | "admin" = "all"): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/members?per_page=${PAGE_SIZE}&role=${role}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/members?per_page=${PAGE_SIZE}&role=${role}`, projectSimpleUser);
   }
 
   async listTwoFactorDisabledMembers(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/members?per_page=${PAGE_SIZE}&filter=2fa_disabled`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/members?per_page=${PAGE_SIZE}&filter=2fa_disabled`, projectSimpleUser);
   }
 
   async getSamlIdentitySnapshot(): Promise<GitHubSamlIdentitySnapshot> {
@@ -1587,19 +1587,19 @@ export class GitHubAuditorClient {
   }
 
   async listOutsideCollaborators(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/outside_collaborators?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/outside_collaborators?per_page=${PAGE_SIZE}`, projectSimpleUser);
   }
 
   async listInvitations(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/invitations?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/invitations?per_page=${PAGE_SIZE}`, projectInvitation);
   }
 
   async listOrganizationRoles(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/organization-roles?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/organization-roles?per_page=${PAGE_SIZE}`, projectOrganizationRole);
   }
 
   async listCredentialAuthorizations(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/credential-authorizations?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/credential-authorizations?per_page=${PAGE_SIZE}`, projectCredentialAuthorization);
   }
 
   // The audit log `after` parameter is an opaque pagination cursor, not a timestamp; the lookback
@@ -1621,23 +1621,23 @@ export class GitHubAuditorClient {
   }
 
   async listHooks(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/hooks?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/hooks?per_page=${PAGE_SIZE}`, projectWebhook);
   }
 
   async listInstallations(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/installations?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/installations?per_page=${PAGE_SIZE}`, projectAppInstallation);
   }
 
   async listRepositories(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/repos?per_page=${PAGE_SIZE}&type=all`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/repos?per_page=${PAGE_SIZE}&type=all`, projectRepository);
   }
 
   async listOrgRulesets(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/rulesets?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/rulesets?per_page=${PAGE_SIZE}`, projectRuleset);
   }
 
   async listRepoRulesets(owner: string, repo: string): Promise<JsonRecord[]> {
-    return this.paginate(`/repos/${owner}/${repo}/rulesets?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/repos/${owner}/${repo}/rulesets?per_page=${PAGE_SIZE}`, projectRuleset);
   }
 
   async getBranchProtection(owner: string, repo: string, branch: string): Promise<JsonRecord | null> {
@@ -1645,58 +1645,66 @@ export class GitHubAuditorClient {
       `/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}/protection`,
       { allow404: true },
     );
-    return payload ? asRecord(payload) : null;
+    return payload ? projectBranchProtection(asRecord(payload)) : null;
   }
 
   async listBranchRules(owner: string, repo: string, branch: string): Promise<JsonRecord[]> {
-    return this.paginate(`/repos/${owner}/${repo}/rules/branches/${encodeURIComponent(branch)}?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/repos/${owner}/${repo}/rules/branches/${encodeURIComponent(branch)}?per_page=${PAGE_SIZE}`, projectBranchRule);
   }
 
   async listRepoHooks(owner: string, repo: string): Promise<JsonRecord[]> {
-    return this.paginate(`/repos/${owner}/${repo}/hooks?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/repos/${owner}/${repo}/hooks?per_page=${PAGE_SIZE}`, projectWebhook);
   }
 
   async listDeployKeys(owner: string, repo: string): Promise<JsonRecord[]> {
-    return this.paginate(`/repos/${owner}/${repo}/keys?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/repos/${owner}/${repo}/keys?per_page=${PAGE_SIZE}`, projectDeployKey);
   }
 
   async getOrgActionsPermissions(): Promise<JsonRecord> {
     const { payload } = await this.requestJson<JsonRecord>(`/orgs/${this.config.organization}/actions/permissions`);
-    return asRecord(payload);
+    return pickFields(asRecord(payload), ACTIONS_PERMISSIONS_FIELDS);
   }
 
   async getOrgSelectedActions(): Promise<JsonRecord> {
     const { payload } = await this.requestJson<JsonRecord>(`/orgs/${this.config.organization}/actions/permissions/selected-actions`);
-    return asRecord(payload);
+    return pickFields(asRecord(payload), SELECTED_ACTIONS_FIELDS);
   }
 
   async getOrgWorkflowPermissions(): Promise<JsonRecord> {
     const { payload } = await this.requestJson<JsonRecord>(`/orgs/${this.config.organization}/actions/permissions/workflow`);
-    return asRecord(payload);
+    return pickFields(asRecord(payload), WORKFLOW_PERMISSIONS_FIELDS);
   }
 
   async listRunnerGroups(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/actions/runner-groups?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/actions/runner-groups?per_page=${PAGE_SIZE}`, projectRunnerGroup);
   }
 
   async listRunners(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/actions/runners?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/actions/runners?per_page=${PAGE_SIZE}`, projectRunner);
   }
 
   async listCodeSecurityConfigurations(): Promise<JsonRecord[]> {
-    return this.paginate(`/orgs/${this.config.organization}/code-security/configurations?per_page=${PAGE_SIZE}`);
+    return this.paginateProjected(`/orgs/${this.config.organization}/code-security/configurations?per_page=${PAGE_SIZE}`, projectCodeSecurityConfiguration);
   }
 
   // code-security/get-default-configurations: each entry pairs default_for_new_repos
   // (public | private_and_internal | all) with the configuration applied to that visibility.
   async listCodeSecurityDefaultConfigurations(): Promise<JsonRecord[]> {
     const { payload } = await this.requestJson(`/orgs/${this.config.organization}/code-security/configurations/defaults`);
-    return extractRecords(payload);
+    return extractRecords(payload).map(projectCodeSecurityDefault);
   }
 
   private async paginate(pathname: string): Promise<JsonRecord[]> {
     const { records } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
     return records;
+  }
+
+  // Every persisted REST record is projected to the fields the verdicts read (rule 9): the API
+  // responses carry webhook secrets, deploy key material, token fragments, and unconstrained bags
+  // that must never reach the evidence bundle.
+  private async paginateProjected(pathname: string, project: (record: JsonRecord) => JsonRecord): Promise<JsonRecord[]> {
+    const records = await this.paginate(pathname);
+    return records.map(project);
   }
 
   // Follows Link rel="next" until exhaustion or the record limit. Truncated is true only when
@@ -1813,6 +1821,270 @@ function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
     }
   }
   return projected;
+}
+
+// Rule 9 projections: each collected object keeps only the documented fields the verdicts read.
+// Presence-only fields (webhook secret) keep a marker so evidence stays legible without the value.
+export const REDACTED_MARKER = "[redacted]";
+
+const ORGANIZATION_FIELDS = [
+  "login",
+  "id",
+  "name",
+  "type",
+  "created_at",
+  "updated_at",
+  "two_factor_requirement_enabled",
+  "default_repository_permission",
+  "web_commit_signoff_required",
+  "members_can_create_repositories",
+  "members_can_create_public_repositories",
+  "members_can_create_private_repositories",
+  "members_can_create_internal_repositories",
+  "members_can_fork_private_repositories",
+  "members_allowed_repository_creation_type",
+  "deploy_keys_enabled_for_repositories",
+  "advanced_security_enabled_for_new_repositories",
+  "dependabot_alerts_enabled_for_new_repositories",
+  "dependabot_security_updates_enabled_for_new_repositories",
+  "dependency_graph_enabled_for_new_repositories",
+  "secret_scanning_enabled_for_new_repositories",
+  "secret_scanning_push_protection_enabled_for_new_repositories",
+  "secret_scanning_push_protection_custom_link_enabled",
+] as const;
+
+const SIMPLE_USER_FIELDS = ["login", "id", "type", "site_admin"] as const;
+const INVITATION_FIELDS = ["id", "login", "role", "created_at", "failed_at", "failed_reason", "invitation_source", "team_count"] as const;
+const ORGANIZATION_ROLE_FIELDS = ["id", "name", "description", "base_role", "source", "permissions", "created_at", "updated_at"] as const;
+// token_last_eight and fingerprint are credential fragments and never persist.
+const CREDENTIAL_AUTHORIZATION_FIELDS = [
+  "login",
+  "credential_id",
+  "credential_type",
+  "credential_authorized_at",
+  "credential_accessed_at",
+  "authorized_credential_id",
+  "authorized_credential_title",
+  "authorized_credential_note",
+  "authorized_credential_expires_at",
+  "scopes",
+] as const;
+const WEBHOOK_FIELDS = ["id", "name", "type", "active", "events", "created_at", "updated_at"] as const;
+const WEBHOOK_CONFIG_FIELDS = ["url", "content_type", "insecure_ssl"] as const;
+const APP_INSTALLATION_FIELDS = [
+  "id",
+  "app_id",
+  "app_slug",
+  "target_type",
+  "target_id",
+  "repository_selection",
+  "permissions",
+  "events",
+  "suspended_at",
+  "created_at",
+  "updated_at",
+] as const;
+const REPOSITORY_FIELDS = [
+  "id",
+  "name",
+  "full_name",
+  "private",
+  "visibility",
+  "archived",
+  "disabled",
+  "fork",
+  "default_branch",
+  "created_at",
+  "updated_at",
+  "pushed_at",
+] as const;
+const RULESET_FIELDS = ["id", "name", "target", "source_type", "source", "enforcement", "bypass_actors", "conditions", "rules", "created_at", "updated_at"] as const;
+const BRANCH_PROTECTION_FIELDS = [
+  "enabled",
+  "required_status_checks",
+  "enforce_admins",
+  "required_pull_request_reviews",
+  "restrictions",
+  "required_linear_history",
+  "allow_force_pushes",
+  "allow_deletions",
+  "block_creations",
+  "required_conversation_resolution",
+  "required_signatures",
+  "lock_branch",
+  "allow_fork_syncing",
+] as const;
+const BRANCH_RULE_FIELDS = ["type", "parameters", "ruleset_source_type", "ruleset_source", "ruleset_id"] as const;
+// key (the public key material) never persists; title, access mode, and dates carry the verdict.
+const DEPLOY_KEY_FIELDS = ["id", "title", "read_only", "verified", "enabled", "created_at", "last_used", "added_by"] as const;
+const ACTIONS_PERMISSIONS_FIELDS = ["enabled_repositories", "allowed_actions"] as const;
+const SELECTED_ACTIONS_FIELDS = ["github_owned_allowed", "verified_allowed", "patterns_allowed"] as const;
+const WORKFLOW_PERMISSIONS_FIELDS = ["default_workflow_permissions", "can_approve_pull_request_reviews"] as const;
+const RUNNER_GROUP_FIELDS = [
+  "id",
+  "name",
+  "visibility",
+  "default",
+  "inherited",
+  "allows_public_repositories",
+  "restricted_to_workflows",
+  "selected_workflows",
+  "workflow_restrictions_read_only",
+] as const;
+const RUNNER_FIELDS = ["id", "name", "os", "status", "busy", "ephemeral", "runner_group_id"] as const;
+const RUNNER_LABEL_FIELDS = ["id", "name", "type"] as const;
+const CODE_SECURITY_CONFIGURATION_FIELDS = [
+  "id",
+  "name",
+  "target_type",
+  "description",
+  "enforcement",
+  "advanced_security",
+  "dependency_graph",
+  "dependency_graph_autosubmit_action",
+  "dependabot_alerts",
+  "dependabot_security_updates",
+  "code_scanning_default_setup",
+  "secret_scanning",
+  "secret_scanning_push_protection",
+  "secret_scanning_validity_checks",
+  "secret_scanning_non_provider_patterns",
+  "secret_scanning_generic_secrets",
+  "private_vulnerability_reporting",
+  "created_at",
+  "updated_at",
+] as const;
+
+function projectNestedUser(value: unknown): JsonRecord | undefined {
+  return value && typeof value === "object" ? pickFields(asRecord(value), SIMPLE_USER_FIELDS) : undefined;
+}
+
+function withNested(record: JsonRecord, field: string, value: JsonRecord | undefined): JsonRecord {
+  if (value !== undefined) {
+    record[field] = value;
+  }
+  return record;
+}
+
+export function projectOrganization(org: JsonRecord): JsonRecord {
+  return pickFields(org, ORGANIZATION_FIELDS);
+}
+
+export function projectSimpleUser(user: JsonRecord): JsonRecord {
+  return pickFields(user, SIMPLE_USER_FIELDS);
+}
+
+export function projectInvitation(invitation: JsonRecord): JsonRecord {
+  return withNested(pickFields(invitation, INVITATION_FIELDS), "inviter", projectNestedUser(invitation.inviter));
+}
+
+export function projectOrganizationRole(role: JsonRecord): JsonRecord {
+  return pickFields(role, ORGANIZATION_ROLE_FIELDS);
+}
+
+export function projectCredentialAuthorization(authorization: JsonRecord): JsonRecord {
+  return pickFields(authorization, CREDENTIAL_AUTHORIZATION_FIELDS);
+}
+
+export function projectWebhook(hook: JsonRecord): JsonRecord {
+  const projected = pickFields(hook, WEBHOOK_FIELDS);
+  if (hook.config && typeof hook.config === "object") {
+    const config = asRecord(hook.config);
+    const projectedConfig = pickFields(config, WEBHOOK_CONFIG_FIELDS);
+    if (config.secret !== undefined && config.secret !== null && config.secret !== "") {
+      projectedConfig.secret = REDACTED_MARKER;
+    }
+    projected.config = projectedConfig;
+  }
+  return projected;
+}
+
+export function projectAppInstallation(installation: JsonRecord): JsonRecord {
+  const projected = pickFields(installation, APP_INSTALLATION_FIELDS);
+  withNested(projected, "account", projectNestedUser(installation.account));
+  withNested(projected, "suspended_by", projectNestedUser(installation.suspended_by));
+  return projected;
+}
+
+export function projectRepository(repo: JsonRecord): JsonRecord {
+  return withNested(pickFields(repo, REPOSITORY_FIELDS), "owner", projectNestedUser(repo.owner));
+}
+
+export function projectRuleset(ruleset: JsonRecord): JsonRecord {
+  return pickFields(ruleset, RULESET_FIELDS);
+}
+
+export function projectBranchProtection(protection: JsonRecord): JsonRecord {
+  return pickFields(protection, BRANCH_PROTECTION_FIELDS);
+}
+
+export function projectBranchRule(rule: JsonRecord): JsonRecord {
+  return pickFields(rule, BRANCH_RULE_FIELDS);
+}
+
+export function projectDeployKey(key: JsonRecord): JsonRecord {
+  return pickFields(key, DEPLOY_KEY_FIELDS);
+}
+
+export function projectRunnerGroup(group: JsonRecord): JsonRecord {
+  return pickFields(group, RUNNER_GROUP_FIELDS);
+}
+
+export function projectRunner(runner: JsonRecord): JsonRecord {
+  const projected = pickFields(runner, RUNNER_FIELDS);
+  if (Array.isArray(runner.labels)) {
+    projected.labels = runner.labels.map((label) => pickFields(asRecord(label), RUNNER_LABEL_FIELDS));
+  }
+  return projected;
+}
+
+export function projectCodeSecurityConfiguration(configuration: JsonRecord): JsonRecord {
+  return pickFields(configuration, CODE_SECURITY_CONFIGURATION_FIELDS);
+}
+
+export function projectCodeSecurityDefault(entry: JsonRecord): JsonRecord {
+  const projected = pickFields(entry, ["default_for_new_repos"]);
+  if (entry.configuration && typeof entry.configuration === "object") {
+    projected.configuration = projectCodeSecurityConfiguration(asRecord(entry.configuration));
+  }
+  return projected;
+}
+
+// Belt for the bundle writer: any object key that names a credential value is masked at any depth,
+// whatever path produced the object. Exact, normalized key names only, so fields such as
+// secret_scanning_default or token_scopes are untouched.
+const SENSITIVE_KEY_NAMES = new Set([
+  "secret",
+  "secrets",
+  "clientsecret",
+  "token",
+  "accesstoken",
+  "refreshtoken",
+  "tokenlasteight",
+  "password",
+  "passwordhash",
+  "privatekey",
+  "opensshpublickey",
+  "authorization",
+]);
+
+export function redactSensitiveKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactSensitiveKeys(entry));
+  }
+  if (value && typeof value === "object") {
+    const result: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) {
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (SENSITIVE_KEY_NAMES.has(normalized)) {
+        result[key] = entry === null || entry === undefined || entry === "" ? entry : REDACTED_MARKER;
+        continue;
+      }
+      result[key] = redactSensitiveKeys(entry);
+    }
+    return result;
+  }
+  return value;
 }
 
 function countByStatus(findings: GitHubFinding[]): Record<GitHubFindingStatus, number> {
@@ -1933,8 +2205,10 @@ function buildExportText(config: GitHubResolvedConfig, result: GitHubAuditBundle
   ].join("\n");
 }
 
+// Every JSON file in the bundle passes through the key-name belt in addition to the collection-time
+// projections, so no write path can bypass redaction.
 function serializeJson(value: unknown): string {
-  return `${JSON.stringify(value, null, 2)}\n`;
+  return `${JSON.stringify(redactSensitiveKeys(value), null, 2)}\n`;
 }
 
 function safeDirName(value: string): string {
