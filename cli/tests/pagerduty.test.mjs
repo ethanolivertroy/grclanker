@@ -2425,7 +2425,10 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
     teamMembers: snapshot({}, forbidden("/teams/team-1/members")),
   }, { maxAdmins: 3 });
   assertStatuses(membersForbidden, { 4: "pass" });
-  assert.match(findingById(membersForbidden, 4).summary, /team membership listing failed: PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members/);
+  assert.match(findingById(membersForbidden, 4).summary, /team membership listing failed \(PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members: Access Denied\), so manager assignments could not be sampled/);
+  assert.equal(findingById(membersForbidden, 4).evidence.team_manager_assignments, null, "a manager count cannot be sampled from a denied member listing");
+  assert.equal(findingById(membersForbidden, 4).evidence.team_member_lists_truncated, null);
+  assert.match(membersForbidden.summary.inventories.team_members, /^team members: unread \(PagerDuty request failed \(403 Forbidden\) for \/teams\/team-1\/members/);
 
   const servicesForbidden = assessPagerdutyIncidentResponse({
     scope: accountScope(),
@@ -2441,7 +2444,7 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
   assert.match(automation.summary, /services could not be read \(PagerDuty request failed \(403 Forbidden\) for \/services/);
   assert.match(automation.summary, /cannot exceed warn until the service directory is readable/);
   assert.doesNotMatch(automation.summary, /0 services still reference one/);
-  assert.equal(automation.evidence.services_readable, false);
+  assert.match(automation.evidence.services_inventory, /^services: unread \(PagerDuty request failed \(403 Forbidden\) for \/services/);
 
   const servicesForbiddenNoAutomation = assessPagerdutyIncidentResponse({
     scope: accountScope(),
@@ -2487,4 +2490,349 @@ test("rule 1 corollary: each secondary read forbidden one at a time with the pri
   });
   assertStatuses(probeForbidden, { 11: "pass", 12: "warn" });
   assert.match(findingById(probeForbidden, 12).summary, /retention window could not be probed \(PagerDuty request failed \(403 Forbidden\) for \/audit\/records/);
+});
+
+// Fetch-level fixture serving the whole PagerDuty read surface with a request log, so a run can
+// deny, empty, or truncate a single endpoint and every status code and path in the output can be
+// checked against requests the run actually made.
+const PAGERDUTY_LIST_ENDPOINTS = [
+  ["/users", "users"],
+  ["/teams", "teams"],
+  ["/teams/team-1/members", "members"],
+  ["/services", "services"],
+  ["/escalation_policies", "escalation_policies"],
+  ["/priorities", "priorities"],
+  ["/incident_workflows", "incident_workflows"],
+  ["/incident_workflows/triggers", "triggers"],
+  ["/schedules", "schedules"],
+  ["/oncalls", "oncalls"],
+  ["/audit/records", "records"],
+  ["/extensions", "extensions"],
+  ["/webhook_subscriptions", "webhook_subscriptions"],
+  ["/business_services", "business_services"],
+  ["/change_events", "change_events"],
+];
+const PAGERDUTY_OBJECT_ENDPOINTS = ["/abilities", "/schedules/sched-1", "/service_dependencies/business_services/bs-1"];
+const PAGERDUTY_CORE_DATA_FILES = {
+  "/abilities": "core_data/abilities.json",
+  "/users": "core_data/users.json",
+  "/teams": "core_data/teams.json",
+  "/teams/team-1/members": "core_data/team_members.json",
+  "/services": "core_data/services.json",
+  "/escalation_policies": "core_data/escalation_policies.json",
+  "/priorities": "core_data/priorities.json",
+  "/incident_workflows": "core_data/incident_workflows.json",
+  "/incident_workflows/triggers": "core_data/incident_workflow_triggers.json",
+  "/schedules": "core_data/schedules.json",
+  "/schedules/sched-1": "core_data/schedule_details.json",
+  "/oncalls": "core_data/oncalls.json",
+  "/audit/records": "core_data/audit_records_recent.json",
+  "/extensions": "core_data/extensions.json",
+  "/webhook_subscriptions": "core_data/webhook_subscriptions.json",
+  "/business_services": "core_data/business_services.json",
+  "/service_dependencies/business_services/bs-1": "core_data/business_service_dependencies.json",
+  "/change_events": "core_data/change_events.json",
+};
+
+function pagerdutyApiFixture({ deny = [], empty = [], truncate = [] } = {}) {
+  const fixtures = healthyFixtures();
+  const requests = [];
+  const listPayload = (key, items, url) => {
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const limit = Number(url.searchParams.get("limit") ?? "100");
+    if (truncate.includes(url.pathname)) {
+      // First page claims more results, the next page comes back empty: the collector records truncation.
+      return offset === 0
+        ? { [key]: items, more: true, total: 2500, limit, offset }
+        : { [key]: [], more: true, total: 2500, limit, offset };
+    }
+    return { [key]: items, more: false, total: items.length, limit, offset };
+  };
+  const listItems = (pathname, url) => {
+    switch (pathname) {
+      case "/users": return fixtures.users;
+      case "/teams": return fixtures.teams;
+      case "/teams/team-1/members": return fixtures.teamMembers;
+      case "/services": return fixtures.services;
+      case "/escalation_policies": return fixtures.escalationPolicies;
+      case "/priorities": return fixtures.priorities;
+      case "/incident_workflows": return fixtures.incidentWorkflows;
+      case "/incident_workflows/triggers": return fixtures.incidentWorkflowTriggers;
+      case "/schedules": return fixtures.schedules;
+      case "/oncalls": return fixtures.oncalls;
+      case "/audit/records": {
+        const since = new Date(url.searchParams.get("since"));
+        return [auditRecord(`audit-${since.getTime()}`, new Date(since.getTime() + DAY_MS).toISOString())];
+      }
+      case "/extensions": return fixtures.extensions;
+      case "/webhook_subscriptions": return fixtures.webhookSubscriptions;
+      case "/business_services": return fixtures.businessServices;
+      case "/change_events": return fixtures.changeEvents;
+      default: return undefined;
+    }
+  };
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const respond = (value, status = 200, statusText = "OK") => {
+      requests.push({ method: "GET", url: url.toString(), path: url.pathname, status });
+      return jsonResponse(value, { status, statusText });
+    };
+    if (deny.includes(url.pathname)) {
+      return respond({ error: { message: "Access Denied", code: 2010, errors: ["Access Denied"] } }, 403, "Forbidden");
+    }
+    if (url.pathname === "/users/me") {
+      // An account-level REST API key has no user, and the API answers 400.
+      return respond({ error: { message: "Account-level access token has no user", code: 2001 } }, 400, "Bad Request");
+    }
+    if (url.pathname === "/abilities") return respond({ abilities: fixtures.abilities });
+    if (url.pathname === "/schedules/sched-1") return respond({ schedule: coveredSchedule("sched-1") });
+    if (url.pathname === "/service_dependencies/business_services/bs-1") {
+      return respond({ relationships: fixtures.businessServiceDependencies });
+    }
+    const listEntry = PAGERDUTY_LIST_ENDPOINTS.find(([path]) => path === url.pathname);
+    if (listEntry) {
+      const items = empty.includes(url.pathname) ? [] : listItems(url.pathname, url);
+      if (url.pathname === "/audit/records" || url.pathname === "/incident_workflows/triggers") {
+        return respond({ [listEntry[1]]: items, next_cursor: null });
+      }
+      return respond(listPayload(listEntry[1], items, url));
+    }
+    return respond({ error: { message: "Not Found", code: 2100 } }, 404, "Not Found");
+  };
+  return { fetchImpl, requests, fixtures };
+}
+
+function pagerdutyApiClient(options = {}) {
+  const fixture = pagerdutyApiFixture(options);
+  const client = new PagerdutyApiClient(sampleConfig(), { fetchImpl: fixture.fetchImpl, now: () => NOW, sleep: async () => {} });
+  return { client, requests: fixture.requests, fixtures: fixture.fixtures };
+}
+
+function isAbsenceValue(value) {
+  if (value === 0 || value === false) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
+function fieldLeaves(value, path, out) {
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    out.set(path, value);
+    return out;
+  }
+  for (const [key, child] of Object.entries(value)) fieldLeaves(child, `${path}.${key}`, out);
+  return out;
+}
+
+function assessmentLeaves(result) {
+  const out = new Map();
+  fieldLeaves(result.summary, `${result.category}.summary`, out);
+  for (const item of result.findings) {
+    out.set(`${item.id}.status`, item.status);
+    out.set(`${item.id}.summary`, item.summary);
+    fieldLeaves(item.evidence ?? {}, `${item.id}.evidence`, out);
+  }
+  return out;
+}
+
+const STATUS_COUNT_KEYS = new Set(["pass", "warn", "fail", "manual"]);
+
+// Every leaf that carried a value in the all-readable baseline must, under a single denial, either
+// keep that value, become null, or (for prose) change text; it must never fall to 0, [], {}, or false.
+function assertNoDefaultedLeaves(baseline, current, label) {
+  const nullAncestor = (path) => {
+    const segments = path.split(".");
+    for (let depth = segments.length - 1; depth > 0; depth -= 1) {
+      const ancestor = segments.slice(0, depth).join(".");
+      if (current.has(ancestor)) return current.get(ancestor) === null;
+    }
+    return false;
+  };
+  for (const [path, base] of baseline) {
+    if (STATUS_COUNT_KEYS.has(path.split(".").at(-1)) && path.includes(".summary.")) continue;
+    if (!current.has(path)) {
+      assert.ok(nullAncestor(path), `${label}: leaf ${path} disappeared without its parent rendering null`);
+      continue;
+    }
+    const value = current.get(path);
+    if (base === null || isAbsenceValue(base)) continue;
+    if (typeof base === "string") continue;
+    if (value === null) continue;
+    assert.ok(
+      !isAbsenceValue(value),
+      `${label}: leaf ${path} defaulted from ${JSON.stringify(base)} to ${JSON.stringify(value)}`,
+    );
+    assert.deepEqual(value, base, `${label}: leaf ${path} changed from ${JSON.stringify(base)} to ${JSON.stringify(value)} instead of rendering null`);
+  }
+}
+
+function collectStrings(value, out = []) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (value && typeof value === "object") for (const item of Object.values(value)) collectStrings(item, out);
+  return out;
+}
+
+// Status codes appear in output as "(403 Forbidden)" or "HTTP 403"; endpoint paths as "/teams" or
+// "/teams/team-1/members" after whitespace, a parenthesis, or "for ".
+function mentionedStatusCodes(text) {
+  return [...text.matchAll(/\((\d{3}) [A-Za-z]/g), ...text.matchAll(/\b(?:HTTP|status)\s+(\d{3})\b/gi)].map((match) => Number(match[1]));
+}
+
+function mentionedEndpoints(text) {
+  return [...text.matchAll(/(?:^|[\s(]|for )(\/[a-z_]+(?:\/[A-Za-z0-9_\-{}]+)*)/g)].map((match) => match[1]);
+}
+
+function assertMentionsMatchRequests(outputs, requests, label) {
+  const strings = collectStrings(outputs);
+  const loggedStatuses = new Set(requests.map((request) => request.status));
+  const loggedPaths = new Set(requests.map((request) => request.path));
+  for (const text of strings) {
+    for (const code of mentionedStatusCodes(text)) {
+      assert.ok(loggedStatuses.has(code), `${label}: output names HTTP ${code} but no request returned it: ${text}`);
+    }
+    for (const endpoint of mentionedEndpoints(text)) {
+      assert.ok(
+        loggedPaths.has(endpoint) || [...loggedPaths].some((path) => path.startsWith(`${endpoint}/`)),
+        `${label}: output names ${endpoint} but no request was made to it: ${text}`,
+      );
+    }
+  }
+}
+
+function principalLabels(fixtures) {
+  return fixtures.users.map((item) => item.email);
+}
+
+async function exportWithFixture(options) {
+  const base = createTempBase("grclanker-pagerduty-sweep-");
+  const { client, requests, fixtures } = pagerdutyApiClient(options);
+  const result = await exportPagerdutyAuditBundle(client, sampleConfig(), base, { maxAdmins: 3, coverageDays: 30 });
+  const files = readBundleFiles(result.outputDir);
+  const analysis = ["access_control", "incident_response", "oncall_coverage", "audit_logging", "integration_security"]
+    .map((category) => JSON.parse(files.get(`analysis/${category}.json`)));
+  const accessCheck = JSON.parse(files.get("core_data/access_check.json"));
+  const payloads = [await checkPagerdutyAccess(client), ...(await runAllAssessments(client)).results];
+  return { result, files, analysis, accessCheck, payloads, requests, fixtures, errors: files.get("_errors.log") ?? "" };
+}
+
+test("collection status, request matching, and denied-list markers: each endpoint denied one at a time writes a marker, renders dependent counts null, names no principal from the denied set, and mentions only observed statuses and paths", async () => {
+  // /extensions is served readable but empty throughout, so every run carries one dataset that must stay [].
+  const baseline = await exportWithFixture({ empty: ["/extensions"] });
+  assert.equal(baseline.result.errorCount, 0);
+  assert.deepEqual(JSON.parse(baseline.files.get("core_data/extensions.json")).items, []);
+  assert.equal(baseline.accessCheck.status, "healthy");
+  const baselineLeaves = new Map(baseline.analysis.flatMap((item) => [...assessmentLeaves(item)]));
+  for (const item of baseline.analysis) {
+    for (const [name, state] of Object.entries(item.summary.inventories)) {
+      assert.match(state, /^.+: complete \(\d+ seen\)$/, `${item.category}.inventories.${name} must be complete in the baseline`);
+    }
+  }
+  assertMentionsMatchRequests([baseline.analysis, baseline.accessCheck, baseline.payloads], baseline.requests, "baseline");
+  for (const file of Object.values(PAGERDUTY_CORE_DATA_FILES)) {
+    assert.notEqual(JSON.parse(baseline.files.get(file)).collected, false, `${file} is collected in the baseline`);
+  }
+
+  const emails = principalLabels(baseline.fixtures);
+  const deniable = [...PAGERDUTY_OBJECT_ENDPOINTS, ...PAGERDUTY_LIST_ENDPOINTS.map(([path]) => path)];
+  for (const endpoint of deniable) {
+    const label = `deny ${endpoint}`;
+    const run = await exportWithFixture({ deny: [endpoint], empty: ["/extensions"] });
+    const denied = run.requests.filter((request) => request.path === endpoint);
+    assert.ok(denied.length > 0 && denied.every((request) => request.status === 403), `${label}: the fixture served 403 for the endpoint`);
+
+    const marker = JSON.parse(run.files.get(PAGERDUTY_CORE_DATA_FILES[endpoint]));
+    assert.equal(marker.collected, false, `${label}: core_data carries the not-collected marker`);
+    assert.equal(marker.status, 403, `${label}: the marker status is the observed status`);
+    assert.equal(marker.endpoint, endpoint, `${label}: the marker endpoint is the requested path`);
+    assert.match(marker.error, /\(403 Forbidden\)/);
+    assert.ok(!("items" in marker), `${label}: a denied dataset is never written as an item list`);
+    const readableEmpty = JSON.parse(run.files.get("core_data/extensions.json"));
+    if (endpoint !== "/extensions") {
+      assert.deepEqual(readableEmpty.items, [], `${label}: a readable-but-empty dataset keeps an empty item list`);
+      assert.equal(readableEmpty.complete, true);
+      assert.notEqual(readableEmpty.collected, false);
+    }
+
+    const currentLeaves = new Map(run.analysis.flatMap((item) => [...assessmentLeaves(item)]));
+    assertNoDefaultedLeaves(baselineLeaves, currentLeaves, label);
+    const unreadStates = run.analysis.flatMap((item) => Object.values(item.summary.inventories)).filter((state) => /: unread \(/.test(state));
+    assert.ok(unreadStates.length > 0, `${label}: at least one assessment summary names the unread inventory`);
+    for (const state of unreadStates) assert.match(state, /\(403 Forbidden\)/, `${label}: the unread state carries the observed failure`);
+    assert.ok(run.errors.includes("(403 Forbidden)") && run.errors.includes(endpoint), `${label}: _errors.log names the observed failure`);
+    const mentionedText = collectStrings([run.analysis, run.errors]);
+    assert.ok(mentionedText.flatMap(mentionedStatusCodes).includes(403), `${label}: the scanner sees the 403 the output names`);
+    assert.ok(mentionedText.flatMap(mentionedEndpoints).includes(endpoint), `${label}: the scanner sees the denied path the output names`);
+    assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors], run.requests, label);
+
+    const surface = run.accessCheck.surfaces.find((item) => item.endpoint === endpoint);
+    if (surface) {
+      assert.equal(surface.status, "not_readable", label);
+      assert.equal(surface.http_status, 403, label);
+      assert.ok(!("count" in surface), `${label}: an unreadable surface carries no count`);
+    }
+
+    if (endpoint === "/users") {
+      const text = JSON.stringify([run.analysis, run.payloads]);
+      for (const email of emails) assert.ok(!text.includes(email), `${label}: ${email} must not be named from the denied user directory`);
+      const accessControl = run.analysis.find((item) => item.category === "access_control");
+      for (const key of ["users_seen", "users_total", "privileged_users", "owners", "users_without_teams"]) {
+        assert.equal(accessControl.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+      for (const control of [1, 2, 3, 4]) {
+        const evidence = findingById(accessControl, control).evidence;
+        assert.match(evidence.principals_withheld, /^users: unread \(PagerDuty request failed \(403 Forbidden\) for \/users/, `${label}: PD-${control} names the unread inventory`);
+      }
+      const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+      assert.equal(oncall.summary.responders, null);
+      assert.equal(oncall.summary.current_oncall_users, null);
+    }
+    if (endpoint === "/audit/records") {
+      const audit = run.analysis.find((item) => item.category === "audit_logging");
+      assert.equal(audit.summary.api_tokens_observed, null);
+      assert.equal(findingById(audit, 13).evidence.api_tokens_observed, null);
+      assert.ok(!JSON.stringify(audit).includes("abcd"), `${label}: no token suffix is named from the denied audit trail`);
+    }
+    if (endpoint === "/services") {
+      const incident = run.analysis.find((item) => item.category === "incident_response");
+      assert.equal(incident.summary.active_services, null);
+      assert.equal(findingById(incident, 5).evidence.disabled_services, null);
+      assert.equal(findingById(incident, 19).evidence.urgency_modes, null);
+    }
+    if (endpoint === "/change_events") {
+      const integration = run.analysis.find((item) => item.category === "integration_security");
+      assert.equal(findingById(integration, 25).evidence.change_events_complete, null, `${label}: a completeness flag never defaults on an unread inventory`);
+    }
+    if (endpoint === "/schedules/sched-1") {
+      const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+      for (const key of ["attached_schedules", "schedules_with_gaps", "single_participant_schedules"]) {
+        assert.equal(oncall.summary[key], null, `${label}: summary ${key} renders null`);
+      }
+    }
+  }
+});
+
+test("collection status: a truncated user directory keeps seen counts, renders principal-derived counts and lists null, and names no user from the partial set", async () => {
+  const run = await exportWithFixture({ truncate: ["/users"] });
+  const users = JSON.parse(run.files.get("core_data/users.json"));
+  assert.equal(users.complete, false);
+  assert.equal(users.total, 2500);
+  assert.equal(users.items.length, 4);
+  const accessControl = run.analysis.find((item) => item.category === "access_control");
+  assert.equal(accessControl.summary.users_seen, 4);
+  assert.equal(accessControl.summary.users_total, 2500);
+  assert.equal(accessControl.summary.privileged_users, null);
+  assert.equal(accessControl.summary.owners, null);
+  assert.match(accessControl.summary.inventories.users, /^users: 4 of 2500 seen \(/);
+  const text = JSON.stringify(run.analysis);
+  for (const email of principalLabels(run.fixtures)) assert.ok(!text.includes(email), `${email} must not be named from a partly read directory`);
+  for (const control of [1, 2, 3, 4]) {
+    const item = findingById(accessControl, control);
+    assert.notEqual(item.status, "pass", `PD-${control} cannot pass on a partial directory`);
+    assert.match(item.evidence.principals_withheld, /^users: 4 of 2500 seen/);
+  }
+  const oncall = run.analysis.find((item) => item.category === "oncall_coverage");
+  assert.equal(findingById(oncall, 17).evidence.responders_without_rules, null);
+  assert.equal(findingById(oncall, 18).evidence.oncall_email_only, null);
+  assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors], run.requests, "truncated users");
 });
