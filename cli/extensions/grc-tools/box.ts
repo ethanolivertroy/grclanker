@@ -1512,16 +1512,17 @@ function countEventTypes(events: JsonRecord[]): Record<string, number> {
   return counts;
 }
 
+export function isUnitlessDuration(value: string | undefined): boolean {
+  return value !== undefined && /^\d+(?:\.\d+)?$/.test(value.trim());
+}
+
 export function parseDurationHours(value: string | undefined): number | undefined {
   if (!value) return undefined;
   const text = value.trim().toLowerCase();
   if (!text) return undefined;
   if (/^(never|none|unlimited|no_expiration|no expiration)$/.test(text)) return Number.POSITIVE_INFINITY;
   const match = text.match(/(\d+(?:\.\d+)?)\s*(minute|min|hour|hr|day|week|month|year|d|h|m|w)s?/);
-  if (!match) {
-    const numeric = Number(text);
-    return Number.isFinite(numeric) ? numeric : undefined;
-  }
+  if (!match) return undefined;
   const amount = Number(match[1]);
   switch (match[2]) {
     case "minute":
@@ -1545,6 +1546,12 @@ export function parseDurationHours(value: string | undefined): number | undefine
     default:
       return undefined;
   }
+}
+
+function describeUninterpretableDuration(value: string | undefined): string {
+  return isUnitlessDuration(value)
+    ? "has no explicit unit and Box does not document one for this field"
+    : "could not be interpreted as a duration";
 }
 
 function accessLevelIsOpen(value: string | undefined): boolean {
@@ -1849,11 +1856,17 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
         ? finding(22, "warn", unusedSettingsSummary(sessionUnused, "the session duration cannot be treated as enforced"), sessionEvidence, sessionManualEvidence)
         : sessionDuration === undefined
           ? finding(22, "warn", "Enterprise session settings were readable but did not expose a session duration value.", sessionEvidence, sessionManualEvidence)
-        : sessionHours === undefined
-          ? finding(22, "warn", `Session duration "${sessionDuration}" could not be interpreted; confirm it is at or below ${maxSessionHours} hours.`, sessionEvidence)
-          : sessionHours <= maxSessionHours && (customSessionEnabled !== true || (customSessionHours !== undefined && customSessionHours <= maxSessionHours))
-            ? finding(22, "pass", `Session duration is ${sessionDuration}, within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
-            : finding(22, "fail", `Session duration ${sessionDuration}${customSessionEnabled === true ? ` (custom group duration ${customSessionValue ?? "unknown"})` : ""} exceeds the ${maxSessionHours}-hour threshold.`, sessionEvidence),
+          : sessionHours === undefined
+            ? finding(22, "warn", `Session duration "${sessionDuration}" ${describeUninterpretableDuration(sessionDuration)}, so it cannot be compared against the ${maxSessionHours}-hour threshold.`, sessionEvidence, `${sessionManualEvidence} Confirm the unit behind the raw value "${sessionDuration}" and whether it is at or below ${maxSessionHours} hours.`)
+            : sessionHours > maxSessionHours
+              ? finding(22, "fail", `Session duration ${sessionDuration} exceeds the ${maxSessionHours}-hour threshold.`, sessionEvidence)
+              : customSessionEnabled !== true
+                ? finding(22, "pass", `Session duration is ${sessionDuration}, within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
+                : customSessionHours === undefined
+                  ? finding(22, "warn", `Session duration is ${sessionDuration}, but the custom group duration "${customSessionValue ?? "unset"}" ${describeUninterpretableDuration(customSessionValue)}, so it cannot be compared against the ${maxSessionHours}-hour threshold.`, sessionEvidence, sessionManualEvidence)
+                  : customSessionHours <= maxSessionHours
+                    ? finding(22, "pass", `Session duration is ${sessionDuration} and the custom group duration is ${customSessionValue}, both within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
+                    : finding(22, "fail", `Session duration ${sessionDuration} is within the threshold, but the custom group duration ${customSessionValue} exceeds ${maxSessionHours} hours.`, sessionEvidence),
   );
 
   const ipLists = data.shieldLists.data.filter((list) => shieldListContentType(list) === "ip");

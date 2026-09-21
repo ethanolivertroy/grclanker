@@ -133,7 +133,7 @@ Status semantics: `pass` means the API evidence satisfies the control, `warn` me
 | 19 | App approval process | sharing_collaboration | BOX-19 | manual: reports app authorization events and integration Shield lists, approval policy must be confirmed in the Admin Console |
 | 20 | Custom terms of service | sharing_collaboration | BOX-20 | pass when a managed terms of service is enabled; fail when disabled or missing |
 | 21 | Password policy strength | identity_access | BOX-21 | pass at or above `min_password_length` with weak password prevention and two character classes; warn between 8 and the target; fail below 8 |
-| 22 | Session duration limits | identity_access | BOX-22 | pass when `session_duration` (and any custom duration) is at or below `max_session_hours`; fail above or when unlimited |
+| 22 | Session duration limits | identity_access | BOX-22 | pass when `session_duration` (and any custom duration) carries an explicit unit and is at or below `max_session_hours`; fail above or when unlimited; warn with the raw value when the value has no unit (Box does not document one) or cannot be interpreted |
 | 23 | IP allowlisting | identity_access | BOX-23 | manual: reports Shield IP lists, enterprise IP restrictions are not exposed |
 | 24 | Inactive user detection | identity_access | BOX-24 | pass when every active managed user has activity events in `lookback_days`; warn or fail on inactive users; warn when the event sample is truncated |
 | 25 | Content access monitoring | shield_monitoring | BOX-25 | pass when anomaly rules or Shield alerts exist; warn when only raw download events exist or when Shield rules or the event stream are unreadable; fail when both are readable and neither signal is present |

@@ -22,6 +22,7 @@ import {
   buildBoxJwtAssertion,
   checkBoxAccess,
   exportBoxAuditBundle,
+  isUnitlessDuration,
   listBoxControls,
   mappingsForControl,
   parseDurationHours,
@@ -1324,8 +1325,65 @@ test("Box control catalog covers all 25 spec controls with eight framework mappi
   assert.equal(parseDurationHours("30 minutes"), 0.5);
   assert.equal(parseDurationHours("7 days"), 168);
   assert.equal(parseDurationHours("never"), Number.POSITIVE_INFINITY);
-  assert.equal(parseDurationHours("24"), 24);
+  assert.equal(parseDurationHours("24"), undefined, "a bare number has no documented unit");
+  assert.equal(parseDurationHours("24h"), 24);
+  assert.equal(parseDurationHours("1440 min"), 24);
   assert.equal(parseDurationHours(undefined), undefined);
+  assert.equal(isUnitlessDuration("24"), true);
+  assert.equal(isUnitlessDuration(" 1.5 "), true);
+  assert.equal(isUnitlessDuration("24 hours"), false);
+  assert.equal(isUnitlessDuration(undefined), false);
+});
+
+test("assessBoxIdentityAccess does not fail BOX-22 on a session duration without an explicit unit", async () => {
+  const withDuration = (sessionDuration, extra = {}) => {
+    const configuration = hardenedConfiguration();
+    configuration.security.session_duration = item(sessionDuration);
+    Object.assign(configuration.security, extra);
+    return createStubClient({ ...hardenedFixture(), configuration });
+  };
+
+  const bare = await assessBoxIdentityAccess(withDuration("24"), { maxSessionHours: 12 });
+  assertStatuses(bare, { "BOX-22": "warn" });
+  assert.match(findingById(bare, "BOX-22").summary, /"24" has no explicit unit and Box does not document one/);
+  assert.match(findingById(bare, "BOX-22").manualEvidence, /raw value "24"/);
+  assert.equal(findingById(bare, "BOX-22").evidence.session_duration, "24");
+  assert.equal(findingById(bare, "BOX-22").evidence.session_hours, null);
+
+  const bareSmall = await assessBoxIdentityAccess(withDuration("1"), { maxSessionHours: 12 });
+  assertStatuses(bareSmall, { "BOX-22": "warn" });
+
+  const explicitPass = await assessBoxIdentityAccess(withDuration("24 hours"), { maxSessionHours: 24 });
+  assertStatuses(explicitPass, { "BOX-22": "pass" });
+  assert.equal(findingById(explicitPass, "BOX-22").evidence.session_hours, 24);
+
+  const explicitFail = await assessBoxIdentityAccess(withDuration("2 days"), { maxSessionHours: 24 });
+  assertStatuses(explicitFail, { "BOX-22": "fail" });
+  assert.match(findingById(explicitFail, "BOX-22").summary, /2 days exceeds the 24-hour threshold/);
+
+  const garbage = await assessBoxIdentityAccess(withDuration("until logout"));
+  assertStatuses(garbage, { "BOX-22": "warn" });
+  assert.match(findingById(garbage, "BOX-22").summary, /could not be interpreted as a duration/);
+
+  const customBare = await assessBoxIdentityAccess(withDuration("8 hours", {
+    is_custom_session_duration_enabled: item(true),
+    custom_session_duration_value: item("48"),
+  }), { maxSessionHours: 24 });
+  assertStatuses(customBare, { "BOX-22": "warn" });
+  assert.match(findingById(customBare, "BOX-22").summary, /custom group duration "48" has no explicit unit/);
+
+  const customFail = await assessBoxIdentityAccess(withDuration("8 hours", {
+    is_custom_session_duration_enabled: item(true),
+    custom_session_duration_value: item("48 hours"),
+  }), { maxSessionHours: 24 });
+  assertStatuses(customFail, { "BOX-22": "fail" });
+  assert.match(findingById(customFail, "BOX-22").summary, /custom group duration 48 hours exceeds 24 hours/);
+
+  const customPass = await assessBoxIdentityAccess(withDuration("8 hours", {
+    is_custom_session_duration_enabled: item(true),
+    custom_session_duration_value: item("12 hours"),
+  }), { maxSessionHours: 24 });
+  assertStatuses(customPass, { "BOX-22": "pass" });
 });
 
 test("Box tools are registered in the tool catalog under the Box group", () => {
