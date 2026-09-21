@@ -1973,7 +1973,13 @@ test("verdict safety rule 2 and self-check (b): empty inventories never pass and
   }
   assert.match(findings.find((item) => item.control === 12).summary, /not applicable through the API while logging stays disabled/);
   assert.match(findings.find((item) => item.control === 13).summary, /Not applicable through the API/);
-  assert.match(findings.find((item) => item.control === 8).summary, /zero accounts/);
+  // Zero authentication domains leave the group and user queries with nothing to query, so the domain-scoped
+  // inventories are not collected and the summary names the upstream query that returned nothing.
+  const separation = findings.find((item) => item.control === 8);
+  assert.match(separation.summary, /could not be collected \(authorizationManagement\.groups was not queried for any authentication domain: userManagement\.authenticationDomains returned zero domains\)/);
+  assert.equal(separation.evidence.cross_environment_users, null);
+  assert.match(separation.evidence.cross_environment_users_status, /^not collected \(userManagement\.users was not queried for any authentication domain: .*; authorizationManagement\.groups was not queried/);
+  assert.match(findings.find((item) => item.control === 2).summary, /Users could not be collected \(userManagement\.users was not queried for any authentication domain: userManagement\.authenticationDomains returned zero domains\)/);
 });
 
 test("verdict safety rule 2: control 6 never passes on zero keys because a complete key listing cannot be empty", async () => {
@@ -2067,10 +2073,11 @@ test("verdict safety rule 3: scoped-out or not-applicable controls render as man
   const obfuscation = findingById(noPipelineControl, "NR-12-LOG-OBFUSCATION");
   assert.equal(obfuscation.status, "warn");
   assert.match(obfuscation.summary, /attribute drop coverage is unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) were not readable/);
-  assert.match(obfuscation.summary, /Partial view: Pipeline Control cloud rules: unreadable \(entityManagement\.pipelineCloudRules: NerdGraph returned errors: Not authorized \(at actor\.entityManagement\)\)/);
-  assert.match(obfuscation.evidence.pipeline_control_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
+  assert.match(obfuscation.summary, /^Partial view: Pipeline Control cloud rules: unreadable \(entityManagement\.pipelineCloudRules: NerdGraph returned errors: Not authorized \(at actor\.entityManagement\)\)\. A dataset this finding depends on was unreadable, so the verdict is limited to warn instead of pass\. Within the readable data: /);
+  assert.match(obfuscation.evidence.pipeline_cloud_rules_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
   assert.equal(obfuscation.evidence.pipeline_cloud_rules, null);
   assert.equal(obfuscation.evidence.attribute_drop_rules, null);
+  assert.match(obfuscation.evidence.attribute_drop_rules_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
   const synthetics = findingById(noPipelineControl, "NR-13-SYNTHETIC-MONITOR-SECURITY");
   assert.equal(synthetics.status, "manual");
   assert.match(synthetics.summary, /Not applicable through the API: none of the 1 synthetic monitors is scripted/);
@@ -3032,7 +3039,8 @@ test("rule 1 corollary hit 1: NR-04 never concludes no admin-owned keys on a par
   assert.match(inventory.summary, /Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
   assert.equal(inventory.evidence.admin_owned_user_keys, null);
   assert.equal(inventory.evidence.admin_roster_complete, false);
-  assert.match(inventory.evidence.admin_roster_status, /^incomplete: users complete; groups 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
+  assert.match(inventory.evidence.admin_roster_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: .*\(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\); complete \(userManagement\.users\)$/);
+  assert.match(inventory.evidence.admin_owned_user_keys_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: .*\); complete \(apiAccess\.keySearch, userManagement\.users\)$/);
   assert.equal(inventory.evidence.key_listing_complete, true);
 
   const full = await assessCorollary([["authorizationManagement.groups", "full"]]);
@@ -3040,7 +3048,7 @@ test("rule 1 corollary hit 1: NR-04 never concludes no admin-owned keys on a par
   assert.equal(unreadable.status, "manual");
   assert.match(unreadable.summary, /group role grants were not readable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)/);
   assert.equal(unreadable.evidence.admin_owned_user_keys, null);
-  assert.match(unreadable.evidence.admin_roster_status, /groups unreadable \(authorizationManagement\.groups: /);
+  assert.match(unreadable.evidence.admin_roster_status, /^unreadable \(authorizationManagement\.groups: /);
 
   const flagged = await assessNewrelicAccessControl(denyInventories(corollaryClient({
     async listApiKeys() {
@@ -3052,8 +3060,10 @@ test("rule 1 corollary hit 1: NR-04 never concludes no admin-owned keys on a par
   }), [["authorizationManagement.groups", "partial"]]), { now: NOW });
   const adminOwned = findingById(flagged, "NR-04-API-KEY-INVENTORY");
   assert.equal(adminOwned.status, "warn");
-  assert.match(adminOwned.summary, /1 user keys inherit admin-level permissions from their owners/);
-  assert.deepEqual(adminOwned.evidence.admin_owned_user_keys, ["alice-cli"], "admins visible in the readable domains are still reported");
+  assert.match(adminOwned.summary, /^Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
+  assert.match(adminOwned.summary, /1 user keys \(alice-cli\) inherit admin-level permissions from their owners identified from the readable domains/, "admins visible in the readable domains are still named");
+  assert.equal(adminOwned.evidence.admin_owned_user_keys, null, "the list is a lower bound from part of the domains, so the evidence field is null beside its partial status");
+  assert.match(adminOwned.evidence.admin_owned_user_keys_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
 });
 
 test("rule 1 corollary hit 2: the NrAuditEvent api_key actor rows are owned by NR-06 and render null with a status when unreadable", async () => {
@@ -3072,11 +3082,15 @@ test("rule 1 corollary hit 2: the NrAuditEvent api_key actor rows are owned by N
       assert.equal(unused.evidence.distinct_api_keys_in_audit, null);
       assert.equal(unused.evidence.audit_readable, false);
       assert.match(unused.evidence.audit_status, /^unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 111: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\); account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)$/);
-      assert.match(unused.summary, /audit events unreadable: nrql\.NrAuditEvent\.api_key_actor: account 111: .*; account 222: .*\(at actor\.account\.nrql\)/);
+      assert.match(unused.summary, /API key change activity is unknown \(NrAuditEvent api_key actors unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 111: .*; account 222: .*\(at actor\.account\.nrql\)\)\)/);
+      assert.doesNotMatch(unused.summary, /0 distinct API keys/, "no zero count stands in for the unreadable audit rows");
     } else {
-      assert.equal(unused.evidence.audit_events_by_api_keys, 1);
-      assert.match(unused.evidence.audit_status, /^1 scope unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)$/);
-      assert.match(unused.summary, /Partial view: NrAuditEvent api_key actors: 1 scope unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 222: /);
+      assert.equal(unused.evidence.audit_events_by_api_keys, null, "a count from the readable account only is not a count");
+      assert.equal(unused.evidence.distinct_api_keys_in_audit, null);
+      assert.equal(unused.evidence.audit_readable, true);
+      assert.match(unused.evidence.audit_status, /^partial: 1 scope unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)$/);
+      assert.match(unused.summary, /^Partial view: NrAuditEvent api_key actors: 1 scope unreadable \(nrql\.NrAuditEvent\.api_key_actor: account 222: /);
+      assert.match(unused.summary, /1 distinct API keys performed configuration changes in the last \d+ days in the readable accounts/);
     }
   }
 });
@@ -3085,7 +3099,7 @@ test("rule 1 corollary hit 3: NR-09 renders workloads as null with a status and 
   const full = await assessCorollary([["entitySearch workloads", "full"]]);
   const coverage = full.findings.find((item) => item.control === 9);
   assert.equal(coverage.status, "warn");
-  assert.match(coverage.summary, /^2 policies with 2 enabled NRQL conditions cover all 2 reporting alertable entities\. A dataset this finding depends on was unreadable, so the verdict is limited to warn instead of pass\. Partial view: workloads: unreadable \(entitySearch\.workloads: account 111: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\); account 222: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\)\)\.$/);
+  assert.match(coverage.summary, /^Partial view: workloads: unreadable \(entitySearch\.workloads: account 111: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\); account 222: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\)\)\. A dataset this finding depends on was unreadable, so the verdict is limited to warn instead of pass\. Within the readable data: 2 policies with 2 enabled NRQL conditions cover all 2 reporting alertable entities\.$/);
   assert.equal(coverage.evidence.workloads, null);
   assert.equal(coverage.evidence.disrupted_workloads, null);
   assert.match(coverage.evidence.workloads_status, /^unreadable \(entitySearch\.workloads: account 111: .*; account 222: /);
@@ -3094,10 +3108,11 @@ test("rule 1 corollary hit 3: NR-09 renders workloads as null with a status and 
   const partial = await assessCorollary([["entitySearch workloads", "partial"]]);
   const partly = partial.findings.find((item) => item.control === 9);
   assert.equal(partly.status, "warn");
-  assert.match(partly.summary, /Partial view: workloads: 1 scope unreadable \(entitySearch\.workloads: account 222: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\)\)/);
-  assert.equal(partly.evidence.workloads, 1);
-  assert.deepEqual(partly.evidence.disrupted_workloads, []);
-  assert.match(partly.evidence.workloads_status, /^1 scope unreadable \(entitySearch\.workloads: account 222: /);
+  assert.match(partly.summary, /^Partial view: workloads: 1 scope unreadable \(entitySearch\.workloads: account 222: NerdGraph returned errors: Not authorized \(at actor\.entitySearch\)\)\. The inventory was incomplete and the counts that follow cover the readable scopes only, so the verdict is limited to warn instead of pass\. Within the readable data: /);
+  assert.equal(partly.evidence.workloads, null, "the guide promises null for a denial affecting any one account");
+  assert.equal(partly.evidence.disrupted_workloads, null);
+  assert.match(partly.evidence.workloads_status, /^partial: 1 scope unreadable \(entitySearch\.workloads: account 222: .*\(at actor\.entitySearch\)\)$/);
+  assert.equal(partly.evidence.reporting_alertable_entities, 2, "inventories with every scope readable keep their counts");
 });
 
 test("rule 1 corollary hit 4: NR-10 is limited to warn naming alerts.policiesSearch when the policy listing is unreadable on the pass path", async () => {
@@ -3105,18 +3120,20 @@ test("rule 1 corollary hit 4: NR-10 is limited to warn naming alerts.policiesSea
     const { findings } = await assessCorollary([["alerts.policiesSearch", mode]]);
     const channels = findings.find((item) => item.control === 10);
     assert.equal(channels.status, "warn", `${mode}: ${channels.summary}`);
-    assert.match(channels.summary, /^2 destinations across 1 types receive 2 enabled workflows/);
+    assert.match(channels.summary, /^Partial view: alert policies: /);
+    assert.match(channels.summary, /Within the readable data: 2 destinations across 1 types receive 2 enabled workflows/);
     assert.match(channels.summary, /alerts\.policiesSearch/);
     assert.match(channels.summary, /\(at actor\.account\.alerts\.policiesSearch\)/);
     if (mode === "full") {
       assert.equal(channels.evidence.alert_policies, null);
       assert.match(channels.evidence.alert_policies_status, /^unreadable \(alerts\.policiesSearch: account 111, account 222: /);
     } else {
-      assert.equal(channels.evidence.alert_policies, 1);
-      assert.match(channels.evidence.alert_policies_status, /^1 scope unreadable \(alerts\.policiesSearch: account 222: /);
-      assert.match(channels.summary, /Partial view: alert policies: 1 scope unreadable \(alerts\.policiesSearch: account 222: /);
+      assert.equal(channels.evidence.alert_policies, null);
+      assert.match(channels.evidence.alert_policies_status, /^partial: 1 scope unreadable \(alerts\.policiesSearch: account 222: /);
+      assert.match(channels.summary, /^Partial view: alert policies: 1 scope unreadable \(alerts\.policiesSearch: account 222: /);
     }
     assert.equal(channels.evidence.destinations, 2);
+    assert.equal(channels.evidence.destinations_status, "complete (aiNotifications.destinations)");
   }
 });
 
@@ -3124,12 +3141,13 @@ test("rule 1 corollary hit 5: NR-12 is limited to warn naming entityManagement.p
   const { findings } = await assessCorollary([["entityManagement.pipelineCloudRules", "full"]]);
   const obfuscation = findings.find((item) => item.control === 12);
   assert.equal(obfuscation.status, "warn");
-  assert.match(obfuscation.summary, /^2 enabled obfuscation rules and 4 expressions cover credential and PII patterns; attribute drop coverage is unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) were not readable\. A dataset this finding depends on was unreadable/);
-  assert.match(obfuscation.summary, /Partial view: Pipeline Control cloud rules: unreadable \(entityManagement\.pipelineCloudRules: NerdGraph returned errors: Not authorized \(at actor\.entityManagement\.entitySearch\)\)\.$/);
+  assert.match(obfuscation.summary, /^Partial view: Pipeline Control cloud rules: unreadable \(entityManagement\.pipelineCloudRules: NerdGraph returned errors: Not authorized \(at actor\.entityManagement\.entitySearch\)\)\. A dataset this finding depends on was unreadable, so the verdict is limited to warn instead of pass\. Within the readable data: 2 enabled obfuscation rules and 4 expressions cover credential and PII patterns; attribute drop coverage is unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) were not readable\.$/);
   assert.equal(obfuscation.evidence.pipeline_cloud_rules, null);
   assert.equal(obfuscation.evidence.attribute_drop_rules, null);
   assert.equal(obfuscation.evidence.legacy_drop_rules, 2, "the readable drop rules keep their count");
-  assert.match(obfuscation.evidence.pipeline_control_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
+  assert.equal(obfuscation.evidence.legacy_drop_rules_status, "complete (nrqlDropRules.list)");
+  assert.match(obfuscation.evidence.pipeline_cloud_rules_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
+  assert.match(obfuscation.evidence.attribute_drop_rules_status, /^unreadable \(entityManagement\.pipelineCloudRules: .*\(at actor\.entityManagement\.entitySearch\)\)$/, "the derived total carries a status of its own");
   assert.doesNotMatch(obfuscation.summary, /\d+ pipeline or drop rules also drop sensitive attributes/);
 });
 
@@ -3143,13 +3161,17 @@ test("rule 1 corollary hit 6: NR-12 is limited to warn naming nrqlDropRules.list
   assert.equal(obfuscation.evidence.attribute_drop_rules, null);
   assert.equal(obfuscation.evidence.pipeline_cloud_rules, 1);
   assert.match(obfuscation.evidence.legacy_drop_rules_status, /^unreadable \(nrqlDropRules\.list: account 111, account 222: /);
+  assert.match(obfuscation.evidence.attribute_drop_rules_status, /^unreadable \(nrqlDropRules\.list: account 111, account 222: /);
 
   const partial = await assessCorollary([["nrqlDropRules.list", "partial"]]);
   const partly = partial.findings.find((item) => item.control === 12);
   assert.equal(partly.status, "warn");
-  assert.match(partly.summary, /2 pipeline or drop rules also drop sensitive attributes \(1 Pipeline Control cloud rules, 1 NRQL drop rules\)\. The inventory was incomplete, so the verdict is limited to warn instead of pass\. Partial view: NRQL drop rules: 1 scope unreadable \(nrqlDropRules\.list: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrqlDropRules\.list\)\)\.$/);
-  assert.equal(partly.evidence.legacy_drop_rules, 1);
-  assert.match(partly.evidence.legacy_drop_rules_status, /^1 scope unreadable \(nrqlDropRules\.list: account 222: /);
+  assert.match(partly.summary, /^Partial view: NRQL drop rules: 1 scope unreadable \(nrqlDropRules\.list: account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrqlDropRules\.list\)\)\. The inventory was incomplete and the counts that follow cover the readable scopes only, so the verdict is limited to warn instead of pass\. Within the readable data: 2 enabled obfuscation rules and 4 expressions cover credential and PII patterns; 2 pipeline or drop rules also drop sensitive attributes \(1 Pipeline Control cloud rules, 1 NRQL drop rules in the readable accounts\)\.$/);
+  assert.equal(partly.evidence.legacy_drop_rules, null, "a count from the readable account only is not a count");
+  assert.match(partly.evidence.legacy_drop_rules_status, /^partial: 1 scope unreadable \(nrqlDropRules\.list: account 222: .*\(at actor\.account\.nrqlDropRules\.list\)\)$/);
+  assert.equal(partly.evidence.attribute_drop_rules, null, "a derived total inherits the partial state of either input");
+  assert.match(partly.evidence.attribute_drop_rules_status, /^partial: 1 scope unreadable \(nrqlDropRules\.list: account 222: .*\); complete \(entityManagement\.pipelineCloudRules\)$/);
+  assert.equal(partly.evidence.pipeline_cloud_rules, 1);
 
   const both = await assessCorollary([["nrqlDropRules.list", "full"], ["entityManagement.pipelineCloudRules", "full"]]);
   assert.match(both.findings.find((item) => item.control === 12).summary, /unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) and NRQL drop rules \(nrqlDropRules\.list\) were not readable/);
@@ -3161,7 +3183,7 @@ test("rule 1 corollary hit 7: NR-12 renders log volume as null with a status and
   assert.equal(obfuscation.status, "warn");
   assert.match(obfuscation.summary, /Partial view: log volume: unreadable \(nrql\.Log\.volume: account 111: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\); account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)/);
   assert.equal(obfuscation.evidence.log_events_last_day, null);
-  assert.match(obfuscation.evidence.log_volume_status, /^unreadable \(nrql\.Log\.volume: account 111: .*; account 222: /);
+  assert.match(obfuscation.evidence.log_events_last_day_status, /^unreadable \(nrql\.Log\.volume: account 111: .*; account 222: /);
   const logs = full.findings.find((item) => item.control === 15);
   assert.equal(logs.status, "manual");
   assert.match(logs.summary, /the log volume query failed \(nrql\.Log\.volume: account 111: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\); account 222: NerdGraph returned errors: Not authorized \(at actor\.account\.nrql\)\)/);
@@ -3170,12 +3192,14 @@ test("rule 1 corollary hit 7: NR-12 renders log volume as null with a status and
   const partial = await assessCorollary([["NRQL Log volume", "partial"]]);
   const partly = partial.findings.find((item) => item.control === 12);
   assert.equal(partly.status, "warn");
-  assert.match(partly.summary, /Partial view: log volume: 1 scope unreadable \(nrql\.Log\.volume: account 222: /);
-  assert.equal(partly.evidence.log_events_last_day, 12_000);
-  assert.match(partly.evidence.log_volume_status, /^1 scope unreadable \(nrql\.Log\.volume: account 222: /);
+  assert.match(partly.summary, /^Partial view: log volume: 1 scope unreadable \(nrql\.Log\.volume: account 222: /);
+  assert.equal(partly.evidence.log_events_last_day, null, "a volume from the readable account only is not a volume");
+  assert.match(partly.evidence.log_events_last_day_status, /^partial: 1 scope unreadable \(nrql\.Log\.volume: account 222: .*\(at actor\.account\.nrql\)\)$/);
   const partlyLogs = partial.findings.find((item) => item.control === 15);
   assert.equal(partlyLogs.status, "warn");
-  assert.match(partlyLogs.summary, /Partial view: log volume: 1 scope unreadable \(nrql\.Log\.volume: account 222: /);
+  assert.match(partlyLogs.summary, /^Partial view: log volume: 1 scope unreadable \(nrql\.Log\.volume: account 222: .*Within the readable data: 12000 log events in the last day/);
+  assert.equal(partlyLogs.evidence.log_events_last_day, null);
+  assert.equal(partlyLogs.evidence.log_volume_readable, true);
 });
 
 test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when group grants are not fully readable", async () => {
@@ -3191,9 +3215,11 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
   const partial = await assessCorollary([["authorizationManagement.groups", "partial"]]);
   const partly = partial.findings.find((item) => item.control === 20);
   assert.equal(partly.status, "warn");
-  assert.match(partly.summary, /the group grant listing \(authorizationManagement\.groups\) is incomplete, so the roles in use were only partly cross-checked against the catalog\. Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)\.$/);
-  assert.deepEqual(partly.evidence.custom_roles_in_group_grants, []);
-  assert.match(partly.evidence.group_grants_status, /^1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
+  assert.match(partly.summary, /^Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)\. No custom roles exist in the catalog .* and none appears in the readable group grants, but the group grant listing \(authorizationManagement\.groups\) is incomplete, so the roles in use were only partly cross-checked against the catalog\.$/);
+  assert.equal(partly.evidence.custom_roles_in_group_grants, null, "an empty list from the readable domain only is not a list");
+  assert.equal(partly.evidence.groups_granted_custom_roles, null);
+  assert.match(partly.evidence.group_grants_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
+  assert.match(partly.evidence.custom_roles_in_group_grants_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
 
   const chained = await assessCorollary([["userManagement.authenticationDomains", "full"]]);
   const viaDomains = chained.findings.find((item) => item.control === 20);
@@ -3255,9 +3281,11 @@ test("rule 1 corollary bundle check: findings.json never carries NR-04, 09, 10, 
   assert.equal(byControl(9).evidence.workloads, null);
   assert.equal(byControl(9).evidence.disrupted_workloads, null);
   assert.match(byControl(9).summary, /alerts\.policiesSearch: account 222/);
-  assert.equal(byControl(10).evidence.alert_policies, 1);
-  assert.equal(byControl(12).evidence.legacy_drop_rules, 1);
-  assert.deepEqual(byControl(20).evidence.custom_roles_in_group_grants, []);
+  assert.equal(byControl(10).evidence.alert_policies, null);
+  assert.match(byControl(10).evidence.alert_policies_status, /^partial: 1 scope unreadable \(alerts\.policiesSearch: account 222: /);
+  assert.equal(byControl(12).evidence.legacy_drop_rules, null);
+  assert.match(byControl(12).evidence.legacy_drop_rules_status, /^partial: 1 scope unreadable \(nrqlDropRules\.list: account 222: /);
+  assert.equal(byControl(20).evidence.custom_roles_in_group_grants, null);
   assert.deepEqual(
     findings.filter((item) => item.status === "pass").map((item) => item.control).sort((a, b) => a - b),
     [1, 2, 5, 11, 13, 14, 15, 19],
@@ -3266,10 +3294,22 @@ test("rule 1 corollary bundle check: findings.json never carries NR-04, 09, 10, 
 
   const summaryJson = JSON.parse(readFileSync(join(result.outputDir, "analysis", "alerting.json"), "utf8"));
   assert.equal(summaryJson.summary.workloads, null);
+  assert.match(summaryJson.summary.workloads_status, /^unreadable \(entitySearch\.workloads: /);
+  assert.equal(summaryJson.summary.policies, null);
+  assert.match(summaryJson.summary.policies_status, /^partial: 1 scope unreadable \(alerts\.policiesSearch: account 222: /);
   assert.ok(summaryJson.coverage.some((note) => note.startsWith("workloads: unreadable (entitySearch.workloads: ")));
   const governance = JSON.parse(readFileSync(join(result.outputDir, "analysis", "data_governance.json"), "utf8"));
-  assert.equal(governance.summary.legacy_drop_rules, 1);
+  assert.equal(governance.summary.legacy_drop_rules, null);
+  assert.match(governance.summary.legacy_drop_rules_status, /^partial: 1 scope unreadable \(nrqlDropRules\.list: account 222: /);
+  assert.equal(governance.summary.attribute_drop_rules, null);
+  assert.match(governance.summary.attribute_drop_rules_status, /^partial: 1 scope unreadable \(nrqlDropRules\.list: account 222: .*; complete \(entityManagement\.pipelineCloudRules\)$/);
   assert.ok(governance.coverage.some((note) => note.startsWith("NRQL drop rules: 1 scope unreadable (nrqlDropRules.list: account 222: ")));
+  const dropRulesFile = JSON.parse(readFileSync(join(result.outputDir, "core_data", "nrql_drop_rules.json"), "utf8"));
+  assert.match(dropRulesFile.status, /^partial: 1 scope unreadable \(nrqlDropRules\.list: account 222: /);
+  assert.equal(dropRulesFile.records.length, 1, "the readable account's rows are kept beside the marker");
+  const workloadsFile = JSON.parse(readFileSync(join(result.outputDir, "core_data", "workloads.json"), "utf8"));
+  assert.match(workloadsFile.status, /^unreadable \(entitySearch\.workloads: /);
+  assert.equal(workloadsFile.records, null);
 });
 
 test("exportNewrelicAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {

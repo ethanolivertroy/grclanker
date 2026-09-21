@@ -3236,7 +3236,9 @@ export function assessNewrelicAccessControlData(
     if (!grantsReadable) return manualVerdict(`${keyInventoryLabel}, but group role grants were not readable (${causeOf(data.groupGrants)}), so admin group members cannot be identified as key owners. Collect ${keyEvidence}`);
     if (ownerIdsUnavailable) return manualVerdict(`${keyInventoryLabel}, but ${ownerIdsUnavailableNote}, so key owners cannot be matched to admin group members. Collect ${keyEvidence}`);
     if (unnamedKeys.length > 0 || adminOwnedUserKeys.length > 0 || unknownTypeKeys.length > 0) {
-      return verdict("warn", `${keyInventoryLabel}; ${unnamedKeys.length} lack a name, ${adminOwnedUserKeys.length} user keys inherit admin-level permissions from their owners, and ${unknownTypeKeys.length} expose no key type.`);
+      const adminOwned = adminOwnedUserKeys.length > 0 ? ` (${sample(adminOwnedUserKeys.map(keyLabel)).join(", ")})` : "";
+      const rosterScope = adminRosterComplete ? "" : " identified from the readable domains";
+      return verdict("warn", `${keyInventoryLabel}; ${unnamedKeys.length} lack a name, ${adminOwnedUserKeys.length} user keys${adminOwned} inherit admin-level permissions from their owners${rosterScope}, and ${unknownTypeKeys.length} expose no key type.`);
     }
     if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0 || userKeysWithoutOwner.length > 0) {
       return verdict("warn", `${keyInventoryLabel} with names and readable key types, but ${usersWithoutGroupData.length} users expose no group membership, ${groupsWithoutRoleData.length} groups expose no role grants, and ${userKeysWithoutOwner.length} user keys expose no userId, so admin-owned user keys may be undercounted.`);
@@ -4169,7 +4171,7 @@ export function assessNewrelicDataGovernanceData(
       ...(dropRulesReadable ? [] : ["NRQL drop rules (nrqlDropRules.list)"]),
     ];
     if (unreadable.length > 0) return `attribute drop coverage is unverified because ${unreadable.join(" and ")} were not readable`;
-    return `${attributeDropRules.length} pipeline or drop rules also drop sensitive attributes (${cloudRules.length} Pipeline Control cloud rules, ${dropRules.length} NRQL drop rules)`;
+    return `${attributeDropRules.length} pipeline or drop rules also drop sensitive attributes (${cloudRules.length} Pipeline Control cloud rules, ${dropRules.length} NRQL drop rules${hasUnreadableScope(data.dropRules) ? " in the readable accounts" : ""})`;
   };
   const logVolumeClause = logVolumeReadable && logCount > 0
     ? ` while ${logCount} log events were ingested in the last day${isComplete(data.logVolume) ? "" : " in the readable accounts"}`
