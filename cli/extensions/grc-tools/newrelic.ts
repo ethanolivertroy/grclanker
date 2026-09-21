@@ -427,6 +427,10 @@ function sample<T>(values: T[], limit = 25): T[] {
   return values.slice(0, limit);
 }
 
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
 function percent(part: number, total: number): number {
   if (total <= 0) return 0;
   return Number(((part / total) * 100).toFixed(1));
@@ -674,9 +678,15 @@ function parseLinkNext(linkHeader: string | null): string | undefined {
   return undefined;
 }
 
-function isUnknownCursorArgumentError(error: unknown): boolean {
+/**
+ * NerdGraph reports a selection that does not match the schema with validation errors such as
+ * `Cannot query field "nextCursor" on type "ApiAccessKeySearchResult"`, `Unknown argument "cursor" on field ...`,
+ * `Unknown field`, or `Argument "query" has invalid value`. Authorization failures use different wording and must
+ * not match, so they keep propagating as unreadable surfaces.
+ */
+function isSchemaMismatchError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /cursor/i.test(message) && /unknown argument|not defined|does not accept|undefined argument/i.test(message);
+  return /cannot query field|unknown argument|unknown field|has invalid value|is not defined|does not accept|undefined argument|undefined field|does not exist on type|field .* doesn't exist/i.test(message);
 }
 
 function nerdgraphErrorSummary(errors: unknown): string {
@@ -723,17 +733,38 @@ const QUERY_DOMAIN_GROUP_GRANTS = `query($domainId: [ID!], $cursor: String) {
         nextCursor totalCount
         groups {
           id displayName
-          roles { roles { id roleId name displayName type accountId organizationId } }
+          roles { roles { id name displayName type accountId organizationId } }
         }
       }
     } }
   } } }
 }`;
-const QUERY_ROLES = `query($cursor: String) {
-  actor { organization { authorizationManagement {
-    roles(cursor: $cursor) { nextCursor totalCount roles { id name displayName scope type } }
-  } } }
-}`;
+/**
+ * Role catalog. The documented catalog is
+ *   customerAdministration.roles(filter: { organizationId: { eq } }) { items { id name scope type } }
+ * Documented: docs.newrelic.com/docs/accounts/accounts-billing/account-structure/multi-tenancy/delegated-administration
+ *   ("List roles"); the same page documents that customerAdministration requires the multi-tenancy entitlement, so
+ *   the surface is optional in newrelic_check_access and control 20 renders manual when it is unavailable.
+ *   The groups tutorial (nerdgraph-manage-groups) documents roles only nested under groups.roles, which
+ *   QUERY_DOMAIN_GROUP_GRANTS reads.
+ * Schema reference: MultiTenantAuthorizationRoleCollection { items nextCursor totalCount }; MultiTenantAuthorizationRole
+ *   { id name scope type } where type is MultiTenantAuthorizationRoleTypeEnum with the values CUSTOM and STANDARD.
+ *   The `cursor` argument is documented on the sibling customerAdministration collections (share-accounts:
+ *   accountShares, accounts) and is only sent when a nextCursor was returned.
+ */
+const ROLE_FIELDS = "id name scope type";
+const ROLE_COLLECTION_FIELDS = "nextCursor totalCount";
+const ROLE_CATALOG_SOURCE = "customerAdministration.roles";
+const ROLE_TYPE_CUSTOM = "CUSTOM";
+const ROLE_TYPE_STANDARD = "STANDARD";
+/**
+ * Documented: delegated-administration ("Query authentication domains"):
+ *   customerAdministration.authenticationDomains(filter: { organizationId: { eq } }) { items { id name provisioningType authenticationType } }
+ * Schema reference: OrganizationAuthenticationDomainCollection { items nextCursor } and OrganizationAuthenticationDomain
+ *   { id name organizationId provisioningType authenticationType }.
+ */
+const AUTHENTICATION_DOMAIN_FIELDS = "id name organizationId provisioningType authenticationType";
+const AUTHENTICATION_DOMAIN_COLLECTION_FIELDS = "nextCursor";
 const API_KEY_FIELDS = `keys {
         id name notes type createdAt
         ... on ApiAccessIngestKey { accountId ingestType }
@@ -1086,23 +1117,59 @@ export class NewrelicApiClient {
     );
   }
 
-  async listOrganizationAuthenticationDomains(organizationId: string): Promise<PagedList> {
-    const query = `{
-  customerAdministration {
-    authenticationDomains(filter: { organizationId: { eq: ${JSON.stringify(organizationId)} } }) {
-      items { id name organizationId provisioningType authenticationType }
-      nextCursor
+  /**
+   * Reads a customerAdministration collection filtered by organization. The first page never sends a cursor; follow-up
+   * pages send the documented `cursor` argument, and if the collection rejects it the first page is returned as an
+   * incomplete listing instead of failing the surface.
+   */
+  private async paginateCustomerAdministration(
+    collection: string,
+    organizationId: string,
+    itemFields: string,
+    collectionFields: string,
+    limit: number,
+  ): Promise<PagedList> {
+    const items: JsonRecord[] = [];
+    let cursor: string | undefined;
+    let totalCount: number | undefined;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const cursorArgument = cursor ? `, cursor: ${JSON.stringify(cursor)}` : "";
+      const query = `{ customerAdministration { ${collection}(filter: { organizationId: { eq: ${JSON.stringify(organizationId)} } }${cursorArgument}) { items { ${itemFields} } ${collectionFields} } } }`;
+      let data: JsonRecord;
+      try {
+        data = await this.nerdgraph(query);
+      } catch (error) {
+        if (cursor && isSchemaMismatchError(error)) {
+          return {
+            items,
+            complete: false,
+            totalCount,
+            note: `customerAdministration.${collection} rejected the cursor argument, so only the first page was read (${items.length}${totalCount !== undefined ? ` of ${totalCount}` : ""} items)`,
+          };
+        }
+        throw error;
+      }
+      const result = asObject(getNestedValue(data, ["customerAdministration", collection]));
+      if (!result) throw new Error(`NerdGraph response did not include customerAdministration.${collection}.`);
+      const pageItems = asRecords(result.items);
+      totalCount = asNumber(result.totalCount) ?? totalCount;
+      items.push(...pageItems.slice(0, Math.max(0, limit - items.length)));
+      const nextCursor = asString(result.nextCursor);
+      if (!nextCursor || nextCursor === cursor || pageItems.length === 0) return { items, complete: true, totalCount };
+      if (items.length >= limit) break;
+      cursor = nextCursor;
     }
+    return { items, complete: false, totalCount, note: `stopped after ${items.length} items with more pages available` };
   }
-}`;
-    const data = await this.nerdgraph(query);
-    const collection = asObject(getNestedValue(data, ["customerAdministration", "authenticationDomains"]));
-    const nextCursor = asString(collection?.nextCursor);
-    return {
-      items: asRecords(collection?.items),
-      complete: !nextCursor,
-      note: nextCursor ? "customerAdministration.authenticationDomains returned more pages than were read" : undefined,
-    };
+
+  async listOrganizationAuthenticationDomains(organizationId: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
+    return this.paginateCustomerAdministration(
+      "authenticationDomains",
+      organizationId,
+      AUTHENTICATION_DOMAIN_FIELDS,
+      AUTHENTICATION_DOMAIN_COLLECTION_FIELDS,
+      limit,
+    );
   }
 
   async listDomainUsers(domainId: string, limit = DEFAULT_USER_LIMIT): Promise<PagedList> {
@@ -1137,8 +1204,8 @@ export class NewrelicApiClient {
     };
   }
 
-  async listRoles(limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
-    return this.paginate(QUERY_ROLES, {}, ["actor", "organization", "authorizationManagement", "roles"], "roles", limit);
+  async listRoles(organizationId: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
+    return this.paginateCustomerAdministration("roles", organizationId, ROLE_FIELDS, ROLE_COLLECTION_FIELDS, limit);
   }
 
   async listApiKeys(types: Array<"USER" | "INGEST">, accountIds?: number[], limit = DEFAULT_USER_LIMIT): Promise<PagedList> {
@@ -1147,7 +1214,7 @@ export class NewrelicApiClient {
     try {
       return await this.paginate(QUERY_API_KEYS, variables, ["actor", "apiAccess", "keySearch"], "keys", limit);
     } catch (error) {
-      if (!isUnknownCursorArgumentError(error)) throw error;
+      if (!isSchemaMismatchError(error)) throw error;
       const data = await this.nerdgraph(QUERY_API_KEYS_SINGLE_PAGE, variables);
       const search = asObject(getNestedValue(data, ["actor", "apiAccess", "keySearch"]));
       const keys = asRecords(search?.keys).slice(0, limit);
@@ -1319,6 +1386,7 @@ type IdentityClient = Pick<
 type AccessControlClient = Pick<
   NewrelicClientSurface,
   | "getResolvedConfig"
+  | "getOrganization"
   | "resolveAccountIds"
   | "listAccounts"
   | "listAuthenticationDomains"
@@ -1519,10 +1587,14 @@ export async function checkNewrelicAccess(
       arrayCount,
     ),
     await readableSurface(
-      "authorization_management",
-      "NerdGraph actor.organization.authorizationManagement.roles",
-      true,
-      () => client.listRoles(),
+      "role_catalog",
+      "NerdGraph customerAdministration.roles (multi-tenancy entitlement)",
+      false,
+      async () => {
+        const organizationId = asString((await client.getOrganization()).id);
+        if (!organizationId) throw new Error("actor.organization returned no id, so customerAdministration.roles cannot be filtered.");
+        return client.listRoles(organizationId, 50);
+      },
       arrayCount,
     ),
     await readableSurface("api_access", "NerdGraph actor.apiAccess.keySearch", true, () => client.listApiKeys(["USER"], undefined, 50), arrayCount),
@@ -1585,6 +1657,7 @@ export async function checkNewrelicAccess(
       `Authenticated as ${asString(currentUser.email) ?? asString(currentUser.name) ?? asString(currentUser.id) ?? "unknown user"}.`,
       `Accounts in scope: ${accountIds.length > 0 ? accountIds.join(", ") : "none resolved"}.`,
       `${readableRequired}/${requiredSurfaces.length} required surfaces and ${readableCount}/${surfaces.length} total surfaces are readable.`,
+      "The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement; when it is not readable, control 20 renders manual and custom roles are reported from group grants only.",
       "REST API v2 /v2/users.json only lists original user model users and is informational.",
     ],
     recommendedNextStep:
@@ -1712,8 +1785,31 @@ export async function collectNewrelicIdentityData(
   );
   const users = await collectList("userManagement.users", () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
   const groupGrants = await collectList("authorizationManagement.groups", () => collectGroupGrants(client, requireDomains(authenticationDomains)));
-  const roles = await collectList("authorizationManagement.roles", () => client.listRoles());
+  const roles = await collectRoles(client, organization);
   return { organization, authenticationDomains, organizationAuthenticationDomains, users, groupGrants, roles };
+}
+
+async function collectRoles(
+  client: Pick<NewrelicClientSurface, "listRoles">,
+  organization: Collected<JsonRecord>,
+): Promise<Collected<JsonRecord[]>> {
+  return collectList(ROLE_CATALOG_SOURCE, async () => {
+    const organizationId = asString(organization.data.id);
+    if (!organizationId) throw new Error(`organization id was not readable (${organization.error ?? "actor.organization returned no id"})`);
+    return client.listRoles(organizationId);
+  });
+}
+
+function roleType(role: JsonRecord): string {
+  return (asString(role.type) ?? "").toUpperCase();
+}
+
+function isCustomRole(role: JsonRecord): boolean {
+  return roleType(role) === ROLE_TYPE_CUSTOM;
+}
+
+function roleLabel(role: JsonRecord): string {
+  return asString(role.name) ?? asString(role.displayName) ?? asString(role.id) ?? "role";
 }
 
 function userTypeId(user: JsonRecord): string {
@@ -1734,7 +1830,7 @@ function userLabel(user: JsonRecord): string {
 }
 
 function grantRoleName(role: JsonRecord): string {
-  return asString(role.displayName) ?? asString(role.name) ?? asString(role.roleId) ?? asString(role.id) ?? "role";
+  return asString(role.displayName) ?? asString(role.name) ?? asString(role.id) ?? "role";
 }
 
 function adminGroupIds(groupGrants: JsonRecord[], adminRolePattern: RegExp): Set<string> {
@@ -1830,7 +1926,7 @@ export function assessNewrelicIdentityData(
     return age !== undefined && age > inactiveDays;
   });
   const neverActiveUsers = users.filter((user) => lastActiveAgeDays(user, now) === undefined);
-  const customRoles = roles.filter((role) => (asString(role.type) ?? "").toUpperCase() === "CUSTOM");
+  const customRoles = roles.filter(isCustomRole);
 
   const domainCoverage = coverageNotes([["authentication domains", data.authenticationDomains]]);
   const authTypeCoverage = coverageNotes([["authentication domain settings", data.organizationAuthenticationDomains]]);
@@ -2052,11 +2148,12 @@ export async function collectNewrelicAccessControlData(
   const config = client.getResolvedConfig();
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 50_000);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
+  const organization = await collect("organization", {} as JsonRecord, () => client.getOrganization());
   const accounts = await collectList("accounts", () => client.listAccounts());
   const authenticationDomains = await collectList("userManagement.authenticationDomains", () => client.listAuthenticationDomains());
   const users = await collectList("userManagement.users", () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
   const groupGrants = await collectList("authorizationManagement.groups", () => collectGroupGrants(client, requireDomains(authenticationDomains)));
-  const roles = await collectList("authorizationManagement.roles", () => client.listRoles());
+  const roles = await collectRoles(client, organization);
   const apiKeys = await collectList("apiAccess.keySearch", () => client.listApiKeys(["USER", "INGEST"], accountIds.length > 0 ? accountIds : undefined));
   const window = config.auditWindowDays;
   const apiKeyAuditEvents = await collectList(
@@ -2233,11 +2330,12 @@ export function assessNewrelicAccessControlData(
     })
     : [];
 
-  const customRoles = roles.filter((role) => (asString(role.type) ?? "").toUpperCase() === "CUSTOM");
-  const standardRoles = roles.filter((role) => (asString(role.type) ?? "").toUpperCase() === "STANDARD");
-  const unknownTypeRoles = roles.filter((role) => !["CUSTOM", "STANDARD"].includes((asString(role.type) ?? "").toUpperCase()));
-  const customRoleGrants = groupGrants.filter((group) =>
-    asRecords(group.roles).some((role) => (asString(role.type) ?? "").toUpperCase() === "CUSTOM"),
+  const customRoles = roles.filter(isCustomRole);
+  const standardRoles = roles.filter((role) => roleType(role) === ROLE_TYPE_STANDARD);
+  const unknownTypeRoles = roles.filter((role) => ![ROLE_TYPE_CUSTOM, ROLE_TYPE_STANDARD].includes(roleType(role)));
+  const customRoleGrants = groupGrants.filter((group) => asRecords(group.roles).some(isCustomRole));
+  const grantedCustomRoleNames = uniqueSorted(
+    groupGrants.flatMap((group) => asRecords(group.roles).filter(isCustomRole).map(grantRoleName)),
   );
 
   const keyCoverage = coverageNotes([["API keys", data.apiKeys]]);
@@ -2345,15 +2443,22 @@ export function assessNewrelicAccessControlData(
   };
 
   const control20 = (): Verdict => {
-    if (!rolesReadable) return unreadableVerdict("Roles (authorizationManagement.roles)", data.roles, "every custom role's capabilities from Administration > Access Management > Roles.");
-    if (roles.length === 0) return manualVerdict("authorizationManagement.roles returned zero roles; New Relic always exposes standard roles, so the key cannot read them and emptiness is unknown rather than compliant. Collect the role list from Administration > Access Management > Roles.");
-    if (customRoles.length > 0) {
-      return manualVerdict(`${customRoles.length} custom roles exist (${sample(customRoles.map((role) => asString(role.displayName) ?? asString(role.name) ?? asString(role.id) ?? "role"), 10).join(", ")}). NerdGraph does not expose role capabilities, so open each role in Administration > Access Management > Roles and confirm no unnecessary manage or delete capabilities are granted.`);
+    const grantedCustomRolesNote = grantsReadable
+      ? grantedCustomRoleNames.length > 0
+        ? `Group grants expose ${grantedCustomRoleNames.length} custom roles in use (${sample(grantedCustomRoleNames, 10).join(", ")}); custom roles that are defined but not granted to any group cannot be enumerated without the catalog.`
+        : "No custom role appears in the readable group grants, but custom roles that are defined and not granted to any group cannot be enumerated without the catalog."
+      : "Group grants were not readable either, so custom roles in use cannot be enumerated.";
+    if (!rolesReadable) {
+      return manualVerdict(`The role catalog (${ROLE_CATALOG_SOURCE}) was not readable: ${causeOf(data.roles)}. The documented catalog is only served to organizations with the multi-tenancy entitlement. ${grantedCustomRolesNote} Collect every custom role's capabilities from Administration > Access Management > Roles.`);
     }
-    if (unknownTypeRoles.length > 0) return manualVerdict(`${unknownTypeRoles.length}/${roles.length} roles exposed no role type, so custom roles cannot be distinguished from standard ones. Collect the role list with types from Administration > Access Management > Roles.`);
+    if (roles.length === 0) return manualVerdict(`${ROLE_CATALOG_SOURCE} returned zero roles; New Relic always exposes standard roles, so the key cannot read them and emptiness is unknown rather than compliant. Collect the role list from Administration > Access Management > Roles.`);
+    if (customRoles.length > 0) {
+      return manualVerdict(`${customRoles.length} custom roles exist (${sample(customRoles.map(roleLabel), 10).join(", ")}). NerdGraph does not expose role capabilities, so open each role in Administration > Access Management > Roles and confirm no unnecessary manage or delete capabilities are granted.`);
+    }
+    if (unknownTypeRoles.length > 0) return manualVerdict(`${unknownTypeRoles.length}/${roles.length} roles exposed a type other than ${ROLE_TYPE_CUSTOM} or ${ROLE_TYPE_STANDARD} (the MultiTenantAuthorizationRoleTypeEnum values), so custom roles cannot be distinguished from standard ones. Collect the role list with types from Administration > Access Management > Roles.`);
     if (!isComplete(data.roles)) return verdict("warn", `No custom roles appeared among ${roles.length} roles, but the role listing was incomplete, so unseen custom roles cannot be ruled out.`);
-    if (standardRoles.length === 0) return manualVerdict(`No custom roles appeared among ${roles.length} roles, but no STANDARD roles were returned either, so the role listing is not trustworthy. Collect the role list from Administration > Access Management > Roles.`);
-    return verdict("pass", `No custom roles exist. Both conditions for accepting this hold: the roles query was readable and complete, and it returned ${standardRoles.length} standard roles.`);
+    if (standardRoles.length === 0) return manualVerdict(`No custom roles appeared among ${roles.length} roles, but no ${ROLE_TYPE_STANDARD} roles were returned either, so the role listing is not trustworthy. Collect the role list from Administration > Access Management > Roles.`);
+    return verdict("pass", `No custom roles exist. Both conditions for accepting this hold: the ${ROLE_CATALOG_SOURCE} query was readable and complete, and it returned ${standardRoles.length} ${ROLE_TYPE_STANDARD} roles.`);
   };
 
   const findings: NewrelicFinding[] = [];
@@ -2413,15 +2518,19 @@ export function assessNewrelicAccessControlData(
   }));
 
   findings.push(finding(20, limitCoverage(control20(), roleCoverage), {
+    role_catalog_source: ROLE_CATALOG_SOURCE,
+    role_catalog_readable: rolesReadable,
     roles_total: roles.length,
     standard_roles: standardRoles.length,
     unknown_type_roles: unknownTypeRoles.length,
     role_listing_complete: isComplete(data.roles),
     custom_roles: sample(customRoles.map((role) => ({
       id: asString(role.id),
-      name: asString(role.displayName) ?? asString(role.name),
+      name: roleLabel(role),
       scope: asString(role.scope),
+      type: asString(role.type),
     }))),
+    custom_roles_in_group_grants: sample(grantedCustomRoleNames),
     groups_granted_custom_roles: sample(customRoleGrants.map((group) => asString(group.displayName) ?? asString(group.id) ?? "group")),
     manual_evidence: "Capability list for each custom role from Administration > Access Management > Roles.",
   }));

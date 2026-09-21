@@ -93,21 +93,20 @@ function orgManagerGroup(id = "g-admin") {
     id,
     displayName: "Organization admins",
     roles: [
-      { id: "grant-1", roleId: "1", name: "Organization manager", displayName: "Organization manager", type: "STANDARD", organizationId: "org-1" },
+      { id: "grant-1", name: "Organization manager", displayName: "Organization manager", type: "STANDARD", organizationId: "org-1" },
     ],
   };
 }
 
-function accountGroup(id, accountIds, roleName = "Read only") {
+function accountGroup(id, accountIds, roleName = "Read only", roleType = "STANDARD") {
   return {
     id,
     displayName: id,
     roles: accountIds.map((accountId) => ({
       id: `grant-${id}-${accountId}`,
-      roleId: "2",
       name: roleName,
       displayName: roleName,
-      type: "STANDARD",
+      type: roleType,
       accountId,
     })),
   };
@@ -115,9 +114,13 @@ function accountGroup(id, accountIds, roleName = "Read only") {
 
 function standardRoles() {
   return [
-    { id: "role-1", name: "Organization manager", displayName: "Organization manager", scope: "organization", type: "STANDARD" },
-    { id: "role-2", name: "Read only", displayName: "Read only", scope: "account", type: "STANDARD" },
+    { id: "1", name: "Organization manager", scope: "organization", type: "STANDARD" },
+    { id: "2", name: "Read only", scope: "account", type: "STANDARD" },
   ];
+}
+
+function requireOrganizationId(organizationId) {
+  assert.equal(organizationId, "org-1", "listRoles must be filtered by the organization id from actor.organization");
 }
 
 function identityClient(overrides = {}) {
@@ -142,7 +145,8 @@ function identityClient(overrides = {}) {
     async listDomainGroupGrants() {
       return [orgManagerGroup(), accountGroup("g-dev", [222])];
     },
-    async listRoles() {
+    async listRoles(organizationId) {
+      requireOrganizationId(organizationId);
       return standardRoles();
     },
     ...overrides,
@@ -152,6 +156,9 @@ function identityClient(overrides = {}) {
 function accessControlClient(overrides = {}) {
   return {
     getResolvedConfig: () => sampleConfig(),
+    async getOrganization() {
+      return { id: "org-1", name: "Example Org" };
+    },
     async resolveAccountIds() {
       return [111, 222];
     },
@@ -170,7 +177,8 @@ function accessControlClient(overrides = {}) {
     async listDomainGroupGrants() {
       return [orgManagerGroup(), accountGroup("g-dev", [222])];
     },
-    async listRoles() {
+    async listRoles(organizationId) {
+      requireOrganizationId(organizationId);
       return standardRoles();
     },
     async listApiKeys() {
@@ -613,6 +621,60 @@ test("NewrelicApiClient falls back to a single-page keySearch when the cursor ar
   assert.doesNotMatch(seen[1], /cursor/);
 });
 
+test("NewrelicApiClient reads the role catalog from customerAdministration.roles with the documented fields and cursor", async () => {
+  const seen = [];
+  const fetchImpl = async (_input, init = {}) => {
+    const body = JSON.parse(init.body);
+    seen.push(body.query);
+    const page = body.query.includes("cursor:")
+      ? { items: [{ id: "2", name: "Read only", scope: "account", type: "STANDARD" }], nextCursor: null, totalCount: 2 }
+      : { items: [{ id: "1", name: "Organization manager", scope: "organization", type: "STANDARD" }], nextCursor: "roles-2", totalCount: 2 };
+    return jsonResponse({ data: { customerAdministration: { roles: page } } });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl });
+  const roles = await client.listRoles("org-1");
+
+  assert.deepEqual(roles.items.map((role) => role.id), ["1", "2"]);
+  assert.equal(roles.complete, true);
+  assert.equal(roles.totalCount, 2);
+  assert.equal(seen.length, 2);
+  assert.match(seen[0], /customerAdministration \{ roles\(filter: \{ organizationId: \{ eq: "org-1" \} \}\) \{ items \{ id name scope type \} nextCursor totalCount \} \}/);
+  assert.doesNotMatch(seen[0], /cursor:|authorizationManagement|displayName/);
+  assert.match(seen[1], /roles\(filter: \{ organizationId: \{ eq: "org-1" \} \}, cursor: "roles-2"\)/);
+
+  const rejectingCursor = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      const body = JSON.parse(init.body);
+      if (body.query.includes("cursor:")) {
+        return jsonResponse({ errors: [{ message: 'Unknown argument "cursor" on field "CustomerAdministration.roles".' }] });
+      }
+      return jsonResponse({ data: { customerAdministration: { roles: { items: [{ id: "1", name: "Organization manager", scope: "organization", type: "STANDARD" }], nextCursor: "roles-2", totalCount: 2 } } } });
+    },
+  });
+  const firstPage = await rejectingCursor.listRoles("org-1");
+  assert.equal(firstPage.complete, false);
+  assert.equal(firstPage.items.length, 1);
+  assert.match(firstPage.note, /customerAdministration\.roles rejected the cursor argument.*1 of 2 items/);
+
+  const unauthorized = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ errors: [{ message: "Not authorized", path: ["customerAdministration", "roles"] }] }),
+  });
+  await assert.rejects(unauthorized.listRoles("org-1"), /Not authorized/);
+
+  const domains = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init = {}) => {
+      const body = JSON.parse(init.body);
+      assert.match(body.query, /authenticationDomains\(filter: \{ organizationId: \{ eq: "org-1" \} \}\) \{ items \{ id name organizationId provisioningType authenticationType \} nextCursor \}/);
+      return jsonResponse({ data: { customerAdministration: { authenticationDomains: { items: [{ id: "domain-1", provisioningType: "SCIM", authenticationType: "SAML_SSO" }], nextCursor: null } } } });
+    },
+  });
+  assert.deepEqual(await domains.listOrganizationAuthenticationDomains("org-1"), {
+    items: [{ id: "domain-1", provisioningType: "SCIM", authenticationType: "SAML_SSO" }],
+    complete: true,
+    totalCount: undefined,
+  });
+});
+
 test("NewrelicApiClient surfaces dashboard live URL errors and omits link values", async () => {
   const fetchImpl = async (_input, init = {}) => {
     const body = JSON.parse(init.body);
@@ -659,7 +721,8 @@ test("checkNewrelicAccess reports healthy when every required surface is readabl
     async listAuthenticationDomains() {
       return [{ id: "domain-1" }];
     },
-    async listRoles() {
+    async listRoles(organizationId) {
+      requireOrganizationId(organizationId);
       return standardRoles();
     },
     async listApiKeys() {
@@ -691,10 +754,67 @@ test("checkNewrelicAccess reports healthy when every required surface is readabl
   assert.deepEqual(result.accountIds, [111, 222]);
   assert.equal(result.surfaces.length, 12);
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 12);
-  assert.equal(result.surfaces.filter((surface) => surface.required).length, 7);
+  assert.equal(result.surfaces.filter((surface) => surface.required).length, 6);
   assert.ok(result.surfaces.some((surface) => surface.name === "nrql" && surface.required));
+  const roleCatalog = result.surfaces.find((surface) => surface.name === "role_catalog");
+  assert.equal(roleCatalog.required, false);
+  assert.match(roleCatalog.endpoint, /customerAdministration\.roles/);
   assert.ok(result.notes.some((note) => note.includes("auditor@example.com")));
   assert.match(result.recommendedNextStep, /newrelic_assess_identity/);
+});
+
+test("checkNewrelicAccess stays healthy when the entitlement-gated role catalog is not served", async () => {
+  const client = {
+    getResolvedConfig: () => sampleConfig(),
+    async getCurrentUser() {
+      return { id: "u-1", email: "auditor@example.com" };
+    },
+    async getOrganization() {
+      return { id: "org-1", name: "Example Org" };
+    },
+    async listAccounts() {
+      return [{ id: 111, name: "Production" }];
+    },
+    async resolveAccountIds() {
+      return [111];
+    },
+    async listAuthenticationDomains() {
+      return [{ id: "domain-1" }];
+    },
+    async listRoles() {
+      throw new Error("NerdGraph returned errors: Not authorized (at customerAdministration.roles)");
+    },
+    async listApiKeys() {
+      return [{ id: "key-1", type: "USER" }];
+    },
+    async runNrql() {
+      return [{ count: 5 }];
+    },
+    async searchEntities() {
+      return [{ guid: "dash-1" }];
+    },
+    async listAlertPolicies() {
+      return [{ id: "policy-1" }];
+    },
+    async listEventRetentionRules() {
+      return [];
+    },
+    async listObfuscationRules() {
+      return [];
+    },
+    async listRestUsers() {
+      return [{ id: 1 }];
+    },
+  };
+
+  const result = await checkNewrelicAccess(client);
+  assert.equal(result.status, "healthy");
+  const roleCatalog = result.surfaces.find((surface) => surface.name === "role_catalog");
+  assert.equal(roleCatalog.status, "not_readable");
+  assert.equal(roleCatalog.required, false);
+  assert.match(roleCatalog.error, /Not authorized/);
+  assert.ok(result.notes.some((note) => /multi-tenancy entitlement/.test(note) && /control 20 renders manual/.test(note)));
+  assert.ok(!result.surfaces.some((surface) => /authorizationManagement\.roles/.test(surface.endpoint)));
 });
 
 test("checkNewrelicAccess reports limited access when required surfaces fail", async () => {
@@ -716,7 +836,7 @@ test("checkNewrelicAccess reports limited access when required surfaces fail", a
       throw new Error("NerdGraph returned errors: Not authorized (at actor.organization.userManagement)");
     },
     async listRoles() {
-      throw new Error("NerdGraph returned errors: Not authorized (at actor.organization.authorizationManagement)");
+      throw new Error("NerdGraph returned errors: Not authorized (at customerAdministration.roles)");
     },
     async listApiKeys() {
       return [];
@@ -861,8 +981,9 @@ test("assessNewrelicAccessControl flags unnamed and aged keys, orphaned owners, 
         accountGroup("g-everything", [222, 333, 444, 555, 666, 777]),
       ];
     },
-    async listRoles() {
-      return [...standardRoles(), { id: "role-9", name: "Deploy operators", displayName: "Deploy operators", scope: "account", type: "CUSTOM" }];
+    async listRoles(organizationId) {
+      requireOrganizationId(organizationId);
+      return [...standardRoles(), { id: "9", name: "Deploy operators", scope: "account", type: "CUSTOM" }];
     },
     async listApiKeys() {
       return [
@@ -887,7 +1008,79 @@ test("assessNewrelicAccessControl flags unnamed and aged keys, orphaned owners, 
   assert.deepEqual(findingById(result, "NR-08-CROSS-ACCOUNT-RESTRICTIONS").evidence.cross_environment_users, ["bob@example.com"]);
   assert.equal(findingById(result, "NR-08-CROSS-ACCOUNT-RESTRICTIONS").evidence.admin_users_excluded, 1);
   assert.equal(findingStatus(result, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
-  assert.match(findingById(result, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /Administration > Access Management > Roles/);
+  assert.match(findingById(result, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /1 custom roles exist \(Deploy operators\).*Administration > Access Management > Roles/);
+  assert.deepEqual(findingById(result, "NR-20-CUSTOM-ROLE-PERMISSIONS").evidence.custom_roles, [
+    { id: "9", name: "Deploy operators", scope: "account", type: "CUSTOM" },
+  ]);
+});
+
+test("control 20 reads the role catalog from customerAdministration.roles and classifies by the CUSTOM/STANDARD enum", async () => {
+  const calls = [];
+  const catalog = accessControlClient({
+    async listRoles(organizationId) {
+      calls.push(organizationId);
+      return [
+        { id: "1", name: "Organization manager", scope: "organization", type: "STANDARD" },
+        { id: "2", name: "Read only", scope: "account", type: "standard" },
+      ];
+    },
+  });
+  const passing = await assessNewrelicAccessControl(catalog, { now: NOW });
+  assert.deepEqual(calls, ["org-1"]);
+  assert.equal(findingStatus(passing, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "pass");
+  assert.match(findingById(passing, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /customerAdministration\.roles query was readable and complete.*2 STANDARD roles/);
+  assert.equal(findingById(passing, "NR-20-CUSTOM-ROLE-PERMISSIONS").evidence.role_catalog_source, "customerAdministration.roles");
+
+  const unknownType = await assessNewrelicAccessControl(accessControlClient({
+    async listRoles() {
+      return [...standardRoles(), { id: "3", name: "Mystery", scope: "account", type: "SYSTEM" }];
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(unknownType, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
+  assert.match(findingById(unknownType, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /1\/3 roles exposed a type other than CUSTOM or STANDARD \(the MultiTenantAuthorizationRoleTypeEnum values\)/);
+
+  const noOrganizationId = await assessNewrelicAccessControl(accessControlClient({
+    async getOrganization() {
+      return { name: "Example Org" };
+    },
+    async listRoles() {
+      throw new Error("listRoles must not be called without an organization id");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(noOrganizationId, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
+  assert.match(findingById(noOrganizationId, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /role catalog \(customerAdministration\.roles\) was not readable: .*organization id was not readable \(actor\.organization returned no id\)/);
+});
+
+test("control 20 renders manual with custom roles from group grants when the role catalog is entitlement-gated", async () => {
+  const result = await assessNewrelicAccessControl(accessControlClient({
+    async listDomainGroupGrants() {
+      return [orgManagerGroup(), accountGroup("g-dev", [222]), accountGroup("g-deploy", [111], "Deploy operators", "CUSTOM")];
+    },
+    async listRoles() {
+      throw new Error("NerdGraph returned errors: Not authorized (at customerAdministration.roles)");
+    },
+  }), { now: NOW });
+
+  const finding = findingById(result, "NR-20-CUSTOM-ROLE-PERMISSIONS");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, /role catalog \(customerAdministration\.roles\) was not readable: .*Not authorized \(at customerAdministration\.roles\)/);
+  assert.match(finding.summary, /only served to organizations with the multi-tenancy entitlement/);
+  assert.match(finding.summary, /Group grants expose 1 custom roles in use \(Deploy operators\)/);
+  assert.equal(finding.evidence.role_catalog_readable, false);
+  assert.deepEqual(finding.evidence.custom_roles_in_group_grants, ["Deploy operators"]);
+  assert.deepEqual(finding.evidence.groups_granted_custom_roles, ["g-deploy"]);
+  assert.ok(result.errors.some((error) => /customerAdministration\.roles: .*Not authorized/.test(error)));
+  assert.equal(findingStatus(result, "NR-04-API-KEY-INVENTORY"), "pass");
+  assert.equal(findingStatus(result, "NR-07-ACCOUNT-ACCESS-CONTROLS"), "pass");
+
+  const identity = await assessNewrelicIdentity(identityClient({
+    async listRoles() {
+      throw new Error("NerdGraph returned errors: Not authorized (at customerAdministration.roles)");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(identity, "NR-01-SSO-ENFORCEMENT"), "pass");
+  assert.equal(findingStatus(identity, "NR-03-ADMIN-MINIMIZATION"), "pass");
+  assert.ok(identity.errors.some((error) => /customerAdministration\.roles: .*Not authorized/.test(error)));
 });
 
 test("assessNewrelicAccessControl marks controls manual when API keys and grants are not readable", async () => {
@@ -1287,7 +1480,7 @@ test("verdict safety rule 2: control 20 passes on zero custom roles only when th
   assert.equal(roles.status, "pass");
   assert.match(roles.summary, /Both conditions for accepting this hold/);
   assert.match(roles.summary, /readable and complete/);
-  assert.match(roles.summary, /returned 2 standard roles/);
+  assert.match(roles.summary, /returned 2 STANDARD roles/);
 
   const noRoles = await assessNewrelicAccessControl(accessControlClient({ async listRoles() { return []; } }), { now: NOW });
   assert.equal(findingStatus(noRoles, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
@@ -1297,7 +1490,7 @@ test("verdict safety rule 2: control 20 passes on zero custom roles only when th
     async listRoles() { return [{ id: "role-1", name: "Organization manager" }]; },
   }), { now: NOW });
   assert.equal(findingStatus(untyped, "NR-20-CUSTOM-ROLE-PERMISSIONS"), "manual");
-  assert.match(findingById(untyped, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /exposed no role type/);
+  assert.match(findingById(untyped, "NR-20-CUSTOM-ROLE-PERMISSIONS").summary, /exposed a type other than CUSTOM or STANDARD/);
 
   const truncated = await assessNewrelicAccessControl(accessControlClient({
     async listRoles() { return { items: standardRoles(), complete: false, note: "stopped after 2 items with more pages available" }; },

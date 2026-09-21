@@ -63,7 +63,7 @@ All tools accept the shared authentication arguments `api_key`, `account_id`, `r
 
 ### `newrelic_check_access`
 
-Probes each read surface the assessments depend on and reports `healthy` or `limited`. Required surfaces: `actor.user`, `actor.accounts`, `actor.organization`, `organization.userManagement.authenticationDomains`, `organization.authorizationManagement.roles`, `actor.apiAccess.keySearch`, and `actor.account.nrql` (`NrAuditEvent`). Optional surfaces: `entitySearch`, `alerts.policiesSearch`, `dataManagement.eventRetentionRules`, `logConfigurations.obfuscationRules`, and REST v2 `GET /v2/users.json` (original user model only, informational).
+Probes each read surface the assessments depend on and reports `healthy` or `limited`. Required surfaces: `actor.user`, `actor.accounts`, `actor.organization`, `organization.userManagement.authenticationDomains`, `actor.apiAccess.keySearch`, and `actor.account.nrql` (`NrAuditEvent`). Optional surfaces: `customerAdministration.roles` (the documented role catalog, only served to organizations with the multi-tenancy entitlement; control 20 renders manual without it), `entitySearch`, `alerts.policiesSearch`, `dataManagement.eventRetentionRules`, `logConfigurations.obfuscationRules`, and REST v2 `GET /v2/users.json` (original user model only, informational).
 
 ### `newrelic_assess_identity`
 
