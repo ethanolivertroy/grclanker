@@ -2004,7 +2004,7 @@ export function assessAnsiblePlatformSecurityData(data: PlatformSecurityData, no
       18,
       hits.length > 0 ? "fail" : surveysUnreadable > 0 || variableSources.length > 0 ? "manual" : "pass",
       hits.length > 0
-        ? `${hits.length} templates, surveys, inventories, or groups carry plaintext values under secret-like variable names.${vaultNote}`
+        ? `${hits.length} templates, surveys, inventories, or groups carry plaintext values under secret-like variable names.${vaultNote}${launchNote}`
         : surveysUnreadable > 0 || variableSources.length > 0
           ? `No plaintext secret pattern matched, but ${surveysUnreadable} survey specs and ${variableSources.length} variable sources (${variableSources.map((view) => view.label).join(", ") || "none"}) could not be read; review them manually.${vaultNote}${launchNote}`
           : `No plaintext secret pattern matched across ${templates.seen} templates, ${Object.keys(data.surveySpecs).length} surveys, ${inventories.seen} inventories, and ${groups.seen} groups. Host variables are not scanned.${vaultNote}${launchNote}`,
