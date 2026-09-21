@@ -1891,6 +1891,133 @@ test("rule 10: assessAwsIdentity caps user and role verdicts at warn when the in
   assert.ok(result.errors.some((line) => /^iam:GetAccountAuthorizationDetails Filter=Role: inventory truncated at role_limit 1/.test(line)));
 });
 
+test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-user read was denied, one secondary at a time", async () => {
+  const twoUsers = {
+    async listIamUsers() {
+      return paged([
+        { UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" },
+        { UserName: "bob", PasswordLastUsed: "2026-04-13T00:00:00Z" },
+      ]);
+    },
+  };
+  assertOnlyDemoted(await assessAwsIdentity(compliantIdentityClient(twoUsers)), {}, "two-user fixture");
+
+  const mfaOne = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listMfaDevices(userName) {
+      if (userName === "bob") throw accessDenied();
+      return [{ SerialNumber: "mfa-alice" }];
+    },
+  }));
+  assertOnlyDemoted(mfaOne, { "AWS-IAM-02": "warn" }, "ListMFADevices denied for one user");
+  assert.match(findingById(mfaOne, "AWS-IAM-02").summary, /All 1 sampled IAM users with readable device lists have MFA devices\. Downgraded to warn: ListMFADevices unreadable for 1 user\(s\) \(bob\)/);
+  assert.deepEqual(findingById(mfaOne, "AWS-IAM-02").evidence.users_mfa_unreadable, ["bob"]);
+  assert.deepEqual(findingById(mfaOne, "AWS-IAM-02").evidence.users_without_mfa, [], "an unreadable device list is not reported as a missing device");
+  assert.ok(mfaOne.errors.some((line) => /^iam:ListMFADevices bob: AccessDenied/.test(line)));
+
+  const mfaAll = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listMfaDevices() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(mfaAll, { "AWS-IAM-02": "manual" }, "ListMFADevices denied for every user");
+  assert.match(findingById(mfaAll, "AWS-IAM-02").summary, /MFA devices could not be listed for any of the 2 sampled IAM users \(iam:ListMFADevices alice: AccessDenied/);
+
+  const keysOne = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listAccessKeys(userName) {
+      if (userName === "bob") throw accessDenied();
+      return [];
+    },
+  }));
+  assertOnlyDemoted(keysOne, { "AWS-IAM-04": "warn", "AWS-IAM-06": "warn" }, "ListAccessKeys denied for one user");
+  assert.match(findingById(keysOne, "AWS-IAM-04").summary, /No sampled access key exceeded the 90-day staleness threshold\. Downgraded to warn: ListAccessKeys unreadable for 1 user\(s\) \(bob\)/);
+  assert.match(findingById(keysOne, "AWS-IAM-06").summary, /Downgraded to warn: ListAccessKeys unreadable for 1 user\(s\) \(bob\)/);
+  assert.deepEqual(findingById(keysOne, "AWS-IAM-04").evidence.users_keys_unreadable, ["bob"]);
+
+  const keysAll = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listAccessKeys() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(keysAll, { "AWS-IAM-04": "manual", "AWS-IAM-06": "warn" }, "ListAccessKeys denied for every user");
+  assert.match(findingById(keysAll, "AWS-IAM-04").summary, /Access keys could not be listed for any of the 2 sampled IAM users \(iam:ListAccessKeys alice: AccessDenied/);
+
+  const noPasswordUser = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      return paged([{ UserName: "svc-deploy" }]);
+    },
+    async listAccessKeys() {
+      throw accessDenied();
+    },
+  }));
+  assert.equal(findingById(noPasswordUser, "AWS-IAM-06").status, "warn");
+  assert.deepEqual(findingById(noPasswordUser, "AWS-IAM-06").evidence.dormant_users, [], "a user without password activity is not called dormant while its key list is unreadable");
+  assert.match(findingById(noPasswordUser, "AWS-IAM-06").summary, /Downgraded to warn: ListAccessKeys unreadable for 1 user\(s\) \(svc-deploy\)/);
+
+  const lastUsed = await assessAwsIdentity(compliantIdentityClient({
+    async listAccessKeys() {
+      return [{ AccessKeyId: "AKIAIOSFODNN7EXAMPLE", CreateDate: "2026-04-01T00:00:00Z" }];
+    },
+    async getAccessKeyLastUsed() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(lastUsed, { "AWS-IAM-04": "warn" }, "GetAccessKeyLastUsed denied");
+  assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key\(s\), judged by key age only/);
+  assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.keys_last_used_unreadable, ["AKIA****MPLE"]);
+  assert.ok(lastUsed.errors.some((line) => /^iam:GetAccessKeyLastUsed AKIA\*\*\*\*MPLE: AccessDenied/.test(line)), "the error line carries the masked key id only");
+  assert.ok(!JSON.stringify(lastUsed).includes("AKIAIOSFODNN7EXAMPLE"));
+});
+
+test("assessAwsIdentity renders manual, never fail, when a primary IAM read is denied", async () => {
+  const summary = await assessAwsIdentity(compliantIdentityClient({
+    async getAccountSummary() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(summary, { "AWS-IAM-01": "manual" }, "GetAccountSummary denied");
+  assert.match(findingById(summary, "AWS-IAM-01").summary, /could not be read \(iam:GetAccountSummary: AccessDenied/);
+
+  const password = await assessAwsIdentity(compliantIdentityClient({
+    async getPasswordPolicy() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(password, { "AWS-IAM-03": "manual" }, "GetAccountPasswordPolicy denied");
+  assert.match(findingById(password, "AWS-IAM-03").summary, /could not be read \(iam:GetAccountPasswordPolicy: AccessDenied/);
+  assert.doesNotMatch(findingById(password, "AWS-IAM-03").summary, /No account password policy/);
+  assert.equal(findingById(password, "AWS-IAM-03").evidence.password_policy_readable, false);
+
+  const noPolicy = await assessAwsIdentity(compliantIdentityClient({
+    async getPasswordPolicy() {
+      return null;
+    },
+  }));
+  assertOnlyDemoted(noPolicy, { "AWS-IAM-03": "fail" }, "no password policy configured");
+  assert.match(findingById(noPolicy, "AWS-IAM-03").summary, /No account password policy is configured \(GetAccountPasswordPolicy returned NoSuchEntity\)/);
+
+  const users = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(users, { "AWS-IAM-02": "manual", "AWS-IAM-04": "manual", "AWS-IAM-06": "manual" }, "ListUsers denied");
+  assert.match(findingById(users, "AWS-IAM-02").summary, /IAM users could not be listed \(iam:ListUsers: AccessDenied/);
+  assert.equal(findingById(users, "AWS-IAM-02").evidence.users_readable, false);
+
+  const roles = await assessAwsIdentity(compliantIdentityClient({
+    async getAccountAuthorizationDetails() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(roles, { "AWS-IAM-05": "manual" }, "GetAccountAuthorizationDetails denied");
+  assert.match(findingById(roles, "AWS-IAM-05").summary, /IAM roles could not be read \(iam:GetAccountAuthorizationDetails Filter=Role: AccessDenied/);
+  assert.equal(roles.errors.length, 1);
+});
+
 test("assessAwsNetworkSecurity names the DescribeRegions failure when the scope falls back to the configured region", async () => {
   const result = await assessAwsNetworkSecurity(compliantNetworkClient({
     async describeRegions() {

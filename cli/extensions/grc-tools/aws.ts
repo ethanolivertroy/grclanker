@@ -1229,12 +1229,14 @@ export class AwsAuditorClient {
     return { SummaryMap: result.SummaryMap ?? {} };
   }
 
+  /** IAM GetAccountPasswordPolicy; null when no policy exists (NoSuchEntity). Denials and other failures propagate to the caller. */
   async getPasswordPolicy(): Promise<JsonRecord | null> {
     try {
       const result = await this.iam.send(new GetAccountPasswordPolicyCommand({}));
       return asObject(result.PasswordPolicy) ?? null;
-    } catch {
-      return null;
+    } catch (error) {
+      if (isErrorCode(error, "NoSuchEntity", "NoSuchEntityException")) return null;
+      throw error;
     }
   }
 
@@ -1704,15 +1706,19 @@ export async function assessAwsIdentity(
   const lookbackStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
   const region = typeof client.getResolvedConfig === "function" ? client.getResolvedConfig().region : DEFAULT_REGION;
 
-  const [summary, passwordPolicy, userList, roleList, rootActivity, customerPolicies] = await Promise.all([
-    client.getAccountSummary(),
-    client.getPasswordPolicy(),
-    client.listIamUsers(userLimit),
-    client.getAccountAuthorizationDetails(roleLimit),
+  const [summaryRead, passwordPolicyRead, userListRead, roleListRead, rootActivity, customerPolicies] = await Promise.all([
+    attemptAwsRead("iam:GetAccountSummary", () => client.getAccountSummary(), errors),
+    attemptAwsRead("iam:GetAccountPasswordPolicy", () => client.getPasswordPolicy(), errors),
+    attemptAwsRead("iam:ListUsers", () => client.listIamUsers(userLimit), errors),
+    attemptAwsRead("iam:GetAccountAuthorizationDetails Filter=Role", () => client.getAccountAuthorizationDetails(roleLimit), errors),
     lookupRootActivity(client, region, lookbackStart, now, errors),
     attemptAwsRead("iam:ListPolicies Scope=Local", () => client.listCustomerManagedPolicies(policyLimit), errors),
   ]);
   const rootEvents = rootActivity.result;
+  const summary = summaryRead.value ?? {};
+  const passwordPolicy = passwordPolicyRead.value ?? null;
+  const userList = userListRead.value ?? { items: [], truncated: false };
+  const roleList = roleListRead.value ?? { items: [], truncated: false };
   const users = userList.items;
   const roles = roleList.items;
   if (userList.truncated) errors.push(`iam:ListUsers: inventory truncated at user_limit ${userLimit}; user verdicts cover the first ${userLimit} users only.`);
@@ -1741,74 +1747,164 @@ export async function assessAwsIdentity(
   const accountAccessKeysPresent = asNumber(summaryMap.AccountAccessKeysPresent) ?? 0;
 
   const usersWithoutMfa: string[] = [];
+  const mfaUnreadableUsers: string[] = [];
   const staleAccessKeys: Array<{ userName: string; accessKeyId: string; ageDays?: number }> = [];
+  const keysUnreadableUsers: string[] = [];
+  const lastUsedUnreadableKeys: string[] = [];
   const dormantUsers: string[] = [];
 
-  for (const user of users) {
+  // Per-user reads are attempted individually so one denied user is named and capped instead of aborting the assessment.
+  const userDetails = await mapWithConcurrency(users, DEFAULT_CONCURRENCY, async (user) => {
     const userName = asString(user.UserName) ?? "unknown";
-    const mfaDevices = await client.listMfaDevices(userName);
-    if (mfaDevices.length === 0) usersWithoutMfa.push(userName);
-
-    const passwordAge = daysBetween(now, extractTimestamp(user.PasswordLastUsed));
-    const accessKeys = await client.listAccessKeys(userName);
-    for (const key of accessKeys) {
+    const [mfaDevices, accessKeys] = await Promise.all([
+      attemptAwsRead(`iam:ListMFADevices ${userName}`, () => client.listMfaDevices(userName), errors),
+      attemptAwsRead(`iam:ListAccessKeys ${userName}`, () => client.listAccessKeys(userName), errors),
+    ]);
+    const keys = await mapWithConcurrency(accessKeys.value ?? [], DEFAULT_CONCURRENCY, async (key) => {
       const accessKeyId = asString(key.AccessKeyId);
-      if (!accessKeyId) continue;
-      const lastUsed = await client.getAccessKeyLastUsed(accessKeyId);
-      const ageDays = daysBetween(now, extractTimestamp(lastUsed) ?? extractTimestamp(key.CreateDate));
+      if (!accessKeyId) return undefined;
+      const lastUsed = await attemptAwsRead(`iam:GetAccessKeyLastUsed ${maskAccessKeyId(accessKeyId)}`, () => client.getAccessKeyLastUsed(accessKeyId), errors);
+      return { accessKeyId, createDate: extractTimestamp(key.CreateDate), lastUsed };
+    });
+    return { userName, passwordAge: daysBetween(now, extractTimestamp(user.PasswordLastUsed)), mfaDevices, accessKeys, keys: keys.filter((key) => key !== undefined) };
+  });
+
+  for (const user of userDetails) {
+    if (user.mfaDevices.error) mfaUnreadableUsers.push(user.userName);
+    else if ((user.mfaDevices.value ?? []).length === 0) usersWithoutMfa.push(user.userName);
+
+    if (user.accessKeys.error) keysUnreadableUsers.push(user.userName);
+    for (const key of user.keys) {
+      if (key.lastUsed.error) lastUsedUnreadableKeys.push(maskAccessKeyId(key.accessKeyId));
+      // A key whose last use is unreadable is judged by its age, which can only understate freshness, never overstate it.
+      const ageDays = daysBetween(now, extractTimestamp(key.lastUsed.value) ?? key.createDate);
       if (ageDays !== undefined && ageDays > staleDays) {
-        staleAccessKeys.push({ userName, accessKeyId, ageDays });
+        staleAccessKeys.push({ userName: user.userName, accessKeyId: key.accessKeyId, ageDays });
       }
     }
 
-    if ((passwordAge !== undefined && passwordAge > staleDays) || (passwordAge === undefined && accessKeys.length === 0)) {
-      dormantUsers.push(userName);
+    // Without password activity, a user is dormant only when it is known to hold no access keys; an unreadable key list is capped instead.
+    if ((user.passwordAge !== undefined && user.passwordAge > staleDays) || (user.passwordAge === undefined && !user.accessKeys.error && user.keys.length === 0)) {
+      dormantUsers.push(user.userName);
     }
   }
 
   const privilegedRoles = roles.filter(hasAdministratorPolicy);
   const rolesWithoutBoundaries = privilegedRoles.filter((role) => !role.PermissionsBoundary);
+  const mfaCaps = [...userCaps];
+  if (mfaUnreadableUsers.length > 0) mfaCaps.push(`ListMFADevices unreadable for ${mfaUnreadableUsers.length} user(s) (${sample(mfaUnreadableUsers, 10).join(", ")})`);
+  const keyCaps = [...userCaps];
+  if (keysUnreadableUsers.length > 0) keyCaps.push(`ListAccessKeys unreadable for ${keysUnreadableUsers.length} user(s) (${sample(keysUnreadableUsers, 10).join(", ")})`);
+  const keyRotationCaps = [...keyCaps];
+  if (lastUsedUnreadableKeys.length > 0) keyRotationCaps.push(`GetAccessKeyLastUsed unreadable for ${lastUsedUnreadableKeys.length} key(s), judged by key age only`);
 
-  const mfaVerdict = withCap(
-    usersWithoutMfa.length > 0 ? "fail" : "pass",
-    usersWithoutMfa.length > 0
-      ? `${usersWithoutMfa.length}/${users.length} IAM users are missing MFA.`
-      : `All ${users.length} sampled IAM users have MFA devices.`,
-    userCaps,
-  );
-  const keyRotationVerdict = withCap(
-    staleAccessKeys.length > 0 ? "fail" : "pass",
-    staleAccessKeys.length > 0
-      ? `${staleAccessKeys.length} access keys are older than ${staleDays} days or unused beyond that threshold.`
-      : `No sampled access key exceeded the ${staleDays}-day staleness threshold.`,
-    userCaps,
-  );
-  const boundaryVerdict = withCap(
-    rolesWithoutBoundaries.length > maxPrivilegedRoles ? "fail" : rolesWithoutBoundaries.length > 0 ? "warn" : "pass",
-    rolesWithoutBoundaries.length > 0
-      ? `${rolesWithoutBoundaries.length}/${privilegedRoles.length} privileged roles lack permission boundaries.`
-      : `No sampled privileged role lacked a permission boundary (${roles.length} roles read).`,
-    roleCaps,
-  );
-  const dormantVerdict = withCap(
-    dormantUsers.length > 0 ? "warn" : "pass",
-    dormantUsers.length > 0
-      ? `${dormantUsers.length} IAM users appear dormant beyond ${staleDays} days or without recent password activity.`
-      : "No dormant IAM users were detected from the sampled password activity.",
-    userCaps,
-  );
+  let mfaStatus: AwsFinding["status"];
+  let mfaSummary: string;
+  if (userListRead.error) {
+    mfaStatus = "manual";
+    mfaSummary = `IAM users could not be listed (${userListRead.error}); review MFA coverage in the IAM console or credential report.`;
+  } else if (usersWithoutMfa.length > 0) {
+    mfaStatus = "fail";
+    mfaSummary = `${usersWithoutMfa.length}/${users.length} IAM users are missing MFA.`;
+  } else if (users.length > 0 && mfaUnreadableUsers.length === users.length) {
+    mfaStatus = "manual";
+    mfaSummary = `MFA devices could not be listed for any of the ${users.length} sampled IAM users (${errors.find((line) => line.startsWith("iam:ListMFADevices")) ?? "iam:ListMFADevices failed"}); review MFA coverage in the IAM credential report.`;
+  } else {
+    mfaStatus = "pass";
+    mfaSummary = `All ${users.length - mfaUnreadableUsers.length} sampled IAM users with readable device lists have MFA devices.`;
+  }
+  const mfaVerdict = withCap(mfaStatus, mfaSummary, mfaCaps);
+
+  let keyRotationStatus: AwsFinding["status"];
+  let keyRotationSummary: string;
+  if (userListRead.error) {
+    keyRotationStatus = "manual";
+    keyRotationSummary = `IAM users could not be listed (${userListRead.error}); review access key age in the IAM credential report.`;
+  } else if (staleAccessKeys.length > 0) {
+    keyRotationStatus = "fail";
+    keyRotationSummary = `${staleAccessKeys.length} access keys are older than ${staleDays} days or unused beyond that threshold.`;
+  } else if (users.length > 0 && keysUnreadableUsers.length === users.length) {
+    keyRotationStatus = "manual";
+    keyRotationSummary = `Access keys could not be listed for any of the ${users.length} sampled IAM users (${errors.find((line) => line.startsWith("iam:ListAccessKeys")) ?? "iam:ListAccessKeys failed"}); review key age in the IAM credential report.`;
+  } else {
+    keyRotationStatus = "pass";
+    keyRotationSummary = `No sampled access key exceeded the ${staleDays}-day staleness threshold.`;
+  }
+  const keyRotationVerdict = withCap(keyRotationStatus, keyRotationSummary, keyRotationCaps);
+
+  let boundaryStatus: AwsFinding["status"];
+  let boundarySummary: string;
+  if (roleListRead.error) {
+    boundaryStatus = "manual";
+    boundarySummary = `IAM roles could not be read (${roleListRead.error}); review permission boundaries on privileged roles in the IAM console.`;
+  } else if (rolesWithoutBoundaries.length > maxPrivilegedRoles) {
+    boundaryStatus = "fail";
+    boundarySummary = `${rolesWithoutBoundaries.length}/${privilegedRoles.length} privileged roles lack permission boundaries.`;
+  } else if (rolesWithoutBoundaries.length > 0) {
+    boundaryStatus = "warn";
+    boundarySummary = `${rolesWithoutBoundaries.length}/${privilegedRoles.length} privileged roles lack permission boundaries.`;
+  } else {
+    boundaryStatus = "pass";
+    boundarySummary = `No sampled privileged role lacked a permission boundary (${roles.length} roles read).`;
+  }
+  const boundaryVerdict = withCap(boundaryStatus, boundarySummary, roleCaps);
+
+  let dormantStatus: AwsFinding["status"];
+  let dormantSummary: string;
+  if (userListRead.error) {
+    dormantStatus = "manual";
+    dormantSummary = `IAM users could not be listed (${userListRead.error}); review dormant users in the IAM credential report.`;
+  } else if (dormantUsers.length > 0) {
+    dormantStatus = "warn";
+    dormantSummary = `${dormantUsers.length} IAM users appear dormant beyond ${staleDays} days or without recent password activity.`;
+  } else {
+    dormantStatus = "pass";
+    dormantSummary = "No dormant IAM users were detected from the sampled password activity.";
+  }
+  const dormantVerdict = withCap(dormantStatus, dormantSummary, keyCaps);
+
+  let rootMfaStatus: AwsFinding["status"];
+  let rootMfaSummary: string;
+  if (summaryRead.error) {
+    rootMfaStatus = "manual";
+    rootMfaSummary = `The IAM account summary could not be read (${summaryRead.error}); verify root MFA and the absence of root access keys under IAM > Dashboard.`;
+  } else if (accountMfaEnabled !== 1 || accountAccessKeysPresent > 0) {
+    rootMfaStatus = "fail";
+    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === 1}; root access keys present=${accountAccessKeysPresent}.`;
+  } else {
+    rootMfaStatus = "pass";
+    rootMfaSummary = "Root account shows MFA enabled and no access keys present.";
+  }
+
+  const passwordComplexityPresent = [
+    passwordPolicy?.RequireSymbols,
+    passwordPolicy?.RequireNumbers,
+    passwordPolicy?.RequireUppercaseCharacters,
+    passwordPolicy?.RequireLowercaseCharacters,
+  ].every((value) => value === true);
+  const passwordMinimumLength = asNumber(passwordPolicy?.MinimumPasswordLength) ?? 0;
+  let passwordStatus: AwsFinding["status"];
+  let passwordSummary: string;
+  if (passwordPolicyRead.error) {
+    passwordStatus = "manual";
+    passwordSummary = `The account password policy could not be read (${passwordPolicyRead.error}); verify it under IAM > Account settings.`;
+  } else if (!passwordPolicy) {
+    passwordStatus = "fail";
+    passwordSummary = "No account password policy is configured (GetAccountPasswordPolicy returned NoSuchEntity).";
+  } else {
+    passwordStatus = passwordMinimumLength < 14 || !passwordComplexityPresent ? "fail" : "pass";
+    passwordSummary = `Minimum length ${passwordMinimumLength} with complexity requirements present=${passwordComplexityPresent}.`;
+  }
 
   const findings = [
     finding(
       "AWS-IAM-01",
       "Root account MFA and access keys",
       "critical",
-      accountMfaEnabled !== 1 || accountAccessKeysPresent > 0 ? "fail" : "pass",
-      accountMfaEnabled !== 1 || accountAccessKeysPresent > 0
-        ? `Root MFA enabled=${accountMfaEnabled === 1}; root access keys present=${accountAccessKeysPresent}.`
-        : "Root account shows MFA enabled and no access keys present.",
+      rootMfaStatus,
+      rootMfaSummary,
       ["FedRAMP IA-2(1)", "FedRAMP AC-6(1)", "CMMC 3.1.5", "CIS AWS 1.4"],
-      { account_mfa_enabled: accountMfaEnabled, account_access_keys_present: accountAccessKeysPresent },
+      { summary_readable: !summaryRead.error, account_mfa_enabled: accountMfaEnabled, account_access_keys_present: accountAccessKeysPresent },
     ),
     finding(
       "AWS-IAM-02",
@@ -1817,30 +1913,22 @@ export async function assessAwsIdentity(
       mfaVerdict.status,
       mfaVerdict.summary,
       ["FedRAMP IA-2(1)", "FedRAMP IA-2(2)", "CMMC 3.5.3", "PCI-DSS 8.4.2"],
-      { user_count: users.length, users_without_mfa: usersWithoutMfa.slice(0, 25), user_inventory_truncated: userList.truncated },
+      {
+        users_readable: !userListRead.error,
+        user_count: users.length,
+        users_without_mfa: usersWithoutMfa.slice(0, 25),
+        users_mfa_unreadable: sample(mfaUnreadableUsers),
+        user_inventory_truncated: userList.truncated,
+      },
     ),
     finding(
       "AWS-IAM-03",
       "Password policy strength",
       "high",
-      !passwordPolicy
-        || (asNumber(passwordPolicy.MinimumPasswordLength) ?? 0) < 14
-        || passwordPolicy.RequireSymbols !== true
-        || passwordPolicy.RequireNumbers !== true
-        || passwordPolicy.RequireUppercaseCharacters !== true
-        || passwordPolicy.RequireLowercaseCharacters !== true
-        ? "fail"
-        : "pass",
-      !passwordPolicy
-        ? "No account password policy was visible."
-        : `Minimum length ${(asNumber(passwordPolicy.MinimumPasswordLength) ?? 0)} with complexity requirements present=${[
-            passwordPolicy.RequireSymbols,
-            passwordPolicy.RequireNumbers,
-            passwordPolicy.RequireUppercaseCharacters,
-            passwordPolicy.RequireLowercaseCharacters,
-          ].every((value) => value === true)}.`,
+      passwordStatus,
+      passwordSummary,
       ["FedRAMP IA-5(1)", "CMMC 3.5.7", "SOC 2 CC6.1", "CIS AWS 1.8"],
-      { password_policy: passwordPolicy ?? {} },
+      { password_policy_readable: !passwordPolicyRead.error, password_policy: passwordPolicy ?? {} },
     ),
     finding(
       "AWS-IAM-04",
@@ -1850,7 +1938,10 @@ export async function assessAwsIdentity(
       keyRotationVerdict.summary,
       ["FedRAMP IA-5(1)", "FedRAMP AC-2(3)", "CMMC 3.5.8", "CIS AWS 1.12"],
       {
+        users_readable: !userListRead.error,
         stale_access_keys: staleAccessKeys.slice(0, 25).map((key) => ({ userName: key.userName, accessKeyId: maskAccessKeyId(key.accessKeyId), ageDays: key.ageDays })),
+        users_keys_unreadable: sample(keysUnreadableUsers),
+        keys_last_used_unreadable: sample(lastUsedUnreadableKeys),
         user_inventory_truncated: userList.truncated,
       },
     ),
@@ -1862,6 +1953,7 @@ export async function assessAwsIdentity(
       boundaryVerdict.summary,
       ["FedRAMP AC-6(1)", "FedRAMP AC-6(2)", "CMMC 3.1.5", "CIS AWS 1.16"],
       {
+        roles_readable: !roleListRead.error,
         roles_read: roles.length,
         privileged_roles: privilegedRoles.length,
         roles_without_boundaries: rolesWithoutBoundaries.slice(0, 25).map((role) => role.RoleName ?? role.Arn),
@@ -1876,7 +1968,12 @@ export async function assessAwsIdentity(
       dormantVerdict.status,
       dormantVerdict.summary,
       ["FedRAMP AC-2(3)", "CMMC 3.1.12", "SOC 2 CC6.2", "CIS AWS 1.12"],
-      { dormant_users: dormantUsers.slice(0, 25), user_inventory_truncated: userList.truncated },
+      {
+        users_readable: !userListRead.error,
+        dormant_users: dormantUsers.slice(0, 25),
+        users_keys_unreadable: sample(keysUnreadableUsers),
+        user_inventory_truncated: userList.truncated,
+      },
     ),
   ];
 
