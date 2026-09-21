@@ -47,7 +47,7 @@ Do not grant any write permission. The tools never call a mutating endpoint.
 
 | Endpoint | Reference section | Notes |
 |---|---|---|
-| `GET /admin/v1/settings` | Settings, Retrieve Settings | `helpdesk_bypass`, `helpdesk_bypass_expiration`, `lockout_threshold`, `lockout_expire_duration`, `unenrolled_user_lockout_threshold`, `global_ssp_policy_enforced`, notification flags |
+| `GET /admin/v1/settings` | Settings, Retrieve Settings | `helpdesk_bypass`, `helpdesk_bypass_expiration`, `lockout_threshold`, `lockout_expire_duration`, `unenrolled_user_lockout_threshold`, notification flags; `global_ssp_policy_enforced` is reported as legacy evidence only |
 | `GET /admin/v1/info/summary` | Account Info, Retrieve Summary | `edition`, `telephony_credits_remaining` |
 | `GET /admin/v1/info/authentication_attempts` | Account Info, Authentication Attempts Report | `mintime` and `maxtime` in Unix seconds; `authentication_attempts.{ERROR,FAILURE,FRAUD,SUCCESS}` |
 | `GET /admin/v2/policies/global` and `GET /admin/v2/policies` | Policies | `sections.authentication_policy.user_auth_behavior`, `authentication_methods`, `new_user`, `remembered_devices`, `trusted_endpoints`, `health_checks`, `duo_desktop`, `operating_systems`, `full_disk_encryption`, `screen_lock` |
@@ -56,7 +56,7 @@ Do not grant any write permission. The tools never call a mutating endpoint.
 | `GET /admin/v1/webauthncredentials` | WebAuthn Credentials, Retrieve WebAuthn Credentials | `uv_capable`, `user`; `limit` max 500 |
 | `GET /admin/v1/admins` | Administrators, Retrieve Administrators | `role`, `status`, `last_login` |
 | `GET /admin/v1/admins/allowed_auth_methods` | Administrators, Retrieve Allowed Authentication Methods | `verified_push_enabled`, `webauthn_enabled`, `sms_enabled`, `voice_enabled` |
-| `GET /admin/v3/integrations` | Integrations, Retrieve Integrations | `type`, `policy_key`, `user_access`, `sensitivity_level`, `compliance_requirements`, `prompt_v4_enabled`, `frameless_auth_prompt_enabled`, `adminapi_*`; `limit` max 500 |
+| `GET /admin/v3/integrations` | Integrations, Retrieve Integrations | `type`, `policy_key`, `user_access`, `sensitivity_level`, `compliance_requirements`, `prompt_v4_enabled`, `frameless_auth_prompt_enabled`, `self_service_allowed`, `adminapi_*`; `limit` max 500; v5 signing |
 | `GET /admin/v2/logs/authentication` | Logs, Authentication Logs | `mintime` and `maxtime` in milliseconds, `next_offset` cursor; `result`, `factor`, `timestamp`, `user.key`, `access_device.location.country` |
 | `GET /admin/v2/logs/activity`, `GET /admin/v2/logs/telephony` | Logs | readability and telephony usage |
 | `GET /admin/v1/logs/offline_enrollment` | Logs, Offline Enrollment Logs | `mintime` in Unix seconds; `action`, `description.factor` |
@@ -86,7 +86,7 @@ Status semantics: `Pass` means the documented setting or population meets the co
 | 16 | Telephony credit monitoring | DUO-MON-003 | Automated |
 | 17 | U2F/WebAuthn credential inventory | DUO-AUTH-010 | Automated |
 | 18 | Offline access configuration | DUO-AUTH-011 | Manual: Policy Section Data documents no offline access section; offline enrollment events are collected as evidence |
-| 19 | Self-service portal policy | DUO-INTEGRATIONS-003 | Automated (`global_ssp_policy_enforced`) |
+| 19 | Self-service portal policy | DUO-INTEGRATIONS-003 | Automated per integration (`self_service_allowed` from `/admin/v3/integrations`); the legacy `global_ssp_policy_enforced` setting is evidence only |
 | 20 | API permission audit | DUO-INTEGRATIONS-004 | Automated (`adminapi_*` flags) |
 
 Supporting findings without a spec control number: DUO-ADMIN-002 (administrator MFA strength), DUO-ADMIN-003 (help desk bypass governance), DUO-ADMIN-004 (stale administrators), DUO-INTEGRATIONS-002 (Universal Prompt adoption), DUO-MON-004 (notifications).

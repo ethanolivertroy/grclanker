@@ -179,6 +179,7 @@ function createSampleIntegrationData() {
         policy_key: "PO-VPN",
         prompt_v4_enabled: 1,
         frameless_auth_prompt_enabled: 1,
+        self_service_allowed: false,
       },
       {
         integration_key: "DIADMIN1",
@@ -751,6 +752,7 @@ function compliantIntegrationData() {
           compliance_requirements: ["FedRAMP"],
           prompt_v4_enabled: 1,
           frameless_auth_prompt_enabled: 1,
+          self_service_allowed: false,
         },
         {
           integration_key: "DIAUDIT",
@@ -874,6 +876,52 @@ test("assessDuoIntegrations covers critical applications and device health depth
   weakHealth.globalPolicy.data.sections.full_disk_encryption = { require_encryption: false };
   weakHealth.globalPolicy.data.sections.screen_lock = { require_screen_lock: false };
   assert.equal(findingById(assessDuoIntegrations(weakHealth, createSampleConfig()), "DUO-INTEGRATIONS-006").status, "Partial");
+});
+
+test("assessDuoIntegrations judges self-service device management per integration, not the legacy settings flag", () => {
+  const config = createSampleConfig();
+
+  const compliant = findingById(assessDuoIntegrations(compliantIntegrationData(), config), "DUO-INTEGRATIONS-003");
+  assert.equal(compliant.status, "Pass");
+  assert.ok(compliant.evidence.includes("self_service_allowed=0"));
+  assert.ok(compliant.evidence.some((line) => line.startsWith("global_ssp_policy_enforced=true (legacy")));
+
+  // The legacy flag is true (its documented default) but the only user-facing application allows self-service.
+  const enabled = compliantIntegrationData();
+  enabled.integrations.data[0].self_service_allowed = 1;
+  const enabledFinding = findingById(assessDuoIntegrations(enabled, config), "DUO-INTEGRATIONS-003");
+  assert.equal(enabledFinding.status, "Fail");
+  assert.ok(enabledFinding.evidence.includes("self_service_integration=VPN type=websdk"));
+
+  const mixed = compliantIntegrationData();
+  mixed.integrations.data.push({
+    integration_key: "DIWIKI",
+    name: "Wiki",
+    type: "websdk",
+    user_access: "ALL_USERS",
+    policy_key: "PO-WIKI",
+    self_service_allowed: 1,
+  });
+  const mixedFinding = findingById(assessDuoIntegrations(mixed, config), "DUO-INTEGRATIONS-003");
+  assert.equal(mixedFinding.status, "Partial");
+  assert.ok(mixedFinding.evidence.includes("self_service_allowed=1"));
+  assert.ok(mixedFinding.evidence.includes("self_service_disabled=1"));
+
+  const absent = compliantIntegrationData();
+  delete absent.integrations.data[0].self_service_allowed;
+  const absentFinding = findingById(assessDuoIntegrations(absent, config), "DUO-INTEGRATIONS-003");
+  assert.equal(absentFinding.status, "Manual");
+  assert.ok(absentFinding.evidence.includes("endpoint=/admin/v3/integrations"));
+  assert.ok(absentFinding.evidence.includes("required_permission=Grant resource - Read"));
+  assert.ok(absentFinding.evidence.some((line) => line.startsWith("manual_evidence=")));
+
+  const partial = compliantIntegrationData();
+  partial.integrations = { data: partial.integrations.data, total: 40, complete: false };
+  assert.equal(findingById(assessDuoIntegrations(partial, config), "DUO-INTEGRATIONS-003").status, "Partial");
+
+  const forbiddenFinding = findingById(assessDuoIntegrations(forbiddenIntegrationData(), config), "DUO-INTEGRATIONS-003");
+  assert.equal(forbiddenFinding.status, "Manual");
+  assert.ok(forbiddenFinding.evidence.includes("required_permission=Grant resource - Read"));
 });
 
 test("assessDuoMonitoring evaluates authentication attempts and impossible travel", () => {

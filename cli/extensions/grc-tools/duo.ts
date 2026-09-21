@@ -2996,6 +2996,89 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
   );
 }
 
+/**
+ * Control 19. Retrieve Integrations (v3) documents self_service_allowed as 1 when users may use
+ * self-service from the integration's prompt to update authentication devices, otherwise false.
+ * Retrieve Settings marks global_ssp_policy_enforced as a legacy parameter that defaults to true,
+ * so it is reported as evidence only and never decides the verdict.
+ */
+function assessSelfServicePortal(
+  data: DuoIntegrationData,
+  protectedIntegrations: JsonRecord[],
+  integrationsEvidence: string[],
+): DuoFinding {
+  if (data.integrations.error) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-003",
+      "Manual",
+      "Self-service device management posture could not be collected because the integration inventory was unavailable.",
+      integrationsEvidence,
+      "Grant the audit principal Grant resource - Read so self_service_allowed can be read for every application.",
+    );
+  }
+  const legacyFlag = getBooleanish(asRecord(data.settings.data), "global_ssp_policy_enforced");
+  const legacyEvidence = `global_ssp_policy_enforced=${legacyFlag ?? "unknown"} (legacy Retrieve Settings parameter, defaults to true, not used for the verdict)`;
+  if (protectedIntegrations.length === 0) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-003",
+      "Partial",
+      "No active protected integrations were returned, so self-service device management cannot be judged (Partial, not Pass).",
+      ["protected_integrations=0", legacyEvidence],
+      "Confirm the application inventory in the Duo Admin Panel before concluding that no application allows self-service device changes.",
+    );
+  }
+
+  const withField = protectedIntegrations.filter((integration) => getBooleanish(integration, "self_service_allowed") !== undefined);
+  const enabled = withField.filter((integration) => getBooleanish(integration, "self_service_allowed") === true);
+  const evidence = [
+    `protected_integrations=${protectedIntegrations.length}`,
+    `self_service_allowed=${enabled.length}`,
+    `self_service_disabled=${withField.length - enabled.length}`,
+    `self_service_field_absent=${protectedIntegrations.length - withField.length}`,
+    legacyEvidence,
+    ...enabled.slice(0, 10).map((integration) =>
+      `self_service_integration=${integrationLabel(integration)} type=${asString(integration.type) ?? "unknown"}`,
+    ),
+  ];
+
+  if (withField.length === 0) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-003",
+      "Manual",
+      "No protected integration exposed self_service_allowed, so device self-service posture requires manual review.",
+      [
+        `endpoint=${DUO_ENDPOINTS.integrations}`,
+        `required_permission=${DUO_PERMISSIONS.readResource}`,
+        ...evidence,
+        "manual_evidence=Review each application's Self-service portal setting in the Duo Admin Panel.",
+      ],
+      "Confirm per application whether users may add or remove authentication devices from the prompt without administrator approval.",
+    );
+  }
+  if (enabled.length === 0) {
+    return withInventoryCap(
+      buildFinding(
+        "DUO-INTEGRATIONS-003",
+        "Pass",
+        "No protected integration allows users to add or remove authentication devices from the prompt.",
+        evidence,
+        "Keep self-service disabled or bound to an approval workflow when applications are added.",
+      ),
+      data.integrations,
+    );
+  }
+  return withInventoryCap(
+    buildFinding(
+      "DUO-INTEGRATIONS-003",
+      enabled.length === withField.length ? "Fail" : "Partial",
+      `${enabled.length} of ${withField.length} protected integration(s) let users manage authentication devices without administrator approval.`,
+      evidence,
+      "Disable self_service_allowed where administrator approval is required, or document the approval and policy controls that govern self-service device changes.",
+    ),
+    data.integrations,
+  );
+}
+
 export function assessDuoIntegrations(
   data: DuoIntegrationData,
   config: DuoResolvedConfig,
@@ -3104,30 +3187,7 @@ export function assessDuoIntegrations(
     );
   }
 
-  const globalSspPolicyEnforced = getBooleanish(asRecord(data.settings.data), "global_ssp_policy_enforced");
-  if (globalSspPolicyEnforced === true) {
-    findings.push(
-      buildFinding(
-        "DUO-INTEGRATIONS-003",
-        "Pass",
-        "A global self-service portal policy is enforced.",
-        ["global_ssp_policy_enforced=true"],
-        "Keep the self-service portal bound to the intended policy so device-management features do not drift per application.",
-      ),
-    );
-  } else {
-    findings.push(
-      buildFinding(
-        "DUO-INTEGRATIONS-003",
-        globalSspPolicyEnforced === false ? "Partial" : "Manual",
-        globalSspPolicyEnforced === false
-          ? "The self-service portal follows destination application policy instead of a single enforced portal policy."
-          : "Self-service portal governance could not be confirmed.",
-        [`global_ssp_policy_enforced=${globalSspPolicyEnforced ?? "unknown"}`],
-        "Review self-service portal behavior and enforce a global policy if portal behavior should be governed consistently.",
-      ),
-    );
-  }
+  findings.push(assessSelfServicePortal(data, integrations, integrationsEvidence));
 
   if (data.integrations.error) {
     findings.push(
