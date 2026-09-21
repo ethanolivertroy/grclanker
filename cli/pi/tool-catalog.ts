@@ -45,6 +45,7 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["scf_", "SCF"],
   ["slack_", "Slack"],
   ["vanta_", "Vanta"],
+  ["veracode_", "Veracode"],
   ["webex_", "Webex"],
   ["zoom_", "Zoom"],
 ];

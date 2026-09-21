@@ -32,6 +32,7 @@
     "test:okta:live": "npm run build && node scripts/okta-live-smoke.mjs",
     "test:oscal:live": "npm run build && node scripts/oscal-live-smoke.mjs",
     "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
+    "test:veracode:live": "npm run build && node scripts/veracode-live-smoke.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },
   "files": [
