@@ -19,7 +19,10 @@ import {
   assessGitHubOrgAccess,
   assessGitHubRepoProtection,
   clearGitHubTokenCacheForTests,
+  collectGitHubActionsData,
+  collectGitHubCodeSecurityData,
   collectGitHubIntegrationsData,
+  collectGitHubOrgAccessData,
   collectGitHubRepoProtectionData,
   exportGitHubAuditBundle,
   resolveGitHubConfiguration,
@@ -1115,7 +1118,9 @@ test("exportGitHubAuditBundle writes evidence and respects secure output roots",
     outputRoot,
   );
 
-  assert.ok(existsSync(join(result.outputDir, "README.md")));
+  assert.ok(existsSync(join(result.outputDir, "QUICK_REFERENCE.md")));
+  assert.ok(!existsSync(join(result.outputDir, "_errors.log")), "a clean run writes no error log");
+  assert.equal(result.errorCount, 0);
   assert.ok(existsSync(join(result.outputDir, "analysis", "org_access.json")));
   assert.ok(existsSync(join(result.outputDir, "analysis", "repo_protection.json")));
   assert.ok(existsSync(join(result.outputDir, "analysis", "integrations.json")));
@@ -1134,4 +1139,337 @@ test("exportGitHubAuditBundle writes evidence and respects secure output roots",
   writeFileSync(target, "target");
   symlinkSync(target, link);
   assert.throws(() => resolveSecureOutputPath(link, "nested"));
+});
+
+class ForbiddenError extends Error {
+  constructor() {
+    super("HTTP 403 Forbidden: Resource not accessible by integration");
+    this.status = 403;
+  }
+}
+
+const SELF_CHECK_CONFIG = createSampleConfig({
+  graphqlUrl: "https://api.github.com/graphql",
+  enterprise: "example-enterprise",
+});
+
+const SELF_CHECK_ORG = {
+  login: "example-org",
+  two_factor_requirement_enabled: true,
+  default_repository_permission: "read",
+  web_commit_signoff_required: true,
+  members_can_create_repositories: true,
+  members_can_create_public_repositories: false,
+  members_can_create_private_repositories: true,
+  members_can_create_internal_repositories: true,
+  members_can_fork_private_repositories: false,
+  deploy_keys_enabled_for_repositories: true,
+  advanced_security_enabled_for_new_repositories: true,
+  dependabot_alerts_enabled_for_new_repositories: true,
+  dependabot_security_updates_enabled_for_new_repositories: true,
+  dependency_graph_enabled_for_new_repositories: true,
+  secret_scanning_enabled_for_new_repositories: true,
+  secret_scanning_push_protection_enabled_for_new_repositories: true,
+};
+
+const SELF_CHECK_REPOS = [
+  { full_name: "example-org/app-one", name: "app-one", default_branch: "main", archived: false, disabled: false, owner: { login: "example-org" } },
+  { full_name: "example-org/app-two", name: "app-two", default_branch: "main", archived: false, disabled: false, owner: { login: "example-org" } },
+];
+
+const SELF_CHECK_RULES = [
+  {
+    type: "pull_request",
+    parameters: { required_approving_review_count: 2, require_code_owner_review: true, dismiss_stale_reviews_on_push: true, require_last_push_approval: true, required_review_thread_resolution: true, allowed_merge_methods: ["squash"] },
+    ruleset_source_type: "Organization",
+    ruleset_source: "example-org",
+    ruleset_id: 1,
+  },
+  {
+    type: "required_status_checks",
+    parameters: { strict_required_status_checks_policy: true, do_not_enforce_on_create: false, required_status_checks: [{ context: "ci" }] },
+    ruleset_source_type: "Organization",
+    ruleset_source: "example-org",
+    ruleset_id: 1,
+  },
+  { type: "required_signatures", ruleset_source_type: "Organization", ruleset_source: "example-org", ruleset_id: 1 },
+  { type: "non_fast_forward", ruleset_source_type: "Organization", ruleset_source: "example-org", ruleset_id: 1 },
+  { type: "deletion", ruleset_source_type: "Organization", ruleset_source: "example-org", ruleset_id: 1 },
+];
+
+const SELF_CHECK_PROTECTION = {
+  required_pull_request_reviews: { required_approving_review_count: 2, dismiss_stale_reviews: true, require_code_owner_reviews: true },
+  required_status_checks: { strict: true, contexts: ["ci"] },
+  required_signatures: { enabled: true },
+  allow_force_pushes: { enabled: false },
+  allow_deletions: { enabled: false },
+  enforce_admins: { enabled: true },
+};
+
+function createCompliantClient() {
+  return {
+    async getOrganization() { return SELF_CHECK_ORG; },
+    async listMembers(role = "all") {
+      return role === "admin" ? [{ login: "alice" }] : [{ login: "alice" }, { login: "bob" }, { login: "carol" }];
+    },
+    async listTwoFactorDisabledMembers() { return []; },
+    async getSamlIdentitySnapshot() {
+      return createSamlSnapshot({
+        externalIdentities: [
+          { guid: "1", samlIdentity: { nameId: "alice@example.test" }, scimIdentity: { username: "alice" }, user: { login: "alice" } },
+          { guid: "2", samlIdentity: { nameId: "bob@example.test" }, scimIdentity: { username: "bob" }, user: { login: "bob" } },
+          { guid: "3", samlIdentity: { nameId: "carol@example.test" }, scimIdentity: { username: "carol" }, user: { login: "carol" } },
+        ],
+      });
+    },
+    async getIpAllowListSnapshot() {
+      return createIpAllowListSnapshot({
+        entries: [{ allowListValue: "203.0.113.0/24", isActive: true, name: "HQ egress", createdAt: "2025-01-01T00:00:00Z" }],
+        entriesTotalCount: 1,
+      });
+    },
+    async getEnterpriseIdentitySnapshot() { return createEnterpriseSnapshot(); },
+    async listOutsideCollaborators() { return []; },
+    async listInvitations() { return []; },
+    async listOrganizationRoles() { return [{ id: 1, name: "all_repo_read" }]; },
+    async listCredentialAuthorizations() {
+      return [{ login: "alice", credential_type: "personal access token", credential_authorized_at: "2026-01-01T00:00:00Z" }];
+    },
+    async listAuditLog() { return [{ action: "repo.create", "@timestamp": 1758400000000 }]; },
+    async listHooks() {
+      return [{ id: 100, active: true, config: { url: "https://siem.example.test/github", content_type: "json", insecure_ssl: "0", secret: "********" } }];
+    },
+    async listInstallations() {
+      return [{ id: 99, app_slug: "compliance-bot", repository_selection: "selected", permissions: { metadata: "read", contents: "read" }, suspended_at: null, created_at: "2025-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }];
+    },
+    async listRepositories() { return SELF_CHECK_REPOS; },
+    async listOrgRulesets() {
+      return [{ id: 1, enforcement: "active", target: "branch", rules: SELF_CHECK_RULES.map((rule) => ({ type: rule.type })) }];
+    },
+    async listRepoRulesets() { return []; },
+    async getBranchProtection() { return SELF_CHECK_PROTECTION; },
+    async listBranchRules() { return SELF_CHECK_RULES; },
+    async getOrgActionsPermissions() { return { enabled_repositories: "selected", allowed_actions: "selected" }; },
+    async getOrgSelectedActions() { return { github_owned_allowed: true, verified_allowed: false, patterns_allowed: ["example-org/*"] }; },
+    async getOrgWorkflowPermissions() { return { default_workflow_permissions: "read", can_approve_pull_request_reviews: false }; },
+    async listRunnerGroups() {
+      return [{ id: 1, name: "prod", visibility: "selected", allows_public_repositories: false, restricted_to_workflows: true }];
+    },
+    async listRunners() { return [{ id: 1, name: "runner-1", status: "online" }]; },
+    async listCodeSecurityConfigurations() {
+      return [{
+        id: 1,
+        name: "Default security baseline",
+        target_type: "organization",
+        enforcement: "enforced",
+        default_for_new_repos: true,
+        advanced_security: "enabled",
+        dependency_graph: "enabled",
+        dependabot_alerts: "enabled",
+        dependabot_security_updates: "enabled",
+        code_scanning_default_setup: "enabled",
+        secret_scanning: "enabled",
+        secret_scanning_push_protection: "enabled",
+      }];
+    },
+    async listRepoHooks() { return [{ id: 5, config: { url: "https://ci.example.test/hook", insecure_ssl: "0", secret: "********" } }]; },
+    async listDeployKeys() { return [{ id: 1, title: "reader", read_only: true, created_at: "2026-06-01T00:00:00Z", last_used: "2026-09-01T00:00:00Z" }]; },
+  };
+}
+
+function createForbiddenClient() {
+  return Object.fromEntries(Object.keys(createCompliantClient()).map((name) => [name, async () => { throw new ForbiddenError(); }]));
+}
+
+function createEmptyClient() {
+  return {
+    ...createCompliantClient(),
+    async listMembers() { return []; },
+    async getSamlIdentitySnapshot() {
+      return createSamlSnapshot({ samlIdentityProvider: null, externalIdentities: [], externalIdentitiesTotalCount: 0 });
+    },
+    async getIpAllowListSnapshot() { return createIpAllowListSnapshot({ entries: [], entriesTotalCount: 0 }); },
+    async getEnterpriseIdentitySnapshot() { return createEnterpriseSnapshot({ ownerInfo: null }); },
+    async listOrganizationRoles() { return []; },
+    async listCredentialAuthorizations() { return []; },
+    async listAuditLog() { return []; },
+    async listHooks() { return []; },
+    async listInstallations() { return []; },
+    async listRepositories() { return []; },
+    async listOrgRulesets() { return []; },
+    async listBranchRules() { return []; },
+    async getBranchProtection() { return null; },
+    async listRunnerGroups() { return []; },
+    async listRunners() { return []; },
+    async listCodeSecurityConfigurations() { return []; },
+    async listRepoHooks() { return []; },
+    async listDeployKeys() { return []; },
+  };
+}
+
+function createPartialClient() {
+  const base = createCompliantClient();
+  return {
+    ...base,
+    async listMembers(role = "all") {
+      if (role === "admin") throw new ForbiddenError();
+      return base.listMembers(role);
+    },
+    async listTwoFactorDisabledMembers() { throw new ForbiddenError(); },
+    async getSamlIdentitySnapshot() {
+      return createSamlSnapshot({ externalIdentitiesTruncated: true, externalIdentitiesTotalCount: 5000 });
+    },
+    async getIpAllowListSnapshot() { return createIpAllowListSnapshot({ entriesTruncated: true, entriesTotalCount: 2000 }); },
+    async getEnterpriseIdentitySnapshot() {
+      return createEnterpriseSnapshot({ ownerInfo: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible", path: ["enterprise", "ownerInfo"] }] });
+    },
+    async listOutsideCollaborators() { throw new ForbiddenError(); },
+    async listInstallations() { throw new ForbiddenError(); },
+    async listAuditLog() {
+      return Array.from({ length: 200 }, (_, index) => ({ action: "repo.create", "@timestamp": 1758400000000 + index }));
+    },
+    async listRepoRulesets(_owner, repo) {
+      if (repo === "app-two") throw new ForbiddenError();
+      return [];
+    },
+    async getBranchProtection(_owner, repo) {
+      if (repo === "app-two") throw new ForbiddenError();
+      return SELF_CHECK_PROTECTION;
+    },
+    async listBranchRules(_owner, repo) {
+      if (repo === "app-two") throw new ForbiddenError();
+      return SELF_CHECK_RULES;
+    },
+    async listRunners() { throw new ForbiddenError(); },
+    async listCodeSecurityConfigurations() { throw new ForbiddenError(); },
+    async listRepoHooks(_owner, repo) {
+      if (repo === "app-two") throw new ForbiddenError();
+      return base.listRepoHooks();
+    },
+    async listDeployKeys(_owner, repo) {
+      if (repo === "app-two") throw new ForbiddenError();
+      return base.listDeployKeys();
+    },
+  };
+}
+
+async function runAllAssessments(client) {
+  const [orgAccess, repoProtection, actions, codeSecurity, integrations] = await Promise.all([
+    collectGitHubOrgAccessData(client, SELF_CHECK_CONFIG),
+    collectGitHubRepoProtectionData(client),
+    collectGitHubActionsData(client),
+    collectGitHubCodeSecurityData(client),
+    collectGitHubIntegrationsData(client),
+  ]);
+  return [
+    assessGitHubOrgAccess(orgAccess, SELF_CHECK_CONFIG),
+    assessGitHubRepoProtection(repoProtection, SELF_CHECK_CONFIG),
+    assessGitHubActionsSecurity(actions, SELF_CHECK_CONFIG),
+    assessGitHubCodeSecurity(codeSecurity, SELF_CHECK_CONFIG),
+    assessGitHubIntegrations(integrations, SELF_CHECK_CONFIG),
+  ].flatMap((assessment) => assessment.findings);
+}
+
+function passingIds(findings) {
+  return findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id).sort();
+}
+
+const SETTING_DRIVEN_IDS = [
+  "GITHUB-ACT-001",
+  "GITHUB-ACT-002",
+  "GITHUB-ACT-003",
+  "GITHUB-ACT-005",
+  "GITHUB-CODE-002",
+  "GITHUB-CODE-003",
+  "GITHUB-CODE-004",
+  "GITHUB-ORG-002",
+  "GITHUB-ORG-009",
+  "GITHUB-ORG-010",
+  "GITHUB-REPO-005",
+];
+
+test("self-check (a): every endpoint forbidden yields zero passes and names the cause", async () => {
+  const findings = await runAllAssessments(createForbiddenClient());
+  assert.equal(findings.length, 31);
+  assert.deepEqual(passingIds(findings), []);
+  for (const finding of findings) {
+    assert.ok(["Manual", "Partial", "Fail", "Info"].includes(finding.status), `${finding.id} reported ${finding.status}`);
+  }
+  const manual = findings.filter((finding) => finding.status === "Manual");
+  assert.ok(manual.length >= 30, `expected almost every finding manual, got ${manual.length}`);
+  for (const finding of manual) {
+    assert.ok(finding.manualNote || /unreadable|could not|not readable|unverified/i.test(finding.summary), `${finding.id} lacks a manual instruction`);
+  }
+});
+
+test("self-check (b): empty inventories pass only where the control intent makes emptiness compliant", async () => {
+  const findings = await runAllAssessments(createEmptyClient());
+  const expectedPasses = [...SETTING_DRIVEN_IDS, "GITHUB-INTEG-003", "GITHUB-ORG-001", "GITHUB-ORG-003"].sort();
+  assert.deepEqual(passingIds(findings), expectedPasses);
+  const byId = Object.fromEntries(findings.map((finding) => [finding.id, finding]));
+  assert.match(byId["GITHUB-ORG-001"].evidence.join("\n"), /two_factor_requirement_enabled = true/);
+  assert.match(byId["GITHUB-ORG-003"].summary, /empty list is compliant/);
+  assert.match(byId["GITHUB-INTEG-003"].summary, /empty inventory is compliant/);
+  assert.equal(byId["GITHUB-ACT-004"].status, "Info");
+  assert.match(byId["GITHUB-ACT-004"].summary, /not a pass/);
+  assert.equal(byId["GITHUB-INTEG-001"].status, "Partial");
+  assert.equal(byId["GITHUB-INTEG-002"].status, "Partial");
+  assert.equal(byId["GITHUB-CODE-001"].status, "Fail");
+  assert.match(byId["GITHUB-CODE-001"].summary, /empty configuration list is a fail/);
+  assert.equal(byId["GITHUB-ORG-004"].status, "Manual");
+  assert.equal(byId["GITHUB-ORG-005"].status, "Info");
+  assert.equal(byId["GITHUB-ORG-006"].status, "Fail");
+  assert.equal(byId["GITHUB-REPO-001"].status, "Fail");
+  for (const id of ["GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
+    assert.equal(byId[id].status, "Info", `${id} should be Info on an empty repository inventory`);
+  }
+});
+
+test("self-check (c): partial inventories never pass an inventory-driven control", async () => {
+  const findings = await runAllAssessments(createPartialClient());
+  const expectedPasses = [...SETTING_DRIVEN_IDS, "GITHUB-ORG-005"].sort();
+  assert.deepEqual(passingIds(findings), expectedPasses);
+  const byId = Object.fromEntries(findings.map((finding) => [finding.id, finding]));
+  assert.match(byId["GITHUB-ORG-005"].summary, /visibility check, not a full population/);
+  assert.equal(byId["GITHUB-ORG-001"].status, "Partial");
+  assert.equal(byId["GITHUB-ORG-003"].status, "Manual");
+  assert.equal(byId["GITHUB-ORG-004"].status, "Manual");
+  assert.equal(byId["GITHUB-ORG-006"].status, "Partial");
+  assert.equal(byId["GITHUB-ORG-007"].status, "Manual");
+  assert.equal(byId["GITHUB-ORG-008"].status, "Partial");
+  for (const id of ["GITHUB-REPO-001", "GITHUB-REPO-002", "GITHUB-REPO-003", "GITHUB-REPO-004", "GITHUB-REPO-006", "GITHUB-REPO-007"]) {
+    assert.equal(byId[id].status, "Partial", `${id} should be Partial when one repository is unreadable`);
+  }
+  assert.equal(byId["GITHUB-ACT-004"].status, "Manual");
+  assert.equal(byId["GITHUB-CODE-001"].status, "Manual");
+  assert.equal(byId["GITHUB-CODE-005"].status, "Manual");
+  assert.equal(byId["GITHUB-INTEG-001"].status, "Partial");
+  assert.equal(byId["GITHUB-INTEG-002"].status, "Partial");
+  assert.equal(byId["GITHUB-INTEG-003"].status, "Manual");
+});
+
+test("self-check (d): a compliant tenant built from documented fields passes every automatable control", async () => {
+  const findings = await runAllAssessments(createCompliantClient());
+  assert.equal(findings.length, 31);
+  const notPassing = findings.filter((finding) => finding.status !== "Pass").map((finding) => `${finding.id}=${finding.status}`);
+  assert.deepEqual(notPassing, ["GITHUB-INTEG-004=Manual"]);
+});
+
+test("exportGitHubAuditBundle records collector failures and never overwrites a prior bundle", async () => {
+  const outputRoot = createTempBase("grclanker-github-rerun-");
+  const first = await exportGitHubAuditBundle(createPartialClient(), SELF_CHECK_CONFIG, outputRoot);
+  const second = await exportGitHubAuditBundle(createPartialClient(), SELF_CHECK_CONFIG, outputRoot);
+
+  assert.notEqual(first.outputDir, second.outputDir);
+  assert.notEqual(first.zipPath, second.zipPath);
+  assert.equal(first.zipPath, `${first.outputDir}.zip`);
+  assert.equal(second.zipPath, `${second.outputDir}.zip`);
+  assert.ok(existsSync(first.zipPath));
+  assert.ok(existsSync(second.zipPath));
+
+  assert.ok(first.errorCount > 0);
+  const errorLog = readFileSync(join(first.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /HTTP 403/);
+  const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.deepEqual(passingIds(findings), [...SETTING_DRIVEN_IDS, "GITHUB-ORG-005"].sort());
 });

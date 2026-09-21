@@ -1986,16 +1986,18 @@ function buildFrameworkReports(findings: GitHubFinding[]): Record<string, string
   };
 }
 
-async function buildBundleReadme(rootDir: string): Promise<void> {
+async function buildBundleQuickReference(rootDir: string): Promise<void> {
   await writeSecureTextFile(
     rootDir,
-    "README.md",
+    "QUICK_REFERENCE.md",
     [
       "# GitHub Audit Bundle Quick Reference",
       "",
       "- `core_data/` contains the raw GitHub API payloads collected for this assessment.",
-      "- `analysis/` contains normalized findings in JSON and terminal-friendly markdown.",
-      "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
+      "- `analysis/` contains normalized findings in JSON (findings.json plus one file per assessment category).",
+      "- `compliance/` contains the executive summary, unified matrix, and per-framework reports under frameworks/.",
+      "- `_errors.log` is present only when one or more collectors failed; every finding that depended on a failed collector is Manual or Partial, never Pass.",
+      "- The paired `.zip` next to this directory carries the same name, so a rerun allocates a new directory and archive instead of overwriting this one.",
       "",
       "This bundle is read-only evidence and analysis output. It does not contain GitHub write-capable credentials.",
     ].join("\n"),
@@ -2745,11 +2747,21 @@ function assessWebhookSecurity(data: GitHubIntegrationsData): GitHubFinding {
       "Repository webhooks require admin access on each repository; review the unreadable repositories manually.",
     );
   }
+  if (repoEntries.length === 0) {
+    return buildFinding(
+      "GITHUB-INTEG-001",
+      "Partial",
+      `${orgHooks.length === 0 ? "No organization webhooks exist" : `All ${orgHooks.length} organization webhook(s) are secure`}, but the repository inventory was empty, so the repository-level webhook sweep had no coverage.`,
+      evidence,
+      recommendation,
+      "Confirm the principal can list the organization's repositories (an installation token only sees repositories it is installed on), then rerun.",
+    );
+  }
   if (orgHooks.length + repoHookCount === 0) {
     return buildFinding(
       "GITHUB-INTEG-001",
       "Pass",
-      "No organization or repository webhooks exist; an empty inventory is compliant because there is no webhook delivery path to secure.",
+      `No organization or repository webhooks exist across ${repoEntries.length} active repositories; an empty inventory is compliant because there is no webhook delivery path to secure.`,
       evidence,
       recommendation,
     );
@@ -2833,6 +2845,16 @@ function assessDeployKeys(data: GitHubIntegrationsData, now: number): GitHubFind
       evidence,
       recommendation,
       "Review the unreadable repositories and undated keys manually.",
+    );
+  }
+  if (entries.length === 0) {
+    return buildFinding(
+      "GITHUB-INTEG-002",
+      "Partial",
+      "The repository inventory was empty, so no deploy keys could be enumerated and the control is unverified.",
+      evidence,
+      recommendation,
+      "Confirm the principal can list the organization's repositories (an installation token only sees repositories it is installed on), then rerun.",
     );
   }
   if (allKeys.length === 0) {
@@ -3376,6 +3398,52 @@ export function assessGitHubRepoProtection(
   };
 }
 
+function assessSelfHostedRunners(
+  data: GitHubActionsData,
+  runnerCount: number,
+  runnerGroupCount: number,
+  openRunnerGroups: number,
+): GitHubFinding {
+  const recommendation = "Scope self-hosted runners to the smallest practical repository set and avoid broad public or org-wide exposure unless it is deliberate.";
+  const evidence = [
+    data.runners.error ? `org runners unreadable: ${data.runners.error}` : `self_hosted_runners = ${runnerCount}`,
+    data.runnerGroups.error ? `runner groups unreadable: ${data.runnerGroups.error}` : `runner_groups = ${runnerGroupCount}`,
+    `open_runner_groups = ${openRunnerGroups}`,
+  ];
+
+  if (data.runners.error || data.runnerGroups.error) {
+    return buildFinding(
+      "GITHUB-ACT-004",
+      "Manual",
+      "The tool could not read the organization runner or runner-group inventory, so runner scoping is unverified.",
+      evidence,
+      recommendation,
+      "Grant admin:org (or the Actions runners read permission on the App) and rerun, or export the runner and runner-group lists from Settings > Actions > Runners.",
+    );
+  }
+
+  if (runnerCount === 0 && runnerGroupCount === 0) {
+    return buildFinding(
+      "GITHUB-ACT-004",
+      "Info",
+      "No organization-level self-hosted runners or runner groups are registered, so there is nothing to scope at the org layer. Repository-level runners are not enumerated by the org endpoint, so this is not a pass.",
+      evidence,
+      recommendation,
+      "Confirm that no repository-level self-hosted runners exist, or enumerate them per repository.",
+    );
+  }
+
+  const scoped = openRunnerGroups === 0;
+  return buildFinding(
+    "GITHUB-ACT-004",
+    scoped ? "Pass" : "Partial",
+    `${runnerCount} self-hosted runner(s) and ${runnerGroupCount} runner group(s) were found; ${openRunnerGroups} runner group(s) appear broadly exposed.`,
+    evidence,
+    recommendation,
+    "Review runner-group targeting and workflow restrictions manually for sensitive repos.",
+  );
+}
+
 export function assessGitHubActionsSecurity(
   data: GitHubActionsData,
   config: GitHubResolvedConfig,
@@ -3441,20 +3509,7 @@ export function assessGitHubActionsSecurity(
       ],
       "Disable workflow-based pull-request approval so CI does not satisfy its own review gates.",
     ),
-    buildFinding(
-      "GITHUB-ACT-004",
-      runnerCount === 0 ? "Pass" : (runnerGroupCount > 0 && openRunnerGroups === 0 ? "Pass" : "Partial"),
-      runnerCount === 0
-        ? "No self-hosted runners were found."
-        : `${runnerCount} self-hosted runner(s) and ${runnerGroupCount} runner group(s) were found; ${openRunnerGroups} runner group(s) appear broadly exposed.`,
-      [
-        `self_hosted_runners = ${runnerCount}`,
-        `runner_groups = ${runnerGroupCount}`,
-        `open_runner_groups = ${openRunnerGroups}`,
-      ],
-      "Scope self-hosted runners to the smallest practical repository set and avoid broad public or org-wide exposure unless it is deliberate.",
-      runnerCount > 0 ? "Review runner-group targeting and workflow restrictions manually for sensitive repos." : undefined,
-    ),
+    assessSelfHostedRunners(data, runnerCount, runnerGroupCount, openRunnerGroups),
     buildFinding(
       "GITHUB-ACT-005",
       enabledRepositories === "selected" ? "Pass" : (enabledRepositories === "all" ? "Partial" : "Manual"),
@@ -3490,30 +3545,45 @@ export function assessGitHubCodeSecurity(
   config: GitHubResolvedConfig,
 ): GitHubAssessmentResult {
   const org = data.org.data ?? null;
-  const configs = data.codeSecurityConfigurations.data;
+  const configsDataset = data.codeSecurityConfigurations;
+  const configs = configsDataset.data;
   const primaryConfigs = selectPrimaryCodeSecurityConfigurations(configs);
-  const secretScanningDefault = asBoolean(org && asRecord(org).secret_scanning_enabled_for_new_repositories)
-    ?? primaryConfigs.some((entry) => featureEnabled(asRecord(entry).secret_scanning));
-  const pushProtectionDefault = asBoolean(org && asRecord(org).secret_scanning_push_protection_enabled_for_new_repositories)
-    ?? primaryConfigs.some((entry) => featureEnabled(asRecord(entry).secret_scanning_push_protection));
-  const dependabotDefault = asBoolean(org && asRecord(org).dependabot_alerts_enabled_for_new_repositories)
-    ?? primaryConfigs.some((entry) => featureEnabled(asRecord(entry).dependabot_alerts));
-  const dependabotUpdatesDefault = asBoolean(org && asRecord(org).dependabot_security_updates_enabled_for_new_repositories)
-    ?? primaryConfigs.some((entry) => featureEnabled(asRecord(entry).dependabot_security_updates));
-  const codeScanningDefault = primaryConfigs.some((entry) => featureEnabled(asRecord(entry).code_scanning_default_setup));
+  // The *_enabled_for_new_repositories flags are documented on organization-full and are only
+  // returned to organization owners; when absent, fall back to the readable default configurations.
+  const resolveDefault = (orgField: string, configField: string): boolean | undefined => {
+    const orgFlag = asBoolean(org && asRecord(org)[orgField]);
+    if (orgFlag !== undefined) return orgFlag;
+    if (configsDataset.error || primaryConfigs.length === 0) return undefined;
+    return primaryConfigs.some((entry) => featureEnabled(asRecord(entry)[configField]));
+  };
+  const secretScanningDefault = resolveDefault("secret_scanning_enabled_for_new_repositories", "secret_scanning");
+  const pushProtectionDefault = resolveDefault("secret_scanning_push_protection_enabled_for_new_repositories", "secret_scanning_push_protection");
+  const dependabotDefault = resolveDefault("dependabot_alerts_enabled_for_new_repositories", "dependabot_alerts");
+  const dependabotUpdatesDefault = resolveDefault("dependabot_security_updates_enabled_for_new_repositories", "dependabot_security_updates");
+  const codeScanningDefault = configsDataset.error
+    ? undefined
+    : primaryConfigs.some((entry) => featureEnabled(asRecord(entry).code_scanning_default_setup));
+  const unreadableSources = [
+    data.org.error ? `organization profile unreadable: ${data.org.error}` : null,
+    configsDataset.error ? `code security configurations unreadable: ${configsDataset.error}` : null,
+  ].filter((entry): entry is string => entry !== null);
+  const manualNote = "Confirm the code security defaults in Settings > Code security with an organization owner, or rerun with an owner token or an App that holds organization administration read access.";
 
   const findings: GitHubFinding[] = [
     buildFinding(
       "GITHUB-CODE-001",
-      configs.length > 0 ? "Pass" : "Partial",
-      configs.length > 0
-        ? `${configs.length} code security configuration(s) were found at the organization layer.`
-        : "No organization-level code security configurations were found.",
+      configsDataset.error ? "Manual" : (configs.length > 0 ? "Pass" : "Fail"),
+      configsDataset.error
+        ? "The tool could not read organization code security configurations, so the control is unverified."
+        : (configs.length > 0
+          ? `${configs.length} code security configuration(s) were found at the organization layer.`
+          : "No organization-level code security configurations exist. An empty configuration list is a fail for this control because new repositories inherit no security baseline."),
       [
-        `code_security_configurations = ${configs.length}`,
+        configsDataset.error ? `code security configurations unreadable: ${configsDataset.error}` : `code_security_configurations = ${configs.length}`,
         `primary_configurations = ${primaryConfigs.length}`,
       ],
       "Define code security configurations so repository defaults are managed centrally instead of relying only on ad hoc per-repo toggles.",
+      configsDataset.error ? manualNote : undefined,
     ),
     buildFinding(
       "GITHUB-CODE-002",
@@ -3525,8 +3595,10 @@ export function assessGitHubCodeSecurity(
           : "The tool could not confirm secret-scanning defaults."),
       [
         `secret_scanning_default = ${String(secretScanningDefault)}`,
+        ...unreadableSources,
       ],
       "Enable secret scanning by default for new repositories and align repo enrollment with an org security configuration when available.",
+      secretScanningDefault === undefined ? manualNote : undefined,
     ),
     buildFinding(
       "GITHUB-CODE-003",
@@ -3538,33 +3610,45 @@ export function assessGitHubCodeSecurity(
           : "The tool could not confirm push-protection defaults."),
       [
         `push_protection_default = ${String(pushProtectionDefault)}`,
+        ...unreadableSources,
       ],
       "Enable push protection so secret exposures are blocked before they land in the repository history.",
+      pushProtectionDefault === undefined ? manualNote : undefined,
     ),
     buildFinding(
       "GITHUB-CODE-004",
-      dependabotDefault === true && dependabotUpdatesDefault === true
-        ? "Pass"
-        : ((dependabotDefault === true || dependabotUpdatesDefault === true) ? "Partial" : "Fail"),
-      dependabotDefault === true && dependabotUpdatesDefault === true
-        ? "Dependabot alerts and security updates are enabled by default."
-        : `Dependabot defaults are incomplete (alerts=${String(dependabotDefault)}, security_updates=${String(dependabotUpdatesDefault)}).`,
+      dependabotDefault === undefined && dependabotUpdatesDefault === undefined
+        ? "Manual"
+        : (dependabotDefault === true && dependabotUpdatesDefault === true
+          ? "Pass"
+          : ((dependabotDefault === true || dependabotUpdatesDefault === true) ? "Partial" : "Fail")),
+      dependabotDefault === undefined && dependabotUpdatesDefault === undefined
+        ? "The tool could not confirm Dependabot defaults."
+        : (dependabotDefault === true && dependabotUpdatesDefault === true
+          ? "Dependabot alerts and security updates are enabled by default."
+          : `Dependabot defaults are incomplete (alerts=${String(dependabotDefault)}, security_updates=${String(dependabotUpdatesDefault)}).`),
       [
         `dependabot_alerts_default = ${String(dependabotDefault)}`,
         `dependabot_security_updates_default = ${String(dependabotUpdatesDefault)}`,
+        ...unreadableSources,
       ],
       "Enable both Dependabot alerts and security updates so vulnerable dependencies are surfaced and can be remediated quickly.",
+      dependabotDefault === undefined && dependabotUpdatesDefault === undefined ? manualNote : undefined,
     ),
     buildFinding(
       "GITHUB-CODE-005",
-      codeScanningDefault ? "Pass" : "Partial",
-      codeScanningDefault
-        ? "Code scanning default setup is enabled through an organization configuration."
-        : "The tool did not find code scanning default setup enabled in the available org security configurations.",
+      codeScanningDefault === undefined ? "Manual" : (codeScanningDefault ? "Pass" : "Partial"),
+      codeScanningDefault === undefined
+        ? "The tool could not read organization code security configurations, so code scanning default setup is unverified."
+        : (codeScanningDefault
+          ? "Code scanning default setup is enabled through an organization configuration."
+          : "The tool did not find code scanning default setup enabled in the available org security configurations."),
       [
         `code_scanning_default_setup = ${String(codeScanningDefault)}`,
+        ...unreadableSources,
       ],
       "Enable code scanning default setup where supported so repositories inherit baseline static-analysis coverage.",
+      codeScanningDefault === undefined ? manualNote : undefined,
     ),
   ];
 
@@ -3644,7 +3728,7 @@ export async function exportGitHubAuditBundle(
     safeDirName(`${config.organization}-audit-bundle`),
   );
 
-  await buildBundleReadme(outputDir);
+  await buildBundleQuickReference(outputDir);
   await writeSecureTextFile(outputDir, "config.json", serializeJson({
     organization: config.organization,
     auth_mode: config.authMode,
