@@ -377,8 +377,101 @@ function upper(value: unknown): string {
   return asString(value)?.toUpperCase() ?? "";
 }
 
+export const REDACTED_MARKER = "[redacted]";
+
+/**
+ * Field names whose values are credential-bearing wherever they appear in an
+ * OCI response: CustomerSecretKey.key and AuthToken.token (returned on
+ * create), ApiKey.keyValue (public PEM, still dropped as verbose key material),
+ * PreauthenticatedRequest.accessUri (a bearer URI), KMS key material and
+ * wrapped keys, Vault secret bundles, and any private key or password field.
+ * Keys are compared after lowercasing and stripping underscores and hyphens.
+ */
+const SENSITIVE_EXACT_KEYS = new Set([
+  "accessuri",
+  "authorization",
+  "ciphertext",
+  "clientsecret",
+  "communitystring",
+  "connectionstring",
+  "credentials",
+  "key",
+  "keyfile",
+  "keymaterial",
+  "keyvalue",
+  "passphrase",
+  "password",
+  "passwordhash",
+  "plaintext",
+  "privatekey",
+  "privatekeypem",
+  "secret",
+  "secretbundle",
+  "secretbundlecontent",
+  "secretcontent",
+  "secretkey",
+  "securitytoken",
+  "securitytokenfile",
+  "sshprivatekey",
+  "token",
+  "userdata",
+  "wrappedimportkey",
+  "wrappedkey",
+]);
+
+const SENSITIVE_KEY_SUFFIXES = ["accessuri", "keymaterial", "passphrase", "password", "privatekey", "secret", "token", "wrappedkey"];
+
+const SENSITIVE_TEXT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
+  { pattern: /-----BEGIN[^-]*-----[\s\S]*?-----END[^-]*-----/g, replacement: "[redacted key material]" },
+  { pattern: /-----BEGIN[^-]*-----[\s\S]*/g, replacement: "[redacted key material]" },
+  { pattern: /\/p\/[A-Za-z0-9_+/=-]+\/n\//g, replacement: "/p/[redacted]/n/" },
+  { pattern: /\b(Signature|Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1 [redacted]" },
+  { pattern: /\b([A-Za-z_-]*(?:token|secret|password|passphrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
+];
+
+function normalizeFieldName(key: string): string {
+  return key.toLowerCase().replace(/[_-]/g, "");
+}
+
+export function isSensitiveFieldName(key: string): boolean {
+  const normalized = normalizeFieldName(key);
+  if (SENSITIVE_EXACT_KEYS.has(normalized)) return true;
+  return SENSITIVE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
+export function redactSensitiveText(text: string): string {
+  let result = text;
+  for (const { pattern, replacement } of SENSITIVE_TEXT_PATTERNS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+
+/**
+ * Deep-copies a value while replacing credential-bearing fields with a
+ * redaction marker (the field name is kept so reviewers can see what was
+ * dropped) and scrubbing key material or bearer URIs embedded in strings.
+ */
+export function redactSensitiveValues<T>(value: T): T {
+  if (typeof value === "string") return redactSensitiveText(value) as T;
+  if (Array.isArray(value)) return value.map((item) => redactSensitiveValues(item)) as T;
+  if (value && typeof value === "object") {
+    const result: JsonRecord = {};
+    for (const [key, entry] of Object.entries(value as JsonRecord)) {
+      if (isSensitiveFieldName(key) && entry !== undefined && entry !== null && typeof entry !== "boolean" && typeof entry !== "number") {
+        result[key] = REDACTED_MARKER;
+      } else {
+        result[key] = redactSensitiveValues(entry);
+      }
+    }
+    return result as T;
+  }
+  return value;
+}
+
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return redactSensitiveText(message).slice(0, 1000);
 }
 
 function finding(
@@ -390,7 +483,29 @@ function finding(
   mappings: string[],
   evidence?: JsonRecord,
 ): OciFinding {
-  return { id, title, severity, status, summary, evidence, mappings };
+  return {
+    id,
+    title,
+    severity,
+    status,
+    summary: redactSensitiveText(summary),
+    evidence: evidence ? redactSensitiveValues(evidence) : undefined,
+    mappings,
+  };
+}
+
+/**
+ * Projects a compartment record down to the documented fields the verdicts
+ * read (OCI_SURFACE_DOCS.compartments.fields) so the raw snapshot never
+ * carries tags, descriptions, or other tenancy configuration verbatim.
+ */
+export function projectCompartmentSnapshot(compartment: JsonRecord): JsonRecord {
+  return {
+    id: asString(compartment.id),
+    compartmentId: asString(compartment.compartmentId),
+    name: asString(compartment.name),
+    lifecycleState: asString(compartment.lifecycleState),
+  };
 }
 
 function serializeJson(value: unknown): string {
@@ -1289,9 +1404,15 @@ export async function assessOciIdentity(
   const credentialErrors: string[] = [];
   let credentialsSeen = 0;
   let credentialCapHit = false;
+  let usersInspected = 0;
   for (const user of activeUsers) {
     const userOcid = asString(user.id);
     if (!userOcid) continue;
+    if (credentialsSeen >= maxKeys) {
+      credentialCapHit = true;
+      break;
+    }
+    usersInspected += 1;
     const userName = asString(user.name) ?? userOcid;
     const loaders: Array<{ kind: string; idKey: string; load: () => Promise<JsonRecord[]> }> = [
       { kind: "api_key", idKey: "fingerprint", load: () => client.listApiKeys(userOcid) },
@@ -1340,7 +1461,10 @@ export async function assessOciIdentity(
     credentialSummary = `${staleCredentials.length} active API keys, customer secret keys, or auth tokens exceeded ${staleDays} days.`;
   } else if (credentialCapHit || credentialErrors.length > 0 || undatedCredentials.length > 0) {
     credentialStatus = "warn";
-    credentialSummary = `No stale credentials among ${credentialsSeen} inspected, but the view is incomplete: cap hit=${credentialCapHit}, listing errors=${credentialErrors.length}, undated credentials=${undatedCredentials.length}.`;
+    const capNote = credentialCapHit
+      ? ` Credential cap ${maxKeys} hit: ${credentialsSeen} credentials seen across ${usersInspected}/${activeUsers.length} active users; the total is unknown because enumeration stopped at the cap.`
+      : "";
+    credentialSummary = `No stale credentials among ${credentialsSeen} inspected, but the view is incomplete: cap hit=${credentialCapHit}, listing errors=${credentialErrors.length}, undated credentials=${undatedCredentials.length}.${capNote}`;
   } else {
     credentialStatus = "pass";
     credentialSummary = `None of the ${credentialsSeen} active API keys, customer secret keys, or auth tokens exceeded ${staleDays} days.`;
@@ -1350,8 +1474,10 @@ export async function assessOciIdentity(
     ? await collectAcrossCompartments("iam policy list", compartments.items, maxCompartments, (compartmentId) => client.listPolicies(compartmentId))
     : collectionFromSingle<JsonRecord>({ ok: false, items: [], error: compartments.error });
   errors.push(...policyScope.errors);
-  const policies = policyScope.items.filter(isActiveLifecycle).slice(0, maxPolicies);
-  const policyCapHit = policyScope.items.length > maxPolicies;
+  const activePolicies = policyScope.items.filter(isActiveLifecycle);
+  const policies = activePolicies.slice(0, maxPolicies);
+  const policyCapHit = activePolicies.length > maxPolicies;
+  const policyCapNote = policyCapHit ? ` Policy cap ${maxPolicies} hit: ${policies.length}/${activePolicies.length} active policies inspected; a pass verdict is withheld.` : "";
   const broadPolicies = policies.filter((policy) => asArray(policy.statements).some((statement) => isBroadPolicy(normalizeStatementText(statement))));
   const policyComputed: OciFindingStatus = broadPolicies.length > 0 ? "warn" : (policyCapHit ? "warn" : "pass");
   const policyStatus = scopedStatus(policyScope, policyComputed, "manual");
@@ -1361,9 +1487,9 @@ export async function assessOciIdentity(
   } else if (policyScope.items.length === 0) {
     policySummary = "Manual: no IAM policies were returned even though every tenancy has a root administrators policy; verify the inspect policies permission and review statements manually.";
   } else if (broadPolicies.length > 0) {
-    policySummary = `${broadPolicies.length}/${policies.length} active policies contain tenancy-wide manage statements.${partialNote(policyScope)}`;
+    policySummary = `${broadPolicies.length}/${policies.length} active policies contain tenancy-wide manage statements.${policyCapNote}${partialNote(policyScope)}`;
   } else {
-    policySummary = `None of the ${policies.length} active policies contain tenancy-wide manage statements.${policyCapHit ? ` Policy cap ${maxPolicies} hit.` : ""}${partialNote(policyScope)}`;
+    policySummary = `None of the ${policies.length} active policies contain tenancy-wide manage statements.${policyCapNote}${partialNote(policyScope)}`;
   }
 
   const activeCompartments = compartments.items.filter(isActiveLifecycle);
@@ -1420,6 +1546,10 @@ export async function assessOciIdentity(
       {
         credentials_seen: credentialsSeen,
         credential_cap_hit: credentialCapHit,
+        credential_cap: maxKeys,
+        credentials_total: credentialCapHit ? null : credentialsSeen,
+        users_inspected: usersInspected,
+        users_total: activeUsers.length,
         stale_credentials: staleCredentials.slice(0, 25),
         undated_credentials: undatedCredentials.slice(0, 25),
         listing_errors: credentialErrors.slice(0, 10),
@@ -1432,7 +1562,7 @@ export async function assessOciIdentity(
       policyStatus,
       policySummary,
       ["FedRAMP AC-6", "CMMC L2 3.1.5", "SOC 2 CC6.3", "CIS OCI 1.14", "PCI-DSS 7.2.1", "STIG SRG-APP-000340", "IRAP ISM-0432", "ISMAP AC-01"],
-      { ...scopeEvidence(policyScope), policy_cap_hit: policyCapHit, broad_policies: broadPolicies.slice(0, 25).map((policy) => ({ name: policy.name, statements: policy.statements })) },
+      { ...scopeEvidence(policyScope), policy_cap_hit: policyCapHit, policy_cap: maxPolicies, policies_seen: policies.length, policies_total: activePolicies.length, broad_policies: broadPolicies.slice(0, 25).map((policy) => ({ name: policy.name, statements: policy.statements })) },
     ),
     finding(
       "OCI-IAM-05",
@@ -1843,8 +1973,8 @@ export async function assessOciTenancyGuardrails(
       ? `Manual: no bastions exist in the ${bastions.seenCompartments} inspected compartments; verify how administrative access reaches private hosts.${partialNote(bastions)}`
       : `${weakBastions.length} bastions have TTL above ${BASTION_MAX_TTL_SECONDS}s or an empty/world CIDR allow list, ${longRunningSessions.length} ACTIVE sessions exceed ${BASTION_SESSION_MAX_HOURS}h, ${undatedSessions.length} sessions lack timeCreated, ${bastionDetailErrors} detail reads failed.${partialNote(bastions)}`;
 
-  const weakKeys: Array<{ vault?: string; key?: string; algorithm?: string; daysSinceRotation?: number; reason: string }> = [];
-  const undatedKeys: Array<{ vault?: string; key?: string }> = [];
+  const weakKeys: Array<{ vault?: string; key_name?: string; algorithm?: string; daysSinceRotation?: number; reason: string }> = [];
+  const undatedKeys: Array<{ vault?: string; key_name?: string }> = [];
   let keysSeen = 0;
   let keyReadErrors = 0;
   for (const vault of vaults.items.filter(isActiveLifecycle)) {
@@ -1858,7 +1988,7 @@ export async function assessOciTenancyGuardrails(
       keysSeen += 1;
       const keyId = asString(key.id);
       const algorithm = upper(key.algorithm);
-      const label = { vault: asString(vault.displayName) ?? asString(vault.id), key: asString(key.displayName) ?? keyId };
+      const label = { vault: asString(vault.displayName) ?? asString(vault.id), key_name: asString(key.displayName) ?? keyId };
       if (algorithm !== "AES" && algorithm !== "RSA" && algorithm !== "ECDSA") {
         weakKeys.push({ ...label, algorithm: algorithm || undefined, reason: "algorithm outside the documented AES/RSA/ECDSA enum or missing" });
       }
@@ -1960,7 +2090,7 @@ export async function assessOciTenancyGuardrails(
     ? unreadableSummary("Object Storage buckets", buckets, "bucket public access settings and pre-authenticated requests")
     : buckets.items.length === 0
       ? `Manual: no buckets exist in the ${buckets.seenCompartments} inspected compartments; confirm Object Storage is out of scope.${partialNote(buckets)}`
-      : `${bucketsSeen} buckets inspected: ${publicBuckets.length} with publicAccessType other than NoPublicAccess, ${longLivedPars.length} PARs expiring more than ${PAR_LONG_LIVED_DAYS} days out, ${undatedPars.length} PARs without timeExpires, ${bucketDetailErrors} detail reads failed${bucketCapHit ? `, bucket cap ${maxBuckets} hit` : ""}.${partialNote(buckets)}`;
+      : `${bucketsSeen} buckets inspected: ${publicBuckets.length} with publicAccessType other than NoPublicAccess, ${longLivedPars.length} PARs expiring more than ${PAR_LONG_LIVED_DAYS} days out, ${undatedPars.length} PARs without timeExpires, ${bucketDetailErrors} detail reads failed.${bucketCapHit ? ` Bucket cap ${maxBuckets} hit: ${bucketsSeen}/${buckets.items.length} buckets inspected; a pass verdict is withheld.` : ""}${partialNote(buckets)}`;
 
   const findings = [
     finding(
@@ -2015,7 +2145,7 @@ export async function assessOciTenancyGuardrails(
       bucketStatus,
       bucketSummary,
       ["FedRAMP AC-3", "CMMC L2 3.1.1", "CMMC L2 3.1.2", "SOC 2 CC6.1", "CIS OCI 5.1", "CIS OCI 5.2", "PCI-DSS 1.3.6", "PCI-DSS 7.2.2", "STIG SRG-APP-000033", "IRAP ISM-0405", "ISMAP DS-01", "ISMAP DS-02"],
-      { ...scopeEvidence(buckets), buckets_seen: bucketsSeen, bucket_cap_hit: bucketCapHit, public_buckets: publicBuckets.slice(0, 25), long_lived_pars: longLivedPars.slice(0, 25), undated_pars: undatedPars.slice(0, 25), detail_errors: bucketDetailErrors },
+      { ...scopeEvidence(buckets), buckets_seen: bucketsSeen, buckets_total: buckets.items.length, bucket_cap: maxBuckets, bucket_cap_hit: bucketCapHit, public_buckets: publicBuckets.slice(0, 25), long_lived_pars: longLivedPars.slice(0, 25), undated_pars: undatedPars.slice(0, 25), detail_errors: bucketDetailErrors },
     ),
   ];
 
@@ -2376,7 +2506,7 @@ export async function exportOciAuditBundle(
     },
   }));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "core_data/compartments.json", serializeJson(compartments.items));
+  await writeSecureTextFile(outputDir, "core_data/compartments.json", serializeJson(compartments.items.map(projectCompartmentSnapshot)));
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
   await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
   await writeSecureTextFile(outputDir, "analysis/logging-detection.json", serializeJson(loggingDetection));
