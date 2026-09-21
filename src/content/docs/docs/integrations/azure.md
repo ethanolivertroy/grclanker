@@ -40,7 +40,7 @@ The tools resolve configuration in this order: explicit tool arguments, environm
 
 | Tool | Findings |
 |------|----------|
-| `azure_check_access` | Probes eight Graph and ARM surfaces and reports which are readable |
+| `azure_check_access` | Probes eight Graph and ARM surfaces and reports which are readable; a probe that stopped at its page cap carries `truncated: true` and its count is a floor |
 | `azure_assess_identity` | AZURE-ID-01 to AZURE-ID-13 |
 | `azure_assess_monitoring` | AZURE-MON-01 to AZURE-MON-07 |
 | `azure_assess_subscription_guardrails` | AZURE-SUB-01 to AZURE-SUB-05 (`max_assignments`, default 500) |
@@ -57,14 +57,28 @@ The tools resolve configuration in this order: explicit tool arguments, environm
 
 Empty inventories that pass by intent are stated in the finding text: no guests (AZURE-ID-08) and no risky users (AZURE-ID-11). Zero Key Vaults, storage accounts, NSGs, users, service principals, app registrations, oauth2PermissionGrants, role assignments, Defender plans, or managed devices render `manual` because emptiness usually means a read problem.
 
+### Verdict safety rules
+
+- Secondary reads never pass silently. Every finding that combines two or more inventories (role members per role, PIM eligibility and assignment schedules, licenses plus Conditional Access, diagnostic settings plus workspaces, role assignments plus role definitions, users plus inbox rules, Network Watchers plus flow logs) renders `manual` naming the failed endpoint and the permission to grant when a secondary read is denied while the primary is readable. The test suite denies each secondary one at a time against a fully compliant fixture and asserts that no unrelated finding moves.
+- AZURE-ID-01 and AZURE-ID-02 treat security defaults as a secondary read: an enabled MFA or legacy-auth block policy satisfies the control on its own and the finding notes when the defaults read failed; with no such policy the verdict rests on the unreadable read and renders `manual` naming `GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy`, never "security defaults are off".
+- AZURE-DP-06 counts denied mailboxes (401/403) separately from mailboxes that errored without a permission failure (typically users without an Exchange mailbox), names `MailboxSettings.Read (application)` for the denied subset, and caps at `warn`; every mailbox denied renders `manual`.
+- Every pagination walk reports `truncated: true` on each early exit: the item cap, a next link that repeats the page just fetched, and an empty page that still advertises a next link. Truncated pages cap `pass` at `warn` with seen and total counts (AZURE-MON-04 and AZURE-MON-05 included), and `azure_check_access` keeps the flag next to a capped probe count so `core_data/access.json` never presents a page cap as an inventory size.
+- Failed reads named inside a non-manual finding (security defaults, security alerts, a denied mailbox subset) are also recorded in the assessment `errors` array and therefore in `_errors.log`.
+
+### Bundle redaction
+
+- Service principal and app registration records are reduced at collection time to `id`, `displayName`, `appId`, and the schedule fields of each credential (`keyId`, `displayName`, `type`, `usage`, `startDateTime`, `endDateTime`); `passwordCredential.hint`, `secretText`, `keyCredential.key`, and `customKeyIdentifier` never reach memory that a finding or the bundle could echo.
+- API error bodies are reduced to the documented envelope (`error.code: error.message` for Graph and ARM, `error: error_description` for the token endpoint); non-JSON bodies are dropped, so `_errors.log`, `core_data/access.json`, and `manual` evidence never carry raw payloads.
+- Tokens and the client secret are never written; the export test drives a real client through fake secrets, hints, key blobs, and an echoing error body and scans every bundle file and every inflated zip entry for them.
+
 ## Control coverage
 
 | # | Spec control | Tool | Finding | Status semantics |
 |---|--------------|------|---------|------------------|
-| 1 | Conditional Access | identity | AZURE-ID-01 | pass with enabled MFA policy or security defaults; report-only never counts |
+| 1 | Conditional Access | identity | AZURE-ID-01 | pass with enabled MFA policy or security defaults; report-only never counts; no MFA policy and an unreadable security defaults read is manual |
 | 2 | MFA Enforcement | identity | AZURE-ID-03 | fail above 10% unregistered; zero users manual |
 | 3 | Secure Score | monitoring | AZURE-MON-01 | pass at 75%+; no score manual |
-| 4 | Legacy Auth Blocked | identity | AZURE-ID-02 | pass only with an enabled block policy on exchangeActiveSync/other or security defaults |
+| 4 | Legacy Auth Blocked | identity | AZURE-ID-02 | pass only with an enabled block policy on exchangeActiveSync/other or security defaults; no block policy and an unreadable security defaults read is manual |
 | 5 | Privileged Roles | identity | AZURE-ID-04, AZURE-ID-06 | fail above 4 Global Admins or 2 permanent privileged PIM assignments; P2 required for ID-06 |
 | 6 | Guest User Access | identity | AZURE-ID-07, AZURE-ID-08 | pass with restricted guestUserRoleId and admin-only invites; stale guests fail, unknown last sign-in warns |
 | 7 | Sign-In Risk | identity | AZURE-ID-09, AZURE-ID-11 | enabled CA on medium/high signInRiskLevels with mfa or block; P2 required |
@@ -75,12 +89,12 @@ Empty inventories that pass by intent are stated in the finding text: no guests 
 | 12 | NSG Rules | network_and_policy | AZURE-NP-01 | fail on inbound Allow from any source to 22/3389/3306/1433 |
 | 13 | Key Vault Access | data_protection | AZURE-DP-04 | fail without enableSoftDelete and enablePurgeProtection; access policies or open network warn |
 | 14 | Storage Encryption | data_protection | AZURE-DP-05 | fail without supportsHttpsTrafficOnly or with allowBlobPublicAccess true; TLS below 1.2 warns |
-| 15 | Diagnostic Logging | monitoring | AZURE-MON-05 | pass with an enabled log category and destination |
-| 16 | Defender Enabled | monitoring | AZURE-MON-04 | pass when every plan is Standard |
+| 15 | Diagnostic Logging | monitoring | AZURE-MON-05 | pass with an enabled log category and destination; a truncated settings page caps at warn |
+| 16 | Defender Enabled | monitoring | AZURE-MON-04 | pass when every plan is Standard; a truncated pricing page caps at warn; a failed alerts read is named in evidence |
 | 17 | RBAC Least Privilege | subscription_guardrails | AZURE-SUB-01, AZURE-SUB-02 | Owner above 2 or Contributor above 5 fails |
 | 18 | Security Contacts | subscription_guardrails | AZURE-SUB-03 | pass with an emails value |
 | 19 | Audit Log Retention | monitoring | AZURE-MON-02, AZURE-MON-03, AZURE-MON-06, AZURE-MON-07 | Log Analytics retentionInDays 90+; Entra export is manual |
-| 20 | Mail Forwarding | data_protection | AZURE-DP-06, AZURE-DP-07 | inbox rules automated; mailbox forwarding and transport rules manual |
+| 20 | Mail Forwarding | data_protection | AZURE-DP-06, AZURE-DP-07 | inbox rules automated (denied mailboxes are named as a MailboxSettings.Read gap and cap at warn; all denied is manual); mailbox forwarding and transport rules manual |
 | 21 | External Sharing | data_protection | AZURE-DP-08 | pass with disabled or existing-guest sharing; anonymous links fail |
 | 22 | App Registrations | identity | AZURE-ID-12, AZURE-ID-13 | expired credentials fail; missing dates, long-lived secrets, or no owners warn; risky AllPrincipals grants fail; zero grants manual |
 | 23 | Service Principals | identity, subscription_guardrails | AZURE-ID-05, AZURE-SUB-05 | expired credentials or Owner/Contributor service principals fail |
@@ -106,7 +120,8 @@ Skips with exit 0 unless `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` are set t
 - Sensitivity labels (control 11) are read from `GET /beta/security/informationProtection/sensitivityLabels`, the only documented tenant-wide (application permission) form; beta endpoints may change without notice and the finding says so.
 - NSG flow logs (control 24) are read per Network Watcher from `Microsoft.Network/networkWatchers/{name}/flowLogs`; retention policy values are reported as evidence but not judged.
 - Identity Protection, PIM, and risk-based Conditional Access require Entra ID P2; Intune and Purview require their licenses. Missing licenses render `manual`, never `pass`.
-- Inbox rule inspection is capped by `max_mailboxes`; a capped or partially readable sample is reported as `warn` with seen and total counts.
+- Inbox rule inspection is capped by `max_mailboxes`; a capped or partially readable sample is reported as `warn` with seen and total counts, and denied mailboxes are counted apart from mailboxes without Exchange.
+- Graph and ARM list walks stop at 5,000 items (500 for risk detections, 200 for alerts, audits, and sign-ins, 20 for secure scores, `max_assignments` for role assignments) and on a repeated or empty-page next link; every early exit is reported as truncated and demotes the dependent verdict.
 - One subscription per run. Certificate credentials and managed identity are documented but not implemented.
 
 ## Official documentation
