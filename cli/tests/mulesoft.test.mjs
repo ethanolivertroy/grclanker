@@ -574,6 +574,23 @@ test("MulesoftApiClient surfaces non-retryable errors with status and redacted s
     },
   );
   assert.deepEqual(sleeps, []);
+
+  const opaqueClient = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async () => new Response("<html>gateway error: x-api-key FAKE_PROXY_ECHOED_SECRET</html>", {
+      status: 403,
+      statusText: "Forbidden",
+      headers: { "content-type": "text/html; charset=utf-8" },
+    }),
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(
+    () => opaqueClient.listMembers(),
+    (error) => {
+      assert.match(error.message, /403 Forbidden.*: response body omitted \(text\/html, 62 characters\)$/);
+      assert.doesNotMatch(error.message, /FAKE_PROXY_ECHOED_SECRET/, "a non-JSON error body is never copied into the error string");
+      return true;
+    },
+  );
 });
 
 test("redaction helpers mask secret-bearing keys and token text", () => {

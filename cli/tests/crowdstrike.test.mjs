@@ -705,6 +705,18 @@ test("CrowdstrikeApiClient redacts secrets in errors and gives up after the retr
   const retryingClient = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl: failingFetch, sleep: async () => {}, retryLimit: 2 });
   await assert.rejects(retryingClient.listHostGroups(), /\(503\)/);
   assert.equal(attempts, 3);
+
+  const opaqueBodyFetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token", expires_in: 1799 });
+    return new Response("<html>gateway error: x-api-key FAKE_PROXY_ECHOED_SECRET</html>", { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
+  };
+  const opaqueClient = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl: opaqueBodyFetch, sleep: async () => {}, retryLimit: 0 });
+  await assert.rejects(opaqueClient.listHostGroups(), (error) => {
+    assert.match(error.message, /\(502\): response body omitted \(text\/html, 62 characters\)/);
+    assert.doesNotMatch(error.message, /FAKE_PROXY_ECHOED_SECRET/, "a non-JSON error body is never copied into the error string");
+    return true;
+  });
 });
 
 test("checkCrowdstrikeAccess reports healthy when every read surface responds", async () => {

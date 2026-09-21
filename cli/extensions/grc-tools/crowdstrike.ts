@@ -818,6 +818,16 @@ function falconErrorSummary(payload: unknown): string | undefined {
   return asString(object.error_description) ?? asString(object.error) ?? asString(object.message);
 }
 
+/**
+ * A non-JSON error body (a proxy or WAF page) is described by shape only; its text is never
+ * copied into an error string because those strings land in the bundle's error log.
+ */
+function describeOpaqueBody(response: Response, rawText: string): string | undefined {
+  if (rawText.length === 0) return undefined;
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `response body omitted (${contentType}, ${rawText.length} characters)`;
+}
+
 function paginationOf(payload: JsonRecord): JsonRecord {
   return asObject(asObject(payload.meta)?.pagination) ?? {};
 }
@@ -948,7 +958,7 @@ export class CrowdstrikeApiClient {
     const rawText = await response.text();
     const payload = parseJsonText(rawText);
     if (!response.ok) {
-      const detail = falconErrorSummary(payload) ?? rawText.slice(0, 200);
+      const detail = falconErrorSummary(payload) ?? describeOpaqueBody(response, rawText);
       throw new CrowdstrikeHttpError(
         this.redact(`CrowdStrike OAuth2 token request failed (${response.status})${detail ? `: ${detail}` : ""}`),
         response.status,
@@ -1017,7 +1027,7 @@ export class CrowdstrikeApiClient {
       const rawText = await response.text();
       const payload = parseJsonText(rawText);
       if (!response.ok) {
-        const detail = falconErrorSummary(payload) ?? rawText.slice(0, 200);
+        const detail = falconErrorSummary(payload) ?? describeOpaqueBody(response, rawText);
         throw new CrowdstrikeHttpError(
           this.redact(`CrowdStrike request failed for ${path} (${response.status})${detail ? `: ${detail}` : ""}`),
           response.status,

@@ -966,7 +966,11 @@ function parseJsonText(rawText: string): unknown {
   }
 }
 
-function anypointErrorDetail(payload: unknown, rawText: string): string {
+/**
+ * A non-JSON error body (a proxy or WAF page) is described by shape only; its text is never
+ * copied into an error string because those strings land in the bundle's error log.
+ */
+function anypointErrorDetail(payload: unknown, response: Response, rawText: string): string {
   const object = asObject(payload);
   const detail = object
     ? [
@@ -975,7 +979,9 @@ function anypointErrorDetail(payload: unknown, rawText: string): string {
       asString(object.error),
       asString(getNestedValue(object, ["errors", "0", "message"])),
     ].filter((item): item is string => Boolean(item)).join("; ")
-    : rawText.slice(0, 240);
+    : rawText.length > 0
+      ? `response body omitted (${response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type"}, ${rawText.length} characters)`
+      : "";
   return detail ? `: ${detail}` : "";
 }
 
@@ -1126,7 +1132,7 @@ export class MulesoftApiClient {
           response.status,
           this.redact(
             `Anypoint request failed (${response.status} ${response.statusText}) for ${method} ${pathLabel}`
-            + anypointErrorDetail(payload, rawText),
+            + anypointErrorDetail(payload, response, rawText),
           ),
         );
       } catch (error) {
