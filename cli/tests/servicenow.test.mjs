@@ -221,7 +221,7 @@ function healthyProperties() {
     property("glide.apply.password_policy.on_login", "true"),
     property("glide.login.no_blank_password", "true"),
     property("glide.authenticate.multifactor", "true"),
-    property("glide.authenticate.multifactor.email.otp.enabled", "false"),
+    property("glide.authenticate.multifactor.email.otp.enable", "false"),
     property("glide.authenticate.multisso.enabled", "true"),
     property("glide.authenticate.sso.redirect.idp", "sso-okta"),
     property("glide.sso.acr.enabled", "true"),
