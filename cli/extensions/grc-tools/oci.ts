@@ -2119,7 +2119,6 @@ export async function assessOciTenancyGuardrails(
       }
     }
   }
-  if (keyCapHit) keyCapHit = keysSeen < keysTotal;
   const keyCapNote = keyCapHit ? ` Key cap ${maxKeys} hit: ${keysSeen}/${keysTotal} ENABLED keys inspected; a pass verdict is withheld.` : "";
   let keyComputed: OciFindingStatus;
   if (weakKeys.length > 0) {
