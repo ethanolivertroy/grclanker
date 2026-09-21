@@ -13,7 +13,7 @@
   "dependencies": {
     "@monaco-editor/loader": "^1.7.0",
     "@tailwindcss/vite": "^4.3.1",
-    "astro": "^7.0.3",
+    "astro": "^7.2.8",
     "marked": "^18.0.5"
   },
   "overrides": {
@@ -21,6 +21,6 @@
     "vite": "8.1.0"
   },
   "devDependencies": {
-    "wrangler": "^4.106.0"
+    "wrangler": "^4.135.0"
   }
 }
