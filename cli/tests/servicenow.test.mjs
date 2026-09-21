@@ -283,6 +283,10 @@ function healthyFixture() {
       ldap_server_config: [],
       sys_certificate: [{ sys_id: "cert-1", name: "Okta signing certificate", type: "cert", expires: "2027-06-01 00:00:00", active: "true" }],
       oauth_entity: [{ sys_id: "oauth-1", name: "Integration app", type: "client", active: "true", client_id: "abc123" }],
+      multi_factor_criteria: [
+        { sys_id: "d427668b73003300fdbd04fbc4f6a7b6", name: "Role-based multi-factor authentication", active: "true", roles: "admin, security_admin" },
+        { sys_id: "mfc-user", name: "User-based multi-factor authentication", active: "true" },
+      ],
       sys_security_acl: acls,
       sys_security_acl_role: aclRoles,
       sys_public: [],
@@ -609,7 +613,7 @@ test("checkServicenowAccess reports a healthy instance with the authenticated id
   assert.equal(result.status, "healthy");
   assert.equal(result.identity, "audit.reader");
   assert.equal(result.authMode, "basic");
-  assert.equal(result.surfaces.length, 25);
+  assert.equal(result.surfaces.length, 26);
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   const audit = result.surfaces.find((surface) => surface.table === "sys_audit");
   assert.equal(audit.total, 1200);
@@ -692,6 +696,66 @@ test("assessServicenowIdentityAccess treats an absent MFA property as disabled, 
 
   assert.equal(mfa.status, "fail");
   assert.match(mfa.summary, /no sys_properties row; the documented default is false/);
+});
+
+test("SNOW-07 reads multi_factor_criteria and passes only when the role-based record is active and covers admin roles", async () => {
+  const { fetchImpl, calls } = fixtureFetch(healthyFixture());
+  const mfa = findingsById(await assessServicenowIdentityAccess(createClient(fetchImpl))).get("SNOW-07");
+
+  assert.equal(mfa.status, "pass", mfa.summary);
+  assert.match(mfa.summary, /Role-based multi-factor authentication criteria record is active and covers admin and security_admin/);
+  assert.equal(mfa.evidence.role_based_criteria_active, true);
+  assert.deepEqual(mfa.evidence.elevated_roles_covered_by_criteria, ["admin", "security_admin"]);
+  assert.equal(mfa.manualEvidence, undefined);
+  const criteriaCall = calls.find((call) => call.url.pathname === "/api/now/table/multi_factor_criteria");
+  assert.ok(criteriaCall, "the enforcement criteria table is read");
+  assert.equal(criteriaCall.url.searchParams.get("sysparm_display_value"), "true");
+});
+
+test("SNOW-07 fails when the role-based criteria record is inactive and admins lack the per-user flag", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.multi_factor_criteria = fixture.tables.multi_factor_criteria.map((row) => (/Role-based/.test(row.name) ? { ...row, active: "false" } : row));
+  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => (row.user_name === "alice.admin" ? { ...row, enable_multifactor_authn: "false" } : row));
+  const mfa = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(fixture).fetchImpl))).get("SNOW-07");
+
+  assert.equal(mfa.status, "fail");
+  assert.match(mfa.summary, /criteria record is inactive and 1\/1 admin users do not carry enable_multifactor_authn/);
+});
+
+test("SNOW-07 warns when the active role-based criteria omit admin roles or when only per-user flags enforce MFA", async () => {
+  const partialRoles = healthyFixture();
+  partialRoles.tables.multi_factor_criteria = partialRoles.tables.multi_factor_criteria.map((row) => (/Role-based/.test(row.name) ? { ...row, roles: "itil" } : row));
+  partialRoles.tables.sys_user = partialRoles.tables.sys_user.map((row) => (row.user_name === "alice.admin" ? { ...row, enable_multifactor_authn: "false" } : row));
+  const uncovered = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(partialRoles).fetchImpl))).get("SNOW-07");
+  assert.equal(uncovered.status, "warn");
+  assert.match(uncovered.summary, /Multi-factor Roles list \(itil\) does not include admin and security_admin/);
+
+  const inactiveRoleBased = healthyFixture();
+  inactiveRoleBased.tables.multi_factor_criteria = inactiveRoleBased.tables.multi_factor_criteria.map((row) => (/Role-based/.test(row.name) ? { ...row, active: "false" } : row));
+  const perUserOnly = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(inactiveRoleBased).fetchImpl))).get("SNOW-07");
+  assert.equal(perUserOnly.status, "warn");
+  assert.match(perUserOnly.summary, /criteria record is inactive, so newly granted administrators are not enforced automatically/);
+
+  const rolesNotExposed = healthyFixture();
+  rolesNotExposed.tables.multi_factor_criteria = rolesNotExposed.tables.multi_factor_criteria.map((row) => (/Role-based/.test(row.name) ? { sys_id: row.sys_id, name: row.name, active: row.active } : row));
+  const flaggedAdmins = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(rolesNotExposed).fetchImpl))).get("SNOW-07");
+  assert.equal(flaggedAdmins.status, "pass", "an active role-based record plus every admin carrying the per-user flag is enforcement");
+  assert.match(flaggedAdmins.summary, /all 1 admin users also carry enable_multifactor_authn/);
+});
+
+test("SNOW-07 is manual, never pass, when multi_factor_criteria is forbidden or returns no rows (rules 1 and 2)", async () => {
+  const forbidden = fixtureFetch(healthyFixture(), { forbiddenTables: ["multi_factor_criteria"] });
+  const gatedResult = await assessServicenowIdentityAccess(createClient(forbidden.fetchImpl));
+  const gated = findingsById(gatedResult).get("SNOW-07");
+  assert.equal(gated.status, "manual");
+  assert.match(gated.summary, /multi_factor_criteria read was forbidden \(403\)/);
+  assert.equal(findingsById(gatedResult).get("SNOW-04").status, "pass", "the criteria read only gates the MFA finding");
+
+  const empty = healthyFixture();
+  empty.tables.multi_factor_criteria = [];
+  const unreadable = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(empty).fetchImpl))).get("SNOW-07");
+  assert.equal(unreadable.status, "manual");
+  assert.match(unreadable.summary, /baseline Role-based multi-factor authentication record always exists/);
 });
 
 test("SNOW-07 warns on the documented email OTP property glide.authenticate.multifactor.email.otp.enabled", async () => {

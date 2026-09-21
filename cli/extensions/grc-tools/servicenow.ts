@@ -1211,6 +1211,25 @@ function userLabel(row: JsonRecord): string {
   return rowString(row, "user_name") ?? rowString(row, "user.user_name") ?? rowString(row, "name") ?? rowString(row, "sys_id") ?? "unknown";
 }
 
+/**
+ * The Multi-factor Roles list on a criteria record is returned as a
+ * comma-separated display value; the column name is not documented, so any
+ * role-named column other than the record name is read.
+ */
+function criteriaRoleNames(row: JsonRecord): string[] {
+  const names = new Set<string>();
+  for (const [key, value] of Object.entries(row)) {
+    if (key === "name" || !/role/i.test(key)) continue;
+    const text = asString(value);
+    if (!text) continue;
+    for (const part of text.split(",")) {
+      const trimmed = part.trim();
+      if (trimmed) names.add(trimmed);
+    }
+  }
+  return [...names].sort();
+}
+
 const INSTANCE_SECURITY_PROPERTIES: PropertyExpectation[] = [
   { name: "glide.security.use_csrf_token", expected: "true", describe: "true" },
   { name: "glide.security.csrf.strict.validation.mode", expected: "true", describe: "true" },
@@ -1267,6 +1286,7 @@ const CERTIFICATE_FIELDS = ["sys_id", "name", "type", "expires", "active", "sys_
 const ACL_FIELDS = ["sys_id", "name", "operation", "type", "active", "admin_overrides", "condition", "script", "advanced", "description"];
 const ACL_ROLE_FIELDS = ["sys_id", "sys_security_acl", "sys_security_acl.name", "sys_user_role", "sys_user_role.name"];
 const PLUGIN_FIELDS = ["sys_id", "name", "source", "active", "version"];
+const MFA_CRITERIA_TABLE = "multi_factor_criteria";
 const IP_ACCESS_TABLE = "ip_access";
 const IP_AUTHENTICATOR_PLUGIN = "com.snc.ipauthenticator";
 const IP_ACCESS_FIELDS = ["sys_id", "type", "direction", "active", "range_start", "range_end", "description", "sys_updated_on"];
@@ -1283,6 +1303,7 @@ export interface ServicenowIdentityData {
   ldapServers: TableSnapshot;
   certificates: TableSnapshot;
   oauthEntities: TableSnapshot;
+  mfaCriteria: TableSnapshot;
   now: Date;
   inactiveDays: number;
   minPasswordLength: number;
@@ -1296,7 +1317,7 @@ export async function collectServicenowIdentityData(
 ): Promise<ServicenowIdentityData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
   const roleList = PRIVILEGED_ROLE_NAMES.join(",");
-  const [users, privilegedAssignments, roleInheritance, roleInheritanceTotal, properties, passwordPolicies, ssoProviders, ldapServers, certificates, oauthEntities] = await Promise.all([
+  const [users, privilegedAssignments, roleInheritance, roleInheritanceTotal, properties, passwordPolicies, ssoProviders, ldapServers, certificates, oauthEntities, mfaCriteria] = await Promise.all([
     client.queryTable("sys_user", { query: "active=true", fields: USER_FIELDS, limit: recordLimit }),
     client.queryTable("sys_user_has_role", { query: `role.nameIN${roleList}`, fields: USER_ROLE_FIELDS, limit: recordLimit }),
     client.queryTable("sys_user_role_contains", { query: `contains.nameIN${ELEVATED_ROLE_NAMES.join(",")}`, fields: ROLE_CONTAINS_FIELDS, limit: recordLimit }),
@@ -1307,6 +1328,7 @@ export async function collectServicenowIdentityData(
     client.queryTable("ldap_server_config", { fields: ["sys_id", "name", "active", "sys_updated_on"], limit: recordLimit }),
     client.queryTable("sys_certificate", { fields: CERTIFICATE_FIELDS, limit: recordLimit }),
     client.queryTable("oauth_entity", { fields: ["sys_id", "name", "type", "active", "client_id", "sys_updated_on"], limit: recordLimit }),
+    client.queryTable(MFA_CRITERIA_TABLE, { displayValue: true, limit: recordLimit }),
   ]);
   return {
     users,
@@ -1319,6 +1341,7 @@ export async function collectServicenowIdentityData(
     ldapServers,
     certificates,
     oauthEntities,
+    mfaCriteria,
     now: client.getNow(),
     inactiveDays: clampNumber(options.inactiveDays, DEFAULT_INACTIVE_DAYS, 1, 3650),
     minPasswordLength: clampNumber(options.minPasswordLength, DEFAULT_MIN_PASSWORD_LENGTH, 1, 128),
@@ -1369,6 +1392,7 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     ...snapshotErrors("ldap servers", data.ldapServers),
     ...snapshotErrors("certificates", data.certificates),
     ...snapshotErrors("oauth entities", data.oauthEntities),
+    ...snapshotErrors("multi-factor criteria", data.mfaCriteria),
   ];
 
   const users = data.users.rows;
@@ -1543,16 +1567,32 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     };
   });
 
-  const mfa = gatedFinding(7, [data.properties, data.users, data.privilegedAssignments], "Open System Properties > Multi-factor Authentication (glide.authenticate.multifactor) and Multi-factor Authentication > Policies, then confirm every admin user or role requires MFA.", () => {
+  const mfa = gatedFinding(7, [data.properties, data.users, data.privilegedAssignments, data.mfaCriteria], `Open Multi-factor Authentication > Multi-factor Criteria (${MFA_CRITERIA_TABLE}) and confirm the Role-based multi-factor authentication record is Active with admin and security_admin in its Multi-factor Roles list; open System Properties for glide.authenticate.multifactor and glide.authenticate.multifactor.email.otp.enabled; confirm every admin user carries enable_multifactor_authn or is covered by an MFA authentication policy.`, () => {
     const enabled = readProperty(data.properties, "glide.authenticate.multifactor");
     const emailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enabled");
     const admins = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? ""));
     const adminsWithoutFlag = admins.filter((user) => rowBoolean(user, "enable_multifactor_authn") !== true).map(userLabel);
+    const criteria = data.mfaCriteria.rows.map((row) => ({
+      name: rowString(row, "name") ?? rowString(row, "sys_id") ?? "criteria",
+      active: rowBoolean(row, "active") ?? null,
+      roles: criteriaRoleNames(row),
+    }));
+    const roleBased = criteria.filter((item) => /role/i.test(item.name));
+    const activeRoleBased = roleBased.filter((item) => item.active === true);
+    const enforcedRoles = [...new Set(activeRoleBased.flatMap((item) => item.roles))].sort();
+    const elevatedCovered = ELEVATED_ROLE_NAMES.filter((role) => enforcedRoles.includes(role));
+    const elevatedMissing = ELEVATED_ROLE_NAMES.filter((role) => !enforcedRoles.includes(role));
+    const roleEnforced = activeRoleBased.length > 0 && elevatedMissing.length === 0;
+    const userEnforced = admins.length > 0 && adminsWithoutFlag.length === 0;
     const evidence: JsonRecord = {
       glide_authenticate_multifactor: enabled.exists ? enabled.value : null,
       email_otp_enabled: emailOtp.exists ? emailOtp.value : null,
       admin_users: admins.length,
       admins_without_user_mfa_flag: truncateList(adminsWithoutFlag),
+      multi_factor_criteria: truncateList(criteria),
+      role_based_criteria_active: activeRoleBased.length > 0,
+      role_based_criteria_roles: enforcedRoles,
+      elevated_roles_covered_by_criteria: elevatedCovered,
     };
     if (!enabled.exists || asBoolean(enabled.value) !== true) {
       return {
@@ -1563,30 +1603,58 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
         evidence,
       };
     }
+    if (criteria.length === 0) {
+      return {
+        status: "manual",
+        summary: `glide.authenticate.multifactor=true, but no ${MFA_CRITERIA_TABLE} rows were visible; the baseline Role-based multi-factor authentication record always exists, so the credential cannot read the enforcement criteria and enforcement is unknown.`,
+        evidence,
+      };
+    }
     if (admins.length === 0) {
       return {
         status: "manual",
-        summary: "Platform MFA is enabled but no admin users were visible to verify per-user enforcement.",
+        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is ${activeRoleBased.length > 0 ? "active" : "inactive"}, but no admin users were visible to verify enforcement.`,
         evidence,
       };
     }
-    if (adminsWithoutFlag.length > 0) {
+    if (activeRoleBased.length === 0 && !userEnforced) {
+      return {
+        status: "fail",
+        summary: `glide.authenticate.multifactor=true, but the Role-based multi-factor authentication criteria record is ${roleBased.length > 0 ? "inactive" : "not present among the visible criteria"} and ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn, so MFA is not enforced for administrators.`,
+        evidence,
+      };
+    }
+    if (activeRoleBased.length === 0) {
       return {
         status: "warn",
-        summary: `Platform MFA is enabled, but ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn; confirm MFA is enforced for them through a role or an authentication policy.`,
+        summary: `glide.authenticate.multifactor=true and all ${admins.length} admin users carry enable_multifactor_authn, but the Role-based multi-factor authentication criteria record is inactive, so newly granted administrators are not enforced automatically.`,
         evidence,
       };
     }
+    if (!roleEnforced && !userEnforced) {
+      const rolesDescription = enforcedRoles.length > 0
+        ? `its Multi-factor Roles list (${enforcedRoles.join(", ")}) does not include ${elevatedMissing.join(" and ")}`
+        : "its Multi-factor Roles list was not returned by the Table API";
+      return {
+        status: "warn",
+        summary: `glide.authenticate.multifactor=true and the Role-based multi-factor authentication criteria record is active, but ${rolesDescription} and ${adminsWithoutFlag.length}/${admins.length} admin users do not carry enable_multifactor_authn; confirm admin and security_admin are enforced.`,
+        evidence,
+      };
+    }
+    const enforcement = roleEnforced
+      ? `the Role-based multi-factor authentication criteria record is active and covers ${elevatedCovered.join(" and ")}`
+      : "the Role-based multi-factor authentication criteria record is active";
+    const perUser = userEnforced ? `; all ${admins.length} admin users also carry enable_multifactor_authn` : "";
     if (emailOtp.exists && asBoolean(emailOtp.value) === true) {
       return {
         status: "warn",
-        summary: `Platform MFA is enabled for all ${admins.length} admin users, but email OTP is enabled as a factor; ServiceNow hardening guidance treats email as a weak factor.`,
+        summary: `MFA is enforced for administrators (${enforcement}${perUser}), but email OTP is enabled as a factor; ServiceNow hardening guidance treats email as a weak factor.`,
         evidence,
       };
     }
     return {
       status: "pass",
-      summary: `glide.authenticate.multifactor=true and all ${admins.length} admin users carry enable_multifactor_authn=true.`,
+      summary: `glide.authenticate.multifactor=true and MFA is enforced for administrators: ${enforcement}${perUser}.`,
       evidence,
     };
   });
@@ -2499,6 +2567,7 @@ const ACCESS_SURFACES: Array<{ name: string; table: string }> = [
   { name: "ldap_servers", table: "ldap_server_config" },
   { name: "certificates", table: "sys_certificate" },
   { name: "oauth_entities", table: "oauth_entity" },
+  { name: "mfa_criteria", table: MFA_CRITERIA_TABLE },
   { name: "audit", table: "sys_audit" },
   { name: "transaction_logs", table: "syslog_transaction" },
   { name: "update_sets", table: "sys_update_set" },
@@ -2808,6 +2877,7 @@ export async function exportServicenowAuditBundle(
     ["core_data/ldap_server_config.json", identityData.ldapServers],
     ["core_data/sys_certificate.json", identityData.certificates],
     ["core_data/oauth_entity.json", identityData.oauthEntities],
+    ["core_data/multi_factor_criteria.json", identityData.mfaCriteria],
     ["core_data/sys_properties_hardening.json", hardeningData.properties],
     ["core_data/sys_properties_debug.json", hardeningData.debugProperties],
     ["core_data/sys_script_eval.json", hardeningData.evalScripts],

@@ -14,7 +14,7 @@ The tools cover the twenty security controls in `specs/servicenow-sec-inspector.
 - Access control: ACL rule completeness (wildcard, unrestricted, and public page exposure) and table-level ACL coverage for sensitive tables
 - Operations governance: encryption at rest, audit logging, update set management, MID Server security, plugin inventory
 
-Tables read: `sys_user`, `sys_user_has_role`, `sys_user_role`, `sys_user_role_contains`, `sys_properties`, `password_policy`, `sso_properties`, `ldap_server_config`, `sys_certificate`, `oauth_entity`, `sys_security_acl`, `sys_security_acl_role`, `sys_public`, `sys_script`, `ip_access` (IP Address Access Controls, present once `com.snc.ipauthenticator` is active), `sys_email_account`, `sys_encryption_context`, `sys_dictionary`, `sys_audit` (count only), `syslog_transaction` (count only), `sys_update_set`, `sys_update_xml`, `sys_user_session` (access probe), `ecc_agent`, and `sys_plugins`.
+Tables read: `sys_user`, `sys_user_has_role`, `sys_user_role`, `sys_user_role_contains`, `sys_properties`, `password_policy`, `sso_properties`, `ldap_server_config`, `sys_certificate`, `oauth_entity`, `multi_factor_criteria`, `sys_security_acl`, `sys_security_acl_role`, `sys_public`, `sys_script`, `ip_access` (IP Address Access Controls, present once `com.snc.ipauthenticator` is active), `sys_email_account`, `sys_encryption_context`, `sys_dictionary`, `sys_audit` (count only), `syslog_transaction` (count only), `sys_update_set`, `sys_update_xml`, `sys_user_session` (access probe), `ecc_agent`, and `sys_plugins`.
 
 ## Setup and authentication
 
@@ -53,7 +53,7 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 
 | Tool | Purpose |
 | --- | --- |
-| `servicenow_check_access` | Probes 25 audit tables with a one-row Table API read plus an Aggregate API count and reports each as `readable`, `forbidden`, `acl_filtered`, or `not_readable`. An aggregate count above zero with no rows returned is reported as ACL-filtered. |
+| `servicenow_check_access` | Probes 26 audit tables with a one-row Table API read plus an Aggregate API count and reports each as `readable`, `forbidden`, `acl_filtered`, or `not_readable`. An aggregate count above zero with no rows returned is reported as ACL-filtered. |
 | `servicenow_assess_identity_access` | Controls 3, 4, 6, 7, 8, 14. Options: `inactive_days` (90), `min_password_length` (12), `cert_expiry_warn_days` (30), `max_admins` (10), `record_limit` (10000). |
 | `servicenow_assess_platform_hardening` | Controls 1, 5, 12, 13, 16, 17, 18. Options: `max_session_timeout_minutes` (60), `record_limit`. |
 | `servicenow_assess_access_control` | Controls 2 and 11. Option: `record_limit`. |
@@ -81,7 +81,7 @@ Rows without a date (`last_login_time`, `expires`) are bucketed separately and n
 | 4 | User access review | identity_access | SNOW-04 | manual on zero users or zero admin assignments; fail on stale admins or admin count above `max_admins`; warn on inactive users, users without a login date, or stacked privileged roles |
 | 5 | Session timeout configuration | platform_hardening | SNOW-05 | fail above `max_session_timeout_minutes`; warn when the property is absent (fallback of 30 minutes is not assumed) or rotation is off |
 | 6 | Password policy enforcement | identity_access | SNOW-06 | fail when `glide.enable.password_policy=false`, no policy row is visible, or a policy is weaker than the threshold; warn when the property row is absent |
-| 7 | MFA enforcement | identity_access | SNOW-07 | fail when `glide.authenticate.multifactor` is false or absent (documented default is false); warn when admins lack `enable_multifactor_authn` or email OTP is enabled |
+| 7 | MFA enforcement | identity_access | SNOW-07 | fail when `glide.authenticate.multifactor` is false or absent (documented default is false), or when the Role-based multi-factor authentication record in `multi_factor_criteria` is inactive and admins lack `enable_multifactor_authn`; manual when `multi_factor_criteria` is forbidden or returns no rows (the baseline record always exists); warn when the active role-based record does not list `admin` and `security_admin` while admins lack the per-user flag, when only per-user flags enforce MFA, or when email OTP is enabled; pass when the role-based record is active and covers both roles (or every admin carries the per-user flag) |
 | 8 | LDAP/SSO integration | identity_access | SNOW-08 | fail with no active SSO provider or LDAP server, or an expired certificate; warn when Multi-Provider SSO or the default redirect IdP is not set or certificates expire soon |
 | 9 | Encryption at rest | operations_governance | SNOW-09 | always manual: encryption contexts and encrypted dictionary fields are inventoried, but coverage and licensing (CLE Enterprise, Cloud Encryption, Edge Encryption) are not exposed through the API |
 | 10 | Audit logging configuration | operations_governance | SNOW-10 | fail when a critical table is not audited or `sys_audit` received zero rows in 7 days; otherwise manual because retention is not exposed through the API |
@@ -116,6 +116,7 @@ The script prints a skip message and exits 0 when no ServiceNow configuration is
 - `sysparm_limit` is applied before ACL evaluation, so a page can legitimately return fewer rows than requested. Pagination follows `Link rel="next"` to completion or records truncation at `record_limit` and downgrades the verdict.
 - Rate limiting (429 with `Retry-After`) and 5xx responses are retried with backoff up to `max_retries`.
 - Instance Security Center hardening scores, Instance Scan results, Edge Encryption, DKIM configuration, MID Server mutual authentication, and audit retention are not read; the corresponding findings state the evidence to collect.
+- MFA enforcement is read from the Role-based multi-factor authentication record in `multi_factor_criteria` (Active flag and its Multi-factor Roles list, when the Table API returns it) plus `sys_user.enable_multifactor_authn`. Adaptive authentication MFA policies are not read; when the roles list is not returned, enforcement falls back to the per-user flags and the finding says so.
 - Mutual TLS is not supported by the runtime's HTTP client.
 
 ## Official documentation
@@ -125,6 +126,7 @@ The script prints a skip message and exits 0 when no ServiceNow configuration is
 - OAuth client credentials grant workflow: https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html
 - OAuth Application User for client credentials: https://www.servicenow.com/docs/r/platform-security/authentication/add-oauth-application-user.html
 - MFA system properties: https://www.servicenow.com/docs/r/platform-security/authentication/mfa-properties.html
+- Role-based multi-factor authentication (`multi_factor_criteria`): https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-role-based-multi-factor-authentication.html
 - Email OTP for multi-factor authentication (`glide.authenticate.multifactor.email.otp.enabled`): https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-enable-email-otp-for-multi-factor-authentication.html
 - Password policy properties: https://www.servicenow.com/docs/r/platform-security/authentication/password-policy-properties.html
 - High Security Settings: https://www.servicenow.com/docs/r/platform-security/exploring-high-security-settings.html
