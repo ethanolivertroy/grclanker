@@ -36,7 +36,7 @@ const DEFAULT_LIST_LIMIT = 1000;
 const DEFAULT_USER_LIMIT = 1000;
 const DEFAULT_TEAM_LIMIT = 50;
 const DEFAULT_SCHEDULE_LIMIT = 50;
-const DEFAULT_AUDIT_LIMIT = 2000;
+export const DEFAULT_AUDIT_LIMIT = 2000;
 const DEFAULT_MAX_ADMINS = 5;
 const DEFAULT_COVERAGE_DAYS = 30;
 const DEFAULT_AUDIT_WINDOW_DAYS = 30;
@@ -2796,6 +2796,13 @@ const limitParams = {
   service_limit: Type.Optional(Type.Number({ description: "Maximum services to inspect. Defaults to 1000.", default: 1000 })),
 };
 
+function auditLimitParam() {
+  return Type.Optional(Type.Number({
+    description: `Maximum recent audit records to fetch. Defaults to ${DEFAULT_AUDIT_LIMIT}.`,
+    default: DEFAULT_AUDIT_LIMIT,
+  }));
+}
+
 function runAssessmentTool(
   pi: any,
   name: string,
@@ -2881,7 +2888,7 @@ export function registerPagerdutyTools(pi: any): void {
     "Assess PagerDuty audit logging (spec controls 11-13): audit record availability, retention against the documented 12 months, and API key rotation evidence derived from audit record token usage.",
     {
       audit_window_days: Type.Optional(Type.Number({ description: "Recent audit window in days (maximum 31 per the API). Defaults to 30.", default: 30 })),
-      audit_limit: Type.Optional(Type.Number({ description: "Maximum recent audit records to fetch. Defaults to 500.", default: 500 })),
+      audit_limit: auditLimitParam(),
       min_retention_days: Type.Optional(Type.Number({ description: "Required audit retention in days. Defaults to 365.", default: 365 })),
       api_key_max_age_days: Type.Optional(Type.Number({ description: "Maximum acceptable API key age in days for the manual rotation review. Defaults to 90.", default: 90 })),
     },
@@ -2914,7 +2921,7 @@ export function registerPagerdutyTools(pi: any): void {
       schedule_limit: Type.Optional(Type.Number({ description: "Maximum schedules to render. Defaults to 50.", default: 50 })),
       coverage_days: Type.Optional(Type.Number({ description: "Days ahead to check final-schedule coverage. Defaults to 30.", default: 30 })),
       audit_window_days: Type.Optional(Type.Number({ description: "Recent audit window in days (maximum 31). Defaults to 30.", default: 30 })),
-      audit_limit: Type.Optional(Type.Number({ description: "Maximum recent audit records to fetch. Defaults to 500.", default: 500 })),
+      audit_limit: auditLimitParam(),
       min_retention_days: Type.Optional(Type.Number({ description: "Required audit retention in days. Defaults to 365.", default: 365 })),
       api_key_max_age_days: Type.Optional(Type.Number({ description: "Maximum acceptable API key age in days. Defaults to 90.", default: 90 })),
       business_service_limit: Type.Optional(Type.Number({ description: "Maximum business services whose dependencies are fetched. Defaults to 50.", default: 50 })),

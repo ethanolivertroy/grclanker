@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  DEFAULT_AUDIT_LIMIT,
   PAGERDUTY_CONTROLS,
   PagerdutyApiClient,
   assessPagerdutyAccessControl,
@@ -23,6 +24,7 @@ import {
   collectionOf,
   exportPagerdutyAuditBundle,
   findingId,
+  registerPagerdutyTools,
   resolvePagerdutyConfiguration,
   resolveSecureOutputPath,
   runPagerdutyAccessControlAssessment,
@@ -1650,6 +1652,23 @@ test("review fix 1: PD-10 counts only triggers with is_disabled false and treats
   assert.equal(findingById(verified, 10).evidence.triggers_missing_is_disabled_flag, 0);
   assert.equal(verified.summary.workflow_triggers_seen, 2);
   assert.equal(verified.summary.enabled_workflow_triggers, 1);
+});
+
+test("review fix 2: audit_limit tool parameter, DEFAULT_AUDIT_LIMIT, and the integration guide agree", () => {
+  assert.equal(DEFAULT_AUDIT_LIMIT, 2000);
+  const registered = [];
+  registerPagerdutyTools({ registerTool: (tool) => registered.push(tool) });
+  const withAuditLimit = registered.filter((tool) => tool.parameters.properties.audit_limit);
+  assert.deepEqual(withAuditLimit.map((tool) => tool.name).sort(), ["pagerduty_assess_audit_logging", "pagerduty_export_audit_bundle"]);
+  for (const tool of withAuditLimit) {
+    const param = tool.parameters.properties.audit_limit;
+    assert.equal(param.default, DEFAULT_AUDIT_LIMIT, `${tool.name} audit_limit default`);
+    assert.match(param.description, new RegExp(`Defaults to ${DEFAULT_AUDIT_LIMIT}\\.`), `${tool.name} audit_limit description`);
+    assert.doesNotMatch(param.description, /500/, `${tool.name} audit_limit description still mentions 500`);
+  }
+  const guide = readFileSync(new URL("../../src/content/docs/docs/integrations/pagerduty.md", import.meta.url), "utf8");
+  assert.match(guide, new RegExp("`audit_limit` \\(default " + DEFAULT_AUDIT_LIMIT + "\\)"));
+  assert.doesNotMatch(guide, /audit_limit[^\n]*default 500/);
 });
 
 test("exportPagerdutyAuditBundle writes core data, analysis, compliance reports, and archive", async () => {
