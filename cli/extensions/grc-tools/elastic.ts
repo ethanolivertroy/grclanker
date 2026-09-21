@@ -43,6 +43,7 @@ const DEFAULT_CERT_EXPIRY_WARNING_DAYS = 30;
 const DEFAULT_MAX_SUPERUSERS = 2;
 const DEFAULT_MAX_ENROLLMENT_KEYS_PER_POLICY = 3;
 const MINIMUM_TLS_PROTOCOLS = new Set(["TLSv1.2", "TLSv1.3"]);
+const DEFAULT_TLS_SUPPORTED_PROTOCOLS = "TLSv1.3,TLSv1.2,TLSv1.1 (TLSv1.2,TLSv1.1 when the JVM lacks TLSv1.3)";
 const SECURE_REALM_TYPES = new Set(["ldap", "active_directory", "pki", "saml", "kerberos", "oidc", "jwt"]);
 const SSO_REALM_TYPES = new Set(["saml", "oidc"]);
 const PLATINUM_REALM_TYPES = new Set(["saml", "oidc", "kerberos", "jwt"]);
@@ -55,6 +56,7 @@ const LICENSE_RANK: Record<string, number> = {
   enterprise: 4,
   trial: 4,
 };
+const ACTIVE_LICENSE_STATUSES = new Set(["active", "valid"]);
 const REQUIRED_AUDIT_EVENTS = ["authentication_failed", "access_denied", "security_config_change"];
 const REQUIRED_CLUSTER_PRIVILEGES = [
   "monitor",
@@ -1442,7 +1444,7 @@ function licenseState(license: JsonRecord | undefined): { type?: string; status?
   const type = asString(info?.type)?.toLowerCase();
   const status = asString(info?.status)?.toLowerCase();
   const rank = type ? LICENSE_RANK[type] : undefined;
-  return { type, status, rank, active: status === undefined ? undefined : status === "active" };
+  return { type, status, rank, active: status === undefined ? undefined : ACTIVE_LICENSE_STATUSES.has(status) };
 }
 
 function licenseSupports(state: ReturnType<typeof licenseState>, requiredRank: number): boolean | undefined {
@@ -2145,6 +2147,32 @@ function perNodeBooleans(view: SettingsView, key: string): Array<{ node: string;
   return view.perNode(key).map((entry) => ({ node: entry.node, value: asBoolean(entry.value) }));
 }
 
+const AUDIT_ENABLED_KEY = "xpack.security.audit.enabled";
+
+interface AuditEnabledResolution {
+  clusterLevel: boolean | undefined;
+  clusterLevelSource: "transient" | "persistent" | undefined;
+  perNode: Array<{ node: string; nodeValue: boolean | undefined; effective: boolean | undefined; source: string }>;
+}
+
+function resolveAuditEnabled(view: SettingsView): AuditEnabledResolution {
+  const transient = asBoolean(view.transient[AUDIT_ENABLED_KEY]);
+  const persistent = asBoolean(view.persistent[AUDIT_ENABLED_KEY]);
+  const clusterLevel = transient ?? persistent;
+  const clusterLevelSource = transient !== undefined ? "transient" : persistent !== undefined ? "persistent" : undefined;
+  const defaultValue = asBoolean(view.defaults[AUDIT_ENABLED_KEY]);
+  const perNode = perNodeBooleans(view, AUDIT_ENABLED_KEY).map((entry) => {
+    if (clusterLevel !== undefined) {
+      return { node: entry.node, nodeValue: entry.value, effective: clusterLevel, source: `${clusterLevelSource} cluster settings` };
+    }
+    if (entry.value !== undefined) {
+      return { node: entry.node, nodeValue: entry.value, effective: entry.value, source: "node settings" };
+    }
+    return { node: entry.node, nodeValue: undefined, effective: defaultValue, source: defaultValue === undefined ? "unset" : "cluster defaults" };
+  });
+  return { clusterLevel, clusterLevelSource, perNode };
+}
+
 function evaluateTlsLayer(
   number: number,
   layer: "transport" | "http",
@@ -2240,28 +2268,36 @@ export function evaluateElasticTransportSecurity(
     protocols: Object.fromEntries(protocolKeys.map((key) => [key, asStringList(node.settings[key])])),
   }));
   const weakProtocols = [...new Set(perNodeProtocols.flatMap((entry) => Object.values(entry.protocols).flat()).filter((protocol) => !MINIMUM_TLS_PROTOCOLS.has(protocol)))];
-  const unsafeDefaultNodes = perNodeProtocols
-    .filter((entry) => Object.values(entry.protocols).some((list) => list.length === 0) && (entry.major === null || entry.major < 8))
-    .map((entry) => entry.node);
+  const unsetProtocolNodes = perNodeProtocols
+    .map((entry) => ({ node: entry.node, unset_keys: protocolKeys.filter((key) => entry.protocols[key].length === 0) }))
+    .filter((entry) => entry.unset_keys.length > 0);
   const majors = nodeMajorVersions(view);
   const tlsCeiling = statusCeiling(transportFinding.status, httpFinding.status);
   const protocolComputed: Verdict = weakProtocols.length > 0
     ? { status: "fail", summary: `Supported TLS protocols include versions below TLSv1.2: ${weakProtocols.join(", ")}.` }
     : tlsCeiling === "fail"
       ? { status: "fail", summary: "TLS is not enforced on every layer (see ELASTIC-02 and ELASTIC-03), so no minimum protocol version applies to the unencrypted traffic." }
-      : unsafeDefaultNodes.length > 0
-        ? { status: "warn", summary: `supported_protocols is not explicitly set on every layer for ${unsafeDefaultNodes.join(", ")}, which run Elasticsearch 7.x or an unknown version whose defaults can include TLSv1.1.` }
+      : unsetProtocolNodes.length > 0
+        ? {
+          status: "warn",
+          summary: `supported_protocols is not explicitly set on ${unsetProtocolNodes.map((entry) => `${entry.node} (${entry.unset_keys.map((key) => key.replace("xpack.security.", "").replace(".ssl.supported_protocols", "")).join(" and ")} layer)`).join(", ")}; the documented default is ${DEFAULT_TLS_SUPPORTED_PROTOCOLS}, which permits TLSv1.1, so the TLSv1.2 floor is not enforced until the setting is restricted explicitly.`,
+        }
         : tlsCeiling !== "pass"
           ? { status: statusCeiling("warn", tlsCeiling === "manual" ? "manual" : "warn"), summary: `TLS protocol settings are TLSv1.2 or newer on every node, but TLS enforcement itself is ${tlsCeiling} (see ELASTIC-02 and ELASTIC-03), so the protocol floor is not confirmed effective.` }
           : {
             status: "pass",
-            summary: perNodeProtocols.every((entry) => Object.values(entry.protocols).every((list) => list.length > 0))
-              ? `Supported TLS protocols are explicitly restricted to ${[...new Set(perNodeProtocols.flatMap((entry) => Object.values(entry.protocols).flat()))].join(", ")} on all ${perNodeProtocols.length} node(s).`
-              : `Every node runs Elasticsearch 8.x, whose documented default supported_protocols is TLSv1.3 and TLSv1.2, and no node configures a weaker protocol (explicit settings: ${perNodeProtocols.filter((entry) => Object.values(entry.protocols).every((list) => list.length > 0)).length}/${perNodeProtocols.length} nodes).`,
+            summary: `Supported TLS protocols are explicitly restricted to ${[...new Set(perNodeProtocols.flatMap((entry) => Object.values(entry.protocols).flat()))].join(", ")} on both layers of all ${perNodeProtocols.length} node(s).`,
           };
   findings.push(guardedFinding(4, "high", {
     ...protocolComputed,
-    evidence: { protocols_per_node: perNodeProtocols, weak_protocols: weakProtocols, node_major_versions: majors, tls_enforcement_status: tlsCeiling },
+    evidence: {
+      protocols_per_node: perNodeProtocols,
+      weak_protocols: weakProtocols,
+      unset_supported_protocols: unsetProtocolNodes,
+      documented_default: DEFAULT_TLS_SUPPORTED_PROTOCOLS,
+      node_major_versions: majors,
+      tls_enforcement_status: tlsCeiling,
+    },
   }, settingsGuard("xpack.security.transport.ssl.supported_protocols and xpack.security.http.ssl.supported_protocols from elasticsearch.yml on every node.")));
 
   const inventory = (certificates ?? []).map((certificate) => {
@@ -2321,6 +2357,7 @@ export function evaluateElasticTransportSecurity(
 
 const DEFAULT_AUDIT_INCLUDE = [
   "access_denied",
+  "access_granted",
   "anonymous_access_denied",
   "authentication_failed",
   "connection_denied",
@@ -2428,10 +2465,10 @@ export function evaluateElasticClusterHardening(
   const licenseProblems = dependencyProblems(snapshot, ["license"]);
   const security = securityEnabledState(view, usage, xpackInfo);
 
-  const auditPerNode = perNodeBooleans(view, "xpack.security.audit.enabled");
-  const auditEnabledNodes = auditPerNode.filter((entry) => entry.value === true).map((entry) => entry.node);
-  const auditDisabledNodes = auditPerNode.filter((entry) => entry.value !== true).map((entry) => entry.node);
-  const auditEnabled = auditPerNode.length > 0 && auditDisabledNodes.length === 0;
+  const audit = resolveAuditEnabled(view);
+  const auditEnabledNodes = audit.perNode.filter((entry) => entry.effective === true).map((entry) => entry.node);
+  const auditDisabledNodes = audit.perNode.filter((entry) => entry.effective !== true).map((entry) => entry.node);
+  const auditEnabled = audit.perNode.length > 0 && auditDisabledNodes.length === 0;
   const auditLicense = licenseSupports(license, LICENSE_RANK.gold);
   const includeSetting = asStringList(view.get("xpack.security.audit.logfile.events.include"));
   const excludeSetting = asStringList(view.get("xpack.security.audit.logfile.events.exclude"));
@@ -2439,7 +2476,10 @@ export function evaluateElasticClusterHardening(
   const missingEvents = REQUIRED_AUDIT_EVENTS.filter((event) => !effectiveInclude.includes(event));
   const auditOutputs = asStringList(getNestedValue(usage, ["security", "audit", "outputs"]));
   const auditEvidence: JsonRecord = {
-    per_node: auditPerNode.map((entry) => ({ node: entry.node, value: entry.value ?? null })),
+    setting: AUDIT_ENABLED_KEY,
+    cluster_level_value: audit.clusterLevel ?? null,
+    cluster_level_source: audit.clusterLevelSource ?? null,
+    per_node: audit.perNode.map((entry) => ({ node: entry.node, node_value: entry.nodeValue ?? null, effective: entry.effective ?? null, source: entry.source })),
     enabled_nodes: auditEnabledNodes,
     disabled_or_unset_nodes: auditDisabledNodes,
     usage_reported_enabled: usageFlag(usage, ["audit", "enabled"]) ?? null,
@@ -2454,9 +2494,12 @@ export function evaluateElasticClusterHardening(
   const auditGuard: VerdictGuard = {
     problems: [...settingsProblems, ...licenseProblems],
     partial: nodeNotes,
-    collect: "xpack.security.audit.* settings from elasticsearch.yml on every node, the license tier (GET /_license), and a sample of <cluster>_audit.json.",
+    collect: "xpack.security.audit.* settings from the cluster settings API (transient and persistent) and elasticsearch.yml on every node, the license tier (GET /_license), and a sample of <cluster>_audit.json.",
   };
   const auditOff = settingsProblems.length === 0 && !auditEnabled;
+  const auditSourceLabel = audit.clusterLevelSource
+    ? `${audit.clusterLevelSource} cluster settings`
+    : "node settings";
   findings.push(guardedFinding(11, "high", {
     status: auditOff || security.enabled === false || auditLicense === false
       ? "fail"
@@ -2467,7 +2510,9 @@ export function evaluateElasticClusterHardening(
       ? "xpack.security.enabled is false, so security audit logging cannot record authentication or authorization events."
       : auditOff
         ? auditEnabledNodes.length === 0
-          ? "xpack.security.audit.enabled is not explicitly true on any inspected node (the documented default is false), so security audit logging is disabled."
+          ? audit.clusterLevel === false
+            ? `xpack.security.audit.enabled is false in ${auditSourceLabel}, which overrides elasticsearch.yml on every node, so security audit logging is disabled.`
+            : "xpack.security.audit.enabled is not true in transient or persistent cluster settings or on any inspected node (the documented default is false), so security audit logging is disabled."
           : `Audit logging is enabled on ${auditEnabledNodes.join(", ")} but disabled or unset on ${auditDisabledNodes.join(", ")}, so events on those nodes are not recorded.`
         : auditLicense === false
           ? `xpack.security.audit.enabled is true but the ${license.type ?? "current"} license (status ${license.status ?? "unknown"}) does not include audit logging, so no audit trail is produced.`
@@ -2475,7 +2520,7 @@ export function evaluateElasticClusterHardening(
             ? `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) but the effective event include list omits ${missingEvents.join(", ")}.`
             : security.enabled === undefined
               ? `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) but xpack.security.enabled was not visible, so enforcement could not be confirmed.`
-              : `Audit logging is explicitly enabled on all ${auditEnabledNodes.length} node(s) with authentication_failed, access_denied, and security_config_change events included (${license.type} license supports audit logging).`,
+              : `Audit logging is enabled on all ${auditEnabledNodes.length} node(s) via ${auditSourceLabel} with authentication_failed, access_denied, and security_config_change events included (${license.type} license supports audit logging).`,
     evidence: { ...auditEvidence, missing_required_events: missingEvents },
   }, auditGuard));
   findings.push(auditOff || security.enabled === false

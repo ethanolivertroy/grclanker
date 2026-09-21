@@ -1726,7 +1726,7 @@ test("verdict rule 6: every enabling flag is read, absent or false flags never s
   delete noAudit.nodeSettings.nodes["node-1"].settings["xpack.security.audit.enabled"];
   const noAuditResult = await assessElasticClusterHardening(stubClient(noAudit));
   assert.equal(findingById(noAuditResult, "ELASTIC-11").status, "fail");
-  assert.match(findingById(noAuditResult, "ELASTIC-11").summary, /not explicitly true on any inspected node \(the documented default is false\)/);
+  assert.match(findingById(noAuditResult, "ELASTIC-11").summary, /not true in transient or persistent cluster settings or on any inspected node \(the documented default is false\)/);
   assert.equal(findingById(noAuditResult, "ELASTIC-12").status, "fail");
 
   const disabledRealm = healthyFixtures(now);
@@ -1896,6 +1896,158 @@ test("false-pass self-check (c): capped, truncated, or privilege-limited invento
       `${item.id} warn must explain the partial view: ${item.summary}`,
     );
   }
+});
+
+test("review fix 1: ELASTIC-04 warns when supported_protocols is unset on an 8.x node and names the documented default", async () => {
+  const documentedDefault = "TLSv1.3,TLSv1.2,TLSv1.1 (TLSv1.2,TLSv1.1 when the JVM lacks TLSv1.3)";
+
+  const httpUnset = healthyFixtures();
+  delete httpUnset.nodeSettings.nodes["node-1"].settings["xpack.security.http.ssl.supported_protocols"];
+  const httpResult = await assessElasticTransportSecurity(stubClient(httpUnset));
+  const httpFinding = findingById(httpResult, "ELASTIC-04");
+  assert.equal(httpFinding.status, "warn", "an unset supported_protocols on an 8.x node must not pass");
+  assert.match(httpFinding.summary, /supported_protocols is not explicitly set on es-1 \(http layer\)/);
+  assert.match(httpFinding.summary, /the documented default is TLSv1\.3,TLSv1\.2,TLSv1\.1 \(TLSv1\.2,TLSv1\.1 when the JVM lacks TLSv1\.3\), which permits TLSv1\.1/);
+  assert.deepEqual(httpFinding.evidence.unset_supported_protocols, [{ node: "es-1", unset_keys: ["xpack.security.http.ssl.supported_protocols"] }]);
+  assert.equal(httpFinding.evidence.documented_default, documentedDefault);
+  assert.deepEqual(httpFinding.evidence.node_major_versions, [8]);
+  assert.deepEqual(httpFinding.evidence.weak_protocols, []);
+
+  const bothUnset = healthyFixtures();
+  delete bothUnset.nodeSettings.nodes["node-1"].settings["xpack.security.http.ssl.supported_protocols"];
+  delete bothUnset.nodeSettings.nodes["node-1"].settings["xpack.security.transport.ssl.supported_protocols"];
+  const bothResult = await assessElasticTransportSecurity(stubClient(bothUnset));
+  assert.equal(findingById(bothResult, "ELASTIC-04").status, "warn");
+  assert.match(findingById(bothResult, "ELASTIC-04").summary, /es-1 \(transport and http layer\)/);
+  assert.ok(!/8\.x/.test(findingById(bothResult, "ELASTIC-04").summary), "the verdict must not rest on the node major version");
+
+  const legacy = healthyFixtures();
+  legacy.nodeSettings.nodes["node-1"].version = "7.17.0";
+  delete legacy.nodeSettings.nodes["node-1"].settings["xpack.security.http.ssl.supported_protocols"];
+  const legacyResult = await assessElasticTransportSecurity(stubClient(legacy));
+  assert.equal(findingById(legacyResult, "ELASTIC-04").status, "warn");
+  assert.equal(findingById(legacyResult, "ELASTIC-04").summary, httpFinding.summary, "7.x and 8.x produce the same verdict and wording for an unset value");
+
+  const explicit = await assessElasticTransportSecurity(stubClient(healthyFixtures()));
+  assert.equal(findingById(explicit, "ELASTIC-04").status, "pass");
+  assert.match(findingById(explicit, "ELASTIC-04").summary, /explicitly restricted to TLSv1\.3, TLSv1\.2 on both layers of all 1 node\(s\)/);
+  assert.deepEqual(findingById(explicit, "ELASTIC-04").evidence.unset_supported_protocols, []);
+});
+
+test("review fix 2: a license reporting status valid is treated as active alongside active", async () => {
+  const now = Date.now();
+  const valid = healthyFixtures(now);
+  valid.spaces = [valid.spaces[0]];
+  valid.license.license.status = "valid";
+
+  const hardening = await assessElasticClusterHardening(stubClient(valid));
+  assert.equal(findingById(hardening, "ELASTIC-23").status, "pass", "a valid platinum license must not fail as inactive");
+  assert.match(findingById(hardening, "ELASTIC-23").summary, /platinum license is active/);
+  assert.equal(findingById(hardening, "ELASTIC-23").evidence.status, "valid");
+  assert.equal(findingById(hardening, "ELASTIC-11").status, "pass");
+  assert.equal(findingById(hardening, "ELASTIC-11").evidence.license_supports_audit, true);
+  const identity = await assessElasticIdentity(stubClient(valid));
+  assert.equal(findingById(identity, "ELASTIC-13").status, "pass");
+  const access = await assessElasticAccessControl(stubClient(valid), { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] });
+  assert.equal(findingById(access, "ELASTIC-07").status, "pass");
+  assert.equal(findingById(access, "ELASTIC-07").evidence.license_supports_feature, true);
+  assert.equal(findingById(access, "ELASTIC-08").status, "pass");
+  assert.equal(hardening.summary.license_status, "valid");
+
+  for (const status of ["invalid", "expired"]) {
+    const inactive = healthyFixtures(now);
+    inactive.license.license.status = status;
+    const inactiveHardening = await assessElasticClusterHardening(stubClient(inactive));
+    assert.equal(findingById(inactiveHardening, "ELASTIC-23").status, "fail", `${status} is not an active status`);
+    assert.match(findingById(inactiveHardening, "ELASTIC-23").summary, new RegExp(`license status is ${status}`));
+    assert.equal(findingById(inactiveHardening, "ELASTIC-11").status, "fail");
+  }
+
+  const upper = healthyFixtures(now);
+  upper.license.license.status = "VALID";
+  assert.equal(findingById(await assessElasticClusterHardening(stubClient(upper)), "ELASTIC-23").status, "pass", "status comparison is case-insensitive");
+});
+
+test("review fix 3: xpack.security.audit.enabled honors transient and persistent cluster settings over node settings", async () => {
+  const persistentOnly = healthyFixtures();
+  delete persistentOnly.nodeSettings.nodes["node-1"].settings["xpack.security.audit.enabled"];
+  persistentOnly.clusterSettings.persistent["xpack.security.audit.enabled"] = "true";
+  const persistentResult = await assessElasticClusterHardening(stubClient(persistentOnly));
+  const persistentFinding = findingById(persistentResult, "ELASTIC-11");
+  assert.equal(persistentFinding.status, "pass", "a persistent-only enablement is a valid runtime enablement");
+  assert.match(persistentFinding.summary, /enabled on all 1 node\(s\) via persistent cluster settings/);
+  assert.equal(persistentFinding.evidence.setting, "xpack.security.audit.enabled");
+  assert.equal(persistentFinding.evidence.cluster_level_value, true);
+  assert.equal(persistentFinding.evidence.cluster_level_source, "persistent");
+  assert.deepEqual(persistentFinding.evidence.per_node, [{ node: "es-1", node_value: null, effective: true, source: "persistent cluster settings" }]);
+  assert.deepEqual(persistentFinding.evidence.enabled_nodes, ["es-1"]);
+  assert.equal(findingById(persistentResult, "ELASTIC-12").status, "manual", "audit output stays a manual item, not a fail, when auditing is enabled at the cluster level");
+
+  const transientOverride = healthyFixtures();
+  transientOverride.clusterSettings.persistent["xpack.security.audit.enabled"] = "true";
+  transientOverride.clusterSettings.transient["xpack.security.audit.enabled"] = "false";
+  const transientResult = await assessElasticClusterHardening(stubClient(transientOverride));
+  const transientFinding = findingById(transientResult, "ELASTIC-11");
+  assert.equal(transientFinding.status, "fail", "a transient false overrides both persistent and elasticsearch.yml true");
+  assert.match(transientFinding.summary, /is false in transient cluster settings, which overrides elasticsearch\.yml on every node/);
+  assert.equal(transientFinding.evidence.cluster_level_source, "transient");
+  assert.deepEqual(transientFinding.evidence.per_node, [{ node: "es-1", node_value: true, effective: false, source: "transient cluster settings" }]);
+  assert.equal(findingById(transientResult, "ELASTIC-12").status, "fail");
+
+  const mixed = healthyFixtures();
+  mixed.nodeSettings._nodes = { total: 2, successful: 2, failed: 0 };
+  mixed.nodeSettings.nodes["node-2"] = {
+    name: "es-2",
+    version: "8.15.0",
+    settings: Object.fromEntries(Object.entries(mixed.nodeSettings.nodes["node-1"].settings).filter(([key]) => key !== "xpack.security.audit.enabled")),
+  };
+  const mixedResult = await assessElasticClusterHardening(stubClient(mixed));
+  const mixedFinding = findingById(mixedResult, "ELASTIC-11");
+  assert.equal(mixedFinding.status, "fail");
+  assert.match(mixedFinding.summary, /enabled on es-1 but disabled or unset on es-2/);
+  assert.deepEqual(mixedFinding.evidence.per_node, [
+    { node: "es-1", node_value: true, effective: true, source: "node settings" },
+    { node: "es-2", node_value: null, effective: null, source: "unset" },
+  ]);
+
+  const defaultsOnly = healthyFixtures();
+  delete defaultsOnly.nodeSettings.nodes["node-1"].settings["xpack.security.audit.enabled"];
+  defaultsOnly.clusterSettings.defaults["xpack.security.audit.enabled"] = "false";
+  const defaultsFinding = findingById(await assessElasticClusterHardening(stubClient(defaultsOnly)), "ELASTIC-11");
+  assert.equal(defaultsFinding.status, "fail");
+  assert.deepEqual(defaultsFinding.evidence.per_node, [{ node: "es-1", node_value: null, effective: false, source: "cluster defaults" }]);
+});
+
+test("review fix 5: the default audit include list contains access_granted and matches the documented nine events", async () => {
+  const documentedDefault = [
+    "access_denied",
+    "access_granted",
+    "anonymous_access_denied",
+    "authentication_failed",
+    "connection_denied",
+    "tampered_request",
+    "run_as_denied",
+    "run_as_granted",
+    "security_config_change",
+  ];
+
+  const defaults = healthyFixtures();
+  delete defaults.nodeSettings.nodes["node-1"].settings["xpack.security.audit.logfile.events.include"];
+  const defaultsFinding = findingById(await assessElasticClusterHardening(stubClient(defaults)), "ELASTIC-11");
+  assert.equal(defaultsFinding.status, "pass");
+  assert.deepEqual(defaultsFinding.evidence.events_include, []);
+  assert.deepEqual(defaultsFinding.evidence.effective_include, documentedDefault);
+  assert.deepEqual(defaultsFinding.evidence.missing_required_events, []);
+
+  const excluded = healthyFixtures();
+  delete excluded.nodeSettings.nodes["node-1"].settings["xpack.security.audit.logfile.events.include"];
+  excluded.nodeSettings.nodes["node-1"].settings["xpack.security.audit.logfile.events.exclude"] = ["access_granted", "run_as_granted"];
+  const excludedFinding = findingById(await assessElasticClusterHardening(stubClient(excluded)), "ELASTIC-11");
+  assert.equal(excludedFinding.status, "pass", "excluding access_granted does not remove a required event");
+  assert.deepEqual(excludedFinding.evidence.effective_include, documentedDefault.filter((event) => event !== "access_granted" && event !== "run_as_granted"));
+
+  const explicit = findingById(await assessElasticClusterHardening(stubClient(healthyFixtures())), "ELASTIC-11");
+  assert.deepEqual(explicit.evidence.effective_include, ["access_denied", "authentication_failed", "security_config_change", "run_as_denied"], "an explicit include list replaces the default rather than merging with it");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
