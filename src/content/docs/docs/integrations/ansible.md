@@ -14,7 +14,7 @@ The Ansible tool family inspects a Red Hat Ansible Automation Platform (AAP) con
 - OAuth2 tokens, organizations and their `admins/`, users with `is_superuser` and `is_system_auditor`, teams, and role assignments
 - Projects, execution environments, notification templates and deliveries, the activity stream, and the authentication, system, and logging settings categories
 
-Nothing is written to the controller. Secrets are masked by the API (`$encrypted$`) and the bundle never records the token or password used to authenticate.
+Nothing is written to the controller. The bundle never records the token or password used to authenticate, and it does not rely on the API's own `$encrypted$` masking: every `core_data/` snapshot is projected to the fields the verdicts read before it is written, and credential-bearing values are replaced by `[REDACTED]` at that step (see the bundle layout below).
 
 ## Setup and authentication
 
@@ -44,21 +44,23 @@ Required roles: grant the audit account the **System Auditor** role. A plain use
 
 `ansible_export_audit_bundle` writes to `./export/ansible-aap/<host>-ansible-aap-audit/` by default (override with `output_dir`). A rerun allocates `-2`, `-3`, and so on instead of overwriting, and the zip is named after the allocated directory.
 
-- `core_data/` raw API snapshots, one JSON file per endpoint, each recording whether the read was complete
+- `core_data/` projected API snapshots, one JSON file per endpoint, each recording whether the read was complete (`complete`, `total`, `truncation`) and the error when it was not readable
 - `analysis/` `findings.json`, `metadata.json`, and one JSON plus Markdown file per assessment
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and `compliance/<framework>/` reports for FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, and DISA STIG
 - `QUICK_REFERENCE.md` and `README.md`
 - `_errors.log`, written only when some reads failed but the bundle still completed
+
+Credentials never reach the bundle. Each snapshot keeps only the fields the controls read (ids, names, statuses, timestamps, flags, and `summary_fields` references), and the redaction step replaces with `[REDACTED]` the bodies of `extra_vars`, `extra_data`, inventory, group, and host `variables`, and `source_vars` (the variable names are kept so control 18 evidence stays reviewable), every credential `inputs` value, OAuth2 `token` and `refresh_token` values, survey question defaults, `notification_configuration` values (webhook URLs are reduced to scheme and host; header values and any `{name, value}` pair are redacted), the `AWX_TASK_ENV` and `GALAXY_TASK_ENV` dictionaries, activity stream `changes`, and any value under a credential-shaped key (`password`, `secret`, `token`, `key`, `passphrase`, `authorization`, and their camelCase and snake_case forms) in the authentication, system, and logging settings trees. Project `scm_url` values lose their userinfo and query string. Error messages keep only the structured `detail` of a failed response, never the raw body.
 
 ## Status semantics
 
 Every finding is `pass`, `warn`, `fail`, or `manual`.
 
 - `manual` means the API cannot prove the control on this deployment or with this account. The summary names the cause (a 403, a missing endpoint, an empty inventory that needs confirmation, a setting the version does not expose) and the evidence to collect from the controller UI.
-- An unreadable endpoint never yields `pass`.
+- An unreadable endpoint never yields `pass`. That holds for every inventory a finding reads, not only its primary one: when a secondary inventory answers 403 (the inventories list for control 22, the system settings for control 26, the notification deliveries for control 27, the job templates for control 13, a user or team role list for control 24), the finding is `warn` or `manual`, its summary names the unreadable read and what was not checked, and `evidence.partial_view` carries `<inventory>: unreadable (<endpoint>: <error>)`.
 - An empty inventory never yields `pass` by default. Each control states whether emptiness is `fail` (for example no jobs, no notification templates, no activity records) or `manual` (for example no hosts visible). The only control where an empty set is compliant by intent is control 20: no OAuth2 tokens means no long-lived API tokens to govern.
 - Items without a date (`finished`, `last_job_run`, `modified`, `created`, `next_run`, `last_updated`, `timestamp`) are never counted as fresh and cap the finding at `warn`.
-- A partial inventory (a list cap reached with a next page still available, or an account that is neither superuser nor system auditor) is recorded in `evidence.partial_view` and downgrades `pass` to `warn`.
+- A partial inventory (a list cap reached with a next page still available, a last page trimmed to the requested limit, a `next` link that repeats or arrives with an empty page, a `count` above the collected items, or an account that is neither superuser nor system auditor) is recorded in `evidence.partial_view` with seen versus total counts and downgrades `pass` to `warn`. The survey spec and error notification probes (50 templates each) report `<n> of <eligible> probed` the same way for controls 18 and 27.
 
 ## Control coverage
 
