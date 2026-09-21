@@ -41,17 +41,56 @@ const COMPUTE_TOOL_NAMES = ["bash", "read", "write", "edit", "ls", "find", "grep
 const WRITE_MARKER = /_(export|generate|collect|init|import|create|assemble)_/;
 // Registered domain tools on main after the batch 1 integration train; integrations only add to it.
 const BASELINE_DOMAIN_TOOL_COUNT = 219;
-// Writers that must stay classified as writes whatever else the registry gains.
+// Every writer registered when this floor was set. Integration PRs never edit it: new writers are
+// covered by the derived expectation below, and the list only changes when a writer is intentionally
+// renamed or removed, so renaming a writer onto a read verb (which would drop the approval gate) fails.
 const BASELINE_WRITE_TOOLS = [
+  "ansible_export_audit_bundle",
   "aws_export_audit_bundle",
+  "azure_export_audit_bundle",
+  "box_export_audit_bundle",
+  "cloudflare_export_audit_bundle",
+  "crowdstrike_export_audit_bundle",
+  "datadog_export_audit_bundle",
+  "duo_export_audit_bundle",
+  "elastic_export_audit_bundle",
   "fedramp_generate_ads_bundle",
+  "fedramp_generate_ads_site",
+  "gcp_export_audit_bundle",
+  "github_export_audit_bundle",
+  "gws_export_audit_bundle",
   "gws_ops_collect_evidence_bundle",
+  "knowbe4_export_audit_bundle",
+  "launchdarkly_export_audit_bundle",
+  "mulesoft_export_audit_bundle",
+  "oci_export_audit_bundle",
+  "okta_export_audit_bundle",
   "oscal_assemble_ssp",
   "oscal_create_model",
+  "oscal_generate_ssp_markdown",
   "oscal_import_model",
   "oscal_init_workspace",
+  "pagerduty_export_audit_bundle",
+  "paloalto_export_audit_bundle",
+  "salesforce_export_audit_bundle",
+  "servicenow_export_audit_bundle",
+  "slack_export_audit_bundle",
+  "snowflake_export_audit_bundle",
+  "splunk_export_audit_bundle",
+  "sumologic_export_audit_bundle",
+  "tenable_export_audit_bundle",
   "vanta_export_audit",
+  "veracode_export_audit_bundle",
+  "webex_export_audit_bundle",
+  "zendesk_export_audit_bundle",
+  "zoom_export_audit_bundle",
 ];
+
+/** Baseline writers that are no longer registered under a write classification. */
+function missingBaselineWriters(registeredNames) {
+  const registered = new Set(registeredNames);
+  return BASELINE_WRITE_TOOLS.filter((name) => !registered.has(name) || classifyGrcToolEffect(name) !== undefined);
+}
 
 function importAgentEntry(...segments) {
   return import(pathToFileURL(resolve(distAgentDir, ...segments)).href);
@@ -185,9 +224,7 @@ test("every registered tool is classified in the expected direction", () => {
 
   assert.deepEqual(undeclared, expectedWriteTools);
   assert.equal(read.length, names.length - expectedWriteTools.length);
-  for (const name of BASELINE_WRITE_TOOLS) {
-    assert.ok(expectedWriteTools.includes(name), `${name} must remain a registered write tool`);
-  }
+  assert.deepEqual(missingBaselineWriters(names), [], "every baseline writer must remain registered as a write tool");
   for (const name of names) {
     if (WRITE_MARKER.test(name)) {
       assert.equal(classifyGrcToolEffect(name), undefined, `${name} writes and must stay undeclared`);
@@ -195,6 +232,15 @@ test("every registered tool is classified in the expected direction", () => {
       assert.equal(classifyGrcToolEffect(name), "read", `${name} reads and must declare effect: "read"`);
     }
   }
+});
+
+test("renaming a baseline writer onto a read verb is caught", () => {
+  const names = listRegisteredGrcToolNames();
+  const renamed = names.map((name) => (name === "box_export_audit_bundle" ? "box_assess_audit_bundle" : name));
+
+  assert.equal(classifyGrcToolEffect("box_assess_audit_bundle"), "read", "the renamed tool would lose its approval gate");
+  assert.deepEqual(missingBaselineWriters(renamed), ["box_export_audit_bundle"]);
+  assert.deepEqual(missingBaselineWriters(names), []);
 });
 
 test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and the result envelope", async () => {
