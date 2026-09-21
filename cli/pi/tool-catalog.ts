@@ -62,6 +62,27 @@ export function resolveToolGroup(name: string): { group: string; kind: Registere
   return { group: match?.[1] ?? "Other Domain Tools", kind: "domain" };
 }
 
+/**
+ * Run the bundled extension against a registration-only ExtensionAPI stub and
+ * return every tool it registers, in registration order.
+ */
+export function collectRegisteredToolDefinitions(): ToolDefinition[] {
+  const registeredTools: ToolDefinition[] = [];
+
+  const api = {
+    registerTool(tool: ToolDefinition) {
+      registeredTools.push(tool);
+    },
+    on() {
+      return undefined;
+    },
+  } as unknown as ExtensionAPI;
+
+  grcTools(api);
+
+  return registeredTools;
+}
+
 function asObject(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
@@ -132,20 +153,7 @@ function getParameterSummaries(parameters: unknown): RegisteredToolParameter[] {
 }
 
 export function getRegisteredToolSummaries(): RegisteredToolSummary[] {
-  const registeredTools: ToolDefinition[] = [];
-
-  const api = {
-    registerTool(tool: ToolDefinition) {
-      registeredTools.push(tool);
-    },
-    on() {
-      return undefined;
-    },
-  } as unknown as ExtensionAPI;
-
-  grcTools(api);
-
-  return registeredTools.map((tool) => {
+  return collectRegisteredToolDefinitions().map((tool) => {
     const { group, kind } = resolveToolGroup(tool.name);
     return {
       name: tool.name,

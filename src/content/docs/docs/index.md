@@ -18,6 +18,7 @@ The current release starts with CMVP, KEV, EPSS, official FedRAMP GitHub-grounde
 - [Setup](/docs/getting-started/setup/) goes deeper on the local-first Ollama + Gemma 4 path and the hosted alternative.
 - [Configuration](/docs/getting-started/configuration/) documents `~/.grclanker/agent/settings.json`, `models.json`, and runtime state.
 - [Compute Backends](/docs/getting-started/compute-backends/) documents `host`, `sandbox-runtime`, Docker, and Parallels configuration plus validation commands.
+- [Cursor Agent SDK](/docs/getting-started/agent-sdk/) documents the `@cursor/july` run mode that exposes the same tools, workflow prompts, and personas as an Agent SDK agent.
 - [Quick Start](/docs/getting-started/quick-start/) is still available if you just want the shortest install → setup → first useful question sequence.
 
 ## Default Recommendation
