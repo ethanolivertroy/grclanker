@@ -689,6 +689,18 @@ function withUndatedItems(item: CrowdstrikeFinding, count: number, label: string
   };
 }
 
+function withUnreadableSecondary(item: CrowdstrikeFinding, dataset: string, errors: Array<string | undefined>, consequence: string): CrowdstrikeFinding {
+  const present = errors.filter((error): error is string => Boolean(error));
+  if (present.length === 0) return item;
+  const previous = asRecordArray(asObject(item.evidence)?.unreadable_secondary_reads);
+  return {
+    ...item,
+    status: item.status === "pass" ? "warn" : item.status,
+    summary: `${item.summary} The ${dataset} read failed (${present.join("; ")}), so ${consequence} and this verdict cannot exceed warn.`,
+    evidence: { ...(item.evidence ?? {}), unreadable_secondary_reads: [...previous, { dataset, errors: present }] },
+  };
+}
+
 function readJsonConfigFile(location: string): JsonRecord | undefined {
   if (!existsSync(location)) return undefined;
   const raw = readFileSync(location, "utf8");
@@ -1068,12 +1080,43 @@ export class CrowdstrikeApiClient {
         break;
       }
       if (opaqueCursor !== undefined) {
-        if (seenCursors.has(opaqueCursor)) break;
+        if (seenCursors.has(opaqueCursor)) {
+          moreAvailable = true;
+          break;
+        }
         seenCursors.add(opaqueCursor);
         offset = opaqueCursor;
         continue;
       }
       offset = (typeof offset === "number" ? offset : 0) + pageItems.length;
+    }
+
+    return pageOf(items.slice(0, limit), total, moreAvailable);
+  }
+
+  private async paginateAfter(
+    loadPage: (after: string | undefined, pageLimit: number) => Promise<JsonRecord>,
+    limit: number,
+    pageSize: number,
+  ): Promise<CrowdstrikePage<unknown>> {
+    const items: unknown[] = [];
+    let after: string | undefined;
+    let total: number | undefined;
+    let moreAvailable = false;
+
+    while (items.length < limit) {
+      const payload = await loadPage(after, Math.min(pageSize, limit - items.length));
+      const pageItems = asArray(payload.resources);
+      items.push(...pageItems);
+      const pagination = paginationOf(payload);
+      total = asNumber(pagination.total) ?? total;
+      const nextAfter = asString(pagination.after);
+      if (!nextAfter) break;
+      if (items.length >= limit || pageItems.length === 0 || nextAfter === after) {
+        moreAvailable = total === undefined || items.length < total;
+        break;
+      }
+      after = nextAfter;
     }
 
     return pageOf(items.slice(0, limit), total, moreAvailable);
@@ -1086,31 +1129,7 @@ export class CrowdstrikeApiClient {
   ): Promise<CrowdstrikePage<unknown>> {
     const limit = clampNumber(options.limit, DEFAULT_HOST_PAGE_SIZE, 1, 100_000);
     const pageSize = Math.min(clampNumber(options.pageSize, DEFAULT_HOST_PAGE_SIZE, 1, 10_000), limit);
-    const items: unknown[] = [];
-    let after: string | undefined;
-    let total: number | undefined;
-    let moreAvailable = false;
-
-    while (items.length < limit) {
-      const payload = await this.getJson(path, {
-        ...query,
-        limit: Math.min(pageSize, limit - items.length),
-        after,
-      });
-      const pageItems = asArray(payload.resources);
-      items.push(...pageItems);
-      const pagination = paginationOf(payload);
-      total = asNumber(pagination.total) ?? total;
-      const nextAfter = asString(pagination.after);
-      if (pageItems.length === 0 || !nextAfter || nextAfter === after) break;
-      if (items.length >= limit) {
-        moreAvailable = total === undefined || items.length < total;
-        break;
-      }
-      after = nextAfter;
-    }
-
-    return pageOf(items.slice(0, limit), total, moreAvailable);
+    return this.paginateAfter((after, pageLimit) => this.getJson(path, { ...query, limit: pageLimit, after }), limit, pageSize);
   }
 
   async getByIds(path: string, ids: string[], batchSize = DEFAULT_ID_BATCH_SIZE): Promise<JsonRecord[]> {
@@ -1143,7 +1162,8 @@ export class CrowdstrikeApiClient {
   private async listEntitiesBySinglePageQuery(queryPath: string, entityPath: string, query: JsonRecord = {}): Promise<CrowdstrikePage<JsonRecord>> {
     const payload = await this.getJson(queryPath, query);
     const ids = asStringArray(asArray(payload.resources));
-    const idPage = pageOf(ids, asNumber(paginationOf(payload).total), false);
+    const total = asNumber(paginationOf(payload).total);
+    const idPage = pageOf(ids, total, total === undefined);
     const entities = await this.getByIds(entityPath, ids);
     return recordPage(idPage, entities);
   }
@@ -1245,30 +1265,17 @@ export class CrowdstrikeApiClient {
   }
 
   async listAlerts(filter: string, limit = DEFAULT_ALERT_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
-    const items: JsonRecord[] = [];
-    let after: string | undefined;
-    let total: number | undefined;
-    let moreAvailable = false;
-    while (items.length < limit) {
-      const payload = await this.postJson("/alerts/combined/alerts/v1", {
+    const page = await this.paginateAfter(
+      (after, pageLimit) => this.postJson("/alerts/combined/alerts/v1", {
         filter,
-        limit: Math.min(1000, limit - items.length),
+        limit: pageLimit,
         sort: "created_timestamp|desc",
         ...(after ? { after } : {}),
-      });
-      const pageItems = asRecordArray(payload.resources);
-      items.push(...pageItems);
-      const pagination = paginationOf(payload);
-      total = asNumber(pagination.total) ?? total;
-      const nextAfter = asString(pagination.after);
-      if (pageItems.length === 0 || !nextAfter || nextAfter === after) break;
-      if (items.length >= limit) {
-        moreAvailable = total === undefined || items.length < total;
-        break;
-      }
-      after = nextAfter;
-    }
-    return pageOf(items.slice(0, limit), total, moreAvailable);
+      }),
+      clampNumber(limit, DEFAULT_ALERT_LIMIT, 1, 100_000),
+      1000,
+    );
+    return recordPage(page, asRecordArray(page.items));
   }
 
   async listIoaExclusions(limit = DEFAULT_EXCLUSION_LIMIT): Promise<CrowdstrikePage<JsonRecord>> {
@@ -1917,6 +1924,85 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
   return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partialInventory(hosts.data, "contained hosts")]);
 }
 
+const ALERT_SNAPSHOT_FIELDS = [
+  "id",
+  "composite_id",
+  "aggregate_id",
+  "cid",
+  "agent_id",
+  "product",
+  "type",
+  "scenario",
+  "objective",
+  "tactic",
+  "tactic_id",
+  "technique",
+  "technique_id",
+  "pattern_id",
+  "name",
+  "display_name",
+  "severity",
+  "severity_name",
+  "confidence",
+  "status",
+  "assigned_to_name",
+  "resolution",
+  "created_timestamp",
+  "updated_timestamp",
+  "timestamp",
+  "seconds_to_triaged",
+  "seconds_to_resolved",
+  "data_domains",
+  "tags",
+];
+const ALERT_DEVICE_SNAPSHOT_FIELDS = ["device_id", "hostname", "platform_name", "os_version", "agent_version"];
+const RTR_SESSION_SNAPSHOT_FIELDS = [
+  "id",
+  "cid",
+  "device_id",
+  "hostname",
+  "platform_name",
+  "platform_id",
+  "user_id",
+  "user_uuid",
+  "created_at",
+  "updated_at",
+  "deleted_at",
+  "duration",
+];
+
+function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+  const output: JsonRecord = {};
+  for (const field of fields) {
+    if (record[field] !== undefined) output[field] = record[field];
+  }
+  return output;
+}
+
+function projectAlert(alert: JsonRecord): JsonRecord {
+  const device = asObject(alert.device);
+  return {
+    ...pickFields(alert, ALERT_SNAPSHOT_FIELDS),
+    ...(device ? { device: pickFields(device, ALERT_DEVICE_SNAPSHOT_FIELDS) } : {}),
+  };
+}
+
+function projectRtrSession(session: JsonRecord): JsonRecord {
+  const commands = asRecordArray(session.commands);
+  return {
+    ...pickFields(session, RTR_SESSION_SNAPSHOT_FIELDS),
+    command_count: commands.length,
+    base_commands: [...new Set(commands.map((command) => asString(command.base_command)).filter((command): command is string => Boolean(command)))],
+  };
+}
+
+function projectPage(
+  dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  project: (record: JsonRecord) => JsonRecord,
+): CollectedDataset<CrowdstrikePage<JsonRecord>> {
+  return { ...dataset, data: { ...dataset.data, items: dataset.data.items.map(project) } };
+}
+
 export async function assessCrowdstrikeResponseReadiness(
   client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listResponsePolicies" | "listRtrSessions" | "listAlerts" | "listHosts">,
   options: CrowdstrikeAssessmentOptions = {},
@@ -1928,11 +2014,17 @@ export async function assessCrowdstrikeResponseReadiness(
   const maxConcurrentSessions = clampNumber(options.maxConcurrentSessions, DEFAULT_MAX_CONCURRENT_SESSIONS, 1, 100);
 
   const policies = await collectDataset(() => client.listResponsePolicies(), emptyPage<JsonRecord>(), "response policies");
-  const sessions = await collectDataset(() => client.listRtrSessions(`created_at:>'now-${lookbackDays}d'`), emptyPage<JsonRecord>(), "rtr audit sessions");
-  const alerts = await collectDataset(
-    () => client.listAlerts(`severity:>=${HIGH_SEVERITY_FLOOR}+created_timestamp:>'now-${lookbackDays}d'`, alertLimit),
-    emptyPage<JsonRecord>(),
-    "alerts",
+  const sessions = projectPage(
+    await collectDataset(() => client.listRtrSessions(`created_at:>'now-${lookbackDays}d'`), emptyPage<JsonRecord>(), "rtr audit sessions"),
+    projectRtrSession,
+  );
+  const alerts = projectPage(
+    await collectDataset(
+      () => client.listAlerts(`severity:>=${HIGH_SEVERITY_FLOOR}+created_timestamp:>'now-${lookbackDays}d'`, alertLimit),
+      emptyPage<JsonRecord>(),
+      "alerts",
+    ),
+    projectAlert,
   );
   const containedHosts = await collectDataset(
     () => client.listHosts(hostLimit, "status:['contained','containment_pending','lift_containment_pending']"),
@@ -2301,13 +2393,19 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
 
   const status = worstStatus(perPolicy.map((item) => item.status));
   const weak = perPolicy.filter((item) => item.status !== "pass");
-  return finding(
-    "CS-12",
-    status,
-    status === "pass"
-      ? `All ${perPolicy.length} enabled and host-assigned sensor update policies auto-update or pin a build within N-2 with uninstall protection enabled.`
-      : `${weak.length}/${perPolicy.length} enabled and host-assigned sensor update policies disable updates, pin builds older than N-2 or unverifiable against the build catalog, or lack uninstall protection: ${weak.map((item) => item.policy).join(", ")}.`,
-    { ...policyInventory(policies), policies: perPolicy },
+  const catalogErrors = [...buildsByPlatform.values()].map((dataset) => dataset.error);
+  return withUnreadableSecondary(
+    finding(
+      "CS-12",
+      status,
+      status === "pass"
+        ? `All ${perPolicy.length} enabled and host-assigned sensor update policies auto-update or pin a build within N-2 with uninstall protection enabled.`
+        : `${weak.length}/${perPolicy.length} enabled and host-assigned sensor update policies disable updates, pin builds older than N-2 or unverifiable against the build catalog, or lack uninstall protection: ${weak.map((item) => item.policy).join(", ")}.`,
+      { ...policyInventory(policies), policies: perPolicy },
+    ),
+    "sensor build catalog",
+    catalogErrors,
+    "build tags and pinned builds could not be verified against the catalog for that platform",
   );
 }
 
@@ -2572,7 +2670,12 @@ export async function assessCrowdstrikeSensorCoverage(
       : withPartialInventory(evaluateSensorUpdate(sensorUpdate.data.items, buildsByPlatform), [partialInventory(sensorUpdate.data, "sensor update policies")]),
     evaluateDeploymentCompleteness(hosts, staleDays),
     evaluateHostGroupAssignment(hosts, hostGroups),
-    evaluateUnmanagedAssets(unmanagedCount, managedCount, unmanagedSamples),
+    withUnreadableSecondary(
+      evaluateUnmanagedAssets(unmanagedCount, managedCount, unmanagedSamples),
+      "Falcon Discover unmanaged asset samples",
+      [unmanagedSamples.error],
+      "the unmanaged asset sample list is unavailable",
+    ),
     evaluateZeroTrust(ztaTotal, ztaBelow, ztaBelowTotal, minScore),
   ];
 
@@ -3030,9 +3133,14 @@ export async function assessCrowdstrikeAccessGovernance(
     if (allRolesFailed) {
       return unreadableFinding(id, "user role grants", roleErrors[0] ?? "role lookups failed", USER_CONSOLE_EVIDENCE);
     }
-    return withPartialInventory(
-      withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
-      [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
+    return withUnreadableSecondary(
+      withPartialInventory(
+        withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
+        [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
+      ),
+      "role catalog",
+      [roleCatalog.error],
+      "the role inventory could not be checked for completeness against the catalog",
     );
   };
 
@@ -3057,9 +3165,9 @@ export async function assessCrowdstrikeAccessGovernance(
       role_lookups_failed: roleErrors.length,
       role_pages_truncated: rolesTruncated,
       admin_users: views.filter((view) => view.admin_roles.length > 0).length,
-      roles_in_catalog: roleCatalog.data.items.length,
-      reported_total_roles: roleCatalog.data.total ?? "unknown",
-      role_catalog_truncated: roleCatalog.data.truncated,
+      roles_in_catalog: roleCatalog.error ? "unavailable" : roleCatalog.data.items.length,
+      reported_total_roles: roleCatalog.error ? "unavailable" : roleCatalog.data.total ?? "unknown",
+      role_catalog_truncated: roleCatalog.error ? "unavailable" : roleCatalog.data.truncated,
       api_clients: apiClients.data.items.length,
       ioa_exclusions: ioa.data.items.length,
       ml_exclusions: ml.data.items.length,
@@ -3243,7 +3351,7 @@ function buildQuickReference(assessments: CrowdstrikeAssessmentResult[], hasErro
     "## Contents",
     "",
     "- `metadata.json`: non-secret run metadata (API base URL, member CID scope, source chain, timestamps).",
-    "- `core_data/<category>/*.json`: raw Falcon API snapshots collected for each assessment.",
+    "- `core_data/<category>/*.json`: Falcon API snapshots collected for each assessment; alerts and RTR audit sessions are projected to verdict fields, so process command lines, file paths, and RTR command strings are never exported.",
     "- `analysis/findings.json`: every normalized finding with severity, status, evidence, and framework mappings.",
     "- `analysis/<category>.json`: per-assessment summaries and findings.",
     "- `analysis/access_check.json`: readable Falcon API surfaces and missing scopes.",

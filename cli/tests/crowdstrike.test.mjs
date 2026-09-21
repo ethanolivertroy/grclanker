@@ -30,6 +30,7 @@ import {
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -1026,6 +1027,48 @@ test("verdict safety rule 1: unreadable dependencies yield manual with cause and
   assert.equal(findingById(someRolesForbidden, "CS-16").evidence.users_without_readable_roles, 1);
   assert.match(findingById(someRolesForbidden, "CS-16").summary, /lower bound/);
   assert.equal(someRolesForbidden.summary.role_lookups_failed, 1);
+
+  const buildCatalogForbidden = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    listSensorUpdateBuilds: forbidden("/policy/combined/sensor-update-builds/v1"),
+  }));
+  const autoUpdate = findingById(buildCatalogForbidden, "CS-12");
+  assert.equal(autoUpdate.status, "warn", `CS-12 must not pass on auto-update tags alone when the build catalog is unreadable: ${autoUpdate.summary}`);
+  assert.match(autoUpdate.summary, /^All 1 enabled and host-assigned sensor update policies auto-update/);
+  assert.match(autoUpdate.summary, /The sensor build catalog read failed \(sensor builds \(windows\): .*\(403\).*\), so build tags and pinned builds could not be verified against the catalog for that platform and this verdict cannot exceed warn\.$/);
+  assert.deepEqual(autoUpdate.evidence.unreadable_secondary_reads.map((entry) => entry.dataset), ["sensor build catalog"]);
+  assert.equal(autoUpdate.evidence.policies[0].supported_builds, undefined);
+  assert.equal(findingById(buildCatalogForbidden, "CS-13").status, "pass");
+  assert.equal(buildCatalogForbidden.errors.length, 1);
+
+  const samplesForbidden = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    listDiscoverHosts: forbidden("/discover/combined/hosts/v1"),
+  }));
+  const unmanaged = findingById(samplesForbidden, "CS-15");
+  assert.equal(unmanaged.status, "warn", `CS-15 must not pass when the unmanaged sample read is forbidden: ${unmanaged.summary}`);
+  assert.match(unmanaged.summary, /^Falcon Discover reports no unmanaged assets against 3 managed assets \(server-side totals\)\. The Falcon Discover unmanaged asset samples read failed \(discover unmanaged samples: .*\(403\).*\), so the unmanaged asset sample list is unavailable and this verdict cannot exceed warn\.$/);
+  assert.equal(findingById(samplesForbidden, "CS-13").status, "pass");
+  assert.equal(findingById(samplesForbidden, "CS-25").status, "pass");
+
+  const roleCatalogForbidden = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listRoles: forbidden("/user-management/queries/roles/v1"),
+  }));
+  for (const id of ["CS-16", "CS-17"]) {
+    const item = findingById(roleCatalogForbidden, id);
+    assert.equal(item.status, "warn", `${id} must not pass when the role catalog is unreadable: ${item.summary}`);
+    assert.match(item.summary, /The role catalog read failed \(role catalog: .*\(403\).*\), so the role inventory could not be checked for completeness against the catalog and this verdict cannot exceed warn\.$/);
+    assert.deepEqual(item.evidence.unreadable_secondary_reads.map((entry) => entry.dataset), ["role catalog"]);
+  }
+  assert.equal(findingById(roleCatalogForbidden, "CS-18").status, "pass");
+  assert.equal(roleCatalogForbidden.summary.roles_in_catalog, "unavailable");
+  assert.equal(roleCatalogForbidden.summary.reported_total_roles, "unavailable");
+  assert.equal(roleCatalogForbidden.summary.role_catalog_truncated, "unavailable");
+
+  const ztaListForbidden = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    listZtaAssessments: forbidden("/zero-trust-assessment/queries/assessments/v1"),
+  }));
+  assert.equal(findingById(ztaListForbidden, "CS-25").status, "manual");
+  assert.match(findingById(ztaListForbidden, "CS-25").summary, /Zero Trust Assessment below-threshold scores read failed \(zero trust assessments below threshold: .*\(403\)/);
+  assert.equal(findingById(ztaListForbidden, "CS-15").status, "pass");
 });
 
 test("verdict safety rule 2: empty inventories pass only where emptiness is compliant and say so", async () => {
@@ -1583,6 +1626,284 @@ test("exportCrowdstrikeAuditBundle records partial collection failures in _error
   const second = await exportCrowdstrikeAuditBundle(client, sampleConfig({ memberCid: "child-cid" }), base);
   assert.notEqual(second.outputDir, result.outputDir);
   assert.match(second.outputDir, /-audit-bundle-2$/);
+});
+
+// Verdict safety rules 9 and 10: export credential hygiene and pagination truncation.
+
+const FAKE_CROWDSTRIKE_SECRETS = {
+  alertCmdlinePassword: "Hunter2-Backup-Pass-4471",
+  alertParentEncodedCommand: "RW5jb2RlZFBhcmVudFNlY3JldC05OTEy",
+  alertGrandparentToken: "grandparent-api-token-0f9e8d",
+  alertDescriptionToken: "ghp_alertDescriptionToken0000000000001",
+  alertIocValue: "ioc-secret-blob-7f3a9c",
+  alertBearer: "eyJhbGciOiJIUzI1NiJ9.fake-alert-bearer.c2VjcmV0",
+  rtrRunscriptSecret: "RtrInlineSecret-2026-Q3",
+  rtrPutCommand: "put creds-export-9a8b7c.txt",
+  rtrStdoutSecret: "rtr-stdout-secret-5561",
+};
+
+function secretBearingCrowdstrikeClient() {
+  const fake = FAKE_CROWDSTRIKE_SECRETS;
+  return createFakeClient({
+    listAlerts: async () => [
+      {
+        id: "a-1",
+        composite_id: "cid-1:ind:a-1",
+        aggregate_id: "agg-1",
+        cid: "cid-1",
+        agent_id: "aid-1",
+        product: "epp",
+        type: "ldt",
+        name: "SuspiciousCredentialUse",
+        display_name: "Suspicious credential use",
+        tactic: "Credential Access",
+        technique: "Credentials In Files",
+        pattern_id: 10101,
+        severity: 90,
+        severity_name: "Critical",
+        confidence: 80,
+        status: "closed",
+        assigned_to_name: "Alice Analyst",
+        resolution: "true_positive",
+        created_timestamp: isoHoursAgo(30),
+        updated_timestamp: isoHoursAgo(26),
+        seconds_to_resolved: 7200,
+        tags: ["reviewed"],
+        cmdline: `net use \\\\fs01\\share /user:corp\\svc-backup ${fake.alertCmdlinePassword}`,
+        filepath: "\\Device\\HarddiskVolume3\\Windows\\System32\\net.exe",
+        filename: "net.exe",
+        parent_details: { filename: "powershell.exe", cmdline: `powershell -EncodedCommand ${fake.alertParentEncodedCommand}` },
+        grandparent_details: { filename: "cmd.exe", cmdline: `cmd.exe /c set API_TOKEN=${fake.alertGrandparentToken}` },
+        description: `A process used the token ${fake.alertDescriptionToken} to access an internal API.`,
+        ioc_value: fake.alertIocValue,
+        user_name: "svc-backup",
+        device: { device_id: "aid-1", hostname: "ws-01", platform_name: "Windows", external_ip: "203.0.113.10", local_ip: "10.0.0.5", mac_address: "00-11-22-33-44-55" },
+      },
+      {
+        composite_id: "cid-1:ind:a-2",
+        severity: 70,
+        severity_name: "High",
+        status: "new",
+        created_timestamp: isoHoursAgo(10),
+        cmdline: `curl -H "Authorization: Bearer ${fake.alertBearer}" https://internal.example.com/api`,
+      },
+    ],
+    listRtrSessions: async () => [
+      {
+        id: "s-1",
+        cid: "cid-1",
+        device_id: "aid-1",
+        hostname: "ws-01",
+        platform_name: "Windows",
+        user_id: "alice@example.com",
+        user_uuid: "u-admin",
+        created_at: isoHoursAgo(5),
+        deleted_at: isoHoursAgo(4.8),
+        duration: 600,
+        commands: [
+          { base_command: "runscript", command_string: `runscript -Raw=\`\`\`$cred = ConvertTo-SecureString '${fake.rtrRunscriptSecret}'\`\`\``, status: "complete" },
+          { base_command: "put", command_string: fake.rtrPutCommand, status: "complete" },
+          { base_command: "ls", command_string: "ls C:\\Users", status: "complete" },
+        ],
+        logs: [{ stdout: `PASSWORD=${fake.rtrStdoutSecret}`, stderr: "" }],
+        device_details: { external_ip: "203.0.113.10" },
+      },
+      {
+        id: "s-2",
+        user_id: "bob@example.com",
+        hostname: "ws-02",
+        created_at: isoHoursAgo(3),
+        deleted_at: isoHoursAgo(2.9),
+        commands: [{ base_command: "ls", command_string: "ls" }],
+      },
+    ],
+  });
+}
+
+test("verdict safety rule 9: exportCrowdstrikeAuditBundle never writes alert command lines, IOC values, or RTR command strings into the bundle, its zip, or the tool payloads", async () => {
+  const base = createTempBase("grclanker-cs-export-secrets-");
+  const secrets = Object.values(FAKE_CROWDSTRIKE_SECRETS);
+  const client = secretBearingCrowdstrikeClient();
+  const result = await exportCrowdstrikeAuditBundle(client, sampleConfig(), base);
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.findingCount, 25);
+
+  const files = readBundleFiles(result.outputDir);
+  for (const file of [
+    "core_data/response_readiness/alerts.json",
+    "core_data/response_readiness/rtr_audit_sessions.json",
+    "analysis/response_readiness.json",
+    "analysis/findings.json",
+    "compliance/executive_summary.md",
+  ]) {
+    assert.ok(files.has(file), `expected ${file} in ${[...files.keys()].join(", ")}`);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const payloads = JSON.stringify([await checkCrowdstrikeAccess(client), ...(await runAllCrowdstrikeAssessments(client))]);
+  for (const secret of secrets) {
+    assert.ok(!payloads.includes(secret), `tool payloads must not carry ${secret}`);
+  }
+
+  const alerts = JSON.parse(files.get("core_data/response_readiness/alerts.json"));
+  assert.equal(alerts.length, 2);
+  assert.deepEqual(Object.keys(alerts[0]).sort(), [
+    "agent_id", "aggregate_id", "assigned_to_name", "cid", "composite_id", "confidence", "created_timestamp", "device", "display_name",
+    "id", "name", "pattern_id", "product", "resolution", "seconds_to_resolved", "severity", "severity_name", "status", "tactic", "tags",
+    "technique", "type", "updated_timestamp",
+  ]);
+  assert.deepEqual(alerts[0].device, { device_id: "aid-1", hostname: "ws-01", platform_name: "Windows" });
+  assert.equal(alerts[0].severity_name, "Critical");
+  assert.deepEqual(Object.keys(alerts[1]).sort(), ["composite_id", "created_timestamp", "severity", "severity_name", "status"]);
+  const sessions = JSON.parse(files.get("core_data/response_readiness/rtr_audit_sessions.json"));
+  assert.equal(sessions.length, 2);
+  assert.deepEqual(Object.keys(sessions[0]).sort(), [
+    "base_commands", "cid", "command_count", "created_at", "deleted_at", "device_id", "duration", "hostname", "id", "platform_name", "user_id", "user_uuid",
+  ]);
+  assert.equal(sessions[0].command_count, 3);
+  assert.deepEqual(sessions[0].base_commands, ["runscript", "put", "ls"]);
+  assert.deepEqual(sessions[1].base_commands, ["ls"]);
+
+  const response = JSON.parse(files.get("analysis/response_readiness.json"));
+  assert.equal(findingById(response, "CS-22").status, "pass");
+  assert.equal(findingById(response, "CS-22").evidence.alerts_reviewed, 2);
+  assert.equal(findingById(response, "CS-07").status, "manual");
+  assert.equal(findingById(response, "CS-07").evidence.sessions_reviewed, 2);
+  assert.equal(response.summary.rtr_sessions_reviewed, 2);
+});
+
+test("verdict safety rule 10: stuck cursors, empty cursor pages, and absent totals are reported as truncated instead of complete", async () => {
+  let deviceCalls = 0;
+  let alertCalls = 0;
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    if (url.pathname === "/devices/combined/devices/v1") {
+      deviceCalls += 1;
+      return jsonResponse({ resources: [{ device_id: `h-${deviceCalls}` }], meta: { pagination: { offset: "stuck-token", limit: 1 } } });
+    }
+    if (url.pathname === "/discover/combined/hosts/v1") {
+      return jsonResponse({ resources: [{ id: "d-1" }], meta: { pagination: { after: "same-cursor" } } });
+    }
+    if (url.pathname === "/zero-trust-assessment/queries/assessments/v1") {
+      if (!url.searchParams.get("after")) return jsonResponse({ resources: [{ aid: "z-1", score: 10 }], meta: { pagination: { after: "zta-2" } } });
+      return jsonResponse({ resources: [], meta: { pagination: { after: "zta-3" } } });
+    }
+    if (url.pathname === "/alerts/combined/alerts/v1") {
+      alertCalls += 1;
+      assert.equal(init.method, "POST");
+      return jsonResponse({ resources: [{ composite_id: `a-${alertCalls}` }], meta: { pagination: { after: "alert-stuck" } } });
+    }
+    if (url.pathname === "/user-management/queries/roles/v1") {
+      return jsonResponse({ resources: ["falcon_administrator", "falcon_analyst"], meta: { pagination: { limit: 2, offset: 0 } } });
+    }
+    if (url.pathname === "/user-management/entities/roles/v1") {
+      return jsonResponse({ resources: url.searchParams.getAll("ids").map((id) => ({ id, display_name: id })) });
+    }
+    if (url.pathname === "/identity-protection/queries/policy-rules/v1") return jsonResponse({ resources: ["idp-1"] });
+    if (url.pathname === "/identity-protection/entities/policy-rules/v1") {
+      return jsonResponse({ resources: [{ id: "idp-1", name: "Block stale accounts", enabled: true, simulationMode: false, action: "BLOCK" }] });
+    }
+    throw new Error(`unexpected path ${url.pathname}`);
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  const stuckOffset = await client.listHosts(10);
+  assert.deepEqual(stuckOffset.items.map((item) => item.device_id), ["h-1", "h-2"]);
+  assert.equal(stuckOffset.total, undefined);
+  assert.equal(stuckOffset.truncated, true, "a repeated opaque offset token with no total must not read as complete");
+  assert.equal(deviceCalls, 2, "the repeated token stops the loop instead of spinning");
+
+  const stuckAfter = await client.listDiscoverHosts("entity_type:'unmanaged'", 10);
+  assert.equal(stuckAfter.items.length, 2);
+  assert.equal(stuckAfter.total, undefined);
+  assert.equal(stuckAfter.truncated, true, "a repeated after cursor with no total must not read as complete");
+
+  const emptyCursorPage = await client.listZtaAssessments("score:<60", 10);
+  assert.equal(emptyCursorPage.items.length, 1);
+  assert.equal(emptyCursorPage.truncated, true, "an empty page that still carries a fresh cursor cannot be confirmed complete");
+
+  const stuckAlerts = await client.listAlerts("severity:>=70", 10);
+  assert.deepEqual(stuckAlerts.items.map((item) => item.composite_id), ["a-1", "a-2"]);
+  assert.equal(stuckAlerts.truncated, true, "a repeated alert cursor with no total must not read as complete");
+
+  const roles = await client.listRoles();
+  assert.equal(roles.items.length, 2);
+  assert.equal(roles.total, undefined);
+  assert.equal(roles.truncated, true, "a single-page query without meta.pagination.total cannot be confirmed complete");
+  const rules = await client.listIdentityProtectionRules();
+  assert.equal(rules.items.length, 1);
+  assert.equal(rules.truncated, true);
+});
+
+test("verdict safety rule 10: a stuck alert cursor and a role catalog without a total demote the dependent findings and state total unknown", async () => {
+  let alertCalls = 0;
+  const users = passingUsers();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const ids = url.searchParams.getAll("ids");
+    switch (url.pathname) {
+      case "/oauth2/token":
+        return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+      case "/policy/combined/response/v1":
+        return jsonResponse({ resources: [responsePolicy()], meta: { pagination: { total: 1 } } });
+      case "/real-time-response-audit/combined/sessions/v1":
+      case "/devices/combined/devices/v1":
+      case "/policy/queries/ioa-exclusions/v1":
+      case "/policy/queries/ml-exclusions/v1":
+      case "/policy/queries/sv-exclusions/v1":
+        return jsonResponse({ resources: [], meta: { pagination: { total: 0 } } });
+      case "/alerts/combined/alerts/v1":
+        alertCalls += 1;
+        return jsonResponse({
+          resources: [{ composite_id: `a-${alertCalls}`, severity: 90, severity_name: "Critical", status: "closed", created_timestamp: isoHoursAgo(30), seconds_to_resolved: 3600 }],
+          meta: { pagination: { after: "alert-stuck" } },
+        });
+      case "/user-management/queries/users/v1":
+        return jsonResponse({ resources: users.users.map((user) => user.uuid), meta: { pagination: { total: 2 } } });
+      case "/user-management/entities/users/GET/v1":
+        return jsonResponse({ resources: users.users.filter((user) => JSON.parse(init.body).ids.includes(user.uuid)) });
+      case "/user-management/combined/user-roles/v2":
+        return jsonResponse({ resources: users.roles[url.searchParams.get("user_uuid")] ?? [], meta: { pagination: { total: 1 } } });
+      case "/user-management/queries/roles/v1":
+        return jsonResponse({ resources: ["falcon_administrator", "falcon_analyst"], meta: { pagination: { limit: 2, offset: 0 } } });
+      case "/user-management/entities/roles/v1":
+        return jsonResponse({ resources: ids.map((id) => ({ id, display_name: id })) });
+      case "/api-clients/queries/api-clients/v1":
+        return jsonResponse({ resources: ["api-1"], meta: { pagination: { total: 1 } } });
+      case "/api-clients/entities/api-clients/v1":
+        return jsonResponse({ resources: [{ id: "api-1", name: "grclanker audit", scopes: [apiScope("hosts", "read")] }] });
+      case "/identity-protection/queries/policy-rules/v1":
+        return jsonResponse({ resources: ["idp-1"], meta: { pagination: { total: 1 } } });
+      case "/identity-protection/entities/policy-rules/v1":
+        return jsonResponse({ resources: [{ id: "idp-1", name: "Block stale accounts", enabled: true, simulationMode: false, action: "BLOCK" }] });
+      default:
+        throw new Error(`unexpected path ${url.pathname}`);
+    }
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  const response = await assessCrowdstrikeResponseReadiness(client, { alertLimit: 10 });
+  const sla = findingById(response, "CS-22");
+  assert.equal(sla.status, "warn", `CS-22 must not pass on a stuck alert cursor: ${sla.summary}`);
+  assert.match(sla.summary, /Partial inventory: only 2 of an unknown total of critical\/high alerts were read/);
+  assert.deepEqual(sla.evidence.partial_inventory, [{ dataset: "critical/high alerts", seen: 2, total: undefined }]);
+  assert.equal(response.summary.alerts_truncated, true);
+  assert.equal(findingById(response, "CS-06").status, "pass");
+
+  const governance = await assessCrowdstrikeAccessGovernance(client);
+  for (const id of ["CS-16", "CS-17"]) {
+    const item = findingById(governance, id);
+    assert.equal(item.status, "warn", `${id} must not pass when the role catalog total is unknown: ${item.summary}`);
+    assert.match(item.summary, /only 2 of an unknown total of roles in the role catalog were read/);
+  }
+  assert.equal(governance.summary.role_catalog_truncated, true);
+  assert.equal(governance.summary.reported_total_roles, "unknown");
+  assert.equal(findingById(governance, "CS-18").status, "pass");
+  assert.equal(findingById(governance, "CS-24").status, "pass");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
