@@ -43,6 +43,69 @@ const MAX_RETRIES = 4;
 const PAGE_SIZE = 100;
 const MAX_AUDIT_EVENTS = 200;
 const INSTALLATION_TOKEN_SKEW_MS = 60 * 1000;
+const GRAPHQL_PAGE_SIZE = 100;
+const MAX_GRAPHQL_PAGES = 50;
+
+// Field names verified against https://docs.github.com/public/fpt/schema.docs.graphql
+// (Organization.samlIdentityProvider, OrganizationIdentityProvider.externalIdentities,
+// ExternalIdentity.samlIdentity/scimIdentity/user, Organization.requiresTwoFactorAuthentication).
+const ORGANIZATION_SAML_QUERY = `
+query GrclankerOrganizationSaml($login: String!, $first: Int!, $after: String) {
+  organization(login: $login) {
+    login
+    requiresTwoFactorAuthentication
+    samlIdentityProvider {
+      ssoUrl
+      issuer
+      digestMethod
+      signatureMethod
+      externalIdentities(first: $first, after: $after, membersOnly: true) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          guid
+          samlIdentity { nameId username }
+          scimIdentity { username }
+          user { login }
+        }
+      }
+    }
+  }
+}`;
+
+// Organization.ipAllowListEnabledSetting, ipAllowListForInstalledAppsEnabledSetting,
+// ipAllowListEntries (IpAllowListEntry.allowListValue/isActive/name/createdAt) per the public schema.
+const ORGANIZATION_IP_ALLOW_LIST_QUERY = `
+query GrclankerOrganizationIpAllowList($login: String!, $first: Int!, $after: String) {
+  organization(login: $login) {
+    login
+    ipAllowListEnabledSetting
+    ipAllowListForInstalledAppsEnabledSetting
+    ipAllowListEntries(first: $first, after: $after) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { allowListValue isActive name createdAt }
+    }
+  }
+}`;
+
+// Enterprise.ownerInfo (EnterpriseOwnerInfo) fields per the public schema. ownerInfo is visible to
+// enterprise owners or their classic PATs with read:enterprise or admin:enterprise.
+const ENTERPRISE_IDENTITY_QUERY = `
+query GrclankerEnterpriseIdentity($slug: String!) {
+  enterprise(slug: $slug) {
+    slug
+    ownerInfo {
+      samlIdentityProvider { ssoUrl issuer }
+      oidcProvider { providerType tenantId }
+      twoFactorRequiredSetting
+      affiliatedUsersWithTwoFactorDisabledExist
+      ipAllowListEnabledSetting
+      ipAllowListForInstalledAppsEnabledSetting
+      ipAllowListUserLevelEnforcementEnabledSetting
+    }
+  }
+}`;
 
 type RawConfigArgs = {
   organization?: string;
@@ -161,10 +224,40 @@ interface CollectedDataset<T = unknown> {
   error?: string;
 }
 
+export interface GitHubSamlIdentitySnapshot {
+  requiresTwoFactorAuthentication: boolean | null;
+  samlIdentityProvider: {
+    ssoUrl: string | null;
+    issuer: string | null;
+    digestMethod: string | null;
+    signatureMethod: string | null;
+  } | null;
+  externalIdentities: JsonRecord[];
+  externalIdentitiesTotalCount: number | null;
+  externalIdentitiesTruncated: boolean;
+  errors: GitHubGraphqlError[];
+}
+
+export interface GitHubIpAllowListSnapshot {
+  ipAllowListEnabledSetting: string | null;
+  ipAllowListForInstalledAppsEnabledSetting: string | null;
+  entries: JsonRecord[];
+  entriesTotalCount: number | null;
+  entriesTruncated: boolean;
+  errors: GitHubGraphqlError[];
+}
+
+export interface GitHubEnterpriseIdentitySnapshot {
+  slug: string;
+  ownerInfo: JsonRecord | null;
+  errors: GitHubGraphqlError[];
+}
+
 interface GitHubOrgAccessData {
   org: CollectedDataset<JsonRecord | null>;
   members: CollectedDataset<JsonRecord[]>;
   adminMembers: CollectedDataset<JsonRecord[]>;
+  twoFactorDisabledMembers: CollectedDataset<JsonRecord[]>;
   outsideCollaborators: CollectedDataset<JsonRecord[]>;
   invitations: CollectedDataset<JsonRecord[]>;
   organizationRoles: CollectedDataset<JsonRecord[]>;
@@ -172,6 +265,9 @@ interface GitHubOrgAccessData {
   auditLog: CollectedDataset<JsonRecord[]>;
   hooks: CollectedDataset<JsonRecord[]>;
   appInstallations: CollectedDataset<JsonRecord[]>;
+  samlIdentity: CollectedDataset<GitHubSamlIdentitySnapshot | null>;
+  ipAllowList: CollectedDataset<GitHubIpAllowListSnapshot | null>;
+  enterpriseIdentity: CollectedDataset<GitHubEnterpriseIdentitySnapshot | null>;
 }
 
 interface GitHubRepoProtectionData {
@@ -308,6 +404,91 @@ const GITHUB_CHECKS: Record<string, CheckDefinition> = {
       irap: ["ISM-1266"],
       ismap: ["CPS.AU-2"],
       general: ["admin activity visibility"],
+    },
+  },
+  "GITHUB-ORG-006": {
+    id: "GITHUB-ORG-006",
+    title: "SAML SSO is configured and members carry linked identities",
+    category: "org_access",
+    severity: "critical",
+    frameworks: {
+      fedramp: ["IA-2", "IA-8"],
+      cmmc: ["AC.L2-3.1.1"],
+      soc2: ["CC6.1"],
+      cis: ["1.1.1"],
+      pci_dss: ["8.3.1"],
+      disa_stig: ["SRG-APP-000148"],
+      irap: ["ISM-1557"],
+      ismap: ["5.1.1"],
+      general: ["single sign-on enforcement"],
+    },
+  },
+  "GITHUB-ORG-007": {
+    id: "GITHUB-ORG-007",
+    title: "Enterprise-managed identity (EMU) governs member accounts",
+    category: "org_access",
+    severity: "high",
+    frameworks: {
+      fedramp: ["IA-2", "IA-5"],
+      cmmc: ["IA.L2-3.5.1"],
+      soc2: ["CC6.1"],
+      cis: ["1.1.3"],
+      pci_dss: ["8.2.1"],
+      disa_stig: ["SRG-APP-000163"],
+      irap: ["ISM-1558"],
+      ismap: ["5.1.3"],
+      general: ["enterprise identity lifecycle"],
+    },
+  },
+  "GITHUB-ORG-008": {
+    id: "GITHUB-ORG-008",
+    title: "IP allow list restricts organization access",
+    category: "org_access",
+    severity: "high",
+    frameworks: {
+      fedramp: ["SC-7", "AC-17"],
+      cmmc: ["SC.L2-3.13.1"],
+      soc2: ["CC6.1", "CC6.6"],
+      cis: ["1.2.1"],
+      pci_dss: ["1.3.1"],
+      disa_stig: ["SRG-APP-000142"],
+      irap: ["ISM-1416"],
+      ismap: ["5.1.4"],
+      general: ["network boundary for source access"],
+    },
+  },
+  "GITHUB-ORG-009": {
+    id: "GITHUB-ORG-009",
+    title: "Members cannot create public repositories",
+    category: "org_access",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-3", "AC-22"],
+      cmmc: ["AC.L2-3.1.22"],
+      soc2: ["CC6.1"],
+      cis: ["1.3.2"],
+      pci_dss: ["7.2.2"],
+      disa_stig: ["SRG-APP-000211"],
+      irap: ["ISM-0264"],
+      ismap: ["5.2.2"],
+      general: ["repository visibility defaults"],
+    },
+  },
+  "GITHUB-ORG-010": {
+    id: "GITHUB-ORG-010",
+    title: "Private repository forking is restricted",
+    category: "org_access",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-3", "AC-4"],
+      cmmc: ["AC.L2-3.1.3"],
+      soc2: ["CC6.1"],
+      cis: ["1.3.3"],
+      pci_dss: ["7.2.3"],
+      disa_stig: ["SRG-APP-000033"],
+      irap: ["ISM-0405"],
+      ismap: ["5.2.3"],
+      general: ["fork policy"],
     },
   },
   "GITHUB-REPO-001": {
@@ -1092,6 +1273,120 @@ export class GitHubAuditorClient {
     return this.paginate(`/orgs/${this.config.organization}/members?per_page=${PAGE_SIZE}&role=${role}`);
   }
 
+  async listTwoFactorDisabledMembers(): Promise<JsonRecord[]> {
+    return this.paginate(`/orgs/${this.config.organization}/members?per_page=${PAGE_SIZE}&filter=2fa_disabled`);
+  }
+
+  async getSamlIdentitySnapshot(): Promise<GitHubSamlIdentitySnapshot> {
+    const snapshot: GitHubSamlIdentitySnapshot = {
+      requiresTwoFactorAuthentication: null,
+      samlIdentityProvider: null,
+      externalIdentities: [],
+      externalIdentitiesTotalCount: null,
+      externalIdentitiesTruncated: false,
+      errors: [],
+    };
+    let after: string | null = null;
+    let pages = 0;
+
+    while (pages < MAX_GRAPHQL_PAGES) {
+      const result: GitHubGraphqlResult<JsonRecord> = await this.graphql<JsonRecord>(ORGANIZATION_SAML_QUERY, {
+        login: this.config.organization,
+        first: GRAPHQL_PAGE_SIZE,
+        after,
+      });
+      pages += 1;
+      snapshot.errors.push(...result.errors);
+      const organization = asRecord(asRecord(result.data).organization);
+      if (pages === 1) {
+        snapshot.requiresTwoFactorAuthentication = asBoolean(organization.requiresTwoFactorAuthentication) ?? null;
+      }
+      const provider = organization.samlIdentityProvider;
+      if (!provider || typeof provider !== "object") {
+        break;
+      }
+      const providerRecord = asRecord(provider);
+      if (!snapshot.samlIdentityProvider) {
+        snapshot.samlIdentityProvider = {
+          ssoUrl: asString(providerRecord.ssoUrl) ?? null,
+          issuer: asString(providerRecord.issuer) ?? null,
+          digestMethod: asString(providerRecord.digestMethod) ?? null,
+          signatureMethod: asString(providerRecord.signatureMethod) ?? null,
+        };
+      }
+      const connection = asRecord(providerRecord.externalIdentities);
+      snapshot.externalIdentitiesTotalCount = asNumber(connection.totalCount) ?? snapshot.externalIdentitiesTotalCount;
+      snapshot.externalIdentities.push(...asArray(connection.nodes).map((node) => asRecord(node)));
+      const pageInfo = asRecord(connection.pageInfo);
+      if (asBoolean(pageInfo.hasNextPage) !== true || !asString(pageInfo.endCursor)) {
+        break;
+      }
+      after = asString(pageInfo.endCursor) ?? null;
+      if (pages >= MAX_GRAPHQL_PAGES) {
+        snapshot.externalIdentitiesTruncated = true;
+      }
+    }
+
+    return snapshot;
+  }
+
+  async getIpAllowListSnapshot(): Promise<GitHubIpAllowListSnapshot> {
+    const snapshot: GitHubIpAllowListSnapshot = {
+      ipAllowListEnabledSetting: null,
+      ipAllowListForInstalledAppsEnabledSetting: null,
+      entries: [],
+      entriesTotalCount: null,
+      entriesTruncated: false,
+      errors: [],
+    };
+    let after: string | null = null;
+    let pages = 0;
+
+    while (pages < MAX_GRAPHQL_PAGES) {
+      const result: GitHubGraphqlResult<JsonRecord> = await this.graphql<JsonRecord>(ORGANIZATION_IP_ALLOW_LIST_QUERY, {
+        login: this.config.organization,
+        first: GRAPHQL_PAGE_SIZE,
+        after,
+      });
+      pages += 1;
+      snapshot.errors.push(...result.errors);
+      const organization = asRecord(asRecord(result.data).organization);
+      if (pages === 1) {
+        snapshot.ipAllowListEnabledSetting = asString(organization.ipAllowListEnabledSetting) ?? null;
+        snapshot.ipAllowListForInstalledAppsEnabledSetting = asString(organization.ipAllowListForInstalledAppsEnabledSetting) ?? null;
+      }
+      const connection = asRecord(organization.ipAllowListEntries);
+      snapshot.entriesTotalCount = asNumber(connection.totalCount) ?? snapshot.entriesTotalCount;
+      snapshot.entries.push(...asArray(connection.nodes).map((node) => asRecord(node)));
+      const pageInfo = asRecord(connection.pageInfo);
+      if (asBoolean(pageInfo.hasNextPage) !== true || !asString(pageInfo.endCursor)) {
+        break;
+      }
+      after = asString(pageInfo.endCursor) ?? null;
+      if (pages >= MAX_GRAPHQL_PAGES) {
+        snapshot.entriesTruncated = true;
+      }
+    }
+
+    return snapshot;
+  }
+
+  async getEnterpriseIdentitySnapshot(): Promise<GitHubEnterpriseIdentitySnapshot | null> {
+    if (!this.config.enterprise) {
+      return null;
+    }
+    const result = await this.graphql<JsonRecord>(ENTERPRISE_IDENTITY_QUERY, { slug: this.config.enterprise });
+    const enterprise = asRecord(asRecord(result.data).enterprise);
+    const ownerInfo = enterprise.ownerInfo && typeof enterprise.ownerInfo === "object"
+      ? asRecord(enterprise.ownerInfo)
+      : null;
+    return {
+      slug: this.config.enterprise,
+      ownerInfo,
+      errors: result.errors,
+    };
+  }
+
   async listOutsideCollaborators(): Promise<JsonRecord[]> {
     return this.paginate(`/orgs/${this.config.organization}/outside_collaborators?per_page=${PAGE_SIZE}`);
   }
@@ -1651,6 +1946,7 @@ export async function collectGitHubOrgAccessData(
     GitHubAuditorClient,
     | "getOrganization"
     | "listMembers"
+    | "listTwoFactorDisabledMembers"
     | "listOutsideCollaborators"
     | "listInvitations"
     | "listOrganizationRoles"
@@ -1658,6 +1954,9 @@ export async function collectGitHubOrgAccessData(
     | "listAuditLog"
     | "listHooks"
     | "listInstallations"
+    | "getSamlIdentitySnapshot"
+    | "getIpAllowListSnapshot"
+    | "getEnterpriseIdentitySnapshot"
   >,
   config: GitHubResolvedConfig,
 ): Promise<GitHubOrgAccessData> {
@@ -1665,6 +1964,7 @@ export async function collectGitHubOrgAccessData(
     org: await collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
     members: await collectDataset<JsonRecord[]>([], () => client.listMembers("all")),
     adminMembers: await collectDataset<JsonRecord[]>([], () => client.listMembers("admin")),
+    twoFactorDisabledMembers: await collectDataset<JsonRecord[]>([], () => client.listTwoFactorDisabledMembers()),
     outsideCollaborators: await collectDataset<JsonRecord[]>([], () => client.listOutsideCollaborators()),
     invitations: await collectDataset<JsonRecord[]>([], () => client.listInvitations()),
     organizationRoles: await collectDataset<JsonRecord[]>([], () => client.listOrganizationRoles()),
@@ -1672,7 +1972,418 @@ export async function collectGitHubOrgAccessData(
     auditLog: await collectDataset<JsonRecord[]>([], () => client.listAuditLog(config.lookbackDays)),
     hooks: await collectDataset<JsonRecord[]>([], () => client.listHooks()),
     appInstallations: await collectDataset<JsonRecord[]>([], () => client.listInstallations()),
+    samlIdentity: await collectDataset<GitHubSamlIdentitySnapshot | null>(null, () => client.getSamlIdentitySnapshot()),
+    ipAllowList: await collectDataset<GitHubIpAllowListSnapshot | null>(null, () => client.getIpAllowListSnapshot()),
+    enterpriseIdentity: await collectDataset<GitHubEnterpriseIdentitySnapshot | null>(null, () => client.getEnterpriseIdentitySnapshot()),
   };
+}
+
+function graphqlErrorsForPath(errors: GitHubGraphqlError[], segment: string): GitHubGraphqlError[] {
+  return errors.filter((error) => (error.path ?? []).some((part) => part === segment) || (error.path ?? []).length === 0);
+}
+
+function describeGraphqlErrors(errors: GitHubGraphqlError[]): string {
+  return errors.map((error) => `${error.type ?? "ERROR"}: ${error.message}`).join("; ");
+}
+
+function assessTwoFactor(data: GitHubOrgAccessData): GitHubFinding {
+  const org = data.org.data ?? null;
+  const twoFactorRequired = asBoolean(org && asRecord(org).two_factor_requirement_enabled);
+  const disabledMembers = data.twoFactorDisabledMembers;
+  const disabledLogins = disabledMembers.data.map((member) => asString(member.login) ?? "unknown");
+  const evidence = [
+    twoFactorRequired !== undefined
+      ? `two_factor_requirement_enabled = ${String(twoFactorRequired)}`
+      : `Organization 2FA setting was not readable from the org profile response${data.org.error ? ` (${data.org.error})` : ""}.`,
+    disabledMembers.error
+      ? `members?filter=2fa_disabled unreadable: ${disabledMembers.error} (the filter is documented as owner-only)`
+      : `members_without_2fa = ${disabledLogins.length}${disabledLogins.length > 0 ? ` (${disabledLogins.slice(0, 10).join(", ")}${disabledLogins.length > 10 ? ", ..." : ""})` : ""}`,
+  ];
+  const recommendation = "Require 2FA at the organization level and remove or remediate every member the 2fa_disabled filter still returns.";
+
+  if (twoFactorRequired === undefined) {
+    return buildFinding(
+      "GITHUB-ORG-001",
+      "Manual",
+      "The tool could not read the organization 2FA requirement, so the control is unverified.",
+      evidence,
+      recommendation,
+      "Confirm the org-wide 2FA requirement in Settings > Authentication security with an org owner, and export the member list filtered to 2FA disabled.",
+    );
+  }
+  if (twoFactorRequired === false) {
+    return buildFinding(
+      "GITHUB-ORG-001",
+      "Fail",
+      disabledMembers.error
+        ? "The organization does not require two-factor authentication; member enumeration by 2FA status was also unreadable."
+        : `The organization does not require two-factor authentication; ${disabledLogins.length} member(s) currently have 2FA disabled.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (disabledMembers.error) {
+    return buildFinding(
+      "GITHUB-ORG-001",
+      "Partial",
+      "The organization requires 2FA, but the tool could not enumerate members without 2FA because the owner-only filter was not readable.",
+      evidence,
+      recommendation,
+      "Run the assessment with an organization owner token (or owner-installed app) so the 2fa_disabled filter is honored, or export the member list from the org People page.",
+    );
+  }
+  if (disabledLogins.length > 0) {
+    return buildFinding(
+      "GITHUB-ORG-001",
+      "Fail",
+      `The organization requires 2FA, yet ${disabledLogins.length} member(s) were returned by the 2fa_disabled filter.`,
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-ORG-001",
+    "Pass",
+    `The organization requires two-factor authentication and the 2fa_disabled member filter returned no members (${data.members.data.length} member(s) enumerated).`,
+    evidence,
+    recommendation,
+  );
+}
+
+function assessSamlSso(data: GitHubOrgAccessData): GitHubFinding {
+  const recommendation = "Configure SAML SSO (or enterprise-level SSO with EMU), require SSO for the organization, and make sure every member has a linked external identity.";
+  const snapshot = data.samlIdentity.data;
+  if (data.samlIdentity.error || !snapshot) {
+    return buildFinding(
+      "GITHUB-ORG-006",
+      "Manual",
+      "The tool could not query the organization SAML identity provider through GraphQL.",
+      [`graphql_error = ${data.samlIdentity.error ?? "no data returned"}`],
+      recommendation,
+      "Confirm SAML SSO status in Settings > Authentication security with an org owner token that is SSO-authorized.",
+    );
+  }
+
+  const providerErrors = graphqlErrorsForPath(snapshot.errors, "samlIdentityProvider");
+  const enterpriseOwnerInfo = data.enterpriseIdentity.data?.ownerInfo ?? null;
+  const enterpriseSaml = enterpriseOwnerInfo && asRecord(enterpriseOwnerInfo.samlIdentityProvider);
+  const enterpriseOidc = enterpriseOwnerInfo && asRecord(enterpriseOwnerInfo.oidcProvider);
+  const enterpriseIdentityConfigured = Boolean(
+    (enterpriseSaml && Object.keys(enterpriseSaml).length > 0) || (enterpriseOidc && Object.keys(enterpriseOidc).length > 0),
+  );
+  const members = data.members;
+  const memberCount = members.data.length;
+
+  if (!snapshot.samlIdentityProvider) {
+    if (providerErrors.length > 0) {
+      return buildFinding(
+        "GITHUB-ORG-006",
+        "Manual",
+        "GraphQL refused to return the organization SAML identity provider, so SSO status is unverified.",
+        [`samlIdentityProvider errors = ${describeGraphqlErrors(providerErrors)}`],
+        recommendation,
+        "samlIdentityProvider is visible only to org owners, owner PATs with read:org or admin:org, or an app installation with members read access. Rerun with such a principal or confirm SSO in the org settings UI.",
+      );
+    }
+    if (enterpriseIdentityConfigured) {
+      return buildFinding(
+        "GITHUB-ORG-006",
+        "Pass",
+        `No organization-level SAML provider exists, but the enterprise ${data.enterpriseIdentity.data?.slug ?? ""} carries an identity provider (${enterpriseOidc && Object.keys(enterpriseOidc).length > 0 ? "OIDC" : "SAML"}), which governs this organization.`,
+        [
+          "organization.samlIdentityProvider = null",
+          `enterprise.ownerInfo.samlIdentityProvider = ${enterpriseSaml && Object.keys(enterpriseSaml).length > 0 ? JSON.stringify(enterpriseSaml) : "null"}`,
+          `enterprise.ownerInfo.oidcProvider = ${enterpriseOidc && Object.keys(enterpriseOidc).length > 0 ? JSON.stringify(enterpriseOidc) : "null"}`,
+        ],
+        recommendation,
+      );
+    }
+    return buildFinding(
+      "GITHUB-ORG-006",
+      "Fail",
+      "No SAML identity provider is configured for the organization" + (data.enterpriseIdentity.data ? " or its enterprise." : "; no enterprise slug was supplied to check enterprise-level SSO."),
+      [
+        "organization.samlIdentityProvider = null",
+        data.enterpriseIdentity.data
+          ? `enterprise ${data.enterpriseIdentity.data.slug} ownerInfo = ${enterpriseOwnerInfo ? "readable, no identity provider" : `unreadable (${describeGraphqlErrors(data.enterpriseIdentity.data.errors) || "no ownerInfo"})`}`
+          : "enterprise = not configured (set GITHUB_ENTERPRISE to evaluate enterprise-level SSO)",
+      ],
+      recommendation,
+    );
+  }
+
+  const linked = snapshot.externalIdentities.filter((identity) => {
+    const user = asRecord(identity.user);
+    return asString(user.login) !== undefined && Object.keys(asRecord(identity.samlIdentity)).length > 0;
+  });
+  const linkedLogins = new Set(linked.map((identity) => asString(asRecord(identity.user).login)?.toLowerCase()));
+  const unlinkedMembers = members.data
+    .map((member) => asString(member.login) ?? "")
+    .filter((login) => login.length > 0 && !linkedLogins.has(login.toLowerCase()));
+  const evidence = [
+    `samlIdentityProvider.ssoUrl = ${snapshot.samlIdentityProvider.ssoUrl ?? "null"}`,
+    `samlIdentityProvider.issuer = ${snapshot.samlIdentityProvider.issuer ?? "null"}`,
+    `external_identities_linked_to_members = ${linked.length} (totalCount ${snapshot.externalIdentitiesTotalCount ?? "unknown"}${snapshot.externalIdentitiesTruncated ? ", truncated" : ""})`,
+    members.error ? `members unreadable: ${members.error}` : `members = ${memberCount}, members_without_saml_identity = ${unlinkedMembers.length}${unlinkedMembers.length > 0 ? ` (${unlinkedMembers.slice(0, 10).join(", ")}${unlinkedMembers.length > 10 ? ", ..." : ""})` : ""}`,
+    "Note: the public GraphQL schema exposes SAML configuration and identity links, not a separate 'require SSO' flag; complete linkage is the observable proxy.",
+  ];
+
+  if (members.error || snapshot.externalIdentitiesTruncated || providerErrors.length > 0) {
+    return buildFinding(
+      "GITHUB-ORG-006",
+      "Partial",
+      "SAML SSO is configured, but the member-to-identity comparison is incomplete (member list unreadable, identities truncated, or partial GraphQL errors).",
+      [...evidence, ...(providerErrors.length > 0 ? [`graphql errors = ${describeGraphqlErrors(providerErrors)}`] : [])],
+      recommendation,
+      "Compare the SSO identity list with the member list in the org settings UI to confirm every member is linked.",
+    );
+  }
+  if (memberCount === 0) {
+    return buildFinding(
+      "GITHUB-ORG-006",
+      "Partial",
+      "SAML SSO is configured, but zero members were enumerated, so identity linkage could not be demonstrated.",
+      evidence,
+      recommendation,
+    );
+  }
+  if (unlinkedMembers.length > 0) {
+    return buildFinding(
+      "GITHUB-ORG-006",
+      "Partial",
+      `SAML SSO is configured, but ${unlinkedMembers.length} of ${memberCount} member(s) have no linked SAML identity, which indicates SSO is not enforced for them.`,
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-ORG-006",
+    "Pass",
+    `SAML SSO is configured and all ${memberCount} member(s) carry a linked SAML identity.`,
+    evidence,
+    recommendation,
+  );
+}
+
+function assessEnterpriseManagedUsers(data: GitHubOrgAccessData): GitHubFinding {
+  const recommendation = "Use Enterprise Managed Users (or at minimum an enterprise-level identity provider) so member accounts are provisioned and deprovisioned by the corporate IdP.";
+  if (!data.enterpriseIdentity.data && !data.enterpriseIdentity.error) {
+    return buildFinding(
+      "GITHUB-ORG-007",
+      "Manual",
+      "Scoped out: no enterprise slug was configured, so enterprise identity management could not be evaluated.",
+      ["enterprise = not configured (set GITHUB_ENTERPRISE or pass enterprise)"],
+      recommendation,
+      "Provide the enterprise slug and rerun, or confirm in the enterprise settings whether Enterprise Managed Users is enabled.",
+    );
+  }
+  if (data.enterpriseIdentity.error || !data.enterpriseIdentity.data) {
+    return buildFinding(
+      "GITHUB-ORG-007",
+      "Manual",
+      "The enterprise identity query failed, so EMU status is unverified.",
+      [`graphql_error = ${data.enterpriseIdentity.error ?? "no data returned"}`],
+      recommendation,
+      "Rerun with an enterprise owner token (read:enterprise or admin:enterprise) or confirm EMU in the enterprise settings UI.",
+    );
+  }
+
+  const snapshot = data.enterpriseIdentity.data;
+  if (!snapshot.ownerInfo) {
+    return buildFinding(
+      "GITHUB-ORG-007",
+      "Manual",
+      `enterprise.ownerInfo for ${snapshot.slug} was not readable, so EMU status is unverified.`,
+      [`graphql errors = ${describeGraphqlErrors(snapshot.errors) || "ownerInfo returned null"}`],
+      recommendation,
+      "ownerInfo is visible only to enterprise owners or their classic PATs with read:enterprise or admin:enterprise.",
+    );
+  }
+
+  const oidc = asRecord(snapshot.ownerInfo.oidcProvider);
+  const saml = asRecord(snapshot.ownerInfo.samlIdentityProvider);
+  const evidence = [
+    `enterprise = ${snapshot.slug}`,
+    `ownerInfo.oidcProvider = ${Object.keys(oidc).length > 0 ? JSON.stringify(oidc) : "null"}`,
+    `ownerInfo.samlIdentityProvider = ${Object.keys(saml).length > 0 ? JSON.stringify(saml) : "null"}`,
+    "Note: the public schema has no EMU boolean; OIDC providers exist only for EMU enterprises, while enterprise SAML is shared by EMU and non-EMU enterprises.",
+  ];
+  if (Object.keys(oidc).length > 0) {
+    return buildFinding(
+      "GITHUB-ORG-007",
+      "Pass",
+      `Enterprise ${snapshot.slug} authenticates through an OIDC identity provider, which GitHub offers only for Enterprise Managed Users.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (Object.keys(saml).length > 0) {
+    return buildFinding(
+      "GITHUB-ORG-007",
+      "Partial",
+      `Enterprise ${snapshot.slug} has an enterprise-level SAML provider; the API cannot distinguish EMU from enterprise SAML, so confirm the account model manually.`,
+      evidence,
+      recommendation,
+      "Check the enterprise Identity provider settings page: EMU enterprises show managed user provisioning (SCIM) and members with the enterprise shortcode suffix.",
+    );
+  }
+  return buildFinding(
+    "GITHUB-ORG-007",
+    "Fail",
+    `Enterprise ${snapshot.slug} has no enterprise-level identity provider, so member accounts are not enterprise managed.`,
+    evidence,
+    recommendation,
+  );
+}
+
+function assessIpAllowList(data: GitHubOrgAccessData): GitHubFinding {
+  const recommendation = "Enable the organization IP allow list with the corporate egress ranges, and enable it for installed GitHub Apps as well.";
+  const snapshot = data.ipAllowList.data;
+  if (data.ipAllowList.error || !snapshot) {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Manual",
+      "The tool could not query IP allow list settings through GraphQL.",
+      [`graphql_error = ${data.ipAllowList.error ?? "no data returned"}`],
+      recommendation,
+      "Confirm the IP allow list in Settings > Security > Authentication security with an org owner.",
+    );
+  }
+  const errors = snapshot.errors;
+  if (!snapshot.ipAllowListEnabledSetting) {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Manual",
+      "GraphQL did not return ipAllowListEnabledSetting, so the IP allow list state is unverified.",
+      [`graphql errors = ${describeGraphqlErrors(errors) || "field missing from response"}`],
+      recommendation,
+      "Rerun with an org owner principal or confirm the setting in the organization security settings UI.",
+    );
+  }
+  const activeEntries = snapshot.entries.filter((entry) => asBoolean(entry.isActive) === true);
+  const evidence = [
+    `ipAllowListEnabledSetting = ${snapshot.ipAllowListEnabledSetting}`,
+    `ipAllowListForInstalledAppsEnabledSetting = ${snapshot.ipAllowListForInstalledAppsEnabledSetting ?? "null"}`,
+    `ip_allow_list_entries = ${snapshot.entries.length} (active ${activeEntries.length}, totalCount ${snapshot.entriesTotalCount ?? "unknown"}${snapshot.entriesTruncated ? ", truncated" : ""})`,
+    ...activeEntries.slice(0, 10).map((entry) => `entry ${asString(entry.allowListValue) ?? "?"} (${asString(entry.name) ?? "unnamed"}, created ${asString(entry.createdAt) ?? "unknown"})`),
+  ];
+  if (snapshot.ipAllowListEnabledSetting !== "ENABLED") {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Fail",
+      `The organization IP allow list is ${snapshot.ipAllowListEnabledSetting}.`,
+      evidence,
+      recommendation,
+    );
+  }
+  if (errors.length > 0 || snapshot.entriesTruncated) {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Partial",
+      "The IP allow list is enabled, but the entry inventory is incomplete (GraphQL errors or truncation), so coverage cannot be confirmed.",
+      [...evidence, ...(errors.length > 0 ? [`graphql errors = ${describeGraphqlErrors(errors)}`] : [])],
+      recommendation,
+    );
+  }
+  if (activeEntries.length === 0) {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Partial",
+      "The IP allow list is enabled but has no active entries; GitHub does not restrict access until at least one active entry exists.",
+      evidence,
+      recommendation,
+    );
+  }
+  if (snapshot.ipAllowListForInstalledAppsEnabledSetting !== "ENABLED") {
+    return buildFinding(
+      "GITHUB-ORG-008",
+      "Partial",
+      `The IP allow list is enabled with ${activeEntries.length} active entries, but it is not applied to installed GitHub Apps.`,
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-ORG-008",
+    "Pass",
+    `The IP allow list is enabled with ${activeEntries.length} active entries and also applies to installed GitHub Apps.`,
+    evidence,
+    recommendation,
+  );
+}
+
+function assessRepositoryVisibilityDefaults(data: GitHubOrgAccessData): GitHubFinding {
+  const org = data.org.data ? asRecord(data.org.data) : null;
+  const canCreatePublic = asBoolean(org?.members_can_create_public_repositories);
+  const canCreatePrivate = asBoolean(org?.members_can_create_private_repositories);
+  const canCreateInternal = asBoolean(org?.members_can_create_internal_repositories);
+  const canCreateRepos = asBoolean(org?.members_can_create_repositories);
+  const evidence = [
+    `members_can_create_repositories = ${String(canCreateRepos)}`,
+    `members_can_create_public_repositories = ${String(canCreatePublic)}`,
+    `members_can_create_private_repositories = ${String(canCreatePrivate)}`,
+    `members_can_create_internal_repositories = ${String(canCreateInternal)}`,
+  ];
+  const recommendation = "Restrict repository creation so members cannot create public repositories; allow private or internal creation only where the development model needs it.";
+  if (canCreatePublic === undefined) {
+    return buildFinding(
+      "GITHUB-ORG-009",
+      "Manual",
+      "The repository creation policy fields were not present in the org response (they are returned only to org owners and admin:org tokens).",
+      [...evidence, ...(data.org.error ? [`org error = ${data.org.error}`] : [])],
+      recommendation,
+      "Rerun with an org owner principal or confirm Member privileges > Repository creation in the org settings UI.",
+    );
+  }
+  if (canCreatePublic) {
+    return buildFinding(
+      "GITHUB-ORG-009",
+      "Fail",
+      "Members can create public repositories, so source code can be published without an owner review.",
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-ORG-009",
+    "Pass",
+    `Members cannot create public repositories (private ${String(canCreatePrivate)}, internal ${String(canCreateInternal)}).`,
+    evidence,
+    recommendation,
+  );
+}
+
+function assessForkPolicy(data: GitHubOrgAccessData): GitHubFinding {
+  const org = data.org.data ? asRecord(data.org.data) : null;
+  const canFork = asBoolean(org?.members_can_fork_private_repositories);
+  const evidence = [`members_can_fork_private_repositories = ${String(canFork)}`];
+  const recommendation = "Disable forking of private and internal repositories so copies of proprietary code cannot leave the organization boundary.";
+  if (canFork === undefined) {
+    return buildFinding(
+      "GITHUB-ORG-010",
+      "Manual",
+      "The fork policy field was not present in the org response (it is returned only to org owners and admin:org tokens).",
+      [...evidence, ...(data.org.error ? [`org error = ${data.org.error}`] : [])],
+      recommendation,
+      "Rerun with an org owner principal or confirm Member privileges > Repository forking in the org settings UI.",
+    );
+  }
+  if (canFork) {
+    return buildFinding(
+      "GITHUB-ORG-010",
+      "Fail",
+      "Members can fork private repositories, so proprietary code can be copied outside the controlled repositories.",
+      evidence,
+      recommendation,
+    );
+  }
+  return buildFinding(
+    "GITHUB-ORG-010",
+    "Pass",
+    "Members cannot fork private repositories.",
+    evidence,
+    recommendation,
+  );
 }
 
 export async function collectGitHubRepoProtectionData(
@@ -1762,31 +2473,18 @@ export function assessGitHubOrgAccess(
   config: GitHubResolvedConfig,
 ): GitHubAssessmentResult {
   const org = data.org.data ?? null;
-  const twoFactorRequired = asBoolean(org && asRecord(org).two_factor_requirement_enabled);
   const defaultRepoPermission = safeLower(org && asRecord(org).default_repository_permission) ?? "unknown";
   const outsideCollaboratorCount = data.outsideCollaborators.data.length;
+  const outsideCollaboratorsUnreadable = Boolean(data.outsideCollaborators.error);
   const adminCount = data.adminMembers.data.length;
+  const adminsUnreadable = Boolean(data.adminMembers.error);
   const roleAssignments = data.organizationRoles.data.length;
   const auditVisible = !data.auditLog.error;
   const auditEventCount = data.auditLog.data.length;
+  const auditCapped = auditEventCount >= MAX_AUDIT_EVENTS;
 
   const findings: GitHubFinding[] = [
-    buildFinding(
-      "GITHUB-ORG-001",
-      twoFactorRequired === true ? "Pass" : (twoFactorRequired === false ? "Fail" : "Manual"),
-      twoFactorRequired === true
-        ? "The organization requires two-factor authentication for members."
-        : (twoFactorRequired === false
-          ? "The organization does not require two-factor authentication for members."
-          : "The tool could not confirm whether two-factor authentication is required."),
-      [
-        twoFactorRequired !== undefined
-          ? `two_factor_requirement_enabled = ${String(twoFactorRequired)}`
-          : "Organization 2FA setting was not readable from the org profile response.",
-      ],
-      "Require 2FA at the organization level so member access cannot remain single-factor.",
-      twoFactorRequired === undefined ? "Confirm the org-wide 2FA requirement manually if the token cannot read the field." : undefined,
-    ),
+    assessTwoFactor(data),
     buildFinding(
       "GITHUB-ORG-002",
       defaultRepoPermission === "read" || defaultRepoPermission === "none"
@@ -1806,43 +2504,60 @@ export function assessGitHubOrgAccess(
     ),
     buildFinding(
       "GITHUB-ORG-003",
-      outsideCollaboratorCount === 0 ? "Pass" : (outsideCollaboratorCount <= 5 ? "Partial" : "Fail"),
-      outsideCollaboratorCount === 0
-        ? "No outside collaborators were found."
-        : `${outsideCollaboratorCount} outside collaborator(s) are attached to the organization.`,
+      outsideCollaboratorsUnreadable
+        ? "Manual"
+        : (outsideCollaboratorCount === 0 ? "Pass" : (outsideCollaboratorCount <= 5 ? "Partial" : "Fail")),
+      outsideCollaboratorsUnreadable
+        ? "The outside collaborator list was not readable, so external access is unverified."
+        : (outsideCollaboratorCount === 0
+          ? "No outside collaborators were found; an empty list is compliant because the control asks for minimal external access."
+          : `${outsideCollaboratorCount} outside collaborator(s) are attached to the organization.`),
       [
-        `outside_collaborators = ${outsideCollaboratorCount}`,
-        `pending_invitations = ${data.invitations.data.length}`,
+        outsideCollaboratorsUnreadable
+          ? `outside_collaborators error = ${data.outsideCollaborators.error}`
+          : `outside_collaborators = ${outsideCollaboratorCount}`,
+        data.invitations.error ? `pending_invitations error = ${data.invitations.error}` : `pending_invitations = ${data.invitations.data.length}`,
+        "Note: the REST org object has no field for 'admin approval required for outside collaborators'; review that policy in Member privileges manually.",
       ],
       "Review outside collaborators regularly and move durable access into managed org membership where possible.",
+      outsideCollaboratorsUnreadable
+        ? "Rerun with an org owner principal (outside_collaborators requires admin:org) or export the outside collaborators page from the org People view."
+        : "Confirm the 'repository invitations' member privilege requires owner approval for outside collaborators.",
     ),
     buildFinding(
       "GITHUB-ORG-004",
-      adminCount === 0 ? "Manual" : (adminCount <= 5 ? "Pass" : "Partial"),
-      adminCount === 0
-        ? "The tool did not find any explicit organization admins."
-        : `${adminCount} org admin member(s) and ${roleAssignments} organization-role assignment(s) were identified.`,
+      adminsUnreadable || adminCount === 0 ? "Manual" : (adminCount <= 5 ? "Pass" : "Partial"),
+      adminsUnreadable
+        ? "The admin member list was not readable, so privileged access concentration is unverified."
+        : (adminCount === 0
+          ? "The tool did not find any explicit organization admins, which is unexpected because every organization has at least one owner."
+          : `${adminCount} org admin member(s) and ${roleAssignments} organization-role assignment(s) were identified.`),
       [
-        `admin_members = ${adminCount}`,
-        `organization_role_assignments = ${roleAssignments}`,
+        adminsUnreadable ? `admin_members error = ${data.adminMembers.error}` : `admin_members = ${adminCount}`,
+        data.organizationRoles.error ? `organization_roles error = ${data.organizationRoles.error}` : `organization_role_assignments = ${roleAssignments}`,
       ],
       "Keep org-admin membership small and use custom roles or teams for narrower delegated duties.",
-      adminCount === 0 ? "If the org uses custom roles heavily, confirm owner/admin concentration through the web UI as a follow-up." : undefined,
+      adminsUnreadable || adminCount === 0 ? "Confirm owner/admin concentration through the org People page filtered by role." : undefined,
     ),
     buildFinding(
       "GITHUB-ORG-005",
       auditVisible ? (auditEventCount > 0 ? "Pass" : "Info") : "Manual",
       auditVisible
-        ? `The organization audit log is readable and returned ${auditEventCount} event(s) for the configured lookback window.`
+        ? `The organization audit log is readable and returned ${auditEventCount} event(s) for the configured lookback window${auditCapped ? ` (sample capped at ${MAX_AUDIT_EVENTS} events, so this is a visibility check, not a full population)` : ""}.`
         : "The tool could not read the organization audit log with the supplied credentials.",
       [
-        auditVisible ? `audit_events_last_${config.lookbackDays}_days = ${auditEventCount}` : `audit_log_error = ${data.auditLog.error}`,
-        `webhooks = ${data.hooks.data.length}`,
-        `app_installations = ${data.appInstallations.data.length}`,
+        auditVisible ? `audit_events_last_${config.lookbackDays}_days = ${auditEventCount}${auditCapped ? ` (capped at ${MAX_AUDIT_EVENTS})` : ""}` : `audit_log_error = ${data.auditLog.error}`,
+        data.hooks.error ? `webhooks error = ${data.hooks.error}` : `webhooks = ${data.hooks.data.length}`,
+        data.appInstallations.error ? `app_installations error = ${data.appInstallations.error}` : `app_installations = ${data.appInstallations.data.length}`,
       ],
       "Ensure the audit log is readable to the audit principal and that recent org events are reviewed or forwarded into monitoring workflows.",
       !auditVisible ? "PATs with SSO authorization are often the safest path for this endpoint." : undefined,
     ),
+    assessSamlSso(data),
+    assessEnterpriseManagedUsers(data),
+    assessIpAllowList(data),
+    assessRepositoryVisibilityDefaults(data),
+    assessForkPolicy(data),
   ];
 
   return {
@@ -1852,10 +2567,14 @@ export function assessGitHubOrgAccess(
     snapshotSummary: {
       members: datasetSnapshotCount(data.members),
       admin_members: datasetSnapshotCount(data.adminMembers),
+      members_without_2fa: datasetSnapshotCount(data.twoFactorDisabledMembers),
       outside_collaborators: datasetSnapshotCount(data.outsideCollaborators),
       invitations: datasetSnapshotCount(data.invitations),
       audit_events: datasetSnapshotCount(data.auditLog),
       hooks: datasetSnapshotCount(data.hooks),
+      saml_external_identities: data.samlIdentity.error ? "error" : (data.samlIdentity.data?.externalIdentities.length ?? 0),
+      ip_allow_list_entries: data.ipAllowList.error ? "error" : (data.ipAllowList.data?.entries.length ?? 0),
+      enterprise: config.enterprise ?? "not configured",
     },
     text: buildAssessmentText("GitHub org access assessment", config.organization, findings),
   };
@@ -2192,6 +2911,10 @@ export async function exportGitHubAuditBundle(
     GitHubAuditorClient,
     | "getOrganization"
     | "listMembers"
+    | "listTwoFactorDisabledMembers"
+    | "getSamlIdentitySnapshot"
+    | "getIpAllowListSnapshot"
+    | "getEnterpriseIdentitySnapshot"
     | "listOutsideCollaborators"
     | "listInvitations"
     | "listOrganizationRoles"
@@ -2379,7 +3102,7 @@ export function registerGitHubTools(pi: any): void {
     name: "github_assess_org_access",
     label: "Assess GitHub org access",
     description:
-      "Review org-level access posture including 2FA enforcement, base permissions, outside collaborators, org roles, and audit-log visibility.",
+      "Review org-level identity and access posture: 2FA enforcement and members without 2FA, SAML SSO and enterprise identity (EMU), IP allow list, base permissions, repository creation and fork policy, outside collaborators, org roles, and audit-log visibility.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: RawConfigArgs) {
