@@ -204,7 +204,86 @@ test("resolveGitHubConfiguration prefers explicit args over environment values",
   assert.equal(resolved.authMode, "pat");
   assert.equal(resolved.lookbackDays, 45);
   assert.equal(resolved.apiBaseUrl, "https://api.github.enterprise.local/api/v3");
+  assert.equal(resolved.graphqlUrl, "https://api.github.enterprise.local/api/graphql");
   assert.deepEqual(resolved.sourceChain, ["environment", "arguments"]);
+});
+
+test("resolveGitHubConfiguration honors the spec env aliases for API, GraphQL, and enterprise", async () => {
+  const fromSpecNames = await resolveGitHubConfiguration({}, {
+    GITHUB_ORG: "env-org",
+    GITHUB_TOKEN: "env-token",
+    GITHUB_ENTERPRISE: "https://github.com/env-enterprise/",
+    GITHUB_API_URL: "https://ghes.example.test/api/v3/",
+    GITHUB_GRAPHQL_URL: "https://ghes.example.test/api/graphql",
+  });
+  assert.equal(fromSpecNames.enterprise, "env-enterprise");
+  assert.equal(fromSpecNames.apiBaseUrl, "https://ghes.example.test/api/v3");
+  assert.equal(fromSpecNames.graphqlUrl, "https://ghes.example.test/api/graphql");
+
+  const specNameWins = await resolveGitHubConfiguration({}, {
+    GITHUB_ORG: "env-org",
+    GITHUB_TOKEN: "env-token",
+    GITHUB_API_URL: "https://spec.example.test/api/v3",
+    GITHUB_API_BASE_URL: "https://legacy.example.test/api/v3",
+  });
+  assert.equal(specNameWins.apiBaseUrl, "https://spec.example.test/api/v3");
+  assert.equal(specNameWins.graphqlUrl, "https://spec.example.test/api/graphql");
+
+  const defaults = await resolveGitHubConfiguration({ organization: "example-org", api_token: "token" }, {});
+  assert.equal(defaults.apiBaseUrl, "https://api.github.com");
+  assert.equal(defaults.graphqlUrl, "https://api.github.com/graphql");
+  assert.equal(defaults.enterprise, undefined);
+
+  const explicitArgs = await resolveGitHubConfiguration(
+    { organization: "example-org", api_token: "token", enterprise: "arg-enterprise", graphql_url: "https://gql.example.test/graphql" },
+    { GITHUB_ENTERPRISE: "env-enterprise", GITHUB_GRAPHQL_URL: "https://env.example.test/graphql" },
+  );
+  assert.equal(explicitArgs.enterprise, "arg-enterprise");
+  assert.equal(explicitArgs.graphqlUrl, "https://gql.example.test/graphql");
+});
+
+test("GitHubAuditorClient.graphql posts to the GraphQL endpoint and surfaces partial errors", async () => {
+  const seen = [];
+  const config = createSampleConfig({ graphqlUrl: "https://api.github.test/graphql", apiBaseUrl: "https://api.github.test" });
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    seen.push({ url: url.toString(), method: init.method, headers: init.headers, body: JSON.parse(init.body) });
+    if (seen.length === 1) {
+      return new Response(
+        JSON.stringify({ data: { organization: { login: "example-org", ipAllowListEnabledSetting: "ENABLED" } } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        data: { organization: { login: "example-org", samlIdentityProvider: null } },
+        errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration", path: ["organization", "samlIdentityProvider"] }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const client = new GitHubAuditorClient(config, fetchImpl);
+  const clean = await client.graphql("query($login: String!) { organization(login: $login) { login ipAllowListEnabledSetting } }", { login: "example-org" });
+  assert.equal(seen[0].url, "https://api.github.test/graphql");
+  assert.equal(seen[0].method, "POST");
+  assert.equal(seen[0].headers.Authorization, "Bearer ghp_test");
+  assert.equal(seen[0].body.variables.login, "example-org");
+  assert.match(seen[0].body.query, /ipAllowListEnabledSetting/);
+  assert.deepEqual(clean.errors, []);
+  assert.equal(clean.data.organization.ipAllowListEnabledSetting, "ENABLED");
+
+  const partial = await client.graphql("query { organization(login: \"example-org\") { login samlIdentityProvider { ssoUrl } } }");
+  assert.equal(partial.data.organization.samlIdentityProvider, null);
+  assert.equal(partial.errors.length, 1);
+  assert.equal(partial.errors[0].type, "FORBIDDEN");
+  assert.deepEqual(partial.errors[0].path, ["organization", "samlIdentityProvider"]);
+
+  const failing = new GitHubAuditorClient(config, async () => new Response(
+    JSON.stringify({ message: "Bad credentials" }),
+    { status: 401, headers: { "content-type": "application/json" } },
+  ));
+  await assert.rejects(() => failing.graphql("query { viewer { login } }"), /Bad credentials/);
 });
 
 test("resolveGitHubConfiguration loads GitHub App private key from a file path", async () => {

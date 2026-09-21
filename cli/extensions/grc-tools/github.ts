@@ -46,6 +46,7 @@ const INSTALLATION_TOKEN_SKEW_MS = 60 * 1000;
 
 type RawConfigArgs = {
   organization?: string;
+  enterprise?: string;
   auth_mode?: string;
   api_token?: string;
   app_id?: string;
@@ -53,30 +54,46 @@ type RawConfigArgs = {
   app_private_key_path?: string;
   installation_id?: string | number;
   api_base_url?: string;
+  graphql_url?: string;
   lookback_days?: number;
 };
 
 type GitHubConfigOverlay = {
   organization?: string;
+  enterprise?: string;
   authMode?: GitHubAuthMode;
   apiToken?: string;
   appId?: string;
   appPrivateKey?: string;
   installationId?: string;
   apiBaseUrl?: string;
+  graphqlUrl?: string;
   lookbackDays?: number;
 };
 
 export interface GitHubResolvedConfig {
   organization: string;
+  enterprise?: string;
   authMode: GitHubAuthMode;
   apiToken?: string;
   appId?: string;
   appPrivateKey?: string;
   installationId?: string;
   apiBaseUrl: string;
+  graphqlUrl: string;
   lookbackDays: number;
   sourceChain: string[];
+}
+
+export interface GitHubGraphqlError {
+  type?: string;
+  message: string;
+  path?: Array<string | number>;
+}
+
+export interface GitHubGraphqlResult<T = JsonRecord> {
+  data: T | null;
+  errors: GitHubGraphqlError[];
 }
 
 type GitHubEndpointStatus = "ok" | "forbidden" | "unauthorized" | "error";
@@ -580,6 +597,13 @@ function normalizeApiBaseUrl(value: string): string {
   return `https://${url.replace(/\/+$/g, "")}`;
 }
 
+function deriveGraphqlUrl(apiBaseUrl: string): string {
+  if (/^https?:\/\/api\.github\.com$/i.test(apiBaseUrl)) {
+    return "https://api.github.com/graphql";
+  }
+  return `${apiBaseUrl.replace(/\/api\/v3$/i, "/api")}/graphql`;
+}
+
 function normalizeAuthMode(value: unknown): GitHubAuthMode | undefined {
   const normalized = safeLower(value);
   if (!normalized) return undefined;
@@ -600,6 +624,7 @@ function normalizeAssessmentArgs(args: unknown): RawConfigArgs {
   const value = (args ?? {}) as RawConfigArgs;
   return {
     organization: trimToUndefined(value.organization),
+    enterprise: trimToUndefined(value.enterprise),
     auth_mode: trimToUndefined(value.auth_mode),
     api_token: trimToUndefined(value.api_token),
     app_id: trimToUndefined(value.app_id),
@@ -609,6 +634,7 @@ function normalizeAssessmentArgs(args: unknown): RawConfigArgs {
       ? value.installation_id
       : trimToUndefined(value.installation_id),
     api_base_url: trimToUndefined(value.api_base_url),
+    graphql_url: trimToUndefined(value.graphql_url),
     lookback_days: parseOptionalNumber(value.lookback_days),
   };
 }
@@ -730,9 +756,11 @@ export async function resolveGitHubConfiguration(
   if (trimToUndefined(env.GITHUB_TOKEN) || trimToUndefined(env.GH_TOKEN)) {
     envOverlay.apiToken = trimToUndefined(env.GITHUB_TOKEN) ?? trimToUndefined(env.GH_TOKEN);
   }
+  envOverlay.enterprise = trimToUndefined(env.GITHUB_ENTERPRISE);
   envOverlay.appId = trimToUndefined(env.GITHUB_APP_ID);
   envOverlay.installationId = trimToUndefined(env.GITHUB_APP_INSTALLATION_ID);
-  envOverlay.apiBaseUrl = trimToUndefined(env.GITHUB_API_BASE_URL);
+  envOverlay.apiBaseUrl = trimToUndefined(env.GITHUB_API_URL) ?? trimToUndefined(env.GITHUB_API_BASE_URL);
+  envOverlay.graphqlUrl = trimToUndefined(env.GITHUB_GRAPHQL_URL);
   envOverlay.lookbackDays = parseOptionalNumber(env.GITHUB_LOOKBACK_DAYS);
 
   const privateKeyFromEnv = trimToUndefined(env.GITHUB_APP_PRIVATE_KEY);
@@ -757,6 +785,7 @@ export async function resolveGitHubConfiguration(
 
   const argOverlay: GitHubConfigOverlay = {};
   argOverlay.organization = trimToUndefined(args.organization);
+  argOverlay.enterprise = trimToUndefined(args.enterprise);
   argOverlay.authMode = normalizeAuthMode(args.auth_mode);
   argOverlay.apiToken = trimToUndefined(args.api_token);
   argOverlay.appId = trimToUndefined(args.app_id);
@@ -764,6 +793,7 @@ export async function resolveGitHubConfiguration(
     ? String(args.installation_id)
     : trimToUndefined(args.installation_id);
   argOverlay.apiBaseUrl = trimToUndefined(args.api_base_url);
+  argOverlay.graphqlUrl = trimToUndefined(args.graphql_url);
   argOverlay.lookbackDays = parseOptionalNumber(args.lookback_days);
   if (trimToUndefined(args.app_private_key)) {
     argOverlay.appPrivateKey = trimToUndefined(args.app_private_key);
@@ -816,14 +846,17 @@ export async function resolveGitHubConfiguration(
     }
   }
 
+  const apiBaseUrl = normalizeApiBaseUrl(overlay.apiBaseUrl ?? "https://api.github.com");
   return {
     organization,
+    enterprise: overlay.enterprise ? normalizeOrganization(overlay.enterprise) : undefined,
     authMode,
     apiToken: overlay.apiToken,
     appId: overlay.appId,
     appPrivateKey: overlay.appPrivateKey,
     installationId: overlay.installationId,
-    apiBaseUrl: normalizeApiBaseUrl(overlay.apiBaseUrl ?? "https://api.github.com"),
+    apiBaseUrl,
+    graphqlUrl: overlay.graphqlUrl ? normalizeApiBaseUrl(overlay.graphqlUrl) : deriveGraphqlUrl(apiBaseUrl),
     lookbackDays: overlay.lookbackDays ?? DEFAULT_LOOKBACK_DAYS,
     sourceChain,
   };
@@ -1027,6 +1060,27 @@ export class GitHubAuditorClient {
     }
 
     throw new Error(`GitHub request retries exhausted for ${pathname}`);
+  }
+
+  async graphql<T = JsonRecord>(
+    query: string,
+    variables: JsonRecord = {},
+  ): Promise<GitHubGraphqlResult<T>> {
+    const { payload } = await this.requestJson<JsonRecord>(this.config.graphqlUrl, {
+      method: "POST",
+      body: { query, variables },
+    });
+    const envelope = asRecord(payload);
+    const errors = asArray(envelope.errors).map((entry) => {
+      const record = asRecord(entry);
+      return {
+        type: asString(record.type),
+        message: asString(record.message) ?? "GraphQL error without a message",
+        path: Array.isArray(record.path) ? record.path as Array<string | number> : undefined,
+      };
+    });
+    const data = envelope.data && typeof envelope.data === "object" ? envelope.data as T : null;
+    return { data, errors };
   }
 
   async getOrganization(): Promise<JsonRecord> {
@@ -2275,9 +2329,19 @@ export function registerGitHubTools(pi: any): void {
         description: "Optional GitHub App installation ID for installation-token auth.",
       }),
     ),
+    enterprise: Type.Optional(
+      Type.String({
+        description: "Optional GitHub Enterprise slug for enterprise-level checks. Falls back to GITHUB_ENTERPRISE.",
+      }),
+    ),
     api_base_url: Type.Optional(
       Type.String({
-        description: "Optional GitHub API base URL. Defaults to https://api.github.com and can be overridden for GHES-style deployments.",
+        description: "Optional GitHub REST API base URL. Defaults to https://api.github.com and can be overridden for GHES-style deployments. Falls back to GITHUB_API_URL or GITHUB_API_BASE_URL.",
+      }),
+    ),
+    graphql_url: Type.Optional(
+      Type.String({
+        description: "Optional GitHub GraphQL endpoint. Defaults to https://api.github.com/graphql (or HOSTNAME/api/graphql for GHES). Falls back to GITHUB_GRAPHQL_URL.",
       }),
     ),
     lookback_days: Type.Optional(
