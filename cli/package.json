@@ -29,6 +29,7 @@
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
     "test:gws-ops:live": "npm run build && node scripts/gws-ops-live-smoke.mjs",
     "test:gws:live": "npm run build && node scripts/gws-live-smoke.mjs",
+    "test:launchdarkly:live": "npm run build && node scripts/launchdarkly-live-smoke.mjs",
     "test:okta:live": "npm run build && node scripts/okta-live-smoke.mjs",
     "test:oscal:live": "npm run build && node scripts/oscal-live-smoke.mjs",
     "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
