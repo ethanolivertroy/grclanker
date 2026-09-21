@@ -1848,7 +1848,7 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       2,
-      { primary: [mfaExemptUsers], partial: [truncationNote("members", members.value)] },
+      { primary: [mfaExemptUsers], partial: [truncationNote("members", members.value), scopeNote] },
       "Capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.",
       () => {
         const evidence = {
@@ -1873,6 +1873,7 @@ export async function assessMulesoftIdentityAccess(
         partial: [
           truncationNote("role groups", roleGroups.value),
           adminUsersTruncated ? `admin role group membership truncated at ${adminUsers.size} users` : undefined,
+          scopeNote,
         ],
       },
       "Export Access Management > Users filtered by the Organization Administrator permission and record the member count.",
@@ -1903,6 +1904,7 @@ export async function assessMulesoftIdentityAccess(
         partial: [
           truncationNote("role groups", roleGroups.value),
           truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
+          scopeNote,
         ],
       },
       "Export each role group and its permissions from Access Management > Role Groups.",
@@ -1932,6 +1934,7 @@ export async function assessMulesoftIdentityAccess(
         partial: [
           truncationNote("role groups", roleGroups.value),
           truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
+          scopeNote,
         ],
       },
       "Export environment permissions per user from Access Management > Users > Permissions and confirm each grant names a specific environment.",
@@ -1958,7 +1961,7 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       6,
-      { primary: [environments] },
+      { primary: [environments], partial: [scopeNote] },
       "Export Access Management > Environments with each environment's type and confirm production workloads do not share a sandbox environment.",
       () => {
         const evidence = {
@@ -1989,6 +1992,7 @@ export async function assessMulesoftIdentityAccess(
         partial: [
           truncationNote("connected apps", connectedApps.value),
           truncatedScopeApps.length > 0 ? `scope lists truncated for ${truncatedScopeApps.join(", ")}` : undefined,
+          scopeNote,
         ],
       },
       "Export Access Management > Connected Apps with each app's scopes and grant type.",
@@ -2018,7 +2022,7 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       19,
-      { primary: [connectedApps], partial: [truncationNote("connected apps", connectedApps.value)] },
+      { primary: [connectedApps], partial: [truncationNote("connected apps", connectedApps.value), scopeNote] },
       "Export the connected apps list with last-used timestamps from Access Management > Connected Apps and confirm each app is still required.",
       () => {
         const evidence = {
@@ -2252,6 +2256,7 @@ export async function assessMulesoftApiGateway(
     primary: [environments.source, apisSource, policiesSource],
     partial: [...environments.partialNotes, ...apiPartialNotes],
   };
+  const apiInventoryFailure = [environments.source, apisSource].find((source) => source.error);
 
   const findings: MulesoftFinding[] = [
     evaluate(
@@ -2283,12 +2288,13 @@ export async function assessMulesoftApiGateway(
     finding(
       9,
       "manual",
-      apisSource.error || environments.source.error
-        ? `Anypoint Platform does not expose client secret rotation timestamps, and the API inventory could not be read (${(apisSource.error ?? environments.source.error) as string}). Export the active contracts from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`
+      apiInventoryFailure
+        ? `Anypoint Platform does not expose client secret rotation timestamps, and the API inventory could not be evaluated: ${describeFailure(apiInventoryFailure)}. Export the active contracts from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`
         : `Anypoint Platform does not expose client secret rotation timestamps. Export the ${activeContracts} active contract(s) from API Manager > API instance > Contracts and the client applications from Exchange > My Applications, then confirm each client secret was reset within the rotation period.`,
       {
-        active_contracts: apisSource.error ? null : activeContracts,
+        active_contracts: apiInventoryFailure ? null : activeContracts,
         apis_sampled: apiRecords.length,
+        unreadable_sources: apiInventoryFailure ? [describeFailure(apiInventoryFailure)] : [],
         partial_view: [...environments.partialNotes, ...apiPartialNotes],
       },
     ),
@@ -3072,6 +3078,7 @@ export async function assessMulesoftAuditMonitoring(
         const evidence = {
           lookback_hours: lookbackHours,
           entries_in_window: entriesInWindow,
+          entries_fetched: recentEntries.length,
           entries_in_fallback_window: fallbackEntries.length,
           fallback_lookback_days: AUDIT_FALLBACK_LOOKBACK_DAYS,
           platforms: platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"),
@@ -3079,7 +3086,8 @@ export async function assessMulesoftAuditMonitoring(
           recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
         };
         if (recentEntries.length > 0) {
-          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours across ${platforms.value.length} platform(s).`, evidence);
+          const fetchedNote = entriesInWindow > recentEntries.length ? ` (${recentEntries.length} fetched)` : "";
+          return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote} across ${platforms.value.length} platform(s).`, evidence);
         }
         if (fallbackEntries.length > 0) {
           return verdict("warn", `Audit logging is queryable but no entries were recorded in the last ${lookbackHours} hours; the most recent activity is older than that window.`, evidence);
