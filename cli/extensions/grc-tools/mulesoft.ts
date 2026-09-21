@@ -494,6 +494,11 @@ export function toPage(value: MulesoftListResult | undefined): MulesoftPage {
   return { items, total: items.length, truncated: false, limit: items.length };
 }
 
+function capPage(page: MulesoftPage, limit: number): MulesoftPage {
+  if (page.items.length <= limit) return page;
+  return { items: page.items.slice(0, limit), total: page.total ?? page.items.length, truncated: true, limit };
+}
+
 function pageTotalLabel(page: MulesoftPage): string {
   return page.total === undefined ? "an unknown total" : `${page.total} total`;
 }
@@ -1311,16 +1316,19 @@ export class MulesoftApiClient {
     return extractCollection(await this.get("/cloudhub/api/v2/alerts", {}, this.environmentHeaders(environmentId)));
   }
 
-  async listVpcs(): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(`/cloudhub/api/organizations/${encodeURIComponent(this.config.organizationId)}/vpcs`));
+  async listVpcs(limit = DEFAULT_VPC_LIMIT): Promise<MulesoftPage> {
+    return this.listOffset(`/cloudhub/api/organizations/${encodeURIComponent(this.config.organizationId)}/vpcs`, { limit });
   }
 
   async getVpc(vpcId: string): Promise<JsonRecord> {
     return asObject(await this.get(`/cloudhub/api/organizations/${encodeURIComponent(this.config.organizationId)}/vpcs/${encodeURIComponent(vpcId)}`)) ?? {};
   }
 
-  async listLoadBalancers(): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(`/cloudhub/api/organizations/${encodeURIComponent(this.config.organizationId)}/loadbalancers`));
+  async listLoadBalancers(limit = DEFAULT_LOAD_BALANCER_LIMIT): Promise<MulesoftPage> {
+    return this.listOffset(
+      `/cloudhub/api/organizations/${encodeURIComponent(this.config.organizationId)}/loadbalancers`,
+      { limit, query: { shortFormat: false } },
+    );
   }
 
   async probeCertificate(host: string): Promise<MulesoftCertificateSummary> {
@@ -2549,10 +2557,11 @@ export async function assessMulesoftRuntimeInfrastructure(
   const mqClientsSource = mergeSources("mq_clients", mqClientSources);
   const secretGroupsSource = mergeSources("secret_groups", secretGroupSources);
 
-  const vpcSummaries = await collect<JsonRecord[]>("vpcs", [], () => client.listVpcs(), errors);
+  const vpcSummaries = await collectPage("vpcs", () => client.listVpcs(DEFAULT_VPC_LIMIT), errors);
+  const vpcPage = capPage(vpcSummaries.value, DEFAULT_VPC_LIMIT);
   const vpcDetails: Array<Collected<JsonRecord>> = [];
   const vpcs: JsonRecord[] = [];
-  for (const vpc of vpcSummaries.value.slice(0, DEFAULT_VPC_LIMIT)) {
+  for (const vpc of vpcPage.items) {
     const vpcId = asString(vpc.id);
     const vpcName = asString(vpc.name) ?? vpcId ?? "vpc";
     const detail: Collected<JsonRecord> = vpcId
@@ -2562,16 +2571,13 @@ export async function assessMulesoftRuntimeInfrastructure(
     vpcs.push({ ...vpc, ...detail.value });
   }
   const vpcDetailsSource = mergeSources("vpc_details", vpcDetails);
-  const vpcPartialNote = vpcSummaries.value.length > DEFAULT_VPC_LIMIT
-    ? `VPC list truncated at ${DEFAULT_VPC_LIMIT} of ${vpcSummaries.value.length}`
-    : undefined;
+  const vpcPartialNote = truncationNote("VPC", vpcPage);
   const vpcsWithoutRules = vpcs.filter((vpc) => !Array.isArray(vpc.firewallRules));
 
-  const loadBalancerSource = await collect<JsonRecord[]>("load_balancers", [], () => client.listLoadBalancers(), errors);
-  const loadBalancers = loadBalancerSource.value.slice(0, DEFAULT_LOAD_BALANCER_LIMIT);
-  const loadBalancerPartialNote = loadBalancerSource.value.length > DEFAULT_LOAD_BALANCER_LIMIT
-    ? `load balancer list truncated at ${DEFAULT_LOAD_BALANCER_LIMIT} of ${loadBalancerSource.value.length}`
-    : undefined;
+  const loadBalancerSource = await collectPage("load_balancers", () => client.listLoadBalancers(DEFAULT_LOAD_BALANCER_LIMIT), errors);
+  const loadBalancerPage = capPage(loadBalancerSource.value, DEFAULT_LOAD_BALANCER_LIMIT);
+  const loadBalancers = loadBalancerPage.items;
+  const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
   const certificateProbes: Array<{ loadBalancer: JsonRecord; certificate?: MulesoftCertificateSummary; error?: string }> = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);

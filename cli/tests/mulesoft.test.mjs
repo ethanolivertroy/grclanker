@@ -1864,8 +1864,8 @@ test("false-pass self-check (c): partial inventories yield no pass in any assess
   assert.match(findingById(runtime, "MULESOFT-RT-15").summary, /load balancer list truncated at 10 of 11/);
   assert.deepEqual(runtime.summary.partial_view, [
     "the environment limit of 1 excluded 1 environment(s) (0 production): Sandbox",
-    "VPC list truncated at 20 of 21",
-    "load balancer list truncated at 10 of 11",
+    "VPC list truncated at 20 of 21 total",
+    "load balancer list truncated at 10 of 11 total",
   ]);
   assert.equal(runtime.summary.applications_not_inspected, 0);
 
@@ -2036,4 +2036,57 @@ test("review fix 2: the ARM server envelope is unwrapped so a RUNNING hybrid ser
   assert.equal(statusOf(result, "MULESOFT-RT-23"), "pass", findingById(result, "MULESOFT-RT-23").summary);
   assert.deepEqual(findingById(result, "MULESOFT-RT-23").evidence.mule_versions, ["4.6.0"]);
   assert.deepEqual(findingById(result, "MULESOFT-RT-23").evidence.disconnected_servers, []);
+});
+
+test("review fix 3: listVpcs and listLoadBalancers page with limit and offset, request the long DLB format, and record truncation", async () => {
+  const vpcs = Array.from({ length: 25 }, (_, index) => ({ id: `vpc-${index}`, name: `vpc-${index}` }));
+  const loadBalancers = Array.from({ length: 12 }, (_, index) => ({ id: `lb-${index}`, name: `dlb-${index}`, domain: `dlb-${index}.lb.anypointdns.net`, tlsv1: false, httpMode: "redirect" }));
+  const seen = [];
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: routedFetch([
+      pagedServer(`/cloudhub/api/organizations/${ORG_ID}/vpcs`, vpcs, 100),
+      pagedServer(`/cloudhub/api/organizations/${ORG_ID}/loadbalancers`, loadBalancers, 100),
+    ], seen),
+  });
+
+  const cappedVpcs = await client.listVpcs();
+  assert.equal(cappedVpcs.items.length, 20);
+  assert.equal(cappedVpcs.total, 25);
+  assert.equal(cappedVpcs.truncated, true);
+  const allVpcs = await client.listVpcs(25);
+  assert.equal(allVpcs.items.length, 25);
+  assert.equal(allVpcs.truncated, false);
+
+  const cappedLoadBalancers = await client.listLoadBalancers();
+  assert.equal(cappedLoadBalancers.items.length, 10);
+  assert.equal(cappedLoadBalancers.total, 12);
+  assert.equal(cappedLoadBalancers.truncated, true);
+  const loadBalancerRequests = seen.filter((request) => request.pathname.endsWith("/loadbalancers"));
+  assert.ok(loadBalancerRequests.length > 0);
+  assert.ok(loadBalancerRequests.every((request) => request.search.includes("shortFormat=false") && /limit=\d+/.test(request.search) && /offset=\d+/.test(request.search)));
+  assert.ok(seen.filter((request) => request.pathname.endsWith("/vpcs")).every((request) => /limit=\d+/.test(request.search) && /offset=\d+/.test(request.search)));
+});
+
+test("review fix 3: truncated VPC and load balancer pages downgrade RT-13 through RT-16 instead of passing", async () => {
+  const healthy = healthyRuntimeClient();
+  const client = healthyRuntimeClient({
+    async listVpcs() {
+      return truncatedPage(await healthy.listVpcs(), 30);
+    },
+    async listLoadBalancers() {
+      return truncatedPage(await healthy.listLoadBalancers(), 15);
+    },
+  });
+
+  const result = await assessMulesoftRuntimeInfrastructure(client);
+
+  for (const id of ["MULESOFT-RT-13", "MULESOFT-RT-14"]) {
+    assert.equal(statusOf(result, id), "warn", id);
+    assert.match(findingById(result, id).summary, /Partial view: VPC list truncated at 1 of 30 total/, id);
+  }
+  for (const id of ["MULESOFT-RT-15", "MULESOFT-RT-16"]) {
+    assert.equal(statusOf(result, id), "warn", id);
+    assert.match(findingById(result, id).summary, /Partial view: load balancer list truncated at 1 of 15 total/, id);
+  }
+  assert.deepEqual(result.summary.partial_view, ["VPC list truncated at 1 of 30 total", "load balancer list truncated at 1 of 15 total"]);
 });
