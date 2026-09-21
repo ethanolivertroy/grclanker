@@ -43,14 +43,21 @@ const EXPECTED_WRITE_TOOLS = [
   "ansible_export_audit_bundle",
   "aws_export_audit_bundle",
   "azure_export_audit_bundle",
+  "box_export_audit_bundle",
   "cloudflare_export_audit_bundle",
+  "crowdstrike_export_audit_bundle",
+  "datadog_export_audit_bundle",
   "duo_export_audit_bundle",
+  "elastic_export_audit_bundle",
   "fedramp_generate_ads_bundle",
   "fedramp_generate_ads_site",
   "gcp_export_audit_bundle",
   "github_export_audit_bundle",
   "gws_export_audit_bundle",
   "gws_ops_collect_evidence_bundle",
+  "knowbe4_export_audit_bundle",
+  "launchdarkly_export_audit_bundle",
+  "mulesoft_export_audit_bundle",
   "oci_export_audit_bundle",
   "okta_export_audit_bundle",
   "oscal_assemble_ssp",
@@ -58,9 +65,19 @@ const EXPECTED_WRITE_TOOLS = [
   "oscal_generate_ssp_markdown",
   "oscal_import_model",
   "oscal_init_workspace",
+  "pagerduty_export_audit_bundle",
+  "paloalto_export_audit_bundle",
+  "salesforce_export_audit_bundle",
+  "servicenow_export_audit_bundle",
   "slack_export_audit_bundle",
+  "snowflake_export_audit_bundle",
+  "splunk_export_audit_bundle",
+  "sumologic_export_audit_bundle",
+  "tenable_export_audit_bundle",
   "vanta_export_audit",
+  "veracode_export_audit_bundle",
   "webex_export_audit_bundle",
+  "zendesk_export_audit_bundle",
   "zoom_export_audit_bundle",
 ];
 
@@ -106,7 +123,7 @@ test("agent sdk registry exposes every domain tool and excludes compute backend 
     .filter((tool) => tool.kind === "domain")
     .map((tool) => tool.name);
 
-  assert.equal(tools.length, 107);
+  assert.equal(tools.length, 219);
   assert.deepEqual(names, expected);
   assert.equal(new Set(names).size, names.length);
   for (const computeTool of COMPUTE_TOOL_NAMES) {
@@ -451,7 +468,7 @@ test("agent/tools has exactly one generated entry per registered domain tool", a
   const files = await listAgentSdkToolFiles(toolsDir);
   const names = [...listRegisteredGrcToolNames()].sort();
 
-  assert.equal(files.length, 107);
+  assert.equal(files.length, 219);
   assert.deepEqual(files, names);
   for (const name of names) {
     const source = readFileSync(resolve(toolsDir, `${name}.ts`), "utf8");
@@ -510,5 +527,5 @@ test("every generated tool entry registers a server tool for its filename", asyn
   }
 
   const after = mockCalls().filter((call) => call.helper === "defineTool").length;
-  assert.equal(after - before, 107);
+  assert.equal(after - before, 219);
 });

@@ -3,11 +3,13 @@ slug: "elastic-sec-inspector"
 name: "Elastic Security Inspector"
 vendor: "Elastic"
 category: "monitoring-logging-observability"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/elastic-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/elastic-sec-inspector"
+reference_docs: "https://www.elastic.co/docs/api/doc/elasticsearch/"
 ---
 
 # Elastic Security Inspector — Architecture Specification
@@ -17,6 +19,22 @@ source_repo: "https://github.com/hackIDLE/elastic-sec-inspector"
 **elastic-sec-inspector** is a security compliance inspection tool for Elastic Cloud and self-managed Elasticsearch/Kibana deployments. It audits authentication realms, TLS configurations, role-based access controls, field/document-level security, API key management, audit logging, and cluster security settings via the Elasticsearch Security API and Kibana API. The tool produces structured findings mapped to major compliance frameworks, enabling security teams to identify misconfigurations and maintain continuous compliance posture.
 
 Written in Go with a hybrid CLI/TUI architecture, it supports both automated pipeline execution (JSON/SARIF output) and interactive exploration of findings.
+
+### grclanker implementation
+
+The shipped implementation is native TypeScript inside grclanker (`cli/extensions/grc-tools/elastic.ts`) rather than the standalone Go binary described below. It registers seven read-only tools:
+
+| Tool | Spec controls |
+|------|---------------|
+| `elastic_check_access` | Probes every read surface across Elasticsearch, Kibana, and Elastic Cloud and reports missing cluster and index privileges |
+| `elastic_assess_identity` | 1, 9, 10, 13, 14 |
+| `elastic_assess_access_control` | 6, 7, 8 |
+| `elastic_assess_transport_security` | 2, 3, 4, 5 |
+| `elastic_assess_cluster_hardening` | 11, 12, 17, 18, 19, 20, 22, 23 |
+| `elastic_assess_kibana` | 15, 16, 21 |
+| `elastic_export_audit_bundle` | All 23, written as `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and a zip archive |
+
+Findings use the ids `ELASTIC-01` through `ELASTIC-23`, carry the Section 5 framework mappings, and use the statuses `pass`, `warn`, `fail`, and `manual`. Tests live in `cli/tests/elastic.test.mjs`, the live smoke path in `cli/scripts/elastic-live-smoke.mjs` (`npm --prefix cli run test:elastic:live`), and the operator guide in `src/content/docs/docs/integrations/elastic.md`.
 
 ## 2. APIs & SDKs
 
@@ -368,4 +386,33 @@ make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+**Implemented in grclanker (2026-09-21).** The Elastic inspector ships as native TypeScript tools in `cli/extensions/grc-tools/elastic.ts`; the Go/TUI architecture in Sections 7 through 9 is preserved as historical design context for the original standalone concept.
+
+### What shipped
+
+- Configuration resolution with the precedence explicit arguments, then environment variables (`ELASTIC_URL`/`ELASTICSEARCH_URL`, `ELASTIC_API_KEY`, `ELASTIC_USERNAME`/`ELASTIC_PASSWORD`, `ELASTIC_BEARER_TOKEN`, `KIBANA_URL`, `KIBANA_SPACE_ID`, `ELASTIC_CLOUD_API_KEY`, `ELASTIC_CLOUD_API_URL`, `ELASTIC_TIMEOUT`), then `~/.elastic-sec-inspector/config.yaml` (or `ELASTIC_SEC_INSPECTOR_CONFIG`). All four Section 3 auth modes are supported: `ApiKey` (with automatic base64 encoding of `id:key`), `Basic`, `Bearer`, and Elastic Cloud `ApiKey`.
+- One client for Elasticsearch, Kibana (`kbn-xsrf: true`, space-aware `/s/{space}/api/...` paths), and Elastic Cloud with 429/502/503/504 retry and exponential backoff honoring `Retry-After`, request timeouts, transient network retry, and redaction of credentials in every error message and snapshot.
+- Documented pagination for every list surface: `search_after` with `_sort` for `POST /_security/_query/api_key`, `from`/`size` for `POST /_watcher/_query/watches`, `page`/`perPage` for Fleet agent policies and enrollment API keys, and `page`/`per_page` for detection and alerting rules. `GET /api/fleet/fleet_server_hosts` and `GET /api/fleet/outputs` document no query parameters, so each is read in a single request; the Fleet Server host list is capped client-side and the response `total` is used to record truncation.
+- `elastic_check_access`, five `elastic_assess_<area>` tools, and `elastic_export_audit_bundle`, together covering all 23 Section 4 controls with the Section 5 mappings on every finding. Verdicts never pass on missing or partial evidence: unreadable or forbidden endpoints yield `manual` findings that name the cause and the evidence a human must collect, empty inventories are judged per control (`fail` or `manual`, stated in the summary) and pass only where the control concerns existing items, scoped-out or unlicensed controls render as "not applicable" `manual` findings, undated items are bucketed and cap the verdict at `warn`, partial views (own API keys only, truncated pages, unresponsive nodes, single-node certificate reports, single-space Kibana inventories) cap the verdict and report seen and total counts, and every enabling flag (`xpack.security.enabled`, TLS `enabled` and `verification_mode`, `xpack.security.audit.enabled`, realm `enabled`, anonymous roles, license type and status) is read before a `pass`, with transient over persistent over node over default precedence.
+- Re-running the export allocates a fresh directory and derives the archive name from it, so a prior bundle is never overwritten.
+- 51 mocked Node tests (including regression tests for each verdict-safety rule, three false-pass self-checks, and one per compliance review fix) plus a live smoke script that skips cleanly without credentials.
+
+### Deviations from this spec (official documentation wins)
+
+- `GET /_security/api_key?owner=false` was replaced by `POST /_security/_query/api_key?with_limited_by=true`, the documented paginated endpoint that also exposes owner privileges for keys that inherit them.
+- `GET /_xpack/security` is not a documented endpoint; feature enablement comes from `GET /_xpack` (`features.security`) and `GET /_xpack/usage`.
+- `GET /api/saved_objects/_find?type=config` is deprecated in current Kibana and is not used. Kibana status comes from `GET /api/status`.
+- `GET /_security/privilege` and `GET /_security/saml/metadata/{realm}` are not collected: application privileges do not feed any Section 4 control, and SAML metadata requires realm names that are only visible in settings. SSO checks (control 13) use non-secret realm settings from `GET /_nodes/settings?flat_settings=true` plus role mappings.
+- Per-item endpoints (`/_security/user/{username}`, `/_security/role/{name}`, `/_security/role_mapping/{name}`, `/api/spaces/space/{id}`, `/api/v1/deployments/{id}`, `/api/v1/deployments/{id}/activity`) are not called because the list endpoints already return the full objects; only `GET /api/v1/deployments` is collected from Elastic Cloud, as inventory.
+- Added surfaces not in Section 2 that the controls require: `GET /_security/_authenticate`, `POST /_security/user/_has_privileges`, `GET /_ilm/status`, `GET /_ilm/policy`, `GET /_slm/status`, `GET /_slm/policy`, `GET /_snapshot/_all`, `POST /_watcher/_query/watches`, `GET /_ingest/pipeline`, `GET /api/fleet/fleet_server_hosts`, `GET /api/detection_engine/rules/_find`, `GET /api/alerting/rules/_find`, and `GET /api/actions/connectors`.
+- Section 3 lists `manage_security` and `manage_pipeline`; the implementation asks for the read-only equivalents (`read_security`, `read_pipeline`) plus `manage_api_key`, `read_ilm`, `read_slm`, `monitor_snapshot`, and `monitor_watcher`, and reports whichever are missing.
+- Cluster defaults are read with `GET /_cluster/settings?include_defaults=true&flat_settings=true` and node values with `GET /_nodes/settings?flat_settings=true`, because per-node settings are where realm, TLS, and audit configuration actually live.
+
+### What remains
+
+- Control 12 (audit log output) can only confirm that auditing is enabled and writes to the `logfile` output; forwarding to a tamper-resistant destination is a permanent manual evidence item.
+- Control 18 verifies encryption only for GCS, Azure, and S3 with `server_side_encryption`; other repository types need manual storage encryption evidence.
+- Controls 7 and 8 need `sensitive_index_patterns` and `tenant_index_patterns` to move beyond a warning, since the API cannot identify which indices hold sensitive or tenant data.
+- No SARIF, CSV, HTML, or TUI output; grclanker's bundle export (JSON, Markdown, zip) is the reporting surface.
+- Custom CA, client certificate (mTLS), and skip-verify options from Section 8 are not exposed; the Node runtime trust store is used.
+- Live validation against a real Elastic Cloud deployment and a self-managed 8.x cluster is still pending.

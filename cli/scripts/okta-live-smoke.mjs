@@ -4,8 +4,14 @@ import { join, resolve } from "node:path";
 
 import {
   OktaAuditorClient,
+  assessOktaAdminAccess,
   assessOktaAuthentication,
+  assessOktaIntegrations,
+  assessOktaMonitoring,
+  collectOktaAdminAccessData,
   collectOktaAuthenticationData,
+  collectOktaIntegrationData,
+  collectOktaMonitoringData,
   resolveOktaConfiguration,
   runOktaAccessCheck,
 } from "../dist/extensions/grc-tools/okta.js";
@@ -23,6 +29,28 @@ function hasConfigHints() {
     || existsSync(resolve(process.cwd(), ".okta.yaml"))
     || existsSync(join(homedir(), ".okta", "okta.yaml"))
   );
+}
+
+function summarize(label, assessment) {
+  log(`${label}: ${assessment.findings.length} findings`);
+  log(
+    `  Pass ${assessment.summary.Pass}, Partial ${assessment.summary.Partial}, Fail ${assessment.summary.Fail}, Manual ${assessment.summary.Manual}, Info ${assessment.summary.Info}`,
+  );
+  const errors = assessment.snapshotSummary.dataset_errors;
+  if (errors > 0) {
+    log(`  Dataset errors: ${errors} (findings backed by those datasets are rendered Manual)`);
+  }
+  for (const finding of assessment.findings) {
+    log(`  - ${finding.id} ${finding.status}: ${finding.summary}`);
+  }
+}
+
+function assertVerdictSafety(assessment) {
+  for (const finding of assessment.findings) {
+    if (finding.status === "Manual" && !finding.manualNote) {
+      throw new Error(`${finding.id} is Manual without naming the evidence to collect.`);
+    }
+  }
 }
 
 try {
@@ -49,13 +77,20 @@ try {
     );
   }
 
-  const authentication = await collectOktaAuthenticationData(client);
-  const assessment = assessOktaAuthentication(authentication, config);
+  const assessments = [
+    ["okta_assess_authentication", assessOktaAuthentication(await collectOktaAuthenticationData(client), config)],
+    ["okta_assess_admin_access", assessOktaAdminAccess(await collectOktaAdminAccessData(client), config)],
+    ["okta_assess_integrations", assessOktaIntegrations(await collectOktaIntegrationData(client), config)],
+    ["okta_assess_monitoring", assessOktaMonitoring(await collectOktaMonitoringData(client), config)],
+  ];
 
-  log(`Authentication findings: ${assessment.findings.length}`);
-  log(
-    `Summary: Pass ${assessment.summary.Pass}, Partial ${assessment.summary.Partial}, Fail ${assessment.summary.Fail}, Manual ${assessment.summary.Manual}, Info ${assessment.summary.Info}`,
-  );
+  for (const [label, assessment] of assessments) {
+    summarize(label, assessment);
+    assertVerdictSafety(assessment);
+  }
+
+  const totalFindings = assessments.reduce((total, [, assessment]) => total + assessment.findings.length, 0);
+  log(`Total findings across assess tools: ${totalFindings}`);
   log("Live Okta smoke test passed.");
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);

@@ -81,7 +81,7 @@ delete process.env.GRCLANKER_FLUE_SANDBOX;
 const { Grclanker, prepareGrclankerAgent } = await import("../dist/flue/agent.js");
 
 const AGENT_IDENTITY_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$/;
-const DOMAIN_TOOL_COUNT = 107;
+const DOMAIN_TOOL_COUNT = 219;
 
 // The Pi CLI's own argument validation (pi-ai 0.80.2, the copy the CLI runs),
 // used as the oracle the adapter is compared against.
@@ -905,8 +905,9 @@ test("credential-bearing tool arguments are redacted before serialization, at an
   };
   for (const parameters of collectToolParameterSchemas().values()) walk(parameters);
   const credentialKeys = [
-    "access_token", "api_key", "api_token", "app_private_key", "client_assertion", "client_secret", "credentials_json",
-    "graph_token", "ikey", "management_token", "private_key", "scim_token", "skey", "token",
+    "access_key", "access_token", "api_key", "api_token", "app_key", "app_private_key", "client_assertion", "client_secret",
+    "consumer_key", "credentials_json", "graph_token", "ikey", "management_token", "prisma_access_key_id", "private_key",
+    "sc_access_key", "scim_token", "skey", "token",
   ];
   for (const key of credentialKeys) {
     assert.ok(declaredKeys.has(key), `${key} is still a declared tool parameter`);
@@ -940,14 +941,47 @@ test("credential-bearing tool arguments are redacted before serialization, at an
   const looselySensitive =
     /secret|key|token|pass|auth|cert|cookie|session|credential|assertion|jwt|pin(?:_|\b)|otp|dsn|bearer|signature|hmac|kubeconfig|connection|webhook|\bsas\b|pem\b|license/i;
   const reviewedSafeKeys = new Set([
+    "api_key_limit", // count threshold
+    "api_key_max_age_days", // duration threshold
     "app_private_key_path", // path to the key file, not the key
+    "auth_method", // selects an authentication strategy (Box, ServiceNow), not a credential
     "auth_mode", // selects an authentication strategy, not a credential
+    "authority_host", // Azure AD authority endpoint
+    "cert_expiry_warn_days", // duration threshold
+    "cert_expiry_warning_days", // duration threshold
     "cert_number", // CMVP certificate number, public
+    "certificate_expiry_warning_days", // duration threshold
+    "certificate_warning_days", // duration threshold
+    "connection", // Snowflake connection profile name in connections.toml, not a connection string
     "credentials_file", // path to the credentials file, not its contents
+    "integration_keys", // LaunchDarkly integration catalog identifiers (datadog, splunk, ...), public
+    "jwt_config_path", // filesystem path to the Box JWT config; the file holds the credential, the path does not
+    "key_inactive_days", // duration threshold
+    "key_limit", // count threshold
+    "key_max_age_days", // duration threshold
+    "key_rotation_days", // duration threshold
+    "key_unused_days", // duration threshold
     "license_limit", // count threshold
+    "max_api_key_age_days", // duration threshold
+    "max_concurrent_sessions", // count threshold
+    "max_credential_age_days", // duration threshold
+    "max_enrollment_keys_per_policy", // count threshold
     "max_keys", // count threshold
+    "max_password_age_days", // duration threshold
     "max_session_hours", // duration threshold
+    "max_session_idle_minutes", // duration threshold
+    "max_session_minutes", // duration threshold
+    "max_session_timeout_minutes", // duration threshold
+    "max_token_age_days", // duration threshold
+    "min_compliance_pass_rate", // percentage threshold
+    "min_password_length", // count threshold
+    "min_posture_pass_rate", // ratio threshold
     "oauth_base_url", // endpoint
+    "private_key_file", // path to the key file, not the key
+    "private_key_path", // path to the key file, not the key
+    "project_keys", // LaunchDarkly project identifiers, not credentials
+    "sdk_key_max_age_days", // duration threshold
+    "session_timeout_minutes", // duration threshold
     "stale_credential_days", // age threshold
     "stale_token_days", // age threshold
     "token_limit", // count threshold

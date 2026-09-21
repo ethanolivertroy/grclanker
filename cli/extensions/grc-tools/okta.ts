@@ -40,6 +40,13 @@ const LOOKBACK_DAYS = 30;
 const TOKEN_SKEW_MS = 60 * 1000;
 const DEFAULT_RATE_LIMIT_RETRIES = 4;
 const DAYS_90_MS = 90 * 24 * 60 * 60 * 1000;
+const DAYS_30_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_USER_PAGES = 50;
+const MAX_PRIVILEGED_FACTOR_LOOKUPS = 50;
+const MAX_PRIVILEGED_GROUP_LOOKUPS = 25;
+const FEDERAL_ORG_HOST_PATTERN = /\.(okta-gov\.com|okta\.gov|okta\.mil)$/i;
+const RESTRICTED_AUTHENTICATOR_KEYS = new Set(["phone_number", "security_question", "okta_email"]);
+const OSCAL_VERSION = "1.1.2";
 const DEFAULT_OKTA_READ_SCOPES = [
   "okta.users.read",
   "okta.groups.read",
@@ -65,7 +72,7 @@ const OKTA_AUTH_PROBE_PATHS = [
   { key: "policies", path: "/api/v1/policies?type=OKTA_SIGN_ON&limit=1" },
   { key: "logs", path: "/api/v1/logs?limit=1" },
   { key: "roles", path: "/api/v1/iam/assignees/users?limit=1" },
-  { key: "api_tokens", path: "/api/v1/api-tokens?limit=1" },
+  { key: "api_tokens", path: "/api/v1/api-tokens" },
 ];
 const ADMIN_GROUP_NAME_PATTERN = /(admin|administrator|privileged|help.?desk|security|access)/i;
 const STRONG_AUTHENTICATOR_PATTERN = /(okta_verify|fastpass|webauthn|fido2|smart[_ -]?card|certificate|piv|cac)/i;
@@ -175,6 +182,14 @@ export interface OktaAssessmentResult {
 interface CollectedDataset<T = unknown> {
   data: T;
   error?: string;
+  truncated?: boolean;
+  truncationNote?: string;
+}
+
+interface PaginatedList {
+  items: JsonRecord[];
+  truncated: boolean;
+  pagesFetched: number;
 }
 
 interface OktaAuthenticationData {
@@ -199,6 +214,10 @@ interface OktaAdminAccessData {
   privilegedGroups: CollectedDataset<JsonRecord[]>;
   privilegedGroupRoles: CollectedDataset<Record<string, JsonRecord[]>>;
   privilegedGroupMembers: CollectedDataset<Record<string, JsonRecord[]>>;
+  users: CollectedDataset<JsonRecord[]>;
+  privilegedUserFactors: CollectedDataset<Record<string, JsonRecord[]>>;
+  oktaSupportAccess: CollectedDataset<JsonRecord | null>;
+  thirdPartyAdminSetting: CollectedDataset<JsonRecord | null>;
 }
 
 interface OktaIntegrationData {
@@ -211,6 +230,7 @@ interface OktaIntegrationData {
   signOnPolicyRules: CollectedDataset<Record<string, JsonRecord[]>>;
   idps: CollectedDataset<JsonRecord[]>;
   authorizationServers: CollectedDataset<JsonRecord[]>;
+  groupRules: CollectedDataset<JsonRecord[]>;
 }
 
 interface OktaMonitoringData {
@@ -221,6 +241,7 @@ interface OktaMonitoringData {
   threatInsight: CollectedDataset<JsonRecord | null>;
   apiTokens: CollectedDataset<JsonRecord[]>;
   deviceAssurance: CollectedDataset<JsonRecord[]>;
+  orgContacts: CollectedDataset<JsonRecord[]>;
 }
 
 interface OktaAuditBundleResult {
@@ -572,7 +593,129 @@ const OKTA_CHECKS: Record<string, CheckDefinition> = {
       general: ["device assurance"],
     },
   },
+  "OKTA-AUTH-009": {
+    id: "OKTA-AUTH-009",
+    title: "FIPS and restricted authenticator posture",
+    category: "authentication",
+    severity: "high",
+    frameworks: {
+      fedramp: ["IA-2(11)", "SC-13"],
+      disa_stig: ["V-273190"],
+      irap: ["ISM-1682"],
+      ismap: ["A.10.1.1"],
+      soc2: ["CC6.1"],
+      pci_dss: ["8.4.2"],
+      general: ["FIPS 140 validated authenticators"],
+    },
+  },
+  "OKTA-ADMIN-004": {
+    id: "OKTA-ADMIN-004",
+    title: "Privileged user MFA enrollment",
+    category: "admin_access",
+    severity: "high",
+    frameworks: {
+      fedramp: ["IA-2(1)"],
+      disa_stig: ["V-273193"],
+      irap: ["ISM-1173"],
+      ismap: ["A.9.4.2"],
+      soc2: ["CC6.1"],
+      pci_dss: ["8.4.2"],
+      general: ["admin MFA enrollment"],
+    },
+  },
+  "OKTA-ADMIN-005": {
+    id: "OKTA-ADMIN-005",
+    title: "Workforce account lifecycle hygiene",
+    category: "admin_access",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-2(3)", "AC-2(4)"],
+      disa_stig: ["V-273188"],
+      irap: ["ISM-1175"],
+      ismap: ["A.9.2.1", "A.9.2.6"],
+      soc2: ["CC6.2", "CC6.3"],
+      pci_dss: ["8.2.6"],
+      general: ["account lifecycle"],
+    },
+  },
+  "OKTA-ADMIN-006": {
+    id: "OKTA-ADMIN-006",
+    title: "Okta Support access and third-party admin governance",
+    category: "admin_access",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-2", "AC-6(5)", "PS-7"],
+      disa_stig: [],
+      irap: ["ISM-1175"],
+      ismap: ["A.9.2.3"],
+      soc2: ["CC6.3"],
+      pci_dss: ["8.2.2"],
+      general: ["vendor access"],
+    },
+  },
+  "OKTA-INTEG-006": {
+    id: "OKTA-INTEG-006",
+    title: "Provisioning and deprovisioning automation",
+    category: "integrations",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-2(1)", "AC-2(3)"],
+      disa_stig: [],
+      irap: ["ISM-1175"],
+      ismap: ["A.9.2.1", "A.9.2.6"],
+      soc2: ["CC6.2", "CC6.3"],
+      pci_dss: ["8.2.5"],
+      general: ["lifecycle automation"],
+    },
+  },
+  "OKTA-MON-007": {
+    id: "OKTA-MON-007",
+    title: "API token expiry and network restrictions",
+    category: "monitoring",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["IA-5(1)", "AC-17"],
+      disa_stig: [],
+      irap: [],
+      ismap: ["A.9.4.3"],
+      soc2: ["CC6.1"],
+      pci_dss: ["8.6.3"],
+      general: ["token expiry"],
+    },
+  },
+  "OKTA-MON-008": {
+    id: "OKTA-MON-008",
+    title: "Security contact routing",
+    category: "monitoring",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["IR-6", "SI-5"],
+      disa_stig: [],
+      irap: ["ISM-0123"],
+      ismap: ["A.16.1.2"],
+      soc2: ["CC2.3"],
+      pci_dss: ["12.10.1"],
+      general: ["security contacts"],
+    },
+  },
+  "OKTA-MON-009": {
+    id: "OKTA-MON-009",
+    title: "Administrator security notification emails",
+    category: "monitoring",
+    severity: "low",
+    frameworks: {
+      fedramp: ["AU-6", "SI-5"],
+      disa_stig: [],
+      irap: ["ISM-0123"],
+      ismap: ["A.16.1.2"],
+      soc2: ["CC7.2"],
+      pci_dss: [],
+      general: ["admin notifications"],
+    },
+  },
 };
+
+export const OKTA_CHECK_IDS = Object.keys(OKTA_CHECKS);
 
 export function clearOktaTokenCacheForTests(): void {
   tokenCache.clear();
@@ -1096,22 +1239,32 @@ export class OktaAuditorClient {
     }
   }
 
-  async listPaginated(pathOrUrl: string): Promise<JsonRecord[]> {
-    const results: JsonRecord[] = [];
+  async listPaginatedWithMeta(pathOrUrl: string, maxPages?: number): Promise<PaginatedList> {
+    const items: JsonRecord[] = [];
     let nextUrl: string | null = pathOrUrl;
+    let pagesFetched = 0;
 
     while (nextUrl) {
+      if (maxPages !== undefined && pagesFetched >= maxPages) {
+        return { items, truncated: true, pagesFetched };
+      }
       const response = await this.request(nextUrl);
       const payload = (await response.json()) as unknown;
       if (Array.isArray(payload)) {
-        results.push(...payload.map((entry) => asRecord(entry)));
+        items.push(...payload.map((entry) => asRecord(entry)));
       } else {
         throw new Error(`Expected array response from ${pathOrUrl}`);
       }
+      pagesFetched += 1;
       nextUrl = parseLinkHeaderNext(response.headers.get("link"));
     }
 
-    return results;
+    return { items, truncated: false, pagesFetched };
+  }
+
+  async listPaginated(pathOrUrl: string): Promise<JsonRecord[]> {
+    const page = await this.listPaginatedWithMeta(pathOrUrl);
+    return page.items;
   }
 
   async listPolicies(type: string): Promise<JsonRecord[]> {
@@ -1123,11 +1276,43 @@ export class OktaAuditorClient {
   }
 
   async listAuthenticators(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/authenticators?limit=${PAGE_LIMIT}`);
+    return this.listPaginated("/api/v1/authenticators");
   }
 
   async listUsers(): Promise<JsonRecord[]> {
     return this.listPaginated(`/api/v1/users?limit=${PAGE_LIMIT}`);
+  }
+
+  async listUsersWithMeta(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/users?limit=${PAGE_LIMIT}`, MAX_USER_PAGES);
+  }
+
+  async getUser(userId: string): Promise<JsonRecord | null> {
+    return this.tryGetJson<JsonRecord>(`/api/v1/users/${encodeURIComponent(userId)}`);
+  }
+
+  async listUserFactors(userId: string): Promise<JsonRecord[]> {
+    return this.listPaginated(`/api/v1/users/${encodeURIComponent(userId)}/factors`);
+  }
+
+  async listGroupRules(): Promise<JsonRecord[]> {
+    return this.listPaginated(`/api/v1/groups/rules?limit=${PAGE_LIMIT}`);
+  }
+
+  async listOrgContacts(): Promise<JsonRecord[]> {
+    return this.listPaginated("/api/v1/org/contacts");
+  }
+
+  async getOrgContactUser(contactType: string): Promise<JsonRecord | null> {
+    return this.tryGetJson<JsonRecord>(`/api/v1/org/contacts/${encodeURIComponent(contactType)}`);
+  }
+
+  async getOktaSupportSettings(): Promise<JsonRecord | null> {
+    return this.getJson<JsonRecord>("/api/v1/org/privacy/oktaSupport");
+  }
+
+  async getThirdPartyAdminSetting(): Promise<JsonRecord | null> {
+    return this.getJson<JsonRecord>("/api/v1/org/orgSettings/thirdPartyAdminSetting");
   }
 
   async listGroups(): Promise<JsonRecord[]> {
@@ -1192,7 +1377,7 @@ export class OktaAuditorClient {
   }
 
   async listApiTokens(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/api-tokens?limit=${PAGE_LIMIT}`);
+    return this.listPaginated("/api/v1/api-tokens");
   }
 
   async listDeviceAssurancePolicies(): Promise<JsonRecord[]> {
@@ -1295,11 +1480,76 @@ export async function collectOktaAuthenticationData(
   };
 }
 
+type OktaAdminAccessClient = Pick<
+  OktaAuditorClient,
+  | "listUsersWithRoleAssignments"
+  | "listUserRoles"
+  | "listGroups"
+  | "listGroupRoles"
+  | "listGroupUsers"
+> &
+  Partial<
+    Pick<
+      OktaAuditorClient,
+      "listUsersWithMeta" | "listUserFactors" | "getOktaSupportSettings" | "getThirdPartyAdminSetting"
+    >
+  >;
+
+async function collectUsersDataset(
+  client: OktaAdminAccessClient,
+): Promise<CollectedDataset<JsonRecord[]>> {
+  if (!client.listUsersWithMeta) {
+    return {
+      data: [],
+      error: "User population listing is not available on this client.",
+    };
+  }
+  try {
+    const page = await client.listUsersWithMeta();
+    return {
+      data: page.items,
+      truncated: page.truncated,
+      truncationNote: page.truncated
+        ? `User listing stopped after ${page.pagesFetched} pages (${page.items.length} users); a Link rel="next" page remained unread.`
+        : undefined,
+    };
+  } catch (error) {
+    return { data: [], error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function collectPrivilegedUserFactors(
+  client: OktaAdminAccessClient,
+  privilegedUsers: JsonRecord[],
+): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
+  const data: Record<string, JsonRecord[]> = {};
+  if (!client.listUserFactors) {
+    return { data, error: "Per-user factor listing is not available on this client." };
+  }
+  const errors: string[] = [];
+  const scoped = privilegedUsers.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
+  for (const user of scoped) {
+    const userId = asString(user.id);
+    if (!userId) continue;
+    try {
+      data[userId] = await client.listUserFactors(userId);
+    } catch (error) {
+      errors.push(`${userId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const truncated = privilegedUsers.length > scoped.length;
+  return {
+    data,
+    error: errors.length > 0 ? errors.join("; ") : undefined,
+    truncated,
+    truncationNote: truncated
+      ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.length} privileged users.`
+      : undefined,
+  };
+}
+
 export async function collectOktaAdminAccessData(
-  client: Pick<
-    OktaAuditorClient,
-    "listUsersWithRoleAssignments" | "listUserRoles" | "listGroups" | "listGroupRoles" | "listGroupUsers"
-  >,
+  client: OktaAdminAccessClient,
 ): Promise<OktaAdminAccessData> {
   const usersWithRoleAssignments = await collectArrayDataset(() => client.listUsersWithRoleAssignments());
   const userRoles: Record<string, JsonRecord[]> = {};
@@ -1327,8 +1577,9 @@ export async function collectOktaAdminAccessData(
   const privilegedGroupMembers: Record<string, JsonRecord[]> = {};
   const groupRoleErrors: string[] = [];
   const groupMemberErrors: string[] = [];
+  const groupsTruncated = privilegedGroups.length > MAX_PRIVILEGED_GROUP_LOOKUPS;
 
-  for (const group of privilegedGroups.slice(0, 25)) {
+  for (const group of privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS)) {
     const groupId = asString(group.id);
     if (!groupId) continue;
     try {
@@ -1345,6 +1596,15 @@ export async function collectOktaAdminAccessData(
     }
   }
 
+  const users = await collectUsersDataset(client);
+  const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments.data);
+  const oktaSupportAccess = client.getOktaSupportSettings
+    ? await collectObjectDataset(() => client.getOktaSupportSettings!(), null)
+    : { data: null, error: "Okta Support access settings are not available on this client." };
+  const thirdPartyAdminSetting = client.getThirdPartyAdminSetting
+    ? await collectObjectDataset(() => client.getThirdPartyAdminSetting!(), null)
+    : { data: null, error: "Third-party admin setting is not available on this client." };
+
   return {
     usersWithRoleAssignments,
     userRoles: {
@@ -1352,7 +1612,13 @@ export async function collectOktaAdminAccessData(
       error: userRoleErrors.length > 0 ? userRoleErrors.join("; ") : undefined,
     },
     groups,
-    privilegedGroups: { data: privilegedGroups },
+    privilegedGroups: {
+      data: privilegedGroups,
+      truncated: groupsTruncated,
+      truncationNote: groupsTruncated
+        ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
+        : undefined,
+    },
     privilegedGroupRoles: {
       data: privilegedGroupRoles,
       error: groupRoleErrors.length > 0 ? groupRoleErrors.join("; ") : undefined,
@@ -1361,20 +1627,27 @@ export async function collectOktaAdminAccessData(
       data: privilegedGroupMembers,
       error: groupMemberErrors.length > 0 ? groupMemberErrors.join("; ") : undefined,
     },
+    users,
+    privilegedUserFactors,
+    oktaSupportAccess,
+    thirdPartyAdminSetting,
   };
 }
 
+type OktaIntegrationClient = Pick<
+  OktaAuditorClient,
+  | "listApps"
+  | "listTrustedOrigins"
+  | "listNetworkZones"
+  | "listPolicies"
+  | "listPolicyRules"
+  | "listIdps"
+  | "listAuthorizationServers"
+> &
+  Partial<Pick<OktaAuditorClient, "listGroupRules">>;
+
 export async function collectOktaIntegrationData(
-  client: Pick<
-    OktaAuditorClient,
-    | "listApps"
-    | "listTrustedOrigins"
-    | "listNetworkZones"
-    | "listPolicies"
-    | "listPolicyRules"
-    | "listIdps"
-    | "listAuthorizationServers"
-  >,
+  client: OktaIntegrationClient,
 ): Promise<OktaIntegrationData> {
   const accessPolicies = await collectArrayDataset(() => client.listPolicies("ACCESS_POLICY"));
   const signOnPolicies = await collectArrayDataset(() => client.listPolicies("OKTA_SIGN_ON"));
@@ -1389,20 +1662,59 @@ export async function collectOktaIntegrationData(
     signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies.data),
     idps: await collectArrayDataset(() => client.listIdps()),
     authorizationServers: await collectArrayDataset(() => client.listAuthorizationServers()),
+    groupRules: client.listGroupRules
+      ? await collectArrayDataset(() => client.listGroupRules!())
+      : { data: [], error: "Group rule listing is not available on this client." },
   };
 }
 
+type OktaMonitoringClient = Pick<
+  OktaAuditorClient,
+  | "listEventHooks"
+  | "listLogStreams"
+  | "listSystemLogs"
+  | "listBehaviors"
+  | "getThreatInsight"
+  | "listApiTokens"
+  | "listDeviceAssurancePolicies"
+> &
+  Partial<Pick<OktaAuditorClient, "listOrgContacts" | "getOrgContactUser" | "getUser">>;
+
+async function collectOrgContacts(
+  client: OktaMonitoringClient,
+): Promise<CollectedDataset<JsonRecord[]>> {
+  if (!client.listOrgContacts || !client.getOrgContactUser) {
+    return { data: [], error: "Org contact listing is not available on this client." };
+  }
+  try {
+    const contactTypes = await client.listOrgContacts();
+    const resolved: JsonRecord[] = [];
+    const errors: string[] = [];
+    for (const contact of contactTypes) {
+      const contactType = asString(contact.contactType);
+      if (!contactType) continue;
+      try {
+        const assignment = await client.getOrgContactUser(contactType);
+        const userId = asString(asRecord(assignment).userId);
+        const user = userId && client.getUser ? await client.getUser(userId) : null;
+        resolved.push({
+          contactType,
+          userId: userId ?? null,
+          userStatus: user ? asString(user.status) ?? null : null,
+          userLogin: user ? asString(asRecord(user.profile).login) ?? null : null,
+        });
+      } catch (error) {
+        errors.push(`${contactType}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { data: resolved, error: errors.length > 0 ? errors.join("; ") : undefined };
+  } catch (error) {
+    return { data: [], error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export async function collectOktaMonitoringData(
-  client: Pick<
-    OktaAuditorClient,
-    | "listEventHooks"
-    | "listLogStreams"
-    | "listSystemLogs"
-    | "listBehaviors"
-    | "getThreatInsight"
-    | "listApiTokens"
-    | "listDeviceAssurancePolicies"
-  >,
+  client: OktaMonitoringClient,
 ): Promise<OktaMonitoringData> {
   return {
     eventHooks: await collectArrayDataset(() => client.listEventHooks()),
@@ -1412,6 +1724,7 @@ export async function collectOktaMonitoringData(
     threatInsight: await collectObjectDataset(() => client.getThreatInsight(), null),
     apiTokens: await collectArrayDataset(() => client.listApiTokens()),
     deviceAssurance: await collectArrayDataset(() => client.listDeviceAssurancePolicies()),
+    orgContacts: await collectOrgContacts(client),
   };
 }
 
@@ -1596,35 +1909,184 @@ function listErrors(datasets: Array<CollectedDataset<unknown>>): string[] {
   return datasets.map((dataset) => dataset.error).filter((value): value is string => Boolean(value));
 }
 
+function listTruncations(datasets: Array<CollectedDataset<unknown>>): string[] {
+  return datasets
+    .map((dataset) => dataset.truncationNote)
+    .filter((value): value is string => Boolean(value));
+}
+
+function isActiveRecord(record: JsonRecord): boolean {
+  return (asString(record.status) ?? "").toUpperCase() === "ACTIVE";
+}
+
+function recordName(record: JsonRecord): string {
+  return (
+    asString(record.name) ??
+    asString(record.label) ??
+    asString(record.displayName) ??
+    asString(asRecord(record.profile).name) ??
+    asString(record.id) ??
+    "unnamed"
+  );
+}
+
+function userLogin(user: JsonRecord): string {
+  return (
+    asString(asRecord(user.profile).login) ??
+    asString(user.login) ??
+    asString(user.id) ??
+    "unknown"
+  );
+}
+
+function describeEndpointError(error: string): string {
+  if (/\(403 /.test(error)) return "the endpoint returned 403 Forbidden (missing scope or admin role)";
+  if (/\(401 /.test(error)) return "the endpoint returned 401 Unauthorized (credential rejected)";
+  if (/\(404 /.test(error)) return "the endpoint returned 404 Not Found (feature not enabled on this org edition)";
+  if (/not available on this client/i.test(error)) return "the collector did not expose this endpoint";
+  return "the endpoint request failed";
+}
+
+function isEditionError(error: string | undefined): boolean {
+  return Boolean(error && /\(404 /.test(error));
+}
+
+function manualFinding(
+  id: keyof typeof OKTA_CHECKS,
+  subject: string,
+  cause: string,
+  evidenceToCollect: string,
+  detail?: string,
+): OktaFinding {
+  return buildFinding(
+    id,
+    "Manual",
+    `${subject} could not be evaluated because ${cause}.`,
+    detail ? [detail] : [`Cause: ${cause}.`],
+    evidenceToCollect,
+    {
+      manualNote: `Collect manually: ${evidenceToCollect}`,
+    },
+  );
+}
+
+function manualForDataset(
+  id: keyof typeof OKTA_CHECKS,
+  subject: string,
+  dataset: CollectedDataset<unknown>,
+  evidenceToCollect: string,
+): OktaFinding {
+  const error = dataset.error ?? "unknown error";
+  return manualFinding(id, subject, describeEndpointError(error), evidenceToCollect, `Error: ${error}`);
+}
+
+function capAtPartial(status: OktaFindingStatus): OktaFindingStatus {
+  return status === "Pass" ? "Partial" : status;
+}
+
+function ruleRequiresMfa(rule: JsonRecord): boolean {
+  const actions = asRecord(rule.actions);
+  if (asRecord(actions.signon).requireFactor === true) return true;
+  const verification = asRecord(asRecord(actions.appSignOn).verificationMethod);
+  if ((asString(verification.factorMode) ?? "").toUpperCase() === "2FA") return true;
+  return asArray(verification.constraints).some((constraint) => {
+    const record = asRecord(constraint);
+    return Object.keys(asRecord(record.possession)).length > 0 && Object.keys(asRecord(record.knowledge)).length > 0;
+  });
+}
+
+function activeRulesFor(policies: JsonRecord[], ruleMap: Record<string, JsonRecord[]>): JsonRecord[] {
+  return getRuleSet(ruleMap, policies.filter(isActiveRecord)).filter(isActiveRecord);
+}
+
+function authenticatorKey(auth: JsonRecord): string {
+  return (asString(auth.key) ?? "").toLowerCase();
+}
+
+function isPhishingResistantFactor(factor: JsonRecord): boolean {
+  const factorType = (asString(factor.factorType) ?? "").toLowerCase();
+  const provider = (asString(factor.provider) ?? "").toLowerCase();
+  return (
+    factorType === "webauthn" ||
+    factorType === "u2f" ||
+    factorType === "signed_nonce" ||
+    factorType === "token:hardware" ||
+    /smart[_ -]?card|piv|cac|x509/.test(`${factorType} ${provider}`)
+  );
+}
+
+function parseIsoDurationDays(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const match = value.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/i);
+  if (!match) return undefined;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  const minutes = Number(match[3] ?? 0);
+  return days + hours / 24 + minutes / 1440;
+}
+
 export function assessOktaAuthentication(
   data: OktaAuthenticationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
   const findings: OktaFinding[] = [];
-  const activeAuthenticators = data.authenticators.data.filter(isActiveAuthenticator);
+  const hostname = new URL(config.orgUrl).hostname;
+  const isFederalTenant = FEDERAL_ORG_HOST_PATTERN.test(hostname);
+  const authenticators = data.authenticators.data;
+  const activeAuthenticators = authenticators.filter(isActiveAuthenticator);
   const strongAuthenticators = activeAuthenticators.filter((auth) =>
     STRONG_AUTHENTICATOR_PATTERN.test(authenticatorLabel(auth).toLowerCase()),
+  );
+  const phishingResistantAuthenticators = strongAuthenticators.filter((auth) =>
+    /webauthn|fido2|smart[_ -]?card|certificate|piv|cac/i.test(authenticatorLabel(auth).toLowerCase()),
   );
   const certAuthenticators = activeAuthenticators.filter((auth) =>
     CERTIFICATE_PATTERN.test(authenticatorLabel(auth).toLowerCase()),
   );
-  const certIdps = data.idps.data.filter((idp) =>
+  const activeIdps = data.idps.data.filter(isActiveRecord);
+  const certIdps = activeIdps.filter((idp) =>
     CERTIFICATE_PATTERN.test(
       `${asString(idp.type) ?? ""} ${asString(idp.name) ?? ""}`.toLowerCase(),
     ),
   );
-  const policyNames = [
-    ...getPolicyNames(data.accessPolicies.data),
-    ...getPolicyNames(data.signOnPolicies.data),
-  ];
-  const adminPolicyCount = policyNames.filter((name) => /admin console|dashboard/i.test(name)).length;
+  const classicEngine =
+    !data.authenticators.error && authenticators.length === 0 && data.orgFactors.data.length > 0;
 
-  if (strongAuthenticators.some((auth) => /webauthn|fido2|smart[_ -]?card|certificate|piv|cac/i.test(authenticatorLabel(auth).toLowerCase()))) {
+  if (data.authenticators.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-AUTH-001",
+        "Phishing-resistant authenticator coverage",
+        data.authenticators,
+        "Export Security > Authenticators and record which phishing-resistant authenticators are active.",
+      ),
+    );
+  } else if (classicEngine) {
+    findings.push(
+      manualFinding(
+        "OKTA-AUTH-001",
+        "Phishing-resistant authenticator coverage",
+        "the Authenticators API returned no records while org factors exist, which indicates a Classic Engine org",
+        "Review Security > Multifactor > Factor Types and record whether WebAuthn or smart card factors are active.",
+        `Org factors returned: ${data.orgFactors.data.map(recordName).join(", ")}`,
+      ),
+    );
+  } else if (authenticators.length === 0) {
+    findings.push(
+      buildFinding(
+        "OKTA-AUTH-001",
+        "Fail",
+        "No authenticators were returned, so no phishing-resistant authenticator is enabled (empty inventory is treated as a failure for this control).",
+        ["Authenticators API returned an empty list with no error and no org factors were present."],
+        "Enable phishing-resistant authenticators and align enrollment policy with the required assurance level.",
+      ),
+    );
+  } else if (phishingResistantAuthenticators.length > 0) {
     findings.push(
       buildFinding(
         "OKTA-AUTH-001",
         "Pass",
-        `${strongAuthenticators.length} strong authenticators are active.`,
+        `${phishingResistantAuthenticators.length} phishing-resistant authenticators are ACTIVE (${strongAuthenticators.length} strong authenticators total).`,
         strongAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
         "Keep phishing-resistant authenticators enabled and verify enrollment policy coverage.",
       ),
@@ -1634,7 +2096,7 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-001",
         "Partial",
-        "Strong authenticators are present, but phishing-resistant coverage needs manual confirmation.",
+        "Strong authenticators are present, but no ACTIVE WebAuthn, FIDO2, smart card, or certificate authenticator was found.",
         strongAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
         "Confirm whether the available authenticators satisfy phishing-resistant MFA requirements for the scoped environment.",
       ),
@@ -1645,38 +2107,80 @@ export function assessOktaAuthentication(
         "OKTA-AUTH-001",
         "Fail",
         "No active phishing-resistant authenticators were detected.",
-        ["Active authenticators did not include WebAuthn, FIDO2, smart card, or certificate-based options."],
+        activeAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
         "Enable phishing-resistant authenticators and align enrollment policy with the required assurance level.",
       ),
     );
   }
 
-  if (adminPolicyCount > 0 && strongAuthenticators.length > 0) {
+  const policyDatasets = [
+    data.signOnPolicies,
+    data.accessPolicies,
+    data.signOnPolicyRules,
+    data.accessPolicyRules,
+  ];
+  const policyErrors = listErrors(policyDatasets);
+  const adminPolicies = [
+    ...data.accessPolicies.data.filter(isActiveRecord),
+    ...data.signOnPolicies.data.filter(isActiveRecord),
+  ].filter((policy) => /admin console|dashboard/i.test(asString(policy.name) ?? ""));
+  const adminRuleMap = { ...data.signOnPolicyRules.data, ...data.accessPolicyRules.data };
+  const adminRules = activeRulesFor(adminPolicies, adminRuleMap);
+  const adminMfaRules = adminRules.filter(ruleRequiresMfa);
+  const adminPolicyCount = adminPolicies.length;
+
+  if (data.signOnPolicies.error && data.accessPolicies.error) {
+    findings.push(
+      manualFinding(
+        "OKTA-AUTH-002",
+        "Administrator MFA enforcement",
+        `sign-on and access policies were unreadable (${describeEndpointError(data.signOnPolicies.error)})`,
+        "Open the Okta Admin Console and Okta Dashboard authentication policies and record the ACTIVE rules that require MFA.",
+        `Errors: ${policyErrors.join(" | ")}`,
+      ),
+    );
+  } else if (adminPolicyCount > 0 && adminMfaRules.length > 0 && strongAuthenticators.length > 0 && policyErrors.length === 0) {
     findings.push(
       buildFinding(
         "OKTA-AUTH-002",
         "Pass",
-        `${adminPolicyCount} admin or dashboard policies were found alongside strong authenticators.`,
-        policyNames
-          .filter((name) => /admin console|dashboard/i.test(name))
-          .map((name) => `Policy: ${name}`),
-        "Verify the policy rules enforce MFA for all administrator entry points.",
-        {
-          manualNote:
-            "Policy-name matching is automated, but individual rule enforcement should still be reviewed in the Okta console for final sign-off.",
-        },
+        `${adminMfaRules.length} ACTIVE rules across ${adminPolicyCount} ACTIVE admin or dashboard policies require MFA, and strong authenticators are active.`,
+        [
+          ...adminPolicies.map((policy) => `Policy: ${asString(policy.name)} (${asString(policy.status)})`),
+          ...adminMfaRules.map((rule) => `Rule requiring MFA: ${recordName(rule)}`),
+        ],
+        "Keep MFA-enforcing rules ACTIVE for all administrator entry points and re-check after policy changes.",
       ),
     );
-  } else if (data.mfaPolicies.data.length > 0 || strongAuthenticators.length > 0) {
+  } else if (adminPolicyCount > 0) {
     findings.push(
       buildFinding(
         "OKTA-AUTH-002",
         "Partial",
-        "MFA-related controls exist, but explicit admin console policy coverage was not fully demonstrated.",
+        adminMfaRules.length === 0
+          ? "Admin or dashboard policies exist, but no ACTIVE rule under them explicitly requires MFA."
+          : "Admin MFA rules exist, but strong authenticators or complete policy data were missing.",
         [
-          `MFA enrollment policies: ${data.mfaPolicies.data.length}`,
+          ...adminPolicies.map((policy) => `Policy: ${asString(policy.name)} (${asString(policy.status)})`),
+          `ACTIVE rules under admin policies: ${adminRules.length}`,
+          `Rules requiring MFA: ${adminMfaRules.length}`,
+          `Strong authenticators: ${strongAuthenticators.length}`,
+          ...(policyErrors.length > 0 ? [`Partial policy data: ${policyErrors.join(" | ")}`] : []),
+        ],
+        "Ensure at least one ACTIVE rule on the Okta Admin Console and Dashboard policies requires MFA (requireFactor or factorMode 2FA).",
+      ),
+    );
+  } else if (data.mfaPolicies.data.some(isActiveRecord) || strongAuthenticators.length > 0) {
+    findings.push(
+      buildFinding(
+        "OKTA-AUTH-002",
+        "Partial",
+        "MFA-related controls exist, but no ACTIVE Admin Console or Dashboard policy was returned.",
+        [
+          `ACTIVE MFA enrollment policies: ${data.mfaPolicies.data.filter(isActiveRecord).length}`,
           `Strong authenticators: ${strongAuthenticators.length}`,
           `Admin/dashboard policies: ${adminPolicyCount}`,
+          ...(policyErrors.length > 0 ? [`Partial policy data: ${policyErrors.join(" | ")}`] : []),
         ],
         "Add or verify explicit Okta Admin Console and Dashboard policies that require MFA.",
       ),
@@ -1686,44 +2190,42 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-002",
         "Fail",
-        "No clear evidence of administrator MFA enforcement was found.",
+        "No evidence of administrator MFA enforcement was found.",
         [
           `MFA enrollment policies: ${data.mfaPolicies.data.length}`,
           `Admin/dashboard policies: ${adminPolicyCount}`,
+          `Strong authenticators: ${strongAuthenticators.length}`,
         ],
         "Configure explicit MFA enforcement for administrator and dashboard access paths.",
       ),
     );
   }
 
-  const passwordPolicies = analyzePasswordPolicies(data.passwordPolicies.data);
-  if (passwordPolicies.length === 0) {
-    findings.push(
-      buildFinding(
-        "OKTA-AUTH-003",
-        "Fail",
-        "No password policies were returned.",
-        ["Password policy data was unavailable or empty."],
-        "Configure and verify password policies before relying on Okta for regulated authentication flows.",
-      ),
+  const activePasswordPolicies = data.passwordPolicies.data.filter(isActiveRecord);
+  const passwordPolicies = analyzePasswordPolicies(activePasswordPolicies);
+  if (data.passwordPolicies.error) {
+    const evidence = "Export Security > Authentication > Password policies and record complexity, age, history, and lockout settings.";
+    findings.push(manualForDataset("OKTA-AUTH-003", "Password complexity", data.passwordPolicies, evidence));
+    findings.push(manualForDataset("OKTA-AUTH-004", "Password aging and history", data.passwordPolicies, evidence));
+    findings.push(manualForDataset("OKTA-AUTH-005", "Password lockout threshold", data.passwordPolicies, evidence));
+  } else if (data.passwordPolicies.data.length === 0) {
+    const cause = "the Policies API returned zero PASSWORD policies although Okta always exposes a Default policy, so the inventory is incomplete";
+    const evidence = "Export Security > Authentication > Password policies and record complexity, age, history, and lockout settings.";
+    findings.push(manualFinding("OKTA-AUTH-003", "Password complexity", cause, evidence));
+    findings.push(manualFinding("OKTA-AUTH-004", "Password aging and history", cause, evidence));
+    findings.push(manualFinding("OKTA-AUTH-005", "Password lockout threshold", cause, evidence));
+  } else if (passwordPolicies.length === 0) {
+    const evidence = data.passwordPolicies.data.map(
+      (policy) => `${recordName(policy)}: status=${asString(policy.status) ?? "unknown"}`,
     );
     findings.push(
-      buildFinding(
-        "OKTA-AUTH-004",
-        "Fail",
-        "No password policy age or history controls were returned.",
-        ["Password policy data was unavailable or empty."],
-        "Configure password age and history settings in Okta password policies.",
-      ),
+      buildFinding("OKTA-AUTH-003", "Fail", "Password policies exist but none are ACTIVE.", evidence, "Activate a password policy that enforces the required complexity baseline."),
     );
     findings.push(
-      buildFinding(
-        "OKTA-AUTH-005",
-        "Fail",
-        "No password lockout controls were returned.",
-        ["Password policy data was unavailable or empty."],
-        "Configure account lockout thresholds in Okta password policies.",
-      ),
+      buildFinding("OKTA-AUTH-004", "Fail", "Password policies exist but none are ACTIVE.", evidence, "Activate a password policy that enforces age and history controls."),
+    );
+    findings.push(
+      buildFinding("OKTA-AUTH-005", "Fail", "Password policies exist but none are ACTIVE.", evidence, "Activate a password policy that enforces lockout thresholds."),
     );
   } else {
     const complexityPass = passwordPolicies.filter(
@@ -1744,7 +2246,7 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-003",
         complexityStatus,
-        `${complexityPass.length} of ${passwordPolicies.length} password policies meet the grclanker baseline.`,
+        `${complexityPass.length} of ${passwordPolicies.length} ACTIVE password policies meet the grclanker baseline.`,
         passwordPolicies.map(
           (policy) =>
             `${policy.name}: min=${policy.minLength}, upper=${policy.requireUppercase}, lower=${policy.requireLowercase}, number=${policy.requireNumber}, symbol=${policy.requireSymbol}`,
@@ -1766,7 +2268,7 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-004",
         ageHistoryStatus,
-        `${ageHistoryPass.length} of ${passwordPolicies.length} password policies meet age/history expectations.`,
+        `${ageHistoryPass.length} of ${passwordPolicies.length} ACTIVE password policies meet age/history expectations.`,
         passwordPolicies.map(
           (policy) =>
             `${policy.name}: maxAge=${policy.maxAge || "unset"} days, history=${policy.historyCount}`,
@@ -1788,7 +2290,7 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-005",
         lockoutStatus,
-        `${lockoutPass.length} of ${passwordPolicies.length} password policies lock after six attempts or fewer.`,
+        `${lockoutPass.length} of ${passwordPolicies.length} ACTIVE password policies lock after six attempts or fewer.`,
         passwordPolicies.map(
           (policy) => `${policy.name}: maxAttempts=${policy.maxAttempts || "unset"}`,
         ),
@@ -1797,73 +2299,98 @@ export function assessOktaAuthentication(
     );
   }
 
-  const sessionRules = getRuleSet(data.signOnPolicyRules.data, data.signOnPolicies.data);
+  const sessionRules = activeRulesFor(data.signOnPolicies.data, data.signOnPolicyRules.data);
   const sessionSignals = getSessionSignals(sessionRules);
-  if (sessionSignals.idleTimeouts.length === 0) {
-    findings.push(
-      buildFinding(
-        "OKTA-AUTH-006",
-        "Manual",
-        "Session idle timeout values were not returned in the sign-on rule payloads.",
-        ["Sign-on policy rules should be reviewed manually for idle timeout coverage."],
-        "Verify maxSessionIdleMinutes values in sign-on rules for administrator-facing apps.",
-      ),
-    );
+  const sessionErrors = listErrors([data.signOnPolicies, data.signOnPolicyRules]);
+  const sessionEvidence = "Review each ACTIVE Okta sign-on rule and record maxSessionIdleMinutes, maxSessionLifetimeMinutes, and usePersistentCookie.";
+  if (data.signOnPolicies.error) {
+    findings.push(manualForDataset("OKTA-AUTH-006", "Session idle timeout", data.signOnPolicies, sessionEvidence));
+    findings.push(manualForDataset("OKTA-AUTH-007", "Session lifetime and persistent cookies", data.signOnPolicies, sessionEvidence));
   } else {
-    const badIdle = sessionSignals.idleTimeouts.filter((value) => value > 15);
-    findings.push(
-      buildFinding(
-        "OKTA-AUTH-006",
-        badIdle.length === 0 ? "Pass" : "Fail",
-        badIdle.length === 0
-          ? "All returned session idle timeouts are 15 minutes or less."
-          : `${badIdle.length} session rules exceed the 15-minute idle timeout target.`,
-        sessionSignals.idleTimeouts.map((value) => `Idle timeout: ${value} minutes`),
-        "Reduce idle timeout values for administrator-facing sign-on rules to 15 minutes or less.",
-      ),
-    );
+    if (sessionSignals.idleTimeouts.length === 0) {
+      findings.push(
+        manualFinding(
+          "OKTA-AUTH-006",
+          "Session idle timeout",
+          sessionErrors.length > 0
+            ? `sign-on rule payloads were incomplete (${describeEndpointError(sessionErrors[0]!)})`
+            : "no ACTIVE sign-on rule returned maxSessionIdleMinutes",
+          sessionEvidence,
+          sessionErrors.length > 0 ? `Errors: ${sessionErrors.join(" | ")}` : `ACTIVE sign-on rules inspected: ${sessionRules.length}`,
+        ),
+      );
+    } else {
+      const badIdle = sessionSignals.idleTimeouts.filter((value) => value > 15);
+      const status: OktaFindingStatus = badIdle.length === 0 ? "Pass" : "Fail";
+      findings.push(
+        buildFinding(
+          "OKTA-AUTH-006",
+          sessionErrors.length > 0 ? capAtPartial(status) : status,
+          badIdle.length === 0
+            ? `All ${sessionSignals.idleTimeouts.length} ACTIVE session rules use a 15-minute idle timeout or less.`
+            : `${badIdle.length} ACTIVE session rules exceed the 15-minute idle timeout target.`,
+          [
+            ...sessionSignals.idleTimeouts.map((value) => `Idle timeout: ${value} minutes`),
+            ...(sessionErrors.length > 0 ? [`Partial rule data: ${sessionErrors.join(" | ")}`] : []),
+          ],
+          "Reduce idle timeout values for administrator-facing sign-on rules to 15 minutes or less.",
+        ),
+      );
+    }
+
+    if (sessionSignals.lifetimes.length === 0 && sessionSignals.persistentCookies.length === 0) {
+      findings.push(
+        manualFinding(
+          "OKTA-AUTH-007",
+          "Session lifetime and persistent cookies",
+          sessionErrors.length > 0
+            ? `sign-on rule payloads were incomplete (${describeEndpointError(sessionErrors[0]!)})`
+            : "no ACTIVE sign-on rule returned session lifetime or persistent-cookie settings",
+          sessionEvidence,
+          sessionErrors.length > 0 ? `Errors: ${sessionErrors.join(" | ")}` : `ACTIVE sign-on rules inspected: ${sessionRules.length}`,
+        ),
+      );
+    } else {
+      const badLifetime = sessionSignals.lifetimes.filter((value) => value > 1080);
+      const persistentCookies = sessionSignals.persistentCookies.filter(Boolean);
+      const status: OktaFindingStatus =
+        badLifetime.length === 0 && persistentCookies.length === 0 ? "Pass" : "Fail";
+      findings.push(
+        buildFinding(
+          "OKTA-AUTH-007",
+          sessionErrors.length > 0 ? capAtPartial(status) : status,
+          status === "Pass"
+            ? "No session lifetime or persistent-cookie violations were detected in ACTIVE sign-on rules."
+            : "Some ACTIVE session rules exceed the 18-hour lifetime target or allow persistent cookies.",
+          [
+            ...sessionSignals.lifetimes.map((value) => `Lifetime: ${value} minutes`),
+            ...sessionSignals.persistentCookies.map((value) => `Persistent cookie enabled: ${value}`),
+            ...(sessionErrors.length > 0 ? [`Partial rule data: ${sessionErrors.join(" | ")}`] : []),
+          ],
+          "Reduce maximum session lifetime to 18 hours or less and disable persistent cookies for sensitive sessions.",
+        ),
+      );
+    }
   }
 
-  if (sessionSignals.lifetimes.length === 0 && sessionSignals.persistentCookies.length === 0) {
+  if (data.idps.error && data.authenticators.error) {
     findings.push(
-      buildFinding(
-        "OKTA-AUTH-007",
-        "Manual",
-        "Session lifetime and persistent-cookie data were not returned in sign-on rules.",
-        ["Sign-on rule session settings require manual validation."],
-        "Review maxSessionLifetimeMinutes and usePersistentCookie settings in sign-on rules.",
+      manualFinding(
+        "OKTA-AUTH-008",
+        "Certificate or PIV/CAC authentication",
+        `identity providers and authenticators were unreadable (${describeEndpointError(data.idps.error)})`,
+        "Record whether a Smart Card IdP or certificate authenticator is ACTIVE under Security > Identity Providers and Security > Authenticators.",
+        `Errors: ${data.idps.error} | ${data.authenticators.error}`,
       ),
     );
-  } else {
-    const badLifetime = sessionSignals.lifetimes.filter((value) => value > 1080);
-    const persistentCookies = sessionSignals.persistentCookies.filter(Boolean);
-    const status: OktaFindingStatus =
-      badLifetime.length === 0 && persistentCookies.length === 0 ? "Pass" : "Fail";
-    findings.push(
-      buildFinding(
-        "OKTA-AUTH-007",
-        status,
-        status === "Pass"
-          ? "No session lifetime or persistent-cookie violations were detected."
-          : "Some session rules exceed the 18-hour lifetime target or allow persistent cookies.",
-        [
-          ...sessionSignals.lifetimes.map((value) => `Lifetime: ${value} minutes`),
-          ...sessionSignals.persistentCookies.map((value) => `Persistent cookie enabled: ${value}`),
-        ],
-        "Reduce maximum session lifetime to 18 hours or less and disable persistent cookies for sensitive sessions.",
-      ),
-    );
-  }
-
-  const isFederalTenant = /\.(okta\.gov|okta\.mil)$/i.test(new URL(config.orgUrl).hostname);
-  if (certIdps.length > 0 || certAuthenticators.length > 0) {
+  } else if (certIdps.length > 0 || certAuthenticators.length > 0) {
     findings.push(
       buildFinding(
         "OKTA-AUTH-008",
         "Pass",
-        `Detected ${certIdps.length + certAuthenticators.length} certificate-oriented IdP or authenticator entries.`,
+        `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries.`,
         [
-          ...certIdps.map((idp) => `IdP: ${asString(idp.name) ?? asString(idp.id) ?? "unnamed"}`),
+          ...certIdps.map((idp) => `IdP: ${recordName(idp)} (${asString(idp.status)})`),
           ...certAuthenticators.map((auth) => `Authenticator: ${authenticatorLabel(auth)}`),
         ],
         "Keep certificate-based and smart-card options documented for scoped federal or DoD use cases.",
@@ -1874,8 +2401,12 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-008",
         "Fail",
-        "No certificate-oriented authentication method was detected for a federal-domain tenant.",
-        [`Org URL: ${config.orgUrl}`],
+        "No ACTIVE certificate-oriented authentication method was detected for a federal-domain tenant.",
+        [
+          `Org URL: ${config.orgUrl}`,
+          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
+          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
+        ],
         "Validate whether PIV/CAC or certificate-based authentication is required for this tenant and configure it if so.",
       ),
     );
@@ -1884,9 +2415,98 @@ export function assessOktaAuthentication(
       buildFinding(
         "OKTA-AUTH-008",
         "Manual",
-        "No certificate-oriented authentication method was detected.",
-        [`Org URL: ${config.orgUrl}`],
+        "No ACTIVE certificate-oriented authentication method was detected.",
+        [
+          `Org URL: ${config.orgUrl}`,
+          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
+          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
+        ],
         "If this Okta tenant supports federal or smart-card requirements, verify whether certificate-based authentication should be added.",
+        {
+          manualNote:
+            "Collect manually: confirm whether PIV/CAC or certificate authentication is in scope for this tenant.",
+        },
+      ),
+    );
+  }
+
+  const oktaVerify = authenticators.find((auth) => authenticatorKey(auth) === "okta_verify");
+  const oktaVerifySettings = asRecord(oktaVerify?.settings);
+  const fipsMode = asString(asRecord(oktaVerifySettings.compliance).fips)?.toUpperCase();
+  const restrictedAuthenticators = activeAuthenticators.filter((auth) => {
+    const key = authenticatorKey(auth);
+    if (!RESTRICTED_AUTHENTICATOR_KEYS.has(key)) return false;
+    const allowedFor = (asString(asRecord(auth.settings).allowedFor) ?? "any").toLowerCase();
+    return !(key === "okta_email" && (allowedFor === "recovery" || allowedFor === "none"));
+  });
+  const fipsEvidence = [
+    `Org URL: ${config.orgUrl} (${isFederalTenant ? "federal domain" : "commercial domain"})`,
+    `Okta Verify: ${oktaVerify ? `${asString(oktaVerify.status) ?? "unknown status"}, FIPS compliance=${fipsMode ?? "not reported"}` : "not returned"}`,
+    ...restrictedAuthenticators.map((auth) => `Restricted authenticator ACTIVE: ${authenticatorLabel(auth)}`),
+  ];
+  const fipsRecommendation =
+    "Set Okta Verify compliance.fips to REQUIRED, disable SMS, voice, security question, and email authenticators (or limit email to recovery), and rely on FIPS 140 validated authenticators.";
+  if (data.authenticators.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-AUTH-009",
+        "FIPS and restricted authenticator posture",
+        data.authenticators,
+        "Record Okta Verify FIPS compliance mode and every ACTIVE authenticator under Security > Authenticators.",
+      ),
+    );
+  } else if (classicEngine) {
+    findings.push(
+      manualFinding(
+        "OKTA-AUTH-009",
+        "FIPS and restricted authenticator posture",
+        "Okta Verify FIPS compliance is only exposed through the Identity Engine Authenticators API and this org appears to be Classic Engine",
+        "Record active factor types under Security > Multifactor and confirm SMS, voice, security question, and email are disabled.",
+        `Org factors returned: ${data.orgFactors.data.map(recordName).join(", ")}`,
+      ),
+    );
+  } else if (authenticators.length === 0) {
+    findings.push(
+      buildFinding(
+        "OKTA-AUTH-009",
+        "Fail",
+        "No authenticators were returned, so no FIPS 140 validated authenticator is enabled (empty inventory is treated as a failure for this control).",
+        fipsEvidence,
+        fipsRecommendation,
+      ),
+    );
+  } else if (isFederalTenant) {
+    const oktaVerifyActive = Boolean(oktaVerify && isActiveAuthenticator(oktaVerify));
+    const status: OktaFindingStatus =
+      restrictedAuthenticators.length > 0 || (oktaVerifyActive && fipsMode !== "REQUIRED")
+        ? "Fail"
+        : oktaVerifyActive
+          ? "Pass"
+          : "Partial";
+    findings.push(
+      buildFinding(
+        "OKTA-AUTH-009",
+        status,
+        status === "Pass"
+          ? "Federal-domain tenant requires FIPS-compliant Okta Verify and no restricted authenticators are ACTIVE."
+          : status === "Fail"
+            ? `Federal-domain tenant has ${restrictedAuthenticators.length} restricted authenticators ACTIVE or Okta Verify FIPS compliance is ${fipsMode ?? "not REQUIRED"}.`
+            : "Federal-domain tenant has no ACTIVE Okta Verify authenticator; FIPS mode cannot be confirmed from the API.",
+        fipsEvidence,
+        fipsRecommendation,
+      ),
+    );
+  } else {
+    const status: OktaFindingStatus = restrictedAuthenticators.length > 0 ? "Partial" : "Pass";
+    findings.push(
+      buildFinding(
+        "OKTA-AUTH-009",
+        status,
+        status === "Pass"
+          ? `No restricted (SMS, voice, security question, email) authenticators are ACTIVE; Okta Verify FIPS compliance is ${fipsMode ?? "not reported"}.`
+          : `${restrictedAuthenticators.length} restricted authenticators are ACTIVE on a commercial tenant (advisory under NIST SP 800-63B).`,
+        fipsEvidence,
+        fipsRecommendation,
       ),
     );
   }
@@ -1894,10 +2514,15 @@ export function assessOktaAuthentication(
   const snapshotSummary = {
     active_authenticators: activeAuthenticators.length,
     strong_authenticators: strongAuthenticators.length,
+    phishing_resistant_authenticators: phishingResistantAuthenticators.length,
+    restricted_authenticators: restrictedAuthenticators.length,
+    okta_verify_fips_mode: fipsMode ?? "not reported",
     password_policies: passwordPolicies.length,
     sign_on_policies: data.signOnPolicies.data.length,
     access_policies: data.accessPolicies.data.length,
     admin_dashboard_policies: adminPolicyCount,
+    admin_mfa_rules: adminMfaRules.length,
+    federal_domain: String(isFederalTenant),
     dataset_errors: listErrors([
       data.signOnPolicies,
       data.signOnPolicyRules,
@@ -1920,7 +2545,7 @@ export function assessOktaAuthentication(
     summary: summarizeFindings(findings),
     text: buildAssessmentText(
       "Okta authentication assessment",
-      new URL(config.orgUrl).hostname,
+      hostname,
       findings,
       snapshotSummary,
     ),
@@ -1938,106 +2563,367 @@ export function assessOktaAdminAccess(
     const roles = data.userRoles.data[userId] ?? [];
     return {
       user,
+      userId,
       roles,
       roleNames: roles.map(roleName),
     };
   });
   const superAdmins = privilegedUsers.filter((entry) => entry.roles.some(isSuperAdmin));
+  const roleAssigneeExport =
+    "Export Security > Administrators and record every user, their roles, status, and last sign-in.";
+  const privilegedInventoryUnavailable =
+    Boolean(data.usersWithRoleAssignments.error) || privilegedUsers.length === 0;
+  const emptyPrivilegedCause =
+    "the role-assignee listing returned zero users although every Okta org has at least one super admin, so the audit principal is likely a scoped admin without okta.roles.read visibility";
+
+  if (data.usersWithRoleAssignments.error) {
+    findings.push(
+      manualForDataset("OKTA-ADMIN-001", "Super admin concentration", data.usersWithRoleAssignments, roleAssigneeExport),
+    );
+  } else if (privilegedUsers.length === 0) {
+    findings.push(manualFinding("OKTA-ADMIN-001", "Super admin concentration", emptyPrivilegedCause, roleAssigneeExport));
+  } else {
+    const baseStatus: OktaFindingStatus =
+      superAdmins.length <= 2 ? "Pass" : superAdmins.length <= 5 ? "Partial" : "Fail";
+    const status = data.userRoles.error ? capAtPartial(baseStatus) : baseStatus;
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-001",
+        status,
+        `${superAdmins.length} of ${privilegedUsers.length} privileged users hold SUPER_ADMIN${data.userRoles.error ? " (some role lookups failed, so the count may be incomplete)" : ""}.`,
+        [
+          ...(superAdmins.length > 0
+            ? superAdmins.map((entry) => `${userLogin(entry.user)}: ${entry.roleNames.join(", ")}`)
+            : ["No SUPER_ADMIN assignments were found among the returned privileged users."]),
+          ...(data.userRoles.error ? [`Role lookup errors: ${data.userRoles.error}`] : []),
+        ],
+        "Keep SUPER_ADMIN assignments tightly bounded and prefer scoped custom or standard roles for day-to-day administration.",
+      ),
+    );
+  }
+
   const stalePrivileged = privilegedUsers.filter((entry) => {
     const lastLoginDays = daysSince(userLastLogin(entry.user));
     const status = (asString(entry.user.status) ?? "").toUpperCase();
     return (lastLoginDays !== null && lastLoginDays > 90) || (status !== "" && status !== "ACTIVE");
   });
-
-  const superAdminStatus: OktaFindingStatus =
-    superAdmins.length <= 2 ? "Pass" : superAdmins.length <= 5 ? "Partial" : "Fail";
-  findings.push(
-    buildFinding(
-      "OKTA-ADMIN-001",
-      superAdminStatus,
-      `${superAdmins.length} users hold SUPER_ADMIN.`,
-      superAdmins.length > 0
-        ? superAdmins.map((entry) => {
-            const login =
-              asString(asRecord(entry.user.profile).login) ??
-              asString(entry.user.login) ??
-              asString(entry.user.id) ??
-              "unknown";
-            return `${login}: ${entry.roleNames.join(", ")}`;
-          })
-        : ["No SUPER_ADMIN assignments were returned."],
-      "Keep SUPER_ADMIN assignments tightly bounded and prefer scoped custom or standard roles for day-to-day administration.",
-    ),
+  const unknownActivityPrivileged = privilegedUsers.filter(
+    (entry) => daysSince(userLastLogin(entry.user)) === null && !stalePrivileged.includes(entry),
   );
-
-  findings.push(
-    buildFinding(
-      "OKTA-ADMIN-002",
-      stalePrivileged.length === 0 ? "Pass" : "Fail",
-      stalePrivileged.length === 0
-        ? "No stale or non-active privileged accounts were detected."
-        : `${stalePrivileged.length} privileged accounts are stale or non-active.`,
-      stalePrivileged.map((entry) => {
-        const login =
-          asString(asRecord(entry.user.profile).login) ??
-          asString(entry.user.id) ??
-          "unknown";
-        return `${login}: status=${asString(entry.user.status) ?? "unknown"}, lastLogin=${userLastLogin(entry.user) ?? "never"}`;
-      }),
-      "Review privileged accounts that are suspended, deprovisioned, or inactive for more than 90 days and remove unnecessary access.",
-    ),
-  );
+  if (data.usersWithRoleAssignments.error) {
+    findings.push(
+      manualForDataset("OKTA-ADMIN-002", "Inactive privileged accounts", data.usersWithRoleAssignments, roleAssigneeExport),
+    );
+  } else if (privilegedUsers.length === 0) {
+    findings.push(manualFinding("OKTA-ADMIN-002", "Inactive privileged accounts", emptyPrivilegedCause, roleAssigneeExport));
+  } else {
+    const baseStatus: OktaFindingStatus =
+      stalePrivileged.length > 0 ? "Fail" : unknownActivityPrivileged.length > 0 ? "Partial" : "Pass";
+    const status = data.userRoles.error ? capAtPartial(baseStatus) : baseStatus;
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-002",
+        status,
+        stalePrivileged.length > 0
+          ? `${stalePrivileged.length} privileged accounts are stale or non-active.`
+          : unknownActivityPrivileged.length > 0
+            ? `${unknownActivityPrivileged.length} privileged accounts have no lastLogin timestamp, so their activity cannot be confirmed.`
+            : `All ${privilegedUsers.length} privileged accounts are ACTIVE with a sign-in within 90 days${data.userRoles.error ? " (role lookups were incomplete)" : ""}.`,
+        [
+          ...(data.userRoles.error ? [`Partial data: ${data.userRoles.error}`] : []),
+          ...stalePrivileged.map(
+            (entry) =>
+              `${userLogin(entry.user)}: status=${asString(entry.user.status) ?? "unknown"}, lastLogin=${userLastLogin(entry.user) ?? "never"}`,
+          ),
+          ...unknownActivityPrivileged.map(
+            (entry) => `${userLogin(entry.user)}: status=${asString(entry.user.status) ?? "unknown"}, lastLogin=missing`,
+          ),
+        ],
+        "Review privileged accounts that are suspended, deprovisioned, never signed in, or inactive for more than 90 days and remove unnecessary access.",
+      ),
+    );
+  }
 
   const privilegedGroups = data.privilegedGroups.data.map((group) => {
     const groupId = asString(group.id) ?? "";
     const name = asString(asRecord(group.profile).name) ?? asString(group.name) ?? groupId;
-    const roleCount = (data.privilegedGroupRoles.data[groupId] ?? []).length;
-    const memberCount = (data.privilegedGroupMembers.data[groupId] ?? []).length;
-    return { groupId, name, roleCount, memberCount };
+    const roles = data.privilegedGroupRoles.data[groupId];
+    const members = data.privilegedGroupMembers.data[groupId];
+    return {
+      groupId,
+      name,
+      roleCount: roles ? roles.length : null,
+      memberCount: members ? members.length : null,
+    };
   });
-
   const oversizedPrivilegedGroups = privilegedGroups.filter(
-    (group) => group.roleCount > 0 && group.memberCount > 25,
+    (group) => (group.roleCount ?? 0) > 0 && (group.memberCount ?? 0) > 25,
   );
-
-  findings.push(
-    buildFinding(
-      "OKTA-ADMIN-003",
-      privilegedGroups.length === 0
-        ? "Manual"
-        : oversizedPrivilegedGroups.length === 0
-          ? "Pass"
-          : "Partial",
-      privilegedGroups.length === 0
-        ? "No admin-like groups were detected automatically."
-        : oversizedPrivilegedGroups.length === 0
-          ? "Detected privileged groups without oversized membership."
-          : `${oversizedPrivilegedGroups.length} privileged groups have more than 25 members.`,
-      privilegedGroups.map(
-        (group) =>
-          `${group.name}: roles=${group.roleCount}, members=${group.memberCount}`,
+  const groupExpansionIssues = [
+    ...listErrors([data.privilegedGroupRoles, data.privilegedGroupMembers]),
+    ...listTruncations([data.privilegedGroups]),
+  ];
+  if (data.groups.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-ADMIN-003",
+        "Privileged group hygiene",
+        data.groups,
+        "Export Directory > Groups, identify admin-like groups, and record their role assignments and member counts.",
       ),
-      "Review privileged group scoping and membership size so elevated access remains traceable and bounded.",
-      privilegedGroups.length === 0
-        ? {
-            manualNote:
-              "Admin-like groups are discovered by name pattern, so tenant-specific naming conventions should still be reviewed manually.",
-          }
-        : undefined,
-    ),
-  );
+    );
+  } else if (privilegedGroups.length === 0) {
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-003",
+        "Manual",
+        "No admin-like groups were detected automatically.",
+        [`Groups returned: ${data.groups.data.length}`],
+        "Review privileged group scoping and membership size so elevated access remains traceable and bounded.",
+        {
+          manualNote:
+            "Admin-like groups are discovered by name pattern, so tenant-specific naming conventions should still be reviewed manually.",
+        },
+      ),
+    );
+  } else {
+    const baseStatus: OktaFindingStatus = oversizedPrivilegedGroups.length === 0 ? "Pass" : "Partial";
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-003",
+        groupExpansionIssues.length > 0 ? capAtPartial(baseStatus) : baseStatus,
+        oversizedPrivilegedGroups.length === 0
+          ? groupExpansionIssues.length > 0
+            ? "Expanded privileged groups are not oversized, but the group inventory was only partially expanded."
+            : `All ${privilegedGroups.length} detected privileged groups have bounded membership.`
+          : `${oversizedPrivilegedGroups.length} privileged groups have more than 25 members.`,
+        [
+          ...privilegedGroups.map(
+            (group) =>
+              `${group.name}: roles=${group.roleCount ?? "unread"}, members=${group.memberCount ?? "unread"}`,
+          ),
+          ...groupExpansionIssues.map((issue) => `Partial data: ${issue}`),
+        ],
+        "Review privileged group scoping and membership size so elevated access remains traceable and bounded.",
+      ),
+    );
+  }
+
+  const factorMap = data.privilegedUserFactors.data;
+  const factorsReadCount = Object.keys(factorMap).length;
+  const factorEvidenceToCollect =
+    "For each administrator, open Directory > People > Security and record enrolled ACTIVE factors.";
+  if (privilegedInventoryUnavailable) {
+    findings.push(
+      manualFinding(
+        "OKTA-ADMIN-004",
+        "Privileged user MFA enrollment",
+        data.usersWithRoleAssignments.error
+          ? describeEndpointError(data.usersWithRoleAssignments.error)
+          : emptyPrivilegedCause,
+        factorEvidenceToCollect,
+      ),
+    );
+  } else if (factorsReadCount === 0) {
+    findings.push(
+      manualFinding(
+        "OKTA-ADMIN-004",
+        "Privileged user MFA enrollment",
+        data.privilegedUserFactors.error
+          ? describeEndpointError(data.privilegedUserFactors.error)
+          : "no factor enrollment data was returned for any privileged user",
+        factorEvidenceToCollect,
+        data.privilegedUserFactors.error ? `Error: ${data.privilegedUserFactors.error}` : undefined,
+      ),
+    );
+  } else {
+    const enrollment = privilegedUsers
+      .filter((entry) => factorMap[entry.userId] !== undefined)
+      .map((entry) => {
+        const activeFactors = (factorMap[entry.userId] ?? []).filter(isActiveRecord);
+        return {
+          login: userLogin(entry.user),
+          activeFactors,
+          phishingResistant: activeFactors.some(isPhishingResistantFactor),
+        };
+      });
+    const unenrolled = enrollment.filter((entry) => entry.activeFactors.length === 0);
+    const weakOnly = enrollment.filter((entry) => entry.activeFactors.length > 0 && !entry.phishingResistant);
+    const partialData = Boolean(data.privilegedUserFactors.error) || Boolean(data.privilegedUserFactors.truncated);
+    const baseStatus: OktaFindingStatus = unenrolled.length > 0 ? "Fail" : weakOnly.length > 0 ? "Partial" : "Pass";
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-004",
+        partialData ? capAtPartial(baseStatus) : baseStatus,
+        unenrolled.length > 0
+          ? `${unenrolled.length} of ${enrollment.length} inspected privileged users have no ACTIVE MFA factor.`
+          : weakOnly.length > 0
+            ? `All ${enrollment.length} inspected privileged users have MFA, but ${weakOnly.length} lack a phishing-resistant factor.`
+            : `All ${enrollment.length} inspected privileged users have an ACTIVE phishing-resistant factor${partialData ? " (inventory partially read)" : ""}.`,
+        [
+          ...enrollment.map(
+            (entry) =>
+              `${entry.login}: ${entry.activeFactors.length > 0 ? entry.activeFactors.map((factor) => `${asString(factor.factorType) ?? "factor"}/${asString(factor.provider) ?? "provider"}`).join(", ") : "no ACTIVE factors"}`,
+          ),
+          ...(data.privilegedUserFactors.truncationNote ? [`Partial data: ${data.privilegedUserFactors.truncationNote}`] : []),
+          ...(data.privilegedUserFactors.error ? [`Factor lookup errors: ${data.privilegedUserFactors.error}`] : []),
+        ],
+        "Require every administrator to enroll a phishing-resistant factor (Okta FastPass, WebAuthn, or smart card) and remove privileged access from unenrolled accounts.",
+      ),
+    );
+  }
+
+  const users = data.users.data;
+  const userInventoryEvidence =
+    "Export Directory > People (all statuses) with created, last sign-in, and status columns, then review stale, never-activated, suspended, and locked accounts.";
+  const activeUsers = users.filter(isActiveRecord);
+  const staleActiveUsers = activeUsers.filter((user) => {
+    const days = daysSince(userLastLogin(user));
+    return days !== null && days > 90;
+  });
+  const neverSignedInUsers = activeUsers.filter((user) => daysSince(userLastLogin(user)) === null);
+  const neverActivatedUsers = users.filter((user) => {
+    const status = (asString(user.status) ?? "").toUpperCase();
+    if (status !== "PROVISIONED" && status !== "STAGED") return false;
+    const createdDays = daysSince(asString(user.created));
+    return createdDays === null || createdDays > 30;
+  });
+  const statusCounts = users.reduce<Record<string, number>>((counts, user) => {
+    const status = (asString(user.status) ?? "UNKNOWN").toUpperCase();
+    counts[status] = (counts[status] ?? 0) + 1;
+    return counts;
+  }, {});
+  const attentionStatuses = ["SUSPENDED", "LOCKED_OUT", "PASSWORD_EXPIRED", "RECOVERY", "UNKNOWN"];
+  const attentionCount = attentionStatuses.reduce((total, status) => total + (statusCounts[status] ?? 0), 0);
+  if (data.users.error) {
+    findings.push(
+      manualForDataset("OKTA-ADMIN-005", "Workforce account lifecycle hygiene", data.users, userInventoryEvidence),
+    );
+  } else if (users.length === 0) {
+    findings.push(
+      manualFinding(
+        "OKTA-ADMIN-005",
+        "Workforce account lifecycle hygiene",
+        "the user listing returned zero users although the audit principal itself should appear, so the inventory is incomplete",
+        userInventoryEvidence,
+      ),
+    );
+  } else {
+    const baseStatus: OktaFindingStatus =
+      staleActiveUsers.length > 0 || neverActivatedUsers.length > 0
+        ? "Fail"
+        : neverSignedInUsers.length > 0 || attentionCount > 0
+          ? "Partial"
+          : "Pass";
+    const status = data.users.truncated ? capAtPartial(baseStatus) : baseStatus;
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-005",
+        status,
+        baseStatus === "Fail"
+          ? `${staleActiveUsers.length} ACTIVE users have not signed in for 90 days and ${neverActivatedUsers.length} accounts were never activated after 30 days.`
+          : baseStatus === "Partial"
+            ? `${neverSignedInUsers.length} ACTIVE users have no lastLogin and ${attentionCount} accounts are suspended, locked, expired, or in recovery.`
+            : `All ${users.length} listed users are ACTIVE with a sign-in within 90 days${data.users.truncated ? " (inventory truncated)" : ""}.`,
+        [
+          `Users listed: ${users.length}${data.users.truncated ? " (truncated)" : ""}`,
+          `Status counts: ${Object.entries(statusCounts).map(([status, count]) => `${status}=${count}`).join(", ")}`,
+          `ACTIVE users without sign-in in 90 days: ${staleActiveUsers.length}`,
+          `ACTIVE users with no lastLogin: ${neverSignedInUsers.length}`,
+          `PROVISIONED or STAGED older than 30 days: ${neverActivatedUsers.length}`,
+          "Note: the default user listing excludes DEPROVISIONED users; deprovisioned account review requires a status filter.",
+          ...(data.users.truncationNote ? [`Partial data: ${data.users.truncationNote}`] : []),
+        ],
+        "Deactivate or remove accounts that are stale, never activated, or suspended, and automate the review through lifecycle policies or Workflows.",
+      ),
+    );
+  }
+
+  const support = data.oktaSupportAccess.data;
+  const thirdParty = data.thirdPartyAdminSetting.data;
+  const supportError = data.oktaSupportAccess.error;
+  const thirdPartyError = data.thirdPartyAdminSetting.error;
+  const supportState = asString(support?.support)?.toUpperCase();
+  const supportExpiration = asString(support?.expiration);
+  // ThirdPartyAdminSetting exposes a single boolean property, thirdPartyAdmin (Okta OpenAPI, tag OrgSettingAdmin).
+  const thirdPartyAdmin = thirdParty?.thirdPartyAdmin;
+  const supportEvidence =
+    "Record Settings > Account > Okta Support access (state and expiration) and Settings > Account > Third-party administrators.";
+  if (supportError) {
+    findings.push(
+      manualFinding(
+        "OKTA-ADMIN-006",
+        "Okta Support access and third-party admin governance",
+        thirdPartyError
+          ? `${describeEndpointError(supportError)} for Okta Support access and ${describeEndpointError(thirdPartyError)} for the third-party admin setting`
+          : `${describeEndpointError(supportError)} for Okta Support access`,
+        supportEvidence,
+        thirdPartyError
+          ? `Errors: ${supportError} | ${thirdPartyError}`
+          : `Error: ${supportError}. Third-party administrators: ${thirdPartyAdmin === undefined ? "unknown" : String(thirdPartyAdmin)}.`,
+      ),
+    );
+  } else if (!support) {
+    findings.push(
+      manualFinding(
+        "OKTA-ADMIN-006",
+        "Okta Support access and third-party admin governance",
+        "the Okta Support access setting returned no object (the endpoint is not available on this org edition)",
+        supportEvidence,
+      ),
+    );
+  } else {
+    const status: OktaFindingStatus =
+      supportState === "DISABLED" && thirdPartyAdmin === false && !thirdPartyError ? "Pass" : "Partial";
+    const summary =
+      status === "Pass"
+        ? "Okta Support access is DISABLED and third-party administrators are not permitted."
+        : supportState === "ENABLED"
+          ? `Okta Support access is ENABLED${supportExpiration ? ` until ${supportExpiration}` : " without a reported expiration"}.`
+          : thirdPartyError
+            ? `Okta Support access is ${supportState ?? "unknown"}, but the third-party admin setting could not be read because ${describeEndpointError(thirdPartyError)}.`
+            : thirdPartyAdmin === true
+              ? "Okta Support access is DISABLED, but third-party administrator access is enabled."
+              : thirdPartyAdmin === undefined
+                ? "Okta Support access is DISABLED, but the third-party admin setting response did not include the thirdPartyAdmin field."
+                : `Okta Support access reported an unexpected state (${supportState ?? "unknown"}).`;
+    findings.push(
+      buildFinding(
+        "OKTA-ADMIN-006",
+        status,
+        summary,
+        [
+          `Okta Support access: ${supportState ?? "unknown"}${supportExpiration ? `, expires ${supportExpiration}` : ""}`,
+          `Third-party administrators: ${thirdPartyAdmin === undefined ? "unknown" : String(thirdPartyAdmin)}`,
+          ...(thirdPartyError ? [`Third-party admin setting error: ${thirdPartyError}`] : []),
+        ],
+        "Grant Okta Support access only for time-boxed cases, and keep third-party administrator access disabled unless a documented vendor agreement requires it.",
+      ),
+    );
+  }
 
   const snapshotSummary = {
     privileged_users: privilegedUsers.length,
     super_admins: superAdmins.length,
     stale_privileged_users: stalePrivileged.length,
+    privileged_users_without_last_login: unknownActivityPrivileged.length,
+    privileged_users_factor_checked: factorsReadCount,
     privileged_groups_reviewed: privilegedGroups.length,
+    users_listed: users.length,
+    users_listing_truncated: String(Boolean(data.users.truncated)),
+    stale_active_users: staleActiveUsers.length,
+    never_activated_users: neverActivatedUsers.length,
+    okta_support_access: supportState ?? "unknown",
     dataset_errors: listErrors([
       data.usersWithRoleAssignments,
       data.userRoles,
       data.groups,
       data.privilegedGroupRoles,
       data.privilegedGroupMembers,
+      data.users,
+      data.privilegedUserFactors,
+      data.oktaSupportAccess,
+      data.thirdPartyAdminSetting,
     ]).length,
   };
 
@@ -2069,118 +2955,267 @@ export function assessOktaIntegrations(
     return {
       raw: origin,
       origin: originUrl,
+      active: isActiveRecord(origin),
       insecure: originUrl.startsWith("http://") || originUrl.includes("*"),
     };
   });
-  const insecureOrigins = trustedOrigins.filter((origin) => origin.insecure);
+  const activeOrigins = trustedOrigins.filter((origin) => origin.active);
+  const insecureOrigins = activeOrigins.filter((origin) => origin.insecure);
+  const inactiveInsecureOrigins = trustedOrigins.filter((origin) => !origin.active && origin.insecure);
 
-  findings.push(
-    buildFinding(
-      "OKTA-INTEG-001",
-      insecureOrigins.length > 0
-        ? "Fail"
-        : trustedOrigins.length > 0
-          ? "Pass"
-          : "Info",
-      insecureOrigins.length > 0
-        ? `${insecureOrigins.length} trusted origins appear overly broad or insecure.`
-        : trustedOrigins.length > 0
-          ? "Trusted origins are present and none matched insecure URL heuristics."
-          : "No trusted origins were returned.",
-      trustedOrigins.length > 0
-        ? trustedOrigins.map((origin) => origin.origin)
-        : ["No trusted origin data was returned."],
-      "Review trusted origins for HTTP entries, wildcards, and other unnecessary cross-origin exposure.",
-    ),
-  );
-
-  const customZones = data.networkZones.data.filter(
-    (zone) => !Boolean(zone.system) && !/legacyipzone/i.test(asString(zone.name) ?? ""),
-  );
-  findings.push(
-    buildFinding(
-      "OKTA-INTEG-002",
-      customZones.length > 0 ? "Pass" : "Partial",
-      customZones.length > 0
-        ? `${customZones.length} custom network zones were returned.`
-        : "Only the system or legacy network zone was detected.",
-      data.networkZones.data.map(
-        (zone) =>
-          `${asString(zone.name) ?? asString(zone.id) ?? "unnamed"}: system=${Boolean(zone.system)}`,
+  if (data.trustedOrigins.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-INTEG-001",
+        "Trusted origins hygiene",
+        data.trustedOrigins,
+        "Export Security > API > Trusted Origins and record every ACTIVE origin URL and scope.",
       ),
-      "Define and use custom network zones when policy conditions depend on trusted source networks.",
-    ),
-  );
-
-  const riskyApps: string[] = [];
-  const inactiveApps = data.apps.data.filter((app) => (asString(app.status) ?? "").toUpperCase() !== "ACTIVE");
-
-  for (const app of data.apps.data) {
-    const name = asString(app.label) ?? asString(app.name) ?? asString(app.id) ?? "unnamed app";
-    const oauthClient = asRecord(asRecord(asRecord(app.settings).oauthClient));
-    const grantTypes = normalizeStringArray(oauthClient.grant_types);
-    if (grantTypes.includes("password") || grantTypes.includes("implicit")) {
-      riskyApps.push(`${name}: ${grantTypes.join(", ")}`);
-    }
+    );
+  } else {
+    findings.push(
+      buildFinding(
+        "OKTA-INTEG-001",
+        insecureOrigins.length > 0
+          ? "Fail"
+          : activeOrigins.length > 0
+            ? "Pass"
+            : "Info",
+        insecureOrigins.length > 0
+          ? `${insecureOrigins.length} ACTIVE trusted origins appear overly broad or insecure.`
+          : activeOrigins.length > 0
+            ? `${activeOrigins.length} ACTIVE trusted origins are present and none matched insecure URL heuristics.`
+            : "No ACTIVE trusted origins were returned (trusted origins are optional, so this is informational).",
+        [
+          ...trustedOrigins.map(
+            (origin) => `${origin.origin || "unnamed"}: status=${asString(origin.raw.status) ?? "unknown"}`,
+          ),
+          ...inactiveInsecureOrigins.map((origin) => `Inactive but insecure: ${origin.origin}`),
+        ],
+        "Review trusted origins for HTTP entries, wildcards, and other unnecessary cross-origin exposure.",
+      ),
+    );
   }
 
-  findings.push(
-    buildFinding(
-      "OKTA-INTEG-003",
-      riskyApps.length === 0 ? "Pass" : "Fail",
-      riskyApps.length === 0
-        ? "No OIDC apps using password or implicit grants were detected."
-        : `${riskyApps.length} OIDC apps use password or implicit grants.`,
-      riskyApps.length > 0 ? riskyApps : ["No risky grant types detected in the returned app inventory."],
-      "Remove password and implicit grants from OIDC applications unless there is a documented exception with compensating controls.",
-    ),
+  const activeZones = data.networkZones.data.filter(isActiveRecord);
+  const customZones = activeZones.filter(
+    (zone) => !Boolean(zone.system) && !/legacyipzone/i.test(asString(zone.name) ?? ""),
   );
+  if (data.networkZones.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-INTEG-002",
+        "Network zone coverage",
+        data.networkZones,
+        "Export Security > Networks and record every ACTIVE zone, its type, and whether it is used in policy conditions.",
+      ),
+    );
+  } else if (data.networkZones.data.length === 0) {
+    findings.push(
+      manualFinding(
+        "OKTA-INTEG-002",
+        "Network zone coverage",
+        "the Zones API returned zero zones although Okta always exposes the system LegacyIpZone, so the inventory is incomplete",
+        "Export Security > Networks and record every ACTIVE zone, its type, and whether it is used in policy conditions.",
+      ),
+    );
+  } else {
+    findings.push(
+      buildFinding(
+        "OKTA-INTEG-002",
+        customZones.length > 0 ? "Pass" : "Partial",
+        customZones.length > 0
+          ? `${customZones.length} ACTIVE custom network zones were returned.`
+          : "Only system, legacy, or inactive network zones were detected.",
+        data.networkZones.data.map(
+          (zone) =>
+            `${recordName(zone)}: system=${Boolean(zone.system)}, status=${asString(zone.status) ?? "unknown"}`,
+        ),
+        "Define and use custom network zones when policy conditions depend on trusted source networks.",
+      ),
+    );
+  }
 
-  const signOnRules = getRuleSet(data.signOnPolicyRules.data, data.signOnPolicies.data);
-  const accessRules = getRuleSet(data.accessPolicyRules.data, data.accessPolicies.data);
+  const apps = data.apps.data;
+  const activeApps = apps.filter(isActiveRecord);
+  const riskyApps: string[] = [];
+  const riskyInactiveApps: string[] = [];
+  const inactiveApps = apps.filter((app) => !isActiveRecord(app));
+  for (const app of apps) {
+    const name = recordName(app);
+    const oauthClient = asRecord(asRecord(app.settings).oauthClient);
+    const grantTypes = normalizeStringArray(oauthClient.grant_types);
+    if (grantTypes.includes("password") || grantTypes.includes("implicit")) {
+      if (isActiveRecord(app)) {
+        riskyApps.push(`${name}: ${grantTypes.join(", ")}`);
+      } else {
+        riskyInactiveApps.push(`${name} (${asString(app.status) ?? "unknown"}): ${grantTypes.join(", ")}`);
+      }
+    }
+  }
+  const appInventoryEvidence =
+    "Export Applications > Applications and record each app, its status, and OIDC grant types.";
+  const emptyAppCause =
+    "the Apps API returned zero applications although Okta always exposes its built-in Admin Console and Dashboard apps, so the inventory is incomplete";
+  if (data.apps.error) {
+    findings.push(manualForDataset("OKTA-INTEG-003", "OIDC grant hygiene", data.apps, appInventoryEvidence));
+  } else if (apps.length === 0) {
+    findings.push(manualFinding("OKTA-INTEG-003", "OIDC grant hygiene", emptyAppCause, appInventoryEvidence));
+  } else {
+    findings.push(
+      buildFinding(
+        "OKTA-INTEG-003",
+        riskyApps.length > 0 ? "Fail" : riskyInactiveApps.length > 0 ? "Partial" : "Pass",
+        riskyApps.length > 0
+          ? `${riskyApps.length} ACTIVE OIDC apps use password or implicit grants.`
+          : riskyInactiveApps.length > 0
+            ? `No ACTIVE OIDC apps use password or implicit grants, but ${riskyInactiveApps.length} inactive apps still carry them.`
+            : `No password or implicit grants were found across ${activeApps.length} ACTIVE apps (${apps.length} total).`,
+        [
+          ...riskyApps,
+          ...riskyInactiveApps,
+          ...(riskyApps.length === 0 && riskyInactiveApps.length === 0
+            ? [`Apps inspected: ${apps.length}`]
+            : []),
+        ],
+        "Remove password and implicit grants from OIDC applications unless there is a documented exception with compensating controls.",
+      ),
+    );
+  }
+
+  const policyErrors = listErrors([
+    data.signOnPolicies,
+    data.signOnPolicyRules,
+    data.accessPolicies,
+    data.accessPolicyRules,
+  ]);
+  const signOnRules = activeRulesFor(data.signOnPolicies.data, data.signOnPolicyRules.data);
+  const accessRules = activeRulesFor(data.accessPolicies.data, data.accessPolicyRules.data);
   const riskAwareRules = [...signOnRules, ...accessRules].filter(appUsesRiskSignal);
-  findings.push(
-    buildFinding(
-      "OKTA-INTEG-004",
-      riskAwareRules.length > 0 ? "Pass" : customZones.length > 0 ? "Partial" : "Fail",
-      riskAwareRules.length > 0
-        ? `${riskAwareRules.length} policy rules include contextual, device, network, or risk conditions.`
-        : customZones.length > 0
-          ? "Custom zones exist, but policy rules with contextual access signals were not clearly returned."
-          : "No contextual access rules or custom zones were detected.",
-      riskAwareRules.length > 0
-        ? riskAwareRules.map((rule) => asString(rule.name) ?? asString(rule.id) ?? "unnamed rule")
-        : ["No sign-on or access rules with risk, device, or network conditions were returned."],
-      "Use contextual access rules that incorporate risk, device, or network conditions for higher assurance scenarios.",
-    ),
-  );
+  if (data.signOnPolicies.error && data.accessPolicies.error) {
+    findings.push(
+      manualFinding(
+        "OKTA-INTEG-004",
+        "Contextual access controls",
+        `sign-on and access policies were unreadable (${describeEndpointError(data.signOnPolicies.error)})`,
+        "Review ACTIVE sign-on and authentication policy rules and record which use network, device, risk, or behavior conditions.",
+        `Errors: ${policyErrors.join(" | ")}`,
+      ),
+    );
+  } else {
+    const baseStatus: OktaFindingStatus =
+      riskAwareRules.length > 0 ? "Pass" : customZones.length > 0 ? "Partial" : "Fail";
+    findings.push(
+      buildFinding(
+        "OKTA-INTEG-004",
+        policyErrors.length > 0 ? capAtPartial(baseStatus) : baseStatus,
+        riskAwareRules.length > 0
+          ? `${riskAwareRules.length} ACTIVE policy rules include contextual, device, network, or risk conditions${policyErrors.length > 0 ? " (policy data partially read)" : ""}.`
+          : customZones.length > 0
+            ? "Custom zones exist, but no ACTIVE policy rule with contextual access signals was returned."
+            : "No ACTIVE contextual access rules or custom zones were detected.",
+        [
+          ...(riskAwareRules.length > 0
+            ? riskAwareRules.map((rule) => recordName(rule))
+            : ["No ACTIVE sign-on or access rules with risk, device, or network conditions were returned."]),
+          ...policyErrors.map((error) => `Partial policy data: ${error}`),
+        ],
+        "Use contextual access rules that incorporate risk, device, or network conditions for higher assurance scenarios.",
+      ),
+    );
+  }
 
-  findings.push(
-    buildFinding(
-      "OKTA-INTEG-005",
-      inactiveApps.length === 0 ? "Pass" : "Partial",
-      inactiveApps.length === 0
-        ? "All returned applications were active."
-        : `${inactiveApps.length} applications were not in ACTIVE status.`,
-      inactiveApps.length > 0
-        ? inactiveApps.map(
-            (app) =>
-              `${asString(app.label) ?? asString(app.name) ?? asString(app.id) ?? "unnamed app"}: ${asString(app.status) ?? "unknown"}`,
-          )
-        : ["No inactive or non-active applications detected."],
-      "Review inactive or restricted applications and confirm whether they should remain configured in the tenant.",
-      { severity: "low" },
-    ),
+  if (data.apps.error) {
+    findings.push(manualForDataset("OKTA-INTEG-005", "Application inventory hygiene", data.apps, appInventoryEvidence));
+  } else if (apps.length === 0) {
+    findings.push(manualFinding("OKTA-INTEG-005", "Application inventory hygiene", emptyAppCause, appInventoryEvidence));
+  } else {
+    findings.push(
+      buildFinding(
+        "OKTA-INTEG-005",
+        inactiveApps.length === 0 ? "Pass" : "Partial",
+        inactiveApps.length === 0
+          ? `All ${apps.length} returned applications are ACTIVE.`
+          : `${inactiveApps.length} of ${apps.length} applications are not in ACTIVE status.`,
+        inactiveApps.length > 0
+          ? inactiveApps.map((app) => `${recordName(app)}: ${asString(app.status) ?? "unknown"}`)
+          : [`Apps inspected: ${apps.length}`],
+        "Review inactive or restricted applications and confirm whether they should remain configured in the tenant.",
+        { severity: "low" },
+      ),
+    );
+  }
+
+  const provisioningFeatures = new Set([
+    "PUSH_NEW_USERS",
+    "IMPORT_NEW_USERS",
+    "PUSH_PROFILE_UPDATES",
+    "IMPORT_PROFILE_UPDATES",
+    "GROUP_PUSH",
+    "PUSH_USER_DEACTIVATION",
+    "PUSH_PASSWORD_UPDATES",
+  ]);
+  const provisioningApps = activeApps.filter((app) =>
+    normalizeStringArray(app.features).some((feature) => provisioningFeatures.has(feature.toUpperCase())),
   );
+  const deactivationApps = activeApps.filter((app) =>
+    normalizeStringArray(app.features).some((feature) => feature.toUpperCase() === "PUSH_USER_DEACTIVATION"),
+  );
+  const activeGroupRules = data.groupRules.data.filter(isActiveRecord);
+  if (data.apps.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-INTEG-006",
+        "Provisioning and deprovisioning automation",
+        data.apps,
+        "Record which applications have provisioning enabled with Deactivate Users, and document Workflows or HR-driven deprovisioning flows.",
+      ),
+    );
+  } else if (apps.length === 0) {
+    findings.push(
+      manualFinding(
+        "OKTA-INTEG-006",
+        "Provisioning and deprovisioning automation",
+        emptyAppCause,
+        "Record which applications have provisioning enabled with Deactivate Users, and document Workflows or HR-driven deprovisioning flows.",
+      ),
+    );
+  } else {
+    const status: OktaFindingStatus =
+      deactivationApps.length > 0 ? "Pass" : provisioningApps.length > 0 ? "Fail" : "Partial";
+    findings.push(
+      buildFinding(
+        "OKTA-INTEG-006",
+        status,
+        status === "Pass"
+          ? `${deactivationApps.length} ACTIVE apps push user deactivation downstream (${provisioningApps.length} apps have provisioning features).`
+          : status === "Fail"
+            ? `${provisioningApps.length} ACTIVE apps have provisioning features but none push user deactivation.`
+            : "No ACTIVE app exposes provisioning features; deprovisioning automation could not be observed through the Management API.",
+        [
+          ...provisioningApps.map(
+            (app) => `${recordName(app)}: features=${normalizeStringArray(app.features).join(", ")}`,
+          ),
+          `ACTIVE group rules: ${data.groupRules.error ? `unread (${data.groupRules.error})` : activeGroupRules.length}`,
+          "Note: Okta Workflows and HR-driven lifecycle flows are not visible through the Management API and require manual evidence.",
+        ],
+        "Enable Deactivate Users on provisioning-integrated apps and document Workflows or HR-sourced deprovisioning so access removal is automated end to end.",
+      ),
+    );
+  }
 
   const snapshotSummary = {
-    applications: data.apps.data.length,
+    applications: apps.length,
+    active_applications: activeApps.length,
     risky_oidc_apps: riskyApps.length,
     trusted_origins: trustedOrigins.length,
     insecure_trusted_origins: insecureOrigins.length,
     custom_network_zones: customZones.length,
     contextual_rules: riskAwareRules.length,
     inactive_apps: inactiveApps.length,
+    provisioning_apps: provisioningApps.length,
+    deactivation_push_apps: deactivationApps.length,
+    active_group_rules: activeGroupRules.length,
     dataset_errors: listErrors([
       data.apps,
       data.trustedOrigins,
@@ -2191,6 +3226,7 @@ export function assessOktaIntegrations(
       data.signOnPolicyRules,
       data.idps,
       data.authorizationServers,
+      data.groupRules,
     ]).length,
   };
 
@@ -2218,139 +3254,350 @@ function threatInsightMode(threatInsight: JsonRecord | null): string {
   );
 }
 
+function tokenLabel(token: JsonRecord): string {
+  return asString(token.name) ?? asString(token.id) ?? asString(token.tokenId) ?? "unnamed token";
+}
+
 export function assessOktaMonitoring(
   data: OktaMonitoringData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
   const findings: OktaFinding[] = [];
-  const activeHooks = data.eventHooks.data.filter((hook) => (asString(hook.status) ?? "").toUpperCase() === "ACTIVE");
-  const activeStreams = data.logStreams.data.filter((stream) => (asString(stream.status) ?? "").toUpperCase() === "ACTIVE");
+  const activeHooks = data.eventHooks.data.filter(isActiveRecord);
+  const activeStreams = data.logStreams.data.filter(isActiveRecord);
+  const logExportEvidence =
+    "Record Reports > Log Streaming destinations and Workflow > Event Hooks, plus the SIEM ingestion proof for Okta System Log events.";
 
-  findings.push(
-    buildFinding(
-      "OKTA-MON-001",
-      activeStreams.length > 0 ? "Pass" : activeHooks.length > 0 ? "Partial" : "Fail",
-      activeStreams.length > 0
-        ? `${activeStreams.length} active log streams were detected.`
-        : activeHooks.length > 0
-          ? `${activeHooks.length} active event hooks were detected, but no active log streams were returned.`
-          : "No active log streams or event hooks were detected.",
-      [
-        ...activeStreams.map(
-          (stream) => `Log stream: ${asString(stream.name) ?? asString(stream.id) ?? "unnamed"}`,
-        ),
-        ...activeHooks.map(
-          (hook) => `Event hook: ${asString(hook.name) ?? asString(hook.id) ?? "unnamed"}`,
-        ),
-      ],
-      "Route Okta audit data to an external monitoring or SIEM destination with durable retention.",
-    ),
-  );
+  if (data.logStreams.error && data.eventHooks.error) {
+    findings.push(
+      manualFinding(
+        "OKTA-MON-001",
+        "Log offloading",
+        `log streams and event hooks were unreadable (${describeEndpointError(data.logStreams.error)})`,
+        logExportEvidence,
+        `Errors: ${data.logStreams.error} | ${data.eventHooks.error}`,
+      ),
+    );
+  } else if (data.logStreams.error && activeHooks.length === 0) {
+    findings.push(manualForDataset("OKTA-MON-001", "Log offloading", data.logStreams, logExportEvidence));
+  } else {
+    const baseStatus: OktaFindingStatus =
+      activeStreams.length > 0 ? "Pass" : activeHooks.length > 0 ? "Partial" : "Fail";
+    const partialData = Boolean(data.logStreams.error) || Boolean(data.eventHooks.error);
+    findings.push(
+      buildFinding(
+        "OKTA-MON-001",
+        partialData ? capAtPartial(baseStatus) : baseStatus,
+        activeStreams.length > 0
+          ? `${activeStreams.length} ACTIVE log streams were detected${partialData ? " (event hook data unavailable)" : ""}.`
+          : activeHooks.length > 0
+            ? `${activeHooks.length} ACTIVE event hooks were detected, but no ACTIVE log stream was returned.`
+            : "Zero ACTIVE log streams and zero ACTIVE event hooks were returned; an empty inventory fails this control because log offloading is required.",
+        [
+          ...data.logStreams.data.map(
+            (stream) => `Log stream: ${recordName(stream)} (${asString(stream.type) ?? "type unknown"}, ${asString(stream.status) ?? "status unknown"})`,
+          ),
+          ...data.eventHooks.data.map(
+            (hook) => `Event hook: ${recordName(hook)} (${asString(hook.status) ?? "status unknown"})`,
+          ),
+          ...(data.eventHooks.error ? [`Event hook error: ${data.eventHooks.error}`] : []),
+          ...(data.logStreams.error ? [`Log stream error: ${data.logStreams.error}`] : []),
+        ],
+        "Route Okta audit data to an external monitoring or SIEM destination with durable retention.",
+      ),
+    );
+  }
 
-  findings.push(
-    buildFinding(
-      "OKTA-MON-002",
-      data.systemLogs.data.length > 0 ? "Pass" : data.systemLogs.error ? "Fail" : "Partial",
-      data.systemLogs.data.length > 0
-        ? `Retrieved ${data.systemLogs.data.length} recent system log events.`
-        : data.systemLogs.error
-          ? "System log data could not be retrieved."
-          : "System log access succeeded but no recent events were returned.",
-      data.systemLogs.data.slice(0, 5).map((entry) => {
-        const published = asString(entry.published) ?? "unknown";
-        const eventType = asString(entry.eventType) ?? "unknown";
-        return `${published}: ${eventType}`;
-      }),
-      "Ensure the System Log API remains readable and that audit records are retained or forwarded to a downstream store.",
-    ),
-  );
+  if (data.systemLogs.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-MON-002",
+        "System Log visibility",
+        data.systemLogs,
+        "Export a recent System Log sample from Reports > System Log and confirm downstream retention.",
+      ),
+    );
+  } else {
+    findings.push(
+      buildFinding(
+        "OKTA-MON-002",
+        data.systemLogs.data.length > 0 ? "Pass" : "Partial",
+        data.systemLogs.data.length > 0
+          ? `Retrieved ${data.systemLogs.data.length} system log events from the last ${LOOKBACK_DAYS} days.`
+          : "System log access succeeded but no recent events were returned, which is unexpected for an active org.",
+        data.systemLogs.data.slice(0, 5).map((entry) => {
+          const published = asString(entry.published) ?? "unknown";
+          const eventType = asString(entry.eventType) ?? "unknown";
+          return `${published}: ${eventType}`;
+        }),
+        "Ensure the System Log API remains readable and that audit records are retained or forwarded to a downstream store.",
+      ),
+    );
+  }
 
   const insightMode = threatInsightMode(data.threatInsight.data);
-  const threatStatus: OktaFindingStatus =
-    insightMode === "block" ? "Pass" : insightMode === "audit" || insightMode === "log_only" ? "Partial" : "Fail";
-  findings.push(
-    buildFinding(
-      "OKTA-MON-003",
-      threatStatus,
-      `ThreatInsight mode: ${insightMode}.`,
-      [JSON.stringify(data.threatInsight.data ?? {})],
-      "Use Okta ThreatInsight in at least audit mode, and prefer block mode when the deployment model supports it.",
-    ),
-  );
-
-  findings.push(
-    buildFinding(
-      "OKTA-MON-004",
-      data.behaviors.data.length > 0 ? "Pass" : "Partial",
-      data.behaviors.data.length > 0
-        ? `${data.behaviors.data.length} behavior rules were returned.`
-        : "No behavior rules were returned.",
-      data.behaviors.data.map(
-        (behavior) => asString(behavior.name) ?? asString(behavior.id) ?? "unnamed behavior",
+  if (data.threatInsight.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-MON-003",
+        "ThreatInsight posture",
+        data.threatInsight,
+        "Record Security > General > Okta ThreatInsight settings (action and exempt zones).",
       ),
-      "Review behavior rules that support risk-based detection and signal generation for authentication monitoring.",
-      { severity: "low" },
-    ),
-  );
+    );
+  } else if (!data.threatInsight.data) {
+    findings.push(
+      manualFinding(
+        "OKTA-MON-003",
+        "ThreatInsight posture",
+        "the ThreatInsight configuration endpoint returned no object (feature not available on this org edition)",
+        "Record Security > General > Okta ThreatInsight settings (action and exempt zones).",
+      ),
+    );
+  } else {
+    const threatStatus: OktaFindingStatus =
+      insightMode === "block" ? "Pass" : insightMode === "audit" || insightMode === "log_only" ? "Partial" : "Fail";
+    findings.push(
+      buildFinding(
+        "OKTA-MON-003",
+        threatStatus,
+        `ThreatInsight mode: ${insightMode}.`,
+        [JSON.stringify(data.threatInsight.data)],
+        "Use Okta ThreatInsight in at least audit mode, and prefer block mode when the deployment model supports it.",
+      ),
+    );
+  }
 
-  const staleTokens = data.apiTokens.data.filter((token) => {
-    const referenceDate =
-      asString(token.lastUpdated) ??
-      asString(token.lastUsed) ??
-      asString(token.created) ??
-      undefined;
-    if (!referenceDate) return false;
-    const age = Date.now() - Date.parse(referenceDate);
-    return Number.isFinite(age) && age > DAYS_90_MS;
+  if (data.behaviors.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-MON-004",
+        "Behavior detection coverage",
+        data.behaviors,
+        "Record Security > Behavior Detection rules, or note that the org edition does not include Adaptive MFA behavior detection.",
+      ),
+    );
+  } else {
+    const activeBehaviors = data.behaviors.data.filter(isActiveRecord);
+    findings.push(
+      buildFinding(
+        "OKTA-MON-004",
+        activeBehaviors.length > 0 ? "Pass" : "Partial",
+        activeBehaviors.length > 0
+          ? `${activeBehaviors.length} ACTIVE behavior rules were returned (${data.behaviors.data.length} total).`
+          : data.behaviors.data.length > 0
+            ? `${data.behaviors.data.length} behavior rules exist but none are ACTIVE.`
+            : "No behavior rules were returned.",
+        data.behaviors.data.map(
+          (behavior) => `${recordName(behavior)}: ${asString(behavior.status) ?? "status unknown"}`,
+        ),
+        "Review behavior rules that support risk-based detection and signal generation for authentication monitoring.",
+        { severity: "low" },
+      ),
+    );
+  }
+
+  const tokens = data.apiTokens.data;
+  const tokenEvidence =
+    "Export Security > API > Tokens and record each token's owner, created date, expiry, token window, and network restriction.";
+  const tokenAges = tokens.map((token) => {
+    const referenceDate = asString(token.lastUpdated) ?? asString(token.lastUsed) ?? asString(token.created);
+    const days = daysSince(referenceDate);
+    return { token, referenceDate, days };
   });
-  findings.push(
-    buildFinding(
-      "OKTA-MON-005",
-      data.apiTokens.error
-        ? "Manual"
-        : staleTokens.length === 0
-          ? "Pass"
-          : "Partial",
-      data.apiTokens.error
-        ? "API token metadata was not readable with the current credentials."
-        : staleTokens.length === 0
-          ? "No stale API tokens were detected from the returned token inventory."
-          : `${staleTokens.length} API tokens appear older than 90 days based on returned metadata.`,
-      data.apiTokens.data.map((token) => {
-        const label =
-          asString(token.name) ??
-          asString(token.id) ??
-          asString(token.tokenId) ??
-          "unnamed token";
-        const updated =
-          asString(token.lastUpdated) ??
-          asString(token.lastUsed) ??
-          asString(token.created) ??
-          "unknown";
-        return `${label}: ${updated}`;
-      }),
-      "Rotate long-lived SSWS tokens and prefer OAuth service apps with scoped short-lived access tokens where possible.",
-      data.apiTokens.error
-        ? {
-            manualNote:
-              "Token inventory requires okta.apiTokens.read. If your audit principal cannot read token metadata, validate token hygiene manually.",
-          }
-        : undefined,
-    ),
+  const staleTokens = tokenAges.filter((entry) => entry.days !== null && entry.days > 90);
+  const undatedTokens = tokenAges.filter((entry) => entry.days === null);
+  const emptyTokenSsws =
+    "the token listing returned zero tokens although the SSWS audit token itself should appear, so the inventory is incomplete";
+  if (data.apiTokens.error) {
+    findings.push(manualForDataset("OKTA-MON-005", "API token hygiene", data.apiTokens, tokenEvidence));
+  } else if (tokens.length === 0 && config.authMode === "SSWS") {
+    findings.push(manualFinding("OKTA-MON-005", "API token hygiene", emptyTokenSsws, tokenEvidence));
+  } else if (tokens.length === 0) {
+    findings.push(
+      buildFinding(
+        "OKTA-MON-005",
+        "Pass",
+        "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent because no long-lived static tokens remain.",
+        [`Auth mode: ${config.authMode}`, "Token inventory: empty with no error"],
+        "Keep using OAuth service apps with scoped short-lived access tokens instead of SSWS tokens.",
+      ),
+    );
+  } else {
+    const status: OktaFindingStatus =
+      staleTokens.length > 0 ? "Partial" : undatedTokens.length > 0 ? "Partial" : "Pass";
+    findings.push(
+      buildFinding(
+        "OKTA-MON-005",
+        status,
+        staleTokens.length > 0
+          ? `${staleTokens.length} of ${tokens.length} API tokens have not been updated for more than 90 days.`
+          : undatedTokens.length > 0
+            ? `${undatedTokens.length} of ${tokens.length} API tokens have no usable date metadata, so their age cannot be confirmed.`
+            : `All ${tokens.length} API tokens were updated within 90 days.`,
+        tokenAges.map(
+          (entry) =>
+            `${tokenLabel(entry.token)}: reference=${entry.referenceDate ?? "missing"}, age=${entry.days === null ? "unknown" : `${entry.days} days`}`,
+        ),
+        "Rotate long-lived SSWS tokens and prefer OAuth service apps with scoped short-lived access tokens where possible.",
+      ),
+    );
+  }
+
+  if (data.deviceAssurance.error) {
+    findings.push(
+      manualForDataset(
+        "OKTA-MON-006",
+        "Device assurance coverage",
+        data.deviceAssurance,
+        "Record Security > Device Assurance Policies, or note that the org edition (Classic Engine) does not support device assurance.",
+      ),
+    );
+  } else {
+    findings.push(
+      buildFinding(
+        "OKTA-MON-006",
+        data.deviceAssurance.data.length > 0 ? "Pass" : "Partial",
+        data.deviceAssurance.data.length > 0
+          ? `${data.deviceAssurance.data.length} device assurance policies were returned.`
+          : "No device assurance policies were returned.",
+        data.deviceAssurance.data.map(
+          (policy) => `${recordName(policy)} (${asString(policy.platform) ?? "platform unknown"})`,
+        ),
+        "Use device assurance policies when your access decisions should incorporate platform or management posture.",
+        { severity: "low" },
+      ),
+    );
+  }
+
+  const now = Date.now();
+  const tokenGovernance = tokens.map((token) => {
+    const network = asRecord(token.network);
+    const connection = (asString(network.connection) ?? "ANYWHERE").toUpperCase();
+    const expiresAt = asString(token.expiresAt);
+    const expiresMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
+    const windowDays = parseIsoDurationDays(asString(token.tokenWindow));
+    return {
+      label: tokenLabel(token),
+      connection,
+      expiresAt,
+      expired: Number.isFinite(expiresMs) && expiresMs < now,
+      missingExpiry: !expiresAt || !Number.isFinite(expiresMs),
+      windowDays,
+      longWindow: windowDays !== undefined && windowDays > 30,
+    };
+  });
+  const expiredTokens = tokenGovernance.filter((entry) => entry.expired);
+  const unrestrictedTokens = tokenGovernance.filter((entry) => entry.connection !== "ZONE");
+  const missingExpiryTokens = tokenGovernance.filter((entry) => entry.missingExpiry);
+  const longWindowTokens = tokenGovernance.filter((entry) => entry.longWindow);
+  if (data.apiTokens.error) {
+    findings.push(
+      manualForDataset("OKTA-MON-007", "API token expiry and network restrictions", data.apiTokens, tokenEvidence),
+    );
+  } else if (tokens.length === 0 && config.authMode === "SSWS") {
+    findings.push(
+      manualFinding("OKTA-MON-007", "API token expiry and network restrictions", emptyTokenSsws, tokenEvidence),
+    );
+  } else if (tokens.length === 0) {
+    findings.push(
+      buildFinding(
+        "OKTA-MON-007",
+        "Pass",
+        "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent.",
+        [`Auth mode: ${config.authMode}`, "Token inventory: empty with no error"],
+        "Keep SSWS token creation restricted and prefer OAuth service apps.",
+      ),
+    );
+  } else {
+    const status: OktaFindingStatus =
+      expiredTokens.length > 0
+        ? "Fail"
+        : unrestrictedTokens.length > 0 || missingExpiryTokens.length > 0 || longWindowTokens.length > 0
+          ? "Partial"
+          : "Pass";
+    findings.push(
+      buildFinding(
+        "OKTA-MON-007",
+        status,
+        status === "Fail"
+          ? `${expiredTokens.length} API tokens are past their expiresAt but still listed; revoke them.`
+          : status === "Partial"
+            ? `${unrestrictedTokens.length} tokens are not restricted to a network zone, ${missingExpiryTokens.length} lack an expiry timestamp, and ${longWindowTokens.length} use an inactivity window over 30 days.`
+            : `All ${tokens.length} API tokens are zone-restricted with a reported expiry and a 30-day or shorter inactivity window.`,
+        tokenGovernance.map(
+          (entry) =>
+            `${entry.label}: network=${entry.connection}, expiresAt=${entry.expiresAt ?? "missing"}, tokenWindow=${entry.windowDays === undefined ? "unknown" : `${entry.windowDays} days`}`,
+        ),
+        "Restrict API tokens to trusted network zones, keep the default 30-day inactivity window or shorter, and revoke expired tokens.",
+      ),
+    );
+  }
+
+  const contacts = data.orgContacts.data;
+  const technicalContact = contacts.find(
+    (contact) => (asString(contact.contactType) ?? "").toUpperCase() === "TECHNICAL",
   );
+  const contactEvidence =
+    "Record Settings > Account > Technical contact and Billing contact, confirming each maps to an ACTIVE administrator.";
+  if (data.orgContacts.error && contacts.length === 0) {
+    findings.push(manualForDataset("OKTA-MON-008", "Security contact routing", data.orgContacts, contactEvidence));
+  } else if (contacts.length === 0) {
+    findings.push(
+      manualFinding(
+        "OKTA-MON-008",
+        "Security contact routing",
+        "the org contacts endpoint returned zero contact types although Okta always defines BILLING and TECHNICAL, so the inventory is incomplete",
+        contactEvidence,
+      ),
+    );
+  } else {
+    const technicalStatus = (asString(technicalContact?.userStatus) ?? "").toUpperCase();
+    const technicalUserId = asString(technicalContact?.userId);
+    const baseStatus: OktaFindingStatus = !technicalContact || !technicalUserId
+      ? "Fail"
+      : technicalStatus === "ACTIVE"
+        ? "Pass"
+        : technicalStatus === ""
+          ? "Partial"
+          : "Fail";
+    findings.push(
+      buildFinding(
+        "OKTA-MON-008",
+        data.orgContacts.error ? capAtPartial(baseStatus) : baseStatus,
+        baseStatus === "Pass"
+          ? "The technical contact resolves to an ACTIVE Okta user."
+          : baseStatus === "Partial"
+            ? "A technical contact is assigned, but the contact user's status could not be read."
+            : technicalContact && technicalUserId
+              ? `The technical contact user is ${technicalStatus || "unknown"}, so security notifications may not reach an active administrator.`
+              : "No technical contact user is assigned for the org.",
+        [
+          ...contacts.map(
+            (contact) =>
+              `${asString(contact.contactType) ?? "contact"}: user=${asString(contact.userLogin) ?? asString(contact.userId) ?? "unassigned"}, status=${asString(contact.userStatus) ?? "unknown"}`,
+          ),
+          ...(data.orgContacts.error ? [`Contact resolution errors: ${data.orgContacts.error}`] : []),
+        ],
+        "Assign the technical contact to an active, monitored administrator or distribution list so Okta security notices are received.",
+      ),
+    );
+  }
 
   findings.push(
     buildFinding(
-      "OKTA-MON-006",
-      data.deviceAssurance.data.length > 0 ? "Pass" : "Partial",
-      data.deviceAssurance.data.length > 0
-        ? `${data.deviceAssurance.data.length} device assurance policies were returned.`
-        : "No device assurance policies were returned.",
-      data.deviceAssurance.data.map(
-        (policy) => asString(policy.displayName) ?? asString(policy.id) ?? "unnamed policy",
-      ),
-      "Use device assurance policies when your access decisions should incorporate platform or management posture.",
-      { severity: "low" },
+      "OKTA-MON-009",
+      "Manual",
+      "Administrator security notification email settings are not exposed by the Okta Management API.",
+      [
+        "Settings > Account > Security notification emails controls new sign-on, factor reset, password change, and suspicious activity notices.",
+        "Settings > Account > Admin notifications controls which administrator roles receive Okta service and security emails.",
+      ],
+      "Capture the notification settings pages and confirm suspicious-activity reporting and administrator notices are enabled.",
+      {
+        manualNote:
+          "Collect manually: screenshots of Security notification emails and Admin notifications with every security notice enabled.",
+      },
     ),
   );
 
@@ -2360,9 +3607,13 @@ export function assessOktaMonitoring(
     system_log_events: data.systemLogs.data.length,
     behaviors: data.behaviors.data.length,
     threat_insight_mode: insightMode,
-    api_tokens: data.apiTokens.data.length,
+    api_tokens: tokens.length,
     stale_api_tokens: staleTokens.length,
+    undated_api_tokens: undatedTokens.length,
+    unrestricted_api_tokens: unrestrictedTokens.length,
+    expired_api_tokens: expiredTokens.length,
     device_assurance_policies: data.deviceAssurance.data.length,
+    org_contacts_resolved: contacts.length,
     dataset_errors: listErrors([
       data.eventHooks,
       data.logStreams,
@@ -2371,6 +3622,7 @@ export function assessOktaMonitoring(
       data.threatInsight,
       data.apiTokens,
       data.deviceAssurance,
+      data.orgContacts,
     ]).length,
   };
 
@@ -2387,6 +3639,7 @@ export function assessOktaMonitoring(
     snapshotSummary,
   };
 }
+
 
 function buildConfigNotes(config: OktaResolvedConfig): string[] {
   const notes = [
@@ -2567,7 +3820,8 @@ function buildQuickReference(): string {
     "- `core_data/` contains raw Okta API responses used during this assessment.",
     "- `analysis/` contains normalized findings and category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
-    "- `_errors.log` appears only when some reads fail but the bundle still completes.",
+    "- `compliance/fedramp/oscal_assessment_results.json` is an OSCAL 1.1.2 assessment-results document keyed by NIST SP 800-53 objective ids.",
+    "- `_errors.log` appears only when some reads fail or an inventory is truncated but the bundle still completes.",
     "- Review manual findings before asserting framework compliance from the automated output alone.",
     "",
     "Recommended reading order:",
@@ -2621,10 +3875,10 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
+  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "-10"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -2653,32 +3907,148 @@ async function createZipArchive(sourceDir: string, zipPath: string): Promise<voi
   });
 }
 
+function oscalControlId(mapping: string): string {
+  return mapping
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/\((\d+)\)/g, ".$1")
+    .replace(/[()]/g, "");
+}
+
+function oscalUuid(seed: string): string {
+  const hash = createHash("sha256").update(seed).digest("hex");
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+}
+
+export function buildOscalAssessmentResults(
+  config: OktaResolvedConfig,
+  findings: OktaFinding[],
+  generatedAt: string = new Date().toISOString(),
+): JsonRecord {
+  const hostname = new URL(config.orgUrl).hostname;
+  const observations = findings.map((finding) => ({
+    uuid: oscalUuid(`${hostname}:observation:${finding.id}`),
+    title: finding.title,
+    description: finding.summary,
+    methods: ["TEST"],
+    types: ["finding"],
+    props: [
+      { name: "grclanker-check-id", value: finding.id },
+      { name: "grclanker-status", value: finding.status },
+      { name: "grclanker-severity", value: finding.severity },
+    ],
+    // OSCAL observation sets additionalProperties=false and relevant-evidence minItems=1, so omit it when empty.
+    ...(finding.evidence.length > 0
+      ? { "relevant-evidence": finding.evidence.map((entry) => ({ description: entry })) }
+      : {}),
+    collected: generatedAt,
+  }));
+  const reviewedControlIds = [
+    ...new Set(findings.flatMap((finding) => finding.frameworks.fedramp.map((mapping) => oscalControlId(mapping)))),
+  ].sort();
+  const oscalFindings = findings.flatMap((finding) =>
+    finding.frameworks.fedramp.map((mapping) => ({
+      uuid: oscalUuid(`${hostname}:finding:${finding.id}:${mapping}`),
+      title: `${finding.id} ${finding.title} (${mapping})`,
+      description: finding.summary,
+      target: {
+        type: "objective-id",
+        "target-id": `${oscalControlId(mapping)}_obj`,
+        status: {
+          state: finding.status === "Pass" ? "satisfied" : "not-satisfied",
+          reason: finding.status === "Pass" ? undefined : finding.status.toLowerCase(),
+          remarks:
+            finding.status === "Pass"
+              ? undefined
+              : finding.status === "Manual"
+                ? `Manual evidence required: ${finding.manualNote ?? finding.recommendation}`
+                : finding.recommendation,
+        },
+      },
+      "related-observations": [{ "observation-uuid": oscalUuid(`${hostname}:observation:${finding.id}`) }],
+    })),
+  );
+
+  return {
+    "assessment-results": {
+      uuid: oscalUuid(`${hostname}:assessment-results:${generatedAt}`),
+      metadata: {
+        title: `Okta security inspector results for ${hostname}`,
+        "last-modified": generatedAt,
+        version: "1.0.0",
+        "oscal-version": OSCAL_VERSION,
+        props: [
+          { name: "generator", value: "grclanker okta_export_audit_bundle" },
+          { name: "framework", value: "FedRAMP / NIST SP 800-53" },
+        ],
+      },
+      "import-ap": { href: "#grclanker-okta-assessment-plan" },
+      results: [
+        {
+          uuid: oscalUuid(`${hostname}:result:${generatedAt}`),
+          title: "Okta Management API automated assessment",
+          description:
+            "Automated read-only assessment of Okta authentication, admin access, integration, and monitoring posture. Findings with state not-satisfied and reason manual require human evidence collection.",
+          start: generatedAt,
+          end: generatedAt,
+          "reviewed-controls": {
+            description: "NIST SP 800-53 controls targeted by the grclanker Okta findings in this result.",
+            "control-selections": [
+              reviewedControlIds.length > 0
+                ? { "include-controls": reviewedControlIds.map((controlId) => ({ "control-id": controlId })) }
+                : { description: "No findings mapped to NIST SP 800-53 controls in this result." },
+            ],
+          },
+          observations,
+          findings: oscalFindings,
+        },
+      ],
+    },
+  };
+}
+
+type OktaAuditBundleClient = Pick<
+  OktaAuditorClient,
+  | "listPolicies"
+  | "listPolicyRules"
+  | "listAuthenticators"
+  | "listIdps"
+  | "listAuthorizationServers"
+  | "getDefaultAuthorizationServer"
+  | "listOrgFactors"
+  | "listUsersWithRoleAssignments"
+  | "listUserRoles"
+  | "listGroups"
+  | "listGroupRoles"
+  | "listGroupUsers"
+  | "listApps"
+  | "listTrustedOrigins"
+  | "listNetworkZones"
+  | "listEventHooks"
+  | "listLogStreams"
+  | "listSystemLogs"
+  | "listBehaviors"
+  | "getThreatInsight"
+  | "listApiTokens"
+  | "listDeviceAssurancePolicies"
+> &
+  Partial<
+    Pick<
+      OktaAuditorClient,
+      | "listUsersWithMeta"
+      | "listUserFactors"
+      | "getOktaSupportSettings"
+      | "getThirdPartyAdminSetting"
+      | "listGroupRules"
+      | "listOrgContacts"
+      | "getOrgContactUser"
+      | "getUser"
+    >
+  >;
+
 export async function exportOktaAuditBundle(
-  client: Pick<
-    OktaAuditorClient,
-    | "listPolicies"
-    | "listPolicyRules"
-    | "listAuthenticators"
-    | "listIdps"
-    | "listAuthorizationServers"
-    | "getDefaultAuthorizationServer"
-    | "listOrgFactors"
-    | "listUsersWithRoleAssignments"
-    | "listUserRoles"
-    | "listGroups"
-    | "listGroupRoles"
-    | "listGroupUsers"
-    | "listApps"
-    | "listTrustedOrigins"
-    | "listNetworkZones"
-    | "listEventHooks"
-    | "listLogStreams"
-    | "listSystemLogs"
-    | "listBehaviors"
-    | "getThreatInsight"
-    | "listApiTokens"
-    | "listDeviceAssurancePolicies"
-  >,
+  client: OktaAuditBundleClient,
   config: OktaResolvedConfig,
   outputRoot: string,
 ): Promise<OktaAuditBundleResult> {
@@ -2699,6 +4069,7 @@ export async function exportOktaAuditBundle(
     ...listErrors(Object.values(adminAccess)),
     ...listErrors(Object.values(integrations)),
     ...listErrors(Object.values(monitoring)),
+    ...listTruncations(Object.values(adminAccess)).map((note) => `Truncated inventory: ${note}`),
   ];
 
   const outputDir = await nextAvailableAuditDir(
@@ -2723,9 +4094,14 @@ export async function exportOktaAuditBundle(
     ["core_data/groups.json", adminAccess.groups.data],
     ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles.data],
     ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers.data],
+    ["core_data/users.json", adminAccess.users.data],
+    ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors.data],
+    ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess.data],
+    ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting.data],
     ["core_data/apps.json", integrations.apps.data],
     ["core_data/trusted_origins.json", integrations.trustedOrigins.data],
     ["core_data/network_zones.json", integrations.networkZones.data],
+    ["core_data/group_rules.json", integrations.groupRules.data],
     ["core_data/event_hooks.json", monitoring.eventHooks.data],
     ["core_data/log_streams.json", monitoring.logStreams.data],
     ["core_data/system_logs_recent.json", monitoring.systemLogs.data],
@@ -2733,6 +4109,7 @@ export async function exportOktaAuditBundle(
     ["core_data/threat_insight.json", monitoring.threatInsight.data],
     ["core_data/api_tokens.json", monitoring.apiTokens.data],
     ["core_data/device_assurance.json", monitoring.deviceAssurance.data],
+    ["core_data/org_contacts.json", monitoring.orgContacts.data],
   ];
 
   for (const [pathName, value] of coreDataFiles) {
@@ -2763,6 +4140,11 @@ export async function exportOktaAuditBundle(
     outputDir,
     "compliance/fedramp/fedramp_compliance_report.md",
     buildFrameworkReport("FedRAMP / NIST 800-53 Compliance Report", allFindings, "fedramp"),
+  );
+  await writeSecureTextFile(
+    outputDir,
+    "compliance/fedramp/oscal_assessment_results.json",
+    serializeJson(buildOscalAssessmentResults(config, allFindings)),
   );
   await writeSecureTextFile(
     outputDir,
@@ -2944,7 +4326,7 @@ export function registerOktaTools(pi: any): void {
     name: "okta_assess_authentication",
     label: "Assess Okta authentication posture",
     description:
-      "Evaluate phishing-resistant MFA, password policies, session controls, and certificate-authentication readiness in Okta.",
+      "Evaluate phishing-resistant MFA, admin MFA rules, password policies, session controls, certificate-authentication readiness, and FIPS or restricted authenticator posture in Okta.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: AssessmentArgs) {
@@ -2966,7 +4348,7 @@ export function registerOktaTools(pi: any): void {
     name: "okta_assess_admin_access",
     label: "Assess Okta admin access",
     description:
-      "Review Okta privileged users, super-admin concentration, stale privileged accounts, and privileged group hygiene.",
+      "Review Okta privileged users, super-admin concentration, stale privileged accounts, admin MFA enrollment, privileged group hygiene, workforce account lifecycle, and Okta Support or third-party admin access.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: AssessmentArgs) {
@@ -2988,7 +4370,7 @@ export function registerOktaTools(pi: any): void {
     name: "okta_assess_integrations",
     label: "Assess Okta integrations",
     description:
-      "Review Okta applications, trusted origins, network zones, OAuth grant hygiene, and contextual access controls.",
+      "Review Okta applications, trusted origins, network zones, OAuth grant hygiene, contextual access controls, and provisioning or deprovisioning automation.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: AssessmentArgs) {
@@ -3010,7 +4392,7 @@ export function registerOktaTools(pi: any): void {
     name: "okta_assess_monitoring",
     label: "Assess Okta monitoring",
     description:
-      "Review Okta log offloading, System Log visibility, ThreatInsight, behavior rules, API token hygiene, and device assurance coverage.",
+      "Review Okta log offloading, System Log visibility, ThreatInsight, behavior rules, API token hygiene and governance, device assurance coverage, and security contact routing.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
     async execute(_toolCallId: string, args: AssessmentArgs) {
