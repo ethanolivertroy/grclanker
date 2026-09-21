@@ -768,10 +768,14 @@ const QUERY_DOMAIN_USERS = `query($domainId: [ID!], $cursor: String) {
  * Documented: apis/nerdgraph/examples/nerdgraph-manage-groups ("Query existing roles"):
  *   authorizationManagement.authenticationDomains { authenticationDomains { groups { groups { roles { roles
  *   { accountId displayName id name organizationId type } } } } } }, and groups { groups { displayName id } }.
- * The `id` filter on authenticationDomains and the cursor pagination on groups (nextCursor totalCount) mirror the
- *   documented userManagement shape for the same collections. The authorizationManagement tutorial shows only the
- *   nested shape, so when NerdGraph rejects either argument QUERY_DOMAIN_GROUP_GRANTS_DOCUMENTED reads that shape as
- *   one page, filters it to the requested domain, and reports the listing as incomplete.
+ * Schema reference (pkg/organization): AuthorizationManagementAuthenticationDomainSearch { authenticationDomains
+ *   nextCursor totalCount }, AuthorizationManagementAuthenticationDomain { id name groups },
+ *   AuthorizationManagementGroupSearch { groups nextCursor totalCount }, AuthorizationManagementGroup { id displayName
+ *   roles }, described as containers "enabling cursor based pagination". The `id` filter and `cursor` argument follow
+ *   the documented userManagement shape for the same collections (nerdgraph-manage-users, "Pagination").
+ * The authorizationManagement tutorial shows only the nested shape, so when NerdGraph rejects either argument
+ *   QUERY_DOMAIN_GROUP_GRANTS_DOCUMENTED reads that shape as one page, filters it to the requested domain, and reports
+ *   the listing as incomplete.
  */
 const GROUP_GRANT_FIELDS = `groups {
           id displayName
