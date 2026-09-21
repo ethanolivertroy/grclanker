@@ -10,7 +10,8 @@ import {
 } from "node:fs";
 import { generateKeyPairSync } from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   GWS_CHECK_IDS,
@@ -25,6 +26,9 @@ import {
   collectGwsAuditData,
   exportGwsAuditBundle,
   normalizeFrameworkSelection,
+  projectActivitySnapshot,
+  projectAlertSnapshot,
+  redactKnownValues,
   redactSecrets,
   resolveGwsConfiguration,
   resolveSecureOutputPath,
@@ -310,6 +314,108 @@ function assessAll(data, config) {
 
 function statusMap(assessments) {
   return Object.fromEntries(assessments.flatMap((assessment) => assessment.findings.map((finding) => [finding.id, finding.status])));
+}
+
+function listFilesRecursively(root) {
+  const files = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const pathname = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...listFilesRecursively(pathname));
+    else files.push(pathname);
+  }
+  return files;
+}
+
+/** Reads every entry of a zip through its central directory so the extracted text can be grepped. */
+function readZipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  const eocd = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(eocd >= 0, "zip end-of-central-directory record not found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = new Map();
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    if (!name.endsWith("/")) {
+      entries.set(name, method === 8 ? inflateRawSync(data).toString("utf8") : data.toString("utf8"));
+    }
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+const PLANTED_SECRET = "FAKESECRET-9f8e7d6c";
+
+function planted(carrier) {
+  return `${PLANTED_SECRET}-${carrier}`;
+}
+
+/** Reports API parameters are {name, value} pairs; the secret sits under the generic value keys. */
+function secretParameters(carrier) {
+  return [
+    { name: "oauth_token", value: planted(`${carrier}-oauth-token-param`) },
+    { name: "accessToken", multiValue: [planted(`${carrier}-access-token-multivalue`)] },
+    { name: "SETTING_NAME", value: planted(`${carrier}-benign-param`) },
+  ];
+}
+
+/** Every collected object type carries the planted secret in every carrier the reviewer used: camelCase keys, pair values, blobs, links. */
+function createSecretBearingCollector() {
+  const withParameters = (item, carrier) => ({
+    ...item,
+    actor: { ...item.actor, key: planted(`${carrier}-actor-key`) },
+    events: item.events.map((event) => ({ ...event, parameters: secretParameters(carrier) })),
+  });
+  const tokens = Object.fromEntries(Object.entries(createTokens()).map(([userKey, list]) => [
+    userKey,
+    list.map((token) => ({ ...token, refreshToken: planted("token-refresh-token"), etag: planted("token-etag") })),
+  ]));
+  return createFakeCollector({
+    collectUsers: async () => collection(createUsers().map((user) => ({
+      ...user,
+      privateKey: planted("user-private-key"),
+      customSchemas: { hr: { badge: planted("user-benign-key") } },
+    }))),
+    collectRoles: async () => collection(createRoles().map((role) => ({
+      ...role,
+      clientSecret: planted("role-client-secret"),
+      roleDescription: planted("role-description"),
+    }))),
+    collectRoleAssignments: async () => collection(createRoleAssignments().map((assignment) => ({
+      ...assignment,
+      refreshToken: planted("assignment-refresh-token"),
+    }))),
+    collectActivities: async (applicationName) => {
+      if (applicationName === "login") return collection(createLoginActivities().map((item) => withParameters(item, "login")));
+      if (applicationName === "admin") return collection(createAdminActivities().map((item) => withParameters(item, "admin")));
+      return collection(createTokenActivities().map((item) => withParameters(item, "token-activity")));
+    },
+    collectAlerts: async () => collection(createAlerts().map((alert) => ({
+      ...alert,
+      etag: planted("alert-etag"),
+      securityInvestigationToolLink: `https://admin.google.com/ac/sc/investigation?token=${planted("alert-link-query")}`,
+      data: {
+        "@type": "type.googleapis.com/google.apps.alertcenter.type.DeviceCompromised",
+        rawConfig: `snmp community=${planted("alert-data-community")}`,
+        note: planted("alert-data-benign-key"),
+        accessToken: planted("alert-data-access-token"),
+      },
+    }))),
+    collectTwoStepPolicies: async () => collection(createTwoStepPolicies().map((entry) => ({
+      ...entry,
+      setting: { ...entry.setting, value: { ...entry.setting.value, secretValue: planted("policy-secret-value"), note: planted("policy-benign-key") } },
+    }))),
+    listUserTokens: async (userKey) => tokens[userKey] ?? [],
+  });
 }
 
 test("resolveGwsConfiguration prefers explicit args over environment values and loads service account JSON", async () => {
@@ -1002,16 +1108,113 @@ test("exportGwsAuditBundle writes _errors.log only on partial collection and hon
   assert.throws(() => normalizeFrameworkSelection(["hipaa"]), /Unknown framework "hipaa"/);
 });
 
-test("redactSecrets strips credential-like keys from raw snapshots", () => {
+test("rule 9: redactSecrets matches normalized key names, {name, value} pairs, and URL query strings", () => {
   const redacted = redactSecrets({
     users: [{ primaryEmail: "user@example.com", password: "hunter2", hashFunction: "SHA-1" }],
     token: { access_token: "ya29.secret", clientId: "client-1" },
+    camel: { privateKey: "-----BEGIN", refreshToken: "1//abc", accessToken: "ya29.def", clientSecret: "GOCSPX-xyz", "API-Key": "k" },
+    parameters: [
+      { name: "oauth_token", value: "ya29.param" },
+      { name: "accessToken", multiValue: ["ya29.multi"], intValue: "7" },
+      { name: "SETTING_NAME", value: "ALLOW_LESS_SECURE_APPS" },
+      { type: "USER_SETTINGS", name: "CHANGE_PASSWORD" },
+    ],
+    link: "https://admin.google.com/ac/sc/investigation?token=abc&x=1",
+    nextPageToken: "CgoQ",
+    scopes: ["https://www.googleapis.com/auth/drive"],
   });
   assert.equal(redacted.users[0].primaryEmail, "user@example.com");
   assert.equal(redacted.users[0].password, "[REDACTED]");
   assert.equal(redacted.users[0].hashFunction, "[REDACTED]");
   assert.equal(redacted.token.access_token, "[REDACTED]");
   assert.equal(redacted.token.clientId, "client-1");
+  assert.deepEqual(redacted.camel, {
+    privateKey: "[REDACTED]",
+    refreshToken: "[REDACTED]",
+    accessToken: "[REDACTED]",
+    clientSecret: "[REDACTED]",
+    "API-Key": "[REDACTED]",
+  });
+  assert.deepEqual(redacted.parameters[0], { name: "oauth_token", value: "[REDACTED]" });
+  assert.deepEqual(redacted.parameters[1], { name: "accessToken", multiValue: "[REDACTED]", intValue: "[REDACTED]" });
+  assert.deepEqual(redacted.parameters[2], { name: "SETTING_NAME", value: "ALLOW_LESS_SECURE_APPS" });
+  assert.deepEqual(redacted.parameters[3], { type: "USER_SETTINGS", name: "CHANGE_PASSWORD" });
+  assert.equal(redacted.link, "https://admin.google.com/ac/sc/investigation");
+  assert.equal(redacted.nextPageToken, "CgoQ");
+  assert.deepEqual(redacted.scopes, ["https://www.googleapis.com/auth/drive"]);
+
+  const scrubbed = redactKnownValues({ actor: "ya29.known-token-value", nested: ["prefix ya29.known-token-value suffix"], short: "abc" }, ["ya29.known-token-value", "abc"]);
+  assert.deepEqual(scrubbed, { actor: "[REDACTED]", nested: ["prefix [REDACTED] suffix"], short: "abc" });
+});
+
+test("rule 9: snapshot projection keeps only documented fields, dropping alert data payloads and event parameters", () => {
+  const alert = projectAlertSnapshot({
+    alertId: "a-1",
+    type: "Device compromised",
+    source: "Mobile device management",
+    createTime: RECENT_LOGIN,
+    etag: "etag-1",
+    securityInvestigationToolLink: "https://admin.google.com/ac/sc/investigation?token=abc",
+    metadata: { alertId: "a-1", status: "NOT_STARTED", severity: "HIGH", etag: "etag-2" },
+    data: { "@type": "type.googleapis.com/google.apps.alertcenter.type.DeviceCompromised", rawConfig: "community=public" },
+  });
+  assert.deepEqual(alert, {
+    alertId: "a-1",
+    type: "Device compromised",
+    source: "Mobile device management",
+    createTime: RECENT_LOGIN,
+    metadata: { alertId: "a-1", status: "NOT_STARTED", severity: "HIGH" },
+  });
+
+  const item = projectActivitySnapshot({
+    kind: "admin#reports#activity",
+    id: { time: RECENT_LOGIN, uniqueQualifier: "1", applicationName: "admin", customerId: "C0123abcd" },
+    actor: { email: "admin@example.com", profileId: "100", callerType: "USER", key: "consumer-key", applicationInfo: { applicationName: "App", oAuthClientId: "client-1" } },
+    ipAddress: "203.0.113.1",
+    events: [{ type: "USER_SETTINGS", name: "CHANGE_PASSWORD", parameters: [{ name: "oauth_token", value: "ya29" }] }],
+  });
+  assert.deepEqual(item, {
+    id: { time: RECENT_LOGIN, uniqueQualifier: "1", applicationName: "admin", customerId: "C0123abcd" },
+    actor: { email: "admin@example.com", profileId: "100", callerType: "USER", applicationInfo: { applicationName: "App" } },
+    ipAddress: "203.0.113.1",
+    events: [{ type: "USER_SETTINGS", name: "CHANGE_PASSWORD" }],
+  });
+});
+
+test("rule 9 (end to end): a bundle exported from secret-bearing fixtures contains no planted value in any file or zip entry", async () => {
+  const base = createTempBase("grclanker-gws-secrets-");
+  const config = createSampleConfig();
+  const result = await exportGwsAuditBundle(createSecretBearingCollector(), config, base);
+
+  assert.equal(result.findingCount, 19);
+  const files = listFilesRecursively(result.outputDir);
+  assert.ok(files.length >= 24, `expected the full bundle, saw ${files.length} files`);
+  for (const file of files) {
+    const content = readFileSync(file, "utf8");
+    const leak = content.match(new RegExp(`${PLANTED_SECRET}-[a-z0-9-]+`));
+    assert.equal(leak, null, `${relative(result.outputDir, file)} leaked ${leak?.[0]}`);
+  }
+
+  const entries = readZipEntries(result.zipPath);
+  assert.equal(entries.size, files.length);
+  for (const [name, content] of entries) {
+    const leak = content.match(new RegExp(`${PLANTED_SECRET}-[a-z0-9-]+`));
+    assert.equal(leak, null, `zip entry ${name} leaked ${leak?.[0]}`);
+  }
+
+  const users = JSON.parse(readFileSync(join(result.outputDir, "core_data", "users.json"), "utf8"));
+  assert.deepEqual(Object.keys(users.data[0]).sort(), ["archived", "id", "isAdmin", "isDelegatedAdmin", "isEnforcedIn2Sv", "isEnrolledIn2Sv", "lastLoginTime", "primaryEmail", "suspended"]);
+  const alerts = JSON.parse(readFileSync(join(result.outputDir, "core_data", "alerts.json"), "utf8"));
+  assert.equal(alerts.data[0].metadata.status, "NOT_STARTED");
+  assert.equal("data" in alerts.data[0], false);
+  const logins = JSON.parse(readFileSync(join(result.outputDir, "core_data", "login_activities.json"), "utf8"));
+  assert.deepEqual(logins.data[0].events, [{ type: "login", name: "login_success" }, { type: "login", name: "suspicious_login" }]);
+  assert.equal("key" in logins.data[0].actor, false);
+  const inventory = JSON.parse(readFileSync(join(result.outputDir, "core_data", "token_inventory.json"), "utf8"));
+  assert.equal(inventory.data[0].token.clientId, "client-1");
+  assert.equal("refreshToken" in inventory.data[0].token, false);
+  const policies = JSON.parse(readFileSync(join(result.outputDir, "core_data", "two_step_verification_policies.json"), "utf8"));
+  assert.deepEqual(policies.data[0].setting.value, { enforcedFrom: ENFORCED_FROM });
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

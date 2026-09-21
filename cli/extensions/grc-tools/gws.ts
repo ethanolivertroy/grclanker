@@ -119,7 +119,40 @@ const SUSPICIOUS_LOGIN_NAMES = new Set([
 /** Alert metadata.status values documented on the Alert Center Alert resource. */
 const CLOSED_ALERT_STATUS = "closed";
 const HIGH_RISK_SCOPE_PATTERN = /(admin|gmail|drive|cloud-platform|apps\.groups|directory|classroom|vault|spreadsheets|docs)/i;
-const SECRET_KEY_PATTERN = /(password|secret|private_key|access_token|refresh_token|client_secret|hashfunction)/i;
+/**
+ * Matched against key names normalized to lowercase alphanumerics, so privateKey,
+ * private_key, and PRIVATE-KEY all match. Bare "token" is excluded on purpose:
+ * nextPageToken and the token inventory wrapper are not secrets.
+ */
+const SECRET_KEY_PATTERN = /(password|passwd|secret|privatekey|accesstoken|refreshtoken|idtoken|oauthtoken|bearertoken|authtoken|sessiontoken|apikey|hashfunction|credential)/;
+/** Reports API event parameters carry their value under one of these documented keys next to `name`. */
+const PAIR_VALUE_KEYS = ["value", "multiValue", "intValue", "multiIntValue", "boolValue", "messageValue", "multiMessageValue"] as const;
+/** Directory API User fields requested through USERS_FIELDS; nothing else is written to core_data. */
+const USER_SNAPSHOT_FIELDS = ["id", "primaryEmail", "isAdmin", "isDelegatedAdmin", "suspended", "archived", "lastLoginTime", "isEnrolledIn2Sv", "isEnforcedIn2Sv", "orgUnitPath"] as const;
+/** Directory API Role resource (https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles). */
+const ROLE_SNAPSHOT_FIELDS = ["roleId", "roleName", "isSystemRole", "isSuperAdminRole"] as const;
+const ROLE_PRIVILEGE_SNAPSHOT_FIELDS = ["privilegeName", "serviceId"] as const;
+/** Directory API RoleAssignment resource (https://developers.google.com/workspace/admin/directory/reference/rest/v1/roleAssignments). */
+const ROLE_ASSIGNMENT_SNAPSHOT_FIELDS = ["roleAssignmentId", "roleId", "assignedTo", "assigneeType", "scopeType", "orgUnitId"] as const;
+/** Directory API Token resource (https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens); scopes is handled separately. */
+const TOKEN_SNAPSHOT_FIELDS = ["clientId", "displayText", "anonymous", "nativeApp", "userKey"] as const;
+/**
+ * Reports API Activity resource (https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list).
+ * events[].parameters[] is not stored: no finding reads it and its {name, value} pairs carry arbitrary values.
+ */
+const ACTIVITY_ID_SNAPSHOT_FIELDS = ["time", "uniqueQualifier", "applicationName", "customerId"] as const;
+const ACTIVITY_ACTOR_SNAPSHOT_FIELDS = ["email", "profileId", "callerType"] as const;
+const ACTIVITY_EVENT_SNAPSHOT_FIELDS = ["type", "name"] as const;
+/**
+ * Alert Center Alert resource (https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts).
+ * The `data` payload is an arbitrary per-source blob and is never stored; verdicts read metadata.status only.
+ */
+const ALERT_SNAPSHOT_FIELDS = ["alertId", "customerId", "createTime", "startTime", "endTime", "updateTime", "type", "source", "deleted"] as const;
+const ALERT_METADATA_SNAPSHOT_FIELDS = ["alertId", "customerId", "status", "assignee", "updateTime", "severity"] as const;
+/** Cloud Identity Policy resource (https://cloud.google.com/identity/docs/reference/rest/v1/policies). */
+const POLICY_SNAPSHOT_FIELDS = ["name", "customer", "type"] as const;
+const POLICY_QUERY_SNAPSHOT_FIELDS = ["query", "orgUnit", "group", "sortOrder"] as const;
+const POLICY_SETTING_VALUE_SNAPSHOT_FIELDS = ["enforcedFrom", "allowEnrollment", "allowedSignInFactorSet"] as const;
 const FRAMEWORK_REPORTS: Record<ReportFrameworkKey, { title: string; file: string }> = {
   fedramp: { title: "FedRAMP / NIST 800-53 Compliance Report", file: "compliance/fedramp/fedramp_compliance_report.md" },
   cmmc: { title: "CMMC 2.0 / NIST 800-171 Compliance Report", file: "compliance/cmmc/cmmc_compliance_report.md" },
@@ -1073,16 +1106,140 @@ function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+function normalizeKeyName(key: string): string {
+  return key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+}
+
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(normalizeKeyName(key));
+}
+
+/** Signed URLs and tokens hide in query strings, so URL-valued strings keep only scheme, host, and path. */
+function stripUrlQuery(value: string): string {
+  const queryIndex = value.indexOf("?");
+  if (queryIndex === -1 || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+  return value.slice(0, queryIndex);
+}
+
+function isSecretPair(record: JsonRecord): boolean {
+  const pairName = asString(record.name) ?? asString(record.key);
+  if (pairName === undefined || !isSecretKey(pairName)) return false;
+  return PAIR_VALUE_KEYS.some((valueKey) => record[valueKey] !== undefined);
+}
+
 export function redactSecrets(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSecrets);
   if (value && typeof value === "object") {
+    const record = value as JsonRecord;
+    const secretPair = isSecretPair(record);
     const output: JsonRecord = {};
-    for (const [key, entry] of Object.entries(value as JsonRecord)) {
-      output[key] = SECRET_KEY_PATTERN.test(key) ? "[REDACTED]" : redactSecrets(entry);
+    for (const [key, entry] of Object.entries(record)) {
+      const redactPairValue = secretPair && (PAIR_VALUE_KEYS as readonly string[]).includes(key);
+      output[key] = isSecretKey(key) || redactPairValue ? "[REDACTED]" : redactSecrets(entry);
     }
     return output;
   }
+  if (typeof value === "string") return stripUrlQuery(value);
   return value;
+}
+
+/** Replaces every occurrence of a known secret value (for example a token from the environment) wherever it appears. */
+export function redactKnownValues(value: unknown, secrets: string[]): unknown {
+  const known = secrets.filter((secret) => secret.length >= 8);
+  if (known.length === 0) return value;
+  const scrub = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(scrub);
+    if (input && typeof input === "object") {
+      const output: JsonRecord = {};
+      for (const [key, entry] of Object.entries(input as JsonRecord)) output[key] = scrub(entry);
+      return output;
+    }
+    if (typeof input === "string") {
+      return known.reduce((current, secret) => current.split(secret).join("[REDACTED]"), input);
+    }
+    return input;
+  };
+  return scrub(value);
+}
+
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
+  const output: JsonRecord = {};
+  for (const field of fields) {
+    if (record[field] !== undefined) output[field] = record[field];
+  }
+  return output;
+}
+
+function projectUserSnapshot(user: JsonRecord): JsonRecord {
+  return pickFields(user, USER_SNAPSHOT_FIELDS);
+}
+
+function projectRoleSnapshot(role: JsonRecord): JsonRecord {
+  const output = pickFields(role, ROLE_SNAPSHOT_FIELDS);
+  if (Array.isArray(role.rolePrivileges)) {
+    output.rolePrivileges = role.rolePrivileges.map((privilege) => pickFields(asRecord(privilege), ROLE_PRIVILEGE_SNAPSHOT_FIELDS));
+  }
+  return output;
+}
+
+function projectRoleAssignmentSnapshot(assignment: JsonRecord): JsonRecord {
+  return pickFields(assignment, ROLE_ASSIGNMENT_SNAPSHOT_FIELDS);
+}
+
+function projectTokenSnapshot(token: JsonRecord): JsonRecord {
+  const output = pickFields(token, TOKEN_SNAPSHOT_FIELDS);
+  if (Array.isArray(token.scopes)) {
+    output.scopes = token.scopes.filter((scope) => typeof scope === "string");
+  }
+  return output;
+}
+
+function projectTokenInventorySnapshot(record: TokenInventoryRecord): JsonRecord {
+  return {
+    userId: record.userId,
+    primaryEmail: record.primaryEmail,
+    token: projectTokenSnapshot(record.token),
+  };
+}
+
+export function projectActivitySnapshot(activity: JsonRecord): JsonRecord {
+  const output: JsonRecord = {};
+  if (activity.id !== undefined) output.id = pickFields(asRecord(activity.id), ACTIVITY_ID_SNAPSHOT_FIELDS);
+  if (activity.actor !== undefined) {
+    const actor = asRecord(activity.actor);
+    const actorOutput = pickFields(actor, ACTIVITY_ACTOR_SNAPSHOT_FIELDS);
+    const applicationName = asString(asRecord(actor.applicationInfo).applicationName);
+    if (applicationName) actorOutput.applicationInfo = { applicationName };
+    output.actor = actorOutput;
+  }
+  if (activity.ipAddress !== undefined) output.ipAddress = activity.ipAddress;
+  if (Array.isArray(activity.events)) {
+    output.events = activity.events.map((event) => pickFields(asRecord(event), ACTIVITY_EVENT_SNAPSHOT_FIELDS));
+  }
+  return output;
+}
+
+export function projectAlertSnapshot(alert: JsonRecord): JsonRecord {
+  const output = pickFields(alert, ALERT_SNAPSHOT_FIELDS);
+  if (alert.metadata !== undefined) output.metadata = pickFields(asRecord(alert.metadata), ALERT_METADATA_SNAPSHOT_FIELDS);
+  return output;
+}
+
+function projectPolicySnapshot(policy: JsonRecord): JsonRecord {
+  const output = pickFields(policy, POLICY_SNAPSHOT_FIELDS);
+  if (policy.policyQuery !== undefined) output.policyQuery = pickFields(asRecord(policy.policyQuery), POLICY_QUERY_SNAPSHOT_FIELDS);
+  if (policy.setting !== undefined) {
+    const setting = asRecord(policy.setting);
+    const settingOutput: JsonRecord = {};
+    if (setting.type !== undefined) settingOutput.type = setting.type;
+    if (setting.value !== undefined) settingOutput.value = pickFields(asRecord(setting.value), POLICY_SETTING_VALUE_SNAPSHOT_FIELDS);
+    output.setting = settingOutput;
+  }
+  return output;
+}
+
+function projectDataset<T>(dataset: CollectedDataset<T[]>, projector: (item: T) => JsonRecord): CollectedDataset<JsonRecord[]> {
+  return { ...dataset, data: dataset.data.map(projector) };
 }
 
 function safeDirName(value: string): string {
@@ -3139,16 +3296,16 @@ export async function exportGwsAuditBundle(
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, safeName);
 
-  const coreDataFiles: Array<[string, CollectedDataset<unknown>]> = [
-    ["core_data/users.json", identity.users],
-    ["core_data/roles.json", identity.roles],
-    ["core_data/role_assignments.json", identity.roleAssignments],
-    ["core_data/login_activities.json", identity.loginActivities],
-    ["core_data/admin_activities.json", adminAccess.adminActivities],
-    ["core_data/token_activities.json", integrations.tokenActivities],
-    ["core_data/token_inventory.json", integrations.tokenInventory],
-    ["core_data/alerts.json", monitoring.alerts],
-    ["core_data/two_step_verification_policies.json", identity.twoStepPolicies ?? { data: [], error: "not collected" }],
+  const coreDataFiles: Array<[string, CollectedDataset<JsonRecord[]>]> = [
+    ["core_data/users.json", projectDataset(identity.users, projectUserSnapshot)],
+    ["core_data/roles.json", projectDataset(identity.roles, projectRoleSnapshot)],
+    ["core_data/role_assignments.json", projectDataset(identity.roleAssignments, projectRoleAssignmentSnapshot)],
+    ["core_data/login_activities.json", projectDataset(identity.loginActivities, projectActivitySnapshot)],
+    ["core_data/admin_activities.json", projectDataset(adminAccess.adminActivities, projectActivitySnapshot)],
+    ["core_data/token_activities.json", projectDataset(integrations.tokenActivities, projectActivitySnapshot)],
+    ["core_data/token_inventory.json", projectDataset(integrations.tokenInventory, projectTokenInventorySnapshot)],
+    ["core_data/alerts.json", projectDataset(monitoring.alerts, projectAlertSnapshot)],
+    ["core_data/two_step_verification_policies.json", projectDataset(identity.twoStepPolicies ?? { data: [], error: "not collected" }, projectPolicySnapshot)],
   ];
   for (const [pathName, dataset] of coreDataFiles) {
     await writeSecureTextFile(outputDir, pathName, serializeJson(redactSecrets(dataset)));

@@ -20,6 +20,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets } from "./gws.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -32,6 +33,8 @@ const DEFAULT_LOOKBACK_DAYS = 14;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_RESULTS_LIMIT = 250;
 const GWS_BIN_ENV_KEYS = ["GRCLANKER_GWS_BIN"] as const;
+const CAPTURE_PROJECTION_NOTE =
+  "The stored capture is projected to the documented Reports API activity fields (id, actor, ipAddress, events[].type and name); event parameters are not stored and credential-like values are redacted. Re-run the recorded command for parameter detail.";
 
 export class GwsCliCommandError extends Error {
   kind: GwsCliErrorKind;
@@ -433,6 +436,40 @@ function normalizeMaxResults(value: unknown): number {
   return Math.max(1, Math.min(MAX_RESULTS_LIMIT, Math.trunc(numeric)));
 }
 
+/** Values from the CLI's own environment that a capture might echo back; scrubbed wherever they appear. */
+function knownSecretValues(env: NodeJS.ProcessEnv): string[] {
+  return Object.entries(env)
+    .filter(([key, value]) => typeof value === "string" && key.startsWith("GOOGLE_WORKSPACE_CLI_") && /TOKEN|SECRET|PASSWORD|KEY/.test(key))
+    .map(([, value]) => value as string);
+}
+
+/**
+ * Captures are projected to the documented Reports or Alert Center fields page by
+ * page (alert `data` payloads and event parameters are dropped), then credential-like
+ * keys and known environment values are redacted. Nothing unprojected is ever written.
+ */
+function sanitizeCapture(
+  parsed: unknown,
+  keys: string[],
+  project: (record: JsonRecord) => JsonRecord,
+  secrets: string[],
+): unknown {
+  const pages = pagesFromOutput(parsed, keys).map((page) => {
+    const output: JsonRecord = {};
+    for (const key of keys) {
+      const value = page[key];
+      if (Array.isArray(value)) output[key] = value.map((item) => project(asRecord(item)));
+    }
+    if (page.nextPageToken !== undefined) output.nextPageToken = page.nextPageToken;
+    return output;
+  });
+  return redactKnownValues(redactSecrets(pages.length === 1 ? pages[0] : pages), secrets);
+}
+
+function sanitizeRecords(records: GwsOpsActivityRecord[], secrets: string[]): GwsOpsActivityRecord[] {
+  return redactKnownValues(redactSecrets(records), secrets) as GwsOpsActivityRecord[];
+}
+
 function normalizeLookbackDays(value: unknown): number {
   const numeric = asNumber(value);
   if (!numeric) return DEFAULT_LOOKBACK_DAYS;
@@ -754,7 +791,7 @@ function buildBundleReadme(): string {
   return [
     "# Google Workspace CLI Operator Evidence Bundle",
     "",
-    "- `raw/` contains the structured JSON returned by the Google Workspace CLI.",
+    "- `raw/` contains the Google Workspace CLI response projected to the documented Reports API and Alert Center fields; alert data payloads and event parameters are not stored, and credential-like keys plus known environment values are redacted.",
     "- `analysis/` contains normalized investigation summaries prepared for GRC review.",
     "- `commands.json` records the exact read-only commands grclanker executed.",
     "- `summary.md` is the quickest human-readable starting point.",
@@ -853,12 +890,13 @@ export async function investigateGwsAlerts(
   } catch (error) {
     throw explainAlertCenterFailure(error);
   }
-  const records = normalizeAlertRecords(execution.parsed);
+  const secrets = knownSecretValues(env);
+  const records = sanitizeRecords(normalizeAlertRecords(execution.parsed), secrets);
   const nextPageToken = trailingPageToken(execution.parsed, ["alerts"]);
   const allNotes = [
     ...notes,
     completenessNote(nextPageToken, records.length),
-    "These records come directly from the Google Workspace CLI Alert Center response.",
+    "These records are projected from the Google Workspace CLI Alert Center response to its documented fields; alert data payloads are not stored and credential-like values are redacted.",
   ];
   return {
     title: "Google Workspace alert investigation",
@@ -868,7 +906,7 @@ export async function investigateGwsAlerts(
     complete: nextPageToken === undefined,
     nextPageToken,
     command,
-    raw: execution.parsed,
+    raw: sanitizeCapture(execution.parsed, ["alerts"], projectAlertSnapshot, secrets),
     records,
     notes: allNotes,
     text: renderActivityText("Google Workspace alert investigation", records, allNotes),
@@ -914,9 +952,10 @@ export async function traceGwsAdminActivity(
   }
 
   const execution = await executePreview(command, args, runner, env);
-  const records = normalizeActivityRecords(execution.parsed, "admin");
+  const secrets = knownSecretValues(env);
+  const records = sanitizeRecords(normalizeActivityRecords(execution.parsed, "admin"), secrets);
   const nextPageToken = trailingPageToken(execution.parsed, ["items"]);
-  const allNotes = [...notes, completenessNote(nextPageToken, records.length)];
+  const allNotes = [...notes, completenessNote(nextPageToken, records.length), CAPTURE_PROJECTION_NOTE];
   return {
     title: "Google Workspace admin activity trace",
     category: "admin_activity",
@@ -925,7 +964,7 @@ export async function traceGwsAdminActivity(
     complete: nextPageToken === undefined,
     nextPageToken,
     command,
-    raw: execution.parsed,
+    raw: sanitizeCapture(execution.parsed, ["items"], projectActivitySnapshot, secrets),
     records,
     notes: allNotes,
     text: renderActivityText("Google Workspace admin activity trace", records, allNotes),
@@ -973,9 +1012,10 @@ export async function reviewGwsTokenActivity(
   }
 
   const execution = await executePreview(command, args, runner, env);
-  const records = normalizeActivityRecords(execution.parsed, "token");
+  const secrets = knownSecretValues(env);
+  const records = sanitizeRecords(normalizeActivityRecords(execution.parsed, "token"), secrets);
   const nextPageToken = trailingPageToken(execution.parsed, ["items"]);
-  const allNotes = [...notes, completenessNote(nextPageToken, records.length)];
+  const allNotes = [...notes, completenessNote(nextPageToken, records.length), CAPTURE_PROJECTION_NOTE];
   return {
     title: "Google Workspace token activity review",
     category: "token_activity",
@@ -984,7 +1024,7 @@ export async function reviewGwsTokenActivity(
     complete: nextPageToken === undefined,
     nextPageToken,
     command,
-    raw: execution.parsed,
+    raw: sanitizeCapture(execution.parsed, ["items"], projectActivitySnapshot, secrets),
     records,
     notes: allNotes,
     text: renderActivityText("Google Workspace token activity review", records, allNotes),

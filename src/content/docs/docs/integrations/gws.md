@@ -111,6 +111,7 @@ Every finding applies these rules, and `cli/tests/gws.test.mjs` carries a regres
 6. Only the documented enabling flag counts: `isEnrolledIn2Sv` without `isEnforcedIn2Sv=true` does not support a pass, and an enforcement policy without a past `enforcedFrom` is not enforced.
 7. Pagination follows `nextPageToken` until it is absent or the collection cap is hit; the cap is recorded as truncation.
 8. Re-running the export allocates `-2`, `-3`, and so on and never overwrites an earlier directory or zip.
+9. Bundle secret hygiene: every `core_data/` object is projected to the documented fields the verdicts read before it is written (Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, and undocumented keys are never stored), then a second pass redacts credential-like keys matched on normalized names (`privateKey`, `refresh_token`, `clientSecret`), redacts `{name, value}` pairs whose name is credential-like, and strips query strings from URL values.
 
 ## Framework mappings
 
@@ -128,7 +129,7 @@ Each finding maps to FedRAMP (NIST 800-53), CMMC 2.0 (NIST 800-171), SOC 2, CIS 
 
 `gws_export_audit_bundle` writes `<domain>-gws-audit/` under `output_dir` (default `./export/gws`) and a zip with the same name:
 
-- `core_data/` raw API snapshots (`users.json`, `roles.json`, `role_assignments.json`, `login_activities.json`, `admin_activities.json`, `token_activities.json`, `token_inventory.json`, `alerts.json`, `two_step_verification_policies.json`), each carrying its error, truncation, and page metadata, with secret-looking keys redacted
+- `core_data/` API snapshots (`users.json`, `roles.json`, `role_assignments.json`, `login_activities.json`, `admin_activities.json`, `token_activities.json`, `token_inventory.json`, `alerts.json`, `two_step_verification_policies.json`), each carrying its error, truncation, and page metadata; every object is projected to the documented fields listed under the endpoint reference and credential-like values are redacted (verdict-safety rule 9)
 - `analysis/` `findings.json` plus one JSON and one Markdown summary per category
 - `compliance/` `executive_summary.md`, `unified_compliance_matrix.md`, and one report per framework (`fedramp/`, `cmmc/`, `soc2/`, `disa_stig/`, `irap/`, `ismap/`, `pci_dss/`, `cis/`)
 - `QUICK_REFERENCE.md`
@@ -165,3 +166,5 @@ Runs `gws_check_access`, all four assessments, and the export into a temp direct
 | `GET https://alertcenter.googleapis.com/v1beta1/alerts` | [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list), [Alert](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts) | `pageSize=100`, `pageToken` | `alerts[].metadata.status` (`NOT_STARTED`, `IN_PROGRESS`, `CLOSED`), `nextPageToken` |
 | `GET https://cloudidentity.googleapis.com/v1/policies` | [policies.list](https://cloud.google.com/identity/docs/reference/rest/v1/policies/list), [Policy](https://cloud.google.com/identity/docs/reference/rest/v1/policies), [settings catalog](https://cloud.google.com/identity/docs/concepts/supported-policy-api-settings) | `pageSize=100` (documented maximum), `filter=customer == "customers/{customer}" && setting.type.matches('^settings/security\\.two_step_verification.*$')`, `pageToken` | `policies[].type`, `policyQuery.orgUnit`, `policyQuery.group`, `setting.type`, `setting.value.enforcedFrom`, `setting.value.allowEnrollment`, `setting.value.allowedSignInFactorSet`, `nextPageToken` |
 | `POST https://oauth2.googleapis.com/token` | [service account delegation](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority) | `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`, `assertion` | `access_token`, `expires_in` |
+
+`core_data/` stores the fields read above plus these documented identifiers and timestamps from the same resource references, and nothing else: roles `rolePrivileges[].serviceId`; role assignments `roleAssignmentId`, `scopeType`, `orgUnitId`; tokens `anonymous`, `nativeApp`, `userKey`; activities `id.time`, `id.uniqueQualifier`, `id.applicationName`, `id.customerId`, `actor.email`, `actor.profileId`, `actor.callerType`, `actor.applicationInfo.applicationName`, `ipAddress`, `events[].type`; alerts `alertId`, `customerId`, `createTime`, `startTime`, `endTime`, `updateTime`, `type`, `source`, `deleted`, `metadata.alertId`, `metadata.customerId`, `metadata.assignee`, `metadata.updateTime`, `metadata.severity`; policies `name`, `customer`, `policyQuery.query`, `policyQuery.sortOrder`.

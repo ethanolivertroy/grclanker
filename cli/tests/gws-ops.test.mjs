@@ -10,7 +10,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   GwsCliCommandError,
@@ -110,6 +111,125 @@ function tokenPayload(overrides = {}) {
     ],
     ...overrides,
   };
+}
+
+function listFilesRecursively(root) {
+  const files = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const pathname = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...listFilesRecursively(pathname));
+    else files.push(pathname);
+  }
+  return files;
+}
+
+/** Reads every entry of a zip through its central directory so the extracted text can be grepped. */
+function readZipEntries(zipPath) {
+  const buffer = readFileSync(zipPath);
+  const eocd = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(eocd >= 0, "zip end-of-central-directory record not found");
+  const entryCount = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = new Map();
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header signature");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    const dataStart = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(dataStart, dataStart + compressedSize);
+    if (!name.endsWith("/")) {
+      entries.set(name, method === 8 ? inflateRawSync(data).toString("utf8") : data.toString("utf8"));
+    }
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+const PLANTED_SECRET = "FAKESECRET-9f8e7d6c";
+const ENV_TOKEN_PLACEHOLDER = "__GOOGLE_WORKSPACE_CLI_TOKEN__";
+
+function planted(carrier) {
+  return `${PLANTED_SECRET}-${carrier}`;
+}
+
+/** A heredoc lets the shell expand $GOOGLE_WORKSPACE_CLI_TOKEN inside the JSON, so the CLI stand-in echoes its own credential. */
+function heredoc(payload) {
+  const json = JSON.stringify(payload).split(`"${ENV_TOKEN_PLACEHOLDER}"`).join('"$GOOGLE_WORKSPACE_CLI_TOKEN"');
+  return `cat <<EOF\n${json}\nEOF`;
+}
+
+/** A gws stand-in whose every response carries planted secrets: camelCase keys, {name, value} pairs, alert data blobs, links, and the env token. */
+function createSecretEchoingBinary(base) {
+  const alerts = {
+    alerts: [
+      {
+        alertId: "a-1",
+        type: "Device compromised",
+        source: "Mobile device management",
+        createTime: "2030-01-01T00:00:00Z",
+        etag: planted("alert-etag"),
+        securityInvestigationToolLink: `https://admin.google.com/ac/sc/investigation?token=${planted("alert-link-query")}`,
+        metadata: { alertId: "a-1", status: "NOT_STARTED", severity: "HIGH", assignee: "secops@example.com" },
+        data: {
+          "@type": "type.googleapis.com/google.apps.alertcenter.type.DeviceCompromised",
+          rawConfig: `snmp community=${planted("alert-data-community")}`,
+          note: planted("alert-data-benign-key"),
+          client_secret: planted("alert-data-client-secret"),
+          echoedToken: ENV_TOKEN_PLACEHOLDER,
+        },
+      },
+    ],
+  };
+  const admin = {
+    items: [
+      {
+        id: { time: "2030-01-01T12:00:00Z", uniqueQualifier: "u1", applicationName: "admin", customerId: "C0123abcd" },
+        actor: { email: "admin@example.com", profileId: "100", callerType: "USER", key: planted("admin-actor-key") },
+        ipAddress: "203.0.113.1",
+        events: [{
+          type: "APPLICATION_SETTINGS",
+          name: "CHANGE_APPLICATION_SETTING",
+          parameters: [
+            { name: "oauth_token", value: planted("admin-oauth-token-param") },
+            { name: "NEW_VALUE", value: planted("admin-benign-param") },
+            { name: "SETTING_NAME", value: ENV_TOKEN_PLACEHOLDER },
+          ],
+        }],
+        privateKey: planted("admin-private-key"),
+      },
+    ],
+  };
+  const token = {
+    items: [
+      {
+        id: { time: "2030-01-01T12:05:00Z", uniqueQualifier: "u2", applicationName: "token", customerId: "C0123abcd" },
+        actor: { email: ENV_TOKEN_PLACEHOLDER, applicationInfo: { applicationName: "Drive Syncer", oAuthClientId: "client-1" } },
+        events: [{ type: "auth", name: "authorize", parameters: [{ name: "accessToken", multiValue: [planted("token-access-token-multivalue")] }] }],
+        refreshToken: planted("token-refresh-token"),
+      },
+    ],
+    nextPageToken: "more-tokens",
+  };
+  return createScriptedBinary(base, [
+    'if [ "$1" = "--version" ]; then echo "gws 0.22.5"; exit 0; fi',
+    'case "$*" in',
+    "  alertcenter:v1beta1*)",
+    heredoc(alerts),
+    "    ;;",
+    "  *'\"applicationName\":\"admin\"'*)",
+    heredoc(admin),
+    "    ;;",
+    "  *'\"applicationName\":\"token\"'*)",
+    heredoc(token),
+    "    ;;",
+    '  *) echo "unexpected command: $*" 1>&2; exit 3 ;;',
+    "esac",
+  ].join("\n"));
 }
 
 function createRunner(options = {}) {
@@ -457,6 +577,55 @@ test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, completen
   const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
   assert.match(summary, /Complete page: no \(nextPageToken present\)/);
   assert.match(summary, /Complete page: yes/);
+});
+
+test("rule 9 (end to end): the evidence bundle and tool results never carry a planted secret or the echoed CLI token", async () => {
+  const base = createTempBase("grclanker-gws-ops-secrets-");
+  const fake = createSecretEchoingBinary(base);
+  const outputRoot = join(base, "export");
+  const env = { PATH: process.env.PATH, GOOGLE_WORKSPACE_CLI_TOKEN: planted("env-token-value") };
+  const leakPattern = new RegExp(`${PLANTED_SECRET}-[a-z0-9-]+`);
+
+  const trace = await traceGwsAdminActivity({ gwsBin: fake }, defaultGwsCliRunner, env);
+  assert.equal(trace.count, 1);
+  assert.equal(JSON.stringify(trace).match(leakPattern), null, "traceGwsAdminActivity result leaked a planted value");
+  assert.deepEqual(trace.raw.items[0].events, [{ type: "APPLICATION_SETTINGS", name: "CHANGE_APPLICATION_SETTING" }]);
+  assert.equal("privateKey" in trace.raw.items[0], false);
+  assert.equal("key" in trace.raw.items[0].actor, false);
+
+  const tokens = await reviewGwsTokenActivity({ gwsBin: fake }, defaultGwsCliRunner, env);
+  assert.equal(tokens.records[0].actor, "[REDACTED]");
+  assert.equal(tokens.raw.items[0].actor.email, "[REDACTED]");
+  assert.equal(tokens.raw.nextPageToken, "more-tokens");
+  assert.equal(tokens.complete, false);
+
+  const alerts = await investigateGwsAlerts({ gwsBin: fake }, defaultGwsCliRunner, env);
+  assert.equal(alerts.records[0].status, "NOT_STARTED");
+  assert.equal("data" in alerts.raw.alerts[0], false);
+  assert.equal("securityInvestigationToolLink" in alerts.raw.alerts[0], false);
+  assert.equal(JSON.stringify(alerts).match(leakPattern), null, "investigateGwsAlerts result leaked a planted value");
+
+  const result = await collectGwsOperatorEvidenceBundle({ gwsBin: fake, output_dir: outputRoot }, defaultGwsCliRunner, env);
+  assert.equal(result.recordCount, 3);
+  const files = listFilesRecursively(result.outputDir);
+  assert.equal(files.length, 9, "README, summary, commands, three analysis files, three raw captures");
+  for (const file of files) {
+    const leak = readFileSync(file, "utf8").match(leakPattern);
+    assert.equal(leak, null, `${relative(result.outputDir, file)} leaked ${leak?.[0]}`);
+  }
+  const entries = readZipEntries(result.zipPath);
+  assert.equal(entries.size, files.length);
+  for (const [name, content] of entries) {
+    const leak = content.match(leakPattern);
+    assert.equal(leak, null, `zip entry ${name} leaked ${leak?.[0]}`);
+  }
+
+  const rawAdmin = JSON.parse(readFileSync(join(result.outputDir, "raw", "admin_activity.json"), "utf8"));
+  assert.equal(rawAdmin.raw.items[0].actor.email, "admin@example.com");
+  assert.equal(rawAdmin.raw.items[0].ipAddress, "203.0.113.1");
+  const rawAlerts = JSON.parse(readFileSync(join(result.outputDir, "raw", "alerts.json"), "utf8"));
+  assert.deepEqual(rawAlerts.raw.alerts[0].metadata, { alertId: "a-1", status: "NOT_STARTED", severity: "HIGH", assignee: "secops@example.com" });
+  assert.match(readFileSync(join(result.outputDir, "README.md"), "utf8"), /projected to the documented Reports API and Alert Center fields/);
 });
 
 test("verdict rule 8: re-running the evidence bundle allocates -2 and never overwrites the earlier bundle or zip", async () => {

@@ -50,6 +50,7 @@ The bridge applies the inspector's verdict-safety rules that are meaningful for 
 - Every result carries `complete` and `next_page_token`. When the last page in the response has a `nextPageToken`, `complete` is `false` and the notes say so; a single page is never presented as the whole population.
 - `--page-all` NDJSON output (one JSON object per page, per the README pagination table) is aggregated across pages and completeness follows the last page.
 - The evidence bundle allocates `gws-operator-evidence`, then `-2`, `-3`, and so on under `output_dir` (default `./export/gws-ops`), names the zip after the allocated directory, and never overwrites an earlier directory or zip. Output paths are validated against traversal and symlinked parents.
+- Bundle secret hygiene: no capture is written verbatim. `raw/<category>.json` holds the CLI response projected page by page to the documented fields in the command reference below (Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, `securityInvestigationToolLink`, and undocumented keys are dropped), and both `raw/` and the normalized records then pass through the inspector's `redactSecrets` (normalized key names, `{name, value}` pairs, URL query strings) plus a scrub of every `GOOGLE_WORKSPACE_CLI_*` token or secret value from the environment, so a CLI that echoes its own credential cannot leak it into evidence. The recorded command in `commands.json` lets an operator re-run for parameter detail.
 
 ## Alert Center caveat
 
