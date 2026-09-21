@@ -1356,6 +1356,548 @@ test("verdict rule 8: a stray archive blocks reuse of its paired directory name"
   assert.equal(readFileSync(join(base, "es.example.com-audit-bundle.zip"), "utf8"), "prior archive");
 });
 
+function pagedList(items, total, truncated, pages = 1) {
+  return { items, total, truncated, pages, seen: items.length };
+}
+
+function forbiddenEverywhere(fixtures, configOverrides = {}) {
+  const client = stubClient(fixtures, {}, configOverrides);
+  const overrides = {};
+  for (const [name, value] of Object.entries(client)) {
+    if (name !== "getResolvedConfig" && typeof value === "function") {
+      overrides[name] = forbidden(`elasticsearch request ${name} failed (403 Forbidden): action is unauthorized for user [grc-auditor]`);
+    }
+  }
+  return { ...client, ...overrides };
+}
+
+function emptyInventoryFixtures(now = Date.now()) {
+  const fixtures = healthyFixtures(now);
+  Object.assign(fixtures, {
+    users: {},
+    roles: {},
+    roleMappings: {},
+    apiKeys: [],
+    sslCertificates: [],
+    ilmPolicies: {},
+    slmPolicies: {},
+    snapshotRepositories: {},
+    watches: [],
+    ingestPipelines: {},
+    spaces: [],
+    kibanaRoles: [],
+    agentPolicies: [],
+    fleetOutputs: [],
+    enrollmentKeys: [],
+    fleetServerHosts: [],
+    detectionRules: [],
+    alertingRules: [],
+    connectors: [],
+    cloudDeployments: [],
+  });
+  return fixtures;
+}
+
+function withoutSecurityFlag(fixtures) {
+  delete fixtures.nodeSettings.nodes["node-1"].settings["xpack.security.enabled"];
+  fixtures.clusterSettings.defaults = {};
+  delete fixtures.xpackUsage.security.enabled;
+  delete fixtures.xpackInfo.features.security.enabled;
+  return fixtures;
+}
+
+function statusMap(result) {
+  return Object.fromEntries(result.findings.map((item) => [item.id, item.status]));
+}
+
+const ALL_AREAS = ["identity", "access_control", "transport_security", "cluster_hardening", "kibana"];
+
+async function assessAll(client, options = {}) {
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, options);
+  const config = client.getResolvedConfig();
+  return ALL_AREAS.flatMap((area) => evaluateElasticArea(area, snapshot, options, { elasticsearchUrl: config.elasticsearchUrl, kibanaSpaceId: config.kibanaSpaceId }).findings);
+}
+
+test("verdict rule 1: forbidden or errored dependencies yield manual verdicts that name the cause, never pass", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+  const options = { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] };
+
+  const fleet = await assessElasticKibana(stubClient(fixtures, { listFleetOutputs: forbidden("kibana request GET /api/fleet/outputs failed (403 Forbidden): missing fleet read") }));
+  const fleetFinding = findingById(fleet, "ELASTIC-21");
+  assert.equal(fleetFinding.status, "manual", "policies readable but outputs forbidden must not pass");
+  assert.match(fleetFinding.summary, /required evidence could not be read: fleet_outputs \(GET \/api\/fleet\/outputs\): .*403 Forbidden.*missing fleet read/);
+  assert.match(fleetFinding.summary, /Collect manually:/);
+  assert.deepEqual(fleetFinding.evidence.unreadable_sources.length, 1);
+
+  const connectors = await assessElasticClusterHardening(stubClient(fixtures, { listConnectors: forbidden("kibana request GET /api/actions/connectors failed (403 Forbidden)") }));
+  assert.equal(findingById(connectors, "ELASTIC-20").status, "manual", "readable watches with forbidden connectors must not pass");
+  assert.match(findingById(connectors, "ELASTIC-20").summary, /connectors \(GET \/api\/actions\/connectors\): .*403/);
+
+  const statuses = await assessElasticClusterHardening(stubClient(fixtures, {
+    getIlmStatus: forbidden("GET /_ilm/status failed (403 Forbidden)"),
+    getSlmStatus: forbidden("GET /_slm/status failed (403 Forbidden)"),
+  }));
+  assert.equal(findingById(statuses, "ELASTIC-17").status, "manual");
+  assert.match(findingById(statuses, "ELASTIC-17").summary, /ilm_status \(GET \/_ilm\/status\)/);
+  assert.equal(findingById(statuses, "ELASTIC-18").status, "manual");
+  assert.match(findingById(statuses, "ELASTIC-18").summary, /slm_status \(GET \/_slm\/status\)/);
+
+  const privileges = await assessElasticIdentity(stubClient(fixtures, { hasPrivileges: forbidden("POST /_security/user/_has_privileges failed (403 Forbidden)") }));
+  assert.equal(findingById(privileges, "ELASTIC-09").status, "manual", "API key visibility cannot be confirmed without the privilege probe");
+  assert.equal(findingById(privileges, "ELASTIC-10").status, "manual");
+  assert.match(findingById(privileges, "ELASTIC-09").summary, /privileges \(POST \/_security\/user\/_has_privileges\)/);
+
+  const license = await assessElasticAccessControl(stubClient(fixtures, { getLicense: forbidden("GET /_license failed (401 Unauthorized)") }), options);
+  assert.equal(findingById(license, "ELASTIC-07").status, "manual", "covered patterns cannot pass when the license tier is unreadable");
+  assert.equal(findingById(license, "ELASTIC-08").status, "manual");
+  const licenseIdentity = await assessElasticIdentity(stubClient(fixtures, { getLicense: forbidden("GET /_license failed (401 Unauthorized)") }));
+  assert.equal(findingById(licenseIdentity, "ELASTIC-13").status, "manual");
+  assert.match(findingById(licenseIdentity, "ELASTIC-13").summary, /license \(GET \/_license\): .*401/);
+
+  const kibanaRoles = await assessElasticKibana(stubClient(fixtures, { listKibanaRoles: forbidden("GET /api/security/role failed (403 Forbidden)") }));
+  assert.equal(findingById(kibanaRoles, "ELASTIC-15").status, "manual", "space isolation depends on readable roles");
+  assert.equal(findingById(kibanaRoles, "ELASTIC-16").status, "manual");
+
+  const timeout = await assessElasticTransportSecurity(stubClient(fixtures, {
+    listSslCertificates: async () => { throw new Error("elasticsearch request GET /_ssl/certificates timed out after 5000ms"); },
+  }));
+  assert.equal(findingById(timeout, "ELASTIC-05").status, "manual");
+  assert.match(findingById(timeout, "ELASTIC-05").summary, /timed out after 5000ms/);
+});
+
+test("verdict rule 2: empty inventories never pass by default and the summary states how emptiness is judged", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+
+  const noUsers = await assessElasticAccessControl(stubClient({ ...fixtures, users: {} }));
+  assert.equal(findingById(noUsers, "ELASTIC-06").status, "manual");
+  assert.match(findingById(noUsers, "ELASTIC-06").summary, /users \(GET \/_security\/user\) returned zero entries although built-in users such as elastic are always returned/);
+
+  const noRoles = await assessElasticAccessControl(stubClient({ ...fixtures, roles: {} }), { sensitiveIndexPatterns: ["customers-*"] });
+  assert.deepEqual(statusMap(noRoles), { "ELASTIC-06": "manual", "ELASTIC-07": "manual", "ELASTIC-08": "manual" });
+
+  const noMappings = await assessElasticIdentity(stubClient({ ...fixtures, roleMappings: {} }));
+  assert.equal(findingById(noMappings, "ELASTIC-13").status, "fail", "an SSO realm with zero role mappings fails, never passes");
+  assert.match(findingById(noMappings, "ELASTIC-13").summary, /zero enabled role mappings and no authorization_realms .* fails this control/);
+
+  const noKeys = await assessElasticIdentity(stubClient({ ...fixtures, apiKeys: [] }));
+  assert.equal(findingById(noKeys, "ELASTIC-09").status, "pass", "zero API keys passes only because the control is about existing keys");
+  assert.match(findingById(noKeys, "ELASTIC-09").summary, /This control concerns existing keys, so an empty inventory is compliant/);
+  assert.match(findingById(noKeys, "ELASTIC-09").summary, /with full inventory visibility/);
+  assert.equal(findingById(noKeys, "ELASTIC-10").status, "pass");
+  const noKeysNoVisibility = await assessElasticIdentity(stubClient({
+    ...fixtures,
+    apiKeys: [],
+    hasPrivileges: { ...fixtures.hasPrivileges, cluster: { ...fixtures.hasPrivileges.cluster, read_security: false, manage_api_key: false, manage_security: false } },
+  }));
+  assert.equal(findingById(noKeysNoVisibility, "ELASTIC-09").status, "warn", "zero keys without full visibility is a partial view, not a pass");
+
+  const noIlm = await assessElasticClusterHardening(stubClient({ ...fixtures, ilmPolicies: {} }));
+  assert.equal(findingById(noIlm, "ELASTIC-17").status, "fail");
+  assert.match(findingById(noIlm, "ELASTIC-17").summary, /zero policies is a failure for this control/);
+
+  const noRepos = await assessElasticClusterHardening(stubClient({ ...fixtures, snapshotRepositories: {} }));
+  assert.equal(findingById(noRepos, "ELASTIC-18").status, "fail");
+  assert.match(findingById(noRepos, "ELASTIC-18").summary, /zero repositories is a failure/);
+  const noSlm = await assessElasticClusterHardening(stubClient({ ...fixtures, slmPolicies: {} }));
+  assert.equal(findingById(noSlm, "ELASTIC-18").status, "fail");
+  assert.match(findingById(noSlm, "ELASTIC-18").summary, /zero snapshot lifecycle policies/);
+
+  const noPipelines = await assessElasticClusterHardening(stubClient({ ...fixtures, ingestPipelines: {} }));
+  assert.equal(findingById(noPipelines, "ELASTIC-22").status, "manual");
+  assert.match(findingById(noPipelines, "ELASTIC-22").summary, /returned zero entries although Elasticsearch ships managed pipelines/);
+
+  const noAlerting = await assessElasticClusterHardening(stubClient({ ...fixtures, watches: [], connectors: [] }));
+  assert.equal(findingById(noAlerting, "ELASTIC-20").status, "pass", "zero destinations in a confirmed single space is compliant for a control about existing destinations");
+  assert.match(findingById(noAlerting, "ELASTIC-20").summary, /Zero watches and zero connectors exist in the only Kibana space.*this passes because the control governs the security of existing alerting destinations/);
+  const noAlertingMultiSpace = await assessElasticClusterHardening(stubClient({ ...healthyFixtures(), watches: [], connectors: [] }));
+  assert.equal(findingById(noAlertingMultiSpace, "ELASTIC-20").status, "manual");
+  assert.match(findingById(noAlertingMultiSpace, "ELASTIC-20").summary, /connector inventory is space-scoped/);
+
+  const noCerts = await assessElasticTransportSecurity(stubClient({ ...fixtures, sslCertificates: [] }));
+  assert.equal(findingById(noCerts, "ELASTIC-05").status, "manual");
+  assert.match(findingById(noCerts, "ELASTIC-05").summary, /returned zero entries although a TLS-enabled node always reports/);
+
+  const noFleet = await assessElasticKibana(stubClient({ ...fixtures, agentPolicies: [] }));
+  assert.equal(findingById(noFleet, "ELASTIC-21").status, "manual", "zero Fleet policies is not applicable, never pass");
+  assert.match(findingById(noFleet, "ELASTIC-21").summary, /Not applicable: zero Fleet agent policies .*\(emptiness is reported as manual, not pass\)/);
+
+  const noKibanaInventory = await assessElasticKibana(stubClient({ ...fixtures, spaces: [], kibanaRoles: [] }));
+  assert.deepEqual(statusMap(noKibanaInventory), { "ELASTIC-15": "manual", "ELASTIC-16": "manual", "ELASTIC-21": "pass" });
+  assert.match(findingById(noKibanaInventory, "ELASTIC-15").summary, /kibana_spaces \(GET \/api\/spaces\/space\) returned zero entries although the default space always exists/);
+  const reservedOnly = await assessElasticKibana(stubClient({ ...fixtures, kibanaRoles: [fixtures.kibanaRoles[0]] }));
+  assert.equal(findingById(reservedOnly, "ELASTIC-16").status, "warn", "reserved-only roles mean no privilege separation was implemented");
+});
+
+test("verdict rule 3: scoped-out, disabled, or unlicensed controls render as manual with a not applicable summary", async () => {
+  const fixtures = healthyFixtures();
+  fixtures.spaces = [fixtures.spaces[0]];
+
+  const noSso = healthyFixtures();
+  for (const key of Object.keys(noSso.nodeSettings.nodes["node-1"].settings)) {
+    if (key.includes("realms.saml")) delete noSso.nodeSettings.nodes["node-1"].settings[key];
+  }
+  const ssoResult = await assessElasticIdentity(stubClient(noSso));
+  assert.equal(findingById(ssoResult, "ELASTIC-13").status, "manual");
+  assert.match(findingById(ssoResult, "ELASTIC-13").summary, /Not applicable from settings: no enabled SAML or OIDC realm is configured/);
+
+  const basic = healthyFixtures();
+  basic.license.license.type = "basic";
+  delete basic.license.license.expiry_date_in_millis;
+  const flsResult = await assessElasticAccessControl(stubClient(basic));
+  for (const id of ["ELASTIC-07", "ELASTIC-08"]) {
+    assert.equal(findingById(flsResult, id).status, "manual");
+    assert.match(findingById(flsResult, id).summary, /Not applicable on this license tier: the basic license \(status active\) does not include/);
+  }
+
+  const noKibana = await assessElasticKibana(stubClient(fixtures, {}, { kibanaUrl: undefined }));
+  for (const item of noKibana.findings) {
+    assert.equal(item.status, "manual");
+    assert.match(item.summary, /Scoped out: Kibana is not configured \(KIBANA_URL is not configured\)/);
+  }
+  const noKibanaAlerting = await assessElasticClusterHardening(stubClient(fixtures, {}, { kibanaUrl: undefined }));
+  assert.equal(findingById(noKibanaAlerting, "ELASTIC-20").status, "manual", "clean watches alone cannot pass when the Kibana half is scoped out");
+  assert.match(findingById(noKibanaAlerting, "ELASTIC-20").summary, /Scoped out: Kibana is not configured .* 1 watch\(es\) were reviewed/);
+
+  const unlicensedWatcher = { ...fixtures, license: { license: { ...fixtures.license.license, type: "basic" } } };
+  const nothingApplies = await assessElasticClusterHardening(stubClient(unlicensedWatcher, {
+    listWatches: forbidden("POST /_watcher/_query/watches failed (403 Forbidden): current license is non-compliant for [watcher]"),
+  }, { kibanaUrl: undefined }));
+  assert.equal(findingById(nothingApplies, "ELASTIC-20").status, "manual");
+  assert.match(findingById(nothingApplies, "ELASTIC-20").summary, /Not applicable or scoped out: Watcher is not available on the basic license and Kibana is not configured/);
+  const connectorsOnly = await assessElasticClusterHardening(stubClient(unlicensedWatcher, {
+    listWatches: forbidden("POST /_watcher/_query/watches failed (403 Forbidden): current license is non-compliant for [watcher]"),
+  }));
+  assert.equal(findingById(connectorsOnly, "ELASTIC-20").status, "pass", "a confirmed unlicensed Watcher is an absence, not missing evidence");
+  assert.match(findingById(connectorsOnly, "ELASTIC-20").summary, /Watcher is not available on the basic license, so only Kibana connectors were assessed/);
+  assert.equal(findingById(connectorsOnly, "ELASTIC-20").evidence.watcher_not_applicable, true);
+
+  const auditUnlicensed = await assessElasticClusterHardening(stubClient(unlicensedWatcher));
+  assert.equal(findingById(auditUnlicensed, "ELASTIC-11").status, "fail");
+  assert.match(findingById(auditUnlicensed, "ELASTIC-11").summary, /basic license \(status active\) does not include audit logging/);
+});
+
+test("verdict rule 4: items without dates are bucketed separately, reported, and cap the verdict at warn", async () => {
+  const now = Date.now();
+  const fixtures = healthyFixtures(now);
+  fixtures.spaces = [fixtures.spaces[0]];
+
+  const undatedKey = { ...fixtures.apiKeys[0], id: "key-undated", name: "undated", creation: undefined, expiration: now + 5 * DAY_MS };
+  const keys = await assessElasticIdentity(stubClient({ ...fixtures, apiKeys: [fixtures.apiKeys[0], undatedKey] }), { maxApiKeyAgeDays: 90 });
+  const hygiene = findingById(keys, "ELASTIC-09");
+  assert.equal(hygiene.status, "warn");
+  assert.match(hygiene.summary, /1 active key\(s\) report no creation date and are not counted as fresh/);
+  assert.equal(hygiene.evidence.missing_creation_date.length, 1);
+  assert.equal(hygiene.evidence.missing_creation_date[0].name, "undated");
+  assert.equal(hygiene.evidence.older_than_max_age, 0, "an undated key is never counted as stale or fresh");
+
+  const certs = await assessElasticTransportSecurity(stubClient({
+    ...fixtures,
+    sslCertificates: [fixtures.sslCertificates[0], { path: "certs/ca.pem", alias: null, subject_dn: "CN=ca", has_private_key: false }],
+  }));
+  const certFinding = findingById(certs, "ELASTIC-05");
+  assert.equal(certFinding.status, "warn");
+  assert.match(certFinding.summary, /1 report no expiry date \(not counted as valid\)/);
+  assert.equal(certFinding.evidence.missing_expiry, 1);
+
+  const slm = await assessElasticClusterHardening(stubClient({
+    ...fixtures,
+    slmPolicies: { nightly: { ...fixtures.slmPolicies.nightly, last_success: undefined } },
+  }));
+  assert.equal(findingById(slm, "ELASTIC-18").status, "warn");
+  assert.match(findingById(slm, "ELASTIC-18").summary, /1\/1 SLM policies report no last_success time .* not counted as working backups/);
+
+  const licenseNoExpiry = await assessElasticClusterHardening(stubClient({
+    ...fixtures,
+    license: { license: { status: "active", type: "platinum", uid: "lic-2" } },
+  }));
+  assert.equal(findingById(licenseNoExpiry, "ELASTIC-23").status, "warn", "an undated license is never counted as valid");
+  assert.match(findingById(licenseNoExpiry, "ELASTIC-23").summary, /platinum license is active but reports no expiry date/);
+  assert.equal(findingById(licenseNoExpiry, "ELASTIC-23").evidence.expiry_missing, true);
+  const goldNoExpiry = await assessElasticClusterHardening(stubClient({
+    ...fixtures,
+    license: { license: { status: "active", type: "gold", uid: "lic-2b" } },
+  }));
+  assert.equal(findingById(goldNoExpiry, "ELASTIC-23").status, "fail", "a missing expiry never masks a coverage failure on a lower tier");
+  assert.match(findingById(goldNoExpiry, "ELASTIC-23").summary, /gold license does not cover configured features/);
+  assert.equal(findingById(goldNoExpiry, "ELASTIC-23").evidence.expiry_missing, true);
+  const licenseNoStatus = await assessElasticClusterHardening(stubClient({
+    ...fixtures,
+    license: { license: { type: "platinum", uid: "lic-3", expiry_date_in_millis: now + 400 * DAY_MS } },
+  }));
+  assert.equal(findingById(licenseNoStatus, "ELASTIC-23").status, "warn");
+  assert.match(findingById(licenseNoStatus, "ELASTIC-23").summary, /reports no status field/);
+});
+
+test("verdict rule 5: partial inventories are flagged with seen and total counts instead of passing", async () => {
+  const now = Date.now();
+  const fixtures = healthyFixtures(now);
+
+  const ownKeysOnly = await assessElasticIdentity(stubClient({
+    ...fixtures,
+    hasPrivileges: { ...fixtures.hasPrivileges, cluster: { ...fixtures.hasPrivileges.cluster, read_security: false, manage_api_key: false, manage_security: false } },
+  }));
+  for (const id of ["ELASTIC-09", "ELASTIC-10"]) {
+    const item = findingById(ownKeysOnly, id);
+    assert.equal(item.status, "warn", `${id} must not pass on the caller's own keys`);
+    assert.match(item.summary, /Verdict is capped at warn because the inventory is partial: the credential lacks read_security, manage_api_key, and manage_security, so POST \/_security\/_query\/api_key returns only its own keys \(1 seen of an unknown total\)/);
+    assert.equal(item.evidence.full_visibility, false);
+  }
+
+  const truncatedKeys = await assessElasticIdentity(stubClient(fixtures, {
+    listApiKeys: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ ...fixtures.apiKeys[0], id: `k${index}`, _sort: [index, `k${index}`] })), 250, true),
+  }));
+  const truncated = findingById(truncatedKeys, "ELASTIC-09");
+  assert.equal(truncated.status, "warn");
+  assert.match(truncated.summary, /100 key\(s\) seen of 250 total/);
+  assert.match(truncated.summary, /api_keys is truncated \(100 of 250 seen across 1 page\(s\); raise the collection limit\)/);
+  assert.equal(truncated.evidence.total_reported, 250);
+  assert.equal(findingById(truncatedKeys, "ELASTIC-10").status, "warn");
+
+  const partialNodes = healthyFixtures(now);
+  partialNodes.nodeSettings._nodes = { total: 3, successful: 1, failed: 2 };
+  const identity = await assessElasticIdentity(stubClient(partialNodes));
+  assert.equal(findingById(identity, "ELASTIC-01").status, "warn");
+  assert.match(findingById(identity, "ELASTIC-01").summary, /node_settings covers 1 of 3 nodes \(2 failed to respond\)/);
+  assert.equal(findingById(identity, "ELASTIC-14").status, "warn");
+  const transport = await assessElasticTransportSecurity(stubClient(partialNodes));
+  assert.deepEqual(statusMap(transport), { "ELASTIC-02": "warn", "ELASTIC-03": "warn", "ELASTIC-04": "warn", "ELASTIC-05": "warn" });
+  assert.match(findingById(transport, "ELASTIC-05").summary, /GET \/_ssl\/certificates reports only the node that handled the request, but the cluster has 3 nodes/);
+  const hardening = await assessElasticClusterHardening(stubClient(partialNodes));
+  assert.equal(findingById(hardening, "ELASTIC-11").status, "warn");
+  assert.equal(findingById(hardening, "ELASTIC-19").status, "warn");
+  assert.equal(findingById(hardening, "ELASTIC-23").status, "warn");
+
+  const multiSpace = await assessElasticClusterHardening(stubClient(fixtures));
+  assert.equal(findingById(multiSpace, "ELASTIC-20").status, "warn");
+  assert.match(findingById(multiSpace, "ELASTIC-20").summary, /read from the default space only; 1 other space\(s\) exist \(security-team\), so set space_id to inspect each/);
+  const spacesUnreadable = await assessElasticClusterHardening(stubClient({ ...fixtures, spaces: [fixtures.spaces[0]] }, { listSpaces: forbidden("GET /api/spaces/space failed (403 Forbidden)") }));
+  assert.equal(findingById(spacesUnreadable, "ELASTIC-20").status, "warn");
+  assert.match(findingById(spacesUnreadable, "ELASTIC-20").summary, /space list could not be read/);
+
+  const truncatedFleet = await assessElasticKibana(stubClient(fixtures, {
+    listAgentPolicies: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ id: `p${index}`, name: `Policy ${index}`, is_protected: true })), 340, true),
+  }));
+  assert.equal(findingById(truncatedFleet, "ELASTIC-21").status, "warn");
+  assert.match(findingById(truncatedFleet, "ELASTIC-21").summary, /fleet_agent_policies is truncated \(100 of 340 seen/);
+
+  const truncatedWatches = await assessElasticClusterHardening(stubClient({ ...fixtures, spaces: [fixtures.spaces[0]] }, {
+    listWatches: async () => pagedList(Array.from({ length: 100 }, (_, index) => ({ ...fixtures.watches[0], _id: `w${index}` })), 500, true),
+  }));
+  assert.equal(findingById(truncatedWatches, "ELASTIC-20").status, "warn");
+  assert.match(findingById(truncatedWatches, "ELASTIC-20").summary, /watches is truncated \(100 of 500 seen/);
+});
+
+test("verdict rule 6: every enabling flag is read, absent or false flags never support pass, and settings precedence is honored", async () => {
+  const now = Date.now();
+
+  const noFlag = withoutSecurityFlag(healthyFixtures(now));
+  noFlag.spaces = [noFlag.spaces[0]];
+  const identity = await assessElasticIdentity(stubClient(noFlag));
+  assert.equal(findingById(identity, "ELASTIC-01").status, "warn");
+  assert.match(findingById(identity, "ELASTIC-01").summary, /xpack.security.enabled was not visible/);
+  assert.equal(findingById(identity, "ELASTIC-14").status, "warn");
+  assert.match(findingById(identity, "ELASTIC-14").summary, /could not be confirmed disabled/);
+  assert.equal(findingById(identity, "ELASTIC-13").status, "warn");
+  const transport = await assessElasticTransportSecurity(stubClient(noFlag));
+  assert.equal(findingById(transport, "ELASTIC-02").status, "warn");
+  assert.match(findingById(transport, "ELASTIC-02").summary, /xpack.security.enabled was not visible/);
+  assert.equal(findingById(transport, "ELASTIC-03").status, "warn");
+  assert.equal(findingById(transport, "ELASTIC-04").status, "warn");
+  const hardening = await assessElasticClusterHardening(stubClient(noFlag));
+  assert.equal(findingById(hardening, "ELASTIC-19").status, "warn");
+  assert.match(findingById(hardening, "ELASTIC-19").summary, /xpack.security.enabled was not visible in node settings, cluster settings, usage statistics, or xpack info/);
+  assert.equal(findingById(hardening, "ELASTIC-11").status, "warn");
+
+  const unsetTls = healthyFixtures(now);
+  delete unsetTls.nodeSettings.nodes["node-1"].settings["xpack.security.transport.ssl.enabled"];
+  const unsetTlsResult = await assessElasticTransportSecurity(stubClient(unsetTls));
+  assert.equal(findingById(unsetTlsResult, "ELASTIC-02").status, "warn", "usage statistics alone cannot prove transport TLS when the setting is unset");
+  assert.match(findingById(unsetTlsResult, "ELASTIC-02").summary, /not explicitly set on es-1 \(the documented default is false\) and usage statistics report it enabled/);
+
+  const noVerification = healthyFixtures(now);
+  noVerification.nodeSettings.nodes["node-1"].settings["xpack.security.transport.ssl.verification_mode"] = "none";
+  const noVerificationResult = await assessElasticTransportSecurity(stubClient(noVerification));
+  assert.equal(findingById(noVerificationResult, "ELASTIC-02").status, "warn");
+  assert.match(findingById(noVerificationResult, "ELASTIC-02").summary, /verification_mode is none on es-1/);
+
+  const noAudit = healthyFixtures(now);
+  delete noAudit.nodeSettings.nodes["node-1"].settings["xpack.security.audit.enabled"];
+  const noAuditResult = await assessElasticClusterHardening(stubClient(noAudit));
+  assert.equal(findingById(noAuditResult, "ELASTIC-11").status, "fail");
+  assert.match(findingById(noAuditResult, "ELASTIC-11").summary, /not explicitly true on any inspected node \(the documented default is false\)/);
+  assert.equal(findingById(noAuditResult, "ELASTIC-12").status, "fail");
+
+  const disabledRealm = healthyFixtures(now);
+  disabledRealm.nodeSettings.nodes["node-1"].settings["xpack.security.authc.realms.saml.corp_sso.enabled"] = "false";
+  const disabledRealmResult = await assessElasticIdentity(stubClient(disabledRealm));
+  assert.equal(findingById(disabledRealmResult, "ELASTIC-01").status, "fail", "a disabled realm does not count as enabled");
+  assert.deepEqual(findingById(disabledRealmResult, "ELASTIC-01").evidence.realms.find((realm) => realm.name === "corp_sso").enabled, false);
+  assert.equal(findingById(disabledRealmResult, "ELASTIC-13").status, "manual");
+
+  const expiredLicense = healthyFixtures(now);
+  expiredLicense.license.license.status = "expired";
+  const expiredIdentity = await assessElasticIdentity(stubClient(expiredLicense));
+  assert.equal(findingById(expiredIdentity, "ELASTIC-13").status, "fail");
+  assert.match(findingById(expiredIdentity, "ELASTIC-13").summary, /platinum license \(status expired\) does not include SAML\/OIDC/);
+  const expiredAccess = await assessElasticAccessControl(stubClient(expiredLicense), { sensitiveIndexPatterns: ["customers-*"] });
+  assert.equal(findingById(expiredAccess, "ELASTIC-07").status, "fail");
+  const expiredHardening = await assessElasticClusterHardening(stubClient(expiredLicense));
+  assert.equal(findingById(expiredHardening, "ELASTIC-23").status, "fail");
+  assert.match(findingById(expiredHardening, "ELASTIC-23").summary, /license status is expired/);
+  assert.equal(findingById(expiredHardening, "ELASTIC-11").status, "fail", "audit logging on an inactive license produces no audit trail");
+
+  const precedence = healthyFixtures(now);
+  precedence.spaces = [precedence.spaces[0]];
+  precedence.clusterSettings.defaults["xpack.security.enabled"] = "false";
+  precedence.clusterSettings.persistent["xpack.security.authc.anonymous.roles"] = ["viewer"];
+  precedence.clusterSettings.transient["xpack.security.authc.anonymous.roles"] = ["superuser"];
+  const precedenceHardening = await assessElasticClusterHardening(stubClient(precedence));
+  assert.equal(findingById(precedenceHardening, "ELASTIC-19").status, "pass", "node-level true overrides the defaults section");
+  assert.equal(findingById(precedenceHardening, "ELASTIC-19").evidence.security_enabled_source, "cluster or node settings");
+  const precedenceIdentity = await assessElasticIdentity(stubClient(precedence));
+  assert.equal(findingById(precedenceIdentity, "ELASTIC-14").status, "fail", "transient settings override persistent settings");
+  assert.deepEqual(findingById(precedenceIdentity, "ELASTIC-14").evidence.anonymous_roles, ["superuser"]);
+
+  const unflaggedPolicy = healthyFixtures(now);
+  unflaggedPolicy.agentPolicies = [{ id: "policy-1", name: "Legacy" }];
+  const unflaggedResult = await assessElasticKibana(stubClient(unflaggedPolicy));
+  assert.equal(findingById(unflaggedResult, "ELASTIC-21").status, "warn");
+  assert.match(findingById(unflaggedResult, "ELASTIC-21").summary, /lack tamper protection \(is_protected is not true\)/);
+});
+
+test("false-pass self-check (a): every endpoint forbidden yields only manual verdicts across all five assess tools", async () => {
+  const fixtures = healthyFixtures();
+  const runs = [
+    ["identity", assessElasticIdentity],
+    ["access_control", assessElasticAccessControl],
+    ["transport_security", assessElasticTransportSecurity],
+    ["cluster_hardening", assessElasticClusterHardening],
+    ["kibana", assessElasticKibana],
+  ];
+  const withKibana = forbiddenEverywhere(fixtures);
+  const withoutKibana = forbiddenEverywhere(fixtures, { kibanaUrl: undefined });
+  const seen = new Set();
+  for (const [area, assess] of runs) {
+    for (const client of [withKibana, withoutKibana]) {
+      const result = await assess(client);
+      assert.equal(result.area, area);
+      if (client === withoutKibana && area === "kibana") {
+        assert.equal(result.errors.length, 0, "an unconfigured Kibana is scoped out, not requested");
+        assert.ok(result.findings.every((item) => /Scoped out: Kibana is not configured/.test(item.summary)), "kibana findings must say the area was scoped out");
+      } else {
+        assert.ok(result.errors.length > 0, `${area} should record collection errors`);
+      }
+      for (const item of result.findings) {
+        seen.add(item.id);
+        assert.equal(item.status, "manual", `${item.id} must be manual when every endpoint is forbidden, got ${item.status}: ${item.summary}`);
+        assert.match(item.summary, /Collect manually:/, `${item.id} must tell the reviewer what to collect`);
+        assert.match(item.summary, /403 Forbidden|Scoped out|Not applicable|could not be read|not configured/, `${item.id} must name the cause`);
+        assert.ok(item.evidence.manual_evidence, `${item.id} must carry manual_evidence`);
+      }
+    }
+  }
+  assert.equal(seen.size, 23, "the self-check exercised every control");
+
+  const bundleFindings = await assessAll(withKibana);
+  assert.equal(bundleFindings.length, 23);
+  assert.ok(bundleFindings.every((item) => item.status === "manual"));
+});
+
+test("false-pass self-check (b): empty inventories pass only where the control's intent makes emptiness compliant", async () => {
+  const findings = await assessAll(stubClient(emptyInventoryFixtures()));
+  assert.equal(findings.length, 23);
+  const statuses = Object.fromEntries(findings.map((item) => [item.id, item.status]));
+
+  const settingsOrLicenseBased = ["ELASTIC-01", "ELASTIC-02", "ELASTIC-03", "ELASTIC-04", "ELASTIC-11", "ELASTIC-19", "ELASTIC-23"];
+  const compliantWhenEmpty = ["ELASTIC-09", "ELASTIC-10", "ELASTIC-14"];
+  const passing = Object.entries(statuses).filter(([, status]) => status === "pass").map(([id]) => id).sort();
+  assert.deepEqual(passing, [...settingsOrLicenseBased, ...compliantWhenEmpty].sort(), `unexpected pass set: ${JSON.stringify(statuses)}`);
+  for (const id of compliantWhenEmpty) {
+    const item = findings.find((entry) => entry.id === id);
+    assert.match(item.summary, /empty inventory is compliant|absence of anonymous roles is the compliant state/, `${id} must state why emptiness passes`);
+  }
+  for (const id of settingsOrLicenseBased) {
+    const item = findings.find((entry) => entry.id === id);
+    assert.ok(!/inventory|zero|empty/i.test(item.summary) || /license/i.test(item.summary), `${id} pass must not rest on an empty inventory: ${item.summary}`);
+  }
+
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(statuses).filter(([id]) => ![...settingsOrLicenseBased, ...compliantWhenEmpty].includes(id))),
+    {
+      "ELASTIC-05": "manual",
+      "ELASTIC-06": "manual",
+      "ELASTIC-07": "manual",
+      "ELASTIC-08": "manual",
+      "ELASTIC-12": "manual",
+      "ELASTIC-13": "fail",
+      "ELASTIC-15": "manual",
+      "ELASTIC-16": "manual",
+      "ELASTIC-17": "fail",
+      "ELASTIC-18": "fail",
+      "ELASTIC-20": "manual",
+      "ELASTIC-21": "manual",
+      "ELASTIC-22": "manual",
+    },
+  );
+});
+
+test("false-pass self-check (c): capped, truncated, or privilege-limited inventories never pass in any assess tool", async () => {
+  const now = Date.now();
+  const partial = healthyFixtures(now);
+  partial.nodeSettings._nodes = { total: 3, successful: 1, failed: 2 };
+  partial.hasPrivileges = { ...partial.hasPrivileges, cluster: { ...partial.hasPrivileges.cluster, read_security: false, manage_api_key: false, manage_security: false } };
+  const truncatedKeys = pagedList(Array.from({ length: 100 }, (_, index) => ({ ...partial.apiKeys[0], id: `k${index}`, _sort: [index, `k${index}`] })), 250, true);
+  const truncatedWatches = pagedList(Array.from({ length: 100 }, (_, index) => ({ ...partial.watches[0], _id: `w${index}` })), 500, true);
+  const truncatedPolicies = pagedList(Array.from({ length: 100 }, (_, index) => ({ id: `p${index}`, name: `Policy ${index}`, is_protected: true })), 340, true);
+  const truncatedRules = pagedList(Array.from({ length: 100 }, (_, index) => ({ id: `r${index}`, actions: [] })), 1200, true);
+
+  const identity = await assessElasticIdentity(stubClient(partial, { listApiKeys: async () => truncatedKeys }));
+  const accessControl = await assessElasticAccessControl(stubClient(partial, {
+    listRoleMappings: forbidden("GET /_security/role_mapping failed (403 Forbidden): read_security missing"),
+    getLicense: forbidden("GET /_license failed (403 Forbidden): monitor missing"),
+  }), { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] });
+  const transport = await assessElasticTransportSecurity(stubClient(partial));
+  const hardening = await assessElasticClusterHardening(stubClient(partial, {
+    listWatches: async () => truncatedWatches,
+    listAlertingRules: async () => truncatedRules,
+    getIlmStatus: forbidden("GET /_ilm/status failed (403 Forbidden): read_ilm missing"),
+    getSlmStatus: forbidden("GET /_slm/status failed (403 Forbidden): read_slm missing"),
+    listIngestPipelines: forbidden("GET /_ingest/pipeline failed (403 Forbidden): read_pipeline missing"),
+  }));
+  const kibana = await assessElasticKibana(stubClient(partial, {
+    listAgentPolicies: async () => truncatedPolicies,
+    listKibanaRoles: forbidden("GET /api/security/role failed (403 Forbidden): manage_security missing"),
+  }));
+
+  const all = [identity, accessControl, transport, hardening, kibana].flatMap((result) => result.findings);
+  assert.equal(all.length, 23);
+  for (const item of all) {
+    assert.notEqual(item.status, "pass", `${item.id} passed on a partial inventory: ${item.summary}`);
+  }
+  assert.deepEqual(statusMap(identity), { "ELASTIC-01": "warn", "ELASTIC-09": "warn", "ELASTIC-10": "warn", "ELASTIC-13": "warn", "ELASTIC-14": "warn" });
+  assert.deepEqual(statusMap(accessControl), { "ELASTIC-06": "manual", "ELASTIC-07": "manual", "ELASTIC-08": "manual" });
+  assert.deepEqual(statusMap(transport), { "ELASTIC-02": "warn", "ELASTIC-03": "warn", "ELASTIC-04": "warn", "ELASTIC-05": "warn" });
+  assert.deepEqual(statusMap(hardening), {
+    "ELASTIC-11": "warn",
+    "ELASTIC-12": "manual",
+    "ELASTIC-17": "manual",
+    "ELASTIC-18": "manual",
+    "ELASTIC-19": "warn",
+    "ELASTIC-20": "warn",
+    "ELASTIC-22": "manual",
+    "ELASTIC-23": "warn",
+  });
+  assert.deepEqual(statusMap(kibana), { "ELASTIC-15": "manual", "ELASTIC-16": "manual", "ELASTIC-21": "warn" });
+  for (const item of all.filter((entry) => entry.status === "warn")) {
+    assert.ok(
+      (item.evidence.partial_sources ?? []).length > 0 || /seen|truncated|only|not visible|reports only/.test(item.summary),
+      `${item.id} warn must explain the partial view: ${item.summary}`,
+    );
+  }
+});
+
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
   const base = createTempBase("elastic-secure-");
   assert.throws(() => resolveSecureOutputPath(base, "../escape"), /Refusing to write outside/);
