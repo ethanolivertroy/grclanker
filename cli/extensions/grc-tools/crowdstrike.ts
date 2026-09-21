@@ -81,7 +81,8 @@ const PRIMARY_ML_SLIDERS = ["CloudAntiMalware", "OnSensorMLSlider"];
 const SUPPLEMENTAL_ML_SLIDERS = [
   "AdwarePUP",
   "CloudAntiMalwareForMicrosoftOfficeFiles",
-  "CloudAntiMalwareUserInitiated",
+  "CloudMLSliderForPupAdwareCloudEndUserScans",
+  "OnSensorMLAdwarePUPSlider",
   "OnSensorMLSliderForSensorEndUserScans",
   "OnSensorMLSliderForCloudEndUserScans",
 ];

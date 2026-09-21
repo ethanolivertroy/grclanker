@@ -1433,6 +1433,43 @@ test("review fix 3: role and Identity Protection rule queries compare returned i
   assert.equal(truncatedRules.summary.identity_protection_rules_truncated, true);
 });
 
+test("review fix 4: supplemental ML sliders are limited to identifiers verified in the Terraform provider", async () => {
+  const slider = (id, detection = "MODERATE", prevention = "MODERATE") => ({ id, type: "mlslider", value: { detection, prevention } });
+  const result = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => [
+      preventionPolicy({
+        sliders: [
+          slider("CloudAntiMalware", "AGGRESSIVE", "AGGRESSIVE"),
+          slider("OnSensorMLSlider", "AGGRESSIVE", "AGGRESSIVE"),
+          slider("AdwarePUP"),
+          slider("CloudAntiMalwareForMicrosoftOfficeFiles"),
+          slider("CloudMLSliderForPupAdwareCloudEndUserScans"),
+          slider("OnSensorMLAdwarePUPSlider"),
+          slider("OnSensorMLSliderForSensorEndUserScans"),
+          slider("OnSensorMLSliderForCloudEndUserScans"),
+          slider("CloudAntiMalwareUserInitiated"),
+        ],
+      }),
+      preventionPolicy({ id: "prev-mac", name: "Mac Hardened", platform: "Mac" }),
+      preventionPolicy({ id: "prev-linux", name: "Linux Hardened", platform: "Linux" }),
+    ],
+  }));
+  const cs01 = findingById(result, "CS-01");
+  assert.equal(cs01.status, "pass");
+  const reported = Object.keys(cs01.evidence.policies[0].sliders).sort();
+  assert.deepEqual(reported, [
+    "AdwarePUP",
+    "CloudAntiMalware",
+    "CloudAntiMalwareForMicrosoftOfficeFiles",
+    "CloudMLSliderForPupAdwareCloudEndUserScans",
+    "OnSensorMLAdwarePUPSlider",
+    "OnSensorMLSlider",
+    "OnSensorMLSliderForCloudEndUserScans",
+    "OnSensorMLSliderForSensorEndUserScans",
+  ]);
+  assert.ok(!reported.includes("CloudAntiMalwareUserInitiated"));
+});
+
 test("false-pass self-check (a): every endpoint forbidden yields 25 manual findings and zero passes", async () => {
   const assessments = await runAllCrowdstrikeAssessments(createForbiddenClient());
   const findings = assessments.flatMap((assessment) => assessment.findings);
