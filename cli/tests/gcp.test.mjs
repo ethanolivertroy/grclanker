@@ -388,11 +388,14 @@ test("self-check (c): partial inventories (project cap, denied project) never pa
   }
   const uniform = assessments[3].findings.find((item) => item.id === "GCP-DATA-01");
   assert.equal(uniform.status, "warn");
-  assert.match(uniform.summary, /Partial view: 1 of 2 projects denied/);
+  // Round 4: a denied project is reported with the dataset and endpoint, not as a bare count.
+  assert.match(uniform.summary, /Partial view: Cloud Storage buckets unreadable for 1 of 2 projects \(denied-project\) via storage\.googleapis\.com\/storage\/v1\/b\?project=\{project\} \(403 Forbidden\)/);
   assert.equal(uniform.evidence.seen, 1);
+  assert.equal(uniform.evidence.denied_projects, 1);
+  assert.deepEqual(uniform.evidence.unreadable_inventories.map((entry) => [entry.dataset, entry.scope]), [["Cloud Storage buckets", "1 of 2 projects (denied-project)"]]);
   assert.equal(assessments[0].summary.projects_truncated, true);
   const flowLogs = assessments[4].findings.find((item) => item.id === "GCP-NET-02");
-  assert.match(flowLogs.summary, /1 of 2 projects denied; 1 unreachable scopes not enumerated \(prod-audit: zones\/europe-west1-b\); 1 seen, total unknown \(inventory incomplete\)/);
+  assert.match(flowLogs.summary, /VPC subnetworks unreadable for 1 of 2 projects \(denied-project\) via compute\.googleapis\.com\/compute\/v1\/projects\/\{project\}\/aggregated\/subnetworks \(403 Forbidden\); 1 unreachable scopes not enumerated \(prod-audit: zones\/europe-west1-b\); 1 seen, total unknown \(inventory incomplete\)/);
 });
 
 test("self-check (d): a fully compliant organization passes every automatable control", async () => {
