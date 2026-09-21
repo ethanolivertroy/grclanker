@@ -130,7 +130,7 @@ const SENSITIVE_WRITE_SCOPE_PATTERNS = [
 ];
 const SENSITIVE_EXCLUSION_PATH_PATTERNS = [
   /^(\\\\\?\\)?[a-z]:\\(windows|program files|program files \(x86\)|programdata|users|temp)(\\|$)/i,
-  /^\/(usr|bin|sbin|etc|var|tmp|home|root|library|system|applications|opt)(\/|$)/i,
+  /^\/(usr|bin|sbin|etc|var|tmp|home|root|library|system)(\/|$)/i,
   /^%(systemroot|windir|programfiles|programdata|userprofile|temp|appdata)%/i,
 ];
 const SHARED_ACCOUNT_PATTERN = /(^|[._-])(admin|administrator|root|shared|service|svc|soc|security|ops|team|helpdesk|noreply|generic|test)([._-]|$|@)/i;
