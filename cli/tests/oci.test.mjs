@@ -15,6 +15,7 @@ import {
   OCI_COMMAND_RUNNER_OPTIONS,
   OCI_SURFACE_DOCS,
   OciAuditorClient,
+  OciCommandError,
   REDACTED_MARKER,
   assessOciComputeAndStorage,
   assessOciIdentity,
@@ -22,9 +23,12 @@ import {
   assessOciTenancyGuardrails,
   checkOciAccess,
   collectAcrossCompartments,
+  createOciCommandRunner,
   exportOciAuditBundle,
   isSensitiveFieldName,
   judgeKeyShape,
+  ociCommandWords,
+  parseServiceError,
   projectCompartmentSnapshot,
   redactSensitiveText,
   redactSensitiveValues,
@@ -32,6 +36,7 @@ import {
   resolveSecureOutputPath,
   ruleReachesSensitivePort,
   scopedStatus,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/oci.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
@@ -968,6 +973,235 @@ test("per-inventory sweep: every finding that reads an unreadable surface drops 
       }
     }
   }
+});
+
+const CANARIES = {
+  bearer: "CANARY-BEARER-oci-7f3a9c1d",
+  session: "CANARY-SESSION-oci-7f3a9c1d",
+  apiKey: "CANARY-APIKEY-oci-7f3a9c1d",
+  urlToken: "CANARY-URLTOKEN-oci-7f3a9c1d",
+  freeText: "CANARY-FREETEXT-oci-7f3a9c1d",
+};
+const CANARY_PATTERN = /CANARY-/;
+const GATEWAY_PAGE = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${CANARIES.bearer}</p><p>Set-Cookie: session_id=${CANARIES.session}; Path=/; HttpOnly</p><p>X-Api-Key: ${CANARIES.apiKey}</p></body></html>`;
+const OPC_REQUEST_ID = "6B5074A48E0B435699E3CF5EC923D475/9C18FC7943F75E13A905193FD7FEC0A3/6C148159E67E634C115C8B7FFE780D0E";
+
+/**
+ * The `ServiceError:` block exactly as the CLI prints it (field set from the
+ * docs.oracle.com known-issues example the runner cites), with a 403 so the
+ * documented status, code, and opc-request-id can be asserted in the output.
+ */
+function serviceErrorBlock(message) {
+  return `ServiceError:\n${JSON.stringify({
+    client_version: "Oracle-PythonSDK/2.124.1, Oracle-PythonCLI/3.37.13",
+    code: "NotAllowed",
+    logging_tips: "Please run the OCI CLI command using --debug flag to find more debug information.",
+    message,
+    "opc-request-id": OPC_REQUEST_ID,
+    operation_name: "list_users",
+    request_endpoint: `GET https://identity.us-ashburn-1.oraclecloud.com/20160918/users?compartmentId=${TENANCY}`,
+    status: 403,
+    target_service: "identity",
+    timestamp: "2026-09-21T22:47:00.000000+00:00",
+    troubleshooting_tips: "See [https://docs.oracle.com/iaas/Content/API/References/apierrors.htm] for more information about resolving this error.",
+  }, null, 4)}\n`;
+}
+
+const SERVICE_ERROR_DISCLOSURE = `exited 1 with ServiceError status=403 code=NotAllowed opc-request-id=${OPC_REQUEST_ID} message=`;
+
+/** Three stderr shapes a failing `oci` process can produce; `disclosure` is the exact error string the runner must emit for a command. */
+const ERROR_BODY_SHAPES = [
+  {
+    name: "A: exit 1 with a non-JSON gateway page on stderr",
+    stderr: GATEWAY_PAGE,
+    disclosure: (command) => `${command} exited 1; ${Buffer.byteLength(GATEWAY_PAGE, "utf8")} bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)`,
+  },
+  {
+    name: "B: exit 1 with a ServiceError block whose message embeds a tokenised URL",
+    stderr: serviceErrorBlock(`Access denied; retry at https://example.invalid/callback?access_token=${CANARIES.urlToken}&state=x`),
+    disclosure: (command) => `${command} ${SERVICE_ERROR_DISCLOSURE}Access denied; retry at https://example.invalid/callback?[redacted]`,
+  },
+  {
+    name: "C: exit 1 with a ServiceError block whose free-text message carries a long token",
+    stderr: serviceErrorBlock(`Upstream rejected the request; debug token ${CANARIES.freeText} then retry`),
+    disclosure: (command) => `${command} ${SERVICE_ERROR_DISCLOSURE}Upstream rejected the request; debug token [redacted] then retry`,
+  },
+];
+
+/** An error shaped exactly like Node's execFileSync failure, whose message echoes argv and stderr verbatim. */
+function execFileSyncFailure(args, stderr, stdout = "") {
+  return Object.assign(new Error(`Command failed: oci ${args.join(" ")}\n${stderr}`), {
+    status: 1,
+    signal: null,
+    stdout,
+    stderr,
+    output: [null, stdout, stderr],
+    pid: 4242,
+  });
+}
+
+/** Every CLI surface the collectors call, derived from the client prototype so the walk cannot drift from the code. */
+const CLI_SURFACES = Object.getOwnPropertyNames(OciAuditorClient.prototype)
+  .filter((name) => /^(list|get)[A-Z]/.test(name) && name !== "getResolvedConfig" && name !== "getNow");
+
+test("scrubErrorText is the one scrub for error strings: credential shapes go, operational text stays, and it is idempotent", () => {
+  const cases = [
+    [`Authorization: Bearer ${CANARIES.bearer}`, "Authorization: Bearer [redacted]"],
+    ["Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic [redacted]"],
+    [`Set-Cookie: session_id=${CANARIES.session}; Path=/; HttpOnly`, "Set-Cookie=[redacted]; Path=/; HttpOnly"],
+    [`Cookie: JSESSIONID=${CANARIES.session}; other=1`, "Cookie=[redacted]; other=1"],
+    [`session_id=${CANARIES.session} sessionId: "${CANARIES.session}" session=${CANARIES.session}`, "session_id=[redacted] sessionId=[redacted] session=[redacted]"],
+    [`X-Api-Key: ${CANARIES.apiKey} api_key="${CANARIES.apiKey}" apikey=${CANARIES.apiKey}`, "X-Api-Key=[redacted] api_key=[redacted] apikey=[redacted]"],
+    [`access_token=${CANARIES.urlToken} "refresh_token": "${CANARIES.urlToken}" id_token: ${CANARIES.urlToken}`, 'access_token=[redacted] "refresh_token=[redacted] id_token=[redacted]'],
+    ["client_secret=hunter2 password=letmein passwd: 'p@ss' pass_phrase=x", "client_secret=[redacted] password=[redacted] passwd=[redacted] pass_phrase=[redacted]"],
+    [`retry at https://example.invalid/callback?access_token=${CANARIES.urlToken}&state=x.`, "retry at https://example.invalid/callback?[redacted]."],
+    [`see https://x.example/cb#access_token=${CANARIES.urlToken}&x=y`, "see https://x.example/cb#[redacted]"],
+    [`Authorization: ${SIGNING_HEADER}`, "Authorization: Signature [redacted]"],
+    ['keyId="ocid1.tenancy.oc1..t/ocid1.user.oc1..u/aa:bb" signature="Zm9v=="', "keyId=[redacted] signature=[redacted]"],
+    [`Upstream rejected the request; debug token ${CANARIES.freeText} then retry`, "Upstream rejected the request; debug token [redacted] then retry"],
+    ["JWT eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", "JWT [redacted].[redacted].[redacted]"],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(scrubErrorText(input), expected, input);
+    assert.doesNotMatch(scrubErrorText(input), CANARY_PATTERN, input);
+  }
+
+  const benign = [
+    `oci iam compartment list --compartment-id ${TENANCY} --all --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root true`,
+    "oci network security-list list in compartment prod: oci network security-list list exited 1; 236 bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)",
+    "ocid1.compartment.oc1..aaaaaaaabcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123",
+    "ServiceError: 404 NotAuthorizedOrNotFound: Authorization failed or requested resource not found.",
+    "ServiceError: 403 NotAllowed: Please go to http://docs.oracle.com/iaas/Content/Identity/Concepts/policies.htm for possible reasons.",
+    `status=403 code=NotAllowed opc-request-id=${OPC_REQUEST_ID} message=Authorization failed`,
+    "token: user",
+    "long_running_sessions: 3 credentials_seen: 12 Session idle timeout: 30 minutes",
+    "kmsKeyId=ocid1.key.oc1..cmk masterKeyId: ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk",
+    "see https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/User/ListUsers",
+    "oci kms management key get exited 0 but printed 236 bytes of non-JSON stdout (withheld)",
+  ];
+  for (const text of benign) {
+    assert.equal(scrubErrorText(text), text, `benign text must survive: ${text}`);
+  }
+  for (const [input] of cases) {
+    assert.equal(scrubErrorText(scrubErrorText(input)), scrubErrorText(input), `idempotent: ${input}`);
+  }
+});
+
+test("OciCommandError never echoes stderr or stdout and parseServiceError keeps only the documented fields", () => {
+  const args = ["--config-file", "/tmp/oci/config", "--profile", "prod-audit", "--region", "us-ashburn-1", "--output", "json", "iam", "user", "list", "--compartment-id", TENANCY, "--all"];
+  assert.deepEqual(ociCommandWords(args), ["iam", "user", "list"]);
+
+  const runner = createOciCommandRunner((file, execArgs, options) => {
+    assert.equal(file, "oci");
+    assert.equal(options, OCI_COMMAND_RUNNER_OPTIONS);
+    throw execFileSyncFailure(execArgs, GATEWAY_PAGE);
+  });
+  assert.throws(() => runner(args), (error) => {
+    assert.ok(error instanceof OciCommandError);
+    assert.equal(error.message, `oci iam user list exited 1; ${Buffer.byteLength(GATEWAY_PAGE, "utf8")} bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)`);
+    assert.equal(error.command, "oci iam user list");
+    assert.equal(error.exitCode, 1);
+    assert.equal(error.serviceError, undefined);
+    assert.doesNotMatch(error.message, /Command failed|--config-file|<html>|CANARY-/);
+    return true;
+  });
+
+  const parsed = parseServiceError(serviceErrorBlock(`Access denied; retry at https://example.invalid/callback?access_token=${CANARIES.urlToken}`));
+  assert.deepEqual(Object.keys(parsed).sort(), ["code", "message", "opcRequestId", "status"]);
+  assert.equal(parsed.status, 403);
+  assert.equal(parsed.code, "NotAllowed");
+  assert.equal(parsed.opcRequestId, OPC_REQUEST_ID);
+  assert.equal(parseServiceError(GATEWAY_PAGE), undefined, "an HTML page is not a ServiceError block");
+  assert.equal(parseServiceError("ServiceError:\n{ not json"), undefined, "a malformed block is described, not echoed");
+  assert.equal(parseServiceError('ServiceError:\n{"code": "bad code <script>", "opc-request-id": "x y", "status": 500}').code, undefined, "an undocumented code shape is dropped");
+  assert.equal(parseServiceError('ServiceError:\n{"code": "InternalServerError", "opc-request-id": "x y", "status": 500}').opcRequestId, undefined, "an undocumented request id shape is dropped");
+
+  const serviceRunner = createOciCommandRunner((_file, execArgs) => {
+    throw execFileSyncFailure(execArgs, serviceErrorBlock(`Access denied; retry at https://example.invalid/callback?access_token=${CANARIES.urlToken}&state=x`));
+  });
+  assert.throws(() => serviceRunner(args), (error) => {
+    assert.equal(error.message, `oci iam user list ${SERVICE_ERROR_DISCLOSURE}Access denied; retry at https://example.invalid/callback?[redacted]`);
+    assert.equal(error.serviceError.message, "Access denied; retry at https://example.invalid/callback?[redacted]");
+    assert.doesNotMatch(error.message, /CANARY-|Oracle-Python|request_endpoint|compartmentId=/);
+    return true;
+  });
+
+  const timedOut = OciCommandError.fromExecFailure(args, Object.assign(new Error("spawnSync oci ETIMEDOUT"), { status: null, signal: "SIGTERM", code: "ETIMEDOUT", stdout: "", stderr: "" }));
+  assert.equal(timedOut.message, "oci iam user list did not exit normally (SIGTERM) (ETIMEDOUT); 0 bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)");
+  assert.equal(timedOut.exitCode, null);
+
+  const client = new OciAuditorClient(sampleConfig(), () => GATEWAY_PAGE, { now: () => NOW });
+  return assert.rejects(client.listUsers(), (error) => {
+    assert.ok(error instanceof OciCommandError);
+    assert.equal(error.message, `oci iam user list exited 0 but printed ${Buffer.byteLength(GATEWAY_PAGE, "utf8")} bytes of non-JSON stdout (withheld)`);
+    return true;
+  });
+});
+
+test("error-body walk: no CLI surface echoes a stderr or stdout canary into findings, summaries, errors, bundle files, the zip, or thrown errors", async () => {
+  assert.deepEqual([...CLI_SURFACES].sort(), INVENTORY_SWEEP.map((entry) => entry.method).sort(), "the walk covers every prototype surface and the sweep table has not drifted");
+  const base = createTempBase("grclanker-oci-error-body-");
+  const walked = [];
+  for (const entry of INVENTORY_SWEEP) {
+    for (const shape of ERROR_BODY_SHAPES) {
+      const label = `${entry.method} / ${shape.name}`;
+      const command = `oci ${entry.command}`;
+      const disclosure = shape.disclosure(command);
+      const thrown = [];
+      const real = new OciAuditorClient(
+        sampleConfig(),
+        createOciCommandRunner((_file, args) => {
+          throw execFileSyncFailure(args, shape.stderr);
+        }),
+        { now: () => NOW },
+      );
+      const client = compliantClient();
+      client[entry.method] = async (...args) => {
+        try {
+          return await real[entry.method](...args);
+        } catch (error) {
+          thrown.push(error);
+          throw error;
+        }
+      };
+
+      const access = await checkOciAccess(client);
+      const results = await runAllAssessments(client);
+      const bundle = await exportOciAuditBundle(client, sampleConfig(), base);
+
+      assert.ok(thrown.length > 0, `${label}: the real client surface ran`);
+      for (const error of thrown) {
+        assert.ok(error instanceof OciCommandError, `${label}: CLI failures surface as OciCommandError`);
+        assert.equal(error.message, disclosure, `${label}: the thrown error discloses the failure without echoing the body`);
+        assert.equal(error.exitCode, 1, label);
+        assert.equal(error.stderrBytes, Buffer.byteLength(shape.stderr, "utf8"), label);
+      }
+      const inMemory = JSON.stringify({ access, results });
+      assert.doesNotMatch(inMemory, CANARY_PATTERN, `${label}: an in-memory finding, summary, or errors array leaked a canary`);
+      assert.doesNotMatch(inMemory, /Command failed|<html>|Oracle-Python|request_endpoint/, `${label}: an in-memory output echoed the CLI body`);
+      const allErrors = results.flatMap((result) => result.errors);
+      assert.ok(allErrors.some((line) => line.includes(disclosure)), `${label}: an errors array discloses the failure: ${allErrors.join(" | ")}`);
+      const dependents = results.flatMap((result) => result.findings).filter((item) => entry.dependents.includes(item.id));
+      for (const item of dependents) {
+        assert.notEqual(item.status, "pass", `${label}: ${item.id} must not pass`);
+        assert.match(item.summary, new RegExp(entry.command), `${label}: ${item.id} names the command`);
+      }
+
+      const files = listFilesRecursively(bundle.outputDir);
+      for (const file of files) {
+        assert.doesNotMatch(readFileSync(file, "utf8"), CANARY_PATTERN, `${label}: ${relative(bundle.outputDir, file)} leaked a canary`);
+      }
+      const entries = readZipEntries(bundle.zipPath);
+      assert.equal(entries.filter((zipEntry) => !zipEntry.name.endsWith("/")).length, files.length, label);
+      for (const zipEntry of entries) {
+        assert.doesNotMatch(zipEntry.content, CANARY_PATTERN, `${label}: zip entry ${zipEntry.name} leaked a canary`);
+      }
+      const errorsLog = readFileSync(join(bundle.outputDir, "_errors.log"), "utf8");
+      assert.ok(errorsLog.includes(disclosure), `${label}: _errors.log discloses the failure`);
+      walked.push(label);
+    }
+  }
+  assert.equal(walked.length, INVENTORY_SWEEP.length * ERROR_BODY_SHAPES.length);
 });
 
 test("scrub covers the JSON-colon keyId form, signingKeyId, pass_phrase, and pass_word assignments", () => {
