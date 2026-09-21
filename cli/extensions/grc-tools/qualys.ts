@@ -1029,7 +1029,8 @@ export class QualysApiClient {
   }
 
   async listScheduledScans(): Promise<QualysListResult> {
-    return this.listSingleXml("/api/2.0/fo/schedule/scan/", { action: "list", show_notifications: 0 }, "SCHEDULE_SCAN");
+    // schedule_scan_list_output.dtd: RESPONSE > SCHEDULE_SCAN_LIST > SCAN+
+    return this.listSingleXml("/api/2.0/fo/schedule/scan/", { action: "list", show_notifications: 0 }, "SCAN");
   }
 
   async listScans(lookbackDays?: number): Promise<QualysListResult> {
@@ -1466,23 +1467,35 @@ function recordLabel(record: JsonRecord, fallback: string): string {
   return asString(record.TITLE) ?? asString(record.NAME) ?? asString(record.name) ?? asString(record.ID) ?? asString(record.id) ?? fallback;
 }
 
-function scheduleTargets(schedule: JsonRecord): string[] {
-  const groups = asArray(pathValue(schedule, "ASSET_GROUP_TITLE_LIST", "ASSET_GROUP_TITLE")).map(asString);
-  const tags = asRecords(pathValue(schedule, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_INCLUDE")).map((tag) => asString(tag.NAME) ?? asString(tag));
-  const rawTags = asArray(pathValue(schedule, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_INCLUDE")).map(asString);
-  const target = asString(schedule.TARGET);
-  return uniqueStrings([...groups, ...tags, ...rawTags, target]);
+// schedule_scan_list_output.dtd: TARGET holds this placeholder when the schedule is targeted by asset tags.
+const TAG_TARGET_PLACEHOLDER = /^asset tags included$/i;
+// The VM/PC API user guide schedule list samples name Qualys external scanners with this literal ISCANNER_NAME.
+const EXTERNAL_SCANNER_NAME = /^external scanner$/i;
+
+function splitCsvText(value: unknown): string[] {
+  return (xmlScalarText(value) ?? "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-function scheduleScanner(schedule: JsonRecord): string {
-  return asString(schedule.ISCANNER_NAME)
-    ?? asString(schedule.EC2_INSTANCE)
-    ?? asString(pathValue(schedule, "ISCANNER_ID"))
-    ?? "external";
+function scheduleTargets(schedule: JsonRecord): string[] {
+  // schedule_scan_list_output.dtd: ASSET_GROUP_TITLE_LIST (ASSET_GROUP_TITLE+), ASSET_TAGS > TAG_SET_INCLUDE (#PCDATA)
+  const groups = asArray(pathValue(schedule, "ASSET_GROUP_TITLE_LIST", "ASSET_GROUP_TITLE")).map(xmlScalarText);
+  const tags = splitCsvText(pathValue(schedule, "ASSET_TAGS", "TAG_SET_INCLUDE"));
+  const target = xmlScalarText(schedule.TARGET)?.trim();
+  return uniqueStrings([...groups, ...tags, target && !TAG_TARGET_PLACEHOLDER.test(target) ? target : undefined]);
+}
+
+function scheduleScannerName(schedule: JsonRecord): string | undefined {
+  const name = xmlScalarText(schedule.ISCANNER_NAME)?.replace(/\s+/g, " ").trim();
+  return name ? name : undefined;
 }
 
 function scheduleUsesExternalScanner(schedule: JsonRecord): boolean {
-  return /^external$/i.test(scheduleScanner(schedule));
+  const name = scheduleScannerName(schedule);
+  return name !== undefined && EXTERNAL_SCANNER_NAME.test(name);
+}
+
+function scheduleScannerUnverified(schedule: JsonRecord): boolean {
+  return scheduleScannerName(schedule) === undefined;
 }
 
 function scheduleNextLaunch(schedule: JsonRecord): string | undefined {
@@ -1582,8 +1595,10 @@ export async function assessQualysScanCoverage(
   const excludedQidCount = profiles.data.reduce((total, profile) => total + optionProfileExcludedQidCount(profile), 0);
   const broadExclusions = excluded.data.filter((entry) => entry.type === "range" && addressCountForRange(asString(entry.value) ?? "") > BROAD_EXCLUSION_ADDRESS_COUNT);
   const externalSchedules = activeSchedules.filter(scheduleUsesExternalScanner);
+  const schedulesWithoutScannerName = activeSchedules.filter(scheduleScannerUnverified);
   const distinctTargets = uniqueStrings(activeSchedules.flatMap(scheduleTargets));
-  const distinctScanners = uniqueStrings(activeSchedules.map(scheduleScanner));
+  const distinctScanners = uniqueStrings(activeSchedules.map(scheduleScannerName));
+  const internalScanners = distinctScanners.filter((name) => !EXTERNAL_SCANNER_NAME.test(name));
   const finishedScans = scans.data.filter((scan) => /finished/i.test(pathString(scan, "STATUS", "STATE") ?? asString(scan.STATUS) ?? ""));
 
   const findings: QualysFinding[] = [];
@@ -1683,6 +1698,9 @@ export async function assessQualysScanCoverage(
     manualEvidence: "export each option profile from Scans > Option Profiles and review authentication, port, and performance settings against internal and external scanning requirements.",
   }));
 
+  const unverifiedScannerNote = schedulesWithoutScannerName.length > 0
+    ? ` ${schedulesWithoutScannerName.length} active schedules carry no ISCANNER_NAME, so their scanner is unverifiable and was never assumed to be external.`
+    : "";
   findings.push(guardedFinding({
     control: 14,
     severity: "medium",
@@ -1692,16 +1710,20 @@ export async function assessQualysScanCoverage(
       : activeSchedules.length === 0
         ? "No active schedules were found, so external perimeter scanning is not configured; emptiness is a failure for this control."
         : externalSchedules.length > 0
-          ? `${externalSchedules.length}/${activeSchedules.length} active schedules have no internal scanner appliance assigned and therefore run from Qualys external scanners.`
-          : `${activeSchedules.length} active schedules all run from internal scanner appliances (${distinctScanners.join(", ")}); none provides perimeter coverage from Qualys external scanners.`,
+          ? `${externalSchedules.length}/${activeSchedules.length} active schedules name the Qualys External Scanner (ISCANNER_NAME "External Scanner") and therefore provide perimeter coverage.${unverifiedScannerNote}`
+          : `${activeSchedules.length} active schedules name only internal scanner appliances (${internalScanners.join(", ") || "none named"}); none names the Qualys External Scanner, so perimeter coverage is not confirmed.${unverifiedScannerNote}`,
     evidence: {
       active_schedules: activeSchedules.length,
       external_schedules: externalSchedules.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50),
+      schedules_without_scanner_name: schedulesWithoutScannerName.map((schedule) => recordLabel(schedule, "schedule")).slice(0, 50),
       scanners_in_use: distinctScanners.slice(0, 50),
+      external_scanner_match: "ISCANNER_NAME equals the documented literal External Scanner",
     },
     sources: [schedules],
     scope,
     manualEvidence: "confirm at least one recurring perimeter scan uses Qualys external scanners against the public IP ranges.",
+    // A missing ISCANNER_NAME only leaves the verdict uncertain when no schedule is confirmed external.
+    unknownBuckets: externalSchedules.length > 0 ? {} : { schedules_without_scanner_name: schedulesWithoutScannerName.length },
   }));
 
   const exclusionStatus: QualysFindingStatus = excluded.error
@@ -1747,11 +1769,12 @@ export async function assessQualysScanCoverage(
       ? unreadableSummary(20, [schedules])
       : activeSchedules.length === 0
         ? "No active schedules exist, so no segment-specific scanning is configured; emptiness is a failure for this control."
-        : `${activeSchedules.length} active schedules target ${distinctTargets.length} distinct targets across ${distinctScanners.length} scanner sources. The API does not label segments, so mapping to DMZ, internal, and OT/ICS is manual and the verdict is capped at warn.`,
+        : `${activeSchedules.length} active schedules target ${distinctTargets.length} distinct targets (asset group titles, TAG_SET_INCLUDE tags, and IP targets) across ${distinctScanners.length} named scanner sources${schedulesWithoutScannerName.length > 0 ? ` plus ${schedulesWithoutScannerName.length} schedules without an ISCANNER_NAME` : ""}. The API does not label segments, so mapping to DMZ, internal, and OT/ICS is manual and the verdict is capped at warn.`,
     evidence: {
       active_schedules: activeSchedules.length,
       distinct_targets: distinctTargets.slice(0, 50),
       distinct_scanners: distinctScanners.slice(0, 50),
+      schedules_without_scanner_name: schedulesWithoutScannerName.length,
     },
     sources: [schedules],
     scope,
@@ -2164,12 +2187,9 @@ function policyHasHiddenAssetGroups(policy: JsonRecord): boolean {
 }
 
 function policyIsAssigned(policy: JsonRecord): boolean {
-  const groupIds = (xmlScalarText(policy.ASSET_GROUP_IDS) ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-  const tagIds = [
-    ...asArray(pathValue(policy, "TAG_SET_INCLUDE", "TAG_ID")),
-    ...asArray(pathValue(policy, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_ID")),
-    ...asArray(pathValue(policy, "ASSET_TAGS", "TAG_SET_INCLUDE", "TAG_INCLUDE")),
-  ].filter((value) => Boolean(xmlScalarText(value)));
+  // policy_list_output.dtd: ASSET_GROUP_IDS (#PCDATA, comma separated), TAG_SET_INCLUDE (TAG_ID+)
+  const groupIds = splitCsvText(policy.ASSET_GROUP_IDS);
+  const tagIds = asArray(pathValue(policy, "TAG_SET_INCLUDE", "TAG_ID")).filter((value) => Boolean(xmlScalarText(value)));
   return groupIds.length > 0 || tagIds.length > 0 || policyHasHiddenAssetGroups(policy);
 }
 
