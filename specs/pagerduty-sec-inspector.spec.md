@@ -3,11 +3,13 @@ slug: "pagerduty-sec-inspector"
 name: "PagerDuty Security Inspector"
 vendor: "PagerDuty"
 category: "devops-developer-platforms"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/pagerduty-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/pagerduty-sec-inspector"
+reference_docs: "https://developer.pagerduty.com/api-reference/"
 ---
 
 # PagerDuty Security Inspector
@@ -225,6 +227,22 @@ pagerduty-sec-inspector/
 └── README.md
 ```
 
+### grclanker implementation
+
+The Go layout above is the original standalone design. The shipped implementation is a single TypeScript module in grclanker, `cli/extensions/grc-tools/pagerduty.ts`, registered through `registerPagerdutyTools`. It exposes seven read-only tools:
+
+| Tool | Controls |
+|------|----------|
+| `pagerduty_check_access` | Probes 14 read surfaces (abilities, users, teams, services, escalation policies, schedules, on-calls, audit records, extensions, webhook subscriptions, business services, priorities, incident workflows, change events) and reports missing permissions |
+| `pagerduty_assess_access_control` | 1, 2, 3, 4, 24 |
+| `pagerduty_assess_incident_response` | 5, 6, 7, 10, 19, 20, 22, 23 |
+| `pagerduty_assess_oncall_coverage` | 8, 9, 17, 18 |
+| `pagerduty_assess_audit_logging` | 11, 12, 13 |
+| `pagerduty_assess_integration_security` | 14, 15, 16, 21, 25 |
+| `pagerduty_export_audit_bundle` | All 25, written as `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log`, and a `.zip` |
+
+Findings use ids `PD-01` through `PD-25`, one per control, with status `pass`, `warn`, `fail`, or `manual` and the eight framework mappings from section 5. Regression coverage lives in `cli/tests/pagerduty.test.mjs`; `npm --prefix cli run test:pagerduty:live` runs a credential-gated smoke test against a real account.
+
 ## 8. CLI Interface
 
 ```
@@ -308,4 +326,31 @@ go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) on 2026-09-21. All 25 controls in section 4 produce a finding; 22 are evaluated automatically from the REST API and 3 (controls 1, 13, and 24) always return `manual` findings that state the exact web app evidence to collect, because the API does not expose the underlying setting. Every finding carries the section 5 framework mappings. The tool set, tests, live smoke script, and integration guide (`src/content/docs/docs/integrations/pagerduty.md`) shipped together.
+
+### Shipped
+
+- Configuration precedence explicit arguments, then environment variables, then `~/.config/grclanker/pagerduty.json` (override with `PAGERDUTY_CONFIG_FILE`).
+- Auth modes: REST API key (`Authorization: Token token=<key>`, account or user key, `PAGERDUTY_API_TOKEN`, `PAGERDUTY_API_KEY`, `PAGERDUTY_TOKEN`, or `PD_API_KEY`), pre-issued OAuth bearer token (`PAGERDUTY_ACCESS_TOKEN`), and Scoped OAuth client credentials (`PAGERDUTY_CLIENT_ID`, `PAGERDUTY_CLIENT_SECRET`, `PAGERDUTY_SUBDOMAIN`) exchanged at `https://identity.pagerduty.com/oauth/token` with the `as_account-<region>.<subdomain>` scope plus the `*.read` scopes each endpoint documents.
+- US (`https://api.pagerduty.com`) and EU (`https://api.eu.pagerduty.com`) service regions via `PAGERDUTY_REGION` or an explicit `PAGERDUTY_BASE_URL`.
+- API client with `Accept: application/vnd.pagerduty+json;version=2`, optional `From` header, classic `limit`/`offset`/`more` pagination capped at the documented 10,000 record ceiling, cursor pagination for audit records and incident workflow triggers, 429 and 5xx retry honoring `ratelimit-reset` and `Retry-After`, timeouts, and token redaction in error messages.
+- Audit bundle with raw API snapshots, per-category analysis JSON, executive summary, unified compliance matrix, eight framework reports, quick reference, error log, and zip archive written through a traversal and symlink safe path resolver.
+
+### Deviations from this spec, following the official docs
+
+- Rate limit headers are `ratelimit-limit`, `ratelimit-remaining`, and `ratelimit-reset` (no `X-` prefix), per https://developer.pagerduty.com/docs/72d3b724589e3-rest-api-rate-limits.
+- Pagination is classic `limit`/`offset` with a `more` flag on most index endpoints (max 100 per page, `offset + limit` no more than 10,000), and cursor based (`cursor`, `next_cursor`) only on the endpoints the docs list, including `GET /audit/records` and `GET /incident_workflows/triggers`, per https://developer.pagerduty.com/docs/rest-api-v2/pagination/.
+- Control 10: `GET /response_plays` is no longer in the published OpenAPI reference, so the implementation reads `GET /incident_workflows` and `GET /incident_workflows/triggers` and treats any `response_play` reference still present on a service as legacy automation.
+- Control 13: there is no REST endpoint that lists API keys or their creation dates. The finding is `manual`, supported by the distinct `method.truncated_token` values seen in audit records so an auditor can compare observed keys against the Integrations > API Access Keys page.
+- Control 14 and 15: v3 webhook subscriptions live at `GET /webhook_subscriptions` (not `/webhooks/subscriptions`), and signature verification cannot be observed from the API. v3 deliveries are always signed with an HMAC-SHA256 `X-PagerDuty-Signature` header, so the finding passes when no unsigned legacy generic webhook extensions remain and asks the auditor to confirm receivers verify the signature.
+- Control 16: `GET /services/{id}/integrations` is not a list endpoint; integrations are read through `include[]=integrations` on `GET /services`.
+- Controls 17 and 18: notification rules and contact methods are read through `include[]=notification_rules,contact_methods` on `GET /users` instead of per-user calls. The API does not expose phone or SMS verification status, so control 18 checks that on-call users have enabled, non-blocked phone, SMS, or push methods and flags email-only users as `warn`.
+- Control 21: business service dependencies are read from `GET /service_dependencies/business_services/{id}`.
+- Control 12: PagerDuty documents 12 months of audit record retention, so the assessment probes the 11-to-12 month window and returns `manual` when the required retention exceeds 365 days.
+- Control 1 and 24: `GET /abilities` reveals whether `sso` and analytics features are enabled but not whether SSO login is required or which roles can open Analytics, so both findings are `manual` with the abilities and user role counts attached as supporting evidence.
+
+### Remaining
+
+- CSV, HTML, and SARIF reporters from section 8 are not implemented; grclanker emits JSON analysis files and markdown reports.
+- Controls 1, 13, and 24 stay `manual` until PagerDuty exposes SSO enforcement, API key inventory, or per-role analytics permissions through the REST API.
+- The live smoke test has not been run against a real account in this repository; it skips when credentials are absent.
