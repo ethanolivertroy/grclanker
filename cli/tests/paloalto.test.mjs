@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { createServer } from "node:http";
 
 import {
   PanosApiClient,
@@ -18,6 +19,10 @@ import {
   assessPanosFirewallPolicy,
   assessPanosThreatPrevention,
   assessPrismaCloudPosture,
+  assessPrismaCompute,
+  collectPrismaSnapshot,
+  createInsecureFetch,
+  PrismaComputeClient,
   checkPaloaltoAccess,
   collectPanosSnapshot,
   createPaloaltoClients,
@@ -172,6 +177,9 @@ function panosSnapshot(overrides = {}) {
   return {
     host: overrides.host ?? "fw1.example.com",
     platform: "firewall",
+    reachable: overrides.reachable ?? true,
+    haStateFailed: overrides.haStateFailed ?? false,
+    failedXpaths: overrides.failedXpaths ?? [],
     systemInfo: overrides.systemInfo ?? { model: "PA-440", "sw-version": good ? "11.1.2" : "9.1.0", "av-version": good ? "4900-5400" : "0", "threat-version": "8800-8600" },
     haState: parseXml(haXml(good ? "yes" : "no")).children[0].children[0],
     config: [
@@ -184,9 +192,36 @@ function panosSnapshot(overrides = {}) {
   };
 }
 
+function computeSnapshot(overrides = {}) {
+  const good = overrides.good !== false;
+  return {
+    consoleUrl: "https://compute.example.com",
+    defenders: good ? [{ hostname: "node-1", connected: true, version: "34.00.100", lastModified: "2026-09-01T00:00:00Z" }] : [{ hostname: "node-2", connected: false, version: "30.00.100" }],
+    runtimeContainerPolicy: good ? { rules: [{ name: "default", disabled: false, processes: { effect: "prevent" }, network: { effect: "alert" }, filesystem: { effect: "alert" } }] } : { rules: [{ name: "alert-only", processes: { effect: "alert" } }] },
+    complianceContainerPolicy: { rules: good ? [{ name: "cis-containers", disabled: false }] : [] },
+    complianceHostPolicy: { rules: good ? [{ name: "cis-hosts", disabled: false }] : [] },
+    vulnerabilityImagePolicy: { rules: good ? [{ name: "block-critical", disabled: false, effect: "block" }] : [{ name: "alert", effect: "alert" }] },
+    registrySettings: { specifications: good ? [{ registry: "registry.example.com", repository: "*", cap: 5, scanners: 2 }] : [] },
+    registryScans: good ? [{ id: "sha256:1", scanTime: "2026-09-01T00:00:00Z" }] : [],
+    images: good ? [{ id: "sha256:2", scanTime: "2026-09-01T00:00:00Z", repoTag: { repo: "app" } }] : [],
+    vulnerabilityStats: good ? { criticalVulnerabilities: 0, highVulnerabilities: 3 } : { criticalVulnerabilities: 12 },
+    complianceStats: good ? { complianceRate: 97 } : {},
+    cloudDiscovery: good ? [{ provider: "aws", serviceType: "eks", total: 3, defended: 3 }] : [],
+    ciScans: good ? [{ time: "2026-09-01T00:00:00Z", pass: true }] : [],
+    failed: overrides.failed ?? [],
+    truncated: overrides.truncated ?? [],
+    errors: overrides.errors ?? [],
+  };
+}
+
 function prismaSnapshot(overrides = {}) {
   const good = overrides.good !== false;
   return {
+    failed: overrides.failed ?? [],
+    alertsTruncated: overrides.alertsTruncated ?? false,
+    alertsTotal: overrides.alertsTotal,
+    compute: "compute" in overrides ? overrides.compute : computeSnapshot({ good }),
+    computeUnavailableReason: overrides.computeUnavailableReason,
     posture: good
       ? { summary: { passedResources: 95, failedResources: 5, totalResources: 100 }, complianceDetails: [{ name: "CIS v1.4", passedResources: 95, failedResources: 5 }] }
       : { summary: { passedResources: 40, failedResources: 60, totalResources: 100 }, complianceDetails: [] },
@@ -199,6 +234,7 @@ function prismaSnapshot(overrides = {}) {
     policies: [
       { name: "AWS EBS volume not encrypted with CMK", policyType: "config", enabled: good },
       { name: "IAM user with excessive permissions", policyType: "iam", enabled: true },
+      { name: "AWS Security Group allows all traffic on SSH port (22)", policyType: "network", enabled: true },
       { name: "Sensitive data exposed in S3 (DLP)", policyType: "data", enabled: good },
     ],
     cloudAccounts: good ? [{ name: "prod", enabled: true, groups: [{ name: "Default" }], status: "ok" }] : [{ name: "legacy", enabled: false, groups: [] }],
@@ -399,16 +435,30 @@ test("collectPanosSnapshot detects Panorama and records per-xpath collection err
   assert.match(snapshot.errors[1], /\/config\/panorama/);
 });
 
+const PANOS_FORBIDDEN = '<response status="error" code="403"><result><msg>Insufficient privileges</msg></result></response>';
+
 function mockedFetch(options = {}) {
+  const { denyAll = false, emptyAll = false, partial = false } = options;
+  const compute = computeSnapshot();
   return async (input, init = {}) => {
     const url = new URL(input);
     if (url.hostname.endsWith("prismacloud.io")) {
       if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
-      if (url.pathname === "/v2/compliance/posture") return jsonResponse(prismaSnapshot().posture);
+      if (denyAll) return jsonResponse({ message: "forbidden" }, { status: 403 });
+      if (url.pathname === "/meta_info") return options.noCompute ? jsonResponse({}, { status: 404 }) : jsonResponse({ twistlockUrl: "https://compute.example.com" });
+      if (emptyAll) {
+        if (url.pathname === "/v2/compliance/posture") return jsonResponse({ summary: { passedResources: 0, failedResources: 0, totalResources: 0 }, complianceDetails: [] });
+        if (url.pathname === "/v2/alert") return jsonResponse({ items: [] });
+        return jsonResponse([]);
+      }
+      if (url.pathname === "/v2/compliance/posture") return partial ? jsonResponse({}, { status: 403 }) : jsonResponse(prismaSnapshot().posture);
       if (url.pathname === "/v2/alert/rule") return jsonResponse(prismaSnapshot().alertRules);
-      if (url.pathname === "/v2/alert") return jsonResponse({ items: [] });
+      if (url.pathname === "/v2/alert") {
+        if (partial) return jsonResponse({ items: [{ policy: { name: "AWS S3 bucket public", policyType: "network", severity: "low" } }], nextPageToken: `next-${url.searchParams.get("pageToken") ?? "0"}`, totalRows: 5000 });
+        return jsonResponse({ items: [] });
+      }
       if (url.pathname === "/v2/policy") return jsonResponse(prismaSnapshot().policies);
-      if (url.pathname === "/cloud") return jsonResponse(prismaSnapshot().cloudAccounts);
+      if (url.pathname === "/cloud") return partial ? jsonResponse({ message: "role cannot read accounts" }, { status: 403 }) : jsonResponse(prismaSnapshot().cloudAccounts);
       if (url.pathname === "/cloud/group") return jsonResponse(prismaSnapshot().accountGroups);
       if (url.pathname === "/user/role") return jsonResponse(prismaSnapshot().userRoles);
       if (url.pathname === "/integration") {
@@ -416,19 +466,40 @@ function mockedFetch(options = {}) {
       }
       return jsonResponse({}, { status: 404 });
     }
+    if (url.hostname === "compute.example.com") {
+      if (url.pathname === "/api/v1/authenticate") return jsonResponse({ token: "compute-token" });
+      if (denyAll || partial || options.computeDenied) return jsonResponse({ err: "forbidden" }, { status: 403 });
+      const path = url.pathname.replace("/api/v1", "");
+      if (emptyAll) return jsonResponse(path.startsWith("/policies") || path.startsWith("/settings") || path.startsWith("/stats") ? {} : []);
+      if (path === "/defenders") return jsonResponse(compute.defenders);
+      if (path === "/policies/runtime/container") return jsonResponse(compute.runtimeContainerPolicy);
+      if (path === "/policies/compliance/container") return jsonResponse(compute.complianceContainerPolicy);
+      if (path === "/policies/compliance/host") return jsonResponse(compute.complianceHostPolicy);
+      if (path === "/policies/vulnerability/images") return jsonResponse(compute.vulnerabilityImagePolicy);
+      if (path === "/settings/registry") return jsonResponse(compute.registrySettings);
+      if (path === "/registry") return jsonResponse(compute.registryScans);
+      if (path === "/images") return jsonResponse(compute.images);
+      if (path === "/stats/vulnerabilities") return jsonResponse(compute.vulnerabilityStats);
+      if (path === "/stats/compliance") return jsonResponse(compute.complianceStats);
+      if (path === "/cloud/discovery") return jsonResponse(compute.cloudDiscovery);
+      if (path === "/scans") return jsonResponse(compute.ciScans);
+      return jsonResponse({}, { status: 404 });
+    }
+    if (partial && url.hostname === "fw2.example.com") throw new Error("connect ECONNREFUSED");
     const type = url.searchParams.get("type");
+    if (denyAll) return xmlResponse(PANOS_FORBIDDEN, 403);
     if (type === "op") {
-      return url.searchParams.get("cmd").includes("high-availability") ? xmlResponse(haXml()) : xmlResponse(systemInfoXml());
+      if (url.searchParams.get("cmd").includes("high-availability")) return xmlResponse(emptyAll ? panosSuccess("") : haXml());
+      return xmlResponse(emptyAll ? panosSuccess("<system><hostname>fw-empty</hostname></system>") : systemInfoXml());
     }
     const xpath = url.searchParams.get("xpath");
+    if (emptyAll) return xmlResponse(panosSuccess(`<${xpath.split("/").at(-1)}/>`));
     if (xpath.endsWith("/vsys")) return xmlResponse(panosSuccess(goodVsysXml()));
     if (xpath.endsWith("/network")) return xmlResponse(panosSuccess("<network/>"));
     if (xpath.endsWith("/deviceconfig")) return xmlResponse(panosSuccess(goodDeviceconfigXml()));
     if (xpath.endsWith("/shared")) return xmlResponse(panosSuccess(goodSharedXml()));
     if (xpath.endsWith("/mgt-config")) {
-      return options.mgtDenied
-        ? xmlResponse('<response status="error" code="403"><result><msg>Insufficient privileges</msg></result></response>', 403)
-        : xmlResponse(panosSuccess(goodMgtConfigXml()));
+      return options.mgtDenied ? xmlResponse(PANOS_FORBIDDEN, 403) : xmlResponse(panosSuccess(goodMgtConfigXml()));
     }
     return xmlResponse(panosSuccess("<empty/>"));
   };
@@ -448,8 +519,9 @@ test("checkPaloaltoAccess reports healthy access across both products", async ()
   const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
   const result = await checkPaloaltoAccess(clients);
   assert.equal(result.status, "healthy");
-  assert.deepEqual(result.products, ["prisma-cloud", "pan-os"]);
-  assert.equal(result.surfaces.length, 8 + 2 + 5);
+  assert.deepEqual(result.products, ["prisma-cloud", "prisma-compute", "pan-os"]);
+  assert.equal(result.surfaces.length, 8 + 8 + 2 + 5);
+  assert.ok(result.notes.some((note) => note.includes("Compute console: https://compute.example.com")));
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   assert.match(result.recommendedNextStep, /paloalto_assess_cloud_posture/);
   assert.ok(result.notes.some((note) => /PA-440/.test(note)));
@@ -486,14 +558,38 @@ test("assessPrismaCloudPosture passes on a healthy tenant and fails on a weak on
   assert.equal(byId(bad, "PA-06").status, "fail");
 
   const missing = assessPrismaCloudPosture({ ...prismaSnapshot(), posture: undefined });
-  assert.equal(byId(missing, "PA-01").status, "warn");
+  assert.equal(byId(missing, "PA-01").status, "manual");
 });
 
-test("assessPaloaltoCloudPosture emits manual findings for Compute controls and for unconfigured Prisma Cloud", async () => {
+test("assessPrismaCompute evaluates controls 7-11, 24, and 25 from the Compute API and falls back to manual", () => {
+  const good = assessPrismaCompute(prismaSnapshot());
+  assert.deepEqual(good.map((item) => [item.control, item.status]), [[7, "pass"], [8, "pass"], [9, "pass"], [10, "pass"], [11, "pass"], [24, "pass"], [25, "warn"]]);
+  assert.match(byId(good, "PA-25").summary, /Admission control policy has no verified public read endpoint/);
+
+  const bad = assessPrismaCompute(prismaSnapshot({ good: false }));
+  assert.deepEqual(bad.map((item) => [item.control, item.status]), [[7, "fail"], [8, "fail"], [9, "warn"], [10, "fail"], [11, "manual"], [24, "manual"], [25, "fail"]]);
+
+  const unreachable = assessPrismaCompute(prismaSnapshot({ compute: undefined, computeUnavailableReason: "set PRISMA_COMPUTE_URL to the Compute console path." }));
+  assert.ok(unreachable.every((item) => item.status === "manual"));
+  assert.match(unreachable[0].summary, /PRISMA_COMPUTE_URL/);
+  assert.ok(assessPrismaCompute(undefined).every((item) => item.status === "manual"));
+});
+
+test("assessPaloaltoCloudPosture automates Compute controls when the console is reachable and stays manual otherwise", async () => {
   const configured = await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mockedFetch()));
   assert.equal(configured.findings.length, 13);
-  assert.deepEqual(configured.findings.filter((item) => item.status === "manual").map((item) => item.control), [7, 8, 9, 10, 11, 24, 25]);
-  assert.match(byId(configured.findings, "PA-10").summary, /Manual evidence required/);
+  assert.equal(configured.summary.compute_configured, true);
+  assert.deepEqual(configured.findings.filter((item) => item.status === "manual"), []);
+  assert.equal(byId(configured.findings, "PA-10").status, "pass");
+
+  const noCompute = await assessPaloaltoCloudPosture(createPaloaltoClients(bothProductsConfig(), mockedFetch({ noCompute: true })));
+  assert.deepEqual(noCompute.findings.filter((item) => item.status === "manual").map((item) => item.control), [7, 8, 9, 10, 11, 24, 25]);
+  assert.match(byId(noCompute.findings, "PA-10").summary, /PRISMA_COMPUTE_URL/);
+
+  const override = createPaloaltoClients(resolvePaloaltoConfiguration({}, { PRISMA_ACCESS_KEY_ID: "k", PRISMA_SECRET_KEY: "s", PRISMA_COMPUTE_URL: "https://compute.example.com/" }), mockedFetch({ noCompute: true }));
+  assert.equal(override.compute.baseUrl, "https://compute.example.com");
+  const overridden = await assessPaloaltoCloudPosture(override);
+  assert.equal(byId(overridden.findings, "PA-10").status, "pass");
 
   const panosOnly = createPaloaltoClients(resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw1.example.com", PANOS_API_KEY: "k" }), mockedFetch());
   const unconfigured = await assessPaloaltoCloudPosture(panosOnly);
@@ -516,7 +612,7 @@ test("assessPanosFirewallPolicy passes hardened rulebases and fails permissive o
   assert.equal(byId(bad, "PA-14").status, "fail");
 
   const manual = assessPanosFirewallPolicy([]);
-  assert.equal(byId(manual, "PA-12").status, "warn");
+  assert.equal(byId(manual, "PA-12").status, "manual");
 });
 
 test("assessPanosThreatPrevention and DLP evaluate profiles and attachment", () => {
@@ -561,7 +657,8 @@ test("admin access, logging, and device hardening findings pass and fail on fixt
   for (const item of good) assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
 
   const bad = assessPanosDeviceHardening([panosSnapshot({ good: false })]);
-  assert.equal(byId(bad, "PA-15").status, "pass");
+  assert.equal(byId(bad, "PA-15").status, "manual");
+  assert.match(byId(bad, "PA-15").summary, /scoped out/);
   assert.equal(byId(bad, "PA-23").status, "fail");
   assert.equal(byId(bad, "PA-23").evidence.devices[0].default_snmp_community, true);
   assert.equal(byId(bad, "PA-HA-01").status, "warn");
@@ -575,8 +672,8 @@ test("assessPaloaltoDeviceHardening covers controls 15, 19, 20, and 23 with live
 
   const prismaOnly = createPaloaltoClients(resolvePaloaltoConfiguration({}, { PRISMA_ACCESS_KEY_ID: "k", PRISMA_SECRET_KEY: "s" }), mockedFetch());
   const partial = await assessPaloaltoDeviceHardening(prismaOnly);
-  assert.deepEqual(partial.findings.map((item) => [item.id, item.status]), [["PA-15", "manual"], ["PA-19", "pass"], ["PA-20", "pass"], ["PA-23", "manual"]]);
-  assert.match(byId(partial.findings, "PA-19").summary, /PAN-OS not configured/);
+  assert.deepEqual(partial.findings.map((item) => [item.id, item.status]), [["PA-15", "manual"], ["PA-19", "warn"], ["PA-20", "warn"], ["PA-23", "manual"]]);
+  assert.match(byId(partial.findings, "PA-19").summary, /PAN-OS not configured, so only the Prisma Cloud half/);
 });
 
 test("exportPaloaltoAuditBundle writes core_data, analysis, compliance reports, zip, and error log", async () => {
@@ -624,6 +721,9 @@ test("exportPaloaltoAuditBundle writes core_data, analysis, compliance reports, 
   const clean = await exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mockedFetch()), base);
   assert.equal(clean.errorCount, 0);
   assert.ok(!existsSync(join(clean.outputDir, "_errors.log")));
+  assert.equal(basename(clean.zipPath), `${basename(clean.outputDir)}.zip`);
+  assert.notEqual(clean.zipPath, result.zipPath);
+  assert.ok(existsSync(result.zipPath) && existsSync(clean.zipPath));
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
@@ -648,4 +748,310 @@ test("Palo Alto tools are registered in the catalog under the Palo Alto Networks
   ]);
   assert.ok(tools.every((tool) => tool.group === "Palo Alto Networks" && tool.kind === "domain"));
   assert.ok(tools.every((tool) => tool.parameterSummaries.some((parameter) => parameter.name === "panos_hosts")));
+});
+
+test("TLS opt-out is scoped to PAN-OS clients and never mutates NODE_TLS_REJECT_UNAUTHORIZED", async () => {
+  const before = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+  const clients = createPaloaltoClients(resolvePaloaltoConfiguration({}, {
+    PRISMA_ACCESS_KEY_ID: "k",
+    PRISMA_SECRET_KEY: "s",
+    PANOS_HOST: "fw1.example.com",
+    PANOS_API_KEY: "k",
+    PANOS_VERIFY_TLS: "false",
+  }));
+  assert.equal(process.env.NODE_TLS_REJECT_UNAUTHORIZED, before);
+  assert.equal(clients.config.verifyTls, false);
+  assert.equal(clients.panos[0].tlsVerification, false);
+  const strict = createPaloaltoClients(resolvePaloaltoConfiguration({}, { PANOS_HOST: "fw1.example.com", PANOS_API_KEY: "k" }));
+  assert.equal(strict.panos[0].tlsVerification, true);
+  assert.equal(process.env.NODE_TLS_REJECT_UNAUTHORIZED, before);
+
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      response.writeHead(201, { "content-type": "application/json", "x-echo-method": request.method, "x-echo-auth": request.headers["x-pan-key"] ?? "" });
+      response.end(JSON.stringify({ path: request.url, body }));
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  try {
+    const insecureFetch = createInsecureFetch();
+    const response = await insecureFetch(`http://127.0.0.1:${server.address().port}/api/?type=op`, { method: "POST", headers: { "X-PAN-KEY": "key" }, body: "cmd=1" });
+    assert.equal(response.status, 201);
+    assert.equal(response.headers.get("x-echo-method"), "POST");
+    assert.equal(response.headers.get("x-echo-auth"), "key");
+    assert.deepEqual(await response.json(), { path: "/api/?type=op", body: "cmd=1" });
+  } finally {
+    server.close();
+  }
+  assert.equal(process.env.NODE_TLS_REJECT_UNAUTHORIZED, before);
+});
+
+test("PrismaComputeClient authenticates with a Compute token, falls back to the CSPM JWT, and pages with offset", async () => {
+  const seen = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(input);
+    seen.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), headers: Object.fromEntries(new Headers(init.headers ?? {})) });
+    if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
+    if (url.pathname === "/api/v1/authenticate") return seen.filter((item) => item.path === "/api/v1/authenticate").length === 1 ? jsonResponse({ token: "compute-token" }) : jsonResponse({}, { status: 401 });
+    if (url.pathname === "/api/v1/defenders") {
+      const offset = Number(url.searchParams.get("offset"));
+      return jsonResponse(offset === 0 ? Array.from({ length: 50 }, (_, index) => ({ hostname: `n${index}` })) : [{ hostname: "last" }]);
+    }
+    return jsonResponse({});
+  };
+  const cspm = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "key", secretKey: "secret" }, { fetchImpl });
+  const compute = new PrismaComputeClient("https://compute.example.com/", cspm);
+  const defenders = await compute.listDefenders();
+  assert.equal(defenders.items.length, 51);
+  assert.equal(defenders.truncated, false);
+  const authenticate = seen.find((item) => item.path === "/api/v1/authenticate");
+  assert.equal(authenticate.headers["content-type"], "application/json");
+  assert.equal(seen.find((item) => item.path === "/api/v1/defenders").headers.authorization, "Bearer compute-token");
+  assert.deepEqual(seen.filter((item) => item.path === "/api/v1/defenders").map((item) => item.query.offset), ["0", "50"]);
+
+  const fallback = new PrismaComputeClient("https://compute.example.com", cspm);
+  seen.length = 0;
+  seen.push({ path: "/api/v1/authenticate" });
+  await fallback.getRuntimeContainerPolicy();
+  assert.equal(seen.at(-1).headers["x-redlock-auth"], "jwt");
+});
+
+test("rule 1: unreadable, forbidden, or errored evidence yields manual, never pass", async () => {
+  const prisma = prismaSnapshot({ failed: ["alert rules"] });
+  const cspm = assessPrismaCloudPosture(prisma);
+  assert.equal(byId(cspm, "PA-02").status, "manual");
+  assert.match(byId(cspm, "PA-02").summary, /Evidence unavailable/);
+  assert.equal(byId(cspm, "PA-01").status, "pass");
+
+  const compute = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ failed: ["defenders"] }) }));
+  assert.equal(byId(compute, "PA-10").status, "manual");
+  assert.equal(byId(compute, "PA-09").status, "pass");
+
+  const failedVsys = assessPanosFirewallPolicy([panosSnapshot({ failedXpaths: ["/config/devices/entry/vsys"] })]);
+  assert.ok(failedVsys.every((item) => item.status === "manual"), failedVsys.map((item) => `${item.id}:${item.status}`).join(","));
+  const unreachable = assessPanosDeviceHardening([panosSnapshot({ reachable: false })]);
+  assert.ok(unreachable.every((item) => item.status === "manual"));
+
+  const snapshot = await collectPanosSnapshot({
+    host: "fw1",
+    showSystemInfo: async () => { throw new Error("PAN-OS API error 403: Insufficient privileges"); },
+    showHighAvailabilityState: async () => { throw new Error("denied"); },
+    showConfig: async () => { throw new Error("denied"); },
+  });
+  assert.equal(snapshot.reachable, false);
+  assert.equal(snapshot.haStateFailed, true);
+  assert.equal(snapshot.failedXpaths.length, 5);
+});
+
+test("rule 2: empty inventories are fail or manual per control intent and say which", () => {
+  const emptyPrisma = assessPrismaCloudPosture({ ...prismaSnapshot(), posture: { summary: { totalResources: 0 } }, alertRules: [], alerts: [], policies: [], cloudAccounts: [] });
+  assert.equal(byId(emptyPrisma, "PA-01").status, "manual");
+  assert.match(byId(emptyPrisma, "PA-01").summary, /treated as manual/);
+  assert.equal(byId(emptyPrisma, "PA-02").status, "fail");
+  assert.match(byId(emptyPrisma, "PA-02").summary, /treated as fail/);
+  assert.equal(byId(emptyPrisma, "PA-03").status, "manual");
+  assert.equal(byId(emptyPrisma, "PA-04").status, "fail");
+  assert.equal(byId(emptyPrisma, "PA-05").status, "manual");
+  assert.equal(byId(emptyPrisma, "PA-06").status, "fail");
+
+  const emptyCompute = assessPrismaCompute(prismaSnapshot({ compute: { ...computeSnapshot({ good: false }), defenders: [] } }));
+  assert.equal(byId(emptyCompute, "PA-10").status, "fail");
+  assert.match(byId(emptyCompute, "PA-10").summary, /Zero Defenders/);
+  assert.equal(byId(emptyCompute, "PA-11").status, "manual");
+  assert.equal(byId(emptyCompute, "PA-24").status, "manual");
+  assert.equal(byId(emptyCompute, "PA-25").status, "fail");
+
+  const emptyDevice = panosSnapshot({ good: false });
+  emptyDevice.config = [parseXml("<vsys/>"), parseXml("<shared/>"), parseXml("<deviceconfig/>"), parseXml("<mgt-config/>")];
+  const firewall = assessPanosFirewallPolicy([emptyDevice]);
+  assert.equal(byId(firewall, "PA-12").status, "manual");
+  assert.equal(byId(firewall, "PA-13").status, "manual");
+  assert.equal(byId(firewall, "PA-14").status, "fail");
+  const threat = assessPanosThreatPrevention([emptyDevice]);
+  assert.ok(threat.every((item) => item.status === "fail"));
+  assert.equal(assessAdminAccess(undefined, [emptyDevice]).status, "manual");
+  assert.match(assessAdminAccess(undefined, [emptyDevice]).summary, /zero administrator accounts/);
+  assert.equal(assessLogging(undefined, [emptyDevice]).status, "fail");
+  assert.equal(byId(assessPanosDeviceHardening([emptyDevice]), "PA-23").status, "manual");
+});
+
+test("rule 3: scoped-out, disabled, or unlicensed controls are manual, never pass", () => {
+  const noGp = panosSnapshot();
+  noGp.config[0] = parseXml(goodVsysXml().replace(/<global-protect>[\s\S]*<\/global-protect>/, ""));
+  const hardening = assessPanosDeviceHardening([noGp]);
+  assert.equal(byId(hardening, "PA-15").status, "manual");
+  assert.match(byId(hardening, "PA-15").summary, /scoped out/);
+
+  const noIam = assessPrismaCloudPosture({ ...prismaSnapshot(), policies: prismaSnapshot().policies.filter((policy) => policy.policyType !== "iam") });
+  assert.equal(byId(noIam, "PA-03").status, "manual");
+  assert.match(byId(noIam, "PA-03").summary, /unlicensed/);
+
+  const noCompute = assessPrismaCompute(prismaSnapshot({ compute: undefined, computeUnavailableReason: "Compute console discovery via CSPM /meta_info failed (404)" }));
+  assert.ok(noCompute.every((item) => item.status === "manual"));
+});
+
+test("rule 4: items without dates are never counted fresh and cap the verdict at warn", () => {
+  const compute = computeSnapshot();
+  compute.defenders = [{ hostname: "node-1", connected: true, version: "34.00.100" }];
+  compute.images = [{ id: "sha256:9", repoTag: { repo: "app" } }];
+  compute.registryScans = [{ id: "sha256:8" }];
+  const findings = assessPrismaCompute(prismaSnapshot({ compute }));
+  assert.equal(byId(findings, "PA-10").status, "warn");
+  assert.match(byId(findings, "PA-10").summary, /no lastModified timestamp/);
+  assert.equal(byId(findings, "PA-07").status, "warn");
+  assert.deepEqual(byId(findings, "PA-07").evidence.images_without_scan_time, ["sha256:9"]);
+  assert.equal(byId(findings, "PA-11").status, "warn");
+
+  const noVersion = panosSnapshot({ systemInfo: { model: "PA-440", "av-version": "4900-5400", "threat-version": "8800-8600" } });
+  assert.equal(byId(assessPanosDeviceHardening([noVersion]), "PA-SW-01").status, "warn");
+});
+
+test("rule 5: partial inventories flag seen and total counts instead of passing", () => {
+  const truncated = assessPrismaCloudPosture(prismaSnapshot({ alertsTruncated: true, alertsTotal: 5000 }));
+  assert.equal(byId(truncated, "PA-02").status, "warn");
+  assert.match(byId(truncated, "PA-02").summary, /truncated at 0 of 5000/);
+  assert.equal(byId(truncated, "PA-05").status, "warn");
+  assert.equal(byId(truncated, "PA-01").status, "pass");
+
+  const twoDevices = assessPanosFirewallPolicy([panosSnapshot(), panosSnapshot({ host: "fw2.example.com", reachable: false })]);
+  assert.ok(twoDevices.every((item) => item.status === "manual"));
+  assert.match(byId(twoDevices, "PA-12").summary, /fw2.example.com unreachable/);
+
+  const computeTruncated = assessPrismaCompute(prismaSnapshot({ compute: computeSnapshot({ truncated: ["defenders"] }) }));
+  assert.equal(byId(computeTruncated, "PA-10").status, "warn");
+  assert.match(byId(computeTruncated, "PA-10").summary, /truncated at 500 records/);
+});
+
+test("rule 6: absent or false enabling flags never support pass", () => {
+  const implicit = prismaSnapshot();
+  implicit.alertRules = [{ name: "no-flag", alertRuleNotificationConfig: [] }];
+  implicit.cloudAccounts = [{ name: "prod", groups: [{ name: "Default" }], status: "ok" }];
+  implicit.policies = implicit.policies.map((policy) => ({ ...policy, enabled: undefined }));
+  const findings = assessPrismaCloudPosture(implicit);
+  assert.equal(byId(findings, "PA-02").status, "fail");
+  assert.equal(byId(findings, "PA-04").status, "fail");
+  assert.equal(byId(findings, "PA-05").status, "manual");
+  assert.equal(byId(findings, "PA-06").status, "fail");
+
+  const implicitLog = panosSnapshot();
+  implicitLog.config[0] = parseXml(goodVsysXml().replace(/<log-end>yes<\/log-end>/g, ""));
+  const firewall = assessPanosFirewallPolicy([implicitLog]);
+  assert.equal(byId(firewall, "PA-12").status, "warn");
+  assert.match(byId(firewall, "PA-12").summary, /without an explicit log-end flag/);
+  assert.equal(assessLogging(undefined, [implicitLog]).status, "warn");
+
+  const haUnknown = panosSnapshot();
+  haUnknown.haState = parseXml(panosSuccess("<group><local-info><state>active</state></local-info></group>")).children[0].children[0];
+  assert.equal(byId(assessPanosDeviceHardening([haUnknown]), "PA-HA-01").status, "warn");
+
+  const runtimeAlertOnly = computeSnapshot();
+  runtimeAlertOnly.runtimeContainerPolicy = { rules: [{ name: "disabled-prevent", disabled: true, processes: { effect: "prevent" } }, { name: "alert", processes: { effect: "alert" } }] };
+  assert.equal(byId(assessPrismaCompute(prismaSnapshot({ compute: runtimeAlertOnly })), "PA-09").status, "warn");
+});
+
+test("rule 7: alert pagination runs to completion or records truncation", async () => {
+  const pages = [];
+  const client = {
+    getCompliancePosture: async () => prismaSnapshot().posture,
+    listAlertRules: async () => prismaSnapshot().alertRules,
+    collectOpenAlerts: async (limit) => {
+      pages.push(limit);
+      return { items: Array.from({ length: limit }, () => ({ policy: { name: "x", policyType: "config", severity: "low" } })), truncated: true, totalRows: 900 };
+    },
+    listPolicies: async () => prismaSnapshot().policies,
+    listCloudAccounts: async () => prismaSnapshot().cloudAccounts,
+    listAccountGroups: async () => prismaSnapshot().accountGroups,
+    listUserRoles: async () => prismaSnapshot().userRoles,
+    listIntegrations: async () => prismaSnapshot().integrations,
+  };
+  const snapshot = await collectPrismaSnapshot(client, 300);
+  assert.equal(snapshot.alertsTruncated, true);
+  assert.equal(snapshot.alertsTotal, 900);
+  assert.deepEqual(pages, [300]);
+  const findings = assessPrismaCloudPosture(snapshot);
+  assert.equal(byId(findings, "PA-02").status, "warn");
+  assert.match(byId(findings, "PA-02").summary, /truncated at 300 of 900/);
+
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    if (url.pathname === "/login") return jsonResponse({ token: "jwt" });
+    seen.push(url.searchParams.get("pageToken"));
+    return jsonResponse({ items: [{ id: seen.length }], nextPageToken: seen.length < 3 ? `t${seen.length}` : undefined, totalRows: 3 });
+  };
+  const complete = await new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, { fetchImpl }).collectOpenAlerts(50);
+  assert.equal(complete.truncated, false);
+  assert.equal(complete.items.length, 3);
+  assert.deepEqual(seen, [null, "t1", "t2"]);
+});
+
+test("rule 8: export reruns allocate a new directory and zip without overwriting", async () => {
+  const base = createTempBase("grclanker-paloalto-rerun-");
+  const first = await exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mockedFetch()), base);
+  const second = await exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mockedFetch()), base);
+  assert.notEqual(first.outputDir, second.outputDir);
+  assert.notEqual(first.zipPath, second.zipPath);
+  assert.equal(basename(first.zipPath), `${basename(first.outputDir)}.zip`);
+  assert.equal(basename(second.zipPath), `${basename(second.outputDir)}.zip`);
+  assert.ok(existsSync(first.zipPath) && existsSync(second.zipPath));
+});
+
+async function runAllAssessments(clients) {
+  const results = [
+    await assessPaloaltoCloudPosture(clients, { alertLimit: 2 }),
+    await assessPaloaltoFirewallPolicy(clients),
+    await assessPaloaltoThreatPrevention(clients),
+    await assessPaloaltoDeviceHardening(clients),
+  ];
+  return results.flatMap((result) => result.findings);
+}
+
+function twoDeviceConfig(extra = {}) {
+  return resolvePaloaltoConfiguration({}, {
+    PRISMA_API_URL: "https://api2.prismacloud.io",
+    PRISMA_ACCESS_KEY_ID: "key",
+    PRISMA_SECRET_KEY: "secret",
+    PANOS_HOST: "fw1.example.com,fw2.example.com",
+    PANOS_API_KEY: "LUFRPT-key",
+    ...extra,
+  });
+}
+
+test("false-pass self-check (a): every endpoint forbidden or erroring yields no pass", async () => {
+  const findings = await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ denyAll: true })));
+  assert.equal(new Set(findings.map((item) => item.control)).size, 25);
+  assert.deepEqual(findings.filter((item) => item.status === "pass"), []);
+  assert.ok(findings.filter((item) => /^PA-\d\d$/.test(item.id)).every((item) => item.status === "manual"), findings.map((item) => `${item.id}:${item.status}`).join(","));
+  assert.ok(findings.every((item) => item.status !== "manual" || /Manual evidence required/.test(item.summary)));
+});
+
+test("false-pass self-check (b): empty inventories only pass where emptiness is compliant", async () => {
+  const findings = await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ emptyAll: true })));
+  assert.equal(new Set(findings.map((item) => item.control)).size, 25);
+  const passes = findings.filter((item) => item.status === "pass").map((item) => item.id);
+  assert.deepEqual(passes, [], `unexpected passes: ${passes.join(",")}`);
+  const expected = {
+    "PA-01": "manual", "PA-02": "fail", "PA-03": "manual", "PA-04": "fail", "PA-05": "manual", "PA-06": "fail",
+    "PA-07": "fail", "PA-08": "fail", "PA-09": "fail", "PA-10": "fail", "PA-11": "manual", "PA-24": "manual", "PA-25": "fail",
+    "PA-12": "manual", "PA-13": "manual", "PA-14": "fail", "PA-15": "manual", "PA-16": "fail", "PA-17": "fail", "PA-18": "fail",
+    "PA-19": "manual", "PA-20": "fail", "PA-21": "fail", "PA-22": "fail", "PA-23": "manual",
+  };
+  for (const [id, status] of Object.entries(expected)) assert.equal(byId(findings, id).status, status, `${id}: ${byId(findings, id).summary}`);
+  for (const item of findings.filter((entry) => ["fail", "manual"].includes(entry.status) && /^PA-\d\d$/.test(entry.id) && !["PA-14", "PA-16", "PA-17", "PA-18", "PA-20", "PA-21", "PA-22", "PA-08", "PA-09", "PA-15", "PA-19", "PA-23"].includes(entry.id))) {
+    assert.match(item.summary, /treated as (fail|manual)|Zero|zero/i, `${item.id}: ${item.summary}`);
+  }
+});
+
+test("false-pass self-check (c): partial inventories never pass", async () => {
+  const findings = await runAllAssessments(createPaloaltoClients(twoDeviceConfig(), mockedFetch({ partial: true })));
+  assert.equal(new Set(findings.map((item) => item.control)).size, 25);
+  assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id), []);
+  assert.equal(byId(findings, "PA-02").status, "warn");
+  assert.match(byId(findings, "PA-02").summary, /truncated at 2 of 5000/);
+  assert.equal(byId(findings, "PA-04").status, "manual");
+  assert.equal(byId(findings, "PA-10").status, "manual");
+  assert.equal(byId(findings, "PA-12").status, "manual");
+  assert.match(byId(findings, "PA-12").summary, /fw2.example.com unreachable/);
 });

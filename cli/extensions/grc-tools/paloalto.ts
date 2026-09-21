@@ -2270,13 +2270,14 @@ export function assessAdminAccess(prisma: PrismaSnapshot | undefined, snapshots:
   const panosWarn = snapshots.length > 0 && localOnly.length > 0;
   const prismaWarn = prisma !== undefined && (sysadminRoles.length > maxSuperusers || prisma.userRoles.length === 0);
   const panosEmpty = snapshots.length > 0 && admins.length === 0;
-  const status: PaloaltoStatus = panosEmpty ? "manual" : panosFail ? "fail" : panosWarn || prismaWarn ? "warn" : "pass";
+  const singleProduct = !prisma || snapshots.length === 0;
+  const status: PaloaltoStatus = panosEmpty ? "manual" : panosFail ? "fail" : panosWarn || prismaWarn || singleProduct ? "warn" : "pass";
   const parts = [
     snapshots.length > 0
       ? panosEmpty
         ? `PAN-OS: zero administrator accounts were readable, which is treated as manual because every device has at least one admin; the mgt-config users subtree is probably hidden from this API role. Manual evidence required: ${instruction}`
         : `PAN-OS: ${admins.length} administrators, ${superusers.length} superusers (threshold ${maxSuperusers}), ${localOnly.length} local-password-only accounts, password complexity ${complexityDisabled ? "not enabled on every device" : "enabled"}. MFA for admin logins must be confirmed in the authentication profiles.`
-      : "PAN-OS not configured.",
+      : "PAN-OS not configured, so only the Prisma Cloud half of this control was evaluated (capped at warn).",
     prisma ? `Prisma Cloud: ${prisma.userRoles.length} roles, ${sysadminRoles.length} System Admin roles.${prisma.userRoles.length === 0 ? " Zero roles were returned, so role assignments could not be evaluated (warn)." : ""}` : "Prisma Cloud not configured.",
   ];
   const gateInfo = mergeGates(prisma ? prismaGate(prisma, ["user roles"]) : undefined, snapshots.length > 0 ? panosGate(snapshots, DEVICE_XPATHS) : undefined);
@@ -2315,11 +2316,12 @@ export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: Pan
   const panosFail = snapshots.length > 0 && (unlogged.length > 0 || !externalForwarding);
   const panosWarn = snapshots.length > 0 && (noForwarding.length > 0 || implicitLog.length > 0 || enabled.length === 0);
   const prismaWarn = Boolean(prisma) && siemIntegrations.length === 0;
-  const status: PaloaltoStatus = panosFail ? "fail" : panosWarn || prismaWarn ? "warn" : "pass";
+  const singleProduct = !prisma || snapshots.length === 0;
+  const status: PaloaltoStatus = panosFail ? "fail" : panosWarn || prismaWarn || singleProduct ? "warn" : "pass";
   const parts = [
     snapshots.length > 0
       ? `PAN-OS: ${unlogged.length}/${enabled.length} rules set log-end=no, ${implicitLog.length} rely on the implicit log-end default, ${noForwarding.length} lack a log forwarding profile, ${syslogServers} syslog server profiles, Panorama forwarding ${panoramaForwarding ? "configured" : "not configured"}.${enabled.length === 0 ? " Zero enabled rules were readable, so rule logging could not be evaluated (warn)." : ""} Log retention must be confirmed against the storage quota.`
-      : "PAN-OS not configured.",
+      : "PAN-OS not configured, so only the Prisma Cloud half of this control was evaluated (capped at warn).",
     prisma ? `Prisma Cloud: ${siemIntegrations.length}/${prisma.integrations.length} integrations forward alerts to a SIEM or notification channel.` : "Prisma Cloud not configured.",
   ];
   const gateInfo = mergeGates(prisma ? prismaGate(prisma, ["integrations"]) : undefined, snapshots.length > 0 ? panosGate(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]) : undefined);
@@ -2388,6 +2390,7 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
   for (const snapshot of snapshots) {
     const system = snapshot.config.map((tree) => xmlFindAll(tree, "system").find((node) => xmlChild(node, "hostname") || xmlChild(node, "ntp-servers") || xmlChild(node, "dns-setting") || xmlChild(node, "service"))).find(Boolean);
     const setting = snapshot.config.map((tree) => xmlFindAll(tree, "setting").find((node) => xmlChild(node, "management"))).find(Boolean);
+    if (!system) continue;
     const ntp = xmlFindAll(system, "ntp-server-address").map(xmlText).filter(Boolean);
     const dns = xmlText(xmlPath(system, ["dns-setting", "servers", "primary"]));
     const banner = xmlText(xmlChild(system, "login-banner"));
