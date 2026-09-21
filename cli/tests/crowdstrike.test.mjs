@@ -1310,6 +1310,54 @@ test("review fix 1: API client write scopes are read from the action and group f
   assert.deepEqual(findingById(withLastUsed, "CS-18").evidence.stale_write_clients, ["stale-writer"]);
 });
 
+test("review fix 2: missing Discover and ZTA pagination totals yield manual or warn, never pass", async () => {
+  const unmanagedMissing = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? undefined : 3),
+  }));
+  const cs15 = findingById(unmanagedMissing, "CS-15");
+  assert.equal(cs15.status, "manual");
+  assert.match(cs15.summary, /did not report a server-side total \(meta\.pagination\.total\) for unmanaged assets/);
+  assert.match(cs15.summary, /Collect manually:/);
+  assert.deepEqual(cs15.evidence.totals_missing, ["unmanaged"]);
+  assert.equal(cs15.evidence.managed_assets, 3);
+
+  const managedMissing = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? 5 : undefined),
+    listDiscoverHosts: async () => [{ hostname: "printer-01", platform_name: "Other" }],
+  }));
+  assert.equal(findingById(managedMissing, "CS-15").status, "manual");
+  assert.match(findingById(managedMissing, "CS-15").summary, /for managed assets/);
+  assert.match(findingById(managedMissing, "CS-15").summary, /1 unmanaged assets were sampled as a lower bound only/);
+
+  const bothMissing = await assessCrowdstrikeSensorCoverage(createFakeClient({ countDiscoverHosts: async () => undefined }));
+  assert.equal(findingById(bothMissing, "CS-15").status, "manual");
+  assert.deepEqual(findingById(bothMissing, "CS-15").evidence.totals_missing, ["unmanaged", "managed"]);
+
+  const scoredMissing = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? 0 : undefined),
+  }));
+  const cs25 = findingById(scoredMissing, "CS-25");
+  assert.equal(cs25.status, "manual");
+  assert.match(cs25.summary, /did not report a server-side total \(meta\.pagination\.total\) for scored hosts/);
+  assert.deepEqual(cs25.evidence.totals_missing, ["scored"]);
+
+  const belowMissing = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? undefined : 100),
+    listZtaAssessments: async () => [],
+  }));
+  assert.equal(findingById(belowMissing, "CS-25").status, "warn");
+  assert.match(findingById(belowMissing, "CS-25").summary, /At least 0 of 100 scored hosts/);
+  assert.match(findingById(belowMissing, "CS-25").summary, /sampled count is a lower bound and this verdict cannot exceed warn/);
+  assert.equal(findingById(belowMissing, "CS-25").evidence.below_threshold_total_reported, false);
+
+  const belowMissingWithSamples = await assessCrowdstrikeSensorCoverage(createFakeClient({
+    countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? undefined : 10),
+    listZtaAssessments: async () => [{ aid: "aid-1", score: 20 }, { aid: "aid-2", score: 30 }],
+  }));
+  assert.equal(findingById(belowMissingWithSamples, "CS-25").status, "fail");
+  assert.equal(findingById(belowMissingWithSamples, "CS-25").evidence.hosts_below_threshold, 2);
+});
+
 test("false-pass self-check (a): every endpoint forbidden yields 25 manual findings and zero passes", async () => {
   const assessments = await runAllCrowdstrikeAssessments(createForbiddenClient());
   const findings = assessments.flatMap((assessment) => assessment.findings);

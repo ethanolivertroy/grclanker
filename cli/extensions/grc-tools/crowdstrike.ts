@@ -2410,8 +2410,26 @@ function evaluateUnmanagedAssets(
   if (managedCount.error) {
     return unreadableFinding("CS-15", "Falcon Discover managed asset count", managedCount.error, DISCOVER_CONSOLE_EVIDENCE);
   }
-  const unmanaged = unmanagedCount.data ?? 0;
-  const managed = managedCount.data ?? 0;
+  const unmanaged = unmanagedCount.data;
+  const managed = managedCount.data;
+  if (unmanaged === undefined || managed === undefined) {
+    const missingTotals = [
+      unmanaged === undefined ? "unmanaged" : undefined,
+      managed === undefined ? "managed" : undefined,
+    ].filter((label): label is string => Boolean(label));
+    return manualFinding(
+      "CS-15",
+      `Falcon Discover was readable but did not report a server-side total (meta.pagination.total) for ${missingTotals.join(" and ")} assets, so the unmanaged asset ratio cannot be computed from API data; ${samples.data.items.length} unmanaged assets were sampled as a lower bound only.`,
+      DISCOVER_CONSOLE_EVIDENCE,
+      {
+        unmanaged_assets: unmanaged,
+        managed_assets: managed,
+        totals_missing: missingTotals,
+        unmanaged_samples_seen: samples.data.items.length,
+        unmanaged_samples_truncated: samples.data.truncated,
+      },
+    );
+  }
   if (managed + unmanaged === 0) {
     return manualFinding(
       "CS-15",
@@ -2460,7 +2478,15 @@ function evaluateZeroTrust(
   if (belowTotal.error ?? belowThreshold.error) {
     return unreadableFinding("CS-25", "Zero Trust Assessment below-threshold scores", belowTotal.error ?? belowThreshold.error ?? "unknown error", ZTA_CONSOLE_EVIDENCE);
   }
-  const scored = total.data ?? 0;
+  const scored = total.data;
+  if (scored === undefined) {
+    return manualFinding(
+      "CS-25",
+      "Zero Trust Assessment was readable but did not report a server-side total (meta.pagination.total) for scored hosts, so the share of hosts below the threshold cannot be computed from API data.",
+      ZTA_CONSOLE_EVIDENCE,
+      { min_score: minScore, scored_hosts: undefined, totals_missing: ["scored"], lowest_scores_seen: belowThreshold.data.items.length },
+    );
+  }
   if (scored === 0) {
     return manualFinding(
       "CS-25",
@@ -2469,17 +2495,22 @@ function evaluateZeroTrust(
       { min_score: minScore, scored_hosts: 0 },
     );
   }
+  const belowTotalReported = belowTotal.data !== undefined;
   const below = belowTotal.data ?? belowThreshold.data.items.length;
   const pct = percentage(below, scored);
-  const status: CrowdstrikeFinding["status"] = below === 0 ? "pass" : pct <= 10 ? "warn" : "fail";
+  const computed: CrowdstrikeFinding["status"] = below === 0 ? "pass" : pct <= 10 ? "warn" : "fail";
+  const status: CrowdstrikeFinding["status"] = belowTotalReported ? computed : computed === "pass" ? "warn" : computed;
   return finding(
     "CS-25",
     status,
-    `${below} of ${scored} scored hosts (${pct}%, server-side totals) fall below the ZTA threshold of ${minScore}.`,
+    belowTotalReported
+      ? `${below} of ${scored} scored hosts (${pct}%, server-side totals) fall below the ZTA threshold of ${minScore}.`
+      : `At least ${below} of ${scored} scored hosts (${pct}%) fall below the ZTA threshold of ${minScore}; the API did not report a server-side total for the below-threshold query, so the sampled count is a lower bound and this verdict cannot exceed warn.`,
     {
       min_score: minScore,
       scored_hosts: scored,
       hosts_below_threshold: below,
+      below_threshold_total_reported: belowTotalReported,
       lowest_scores_truncated: belowThreshold.data.truncated,
       lowest_scores: belowThreshold.data.items.slice(0, 25).map((item) => ({ aid: asString(item.aid), score: asNumber(item.score) })),
     },
