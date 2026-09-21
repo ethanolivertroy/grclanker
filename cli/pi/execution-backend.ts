@@ -144,12 +144,17 @@ const SECRET_ENV_KEYS = [
   "CLOUDFLARE_API_TOKEN",
 ] as const;
 
+const PEM_BEGIN_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+const PEM_BEGIN_GLOBAL_PATTERN = new RegExp(PEM_BEGIN_PATTERN.source, "g");
+const PEM_END_PATTERN = /-----END [A-Z ]*PRIVATE KEY-----/;
+const PEM_REDACTION = "[REDACTED PRIVATE KEY]";
+
 // Secondary, format-based patterns for the providers this runtime talks to. The primary
 // mechanism is the exact values of the credential environment variables above; these
 // patterns catch the same credentials when they arrive from a remote (for example a
 // container echoing its own environment) without ever being set locally.
 const SECRET_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
-  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED PRIVATE KEY]" },
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: PEM_REDACTION },
   { pattern: /(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1[REDACTED]" },
   { pattern: /\brpa_[A-Za-z0-9]{16,}\b/g, replacement: "[REDACTED]" },
   { pattern: /\ba[ks]-[A-Za-z0-9]{12,}\b/g, replacement: "[REDACTED]" },
@@ -179,31 +184,126 @@ export type RedactingSink = {
   end: () => void;
 };
 
+// Upper bound on text the sink holds back before it flushes regardless of an open block or a
+// missing newline. Real private keys are a few KB, so a block still open at this size is not
+// a key; flushing it (with its marker neutralized) keeps a hostile stream from pinning memory.
+export const REDACTING_SINK_MAX_HELD_CHARS = 256 * 1024;
+
+// How far back the incremental END search re-reads, so an END marker straddling two writes is
+// still found. Longer than any realistic "-----END <label> PRIVATE KEY-----" marker.
+const PEM_MARKER_OVERLAP = 128;
+
+type UnflushablePemBlock = { start: number; open: boolean };
+
+// Finds the first PEM private key block that starts before `boundary` and is not complete before
+// it: `open` when its END marker has not arrived at all, closed-but-crossing the boundary otherwise.
+function findUnflushablePemBlock(text: string, boundary: number): UnflushablePemBlock | undefined {
+  let cursor = 0;
+  while (cursor < boundary) {
+    const begin = PEM_BEGIN_PATTERN.exec(text.slice(cursor, boundary));
+    if (!begin) return undefined;
+    const start = cursor + begin.index;
+    const bodyStart = start + begin[0].length;
+    const end = PEM_END_PATTERN.exec(text.slice(bodyStart));
+    if (!end) return { start, open: true };
+    const blockEnd = bodyStart + end.index + end[0].length;
+    if (blockEnd > boundary) return { start, open: false };
+    cursor = blockEnd;
+  }
+  return undefined;
+}
+
+// The Bearer pattern allows whitespace (including a newline) between the word and the token, so
+// a line that ends in "Bearer" is held until the next line arrives. Only the tail of the
+// flushable text can match, so only the tail is examined.
+const BEARER_TAIL_WINDOW = 64;
+
+function findDanglingBearerStart(text: string, boundary: number): number | undefined {
+  const windowStart = Math.max(0, boundary - BEARER_TAIL_WINDOW);
+  const tail = /Bearer\s*$/.exec(text.slice(windowStart, boundary));
+  return tail ? windowStart + tail.index : undefined;
+}
+
 // Streams are redacted per completed line so a credential split across two chunks is still
-// caught; the trailing partial line is held until the next newline or `end()`.
+// caught, and the sink never flushes through an open PEM block: from a `-----BEGIN ... PRIVATE
+// KEY-----` marker onward, text is held until the matching END marker arrives (so a
+// line-at-a-time producer cannot leak the header and body one line at a time), until `end()`,
+// or until the held buffer reaches the cap. A block still open at that point has its BEGIN
+// marker replaced before the flush so it can never be emitted verbatim.
 export function createRedactingSink(
   onData: ((chunk: Buffer) => void) | undefined,
   extraSecrets: Array<string | undefined> = [],
 ): RedactingSink {
   const decoder = new StringDecoder("utf8");
   let pending = "";
+  // Set while a PEM block is known to be open: where it starts in `pending` and how far the END
+  // search has already looked, so a long body is not rescanned on every write.
+  let openBlock: { start: number; searched: number } | undefined;
+
   const emit = (text: string) => {
     if (text.length === 0 || !onData) return;
     onData(Buffer.from(redactSecrets(text, extraSecrets), "utf8"));
   };
+
+  const flushEverything = () => {
+    openBlock = undefined;
+    if (pending.length === 0 || !onData) {
+      pending = "";
+      return;
+    }
+    const scrubbed = redactSecrets(pending, extraSecrets).replace(PEM_BEGIN_GLOBAL_PATTERN, PEM_REDACTION);
+    pending = "";
+    onData(Buffer.from(scrubbed, "utf8"));
+  };
+
+  // Returns the index from which `pending` must be held back, or undefined when everything up to
+  // `boundary` may be flushed.
+  const findHoldStart = (boundary: number): number | undefined => {
+    if (openBlock) {
+      const from = Math.max(openBlock.start, openBlock.searched - PEM_MARKER_OVERLAP);
+      if (!PEM_END_PATTERN.test(pending.slice(from))) {
+        openBlock.searched = pending.length;
+        return openBlock.start;
+      }
+      openBlock = undefined;
+    }
+    const block = findUnflushablePemBlock(pending, boundary);
+    if (!block) return undefined;
+    if (block.open) openBlock = { start: block.start, searched: pending.length };
+    return block.start;
+  };
+
+  const flushCompletedLines = () => {
+    const lastNewline = pending.lastIndexOf("\n");
+    if (lastNewline === -1) return;
+    let boundary = lastNewline + 1;
+    const holdStart = findHoldStart(boundary);
+    if (holdStart !== undefined) boundary = holdStart;
+    const danglingBearer = findDanglingBearerStart(pending, boundary);
+    if (danglingBearer !== undefined) boundary = danglingBearer;
+    if (boundary === 0) return;
+    emit(pending.slice(0, boundary));
+    pending = pending.slice(boundary);
+    if (openBlock) {
+      openBlock.start -= boundary;
+      openBlock.searched -= boundary;
+    }
+  };
+
   return {
     write(chunk) {
       if (!onData) return;
-      pending += decoder.write(chunk);
-      const lastNewline = pending.lastIndexOf("\n");
-      if (lastNewline === -1) return;
-      emit(pending.slice(0, lastNewline + 1));
-      pending = pending.slice(lastNewline + 1);
+      const text = decoder.write(chunk);
+      if (text.length === 0) return;
+      pending += text;
+      // Only a newline can complete a flush group, so chunks without one skip the scan and the
+      // string flattening it forces.
+      if (text.includes("\n")) flushCompletedLines();
+      if (pending.length >= REDACTING_SINK_MAX_HELD_CHARS) flushEverything();
     },
     end() {
       pending += decoder.end();
-      emit(pending);
-      pending = "";
+      flushEverything();
     },
   };
 }

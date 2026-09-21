@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -54,9 +54,11 @@ import {
   assertSafeSessionId,
   createRedactingSink,
   ExecutionBackendTimeoutError,
+  REDACTING_SINK_MAX_HELD_CHARS,
   redactSecrets,
 } from "../dist/pi/execution-backend.js";
 import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
+import { quoteForBash } from "../dist/pi/shell.js";
 
 const RUNPOD_POD_JSON = JSON.stringify({
   id: "pod42",
@@ -814,17 +816,116 @@ test("redacting sink catches a secret split across streamed chunks", () => {
   });
 });
 
-test("every backend output path redacts credentials echoed by the remote", async () => {
+const FAKE_PEM_BODY = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW", "QyNTUxOQAAACBmYWtlIGtleSBib2R5IGZvciB0ZXN0cyBvbmx5AAAAAAAAAAAAAAAAAAA"];
+const FAKE_PEM = `-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY.join("\n")}\n-----END OPENSSH PRIVATE KEY-----\n`;
+
+// Chunking strategies a producer can exhibit: one write, a line-flushing script or tty, and a
+// byte-at-a-time trickle (which also splits multi-byte characters).
+const CHUNKERS = {
+  "one-shot": (text) => [Buffer.from(text, "utf8")],
+  "per-line": (text) => text.split(/(?<=\n)/).map((line) => Buffer.from(line, "utf8")),
+  "byte-at-a-time": (text) => [...Buffer.from(text, "utf8")].map((byte) => Buffer.from([byte])),
+};
+
+function collectSink(text, chunker, extraSecrets = []) {
+  const chunks = [];
+  const sink = createRedactingSink((chunk) => chunks.push(chunk.toString("utf8")), extraSecrets);
+  for (const chunk of chunker(text)) sink.write(chunk);
+  const beforeEnd = chunks.join("");
+  sink.end();
+  return { chunks, beforeEnd, joined: chunks.join("") };
+}
+
+test("redacting sink never flushes through an open PEM block under any chunking", () => {
+  const text = `before\n./notes.md:${FAKE_PEM}after\n`;
+  for (const [strategy, chunker] of Object.entries(CHUNKERS)) {
+    const { joined } = collectSink(text, chunker);
+    assert.equal(joined, "before\n./notes.md:[REDACTED PRIVATE KEY]\nafter\n", strategy);
+  }
+
+  // Per-line delivery: lines before the marker flow immediately, the block is held until END.
+  const chunks = [];
+  const sink = createRedactingSink((chunk) => chunks.push(chunk.toString("utf8")));
+  sink.write(Buffer.from("before\n"));
+  sink.write(Buffer.from("./notes.md:-----BEGIN OPENSSH PRIVATE KEY-----\n"));
+  assert.deepEqual(chunks, ["before\n", "./notes.md:"]);
+  for (const line of FAKE_PEM_BODY) sink.write(Buffer.from(`${line}\n`));
+  assert.deepEqual(chunks, ["before\n", "./notes.md:"], "body lines stay held while the block is open");
+  sink.write(Buffer.from("-----END OPENSSH PRIVATE KEY-----"));
+  assert.deepEqual(chunks, ["before\n", "./notes.md:"], "END without a newline is still a partial line");
+  sink.write(Buffer.from("\nafter\n"));
+  assert.deepEqual(chunks, ["before\n", "./notes.md:", "[REDACTED PRIVATE KEY]\nafter\n"]);
+  sink.end();
+  assert.equal(chunks.join(""), "before\n./notes.md:[REDACTED PRIVATE KEY]\nafter\n");
+
+  // A closed block followed by an open one: the closed block is redacted, the open one held.
+  const two = collectSink(`${FAKE_PEM}-----BEGIN RSA PRIVATE KEY-----\n${FAKE_PEM_BODY[0]}\n`, CHUNKERS["per-line"]);
+  assert.equal(two.beforeEnd, "[REDACTED PRIVATE KEY]\n");
+  assert.equal(two.joined, `[REDACTED PRIVATE KEY]\n[REDACTED PRIVATE KEY]\n${FAKE_PEM_BODY[0]}\n`);
+});
+
+test("redacting sink neutralizes a never-closed PEM block at end() and at the hold cap", () => {
+  const unterminated = collectSink(`-----BEGIN OPENSSH PRIVATE KEY-----\n${FAKE_PEM_BODY[0]}\n`, CHUNKERS["per-line"]);
+  assert.equal(unterminated.beforeEnd, "", "nothing is emitted while the block is open");
+  assert.equal(unterminated.joined, `[REDACTED PRIVATE KEY]\n${FAKE_PEM_BODY[0]}\n`);
+
+  const chunks = [];
+  const sink = createRedactingSink((chunk) => chunks.push(chunk.toString("utf8")));
+  sink.write(Buffer.from("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
+  const filler = `${"x".repeat(1023)}\n`;
+  let written = 0;
+  while (chunks.length === 0 && written < REDACTING_SINK_MAX_HELD_CHARS * 2) {
+    sink.write(Buffer.from(filler));
+    written += filler.length;
+  }
+  assert.ok(chunks.length > 0, "the held buffer is flushed once it reaches the cap");
+  assert.ok(written <= REDACTING_SINK_MAX_HELD_CHARS + filler.length);
+  assert.ok(chunks[0].startsWith("[REDACTED PRIVATE KEY]\n"), "the marker is replaced before the forced flush");
+  assert.ok(!chunks.join("").includes("BEGIN OPENSSH"));
+  sink.write(Buffer.from("later line\n"));
+  assert.equal(chunks.at(-1), "later line\n", "the sink is back to per-line flushing after the forced flush");
+  sink.end();
+
+  // A long single line without a newline is bounded by the same cap.
+  const single = [];
+  const singleSink = createRedactingSink((chunk) => single.push(chunk.toString("utf8")));
+  singleSink.write(Buffer.from("y".repeat(REDACTING_SINK_MAX_HELD_CHARS)));
+  assert.equal(single.length, 1);
+  singleSink.end();
+});
+
+test("redacting sink holds a dangling Bearer for the token on the next line", () => {
+  const chunks = [];
+  const sink = createRedactingSink((chunk) => chunks.push(chunk.toString("utf8")));
+  sink.write(Buffer.from("Authorization: Bearer\n"));
+  assert.deepEqual(chunks, ["Authorization: "], "a line ending in Bearer waits for the next line");
+  sink.write(Buffer.from("abcdefghijklmnopqrstuvwxyz\n"));
+  assert.deepEqual(chunks, ["Authorization: ", "Bearer\n[REDACTED]\n"], "the token on the next line is redacted, the whitespace is kept");
+  sink.write(Buffer.from("plain\nBearer   "));
+  sink.end();
+  assert.equal(chunks.join(""), "Authorization: Bearer\n[REDACTED]\nplain\nBearer   ");
+
+  for (const [strategy, chunker] of Object.entries(CHUNKERS)) {
+    const { joined } = collectSink("Authorization: Bearer\nabcdefghijklmnopqrstuvwxyz\ndone\n", chunker);
+    assert.equal(joined, "Authorization: Bearer\n[REDACTED]\ndone\n", strategy);
+  }
+});
+
+test("every backend output path redacts credentials echoed by the remote under every chunking", async () => {
   const envSecret = "fake-distinctive-secret-9f8e7d6c";
   const remoteOnlySecret = "rpa_REMOTEONLYKEY0123456789ABCDEF";
-  const leak = `token=${envSecret} remote=${remoteOnlySecret}\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\ntail without newline ${envSecret}`;
-  const leaks = (text) => text.includes(envSecret) || text.includes(remoteOnlySecret) || text.includes("BEGIN OPENSSH PRIVATE KEY");
-  const assertClean = (kind, ...texts) => {
+  const leak = `token=${envSecret} remote=${remoteOnlySecret} café\n${FAKE_PEM}tail without newline ${envSecret}`;
+  const leaks = (text) => text.includes(envSecret)
+    || text.includes(remoteOnlySecret)
+    || text.includes("BEGIN OPENSSH PRIVATE KEY")
+    || FAKE_PEM_BODY.some((line) => text.includes(line));
+  const assertClean = (label, ...texts) => {
     for (const text of texts) {
-      assert.ok(!leaks(text), `${kind} surfaced a credential: ${text}`);
+      assert.ok(!leaks(text), `${label} surfaced a credential: ${text}`);
     }
-    assert.ok(texts.some((text) => text.includes("[REDACTED]")), `${kind} produced no redaction marker`);
+    assert.ok(texts.some((text) => text.includes("[REDACTED]")), `${label} produced no redaction marker`);
   };
+  const expectedStream = `token=[REDACTED] remote=[REDACTED] café\n[REDACTED PRIVATE KEY]\ntail without newline [REDACTED]`;
 
   await withEnv({
     RUNPOD_API_KEY: envSecret,
@@ -833,11 +934,9 @@ test("every backend output path redacts credentials echoed by the remote", async
     MODAL_TOKEN_ID: "ak-FAKEID0123456789ABCD",
     MODAL_TOKEN_SECRET: "as-FAKESECRET0123456789",
   }, async () => {
-    const leakyRunner = async (_executable, args, options = {}) => {
+    const makeLeakyRunner = (chunker) => async (_executable, args, options = {}) => {
       if (options.onData) {
-        const split = Math.floor(leak.length / 2);
-        options.onData(Buffer.from(leak.slice(0, split), "utf8"));
-        options.onData(Buffer.from(leak.slice(split), "utf8"));
+        for (const chunk of chunker(leak)) options.onData(chunk);
       }
       if (args[0] === "exec" && String(args.at(-1)).includes("test -d")) return { exitCode: 0, stdout: "ok", stderr: "" };
       if (["info", "--version", "list"].includes(args[0])) return { exitCode: 0, stdout: "ok", stderr: "" };
@@ -856,7 +955,7 @@ test("every backend output path redacts credentials echoed by the remote", async
       return new Response("{}", { status: 200 });
     };
 
-    const runExec = async (kind, backend) => {
+    const runExec = async (label, backend) => {
       const chunks = [];
       const staged = await backend.stageWorkspace({ localPath: "/repo", sessionId: "leak" });
       const result = await backend.exec({
@@ -865,28 +964,46 @@ test("every backend output path redacts credentials echoed by the remote", async
         cwd: staged.remotePath,
         onData: (chunk) => chunks.push(chunk.toString("utf8")),
       });
-      assertClean(kind, chunks.join(""), result.stdout, result.stderr);
+      const streamed = chunks.join("");
+      assertClean(label, streamed, result.stdout, result.stderr);
+      assert.ok(streamed.includes("café"), `${label} corrupted a multi-byte character`);
       await backend.teardown("leak");
+      return streamed;
     };
 
-    for (const kind of ["docker", "parallels-vm", "modal", "runpod-pod", "runpod-serverless"]) {
-      const settings = { computeBackend: kind, parallelsTemplateName: "tpl" };
-      await runExec(kind, createExecutionBackend("/repo", settings, { runner: leakyRunner, fetch: leakyFetch }, kind));
+    for (const [strategy, chunker] of Object.entries(CHUNKERS)) {
+      const runner = makeLeakyRunner(chunker);
+      for (const kind of ["docker", "parallels-vm", "modal", "runpod-pod"]) {
+        const settings = { computeBackend: kind, parallelsTemplateName: "tpl" };
+        const streamed = await runExec(`${kind} (${strategy})`, createExecutionBackend("/repo", settings, { runner, fetch: leakyFetch }, kind));
+        assert.equal(streamed, expectedStream, `${kind} (${strategy})`);
+      }
+      const sandboxStream = await runExec(
+        `sandbox-runtime (${strategy})`,
+        createSandboxRuntimeBackend({ runner, wrapCommand: async (command) => command }),
+      );
+      assert.equal(sandboxStream, expectedStream, `sandbox-runtime (${strategy})`);
+
+      const runtimeChunks = [];
+      await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
+        await execution.bashOperations.exec("env", "/repo", { onData: (chunk) => runtimeChunks.push(chunk.toString("utf8")) });
+        assert.equal(runtimeChunks.join(""), expectedStream, `docker runtime (${strategy})`);
+        // File content round-trips through the edit tool, so reads keep the raw bytes rather
+        // than writing a redaction marker back into the file.
+        const roundTrip = (await execution.editOperations.readFile("/repo/.env")).toString("utf8");
+        assert.equal(roundTrip, leak);
+      }, { runner });
     }
-    await runExec("sandbox-runtime", createSandboxRuntimeBackend({ runner: leakyRunner, wrapCommand: async (command) => command }));
 
-    const runtimeChunks = [];
-    await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
-      await execution.bashOperations.exec("env", "/repo", { onData: (chunk) => runtimeChunks.push(chunk.toString("utf8")) });
-      assertClean("docker runtime", runtimeChunks.join(""));
-      // File content round-trips through the edit tool, so reads keep the raw bytes rather
-      // than writing a redaction marker back into the file.
-      const roundTrip = (await execution.editOperations.readFile("/repo/.env")).toString("utf8");
-      assert.equal(roundTrip, leak);
-    }, { runner: leakyRunner });
+    // Serverless output arrives whole from /status, so there is a single delivery to check.
+    const serverless = await runExec(
+      "runpod-serverless",
+      createExecutionBackend("/repo", { computeBackend: "runpod-serverless" }, { fetch: leakyFetch }, "runpod-serverless"),
+    );
+    assert.equal(serverless, `${expectedStream}stderr [REDACTED]`);
 
-    const hostChunks = [];
     const host = resolveComputeBackendExecution(tmpdir(), { computeBackend: "host" });
+    const hostChunks = [];
     const hostResult = await host.bashOperations.exec(
       "printf '%s\\n' \"key=$RUNPOD_API_KEY\"; printf 'no newline %s' \"$RUNPOD_API_KEY\"",
       tmpdir(),
@@ -895,6 +1012,27 @@ test("every backend output path redacts credentials echoed by the remote", async
     assert.equal(hostResult.exitCode, 0);
     assertClean("host", hostChunks.join(""));
     assert.equal(hostChunks.join(""), "key=[REDACTED]\nno newline [REDACTED]");
+
+    // A real shell streaming a key file line at a time, the way a tty-attached or line-flushing
+    // producer would deliver it.
+    const keyDir = mkdtempSync(join(tmpdir(), "grclanker-pem-"));
+    const keyPath = join(keyDir, "id_ed25519");
+    writeFileSync(keyPath, FAKE_PEM);
+    try {
+      const pemChunks = [];
+      const pemResult = await host.bashOperations.exec(
+        `while IFS= read -r l; do printf '%s\\n' "$l"; sleep 0.05; done < ${quoteForBash(keyPath)}; printf 'done\\n'`,
+        keyDir,
+        { onData: (chunk) => pemChunks.push(chunk.toString("utf8")) },
+      );
+      assert.equal(pemResult.exitCode, 0);
+      const streamed = pemChunks.join("");
+      assert.ok(!streamed.includes("BEGIN OPENSSH PRIVATE KEY"), streamed);
+      assert.ok(!FAKE_PEM_BODY.some((line) => streamed.includes(line)), streamed);
+      assert.equal(streamed, "[REDACTED PRIVATE KEY]\ndone\n");
+    } finally {
+      rmSync(keyDir, { recursive: true, force: true });
+    }
   });
 });
 
