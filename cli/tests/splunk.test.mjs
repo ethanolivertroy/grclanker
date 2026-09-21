@@ -502,6 +502,164 @@ test("audit.conf [auditTrail] queueing is read explicitly: absent file assumes t
   assert.equal(forbidden.errors.length, 1);
 });
 
+async function dataProtectionWithOutputs(entries) {
+  return assessSplunkDataProtection(client({ ...HARDENED, "/services/configs/conf-outputs": entries }).client);
+}
+
+test("review fix 1: an explicit useSSL=false fails control 15 even when a clientCert is present", async () => {
+  const result = await dataProtectionWithOutputs([entry("tcpout:primary", { useSSL: "false", clientCert: "/opt/splunk/etc/auth/client.pem", sslPassword: "password" })]);
+  const forwarding = byId(result, "SPLUNK-DP-15");
+  assert.equal(forwarding.status, "fail");
+  assert.match(forwarding.summary, /useSSL=false explicitly disables TLS regardless of certificate settings/);
+  assert.equal(forwarding.evidence.targets[0].mode, "plaintext");
+  assert.equal(forwarding.evidence.targets[0].clientCert, "/opt/splunk/etc/auth/client.pem");
+
+  const explicit = await dataProtectionWithOutputs([entry("tcpout:primary", { useSSL: "true" })]);
+  assert.equal(byId(explicit, "SPLUNK-DP-15").status, "pass");
+  assert.match(byId(explicit, "SPLUNK-DP-15").summary, /useSSL=true explicitly/);
+});
+
+test("review fix 2: sslPassword is never TLS evidence and legacy mode with a clientCert caps at warn", async () => {
+  const passwordOnly = await dataProtectionWithOutputs([entry("tcpout:primary", { server: "idx:9997", sslPassword: "password" })]);
+  const finding = byId(passwordOnly, "SPLUNK-DP-15");
+  assert.equal(finding.status, "fail");
+  assert.match(finding.summary, /useSSL unset \(documented default legacy\) with no clientCert/);
+  assert.equal(finding.evidence.targets[0].sslPassword_present, true);
+  assert.match(finding.evidence.sslPassword_note, /not treated as TLS evidence/);
+
+  const legacyWithCert = await dataProtectionWithOutputs([entry("tcpout:primary", { useSSL: "legacy", clientCert: "/opt/splunk/etc/auth/client.pem" })]);
+  assert.equal(byId(legacyWithCert, "SPLUNK-DP-15").status, "warn");
+  assert.match(byId(legacyWithCert, "SPLUNK-DP-15").summary, /only infer TLS/);
+  assert.equal(byId(legacyWithCert, "SPLUNK-DP-15").evidence.targets[0].mode, "inferred_from_clientCert");
+
+  const unsetWithCert = await dataProtectionWithOutputs([entry("tcpout:primary", { clientCert: "/opt/splunk/etc/auth/client.pem" })]);
+  assert.equal(byId(unsetWithCert, "SPLUNK-DP-15").status, "warn");
+});
+
+test("review fix 3: useSSL set once in the global [tcpout] stanza applies to every target group and can be overridden per group or server", async () => {
+  const inherited = await dataProtectionWithOutputs([
+    entry("tcpout", { defaultGroup: "primary", useSSL: "true" }),
+    entry("tcpout:primary", { server: "idx1:9997,idx2:9997" }),
+    entry("tcpout:secondary", { server: "idx3:9997" }),
+  ]);
+  const finding = byId(inherited, "SPLUNK-DP-15");
+  assert.equal(finding.status, "pass");
+  assert.match(finding.summary, /2 inherit it from the global \[tcpout\] stanza/);
+  assert.ok(finding.evidence.targets.every((item) => item.useSSL_source === "global [tcpout]"));
+  assert.equal(finding.evidence.global_tcpout.useSSL, "true");
+
+  const overridden = await dataProtectionWithOutputs([
+    entry("tcpout", { useSSL: "true" }),
+    entry("tcpout:primary", { server: "idx1:9997,idx2:9997" }),
+    entry("tcpout-server://idx2:9997", { useSSL: "false" }),
+  ]);
+  const overriddenFinding = byId(overridden, "SPLUNK-DP-15");
+  assert.equal(overriddenFinding.status, "fail");
+  assert.match(overriddenFinding.summary, /tcpout-server:\/\/idx2:9997/);
+  assert.equal(overriddenFinding.evidence.targets.find((item) => item.target === "tcpout:primary").mode, "explicit_tls");
+
+  const groupOverride = await dataProtectionWithOutputs([entry("tcpout", { useSSL: "true" }), entry("tcpout:primary", { useSSL: "false" })]);
+  assert.equal(byId(groupOverride, "SPLUNK-DP-15").status, "fail");
+});
+
+async function platformWithReceivers(cooked, inputs) {
+  const fixture = { ...HARDENED, "/services/data/inputs/tcp/cooked": cooked };
+  if (inputs === undefined) delete fixture["/services/configs/conf-inputs"];
+  else fixture["/services/configs/conf-inputs"] = inputs;
+  return assessSplunkPlatformHardening(client(fixture).client);
+}
+
+const HARDENED_SSL_STANZA = entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem", requireClientCert: 1 });
+
+test("review fix 4: a listener name containing ssl never upgrades an explicit plaintext receiver", async () => {
+  const named = await platformWithReceivers(
+    [entry("ssl9997", { disabled: 0, SSL: 0 }), entry("sslhost.example.com:9998", { disabled: 0 })],
+    [entry("splunktcp://ssl9997", { disabled: 0 }), entry("splunktcp://sslhost.example.com:9998", { disabled: 0 }), HARDENED_SSL_STANZA],
+  );
+  const finding = byId(named, "SPLUNK-PLAT-23");
+  assert.equal(finding.status, "fail");
+  assert.match(finding.summary, /2 of 2 enabled S2S listeners are plaintext/);
+  assert.deepEqual(finding.evidence.listeners.map((item) => item.port).sort(), ["9997", "9998"]);
+
+  const mixed = await platformWithReceivers(
+    [entry("9997", { disabled: 0 }), entry("9998", { disabled: 0 })],
+    [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("splunktcp://9998", { disabled: 0 }), HARDENED_SSL_STANZA],
+  );
+  assert.equal(byId(mixed, "SPLUNK-PLAT-23").status, "fail");
+  assert.match(byId(mixed, "SPLUNK-PLAT-23").summary, /ports 9998/);
+});
+
+test("review fix 5: control 23 decides TLS from inputs.conf [splunktcp-ssl:*] and [SSL], never from the cooked REST view alone", async () => {
+  const cookedOnly = await platformWithReceivers([entry("9997", { disabled: 0, SSL: 1 })], undefined);
+  const unknown = byId(cookedOnly, "SPLUNK-PLAT-23");
+  assert.equal(unknown.status, "manual");
+  assert.match(unknown.summary, /conf-inputs could not be read/);
+  assert.match(unknown.summary, /does not report TLS/);
+
+  const noStanza = await platformWithReceivers([entry("9997", { disabled: 0, SSL: 1 })], [HARDENED_SSL_STANZA]);
+  assert.equal(byId(noStanza, "SPLUNK-PLAT-23").status, "manual");
+  assert.match(byId(noStanza, "SPLUNK-PLAT-23").summary, /no \[splunktcp-ssl:<port>\] stanza/);
+
+  const noRequire = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("SSL", { serverCert: "/opt/splunk/etc/auth/server.pem" })]);
+  assert.equal(byId(noRequire, "SPLUNK-PLAT-23").status, "warn");
+  assert.match(byId(noRequire, "SPLUNK-PLAT-23").summary, /documented default varies with the certificate in use/);
+
+  const noCert = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("SSL", { requireClientCert: 1 })]);
+  assert.equal(byId(noCert, "SPLUNK-PLAT-23").status, "warn");
+  assert.match(byId(noCert, "SPLUNK-PLAT-23").summary, /serverCert is absent/);
+
+  const missingSsl = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 })]);
+  assert.equal(byId(missingSsl, "SPLUNK-PLAT-23").status, "warn");
+  assert.match(byId(missingSsl, "SPLUNK-PLAT-23").summary, /no \[SSL\] stanza/);
+
+  const hardened = await platformWithReceivers([entry("9997", { disabled: 0 })], [entry("splunktcp-ssl:9997", { disabled: 0 }), HARDENED_SSL_STANZA]);
+  assert.equal(byId(hardened, "SPLUNK-PLAT-23").status, "pass");
+  assert.match(byId(hardened, "SPLUNK-PLAT-23").summary, /\[splunktcp-ssl:\*\] receivers \(ports 9997\) with \[SSL\] serverCert set and requireClientCert=true/);
+
+  const confOnly = await platformWithReceivers([], [entry("splunktcp-ssl:9997", { disabled: 0 }), entry("splunktcp://9996", { disabled: 1 }), HARDENED_SSL_STANZA]);
+  assert.equal(byId(confOnly, "SPLUNK-PLAT-23").status, "pass");
+  assert.equal(byId(confOnly, "SPLUNK-PLAT-23").evidence.listeners.length, 1);
+});
+
+test("review fix 6: an absent sslVersions is an unknown default and caps control 13 at warn", async () => {
+  const fixture = { ...HARDENED, "/services/configs/conf-server": [entry("general", { sessionTimeout: "30m" }), entry("sslConfig", { enableSplunkdSSL: 1, requireClientCert: 1 })] };
+  const result = await assessSplunkDataProtection(client(fixture).client);
+  const tls = byId(result, "SPLUNK-DP-13");
+  assert.equal(tls.status, "warn");
+  assert.match(tls.summary, /sslVersions absent and its documented default varies by release/);
+  assert.doesNotMatch(tls.summary, /tls1\.2 \(default\)|default tls1\.2 assumed/);
+  assert.equal(tls.evidence.unknown_defaults.length, 1);
+  assert.equal(byId(await assessSplunkDataProtection(client(HARDENED).client), "SPLUNK-DP-13").status, "pass");
+});
+
+test("review fix 7: non-admin roles without srchIndexesAllowed are never counted as lacking _audit or _internal access", async () => {
+  const someMissing = {
+    ...HARDENED,
+    "/services/authorization/roles": [
+      entry("admin", { capabilities: ["admin_all_objects"], srchIndexesAllowed: ["*", "_*"] }),
+      entry("user", { capabilities: ["search"], srchIndexesAllowed: ["main"] }),
+      entry("opaque", { capabilities: ["search"] }),
+    ],
+  };
+  const partial = await assessSplunkAccessControl(client(someMissing).client);
+  const indexAccess = byId(partial, "SPLUNK-AC-10");
+  assert.equal(indexAccess.status, "warn");
+  assert.match(indexAccess.summary, /1 of 2 non-admin roles did not expose srchIndexesAllowed \(opaque\)/);
+  assert.match(indexAccess.summary, /not counted as granted/);
+  assert.deepEqual(indexAccess.evidence.roles_without_srchIndexesAllowed_field, ["opaque"]);
+  const searchScope = byId(partial, "SPLUNK-AC-09");
+  assert.equal(searchScope.status, "warn");
+  assert.match(searchScope.summary, /not counted as unrestricted/);
+
+  const allMissing = { ...HARDENED, "/services/authorization/roles": [entry("admin", { capabilities: ["admin_all_objects"], srchIndexesAllowed: ["*", "_*"] }), entry("opaque", { capabilities: ["search"] })] };
+  const unknown = await assessSplunkAccessControl(client(allMissing).client);
+  assert.equal(byId(unknown, "SPLUNK-AC-10").status, "manual");
+  assert.match(byId(unknown, "SPLUNK-AC-10").summary, /Unknown: no non-admin role exposed the srchIndexesAllowed field/);
+
+  const explicit = await assessSplunkAccessControl(client({ ...someMissing, "/services/authorization/roles": [...someMissing["/services/authorization/roles"], entry("leaky", { capabilities: ["search"], imported_srchIndexesAllowed: ["_*"] })] }).client);
+  assert.equal(byId(explicit, "SPLUNK-AC-10").status, "fail");
+});
+
 test("exportSplunkAuditBundle writes core_data, analysis, compliance reports, quick reference, errors log, and a paired zip", async () => {
   const base = createTempBase("grclanker-splunk-export-");
   const partialFailure = { ...HARDENED };
@@ -515,7 +673,7 @@ test("exportSplunkAuditBundle writes core_data, analysis, compliance reports, qu
   assert.ok(result.errorCount >= 1);
   for (const file of [
     "QUICK_REFERENCE.md", "_errors.log", "metadata.json", "analysis/findings.json", "analysis/authentication.json", "analysis/platform_hardening.json",
-    "core_data/server_info.json", "core_data/roles.json", "core_data/access_check.json",
+    "core_data/server_info.json", "core_data/roles.json", "core_data/access_check.json", "core_data/conf_outputs.json", "core_data/conf_inputs.json",
     "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md", "compliance/fedramp.md", "compliance/cmmc.md", "compliance/soc2.md", "compliance/cis.md", "compliance/pci.md", "compliance/stig.md", "compliance/irap.md", "compliance/ismap.md",
   ]) {
     assert.ok(existsSync(join(result.outputDir, file)), file);
