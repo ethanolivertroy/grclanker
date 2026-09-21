@@ -598,20 +598,24 @@ export function resolvePaloaltoConfiguration(
   const sourceChain: string[] = [];
   const configFile = readConfigFile(asString(input.config_file) ?? asString(env.PALOALTO_CONFIG_FILE));
 
+  const ranks = new Map<string, number>();
   const pick = (argKey: string, envKey: string, label: string): string | undefined => {
     const fromArgs = asString(input[argKey]);
     if (fromArgs) {
       sourceChain.push(`arguments-${label}`);
+      ranks.set(argKey, 3);
       return fromArgs;
     }
     const fromEnv = asString(env[envKey]);
     if (fromEnv) {
       sourceChain.push(`environment-${label}`);
+      ranks.set(argKey, 2);
       return fromEnv;
     }
     const fromFile = asString(configFile[envKey]) ?? asString(configFile[argKey]);
     if (fromFile) {
       sourceChain.push(`config-file-${label}`);
+      ranks.set(argKey, 1);
       return fromFile;
     }
     return undefined;
@@ -628,9 +632,12 @@ export function resolvePaloaltoConfiguration(
   }
 
   const panosHostsRaw = pick("panos_hosts", "PANOS_HOST", "panos-host") ?? asString(input.panos_host);
-  const panosApiKey = pick("panos_api_key", "PANOS_API_KEY", "panos-api-key");
+  const pickedApiKey = pick("panos_api_key", "PANOS_API_KEY", "panos-api-key");
   const panosUsername = pick("panos_username", "PANOS_USERNAME", "panos-username");
   const panosPassword = pick("panos_password", "PANOS_PASSWORD", "panos-password");
+  const credentialsOutrankKey = Boolean(panosUsername && panosPassword)
+    && Math.min(ranks.get("panos_username") ?? 0, ranks.get("panos_password") ?? 0) > (ranks.get("panos_api_key") ?? 0);
+  const panosApiKey = credentialsOutrankKey ? undefined : pickedApiKey;
   const panosHosts = splitList(panosHostsRaw);
   if (panosHosts.length > 0 && !panosApiKey && !(panosUsername && panosPassword)) {
     throw new Error("PAN-OS requires PANOS_API_KEY or both PANOS_USERNAME and PANOS_PASSWORD for keygen.");
