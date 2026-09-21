@@ -26,6 +26,7 @@
     "prepack": "npm run build",
     "test:cli": "npm run build && node --test \"tests/*.test.mjs\"",
     "test:duo:live": "npm run build && node scripts/duo-live-smoke.mjs",
+    "test:gcp:live": "npm run build && node scripts/gcp-live-smoke.mjs",
     "test:github:live": "npm run build && node scripts/github-live-smoke.mjs",
     "test:gws-ops:live": "npm run build && node scripts/gws-ops-live-smoke.mjs",
     "test:gws:live": "npm run build && node scripts/gws-live-smoke.mjs",
