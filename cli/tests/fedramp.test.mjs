@@ -17,6 +17,10 @@ import {
 } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { buildFedrampDocsSnapshot } from "../dist/extensions/grc-tools/fedramp-docs.js";
 import {
+  persistentCachesEnabled,
+  runWithoutPersistentCaches,
+} from "../dist/extensions/grc-tools/shared.js";
+import {
   buildFedrampAdsSite,
   buildFedrampAdsStarterBundle,
   buildFedrampAdsPackagePlan,
@@ -336,6 +340,45 @@ test("loadFedrampCatalog writes cache and falls back to stale disk data if refre
     globalThis.fetch = originalFetch;
     clearFedrampCachesForTests();
     rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("loadFedrampCatalog and inspectFedrampOfficialSources keep caches in memory when persistent caches are disabled", async () => {
+  const originalFetch = globalThis.fetch;
+  const homeDir = join(mkdtempSync(join(tmpdir(), "grclanker-fedramp-nopersist-")), ".grclanker");
+  const fedrampStateDir = join(homeDir, ".state", "fedramp");
+
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url === "https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json") {
+      return jsonResponse(consolidatedRulesFixture);
+    }
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+
+  clearFedrampCachesForTests();
+
+  try {
+    assert.equal(persistentCachesEnabled(), true);
+
+    const status = await runWithoutPersistentCaches(async () => {
+      assert.equal(persistentCachesEnabled(), false);
+      const catalog = await loadFedrampCatalog({ refresh: true, homeDir });
+      assert.equal(catalog.cacheStatus, "live");
+      return inspectFedrampOfficialSources({ refresh: true, homeDir });
+    });
+
+    assert.equal(status.cacheStatus, "live");
+    assert.equal(persistentCachesEnabled(), true);
+    assert.equal(existsSync(homeDir), false, "dry runs must not create the grclanker home");
+
+    clearFedrampCachesForTests();
+    await loadFedrampCatalog({ refresh: true, homeDir });
+    assert.equal(existsSync(join(fedrampStateDir, "catalog.json")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFedrampCachesForTests();
+    rmSync(join(homeDir, ".."), { recursive: true, force: true });
   }
 });
 

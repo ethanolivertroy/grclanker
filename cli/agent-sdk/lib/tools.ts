@@ -1,10 +1,21 @@
 import type { JsonObject, JsonSchemaObject } from "@cursor/july";
 import type { ToolContext, ToolExecuteResult } from "@cursor/july/tools";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
+import { runWithoutPersistentCaches } from "../../extensions/grc-tools/shared.js";
 import { classifyGrcToolEffect, type GrcToolEffect, isGrcWriteTool } from "./effects.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
 import { errorEnvelope, toSdkToolResult } from "./results.js";
 import { toJsonSchema } from "./schema.js";
+
+/**
+ * The slice of the Agent SDK `ToolContext` the adapter reads: the call id
+ * and the session's dry-run flag (`SessionInfo.dryRun`, true when the host
+ * answers write-classified calls instead of running them).
+ */
+export interface GrcToolExecutionContext {
+  toolCallId?: string;
+  session?: Pick<ToolContext["session"], "dryRun">;
+}
 
 /** Server tool config accepted by `defineTool` from `@cursor/july/tools`. */
 export interface GrclankerSdkToolConfig {
@@ -17,7 +28,18 @@ export interface GrclankerSdkToolConfig {
    * Deterministic `agent-sdk call` runs bypass the gate.
    */
   needsApproval: boolean;
-  execute: (input: JsonObject, ctx: Pick<ToolContext, "toolCallId">) => Promise<ToolExecuteResult>;
+  execute: (input: JsonObject, ctx: GrcToolExecutionContext) => Promise<ToolExecuteResult>;
+}
+
+export interface ExecuteGrcToolOptions {
+  toolCallId?: string;
+  /**
+   * Run the tool with on-disk caches disabled. Read-classified tools such as
+   * the FedRAMP lookups mirror public catalogs to the grclanker state
+   * directory; in a dry-run session that mirror must stay in memory so the
+   * session changes nothing on the user's disk.
+   */
+  dryRun?: boolean;
 }
 
 function describeError(error: unknown): string {
@@ -44,8 +66,9 @@ export function prepareGrcToolArguments(tool: RegisteredGrcTool, toolCallId: str
 export async function executeGrcTool(
   tool: RegisteredGrcTool,
   input: JsonObject,
-  toolCallId: string = `grclanker_${tool.name}`,
+  options: ExecuteGrcToolOptions = {},
 ): Promise<ToolExecuteResult> {
+  const toolCallId = options.toolCallId ?? `grclanker_${tool.name}`;
   let args: unknown;
   try {
     args = prepareGrcToolArguments(tool, toolCallId, input);
@@ -53,8 +76,10 @@ export async function executeGrcTool(
     return errorEnvelope(describeError(error));
   }
 
+  const run = () => tool.execute(toolCallId, args);
   try {
-    return toSdkToolResult(await tool.execute(toolCallId, args));
+    const result = options.dryRun === true ? await runWithoutPersistentCaches(run) : await run();
+    return toSdkToolResult(result);
   } catch (error) {
     return errorEnvelope(`${tool.name} failed: ${describeError(error)}`);
   }
@@ -67,7 +92,8 @@ export function buildSdkToolConfig(tool: RegisteredGrcTool): GrclankerSdkToolCon
     inputSchema: toJsonSchema(tool.parameters),
     effect: classifyGrcToolEffect(tool.name),
     needsApproval: isGrcWriteTool(tool.name),
-    execute: (input, ctx) => executeGrcTool(tool, input, ctx.toolCallId),
+    execute: (input, ctx) =>
+      executeGrcTool(tool, input, { toolCallId: ctx.toolCallId, dryRun: ctx.session?.dryRun === true }),
   };
 }
 

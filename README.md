@@ -106,7 +106,7 @@ The same GRC tool surface can run as a Cursor Agent SDK agent built on [`@cursor
 - all 107 domain tools are exposed as Agent SDK server tools under their native names, with TypeBox parameter schemas converted to plain JSON Schema at the adapter boundary and arguments validated with the same `prepareArguments` shims and Pi validator the CLI uses
 - `SYSTEM.md` becomes the always-on instructions, the `/investigate`, `/audit`, `/assess`, and `/validate` prompts become on-demand skills, the bundled `crypto-validation` skill is exposed as a skill, and the `auditor` and `verifier` personas become subagents
 - Pi's compute-backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) are not exposed; the Cursor harness supplies its own shell and file tools
-- the 85 query tools declare `effect: "read"` for Agent SDK dry runs, and the 22 writers (exports, generators, the evidence collector, OSCAL workspace commands) require human approval before a model-initiated call runs
+- the 85 query tools declare `effect: "read"` for Agent SDK dry runs (FedRAMP lookups keep their catalog cache in memory during a dry run and leave `~/.grclanker`, or `GRCLANKER_HOME`, untouched), and the 22 writers (exports, generators, the evidence collector, OSCAL workspace commands) require human approval before a model-initiated call runs
 
 Run it from a source checkout (`@cursor/july` is a CLI devDependency, so `npm --prefix cli install` provides `agent-sdk`):
 
