@@ -1819,6 +1819,12 @@ test("verdict safety rule 10: stuck cursors, empty cursor pages, and absent tota
     if (url.pathname === "/identity-protection/entities/policy-rules/v1") {
       return jsonResponse({ resources: [{ id: "idp-1", name: "Block stale accounts", enabled: true, simulationMode: false, action: "BLOCK" }] });
     }
+    if (url.pathname === "/api-clients/queries/api-clients/v1") {
+      return jsonResponse({ resources: ["client-1", "client-2", "client-3"], meta: { pagination: { total: 3, limit: 500, offset: 3 } } });
+    }
+    if (url.pathname === "/api-clients/entities/api-clients/v1") {
+      return jsonResponse({ resources: url.searchParams.getAll("ids").filter((id) => id !== "client-2").map((id) => ({ id, name: id })) });
+    }
     throw new Error(`unexpected path ${url.pathname}`);
   };
   const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
@@ -1849,6 +1855,11 @@ test("verdict safety rule 10: stuck cursors, empty cursor pages, and absent tota
   const rules = await client.listIdentityProtectionRules();
   assert.equal(rules.items.length, 1);
   assert.equal(rules.truncated, true);
+
+  const apiClients = await client.listApiClients();
+  assert.deepEqual(apiClients.items.map((item) => item.id), ["client-1", "client-3"]);
+  assert.equal(apiClients.total, 3);
+  assert.equal(apiClients.truncated, true, "an entity lookup that returns fewer records than the id query listed is a partial inventory");
 });
 
 test("verdict safety rule 10: a stuck alert cursor and a role catalog without a total demote the dependent findings and state total unknown", async () => {

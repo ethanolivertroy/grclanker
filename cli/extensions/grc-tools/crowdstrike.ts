@@ -873,8 +873,13 @@ function pageOf<T>(items: T[], total: number | undefined, moreAvailable: boolean
   return { items, total, truncated };
 }
 
+/**
+ * An entity lookup that returns fewer records than the id query listed (deleted or forbidden
+ * entities) leaves the consumer counting a subset of what the server said exists, so the page
+ * is marked truncated and the dependent verdict demotes instead of passing on the shortfall.
+ */
 function recordPage<T>(page: CrowdstrikePage<T>, entities: JsonRecord[]): CrowdstrikePage<JsonRecord> {
-  return { items: entities, total: page.total, truncated: page.truncated };
+  return { items: entities, total: page.total, truncated: page.truncated || entities.length < page.items.length };
 }
 
 export class CrowdstrikeApiClient {
