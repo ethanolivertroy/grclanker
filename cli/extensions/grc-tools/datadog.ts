@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -32,13 +32,18 @@ const MAX_RATE_LIMIT_WAIT_MS = 60_000;
 const V2_PAGE_SIZE = 100;
 const CURSOR_PAGE_SIZE = 100;
 const MONITOR_PAGE_SIZE = 200;
+const FINDING_PAGE_SIZE = 1000;
+const ORG_CONNECTION_PAGE_SIZE = 1000;
+const DASHBOARD_PAGE_SIZE = 100;
+const DEFAULT_DASHBOARD_LIMIT = 2000;
 const DEFAULT_USER_LIMIT = 2000;
 const DEFAULT_ROLE_LIMIT = 100;
 const DEFAULT_KEY_LIMIT = 500;
 const DEFAULT_RULE_LIMIT = 1000;
 const DEFAULT_SIGNAL_LIMIT = 200;
 const DEFAULT_MONITOR_LIMIT = 1000;
-const DEFAULT_FINDING_LIMIT = 100;
+const DEFAULT_FINDING_LIMIT = 10000;
+const DEFAULT_ORG_CONNECTION_LIMIT = 10000;
 const DEFAULT_KEY_ROTATION_DAYS = 90;
 const DEFAULT_KEY_UNUSED_DAYS = 30;
 const DEFAULT_INACTIVE_USER_DAYS = 90;
@@ -76,6 +81,7 @@ const SITE_ALIASES: Record<string, string> = {
   uk1: "uk1.datadoghq.com",
   gov: "ddog-gov.com",
   "us1-fed": "ddog-gov.com",
+  "us2-fed": "us2.ddog-gov.com",
   us2gov: "us2.ddog-gov.com",
 };
 
@@ -208,6 +214,7 @@ export interface DatadogAccessCheckResult {
   status: "healthy" | "limited" | "failed";
   site: string;
   apiKeyValid: boolean;
+  keyPairValid: boolean;
   surfaces: DatadogAccessSurface[];
   missingPermissions: string[];
   notes: string[];
@@ -244,6 +251,8 @@ interface SurfaceResult<T> {
   value?: T;
   error?: string;
   forbidden?: boolean;
+  truncated?: boolean;
+  limit?: number;
 }
 
 export interface DatadogIdentitySnapshot {
@@ -251,6 +260,7 @@ export interface DatadogIdentitySnapshot {
   users: SurfaceResult<JsonRecord[]>;
   roles: SurfaceResult<JsonRecord[]>;
   rolePermissions: Record<string, string[]>;
+  rolePermissionErrors: Record<string, string>;
   applicationKeys: SurfaceResult<JsonRecord>;
   orgConfigs: SurfaceResult<JsonRecord[]>;
   errors: string[];
@@ -317,6 +327,7 @@ export interface DatadogSecurityMonitoringOptions {
   signalSlaHours?: number;
   signalLookbackDays?: number;
   monitorLimit?: number;
+  findingLimit?: number;
   minPosturePassRate?: number;
   requiredFrameworks?: string[];
 }
@@ -365,6 +376,7 @@ type SecurityMonitoringArgs = CheckAccessArgs & {
   signal_sla_hours?: number;
   signal_lookback_days?: number;
   monitor_limit?: number;
+  finding_limit?: number;
   min_posture_pass_rate?: number;
   required_frameworks?: string;
 };
@@ -535,7 +547,7 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -887,6 +899,10 @@ export class DatadogApiClient {
     return asObject(await this.get("/api/v1/validate")) ?? {};
   }
 
+  async validateKeyPair(): Promise<JsonRecord> {
+    return asObject(await this.get("/api/v2/validate_keys")) ?? {};
+  }
+
   async getOrganization(): Promise<JsonRecord> {
     const payload = asObject(await this.get("/api/v1/org")) ?? {};
     const orgs = asRecordArray(payload.orgs);
@@ -898,9 +914,18 @@ export class DatadogApiClient {
     return asRecordArray(payload.data);
   }
 
-  async listOrgConnections(limit = 100): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v2/org_connections", { limit, offset: 0 })) ?? {};
-    return asRecordArray(payload.data);
+  async listOrgConnections(limit = DEFAULT_ORG_CONNECTION_LIMIT): Promise<JsonRecord[]> {
+    const items: JsonRecord[] = [];
+    const pageSize = Math.min(ORG_CONNECTION_PAGE_SIZE, limit);
+    for (let offset = 0; items.length < limit; offset += pageSize) {
+      const payload = asObject(await this.get("/api/v2/org_connections", { limit: pageSize, offset })) ?? {};
+      const data = asRecordArray(payload.data);
+      items.push(...data.slice(0, limit - items.length));
+      const total = asNumber(getNestedValue(payload, ["meta", "page", "total_filtered_count"]))
+        ?? asNumber(getNestedValue(payload, ["meta", "page", "total_count"]));
+      if (data.length < pageSize || (total !== undefined && items.length >= total)) break;
+    }
+    return items;
   }
 
   async listUsers(limit = DEFAULT_USER_LIMIT): Promise<JsonRecord[]> {
@@ -989,16 +1014,32 @@ export class DatadogApiClient {
     status?: string;
     limit?: number;
   } = {}): Promise<JsonRecord> {
-    const limit = clampNumber(options.limit, DEFAULT_FINDING_LIMIT, 1, 1000);
-    const payload = asObject(await this.get("/api/v2/posture_management/findings", {
-      "filter[evaluation]": options.evaluation,
-      "filter[status]": options.status,
-      "page[limit]": limit,
-    })) ?? {};
-    return {
-      data: asRecordArray(payload.data),
-      total_filtered_count: asNumber(getNestedValue(payload, ["meta", "page", "total_filtered_count"])) ?? null,
-    };
+    const limit = clampNumber(options.limit, DEFAULT_FINDING_LIMIT, 1, 100000);
+    const pageSize = Math.min(FINDING_PAGE_SIZE, limit);
+    const items: JsonRecord[] = [];
+    let totalFilteredCount: number | null = null;
+    let cursor: string | undefined;
+    let truncated = false;
+    for (;;) {
+      const payload = asObject(await this.get("/api/v2/posture_management/findings", {
+        "filter[evaluation]": options.evaluation,
+        "filter[status]": options.status,
+        "page[limit]": pageSize,
+        "page[cursor]": cursor,
+      })) ?? {};
+      const data = asRecordArray(payload.data);
+      items.push(...data.slice(0, limit - items.length));
+      totalFilteredCount ??= asNumber(getNestedValue(payload, ["meta", "page", "total_filtered_count"])) ?? null;
+      const nextCursor = asString(getNestedValue(payload, ["meta", "page", "cursor"]));
+      if (totalFilteredCount !== null) break;
+      if (!nextCursor || data.length === 0 || nextCursor === cursor) break;
+      if (items.length >= limit) {
+        truncated = true;
+        break;
+      }
+      cursor = nextCursor;
+    }
+    return { data: items, total_filtered_count: totalFilteredCount, truncated };
   }
 
   async getIpAllowlist(): Promise<JsonRecord> {
@@ -1027,11 +1068,21 @@ export class DatadogApiClient {
     return asRecordArray(payload.data);
   }
 
-  async listDashboards(options: { shared?: boolean } = {}): Promise<JsonRecord[]> {
-    const payload = asObject(await this.get("/api/v1/dashboard", {
-      "filter[shared]": options.shared === undefined ? undefined : String(options.shared),
-    })) ?? {};
-    return asRecordArray(payload.dashboards);
+  async listDashboards(options: { shared?: boolean; limit?: number } = {}): Promise<JsonRecord[]> {
+    const limit = clampNumber(options.limit, DEFAULT_DASHBOARD_LIMIT, 1, 100000);
+    const pageSize = Math.min(DASHBOARD_PAGE_SIZE, limit);
+    const items: JsonRecord[] = [];
+    for (let start = 0; items.length < limit; start += pageSize) {
+      const payload = asObject(await this.get("/api/v1/dashboard", {
+        "filter[shared]": options.shared === undefined ? undefined : String(options.shared),
+        count: pageSize,
+        start,
+      })) ?? {};
+      const data = asRecordArray(payload.dashboards);
+      items.push(...data.slice(0, limit - items.length));
+      if (data.length < pageSize) break;
+    }
+    return items;
   }
 
   async listMonitors(limit = DEFAULT_MONITOR_LIMIT): Promise<JsonRecord[]> {
@@ -1105,7 +1156,9 @@ type AccessCheckReader = Pick<
   DatadogApiClient,
   | "getResolvedConfig"
   | "validateApiKey"
+  | "validateKeyPair"
   | "getOrganization"
+  | "listOrgConnections"
   | "listUsers"
   | "listRoles"
   | "listApiKeys"
@@ -1133,7 +1186,7 @@ function errorMessage(error: unknown): string {
 }
 
 function isForbidden(error: unknown): boolean {
-  return error instanceof DatadogApiError && error.status === 403;
+  return error instanceof DatadogApiError && (error.status === 401 || error.status === 403);
 }
 
 async function loadSurface<T>(label: string, load: () => Promise<T>, errors: string[]): Promise<SurfaceResult<T>> {
@@ -1144,6 +1197,49 @@ async function loadSurface<T>(label: string, load: () => Promise<T>, errors: str
     errors.push(`${label}: ${message}`);
     return { error: message, forbidden: isForbidden(error) };
   }
+}
+
+async function loadInventory(
+  label: string,
+  limit: number,
+  load: (probeLimit: number) => Promise<JsonRecord[]>,
+  errors: string[],
+): Promise<SurfaceResult<JsonRecord[]>> {
+  const result = await loadSurface(label, () => load(limit + 1), errors);
+  if (!result.value) return result;
+  if (result.value.length > limit) {
+    errors.push(`${label}: inventory truncated at ${limit} items; raise the matching limit argument to inspect the full list`);
+    return { value: result.value.slice(0, limit), truncated: true, limit };
+  }
+  return { value: result.value, truncated: false, limit };
+}
+
+function unreadableSurfaces(entries: Array<[string, SurfaceResult<unknown>]>): string[] {
+  return entries
+    .filter(([, surface]) => surface.value === undefined)
+    .map(([label, surface]) => `${label} (${surface.forbidden ? "403 forbidden" : surface.error ?? "unknown error"})`);
+}
+
+function unreadableSurfacesReason(unreadable: string[]): string {
+  return `The following surfaces were not readable, so this control could not be verified through the API: ${unreadable.join("; ")}.`;
+}
+
+function truncationCaveat(label: string, surface: SurfaceResult<unknown>, limitArgument: string): string | undefined {
+  if (!surface.truncated) return undefined;
+  return `${label} inventory is truncated at ${surface.limit ?? "the configured limit of"} items (raise ${limitArgument}), so the verdict covers a partial view.`;
+}
+
+function withVerdictCaveats(finding: DatadogFinding, caveats: Array<string | undefined>): DatadogFinding {
+  const active = caveats.filter((caveat): caveat is string => Boolean(caveat));
+  if (active.length === 0) return finding;
+  const evidence = { ...finding.evidence, verdict_caveats: active };
+  if (finding.status !== "pass") return { ...finding, evidence };
+  return {
+    ...finding,
+    status: "warn",
+    summary: `${finding.summary} Downgraded to warn: ${active.join(" ")}`,
+    evidence,
+  };
 }
 
 function controlId(controlNumber: number): string {
@@ -1280,26 +1376,47 @@ export async function collectDatadogIdentityData(
 
   const [organization, users, roles, applicationKeys, orgConfigs] = await Promise.all([
     loadSurface("organization", () => client.getOrganization(), errors),
-    loadSurface("users", () => client.listUsers(userLimit), errors),
-    loadSurface("roles", () => client.listRoles(roleLimit), errors),
-    loadSurface("application_keys", () => client.listApplicationKeys(), errors),
+    loadInventory("users", userLimit, (probeLimit) => client.listUsers(probeLimit), errors),
+    loadInventory("roles", roleLimit, (probeLimit) => client.listRoles(probeLimit), errors),
+    loadApplicationKeyInventory(client, DEFAULT_KEY_LIMIT, errors),
     loadSurface("org_configs", () => client.listOrgConfigs(), errors),
   ]);
 
   const rolePermissions: Record<string, string[]> = {};
-  const customRoles = (roles.value ?? []).filter((role) => !isDefaultRole(role)).slice(0, roleLimit);
+  const rolePermissionErrors: Record<string, string> = {};
+  const customRoles = (roles.value ?? []).filter((role) => !isDefaultRole(role));
   await Promise.all(customRoles.map(async (role) => {
     const roleId = asString(role.id);
-    if (!roleId) return;
+    if (!roleId) {
+      rolePermissionErrors[roleName(role)] = "role record has no id";
+      return;
+    }
     try {
       const permissions = await client.listRolePermissions(roleId);
       rolePermissions[roleId] = permissions.map(permissionName).filter((name): name is string => Boolean(name));
     } catch (error) {
-      errors.push(`role_permissions(${roleName(role)}): ${errorMessage(error)}`);
+      const message = errorMessage(error);
+      rolePermissionErrors[roleId] = message;
+      errors.push(`role_permissions(${roleName(role)}): ${message}`);
     }
   }));
 
-  return { organization, users, roles, rolePermissions, applicationKeys, orgConfigs, errors };
+  return { organization, users, roles, rolePermissions, rolePermissionErrors, applicationKeys, orgConfigs, errors };
+}
+
+async function loadApplicationKeyInventory(
+  client: Pick<DatadogApiClient, "listApplicationKeys">,
+  limit: number,
+  errors: string[],
+): Promise<SurfaceResult<JsonRecord>> {
+  const result = await loadSurface("application_keys", () => client.listApplicationKeys(limit + 1), errors);
+  if (!result.value) return result;
+  const data = asRecordArray(result.value.data);
+  if (data.length > limit) {
+    errors.push(`application_keys: inventory truncated at ${limit} items; raise key_limit to inspect the full list`);
+    return { value: { ...result.value, data: data.slice(0, limit) }, truncated: true, limit };
+  }
+  return { value: result.value, truncated: false, limit };
 }
 
 function evaluateSamlControl(snapshot: DatadogIdentitySnapshot): { finding: DatadogFinding; strictSaml: boolean } {
@@ -1312,18 +1429,28 @@ function evaluateSamlControl(snapshot: DatadogIdentitySnapshot): { finding: Data
     };
   }
   const settings = asObject(snapshot.organization.value.settings) ?? {};
-  const samlEnabled = settingEnabled(settings, "saml") === true;
-  const strictMode = settingEnabled(settings, "saml_strict_mode") === true;
+  const samlSetting = settingEnabled(settings, "saml");
+  const strictSetting = settingEnabled(settings, "saml_strict_mode");
+  const samlEnabled = samlSetting === true;
+  const strictMode = strictSetting === true;
   const idpInitiated = settingEnabled(settings, "saml_idp_initiated_login") === true;
   const metadataUploaded = asBoolean(settings.saml_idp_metadata_uploaded);
   const evidence = {
-    saml_enabled: samlEnabled,
-    saml_strict_mode: strictMode,
+    saml_enabled: samlSetting ?? null,
+    saml_strict_mode: strictSetting ?? null,
     saml_idp_initiated_login: idpInitiated,
     saml_idp_metadata_uploaded: metadataUploaded ?? null,
     saml_can_be_enabled: asBoolean(settings.saml_can_be_enabled) ?? null,
     saml_autocreate_users_domains: getNestedValue(settings, ["saml_autocreate_users_domains", "domains"]) ?? null,
   };
+  if (samlSetting === undefined) {
+    return {
+      strictSaml: false,
+      finding: manualFinding(1, "critical", "The organization response did not include the saml setting, so SSO enforcement could not be read.", [
+        "Capture Organization Settings > Login Methods showing SAML enabled, strict mode, and the IdP metadata status.",
+      ], evidence),
+    };
+  }
   if (!samlEnabled) {
     return {
       strictSaml: false,
@@ -1352,23 +1479,36 @@ function evaluateMfaControl(snapshot: DatadogIdentitySnapshot, strictSaml: boole
   const activeHumans = users.filter((user) => user.status === "active" && !user.disabled && !user.serviceAccount);
   const withoutMfa = activeHumans.filter((user) => user.mfaEnabled !== true);
   const evidence = {
+    users_returned: users.length,
     active_human_users: activeHumans.length,
     users_without_native_mfa: withoutMfa.length,
     users_without_native_mfa_sample: sample(withoutMfa.map((user) => user.handle)),
     saml_strict_mode: strictSaml,
+    users_inventory_truncated: snapshot.users.truncated ?? false,
   };
+  if (users.length === 0) {
+    return manualFinding(2, "critical", "The users endpoint returned no users, which cannot be a complete inventory because the application key in use belongs to a user; the empty list is treated as unverifiable rather than compliant.", [
+      "Export Organization Settings > Users and confirm every active human user has MFA enabled or authenticates only through a SAML IdP that enforces MFA.",
+    ], evidence);
+  }
+  const caveats = [truncationCaveat("users", snapshot.users, "user_limit")];
   if (activeHumans.length === 0) {
-    return finding(2, "critical", "warn", "No active human users were returned, so MFA coverage could not be measured.", evidence);
+    return finding(2, "critical", "warn", `${users.length} users were returned but none is an active human user, so MFA coverage could not be measured; review the disabled and service account population manually.`, evidence);
   }
   if (withoutMfa.length === 0) {
-    return finding(2, "critical", "pass", `All ${activeHumans.length} active human users have Datadog MFA enabled.`, evidence);
+    return withVerdictCaveats(
+      finding(2, "critical", "pass", `All ${activeHumans.length} active human users have Datadog MFA enabled (mfa_enabled was read as true for each of them).`, evidence),
+      caveats,
+    );
   }
   if (strictSaml) {
-    return finding(
+    return manualFinding(
       2,
       "critical",
-      "pass",
-      `${withoutMfa.length}/${activeHumans.length} active users lack Datadog-native MFA, but SAML strict mode disables password login so MFA is enforced by the identity provider.`,
+      `${withoutMfa.length}/${activeHumans.length} active users lack Datadog-native MFA. SAML strict mode disables password login, but the Datadog API does not expose whether the identity provider enforces a second factor, so IdP MFA cannot be confirmed here.`,
+      [
+        "Capture the identity provider sign-on policy for the Datadog application showing MFA is required for every assigned user (for example an Okta authentication policy or Entra ID conditional access policy) and export the IdP MFA enrollment report for the listed users.",
+      ],
       evidence,
     );
   }
@@ -1399,7 +1539,11 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
   const adminRole = roles.find((role) => roleName(role).toLowerCase() === "datadog admin role");
   const adminCount = asNumber(attributesOf(adminRole ?? {}).user_count);
   const adminOverAssigned = adminCount !== undefined && adminCount > maxAdmins;
-  const unresolvedRoles = customRoles.filter((role) => !((asString(role.id) ?? "") in snapshot.rolePermissions)).length;
+  const unresolved = customRoles.filter((role) => !((asString(role.id) ?? "") in snapshot.rolePermissions));
+  const unresolvedDetail = unresolved.map((role) => ({
+    role: roleName(role),
+    error: snapshot.rolePermissionErrors[asString(role.id) ?? roleName(role)] ?? "permissions were not collected",
+  }));
   const evidence = {
     total_roles: roles.length,
     custom_roles: customRoles.length,
@@ -1407,26 +1551,56 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
     admin_role_user_count: adminCount ?? null,
     total_users: totalUsers ?? null,
     max_admins: maxAdmins,
-    custom_roles_without_permission_detail: unresolvedRoles,
+    custom_roles_without_permission_detail: unresolved.length,
+    custom_roles_without_permission_detail_sample: sample(unresolvedDetail),
+    roles_inventory_truncated: snapshot.roles.truncated ?? false,
   };
+  if (roles.length === 0) {
+    return manualFinding(3, "high", "The roles endpoint returned no roles, which cannot be a complete inventory because every organization has the three managed Datadog roles; the empty list is treated as unverifiable rather than compliant.", [
+      "Export Organization Settings > Roles with each custom role's permission list and the Datadog Admin Role membership count.",
+    ], evidence);
+  }
   if (overPrivileged.length > 0) {
-    return finding(
+    return withVerdictCaveats(
+      finding(
+        3,
+        "high",
+        "fail",
+        `${overPrivileged.length}/${customRoles.length} custom roles grant admin-equivalent permissions (${ADMIN_EQUIVALENT_PERMISSIONS.join(", ")}).`,
+        evidence,
+      ),
+      [
+        unresolved.length > 0 ? `${unresolved.length} custom roles could not have their permissions read.` : undefined,
+        truncationCaveat("roles", snapshot.roles, "role_limit"),
+      ],
+    );
+  }
+  if (unresolved.length > 0) {
+    return manualFinding(
       3,
       "high",
-      "fail",
-      `${overPrivileged.length}/${customRoles.length} custom roles grant admin-equivalent permissions (${ADMIN_EQUIVALENT_PERMISSIONS.join(", ")}).`,
+      `${unresolved.length}/${customRoles.length} custom roles could not have their permissions read (GET /api/v2/roles/{id}/permissions failed), so admin-equivalent grants could not be ruled out.`,
+      [
+        `Export the permission list for ${unresolved.map((role) => roleName(role)).slice(0, MAX_EVIDENCE_SAMPLES).join(", ")} from Organization Settings > Roles and confirm none grants ${ADMIN_EQUIVALENT_PERMISSIONS.join(", ")}.`,
+      ],
       evidence,
     );
   }
   if (adminOverAssigned) {
     return finding(3, "high", "warn", `Datadog Admin Role is assigned to ${adminCount} users, above the threshold of ${maxAdmins}.`, evidence);
   }
-  return finding(
-    3,
-    "high",
-    "pass",
-    `${customRoles.length} custom roles grant no admin-equivalent permissions and the Datadog Admin Role has ${adminCount ?? "an unknown number of"} members.`,
-    evidence,
+  return withVerdictCaveats(
+    finding(
+      3,
+      "high",
+      "pass",
+      `${customRoles.length} custom roles were checked and none grants admin-equivalent permissions; the Datadog Admin Role has ${adminCount ?? "an unknown number of"} members.`,
+      evidence,
+    ),
+    [
+      adminCount === undefined ? "The Datadog Admin Role membership count (user_count) was not returned, so admin over-assignment could not be checked." : undefined,
+      truncationCaveat("roles", snapshot.roles, "role_limit"),
+    ],
   );
 }
 
@@ -1449,6 +1623,8 @@ function evaluateUserAccessControl(snapshot: DatadogIdentitySnapshot, now: Date,
     return age !== undefined && age > pendingInviteDays;
   });
   const disabledUsers = users.filter((user) => user.disabled || user.status === "disabled");
+  const undated = activeHumans.filter((user) => user.lastLogin === undefined && user.createdAt === undefined);
+  const undatedPending = users.filter((user) => user.status === "pending" && user.createdAt === undefined);
   const evidence = {
     total_users: users.length,
     active_human_users: activeHumans.length,
@@ -1458,14 +1634,36 @@ function evaluateUserAccessControl(snapshot: DatadogIdentitySnapshot, now: Date,
     inactive_users: sample(inactive.map((user) => ({ handle: user.handle, last_login: user.lastLogin?.toISOString() ?? null }))),
     inactive_user_count: inactive.length,
     stale_pending_invitations: sample(stalePending.map((user) => user.handle)),
+    active_users_without_login_or_creation_date: sample(undated.map((user) => user.handle)),
+    pending_invitations_without_creation_date: sample(undatedPending.map((user) => user.handle)),
+    users_inventory_truncated: snapshot.users.truncated ?? false,
   };
+  if (users.length === 0) {
+    return manualFinding(4, "high", "The users endpoint returned no users, which cannot be a complete inventory because the application key in use belongs to a user; the empty list is treated as unverifiable rather than compliant.", [
+      `Export the user list and confirm no active user has been inactive for more than ${inactiveDays} days and no invitation has been pending for more than ${pendingInviteDays} days.`,
+    ], evidence);
+  }
+  const caveats = [
+    truncationCaveat("users", snapshot.users, "user_limit"),
+    undated.length > 0 ? `${undated.length} active users have neither last_login_time nor created_at and were not counted as recently active.` : undefined,
+    undatedPending.length > 0 ? `${undatedPending.length} pending invitations have no created_at and could not be aged.` : undefined,
+  ];
   if (inactive.length > 0) {
-    return finding(4, "high", "fail", `${inactive.length}/${activeHumans.length} active users have not signed in for more than ${inactiveDays} days.`, evidence);
+    return withVerdictCaveats(
+      finding(4, "high", "fail", `${inactive.length}/${activeHumans.length} active users have not signed in for more than ${inactiveDays} days.`, evidence),
+      caveats,
+    );
   }
   if (stalePending.length > 0) {
-    return finding(4, "high", "warn", `${stalePending.length} invitations have been pending for more than ${pendingInviteDays} days.`, evidence);
+    return withVerdictCaveats(
+      finding(4, "high", "warn", `${stalePending.length} invitations have been pending for more than ${pendingInviteDays} days.`, evidence),
+      caveats,
+    );
   }
-  return finding(4, "high", "pass", `All ${activeHumans.length} active users signed in within ${inactiveDays} days and no invitations are stale.`, evidence);
+  return withVerdictCaveats(
+    finding(4, "high", "pass", `All ${activeHumans.length} active users signed in within ${inactiveDays} days and no invitations are stale.`, evidence),
+    caveats,
+  );
 }
 
 function evaluateSessionTimeoutControl(snapshot: DatadogIdentitySnapshot): DatadogFinding {
@@ -1503,7 +1701,9 @@ function evaluateServiceAccountControl(snapshot: DatadogIdentitySnapshot, now: D
     const age = daysBetween(parseDate(attributesOf(key).created_at), now);
     return age !== undefined && age > keyRotationDays;
   });
+  const undatedKeys = serviceKeys.filter((key) => parseDate(attributesOf(key).created_at) === undefined);
   const evidence = {
+    users_returned: snapshot.users.value.length,
     service_accounts: serviceAccounts.length,
     service_account_handles: sample(serviceAccounts.map((user) => user.handle)),
     non_conforming_names: sample(nonConforming.map((user) => user.handle)),
@@ -1511,32 +1711,56 @@ function evaluateServiceAccountControl(snapshot: DatadogIdentitySnapshot, now: D
     service_account_application_keys: serviceKeys.length,
     application_keys_readable: Boolean(snapshot.applicationKeys.value),
     stale_service_account_keys: sample(staleKeys.map(keyLabel)),
+    service_account_keys_without_created_at: sample(undatedKeys.map(keyLabel)),
     key_rotation_days: keyRotationDays,
+    users_inventory_truncated: snapshot.users.truncated ?? false,
+    application_keys_inventory_truncated: snapshot.applicationKeys.truncated ?? false,
   };
-  if (serviceAccounts.length === 0) {
-    return finding(19, "medium", "pass", "No service accounts exist in the organization.", evidence);
+  if (snapshot.users.value.length === 0) {
+    return manualFinding(19, "medium", "The users endpoint returned no users, so the service account population could not be inventoried; the empty list is treated as unverifiable rather than compliant.", [
+      "List service accounts from Organization Settings > Service Accounts, confirm naming convention, confirm none have interactive logins, and confirm their application keys were rotated within policy.",
+    ], evidence);
   }
+  if (serviceAccounts.length === 0) {
+    return manualFinding(19, "medium", `None of the ${snapshot.users.value.length} returned users is flagged service_account, so there is nothing to audit through the API; the empty service account inventory is treated as not applicable rather than compliant.`, [
+      "Confirm in Organization Settings > Service Accounts that no service accounts exist and document how automation authenticates (personal application keys used by automation should be reviewed under DD-06).",
+    ], evidence);
+  }
+  const caveats = [
+    truncationCaveat("users", snapshot.users, "user_limit"),
+    truncationCaveat("application_keys", snapshot.applicationKeys, "key_limit"),
+    undatedKeys.length > 0 ? `${undatedKeys.length} service account application keys have no created_at and were not counted as rotated.` : undefined,
+  ];
   if (interactive.length > 0 || staleKeys.length > 0) {
-    return finding(
-      19,
-      "medium",
-      "fail",
-      `${interactive.length} service accounts show interactive login history and ${staleKeys.length} service account application keys are older than ${keyRotationDays} days.`,
-      evidence,
+    return withVerdictCaveats(
+      finding(
+        19,
+        "medium",
+        "fail",
+        `${interactive.length} service accounts show interactive login history and ${staleKeys.length} service account application keys are older than ${keyRotationDays} days.`,
+        evidence,
+      ),
+      caveats,
     );
   }
   if (nonConforming.length > 0 || !snapshot.applicationKeys.value) {
-    return finding(
-      19,
-      "medium",
-      "warn",
-      nonConforming.length > 0
-        ? `${nonConforming.length}/${serviceAccounts.length} service accounts do not follow the naming convention.`
-        : "Service accounts look healthy but their application keys could not be read to confirm rotation.",
-      evidence,
+    return withVerdictCaveats(
+      finding(
+        19,
+        "medium",
+        "warn",
+        nonConforming.length > 0
+          ? `${nonConforming.length}/${serviceAccounts.length} service accounts do not follow the naming convention.`
+          : "Service accounts look healthy but their application keys could not be read to confirm rotation.",
+        evidence,
+      ),
+      caveats,
     );
   }
-  return finding(19, "medium", "pass", `${serviceAccounts.length} service accounts follow the naming convention, have no interactive logins, and their keys are within the rotation window.`, evidence);
+  return withVerdictCaveats(
+    finding(19, "medium", "pass", `${serviceAccounts.length} service accounts follow the naming convention, have no interactive logins, and their ${serviceKeys.length} application keys are within the rotation window.`, evidence),
+    caveats,
+  );
 }
 
 export function evaluateDatadogIdentity(
@@ -1591,9 +1815,9 @@ export async function collectDatadogAccessControlData(
   const keyLimit = clampNumber(options.keyLimit, DEFAULT_KEY_LIMIT, 1, 10000);
   const [organization, apiKeys, applicationKeys, sharedDashboards, ipAllowlist, awsIntegrations, gcpIntegrations, azureIntegrations] = await Promise.all([
     loadSurface("organization", () => client.getOrganization(), errors),
-    loadSurface("api_keys", () => client.listApiKeys(keyLimit), errors),
-    loadSurface("application_keys", () => client.listApplicationKeys(keyLimit), errors),
-    loadSurface("shared_dashboards", () => client.listDashboards({ shared: true }), errors),
+    loadInventory("api_keys", keyLimit, (probeLimit) => client.listApiKeys(probeLimit), errors),
+    loadApplicationKeyInventory(client, keyLimit, errors),
+    loadInventory("shared_dashboards", DEFAULT_DASHBOARD_LIMIT, (probeLimit) => client.listDashboards({ shared: true, limit: probeLimit }), errors),
     loadSurface("ip_allowlist", () => client.getIpAllowlist(), errors),
     loadSurface("aws_integrations", () => client.listAwsIntegrations(), errors),
     loadSurface("gcp_integrations", () => client.listGcpIntegrations(), errors),
@@ -1624,6 +1848,7 @@ function evaluateApiKeyControl(snapshot: DatadogAccessControlSnapshot, now: Date
     return idle !== undefined && idle > unusedDays;
   });
   const placeholders = keys.filter((key) => isPlaceholderKeyName(asString(attributesOf(key).name)));
+  const undated = keys.filter((key) => parseDate(attributesOf(key).created_at) === undefined);
   const evidence = {
     api_keys: keys.length,
     rotation_days: rotationDays,
@@ -1632,20 +1857,41 @@ function evaluateApiKeyControl(snapshot: DatadogAccessControlSnapshot, now: Date
     unused_days: unusedDays,
     keys_unused_beyond_threshold: sample(stale.map(keyLabel)),
     keys_with_placeholder_names: sample(placeholders.map(keyLabel)),
+    keys_without_created_at: sample(undated.map(keyLabel)),
+    keys_without_created_at_count: undated.length,
+    api_keys_inventory_truncated: snapshot.apiKeys.truncated ?? false,
   };
-  if (aged.length > 0) {
-    return finding(5, "high", "fail", `${aged.length}/${keys.length} API keys are older than the ${rotationDays}-day rotation window.`, evidence);
+  if (keys.length === 0) {
+    return manualFinding(5, "high", "The API keys endpoint returned no keys, which cannot be a complete inventory because the API key used for this request must exist; the empty list is treated as unverifiable rather than compliant.", [
+      `Export Organization Settings > API Keys and confirm every key was created or rotated within ${rotationDays} days and unused keys were revoked.`,
+    ], evidence);
   }
-  if (stale.length > 0 || placeholders.length > 0) {
-    return finding(
-      5,
-      "high",
-      "warn",
-      `${stale.length} API keys have been unused for more than ${unusedDays} days and ${placeholders.length} use placeholder names.`,
-      evidence,
+  const caveats = [
+    truncationCaveat("api_keys", snapshot.apiKeys, "key_limit"),
+    undated.length > 0 ? `${undated.length} API keys have no created_at and were not counted as rotated within the window.` : undefined,
+  ];
+  if (aged.length > 0) {
+    return withVerdictCaveats(
+      finding(5, "high", "fail", `${aged.length}/${keys.length} API keys are older than the ${rotationDays}-day rotation window.`, evidence),
+      caveats,
     );
   }
-  return finding(5, "high", "pass", `All ${keys.length} API keys are within the ${rotationDays}-day rotation window, recently used, and descriptively named.`, evidence);
+  if (stale.length > 0 || placeholders.length > 0) {
+    return withVerdictCaveats(
+      finding(
+        5,
+        "high",
+        "warn",
+        `${stale.length} API keys have been unused for more than ${unusedDays} days and ${placeholders.length} use placeholder names.`,
+        evidence,
+      ),
+      caveats,
+    );
+  }
+  return withVerdictCaveats(
+    finding(5, "high", "pass", `All ${keys.length} API keys are within the ${rotationDays}-day rotation window, recently used, and descriptively named.`, evidence),
+    caveats,
+  );
 }
 
 function evaluateApplicationKeyControl(snapshot: DatadogAccessControlSnapshot, now: Date, unusedDays: number): DatadogFinding {
@@ -1675,6 +1921,14 @@ function evaluateApplicationKeyControl(snapshot: DatadogAccessControlSnapshot, n
     const age = daysBetween(reference, now);
     return age !== undefined && age > unusedDays;
   });
+  const undated = keys.filter((key) => {
+    const attributes = attributesOf(key);
+    return parseDate(attributes.last_used_at) === undefined && parseDate(attributes.created_at) === undefined;
+  });
+  const ownerUnresolved = keys.filter((key) => {
+    const owner = keyOwnerId(key);
+    return !owner || !ownersById.has(owner);
+  });
   const evidence = {
     application_keys: keys.length,
     unscoped_keys: unscoped.length,
@@ -1683,50 +1937,93 @@ function evaluateApplicationKeyControl(snapshot: DatadogAccessControlSnapshot, n
     idle_keys: sample(idle.map(keyLabel)),
     idle_days_threshold: unusedDays,
     owners_resolved: ownersById.size,
+    keys_without_resolved_owner: ownerUnresolved.length,
+    keys_without_resolved_owner_sample: sample(ownerUnresolved.map(keyLabel)),
+    keys_without_any_date: sample(undated.map(keyLabel)),
+    application_keys_inventory_truncated: snapshot.applicationKeys.truncated ?? false,
   };
-  if (orphaned.length > 0) {
-    return finding(6, "high", "fail", `${orphaned.length} application keys belong to disabled users and remain active.`, evidence);
+  if (keys.length === 0) {
+    return manualFinding(6, "high", "The application keys endpoint returned no keys, which cannot be a complete inventory because the application key used for this request must exist; the empty list is treated as unverifiable rather than compliant.", [
+      "Export Organization Settings > Application Keys, confirm each key is scoped, owned by an active user or service account, and used recently.",
+    ], evidence);
   }
-  if (unscoped.length > 0 || idle.length > 0) {
-    return finding(
-      6,
-      "high",
-      "warn",
-      `${unscoped.length}/${keys.length} application keys inherit the owner's full permissions (unscoped) and ${idle.length} have not been used for more than ${unusedDays} days.`,
-      evidence,
+  const caveats = [
+    truncationCaveat("application_keys", snapshot.applicationKeys, "key_limit"),
+    ownerUnresolved.length > 0
+      ? `${ownerUnresolved.length} application keys have no owner record in the response (include=owned_by), so ownership by an active user could not be confirmed for them.`
+      : undefined,
+    undated.length > 0 ? `${undated.length} application keys have neither last_used_at nor created_at and were not counted as recently used.` : undefined,
+  ];
+  if (orphaned.length > 0) {
+    return withVerdictCaveats(
+      finding(6, "high", "fail", `${orphaned.length} application keys belong to disabled users and remain active.`, evidence),
+      caveats,
     );
   }
-  return finding(6, "high", "pass", `All ${keys.length} application keys are scoped, owned by active users, and recently used.`, evidence);
+  if (unscoped.length > 0 || idle.length > 0) {
+    return withVerdictCaveats(
+      finding(
+        6,
+        "high",
+        "warn",
+        `${unscoped.length}/${keys.length} application keys inherit the owner's full permissions (unscoped) and ${idle.length} have not been used for more than ${unusedDays} days.`,
+        evidence,
+      ),
+      caveats,
+    );
+  }
+  return withVerdictCaveats(
+    finding(6, "high", "pass", `All ${keys.length} application keys are scoped, owned by active users (${ownersById.size} owner records resolved), and recently used.`, evidence),
+    caveats,
+  );
 }
 
 function evaluateDashboardSharingControl(snapshot: DatadogAccessControlSnapshot): DatadogFinding {
+  const organizationReadable = Boolean(snapshot.organization.value);
   const settings = asObject(snapshot.organization.value?.settings) ?? {};
-  const widgetShare = snapshot.organization.value ? asBoolean(settings.private_widget_share) : undefined;
-  if (!snapshot.sharedDashboards.value) {
-    return manualFinding(14, "high", unreadableReason("dashboards (dashboards_read)", snapshot.sharedDashboards), [
-      "Open Dashboards > Shared Dashboards and confirm every shared dashboard is invite-only with an email domain allowlist, and that Organization Settings > Public Sharing disables widget sharing outside the org.",
-    ], { private_widget_share: widgetShare ?? null });
-  }
-  const shared = snapshot.sharedDashboards.value;
+  const widgetShare = organizationReadable ? asBoolean(settings.private_widget_share) : undefined;
+  const shared = snapshot.sharedDashboards.value ?? [];
   const evidence = {
-    shared_dashboards: shared.length,
+    shared_dashboards: snapshot.sharedDashboards.value ? shared.length : null,
     shared_dashboard_titles: sample(shared.map((dashboard) => asString(dashboard.title) ?? asString(dashboard.id) ?? "dashboard")),
     private_widget_share: widgetShare ?? null,
-    organization_settings_readable: Boolean(snapshot.organization.value),
+    organization_settings_readable: organizationReadable,
+    shared_dashboards_readable: Boolean(snapshot.sharedDashboards.value),
+    shared_dashboards_inventory_truncated: snapshot.sharedDashboards.truncated ?? false,
   };
   if (widgetShare === true) {
     return finding(14, "high", "fail", "Organization settings allow users to share widgets outside Datadog (private_widget_share enabled).", evidence);
   }
+  const publicSharingEvidence = "Capture Organization Settings > Public Sharing showing that sharing widgets outside the organization (private_widget_share) is disabled.";
+  if (!snapshot.sharedDashboards.value) {
+    return manualFinding(14, "high", unreadableReason("dashboards (dashboards_read)", snapshot.sharedDashboards), [
+      "Open Dashboards > Shared Dashboards and confirm every shared dashboard is invite-only with an email domain allowlist.",
+      publicSharingEvidence,
+    ], evidence);
+  }
+  if (!organizationReadable) {
+    return manualFinding(14, "high", `${unreadableReason("organization settings (org_management)", snapshot.organization)} The private_widget_share setting was therefore never read.`, [
+      publicSharingEvidence,
+    ], evidence);
+  }
+  if (widgetShare === undefined) {
+    return manualFinding(14, "high", "The organization response did not include the private_widget_share setting, so widget sharing outside the org could not be confirmed.", [
+      publicSharingEvidence,
+    ], evidence);
+  }
   if (shared.length > 0) {
-    return finding(
-      14,
-      "high",
-      "warn",
-      `${shared.length} dashboards are shared through public links; confirm each uses invite-only sharing with an email domain allowlist because the list endpoint does not expose the share type.`,
-      evidence,
+    return withVerdictCaveats(
+      finding(
+        14,
+        "high",
+        "warn",
+        `${shared.length} dashboards are shared through public links; confirm each uses invite-only sharing with an email domain allowlist because the list endpoint does not expose the share type.`,
+        evidence,
+      ),
+      [truncationCaveat("shared_dashboards", snapshot.sharedDashboards, "the dashboard limit")],
     );
   }
-  return finding(14, "high", "pass", "No dashboards are shared through public links and widget sharing outside the org is disabled.", evidence);
+  return finding(14, "high", "pass", "No dashboards are shared through public links and widget sharing outside the org is disabled (private_widget_share read as false).", evidence);
 }
 
 function cidrPrefixLength(cidr: string): number | undefined {
@@ -1744,7 +2041,8 @@ function evaluateIpAllowlistControl(snapshot: DatadogAccessControlSnapshot): Dat
     ]);
   }
   const attributes = asObject(getNestedValue(snapshot.ipAllowlist.value, ["data", "attributes"])) ?? {};
-  const enabled = asBoolean(attributes.enabled) === true;
+  const enabledSetting = asBoolean(attributes.enabled);
+  const enabled = enabledSetting === true;
   const entries = asRecordArray(attributes.entries).map((entry) => {
     const entryAttributes = asObject(getNestedValue(entry, ["data", "attributes"])) ?? attributesOf(entry);
     return {
@@ -1763,12 +2061,17 @@ function evaluateIpAllowlistControl(snapshot: DatadogAccessControlSnapshot): Dat
     return prefix !== undefined && prefix > (isIpv6 ? 32 : 8) && prefix < (isIpv6 ? 48 : 16);
   });
   const evidence = {
-    enabled,
+    enabled: enabledSetting ?? null,
     entries: entries.length,
     entry_sample: sample(entries),
     overly_broad_entries: broad.map((entry) => entry.cidr_block),
     wide_entries: wide.map((entry) => entry.cidr_block),
   };
+  if (enabledSetting === undefined) {
+    return manualFinding(15, "high", "The IP allowlist response did not include the enabled flag, so enforcement could not be confirmed.", [
+      "Capture Organization Settings > Security > IP Allowlist showing it is enabled and listing every CIDR entry with its justification.",
+    ], evidence);
+  }
   if (!enabled) {
     return finding(15, "high", "fail", "The organization IP allowlist is disabled.", evidence);
   }
@@ -1778,7 +2081,10 @@ function evaluateIpAllowlistControl(snapshot: DatadogAccessControlSnapshot): Dat
   if (wide.length > 0) {
     return finding(15, "high", "warn", `The IP allowlist is enabled but ${wide.length} entries are wider than /16 and should be reviewed.`, evidence);
   }
-  return finding(15, "high", "pass", `The IP allowlist is enabled with ${entries.length} scoped entries.`, evidence);
+  if (entries.length === 0) {
+    return finding(15, "high", "warn", "The IP allowlist reports enabled but returned no CIDR entries, so the enforced range could not be reviewed; confirm the entry list in Organization Settings > Security > IP Allowlist.", evidence);
+  }
+  return finding(15, "high", "pass", `The IP allowlist is enabled (enabled read as true) with ${entries.length} scoped entries.`, evidence);
 }
 
 function evaluateIntegrationPermissionsControl(snapshot: DatadogAccessControlSnapshot): DatadogFinding {
@@ -1808,52 +2114,65 @@ function evaluateIntegrationPermissionsControl(snapshot: DatadogAccessControlSna
   ], evidence);
 }
 
-function evaluateOrgSettingsControl(
-  snapshot: { organization: SurfaceResult<JsonRecord>; indexes?: SurfaceResult<JsonRecord[]>; orgConnections?: SurfaceResult<JsonRecord[]> },
-  minLogRetentionDays: number,
-): DatadogFinding {
-  if (!snapshot.organization.value) {
-    return manualFinding(20, "medium", unreadableReason("organization settings (org_management)", snapshot.organization), [
-      "Capture Organization Settings > Preferences and Public Sharing showing widget sharing outside the org disabled, and Logs > Configuration > Indexes showing retention per index.",
-    ]);
-  }
-  const settings = asObject(snapshot.organization.value.settings) ?? {};
-  const widgetShare = asBoolean(settings.private_widget_share) === true;
+function evaluateOrgSettingsControl(snapshot: DatadogDataProtectionSnapshot, minLogRetentionDays: number): DatadogFinding {
+  const consoleEvidence = [
+    "Capture Organization Settings > Public Sharing showing widget sharing outside the org (private_widget_share) disabled.",
+    `Capture Logs > Configuration > Indexes showing retention per index of at least ${minLogRetentionDays} days.`,
+    "Capture Organization Settings > Org Connections (or the Cross-Org Visibility settings) showing no connections that share data with other organizations.",
+  ];
+  const settings = asObject(snapshot.organization.value?.settings) ?? {};
+  const widgetShareSetting = snapshot.organization.value ? asBoolean(settings.private_widget_share) : undefined;
   const autocreateEnabled = settingEnabled(settings, "saml_autocreate_users_domains") === true;
   const autocreateDomains = asStringArray(getNestedValue(settings, ["saml_autocreate_users_domains", "domains"]));
-  const indexes = snapshot.indexes?.value ?? [];
-  const shortRetention = indexes
-    .map((index) => ({ name: asString(index.name) ?? "index", retention_days: asNumber(index.num_retention_days) ?? null }))
-    .filter((index) => index.retention_days !== null && index.retention_days < minLogRetentionDays);
-  const connections = snapshot.orgConnections?.value ?? [];
+  const indexes = snapshot.indexes.value ?? [];
+  const retentionByIndex = indexes.map((index) => ({ name: asString(index.name) ?? "index", retention_days: asNumber(index.num_retention_days) ?? null }));
+  const shortRetention = retentionByIndex.filter((index) => index.retention_days !== null && index.retention_days < minLogRetentionDays);
+  const unknownRetention = retentionByIndex.filter((index) => index.retention_days === null);
+  const connections = snapshot.orgConnections.value ?? [];
+  const unreadable = unreadableSurfaces([
+    ["organization settings (org_management)", snapshot.organization],
+    ["log_indexes (logs_read_config)", snapshot.indexes],
+    ["org_connections (org_connections_read)", snapshot.orgConnections],
+  ]);
   const evidence = {
-    private_widget_share: widgetShare,
+    private_widget_share: widgetShareSetting ?? null,
+    organization_settings_readable: Boolean(snapshot.organization.value),
     saml_autocreate_users_enabled: autocreateEnabled,
     saml_autocreate_domains: autocreateDomains,
-    log_indexes: indexes.length,
-    log_indexes_readable: Boolean(snapshot.indexes?.value),
+    log_indexes: snapshot.indexes.value ? indexes.length : null,
+    log_indexes_readable: Boolean(snapshot.indexes.value),
     min_log_retention_days: minLogRetentionDays,
     indexes_below_retention_minimum: shortRetention,
-    org_connections: connections.length,
-    org_connections_readable: Boolean(snapshot.orgConnections?.value),
+    indexes_without_retention_value: sample(unknownRetention.map((index) => index.name)),
+    org_connections: snapshot.orgConnections.value ? connections.length : null,
+    org_connections_readable: Boolean(snapshot.orgConnections.value),
     org_connection_sample: sample(connections.map((connection) => ({
       types: asStringArray(attributesOf(connection).connection_types),
       sink_org: asString(getNestedValue(connection, ["relationships", "sink_org", "data", "id"])) ?? null,
     }))),
   };
-  if (widgetShare) {
+  if (widgetShareSetting === true) {
     return finding(20, "medium", "fail", "Widget sharing outside the organization is enabled (private_widget_share).", evidence);
   }
-  if (shortRetention.length > 0 || connections.length > 0 || (autocreateEnabled && autocreateDomains.length === 0)) {
+  if (unreadable.length > 0) {
+    return manualFinding(20, "medium", unreadableSurfacesReason(unreadable), consoleEvidence, evidence);
+  }
+  if (widgetShareSetting === undefined) {
+    return manualFinding(20, "medium", "The organization response did not include the private_widget_share setting, so widget sharing outside the org could not be confirmed.", [consoleEvidence[0]], evidence);
+  }
+  if (indexes.length === 0) {
+    return manualFinding(20, "medium", "The log indexes endpoint returned no indexes, so log retention could not be evaluated; the empty inventory is treated as unverifiable rather than compliant.", [consoleEvidence[1]], evidence);
+  }
+  if (shortRetention.length > 0 || unknownRetention.length > 0 || connections.length > 0 || (autocreateEnabled && autocreateDomains.length === 0)) {
     return finding(
       20,
       "medium",
       "warn",
-      `${shortRetention.length} log indexes retain data for less than ${minLogRetentionDays} days, ${connections.length} cross-org connections share data with other orgs, and SAML user auto-creation ${autocreateEnabled ? `is enabled for ${autocreateDomains.length} domains` : "is disabled"}.`,
+      `${shortRetention.length} log indexes retain data for less than ${minLogRetentionDays} days, ${unknownRetention.length} indexes did not report num_retention_days, ${connections.length} cross-org connections share data with other orgs, and SAML user auto-creation ${autocreateEnabled ? `is enabled for ${autocreateDomains.length} domains` : "is disabled"}.`,
       evidence,
     );
   }
-  return finding(20, "medium", "pass", `Widget sharing outside the org is disabled, ${indexes.length} log indexes meet the ${minLogRetentionDays}-day retention minimum, and no cross-org connections exist.`, evidence);
+  return finding(20, "medium", "pass", `Widget sharing outside the org is disabled (private_widget_share read as false), all ${indexes.length} log indexes meet the ${minLogRetentionDays}-day retention minimum, and the org connections list was read and is empty.`, evidence);
 }
 
 export function evaluateDatadogAccessControls(
@@ -1906,19 +2225,20 @@ export async function collectDatadogSecurityMonitoringData(
   const signalLimit = clampNumber(options.signalLimit, DEFAULT_SIGNAL_LIMIT, 1, 5000);
   const lookbackDays = clampNumber(options.signalLookbackDays, DEFAULT_SIGNAL_LOOKBACK_DAYS, 1, 365);
   const monitorLimit = clampNumber(options.monitorLimit, DEFAULT_MONITOR_LIMIT, 1, 20000);
+  const findingLimit = clampNumber(options.findingLimit, DEFAULT_FINDING_LIMIT, 1, 100000);
 
   const [rules, signals, postureFailing, posturePassing, monitors, awsIntegrations, gcpIntegrations, azureIntegrations] = await Promise.all([
-    loadSurface("security_rules", () => client.listSecurityRules(ruleLimit), errors),
-    loadSurface("security_signals", () => client.listSecuritySignals({
+    loadInventory("security_rules", ruleLimit, (probeLimit) => client.listSecurityRules(probeLimit), errors),
+    loadInventory("security_signals", signalLimit, (probeLimit) => client.listSecuritySignals({
       query: signalQuery(),
       from: `now-${lookbackDays}d`,
       to: "now",
       sort: "timestamp",
-      limit: signalLimit,
+      limit: probeLimit,
     }), errors),
-    loadSurface("posture_findings_fail", () => client.listPostureFindings({ evaluation: "fail", limit: DEFAULT_FINDING_LIMIT }), errors),
-    loadSurface("posture_findings_pass", () => client.listPostureFindings({ evaluation: "pass", limit: DEFAULT_FINDING_LIMIT }), errors),
-    loadSurface("monitors", () => client.listMonitors(monitorLimit), errors),
+    loadSurface("posture_findings_fail", () => client.listPostureFindings({ evaluation: "fail", limit: findingLimit }), errors),
+    loadSurface("posture_findings_pass", () => client.listPostureFindings({ evaluation: "pass", limit: findingLimit }), errors),
+    loadInventory("monitors", monitorLimit, (probeLimit) => client.listMonitors(probeLimit), errors),
     loadSurface("aws_integrations", () => client.listAwsIntegrations(), errors),
     loadSurface("gcp_integrations", () => client.listGcpIntegrations(), errors),
     loadSurface("azure_integrations", () => client.listAzureIntegrations(), errors),
@@ -1964,17 +2284,31 @@ function evaluateDetectionRulesControl(snapshot: DatadogSecurityMonitoringSnapsh
     disabled_default_rules: disabledDefaults.length,
     disabled_default_rule_sample: sample(disabledDefaults.map((rule) => asString(rule.name) ?? asString(rule.id) ?? "rule")),
     critical_category_coverage: categoryCoverage,
+    rules_inventory_truncated: snapshot.rules.truncated ?? false,
   };
+  if (rules.length === 0) {
+    return finding(8, "high", "fail", "The security monitoring rules endpoint returned no rules at all. An empty rule inventory is treated as fail because no detection is active; if Cloud SIEM is not licensed for this organization, record the control as not applicable with the plan evidence.", evidence);
+  }
+  const caveats = [truncationCaveat("security_rules", snapshot.rules, "rule_limit")];
   if (enabledDetection.length === 0) {
-    return finding(8, "high", "fail", "No Cloud SIEM detection rules are enabled.", evidence);
+    return withVerdictCaveats(finding(8, "high", "fail", `${rules.length} rules were returned but no Cloud SIEM detection rules are enabled.`, evidence), caveats);
   }
   if (uncovered.length > 0) {
-    return finding(8, "high", "fail", `${enabledDetection.length} detection rules are enabled but no enabled rule covers: ${uncovered.join(", ")}.`, evidence);
+    return withVerdictCaveats(
+      finding(8, "high", "fail", `${enabledDetection.length} detection rules are enabled but no enabled rule covers: ${uncovered.join(", ")}.`, evidence),
+      caveats,
+    );
   }
   if (disabledDefaults.length > 0) {
-    return finding(8, "high", "warn", `${enabledDetection.length} detection rules are enabled across all critical categories, but ${disabledDefaults.length} default rules have been disabled.`, evidence);
+    return withVerdictCaveats(
+      finding(8, "high", "warn", `${enabledDetection.length} detection rules are enabled across all critical categories, but ${disabledDefaults.length} default rules have been disabled.`, evidence),
+      caveats,
+    );
   }
-  return finding(8, "high", "pass", `${enabledDetection.length} detection rules are enabled, all critical categories are covered, and no default rules are disabled.`, evidence);
+  return withVerdictCaveats(
+    finding(8, "high", "pass", `${enabledDetection.length} detection rules are enabled, all critical categories are covered, and no default rules are disabled.`, evidence),
+    caveats,
+  );
 }
 
 function signalDetails(signal: JsonRecord, now: Date): { id: string; severity: string; triage: string; ageHours: number | undefined; title: string } {
@@ -1999,21 +2333,36 @@ function evaluateSignalsControl(snapshot: DatadogSecurityMonitoringSnapshot, now
   }
   const signals = snapshot.signals.value.map((signal) => signalDetails(signal, now)).filter((signal) => signal.triage !== "archived");
   const overdue = signals.filter((signal) => signal.ageHours !== undefined && signal.ageHours > slaHours);
+  const undated = signals.filter((signal) => signal.ageHours === undefined);
+  const enabledDetectionRules = snapshot.rules.value?.filter((rule) => isDetectionRule(rule) && ruleEnabled(rule)).length;
   const evidence = {
     lookback_days: lookbackDays,
     unresolved_high_or_critical_signals: signals.length,
     sla_hours: slaHours,
     overdue_signals: overdue.length,
     overdue_signal_sample: sample(overdue.map((signal) => ({ id: signal.id, severity: signal.severity, triage: signal.triage, age_hours: signal.ageHours, title: signal.title }))),
+    signals_without_timestamp: undated.length,
+    signals_without_timestamp_sample: sample(undated.map((signal) => signal.id)),
+    enabled_detection_rules: enabledDetectionRules ?? null,
+    signals_inventory_truncated: snapshot.signals.truncated ?? false,
     query: signalQuery(),
   };
   if (overdue.length > 0) {
     return finding(9, "high", "fail", `${overdue.length}/${signals.length} unresolved high or critical signals are older than the ${slaHours}-hour SLA.`, evidence);
   }
   if (signals.length > 0) {
-    return finding(9, "high", "warn", `${signals.length} unresolved high or critical signals are open within the ${slaHours}-hour SLA.`, evidence);
+    const truncated = snapshot.signals.truncated ? ` The signal list is truncated at ${snapshot.signals.limit} items (raise signal_limit), so older overdue signals may exist.` : "";
+    const undatedNote = undated.length > 0 ? ` ${undated.length} signals have no timestamp and could not be aged.` : "";
+    return finding(9, "high", "warn", `${signals.length} unresolved high or critical signals are open within the ${slaHours}-hour SLA.${undatedNote}${truncated}`, evidence);
   }
-  return finding(9, "high", "pass", `No unresolved high or critical security signals in the last ${lookbackDays} days.`, evidence);
+  const signalEvidence = `Open Security > Signals filtered to status:(critical OR high) over the last ${lookbackDays} days and confirm Cloud SIEM is enabled and generating signals.`;
+  if (enabledDetectionRules === undefined) {
+    return manualFinding(9, "high", "No unresolved high or critical signals were returned, but the detection rule inventory was not readable, so it is unknown whether Cloud SIEM is generating signals at all; the empty list is treated as unverifiable rather than compliant.", [signalEvidence], evidence);
+  }
+  if (enabledDetectionRules === 0) {
+    return manualFinding(9, "high", "No unresolved high or critical signals were returned, but no detection rules are enabled, so the empty signal list reflects the absence of detection rather than timely triage; the empty list is treated as unverifiable rather than compliant.", [signalEvidence], evidence);
+  }
+  return finding(9, "high", "pass", `No unresolved high or critical security signals in the last ${lookbackDays} days. The empty result is treated as compliant because ${enabledDetectionRules} enabled detection rules are active, so signals would appear here if they were open.`, evidence);
 }
 
 function integrationCspmEnabled(snapshot: { awsIntegrations: SurfaceResult<JsonRecord[]>; gcpIntegrations: SurfaceResult<JsonRecord[]>; azureIntegrations: SurfaceResult<JsonRecord[]> }): { enabled: number; total: number } {
@@ -2026,9 +2375,11 @@ function integrationCspmEnabled(snapshot: { awsIntegrations: SurfaceResult<JsonR
   return { enabled, total: aws.length + gcp.length + azure.length };
 }
 
-function postureCount(surface: SurfaceResult<JsonRecord>): number | undefined {
+function postureCount(surface: SurfaceResult<JsonRecord>): { count: number; source: "total_filtered_count" | "paged_data"; truncated: boolean } | undefined {
   if (!surface.value) return undefined;
-  return asNumber(surface.value.total_filtered_count) ?? asRecordArray(surface.value.data).length;
+  const total = asNumber(surface.value.total_filtered_count);
+  if (total !== undefined) return { count: total, source: "total_filtered_count", truncated: false };
+  return { count: asRecordArray(surface.value.data).length, source: "paged_data", truncated: asBoolean(surface.value.truncated) === true };
 }
 
 function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPassRate: number): DatadogFinding {
@@ -2037,34 +2388,66 @@ function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPas
   const cspm = integrationCspmEnabled(snapshot);
   const failing = postureCount(snapshot.postureFailing);
   const passing = postureCount(snapshot.posturePassing);
-  const passRate = failing !== undefined && passing !== undefined && failing + passing > 0 ? passing / (failing + passing) : undefined;
+  const countsTruncated = Boolean(failing?.truncated || passing?.truncated);
+  const passRate = failing && passing && failing.count + passing.count > 0 ? passing.count / (failing.count + passing.count) : undefined;
+  const unreadableInputs = unreadableSurfaces([
+    ["security_rules (security_monitoring_rules_read)", snapshot.rules],
+    ["aws_integrations (aws_configuration_read)", snapshot.awsIntegrations],
+    ["gcp_integrations (gcp_configuration_read)", snapshot.gcpIntegrations],
+    ["azure_integrations (azure_configuration_read)", snapshot.azureIntegrations],
+  ]);
+  const unreadablePosture = unreadableSurfaces([
+    ["posture_findings_fail (security_monitoring_findings_read)", snapshot.postureFailing],
+    ["posture_findings_pass (security_monitoring_findings_read)", snapshot.posturePassing],
+  ]);
   const evidence = {
     cloud_configuration_rules: cloudRules.length,
     enabled_cloud_configuration_rules: enabledCloudRules.length,
     rules_readable: Boolean(snapshot.rules.value),
+    rules_inventory_truncated: snapshot.rules.truncated ?? false,
     integrations_with_cspm_resource_collection: cspm.enabled,
     cloud_integrations: cspm.total,
-    posture_findings_failing: failing ?? null,
-    posture_findings_passing: passing ?? null,
+    cloud_integration_surfaces_readable: {
+      aws: Boolean(snapshot.awsIntegrations.value),
+      gcp: Boolean(snapshot.gcpIntegrations.value),
+      azure: Boolean(snapshot.azureIntegrations.value),
+    },
+    posture_findings_failing: failing?.count ?? null,
+    posture_findings_passing: passing?.count ?? null,
+    posture_count_source: failing?.source ?? passing?.source ?? null,
+    posture_counts_truncated: countsTruncated,
     posture_pass_rate: passRate === undefined ? null : Number(passRate.toFixed(3)),
     min_posture_pass_rate: minPassRate,
-    posture_findings_readable: Boolean(snapshot.postureFailing.value && snapshot.posturePassing.value),
+    posture_findings_readable: unreadablePosture.length === 0,
   };
-  if (!snapshot.rules.value && !snapshot.postureFailing.value) {
-    return manualFinding(12, "high", "Neither security monitoring rules nor posture findings were readable (security_monitoring_rules_read, security_monitoring_findings_read).", [
-      "Open Security > Cloud Security > Compliance and capture the enabled frameworks and the current passing percentage.",
+  const consoleEvidence = "Open Security > Cloud Security > Compliance and capture the enabled frameworks, the cloud accounts with resource collection enabled, and the current passing percentage.";
+  if (unreadableInputs.length > 0) {
+    return manualFinding(12, "high", unreadableSurfacesReason(unreadableInputs), [consoleEvidence], evidence);
+  }
+  if (cspm.total === 0 && enabledCloudRules.length === 0) {
+    return manualFinding(12, "high", "No AWS, GCP, or Azure integrations are configured and no cloud_configuration rules are enabled, so there is no cloud footprint for CSPM to evaluate through the API; the empty inventory is treated as not applicable rather than compliant.", [
+      "Confirm whether cloud accounts are in scope for this organization; if none are, record CSPM as not applicable, otherwise connect the accounts and enable resource collection.",
     ], evidence);
   }
   if (enabledCloudRules.length === 0 && cspm.enabled === 0) {
-    return finding(12, "high", "fail", "Cloud Security Posture Management is not active: no cloud_configuration rules are enabled and no cloud integration has CSPM resource collection enabled.", evidence);
+    return finding(12, "high", "fail", `Cloud Security Posture Management is not active: ${cspm.total} cloud integrations are configured but none has CSPM resource collection enabled and no cloud_configuration rules are enabled.`, evidence);
   }
-  if (passRate !== undefined && passRate < minPassRate) {
-    return finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules, but the posture passing rate ${(passRate * 100).toFixed(1)}% is below the ${(minPassRate * 100).toFixed(0)}% threshold.`, evidence);
+  if (unreadablePosture.length > 0) {
+    return manualFinding(12, "high", `CSPM appears active (${enabledCloudRules.length} enabled cloud_configuration rules, ${cspm.enabled} integrations with resource collection), but ${unreadableSurfacesReason(unreadablePosture)}`, [consoleEvidence], evidence);
+  }
+  if (countsTruncated) {
+    return finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules, but the posture findings response carried no total_filtered_count and the paged counts hit the finding_limit, so the passing rate could not be measured reliably; raise finding_limit or capture the passing percentage from the console.`, evidence);
   }
   if (passRate === undefined) {
-    return finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules, but posture findings were not readable so the passing rate could not be measured.`, evidence);
+    return finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules, but no posture findings were returned yet so the passing rate could not be measured.`, evidence);
   }
-  return finding(12, "high", "pass", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules and a ${(passRate * 100).toFixed(1)}% posture passing rate.`, evidence);
+  if (passRate < minPassRate) {
+    return finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules, but the posture passing rate ${(passRate * 100).toFixed(1)}% is below the ${(minPassRate * 100).toFixed(0)}% threshold.`, evidence);
+  }
+  return withVerdictCaveats(
+    finding(12, "high", "pass", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules and a ${(passRate * 100).toFixed(1)}% posture passing rate (${failing?.source === "paged_data" ? "counted from paged findings" : "from total_filtered_count"}).`, evidence),
+    [truncationCaveat("security_rules", snapshot.rules, "rule_limit")],
+  );
 }
 
 function frameworkTokens(rule: JsonRecord): string[] {
@@ -2093,18 +2476,30 @@ function evaluateComplianceCoverageControl(snapshot: DatadogSecurityMonitoringSn
   }));
   const gaps = coverage.filter((item) => item.enabled_rules === 0).map((item) => item.framework);
   const evidence = {
+    total_rules: snapshot.rules.value.length,
     enabled_compliance_rules: complianceRules.length,
     frameworks_observed: [...tokens].sort(),
     required_frameworks: requiredFrameworks,
     coverage,
+    rules_inventory_truncated: snapshot.rules.truncated ?? false,
   };
+  const caveats = [truncationCaveat("security_rules", snapshot.rules, "rule_limit")];
   if (complianceRules.length === 0) {
-    return finding(13, "medium", "fail", "No enabled cloud_configuration or infrastructure_configuration compliance rules were found.", evidence);
+    return withVerdictCaveats(
+      finding(13, "medium", "fail", `${snapshot.rules.value.length} rules were returned but none is an enabled cloud_configuration or infrastructure_configuration compliance rule. The empty compliance rule set is treated as fail; if Cloud Security is not licensed for this organization, record the control as not applicable with the plan evidence.`, evidence),
+      caveats,
+    );
   }
   if (gaps.length > 0) {
-    return finding(13, "medium", "fail", `Enabled compliance rules cover ${tokens.size} framework tags but none reference: ${gaps.join(", ")}.`, evidence);
+    return withVerdictCaveats(
+      finding(13, "medium", "fail", `Enabled compliance rules cover ${tokens.size} framework tags but none reference: ${gaps.join(", ")}.`, evidence),
+      caveats,
+    );
   }
-  return finding(13, "medium", "pass", `Enabled compliance rules reference every required framework (${requiredFrameworks.join(", ")}).`, evidence);
+  return withVerdictCaveats(
+    finding(13, "medium", "pass", `Enabled compliance rules reference every required framework (${requiredFrameworks.join(", ")}).`, evidence),
+    caveats,
+  );
 }
 
 function notificationHandles(message: string): string[] {
@@ -2152,17 +2547,36 @@ function evaluateMonitorNotificationControl(snapshot: DatadogSecurityMonitoringS
     security_monitors_without_notifications: sample(silent.map((monitor) => monitor.name)),
     security_monitors_email_only: sample(emailOnly.map((monitor) => ({ name: monitor.name, handles: monitor.handles }))),
     security_monitors_with_integration_channels: classified.filter((monitor) => monitor.hasIntegration).length,
+    monitors_inventory_truncated: snapshot.monitors.truncated ?? false,
   };
+  if (monitors.length === 0) {
+    return manualFinding(17, "medium", "The monitors endpoint returned no monitors, so there are no security alerts whose routing can be verified; the empty inventory is treated as unverifiable rather than compliant.", [
+      "Confirm in Monitors > Manage Monitors whether security-related monitors exist; if alerting is handled entirely by Cloud SIEM notification rules, capture Security > Cloud SIEM > Notification Rules instead.",
+    ], evidence);
+  }
+  const caveats = [truncationCaveat("monitors", snapshot.monitors, "monitor_limit")];
   if (securityMonitors.length === 0) {
-    return finding(17, "medium", "warn", `${monitors.length} monitors were inventoried but none are tagged or named as security monitors; tag security-critical monitors so notification routing can be verified.`, evidence);
+    return withVerdictCaveats(
+      finding(17, "medium", "warn", `${monitors.length} monitors were inventoried but none are tagged or named as security monitors; tag security-critical monitors so notification routing can be verified.`, evidence),
+      caveats,
+    );
   }
   if (silent.length > 0) {
-    return finding(17, "medium", "fail", `${silent.length}/${securityMonitors.length} security monitors have no notification handles in their message.`, evidence);
+    return withVerdictCaveats(
+      finding(17, "medium", "fail", `${silent.length}/${securityMonitors.length} security monitors have no notification handles in their message.`, evidence),
+      caveats,
+    );
   }
   if (emailOnly.length > 0) {
-    return finding(17, "medium", "warn", `${emailOnly.length}/${securityMonitors.length} security monitors notify individual email addresses only; confirm they are distribution lists or route them to PagerDuty or a security channel.`, evidence);
+    return withVerdictCaveats(
+      finding(17, "medium", "warn", `${emailOnly.length}/${securityMonitors.length} security monitors notify individual email addresses only; confirm they are distribution lists or route them to PagerDuty or a security channel.`, evidence),
+      caveats,
+    );
   }
-  return finding(17, "medium", "pass", `All ${securityMonitors.length} security monitors notify at least one integration channel.`, evidence);
+  return withVerdictCaveats(
+    finding(17, "medium", "pass", `All ${securityMonitors.length} security monitors notify at least one integration channel.`, evidence),
+    caveats,
+  );
 }
 
 export function evaluateDatadogSecurityMonitoring(
@@ -2224,10 +2638,16 @@ export async function collectDatadogDataProtectionData(
 }
 
 function evaluateAuditTrailControl(snapshot: DatadogDataProtectionSnapshot, now: Date, retentionDays: number): DatadogFinding {
-  if (!snapshot.oldestAuditEvents.value && !snapshot.recentAuditEvents.value) {
-    return manualFinding(7, "high", unreadableReason("audit events (audit_logs_read)", snapshot.oldestAuditEvents), [
-      `Open Organization Settings > Audit Trail, confirm it is enabled, and capture the retention setting showing at least ${retentionDays} days.`,
-    ]);
+  const unreadable = unreadableSurfaces([
+    ["audit_events_oldest (audit_logs_read)", snapshot.oldestAuditEvents],
+    ["audit_events_recent (audit_logs_read)", snapshot.recentAuditEvents],
+  ]);
+  const consoleEvidence = `Open Organization Settings > Audit Trail, confirm it is enabled, and capture the retention setting showing at least ${retentionDays} days.`;
+  if (unreadable.length > 0) {
+    return manualFinding(7, "high", unreadableSurfacesReason(unreadable), [consoleEvidence], {
+      oldest_events_readable: Boolean(snapshot.oldestAuditEvents.value),
+      recent_events_readable: Boolean(snapshot.recentAuditEvents.value),
+    });
   }
   const oldest = snapshot.oldestAuditEvents.value ?? [];
   const recent = snapshot.recentAuditEvents.value ?? [];
@@ -2237,11 +2657,18 @@ function evaluateAuditTrailControl(snapshot: DatadogDataProtectionSnapshot, now:
     recent_events_last_7_days: recent.length,
     oldest_event_timestamp: oldestTimestamp?.toISOString() ?? null,
     oldest_event_age_days: oldestAgeDays ?? null,
+    oldest_event_has_timestamp: oldest.length > 0 ? oldestTimestamp !== undefined : null,
     min_retention_days: retentionDays,
     retention_inferred_from_oldest_event: true,
   };
   if (oldest.length === 0 && recent.length === 0) {
-    return finding(7, "high", "fail", "Audit Trail returned no events; it appears disabled or has never recorded activity.", evidence);
+    return finding(7, "high", "fail", `Audit Trail returned no events in the last ${retentionDays} days even though this assessment's own API calls are auditable activity. The empty inventory is treated as fail because Audit Trail appears disabled or is not recording; if Audit Trail is not available on the plan, record the control as not applicable.`, evidence);
+  }
+  if (oldest.length > 0 && oldestTimestamp === undefined) {
+    return finding(7, "high", "warn", `Audit Trail is recording events (${recent.length} in the last 7 days) but the oldest returned event has no timestamp, so ${retentionDays}-day retention could not be inferred from the API.`, evidence);
+  }
+  if (recent.length === 0) {
+    return finding(7, "high", "warn", `Audit Trail has historical events (oldest is ${oldestAgeDays ?? "an unknown number of"} days old) but returned none in the last 7 days, so current recording could not be confirmed.`, evidence);
   }
   if (oldestAgeDays !== undefined && oldestAgeDays >= retentionDays - 7) {
     return finding(7, "high", "pass", `Audit Trail is recording events (${recent.length} in the last 7 days) and the oldest available event is ${oldestAgeDays} days old, supporting ${retentionDays}-day retention.`, evidence);
@@ -2266,25 +2693,30 @@ function exclusionFilters(index: JsonRecord): Array<{ index: string; name: strin
 }
 
 function evaluateLogPipelineControl(snapshot: DatadogDataProtectionSnapshot): DatadogFinding {
-  if (!snapshot.pipelines.value && !snapshot.indexes.value && !snapshot.archives.value) {
-    return manualFinding(10, "medium", unreadableReason("log configuration (logs_read_config, logs_read_archives)", snapshot.pipelines), [
-      "Capture Logs > Configuration > Indexes (exclusion filters), Pipelines, and Archives showing that security sources are retained and an archive destination exists.",
-    ]);
-  }
+  const consoleEvidence = "Capture Logs > Configuration > Indexes (exclusion filters), Pipelines, and Archives showing that security sources are retained and an archive destination exists.";
   const pipelines = snapshot.pipelines.value ?? [];
   const indexes = snapshot.indexes.value ?? [];
   const archives = snapshot.archives.value ?? [];
   const filters = indexes.flatMap(exclusionFilters);
   const securityDrops = filters.filter((filter) => filter.enabled && SECURITY_SOURCE_PATTERN.test(filter.query));
   const failingArchives = archives.filter((archive) => /failing/i.test(asString(attributesOf(archive).state) ?? ""));
+  const unreadable = unreadableSurfaces([
+    ["log_pipelines (logs_read_config)", snapshot.pipelines],
+    ["log_indexes (logs_read_config)", snapshot.indexes],
+    ["log_archives (logs_read_archives)", snapshot.archives],
+  ]);
   const evidence = {
-    pipelines: pipelines.length,
+    pipelines: snapshot.pipelines.value ? pipelines.length : null,
     enabled_pipelines: pipelines.filter((pipeline) => asBoolean(pipeline.is_enabled) !== false).length,
-    indexes: indexes.length,
+    indexes: snapshot.indexes.value ? indexes.length : null,
     exclusion_filters: filters.length,
     exclusion_filters_dropping_security_sources: sample(securityDrops),
-    archives: archives.length,
-    archives_readable: Boolean(snapshot.archives.value),
+    archives: snapshot.archives.value ? archives.length : null,
+    surfaces_readable: {
+      pipelines: Boolean(snapshot.pipelines.value),
+      indexes: Boolean(snapshot.indexes.value),
+      archives: Boolean(snapshot.archives.value),
+    },
     archive_destinations: sample(archives.map((archive) => ({
       name: asString(attributesOf(archive).name) ?? "archive",
       destination: asString(getNestedValue(archive, ["attributes", "destination", "type"])) ?? null,
@@ -2295,6 +2727,14 @@ function evaluateLogPipelineControl(snapshot: DatadogDataProtectionSnapshot): Da
   };
   if (securityDrops.length > 0) {
     return finding(10, "medium", "fail", `${securityDrops.length} enabled index exclusion filters drop security-relevant log sources.`, evidence);
+  }
+  if (unreadable.length > 0) {
+    return manualFinding(10, "medium", unreadableSurfacesReason(unreadable), [consoleEvidence], evidence);
+  }
+  if (indexes.length === 0) {
+    return manualFinding(10, "medium", "The log indexes endpoint returned no indexes, so there is no retained log data whose exclusion filters or retention can be evaluated; the empty inventory is treated as unverifiable rather than compliant.", [
+      "Confirm in Logs > Configuration > Indexes whether Log Management is in use; if it is not, record the control as not applicable, otherwise capture the index list and exclusion filters.",
+    ], evidence);
   }
   if (archives.length === 0 || failingArchives.length > 0) {
     return finding(
@@ -2339,7 +2779,7 @@ function evaluateSensitiveDataScannerControl(snapshot: DatadogDataProtectionSnap
     rule_sample: sample(enabledRules.map((rule) => asString(attributesOf(rule).name) ?? "rule")),
   };
   if (enabledGroups.length === 0) {
-    return finding(11, "medium", "fail", "Sensitive Data Scanner has no enabled scanning groups.", evidence);
+    return finding(11, "medium", "fail", `Sensitive Data Scanner has no enabled scanning groups (${groups.length} groups returned). The empty configuration is treated as fail because no redaction is active; if Sensitive Data Scanner is not licensed for this organization, record the control as not applicable with the plan evidence.`, evidence);
   }
   if (enabledRules.length === 0 || piiRules.length === 0) {
     return finding(11, "medium", "fail", `${enabledGroups.length} scanning groups are enabled but no active PII or PCI detection rules were found.`, evidence);
@@ -2463,10 +2903,14 @@ export async function checkDatadogAccess(client: AccessCheckReader): Promise<Dat
   const config = client.getResolvedConfig();
   const validate = await probeSurface("validate", "/api/v1/validate", "API key", () => client.validateApiKey(), () => 1);
   const apiKeyValid = validate.status === "readable";
+  const validateKeys = await probeSurface("validate_keys", "/api/v2/validate_keys", "API key + application key", () => client.validateKeyPair(), () => 1);
+  const keyPairValid = validateKeys.status === "readable";
 
   const surfaces: DatadogAccessSurface[] = [
     validate,
+    validateKeys,
     await probeSurface("organization", "/api/v1/org", "org_management", () => client.getOrganization(), () => 1),
+    await probeSurface("org_connections", "/api/v2/org_connections", "org_connections_read", () => client.listOrgConnections(1), arrayCount),
     await probeSurface("users", "/api/v2/users", "user_access_read", () => client.listUsers(1), arrayCount),
     await probeSurface("roles", "/api/v2/roles", "user_access_read", () => client.listRoles(1), arrayCount),
     await probeSurface("api_keys", "/api/v2/api_keys", "api_keys_read", () => client.listApiKeys(1), arrayCount),
@@ -2480,25 +2924,27 @@ export async function checkDatadogAccess(client: AccessCheckReader): Promise<Dat
     await probeSurface("log_pipelines", "/api/v1/logs/config/pipelines", "logs_read_config", () => client.listLogPipelines(), arrayCount),
     await probeSurface("log_indexes", "/api/v1/logs/config/indexes", "logs_read_config", () => client.listLogIndexes(), arrayCount),
     await probeSurface("log_archives", "/api/v2/logs/config/archives", "logs_read_archives", () => client.listLogArchives(), arrayCount),
-    await probeSurface("dashboards", "/api/v1/dashboard?filter[shared]=true", "dashboards_read", () => client.listDashboards({ shared: true }), arrayCount),
+    await probeSurface("dashboards", "/api/v1/dashboard?filter[shared]=true", "dashboards_read", () => client.listDashboards({ shared: true, limit: 1 }), arrayCount),
     await probeSurface("monitors", "/api/v1/monitor", "monitors_read", () => client.listMonitors(1), arrayCount),
     await probeSurface("aws_integrations", "/api/v1/integration/aws", "aws_configuration_read", () => client.listAwsIntegrations(), arrayCount),
     await probeSurface("gcp_integrations", "/api/v1/integration/gcp", "gcp_configuration_read", () => client.listGcpIntegrations(), arrayCount),
     await probeSurface("azure_integrations", "/api/v1/integration/azure", "azure_configuration_read", () => client.listAzureIntegrations(), arrayCount),
   ];
 
+  const validationSurfaces = new Set(["validate", "validate_keys"]);
   const coreSurfaces = new Set(["organization", "users", "roles", "api_keys", "application_keys", "audit_events", "security_rules"]);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
+  const dataSurfacesReadable = surfaces.filter((surface) => !validationSurfaces.has(surface.name) && surface.status === "readable").length;
   const coreReadable = surfaces.filter((surface) => coreSurfaces.has(surface.name) && surface.status === "readable").length;
   const missingPermissions = [...new Set(
     surfaces
-      .filter((surface) => surface.status === "forbidden" && surface.permission !== "API key")
+      .filter((surface) => surface.status === "forbidden" && !validationSurfaces.has(surface.name))
       .map((surface) => surface.permission),
   )];
 
-  const status: DatadogAccessCheckResult["status"] = !apiKeyValid || readableCount <= 1
+  const status: DatadogAccessCheckResult["status"] = !apiKeyValid || dataSurfacesReadable === 0
     ? "failed"
-    : coreReadable === coreSurfaces.size
+    : coreReadable === coreSurfaces.size && keyPairValid
       ? "healthy"
       : "limited";
 
@@ -2506,11 +2952,15 @@ export async function checkDatadogAccess(client: AccessCheckReader): Promise<Dat
     status,
     site: config.site,
     apiKeyValid,
+    keyPairValid,
     surfaces,
     missingPermissions,
     notes: [
       `Using Datadog site ${config.site} (${config.baseUrl}).`,
       apiKeyValid ? "The API key validated successfully." : `The API key did not validate: ${validate.error ?? "unknown error"}.`,
+      keyPairValid
+        ? "The API key and application key pair validated successfully (GET /api/v2/validate_keys)."
+        : `The API key and application key pair did not validate (GET /api/v2/validate_keys): ${validateKeys.error ?? "unknown error"}.`,
       `${readableCount}/${surfaces.length} Datadog audit surfaces are readable.`,
       missingPermissions.length > 0
         ? `Missing application key permissions: ${missingPermissions.join(", ")}.`
@@ -2808,7 +3258,7 @@ export async function exportDatadogAuditBundle(
     await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${bundleName}.zip`);
+  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
   await createZipArchive(outputDir, zipPath);
 
   return {
@@ -2866,6 +3316,7 @@ function normalizeSecurityMonitoringArgs(args: unknown): SecurityMonitoringArgs 
     signal_sla_hours: asNumber(value.signal_sla_hours),
     signal_lookback_days: asNumber(value.signal_lookback_days),
     monitor_limit: asNumber(value.monitor_limit),
+    finding_limit: asNumber(value.finding_limit),
     min_posture_pass_rate: asNumber(value.min_posture_pass_rate),
     required_frameworks: asString(value.required_frameworks),
   };
@@ -2924,6 +3375,7 @@ function securityMonitoringOptions(args: SecurityMonitoringArgs): DatadogSecurit
     signalSlaHours: args.signal_sla_hours,
     signalLookbackDays: args.signal_lookback_days,
     monitorLimit: args.monitor_limit,
+    findingLimit: args.finding_limit,
     minPosturePassRate: args.min_posture_pass_rate,
     requiredFrameworks: parseFrameworkList(args.required_frameworks),
   };
@@ -2951,8 +3403,8 @@ const authParams = {
 };
 
 const identityParams = {
-  user_limit: Type.Optional(Type.Number({ description: "Maximum users to inspect. Defaults to 2000.", default: DEFAULT_USER_LIMIT })),
-  role_limit: Type.Optional(Type.Number({ description: "Maximum custom roles whose permissions are expanded. Defaults to 100.", default: DEFAULT_ROLE_LIMIT })),
+  user_limit: Type.Optional(Type.Number({ description: "Maximum users to inspect; a larger inventory is reported as truncated and caps the verdict at warn. Defaults to 2000.", default: DEFAULT_USER_LIMIT })),
+  role_limit: Type.Optional(Type.Number({ description: "Maximum roles to inspect (every listed custom role has its permissions expanded); a larger inventory is reported as truncated. Defaults to 100.", default: DEFAULT_ROLE_LIMIT })),
   max_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Datadog Admin Role members before warning. Defaults to 10.", default: DEFAULT_MAX_ADMINS })),
   inactive_days: Type.Optional(Type.Number({ description: "Days without login before an active user is flagged. Defaults to 90.", default: DEFAULT_INACTIVE_USER_DAYS })),
   pending_invite_days: Type.Optional(Type.Number({ description: "Days before a pending invitation is flagged. Defaults to 30.", default: DEFAULT_PENDING_INVITE_DAYS })),
@@ -2972,6 +3424,7 @@ const securityMonitoringParams = {
   signal_sla_hours: Type.Optional(Type.Number({ description: "Hours before an unresolved high or critical signal breaches SLA. Defaults to 72.", default: DEFAULT_SIGNAL_SLA_HOURS })),
   signal_lookback_days: Type.Optional(Type.Number({ description: "Days of signal history to search. Defaults to 30.", default: DEFAULT_SIGNAL_LOOKBACK_DAYS })),
   monitor_limit: Type.Optional(Type.Number({ description: "Maximum monitors to inspect. Defaults to 1000.", default: DEFAULT_MONITOR_LIMIT })),
+  finding_limit: Type.Optional(Type.Number({ description: "Maximum CSPM posture findings to page through per evaluation when the API omits total_filtered_count. Defaults to 10000.", default: DEFAULT_FINDING_LIMIT })),
   min_posture_pass_rate: Type.Optional(Type.Number({ description: "Minimum CSPM posture passing rate (0 to 1). Defaults to 0.8.", default: DEFAULT_MIN_POSTURE_PASS_RATE })),
   required_frameworks: Type.Optional(Type.String({ description: "Comma-separated compliance frameworks that must have enabled rules. Defaults to cis,pci,soc2,hipaa.", default: DEFAULT_REQUIRED_FRAMEWORKS.join(",") })),
 };

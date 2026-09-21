@@ -182,6 +182,9 @@ function healthyClient(overrides = {}) {
     async validateApiKey() {
       return { valid: true };
     },
+    async validateKeyPair() {
+      return { status: "ok" };
+    },
     async getOrganization() {
       return healthyOrganization();
     },
@@ -523,8 +526,11 @@ test("checkDatadogAccess reports healthy access when every surface is readable",
   const result = await checkDatadogAccess(healthyClient());
   assert.equal(result.status, "healthy");
   assert.equal(result.apiKeyValid, true);
-  assert.equal(result.surfaces.length, 20);
-  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 20);
+  assert.equal(result.keyPairValid, true);
+  assert.equal(result.surfaces.length, 22);
+  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 22);
+  assert.equal(result.surfaces.find((surface) => surface.name === "validate_keys")?.endpoint, "/api/v2/validate_keys");
+  assert.equal(result.surfaces.find((surface) => surface.name === "org_connections")?.permission, "org_connections_read");
   assert.deepEqual(result.missingPermissions, []);
   assert.match(result.recommendedNextStep, /datadog_assess_identity/);
 });
