@@ -376,7 +376,7 @@ test("self-check (c): partial inventories (project cap, denied project) never pa
       });
     }
     if (url.includes("denied-project")) return forbidden();
-    return jsonResponse(routeCompliant(url, init));
+    return jsonResponse(routeCompliant(url, init, withUnreachableScopes(COMPLIANT, (list) => ({ ...list, unreachables: ["zones/europe-west1-b"] }))));
   });
   const assessments = await runAllAssessments(client, { maxProjects: 2 });
   const all = statuses(assessments);
@@ -388,6 +388,8 @@ test("self-check (c): partial inventories (project cap, denied project) never pa
   assert.match(uniform.summary, /Partial view: 1 of 2 projects denied/);
   assert.equal(uniform.evidence.seen, 1);
   assert.equal(assessments[0].summary.projects_truncated, true);
+  const flowLogs = assessments[4].findings.find((item) => item.id === "GCP-NET-02");
+  assert.match(flowLogs.summary, /1 of 2 projects denied; 1 unreachable scopes not enumerated \(prod-audit: zones\/europe-west1-b\); inventory incomplete/);
 });
 
 test("self-check (d): a fully compliant organization passes every automatable control", async () => {
