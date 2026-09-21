@@ -11,7 +11,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { generateKeyPairSync } from "node:crypto";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
 
 import {
@@ -1688,8 +1689,10 @@ test("self-check (d): a compliant tenant built from documented fields passes eve
   }
 });
 
+const SPEC_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "specs", "github-sec-inspector.spec.md");
+
 function readSpecMappingTable() {
-  const spec = readFileSync(resolve(process.cwd(), "specs/github-sec-inspector.spec.md"), "utf8");
+  const spec = readFileSync(SPEC_PATH, "utf8");
   const rows = new Map();
   const splitIds = (cell) => cell.split(",").map((entry) => entry.trim()).filter(Boolean);
   for (const line of spec.split("\n")) {
@@ -1711,7 +1714,7 @@ function readSpecMappingTable() {
 }
 
 function readSpecCoverageTable() {
-  const spec = readFileSync(resolve(process.cwd(), "specs/github-sec-inspector.spec.md"), "utf8");
+  const spec = readFileSync(SPEC_PATH, "utf8");
   const coverage = new Map();
   for (const line of spec.split("\n")) {
     const cells = line.split("|").map((cell) => cell.trim());
