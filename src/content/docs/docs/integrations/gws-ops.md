@@ -39,7 +39,7 @@ Every other `GOOGLE_WORKSPACE_CLI_*` variable in grclanker's environment is pass
 | `gws_ops_review_tokens` | Same as above with `"applicationName":"token"` | yes | Token and OAuth activity records with `actor.applicationInfo.applicationName` |
 | `gws_ops_collect_evidence_bundle` | The three commands above | yes | `raw/`, `analysis/`, `commands.json`, `summary.md`, `README.md`, and a zip |
 
-Every workflow accepts `dry_run: true` to print the exact command without executing it. `max_results` is clamped to 1-250 and `lookback_days` to 1-90.
+Every workflow accepts `dry_run: true` to print the exact command without executing it. `max_results` is clamped to 1-250 and `lookback_days` to 1-90; when a request exceeds 250 (for example 1000, the `activities.list` maximum), the notes state the requested value and the clamp rather than silently reporting 250.
 
 ## Result semantics
 

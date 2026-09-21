@@ -99,7 +99,7 @@ grclanker adds only:
 ### Deviations and caveats
 
 - The googleworkspace/cli source consulted for this release registers no `alertcenter` service alias, and `parse_service_and_version` resolves the `<service>:<version>` form through the alias table, so `gws alertcenter:v1beta1 alerts list` fails with a validation error (exit 3) on such a build. `gws_ops_investigate_alerts` reports that as an explicit error naming the cause and pointing to `gws_assess_monitoring`; the command is left in place so a build that adds the alias works unchanged.
-- `max_results` is clamped to 250 even though `activities.list` allows 1000, keeping operator output bounded; a trailing `nextPageToken` is reported instead of silently dropping records.
+- `max_results` is clamped to 250 even though `activities.list` allows 1000, keeping operator output bounded; a trailing `nextPageToken` is reported instead of silently dropping records, and when the requested value exceeded 250 the notes state the requested value and the clamp (for example `Max results: 250 (requested 1000, clamped to the bridge limit of 250; ...)`).
 
 ### What remains
 

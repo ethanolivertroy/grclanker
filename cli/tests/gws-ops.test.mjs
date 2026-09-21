@@ -346,6 +346,22 @@ test("curated commands match the published gws CLI shape: <service> <resource> <
   assert.match(token.command.command, /^\S+ admin-reports activities list --params '\{"userKey":"all","applicationName":"token"/);
 });
 
+test("max_results above the bridge limit is clamped to 250 and the clamp is stated in the notes", async () => {
+  const base = createTempBase("grclanker-gws-ops-clamp-");
+  const fake = createFakeBinary(base);
+
+  const admin = await traceGwsAdminActivity({ gwsBin: fake, max_results: 1000 }, createRunner());
+  assert.equal(JSON.parse(admin.command.args[4]).maxResults, 250);
+  assert.ok(admin.notes.some((note) => /^Max results: 250 \(requested 1000, clamped to the bridge limit of 250/.test(note)), admin.notes.join("\n"));
+
+  const alerts = await investigateGwsAlerts({ gwsBin: fake, max_results: 300 }, createRunner());
+  assert.equal(JSON.parse(alerts.command.args[4]).pageSize, 250);
+  assert.ok(alerts.notes.some((note) => /^Page size: 250 \(requested 300, clamped to the bridge limit of 250/.test(note)), alerts.notes.join("\n"));
+
+  const withinLimit = await reviewGwsTokenActivity({ gwsBin: fake, max_results: 40 }, createRunner());
+  assert.ok(withinLimit.notes.includes("Max results: 40"));
+});
+
 test("checkGwsCliAccess previews the probe command in dry-run mode", async () => {
   const base = createTempBase("grclanker-gws-ops-check-");
   const fake = createFakeBinary(base);

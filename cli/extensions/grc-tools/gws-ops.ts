@@ -593,6 +593,16 @@ function completenessNote(nextPageToken: string | undefined, count: number): str
     : `Complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query.`;
 }
 
+/** The clamp is stated in the notes so a request for 1000 is never silently reported as 250. */
+function maxResultsNote(value: unknown, label: string): string {
+  const requested = asNumber(value);
+  const effective = normalizeMaxResults(value);
+  if (requested !== undefined && Math.trunc(requested) > MAX_RESULTS_LIMIT) {
+    return `${label}: ${effective} (requested ${Math.trunc(requested)}, clamped to the bridge limit of ${MAX_RESULTS_LIMIT}; the underlying API allows more, so re-run with --page-all for the full population)`;
+  }
+  return `${label}: ${effective}`;
+}
+
 /**
  * Alert fields per the Alert Center Alert resource
  * (https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts):
@@ -860,6 +870,7 @@ export async function investigateGwsAlerts(
     asString(args.filter)
       ? `Alert filter passed through to gws: ${args.filter!.trim()}`
       : "No Alert Center filter was supplied; this query relies on page-size bounds instead of a time filter.",
+    maxResultsNote(args.max_results, "Page size"),
   ];
 
   if (mode === "dry_run") {
@@ -927,7 +938,7 @@ export async function traceGwsAdminActivity(
   const mode: GwsOpsMode = normalizeDryRun(args.dry_run) ? "dry_run" : "execute";
   const notes = [
     `Lookback window: ${normalizeLookbackDays(args.lookback_days)} day(s)`,
-    `Max results: ${normalizeMaxResults(args.max_results)}`,
+    maxResultsNote(args.max_results, "Max results"),
   ];
 
   if (mode === "dry_run") {
@@ -985,7 +996,7 @@ export async function reviewGwsTokenActivity(
   const mode: GwsOpsMode = normalizeDryRun(args.dry_run) ? "dry_run" : "execute";
   const notes = [
     `Lookback window: ${normalizeLookbackDays(args.lookback_days)} day(s)`,
-    `Max results: ${normalizeMaxResults(args.max_results)}`,
+    maxResultsNote(args.max_results, "Max results"),
     "This workflow focuses on token and OAuth activity telemetry, not a full tenant-wide token inventory clone.",
     "Use gws_assess_integrations when you need the broader native compliance view.",
   ];
