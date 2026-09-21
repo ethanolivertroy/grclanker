@@ -47,6 +47,23 @@ const DEFAULT_MAX_ADMINS = 10;
 const DEFAULT_MIN_PASSWORD_LENGTH = 12;
 const DEFAULT_MAX_SESSION_HOURS = 24;
 const DEFAULT_STALE_ALLOWLIST_DAYS = 365;
+const MAX_ASSIGNMENT_POLICIES = 50;
+const REDACTED = "[REDACTED]";
+const CREDENTIAL_LAST_SEGMENTS = new Set([
+  "token",
+  "secret",
+  "secrets",
+  "password",
+  "passwd",
+  "pwd",
+  "passphrase",
+  "apikey",
+  "authorization",
+  "credential",
+  "credentials",
+  "community",
+]);
+const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client"]);
 const JWT_ASSERTION_TTL_SECONDS = 45;
 const MAX_RETRY_AFTER_MS = 60_000;
 
@@ -839,6 +856,123 @@ export function redactSecrets(message: string, secrets: Array<string | undefined
   return redacted;
 }
 
+function keySegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment.length > 0);
+}
+
+export function isCredentialKey(name: string): boolean {
+  const segments = keySegments(name);
+  const last = segments[segments.length - 1];
+  if (!last) return false;
+  if (CREDENTIAL_LAST_SEGMENTS.has(last)) return true;
+  if (last === "key" && segments.length > 1 && CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2])) return true;
+  return false;
+}
+
+function safeDecode(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+function redactUrlQuery(text: string): string {
+  if (!/^https?:\/\/[^\s]+\?/i.test(text)) return text;
+  const [base, query] = text.split("?", 2);
+  const rewritten = query
+    .split("&")
+    .map((pair) => {
+      const [name] = pair.split("=", 1);
+      return isCredentialKey(safeDecode(name)) ? `${name}=${REDACTED}` : pair;
+    })
+    .join("&");
+  return `${base}?${rewritten}`;
+}
+
+/**
+ * Deep-copies a collected payload while replacing every value stored under a
+ * credential-shaped key (token, secret, password, api_key, ...) with a marker,
+ * including {name, value} and {key, value} pair shapes and token-bearing URL
+ * query parameters. Applied to every snapshot before it is written.
+ */
+export function redactCredentialValues(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactCredentialValues(entry));
+  if (typeof value === "string") return redactUrlQuery(value);
+  const record = asObject(value);
+  if (!record) return value;
+  const pairName = asString(record.name) ?? asString(record.key);
+  const redacted: JsonRecord = {};
+  for (const [key, entry] of Object.entries(record)) {
+    if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
+      redacted[key] = entry === null || entry === undefined ? entry : REDACTED;
+    } else {
+      redacted[key] = redactCredentialValues(entry);
+    }
+  }
+  return redacted;
+}
+
+function projectActor(actor: unknown): JsonRecord | null {
+  const record = asObject(actor);
+  if (!record) return null;
+  return { id: asString(record.id) ?? null, type: asString(record.type) ?? null, name: asString(record.name) ?? null, login: asString(record.login) ?? null };
+}
+
+/** Keeps only the event fields the verdicts read, dropping the free-form additional_details bucket. */
+export function projectEnterpriseEvent(event: JsonRecord): JsonRecord {
+  return {
+    event_id: asString(event.event_id) ?? null,
+    event_type: asString(event.event_type) ?? null,
+    created_at: asString(event.created_at) ?? null,
+    created_by: projectActor(event.created_by),
+    source: projectActor(event.source),
+    session_id: asString(event.session_id) ?? null,
+    ip_address: asString(event.ip_address) ?? null,
+  };
+}
+
+interface UnreadableInventory {
+  name: string;
+  endpoint: string;
+  reason: string;
+  unchecked: string;
+}
+
+function unreadableInventory(name: string, endpoint: string, dataset: CollectedDataset<unknown>, unchecked: string): UnreadableInventory | undefined {
+  if (!dataset.error) return undefined;
+  return { name, endpoint, reason: unreadableReason(dataset), unchecked };
+}
+
+/**
+ * Rule 1 corollary: a finding computed from several inventories never reports
+ * pass while one of them is unreadable. The unreadable inventories are named in
+ * the summary and recorded in the evidence; pass drops to warn.
+ */
+function capForUnreadableInventories(item: BoxFinding, inventories: Array<UnreadableInventory | undefined>, manualEvidence: string): BoxFinding {
+  const unreadable = inventories.filter((entry): entry is UnreadableInventory => entry !== undefined);
+  if (unreadable.length === 0) return item;
+  const evidence = {
+    ...(item.evidence ?? {}),
+    unreadable_inventories: unreadable.map(({ name, endpoint, reason }) => ({ name, endpoint, reason })),
+  };
+  if (item.status !== "pass" && item.status !== "warn") return { ...item, evidence };
+  const described = unreadable
+    .map((entry) => `${entry.name} (${entry.endpoint}) could not be read because ${entry.reason}, so ${entry.unchecked}`)
+    .join("; ");
+  return {
+    ...item,
+    status: "warn",
+    summary: `${item.summary} The verdict is capped at warn because ${described}.`,
+    evidence,
+    manualEvidence: item.manualEvidence ?? manualEvidence,
+  };
+}
+
 export function buildBoxJwtAssertion(options: {
   clientId: string;
   subjectId: string;
@@ -1052,11 +1186,12 @@ export class BoxApiClient implements BoxReadClient {
       const response = await this.fetchWithTimeout(url, { ...init, headers });
       const rawText = await response.text();
       let payload: JsonRecord = {};
+      let nonJsonDetail: string | undefined;
       if (rawText.length > 0) {
         try {
           payload = asObject(JSON.parse(rawText)) ?? {};
         } catch {
-          payload = { raw: rawText.slice(0, 240) };
+          nonJsonDetail = `non-JSON ${response.headers.get("content-type") ?? "unknown content type"} response body (${rawText.length} bytes, not echoed)`;
         }
       }
 
@@ -1076,7 +1211,7 @@ export class BoxApiClient implements BoxReadClient {
       }
 
       const summary = boxErrorSummary(payload);
-      const detail = summary.message ?? asString(payload.raw);
+      const detail = summary.message ?? nonJsonDetail;
       throw new BoxApiError(
         this.redact(`Box request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
         response.status,
@@ -1217,7 +1352,10 @@ export class BoxApiClient implements BoxReadClient {
       const entries = asRecordArray(payload.entries);
       items.push(...entries.slice(0, remaining));
       const nextMarker = asString(payload.next_marker);
-      if (entries.length === 0) break;
+      if (entries.length === 0) {
+        truncated = Boolean(nextMarker);
+        break;
+      }
       if (entries.length > remaining) {
         truncated = true;
         break;
@@ -1253,7 +1391,11 @@ export class BoxApiClient implements BoxReadClient {
       offset += entries.length;
       const totalCount = asNumber(payload.total_count);
       const moreAvailable = totalCount !== undefined ? offset < totalCount : entries.length >= requested;
-      if (entries.length === 0 || !moreAvailable) break;
+      if (entries.length === 0) {
+        truncated = moreAvailable && totalCount !== undefined;
+        break;
+      }
+      if (!moreAvailable) break;
       if (items.length >= limit) {
         truncated = true;
         break;
@@ -1320,8 +1462,8 @@ export class BoxApiClient implements BoxReadClient {
         const entries = asRecordArray(payload.entries);
         items.push(...entries.slice(0, remaining));
         const nextPosition = asString(payload.next_stream_position);
-        if (entries.length === 0 || !nextPosition || nextPosition === streamPosition) break;
-        if (entries.length > remaining || items.length >= limit) {
+        if (entries.length === 0) break;
+        if (!nextPosition || nextPosition === streamPosition || entries.length > remaining || items.length >= limit) {
           truncated = true;
           break;
         }
@@ -2137,7 +2279,10 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     unused_settings: externalUnused,
   };
   const externalManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: record whether external collaboration is enabled for everyone, restricted to allowlisted domains, or disabled.";
-  findings.push(
+  const allowlistUnreadable = unreadableInventory("collaboration_allowlist_entries", "/collaboration_whitelist_entries", data.allowlistEntries, "the permitted external domains were not checked");
+  const exemptTargetsUnreadable = unreadableInventory("collaboration_allowlist_exempt_targets", "/collaboration_whitelist_exempt_targets", data.exemptTargets, "users exempt from the domain restriction were not checked");
+  const collaborationConfigUnreadable = unreadableInventory("enterprise_configuration (content_and_sharing)", "/enterprise_configurations/{enterprise_id}", data.configuration, "the external collaboration mode that decides whether an empty allowlist is compliant was not checked");
+  findings.push(capForUnreadableInventories(
     !configReadable
       ? allowlistReadable && entries.length > 0
         ? finding(4, "warn", `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${configUnreadableReason}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
@@ -2147,13 +2292,17 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
         : externalStatus === "limit_collaboration_to_users_within_enterprise"
         ? finding(4, "pass", "External collaboration is limited to users within the enterprise.", externalEvidence)
         : externalStatus === "limit_collaboration_to_allowlisted_domains"
-          ? entries.length > 0 || !allowlistReadable
-            ? finding(4, "pass", `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible).`, externalEvidence)
-            : finding(4, "warn", "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
+          ? !allowlistReadable
+            ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the collaboration allowlist (/collaboration_whitelist_entries) could not be read because ${unreadableReason(data.allowlistEntries)}, so the permitted domains were not checked.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and confirm each entry is a business partner.")
+            : entries.length > 0
+              ? finding(4, "pass", `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible).`, externalEvidence)
+              : finding(4, "warn", "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
           : externalStatus === "enable_external_collaboration"
             ? finding(4, "fail", "External collaboration is enabled for any domain without an allowlist restriction.", externalEvidence)
             : finding(4, "warn", `External collaboration status "${externalStatus ?? "unknown"}" was not recognized; confirm the setting manually.`, externalEvidence),
-  );
+    [allowlistUnreadable],
+    externalManualEvidence,
+  ));
 
   const publicDomainEntries = entries.filter((entry) => isPublicEmailDomain(asString(entry.domain) ?? ""));
   const undatedEntries = entries.filter((entry) => parseIsoDate(entry.created_at) === undefined);
@@ -2178,7 +2327,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...(undatedEntries.length > 0 ? [`${undatedEntries.length} allowlist entries have a missing or unparseable created_at (a documented CollaborationAllowlistEntry field), so their age cannot be assessed`] : []),
     ...(exemptTargets.length > 0 ? [`${exemptTargets.length} users are exempt from domain restrictions`] : []),
   ];
-  findings.push(
+  findings.push(capForUnreadableInventories(
     !allowlistReadable
       ? finding(5, "manual", `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, allowlistManualEvidence)
       : publicDomainEntries.length > 0
@@ -2190,7 +2339,9 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
           : allowlistReviewReasons.length > 0
             ? finding(5, "warn", `${allowlistReviewReasons.join("; ")}; review them for continued need.`, allowlistEvidence, "Confirm with content owners that each stale, undated, or exempt entry still has an active business relationship, and record the creation date of any undated entry from the Admin Console export.")
             : finding(5, "pass", `${entries.length} allowlist entries are dated, recent, non-public domains with no user exemptions.`, allowlistEvidence),
-  );
+    [exemptTargetsUnreadable, collaborationConfigUnreadable],
+    allowlistManualEvidence,
+  ));
 
   const sharedLinkDefault = configString(configuration, "content_and_sharing", "shared_link_default_access");
   const sharedLinkAllowed = configString(configuration, "content_and_sharing", "shared_link_access");
@@ -2370,8 +2521,8 @@ async function collectAssignments(
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
   const result: Record<string, JsonRecord[]> = {};
   const errors: string[] = [];
-  let truncated = false;
-  for (const policy of policies.slice(0, 50)) {
+  let truncated = policies.length > MAX_ASSIGNMENT_POLICIES;
+  for (const policy of policies.slice(0, MAX_ASSIGNMENT_POLICIES)) {
     const policyId = asString(policy.id);
     if (!policyId) continue;
     try {
@@ -2482,15 +2633,18 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     active_policies: activeRetention.length,
     assigned_policies: assignedRetention.length,
   };
-  findings.push(
+  const retentionManualEvidence = "Admin Console > Governance > Retention: record each policy, its retention length, disposition action, and the folders or metadata it is assigned to.";
+  findings.push(capForUnreadableInventories(
     data.retentionPolicies.error
-      ? finding(12, "manual", `Retention policies could not be read because ${unreadableReason(data.retentionPolicies)}; this endpoint requires Box Governance and the manage_data_retention scope.`, retentionEvidence, "Admin Console > Governance > Retention: record each policy, its retention length, disposition action, and the folders or metadata it is assigned to.")
+      ? finding(12, "manual", `Retention policies could not be read because ${unreadableReason(data.retentionPolicies)}; this endpoint requires Box Governance and the manage_data_retention scope.`, retentionEvidence, retentionManualEvidence)
       : assignedRetention.length > 0
         ? finding(12, "pass", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments.`, retentionEvidence)
         : activeRetention.length > 0
           ? finding(12, "warn", `${activeRetention.length} active retention policies exist but none have visible assignments.`, retentionEvidence)
           : finding(12, "fail", "No active retention policies exist.", retentionEvidence),
-  );
+    [unreadableInventory("retention_policy_assignments", "/retention_policies/{policy_id}/assignments", data.retentionAssignments, "the folders and metadata each policy is assigned to were not checked (only the policy's own assignment_counts were read)")],
+    retentionManualEvidence,
+  ));
 
   const legalHolds = data.legalHoldPolicies.data;
   const activeHolds = legalHolds.filter((policy) => ["active", "applying"].includes(asString(policy.status) ?? ""));
@@ -2507,15 +2661,18 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     active_policies: activeHolds.length,
     assigned_policies: assignedHolds.length,
   };
-  findings.push(
+  const holdManualEvidence = "Admin Console > Governance > Legal Holds: record each policy, its custodians or folders, and confirm the legal team's hold process is documented.";
+  findings.push(capForUnreadableInventories(
     data.legalHoldPolicies.error
-      ? finding(13, "manual", `Legal hold policies could not be read because ${unreadableReason(data.legalHoldPolicies)}; this endpoint requires Box Governance and the manage_legal_holds scope.`, holdEvidence, "Admin Console > Governance > Legal Holds: record each policy, its custodians or folders, and confirm the legal team's hold process is documented.")
+      ? finding(13, "manual", `Legal hold policies could not be read because ${unreadableReason(data.legalHoldPolicies)}; this endpoint requires Box Governance and the manage_legal_holds scope.`, holdEvidence, holdManualEvidence)
       : assignedHolds.length > 0
         ? finding(13, "pass", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments.`, holdEvidence)
         : activeHolds.length > 0
           ? finding(13, "warn", `${activeHolds.length} active legal hold policies exist without visible assignments.`, holdEvidence)
           : finding(13, "warn", "No legal hold policies exist; confirm a documented process exists to create holds when litigation is anticipated.", holdEvidence, "Obtain the legal team's hold procedure and confirm Box Governance is licensed so holds can be applied when required."),
-  );
+    [unreadableInventory("legal_hold_policy_assignments", "/legal_hold_policy_assignments", data.legalHoldAssignments, "the custodians and content each hold covers were not checked (only the policy's own assignment_counts were read)")],
+    holdManualEvidence,
+  ));
 
   return {
     area: "data_governance",
@@ -2626,9 +2783,10 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     enabled_barriers: enabledBarriers.length,
   };
   const enabledWithSegments = enabledBarriers.filter((barrier) => (data.barrierSegments.data[asString(barrier.id) ?? ""]?.length ?? 0) > 0);
-  findings.push(
+  const barrierManualEvidence = "Admin Console > Shield > Information Barriers: record each barrier, its segments, and the restrictions between segments, or confirm barriers are not required for this enterprise.";
+  findings.push(capForUnreadableInventories(
     data.barriers.error
-      ? finding(15, "manual", `Shield information barriers could not be read because ${unreadableReason(data.barriers)}.`, barrierEvidence, "Admin Console > Shield > Information Barriers: record each barrier, its segments, and the restrictions between segments, or confirm barriers are not required for this enterprise.")
+      ? finding(15, "manual", `Shield information barriers could not be read because ${unreadableReason(data.barriers)}.`, barrierEvidence, barrierManualEvidence)
       : enabledWithSegments.length > 0
         ? finding(15, "pass", `${enabledWithSegments.length} enabled information barriers have segments defined.`, barrierEvidence)
         : enabledBarriers.length > 0
@@ -2636,7 +2794,9 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
           : barriers.length > 0
             ? finding(15, "warn", `${barriers.length} information barriers exist but none are enabled.`, barrierEvidence)
             : finding(15, "warn", "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
-  );
+    [unreadableInventory("shield_information_barrier_segments", "/shield_information_barrier_segments", data.barrierSegments, "the segments behind the enabled barriers were not checked")],
+    barrierManualEvidence,
+  ));
 
   const streamEvidence = {
     sampled_events: events.length,
@@ -2667,7 +2827,9 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     lookback_days: data.lookbackDays,
   };
   const monitoringManualEvidence = "Admin Console > Shield > Threat Detection: confirm anomalous download, session, and location detection rules are enabled and alerts route to the security team.";
-  findings.push(
+  const shieldConfigUnreadable = unreadableInventory("enterprise_configuration (shield)", "/enterprise_configurations/{enterprise_id}", data.configuration, "the configured Shield anomaly detection rules were not checked");
+  const monitoringEventsUnreadable = unreadableInventory("enterprise_events", "/events?stream_type=admin_logs", data.events, "Shield alert and block events were not checked");
+  findings.push(capForUnreadableInventories(
     !eventsReadable && !shieldReadable
       ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
       : anomalyRules.length > 0 || anomalyEvents.length > 0
@@ -2681,7 +2843,9 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
               : data.events.truncated
                 ? finding(25, "warn", `No Shield anomaly detection rules exist and no Shield alerts appeared in the ${events.length} sampled events, but the event collection stopped at the cap while Box reported more events, so alerts may exist beyond the sample; raise event_limit and rerun.`, monitoringEvidence, monitoringManualEvidence)
                 : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
-  );
+    [shieldConfigUnreadable, monitoringEventsUnreadable],
+    monitoringManualEvidence,
+  ));
 
   return {
     area: "shield_monitoring",
@@ -2980,11 +3144,15 @@ function buildFrameworkReport(title: string, framework: BoxFramework, findings: 
   return `${lines.join("\n")}\n`;
 }
 
+function projectEventDataset(dataset: CollectedDataset<JsonRecord[]>): CollectedDataset<JsonRecord[]> {
+  return { ...dataset, data: dataset.data.map(projectEnterpriseEvent) };
+}
+
 function buildQuickReference(): string {
   return [
     "# Box Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Box API responses used during this assessment.",
+    "- `core_data/` contains the Box API responses used during this assessment; enterprise events are projected to the actor, source, and timing fields the verdicts read, and any credential-shaped field (token, secret, password, api key) is replaced with [REDACTED] before it is written.",
     "- `core_data/collection_status.json` records, per snapshot file, the record count, any read error, and whether the list was truncated at its cap; truncated lists never support a PASS that depends on the absence of a record.",
     "- `analysis/` contains normalized findings and per-area assessment summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
@@ -3055,9 +3223,9 @@ export async function exportBoxAuditBundle(
     ["core_data/current_user.json", identityData.currentUser],
     ["core_data/users.json", identityData.users],
     ["core_data/groups.json", groups],
-    ["core_data/enterprise_events_activity.json", identityData.events],
-    ["core_data/enterprise_events_sharing.json", sharingData.events],
-    ["core_data/enterprise_events_shield.json", shieldData.events],
+    ["core_data/enterprise_events_activity.json", projectEventDataset(identityData.events)],
+    ["core_data/enterprise_events_sharing.json", projectEventDataset(sharingData.events)],
+    ["core_data/enterprise_events_shield.json", projectEventDataset(shieldData.events)],
     ["core_data/device_pinners.json", governanceData.devicePinners],
     ["core_data/classification_template.json", governanceData.classificationTemplate],
     ["core_data/metadata_templates.json", governanceData.metadataTemplates],
@@ -3103,7 +3271,7 @@ export async function exportBoxAuditBundle(
     }],
   ];
   for (const [pathname, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathname, serializeJson(value));
+    await writeSecureTextFile(outputDir, pathname, serializeJson(redactCredentialValues(value)));
   }
 
   for (const assessment of assessments) {

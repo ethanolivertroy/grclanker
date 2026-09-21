@@ -33,6 +33,7 @@ import {
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/box.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -649,7 +650,7 @@ test("BoxApiClient exchanges Client Credentials Grant and paginates users with m
 
   const events = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], createdAfter: NOW, limit: 5 });
   assert.deepEqual(events.items.map((entry) => entry.event_id), ["e-1", "e-2"]);
-  assert.equal(events.truncated, false, "the stream position stopped advancing, so the stream was drained");
+  assert.equal(events.truncated, true, "a stream position that stops advancing while entries keep arriving cannot be drained, so the sample is partial");
   const eventCalls = seen.filter((call) => call.pathname === "/2.0/events");
   assert.equal(eventCalls[0].params.get("stream_type"), "admin_logs");
   assert.equal(eventCalls[0].params.get("event_type"), "LOGIN");
@@ -703,6 +704,81 @@ test("BoxApiClient reports list truncation only when a marker, offset, or stream
   const events = await client.listEnterpriseEvents({ limit: 3 });
   assert.equal(events.items.length, 3);
   assert.equal(events.truncated, true, "the cap filled while a fresh next_stream_position remained");
+});
+
+test("verdict rule 10: every Box pagination exit that leaves records behind reports truncated", async () => {
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/2.0/users") {
+      const marker = url.searchParams.get("marker");
+      if (!marker) return jsonResponse({ entries: [{ id: "user-1", type: "user" }], next_marker: "marker-2" });
+      return jsonResponse({ entries: [], next_marker: "marker-3" });
+    }
+    if (url.pathname === "/2.0/groups") {
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      if (offset === 0) return jsonResponse({ entries: [{ id: "group-1", type: "group" }], total_count: 5, offset, limit: 1 });
+      return jsonResponse({ entries: [], total_count: 5, offset, limit: 1 });
+    }
+    if (url.pathname === "/2.0/events") {
+      const kind = url.searchParams.get("event_type");
+      const position = url.searchParams.get("stream_position");
+      if (kind === "LOGIN") {
+        return jsonResponse({ entries: [{ event_id: `e-${position ?? "0"}`, event_type: "LOGIN" }], next_stream_position: "stuck" });
+      }
+      return jsonResponse({ entries: [{ event_id: "e-1", event_type: "DOWNLOAD" }] });
+    }
+    if (url.pathname === "/2.0/retention_policies") {
+      return jsonResponse({ entries: Array.from({ length: 60 }, (_, index) => ({ id: `policy-${index}`, type: "retention_policy", status: "active", assignment_counts: { folder: 1 } })), next_marker: null });
+    }
+    if (/^\/2\.0\/retention_policies\/[^/]+\/assignments$/.test(url.pathname)) {
+      return jsonResponse({ entries: [{ id: `assignment-${url.pathname.split("/")[3]}`, type: "retention_policy_assignment" }], next_marker: null });
+    }
+    if (url.pathname === "/2.0/legal_hold_policies") return jsonResponse({ entries: [], next_marker: null });
+    if (url.pathname === "/2.0/metadata_templates/enterprise") return jsonResponse({ entries: [], next_marker: null });
+    if (url.pathname.startsWith("/2.0/enterprises/")) return jsonResponse({ entries: [], next_marker: null });
+    if (url.pathname.startsWith("/2.0/metadata_templates/enterprise/")) return jsonResponse({ fields: [] });
+    if (url.pathname.startsWith("/2.0/enterprise_configurations/")) return jsonResponse(hardenedConfiguration());
+    return jsonResponse({}, { status: 404 });
+  };
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined }), { fetchImpl, now: () => NOW });
+
+  const emptyPageWithMarker = await client.listUsers(10);
+  assert.deepEqual(emptyPageWithMarker.items.map((entry) => entry.id), ["user-1"]);
+  assert.equal(emptyPageWithMarker.truncated, true, "an empty marker page that still carries next_marker is a partial inventory");
+
+  const emptyPageBelowTotal = await client.listGroups(10);
+  assert.deepEqual(emptyPageBelowTotal.items.map((entry) => entry.id), ["group-1"]);
+  assert.equal(emptyPageBelowTotal.truncated, true, "an empty offset page while offset < total_count is a partial inventory");
+
+  const stuckPosition = await client.listEnterpriseEvents({ eventTypes: ["LOGIN"], limit: 10 });
+  assert.equal(stuckPosition.items.length, 2);
+  assert.equal(stuckPosition.truncated, true, "a next_stream_position that stops advancing while entries keep arriving is a partial inventory");
+
+  const missingPosition = await client.listEnterpriseEvents({ eventTypes: ["DOWNLOAD"], limit: 10 });
+  assert.equal(missingPosition.items.length, 1);
+  assert.equal(missingPosition.truncated, true, "a non-empty page without next_stream_position cannot be continued");
+
+  const governance = await assessBoxDataGovernance(client, { listLimit: 100 });
+  const cap = governance.truncated.find((note) => note.startsWith("retention_policy_assignments:"));
+  assert.ok(cap, `the 50-policy assignment cap must be recorded, got ${JSON.stringify(governance.truncated)}`);
+  assert.match(cap, /stopped at the 50-record cap/);
+  assert.equal(findingById(governance, "BOX-12").status, "pass", "assignment presence is still proven for the 50 policies that were read");
+});
+
+test("verdict rule 9: non-JSON error bodies are described, never echoed, into Box error text", async () => {
+  const fetchImpl = async () => new Response(`<html><body>gateway error; upstream header Authorization: Bearer FAKE_SECRET_TOKEN_8</body></html>`, {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { "content-type": "text/html" },
+  });
+  const client = new BoxApiClient(sampleConfig({ authMode: "oauth", accessToken: "token", clientId: undefined, clientSecret: undefined, maxRetries: 0 }), { fetchImpl, now: () => NOW });
+  await assert.rejects(client.listUsers(5), (error) => {
+    assert.ok(error instanceof BoxApiError);
+    assert.equal(error.status, 502);
+    assert.match(error.message, /non-JSON text\/html response body \(\d+ bytes, not echoed\)/);
+    assert.doesNotMatch(error.message, /FAKE_SECRET_TOKEN_8|gateway error/);
+    return true;
+  });
 });
 
 test("BoxApiClient retries 429 and 5xx responses with backoff and redacts secrets from errors", async () => {
@@ -1654,6 +1730,94 @@ test("exportBoxAuditBundle records truncated snapshots without counting them as 
   assert.match(executive, /## Truncated Datasets/);
   assert.match(executive, /raise user_limit/);
   assert.doesNotMatch(executive, /Partial Collection Warnings/);
+});
+
+const MULTI_INVENTORY_CASES = [
+  { id: "BOX-02", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users/ },
+  { id: "BOX-02", assess: assessBoxIdentityAccess, secondary: "getEnterpriseConfiguration", names: /MFA settings/ },
+  { id: "BOX-03", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users/ },
+  { id: "BOX-03", assess: assessBoxIdentityAccess, secondary: "getEnterpriseConfiguration", names: /MFA settings/ },
+  { id: "BOX-24", assess: assessBoxIdentityAccess, secondary: "listEnterpriseEvents", names: /events were unreadable/ },
+  { id: "BOX-24", assess: assessBoxIdentityAccess, secondary: "listUsers", names: /users were unreadable/ },
+  { id: "BOX-04", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistEntries", names: /collaboration allowlist \(\/collaboration_whitelist_entries\)/ },
+  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "listCollaborationAllowlistExemptTargets", names: /collaboration_allowlist_exempt_targets \(\/collaboration_whitelist_exempt_targets\)/ },
+  { id: "BOX-05", assess: assessBoxSharingCollaboration, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(content_and_sharing\)/ },
+  { id: "BOX-12", assess: assessBoxDataGovernance, secondary: "listRetentionPolicyAssignments", names: /retention_policy_assignments \(\/retention_policies\/\{policy_id\}\/assignments\)/ },
+  { id: "BOX-13", assess: assessBoxDataGovernance, secondary: "listLegalHoldPolicyAssignments", names: /legal_hold_policy_assignments \(\/legal_hold_policy_assignments\)/ },
+  { id: "BOX-15", assess: assessBoxShieldMonitoring, secondary: "listShieldInformationBarrierSegments", names: /shield_information_barrier_segments \(\/shield_information_barrier_segments\)/ },
+  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "getEnterpriseConfiguration", names: /enterprise_configuration \(shield\)/ },
+  { id: "BOX-25", assess: assessBoxShieldMonitoring, secondary: "listEnterpriseEvents", names: /enterprise_events \(\/events\?stream_type=admin_logs\)/ },
+];
+
+test("verdict rule 1 corollary: Box findings that read several inventories never pass while a secondary inventory is forbidden", async () => {
+  for (const testCase of MULTI_INVENTORY_CASES) {
+    const baseline = findingById(await testCase.assess(createStubClient(hardenedFixture())), testCase.id);
+    assert.equal(baseline.status, "pass", `${testCase.id} must pass on the hardened fixture so the demotion below is meaningful`);
+
+    const degraded = await testCase.assess(createStubClient(hardenedFixture(), { [testCase.secondary]: forbidden("scope missing") }));
+    const found = findingById(degraded, testCase.id);
+    assert.notEqual(found.status, "pass", `${testCase.id} passed while ${testCase.secondary} returned 403: ${found.summary}`);
+    assert.ok(["warn", "manual"].includes(found.status), `${testCase.id} should be warn or manual, got ${found.status}`);
+    assert.match(found.summary, testCase.names, `${testCase.id} summary must name the unreadable inventory when ${testCase.secondary} is forbidden`);
+    assert.ok(found.manualEvidence, `${testCase.id} must tell a human what evidence to collect`);
+    assert.ok(degraded.errors.some((entry) => /scope missing/.test(entry)), "the 403 is also disclosed in the errors array");
+  }
+});
+
+const BOX_FAKE_SECRETS = [
+  "FAKE_SECRET_TOKEN_1",
+  "FAKE_SECRET_TOKEN_2",
+  "FAKE_SECRET_TOKEN_3",
+  "FAKE_SECRET_TOKEN_4",
+  "FAKE_SECRET_TOKEN_5",
+  "FAKE_SECRET_TOKEN_6",
+  "FAKE_SECRET_TOKEN_7",
+];
+
+function secretBearingFixture() {
+  const fixture = hardenedFixture();
+  fixture.events[0].additional_details = { shared_link: "https://app.box.com/s/FAKE_SECRET_TOKEN_1", access_token: "FAKE_SECRET_TOKEN_2" };
+  fixture.users[1].tracking_codes = [{ type: "tracking_code", name: "api_token", value: "FAKE_SECRET_TOKEN_3" }];
+  fixture.configuration.security.sso_shared_secret = item("FAKE_SECRET_TOKEN_4");
+  fixture.shieldLists[1].content.integrations[0].client_secret = "FAKE_SECRET_TOKEN_5";
+  fixture.retentionPolicies[0].notification_webhook = "https://hooks.example.com/notify?token=FAKE_SECRET_TOKEN_6&policy=retention-1";
+  fixture.groups[0].provisioning_password = "FAKE_SECRET_TOKEN_7";
+  return fixture;
+}
+
+test("verdict rule 9: the Box bundle and its zip never carry credential-shaped values from any collected object", async () => {
+  const base = createTempBase("grclanker-box-export-secrets-");
+  const result = await exportBoxAuditBundle(createStubClient(secretBearingFixture()), sampleConfig(), base);
+
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.size >= 40, `expected the full bundle layout, got ${files.size} files`);
+  assertSecretsAbsent(assert, files, BOX_FAKE_SECRETS, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "every written file is archived");
+  assertSecretsAbsent(assert, zipEntries, BOX_FAKE_SECRETS, "zip archive");
+
+  const events = JSON.parse(files.get("core_data/enterprise_events_activity.json"));
+  assert.ok(events.length > 0);
+  assert.ok(events.every((event) => event.additional_details === undefined), "events are projected to the fields the verdicts read");
+  assert.equal(events[0].event_type, "ADMIN_LOGIN");
+  assert.equal(events[0].created_by.id, "admin-1");
+
+  const users = JSON.parse(files.get("core_data/users.json"));
+  assert.deepEqual(users[1].tracking_codes, [{ type: "tracking_code", name: "api_token", value: "[REDACTED]" }], "pair-shaped credentials keep their name and lose their value");
+  const configuration = JSON.parse(files.get("core_data/enterprise_configuration.json"));
+  assert.equal(configuration.security.sso_shared_secret, "[REDACTED]");
+  assert.equal(configuration.security.is_multi_factor_auth_required.value, true, "non-credential settings are untouched");
+  const shieldLists = JSON.parse(files.get("core_data/shield_lists.json"));
+  assert.equal(shieldLists[1].content.integrations[0].client_secret, "[REDACTED]");
+  assert.equal(shieldLists[1].content.integrations[0].id, "app-1");
+  const retention = JSON.parse(files.get("core_data/retention_policies.json"));
+  assert.equal(retention[0].notification_webhook, "https://hooks.example.com/notify?token=[REDACTED]&policy=retention-1");
+  const groups = JSON.parse(files.get("core_data/groups.json"));
+  assert.equal(groups[0].provisioning_password, "[REDACTED]");
+
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  assert.equal(findings.filter((entry) => entry.status === "pass").length, JSON.parse(readFileSync(join(result.outputDir, "analysis/summary.json"), "utf8")).status_counts.pass);
+  assert.equal(result.errorCount, 0, "redaction never counts as a collection error");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
