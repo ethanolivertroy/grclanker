@@ -1909,7 +1909,7 @@ function enrollmentCompleted(enrollment: JsonRecord): boolean {
 }
 
 function enrollmentActivityDate(enrollment: JsonRecord): Date | undefined {
-  return toDate(enrollment.completion_date) ?? toDate(enrollment.start_date) ?? toDate(enrollment.enrollment_date);
+  return toDate(enrollment.completion_date) ?? toDate(enrollment.start_date);
 }
 
 function campaignEndDate(campaign: JsonRecord): Date | undefined {
