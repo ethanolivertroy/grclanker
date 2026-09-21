@@ -92,7 +92,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -314,6 +314,7 @@ export interface AwsAuditBundleResult {
   zipPath: string;
   fileCount: number;
   findingCount: number;
+  errorCount: number;
 }
 
 type CheckAccessArgs = {
@@ -348,6 +349,13 @@ type ExportAuditBundleArgs = CheckAccessArgs & {
   lookback_days?: number;
   policy_limit?: number;
   max_findings?: number;
+  regions?: string[];
+  region_limit?: number;
+  bucket_limit?: number;
+  key_limit?: number;
+  instance_limit?: number;
+  resource_limit?: number;
+  sensitive_ports?: number[];
 };
 
 function asObject(value: unknown): JsonRecord | undefined {
@@ -2955,52 +2963,164 @@ function formatAssessmentText(result: AwsAssessmentResult): string {
   ].join("\n");
 }
 
+function countByStatus(findings: AwsFinding[]): Record<AwsFinding["status"], number> {
+  const counts: Record<AwsFinding["status"], number> = { pass: 0, warn: 0, fail: 0, manual: 0 };
+  for (const item of findings) counts[item.status] += 1;
+  return counts;
+}
+
+function severityRank(severity: AwsFinding["severity"]): number {
+  switch (severity) {
+    case "critical":
+      return 0;
+    case "high":
+      return 1;
+    case "medium":
+      return 2;
+    case "low":
+      return 3;
+    case "info":
+      return 4;
+    default: {
+      const exhaustive: never = severity;
+      return exhaustive;
+    }
+  }
+}
+
+function markdownEscape(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
+function mappingsForFramework(item: AwsFinding, framework: AwsFrameworkDescriptor): string[] {
+  const prefix = `${framework.label} `;
+  return item.mappings.filter((mapping) => mapping.startsWith(prefix)).map((mapping) => mapping.slice(prefix.length));
+}
+
+export function coveredAwsControls(findings: AwsFinding[]): number[] {
+  const covered = new Set<number>();
+  for (const item of findings) {
+    for (const controlNumber of AWS_FINDING_CONTROLS[item.id] ?? []) covered.add(controlNumber);
+  }
+  return [...covered].sort((left, right) => left - right);
+}
+
 function buildExecutiveSummary(
   config: AwsResolvedConfig,
   assessments: AwsAssessmentResult[],
+  errors: string[],
+  generatedAt: Date,
 ): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const failCount = findings.filter((item) => item.status === "fail").length;
-  const warnCount = findings.filter((item) => item.status === "warn").length;
-  const passCount = findings.filter((item) => item.status === "pass").length;
-  const criticalCount = findings.filter((item) => item.severity === "critical").length;
-  const highCount = findings.filter((item) => item.severity === "high").length;
+  const counts = countByStatus(findings);
+  const covered = coveredAwsControls(findings);
+  const prioritized = findings
+    .filter((item) => item.status === "fail" || item.status === "warn")
+    .sort((left, right) => (left.status === right.status ? severityRank(left.severity) - severityRank(right.severity) : left.status === "fail" ? -1 : 1))
+    .slice(0, 10);
+  const manual = findings.filter((item) => item.status === "manual");
 
   return [
-    "# AWS Audit Bundle",
+    "# AWS Security Inspector Executive Summary",
     "",
-    `Region: ${config.region}`,
-    `Generated: ${new Date().toISOString()}`,
+    `- Region: ${config.region}`,
+    `- Account hint: ${config.accountId ?? "not provided"}`,
+    `- Generated: ${generatedAt.toISOString()}`,
+    `- Source chain: ${config.sourceChain.join(" -> ")}`,
+    `- Findings: ${findings.length}`,
+    `- Spec controls covered: ${covered.length} of ${Object.keys(AWS_CONTROL_CATALOG).length} (${covered.join(", ")})`,
     "",
     "## Result Counts",
     "",
-    `- Failed controls: ${failCount}`,
-    `- Warning controls: ${warnCount}`,
-    `- Passing controls: ${passCount}`,
-    `- Critical-severity controls: ${criticalCount}`,
-    `- High-severity controls: ${highCount}`,
+    `- Pass: ${counts.pass}`,
+    `- Warn: ${counts.warn}`,
+    `- Fail: ${counts.fail}`,
+    `- Manual: ${counts.manual}`,
     "",
     "## Highest Priority Findings",
     "",
-    ...findings
-      .filter((item) => item.status !== "pass")
-      .slice(0, 10)
-      .map((item) => `- ${item.id} (${item.severity.toUpperCase()} / ${item.status.toUpperCase()}): ${item.summary}`),
+    ...(prioritized.length > 0
+      ? prioritized.map((item) => `- ${item.id} ${item.title} (${item.severity.toUpperCase()} / ${item.status.toUpperCase()}): ${item.summary}`)
+      : ["- No failing or warning findings were generated."]),
+    "",
+    "## Manual Evidence Required",
+    "",
+    ...(manual.length > 0
+      ? manual.map((item) => `- ${item.id} ${item.title}: ${item.summary}`)
+      : ["- Every finding was decided from API evidence."]),
+    ...(errors.length > 0 ? ["", "## Collection Warnings", "", ...errors.map((error) => `- ${error}`)] : []),
+    "",
   ].join("\n");
 }
 
-function buildControlMatrix(findings: AwsFinding[]): string {
-  const rows = findings.map((item) => [
-    item.id,
-    item.severity.toUpperCase(),
-    item.status.toUpperCase(),
-    item.title,
-    item.mappings.join(", "),
-  ]);
+function buildUnifiedMatrix(findings: AwsFinding[]): string {
+  const header = ["Finding", "Controls", "Title", "Status", "Severity", ...AWS_FRAMEWORKS.map((framework) => framework.label)];
   return [
-    "# AWS Control Matrix",
+    "# Unified Compliance Matrix",
     "",
-    formatTable(["Control", "Severity", "Status", "Title", "Mappings"], rows),
+    `| ${header.join(" | ")} |`,
+    `| ${header.map(() => "---").join(" | ")} |`,
+    ...findings.map((item) => `| ${[
+      item.id,
+      (AWS_FINDING_CONTROLS[item.id] ?? []).join(", ") || "N/A",
+      item.title,
+      item.status,
+      item.severity,
+      ...AWS_FRAMEWORKS.map((framework) => mappingsForFramework(item, framework).join(", ") || "N/A"),
+    ].map(markdownEscape).join(" | ")} |`),
+    "",
+  ].join("\n");
+}
+
+function buildFrameworkReport(framework: AwsFrameworkDescriptor, findings: AwsFinding[]): string {
+  const scoped = findings.filter((item) => mappingsForFramework(item, framework).length > 0);
+  if (scoped.length === 0) {
+    return `# ${framework.label} Report\n\nNo mapped findings were generated for this framework.\n`;
+  }
+  const counts = countByStatus(scoped);
+  return [
+    `# ${framework.label} Report`,
+    "",
+    `- Mapped findings: ${scoped.length}`,
+    `- Pass: ${counts.pass}, Warn: ${counts.warn}, Fail: ${counts.fail}, Manual: ${counts.manual}`,
+    "",
+    "| Finding | Title | Status | Severity | Mapping | Summary |",
+    "| --- | --- | --- | --- | --- | --- |",
+    ...scoped.map((item) => `| ${[
+      item.id,
+      item.title,
+      item.status,
+      item.severity,
+      mappingsForFramework(item, framework).join(", "),
+      item.summary,
+    ].map(markdownEscape).join(" | ")} |`),
+    "",
+  ].join("\n");
+}
+
+function buildQuickReference(assessments: AwsAssessmentResult[], access: AwsAccessCheckResult, errors: string[]): string {
+  const findings = assessments.flatMap((assessment) => assessment.findings);
+  const counts = countByStatus(findings);
+  return [
+    "# AWS Audit Bundle Quick Reference",
+    "",
+    `Access check: ${access.status} (${access.surfaces.filter((surface) => surface.status === "readable").length}/${access.surfaces.length} surfaces readable)`,
+    `Findings: ${findings.length} (pass ${counts.pass}, warn ${counts.warn}, fail ${counts.fail}, manual ${counts.manual})`,
+    "",
+    "## Where to look",
+    "",
+    "- `compliance/executive_summary.md`: prioritized findings, manual evidence list, and control coverage",
+    "- `compliance/unified_compliance_matrix.md`: every finding mapped across FedRAMP, CMMC, SOC 2, CIS AWS, PCI-DSS, DISA STIG, IRAP, and ISMAP",
+    "- `compliance/frameworks/*.md`: one report per framework",
+    "- `analysis/findings.json`: normalized findings (id, title, severity, status, summary, evidence, mappings)",
+    "- `analysis/<category>.json`: per-assessment summaries and collection errors",
+    "- `core_data/access.json`: readable AWS audit surfaces",
+    ...(errors.length > 0 ? ["- `_errors.log`: surfaces that failed or were truncated during collection"] : []),
+    "",
+    "## Findings by status",
+    "",
+    ...findings.map((item) => `- ${item.id} ${item.title}: ${item.status.toUpperCase()}`),
+    "",
   ].join("\n");
 }
 
@@ -3008,21 +3128,25 @@ function buildBundleReadme(): string {
   return [
     "# AWS Evidence Bundle",
     "",
-    "This bundle was generated by grclanker's native AWS tools.",
+    "This bundle was generated by grclanker's native AWS security inspector tools.",
     "",
     "## Contents",
     "",
-    "- `summary.md`: combined human-readable assessment output",
-    "- `reports/executive-summary.md`: prioritized audit summary",
-    "- `reports/control-matrix.md`: framework mapping matrix",
-    "- `reports/*.md`: per-assessment markdown reports",
+    "- `QUICK_REFERENCE.md`: orientation and finding status list",
+    "- `compliance/executive_summary.md`: prioritized audit summary and spec control coverage",
+    "- `compliance/unified_compliance_matrix.md`: cross-framework mapping matrix",
+    "- `compliance/frameworks/*.md`: per-framework reports",
     "- `analysis/*.json`: normalized findings and assessment details",
     "- `core_data/access.json`: accessible AWS audit surface inventory",
     "- `metadata.json`: non-secret run metadata",
+    "- `_errors.log`: present only when some surfaces failed or were truncated",
     "",
-    "Credentials are resolved through the AWS SDK chain and are not written to this bundle.",
+    "Credentials are resolved through the AWS SDK chain and are never written to this bundle.",
+    "",
   ].join("\n");
 }
+
+const ASSESSMENT_CATEGORIES = ["identity", "logging-detection", "org-guardrails", "data-protection", "network-security"] as const;
 
 export async function exportAwsAuditBundle(
   client: AwsAuditorClient,
@@ -3030,6 +3154,7 @@ export async function exportAwsAuditBundle(
   outputRoot: string,
   options: ExportAuditBundleArgs = {},
 ): Promise<AwsAuditBundleResult> {
+  const now = new Date();
   const access = await checkAwsAccess(client);
   const identity = await assessAwsIdentity(client, {
     userLimit: options.user_limit,
@@ -3043,40 +3168,79 @@ export async function exportAwsAuditBundle(
   const orgGuardrails = await assessAwsOrgGuardrails(client, {
     maxFindings: options.max_findings,
   });
+  const dataProtection = await assessAwsDataProtection(client, {
+    regions: options.regions,
+    regionLimit: options.region_limit,
+    bucketLimit: options.bucket_limit,
+    keyLimit: options.key_limit,
+    instanceLimit: options.instance_limit,
+  });
+  const networkSecurity = await assessAwsNetworkSecurity(client, {
+    regions: options.regions,
+    regionLimit: options.region_limit,
+    resourceLimit: options.resource_limit,
+    sensitivePorts: options.sensitive_ports,
+  });
 
-  const assessments = [identity, loggingDetection, orgGuardrails];
+  const assessments = [identity, loggingDetection, orgGuardrails, dataProtection, networkSecurity];
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const targetName = safeDirName(`${config.accountId ?? "aws-account"}-${config.region}-audit`);
+  const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors ?? []))];
+  const counts = countByStatus(findings);
+  const accountId = access.accountId ?? config.accountId ?? "aws-account";
+  const targetName = safeDirName(`${accountId}-${config.region}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
 
   await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
+  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(assessments, access, errors));
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
     region: config.region,
     profile: config.profile ?? null,
+    account_id: access.accountId ?? null,
     account_id_hint: config.accountId ?? null,
     source_chain: config.sourceChain,
-    generated_at: new Date().toISOString(),
+    generated_at: now.toISOString(),
+    findings: findings.length,
+    controls_covered: coveredAwsControls(findings),
+    controls_total: Object.keys(AWS_CONTROL_CATALOG).length,
+    ...counts,
     options: {
       user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
       stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
       role_limit: options.role_limit ?? DEFAULT_ROLE_LIMIT,
       max_privileged_roles: options.max_privileged_roles ?? DEFAULT_MAX_PRIVILEGED_ROLES,
+      lookback_days: options.lookback_days ?? DEFAULT_ROOT_LOOKBACK_DAYS,
+      policy_limit: options.policy_limit ?? DEFAULT_POLICY_LIMIT,
       max_findings: options.max_findings ?? DEFAULT_MAX_FINDINGS,
+      regions: options.regions ?? null,
+      region_limit: options.region_limit ?? DEFAULT_REGION_LIMIT,
+      bucket_limit: options.bucket_limit ?? DEFAULT_BUCKET_LIMIT,
+      key_limit: options.key_limit ?? DEFAULT_KEY_LIMIT,
+      instance_limit: options.instance_limit ?? DEFAULT_INSTANCE_LIMIT,
+      resource_limit: options.resource_limit ?? DEFAULT_RESOURCE_LIMIT,
+      sensitive_ports: options.sensitive_ports ?? DEFAULT_SENSITIVE_PORTS,
     },
   }));
-  await writeSecureTextFile(outputDir, "summary.md", assessments.map(formatAssessmentText).join("\n\n"));
-  await writeSecureTextFile(outputDir, "reports/executive-summary.md", buildExecutiveSummary(config, assessments));
-  await writeSecureTextFile(outputDir, "reports/control-matrix.md", buildControlMatrix(findings));
-  await writeSecureTextFile(outputDir, "reports/identity.md", formatAssessmentText(identity));
-  await writeSecureTextFile(outputDir, "reports/logging-detection.md", formatAssessmentText(loggingDetection));
-  await writeSecureTextFile(outputDir, "reports/org-guardrails.md", formatAssessmentText(orgGuardrails));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/logging-detection.json", serializeJson(loggingDetection));
-  await writeSecureTextFile(outputDir, "analysis/org-guardrails.json", serializeJson(orgGuardrails));
   await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
+  for (const [index, category] of ASSESSMENT_CATEGORIES.entries()) {
+    await writeSecureTextFile(outputDir, `analysis/${category}.json`, serializeJson(assessments[index]));
+  }
+  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
+    findings: findings.length,
+    controls_covered: coveredAwsControls(findings),
+    ...counts,
+    categories: ASSESSMENT_CATEGORIES.map((category, index) => ({ category, ...countByStatus(assessments[index].findings) })),
+  }));
+  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, now));
+  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  for (const framework of AWS_FRAMEWORKS) {
+    await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.file}.md`, buildFrameworkReport(framework, findings));
+  }
+  if (errors.length > 0) {
+    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+  }
 
-  const zipPath = `${outputDir}.zip`;
+  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
   await createZipArchive(outputDir, zipPath);
   const fileCount = await countFilesRecursively(outputDir);
 
@@ -3085,6 +3249,7 @@ export async function exportAwsAuditBundle(
     zipPath,
     fileCount,
     findingCount: findings.length,
+    errorCount: errors.length,
   };
 }
 
@@ -3186,6 +3351,13 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
     lookback_days: asNumber(value.lookback_days),
     policy_limit: asNumber(value.policy_limit),
     max_findings: asNumber(value.max_findings),
+    regions: parseRegionList(value.regions),
+    region_limit: asNumber(value.region_limit),
+    bucket_limit: asNumber(value.bucket_limit),
+    key_limit: asNumber(value.key_limit),
+    instance_limit: asNumber(value.instance_limit),
+    resource_limit: asNumber(value.resource_limit),
+    sensitive_ports: parsePortList(value.sensitive_ports),
   };
 }
 

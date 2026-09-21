@@ -3,15 +3,17 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import {
   AWS_CONTROL_CATALOG,
   AWS_FINDING_CONTROLS,
+  AWS_FRAMEWORKS,
   assessAwsDataProtection,
   assessAwsIdentity,
   assessAwsLoggingDetection,
@@ -394,9 +396,11 @@ test("assessAwsOrgGuardrails flags external access and missing Identity Center",
   assert.equal(result.findings.find((item) => item.id === "AWS-ORG-05")?.status, "warn");
 });
 
-test("exportAwsAuditBundle writes reports, analysis, and archive", async () => {
-  const base = createTempBase("grclanker-aws-export-");
-  const client = {
+/** Fixture (d) for the bundle: a compliant account across all five assessment categories. */
+function compliantBundleClient(overrides = {}) {
+  return {
+    ...compliantDataProtectionClient(),
+    ...compliantNetworkClient(),
     getResolvedConfig: () => sampleConfig(),
     getNow: () => new Date("2026-04-16T00:00:00.000Z"),
     async getCallerIdentity() {
@@ -492,18 +496,93 @@ test("exportAwsAuditBundle writes reports, analysis, and archive", async () => {
     async getSecurityAlternateContact() {
       return { Name: "Security Team", Title: "CISO", EmailAddress: "security@example.com", PhoneNumber: "+1 555 0100" };
     },
+    ...overrides,
   };
+}
 
-  const result = await exportAwsAuditBundle(client, sampleConfig(), base);
+test("exportAwsAuditBundle fixture (d): compliant account writes the shared layout with no error log", async () => {
+  const base = createTempBase("grclanker-aws-export-");
+  const result = await exportAwsAuditBundle(compliantBundleClient(), sampleConfig(), base);
+
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));
-  assert.ok(result.fileCount >= 12);
-  assert.equal(result.findingCount, 20);
+  assert.equal(basename(result.zipPath), `${basename(result.outputDir)}.zip`);
+  assert.equal(result.findingCount, 27);
+  assert.equal(result.errorCount, 0);
+  assert.ok(result.fileCount >= 20);
+
+  for (const relative of [
+    "README.md",
+    "QUICK_REFERENCE.md",
+    "metadata.json",
+    "core_data/access.json",
+    "analysis/findings.json",
+    "analysis/summary.json",
+    "analysis/identity.json",
+    "analysis/logging-detection.json",
+    "analysis/org-guardrails.json",
+    "analysis/data-protection.json",
+    "analysis/network-security.json",
+    "compliance/executive_summary.md",
+    "compliance/unified_compliance_matrix.md",
+    ...AWS_FRAMEWORKS.map((framework) => `compliance/frameworks/${framework.file}.md`),
+  ]) {
+    assert.ok(existsSync(join(result.outputDir, relative)), `${relative} should exist`);
+  }
+  assert.ok(!existsSync(join(result.outputDir, "_errors.log")), "_errors.log must be absent when nothing failed");
 
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.region, "us-east-1");
   assert.equal(metadata.profile, "prod-audit");
-  assert.ok(existsSync(join(result.outputDir, "analysis", "findings.json")));
+  assert.equal(metadata.findings, 27);
+  assert.equal(metadata.controls_total, 25);
+  assert.equal(metadata.fail, 0);
+  assert.equal(metadata.manual, 0);
+  assert.ok(metadata.controls_covered.length >= 20, `expected broad control coverage, saw ${metadata.controls_covered.join(", ")}`);
+
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.equal(findings.length, 27);
+  const notPassing = findings.filter((item) => item.status !== "pass").map((item) => `${item.id}=${item.status}`);
+  assert.deepEqual(notPassing, [], `every finding should pass on the compliant fixture, saw ${notPassing.join(", ")}`);
+
+  const executive = readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8");
+  assert.match(executive, /Spec controls covered: \d+ of 25/);
+  assert.doesNotMatch(executive, /\u2014/, "no em dashes in reports");
+  const matrix = readFileSync(join(result.outputDir, "compliance", "unified_compliance_matrix.md"), "utf8");
+  for (const framework of AWS_FRAMEWORKS) assert.ok(matrix.includes(`| ${framework.label}`), `${framework.label} column present`);
+  const fedramp = readFileSync(join(result.outputDir, "compliance", "frameworks", "fedramp.md"), "utf8");
+  assert.match(fedramp, /Mapped findings: \d+/);
+});
+
+test("exportAwsAuditBundle records collection errors in _errors.log and never overwrites a prior run", async () => {
+  const base = createTempBase("grclanker-aws-export-rerun-");
+  const first = await exportAwsAuditBundle(compliantBundleClient(), sampleConfig(), base);
+
+  const degraded = compliantBundleClient({
+    async describeSecurityGroups() {
+      throw accessDenied("UnauthorizedOperation");
+    },
+    async listKmsKeys() {
+      throw accessDenied();
+    },
+  });
+  const second = await exportAwsAuditBundle(degraded, sampleConfig(), base);
+
+  assert.notEqual(second.outputDir, first.outputDir);
+  assert.notEqual(second.zipPath, first.zipPath);
+  assert.ok(existsSync(first.outputDir), "first run directory must survive a rerun");
+  assert.ok(existsSync(first.zipPath), "first run archive must survive a rerun");
+  assert.equal(readdirSync(base).filter((entry) => entry.endsWith(".zip")).length, 2);
+
+  assert.ok(second.errorCount > 0);
+  const errorLog = readFileSync(join(second.outputDir, "_errors.log"), "utf8");
+  assert.match(errorLog, /DescribeSecurityGroups|security group/i);
+  assert.match(errorLog, /ListKeys|KMS/i);
+
+  const findings = JSON.parse(readFileSync(join(second.outputDir, "analysis", "findings.json"), "utf8"));
+  const statuses = Object.fromEntries(findings.map((item) => [item.id, item.status]));
+  assert.notEqual(statuses["AWS-NET-21"], "pass", "denied security group surface must not pass");
+  assert.notEqual(statuses["AWS-DATA-22"], "pass", "denied KMS surface must not pass");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
