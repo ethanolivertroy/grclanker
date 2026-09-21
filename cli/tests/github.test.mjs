@@ -13,11 +13,13 @@ import { join, resolve } from "node:path";
 
 import {
   GitHubAuditorClient,
+  advanceGraphqlPage,
   assessGitHubActionsSecurity,
   assessGitHubCodeSecurity,
   assessGitHubIntegrations,
   assessGitHubOrgAccess,
   assessGitHubRepoProtection,
+  buildAuditLogWindow,
   clearGitHubTokenCacheForTests,
   collectGitHubActionsData,
   collectGitHubCodeSecurityData,
@@ -103,6 +105,18 @@ function createEnterpriseSnapshot(overrides = {}) {
   };
 }
 
+function createAuditLogSnapshot(overrides = {}) {
+  return {
+    events: [{ action: "repo.create" }, { action: "member.added" }],
+    truncated: false,
+    limit: 200,
+    lookbackDays: 30,
+    createdSince: "2026-08-22",
+    phrase: "created:>=2026-08-22",
+    ...overrides,
+  };
+}
+
 function createOrgAccessData(overrides = {}) {
   return {
     org: dataset({
@@ -123,7 +137,7 @@ function createOrgAccessData(overrides = {}) {
     invitations: dataset([{ id: 1 }]),
     organizationRoles: dataset([{ id: 1 }, { id: 2 }]),
     credentialAuthorizations: dataset([{ credential_id: 1 }]),
-    auditLog: dataset([{ action: "repo.create" }, { action: "member.added" }]),
+    auditLog: dataset(createAuditLogSnapshot()),
     hooks: dataset([{ id: 100 }]),
     appInstallations: dataset([{ id: 99 }]),
     samlIdentity: dataset(createSamlSnapshot()),
@@ -742,6 +756,189 @@ test("GitHubAuditorClient identity collectors paginate GraphQL connections and u
   assert.equal(requests.filter((entry) => entry.url.pathname === "/graphql").length, 5);
 });
 
+function jsonResponse(body, headers = {}) {
+  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
+}
+
+function createGraphqlPagingFetch({ samlPageInfo, ipPageInfo, samlTotal = 7000, ipTotal = 7000 }) {
+  let samlPages = 0;
+  let ipPages = 0;
+  const fetchImpl = async (input, init) => {
+    const body = JSON.parse(init.body);
+    if (body.query.includes("GrclankerOrganizationSaml")) {
+      samlPages += 1;
+      return jsonResponse({
+        data: {
+          organization: {
+            requiresTwoFactorAuthentication: true,
+            samlIdentityProvider: {
+              ssoUrl: "https://idp.example.test/sso",
+              issuer: "https://idp.example.test",
+              digestMethod: null,
+              signatureMethod: null,
+              externalIdentities: {
+                totalCount: samlTotal,
+                pageInfo: samlPageInfo(samlPages, body.variables.after),
+                nodes: [{ guid: String(samlPages), samlIdentity: { nameId: `user${samlPages}@example.test` }, scimIdentity: null, user: { login: `user${samlPages}` } }],
+              },
+            },
+          },
+        },
+      });
+    }
+    if (body.query.includes("GrclankerOrganizationIpAllowList")) {
+      ipPages += 1;
+      return jsonResponse({
+        data: {
+          organization: {
+            ipAllowListEnabledSetting: "ENABLED",
+            ipAllowListForInstalledAppsEnabledSetting: "ENABLED",
+            ipAllowListEntries: {
+              totalCount: ipTotal,
+              pageInfo: ipPageInfo(ipPages, body.variables.after),
+              nodes: [{ allowListValue: `10.0.0.${ipPages}`, isActive: true, name: null, createdAt: "2025-01-01T00:00:00Z" }],
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`Unexpected GraphQL query: ${body.query.slice(0, 40)}`);
+  };
+  return { fetchImpl, pagesFetched: () => ({ saml: samlPages, ip: ipPages }) };
+}
+
+function createGraphqlConfig() {
+  return createSampleConfig({ graphqlUrl: "https://api.github.com/graphql" });
+}
+
+function createTruncationOrgData(saml, ipAllowList) {
+  return createOrgAccessData({
+    members: dataset([{ login: "user1" }, { login: "user2" }]),
+    samlIdentity: dataset(saml),
+    ipAllowList: dataset(ipAllowList),
+  });
+}
+
+test("GraphQL paging reports truncated when hasNextPage is true without an endCursor and demotes ORG-006 and ORG-008", async () => {
+  const missingCursor = () => ({ hasNextPage: true, endCursor: null });
+  const { fetchImpl, pagesFetched } = createGraphqlPagingFetch({ samlPageInfo: missingCursor, ipPageInfo: missingCursor });
+  const client = new GitHubAuditorClient(createGraphqlConfig(), fetchImpl);
+
+  const saml = await client.getSamlIdentitySnapshot();
+  assert.equal(saml.externalIdentities.length, 1);
+  assert.equal(saml.externalIdentitiesTotalCount, 7000);
+  assert.equal(saml.externalIdentitiesTruncated, true);
+  const ipAllowList = await client.getIpAllowListSnapshot();
+  assert.equal(ipAllowList.entries.length, 1);
+  assert.equal(ipAllowList.entriesTruncated, true);
+  assert.deepEqual(pagesFetched(), { saml: 1, ip: 1 });
+
+  const result = assessGitHubOrgAccess(createTruncationOrgData(saml, ipAllowList), createSampleConfig());
+  const byId = Object.fromEntries(result.findings.map((finding) => [finding.id, finding]));
+  assert.equal(byId["GITHUB-ORG-006"].status, "Partial");
+  assert.match(byId["GITHUB-ORG-006"].evidence.join("\n"), /totalCount 7000, truncated/);
+  assert.equal(byId["GITHUB-ORG-008"].status, "Partial");
+  assert.match(byId["GITHUB-ORG-008"].evidence.join("\n"), /ip_allow_list_entries = 1 \(active 1, totalCount 7000, truncated\)/);
+});
+
+test("GraphQL paging reports truncated at the page cap and demotes ORG-006 and ORG-008", async () => {
+  const endless = (page) => ({ hasNextPage: true, endCursor: `cursor-${page}` });
+  const { fetchImpl, pagesFetched } = createGraphqlPagingFetch({ samlPageInfo: endless, ipPageInfo: endless });
+  const client = new GitHubAuditorClient(createGraphqlConfig(), fetchImpl);
+
+  const saml = await client.getSamlIdentitySnapshot();
+  const ipAllowList = await client.getIpAllowListSnapshot();
+  assert.deepEqual(pagesFetched(), { saml: 50, ip: 50 });
+  assert.equal(saml.externalIdentities.length, 50);
+  assert.equal(saml.externalIdentitiesTruncated, true);
+  assert.equal(ipAllowList.entries.length, 50);
+  assert.equal(ipAllowList.entriesTruncated, true);
+
+  const result = assessGitHubOrgAccess(createTruncationOrgData(saml, ipAllowList), createSampleConfig());
+  const byId = Object.fromEntries(result.findings.map((finding) => [finding.id, finding]));
+  assert.notEqual(byId["GITHUB-ORG-006"].status, "Pass");
+  assert.notEqual(byId["GITHUB-ORG-008"].status, "Pass");
+});
+
+test("GraphQL paging reports truncated when totalCount exceeds the collected nodes or the cursor repeats", async () => {
+  const complete = () => ({ hasNextPage: false, endCursor: null });
+  const shortfall = createGraphqlPagingFetch({ samlPageInfo: complete, ipPageInfo: complete, samlTotal: 3, ipTotal: 9 });
+  const client = new GitHubAuditorClient(createGraphqlConfig(), shortfall.fetchImpl);
+  const saml = await client.getSamlIdentitySnapshot();
+  assert.equal(saml.externalIdentitiesTruncated, true, "totalCount 3 with one node collected is a shortfall");
+  const ipAllowList = await client.getIpAllowListSnapshot();
+  assert.equal(ipAllowList.entriesTruncated, true);
+  assert.deepEqual(shortfall.pagesFetched(), { saml: 1, ip: 1 });
+
+  const stuck = createGraphqlPagingFetch({
+    samlPageInfo: () => ({ hasNextPage: true, endCursor: "same-cursor" }),
+    ipPageInfo: () => ({ hasNextPage: true, endCursor: "same-cursor" }),
+  });
+  const stuckClient = new GitHubAuditorClient(createGraphqlConfig(), stuck.fetchImpl);
+  const stuckSaml = await stuckClient.getSamlIdentitySnapshot();
+  assert.equal(stuckSaml.externalIdentitiesTruncated, true);
+  assert.deepEqual(stuck.pagesFetched().saml, 2, "a repeating cursor stops after the second page");
+
+  assert.deepEqual(advanceGraphqlPage({ hasNextPage: false, endCursor: "x" }, null, 1), { nextCursor: null, truncated: false });
+  assert.deepEqual(advanceGraphqlPage({ hasNextPage: true, endCursor: null }, null, 1), { nextCursor: null, truncated: true });
+  assert.deepEqual(advanceGraphqlPage({ hasNextPage: true, endCursor: "b" }, "a", 1), { nextCursor: "b", truncated: false });
+  assert.deepEqual(advanceGraphqlPage({ hasNextPage: true, endCursor: "b" }, "a", 50), { nextCursor: null, truncated: true });
+});
+
+test("audit log collection uses the created:>= phrase window and reports the record cap through the snapshot", async () => {
+  const window = buildAuditLogWindow(30, new Date("2026-09-21T17:00:00Z"));
+  assert.deepEqual(window, { createdSince: "2026-08-22", phrase: "created:>=2026-08-22" });
+
+  const buildFetch = (pages) => {
+    const seen = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      seen.push(url);
+      const pageIndex = Number(url.searchParams.get("page") ?? "1") - 1;
+      const page = pages[pageIndex];
+      const headers = page.next
+        ? { link: `<${url.origin}${url.pathname}?${url.searchParams.toString().replace(/&page=\d+/, "")}&page=${pageIndex + 2}>; rel="next"` }
+        : {};
+      return jsonResponse(page.records, headers);
+    };
+    return { fetchImpl, seen };
+  };
+  const events = (count, offset = 0) => Array.from({ length: count }, (_, index) => ({ action: "repo.create", "@timestamp": offset + index }));
+
+  const exact = buildFetch([{ records: events(100), next: true }, { records: events(100, 100), next: false }]);
+  const exactSnapshot = await new GitHubAuditorClient(createSampleConfig(), exact.fetchImpl).listAuditLog(30);
+  assert.equal(exactSnapshot.events.length, 200);
+  assert.equal(exactSnapshot.truncated, false, "exactly 200 events with no next link is complete");
+  assert.equal(exactSnapshot.limit, 200);
+  assert.equal(exact.seen[0].searchParams.get("phrase"), `created:>=${exactSnapshot.createdSince}`);
+  assert.equal(exact.seen[0].searchParams.get("include"), "all");
+  assert.equal(exact.seen[0].searchParams.has("after"), false, "after is a pagination cursor, not a timestamp");
+
+  const capped = buildFetch([{ records: events(100), next: true }, { records: events(100, 100), next: true }, { records: events(100, 200), next: false }]);
+  const cappedSnapshot = await new GitHubAuditorClient(createSampleConfig(), capped.fetchImpl).listAuditLog(30);
+  assert.equal(cappedSnapshot.events.length, 200);
+  assert.equal(cappedSnapshot.truncated, true, "a next link after the cap means events were left behind");
+  assert.equal(capped.seen.length, 2, "the collector stops requesting pages at the cap");
+
+  const overflow = buildFetch([{ records: events(100), next: true }, { records: events(150, 100), next: false }]);
+  const overflowSnapshot = await new GitHubAuditorClient(createSampleConfig(), overflow.fetchImpl).listAuditLog(30);
+  assert.equal(overflowSnapshot.events.length, 200);
+  assert.equal(overflowSnapshot.truncated, true, "records dropped inside a page mark the sample truncated");
+
+  const small = buildFetch([{ records: events(3), next: false }]);
+  const smallSnapshot = await new GitHubAuditorClient(createSampleConfig(), small.fetchImpl).listAuditLog(30);
+  assert.equal(smallSnapshot.truncated, false);
+
+  const cappedResult = assessGitHubOrgAccess(createOrgAccessData({ auditLog: dataset(cappedSnapshot) }), createSampleConfig());
+  const cappedFinding = cappedResult.findings.find((finding) => finding.id === "GITHUB-ORG-005");
+  assert.match(cappedFinding.summary, /sample capped at 200 events, so this is a visibility check/);
+  assert.match(cappedFinding.evidence.join("\n"), /audit_log_window = phrase created:>=/);
+  const exactResult = assessGitHubOrgAccess(createOrgAccessData({ auditLog: dataset(exactSnapshot) }), createSampleConfig());
+  const exactFinding = exactResult.findings.find((finding) => finding.id === "GITHUB-ORG-005");
+  assert.doesNotMatch(exactFinding.summary, /capped/);
+  assert.match(exactFinding.evidence.join("\n"), /audit_events_last_30_days = 200 \(complete within the window\)/);
+});
+
 test("repo protection findings read review and status-check detail from rules and legacy protection", () => {
   const config = createSampleConfig();
   const mixed = assessGitHubRepoProtection(createRepoProtectionData(), config);
@@ -1235,7 +1432,7 @@ function createCompliantClient() {
     async listCredentialAuthorizations() {
       return [{ login: "alice", credential_type: "personal access token", credential_authorized_at: "2026-01-01T00:00:00Z" }];
     },
-    async listAuditLog() { return [{ action: "repo.create", "@timestamp": 1758400000000 }]; },
+    async listAuditLog() { return createAuditLogSnapshot({ events: [{ action: "repo.create", "@timestamp": 1758400000000 }] }); },
     async listHooks() {
       return [{ id: 100, active: true, config: { url: "https://siem.example.test/github", content_type: "json", insecure_ssl: "0", secret: "********" } }];
     },
@@ -1292,7 +1489,7 @@ function createEmptyClient() {
     async getEnterpriseIdentitySnapshot() { return createEnterpriseSnapshot({ ownerInfo: null }); },
     async listOrganizationRoles() { return []; },
     async listCredentialAuthorizations() { return []; },
-    async listAuditLog() { return []; },
+    async listAuditLog() { return createAuditLogSnapshot({ events: [] }); },
     async listHooks() { return []; },
     async listInstallations() { return []; },
     async listRepositories() { return []; },
@@ -1326,7 +1523,10 @@ function createPartialClient() {
     async listOutsideCollaborators() { throw new ForbiddenError(); },
     async listInstallations() { throw new ForbiddenError(); },
     async listAuditLog() {
-      return Array.from({ length: 200 }, (_, index) => ({ action: "repo.create", "@timestamp": 1758400000000 + index }));
+      return createAuditLogSnapshot({
+        events: Array.from({ length: 200 }, (_, index) => ({ action: "repo.create", "@timestamp": 1758400000000 + index })),
+        truncated: true,
+      });
     },
     async listRepoRulesets(_owner, repo) {
       if (repo === "app-two") throw new ForbiddenError();

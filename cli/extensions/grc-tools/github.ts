@@ -253,6 +253,20 @@ export interface GitHubEnterpriseIdentitySnapshot {
   errors: GitHubGraphqlError[];
 }
 
+export interface GitHubPaginatedRecords {
+  records: JsonRecord[];
+  truncated: boolean;
+}
+
+export interface GitHubAuditLogSnapshot {
+  events: JsonRecord[];
+  truncated: boolean;
+  limit: number;
+  lookbackDays: number;
+  createdSince: string;
+  phrase: string;
+}
+
 interface GitHubOrgAccessData {
   org: CollectedDataset<JsonRecord | null>;
   members: CollectedDataset<JsonRecord[]>;
@@ -262,7 +276,7 @@ interface GitHubOrgAccessData {
   invitations: CollectedDataset<JsonRecord[]>;
   organizationRoles: CollectedDataset<JsonRecord[]>;
   credentialAuthorizations: CollectedDataset<JsonRecord[]>;
-  auditLog: CollectedDataset<JsonRecord[]>;
+  auditLog: CollectedDataset<GitHubAuditLogSnapshot>;
   hooks: CollectedDataset<JsonRecord[]>;
   appInstallations: CollectedDataset<JsonRecord[]>;
   samlIdentity: CollectedDataset<GitHubSamlIdentitySnapshot | null>;
@@ -1494,16 +1508,19 @@ export class GitHubAuditorClient {
       const connection = asRecord(providerRecord.externalIdentities);
       snapshot.externalIdentitiesTotalCount = asNumber(connection.totalCount) ?? snapshot.externalIdentitiesTotalCount;
       snapshot.externalIdentities.push(...asArray(connection.nodes).map((node) => asRecord(node)));
-      const pageInfo = asRecord(connection.pageInfo);
-      if (asBoolean(pageInfo.hasNextPage) !== true || !asString(pageInfo.endCursor)) {
-        break;
-      }
-      after = asString(pageInfo.endCursor) ?? null;
-      if (pages >= MAX_GRAPHQL_PAGES) {
+      const step = advanceGraphqlPage(asRecord(connection.pageInfo), after, pages);
+      if (step.truncated) {
         snapshot.externalIdentitiesTruncated = true;
       }
+      if (!step.nextCursor) {
+        break;
+      }
+      after = step.nextCursor;
     }
 
+    if (collectionFellShort(snapshot.externalIdentitiesTotalCount, snapshot.externalIdentities.length)) {
+      snapshot.externalIdentitiesTruncated = true;
+    }
     return snapshot;
   }
 
@@ -1535,16 +1552,19 @@ export class GitHubAuditorClient {
       const connection = asRecord(organization.ipAllowListEntries);
       snapshot.entriesTotalCount = asNumber(connection.totalCount) ?? snapshot.entriesTotalCount;
       snapshot.entries.push(...asArray(connection.nodes).map((node) => asRecord(node)));
-      const pageInfo = asRecord(connection.pageInfo);
-      if (asBoolean(pageInfo.hasNextPage) !== true || !asString(pageInfo.endCursor)) {
-        break;
-      }
-      after = asString(pageInfo.endCursor) ?? null;
-      if (pages >= MAX_GRAPHQL_PAGES) {
+      const step = advanceGraphqlPage(asRecord(connection.pageInfo), after, pages);
+      if (step.truncated) {
         snapshot.entriesTruncated = true;
       }
+      if (!step.nextCursor) {
+        break;
+      }
+      after = step.nextCursor;
     }
 
+    if (collectionFellShort(snapshot.entriesTotalCount, snapshot.entries.length)) {
+      snapshot.entriesTruncated = true;
+    }
     return snapshot;
   }
 
@@ -1580,13 +1600,22 @@ export class GitHubAuditorClient {
     return this.paginate(`/orgs/${this.config.organization}/credential-authorizations?per_page=${PAGE_SIZE}`);
   }
 
-  async listAuditLog(lookbackDays: number = this.config.lookbackDays): Promise<JsonRecord[]> {
-    const after = new Date(Date.now() - (lookbackDays * 24 * 60 * 60 * 1000)).toISOString();
-    const records = await this.paginate(
-      `/orgs/${this.config.organization}/audit-log?per_page=${PAGE_SIZE}&include=all&after=${encodeURIComponent(after)}`,
+  // The audit log `after` parameter is an opaque pagination cursor, not a timestamp; the lookback
+  // window is expressed through the documented search phrase syntax (`created:>=YYYY-MM-DD`).
+  async listAuditLog(lookbackDays: number = this.config.lookbackDays): Promise<GitHubAuditLogSnapshot> {
+    const window = buildAuditLogWindow(lookbackDays);
+    const { records, truncated } = await this.paginateWithStatus(
+      `/orgs/${this.config.organization}/audit-log?per_page=${PAGE_SIZE}&include=all&phrase=${encodeURIComponent(window.phrase)}`,
       MAX_AUDIT_EVENTS,
     );
-    return records;
+    return {
+      events: records.map(projectAuditLogEvent),
+      truncated,
+      limit: MAX_AUDIT_EVENTS,
+      lookbackDays,
+      createdSince: window.createdSince,
+      phrase: window.phrase,
+    };
   }
 
   async listHooks(): Promise<JsonRecord[]> {
@@ -1656,23 +1685,39 @@ export class GitHubAuditorClient {
     return this.paginate(`/orgs/${this.config.organization}/code-security/configurations?per_page=${PAGE_SIZE}`);
   }
 
-  private async paginate(pathname: string, limit: number = Number.POSITIVE_INFINITY): Promise<JsonRecord[]> {
+  private async paginate(pathname: string): Promise<JsonRecord[]> {
+    const { records } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
+    return records;
+  }
+
+  // Follows Link rel="next" until exhaustion or the record limit. Truncated is true only when
+  // records were actually left behind: a page record dropped at the limit, or a next link still
+  // advertised once the limit is reached. Exactly `limit` records with no next link is complete.
+  private async paginateWithStatus(pathname: string, limit: number): Promise<GitHubPaginatedRecords> {
     const collected: JsonRecord[] = [];
     let nextPath: string | null = pathname;
+    let truncated = false;
 
-    while (nextPath && collected.length < limit) {
+    while (nextPath) {
       const { response, payload } = await this.requestJson(nextPath);
       const pageRecords = extractRecords(payload);
       for (const record of pageRecords) {
+        if (collected.length >= limit) {
+          truncated = true;
+          break;
+        }
         collected.push(record);
-        if (collected.length >= limit) break;
       }
+      if (truncated) break;
 
-      const linkHeader = response.headers.get("link");
-      nextPath = parseNextLink(linkHeader);
+      nextPath = parseNextLink(response.headers.get("link"));
+      if (nextPath && collected.length >= limit) {
+        truncated = true;
+        break;
+      }
     }
 
-    return collected;
+    return { records: collected, truncated };
   }
 }
 
@@ -1684,6 +1729,81 @@ function parseNextLink(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
   const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/i);
   return match?.[1] ?? null;
+}
+
+interface GraphqlPageStep {
+  nextCursor: string | null;
+  truncated: boolean;
+}
+
+// PageInfo.endCursor is nullable in the schema, so hasNextPage: true can arrive without a cursor;
+// that exit, a repeating cursor, and the page cap all leave records unfetched and must report truncated.
+export function advanceGraphqlPage(pageInfo: JsonRecord, previousCursor: string | null, pagesFetched: number): GraphqlPageStep {
+  if (asBoolean(pageInfo.hasNextPage) !== true) {
+    return { nextCursor: null, truncated: false };
+  }
+  const endCursor = asString(pageInfo.endCursor) ?? null;
+  if (!endCursor || endCursor === previousCursor || pagesFetched >= MAX_GRAPHQL_PAGES) {
+    return { nextCursor: null, truncated: true };
+  }
+  return { nextCursor: endCursor, truncated: false };
+}
+
+export function collectionFellShort(totalCount: number | null, collectedCount: number): boolean {
+  return totalCount !== null && Number.isFinite(totalCount) && totalCount > collectedCount;
+}
+
+export function buildAuditLogWindow(lookbackDays: number, now: Date = new Date()): { createdSince: string; phrase: string } {
+  const days = Number.isFinite(lookbackDays) && lookbackDays > 0 ? Math.floor(lookbackDays) : 1;
+  const since = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
+  const createdSince = since.toISOString().slice(0, 10);
+  return { createdSince, phrase: `created:>=${createdSince}` };
+}
+
+export function emptyAuditLogSnapshot(lookbackDays: number): GitHubAuditLogSnapshot {
+  const window = buildAuditLogWindow(lookbackDays);
+  return {
+    events: [],
+    truncated: false,
+    limit: MAX_AUDIT_EVENTS,
+    lookbackDays,
+    createdSince: window.createdSince,
+    phrase: window.phrase,
+  };
+}
+
+// Audit log events carry unconstrained bags (config, config_was, data, additionalProperties) that
+// can hold webhook secrets and key material; only the identifying fields the verdicts read persist.
+const AUDIT_LOG_EVENT_FIELDS = [
+  "@timestamp",
+  "created_at",
+  "action",
+  "operation_type",
+  "actor",
+  "actor_id",
+  "user",
+  "user_id",
+  "org",
+  "org_id",
+  "repo",
+  "repo_id",
+  "business",
+  "business_id",
+  "_document_id",
+] as const;
+
+export function projectAuditLogEvent(event: JsonRecord): JsonRecord {
+  return pickFields(event, AUDIT_LOG_EVENT_FIELDS);
+}
+
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const field of fields) {
+    if (record[field] !== undefined) {
+      projected[field] = record[field];
+    }
+  }
+  return projected;
 }
 
 function countByStatus(findings: GitHubFinding[]): Record<GitHubFindingStatus, number> {
@@ -2150,7 +2270,7 @@ export async function collectGitHubOrgAccessData(
     invitations: await collectDataset<JsonRecord[]>([], () => client.listInvitations()),
     organizationRoles: await collectDataset<JsonRecord[]>([], () => client.listOrganizationRoles()),
     credentialAuthorizations: await collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations()),
-    auditLog: await collectDataset<JsonRecord[]>([], () => client.listAuditLog(config.lookbackDays)),
+    auditLog: await collectDataset<GitHubAuditLogSnapshot>(emptyAuditLogSnapshot(config.lookbackDays), () => client.listAuditLog(config.lookbackDays)),
     hooks: await collectDataset<JsonRecord[]>([], () => client.listHooks()),
     appInstallations: await collectDataset<JsonRecord[]>([], () => client.listInstallations()),
     samlIdentity: await collectDataset<GitHubSamlIdentitySnapshot | null>(null, () => client.getSamlIdentitySnapshot()),
@@ -3118,8 +3238,9 @@ export function assessGitHubOrgAccess(
   const adminsUnreadable = Boolean(data.adminMembers.error);
   const roleAssignments = data.organizationRoles.data.length;
   const auditVisible = !data.auditLog.error;
-  const auditEventCount = data.auditLog.data.length;
-  const auditCapped = auditEventCount >= MAX_AUDIT_EVENTS;
+  const auditEventCount = data.auditLog.data.events.length;
+  const auditCapped = data.auditLog.data.truncated;
+  const auditWindow = data.auditLog.data.phrase;
 
   const findings: GitHubFinding[] = [
     assessTwoFactor(data),
@@ -3184,7 +3305,8 @@ export function assessGitHubOrgAccess(
         ? `The organization audit log is readable and returned ${auditEventCount} event(s) for the configured lookback window${auditCapped ? ` (sample capped at ${MAX_AUDIT_EVENTS} events, so this is a visibility check, not a full population)` : ""}.`
         : "The tool could not read the organization audit log with the supplied credentials.",
       [
-        auditVisible ? `audit_events_last_${config.lookbackDays}_days = ${auditEventCount}${auditCapped ? ` (capped at ${MAX_AUDIT_EVENTS})` : ""}` : `audit_log_error = ${data.auditLog.error}`,
+        auditVisible ? `audit_events_last_${config.lookbackDays}_days = ${auditEventCount}${auditCapped ? ` (capped at ${MAX_AUDIT_EVENTS}, more events exist)` : " (complete within the window)"}` : `audit_log_error = ${data.auditLog.error}`,
+        `audit_log_window = phrase ${auditWindow} (include=all)`,
         data.hooks.error ? `webhooks error = ${data.hooks.error}` : `webhooks = ${data.hooks.data.length}`,
         data.appInstallations.error ? `app_installations error = ${data.appInstallations.error}` : `app_installations = ${data.appInstallations.data.length}`,
       ],
@@ -3209,7 +3331,7 @@ export function assessGitHubOrgAccess(
       members_without_2fa: datasetSnapshotCount(data.twoFactorDisabledMembers),
       outside_collaborators: datasetSnapshotCount(data.outsideCollaborators),
       invitations: datasetSnapshotCount(data.invitations),
-      audit_events: datasetSnapshotCount(data.auditLog),
+      audit_events: data.auditLog.error ? "error" : data.auditLog.data.events.length,
       hooks: datasetSnapshotCount(data.hooks),
       saml_external_identities: data.samlIdentity.error ? "error" : (data.samlIdentity.data?.externalIdentities.length ?? 0),
       ip_allow_list_entries: data.ipAllowList.error ? "error" : (data.ipAllowList.data?.entries.length ?? 0),
