@@ -33,6 +33,8 @@ export interface GrclankerAgentContent {
 
 const MAX_SKILL_DESCRIPTION_LENGTH = 1024;
 
+const SKILL_FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
+
 export function resolveFlueAppRoot(currentDir: string): string {
   const candidates = [resolve(currentDir, ".."), resolve(currentDir, "../..")];
   const appRoot = candidates.find((candidate) => existsSync(resolve(candidate, ".grclanker", "SYSTEM.md")));
@@ -97,7 +99,7 @@ export function loadWorkflowSkills(appRoot: string): SkillDefinition[] {
 
 /** Parse Agent Skills `SKILL.md` frontmatter (`---` delimited YAML) and body. */
 export function parseSkillMarkdown(markdown: string): { frontmatter: Record<string, unknown>; body: string } {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(markdown);
+  const match = markdown.match(SKILL_FRONTMATTER_PATTERN);
   if (!match) return { frontmatter: {}, body: markdown.trim() };
 
   const parsed = parseYaml(match[1]) as unknown;
@@ -131,9 +133,12 @@ export function loadBundledSkills(appRoot: string): SkillDefinition[] {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function readLabeledLine(markdown: string, label: string): string | undefined {
-  const pattern = new RegExp(`^${label}:\\s*(.+)$`, "m");
-  return pattern.exec(markdown)?.[1]?.trim();
+/** The text after `<label>:` on the first line that starts with it, or undefined when absent or empty. */
+export function readLabeledLine(markdown: string, label: string): string | undefined {
+  const prefix = `${label}:`;
+  const line = markdown.split(/\r?\n/).find((candidate) => candidate.startsWith(prefix));
+  const value = line?.slice(prefix.length).trim();
+  return value ? value : undefined;
 }
 
 /** Parse one `.grclanker/agents/<role>.md` persona file. */

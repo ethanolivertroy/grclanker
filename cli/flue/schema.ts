@@ -79,7 +79,8 @@ function convertString(node: JsonSchemaObject): v.GenericSchema {
   const maxLength = asFiniteNumber(node.maxLength);
   if (minLength !== undefined) schema = v.pipe(schema, v.minLength(minLength));
   if (maxLength !== undefined) schema = v.pipe(schema, v.maxLength(maxLength));
-  if (typeof node.pattern === "string") schema = v.pipe(schema, v.regex(new RegExp(node.pattern)));
+  // `pattern` is not compiled into a RegExp here; `withAnnotations` renders it
+  // into the model-facing schema, where Flue's own argument check enforces it.
   return schema;
 }
 
@@ -187,9 +188,12 @@ function withAnnotations(node: JsonSchemaObject, schema: v.GenericSchema): v.Gen
   const metadata: Record<string, unknown> = {};
   if (node.default !== undefined) metadata.default = node.default;
   if (Array.isArray(node.examples)) metadata.examples = node.examples;
+  if (typeof node.pattern === "string") metadata.pattern = node.pattern;
   if (Object.keys(metadata).length > 0) {
-    // `v.metadata()` carries `default` into the rendered JSON Schema without
-    // applying it at parse time; Pi treats TypeBox defaults as informational too.
+    // `v.metadata()` carries these keys into the rendered JSON Schema without
+    // applying them at parse time. Pi treats TypeBox defaults as informational
+    // too, and `pattern` is enforced by Flue's argument check on the rendered
+    // schema rather than by a RegExp compiled from schema input here.
     annotated = v.pipe(annotated, v.metadata(metadata));
   }
   return annotated;

@@ -27,6 +27,7 @@ import {
   loadGrclankerAgentContent,
   parseSkillMarkdown,
   parseSubagentRole,
+  readLabeledLine,
   resolveFlueAppRoot,
   summarizeMarkdownPrompt,
   workflowSkillFromPrompt,
@@ -279,6 +280,7 @@ const GATE_REASONS = [
   ["object", /must be object/],
   ["type", /must be (string|number|boolean)/],
   ["range", /must be (>=|<=)/],
+  ["pattern", /must match pattern/],
 ];
 
 /** Flue's gate: Pi 0.83 `validateToolArguments` against the rendered schema; returns coerced args or a reason. */
@@ -337,6 +339,32 @@ function sampleValue(property) {
 }
 
 const PROBE_VALUES = ["true", "false", "1", "0", 1, 0, null, true, {}, [], "bogus", 5, 1.5, "1e3", " 7 ", "", "null", -1, "0x10", "yes"];
+
+test("string patterns render for the model and are enforced by Flue's gate, without compiling schema input into a RegExp", () => {
+  const piTool = {
+    name: "pattern_probe",
+    label: "Pattern probe",
+    description: "Probe.",
+    parameters: Type.Object({ code: Type.String({ pattern: "^[A-Z]{3}-[0-9]+$" }), note: Type.Optional(Type.String({ minLength: 2 })) }),
+    execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+  };
+  const [flueTool] = createGrclankerFlueTools([piTool]);
+
+  const rendered = renderedToolSchema(flueTool);
+  assert.equal(rendered.properties.code.pattern, "^[A-Z]{3}-[0-9]+$", "the model-facing schema keeps the pattern");
+  assert.equal(rendered.properties.note.minLength, 2);
+
+  assert.deepEqual(flueVerdict(flueTool, { code: "ABC-12" }), { ok: true, args: { code: "ABC-12" } });
+  assert.deepEqual(flueVerdict(flueTool, { code: "nope" }), { ok: false, stage: "gate", reason: "pattern" }, "a non-matching value stops at Flue's gate");
+  assert.match(flueGate(flueTool, { code: "nope" }).message, /code: must match pattern/);
+  const shortNote = flueGate(flueTool, { code: "ABC-1", note: "x" });
+  assert.equal(shortNote.ok, false);
+  assert.match(shortNote.message, /note/);
+
+  // The adapter stage itself only checks what Valibot expresses natively; the pattern is delegated to the gate above.
+  assert.equal(v.safeParse(flueTool.input, { code: "nope" }).success, true);
+  assert.equal(v.safeParse(flueTool.input, { code: "ABC-1", note: "x" }).success, false);
+});
 
 test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI loop for every domain tool", () => {
   const piTools = collectGrclankerDomainTools();
@@ -598,12 +626,24 @@ test("prompt parsing helpers extract titles, frontmatter, and persona fields", (
   assert.deepEqual(parsed.frontmatter, { name: "demo", description: "Demo skill.", license: "MIT" });
   assert.equal(parsed.body, "# Demo\n\nBody.");
   assert.deepEqual(parseSkillMarkdown("plain body"), { frontmatter: {}, body: "plain body" });
+  const crlf = parseSkillMarkdown("---\r\nname: crlf\r\n---\r\n\r\nBody.\r\n");
+  assert.deepEqual(crlf, { frontmatter: { name: "crlf" }, body: "Body." });
 
   const role = parseSubagentRole("fallback", "Name: checker\n\nPurpose: Check things.\n\n## Tool Access\n\nAllowed: a_tool, b_tool\n");
   assert.equal(role.name, "checker");
   assert.equal(role.description, "Check things.");
   assert.deepEqual(role.allowedTools, ["a_tool", "b_tool"]);
   assert.equal(parseSubagentRole("fallback", "No labels here.").name, "fallback");
+
+  // Labeled lines are matched by literal prefix at the start of a line: no regex is built from the label.
+  assert.equal(readLabeledLine("Name: checker\n", "Name"), "checker");
+  assert.equal(readLabeledLine("Name:   spaced  \r\nPurpose: x\r\n", "Name"), "spaced", "CRLF endings and padding are trimmed");
+  assert.equal(readLabeledLine("Name:\nPurpose: x\n", "Name"), undefined, "an empty value is treated as absent");
+  assert.equal(readLabeledLine("Name:    \n", "Name"), undefined, "a whitespace-only value is treated as absent");
+  assert.equal(readLabeledLine("The Name: not at line start\n", "Name"), undefined, "the label must start the line");
+  assert.equal(readLabeledLine("Nameplate: no\nName: yes\n", "Name"), "yes", "the colon must follow the label directly");
+  assert.equal(readLabeledLine("AxB: no\nA.B: yes\n", "A.B"), "yes", "label characters are literal, not regex syntax");
+  assert.equal(parseSubagentRole("fallback", "Name:   \nPurpose: p\n").name, "fallback", "a blank Name falls back");
 });
 
 test("agent render declares model, sandbox, tools, skills, and subagents through the hooks", () => {
