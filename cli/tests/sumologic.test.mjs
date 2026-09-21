@@ -1212,6 +1212,149 @@ test("rule 9: every Sumo Logic surface that fails with a 502 HTML page or a JSON
   }
 });
 
+// The list datasets the assessments collect, the API path each one reads, and
+// the core_data file the collection is written to.
+const SUMOLOGIC_LIST_DATASETS = [
+  ["users", ["/api/v1/users"], "identity.json"],
+  ["saml_identity_providers", ["/api/v1/saml/identityProviders"], "identity.json"],
+  ["saml_allowlisted_users", ["/api/v1/saml/allowlistedUsers"], "identity.json"],
+  ["roles", ["/api/v1/roles"], "access-control.json"],
+  ["access_keys", ["/api/v1/accessKeys", "/api/v1/accessKeys/personal"], "access-control.json"],
+  ["service_allowlist_addresses", ["/api/v1/serviceAllowlist/addresses"], "access-control.json"],
+  ["partitions", ["/api/v1/partitions"], "data-governance.json"],
+  ["scheduled_views", ["/api/v1/scheduledViews"], "data-governance.json"],
+  ["connections", ["/api/v1/connections"], "data-governance.json"],
+  ["ingest_budgets", ["/api/v2/ingestBudgets"], "data-governance.json"],
+  ["collectors", ["/api/v1/collectors"], "data-governance.json"],
+  ["monitors", ["/api/v1/monitors/search"], "content-sharing.json"],
+  ["dashboards", ["/api/v2/dashboards"], "content-sharing.json"],
+];
+
+/**
+ * Serves the healthy route table, denies `deniedPaths` with a 403 JSON body,
+ * serves `emptyPaths` as readable empty lists, and records every request it
+ * answered so the outputs can be checked against what the run observed.
+ */
+function recordingFetch({ deniedPaths = [], emptyPaths = [] } = {}) {
+  const routes = healthyRoutes();
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const method = init.method ?? "GET";
+    let response;
+    if (deniedPaths.includes(url.pathname)) {
+      response = jsonResponse({ errors: [{ code: "forbidden", message: "The access key lacks the capability for this endpoint" }] }, { status: 403, statusText: "Forbidden" });
+    } else if (emptyPaths.includes(url.pathname)) {
+      response = jsonResponse(url.pathname === "/api/v1/collectors" ? { collectors: [] } : url.pathname === "/api/v2/dashboards" ? { dashboards: [] } : url.pathname === "/api/v1/monitors/search" ? [] : { data: [] });
+    } else {
+      assert.ok(url.pathname in routes, `unexpected request to ${url.pathname}`);
+      response = jsonResponse(routes[url.pathname]);
+    }
+    requests.push({ method, path: url.pathname, status: response.status });
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+const MENTIONED_STATUS_PATTERNS = [
+  /\((\d{3})(?: [A-Za-z][A-Za-z ]*)?\)/g,
+  /"(?:http_status|httpStatus|status)":\s*(\d{3})\b/g,
+  /\b(?:HTTP|status|returned)\s+(\d{3})\b/gi,
+];
+const MENTIONED_ENDPOINT_PATTERN = /\/(?:api\/)?v[123]\/[A-Za-z0-9_./{}-]*[A-Za-z0-9}]/g;
+
+/**
+ * Every 4xx or 5xx status code and every API path named anywhere in the
+ * outputs must belong to a request the fixture actually served: a code or
+ * endpoint that never appears in the request log is a claim the run did not
+ * observe.
+ */
+function assertOutputsNameOnlyObservedRequests(outputs, requests, label) {
+  const observedStatuses = new Set(requests.map((request) => request.status));
+  const observedPaths = requests.map((request) => request.path);
+  for (const [name, text] of outputs) {
+    for (const pattern of MENTIONED_STATUS_PATTERNS) {
+      for (const match of text.matchAll(pattern)) {
+        const status = Number(match[1]);
+        if (status < 400 || status > 599) continue;
+        assert.ok(observedStatuses.has(status), `${label} ${name}: mentions status ${status} but the run observed only ${[...observedStatuses].join(", ")} (in: ${match[0]})`);
+      }
+    }
+    for (const match of text.matchAll(MENTIONED_ENDPOINT_PATTERN)) {
+      const mention = match[0].replace(/[.)]+$/, "");
+      const template = new RegExp(`${mention.replace(/[.*+?^$()|[\\]\\\\]/g, "\\$&").replace(/\\\{[^}]*\\\}|\{[^}]*\}/g, "[^/]+")}$`);
+      assert.ok(observedPaths.some((path) => template.test(path)), `${label} ${name}: names endpoint ${mention} but the run requested only ${[...new Set(observedPaths)].join(", ")}`);
+    }
+  }
+}
+
+function sumologicOutputs(access, results, exported) {
+  return new Map([
+    ["check_access", JSON.stringify(access)],
+    ...results.map((result) => [`assess ${result.area}`, JSON.stringify(result)]),
+    ...[...readBundleFiles(exported.outputDir)].map(([name, content]) => [`bundle ${name}`, content]),
+  ]);
+}
+
+test("collection status: a denied list dataset is written to core_data and the assess payload as a not-collected marker with null flags, and every status code and endpoint named in any output was actually observed", async () => {
+  const base = createTempBase("grclanker-sumo-denied-markers-");
+
+  for (const [dataset, paths, areaFile] of SUMOLOGIC_LIST_DATASETS) {
+    const { fetchImpl, requests } = recordingFetch({ deniedPaths: paths });
+    const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+    const access = await checkSumologicAccess(client);
+    const results = await allAssessments(client);
+    const exported = await exportSumologicAuditBundle(client, sampleConfig(), join(base, dataset), { now: NOW });
+
+    const snapshot = JSON.parse(readFileSync(join(exported.outputDir, "core_data", areaFile), "utf8"));
+    const entry = snapshot[dataset];
+    assert.ok(entry, `${dataset}: written to core_data/${areaFile}`);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.complete, null, `${dataset}: complete is null, not false, when nothing was read`);
+    assert.equal(entry.scope, null, `${dataset}: scope is null, not org, when nothing was read`);
+    assert.equal(entry.count, null);
+    assert.equal(entry.http_status, 403);
+    assert.ok(!Array.isArray(entry.data), `${dataset}: a denied list is never written as an array`);
+    assert.deepEqual(entry.data, { collected: false, status: 403, endpoint: entry.endpoint, error: entry.error });
+    assert.ok(paths.some((path) => path.endsWith(entry.data.endpoint)), `${dataset}: the marker names the denied endpoint, got ${entry.data.endpoint}`);
+    assert.match(entry.data.error, /failed \(403 forbidden\)/);
+
+    const rawEntry = results.find((result) => result.rawData[dataset])?.rawData[dataset];
+    assert.deepEqual(rawEntry.data, entry.data, `${dataset}: the assess payload carries the same marker`);
+
+    const surface = access.surfaces.find((item) => item.name === dataset);
+    assert.equal(surface.status, "not_readable");
+    assert.equal(surface.count, null, `${dataset}: access check count is null when the probe failed`);
+    assert.equal(surface.complete, null, `${dataset}: access check complete is null when the probe failed`);
+    assert.equal(surface.httpStatus, 403);
+    assert.ok(paths.some((path) => path.endsWith(surface.endpoint)), `${dataset}: the surface names the endpoint that failed, got ${surface.endpoint}`);
+
+    assertOutputsNameOnlyObservedRequests(sumologicOutputs(access, results, exported), requests, `${dataset} denied`);
+  }
+
+  const { fetchImpl, requests } = recordingFetch({ emptyPaths: ["/api/v1/connections", "/api/v1/scheduledViews", "/api/v1/collectors", "/api/v2/dashboards", "/api/v1/monitors/search"] });
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const access = await checkSumologicAccess(client);
+  const results = await allAssessments(client);
+  const exported = await exportSumologicAuditBundle(client, sampleConfig(), join(base, "empty"), { now: NOW });
+  const governance = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "data-governance.json"), "utf8"));
+  const sharing = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "content-sharing.json"), "utf8"));
+  for (const entry of [governance.connections, governance.scheduled_views, governance.collectors, sharing.dashboards, sharing.monitors]) {
+    assert.deepEqual(entry.data, [], "a readable empty list stays []");
+    assert.equal(entry.ok, true);
+    assert.equal(entry.complete, true);
+    assert.equal(entry.count, 0);
+    assert.equal(entry.http_status, null);
+  }
+  for (const surface of access.surfaces) {
+    assert.equal(surface.status, "readable");
+    assert.equal(typeof surface.count, "number");
+    assert.equal(surface.complete, true);
+    assert.equal(surface.httpStatus, null);
+  }
+  assertOutputsNameOnlyObservedRequests(sumologicOutputs(access, results, exported), requests, "healthy with empty lists");
+});
+
 test("rule 10: token pagination stops on a repeated cursor or an empty page with a next token and reports the inventory incomplete", async () => {
   let repeatedRequests = 0;
   let emptyRequests = 0;

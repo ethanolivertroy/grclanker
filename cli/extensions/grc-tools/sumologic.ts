@@ -116,14 +116,29 @@ export interface SumologicResolvedConfig {
   sourceChain: string[];
 }
 
+/**
+ * One collected dataset. `complete` and `scope` describe a read that
+ * happened, so they are null (not false or "org") when the read failed;
+ * `endpoint` names the path whose request failed so the bundle can carry a
+ * not-collected marker instead of an empty inventory.
+ */
 export interface SumologicCollection<T> {
   ok: boolean;
   data?: T;
   error?: string;
   httpStatus?: number;
-  complete: boolean;
-  scope: "org" | "personal";
+  endpoint?: string;
+  complete: boolean | null;
+  scope: "org" | "personal" | null;
   count?: number;
+}
+
+/** What a bundle consumer reads in place of a list that was never collected. */
+export interface SumologicNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string | null;
 }
 
 export type SumologicPolicyName =
@@ -162,8 +177,12 @@ export interface SumologicAccessSurface {
   name: string;
   endpoint: string;
   status: "readable" | "not_readable";
-  count?: number;
-  complete?: boolean;
+  /** Items seen on a readable surface; null when the probe did not succeed. */
+  count: number | null;
+  /** Whether pagination finished on a readable surface; null when the probe did not succeed. */
+  complete: boolean | null;
+  /** The observed HTTP status of a failed probe; null when the probe succeeded or failed before a response. */
+  httpStatus: number | null;
   error?: string;
   capabilityHint: string;
 }
@@ -563,17 +582,19 @@ export function resolveSumologicConfiguration(
 export class SumologicApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly endpoint?: string;
 
   /**
    * The message and code are scrubbed in the constructor as well as at the
    * record point, so an error built anywhere in the client never carries a
    * credential even if a caller stores error.message directly.
    */
-  constructor(message: string, status: number, code?: string) {
+  constructor(message: string, status: number, code?: string, endpoint?: string) {
     super(scrubErrorText(message));
     this.name = "SumologicApiError";
     this.status = status;
     this.code = code === undefined ? undefined : scrubErrorText(code);
+    this.endpoint = endpoint;
   }
 
   /**
@@ -590,7 +611,19 @@ export class SumologicApiError extends Error {
       scrubErrorText(`Sumo Logic request to ${path} ${outcome} (${statusLine(response)}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`, secrets),
       response.status,
       code,
+      path,
     );
+  }
+}
+
+/** A request that never produced a response (network failure, timeout); it still names its endpoint. */
+export class SumologicTransportError extends Error {
+  readonly endpoint: string;
+
+  constructor(message: string, endpoint: string) {
+    super(scrubErrorText(message));
+    this.name = "SumologicTransportError";
+    this.endpoint = endpoint;
   }
 }
 
@@ -696,7 +729,7 @@ export class SumologicApiClient implements SumologicReader {
           await this.sleepImpl(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        throw new Error(`Sumo Logic request to ${path} failed: ${this.scrubError(error)}`);
+        throw new SumologicTransportError(`Sumo Logic request to ${path} failed: ${this.scrubError(error)}`, path);
       }
       clearTimeout(timeout);
 
@@ -717,7 +750,15 @@ export class SumologicApiClient implements SumologicReader {
     }
   }
 
+  /**
+   * `endpoint` is the path the collector reads; a failed collection records
+   * the endpoint the error actually came from when the error names one (the
+   * access key fallback reads a second path), and this declared path
+   * otherwise. Pagination and scope flags are null on failure because no
+   * read happened that they could describe.
+   */
   private async collect<T>(
+    endpoint: string,
     load: () => Promise<{ data: T; complete: boolean; count?: number; scope?: "org" | "personal" }>,
   ): Promise<SumologicCollection<T>> {
     try {
@@ -736,8 +777,9 @@ export class SumologicApiClient implements SumologicReader {
         ok: false,
         error: this.scrubError(error),
         httpStatus: error instanceof SumologicApiError ? error.status : undefined,
-        complete: false,
-        scope: "org",
+        endpoint: error instanceof SumologicApiError || error instanceof SumologicTransportError ? error.endpoint ?? endpoint : endpoint,
+        complete: null,
+        scope: null,
       };
     }
   }
@@ -789,19 +831,19 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getAccountStatus() {
-    return this.collect(() => this.getObject("/v1/account/status"));
+    return this.collect("/v1/account/status", () => this.getObject("/v1/account/status"));
   }
 
   listUsers() {
-    return this.collect(() => this.listWithToken("/v1/users", { includeServiceAccounts: false }));
+    return this.collect("/v1/users", () => this.listWithToken("/v1/users", { includeServiceAccounts: false }));
   }
 
   listRoles() {
-    return this.collect(() => this.listWithToken("/v1/roles"));
+    return this.collect("/v1/roles", () => this.listWithToken("/v1/roles"));
   }
 
   listAccessKeys() {
-    return this.collect(async () => {
+    return this.collect("/v1/accessKeys", async () => {
       try {
         return await this.listWithToken("/v1/accessKeys");
       } catch (error) {
@@ -813,54 +855,54 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   listSamlIdentityProviders() {
-    return this.collect(() => this.getArray("/v1/saml/identityProviders"));
+    return this.collect("/v1/saml/identityProviders", () => this.getArray("/v1/saml/identityProviders"));
   }
 
   listSamlAllowlistedUsers() {
-    return this.collect(() => this.getArray("/v1/saml/allowlistedUsers"));
+    return this.collect("/v1/saml/allowlistedUsers", () => this.getArray("/v1/saml/allowlistedUsers"));
   }
 
   getPasswordPolicy() {
-    return this.collect(() => this.getObject("/v1/passwordPolicy"));
+    return this.collect("/v1/passwordPolicy", () => this.getObject("/v1/passwordPolicy"));
   }
 
   getServiceAllowlistStatus() {
-    return this.collect(() => this.getObject("/v1/serviceAllowlist/status"));
+    return this.collect("/v1/serviceAllowlist/status", () => this.getObject("/v1/serviceAllowlist/status"));
   }
 
   listServiceAllowlistAddresses() {
-    return this.collect(async () => ({
+    return this.collect("/v1/serviceAllowlist/addresses", async () => ({
       data: asRecords(asObject(await this.get("/v1/serviceAllowlist/addresses"))?.data),
       complete: true,
     }));
   }
 
   getPolicy(name: SumologicPolicyName) {
-    return this.collect(() => this.getObject(`/v1/policies/${name}`));
+    return this.collect(`/v1/policies/${name}`, () => this.getObject(`/v1/policies/${name}`));
   }
 
   listPartitions() {
-    return this.collect(() => this.listWithToken("/v1/partitions", { viewTypes: "DefaultView,Partition,AuditIndex" }));
+    return this.collect("/v1/partitions", () => this.listWithToken("/v1/partitions", { viewTypes: "DefaultView,Partition,AuditIndex" }));
   }
 
   listScheduledViews() {
-    return this.collect(() => this.listWithToken("/v1/scheduledViews"));
+    return this.collect("/v1/scheduledViews", () => this.listWithToken("/v1/scheduledViews"));
   }
 
   listIngestBudgets() {
-    return this.collect(() => this.listWithToken("/v2/ingestBudgets"));
+    return this.collect("/v2/ingestBudgets", () => this.listWithToken("/v2/ingestBudgets"));
   }
 
   listConnections() {
-    return this.collect(() => this.listWithToken("/v1/connections"));
+    return this.collect("/v1/connections", () => this.listWithToken("/v1/connections"));
   }
 
   listCollectors() {
-    return this.collect(() => this.listWithOffset("/v1/collectors", {}, (payload) => asRecords(asObject(payload)?.collectors)));
+    return this.collect("/v1/collectors", () => this.listWithOffset("/v1/collectors", {}, (payload) => asRecords(asObject(payload)?.collectors)));
   }
 
   listMonitors() {
-    return this.collect(() => this.listWithOffset(
+    return this.collect("/v1/monitors/search", () => this.listWithOffset(
       "/v1/monitors/search",
       { query: "type:monitor" },
       (payload) => asRecords(payload).map((entry) => ({ ...(asObject(entry.item) ?? {}), path: entry.path })),
@@ -868,15 +910,16 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getPersonalFolder() {
-    return this.collect(() => this.getObject("/v2/content/folders/personal"));
+    return this.collect("/v2/content/folders/personal", () => this.getObject("/v2/content/folders/personal"));
   }
 
   listDashboards() {
-    return this.collect(() => this.listWithToken("/v2/dashboards", { mode: "allViewableByUser" }, "dashboards", DASHBOARDS_PAGE_SIZE));
+    return this.collect("/v2/dashboards", () => this.listWithToken("/v2/dashboards", { mode: "allViewableByUser" }, "dashboards", DASHBOARDS_PAGE_SIZE));
   }
 
   getContentPermissions(contentId: string) {
-    return this.collect(() => this.getObject(`/v2/content/${encodeURIComponent(contentId)}/permissions`, { explicitOnly: false }));
+    const path = `/v2/content/${encodeURIComponent(contentId)}/permissions`;
+    return this.collect(path, () => this.getObject(path, { explicitOnly: false }));
   }
 }
 
@@ -891,8 +934,22 @@ export function collectionOf<T>(data: T, options: Partial<SumologicCollection<T>
   };
 }
 
-export function failedCollection<T>(error: string, httpStatus?: number): SumologicCollection<T> {
-  return { ok: false, error, httpStatus, complete: false, scope: "org" };
+export function failedCollection<T>(error: string, httpStatus?: number, endpoint?: string): SumologicCollection<T> {
+  return { ok: false, error, httpStatus, endpoint, complete: null, scope: null };
+}
+
+/**
+ * The object written in place of a dataset that was never collected, so a
+ * bundle consumer cannot mistake a denied or failed read for an empty
+ * inventory: readable-but-empty lists stay [].
+ */
+export function notCollectedMarker(collection: SumologicCollection<unknown>): SumologicNotCollectedMarker {
+  return {
+    collected: false,
+    status: collection.httpStatus ?? null,
+    endpoint: collection.endpoint ?? null,
+    error: collection.error ?? null,
+  };
 }
 
 function controlById(number: number): ControlDefinition {
@@ -930,6 +987,7 @@ function unreadableSummary(what: string, collection: SumologicCollection<unknown
 
 function unreadable(number: number, severity: SumologicFinding["severity"], what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): SumologicFinding {
   return finding(number, severity, "manual", unreadableSummary(what, collection, evidenceToCollect), {
+    endpoint: collection.endpoint ?? null,
     endpoint_error: collection.error ?? null,
     http_status: collection.httpStatus ?? null,
   });
@@ -1155,12 +1213,13 @@ function projectSnapshotData(name: string, data: unknown): unknown {
 function rawSnapshot(collections: Array<[string, SumologicCollection<unknown>]>): Record<string, unknown> {
   return Object.fromEntries(collections.map(([name, item]) => [name, {
     ok: item.ok,
-    complete: item.complete,
-    scope: item.scope,
-    count: item.count ?? null,
+    complete: item.ok ? item.complete : null,
+    scope: item.ok ? item.scope : null,
+    count: item.ok ? item.count ?? null : null,
     error: item.error ?? null,
     http_status: item.httpStatus ?? null,
-    data: projectSnapshotData(name, item.data),
+    endpoint: item.endpoint ?? null,
+    data: item.ok ? projectSnapshotData(name, item.data) : notCollectedMarker(item),
   }]));
 }
 
@@ -1223,10 +1282,11 @@ export async function checkSumologicAccess(client: SumologicReader): Promise<Sum
     const collection = await load();
     surfaces.push({
       name,
-      endpoint,
+      endpoint: collection.ok ? endpoint : collection.endpoint ?? endpoint,
       status: collection.ok ? "readable" : "not_readable",
-      count: collection.ok ? collection.count : undefined,
-      complete: collection.ok ? collection.complete : undefined,
+      count: collection.ok ? collection.count ?? null : null,
+      complete: collection.ok ? collection.complete : null,
+      httpStatus: collection.ok ? null : collection.httpStatus ?? null,
       error: collection.error,
       capabilityHint,
     });
@@ -1505,7 +1565,7 @@ export async function assessSumologicAccessControl(
   }
 
   const keys = accessKeys.data ?? [];
-  const keyEvidenceBase = { keys_seen: keys.length, keys_complete: accessKeys.complete, scope: accessKeys.scope };
+  const keyEvidenceBase = { keys_seen: whenReadable(accessKeys, keys.length), keys_complete: whenReadable(accessKeys, accessKeys.complete), scope: whenReadable(accessKeys, accessKeys.scope) };
   if (!accessKeys.ok) {
     findings.push(unreadable(7, "high", "the access key inventory", accessKeys, "export Administration > Security > Access Keys with created dates."));
     findings.push(unreadable(8, "medium", "the access key inventory", accessKeys, "export Administration > Security > Access Keys with last-used dates."));
@@ -1859,7 +1919,7 @@ export async function assessSumologicContentSharing(
     permission_lookups_failed: whenReadable(personalFolder, unreadablePermissions.length),
   };
   const sampledShareText = personalFolder.ok ? `${orgShared.length} sampled item(s) are shared org-wide` : "the personal folder could not be read, so no items were sampled";
-  const personalFolderEvidence = "export the key owner's personal folder listing and /v2/content/{id}/permissions for each item to review org-wide shares.";
+  const personalFolderEvidence = "export the key owner's personal folder listing and the content permissions of each item to review org-wide shares.";
   const permissionLookupNote = unreadablePermissions.length > 0 ? ` ${unreadablePermissions.length} content permission lookup(s) failed (${unreadablePermissions.slice(0, 5).map((entry) => `${asString(entry.item.name) ?? asString(entry.item.id) ?? "item"}: ${entry.permissions.error ?? "unknown error"}`).join("; ")}), so those items were not checked.` : "";
   let sharingFinding: SumologicFinding;
   if (!dataAccessPolicy.ok) {
@@ -1918,7 +1978,7 @@ export async function assessSumologicContentSharing(
     lookupFinding = finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.${permissionLookupNote}`, lookupEvidence);
   } else {
     const sampledText = personalFolder.ok ? `${lookupItems.length} lookup table(s) were seen in the sampled folder` : "the personal folder could not be read, so no lookup tables were sampled";
-    lookupFinding = finding(18, "medium", "manual", `The API has no lookup table listing endpoint (only /v1/lookupTables/{id}); ${sampledText}. A human must inventory lookup tables in the Library, identify those with sensitive data, and export /v2/content/{id}/permissions for each.${permissionLookupNote}`, lookupEvidence);
+    lookupFinding = finding(18, "medium", "manual", `The API has no lookup table listing endpoint (lookup tables are only readable one at a time by id); ${sampledText}. A human must inventory lookup tables in the Library, identify those with sensitive data, and export the content permissions of each.${permissionLookupNote}`, lookupEvidence);
   }
   findings.push(withUnreadableDowngrade(lookupFinding, "personal folder", personalFolder, personalFolderEvidence, "manual"));
 
