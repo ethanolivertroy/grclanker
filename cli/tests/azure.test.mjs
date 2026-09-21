@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import {
   AZURE_ARM_API_VERSIONS,
+  AzureApiError,
   AzureAuditorClient,
   assessAzureDataProtection,
   assessAzureIdentity,
@@ -27,9 +28,20 @@ import {
   projectCredentialCarrier,
   resolveAzureCloud,
   resolveAzureConfiguration,
+  redactErrorText,
   resolveSecureOutputPath,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
+import {
+  CANARY_URL,
+  HTML_BODY_NOTE,
+  REDACTED_CANARY_URL,
+  assertNoCanaries,
+  assertNoCanariesInFiles,
+  assertRedactionCases,
+  htmlCanaryBody,
+  jsonCanaryMessage,
+} from "./helpers/error-canaries.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
@@ -261,7 +273,7 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
 });
 
 // Prototype members that do not issue a Graph or ARM request; every other client method must appear in the URL assertions below.
-const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
+const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "parseJsonBody", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
 
 test("AzureAuditorClient sends the documented request URL and API version for every request method", async () => {
   const requests = [];
@@ -416,8 +428,17 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
   assert.equal(describeErrorBody(""), "");
   assert.equal(describeErrorBody(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation.", innerError: { "request-id": "req-1", date: "2026-04-16" } } })), "Authorization_RequestDenied: Insufficient privileges to complete the operation.");
   assert.equal(describeErrorBody(JSON.stringify({ error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided.", trace_id: "trace-1", correlation_id: "corr-1" })), "invalid_client: AADSTS7000215: Invalid client secret provided.");
-  assert.equal(describeErrorBody("<html>Bad gateway, request Authorization: Bearer leaked-token</html>"), "non-JSON error body omitted");
+  const htmlBody = "<html>Bad gateway, request Authorization: Bearer leaked-token</html>";
+  assert.equal(describeErrorBody(htmlBody, "text/html; charset=utf-8"), `non-JSON body (text/html, ${htmlBody.length} bytes)`);
+  assert.equal(describeErrorBody(htmlBody), `non-JSON body (unknown content type, ${htmlBody.length} bytes)`);
+  assert.equal(describeErrorBody("[1,2,3]", "application/json"), "non-JSON body (application/json, 7 bytes)", "a JSON body that is not an object is described by shape too");
   assert.equal(describeErrorBody(JSON.stringify({ unexpected: "shape", token: "leaked-token" })), "error body without code or message");
+  assertRedactionCases(assert, redactErrorText);
+  assert.equal(
+    new AzureApiError(`403 Forbidden: AuthorizationFailed: see ${CANARY_URL} for the denied scope`, "https://management.azure.com/x", 403).message,
+    "403 Forbidden: AuthorizationFailed: see https://api.example.com/v1/x?[REDACTED] for the denied scope",
+    "AzureApiError scrubs its own message",
+  );
 
   const leakedMarker = "LEAKED-REQUEST-CONTEXT";
   const fetchImpl = async (url) => {
@@ -842,21 +863,21 @@ test("AZURE-DP-03 reads the beta sensitivity label endpoint and states the beta 
  * stated status, and no other finding may move off the compliant baseline.
  */
 const SECONDARY_DENIALS = [
-  { method: "getSecurityDefaultsPolicy", assessor: assessAzureIdentity, expect: { "AZURE-ID-01": "pass", "AZURE-ID-02": "pass" }, note: /Security defaults could not be read \(GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\)/ },
-  { method: "listDirectoryRoleMembers", assessor: assessAzureIdentity, expect: { "AZURE-ID-04": "manual" }, endpoint: "GET /v1.0/directoryRoles/{id}/members" },
+  { method: "getSecurityDefaultsPolicy", assessor: assessAzureIdentity, expect: { "AZURE-ID-01": "pass", "AZURE-ID-02": "pass" }, nullFields: ["security_defaults_enabled"], note: /Security defaults could not be read \(GET \/v1\.0\/policies\/identitySecurityDefaultsEnforcementPolicy returned 403 Forbidden\)/ },
+  { method: "listDirectoryRoleMembers", assessor: assessAzureIdentity, expect: { "AZURE-ID-04": "manual" }, nullFields: ["global_administrators", "privileged_role_assignments"], endpoint: "GET /v1.0/directoryRoles/{id}/members" },
   { method: "listRoleEligibilitySchedules", assessor: assessAzureIdentity, expect: { "AZURE-ID-06": "manual" }, endpoint: "GET /v1.0/roleManagement/directory/roleEligibilitySchedules" },
   { method: "listRoleAssignmentSchedules", assessor: assessAzureIdentity, expect: { "AZURE-ID-06": "manual" }, endpoint: "GET /v1.0/roleManagement/directory/roleAssignmentSchedules" },
-  { method: "listSubscribedSkus", assessor: assessAzureIdentity, expect: { "AZURE-ID-09": "manual", "AZURE-ID-10": "manual" }, endpoint: "GET /v1.0/subscribedSkus" },
+  { method: "listSubscribedSkus", assessor: assessAzureIdentity, expect: { "AZURE-ID-09": "manual", "AZURE-ID-10": "manual" }, nullFields: ["entra_id_p2_license"], endpoint: "GET /v1.0/subscribedSkus" },
   { method: "listRiskDetections", assessor: assessAzureIdentity, expect: { "AZURE-ID-11": "manual" }, endpoint: "GET /v1.0/identityProtection/riskDetections" },
-  { method: "listSecurityAlerts", assessor: assessAzureMonitoring, expect: { "AZURE-MON-04": "pass" }, evidence: (item) => assert.equal(item.evidence.alerts_error, "403 Forbidden") },
+  { method: "listSecurityAlerts", assessor: assessAzureMonitoring, expect: { "AZURE-MON-04": "pass" }, nullFields: ["security_alerts"], evidence: (item) => assert.equal(item.evidence.alerts_error, "403 Forbidden") },
   { method: "listLogAnalyticsWorkspaces", assessor: assessAzureMonitoring, expect: { "AZURE-MON-06": "manual" }, endpoint: "GET Microsoft.OperationalInsights/workspaces" },
-  { method: "listRoleDefinitions", assessor: assessAzureSubscriptionGuardrails, expect: { "AZURE-SUB-01": "manual", "AZURE-SUB-02": "manual", "AZURE-SUB-05": "manual" }, endpoint: "GET Microsoft.Authorization/roleDefinitions" },
-  { method: "listSubscribedSkus", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, endpoint: "GET /v1.0/subscribedSkus" },
-  { method: "listDeviceCompliancePolicies", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, endpoint: "GET /v1.0/deviceManagement/deviceCompliancePolicies" },
-  { method: "listManagedDevices", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, endpoint: "GET /v1.0/deviceManagement/managedDevices" },
+  { method: "listRoleDefinitions", assessor: assessAzureSubscriptionGuardrails, expect: { "AZURE-SUB-01": "manual", "AZURE-SUB-02": "manual", "AZURE-SUB-05": "manual" }, nullFields: ["owner_assignments", "contributor_assignments", "privileged_service_principals"], endpoint: "GET Microsoft.Authorization/roleDefinitions" },
+  { method: "listSubscribedSkus", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, nullFields: ["intune_license"], endpoint: "GET /v1.0/subscribedSkus" },
+  { method: "listDeviceCompliancePolicies", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, nullFields: ["compliance_policies"], endpoint: "GET /v1.0/deviceManagement/deviceCompliancePolicies" },
+  { method: "listManagedDevices", assessor: assessAzureDataProtection, expect: { "AZURE-DP-01": "manual" }, nullFields: ["managed_devices"], endpoint: "GET /v1.0/deviceManagement/managedDevices" },
   { method: "listInboxMessageRules", assessor: assessAzureDataProtection, expect: { "AZURE-DP-06": "manual" }, endpoint: "GET /v1.0/users/{id}/mailFolders/inbox/messageRules" },
-  { method: "listNetworkWatchers", assessor: assessAzureNetworkAndPolicy, expect: { "AZURE-NP-04": "manual" }, endpoint: "GET Microsoft.Network/networkWatchers" },
-  { method: "listFlowLogs", assessor: assessAzureNetworkAndPolicy, expect: { "AZURE-NP-04": "manual" }, endpoint: "GET Microsoft.Network/networkWatchers/{networkWatcherName}/flowLogs" },
+  { method: "listNetworkWatchers", assessor: assessAzureNetworkAndPolicy, expect: { "AZURE-NP-04": "manual" }, nullFields: ["network_watchers", "flow_logs"], endpoint: "GET Microsoft.Network/networkWatchers" },
+  { method: "listFlowLogs", assessor: assessAzureNetworkAndPolicy, expect: { "AZURE-NP-04": "manual" }, nullFields: ["flow_logs"], endpoint: "GET Microsoft.Network/networkWatchers/{networkWatcherName}/flowLogs" },
 ];
 
 test("rule 1 corollary: denying one secondary read at a time never passes the dependent finding silently and never moves unrelated findings", async () => {
@@ -886,6 +907,32 @@ test("rule 1 corollary: denying one secondary read at a time never passes the de
     for (const [id, status] of Object.entries(baseline)) {
       if (id in scenario.expect) continue;
       assert.equal(statuses[id], status, `${label}: unrelated ${id} moved from ${status} to ${statuses[id]}`);
+    }
+    for (const field of scenario.nullFields ?? []) {
+      assert.equal(result.summary[field], null, `${label}: summary ${field} must be null, not a value derived from the empty fallback`);
+    }
+  }
+});
+
+test("rule 1 corollary: every assessment summary renders null, never zero, for an inventory whose read failed", async () => {
+  const cases = [
+    [assessAzureIdentity, "listConditionalAccessPolicies", ["enabled_conditional_access_policies", "report_only_conditional_access_policies", "mfa_conditional_access_policies", "legacy_auth_block_policies"]],
+    [assessAzureIdentity, "listDirectoryRoles", ["global_administrators", "privileged_role_assignments"]],
+    [assessAzureIdentity, "listGuestUsers", ["guests"]],
+    [assessAzureMonitoring, "listSecureScores", ["secure_score_ratio"]],
+    [assessAzureMonitoring, "listDefenderPricings", ["defender_standard_plans", "defender_total_plans"]],
+    [assessAzureMonitoring, "listDiagnosticSettings", ["effective_diagnostic_settings"]],
+    [assessAzureMonitoring, "listDirectoryAudits", ["directory_audits"]],
+    [assessAzureSubscriptionGuardrails, "listRoleAssignments", ["owner_assignments", "contributor_assignments", "inspected_assignments", "privileged_service_principals"]],
+    [assessAzureNetworkAndPolicy, "listNetworkSecurityGroups", ["network_security_groups", "flow_logs"]],
+    [assessAzureNetworkAndPolicy, "listPolicyAssignments", ["policy_assignments"]],
+    [assessAzureDataProtection, "listKeyVaults", ["key_vaults"]],
+    [assessAzureDataProtection, "listMemberUsers", ["mailboxes_sampled"]],
+  ];
+  for (const [assessor, method, fields] of cases) {
+    const result = await assessor(clientWith({ ...compliantClient(), [method]: async () => { throw forbidden(); } }));
+    for (const field of fields) {
+      assert.equal(result.summary[field], null, `${assessor.name} with ${method} denied: summary ${field} is null`);
     }
   }
 });
@@ -954,16 +1001,20 @@ test("rule 1 corollary: AZURE-DP-06 reports denied mailboxes as a MailboxSetting
   assert.equal(rules.evidence.mailboxes_permission_denied, 1);
   assert.equal(rules.evidence.mailboxes_other_errors, 1);
   assert.deepEqual(rules.evidence.permission_failure, { endpoint: "GET /v1.0/users/{id}/mailFolders/inbox/messageRules", http_status: 403, required_access: "MailboxSettings.Read (application)", error: "403 Forbidden: Insufficient privileges" });
-  assert.deepEqual(result.errors, ["AZURE-DP-06 GET /v1.0/users/{id}/mailFolders/inbox/messageRules: 403 Forbidden on 1 of 3 mailboxes"]);
+  assert.deepEqual(result.errors, [
+    "AZURE-DP-06 GET /v1.0/users/{id}/mailFolders/inbox/messageRules: 403 Forbidden on 1 of 3 mailboxes",
+    "AZURE-DP-06 GET /v1.0/users/{id}/mailFolders/inbox/messageRules: 404 Not Found: MailboxNotEnabledForRESTAPI on 1 of 3 mailboxes",
+  ]);
+  assert.deepEqual(rules.evidence.other_failure, { endpoint: "GET /v1.0/users/{id}/mailFolders/inbox/messageRules", http_status: 404, error: "404 Not Found: MailboxNotEnabledForRESTAPI" });
 
-  // Only non-permission failures keep the "no Exchange mailbox" explanation and nothing is written to errors.
+  // Only non-permission failures keep the "no Exchange mailbox" explanation; the failed read is still logged so the bundle names it.
   const onlyMissing = clientWith({ ...compliantClient(), listMemberUsers: async () => users.slice(0, 1).concat(users.slice(2)), listInboxMessageRules: async (userId) => { if (userId === "u-nomailbox") throw notFound(); return []; } });
   const missingResult = await assessAzureDataProtection(onlyMissing);
   const missing = missingResult.findings.find((item) => item.id === "AZURE-DP-06");
   assert.equal(missing.status, "warn");
   assert.match(missing.summary, /\(1 unreadable: 1 returned a non-permission error \(404 Not Found: MailboxNotEnabledForRESTAPI; commonly users without an Exchange mailbox\); verdict capped at warn\)/);
   assert.equal(missing.evidence.permission_failure, null);
-  assert.equal(missingResult.errors.length, 0);
+  assert.deepEqual(missingResult.errors, ["AZURE-DP-06 GET /v1.0/users/{id}/mailFolders/inbox/messageRules: 404 Not Found: MailboxNotEnabledForRESTAPI on 1 of 2 mailboxes"]);
 
   // Forwarding rules found alongside a denied subset still fail, and the denial stays named without the warn cap text.
   const leaking = clientWith({ ...compliantClient(), listMemberUsers: async () => users.slice(0, 2), listInboxMessageRules: async (userId) => { if (userId === "u-denied") throw forbidden(); return [{ displayName: "Leak", isEnabled: true, actions: { forwardTo: [{ emailAddress: { address: "ext@example.net" } }] } }]; } });
@@ -1130,6 +1181,170 @@ test("rule 9: the exported bundle and its zip never contain tokens, the client s
   assert.equal(vaults.status, "manual");
   assert.equal(vaults.evidence.error, "403 Forbidden: AuthorizationFailed: The client does not have authorization to perform action 'Microsoft.KeyVault/vaults/read'.");
   assert.doesNotMatch(files.get("core_data/metadata.json"), /client-123.*secret|access_token/i);
+});
+
+/** One key per documented surface: Graph paths, ARM paths, the two user lists (by $filter), and the token endpoint. */
+function azureSurfaceKey(urlString) {
+  const url = new URL(urlString);
+  if (url.pathname === "/v1.0/users") return url.searchParams.get("$filter")?.includes("Guest") ? "/v1.0/users(guest)" : "/v1.0/users(member)";
+  return url.pathname;
+}
+
+const AZURE_TOKEN_PATH = "/tenant-123/oauth2/v2.0/token";
+const AZURE_SUB = "/subscriptions/sub-123";
+const CANARY_WATCHER_ID = `${AZURE_SUB}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_eastus`;
+
+/** Healthy answers for every surface the access check and the five collectors read; dependent reads are reachable. */
+function healthyAzureRoutes() {
+  const list = (value) => () => new Response(JSON.stringify({ value }), { status: 200 });
+  const object = (value) => () => new Response(JSON.stringify(value), { status: 200 });
+  return {
+    [AZURE_TOKEN_PATH]: () => new Response(JSON.stringify({ token_type: "Bearer", expires_in: 3599, access_token: "token-from-endpoint-1234567890" }), { status: 200 }),
+    "/v1.0/organization": list([{ id: "org-1", displayName: "Contoso" }]),
+    "/v1.0/identity/conditionalAccess/policies": list([CA_MFA, CA_LEGACY, CA_SIGNIN_RISK, CA_USER_RISK, CA_COMPLIANT_DEVICE]),
+    "/v1.0/reports/authenticationMethods/userRegistrationDetails": list([{ id: "user-1", isMfaRegistered: true }]),
+    "/v1.0/directoryRoles": list([{ id: "role-ga", displayName: "Global Administrator", roleTemplateId: "62e90394-69f5-4237-9190-012177145e10" }]),
+    "/v1.0/directoryRoles/role-ga/members": list([{ id: "user-1" }, { id: "user-2" }]),
+    "/v1.0/policies/identitySecurityDefaultsEnforcementPolicy": object({ isEnabled: false }),
+    "/v1.0/policies/authorizationPolicy": object({ allowInvitesFrom: "adminsAndGuestInviters", defaultUserRolePermissions: { allowedToCreateApps: false } }),
+    "/v1.0/servicePrincipals": list([]),
+    "/v1.0/applications": list([]),
+    "/v1.0/oauth2PermissionGrants": list([]),
+    "/v1.0/users(guest)": list([]),
+    "/v1.0/users(member)": list([{ id: "user-1", userPrincipalName: "user-1@contoso.example", mail: "user-1@contoso.example" }]),
+    "/v1.0/users/user-1/mailFolders/inbox/messageRules": list([]),
+    "/v1.0/identityProtection/riskyUsers": list([]),
+    "/v1.0/identityProtection/riskDetections": list([]),
+    "/v1.0/subscribedSkus": list([{ skuPartNumber: "EMSPREMIUM", servicePlans: [{ servicePlanName: "AAD_PREMIUM_P2", provisioningStatus: "Success" }, { servicePlanName: "INTUNE_A", provisioningStatus: "Success" }] }]),
+    "/v1.0/roleManagement/directory/roleEligibilitySchedules": list([{ id: "el-1" }]),
+    "/v1.0/roleManagement/directory/roleAssignmentSchedules": list([]),
+    "/v1.0/deviceManagement/deviceCompliancePolicies": list([{ id: "cp-1" }]),
+    "/v1.0/deviceManagement/managedDevices": list([{ id: "d-1", complianceState: "compliant", lastSyncDateTime: NOW.toISOString() }]),
+    "/beta/security/informationProtection/sensitivityLabels": list([{ id: "label-1" }]),
+    "/v1.0/admin/sharepoint/settings": object({ sharingCapability: "externalUserSharingOnly" }),
+    "/v1.0/security/secureScores": list([{ currentScore: 80, maxScore: 100 }]),
+    "/v1.0/security/alerts_v2": list([]),
+    "/v1.0/auditLogs/directoryAudits": list([{ id: "audit-1" }]),
+    "/v1.0/auditLogs/signIns": list([{ id: "signin-1" }]),
+    [`${AZURE_SUB}/providers/Microsoft.Security/pricings`]: list([{ name: "VirtualMachines", properties: { pricingTier: "Standard" } }]),
+    [`${AZURE_SUB}/providers/Microsoft.Insights/diagnosticSettings`]: list([]),
+    [`${AZURE_SUB}/providers/Microsoft.OperationalInsights/workspaces`]: list([]),
+    [`${AZURE_SUB}/providers/Microsoft.Security/securityContacts`]: list([{ properties: { emails: "secops@contoso.example" } }]),
+    [`${AZURE_SUB}/providers/Microsoft.Authorization/roleAssignments`]: list([{ properties: { roleDefinitionId: "role-owner", principalType: "User" } }]),
+    [`${AZURE_SUB}/providers/Microsoft.Authorization/roleDefinitions`]: list([{ name: "role-owner", properties: { roleName: "Owner" } }]),
+    [`${AZURE_SUB}/providers/Microsoft.Network/networkWatchers`]: list([{ id: CANARY_WATCHER_ID, name: "NetworkWatcher_eastus", location: "eastus" }]),
+    [`${AZURE_SUB}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_eastus/flowLogs`]: list([ENABLED_FLOW_LOG]),
+    [`${AZURE_SUB}/providers/Microsoft.Network/networkSecurityGroups`]: list([{ id: NSG_ID, name: "nsg-1", properties: { securityRules: [] } }]),
+    [`${AZURE_SUB}/providers/Microsoft.KeyVault/vaults`]: list([]),
+    [`${AZURE_SUB}/providers/Microsoft.Storage/storageAccounts`]: list([]),
+    [`${AZURE_SUB}/providers/Microsoft.Authorization/policyAssignments`]: list([]),
+    [`${AZURE_SUB}/providers/Microsoft.PolicyInsights/policyStates/latest/summarize`]: list([]),
+  };
+}
+
+function azureRoutedFetch(routes, seen = new Set()) {
+  return async (url) => {
+    const key = azureSurfaceKey(url);
+    seen.add(key);
+    const route = routes[key];
+    if (!route) throw new Error(`Unexpected Azure request: ${url}`);
+    return route();
+  };
+}
+
+function canaryHtmlResponse() {
+  return new Response(htmlCanaryBody(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function canaryJsonResponse(key) {
+  const body = key === AZURE_TOKEN_PATH
+    ? { error: "invalid_client", error_description: jsonCanaryMessage() }
+    : { error: { code: "AuthorizationFailed", message: jsonCanaryMessage() } };
+  return new Response(JSON.stringify(body), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+}
+
+function canaryConfig() {
+  return resolveAzureConfiguration(
+    {},
+    { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: "canary-client-secret-value-1" },
+    () => undefined,
+  );
+}
+
+async function runEveryAzureTool(client, config, outputRoot) {
+  const access = await checkAzureAccess(client);
+  const assessments = [];
+  for (const [, assess] of ASSESSORS) assessments.push(await assess(client));
+  const exported = await exportAzureAuditBundle(client, config, outputRoot);
+  return { access, assessments, exported };
+}
+
+test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
+  const config = canaryConfig();
+  const outputRoot = createTempBase("grclanker-azure-canary-");
+
+  // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
+  const healthySeen = new Set();
+  const healthy = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), healthySeen), now: () => NOW });
+  const healthyRun = await runEveryAzureTool(healthy, config, outputRoot);
+  assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
+  const surfaces = Object.keys(healthyAzureRoutes());
+  assert.deepEqual([...healthySeen].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the collectors, or the export");
+  const accessSurfaces = new Set();
+  await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), accessSurfaces), now: () => NOW }));
+  const collectorSurfaces = new Set();
+  const collectorClient = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), collectorSurfaces), now: () => NOW });
+  for (const [, assess] of ASSESSORS) await assess(collectorClient);
+  assert.equal(accessSurfaces.size, 9, "the access check probes eight surfaces plus the token endpoint");
+  assert.ok(collectorSurfaces.size >= surfaces.length - 1, "every surface but the organization probe is read by a collector");
+
+  for (const surface of surfaces) {
+    for (const [variant, response, expectedNote] of [
+      ["html", canaryHtmlResponse, HTML_BODY_NOTE],
+      ["json", () => canaryJsonResponse(surface), REDACTED_CANARY_URL],
+    ]) {
+      const label = `${surface} (${variant})`;
+      const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: response }), now: () => NOW });
+      const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-canary-"));
+
+      assertNoCanaries(assert, access, `${label} check_access`);
+      if (accessSurfaces.has(surface)) {
+        const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
+        assert.ok(failed.length > 0, `${label}: the access check records the failing surface`);
+        for (const entry of failed) assert.match(entry.error, expectedNote, `${label}: probe ${entry.name} carries the expected note`);
+      }
+
+      const recorded = [];
+      for (const assessment of assessments) {
+        assertNoCanaries(assert, assessment, `${label} ${assessment.title}`);
+        recorded.push(...assessment.errors);
+        for (const finding of assessment.findings) {
+          for (const evidenceError of [finding.evidence?.error, finding.evidence?.alerts_error, finding.evidence?.permission_failure?.error, finding.evidence?.other_failure?.error]) {
+            if (typeof evidenceError === "string") recorded.push(evidenceError);
+          }
+        }
+      }
+      if (collectorSurfaces.has(surface)) {
+        assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by a collector`);
+      }
+      if (variant === "html") {
+        for (const error of recorded) assert.match(error, HTML_BODY_NOTE, `${label}: "${error}" carries the status-and-length note`);
+      } else {
+        // describeFailure drops the message for 401/402/403; wherever the message does survive, only the redacted URL may remain.
+        for (const error of recorded.filter((entry) => entry.includes("api.example.com"))) {
+          assert.match(error, REDACTED_CANARY_URL, `${label}: the JSON message survives only with its query redacted`);
+        }
+      }
+
+      const files = readBundleFiles(exported.outputDir);
+      assertNoCanariesInFiles(assert, files, `${label} bundle`);
+      assertNoCanariesInFiles(assert, readZipEntries(exported.zipPath), `${label} zip`);
+      if (recorded.length > 0) {
+        assert.ok(exported.errorCount > 0, `${label}: the export logs the failed read`);
+        if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes\)/);
+      }
+    }
+  }
 });
 
 test("verdict safety 8: re-running the export never overwrites a prior bundle and logs errors on partial failure", async () => {

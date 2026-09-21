@@ -433,13 +433,73 @@ export function toPage(value: unknown): AzurePage {
   return { items: [], truncated: false, seen: 0 };
 }
 
+const REDACTED_ERROR_VALUE = "[REDACTED]";
+const CONFIGURED_SECRETS = new Set<string>();
+
+/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them. */
+function registerConfiguredSecrets(...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value && value.length >= 8) CONFIGURED_SECRETS.add(value);
+  }
+}
+
+const CREDENTIAL_KEY_PATTERN =
+  "[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|apikey|session(?:[_-]?id)?|sid|cookie|authorization|auth|signature|sig|credentials?|access[_-]?key|private[_-]?key)";
+// A credential value is a single token that is either long or carries a digit; short prose words after a
+// colon (for example the Graph code "InvalidAuthenticationToken: Access token has expired") are left alone.
+const CREDENTIAL_VALUE_PATTERN = `(?:(?:Bearer|Basic|Digest|Token)\\s+)?(?:(?=[^\\s"'&;,<>]{16,})|(?=[^\\s"'&;,<>]*\\d))[^\\s"'&;,<>]{8,}`;
+
+const ERROR_TEXT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages); the value must
+  // be long or carry a digit or base64 padding so prose such as "Basic authentication" is left alone.
+  [/\b(Bearer|Basic|Digest|Negotiate|SSWS|Token)\s+(?=[A-Za-z0-9\-._~+/=:]{16,}|[A-Za-z0-9\-._~+/=:]*[\d+/=])[A-Za-z0-9\-._~+/=:]{8,}/gi, `$1 ${REDACTED_ERROR_VALUE}`],
+  // JWT-shaped strings.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
+  // AWS access key ids, 40-character secret access keys, long secret-shaped blobs, and hex API keys.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
+  [/(?<![A-Za-z0-9+_=-])[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
+  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
+  // Cookie headers carry session values in free form.
+  [/\b(set-cookie|cookie)(\s*[:=]\s*)[^\n<>]+/gi, `$1$2${REDACTED_ERROR_VALUE}`],
+  // key=value, key: value, and "key":"value" pairs whose key names a credential.
+  [new RegExp(`\\b(${CREDENTIAL_KEY_PATTERN})(["']?\\s*[=:]\\s*["']?)${CREDENTIAL_VALUE_PATTERN}`, "gi"), `$1$2${REDACTED_ERROR_VALUE}`],
+];
+
+// URL userinfo and query strings anywhere in the string, not only when the string starts with a URL.
+const URL_PATTERN = /\b(https?:\/\/)(?:[^\s/@"'<>]+@)?([^\s?#"'<>]+)(\?[^\s#"'<>]*)?/gi;
+
+/**
+ * Rule 9 sink for error text. AzureApiError scrubs its own message and every recorded error string
+ * (attempt results, access surfaces, tool results) passes through here again, so no path can carry a
+ * credential echoed by an upstream error body, a transport error, or a URL into the audit output.
+ */
+export function redactErrorText(text: string): string {
+  let scrubbed = text;
+  for (const secret of CONFIGURED_SECRETS) {
+    scrubbed = scrubbed.split(secret).join(REDACTED_ERROR_VALUE);
+  }
+  scrubbed = scrubbed.replace(URL_PATTERN, (_match, scheme: string, hostPath: string, query?: string) =>
+    `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}`,
+  );
+  for (const [pattern, replacement] of ERROR_TEXT_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  return scrubbed;
+}
+
+/** The only way a thrown error becomes recorded text. */
+function describeThrown(error: unknown): string {
+  return redactErrorText(error instanceof Error ? error.message : String(error));
+}
+
 export class AzureApiError extends Error {
   constructor(
     message: string,
     readonly url: string,
     readonly status?: number,
   ) {
-    super(message);
+    super(redactErrorText(message));
     this.name = "AzureApiError";
   }
 }
@@ -451,7 +511,7 @@ async function attempt<T>(load: () => Promise<T>): Promise<Attempt<T>> {
     return { ok: true, value: await load() };
   } catch (error) {
     const status = error instanceof AzureApiError ? error.status : undefined;
-    return { ok: false, error: error instanceof Error ? error.message : String(error), status };
+    return { ok: false, error: describeThrown(error), status };
   }
 }
 
@@ -786,7 +846,7 @@ async function surface(
       name,
       service,
       status: "not_readable",
-      error: error instanceof Error ? error.message : String(error),
+      error: describeThrown(error),
     };
   }
 }
@@ -806,16 +866,22 @@ function pageSummary(value: unknown): SurfaceSummary {
  * https://learn.microsoft.com/en-us/graph/errors and
  * https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
  */
-export function describeErrorBody(text: string): string {
+/**
+ * Reduces an error response body to the vendor's documented fields: Graph/ARM `error.code` and
+ * `error.message`, or the OAuth `error` and `error_description`. Any body that is not a JSON object,
+ * whatever its content type claims, is described by status shape and length and never quoted.
+ */
+export function describeErrorBody(text: string, contentType?: string | null): string {
   if (!text.trim()) return "";
+  const nonJson = `non-JSON body (${contentType?.split(";")[0]?.trim() || "unknown content type"}, ${Buffer.byteLength(text, "utf8")} bytes)`;
   let payload: unknown;
   try {
     payload = JSON.parse(text);
   } catch {
-    return "non-JSON error body omitted";
+    return nonJson;
   }
   const record = asObject(payload);
-  if (!record) return "non-JSON error body omitted";
+  if (!record) return nonJson;
   const envelope = asObject(record.error);
   if (envelope) {
     const code = asString(envelope.code);
@@ -876,6 +942,7 @@ export class AzureAuditorClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.cloud = config.cloud ?? AZURE_CLOUDS["login.microsoftonline.com"];
+    registerConfiguredSecrets(config.graphToken, config.managementToken, config.clientCredentials?.clientSecret);
   }
 
   getResolvedConfig(): AzureResolvedConfig {
@@ -917,15 +984,26 @@ export class AzureAuditorClient {
     });
     const text = await response.text().catch(() => "");
     if (!response.ok) {
-      const detail = describeErrorBody(text);
+      const detail = describeErrorBody(text, response.headers.get("content-type"));
       throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
-    const payload = asObject(JSON.parse(text)) ?? {};
+    const payload = this.parseJsonBody(text, response, url, "Token request");
     const token = asString(payload.access_token);
     if (!token) throw new AzureApiError("Token response did not include access_token.", url);
+    registerConfiguredSecrets(token);
     const expiresIn = asNumber(payload.expires_in) ?? 3600;
     this.tokenCache.set(resource, { token, expiresAt: this.now().getTime() + expiresIn * 1000 });
     return token;
+  }
+
+  /** A 2xx body that is not JSON (a proxy login page, an HTML error) is described by shape, never echoed. */
+  private parseJsonBody(text: string, response: Response, url: string, label: string): JsonRecord {
+    if (text.trim().length === 0) return {};
+    try {
+      return asObject(JSON.parse(text)) ?? {};
+    } catch {
+      throw new AzureApiError(`${label} returned ${response.status} ${response.statusText}: ${describeErrorBody(text, response.headers.get("content-type"))}`, url, response.status);
+    }
   }
 
   private async requestJson(url: string, resource: "graph" | "management", init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<JsonRecord> {
@@ -941,11 +1019,11 @@ export class AzureAuditorClient {
     });
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      const detail = describeErrorBody(text);
+      const detail = describeErrorBody(text, response.headers.get("content-type"));
       throw new AzureApiError(`${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
     const text = await response.text();
-    return text.trim().length > 0 ? (JSON.parse(text) as JsonRecord) : {};
+    return this.parseJsonBody(text, response, url, "Request");
   }
 
   /**
@@ -1573,18 +1651,19 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
 
   return {
     title: "Azure identity posture",
+    // Every count derived from an unreadable inventory renders null, never the zero of its empty fallback.
     summary: {
-      enabled_conditional_access_policies: enabled.length,
-      report_only_conditional_access_policies: reportOnly.length,
-      mfa_conditional_access_policies: mfaPolicies.length,
-      legacy_auth_block_policies: legacyAuthPolicies.length,
+      enabled_conditional_access_policies: policies.ok ? enabled.length : null,
+      report_only_conditional_access_policies: policies.ok ? reportOnly.length : null,
+      mfa_conditional_access_policies: policies.ok ? mfaPolicies.length : null,
+      legacy_auth_block_policies: policies.ok ? legacyAuthPolicies.length : null,
       users_in_registration_report: registrations.ok ? registrations.value.items.length : null,
-      global_administrators: globalAdmins,
-      privileged_role_assignments: privilegedAssignments,
+      global_administrators: roles.ok && !memberReadFailure ? globalAdmins : null,
+      privileged_role_assignments: roles.ok && !memberReadFailure ? privilegedAssignments : null,
       guests: guests.ok ? guests.value.items.length : null,
       risky_users: riskyUsers.ok ? riskyUsers.value.items.length : null,
       app_registrations: applications.ok ? applications.value.items.length : null,
-      security_defaults_enabled: securityDefaultsEnabled,
+      security_defaults_enabled: securityDefaults.ok ? securityDefaultsEnabled : null,
       entra_id_p2_license: p2 ?? null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
@@ -1649,6 +1728,8 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
 
   const standardPlans = defenderPricings.ok ? defenderPricings.value.items.filter((item) => asLower(asObject(item.properties)?.pricingTier) === "standard") : [];
   const totalPlans = defenderPricings.ok ? defenderPricings.value.items.length : 0;
+  // The alerts read only annotates MON-04, but a failed read is still logged so the bundle names it.
+  if (!alerts.ok) errors.push(`AZURE-MON-04 GET /v1.0/security/alerts_v2: ${describeFailure(alerts)}`);
   if (!defenderPricings.ok) {
     findings.push(manualForError("AZURE-MON-04", 16, "Defender for Cloud plan coverage", "high", "GET Microsoft.Security/pricings", "Security Reader on the subscription", "the Defender for Cloud environment settings page", defenderPricings, AZURE_ENDPOINT_DOCS.defenderPricings, errors));
   } else {
@@ -1701,13 +1782,13 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
   return {
     title: "Azure monitoring posture",
     summary: {
-      secure_score_ratio: round(secureScoreRatio, 2),
+      secure_score_ratio: secureScores.ok && maxScoreValue > 0 ? round(secureScoreRatio, 2) : null,
       directory_audits: audits.ok ? audits.value.seen : null,
       sign_ins: signIns.ok ? signIns.value.seen : null,
-      defender_standard_plans: standardPlans.length,
-      defender_total_plans: totalPlans,
+      defender_standard_plans: defenderPricings.ok ? standardPlans.length : null,
+      defender_total_plans: defenderPricings.ok ? totalPlans : null,
       security_alerts: alerts.ok ? alerts.value.seen : null,
-      effective_diagnostic_settings: effectiveSettings.length,
+      effective_diagnostic_settings: diagnosticSettings.ok ? effectiveSettings.length : null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
     findings,
@@ -1808,11 +1889,11 @@ export async function assessAzureSubscriptionGuardrails(
   return {
     title: "Azure subscription guardrails",
     summary: {
-      owner_assignments: ownerAssignments.length,
-      contributor_assignments: contributorAssignments.length,
+      owner_assignments: rbacManual ? null : ownerAssignments.length,
+      contributor_assignments: rbacManual ? null : contributorAssignments.length,
       inspected_assignments: roleAssignments.ok ? roleAssignments.value.seen : null,
       network_watchers: networkWatchers.ok ? networkWatchers.value.items.length : null,
-      privileged_service_principals: privilegedServicePrincipals.length,
+      privileged_service_principals: rbacManual ? null : privilegedServicePrincipals.length,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
     findings,
@@ -1978,6 +2059,7 @@ export async function assessAzureDataProtection(
       // A denied subset is a permission gap on those mailboxes, not a licensing quirk; only non-permission
       // errors (typically 404 for users without an Exchange mailbox) are described that way.
       if (permissionFailure) errors.push(`AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(permissionFailure)} on ${mailboxesDenied} of ${mailboxesRead + mailboxesUnreadable} mailboxes`);
+      if (otherFailure) errors.push(`AZURE-DP-06 ${MESSAGE_RULES_ENDPOINT}: ${describeFailure(otherFailure)} on ${mailboxesErrored} of ${mailboxesRead + mailboxesUnreadable} mailboxes`);
       const unreadableNotes = [
         mailboxesDenied > 0 && permissionFailure ? `${mailboxesDenied} denied with ${describeFailure(permissionFailure)}, so ${MAILBOX_RULES_PERMISSION} is missing for those mailboxes and their rules were not inspected` : "",
         mailboxesErrored > 0 && otherFailure ? `${mailboxesErrored} returned a non-permission error (${describeFailure(otherFailure)}; commonly users without an Exchange mailbox)` : "",
@@ -1999,6 +2081,7 @@ export async function assessAzureDataProtection(
           mailboxes_permission_denied: mailboxesDenied,
           mailboxes_other_errors: mailboxesErrored,
           permission_failure: permissionFailure ? { endpoint: MESSAGE_RULES_ENDPOINT, http_status: permissionFailure.status ?? null, required_access: MAILBOX_RULES_PERMISSION, error: permissionFailure.error.slice(0, 300) } : null,
+          other_failure: otherFailure ? { endpoint: MESSAGE_RULES_ENDPOINT, http_status: otherFailure.status ?? null, error: otherFailure.error.slice(0, 300) } : null,
           forwarding_rules: forwardingRules.slice(0, 25),
           ...pageEvidence(members.value),
         }));
@@ -2216,7 +2299,7 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
     summary: {
       network_security_groups: nsgs.ok ? nsgs.value.items.length : null,
       network_watchers: watchers.ok ? watchers.value.items.length : null,
-      flow_logs: flowLogPage.seen,
+      flow_logs: watchers.ok && nsgs.ok && !flowLogFailure ? flowLogPage.seen : null,
       policy_assignments: assignments.ok ? assignments.value.items.length : null,
       manual_findings: findings.filter((item) => item.status === "manual").length,
     },
@@ -2539,7 +2622,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAccessCheckText(result), { tool: "azure_check_access", ...result });
       } catch (error) {
         return errorResult(
-          `Azure access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure access check failed: ${describeThrown(error)}`,
           { tool: "azure_check_access" },
         );
       }
@@ -2559,7 +2642,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_identity", ...result });
       } catch (error) {
         return errorResult(
-          `Azure identity assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure identity assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_identity" },
         );
       }
@@ -2579,7 +2662,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_monitoring", ...result });
       } catch (error) {
         return errorResult(
-          `Azure monitoring assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure monitoring assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_monitoring" },
         );
       }
@@ -2599,7 +2682,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_subscription_guardrails", ...result });
       } catch (error) {
         return errorResult(
-          `Azure subscription guardrail assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure subscription guardrail assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_subscription_guardrails" },
         );
       }
@@ -2619,7 +2702,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(
-          `Azure data protection assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure data protection assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_data_protection" },
         );
       }
@@ -2639,7 +2722,7 @@ export function registerAzureTools(pi: any): void {
         return textResult(formatAssessmentText(result), { tool: "azure_assess_network_and_policy", ...result });
       } catch (error) {
         return errorResult(
-          `Azure network and policy assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure network and policy assessment failed: ${describeThrown(error)}`,
           { tool: "azure_assess_network_and_policy" },
         );
       }
@@ -2683,7 +2766,7 @@ export function registerAzureTools(pi: any): void {
         );
       } catch (error) {
         return errorResult(
-          `Azure audit bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Azure audit bundle export failed: ${describeThrown(error)}`,
           { tool: "azure_export_audit_bundle" },
         );
       }
