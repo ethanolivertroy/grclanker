@@ -1120,6 +1120,10 @@ function capForPartial(status: ZscalerFindingStatus, dataset: CollectedDataset<J
   return status;
 }
 
+function capForPartialAll(status: ZscalerFindingStatus, datasets: CollectedDataset<JsonRecord[]>[]): ZscalerFindingStatus {
+  return status === "pass" && datasets.some((dataset) => dataset.truncated) ? "warn" : status;
+}
+
 function isEnabledState(record: JsonRecord): boolean {
   return asString(record.state)?.toUpperCase() === "ENABLED";
 }
@@ -1247,6 +1251,7 @@ export function assessZiaAccessControlData(
       admin_scope_field_source: "adminScope.Type per the published reference; adminScopeType is accepted only as zscaler-sdk-go legacy evidence",
       password_expiration_enabled: asBoolean(data.passwordExpiry.data.passwordExpirationEnabled) ?? null,
       password_expiry_days: asNumber(data.passwordExpiry.data.passwordExpiryDays) ?? null,
+      partial_inventory: data.adminUsers.truncated === true,
     }));
   }
 
@@ -2050,6 +2055,7 @@ function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): Zscale
     exempted_urls: exempted ? exempted.length : null,
     exempted_urls_readable: exempted !== undefined,
     locations_without_ssl_scan: locationsWithoutScan ?? null,
+    location_inventory_partial: data.locations.truncated === true,
     rules: ruleSummaries(rules.data),
   };
   if (rules.data.length === 0) {
@@ -2070,7 +2076,8 @@ function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): Zscale
   if ((locationsWithoutScan ?? 0) > 0) {
     return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules and ${exempted.length} exemptions, but ${locationsWithoutScan} location(s) have sslScanEnabled=false.`, evidence, evidenceNote);
   }
-  return finding(4, "pass", `${decrypt.length} enabled DECRYPT rules, ${exempted.length} exempted URLs (threshold ${maxExemptions}), no blanket bypass rules${locationsWithoutScan === undefined ? "" : ", and SSL scanning enabled on every location"}.`, evidence);
+  const status = capForPartial("pass", data.locations);
+  return finding(4, status, `${decrypt.length} enabled DECRYPT rules, ${exempted.length} exempted URLs (threshold ${maxExemptions}), no blanket bypass rules${locationsWithoutScan === undefined ? "" : ", and SSL scanning enabled on every location that was read"}.${partialSuffix(data.locations, "location")}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessSandbox(data: ZiaPolicyData): ZscalerFinding {
@@ -2131,6 +2138,7 @@ function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
     profiles: truncateList(profiles.data.map((profile) => asString(profile.name) ?? asString(profile.id) ?? "profile")),
     isolate_url_rules: truncateList(isolateRules.map(ruleLabel)),
     url_rule_inventory_partial: urlRules.truncated === true,
+    partial_inventory: urlRules.truncated === true,
   };
   if (profiles.data.length === 0) {
     return finding(17, "manual", "Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.", evidence, evidenceNote);
@@ -2157,11 +2165,13 @@ function assessLocations(data: ZiaPolicyData): ZscalerFinding {
   const subLocationParentsRead = subLocations.seen ?? locations.data.length;
   const subLocationParentsTotal = subLocations.total ?? locations.data.length;
   const subLocationsPartial = subLocations.truncated === true || subLocations.error !== undefined;
+  const tunnelsPartial = data.greTunnels.truncated === true || data.vpnCredentials.truncated === true;
   const subLocationSuffix = subLocations.truncated
     ? ` Sub-locations were read for only ${subLocationParentsRead} of ${subLocationParentsTotal} parent locations, so the sub-location inventory is partial and this verdict is capped at warn.`
     : subLocations.error
       ? ` Sub-locations could not be read for every parent (${subLocations.error}), so the sub-location inventory is partial and this verdict is capped at warn.`
       : "";
+  const tunnelSuffix = `${partialSuffix(data.greTunnels, "GRE tunnel")}${partialSuffix(data.vpnCredentials, "VPN credential")}`;
   const evidence = {
     location_count: locations.data.length,
     sub_location_count: subLocations.data.length,
@@ -2175,7 +2185,7 @@ function assessLocations(data: ZiaPolicyData): ZscalerFinding {
     locations_without_auth: truncateList(noAuth.map(locationLabel)),
     locations_without_ssl_scan: truncateList(noSsl.map(locationLabel)),
     locations_without_firewall: truncateList(noFirewall.map(locationLabel)),
-    partial_inventory: locations.truncated === true || subLocationsPartial,
+    partial_inventory: locations.truncated === true || subLocationsPartial || tunnelsPartial,
   };
   if (locations.data.length === 0) {
     return finding(18, "manual", "Empty inventory: zero locations exist, so the tenant may forward traffic only through Zscaler Client Connector; confirm that no GRE or IPSec sites are expected.", evidence, evidenceNote);
@@ -2185,10 +2195,10 @@ function assessLocations(data: ZiaPolicyData): ZscalerFinding {
   if (noSsl.length > 0) issues.push(`${noSsl.length} without sslScanEnabled`);
   if (noFirewall.length > 0) issues.push(`${noFirewall.length} without ofwEnabled`);
   if (issues.length > 0) {
-    return finding(18, "warn", `${all.length} locations and sub-locations reviewed: ${issues.join(", ")}.${partialSuffix(locations, "location")}${subLocationSuffix}`, evidence, evidenceNote);
+    return finding(18, "warn", `${all.length} locations and sub-locations reviewed: ${issues.join(", ")}.${partialSuffix(locations, "location")}${subLocationSuffix}${tunnelSuffix}`, evidence, evidenceNote);
   }
-  const status = subLocationsPartial ? "warn" : capForPartial("pass", locations);
-  return finding(18, status, `All ${all.length} locations and sub-locations that were read enforce authentication, SSL inspection, and the cloud firewall.${partialSuffix(locations, "location")}${subLocationSuffix}`, evidence, status === "warn" ? evidenceNote : undefined);
+  const status = subLocationsPartial || tunnelsPartial ? "warn" : capForPartial("pass", locations);
+  return finding(18, status, `All ${all.length} locations and sub-locations that were read enforce authentication, SSL inspection, and the cloud firewall.${partialSuffix(locations, "location")}${subLocationSuffix}${tunnelSuffix}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessCloudAppControl(data: ZiaPolicyData): ZscalerFinding {
@@ -2204,6 +2214,7 @@ function assessCloudAppControl(data: ZiaPolicyData): ZscalerFinding {
     enabled_rules: active.length,
     restrictive_rules: restrictive.length,
     partial_reads: rules.error ?? null,
+    partial_inventory: rules.truncated === true,
     rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), type: asString(rule.ruleType) ?? asString(rule.type) ?? null, state: asString(rule.state) ?? null, actions: asStringList(rule.actions) }))),
   };
   if (rules.error) {
@@ -2470,7 +2481,7 @@ function assessSegmentation(data: ZpaData): ZscalerFinding {
     full_port_range_segments: truncateList(fullRange.map(ruleLabel)),
     bypass_always_segments: truncateList(bypassAlways.map(ruleLabel)),
     ungrouped_segments: ungrouped.length,
-    partial_inventory: segments.truncated === true,
+    partial_inventory: segments.truncated === true || data.segmentGroups.truncated === true,
   };
   if (segments.data.length === 0) {
     return finding(8, "fail", "Empty inventory: zero application segments are defined, so ZPA is not brokering access to any private application.", evidence, evidenceNote);
@@ -2485,10 +2496,12 @@ function assessSegmentation(data: ZpaData): ZscalerFinding {
   if (wildcard.length > 0) issues.push(`${wildcard.length} use wildcard domains`);
   if (fullRange.length > 0) issues.push(`${fullRange.length} expose the full port range`);
   if (bypassAlways.length > 0) issues.push(`${bypassAlways.length} have bypassType ALWAYS`);
+  const partialNote = `${partialSuffix(segments, "application segment")}${partialSuffix(data.segmentGroups, "segment group")}`;
   if (issues.length > 0) {
-    return finding(8, "warn", `${enabled.length} enabled segments: ${issues.join(", ")}.${partialSuffix(segments, "application segment")}`, evidence, evidenceNote);
+    return finding(8, "warn", `${enabled.length} enabled segments: ${issues.join(", ")}.${partialNote}`, evidence, evidenceNote);
   }
-  return finding(8, capForPartial("pass", segments), `${enabled.length} enabled application segments are scoped to explicit domains and ports with no ZPA bypass.${partialSuffix(segments, "application segment")}`, evidence);
+  const status = capForPartialAll("pass", [segments, data.segmentGroups]);
+  return finding(8, status, `${enabled.length} enabled application segments are scoped to explicit domains and ports with no ZPA bypass.${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessAccessPolicies(data: ZpaData): ZscalerFinding {
@@ -2550,7 +2563,8 @@ function assessPosture(data: ZpaData): ZscalerFinding {
   if (postureRules.length < allow.length) {
     return finding(10, "warn", `${postureRules.length} of ${allow.length} enabled ALLOW rules enforce posture; the remaining ${allow.length - postureRules.length} grant access without a device check.`, evidence, evidenceNote);
   }
-  return finding(10, profiles.truncated || data.accessRules.truncated ? "warn" : "pass", `All ${allow.length} enabled ALLOW rules enforce one of ${profiles.data.length} posture profiles.${partialSuffix(data.accessRules, "access rule")}`, evidence);
+  const status = capForPartialAll("pass", [profiles, data.accessRules]);
+  return finding(10, status, `All ${allow.length} enabled ALLOW rules enforce one of ${profiles.data.length} posture profiles.${partialSuffix(profiles, "posture profile")}${partialSuffix(data.accessRules, "access rule")}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 interface ConnectorHealth {
@@ -2613,8 +2627,9 @@ function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
     disconnected: truncateList(health.disconnected.map(ruleLabel)),
     connector_groups: data.appConnectorGroups.error ? null : groups.length,
     groups_without_redundancy: truncateList(singleConnectorGroups),
-    partial_inventory: connectors.truncated === true,
+    partial_inventory: connectors.truncated === true || data.appConnectorGroups.truncated === true,
   };
+  const partialNote = `${partialSuffix(connectors, "connector")}${partialSuffix(data.appConnectorGroups, "connector group")}`;
   if (connectors.data.length === 0) {
     return finding(11, "fail", "Empty inventory: zero app connectors are enrolled, so no private application can be reached through ZPA.", evidence, evidenceNote);
   }
@@ -2624,9 +2639,10 @@ function assessConnectors(data: ZpaData, staleDays: number): ZscalerFinding {
   const issues = connectorHealthIssues(health, staleDays);
   if (singleConnectorGroups.length > 0) issues.push(`${singleConnectorGroups.length} group(s) with fewer than two connected connectors`);
   if (issues.length > 0) {
-    return finding(11, "warn", `${health.connected.length} of ${enabled.length} enabled connectors are authenticated with a broker connect time within ${staleDays} days; ${issues.join(", ")}.${partialSuffix(connectors, "connector")}`, evidence, evidenceNote);
+    return finding(11, "warn", `${health.connected.length} of ${enabled.length} enabled connectors are authenticated with a broker connect time within ${staleDays} days; ${issues.join(", ")}.${partialNote}`, evidence, evidenceNote);
   }
-  return finding(11, capForPartial("pass", connectors), `All ${health.connected.length} enabled connectors are authenticated with a broker connect time within ${staleDays} days, and every enabled connector group has at least two connected connectors.${partialSuffix(connectors, "connector")}`, evidence, connectors.truncated ? evidenceNote : undefined);
+  const status = capForPartialAll("pass", [connectors, data.appConnectorGroups]);
+  return finding(11, status, `All ${health.connected.length} enabled connectors are authenticated with a broker connect time within ${staleDays} days, and every enabled connector group that was read has at least two connected connectors.${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessIdp(data: ZpaData): ZscalerFinding {
@@ -2652,7 +2668,7 @@ function assessIdp(data: ZpaData): ZscalerFinding {
     zpa_admins_enabled: admins ? admins.length : null,
     zpa_admins_local_login_without_2fa: truncateList(weakAdmins.map((admin) => asString(admin.username) ?? asString(admin.email) ?? asString(admin.id) ?? "admin")),
     zpa_administrators_surface: `${ZPA_ADMINISTRATORS_PROVENANCE}; it supplements the IdP evidence and is never the sole basis for pass`,
-    partial_inventory: idps.truncated === true || data.administrators.truncated === true,
+    partial_inventory: [idps, data.administrators, data.samlAttributes, data.scimGroups].some((dataset) => dataset.truncated === true),
   };
   if (idps.data.length === 0) {
     return finding(12, "fail", "Empty inventory: zero identity providers are configured, so ZPA cannot authenticate users through SAML.", evidence, evidenceNote);
@@ -2666,11 +2682,11 @@ function assessIdp(data: ZpaData): ZscalerFinding {
   if (admins === undefined) issues.push(`ZPA administrators could not be read from GET /administrators (${unreadableReason(data.administrators)}; ${ZPA_ADMINISTRATORS_PROVENANCE})`);
   if (weakAdmins.length > 0) issues.push(`${weakAdmins.length} enabled ZPA administrator(s) allow local login without two-factor authentication`);
   if (adminIdps.length === 0) issues.push("no IdP is enabled for admin SSO");
-  const partialNote = `${partialSuffix(idps, "IdP")}${partialSuffix(data.administrators, "ZPA administrator")}`;
+  const partialNote = `${partialSuffix(idps, "IdP")}${partialSuffix(data.administrators, "ZPA administrator")}${partialSuffix(data.samlAttributes, "SAML attribute")}${partialSuffix(data.scimGroups, "SCIM group")}`;
   if (issues.length > 0) {
     return finding(12, "warn", `${userIdps.length} enabled user IdP(s) found, but: ${issues.join("; ")}.${partialNote}`, evidence, evidenceNote);
   }
-  const status = capForPartial(capForPartial("pass", idps), data.administrators);
+  const status = capForPartialAll("pass", [idps, data.administrators, data.samlAttributes, data.scimGroups]);
   return finding(12, status, `${userIdps.length} enabled user IdP(s) with SCIM provisioning and signed SAML requests, ${adminIdps.length} admin SSO IdP(s), and every enabled ZPA administrator has local login disabled or two-factor authentication (administrator state read from GET /administrators, ${ZPA_ADMINISTRATORS_PROVENANCE}).${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
@@ -2722,8 +2738,9 @@ function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
     networks: truncateList(networks.data.map(ruleLabel)),
     rules_referencing_trusted_networks: truncateList(referencing.map(ruleLabel)),
     policy_rules_readable: !data.accessRules.error && !data.forwardingRules.error,
-    partial_inventory: networks.truncated === true,
+    partial_inventory: [networks, data.accessRules, data.forwardingRules].some((dataset) => dataset.truncated === true),
   };
+  const partialNote = `${partialSuffix(networks, "trusted network")}${partialSuffix(data.accessRules, "access rule")}${partialSuffix(data.forwardingRules, "forwarding rule")}`;
   if (networks.data.length === 0) {
     return finding(15, "manual", "Not configured: zero trusted networks are defined, so on-network detection is not in use; confirm whether the architecture requires it.", evidence, evidenceNote);
   }
@@ -2731,10 +2748,10 @@ function assessTrustedNetworks(data: ZpaData): ZscalerFinding {
     return finding(15, "manual", `${networks.data.length} trusted networks exist but policy rules could not be read, so their enforcement is unverified.`, evidence, evidenceNote);
   }
   if (referencing.length === 0) {
-    return finding(15, "warn", `${networks.data.length} trusted networks are defined but no enabled access or forwarding rule references a TRUSTED_NETWORK condition.${partialSuffix(networks, "trusted network")}`, evidence, evidenceNote);
+    return finding(15, "warn", `${networks.data.length} trusted networks are defined but no enabled access or forwarding rule references a TRUSTED_NETWORK condition.${partialNote}`, evidence, evidenceNote);
   }
-  const status = capForPartial("pass", networks);
-  return finding(15, status, `${networks.data.length} trusted networks are referenced by ${referencing.length} enabled policy rule(s).${partialSuffix(networks, "trusted network")}`, evidence, status === "warn" ? evidenceNote : undefined);
+  const status = capForPartialAll("pass", [networks, data.accessRules, data.forwardingRules]);
+  return finding(15, status, `${networks.data.length} trusted networks are referenced by ${referencing.length} enabled policy rule(s).${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
@@ -2752,8 +2769,9 @@ function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
     authenticated_without_connect_time: truncateList(health.undated.map(ruleLabel)),
     disconnected: truncateList(health.disconnected.map(ruleLabel)),
     service_edge_groups: data.serviceEdgeGroups.error ? null : data.serviceEdgeGroups.data.length,
-    partial_inventory: edges.truncated === true,
+    partial_inventory: edges.truncated === true || data.serviceEdgeGroups.truncated === true,
   };
+  const partialNote = `${partialSuffix(edges, "service edge")}${partialSuffix(data.serviceEdgeGroups, "service edge group")}`;
   if (edges.data.length === 0) {
     return finding(21, "manual", "Not applicable or not configured: zero private service edges are enrolled, so the tenant relies on Zscaler public service edges; document that decision.", evidence, evidenceNote);
   }
@@ -2762,9 +2780,10 @@ function assessServiceEdges(data: ZpaData, staleDays: number): ZscalerFinding {
   }
   const issues = connectorHealthIssues(health, staleDays);
   if (issues.length > 0) {
-    return finding(21, "warn", `${health.connected.length} of ${enabled.length} enabled private service edges are authenticated with a broker connect time within ${staleDays} days; ${issues.join(", ")}.${partialSuffix(edges, "service edge")}`, evidence, evidenceNote);
+    return finding(21, "warn", `${health.connected.length} of ${enabled.length} enabled private service edges are authenticated with a broker connect time within ${staleDays} days; ${issues.join(", ")}.${partialNote}`, evidence, evidenceNote);
   }
-  return finding(21, capForPartial("pass", edges), `All ${health.connected.length} enabled private service edges are authenticated with a broker connect time within ${staleDays} days.${partialSuffix(edges, "service edge")}`, evidence, edges.truncated ? evidenceNote : undefined);
+  const status = capForPartialAll("pass", [edges, data.serviceEdgeGroups]);
+  return finding(21, status, `All ${health.connected.length} enabled private service edges are authenticated with a broker connect time within ${staleDays} days.${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function assessForwardingPolicy(data: ZpaData): ZscalerFinding {
@@ -2780,6 +2799,7 @@ function assessForwardingPolicy(data: ZpaData): ZscalerFinding {
     bypass_rules: truncateList(bypass.map(ruleLabel)),
     unconditional_bypass_rules: truncateList(unconditionalBypass.map(ruleLabel)),
     rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), action: asString(rule.action) ?? null, disabled: asBoolean(rule.disabled) ?? false, operands: ruleOperandTypes(rule) }))),
+    partial_inventory: rules.truncated === true,
   };
   if (rules.data.length === 0) {
     return finding(22, "manual", "Empty inventory: zero client forwarding rules exist, so the platform default applies; confirm in the portal that the default forwards all application traffic through ZPA.", evidence, evidenceNote);
@@ -2804,14 +2824,17 @@ function assessEmergencyAccess(data: ZpaData): ZscalerFinding {
     active_users: truncateList(active.map((user) => asString(user.emailId) ?? asString(user.userId) ?? "user")),
     users_without_last_login: undated.length,
     users: truncateList(users.data.map((user) => ({ email: asString(user.emailId) ?? null, status: asString(user.userStatus) ?? null, lastLoginTime: asString(user.lastLoginTime) ?? null }))),
+    partial_inventory: users.truncated === true,
   };
   if (users.data.length === 0) {
     return finding(23, "manual", "Not configured: zero emergency access users exist; confirm the documented break-glass procedure covers ZPA outages without them.", evidence, evidenceNote);
   }
+  const partialNote = partialSuffix(users, "emergency access user");
   if (active.length > 0) {
-    return finding(23, "warn", `${active.length} of ${users.data.length} emergency access users are currently active and should be deactivated when the incident closes: ${active.map((user) => asString(user.emailId) ?? "user").join(", ")}.`, evidence, evidenceNote);
+    return finding(23, "warn", `${active.length} of ${users.data.length} emergency access users are currently active and should be deactivated when the incident closes: ${active.map((user) => asString(user.emailId) ?? "user").join(", ")}.${partialNote}`, evidence, evidenceNote);
   }
-  return finding(23, capForPartial("pass", users), `${users.data.length} emergency access users are defined and none is currently active (${undated.length} have never logged in).`, evidence);
+  const status = capForPartial("pass", users);
+  return finding(23, status, `${users.data.length} emergency access users are defined and none is currently active (${undated.length} have never logged in).${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 function certificateExpiry(items: JsonRecord[], now: Date, warnDays: number): { expired: string[]; expiring: string[]; undated: string[]; healthy: number } {
@@ -2852,7 +2875,9 @@ function assessCertificates(data: ZpaData, warnDays: number): ZscalerFinding {
     browser_access_expiring_within_days: baExpiry.expiring,
     browser_access_without_validity: baExpiry.undated,
     warn_days: warnDays,
+    partial_inventory: enrollment.truncated === true || data.browserAccessCertificates.truncated === true,
   };
+  const partialNote = `${partialSuffix(enrollment, "enrollment certificate")}${partialSuffix(data.browserAccessCertificates, "browser access certificate")}`;
   if (enrollment.data.length === 0) {
     return finding(24, "manual", "Empty inventory: zero enrollment certificates were returned although every ZPA tenant has Zscaler-managed enrollment certificates, so the credential is probably scoped.", evidence, evidenceNote);
   }
@@ -2867,9 +2892,10 @@ function assessCertificates(data: ZpaData, warnDays: number): ZscalerFinding {
     if (expiring.length > 0) issues.push(`${expiring.length} expire within ${warnDays} days`);
     if (undated.length > 0) issues.push(`${undated.length} have no validToInEpochSec and cannot be counted as valid`);
     if (data.browserAccessCertificates.error) issues.push(`browser access certificates could not be read (${unreadableReason(data.browserAccessCertificates)})`);
-    return finding(24, "warn", `${enrollmentExpiry.healthy + baExpiry.healthy} certificates are valid beyond ${warnDays} days, but ${issues.join("; ")}.`, evidence, evidenceNote);
+    return finding(24, "warn", `${enrollmentExpiry.healthy + baExpiry.healthy} certificates are valid beyond ${warnDays} days, but ${issues.join("; ")}.${partialNote}`, evidence, evidenceNote);
   }
-  return finding(24, capForPartial("pass", enrollment), `All ${enrollmentExpiry.healthy} enrollment and ${baExpiry.healthy} browser access certificates are valid for more than ${warnDays} days.`, evidence);
+  const status = capForPartialAll("pass", [enrollment, data.browserAccessCertificates]);
+  return finding(24, status, `All ${enrollmentExpiry.healthy} enrollment and ${baExpiry.healthy} browser access certificates that were read are valid for more than ${warnDays} days.${partialNote}`, evidence, status === "warn" ? evidenceNote : undefined);
 }
 
 export interface ZpaAssessmentOptions {
