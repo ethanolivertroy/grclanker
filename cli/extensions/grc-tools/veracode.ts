@@ -32,6 +32,8 @@ const DEFAULT_MAX_APPLICATIONS = 100;
 const DEFAULT_MAX_WORKSPACES = 25;
 const DEFAULT_MAX_ANALYSES = 25;
 const DEFAULT_MAX_SCAN_AGE_DAYS = 90;
+const DEFAULT_CRITICAL_SCAN_INTERVAL_DAYS = 7;
+const DEFAULT_STANDARD_SCAN_INTERVAL_DAYS = 31;
 const DEFAULT_MAX_FP_RATE_PERCENT = 20;
 const DEFAULT_MAX_FLAW_DENSITY_PER_KLOC = 1;
 const DEFAULT_SCA_CVSS_THRESHOLD = 7;
@@ -196,6 +198,8 @@ type ScanCoverageArgs = AuthArgs & {
   max_applications?: number;
   max_scan_age_days?: number;
   max_analyses?: number;
+  critical_scan_interval_days?: number;
+  standard_scan_interval_days?: number;
 };
 
 type PolicyArgs = AuthArgs & {
@@ -1015,56 +1019,140 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
   return finding(1, "critical", limitedStatus("pass", [partial]), joinNotes(`All ${fresh} applications read have a published static scan within ${maxScanAgeDays} days.`, partial), evidence);
 }
 
-function policyFrequencyDays(policy: JsonRecord | undefined): number | undefined {
-  if (!policy) return undefined;
-  const days = asRecords(policy.scan_frequency_rules)
-    .map((rule) => FREQUENCY_DAYS[asString(rule.frequency)?.toUpperCase() ?? ""])
-    .filter((value): value is number => typeof value === "number");
-  return days.length > 0 ? Math.min(...days) : undefined;
+interface FrequencyRequirement {
+  scanType: string;
+  days: number;
+  source: string;
 }
 
-function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<HalListResult>, now: Date): VeracodeFinding {
-  const blocker = applicationInventoryBlocker(4, "high", snapshot, ["Export the policy scan frequency requirements and last scan dates per application."]);
+interface CriticalityIntervals {
+  criticalDays: number;
+  standardDays: number;
+}
+
+type RequirementOutcome =
+  | { kind: "met" }
+  | { kind: "overdue"; detail: string }
+  | { kind: "unconfirmed"; detail: string };
+
+function describeInterval(days: number): string {
+  return Number.isFinite(days) ? `every ${days} days` : "at least once";
+}
+
+function policyFrequencyRequirements(policy: JsonRecord): FrequencyRequirement[] {
+  const name = asString(policy.name) ?? asString(policy.guid) ?? "policy";
+  return asRecords(policy.scan_frequency_rules).flatMap((rule) => {
+    const frequency = asString(rule.frequency)?.toUpperCase() ?? "";
+    const days = frequency === "ONCE" ? Number.POSITIVE_INFINITY : FREQUENCY_DAYS[frequency];
+    if (days === undefined) return [];
+    return [{ scanType: asString(rule.scan_type)?.toUpperCase() ?? "ANY", days, source: `policy ${name} (${frequency})` }];
+  });
+}
+
+function criticalityRequirement(app: JsonRecord, intervals: CriticalityIntervals): FrequencyRequirement | undefined {
+  const criticality = businessCriticality(app);
+  if (!criticality) return undefined;
+  const days = criticality === "VERY_HIGH" ? intervals.criticalDays : intervals.standardDays;
+  return { scanType: "ANY", days, source: `business criticality ${criticality}` };
+}
+
+function strictestRequirements(requirements: FrequencyRequirement[]): FrequencyRequirement[] {
+  const byScanType = new Map<string, FrequencyRequirement>();
+  for (const requirement of requirements) {
+    const current = byScanType.get(requirement.scanType);
+    if (!current || requirement.days < current.days) byScanType.set(requirement.scanType, requirement);
+  }
+  return [...byScanType.values()];
+}
+
+function evaluateRequirement(app: JsonRecord, requirement: FrequencyRequirement, now: Date): RequirementOutcome {
+  const interval = describeInterval(requirement.days);
+  if (requirement.scanType === "ANY") {
+    const last = parseDate(app.last_completed_scan_date);
+    if (!last) return { kind: "unconfirmed", detail: `${requirement.source} requires a scan ${interval} but the profile exposes no last_completed_scan_date` };
+    const age = daysSince(last, now);
+    return age > requirement.days ? { kind: "overdue", detail: `${requirement.source} requires a scan ${interval}; the last completed scan was ${age} days ago` } : { kind: "met" };
+  }
+  const state = latestScanState(app, requirement.scanType);
+  switch (state.kind) {
+    case "none":
+      return { kind: "overdue", detail: `${requirement.source} requires a ${requirement.scanType} scan ${interval} but the profile exposes no ${requirement.scanType} scan` };
+    case "not_completed":
+      return { kind: "unconfirmed", detail: `${requirement.source} requires a ${requirement.scanType} scan ${interval} but the latest ${requirement.scanType} scan status is ${state.status}, not published` };
+    case "missing_date":
+      return { kind: "unconfirmed", detail: `${requirement.source} requires a ${requirement.scanType} scan ${interval} but the published ${requirement.scanType} scan exposes no modified_date` };
+    case "completed": {
+      const age = daysSince(state.date, now);
+      return age > requirement.days ? { kind: "overdue", detail: `${requirement.source} requires a ${requirement.scanType} scan ${interval}; the last published ${requirement.scanType} scan was ${age} days ago` } : { kind: "met" };
+    }
+    default: {
+      const exhaustive: never = state;
+      throw new Error(`Unhandled scan state ${String(exhaustive)}`);
+    }
+  }
+}
+
+function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<HalListResult>, intervals: CriticalityIntervals, now: Date): VeracodeFinding {
+  const blocker = applicationInventoryBlocker(4, "high", snapshot, ["Export the policy scan frequency requirements, business criticality, and last scan dates per application."]);
   if (blocker) return blocker;
   if (policies.status === "error") {
-    return manualFinding(4, "high", unreadableReason("policies", policies), ["Export the assigned policy for each application and its scan frequency rules from the Platform."]);
+    return manualFinding(4, "high", unreadableReason("policies", policies), ["Export the assigned policies for each application and their scan frequency rules from the Platform."]);
   }
   const list = (snapshot.applications as { value: HalListResult }).value;
   const policyByGuid = new Map(policies.value.items.map((policy) => [asString(policy.guid) ?? "", policy]));
-  const overdue: string[] = [];
+  const overdue: Array<{ application: string; details: string[] }> = [];
+  const unconfirmed: Array<{ application: string; details: string[] }> = [];
   const noRequirement: string[] = [];
-  const missingDate: string[] = [];
+  const requirementsByApplication: Record<string, string[]> = {};
   let compliant = 0;
   for (const app of list.items) {
-    const assigned = applicationPolicies(app)[0];
-    const requiredDays = policyFrequencyDays(policyByGuid.get(asString(assigned?.guid) ?? ""));
-    if (requiredDays === undefined) {
-      noRequirement.push(applicationName(app));
+    const name = applicationName(app);
+    const assigned = applicationPolicies(app);
+    const resolvedPolicies = assigned.map((policy) => policyByGuid.get(asString(policy.guid) ?? "")).filter((policy): policy is JsonRecord => policy !== undefined);
+    const unresolvedPolicies = assigned.length - resolvedPolicies.length;
+    const criticality = criticalityRequirement(app, intervals);
+    const requirements = strictestRequirements([
+      ...resolvedPolicies.flatMap(policyFrequencyRequirements),
+      ...(criticality ? [criticality] : []),
+    ]);
+    if (requirements.length === 0 && unresolvedPolicies === 0) {
+      noRequirement.push(name);
       continue;
     }
-    const lastScan = parseDate(app.last_completed_scan_date);
-    if (!lastScan) missingDate.push(applicationName(app));
-    else if (daysSince(lastScan, now) > requiredDays) overdue.push(applicationName(app));
+    requirementsByApplication[name] = requirements.map((requirement) => `${requirement.scanType} ${describeInterval(requirement.days)} from ${requirement.source}`);
+    const outcomes = requirements.map((requirement) => evaluateRequirement(app, requirement, now));
+    const overdueDetails = outcomes.flatMap((outcome) => (outcome.kind === "overdue" ? [outcome.detail] : []));
+    const unconfirmedDetails = [
+      ...outcomes.flatMap((outcome) => (outcome.kind === "unconfirmed" ? [outcome.detail] : [])),
+      ...(unresolvedPolicies > 0 ? [`${unresolvedPolicies} assigned policies were not found in the readable policy inventory, so their scan frequency rules were not evaluated`] : []),
+    ];
+    if (overdueDetails.length > 0) overdue.push({ application: name, details: overdueDetails });
+    else if (unconfirmedDetails.length > 0) unconfirmed.push({ application: name, details: unconfirmedDetails });
     else compliant += 1;
   }
   const partial = joinNotes(partialInventoryNote(list, "applications"), partialInventoryNote(policies.value, "policies")) || undefined;
+  const tiers = `VERY_HIGH ${describeInterval(intervals.criticalDays)}, other criticality tiers ${describeInterval(intervals.standardDays)}`;
   const evidence = {
     applications_seen: list.items.length,
     compliant_applications: compliant,
     overdue_applications: overdue.slice(0, 50),
+    unconfirmed_applications: unconfirmed.slice(0, 50),
     applications_without_frequency_requirement: noRequirement.slice(0, 50),
-    applications_without_scan_date: missingDate.slice(0, 50),
+    critical_scan_interval_days: intervals.criticalDays,
+    standard_scan_interval_days: intervals.standardDays,
+    requirement_basis: "strictest scan_frequency_rules across every assigned policy per scan type plus the business criticality tier against last_completed_scan_date",
+    requirements_by_application: Object.fromEntries(Object.entries(requirementsByApplication).slice(0, 50)),
   };
   if (overdue.length > 0) {
-    return finding(4, "high", "fail", joinNotes(`${overdue.length}/${list.items.length} applications are overdue against the scan frequency required by their assigned policy.`, partial), evidence);
+    return finding(4, "high", "fail", joinNotes(`${overdue.length}/${list.items.length} applications are overdue against their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence);
   }
-  if (noRequirement.length > 0 || missingDate.length > 0) {
+  if (noRequirement.length > 0 || unconfirmed.length > 0) {
     return finding(4, "high", "warn", joinNotes(
-      `${noRequirement.length} applications have no policy scan frequency requirement and ${missingDate.length} expose no completed scan date, so frequency compliance could not be confirmed for them; ${compliant} applications meet their requirement.`,
+      `${noRequirement.length} applications have neither a policy scan frequency rule nor a business criticality tier and ${unconfirmed.length} could not be confirmed (unpublished latest scan, missing scan date, or unresolved assigned policy), so frequency compliance is not established for them; ${compliant} applications meet their strictest requirement (${tiers}).`,
       partial,
     ), evidence);
   }
-  return finding(4, "high", limitedStatus("pass", [partial]), joinNotes(`All ${compliant} applications meet the scan frequency required by their assigned policy.`, partial), evidence);
+  return finding(4, "high", limitedStatus("pass", [partial]), joinNotes(`All ${compliant} applications meet their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence);
 }
 
 function evaluateScanCompletion(snapshot: ApplicationSnapshot): VeracodeFinding {
@@ -1206,19 +1294,23 @@ function pipelineManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
 
 export async function assessVeracodeScanCoverage(
   client: ClientLike,
-  options: { maxApplications?: number; maxScanAgeDays?: number; maxAnalyses?: number; now?: Date } = {},
+  options: { maxApplications?: number; maxScanAgeDays?: number; maxAnalyses?: number; criticalScanIntervalDays?: number; standardScanIntervalDays?: number; now?: Date } = {},
 ): Promise<VeracodeAssessmentResult> {
   const now = options.now ?? new Date();
   const maxApplications = clampNumber(options.maxApplications, DEFAULT_MAX_APPLICATIONS, 1, 5000);
   const maxScanAgeDays = clampNumber(options.maxScanAgeDays, DEFAULT_MAX_SCAN_AGE_DAYS, 1, 3650);
   const maxAnalyses = clampNumber(options.maxAnalyses, DEFAULT_MAX_ANALYSES, 1, 500);
+  const intervals: CriticalityIntervals = {
+    criticalDays: clampNumber(options.criticalScanIntervalDays, DEFAULT_CRITICAL_SCAN_INTERVAL_DAYS, 1, 3650),
+    standardDays: clampNumber(options.standardScanIntervalDays, DEFAULT_STANDARD_SCAN_INTERVAL_DAYS, 1, 3650),
+  };
   const snapshot = await collectApplications(client);
   const policies = await surface(() => client.listPolicies());
   const sandbox = await evaluateSandboxUsage(client, snapshot, maxApplications);
   const dynamic = await evaluateDynamicScanConfiguration(client, maxAnalyses);
   const findings = [
     evaluateScanCoverage(snapshot, maxScanAgeDays, now),
-    evaluateScanFrequency(snapshot, policies, now),
+    evaluateScanFrequency(snapshot, policies, intervals, now),
     sandbox.finding,
     prescanManualFinding(snapshot),
     dynamic.finding,
@@ -2229,6 +2321,8 @@ export async function exportVeracodeAuditBundle(
     maxApplications?: number;
     maxScanAgeDays?: number;
     maxAnalyses?: number;
+    criticalScanIntervalDays?: number;
+    standardScanIntervalDays?: number;
     maxFpRatePercent?: number;
     maxFlawDensityPerKloc?: number;
     maxWorkspaces?: number;
@@ -2299,7 +2393,14 @@ function normalizeAuthArgs(args: unknown): AuthArgs {
 
 function normalizeScanCoverageArgs(args: unknown): ScanCoverageArgs {
   const value = asObject(args) ?? {};
-  return { ...normalizeAuthArgs(args), max_applications: asNumber(value.max_applications), max_scan_age_days: asNumber(value.max_scan_age_days), max_analyses: asNumber(value.max_analyses) };
+  return {
+    ...normalizeAuthArgs(args),
+    max_applications: asNumber(value.max_applications),
+    max_scan_age_days: asNumber(value.max_scan_age_days),
+    max_analyses: asNumber(value.max_analyses),
+    critical_scan_interval_days: asNumber(value.critical_scan_interval_days),
+    standard_scan_interval_days: asNumber(value.standard_scan_interval_days),
+  };
 }
 
 function normalizePolicyArgs(args: unknown): PolicyArgs {
@@ -2336,6 +2437,8 @@ function exportOptions(args: ExportArgs) {
     maxApplications: args.max_applications,
     maxScanAgeDays: args.max_scan_age_days,
     maxAnalyses: args.max_analyses,
+    criticalScanIntervalDays: args.critical_scan_interval_days,
+    standardScanIntervalDays: args.standard_scan_interval_days,
     maxFpRatePercent: args.max_fp_rate_percent,
     maxFlawDensityPerKloc: args.max_flaw_density_per_kloc,
     maxWorkspaces: args.max_workspaces,
@@ -2387,13 +2490,21 @@ export function registerVeracodeTools(pi: any): void {
     parameters: Type.Object({
       ...authParams,
       ...applicationParams,
-      max_scan_age_days: Type.Optional(Type.Number({ description: "Maximum days since the last completed scan before an application is stale. Defaults to 90.", default: 90 })),
+      max_scan_age_days: Type.Optional(Type.Number({ description: "Maximum days since the latest published static scan before an application is stale. Defaults to 90.", default: 90 })),
       max_analyses: Type.Optional(Type.Number({ description: "Maximum Dynamic Analysis configurations to inspect. Defaults to 25.", default: 25 })),
+      critical_scan_interval_days: Type.Optional(Type.Number({ description: "Required scan interval in days for VERY_HIGH business criticality applications (control 4). Defaults to 7.", default: 7 })),
+      standard_scan_interval_days: Type.Optional(Type.Number({ description: "Required scan interval in days for every other business criticality tier (control 4). Defaults to 31.", default: 31 })),
     }),
     prepareArguments: normalizeScanCoverageArgs,
     async execute(_toolCallId: string, args: ScanCoverageArgs) {
       try {
-        const result = await assessVeracodeScanCoverage(createClient(args), { maxApplications: args.max_applications, maxScanAgeDays: args.max_scan_age_days, maxAnalyses: args.max_analyses });
+        const result = await assessVeracodeScanCoverage(createClient(args), {
+          maxApplications: args.max_applications,
+          maxScanAgeDays: args.max_scan_age_days,
+          maxAnalyses: args.max_analyses,
+          criticalScanIntervalDays: args.critical_scan_interval_days,
+          standardScanIntervalDays: args.standard_scan_interval_days,
+        });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_scan_coverage", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
         return errorResult(`Veracode scan coverage assessment failed: ${error instanceof Error ? error.message : String(error)}`, { tool: "veracode_assess_scan_coverage" });
@@ -2422,11 +2533,11 @@ export function registerVeracodeTools(pi: any): void {
     name: "veracode_assess_findings_hygiene",
     label: "Assess Veracode findings hygiene",
     description:
-      "Assess Veracode findings hygiene (controls 3, 12, 16, 17): open flaw aging against severity SLAs, mitigation approval workflow, potential false positive rate, and Very High/High flaw density per KLOC from summary reports.",
+      "Assess Veracode findings hygiene (controls 3, 12, 16, 17): open flaw aging against severity SLAs, mitigation approval workflow, false positive rate from FP mitigation annotations, and Very High/High flaw density per KLOC from summary reports.",
     parameters: Type.Object({
       ...authParams,
       ...applicationParams,
-      max_fp_rate_percent: Type.Optional(Type.Number({ description: "Maximum acceptable potential false positive rate per application. Defaults to 20.", default: 20 })),
+      max_fp_rate_percent: Type.Optional(Type.Number({ description: "Maximum acceptable false positive rate per application (findings carrying an FP mitigation annotation). Defaults to 20.", default: 20 })),
       max_flaw_density_per_kloc: Type.Optional(Type.Number({ description: "Maximum Very High/High flaws per KLOC. Defaults to 1.", default: 1 })),
     }),
     prepareArguments: normalizeFindingsArgs,
@@ -2494,9 +2605,11 @@ export function registerVeracodeTools(pi: any): void {
       ...authParams,
       ...applicationParams,
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
-      max_scan_age_days: Type.Optional(Type.Number({ description: "Maximum days since the last completed scan. Defaults to 90.", default: 90 })),
+      max_scan_age_days: Type.Optional(Type.Number({ description: "Maximum days since the latest published static scan. Defaults to 90.", default: 90 })),
       max_analyses: Type.Optional(Type.Number({ description: "Maximum Dynamic Analysis configurations to inspect. Defaults to 25.", default: 25 })),
-      max_fp_rate_percent: Type.Optional(Type.Number({ description: "Maximum potential false positive rate. Defaults to 20.", default: 20 })),
+      critical_scan_interval_days: Type.Optional(Type.Number({ description: "Required scan interval in days for VERY_HIGH business criticality applications. Defaults to 7.", default: 7 })),
+      standard_scan_interval_days: Type.Optional(Type.Number({ description: "Required scan interval in days for other business criticality tiers. Defaults to 31.", default: 31 })),
+      max_fp_rate_percent: Type.Optional(Type.Number({ description: "Maximum false positive rate (findings carrying an FP mitigation annotation). Defaults to 20.", default: 20 })),
       max_flaw_density_per_kloc: Type.Optional(Type.Number({ description: "Maximum Very High/High flaws per KLOC. Defaults to 1.", default: 1 })),
       max_workspaces: Type.Optional(Type.Number({ description: "Maximum SCA workspaces to inspect. Defaults to 25.", default: 25 })),
       sca_cvss_threshold: Type.Optional(Type.Number({ description: "Minimum severity that flags an SCA vulnerability. Defaults to 7.", default: 7 })),

@@ -430,6 +430,78 @@ test("assessVeracodeScanCoverage judges control 1 on published static scans rath
   assert.equal(staleResult.findings.find((item) => item.id === "VERACODE-01").evidence.stale_applications[0].days_since_published_static_scan, 120);
 });
 
+test("assessVeracodeScanCoverage applies the business criticality tier to control 4", async () => {
+  const fixture = healthyFixture();
+  fixture.applications[0].profile.business_criticality = "VERY_HIGH";
+  fixture.applications[0].last_completed_scan_date = daysAgo(20);
+  fixture.applications[0].scans[0].modified_date = daysAgo(20);
+  const weekly = await assessVeracodeScanCoverage(mockClient(fixture), { now: NOW });
+  assert.equal(statusOf(weekly.findings, 4), "fail");
+  const finding4 = weekly.findings.find((item) => item.id === "VERACODE-04");
+  assert.match(finding4.evidence.overdue_applications[0].details[0], /business criticality VERY_HIGH requires a scan every 7 days; the last completed scan was 20 days ago/);
+  assert.equal(finding4.evidence.critical_scan_interval_days, 7);
+
+  const relaxed = await assessVeracodeScanCoverage(mockClient(fixture), { now: NOW, criticalScanIntervalDays: 30 });
+  assert.equal(statusOf(relaxed.findings, 4), "pass");
+
+  const standard = healthyFixture();
+  standard.applications[1].profile.business_criticality = "LOW";
+  standard.applications[1].last_completed_scan_date = daysAgo(45);
+  standard.applications[1].scans[0].modified_date = daysAgo(45);
+  standard.policies[0].scan_frequency_rules = [{ scan_type: "STATIC", frequency: "QUARTERLY" }];
+  const standardResult = await assessVeracodeScanCoverage(mockClient(standard), { now: NOW });
+  assert.equal(statusOf(standardResult.findings, 4), "fail");
+  assert.match(standardResult.findings.find((item) => item.id === "VERACODE-04").evidence.overdue_applications[0].details[0], /business criticality LOW requires a scan every 31 days/);
+
+  const noCriticality = healthyFixture();
+  for (const app of noCriticality.applications) delete app.profile.business_criticality;
+  noCriticality.policies[0].scan_frequency_rules = [];
+  const noRequirement = await assessVeracodeScanCoverage(mockClient(noCriticality), { now: NOW });
+  assert.equal(statusOf(noRequirement.findings, 4), "warn");
+  assert.match(noRequirement.findings.find((item) => item.id === "VERACODE-04").summary, /neither a policy scan frequency rule nor a business criticality tier/);
+});
+
+test("assessVeracodeScanCoverage judges control 4 against the strictest assigned policy and scan type", async () => {
+  const fixture = healthyFixture();
+  fixture.policies = [
+    { guid: "pol-quarterly", name: "Quarterly", type: "CUSTOMER", finding_rules: [{ type: "MAX_SEVERITY", value: "4" }], scan_frequency_rules: [{ scan_type: "STATIC", frequency: "QUARTERLY" }] },
+    { guid: "pol-weekly", name: "Weekly", type: "CUSTOMER", finding_rules: [{ type: "MAX_SEVERITY", value: "4" }], scan_frequency_rules: [{ scan_type: "STATIC", frequency: "WEEKLY" }] },
+  ];
+  for (const app of fixture.applications) {
+    app.profile.business_criticality = "MEDIUM";
+    app.profile.policies = [
+      { guid: "pol-quarterly", name: "Quarterly", is_default: false, policy_compliance_status: "PASSED" },
+      { guid: "pol-weekly", name: "Weekly", is_default: false, policy_compliance_status: "PASSED" },
+    ];
+    app.last_completed_scan_date = daysAgo(20);
+    app.scans = [{ scan_type: "STATIC", status: "PUBLISHED", modified_date: daysAgo(20) }];
+  }
+  const result = await assessVeracodeScanCoverage(mockClient(fixture), { now: NOW });
+  assert.equal(statusOf(result.findings, 4), "fail");
+  const finding4 = result.findings.find((item) => item.id === "VERACODE-04");
+  assert.equal(finding4.evidence.overdue_applications.length, 2);
+  assert.match(finding4.evidence.overdue_applications[0].details[0], /policy Weekly \(WEEKLY\) requires a STATIC scan every 7 days; the last published STATIC scan was 20 days ago/);
+  assert.deepEqual(finding4.evidence.requirements_by_application.Payments, ["STATIC every 7 days from policy Weekly (WEEKLY)", "ANY every 31 days from business criticality MEDIUM"]);
+
+  const dynamicRule = healthyFixture();
+  dynamicRule.policies[0].scan_frequency_rules = [{ scan_type: "STATIC", frequency: "MONTHLY" }, { scan_type: "DYNAMIC", frequency: "QUARTERLY" }, { scan_type: "SCA", frequency: "NOT_REQUIRED" }];
+  const dynamicResult = await assessVeracodeScanCoverage(mockClient(dynamicRule), { now: NOW });
+  assert.equal(statusOf(dynamicResult.findings, 4), "fail");
+  assert.match(dynamicResult.findings.find((item) => item.id === "VERACODE-04").evidence.overdue_applications[0].details[0], /requires a DYNAMIC scan every 92 days but the profile exposes no DYNAMIC scan/);
+
+  const onceRule = healthyFixture();
+  onceRule.policies[0].scan_frequency_rules = [{ scan_type: "STATIC", frequency: "ONCE" }];
+  const onceResult = await assessVeracodeScanCoverage(mockClient(onceRule), { now: NOW });
+  assert.equal(statusOf(onceResult.findings, 4), "pass");
+  assert.deepEqual(onceResult.findings.find((item) => item.id === "VERACODE-04").evidence.requirements_by_application.Payments, ["STATIC at least once from policy Custom Policy (ONCE)", "ANY every 7 days from business criticality VERY_HIGH"]);
+
+  const unresolved = healthyFixture();
+  unresolved.applications[0].profile.policies.push({ guid: "pol-missing", name: "Unlisted", is_default: false, policy_compliance_status: "PASSED" });
+  const unresolvedResult = await assessVeracodeScanCoverage(mockClient(unresolved), { now: NOW });
+  assert.equal(statusOf(unresolvedResult.findings, 4), "warn");
+  assert.match(unresolvedResult.findings.find((item) => item.id === "VERACODE-04").evidence.unconfirmed_applications[0].details[0], /1 assigned policies were not found/);
+});
+
 test("assessVeracodePolicyCompliance flags failing, unassigned, and default policies", async () => {
   const fixture = healthyFixture();
   fixture.applications[0].profile.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", is_default: true, policy_compliance_status: "DID_NOT_PASS" }];
