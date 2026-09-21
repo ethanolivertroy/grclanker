@@ -26,7 +26,7 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 
 | Kind | Bucket | State | Runtime path | Snapshot / restore | GPU | Workspace staging | Artifact sync-back |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `host` | host | shipped | Pi's native local shell operations (the `createHostBackend` contract adapter is exercised by tests and `env list` only) | no | no | in place | in place |
+| `host` | host | shipped | Pi's native local shell operations wrapped in the output redaction guard (the `createHostBackend` contract adapter is exercised by tests and `env list` only) | no | no | in place | in place |
 | `sandbox-runtime` | sandboxed | shipped | contract adapter for bash, grep, and find; file tools stay local with the same FS policy | no | no | in place | in place |
 | `docker` | sandboxed | shipped | contract adapter (`docker run` args unchanged from phase 1) | no | no | bind mount | bind mount |
 | `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |
@@ -60,6 +60,29 @@ interface ExecutionBackend {
 ```
 
 Adapters that do not support an operation throw a clear "does not support" error instead of pretending. Every adapter takes an injected command runner or `fetch`, which is how the unit tests exercise Docker, Parallels, Modal, and RunPod without touching real binaries or the network.
+
+### Credential hygiene in output
+
+Command output is untrusted text: a container, VM, worker, or pod can echo its own environment, and the host shell inherits yours. Every adapter therefore routes its output through one redaction guard before anything is streamed, returned, printed, or persisted:
+
+- Exact values of `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `VERCEL_TOKEN`, and `CLOUDFLARE_API_TOKEN` from your environment are replaced with `[REDACTED]`.
+- Format-based patterns catch the same credentials when they arrive from the remote without being set locally: `Bearer <token>` headers, RunPod keys (`rpa_...`), Modal token ids and secrets (`ak-...`, `as-...`), `NAME=value` assignments of those variables (quoted or not), and PEM private key blocks (`-----BEGIN ... PRIVATE KEY-----` through `-----END ...-----`, replaced with `[REDACTED PRIVATE KEY]`).
+- Streamed output is scrubbed per completed line, so a credential split across two chunks is still caught; the trailing partial line is held until the next newline or the end of the command.
+- Provider error bodies (RunPod JSON errors, `prlctl` and `ssh` stderr) go through the same function before they become an error message, and `env exec` scrubs the command line it echoes.
+
+This covers `env smoke-test`, `env exec`, the agent's bash tool on every backend including `host`, and the RunPod serverless worker output that `/status` returns. `env list` and `env doctor` print variable names only, never values. Session records in `compute-sessions.ts` hold teardown handles, not credentials.
+
+File operations are the one deliberate exception: `read`, `edit`, `write`, `grep`, and `find` on a non-host backend fetch file content through the same adapter with `redactOutput: false`, because Pi's edit tool reads a file and writes it back, and a redaction marker must never be written into a file. Their failure text is still scrubbed.
+
+### Deadlines and caps are never reported as success
+
+Every loop in the backends that can stop early says why:
+
+- The RunPod serverless status poll raises `ExecutionBackendTimeoutError` (`runpod-serverless timed out after Ns: ...`) when its deadline passes, after cancelling the job; an aborted request raises an explicit `aborted` error; any terminal status other than `COMPLETED` (`FAILED`, `CANCELLED`, `TIMED_OUT`) raises with that status.
+- The Parallels mount wait raises `ExecutionBackendTimeoutError` (`parallels-vm timed out after Ns: could not locate the repo share ... before the mount deadline. Tried: ...`) and destroys the clone it created.
+- Backend `grep` returns `matchLimitReached: true` when more matches exist than the limit, and backend `find` returns exactly the limit so Pi's find tool prints its results-limit warning.
+
+The adapters never call the RunPod pod or endpoint list APIs or `prlctl snapshot-list`, so there is no paginated listing that could stop on a missing total. `env list` enumerates every kind.
 
 ## Validate the backend
 

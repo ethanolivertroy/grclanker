@@ -434,17 +434,21 @@ Status as of 2026-09-21: implemented for seven of nine kinds, with `vercel-sandb
 
 | Kind | Implemented | Runtime path | Tested | Documented | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `host` | yes | Pi's native local shell operations; `createHostBackend` is a contract implementation used by tests and `env list` only | yes (contract shape) | yes | phase 1 behavior unchanged |
-| `sandbox-runtime` | yes | contract adapter for bash, grep, find; file tools stay local under the same FS policy | yes (FS policy, contract shape) | yes | bash now runs through the contract runner (`bash -lc` plus the sandbox wrapper) |
-| `docker` | yes | contract adapter | yes (injected runner, run-arg shape byte-identical to phase 1, computeDefaults, daemon-unreachable error) | yes | `deny-all` maps to `--network none`, `ro` maps to a read-only bind mount |
-| `parallels-vm` | yes | contract adapter (replaces the phase 1 `spawnSync` clone path) | yes (injected runner: stage, exec, snapshot, restore, teardown, failure cleanup, mount mode) | yes | snapshot via `prlctl snapshot`, rollback via `prlctl snapshot-switch --id {uuid}`; `env smoke-test` exercises both |
+| `host` | yes | Pi's native local shell operations wrapped in the output redaction guard; `createHostBackend` is a contract implementation used by tests and `env list` only | yes (contract shape, redacted stream through a real shell) | yes | phase 1 behavior unchanged apart from output redaction |
+| `sandbox-runtime` | yes | contract adapter for bash, grep, find; file tools stay local under the same FS policy | yes (FS policy, contract shape, redaction) | yes | bash now runs through the contract runner (`bash -lc` plus the sandbox wrapper) |
+| `docker` | yes | contract adapter | yes (injected runner, run-arg shape byte-identical to phase 1, computeDefaults, daemon-unreachable error, redaction, grep and find caps) | yes | `deny-all` maps to `--network none`, `ro` maps to a read-only bind mount |
+| `parallels-vm` | yes | contract adapter (replaces the phase 1 `spawnSync` clone path) | yes (injected runner: stage, exec, snapshot, restore, teardown, failure cleanup, mount mode, typed mount deadline, redaction) | yes | snapshot via `prlctl snapshot`, rollback via `prlctl snapshot-switch --id {uuid}`; `env smoke-test` exercises both |
 | `modal` | yes (CLI: `modal shell`) | contract adapter | yes (injected runner, flag shape, shlex-safe command wrapper, redaction) | yes | no sync-back or snapshots through the CLI |
-| `runpod-serverless` | yes (HTTP: `/health`, `/run`, `/status`, `/cancel`) | contract adapter | yes (mocked fetch, typed poll timeout) | yes | requires a worker implementing the grclanker input/output contract; 600000 ms default poll ceiling |
-| `runpod-pod` | yes (HTTP `GET /pods/{id}` plus SSH/scp) | contract adapter | yes (mocked fetch, injected runner, scp-failure cleanup, session-id validation, awaited teardown) | yes | REST v1 is deprecated by RunPod; base URL isolated for the v2 move |
+| `runpod-serverless` | yes (HTTP: `/health`, `/run`, `/status`, `/cancel`) | contract adapter | yes (mocked fetch, typed poll timeout, redacted worker output) | yes | requires a worker implementing the grclanker input/output contract; 600000 ms default poll ceiling |
+| `runpod-pod` | yes (HTTP `GET /pods/{id}` plus SSH/scp) | contract adapter | yes (mocked fetch, injected runner, scp-failure cleanup, session-id validation, awaited teardown, redaction) | yes | REST v1 is deprecated by RunPod; base URL isolated for the v2 move |
 | `vercel-sandbox` | stub | fails fast | yes (fails fast) | yes (marked not available) | SDK/CLI only, no npm dependency added |
 | `cloudflare-sandbox` | stub | fails fast | yes (fails fast) | yes (marked not available) | Workers SDK only, no public HTTP lifecycle API |
 
 Session lifecycle: `grclanker env smoke-test` and `grclanker env exec` await `teardown` in a `finally` block on success and failure; the agent session tears down every registered backend session on `session_shutdown`; a synchronous `process.on("exit")` hook running each adapter's `teardownSync` is the last resort only.
+
+Output hygiene: every adapter (host, sandbox-runtime, docker, parallels-vm, modal, runpod-serverless, runpod-pod) routes streamed chunks and the returned stdout/stderr through one redaction guard (`createExecutionOutputGuard`) that removes the configured credential values, `Bearer` tokens, RunPod and Modal token formats, `NAME=value` echoes of the credential variables, and PEM private key blocks; streamed output is scrubbed per completed line so a split credential is still caught. Provider error text and the `env exec` command echo go through the same function. `env list` and `env doctor` print variable names only; session records hold teardown handles only. File operations on non-host backends (`read`, `edit`, `write`, `grep`, `find`) request `redactOutput: false` so a redaction marker is never written back into a file by the edit tool.
+
+Cap and deadline exits: the RunPod serverless poll (`ExecutionBackendTimeoutError` after cancelling the job; explicit `aborted` and non-`COMPLETED` status errors) and the Parallels mount wait (`ExecutionBackendTimeoutError`, clone destroyed) never exit as success; backend `grep` reports `matchLimitReached` and backend `find` returns exactly the limit so Pi's find tool prints its results-limit warning. No adapter calls a paginated list API (RunPod pods or endpoints, `prlctl snapshot-list`).
 
 ### Deviations from this spec
 
