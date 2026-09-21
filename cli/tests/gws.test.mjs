@@ -24,6 +24,7 @@ import {
   buildTwoStepPolicyFilter,
   clearGwsTokenCacheForTests,
   collectGwsAuditData,
+  describeErrorReasons,
   exportGwsAuditBundle,
   normalizeFrameworkSelection,
   projectActivitySnapshot,
@@ -377,7 +378,13 @@ function createSecretBearingCollector() {
   });
   const tokens = Object.fromEntries(Object.entries(createTokens()).map(([userKey, list]) => [
     userKey,
-    list.map((token) => ({ ...token, refreshToken: planted("token-refresh-token"), etag: planted("token-etag") })),
+    list.map((token) => ({
+      ...token,
+      // displayText is third-party-controlled and is rendered into the GWS-INTEG-002 evidence line, so it carries a URL query token mid-prose.
+      displayText: `${token.displayText} (callback https://app.test/callback?token=${planted("token-display-text-url")})`,
+      refreshToken: planted("token-refresh-token"),
+      etag: planted("token-etag"),
+    })),
   ]));
   return createFakeCollector({
     collectUsers: async () => collection(createUsers().map((user) => ({
@@ -1167,6 +1174,11 @@ test("rule 9: redactSecrets matches normalized key names, {name, value} pairs, a
       { type: "USER_SETTINGS", name: "CHANGE_PASSWORD" },
     ],
     link: "https://admin.google.com/ac/sc/investigation?token=abc&x=1",
+    embedded: "Notes App (callback https://app.test/cb?token=abc) and https://x.test/p?sig=1#frag then text",
+    prose: "Invalid token: PLANTED-VALUE-0123, refresh 1//0gPLANTEDrefresh, key AIzaSyA-PLANTED_0123456789abcdefghijklm, Bearer PLANTEDbearer01, access_token=PLANTED-VALUE-0456, pageToken: CgoQabcdefgh stays",
+    jwt: "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.c2lnbmF0dXJlLXNpZ25hdHVyZQ",
+    pem: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----",
+    counts: "Privileged third-party tokens: 3; token_records: 12345678; Auth mode: access_token",
     nextPageToken: "CgoQ",
     scopes: ["https://www.googleapis.com/auth/drive"],
   });
@@ -1187,11 +1199,54 @@ test("rule 9: redactSecrets matches normalized key names, {name, value} pairs, a
   assert.deepEqual(redacted.parameters[2], { name: "SETTING_NAME", value: "ALLOW_LESS_SECURE_APPS" });
   assert.deepEqual(redacted.parameters[3], { type: "USER_SETTINGS", name: "CHANGE_PASSWORD" });
   assert.equal(redacted.link, "https://admin.google.com/ac/sc/investigation");
+  assert.equal(redacted.embedded, "Notes App (callback https://app.test/cb) and https://x.test/p then text");
+  assert.equal(
+    redacted.prose,
+    "Invalid token: [REDACTED], refresh [REDACTED], key [REDACTED], Bearer [REDACTED], access_token=[REDACTED], pageToken: CgoQabcdefgh stays",
+  );
+  assert.equal(redacted.jwt, "[REDACTED]");
+  assert.equal(redacted.pem, "[REDACTED]");
+  assert.equal(redacted.counts, "Privileged third-party tokens: 3; token_records: 12345678; Auth mode: access_token");
   assert.equal(redacted.nextPageToken, "CgoQ");
   assert.deepEqual(redacted.scopes, ["https://www.googleapis.com/auth/drive"]);
 
   const scrubbed = redactKnownValues({ actor: "ya29.known-token-value", nested: ["prefix ya29.known-token-value suffix"], short: "abc" }, ["ya29.known-token-value", "abc"]);
   assert.deepEqual(scrubbed, { actor: "[REDACTED]", nested: ["prefix [REDACTED] suffix"], short: "abc" });
+});
+
+test("rule 9: API error bodies reduce to documented status and reason identifiers and the free-text message is never kept", async () => {
+  const config = createSampleConfig();
+  const body = {
+    error: {
+      code: 403,
+      message: "Request had insufficient authentication scopes. token=ya29.PLANTED-VALUE-0123456789",
+      status: "PERMISSION_DENIED",
+      errors: [{ message: "Insufficient Permission: PLANTED-VALUE-0123456789", domain: "global", reason: "insufficientPermissions" }],
+      details: [
+        { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "ACCESS_TOKEN_SCOPE_INSUFFICIENT", domain: "googleapis.com", metadata: { service: "admin.googleapis.com" } },
+        { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "not an identifier PLANTED-VALUE-0123456789", domain: "googleapis.com" },
+      ],
+    },
+  };
+  const jsonError = () => new Response(JSON.stringify(body), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+  const client = new GoogleWorkspaceAuditorClient(config, async () => jsonError());
+  await assert.rejects(client.collectAlerts(), (error) => {
+    assert.ok(error instanceof GwsApiError);
+    assert.equal(error.status, 403);
+    assert.equal(error.message, "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions, reason ACCESS_TOKEN_SCOPE_INSUFFICIENT)");
+    return true;
+  });
+
+  const data = await collectGwsAuditData(createFakeCollector({ collectAlerts: () => client.collectAlerts() }));
+  assert.equal(data.monitoring.alerts.errorKind, "forbidden");
+  assert.equal(data.monitoring.alerts.error, "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions, reason ACCESS_TOKEN_SCOPE_INSUFFICIENT)");
+
+  assert.deepEqual(describeErrorReasons({ error: "invalid_grant", error_description: "Invalid JWT Signature. token=PLANTED-VALUE-0123456789" }), ["error invalid_grant"]);
+  assert.deepEqual(describeErrorReasons({ error: { code: 400, message: "only a free-text message" } }), []);
+  assert.deepEqual(describeErrorReasons({ message: "top-level message only" }), []);
+
+  const plain = new GoogleWorkspaceAuditorClient(config, async () => new Response("<html>denied PLANTED-VALUE-0123456789</html>", { status: 403, statusText: "Forbidden" }));
+  await assert.rejects(plain.collectAlerts(), { message: "403 Forbidden" });
 });
 
 test("rule 9: snapshot projection keeps only documented fields, dropping alert data payloads and event parameters", () => {
@@ -1231,11 +1286,33 @@ test("rule 9: snapshot projection keeps only documented fields, dropping alert d
 test("rule 9 (end to end): a bundle exported from secret-bearing fixtures contains no planted value in any file or zip entry", async () => {
   const base = createTempBase("grclanker-gws-secrets-");
   const config = createSampleConfig();
-  const result = await exportGwsAuditBundle(createSecretBearingCollector(), config, base);
+  const secretBearing = createSecretBearingCollector();
+  // The token activity endpoint fails through the real client so the token-bearing error body travels the production readError path.
+  const failingClient = new GoogleWorkspaceAuditorClient(config, async () => new Response(JSON.stringify({
+    error: {
+      code: 401,
+      message: `Invalid Credentials: ${planted("error-message")}`,
+      status: "UNAUTHENTICATED",
+      errors: [{ message: planted("error-errors-message"), domain: "global", reason: "authError", location: "Authorization", locationType: "header" }],
+      details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "ACCESS_TOKEN_TYPE_UNSUPPORTED", domain: "googleapis.com", metadata: { token: planted("error-details-metadata") } }],
+    },
+  }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } }));
+  const collector = {
+    ...secretBearing,
+    collectActivities: async (applicationName) => (
+      applicationName === "token" ? failingClient.collectActivities("token") : secretBearing.collectActivities(applicationName)
+    ),
+  };
+  const result = await exportGwsAuditBundle(collector, config, base);
 
   assert.equal(result.findingCount, 19);
+  assert.equal(result.errorCount, 1);
   const files = listFilesRecursively(result.outputDir);
-  assert.ok(files.length >= 24, `expected the full bundle, saw ${files.length} files`);
+  assert.ok(files.length >= 25, `expected the full bundle plus _errors.log, saw ${files.length} files`);
+  const relativeFiles = files.map((file) => relative(result.outputDir, file));
+  for (const expected of ["_errors.log", "analysis/findings.json", "analysis/integrations.json", "analysis/integrations.md", "analysis/monitoring.md", "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md"]) {
+    assert.ok(relativeFiles.includes(expected), `bundle is missing ${expected}`);
+  }
   for (const file of files) {
     const content = readFileSync(file, "utf8");
     const leak = content.match(new RegExp(`${PLANTED_SECRET}-[a-z0-9-]+`));
@@ -1262,6 +1339,21 @@ test("rule 9 (end to end): a bundle exported from secret-bearing fixtures contai
   assert.equal("refreshToken" in inventory.data[0].token, false);
   const policies = JSON.parse(readFileSync(join(result.outputDir, "core_data", "two_step_verification_policies.json"), "utf8"));
   assert.deepEqual(policies.data[0].setting.value, { enforcedFrom: ENFORCED_FROM });
+  assert.equal(inventory.data[0].token.displayText, "Drive Syncer (callback https://app.test/callback)");
+
+  // The rendered surfaces (findings, per-category analysis, compliance, _errors.log) carry the scrubbed display name and the projected error.
+  const clientLine = "Privileged token clients: Drive Syncer (callback https://app.test/callback) (client-1)";
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
+  assert.ok(findings.find((finding) => finding.id === "GWS-INTEG-002").evidence.includes(clientLine));
+  const integrations = JSON.parse(readFileSync(join(result.outputDir, "analysis", "integrations.json"), "utf8"));
+  assert.ok(integrations.findings.find((finding) => finding.id === "GWS-INTEG-002").evidence.includes(clientLine));
+  assert.match(readFileSync(join(result.outputDir, "analysis", "integrations.md"), "utf8"), /Drive Syncer \(callback https:\/\/app\.test\/callback\) \(client-1\)/);
+  const projectedError = "401 Unauthorized (status UNAUTHENTICATED, reason authError, reason ACCESS_TOKEN_TYPE_UNSUPPORTED)";
+  assert.equal(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), `activities.list (token): ${projectedError}\n`);
+  assert.match(readFileSync(join(result.outputDir, "compliance", "executive_summary.md"), "utf8"), new RegExp(`## Partial Collection Warnings\\n\\n- activities\\.list \\(token\\): ${projectedError.replace(/[()]/g, "\\$&")}`));
+  const tokenActivities = JSON.parse(readFileSync(join(result.outputDir, "core_data", "token_activities.json"), "utf8"));
+  assert.equal(tokenActivities.error, projectedError);
+  assert.equal(tokenActivities.errorKind, "unauthorized");
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

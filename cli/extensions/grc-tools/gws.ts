@@ -131,6 +131,28 @@ const HIGH_RISK_SCOPE_PATTERN = /(admin|gmail|drive|cloud-platform|apps\.groups|
 const SECRET_KEY_PATTERN = /(password|passwd|secret|privatekey|accesstoken|refreshtoken|idtoken|oauthtoken|bearertoken|authtoken|sessiontoken|apikey|hashfunction|credential)/;
 /** Reports API event parameters carry their value under one of these documented keys next to `name`. */
 const PAIR_VALUE_KEYS = ["value", "multiValue", "intValue", "multiIntValue", "boolValue", "messageValue", "multiMessageValue"] as const;
+/** Every URL inside a string, whether the string is the URL or the URL sits mid-prose; stops at whitespace, quotes, and brackets. */
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
+/**
+ * Well-known credential shapes redacted wherever they appear in free text: RFC 6750 bearer credentials, Google
+ * OAuth access (ya29.) and refresh (1//) tokens, Google API keys (AIza), OAuth client secrets (GOCSPX-), JWTs,
+ * and PEM private key blocks. This is defense in depth behind projection and key-based redaction.
+ */
+const CREDENTIAL_SHAPE_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
+  { pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "Bearer [REDACTED]" },
+  { pattern: /\bya29\.[A-Za-z0-9._-]{8,}/g, replacement: "[REDACTED]" },
+  { pattern: /\b1\/\/[A-Za-z0-9._-]{8,}/g, replacement: "[REDACTED]" },
+  { pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g, replacement: "[REDACTED]" },
+  { pattern: /\bGOCSPX-[A-Za-z0-9_-]{8,}/g, replacement: "[REDACTED]" },
+  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: "[REDACTED]" },
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[^"]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED]" },
+];
+/** `key=value`, `key: value`, and `"key": "value"` pairs inside free text such as error messages, display names, and rendered JSON. */
+const TEXT_PAIR_PATTERN = /([A-Za-z_][A-Za-z0-9_.-]*)"?\s*[=:]\s*"?([A-Za-z0-9._~+/=-]{8,})/g;
+/** A free-text pair whose normalized key ends in one of these names carries a credential; page tokens are cursors, not secrets. */
+const TEXT_SECRET_KEY_PATTERN = /(token|secret|password|passwd|credential|credentials|apikey|authorization|assertion)$/;
+/** Google API error identifiers (google.rpc.Code names, errors[].reason, ErrorInfo.reason, RFC 6749 error codes) are short identifiers. */
+const ERROR_IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 /** Directory API User fields requested through USERS_FIELDS; nothing else is written to core_data. */
 const USER_SNAPSHOT_FIELDS = ["id", "primaryEmail", "isAdmin", "isDelegatedAdmin", "suspended", "archived", "lastLoginTime", "isEnrolledIn2Sv", "isEnforcedIn2Sv", "orgUnitPath"] as const;
 /** Directory API Role resource (https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles). */
@@ -851,6 +873,33 @@ function tokenCacheKey(config: GwsResolvedConfig, scopes: string[]): string {
   ].join("::");
 }
 
+function errorIdentifier(value: unknown): string | undefined {
+  const text = asString(value);
+  return text !== undefined && ERROR_IDENTIFIER_PATTERN.test(text) ? text : undefined;
+}
+
+/**
+ * Closed-vocabulary identifiers from an error body: `error.status` (a google.rpc.Code name), `error.errors[].reason`,
+ * `error.details[].reason` (google.rpc.ErrorInfo), or the RFC 6749 `error` code of a token response
+ * (https://cloud.google.com/apis/design/errors, https://datatracker.ietf.org/doc/html/rfc6749#section-5.2).
+ * `error.message` and `error_description` are server-controlled free text and are never returned.
+ */
+export function describeErrorReasons(payload: JsonRecord): string[] {
+  const reasons: string[] = [];
+  const tokenErrorCode = errorIdentifier(payload.error);
+  if (tokenErrorCode) reasons.push(`error ${tokenErrorCode}`);
+  const error = asRecord(payload.error);
+  const status = errorIdentifier(error.status);
+  if (status) reasons.push(`status ${status}`);
+  const reasonCodes = [...asArray(error.errors), ...asArray(error.details)]
+    .map((entry) => errorIdentifier(asRecord(entry).reason))
+    .filter((value): value is string => value !== undefined);
+  for (const reason of Array.from(new Set(reasonCodes))) {
+    reasons.push(`reason ${reason}`);
+  }
+  return reasons;
+}
+
 function classifyError(error: unknown): GwsEndpointStatus {
   if (error instanceof GwsApiError) {
     if (error.status === 403) return "forbidden";
@@ -1127,11 +1176,28 @@ function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(normalizeKeyName(key));
 }
 
-/** Signed URLs and tokens hide in query strings, so URL-valued strings keep only scheme, host, and path. */
+/** Signed URLs and tokens hide in query strings, so every URL in the string, bare or embedded in prose, keeps only scheme, host, and path. */
 function stripUrlQuery(value: string): string {
-  const queryIndex = value.indexOf("?");
-  if (queryIndex === -1 || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
-  return value.slice(0, queryIndex);
+  return value.replace(EMBEDDED_URL_PATTERN, (url) => url.replace(/[?#].*$/, ""));
+}
+
+function isTextSecretKey(key: string): boolean {
+  const normalized = normalizeKeyName(key);
+  return TEXT_SECRET_KEY_PATTERN.test(normalized) && !normalized.endsWith("pagetoken");
+}
+
+/**
+ * Scrubs free text before it reaches a bundle: URL query strings are removed, well-known credential shapes are
+ * replaced, and `key=value` or `key: value` pairs whose key names a credential lose their value.
+ */
+export function scrubText(value: string): string {
+  let output = stripUrlQuery(value);
+  for (const { pattern, replacement } of CREDENTIAL_SHAPE_PATTERNS) {
+    output = output.replace(pattern, replacement);
+  }
+  return output.replace(TEXT_PAIR_PATTERN, (match: string, key: string, secret: string) => (
+    isTextSecretKey(key) ? `${match.slice(0, match.length - secret.length)}[REDACTED]` : match
+  ));
 }
 
 function isSecretPair(record: JsonRecord): boolean {
@@ -1152,7 +1218,7 @@ export function redactSecrets(value: unknown): unknown {
     }
     return output;
   }
-  if (typeof value === "string") return stripUrlQuery(value);
+  if (typeof value === "string") return scrubText(value);
   return value;
 }
 
@@ -1317,10 +1383,10 @@ function buildQuickReference(frameworks: ReportFrameworkKey[]): string {
   ].join("\n");
 }
 
-function collectErrors(...datasets: Array<CollectedDataset<unknown>>): string[] {
+function collectErrors(...datasets: Array<[label: string, dataset: CollectedDataset<unknown>]>): string[] {
   return datasets
-    .map((dataset) => dataset.error)
-    .filter((value): value is string => Boolean(value));
+    .filter(([, dataset]) => Boolean(dataset.error))
+    .map(([label, dataset]) => `${label}: ${dataset.error}`);
 }
 
 function parseDate(value: unknown): number | undefined {
@@ -1455,12 +1521,16 @@ function countHighRiskTokens(records: TokenInventoryRecord[]): number {
   }).length;
 }
 
-function uniqueClientDisplayNames(records: TokenInventoryRecord[]): string[] {
+/** displayText is third-party-controlled free text, so it is scrubbed and paired with the documented clientId. */
+function uniqueClientLabels(records: TokenInventoryRecord[]): string[] {
   return Array.from(
     new Set(
-      records
-        .map((record) => asString(record.token.displayText) ?? asString(record.token.clientId) ?? "unknown-client")
-        .filter(Boolean),
+      records.map((record) => {
+        const clientId = asString(record.token.clientId);
+        const displayText = asString(record.token.displayText);
+        if (displayText && clientId) return `${scrubText(displayText)} (${clientId})`;
+        return scrubText(displayText ?? clientId ?? "unknown-client");
+      }),
     ),
   );
 }
@@ -1549,6 +1619,24 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
+}
+
+/** The credential values this run holds (direct bearer, service-account key, minted tokens), so any echo of them is scrubbed. */
+function knownGwsSecretValues(config: GwsResolvedConfig): string[] {
+  const values: Array<string | undefined> = [config.accessToken, config.serviceAccountPrivateKey];
+  for (const entry of tokenCache.values()) {
+    values.push(entry.token);
+  }
+  return values.filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+/** Every bundle file passes through here, so no rendered text reaches disk without free-text scrubbing and known-value replacement. */
+function scrubBundleText(content: string, knownSecrets: string[]): string {
+  return redactKnownValues(scrubText(content), knownSecrets) as string;
+}
+
+async function writeBundleFile(rootDir: string, relativePathname: string, content: string, knownSecrets: string[]): Promise<void> {
+  await writeSecureTextFile(rootDir, relativePathname, scrubBundleText(content, knownSecrets));
 }
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
@@ -1923,18 +2011,17 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
     throw new GwsApiError(response.status, await this.readError(response), url);
   }
 
+  /** Renders the HTTP status plus documented identifiers only; the body's free-text message is never kept (see describeErrorReasons). */
   private async readError(response: Response): Promise<string> {
+    const base = `${response.status} ${response.statusText}`.trim();
+    let payload: JsonRecord;
     try {
-      const payload = asRecord(await response.json());
-      const error = asRecord(payload.error);
-      const message = asString(error.message) ?? asString(payload.message);
-      if (message) {
-        return `${response.status} ${response.statusText}: ${message}`;
-      }
+      payload = asRecord(await response.json());
     } catch {
-      // fall through
+      return base;
     }
-    return `${response.status} ${response.statusText}`;
+    const reasons = describeErrorReasons(payload);
+    return reasons.length > 0 ? `${base} (${reasons.join(", ")})` : base;
   }
 
   private clearToken(scopes: string[]): void {
@@ -2777,7 +2864,7 @@ export function assessGwsIntegrations(
   const privilegedIds = new Set(privileged.privilegedUsers.map((user) => asString(user.id)).filter((value): value is string => Boolean(value)));
   const allTokens = data.tokenInventory.data;
   const privilegedTokens = allTokens.filter((record) => privilegedIds.has(record.userId));
-  const uniqueClients = uniqueClientDisplayNames(allTokens);
+  const uniqueClients = uniqueClientLabels(allTokens);
   const highRiskTokens = countHighRiskTokens(allTokens);
   const tokenEvents = extractActivityEventNames(data.tokenActivities.data);
   const sampled = data.tokenInventory.seen ?? 0;
@@ -2878,7 +2965,7 @@ export function assessGwsIntegrations(
     const evidence = [
       `Privileged users sampled: ${Math.min(privileged.privilegedUsers.length, MAX_TOKEN_USERS)} of ${privileged.privilegedUsers.length}`,
       `Privileged third-party tokens: ${privilegedTokens.length}`,
-      `Privileged token clients: ${uniqueClientDisplayNames(privilegedTokens).join(", ") || "none"}`,
+      `Privileged token clients: ${uniqueClientLabels(privilegedTokens).join(", ") || "none"}`,
     ];
     const capNotes = [
       ...(privilegedSampled ? [] : [`Privileged users beyond the ${MAX_TOKEN_USERS}-user token sample were not inspected`]),
@@ -3291,25 +3378,27 @@ export async function exportGwsAuditBundle(
   const data = await collectGwsAuditData(client);
   const { identity, adminAccess, integrations, monitoring } = data;
 
-  const assessments = [
+  // Findings and errors are redacted as objects before any rendering, then every file passes through writeBundleFile.
+  const assessments = redactSecrets([
     assessGwsIdentity(identity, config),
     assessGwsAdminAccess(adminAccess, config),
     assessGwsIntegrations(integrations, config),
     assessGwsMonitoring(monitoring, config),
-  ];
+  ]) as GwsAssessmentResult[];
 
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
-  const errors = collectErrors(
-    identity.users,
-    identity.roles,
-    identity.roleAssignments,
-    identity.loginActivities,
-    identity.twoStepPolicies ?? { data: [] },
-    adminAccess.adminActivities,
-    integrations.tokenInventory,
-    integrations.tokenActivities,
-    monitoring.alerts,
-  );
+  const errors = redactSecrets(collectErrors(
+    ["users.list", identity.users],
+    ["roles.list", identity.roles],
+    ["roleAssignments.list", identity.roleAssignments],
+    ["activities.list (login)", identity.loginActivities],
+    ["policies.list", identity.twoStepPolicies ?? { data: [] }],
+    ["activities.list (admin)", adminAccess.adminActivities],
+    ["tokens.list", integrations.tokenInventory],
+    ["activities.list (token)", integrations.tokenActivities],
+    ["alerts.list", monitoring.alerts],
+  )) as string[];
+  const knownSecrets = knownGwsSecretValues(config);
 
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, safeName);
@@ -3326,29 +3415,29 @@ export async function exportGwsAuditBundle(
     ["core_data/two_step_verification_policies.json", projectDataset(identity.twoStepPolicies ?? { data: [], error: "not collected" }, projectPolicySnapshot)],
   ];
   for (const [pathName, dataset] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(redactSecrets(dataset)));
+    await writeBundleFile(outputDir, pathName, serializeJson(redactSecrets(dataset)), knownSecrets);
   }
 
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(allFindings));
+  await writeBundleFile(outputDir, "analysis/findings.json", serializeJson(allFindings), knownSecrets);
   for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+    await writeBundleFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
       category: assessment.category,
       summary: assessment.summary,
       snapshot_summary: assessment.snapshotSummary,
       findings: assessment.findings,
-    }));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.md`, assessment.text);
+    }), knownSecrets);
+    await writeBundleFile(outputDir, `analysis/${assessment.category}.md`, assessment.text, knownSecrets);
   }
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings));
+  await writeBundleFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), knownSecrets);
+  await writeBundleFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings), knownSecrets);
   for (const framework of frameworks) {
     const report = FRAMEWORK_REPORTS[framework];
-    await writeSecureTextFile(outputDir, report.file, buildFrameworkReport(report.title, allFindings, framework));
+    await writeBundleFile(outputDir, report.file, buildFrameworkReport(report.title, allFindings, framework), knownSecrets);
   }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(frameworks));
+  await writeBundleFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(frameworks), knownSecrets);
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeBundleFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, knownSecrets);
   }
 
   const zipPath = `${outputDir}.zip`;
