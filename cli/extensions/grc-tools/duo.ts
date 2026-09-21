@@ -2636,6 +2636,183 @@ export function assessDuoAdminAccess(
   };
 }
 
+function integrationLabel(integration: JsonRecord): string {
+  return asString(integration.name) ?? asString(integration.integration_key) ?? "unknown-integration";
+}
+
+function isCriticalIntegration(integration: JsonRecord): boolean {
+  const sensitivity = asString(integration.sensitivity_level)?.toLowerCase();
+  return sensitivity === "critical" || sensitivity === "high" || listStrings(integration.compliance_requirements).length > 0;
+}
+
+function assessCriticalApplications(data: DuoIntegrationData, integrationsEvidence: string[]): DuoFinding {
+  if (data.integrations.error) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-005",
+      "Manual",
+      "Critical application coverage could not be assessed because the integration inventory was unavailable.",
+      integrationsEvidence,
+      "Grant the audit principal Grant resource - Read and tag critical applications with a sensitivity level in the Duo Admin Panel.",
+    );
+  }
+
+  const protectedIntegrations = data.integrations.data.filter(integrationIsProtected);
+  const tagged = protectedIntegrations.filter(isCriticalIntegration);
+  const taggedWithoutPolicy = tagged.filter((integration) => !policyKey(integration));
+  const evidence = [
+    `protected_integrations=${protectedIntegrations.length}`,
+    `critical_or_high_or_regulated=${tagged.length}`,
+    `critical_without_policy_key=${taggedWithoutPolicy.length}`,
+    ...taggedWithoutPolicy.slice(0, 10).map((integration) =>
+      `unprotected_critical_app=${integrationLabel(integration)} type=${asString(integration.type) ?? "unknown"} sensitivity_level=${asString(integration.sensitivity_level) ?? "null"} compliance_requirements=${listStrings(integration.compliance_requirements).join("/") || "none"}`,
+    ),
+  ];
+
+  if (protectedIntegrations.length === 0) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-005",
+      "Manual",
+      "No protected integrations were returned, so critical application coverage cannot be compared against the tenant inventory.",
+      evidence,
+      "Confirm the application inventory in the Duo Admin Panel and compare it with the organization's critical application list.",
+    );
+  }
+  if (tagged.length === 0) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-005",
+      "Manual",
+      "No integration carries a Critical or High sensitivity_level or any compliance_requirements, so critical applications cannot be identified from the API.",
+      [...evidence, "sensitivity_level and compliance_requirements are read-only fields set in the Duo Admin Panel."],
+      "Tag critical applications with a sensitivity level and compliance requirements in the Duo Admin Panel, then compare against the organization's critical application list.",
+    );
+  }
+  if (taggedWithoutPolicy.length === 0) {
+    return withInventoryCap(
+      buildFinding(
+        "DUO-INTEGRATIONS-005",
+        "Pass",
+        "Every Critical, High, or regulated application has an explicit Duo policy attached.",
+        evidence,
+        "Keep sensitivity tagging current and compare the Duo inventory against the organization's critical application list during access reviews.",
+      ),
+      data.integrations,
+    );
+  }
+  return withInventoryCap(
+    buildFinding(
+      "DUO-INTEGRATIONS-005",
+      taggedWithoutPolicy.length === tagged.length ? "Fail" : "Partial",
+      `${taggedWithoutPolicy.length} Critical, High, or regulated application(s) rely on the global policy only.`,
+      evidence,
+      "Attach an explicit policy to every critical application so its MFA, device, and network requirements are reviewable.",
+    ),
+    data.integrations,
+  );
+}
+
+function osList(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  }
+  return listStrings(value).map((item) => item.toLowerCase());
+}
+
+function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
+  const globalPolicy = getGlobalPolicyRecord(data);
+  const sections = getPolicySections(globalPolicy);
+  const edition = asString(asRecord(data.infoSummary?.data).edition) ?? "unknown";
+  if (Object.keys(sections).length === 0) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-006",
+      "Manual",
+      "Device health requirements could not be read because the global policy was unavailable.",
+      unavailableEvidence(
+        DUO_ENDPOINTS.globalPolicy,
+        DUO_PERMISSIONS.readResource,
+        data.globalPolicy.error ?? data.policies.error,
+        "Export the Global Policy Duo Desktop, Operating Systems, Full Disk Encryption, and Screen Lock sections.",
+      ),
+      "Grant the audit principal Grant resource - Read and review the device health policy sections.",
+    );
+  }
+
+  const healthChecks = asRecord(sections.health_checks);
+  const duoDesktop = asRecord(sections.duo_desktop);
+  const healthSource = Object.keys(healthChecks).length > 0 ? "health_checks" : Object.keys(duoDesktop).length > 0 ? "duo_desktop" : undefined;
+  const health = healthSource === "health_checks" ? healthChecks : duoDesktop;
+  const operatingSystems = asRecord(sections.operating_systems);
+  const osRestrictions = asRecord(operatingSystems.os_restrictions);
+  const fullDiskEncryption = asRecord(sections.full_disk_encryption);
+  const screenLock = asRecord(sections.screen_lock);
+  const hasEditionSections = [healthSource, sections.operating_systems, sections.full_disk_encryption, sections.screen_lock].some(Boolean);
+
+  if (!hasEditionSections) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-006",
+      "Manual",
+      `The global policy exposes no device health sections; health_checks, duo_desktop, operating_systems, full_disk_encryption, and screen_lock require Duo Advantage or Premier (edition reported: ${edition}).`,
+      [`edition=${edition}`, "Policy Section Data marks these sections as Premier and Advantage edition features."],
+      "Confirm the tenant edition and, if eligible, configure device health requirements in the Global Policy.",
+    );
+  }
+
+  const requiresDuoDesktop = osList(health.requires_duo_desktop);
+  const enforceEncryption = osList(health.enforce_encryption);
+  const enforceFirewall = osList(health.enforce_firewall);
+  const enforceSystemPassword = osList(health.enforce_system_password);
+  const restrictedOs = Object.entries(osRestrictions).filter(([, rule]) => {
+    const record = asRecord(rule);
+    return Boolean(asString(record.block_policy) || asString(record.warn_policy) || asString(record.block_version) || asString(record.warn_version));
+  }).map(([os]) => os);
+  const requireEncryption = asBoolean(fullDiskEncryption.require_encryption);
+  const requireScreenLock = asBoolean(screenLock.require_screen_lock);
+  const evidence = [
+    `edition=${edition}`,
+    `health_section=${healthSource ?? "absent"}`,
+    `requires_duo_desktop=${requiresDuoDesktop.join(",") || "none"}`,
+    `enforce_encryption=${enforceEncryption.join(",") || "none"}`,
+    `enforce_firewall=${enforceFirewall.join(",") || "none"}`,
+    `enforce_system_password=${enforceSystemPassword.join(",") || "none"}`,
+    `os_restrictions=${restrictedOs.join(",") || "none"}`,
+    `full_disk_encryption.require_encryption=${requireEncryption ?? "absent"}`,
+    `screen_lock.require_screen_lock=${requireScreenLock ?? "absent"}`,
+  ];
+  const checks = [
+    requiresDuoDesktop.length > 0,
+    enforceEncryption.length > 0 || requireEncryption === true,
+    enforceFirewall.length > 0,
+    enforceSystemPassword.length > 0 || requireScreenLock === true,
+    restrictedOs.length > 0,
+  ];
+  const satisfied = checks.filter(Boolean).length;
+
+  if (satisfied === checks.length) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-006",
+      "Pass",
+      "Device health policy requires Duo Desktop with encryption, firewall, system password or screen lock, and operating system version restrictions.",
+      evidence,
+      "Keep device health requirements aligned with the managed fleet and review remediation notes for blocked users.",
+    );
+  }
+  if (satisfied === 0) {
+    return buildFinding(
+      "DUO-INTEGRATIONS-006",
+      "Fail",
+      "Device health sections are present but no health requirement is enforced.",
+      evidence,
+      "Require Duo Desktop and enable encryption, firewall, system password, and OS version checks for managed platforms.",
+    );
+  }
+  return buildFinding(
+    "DUO-INTEGRATIONS-006",
+    "Partial",
+    `${satisfied} of ${checks.length} device health requirement groups are enforced.`,
+    evidence,
+    "Extend device health enforcement to encryption, firewall, system password or screen lock, and OS version restrictions.",
+  );
+}
+
 export function assessDuoIntegrations(
   data: DuoIntegrationData,
   config: DuoResolvedConfig,
@@ -2658,6 +2835,13 @@ export function assessDuoIntegrations(
       || getBooleanish(integration, "adminapi_allow_to_set_permissions"),
   );
 
+  const integrationsEvidence = unavailableEvidence(
+    DUO_ENDPOINTS.integrations,
+    DUO_PERMISSIONS.readResource,
+    data.integrations.error,
+    "Export the Applications list from the Duo Admin Panel with type, policy, sensitivity level, and user access.",
+  );
+
   if (integrations.length === 0) {
     findings.push(
       buildFinding(
@@ -2665,19 +2849,22 @@ export function assessDuoIntegrations(
         data.integrations.error ? "Manual" : "Partial",
         data.integrations.error
           ? "Direct integration inventory could not be collected."
-          : "No active protected integrations were returned.",
-        [data.integrations.error ?? "Protected integration count was zero."],
+          : "No active protected integrations were returned (Partial, not Pass: an empty inventory cannot demonstrate policy coverage).",
+        data.integrations.error ? integrationsEvidence : ["Protected integration count was zero."],
         "Confirm integration inventory and policy attachment inside the Duo Admin Panel before concluding the environment has no protected apps.",
       ),
     );
   } else if (policyAttachedCount === integrations.length) {
     findings.push(
-      buildFinding(
-        "DUO-INTEGRATIONS-001",
-        "Pass",
-        "All active protected integrations expose an explicit policy attachment.",
-        [`protected_integrations=${integrations.length}`, `with_policy_key=${policyAttachedCount}`],
-        "Keep custom policy attachment visible for high-value applications instead of relying only on the global policy.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-INTEGRATIONS-001",
+          "Pass",
+          "All active protected integrations expose an explicit policy attachment.",
+          [`protected_integrations=${integrations.length}`, `with_policy_key=${policyAttachedCount}`],
+          "Keep custom policy attachment visible for high-value applications instead of relying only on the global policy.",
+        ),
+        data.integrations,
       ),
     );
   } else if (policyAttachedCount > 0) {
@@ -2759,24 +2946,40 @@ export function assessDuoIntegrations(
     );
   }
 
-  if (adminApiIntegrations.length === 0) {
+  if (data.integrations.error) {
     findings.push(
       buildFinding(
         "DUO-INTEGRATIONS-004",
-        "Pass",
-        "No Admin API integrations were returned in the direct integration inventory.",
-        ["adminapi_integrations=0"],
-        "If Admin API applications exist outside the returned inventory, review them separately for least-privilege scope.",
+        "Manual",
+        "Admin API integration permissions could not be collected.",
+        integrationsEvidence,
+        "Grant the audit principal Grant resource - Read so Admin API application permissions can be reviewed.",
+      ),
+    );
+  } else if (adminApiIntegrations.length === 0) {
+    findings.push(
+      buildFinding(
+        "DUO-INTEGRATIONS-004",
+        "Partial",
+        "No Admin API integrations were returned even though this audit runs through one, so the inventory is not authoritative.",
+        ["adminapi_integrations=0", `integrations_returned=${data.integrations.data.length}`],
+        "Review Admin API applications directly in the Duo Admin Panel and confirm the audit principal can list them.",
       ),
     );
   } else if (overPrivilegedAdminApis.length === 0) {
     findings.push(
-      buildFinding(
-        "DUO-INTEGRATIONS-004",
-        "Pass",
-        "Admin API integrations appear read-oriented in the returned inventory.",
-        [`adminapi_integrations=${adminApiIntegrations.length}`],
-        "Keep Admin API applications constrained to read permissions unless a write path is formally justified.",
+      withInventoryCap(
+        buildFinding(
+          "DUO-INTEGRATIONS-004",
+          "Pass",
+          "Admin API integrations appear read-oriented in the returned inventory.",
+          [
+            `adminapi_integrations=${adminApiIntegrations.length}`,
+            "No integration sets adminapi_integrations, adminapi_write_resource, adminapi_settings, or adminapi_allow_to_set_permissions.",
+          ],
+          "Keep Admin API applications constrained to read permissions unless a write path is formally justified.",
+        ),
+        data.integrations,
       ),
     );
   } else {
@@ -2791,11 +2994,15 @@ export function assessDuoIntegrations(
     );
   }
 
+  findings.push(assessCriticalApplications(data, integrationsEvidence));
+  findings.push(assessDeviceHealthDepth(data));
+
   const snapshotSummary = {
     protected_integrations: integrations.length,
     policies: data.policies.data.length,
     adminapi_integrations: adminApiIntegrations.length,
     overprivileged_adminapi_integrations: overPrivilegedAdminApis.length,
+    edition: asString(asRecord(data.infoSummary?.data).edition) ?? "unknown",
   };
 
   return {
@@ -2805,6 +3012,163 @@ export function assessDuoIntegrations(
     snapshotSummary,
     text: buildAssessmentText("Duo integration assessment", getOrganizationName(config), findings, snapshotSummary),
   };
+}
+
+interface TravelAnomaly {
+  user: string;
+  fromCountry: string;
+  toCountry: string;
+  minutesApart: number;
+}
+
+function eventCountry(event: JsonRecord): string | undefined {
+  return asString(asRecord(asRecord(event.access_device).location).country);
+}
+
+function detectImpossibleTravel(events: JsonRecord[]): { anomalies: TravelAnomaly[]; locatedEvents: number } {
+  const byUser = new Map<string, Array<{ timestamp: number; country: string }>>();
+  let locatedEvents = 0;
+  for (const event of events) {
+    if (asString(event.result)?.toLowerCase() !== "success") continue;
+    const country = eventCountry(event);
+    const timestamp = parseTimestamp(event.timestamp);
+    if (!country || timestamp === null) continue;
+    locatedEvents += 1;
+    const user = asString(asRecord(event.user).key) ?? asString(asRecord(event.user).name) ?? "unknown-user";
+    const list = byUser.get(user) ?? [];
+    list.push({ timestamp, country });
+    byUser.set(user, list);
+  }
+
+  const anomalies: TravelAnomaly[] = [];
+  for (const [user, list] of byUser) {
+    list.sort((a, b) => a.timestamp - b.timestamp);
+    for (let index = 1; index < list.length; index += 1) {
+      const previous = list[index - 1];
+      const current = list[index];
+      if (previous.country !== current.country && current.timestamp - previous.timestamp <= IMPOSSIBLE_TRAVEL_WINDOW_MS) {
+        anomalies.push({
+          user,
+          fromCountry: previous.country,
+          toCountry: current.country,
+          minutesApart: Math.round((current.timestamp - previous.timestamp) / 60000),
+        });
+      }
+    }
+  }
+  return { anomalies, locatedEvents };
+}
+
+function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResolvedConfig): DuoFinding {
+  const attempts = data.authenticationAttempts;
+  const edition = asString(asRecord(data.infoSummary.data).edition) ?? "unknown";
+  if (!attempts || attempts.error) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Manual",
+      "Authentication attempt statistics could not be collected.",
+      unavailableEvidence(
+        DUO_ENDPOINTS.authenticationAttempts,
+        DUO_PERMISSIONS.readInformation,
+        attempts?.error ?? `${DUO_ENDPOINTS.authenticationAttempts} was not collected.`,
+        "Export the Authentication Summary report from the Duo Admin Panel for the review window.",
+      ),
+      "Grant the audit principal Grant read information so fraud, failure, and error counts can be reviewed.",
+    );
+  }
+  if (data.authenticationLogs.error) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Manual",
+      "Authentication logs could not be collected, so travel anomalies cannot be evaluated.",
+      unavailableEvidence(
+        DUO_ENDPOINTS.authenticationLogs,
+        DUO_PERMISSIONS.readLog,
+        data.authenticationLogs.error,
+        "Export the Authentication Log with access device location for the review window.",
+      ),
+      "Grant the audit principal Grant read log so authentication events can be analyzed.",
+    );
+  }
+
+  const counts = asRecord(asRecord(attempts.data).authentication_attempts);
+  const fraud = asNumber(counts.FRAUD) ?? 0;
+  const failure = asNumber(counts.FAILURE) ?? 0;
+  const error = asNumber(counts.ERROR) ?? 0;
+  const success = asNumber(counts.SUCCESS) ?? 0;
+  const total = fraud + failure + error + success;
+  const failureShare = percentage(failure + fraud, total);
+  const { anomalies, locatedEvents } = detectImpossibleTravel(data.authenticationLogs.data);
+  const evidence = [
+    `lookback_days=${config.lookbackDays}`,
+    `attempts_success=${success}`,
+    `attempts_failure=${failure}`,
+    `attempts_fraud=${fraud}`,
+    `attempts_error=${error}`,
+    `denied_share_percent=${failureShare}`,
+    `auth_logs_sampled=${data.authenticationLogs.data.length}`,
+    `auth_logs_with_location=${locatedEvents}`,
+    `impossible_travel_pairs=${anomalies.length}`,
+    ...anomalies.slice(0, 10).map((anomaly) =>
+      `impossible_travel user=${anomaly.user} ${anomaly.fromCountry} -> ${anomaly.toCountry} within ${anomaly.minutesApart} minutes`,
+    ),
+  ];
+
+  if (Object.keys(counts).length === 0) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Manual",
+      "The authentication attempts report did not include the documented authentication_attempts counts.",
+      evidence,
+      "Review the Authentication Summary report in the Duo Admin Panel.",
+    );
+  }
+  if (total === 0 && data.authenticationLogs.data.length === 0) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Partial",
+      "No authentication attempts or events were recorded in the lookback window, so anomaly review has no data (Partial, not Pass).",
+      evidence,
+      "Confirm the lookback window covers real usage and that authentication telemetry is retained.",
+    );
+  }
+  if (anomalies.length > 0) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Fail",
+      `${anomalies.length} successful authentication pair(s) show a country change within ${IMPOSSIBLE_TRAVEL_WINDOW_MS / 60000} minutes.`,
+      evidence,
+      "Investigate the flagged users for credential compromise or shared accounts and enable User Location or Trust Monitor policies.",
+    );
+  }
+  if (locatedEvents === 0) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Manual",
+      `No authentication event exposed access_device.location, which the Admin API documents for Duo Premier and Duo Advantage plans (edition reported: ${edition}); travel analysis requires manual review.`,
+      evidence,
+      "Confirm the tenant edition, then review authentication locations in the Duo Admin Panel or upgrade to an edition with access device location.",
+      { manualNote: "Fraud, failure, and error counts were collected; only geographic analysis is blocked by missing location data." },
+    );
+  }
+  if (fraud > 0 || failureShare > 20) {
+    return buildFinding(
+      "DUO-MON-005",
+      "Partial",
+      fraud > 0
+        ? `${fraud} authentication attempt(s) were reported as fraud in the lookback window.`
+        : `${failureShare} percent of authentication attempts were denied in the lookback window.`,
+      evidence,
+      "Review fraud reports and denied authentications with the affected users and confirm follow-up in the incident workflow.",
+    );
+  }
+  return buildFinding(
+    "DUO-MON-005",
+    "Pass",
+    "No fraud reports, elevated denial rates, or impossible travel pairs were found in the lookback window.",
+    evidence,
+    "Keep reviewing authentication summaries and location changes as part of routine monitoring.",
+  );
 }
 
 export function assessDuoMonitoring(
@@ -2952,13 +3316,30 @@ export function assessDuoMonitoring(
     );
   }
 
+  findings.push(assessAuthenticationAnomalies(data, config));
+
   const settings = asRecord(data.settings.data);
   const notificationSignals = [
     getBooleanish(settings, "fraud_email_enabled"),
     getBooleanish(settings, "push_activity_notification_enabled"),
     getBooleanish(settings, "email_activity_notification_enabled"),
   ].filter((value): value is boolean => value !== undefined);
-  if (notificationSignals.some(Boolean)) {
+  if (data.settings.error || Object.keys(settings).length === 0) {
+    findings.push(
+      buildFinding(
+        "DUO-MON-004",
+        "Manual",
+        "Notification settings could not be collected.",
+        unavailableEvidence(
+          DUO_ENDPOINTS.settings,
+          DUO_PERMISSIONS.settings,
+          data.settings.error,
+          "Review Settings > Notifications in the Duo Admin Panel.",
+        ),
+        "Grant the audit principal Grant settings so fraud and activity notification toggles can be verified.",
+      ),
+    );
+  } else if (notificationSignals.some(Boolean)) {
     findings.push(
       buildFinding(
         "DUO-MON-004",

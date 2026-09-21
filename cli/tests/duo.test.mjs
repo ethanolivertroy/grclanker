@@ -604,6 +604,204 @@ test("assessDuoAdminAccess evaluates lockout policy and undated administrators",
   assert.equal(findingById(assessDuoAdminAccess(partial, createSampleConfig()), "DUO-ADMIN-001").status, "Partial");
 });
 
+function compliantIntegrationData() {
+  const policy = compliantGlobalPolicy();
+  return {
+    settings: dataset(compliantSettings()),
+    policies: dataset([policy]),
+    globalPolicy: dataset(policy),
+    infoSummary: dataset({ edition: "Duo Premier", integration_count: 2, user_count: 2, admin_count: 2 }),
+    integrations: {
+      data: [
+        {
+          integration_key: "DIVPN",
+          name: "VPN",
+          type: "websdk",
+          user_access: "ALL_USERS",
+          policy_key: "PO-VPN",
+          sensitivity_level: "Critical",
+          compliance_requirements: ["FedRAMP"],
+          prompt_v4_enabled: 1,
+          frameless_auth_prompt_enabled: 1,
+        },
+        {
+          integration_key: "DIAUDIT",
+          name: "grclanker audit",
+          type: "adminapi",
+          user_access: "NO_USERS",
+          adminapi_read_log: 1,
+          adminapi_read_resource: 1,
+          adminapi_admins_read: 1,
+          adminapi_info: 1,
+          adminapi_settings: 0,
+          adminapi_write_resource: 0,
+          adminapi_integrations: 0,
+          adminapi_allow_to_set_permissions: 0,
+        },
+      ],
+      total: 2,
+      complete: true,
+    },
+  };
+}
+
+function forbiddenIntegrationData() {
+  return {
+    settings: forbiddenDataset("/admin/v1/settings", null),
+    policies: forbiddenDataset("/admin/v2/policies", []),
+    globalPolicy: forbiddenDataset("/admin/v2/policies/global", null),
+    infoSummary: forbiddenDataset("/admin/v1/info/summary", null),
+    integrations: forbiddenDataset("/admin/v3/integrations", []),
+  };
+}
+
+function locatedAuthEvent(txid, userKey, country, minutesAgo) {
+  return {
+    txid,
+    result: "success",
+    factor: "webauthn",
+    timestamp: NOW_SECONDS - minutesAgo * 60,
+    user: { key: userKey, name: `${userKey}@example.gov` },
+    access_device: { location: { city: "Springfield", state: "VA", country } },
+  };
+}
+
+function compliantMonitoringData() {
+  return {
+    settings: dataset(compliantSettings()),
+    infoSummary: dataset({ edition: "Duo Premier", telephony_credits_remaining: 900 }),
+    authenticationAttempts: dataset({ authentication_attempts: { ERROR: 0, FAILURE: 2, FRAUD: 0, SUCCESS: 98 } }),
+    authenticationLogs: {
+      data: [locatedAuthEvent("tx-1", "DU1", "United States", 30), locatedAuthEvent("tx-2", "DU1", "United States", 10)],
+      complete: true,
+    },
+    activityLogs: { data: [{ txid: "a-1" }], complete: true },
+    telephonyLogs: { data: [], complete: true },
+    trustMonitorEvents: { data: [{ sekey: "SE1", priority_event: false, state: "closed" }], complete: true },
+  };
+}
+
+function forbiddenMonitoringData() {
+  return {
+    settings: forbiddenDataset("/admin/v1/settings", null),
+    infoSummary: forbiddenDataset("/admin/v1/info/summary", null),
+    authenticationAttempts: forbiddenDataset("/admin/v1/info/authentication_attempts", null),
+    authenticationLogs: forbiddenDataset("/admin/v2/logs/authentication", []),
+    activityLogs: forbiddenDataset("/admin/v2/logs/activity", []),
+    telephonyLogs: forbiddenDataset("/admin/v2/logs/telephony", []),
+    trustMonitorEvents: forbiddenDataset("/admin/v1/trust_monitor/events", []),
+  };
+}
+
+test("assessDuoIntegrations covers critical applications and device health depth", () => {
+  const compliant = assessDuoIntegrations(compliantIntegrationData(), createSampleConfig());
+  for (const id of ["DUO-INTEGRATIONS-001", "DUO-INTEGRATIONS-002", "DUO-INTEGRATIONS-003", "DUO-INTEGRATIONS-004", "DUO-INTEGRATIONS-005", "DUO-INTEGRATIONS-006"]) {
+    assert.equal(findingById(compliant, id).status, "Pass", `${id} passes on the compliant tenant`);
+  }
+
+  const forbiddenResult = assessDuoIntegrations(forbiddenIntegrationData(), createSampleConfig());
+  assertNoPass(forbiddenResult, "forbidden integration data");
+  for (const finding of forbiddenResult.findings) {
+    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
+  }
+
+  const emptyResult = assessDuoIntegrations(
+    { settings: dataset({}), policies: dataset([]), globalPolicy: dataset(null), infoSummary: dataset({}), integrations: dataset([]) },
+    createSampleConfig(),
+  );
+  assertNoPass(emptyResult, "empty integration data");
+  assert.equal(findingById(emptyResult, "DUO-INTEGRATIONS-004").status, "Partial");
+  assert.equal(findingById(emptyResult, "DUO-INTEGRATIONS-005").status, "Manual");
+
+  const untagged = compliantIntegrationData();
+  untagged.integrations.data[0].sensitivity_level = null;
+  untagged.integrations.data[0].compliance_requirements = [];
+  assert.equal(findingById(assessDuoIntegrations(untagged, createSampleConfig()), "DUO-INTEGRATIONS-005").status, "Manual");
+
+  const unprotected = compliantIntegrationData();
+  delete unprotected.integrations.data[0].policy_key;
+  const unprotectedFinding = findingById(assessDuoIntegrations(unprotected, createSampleConfig()), "DUO-INTEGRATIONS-005");
+  assert.equal(unprotectedFinding.status, "Fail");
+  assert.ok(unprotectedFinding.evidence.some((line) => line.startsWith("unprotected_critical_app=VPN type=websdk")));
+
+  const partial = compliantIntegrationData();
+  partial.integrations = { data: partial.integrations.data, total: 30, complete: false };
+  const partialResult = assessDuoIntegrations(partial, createSampleConfig());
+  for (const id of ["DUO-INTEGRATIONS-001", "DUO-INTEGRATIONS-004", "DUO-INTEGRATIONS-005"]) {
+    assert.equal(findingById(partialResult, id).status, "Partial", `${id} must not pass on a partial inventory`);
+  }
+
+  const essentials = compliantIntegrationData();
+  essentials.infoSummary = dataset({ edition: "Duo Essentials" });
+  for (const section of ["health_checks", "operating_systems", "full_disk_encryption", "screen_lock"]) {
+    delete essentials.globalPolicy.data.sections[section];
+  }
+  const editionFinding = findingById(assessDuoIntegrations(essentials, createSampleConfig()), "DUO-INTEGRATIONS-006");
+  assert.equal(editionFinding.status, "Manual");
+  assert.match(editionFinding.summary, /Duo Essentials/);
+
+  const weakHealth = compliantIntegrationData();
+  weakHealth.globalPolicy.data.sections.health_checks = { requires_duo_desktop: "windows", enforce_encryption: "", enforce_firewall: "", enforce_system_password: "" };
+  weakHealth.globalPolicy.data.sections.operating_systems = { os_restrictions: {} };
+  weakHealth.globalPolicy.data.sections.full_disk_encryption = { require_encryption: false };
+  weakHealth.globalPolicy.data.sections.screen_lock = { require_screen_lock: false };
+  assert.equal(findingById(assessDuoIntegrations(weakHealth, createSampleConfig()), "DUO-INTEGRATIONS-006").status, "Partial");
+});
+
+test("assessDuoMonitoring evaluates authentication attempts and impossible travel", () => {
+  const compliant = assessDuoMonitoring(compliantMonitoringData(), createSampleConfig());
+  for (const id of ["DUO-MON-001", "DUO-MON-002", "DUO-MON-003", "DUO-MON-004", "DUO-MON-005"]) {
+    assert.equal(findingById(compliant, id).status, "Pass", `${id} passes on the compliant tenant`);
+  }
+
+  const forbiddenResult = assessDuoMonitoring(forbiddenMonitoringData(), createSampleConfig());
+  assertNoPass(forbiddenResult, "forbidden monitoring data");
+  for (const finding of forbiddenResult.findings) {
+    assert.equal(finding.status, "Manual", `${finding.id} should be Manual on 403`);
+  }
+  assert.ok(findingById(forbiddenResult, "DUO-MON-005").evidence.includes("required_permission=Grant read information"));
+
+  const emptyResult = assessDuoMonitoring(
+    {
+      settings: dataset({}),
+      infoSummary: dataset({}),
+      authenticationAttempts: dataset({ authentication_attempts: { ERROR: 0, FAILURE: 0, FRAUD: 0, SUCCESS: 0 } }),
+      authenticationLogs: dataset([]),
+      activityLogs: dataset([]),
+      telephonyLogs: dataset([]),
+      trustMonitorEvents: dataset([]),
+    },
+    createSampleConfig(),
+  );
+  assert.deepEqual(
+    emptyResult.findings.filter((finding) => finding.status === "Pass").map((finding) => finding.id),
+    ["DUO-MON-003"],
+    "zero telephony usage with unknown credits is the only compliant-by-intent empty result",
+  );
+  assert.equal(findingById(emptyResult, "DUO-MON-005").status, "Partial");
+
+  const travel = compliantMonitoringData();
+  travel.authenticationLogs = dataset([
+    locatedAuthEvent("tx-1", "DU1", "United States", 40),
+    locatedAuthEvent("tx-2", "DU1", "Brazil", 15),
+    locatedAuthEvent("tx-3", "DU2", "United States", 30),
+  ]);
+  const travelFinding = findingById(assessDuoMonitoring(travel, createSampleConfig()), "DUO-MON-005");
+  assert.equal(travelFinding.status, "Fail");
+  assert.ok(travelFinding.evidence.some((line) => line.includes("user=DU1 United States -> Brazil within 25 minutes")));
+
+  const fraud = compliantMonitoringData();
+  fraud.authenticationAttempts = dataset({ authentication_attempts: { ERROR: 0, FAILURE: 0, FRAUD: 1, SUCCESS: 50 } });
+  assert.equal(findingById(assessDuoMonitoring(fraud, createSampleConfig()), "DUO-MON-005").status, "Partial");
+
+  const noLocation = compliantMonitoringData();
+  noLocation.infoSummary = dataset({ edition: "Duo Essentials", telephony_credits_remaining: 900 });
+  noLocation.authenticationLogs = dataset([{ txid: "tx-1", result: "success", factor: "webauthn", timestamp: NOW_SECONDS - 60 }]);
+  const noLocationFinding = findingById(assessDuoMonitoring(noLocation, createSampleConfig()), "DUO-MON-005");
+  assert.equal(noLocationFinding.status, "Manual");
+  assert.match(noLocationFinding.summary, /Duo Essentials/);
+});
+
 test("resolveDuoConfiguration prefers explicit args over environment values", () => {
   const base = resolveDuoConfiguration(
     {},
