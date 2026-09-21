@@ -35,6 +35,7 @@ import {
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/elastic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const DAY_MS = 86_400_000;
 const API_KEY = Buffer.from("audit-id:audit-secret-value").toString("base64");
@@ -2223,5 +2224,614 @@ test("Elastic tools appear in the tool catalog under the Elastic group", () => {
     assert.equal(tool.group, "Elastic");
     assert.equal(tool.kind, "domain");
     assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "elasticsearch_url"));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Rules 9 and 10, the rule 1 corollary, and the addenda on error strings,
+// null rendering, principal gating, collection status, request matching, and
+// denied-list markers.
+// ---------------------------------------------------------------------------
+
+const CANARIES = {
+  bearer: "BEARER_CANARY_9f8e7d6c5b4a3210",
+  cookie: "SESSION_CANARY_0123456789abcdef",
+  apiKey: "APIKEY_CANARY_fedcba9876543210",
+  urlToken: "URLTOKEN_CANARY_1122334455667788",
+  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKV1RfQ0FOQVJZX2FiY2RlZjAxMjM0NTY3ODkifQ.JWT_CANARY_SIGNATURE_abcdef0123456789",
+  privateKey: "PRIVATEKEY_CANARY_a1b2c3d4e5f60718",
+  bindPassword: "BINDPASSWORD_CANARY_2233445566778899",
+  connectorSecret: "CONNECTORSECRET_CANARY_33445566778899aa",
+  watchPassword: "WATCHPASSWORD_CANARY_445566778899aabb",
+  pipelineLiteral: "PIPELINE_LITERAL_CANARY_5566778899aabbcc",
+  enrollmentKey: "ENROLLMENT_CANARY_66778899aabbccdd",
+  outputKey: "OUTPUTKEY_CANARY_778899aabbccddee",
+  headerToken: "HEADERTOKEN_CANARY_8899aabbccddeeff",
+  urlPath: "URLPATH_CANARY_99aabbccddeeff00",
+};
+
+function canaryValues() {
+  return Object.values(CANARIES);
+}
+
+function canaryFixtures(now = Date.now()) {
+  const fixtures = healthyFixtures(now);
+  fixtures.clusterSettings.persistent["xpack.security.authc.realms.ldap.ldap1.bind_password"] = CANARIES.bindPassword;
+  fixtures.clusterSettings.persistent["xpack.security.http.ssl.key"] = CANARIES.privateKey;
+  fixtures.nodeSettings.nodes["node-1"].settings["xpack.security.transport.ssl.keystore.secure_password"] = CANARIES.privateKey;
+  fixtures.connectors = [
+    {
+      id: "connector-1",
+      name: "slack-hook",
+      connector_type_id: ".webhook",
+      is_missing_secrets: false,
+      config: {
+        url: `https://hooks.example.com/services/${CANARIES.urlPath}?token=${CANARIES.urlToken}`,
+        headers: { Authorization: `Bearer ${CANARIES.headerToken}`, "X-Api-Key": CANARIES.apiKey },
+        hasAuth: true,
+      },
+      secrets: { user: "svc", password: CANARIES.connectorSecret },
+    },
+  ];
+  fixtures.watches = [
+    {
+      _id: "cpu-alert",
+      watch: {
+        trigger: { schedule: { interval: "5m" } },
+        actions: {
+          notify: {
+            webhook: {
+              scheme: "https",
+              host: "hooks.example.com",
+              port: 443,
+              method: "post",
+              path: `/alerts/${CANARIES.urlPath}`,
+              params: { token: CANARIES.urlToken },
+              headers: { Authorization: `Basic ${CANARIES.headerToken}` },
+              auth: { basic: { username: "svc", password: CANARIES.watchPassword } },
+              body: `{"token":"${CANARIES.urlToken}"}`,
+            },
+          },
+        },
+      },
+    },
+  ];
+  fixtures.ingestPipelines = {
+    "logs-enrich": { processors: [{ set: { field: "event.kind", value: "event" } }, { set: { field: "http.request.headers.authorization", value: CANARIES.pipelineLiteral } }] },
+    ".fleet_final_pipeline-1": { _meta: { managed: true }, processors: [{ script: { source: "ctx.x = 1" } }] },
+  };
+  fixtures.enrollmentKeys = [{ id: "enroll-1", active: true, policy_id: "policy-1", api_key_id: "ak-1", api_key: CANARIES.enrollmentKey, name: "Default" }];
+  fixtures.fleetOutputs = [
+    { id: "default-output", name: "default", type: "elasticsearch", hosts: ["https://es.example.com:9200"], ca_trusted_fingerprint: "abc123", is_default: true, ssl: { certificate: "cert", key: CANARIES.outputKey } },
+  ];
+  fixtures.apiKeys[0].metadata = { rotation_token: CANARIES.apiKey };
+  return fixtures;
+}
+
+const HTML_ERROR_BODY = `<html><body><h1>502 Bad Gateway</h1><p>upstream sent Authorization: Bearer ${CANARIES.bearer}; Set-Cookie: session=${CANARIES.cookie}; api_key=${CANARIES.apiKey}; retry at https://api.example.com/v1/x?token=${CANARIES.urlToken} later; jwt ${CANARIES.jwt}</p></body></html>`;
+
+function htmlGateway() {
+  return () => new Response(HTML_ERROR_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function jsonErrorWithUrl() {
+  return () => jsonResponse(
+    { error: { type: "security_exception", reason: `unauthorized; see https://api.example.com/v1/x?token=${CANARIES.urlToken} for details`, header: { "WWW-Authenticate": `Bearer ${CANARIES.bearer}` } }, status: 403 },
+    { status: 403, statusText: "Forbidden" },
+  );
+}
+
+/**
+ * Router that also records the status of every response it served, for request-log assertions.
+ * Kibana space prefixes (/s/<space>/api/...) are routed to the unprefixed fixture route while the
+ * log keeps the path exactly as requested.
+ */
+function createLoggingRouter(routes, log) {
+  const inner = createRouter(routes);
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const routed = new URL(url.toString());
+    routed.pathname = url.pathname.replace(/^\/s\/[^/]+(?=\/api\/)/, "");
+    const response = await inner(routed.toString(), init);
+    log.push({ method: init.method ?? "GET", url: url.toString(), path: url.pathname, status: response.status });
+    return response;
+  };
+}
+
+function allText(values) {
+  return values.map((value) => (typeof value === "string" ? value : JSON.stringify(value))).join("\n");
+}
+
+test("verdict rule 9: redactSecrets scrubs configured secrets and every credential class anywhere in an error string", () => {
+  const config = sampleConfig({ apiKey: API_KEY, password: undefined });
+  const text = [
+    `elasticsearch request GET /_security/user failed (502 Bad Gateway): proxy said Authorization: Bearer ${CANARIES.bearer}`,
+    `and ApiKey ${API_KEY} and Basic dXNlcjpwYXNzd29yZA== then Set-Cookie: session=${CANARIES.cookie}; Path=/`,
+    `api_key="${CANARIES.apiKey}" token=${CANARIES.urlToken} secret: ${CANARIES.connectorSecret}`,
+    `retry at https://user:${CANARIES.bindPassword}@api.example.com/v1/x?token=${CANARIES.urlToken}#frag mid sentence and ${CANARIES.jwt} as jwt`,
+    "the raw secret audit-secret-value must go too",
+  ].join(" ");
+  const scrubbed = redactSecrets(text, config);
+  for (const canary of [...canaryValues(), API_KEY, "audit-secret-value", "dXNlcjpwYXNzd29yZA=="]) {
+    assert.ok(!scrubbed.includes(canary), `${canary} survived redaction in: ${scrubbed}`);
+  }
+  assert.match(scrubbed, /GET \/_security\/user failed \(502 Bad Gateway\)/, "the request line and status stay readable");
+  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, "URLs keep scheme, host, and path but lose userinfo, query, and fragment");
+  assert.match(scrubbed, /Authorization: \[REDACTED\]/);
+});
+
+test("verdict rule 9: redactSensitiveValues masks whole subtrees, plural and camelCase keys, and deep nesting while keeping booleans", () => {
+  const nested = { level: 0 };
+  let cursor = nested;
+  for (let depth = 1; depth <= 40; depth += 1) {
+    cursor.child = { level: depth, password: `deep-${depth}` };
+    cursor = cursor.child;
+  }
+  const redacted = redactSensitiveValues({
+    secrets: { user: "svc", password: "p1", nested: { token: "t1" } },
+    tokens: ["t2", "t3"],
+    apiKey: "camel",
+    api_keys: ["k1"],
+    keystore: { key: "ks", path: "/etc/ks.p12" },
+    ssl: { key: "pem", certificate: "cert" },
+    tls: { key: "pem2" },
+    bind_password: "bp",
+    passphrase: "pp",
+    truststore_password: "tp",
+    sessionToken: "st",
+    is_missing_secrets: false,
+    has_private_key: true,
+    "xpack.security.http.ssl.key": "flat-key",
+    fine: { name: "ok", count: 2 },
+    deep: nested,
+  });
+  assert.equal(redacted.secrets, "[REDACTED]", "an object under a secret-shaped key is replaced whole");
+  assert.equal(redacted.tokens, "[REDACTED]", "an array under a plural secret key is replaced whole");
+  assert.equal(redacted.apiKey, "[REDACTED]");
+  assert.equal(redacted.api_keys, "[REDACTED]");
+  assert.equal(redacted.keystore.key, "[REDACTED]");
+  assert.equal(redacted.keystore.path, "/etc/ks.p12");
+  assert.equal(redacted.ssl.key, "[REDACTED]");
+  assert.equal(redacted.ssl.certificate, "cert");
+  assert.equal(redacted.tls.key, "[REDACTED]");
+  assert.equal(redacted.bind_password, "[REDACTED]");
+  assert.equal(redacted.passphrase, "[REDACTED]");
+  assert.equal(redacted.truststore_password, "[REDACTED]");
+  assert.equal(redacted.sessionToken, "[REDACTED]");
+  assert.equal(redacted["xpack.security.http.ssl.key"], "[REDACTED]");
+  assert.equal(redacted.is_missing_secrets, false, "boolean flags whose names merely mention secrets are preserved");
+  assert.equal(redacted.has_private_key, true);
+  assert.deepEqual(redacted.fine, { name: "ok", count: 2 });
+  assert.ok(!JSON.stringify(redacted).includes("deep-40"), "values past the depth cap are replaced, never copied through");
+  assert.match(JSON.stringify(redacted), /\[REDACTED\]: nesting deeper than 32 levels/);
+});
+
+test("verdict rule 9: ElasticApiClient describes non-JSON bodies by status and length and echoes only documented JSON error fields", async () => {
+  const routes = healthyRoutes(healthyFixtures());
+  routes["GET /_security/user"] = htmlGateway();
+  routes["GET /_security/role_mapping"] = jsonErrorWithUrl();
+  routes["GET /_license"] = () => new Response("<html>login page</html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
+  routes["GET /_ilm/status"] = () => jsonResponse({ unexpected: `field carrying ${CANARIES.apiKey}` }, { status: 500, statusText: "Internal Server Error" });
+  const client = new ElasticApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: createRouter(routes) });
+
+  await assert.rejects(client.listUsers(), (error) => {
+    assert.ok(error instanceof ElasticRequestError);
+    assert.equal(error.status, 502);
+    assert.match(error.message, /GET \/_security\/user failed \(502 Bad Gateway\): 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
+    for (const canary of canaryValues()) assert.ok(!error.message.includes(canary), `${canary} leaked into ${error.message}`);
+    return true;
+  });
+  await assert.rejects(client.listRoleMappings(), (error) => {
+    assert.equal(error.status, 403);
+    assert.match(error.message, /security_exception/);
+    assert.match(error.message, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, "a URL embedded mid-message loses its query string");
+    assert.ok(!error.message.includes(CANARIES.urlToken));
+    assert.ok(!error.message.includes(CANARIES.bearer), "undocumented header fields are never echoed");
+    return true;
+  });
+  await assert.rejects(client.getLicense(), (error) => {
+    assert.equal(error.status, 200);
+    assert.match(error.message, /returned a 200 OK: non-JSON body \(text\/html, \d+ bytes, not echoed\); the endpoint is not serving the JSON API/);
+    assert.ok(!error.message.includes("login page"));
+    return true;
+  });
+  await assert.rejects(client.getIlmStatus(), (error) => {
+    assert.equal(error.status, 500);
+    assert.match(error.message, /500 Internal Server Error: JSON body without a documented error field \(application\/json, \d+ bytes, not echoed\)/);
+    assert.ok(!error.message.includes(CANARIES.apiKey));
+    return true;
+  });
+});
+
+test("verdict rule 9: the Elastic bundle, its zip, every assess payload, and the access check never carry canaries from bodies or collected objects", async () => {
+  const fixtures = canaryFixtures();
+  const routes = healthyRoutes(fixtures);
+  routes["GET /_security/role_mapping"] = htmlGateway();
+  routes["GET /_ssl/certificates"] = jsonErrorWithUrl();
+  const config = sampleConfig({ maxRetries: 0 });
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+  const base = createTempBase("elastic-canary-");
+
+  const access = await checkElasticAccess(client);
+  const result = await exportElasticAuditBundle(client, config, base, { sensitiveIndexPatterns: ["customers-*"] });
+  const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, {});
+  const assessments = ALL_AREAS.map((area) => evaluateElasticArea(area, snapshot, {}, { elasticsearchUrl: config.elasticsearchUrl }));
+
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size > 20 && entries.size === files.size, `expected the zip to mirror ${files.size} files, got ${entries.size}`);
+  const secrets = [...canaryValues(), API_KEY, "audit-secret-value", "enrollment-secret"];
+  assertSecretsAbsent(assert, files, secrets, "bundle file");
+  assertSecretsAbsent(assert, entries, secrets, "zip entry");
+  assertSecretsAbsent(assert, new Map([["access", JSON.stringify(access)], ["assessments", JSON.stringify(assessments)]]), secrets, "tool payload");
+
+  const errors = files.get("_errors.log");
+  assert.match(errors, /role_mappings \(GET \/_security\/role_mapping\): elasticsearch request GET \/_security\/role_mapping failed \(502 Bad Gateway\): 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/);
+  assert.match(errors, /ssl_certificates \(GET \/_ssl\/certificates\): .*403 Forbidden.*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/);
+  const roleMappings = JSON.parse(files.get("core_data/role_mappings.json"));
+  assert.equal(roleMappings.collected, false);
+  assert.equal(roleMappings.status, 502);
+  assert.match(roleMappings.error, /non-JSON body \(text\/html/);
+
+  const connectors = JSON.parse(files.get("core_data/connectors.json")).data;
+  assert.equal(connectors[0].config.url, "https://hooks.example.com", "connector URLs are reduced to origin");
+  assert.deepEqual(connectors[0].config.headers, ["Authorization", "X-Api-Key"], "header names are kept, header values are not");
+  assert.equal(connectors[0].secrets, undefined, "connector secrets are dropped by projection");
+  const watches = JSON.parse(files.get("core_data/watches.json")).data;
+  assert.equal(watches[0].actions.notify.webhook.scheme, "https");
+  assert.equal(watches[0].actions.notify.webhook.path, "[REDACTED]");
+  assert.deepEqual(watches[0].actions.notify.webhook.auth.types, ["basic"]);
+  const pipelines = JSON.parse(files.get("core_data/ingest_pipelines.json")).data;
+  assert.equal(pipelines["logs-enrich"].processors[1].set.sensitive_literal, true);
+  assert.equal(pipelines["logs-enrich"].processors[1].set.value, undefined, "set literals are classified, never copied");
+  const pipelineFinding = assessments[3].findings.find((item) => item.id === "ELASTIC-22");
+  assert.equal(pipelineFinding.status, "fail", "the projected pipeline still drives the sensitive-literal verdict");
+  assert.deepEqual(pipelineFinding.evidence.pipelines_with_sensitive_set[0].sensitive_set_processors, ["http.request.headers.authorization"]);
+});
+
+test("verdict rule 10: listApiKeys reports truncation when a full page has no search_after cursor and listFleetOutputs reports the cap and total", async () => {
+  const fixtures = healthyFixtures();
+  const now = Date.now();
+  const cursorlessKeys = Array.from({ length: 3 }, (_, index) => ({ id: `key-${index}`, name: `key-${index}`, creation: now - index * DAY_MS, invalidated: false }));
+  const routes = healthyRoutes(fixtures);
+  routes["POST /_security/_query/api_key"] = () => jsonResponse({ total: 500, count: 3, api_keys: cursorlessKeys });
+  routes["GET /api/fleet/outputs"] = { items: fixtures.fleetOutputs.concat(fixtures.fleetOutputs, fixtures.fleetOutputs), total: 7 };
+  const client = new ElasticApiClient(sampleConfig(), { fetchImpl: createRouter(routes) });
+
+  const keys = await client.listApiKeys(3, 3);
+  assert.equal(keys.seen, 3);
+  assert.equal(keys.total, 500);
+  assert.equal(keys.truncated, true, "a full page without _sort cannot be continued, so the remainder is unknown");
+
+  const routesWithCursor = healthyRoutes(fixtures);
+  let calls = 0;
+  routesWithCursor["POST /_security/_query/api_key"] = () => {
+    calls += 1;
+    return jsonResponse(calls === 1
+      ? { total: 4, count: 3, api_keys: cursorlessKeys.map((key) => ({ ...key, _sort: [key.creation, key.name] })) }
+      : { total: 4, count: 1, api_keys: [{ id: "key-last", name: "key-last", creation: now, invalidated: false, _sort: [now, "key-last"] }] });
+  };
+  const complete = await (new ElasticApiClient(sampleConfig(), { fetchImpl: createRouter(routesWithCursor) })).listApiKeys(10, 3);
+  assert.equal(complete.seen, 4);
+  assert.equal(complete.truncated, false, "an exhausted cursor walk that reaches total is complete");
+
+  const outputs = await client.listFleetOutputs(2);
+  assert.equal(outputs.seen, 2);
+  assert.equal(outputs.total, 7);
+  assert.equal(outputs.truncated, true);
+  const outputsUncapped = await client.listFleetOutputs(10);
+  assert.equal(outputsUncapped.seen, 3);
+  assert.equal(outputsUncapped.truncated, true, "fewer items than the advertised total is still truncated");
+});
+
+const ELASTIC_MULTI_INVENTORY = [
+  { id: "ELASTIC-01", assess: assessElasticIdentity, secondaries: { getXpackUsage: "xpack_usage", getClusterSettings: "cluster_settings" }, nullEvidence: { xpack_usage: ["usage_realm_types"], cluster_settings: ["realms", "secure_realm_types"] }, nullSummary: { xpack_usage: [], cluster_settings: ["realm_types", "secure_realm_types", "anonymous_roles"] } },
+  { id: "ELASTIC-13", assess: assessElasticIdentity, secondaries: { listRoleMappings: "role_mappings", getLicense: "license" }, nullEvidence: { role_mappings: ["role_mapping_count"], license: ["license_supports_sso"] }, nullSummary: { role_mappings: ["role_mappings"], license: ["license_type"] } },
+  { id: "ELASTIC-14", assess: assessElasticIdentity, secondaries: { getXpackUsage: "xpack_usage", getClusterSettings: "cluster_settings" }, nullEvidence: { xpack_usage: ["usage_anonymous_enabled"], cluster_settings: ["anonymous_roles", "anonymous_roles_grant_broad_access"] }, nullSummary: { xpack_usage: [], cluster_settings: ["anonymous_roles"] } },
+  { id: "ELASTIC-09", assess: assessElasticIdentity, secondaries: { hasPrivileges: "privileges" }, nullEvidence: { privileges: ["inspected", "active", "without_expiration", "flagged", "missing_creation_date"] }, nullSummary: { privileges: ["api_keys_complete"] } },
+  { id: "ELASTIC-10", assess: assessElasticIdentity, secondaries: { hasPrivileges: "privileges" }, nullEvidence: { privileges: ["active", "privileged", "unverifiable"] }, nullSummary: { privileges: [] } },
+  { id: "ELASTIC-06", assess: assessElasticAccessControl, secondaries: { listUsers: "users", listRoleMappings: "role_mappings" }, nullEvidence: { users: ["users_reviewed", "superusers", "superuser_count", "users_with_broad_roles"], role_mappings: ["role_mappings_reviewed", "superuser_role_mappings"] }, nullSummary: { users: ["users_reviewed", "superusers"], role_mappings: ["role_mappings_reviewed"] } },
+  { id: "ELASTIC-07", assess: assessElasticAccessControl, secondaries: { getLicense: "license", getXpackUsage: "xpack_usage" }, nullEvidence: { license: ["license_type", "license_status"], xpack_usage: ["usage_reports_in_use"] }, nullSummary: { license: ["license_type", "license_status"], xpack_usage: [] } },
+  { id: "ELASTIC-08", assess: assessElasticAccessControl, secondaries: { getLicense: "license", getXpackUsage: "xpack_usage" }, nullEvidence: { license: ["license_type"], xpack_usage: ["usage_reports_in_use"] }, nullSummary: { license: ["license_type"], xpack_usage: [] } },
+  { id: "ELASTIC-02", assess: assessElasticTransportSecurity, secondaries: { getXpackUsage: "xpack_usage", getClusterSettings: "cluster_settings" }, nullEvidence: { xpack_usage: ["usage_reported_enabled"], cluster_settings: ["per_node", "enabled_nodes"] }, nullSummary: { xpack_usage: [], cluster_settings: ["weak_protocols"] } },
+  { id: "ELASTIC-03", assess: assessElasticTransportSecurity, secondaries: { getXpackUsage: "xpack_usage", getClusterSettings: "cluster_settings" }, nullEvidence: { xpack_usage: ["usage_reported_enabled"], cluster_settings: ["per_node"] }, nullSummary: { xpack_usage: [], cluster_settings: [] } },
+  { id: "ELASTIC-04", assess: assessElasticTransportSecurity, secondaries: { getClusterSettings: "cluster_settings" }, nullEvidence: { cluster_settings: ["protocols_per_node", "weak_protocols", "unset_supported_protocols", "node_major_versions"] }, nullSummary: { cluster_settings: ["weak_protocols"] } },
+  { id: "ELASTIC-05", assess: assessElasticTransportSecurity, secondaries: { getNodeSettings: "node_settings" }, nullEvidence: { node_settings: ["nodes_in_cluster"] }, nullSummary: { node_settings: ["nodes_inspected"] } },
+  { id: "ELASTIC-11", assess: assessElasticClusterHardening, secondaries: { getLicense: "license", getXpackUsage: "xpack_usage" }, nullEvidence: { license: ["license_type"], xpack_usage: ["outputs", "usage_reported_enabled"] }, nullSummary: { license: ["license_type"], xpack_usage: ["audit_outputs"] } },
+  { id: "ELASTIC-17", assess: assessElasticClusterHardening, secondaries: { getIlmStatus: "ilm_status" }, nullEvidence: { ilm_status: ["operation_mode"] }, nullSummary: { ilm_status: ["ilm_operation_mode"] } },
+  { id: "ELASTIC-18", assess: assessElasticClusterHardening, secondaries: { listSlmPolicies: "slm_policies", getSlmStatus: "slm_status" }, nullEvidence: { slm_policies: ["slm_policy_count", "slm_policies", "slm_policies_without_last_success"], slm_status: ["slm_operation_mode"] }, nullSummary: { slm_policies: ["slm_policies"], slm_status: ["slm_operation_mode"] } },
+  { id: "ELASTIC-19", assess: assessElasticClusterHardening, secondaries: { getXpackUsage: "xpack_usage", getXpackInfo: "xpack_info" }, nullEvidence: { xpack_usage: [], xpack_info: [] }, nullSummary: { xpack_usage: ["audit_outputs"], xpack_info: [] } },
+  { id: "ELASTIC-20", assess: assessElasticClusterHardening, secondaries: { listConnectors: "connectors", listAlertingRules: "alerting_rules", listDetectionRules: "detection_rules", getLicense: "license" }, nullEvidence: { connectors: ["connectors", "insecure_connectors", "connectors_missing_secrets"], alerting_rules: ["alerting_rules", "rules_with_actions"], detection_rules: ["detection_rules", "rules_with_actions"], license: ["watcher_not_applicable"] }, nullSummary: { connectors: ["connectors"], alerting_rules: ["alerting_rules"], detection_rules: ["detection_rules"], license: ["license_type"] } },
+  { id: "ELASTIC-23", assess: assessElasticClusterHardening, secondaries: { getNodeSettings: "node_settings", listRoles: "roles", getXpackUsage: "xpack_usage", getXpackInfo: "xpack_info", listWatches: "watches" }, nullEvidence: { node_settings: ["unsupported_features"], roles: ["unsupported_features"], xpack_usage: ["unsupported_features"], xpack_info: [], watches: ["unsupported_features"] }, nullSummary: { node_settings: ["audit_enabled"], roles: [], xpack_usage: ["audit_outputs"], xpack_info: [], watches: ["watches"] } },
+  { id: "ELASTIC-15", assess: assessElasticKibana, secondaries: { listKibanaRoles: "kibana_roles" }, nullEvidence: { kibana_roles: ["space_scoped_roles", "global_all_roles"] }, nullSummary: { kibana_roles: ["kibana_roles", "global_all_roles"] } },
+  { id: "ELASTIC-21", assess: assessElasticKibana, secondaries: { listFleetOutputs: "fleet_outputs", listEnrollmentApiKeys: "fleet_enrollment_api_keys", listFleetServerHosts: "fleet_server_hosts" }, nullEvidence: { fleet_outputs: ["outputs", "insecure_outputs", "outputs_without_ca_trust"], fleet_enrollment_api_keys: ["enrollment_keys_active", "enrollment_keys_inactive", "policies_over_enrollment_key_threshold"], fleet_server_hosts: ["fleet_server_hosts", "insecure_fleet_server_hosts"] }, nullSummary: { fleet_outputs: ["fleet_outputs"], fleet_enrollment_api_keys: ["enrollment_keys"], fleet_server_hosts: ["fleet_server_hosts"] } },
+];
+
+/** Names that only ever appear in the fixture inventory they belong to, so their absence proves gating. */
+const PRINCIPAL_CANARIES = {
+  users: ["usr-canary-superadmin", "usr-canary-analyst"],
+  role_mappings: ["mapping-canary-saml"],
+  roles: ["role-canary-broad"],
+  kibana_roles: ["kbrole-canary-global"],
+  fleet_outputs: ["output-canary-plain"],
+  fleet_server_hosts: ["fleet-canary-plain"],
+  fleet_enrollment_api_keys: ["policy-canary-crowded"],
+  connectors: ["connector-canary-http"],
+  slm_policies: ["slm-canary-stale"],
+  api_keys: ["apikey-canary-stale"],
+  watches: ["watch-canary-http"],
+};
+
+function principalFixtures(now = Date.now()) {
+  const fixtures = healthyFixtures(now);
+  fixtures.users = {
+    "usr-canary-superadmin": { username: "usr-canary-superadmin", roles: ["superuser"], enabled: true, metadata: {} },
+    "usr-canary-analyst": { username: "usr-canary-analyst", roles: ["role-canary-broad"], enabled: true, metadata: {} },
+  };
+  fixtures.roles["role-canary-broad"] = { cluster: ["all"], indices: [{ names: ["*"], privileges: ["all"] }], metadata: {} };
+  fixtures.roleMappings = { "mapping-canary-saml": { enabled: true, roles: ["superuser"], rules: { field: { "realm.name": "corp_sso" } }, metadata: {} } };
+  fixtures.kibanaRoles.push({ name: "kbrole-canary-global", metadata: {}, elasticsearch: { cluster: [], indices: [] }, kibana: [{ base: ["all"], feature: {}, spaces: ["*"] }] });
+  fixtures.fleetOutputs.push({ id: "out-2", name: "output-canary-plain", type: "elasticsearch", hosts: ["http://es-plain.example.com:9200"], is_default: false });
+  fixtures.fleetServerHosts.push({ id: "fleet-2", name: "fleet-canary-plain", host_urls: ["http://fleet-plain.example.com:8220"], is_default: false });
+  fixtures.enrollmentKeys = Array.from({ length: 6 }, (_, index) => ({ id: `enroll-${index}`, active: true, policy_id: "policy-canary-crowded", api_key_id: `ak-${index}`, name: `key ${index}` }));
+  fixtures.connectors.push({ id: "connector-2", name: "connector-canary-http", connector_type_id: ".webhook", is_missing_secrets: true, config: { url: "http://hooks.example.com/plain" } });
+  fixtures.slmPolicies["slm-canary-stale"] = { version: 1, repository: "backups", policy: { indices: ["*"] } };
+  fixtures.apiKeys.push({ id: "key-2", name: "apikey-canary-stale", type: "rest", creation: now - 400 * DAY_MS, invalidated: false, username: "auditor", realm: "native1", metadata: {}, role_descriptors: { reader: { cluster: ["all"] } }, _sort: [now - 400 * DAY_MS, "apikey-canary-stale"] });
+  fixtures.watches.push({ _id: "watch-canary-http", watch: { trigger: {}, actions: { hook: { webhook: { scheme: "http", host: "hooks.example.com", port: 80 } } } } });
+  return fixtures;
+}
+
+function leaves(value, path = "", output = []) {
+  if (value !== null && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) leaves(entry, path ? `${path}.${key}` : key, output);
+  } else {
+    output.push([path, value]);
+  }
+  return output;
+}
+
+function pluck(value, path) {
+  return path.split(".").reduce((cursor, key) => (cursor === null || cursor === undefined ? undefined : cursor[key]), value);
+}
+
+test("verdict rule 1 corollary: Elastic findings that read several inventories never pass, name the unreadable inventory, render its counts null, and name no principal from it", async () => {
+  const fixtures = principalFixtures();
+  const options = { sensitiveIndexPatterns: ["customers-*"], tenantIndexPatterns: ["tenant-*"] };
+  const checked = [];
+  for (const entry of ELASTIC_MULTI_INVENTORY) {
+    const baseline = await entry.assess(stubClient(fixtures), options);
+    const baselineFinding = findingById(baseline, entry.id);
+    for (const [method, dataset] of Object.entries(entry.secondaries)) {
+      const result = await entry.assess(stubClient(fixtures, { [method]: forbidden(`request ${method} failed (403 Forbidden): action is unauthorized for user [grc-auditor]`) }), options);
+      const finding = findingById(result, entry.id);
+      const label = `${entry.id} with ${dataset} forbidden`;
+      assert.notEqual(finding.status, "pass", `${label} must not pass (was ${finding.status}: ${finding.summary})`);
+      assert.ok(finding.summary.includes(dataset), `${label}: summary must name the unreadable inventory, got: ${finding.summary}`);
+      const sources = [...(finding.evidence.unreadable_sources ?? []), ...(finding.evidence.unchecked_sources ?? []), ...(finding.evidence.partial_sources ?? [])];
+      assert.ok(sources.some((source) => source.startsWith(`${dataset} (`)), `${label}: evidence must list ${dataset} among unreadable/unchecked sources, got ${JSON.stringify(sources)}`);
+      if (finding.status === "manual") assert.match(finding.summary, /Collect manually:/, `${label}: manual verdicts say what a human must collect`);
+      for (const field of entry.nullEvidence[dataset] ?? []) {
+        const value = pluck(finding.evidence, field);
+        assert.equal(value, null, `${label}: evidence.${field} must render null, got ${JSON.stringify(value)} (baseline ${JSON.stringify(pluck(baselineFinding.evidence, field))})`);
+      }
+      for (const field of entry.nullSummary[dataset] ?? []) {
+        assert.equal(result.summary[field], null, `${label}: summary.${field} must render null, got ${JSON.stringify(result.summary[field])}`);
+      }
+      for (const [path, value] of leaves(finding.evidence)) {
+        if (path.startsWith("unreadable_sources") || path.startsWith("unchecked_sources") || path.startsWith("partial_sources") || path.startsWith("inventories") || path.startsWith("inventory")) continue;
+        const baselineValue = pluck(baselineFinding.evidence, path);
+        if ((value === 0 || value === "none") && baselineValue !== 0 && baselineValue !== "none" && baselineValue !== undefined) {
+          assert.fail(`${label}: evidence.${path} fell back to ${JSON.stringify(value)} from baseline ${JSON.stringify(baselineValue)} instead of null`);
+        }
+      }
+      const serialized = JSON.stringify(finding);
+      for (const principal of PRINCIPAL_CANARIES[dataset] ?? []) {
+        assert.ok(!serialized.includes(principal), `${label}: ${principal} is named from the denied ${dataset} inventory`);
+      }
+      const inventories = finding.evidence.inventories ?? (finding.evidence.inventory ? [finding.evidence.inventory] : []);
+      for (const inventory of inventories) {
+        if (inventory.dataset === dataset) {
+          assert.equal(inventory.read, false, `${label}: inventory state for ${dataset} must say it was not read`);
+          assert.equal(inventory.seen, null);
+          assert.equal(inventory.complete, false);
+        }
+      }
+      checked.push(label);
+    }
+  }
+  assert.ok(checked.length >= 38, `expected every multi-inventory pairing to be exercised, got ${checked.length}`);
+});
+
+test("verdict rule 1 corollary: Elastic findings keep judging readable inventories and still fail on them while a secondary is unreadable", async () => {
+  const fixtures = principalFixtures();
+  const rbac = findingById(await assessElasticAccessControl(stubClient(fixtures, { listRoleMappings: forbidden("request listRoleMappings failed (403 Forbidden)") })), "ELASTIC-06");
+  assert.equal(rbac.status, "fail", "a violation observed in the readable users inventory is a real finding and is not hidden behind manual");
+  assert.equal(rbac.evidence.observed_status, "fail");
+  assert.match(rbac.summary, /Additional sources were unreadable or partial: role_mappings \(GET \/_security\/role_mapping\): request listRoleMappings failed \(403 Forbidden\)/);
+  assert.match(rbac.summary, /The picture is incomplete until a human collects: /, "an unreadable essential inventory still says what a human must collect");
+  assert.equal(typeof rbac.evidence.manual_evidence, "string");
+  assert.equal(rbac.evidence.superuser_role_mappings, null);
+  assert.equal(rbac.evidence.role_mappings_reviewed, null);
+  assert.deepEqual(rbac.evidence.superusers, ["usr-canary-superadmin"], "principals from the readable users inventory are still named");
+  assert.ok(!JSON.stringify(rbac).includes("mapping-canary-saml"), "no principal is named from the denied role_mappings inventory");
+
+  const rbacNoViolation = findingById(await assessElasticAccessControl(stubClient(healthyFixtures(), { listRoleMappings: forbidden("request listRoleMappings failed (403 Forbidden)") })), "ELASTIC-06");
+  assert.equal(rbacNoViolation.status, "manual", "without an observed violation, an unreadable essential inventory leaves the verdict unknown");
+  assert.equal(rbacNoViolation.evidence.observed_status, "pass");
+  assert.match(rbacNoViolation.summary, /Verdict is unknown because required evidence could not be read: role_mappings \(GET \/_security\/role_mapping\)/);
+
+  const realms = findingById(await assessElasticIdentity(stubClient(fixtures, { getXpackUsage: forbidden("request getXpackUsage failed (403 Forbidden)") })), "ELASTIC-01");
+  assert.equal(realms.status, "warn");
+  assert.match(realms.summary, /Secure authentication realms are enabled beyond native\/file: saml/);
+  assert.match(realms.summary, /not checked because they could not be read: xpack_usage \(GET \/_xpack\/usage\)/);
+  assert.equal(realms.evidence.usage_realm_types, null);
+
+  fixtures.nodeSettings.nodes["node-1"].settings["xpack.security.transport.ssl.enabled"] = "false";
+  const transport = findingById(await assessElasticTransportSecurity(stubClient(fixtures, { getXpackUsage: forbidden("request getXpackUsage failed (403 Forbidden)") })), "ELASTIC-02");
+  assert.equal(transport.status, "fail", "a violation observed in readable settings still fails");
+  assert.match(transport.summary, /Additional sources were unreadable or partial: xpack_usage/);
+});
+
+test("verdict rule 5 / addendum 3: a truncated API key inventory never names a key and renders every count null", async () => {
+  const now = Date.now();
+  const fixtures = principalFixtures(now);
+  const truncatedKeys = pagedList(fixtures.apiKeys, 5000, true, 1);
+  const result = await assessElasticIdentity(stubClient(fixtures, { listApiKeys: async () => truncatedKeys }));
+  for (const id of ["ELASTIC-09", "ELASTIC-10"]) {
+    const finding = findingById(result, id);
+    assert.notEqual(finding.status, "pass");
+    assert.match(finding.summary, /api_keys inventory was not fully read \(2 key\(s\) seen of 5000 total\), so violators are neither counted nor named/);
+    assert.ok(!JSON.stringify(finding).includes("apikey-canary-stale"), `${id} names a key from the truncated inventory`);
+    assert.equal(finding.evidence.inventory.complete, false);
+    assert.equal(finding.evidence.inventory.seen, 2);
+    assert.equal(finding.evidence.inventory.total, 5000);
+    assert.equal(finding.evidence.active, null);
+    assert.equal(finding.evidence.inspected, null);
+    assert.equal(finding.evidence.violation_observed, true, "a violation seen among the read keys is still reported without naming it");
+  }
+  assert.equal(findingById(result, "ELASTIC-09").status, "fail");
+  assert.equal(findingById(result, "ELASTIC-09").evidence.flagged, null);
+  assert.equal(findingById(result, "ELASTIC-10").evidence.privileged, null);
+  assert.equal(result.summary.api_keys_complete, false);
+  assert.equal(result.summary.api_keys_total, 5000);
+  assert.match(result.truncated[0], /api_keys \(POST \/_security\/_query\/api_key\?with_limited_by=true\): truncated after 2 of 5000/);
+});
+
+test("addendum 5: access check surfaces and collection_status render collected/count/truncated as null for reads that never completed", async () => {
+  const fixtures = healthyFixtures();
+  const routes = healthyRoutes(fixtures);
+  routes["GET /_security/role_mapping"] = jsonErrorWithUrl();
+  routes["POST /_security/user/_has_privileges"] = htmlGateway();
+  const config = sampleConfig({ maxRetries: 0, kibanaUrl: undefined });
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(routes) });
+
+  const access = await checkElasticAccess(client);
+  const denied = access.surfaces.find((surface) => surface.name === "role_mappings");
+  assert.deepEqual({ status: denied.status, collected: denied.collected, http_status: denied.http_status, count: denied.count, truncated: denied.truncated }, { status: "not_readable", collected: false, http_status: 403, count: null, truncated: null });
+  const readable = access.surfaces.find((surface) => surface.name === "api_keys");
+  assert.deepEqual({ collected: readable.collected, http_status: readable.http_status, count: readable.count, truncated: readable.truncated }, { collected: true, http_status: null, count: 1, truncated: false });
+  const skipped = access.surfaces.find((surface) => surface.name === "kibana_spaces");
+  assert.deepEqual({ status: skipped.status, collected: skipped.collected, http_status: skipped.http_status, count: skipped.count, truncated: skipped.truncated }, { status: "not_configured", collected: false, http_status: null, count: null, truncated: null });
+  assert.equal(access.privilegeProbe, "not_readable");
+  assert.equal(access.missingClusterPrivileges, null, "a failed privilege probe leaves missing privileges unknown, not empty");
+  assert.equal(access.missingIndexPrivileges, null);
+  assert.equal(access.status, "limited");
+  assert.ok(access.notes.some((note) => /Privilege probe failed, so missing privileges are unknown: .*502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)/.test(note)), access.notes.join("\n"));
+  for (const canary of canaryValues()) assert.ok(!JSON.stringify(access).includes(canary));
+
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-collection-status-"));
+  const status = JSON.parse(readFileSync(join(result.outputDir, "collection_status.json"), "utf8"));
+  const deniedStatus = status.datasets.find((dataset) => dataset.name === "role_mappings");
+  assert.deepEqual(
+    { collected: deniedStatus.collected, status: deniedStatus.status, http_status: deniedStatus.http_status, count: deniedStatus.count, truncated: deniedStatus.truncated, paged: deniedStatus.paged, seen: deniedStatus.seen },
+    { collected: false, status: "not_readable", http_status: 403, count: null, truncated: null, paged: null, seen: null },
+  );
+  const keyStatus = status.datasets.find((dataset) => dataset.name === "api_keys");
+  assert.deepEqual({ collected: keyStatus.collected, truncated: keyStatus.truncated, seen: keyStatus.seen, total: keyStatus.total }, { collected: true, truncated: false, seen: 1, total: 1 });
+  const skippedStatus = status.datasets.find((dataset) => dataset.name === "connectors");
+  assert.deepEqual({ collected: skippedStatus.collected, status: skippedStatus.status, truncated: skippedStatus.truncated, http_status: skippedStatus.http_status }, { collected: false, status: "not_configured", truncated: null, http_status: null });
+  assert.equal(status.totals.not_readable, 2, "role_mappings and the privilege probe were denied");
+  assert.equal(status.totals.truncation_unknown, status.totals.not_readable + status.totals.not_configured);
+  assert.equal(result.notCollectedCount, status.totals.not_configured);
+  assert.equal(result.truncatedCount, 0);
+});
+
+test("addendum 5: denied list datasets write a not-collected marker in core_data while readable-but-empty datasets stay []", async () => {
+  // role_mappings is keyed by mapping name in the Elasticsearch API, so its readable-but-empty shape is {}.
+  const denials = [
+    ["role_mappings", "GET /_security/role_mapping", "object"],
+    ["ssl_certificates", "GET /_ssl/certificates", "array"],
+    ["api_keys", "POST /_security/_query/api_key", "array"],
+    ["watches", "POST /_watcher/_query/watches", "array"],
+    ["connectors", "GET /api/actions/connectors", "array"],
+    ["fleet_outputs", "GET /api/fleet/outputs", "array"],
+  ];
+  const isEmptyNativeShape = (data, shape) => (shape === "array"
+    ? Array.isArray(data) && data.length === 0
+    : !Array.isArray(data) && data !== null && typeof data === "object" && Object.keys(data).length === 0);
+  for (const [dataset, route] of denials) {
+    const fixtures = emptyInventoryFixtures();
+    const routes = healthyRoutes(fixtures);
+    routes[route] = jsonErrorWithUrl();
+    const config = sampleConfig({ maxRetries: 0 });
+    const result = await exportElasticAuditBundle(new ElasticApiClient(config, { fetchImpl: createRouter(routes) }), config, createTempBase(`elastic-marker-${dataset}-`));
+    const files = readBundleFiles(result.outputDir);
+    const file = JSON.parse(files.get(`core_data/${dataset}.json`));
+    assert.equal(file.collected, false, `${dataset}: denied dataset must carry collected: false`);
+    assert.equal(file.status, 403, `${dataset}: the marker carries the observed HTTP status`);
+    assert.equal(`${file.endpoint}`.split("?")[0], route, `${dataset}: the marker names the endpoint that was requested`);
+    assert.match(file.error, /403 Forbidden/);
+    assert.equal(file.reason, "not_readable");
+    assert.ok(!Array.isArray(file.data), `${dataset}: data must be the marker object, never []`);
+    assert.equal(file.data.collected, false);
+    assert.equal(file.data.status, 403);
+    for (const [other, otherRoute, shape] of denials) {
+      if (other === dataset) continue;
+      const readable = JSON.parse(files.get(`core_data/${other}.json`));
+      assert.equal(readable.collected, true, `${other} is readable when only ${dataset} is denied`);
+      assert.equal(readable.status, "readable");
+      assert.ok(isEmptyNativeShape(readable.data, shape), `${other}: readable-but-empty stays ${shape === "array" ? "[]" : "{}"}, got ${JSON.stringify(readable.data)} (route ${otherRoute})`);
+      assert.equal(readable.data.collected, undefined, `${other}: an empty inventory never carries a marker field`);
+    }
+    for (const canary of canaryValues()) assertSecretsAbsent(assert, files, [canary], `marker bundle for ${dataset}`);
+  }
+});
+
+function mentionedEndpoints(text) {
+  return [...text.matchAll(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_./?=&*<>-]+)/g)].map((match) => ({ method: match[1], path: match[2].split("?")[0].replace(/[.,;:)]+$/, "") }));
+}
+
+function mentionedStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\b([1-5]\d\d) (?:OK|Forbidden|Unauthorized|Bad Gateway|Not Found|Internal Server Error|Service Unavailable|Gateway Timeout|Error)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"(?:http_)?status":\s*([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/\bstatus(?:Code)? ([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  return [...codes];
+}
+
+test("addendum 5: every endpoint and status code named in Elastic output corresponds to a request the run made and observed", async () => {
+  const fixtures = canaryFixtures();
+  const routes = healthyRoutes(fixtures);
+  routes["GET /_security/role_mapping"] = htmlGateway();
+  routes["GET /_ssl/certificates"] = jsonErrorWithUrl();
+  routes["GET /api/fleet/outputs"] = () => jsonResponse({ statusCode: 403, error: "Forbidden", message: "missing fleet read" }, { status: 403, statusText: "Forbidden" });
+  const log = [];
+  const config = sampleConfig({ maxRetries: 0, kibanaSpaceId: "audit" });
+  const client = new ElasticApiClient(config, { fetchImpl: createLoggingRouter(routes, log) });
+
+  const access = await checkElasticAccess(client);
+  const result = await exportElasticAuditBundle(client, config, createTempBase("elastic-request-log-"), { sensitiveIndexPatterns: ["customers-*"] });
+  const files = readBundleFiles(result.outputDir);
+  const outputs = [...files.values(), JSON.stringify(access)];
+
+  const requested = new Set(log.map((entry) => `${entry.method} ${entry.path.replace(/^\/s\/[^/]+/, "")}`));
+  const statuses = new Set(log.map((entry) => entry.status));
+  assert.ok(statuses.has(502) && statuses.has(403) && statuses.has(200), `fixture must have served 200, 403, and 502; got ${[...statuses]}`);
+  let endpointMentions = 0;
+  let statusMentions = 0;
+  for (const text of outputs) {
+    for (const { method, path } of mentionedEndpoints(text)) {
+      endpointMentions += 1;
+      assert.ok(requested.has(`${method} ${path}`), `output names ${method} ${path} but the run never requested it; requested: ${[...requested].sort().join(", ")}`);
+    }
+    for (const code of mentionedStatusCodes(text)) {
+      statusMentions += 1;
+      assert.ok(statuses.has(code), `output names HTTP ${code} but no request observed it; observed: ${[...statuses]}`);
+    }
+  }
+  assert.ok(endpointMentions > 30, `expected endpoint mentions across the bundle, got ${endpointMentions}`);
+  assert.ok(statusMentions > 3, `expected status mentions across the bundle, got ${statusMentions}`);
+  assert.ok(log.some((entry) => entry.path.startsWith("/s/audit/api/")), "Kibana requests carry the configured space prefix");
+
+  // Kibana not configured: no Kibana endpoint may be named because none was requested.
+  const noKibanaLog = [];
+  const noKibanaConfig = sampleConfig({ maxRetries: 0, kibanaUrl: undefined });
+  const noKibana = await exportElasticAuditBundle(new ElasticApiClient(noKibanaConfig, { fetchImpl: createLoggingRouter(healthyRoutes(healthyFixtures()), noKibanaLog) }), noKibanaConfig, createTempBase("elastic-no-kibana-"));
+  const noKibanaRequested = new Set(noKibanaLog.map((entry) => `${entry.method} ${entry.path}`));
+  assert.ok(![...noKibanaRequested].some((entry) => entry.includes("/api/")), "no Kibana request is made without KIBANA_URL");
+  for (const [name, text] of readBundleFiles(noKibana.outputDir)) {
+    for (const { method, path } of mentionedEndpoints(text)) {
+      assert.ok(noKibanaRequested.has(`${method} ${path}`), `${name} names ${method} ${path} although Kibana was never requested`);
+    }
   }
 });

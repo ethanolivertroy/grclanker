@@ -186,7 +186,8 @@ export type ElasticTarget = "elasticsearch" | "kibana" | "cloud";
 export interface ElasticAccessSurface {
   name: string;
   target: ElasticTarget;
-  endpoint: string;
+  /** Endpoint that was requested; null when the surface was never requested because its target is not configured. */
+  endpoint: string | null;
   status: "readable" | "not_readable" | "not_configured";
   /** True only when the request was made and answered with a readable payload. */
   collected: boolean;
@@ -611,7 +612,10 @@ function isSecretKey(key: string, parentKey: string | undefined): boolean {
   const last = segments[segments.length - 1] ?? key;
   if (/^(is|has)_/i.test(last)) return false;
   if (SECRET_KEY_PATTERN.test(last) || SECRET_KEY_SUFFIX_PATTERN.test(last)) return true;
-  return /^key$/i.test(last) && /^(ssl|tls|keystore|secrets)$/i.test(parentKey ?? segments[segments.length - 2] ?? "");
+  // Flat dotted settings keys ("xpack.security.http.ssl.key") carry their own parent segment,
+  // which takes precedence over the enclosing object key ("persistent").
+  const parent = segments.length > 1 ? segments[segments.length - 2] : parentKey;
+  return /^key$/i.test(last) && /^(ssl|tls|keystore|secrets)$/i.test(parent ?? "");
 }
 
 function isRedactableValue(value: unknown): boolean {
@@ -1227,9 +1231,9 @@ export class ElasticApiClient {
     return asObject(await this.esGet("/_security/role_mapping")) ?? {};
   }
 
-  async listApiKeys(limit = DEFAULT_API_KEY_LIMIT): Promise<ElasticPagedList> {
+  async listApiKeys(limit = DEFAULT_API_KEY_LIMIT, pageSize = DEFAULT_API_KEY_PAGE_SIZE): Promise<ElasticPagedList> {
     const maxItems = clampNumber(limit, DEFAULT_API_KEY_LIMIT, 1, 10_000);
-    const size = Math.min(DEFAULT_API_KEY_PAGE_SIZE, maxItems);
+    const size = Math.min(clampNumber(pageSize, DEFAULT_API_KEY_PAGE_SIZE, 1, 10_000), maxItems);
     const items: JsonRecord[] = [];
     let searchAfter: unknown[] | undefined;
     let total: number | undefined;
@@ -1584,7 +1588,7 @@ export function listSnapshotErrors(snapshot: ElasticSnapshot): string[] {
 export function listSnapshotSkips(snapshot: ElasticSnapshot): string[] {
   return Object.values(snapshot)
     .filter((dataset): dataset is ElasticDataset => Boolean(dataset?.skipped))
-    .map((dataset) => `${dataset.name} (${dataset.endpoint}): not requested, ${dataset.skipped}`);
+    .map((dataset) => `${dataset.name}: not requested, ${dataset.skipped}`);
 }
 
 /** Lists paged datasets whose collection stopped before the inventory was exhausted. */
@@ -1614,7 +1618,11 @@ function dependencyProblems(snapshot: ElasticSnapshot, names: ElasticDatasetName
   return names
     .map((name) => {
       const problem = datasetProblem(snapshot, name);
-      return problem ? `${name} (${DATASET_SPECS[name].endpoint}): ${problem}` : undefined;
+      if (!problem) return undefined;
+      // A dataset that was never requested (not configured, or not part of this run) names no
+      // endpoint, because no request was observed.
+      if (!snapshot[name]) return `${name}: not collected in this run`;
+      return snapshot[name]?.skipped ? `${name}: not requested, ${problem}` : `${name} (${DATASET_SPECS[name].endpoint}): ${problem}`;
     })
     .filter((item): item is string => Boolean(item));
 }
@@ -1659,13 +1667,22 @@ function guardedFinding(
   const unchecked = guard.unchecked ?? [];
   const evidence: JsonRecord = {
     ...(computed.evidence ?? {}),
+    /** What the readable sources alone showed, before the guard demoted the verdict. */
+    observed_status: computed.status,
     unreadable_sources: guard.problems,
     partial_sources: guard.partial,
     unchecked_sources: unchecked,
   };
   if (computed.status === "fail") {
+    // A violation observed in readable inventories is a real finding and stays fail (evaluators
+    // never derive a fail from an unread inventory's fallback); the unread sources are still named
+    // and, when essential, the summary says what a human must collect to complete the picture.
     const notes = [...guard.problems, ...guard.partial, ...unchecked];
-    return finding(number, severity, "fail", notes.length > 0 ? `${computed.summary} Additional sources were unreadable or partial: ${notes.join("; ")}.` : computed.summary, evidence);
+    const collect = guard.problems.length > 0 ? ` The picture is incomplete until a human collects: ${guard.collect}` : "";
+    return finding(number, severity, "fail", notes.length > 0 ? `${computed.summary} Additional sources were unreadable or partial: ${notes.join("; ")}.${collect}` : computed.summary, {
+      ...evidence,
+      ...(guard.problems.length > 0 ? { manual_evidence: guard.collect } : {}),
+    });
   }
   if (guard.problems.length > 0) {
     return manualFinding(
@@ -1727,15 +1744,21 @@ function principalsWhenComplete<T>(complete: boolean, items: T[], cap = 25): T[]
   return complete ? items.slice(0, cap) : null;
 }
 
-/** Describes what an inventory contributed: read completely, read partially, or not read at all. */
-function inventoryState(snapshot: ElasticSnapshot, name: ElasticDatasetName, seen: number | undefined, extraPartial = false): JsonRecord {
+/**
+ * Describes what an inventory contributed: read completely, read partially, or not read at all.
+ * `extraPartial` is `true` when a source outside pagination proves the view partial (a single-node
+ * view, a credential that only sees its own keys) and `null` when that could not be determined, in
+ * which case `complete` renders null rather than defaulting to true.
+ */
+function inventoryState(snapshot: ElasticSnapshot, name: ElasticDatasetName, seen: number | undefined, extraPartial: boolean | null = false): JsonRecord {
   const readable = datasetReadable(snapshot, name);
   const page = datasetPage(snapshot, name);
+  const complete = !readable || page?.truncated === true || extraPartial === true ? false : extraPartial === null ? null : true;
   return {
     dataset: name,
-    endpoint: DATASET_SPECS[name].endpoint,
+    endpoint: snapshot[name]?.skipped ? null : DATASET_SPECS[name].endpoint,
     read: readable,
-    complete: readable && page?.truncated !== true && !extraPartial,
+    complete,
     seen: readable ? seen ?? page?.seen ?? null : null,
     total: readable ? page?.total ?? seen ?? null : null,
     status: readable ? "readable" : snapshot[name]?.skipped ? "not_configured" : "not_readable",
@@ -2185,7 +2208,10 @@ export function evaluateElasticIdentity(
       : []),
   ];
   const apiKeysComplete = apiKeysReadable && apiKeyProblems.length === 0 && apiKeyPartial.length === 0;
-  const apiKeyInventory = inventoryState(snapshot, "api_keys", apiKeys?.length, apiKeyVisibility === false);
+  // Completeness is known false when pagination or visibility proved the view partial, unknown (null)
+  // when the visibility probe could not be read, and true only when both were observed.
+  const apiKeysCompleteness: boolean | null = !apiKeysReadable ? null : apiKeyPartial.length > 0 ? false : apiKeyVisibility === undefined ? null : true;
+  const apiKeyInventory = inventoryState(snapshot, "api_keys", apiKeys?.length, apiKeyVisibility === undefined ? null : apiKeyVisibility === false);
   const keyInventoryLabel = apiKeysReadable
     ? `${apiKeys.length} key(s) seen${apiKeyPage?.total !== undefined ? ` of ${apiKeyPage.total} total` : ""}`
     : "api_keys unread";
@@ -2310,7 +2336,7 @@ export function evaluateElasticIdentity(
       anonymous_roles: whenRead(settingsReadable, anonymousRoles),
       api_keys_inspected: countWhenRead(apiKeysReadable, apiKeys?.length ?? 0),
       api_keys_total: whenRead(apiKeysReadable, apiKeyPage?.total ?? null),
-      api_keys_complete: apiKeysReadable ? apiKeysComplete : null,
+      api_keys_complete: apiKeysCompleteness,
       api_key_full_visibility: apiKeyVisibility ?? null,
       role_mappings: countWhenRead(roleMappingsReadable, Object.keys(roleMappings ?? {}).length),
       license_type: whenRead(licenseData !== undefined, license.type ?? null),
@@ -2755,7 +2781,7 @@ export function evaluateElasticTransportSecurity(
   const nodeHeaderTotal = asNumber(asObject(nodeSettings?._nodes)?.total);
   const nodeTotal = nodeHeaderTotal ?? (nodeSettings !== undefined ? view.nodes.length : undefined);
   const certificatePartial = nodeSettings === undefined
-    ? [`GET /_ssl/certificates reports only the node that handled the request and the node inventory could not be read (${datasetProblem(snapshot, "node_settings") ?? "node_settings unread"}), so certificates on other nodes are unknown`]
+    ? dependencyProblems(snapshot, ["node_settings"]).map((problem) => `${problem}; GET /_ssl/certificates reports only the node that handled the request, so without the node inventory certificates on other nodes are unknown`)
     : (nodeTotal ?? 0) > 1
       ? [`GET /_ssl/certificates reports only the node that handled the request, but the cluster has ${nodeTotal} nodes; run the check against each node to cover every keystore and truststore`]
       : [];
@@ -2769,7 +2795,7 @@ export function evaluateElasticTransportSecurity(
           ? "the certificate inventory could not be read."
           : `All ${inventory.length} TLS certificates on the responding node report an expiry date and remain valid for at least ${warningDays} more days${nodeTotal === 1 ? " (single-node cluster, so the inventory is complete)" : ""}.`,
     evidence: {
-      inventory: inventoryState(snapshot, "ssl_certificates", certificates?.length, (nodeTotal ?? 2) > 1),
+      inventory: inventoryState(snapshot, "ssl_certificates", certificates?.length, nodeTotal === undefined ? null : nodeTotal > 1),
       certificates: principalsWhenComplete(certificatesComplete, inventory),
       certificate_count: countWhenRead(certificatesComplete, inventory.length),
       expired: countWhenRead(certificatesComplete, expired.length),
@@ -3728,7 +3754,7 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
     return {
       name,
       target: dataset.target,
-      endpoint: dataset.endpoint,
+      endpoint: dataset.skipped ? null : dataset.endpoint,
       status: dataset.skipped ? "not_configured" : dataset.error ? "not_readable" : "readable",
       collected,
       http_status: dataset.status ?? null,
@@ -3958,7 +3984,8 @@ function buildQuickReference(): string {
 export interface ElasticNotCollectedMarker {
   collected: false;
   status: number | "error" | "not-collected";
-  endpoint: string;
+  /** The endpoint that failed; null when the dataset was never requested, so no unobserved endpoint is named. */
+  endpoint: string | null;
   target: ElasticTarget;
   error: string | null;
   reason: "not_readable" | "not_configured";
@@ -3968,7 +3995,7 @@ function notCollectedMarker(dataset: ElasticDataset): ElasticNotCollectedMarker 
   return {
     collected: false,
     status: dataset.skipped ? "not-collected" : dataset.status ?? "error",
-    endpoint: dataset.endpoint,
+    endpoint: dataset.skipped ? null : dataset.endpoint,
     target: dataset.target,
     error: dataset.error ?? dataset.skipped ?? null,
     reason: dataset.skipped ? "not_configured" : "not_readable",
@@ -3999,7 +4026,7 @@ export function buildCollectionStatus(snapshot: ElasticSnapshot): JsonRecord {
     const collected = dataset.error === undefined && dataset.skipped === undefined;
     return {
       name: dataset.name,
-      endpoint: dataset.endpoint,
+      endpoint: dataset.skipped ? null : dataset.endpoint,
       target: dataset.target,
       status: collected ? "readable" : dataset.skipped ? "not_configured" : "not_readable",
       collected,
