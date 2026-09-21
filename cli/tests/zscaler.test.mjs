@@ -1676,6 +1676,202 @@ test("self-check (c): a single partial dataset caps exactly the controls that re
   assert.match(assessZpaData(connectors).findings.find((item) => item.id === "ZS-11").summary, /every enabled connector group that was read has at least two connected connectors\. The connector group inventory is partial/);
 });
 
+const UNREADABLE_DATASET_DEPENDENTS = {
+  access: {
+    adminUsers: ["GET /adminUsers", { primary: ["ZS-06", "ZS-07"] }],
+    adminRoles: ["GET /adminRoles/lite", { primary: ["ZS-07"] }],
+    authSettings: ["GET /authSettings", { secondary: ["ZS-06"] }],
+    passwordExpiry: ["GET /passwordExpiry/settings", { secondary: ["ZS-07"] }],
+    auditLogReport: ["GET /auditlogEntryReport", { primary: ["ZS-14"] }],
+    nssFeeds: ["GET /nssFeeds", { secondary: ["ZS-14"] }],
+  },
+  policy: {
+    urlFilteringRules: ["GET /urlFilteringRules", { primary: ["ZS-01", "ZS-17"] }],
+    firewallRules: ["GET /firewallFilteringRules", { primary: ["ZS-02"] }],
+    dnsRules: ["GET /firewallDnsRules", { primary: ["ZS-20"] }],
+    dlpEngines: ["GET /dlpEngines", { primary: ["ZS-03"] }],
+    dlpDictionaries: ["GET /dlpDictionaries", { secondary: ["ZS-03"] }],
+    webDlpRules: ["GET /webDlpRules", { primary: ["ZS-03"] }],
+    sslInspectionRules: ["GET /sslInspectionRules", { primary: ["ZS-04"] }],
+    sslExemptedUrls: ["GET /sslSettings/exemptedUrls", { secondary: ["ZS-04"] }],
+    sandboxRules: ["GET /sandboxRules", { primary: ["ZS-05"] }],
+    sandboxSettings: ["GET /behavioralAnalysisAdvancedSettings", { secondary: ["ZS-05"] }],
+    advancedThreatSettings: ["GET /cyberThreatProtection/advancedThreatSettings", { primary: ["ZS-25"], secondary: ["ZS-20"] }],
+    malwarePolicy: ["GET /cyberThreatProtection/malwarePolicy", { secondary: ["ZS-25"] }],
+    malwareSettings: ["GET /cyberThreatProtection/malwareSettings", { primary: ["ZS-25"] }],
+    securityAllowlist: ["GET /security", { secondary: ["ZS-25"] }],
+    securityDenylist: ["GET /security/advanced", { secondary: ["ZS-25"] }],
+    locations: ["GET /locations", { primary: ["ZS-18"], secondary: ["ZS-04"] }],
+    subLocations: ["GET /locations/{locationId}/sublocations", { secondary: ["ZS-18"] }],
+    greTunnels: ["GET /greTunnels", { secondary: ["ZS-18"] }],
+    vpnCredentials: ["GET /vpnCredentials", { secondary: ["ZS-18"] }],
+    bandwidthRules: ["GET /bandwidthControlRules", { primary: ["ZS-16"] }],
+    isolationProfiles: ["GET /browserIsolation/profiles", { primary: ["ZS-17"] }],
+    cloudAppRules: ["GET /webApplicationRules/{ruleType}", { primary: ["ZS-19"] }],
+  },
+  zpa: {
+    applicationSegments: ["GET /application", { primary: ["ZS-08"] }],
+    segmentGroups: ["GET /segmentGroup", { secondary: ["ZS-08"] }],
+    accessRules: ["GET /policySet/rules/policyType/ACCESS_POLICY", { primary: ["ZS-09", "ZS-10"], secondary: ["ZS-15"] }],
+    timeoutRules: ["GET /policySet/rules/policyType/TIMEOUT_POLICY", { primary: ["ZS-13"] }],
+    forwardingRules: ["GET /policySet/rules/policyType/CLIENT_FORWARDING_POLICY", { primary: ["ZS-22"], secondary: ["ZS-15"] }],
+    isolationRules: ["GET /policySet/rules/policyType/ISOLATION_POLICY", {}],
+    appConnectorGroups: ["GET /appConnectorGroup", { secondary: ["ZS-11"] }],
+    appConnectors: ["GET /connector", { primary: ["ZS-11"] }],
+    serviceEdgeGroups: ["GET /serviceEdgeGroup", { secondary: ["ZS-21"] }],
+    serviceEdges: ["GET /serviceEdge", { primary: ["ZS-21"] }],
+    postureProfiles: ["GET /posture", { primary: ["ZS-10"] }],
+    trustedNetworks: ["GET /network", { primary: ["ZS-15"] }],
+    idpControllers: ["GET /idp", { primary: ["ZS-12"] }],
+    samlAttributes: ["GET /samlAttribute", { secondary: ["ZS-12"] }],
+    scimGroups: ["GET /scimgroup/idpId/{idpId}", { secondary: ["ZS-12"] }],
+    enrollmentCertificates: ["GET /enrollmentCert", { primary: ["ZS-24"] }],
+    browserAccessCertificates: ["GET /clientlessCertificate/issued", { secondary: ["ZS-24"] }],
+    emergencyAccessUsers: ["GET /emergencyAccess/users", { primary: ["ZS-23"] }],
+    administrators: ["GET /administrators", { secondary: ["ZS-12"] }],
+  },
+};
+
+function unreadableDataset(dataset, endpoint) {
+  return {
+    data: Array.isArray(dataset.data) ? [] : {},
+    error: `stub ${endpoint} failed (403): forbidden`,
+    statusCode: 403,
+  };
+}
+
+test("rule 1: every unreadable dataset demotes exactly the findings that read it, primary to manual and secondary to warn", () => {
+  const suites = {
+    access: [accessControlFixture, assessZiaAccessControlData],
+    policy: [policyFixture, assessZiaPolicyData],
+    zpa: [zpaFixture, assessZpaData],
+  };
+  let datasetCount = 0;
+  for (const [suite, [build, assess]] of Object.entries(suites)) {
+    const baseline = build();
+    const collectedKeys = Object.keys(baseline).filter((key) => key !== "now").sort();
+    assert.deepEqual(Object.keys(UNREADABLE_DATASET_DEPENDENTS[suite]).sort(), collectedKeys, `${suite}: every collected dataset must be classified`);
+    const baselinePass = new Set(assess(baseline).findings.filter((item) => item.status === "pass").map((item) => item.id));
+    for (const [key, [endpoint, { primary = [], secondary = [] }]] of Object.entries(UNREADABLE_DATASET_DEPENDENTS[suite])) {
+      datasetCount += 1;
+      const data = build();
+      data[key] = unreadableDataset(data[key], endpoint);
+      const result = assess(data);
+      assert.ok(result.errors.some((entry) => entry.includes("failed (403)")), `${suite}.${key}: 403 not disclosed in errors`);
+      for (const item of result.findings) {
+        if (primary.includes(item.id)) {
+          assert.equal(item.status, "manual", `${suite}.${key} unreadable left primary ${item.id} at ${item.status}: ${item.summary}`);
+          assert.ok(item.summary.includes(`${endpoint} could not be read`), `${suite}.${key}: ${item.id} summary does not name the endpoint: ${item.summary}`);
+        } else if (secondary.includes(item.id)) {
+          assert.notEqual(item.status, "pass", `${suite}.${key} unreadable left ${item.id} at pass: ${item.summary}`);
+          assert.ok(item.summary.includes(`inventory could not be read (${endpoint} returned 403)`), `${suite}.${key}: ${item.id} summary does not name the inventory and endpoint: ${item.summary}`);
+          const recorded = item.evidence.unreadable_inventories.find((entry) => entry.endpoint === endpoint);
+          assert.ok(recorded, `${suite}.${key}: ${item.id} evidence.unreadable_inventories does not carry ${endpoint}`);
+          assert.equal(recorded.status_code, 403);
+          if (baselinePass.has(item.id)) assert.ok(["warn", "manual"].includes(item.status), `${suite}.${key}: ${item.id} should cap at warn or manual, got ${item.status}`);
+        } else if (baselinePass.has(item.id)) {
+          assert.equal(item.status, "pass", `${suite}.${key} unreadable should not affect ${item.id}: ${item.summary}`);
+          assert.deepEqual(item.evidence.unreadable_inventories ?? [], [], `${suite}.${key}: ${item.id} records an unrelated unreadable inventory`);
+        }
+      }
+    }
+  }
+  assert.equal(datasetCount, 47);
+});
+
+const SECONDARY_INVENTORY_403_CASES = [
+  { product: "zpa", path: "segmentGroup", endpoint: "GET /segmentGroup", inventory: "segment group", secondary: ["ZS-08"] },
+  { product: "zpa", path: "appConnectorGroup", endpoint: "GET /appConnectorGroup", inventory: "connector group", secondary: ["ZS-11"] },
+  { product: "zpa", path: "administrators", endpoint: "GET /administrators", inventory: "ZPA administrator", secondary: ["ZS-12"] },
+  { product: "zpa", path: "samlAttribute", endpoint: "GET /samlAttribute", inventory: "SAML attribute", secondary: ["ZS-12"] },
+  { product: "zpa", path: "scimgroup/idpId/idp-1", endpoint: "GET /scimgroup/idpId/{idpId}", inventory: "SCIM group", secondary: ["ZS-12"], statusless: true },
+  { product: "zpa", path: "policySet/rules/policyType/ACCESS_POLICY", endpoint: "GET /policySet/rules/policyType/ACCESS_POLICY", inventory: "access rule", secondary: ["ZS-15"], primary: ["ZS-09", "ZS-10"] },
+  { product: "zpa", path: "policySet/rules/policyType/CLIENT_FORWARDING_POLICY", endpoint: "GET /policySet/rules/policyType/CLIENT_FORWARDING_POLICY", inventory: "forwarding rule", secondary: ["ZS-15"], primary: ["ZS-22"] },
+  { product: "zpa", path: "serviceEdgeGroup", endpoint: "GET /serviceEdgeGroup", inventory: "service edge group", secondary: ["ZS-21"] },
+  { product: "zpa", path: "clientlessCertificate/issued", endpoint: "GET /clientlessCertificate/issued", inventory: "browser access certificate", secondary: ["ZS-24"] },
+  { product: "zia", path: "/dlpDictionaries", endpoint: "GET /dlpDictionaries", inventory: "DLP dictionary", secondary: ["ZS-03"] },
+  { product: "zia", path: "/sslSettings/exemptedUrls", endpoint: "GET /sslSettings/exemptedUrls", inventory: "SSL exemption list", secondary: ["ZS-04"] },
+  { product: "zia", path: "/locations", endpoint: "GET /locations", inventory: "location", secondary: ["ZS-04"], primary: ["ZS-18"] },
+  { product: "zia", path: "/locations/100/sublocations", endpoint: "GET /locations/{locationId}/sublocations", inventory: "sub-location", secondary: ["ZS-18"], statusless: true },
+  { product: "zia", path: "/behavioralAnalysisAdvancedSettings", endpoint: "GET /behavioralAnalysisAdvancedSettings", inventory: "sandbox advanced settings", secondary: ["ZS-05"] },
+  { product: "zia", path: "/passwordExpiry/settings", endpoint: "GET /passwordExpiry/settings", inventory: "password expiry settings", secondary: ["ZS-07"] },
+  { product: "zia", path: "/nssFeeds", endpoint: "GET /nssFeeds", inventory: "NSS feed", secondary: ["ZS-14"] },
+  { product: "zia", path: "/greTunnels", endpoint: "GET /greTunnels", inventory: "GRE tunnel", secondary: ["ZS-18"] },
+  { product: "zia", path: "/vpnCredentials", endpoint: "GET /vpnCredentials", inventory: "VPN credential", secondary: ["ZS-18"] },
+  { product: "zia", path: "/cyberThreatProtection/advancedThreatSettings", endpoint: "GET /cyberThreatProtection/advancedThreatSettings", inventory: "advanced threat protection settings", secondary: ["ZS-20"], primary: ["ZS-25"] },
+  { product: "zia", path: "/cyberThreatProtection/malwarePolicy", endpoint: "GET /cyberThreatProtection/malwarePolicy", inventory: "malware policy", secondary: ["ZS-25"] },
+  { product: "zia", path: "/security", endpoint: "GET /security", inventory: "security allowlist", secondary: ["ZS-25"] },
+  { product: "zia", path: "/security/advanced", endpoint: "GET /security/advanced", inventory: "security denylist", secondary: ["ZS-25"] },
+];
+
+test("rule 1: a 403 on each secondary inventory served through the real clients caps the dependent findings and names the inventory and endpoint", async () => {
+  for (const testCase of SECONDARY_INVENTORY_403_CASES) {
+    const options = testCase.product === "zpa" ? { zpaStatus: { [testCase.path]: 403 } } : { ziaStatus: { [testCase.path]: 403 } };
+    const run = await runCompliantTenant({}, {}, options);
+    const affected = new Set([...testCase.secondary, ...(testCase.primary ?? [])]);
+    for (const id of testCase.secondary) {
+      const item = findingById(run, id);
+      assert.notEqual(item.status, "pass", `${testCase.path}: ${id} still passes: ${item.summary}`);
+      assert.ok(item.summary.includes(`The ${testCase.inventory} inventory could not be read (${testCase.endpoint} ${testCase.statusless ? "failed" : "returned 403"}`), `${testCase.path}: ${id} summary does not name the inventory: ${item.summary}`);
+      const recorded = item.evidence.unreadable_inventories.find((entry) => entry.endpoint === testCase.endpoint);
+      assert.ok(recorded, `${testCase.path}: ${id} evidence lacks unreadable_inventories for ${testCase.endpoint}`);
+      assert.equal(recorded.status_code, testCase.statusless ? null : 403);
+      assert.match(recorded.error, /403/);
+    }
+    for (const id of testCase.primary ?? []) {
+      assert.equal(findingById(run, id).status, "manual", `${testCase.path}: primary ${id} should be manual`);
+    }
+    for (const id of AUTOMATABLE_CONTROL_IDS) {
+      if (!affected.has(id)) assert.equal(findingById(run, id).status, "pass", `${testCase.path}: ${id} should be unaffected: ${findingById(run, id).summary}`);
+    }
+    const errors = [...run.access.errors, ...run.policy.errors, ...run.zpa.errors];
+    assert.ok(errors.some((entry) => /403/.test(entry)), `${testCase.path}: 403 not disclosed in errors`);
+  }
+  const edges = await runCompliantTenant({}, {}, { zpaStatus: { serviceEdgeGroup: 403 } });
+  assert.equal(findingById(edges, "ZS-21").status, "warn");
+  assert.equal(findingById(edges, "ZS-21").evidence.service_edge_groups, null);
+  assert.deepEqual(findingById(edges, "ZS-21").evidence.unreadable_inventories, [
+    { inventory: "service edge group", endpoint: "GET /serviceEdgeGroup", status_code: 403, error: findingById(edges, "ZS-21").evidence.unreadable_inventories[0].error },
+  ]);
+  assert.match(findingById(edges, "ZS-21").summary, /^All 1 enabled private service edges are authenticated with a broker connect time within 30 days\. The service edge group inventory could not be read \(GET \/serviceEdgeGroup returned 403\), so this verdict is capped at warn\.$/);
+  assert.ok(findingById(edges, "ZS-21").manualEvidence);
+  const bothRules = await runCompliantTenant({}, {}, { zpaStatus: { "policySet/rules/policyType/ACCESS_POLICY": 403, "policySet/rules/policyType/CLIENT_FORWARDING_POLICY": 403 } });
+  assert.equal(findingById(bothRules, "ZS-15").status, "manual");
+  assert.match(findingById(bothRules, "ZS-15").summary, /policy rules could not be read.*The access rule inventory could not be read \(GET \/policySet\/rules\/policyType\/ACCESS_POLICY returned 403\) and the forwarding rule inventory could not be read \(GET \/policySet\/rules\/policyType\/CLIENT_FORWARDING_POLICY returned 403\)\.$/);
+  assert.equal(findingById(bothRules, "ZS-15").evidence.unreadable_inventories.length, 2);
+});
+
+test("ZS-24 reads certificate expiry from validToInEpochSec or the published validTo date-time", async () => {
+  const isoFuture = new Date(Number(FUTURE_EPOCH) * 1000).toISOString();
+  const isoPast = new Date(Number(PAST_EPOCH) * 1000).toISOString();
+  const readable = (items) => ({ data: items, truncated: false, seen: 1, total: 1 });
+  const hubShapes = zpaFixture({
+    enrollmentCertificates: readable([{ id: "ec-1", name: "Connector", validTo: isoFuture }, { id: "ec-2", name: "Client", validToInEpochSec: FUTURE_EPOCH }]),
+    browserAccessCertificates: readable([{ id: "ba-1", name: "portal cert", validTo: isoFuture }]),
+  });
+  const passing = findingById(assessZpaData(hubShapes), "ZS-24");
+  assert.equal(passing.status, "pass", passing.summary);
+  assert.deepEqual(passing.evidence.enrollment_without_validity, []);
+  assert.deepEqual(passing.evidence.browser_access_without_validity, []);
+  assert.deepEqual(passing.evidence.unreadable_inventories, []);
+
+  const expired = findingById(assessZpaData(zpaFixture({ enrollmentCertificates: readable([{ id: "ec-1", name: "Connector", validTo: isoPast }]) })), "ZS-24");
+  assert.equal(expired.status, "fail");
+  assert.deepEqual(expired.evidence.enrollment_expired, ["Connector"]);
+
+  const malformed = findingById(assessZpaData(zpaFixture({ enrollmentCertificates: readable([{ id: "ec-1", name: "Connector", validTo: "not a date" }, { id: "ec-2", name: "Numeric text", validTo: FUTURE_EPOCH }]) })), "ZS-24");
+  assert.equal(malformed.status, "warn");
+  assert.deepEqual(malformed.evidence.enrollment_without_validity, ["Connector", "Numeric text"]);
+  assert.match(malformed.summary, /have no validToInEpochSec or validTo/);
+
+  const run = await runCompliantTenant({}, {
+    enrollmentCert: [{ id: "ec-1", name: "Connector", validTo: isoFuture }, { id: "ec-2", name: "Client", validTo: isoFuture }],
+    clientlessCertificate: [{ id: "ba-1", name: "portal cert", validTo: isoFuture }],
+  });
+  assert.equal(findingById(run, "ZS-24").status, "pass", findingById(run, "ZS-24").summary);
+  assert.equal(findingById(run, "ZS-24").evidence.enrollment_certificates, 2);
+});
+
 test("self-check (d): a compliant tenant served in Automation Hub shapes passes every automatable control, including ZS-15", async () => {
   const run = await runCompliantTenant();
   assert.equal(run.findings.length, 25);
