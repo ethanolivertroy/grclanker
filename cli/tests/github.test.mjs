@@ -2501,6 +2501,13 @@ test("bundle check: one repository's classic protection 403 reaches _errors.log 
     assert.doesNotMatch(byId[id].evidence.join("\n"), /= 0\/2/);
   }
   assert.equal(byId["GITHUB-REPO-005"].status, "Pass", "web commit signoff reads only the org profile and keeps passing");
+  const analysisSummaries = ["org_access", "repo_protection", "actions_security", "code_security", "integrations"]
+    .map((category) => JSON.parse(readFileSync(join(result.outputDir, "analysis", `${category}.json`), "utf8")).snapshotSummary);
+  assertNoFabricatedValues(analysisSummaries, "analysis/<category>.json snapshot summaries");
+  const repoSummary = analysisSummaries[1];
+  assert.equal(repoSummary.evaluated_repositories, 1);
+  assert.match(repoSummary.evaluated_repositories_status, /^partial: 1 of 2 active repositories fully evaluated; 1 could not be fully evaluated: example-org\/beta: classic branch protection \(GET \/repos\/example-org\/beta\/branches\/main\/protection\) unreadable: GitHub request failed \(403\)/);
+  assert.equal(repoSummary.repos_not_evaluable, 1);
   const coreData = JSON.parse(readFileSync(join(result.outputDir, "core_data", "repo_protection.json"), "utf8"));
   assert.equal(coreData.branchProtections.error, undefined);
   assert.deepEqual(coreData.branchProtections.data["example-org/alpha"].protection.enforce_admins, { enabled: true });
