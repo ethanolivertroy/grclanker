@@ -1065,7 +1065,7 @@ test("rule 9: error bodies and vendor messages are scrubbed at the record point,
   assert.match(roles.error, /failed \(403 forbidden\): Denied while fetching https:\/\/api\.example\.com\/v1\/x for this key, sent with Authorization: \[REDACTED\] \[REDACTED\], api_key=\[REDACTED\] \(session_id: \[REDACTED\]\) and \[REDACTED\]$/);
   const collectors = await client.listCollectors();
   assert.equal(collectors.ok, false, "a 200 with a non-JSON body is an unreadable surface, not an empty inventory");
-  assert.match(collectors.error, /returned an unreadable response \(200 OK: non-JSON body \(text\/html, \d+ bytes\)\)/);
+  assert.match(collectors.error, /returned an unreadable response \(200 OK\): non-JSON body \(text\/html, \d+ bytes\)$/);
 
   const access = await checkSumologicAccess(client);
   const connectionSurface = access.surfaces.find((surface) => surface.name === "connections");
@@ -1086,9 +1086,130 @@ test("rule 9: error bodies and vendor messages are scrubbed at the record point,
   const files = readBundleFiles(exported.outputDir);
   assert.ok(files.has("_errors.log"));
   assert.match(files.get("_errors.log"), /connections: Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
-  assert.match(files.get("_errors.log"), /collectors: Sumo Logic request to \/v1\/collectors returned an unreadable response \(200 OK: non-JSON body/);
+  assert.match(files.get("_errors.log"), /collectors: Sumo Logic request to \/v1\/collectors returned an unreadable response \(200 OK\): non-JSON body/);
   assertSecretsAbsent(assert, files, ERROR_BODY_CANARIES, "bundle directory");
   assertSecretsAbsent(assert, readZipEntries(exported.zipPath), ERROR_BODY_CANARIES, "zip archive");
+});
+
+const SURFACE_CANARIES = ["CANARY_BEARER_S1", "CANARY_SESSION_S1", "CANARY_APIKEY_S1", "CANARY_URL_TOKEN_S1"];
+const SURFACE_HTML_BODY = "<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer CANARY_BEARER_S1</p><p>Set-Cookie: JSESSIONID=CANARY_SESSION_S1; Path=/</p><p>api_key=CANARY_APIKEY_S1</p><p>Retry at https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 later.</p></body></html>";
+const SURFACE_JSON_BODY = {
+  errors: [{
+    code: "forbidden",
+    message: "Denied while fetching https://api.example.com/v1/x?token=CANARY_URL_TOKEN_S1 for this key; Authorization: Bearer CANARY_BEARER_S1; api_key=CANARY_APIKEY_S1; session_id=CANARY_SESSION_S1",
+  }],
+};
+
+// Every path the client reads: the access check probes plus the collectors the
+// assessments call outside the access check (the remaining policies and the
+// content permission lookup). The access key inventory falls back to the
+// personal endpoint on 403, so both endpoints belong to that surface.
+const SUMOLOGIC_SURFACES = [
+  ["account_status", ["/api/v1/account/status"]],
+  ["users", ["/api/v1/users"]],
+  ["roles", ["/api/v1/roles"]],
+  ["access_keys", ["/api/v1/accessKeys", "/api/v1/accessKeys/personal"]],
+  ["saml_identity_providers", ["/api/v1/saml/identityProviders"]],
+  ["saml_allowlisted_users", ["/api/v1/saml/allowlistedUsers"]],
+  ["password_policy", ["/api/v1/passwordPolicy"]],
+  ["service_allowlist_status", ["/api/v1/serviceAllowlist/status"]],
+  ["service_allowlist_addresses", ["/api/v1/serviceAllowlist/addresses"]],
+  ["audit_policy", ["/api/v1/policies/audit"]],
+  ["search_audit_policy", ["/api/v1/policies/searchAudit"]],
+  ["share_dashboards_policy", ["/api/v1/policies/shareDashboardsOutsideOrganization"]],
+  ["data_access_level_policy", ["/api/v1/policies/dataAccessLevel"]],
+  ["concurrent_sessions_policy", ["/api/v1/policies/userConcurrentSessionsLimit"]],
+  ["session_timeout_policy", ["/api/v1/policies/maxUserSessionTimeout"]],
+  ["access_keys_lifetime_policy", ["/api/v1/policies/accessKeysLifetime"]],
+  ["partitions", ["/api/v1/partitions"]],
+  ["scheduled_views", ["/api/v1/scheduledViews"]],
+  ["ingest_budgets", ["/api/v2/ingestBudgets"]],
+  ["connections", ["/api/v1/connections"]],
+  ["collectors", ["/api/v1/collectors"]],
+  ["monitors", ["/api/v1/monitors/search"]],
+  ["personal_folder", ["/api/v2/content/folders/personal"]],
+  ["dashboards", ["/api/v2/dashboards"]],
+  ["content_permissions", ["/api/v2/content/c1/permissions"]],
+];
+
+function healthyRoutes(data = healthyData()) {
+  const routes = {
+    "/api/v1/account/status": data.accountStatus,
+    "/api/v1/users": { data: data.users },
+    "/api/v1/roles": { data: data.roles },
+    "/api/v1/accessKeys": { data: data.accessKeys },
+    "/api/v1/accessKeys/personal": { data: data.accessKeys },
+    "/api/v1/saml/identityProviders": data.identityProviders,
+    "/api/v1/saml/allowlistedUsers": data.allowlistedUsers,
+    "/api/v1/passwordPolicy": data.passwordPolicy,
+    "/api/v1/serviceAllowlist/status": data.allowlistStatus,
+    "/api/v1/serviceAllowlist/addresses": { data: data.allowlistAddresses },
+    "/api/v1/partitions": { data: data.partitions },
+    "/api/v1/scheduledViews": { data: data.scheduledViews },
+    "/api/v2/ingestBudgets": { data: data.ingestBudgets },
+    "/api/v1/connections": { data: data.connections },
+    "/api/v1/collectors": { collectors: data.collectors },
+    "/api/v1/monitors/search": data.monitors.map((item) => ({ item, path: `/Monitor/${item.name}` })),
+    "/api/v2/content/folders/personal": data.personalFolder,
+    "/api/v2/dashboards": { dashboards: data.dashboards },
+    "/api/v2/content/c1/permissions": data.permissions,
+  };
+  for (const [name, policy] of Object.entries(data.policies)) routes[`/api/v1/policies/${name}`] = policy;
+  return routes;
+}
+
+function surfaceCanaryFetch(failingPaths, variant) {
+  const routes = healthyRoutes();
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (failingPaths.includes(url.pathname)) {
+      return variant === "html"
+        ? new Response(SURFACE_HTML_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } })
+        : jsonResponse(SURFACE_JSON_BODY, { status: 403, statusText: "Forbidden" });
+    }
+    assert.ok(url.pathname in routes, `unexpected request to ${url.pathname}`);
+    return jsonResponse(routes[url.pathname]);
+  };
+}
+
+test("rule 9: every Sumo Logic surface that fails with a 502 HTML page or a JSON error embedding a token URL records only a scrubbed error, on every output", async () => {
+  const base = createTempBase("grclanker-sumo-surface-canaries-");
+  const healthy = await checkSumologicAccess(new SumologicApiClient(sampleConfig(), { fetchImpl: surfaceCanaryFetch([], "html"), maxRetries: 0 }));
+  assert.equal(healthy.surfaces.filter((surface) => surface.status !== "readable").length, 0, "the healthy route table serves every probe");
+
+  for (const [surface, paths] of SUMOLOGIC_SURFACES) {
+    for (const variant of ["html", "json"]) {
+      const label = `${surface} (${variant})`;
+      const client = new SumologicApiClient(sampleConfig(), { fetchImpl: surfaceCanaryFetch(paths, variant), sleepImpl: async () => {}, maxRetries: 0 });
+      const access = await checkSumologicAccess(client);
+      const results = await allAssessments(client);
+      const exported = await exportSumologicAuditBundle(client, sampleConfig(), join(base, `${surface}-${variant}`), { now: NOW });
+      const files = readBundleFiles(exported.outputDir);
+
+      const outputs = new Map([
+        [`${label} check_access`, JSON.stringify(access)],
+        ...results.map((result) => [`${label} assess ${result.area}`, JSON.stringify(result)]),
+        ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
+      ]);
+      assertSecretsAbsent(assert, outputs, SURFACE_CANARIES, label);
+
+      const errorStrings = [
+        ...access.surfaces.filter((item) => item.status === "not_readable").map((item) => item.error),
+        ...results.flatMap((result) => result.errors),
+        ...results.flatMap((result) => result.findings.map((item) => item.summary)).filter((summary) => /non-JSON body|api\.example\.com/.test(summary)),
+      ];
+      assert.ok(errorStrings.length >= 1, `${label}: the failing surface is recorded as an error`);
+      for (const text of errorStrings) {
+        if (variant === "html") {
+          assert.match(text, /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/, `${label}: the error carries the status-and-length note, got ${text}`);
+        } else {
+          assert.match(text, /https:\/\/api\.example\.com\/v1\/x(?![?#])/, `${label}: the URL keeps scheme, host, and path, got ${text}`);
+          assert.match(text, /Authorization: \[REDACTED\]/, `${label}: the authorization value is redacted, got ${text}`);
+        }
+      }
+    }
+  }
 });
 
 test("rule 10: token pagination stops on a repeated cursor or an empty page with a next token and reports the inventory incomplete", async () => {

@@ -457,6 +457,21 @@ function statusLine(response: Response): string {
   return `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
 }
 
+interface ParsedResponseBody {
+  payload: unknown;
+  /** Set when the body was not JSON; the text itself is never kept. */
+  nonJsonBody?: string;
+}
+
+function parseResponseBody(response: Response, rawText: string): ParsedResponseBody {
+  if (rawText.length === 0) return { payload: {} };
+  try {
+    return { payload: JSON.parse(rawText) as unknown };
+  } catch {
+    return { payload: {}, nonJsonBody: describeNonJsonBody(response, rawText) };
+  }
+}
+
 export function resolveSumologicBaseUrl(endpointOrDeployment: string): { baseUrl: string; deployment?: string } {
   const trimmed = endpointOrDeployment.trim();
   const code = trimmed.toLowerCase();
@@ -549,11 +564,33 @@ export class SumologicApiError extends Error {
   readonly status: number;
   readonly code?: string;
 
+  /**
+   * The message and code are scrubbed in the constructor as well as at the
+   * record point, so an error built anywhere in the client never carries a
+   * credential even if a caller stores error.message directly.
+   */
   constructor(message: string, status: number, code?: string) {
-    super(message);
+    super(scrubErrorText(message));
     this.name = "SumologicApiError";
     this.status = status;
-    this.code = code;
+    this.code = code === undefined ? undefined : scrubErrorText(code);
+  }
+
+  /**
+   * Builds the error for a response that cannot be used: a body that is not
+   * JSON becomes a status-and-length note whatever its content type, a JSON
+   * body contributes only the documented message, detail, and code fields,
+   * and the configured secrets are removed before the pattern pass runs.
+   */
+  static fromResponse(path: string, response: Response, body: ParsedResponseBody, secrets: Array<string | undefined>): SumologicApiError {
+    const { message, code } = body.nonJsonBody === undefined ? sumologicErrorSummary(body.payload) : {};
+    const detail = body.nonJsonBody ?? message;
+    const outcome = response.ok ? "returned an unreadable response" : "failed";
+    return new SumologicApiError(
+      scrubErrorText(`Sumo Logic request to ${path} ${outcome} (${statusLine(response)}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`, secrets),
+      response.status,
+      code,
+    );
   }
 }
 
@@ -630,8 +667,12 @@ export class SumologicApiClient implements SumologicReader {
     return `Basic ${this.basicCredential()}`;
   }
 
+  private configuredSecrets(): string[] {
+    return [this.config.accessKey, this.basicCredential()];
+  }
+
   private scrubError(error: unknown): string {
-    return scrubErrorText(error instanceof Error ? error.message : String(error), [this.config.accessKey, this.basicCredential()]);
+    return scrubErrorText(error instanceof Error ? error.message : String(error), this.configuredSecrets());
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<unknown> {
@@ -660,37 +701,19 @@ export class SumologicApiClient implements SumologicReader {
       clearTimeout(timeout);
 
       // A body that is not JSON (a proxy error page, an HTML sign-in form) is
-      // never copied into an error string: it is described by content type
-      // and size only, because such pages can echo the request credentials.
-      const rawText = await response.text();
-      let payload: unknown = {};
-      let nonJsonBody: string | undefined;
-      if (rawText.length > 0) {
-        try {
-          payload = JSON.parse(rawText) as unknown;
-        } catch {
-          nonJsonBody = describeNonJsonBody(response, rawText);
-        }
-      }
+      // never copied into an error string: SumologicApiError.fromResponse
+      // describes it by content type and size only, because such pages can
+      // echo the request credentials, and a 2xx non-JSON body is an
+      // unreadable surface rather than an empty inventory.
+      const body = parseResponseBody(response, await response.text());
+      if (response.ok && body.nonJsonBody === undefined) return body.payload;
 
-      if (response.ok) {
-        if (nonJsonBody === undefined) return payload;
-        throw new SumologicApiError(`Sumo Logic request to ${path} returned an unreadable response (${statusLine(response)}: ${nonJsonBody})`, response.status);
-      }
-
-      const retryable = response.status === 429 || response.status >= 500;
+      const retryable = !response.ok && (response.status === 429 || response.status >= 500);
       if (retryable && attempt < this.maxRetries) {
         await this.sleepImpl(retryDelayMs(response, attempt));
         continue;
       }
-
-      const { message, code } = nonJsonBody === undefined ? sumologicErrorSummary(payload) : {};
-      const detail = nonJsonBody ?? message;
-      throw new SumologicApiError(
-        this.scrubError(`Sumo Logic request to ${path} failed (${statusLine(response)}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`),
-        response.status,
-        code,
-      );
+      throw SumologicApiError.fromResponse(path, response, body, this.configuredSecrets());
     }
   }
 
