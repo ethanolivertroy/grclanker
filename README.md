@@ -124,6 +124,32 @@ What ships in `0.0.1`:
 - Dedicated runtime identity and state under `~/.grclanker/agent`
 - A real setup command for local-first or hosted model configuration
 
+## Run Under Flue
+
+grclanker can also run as a [Flue Framework](https://flueframework.com/) agent. The adapter in `cli/flue/` mounts the same 107 domain tools, the shipped system prompt, the `/investigate`, `/audit`, `/assess`, and `/validate` prompts (as Flue skills), and the `auditor` and `verifier` personas (as Flue subagents). Tool schemas are converted from TypeBox JSON Schema to Valibot at the adapter boundary; the tool implementations are untouched.
+
+Bundled runner (built on Flue's `start()` API, no extra install):
+
+```bash
+export ANTHROPIC_API_KEY=...
+grclanker flue run --message "Is BoringCrypto FIPS validated?"
+grclanker flue run --message "Now check KEV exposure" --id fips-review --json
+```
+
+Official Flue CLI (from the `cli/` directory, Node 22.19 or newer):
+
+```bash
+npx @flue/cli run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
+```
+
+Configuration:
+
+- `GRCLANKER_FLUE_MODEL` sets the `provider/model` specifier. Without it, a hosted `grclanker setup` choice is reused, otherwise `anthropic/claude-sonnet-4-6`. Provider API keys come from the environment, as in any Flue project.
+- `GRCLANKER_FLUE_SANDBOX=none` disables the local sandbox that provides file and shell tools for the current directory.
+- Conversations persist in `~/.grclanker/flue/conversations.db`. Pass `--db <path>` or `--db :memory:` to change that.
+
+Limitations: local-first models configured through `grclanker setup` are not available under Flue, because the Flue runtime registers Pi's built-in providers only. The Pi compute backends (`host`, `sandbox-runtime`, Docker, Parallels) do not apply; Flue's own sandbox model is used instead. See [`/docs/getting-started/flue-runtime`](https://grclanker.com/docs/getting-started/flue-runtime) for details.
+
 ## Skills Only
 
 User-scoped Codex skill:
