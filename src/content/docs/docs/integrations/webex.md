@@ -101,7 +101,8 @@ The script skips with exit code 0 when no `WEBEX_TOKEN`, refresh credential trio
 
 - `GET /rooms`, `GET /webhooks`, and `GET /meetings` list only what the authenticated identity can see; findings state this and downgrade to `warn` under a bot token.
 - `GET /people` returns 400 for non-admin tokens without a filter; that renders as manual, not empty.
-- `GET /admin/meeting/config/commonSettings` needs a site administrator with `meeting:admin_config_read`; `GET /guests/count` needs `guest-issuer:read`. A denied guest count is noted in WEBEX-ID-07 without blocking the people-based inventory.
+- `GET /admin/meeting/config/commonSettings` needs a site administrator with `meeting:admin_config_read`; `GET /guests/count` needs `guest-issuer:read`.
+- A finding that reads more than one inventory cannot pass while any of them is unreadable: WEBEX-ID-07 caps at `warn` when `GET /guests/count` is denied, WEBEX-MTG-02 and WEBEX-MTG-06 cap at `warn` when `GET /meetings` or `GET /meetingPreferences` is denied, and WEBEX-COLLAB-04, WEBEX-COLLAB-05, WEBEX-MTG-02, WEBEX-MTG-03, and WEBEX-MTG-06 cap at `warn` when `GET /people/me` is unreadable (the bot-token partial view cannot be excluded). Each summary names the unreadable endpoint, and counts derived from it render as `null` beside a `*_status` object rather than `0` or `[]`.
 - Events older than 90 days require Pro Pack for Control Hub.
 - Pagination follows `Link rel="next"` for at most 1000 pages per listing; both the item limit and the page ceiling report `truncated: true`, and evidence lists capped at 25 or 50 entries carry a matching `*_count` total.
 - SARIF, CSV, and HTML reporters from the spec are out of scope for this pass.

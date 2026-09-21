@@ -959,7 +959,7 @@ test("WEBEX-ID-07 inventories guests from Person.type = appuser and GET /guests/
     },
   }));
   const partialGuests = byId(noScope.findings, "WEBEX-ID-07");
-  assert.equal(partialGuests.status, "pass", "a denied /guests/count is supplementary and does not block the people-based inventory");
+  assert.equal(partialGuests.status, "warn", "rule 1 corollary: a denied /guests/count is a dependent inventory, so the people-based inventory cannot pass");
   assert.match(partialGuests.summary, /GET \/guests\/count was not readable \(.*403.*; scope guest-issuer:read\)/);
   assert.equal(partialGuests.evidence.guest_count_api, null);
   assert.match(partialGuests.evidence.guest_count_api_error, /403/);
@@ -971,6 +971,290 @@ test("WEBEX-ID-07 inventories guests from Person.type = appuser and GET /guests/
   assert.equal(external.status, "manual");
   assert.match(external.summary, /Guest access \(control 13\) is judged from the site common settings in WEBEX-MTG-03 and inventoried in WEBEX-ID-07/);
   assert.doesNotMatch(external.summary, /guest access policy;/);
+});
+
+/** Endpoint each client method reads, for 403 fixtures that name the real path. */
+const ENDPOINT_OF = {
+  getMe: "/people/me",
+  listOrganizations: "/organizations",
+  getOrganization: "/organizations/org-123",
+  listPeople: "/people",
+  listRoles: "/roles",
+  listLicenses: "/licenses",
+  getGuestCount: "/guests/count",
+  listEvents: "/events",
+  listAdminAuditEvents: "/adminAudit/events",
+  listAdminRecordings: "/admin/recordings",
+  listMeetings: "/meetings",
+  getMeetingPreferences: "/meetingPreferences",
+  listMeetingSites: "/meetingPreferences/sites",
+  getMeetingCommonSettings: "/admin/meeting/config/commonSettings",
+  listHybridClusters: "/hybrid/clusters",
+  listHybridConnectors: "/hybrid/connectors",
+  listDevices: "/devices",
+  listWorkspaces: "/workspaces",
+  listRooms: "/rooms",
+  listWebhooks: "/webhooks",
+};
+
+const TWO_SITES = [{ siteUrl: "a.webex.com", default: true }, { siteUrl: "b.webex.com", default: false }];
+
+/** Rule 1 corollary baseline: fixture (d) with two sites so a per-site commonSettings denial is meaningful. */
+function twoSiteClient(overrides = {}) {
+  return compliantClient({
+    async getMeetingPreferences() {
+      return { personalMeetingRoom: { enabledAutoLock: true, autoLockMinutes: 5 }, schedulingOptions: { enabledJoinBeforeHost: false }, sites: TWO_SITES };
+    },
+    async listMeetingSites() {
+      return page(TWO_SITES);
+    },
+    ...overrides,
+  });
+}
+
+/** The two-site baseline with exactly the named inventories answering 403 and everything else compliant. */
+function denying(methods, overrides = {}) {
+  const denied = {};
+  for (const method of methods) {
+    denied[method] = async () => { throw forbidden(ENDPOINT_OF[method]); };
+  }
+  return twoSiteClient({ ...denied, ...overrides });
+}
+
+/** The two-site baseline with commonSettings denied for one site only. */
+function denyingSite(siteUrl, overrides = {}) {
+  return twoSiteClient({
+    async getMeetingCommonSettings(requested) {
+      if (requested === siteUrl) throw forbidden(ENDPOINT_OF.getMeetingCommonSettings);
+      return compliantCommonSettings();
+    },
+    ...overrides,
+  });
+}
+
+function unreadable(endpoint) {
+  return { readable: false, status: 403, error: `Webex request failed (403 Forbidden) for ${endpoint}` };
+}
+
+test("corollary hit 1: WEBEX-ID-07 caps at warn when GET /guests/count is denied and renders the API count as null plus status", async () => {
+  const identity = await assessWebexIdentity(denying(["getGuestCount"]));
+  const guests = byId(identity.findings, "WEBEX-ID-07");
+  assert.equal(guests.status, "warn");
+  assert.match(guests.summary, /^1 guest accounts .* were inventoried among 5 people\. GET \/guests\/count was not readable \(Webex request failed \(403 Forbidden\) for \/guests\/count; scope guest-issuer:read\), so the guest-issuer count could not be reconciled\./);
+  assert.equal(guests.evidence.guest_count_api, null);
+  assert.deepEqual(guests.evidence.guest_count_api_status, unreadable("/guests/count"));
+  assert.equal(guests.evidence.guest_count_people, 1, "the people-derived count stays a real value because GET /people was readable");
+  assert.equal(guests.evidence.people_seen, 5);
+  assert.deepEqual(identity.summary.inventory_status.guest_count, unreadable("/guests/count"));
+  assert.ok(identity.errors.some((item) => /^guest_count: .*403/.test(item)));
+  for (const id of ["WEBEX-ID-03", "WEBEX-ID-04", "WEBEX-ID-05"]) {
+    assert.equal(byId(identity.findings, id).status, "pass", `${id} does not read /guests/count`);
+  }
+
+  const denied = byId((await assessWebexIdentity(denying(["listPeople"]))).findings, "WEBEX-ID-07");
+  assert.equal(denied.status, "manual");
+  assert.equal(denied.evidence.guests, null, "a guest list derived from an unreadable /people is null, not []");
+  assert.equal(denied.evidence.guest_count_people, null);
+  assert.equal(denied.evidence.people_seen, null);
+});
+
+test("corollary hit 2: WEBEX-MTG-02 and WEBEX-MTG-06 cap at warn when GET /meetings is denied, with null sampled counts", async () => {
+  const result = await assessWebexMeetingHybridSecurity(denying(["listMeetings"]));
+  for (const id of ["WEBEX-MTG-02", "WEBEX-MTG-06"]) {
+    const item = byId(result.findings, id);
+    assert.equal(item.status, "warn", id);
+    assert.match(item.summary, /^a\.webex\.com: .*; b\.webex\.com: .* \(GET \/admin\/meeting\/config\/commonSettings, 2 of 2 sites\)\. GET \/meetings was not readable \(403; scope meeting:schedules_read or meeting:admin_schedule_read\), so the sampled per-meeting lobby and password evidence is unavailable\.$/, id);
+    assert.equal(item.evidence.meetings_seen, null, `${id}: meetings_seen must not be a fabricated 0`);
+    assert.equal(item.evidence.sampled_allow_join_without_lobby, null);
+    assert.equal(item.evidence.sampled_without_password, null);
+    assert.equal(item.evidence.meetings_truncated, null);
+    assert.deepEqual(item.evidence.meetings_status, unreadable("/meetings"));
+    assert.equal(item.evidence.personal_meeting_room_auto_lock, true, "the preferences read stays a real value");
+    assert.equal(item.evidence.site_coverage_complete, true);
+    assert.equal(item.evidence.sites.length, 2);
+  }
+  assert.equal(byId(result.findings, "WEBEX-MTG-03").status, "pass", "guest access reads commonSettings only");
+  assert.equal(byId(result.findings, "WEBEX-MTG-04").status, "pass");
+  assert.equal(result.summary.meetings_seen, null);
+  assert.deepEqual(result.summary.inventory_status.meetings, unreadable("/meetings"));
+  assert.ok(result.errors.some((item) => /^meetings: .*403/.test(item)));
+});
+
+test("corollary hit 3: WEBEX-MTG-02 and WEBEX-MTG-06 cap at warn when GET /meetingPreferences is denied and name the endpoint", async () => {
+  const result = await assessWebexMeetingHybridSecurity(denying(["getMeetingPreferences"]));
+  for (const id of ["WEBEX-MTG-02", "WEBEX-MTG-06"]) {
+    const item = byId(result.findings, id);
+    assert.equal(item.status, "warn", id);
+    assert.match(item.summary, /\(GET \/admin\/meeting\/config\/commonSettings, 2 of 2 sites\)\. GET \/meetingPreferences was not readable \(403; scope meeting:preferences_read or meeting:admin_preferences_read\), so the Personal Room auto-lock preference is unavailable\.$/, id);
+    assert.doesNotMatch(item.summary, /GET \/meetings was not readable/);
+    assert.equal(item.evidence.personal_meeting_room_auto_lock, null);
+    assert.deepEqual(item.evidence.meeting_preferences_status, unreadable("/meetingPreferences"));
+    assert.equal(item.evidence.meetings_seen, 1, "the meetings sample stays a real count because GET /meetings was readable");
+    assert.equal(item.evidence.sampled_without_password, 0);
+    assert.equal(item.evidence.site_coverage_complete, true, "the site list still came from GET /meetingPreferences/sites");
+  }
+  assert.equal(byId(result.findings, "WEBEX-MTG-03").status, "pass", "guest access takes its sites from GET /meetingPreferences/sites when it answers");
+  assert.ok(result.errors.some((item) => /^meeting_preferences: .*403/.test(item)));
+});
+
+test("corollary hit 4: an unreadable GET /people/me caps every token-type-gated finding at warn and names the probe", async () => {
+  const assessments = await allAssessments(denying(["getMe"]));
+  const findings = findingsOf(assessments);
+  const gated = ["WEBEX-COLLAB-04", "WEBEX-COLLAB-05", "WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"];
+  for (const id of gated) {
+    const item = byId(findings, id);
+    assert.equal(item.status, "warn", id);
+    assert.match(item.summary, / GET \/people\/me was not readable \(403; scope spark:people_read\), so the token type could not be verified and a bot token's partial view cannot be excluded\.$/, id);
+    assert.equal(item.evidence.token_type, "unknown", id);
+    assert.deepEqual(item.evidence.token_probe_status, unreadable("/people/me"), id);
+  }
+  for (const id of AUTOMATABLE.filter((entry) => !gated.includes(entry))) {
+    assert.equal(byId(findings, id).status, "pass", `${id} reads org-wide admin surfaces that do not depend on the token type`);
+  }
+  for (const assessment of assessments) {
+    assert.equal(assessment.summary.token_type, "unknown");
+    assert.ok(assessment.errors.some((item) => /^me: .*403/.test(item)), `${assessment.category} errors array carries the probe failure`);
+  }
+
+  const typeless = await assessWebexCollaborationGovernance(twoSiteClient({
+    async getMe() {
+      return { id: "me-1", displayName: "Auditor" };
+    },
+  }));
+  const rooms = byId(typeless.findings, "WEBEX-COLLAB-04");
+  assert.equal(rooms.status, "warn", "a probe that answers without Person.type leaves the same uncertainty");
+  assert.match(rooms.summary, /GET \/people\/me was not readable \(the response carried no Person\.type\)/);
+  assert.deepEqual(rooms.evidence.token_probe_status, { readable: false, status: null, error: "the response carried no Person.type" });
+});
+
+test("corollary wording (a): a denied GET /meetingPreferences/sites is named even when GET /meetingPreferences still lists the sites", async () => {
+  const requested = [];
+  const result = await assessWebexMeetingHybridSecurity(denying(["listMeetingSites"], {
+    async getMeetingCommonSettings(siteUrl) {
+      requested.push(siteUrl);
+      return compliantCommonSettings();
+    },
+  }));
+  assert.deepEqual(requested.sort(), ["a.webex.com", "b.webex.com"], "the fallback site list from GET /meetingPreferences is still evaluated per site");
+  for (const id of ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"]) {
+    const item = byId(result.findings, id);
+    assert.equal(item.status, "warn", id);
+    assert.match(item.summary, /\(GET \/admin\/meeting\/config\/commonSettings, 2 of 2 sites\)\. The site list \(GET \/meetingPreferences\/sites\) was not readable \(Webex request failed \(403 Forbidden\) for \/meetingPreferences\/sites\), so the 2 sites came from the sites array of GET \/meetingPreferences and site coverage cannot be confirmed complete\./, id);
+    assert.equal(item.evidence.site_coverage_complete, false);
+    assert.deepEqual(item.evidence.site_list_status, unreadable("/meetingPreferences/sites"), `${id}: site_coverage_complete carries its reason`);
+    assert.deepEqual(item.evidence.denied_sites, []);
+  }
+  assert.ok(result.errors.some((item) => /^meeting_sites: .*403/.test(item)));
+  assert.deepEqual(result.summary.inventory_status.meeting_sites, unreadable("/meetingPreferences/sites"));
+});
+
+test("corollary wording (b): a commonSettings denial for one site is recorded in the errors array and _errors.log", async () => {
+  const result = await assessWebexMeetingHybridSecurity(denyingSite("b.webex.com"));
+  assert.deepEqual(result.errors, ["meeting_common_settings[b.webex.com]: Webex request failed (403 Forbidden) for /admin/meeting/config/commonSettings"]);
+  for (const id of ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"]) {
+    const item = byId(result.findings, id);
+    assert.equal(item.status, "warn", id);
+    assert.match(item.summary, /1 of 2 sites could not be read \(b\.webex\.com: Webex request failed \(403 Forbidden\) for \/admin\/meeting\/config\/commonSettings\)/, id);
+    assert.deepEqual(item.evidence.site_list_status, { readable: true, truncated: false });
+  }
+  assert.equal(result.summary.sites_evaluated, 1);
+  assert.equal(result.summary.sites_denied, 1);
+  assert.deepEqual(result.summary.inventory_status.meeting_common_settings, { readable: true, truncated: true });
+
+  const everySite = await assessWebexMeetingHybridSecurity(denying(["getMeetingCommonSettings"]));
+  assert.deepEqual(everySite.errors, [
+    "meeting_common_settings[a.webex.com]: Webex request failed (403 Forbidden) for /admin/meeting/config/commonSettings",
+    "meeting_common_settings[b.webex.com]: Webex request failed (403 Forbidden) for /admin/meeting/config/commonSettings",
+  ], "an all-sites denial lists each site once instead of one anonymous surface entry");
+
+  const base = createTempBase("grclanker-webex-site-errors-");
+  const bundle = await exportWebexAuditBundle(denyingSite("b.webex.com"), sampleConfig(), base);
+  assert.equal(bundle.errorCount, 1);
+  assert.match(readFileSync(join(bundle.outputDir, "_errors.log"), "utf8"), /meeting-hybrid-security: meeting_common_settings\[b\.webex\.com\]: .*403/);
+});
+
+/**
+ * Reviewer's per-inventory sweep: deny exactly one inventory (fully, or for one
+ * site) against the two-site compliant baseline and check that exactly the
+ * dependent findings drop below pass while every other baseline pass stays pass.
+ */
+const COROLLARY_SWEEP = [
+  { inventory: "/people/me (token type)", deny: ["getMe"], demotes: ["WEBEX-COLLAB-04", "WEBEX-COLLAB-05", "WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"], names: /GET \/people\/me was not readable/ },
+  { inventory: "/organizations (orgId configured)", deny: ["listOrganizations"], demotes: [] },
+  { inventory: "/organizations (orgId not configured)", deny: ["listOrganizations"], config: { orgId: undefined }, demotes: ["WEBEX-COLLAB-07"], names: /GET \/organizations was not readable/ },
+  { inventory: "/organizations/{orgId}", deny: ["getOrganization"], demotes: [] },
+  { inventory: "/people", deny: ["listPeople"], demotes: ["WEBEX-ID-03", "WEBEX-ID-04", "WEBEX-ID-05", "WEBEX-ID-07"], names: /\/people(?: and \/roles)? returned 403/ },
+  { inventory: "/roles", deny: ["listRoles"], demotes: ["WEBEX-ID-03", "WEBEX-ID-04"], names: /\/roles returned 403/ },
+  { inventory: "/guests/count", deny: ["getGuestCount"], demotes: ["WEBEX-ID-07"], names: /GET \/guests\/count was not readable/ },
+  { inventory: "/licenses", deny: ["listLicenses"], demotes: ["WEBEX-COLLAB-06"], names: /\/licenses returned 403/ },
+  { inventory: "/events", deny: ["listEvents"], demotes: [] },
+  { inventory: "/adminAudit/events", deny: ["listAdminAuditEvents"], demotes: ["WEBEX-COLLAB-07"], names: /\/adminAudit\/events returned 403/ },
+  { inventory: "/admin/recordings", deny: ["listAdminRecordings"], demotes: [] },
+  { inventory: "/rooms", deny: ["listRooms"], demotes: ["WEBEX-COLLAB-04"], names: /\/rooms returned 403/ },
+  { inventory: "/webhooks", deny: ["listWebhooks"], demotes: ["WEBEX-COLLAB-05"], names: /\/webhooks returned 403/ },
+  { inventory: "/meetings", deny: ["listMeetings"], demotes: ["WEBEX-MTG-02", "WEBEX-MTG-06"], names: /GET \/meetings was not readable/ },
+  { inventory: "/meetingPreferences", deny: ["getMeetingPreferences"], demotes: ["WEBEX-MTG-02", "WEBEX-MTG-06"], names: /GET \/meetingPreferences was not readable/ },
+  { inventory: "/meetingPreferences/sites (preferences still list sites)", deny: ["listMeetingSites"], demotes: ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"], names: /\(GET \/meetingPreferences\/sites\) was not readable/ },
+  { inventory: "/meetingPreferences/sites and /meetingPreferences", deny: ["listMeetingSites", "getMeetingPreferences"], demotes: ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"], names: /\(GET \/meetingPreferences\/sites\) was not readable/ },
+  { inventory: "/admin/meeting/config/commonSettings (every site)", deny: ["getMeetingCommonSettings"], demotes: ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"], names: /\/admin\/meeting\/config\/commonSettings returned 403/ },
+  { inventory: "commonSettings for b.webex.com only", denySite: "b.webex.com", demotes: ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"], names: /1 of 2 sites could not be read \(b\.webex\.com: .*403/ },
+  { inventory: "/hybrid/clusters", deny: ["listHybridClusters"], demotes: ["WEBEX-MTG-04"], names: /\/hybrid\/clusters returned 403/ },
+  { inventory: "/hybrid/connectors", deny: ["listHybridConnectors"], demotes: ["WEBEX-MTG-04"], names: /\/hybrid\/connectors returned 403/ },
+  { inventory: "/devices", deny: ["listDevices"], demotes: [] },
+  { inventory: "/workspaces", deny: ["listWorkspaces"], demotes: [] },
+];
+
+test("corollary sweep: denying one inventory demotes exactly its dependent findings and names it, every other pass stays pass", async () => {
+  const swept = new Set(COROLLARY_SWEEP.flatMap((row) => row.deny ?? ["getMeetingCommonSettings"]));
+  assert.deepEqual([...swept].sort(), [...CLIENT_METHODS].sort(), "every surface the collectors read is swept");
+  for (const row of COROLLARY_SWEEP) {
+    const config = sampleConfig(row.config ?? {});
+    const configured = { getResolvedConfig: () => config };
+    const baseline = findingsOf(await allAssessments(twoSiteClient(configured)));
+    const baselinePass = baseline.filter((item) => item.status === "pass").map((item) => item.id).sort();
+    assert.deepEqual(baselinePass, [...AUTOMATABLE].sort(), `${row.inventory}: the baseline must pass every automatable finding`);
+
+    const client = row.denySite ? denyingSite(row.denySite, configured) : denying(row.deny, configured);
+    const findings = findingsOf(await allAssessments(client));
+    const demoted = baselinePass.filter((id) => byId(findings, id).status !== "pass");
+    assert.deepEqual(demoted, [...row.demotes].sort(), `${row.inventory}: exactly the dependent findings drop below pass`);
+    for (const id of row.demotes) {
+      const item = byId(findings, id);
+      assert.notEqual(item.status, "pass");
+      assert.match(item.summary, row.names, `${row.inventory}: ${id} names the unreadable inventory`);
+    }
+    for (const item of findings) {
+      assert.ok(["pass", "warn", "fail", "manual"].includes(item.status));
+      if (item.status === "manual") assert.match(item.summary, /^Manual:/, `${row.inventory}: ${item.id}`);
+    }
+  }
+});
+
+test("corollary bundle check: findings.json never carries ID-07, MTG-02, or MTG-06 as pass when /meetings, /guests/count, and /meetingPreferences are denied", async () => {
+  const base = createTempBase("grclanker-webex-corollary-");
+  const result = await exportWebexAuditBundle(denying(["listMeetings", "getGuestCount", "getMeetingPreferences"]), sampleConfig(), base);
+  const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
+  for (const id of ["WEBEX-ID-07", "WEBEX-MTG-02", "WEBEX-MTG-06"]) {
+    const item = findings.find((entry) => entry.id === id);
+    assert.equal(item.status, "warn", `${id} must not be pass in the exported bundle`);
+  }
+  assert.match(byId(findings, "WEBEX-ID-07").summary, /GET \/guests\/count was not readable/);
+  assert.match(byId(findings, "WEBEX-MTG-02").summary, /GET \/meetings was not readable .* GET \/meetingPreferences was not readable/);
+  assert.equal(byId(findings, "WEBEX-MTG-02").evidence.meetings_seen, null);
+  assert.equal(byId(findings, "WEBEX-MTG-02").evidence.personal_meeting_room_auto_lock, null);
+  for (const id of ["WEBEX-ID-03", "WEBEX-ID-04", "WEBEX-ID-05", "WEBEX-COLLAB-04", "WEBEX-COLLAB-05", "WEBEX-COLLAB-06", "WEBEX-COLLAB-07", "WEBEX-MTG-03", "WEBEX-MTG-04"]) {
+    assert.equal(byId(findings, id).status, "pass", `${id} keeps its complete-inventory pass`);
+  }
+  assert.equal(result.errorCount, 3);
+  const errors = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+  assert.match(errors, /identity: guest_count: .*403/);
+  assert.match(errors, /meeting-hybrid-security: meeting_preferences: .*403/);
+  assert.match(errors, /meeting-hybrid-security: meetings: .*403/);
+  const meeting = JSON.parse(readFileSync(join(result.outputDir, "analysis/meeting-hybrid-security.json"), "utf8"));
+  assert.equal(meeting.summary.meetings_seen, null);
+  assert.equal(meeting.summary.inventory_status.meetings.readable, false);
+  const rawMeetings = JSON.parse(readFileSync(join(result.outputDir, "core_data/meeting-hybrid-security/meetings.json"), "utf8"));
+  assert.equal(rawMeetings.status, 403);
 });
 
 test("WEBEX-ID-02 states that mfaEnabled is documented only on the PATCH authenticationConfig schema", async () => {

@@ -1138,6 +1138,62 @@ function partialNote(result: SurfaceResult<JsonRecord[]>, label: string): string
     : "";
 }
 
+/** Readability of a collected inventory, rendered beside every count or list derived from it. */
+function inventoryStatus(result: SurfaceResult<unknown>): JsonRecord {
+  return result.ok
+    ? { readable: true, truncated: result.truncated }
+    : { readable: false, status: result.status ?? null, error: scrubValue(result.error) };
+}
+
+/** A count derived from one or more inventories is null, never a fabricated 0, when any of them was unreadable. */
+function countIfReadable(value: number, ...inventories: SurfaceResult<unknown>[]): number | null {
+  return inventories.every((result) => result.ok) ? value : null;
+}
+
+/**
+ * An inventory a finding depends on besides the one its verdict is computed from. Rule 1
+ * corollary: when it is unreadable the finding cannot pass, the summary names the endpoint,
+ * and anything derived from it is rendered as null plus status.
+ */
+interface SecondaryInventory {
+  endpoint: string;
+  scope: string;
+  result: SurfaceResult<unknown>;
+  consequence: string;
+}
+
+function unreadableDetail(item: SecondaryInventory): string {
+  if (item.result.ok) return "";
+  return item.result.status ? `${item.result.status}; scope ${item.scope}` : item.result.error;
+}
+
+function unreadableNote(secondaries: SecondaryInventory[]): string {
+  return secondaries
+    .filter((item) => !item.result.ok)
+    .map((item) => ` ${item.endpoint} was not readable (${unreadableDetail(item)}), so ${item.consequence}.`)
+    .join("");
+}
+
+function capForUnreadable(status: WebexFindingStatus, secondaries: SecondaryInventory[]): { status: WebexFindingStatus; note: string } {
+  const note = unreadableNote(secondaries);
+  return { status: status === "pass" && note.length > 0 ? "warn" : status, note };
+}
+
+/**
+ * The token-type probe as a secondary inventory: when GET /people/me was unreadable or carried
+ * no type, a bot token's partial view cannot be excluded, so findings that gate their bot-token
+ * warn path on the token type cannot pass.
+ */
+function tokenProbeInventory(me: SurfaceResult<JsonRecord>, tokenType: WebexTokenType): SecondaryInventory {
+  const result: SurfaceResult<unknown> = tokenType === "unknown" && me.ok ? { ok: false, error: "the response carried no Person.type" } : me;
+  return {
+    endpoint: "GET /people/me",
+    scope: "spark:people_read",
+    result,
+    consequence: "the token type could not be verified and a bot token's partial view cannot be excluded",
+  };
+}
+
 type SiteJudgement = { status: WebexFindingStatus; detail: string; values: JsonRecord };
 
 interface SiteSettingsCoverage {
@@ -1146,6 +1202,8 @@ interface SiteSettingsCoverage {
   /** True only when the site list was read completely and every listed site answered. */
   complete: boolean;
   coverageNote: string;
+  /** Readability of GET /meetingPreferences/sites, the reason coverage can stay incomplete when every site answered. */
+  siteListStatus: JsonRecord;
 }
 
 function worstStatus(statuses: WebexFindingStatus[]): WebexFindingStatus {
@@ -1167,9 +1225,11 @@ async function collectSiteSettings(
   const listedSites = meetingSites.ok ? meetingSites.data : asArray(meetingPreferences.ok ? meetingPreferences.data.sites : []).map(asObject);
   const siteUrls = [...new Set(listedSites.map((site) => asString(site?.siteUrl)).filter((site): site is string => Boolean(site)))];
 
+  const siteListStatus = inventoryStatus(meetingSites);
+
   if (tokenType === "bot") {
     const error = "bot token cannot read admin surfaces";
-    return { readable: [], denied: [{ site_url: "*", error, status: 403 }], complete: false, coverageNote: "", raw: { ok: false, error, status: 403 } };
+    return { readable: [], denied: [{ site_url: "*", error, status: 403 }], complete: false, coverageNote: "", siteListStatus, raw: { ok: false, error, status: 403 } };
   }
 
   const targets = siteUrls.length > 0 ? siteUrls : [undefined];
@@ -1178,11 +1238,13 @@ async function collectSiteSettings(
   const denied = results.flatMap(({ siteUrl, result }) => (result.ok ? [] : [{ site_url: siteUrl ?? "(preferred site)", error: result.error, status: result.status ?? null }]));
 
   const notes: string[] = [];
-  if (siteUrls.length === 0) {
-    notes.push(meetingSites.ok
-      ? " The site list (GET /meetingPreferences/sites) was empty, so only the administrator's preferred site was evaluated."
+  if (!meetingSites.ok) {
+    notes.push(siteUrls.length > 0
+      ? ` The site list (GET /meetingPreferences/sites) was not readable (${meetingSites.error}), so the ${siteUrls.length} sites came from the sites array of GET /meetingPreferences and site coverage cannot be confirmed complete.`
       : ` The site list (GET /meetingPreferences/sites) was not readable (${meetingSites.error}), so only the administrator's preferred site was evaluated.`);
-  } else if (meetingSites.ok && meetingSites.truncated) {
+  } else if (siteUrls.length === 0) {
+    notes.push(" The site list (GET /meetingPreferences/sites) was empty, so only the administrator's preferred site was evaluated.");
+  } else if (meetingSites.truncated) {
     notes.push(` The site list was truncated at ${siteUrls.length} sites (more pages remained), so the population is partial.`);
   }
   if (denied.length > 0 && readable.length > 0) {
@@ -1192,7 +1254,12 @@ async function collectSiteSettings(
   const raw: SurfaceResult<JsonRecord[]> = readable.length > 0
     ? { ok: true, data: readable.map((site) => ({ siteUrl: site.siteUrl, ...site.settings })), truncated: !complete }
     : { ok: false, error: denied[0]?.error ?? "no Webex site answered", status: denied[0]?.status ?? undefined };
-  return { readable, denied, complete, coverageNote: notes.join(""), raw };
+  return { readable, denied, complete, coverageNote: notes.join(""), siteListStatus, raw };
+}
+
+/** Per-site commonSettings failures for the assessment errors array, which surfaceErrors misses whenever any site answered. */
+function siteSettingsErrors(coverage: SiteSettingsCoverage): string[] {
+  return coverage.denied.map((site) => `meeting_common_settings[${site.site_url}]: ${site.error}`);
 }
 
 function judgeSites(
@@ -1210,6 +1277,7 @@ function judgeSites(
       sites: judgements.map((item) => ({ site_url: item.site_url, status: item.status, detail: item.detail, ...item.values })),
       denied_sites: coverage.denied,
       site_coverage_complete: coverage.complete,
+      site_list_status: coverage.siteListStatus,
       citation: WEBEX_DOCS.meetingCommonSettings,
     },
   };
@@ -1282,19 +1350,21 @@ function siteFinding(
   judge: (securityOptions: JsonRecord | undefined) => SiteJudgement,
   tokenType: WebexTokenType,
   manualEvidence: string,
+  secondaries: SecondaryInventory[],
   extraEvidence: JsonRecord = {},
 ): WebexFinding {
   if (coverage.readable.length === 0) {
     const denied = coverage.denied[0] ?? { site_url: "*", error: "no Webex site answered", status: null };
     return finding(id, control, title, severity, "manual",
-      `${deniedSummary("meeting common settings", "/admin/meeting/config/commonSettings", { error: denied.error, status: denied.status ?? undefined }, manualEvidence)}${coverage.coverageNote}`,
-      { denied_sites: coverage.denied, citation: WEBEX_DOCS.meetingCommonSettings, token_type: tokenType, ...extraEvidence });
+      `${deniedSummary("meeting common settings", "/admin/meeting/config/commonSettings", { error: denied.error, status: denied.status ?? undefined }, manualEvidence)}${coverage.coverageNote}${unreadableNote(secondaries)}`,
+      { denied_sites: coverage.denied, site_list_status: coverage.siteListStatus, citation: WEBEX_DOCS.meetingCommonSettings, token_type: tokenType, ...extraEvidence });
   }
   const judged = judgeSites(coverage, judge);
+  const capped = capForUnreadable(judged.status, secondaries);
   const summary = judged.status === "manual"
-    ? `Manual: ${judged.text} Collect ${manualEvidence}.`
-    : judged.text;
-  return finding(id, control, title, severity, judged.status, summary, { ...judged.evidence, token_type: tokenType, ...extraEvidence });
+    ? `Manual: ${judged.text} Collect ${manualEvidence}.${capped.note}`
+    : `${judged.text}${capped.note}`;
+  return finding(id, control, title, severity, capped.status, summary, { ...judged.evidence, token_type: tokenType, ...extraEvidence });
 }
 
 /** Person.type is documented as person, bot, or appuser (people reference, bots guide). */
@@ -1596,13 +1666,14 @@ export async function assessWebexIdentity(
     ? guestCountValue === undefined
       ? "GET /guests/count answered without a numeric body."
       : `GET /guests/count reports ${guestCountValue} guest-issuer guests.`
-    : `GET /guests/count was not readable (${guestCount.error}; scope guest-issuer:read).`;
+    : `GET /guests/count was not readable (${guestCount.error}; scope guest-issuer:read), so the guest-issuer count could not be reconciled.`;
   const guestEvidence = {
-    guests: guests.slice(0, 100).map((guest) => ({ id: asString(guest.id), display_name: asString(guest.displayName), created: asString(guest.created) })),
-    guest_count_people: guests.length,
+    guests: people.ok ? guests.slice(0, 100).map((guest) => ({ id: asString(guest.id), display_name: asString(guest.displayName), created: asString(guest.created) })) : null,
+    guest_count_people: countIfReadable(guests.length, people),
     guest_count_api: guestCountValue ?? null,
     guest_count_api_error: guestCount.ok ? null : guestCount.error,
-    people_seen: surfaceItems(people).length,
+    guest_count_api_status: inventoryStatus(guestCount),
+    people_seen: countIfReadable(surfaceItems(people).length, people),
     people_truncated: people.ok ? people.truncated : null,
     citation: WEBEX_DOCS.peopleList,
     guest_count_citation: WEBEX_DOCS.guestCount,
@@ -1617,7 +1688,7 @@ export async function assessWebexIdentity(
       `Manual: GET /people returned zero people, so no guest inventory could be built. ${guestCountNote}`,
       guestEvidence);
   } else {
-    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", people.truncated ? "warn" : "pass",
+    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", people.truncated || !guestCount.ok ? "warn" : "pass",
       `${guests.length} guest accounts (Person.type = appuser, documented as a guest user) were inventoried among ${surfaceItems(people).length} people. ${guestCountNote} Reconcile the list with the guest access policy assessed in WEBEX-MTG-03.${peoplePartial}`,
       guestEvidence);
   }
@@ -1629,12 +1700,17 @@ export async function assessWebexIdentity(
     summary: {
       org_id: orgId ?? null,
       token_type: tokenType,
-      people_seen: surfaceItems(people).length,
+      people_seen: countIfReadable(surfaceItems(people).length, people),
       people_truncated: people.ok ? people.truncated : null,
-      admin_users: adminUsers.length,
-      compliance_officers: complianceOfficers.length,
-      bots: bots.length,
-      guests: guests.length,
+      admin_users: countIfReadable(adminUsers.length, people, roles),
+      compliance_officers: countIfReadable(complianceOfficers.length, people, roles),
+      bots: countIfReadable(bots.length, people),
+      guests: countIfReadable(guests.length, people),
+      inventory_status: {
+        people: inventoryStatus(people),
+        roles: inventoryStatus(roles),
+        guest_count: inventoryStatus(guestCount),
+      },
       ...countStatuses(findings),
     },
     findings,
@@ -1669,14 +1745,15 @@ export async function assessWebexCollaborationGovernance(
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listLicenses(licenseLimit)),
   ]);
   const surfaces: SurfaceSet = { me, organizations: orgs, events, admin_audit_events: adminAudit, admin_recordings: recordings, rooms, webhooks, licenses };
+  const tokenProbe = tokenProbeInventory(me, tokenType);
 
   const externalFinding = finding("WEBEX-COLLAB-01", [4], "External communications policy", "high", "manual",
     `Manual: no documented Webex API endpoint exposes the external communication policy; the Organizations reference (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created. Guest access (control 13) is judged from the site common settings in WEBEX-MTG-03 and inventoried in WEBEX-ID-07. Export Control Hub Messaging settings (external communication allow list).`,
     { org_id: orgId ?? null, citation: WEBEX_DOCS.organizationGet });
 
   const fileDlpFinding = finding("WEBEX-COLLAB-02", [5, 21], "File sharing restrictions and messaging DLP", "high", "manual",
-    `Manual: file sharing restrictions are Control Hub settings and DLP is delivered through Events API integrations (${WEBEX_DOCS.complianceGuide}); no API field reports the policy state. Export Control Hub file sharing controls and the DLP/CASB integration evidence.${events.ok ? ` ${surfaceItems(events).length} compliance events were readable as integration evidence.` : ""}`,
-    { events_readable: events.ok, events_seen: surfaceItems(events).length, citation: WEBEX_DOCS.complianceGuide });
+    `Manual: file sharing restrictions are Control Hub settings and DLP is delivered through Events API integrations (${WEBEX_DOCS.complianceGuide}); no API field reports the policy state. Export Control Hub file sharing controls and the DLP/CASB integration evidence.${events.ok ? ` ${surfaceItems(events).length} compliance events were readable as integration evidence.` : ` GET /events was not readable (${events.error}).`}`,
+    { events_readable: events.ok, events_seen: countIfReadable(surfaceItems(events).length, events), events_status: inventoryStatus(events), citation: WEBEX_DOCS.complianceGuide });
 
   const recordingItems = surfaceItems(recordings);
   const deletedRecordings = recordingItems.filter((item) => asString(item.status) === "deleted");
@@ -1699,9 +1776,10 @@ export async function assessWebexCollaborationGovernance(
       "Manual: GET /rooms lists only spaces the token is a member of and returned none; confirm classification enforcement in Control Hub.",
       { rooms_seen: 0, citation: WEBEX_DOCS.roomsList });
   } else if (roomsWithoutClassification.length === 0) {
-    classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", rooms.truncated || tokenType === "bot" ? "warn" : "pass",
-      `All ${roomItems.length} spaces visible to this token carry a classificationId. GET /rooms only lists spaces the token is a member of, so this is the credential's view, not the whole org.${tokenType === "bot" ? " A bot token sees only its own spaces, so the view is partial." : ""}${partialNote(rooms, "rooms")}`,
-      { rooms_seen: roomItems.length, rooms_truncated: rooms.truncated, token_type: tokenType });
+    const capped = capForUnreadable(rooms.truncated || tokenType === "bot" ? "warn" : "pass", [tokenProbe]);
+    classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", capped.status,
+      `All ${roomItems.length} spaces visible to this token carry a classificationId. GET /rooms only lists spaces the token is a member of, so this is the credential's view, not the whole org.${tokenType === "bot" ? " A bot token sees only its own spaces, so the view is partial." : ""}${partialNote(rooms, "rooms")}${capped.note}`,
+      { rooms_seen: roomItems.length, rooms_truncated: rooms.truncated, token_type: tokenType, token_probe_status: inventoryStatus(tokenProbe.result) });
   } else {
     classificationFinding = finding("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", "fail",
       `${roomsWithoutClassification.length} of ${roomItems.length} visible spaces have no classificationId.${partialNote(rooms, "rooms")}`,
@@ -1728,9 +1806,10 @@ export async function assessWebexCollaborationGovernance(
       "Manual: no webhooks are visible to this token (GET /webhooks lists only the caller's webhooks); collect webhook inventories from integration owners.",
       { webhooks_seen: 0, citation: WEBEX_DOCS.webhooksList });
   } else if (insecureWebhooks.length === 0) {
-    webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", webhooks.truncated || tokenType === "bot" ? "warn" : "pass",
-      `All ${webhookItems.length} webhooks visible to this token use https targetUrl values and have a secret (${inactiveWebhooks.length} inactive).${tokenType === "bot" ? " A bot token sees only its own webhooks, so the view is partial." : ""}${partialNote(webhooks, "webhooks")}`,
-      { webhooks_seen: webhookItems.length, inactive_webhooks: inactiveWebhooks.length, webhooks_truncated: webhooks.truncated, token_type: tokenType });
+    const capped = capForUnreadable(webhooks.truncated || tokenType === "bot" ? "warn" : "pass", [tokenProbe]);
+    webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", capped.status,
+      `All ${webhookItems.length} webhooks visible to this token use https targetUrl values and have a secret (${inactiveWebhooks.length} inactive).${tokenType === "bot" ? " A bot token sees only its own webhooks, so the view is partial." : ""}${partialNote(webhooks, "webhooks")}${capped.note}`,
+      { webhooks_seen: webhookItems.length, inactive_webhooks: inactiveWebhooks.length, webhooks_truncated: webhooks.truncated, token_type: tokenType, token_probe_status: inventoryStatus(tokenProbe.result) });
   } else {
     webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "fail",
       `${insecureWebhooks.length} of ${webhookItems.length} visible webhooks lack an https targetUrl or a secret.${partialNote(webhooks, "webhooks")}`,
@@ -1782,7 +1861,7 @@ export async function assessWebexCollaborationGovernance(
 
   const ediscoveryFinding = finding("WEBEX-COLLAB-08", [11], "eDiscovery and legal hold capability", "high", "manual",
     `Manual: the compliance guide (${WEBEX_DOCS.complianceGuide}) states the eDiscovery report is available through Control Hub and documents no API for eDiscovery or legal hold configuration. Events older than 90 days require Pro Pack. Export the Control Hub eDiscovery and legal hold configuration${events.ok ? `; ${surfaceItems(events).length} compliance events were readable as capability evidence` : `; GET /events was not readable (${events.error})`}.`,
-    { events_readable: events.ok, events_seen: surfaceItems(events).length, events_truncated: events.ok ? events.truncated : null, citation: WEBEX_DOCS.complianceGuide });
+    { events_readable: events.ok, events_seen: countIfReadable(surfaceItems(events).length, events), events_truncated: events.ok ? events.truncated : null, events_status: inventoryStatus(events), citation: WEBEX_DOCS.complianceGuide });
 
   const findings = [externalFinding, fileDlpFinding, recordingFinding, classificationFinding, webhookFinding, licenseFinding, auditFinding, ediscoveryFinding];
   return {
@@ -1791,15 +1870,23 @@ export async function assessWebexCollaborationGovernance(
     summary: {
       org_id: orgId ?? null,
       token_type: tokenType,
-      rooms_seen: roomItems.length,
-      rooms_without_classification: roomsWithoutClassification.length,
-      webhooks_seen: webhookItems.length,
-      insecure_webhooks: insecureWebhooks.length,
-      recordings_seen: recordingItems.length,
-      admin_audit_events: auditItems.length,
-      compliance_events: surfaceItems(events).length,
-      unassigned_license_units: unassigned,
-      total_license_units: totalUnits,
+      rooms_seen: countIfReadable(roomItems.length, rooms),
+      rooms_without_classification: countIfReadable(roomsWithoutClassification.length, rooms),
+      webhooks_seen: countIfReadable(webhookItems.length, webhooks),
+      insecure_webhooks: countIfReadable(insecureWebhooks.length, webhooks),
+      recordings_seen: countIfReadable(recordingItems.length, recordings),
+      admin_audit_events: countIfReadable(auditItems.length, adminAudit),
+      compliance_events: countIfReadable(surfaceItems(events).length, events),
+      unassigned_license_units: countIfReadable(unassigned, licenses),
+      total_license_units: countIfReadable(totalUnits, licenses),
+      inventory_status: {
+        rooms: inventoryStatus(rooms),
+        webhooks: inventoryStatus(webhooks),
+        admin_recordings: inventoryStatus(recordings),
+        admin_audit_events: inventoryStatus(adminAudit),
+        events: inventoryStatus(events),
+        licenses: inventoryStatus(licenses),
+      },
       ...countStatuses(findings),
     },
     findings,
@@ -1844,28 +1931,43 @@ export async function assessWebexMeetingHybridSecurity(
     workspaces,
   };
 
+  const tokenProbe = tokenProbeInventory(me, tokenType);
+
   const encryptionFinding = finding("WEBEX-MTG-01", [8, 22], "Meeting E2EE and calling SRTP defaults", "high", "manual",
     `Manual: no encryption field exists in the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}), the site common settings (${WEBEX_DOCS.meetingCommonSettings}), or the session types reference (${WEBEX_DOCS.sessionTypes}, which returns id, shortName, siteUrl, name, and type), and no public API exposes a Webex Calling SRTP setting, so calling SRTP (control 22) stays folded into this finding. Export the Control Hub meeting session type (E2EE) and calling security configuration.`,
-    { meeting_preferences_readable: meetingPreferences.ok, sites_seen: surfaceItems(meetingSites).map((site) => asString(site.siteUrl)), citation: WEBEX_DOCS.meetingCommonSettings });
+    {
+      meeting_preferences_readable: meetingPreferences.ok,
+      sites_seen: meetingSites.ok ? surfaceItems(meetingSites).map((site) => asString(site.siteUrl)) : null,
+      meeting_sites_status: inventoryStatus(meetingSites),
+      citation: WEBEX_DOCS.meetingCommonSettings,
+    });
 
   const meetingItems = surfaceItems(meetings);
   const sampledWithoutLobby = meetingItems.filter((meeting) => asString(meeting.unlockedMeetingJoinSecurity) === "allowJoin");
   const sampledWithoutPassword = meetingItems.filter((meeting) => !asString(meeting.password));
   const pmr = asObject(meetingPreferences.ok ? meetingPreferences.data.personalMeetingRoom : undefined);
   const sampledMeetingEvidence = {
-    meetings_seen: meetingItems.length,
+    meetings_seen: countIfReadable(meetingItems.length, meetings),
     meetings_truncated: meetings.ok ? meetings.truncated : null,
-    sampled_allow_join_without_lobby: sampledWithoutLobby.length,
-    sampled_without_password: sampledWithoutPassword.length,
+    meetings_status: inventoryStatus(meetings),
+    sampled_allow_join_without_lobby: countIfReadable(sampledWithoutLobby.length, meetings),
+    sampled_without_password: countIfReadable(sampledWithoutPassword.length, meetings),
     personal_meeting_room_auto_lock: pmr ? asBoolean(pmr.enabledAutoLock) ?? null : null,
+    meeting_preferences_status: inventoryStatus(meetingPreferences),
+    token_probe_status: inventoryStatus(tokenProbe.result),
     meetings_citation: WEBEX_DOCS.meetingsList,
   };
+  const meetingSecondaries: SecondaryInventory[] = [
+    { endpoint: "GET /meetings", scope: "meeting:schedules_read or meeting:admin_schedule_read", result: meetings, consequence: "the sampled per-meeting lobby and password evidence is unavailable" },
+    { endpoint: "GET /meetingPreferences", scope: "meeting:preferences_read or meeting:admin_preferences_read", result: meetingPreferences, consequence: "the Personal Room auto-lock preference is unavailable" },
+    tokenProbe,
+  ];
   const lobbyFinding = siteFinding("WEBEX-MTG-02", [9], "Meeting lobby and join-before-host defaults", "high", siteSettings, judgeLobbyDefaults, tokenType,
-    "the Control Hub site Common Settings > Security page (join before host, unlisted meetings)", sampledMeetingEvidence);
+    "the Control Hub site Common Settings > Security page (join before host, unlisted meetings)", meetingSecondaries, sampledMeetingEvidence);
   const passwordFinding = siteFinding("WEBEX-MTG-06", [10], "Meeting password policy", "high", siteSettings, judgePasswordPolicy, tokenType,
-    "the Control Hub site Common Settings > Security page (strong password criteria)", sampledMeetingEvidence);
+    "the Control Hub site Common Settings > Security page (strong password criteria)", meetingSecondaries, sampledMeetingEvidence);
   const guestFinding = siteFinding("WEBEX-MTG-03", [13], "Guest meeting access policy", "medium", siteSettings, judgeGuestAccess, tokenType,
-    "the Control Hub site Common Settings > Security page (require login before site access)");
+    "the Control Hub site Common Settings > Security page (require login before site access)", [tokenProbe], { token_probe_status: inventoryStatus(tokenProbe.result) });
 
   const virtualBackgroundFinding = finding("WEBEX-MTG-07", [23], "Virtual background policy", "low", "manual",
     `Manual: virtual background enforcement is a Control Hub meeting setting with no field in the site common settings (${WEBEX_DOCS.meetingCommonSettings}), the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}), or the session types reference (${WEBEX_DOCS.sessionTypes}). Export the Control Hub meeting settings page for virtual backgrounds.`,
@@ -1914,7 +2016,7 @@ export async function assessWebexMeetingHybridSecurity(
     ? finding("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", "manual",
       deniedSummary("devices", "/devices", devices, "the Control Hub device inventory with software versions"), { citation: WEBEX_DOCS.devicesList, token_type: tokenType })
     : finding("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", "manual",
-      `Manual: the devices reference (${WEBEX_DOCS.devicesList}) documents software, upgradeChannel, connectionStatus, managedBy, personId, and workspaceId but no end-of-life flag or device-blocking policy; ${deviceItems.length} devices were inventoried (${personalModeDevices.length} assigned to a person, ${softwareVersions.length} distinct software versions, upgrade channels ${upgradeChannels.length > 0 ? upgradeChannels.join(", ") : "unreported"}, ${surfaceItems(workspaces).length} workspaces). Compare the versions against Cisco RoomOS release notes and export the Control Hub device activation policy.${partialNote(devices, "devices")}`,
+      `Manual: the devices reference (${WEBEX_DOCS.devicesList}) documents software, upgradeChannel, connectionStatus, managedBy, personId, and workspaceId but no end-of-life flag or device-blocking policy; ${deviceItems.length} devices were inventoried (${personalModeDevices.length} assigned to a person, ${softwareVersions.length} distinct software versions, upgrade channels ${upgradeChannels.length > 0 ? upgradeChannels.join(", ") : "unreported"}, ${workspaces.ok ? `${surfaceItems(workspaces).length} workspaces` : `workspaces not readable: GET /workspaces ${workspaces.error}`}). Compare the versions against Cisco RoomOS release notes and export the Control Hub device activation policy.${partialNote(devices, "devices")}`,
       {
         devices_seen: deviceItems.length,
         devices_truncated: devices.truncated,
@@ -1925,7 +2027,8 @@ export async function assessWebexMeetingHybridSecurity(
         upgrade_channel_count: upgradeChannels.length,
         devices_without_upgrade_channel: devicesWithoutUpgradeChannel,
         managed_by: [...new Set(deviceItems.map((item) => asString(item.managedBy)).filter(Boolean))],
-        workspaces_seen: surfaceItems(workspaces).length,
+        workspaces_seen: countIfReadable(surfaceItems(workspaces).length, workspaces),
+        workspaces_status: inventoryStatus(workspaces),
         citation: WEBEX_DOCS.devicesList,
       });
 
@@ -1938,16 +2041,26 @@ export async function assessWebexMeetingHybridSecurity(
       token_type: tokenType,
       sites_evaluated: siteSettings.readable.length,
       sites_denied: siteSettings.denied.length,
-      meetings_seen: meetingItems.length,
-      hybrid_clusters: clusterItems.length,
-      hybrid_connectors: connectorItems.length,
-      non_operational_connectors: nonOperational.length,
-      devices_seen: deviceItems.length,
-      workspaces_seen: surfaceItems(workspaces).length,
+      meetings_seen: countIfReadable(meetingItems.length, meetings),
+      hybrid_clusters: countIfReadable(clusterItems.length, hybridClusters),
+      hybrid_connectors: countIfReadable(connectorItems.length, hybridConnectors),
+      non_operational_connectors: countIfReadable(nonOperational.length, hybridConnectors),
+      devices_seen: countIfReadable(deviceItems.length, devices),
+      workspaces_seen: countIfReadable(surfaceItems(workspaces).length, workspaces),
+      inventory_status: {
+        meeting_preferences: inventoryStatus(meetingPreferences),
+        meeting_sites: inventoryStatus(meetingSites),
+        meeting_common_settings: inventoryStatus(siteSettings.raw),
+        meetings: inventoryStatus(meetings),
+        hybrid_clusters: inventoryStatus(hybridClusters),
+        hybrid_connectors: inventoryStatus(hybridConnectors),
+        devices: inventoryStatus(devices),
+        workspaces: inventoryStatus(workspaces),
+      },
       ...countStatuses(findings),
     },
     findings,
-    errors: surfaceErrors(surfaces),
+    errors: [...surfaceErrors(surfaces).filter((item) => !item.startsWith("meeting_common_settings:")), ...siteSettingsErrors(siteSettings)],
     rawData: surfaceRaw(surfaces),
   };
 }
