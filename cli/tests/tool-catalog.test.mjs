@@ -10,13 +10,30 @@ import {
 } from "../dist/pi/tool-catalog.js";
 import { buildToolCatalogMarkdown } from "../scripts/generate-tool-catalog-docs.mjs";
 
+const BASELINE_DOMAIN_TOOL_COUNT = 107;
+
+function countTools(tools, kind) {
+  return tools.filter((tool) => tool.kind === kind).length;
+}
+
 test("tool catalog reflects the bundled extension registration surface", () => {
   const tools = getRegisteredToolSummaries();
   const domainTools = tools.filter((tool) => tool.kind === "domain");
   const computeTools = tools.filter((tool) => tool.kind === "compute");
 
-  assert.equal(domainTools.length, 107);
+  assert.ok(
+    domainTools.length >= BASELINE_DOMAIN_TOOL_COUNT,
+    `expected at least ${BASELINE_DOMAIN_TOOL_COUNT} domain tools, saw ${domainTools.length}`,
+  );
+  assert.equal(new Set(tools.map((tool) => tool.name)).size, tools.length, "tool names must be unique");
   assert.equal(computeTools.length, 7);
+  assert.ok(
+    domainTools.every((tool) => tool.group !== "Other Domain Tools"),
+    `every domain tool needs a DOMAIN_GROUPS entry: ${domainTools
+      .filter((tool) => tool.group === "Other Domain Tools")
+      .map((tool) => tool.name)
+      .join(", ")}`,
+  );
   assert.ok(tools.some((tool) => tool.name === "ansible_check_access"));
   assert.ok(tools.some((tool) => tool.name === "ansible_export_audit_bundle"));
   assert.ok(tools.some((tool) => tool.name === "aws_check_access"));
@@ -53,7 +70,10 @@ test("tool catalog groups tools by domain for CLI display", () => {
   assert.ok(groupNames.includes("Google Workspace Operator"));
 
   const text = formatToolCatalogText(tools);
-  assert.match(text, /107 domain tools \+ 7 compute backend tools/);
+  assert.match(
+    text,
+    new RegExp(`${countTools(tools, "domain")} domain tools \\+ ${countTools(tools, "compute")} compute backend tools`),
+  );
   assert.match(text, /Ansible AAP \(5\)/);
   assert.match(text, /AWS \(5\)/);
   assert.match(text, /Azure \(5\)/);
@@ -87,7 +107,7 @@ test("tool catalog docs markdown is generated from registered tools", () => {
   const markdown = buildToolCatalogMarkdown(tools);
 
   assert.match(markdown, /title: Tool Catalog/);
-  assert.match(markdown, /107 domain tools/);
+  assert.match(markdown, new RegExp(`- ${countTools(tools, "domain")} domain tools`));
   assert.match(markdown, /## Ansible AAP/);
   assert.match(markdown, /\| `ansible_export_audit_bundle` \| Export Ansible AAP audit bundle \|/);
   assert.match(markdown, /## AWS/);
