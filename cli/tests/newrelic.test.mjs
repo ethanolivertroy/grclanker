@@ -3210,7 +3210,8 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
   const full = await assessCorollary([["authorizationManagement.groups", "full"]]);
   const roles = full.findings.find((item) => item.control === 20);
   assert.equal(roles.status, "warn");
-  assert.match(roles.summary, /^No custom roles exist in the catalog \(the customerAdministration\.roles query was readable and complete, and it returned 2 STANDARD roles\), but group grants \(authorizationManagement\.groups\) were unreadable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\), so the roles in use were not cross-checked against the catalog\.$/);
+  // The gap leads; the catalog's zero count follows it so it is not read as a confirmed absence of custom roles.
+  assert.match(roles.summary, /^Group grants \(authorizationManagement\.groups\) were unreadable \(authorizationManagement\.groups: authentication domain Corporate SSO, authentication domain Contractors: .*Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\), so the roles in use were not cross-checked against the catalog; the catalog itself lists no custom roles \(the customerAdministration\.roles query was readable and complete, and it returned 2 STANDARD roles\)\.$/);
   assert.equal(roles.evidence.custom_roles_in_group_grants, null);
   assert.equal(roles.evidence.groups_granted_custom_roles, null);
   assert.match(roles.evidence.group_grants_status, /^unreadable \(authorizationManagement\.groups: /);
@@ -3219,7 +3220,7 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
   const partial = await assessCorollary([["authorizationManagement.groups", "partial"]]);
   const partly = partial.findings.find((item) => item.control === 20);
   assert.equal(partly.status, "warn");
-  assert.match(partly.summary, /^Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)\. No custom roles exist in the catalog .* and none appears in the readable group grants, but the group grant listing \(authorizationManagement\.groups\) is incomplete, so the roles in use were only partly cross-checked against the catalog\.$/);
+  assert.match(partly.summary, /^Partial view: groups: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: NerdGraph returned errors: Not authorized \(at actor\.organization\.authorizationManagement\.authenticationDomains\.groups\)\)\. The group grant listing \(authorizationManagement\.groups\) is incomplete, so the roles in use were only partly cross-checked against the catalog; no custom role appears in the readable group grants and the catalog itself lists none \(the customerAdministration\.roles query was readable and complete, and it returned 2 STANDARD roles\)\.$/);
   assert.equal(partly.evidence.custom_roles_in_group_grants, null, "an empty list from the readable domain only is not a list");
   assert.equal(partly.evidence.groups_granted_custom_roles, null);
   assert.match(partly.evidence.group_grants_status, /^partial: 1 scope unreadable \(authorizationManagement\.groups: authentication domain Contractors: /);
@@ -3231,7 +3232,7 @@ test("rule 1 corollary hit 8: NR-20 is limited to warn naming the path when grou
   // The group query is never issued when the domain listing it iterates is unreadable, so the grants are not
   // collected (not unreadable) and the status names the upstream query, its failure status, and its path. The
   // compacted cause keeps the status and path and elides the boilerplate between them.
-  assert.match(viaDomains.summary, /group grants \(authorizationManagement\.groups\) were not collected \(authorizationManagement\.groups was not queried for any authentication domain: userManagement\.authenticationDomains was .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\)/);
+  assert.match(viaDomains.summary, /^Group grants \(authorizationManagement\.groups\) were not collected \(authorizationManagement\.groups was not queried for any authentication domain: userManagement\.authenticationDomains was .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\), so the roles in use were not cross-checked against the catalog; the catalog itself lists no custom roles/);
   assert.equal(viaDomains.evidence.custom_roles_in_group_grants, null);
   assert.equal(viaDomains.evidence.groups_granted_custom_roles, null);
   assert.match(viaDomains.evidence.group_grants_status, /^not collected \(authorizationManagement\.groups was not queried for any authentication domain: userManagement\.authenticationDomains was .*Not authorized \(at actor\.organization\.userManagement\.authenticationDomains\)\)\)$/);

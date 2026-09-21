@@ -1964,6 +1964,48 @@ export type NewrelicClientSurface = Pick<
   | "listRestUsers"
 >;
 
+type NewrelicClientSurfaceMethod = keyof NewrelicClientSurface;
+
+/**
+ * Every method of the client surface, as a runtime list so tests can tie their per-inventory denial tables to the
+ * queries the collectors and `check_access` run. The `satisfies` clause rejects a name outside the surface and the
+ * exhaustiveness check below fails to compile when a surface method is missing from the list.
+ */
+export const NEWRELIC_CLIENT_SURFACE_METHODS = [
+  "getResolvedConfig",
+  "getCurrentUser",
+  "getOrganization",
+  "listAccounts",
+  "resolveAccountIds",
+  "listAuthenticationDomains",
+  "listOrganizationAuthenticationDomains",
+  "listDomainUsers",
+  "listDomainGroupGrants",
+  "listRoles",
+  "listApiKeys",
+  "runNrql",
+  "searchEntities",
+  "countEntities",
+  "listAlertPolicies",
+  "listNrqlConditions",
+  "listNotificationDestinations",
+  "listNotificationChannels",
+  "listWorkflows",
+  "listEventRetentionRules",
+  "listRetentionNamespaces",
+  "listObfuscationRules",
+  "listObfuscationExpressions",
+  "listPipelineCloudRules",
+  "listNrqlDropRules",
+  "getSyntheticScript",
+  "listDashboardLiveUrls",
+  "listRestUsers",
+] as const satisfies readonly NewrelicClientSurfaceMethod[];
+
+type UnlistedSurfaceMethod = Exclude<NewrelicClientSurfaceMethod, (typeof NEWRELIC_CLIENT_SURFACE_METHODS)[number]>;
+const surfaceMethodListIsExhaustive: [UnlistedSurfaceMethod] extends [never] ? true : never = true;
+void surfaceMethodListIsExhaustive;
+
 type IdentityClient = Pick<
   NewrelicClientSurface,
   | "getResolvedConfig"
@@ -2188,9 +2230,14 @@ function coreDataFile(item: Collected<unknown>, records: unknown = item.data): u
   return { status: collectionStatus(item), records: isReadable(item) ? records : null };
 }
 
-/** Errors to disclose when the account list itself could not be resolved, so every account-scoped assessment names the cause. */
-function accountScopeErrors(scope: AccountScope): string[] {
-  return scope.error !== undefined ? [`actor.accounts: ${scope.error}`] : [];
+/**
+ * Errors to disclose for an account-scoped assessment: the failed account resolution first (so every such assessment
+ * names the cause), then every failure and skipped query, each text once even when the accounts inventory failed
+ * with the same message.
+ */
+function accountScopeErrors(scope: AccountScope, items: Array<Collected<unknown>>): string[] {
+  const resolution = scope.error !== undefined ? [`actor.accounts: ${scope.error}`] : [];
+  return [...new Set([...resolution, ...collectedErrors(items)])];
 }
 
 /** Evidence for the accounts in scope: the resolved ids with the query they came from, or null with the reason none resolved. */
@@ -3321,7 +3368,7 @@ export function assessNewrelicAccessControlData(
     if (broadAccessUsers.length > 0) {
       return verdict("warn", `${broadAccessUsers.length}/${users.length} non-admin users hold organization-scoped grants or access to more than ${maxAccountsPerUser} accounts.`);
     }
-    if (!accountsReadable) return manualVerdict(`No non-admin users exceed ${maxAccountsPerUser} accounts, but actor.accounts was not readable (${causeOf(data.accounts)}), so the account population is unknown. Collect the account list from Administration > Access Management > Accounts.`);
+    if (!accountsReadable) return manualVerdict(`Accounts (actor.accounts) were ${unavailableDetail(data.accounts)}, so the account population is unknown; within the readable group grants, no non-admin user exceeds ${maxAccountsPerUser} accounts. Collect the account list from Administration > Access Management > Accounts.`);
     if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0) {
       return verdict("warn", `No mapped non-admin user exceeds ${maxAccountsPerUser} accounts, but ${usersWithoutGroupData.length} users expose no group membership and ${groupsWithoutRoleData.length} groups expose no role grants, so their access is unknown.`);
     }
@@ -3368,11 +3415,12 @@ export function assessNewrelicAccessControlData(
     if (!isComplete(data.roles)) return verdict("warn", `No custom roles appeared among ${roles.length} roles, but the role listing was incomplete, so unseen custom roles cannot be ruled out.`);
     if (standardRoles.length === 0) return manualVerdict(`No custom roles appeared among ${roles.length} roles, but no ${ROLE_TYPE_STANDARD} roles were returned either, so the role listing is not trustworthy. Collect the role list from Administration > Access Management > Roles.`);
     const catalogClause = `the ${ROLE_CATALOG_SOURCE} query was readable and complete, and it returned ${standardRoles.length} ${ROLE_TYPE_STANDARD} roles`;
+    // The gap leads and the catalog's zero count follows, so the absence of custom roles is not read as confirmed.
     if (!grantsReadable) {
-      return verdict("warn", `No custom roles exist in the catalog (${catalogClause}), but group grants (authorizationManagement.groups) were ${unavailableDetail(data.groupGrants)}, so the roles in use were not cross-checked against the catalog.`);
+      return verdict("warn", `Group grants (authorizationManagement.groups) were ${unavailableDetail(data.groupGrants)}, so the roles in use were not cross-checked against the catalog; the catalog itself lists no custom roles (${catalogClause}).`);
     }
     if (!isComplete(data.groupGrants)) {
-      return verdict("warn", `No custom roles exist in the catalog (${catalogClause}) and none appears in the readable group grants, but the group grant listing (authorizationManagement.groups) is incomplete, so the roles in use were only partly cross-checked against the catalog.`);
+      return verdict("warn", `The group grant listing (authorizationManagement.groups) is incomplete, so the roles in use were only partly cross-checked against the catalog; no custom role appears in the readable group grants and the catalog itself lists none (${catalogClause}).`);
     }
     return verdict("pass", `No custom roles exist. Both conditions for accepting this hold: ${catalogClause}. The complete group grant listing confirms none is in use.`);
   };
@@ -3498,11 +3546,11 @@ export function assessNewrelicAccessControlData(
       ...measured("cross_environment_users", accessMap, crossEnvironmentUsers.length),
       ...measured("custom_roles", data.roles, customRoles.length),
       ...measured("api_key_audit_events", data.apiKeyAuditEvents, data.apiKeyAuditEvents.data.length),
-      collection_errors: collectedErrors(allCollected).length,
+      collection_errors: accountScopeErrors(data.accountScope, allCollected).length,
       coverage_limitations: coverage.length,
     },
     findings,
-    errors: [...accountScopeErrors(data.accountScope), ...collectedErrors(allCollected)],
+    errors: accountScopeErrors(data.accountScope, allCollected),
     coverage,
     coreData: {
       "core_data/accounts.json": coreDataFile(data.accounts),
@@ -3873,11 +3921,11 @@ export function assessNewrelicAlertingData(
       ...measured("enabled_workflows", data.workflows, enabledWorkflows.length),
       ...measured("enriched_external_workflows", routing, enrichedExternalWorkflows.length),
       ...measured("workloads", data.workloads, workloads.length),
-      collection_errors: collectedErrors(allCollected).length,
+      collection_errors: accountScopeErrors(data.accountScope, allCollected).length,
       coverage_limitations: coverage.length,
     },
     findings,
-    errors: [...accountScopeErrors(data.accountScope), ...collectedErrors(allCollected)],
+    errors: accountScopeErrors(data.accountScope, allCollected),
     coverage,
     coreData: {
       "core_data/alert_policies.json": coreDataFile(data.policies),
@@ -4357,7 +4405,8 @@ export function assessNewrelicDataGovernanceData(
     ...measured("monitors_without_type", data.syntheticMonitors, monitorsWithoutType.length),
     ...measured("scripted_monitors", data.syntheticMonitors, scriptedMonitors.length),
     ...measured("scripts_sampled", data.syntheticScripts, scripts.length),
-    scripts_sample_complete: isComplete(data.syntheticScripts),
+    // The sample flag is null, not false, when the scan was never issued or lost a monitor, since its status says why.
+    scripts_sample_complete: unlessUnreadable(data.syntheticScripts, isComplete(data.syntheticScripts)),
     scripts_status: collectionStatus(data.syntheticScripts),
     ...measured("scripts_with_secret_indicators", data.syntheticScripts, sample(scriptsWithSecrets.map((script) => `${asString(script.name) ?? asString(script.guid)}: ${asArray(script.secretIndicators).join(", ")}`))),
     ...measured("scripts_using_secure_credentials", data.syntheticScripts, scriptsUsingSecureCredentials.length),
@@ -4436,11 +4485,11 @@ export function assessNewrelicDataGovernanceData(
       ...measured("log_events_last_day", data.logVolume, logCount),
       ...measured("log_secret_pattern_matches", data.logSecretMatches, secretMatchCount),
       ...measured("reporting_hosts", data.infraHosts, reportingHosts),
-      collection_errors: collectedErrors(allCollected).length,
+      collection_errors: accountScopeErrors(data.accountScope, allCollected).length,
       coverage_limitations: coverage.length,
     },
     findings,
-    errors: [...accountScopeErrors(data.accountScope), ...collectedErrors(allCollected)],
+    errors: accountScopeErrors(data.accountScope, allCollected),
     coverage,
     coreData: {
       "core_data/retention_rules.json": coreDataFile(data.retentionRules),
