@@ -881,6 +881,51 @@ test("assessBoxIdentityAccess falls back to manual findings when the API refuses
   assert.match(findingById(nothingReadable, "BOX-03").summary, /^Neither enterprise MFA settings/);
 });
 
+test("assessBoxIdentityAccess does not count failed logins as user activity", async () => {
+  const fixture = {
+    ...hardenedFixture(),
+    users: [user("admin-1", { role: "admin" }), user("member-1"), user("member-2"), user("member-3")],
+    events: [
+      loginEvent("admin-1", "ADMIN_LOGIN"),
+      loginEvent("member-1"),
+      loginEvent("member-2", "FAILED_LOGIN"),
+      { ...loginEvent("member-2", "FAILED_LOGIN"), event_id: "FAILED_LOGIN-member-2-retry" },
+      loginEvent("member-3", "FAILED_LOGIN"),
+    ],
+  };
+  const base = createStubClient(fixture);
+  let requestedTypes;
+  const client = {
+    ...base,
+    async listEnterpriseEvents(options) {
+      requestedTypes = options.eventTypes;
+      return base.listEnterpriseEvents(options);
+    },
+  };
+
+  const result = await assessBoxIdentityAccess(client, { lookbackDays: 30 });
+  assert.ok(requestedTypes.includes("FAILED_LOGIN"), "failed logins stay in the evidence query");
+  assert.ok(requestedTypes.includes("LOGIN"));
+  assertStatuses(result, { "BOX-24": "fail" });
+  const inactive = findingById(result, "BOX-24");
+  assert.deepEqual(inactive.evidence.inactive_candidates, ["member-2@example.com", "member-3@example.com"]);
+  assert.deepEqual(inactive.evidence.inactive_candidates_with_failed_logins, ["member-2@example.com", "member-3@example.com"]);
+  assert.equal(inactive.evidence.failed_login_events, 3);
+  assert.equal(inactive.evidence.activity_events, 2);
+  assert.equal(inactive.evidence.sampled_events, 5);
+  assert.match(inactive.summary, /2\/4 active users had no successful login or content activity/);
+  assert.match(inactive.summary, /2 of them only recorded failed logins/);
+  assert.equal(result.summary.inactive_candidates, 2);
+
+  const recovered = await assessBoxIdentityAccess(createStubClient({
+    ...fixture,
+    events: [...fixture.events, loginEvent("member-2"), loginEvent("member-3", "UPLOAD")],
+  }), { lookbackDays: 30 });
+  assertStatuses(recovered, { "BOX-24": "pass" });
+  assert.deepEqual(findingById(recovered, "BOX-24").evidence.inactive_candidates, []);
+  assert.equal(findingById(recovered, "BOX-24").evidence.failed_login_events, 3);
+});
+
 test("assessBoxIdentityAccess treats null configuration categories as absent data instead of failing", async () => {
   const result = await assessBoxIdentityAccess(createStubClient({
     ...hardenedFixture(),

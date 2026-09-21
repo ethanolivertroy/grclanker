@@ -71,7 +71,6 @@ const GROUP_FIELDS = ["id", "type", "name", "provenance", "invitability_level", 
 const ACTIVITY_EVENT_TYPES = [
   "LOGIN",
   "ADMIN_LOGIN",
-  "FAILED_LOGIN",
   "CHANGE_ADMIN_ROLE",
   "NEW_USER",
   "UPLOAD",
@@ -85,6 +84,12 @@ const ACTIVITY_EVENT_TYPES = [
   "LOCK",
   "UNLOCK",
 ];
+
+const ACTIVITY_EVENT_TYPE_SET = new Set(ACTIVITY_EVENT_TYPES);
+
+const FAILED_LOGIN_EVENT_TYPE = "FAILED_LOGIN";
+
+const IDENTITY_EVENT_TYPES = [...ACTIVITY_EVENT_TYPES, FAILED_LOGIN_EVENT_TYPE];
 
 const SHARING_EVENT_TYPES = [
   "ENTERPRISE_APP_AUTHORIZATION_UPDATE",
@@ -1646,7 +1651,7 @@ export async function collectBoxIdentityData(
     collect(() => client.getEnterpriseConfiguration(["security", "user_settings"]), {}),
     collect(() => client.listUsers(userLimit), []),
     collect(() => client.listEnterpriseEvents({
-      eventTypes: ACTIVITY_EVENT_TYPES,
+      eventTypes: IDENTITY_EVENT_TYPES,
       createdAfter: lookbackStart(now, lookbackDays),
       limit: eventLimit,
     }), []),
@@ -1885,7 +1890,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   );
 
   const eventsReadable = !data.events.error;
-  const activeActorIds = new Set(events.map(eventActorId).filter((id): id is string => Boolean(id)));
+  const activityEvents = events.filter((event) => ACTIVITY_EVENT_TYPE_SET.has(eventType(event)));
+  const failedLogins = events.filter((event) => eventType(event) === FAILED_LOGIN_EVENT_TYPE);
+  const activeActorIds = new Set(activityEvents.map(eventActorId).filter((id): id is string => Boolean(id)));
   const cutoff = lookbackStart(data.now, data.lookbackDays);
   const inactiveCandidates = activeUsers.filter((user) => {
     const createdAt = parseIsoDate(user.created_at);
@@ -1893,18 +1900,30 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     const id = asString(user.id);
     return Boolean(id) && !activeActorIds.has(id as string);
   });
+  const failedLoginActorIds = new Set(failedLogins.map(eventActorId).filter((id): id is string => Boolean(id)));
+  const inactiveWithFailedLogins = inactiveCandidates.filter((user) => failedLoginActorIds.has(asString(user.id) ?? ""));
   const eventsTruncated = events.length >= data.eventLimit;
   const inactiveRatio = activeUsers.length > 0 ? inactiveCandidates.length / activeUsers.length : 0;
+  const inactivityEvidence = {
+    lookback_days: data.lookbackDays,
+    active_users: activeUsers.length,
+    inactive_candidates: truncateList(inactiveCandidates.map(userLabel)),
+    inactive_candidates_with_failed_logins: truncateList(inactiveWithFailedLogins.map(userLabel)),
+    sampled_events: events.length,
+    activity_events: activityEvents.length,
+    failed_login_events: failedLogins.length,
+    event_limit: data.eventLimit,
+  };
   findings.push(
     !usersReadable || !eventsReadable
       ? finding(24, "manual", `Inactive users could not be derived because ${!usersReadable ? `users were unreadable (${unreadableReason(data.users)})` : `enterprise events were unreadable (${unreadableReason(data.events)})`}.`, { lookback_days: data.lookbackDays }, `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`)
       : eventsTruncated
-        ? finding(24, "warn", `The ${data.eventLimit}-event sample window filled up, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, { lookback_days: data.lookbackDays, inactive_candidates: truncateList(inactiveCandidates.map(userLabel)), sampled_events: events.length, event_limit: data.eventLimit })
+        ? finding(24, "warn", `The ${data.eventLimit}-event sample window filled up, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence)
         : inactiveCandidates.length === 0
-          ? finding(24, "pass", `All ${activeUsers.length} active users showed activity events within the last ${data.lookbackDays} days.`, { lookback_days: data.lookbackDays, active_users: activeUsers.length, sampled_events: events.length })
+          ? finding(24, "pass", `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
           : inactiveRatio > 0.25
-            ? finding(24, "fail", `${inactiveCandidates.length}/${activeUsers.length} active users had no login or content activity in the last ${data.lookbackDays} days.`, { lookback_days: data.lookbackDays, inactive_candidates: truncateList(inactiveCandidates.map(userLabel)), sampled_events: events.length })
-            : finding(24, "warn", `${inactiveCandidates.length}/${activeUsers.length} active users had no login or content activity in the last ${data.lookbackDays} days.`, { lookback_days: data.lookbackDays, inactive_candidates: truncateList(inactiveCandidates.map(userLabel)), sampled_events: events.length }),
+            ? finding(24, "fail", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence)
+            : finding(24, "warn", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence),
   );
 
   return {

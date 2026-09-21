@@ -135,7 +135,7 @@ Status semantics: `pass` means the API evidence satisfies the control, `warn` me
 | 21 | Password policy strength | identity_access | BOX-21 | pass at or above `min_password_length` with weak password prevention and two character classes; warn between 8 and the target; fail below 8 |
 | 22 | Session duration limits | identity_access | BOX-22 | pass when `session_duration` (and any custom duration) carries an explicit unit and is at or below `max_session_hours`; fail above or when unlimited; warn with the raw value when the value has no unit (Box does not document one) or cannot be interpreted |
 | 23 | IP allowlisting | identity_access | BOX-23 | manual: reports Shield IP lists, enterprise IP restrictions are not exposed |
-| 24 | Inactive user detection | identity_access | BOX-24 | pass when every active managed user has activity events in `lookback_days`; warn or fail on inactive users; warn when the event sample is truncated |
+| 24 | Inactive user detection | identity_access | BOX-24 | pass when every active managed user has successful login or content activity events in `lookback_days`; warn or fail on inactive users; warn when the event sample is truncated. `FAILED_LOGIN` events are collected as evidence but never count as activity |
 | 25 | Content access monitoring | shield_monitoring | BOX-25 | pass when anomaly rules or Shield alerts exist; warn when only raw download events exist or when Shield rules or the event stream are unreadable; fail when both are readable and neither signal is present |
 
 ## Framework mappings
@@ -153,7 +153,7 @@ The script exits 0 with a skip message when no Box credentials are present. With
 ## Limitations and manual controls
 
 - Controls 8, 19, and 23 are always `manual`: the Box API does not expose the open shared link password requirement, the app approval policy, or enterprise IP allowlisting. Controls 10 and 18 are `manual` whenever device pins or co-admins exist because the device trust policy and co-admin permission sets are not exposed.
-- Inactive user detection correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar) because the user object has no last login field. Raise `event_limit` for large enterprises; a truncated sample is reported as `warn`.
+- Inactive user detection correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar) because the user object has no last login field. `FAILED_LOGIN` events are recorded in the evidence (`failed_login_events`, `inactive_candidates_with_failed_logins`) but do not make an account active, so a user who only receives credential-stuffing attempts still counts as inactive. Raise `event_limit` for large enterprises; a truncated sample is reported as `warn`.
 - Enterprise configuration, Shield lists, and Shield rules come from the versioned `2025.0` endpoints and require Manage enterprise properties. Retention and legal hold endpoints require Box Governance, Shield endpoints require Box Shield; missing licenses surface as `manual` findings with the reason.
 - Box's published rate limit is 1000 API requests per minute per user; the client honors `retry-after` on 429 and applies exponential backoff on 5xx.
 - Watermarking, classification application, and SIEM consumption of the event stream are verified at the enterprise level; sampled folder reviews remain a human step and are listed in `manualEvidence`.
