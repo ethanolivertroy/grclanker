@@ -3,11 +3,12 @@ slug: "veracode-sec-inspector"
 name: "Veracode Security Inspector"
 vendor: "Veracode"
 category: "vulnerability-application-security"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/veracode-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/veracode-sec-inspector"
 ---
 
 # Veracode Security Inspector - Architecture Specification
@@ -16,7 +17,23 @@ source_repo: "https://github.com/hackIDLE/veracode-sec-inspector"
 
 Veracode Security Inspector is a security compliance inspection tool for the Veracode Application Security Platform. It audits application scan coverage, policy compliance status, flaw aging, SCA library health, access controls, pipeline integration, and security program effectiveness across a Veracode enterprise account. The tool produces structured findings mapped to major compliance frameworks, enabling continuous compliance monitoring of application security programs.
 
-Written in Go with a hybrid CLI/TUI architecture, it performs read-only inspection of Veracode platform data using both the REST and XML APIs and produces machine-readable JSON and human-readable reports.
+The original design described a standalone Go CLI/TUI that used both the REST and XML APIs. The shipped implementation is a grclanker native tool set written in TypeScript that performs read-only inspection through the HMAC-signed REST APIs only and produces normalized findings, tables, and an audit bundle.
+
+### grclanker implementation
+
+The Veracode inspector ships in `cli/extensions/grc-tools/veracode.ts` and registers these tools:
+
+| Tool | Purpose |
+|------|---------|
+| `veracode_check_access` | Probes every read surface (applications, policies, findings, summary reports, users, API credentials, teams, roles, SCA workspaces, dynamic analyses) and reports readable counts, HTTP status, and the missing role for each surface (Security Insights, Reviewer, Administrator, Workspace roles) |
+| `veracode_assess_scan_coverage` | Controls 1, 4, 10, 11, 13, 14, 19 |
+| `veracode_assess_policy_compliance` | Controls 2, 15, 20 |
+| `veracode_assess_findings_hygiene` | Controls 3, 12, 16, 17 |
+| `veracode_assess_sca_posture` | Controls 5, 6, 18 |
+| `veracode_assess_access_controls` | Controls 7, 8, 9 |
+| `veracode_export_audit_bundle` | Runs every assessment and writes `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip paired with the allocated output directory |
+
+Findings are normalized as `{ id, title, severity, status, summary, evidence, mappings }` with `status` in `pass`, `warn`, `fail`, `manual`, and every finding carries the framework mapping row from section 5. The integration guide lives at `src/content/docs/docs/integrations/veracode.md`, regression tests in `cli/tests/veracode.test.mjs`, and a live smoke in `cli/scripts/veracode-live-smoke.mjs` (`npm --prefix cli run test:veracode:live`).
 
 ## 2. APIs & SDKs
 
@@ -45,8 +62,8 @@ Written in Go with a hybrid CLI/TUI architecture, it performs read-only inspecti
 
 ### API Details
 
-- **Base URL**: `https://api.veracode.com` (US), `https://api.veracode.eu` (EU)
-- **Pagination**: REST APIs use cursor-based pagination with `page` and `size` parameters; `_embedded` and `_links` (HAL format)
+- **Base URL**: `https://api.veracode.com` (US commercial), `https://api.veracode.eu` (EU), `https://api.veracode.us` (US federal)
+- **Pagination**: REST APIs use page-number pagination with `page` and `size` parameters; responses are HAL with `_embedded`, `_links`, and `page` (`number`, `size`, `total_elements`, `total_pages`)
 - **Rate Limits**: Documented as "fair use" with no published hard limits; in practice, sustained >100 req/s may trigger throttling
 - **Response Format**: JSON (REST APIs), XML (legacy APIs)
 - **API Versioning**: REST APIs are versioned in the URL path; XML APIs are versioned (v5.0 is current)
@@ -76,11 +93,13 @@ Veracode uses a custom HMAC-SHA-256 signature scheme (not bearer tokens, not OAu
 
 ### Signing Process
 
-1. Generate a nonce (unique random hex string)
+1. Generate a nonce (16 random bytes, hex encoded)
 2. Compute timestamp (Unix epoch in milliseconds)
-3. Derive signing key: `HMAC(HMAC(HMAC(HMAC(nonce, api_key), timestamp), "vcode_request_version_1"), "vcode_hmac_sha_256")`
-4. Compute signature: `HMAC(signing_key, "id={id}&host={host}&url={url}&method={method}")` (lowercase hex)
+3. Derive signing key with the API key hex-decoded as the first HMAC key: `signing_key = HMAC(HMAC(HMAC(api_key_bytes, nonce_bytes), timestamp), "vcode_request_version_1")`
+4. Compute signature: `HMAC(signing_key, "id={id}&host={host}&url={path_and_query}&method={METHOD}")` (lowercase hex)
 5. Construct Authorization header with id, ts, nonce, sig fields
+
+The earlier draft of this spec listed a fourth derivation step keyed on `"vcode_hmac_sha_256"`; the published Veracode signing examples use the three-step chain above, and the implementation follows the published algorithm.
 
 ### Credential Storage
 
@@ -98,10 +117,12 @@ veracode_api_key_secret = <api_key>
 
 ### Configuration Precedence
 
-1. CLI flags (`--api-id`, `--api-key`)
+1. Explicit tool arguments (`api_key_id`, `api_key_secret`; the legacy CLI design used `--api-id`, `--api-key`)
 2. Environment variables (`VERACODE_API_KEY_ID`, `VERACODE_API_KEY_SECRET`)
-3. Credentials file (`~/.veracode/credentials`) with profile selection
+3. Credentials file (`~/.veracode/credentials`, overridable with `credentials_file` or `VERACODE_API_CREDENTIALS_FILE`) with profile selection through `profile` or `VERACODE_API_PROFILE`
 4. Default profile: `default`
+
+Region selection uses `region` or `VERACODE_REGION` (`us`, `eu`, `us-fed`), and `base_url` or `VERACODE_API_BASE_URL` overrides the host explicitly.
 
 ### Required Permissions
 
@@ -374,4 +395,35 @@ GOOS=windows GOARCH=amd64 go build -o bin/veracode-sec-inspector-windows-amd64.e
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as a TypeScript native tool set (see "grclanker implementation" in section 1). The Go CLI/TUI layout in sections 7 through 9 is retained as the original design record; it was not built.
+
+### What shipped
+
+- HMAC-SHA-256 request signing per the published Veracode algorithm, with the secret redacted from every error message and never written into bundles
+- Configuration precedence: explicit tool arguments, then `VERACODE_API_KEY_ID` and `VERACODE_API_KEY_SECRET`, then the `~/.veracode/credentials` INI profile file (`VERACODE_API_PROFILE`), with `us`, `eu`, and `us-fed` regions
+- HAL pagination that runs to `page.total_pages` and records truncation, 429 and 5xx retry with backoff, and request timeouts
+- `veracode_check_access` plus five read-only assessment tools covering all 20 controls, and `veracode_export_audit_bundle`
+- 17 of 20 controls are evaluated from API data: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 19
+- 3 of 20 controls always render as `manual` with the evidence a human must collect: 11 (prescan module coverage lives only in the XML `getprescanresults.do` API), 14 (Pipeline Scan results are not persisted on application profiles), 20 (the Collections API is not in the published REST reference; business-unit grouping is provided as supporting evidence)
+- Verdict safety: forbidden or errored endpoints yield `manual`, empty inventories never pass by default, items without dates are bucketed separately and cap at `warn`, unlicensed SCA or Dynamic Analysis renders as `manual`, and partial views (pagination truncation, the `max_applications` sampling cap, team-scoped visibility) downgrade `pass` to `warn` with seen and total counts
+- Schema fidelity: control 1 judges the latest STATIC entry in `scans[]` (published status and `modified_date`), control 4 judges the strictest `scan_frequency_rules` across every assigned policy per scan type plus the business criticality tier (VERY_HIGH every 7 days, other tiers every 31 days by default), control 16 counts findings carrying an `annotations[].action` FP mitigation, control 18 reads `linked_projects` from the documented `LinkedProjects` response, users are listed with `detailed`, `include_roles`, and `include_teams`, and teams with `all_for_org=true` (a refused flag is recorded and the member-only list is treated as a partial view)
+- Regression tests in `cli/tests/veracode.test.mjs` and a live smoke script that skips cleanly without credentials
+
+### Deviations from the original spec
+
+- The signing key chain is the three-step chain documented by Veracode (nonce, timestamp, `vcode_request_version_1`); the draft's fourth step keyed on `vcode_hmac_sha_256` does not appear in the published examples and was dropped. The `url` component of the data string includes the query string.
+- Pagination is page-number based (`page`, `size`, `page.total_pages`), not cursor based.
+- The XML APIs are not used; the implementation is REST only, which is why control 11 is manual.
+- The Collections API listed in section 2 is not called because it is not in the published REST reference.
+- Region `api.veracode.us` (US federal) was added to the documented base URLs.
+- Per-application calls (sandboxes, findings, summary reports, SCA project links) are sampled up to `max_applications` (default 100) and the verdict flags the partial view instead of passing on it.
+- Thresholds are tool arguments (`max_scan_age_days`, `critical_scan_interval_days`, `standard_scan_interval_days`, `max_fp_rate_percent`, `max_flaw_density_per_kloc`, `sca_cvss_threshold`, `max_admins`, `inactive_days`, `max_credential_age_days`, `max_unrestricted_users`) rather than CLI flags or a YAML file.
+- Control 16 uses the enumerated `annotations[].action` value `FP` as the false positive signal because `finding_status.resolution` is an unenumerated string in the published Findings reference; the resolution value is exported as evidence only.
+- Findings are exported as JSON and Markdown inside the audit bundle; the CSV, HTML, SARIF, and TUI outputs from the Go design were not built.
+
+### What remains
+
+- Pipeline Scan evidence (control 14) and prescan module coverage (control 11) if Veracode publishes REST endpoints for them
+- Collections compliance posture (control 20) once the Collections API is in the published reference
+- Report generation through the Reporting API, which requires a POST and is therefore outside the read-only contract
+- Optional SARIF or CSV exports if consumers need them

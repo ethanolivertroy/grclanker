@@ -3,11 +3,11 @@ slug: "knowbe4-sec-inspector"
 name: "KnowBe4 Security Inspector"
 vendor: "KnowBe4"
 category: "vulnerability-application-security"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/knowbe4-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # KnowBe4 Security Inspector - Architecture Specification
@@ -17,6 +17,19 @@ source_repo: "https://github.com/hackIDLE/knowbe4-sec-inspector"
 KnowBe4 Security Inspector is a security compliance inspection tool for KnowBe4 Security Awareness Training and Simulated Phishing platforms. It audits phishing simulation coverage, training completion rates, user risk scores, campaign effectiveness, and organizational security awareness posture through the KnowBe4 Reporting API. The tool produces structured findings mapped to major compliance frameworks, enabling continuous monitoring of human-layer security controls.
 
 Written in Go with a hybrid CLI/TUI architecture, it performs read-only inspection of KnowBe4 account configuration and metrics via the REST Reporting API and produces machine-readable JSON and human-readable reports.
+
+### grclanker implementation
+
+The controls in this spec ship as native grclanker tools in `cli/extensions/grc-tools/knowbe4.ts` (TypeScript, Reporting API plus optional PhishER GraphQL) rather than as the standalone Go binary described in sections 7 through 9:
+
+- `knowbe4_check_access`: probes every Reporting API read surface and the PhishER GraphQL endpoint when a key is configured
+- `knowbe4_assess_phishing_program`: controls 1, 2, 6, 7, 9, 19, 20
+- `knowbe4_assess_training_program`: controls 3, 4, 10, 11, 17
+- `knowbe4_assess_user_risk`: controls 5, 8, 18
+- `knowbe4_assess_account_governance`: controls 12, 13, 14, 15, 16
+- `knowbe4_export_audit_bundle`: all twenty controls plus `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and a zip archive
+
+Findings are `KNOWBE4-01` through `KNOWBE4-20` and carry the eight framework mappings from section 5. The integration guide lives at `src/content/docs/docs/integrations/knowbe4.md`.
 
 ## 2. APIs & SDKs
 
@@ -347,4 +360,28 @@ GOOS=windows GOARCH=amd64 go build -o bin/knowbe4-sec-inspector-windows-amd64.ex
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker on 2026-09-21 as six read-only tools (see "grclanker implementation" in section 1), with mocked tests in `cli/tests/knowbe4.test.mjs` and a live smoke script (`npm --prefix cli run test:knowbe4:live`) that skips when `KNOWBE4_API_TOKEN` and the config file are absent.
+
+### What shipped
+
+- Configuration precedence exactly as in section 3: tool arguments, then `KNOWBE4_API_TOKEN` / `KNOWBE4_REGION` (plus `KNOWBE4_BASE_URL`, `KNOWBE4_PHISHER_API_TOKEN`, `KNOWBE4_PHISHER_GRAPHQL_URL`, `KNOWBE4_CONFIG_FILE`, `KNOWBE4_TIMEOUT`, `KNOWBE4_REDACT_PII`), then `~/.knowbe4-inspector/config.yaml`; all five regions; PII redaction through `redact_pii`.
+- Bearer-token Reporting API client with client-side throttling, `429`/`503` retry with backoff that honors `Retry-After`, timeouts, and token redaction in error messages.
+- Optional PhishER GraphQL enrichment of the report-rate control (`phisherMessages` filtered by `reported_at`).
+- Seventeen controls evaluated automatically (1 through 12 and 16 through 20). Controls 13, 14, and 15 are emitted as `manual` findings that state the console evidence to collect. Controls 15 and 16 also render as `manual` (never `pass`) when they are scoped out with `require_usb_tests: false` or `require_vishing_tests: false`.
+- Missing-data guardrails: a verdict never passes on absent evidence. No security test in the window, undated training modules, required compliance topics with zero enrollments, unsampled tests in the window, a truncated user list (`user_limit_reached`), completion figures computed over a truncated enrollment list (`enrollment_limit_reached`, including the `-1` completion sentinel fallback), an empty user list (anonymized accounts cannot retrieve user data), or a stopped test cadence (measured to now) all yield `warn` or `fail` with the reason in the evidence.
+- Evidence bundle with raw snapshots, normalized findings, a 20-control coverage map, an executive summary, a unified compliance matrix, and one report per framework in section 5.
+
+### Deviations from this spec (official documentation wins)
+
+- Pagination: the Reporting API paginates with `page` and `per_page` (default 100, maximum 500) rather than `Link` headers. KnowBe4 has announced that `page` is deprecated from November 2026 in favor of `per_page` plus `cursor`; the cursor response contract is not yet published, so the client still uses `page`.
+- Rate limits: the documented limits are four requests per second, 50 requests per minute burst, and 2,000 requests per day plus the number of licensed users, not "typically 1000 requests per day". Recipient results are therefore sampled from the most recent tests (`security_test_sample_limit`).
+- Control 13: `/v1/account` does not expose SAML or admin MFA settings, so SSO status cannot be checked through the Reporting API and is a manual finding. The KSAT GraphQL API (`account { samlEnabled forceMfa samlSettings { ... } }`) is the automation path for entitled accounts.
+- Controls 14 and 15: neither report generation history nor USB Drive Test campaigns are exposed by the Reporting API; both are manual findings. `usbCampaigns` exists in the KSAT GraphQL API.
+- Control 16: vishing is evaluated through callback phishing security tests (`GET /v1/phishing/security_tests?campaign_type=callback`), which is the voice-channel simulation the Reporting API exposes.
+- Sections 7 through 9 (Go module layout, Cobra CLI, TUI, Makefile, Docker) describe the original standalone design and were not built; the grclanker tools replace them.
+
+### What remains
+
+- Cursor pagination once KnowBe4 documents the cursor response contract.
+- Optional KSAT GraphQL client to automate controls 13 and 15 for accounts entitled to that API.
+- Per-user endpoints (`/v1/users/{userId}`, `/v1/users/{userId}/risk_score_history`) are not used; risk trends rely on account-level history and user `current_risk_score` values.

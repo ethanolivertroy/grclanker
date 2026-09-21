@@ -23,9 +23,13 @@ import { readGrclankerSettings } from "../pi/settings.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
 import { registerAwsTools } from "./grc-tools/aws.js";
 import { registerAzureTools } from "./grc-tools/azure.js";
+import { registerBoxTools } from "./grc-tools/box.js";
 import { registerCloudflareTools } from "./grc-tools/cloudflare.js";
 import { registerCmvpTools } from "./grc-tools/cmvp.js";
+import { registerCrowdstrikeTools } from "./grc-tools/crowdstrike.js";
+import { registerDatadogTools } from "./grc-tools/datadog.js";
 import { registerDuoTools } from "./grc-tools/duo.js";
+import { registerElasticTools } from "./grc-tools/elastic.js";
 import { registerFedrampTools } from "./grc-tools/fedramp.js";
 import { registerGitHubTools } from "./grc-tools/github.js";
 import { registerGcpTools } from "./grc-tools/gcp.js";
@@ -33,13 +37,26 @@ import { registerGwsTools } from "./grc-tools/gws.js";
 import { registerGwsOperatorTools } from "./grc-tools/gws-ops.js";
 import { installGrclankerHeader } from "./grc-tools/header.js";
 import { registerKevsTools } from "./grc-tools/kevs.js";
+import { registerKnowbe4Tools } from "./grc-tools/knowbe4.js";
+import { registerLaunchdarklyTools } from "./grc-tools/launchdarkly.js";
+import { registerMulesoftTools } from "./grc-tools/mulesoft.js";
 import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOciTools } from "./grc-tools/oci.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
+import { registerPagerdutyTools } from "./grc-tools/pagerduty.js";
+import { registerPaloaltoTools } from "./grc-tools/paloalto.js";
+import { registerSalesforceTools } from "./grc-tools/salesforce.js";
 import { registerScfTools } from "./grc-tools/scf.js";
+import { registerServicenowTools } from "./grc-tools/servicenow.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
+import { registerSnowflakeTools } from "./grc-tools/snowflake.js";
+import { registerSplunkTools } from "./grc-tools/splunk.js";
+import { registerSumologicTools } from "./grc-tools/sumologic.js";
+import { registerTenableTools } from "./grc-tools/tenable.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
+import { registerVeracodeTools } from "./grc-tools/veracode.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
+import { registerZendeskTools } from "./grc-tools/zendesk.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
 
 /**
@@ -51,22 +68,39 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerAnsibleTools,
   registerAwsTools,
   registerAzureTools,
+  registerBoxTools,
   registerCloudflareTools,
   registerCmvpTools,
+  registerCrowdstrikeTools,
+  registerDatadogTools,
   registerDuoTools,
+  registerElasticTools,
   registerFedrampTools,
   registerGcpTools,
   registerGitHubTools,
   registerGwsOperatorTools,
   registerGwsTools,
   registerKevsTools,
+  registerKnowbe4Tools,
+  registerLaunchdarklyTools,
+  registerMulesoftTools,
   registerOciTools,
   registerOktaTools,
   registerOscalTools,
+  registerPagerdutyTools,
+  registerPaloaltoTools,
+  registerSalesforceTools,
   registerScfTools,
+  registerServicenowTools,
   registerSlackTools,
+  registerSnowflakeTools,
+  registerSplunkTools,
+  registerSumologicTools,
+  registerTenableTools,
   registerVantaTools,
+  registerVeracodeTools,
   registerWebexTools,
+  registerZendeskTools,
   registerZoomTools,
 ];
 

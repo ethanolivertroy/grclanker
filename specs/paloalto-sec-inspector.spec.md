@@ -3,11 +3,11 @@ slug: "paloalto-sec-inspector"
 name: "Palo Alto Security Inspector"
 vendor: "Palo Alto Networks"
 category: "security-network-infrastructure"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/paloalto-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # paloalto-sec-inspector -- Architecture Specification
@@ -23,6 +23,19 @@ Palo Alto Networks is a leading cybersecurity platform that provides network sec
 3. **PAN-OS Firewalls / Panorama** -- Network security device configuration: security rules, zone segmentation, threat prevention profiles, SSL/TLS decryption, GlobalProtect VPN, WildFire analysis, URL filtering, admin roles, and logging.
 
 The tool produces compliance-mapped audit reports against FedRAMP, CMMC 2.0, SOC 2, CIS Benchmarks, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP frameworks.
+
+### 1.1 grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/paloalto.ts` and registers these read-only tools:
+
+- `paloalto_check_access`: probes every Prisma Cloud and PAN-OS read surface and reports missing permissions
+- `paloalto_assess_cloud_posture`: controls 1-6 through the Prisma Cloud CSPM API and controls 7-11, 24, and 25 through the Prisma Cloud Compute API (manual findings when the Compute console is not configured or reachable)
+- `paloalto_assess_firewall_policy`: controls 12-14 through the PAN-OS XML API
+- `paloalto_assess_threat_prevention`: controls 16-18, 21, and 22
+- `paloalto_assess_device_hardening`: controls 15, 19, 20, and 23, plus HA state and software version findings
+- `paloalto_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified compliance matrix, per-framework reports, and a zip archive
+
+Regression coverage is in `cli/tests/paloalto.test.mjs`; the live smoke script is `npm --prefix cli run test:paloalto:live`; the integration guide is `src/content/docs/docs/integrations/paloalto.md`.
 
 ## 2. APIs & SDKs
 
@@ -412,4 +425,36 @@ paloalto-inspector test-connection \
 
 ## 10. Status
 
-**Not yet implemented. Spec only.**
+**Implemented in grclanker (TypeScript) as native tools; the standalone Python/Go layout in sections 7-9 was not built.**
+
+What shipped:
+
+- Prisma Cloud CSPM client with `POST /login` JWT auth, re-login on `401`, `429`/`5xx` retry with backoff, timeouts, pagination for `GET /v2/alert` (`pageToken`/`nextPageToken`), and secret redaction in errors
+- PAN-OS XML API client with `type=keygen` (credentials in the POST body), `X-PAN-KEY` header auth, a dependency-free XML parser, `type=op` show commands, and `type=config&action=show` subtree collection for firewalls and Panorama
+- Prisma Cloud Compute client: console located through `PRISMA_COMPUTE_URL` or the CSPM `GET /meta_info` field `twistlockUrl`, authenticated with `POST /api/v1/authenticate` (access key credentials, Bearer token) with fallback to the CSPM JWT in `x-redlock-auth`; `limit`/`offset` paging with recorded truncation; read endpoints `/defenders`, `/policies/runtime/container`, `/policies/compliance/container`, `/policies/compliance/host`, `/policies/vulnerability/images`, `/settings/registry`, `/registry`, `/images`, `/stats/vulnerabilities`, `/stats/compliance`, `/cloud/discovery`, `/scans`
+- All 25 controls emit a finding: controls 1-6, 7-11, 24, and 12-23 are evaluated from API evidence; control 25 evaluates CI scan results but caps at `warn` because admission control has no verified public read endpoint; when a product or the Compute console is not configured its controls become `manual` findings naming the missing credential or URL
+- Verdict-safety rules are enforced by an evidence gate on every finding: unreadable or forbidden evidence forces `manual`, empty inventories are `fail` or `manual` per control intent (stated in the summary), scoped-out or unlicensed controls are `manual`, undated items cap at `warn`, partial inventories (unreachable device, truncated alert or Compute page) cap at `warn` with seen and total counts, enabling flags must be read as true, alert pagination runs to completion or records truncation, and export reruns never overwrite a prior bundle
+- TLS verification opt-out (`PANOS_VERIFY_TLS=false`) is scoped to the PAN-OS clients through a dedicated `node:https` transport; `NODE_TLS_REJECT_UNAUTHORIZED` is never set
+- Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip archive
+
+Deviations from this spec, following the official documentation:
+
+- Compliance posture uses `GET /v2/compliance/posture` (documented V2 endpoint) rather than `/compliance/posture`
+- Alert rules use `GET /v2/alert/rule`. `GET /alert/policy` is documented ("List Alert Counts By Policy", Alerts.json) but returns open alert counts grouped by policy, not the alert rule configuration (enabled state, scan targets, notification channels) that control 2 evaluates; the open critical alerts side of control 2 comes from `GET /v2/alert`, which carries the same policy grouping per alert
+- IAM overprivilege (control 3) is evaluated from IAM-type policies (`GET /v2/policy`) and open `iam` alerts (`GET /v2/alert`) rather than the documented `POST /api/v1/permission` ("Get Permissions", IAMMicroService.json) and `GET /api/v1/permission/alert/search` ("Get IAM Query"). The choice is deliberate: the permission endpoint executes a caller-supplied IAM RQL query and returns raw permission rows, so the tool would have to hard-code its own definition of "overprivileged" in RQL that cannot be validated without a licensed CIEM tenant, while the built-in IAM policies already encode Palo Alto Networks' overprivilege detections and their open alerts are the tenant's own verdict. `GET /api/v1/permission/alert/search` only returns the RQL behind a single alert ID, so it is not an inventory source. The `/iam/query` path in section 2.1 has no page in the current reference
+- Audit log retrieval is documented as `POST /audit/api/v1/log`, not `/audit/redlock`; the implementation does not need audit logs
+- The Prisma Cloud JWT is refreshed by logging in again; `GET /auth_token/extend` is documented and could replace that
+- The SIEM check in control 20 reads `GET /api/v1/tenant/{prismaId}/integration` ("List Integrations", IntegrationsMicroService.json), which returns the push integrations (Splunk, Amazon SQS, webhook, ServiceNow, Microsoft Teams, and so on); `prismaId` is taken from `customerNames[].prismaId` in the login response. The section 2.1 path `GET /integration` ("List All Integrations", IntegrationsPull.json) is documented but only returns the Okta, Qualys, and Tenable pull integrations, so it is used only as a fallback when the login response carries no `prismaId`. A failure on either surface makes the Prisma Cloud half of PA-20 manual and is written to `_errors.log`
+- The PAN-OS REST API (section 2.4) is not used; every device read goes through the XML API so one client covers PAN-OS 9.x through 11.x and Panorama
+- Compute endpoints are called under `/api/v1/` (the documented paths carry a version segment such as `/api/v34.04/`); `/audits/runtime/container`, `/defenders/summary`, `/compliance`, and `/hosts` from section 4 are not needed because the policy and stats endpoints carry the verdict evidence
+- Control 7 reads `GET /stats/vulnerabilities` as the documented array of `types.VulnerabilityStats`, summing the `cves.critical` and `cves.high` distributions of the `images`, `registryImages`, `containers`, `hosts`, and `functions` members, and combines that with `vulnerabilityDistribution` on the `GET /images` scan results (the stricter count drives the verdict)
+- Control 8 uses `GET /stats/compliance` (documented `types.ComplianceStats`) for the compliance rate instead of a per-host `/compliance` listing; the rate is derived from `rules[]` (or `categories[]` when rules carry no totals) as `1 - sum(failed) / sum(total)`, since the schema exposes no precomputed rate. Controls 8 and 9 also require `GET /defenders` to be readable and at least one Defender with `connected=true`, because a compliance or prevent-effect rule with an unknown Defender population is not verified enforcement
+- The supplementary PAN-OS software version finding (`PA-SW-01`) and HA state finding (`PA-HA-01`) are mapped to control 23 (system hardening, CM-6 and CM-7) and listed in a separate section of the unified compliance matrix, which keeps exactly one row per numbered control
+- Control 25: the admission control policy read endpoint could not be located on the public pan.dev CWPP reference (https://pan.dev/prisma-cloud/api/cwpp/), so admission rules stay a manual review inside the finding and the verdict caps at `warn`
+- The CSPM `GET /meta_info` reference page is not published on pan.dev; the PCEE access guide (https://pan.dev/prisma-cloud/api/cwpp/access-api-saas/) documents copying the console path from Compute > Manage > System > Utilities, which `PRISMA_COMPUTE_URL` carries
+
+What remains:
+
+- Admission control (OPA) evidence for control 25 once a public read endpoint is documented
+- WildFire cloud connectivity (`show wildfire status`), GlobalProtect HIP requirements, admin MFA enforcement details, and log retention quotas are surfaced as review notes rather than automated checks
+- Framework-specific output formats such as STIG CKL XML

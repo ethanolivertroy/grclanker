@@ -39,8 +39,8 @@ const agentSdkRoot = resolve(cliRoot, "agent-sdk");
 const distAgentDir = resolve(cliRoot, "dist", "agent-sdk", "agent");
 const COMPUTE_TOOL_NAMES = ["bash", "read", "write", "edit", "ls", "find", "grep"];
 const WRITE_MARKER = /_(export|generate|collect|init|import|create|assemble)_/;
-// Registered domain tools when the Agent SDK runtime landed; integrations only add to it.
-const BASELINE_DOMAIN_TOOL_COUNT = 107;
+// Registered domain tools on main after the batch 1 integration train; integrations only add to it.
+const BASELINE_DOMAIN_TOOL_COUNT = 219;
 // Writers that must stay classified as writes whatever else the registry gains.
 const BASELINE_WRITE_TOOLS = [
   "aws_export_audit_bundle",

@@ -5,8 +5,8 @@ vendor: "Okta"
 category: "identity-access-management"
 language: "typescript"
 status: "implemented"
-version: "1.0"
-last_updated: "2026-04-14"
+version: "1.1"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/grclanker"
 legacy_repo: "https://github.com/hackIDLE/okta-inspector-py"
 reference_repo: "https://github.com/okta/okta-cli-client"
@@ -41,10 +41,13 @@ The current tool family is designed for GRC engineers who need evidence-backed p
 - `GET /api/v1/policies`
 - `GET /api/v1/policies/{policyId}/rules`
 - `GET /api/v1/authenticators`
-- `GET /api/v1/users`
+- `GET /api/v1/users` (paginated via `Link: rel="next"`, capped at 50 pages with recorded truncation)
+- `GET /api/v1/users/{userId}`
+- `GET /api/v1/users/{userId}/factors`
 - `GET /api/v1/iam/assignees/users`
 - `GET /api/v1/users/{userId}/roles`
 - `GET /api/v1/groups`
+- `GET /api/v1/groups/rules`
 - `GET /api/v1/groups/{groupId}/roles`
 - `GET /api/v1/groups/{groupId}/users`
 - `GET /api/v1/apps`
@@ -61,6 +64,10 @@ The current tool family is designed for GRC engineers who need evidence-backed p
 - `GET /api/v1/threats/configuration`
 - `GET /api/v1/api-tokens`
 - `GET /api/v1/device-assurances`
+- `GET /api/v1/org/contacts`
+- `GET /api/v1/org/contacts/{contactType}`
+- `GET /api/v1/org/privacy/oktaSupport`
+- `GET /api/v1/org/orgSettings/thirdPartyAdminSetting` (operationId `getThirdPartyAdminSetting`, tag `OrgSettingAdmin`, scope `okta.orgs.read`; response `{ thirdPartyAdmin: boolean }`)
 
 ### Reference Implementations
 
@@ -127,12 +134,16 @@ The implementation mirrors the Okta CLI-compatible precedence chain:
 6. Session idle timeout
 7. Session lifetime and persistent cookies
 8. PIV/CAC or certificate-auth readiness
+9. FIPS and restricted authenticator posture (Okta Verify `compliance.fips`, SMS, voice, security question, email; federal-domain detection for `okta-gov.com`, `okta.gov`, `okta.mil`)
 
 ### Admin Access
 
 1. SUPER_ADMIN concentration
 2. Stale or inactive privileged users
 3. Privileged group size and hygiene
+4. Privileged user MFA enrollment (per-user factors, ACTIVE status, phishing-resistant preference)
+5. Workforce account lifecycle hygiene (paginated user population: stale, never-activated, suspended, locked)
+6. Okta Support access and third-party administrator governance
 
 ### Integrations
 
@@ -141,6 +152,7 @@ The implementation mirrors the Okta CLI-compatible precedence chain:
 3. Risky OIDC grant types
 4. Contextual access conditions
 5. Inactive application review
+6. Provisioning and deprovisioning automation (app `features` incl. `PUSH_USER_DEACTIVATION`, group rules)
 
 ### Monitoring
 
@@ -150,6 +162,22 @@ The implementation mirrors the Okta CLI-compatible precedence chain:
 4. Behavior rule coverage
 5. API token hygiene
 6. Device assurance coverage
+7. API token expiry, inactivity window, and network restriction
+8. Security contact routing (org TECHNICAL contact resolves to an ACTIVE user)
+9. Administrator security notification emails (always Manual; not exposed by the API)
+
+### Verdict Safety Rules
+
+Every finding follows these rules, each covered by a regression test in `cli/tests/okta.test.mjs`:
+
+1. Unreadable, forbidden, or errored endpoints yield `Manual` naming the cause and the evidence to collect, never `Pass`.
+2. Empty inventories never yield `Pass` by default. Inventories Okta always populates (password policies, zones, apps, privileged users, users, org contacts, the SSWS audit token) render `Manual`; inventories whose absence is a real gap (authenticators, log streams and hooks) render `Fail`. Zero SSWS tokens in OAuth mode is the one intentional empty `Pass`.
+3. Controls unavailable on the org edition (Classic Engine, 404 responses) render `Manual`.
+4. Items missing a date are never counted fresh and cap the finding at `Partial`.
+5. Partial inventories (truncated pagination, capped expansion, failed per-item lookups) cap the finding at `Partial`.
+6. Every documented status flag the verdict depends on is read.
+7. Pagination runs to completion or records truncation and downgrades.
+8. Re-running the export never overwrites a prior bundle.
 
 ## 5. Compliance Framework Mappings
 
@@ -174,6 +202,7 @@ These mappings are intentionally evidence-backed and check-level, not vague post
 - `compliance/executive_summary.md`
 - `compliance/unified_compliance_matrix.md`
 - per-framework markdown reports
+- `compliance/fedramp/oscal_assessment_results.json` (OSCAL 1.1.2 assessment-results keyed by NIST SP 800-53 objective ids)
 - `QUICK_REFERENCE.md`
 - `.zip` archive
 - `_errors.log` when partial collection failures occur
@@ -199,9 +228,25 @@ cli/extensions/grc-tools/okta.ts
 - No tenant-data persistence unless the user explicitly exports an audit bundle
 - API pagination, rate-limit retry, and OAuth token refresh handled in the client layer
 
-## 8. Gaps / Follow-On Ideas
+## 8. Status
 
-- live end-to-end smoke testing with a real Okta tenant
-- broader federal/FIPS heuristics for Okta Gov and DoD-adjacent tenants
-- more explicit notification, token governance, and lifecycle automation checks
-- future trust-center or artifact export alignment with FedRAMP/OSCAL workflows
+Shipped (version 1.1, 2026-09-21):
+
+- 30 findings across the four assess tools (22 original controls plus OKTA-AUTH-009, OKTA-ADMIN-004 to 006, OKTA-INTEG-006, OKTA-MON-007 to 009); tool names and exported functions are unchanged
+- `listUsers` pagination wired into the admin-access collector with a 50-page cap and recorded truncation; per-admin factor enrollment for up to 50 privileged users; admin-like group expansion capped at 25 with recorded truncation
+- Okta Gov and FIPS heuristics: federal-domain detection (`okta-gov.com`, `okta.gov`, `okta.mil`), Okta Verify `compliance.fips`, restricted authenticator detection
+- Token governance: age, missing dates, `expiresAt`, `tokenWindow`, `network.connection`
+- Lifecycle: workforce population hygiene, provisioning features, group rules, Okta Support and third-party admin settings, org security contacts
+- OSCAL 1.1.2 assessment-results export in the bundle
+- Verdict-safety rules 1 to 8 applied to every finding with a regression test per rule, plus all-403, all-empty, and partial-inventory self-check fixtures
+- Live smoke (`npm --prefix cli run test:okta:live`) runs `okta_check_access` plus all four assess tools and skips cleanly without credentials
+- Integration guide at `src/content/docs/docs/integrations/okta.md`
+
+## 9. Gaps / Follow-On Ideas
+
+- Live end-to-end validation against a real Okta Identity Engine tenant and a Classic Engine tenant (the smoke exists; no tenant run has been recorded)
+- DEPROVISIONED users are excluded from the default user listing; add a filtered pass for deprovisioned-account review
+- Admin security notification emails and admin notification preferences have no Management API surface and remain Manual (OKTA-MON-009)
+- Okta Workflows and HR-driven lifecycle flows are not inspectable; OKTA-INTEG-006 relies on app provisioning features and group rules
+- Generic truncation metadata for every paginated list (today only the user listing, factor lookups, and group expansion record truncation)
+- Trust-center artifact packaging beyond the OSCAL assessment-results document (assessment plan and component definition alignment)
