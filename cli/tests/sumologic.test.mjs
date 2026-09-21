@@ -375,17 +375,25 @@ test("SumologicApiClient marks capped pagination incomplete, paginates collector
 test("checkSumologicAccess reports healthy and degraded surfaces with capability hints", async () => {
   const healthy = await checkSumologicAccess(readerFrom(healthyData()));
   assert.equal(healthy.status, "healthy");
-  assert.equal(healthy.surfaces.length, 17);
+  assert.equal(healthy.surfaces.length, 18);
   assert.equal(healthy.missingCapabilities.length, 0);
   assert.match(healthy.recommendedNextStep, /sumologic_assess_identity/);
+  const addresses = healthy.surfaces.find((surface) => surface.endpoint === "/v1/serviceAllowlist/addresses");
+  assert.equal(addresses.name, "service_allowlist_addresses");
+  assert.equal(addresses.status, "readable");
+  assert.equal(addresses.count, 1);
+  assert.equal(addresses.capabilityHint, "ipAllowlisting");
 
   const degraded = await checkSumologicAccess(readerFrom(healthyData(), {
     listUsers: async () => failedCollection("forbidden", 403),
     listCollectors: async () => failedCollection("forbidden", 403),
+    listServiceAllowlistAddresses: async () => failedCollection("forbidden", 403),
   }));
   assert.equal(degraded.status, "limited");
   assert.ok(degraded.missingCapabilities.includes("manageUsersAndRoles"));
   assert.ok(degraded.missingCapabilities.includes("viewCollectors"));
+  assert.ok(degraded.missingCapabilities.includes("ipAllowlisting"));
+  assert.equal(degraded.surfaces.find((surface) => surface.name === "service_allowlist_addresses").status, "not_readable");
   assert.match(degraded.recommendedNextStep, /never as passes/);
 });
 
@@ -503,6 +511,10 @@ test("self-check (b): empty inventories never pass by default and state whether 
   assert.equal(byIdMap["SUMO-20"].status, "manual");
   assert.equal(byIdMap["SUMO-09"].status, "fail");
   assert.equal(byIdMap["SUMO-11"].status, "fail");
+  assert.equal(byIdMap["SUMO-05"].status, "fail");
+  assert.match(byIdMap["SUMO-05"].summary, /requireMfa=absent/);
+  assert.equal(byIdMap["SUMO-07"].status, "manual");
+  assert.match(byIdMap["SUMO-07"].summary, /did not include accessKeysLifetimeInDays/);
 });
 
 test("self-check (b) exception: empty lists pass only where the control intent makes emptiness compliant and the endpoint was readable", async () => {
@@ -535,6 +547,260 @@ test("self-check (c): partial inventories never pass", async () => {
   assert.equal(byIdMap["SUMO-17"].status, "warn");
   assert.equal(byIdMap["SUMO-19"].status, "warn");
   assert.equal(byIdMap["SUMO-20"].status, "warn");
+});
+
+test("SumologicApiClient caps the dashboards page size at 100 and follows the dashboards cursor", async () => {
+  const requests = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push({ pathname: url.pathname, limit: url.searchParams.get("limit"), token: url.searchParams.get("token"), mode: url.searchParams.get("mode") });
+    if (url.pathname === "/api/v2/dashboards") {
+      if (Number(url.searchParams.get("limit")) > 100) return jsonResponse({ errors: [{ code: "invalid.limit", message: "limit must be at most 100" }] }, { status: 400 });
+      if (!url.searchParams.get("token")) return jsonResponse({ dashboards: Array.from({ length: 100 }, (_, index) => ({ id: `d${index}`, title: `Dashboard ${index}`, isPublic: false })), next: "page-2" });
+      return jsonResponse({ dashboards: [{ id: "d100", title: "Last", isPublic: false }], next: null });
+    }
+    if (url.pathname === "/api/v1/users") return jsonResponse({ data: [{ id: "u1" }], next: null });
+    return jsonResponse({});
+  };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, maxRetries: 0 });
+
+  const dashboards = await client.listDashboards();
+  assert.equal(dashboards.ok, true, dashboards.error);
+  assert.equal(dashboards.complete, true);
+  assert.equal(dashboards.data.length, 101);
+  const dashboardRequests = requests.filter((item) => item.pathname === "/api/v2/dashboards");
+  assert.equal(dashboardRequests.length, 2);
+  assert.ok(dashboardRequests.every((item) => item.limit === "100" && item.mode === "allViewableByUser"));
+  assert.equal(dashboardRequests[1].token, "page-2");
+
+  await client.listUsers();
+  assert.equal(requests.find((item) => item.pathname === "/api/v1/users").limit, "1000");
+
+  const access = await checkSumologicAccess(client);
+  assert.equal(access.surfaces.find((surface) => surface.name === "dashboards").status, "readable");
+});
+
+test("control 11 downgrades when the personal folder holds more items than content_sample", async () => {
+  const data = healthyData();
+  data.personalFolder = { id: "f1", children: Array.from({ length: 40 }, (_, index) => ({ id: `c${index}`, name: `Search ${index}`, itemType: "Search" })) };
+  let permissionLookups = 0;
+  const reader = readerFrom(data, { getContentPermissions: async () => { permissionLookups += 1; return collectionOf(data.permissions); } });
+
+  const sampled = await assessSumologicContentSharing(reader, { now: NOW });
+  const sharing = byId(sampled, "SUMO-11");
+  assert.equal(permissionLookups, 25);
+  assert.equal(sharing.status, "warn");
+  assert.match(sharing.summary, /Only 25 of 40 personal-folder items were sampled \(content_sample=25\); 15 were not evaluated/);
+  assert.equal(sharing.evidence.personal_folder_items_total, 40);
+  assert.equal(sharing.evidence.personal_folder_items_sampled, 25);
+  assert.equal(sharing.evidence.personal_folder_items_unsampled, 15);
+  assert.equal(sampled.summary.personal_folder_items_unsampled, 15);
+  assert.equal(byId(sampled, "SUMO-15").evidence.personal_folder_items_total, 40);
+  assert.equal(byId(sampled, "SUMO-18").evidence.personal_folder_items_total, 40);
+
+  const full = await assessSumologicContentSharing(readerFrom(data), { now: NOW, contentSample: 40 });
+  assert.equal(byId(full, "SUMO-11").status, "pass");
+  assert.match(byId(full, "SUMO-11").summary, /all 40 items in the folder were evaluated/);
+  assert.equal(byId(full, "SUMO-11").evidence.personal_folder_items_unsampled, 0);
+});
+
+test("control 7 treats an access key lifetime policy of 0 or absent as at most warn and always states the policy", async () => {
+  const healthy = await assessSumologicAccessControl(readerFrom(healthyData()), { now: NOW });
+  assert.equal(byId(healthy, "SUMO-07").status, "pass");
+  assert.match(byId(healthy, "SUMO-07").summary, /The access key lifetime policy is 90 days\./);
+  assert.equal(byId(healthy, "SUMO-07").evidence.access_keys_lifetime_policy_state, "enforced");
+
+  const neverExpire = healthyData();
+  neverExpire.policies.accessKeysLifetime = { accessKeysLifetimeInDays: "0" };
+  const zero = await assessSumologicAccessControl(readerFrom(neverExpire), { now: NOW });
+  assert.equal(byId(zero, "SUMO-07").status, "warn");
+  assert.match(byId(zero, "SUMO-07").summary, /The access key lifetime policy is 0 \(keys never expire\)\./);
+  assert.equal(byId(zero, "SUMO-07").evidence.access_keys_lifetime_policy_days, 0);
+  assert.equal(byId(zero, "SUMO-07").evidence.access_keys_lifetime_policy_state, "never-expire");
+  assert.equal(byId(zero, "SUMO-08").status, "pass");
+
+  const absent = healthyData();
+  absent.policies.accessKeysLifetime = {};
+  const missing = await assessSumologicAccessControl(readerFrom(absent), { now: NOW });
+  assert.equal(byId(missing, "SUMO-07").status, "warn");
+  assert.match(byId(missing, "SUMO-07").summary, /did not include accessKeysLifetimeInDays/);
+  assert.equal(byId(missing, "SUMO-07").evidence.access_keys_lifetime_policy_state, "absent");
+
+  const unreadable = await assessSumologicAccessControl(readerFrom(healthyData(), {
+    getPolicy: async (name) => (name === "accessKeysLifetime" ? failedCollection("forbidden", 403) : collectionOf(healthyData().policies[name] ?? {})),
+  }), { now: NOW });
+  assert.equal(byId(unreadable, "SUMO-07").status, "warn");
+  assert.match(byId(unreadable, "SUMO-07").summary, /lifetime policy was unreadable/);
+
+  const stale = healthyData();
+  stale.policies.accessKeysLifetime = { accessKeysLifetimeInDays: "0" };
+  stale.accessKeys = [{ id: "k2", label: "old", disabled: false, createdAt: STALE, lastUsed: FRESH }];
+  const failed = await assessSumologicAccessControl(readerFrom(stale), { now: NOW });
+  assert.equal(byId(failed, "SUMO-07").status, "fail");
+  assert.match(byId(failed, "SUMO-07").summary, /have not been rotated\. The access key lifetime policy is 0 \(keys never expire\)\./);
+
+  const personal = await assessSumologicAccessControl(readerFrom(stale, { listAccessKeys: async () => collectionOf(stale.accessKeys, { scope: "personal" }) }), { now: NOW });
+  assert.equal(byId(personal, "SUMO-07").status, "manual");
+  assert.match(byId(personal, "SUMO-07").summary, /The access key lifetime policy is 0/);
+});
+
+test("control 6 warns on custom roles without a filterPredicate and names them", async () => {
+  const data = healthyData();
+  data.roles.push({ id: "r4", name: "Wide Open", systemDefined: false, capabilities: ["viewCollectors"], users: ["u2"] });
+  const unscoped = await assessSumologicAccessControl(readerFrom(data), { now: NOW });
+  assert.equal(byId(unscoped, "SUMO-06").status, "warn");
+  assert.match(byId(unscoped, "SUMO-06").summary, /1 custom role\(s\) have no filterPredicate and grant unrestricted search scope \(Wide Open\)/);
+  assert.deepEqual(byId(unscoped, "SUMO-06").evidence.custom_roles_without_filter_predicate, ["Wide Open"]);
+
+  data.roles[2].filterPredicate = "_sourceCategory=web";
+  const scoped = await assessSumologicAccessControl(readerFrom(data), { now: NOW });
+  assert.equal(byId(scoped, "SUMO-06").status, "pass");
+  assert.match(byId(scoped, "SUMO-06").summary, /every custom role carries a filterPredicate/);
+
+  const systemUnscoped = healthyData();
+  systemUnscoped.roles.push({ id: "r5", name: "Analyst (system)", systemDefined: true, capabilities: ["viewCollectors"], users: [] });
+  const system = await assessSumologicAccessControl(readerFrom(systemUnscoped), { now: NOW });
+  assert.equal(byId(system, "SUMO-06").status, "pass");
+});
+
+test("controls 5 and 6 report locked and dormant users and keep undated logins out of the active bucket", async () => {
+  const data = healthyData();
+  data.users.push(
+    { id: "u3", email: "locked@example.com", isActive: true, isMfaEnabled: true, isLocked: true, lastLoginTimestamp: FRESH },
+    { id: "u4", email: "dormant@example.com", isActive: true, isMfaEnabled: true, isLocked: false, lastLoginTimestamp: STALE },
+    { id: "u5", email: "never@example.com", isActive: true, isMfaEnabled: true, isLocked: false, lastLoginTimestamp: null },
+  );
+  const [identity, access] = await allAssessments(readerFrom(data));
+  const mfa = byId(identity, "SUMO-05");
+  assert.equal(mfa.status, "pass");
+  assert.deepEqual(mfa.evidence.locked_users, ["locked@example.com"]);
+  assert.deepEqual(mfa.evidence.dormant_active_users, ["dormant@example.com"]);
+  assert.deepEqual(mfa.evidence.active_users_without_last_login, ["never@example.com"]);
+  assert.equal(mfa.evidence.active_users_with_recent_login, 3);
+  assert.equal(mfa.evidence.user_inactive_threshold_days, 90);
+  assert.equal(identity.summary.locked_users, 1);
+  assert.equal(identity.summary.dormant_active_users, 1);
+  assert.equal(identity.summary.active_users_without_last_login, 1);
+
+  const rbac = byId(access, "SUMO-06");
+  assert.equal(rbac.status, "pass");
+  assert.deepEqual(rbac.evidence.locked_users, ["locked@example.com"]);
+  assert.deepEqual(rbac.evidence.dormant_active_users, ["dormant@example.com"]);
+  assert.deepEqual(rbac.evidence.active_users_without_last_login, ["never@example.com"]);
+  assert.deepEqual(rbac.evidence.dormant_admin_members, []);
+
+  data.roles[0].users = ["u1", "u4"];
+  const dormantAdmin = await assessSumologicAccessControl(readerFrom(data), { now: NOW });
+  assert.equal(byId(dormantAdmin, "SUMO-06").status, "warn");
+  assert.match(byId(dormantAdmin, "SUMO-06").summary, /1 admin role member\(s\) have not logged in for over 90 days \(dormant@example.com\)/);
+  assert.deepEqual(byId(dormantAdmin, "SUMO-06").evidence.dormant_admin_members, ["dormant@example.com"]);
+
+  data.roles[0].users = ["u1", "u5"];
+  const undatedAdmin = await assessSumologicAccessControl(readerFrom(data), { now: NOW });
+  assert.equal(byId(undatedAdmin, "SUMO-06").status, "warn");
+  assert.match(byId(undatedAdmin, "SUMO-06").summary, /have no lastLoginTimestamp and are not counted as active/);
+  assert.deepEqual(byId(undatedAdmin, "SUMO-06").evidence.admin_members_without_last_login, ["never@example.com"]);
+  assert.deepEqual(byId(undatedAdmin, "SUMO-06").evidence.dormant_admin_members, []);
+
+  data.roles[0].users = ["u1", "u4"];
+  const relaxed = await assessSumologicAccessControl(readerFrom(data), { now: NOW, userInactiveDays: 3650 });
+  assert.equal(byId(relaxed, "SUMO-06").status, "pass");
+  assert.equal(byId(relaxed, "SUMO-06").evidence.user_inactive_threshold_days, 3650);
+  assert.deepEqual(byId(relaxed, "SUMO-06").evidence.dormant_admin_members, []);
+
+  data.roles[0].users = ["u1"];
+  const usersUnreadable = await assessSumologicAccessControl(readerFrom(data, { listUsers: async () => failedCollection("forbidden", 403) }), { now: NOW });
+  assert.equal(byId(usersUnreadable, "SUMO-06").status, "warn");
+  assert.match(byId(usersUnreadable, "SUMO-06").summary, /user list was unreadable/);
+});
+
+test("control 5 reports an absent requireMfa flag as absent, not false", async () => {
+  const data = healthyData();
+  delete data.passwordPolicy.requireMfa;
+  const identity = await assessSumologicIdentity(readerFrom(data), { now: NOW });
+  assert.equal(byId(identity, "SUMO-05").status, "fail");
+  assert.match(byId(identity, "SUMO-05").summary, /requireMfa=absent/);
+  assert.doesNotMatch(byId(identity, "SUMO-05").summary, /requireMfa=false/);
+  assert.equal(byId(identity, "SUMO-05").evidence.require_mfa_policy, "absent");
+
+  data.passwordPolicy.requireMfa = false;
+  const explicit = await assessSumologicIdentity(readerFrom(data), { now: NOW });
+  assert.match(byId(explicit, "SUMO-05").summary, /requireMfa=false/);
+  assert.equal(byId(explicit, "SUMO-05").evidence.require_mfa_policy, "false");
+});
+
+test("control 10 resolves connection hosts from url only and flags connections without a url", async () => {
+  const data = healthyData();
+  data.connections = [
+    { id: "c1", name: "approved-hook", type: "WebhookConnection", url: "https://hooks.example.com/x", defaultPayload: "{\"url\":\"https://hooks.evil.example/decoy\"}" },
+    { id: "c2", name: "payload-only", type: "WebhookConnection", defaultPayload: "{\"url\":\"https://hooks.example.com/decoy\"}" },
+  ];
+  const governance = await assessSumologicDataGovernance(readerFrom(data), { now: NOW, approvedDestinationDomains: ["example.com"] });
+  const forwarding = byId(governance, "SUMO-10");
+  assert.equal(forwarding.status, "fail");
+  assert.deepEqual(forwarding.evidence.destinations.map((item) => item.host), ["hooks.example.com", null]);
+  assert.deepEqual(forwarding.evidence.unapproved_destinations, ["payload-only"]);
+
+  data.connections = [data.connections[0]];
+  const approved = await assessSumologicDataGovernance(readerFrom(data), { now: NOW, approvedDestinationDomains: ["example.com"] });
+  assert.equal(byId(approved, "SUMO-10").status, "pass");
+});
+
+test("approved_email_domains drives control 20 when org domains cannot be derived from the user list", async () => {
+  const data = healthyData();
+  data.monitors[0].notifications = [{ notification: { connectionType: "Email", recipients: ["soc@partner.example.org"] }, runForTriggerTypes: ["Critical"] }];
+  const usersUnreadable = { listUsers: async () => failedCollection("forbidden", 403) };
+
+  const noDomains = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW });
+  assert.equal(byId(noDomains, "SUMO-20").status, "manual");
+  assert.match(byId(noDomains, "SUMO-20").summary, /no org email domains could be derived/);
+
+  const approved = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW, approvedEmailDomains: ["partner.example.org"] });
+  assert.equal(byId(approved, "SUMO-20").status, "pass");
+  assert.deepEqual(byId(approved, "SUMO-20").evidence.org_email_domains, ["partner.example.org"]);
+
+  const mismatch = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW, approvedEmailDomains: ["example.com"] });
+  assert.equal(byId(mismatch, "SUMO-20").status, "fail");
+  assert.deepEqual(byId(mismatch, "SUMO-20").evidence.external_email_recipients, ["soc@partner.example.org"]);
+
+  const combined = await assessSumologicContentSharing(readerFrom(data), { now: NOW, approvedEmailDomains: ["Partner.Example.org"] });
+  assert.equal(byId(combined, "SUMO-20").status, "pass");
+  assert.ok(byId(combined, "SUMO-20").evidence.org_email_domains.includes("example.com"));
+  assert.ok(byId(combined, "SUMO-20").evidence.org_email_domains.includes("partner.example.org"));
+});
+
+test("a 401 response is reported as rejected credentials, is not retried, and never falls back to personal keys", async () => {
+  const requests = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push(url.pathname);
+    return jsonResponse({ errors: [{ code: "unauthorized", message: "Full authentication is required" }] }, { status: 401 });
+  };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {} });
+
+  const keys = await client.listAccessKeys();
+  assert.equal(keys.ok, false);
+  assert.equal(keys.httpStatus, 401);
+  assert.match(keys.error, /\(401 unauthorized\)/);
+  assert.deepEqual(requests, ["/api/v1/accessKeys"]);
+
+  const access = await checkSumologicAccess(client);
+  assert.equal(access.status, "limited");
+  assert.equal(access.surfaces.filter((surface) => surface.status === "readable").length, 0);
+
+  const unauthorized = async () => failedCollection("Sumo Logic request failed (401 unauthorized)", 401);
+  const reader = { ...forbiddenReader() };
+  for (const key of Object.keys(reader)) if (key !== "getResolvedConfig") reader[key] = unauthorized;
+  const results = await allAssessments(reader);
+  const findings = results.flatMap((result) => result.findings);
+  assert.equal(findings.length, 20);
+  for (const item of findings) {
+    assert.equal(item.status, "manual", `${item.id} must be manual on 401`);
+    assert.doesNotMatch(item.summary, /403/, `${item.id} must not describe a 401 as a 403`);
+  }
+  assert.match(byId(results[0], "SUMO-01").summary, /credentials were rejected \(401\)/);
+  assert.equal(byId(results[0], "SUMO-01").evidence.http_status, 401);
+  assert.match(byId(results[1], "SUMO-07").summary, /credentials were rejected \(401\)/);
 });
 
 test("undated items are never counted as fresh or active", async () => {

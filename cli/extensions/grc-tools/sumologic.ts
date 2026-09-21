@@ -26,10 +26,12 @@ type JsonRecord = Record<string, unknown>;
 const DEFAULT_OUTPUT_DIR = "./export/sumologic";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PAGE_SIZE = 1000;
+const DASHBOARDS_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 50;
 const DEFAULT_MAX_RETRIES = 4;
 const DEFAULT_KEY_MAX_AGE_DAYS = 90;
 const DEFAULT_KEY_INACTIVE_DAYS = 90;
+const DEFAULT_USER_INACTIVE_DAYS = 90;
 const DEFAULT_MAX_ADMINS = 5;
 const DEFAULT_MAX_ALLOWLISTED_USERS = 2;
 const DEFAULT_MIN_PASSWORD_LENGTH = 12;
@@ -221,6 +223,7 @@ type AccessControlArgs = AuthArgs & {
   max_admins?: number;
   key_max_age_days?: number;
   key_inactive_days?: number;
+  user_inactive_days?: number;
   max_session_timeout_minutes?: number;
 };
 
@@ -246,6 +249,7 @@ export interface SumologicAssessmentOptions {
   maxAdmins?: number;
   keyMaxAgeDays?: number;
   keyInactiveDays?: number;
+  userInactiveDays?: number;
   maxSessionTimeoutMinutes?: number;
   minRetentionDays?: number;
   collectorOfflineDays?: number;
@@ -664,11 +668,16 @@ export class SumologicApiClient implements SumologicReader {
     }
   }
 
-  private async listWithToken(path: string, query: JsonRecord = {}, collectionKey = "data"): Promise<{ data: JsonRecord[]; complete: boolean }> {
+  private async listWithToken(
+    path: string,
+    query: JsonRecord = {},
+    collectionKey = "data",
+    pageSize = DEFAULT_PAGE_SIZE,
+  ): Promise<{ data: JsonRecord[]; complete: boolean }> {
     const items: JsonRecord[] = [];
     let token: string | undefined;
     for (let page = 0; page < this.maxPages; page += 1) {
-      const payload = asObject(await this.get(path, { ...query, limit: DEFAULT_PAGE_SIZE, token })) ?? {};
+      const payload = asObject(await this.get(path, { ...query, limit: pageSize, token })) ?? {};
       items.push(...asRecords(payload[collectionKey]));
       token = asString(payload.next);
       if (!token) return { data: items, complete: true };
@@ -783,7 +792,7 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   listDashboards() {
-    return this.collect(() => this.listWithToken("/v2/dashboards", { mode: "allViewableByUser" }, "dashboards"));
+    return this.collect(() => this.listWithToken("/v2/dashboards", { mode: "allViewableByUser" }, "dashboards", DASHBOARDS_PAGE_SIZE));
   }
 
   getContentPermissions(contentId: string) {
@@ -856,6 +865,50 @@ function names(items: JsonRecord[], key = "name", limit = 25): string[] {
   return items.slice(0, limit).map((item) => asString(item[key]) ?? asString(item.id) ?? asString(item.email) ?? "unnamed");
 }
 
+function flagText(value: unknown): string {
+  return typeof value === "boolean" ? String(value) : "absent";
+}
+
+interface UserActivityBuckets {
+  locked: JsonRecord[];
+  recentLogin: JsonRecord[];
+  dormant: JsonRecord[];
+  undatedLogin: JsonRecord[];
+}
+
+function userActivityBuckets(users: JsonRecord[], now: Date, inactiveDays: number): UserActivityBuckets {
+  const active = users.filter((user) => user.isActive === true);
+  const loginAge = (user: JsonRecord) => ageInDays(user.lastLoginTimestamp, now);
+  return {
+    locked: users.filter((user) => user.isLocked === true),
+    recentLogin: active.filter((user) => (loginAge(user) ?? Number.POSITIVE_INFINITY) <= inactiveDays),
+    dormant: active.filter((user) => (loginAge(user) ?? -1) > inactiveDays),
+    undatedLogin: active.filter((user) => loginAge(user) === undefined),
+  };
+}
+
+type KeyLifetimeState = "enforced" | "never-expire" | "absent" | "unreadable";
+
+interface KeyLifetimePolicy {
+  state: KeyLifetimeState;
+  days: number | null;
+  text: string;
+}
+
+function keyLifetimePolicy(policy: SumologicCollection<JsonRecord>): KeyLifetimePolicy {
+  if (!policy.ok) {
+    return { state: "unreadable", days: null, text: `The access key lifetime policy was unreadable (${policy.error ?? "unknown error"}).` };
+  }
+  const days = asNumber(policy.data?.accessKeysLifetimeInDays);
+  if (days === undefined) {
+    return { state: "absent", days: null, text: "The access key lifetime policy response did not include accessKeysLifetimeInDays." };
+  }
+  if (days <= 0) {
+    return { state: "never-expire", days, text: "The access key lifetime policy is 0 (keys never expire)." };
+  }
+  return { state: "enforced", days, text: `The access key lifetime policy is ${days} days.` };
+}
+
 function collectErrors(collections: Array<[string, SumologicCollection<unknown>]>): string[] {
   return collections.filter(([, item]) => !item.ok).map(([name, item]) => `${name}: ${item.error ?? "unknown error"}`);
 }
@@ -914,6 +967,7 @@ export async function checkSumologicAccess(client: SumologicReader): Promise<Sum
     ["saml_allowlisted_users", "/v1/saml/allowlistedUsers", "manageSaml", () => client.listSamlAllowlistedUsers()],
     ["password_policy", "/v1/passwordPolicy", "managePasswordPolicy", () => client.getPasswordPolicy()],
     ["service_allowlist_status", "/v1/serviceAllowlist/status", "ipAllowlisting", () => client.getServiceAllowlistStatus()],
+    ["service_allowlist_addresses", "/v1/serviceAllowlist/addresses", "ipAllowlisting", () => client.listServiceAllowlistAddresses()],
     ["audit_policy", "/v1/policies/audit", "manageOrgSettings", () => client.getPolicy("audit")],
     ["partitions", "/v1/partitions", "viewPartitions", () => client.listPartitions()],
     ["scheduled_views", "/v1/scheduledViews", "viewScheduledViews", () => client.listScheduledViews()],
@@ -963,9 +1017,11 @@ export async function assessSumologicIdentity(
   client: SumologicReader,
   options: SumologicAssessmentOptions = {},
 ): Promise<SumologicAssessmentResult> {
+  const now = options.now ?? new Date();
   const maxAllowlisted = clampNumber(options.maxAllowlistedUsers, DEFAULT_MAX_ALLOWLISTED_USERS, 0, 1000);
   const minPasswordLength = clampNumber(options.minPasswordLength, DEFAULT_MIN_PASSWORD_LENGTH, 1, 128);
   const maxPasswordAge = clampNumber(options.maxPasswordAgeDays, DEFAULT_MAX_PASSWORD_AGE_DAYS, 1, 3650);
+  const userInactiveDays = clampNumber(options.userInactiveDays, DEFAULT_USER_INACTIVE_DAYS, 1, 3650);
 
   const [identityProviders, allowlisted, passwordPolicy, users] = await Promise.all([
     client.listSamlIdentityProviders(),
@@ -1059,21 +1115,28 @@ export async function assessSumologicIdentity(
   const activeUsers = userList.filter((user) => user.isActive === true);
   const activeWithoutMfa = activeUsers.filter((user) => user.isMfaEnabled !== true);
   const usersMissingActiveFlag = userList.filter((user) => typeof user.isActive !== "boolean");
-  const requireMfa = passwordPolicy.ok ? policy.requireMfa === true : undefined;
+  const activity = userActivityBuckets(userList, now, userInactiveDays);
+  const requireMfaFlag = passwordPolicy.ok ? policy.requireMfa : undefined;
+  const requireMfa = requireMfaFlag === true;
   const mfaEvidence = {
-    require_mfa_policy: requireMfa ?? null,
+    require_mfa_policy: passwordPolicy.ok ? flagText(requireMfaFlag) : null,
     users_seen: userList.length,
     users_complete: users.complete,
     active_users: activeUsers.length,
     active_users_without_mfa: names(activeWithoutMfa, "email"),
     users_missing_is_active_flag: usersMissingActiveFlag.length,
+    locked_users: names(activity.locked, "email"),
+    active_users_with_recent_login: activity.recentLogin.length,
+    dormant_active_users: names(activity.dormant, "email"),
+    active_users_without_last_login: names(activity.undatedLogin, "email"),
+    user_inactive_threshold_days: userInactiveDays,
   };
   if (!passwordPolicy.ok && !users.ok) {
     findings.push(unreadable(5, "critical", "the MFA policy and user list", passwordPolicy, "screenshot the Require MFA setting and export the user list with MFA status."));
-  } else if (requireMfa === false) {
-    findings.push(finding(5, "critical", "fail", `The password policy does not require MFA (requireMfa=false); ${activeWithoutMfa.length}/${activeUsers.length} seen active users have MFA disabled.`, mfaEvidence));
-  } else if (requireMfa === undefined) {
+  } else if (!passwordPolicy.ok) {
     findings.push(finding(5, "critical", "manual", `The password policy was unreadable, so org-wide MFA enforcement is unknown; ${activeWithoutMfa.length}/${activeUsers.length} seen active users report MFA disabled. Confirm Require MFA in Administration > Security > Password Policy.`, mfaEvidence));
+  } else if (!requireMfa) {
+    findings.push(finding(5, "critical", "fail", `The password policy does not require MFA (requireMfa=${flagText(requireMfaFlag)}); ${activeWithoutMfa.length}/${activeUsers.length} seen active users have MFA disabled.`, mfaEvidence));
   } else if (!users.ok) {
     findings.push(finding(5, "critical", "manual", `Require MFA is enabled, but the user list was unreadable (${users.error ?? "unknown error"}), so per-user coverage cannot be confirmed; export the user list with MFA status.`, mfaEvidence));
   } else if (userList.length === 0) {
@@ -1092,6 +1155,9 @@ export async function assessSumologicIdentity(
       allowlisted_users: allowlistedUsers.length,
       users_seen: userList.length,
       active_users_without_mfa: activeWithoutMfa.length,
+      locked_users: activity.locked.length,
+      dormant_active_users: activity.dormant.length,
+      active_users_without_last_login: activity.undatedLogin.length,
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -1108,6 +1174,7 @@ export async function assessSumologicAccessControl(
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10000);
   const keyMaxAge = clampNumber(options.keyMaxAgeDays, DEFAULT_KEY_MAX_AGE_DAYS, 1, 3650);
   const keyInactive = clampNumber(options.keyInactiveDays, DEFAULT_KEY_INACTIVE_DAYS, 1, 3650);
+  const userInactiveDays = clampNumber(options.userInactiveDays, DEFAULT_USER_INACTIVE_DAYS, 1, 3650);
   const maxSessionMinutes = clampNumber(options.maxSessionTimeoutMinutes, DEFAULT_MAX_SESSION_TIMEOUT_MINUTES, 1, 10080);
 
   const [roles, users, accessKeys, allowlistStatus, allowlistAddresses, sessionTimeout, concurrentSessions, keyLifetime] = await Promise.all([
@@ -1133,6 +1200,8 @@ export async function assessSumologicAccessControl(
   const findings: SumologicFinding[] = [];
 
   const roleList = roles.data ?? [];
+  const userList = users.data ?? [];
+  const activity = userActivityBuckets(userList, now, userInactiveDays);
   if (!roles.ok) {
     findings.push(unreadable(6, "high", "the role list", roles, "export Administration > Users and Roles > Roles with capabilities and member counts."));
   } else if (roleList.length === 0) {
@@ -1143,6 +1212,8 @@ export async function assessSumologicAccessControl(
     const adminUserIds = new Set<string>();
     for (const role of adminRoles) for (const id of asArray(role.users)) if (asString(id)) adminUserIds.add(asString(id) as string);
     const unscopedRoles = roleList.filter((role) => !asString(role.filterPredicate) && role.systemDefined !== true);
+    const adminMembers = userList.filter((user) => adminUserIds.has(asString(user.id) ?? ""));
+    const adminActivity = userActivityBuckets(adminMembers, now, userInactiveDays);
     const evidence = {
       roles_seen: roleList.length,
       roles_complete: roles.complete,
@@ -1151,13 +1222,40 @@ export async function assessSumologicAccessControl(
       admin_role_members: adminUserIds.size,
       max_admins: maxAdmins,
       custom_roles_without_filter_predicate: names(unscopedRoles),
+      users_readable: users.ok,
+      users_complete: users.complete,
+      locked_users: names(activity.locked, "email"),
+      dormant_active_users: names(activity.dormant, "email"),
+      active_users_without_last_login: names(activity.undatedLogin, "email"),
+      admin_members_seen_in_user_list: adminMembers.length,
+      dormant_admin_members: names(adminActivity.dormant, "email"),
+      admin_members_without_last_login: names(adminActivity.undatedLogin, "email"),
+      user_inactive_threshold_days: userInactiveDays,
     };
+    const concerns: string[] = [];
+    if (customAdminRoles.length > 0) {
+      concerns.push(`${customAdminRoles.length} custom role(s) carry administrative capabilities (${names(customAdminRoles).join(", ")})`);
+    }
+    if (unscopedRoles.length > 0) {
+      concerns.push(`${unscopedRoles.length} custom role(s) have no filterPredicate and grant unrestricted search scope (${names(unscopedRoles).join(", ")})`);
+    }
+    if (!users.ok) {
+      concerns.push("the user list was unreadable, so admin member activity could not be checked");
+    } else if (!users.complete) {
+      concerns.push("user list pagination was incomplete, so admin member activity was checked on a partial population");
+    }
+    if (adminActivity.dormant.length > 0) {
+      concerns.push(`${adminActivity.dormant.length} admin role member(s) have not logged in for over ${userInactiveDays} days (${names(adminActivity.dormant, "email").join(", ")})`);
+    }
+    if (adminActivity.undatedLogin.length > 0) {
+      concerns.push(`${adminActivity.undatedLogin.length} admin role member(s) have no lastLoginTimestamp and are not counted as active (${names(adminActivity.undatedLogin, "email").join(", ")})`);
+    }
     if (adminUserIds.size > maxAdmins) {
-      findings.push(finding(6, "high", "fail", `${adminUserIds.size} users hold roles with administrative capabilities (threshold ${maxAdmins}) across ${adminRoles.length} admin-like roles.${partialNote(roles)}`, evidence));
-    } else if (customAdminRoles.length > 0) {
-      findings.push(finding(6, "high", "warn", `${customAdminRoles.length} custom role(s) carry administrative capabilities (${names(customAdminRoles).join(", ")}); ${adminUserIds.size} admin members are within the threshold of ${maxAdmins}.${partialNote(roles)}`, evidence));
+      findings.push(finding(6, "high", "fail", `${adminUserIds.size} users hold roles with administrative capabilities (threshold ${maxAdmins}) across ${adminRoles.length} admin-like roles.${concerns.length > 0 ? ` Also: ${concerns.join("; ")}.` : ""}${partialNote(roles)}`, evidence));
+    } else if (concerns.length > 0) {
+      findings.push(finding(6, "high", "warn", `${concerns.join("; ")}; ${adminUserIds.size} admin members are within the threshold of ${maxAdmins}. Least privilege requires scoped custom roles and active, individually owned admin accounts.${partialNote(roles)}`, evidence));
     } else {
-      findings.push(withPartialDowngrade(finding(6, "high", "pass", `${roleList.length} roles reviewed: administrative capabilities are limited to ${adminRoles.length} system role(s) with ${adminUserIds.size} members (threshold ${maxAdmins}).`, evidence), roles));
+      findings.push(withPartialDowngrade(finding(6, "high", "pass", `${roleList.length} roles reviewed: administrative capabilities are limited to ${adminRoles.length} system role(s) with ${adminUserIds.size} members (threshold ${maxAdmins}), every custom role carries a filterPredicate, and all admin members logged in within ${userInactiveDays} days.`, evidence), roles));
     }
   }
 
@@ -1172,7 +1270,7 @@ export async function assessSumologicAccessControl(
     const staleKeys = enabledKeys.filter((key) => (ageInDays(key.createdAt, now) ?? -1) > keyMaxAge);
     const undatedKeys = enabledKeys.filter((key) => ageInDays(key.createdAt, now) === undefined);
     const corsKeys = enabledKeys.filter((key) => asArray(key.corsHeaders).length > 0);
-    const lifetimeDays = keyLifetime.ok ? asNumber(keyLifetime.data?.accessKeysLifetimeInDays) : undefined;
+    const lifetime = keyLifetimePolicy(keyLifetime);
     const rotationEvidence = {
       ...keyEvidenceBase,
       enabled_keys: enabledKeys.length,
@@ -1180,23 +1278,26 @@ export async function assessSumologicAccessControl(
       keys_older_than_threshold: names(staleKeys, "label"),
       keys_missing_created_at: names(undatedKeys, "label"),
       keys_with_cors_headers: names(corsKeys, "label"),
-      access_keys_lifetime_policy_days: lifetimeDays ?? null,
+      access_keys_lifetime_policy_days: lifetime.days,
+      access_keys_lifetime_policy_state: lifetime.state,
       threshold_days: keyMaxAge,
     };
     const scopeNote = accessKeys.scope === "personal" ? " Only the caller's personal keys were visible (manageAccessKeys missing), so the org-wide population is unknown." : "";
     if (keys.length === 0) {
-      findings.push(finding(7, "high", "manual", "Zero access keys were returned even though the calling key must appear in the inventory, so the view is partial; export Administration > Security > Access Keys manually.", rotationEvidence));
+      findings.push(finding(7, "high", "manual", `Zero access keys were returned even though the calling key must appear in the inventory, so the view is partial; export Administration > Security > Access Keys manually. ${lifetime.text}`, rotationEvidence));
       findings.push(finding(8, "medium", "manual", "Zero access keys were returned even though the calling key must appear in the inventory, so the view is partial; export the key list with last-used dates manually.", { ...keyEvidenceBase }));
     } else if (accessKeys.scope === "personal") {
-      findings.push(finding(7, "high", "manual", `Partial view: ${keys.length} personal access key(s) seen, ${staleKeys.length} older than ${keyMaxAge} days.${scopeNote} Grant manageAccessKeys or export the org-wide key list.`, rotationEvidence));
+      findings.push(finding(7, "high", "manual", `Partial view: ${keys.length} personal access key(s) seen, ${staleKeys.length} older than ${keyMaxAge} days.${scopeNote} Grant manageAccessKeys or export the org-wide key list. ${lifetime.text}`, rotationEvidence));
       findings.push(finding(8, "medium", "manual", `Partial view: ${keys.length} personal access key(s) seen.${scopeNote} Grant manageAccessKeys or export the org-wide key list with last-used dates.`, { ...keyEvidenceBase }));
     } else {
       if (staleKeys.length > 0) {
-        findings.push(finding(7, "high", "fail", `${staleKeys.length}/${enabledKeys.length} enabled access keys were created more than ${keyMaxAge} days ago and have not been rotated.${partialNote(accessKeys)}`, rotationEvidence));
+        findings.push(finding(7, "high", "fail", `${staleKeys.length}/${enabledKeys.length} enabled access keys were created more than ${keyMaxAge} days ago and have not been rotated. ${lifetime.text}${partialNote(accessKeys)}`, rotationEvidence));
       } else if (undatedKeys.length > 0) {
-        findings.push(finding(7, "high", "warn", `No enabled key is older than ${keyMaxAge} days, but ${undatedKeys.length} key(s) lack a createdAt timestamp and cannot be counted as fresh.${partialNote(accessKeys)}`, rotationEvidence));
+        findings.push(finding(7, "high", "warn", `No enabled key is older than ${keyMaxAge} days, but ${undatedKeys.length} key(s) lack a createdAt timestamp and cannot be counted as fresh. ${lifetime.text}${partialNote(accessKeys)}`, rotationEvidence));
+      } else if (lifetime.state !== "enforced") {
+        findings.push(finding(7, "high", "warn", `All ${enabledKeys.length} enabled access key(s) were created within ${keyMaxAge} days, but the platform does not enforce expiry. ${lifetime.text} Set the access key lifetime policy so rotation does not depend on manual review.${partialNote(accessKeys)}`, rotationEvidence));
       } else {
-        findings.push(withPartialDowngrade(finding(7, "high", "pass", `${enabledKeys.length} enabled access key(s) seen (org scope, endpoint readable); all were created within ${keyMaxAge} days${lifetimeDays ? ` and the access key lifetime policy is ${lifetimeDays} days` : ""}.`, rotationEvidence), accessKeys));
+        findings.push(withPartialDowngrade(finding(7, "high", "pass", `${enabledKeys.length} enabled access key(s) seen (org scope, endpoint readable); all were created within ${keyMaxAge} days. ${lifetime.text}`, rotationEvidence), accessKeys));
       }
 
       const inactiveKeys = enabledKeys.filter((key) => (ageInDays(key.lastUsed, now) ?? -1) > keyInactive);
@@ -1328,7 +1429,7 @@ export async function assessSumologicDataGovernance(
   if (!connections.ok) {
     findings.push(unreadable(10, "medium", "the connection list", connections, "export Manage Data > Monitoring > Connections and Manage Data > Logs > Data Forwarding destinations with owner approvals."));
   } else {
-    const destinations = connectionList.map((connection) => ({ name: asString(connection.name) ?? asString(connection.id) ?? "connection", type: asString(connection.type) ?? "unknown", host: hostOf(asString(connection.url) ?? asString(asObject(connection.defaultPayload)?.url)) ?? null }));
+    const destinations = connectionList.map((connection) => ({ name: asString(connection.name) ?? asString(connection.id) ?? "connection", type: asString(connection.type) ?? "unknown", host: hostOf(asString(connection.url)) ?? null }));
     const unapproved = approvedDestinations.length > 0 ? destinations.filter((item) => !item.host || !domainMatches(item.host, approvedDestinations)) : [];
     const evidence = { connections_seen: connectionList.length, connections_complete: connections.complete, destinations, partitions_forwarding: names(forwardingPartitions), scheduled_views_forwarding: names(forwardingViews, "indexName"), approved_destination_domains: approvedDestinations, unapproved_destinations: unapproved.map((item) => item.name) };
     if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok && partitionList.length > 0) {
@@ -1434,7 +1535,9 @@ export async function assessSumologicContentSharing(
     client.listConnections(),
     client.listUsers(),
   ]);
-  const children = asRecords(personalFolder.data?.children).slice(0, sample);
+  const allChildren = asRecords(personalFolder.data?.children);
+  const children = allChildren.slice(0, sample);
+  const unsampledChildren = allChildren.length - children.length;
   const permissionResults: Array<{ item: JsonRecord; permissions: SumologicCollection<JsonRecord> }> = [];
   for (const item of children) {
     const id = asString(item.id);
@@ -1455,23 +1558,34 @@ export async function assessSumologicContentSharing(
 
   const orgShared = permissionResults.filter((entry) => [...asRecords(entry.permissions.data?.explicitPermissions), ...asRecords(entry.permissions.data?.implicitPermissions)].some((permission) => asString(permission.sourceType) === "org"));
   const unreadablePermissions = permissionResults.filter((entry) => !entry.permissions.ok);
-  const sharingEvidence = { data_access_level_enabled: dataAccessPolicy.ok ? dataAccessPolicy.data?.enabled === true : null, personal_folder_items_sampled: permissionResults.length, org_shared_items: names(orgShared.map((entry) => entry.item)), permission_lookups_failed: unreadablePermissions.length };
+  const sampleNote = unsampledChildren > 0 ? ` Only ${children.length} of ${allChildren.length} personal-folder items were sampled (content_sample=${sample}); ${unsampledChildren} were not evaluated.` : "";
+  const sharingEvidence = {
+    data_access_level_enabled: dataAccessPolicy.ok ? dataAccessPolicy.data?.enabled === true : null,
+    personal_folder_items_total: allChildren.length,
+    personal_folder_items_sampled: permissionResults.length,
+    personal_folder_items_unsampled: unsampledChildren,
+    content_sample: sample,
+    org_shared_items: names(orgShared.map((entry) => entry.item)),
+    permission_lookups_failed: unreadablePermissions.length,
+  };
   if (!dataAccessPolicy.ok) {
     findings.push(unreadable(11, "medium", "the data access level policy", dataAccessPolicy, "screenshot Administration > Security > Policies > Data Access Level and review Library sharing for org-wide shares."));
   } else if (dataAccessPolicy.data?.enabled !== true) {
-    findings.push(finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${orgShared.length} sampled item(s) are shared org-wide.`, sharingEvidence));
+    findings.push(finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${orgShared.length} sampled item(s) are shared org-wide.${sampleNote}`, sharingEvidence));
   } else if (orgShared.length > 0) {
-    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.`, sharingEvidence));
+    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.${sampleNote}`, sharingEvidence));
   } else if (!personalFolder.ok || permissionResults.length === 0 || unreadablePermissions.length > 0) {
-    findings.push(finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.`, sharingEvidence));
+    findings.push(finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.${sampleNote}`, sharingEvidence));
+  } else if (unsampledChildren > 0) {
+    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide, but the population is incomplete.${sampleNote} Raise content_sample or review the remaining items in the Library before treating this control as satisfied.`, sharingEvidence));
   } else {
-    findings.push(finding(11, "medium", "pass", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide; the sample covers the key owner's folder only, so Admin Recommended and Global folders still merit periodic review.`, sharingEvidence));
+    findings.push(finding(11, "medium", "pass", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide (all ${allChildren.length} items in the folder were evaluated); the sample covers the key owner's folder only, so Admin Recommended and Global folders still merit periodic review.`, sharingEvidence));
   }
 
   const monitorList = monitors.data ?? [];
   const monitorsWithRunAs = monitorList.filter((monitor) => asString(asObject(monitor.runAs)?.runAsId));
   const scheduledContent = children.filter((item) => item.isScheduled === true);
-  const scheduleEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, monitors_with_run_as: monitorsWithRunAs.length, scheduled_searches_in_sampled_folder: names(scheduledContent), monitors_readable: monitors.ok };
+  const scheduleEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, monitors_with_run_as: monitorsWithRunAs.length, scheduled_searches_in_sampled_folder: names(scheduledContent), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, monitors_readable: monitors.ok };
   if (!monitors.ok && !personalFolder.ok) {
     findings.push(unreadable(15, "medium", "the monitor and content inventories", monitors, "list scheduled searches and monitors with their owners and runAs identities, and confirm none run under shared administrator accounts."));
   } else {
@@ -1480,7 +1594,7 @@ export async function assessSumologicContentSharing(
 
   const lookupItems = children.filter((item) => /lookup/i.test(asString(item.itemType) ?? ""));
   const lookupOrgShared = orgShared.filter((entry) => /lookup/i.test(asString(entry.item.itemType) ?? ""));
-  const lookupEvidence = { lookup_tables_in_sampled_folder: names(lookupItems), lookup_tables_shared_org_wide: names(lookupOrgShared.map((entry) => entry.item)) };
+  const lookupEvidence = { lookup_tables_in_sampled_folder: names(lookupItems), lookup_tables_shared_org_wide: names(lookupOrgShared.map((entry) => entry.item)), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length };
   if (lookupOrgShared.length > 0) {
     findings.push(finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.`, lookupEvidence));
   } else {
@@ -1546,7 +1660,9 @@ export async function assessSumologicContentSharing(
     title: "Sumo Logic content sharing and alerting",
     area: "content-sharing",
     summary: {
+      personal_folder_items_total: allChildren.length,
       personal_folder_items_sampled: permissionResults.length,
+      personal_folder_items_unsampled: unsampledChildren,
       org_shared_items: orgShared.length,
       dashboards_seen: dashboardList.length,
       monitors_seen: monitorList.length,
@@ -1768,6 +1884,7 @@ function normalizeAccessControlArgs(args: unknown): AccessControlArgs {
     max_admins: asNumber(value.max_admins),
     key_max_age_days: asNumber(value.key_max_age_days),
     key_inactive_days: asNumber(value.key_inactive_days),
+    user_inactive_days: asNumber(value.user_inactive_days),
     max_session_timeout_minutes: asNumber(value.max_session_timeout_minutes),
   };
 }
@@ -1810,6 +1927,7 @@ function toOptions(args: ExportAuditBundleArgs): SumologicAssessmentOptions {
     maxAdmins: args.max_admins,
     keyMaxAgeDays: args.key_max_age_days,
     keyInactiveDays: args.key_inactive_days,
+    userInactiveDays: args.user_inactive_days,
     maxSessionTimeoutMinutes: args.max_session_timeout_minutes,
     minRetentionDays: args.min_retention_days,
     collectorOfflineDays: args.collector_offline_days,
@@ -1846,6 +1964,7 @@ const accessControlParams = {
   max_admins: Type.Optional(Type.Number({ description: "Maximum users holding administrative roles before failing control 6. Defaults to 5.", default: 5 })),
   key_max_age_days: Type.Optional(Type.Number({ description: "Access key age in days before rotation is required. Defaults to 90.", default: 90 })),
   key_inactive_days: Type.Optional(Type.Number({ description: "Idle days before an access key is inactive. Defaults to 90.", default: 90 })),
+  user_inactive_days: Type.Optional(Type.Number({ description: "Days since last login before an active user (and any admin role member) is reported dormant. Defaults to 90.", default: 90 })),
   max_session_timeout_minutes: Type.Optional(Type.Number({ description: "Maximum acceptable web session timeout in minutes. Defaults to 15.", default: 15 })),
 };
 
