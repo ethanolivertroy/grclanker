@@ -40,6 +40,7 @@ const ROOT = { id: TENANCY, compartmentId: TENANCY, name: "root", lifecycleState
 const PROD = { id: "ocid1.compartment.oc1..prod", compartmentId: TENANCY, name: "prod", lifecycleState: "ACTIVE" };
 const APPS = { id: "ocid1.compartment.oc1..apps", compartmentId: PROD.id, name: "apps", lifecycleState: "ACTIVE" };
 const DENIED_ERROR = new Error("ServiceError: 404 NotAuthorizedOrNotFound: Authorization failed or requested resource not found.");
+const FORBIDDEN_ERROR = new Error("ServiceError: 403 NotAllowed: Please go to http://docs.oracle.com/iaas/Content/Identity/Concepts/policies.htm for possible reasons.");
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -741,7 +742,7 @@ test("control 19: a denied or shapeless key get never passes and names the cause
   };
   const single = byId(await assessOciTenancyGuardrails(denied), "OCI-GRD-05");
   assert.equal(single.status, "manual");
-  assert.match(single.summary, /none of the 1 ENABLED keys could be read with kms key get/);
+  assert.match(single.summary, /none of the 1 ENABLED keys could be read with kms management key get/);
   assert.match(single.summary, /NotAuthorizedOrNotFound/);
   assert.equal(single.evidence.key_detail_errors, 1);
   assert.equal(single.evidence.keys_judged, 0);
@@ -761,7 +762,7 @@ test("control 19: a denied or shapeless key get never passes and names the cause
   assert.equal(mixed.evidence.keys_judged, 1);
   assert.equal(mixed.evidence.key_detail_errors, 1);
   assert.match(mixed.summary, /1\/2 ENABLED keys judged from Key.keyShape/);
-  assert.match(mixed.summary, /1 key get reads failed/);
+  assert.match(mixed.summary, /1 kms management key get reads failed/);
 
   const shapeless = compliantClient();
   shapeless.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED" });
@@ -824,6 +825,162 @@ test("NSG rule evidence carries the documented SecurityRule.isValid flag", async
   assert.equal(finding.evidence.nsg_rules_is_valid_false, 1);
   assert.equal(finding.evidence.permissive_nsg_rules[0].isValid, false);
   assert.ok(OCI_SURFACE_DOCS.networkSecurityGroupRules.fields.includes("isValid"));
+});
+
+test("rule 1 corollary: vacuous NSG and gateway emptiness never passes beside a partially unreadable security list inventory", async () => {
+  const oneCompartmentForbidden = compliantClient();
+  oneCompartmentForbidden.listNetworkSecurityGroups = async () => [];
+  oneCompartmentForbidden.listSecurityLists = async (compartmentId) => {
+    if (compartmentId === PROD.id) throw FORBIDDEN_ERROR;
+    return compartmentId === APPS.id ? [{ id: "sl-1", lifecycleState: "AVAILABLE", ingressSecurityRules: [] }] : [];
+  };
+  const denied = await assessOciTenancyGuardrails(oneCompartmentForbidden);
+  assert.equal(byId(denied, "OCI-GRD-01").status, "warn");
+  for (const id of ["OCI-GRD-02", "OCI-GRD-03"]) {
+    const item = byId(denied, id);
+    assert.equal(item.status, "warn", `${id} must not pass beside a partial security list inventory: ${item.summary}`);
+    assert.match(item.summary, /1 security lists were readable across 2\/3 compartments/);
+    assert.match(item.summary, /The security list inventory is incomplete \(network security-list list denied or unreadable in 1 compartment\(s\): prod\), so a pass verdict is withheld/);
+    assert.equal(item.evidence.security_lists_readable, true);
+    assert.equal(item.evidence.security_lists_partial, true);
+    assert.deepEqual(item.evidence.security_lists_denied_compartments, ["prod"]);
+    assert.equal(item.evidence.security_lists_compartments_truncated, false);
+  }
+  assert.ok(denied.errors.some((error) => /network security-list list in compartment prod: ServiceError: 403 NotAllowed/.test(error)));
+
+  const capped = compliantClient();
+  capped.listNetworkSecurityGroups = async () => [];
+  capped.listSecurityLists = async (compartmentId) => (compartmentId === TENANCY ? [{ id: "sl-root", lifecycleState: "AVAILABLE", ingressSecurityRules: [] }] : []);
+  const truncated = await assessOciTenancyGuardrails(capped, { maxCompartments: 1 });
+  for (const id of ["OCI-GRD-02", "OCI-GRD-03"]) {
+    const item = byId(truncated, id);
+    assert.equal(item.status, "warn", `${id}: ${item.summary}`);
+    assert.match(item.summary, /compartment cap hit \(1\/3 compartments inspected by network security-list list\)/);
+    assert.equal(item.evidence.security_lists_compartments_truncated, true);
+  }
+
+  const unreadable = compliantClient();
+  unreadable.listNetworkSecurityGroups = async () => [];
+  unreadable.listSecurityLists = async () => {
+    throw DENIED_ERROR;
+  };
+  const manual = await assessOciTenancyGuardrails(unreadable);
+  for (const id of ["OCI-GRD-02", "OCI-GRD-03"]) {
+    const item = byId(manual, id);
+    assert.equal(item.status, "manual", `${id}: ${item.summary}`);
+    assert.match(item.summary, /no readable security lists were found \(network security-list list in compartment root: ServiceError: 404 NotAuthorizedOrNotFound/);
+    assert.equal(item.evidence.security_lists_readable, false);
+  }
+
+  const complete = compliantClient();
+  complete.listNetworkSecurityGroups = async () => [];
+  const passing = await assessOciTenancyGuardrails(complete);
+  for (const id of ["OCI-GRD-02", "OCI-GRD-03"]) {
+    const item = byId(passing, id);
+    assert.equal(item.status, "pass", `${id}: ${item.summary}`);
+    assert.match(item.summary, /1 security lists were readable across 3\/3 compartments/);
+    assert.equal(item.evidence.security_lists_partial, false);
+  }
+});
+
+/**
+ * Every client surface, the OCI CLI command it wraps, the findings whose
+ * verdict or evidence reads it under fixture (d), and (for compartment-scoped
+ * lists) the argument position of the compartment OCID. Findings not listed
+ * for a surface must keep passing when only that surface fails, so the table
+ * also guards against over-demotion.
+ */
+const INVENTORY_SWEEP = [
+  { method: "listCompartments", command: "iam compartment list", dependents: ["OCI-IAM-04", "OCI-IAM-05", "OCI-LOG-05", "OCI-GRD-01", "OCI-GRD-02", "OCI-GRD-03", "OCI-GRD-04", "OCI-GRD-05", "OCI-GRD-06", "OCI-CMP-01", "OCI-CMP-02", "OCI-CMP-03"] },
+  { method: "listUsers", command: "iam user list", dependents: ["OCI-IAM-02", "OCI-IAM-03"] },
+  { method: "getAuthenticationPolicy", command: "iam authentication-policy get", dependents: ["OCI-IAM-01"] },
+  { method: "listApiKeys", command: "iam user api-key list", dependents: ["OCI-IAM-03"] },
+  { method: "listCustomerSecretKeys", command: "iam customer-secret-key list", dependents: ["OCI-IAM-03"] },
+  { method: "listAuthTokens", command: "iam auth-token list", dependents: ["OCI-IAM-03"] },
+  { method: "listPolicies", command: "iam policy list", dependents: ["OCI-IAM-04"], compartmentArg: 0 },
+  { method: "listAvailabilityDomains", command: "iam availability-domain list", dependents: ["OCI-CMP-03"] },
+  { method: "getAuditConfiguration", command: "audit config get", dependents: ["OCI-LOG-06"] },
+  { method: "listAuditEvents", command: "audit event list", dependents: ["OCI-LOG-04"] },
+  { method: "getCloudGuardConfiguration", command: "cloud-guard configuration get", dependents: ["OCI-LOG-01", "OCI-LOG-02", "OCI-LOG-03"] },
+  { method: "listCloudGuardTargets", command: "cloud-guard target list", dependents: ["OCI-LOG-01"] },
+  { method: "listCloudGuardProblems", command: "cloud-guard problem list", dependents: ["OCI-LOG-02"] },
+  { method: "listResponderRecipes", command: "cloud-guard responder-recipe list", dependents: ["OCI-LOG-03"] },
+  { method: "listEventRules", command: "events rule list", dependents: ["OCI-LOG-05"], compartmentArg: 0 },
+  { method: "listSecurityLists", command: "network security-list list", dependents: ["OCI-GRD-01", "OCI-GRD-03"], compartmentArg: 0 },
+  { method: "listNetworkSecurityGroups", command: "network nsg list", dependents: ["OCI-GRD-02"], compartmentArg: 0 },
+  { method: "listNetworkSecurityGroupRules", command: "network nsg rules list", dependents: ["OCI-GRD-02"] },
+  { method: "listInternetGateways", command: "network internet-gateway list", dependents: ["OCI-GRD-03"], compartmentArg: 0 },
+  { method: "listBastions", command: "bastion bastion list", dependents: ["OCI-GRD-04"], compartmentArg: 0 },
+  { method: "getBastion", command: "bastion bastion get", dependents: ["OCI-GRD-04"] },
+  { method: "listBastionSessions", command: "bastion session list", dependents: ["OCI-GRD-04"] },
+  { method: "listVaults", command: "kms management vault list", dependents: ["OCI-GRD-05"], compartmentArg: 0 },
+  { method: "listKeys", command: "kms management key list", dependents: ["OCI-GRD-05"] },
+  { method: "getKey", command: "kms management key get", dependents: ["OCI-GRD-05"] },
+  { method: "listKeyVersions", command: "kms management key-version list", dependents: ["OCI-GRD-05"] },
+  { method: "getObjectStorageNamespace", command: "os ns get", dependents: ["OCI-GRD-06"] },
+  { method: "listBuckets", command: "os bucket list", dependents: ["OCI-GRD-06"], compartmentArg: 1 },
+  { method: "getBucket", command: "os bucket get", dependents: ["OCI-GRD-06"] },
+  { method: "listPreauthenticatedRequests", command: "os preauth-request list", dependents: ["OCI-GRD-06"] },
+  { method: "listInstances", command: "compute instance list", dependents: ["OCI-CMP-01"], compartmentArg: 0 },
+  { method: "listVolumes", command: "bv volume list", dependents: ["OCI-CMP-02"], compartmentArg: 0 },
+  { method: "listBootVolumes", command: "bv boot-volume list", dependents: ["OCI-CMP-03"], compartmentArg: 0 },
+];
+
+function sweepClient(entry, mode, error) {
+  const client = compliantClient();
+  const original = client[entry.method];
+  client[entry.method] = async (...args) => {
+    if (mode === "full" || args[entry.compartmentArg] === PROD.id) throw error;
+    return original(...args);
+  };
+  return client;
+}
+
+function hasNullEvidence(value) {
+  if (value === null) return true;
+  if (Array.isArray(value)) return value.some(hasNullEvidence);
+  if (value && typeof value === "object") return Object.values(value).some(hasNullEvidence);
+  return false;
+}
+
+test("per-inventory sweep: every finding that reads an unreadable surface drops below pass and names the command and compartment", async () => {
+  assert.equal(INVENTORY_SWEEP.length, Object.keys(compliantClient()).filter((key) => key !== "getResolvedConfig" && key !== "getNow").length, "every client surface is in the sweep table");
+  for (const entry of INVENTORY_SWEEP) {
+    const modes = entry.compartmentArg === undefined ? ["full"] : ["full", "compartment"];
+    for (const mode of modes) {
+      for (const error of [DENIED_ERROR, FORBIDDEN_ERROR]) {
+        const results = await runAllAssessments(sweepClient(entry, mode, error));
+        const findings = results.flatMap((result) => result.findings);
+        const label = `${entry.method} (${mode}, ${error.message.slice(14, 17)})`;
+        for (const item of findings) {
+          if (entry.dependents.includes(item.id)) {
+            assert.notEqual(item.status, "pass", `${label}: ${item.id} must not pass: ${item.summary}`);
+            assert.match(item.summary, new RegExp(entry.command), `${label}: ${item.id} must name the command: ${item.summary}`);
+            if (mode === "compartment") {
+              assert.match(item.summary, /\bprod\b/, `${label}: ${item.id} must name the denied compartment: ${item.summary}`);
+            }
+          } else if (item.id !== "OCI-IAM-06") {
+            assert.equal(item.status, "pass", `${label}: ${item.id} does not read this surface and must keep passing: ${item.summary}`);
+            assert.equal(hasNullEvidence(item.evidence), false, `${label}: ${item.id} passes with null evidence`);
+          }
+        }
+        assert.ok(results.some((result) => result.errors.some((line) => line.includes(error.message))), `${label}: the collection error is recorded`);
+      }
+    }
+  }
+});
+
+test("scrub covers the JSON-colon keyId form, signingKeyId, pass_phrase, and pass_word assignments", () => {
+  const json = redactSensitiveText('{"keyId": "ocid1.tenancy.oc1..FAKE_T/ocid1.user.oc1..FAKE_U/FAKE_FP", "signature": "FAKE_SIG==", "kmsKeyId": "ocid1.key.oc1..cmk"}');
+  assert.doesNotMatch(json, /FAKE_/);
+  assert.match(json, /keyId=\[redacted\]/);
+  assert.match(json, /signature=\[redacted\]/);
+  assert.match(json, /"kmsKeyId": "ocid1\.key\.oc1\.\.cmk"/, "KMS key OCIDs stay readable");
+  assert.equal(redactSensitiveText("signingKeyId=ocid1.tenancy.oc1..FAKE_T/ocid1.user.oc1..FAKE_U/FAKE_FP"), "signingKeyId=[redacted]");
+  assert.equal(redactSensitiveText('SigningKeyId="ocid1.tenancy.oc1..FAKE_T/ocid1.user.oc1..FAKE_U/FAKE_FP"'), "SigningKeyId=[redacted]");
+  assert.equal(redactSensitiveText("pass_phrase=FAKE_PASSPHRASE_1 passphrase=FAKE_PASSPHRASE_2 pass_word=FAKE_PASSWORD_1"), "pass_phrase=[redacted] passphrase=[redacted] pass_word=[redacted]");
+  assert.equal(redactSensitiveText("masterKeyId=ocid1.key.oc1..cmk kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk"), "masterKeyId=ocid1.key.oc1..cmk kmsKeyId=ocid1.key.oc1..cmk --key-id ocid1.key.oc1..cmk");
+  assert.equal(isSensitiveFieldName("pass_phrase"), true);
 });
 
 test("OCI-LOG-04 reads as supporting evidence without framework mappings", async () => {
