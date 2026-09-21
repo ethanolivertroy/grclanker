@@ -784,6 +784,57 @@ const GITHUB_CHECKS: Record<string, CheckDefinition> = {
       general: ["third-party OAuth governance"],
     },
   },
+  "GITHUB-INTEG-005": {
+    id: "GITHUB-INTEG-005",
+    title: "Package registry visibility is governed",
+    category: "integrations",
+    severity: "medium",
+    frameworks: {
+      fedramp: ["AC-3", "AC-22"],
+      cmmc: ["AC.L2-3.1.22"],
+      soc2: ["CC6.1"],
+      cis: ["5.3.1"],
+      pci_dss: ["7.2.6"],
+      disa_stig: ["SRG-APP-000211"],
+      irap: ["ISM-0264"],
+      ismap: ["5.6.5"],
+      general: ["package registry access"],
+    },
+  },
+  "GITHUB-ORG-011": {
+    id: "GITHUB-ORG-011",
+    title: "Audit log streaming delivers events to an external SIEM",
+    category: "org_access",
+    severity: "high",
+    frameworks: {
+      fedramp: ["AU-2", "AU-6", "SI-4"],
+      cmmc: ["AU.L2-3.3.1"],
+      soc2: ["CC7.2", "CC7.3"],
+      cis: ["4.1.1"],
+      pci_dss: ["10.2.1"],
+      disa_stig: ["SRG-APP-000095"],
+      irap: ["ISM-0580"],
+      ismap: ["5.5.1"],
+      general: ["audit log streaming"],
+    },
+  },
+  "GITHUB-CODE-006": {
+    id: "GITHUB-CODE-006",
+    title: "Repositories publish a security policy",
+    category: "code_security",
+    severity: "low",
+    frameworks: {
+      fedramp: ["PL-2", "IR-8"],
+      cmmc: ["IR.L2-3.6.1"],
+      soc2: ["CC2.2"],
+      cis: ["3.1.4"],
+      pci_dss: ["12.10.1"],
+      disa_stig: ["SRG-APP-000516"],
+      irap: ["ISM-0043"],
+      ismap: ["5.4.4"],
+      general: ["security policy"],
+    },
+  },
   "GITHUB-CODE-001": {
     id: "GITHUB-CODE-001",
     title: "Code security configurations exist at the org layer",
@@ -2442,6 +2493,27 @@ function assessIpAllowList(data: GitHubOrgAccessData): GitHubFinding {
   );
 }
 
+// Deferred automation: audit log streaming configuration is an enterprise-level GHEC resource
+// (GET /enterprises/{enterprise}/audit-log/streams, enterprise-admin/get-audit-log-streams) that
+// needs an enterprise owner principal; the organization API has no streaming field.
+function assessAuditLogStreaming(config: GitHubResolvedConfig): GitHubFinding {
+  const enterprise = config.enterprise?.trim();
+  return buildFinding(
+    "GITHUB-ORG-011",
+    "Manual",
+    enterprise
+      ? `Audit log streaming for enterprise ${enterprise} is not yet read by this tool, so SIEM delivery is unverified.`
+      : "Audit log streaming is configured at the enterprise level and no enterprise slug was supplied, so SIEM delivery is unverified.",
+    [
+      `enterprise = ${enterprise ?? "not configured (set GITHUB_ENTERPRISE)"}`,
+      "Deferred collector: GET /enterprises/{enterprise}/audit-log/streams (GitHub Enterprise Cloud, enterprise owner).",
+      "GITHUB-ORG-005 covers organization audit log visibility only; it does not prove forwarding.",
+    ],
+    "Configure audit log streaming to the SIEM at the enterprise level and confirm the stream is healthy.",
+    "Export the enterprise audit log stream configurations (Enterprise settings > Audit log > Log streaming) and record the destination, status, and last delivery time.",
+  );
+}
+
 function assessRepositoryVisibilityDefaults(data: GitHubOrgAccessData): GitHubFinding {
   const org = data.org.data ? asRecord(data.org.data) : null;
   const canCreatePublic = asBoolean(org?.members_can_create_public_repositories);
@@ -2990,6 +3062,22 @@ function assessOAuthRestrictions(data: GitHubIntegrationsData): GitHubFinding {
   );
 }
 
+// Deferred automation: GET /orgs/{org}/packages requires a package_type query parameter per
+// package ecosystem and read:packages, so the sweep is not yet wired into the collector.
+function assessPackageRegistryAccess(): GitHubFinding {
+  return buildFinding(
+    "GITHUB-INTEG-005",
+    "Manual",
+    "Package registry visibility is not yet enumerated by this tool, so the control is unverified.",
+    [
+      "Deferred collector: GET /orgs/{org}/packages?package_type={npm|maven|rubygems|docker|nuget|container} (packages/list-packages-for-organization).",
+      "Evidence to collect: each package's visibility field and, for private organizations, any package whose visibility is public.",
+    ],
+    "Keep packages private unless publication is intentional, and review package access inheritance from the owning repository.",
+    "Run the packages listing per package_type with a principal that holds read:packages, or review Packages in the organization profile and record any public packages.",
+  );
+}
+
 export function assessGitHubIntegrations(
   data: GitHubIntegrationsData,
   config: GitHubResolvedConfig,
@@ -3000,6 +3088,7 @@ export function assessGitHubIntegrations(
     assessDeployKeys(data, now),
     assessAppInstallations(data),
     assessOAuthRestrictions(data),
+    assessPackageRegistryAccess(),
   ];
   const deployKeyEntries = Object.values(data.deployKeys.data);
   return {
@@ -3107,6 +3196,7 @@ export function assessGitHubOrgAccess(
     assessIpAllowList(data),
     assessRepositoryVisibilityDefaults(data),
     assessForkPolicy(data),
+    assessAuditLogStreaming(config),
   ];
 
   return {
@@ -3540,6 +3630,23 @@ export function assessGitHubActionsSecurity(
   };
 }
 
+// Deferred automation: per-repository security policy presence is exposed by GraphQL
+// Repository.isSecurityPolicyEnabled and Repository.securityPolicyUrl; the sweep is not yet wired.
+function assessSecurityPolicyPresence(data: GitHubCodeSecurityData): GitHubFinding {
+  const repoCount = data.repositories.error ? "unknown" : String(data.repositories.data.length);
+  return buildFinding(
+    "GITHUB-CODE-006",
+    "Manual",
+    "Security policy (SECURITY.md) presence is not yet enumerated per repository, so the control is unverified.",
+    [
+      `repositories_in_scope = ${repoCount}`,
+      "Deferred collector: GraphQL Repository.isSecurityPolicyEnabled and Repository.securityPolicyUrl per active repository.",
+    ],
+    "Publish a SECURITY.md (or an organization-level .github/SECURITY.md) so vulnerability reporting instructions are available for every repository.",
+    "Query isSecurityPolicyEnabled for each active repository, or check the Security tab of each repository, and record the repositories without a policy.",
+  );
+}
+
 export function assessGitHubCodeSecurity(
   data: GitHubCodeSecurityData,
   config: GitHubResolvedConfig,
@@ -3650,6 +3757,7 @@ export function assessGitHubCodeSecurity(
       "Enable code scanning default setup where supported so repositories inherit baseline static-analysis coverage.",
       codeScanningDefault === undefined ? manualNote : undefined,
     ),
+    assessSecurityPolicyPresence(data),
   ];
 
   return {

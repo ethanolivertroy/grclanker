@@ -570,7 +570,7 @@ test("org access identity findings pass on a fully documented compliant tenant",
   assert.equal(findingStatus(result, "GITHUB-ORG-008"), "Pass");
   assert.equal(findingStatus(result, "GITHUB-ORG-009"), "Pass");
   assert.equal(findingStatus(result, "GITHUB-ORG-010"), "Pass");
-  assert.equal(result.findings.length, 10);
+  assert.equal(result.findings.length, 11);
   for (const finding of result.findings) {
     assert.ok(finding.frameworks.fedramp.length > 0, `${finding.id} lacks FedRAMP mapping`);
     assert.ok(finding.frameworks.cis.length > 0, `${finding.id} lacks CIS mapping`);
@@ -874,7 +874,7 @@ test("integrations findings classify webhook, deploy key, and app installation p
   const config = createSampleConfig();
   const now = Date.parse("2026-09-21T00:00:00Z");
   const healthy = assessGitHubIntegrations(createIntegrationsData(), config, now);
-  assert.equal(healthy.findings.length, 4);
+  assert.equal(healthy.findings.length, 5);
   assert.equal(findingStatus(healthy, "GITHUB-INTEG-001"), "Pass");
   assert.equal(findingStatus(healthy, "GITHUB-INTEG-002"), "Pass");
   assert.equal(findingStatus(healthy, "GITHUB-INTEG-003"), "Pass");
@@ -1390,13 +1390,13 @@ const SETTING_DRIVEN_IDS = [
 
 test("self-check (a): every endpoint forbidden yields zero passes and names the cause", async () => {
   const findings = await runAllAssessments(createForbiddenClient());
-  assert.equal(findings.length, 31);
+  assert.equal(findings.length, 34);
   assert.deepEqual(passingIds(findings), []);
   for (const finding of findings) {
     assert.ok(["Manual", "Partial", "Fail", "Info"].includes(finding.status), `${finding.id} reported ${finding.status}`);
   }
   const manual = findings.filter((finding) => finding.status === "Manual");
-  assert.ok(manual.length >= 30, `expected almost every finding manual, got ${manual.length}`);
+  assert.ok(manual.length >= 33, `expected almost every finding manual, got ${manual.length}`);
   for (const finding of manual) {
     assert.ok(finding.manualNote || /unreadable|could not|not readable|unverified/i.test(finding.summary), `${finding.id} lacks a manual instruction`);
   }
@@ -1450,9 +1450,21 @@ test("self-check (c): partial inventories never pass an inventory-driven control
 
 test("self-check (d): a compliant tenant built from documented fields passes every automatable control", async () => {
   const findings = await runAllAssessments(createCompliantClient());
-  assert.equal(findings.length, 31);
-  const notPassing = findings.filter((finding) => finding.status !== "Pass").map((finding) => `${finding.id}=${finding.status}`);
-  assert.deepEqual(notPassing, ["GITHUB-INTEG-004=Manual"]);
+  assert.equal(findings.length, 34);
+  const notPassing = findings.filter((finding) => finding.status !== "Pass").map((finding) => `${finding.id}=${finding.status}`).sort();
+  assert.deepEqual(notPassing, [
+    "GITHUB-CODE-006=Manual",
+    "GITHUB-INTEG-004=Manual",
+    "GITHUB-INTEG-005=Manual",
+    "GITHUB-ORG-011=Manual",
+  ]);
+  const byId = Object.fromEntries(findings.map((finding) => [finding.id, finding]));
+  assert.match(byId["GITHUB-ORG-011"].evidence.join("\n"), /\/enterprises\/\{enterprise\}\/audit-log\/streams/);
+  assert.match(byId["GITHUB-CODE-006"].evidence.join("\n"), /isSecurityPolicyEnabled/);
+  assert.match(byId["GITHUB-INTEG-005"].evidence.join("\n"), /\/orgs\/\{org\}\/packages\?package_type=/);
+  for (const id of ["GITHUB-CODE-006", "GITHUB-INTEG-004", "GITHUB-INTEG-005", "GITHUB-ORG-011"]) {
+    assert.ok(byId[id].manualNote, `${id} must tell the reviewer what evidence to collect`);
+  }
 });
 
 test("exportGitHubAuditBundle records collector failures and never overwrites a prior bundle", async () => {
