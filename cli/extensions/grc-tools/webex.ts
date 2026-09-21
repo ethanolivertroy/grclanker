@@ -26,9 +26,13 @@ type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
 
 /**
- * Public documentation pages backing each request. Reference pages on
- * developer.webex.com are client-rendered; the guide pages (basics,
- * compliance, bots, integrations, service-apps) render statically.
+ * Public documentation pages backing each request. The canonical reference URL
+ * https://developer.webex.com/docs/api/v1/<category>/<page> answers 302 to a
+ * category-prefixed page (/admin/docs, /meeting/docs, /calling/docs,
+ * /messaging/docs) whose server-rendered HTML embeds the OpenAPI 3.0.3 spec
+ * for every endpoint in that category; `curl -L` fetches it without a browser.
+ * The URLs below are those redirect targets, and every field read in this
+ * module was checked against the embedded schema.
  */
 export const WEBEX_DOCS = {
   basics: "https://developer.webex.com/docs/api/basics",
@@ -36,25 +40,28 @@ export const WEBEX_DOCS = {
   serviceApps: "https://developer.webex.com/docs/service-apps",
   bots: "https://developer.webex.com/docs/bots",
   complianceGuide: "https://developer.webex.com/docs/api/guides/compliance",
-  accessToken: "https://developer.webex.com/docs/api/v1/oauth/access-token",
-  peopleMe: "https://developer.webex.com/docs/api/v1/people/get-my-own-details",
-  peopleList: "https://developer.webex.com/docs/api/v1/people/list-people",
-  organizationsList: "https://developer.webex.com/docs/api/v1/organizations/list-organizations",
-  organizationGet: "https://developer.webex.com/docs/api/v1/organizations/get-organization-details",
-  rolesList: "https://developer.webex.com/docs/api/v1/roles/list-roles",
-  licensesList: "https://developer.webex.com/docs/api/v1/licenses/list-licenses",
-  eventsList: "https://developer.webex.com/docs/api/v1/events/list-events",
-  adminAuditEvents: "https://developer.webex.com/docs/api/v1/admin-audit-events/list-admin-audit-events",
-  adminRecordings: "https://developer.webex.com/docs/api/v1/recordings/list-recordings-for-an-admin-or-compliance-officer",
-  meetingsList: "https://developer.webex.com/docs/api/v1/meetings/list-meetings",
-  meetingPreferences: "https://developer.webex.com/docs/api/v1/meeting-preferences/get-meeting-preference-details",
-  meetingSites: "https://developer.webex.com/docs/api/v1/meeting-preferences/get-site-list",
-  hybridClusters: "https://developer.webex.com/docs/api/v1/hybrid-clusters/list-hybrid-clusters",
-  hybridConnectors: "https://developer.webex.com/docs/api/v1/hybrid-connectors/list-hybrid-connectors",
-  devicesList: "https://developer.webex.com/docs/api/v1/devices/list-devices",
-  workspacesList: "https://developer.webex.com/docs/api/v1/workspaces/list-workspaces",
-  roomsList: "https://developer.webex.com/docs/api/v1/rooms/list-rooms",
-  webhooksList: "https://developer.webex.com/docs/api/v1/webhooks/list-webhooks",
+  peopleMe: "https://developer.webex.com/admin/docs/api/v1/people/get-my-own-details",
+  peopleList: "https://developer.webex.com/admin/docs/api/v1/people/list-people",
+  organizationsList: "https://developer.webex.com/admin/docs/api/v1/organizations/list-organizations",
+  organizationGet: "https://developer.webex.com/admin/docs/api/v1/organizations/get-organization-details",
+  authenticationConfig: "https://developer.webex.com/admin/docs/api/v1/identity-organization/update-organization-authentication-configuration-settings",
+  rolesList: "https://developer.webex.com/admin/docs/api/v1/roles/list-roles",
+  licensesList: "https://developer.webex.com/admin/docs/api/v1/licenses/list-licenses",
+  eventsList: "https://developer.webex.com/admin/docs/api/v1/events/list-events",
+  adminAuditEvents: "https://developer.webex.com/admin/docs/api/v1/admin-audit-events/list-admin-audit-events",
+  adminRecordings: "https://developer.webex.com/admin/docs/api/v1/recordings/list-recordings-for-an-admin-or-compliance-officer",
+  guestCount: "https://developer.webex.com/admin/docs/api/v1/guest-management/get-guest-count",
+  hybridClusters: "https://developer.webex.com/admin/docs/api/v1/hybrid-clusters/list-hybrid-clusters",
+  hybridConnectors: "https://developer.webex.com/admin/docs/api/v1/hybrid-connectors/list-hybrid-connectors",
+  meetingsList: "https://developer.webex.com/meeting/docs/api/v1/meetings/list-meetings",
+  meetingPreferences: "https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-meeting-preference-details",
+  meetingSites: "https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-site-list",
+  meetingCommonSettings: "https://developer.webex.com/meeting/docs/api/v1/site/get-meeting-common-settings-configuration",
+  sessionTypes: "https://developer.webex.com/meeting/docs/api/v1/session-types",
+  webhooksList: "https://developer.webex.com/meeting/docs/api/v1/webhooks/list-webhooks",
+  devicesList: "https://developer.webex.com/calling/docs/api/v1/devices/list-devices",
+  workspacesList: "https://developer.webex.com/calling/docs/api/v1/workspaces/list-workspaces",
+  roomsList: "https://developer.webex.com/messaging/docs/api/v1/rooms/list-rooms",
 } as const;
 
 const DEFAULT_OUTPUT_DIR = "./export/webex";
@@ -64,23 +71,25 @@ const CONFIG_FILE_NAMES = ["config.json", "config.yaml", "config.yml"];
 const MAX_RETRY_AFTER_MS = 30_000;
 const MAX_429_RETRIES = 2;
 
-/** Documented `max` per page ceilings; the API silently caps larger values (basics guide). */
+/**
+ * Per-page `max` for the endpoints whose reference documents a `max` query
+ * parameter, kept within each documented ceiling (adminAudit 200, admin
+ * recordings 1 to 100, meetings up to 100, events and rooms 1 to 1000).
+ * /organizations, /roles, /licenses, /meetingPreferences/sites,
+ * /hybrid/clusters, and /hybrid/connectors document no `max`, so none is sent.
+ */
 const PAGE_MAX = {
   people: 100,
-  organizations: 100,
-  roles: 100,
-  licenses: 100,
   events: 100,
   adminAudit: 200,
   adminRecordings: 100,
   meetings: 100,
-  sites: 100,
-  hybrid: 100,
   devices: 100,
   workspaces: 100,
   rooms: 100,
   webhooks: 100,
 } as const;
+const MIN_MEETING_PASSWORD_LENGTH = 8;
 
 const DEFAULT_PEOPLE_LIMIT = 1000;
 const DEFAULT_EVENT_LIMIT = 500;
@@ -305,6 +314,13 @@ function asNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function asBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return undefined;
+}
+
 function asDate(value: unknown): Date | undefined {
   const text = asString(value);
   if (!text) return undefined;
@@ -344,6 +360,8 @@ function serializeJson(value: unknown): string {
 }
 
 const SECRET_KEY_PATTERN = /token|secret|password|hostpin|authorization/i;
+/** Policy flags from commonSettings.securityOptions that name passwords without holding one. */
+const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword)$/;
 
 export function redactSecrets(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactSecrets);
@@ -351,7 +369,8 @@ export function redactSecrets(value: unknown): unknown {
   if (!object) return value;
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
-    output[key] = SECRET_KEY_PATTERN.test(key) && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry);
+    const sensitive = SECRET_KEY_PATTERN.test(key) && !POLICY_KEY_PATTERN.test(key);
+    output[key] = sensitive && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry);
   }
   return output;
 }
@@ -636,7 +655,7 @@ export class WebexApiClient {
     return this.refreshAccessToken();
   }
 
-  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; nextUrl: string | null }> {
+  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; rawText: string; nextUrl: string | null }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     const endpoint = new URL(url).pathname;
@@ -660,7 +679,7 @@ export class WebexApiClient {
       const rawText = await response.text();
       let payload: JsonRecord = {};
       try {
-        payload = rawText.length > 0 ? JSON.parse(rawText) as JsonRecord : {};
+        payload = rawText.length > 0 ? asObject(JSON.parse(rawText)) ?? {} : {};
       } catch {
         payload = {};
       }
@@ -676,6 +695,7 @@ export class WebexApiClient {
 
       return {
         payload,
+        rawText,
         nextUrl: parseLinkHeaderNext(response.headers.get("link")),
       };
     } finally {
@@ -688,17 +708,21 @@ export class WebexApiClient {
     return payload;
   }
 
-  /** Follows rel="next" until absent or the item limit is reached; truncation is reported, never hidden. */
+  /**
+   * Follows rel="next" until absent or the item limit is reached; truncation is
+   * reported, never hidden. `max` is sent only when the caller passes pageMax,
+   * which happens only for endpoints whose reference documents that parameter.
+   */
   async list(
     path: string,
     query: JsonRecord = {},
     options: { limit?: number; pageMax?: number } = {},
   ): Promise<WebexPage> {
     const limit = clampNumber(options.limit, DEFAULT_GENERIC_LIMIT, 1, 50_000);
-    const pageMax = clampNumber(options.pageMax, 100, 1, 1000);
+    const pageQuery: JsonRecord = options.pageMax === undefined ? {} : { max: clampNumber(options.pageMax, 100, 1, 1000) };
     const items: JsonRecord[] = [];
     let pageCount = 0;
-    let nextUrl: string | null = this.buildUrl(path, { max: pageMax, ...query });
+    let nextUrl: string | null = this.buildUrl(path, { ...pageQuery, ...query });
 
     while (nextUrl) {
       const response = await this.fetchJson(nextUrl);
@@ -720,7 +744,7 @@ export class WebexApiClient {
   }
 
   async listOrganizations(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
-    return this.list("/organizations", {}, { limit, pageMax: PAGE_MAX.organizations });
+    return this.list("/organizations", {}, { limit });
   }
 
   async getOrganization(orgId: string): Promise<JsonRecord> {
@@ -732,11 +756,22 @@ export class WebexApiClient {
   }
 
   async listRoles(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
-    return this.list("/roles", {}, { limit, pageMax: PAGE_MAX.roles });
+    return this.list("/roles", {}, { limit });
   }
 
   async listLicenses(limit = DEFAULT_LICENSE_LIMIT): Promise<WebexPage> {
-    return this.list("/licenses", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.licenses });
+    return this.list("/licenses", this.getOrgQuery(), { limit });
+  }
+
+  /**
+   * GET /guests/count (guest-management reference, scope guest-issuer:read)
+   * answers with a bare number in a text/plain body.
+   */
+  async getGuestCount(): Promise<JsonRecord> {
+    const { payload, rawText } = await this.fetchJson(this.buildUrl("/guests/count"));
+    const fromObject = Object.values(payload).map(asNumber).find((value) => value !== undefined);
+    const count = fromObject ?? asNumber(rawText.trim());
+    return { count: count ?? null };
   }
 
   async listEvents(limit = DEFAULT_EVENT_LIMIT): Promise<WebexPage> {
@@ -767,15 +802,24 @@ export class WebexApiClient {
   }
 
   async listMeetingSites(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
-    return this.list("/meetingPreferences/sites", {}, { limit, pageMax: PAGE_MAX.sites });
+    return this.list("/meetingPreferences/sites", {}, { limit });
+  }
+
+  /**
+   * Site administrator common settings (site reference, scope
+   * meeting:admin_config_read). siteUrl selects the site; without it the API
+   * answers for the administrator's preferred site.
+   */
+  async getMeetingCommonSettings(siteUrl?: string): Promise<JsonRecord> {
+    return this.get("/admin/meeting/config/commonSettings", siteUrl ? { siteUrl } : {});
   }
 
   async listHybridClusters(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
-    return this.list("/hybrid/clusters", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.hybrid });
+    return this.list("/hybrid/clusters", this.getOrgQuery(), { limit });
   }
 
   async listHybridConnectors(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
-    return this.list("/hybrid/connectors", this.getOrgQuery(), { limit, pageMax: PAGE_MAX.hybrid });
+    return this.list("/hybrid/connectors", this.getOrgQuery(), { limit });
   }
 
   async listDevices(limit = DEFAULT_DEVICE_LIMIT): Promise<WebexPage> {
@@ -804,12 +848,14 @@ type WebexClientLike = Pick<
   | "listPeople"
   | "listRoles"
   | "listLicenses"
+  | "getGuestCount"
   | "listEvents"
   | "listAdminAuditEvents"
   | "listAdminRecordings"
   | "listMeetings"
   | "getMeetingPreferences"
   | "listMeetingSites"
+  | "getMeetingCommonSettings"
   | "listHybridClusters"
   | "listHybridConnectors"
   | "listDevices"
@@ -921,6 +967,165 @@ function partialNote(result: SurfaceResult<JsonRecord[]>, label: string): string
   return result.ok && result.truncated
     ? ` The ${label} listing was truncated at ${result.data.length} items (more pages remained), so the population is partial.`
     : "";
+}
+
+type SiteJudgement = { status: WebexFindingStatus; detail: string; values: JsonRecord };
+
+interface SiteSettingsCoverage {
+  readable: Array<{ siteUrl: string; settings: JsonRecord }>;
+  denied: Array<{ site_url: string; error: string; status: number | null }>;
+  /** True only when the site list was read completely and every listed site answered. */
+  complete: boolean;
+  coverageNote: string;
+}
+
+function worstStatus(statuses: WebexFindingStatus[]): WebexFindingStatus {
+  return statuses.reduce<WebexFindingStatus>((worst, status) => (statusRank(status) < statusRank(worst) ? status : worst), "pass");
+}
+
+/**
+ * Reads GET /admin/meeting/config/commonSettings once per Webex site. The site
+ * list comes from GET /meetingPreferences/sites, falling back to the sites array
+ * of GET /meetingPreferences; when neither names a site, the API is asked once
+ * for the administrator's preferred site and coverage is marked incomplete.
+ */
+async function collectSiteSettings(
+  client: WebexClientLike,
+  tokenType: WebexTokenType,
+  meetingSites: SurfaceResult<JsonRecord[]>,
+  meetingPreferences: SurfaceResult<JsonRecord>,
+): Promise<SiteSettingsCoverage & { raw: SurfaceResult<JsonRecord[]> }> {
+  const listedSites = meetingSites.ok ? meetingSites.data : asArray(meetingPreferences.ok ? meetingPreferences.data.sites : []).map(asObject);
+  const siteUrls = [...new Set(listedSites.map((site) => asString(site?.siteUrl)).filter((site): site is string => Boolean(site)))];
+
+  if (tokenType === "bot") {
+    const error = "bot token cannot read admin surfaces";
+    return { readable: [], denied: [{ site_url: "*", error, status: 403 }], complete: false, coverageNote: "", raw: { ok: false, error, status: 403 } };
+  }
+
+  const targets = siteUrls.length > 0 ? siteUrls : [undefined];
+  const results = await Promise.all(targets.map(async (siteUrl) => ({ siteUrl, result: await collectObject(() => client.getMeetingCommonSettings(siteUrl)) })));
+  const readable = results.flatMap(({ siteUrl, result }) => (result.ok ? [{ siteUrl: siteUrl ?? "(preferred site)", settings: result.data }] : []));
+  const denied = results.flatMap(({ siteUrl, result }) => (result.ok ? [] : [{ site_url: siteUrl ?? "(preferred site)", error: result.error, status: result.status ?? null }]));
+
+  const notes: string[] = [];
+  if (siteUrls.length === 0) {
+    notes.push(meetingSites.ok
+      ? " The site list (GET /meetingPreferences/sites) was empty, so only the administrator's preferred site was evaluated."
+      : ` The site list (GET /meetingPreferences/sites) was not readable (${meetingSites.error}), so only the administrator's preferred site was evaluated.`);
+  } else if (meetingSites.ok && meetingSites.truncated) {
+    notes.push(` The site list was truncated at ${siteUrls.length} sites (more pages remained), so the population is partial.`);
+  }
+  if (denied.length > 0 && readable.length > 0) {
+    notes.push(` ${denied.length} of ${results.length} sites could not be read (${denied.map((item) => `${item.site_url}: ${item.error}`).join("; ")}), so the org-wide view is partial.`);
+  }
+  const complete = siteUrls.length > 0 && meetingSites.ok && !meetingSites.truncated && denied.length === 0;
+  const raw: SurfaceResult<JsonRecord[]> = readable.length > 0
+    ? { ok: true, data: readable.map((site) => ({ siteUrl: site.siteUrl, ...site.settings })), truncated: !complete }
+    : { ok: false, error: denied[0]?.error ?? "no Webex site answered", status: denied[0]?.status ?? undefined };
+  return { readable, denied, complete, coverageNote: notes.join(""), raw };
+}
+
+function judgeSites(
+  coverage: SiteSettingsCoverage,
+  judge: (securityOptions: JsonRecord | undefined) => SiteJudgement,
+): { status: WebexFindingStatus; text: string; evidence: JsonRecord } {
+  const judgements = coverage.readable.map((site) => ({ site_url: site.siteUrl, ...judge(asObject(site.settings.securityOptions)) }));
+  const worst = worstStatus(judgements.map((item) => item.status));
+  const status: WebexFindingStatus = worst === "pass" && !coverage.complete ? "warn" : worst;
+  const text = `${judgements.map((item) => `${item.site_url}: ${item.detail}`).join("; ")} (GET /admin/meeting/config/commonSettings, ${judgements.length} of ${judgements.length + coverage.denied.length} sites).${coverage.coverageNote}`;
+  return {
+    status,
+    text,
+    evidence: {
+      sites: judgements.map((item) => ({ site_url: item.site_url, status: item.status, detail: item.detail, ...item.values })),
+      denied_sites: coverage.denied,
+      site_coverage_complete: coverage.complete,
+      citation: WEBEX_DOCS.meetingCommonSettings,
+    },
+  };
+}
+
+/** Control 9: attendees held until the host joins and meetings unlisted (securityOptions, site reference). */
+function judgeLobbyDefaults(securityOptions: JsonRecord | undefined): SiteJudgement {
+  const joinBeforeHost = asBoolean(securityOptions?.joinBeforeHost);
+  const audioBeforeHost = asBoolean(securityOptions?.audioBeforeHost);
+  const unlistAllMeetings = asBoolean(securityOptions?.unlistAllMeetings);
+  const values = { join_before_host: joinBeforeHost ?? null, audio_before_host: audioBeforeHost ?? null, unlist_all_meetings: unlistAllMeetings ?? null };
+  if (joinBeforeHost === undefined) {
+    return { status: "manual", detail: "securityOptions.joinBeforeHost was absent from the response", values };
+  }
+  if (joinBeforeHost || audioBeforeHost) {
+    return { status: "fail", detail: `attendees may join before the host (joinBeforeHost = ${joinBeforeHost}, audioBeforeHost = ${audioBeforeHost ?? "unreported"})`, values };
+  }
+  if (audioBeforeHost === undefined || unlistAllMeetings !== true) {
+    return { status: "warn", detail: `joinBeforeHost = false but audioBeforeHost = ${audioBeforeHost ?? "unreported"} and unlistAllMeetings = ${unlistAllMeetings ?? "unreported"}`, values };
+  }
+  return { status: "pass", detail: "joinBeforeHost = false, audioBeforeHost = false, unlistAllMeetings = true", values };
+}
+
+/** Control 10: strict meeting passwords with a documented minimum length (securityOptions.passwordCriteria). */
+function judgePasswordPolicy(securityOptions: JsonRecord | undefined): SiteJudgement {
+  const requireStrongPassword = asBoolean(securityOptions?.requireStrongPassword);
+  const criteria = asObject(securityOptions?.passwordCriteria);
+  const minLength = asNumber(criteria?.minLength);
+  const values = {
+    require_strong_password: requireStrongPassword ?? null,
+    min_length: minLength ?? null,
+    mixed_case: asBoolean(criteria?.mixedCase) ?? null,
+    min_numeric: asNumber(criteria?.minNumeric) ?? null,
+    min_alpha: asNumber(criteria?.minAlpha) ?? null,
+    min_special: asNumber(criteria?.minSpecial) ?? null,
+    disallow_dynamic_web_text: asBoolean(criteria?.disallowDynamicWebText) ?? null,
+    disallow_list: asBoolean(criteria?.disallowList) ?? null,
+  };
+  if (requireStrongPassword === undefined) {
+    return { status: "manual", detail: "securityOptions.requireStrongPassword was absent from the response", values };
+  }
+  if (!requireStrongPassword) {
+    return { status: "fail", detail: "requireStrongPassword = false", values };
+  }
+  if (minLength === undefined || minLength < MIN_MEETING_PASSWORD_LENGTH) {
+    return { status: "warn", detail: `requireStrongPassword = true but passwordCriteria.minLength = ${minLength ?? "unreported"} (threshold ${MIN_MEETING_PASSWORD_LENGTH})`, values };
+  }
+  return { status: "pass", detail: `requireStrongPassword = true with passwordCriteria.minLength = ${minLength}`, values };
+}
+
+/** Control 13: site access requires login (securityOptions.requireLoginBeforeAccess). */
+function judgeGuestAccess(securityOptions: JsonRecord | undefined): SiteJudgement {
+  const requireLoginBeforeAccess = asBoolean(securityOptions?.requireLoginBeforeAccess);
+  const values = { require_login_before_access: requireLoginBeforeAccess ?? null };
+  if (requireLoginBeforeAccess === undefined) {
+    return { status: "manual", detail: "securityOptions.requireLoginBeforeAccess was absent from the response", values };
+  }
+  if (!requireLoginBeforeAccess) {
+    return { status: "fail", detail: "requireLoginBeforeAccess = false (unauthenticated guests can reach the site)", values };
+  }
+  return { status: "pass", detail: "requireLoginBeforeAccess = true", values };
+}
+
+function siteFinding(
+  id: string,
+  control: number[],
+  title: string,
+  severity: WebexFinding["severity"],
+  coverage: SiteSettingsCoverage,
+  judge: (securityOptions: JsonRecord | undefined) => SiteJudgement,
+  tokenType: WebexTokenType,
+  manualEvidence: string,
+  extraEvidence: JsonRecord = {},
+): WebexFinding {
+  if (coverage.readable.length === 0) {
+    const denied = coverage.denied[0] ?? { site_url: "*", error: "no Webex site answered", status: null };
+    return finding(id, control, title, severity, "manual",
+      `${deniedSummary("meeting common settings", "/admin/meeting/config/commonSettings", { error: denied.error, status: denied.status ?? undefined }, manualEvidence)}${coverage.coverageNote}`,
+      { denied_sites: coverage.denied, citation: WEBEX_DOCS.meetingCommonSettings, token_type: tokenType, ...extraEvidence });
+  }
+  const judged = judgeSites(coverage, judge);
+  const summary = judged.status === "manual"
+    ? `Manual: ${judged.text} Collect ${manualEvidence}.`
+    : judged.text;
+  return finding(id, control, title, severity, judged.status, summary, { ...judged.evidence, token_type: tokenType, ...extraEvidence });
 }
 
 /** Person.type is documented as person, bot, or appuser (people reference, bots guide). */
@@ -1057,6 +1262,22 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
     surfaces.push(await pageSurface(name, endpoint, doc, load));
   }
   surfaces.push(await objectSurface("meeting_preferences", "/meetingPreferences", WEBEX_DOCS.meetingPreferences, () => client.getMeetingPreferences()));
+  const sites = await collectPage(() => client.listMeetingSites());
+  surfaces.push(sites.ok
+    ? { name: "meeting_sites", endpoint: "/meetingPreferences/sites", doc: WEBEX_DOCS.meetingSites, status: "readable", count: sites.data.length, truncated: sites.truncated }
+    : { name: "meeting_sites", endpoint: "/meetingPreferences/sites", doc: WEBEX_DOCS.meetingSites, status: "not_readable", error: sites.error });
+  const firstSite = sites.ok ? asString(sites.data[0]?.siteUrl) : undefined;
+  const adminObjectSurfaces: Array<[string, string, string, () => Promise<JsonRecord>]> = [
+    ["meeting_common_settings", "/admin/meeting/config/commonSettings", WEBEX_DOCS.meetingCommonSettings, () => client.getMeetingCommonSettings(firstSite)],
+    ["guest_count", "/guests/count", WEBEX_DOCS.guestCount, () => client.getGuestCount()],
+  ];
+  for (const [name, endpoint, doc, load] of adminObjectSurfaces) {
+    if (tokenType === "bot") {
+      surfaces.push({ name, endpoint, doc, status: "manual", error: "Bot tokens cannot read admin surfaces; use an admin, integration, or Service App token." });
+    } else {
+      surfaces.push(await objectSurface(name, endpoint, doc, load));
+    }
+  }
 
   const readable = surfaces.filter((item) => item.status === "readable");
   const adminCapable = tokenType !== "bot"
@@ -1081,7 +1302,7 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
     recommendedNextStep:
       status === "healthy"
         ? "Run webex_assess_identity, webex_assess_collaboration_governance, webex_assess_meeting_hybrid_security, or webex_export_audit_bundle."
-        : "Provide an admin, integration, or Service App token with spark-admin:people_read, spark-admin:roles_read, spark-admin:licenses_read, spark-admin:organizations_read, spark-admin:devices_read, spark-admin:hybrid_clusters_read, spark-compliance:events_read, spark-compliance:recordings_read, and audit:events_read.",
+        : "Provide an admin, integration, or Service App token with spark-admin:people_read, spark-admin:roles_read, spark-admin:licenses_read, spark-admin:organizations_read, spark-admin:devices_read, spark-admin:hybrid_clusters_read, spark-compliance:events_read, spark-compliance:recordings_read, audit:events_read, meeting:admin_config_read, and guest-issuer:read.",
   };
 }
 
@@ -1098,16 +1319,19 @@ export async function assessWebexIdentity(
   const orgs = await collectPage(() => client.listOrganizations());
   const { orgId, note } = deriveOrgContext(config, orgs);
   const botDenied: SurfaceResult<JsonRecord[]> = { ok: false, error: "bot token cannot read admin surfaces", status: 403 };
-  const [people, roles, organization] = await Promise.all([
+  const botDeniedObject: SurfaceResult<JsonRecord> = { ok: false, error: "bot token cannot read admin surfaces", status: 403 };
+  const [people, roles, organization, guestCount] = await Promise.all([
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listPeople(peopleLimit)),
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listRoles()),
     orgId ? collectObject(() => client.getOrganization(orgId)) : Promise.resolve<SurfaceResult<JsonRecord>>({ ok: false, error: note }),
+    tokenType === "bot" ? Promise.resolve(botDeniedObject) : collectObject(() => client.getGuestCount()),
   ]);
-  const surfaces = { me, organizations: orgs, people, roles, organization };
+  const surfaces = { me, organizations: orgs, people, roles, organization, guest_count: guestCount };
 
   const roleMap = roleMapFromRoles(surfaceItems(roles));
-  const humans = surfaceItems(people).filter((person) => asString(person.type) !== "bot");
+  const humans = surfaceItems(people).filter((person) => !["bot", "appuser"].includes(asString(person.type) ?? ""));
   const bots = surfaceItems(people).filter((person) => asString(person.type) === "bot");
+  const guests = surfaceItems(people).filter((person) => asString(person.type) === "appuser");
   const adminUsers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => /administrator/i.test(role)));
   const complianceOfficers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => /compliance officer/i.test(role)));
   const peoplePartial = partialNote(people, "people");
@@ -1123,13 +1347,14 @@ export async function assessWebexIdentity(
     { org_id: orgId ?? null, organization: organization.ok ? redactSecrets(organization.data) : { error: organization.error }, citation: WEBEX_DOCS.organizationGet },
   );
 
+  const mfaReadOnlyNote = `mfaEnabled is documented on /identity/organizations/{orgId}/authenticationConfig only in the PATCH request schema (${WEBEX_DOCS.authenticationConfig}); no GET is published, and this read-only inspector never issues a PATCH, so the org MFA setting cannot be read.`;
   const adminMfaFinding = !people.ok
     ? finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
-      deniedSummary("people", "/people", people, "the Control Hub admin list with MFA status for each administrator"),
-      { citation: WEBEX_DOCS.peopleList, token_type: tokenType })
+      `${deniedSummary("people", "/people", people, "the Control Hub admin list with MFA status for each administrator")} ${mfaReadOnlyNote}`,
+      { citation: WEBEX_DOCS.authenticationConfig, people_citation: WEBEX_DOCS.peopleList, token_type: tokenType })
     : finding("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", "manual",
-      `Manual: the People API (${WEBEX_DOCS.peopleList}) exposes roles but no MFA attribute, so MFA status for the ${adminUsers.length} administrators found cannot be read. Confirm MFA enforcement in Control Hub Organization Settings > Authentication for each listed admin.${peoplePartial}`,
-      { admin_users: adminUsers.slice(0, 50).map(personLabel), admin_count: adminUsers.length, people_seen: surfaceItems(people).length, people_truncated: people.truncated, citation: WEBEX_DOCS.peopleList });
+      `Manual: ${mfaReadOnlyNote} The People API (${WEBEX_DOCS.peopleList}) exposes roles but no MFA attribute, so the ${adminUsers.length} administrators found are listed as evidence only. Confirm MFA enforcement in Control Hub Organization Settings > Authentication for each listed admin.${peoplePartial}`,
+      { admin_users: adminUsers.slice(0, 50).map(personLabel), admin_count: adminUsers.length, people_seen: surfaceItems(people).length, people_truncated: people.truncated, citation: WEBEX_DOCS.authenticationConfig, people_citation: WEBEX_DOCS.peopleList });
 
   let complianceFinding: WebexFinding;
   if (!people.ok || !roles.ok) {
@@ -1197,7 +1422,38 @@ export async function assessWebexIdentity(
     `Manual: bot approval is managed in Control Hub (Management > Apps) and the bots guide (${WEBEX_DOCS.bots}) documents no API field for approval state. Export the Control Hub bot management page and reconcile it with the ${bots.length} inventoried bots.`,
     { bot_count: people.ok ? bots.length : null, citation: WEBEX_DOCS.bots });
 
-  const findings = [ssoFinding, adminMfaFinding, complianceFinding, concentrationFinding, botInventoryFinding, botApprovalFinding];
+  const guestCountValue = guestCount.ok ? asNumber(guestCount.data.count) : undefined;
+  const guestCountNote = guestCount.ok
+    ? guestCountValue === undefined
+      ? "GET /guests/count answered without a numeric body."
+      : `GET /guests/count reports ${guestCountValue} guest-issuer guests.`
+    : `GET /guests/count was not readable (${guestCount.error}; scope guest-issuer:read).`;
+  const guestEvidence = {
+    guests: guests.slice(0, 100).map((guest) => ({ id: asString(guest.id), display_name: asString(guest.displayName), created: asString(guest.created) })),
+    guest_count_people: guests.length,
+    guest_count_api: guestCountValue ?? null,
+    guest_count_api_error: guestCount.ok ? null : guestCount.error,
+    people_seen: surfaceItems(people).length,
+    people_truncated: people.ok ? people.truncated : null,
+    citation: WEBEX_DOCS.peopleList,
+    guest_count_citation: WEBEX_DOCS.guestCount,
+  };
+  let guestInventoryFinding: WebexFinding;
+  if (!people.ok) {
+    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", "manual",
+      `${deniedSummary("people", "/people", people, "the Control Hub guest user list")} ${guestCountNote}`,
+      { ...guestEvidence, token_type: tokenType });
+  } else if (surfaceItems(people).length === 0) {
+    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", "manual",
+      `Manual: GET /people returned zero people, so no guest inventory could be built. ${guestCountNote}`,
+      guestEvidence);
+  } else {
+    guestInventoryFinding = finding("WEBEX-ID-07", [13], "Guest account inventory", "medium", people.truncated ? "warn" : "pass",
+      `${guests.length} guest accounts (Person.type = appuser, documented as a guest user) were inventoried among ${surfaceItems(people).length} people. ${guestCountNote} Reconcile the list with the guest access policy assessed in WEBEX-MTG-03.${peoplePartial}`,
+      guestEvidence);
+  }
+
+  const findings = [ssoFinding, adminMfaFinding, complianceFinding, concentrationFinding, botInventoryFinding, botApprovalFinding, guestInventoryFinding];
   return {
     title: "Webex identity posture",
     category: "identity",
@@ -1209,6 +1465,7 @@ export async function assessWebexIdentity(
       admin_users: adminUsers.length,
       compliance_officers: complianceOfficers.length,
       bots: bots.length,
+      guests: guests.length,
       ...countStatuses(findings),
     },
     findings,
@@ -1244,8 +1501,8 @@ export async function assessWebexCollaborationGovernance(
   ]);
   const surfaces = { me, organizations: orgs, events, admin_audit_events: adminAudit, admin_recordings: recordings, rooms, webhooks, licenses };
 
-  const externalFinding = finding("WEBEX-COLLAB-01", [4, 13], "External communications and guest access policy", "high", "manual",
-    `Manual: no public Webex API exposes external communication or guest access policy; the Organizations reference (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created. Export Control Hub Messaging settings (external communication allow list, guest access).`,
+  const externalFinding = finding("WEBEX-COLLAB-01", [4], "External communications policy", "high", "manual",
+    `Manual: no documented Webex API endpoint exposes the external communication policy; the Organizations reference (${WEBEX_DOCS.organizationGet}) documents only id, displayName, and created. Guest access (control 13) is judged from the site common settings in WEBEX-MTG-03 and inventoried in WEBEX-ID-07. Export Control Hub Messaging settings (external communication allow list).`,
     { org_id: orgId ?? null, citation: WEBEX_DOCS.organizationGet });
 
   const fileDlpFinding = finding("WEBEX-COLLAB-02", [5, 21], "File sharing restrictions and messaging DLP", "high", "manual",
@@ -1395,35 +1652,51 @@ export async function assessWebexMeetingHybridSecurity(
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listDevices(deviceLimit)),
     tokenType === "bot" ? Promise.resolve(botDenied) : collectPage(() => client.listWorkspaces()),
   ]);
-  const surfaces = { me, organizations: orgs, meeting_preferences: meetingPreferences, meeting_sites: meetingSites, meetings, hybrid_clusters: hybridClusters, hybrid_connectors: hybridConnectors, devices, workspaces };
+  const siteSettings = await collectSiteSettings(client, tokenType, meetingSites, meetingPreferences);
+  const surfaces = {
+    me,
+    organizations: orgs,
+    meeting_preferences: meetingPreferences,
+    meeting_sites: meetingSites,
+    meeting_common_settings: siteSettings.raw,
+    meetings,
+    hybrid_clusters: hybridClusters,
+    hybrid_connectors: hybridConnectors,
+    devices,
+    workspaces,
+  };
 
   const encryptionFinding = finding("WEBEX-MTG-01", [8, 22], "Meeting E2EE and calling SRTP defaults", "high", "manual",
-    `Manual: the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}) documents personalMeetingRoom, audio, video, schedulingOptions, and sites with no encryption field, and no public API exposes a Webex Calling SRTP setting, so calling SRTP (control 22) stays folded into this finding. Export the Control Hub meeting session type (E2EE) and calling security configuration.`,
-    { meeting_preferences_readable: meetingPreferences.ok, sites_seen: surfaceItems(meetingSites).map((site) => asString(site.siteUrl)), citation: WEBEX_DOCS.meetingPreferences });
+    `Manual: no encryption field exists in the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}), the site common settings (${WEBEX_DOCS.meetingCommonSettings}), or the session types reference (${WEBEX_DOCS.sessionTypes}, which returns id, shortName, siteUrl, name, and type), and no public API exposes a Webex Calling SRTP setting, so calling SRTP (control 22) stays folded into this finding. Export the Control Hub meeting session type (E2EE) and calling security configuration.`,
+    { meeting_preferences_readable: meetingPreferences.ok, sites_seen: surfaceItems(meetingSites).map((site) => asString(site.siteUrl)), citation: WEBEX_DOCS.meetingCommonSettings });
 
   const meetingItems = surfaceItems(meetings);
   const sampledWithoutLobby = meetingItems.filter((meeting) => asString(meeting.unlockedMeetingJoinSecurity) === "allowJoin");
   const sampledWithoutPassword = meetingItems.filter((meeting) => !asString(meeting.password));
   const pmr = asObject(meetingPreferences.ok ? meetingPreferences.data.personalMeetingRoom : undefined);
-  const lobbyFinding = finding("WEBEX-MTG-02", [9, 10], "Meeting lobby and password defaults", "high", "manual",
-    `Manual: org-wide lobby and password defaults are Control Hub site settings not exposed by the meetings API (${WEBEX_DOCS.meetingsList}); ${meetingItems.length} meetings visible to this token were sampled (${sampledWithoutLobby.length} with unlockedMeetingJoinSecurity = allowJoin, ${sampledWithoutPassword.length} without a password). Export the Control Hub site security settings.${partialNote(meetings, "meetings")}`,
-    {
-      meetings_seen: meetingItems.length,
-      meetings_truncated: meetings.ok ? meetings.truncated : null,
-      sampled_allow_join_without_lobby: sampledWithoutLobby.length,
-      sampled_without_password: sampledWithoutPassword.length,
-      personal_meeting_room_auto_lock: pmr ? asObject(pmr)?.enabledAutoLock ?? null : null,
-      citation: WEBEX_DOCS.meetingsList,
-    });
+  const sampledMeetingEvidence = {
+    meetings_seen: meetingItems.length,
+    meetings_truncated: meetings.ok ? meetings.truncated : null,
+    sampled_allow_join_without_lobby: sampledWithoutLobby.length,
+    sampled_without_password: sampledWithoutPassword.length,
+    personal_meeting_room_auto_lock: pmr ? asBoolean(pmr.enabledAutoLock) ?? null : null,
+    meetings_citation: WEBEX_DOCS.meetingsList,
+  };
+  const lobbyFinding = siteFinding("WEBEX-MTG-02", [9], "Meeting lobby and join-before-host defaults", "high", siteSettings, judgeLobbyDefaults, tokenType,
+    "the Control Hub site Common Settings > Security page (join before host, unlisted meetings)", sampledMeetingEvidence);
+  const passwordFinding = siteFinding("WEBEX-MTG-06", [10], "Meeting password policy", "high", siteSettings, judgePasswordPolicy, tokenType,
+    "the Control Hub site Common Settings > Security page (strong password criteria)", sampledMeetingEvidence);
+  const guestFinding = siteFinding("WEBEX-MTG-03", [13], "Guest meeting access policy", "medium", siteSettings, judgeGuestAccess, tokenType,
+    "the Control Hub site Common Settings > Security page (require login before site access)");
 
-  const guestBackgroundFinding = finding("WEBEX-MTG-03", [13, 23], "Guest meeting access and virtual background policy", "medium", "manual",
-    `Manual: guest join policy and virtual background enforcement are Control Hub settings; the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}) exposes only the caller's video device preferences. Export the Control Hub meeting settings for guest join and virtual backgrounds.`,
-    { citation: WEBEX_DOCS.meetingPreferences });
+  const virtualBackgroundFinding = finding("WEBEX-MTG-07", [23], "Virtual background policy", "low", "manual",
+    `Manual: virtual background enforcement is a Control Hub meeting setting with no field in the site common settings (${WEBEX_DOCS.meetingCommonSettings}), the meeting preferences reference (${WEBEX_DOCS.meetingPreferences}), or the session types reference (${WEBEX_DOCS.sessionTypes}). Export the Control Hub meeting settings page for virtual backgrounds.`,
+    { citation: WEBEX_DOCS.meetingCommonSettings });
 
   const clusterItems = surfaceItems(hybridClusters);
   const connectorItems = surfaceItems(hybridConnectors);
   const nonOperational = connectorItems.filter((connector) => asString(connector.status) !== "operational");
-  const undatedConnectors = connectorItems.filter((connector) => !asDate(connector.createdAt));
+  const undatedConnectors = connectorItems.filter((connector) => !asDate(connector.created));
   let hybridFinding: WebexFinding;
   if (!hybridClusters.ok || !hybridConnectors.ok) {
     const denied = (!hybridClusters.ok ? hybridClusters : hybridConnectors) as { error: string; status?: number };
@@ -1452,28 +1725,34 @@ export async function assessWebexMeetingHybridSecurity(
   const deviceItems = surfaceItems(devices);
   const personalModeDevices = deviceItems.filter((device) => asString(device.personId));
   const softwareVersions = [...new Set(deviceItems.map((item) => asString(item.software)).filter(Boolean))];
+  const upgradeChannels = [...new Set(deviceItems.map((item) => asString(item.upgradeChannel)).filter(Boolean))];
+  const devicesWithoutUpgradeChannel = deviceItems.filter((item) => !asString(item.upgradeChannel)).length;
   const deviceFinding = !devices.ok
     ? finding("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", "manual",
       deniedSummary("devices", "/devices", devices, "the Control Hub device inventory with software versions"), { citation: WEBEX_DOCS.devicesList, token_type: tokenType })
     : finding("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", "manual",
-      `Manual: the devices reference (${WEBEX_DOCS.devicesList}) documents software, upgradeChannel, connectionStatus, managedBy, personId, and workspaceId but no end-of-life flag or device-blocking policy; ${deviceItems.length} devices were inventoried (${personalModeDevices.length} assigned to a person, ${softwareVersions.length} distinct software versions, ${surfaceItems(workspaces).length} workspaces). Compare the versions against Cisco RoomOS release notes and export the Control Hub device activation policy.${partialNote(devices, "devices")}`,
+      `Manual: the devices reference (${WEBEX_DOCS.devicesList}) documents software, upgradeChannel, connectionStatus, managedBy, personId, and workspaceId but no end-of-life flag or device-blocking policy; ${deviceItems.length} devices were inventoried (${personalModeDevices.length} assigned to a person, ${softwareVersions.length} distinct software versions, upgrade channels ${upgradeChannels.length > 0 ? upgradeChannels.join(", ") : "unreported"}, ${surfaceItems(workspaces).length} workspaces). Compare the versions against Cisco RoomOS release notes and export the Control Hub device activation policy.${partialNote(devices, "devices")}`,
       {
         devices_seen: deviceItems.length,
         devices_truncated: devices.truncated,
         personal_mode_devices: personalModeDevices.length,
         software_versions: softwareVersions.slice(0, 50),
+        upgrade_channels: upgradeChannels.slice(0, 50),
+        devices_without_upgrade_channel: devicesWithoutUpgradeChannel,
         managed_by: [...new Set(deviceItems.map((item) => asString(item.managedBy)).filter(Boolean))],
         workspaces_seen: surfaceItems(workspaces).length,
         citation: WEBEX_DOCS.devicesList,
       });
 
-  const findings = [encryptionFinding, lobbyFinding, guestBackgroundFinding, hybridFinding, deviceFinding];
+  const findings = [encryptionFinding, lobbyFinding, guestFinding, hybridFinding, deviceFinding, passwordFinding, virtualBackgroundFinding];
   return {
     title: "Webex meeting and hybrid security",
     category: "meeting-hybrid-security",
     summary: {
       org_id: orgId ?? null,
       token_type: tokenType,
+      sites_evaluated: siteSettings.readable.length,
+      sites_denied: siteSettings.denied.length,
       meetings_seen: meetingItems.length,
       hybrid_clusters: clusterItems.length,
       hybrid_connectors: connectorItems.length,
@@ -1766,7 +2045,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_check_access",
     label: "Check Webex audit access",
     description:
-      "Validate read-only Webex access across people, organizations, roles, licenses, recordings, events, admin audit, hybrid, devices, workspaces, rooms, webhooks, and meetings, and report the token type.",
+      "Validate read-only Webex access across people, organizations, roles, licenses, recordings, events, admin audit, hybrid, devices, workspaces, rooms, webhooks, meetings, site common settings, and guest count, and report the token type.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs) {
@@ -1786,7 +2065,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_assess_identity",
     label: "Assess Webex identity posture",
     description:
-      "Assess Webex identity posture across SSO enforcement, admin MFA, Compliance Officer assignment, administrative privilege concentration, bot inventory, and bot approval state.",
+      "Assess Webex identity posture across SSO enforcement, admin MFA, Compliance Officer assignment, administrative privilege concentration, bot inventory, bot approval state, and guest account inventory.",
     parameters: Type.Object({
       ...authParams,
       people_limit: Type.Optional(Type.Number({ description: "Maximum people to inspect. Defaults to 1000.", default: 1000 })),
@@ -1837,7 +2116,7 @@ export function registerWebexTools(pi: any): void {
     name: "webex_assess_meeting_hybrid_security",
     label: "Assess Webex meeting and hybrid security",
     description:
-      "Assess Webex meeting and hybrid security across encryption defaults, lobby and password controls, guest and virtual background policy, hybrid connector health, and device inventory posture.",
+      "Assess Webex meeting and hybrid security across encryption defaults, per-site lobby, password, and guest access settings from the site common settings API, virtual background policy, hybrid connector health, and device inventory posture.",
     parameters: Type.Object({
       ...authParams,
       meeting_limit: Type.Optional(Type.Number({ description: "Maximum meetings to inspect. Defaults to 200.", default: 200 })),
