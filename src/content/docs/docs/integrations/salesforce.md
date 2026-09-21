@@ -115,6 +115,7 @@ The script skips with exit code 0 when no credentials are present; otherwise it 
 - Custom object organization-wide defaults and sharing rules are not read; only the standard object defaults on `Organization` are evaluated.
 - `Certificate` is a Tooling API object; self-signed certificates are reported but not failed on their own, since Salesforce issues self-signed certificates for JWT connected apps and SAML signing by design. Certificates without a `KeySize` value are reported as unknown and never counted as compliant.
 - `listMetadata` and `readMetadata` require `Modify Metadata Through Metadata API Functions` or `Modify All Data`; without it, controls 2, 3, 5, 6, 18, 19, and 20 render as manual.
+- `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata trees are projected to the leaves the verdicts read before they are stored in `core_data/` (dropped section names are listed under `_omittedSections`); SOQL results whose `nextRecordsUrl` stops advancing or that omit `done`/`totalSize` are reported as truncated with an unknown total, and a finding that also reads a secondary inventory (for example permission set assignments or `EventLogFile`) stops at `warn` or `manual` while that inventory is unreadable.
 - Shield Event Monitoring and Platform Encryption are add-on licenses; unavailable objects render as manual not-applicable, never pass.
 - The username-password flow is disabled by default in newer orgs and is kept only for legacy compatibility.
 

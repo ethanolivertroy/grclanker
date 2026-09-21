@@ -21,10 +21,14 @@ import {
   decodeJwtClaims,
   exportSalesforceAuditBundle,
   parseSimpleXml,
+  projectMyDomainSettings,
+  projectProfileMetadata,
+  projectSecuritySettings,
   resolveSalesforceConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/salesforce.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -1275,6 +1279,238 @@ test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports
   assert.equal(rerun.zipPath, `${rerun.outputDir}.zip`);
   assert.ok(existsSync(result.zipPath));
   assert.ok(existsSync(rerun.zipPath));
+});
+
+const FAKE_SALESFORCE_SECRETS = {
+  accessToken: "FAKE_ACCESS_TOKEN_1",
+  consumerSecret: "FAKE_CONSUMER_SECRET_1",
+  privateKey: "FAKE_PRIVATE_KEY_1",
+  sessionSecret: "FAKE_SECRET_TOKEN_1",
+  samlCertificate: "FAKE_SECRET_TOKEN_2",
+  domainSuffix: "FAKE_SECRET_TOKEN_3",
+  ipRangeDescription: "FAKE_COMMUNITY_1",
+  profileHash: "FAKE_HASH_1",
+};
+
+test("rule 9: exportSalesforceAuditBundle projects Metadata API trees so fake secrets never reach the bundle directory or the zip", async () => {
+  const base = createTempBase("grclanker-sf-export-secrets-");
+  const secrets = Object.values(FAKE_SALESFORCE_SECRETS);
+  const config = sampleConfig({
+    accessToken: FAKE_SALESFORCE_SECRETS.accessToken,
+    consumerSecret: FAKE_SALESFORCE_SECRETS.consumerSecret,
+    privateKey: FAKE_SALESFORCE_SECRETS.privateKey,
+  });
+  const client = createFullMockClient({
+    getResolvedConfig: () => config,
+    async getSession() { return { accessToken: FAKE_SALESFORCE_SECRETS.accessToken, instanceUrl: "https://acme.my.salesforce.com" }; },
+    async readSecuritySettings() {
+      return {
+        ...securitySettingsFixture({ sessionSettings: { identityConfirmationSecret: FAKE_SALESFORCE_SECRETS.sessionSecret } }),
+        singleSignOnSettings: { samlCertificate: FAKE_SALESFORCE_SECRETS.samlCertificate, signingKey: FAKE_SALESFORCE_SECRETS.privateKey },
+        networkAccess: { ipRanges: [{ start: "10.0.0.1", end: "10.0.0.254", description: FAKE_SALESFORCE_SECRETS.ipRangeDescription }] },
+      };
+    },
+    async readMyDomainSettings() { return { ...goodPlatformData().myDomainSettings.data, myDomainSuffix: FAKE_SALESFORCE_SECRETS.domainSuffix }; },
+    async readProfileMetadata(fullNames) {
+      return goodProfileMetadataRecords.filter((record) => fullNames.includes(record.fullName)).map((record) => ({
+        ...record,
+        loginHours: { ...record.loginHours, note: FAKE_SALESFORCE_SECRETS.sessionSecret },
+        loginIpRanges: [{ startAddress: "10.0.0.1", endAddress: "10.0.0.254", description: FAKE_SALESFORCE_SECRETS.profileHash }],
+        customPermissions: [{ enabled: "true", name: FAKE_SALESFORCE_SECRETS.samlCertificate }],
+      }));
+    },
+  });
+  const result = await exportSalesforceAuditBundle(client, config, base, { now: NOW });
+  assert.equal(result.errorCount, 0);
+
+  const files = readBundleFiles(result.outputDir);
+  for (const relativePath of ["core_data/security_settings.json", "core_data/my_domain_settings.json", "core_data/profile_metadata.json", "analysis/platform_security.json", "analysis/identity_access.json", "QUICK_REFERENCE.md"]) {
+    assert.ok(files.has(join(...relativePath.split("/"))), `expected ${relativePath}`);
+  }
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  const settings = JSON.parse(files.get(join("core_data", "security_settings.json"))).data;
+  assert.equal(settings.sessionSettings.sessionTimeout, "TwoHours");
+  assert.equal(settings.sessionSettings.identityConfirmationSecret, undefined);
+  assert.equal(settings.passwordPolicies.minimumPasswordLength, "14");
+  assert.deepEqual(settings.networkAccess.ipRanges, [{ start: "10.0.0.1", end: "10.0.0.254" }]);
+  assert.deepEqual(settings._omittedSections, ["singleSignOnSettings"]);
+  const myDomain = JSON.parse(files.get(join("core_data", "my_domain_settings.json"))).data;
+  assert.equal(myDomain.myDomainName, "acme");
+  assert.deepEqual(myDomain._omittedSections, ["myDomainSuffix"]);
+  const admin = JSON.parse(files.get(join("core_data", "profile_metadata.json"))).data.find((record) => record._fullName === "Admin");
+  assert.equal(admin._resolved, true);
+  assert.deepEqual(admin.loginIpRanges, [{ startAddress: "10.0.0.1", endAddress: "10.0.0.254" }]);
+  assert.equal(admin.loginHours.mondayStart, "420");
+  assert.equal(admin.loginHours.note, undefined);
+  assert.deepEqual(admin._omittedSections, ["customPermissions", "userPermissions"]);
+
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
+  for (const id of ["SF-02", "SF-03", "SF-05", "SF-06", "SF-18", "SF-19", "SF-20"]) {
+    assert.equal(findings.find((item) => item.id === id).status, "pass", `${id} must still pass on the projected trees`);
+  }
+
+  assert.equal(projectSecuritySettings(undefined), undefined);
+  assert.equal(projectMyDomainSettings(undefined), undefined);
+  assert.deepEqual(projectProfileMetadata({ fullName: "Bare" }), { fullName: "Bare", _omittedSections: [] });
+});
+
+test("rule 9: SalesforceApiClient never echoes a non-JSON error body into error messages", async () => {
+  const fetchImpl = async () => new Response(`<html>gateway down FAKE_SECRET_TOKEN_1 Bearer ${sampleConfig().accessToken}</html>`, { status: 502, headers: { "content-type": "text/html" } });
+  const client = new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl });
+  await assert.rejects(() => client.getLimits(), (error) => {
+    assert.equal(error.status, 502);
+    assert.ok(!error.message.includes("FAKE_SECRET_TOKEN_1"), error.message);
+    assert.ok(!error.message.includes("token-abc123"), error.message);
+    assert.ok(!error.message.includes("gateway down"), error.message);
+    assert.match(error.message, /non-JSON response body \(text\/html, \d+ bytes\)/);
+    return true;
+  });
+});
+
+test("rule 10: SalesforceApiClient reports truncated with an unknown total on stalled cursors, empty pages, and missing done or totalSize", async () => {
+  const pages = new Map();
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    const key = url.pathname.endsWith("/query") ? `${url.pathname}?${url.searchParams.get("q")}` : url.pathname;
+    const page = pages.get(key);
+    return page ? jsonResponse(page) : jsonResponse([{ message: `no fixture for ${key}`, errorCode: "NOT_FOUND" }], { status: 404 });
+  };
+  const client = new SalesforceApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl });
+  const query = "/services/data/v64.0/query";
+
+  pages.set(`${query}?SELECT Id FROM Stuck`, { totalSize: 10, done: false, nextRecordsUrl: `${query}/stuck-2`, records: [{ Id: "1" }] });
+  pages.set(`${query}/stuck-2`, { totalSize: 10, done: false, nextRecordsUrl: `${query}/stuck-2`, records: [{ Id: "2" }] });
+  const stuck = await client.query("SELECT Id FROM Stuck");
+  assert.deepEqual(stuck.records.map((record) => record.Id), ["1", "2"]);
+  assert.equal(stuck.pages, 2, "a repeated nextRecordsUrl is fetched once and never looped");
+  assert.equal(stuck.done, false);
+  assert.equal(stuck.truncated, true);
+
+  pages.set(`${query}?SELECT Id FROM Empty`, { totalSize: 10, done: false, nextRecordsUrl: `${query}/empty-2`, records: [{ Id: "1" }] });
+  pages.set(`${query}/empty-2`, { totalSize: 10, done: false, nextRecordsUrl: `${query}/empty-3`, records: [] });
+  const empty = await client.query("SELECT Id FROM Empty");
+  assert.equal(empty.pages, 2, "an empty page that still promises more stops the loop");
+  assert.equal(empty.done, false);
+  assert.equal(empty.truncated, true);
+
+  pages.set(`${query}?SELECT Id FROM NoCursor`, { totalSize: 10, done: false, records: [{ Id: "1" }] });
+  const noCursor = await client.query("SELECT Id FROM NoCursor");
+  assert.equal(noCursor.truncated, true);
+  assert.equal(noCursor.done, false);
+
+  pages.set(`${query}?SELECT Id FROM Bare`, { records: [{ Id: "1" }, { Id: "2" }] });
+  const bare = await client.query("SELECT Id FROM Bare");
+  assert.equal(bare.records.length, 2);
+  assert.equal(bare.totalSize, undefined, "a missing totalSize is not replaced by the page size");
+  assert.equal(bare.truncated, true, "a missing done flag and total cannot prove completeness");
+
+  pages.set(`${query}?SELECT Id FROM Inferred`, { totalSize: 3, nextRecordsUrl: `${query}/inferred-2`, records: [{ Id: "1" }, { Id: "2" }] });
+  pages.set(`${query}/inferred-2`, { totalSize: 3, done: true, records: [{ Id: "3" }] });
+  const inferred = await client.query("SELECT Id FROM Inferred");
+  assert.equal(inferred.pages, 2, "a missing done flag with a nextRecordsUrl keeps paginating");
+  assert.equal(inferred.truncated, false);
+  assert.deepEqual(inferred.records.map((record) => record.Id), ["1", "2", "3"]);
+
+  const identity = await assessSalesforceIdentityAccess(createFullMockClient({
+    async listUsers() { return { records: goodUsers, totalSize: undefined, done: true, truncated: true, pages: 1 }; },
+  }));
+  for (const id of ["SF-07", "SF-10", "SF-13"]) {
+    const item = findingById(identity, id);
+    assert.notEqual(item.status, "pass", `${id} must not pass on an unknown-total user list: ${item.summary}`);
+  }
+  assert.match(findingById(identity, "SF-10").summary, /Only 3 of an unknown total of User records were read/);
+  assert.match(findingById(identity, "SF-13").summary, /Only 3 of unknown users were read/);
+});
+
+test("rule 10: SF-07, SF-09, and SF-10 demote when a secondary list is truncated and state seen versus total", () => {
+  const truncated = (name, data, total) => okDataset(name, data, { truncated: true, seen: data.length, total });
+  const elevatedSets = [{ Id: "PS-elevated", Name: "Elevated", IsOwnedByProfile: false, PermissionsModifyAllData: true }];
+  const noAssignees = okDataset("PermissionSetAssignment", []);
+
+  const completeSets = assessSalesforceIdentityData(goodIdentityData({ permissionSets: okDataset("PermissionSet", elevatedSets), assignments: noAssignees }), { now: NOW });
+  assert.equal(findingById(completeSets, "SF-09").status, "pass", "an elevated set with no active assignees passes on a complete list");
+  const cappedSets = assessSalesforceIdentityData(goodIdentityData({ permissionSets: truncated("PermissionSet", elevatedSets, 400), assignments: noAssignees }), { now: NOW });
+  const sf09 = findingById(cappedSets, "SF-09");
+  assert.equal(sf09.status, "warn");
+  assert.match(sf09.summary, /Only 1 of 400 PermissionSet records were read/);
+  assert.ok(sf09.manualEvidence);
+  const cappedAssignments = assessSalesforceIdentityData(goodIdentityData({ permissionSets: okDataset("PermissionSet", elevatedSets), assignments: truncated("PermissionSetAssignment", [], undefined) }), { now: NOW });
+  assert.equal(findingById(cappedAssignments, "SF-09").status, "warn");
+  assert.match(findingById(cappedAssignments, "SF-09").summary, /Only 0 of an unknown total of PermissionSetAssignment records were read/);
+
+  assert.equal(findingById(assessSalesforceIdentityData(goodIdentityData(), { now: NOW }), "SF-10").status, "pass");
+  const cappedProfiles = assessSalesforceIdentityData(goodIdentityData({ profiles: truncated("Profile", goodProfiles, 60) }), { now: NOW });
+  const sf10 = findingById(cappedProfiles, "SF-10");
+  assert.equal(sf10.status, "warn");
+  assert.match(sf10.summary, /Only 8 of 60 Profile records were read/);
+  assert.equal(sf10.evidence.profiles_truncated, true);
+
+  assert.equal(findingById(assessSalesforceIdentityData(goodIdentityData(), { now: NOW }), "SF-07").status, "pass");
+  const cappedUsers = assessSalesforceIdentityData(goodIdentityData({ users: truncated("User", goodUsers, undefined) }), { now: NOW });
+  const sf07 = findingById(cappedUsers, "SF-07");
+  assert.equal(sf07.status, "warn");
+  assert.match(sf07.summary, /Only 3 of an unknown total of User records were read/);
+});
+
+test("rule 1 corollary: multi-inventory findings never pass when a secondary inventory is forbidden and the summary names it", () => {
+  const elevatedIdentity = (overrides = {}) => goodIdentityData({
+    permissionSets: okDataset("PermissionSet", [{ Id: "PS-elevated", Name: "Elevated", IsOwnedByProfile: false, PermissionsModifyAllData: true }]),
+    assignments: okDataset("PermissionSetAssignment", []),
+    ...overrides,
+  });
+  const cases = [
+    { id: "SF-01", assess: assessSalesforcePlatformData, data: goodPlatformData, secondaries: [["healthCheckRisks", "SecurityHealthCheckRisks", []]] },
+    { id: "SF-05", assess: assessSalesforcePlatformData, data: goodPlatformData, secondaries: [["profiles", "Profile", []], ["profileMetadata", "Profile metadata", []]] },
+    {
+      id: "SF-04",
+      assess: assessSalesforceIdentityData,
+      data: goodIdentityData,
+      secondaries: [["securitySettings", "SecuritySettings", undefined], ["healthCheckRisks", "SecurityHealthCheckRisks", []], ["twoFactorMethods", "TwoFactorMethodsInfo", []], ["users", "User", []], ["profiles", "Profile", []]],
+    },
+    { id: "SF-06", assess: assessSalesforceIdentityData, data: goodIdentityData, secondaries: [["profileMetadata", "Profile metadata", []], ["profiles", "Profile", []]] },
+    { id: "SF-07", assess: assessSalesforceIdentityData, data: goodIdentityData, secondaries: [["users", "User", []], ["profiles", "Profile", []]] },
+    { id: "SF-09", assess: assessSalesforceIdentityData, data: goodIdentityData, secondaries: [["assignments", "PermissionSetAssignment", []], ["users", "User", []], ["profiles", "Profile", []]] },
+    { id: "SF-09", assess: assessSalesforceIdentityData, data: elevatedIdentity, secondaries: [["assignments", "PermissionSetAssignment", []]] },
+    { id: "SF-10", assess: assessSalesforceIdentityData, data: goodIdentityData, secondaries: [["profiles", "Profile", []]] },
+    { id: "SF-13", assess: assessSalesforceIdentityData, data: goodIdentityData, secondaries: [["profiles", "Profile", []]] },
+    { id: "SF-11", assess: assessSalesforceMonitoringData, data: goodMonitoringData, secondaries: [["oauthTokens", "OauthToken", []], ["callerPermissions", "UserPermissionAccess", undefined]] },
+    { id: "SF-15", assess: assessSalesforceMonitoringData, data: goodMonitoringData, secondaries: [["eventLogFiles", "EventLogFile", []]] },
+  ];
+  const checked = [];
+  for (const { id, assess, data, secondaries } of cases) {
+    const baseline = findingById(assess(data(), { now: NOW }), id);
+    assert.ok(baseline, `${id} must exist`);
+    for (const [key, name, empty] of secondaries) {
+      const result = assess(data({ [key]: forbiddenDataset(name, empty) }), { now: NOW });
+      const item = findingById(result, id);
+      assert.notEqual(item.status, "pass", `${id} must not pass when ${name} is forbidden (baseline ${baseline.status}): ${item.summary}`);
+      assert.ok(item.summary.includes(`the ${name} query was forbidden`), `${id} summary must name ${name}: ${item.summary}`);
+      assert.ok(item.manualEvidence, `${id} must tell a human what to collect when ${name} is forbidden`);
+      assert.ok(result.errors.some((error) => error.startsWith(`${name}: forbidden`)), `${id} errors must disclose ${name}`);
+      checked.push(`${id}/${name}`);
+    }
+  }
+  assert.equal(checked.length, 21, "every secondary inventory of every multi-inventory finding was exercised");
+
+  const mfa = findingById(assessSalesforceIdentityData(goodIdentityData({ securitySettings: forbiddenDataset("SecuritySettings", undefined) }), { now: NOW }), "SF-04");
+  assert.equal(mfa.status, "warn", "Health Check still proves the MFA requirement, so the verdict is judged from it and capped at warn");
+  assert.match(mfa.summary, /second source was not checked and the verdict is capped at warn/);
+  const eventLog = findingById(assessSalesforceMonitoringData(goodMonitoringData({ eventLogFiles: forbiddenDataset("EventLogFile", []) })), "SF-15");
+  assert.equal(eventLog.status, "warn");
+  assert.match(eventLog.manualEvidence, /Event Manager/);
+  const permissionSets = findingById(assessSalesforceIdentityData(goodIdentityData({ assignments: forbiddenDataset("PermissionSetAssignment", []) }), { now: NOW }), "SF-09");
+  assert.equal(permissionSets.status, "warn");
+  assert.match(permissionSets.summary, /assignment coverage of the permission sets that were read was not checked/);
+  const noSource = findingById(assessSalesforceIdentityData(goodIdentityData({
+    securitySettings: okDataset("SecuritySettings", securitySettingsFixture({ sessionSettings: { enableMFADirectUILoginOptIn: undefined } })),
+    healthCheckRisks: forbiddenDataset("SecurityHealthCheckRisks", []),
+  }), { now: NOW }), "SF-04");
+  assert.equal(noSource.status, "manual");
+  assert.match(noSource.summary, /the SecurityHealthCheckRisks query was forbidden/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {

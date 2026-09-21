@@ -97,7 +97,8 @@ export interface SalesforceResolvedConfig {
 
 export interface SalesforceQueryResult {
   records: JsonRecord[];
-  totalSize: number;
+  /** Undefined when Salesforce omitted totalSize; the result is then reported as truncated with an unknown total. */
+  totalSize?: number;
   done: boolean;
   truncated: boolean;
   pages: number;
@@ -956,7 +957,9 @@ export class SalesforceApiClient {
     try {
       payload = rawText.length > 0 ? JSON.parse(rawText) : {};
     } catch {
-      payload = { message: rawText.slice(0, 200) };
+      // Never echo a non-JSON body (proxy HTML, plain-text gateway errors) into error messages that
+      // land in _errors.log and analysis JSON; describe its shape instead.
+      payload = { message: `non-JSON response body (${response.headers.get("content-type") ?? "unknown content type"}, ${rawText.length} bytes)` };
     }
     if (!response.ok) {
       const summary = salesforceErrorSummary(payload);
@@ -971,23 +974,40 @@ export class SalesforceApiClient {
   private async runQuery(resource: string, soql: string, limit: number): Promise<SalesforceQueryResult> {
     const recordLimit = clampNumber(limit, DEFAULT_RECORD_LIMIT, 1, 200_000);
     const records: JsonRecord[] = [];
+    const visitedCursors = new Set<string>();
     let payload = asObject(await this.getJson(this.dataPath(resource), { q: soql })) ?? {};
     let pages = 1;
-    let done = asBoolean(payload.done) ?? true;
-    const totalSize = asNumber(payload.totalSize) ?? asRecords(payload.records).length;
+    const totalSize = asNumber(payload.totalSize);
+    let doneFlag = asBoolean(payload.done);
+    let nextUrl = asString(payload.nextRecordsUrl);
+    // A missing done flag is only trusted as "complete" when no further page is promised.
+    let done = doneFlag ?? nextUrl === undefined;
+    let stalled = false;
     records.push(...asRecords(payload.records));
 
     while (!done && records.length < recordLimit) {
-      const nextUrl = asString(payload.nextRecordsUrl);
-      if (!nextUrl) break;
+      // More records promised but no cursor, or a cursor that stopped advancing: exit and report truncated.
+      if (!nextUrl || visitedCursors.has(nextUrl)) {
+        stalled = true;
+        break;
+      }
+      visitedCursors.add(nextUrl);
       payload = asObject(await this.getJson(nextUrl)) ?? {};
       pages += 1;
-      records.push(...asRecords(payload.records));
-      done = asBoolean(payload.done) ?? true;
+      const pageRecords = asRecords(payload.records);
+      records.push(...pageRecords);
+      doneFlag = asBoolean(payload.done);
+      nextUrl = asString(payload.nextRecordsUrl);
+      done = doneFlag ?? nextUrl === undefined;
+      if (pageRecords.length === 0 && !done) {
+        stalled = true;
+        break;
+      }
     }
 
-    const truncated = !done || records.length > recordLimit || totalSize > records.length;
-    return { records: records.slice(0, recordLimit), totalSize, done, truncated, pages };
+    const complete = done && !stalled && records.length <= recordLimit
+      && (totalSize === undefined ? doneFlag === true : totalSize <= records.length);
+    return { records: records.slice(0, recordLimit), totalSize, done: done && !stalled, truncated: !complete, pages };
   }
 
   async query(soql: string, limit = DEFAULT_RECORD_LIMIT): Promise<SalesforceQueryResult> {
@@ -1364,6 +1384,89 @@ function withPartialDowngrade(status: SalesforceFindingStatus, dataset: Salesfor
   return status === "pass" ? "warn" : status;
 }
 
+/** Rule 1 corollary: a verdict that also reads a secondary inventory cannot pass while that inventory is unreadable. */
+function withUnreadableDowngrade(status: SalesforceFindingStatus, ...datasets: Array<SalesforceDataset<unknown>>): SalesforceFindingStatus {
+  if (datasets.every((dataset) => dataset.status === "ok")) return status;
+  return status === "pass" ? "warn" : status;
+}
+
+function unreadableNote(notChecked: string, ...datasets: Array<SalesforceDataset<unknown>>): string {
+  const unreadable = datasets.filter((dataset) => dataset.status !== "ok");
+  if (unreadable.length === 0) return "";
+  return ` ${unreadable.map(unreadableReason).join(" and ")}, so ${notChecked} was not checked and the verdict is capped at warn.`;
+}
+
+const SECURITY_SETTINGS_PROJECTION: Record<string, string[]> = {
+  sessionSettings: [
+    "sessionTimeout",
+    "forceLogoutOnSessionTimeout",
+    "lockSessionsToIp",
+    "enforceIpRangesEveryRequest",
+    "enableClickjackSetup",
+    "enableClickjackNonsetupSFDC",
+    "enableClickjackNonsetupUser",
+    "enableClickjackNonsetupUserHeaderless",
+    "enableCSRFOnGet",
+    "enableCSRFOnPost",
+    "enableMFADirectUILoginOptIn",
+  ],
+  passwordPolicies: ["minimumPasswordLength", "complexity", "expiration", "historyRestriction", "maxLoginAttempts", "lockoutInterval"],
+};
+const MY_DOMAIN_SETTINGS_FIELDS = ["myDomainName", "canOnlyLoginWithMyDomainUrl", "doesApiLoginRequireOrgDomain"];
+const PROFILE_METADATA_FIELDS = ["fullName", "custom"];
+const LOGIN_HOURS_FIELDS = WEEKDAYS.flatMap((day) => [`${day}Start`, `${day}End`]);
+const LOGIN_IP_RANGE_FIELDS = ["startAddress", "endAddress"];
+const OMITTED_SECTIONS_KEY = "_omittedSections";
+
+function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+  const picked: JsonRecord = {};
+  for (const field of fields) {
+    if (record[field] !== undefined) picked[field] = record[field];
+  }
+  return picked;
+}
+
+function omittedKeys(record: JsonRecord, kept: string[]): string[] {
+  return Object.keys(record).filter((key) => !kept.includes(key)).sort();
+}
+
+function asRecordList(value: unknown): JsonRecord[] {
+  return asRecords(Array.isArray(value) ? value : value ? [value] : []);
+}
+
+/**
+ * Metadata API settings and Profile trees are whole-tenant configuration dumps. Only the leaves the verdicts
+ * read are persisted (rule 9); the names of dropped sections are kept under _omittedSections so the evidence
+ * stays legible without carrying any of their values.
+ */
+export function projectSecuritySettings(record: JsonRecord | undefined): JsonRecord | undefined {
+  if (!record) return undefined;
+  const projected: JsonRecord = pickFields(record, ["fullName"]);
+  for (const [section, fields] of Object.entries(SECURITY_SETTINGS_PROJECTION)) {
+    const tree = asObject(record[section]);
+    if (tree) projected[section] = pickFields(tree, fields);
+  }
+  const network = asObject(record.networkAccess);
+  if (network) projected.networkAccess = { ipRanges: asRecordList(network.ipRanges).map((range) => pickFields(range, ["start", "end"])) };
+  projected[OMITTED_SECTIONS_KEY] = omittedKeys(record, ["fullName", ...Object.keys(SECURITY_SETTINGS_PROJECTION), "networkAccess"]);
+  return projected;
+}
+
+export function projectMyDomainSettings(record: JsonRecord | undefined): JsonRecord | undefined {
+  if (!record) return undefined;
+  const kept = ["fullName", ...MY_DOMAIN_SETTINGS_FIELDS];
+  return { ...pickFields(record, kept), [OMITTED_SECTIONS_KEY]: omittedKeys(record, kept) };
+}
+
+export function projectProfileMetadata(record: JsonRecord): JsonRecord {
+  const projected: JsonRecord = pickFields(record, PROFILE_METADATA_FIELDS);
+  const hours = asObject(record.loginHours);
+  if (hours) projected.loginHours = pickFields(hours, LOGIN_HOURS_FIELDS);
+  if (record.loginIpRanges !== undefined) projected.loginIpRanges = asRecordList(record.loginIpRanges).map((range) => pickFields(range, LOGIN_IP_RANGE_FIELDS));
+  projected[OMITTED_SECTIONS_KEY] = omittedKeys(record, [...PROFILE_METADATA_FIELDS, "loginHours", "loginIpRanges"]);
+  return projected;
+}
+
 function metadataBoolean(value: unknown): boolean | undefined {
   return asBoolean(value);
 }
@@ -1466,7 +1569,7 @@ export async function collectProfileMetadata(client: ReadClient, profiles: Sales
     const data = resolvedNames.map(({ profile, fullName }) => {
       const record = fullName ? byFullName.get(fullName) : undefined;
       return {
-        ...(record ?? {}),
+        ...(record ? projectProfileMetadata(record) : {}),
         [PROFILE_ID_KEY]: asString(profile.Id) ?? null,
         [PROFILE_NAME_KEY]: asString(profile.Name) ?? null,
         [PROFILE_FULL_NAME_KEY]: fullName ?? null,
@@ -1532,8 +1635,8 @@ export async function collectSalesforcePlatformData(client: ReadClient, options:
     collectRecord("Organization", () => client.getOrganization()),
     collectRecord("SecurityHealthCheck", () => client.getHealthCheck()),
     collectRecords("SecurityHealthCheckRisks", () => client.listHealthCheckRisks(limit)),
-    collectRecord("SecuritySettings", () => client.readSecuritySettings()),
-    collectRecord("MyDomainSettings", () => client.readMyDomainSettings()),
+    collectRecord("SecuritySettings", async () => projectSecuritySettings(await client.readSecuritySettings())),
+    collectRecord("MyDomainSettings", async () => projectMyDomainSettings(await client.readMyDomainSettings())),
     collectRecords("Profile", () => client.listProfiles(limit)),
   ]);
   const profileMetadata = await collectProfileMetadata(client, profiles);
@@ -1773,7 +1876,7 @@ export async function collectSalesforceIdentityData(client: ReadClient, options:
     collectRecords("PermissionSet", () => client.listPermissionSets(limit)),
     collectRecords("PermissionSetAssignment", () => client.listPermissionSetAssignments(limit)),
     collectRecords("TwoFactorMethodsInfo", () => client.listTwoFactorMethods(limit)),
-    collectRecord("SecuritySettings", () => client.readSecuritySettings()),
+    collectRecord("SecuritySettings", async () => projectSecuritySettings(await client.readSecuritySettings())),
     collectRecords("SecurityHealthCheckRisks", () => client.listHealthCheckRisks(limit)),
   ]);
   const profileMetadata = await collectProfileMetadata(client, profiles);
@@ -1854,13 +1957,19 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
     } else if (standardActiveUsers.length === 0) {
       findings.push(finding(4, "manual", "MFA is required for direct UI logins, but zero active standard users were returned, which indicates a partial user view rather than a compliant org.", mfaEvidence, mfaManual));
     } else if (unenrolled.length === 0) {
-      const status = withPartialDowngrade(withPartialDowngrade("pass", data.users), data.twoFactorMethods);
-      findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
+      const status = withUnreadableDowngrade(
+        withPartialDowngrade(withPartialDowngrade("pass", data.users), data.twoFactorMethods),
+        data.securitySettings,
+        data.healthCheckRisks,
+      );
+      const sourceNote = unreadableNote("the MFA requirement's second source", data.securitySettings, data.healthCheckRisks);
+      findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}${sourceNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
     } else {
       findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).${capNote}`, mfaEvidence));
     }
   } else {
-    findings.push(finding(4, "manual", "Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed.", mfaEvidence, mfaManual));
+    const unreadableSources = [data.securitySettings, data.healthCheckRisks].filter((dataset) => dataset.status !== "ok").map(unreadableReason);
+    findings.push(finding(4, "manual", `Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed${unreadableSources.length > 0 ? ` (${unreadableSources.join("; ")})` : ""}.`, mfaEvidence, mfaManual));
   }
 
   const hoursManual = "Setup > Profiles > (System Administrator and other elevated profiles) > Login Hours: record configured hours or the decision not to restrict them.";
@@ -1916,9 +2025,9 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       profiles_truncated: data.profiles.truncated,
       profile_fields_omitted: data.profiles.omittedFields ?? [],
     };
-    const status: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : withPartialDowngrade("pass", data.profiles);
+    const status: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.profiles), data.users);
     const apiOnlyNote = apiOnlyFlagAvailable ? `${apiOnlyProfiles.length} are API Only User profiles.` : "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified.";
-    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} profiles grant API Enabled covering ${usersOnApiProfiles.length} active users; ${apiOnlyNote}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : apiManual));
+    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} profiles grant API Enabled covering ${usersOnApiProfiles.length} active users; ${apiOnlyNote}${partialNote(data.profiles)}${partialNote(data.users)}`, evidence, status === "pass" ? undefined : apiManual));
   }
 
   const permSetManual = "Setup > Permission Sets: filter by Modify All Data, View All Data, Manage Users, and Author Apex; export the assignment list and confirm each assignee is justified.";
@@ -1945,12 +2054,14 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       permission_sets_truncated: data.permissionSets.truncated,
     };
     if (elevated.length === 0) {
-      findings.push(finding(9, withPartialDowngrade("pass", data.permissionSets), `None of the ${permissionSets.length} permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.${partialNote(data.permissionSets)}`, evidence));
+      const status = withUnreadableDowngrade(withPartialDowngrade("pass", data.permissionSets), data.assignments);
+      const assignmentNote = unreadableNote("assignment coverage of the permission sets that were read", data.assignments);
+      findings.push(finding(9, status, `None of the ${permissionSets.length} permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.${partialNote(data.permissionSets)}${assignmentNote}`, evidence, status === "pass" ? undefined : permSetManual));
     } else if (!assignmentsReadable) {
       findings.push(finding(9, "manual", `${elevated.length} permission sets grant elevated permissions, but assignments could not be read because ${unreadableReason(data.assignments)}.`, evidence, permSetManual));
     } else {
-      const status: SalesforceFindingStatus = assignees.size > maxAdmins ? "fail" : assignees.size > 0 ? "warn" : withPartialDowngrade("pass", data.assignments);
-      findings.push(finding(9, status, `${elevated.length} permission sets grant elevated permissions and are assigned to ${assignees.size} distinct active users (threshold ${maxAdmins}).${partialNote(data.assignments)}`, evidence, status === "pass" ? undefined : permSetManual));
+      const status: SalesforceFindingStatus = assignees.size > maxAdmins ? "fail" : assignees.size > 0 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.assignments), data.permissionSets);
+      findings.push(finding(9, status, `${elevated.length} permission sets grant elevated permissions and are assigned to ${assignees.size} distinct active users (threshold ${maxAdmins}).${partialNote(data.permissionSets)}${partialNote(data.assignments)}`, evidence, status === "pass" ? undefined : permSetManual));
     }
   }
 
@@ -1975,9 +2086,10 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
       users_truncated: data.users.truncated,
       users_seen: data.users.seen,
       users_total: data.users.total ?? null,
+      profiles_truncated: data.profiles.truncated,
     };
-    const status: SalesforceFindingStatus = admins.length > maxAdmins || staleAdmins.length > 0 ? "fail" : adminsWithoutLogin.length > 0 ? "warn" : withPartialDowngrade("pass", data.users);
-    findings.push(finding(10, status, `${admins.length} active users hold administrator-class profiles (threshold ${maxAdmins}); ${staleAdmins.length} have not logged in for ${staleDays}+ days and ${adminsWithoutLogin.length} have no LastLoginDate and are not counted as active administrators.${partialNote(data.users)}`, evidence, status === "pass" ? undefined : adminManual));
+    const status: SalesforceFindingStatus = admins.length > maxAdmins || staleAdmins.length > 0 ? "fail" : adminsWithoutLogin.length > 0 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.users), data.profiles);
+    findings.push(finding(10, status, `${admins.length} active users hold administrator-class profiles (threshold ${maxAdmins}); ${staleAdmins.length} have not logged in for ${staleDays}+ days and ${adminsWithoutLogin.length} have no LastLoginDate and are not counted as active administrators.${partialNote(data.users)}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : adminManual));
   }
 
   const guestManual = "Setup > Sites and Digital Experiences > (each site) > Public Access Settings: confirm guest profiles have no API access, no View All or Modify All permissions, and object access limited to what the site needs.";
@@ -2214,9 +2326,14 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     : tokensTruncated
       ? ` Only ${data.oauthTokens.data.length} of ${data.oauthTokens.total ?? "?"} OauthToken rows were read, so the token count is incomplete.`
       : "";
+  const callerPermissionLabel = canSeeAllTokens === false
+    ? "false"
+    : data.callerPermissions.status !== "ok"
+      ? `unknown because ${unreadableReason(data.callerPermissions)}`
+      : "unknown";
   const tokenViewNote = `${tokenViewPartial
-    ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${canSeeAllTokens === false ? "false" : "unknown"}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
-    : ""}${tokenCountNote}`;
+    ? ` OauthToken shows only the caller's own tokens without Customize Application (caller permission: ${callerPermissionLabel}), so the ${data.oauthTokens.data.length} tokens seen are a partial view.`
+    : ""}${tokensReadable ? "" : ` Token usage was not checked because ${unreadableReason(data.oauthTokens)}; review Setup > Connected Apps OAuth Usage manually.`}${tokenCountNote}`;
   const tokenEvidence = {
     oauth_tokens: tokensReadable ? data.oauthTokens.data.length : null,
     oauth_tokens_partial_view: tokenViewPartial,
@@ -2309,11 +2426,17 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
       high_risk_actors: truncateList(actors),
       sample_high_risk_changes: truncateList(highRisk.map((row) => `${asString(row.CreatedDate) ?? "?"} ${asString(row.Section) ?? ""}/${asString(row.Action) ?? ""}: ${asString(row.Display) ?? ""}`), 15),
       rows_without_created_date: undated.length,
-      event_monitoring: eventLogReadable ? { event_log_files_last_7_days: data.eventLogFiles.data.length, event_types: eventTypes } : { status: data.eventLogFiles.status, error: data.eventLogFiles.error ?? null },
+      event_monitoring: eventLogReadable
+        ? { event_log_files_last_7_days: data.eventLogFiles.data.length, event_types: eventTypes, truncated: data.eventLogFiles.truncated }
+        : { status: data.eventLogFiles.status, error: data.eventLogFiles.error ?? null },
       truncated: data.setupAuditTrail.truncated,
     };
-    const status: SalesforceFindingStatus = data.setupAuditTrail.truncated || undated.length > 0 ? "warn" : highRisk.length > 0 ? "warn" : "pass";
-    findings.push(finding(15, status, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventLogReadable ? `exposed ${data.eventLogFiles.data.length} EventLogFile rows in 7 days` : `is not readable (${data.eventLogFiles.status})`}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : auditManual));
+    const status: SalesforceFindingStatus = data.setupAuditTrail.truncated || undated.length > 0 || highRisk.length > 0 ? "warn" : withUnreadableDowngrade("pass", data.eventLogFiles);
+    const eventNote = eventLogReadable
+      ? `exposed ${data.eventLogFiles.data.length} EventLogFile rows in 7 days`
+      : `was not checked because ${unreadableReason(data.eventLogFiles)}, so the verdict is capped at warn`;
+    const eventManual = eventLogReadable ? "" : " Setup > Event Manager and the EventLogFile browser: confirm Event Monitoring log files are being generated and retained.";
+    findings.push(finding(15, status, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventNote}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : `${auditManual}${eventManual}`));
   }
 
   return {
