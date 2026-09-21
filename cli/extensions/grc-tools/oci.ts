@@ -427,7 +427,7 @@ const SENSITIVE_TEXT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> =
   { pattern: /\/p\/[A-Za-z0-9_+/=-]+\/n\//g, replacement: "/p/[redacted]/n/" },
   { pattern: /\b(Signature|Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1 [redacted]" },
   { pattern: /--config-file\s+("[^"]*"|'[^']*'|\S+)/g, replacement: `--config-file ${REDACTED_MARKER}` },
-  { pattern: /\b([A-Za-z_-]*(?:token|secret|password|passphrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
+  { pattern: /\b([A-Za-z_-]*(?:token|secret|password|passphrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)["']?\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
 ];
 
 function normalizeFieldName(key: string): string {
