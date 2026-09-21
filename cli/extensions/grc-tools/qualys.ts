@@ -43,6 +43,7 @@ const DEFAULT_MAX_RATE_LIMIT_WAIT_MS = 30_000;
 const DEFAULT_LIST_LIMIT = 5000;
 const DEFAULT_TAG_LIMIT = 2000;
 const KNOWLEDGE_BASE_QID_BATCH = 200;
+const WAS_HISTORY_ID_BATCH = 100;
 const KNOWLEDGE_BASE_MAX_QIDS = 2000;
 const STALE_CONNECTOR_DAYS = 7;
 const STALE_AGENT_DAYS = 7;
@@ -1206,6 +1207,8 @@ export class QualysApiClient {
   }
 
   async searchWasScans(lookbackDays?: number): Promise<QualysListResult> {
+    // WAS API "Search Scans" (wasscan.xsd): launchedDate, type, and status are documented filters and
+    // WasScan carries id, target/webApp/id, launchedDate, and status.
     return this.searchQps(
       "/qps/rest/3.0/search/was/wasscan",
       [
@@ -1214,6 +1217,40 @@ export class QualysApiClient {
       ],
       { pageSize: 100, limit: DEFAULT_LIST_LIMIT },
     );
+  }
+
+  async searchWasScanHistory(webAppIds: string[]): Promise<QualysListResult> {
+    // Resolves the last finished vulnerability scan of web applications that had none inside the lookback
+    // window. webApp.id is a documented integer filter, and the WAS API operator table documents IN with a
+    // comma-separated value list. No date bound, so a scan older than the window is still found.
+    const ids = uniqueStrings(webAppIds.map((id) => id.trim()));
+    const items: JsonRecord[] = [];
+    let pages = 0;
+    let truncationReason: string | undefined;
+    let index = 0;
+    while (index < ids.length && items.length < DEFAULT_LIST_LIMIT) {
+      const batch = ids.slice(index, index + WAS_HISTORY_ID_BATCH);
+      const result = await this.searchQps(
+        "/qps/rest/3.0/search/was/wasscan",
+        [
+          { field: "webApp.id", operator: "IN", value: batch.join(",") },
+          { field: "type", operator: "EQUALS", value: "VULNERABILITY" },
+          { field: "status", operator: "EQUALS", value: "FINISHED" },
+        ],
+        { pageSize: 100, limit: DEFAULT_LIST_LIMIT - items.length },
+      );
+      pages += result.pages;
+      items.push(...result.items);
+      index += WAS_HISTORY_ID_BATCH;
+      if (result.truncated) {
+        truncationReason = result.truncationReason;
+        break;
+      }
+    }
+    if (!truncationReason && index < ids.length) {
+      truncationReason = `item cap ${DEFAULT_LIST_LIMIT} reached before all ${ids.length} web applications were queried`;
+    }
+    return listResult(items, pages, truncationReason);
   }
 
   async searchWasAuthRecords(): Promise<QualysListResult> {
@@ -1274,6 +1311,7 @@ export type QualysDataClient = Pick<
   | "searchTags"
   | "searchWebApps"
   | "searchWasScans"
+  | "searchWasScanHistory"
   | "searchWasAuthRecords"
   | "searchWasSchedules"
 >;
@@ -2610,16 +2648,69 @@ function wasScheduleFlagMissing(schedule: JsonRecord): boolean {
   return asBoolean(schedule.active) === undefined && asString(schedule.status) === undefined;
 }
 
+// wasscan.xsd: WasScanTarget carries webApp (single target) or webApps/list/WebApp (multi target).
+function wasScanWebAppIds(scan: JsonRecord): string[] {
+  const single = pathString(scan, "target", "webApp", "id");
+  const multi = pathRecords(scan, "target", "webApps", "list")
+    .flatMap((entry) => asRecords(entry.WebApp ?? entry))
+    .map((webApp) => asString(webApp.id));
+  return uniqueStrings([single, ...multi]);
+}
+
+function wasScanIsFinishedVulnerabilityScan(scan: JsonRecord): boolean {
+  // wasscan.xsd: status enum includes FINISHED; type enum is VULNERABILITY or DISCOVERY.
+  const type = asString(scan.type);
+  return /^FINISHED$/i.test(asString(scan.status) ?? "") && (type === undefined || /^VULNERABILITY$/i.test(type));
+}
+
+// webapp.xsd: WebApp.lastScan is a WasScan reference carrying id and name only, so the date of the last scan
+// is always resolved through the WAS scan search (launchedDate), never read from the web application record.
 function webAppLastScanDate(webApp: JsonRecord, scans: JsonRecord[]): Date | undefined {
   const id = asString(webApp.id);
+  if (!id) return undefined;
   const dates = scans
-    .filter((scan) => pathString(scan, "target", "webApp", "id") === id && /FINISHED/i.test(asString(scan.status) ?? ""))
+    .filter((scan) => wasScanIsFinishedVulnerabilityScan(scan) && wasScanWebAppIds(scan).includes(id))
     .map((scan) => parseDate(scan.launchedDate))
     .filter((date): date is Date => Boolean(date));
-  const fromWebApp = parseDate(pathValue(webApp, "lastScan", "date") ?? webApp.lastScanDate);
-  if (fromWebApp) dates.push(fromWebApp);
   if (dates.length === 0) return undefined;
   return new Date(Math.max(...dates.map((date) => date.getTime())));
+}
+
+async function collectWasScanHistory(client: QualysDataClient, webApps: Collected, wasScans: Collected, errors: string[]): Promise<Collected> {
+  if (webApps.error || wasScans.error) return emptyCollected("was_scan_history");
+  const unresolved = webApps.data
+    .filter((webApp) => !webAppLastScanDate(webApp, wasScans.data))
+    .map((webApp) => asString(webApp.id))
+    .filter((id): id is string => Boolean(id));
+  if (unresolved.length === 0) return emptyCollected("was_scan_history");
+  return collect("was_scan_history", () => client.searchWasScanHistory(unresolved), errors, DEFAULT_LIST_LIMIT);
+}
+
+interface WebAppScanClassification {
+  fresh: JsonRecord[];
+  stale: JsonRecord[];
+  neverScanned: JsonRecord[];
+  unresolved: JsonRecord[];
+}
+
+function classifyWebAppScans(webApps: JsonRecord[], recentScans: JsonRecord[], history: Collected, now: Date, lookbackDays: number): WebAppScanClassification {
+  const result: WebAppScanClassification = { fresh: [], stale: [], neverScanned: [], unresolved: [] };
+  for (const webApp of webApps) {
+    const recent = webAppLastScanDate(webApp, recentScans);
+    const historic = recent ? undefined : webAppLastScanDate(webApp, history.data);
+    const last = recent ?? historic;
+    if (last && (ageInDays(last, now) ?? Number.POSITIVE_INFINITY) <= lookbackDays) {
+      result.fresh.push(webApp);
+    } else if (history.error || history.truncated) {
+      // Rule 4: a date that could not be resolved is reported separately, never counted as fresh or as never scanned.
+      result.unresolved.push(webApp);
+    } else if (last) {
+      result.stale.push(webApp);
+    } else {
+      result.neverScanned.push(webApp);
+    }
+  }
+  return result;
 }
 
 const SENSITIVE_ACTIVITY_PATTERN = /user|delete|remove|policy|exclu|schedule|option profile|permission|role|password/i;
@@ -2645,6 +2736,7 @@ export async function assessQualysAdministration(
     collect("was_schedules", () => client.searchWasSchedules(), errors, DEFAULT_LIST_LIMIT),
   ]);
   const scope = resolveViewScope(config, users, activity, userList);
+  const wasHistory = await collectWasScanHistory(client, webApps, wasScans, errors);
 
   const activeScheduledReports = scheduledReports.data.filter(reportIsActive);
   const reportsWithoutActiveFlag = scheduledReports.data.filter(reportActiveFlagMissing);
@@ -2674,11 +2766,10 @@ export async function assessQualysAdministration(
 
   const sensitiveActions = activity.data.filter((entry) => SENSITIVE_ACTIVITY_PATTERN.test(`${asString(entry.action) ?? ""} ${asString(entry.module) ?? ""} ${asString(entry.details) ?? ""}`));
 
-  const neverScannedWebApps = webApps.data.filter((webApp) => !webAppLastScanDate(webApp, wasScans.data)).map((webApp) => recordLabel(webApp, "web app"));
-  const staleWebApps = webApps.data.filter((webApp) => {
-    const last = webAppLastScanDate(webApp, wasScans.data);
-    return Boolean(last) && (ageInDays(last, now) ?? 0) > settings.lookbackDays;
-  }).map((webApp) => recordLabel(webApp, "web app"));
+  const webAppScans = classifyWebAppScans(webApps.data, wasScans.data, wasHistory, now, settings.lookbackDays);
+  const neverScannedWebApps = webAppScans.neverScanned.map((webApp) => recordLabel(webApp, "web app"));
+  const staleWebApps = webAppScans.stale.map((webApp) => recordLabel(webApp, "web app"));
+  const unresolvedWebApps = webAppScans.unresolved.map((webApp) => recordLabel(webApp, "web app"));
   const wasAuthWithoutDate = wasAuth.data.filter((record) => !parseDate(record.updatedDate ?? record.createdDate)).map((record) => recordLabel(record, "auth record"));
   const staleWasAuth = wasAuth.data.filter((record) => (ageInDays(record.updatedDate ?? record.createdDate, now) ?? -1) > STALE_WAS_AUTH_DAYS).map((record) => recordLabel(record, "auth record"));
   const activeWasSchedules = wasSchedules.data.filter(wasScheduleIsActive);
@@ -2780,20 +2871,28 @@ export async function assessQualysAdministration(
       ? `${unreadableSummary(15, [webApps, wasScans, wasAuth])}${webApps.moduleUnavailable ? " The WAS module is not licensed or not enabled for this API user, so this control is not applicable unless web applications are scanned elsewhere." : ""}`
       : webApps.data.length === 0
         ? "WAS responded but no web applications are inventoried. This is not applicable if no web applications are in scope; otherwise the WAS inventory is missing. Emptiness is treated as unknown, not compliant."
-        : `${neverScannedWebApps.length}/${webApps.data.length} web applications have never had a finished vulnerability scan and ${staleWebApps.length} have none within ${settings.lookbackDays} days; ${staleWasAuth.length} WAS authentication records are older than ${STALE_WAS_AUTH_DAYS} days; ${activeWasSchedules.length}/${wasSchedules.data.length} WAS schedules report an active flag.`,
+        : `${webAppScans.fresh.length}/${webApps.data.length} web applications have a finished vulnerability scan (WAS scan search launchedDate) within ${settings.lookbackDays} days, ${staleWebApps.length} were last scanned before the window per the unbounded scan history, ${neverScannedWebApps.length} have no finished vulnerability scan in the fully read scan history, and ${unresolvedWebApps.length} could not be resolved because the scan history was ${wasHistory.error ? "not readable" : "truncated"} (reported, never counted as fresh or as never scanned); ${staleWasAuth.length} WAS authentication records are older than ${STALE_WAS_AUTH_DAYS} days; ${activeWasSchedules.length}/${wasSchedules.data.length} WAS schedules report an active flag.`,
     evidence: {
       web_apps: webApps.data.length,
+      recently_scanned_web_apps: webAppScans.fresh.length,
       never_scanned_web_apps: neverScannedWebApps.slice(0, 50),
       stale_web_apps: staleWebApps.slice(0, 50),
+      unresolved_web_apps: unresolvedWebApps.slice(0, 50),
       stale_auth_records: staleWasAuth.slice(0, 50),
       active_schedules: activeWasSchedules.length,
       schedules_returned: wasSchedules.data.length,
       scans_in_lookback: wasScans.data.length,
+      scan_history_scans: wasHistory.data.length,
+      last_scan_source: "WAS scan search launchedDate (webapp.xsd lastScan carries id and name only)",
     },
-    sources: [webApps, wasScans, wasAuth, wasSchedules],
+    sources: [webApps, wasScans, wasHistory, wasAuth, wasSchedules],
     scope,
     manualEvidence: "export the WAS web application list with last scan dates and authentication record ages, or record that no web applications are in scope.",
-    unknownBuckets: { was_auth_records_without_date: wasAuthWithoutDate.length, was_schedules_without_active_flag: wasSchedulesWithoutFlag.length },
+    unknownBuckets: {
+      web_apps_without_resolved_scan_date: unresolvedWebApps.length,
+      was_auth_records_without_date: wasAuthWithoutDate.length,
+      was_schedules_without_active_flag: wasSchedulesWithoutFlag.length,
+    },
   }));
 
   findings.push(guardedFinding({
