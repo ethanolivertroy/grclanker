@@ -36,6 +36,8 @@ const DEFAULT_MAX_SESSION_INACTIVITY_MINUTES = 120;
 const DEFAULT_ROLE_MEMBER_LIMIT = 3000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const MAX_RETRY_AFTER_MS = 30_000;
+const MAX_LIST_PAGES = 500;
+const REDACTED = "[REDACTED]";
 const DEFAULT_CONFIG_FILE_NAMES = [".zoom.json", ".grclanker-zoom.json"];
 
 /**
@@ -209,6 +211,10 @@ export interface ZoomSettingsBundle {
   locks: JsonRecord;
   settingsSurfaces: ZoomSurface<JsonRecord>[];
   lockSurfaces: ZoomSurface<JsonRecord>[];
+  /** Setting paths a verdict read; the export bundle projects settings to these paths only. */
+  readPaths: Set<string>;
+  /** Lock paths a verdict read; the export bundle projects lock settings to these paths only. */
+  lockPaths: Set<string>;
 }
 
 export interface ZoomGroupPolicy {
@@ -362,6 +368,112 @@ function parseTimeoutSeconds(value: number | undefined): number {
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
+
+/**
+ * Bundle secret hygiene. Keys that carry credential material are redacted
+ * (the key stays, the value becomes the marker); policy flags whose names
+ * merely mention passwords (require_password_*, embed_password_*,
+ * *_requirement) are not credentials and stay readable.
+ */
+const SENSITIVE_KEY_PATTERN = /(^|_)(token|secret|password|passcode|pwd|host_key|hostkey|private_key|certificate|cert|api_key|apikey|zak|credential|signature|sig)s?($|_)/i;
+const POLICY_KEY_PATTERN = /^(require_|allow_|enable_|embed_|force_|only_|use_|show_|hide_|auto_)|(_requirement|_requirements|_policy|_protection|_protected|_enabled|_required|_length|_strength|_options|_type)$/i;
+const SECRET_QUERY_PARAM_PATTERN = /([?&](?:pwd|passcode|password|token|access_token|refresh_token|tk|zak|sig|signature|api_key|apikey|secret|client_secret)=)[^&#\s"'<>]*/gi;
+const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g;
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEY_PATTERN.test(key) && !POLICY_KEY_PATTERN.test(key);
+}
+
+function credentialValues(config: ZoomResolvedConfig): string[] {
+  return [config.token, config.clientSecret, config.clientId]
+    .filter((value): value is string => typeof value === "string" && value.trim().length >= 4);
+}
+
+function scrubSecretText(text: string, secrets: string[]): string {
+  let scrubbed = text;
+  for (const secret of secrets) {
+    scrubbed = scrubbed.split(secret).join(REDACTED);
+  }
+  return scrubbed
+    .replace(SECRET_QUERY_PARAM_PATTERN, `$1${REDACTED}`)
+    .replace(BEARER_PATTERN, `Bearer ${REDACTED}`);
+}
+
+function sanitizeValue(value: unknown, secrets: string[], redactLeaves = false): unknown {
+  if (typeof value === "string") {
+    return redactLeaves ? REDACTED : scrubSecretText(value, secrets);
+  }
+  if (typeof value === "number") {
+    return redactLeaves ? REDACTED : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeValue(item, secrets, redactLeaves));
+  }
+  const record = asObject(value);
+  if (!record) return value;
+  const sanitized: JsonRecord = {};
+  for (const [key, child] of Object.entries(record)) {
+    const sensitive = redactLeaves || isSensitiveKey(key);
+    if (sensitive && (typeof child === "string" || typeof child === "number")) {
+      sanitized[key] = REDACTED;
+    } else {
+      sanitized[key] = sanitizeValue(child, secrets, sensitive);
+    }
+  }
+  return sanitized;
+}
+
+function sanitizeSurface<T>(surface: ZoomSurface<T>, secrets: string[]): ZoomSurface<T> {
+  return {
+    ...surface,
+    ...(surface.data === undefined ? {} : { data: sanitizeValue(surface.data, secrets) as T }),
+    ...(surface.error === undefined ? {} : { error: scrubSecretText(surface.error, secrets) }),
+  };
+}
+
+function projectPaths(source: JsonRecord, paths: Iterable<string>): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const path of [...paths].sort()) {
+    const segments = path.split(".");
+    const value = getNestedValue(source, segments);
+    if (value === undefined) continue;
+    let cursor = projected;
+    for (const segment of segments.slice(0, -1)) {
+      const existing = asObject(cursor[segment]);
+      if (!existing) cursor[segment] = {};
+      cursor = asObject(cursor[segment]) as JsonRecord;
+    }
+    cursor[segments[segments.length - 1]] = value;
+  }
+  return projected;
+}
+
+function projectRecord(record: unknown, fields: readonly string[]): unknown {
+  const source = asObject(record);
+  if (!source) return typeof record === "string" ? record : null;
+  return Object.fromEntries(fields.filter((field) => field in source).map((field) => [field, source[field]]));
+}
+
+/** Fields the verdicts read per list surface; everything else is dropped from the bundle. */
+const BUNDLE_RECORD_FIELDS = {
+  current_user: ["id", "email", "first_name"],
+  users: ["id", "email", "type", "status", "login_types", "role_id"],
+  roles: ["id", "name", "total_members"],
+  role_members: ["id", "email"],
+  groups: ["id", "name", "total_members"],
+  im_groups: ["id", "name", "type", "total_members", "search_by_account", "search_by_domain", "search_by_ma_account"],
+  managed_domains: ["domain", "status"],
+  operation_logs: ["time", "action", "category_type", "operator"],
+} as const;
+const BUNDLE_PHONE_PATHS = [
+  "auto_call_recording.enable",
+  "auto_call_recording.locked",
+  "auto_call_recording.locked_by",
+  "auto_call_recording.recording_calls",
+  "ad_hoc_call_recording.enable",
+  "ad_hoc_call_recording.locked",
+  "ad_hoc_call_recording.locked_by",
+] as const;
 
 function safeDirName(value: string): string {
   const normalized = value
@@ -779,7 +891,9 @@ export class ZoomApiClient {
 
   /**
    * next_page_token pagination per ZOOM_DOCS.pagination. Runs to completion
-   * unless the caller's limit is reached, in which case truncated is true.
+   * unless a cap stops it; every cap exit (item limit, page cap, a
+   * next_page_token that repeats or stops yielding items, or a total_records
+   * above the collected count) reports truncated so verdicts demote.
    */
   async list<T = JsonRecord>(
     path: string,
@@ -790,6 +904,7 @@ export class ZoomApiClient {
     const limit = clampNumber(options.limit, 10000, 1, 100000);
     const mapItem = options.mapItem ?? ((item: unknown) => item as T);
     const items: T[] = [];
+    const seenTokens = new Set<string>();
     let nextPageToken: string | undefined;
     let totalRecords: number | undefined;
     let pages = 0;
@@ -816,16 +931,28 @@ export class ZoomApiClient {
       nextPageToken = asString(payload.next_page_token);
       if (truncated) break;
       if (!nextPageToken) break;
-      if (pageItems.length === 0) {
+      if (pageItems.length === 0 || seenTokens.has(nextPageToken) || pages >= MAX_LIST_PAGES) {
         truncated = true;
         break;
       }
+      seenTokens.add(nextPageToken);
     }
 
     if (!truncated && totalRecords !== undefined && totalRecords > items.length) {
       truncated = true;
     }
     return { items, totalRecords, truncated, pages };
+  }
+
+  /**
+   * Single-response lists whose reference documents total_records: the list
+   * is complete only when total_records is present and matches the returned
+   * count; a missing total leaves completeness unknown, so truncated is true.
+   */
+  private singleResponseList(payload: JsonRecord, collectionKey: string): ZoomListResult {
+    const items = toRecords(extractCollection(payload, collectionKey));
+    const totalRecords = asNumber(payload.total_records);
+    return { items, totalRecords, truncated: totalRecords === undefined || totalRecords > items.length, pages: 1 };
   }
 
   /** ZOOM_DOCS.user with the documented `me` alias. */
@@ -853,12 +980,9 @@ export class ZoomApiClient {
     return this.get(`/users/${encodeURIComponent(userIdValue)}/settings`, { option });
   }
 
-  /** ZOOM_DOCS.roles; the reference documents no pagination parameters for this endpoint. */
+  /** ZOOM_DOCS.roles; the reference documents no pagination parameters, only total_records and roles[]. */
   async listRoles(): Promise<ZoomListResult> {
-    const payload = await this.get("/roles", { type: "common" });
-    const items = toRecords(extractCollection(payload, "roles"));
-    const totalRecords = asNumber(payload.total_records);
-    return { items, totalRecords, truncated: totalRecords !== undefined && totalRecords > items.length, pages: 1 };
+    return this.singleResponseList(await this.get("/roles", { type: "common" }), "roles");
   }
 
   /** ZOOM_DOCS.roleMembers; page_size maximum 300. */
@@ -886,23 +1010,21 @@ export class ZoomApiClient {
     return this.list("/report/operationlogs", "operation_logs", { from, to }, { limit, pageSize: 300, mapItem: asObject });
   }
 
-  /** ZOOM_DOCS.imGroups; the reference documents no pagination parameters for this endpoint. */
+  /** ZOOM_DOCS.imGroups; the reference documents no pagination parameters, only total_records and groups[]. */
   async listImGroups(): Promise<ZoomListResult> {
-    const payload = await this.get("/im/groups");
-    const items = toRecords(extractCollection(payload, "groups"));
-    const totalRecords = asNumber(payload.total_records);
-    return { items, totalRecords, truncated: totalRecords !== undefined && totalRecords > items.length, pages: 1 };
+    return this.singleResponseList(await this.get("/im/groups"), "groups");
   }
 
-  /** ZOOM_DOCS.managedDomains; response key domains[] with domain and status. */
+  /** ZOOM_DOCS.managedDomains; response keys total_records and domains[] with domain and status. */
   async getManagedDomains(): Promise<ZoomListResult> {
-    const payload = await this.get(`/accounts/${encodeURIComponent(this.config.accountId)}/managed_domains`);
-    const items = toRecords(extractCollection(payload, "domains"));
-    const totalRecords = asNumber(payload.total_records);
-    return { items, totalRecords, truncated: totalRecords !== undefined && totalRecords > items.length, pages: 1 };
+    return this.singleResponseList(await this.get(`/accounts/${encodeURIComponent(this.config.accountId)}/managed_domains`), "domains");
   }
 
-  /** ZOOM_DOCS.trustedDomains; response key trusted_domains[] (strings). */
+  /**
+   * ZOOM_DOCS.trustedDomains; the documented response is the single array
+   * trusted_domains[] (strings) with no total_records or pagination, so the
+   * response is complete by contract and cannot report a partial view.
+   */
   async listTrustedDomains(): Promise<ZoomListResult<unknown>> {
     const payload = await this.get(`/accounts/${encodeURIComponent(this.config.accountId)}/trusted_domains`);
     const items = extractCollection(payload, "trusted_domains");
@@ -992,6 +1114,44 @@ async function collectSettingsBundle(
     locks: mergeSurfaces(lockSurfaces),
     settingsSurfaces,
     lockSurfaces,
+    readPaths: new Set<string>(),
+    lockPaths: new Set<string>(),
+  };
+}
+
+/**
+ * Applied once per collection so every downstream consumer (tool text,
+ * findings evidence, and the export bundle) sees credential-bearing keys
+ * redacted and known credential values scrubbed from strings and errors.
+ */
+function sanitizeSnapshot(snapshot: ZoomSnapshot, secrets: string[]): ZoomSnapshot {
+  const settings = snapshot.settings.settingsSurfaces.map((surface) => sanitizeSurface(surface, secrets));
+  const locks = snapshot.settings.lockSurfaces.map((surface) => sanitizeSurface(surface, secrets));
+  return {
+    ...snapshot,
+    currentUser: sanitizeSurface(snapshot.currentUser, secrets),
+    settings: {
+      ...snapshot.settings,
+      settings: mergeSurfaces(settings),
+      locks: mergeSurfaces(locks),
+      settingsSurfaces: settings,
+      lockSurfaces: locks,
+    },
+    users: sanitizeSurface(snapshot.users, secrets),
+    roles: sanitizeSurface(snapshot.roles, secrets),
+    roleMembers: Object.fromEntries(Object.entries(snapshot.roleMembers).map(([roleId, surface]) => [roleId, sanitizeSurface(surface, secrets)])),
+    groups: sanitizeSurface(snapshot.groups, secrets),
+    groupPolicies: snapshot.groupPolicies.map((policy) => ({
+      ...policy,
+      name: scrubSecretText(policy.name, secrets),
+      settings: sanitizeSurface(policy.settings, secrets),
+      locks: sanitizeSurface(policy.locks, secrets),
+    })),
+    imGroups: sanitizeSurface(snapshot.imGroups, secrets),
+    managedDomains: sanitizeSurface(snapshot.managedDomains, secrets),
+    trustedDomains: sanitizeSurface(snapshot.trustedDomains, secrets),
+    operationLogs: { ...sanitizeSurface(snapshot.operationLogs, secrets), from: snapshot.operationLogs.from, to: snapshot.operationLogs.to },
+    phoneSettings: sanitizeSurface(snapshot.phoneSettings, secrets),
   };
 }
 
@@ -1095,7 +1255,7 @@ export async function collectZoomSnapshot(
     ? await captureSurface("phone_account_settings", `/phone/account_settings?setting_types=${PHONE_SETTING_TYPES}`, ZOOM_DOCS.phoneAccountSettings, () => client.getPhoneAccountSettings())
     : skippedSurface<JsonRecord>("phone_account_settings", "/phone/account_settings", ZOOM_DOCS.phoneAccountSettings);
 
-  return {
+  return sanitizeSnapshot({
     accountId: config.accountId,
     collectedAt: now.toISOString(),
     currentUser,
@@ -1110,7 +1270,7 @@ export async function collectZoomSnapshot(
     trustedDomains,
     operationLogs: { ...operationLogs, from, to },
     phoneSettings,
-  };
+  }, credentialValues(config));
 }
 
 function snapshotSurfaces(snapshot: ZoomSnapshot): ZoomSurface[] {
@@ -1163,11 +1323,13 @@ interface SettingRead {
 }
 
 function readSetting(bundle: ZoomSettingsBundle, path: string): SettingRead {
+  bundle.readPaths.add(path);
   const value = getNestedValue(bundle.settings, path.split("."));
   return { path, value, present: value !== undefined };
 }
 
 function readLock(bundle: ZoomSettingsBundle, path: string): boolean | undefined {
+  bundle.lockPaths.add(path);
   return asBoolean(getNestedValue(bundle.locks, path.split(".")));
 }
 
@@ -1318,11 +1480,13 @@ export function assessZoomIdentityFromSnapshot(
             "Two-factor authentication for admins",
             "critical",
             [6],
-            uncovered.length === 0 ? "pass" : "fail",
-            uncovered.length === 0
-              ? `security.sign_in_with_two_factor_auth is \`role\` and all ${adminRoles.length} admin or owner roles appear in sign_in_with_two_factor_auth_roles.`
-              : `security.sign_in_with_two_factor_auth is \`role\` but ${uncovered.length}/${adminRoles.length} admin or owner roles are missing from sign_in_with_two_factor_auth_roles.`,
-            { ...twoFactorEvidence, uncovered_admin_roles: uncovered.map((role) => asString(role.name) ?? asString(role.id) ?? "role") },
+            uncovered.length > 0 ? "fail" : roles.truncated ? "warn" : "pass",
+            uncovered.length > 0
+              ? `security.sign_in_with_two_factor_auth is \`role\` but ${uncovered.length}/${adminRoles.length} admin or owner roles are missing from sign_in_with_two_factor_auth_roles.`
+              : roles.truncated
+                ? `${partialNote(roleRecords.length, roles.total, false)} The ${adminRoles.length} admin or owner roles seen appear in sign_in_with_two_factor_auth_roles, but unseen roles were not judged.`
+                : `security.sign_in_with_two_factor_auth is \`role\` and all ${adminRoles.length} admin or owner roles appear in sign_in_with_two_factor_auth_roles (total_records matches).`,
+            { ...twoFactorEvidence, uncovered_admin_roles: uncovered.map((role) => asString(role.name) ?? asString(role.id) ?? "role"), roles_truncated: roles.truncated, roles_total_records: roles.total ?? null },
           ));
         }
         break;
@@ -1408,7 +1572,7 @@ export function assessZoomIdentityFromSnapshot(
         ? "manual"
         : memberDenied
           ? "manual"
-          : memberTruncated
+          : memberTruncated || roles.truncated
             ? "warn"
             : adminIds.size <= maxAdmins
               ? "pass"
@@ -1420,11 +1584,13 @@ export function assessZoomIdentityFromSnapshot(
         : memberDenied
           ? "Manual: at least one admin role member list (GET /roles/{roleId}/members) was denied or failed; admin count cannot be confirmed."
           : memberTruncated
-            ? `Partial inventory: admin role member pagination stopped at the configured limit; ${adminIds.size} distinct admins were seen of ${declaredTotals} declared.`
-            : adminIds.size <= maxAdmins
-              ? `${adminIds.size} distinct users hold admin or owner roles (complete membership), within the threshold of ${maxAdmins}.`
-              : `${adminIds.size} distinct users hold admin or owner roles, above the threshold of ${maxAdmins}.`,
-    adminEvidence,
+            ? `Partial inventory: admin role member pagination stopped at the configured limit; ${adminIds.size} distinct admins were seen of ${declaredTotals > 0 ? `${declaredTotals} declared` : "an unknown total"}.`
+            : roles.truncated
+              ? `${partialNote(roleRecords.length, roles.total, false)} ${adminIds.size} distinct admins were seen in the ${adminRoles.length} admin or owner roles returned, but unseen roles were not judged.`
+              : adminIds.size <= maxAdmins
+                ? `${adminIds.size} distinct users hold admin or owner roles (complete membership), within the threshold of ${maxAdmins}.`
+                : `${adminIds.size} distinct users hold admin or owner roles, above the threshold of ${maxAdmins}.`,
+    { ...adminEvidence, roles_truncated: roles.truncated, roles_total_records: roles.total ?? null },
   ));
 
   const clientTimeout = readSetting(snapshot.settings, "security.sign_again_period_for_inactivity_on_client");
@@ -1703,7 +1869,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
       : logRecords.length === 0
         ? `GET /report/operationlogs returned no entries between ${snapshot.operationLogs.from} and ${snapshot.operationLogs.to}; emptiness cannot prove retention, so this is reported as warn.`
         : logs.truncated
-          ? `Partial inventory: ${logRecords.length} operation log entries seen before the configured limit; the full population was not enumerated.`
+          ? `${partialNote(logRecords.length, logs.total, true)} The full operation log population for ${snapshot.operationLogs.from} to ${snapshot.operationLogs.to} was not enumerated.`
           : undatedLogs.length > 0
             ? `${undatedLogs.length}/${logRecords.length} operation log entries lack a parseable time and are reported separately; they cannot count as recent.`
             : `${logRecords.length} admin operation log entries were readable for ${snapshot.operationLogs.from} to ${snapshot.operationLogs.to} (complete pagination, newest ${new Date(newestLog).toISOString()}). Retention length beyond the API window must be confirmed against Zoom's published retention.`,
@@ -1824,6 +1990,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
 }
 
 function groupsRelaxing(snapshot: ZoomSnapshot, path: string, compliantValue: unknown): string[] {
+  snapshot.settings.readPaths.add(path);
   return snapshot.groupPolicies
     .filter((policy) => policy.settings.status === "ok")
     .filter((policy) => {
@@ -2404,7 +2571,7 @@ function buildQuickReference(result: { outputDir: string; zipPath: string }, fin
     "",
     "## Layout",
     "",
-    "- `core_data/`: raw API snapshots per surface (no credentials or tokens are written)",
+    "- `core_data/`: API snapshots projected to the fields the verdicts read; credential-bearing keys are redacted and no tokens are written",
     "- `analysis/findings.json`: every finding with status, evidence, spec controls, and framework mappings",
     "- `analysis/*.json`: per-assessment summaries (identity, collaboration governance, meeting security)",
     "- `compliance/executive_summary.md`: prioritized summary and manual follow-up list",
@@ -2423,7 +2590,7 @@ function buildQuickReference(result: { outputDir: string; zipPath: string }, fin
   ].join("\n");
 }
 
-function redactSurface(surface: ZoomSurface): JsonRecord {
+function describeSurface(surface: ZoomSurface): JsonRecord {
   return {
     name: surface.name,
     endpoint: surface.endpoint,
@@ -2431,7 +2598,30 @@ function redactSurface(surface: ZoomSurface): JsonRecord {
     status: surface.status,
     http_status: surface.httpStatus ?? null,
     error: surface.error ?? null,
-    data: surface.data ?? null,
+  };
+}
+
+/** Bundle snapshot of a settings-style surface: only the paths a verdict read. */
+function projectedSettingsSurface(surface: ZoomSurface<JsonRecord>, paths: Iterable<string>): JsonRecord {
+  return {
+    ...describeSurface(surface),
+    data: surface.data === undefined ? null : projectPaths(asObject(surface.data) ?? {}, paths),
+  };
+}
+
+/** Bundle snapshot of a list surface: only the record fields a verdict read. */
+function projectedListSurface(surface: ZoomSurface<ZoomListResult<unknown>>, fields: readonly string[]): JsonRecord {
+  const data = surface.data;
+  return {
+    ...describeSurface(surface),
+    data: data === undefined
+      ? null
+      : {
+        items: data.items.map((item) => projectRecord(item, fields)),
+        total_records: data.totalRecords ?? null,
+        truncated: data.truncated,
+        pages: data.pages,
+      },
   };
 }
 
@@ -2453,10 +2643,15 @@ export async function exportZoomAuditBundle(
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.accountId)}-audit-bundle`);
   const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
+  const secrets = credentialValues(config);
+  const write = (relativePathname: string, content: string) =>
+    writeSecureTextFile(outputDir, relativePathname, scrubSecretText(content, secrets));
+  const readPaths = [...snapshot.settings.readPaths].sort();
+  const lockPaths = [...snapshot.settings.lockPaths].sort();
 
-  await writeSecureTextFile(outputDir, "README.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await write("README.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
+  await write("QUICK_REFERENCE.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
+  await write("metadata.json", serializeJson({
     generated_at: new Date().toISOString(),
     collected_at: snapshot.collectedAt,
     account_id: config.accountId,
@@ -2465,8 +2660,10 @@ export async function exportZoomAuditBundle(
     config_file: config.configFile ?? null,
     finding_count: findings.length,
     error_count: errors.length,
+    settings_paths_read: readPaths,
+    lock_paths_read: lockPaths,
   }));
-  await writeSecureTextFile(outputDir, "summary.md", [
+  await write("summary.md", [
     formatAccessCheckText(access),
     "",
     formatAssessmentText(identity),
@@ -2476,49 +2673,63 @@ export async function exportZoomAuditBundle(
     formatAssessmentText(meetingSecurity),
   ].join("\n"));
 
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "core_data/current_user.json", serializeJson(redactSurface(snapshot.currentUser)));
-  await writeSecureTextFile(outputDir, "core_data/account_settings.json", serializeJson({
-    merged: snapshot.settings.settings,
-    surfaces: snapshot.settings.settingsSurfaces.map(redactSurface),
+  await write("core_data/access.json", serializeJson(access));
+  await write("core_data/current_user.json", serializeJson({
+    ...describeSurface(snapshot.currentUser),
+    data: snapshot.currentUser.data === undefined ? null : projectRecord(snapshot.currentUser.data, BUNDLE_RECORD_FIELDS.current_user),
   }));
-  await writeSecureTextFile(outputDir, "core_data/account_lock_settings.json", serializeJson({
-    merged: snapshot.settings.locks,
-    surfaces: snapshot.settings.lockSurfaces.map(redactSurface),
+  await write("core_data/account_settings.json", serializeJson({
+    fields_read: readPaths,
+    merged: projectPaths(snapshot.settings.settings, readPaths),
+    surfaces: snapshot.settings.settingsSurfaces.map((surface) => projectedSettingsSurface(surface, readPaths)),
   }));
-  await writeSecureTextFile(outputDir, "core_data/users.json", serializeJson(redactSurface(snapshot.users)));
-  await writeSecureTextFile(outputDir, "core_data/roles.json", serializeJson({
-    roles: redactSurface(snapshot.roles),
-    members: Object.values(snapshot.roleMembers).map(redactSurface),
+  await write("core_data/account_lock_settings.json", serializeJson({
+    fields_read: lockPaths,
+    merged: projectPaths(snapshot.settings.locks, lockPaths),
+    surfaces: snapshot.settings.lockSurfaces.map((surface) => projectedSettingsSurface(surface, lockPaths)),
   }));
-  await writeSecureTextFile(outputDir, "core_data/groups.json", serializeJson({
-    groups: redactSurface(snapshot.groups),
-    policies: snapshot.groupPolicies.map((policy) => ({ id: policy.id, name: policy.name, settings: redactSurface(policy.settings), lock_settings: redactSurface(policy.locks) })),
+  await write("core_data/users.json", serializeJson(projectedListSurface(snapshot.users, BUNDLE_RECORD_FIELDS.users)));
+  await write("core_data/roles.json", serializeJson({
+    roles: projectedListSurface(snapshot.roles, BUNDLE_RECORD_FIELDS.roles),
+    members: Object.values(snapshot.roleMembers).map((surface) => projectedListSurface(surface, BUNDLE_RECORD_FIELDS.role_members)),
   }));
-  await writeSecureTextFile(outputDir, "core_data/im_groups.json", serializeJson(redactSurface(snapshot.imGroups)));
-  await writeSecureTextFile(outputDir, "core_data/managed_domains.json", serializeJson(redactSurface(snapshot.managedDomains)));
-  await writeSecureTextFile(outputDir, "core_data/trusted_domains.json", serializeJson(redactSurface(snapshot.trustedDomains)));
-  await writeSecureTextFile(outputDir, "core_data/operation_logs.json", serializeJson({ ...redactSurface(snapshot.operationLogs), from: snapshot.operationLogs.from, to: snapshot.operationLogs.to }));
-  await writeSecureTextFile(outputDir, "core_data/phone_account_settings.json", serializeJson(redactSurface(snapshot.phoneSettings)));
+  await write("core_data/groups.json", serializeJson({
+    groups: projectedListSurface(snapshot.groups, BUNDLE_RECORD_FIELDS.groups),
+    policies: snapshot.groupPolicies.map((policy) => ({
+      id: policy.id,
+      name: policy.name,
+      settings: projectedSettingsSurface(policy.settings, readPaths),
+      lock_settings: projectedSettingsSurface(policy.locks, lockPaths),
+    })),
+  }));
+  await write("core_data/im_groups.json", serializeJson(projectedListSurface(snapshot.imGroups, BUNDLE_RECORD_FIELDS.im_groups)));
+  await write("core_data/managed_domains.json", serializeJson(projectedListSurface(snapshot.managedDomains, BUNDLE_RECORD_FIELDS.managed_domains)));
+  await write("core_data/trusted_domains.json", serializeJson(projectedListSurface(snapshot.trustedDomains, [])));
+  await write("core_data/operation_logs.json", serializeJson({
+    ...projectedListSurface(snapshot.operationLogs, BUNDLE_RECORD_FIELDS.operation_logs),
+    from: snapshot.operationLogs.from,
+    to: snapshot.operationLogs.to,
+  }));
+  await write("core_data/phone_account_settings.json", serializeJson(projectedSettingsSurface(snapshot.phoneSettings, BUNDLE_PHONE_PATHS)));
 
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/collaboration-governance.json", serializeJson(collaboration));
-  await writeSecureTextFile(outputDir, "analysis/meeting-security.json", serializeJson(meetingSecurity));
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
+  await write("analysis/findings.json", serializeJson(findings));
+  await write("analysis/identity.json", serializeJson(identity));
+  await write("analysis/collaboration-governance.json", serializeJson(collaboration));
+  await write("analysis/meeting-security.json", serializeJson(meetingSecurity));
+  await write("analysis/summary.json", serializeJson({
     counts: statusCounts(findings),
     controls_covered: [...new Set(findings.flatMap((item) => item.controls))].sort((a, b) => a - b),
     controls_total: ZOOM_SPEC_CONTROLS.length,
   }));
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(snapshot, assessments, errors)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+  await write("compliance/executive_summary.md", `${buildExecutiveSummary(snapshot, assessments, errors)}\n`);
+  await write("compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
   for (const framework of ZOOM_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${frameworkFileName(framework)}`, `${buildFrameworkReport(framework, findings)}\n`);
+    await write(`compliance/${frameworkFileName(framework)}`, `${buildFrameworkReport(framework, findings)}\n`);
   }
 
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await write("_errors.log", `${errors.join("\n")}\n`);
   }
 
   await createZipArchive(outputDir, zipPath);
