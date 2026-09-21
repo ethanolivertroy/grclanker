@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -56,6 +57,7 @@ import {
   isSensitiveArgumentKey,
   redactSensitiveArguments,
   scrubSensitiveValues,
+  scrubbedFormsOf,
   withholdEchoedArguments,
 } from "../dist/flue/redact.js";
 import { formatFlueHelp, formatFlueRunOutcome, parseFlueRunArgs, runFlueCommand } from "../dist/flue/cli.js";
@@ -914,15 +916,40 @@ test("credential-bearing tool arguments are redacted before serialization, at an
     assert.equal(isSensitiveArgumentKey(key), false, `${key} stays visible`);
   }
 
+  // Names the delta review listed as slipping past the old pattern, plus camelCase and hyphenated spellings.
+  for (const key of [
+    "pin_code", "pinCode", "passcode", "otp_code", "totp", "bearer", "bearer_token", "signing_key", "encryption_key", "shared_key",
+    "client_key", "service_account_key", "license_key", "licenseKey", "access_key_id", "connection_string", "connectionString",
+    "hmac", "hmac_secret", "signature", "cookie", "session_id", "sessionId", "dsn", "jwt", "sas_url", "sas", "kubeconfig",
+    "webhook_url", "webhookUrl", "auth_header", "basic_auth", "cert_pem", "x-api-key", "apiKey", "ClientSecret", "accessToken",
+  ]) {
+    assert.ok(isSensitiveArgumentKey(key), `${key} is redacted`);
+  }
+  // Thresholds, durations, counts, and file references stay visible even when they mention a credential word.
+  for (const key of [
+    "token_limit", "stale_token_days", "stale_credential_days", "app_private_key_path", "credentials_file", "webhook_limit",
+    "max_keys", "min_key_length", "max_session_hours", "license_limit", "keyword", "monkey", "bypass", "compass", "certificate_count",
+  ]) {
+    assert.equal(isSensitiveArgumentKey(key), false, `${key} stays visible`);
+  }
+
   // Guard against future parameters: any declared name that even loosely smells like a credential must be
   // redacted by the pattern or be listed here as reviewed and known to be safe to print.
-  const looselySensitive = /secret|key|token|pass|auth|cert|cookie|session|credential|assertion|jwt|pin\b|otp|dsn/i;
+  const looselySensitive =
+    /secret|key|token|pass|auth|cert|cookie|session|credential|assertion|jwt|pin(?:_|\b)|otp|dsn|bearer|signature|hmac|kubeconfig|connection|webhook|\bsas\b|pem\b|license/i;
   const reviewedSafeKeys = new Set([
+    "app_private_key_path", // path to the key file, not the key
     "auth_mode", // selects an authentication strategy, not a credential
     "cert_number", // CMVP certificate number, public
+    "credentials_file", // path to the credentials file, not its contents
+    "license_limit", // count threshold
     "max_keys", // count threshold
     "max_session_hours", // duration threshold
     "oauth_base_url", // endpoint
+    "stale_credential_days", // age threshold
+    "stale_token_days", // age threshold
+    "token_limit", // count threshold
+    "webhook_limit", // count threshold
   ]);
   const unclassified = [...declaredKeys].filter(
     (key) => looselySensitive.test(key) && !isSensitiveArgumentKey(key) && !reviewedSafeKeys.has(key),
@@ -943,14 +970,68 @@ test("tool error text loses Pi's echoed payload and any sensitive value from the
   );
   assert.deepEqual(
     values,
-    [pem, "nested_secret_value", "svc@example.iam", "tok_1234567890"],
-    "everything inside a sensitive object counts, sorted longest first; short values are left to structural redaction",
+    [pem, "nested_secret_value", "svc@example.iam", "tok_1234567890", "0000"],
+    "everything inside a sensitive object counts, sorted longest first; values under four characters are dropped",
   );
   assert.equal(
     scrubSensitiveValues(`token tok_1234567890 rejected; key ${pem} and ${JSON.stringify(pem)} invalid`, values),
     `token ${REDACTED_VALUE} rejected; key ${REDACTED_VALUE} and "${REDACTED_VALUE}" invalid`,
     "raw and JSON-escaped forms are both scrubbed",
   );
+});
+
+test("scrubbing recognizes transformed echoes: encodings, reflowed PEM, case changes, short and numeric values", () => {
+  const token = "tok_Live/AbC+dEf=9Q";
+  const base64 = Buffer.from(token, "utf8").toString("base64");
+  const base64url = Buffer.from(token, "utf8").toString("base64url");
+  const urlEncoded = encodeURIComponent(token);
+  assert.notEqual(base64, base64url, "the token was chosen so that base64 and base64url differ");
+  assert.notEqual(urlEncoded, token);
+  assert.ok(scrubbedFormsOf(token).includes(base64) && scrubbedFormsOf(token).includes(base64url) && scrubbedFormsOf(token).includes(urlEncoded));
+
+  const values = collectSensitiveValues({ api_token: token });
+  const echo = `upstream said: raw ${token}; b64 ${base64}; b64url ${base64url}; url ${urlEncoded}; upper ${token.toUpperCase()}; lower ${token.toLowerCase()}`;
+  assert.equal(
+    scrubSensitiveValues(echo, values),
+    `upstream said: raw ${REDACTED_VALUE}; b64 ${REDACTED_VALUE}; b64url ${REDACTED_VALUE}; url ${REDACTED_VALUE}; upper ${REDACTED_VALUE}; lower ${REDACTED_VALUE}`,
+  );
+
+  // A PEM re-flowed by a tool: newlines turned into spaces, removed, or one body line quoted alone.
+  const body1 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+  const body2 = "MzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu";
+  const pem = `-----BEGIN PRIVATE KEY-----\n${body1}\n${body2}\n-----END PRIVATE KEY-----`;
+  const pemValues = collectSensitiveValues({ private_key: pem });
+  for (const reflowed of [pem.replace(/\n/g, " "), pem.replace(/\n/g, ""), `bad key line "${body2}"`, `lower ${body1.toLowerCase()}`]) {
+    const scrubbed = scrubSensitiveValues(reflowed, pemValues);
+    assert.equal(scrubbed.includes(body1) || scrubbed.includes(body2) || scrubbed.toLowerCase().includes(body1.toLowerCase()), false, `no body line survives in: ${scrubbed}`);
+  }
+  assert.equal(scrubSensitiveValues(pem.replace(/\n/g, " "), pemValues), REDACTED_VALUE, "a whole re-flowed PEM collapses to one marker");
+
+  // Four to seven character values are scrubbed as whole tokens only; shorter ones never are.
+  const shortValues = collectSensitiveValues({ passcode: "4711", pin: "12", otp: "918273" });
+  assert.deepEqual(shortValues, ["918273", "4711"]);
+  assert.equal(scrubSensitiveValues("passcode 4711 rejected, otp 918273 expired", shortValues), `passcode ${REDACTED_VALUE} rejected, otp ${REDACTED_VALUE} expired`);
+  assert.equal(scrubSensitiveValues("submission sub_4711abc kept, id 47119 kept", shortValues), "submission sub_4711abc kept, id 47119 kept", "short values inside longer tokens are left alone");
+  assert.equal(scrubSensitiveValues("(4711) and 4711.", shortValues), `(${REDACTED_VALUE}) and ${REDACTED_VALUE}.`, "punctuation counts as a token boundary");
+  assert.equal(scrubSensitiveValues("pin 12 wrong", shortValues), "pin 12 wrong", "values under four characters are not scrubbed");
+
+  // A numeric secret (a Duo ikey sent as a JSON number) is scrubbed in the decimal form JSON.stringify prints.
+  const numericValues = collectSensitiveValues({ ikey: 12345678901234567890, skey: 4242 });
+  assert.deepEqual(numericValues, [String(12345678901234567890), "4242"]);
+  const numericEcho = `Received: ${JSON.stringify({ ikey: 12345678901234567890, skey: 4242 })}`;
+  assert.equal(scrubSensitiveValues(numericEcho, numericValues), `Received: {"ikey":${REDACTED_VALUE},"skey":${REDACTED_VALUE}}`);
+
+  // The formatter applies all of it to a tool-authored error that echoes the input in transformed forms.
+  const format = createFlueActivityFormatter();
+  format({ type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t1", toolName: "probe", input: { api_token: token, passcode: "4711" }, position: { batch: 1, index: 0 } });
+  const line = format({
+    type: "tool-output-error",
+    conversationId: "c",
+    toolCallId: "t1",
+    errorText: `rejected ${base64} / ${urlEncoded} / ${token.toUpperCase()} / passcode 4711`,
+    position: { batch: 2, index: 0 },
+  });
+  assert.equal(line, `<- probe error: rejected ${REDACTED_VALUE} / ${REDACTED_VALUE} / ${REDACTED_VALUE} / passcode ${REDACTED_VALUE}`);
 });
 
 test("regression: gate validation errors for shipped credential tools never put the secret on stderr", () => {
