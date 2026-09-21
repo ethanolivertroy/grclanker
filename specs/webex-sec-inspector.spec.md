@@ -325,28 +325,30 @@ goreleaser release --clean
 
 ## 10. Status
 
-Implemented in grclanker (2026-09-21) as five read-only tools with 19 findings covering all 25 controls.
+Implemented in grclanker (2026-09-21) as five read-only tools with 22 findings covering all 25 controls.
 
 ### What shipped
 
 - Auth: bearer token, integration or Service App `refresh_token` grant against `POST /access_token`, config file discovery, bot token detection with admin-only controls rendered manual, and token redaction in every output.
-- Automatable controls (pass, warn, or fail from documented fields): 3 (Compliance Officer role), 14 (space classification via `classificationId`), 15 and 16 (hybrid connector `status`), 19 inventory (People `type = bot`), 20 (webhook `targetUrl` and `secret`), 24 (license `totalUnits` and `consumedUnits`), 25 (`/adminAudit/events`).
-- Manual controls with the citation proving the setting is absent from the public API and the Control Hub evidence to collect: 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18, 19 approval, 21, 22, 23.
-- Verdict safety: denied or errored endpoints, empty inventories, partial views (truncated pages, bot tokens), and undated items never pass; pagination follows `Link rel="next"` to completion and reports truncation; 429 honors `Retry-After`.
+- Automatable controls (pass, warn, or fail from documented fields): 3 (Compliance Officer role), 9 (`securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings` from `GET /admin/meeting/config/commonSettings` per site), 10 (`securityOptions.requireStrongPassword` and `passwordCriteria.minLength`, same endpoint), 13 (`securityOptions.requireLoginBeforeAccess`, same endpoint, plus a guest inventory from People `type = appuser` and `GET /guests/count`), 14 (space classification via `classificationId`), 15 and 16 (hybrid connector `status`), 19 inventory (People `type = bot`), 20 (webhook `targetUrl` and `secret`), 24 (license `totalUnits` and `consumedUnits`), 25 (`/adminAudit/events`).
+- Manual controls with the citation proving the setting is absent from the public API and the Control Hub evidence to collect: 1, 2, 4, 5, 6, 7, 8, 11, 12, 17, 18, 19 approval, 21, 22, 23.
+- Verdict safety: denied or errored endpoints, empty inventories, partial views (truncated pages, bot tokens, sites that could not be read or listed), and undated items never pass; pagination follows `Link rel="next"` to completion and reports truncation; 429 honors `Retry-After`.
 - Bundle layout: `core_data/` (redacted), `analysis/`, `compliance/` with executive summary, unified matrix, and one report per framework in section 5, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, zip named after the allocated directory with `-2`, `-3` reruns.
 - Live smoke: `npm --prefix cli run test:webex:live`.
 
 ### Deviations from this spec
 
 - `/admin/organizations/{orgId}/settings` and `/admin/organizations/{orgId}/security` do not exist in the public API; the Organizations reference documents only `id`, `displayName`, and `created`, so controls that depended on them render manual.
-- `/people` has no MFA attribute; control 2 renders manual with the admin list as evidence.
+- Org-wide meeting lobby, password, and guest access defaults (controls 9, 10, 13) are read from `GET /admin/meeting/config/commonSettings` (site reference, scope `meeting:admin_config_read`), once per site returned by `GET /meetingPreferences/sites`, instead of the per-meeting or organization endpoints this spec named.
+- Control 2 (admin MFA) stays manual by coordinator ruling: `mfaEnabled` exists only in the PATCH request schema of `/identity/organizations/{orgId}/authenticationConfig` (update-organization-authentication-configuration-settings); no GET is documented, and a read-only inspector does not PATCH. `/people` has no MFA attribute either, so the admin list is attached as evidence only.
 - Recordings are read through `/admin/recordings` (the admin and compliance officer endpoint named in the compliance guide) and expose no storage or retention fields.
 - Admin audit evidence comes from `/adminAudit/events` (`audit:events_read`), not `/events`.
-- `orgId` is sent only where documented: `/people`, `/licenses`, `/devices`, `/workspaces`, `/hybrid/clusters`, `/hybrid/connectors`, `/adminAudit/events`.
+- `orgId` is sent only where documented: `/people`, `/licenses`, `/devices`, `/workspaces`, `/hybrid/clusters`, `/hybrid/connectors`, `/adminAudit/events`. `max` is sent only where documented: `/people`, `/events`, `/adminAudit/events`, `/admin/recordings`, `/meetings`, `/devices`, `/workspaces`, `/rooms`, `/webhooks`.
 - Config file is `~/.config/webex-sec-inspector/config.json`, `.yaml`, or `.yml` instead of `config.toml`.
 - Control 22 (SRTP) stays folded into WEBEX-MTG-01 because no public API exposes a calling SRTP setting.
 - Per-resource GET endpoints are unused except `/organizations/{orgId}`; no control needs a field the list endpoints lack.
-- Reference pages on developer.webex.com are client-rendered and could not be fetched unauthenticated; field names were taken from those pages as known and cross-checked against the rendered basics, compliance, bots, integrations, and Service Apps guides.
+- Guest inventory (control 13) uses the People `type` enum, whose `appuser` value is documented as a guest user, and `GET /guests/count` (scope `guest-issuer:read`), which answers with a bare number.
+- Reference verification: the canonical `https://developer.webex.com/docs/api/v1/<category>/<page>` URL answers 302 to a category-prefixed page (`/admin/docs`, `/meeting/docs`, `/calling/docs`, `/messaging/docs`) whose server-rendered HTML embeds the OpenAPI 3.0.3 schema for every endpoint in that category. `curl -L` fetches it without a browser, and every field read by the implementation was checked against that embedded schema.
 
 ### Deferred
 
