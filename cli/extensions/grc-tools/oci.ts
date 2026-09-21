@@ -505,12 +505,14 @@ const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
 /**
  * Free-text error fields (ServiceError.message, spawn failures) can carry an
  * unlabeled credential, so scrubErrorText additionally drops every run of 16
- * or more token characters that contains a digit or base64 marker. OCIDs, CLI
- * flags, PascalCase error codes such as NotAuthorizedOrNotFound, and the
- * documented opc-request-id correlation id (validated to its charset by
+ * or more token characters (`=` separates a label from its value) that
+ * contains a digit or a base64 `+`. OCIDs, CLI flags, PascalCase error codes
+ * such as NotAuthorizedOrNotFound,
+ * embedded URLs (already reduced to host and path), and the documented
+ * opc-request-id correlation id (validated to its charset by
  * parseServiceError) are kept because verdict summaries name them.
  */
-const LONG_TOKEN_PATTERN = /\bocid1\.[A-Za-z0-9._-]+|(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{16,}(?![A-Za-z0-9+/=_-])/g;
+const LONG_TOKEN_PATTERN = /\bocid1\.[A-Za-z0-9._-]+|(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}(?![A-Za-z0-9+/_-])/g;
 const OPC_REQUEST_ID_LABEL = "opc-request-id=";
 
 function scrubEmbeddedUrl(url: string): string {
@@ -532,14 +534,27 @@ function scrubEmbeddedUrl(url: string): string {
  * and every token-shaped value, is redacted.
  */
 function redactCredentialAssignment(match: string, key: string, value: string): string {
+  if (value === REDACTED_MARKER) return match;
   if (key.toLowerCase() === "token" && /^["']?[a-z]{1,11}["']?$/.test(value)) return match;
   return `${key}=${REDACTED_MARKER}`;
 }
 
 function redactLongToken(match: string, offset: number, text: string): string {
-  if (match.startsWith("ocid1.") || match.startsWith("-") || !/[0-9+/=]/.test(match)) return match;
+  if (match.startsWith("ocid1.") || match.startsWith("-") || !/[0-9+]/.test(match)) return match;
   if (text.slice(0, offset).endsWith(OPC_REQUEST_ID_LABEL)) return match;
   return REDACTED_MARKER;
+}
+
+/** Applies the long-token rule outside embedded URLs, whose credential-bearing parts scrubEmbeddedUrl already removed. */
+function redactLongTokensOutsideUrls(text: string): string {
+  let result = "";
+  let cursor = 0;
+  for (const match of text.matchAll(EMBEDDED_URL_PATTERN)) {
+    const start = match.index ?? 0;
+    result += text.slice(cursor, start).replace(LONG_TOKEN_PATTERN, redactLongToken) + match[0];
+    cursor = start + match[0].length;
+  }
+  return result + text.slice(cursor).replace(LONG_TOKEN_PATTERN, redactLongToken);
 }
 
 function normalizeFieldName(key: string): string {
@@ -574,7 +589,7 @@ export function redactSensitiveText(text: string): string {
  * error message is free text that may quote an unlabeled credential.
  */
 export function scrubErrorText(text: string): string {
-  return redactSensitiveText(text).replace(LONG_TOKEN_PATTERN, redactLongToken);
+  return redactLongTokensOutsideUrls(redactSensitiveText(text));
 }
 
 /**
@@ -3006,21 +3021,25 @@ export async function exportOciAuditBundle(
   });
   const compartments = await collect(() => client.listCompartments());
 
-  const assessments = [identity, loggingDetection, tenancyGuardrails, computeStorage].map(scrubAssessmentForBundle);
+  const identityBundle = scrubAssessmentForBundle(identity);
+  const loggingDetectionBundle = scrubAssessmentForBundle(loggingDetection);
+  const tenancyGuardrailsBundle = scrubAssessmentForBundle(tenancyGuardrails);
+  const computeStorageBundle = scrubAssessmentForBundle(computeStorage);
+  const assessments = [identityBundle, loggingDetectionBundle, tenancyGuardrailsBundle, computeStorageBundle];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   if (compartments.error) errors.push(scrubErrorText(compartments.error));
   const targetName = safeDirName(`${config.tenancyOcid}-${config.region}-audit`);
   const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
 
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  await writeBundleText(outputDir, "README.md", buildBundleReadme());
+  await writeBundleText(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
   const bundleAccess: OciAccessCheckResult = {
     ...access,
     notes: access.notes.map((note) => note.replace(/^Using OCI config .* profile /, `Using OCI config ${REDACTED_MARKER} profile `)),
     surfaces: access.surfaces.map((item) => (item.error === undefined ? item : { ...item, error: scrubErrorText(item.error) })),
   };
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await writeBundleJson(outputDir, "metadata.json", {
     config_file: REDACTED_MARKER,
     profile: config.profile,
     region: config.region,
@@ -3036,22 +3055,22 @@ export async function exportOciAuditBundle(
       max_buckets: options.max_buckets ?? DEFAULT_MAX_BUCKETS,
       lookback_days: options.lookback_days ?? DEFAULT_LOOKBACK_DAYS,
     },
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(redactSensitiveValues(bundleAccess)));
-  await writeSecureTextFile(outputDir, "core_data/compartments.json", serializeJson(compartments.items.map(projectCompartmentSnapshot)));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/logging-detection.json", serializeJson(loggingDetection));
-  await writeSecureTextFile(outputDir, "analysis/tenancy-guardrails.json", serializeJson(tenancyGuardrails));
-  await writeSecureTextFile(outputDir, "analysis/compute-storage.json", serializeJson(computeStorage));
-  await writeSecureTextFile(outputDir, "analysis/summary.md", assessments.map(formatAssessmentText).join("\n\n"));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  });
+  await writeBundleJson(outputDir, "core_data/access.json", bundleAccess);
+  await writeBundleJson(outputDir, "core_data/compartments.json", compartments.items.map(projectCompartmentSnapshot));
+  await writeBundleJson(outputDir, "analysis/findings.json", findings);
+  await writeBundleJson(outputDir, "analysis/identity.json", identityBundle);
+  await writeBundleJson(outputDir, "analysis/logging-detection.json", loggingDetectionBundle);
+  await writeBundleJson(outputDir, "analysis/tenancy-guardrails.json", tenancyGuardrailsBundle);
+  await writeBundleJson(outputDir, "analysis/compute-storage.json", computeStorageBundle);
+  await writeBundleText(outputDir, "analysis/summary.md", assessments.map(formatAssessmentText).join("\n\n"));
+  await writeBundleText(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeBundleText(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const report of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, report.path, buildFrameworkReport(report.title, report.prefix, findings));
+    await writeBundleText(outputDir, report.path, buildFrameworkReport(report.title, report.prefix, findings));
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeBundleText(outputDir, "_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = `${outputDir}.zip`;
