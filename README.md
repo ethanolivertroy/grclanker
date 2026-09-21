@@ -136,11 +136,13 @@ grclanker flue run --message "Is BoringCrypto FIPS validated?"
 grclanker flue run --message "Now check KEV exposure" --id fips-review --json
 ```
 
-Official Flue CLI (from the `cli/` directory, Node 22.19 or newer):
+Official Flue CLI (from a repo checkout, in the `cli/` directory after `npm install`, Node 22.19 or newer):
 
 ```bash
-npx @flue/cli run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
+npx flue run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
 ```
+
+`@flue/cli` is a devDependency of the CLI package on purpose: the CLI must share the project's `@flue/runtime` install. Running a separately downloaded copy (for example `npx @flue/cli run ...` without the local install) loads a second runtime and fails with an internal hook error.
 
 Configuration:
 

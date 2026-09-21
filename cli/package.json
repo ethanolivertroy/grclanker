@@ -78,6 +78,7 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@flue/cli": "^2.1.0",
     "@types/archiver": "^8.0.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"

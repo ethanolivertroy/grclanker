@@ -42,14 +42,16 @@ The reply prints to stdout. Tool activity and the conversation id print to stder
 
 ## Run with the official Flue CLI
 
-The agent module is `cli/flue/agent.ts`, a `'use agent'` module that exports one agent named `grclanker`. From the `cli/` directory, with Node.js 22.19 or newer:
+The agent module is `cli/flue/agent.ts`, a `'use agent'` module that exports one agent named `grclanker`. `@flue/cli` is a devDependency of the CLI package, so from a repo checkout, in the `cli/` directory after `npm install`, with Node.js 22.19 or newer:
 
 ```bash
-npx @flue/cli run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
-npx @flue/cli run flue/agent.ts --message "Any update?" --id fips-review
+npx flue run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
+npx flue run flue/agent.ts --message "Any update?" --id fips-review
 ```
 
-`flue run` loads the TypeScript module directly, resolves `@flue/runtime` from `cli/node_modules`, and stores conversations in `node_modules/.cache/flue/run.db` unless a `flue.config.*` database entry says otherwise. The same module can be mounted in a Flue application with `createAgentRouter()` if you want it behind HTTP.
+`flue run` loads the TypeScript module directly and stores conversations in `node_modules/.cache/flue/run.db` unless a `flue.config.*` database entry says otherwise. The same module can be mounted in a Flue application with `createAgentRouter()` if you want it behind HTTP.
+
+The CLI has to be installed next to the runtime it drives. `@flue/runtime` publishes import-only package exports, which defeats the CLI's single-copy resolver, so a separately downloaded CLI (for example `npx @flue/cli run ...` in a checkout without the devDependency) loads its own runtime copy and the agent's hooks fail with `useModel() was called outside an agent function`. Keep the devDependency, or install `@flue/cli` into the same `node_modules` before running it.
 
 ## Configuration
 
