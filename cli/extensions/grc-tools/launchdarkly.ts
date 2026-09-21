@@ -170,10 +170,24 @@ interface SensitiveActionGroup {
 interface EnvironmentContext {
   projectKey: string;
   projectName: string;
+  projectTags: string[];
   environment: JsonRecord;
   key: string;
   name: string;
   production: boolean;
+}
+
+interface ResourceSegment {
+  type: string;
+  name: string;
+  tags: string[];
+  selectors: Record<string, string>;
+}
+
+interface EnvironmentRestriction {
+  role: string;
+  kind: "deny" | "not_resources" | "scoped_elsewhere";
+  resource: string;
 }
 
 type AuthArgs = {
@@ -1921,6 +1935,7 @@ async function collectEnvironmentContexts(
       environments.push({
         projectKey,
         projectName: asString(project.name) ?? projectKey,
+        projectTags: asStringArray(project.tags),
         environment,
         key,
         name,
@@ -1937,14 +1952,160 @@ function environmentLabel(context: EnvironmentContext): string {
   return `${context.projectKey}/${context.key}`;
 }
 
-function roleRestrictsEnvironment(statements: PolicyStatement[], context: EnvironmentContext): boolean {
-  const referencesEnvironment = (resource: string) => {
-    const lowered = resource.toLowerCase();
-    return lowered.includes(`env/${context.key.toLowerCase()}`) || lowered.includes("{critical:true}");
-  };
-  return statements.some((statement) =>
-    (statement.effect === "deny" && statement.resources.some(referencesEnvironment))
-    || (statement.effect === "allow" && statement.notResources.some(referencesEnvironment)));
+function splitResourceSegments(resource: string): string[] {
+  const segments: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const char of resource) {
+    if (char === "{") depth += 1;
+    if (char === "}") depth = Math.max(0, depth - 1);
+    if (char === ":" && depth === 0) {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  segments.push(current);
+  return segments;
+}
+
+function mergeBareSelectorSegments(segments: string[]): string[] {
+  const merged: string[] = [];
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (merged.length > 0 && trimmed !== "*" && !trimmed.includes("/")) {
+      merged[merged.length - 1] = `${merged[merged.length - 1]}:${trimmed}`;
+      continue;
+    }
+    merged.push(trimmed);
+  }
+  return merged;
+}
+
+function parseResourceSegment(raw: string): ResourceSegment {
+  const [head, ...filterParts] = raw.replace(/^\/+/, "").split(";");
+  const slash = head.indexOf("/");
+  const type = (slash === -1 ? head : head.slice(0, slash)).toLowerCase();
+  const name = slash === -1 ? "*" : head.slice(slash + 1);
+  const tags: string[] = [];
+  const selectors: Record<string, string> = {};
+  for (const item of filterParts.join(";").split(",")) {
+    const filter = item.trim();
+    if (!filter) continue;
+    const selector = filter.replace(/^\{/, "").replace(/\}$/, "");
+    const colon = selector.indexOf(":");
+    if (colon > 0) {
+      selectors[selector.slice(0, colon).trim().toLowerCase()] = selector.slice(colon + 1).trim().toLowerCase();
+    } else {
+      tags.push(filter);
+    }
+  }
+  return { type, name, tags, selectors };
+}
+
+function parseResourceSpecifier(resource: string): ResourceSegment[] {
+  return mergeBareSelectorSegments(splitResourceSegments(resource.trim()))
+    .filter((segment) => segment.length > 0)
+    .map(parseResourceSegment);
+}
+
+function globMatches(pattern: string, value: string): boolean {
+  return actionMatches(pattern.toLowerCase(), value.toLowerCase());
+}
+
+function tagsMatch(patterns: string[], tags: string[]): boolean {
+  return patterns.every((pattern) => tags.some((tag) => globMatches(pattern, tag)));
+}
+
+function environmentSegmentMatches(segment: ResourceSegment, context: EnvironmentContext): boolean | undefined {
+  if (!globMatches(segment.name, context.key)) return false;
+  if (!tagsMatch(segment.tags, asStringArray(context.environment.tags))) return false;
+  let unknownSelector = false;
+  for (const [selector, value] of Object.entries(segment.selectors)) {
+    if (selector === "critical") {
+      const critical = asBoolean(context.environment.critical) === true;
+      if ((value === "true") !== critical) return false;
+    } else {
+      unknownSelector = true;
+    }
+  }
+  return unknownSelector ? undefined : true;
+}
+
+function projectSegmentMatches(segment: ResourceSegment | undefined, context: EnvironmentContext): boolean {
+  if (!segment) return true;
+  return globMatches(segment.name, context.projectKey) && tagsMatch(segment.tags, context.projectTags);
+}
+
+function resourceIsEnvironmentScoped(resource: string): boolean {
+  return parseResourceSpecifier(resource).some((segment) => segment.type === "env");
+}
+
+function resourceRestrictsEnvironment(resource: string, context: EnvironmentContext): boolean {
+  if (resource.trim() === "*") return true;
+  const segments = parseResourceSpecifier(resource);
+  const environment = segments.find((segment) => segment.type === "env");
+  if (!environment || !projectSegmentMatches(segments.find((segment) => segment.type === "proj"), context)) return false;
+  return environmentSegmentMatches(environment, context) === true;
+}
+
+function resourceCoversEnvironment(resource: string, context: EnvironmentContext): boolean {
+  if (resource.trim() === "*") return true;
+  const segments = parseResourceSpecifier(resource);
+  const project = segments.find((segment) => segment.type === "proj");
+  if (!project || !projectSegmentMatches(project, context)) return false;
+  const environment = segments.find((segment) => segment.type === "env");
+  if (!environment) return true;
+  return environmentSegmentMatches(environment, context) !== false;
+}
+
+function statementCoversEnvironment(statement: PolicyStatement, context: EnvironmentContext): boolean {
+  if (statement.resources.length > 0) {
+    return statement.resources.some((resource) => resourceCoversEnvironment(resource, context));
+  }
+  if (statement.notResources.length > 0) {
+    return !statement.notResources.some((resource) => resourceRestrictsEnvironment(resource, context));
+  }
+  return false;
+}
+
+function roleEnvironmentRestrictions(
+  role: string,
+  statements: PolicyStatement[],
+  context: EnvironmentContext,
+): EnvironmentRestriction[] {
+  const restrictions: EnvironmentRestriction[] = [];
+  for (const statement of statements) {
+    if (statement.effect === "deny") {
+      const resource = statement.resources.find((candidate) => resourceRestrictsEnvironment(candidate, context));
+      if (resource) restrictions.push({ role, kind: "deny", resource });
+      continue;
+    }
+    const excluded = statement.notResources.find((candidate) => resourceRestrictsEnvironment(candidate, context));
+    if (excluded) restrictions.push({ role, kind: "not_resources", resource: excluded });
+  }
+  const allows = statements.filter((statement) => statement.effect === "allow");
+  const scopedAllow = allows.find((statement) => statement.resources.some(resourceIsEnvironmentScoped));
+  if (scopedAllow && !allows.some((statement) => statementCoversEnvironment(statement, context))) {
+    restrictions.push({ role, kind: "scoped_elsewhere", resource: scopedAllow.resources.find(resourceIsEnvironmentScoped) ?? scopedAllow.resources[0] });
+  }
+  return restrictions;
+}
+
+function restrictionLabel(restriction: EnvironmentRestriction): string {
+  switch (restriction.kind) {
+    case "deny":
+      return `${restriction.role}: deny ${restriction.resource}`;
+    case "not_resources":
+      return `${restriction.role}: allow excludes ${restriction.resource}`;
+    case "scoped_elsewhere":
+      return `${restriction.role}: allow scoped to ${restriction.resource}`;
+    default: {
+      const exhaustive: never = restriction.kind;
+      return exhaustive;
+    }
+  }
 }
 
 export async function assessLaunchdarklyEnvironmentGovernance(
@@ -1964,8 +2125,11 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
   });
-  const roles = await collect(errors, "custom_roles", () => client.listCustomRoles(DEFAULT_ROLE_LIMIT), [] as JsonRecord[]);
-  const roleStatements = roles.map((role) => parseStatements(role.policy));
+  const roleErrors: string[] = [];
+  const roles = await collect(roleErrors, "custom_roles", () => client.listCustomRoles(DEFAULT_ROLE_LIMIT), [] as JsonRecord[]);
+  errors.push(...roleErrors);
+  const rolesReadable = roleErrors.length === 0;
+  const roleStatements = roles.map((role) => ({ key: roleKey(role), statements: parseStatements(role.policy) }));
 
   const productionEnvironments = environments.filter((context) => context.production);
   const sdkKeyResults = await Promise.all(environments.map(async (context) => {
@@ -1994,9 +2158,16 @@ export async function assessLaunchdarklyEnvironmentGovernance(
       is_default: asBoolean(key.isDefault) === true,
     })));
 
-  const unrestrictedProduction = productionEnvironments.filter((context) =>
-    asBoolean(context.environment.critical) !== true
-    && !roleStatements.some((statements) => roleRestrictsEnvironment(statements, context)));
+  const productionRestrictions = productionEnvironments.map((context) => ({
+    context,
+    critical: asBoolean(context.environment.critical) === true,
+    restrictions: roleStatements.flatMap((role) => roleEnvironmentRestrictions(role.key, role.statements, context)),
+  }));
+  const restrictedProduction = productionRestrictions.filter((entry) => entry.restrictions.length > 0);
+  const criticalOnlyProduction = productionRestrictions.filter((entry) => entry.restrictions.length === 0 && entry.critical);
+  const unrestrictedProduction = productionRestrictions
+    .filter((entry) => entry.restrictions.length === 0 && !entry.critical)
+    .map((entry) => entry.context);
 
   const approvalsMissing = productionEnvironments.filter((context) =>
     asBoolean(asObject(context.environment.approvalSettings)?.required) !== true);
@@ -2033,14 +2204,26 @@ export async function assessLaunchdarklyEnvironmentGovernance(
   const findings: LaunchdarklyFinding[] = [
     buildFinding(
       16,
-      productionEnvironments.length === 0 ? "warn" : unrestrictedProduction.length === 0 ? "pass" : "fail",
+      productionEnvironments.length === 0 || !rolesReadable
+        ? "warn"
+        : unrestrictedProduction.length > 0 ? "fail" : criticalOnlyProduction.length > 0 ? "warn" : "pass",
       productionEnvironments.length === 0
         ? noProductionSummary
-        : unrestrictedProduction.length === 0
-          ? `All ${productionEnvironments.length} production environments are marked critical or are explicitly restricted by custom role policy statements.`
-          : `${unrestrictedProduction.length}/${productionEnvironments.length} production environments are neither marked critical nor restricted by any custom role deny or notResources statement.`,
+        : !rolesReadable
+          ? `Custom roles could not be read (${roleErrors[0]}), so role-based access restrictions on the ${productionEnvironments.length} production environments could not be evaluated.`
+          : unrestrictedProduction.length > 0
+            ? `${unrestrictedProduction.length}/${productionEnvironments.length} production environments are not restricted by any custom role statement that denies, excludes, or scopes actions away from them${criticalOnlyProduction.length > 0 ? `, and ${criticalOnlyProduction.length} more rely on the critical designation alone` : ""}.`
+            : criticalOnlyProduction.length > 0
+              ? `${criticalOnlyProduction.length}/${productionEnvironments.length} production environments are marked critical, which only enables safeguards and UI prompts; no custom role denies, excludes, or scopes actions away from them (for example a deny on proj/*:env/*;{critical:true}:flag/*).`
+              : `All ${productionEnvironments.length} production environments are restricted by custom role statements that deny, exclude, or scope actions away from them (${roles.length} custom roles evaluated).`,
       {
         production_environments: sample(productionEnvironments.map(environmentLabel)),
+        restricted_production_environments: sample(restrictedProduction.map((entry) => ({
+          environment: environmentLabel(entry.context),
+          critical: entry.critical,
+          restrictions: sample(entry.restrictions.map(restrictionLabel)),
+        }))),
+        critical_only_production_environments: sample(criticalOnlyProduction.map((entry) => environmentLabel(entry.context))),
         unrestricted_production_environments: sample(unrestrictedProduction.map(environmentLabel)),
         custom_roles_evaluated: roles.length,
       },
@@ -2132,6 +2315,8 @@ export async function assessLaunchdarklyEnvironmentGovernance(
       projects: projects.length,
       environments: environments.length,
       production_environments: productionEnvironments.length,
+      restricted_production_environments: restrictedProduction.length,
+      critical_only_production_environments: criticalOnlyProduction.length,
       unrestricted_production_environments: unrestrictedProduction.length,
       approvals_missing: approvalsMissing.length,
       stale_sdk_keys: staleSdkKeys.length,

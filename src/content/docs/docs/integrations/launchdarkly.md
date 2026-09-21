@@ -64,6 +64,8 @@ Every tool accepts the shared auth arguments `token`, `base_url`, `api_version`,
 
 Production environments are those flagged `critical` in LaunchDarkly or whose key or name matches `production_pattern` (default `prod`, case-insensitive).
 
+Control 16 evaluates custom role policies with a resource specifier parser that follows the documented `proj/<key>:env/<key>;tag1,tag2,{selector:value}` syntax: project and environment keys support `*` globs, tags must all be present on the environment, and the `{critical:true}` property-based selector matches environments marked critical. The bare form `proj/*:env/*;critical:true:flag/*` is accepted as an alias for the documented `proj/*:env/*;{critical:true}:flag/*`.
+
 ### Export bundle layout
 
 ```text
@@ -120,7 +122,7 @@ An unreadable endpoint never produces a `pass`; it produces `warn` or `manual` a
 | 13 | Audit log events present for critical actions | `launchdarkly_assess_monitoring_integrations` | LD-13 | `pass` when member or role entries carry critical actions; `warn` when none were returned; `fail` when unreadable. |
 | 14 | Flag targeting rules do not expose individual user keys in production | `launchdarkly_assess_flag_hygiene` | LD-14 | `fail` when production flags carry `targets` or `contextTargets` values; `warn` when no production flags were readable. |
 | 15 | Stale flags identified (> 30 days) | `launchdarkly_assess_flag_hygiene` | LD-15 | `warn` when flags are inactive or unrequested beyond `stale_flag_days`. |
-| 16 | Environment-level access controls restrict production modifications | `launchdarkly_assess_environment_governance` | LD-16 | `fail` when a production environment is neither `critical` nor referenced by a custom role deny or `notResources` statement. |
+| 16 | Environment-level access controls restrict production modifications | `launchdarkly_assess_environment_governance` | LD-16 | `pass` only when every production environment is restricted by a custom role statement (a `deny` or `notResources` entry whose resource specifier matches it, or a role whose environment-scoped allows never cover it); `warn` when the environment relies on the `critical` designation alone, which only enables safeguards; `fail` when a non-critical production environment has no role restriction. |
 | 17 | Approval workflows enabled for production changes | `launchdarkly_assess_environment_governance` | LD-17 | `fail` when `approvalSettings.required` is false; `warn` when bypass or self review is allowed. |
 | 18 | Relay proxy configurations use secure mode | `launchdarkly_assess_monitoring_integrations` | LD-18 | `fail` for wildcard project or environment scope or referenced production environments without secure mode; `warn` when unmodified beyond `relay_config_max_age_days`; `manual` when no automatic configurations exist. |
 | 19 | SDK keys rotated within policy period (< 365 days) | `launchdarkly_assess_environment_governance` | LD-19 | `fail` when server-side keys exceed `sdk_key_max_age_days`; `manual` when the beta SDK keys endpoint is unreadable. |
@@ -172,6 +174,8 @@ The script prints a skip message and exits 0 when no token or config file is pre
 - [Integration audit log subscriptions](https://launchdarkly.com/docs/api/integration-audit-log-subscriptions)
 - [API migration guide (flag `env` filter behavior)](https://launchdarkly.com/docs/guides/api/api-migration-guide)
 - [Role resources syntax](https://launchdarkly.com/docs/home/account/roles/role-resources)
+- [Role concepts, including the `{critical:true}` property-based selector](https://launchdarkly.com/docs/home/account/roles/role-concepts#property-based-selectors)
+- [Critical environments (safeguards versus custom role access)](https://launchdarkly.com/docs/home/account/environment#critical-environments)
 - [Role actions reference](https://launchdarkly.com/docs/home/account/roles/role-actions)
 - [Multi-factor authentication](https://launchdarkly.com/docs/home/account/mfa)
 - [Enable SAML SSO](https://launchdarkly.com/docs/home/account/saml/enable)

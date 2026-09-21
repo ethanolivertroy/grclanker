@@ -135,7 +135,7 @@ function healthyClient(overrides = {}) {
           basePermissions: "no_access",
           policy: [
             { effect: "allow", actions: ["updateOn", "updateRules"], resources: ["proj/*:env/production:flag/*"] },
-            { effect: "deny", actions: ["updateOn"], resources: ["proj/*:env/*;critical:true:flag/*"] },
+            { effect: "deny", actions: ["updateOn"], resources: ["proj/*:env/*;{critical:true}:flag/*"] },
           ],
         },
       ];
@@ -670,6 +670,120 @@ test("assessLaunchdarklyEnvironmentGovernance passes hardened production environ
     assert.equal(findingStatus(result, id), "pass", `${id} should pass`);
   }
   assert.equal(result.summary.production_environments, 1);
+  assert.equal(result.summary.restricted_production_environments, 1);
+  assert.deepEqual(finding(result, "LD-16").evidence.restricted_production_environments, [
+    {
+      environment: "web/production",
+      critical: true,
+      restrictions: ["release-manager: deny proj/*:env/*;{critical:true}:flag/*"],
+    },
+  ]);
+});
+
+function governanceClient(roles, environmentOverrides = {}) {
+  return healthyClient({
+    async listCustomRoles() {
+      return roles;
+    },
+    async listEnvironments() {
+      return [
+        {
+          key: "production",
+          name: "Production",
+          critical: true,
+          secureMode: true,
+          defaultTtl: 5,
+          confirmChanges: true,
+          requireComments: true,
+          approvalSettings: { required: true, bypassApprovalsForPendingChanges: false, canReviewOwnRequest: false, minNumApprovals: 1 },
+          ...environmentOverrides,
+        },
+        { key: "staging", name: "Staging", critical: false, secureMode: false, defaultTtl: 0 },
+      ];
+    },
+  });
+}
+
+test("assessLaunchdarklyEnvironmentGovernance does not pass LD-16 when critical is the only production qualifier", async () => {
+  const result = await assessLaunchdarklyEnvironmentGovernance(governanceClient([
+    { key: "dev", basePermissions: "no_access", policy: [{ effect: "allow", actions: ["updateOn"], resources: ["proj/*:env/*:flag/*"] }] },
+  ]), { now: NOW });
+
+  assert.notEqual(findingStatus(result, "LD-16"), "pass");
+  assert.equal(findingStatus(result, "LD-16"), "warn");
+  assert.match(finding(result, "LD-16").summary, /marked critical, which only enables safeguards/);
+  assert.deepEqual(finding(result, "LD-16").evidence.critical_only_production_environments, ["web/production"]);
+  assert.deepEqual(finding(result, "LD-16").evidence.restricted_production_environments, []);
+  assert.equal(result.summary.critical_only_production_environments, 1);
+
+  const noRoles = await assessLaunchdarklyEnvironmentGovernance(governanceClient([]), { now: NOW });
+  assert.equal(findingStatus(noRoles, "LD-16"), "warn");
+  assert.equal(finding(noRoles, "LD-16").evidence.custom_roles_evaluated, 0);
+});
+
+test("assessLaunchdarklyEnvironmentGovernance parses role resource specifiers when matching production restrictions", async () => {
+  const restrictionFor = async (roles, environmentOverrides) => {
+    const result = await assessLaunchdarklyEnvironmentGovernance(governanceClient(roles, environmentOverrides), { now: NOW });
+    return {
+      status: findingStatus(result, "LD-16"),
+      restrictions: finding(result, "LD-16").evidence.restricted_production_environments.flatMap((entry) => entry.restrictions),
+    };
+  };
+  const denyOn = (resource) => [
+    { key: "guard", basePermissions: "no_access", policy: [{ effect: "deny", actions: ["updateOn"], resources: [resource] }] },
+  ];
+
+  assert.deepEqual(await restrictionFor(denyOn("proj/*:env/*;{critical:true}:flag/*")), {
+    status: "pass",
+    restrictions: ["guard: deny proj/*:env/*;{critical:true}:flag/*"],
+  });
+  assert.deepEqual(await restrictionFor(denyOn("proj/*:env/*;critical:true:flag/*")), {
+    status: "pass",
+    restrictions: ["guard: deny proj/*:env/*;critical:true:flag/*"],
+  });
+  assert.deepEqual(await restrictionFor(denyOn("proj/web:env/production:flag/*")), {
+    status: "pass",
+    restrictions: ["guard: deny proj/web:env/production:flag/*"],
+  });
+  assert.deepEqual(await restrictionFor(denyOn("proj/*:env/prod*:segment/*")), {
+    status: "pass",
+    restrictions: ["guard: deny proj/*:env/prod*:segment/*"],
+  });
+  assert.deepEqual(await restrictionFor(denyOn("proj/*:env/*;tier-1:flag/*"), { tags: ["tier-1", "pci"] }), {
+    status: "pass",
+    restrictions: ["guard: deny proj/*:env/*;tier-1:flag/*"],
+  });
+
+  assert.equal((await restrictionFor(denyOn("proj/*:env/staging:flag/*"))).status, "warn");
+  assert.equal((await restrictionFor(denyOn("proj/mobile:env/production:flag/*"))).status, "warn");
+  assert.equal((await restrictionFor(denyOn("proj/*:env/*;{critical:false}:flag/*"))).status, "warn");
+  assert.equal((await restrictionFor(denyOn("proj/*:env/*;tier-2:flag/*"), { tags: ["tier-1"] })).status, "warn");
+  assert.equal((await restrictionFor(denyOn("proj/*"))).status, "warn");
+
+  assert.deepEqual(await restrictionFor([
+    { key: "release", basePermissions: "no_access", policy: [{ effect: "allow", actions: ["updateOn"], notResources: ["proj/*:env/*;{critical:true}:flag/*"] }] },
+  ]), { status: "pass", restrictions: ["release: allow excludes proj/*:env/*;{critical:true}:flag/*"] });
+  assert.deepEqual(await restrictionFor([
+    { key: "qa", basePermissions: "no_access", policy: [{ effect: "allow", actions: ["updateOn", "updateRules"], resources: ["proj/*:env/staging:flag/*"] }] },
+  ]), { status: "pass", restrictions: ["qa: allow scoped to proj/*:env/staging:flag/*"] });
+  assert.equal((await restrictionFor([
+    {
+      key: "qa-plus",
+      basePermissions: "no_access",
+      policy: [
+        { effect: "allow", actions: ["updateOn"], resources: ["proj/*:env/staging:flag/*"] },
+        { effect: "allow", actions: ["updateRules"], resources: ["proj/*:env/*:flag/*"] },
+      ],
+    },
+  ])).status, "warn");
+
+  const unreadable = await assessLaunchdarklyEnvironmentGovernance(healthyClient({
+    async listCustomRoles() {
+      throw new Error("LaunchDarkly request failed (403 Forbidden) for GET /api/v2/roles");
+    },
+  }), { now: NOW });
+  assert.equal(findingStatus(unreadable, "LD-16"), "warn");
+  assert.match(finding(unreadable, "LD-16").summary, /Custom roles could not be read/);
 });
 
 test("assessLaunchdarklyEnvironmentGovernance flags unrestricted production, missing approvals, old SDK keys, and test projects", async () => {
