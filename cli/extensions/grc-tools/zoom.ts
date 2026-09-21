@@ -2076,16 +2076,12 @@ function booleanControl(
   const surface = settingsUnreadable(bundle, labels.surfaceName);
   const setting = readSetting(bundle, path);
   const locked = readLock(bundle, labels.lockPath ?? path);
-  const relaxed = groupsRelaxing(snapshot, path, compliantValue);
-  const unreadableGroups = groupsUnreadable(snapshot);
-  const groupsTruncated = snapshot.groups.status === "ok" && listSurfaceState(snapshot.groups).truncated;
+  const groups = groupOverrideState(snapshot, groupsRelaxing(snapshot, path, compliantValue));
   const evidence = {
     [path]: setting.value ?? null,
     locked: locked ?? null,
     groups_sampled: snapshot.groupPolicies.length,
-    groups_relaxing: relaxed.slice(0, 25),
-    groups_unreadable: unreadableGroups.slice(0, 25),
-    groups_truncated: groupsTruncated,
+    ...groups.evidence,
     ...extraEvidence,
   };
   if (surface) {
@@ -2097,40 +2093,40 @@ function booleanControl(
   if (setting.value !== compliantValue) {
     return finding(id, title, severity, controls, "fail", `${path} is ${String(setting.value)}: ${labels.nonCompliant}`, evidence);
   }
-  const notes = [`${path} is ${String(compliantValue)}: ${labels.compliant}`, lockNote(locked, path)];
-  let status: ZoomFindingStatus = locked === true ? "pass" : "warn";
-  if (relaxed.length > 0) {
-    status = "warn";
-    notes.push(`${relaxed.length} sampled groups override it: ${relaxed.slice(0, 5).join(", ")}.`);
-  }
-  if (unreadableGroups.length > 0) {
-    status = "warn";
-    notes.push(`${unreadableGroups.length} group settings surfaces were unreadable, so group overrides are unproven.`);
-  }
-  if (groupsTruncated) {
-    status = "warn";
-    notes.push(groupTruncationNote(snapshot));
-  }
-  return finding(id, title, severity, controls, status, notes.join(" "), evidence);
+  const status: ZoomFindingStatus = locked === true && !groups.demote ? "pass" : "warn";
+  const summary = [`${path} is ${String(compliantValue)}: ${labels.compliant}`, lockNote(locked, path), groups.note].filter(Boolean).join(" ");
+  return finding(id, title, severity, controls, status, summary, evidence);
 }
 
 function groupInventoryTruncated(snapshot: ZoomSnapshot): boolean {
   return snapshot.groups.status === "ok" && listSurfaceState(snapshot.groups).truncated;
 }
 
-/** Group overrides, unreadable group surfaces, or a truncated group inventory all block pass. */
+/**
+ * Every group-dependent verdict goes through this helper: group overrides,
+ * unreadable group settings surfaces, a denied or failed GET /groups, or a
+ * truncated group inventory all block pass. A skipped group list (the
+ * collaboration tool run alone) leaves the verdict to the account lock.
+ */
 function groupOverrideState(snapshot: ZoomSnapshot, relaxed: string[]): { demote: boolean; note: string; evidence: JsonRecord } {
   const unreadable = groupsUnreadable(snapshot);
   const truncated = groupInventoryTruncated(snapshot);
+  const listUnreadable = snapshot.groups.status === "denied" || snapshot.groups.status === "error";
   const notes = [
     relaxed.length > 0 ? `${relaxed.length} sampled groups override it: ${relaxed.slice(0, 5).join(", ")}.` : "",
+    listUnreadable ? `Group overrides could not be checked: ${surfaceCause(snapshot.groups)}.` : "",
     unreadable.length > 0 ? `${unreadable.length} group settings surfaces were unreadable, so group overrides are unproven.` : "",
     truncated ? groupTruncationNote(snapshot) : "",
   ].filter(Boolean);
   return {
     demote: notes.length > 0,
     note: notes.join(" "),
-    evidence: { groups_relaxing: relaxed.slice(0, 25), groups_unreadable: unreadable.slice(0, 25), groups_truncated: truncated },
+    evidence: {
+      groups_list_status: snapshot.groups.status,
+      groups_relaxing: relaxed.slice(0, 25),
+      groups_unreadable: unreadable.slice(0, 25),
+      groups_truncated: truncated,
+    },
   };
 }
 
@@ -2303,10 +2299,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const pmiScheduledLocked = readLock(bundle, "schedule_meeting.use_pmi_for_scheduled_meetings");
   const pmiInstantLocked = readLock(bundle, "schedule_meeting.use_pmi_for_instant_meetings");
   const pmiLocked = pmiScheduledLocked === true && pmiInstantLocked === true;
-  const pmiRelaxedGroups = [...new Set([
+  const pmiGroups = groupOverrideState(snapshot, [...new Set([
     ...groupsRelaxing(snapshot, "schedule_meeting.use_pmi_for_scheduled_meetings", false),
     ...groupsRelaxing(snapshot, "schedule_meeting.use_pmi_for_instant_meetings", false),
-  ])];
+  ])]);
   const pmiEvidence = {
     use_pmi_for_scheduled_meetings: pmiScheduled.value ?? null,
     use_pmi_for_instant_meetings: pmiInstant.value ?? null,
@@ -2314,8 +2310,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
     require_password_for_pmi_meetings: readSetting(bundle, "schedule_meeting.require_password_for_pmi_meetings").value ?? null,
     use_pmi_for_scheduled_meetings_locked: pmiScheduledLocked ?? null,
     use_pmi_for_instant_meetings_locked: pmiInstantLocked ?? null,
-    groups_relaxing: pmiRelaxedGroups.slice(0, 25),
-    groups_truncated: groupInventoryTruncated(snapshot),
+    ...pmiGroups.evidence,
   };
   const pmiCompliant = personalMeeting.value === false || (pmiScheduled.value === false && pmiInstant.value === false);
   findings.push(finding(
@@ -2329,7 +2324,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
         ? "manual"
         : !pmiCompliant
           ? "fail"
-          : pmiLocked && pmiRelaxedGroups.length === 0 && !groupInventoryTruncated(snapshot)
+          : pmiLocked && !pmiGroups.demote
             ? "pass"
             : "warn",
     pmiSurface
@@ -2343,8 +2338,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
               ? "schedule_meeting.personal_meeting is false: Personal Meeting IDs are disabled for the account."
               : "PMI is not used for scheduled or instant meetings (use_pmi_for_scheduled_meetings and use_pmi_for_instant_meetings are false).",
             pmiLocked ? "Both PMI settings are locked at account level." : "The PMI settings are not both locked in lock_settings, so groups may re-enable PMI.",
-            pmiRelaxedGroups.length > 0 ? `${pmiRelaxedGroups.length} sampled groups override it: ${pmiRelaxedGroups.slice(0, 5).join(", ")}.` : "",
-            groupInventoryTruncated(snapshot) ? groupTruncationNote(snapshot) : "",
+            pmiGroups.note,
           ].filter(Boolean).join(" "),
     pmiEvidence,
   ));
@@ -2372,7 +2366,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const regionList = asArray(regions.value).map(asString).filter((item): item is string => Boolean(item));
   const regionSurface = settingsUnreadable(bundle);
   const regionsLocked = readLock(bundle, "in_meeting.custom_data_center_regions");
-  const regionRelaxedGroups = groupsRelaxing(snapshot, "in_meeting.custom_data_center_regions", true);
+  const regionGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "in_meeting.custom_data_center_regions", true));
   findings.push(finding(
     "ZOOM-MTG-09",
     "Data routing control enabled",
@@ -2386,7 +2380,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
           ? "fail"
           : regionList.length === 0
             ? "warn"
-            : regionsLocked === true && regionRelaxedGroups.length === 0 && !groupInventoryTruncated(snapshot)
+            : regionsLocked === true && !regionGroups.demote
               ? "pass"
               : "warn",
     regionSurface
@@ -2397,8 +2391,8 @@ export function assessZoomMeetingSecurityFromSnapshot(
           ? "in_meeting.custom_data_center_regions is false: meeting traffic may route through any Zoom data center region."
           : regionList.length === 0
             ? "in_meeting.custom_data_center_regions is true but in_meeting.data_center_regions is empty or absent, so the allowed regions are unknown."
-            : `Custom data center regions are enabled and limited to: ${regionList.join(", ")}. ${lockNote(regionsLocked, "in_meeting.custom_data_center_regions")}${regionRelaxedGroups.length > 0 ? ` ${regionRelaxedGroups.length} sampled groups override it: ${regionRelaxedGroups.slice(0, 5).join(", ")}.` : ""}${groupInventoryTruncated(snapshot) ? ` ${groupTruncationNote(snapshot)}` : ""}`,
-    { custom_data_center_regions: customRegions.value ?? null, data_center_regions: regionList, locked: regionsLocked ?? null, groups_relaxing: regionRelaxedGroups.slice(0, 25), groups_truncated: groupInventoryTruncated(snapshot) },
+            : [`Custom data center regions are enabled and limited to: ${regionList.join(", ")}.`, lockNote(regionsLocked, "in_meeting.custom_data_center_regions"), regionGroups.note].filter(Boolean).join(" "),
+    { custom_data_center_regions: customRegions.value ?? null, data_center_regions: regionList, locked: regionsLocked ?? null, ...regionGroups.evidence },
   ));
 
   const disclaimerSurface = settingsUnreadable(bundle);
@@ -2412,22 +2406,16 @@ export function assessZoomMeetingSecurityFromSnapshot(
       return value !== undefined && !/all participants/i.test(value);
     })
     .map((policy) => policy.name);
-  const disclaimerGroupsUnreadable = groupsUnreadable(snapshot);
-  const disclaimerGroupsTruncated = snapshot.groups.status === "ok" && listSurfaceState(snapshot.groups).truncated;
-  const disclaimerNotes = [
-    disclaimerGroupsRelaxing.length > 0 ? `${disclaimerGroupsRelaxing.length} sampled groups select a different disclaimer option: ${disclaimerGroupsRelaxing.slice(0, 5).join(", ")}.` : "",
-    disclaimerGroupsUnreadable.length > 0 ? `${disclaimerGroupsUnreadable.length} group settings surfaces were unreadable, so group overrides are unproven.` : "",
-    disclaimerGroupsTruncated ? groupTruncationNote(snapshot) : "",
-  ].filter(Boolean);
-  const disclaimerStatus: ZoomFindingStatus = disclaimer.status === "pass" && disclaimerNotes.length > 0 ? "warn" : disclaimer.status;
+  const disclaimerGroups = groupOverrideState(snapshot, disclaimerGroupsRelaxing);
+  const disclaimerStatus: ZoomFindingStatus = disclaimer.status === "pass" && disclaimerGroups.demote ? "warn" : disclaimer.status;
   findings.push(finding(
     "ZOOM-MTG-10",
     "Recording consent disclaimer shown to participants",
     "high",
     [4],
     disclaimerStatus,
-    [disclaimer.summary, ...disclaimerNotes].join(" "),
-    { ...disclaimer.evidence, groups_relaxing: disclaimerGroupsRelaxing.slice(0, 25), groups_unreadable: disclaimerGroupsUnreadable.slice(0, 25), groups_truncated: disclaimerGroupsTruncated },
+    [disclaimer.summary, disclaimerGroups.note].filter(Boolean).join(" "),
+    { ...disclaimer.evidence, ...disclaimerGroups.evidence },
   ));
 
   return {

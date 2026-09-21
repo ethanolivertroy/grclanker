@@ -21,6 +21,7 @@ import {
   assessZoomCollaborationGovernanceFromSnapshot,
   assessZoomIdentity,
   assessZoomMeetingSecurity,
+  assessZoomMeetingSecurityFromSnapshot,
   checkZoomAccess,
   collectZoomSnapshot,
   exportZoomAuditBundle,
@@ -1289,4 +1290,48 @@ test("review fix 3: every documented login_types code is classified and unclassi
   assert.equal(findingById(sso, "ZOOM-ID-05").status, "pass");
   assert.match(findingById(sso, "ZOOM-ID-05").summary, /complete active-user inventory/);
   assert.match(findingById(sso, "ZOOM-ID-01").summary, /complete active-user inventory/);
+});
+
+test("review fix 4: every group-dependent verdict demotes on a truncated, denied, or unreadable group inventory while lock_settings stays fully readable", async () => {
+  const meetingIds = ["ZOOM-MTG-01", "ZOOM-MTG-02", "ZOOM-MTG-03", "ZOOM-MTG-04", "ZOOM-MTG-05", "ZOOM-MTG-06", "ZOOM-MTG-07", "ZOOM-MTG-08", "ZOOM-MTG-09", "ZOOM-MTG-10"];
+  const collaborationIds = ["ZOOM-COLLAB-02", "ZOOM-COLLAB-03", "ZOOM-COLLAB-07"];
+  const scenarios = [
+    {
+      name: "listGroups truncated",
+      overrides: { async listGroups() { return list([{ id: "group-1", name: "Finance", total_members: 4 }], { truncated: true, totalRecords: 3 }); } },
+      pattern: /Group inventory was truncated at the configured limit \(1 groups seen of 3\)/,
+    },
+    {
+      name: "every sampled group settings surface denied",
+      overrides: { async getGroupSettings() { throw new ZoomApiError("Zoom request failed (403 Forbidden): Invalid access token, does not contain scopes", 403); } },
+      pattern: /1 group settings surfaces were unreadable, so group overrides are unproven/,
+    },
+    {
+      name: "GET /groups denied",
+      overrides: { async listGroups() { throw new ZoomApiError("Zoom request failed (403 Forbidden): Invalid access token, does not contain scopes", 403); } },
+      pattern: /Group overrides could not be checked: \/groups was denied \(403/,
+    },
+  ];
+
+  const baseline = await collectZoomSnapshot(compliantClient(), { now: NOW });
+  for (const id of meetingIds) assert.equal(findingById(assessZoomMeetingSecurityFromSnapshot(baseline), id).status, "pass", id);
+  for (const id of collaborationIds) assert.equal(findingById(assessZoomCollaborationGovernanceFromSnapshot(baseline, { now: NOW }), id).status, "pass", id);
+
+  for (const scenario of scenarios) {
+    const snapshot = await collectZoomSnapshot(compliantClient(scenario.overrides), { now: NOW });
+    assert.equal(snapshot.settings.lockSurfaces.every((surface) => surface.status === "ok"), true, `${scenario.name}: lock_settings must stay readable`);
+    const meeting = assessZoomMeetingSecurityFromSnapshot(snapshot);
+    const collaboration = assessZoomCollaborationGovernanceFromSnapshot(snapshot, { now: NOW });
+    for (const id of meetingIds) {
+      const item = findingById(meeting, id);
+      assert.equal(item.status, "warn", `${scenario.name} ${id}: ${item.summary}`);
+      assert.match(item.summary, scenario.pattern, `${scenario.name} ${id}: ${item.summary}`);
+    }
+    for (const id of collaborationIds) {
+      const item = findingById(collaboration, id);
+      assert.equal(item.status, "warn", `${scenario.name} ${id}: ${item.summary}`);
+      assert.match(item.summary, scenario.pattern, `${scenario.name} ${id}: ${item.summary}`);
+    }
+    assert.equal(findingById(meeting, "ZOOM-MTG-01").evidence.locked, true, `${scenario.name}: the account lock itself was readable and set`);
+  }
 });
