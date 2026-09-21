@@ -4,13 +4,13 @@ name: "grclanker Compute Backends"
 vendor: "grclanker"
 category: "devops-developer-platforms"
 language: "typescript"
-status: "spec-only"
+status: "implemented"
 version: "0.1"
-last_updated: "2026-04-05"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# grclanker Compute Backends — Architecture Specification
+# grclanker Compute Backends - Architecture Specification
 
 ## Overview
 
@@ -56,7 +56,7 @@ Use a split control-plane / execution-plane design.
 - Control plane: local `grclanker` process, prompts, extensions, UI, settings, orchestration.
 - Execution plane: backend-specific environment used for selected tool calls, build/test steps, or compute-heavy analyzers.
 
-This is a better fit than “run everything remotely” because it preserves the current local Pi ergonomics while making isolation and remote compute opt-in per workflow or per tool class.
+This is a better fit than "run everything remotely" because it preserves the current local Pi ergonomics while making isolation and remote compute opt-in per workflow or per tool class.
 
 This also follows the pattern used by Feynman: keep model/provider choice separate from execution environment choice, and present environments like Docker, Modal, and RunPod as explicit execution lanes rather than hidden runtime behavior.
 
@@ -160,7 +160,7 @@ Design notes:
 
 ### 2. Docker
 
-Docker is the best first “real environment switch” for `grclanker`.
+Docker is the best first "real environment switch" for `grclanker`.
 
 Use it for:
 
@@ -250,8 +250,8 @@ Use for:
 
 Design notes:
 
-- Pods are better for “remote workstation” workflows.
-- Serverless is better for “dispatch a job and collect output”.
+- Pods are better for "remote workstation" workflows.
+- Serverless is better for "dispatch a job and collect output".
 
 ### 6. Vercel Sandbox
 
@@ -283,7 +283,7 @@ Do not treat it as a drop-in replacement for Modal or RunPod GPUs.
 
 Build this in three phases.
 
-### Phase 1 — Local Sandboxing
+### Phase 1 - Local Sandboxing
 
 Ship:
 
@@ -300,7 +300,7 @@ Why:
 - aligns with Pi extension interception patterns
 - gives users a stronger local isolation option without introducing a hosted control plane
 
-### Phase 2 — Remote Compute
+### Phase 2 - Remote Compute
 
 Ship:
 
@@ -311,10 +311,10 @@ Ship:
 Why:
 
 - covers burst GPU and long-running GPU lanes
-- separates “secure code execution” from “heavy compute”
+- separates "secure code execution" from "heavy compute"
 - provides both stateless and persistent remote options
 
-### Phase 3 — Hosted CPU Sandboxes
+### Phase 3 - Hosted CPU Sandboxes
 
 Ship one first, not both at once:
 
@@ -413,6 +413,54 @@ grclanker env doctor
 4. `grclanker investigate` can run a shell-heavy subtask in Docker or Parallels and return synced artifacts.
 5. Remote providers stage the workspace, execute commands, and sync artifacts back reliably.
 6. GPU-oriented workflows can target Modal or RunPod without changing the local control plane.
+
+## grclanker implementation
+
+The shipped implementation lives in the CLI:
+
+- `cli/pi/execution-backend.ts`: the `ExecutionBackend` interface (`healthcheck`, `stageWorkspace`, `exec`, `snapshot`, `restore`, `teardown`), capability flags (`snapshot`, `restore`, `gpu`, `stageWorkspace`, `artifactSync`, `interactive`), the injected `CommandRunner` and `FetchLike` types, secret redaction, and the `assertExhaustive` helper used by every switch over the kind union.
+- `cli/pi/backends/`: one adapter per kind (`local.ts` for host and sandbox-runtime, `docker.ts`, `parallels.ts`, `modal.ts`, `runpod.ts` for both RunPod kinds) plus `index.ts`, the factory with an exhaustive switch and the fail-fast stubs for `vercel-sandbox` and `cloudflare-sandbox`.
+- `cli/pi/compute.ts`: the nine-kind union, routing buckets, `computeProfile`, `computeDefaults` (network policy and workspace mount mode) normalization and validation, credential detection per remote kind, and backend status detection.
+- `cli/pi/backend-exec.ts`: the Pi tool surface (`bash`, `read`, `write`, `edit`, `ls`, `grep`, `find`) routed through either the phase 1 adapters or a contract-backed command adapter for remote kinds.
+- `cli/pi/env.ts` and `cli/index.ts`: `grclanker env list`, `env doctor`, `env smoke-test`, `env exec`, and the `--compute <kind>` flag on `setup`, `investigate`, and `audit`.
+- `cli/tests/compute-backends.test.mjs`: unit coverage with injected runners and mocked `fetch`; `cli/scripts/compute-backends-live-smoke.mjs`: opt-in live smoke wired as `test:compute-backends:live`.
+- Docs: `src/content/docs/docs/getting-started/compute-backends.md`.
+
+## Status
+
+Status as of 2026-09-21: implemented for seven of nine kinds, with `vercel-sandbox` and `cloudflare-sandbox` shipped as fail-fast stubs.
+
+### Backend matrix
+
+| Kind | Implemented | Tested | Documented | Notes |
+| --- | --- | --- | --- | --- |
+| `host` | yes | yes (contract shape) | yes | phase 1 behavior unchanged |
+| `sandbox-runtime` | yes | yes (FS policy, contract shape) | yes | phase 1 behavior unchanged |
+| `docker` | yes | yes (injected runner, run-arg shape, computeDefaults) | yes | `deny-all` maps to `--network none`, `ro` maps to a read-only bind mount |
+| `parallels-vm` | yes | yes (injected runner: stage, exec, snapshot, restore, teardown, failure cleanup) | yes | snapshot via `prlctl snapshot`, rollback via `prlctl snapshot-switch` |
+| `modal` | yes (CLI: `modal shell`) | yes (injected runner, flag shape, redaction) | yes | no sync-back or snapshots through the CLI |
+| `runpod-serverless` | yes (HTTP: `/health`, `/run`, `/status`, `/cancel`) | yes (mocked fetch) | yes | requires a worker implementing the grclanker input/output contract |
+| `runpod-pod` | yes (HTTP `GET /pods/{id}` plus SSH/scp) | yes (mocked fetch, injected runner) | yes | REST v1 is deprecated by RunPod; base URL isolated for the v2 move |
+| `vercel-sandbox` | stub | yes (fails fast) | yes (marked not available) | SDK/CLI only, no npm dependency added |
+| `cloudflare-sandbox` | stub | yes (fails fast) | yes (marked not available) | Workers SDK only, no public HTTP lifecycle API |
+
+### Deviations from this spec
+
+- The contract names the final lifecycle step `teardown` rather than `cleanup`, and `snapshot`/`restore` are required members that throw a typed "not supported" error when `capabilities.snapshot` or `capabilities.restore` is false, instead of being optional.
+- `ExecutionRequest` carries `sessionId`, `onData`, and `signal` so streaming tool output and aborts work through the same contract.
+- Parallels rollback uses `prlctl snapshot-switch --id`, which is the prlctl command for the operation this spec calls `prlctl rollback`. Guest execution still uses `prlctl exec`; the SSH guest path remains unimplemented because `prlctl exec` already covers the tool surface.
+- Modal is driven through the documented `modal shell` CLI rather than the Sandbox SDK or an HTTP API, because Modal does not document a public HTTP lifecycle API and the project does not add npm dependencies for this.
+- `runpod-pod` never creates or destroys pods. It operates only inside a per-session directory on a pod the operator already owns.
+- `computeProfile` is validated against the selected backend's routing bucket rather than selecting a backend on its own.
+
+### Remaining work
+
+- `vercel-sandbox` and `cloudflare-sandbox` adapters (deferred; both need an SDK dependency or a hosted Worker).
+- Artifact sync-back for Modal (not exposed by `modal shell`) and automatic sync-back for RunPod pods (manual `scp` today).
+- Enforcing `computeDefaults.networkPolicy` on remote providers, which do not expose a documented per-command network policy.
+- Moving `runpod-pod` to RunPod REST API v2 before the documented v1 retirement on 2026-11-15.
+- A reference RunPod serverless worker image implementing the grclanker input/output contract.
+- Header text still reads the backend kind; per-session snapshot and artifact manifests are not surfaced in the TUI yet.
 
 ## Decision Summary
 
