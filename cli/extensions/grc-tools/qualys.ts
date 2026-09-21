@@ -1082,14 +1082,16 @@ export class QualysApiClient {
   }
 
   async listAuthRecordSummary(): Promise<QualysListResult> {
+    // auth_records.dtd: RESPONSE > AUTH_RECORDS > AUTH_<TECHNOLOGY>_IDS > ID_SET > (ID|ID_RANGE)+. The older
+    // guide sample names the wrappers AUTH_<TECHNOLOGY>_RECORDS, so both suffixes normalize to the technology.
     const document = await this.getXml("/api/2.0/fo/auth/", { action: "list" });
     const container = findXmlElement(document, "AUTH_RECORDS");
     const items = container
       ? container.children
-        .filter((child) => child.name.startsWith("AUTH_"))
+        .filter((child) => /^AUTH_.+_(IDS|RECORDS)$/.test(child.name))
         .map((child) => ({
-          type: child.name.replace(/^AUTH_/, "").toLowerCase(),
-          count: findXmlElements(child, "ID").length + findXmlElements(child, "ID_RANGE").length,
+          type: child.name.replace(/^AUTH_/, "").replace(/_(IDS|RECORDS)$/, "").toLowerCase(),
+          count: idSetCount(child),
         }))
       : [];
     return listResult(items, 1, unfollowedWarning(document));
@@ -1270,6 +1272,20 @@ function unfollowedWarning(document: XmlNode): string | undefined {
   const warning = findXmlElement(document, "WARNING");
   const url = warning ? xmlText(findXmlElement(warning, "URL")) : undefined;
   return url ? "WARNING/URL continuation present and not followed" : undefined;
+}
+
+// auth_records.dtd: ID_SET (ID|ID_RANGE)+ where an ID_RANGE is written first-last (the guide documents
+// ranges such as 3000-3250), so a range counts every record it spans rather than one entry.
+export function idSetCount(node: XmlNode): number {
+  const singles = findXmlElements(node, "ID").length;
+  const spanned = findXmlElements(node, "ID_RANGE").reduce((total, range) => {
+    const match = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(range.text);
+    if (!match) return total + 1;
+    const first = Number(match[1]);
+    const last = Number(match[2]);
+    return total + (last >= first ? last - first + 1 : 1);
+  }, 0);
+  return singles + spanned;
 }
 
 export function normalizeList(value: unknown): QualysListResult {
@@ -1548,12 +1564,22 @@ function resolveAssessmentOptions(config: QualysResolvedConfig, options: QualysA
   };
 }
 
+// schedule_scan_list_output.dtd: ACTIVE (#PCDATA). The VM/PC API user guide documents 0 as a deactivated
+// schedule and states that an active=1 request returns records with ACTIVE 1, 2, and 3, all active statuses.
+function scheduleActiveState(schedule: JsonRecord): "active" | "inactive" | "unknown" {
+  const text = xmlScalarText(schedule.ACTIVE)?.trim();
+  if (text === undefined) return "unknown";
+  if (text === "0") return "inactive";
+  if (/^[123]$/.test(text)) return "active";
+  return "unknown";
+}
+
 function scheduleIsActive(schedule: JsonRecord): boolean {
-  return asBoolean(schedule.ACTIVE) === true;
+  return scheduleActiveState(schedule) === "active";
 }
 
 function scheduleActiveFlagMissing(schedule: JsonRecord): boolean {
-  return asBoolean(schedule.ACTIVE) === undefined;
+  return scheduleActiveState(schedule) === "unknown";
 }
 
 function recordLabel(record: JsonRecord, fallback: string): string {
@@ -1592,7 +1618,8 @@ function scheduleScannerUnverified(schedule: JsonRecord): boolean {
 }
 
 function scheduleNextLaunch(schedule: JsonRecord): string | undefined {
-  return pathString(schedule, "SCHEDULE", "NEXTLAUNCH_UTC") ?? asString(schedule.NEXTLAUNCH_UTC);
+  // schedule_scan_list_output.dtd: SCHEDULE > NEXTLAUNCH_UTC?
+  return pathString(schedule, "SCHEDULE", "NEXTLAUNCH_UTC");
 }
 
 function hostOs(host: JsonRecord): string {
@@ -1611,10 +1638,23 @@ function hostTags(host: JsonRecord): string[] {
   return pathRecords(host, "TAGS", "TAG").map((tag) => asString(tag.NAME)).filter((name): name is string => Boolean(name));
 }
 
+function scalarEntries(value: unknown): string[] {
+  return asArray(value).map(xmlScalarText).filter((text): text is string => Boolean(text));
+}
+
 function assetGroupHasTargets(group: JsonRecord): boolean {
+  // asset_group_list_output.dtd: IP_SET ((IP|IP_RANGE)+), DOMAIN_LIST (DOMAIN+), DNS_LIST (DNS+),
+  // NETBIOS_LIST (NETBIOS+), HOST_IDS (#PCDATA, comma separated), EC2_IDS (#PCDATA)
   const ipSet = asObject(group.IP_SET);
-  const hasIps = Boolean(ipSet && (asArray(ipSet.IP).length > 0 || asArray(ipSet.IP_RANGE).length > 0));
-  return hasIps || asArray(group.DOMAIN_LIST).length > 0 || asArray(pathValue(group, "HOST_IDS")).length > 0 || asArray(group.DNS_LIST).length > 0;
+  const targets = [
+    ...(ipSet ? [...scalarEntries(ipSet.IP), ...scalarEntries(ipSet.IP_RANGE)] : []),
+    ...scalarEntries(pathValue(group, "DOMAIN_LIST", "DOMAIN")),
+    ...scalarEntries(pathValue(group, "DNS_LIST", "DNS")),
+    ...scalarEntries(pathValue(group, "NETBIOS_LIST", "NETBIOS")),
+    ...splitCsvText(group.HOST_IDS),
+    ...splitCsvText(group.EC2_IDS),
+  ];
+  return targets.length > 0;
 }
 
 function addressCountForRange(range: string): number {
@@ -1625,15 +1665,14 @@ function addressCountForRange(range: string): number {
 }
 
 function optionProfileName(profile: JsonRecord): string {
-  return pathString(profile, "BASIC_INFO", "GROUP_NAME") ?? asString(profile.GROUP_NAME) ?? pathString(profile, "BASIC_INFO", "ID") ?? "option profile";
+  // option_profile_info.dtd: BASIC_INFO (ID, GROUP_NAME, ...)
+  return xmlScalarText(pathValue(profile, "BASIC_INFO", "GROUP_NAME")) ?? xmlScalarText(pathValue(profile, "BASIC_INFO", "ID")) ?? "option profile";
 }
 
 function optionProfileAuthTypes(profile: JsonRecord): string[] {
-  const value = pathValue(profile, "SCAN", "AUTHENTICATION");
-  if (value === undefined) return [];
-  const text = asString(value);
-  if (text) return text.split(",").map((item) => item.trim()).filter(Boolean);
-  return Object.keys(asObject(value) ?? {}).filter((key) => !key.startsWith("@") && key !== "#text");
+  // option_profile_info.dtd: SCAN > AUTHENTICATION (#PCDATA), a comma separated list such as
+  // "Windows,Unix,Oracle,Oracle Listener,SNMP,VMware,DB2,HTTP,MySQL,Sybase" in the guide sample.
+  return splitCsvText(pathValue(profile, "SCAN", "AUTHENTICATION"));
 }
 
 function optionProfileExclusionLists(profile: JsonRecord): string[] {
@@ -1912,7 +1951,8 @@ function hostRecentlyAuthScanned(host: JsonRecord, now: Date, lookbackDays: numb
 }
 
 function connectorState(connector: JsonRecord): string {
-  return (asString(connector.connectorState) ?? asString(connector.state) ?? "unknown").toUpperCase();
+  // asset_data_connector.xsd: connectorState (AssetDataConnectorState enum), lastSync (dateTime), lastError, disabled
+  return (asString(connector.connectorState) ?? "unknown").toUpperCase();
 }
 
 function connectorStateUnknown(connector: JsonRecord): boolean {
@@ -1935,15 +1975,42 @@ function applianceIsOffline(appliance: JsonRecord): boolean {
   return /offline|inactive|disconnected/.test(applianceStatus(appliance));
 }
 
+type VersionState = "current" | "outdated" | "unknown";
+
+// appliance_list_output.dtd: ML_LATEST?, ML_VERSION? with attribute updated, VULNSIGS_LATEST?, VULNSIGS_VERSION?
+// with attribute updated. The guide sample shows an offline appliance as <ML_VERSION updated="no"></ML_VERSION>,
+// so the version text is compared with the latest release first and the updated attribute decides when the
+// text is empty. SOFTWARE_VERSION is the appliance software build and is never compared with ML_LATEST.
+function versionPairState(versionValue: unknown, latestValue: unknown): VersionState {
+  const version = xmlScalarText(versionValue);
+  const latest = xmlScalarText(latestValue);
+  if (version && latest) return version === latest ? "current" : "outdated";
+  const updated = asBoolean(asObject(versionValue)?.["@updated"]);
+  if (updated === false) return "outdated";
+  if (updated === true) return "current";
+  return "unknown";
+}
+
+function applianceVersionState(appliance: JsonRecord): VersionState {
+  const states = [
+    versionPairState(appliance.ML_VERSION, appliance.ML_LATEST),
+    versionPairState(appliance.VULNSIGS_VERSION, appliance.VULNSIGS_LATEST),
+  ];
+  if (states.includes("outdated")) return "outdated";
+  if (states.includes("unknown")) return "unknown";
+  return "current";
+}
+
+function applianceMissedHeartbeats(appliance: JsonRecord): number {
+  return asNumber(appliance.HEARTBEATS_MISSED) ?? 0;
+}
+
 function applianceIsOutdated(appliance: JsonRecord): boolean {
-  const version = asString(appliance.SOFTWARE_VERSION);
-  const latest = asString(appliance.ML_LATEST);
-  const missed = asNumber(appliance.HEARTBEATS_MISSED) ?? 0;
-  const vulnsigsLatest = asString(appliance.VULNSIGS_LATEST);
-  const vulnsigsVersion = asString(appliance.VULNSIGS_VERSION);
-  return missed > 0
-    || (Boolean(version && latest) && version !== latest)
-    || (Boolean(vulnsigsLatest && vulnsigsVersion) && vulnsigsLatest !== vulnsigsVersion);
+  return applianceMissedHeartbeats(appliance) > 0 || applianceVersionState(appliance) === "outdated";
+}
+
+function applianceVersionUnknown(appliance: JsonRecord): boolean {
+  return applianceVersionState(appliance) === "unknown";
 }
 
 function agentStatus(agent: JsonRecord): string {
@@ -1994,6 +2061,7 @@ export async function assessQualysAssetInventory(
   const offlineAppliances = appliances.data.filter(applianceIsOffline);
   const unknownStatusAppliances = appliances.data.filter(applianceStatusUnknown);
   const outdatedAppliances = appliances.data.filter((appliance) => !applianceIsOffline(appliance) && applianceIsOutdated(appliance));
+  const appliancesWithoutVersionData = appliances.data.filter((appliance) => !applianceIsOffline(appliance) && !applianceIsOutdated(appliance) && applianceVersionUnknown(appliance));
   const agentHosts = hosts.data.filter(hostIsAgentTracked);
   const hostsWithoutTrackingMethod = hosts.data.filter((host) => hostTrackingMethod(host) === "");
   const agentPercent = percent(agentHosts.length, hosts.data.length);
@@ -2004,7 +2072,11 @@ export async function assessQualysAssetInventory(
   const staleAgents = agents.data.filter((agent) => (ageInDays(agentLastCheckIn(agent), now) ?? -1) > STALE_AGENT_DAYS);
   const untaggedHosts = hosts.data.filter((host) => hostTags(host).length === 0);
   const untaggedPercent = percent(untaggedHosts.length, hosts.data.length);
-  const dynamicTags = tags.data.filter((tag) => Boolean(asString(tag.ruleType)));
+  // tag.xsd: ruleType is a TagRuleType enum whose values include STATIC; only the other values are rule based.
+  const dynamicTags = tags.data.filter((tag) => {
+    const ruleType = asString(tag.ruleType);
+    return Boolean(ruleType) && !/^STATIC$/i.test(ruleType ?? "");
+  });
 
   const findings: QualysFinding[] = [];
 
@@ -2083,24 +2155,29 @@ export async function assessQualysAssetInventory(
         : offlineAppliances.length > 0
           ? `${offlineAppliances.length}/${appliances.data.length} scanner appliances are offline.`
           : outdatedAppliances.length > 0
-            ? `${outdatedAppliances.length}/${appliances.data.length} scanner appliances missed heartbeats or run outdated software or signatures.`
-            : `All ${appliances.data.length} scanner appliances report an online status with current software and signatures.`,
+            ? `${outdatedAppliances.length}/${appliances.data.length} scanner appliances missed heartbeats (HEARTBEATS_MISSED) or run a scanner (ML_VERSION versus ML_LATEST) or signature (VULNSIGS_VERSION versus VULNSIGS_LATEST) release behind the latest.`
+            : `All ${appliances.data.length} scanner appliances report an online STATUS, zero missed heartbeats, and ML_VERSION and VULNSIGS_VERSION equal to ML_LATEST and VULNSIGS_LATEST.`,
     evidence: {
       appliances: appliances.data.map((appliance) => ({
-        name: asString(appliance.NAME),
+        name: xmlScalarText(appliance.NAME),
         status: applianceStatus(appliance),
-        software_version: asString(appliance.SOFTWARE_VERSION),
-        latest_version: asString(appliance.ML_LATEST),
-        heartbeats_missed: asNumber(appliance.HEARTBEATS_MISSED) ?? 0,
-        last_updated: asString(appliance.LAST_UPDATED_DATE),
+        software_version: xmlScalarText(appliance.SOFTWARE_VERSION),
+        ml_version: xmlScalarText(appliance.ML_VERSION),
+        ml_latest: xmlScalarText(appliance.ML_LATEST),
+        vulnsigs_version: xmlScalarText(appliance.VULNSIGS_VERSION),
+        vulnsigs_latest: xmlScalarText(appliance.VULNSIGS_LATEST),
+        version_state: applianceVersionState(appliance),
+        heartbeats_missed: applianceMissedHeartbeats(appliance),
+        last_updated: xmlScalarText(appliance.LAST_UPDATED_DATE),
       })).slice(0, 100),
       offline_appliances: offlineAppliances.length,
       outdated_appliances: outdatedAppliances.length,
+      version_comparison: "ML_VERSION against ML_LATEST and VULNSIGS_VERSION against VULNSIGS_LATEST (appliance_list_output.dtd); SOFTWARE_VERSION is reported only",
     },
     sources: [appliances],
     scope,
     manualEvidence: "review Scans > Appliances for offline scanners, missed heartbeats, and outdated software or signature versions.",
-    unknownBuckets: { appliances_without_status: unknownStatusAppliances.length },
+    unknownBuckets: { appliances_without_status: unknownStatusAppliances.length, appliances_without_version_data: appliancesWithoutVersionData.length },
   }));
 
   const agentCoverageStatus: QualysFindingStatus = hosts.error || agents.error
@@ -2250,10 +2327,9 @@ function detectionHasSeverity(detection: JsonRecord): boolean {
 }
 
 function policyStatus(policy: JsonRecord): "active" | "inactive" | "unknown" {
-  const isActive = asBoolean(policy.IS_ACTIVE);
-  if (isActive === true) return "active";
-  if (isActive === false) return "inactive";
-  const status = asString(policy.STATUS)?.trim().toLowerCase();
+  // policy_list_output.dtd: STATUS? (#PCDATA); the guide sample carries <STATUS><![CDATA[active]]></STATUS>.
+  // No IS_ACTIVE element exists on a compliance policy, so only STATUS is read.
+  const status = xmlScalarText(policy.STATUS)?.trim().toLowerCase();
   if (status === "active") return "active";
   if (status && /inactive|draft|disabled/.test(status)) return "inactive";
   return "unknown";
@@ -2631,21 +2707,23 @@ function legacyUserLastLogin(user: JsonRecord): unknown {
   return xmlScalarText(user.LAST_LOGIN_DATE);
 }
 
+// schedule_report_list_output.dtd: REPORT (ID, TITLE?, OUTPUT_FORMAT, TEMPLATE_TITLE?, ACTIVE, SCHEDULE) with
+// ACTIVE (#PCDATA) carrying 0 or 1. No IS_ACTIVE element exists, and a missing flag never counts as active.
 function reportIsActive(report: JsonRecord): boolean {
-  const flag = asBoolean(report.ACTIVE) ?? asBoolean(report.IS_ACTIVE);
-  return flag !== false;
+  return asBoolean(report.ACTIVE) === true;
 }
 
 function reportActiveFlagMissing(report: JsonRecord): boolean {
-  return asBoolean(report.ACTIVE) === undefined && asBoolean(report.IS_ACTIVE) === undefined;
+  return asBoolean(report.ACTIVE) === undefined;
 }
 
+// wasscanschedule.xsd: WasScanSchedule.active is an optional xs:boolean; no status element exists.
 function wasScheduleIsActive(schedule: JsonRecord): boolean {
-  return asBoolean(schedule.active) === true || /^active$/i.test(asString(schedule.status) ?? "");
+  return asBoolean(schedule.active) === true;
 }
 
 function wasScheduleFlagMissing(schedule: JsonRecord): boolean {
-  return asBoolean(schedule.active) === undefined && asString(schedule.status) === undefined;
+  return asBoolean(schedule.active) === undefined;
 }
 
 // wasscan.xsd: WasScanTarget carries webApp (single target) or webApps/list/WebApp (multi target).
