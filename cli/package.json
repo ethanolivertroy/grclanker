@@ -53,6 +53,7 @@
     "test:sumologic:live": "npm run build && node scripts/sumologic-live-smoke.mjs",
     "test:snowflake:live": "npm run build && node scripts/snowflake-live-smoke.mjs",
     "test:splunk:live": "npm run build && node scripts/splunk-live-smoke.mjs",
+    "test:tenable:live": "npm run build && node scripts/tenable-live-smoke.mjs",
     "test:vanta:live": "npm run build && node scripts/vanta-live-smoke.mjs",
     "test:isolation": "npm run build && node --test tests/isolation.test.mjs"
   },
