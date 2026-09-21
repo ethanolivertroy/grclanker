@@ -10,12 +10,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
   API_KEY_DOCUMENTED_ONLY_NOTE,
   NEWRELIC_CONTROL_CATALOG,
   NEWRELIC_NERDGRAPH_SELECTIONS,
+  NEWRELIC_STORED_RECORD_SHAPES,
   NewrelicApiClient,
   assessNewrelicAccessControl,
   assessNewrelicAlerting,
@@ -23,6 +25,7 @@ import {
   assessNewrelicIdentity,
   checkNewrelicAccess,
   exportNewrelicAuditBundle,
+  projectRecord,
   resolveNewrelicConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/newrelic.js";
@@ -1475,6 +1478,130 @@ test("every NerdGraph selection stays on the documented field allowlist", () => 
   assert.doesNotMatch(NEWRELIC_NERDGRAPH_SELECTIONS.domainGroupGrants, /authorizationManagement \{\s*roles/);
 });
 
+// Fields this module attaches to stored records itself; they never come from NerdGraph.
+const SYNTHESIZED_RECORD_FIELDS = new Set([
+  "queriedAccountId", "authenticationDomainId", "authenticationDomainName", "provisioningType", "rolesReadable",
+]);
+
+// NRQL result rows and rows this module builds are keyed by the SELECT clause or by the builder, not by a NerdGraph selection.
+const NON_NERDGRAPH_SHAPES = new Set([
+  "apiKeyActorEvents", "apiKeyChangeEvents", "syntheticScriptScan", "logVolume", "logSecretMatches", "infraHostCounts", "infraAgentVersions",
+]);
+
+const SHAPE_SELECTION_SOURCES = {
+  organization: ["organization"],
+  currentUser: ["currentUser"],
+  accounts: ["accounts"],
+  authenticationDomains: ["authenticationDomains"],
+  organizationAuthenticationDomains: ["organizationAuthenticationDomainFields"],
+  users: ["domainUsers"],
+  groupGrants: ["domainGroupGrants"],
+  roles: ["roleCatalogFields"],
+  apiKeys: ["apiKeys"],
+  alertPolicies: ["alertPolicies"],
+  nrqlConditions: ["nrqlConditions"],
+  destinations: ["destinations"],
+  channels: ["channels"],
+  workflows: ["workflows"],
+  entities: ["entitySearch"],
+  retentionRules: ["retentionRules"],
+  retentionNamespaces: ["retentionNamespaces"],
+  obfuscationRules: ["obfuscationRules"],
+  obfuscationExpressions: ["obfuscationExpressions"],
+  pipelineCloudRules: ["pipelineCloudRules"],
+  nrqlDropRules: ["nrqlDropRules"],
+  dashboardLiveUrls: ["dashboardLiveUrls"],
+};
+
+function shapeFieldNames(shape) {
+  return Object.entries(shape).flatMap(([field, fieldShape]) =>
+    typeof fieldShape === "object" ? [field, ...shapeFieldNames(fieldShape)] : [field],
+  );
+}
+
+test("bundle secret hygiene: every stored record shape names only fields its NerdGraph selection requests", () => {
+  const shapeNames = Object.keys(NEWRELIC_STORED_RECORD_SHAPES);
+  assert.deepEqual(
+    shapeNames.filter((name) => !NON_NERDGRAPH_SHAPES.has(name)).sort(),
+    Object.keys(SHAPE_SELECTION_SOURCES).sort(),
+    "every NerdGraph-backed shape must map to the selection it stores",
+  );
+  for (const [shapeName, selectionKeys] of Object.entries(SHAPE_SELECTION_SOURCES)) {
+    const selected = new Set(selectionKeys.flatMap((key) => selectionTokens(NEWRELIC_NERDGRAPH_SELECTIONS[key])));
+    const stray = shapeFieldNames(NEWRELIC_STORED_RECORD_SHAPES[shapeName]).filter(
+      (field) => !selected.has(field) && !SYNTHESIZED_RECORD_FIELDS.has(field),
+    );
+    assert.deepEqual(stray, [], `${shapeName} stores fields its selection never requests: ${stray.join(", ")}`);
+  }
+  for (const shapeName of NON_NERDGRAPH_SHAPES) {
+    assert.ok(NEWRELIC_STORED_RECORD_SHAPES[shapeName], `${shapeName} shape is missing`);
+  }
+  for (const field of UNDOCUMENTED_FIELDS) {
+    for (const [shapeName, shape] of Object.entries(NEWRELIC_STORED_RECORD_SHAPES)) {
+      assert.equal(shapeFieldNames(shape).includes(field), false, `${shapeName} would store the undocumented field ${field}`);
+    }
+  }
+  assert.equal(shapeFieldNames(NEWRELIC_STORED_RECORD_SHAPES.apiKeys).includes("key"), false);
+  assert.equal(shapeFieldNames(NEWRELIC_STORED_RECORD_SHAPES.users).includes("passwordHash"), false);
+  assert.equal(typeof NEWRELIC_STORED_RECORD_SHAPES.destinations.properties, "function");
+  assert.equal("properties" in NEWRELIC_STORED_RECORD_SHAPES.channels, false);
+});
+
+test("bundle secret hygiene: projectRecord keeps selected fields and drops everything the API volunteers", () => {
+  const projected = projectRecord(
+    {
+      id: "wf-1",
+      name: "Production",
+      workflowEnabled: true,
+      apiToken: "PLANTED-VOLUNTEERED-TOKEN",
+      destinationConfigurations: [
+        { channelId: "chan-1", type: "EMAIL", notificationTriggers: ["ACTIVATED", { nested: "object" }], secret: "PLANTED" },
+        "not an object",
+      ],
+      enrichments: null,
+      queriedAccountId: 111,
+      nested: { deep: "PLANTED" },
+    },
+    NEWRELIC_STORED_RECORD_SHAPES.workflows,
+  );
+  assert.deepEqual(projected, {
+    id: "wf-1",
+    name: "Production",
+    workflowEnabled: true,
+    destinationConfigurations: [{ channelId: "chan-1", type: "EMAIL", notificationTriggers: ["ACTIVATED"] }],
+    enrichments: null,
+    queriedAccountId: 111,
+  });
+
+  assert.deepEqual(projectRecord({ id: "u-1", lastActive: null, type: "not an object", groups: { groups: "not a list" } }, NEWRELIC_STORED_RECORD_SHAPES.users), {
+    id: "u-1",
+    lastActive: null,
+    groups: {},
+  });
+
+  const destination = projectRecord(
+    {
+      id: "dest-1",
+      name: "Hooks",
+      type: "WEBHOOK",
+      properties: [
+        { key: "url", value: "https://hooks.example.com/PLANTED-TOKEN" },
+        { key: "Email", value: "ops@example.com, sre@example.com" },
+        { key: "headers", value: { Authorization: "Bearer PLANTED" } },
+        { value: "PLANTED-KEYLESS" },
+        "not an object",
+      ],
+    },
+    NEWRELIC_STORED_RECORD_SHAPES.destinations,
+  );
+  assert.deepEqual(destination, {
+    id: "dest-1",
+    name: "Hooks",
+    type: "WEBHOOK",
+    properties: [{ key: "url" }, { key: "Email", value: "ops@example.com, sre@example.com" }, { key: "headers" }],
+  });
+});
+
 test("NewrelicApiClient falls back to the documented group grant shape when the domain filter or cursor is rejected", async () => {
   const seen = [];
   const documentedShape = {
@@ -2693,6 +2820,242 @@ test("exportNewrelicAuditBundle writes core data, analysis, compliance reports, 
   const scriptScan = JSON.parse(readFileSync(join(result.outputDir, "core_data", "synthetic_script_scan.json"), "utf8"));
   assert.equal(scriptScan[0].usesSecureCredentials, true);
   assert.equal("text" in scriptScan[0], false);
+});
+
+function listFilesRecursively(root, dir = root) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const pathname = join(dir, entry.name);
+    return entry.isDirectory() ? listFilesRecursively(root, pathname) : [relative(root, pathname)];
+  });
+}
+
+// Minimal reader for the archives archiver writes: walks the central directory and inflates each entry.
+function readZipEntries(buffer) {
+  let endOfCentralDirectory = -1;
+  for (let offset = buffer.length - 22; offset >= 0; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      endOfCentralDirectory = offset;
+      break;
+    }
+  }
+  assert.notEqual(endOfCentralDirectory, -1, "zip end of central directory record not found");
+  const entryCount = buffer.readUInt16LE(endOfCentralDirectory + 10);
+  let offset = buffer.readUInt32LE(endOfCentralDirectory + 16);
+  const entries = new Map();
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, "central directory header expected");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localHeaderOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+    assert.equal(buffer.readUInt32LE(localHeaderOffset), 0x04034b50, `local header expected for ${name}`);
+    const dataStart = localHeaderOffset + 30 + buffer.readUInt16LE(localHeaderOffset + 26) + buffer.readUInt16LE(localHeaderOffset + 28);
+    const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
+    if (method === 8) entries.set(name, inflateRawSync(compressed).toString("utf8"));
+    else if (method === 0) entries.set(name, compressed.toString("utf8"));
+    else assert.fail(`unsupported zip compression method ${method} for ${name}`);
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+const PLANTED_SECRETS = {
+  webhookUrlToken: "https://hooks.example.com/services/PLANTED-WEBHOOK-TOKEN-7f3a",
+  webhookSecurityCode: "PLANTED-SECURITY-CODE-91b2",
+  slackAccessToken: "xoxb-PLANTED-SLACK-TOKEN-4c8d",
+  authorizationHeader: "Bearer PLANTED-AUTHORIZATION-HEADER-2e6f",
+  destinationVolunteeredField: "PLANTED-DESTINATION-AUTH-3b0a",
+  channelPropertySecret: "PLANTED-CHANNEL-PROPERTY-SECRET-5a1c",
+  userKeyValue: "NRAK-PLANTEDUSERKEYVALUE0123456789",
+  ingestKeyValue: "PLANTED-LICENSE-KEY-VALUE-NRAL-8d2b",
+  passwordHash: "$2b$12$PLANTED-PASSWORD-HASH-3f9e",
+  liveUrlToken: "https://onenr.io/PLANTED-LIVE-URL-TOKEN-6c4a",
+  liveUrlUuid: "PLANTED-LIVE-URL-UUID-1b7d",
+  secureCredentialValue: "PLANTED-SECURE-CREDENTIAL-VALUE-9a0e",
+  scriptInlineSecret: "PLANTED-SCRIPT-INLINE-SECRET-2d5c",
+  logMessage: "PLANTED-LOG-MESSAGE-SECRET-7e1f",
+  volunteeredField: "PLANTED-VOLUNTEERED-FIELD-0c9d",
+};
+
+function plantedBundleClient() {
+  const planted = { volunteered: PLANTED_SECRETS.volunteeredField };
+  return bundleClient({
+    async getOrganization() {
+      return { id: "org-1", name: "Example Org", ...planted };
+    },
+    async getCurrentUser() {
+      return { id: "u-1", email: "auditor@example.com", name: "Auditor", ...planted };
+    },
+    async listAccounts() {
+      return [{ id: 111, name: "Payments Production", ...planted }];
+    },
+    async listAuthenticationDomains() {
+      return [{ id: "domain-1", name: "Corporate SSO", provisioningType: "SCIM", ...planted }];
+    },
+    async listOrganizationAuthenticationDomains() {
+      return [{ id: "domain-1", name: "Corporate SSO", organizationId: "org-1", provisioningType: "SCIM", authenticationType: "SAML_SSO", ...planted }];
+    },
+    async listDomainUsers() {
+      return [
+        { ...user("alice", { type: "FULL_PLATFORM", groups: ["g-admin"] }), passwordHash: PLANTED_SECRETS.passwordHash },
+        { ...user("bob", { type: "BASIC", groups: ["g-dev"] }), passwordHash: PLANTED_SECRETS.passwordHash, ...planted },
+      ];
+    },
+    async listDomainGroupGrants() {
+      return [{ ...orgManagerGroup(), ...planted }, { ...accountGroup("g-dev", [111]), ...planted }];
+    },
+    async listRoles(organizationId) {
+      requireOrganizationId(organizationId);
+      return standardRoles().map((role) => ({ ...role, ...planted }));
+    },
+    async listApiKeys() {
+      return [
+        { id: "key-1", name: "ci-deploy", type: "USER", key: PLANTED_SECRETS.userKeyValue, createdAt: secondsAgo(10), userId: "bob", accountId: 111, ...planted },
+        { id: "key-2", name: "license-prod", type: "INGEST", key: PLANTED_SECRETS.ingestKeyValue, ingestType: "LICENSE", createdAt: secondsAgo(20), accountId: 111 },
+      ];
+    },
+    async listAlertPolicies() {
+      return [{ id: "policy-1", name: "Production", incidentPreference: "PER_CONDITION_AND_TARGET", ...planted }];
+    },
+    async listNrqlConditions() {
+      return [{ id: "cond-1", name: "Error rate", type: "STATIC", enabled: true, policyId: "policy-1", nrql: { query: "SELECT count(*) FROM TransactionError" }, ...planted }];
+    },
+    async listNotificationDestinations() {
+      return [
+        {
+          id: "dest-1",
+          name: "Ops distribution list",
+          type: "EMAIL",
+          properties: [{ key: "email", value: "ops@example.com" }],
+          auth: { token: PLANTED_SECRETS.destinationVolunteeredField },
+        },
+        {
+          id: "dest-2",
+          name: "Pager webhook",
+          type: "WEBHOOK",
+          properties: [
+            { key: "url", value: PLANTED_SECRETS.webhookUrlToken },
+            { key: "securityCode", value: PLANTED_SECRETS.webhookSecurityCode },
+            { key: "headers", value: PLANTED_SECRETS.authorizationHeader },
+          ],
+        },
+        {
+          id: "dest-3",
+          name: "Ops Slack",
+          type: "SLACK",
+          properties: [{ key: "accessToken", value: PLANTED_SECRETS.slackAccessToken }, { key: "teamName", value: "example" }],
+        },
+      ];
+    },
+    async listNotificationChannels() {
+      return [
+        { id: "chan-1", name: "Ops email", type: "EMAIL", destinationId: "dest-1", properties: [{ key: "payload", value: PLANTED_SECRETS.channelPropertySecret }] },
+        { id: "chan-2", name: "Pager", type: "WEBHOOK", destinationId: "dest-2", properties: [{ key: "headers", value: PLANTED_SECRETS.authorizationHeader }] },
+      ];
+    },
+    async listWorkflows() {
+      return [
+        {
+          id: "wf-1",
+          name: "Production issues",
+          workflowEnabled: true,
+          enrichmentsEnabled: false,
+          destinationsEnabled: true,
+          destinationConfigurations: [{ channelId: "chan-1", name: "Ops email", type: "EMAIL", ...planted }],
+          enrichments: [],
+          ...planted,
+        },
+      ];
+    },
+    async searchEntities(query) {
+      if (query.includes("alertSeverity") || query.includes("WORKLOAD")) return alertingClient().searchEntities(query);
+      if (query.includes("DASHBOARD")) {
+        return [{ guid: "dash-1", name: "Ops overview", domain: "VIZ", type: "DASHBOARD", permissions: "PUBLIC_READ_ONLY", accountId: 111, ...planted }];
+      }
+      if (query.includes("SECURE_CRED")) {
+        return [{ guid: "cred-1", name: "LOGIN_PASSWORD", domain: "SYNTH", type: "SECURE_CRED", accountId: 111, value: PLANTED_SECRETS.secureCredentialValue }];
+      }
+      if (query.includes("MONITOR")) {
+        return [{ guid: "mon-1", name: "Login flow", domain: "SYNTH", type: "MONITOR", monitorType: "SCRIPT_BROWSER", accountId: 111, ...planted }];
+      }
+      return [];
+    },
+    async getSyntheticScript() {
+      return `const password = $secure.LOGIN_PASSWORD;\nconst inline = "${PLANTED_SECRETS.scriptInlineSecret}";\n$browser.get('https://example.com/login');`;
+    },
+    async listDashboardLiveUrls() {
+      return [{ title: "Ops overview", type: "DASHBOARD", createdAt: secondsAgo(5), url: PLANTED_SECRETS.liveUrlToken, uuid: PLANTED_SECRETS.liveUrlUuid }];
+    },
+    async listEventRetentionRules() {
+      return [{ id: "rule-1", namespace: "Log", retentionInDays: 90, createdAt: secondsAgo(100), deletedAt: null, ...planted }];
+    },
+    async listObfuscationRules() {
+      return dataGovernanceClient().listObfuscationRules().then((rules) => rules.map((rule) => ({ ...rule, ...planted })));
+    },
+    async listPipelineCloudRules() {
+      return [{ id: "rule-guid-1", name: "Drop card numbers", type: "PIPELINE_CLOUD_RULE", nrql: "DELETE cardNumber FROM Log", enabled: true, ...planted }];
+    },
+    async runNrql(accountId, nrql) {
+      if (nrql.includes("NrAuditEvent")) {
+        const rows = await accessControlClient().runNrql(accountId, nrql);
+        return rows.map((row) => ({ ...row, ...planted }));
+      }
+      if (nrql.includes("RLIKE")) return [{ matchCount: 1, message: PLANTED_SECRETS.logMessage }];
+      return dataGovernanceClient().runNrql(accountId, nrql);
+    },
+  });
+}
+
+test("bundle secret hygiene: planted credentials never reach any bundle file or zip entry", async () => {
+  const base = createTempBase("grclanker-newrelic-export-secrets-");
+  const result = await exportNewrelicAuditBundle(plantedBundleClient(), sampleConfig({ accountIds: [111] }), base, { now: NOW });
+  assert.equal(result.findingCount, 20);
+
+  const files = listFilesRecursively(result.outputDir);
+  assert.ok(files.length >= 40, `expected at least 40 files, saw ${files.length}`);
+  const fileContents = new Map(files.map((file) => [file, readFileSync(join(result.outputDir, file), "utf8")]));
+  const zipEntries = readZipEntries(readFileSync(result.zipPath));
+  assert.deepEqual([...zipEntries.keys()].filter((name) => !name.endsWith("/")).sort(), files.sort(), "the zip must contain exactly the bundle files");
+
+  for (const [label, secret] of Object.entries(PLANTED_SECRETS)) {
+    for (const [file, content] of fileContents) {
+      assert.equal(content.includes(secret), false, `${label} leaked into ${file}`);
+    }
+    for (const [entry, content] of zipEntries) {
+      assert.equal(content.includes(secret), false, `${label} leaked into zip entry ${entry}`);
+    }
+  }
+  for (const [file, content] of fileContents) {
+    assert.equal(content.includes(TEST_KEY), false, `caller API key leaked into ${file}`);
+    assert.equal(content.includes("PLANTED"), false, `a planted marker leaked into ${file}`);
+  }
+
+  const destinations = JSON.parse(fileContents.get("core_data/notification_destinations.json"));
+  assert.deepEqual(destinations.map((destination) => destination.properties), [
+    [{ key: "email", value: "ops@example.com" }],
+    [{ key: "url" }, { key: "securityCode" }, { key: "headers" }],
+    [{ key: "accessToken" }, { key: "teamName" }],
+  ]);
+  assert.ok(destinations.every((destination) => !("auth" in destination) && !("volunteered" in destination)));
+  const channels = JSON.parse(fileContents.get("core_data/notification_channels.json"));
+  assert.ok(channels.every((channel) => !("properties" in channel)));
+  assert.deepEqual(Object.keys(channels[0]).sort(), ["destinationId", "id", "name", "queriedAccountId", "type"]);
+  const keys = JSON.parse(fileContents.get("core_data/api_keys.json"));
+  assert.ok(keys.every((key) => !("key" in key) && !("volunteered" in key)));
+  const users = JSON.parse(fileContents.get("core_data/users.json"));
+  assert.ok(users.every((entry) => !("passwordHash" in entry)));
+  assert.deepEqual(JSON.parse(fileContents.get("core_data/dashboard_live_urls.json")), [{ title: "Ops overview", type: "DASHBOARD", createdAt: secondsAgo(5) }]);
+  const scriptScan = JSON.parse(fileContents.get("core_data/synthetic_script_scan.json"));
+  assert.equal(scriptScan[0].usesSecureCredentials, true);
+  assert.equal("text" in scriptScan[0], false);
+  const logScan = JSON.parse(fileContents.get("core_data/log_secret_scan.json"));
+  assert.deepEqual(logScan.matches, [{ matchCount: 1, queriedAccountId: 111 }]);
+
+  const alerting = JSON.parse(fileContents.get("analysis/alerting.json"));
+  assert.equal(alerting.findings.find((item) => item.control === 10).status, "pass");
 });
 
 test("exportNewrelicAuditBundle allocates a fresh directory and zip on repeated runs", async () => {

@@ -1160,6 +1160,227 @@ export const NEWRELIC_NERDGRAPH_SELECTIONS: Readonly<Record<string, string>> = O
   dashboardLiveUrls: QUERY_DASHBOARD_LIVE_URLS,
 });
 
+/*
+ * Stored record shapes.
+ * Every record that reaches an assessment or an evidence bundle is projected to the fields its query selects plus the
+ * scope fields this module attaches (queriedAccountId, authenticationDomainId, authenticationDomainName,
+ * provisioningType on users, rolesReadable on group grants). A value the API volunteers beyond the selection is
+ * dropped before it can reach core_data or a finding. `true` keeps a scalar or a list of scalars, a nested shape
+ * projects an object or each object of a list, and a function supplies its own projection. Values are dropped, never
+ * rewritten, with one exception: destination property values are kept only for the documented `email` key, because
+ * the destinations tutorial documents the other property values as credential-bearing (webhook URLs with embedded
+ * tokens, security codes, Slack access tokens, Authorization header values). NrAuditEvent.actorAPIKey is stored as
+ * returned because the attribute dictionary documents it as the partially obfuscated key ID.
+ * Drop-rule and pipeline-rule NRQL, obfuscation rule filters, and obfuscation expression regexes are stored verbatim
+ * as evidence and may quote literals from the tenant's own configuration.
+ */
+type FieldShape = true | RecordShape | ((value: unknown) => unknown);
+interface RecordShape {
+  readonly [field: string]: FieldShape;
+}
+
+function isScalarValue(value: unknown): boolean {
+  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
+function projectScalar(value: unknown): unknown {
+  if (isScalarValue(value)) return value;
+  if (Array.isArray(value)) return value.filter(isScalarValue);
+  return undefined;
+}
+
+function projectValue(value: unknown, shape: FieldShape): unknown {
+  if (shape === true) return projectScalar(value);
+  if (typeof shape === "function") return shape(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => asObject(entry))
+      .filter((entry): entry is JsonRecord => entry !== undefined)
+      .map((entry) => projectRecord(entry, shape));
+  }
+  if (value === null) return null;
+  const record = asObject(value);
+  return record ? projectRecord(record, shape) : undefined;
+}
+
+/** Keeps only the fields named by `shape`; anything else the API returned is dropped. */
+export function projectRecord(record: JsonRecord, shape: RecordShape): JsonRecord {
+  const projected: JsonRecord = {};
+  for (const [field, fieldShape] of Object.entries(shape)) {
+    if (!(field in record)) continue;
+    const value = projectValue(record[field], fieldShape);
+    if (value !== undefined) projected[field] = value;
+  }
+  return projected;
+}
+
+const DESTINATION_EMAIL_PROPERTY_KEY = "email";
+
+/** Stores destination property keys, and a value only for the email address key that control 10 reads. */
+function projectDestinationProperties(value: unknown): JsonRecord[] {
+  return asRecords(value).flatMap((property) => {
+    const key = asString(property.key);
+    if (key === undefined) return [];
+    if (key.toLowerCase() !== DESTINATION_EMAIL_PROPERTY_KEY) return [{ key }];
+    const address = projectScalar(property.value);
+    return [address === undefined ? { key } : { key, value: address }];
+  });
+}
+
+const SCOPE_SHAPE: RecordShape = { queriedAccountId: true };
+const ORGANIZATION_SHAPE: RecordShape = { id: true, name: true };
+const CURRENT_USER_SHAPE: RecordShape = { id: true, email: true, name: true };
+const ACCOUNT_SHAPE: RecordShape = { id: true, name: true };
+const AUTHENTICATION_DOMAIN_SHAPE: RecordShape = { id: true, name: true, provisioningType: true };
+const ORGANIZATION_AUTHENTICATION_DOMAIN_SHAPE: RecordShape = {
+  id: true,
+  name: true,
+  organizationId: true,
+  provisioningType: true,
+  authenticationType: true,
+};
+const USER_SHAPE: RecordShape = {
+  id: true,
+  name: true,
+  email: true,
+  lastActive: true,
+  type: { id: true, displayName: true },
+  groups: { groups: { id: true, displayName: true } },
+  authenticationDomainId: true,
+  authenticationDomainName: true,
+  provisioningType: true,
+};
+const GROUP_GRANT_SHAPE: RecordShape = {
+  id: true,
+  displayName: true,
+  roles: { id: true, name: true, displayName: true, type: true, accountId: true, organizationId: true },
+  rolesReadable: true,
+  authenticationDomainId: true,
+};
+const ROLE_SHAPE: RecordShape = { id: true, name: true, scope: true, type: true };
+const API_KEY_SHAPE: RecordShape = { id: true, name: true, type: true, createdAt: true, ingestType: true, accountId: true, userId: true };
+const API_KEY_ACTOR_EVENT_SHAPE: RecordShape = {
+  actorAPIKey: true,
+  actorId: true,
+  actorEmail: true,
+  actionIdentifier: true,
+  targetType: true,
+  targetId: true,
+  timestamp: true,
+  ...SCOPE_SHAPE,
+};
+const API_KEY_CHANGE_EVENT_SHAPE: RecordShape = {
+  actionIdentifier: true,
+  actorEmail: true,
+  actorType: true,
+  description: true,
+  targetType: true,
+  targetId: true,
+  timestamp: true,
+  ...SCOPE_SHAPE,
+};
+const ALERT_POLICY_SHAPE: RecordShape = { id: true, name: true, incidentPreference: true, ...SCOPE_SHAPE };
+const NRQL_CONDITION_SHAPE: RecordShape = { id: true, name: true, type: true, enabled: true, policyId: true, nrql: { query: true }, ...SCOPE_SHAPE };
+const DESTINATION_SHAPE: RecordShape = { id: true, name: true, type: true, properties: projectDestinationProperties, ...SCOPE_SHAPE };
+const CHANNEL_SHAPE: RecordShape = { id: true, name: true, type: true, destinationId: true, ...SCOPE_SHAPE };
+const WORKFLOW_SHAPE: RecordShape = {
+  id: true,
+  name: true,
+  workflowEnabled: true,
+  enrichmentsEnabled: true,
+  destinationsEnabled: true,
+  destinationConfigurations: { channelId: true, name: true, type: true, notificationTriggers: true },
+  enrichments: { id: true, name: true, configurations: { query: true } },
+  ...SCOPE_SHAPE,
+};
+const ENTITY_SHAPE: RecordShape = {
+  guid: true,
+  name: true,
+  entityType: true,
+  domain: true,
+  type: true,
+  accountId: true,
+  reporting: true,
+  tags: { key: true, values: true },
+  alertSeverity: true,
+  permissions: true,
+  monitorType: true,
+  workloadStatus: { statusValue: true },
+  ...SCOPE_SHAPE,
+};
+const RETENTION_RULE_SHAPE: RecordShape = {
+  id: true,
+  namespace: true,
+  retentionInDays: true,
+  createdAt: true,
+  createdById: true,
+  deletedAt: true,
+  deletedById: true,
+  ...SCOPE_SHAPE,
+};
+const RETENTION_NAMESPACE_SHAPE: RecordShape = { namespace: true, ...SCOPE_SHAPE };
+const OBFUSCATION_RULE_SHAPE: RecordShape = {
+  id: true,
+  name: true,
+  description: true,
+  filter: true,
+  enabled: true,
+  createdAt: true,
+  updatedAt: true,
+  actions: { attributes: true, method: true, expression: { name: true } },
+  ...SCOPE_SHAPE,
+};
+const OBFUSCATION_EXPRESSION_SHAPE: RecordShape = { id: true, name: true, regex: true, description: true, createdAt: true, updatedAt: true, ...SCOPE_SHAPE };
+const PIPELINE_CLOUD_RULE_SHAPE: RecordShape = { id: true, type: true, name: true, nrql: true, description: true, enabled: true };
+const NRQL_DROP_RULE_SHAPE: RecordShape = { id: true, nrql: true, accountId: true, action: true, createdBy: true, createdAt: true, description: true, ...SCOPE_SHAPE };
+const LIVE_URL_SHAPE: RecordShape = { title: true, type: true, createdAt: true };
+const SYNTHETIC_SCRIPT_SCAN_SHAPE: RecordShape = {
+  guid: true,
+  name: true,
+  accountId: true,
+  monitorType: true,
+  scriptLength: true,
+  usesSecureCredentials: true,
+  secretIndicators: true,
+};
+const LOG_VOLUME_SHAPE: RecordShape = { logCount: true, ...SCOPE_SHAPE };
+const LOG_SECRET_MATCH_SHAPE: RecordShape = { matchCount: true, ...SCOPE_SHAPE };
+const INFRA_HOST_COUNT_SHAPE: RecordShape = { reportingHosts: true, ...SCOPE_SHAPE };
+const INFRA_AGENT_VERSION_SHAPE: RecordShape = { agentVersion: true, facet: true, hosts: true, ...SCOPE_SHAPE };
+
+/** Every stored record shape, keyed by purpose, so tests can hold each one to the fields its query selects. */
+export const NEWRELIC_STORED_RECORD_SHAPES: Readonly<Record<string, RecordShape>> = Object.freeze({
+  organization: ORGANIZATION_SHAPE,
+  currentUser: CURRENT_USER_SHAPE,
+  accounts: ACCOUNT_SHAPE,
+  authenticationDomains: AUTHENTICATION_DOMAIN_SHAPE,
+  organizationAuthenticationDomains: ORGANIZATION_AUTHENTICATION_DOMAIN_SHAPE,
+  users: USER_SHAPE,
+  groupGrants: GROUP_GRANT_SHAPE,
+  roles: ROLE_SHAPE,
+  apiKeys: API_KEY_SHAPE,
+  apiKeyActorEvents: API_KEY_ACTOR_EVENT_SHAPE,
+  apiKeyChangeEvents: API_KEY_CHANGE_EVENT_SHAPE,
+  alertPolicies: ALERT_POLICY_SHAPE,
+  nrqlConditions: NRQL_CONDITION_SHAPE,
+  destinations: DESTINATION_SHAPE,
+  channels: CHANNEL_SHAPE,
+  workflows: WORKFLOW_SHAPE,
+  entities: ENTITY_SHAPE,
+  retentionRules: RETENTION_RULE_SHAPE,
+  retentionNamespaces: RETENTION_NAMESPACE_SHAPE,
+  obfuscationRules: OBFUSCATION_RULE_SHAPE,
+  obfuscationExpressions: OBFUSCATION_EXPRESSION_SHAPE,
+  pipelineCloudRules: PIPELINE_CLOUD_RULE_SHAPE,
+  nrqlDropRules: NRQL_DROP_RULE_SHAPE,
+  dashboardLiveUrls: LIVE_URL_SHAPE,
+  syntheticScriptScan: SYNTHETIC_SCRIPT_SCAN_SHAPE,
+  logVolume: LOG_VOLUME_SHAPE,
+  logSecretMatches: LOG_SECRET_MATCH_SHAPE,
+  infraHostCounts: INFRA_HOST_COUNT_SHAPE,
+  infraAgentVersions: INFRA_AGENT_VERSION_SHAPE,
+});
+
 export class NewrelicApiClient {
   private readonly config: NewrelicResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -1760,19 +1981,19 @@ function toPagedList<T>(value: PagedList<T> | T[]): PagedList<T> {
   return Array.isArray(value) ? completeList(value) : value;
 }
 
-async function collect<T>(source: string, fallback: T, load: () => Promise<T>): Promise<Collected<T>> {
+async function collectRecord(source: string, shape: RecordShape, load: () => Promise<JsonRecord>): Promise<Collected<JsonRecord>> {
   try {
-    return { data: await load() };
+    return { data: projectRecord(await load(), shape) };
   } catch (error) {
-    return { data: fallback, error: `${source}: ${errorMessage(error)}` };
+    return { data: {}, error: `${source}: ${errorMessage(error)}` };
   }
 }
 
-async function collectList(source: string, load: () => Promise<PagedList | JsonRecord[]>): Promise<Collected<JsonRecord[]>> {
+async function collectList(source: string, shape: RecordShape, load: () => Promise<PagedList | JsonRecord[]>): Promise<Collected<JsonRecord[]>> {
   try {
     const page = toPagedList(await load());
     return {
-      data: page.items,
+      data: page.items.map((item) => projectRecord(item, shape)),
       partial: page.failures && page.failures.length > 0 ? page.failures.map((failure) => `${source}: ${failure}`) : undefined,
       truncated: page.complete ? undefined : true,
       seen: page.items.length,
@@ -2098,18 +2319,19 @@ export async function collectNewrelicIdentityData(
   options: { userLimit?: number } = {},
 ): Promise<NewrelicIdentityData> {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 50_000);
-  const organization = await collect("organization", {} as JsonRecord, () => client.getOrganization());
-  const authenticationDomains = await collectList("userManagement.authenticationDomains", () => client.listAuthenticationDomains());
+  const organization = await collectRecord("organization", ORGANIZATION_SHAPE, () => client.getOrganization());
+  const authenticationDomains = await collectList("userManagement.authenticationDomains", AUTHENTICATION_DOMAIN_SHAPE, () => client.listAuthenticationDomains());
   const organizationId = asString(organization.data.id);
   const organizationAuthenticationDomains = await collectList(
     "customerAdministration.authenticationDomains",
+    ORGANIZATION_AUTHENTICATION_DOMAIN_SHAPE,
     async () => {
       if (!organizationId) throw new Error(`organization id was not readable (${organization.error ?? "actor.organization returned no id"})`);
       return client.listOrganizationAuthenticationDomains(organizationId);
     },
   );
-  const users = await collectList("userManagement.users", () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
-  const groupGrants = await collectList("authorizationManagement.groups", () => collectGroupGrants(client, requireDomains(authenticationDomains)));
+  const users = await collectList("userManagement.users", USER_SHAPE, () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
+  const groupGrants = await collectList("authorizationManagement.groups", GROUP_GRANT_SHAPE, () => collectGroupGrants(client, requireDomains(authenticationDomains)));
   const roles = await collectRoles(client, organization);
   return { organization, authenticationDomains, organizationAuthenticationDomains, users, groupGrants, roles };
 }
@@ -2118,7 +2340,7 @@ async function collectRoles(
   client: Pick<NewrelicClientSurface, "listRoles">,
   organization: Collected<JsonRecord>,
 ): Promise<Collected<JsonRecord[]>> {
-  return collectList(ROLE_CATALOG_SOURCE, async () => {
+  return collectList(ROLE_CATALOG_SOURCE, ROLE_SHAPE, async () => {
     const organizationId = asString(organization.data.id);
     if (!organizationId) throw new Error(`organization id was not readable (${organization.error ?? "actor.organization returned no id"})`);
     return client.listRoles(organizationId);
@@ -2473,16 +2695,17 @@ export async function collectNewrelicAccessControlData(
   const config = client.getResolvedConfig();
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 50_000);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
-  const organization = await collect("organization", {} as JsonRecord, () => client.getOrganization());
-  const accounts = await collectList("accounts", () => client.listAccounts());
-  const authenticationDomains = await collectList("userManagement.authenticationDomains", () => client.listAuthenticationDomains());
-  const users = await collectList("userManagement.users", () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
-  const groupGrants = await collectList("authorizationManagement.groups", () => collectGroupGrants(client, requireDomains(authenticationDomains)));
+  const organization = await collectRecord("organization", ORGANIZATION_SHAPE, () => client.getOrganization());
+  const accounts = await collectList("accounts", ACCOUNT_SHAPE, () => client.listAccounts());
+  const authenticationDomains = await collectList("userManagement.authenticationDomains", AUTHENTICATION_DOMAIN_SHAPE, () => client.listAuthenticationDomains());
+  const users = await collectList("userManagement.users", USER_SHAPE, () => collectUsers(client, requireDomains(authenticationDomains), userLimit));
+  const groupGrants = await collectList("authorizationManagement.groups", GROUP_GRANT_SHAPE, () => collectGroupGrants(client, requireDomains(authenticationDomains)));
   const roles = await collectRoles(client, organization);
-  const apiKeys = await collectList("apiAccess.keySearch", () => client.listApiKeys(["USER", "INGEST"], accountIds.length > 0 ? accountIds : undefined));
+  const apiKeys = await collectList("apiAccess.keySearch", API_KEY_SHAPE, () => client.listApiKeys(["USER", "INGEST"], accountIds.length > 0 ? accountIds : undefined));
   const window = config.auditWindowDays;
   const apiKeyAuditEvents = await collectList(
     "nrql.NrAuditEvent.api_key_actor",
+    API_KEY_ACTOR_EVENT_SHAPE,
     () => runNrqlAcrossAccounts(
       client,
       accountIds,
@@ -2491,6 +2714,7 @@ export async function collectNewrelicAccessControlData(
   );
   const apiKeyChangeEvents = await collectList(
     "nrql.NrAuditEvent.api_key_changes",
+    API_KEY_CHANGE_EVENT_SHAPE,
     () => runNrqlAcrossAccounts(
       client,
       accountIds,
@@ -2958,18 +3182,20 @@ export async function collectNewrelicAlertingData(
   const config = client.getResolvedConfig();
   const entityLimit = clampNumber(options.entityLimit, DEFAULT_ENTITY_LIMIT, 1, 20_000);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
-  const currentUser = await collect("actor.user", {} as JsonRecord, () => client.getCurrentUser());
-  const policies = await collectList("alerts.policiesSearch", () => collectPerAccount(accountIds, (id) => client.listAlertPolicies(id)));
-  const conditions = await collectList("alerts.nrqlConditionsSearch", () => collectPerAccount(accountIds, (id) => client.listNrqlConditions(id)));
-  const destinations = await collectList("aiNotifications.destinations", () => collectPerAccount(accountIds, (id) => client.listNotificationDestinations(id)));
-  const channels = await collectList("aiNotifications.channels", () => collectPerAccount(accountIds, (id) => client.listNotificationChannels(id)));
-  const workflows = await collectList("aiWorkflows.workflows", () => collectPerAccount(accountIds, (id) => client.listWorkflows(id)));
+  const currentUser = await collectRecord("actor.user", CURRENT_USER_SHAPE, () => client.getCurrentUser());
+  const policies = await collectList("alerts.policiesSearch", ALERT_POLICY_SHAPE, () => collectPerAccount(accountIds, (id) => client.listAlertPolicies(id)));
+  const conditions = await collectList("alerts.nrqlConditionsSearch", NRQL_CONDITION_SHAPE, () => collectPerAccount(accountIds, (id) => client.listNrqlConditions(id)));
+  const destinations = await collectList("aiNotifications.destinations", DESTINATION_SHAPE, () => collectPerAccount(accountIds, (id) => client.listNotificationDestinations(id)));
+  const channels = await collectList("aiNotifications.channels", CHANNEL_SHAPE, () => collectPerAccount(accountIds, (id) => client.listNotificationChannels(id)));
+  const workflows = await collectList("aiWorkflows.workflows", WORKFLOW_SHAPE, () => collectPerAccount(accountIds, (id) => client.listWorkflows(id)));
   const alertableEntities = await collectList(
     "entitySearch.alertable",
+    ENTITY_SHAPE,
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`alertSeverity IS NOT NULL AND accountId = ${id}`, entityLimit)),
   );
   const workloads = await collectList(
     "entitySearch.workloads",
+    ENTITY_SHAPE,
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`type = 'WORKLOAD' AND accountId = ${id}`, entityLimit)),
   );
   return { accountIds, currentUser, policies, conditions, destinations, channels, workflows, alertableEntities, workloads };
@@ -3361,36 +3587,42 @@ export async function collectNewrelicDataGovernanceData(
   const scriptSampleLimit = clampNumber(options.scriptSampleLimit, DEFAULT_SCRIPT_SAMPLE_LIMIT, 0, 500);
   const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
 
-  const retentionRules = await collectList("dataManagement.eventRetentionRules", () => collectPerAccount(accountIds, (id) => client.listEventRetentionRules(id)));
-  const retentionNamespaces = await collectList("dataManagement.customizableRetention", () => collectPerAccount(accountIds, (id) => client.listRetentionNamespaces(id)));
-  const obfuscationRules = await collectList("logConfigurations.obfuscationRules", () => collectPerAccount(accountIds, (id) => client.listObfuscationRules(id)));
-  const obfuscationExpressions = await collectList("logConfigurations.obfuscationExpressions", () => collectPerAccount(accountIds, (id) => client.listObfuscationExpressions(id)));
-  const cloudRules = await collectList("entityManagement.pipelineCloudRules", () => client.listPipelineCloudRules());
-  const dropRules = await collectList("nrqlDropRules.list", () => collectPerAccount(accountIds, (id) => client.listNrqlDropRules(id)));
+  const retentionRules = await collectList("dataManagement.eventRetentionRules", RETENTION_RULE_SHAPE, () => collectPerAccount(accountIds, (id) => client.listEventRetentionRules(id)));
+  const retentionNamespaces = await collectList("dataManagement.customizableRetention", RETENTION_NAMESPACE_SHAPE, () => collectPerAccount(accountIds, (id) => client.listRetentionNamespaces(id)));
+  const obfuscationRules = await collectList("logConfigurations.obfuscationRules", OBFUSCATION_RULE_SHAPE, () => collectPerAccount(accountIds, (id) => client.listObfuscationRules(id)));
+  const obfuscationExpressions = await collectList("logConfigurations.obfuscationExpressions", OBFUSCATION_EXPRESSION_SHAPE, () => collectPerAccount(accountIds, (id) => client.listObfuscationExpressions(id)));
+  const cloudRules = await collectList("entityManagement.pipelineCloudRules", PIPELINE_CLOUD_RULE_SHAPE, () => client.listPipelineCloudRules());
+  const dropRules = await collectList("nrqlDropRules.list", NRQL_DROP_RULE_SHAPE, () => collectPerAccount(accountIds, (id) => client.listNrqlDropRules(id)));
   const dashboards = await collectList(
     "entitySearch.dashboards",
+    ENTITY_SHAPE,
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`type = 'DASHBOARD' AND accountId = ${id}`, entityLimit)),
   );
-  const dashboardLiveUrls = await collectList("dashboard.liveUrls", () => client.listDashboardLiveUrls());
+  const dashboardLiveUrls = await collectList("dashboard.liveUrls", LIVE_URL_SHAPE, () => client.listDashboardLiveUrls());
   const syntheticMonitors = await collectList(
     "entitySearch.syntheticMonitors",
+    ENTITY_SHAPE,
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`domain = 'SYNTH' AND type = 'MONITOR' AND accountId = ${id}`, entityLimit)),
   );
   const secureCredentials = await collectList(
     "entitySearch.secureCredentials",
+    ENTITY_SHAPE,
     () => collectPerAccount(accountIds, (id) => client.searchEntities(`domain = 'SYNTH' AND type = 'SECURE_CRED' AND accountId = ${id}`, entityLimit)),
   );
-  const syntheticScripts = await collectList("synthetics.script", () => collectSyntheticScripts(client, syntheticMonitors.data, scriptSampleLimit));
+  const syntheticScripts = await collectList("synthetics.script", SYNTHETIC_SCRIPT_SCAN_SHAPE, () => collectSyntheticScripts(client, syntheticMonitors.data, scriptSampleLimit));
   const logVolume = await collectList(
     "nrql.Log.volume",
+    LOG_VOLUME_SHAPE,
     () => runNrqlAcrossAccounts(client, accountIds, "SELECT count(*) AS logCount FROM Log SINCE 1 day ago"),
   );
   const logSecretMatches = await collectList(
     "nrql.Log.secret_patterns",
+    LOG_SECRET_MATCH_SHAPE,
     () => runNrqlAcrossAccounts(client, accountIds, `SELECT count(*) AS matchCount FROM Log WHERE message RLIKE r'${LOG_SECRET_NRQL_PATTERN}' SINCE 1 day ago`),
   );
   const infraHosts = await collectList(
     "entitySearch.infraHosts",
+    INFRA_HOST_COUNT_SHAPE,
     () => collectScoped(
       accountScopes(accountIds),
       async (accountId) => {
@@ -3402,6 +3634,7 @@ export async function collectNewrelicDataGovernanceData(
   );
   const infraAgentVersions = await collectList(
     "nrql.SystemSample.agentVersion",
+    INFRA_AGENT_VERSION_SHAPE,
     () => runNrqlAcrossAccounts(client, accountIds, "SELECT uniqueCount(entityGuid) AS hosts FROM SystemSample FACET agentVersion SINCE 1 day ago LIMIT 50"),
   );
 
@@ -3955,7 +4188,8 @@ function buildQuickReference(): string {
   return [
     "# New Relic Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw NerdGraph and REST API v2 responses used during this assessment (API key values are never requested).",
+    "- `core_data/` contains the NerdGraph and REST API v2 records used during this assessment, projected to the fields each query selects (API key values are never requested; notification destination property values are stored only for the email key).",
+    "- Drop-rule and pipeline-rule NRQL, obfuscation rule filters, and obfuscation expression regexes are stored verbatim as evidence and may quote literals from your configuration.",
     "- `analysis/` contains normalized findings and per-category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `_errors.log` appears only when some reads fail but the bundle still completes.",
