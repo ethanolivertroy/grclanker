@@ -710,9 +710,15 @@ test("exportOktaAuditBundle writes the expected package and secure paths stay ro
     readFileSync(join(result.outputDir, "compliance", "fedramp", "oscal_assessment_results.json"), "utf8"),
   );
   assert.equal(oscal["assessment-results"].metadata["oscal-version"], "1.1.2");
-  const oscalFindings = oscal["assessment-results"].results[0].findings;
+  const oscalResult = oscal["assessment-results"].results[0];
+  const oscalFindings = oscalResult.findings;
   assert.ok(oscalFindings.some((finding) => finding.target["target-id"] === "ia-2.11_obj"));
   assert.ok(oscalFindings.every((finding) => ["satisfied", "not-satisfied"].includes(finding.target.status.state)));
+  const reviewedIds = oscalResult["reviewed-controls"]["control-selections"][0]["include-controls"].map(
+    (entry) => entry["control-id"],
+  );
+  assert.ok(reviewedIds.includes("ia-2.11"));
+  assert.ok(oscalResult.observations.every((observation) => !("relevant_evidence" in observation)));
 
   assert.throws(
     () => resolveSecureOutputPath(outputRoot, "../escape"),
@@ -747,6 +753,79 @@ test("OSCAL export marks manual findings not-satisfied with a manual reason", ()
   assert.equal(findings[0].target["target-id"], "au-6_obj");
 });
 
+test("OSCAL export uses relevant-evidence and reviewed-controls per the 1.1.2 assessment-results schema", () => {
+  const config = createSampleConfig();
+  const frameworks = { fedramp: [], disa_stig: [], irap: [], ismap: [], soc2: [], pci_dss: [], general: [] };
+  const oscal = buildOscalAssessmentResults(
+    config,
+    [
+      {
+        id: "OKTA-ADMIN-006",
+        title: "Okta Support access and third-party admin governance",
+        category: "admin_access",
+        status: "Pass",
+        severity: "medium",
+        summary: "Okta Support access is DISABLED and third-party administrators are not permitted.",
+        evidence: ["Okta Support access: DISABLED", "Third-party administrators: false"],
+        recommendation: "Keep disabled.",
+        frameworks: { ...frameworks, fedramp: ["AC-2", "AC-6(5)", "AC-2"] },
+      },
+      {
+        id: "OKTA-MON-009",
+        title: "Administrator security notification emails",
+        category: "monitoring",
+        status: "Manual",
+        severity: "low",
+        summary: "Not exposed by API.",
+        evidence: [],
+        recommendation: "Capture screenshots.",
+        manualNote: "Collect manually.",
+        frameworks: { ...frameworks, fedramp: ["AU-6"] },
+      },
+    ],
+    "2026-09-21T00:00:00.000Z",
+  );
+
+  const document = oscal["assessment-results"];
+  for (const key of ["uuid", "metadata", "import-ap", "results"]) {
+    assert.ok(key in document, `assessment-results.${key}`);
+  }
+  const result = document.results[0];
+  for (const key of ["uuid", "title", "description", "start", "reviewed-controls"]) {
+    assert.ok(key in result, `result.${key}`);
+  }
+
+  const reviewed = result["reviewed-controls"];
+  assert.ok(Array.isArray(reviewed["control-selections"]));
+  assert.equal(reviewed["control-selections"].length, 1);
+  const included = reviewed["control-selections"][0]["include-controls"];
+  assert.deepEqual(
+    included.map((entry) => entry["control-id"]),
+    ["ac-2", "ac-6.5", "au-6"],
+  );
+  for (const entry of included) {
+    assert.deepEqual(Object.keys(entry), ["control-id"]);
+  }
+
+  const [withEvidence, withoutEvidence] = result.observations;
+  assert.deepEqual(withEvidence["relevant-evidence"], [
+    { description: "Okta Support access: DISABLED" },
+    { description: "Third-party administrators: false" },
+  ]);
+  assert.equal("relevant-evidence" in withoutEvidence, false, "empty evidence omits relevant-evidence (minItems 1)");
+  const observationKeys = new Set(["uuid", "title", "description", "props", "links", "methods", "types", "origins", "subjects", "relevant-evidence", "collected", "expires", "remarks"]);
+  for (const observation of result.observations) {
+    for (const key of Object.keys(observation)) {
+      assert.ok(observationKeys.has(key), `observation key ${key} is not allowed by the OSCAL schema`);
+    }
+    assert.ok(Array.isArray(observation.methods) && observation.methods.length > 0);
+    assert.match(observation.uuid, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  }
+
+  const serialized = JSON.stringify(oscal);
+  assert.equal(serialized.includes("relevant_evidence"), false);
+  assert.equal(serialized.includes("reviewed_controls"), false);
+});
 
 test("OKTA-ADMIN-006 reads thirdPartyAdmin and passes only for a compliant org", () => {
   const config = createSampleConfig();

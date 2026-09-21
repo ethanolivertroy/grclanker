@@ -3938,9 +3938,15 @@ export function buildOscalAssessmentResults(
       { name: "grclanker-status", value: finding.status },
       { name: "grclanker-severity", value: finding.severity },
     ],
-    relevant_evidence: finding.evidence.map((entry) => ({ description: entry })),
+    // OSCAL observation sets additionalProperties=false and relevant-evidence minItems=1, so omit it when empty.
+    ...(finding.evidence.length > 0
+      ? { "relevant-evidence": finding.evidence.map((entry) => ({ description: entry })) }
+      : {}),
     collected: generatedAt,
   }));
+  const reviewedControlIds = [
+    ...new Set(findings.flatMap((finding) => finding.frameworks.fedramp.map((mapping) => oscalControlId(mapping)))),
+  ].sort();
   const oscalFindings = findings.flatMap((finding) =>
     finding.frameworks.fedramp.map((mapping) => ({
       uuid: oscalUuid(`${hostname}:finding:${finding.id}:${mapping}`),
@@ -3986,6 +3992,14 @@ export function buildOscalAssessmentResults(
             "Automated read-only assessment of Okta authentication, admin access, integration, and monitoring posture. Findings with state not-satisfied and reason manual require human evidence collection.",
           start: generatedAt,
           end: generatedAt,
+          "reviewed-controls": {
+            description: "NIST SP 800-53 controls targeted by the grclanker Okta findings in this result.",
+            "control-selections": [
+              reviewedControlIds.length > 0
+                ? { "include-controls": reviewedControlIds.map((controlId) => ({ "control-id": controlId })) }
+                : { description: "No findings mapped to NIST SP 800-53 controls in this result." },
+            ],
+          },
           observations,
           findings: oscalFindings,
         },
