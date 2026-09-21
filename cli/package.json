@@ -18,6 +18,7 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc && npm run brand:embedded-pi",
     "dev": "tsx index.ts",
     "start": "node dist/index.js",
+    "flue:run": "node dist/flue/cli.js run",
     "sync:fedramp": "tsx scripts/sync-fedramp.ts",
     "sync:tool-catalog": "npm run build && node scripts/generate-tool-catalog-docs.mjs",
     "postinstall": "node scripts/patch-embedded-pi.mjs --root .",
@@ -38,6 +39,7 @@
     "bin",
     "dist",
     "extensions",
+    "flue",
     "prompts",
     "scripts",
     "skills",
@@ -69,8 +71,10 @@
     "@clack/prompts": "^1.6.0",
     "@earendil-works/pi-ai": "^0.80.2",
     "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@flue/runtime": "^2.1.0",
     "@sinclair/typebox": "^0.34.48",
     "archiver": "^8.0.0",
+    "valibot": "^1.5.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

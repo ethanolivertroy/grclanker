@@ -22,6 +22,10 @@ export interface RegisteredToolParameter {
 
 const COMPUTE_TOOL_NAMES = new Set(["bash", "read", "write", "edit", "ls", "find", "grep"]);
 
+export function isComputeToolName(name: string): boolean {
+  return COMPUTE_TOOL_NAMES.has(name);
+}
+
 const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["ansible_", "Ansible AAP"],
   ["aws_", "AWS"],
@@ -123,7 +127,12 @@ function getParameterSummaries(parameters: unknown): RegisteredToolParameter[] {
   });
 }
 
-export function getRegisteredToolSummaries(): RegisteredToolSummary[] {
+/**
+ * Run the bundled extension against a capture-only API and return every tool
+ * it registers, in registration order. This is the single registration path
+ * shared by `grclanker tools` and the Flue adapter.
+ */
+export function collectRegisteredTools(): ToolDefinition[] {
   const registeredTools: ToolDefinition[] = [];
 
   const api = {
@@ -137,7 +146,11 @@ export function getRegisteredToolSummaries(): RegisteredToolSummary[] {
 
   grcTools(api);
 
-  return registeredTools.map((tool) => {
+  return registeredTools;
+}
+
+export function getRegisteredToolSummaries(): RegisteredToolSummary[] {
+  return collectRegisteredTools().map((tool) => {
     const { group, kind } = resolveToolGroup(tool.name);
     return {
       name: tool.name,
