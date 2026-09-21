@@ -1192,6 +1192,13 @@ function verdict(input: VerdictInput): GcpFinding {
       summary: `Manual: inventory unreadable (${input.inventoryError}). Collect manually: ${input.manualEvidence}`,
     };
   }
+  if (input.scannedProjects === 0) {
+    return {
+      ...base,
+      status: "manual",
+      summary: `Manual: no projects were inventoried in the scope, so per-project evidence could not be collected. Collect manually: ${input.manualEvidence}`,
+    };
+  }
   if (input.total === 0 && (allDenied || allDisabled)) {
     return {
       ...base,
@@ -1422,7 +1429,7 @@ export async function assessGcpIdentity(
   const policyBase = {
     total: iamPolicies.data.items.length,
     inventoryError: iamPolicies.error,
-    truncated: iamPolicies.truncated,
+    truncated: iamPolicies.truncated || context.truncated,
     emptyVerdict: "manual" as const,
     emptySummary: "Cloud Asset Inventory returned no IAM policies for the scope; an org or project always carries at least one binding, so treat this as a denied or empty scope.",
     manualEvidence: "export the IAM policy bindings for the organization, folders, and projects and review privileged roles.",
@@ -1664,7 +1671,7 @@ export async function assessGcpLoggingDetection(
           id: "GCP-LOG-05",
           title: "Security Command Center visibility",
           severity: "info",
-          status: sccSources.data.length > 0 ? "pass" : "warn",
+          status: sccSources.data.length > 0 && !context.truncated ? "pass" : "warn",
           summary: sccSources.data.length > 0
             ? `Security Command Center returned ${sccSources.data.length} sources and ${sccFindings.data.items.length}${sccFindings.truncated ? "+" : ""} findings. Visibility only; findings are not scored as controls.`
             : "Security Command Center returned no sources for the scope; verify the tier or organization scope. Visibility only.",
@@ -1730,6 +1737,7 @@ function orgPolicyFinding(
   failSummary: string,
   failStatus: "fail" | "warn",
   manualEvidence: string,
+  partial: boolean,
 ): GcpFinding {
   if (policy.error) {
     return manualFinding(id, title, severity, controls, `the effective org policy was not readable (${policy.error}).`, manualEvidence, { policy: null });
@@ -1739,9 +1747,11 @@ function orgPolicyFinding(
     id,
     title,
     severity,
-    status: enabled ? "pass" : failStatus,
-    summary: enabled ? passSummary : failSummary,
-    evidence: { policy: policy.data ?? null },
+    status: enabled ? (partial ? "warn" : "pass") : failStatus,
+    summary: enabled
+      ? `${passSummary}${partial ? " Partial view: the project inventory was truncated, so other projects may resolve a different effective policy." : ""}`
+      : failSummary,
+    evidence: { policy: policy.data ?? null, partial },
     mappings: controlMappings(...controls),
     controls,
   };
@@ -1833,10 +1843,16 @@ export async function assessGcpOrgGuardrails(
           id: "GCP-ORG-01",
           title: "Organization visibility",
           severity: "medium",
-          status: context.error ? "manual" : context.truncated ? "warn" : "pass",
+          status: context.error
+            ? "manual"
+            : context.truncated || context.projectIds.length === 0 || !asString(organization.data?.name)
+              ? "warn"
+              : "pass",
           summary: context.error
             ? `Manual: organization ${config.organizationId} was readable but the project inventory failed (${context.error}). Collect manually: list projects under the organization.`
-            : `Organization ${asString(organization.data?.displayName) ?? config.organizationId} was readable and ${context.projectIds.length} projects were sampled${context.truncated ? " (project inventory truncated by the project cap)" : ""}.`,
+            : !asString(organization.data?.name)
+              ? `Organization ${config.organizationId} answered without the documented name field; confirm the organization resource manually.`
+              : `Organization ${asString(organization.data?.displayName) ?? config.organizationId} was readable and ${context.projectIds.length} projects were sampled${context.truncated ? " (project inventory truncated by the project cap)" : context.projectIds.length === 0 ? " (no projects inventoried)" : ""}.`,
           evidence: { sampled_projects: context.projectIds.length, projects_truncated: context.truncated, target_project: targetProjectId ?? null },
           mappings: controlMappings(6),
           controls: [6],
@@ -1847,15 +1863,15 @@ export async function assessGcpOrgGuardrails(
     orgPolicyFinding("GCP-ORG-02", "Domain-restricted sharing", "high", [6], domainPolicy,
       "constraints/iam.allowedPolicyMemberDomains is enforced in the effective policy of the sampled project.",
       "constraints/iam.allowedPolicyMemberDomains is not enforced in the effective policy of the sampled project.",
-      "warn", "review constraints/iam.allowedPolicyMemberDomains at the organization."),
+      "warn", "review constraints/iam.allowedPolicyMemberDomains at the organization.", context.truncated),
     orgPolicyFinding("GCP-ORG-03", "Service account key creation restriction", "high", [6, 1], keyCreationPolicy,
       "constraints/iam.disableServiceAccountKeyCreation is enforced in the effective policy of the sampled project.",
       "constraints/iam.disableServiceAccountKeyCreation is not enforced in the effective policy of the sampled project.",
-      "fail", "review constraints/iam.disableServiceAccountKeyCreation at the organization."),
+      "fail", "review constraints/iam.disableServiceAccountKeyCreation at the organization.", context.truncated),
     orgPolicyFinding("GCP-ORG-04", "Service account key upload restriction", "high", [6, 1], keyUploadPolicy,
       "constraints/iam.disableServiceAccountKeyUpload is enforced in the effective policy of the sampled project.",
       "constraints/iam.disableServiceAccountKeyUpload is not enforced in the effective policy of the sampled project.",
-      "warn", "review constraints/iam.disableServiceAccountKeyUpload at the organization."),
+      "warn", "review constraints/iam.disableServiceAccountKeyUpload at the organization.", context.truncated),
     serialPortPolicy.error || shieldedVmPolicy.error
       ? manualFinding("GCP-ORG-05", "Serial port and Shielded VM guardrails", "medium", [12, 23], `the effective compute org policies were not readable (${serialPortPolicy.error ?? shieldedVmPolicy.error}).`, "review constraints/compute.disableSerialPortAccess and constraints/compute.requireShieldedVm.")
       : {
@@ -1863,7 +1879,7 @@ export async function assessGcpOrgGuardrails(
           title: "Serial port and Shielded VM guardrails",
           severity: "medium",
           status: interpretOrgPolicyEnabled(serialPortPolicy.data) && interpretOrgPolicyEnabled(shieldedVmPolicy.data)
-            ? "pass"
+            ? (context.truncated ? "warn" : "pass")
             : interpretOrgPolicyEnabled(serialPortPolicy.data) || interpretOrgPolicyEnabled(shieldedVmPolicy.data)
               ? "warn"
               : "fail",
@@ -1879,10 +1895,10 @@ export async function assessGcpOrgGuardrails(
           id: "GCP-ORG-06",
           title: "OS Login enforcement",
           severity: "high",
-          status: osLoginOverrides.length > 0 ? "warn" : "pass",
+          status: osLoginOverrides.length > 0 || context.truncated || instanceScan.denied.length > 0 || instanceScan.truncated ? "warn" : "pass",
           summary: osLoginOverrides.length > 0
             ? `constraints/compute.requireOsLogin is enforced but ${osLoginOverrides.length} instances carry an enable-oslogin metadata override that is not TRUE.`
-            : "constraints/compute.requireOsLogin is enforced in the effective policy and no instance overrides enable-oslogin.",
+            : `constraints/compute.requireOsLogin is enforced in the effective policy and no instance overrides enable-oslogin.${context.truncated || instanceScan.denied.length > 0 || instanceScan.truncated ? " Partial view: the instance inventory was truncated or partly denied." : ""}`,
           evidence: { policy: osLoginPolicy.data ?? null, instance_overrides: osLoginOverrides.slice(0, 25) },
           mappings: controlMappings(11),
           controls: [11],
@@ -2153,7 +2169,7 @@ export async function assessGcpDataProtection(
       violations: rotationViolations.length,
       unknown: rotationUnknown.length,
       inventoryError: cryptoKeys.error,
-      truncated: cryptoKeys.truncated,
+      truncated: cryptoKeys.truncated || context.truncated,
       emptyVerdict: "manual",
       passSummary: `All ${rotatingKeys.length} ENCRYPT_DECRYPT keys rotate automatically within ${MAX_KMS_ROTATION_DAYS} days and have a future nextRotationTime.`,
       failSummary: `${rotationViolations.length} of ${rotatingKeys.length} ENCRYPT_DECRYPT keys lack automatic rotation within ${MAX_KMS_ROTATION_DAYS} days.`,
@@ -2225,6 +2241,7 @@ export async function assessGcpDataProtection(
           violationStatus: "warn",
           unknown: dryRunOnlyPerimeters.length,
           inventoryError: accessPolicies.error ?? perimeterErrors[0],
+          truncated: context.truncated,
           emptyVerdict: "fail",
           passSummary: `${enforcedPerimeters.length} enforced service perimeters protect resources with restricted services.`,
           failSummary: `${perimeters.length} perimeters exist but none is enforced with both resources and restricted services.`,
