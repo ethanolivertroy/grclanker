@@ -113,7 +113,7 @@ All tools accept the same optional auth arguments listed above.
 | Privileged group hygiene | `okta_assess_admin_access` | OKTA-ADMIN-003 | Partial when a role-bearing group exceeds 25 members or expansion was capped at 25 groups; Manual when no admin-like group name matched. |
 | Admin MFA enrollment (follow-on) | `okta_assess_admin_access` | OKTA-ADMIN-004 | Reads `/users/{id}/factors` for up to 50 privileged users; Fail when any has no ACTIVE factor; Partial when any lacks a phishing-resistant factor or the set was truncated. |
 | Lifecycle hygiene (follow-on) | `okta_assess_admin_access` | OKTA-ADMIN-005 | Paginates `/users`; Fail on ACTIVE users idle 90 days or PROVISIONED/STAGED accounts older than 30 days; Partial for missing `lastLogin`, suspended, locked, expired, or recovery accounts, or a truncated listing; Manual on 403 or an empty list. |
-| Okta Support and third-party admin (follow-on) | `okta_assess_admin_access` | OKTA-ADMIN-006 | Pass only when Okta Support access is DISABLED and third-party administrators are off; Partial when support is ENABLED (with expiration in evidence); Manual when the setting is unreadable or absent. |
+| Okta Support and third-party admin (follow-on) | `okta_assess_admin_access` | OKTA-ADMIN-006 | Reads `/org/privacy/oktaSupport` (`support`) and `/org/orgSettings/thirdPartyAdminSetting` (`thirdPartyAdmin`). Pass only when support is DISABLED and `thirdPartyAdmin` is false; Partial when support is ENABLED (with expiration in evidence) or when the third-party setting returns 403/404 (the HTTP cause is named); Manual when the Okta Support setting is unreadable or absent. |
 | Trusted-origin hygiene | `okta_assess_integrations` | OKTA-INTEG-001 | Fail on ACTIVE `http://` or wildcard origins; Info when none exist; Manual on 403. |
 | Custom network-zone coverage | `okta_assess_integrations` | OKTA-INTEG-002 | Pass with an ACTIVE non-system zone; Partial with only system, legacy, or inactive zones; Manual on 403 or an empty list. |
 | Risky OIDC grant types | `okta_assess_integrations` | OKTA-INTEG-003 | Fail when an ACTIVE app uses `password` or `implicit`; Partial when only inactive apps do; Manual on 403 or an empty app list. |
@@ -150,6 +150,7 @@ The script skips with exit code 0 when no Okta configuration is present. With cr
 - Okta Workflows and HR-driven lifecycle flows are not visible through the Management API; OKTA-INTEG-006 uses app provisioning features and group rules as the observable evidence.
 - Security notification emails and admin notification preferences are not exposed by the API (OKTA-MON-009 is always Manual).
 - Okta Verify FIPS compliance is only exposed on Identity Engine orgs; Classic Engine orgs render the FIPS finding Manual.
+- The org-level factor listing (`GET /api/v1/org/factors`) is a legacy Classic Engine endpoint that is not in Okta's published OpenAPI spec; it is only used to detect Classic Engine orgs, and a 404 on it is counted in the snapshot's `dataset_errors` without changing any finding status.
 - Framework mappings are check-level evidence pointers, not attestations.
 
 ## Official documentation
@@ -158,7 +159,9 @@ The script skips with exit code 0 when no Okta configuration is present. With cr
 - [Users API: list users](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/User/#tag/User/operation/listUsers)
 - [User Factors API: list factors](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/UserFactor/#tag/UserFactor/operation/listFactors)
 - [API Tokens API](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/ApiToken/)
-- [Org Settings API: contacts, Okta Support access, third-party admins](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSetting/)
+- [Org Settings API: third-party admin setting (`OrgSettingAdmin`)](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSettingAdmin/)
+- [Org Settings API: Okta Support access (`OrgSettingSupport`)](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSettingSupport/)
+- [Org Settings API: contacts (`OrgSettingContact`)](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSettingContact/)
 - [Authenticators API (Okta Verify compliance.fips, allowedFor)](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Authenticator/)
 - [Log Streams API](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/LogStream/)
 - [Applications API (features, oauthClient.grant_types)](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Application/)
