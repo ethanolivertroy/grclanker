@@ -3,11 +3,11 @@ slug: "zendesk-sec-inspector"
 name: "Zendesk Security Inspector"
 vendor: "Zendesk"
 category: "saas-collaboration"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/zendesk-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
 # Zendesk Security Inspector
@@ -17,6 +17,19 @@ source_repo: "https://github.com/hackIDLE/zendesk-sec-inspector"
 A security compliance inspection tool for **Zendesk** customer service platforms (Support, Guide, Chat, Talk). Audits authentication settings, agent access controls, data protection configurations, audit logging, API token management, and application security against enterprise security baselines and compliance frameworks.
 
 Zendesk handles sensitive customer data (PII, support tickets, HIPAA-protected information in healthcare contexts); misconfigurations can lead to data exposure, unauthorized access, or compliance violations. This tool uses the Zendesk REST API to evaluate security posture.
+
+### grclanker implementation
+
+The shipped implementation lives in `cli/extensions/grc-tools/zendesk.ts` and registers six read-only native tools:
+
+- `zendesk_check_access`: probes the 18 Support API read surfaces the assessments depend on and reports which admin-only or Enterprise-only surfaces the credential cannot read.
+- `zendesk_assess_authentication`: controls 1-5 and 21.
+- `zendesk_assess_access_control`: controls 6-8, 13, and 14.
+- `zendesk_assess_data_protection`: controls 9-12 and 18-20.
+- `zendesk_assess_integrations`: controls 15-17 and 22-25.
+- `zendesk_export_audit_bundle`: runs the access check and all four assessments, then writes `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` on partial collection, and a paired `.zip`.
+
+Every finding carries `{id, control, title, severity, status, summary, evidence, mappings}` with `status` in `pass | warn | fail | manual`. Controls whose settings are not exposed by the published API render as `manual` findings that name the Admin Center evidence to collect. See `src/content/docs/docs/integrations/zendesk.md` for the setup guide and the control coverage table.
 
 ## 2. APIs & SDKs
 
@@ -304,4 +317,25 @@ go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as TypeScript native tools (`cli/extensions/grc-tools/zendesk.ts`) with mocked regression coverage in `cli/tests/zendesk.test.mjs` and an optional live smoke (`npm --prefix cli run test:zendesk:live`). The original Go CLI layout in sections 7-9 is retained as design history; the grclanker tools replace it.
+
+### What shipped
+
+- API token (`{email}/token:{api_token}` Basic) and OAuth bearer authentication, resolved from explicit arguments, then `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN`, `ZENDESK_OAUTH_TOKEN` (or `ZENDESK_ACCESS_TOKEN`), `ZENDESK_BASE_URL`, `ZENDESK_TIMEOUT`, then a JSON config file (`ZENDESK_CONFIG_FILE` or `~/.zendesk/config.json`).
+- A client that follows cursor pagination (`page[size]`, `meta.has_more`, `links.next`) and offset pagination (`per_page`, `next_page`) to completion or records truncation, retries 429 honoring `Retry-After` and 5xx with backoff, applies timeouts, and redacts tokens from error messages.
+- All 25 controls rendered as findings. Controls 2, 6-10, 13-18, 20, 22-25 are verified from documented API fields; controls 1, 3, 4, 5, 11, 12, 19, 21 are `manual` because the published Account Settings reference exposes no field for them; controls 13, 15, 16, 23 stay `manual` whenever an inventory exists because the review itself is a human activity.
+- Verdict safety: forbidden, missing, or errored endpoints render `manual`; empty inventories pass only where emptiness is compliant and the summary states the count; truncated inventories and undated items downgrade to `warn`; a non-admin credential (or a failed `/users/me` lookup) caps every verdict at `warn`; reruns of the export allocate a new directory and a matching zip name.
+
+### Deviations from this spec, following the official documentation
+
+- Section 3 lists Basic email and password authentication. Zendesk retired password access for the API (announced end date January 12, 2026), so the implementation supports only API tokens and OAuth bearer tokens.
+- Section 4 cites `active_features.sso`, `security.require_two_factor_auth`, `security.password_policy`, `security.ip_restrictions`, `security.session_expiration`, HIPAA flags, and end-user authentication settings under `/api/v2/account/settings`. The published Account Settings reference documents none of these keys, so controls 1, 3, 4, 5, 11, 12, and 21 are `manual` findings. Control 2 instead reads the documented per-user `two_factor_auth_enabled` flag across all active agents and admins.
+- Control 13 (API tokens) relied on `/api/v2/api_tokens`, which is not part of the published API reference. The implementation reads the documented `settings.api.api_token_access` flag (passes only when it is `false`) and otherwise renders `manual`, noting that Zendesk is retiring API tokens (unused tokens deactivated from July 28, 2026; all API tokens stop working April 30, 2027).
+- Control 24 reviews `/api/v2/webhooks` (the successor to targets) alongside `/api/v2/targets`; control 25 resolves `notification_webhook`, `notification_target`, and `share_ticket` trigger and automation actions.
+- Control 18 uses the documented `settings.tickets.private_attachments` flag as the verifiable attachment hosting control.
+
+### What remains
+
+- Help Center (Guide) article and section visibility is not inspected; brand `help_center_state` is the only Guide-related signal read.
+- Talk, Chat, and Sell settings are out of scope for the current tools and are not represented as controls in this spec's table.
+- The live smoke has not been run against a production account in CI; run `npm --prefix cli run test:zendesk:live` with admin credentials to validate a real tenant.
