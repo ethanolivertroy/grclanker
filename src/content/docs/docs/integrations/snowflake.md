@@ -9,7 +9,7 @@ The Snowflake integration runs read-only `SHOW` commands and `SNOWFLAKE.ACCOUNT_
 
 - Network policies, account-level activation, and IP allowlist breadth
 - MFA coverage for person users, password policies, session policies, SAML2 and SCIM integrations
-- Key-pair authentication for `SERVICE` and `LEGACY_SERVICE` users
+- Key-pair authentication for `SERVICE`, `SERVICE_AGENT`, and `LEGACY_SERVICE` users
 - Role hierarchy, `ACCOUNTADMIN` and `SECURITYADMIN` membership, routine `ACCOUNTADMIN` usage, direct user grants, and `PUBLIC` grants
 - Failed login patterns, stale users, retention parameters, `ACCESS_HISTORY` readability, warehouse auto-suspend
 - Masking and row access policy assignment, tag-based classification, stage and unload restrictions, Time Travel retention, outbound shares and listings, API and external access integrations
@@ -64,7 +64,7 @@ GRANT USAGE ON WAREHOUSE AUDIT_WH TO ROLE SNOWFLAKE_AUDITOR;
 GRANT ROLE SNOWFLAKE_AUDITOR TO USER GRCLANKER_SVC;
 ```
 
-`IMPORTED PRIVILEGES` on the `SNOWFLAKE` database unlocks the `ACCOUNT_USAGE` views ([enabling ACCOUNT_USAGE for other roles](https://docs.snowflake.com/en/sql-reference/account-usage#enabling-the-snowflake-database-usage-for-other-roles)). `SHOW` commands only list objects the active role can access, and `SHOW SHARES` returns an empty result without the `IMPORT SHARE` privilege, so the tools treat `ACCOUNTADMIN` and `SECURITYADMIN` as full-visibility roles and flag every other role as partial visibility: an empty `SHOW` inventory under a custom role yields `manual` or `warn`, never `pass`. `ACCESS_HISTORY` requires Enterprise Edition or higher.
+`IMPORTED PRIVILEGES` on the `SNOWFLAKE` database unlocks the `ACCOUNT_USAGE` views ([enabling ACCOUNT_USAGE for other roles](https://docs.snowflake.com/en/sql-reference/account-usage#enabling-the-snowflake-database-usage-for-other-roles)). `SHOW` commands only list objects the active role can access, so the tools treat `ACCOUNTADMIN` and `SECURITYADMIN` as full-visibility roles and flag every other role as partial visibility: an empty `SHOW` inventory under a custom role yields `manual` or `warn`, never `pass`. `SHOW SHARES` is stricter: only `ACCOUNTADMIN` lists every outbound share, other roles holding `IMPORT SHARE` list only the shares they own, and roles without the privilege receive an empty result rather than an error, so control 22 passes only under `ACCOUNTADMIN`. `ACCESS_HISTORY` requires Enterprise Edition or higher.
 
 ## Tools
 
@@ -101,12 +101,12 @@ Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and neve
 | 1 | Network policy configured and applied to account | network_and_authentication | SNOWFLAKE-01 | pass when `SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT` reports a policy at `ACCOUNT` level; warn when only user-level `POLICY_REFERENCES` exist; fail on zero policies or no activation |
 | 2 | Network policy IP allowlist is restrictive | network_and_authentication | SNOWFLAKE-02 | fail on `0.0.0.0/0`, `::/0`, or CIDRs broader than `/8`, or zero policies in `NETWORK_POLICIES`; warn when every `ALLOWED_IP_LIST` is empty |
 | 3 | MFA enforced for all human users | network_and_authentication | SNOWFLAKE-03 | reads `TYPE`, `DISABLED`, `HAS_PASSWORD`, `HAS_MFA`, `EXT_AUTHN_DUO`; fail if any enabled person user with a password lacks both flags; manual on zero users |
-| 4 | Password policy meets complexity requirements | network_and_authentication | SNOWFLAKE-04 | requires an `ACCOUNT`-level assignment in `POLICY_REFERENCES` and a policy meeting `min_password_length`, one of each character class, and retries <= 10 |
-| 5 | Key pair authentication used for service accounts | network_and_authentication | SNOWFLAKE-05 | fail if any `SERVICE` or `LEGACY_SERVICE` user lacks `HAS_RSA_PUBLIC_KEY` or `HAS_WORKLOAD_IDENTITY`, or still has a password; manual when no user is typed as a service user |
+| 4 | Password policy meets complexity requirements | network_and_authentication | SNOWFLAKE-04 | discovers policies in `ACCOUNT_USAGE.PASSWORD_POLICIES`, then runs the `INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => ...)` table function per policy (the `ACCOUNT_USAGE.POLICY_REFERENCES` view does not cover password policies); requires a `REF_ENTITY_DOMAIN = 'ACCOUNT'` row and a policy meeting `min_password_length`, one of each character class, and retries <= 10; manual when a lookup is denied or a limited role sees no account row |
+| 5 | Key pair authentication used for service accounts | network_and_authentication | SNOWFLAKE-05 | fail if any `SERVICE`, `SERVICE_AGENT`, or `LEGACY_SERVICE` user lacks `HAS_RSA_PUBLIC_KEY` or `HAS_WORKLOAD_IDENTITY`, or still has a password; `SNOWFLAKE_SERVICE` users are Snowflake managed and listed in evidence; an unrecognized `TYPE` value is surfaced and blocks `pass`; manual when no user is typed as a service user |
 | 6 | SSO/SAML integration configured | network_and_authentication | SNOWFLAKE-06 | pass on an enabled `SAML2` security integration (SCIM reported); fail when none is enabled; manual when a custom role sees none |
 | 7 | Role hierarchy follows least privilege | access_control | SNOWFLAKE-07 | fail if a custom role inherits `ACCOUNTADMIN` or `SECURITYADMIN`; warn on sensitive global privileges on custom roles or roles that do not roll up to `SYSADMIN`; manual on an empty graph |
 | 8 | ACCOUNTADMIN role has minimal members | access_control | SNOWFLAKE-08 | fail above `max_accountadmins`; warn on a single member; manual on zero rows (Snowflake always has at least one) |
-| 9 | ACCOUNTADMIN not used for routine queries | access_control | SNOWFLAKE-09 | fail at 10 percent or 100 routine queries in the lookback window; warn on any usage; manual on an empty window |
+| 9 | ACCOUNTADMIN not used for routine queries | access_control | SNOWFLAKE-09 | fail at 10 percent or 100 routine queries in the lookback window; warn on any usage or when the 500-row role list is truncated; manual on an empty window |
 | 10 | No direct object grants to users | access_control | SNOWFLAKE-10 | pass only when `GRANTS_TO_ROLES WHERE GRANTED_TO = 'USER'` was readable and empty |
 | 11 | Failed login monitoring | monitoring_and_lifecycle | SNOWFLAKE-11 | fail when a user/IP source exceeds `failed_login_threshold`; manual when `LOGIN_HISTORY` has zero events in the window |
 | 12 | Stale users disabled | monitoring_and_lifecycle | SNOWFLAKE-12 | fail on enabled person users beyond `stale_user_days`; warn when any enabled user has a NULL `LAST_SUCCESS_LOGIN`; manual on zero users |
@@ -119,10 +119,10 @@ Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and neve
 | 19 | Time Travel retention for databases | data_protection | SNOWFLAKE-19 | fail when a customer database has `retention_time` below `min_retention_days`; warn under a custom role; manual on zero databases |
 | 20 | Tri-Secret Secure | data_protection | SNOWFLAKE-20 | always manual: Business Critical feature enabled through Snowflake Support, not exposed in SQL |
 | 21 | Customer-managed keys configured | data_protection | SNOWFLAKE-21 | always manual: `SYSTEM$GET_SNOWFLAKE_PLATFORM_INFO()` returns VPC/VNet IDs only; collect KMS evidence |
-| 22 | Outbound shares reviewed | data_protection | SNOWFLAKE-22 | warn on any `OUTBOUND` share (listing exposure counted); pass on zero outbound shares only under `ACCOUNTADMIN` or `SECURITYADMIN`; manual on zero rows under other roles |
+| 22 | Outbound shares reviewed | data_protection | SNOWFLAKE-22 | warn on any `OUTBOUND` share (listing exposure counted, partial inventory noted under non-`ACCOUNTADMIN` roles); pass on zero outbound shares only under `ACCOUNTADMIN`; manual under every other role because `SHOW SHARES` lists only owned shares or returns empty without `IMPORT SHARE` |
 | 23 | External functions and API integrations reviewed | data_protection | SNOWFLAKE-23 | warn on enabled `API` or `EXTERNAL_ACCESS` integrations; pass on none only with full visibility |
 | 24 | Warehouse auto-suspend configured | monitoring_and_lifecycle | SNOWFLAKE-24 | fail on `auto_suspend` NULL or 0; warn above `max_auto_suspend_seconds` or under a custom role; manual on zero warehouses |
-| 25 | Session policies configured | network_and_authentication | SNOWFLAKE-25 | requires an `ACCOUNT`-level `POLICY_REFERENCES` assignment with idle timeouts within `max_session_idle_minutes` |
+| 25 | Session policies configured | network_and_authentication | SNOWFLAKE-25 | discovers policies in `ACCOUNT_USAGE.SESSION_POLICIES`, then runs the `INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => ...)` table function per policy; requires a `REF_ENTITY_DOMAIN = 'ACCOUNT'` row with idle timeouts within `max_session_idle_minutes`; manual when a lookup is denied or a limited role sees no account row |
 
 Any control whose required statement is denied, fails, or times out renders as `manual` with the cause and the Snowsight evidence to collect.
 
@@ -168,7 +168,9 @@ The script exits 0 with a skip message when no credentials resolve. With credent
 - [SESSION_POLICIES view](https://docs.snowflake.com/en/sql-reference/account-usage/session_policies)
 - [MASKING_POLICIES view](https://docs.snowflake.com/en/sql-reference/account-usage/masking_policies)
 - [ROW_ACCESS_POLICIES view](https://docs.snowflake.com/en/sql-reference/account-usage/row_access_policies)
-- [POLICY_REFERENCES view](https://docs.snowflake.com/en/sql-reference/account-usage/policy_references)
+- [POLICY_REFERENCES view](https://docs.snowflake.com/en/sql-reference/account-usage/policy_references) (aggregation, feature, masking, network, projection, row access, and storage lifecycle policies only)
+- [POLICY_REFERENCES table function](https://docs.snowflake.com/en/sql-reference/functions/policy_references) (password and session policy assignments)
+- [User types](https://docs.snowflake.com/en/user-guide/admin-user-management#types-of-users)
 - [TAG_REFERENCES view](https://docs.snowflake.com/en/sql-reference/account-usage/tag_references)
 - [SHOW NETWORK POLICIES](https://docs.snowflake.com/en/sql-reference/sql/show-network-policies)
 - [SHOW PARAMETERS](https://docs.snowflake.com/en/sql-reference/sql/show-parameters)
