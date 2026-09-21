@@ -37,7 +37,7 @@ const DEFAULT_ACS_BASE_URL = "https://admin.splunk.com";
 const DEFAULT_CONFIG_FILE = join(homedir(), ".config", "grclanker", "splunk.json");
 const DEFAULT_RETRY_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 400;
-const ADMIN_ROLE_NAMES = new Set(["admin", "sc_admin", "splunk-system-role"]);
+const ADMIN_ROLE_NAMES = new Set(["admin", "sc_admin", "splunk-system-role", "can_delete"]);
 const ACS_ALLOWLIST_FEATURES = ["search-api", "hec", "s2s", "search-ui"] as const;
 const CORE_APP_PREFIXES = ["splunk_", "splunk-", "SplunkForwarder", "SplunkLightForwarder", "SA-", "DA-", "TA-"];
 const CORE_APP_NAMES = new Set([
@@ -978,6 +978,17 @@ function parseSplunkDurationMinutes(value: string | undefined): number | undefin
   }
 }
 
+function downgradePassOnPartialInventory(
+  findings: SplunkFinding[],
+  sources: Array<[string, Collected<SplunkListResult> | undefined]>,
+): SplunkFinding[] {
+  const partialSources = sources.filter(([, item]) => item?.ok && partialView(item.value)).map(([name]) => name);
+  if (partialSources.length === 0) return findings;
+  return findings.map((item) => item.status === "pass"
+    ? { ...item, status: "warn", summary: `${item.summary} Downgraded: the ${partialSources.join(", ")} inventory was only partially retrieved (paging.total exceeded the entries returned).`, evidence: { ...item.evidence, partial_sources: partialSources } }
+    : item);
+}
+
 function summarizeStatuses(findings: SplunkFinding[]): JsonRecord {
   return {
     pass: findings.filter((item) => item.status === "pass").length,
@@ -1190,10 +1201,11 @@ export async function assessSplunkAuthentication(
     }
   }
 
+  const finalFindings = downgradePassOnPartialInventory(findings, [["conf-authentication", authConf], ["conf-web", webConf], ["conf-server", serverConf], ["users", users], ["tokens", tokens]]);
   return {
     title: "Splunk authentication and identity",
-    summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", auth_type: authType ?? null, ...summarizeStatuses(findings) },
-    findings,
+    summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", auth_type: authType ?? null, ...summarizeStatuses(finalFindings) },
+    findings: finalFindings,
     errors: collectedErrors([["server/info", deployment.collected], ["conf-authentication", authConf], ["conf-web", webConf], ["conf-server", serverConf], ["users", users], ["tokens", tokens], ["roles", roles]]),
   };
 }
@@ -1343,10 +1355,11 @@ export async function assessSplunkAccessControl(
     }
   }
 
+  const finalFindings = downgradePassOnPartialInventory(findings, [["roles", roles], ["users", users], ["saved-searches", savedSearches], ["lookup-table-files", lookups]]);
   return {
     title: "Splunk authorization and access control",
-    summary: { url: client.getResolvedConfig().url, roles: roles.ok ? roles.value.entries.length : null, users: users.ok ? users.value.entries.length : null, ...summarizeStatuses(findings) },
-    findings,
+    summary: { url: client.getResolvedConfig().url, roles: roles.ok ? roles.value.entries.length : null, users: users.ok ? users.value.entries.length : null, ...summarizeStatuses(finalFindings) },
+    findings: finalFindings,
     errors: collectedErrors([["roles", roles], ["users", users], ["saved-searches", savedSearches], ["lookup-table-files", lookups]]),
   };
 }
@@ -1388,23 +1401,24 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     const webSslRaw = asBoolean(webSettings?.enableSplunkWebSSL);
     const assumed: string[] = [];
     const problems: string[] = [];
-    if (!ssl) problems.push("server.conf [sslConfig] stanza not returned");
+    const unknowns: string[] = [];
+    if (!ssl) unknowns.push("server.conf [sslConfig] stanza not returned");
     if (splunkdSslRaw === false) problems.push("enableSplunkdSSL=false");
     if (ssl && splunkdSslRaw === undefined) assumed.push("enableSplunkdSSL absent, documented default true assumed");
     if (sslVersions.length === 0 && ssl) assumed.push("sslVersions absent, documented default tls1.2 assumed");
     if (sslVersions.length > 0 && tlsVersionsAllowLegacy(sslVersions)) problems.push(`sslVersions=${sslVersions.join(",")} permits TLS below 1.2`);
     if (!webConf.ok) {
-      problems.push(`web.conf unreadable (${unreadableCause(webConf)})`);
+      unknowns.push(`web.conf unreadable (${unreadableCause(webConf)})`);
     } else if (webSslRaw === false || (webSettings && webSslRaw === undefined)) {
       problems.push(webSslRaw === false ? "enableSplunkWebSSL=false" : "enableSplunkWebSSL absent (documented default false)");
     } else if (!webSettings) {
-      problems.push("web.conf [settings] stanza not returned");
+      unknowns.push("web.conf [settings] stanza not returned");
     }
-    const evidence = { enableSplunkdSSL: ssl?.enableSplunkdSSL ?? null, sslVersions, cipherSuite: asString(ssl?.cipherSuite) ?? null, requireClientCert: ssl?.requireClientCert ?? null, enableSplunkWebSSL: webSettings?.enableSplunkWebSSL ?? null, web_sslVersions: asStringList(webSettings?.sslVersions), assumed_defaults: assumed, problems };
-    if (deployment.info.isCloud && (!ssl || !webSettings)) {
-      findings.push(finding(13, "manual", "Splunk Cloud manages TLS on the management and web ports and the sslConfig or web settings stanza was not exposed; record the Splunk Cloud TLS attestation as evidence.", evidence));
-    } else if (problems.length > 0) {
+    const evidence = { enableSplunkdSSL: ssl?.enableSplunkdSSL ?? null, sslVersions, cipherSuite: asString(ssl?.cipherSuite) ?? null, requireClientCert: ssl?.requireClientCert ?? null, enableSplunkWebSSL: webSettings?.enableSplunkWebSSL ?? null, web_sslVersions: asStringList(webSettings?.sslVersions), assumed_defaults: assumed, problems, unknowns };
+    if (problems.length > 0) {
       findings.push(finding(13, "fail", `TLS configuration problems: ${problems.join("; ")}.`, evidence));
+    } else if (unknowns.length > 0) {
+      findings.push(finding(13, "manual", `Unknown: ${unknowns.join("; ")}${deployment.info.isCloud ? " (Splunk Cloud manages TLS on these ports; record the Splunk Cloud TLS attestation)" : ""}. Collect server.conf [sslConfig] and web.conf [settings] manually.`, evidence));
     } else {
       findings.push(finding(13, requireClientCert === true ? "pass" : "warn", `splunkd and Splunk Web use TLS with sslVersions ${sslVersions.join(",") || "tls1.2 (default)"}${requireClientCert === true ? " and requireClientCert=true" : "; requireClientCert is not enabled"}${assumed.length > 0 ? `; ${assumed.join("; ")}` : ""}.`, evidence));
     }
@@ -1490,10 +1504,11 @@ export async function assessSplunkDataProtection(client: SplunkInspectorClient):
     }
   }
 
+  const finalFindings = downgradePassOnPartialInventory(findings, [["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["tcp-ssl-inputs", sslInputs], ["hec-inputs", hecInputs], ["indexes", indexes]]);
   return {
     title: "Splunk data protection and encryption",
-    summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", acs_configured: client.hasAcs(), ...summarizeStatuses(findings) },
-    findings,
+    summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", acs_configured: client.hasAcs(), ...summarizeStatuses(finalFindings) },
+    findings: finalFindings,
     errors: collectedErrors([["server/info", deployment.collected], ["conf-server", serverConf], ["conf-web", webConf], ["conf-outputs", outputsConf], ["tcp-ssl-inputs", sslInputs], ["hec-inputs", hecInputs], ["indexes", indexes], ...(acsHec ? [["acs-hec", acsHec] as [string, Collected<unknown>]] : [])]),
   };
 }
@@ -1573,10 +1588,11 @@ export async function assessSplunkAuditMonitoring(
     }
   }
 
+  const finalFindings = downgradePassOnPartialInventory(findings, [["indexes", indexes], ["roles", roles], ["users", users]]);
   return {
     title: "Splunk audit and monitoring",
-    summary: { url: client.getResolvedConfig().url, audit_index_visible: Boolean(auditIndex), ...summarizeStatuses(findings) },
-    findings,
+    summary: { url: client.getResolvedConfig().url, audit_index_visible: Boolean(auditIndex), ...summarizeStatuses(finalFindings) },
+    findings: finalFindings,
     errors: collectedErrors([["indexes", indexes], ["roles", roles], ["users", users]]),
   };
 }
@@ -1730,10 +1746,11 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     }
   }
 
+  const finalFindings = downgradePassOnPartialInventory(findings, [["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["tcp-ssl-inputs", sslInputs]]);
   return {
     title: "Splunk network and platform hardening",
-    summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", version: deployment.info.version ?? null, acs_configured: client.hasAcs(), ...summarizeStatuses(findings) },
-    findings,
+    summary: { url: client.getResolvedConfig().url, deployment: deployment.info.isCloud ? "splunk_cloud" : "enterprise", version: deployment.info.version ?? null, acs_configured: client.hasAcs(), ...summarizeStatuses(finalFindings) },
+    findings: finalFindings,
     errors: collectedErrors([["server/info", deployment.collected], ["apps", apps], ["roles", roles], ["kv-collections", kvCollections], ["saved-searches", savedSearches], ["users", users], ["tcp-cooked-inputs", cookedInputs], ["tcp-ssl-inputs", sslInputs]]),
   };
 }
