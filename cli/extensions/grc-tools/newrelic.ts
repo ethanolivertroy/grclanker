@@ -2013,8 +2013,13 @@ function isComplete(item: Collected<unknown>): boolean {
   return !item.error && !(item.partial && item.partial.length > 0) && !item.truncated && !item.note;
 }
 
-function coverageNote(label: string, item: Collected<unknown[]>): string | undefined {
-  if (item.error) return undefined;
+/**
+ * Describes why a collected inventory is less than complete, or returns undefined when it is complete. A fully
+ * unreadable inventory is described too (rule 1 corollary): a finding that lists such an inventory in its coverage is
+ * limited below pass even when its primary inventory was complete, and the note names the dataset and query path.
+ */
+function coverageDetail(item: Collected<unknown[]>): string | undefined {
+  if (item.error) return `unreadable (${causeOf(item)})`;
   const parts: string[] = [];
   if (item.truncated) {
     parts.push(`${item.seen ?? item.data.length}${item.total !== undefined ? ` of ${item.total}` : ""} seen before pagination stopped`);
@@ -2023,16 +2028,87 @@ function coverageNote(label: string, item: Collected<unknown[]>): string | undef
     parts.push(`${item.partial.length} scope${item.partial.length === 1 ? "" : "s"} unreadable (${item.partial.join("; ")})`);
   }
   if (item.note) parts.push(item.note);
-  return parts.length > 0 ? `${label}: ${parts.join("; ")}` : undefined;
+  return parts.length > 0 ? parts.join("; ") : undefined;
+}
+
+function coverageNote(label: string, item: Collected<unknown[]>): string | undefined {
+  const detail = coverageDetail(item);
+  return detail ? `${label}: ${detail}` : undefined;
 }
 
 function coverageNotes(entries: Array<[string, Collected<unknown[]>]>): string[] {
   return entries.map(([label, item]) => coverageNote(label, item)).filter((note): note is string => Boolean(note));
 }
 
+/** Evidence status for an inventory: "complete", or the same detail the coverage note carries. */
+function collectionStatus(item: Collected<unknown[]>): string {
+  return coverageDetail(item) ?? "complete";
+}
+
+/** A count derived from an unreadable inventory is rendered as null (beside its status), never as 0. */
+function countUnlessUnreadable(item: Collected<unknown[]>, count: number): number | null {
+  return item.error ? null : count;
+}
+
+/** A list derived from an unreadable inventory is rendered as null (beside its status), never as []. */
+function listUnlessUnreadable<T>(item: Collected<unknown[]>, values: T[]): T[] | null {
+  return item.error ? null : values;
+}
+
+const SCOPE_FAILURE_PATTERN = /^(account \d+|authentication domain .+?): (.+)$/;
+
+/**
+ * Renders a collection error for a finding summary. The full text stays in the errors array and `_errors.log`. When
+ * the text exceeds the summary budget, scopes that failed with the same message are merged ("account 111, account
+ * 222: ...") so every query path survives, further scopes are counted rather than cut mid-path, and a single long
+ * message is shortened ahead of its "(at path)" suffix, never through it.
+ */
+export function compactCause(cause: string): string {
+  if (cause.length <= CAUSE_MAX_LENGTH) return cause;
+  const separator = cause.indexOf(": ");
+  const prefix = separator === -1 ? "" : `${cause.slice(0, separator)}: `;
+  const groups = mergeScopeFailures((separator === -1 ? cause : cause.slice(separator + 2)).split("; "));
+  const kept: string[] = [];
+  let omitted = 0;
+  for (const group of groups) {
+    const candidate = [...kept, group].join("; ");
+    if (kept.length > 0 && prefix.length + candidate.length > CAUSE_MAX_LENGTH) {
+      omitted += 1;
+      continue;
+    }
+    kept.push(group);
+  }
+  const body = kept.join("; ");
+  const suffix = omitted > 0 ? `; ${omitted} more scope${omitted === 1 ? "" : "s"} failed and ${omitted === 1 ? "is" : "are"} listed in the errors array` : "";
+  return `${prefix}${truncateAheadOfPath(body, Math.max(CAUSE_MAX_LENGTH - prefix.length - suffix.length, 40))}${suffix}`;
+}
+
+function mergeScopeFailures(segments: string[]): string[] {
+  const merged: Array<{ scopes: string[]; message: string }> = [];
+  for (const segment of segments) {
+    const match = SCOPE_FAILURE_PATTERN.exec(segment);
+    if (!match) {
+      merged.push({ scopes: [], message: segment });
+      continue;
+    }
+    const existing = merged.find((entry) => entry.scopes.length > 0 && entry.message === match[2]);
+    if (existing) existing.scopes.push(match[1]);
+    else merged.push({ scopes: [match[1]], message: match[2] });
+  }
+  return merged.map((entry) => (entry.scopes.length > 0 ? `${entry.scopes.join(", ")}: ${entry.message}` : entry.message));
+}
+
+function truncateAheadOfPath(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const pathStart = text.lastIndexOf(" (at ");
+  const path = pathStart === -1 ? "" : text.slice(pathStart);
+  const room = budget - path.length - 3;
+  if (room <= 0) return `${text.slice(0, Math.max(budget - 3, 1))}...`;
+  return `${text.slice(0, room)}...${path}`;
+}
+
 function causeOf(item: Collected<unknown>): string {
-  const cause = item.error ?? "unknown cause";
-  return cause.length > CAUSE_MAX_LENGTH ? `${cause.slice(0, CAUSE_MAX_LENGTH)}...` : cause;
+  return compactCause(item.error ?? "unknown cause");
 }
 
 function verdict(status: NewrelicFindingStatus, summary: string): Verdict {
@@ -2047,11 +2123,27 @@ function unreadableVerdict(surface: string, item: Collected<unknown>, evidence: 
   return manualVerdict(`${surface} could not be read (${causeOf(item)}), so this control is unknown rather than passing. Collect ${evidence}`);
 }
 
+const UNREADABLE_NOTE_PATTERN = /: unreadable \((.*)\)$/;
+
+/**
+ * Caps a finding by the coverage of every inventory it lists. A passing verdict becomes warn when any listed inventory
+ * was unreadable, partly unreadable, or truncated; the appended clause names each dataset and query path. A verdict
+ * that is already below pass keeps its status and gains the clause, minus notes whose cause it already quotes.
+ */
 function limitCoverage(base: Verdict, notes: string[]): Verdict {
-  if (notes.length === 0) return base;
-  const suffix = ` Partial view: ${notes.join("; ")}.`;
+  const unseen = base.status === "pass"
+    ? notes
+    : notes.filter((note) => {
+      const cause = UNREADABLE_NOTE_PATTERN.exec(note)?.[1];
+      return cause === undefined || !base.summary.includes(cause);
+    });
+  if (unseen.length === 0) return base;
+  const suffix = ` Partial view: ${unseen.join("; ")}.`;
   if (base.status === "pass") {
-    return verdict("warn", `${base.summary} The inventory was incomplete, so the verdict is limited to warn instead of pass.${suffix}`);
+    const reason = unseen.some((note) => UNREADABLE_NOTE_PATTERN.test(note))
+      ? "A dataset this finding depends on was unreadable"
+      : "The inventory was incomplete";
+    return verdict("warn", `${base.summary} ${reason}, so the verdict is limited to warn instead of pass.${suffix}`);
   }
   return verdict(base.status, `${base.summary}${suffix}`);
 }
@@ -2581,36 +2673,41 @@ export function assessNewrelicIdentityData(
   }));
 
   findings.push(finding(2, limitCoverage(control2(), userCoverage), {
-    users: users.length,
+    users: countUnlessUnreadable(data.users, users.length),
+    user_listing_status: collectionStatus(data.users),
     user_type_counts: userTypeCounts,
-    full_platform_percent: fullPlatformShare,
+    full_platform_percent: usersReadable ? fullPlatformShare : null,
     max_full_platform_percent: maxFullPlatformPercent,
     inactive_full_platform_users: sample(inactiveFullPlatformUsers.map(userLabel)),
     undated_full_platform_users: sample(undatedFullPlatformUsers.map(userLabel)),
     unknown_type_users: sample(unknownTypeUsers.map(userLabel)),
   }));
 
+  const adminRosterReadable = usersReadable && grantsReadable;
   findings.push(finding(3, limitCoverage(control3(), [...groupCoverage, ...userCoverage]), {
-    admin_groups: sample(adminGroupNames),
-    admin_users: adminUsers.length,
-    admin_user_sample: sample(adminUsers.map(userLabel)),
+    admin_groups: listUnlessUnreadable(data.groupGrants, sample(adminGroupNames)),
+    admin_users: adminRosterReadable ? adminUsers.length : null,
+    admin_user_sample: adminRosterReadable ? sample(adminUsers.map(userLabel)) : null,
+    admin_roster_status: adminRosterReadable ? "readable" : `unreadable: users ${collectionStatus(data.users)}; groups ${collectionStatus(data.groupGrants)}`,
     max_admins: maxAdmins,
     admin_role_pattern: adminRolePattern.source,
-    users_without_group_data: usersWithoutGroupData.length,
-    groups_without_role_data: groupsWithoutRoleData.length,
+    users_without_group_data: countUnlessUnreadable(data.users, usersWithoutGroupData.length),
+    groups_without_role_data: countUnlessUnreadable(data.groupGrants, groupsWithoutRoleData.length),
   }));
 
   findings.push(finding(18, limitCoverage(control18(), domainCoverage), {
     authentication_domains: domainProvisioning,
     manual_provisioning_domains: manualProvisioningDomains.map((domain) => domain.name),
     unknown_provisioning_domains: unknownProvisioningDomains.map((domain) => domain.name),
-    custom_roles_visible: customRoles.length,
+    custom_roles_visible: countUnlessUnreadable(data.roles, customRoles.length),
+    role_catalog_status: collectionStatus(data.roles),
     manual_evidence: "Administration > Access Management > Authentication domains: Session settings and User upgrade settings for each domain.",
   }));
 
   findings.push(finding(19, limitCoverage(control19(), userCoverage), {
     inactive_days: inactiveDays,
-    inactive_users: inactiveUsers.length,
+    inactive_users: countUnlessUnreadable(data.users, inactiveUsers.length),
+    user_listing_status: collectionStatus(data.users),
     inactive_user_sample: sample(inactiveUsers.map(userLabel)),
     never_active_users: sample(neverActiveUsers.map(userLabel)),
   }));
@@ -2622,15 +2719,15 @@ export function assessNewrelicIdentityData(
     summary: {
       region: config.region,
       organization: asString(data.organization.data.name) ?? asString(data.organization.data.id) ?? null,
-      authentication_domains: domains.length,
-      sso_domains: ssoDomains.length,
-      password_domains: passwordDomains.length,
-      scim_domains: scimDomains.length,
-      users: users.length,
-      full_platform_users: fullPlatformUsers.length,
-      admin_users: adminUsers.length,
-      inactive_users: inactiveUsers.length,
-      custom_roles: customRoles.length,
+      authentication_domains: countUnlessUnreadable(data.authenticationDomains, domains.length),
+      sso_domains: countUnlessUnreadable(data.organizationAuthenticationDomains, ssoDomains.length),
+      password_domains: countUnlessUnreadable(data.organizationAuthenticationDomains, passwordDomains.length),
+      scim_domains: countUnlessUnreadable(data.authenticationDomains, scimDomains.length),
+      users: countUnlessUnreadable(data.users, users.length),
+      full_platform_users: countUnlessUnreadable(data.users, fullPlatformUsers.length),
+      admin_users: data.users.error || data.groupGrants.error ? null : adminUsers.length,
+      inactive_users: countUnlessUnreadable(data.users, inactiveUsers.length),
+      custom_roles: countUnlessUnreadable(data.roles, customRoles.length),
       collection_errors: collectedErrors(allCollected).length,
       coverage_limitations: [...domainCoverage, ...authTypeCoverage, ...userCoverage, ...groupCoverage].length,
     },
@@ -2831,6 +2928,9 @@ export function assessNewrelicAccessControlData(
   const access = buildUserAccountAccess(users, groupGrants, adminRolePattern);
   const adminUserIds = new Set(access.filter((entry) => entry.admin).map((entry) => asString(entry.user.id) ?? ""));
   const adminOwnedUserKeys = userKeys.filter((key) => adminUserIds.has(asString(key.userId) ?? ""));
+  // The admin roster is the join of users and group grants; a domain missing from either side hides admins, so the
+  // absence of admin-owned keys is concluded only when both listings are complete.
+  const adminRosterComplete = isComplete(data.users) && isComplete(data.groupGrants);
   const userKeysWithoutOwner = userKeys.filter((key) => asString(key.userId) === undefined);
   const ownerIdsUnavailable = userKeys.length > 0 && userKeysWithoutOwner.length === userKeys.length;
   const ownerIdsUnavailableNote = `none of the ${userKeys.length} user keys exposed a userId (the schema-cited ApiAccessUserKey.userId field was not returned)`;
@@ -2918,6 +3018,9 @@ export function assessNewrelicAccessControlData(
     }
     if (usersWithoutGroupData.length > 0 || groupsWithoutRoleData.length > 0 || userKeysWithoutOwner.length > 0) {
       return verdict("warn", `${keyInventoryLabel} with names and readable key types, but ${usersWithoutGroupData.length} users expose no group membership, ${groupsWithoutRoleData.length} groups expose no role grants, and ${userKeysWithoutOwner.length} user keys expose no userId, so admin-owned user keys may be undercounted.`);
+    }
+    if (!adminRosterComplete) {
+      return verdict("warn", `${keyInventoryLabel} with names and readable key types; none of the ${userKeys.length} user keys belongs to the ${adminUserIds.size} admin users visible so far, but the admin roster (userManagement.users joined to authorizationManagement.groups) is incomplete, so the absence of admin-owned keys is not concluded.`);
     }
     return verdict("pass", `${keyInventoryLabel} with names, readable key types, and no user keys owned by admin group members (${adminUserIds.size} admin users matched against ${userKeys.length} user keys, every one exposing a userId).`);
   };
@@ -3018,22 +3121,32 @@ export function assessNewrelicAccessControlData(
     if (unknownTypeRoles.length > 0) return manualVerdict(`${unknownTypeRoles.length}/${roles.length} roles exposed a type other than ${ROLE_TYPE_CUSTOM} or ${ROLE_TYPE_STANDARD} (the MultiTenantAuthorizationRoleTypeEnum values), so custom roles cannot be distinguished from standard ones. Collect the role list with types from Administration > Access Management > Roles.`);
     if (!isComplete(data.roles)) return verdict("warn", `No custom roles appeared among ${roles.length} roles, but the role listing was incomplete, so unseen custom roles cannot be ruled out.`);
     if (standardRoles.length === 0) return manualVerdict(`No custom roles appeared among ${roles.length} roles, but no ${ROLE_TYPE_STANDARD} roles were returned either, so the role listing is not trustworthy. Collect the role list from Administration > Access Management > Roles.`);
-    return verdict("pass", `No custom roles exist. Both conditions for accepting this hold: the ${ROLE_CATALOG_SOURCE} query was readable and complete, and it returned ${standardRoles.length} ${ROLE_TYPE_STANDARD} roles.`);
+    const catalogClause = `the ${ROLE_CATALOG_SOURCE} query was readable and complete, and it returned ${standardRoles.length} ${ROLE_TYPE_STANDARD} roles`;
+    if (!grantsReadable) {
+      return verdict("warn", `No custom roles exist in the catalog (${catalogClause}), but group grants (authorizationManagement.groups) were not readable (${causeOf(data.groupGrants)}), so the roles in use were not cross-checked against the catalog.`);
+    }
+    if (!isComplete(data.groupGrants)) {
+      return verdict("warn", `No custom roles exist in the catalog (${catalogClause}) and none appears in the readable group grants, but the group grant listing (authorizationManagement.groups) is incomplete, so the roles in use were only partly cross-checked against the catalog.`);
+    }
+    return verdict("pass", `No custom roles exist. Both conditions for accepting this hold: ${catalogClause}. The complete group grant listing confirms none is in use.`);
   };
 
   const findings: NewrelicFinding[] = [];
 
-  findings.push(finding(4, limitCoverage(control4(), [...keyCoverage, ...userCoverage, ...scopeCoverage]), {
-    keys_total: keys.length,
+  // NR-04 lists only the inventories its verdict reads (keys, users, group grants, accounts in scope); the NrAuditEvent
+  // key-actor rows belong to NR-06, which renders them with their own status.
+  findings.push(finding(4, limitCoverage(control4(), [...keyCoverage, ...userCoverage, ...groupCoverage, ...scopeCoverage]), {
+    keys_total: countUnlessUnreadable(data.apiKeys, keys.length),
     keys_reported_total: data.apiKeys.total ?? null,
-    user_keys: userKeys.length,
-    license_keys: licenseKeys.length,
-    browser_keys: browserKeys.length,
-    unknown_type_keys: unknownTypeKeys.length,
-    unnamed_keys: sample(unnamedKeys.map(keyLabel)),
-    admin_owned_user_keys: sample(adminOwnedUserKeys.map(keyLabel)),
-    user_keys_without_user_id: userKeysWithoutOwner.length,
-    audit_events_by_api_keys: data.apiKeyAuditEvents.data.length,
+    user_keys: countUnlessUnreadable(data.apiKeys, userKeys.length),
+    license_keys: countUnlessUnreadable(data.apiKeys, licenseKeys.length),
+    browser_keys: countUnlessUnreadable(data.apiKeys, browserKeys.length),
+    unknown_type_keys: countUnlessUnreadable(data.apiKeys, unknownTypeKeys.length),
+    unnamed_keys: listUnlessUnreadable(data.apiKeys, sample(unnamedKeys.map(keyLabel))),
+    admin_owned_user_keys: adminRosterComplete || adminOwnedUserKeys.length > 0 ? sample(adminOwnedUserKeys.map(keyLabel)) : null,
+    admin_roster_complete: adminRosterComplete,
+    admin_roster_status: adminRosterComplete ? "complete" : `incomplete: users ${collectionStatus(data.users)}; groups ${collectionStatus(data.groupGrants)}`,
+    user_keys_without_user_id: countUnlessUnreadable(data.apiKeys, userKeysWithoutOwner.length),
     key_listing_complete: isComplete(data.apiKeys),
   }));
 
@@ -3052,49 +3165,54 @@ export function assessNewrelicAccessControlData(
     accounts_in_scope: data.accountIds,
     accounts_in_scope_not_visible: unseenScopeAccounts,
     key_listing_complete: isComplete(data.apiKeys),
-    distinct_api_keys_in_audit: distinctActorKeys.size,
+    distinct_api_keys_in_audit: countUnlessUnreadable(data.apiKeyAuditEvents, distinctActorKeys.size),
+    audit_events_by_api_keys: countUnlessUnreadable(data.apiKeyAuditEvents, data.apiKeyAuditEvents.data.length),
     audit_window_days: data.auditWindowDays,
     audit_readable: auditReadable,
+    audit_status: collectionStatus(data.apiKeyAuditEvents),
     orphaned_user_keys: sample(orphanedUserKeys.map(keyLabel)),
     inactive_owner_user_keys: sample(inactiveOwnerKeys.map(keyLabel)),
     undated_owner_user_keys: sample(undatedOwnerKeys.map(keyLabel)),
     manual_evidence: "API keys UI export plus owner confirmation for every key without a documented consumer; NrAuditEvent WHERE actorType = 'api_key' for change activity.",
   }));
 
+  const accessMapReadable = usersReadable && grantsReadable;
   findings.push(finding(7, limitCoverage(control7(), [...groupCoverage, ...userCoverage, ...accountCoverage, ...scopeCoverage]), {
-    accounts_visible: accounts.length,
+    accounts_visible: countUnlessUnreadable(data.accounts, accounts.length),
     max_accounts_per_user: maxAccountsPerUser,
-    broad_access_users: sample(broadAccessUsers.map((entry) => `${userLabel(entry.user)} (${entry.organizationScoped ? "organization scope" : `${entry.accountIds.size} accounts`})`)),
-    users_without_grants: usersWithoutGrants.length,
-    users_without_group_data: usersWithoutGroupData.length,
-    groups_without_role_data: groupsWithoutRoleData.length,
+    broad_access_users: accessMapReadable ? sample(broadAccessUsers.map((entry) => `${userLabel(entry.user)} (${entry.organizationScoped ? "organization scope" : `${entry.accountIds.size} accounts`})`)) : null,
+    users_without_grants: accessMapReadable ? usersWithoutGrants.length : null,
+    users_without_group_data: countUnlessUnreadable(data.users, usersWithoutGroupData.length),
+    groups_without_role_data: countUnlessUnreadable(data.groupGrants, groupsWithoutRoleData.length),
+    access_map_status: accessMapReadable ? "readable" : `unreadable: users ${collectionStatus(data.users)}; groups ${collectionStatus(data.groupGrants)}`,
   }));
 
   findings.push(finding(8, limitCoverage(control8(), [...groupCoverage, ...userCoverage, ...accountCoverage, ...scopeCoverage]), {
-    accounts_visible: accounts.length,
-    production_accounts: sample(productionAccounts.map(accountLabel)),
-    nonproduction_accounts: sample(nonproductionAccounts.map(accountLabel)),
-    unclassified_accounts: sample(unclassifiedAccounts.map(accountLabel)),
-    cross_environment_users: sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user))),
-    admin_users_excluded: adminUserIds.size,
+    accounts_visible: countUnlessUnreadable(data.accounts, accounts.length),
+    production_accounts: listUnlessUnreadable(data.accounts, sample(productionAccounts.map(accountLabel))),
+    nonproduction_accounts: listUnlessUnreadable(data.accounts, sample(nonproductionAccounts.map(accountLabel))),
+    unclassified_accounts: listUnlessUnreadable(data.accounts, sample(unclassifiedAccounts.map(accountLabel))),
+    cross_environment_users: accessMapReadable && accountsReadable ? sample(crossEnvironmentUsers.map((entry) => userLabel(entry.user))) : null,
+    admin_users_excluded: accessMapReadable ? adminUserIds.size : null,
     manual_evidence: "Account inventory with environment classification from Administration > Access Management > Accounts.",
   }));
 
-  findings.push(finding(20, limitCoverage(control20(), roleCoverage), {
+  findings.push(finding(20, limitCoverage(control20(), [...roleCoverage, ...groupCoverage]), {
     role_catalog_source: ROLE_CATALOG_SOURCE,
     role_catalog_readable: rolesReadable,
-    roles_total: roles.length,
-    standard_roles: standardRoles.length,
-    unknown_type_roles: unknownTypeRoles.length,
+    roles_total: countUnlessUnreadable(data.roles, roles.length),
+    standard_roles: countUnlessUnreadable(data.roles, standardRoles.length),
+    unknown_type_roles: countUnlessUnreadable(data.roles, unknownTypeRoles.length),
     role_listing_complete: isComplete(data.roles),
-    custom_roles: sample(customRoles.map((role) => ({
+    custom_roles: listUnlessUnreadable(data.roles, sample(customRoles.map((role) => ({
       id: asString(role.id),
       name: roleLabel(role),
       scope: asString(role.scope),
       type: asString(role.type),
-    }))),
-    custom_roles_in_group_grants: sample(grantedCustomRoleNames),
-    groups_granted_custom_roles: sample(customRoleGrants.map((group) => asString(group.displayName) ?? asString(group.id) ?? "group")),
+    })))),
+    custom_roles_in_group_grants: listUnlessUnreadable(data.groupGrants, sample(grantedCustomRoleNames)),
+    groups_granted_custom_roles: listUnlessUnreadable(data.groupGrants, sample(customRoleGrants.map((group) => asString(group.displayName) ?? asString(group.id) ?? "group"))),
+    group_grants_status: collectionStatus(data.groupGrants),
     manual_evidence: "Capability list for each custom role from Administration > Access Management > Roles.",
   }));
 
@@ -3116,16 +3234,16 @@ export function assessNewrelicAccessControlData(
     summary: {
       region: config.region,
       accounts_in_scope: data.accountIds,
-      accounts_visible: accounts.length,
-      users: users.length,
-      keys_total: keys.length,
-      user_keys: userKeys.length,
-      aged_user_keys: agedUserKeys.length,
-      admin_users: adminUserIds.size,
-      broad_access_users: broadAccessUsers.length,
-      cross_environment_users: crossEnvironmentUsers.length,
-      custom_roles: customRoles.length,
-      api_key_audit_events: data.apiKeyAuditEvents.data.length,
+      accounts_visible: countUnlessUnreadable(data.accounts, accounts.length),
+      users: countUnlessUnreadable(data.users, users.length),
+      keys_total: countUnlessUnreadable(data.apiKeys, keys.length),
+      user_keys: countUnlessUnreadable(data.apiKeys, userKeys.length),
+      aged_user_keys: countUnlessUnreadable(data.apiKeys, agedUserKeys.length),
+      admin_users: data.users.error || data.groupGrants.error ? null : adminUserIds.size,
+      broad_access_users: data.users.error || data.groupGrants.error ? null : broadAccessUsers.length,
+      cross_environment_users: data.users.error || data.groupGrants.error || data.accounts.error ? null : crossEnvironmentUsers.length,
+      custom_roles: countUnlessUnreadable(data.roles, customRoles.length),
+      api_key_audit_events: countUnlessUnreadable(data.apiKeyAuditEvents, data.apiKeyAuditEvents.data.length),
       collection_errors: collectedErrors(allCollected).length,
       coverage_limitations: coverage.length,
     },
@@ -3318,6 +3436,7 @@ export function assessNewrelicAlertingData(
   const policyCoverage = coverageNotes([["alert policies", data.policies]]);
   const conditionCoverage = coverageNotes([["NRQL conditions", data.conditions]]);
   const entityCoverage = coverageNotes([["alertable entities", data.alertableEntities]]);
+  const workloadCoverage = coverageNotes([["workloads", data.workloads]]);
   const destinationCoverage = coverageNotes([["destinations", data.destinations]]);
   const channelCoverage = coverageNotes([["channels", data.channels]]);
   const workflowCoverage = coverageNotes([["workflows", data.workflows]]);
@@ -3408,27 +3527,34 @@ export function assessNewrelicAlertingData(
 
   const findings: NewrelicFinding[] = [];
 
-  findings.push(finding(9, limitCoverage(control9(), [...policyCoverage, ...conditionCoverage, ...entityCoverage]), {
-    policies: policies.length,
-    conditions: conditions.length,
-    enabled_conditions: enabledConditions.length,
-    conditions_without_enabled_flag: conditionsWithoutEnabledFlag.length,
-    empty_policies: sample(emptyPolicies.map((policy) => asString(policy.name) ?? asString(policy.id) ?? "policy")),
-    reporting_alertable_entities: reportingEntities.length,
+  // NR-09 reads workloads for its disruption evidence, so the workload listing is part of its coverage.
+  findings.push(finding(9, limitCoverage(control9(), [...policyCoverage, ...conditionCoverage, ...entityCoverage, ...workloadCoverage]), {
+    policies: countUnlessUnreadable(data.policies, policies.length),
+    policies_status: collectionStatus(data.policies),
+    conditions: countUnlessUnreadable(data.conditions, conditions.length),
+    enabled_conditions: countUnlessUnreadable(data.conditions, enabledConditions.length),
+    conditions_without_enabled_flag: countUnlessUnreadable(data.conditions, conditionsWithoutEnabledFlag.length),
+    empty_policies: policiesReadable && conditionsReadable ? sample(emptyPolicies.map((policy) => asString(policy.name) ?? asString(policy.id) ?? "policy")) : null,
+    reporting_alertable_entities: countUnlessUnreadable(data.alertableEntities, reportingEntities.length),
     alertable_entities_reported_total: data.alertableEntities.total ?? null,
-    uncovered_entities: uncoveredEntities.length,
-    uncovered_critical_entities: sample(uncoveredCritical.map(entityLabel)),
-    workloads: workloads.length,
-    disrupted_workloads: sample(disruptedWorkloads.map((workload) => asString(workload.name) ?? "workload")),
+    uncovered_entities: countUnlessUnreadable(data.alertableEntities, uncoveredEntities.length),
+    uncovered_critical_entities: listUnlessUnreadable(data.alertableEntities, sample(uncoveredCritical.map(entityLabel))),
+    workloads: countUnlessUnreadable(data.workloads, workloads.length),
+    workloads_status: collectionStatus(data.workloads),
+    disrupted_workloads: listUnlessUnreadable(data.workloads, sample(disruptedWorkloads.map((workload) => asString(workload.name) ?? "workload"))),
   }));
 
+  // NR-10 reads alert policies on its zero-destination and zero-workflow branches, so the policy listing is part of
+  // its coverage and is disclosed with its status even on the pass path.
   findings.push(finding(10, limitCoverage(control10(), [...destinationCoverage, ...channelCoverage, ...workflowCoverage, ...policyCoverage]), {
-    destinations: destinations.length,
+    destinations: countUnlessUnreadable(data.destinations, destinations.length),
     destination_types: destinationTypeCounts,
-    channels: channels.length,
-    workflows: workflows.length,
-    enabled_workflows: enabledWorkflows.length,
-    workflows_without_enabled_flag: workflowsWithoutEnabledFlag.length,
+    channels: countUnlessUnreadable(data.channels, channels.length),
+    workflows: countUnlessUnreadable(data.workflows, workflows.length),
+    enabled_workflows: countUnlessUnreadable(data.workflows, enabledWorkflows.length),
+    workflows_without_enabled_flag: countUnlessUnreadable(data.workflows, workflowsWithoutEnabledFlag.length),
+    alert_policies: countUnlessUnreadable(data.policies, policies.length),
+    alert_policies_status: collectionStatus(data.policies),
     approved_email_domains: [...approvedDomains],
     personal_email_destinations: sample(personalEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
     unapproved_email_destinations: sample(unapprovedEmailDestinations.map((destination) => asString(destination.name) ?? "destination")),
@@ -3465,7 +3591,7 @@ export function assessNewrelicAlertingData(
     ...channelCoverage,
     ...workflowCoverage,
     ...entityCoverage,
-    ...coverageNotes([["workloads", data.workloads]]),
+    ...workloadCoverage,
   ];
 
   return {
@@ -3474,15 +3600,15 @@ export function assessNewrelicAlertingData(
     summary: {
       region: config.region,
       accounts_in_scope: data.accountIds,
-      policies: policies.length,
-      enabled_conditions: enabledConditions.length,
-      reporting_alertable_entities: reportingEntities.length,
-      uncovered_entities: uncoveredEntities.length,
-      destinations: destinations.length,
-      personal_email_destinations: personalEmailDestinations.length,
-      enabled_workflows: enabledWorkflows.length,
-      enriched_external_workflows: enrichedExternalWorkflows.length,
-      workloads: workloads.length,
+      policies: countUnlessUnreadable(data.policies, policies.length),
+      enabled_conditions: countUnlessUnreadable(data.conditions, enabledConditions.length),
+      reporting_alertable_entities: countUnlessUnreadable(data.alertableEntities, reportingEntities.length),
+      uncovered_entities: countUnlessUnreadable(data.alertableEntities, uncoveredEntities.length),
+      destinations: countUnlessUnreadable(data.destinations, destinations.length),
+      personal_email_destinations: countUnlessUnreadable(data.destinations, personalEmailDestinations.length),
+      enabled_workflows: countUnlessUnreadable(data.workflows, enabledWorkflows.length),
+      enriched_external_workflows: countUnlessUnreadable(data.workflows, enrichedExternalWorkflows.length),
+      workloads: countUnlessUnreadable(data.workloads, workloads.length),
       collection_errors: collectedErrors(allCollected).length,
       coverage_limitations: coverage.length,
     },
@@ -3748,16 +3874,30 @@ export function assessNewrelicDataGovernanceData(
 
   const retentionCoverage = coverageNotes([["retention rules", data.retentionRules], ["retention namespaces", data.retentionNamespaces]]);
   const obfuscationCoverage = coverageNotes([["obfuscation rules", data.obfuscationRules], ["obfuscation expressions", data.obfuscationExpressions]]);
+  const attributeDropCoverage = coverageNotes([["Pipeline Control cloud rules", data.cloudRules], ["NRQL drop rules", data.dropRules]]);
+  const logVolumeCoverage = coverageNotes([["log volume", data.logVolume]]);
   const monitorCoverage = coverageNotes([["synthetic monitors", data.syntheticMonitors], ["secure credentials", data.secureCredentials], ["synthetic scripts", data.syntheticScripts]]);
   const dashboardCoverage = coverageNotes([["dashboards", data.dashboards], ["dashboard live URLs", data.dashboardLiveUrls]]);
-  const logCoverage = coverageNotes([["log volume", data.logVolume], ["log secret matches", data.logSecretMatches]]);
+  const logCoverage = [...logVolumeCoverage, ...coverageNotes([["log secret matches", data.logSecretMatches]])];
   const retentionEvidence = "the retention per data type from Administration > Data management > Data retention for every account.";
   const obfuscationEvidence = "the rules and expressions shown in Logs > Obfuscation for every account.";
   const scriptEvidence = "each scripted monitor's script from Synthetic monitoring, confirming credentials come from secure credentials ($secure.NAME).";
   const dashboardEvidence = "dashboard permissions and public sharing links from the Dashboards UI.";
-  const pipelineControlNote = cloudRulesReadable
-    ? `${cloudRules.length} Pipeline Control cloud rules`
-    : `Pipeline Control cloud rules were not readable and are treated as unavailable on this account (${causeOf(data.cloudRules)})`;
+  // Attribute-level drop coverage joins two inventories. A count is stated only when both were readable; otherwise the
+  // clause names the unreadable dataset and query path, and the coverage list limits the finding below pass. A 403 on
+  // entityManagement.pipelineCloudRules cannot be told apart from a missing Pipeline Control entitlement, so it is
+  // reported as unverified rather than treated as "no rules".
+  const attributeDropClause = (): string => {
+    const unreadable = [
+      ...(cloudRulesReadable ? [] : ["Pipeline Control cloud rules (entityManagement.pipelineCloudRules)"]),
+      ...(dropRulesReadable ? [] : ["NRQL drop rules (nrqlDropRules.list)"]),
+    ];
+    if (unreadable.length > 0) return `attribute drop coverage is unverified because ${unreadable.join(" and ")} were not readable`;
+    return `${attributeDropRules.length} pipeline or drop rules also drop sensitive attributes (${cloudRules.length} Pipeline Control cloud rules, ${dropRules.length} NRQL drop rules)`;
+  };
+  const logVolumeClause = logVolumeReadable && logCount > 0
+    ? ` while ${logCount} log events were ingested in the last day${isComplete(data.logVolume) ? "" : " in the readable accounts"}`
+    : "";
 
   const control11 = (): Verdict => {
     if (!retentionReadable) return unreadableVerdict("Data retention rules (dataManagement.eventRetentionRules)", data.retentionRules, retentionEvidence);
@@ -3786,7 +3926,7 @@ export function assessNewrelicDataGovernanceData(
       if (obfuscationRules.length === 0 && logVolumeReadable && isComplete(data.logVolume) && logCount === 0) {
         return manualVerdict(`No log obfuscation rules exist and no log events were ingested in the last day across ${accountCount} accounts, so the control is not applicable through the API while logging stays disabled; emptiness is unknown rather than compliant. Confirm log ingestion is intentionally disabled and collect ${obfuscationEvidence}`);
       }
-      return verdict("fail", `No obfuscation rule with enabled = true exists across ${accountCount} accounts (${obfuscationRules.length} rules returned, ${obfuscationRulesWithoutEnabledFlag.length} without an enabled flag)${logCount > 0 ? ` while ${logCount} log events were ingested in the last day` : ""}.`);
+      return verdict("fail", `No obfuscation rule with enabled = true exists across ${accountCount} accounts (${obfuscationRules.length} rules returned, ${obfuscationRulesWithoutEnabledFlag.length} without an enabled flag)${logVolumeClause}.`);
     }
     if (!expressionsReadable) {
       return verdict("warn", `${enabledObfuscationRules.length} enabled obfuscation rules exist, but obfuscation expressions were not readable (${causeOf(data.obfuscationExpressions)}), so credential and PII coverage cannot be confirmed.`);
@@ -3797,7 +3937,7 @@ export function assessNewrelicDataGovernanceData(
     if (obfuscationRulesWithoutEnabledFlag.length > 0) {
       return verdict("warn", `${enabledObfuscationRules.length} enabled obfuscation rules cover credential and PII patterns, but ${obfuscationRulesWithoutEnabledFlag.length} rules expose no enabled flag and were not counted as active.`);
     }
-    return verdict("pass", `${enabledObfuscationRules.length} enabled obfuscation rules and ${obfuscationExpressions.length} expressions cover credential and PII patterns; ${attributeDropRules.length} pipeline or drop rules also drop sensitive attributes (${pipelineControlNote}).`);
+    return verdict("pass", `${enabledObfuscationRules.length} enabled obfuscation rules and ${obfuscationExpressions.length} expressions cover credential and PII patterns; ${attributeDropClause()}.`);
   };
 
   const control13 = (): Verdict => {
@@ -3876,63 +4016,74 @@ export function assessNewrelicDataGovernanceData(
 
   findings.push(finding(11, limitCoverage(control11(), retentionCoverage), {
     min_retention_days: minRetentionDays,
-    active_rules: sample(retentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`), 50),
-    short_retention_rules: sample(shortRetentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`)),
-    rules_without_retention_days: rulesWithoutRetentionDays.length,
-    customizable_namespaces: data.retentionNamespaces.data.length,
-    namespaces_without_rules: sample(namespacesWithoutRules.map((row) => asString(row.namespace) ?? "namespace"), 50),
+    active_rules: listUnlessUnreadable(data.retentionRules, sample(retentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`), 50)),
+    short_retention_rules: listUnlessUnreadable(data.retentionRules, sample(shortRetentionRules.map((rule) => `${asString(rule.namespace) ?? "namespace"}: ${asNumber(rule.retentionInDays) ?? "?"} days`))),
+    rules_without_retention_days: countUnlessUnreadable(data.retentionRules, rulesWithoutRetentionDays.length),
+    customizable_namespaces: countUnlessUnreadable(data.retentionNamespaces, data.retentionNamespaces.data.length),
+    customizable_namespaces_status: collectionStatus(data.retentionNamespaces),
+    namespaces_without_rules: namespacesReadable && retentionReadable ? sample(namespacesWithoutRules.map((row) => asString(row.namespace) ?? "namespace"), 50) : null,
   }));
 
-  findings.push(finding(12, limitCoverage(control12(), obfuscationCoverage), {
-    obfuscation_rules: obfuscationRules.length,
-    enabled_obfuscation_rules: enabledObfuscationRules.length,
-    obfuscation_rules_without_enabled_flag: obfuscationRulesWithoutEnabledFlag.length,
-    obfuscation_expressions: sample(obfuscationExpressions.map((expression) => asString(expression.name) ?? "expression")),
-    credential_coverage: credentialCoverage,
-    pii_coverage: piiCoverage,
-    log_events_last_day: logCount,
-    pipeline_cloud_rules: cloudRulesReadable ? cloudRules.length : null,
-    pipeline_control_status: cloudRulesReadable ? "readable" : `not available: ${causeOf(data.cloudRules)}`,
-    legacy_drop_rules: dropRulesReadable ? dropRules.length : null,
-    legacy_drop_rules_status: dropRulesReadable ? "readable" : `not available: ${causeOf(data.dropRules)}`,
-    attribute_drop_rules: attributeDropRules.length,
+  // NR-12 joins obfuscation rules and expressions with Pipeline Control cloud rules, NRQL drop rules, and the log
+  // volume query, so all five inventories are in its coverage and each count is null with its status when unreadable.
+  findings.push(finding(12, limitCoverage(control12(), [...obfuscationCoverage, ...attributeDropCoverage, ...logVolumeCoverage]), {
+    obfuscation_rules: countUnlessUnreadable(data.obfuscationRules, obfuscationRules.length),
+    enabled_obfuscation_rules: countUnlessUnreadable(data.obfuscationRules, enabledObfuscationRules.length),
+    obfuscation_rules_without_enabled_flag: countUnlessUnreadable(data.obfuscationRules, obfuscationRulesWithoutEnabledFlag.length),
+    obfuscation_expressions: listUnlessUnreadable(data.obfuscationExpressions, sample(obfuscationExpressions.map((expression) => asString(expression.name) ?? "expression"))),
+    credential_coverage: expressionsReadable ? credentialCoverage : null,
+    pii_coverage: expressionsReadable ? piiCoverage : null,
+    log_events_last_day: countUnlessUnreadable(data.logVolume, logCount),
+    log_volume_status: collectionStatus(data.logVolume),
+    pipeline_cloud_rules: countUnlessUnreadable(data.cloudRules, cloudRules.length),
+    pipeline_control_status: collectionStatus(data.cloudRules),
+    legacy_drop_rules: countUnlessUnreadable(data.dropRules, dropRules.length),
+    legacy_drop_rules_status: collectionStatus(data.dropRules),
+    attribute_drop_rules: cloudRulesReadable && dropRulesReadable ? attributeDropRules.length : null,
   }));
 
   findings.push(finding(13, limitCoverage(control13(), monitorCoverage), {
-    monitors: monitors.length,
+    monitors: countUnlessUnreadable(data.syntheticMonitors, monitors.length),
     monitor_types: monitorTypeCounts,
-    monitors_without_type: monitorsWithoutType.length,
-    scripted_monitors: scriptedMonitors.length,
-    scripts_sampled: scripts.length,
+    monitors_without_type: countUnlessUnreadable(data.syntheticMonitors, monitorsWithoutType.length),
+    scripted_monitors: countUnlessUnreadable(data.syntheticMonitors, scriptedMonitors.length),
+    scripts_sampled: countUnlessUnreadable(data.syntheticScripts, scripts.length),
     scripts_sample_complete: isComplete(data.syntheticScripts),
-    scripts_with_secret_indicators: sample(scriptsWithSecrets.map((script) => `${asString(script.name) ?? asString(script.guid)}: ${asArray(script.secretIndicators).join(", ")}`)),
-    scripts_using_secure_credentials: scriptsUsingSecureCredentials.length,
-    secure_credentials: secureCredentials.length,
+    scripts_status: collectionStatus(data.syntheticScripts),
+    scripts_with_secret_indicators: listUnlessUnreadable(data.syntheticScripts, sample(scriptsWithSecrets.map((script) => `${asString(script.name) ?? asString(script.guid)}: ${asArray(script.secretIndicators).join(", ")}`))),
+    scripts_using_secure_credentials: countUnlessUnreadable(data.syntheticScripts, scriptsUsingSecureCredentials.length),
+    secure_credentials: countUnlessUnreadable(data.secureCredentials, secureCredentials.length),
+    secure_credentials_status: collectionStatus(data.secureCredentials),
   }));
 
   findings.push(finding(14, limitCoverage(control14(), dashboardCoverage), {
-    dashboards: dashboards.length,
+    dashboards: countUnlessUnreadable(data.dashboards, dashboards.length),
     dashboards_reported_total: data.dashboards.total ?? null,
-    public_read_write_dashboards: sample(publicReadWriteDashboards.map((dashboard) => asString(dashboard.name) ?? "dashboard")),
-    private_dashboards: privateDashboards.length,
-    dashboards_without_permissions: dashboardsWithoutPermissions.length,
-    public_live_urls: liveUrls.length,
+    public_read_write_dashboards: listUnlessUnreadable(data.dashboards, sample(publicReadWriteDashboards.map((dashboard) => asString(dashboard.name) ?? "dashboard"))),
+    private_dashboards: countUnlessUnreadable(data.dashboards, privateDashboards.length),
+    dashboards_without_permissions: countUnlessUnreadable(data.dashboards, dashboardsWithoutPermissions.length),
+    public_live_urls: countUnlessUnreadable(data.dashboardLiveUrls, liveUrls.length),
     live_urls_readable: liveUrlsReadable,
-    public_dashboard_live_urls: sample(dashboardLiveUrls.map((liveUrl) => liveUrl.title || "untitled dashboard")),
-    public_widget_live_urls: widgetLiveUrls.length,
+    live_urls_status: collectionStatus(data.dashboardLiveUrls),
+    public_dashboard_live_urls: listUnlessUnreadable(data.dashboardLiveUrls, sample(dashboardLiveUrls.map((liveUrl) => liveUrl.title || "untitled dashboard"))),
+    public_widget_live_urls: countUnlessUnreadable(data.dashboardLiveUrls, widgetLiveUrls.length),
     live_url_visibility_note: "liveUrls only lists public links visible to the authenticated user; link values are intentionally not collected.",
   }));
 
   findings.push(finding(15, limitCoverage(control15(), logCoverage), {
-    log_events_last_day: logCount,
+    log_events_last_day: countUnlessUnreadable(data.logVolume, logCount),
     log_volume_readable: logVolumeReadable,
-    secret_pattern_matches: secretMatchCount,
+    log_volume_status: collectionStatus(data.logVolume),
+    secret_pattern_matches: countUnlessUnreadable(data.logSecretMatches, secretMatchCount),
+    secret_pattern_status: collectionStatus(data.logSecretMatches),
     nrql_pattern: LOG_SECRET_NRQL_PATTERN,
   }));
 
   findings.push(finding(16, control16(), {
-    reporting_hosts: reportingHosts,
-    agent_versions: sample(agentVersions, 50),
+    reporting_hosts: countUnlessUnreadable(data.infraHosts, reportingHosts),
+    reporting_hosts_status: collectionStatus(data.infraHosts),
+    agent_versions: listUnlessUnreadable(data.infraAgentVersions, sample(agentVersions, 50)),
+    agent_versions_status: collectionStatus(data.infraAgentVersions),
     manual_evidence: "newrelic-infra.yml (or fleet configuration) showing proxy, proxy_validate_certificates, ca_bundle_file, and agent version for each host group.",
   }));
 
@@ -3956,7 +4107,7 @@ export function assessNewrelicDataGovernanceData(
   const coverage = [
     ...retentionCoverage,
     ...obfuscationCoverage,
-    ...coverageNotes([["pipeline cloud rules", data.cloudRules], ["legacy drop rules", data.dropRules]]),
+    ...attributeDropCoverage,
     ...dashboardCoverage,
     ...monitorCoverage,
     ...logCoverage,
@@ -3969,16 +4120,18 @@ export function assessNewrelicDataGovernanceData(
     summary: {
       region: config.region,
       accounts_in_scope: data.accountIds,
-      retention_rules: retentionRules.length,
-      short_retention_rules: shortRetentionRules.length,
-      enabled_obfuscation_rules: enabledObfuscationRules.length,
-      pipeline_cloud_rules: cloudRules.length,
-      scripted_monitors: scriptedMonitors.length,
-      scripts_with_secret_indicators: scriptsWithSecrets.length,
-      dashboards: dashboards.length,
-      public_live_urls: liveUrls.length,
-      log_secret_pattern_matches: secretMatchCount,
-      reporting_hosts: reportingHosts,
+      retention_rules: countUnlessUnreadable(data.retentionRules, retentionRules.length),
+      short_retention_rules: countUnlessUnreadable(data.retentionRules, shortRetentionRules.length),
+      enabled_obfuscation_rules: countUnlessUnreadable(data.obfuscationRules, enabledObfuscationRules.length),
+      pipeline_cloud_rules: countUnlessUnreadable(data.cloudRules, cloudRules.length),
+      legacy_drop_rules: countUnlessUnreadable(data.dropRules, dropRules.length),
+      scripted_monitors: countUnlessUnreadable(data.syntheticMonitors, scriptedMonitors.length),
+      scripts_with_secret_indicators: countUnlessUnreadable(data.syntheticScripts, scriptsWithSecrets.length),
+      dashboards: countUnlessUnreadable(data.dashboards, dashboards.length),
+      public_live_urls: countUnlessUnreadable(data.dashboardLiveUrls, liveUrls.length),
+      log_events_last_day: countUnlessUnreadable(data.logVolume, logCount),
+      log_secret_pattern_matches: countUnlessUnreadable(data.logSecretMatches, secretMatchCount),
+      reporting_hosts: countUnlessUnreadable(data.infraHosts, reportingHosts),
       collection_errors: collectedErrors(allCollected).length,
       coverage_limitations: coverage.length,
     },

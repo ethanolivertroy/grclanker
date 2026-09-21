@@ -2064,10 +2064,12 @@ test("verdict safety rule 3: scoped-out or not-applicable controls render as man
     },
   }));
   const obfuscation = findingById(noPipelineControl, "NR-12-LOG-OBFUSCATION");
-  assert.equal(obfuscation.status, "pass");
-  assert.match(obfuscation.summary, /Pipeline Control cloud rules were not readable and are treated as unavailable on this account/);
-  assert.match(obfuscation.evidence.pipeline_control_status, /^not available: /);
+  assert.equal(obfuscation.status, "warn");
+  assert.match(obfuscation.summary, /attribute drop coverage is unverified because Pipeline Control cloud rules \(entityManagement\.pipelineCloudRules\) were not readable/);
+  assert.match(obfuscation.summary, /Partial view: Pipeline Control cloud rules: unreadable \(entityManagement\.pipelineCloudRules: NerdGraph returned errors: Not authorized \(at actor\.entityManagement\)\)/);
+  assert.match(obfuscation.evidence.pipeline_control_status, /^unreadable \(entityManagement\.pipelineCloudRules: /);
   assert.equal(obfuscation.evidence.pipeline_cloud_rules, null);
+  assert.equal(obfuscation.evidence.attribute_drop_rules, null);
   const synthetics = findingById(noPipelineControl, "NR-13-SYNTHETIC-MONITOR-SECURITY");
   assert.equal(synthetics.status, "manual");
   assert.match(synthetics.summary, /Not applicable through the API: none of the 1 synthetic monitors is scripted/);
