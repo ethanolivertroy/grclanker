@@ -2069,18 +2069,22 @@ export async function assessGcpIdentity(
   const keyList = <T>(value: T): T | null => jointValue([scanReadable(accountScan), keysReadable], value);
   const keyTruncation: boolean | null = keyInventoryTruncated ? true : keyList(false);
   const accountBase = scanVerdictBase(context, accountScan);
-  const keyBase = {
-    ...accountBase,
-    inventoryError: accountBase.inventoryError ?? (keysReadable ? undefined : keyReadsUnreadable[0]),
-    truncated: anyTruncated([projectsTruncated(context), scanTruncation(accountScan), keyTruncation]),
-    unreadable: [...unreadableScans(accountScan), ...(keysReadable ? keyReadsUnreadable : [])],
-  };
   /** Key lists were never requested when no account list arrived, and unreadable when every requested list failed. */
   const keysUnreadable: UnreadableInventory | undefined = !scanReadable(accountScan)
     ? notCollected(GCP_INVENTORIES.serviceAccountKeys, "the scope", `no service account could be listed because ${accountScan.notAttempted ?? `${GCP_INVENTORIES.serviceAccounts.dataset} were unreadable via ${GCP_INVENTORIES.serviceAccounts.endpoint} (${shortError(accountScan.denied[0]?.error ?? "")})`}`)
     : keysReadable
       ? undefined
       : keyReadsUnreadable[0];
+  const keyBase = {
+    ...accountBase,
+    inventoryError: accountBase.inventoryError ?? (keysReadable ? undefined : keyReadsUnreadable[0]),
+    truncated: anyTruncated([projectsTruncated(context), scanTruncation(accountScan), keyTruncation]),
+    unreadable: [
+      ...unreadableScans(accountScan),
+      ...(keysUnreadable?.status === "not_collected" ? [keysUnreadable] : []),
+      ...(keysReadable ? keyReadsUnreadable : []),
+    ],
+  };
 
   const findings: GcpFinding[] = [
     verdict({
@@ -2189,7 +2193,13 @@ export async function assessGcpIdentity(
         accounts: row.data.items.map((account) => asString(account.email) ?? null),
       }))),
       user_managed_keys: keysUnreadable ? snapshotMarker(keysUnreadable) : userManagedKeys,
-      unreadable_inventories: [...context.unreadable, ...unreadableCollected(GCP_INVENTORIES.iamPolicies, iamPolicies), ...unreadableScans(accountScan), ...keyReadsUnreadable],
+      unreadable_inventories: [
+        ...context.unreadable,
+        ...unreadableCollected(GCP_INVENTORIES.iamPolicies, iamPolicies),
+        ...unreadableScans(accountScan),
+        ...(keysUnreadable?.status === "not_collected" ? [keysUnreadable] : []),
+        ...keyReadsUnreadable,
+      ],
     },
   };
 }
@@ -3119,7 +3129,7 @@ export async function assessGcpDataProtection(
           unknown: dryRunOnlyPerimeters.length,
           inventory: GCP_INVENTORIES.accessPolicies,
           inventoryError: unreadableCollected(GCP_INVENTORIES.accessPolicies, accessPolicies)[0] ?? perimetersUnreadable[0],
-          unreadable: context.unreadable,
+          unreadable: [...context.unreadable, ...(perimetersMarker?.status === "not_collected" ? [perimetersMarker] : [])],
           truncated: anyTruncated([projectsTruncated(context), collectedTruncation(accessPolicies), perimeterTruncation]),
           emptyVerdict: "fail",
           passSummary: `${enforcedPerimeters.length} enforced service perimeters protect resources with restricted services.`,
