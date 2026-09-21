@@ -2321,15 +2321,21 @@ export function assessDuoAuthentication(
   const trustedEndpoints = asRecord(getPolicySections(globalPolicy).trusted_endpoints);
   const trustedChecking = asString(trustedEndpoints.trusted_endpoint_checking);
   const trustedCheckingMobile = asString(trustedEndpoints.trusted_endpoint_checking_mobile);
+  const healthChecksSection = asRecord(getPolicySections(globalPolicy).health_checks);
   const duoDesktop = asRecord(getPolicySections(globalPolicy).duo_desktop);
   const screenLock = asRecord(getPolicySections(globalPolicy).screen_lock);
   const diskEncryption = asRecord(getPolicySections(globalPolicy).full_disk_encryption);
+  // requires_duo_desktop is a comma-separated operating system list in both health_checks and the
+  // deprecated duo_desktop section; full_disk_encryption exposes require_encryption.
+  const duoDesktopOperatingSystems = osList(
+    healthChecksSection.requires_duo_desktop !== undefined ? healthChecksSection.requires_duo_desktop : duoDesktop.requires_duo_desktop,
+  );
   const healthEvidence = [
     trustedChecking ? `trusted_endpoint_checking=${trustedChecking}` : undefined,
     trustedCheckingMobile ? `trusted_endpoint_checking_mobile=${trustedCheckingMobile}` : undefined,
-    getBooleanish(duoDesktop, "requires_duo_desktop") ? "Duo Desktop required." : undefined,
-    getBooleanish(screenLock, "require_screen_lock") ? "Screen lock required." : undefined,
-    getBooleanish(diskEncryption, "require_disk_encryption") ? "Full disk encryption required." : undefined,
+    duoDesktopOperatingSystems.length > 0 ? `requires_duo_desktop=${duoDesktopOperatingSystems.join(",")}` : undefined,
+    getBooleanish(screenLock, "require_screen_lock") ? "screen_lock.require_screen_lock=true" : undefined,
+    getBooleanish(diskEncryption, "require_encryption") ? "full_disk_encryption.require_encryption=true" : undefined,
   ].filter((item): item is string => Boolean(item));
   if (policyUnavailable) {
     findings.push(

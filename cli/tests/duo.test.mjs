@@ -75,7 +75,7 @@ function createSampleAuthenticationData() {
             trusted_endpoint_checking_mobile: "require-trusted",
           },
           duo_desktop: {
-            requires_duo_desktop: true,
+            requires_duo_desktop: "macos,windows",
           },
           screen_lock: {
             require_screen_lock: true,
@@ -111,7 +111,7 @@ function createSampleAuthenticationData() {
           trusted_endpoint_checking_mobile: "require-trusted",
         },
         duo_desktop: {
-          requires_duo_desktop: true,
+          requires_duo_desktop: "macos,windows",
         },
       },
     }),
@@ -687,6 +687,29 @@ test("assessDuoAuthentication audits bypass codes with the documented created, e
   const forbiddenResult = findingById(assessDuoAuthentication(forbiddenAuthenticationData(), config), "DUO-AUTH-006");
   assert.equal(forbiddenResult.status, "Manual");
   assert.ok(forbiddenResult.evidence.includes("endpoint=/admin/v1/bypass_codes"));
+});
+
+test("assessDuoAuthentication reports trusted endpoint evidence with the documented device health keys", () => {
+  const config = createSampleConfig();
+  const compliant = findingById(assessDuoAuthentication(compliantAuthenticationData(), config), "DUO-AUTH-005");
+  assert.equal(compliant.status, "Pass");
+  assert.ok(compliant.evidence.includes("requires_duo_desktop=macos,windows,linux"), "requires_duo_desktop is an operating system list");
+  assert.ok(compliant.evidence.includes("full_disk_encryption.require_encryption=true"));
+  assert.ok(compliant.evidence.includes("screen_lock.require_screen_lock=true"));
+
+  const legacy = compliantAuthenticationData();
+  for (const policy of [legacy.globalPolicy.data, legacy.policies.data[0]]) {
+    delete policy.sections.health_checks;
+    policy.sections.duo_desktop = { requires_duo_desktop: "windows" };
+    policy.sections.full_disk_encryption = { require_disk_encryption: true };
+  }
+  const legacyFinding = findingById(assessDuoAuthentication(legacy, config), "DUO-AUTH-005");
+  assert.ok(legacyFinding.evidence.includes("requires_duo_desktop=windows"), "the deprecated duo_desktop section uses the same OS list shape");
+  assert.equal(
+    legacyFinding.evidence.some((line) => line.startsWith("full_disk_encryption")),
+    false,
+    "an undocumented require_disk_encryption key never counts as encryption evidence",
+  );
 });
 
 test("assessDuoAdminAccess evaluates lockout policy and undated administrators", () => {
