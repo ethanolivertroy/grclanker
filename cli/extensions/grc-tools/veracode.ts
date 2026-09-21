@@ -749,10 +749,11 @@ async function surface<T>(load: () => Promise<T>): Promise<Surface<T>> {
   try {
     return { status: "ok", value: await load() };
   } catch (error) {
+    const statusCode = asNumber(asObject(error)?.statusCode);
     return {
       status: "error",
       error: error instanceof Error ? error.message : String(error),
-      statusCode: error instanceof VeracodeApiError ? error.statusCode : undefined,
+      statusCode,
     };
   }
 }
