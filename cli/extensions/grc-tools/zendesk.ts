@@ -589,11 +589,8 @@ export class ZendeskApiClient {
   }
 
   async listTeamMembers(maxItems?: number): Promise<ZendeskListResult> {
-    return this.listCursor("/users", "users", { "role[]": "agent" }, { maxItems }).then(async (agents) => {
-      const url = `${this.buildUrl("/users", {})}?role[]=agent&role[]=admin&page[size]=${DEFAULT_PAGE_SIZE}`;
-      const combined = await this.listCursor(url, "users", {}, { maxItems });
-      return combined.items.length >= agents.items.length ? combined : agents;
-    });
+    const url = `${this.buildUrl("/users")}?role[]=agent&role[]=admin`;
+    return this.listCursor(url, "users", {}, { maxItems });
   }
 
   async listCustomRoles(): Promise<ZendeskListResult> {
@@ -934,12 +931,36 @@ function summarizeStatuses(findings: ZendeskFinding[]): JsonRecord {
   };
 }
 
+function roleCeilingReason(currentUser: ZendeskSnapshot<JsonRecord>): string | undefined {
+  const role = asString(currentUser.data?.role);
+  if (currentUser.status === "ok" && role === "admin") return undefined;
+  return currentUser.status === "ok"
+    ? `the credential's role is ${role ?? "unknown"} rather than admin, so it may only see a partial view of the account`
+    : `the current user lookup (/users/me) failed (${currentUser.error ?? currentUser.status}), so the credential's role could not be confirmed`;
+}
+
+function finalizeFindings(findings: ZendeskFinding[], currentUser: ZendeskSnapshot<JsonRecord>): ZendeskFinding[] {
+  const reason = roleCeilingReason(currentUser);
+  const capped = reason
+    ? findings.map((item): ZendeskFinding => item.status === "pass"
+      ? {
+        ...item,
+        status: "warn",
+        summary: `${item.summary} Verdict capped at warn because ${reason}.`,
+        evidence: { ...(item.evidence ?? {}), verdict_capped_by_role: asString(currentUser.data?.role) ?? null },
+      }
+      : item)
+    : findings;
+  return [...capped].sort((left, right) => left.control - right.control);
+}
+
 export async function assessZendeskAuthentication(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
+  const currentUserSnap = await snapshot(() => client.getCurrentUser());
   const settingsSnap = await snapshot(() => client.getAccountSettings());
   const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
   const settings = settingsSnap.data ?? {};
@@ -1013,18 +1034,24 @@ export async function assessZendeskAuthentication(
     ));
   }
 
-  findings.sort((left, right) => left.control - right.control);
+  const finalFindings = finalizeFindings(findings, currentUserSnap);
+  const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
+    ["current_user", currentUserSnap],
+    ["account_settings", settingsSnap],
+    ["team_members", teamSnap],
+  ];
   return {
     category: "authentication",
     title: "Zendesk authentication and network access",
     summary: {
       subdomain: config.subdomain,
+      current_user_role: asString(currentUserSnap.data?.role) ?? null,
       seen_team_members: teamMembers.length,
-      ...summarizeStatuses(findings),
+      ...summarizeStatuses(finalFindings),
     },
-    findings,
-    errors: snapshotErrors([["account_settings", settingsSnap], ["team_members", teamSnap]]),
-    snapshots: { account_settings: settingsSnap.data ?? null, team_members: teamSnap.data ?? null },
+    findings: finalFindings,
+    errors: snapshotErrors(entries),
+    snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
   };
 }
 
@@ -1035,6 +1062,7 @@ export async function assessZendeskAccessControl(
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const now = resolved.now();
+  const currentUserSnap = await snapshot(() => client.getCurrentUser());
   const settingsSnap = await snapshot(() => client.getAccountSettings());
   const teamSnap = await snapshot(() => client.listTeamMembers(resolved.maxItems));
   const rolesSnap = await snapshot(() => client.listCustomRoles());
@@ -1176,8 +1204,9 @@ export async function assessZendeskAccessControl(
     }
   }
 
-  findings.sort((left, right) => left.control - right.control);
+  const finalFindings = finalizeFindings(findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
+    ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
     ["team_members", teamSnap],
     ["custom_roles", rolesSnap],
@@ -1191,14 +1220,15 @@ export async function assessZendeskAccessControl(
     title: "Zendesk access control and API credentials",
     summary: {
       subdomain: config.subdomain,
+      current_user_role: asString(currentUserSnap.data?.role) ?? null,
       seen_team_members: teamMembers.length,
       admins: admins.length,
       custom_roles: listSnapshotItems(rolesSnap).length,
       groups: groups.length,
       oauth_clients: listSnapshotItems(clientsSnap).length,
-      ...summarizeStatuses(findings),
+      ...summarizeStatuses(finalFindings),
     },
-    findings,
+    findings: finalFindings,
     errors: snapshotErrors(entries),
     snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
   };
@@ -1211,6 +1241,7 @@ export async function assessZendeskDataProtection(
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const now = resolved.now();
+  const currentUserSnap = await snapshot(() => client.getCurrentUser());
   const settingsSnap = await snapshot(() => client.getAccountSettings());
   const auditSnap = await snapshot(() => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
   const oldestSnap: ZendeskSnapshot<JsonRecord | undefined> = auditSnap.status === "ok"
@@ -1325,8 +1356,9 @@ export async function assessZendeskDataProtection(
     }
   }
 
-  findings.sort((left, right) => left.control - right.control);
+  const finalFindings = finalizeFindings(findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
+    ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
     ["audit_logs_recent", auditSnap],
     ["audit_log_oldest", oldestSnap],
@@ -1338,13 +1370,14 @@ export async function assessZendeskDataProtection(
     title: "Zendesk audit logging and data protection",
     summary: {
       subdomain: config.subdomain,
+      current_user_role: asString(currentUserSnap.data?.role) ?? null,
       audit_log_status: auditSnap.status,
       audit_log_entries_sampled: auditEntries.length,
       private_attachments: privateAttachments ?? null,
       suspended_tickets: listSnapshotItems(suspendedSnap).length,
-      ...summarizeStatuses(findings),
+      ...summarizeStatuses(finalFindings),
     },
-    findings,
+    findings: finalFindings,
     errors: snapshotErrors(entries),
     snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
   };
@@ -1543,10 +1576,10 @@ export async function assessZendeskIntegrations(
     }
   }
 
-  findings.sort((left, right) => left.control - right.control);
+  const finalFindings = finalizeFindings(findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
-    ["account_settings", settingsSnap],
     ["current_user", currentUserSnap],
+    ["account_settings", settingsSnap],
     ["app_installations", installationsSnap],
     ["owned_apps", ownedSnap],
     ["brands", brandsSnap],
@@ -1561,14 +1594,15 @@ export async function assessZendeskIntegrations(
     title: "Zendesk apps, brands, and external communications",
     summary: {
       subdomain: config.subdomain,
+      current_user_role: currentRole ?? null,
       app_installations: installations.length,
       owned_apps: ownedApps.length,
       brands: listSnapshotItems(brandsSnap).length,
       webhooks: webhooks.length,
       targets: targets.length,
-      ...summarizeStatuses(findings),
+      ...summarizeStatuses(finalFindings),
     },
-    findings,
+    findings: finalFindings,
     errors: snapshotErrors(entries),
     snapshots: Object.fromEntries(entries.map(([name, snap]) => [name, snap.data ?? null])),
   };
