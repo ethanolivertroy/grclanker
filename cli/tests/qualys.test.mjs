@@ -78,6 +78,722 @@ function qpsResponse(entity, items, extra = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// Documented-shape builders. Every record below follows the published DTD or XSD for its endpoint
+// (schedule_scan_list_output.dtd, host_list_output.dtd, option_profile_info.dtd,
+// appliance_list_output.dtd, asset_group_list_output.dtd, policy_list_output.dtd,
+// schedule_report_list_output.dtd, report_list_output.dtd, user_list_output.dtd, user.xsd,
+// hostasset.xsd with agent_source.xsd, asset_data_connector.xsd, tag.xsd, webapp.xsd, wasscan.xsd,
+// webappauthrecord.xsd, wasscanschedule.xsd). Objects mirror what xmlToRecord produces: attributes
+// as "@name", element text as "#text" when attributes are present, repeated elements as arrays.
+// ---------------------------------------------------------------------------------------------
+
+function escapeXml(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function xmlFromRecord(name, value) {
+  if (value === undefined) return "";
+  if (Array.isArray(value)) return value.map((item) => xmlFromRecord(name, item)).join("");
+  if (value === null || typeof value !== "object") return `<${name}>${escapeXml(value)}</${name}>`;
+  const attributes = Object.entries(value)
+    .filter(([key]) => key.startsWith("@"))
+    .map(([key, item]) => ` ${key.slice(1)}="${escapeXml(item)}"`)
+    .join("");
+  const text = value["#text"] === undefined ? "" : escapeXml(value["#text"]);
+  const children = Object.entries(value)
+    .filter(([key]) => !key.startsWith("@") && key !== "#text")
+    .map(([key, item]) => xmlFromRecord(key, item))
+    .join("");
+  return `<${name}${attributes}>${text}${children}</${name}>`;
+}
+
+function listOutputXml(root, listName, itemName, items) {
+  return `<?xml version="1.0" encoding="UTF-8" ?><${root}><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><${listName}>${xmlFromRecord(itemName, items)}</${listName}></RESPONSE></${root}>`;
+}
+
+function userListXml(users) {
+  return `<?xml version="1.0" encoding="UTF-8" ?><!DOCTYPE USER_LIST_OUTPUT SYSTEM "https://qualysapi.qualys.com/user_list_output.dtd"><USER_LIST_OUTPUT><USER_LIST>${xmlFromRecord("USER", users)}</USER_LIST></USER_LIST_OUTPUT>`;
+}
+
+const SCHEDULE_TIME_ZONE = { TIME_ZONE_CODE: "US-CA", TIME_ZONE_DETAILS: "(GMT-0800) United States: America/Los_Angeles" };
+
+// schedule_scan_list_output.dtd: SCAN (ID, SCAN_TYPE?, ACTIVE, TITLE?, CLIENT?, USER_LOGIN, TARGET, NETWORK_ID?,
+// ISCANNER_NAME?, ..., ASSET_GROUP_TITLE_LIST?, ASSET_TAGS?, ..., USER_ENTERED_IPS?, ..., OPTION_PROFILE?,
+// PROCESSING_PRIORITY?, SCHEDULE, NOTIFICATIONS?)
+function documentedSchedule(overrides = {}) {
+  return {
+    ID: "160642",
+    ACTIVE: "1",
+    TITLE: "My Daily Scan",
+    USER_LOGIN: "acme_api",
+    TARGET: "10.10.10.10-10.10.10.20",
+    NETWORK_ID: "0",
+    ISCANNER_NAME: "dmz-scanner",
+    USER_ENTERED_IPS: { RANGE: { START: "10.10.10.10", END: "10.10.10.20" } },
+    OPTION_PROFILE: { TITLE: "Initial Options", DEFAULT_FLAG: "1" },
+    PROCESSING_PRIORITY: "0 - No Priority",
+    SCHEDULE: {
+      DAILY: { "@frequency_days": "1" },
+      START_DATE_UTC: "2017-11-30T00:30:00Z",
+      START_HOUR: "16",
+      START_MINUTE: "30",
+      NEXTLAUNCH_UTC: daysAgo(-1),
+      TIME_ZONE: SCHEDULE_TIME_ZONE,
+      DST_SELECTED: "1",
+    },
+    ...overrides,
+  };
+}
+
+// schedule_scan_list_output.dtd: ASSET_TAGS (TAG_INCLUDE_SELECTOR, TAG_SET_INCLUDE (#PCDATA), TAG_EXCLUDE_SELECTOR?,
+// TAG_SET_EXCLUDE?, USE_IP_NT_RANGE_TAGS?, USE_IP_NT_RANGE_TAGS_INCLUDE, USE_IP_NT_RANGE_TAGS_EXCLUDE?)
+function documentedAssetTags(tagSetInclude) {
+  return { TAG_INCLUDE_SELECTOR: "any", TAG_SET_INCLUDE: tagSetInclude, USE_IP_NT_RANGE_TAGS: "0", USE_IP_NT_RANGE_TAGS_INCLUDE: "0" };
+}
+
+// scan_list_output.dtd: SCAN (ID?, REF, SCAN_TYPE?, TYPE, TITLE, CLIENT?, USER_LOGIN, LAUNCH_DATETIME, DURATION,
+// PROCESSING_PRIORITY?, PROCESSED, STATUS?, TARGET?, ...) with STATUS (STATE, SUB_STATE?)
+function documentedScan(overrides = {}) {
+  return {
+    REF: "scan/1758000000.12345",
+    TYPE: "Scheduled",
+    TITLE: "Internal weekly",
+    USER_LOGIN: "acme_api",
+    LAUNCH_DATETIME: daysAgo(2),
+    DURATION: "00:42:10",
+    PROCESSING_PRIORITY: "0 - No Priority",
+    PROCESSED: "1",
+    STATUS: { STATE: "Finished" },
+    TARGET: "10.0.0.1-10.0.0.254",
+    ...overrides,
+  };
+}
+
+// host_list_output.dtd (details=All, show_tags=1): HOST with ID, IP, TRACKING_METHOD, DNS, OS, LAST_VULN_SCAN_DATETIME,
+// LAST_VM_SCANNED_DATE, LAST_VM_AUTH_SCANNED_DATE, TAGS (TAG (TAG_ID, NAME))
+function documentedHost(overrides = {}) {
+  return {
+    ID: "100",
+    IP: "10.0.0.5",
+    TRACKING_METHOD: "Cloud Agent",
+    DNS: "web-01.example.com",
+    OS: "Windows Server 2022",
+    LAST_VULN_SCAN_DATETIME: daysAgo(2),
+    LAST_VM_SCANNED_DATE: daysAgo(2),
+    LAST_VM_SCANNED_DURATION: "600",
+    LAST_VM_AUTH_SCANNED_DATE: daysAgo(2),
+    LAST_VM_AUTH_SCANNED_DURATION: "600",
+    TAGS: { TAG: [{ TAG_ID: "1", NAME: "PCI" }, { TAG_ID: "2", NAME: "Prod" }] },
+    ...overrides,
+  };
+}
+
+// option_profile_info.dtd, values from the guide "Sample - List VM Option Profile" (option_profile/vm/?action=list)
+function documentedOptionProfile(overrides = {}) {
+  return {
+    BASIC_INFO: {
+      ID: "51451401",
+      GROUP_NAME: "Authenticated Full",
+      GROUP_TYPE: "user",
+      USER_ID: "John smith (jsmith_ap)",
+      UNIT_ID: "0",
+      SUBSCRIPTION_ID: "10421401",
+      IS_DEFAULT: "0",
+      IS_GLOBAL: "1",
+      IS_OFFLINE_SYNCABLE: "1",
+      UPDATE_DATE: "2018-04-10T13:39:41Z",
+    },
+    SCAN: {
+      PORTS: { TCP_PORTS: { TCP_PORTS_TYPE: "standard", THREE_WAY_HANDSHAKE: "1" }, UDP_PORTS: { UDP_PORTS_TYPE: "light" }, AUTHORITATIVE_OPTION: "1" },
+      SCAN_DEAD_HOSTS: "1",
+      PERFORMANCE: { PARALLEL_SCALING: "1", OVERALL_PERFORMANCE: "Normal" },
+      VULNERABILITY_DETECTION: { COMPLETE: "complete", DETECTION_INCLUDE: { BASIC_HOST_INFO_CHECKS: "0", OVAL_CHECKS: "1" } },
+      AUTHENTICATION: "Windows,Unix",
+    },
+    ...overrides,
+  };
+}
+
+// appliance_list_output.dtd: APPLIANCE (ID, UUID, NAME, ..., SOFTWARE_VERSION, RUNNING_SLICES_COUNT, RUNNING_SCAN_COUNT,
+// STATUS, ..., ML_LATEST?, ML_VERSION?, VULNSIGS_LATEST?, VULNSIGS_VERSION?, ..., LAST_UPDATED_DATE?, ..., HEARTBEATS_MISSED?)
+function documentedAppliance(overrides = {}) {
+  return {
+    ID: "1",
+    UUID: "f0e2b1c4-6d1a-4d1e-9a8c-1f2e3d4c5b6a",
+    NAME: "dmz-scanner",
+    SOFTWARE_VERSION: "12.7.50-1",
+    RUNNING_SLICES_COUNT: "0",
+    RUNNING_SCAN_COUNT: "0",
+    STATUS: "Online",
+    ML_LATEST: "12.7.50-1",
+    ML_VERSION: { "@updated": "yes", "#text": "12.7.50-1" },
+    VULNSIGS_LATEST: "2.6.212-3",
+    VULNSIGS_VERSION: { "@updated": "yes", "#text": "2.6.212-3" },
+    LAST_UPDATED_DATE: daysAgo(0),
+    HEARTBEATS_MISSED: "0",
+    ...overrides,
+  };
+}
+
+// asset_group_list_output.dtd: ASSET_GROUP (ID, TITLE, OWNER_USER_ID?, UNIT_ID?, LAST_UPDATE?, IP_SET?, ...)
+function documentedAssetGroup(overrides = {}) {
+  return { ID: "10", TITLE: "Internal", OWNER_USER_ID: "1001", UNIT_ID: "0", LAST_UPDATE: daysAgo(20), IP_SET: { IP_RANGE: "10.0.0.1-10.0.0.254" }, ...overrides };
+}
+
+// policy_list_output.dtd: POLICY (ID, TITLE, CREATED?, LAST_MODIFIED?, STATUS?, ASSET_GROUP_IDS?, TAG_SET_INCLUDE?, ...)
+function documentedPolicy(overrides = {}) {
+  return {
+    ID: "5",
+    TITLE: "CIS Baseline",
+    CREATED: { DATETIME: "2024-02-01T10:00:00Z", BY: "acme_mgr" },
+    LAST_MODIFIED: { DATETIME: daysAgo(40), BY: "acme_mgr" },
+    STATUS: "active",
+    ASSET_GROUP_IDS: "10,11",
+    ...overrides,
+  };
+}
+
+// host_list_vm_detection_output.dtd: DETECTION (QID, TYPE, SEVERITY?, PORT?, PROTOCOL?, SSL?, RESULTS?, STATUS?,
+// FIRST_FOUND_DATETIME?, LAST_FOUND_DATETIME?, QDS?, TIMES_FOUND?, LAST_TEST_DATETIME?, LAST_UPDATE_DATETIME?, IS_IGNORED?, IS_DISABLED?)
+function documentedDetection(overrides = {}) {
+  return {
+    QID: "91000",
+    TYPE: "Confirmed",
+    SEVERITY: "5",
+    SSL: "0",
+    RESULTS: "Vulnerable version detected",
+    STATUS: "Active",
+    FIRST_FOUND_DATETIME: daysAgo(3),
+    LAST_FOUND_DATETIME: daysAgo(1),
+    QDS: { "@severity": "HIGH", "#text": "72" },
+    TIMES_FOUND: "3",
+    LAST_TEST_DATETIME: daysAgo(1),
+    LAST_UPDATE_DATETIME: daysAgo(1),
+    IS_IGNORED: "0",
+    IS_DISABLED: "0",
+    ...overrides,
+  };
+}
+
+// knowledge_base_vuln_list_output.dtd: VULN (QID, VULN_TYPE, SEVERITY_LEVEL, TITLE, ..., PATCHABLE, ...)
+function documentedVuln(overrides = {}) {
+  return { QID: "91000", VULN_TYPE: "Vulnerability", SEVERITY_LEVEL: "5", TITLE: "Remote code execution", PATCHABLE: "1", ...overrides };
+}
+
+// schedule_report_list_output.dtd: REPORT (ID, TITLE?, OUTPUT_FORMAT, TEMPLATE_TITLE?, ACTIVE, SCHEDULE)
+function documentedScheduledReport(overrides = {}) {
+  return {
+    ID: "3",
+    TITLE: "Weekly executive report",
+    OUTPUT_FORMAT: "pdf",
+    TEMPLATE_TITLE: "Executive Report",
+    ACTIVE: "1",
+    SCHEDULE: {
+      WEEKLY: { "@frequency_weeks": "1", "@weekdays": "1" },
+      START_DATE_UTC: "2024-03-04T06:00:00Z",
+      START_HOUR: "6",
+      START_MINUTE: "0",
+      TIME_ZONE: SCHEDULE_TIME_ZONE,
+      DST_SELECTED: "0",
+    },
+    ...overrides,
+  };
+}
+
+// report_list_output.dtd: REPORT (ID, TITLE?, CLIENT?, TYPE, USER_LOGIN, LAUNCH_DATETIME, OUTPUT_FORMAT, SIZE, STATUS, EXPIRATION_DATETIME)
+function documentedReport(overrides = {}) {
+  return {
+    ID: "9",
+    TITLE: "Weekly executive report",
+    TYPE: "Scan",
+    USER_LOGIN: "acme_api",
+    LAUNCH_DATETIME: daysAgo(1),
+    OUTPUT_FORMAT: "PDF",
+    SIZE: "1.2 MB",
+    STATUS: { STATE: "Finished" },
+    EXPIRATION_DATETIME: daysAgo(-6),
+    ...overrides,
+  };
+}
+
+// user_list_output.dtd: USER (USER_LOGIN?, USER_ID?, EXTERNAL_ID?, CONTACT_INFO, ASSIGNED_ASSET_GROUPS?, USER_STATUS,
+// CREATION_DATE, LAST_LOGIN_DATE?, USER_ROLE?, BUSINESS_UNIT?, ...) with CONTACT_INFO (FIRSTNAME, LASTNAME, TITLE, PHONE, FAX,
+// EMAIL, COMPANY, ADDRESS1, ADDRESS2, CITY, COUNTRY, STATE, ZIP_CODE, TIME_ZONE_CODE)
+function legacyUser(options = {}) {
+  const login = options.login ?? "acme_api";
+  const user = {
+    USER_LOGIN: login,
+    USER_ID: options.id ?? "1001",
+    CONTACT_INFO: {
+      FIRSTNAME: options.firstName ?? "Api",
+      LASTNAME: options.lastName ?? "Account",
+      TITLE: "",
+      PHONE: "",
+      FAX: "",
+      EMAIL: options.email ?? `${login}@example.com`,
+      COMPANY: "Acme",
+      ADDRESS1: "",
+      ADDRESS2: "",
+      CITY: "",
+      COUNTRY: "United States of America",
+      STATE: "",
+      ZIP_CODE: "",
+      TIME_ZONE_CODE: "",
+    },
+    USER_STATUS: options.status ?? "Active",
+    CREATION_DATE: "2024-01-05T10:00:00Z",
+  };
+  if (options.lastLogin !== null) user.LAST_LOGIN_DATE = options.lastLogin ?? daysAgo(1);
+  if (options.role !== null) user.USER_ROLE = options.role ?? "Reader";
+  user.BUSINESS_UNIT = options.businessUnit ?? "Unassigned";
+  if (options.hideLogin) {
+    // Restricted view (guide "Sub-user Permissions"): user login, user ID, and external ID are not visible.
+    delete user.USER_LOGIN;
+    delete user.USER_ID;
+  }
+  return user;
+}
+
+// user.xsd (Administration API search/am/user): id, username, firstName, lastName, title, emailAddress, roleList, scopeTags
+function adminUser(id, username, role, overrides = {}) {
+  return {
+    id,
+    username,
+    firstName: username.split("_")[0],
+    lastName: "Account",
+    title: "",
+    emailAddress: `${username}@example.com`,
+    roleList: { count: 1, list: [{ RoleData: { id: /manager/i.test(role) ? 1 : 2, name: role } }] },
+    ...overrides,
+  };
+}
+
+// hostasset.xsd with agent_source.xsd: agentInfo (agentVersion, agentId, status, lastCheckedIn, platform, activationKey (activationId, title), manifestVersion)
+function documentedAgent(overrides = {}) {
+  return {
+    id: 100,
+    name: "web-01.example.com",
+    created: daysAgo(200),
+    modified: daysAgo(0),
+    trackingMethod: "QAGENT",
+    agentInfo: {
+      agentVersion: "6.1.0.36",
+      agentId: "4d7f2c0a-1b2c-4d5e-8f90-1a2b3c4d5e6f",
+      status: "STATUS_ACTIVE",
+      lastCheckedIn: { date: daysAgo(0) },
+      platform: "WINDOWS",
+      activationKey: { activationId: "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", title: "prod-key" },
+      manifestVersion: { vm: "2.6.212-3", pc: "2.6.212-3" },
+    },
+    ...overrides,
+  };
+}
+
+// asset_data_connector.xsd: id, name, awsAccountId, description, lastSync, lastError, connectorState, type, disabled; the
+// AWS connector documentation adds arn and externalId (credential material).
+function documentedConnector(overrides = {}) {
+  return {
+    id: 1,
+    name: "prod-aws",
+    awsAccountId: "123456789012",
+    description: "Production account",
+    lastSync: daysAgo(0),
+    connectorState: "FINISHED_SUCCESS",
+    type: "AWS",
+    disabled: false,
+    arn: "arn:aws:iam::123456789012:role/qualys-connector",
+    externalId: "connector-external-id-1",
+    ...overrides,
+  };
+}
+
+// tag.xsd: id, name, created, modified, ruleType (TagRuleType, STATIC among the values)
+function documentedTag(overrides = {}) {
+  return { id: 1, name: "PCI", created: daysAgo(300), modified: daysAgo(30), ruleType: "NAME_CONTAINS", ...overrides };
+}
+
+// webapp.xsd: WebApp (id, name, url, ..., lastScan (WasScan reference: id and name only), createdDate, updatedDate)
+function documentedWebApp(overrides = {}) {
+  return {
+    id: 500,
+    name: "Portal",
+    url: "https://portal.example.com",
+    createdDate: daysAgo(300),
+    updatedDate: daysAgo(4),
+    lastScan: { id: 1, name: "Portal weekly" },
+    ...overrides,
+  };
+}
+
+// wasscan.xsd: WasScan (id, name, type (VULNERABILITY|DISCOVERY), target (webApp (id, name, url)), launchedDate, status)
+function documentedWasScan(overrides = {}) {
+  return {
+    id: 1,
+    name: "Portal weekly",
+    type: "VULNERABILITY",
+    target: { webApp: { id: 500, name: "Portal", url: "https://portal.example.com" } },
+    launchedDate: daysAgo(4),
+    status: "FINISHED",
+    ...overrides,
+  };
+}
+
+// webappauthrecord.xsd: WebAppAuthRecord (id, name, owner, formRecord (type, sslOnly, fields (count, list (WebAppAuthFormRecordField
+// (id, name, secured, value)))), createdDate, updatedDate)
+function documentedWasAuthRecord(overrides = {}) {
+  return {
+    id: 1,
+    name: "portal-login",
+    owner: { id: 1001, username: "acme_api" },
+    formRecord: {
+      type: "STANDARD",
+      sslOnly: false,
+      fields: {
+        count: 2,
+        list: [
+          { WebAppAuthFormRecordField: { id: 1, name: "username", secured: false, value: "portal_user" } },
+          { WebAppAuthFormRecordField: { id: 2, name: "password", secured: true, value: "portal-form-password" } },
+        ],
+      },
+    },
+    createdDate: daysAgo(30),
+    updatedDate: daysAgo(10),
+    ...overrides,
+  };
+}
+
+// wasscanschedule.xsd: WasScanSchedule (id, name, type, active (xs:boolean), target)
+function documentedWasSchedule(overrides = {}) {
+  return { id: 1, name: "Portal weekly", type: "VULNERABILITY", active: true, target: { webApp: { id: 500, name: "Portal" } }, ...overrides };
+}
+
+// A fully compliant tenant built only from the documented shapes above. The fake-client fixtures and the routed
+// compliant fixture (d) both read from it, so the assessors see the same tenant through the real parser and directly.
+const tenant = {
+  schedules: [
+    documentedSchedule({
+      ID: "1",
+      TITLE: "Internal weekly",
+      TARGET: "10.0.0.1-10.0.0.254",
+      ISCANNER_NAME: "dmz-scanner",
+      ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: "Internal" },
+      USER_ENTERED_IPS: { RANGE: { START: "10.0.0.1", END: "10.0.0.254" } },
+      SCHEDULE: { WEEKLY: { "@frequency_weeks": "1", "@weekdays": "1" }, START_DATE_UTC: "2024-03-04T02:00:00Z", START_HOUR: "2", START_MINUTE: "0", NEXTLAUNCH_UTC: daysAgo(-2), TIME_ZONE: SCHEDULE_TIME_ZONE, DST_SELECTED: "0" },
+    }),
+    documentedSchedule({
+      ID: "2",
+      TITLE: "Perimeter",
+      TARGET: "Asset Tags Included",
+      ISCANNER_NAME: "External Scanner",
+      USER_ENTERED_IPS: undefined,
+      ASSET_TAGS: documentedAssetTags("DMZ"),
+    }),
+  ],
+  scans: [documentedScan()],
+  hosts: [
+    documentedHost(),
+    documentedHost({ ID: "101", IP: "10.0.0.6", DNS: "app-01.example.com", OS: "Ubuntu Linux 22.04", LAST_VULN_SCAN_DATETIME: daysAgo(3), LAST_VM_SCANNED_DATE: daysAgo(3), LAST_VM_AUTH_SCANNED_DATE: daysAgo(3), TAGS: { TAG: { TAG_ID: "2", NAME: "Prod" } } }),
+  ],
+  profiles: [documentedOptionProfile()],
+  groups: [documentedAssetGroup(), documentedAssetGroup({ ID: "11", TITLE: "DMZ", IP_SET: { IP: "203.0.113.5" } })],
+  appliances: [documentedAppliance()],
+  policies: [documentedPolicy()],
+  detectionHosts: [
+    { ID: "100", IP: "10.0.0.5", TRACKING_METHOD: "Cloud Agent", OS: "Windows Server 2022", LAST_SCAN_DATETIME: daysAgo(1), DETECTION_LIST: { DETECTION: [documentedDetection()] } },
+    { ID: "101", IP: "10.0.0.6", TRACKING_METHOD: "Cloud Agent", OS: "Ubuntu Linux 22.04", LAST_SCAN_DATETIME: daysAgo(1), DETECTION_LIST: { DETECTION: [documentedDetection({ QID: "38000", SEVERITY: "4", STATUS: "New", FIRST_FOUND_DATETIME: daysAgo(5), QDS: { "@severity": "MEDIUM", "#text": "50" } })] } },
+  ],
+  knowledgeBase: [documentedVuln(), documentedVuln({ QID: "38000", SEVERITY_LEVEL: "4", TITLE: "Information disclosure", PATCHABLE: "0" })],
+  scheduledReports: [documentedScheduledReport()],
+  reports: [documentedReport()],
+  activityRows: [{ date: daysAgo(1), action: "login", module: "auth", details: "ok", user_name: "acme_api", user_role: "Manager", user_ip: "10.0.0.9" }],
+  legacyUsers: [
+    legacyUser({ login: "acme_api", id: "1001", role: "Manager", email: "api@example.com" }),
+    legacyUser({ login: "acme_mgr", id: "1002", role: "Manager", email: "mgr@example.com", firstName: "Morgan", lastName: "Manager" }),
+    legacyUser({ login: "acme_rd", id: "1003", role: "Reader", email: "reader@example.com", firstName: "Riley", lastName: "Reader" }),
+  ],
+  adminUsers: [
+    adminUser(0, "acme_api", "MANAGER", { emailAddress: "api@example.com" }),
+    adminUser(1, "acme_mgr", "Manager", { emailAddress: "mgr@example.com" }),
+    adminUser(2, "acme_rd", "Reader", { emailAddress: "reader@example.com" }),
+  ],
+  agents: [
+    documentedAgent(),
+    documentedAgent({ id: 101, name: "app-01.example.com", agentInfo: { ...documentedAgent().agentInfo, agentId: "5e8a3d1b-2c3d-4e6f-9a01-2b3c4d5e6f70", lastCheckedIn: { date: daysAgo(1) }, platform: "LINUX" } }),
+  ],
+  connectors: [documentedConnector()],
+  tags: [documentedTag(), documentedTag({ id: 2, name: "Prod", ruleType: "STATIC" })],
+  webApps: [documentedWebApp()],
+  wasScans: [documentedWasScan()],
+  wasAuthRecords: [documentedWasAuthRecord()],
+  wasSchedules: [documentedWasSchedule()],
+};
+
+function flattenDetections(hosts) {
+  return hosts.flatMap((host) => [].concat(host.DETECTION_LIST.DETECTION).map((detection) => ({ host_id: host.ID, ip: host.IP, ...detection })));
+}
+
+function activityCsv(rows) {
+  return `${CSV_HEADER}${rows.map((row) => `"${row.date}","${row.action}","${row.module}","${row.details}","${row.user_name}","${row.user_role}","${row.user_ip}"`).join("\n")}\n`;
+}
+
+// auth_records.dtd: RESPONSE > AUTH_RECORDS > AUTH_<TECHNOLOGY>_IDS > ID_SET > (ID|ID_RANGE)+. The guide writes ranges as
+// first-last, so 3010-3260 spans 251 records.
+const AUTH_RECORDS_SAMPLE = `<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE AUTH_RECORDS_OUTPUT SYSTEM "https://qualysapi.qualys.com/api/2.0/fo/auth/auth_records.dtd">
+<AUTH_RECORDS_OUTPUT>
+  <RESPONSE>
+    <DATETIME>2026-09-21T00:00:00Z</DATETIME>
+    <AUTH_RECORDS>
+      <AUTH_UNIX_IDS>
+        <ID_SET>
+          <ID>3000</ID>
+          <ID_RANGE>3010-3260</ID_RANGE>
+          <ID>3300</ID>
+        </ID_SET>
+      </AUTH_UNIX_IDS>
+      <AUTH_WINDOWS_IDS>
+        <ID_SET>
+          <ID>4000</ID>
+          <ID>4001</ID>
+        </ID_SET>
+      </AUTH_WINDOWS_IDS>
+    </AUTH_RECORDS>
+  </RESPONSE>
+</AUTH_RECORDS_OUTPUT>`;
+
+// VM/PC API user guide, "VM Scan Schedules" list samples, reproduced verbatim: SCAN nested in SCHEDULE_SCAN_LIST, the
+// line-wrapped ISCANNER_NAME CDATA of the first sample, an empty ACTIVE on the cloud perimeter sample, TARGET
+// "Asset Tags Included", and TAG_SET_INCLUDE as PCDATA.
+const GUIDE_SCHEDULE_SCAN_LIST_SAMPLE = `<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE SCHEDULE_SCAN_LIST_OUTPUT SYSTEM "https://qualysapi.qualys.com/api/2.0/fo/schedule/scan/schedule_scan_list_output.dtd">
+<SCHEDULE_SCAN_LIST_OUTPUT>
+  <RESPONSE>
+    <DATETIME>2017-12-01T19:26:50Z</DATETIME>
+    <SCHEDULE_SCAN_LIST>
+      <SCAN>
+        <ID>160642</ID>
+        <ACTIVE>1</ACTIVE>
+        <TITLE><![CDATA[My Daily Scan]]></TITLE>
+        <USER_LOGIN>qualys_ps</USER_LOGIN>
+        <TARGET><![CDATA[10.10.10.10-10.10.10.20]]></TARGET>
+        <NETWORK_ID><![CDATA[0]]></NETWORK_ID>
+        <ISCANNER_NAME><![CDATA[External 
+Scanner]]></ISCANNER_NAME>
+        <USER_ENTERED_IPS>
+          <RANGE>
+            <START>10.10.10.10</START>
+            <END>10.10.10.20</END>
+          </RANGE>
+        </USER_ENTERED_IPS>
+        <OPTION_PROFILE>
+          <TITLE><![CDATA[Initial Options]]></TITLE>
+          <DEFAULT_FLAG>1</DEFAULT_FLAG>
+        </OPTION_PROFILE>
+        <PROCESSING_PRIORITY>0 - No Priority</PROCESSING_PRIORITY>
+        <SCHEDULE>
+          <DAILY frequency_days="1" />
+          <START_DATE_UTC>2017-11-30T00:30:00Z</START_DATE_UTC>
+          <START_HOUR>16</START_HOUR>
+          <START_MINUTE>30</START_MINUTE>
+          <NEXTLAUNCH_UTC>2017-12-02T00:30:00</NEXTLAUNCH_UTC>
+          <TIME_ZONE>
+            <TIME_ZONE_CODE>US-CA</TIME_ZONE_CODE>
+            <TIME_ZONE_DETAILS>(GMT-0800) United States: America/Los_Angeles</TIME_ZONE_DETAILS>
+          </TIME_ZONE>
+          <DST_SELECTED>1</DST_SELECTED>
+        </SCHEDULE>
+        <NOTIFICATIONS>
+          <BEFORE_LAUNCH>
+            <TIME>30</TIME>
+            <UNIT><![CDATA[minutes]]></UNIT>
+            <MESSAGE><![CDATA[This is my custom before scan email message.]]></MESSAGE>
+          </BEFORE_LAUNCH>
+          <AFTER_COMPLETE>
+            <MESSAGE><![CDATA[This is my custom after scan email message.]]></MESSAGE>
+          </AFTER_COMPLETE>
+        </NOTIFICATIONS>
+      </SCAN>
+      <SCAN>
+        <ID>1340788</ID>
+        <ACTIVE></ACTIVE>
+        <TITLE><![CDATA[My_External_Scan]]></TITLE>
+        <USER_LOGIN>utwrx_mp</USER_LOGIN>
+        <TARGET><![CDATA[Asset Tags Included]]></TARGET>
+        <ISCANNER_NAME><![CDATA[External Scanner]]></ISCANNER_NAME>
+        <EC2_INSTANCE>
+          <CONNECTOR_UUID><![CDATA[8047abce-c3ac-42e0-ad49-be4181d22c84]]></CONNECTOR_UUID>
+          <EC2_ENDPOINT><![CDATA[1507b6c1-07a7-4d88-acf2-8c6b63e749c4]]></EC2_ENDPOINT>
+          <EC2_ONLY_CLASSIC><![CDATA[1]]></EC2_ONLY_CLASSIC>
+        </EC2_INSTANCE>
+        <CLOUD_DETAILS>
+          <PROVIDER>AWS</PROVIDER>
+          <CONNECTOR>
+            <ID>37361</ID>
+            <UUID>8047abce-c3ac-42e0-ad49-be4181d22c84</UUID>
+            <NAME><![CDATA[EC2 Connector]]></NAME>
+          </CONNECTOR>
+          <SCAN_TYPE>Cloud Perimeter</SCAN_TYPE>
+          <CLOUD_TARGET>
+            <PLATFORM>Classic</PLATFORM>
+            <REGION>
+              <UUID>1507b6c1-07a7-4d88-acf2-8c6b63e749c4</UUID>
+              <CODE>us-east-1</CODE>
+              <NAME><![CDATA[US East (N. Virginia)]]></NAME>
+            </REGION>
+            <VPC_SCOPE>None</VPC_SCOPE>
+          </CLOUD_TARGET>
+        </CLOUD_DETAILS>
+        <ASSET_TAGS>
+          <TAG_INCLUDE_SELECTOR>any</TAG_INCLUDE_SELECTOR>
+          <TAG_SET_INCLUDE><![CDATA[EC2_Targets]]></TAG_SET_INCLUDE>
+          <TAG_EXCLUDE_SELECTOR>any</TAG_EXCLUDE_SELECTOR>
+          <TAG_SET_EXCLUDE><![CDATA[EC2_Test]]></TAG_SET_EXCLUDE>
+          <USE_IP_NT_RANGE_TAGS>0</USE_IP_NT_RANGE_TAGS>
+        </ASSET_TAGS>
+        <ELB_DNS>
+          <DNS><![CDATA[abc.com]]></DNS>
+          <DNS><![CDATA[abc123.com]]></DNS>
+        </ELB_DNS>
+        <OPTION_PROFILE>
+          <TITLE><![CDATA[Initial Options]]></TITLE>
+          <DEFAULT_FLAG>1</DEFAULT_FLAG>
+        </OPTION_PROFILE>
+        <PROCESSING_PRIORITY>0 - No Priority</PROCESSING_PRIORITY>
+        <SCHEDULE>
+          <DAILY frequency_days="364" />
+          <START_DATE_UTC>2018-04-02T05:00:00Z</START_DATE_UTC>
+          <START_HOUR>10</START_HOUR>
+          <START_MINUTE>30</START_MINUTE>
+          <TIME_ZONE>
+            <TIME_ZONE_CODE>IN</TIME_ZONE_CODE>
+            <TIME_ZONE_DETAILS>(GMT+0530) India: Asia/Calcutta</TIME_ZONE_DETAILS>
+          </TIME_ZONE>
+          <DST_SELECTED>0</DST_SELECTED>
+        </SCHEDULE>
+      </SCAN>
+    </SCHEDULE_SCAN_LIST>
+  </RESPONSE>
+</SCHEDULE_SCAN_LIST_OUTPUT>`;
+
+// VM/PC API user guide, "Sample - List VM Option Profile" (/api/2.0/fo/subscription/option_profile/vm/?action=list),
+// reproduced verbatim apart from the MAP and ADDITIONAL sections. It carries brute-force LOGIN_PASSWORD entries, which
+// is why option profile configuration is never written verbatim into an audit bundle.
+const GUIDE_OPTION_PROFILE_LIST_SAMPLE = `<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE OPTION_PROFILES SYSTEM "https://qualysapi.qualys.com/api/2.0/fo/subscription/option_profile/option_profile_info.dtd">
+<OPTION_PROFILES>
+<OPTION_PROFILE>
+    <BASIC_INFO>
+      <ID>51451401</ID>
+      <GROUP_NAME><![CDATA[user op - 1]]></GROUP_NAME>
+      <GROUP_TYPE>user</GROUP_TYPE>
+      <USER_ID><![CDATA[John smith (jsmith_ap)]]></USER_ID>
+      <UNIT_ID>0</UNIT_ID>
+      <SUBSCRIPTION_ID>10421401</SUBSCRIPTION_ID>
+      <IS_DEFAULT>0</IS_DEFAULT>
+      <IS_GLOBAL>1</IS_GLOBAL>
+      <IS_OFFLINE_SYNCABLE>1</IS_OFFLINE_SYNCABLE>
+      <UPDATE_DATE>2018-04-10T13:39:41Z</UPDATE_DATE>
+    </BASIC_INFO>
+    <SCAN>
+      <PORTS>
+        <TCP_PORTS>
+          <TCP_PORTS_TYPE>standard</TCP_PORTS_TYPE>
+          <TCP_PORTS_ADDITIONAL>
+            <HAS_ADDITIONAL>1</HAS_ADDITIONAL>
+            <ADDITIONAL_PORTS>1024</ADDITIONAL_PORTS>
+          </TCP_PORTS_ADDITIONAL>
+          <THREE_WAY_HANDSHAKE>1</THREE_WAY_HANDSHAKE>
+        </TCP_PORTS>
+        <UDP_PORTS>
+          <UDP_PORTS_TYPE>light</UDP_PORTS_TYPE>
+          <UDP_PORTS_ADDITIONAL>
+            <HAS_ADDITIONAL>1</HAS_ADDITIONAL>
+            <ADDITIONAL_PORTS>8080</ADDITIONAL_PORTS>
+          </UDP_PORTS_ADDITIONAL>
+        </UDP_PORTS>
+        <AUTHORITATIVE_OPTION>1</AUTHORITATIVE_OPTION>
+      </PORTS>
+      <SCAN_DEAD_HOSTS>1</SCAN_DEAD_HOSTS>
+      <CLOSE_VULNERABILITIES>
+        <HAS_CLOSE_VULNERABILITIES>1</HAS_CLOSE_VULNERABILITIES>
+        <HOST_NOT_FOUND_ALIVE>10</HOST_NOT_FOUND_ALIVE>
+      </CLOSE_VULNERABILITIES>
+      <PURGE_OLD_HOST_OS_CHANGED>1</PURGE_OLD_HOST_OS_CHANGED>
+      <PERFORMANCE>
+        <PARALLEL_SCALING>1</PARALLEL_SCALING>
+        <OVERALL_PERFORMANCE>Normal</OVERALL_PERFORMANCE>
+        <HOSTS_TO_SCAN>
+          <EXTERNAL_SCANNERS>10</EXTERNAL_SCANNERS>
+          <SCANNER_APPLIANCES>30</SCANNER_APPLIANCES>
+        </HOSTS_TO_SCAN>
+        <PROCESSES_TO_RUN>
+          <TOTAL_PROCESSES>10</TOTAL_PROCESSES>
+          <HTTP_PROCESSES>10</HTTP_PROCESSES>
+        </PROCESSES_TO_RUN>
+        <PACKET_DELAY>Medium</PACKET_DELAY>
+        <PORT_SCANNING_AND_HOST_DISCOVERY>Normal</PORT_SCANNING_AND_HOST_DISCOVERY>
+      </PERFORMANCE>
+      <LOAD_BALANCER_DETECTION>1</LOAD_BALANCER_DETECTION>
+      <PASSWORD_BRUTE_FORCING>
+        <SYSTEM>
+          <HAS_SYSTEM>1</HAS_SYSTEM>
+          <SYSTEM_LEVEL>Standard</SYSTEM_LEVEL>
+        </SYSTEM>
+        <CUSTOM_LIST>
+          <CUSTOM>
+            <ID>1001</ID>
+            <TITLE><![CDATA[ftp - 1]]></TITLE>
+            <TYPE>FTP</TYPE>
+            <LOGIN_PASSWORD><![CDATA[L:Guest,P:temp]]></LOGIN_PASSWORD>
+          </CUSTOM>
+          <CUSTOM>
+            <ID>1002</ID>
+            <TITLE><![CDATA[ssh - 1]]></TITLE>
+            <TYPE>SSH</TYPE>
+            <LOGIN_PASSWORD><![CDATA[L:Guest,P:temp]]></LOGIN_PASSWORD>
+          </CUSTOM>
+          <CUSTOM>
+            <ID>1003</ID>
+            <TITLE><![CDATA[window - 1]]></TITLE>
+            <TYPE>Windows</TYPE>
+            <LOGIN_PASSWORD><![CDATA[L:Guest,P:temp]]></LOGIN_PASSWORD>
+          </CUSTOM>
+        </CUSTOM_LIST>
+      </PASSWORD_BRUTE_FORCING>
+      <VULNERABILITY_DETECTION>
+        <COMPLETE><![CDATA[complete]]></COMPLETE>
+        <DETECTION_INCLUDE>
+          <BASIC_HOST_INFO_CHECKS>0</BASIC_HOST_INFO_CHECKS>
+          <OVAL_CHECKS>1</OVAL_CHECKS>
+        </DETECTION_INCLUDE>
+      </VULNERABILITY_DETECTION>
+      <AUTHENTICATION><![CDATA[Windows,Unix,Oracle,Oracle Listener,SNMP,VMware,DB2,HTTP,MySQL,Sybase]]></AUTHENTICATION>
+      <AUTHENTICATION_LEAST_PRIVILEGE><![CDATA[Unix]]></AUTHENTICATION_LEAST_PRIVILEGE>
+      <ADDL_CERT_DETECTION>1</ADDL_CERT_DETECTION>
+      <DISSOLVABLE_AGENT>
+        <DISSOLVABLE_AGENT_ENABLE>1</DISSOLVABLE_AGENT_ENABLE>
+        <WINDOWS_SHARE_ENUMERATION_ENABLE>1</WINDOWS_SHARE_ENUMERATION_ENABLE>
+      </DISSOLVABLE_AGENT>
+      <LITE_OS_SCAN>1</LITE_OS_SCAN>
+      <CUSTOM_HTTP_HEADER>
+        <VALUE>sdfdsf</VALUE>
+        <DEFINITION_KEY>abc</DEFINITION_KEY>
+        <DEFINITION_VALUE>xyz</DEFINITION_VALUE>
+      </CUSTOM_HTTP_HEADER>
+      <SYSTEM_AUTH_RECORD>
+          <INCLUDE_SYSTEM_AUTH>
+            <ON_DUPLICATE_USE_USER_AUTH>1</ON_DUPLICATE_USE_USER_AUTH>
+          </INCLUDE_SYSTEM_AUTH>
+      </SYSTEM_AUTH_RECORD>
+    </SCAN>
+  </OPTION_PROFILE>
+</OPTION_PROFILES>`;
+
+// ---------------------------------------------------------------------------------------------
+// Fake client and fixture sets
+// ---------------------------------------------------------------------------------------------
+
 function createFakeClient(overrides = {}, config = sampleConfig()) {
   const base = {
     getResolvedConfig: () => config,
@@ -95,12 +811,14 @@ function createFakeClient(overrides = {}, config = sampleConfig()) {
     listScheduledReports: async () => [],
     listReports: async () => [],
     listActivityLog: async () => [],
+    listUsers: async () => [],
     searchUsers: async () => [],
     searchCloudAgents: async () => [],
     searchConnectors: async () => [],
     searchTags: async () => [],
     searchWebApps: async () => [],
     searchWasScans: async () => [],
+    searchWasScanHistory: async () => [],
     searchWasAuthRecords: async () => [],
     searchWasSchedules: async () => [],
     lastRateLimit: {},
@@ -123,12 +841,14 @@ const LIST_METHODS = [
   "listScheduledReports",
   "listReports",
   "listActivityLog",
+  "listUsers",
   "searchUsers",
   "searchCloudAgents",
   "searchConnectors",
   "searchTags",
   "searchWebApps",
   "searchWasScans",
+  "searchWasScanHistory",
   "searchWasAuthRecords",
   "searchWasSchedules",
 ];
@@ -167,6 +887,10 @@ function statusMap(result) {
   return Object.fromEntries(result.findings.map((item) => [item.id, item.status]));
 }
 
+function statusCounts(findings) {
+  return findings.reduce((total, item) => ({ ...total, [item.status]: (total[item.status] ?? 0) + 1 }), {});
+}
+
 async function runAllAssessments(client, options = {}) {
   return Promise.all([
     assessQualysScanCoverage(client, options),
@@ -181,86 +905,75 @@ function allFindings(results) {
 }
 
 const healthyFixtures = {
-  listScheduledScans: async () => [
-    { ID: "1", ACTIVE: "1", TITLE: "Internal weekly", TARGET: "10.0.0.0/24", ISCANNER_NAME: "dmz-scanner", ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: "Internal" }, SCHEDULE: { NEXTLAUNCH_UTC: daysAgo(-2) } },
-    { ID: "2", ACTIVE: "1", TITLE: "Perimeter", TARGET: "203.0.113.0/28", ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: "DMZ" }, SCHEDULE: { NEXTLAUNCH_UTC: daysAgo(-1) } },
-  ],
-  listScans: async () => [{ REF: "scan/1", STATUS: { STATE: "Finished" } }],
-  listHosts: async () => [
-    { ID: "100", IP: "10.0.0.5", OS: "Windows Server 2022", TRACKING_METHOD: "Cloud Agent", LAST_VULN_SCAN_DATETIME: daysAgo(2), LAST_VM_AUTH_SCANNED_DATE: daysAgo(2), TAGS: { TAG: [{ TAG_ID: "1", NAME: "PCI" }] } },
-    { ID: "101", IP: "10.0.0.6", OS: "Ubuntu Linux 22.04", TRACKING_METHOD: "Cloud Agent", LAST_VULN_SCAN_DATETIME: daysAgo(3), LAST_VM_AUTH_SCANNED_DATE: daysAgo(3), TAGS: { TAG: { TAG_ID: "2", NAME: "Prod" } } },
-  ],
-  listOptionProfiles: async () => [{ BASIC_INFO: { ID: "7", GROUP_NAME: "Authenticated Full" }, SCAN: { AUTHENTICATION: "Windows, Unix" } }],
+  listScheduledScans: async () => tenant.schedules,
+  listScans: async () => tenant.scans,
+  listHosts: async () => tenant.hosts,
+  listOptionProfiles: async () => tenant.profiles,
   listExcludedIps: async () => [],
-  listAssetGroups: async () => [
-    { ID: "10", TITLE: "Internal", IP_SET: { IP_RANGE: "10.0.0.1-10.0.0.254" } },
-    { ID: "11", TITLE: "DMZ", IP_SET: { IP: "203.0.113.5" } },
-  ],
-  listAppliances: async () => [{ ID: "1", NAME: "dmz-scanner", STATUS: "Online", SOFTWARE_VERSION: "12.7", ML_LATEST: "12.7", HEARTBEATS_MISSED: "0" }],
-  listAuthRecordSummary: async () => [{ type: "windows", count: 2 }, { type: "unix", count: 3 }],
-  listCompliancePolicies: async () => [{ ID: "5", TITLE: "CIS Baseline", STATUS: "active", ASSET_GROUP_IDS: "10,11" }],
-  listDetections: async () => [
-    { host_id: "100", QID: "91000", TYPE: "Confirmed", SEVERITY: "5", STATUS: "Active", FIRST_FOUND_DATETIME: daysAgo(3), QDS: { "@severity": "HIGH", "#text": "72" } },
-    { host_id: "101", QID: "38000", TYPE: "Confirmed", SEVERITY: "4", STATUS: "New", FIRST_FOUND_DATETIME: daysAgo(5), QDS: { "@severity": "MEDIUM", "#text": "50" } },
-  ],
-  listKnowledgeBase: async () => [{ QID: "91000", PATCHABLE: "1" }, { QID: "38000", PATCHABLE: "0" }],
-  listScheduledReports: async () => [{ ID: "3", ACTIVE: "1", TITLE: "Weekly executive report" }],
-  listReports: async () => [{ ID: "9", TITLE: "Weekly executive report", LAUNCH_DATETIME: daysAgo(1) }],
-  listActivityLog: async () => [{ date: daysAgo(1), action: "login", module: "auth", details: "ok", user_name: "acme_api", user_role: "Manager" }],
-  searchUsers: async () => [
-    { id: 0, username: "acme_api", emailAddress: "api@example.com", roleList: { list: [{ RoleData: { id: 1, name: "MANAGER" } }] } },
-    { id: 1, username: "acme_mgr", emailAddress: "mgr@example.com", roleList: { list: [{ RoleData: { id: 1, name: "Manager" } }] } },
-    { id: 2, username: "acme_rd", emailAddress: "reader@example.com", roleList: { list: [{ RoleData: { id: 2, name: "Reader" } }] } },
-  ],
-  searchCloudAgents: async () => [
-    { id: 100, agentInfo: { status: "STATUS_ACTIVE", lastCheckedIn: daysAgo(0), agentVersion: "6.1", activationKey: { activationId: "key-1", title: "prod-key" } } },
-    { id: 101, agentInfo: { status: "STATUS_ACTIVE", lastCheckedIn: { date: daysAgo(1) }, agentVersion: "6.1", activationKey: { activationId: "key-1", title: "prod-key" } } },
-  ],
-  searchConnectors: async () => [{ id: 1, name: "prod-aws", type: "AWS", connectorState: "FINISHED_SUCCESS", lastSync: daysAgo(0), disabled: false }],
-  searchTags: async () => [{ id: 1, name: "PCI", ruleType: "NAME_CONTAINS" }, { id: 2, name: "Prod" }],
-  searchWebApps: async () => [{ id: 500, name: "Portal", url: "https://portal.example.com" }],
-  searchWasScans: async () => [{ id: 1, status: "FINISHED", launchedDate: daysAgo(4), target: { webApp: { id: 500 } } }],
-  searchWasAuthRecords: async () => [{ id: 1, name: "portal-login", updatedDate: daysAgo(10) }],
-  searchWasSchedules: async () => [{ id: 1, active: true }],
+  listAssetGroups: async () => tenant.groups,
+  listAppliances: async () => tenant.appliances,
+  listAuthRecordSummary: async () => [{ type: "unix", count: 253 }, { type: "windows", count: 2 }],
+  listCompliancePolicies: async () => tenant.policies,
+  listDetections: async () => flattenDetections(tenant.detectionHosts),
+  listKnowledgeBase: async () => tenant.knowledgeBase,
+  listScheduledReports: async () => tenant.scheduledReports,
+  listReports: async () => tenant.reports,
+  listActivityLog: async () => tenant.activityRows,
+  listUsers: async () => tenant.legacyUsers,
+  searchUsers: async () => tenant.adminUsers,
+  searchCloudAgents: async () => tenant.agents,
+  searchConnectors: async () => tenant.connectors,
+  searchTags: async () => tenant.tags,
+  searchWebApps: async () => tenant.webApps,
+  searchWasScans: async () => tenant.wasScans,
+  searchWasScanHistory: async () => [],
+  searchWasAuthRecords: async () => tenant.wasAuthRecords,
+  searchWasSchedules: async () => tenant.wasSchedules,
 };
 
 const failingFixtures = {
-  listScheduledScans: async () => [{ ID: "1", ACTIVE: "0", TITLE: "Disabled", TARGET: "10.0.0.0/24" }],
+  listScheduledScans: async () => [documentedSchedule({ ID: "1", ACTIVE: "0", TITLE: "Disabled", TARGET: "10.0.0.0/24", USER_ENTERED_IPS: undefined })],
   listScans: async () => [],
   listHosts: async () => [
-    { ID: "100", IP: "10.0.0.5", OS: "Windows Server 2019", TRACKING_METHOD: "IP", LAST_VULN_SCAN_DATETIME: daysAgo(120) },
-    { ID: "101", IP: "10.0.0.6", OS: "Red Hat Enterprise Linux 8", TRACKING_METHOD: "IP", LAST_VULN_SCAN_DATETIME: daysAgo(90) },
-    { ID: "102", IP: "10.0.0.7", OS: "Windows 10", TRACKING_METHOD: "IP" },
+    { ID: "100", IP: "10.0.0.5", TRACKING_METHOD: "IP", OS: "Windows Server 2019", LAST_VULN_SCAN_DATETIME: daysAgo(120), LAST_VM_SCANNED_DATE: daysAgo(120) },
+    { ID: "101", IP: "10.0.0.6", TRACKING_METHOD: "IP", OS: "Red Hat Enterprise Linux 8", LAST_VULN_SCAN_DATETIME: daysAgo(90), LAST_VM_SCANNED_DATE: daysAgo(90) },
+    { ID: "102", IP: "10.0.0.7", TRACKING_METHOD: "IP", OS: "Windows 10" },
   ],
-  listOptionProfiles: async () => [{ BASIC_INFO: { ID: "7", GROUP_NAME: "Unauthenticated" }, SCAN: { PORTS: { TCP_PORTS: { TCP_PORTS_TYPE: "standard" } } } }],
+  listOptionProfiles: async () => [documentedOptionProfile({ BASIC_INFO: { ID: "7", GROUP_NAME: "Unauthenticated" }, SCAN: { PORTS: { TCP_PORTS: { TCP_PORTS_TYPE: "standard" } } } })],
   listExcludedIps: async () => [{ type: "range", value: "10.0.0.0-10.0.255.255" }],
-  listAssetGroups: async () => [{ ID: "10", TITLE: "Everything", IP_SET: {} }],
-  listAppliances: async () => [{ ID: "1", NAME: "old-scanner", STATUS: "Offline", SOFTWARE_VERSION: "11.0", ML_LATEST: "12.7", HEARTBEATS_MISSED: "12" }],
+  listAssetGroups: async () => [documentedAssetGroup({ ID: "10", TITLE: "Everything", IP_SET: undefined })],
+  listAppliances: async () => [documentedAppliance({ NAME: "old-scanner", STATUS: "Offline", SOFTWARE_VERSION: "11.0.10-1", ML_VERSION: { "@updated": "no", "#text": "" }, VULNSIGS_VERSION: { "@updated": "no", "#text": "" }, HEARTBEATS_MISSED: "12" })],
   listAuthRecordSummary: async () => [{ type: "windows", count: 0 }],
-  listCompliancePolicies: async () => [{ ID: "5", TITLE: "Unassigned policy", STATUS: "active" }],
+  listCompliancePolicies: async () => [documentedPolicy({ TITLE: "Unassigned policy", ASSET_GROUP_IDS: undefined })],
   listDetections: async () => [
-    { host_id: "100", QID: "91000", TYPE: "Confirmed", SEVERITY: "5", STATUS: "Active", FIRST_FOUND_DATETIME: daysAgo(60) },
-    { host_id: "101", QID: "38000", TYPE: "Confirmed", SEVERITY: "4", STATUS: "Active", FIRST_FOUND_DATETIME: daysAgo(90) },
-    { host_id: "102", QID: "11000", TYPE: "Confirmed", SEVERITY: "3", STATUS: "Active", FIRST_FOUND_DATETIME: daysAgo(200) },
+    { host_id: "100", ...documentedDetection({ FIRST_FOUND_DATETIME: daysAgo(60), QDS: undefined }) },
+    { host_id: "101", ...documentedDetection({ QID: "38000", SEVERITY: "4", FIRST_FOUND_DATETIME: daysAgo(90), QDS: undefined }) },
+    { host_id: "102", ...documentedDetection({ QID: "11000", SEVERITY: "3", FIRST_FOUND_DATETIME: daysAgo(200), QDS: undefined }) },
   ],
-  listKnowledgeBase: async () => [{ QID: "91000", PATCHABLE: "1" }, { QID: "38000", PATCHABLE: "1" }, { QID: "11000", PATCHABLE: "1" }],
+  listKnowledgeBase: async () => [documentedVuln(), documentedVuln({ QID: "38000" }), documentedVuln({ QID: "11000", SEVERITY_LEVEL: "3" })],
   listScheduledReports: async () => [],
   listReports: async () => [],
-  listActivityLog: async () => [{ date: daysAgo(1), action: "delete", module: "user", details: "User removed", user_name: "acme_mgr", user_role: "Manager" }],
-  searchUsers: async () => [
-    { id: 1, username: "shared_admin", emailAddress: "ops@example.com", roleList: { list: [{ RoleData: { name: "Manager" } }] } },
-    { id: 2, username: "svc_scan", emailAddress: "ops@example.com", roleList: { list: [{ RoleData: { name: "Manager" } }] } },
+  listActivityLog: async () => [{ date: daysAgo(1), action: "delete", module: "user", details: "User removed", user_name: "acme_mgr", user_role: "Manager", user_ip: "10.0.0.9" }],
+  listUsers: async () => [
+    legacyUser({ login: "shared_admin", id: "2001", role: "Manager", email: "ops@example.com" }),
+    legacyUser({ login: "svc_scan", id: "2002", role: "Manager", email: "ops@example.com" }),
   ],
-  searchCloudAgents: async () => [{ id: 100, agentInfo: { status: "STATUS_INACTIVE", lastCheckedIn: daysAgo(40), activationKey: { title: "old-key" } } }],
-  searchConnectors: async () => [{ id: 1, name: "prod-aws", type: "AWS", connectorState: "ERROR", lastError: "Invalid role", lastSync: daysAgo(30) }],
+  searchUsers: async () => [
+    adminUser(1, "shared_admin", "Manager", { emailAddress: "ops@example.com" }),
+    adminUser(2, "svc_scan", "Manager", { emailAddress: "ops@example.com" }),
+  ],
+  searchCloudAgents: async () => [documentedAgent({ agentInfo: { status: "STATUS_INACTIVE", lastCheckedIn: { date: daysAgo(40) }, activationKey: { activationId: "old-activation-id", title: "old-key" } } })],
+  searchConnectors: async () => [documentedConnector({ connectorState: "ERROR", lastError: "Invalid role", lastSync: daysAgo(30) })],
   searchTags: async () => [],
-  searchWebApps: async () => [{ id: 500, name: "Legacy portal", url: "https://legacy.example.com" }],
+  searchWebApps: async () => [documentedWebApp({ name: "Legacy portal", url: "https://legacy.example.com", lastScan: undefined })],
   searchWasScans: async () => [],
-  searchWasAuthRecords: async () => [{ id: 1, name: "old-login", updatedDate: daysAgo(400) }],
+  searchWasScanHistory: async () => [],
+  searchWasAuthRecords: async () => [documentedWasAuthRecord({ name: "old-login", updatedDate: daysAgo(400) })],
   searchWasSchedules: async () => [],
 };
 
 const EMPTY_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><LIST_OUTPUT><RESPONSE><DATETIME>2026-09-21T00:00:00Z</DATETIME></RESPONSE></LIST_OUTPUT>';
+const EMPTY_USER_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><USER_LIST></USER_LIST></USER_LIST_OUTPUT>';
 const CSV_HEADER = '"Date","Action","Module","Details","User Name","User Role","User IP"\n';
 
 function routedClient(handler, configOverrides = {}) {
@@ -270,9 +983,17 @@ function routedClient(handler, configOverrides = {}) {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Routers driving the real QualysApiClient: (a) forbidden, (b) empty, (c) partial, (d) compliant
+// ---------------------------------------------------------------------------------------------
+
 const forbiddenRouter = async (url) => {
   if (url.includes("/qps/rest/")) {
     return jsonResponse({ ServiceResponse: { responseCode: "UNAUTHORIZED", responseErrorDetails: { errorMessage: "User is not authorized to access this module" } } }, { status: 403 });
+  }
+  if (url.includes("/msp/user_list.php")) {
+    // user_list_output.dtd: USER_LIST_OUTPUT (ERROR | USER_LIST) with ATTLIST ERROR number
+    return xmlResponse('<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><ERROR number="999">Forbidden: this account is not authorized to list users</ERROR></USER_LIST_OUTPUT>');
   }
   return xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>2010</CODE><TEXT>Forbidden: module not subscribed</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 403 });
 };
@@ -280,6 +1001,7 @@ const forbiddenRouter = async (url) => {
 const emptyRouter = async (url) => {
   if (url.includes("/qps/rest/")) return jsonResponse({ ServiceResponse: { responseCode: "SUCCESS", count: 0, hasMoreRecords: "false" } });
   if (url.includes("/activity_log/")) return csvResponse(CSV_HEADER);
+  if (url.includes("/msp/user_list.php")) return xmlResponse(EMPTY_USER_LIST_XML);
   return xmlResponse(EMPTY_LIST_XML);
 };
 
@@ -291,31 +1013,35 @@ function xmlPage(recordXml, url) {
 }
 
 function partialXmlRecord(url, id) {
-  if (url.includes("/schedule/scan/")) return `<SCHEDULE_SCAN_LIST><SCHEDULE_SCAN><ID>${id}</ID><ACTIVE>1</ACTIVE><TITLE>Sched ${id}</TITLE><TARGET>10.0.${id}.0/24</TARGET></SCHEDULE_SCAN></SCHEDULE_SCAN_LIST>`;
-  if (url.includes("/scan/?")) return `<SCAN_LIST><SCAN><REF>scan/${id}</REF><STATUS><STATE>Finished</STATE></STATUS></SCAN></SCAN_LIST>`;
-  if (url.includes("/vm/detection/")) return `<HOST_LIST><HOST><ID>${id}</ID><IP>10.0.0.${id}</IP><DETECTION_LIST><DETECTION><QID>9${id}</QID><TYPE>Confirmed</TYPE><SEVERITY>4</SEVERITY><STATUS>Active</STATUS><FIRST_FOUND_DATETIME>${daysAgo(2)}</FIRST_FOUND_DATETIME><QDS severity="HIGH">70</QDS></DETECTION></DETECTION_LIST></HOST></HOST_LIST>`;
-  if (url.includes("/asset/host/")) return `<HOST_LIST><HOST><ID>${id}</ID><IP>10.0.0.${id}</IP><OS>Windows Server 2022</OS><TRACKING_METHOD>Cloud Agent</TRACKING_METHOD><LAST_VULN_SCAN_DATETIME>${daysAgo(1)}</LAST_VULN_SCAN_DATETIME><LAST_VM_AUTH_SCANNED_DATE>${daysAgo(1)}</LAST_VM_AUTH_SCANNED_DATE><TAGS><TAG><NAME>Prod</NAME></TAG></TAGS></HOST></HOST_LIST>`;
-  if (url.includes("/option_profile/")) return `<OPTION_PROFILES><OPTION_PROFILE><BASIC_INFO><ID>${id}</ID><GROUP_NAME>Profile ${id}</GROUP_NAME></BASIC_INFO><SCAN><AUTHENTICATION>Windows, Unix</AUTHENTICATION></SCAN></OPTION_PROFILE></OPTION_PROFILES>`;
+  if (url.includes("/schedule/scan/")) {
+    return `<SCHEDULE_SCAN_LIST>${xmlFromRecord("SCAN", documentedSchedule({ ID: String(id), TITLE: `Sched ${id}`, TARGET: "Asset Tags Included", ISCANNER_NAME: "External Scanner", USER_ENTERED_IPS: undefined, ASSET_TAGS: documentedAssetTags(`Segment ${id}`) }))}</SCHEDULE_SCAN_LIST>`;
+  }
+  if (url.includes("/fo/scan/")) return `<SCAN_LIST>${xmlFromRecord("SCAN", documentedScan({ REF: `scan/${id}`, TITLE: `Sched ${id}` }))}</SCAN_LIST>`;
+  if (url.includes("/vm/detection/")) {
+    return `<HOST_LIST>${xmlFromRecord("HOST", { ID: String(id), IP: `10.0.0.${id}`, DETECTION_LIST: { DETECTION: documentedDetection({ QID: `9${id}`, SEVERITY: "4", FIRST_FOUND_DATETIME: daysAgo(2), QDS: { "@severity": "HIGH", "#text": "70" } }) } })}</HOST_LIST>`;
+  }
+  if (url.includes("/asset/host/")) return `<HOST_LIST>${xmlFromRecord("HOST", documentedHost({ ID: String(id), IP: `10.0.0.${id}`, LAST_VULN_SCAN_DATETIME: daysAgo(1), LAST_VM_SCANNED_DATE: daysAgo(1), LAST_VM_AUTH_SCANNED_DATE: daysAgo(1), TAGS: { TAG: { TAG_ID: "2", NAME: "Prod" } } }))}</HOST_LIST>`;
+  if (url.includes("/option_profile/vm/")) return `<OPTION_PROFILES>${xmlFromRecord("OPTION_PROFILE", documentedOptionProfile({ BASIC_INFO: { ID: String(id), GROUP_NAME: `Profile ${id}` } }))}</OPTION_PROFILES>`;
   if (url.includes("/excluded_ip/")) return `<IP_SET><IP>10.0.0.${id}</IP></IP_SET>`;
-  if (url.includes("/asset/group/")) return `<ASSET_GROUP_LIST><ASSET_GROUP><ID>${id}</ID><TITLE>Sched ${id}</TITLE><IP_SET><IP>10.0.${id}.5</IP></IP_SET></ASSET_GROUP></ASSET_GROUP_LIST>`;
-  if (url.includes("/appliance/")) return `<APPLIANCE_LIST><APPLIANCE><ID>${id}</ID><NAME>scanner-${id}</NAME><STATUS>Online</STATUS><SOFTWARE_VERSION>12.7</SOFTWARE_VERSION><ML_LATEST>12.7</ML_LATEST><HEARTBEATS_MISSED>0</HEARTBEATS_MISSED></APPLIANCE></APPLIANCE_LIST>`;
-  if (url.includes("/auth/")) return "<AUTH_RECORDS><AUTH_WINDOWS_RECORDS><ID_SET><ID>1</ID></ID_SET></AUTH_WINDOWS_RECORDS><AUTH_UNIX_RECORDS><ID_SET><ID>2</ID></ID_SET></AUTH_UNIX_RECORDS></AUTH_RECORDS>";
-  if (url.includes("/compliance/policy/")) return `<POLICY_LIST><POLICY><ID>${id}</ID><TITLE>Policy ${id}</TITLE><STATUS>active</STATUS><ASSET_GROUP_IDS>${id}</ASSET_GROUP_IDS></POLICY></POLICY_LIST>`;
-  if (url.includes("/knowledge_base/")) return `<VULN_LIST><VULN><QID>9${id}</QID><PATCHABLE>0</PATCHABLE></VULN></VULN_LIST>`;
-  if (url.includes("/schedule/report/")) return `<SCHEDULE_REPORT_LIST><REPORT><ID>${id}</ID><ACTIVE>1</ACTIVE><TITLE>Report ${id}</TITLE></REPORT></SCHEDULE_REPORT_LIST>`;
-  if (url.includes("/report/")) return `<REPORT_LIST><REPORT><ID>${id}</ID><TITLE>Report ${id}</TITLE><LAUNCH_DATETIME>${daysAgo(1)}</LAUNCH_DATETIME></REPORT></REPORT_LIST>`;
+  if (url.includes("/asset/group/")) return `<ASSET_GROUP_LIST>${xmlFromRecord("ASSET_GROUP", documentedAssetGroup({ ID: String(id), TITLE: `Segment ${id}`, IP_SET: { IP: `10.0.${id}.5` } }))}</ASSET_GROUP_LIST>`;
+  if (url.includes("/appliance/")) return `<APPLIANCE_LIST>${xmlFromRecord("APPLIANCE", documentedAppliance({ ID: String(id), NAME: `scanner-${id}` }))}</APPLIANCE_LIST>`;
+  if (url.includes("/fo/auth/")) return "<AUTH_RECORDS><AUTH_WINDOWS_IDS><ID_SET><ID>1</ID></ID_SET></AUTH_WINDOWS_IDS><AUTH_UNIX_IDS><ID_SET><ID>2</ID></ID_SET></AUTH_UNIX_IDS></AUTH_RECORDS>";
+  if (url.includes("/compliance/policy/")) return `<POLICY_LIST>${xmlFromRecord("POLICY", documentedPolicy({ ID: String(id), TITLE: `Policy ${id}`, ASSET_GROUP_IDS: String(id) }))}</POLICY_LIST>`;
+  if (url.includes("/knowledge_base/")) return `<VULN_LIST>${xmlFromRecord("VULN", documentedVuln({ QID: `9${id}`, PATCHABLE: "0" }))}</VULN_LIST>`;
+  if (url.includes("/schedule/report/")) return `<SCHEDULE_REPORT_LIST>${xmlFromRecord("REPORT", documentedScheduledReport({ ID: String(id), TITLE: `Report ${id}` }))}</SCHEDULE_REPORT_LIST>`;
+  if (url.includes("/fo/report/")) return `<REPORT_LIST>${xmlFromRecord("REPORT", documentedReport({ ID: String(id), TITLE: `Report ${id}` }))}</REPORT_LIST>`;
   throw new Error(`unexpected XML url ${url}`);
 }
 
 function qpsEntity(url) {
-  if (url.includes("/am/user")) return ["User", (id) => ({ id, username: `user${id}`, emailAddress: `user${id}@example.com`, roleList: { list: [{ RoleData: { name: "Reader" } }] } })];
-  if (url.includes("/am/hostasset")) return ["HostAsset", (id) => ({ id, agentInfo: { status: "STATUS_ACTIVE", lastCheckedIn: daysAgo(0), activationKey: { title: "k" } } })];
-  if (url.includes("/am/assetdataconnector")) return ["AwsAssetDataConnector", (id) => ({ id, name: `aws-${id}`, connectorState: "FINISHED_SUCCESS", lastSync: daysAgo(0) })];
-  if (url.includes("/am/tag")) return ["Tag", (id) => ({ id, name: `Tag ${id}` })];
-  if (url.includes("/was/webapp")) return ["WebApp", (id) => ({ id, name: `App ${id}`, lastScan: { date: daysAgo(2) } })];
-  if (url.includes("/was/wasscan")) return ["WasScan", (id) => ({ id, status: "FINISHED", launchedDate: daysAgo(2), target: { webApp: { id } } })];
-  if (url.includes("/was/webappauthrecord")) return ["WebAppAuthRecord", (id) => ({ id, name: `auth-${id}`, updatedDate: daysAgo(3) })];
-  if (url.includes("/was/wasscanschedule")) return ["WasScanSchedule", (id) => ({ id, active: true })];
+  if (url.includes("/am/user")) return ["User", (id) => adminUser(id, `user${id}`, "Reader")];
+  if (url.includes("/am/hostasset")) return ["HostAsset", (id) => documentedAgent({ id, name: `host-${id}` })];
+  if (url.includes("/am/assetdataconnector")) return ["AwsAssetDataConnector", (id) => documentedConnector({ id, name: `aws-${id}` })];
+  if (url.includes("/am/tag")) return ["Tag", (id) => documentedTag({ id, name: `Tag ${id}` })];
+  if (url.includes("/was/webappauthrecord")) return ["WebAppAuthRecord", (id) => documentedWasAuthRecord({ id, name: `auth-${id}`, updatedDate: daysAgo(3) })];
+  if (url.includes("/was/wasscanschedule")) return ["WasScanSchedule", (id) => documentedWasSchedule({ id, name: `Schedule ${id}` })];
+  if (url.includes("/was/wasscan")) return ["WasScan", (id) => documentedWasScan({ id, name: `Scan ${id}`, launchedDate: daysAgo(2), target: { webApp: { id, name: `App ${id}` } } })];
+  if (url.includes("/was/webapp")) return ["WebApp", (id) => documentedWebApp({ id, name: `App ${id}`, lastScan: { id, name: `Scan ${id}` } })];
   throw new Error(`unexpected QPS url ${url}`);
 }
 
@@ -331,8 +1057,49 @@ const partialRouter = async (url, init) => {
     const rows = Array.from({ length: 5000 }, (_, index) => `"${daysAgo(1)}","request","auth","API: /api/2.0/fo/activity_log/","acme_api","Reader","10.0.0.${index % 250}"`);
     return csvResponse(`${CSV_HEADER}${rows.join("\n")}\n`);
   }
+  if (url.includes("/msp/user_list.php")) {
+    // A Reader caller: the User List API is read completely, but the role only sees its own business unit.
+    return xmlResponse(userListXml([legacyUser({ login: "acme_api", role: "Reader" })]));
+  }
   return xmlPage((id) => partialXmlRecord(url, id), url);
 };
+
+const compliantRouter = async (url) => {
+  if (url.includes("/qps/rest/")) {
+    if (url.includes("/am/user")) return jsonResponse(qpsResponse("User", tenant.adminUsers));
+    if (url.includes("/am/hostasset")) return jsonResponse(qpsResponse("HostAsset", tenant.agents));
+    if (url.includes("/am/assetdataconnector")) return jsonResponse(qpsResponse("AwsAssetDataConnector", tenant.connectors));
+    if (url.includes("/am/tag")) return jsonResponse(qpsResponse("Tag", tenant.tags));
+    if (url.includes("/was/webappauthrecord")) return jsonResponse(qpsResponse("WebAppAuthRecord", tenant.wasAuthRecords));
+    if (url.includes("/was/wasscanschedule")) return jsonResponse(qpsResponse("WasScanSchedule", tenant.wasSchedules));
+    if (url.includes("/was/wasscan")) return jsonResponse(qpsResponse("WasScan", tenant.wasScans));
+    if (url.includes("/was/webapp")) return jsonResponse(qpsResponse("WebApp", tenant.webApps));
+    throw new Error(`unexpected QPS url ${url}`);
+  }
+  if (url.includes("/activity_log/")) return csvResponse(activityCsv(tenant.activityRows));
+  if (url.includes("/msp/user_list.php")) return xmlResponse(userListXml(tenant.legacyUsers));
+  if (url.includes("/schedule/scan/")) return xmlResponse(listOutputXml("SCHEDULE_SCAN_LIST_OUTPUT", "SCHEDULE_SCAN_LIST", "SCAN", tenant.schedules));
+  if (url.includes("/fo/scan/")) return xmlResponse(listOutputXml("SCAN_LIST_OUTPUT", "SCAN_LIST", "SCAN", tenant.scans));
+  if (url.includes("/vm/detection/")) return xmlResponse(listOutputXml("HOST_LIST_VM_DETECTION_OUTPUT", "HOST_LIST", "HOST", tenant.detectionHosts));
+  if (url.includes("/asset/host/")) return xmlResponse(listOutputXml("HOST_LIST_OUTPUT", "HOST_LIST", "HOST", tenant.hosts));
+  if (url.includes("/option_profile/vm/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><OPTION_PROFILES>${xmlFromRecord("OPTION_PROFILE", tenant.profiles)}</OPTION_PROFILES>`);
+  if (url.includes("/excluded_ip/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><IP_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME></RESPONSE></IP_LIST_OUTPUT>`);
+  if (url.includes("/asset/group/")) return xmlResponse(listOutputXml("ASSET_GROUP_LIST_OUTPUT", "ASSET_GROUP_LIST", "ASSET_GROUP", tenant.groups));
+  if (url.includes("/appliance/")) return xmlResponse(listOutputXml("APPLIANCE_LIST_OUTPUT", "APPLIANCE_LIST", "APPLIANCE", tenant.appliances));
+  if (url.includes("/fo/auth/")) return xmlResponse(AUTH_RECORDS_SAMPLE);
+  if (url.includes("/compliance/policy/")) return xmlResponse(listOutputXml("POLICY_LIST_OUTPUT", "POLICY_LIST", "POLICY", tenant.policies));
+  if (url.includes("/knowledge_base/")) return xmlResponse(listOutputXml("KNOWLEDGE_BASE_VULN_LIST_OUTPUT", "VULN_LIST", "VULN", tenant.knowledgeBase));
+  if (url.includes("/schedule/report/")) return xmlResponse(listOutputXml("SCHEDULE_REPORT_LIST_OUTPUT", "SCHEDULE_REPORT_LIST", "REPORT", tenant.scheduledReports));
+  if (url.includes("/fo/report/")) return xmlResponse(listOutputXml("REPORT_LIST_OUTPUT", "REPORT_LIST", "REPORT", tenant.reports));
+  throw new Error(`unexpected url ${url}`);
+};
+
+const COMPLIANT_PASS_IDS = ["QUALYS-C01", "QUALYS-C02", "QUALYS-C05", "QUALYS-C06", "QUALYS-C07", "QUALYS-C08", "QUALYS-C09", "QUALYS-C10", "QUALYS-C11", "QUALYS-C13", "QUALYS-C14", "QUALYS-C15", "QUALYS-C16", "QUALYS-C18"];
+const CAPPED_BY_DESIGN_IDS = ["QUALYS-C03", "QUALYS-C12", "QUALYS-C17", "QUALYS-C19", "QUALYS-C20"];
+
+// ---------------------------------------------------------------------------------------------
+// Configuration, platform, and parser tests
+// ---------------------------------------------------------------------------------------------
 
 test("resolveQualysConfiguration prefers arguments, then environment, then config file", () => {
   const dir = createTempBase("qualys-config-");
@@ -421,7 +1188,7 @@ test("QualysApiClient sends basic auth and X-Requested-With headers and surfaces
   const client = new QualysApiClient(sampleConfig(), {
     fetchImpl: async (url, init) => {
       calls.push({ url: String(url), headers: init.headers });
-      return xmlResponse('<?xml version="1.0"?><SCHEDULE_SCAN_LIST_OUTPUT><RESPONSE><SCHEDULE_SCAN_LIST><SCHEDULE_SCAN><ID>1</ID><ACTIVE>1</ACTIVE></SCHEDULE_SCAN></SCHEDULE_SCAN_LIST></RESPONSE></SCHEDULE_SCAN_LIST_OUTPUT>');
+      return xmlResponse(listOutputXml("SCHEDULE_SCAN_LIST_OUTPUT", "SCHEDULE_SCAN_LIST", "SCAN", [documentedSchedule({ ID: "1" })]));
     },
     sleepImpl: async () => {},
   });
@@ -559,30 +1326,263 @@ test("normalizeList accepts plain arrays and list results", () => {
   assert.deepEqual(normalizeList(undefined).items, []);
 });
 
-test("resolveViewScope verifies the API user role from the user search, falls back to the activity log, and reports unverified", () => {
+// ---------------------------------------------------------------------------------------------
+// Docs fidelity pins: each of these fails on the pre-fix build (5792ce3) and passes on the fixed parsers.
+// ---------------------------------------------------------------------------------------------
+
+test("docs fidelity 1: listScheduledScans reads SCAN nested in SCHEDULE_SCAN_LIST from the guide sample verbatim", async () => {
+  const client = routedClient(async () => xmlResponse(GUIDE_SCHEDULE_SCAN_LIST_SAMPLE));
+  const schedules = await client.listScheduledScans();
+  assert.equal(schedules.items.length, 2, "schedule_scan_list_output.dtd nests SCAN, not SCHEDULE_SCAN, inside SCHEDULE_SCAN_LIST");
+  assert.deepEqual(schedules.items.map((schedule) => schedule.ID), ["160642", "1340788"]);
+  assert.equal(schedules.items[0].ACTIVE, "1");
+  assert.equal(schedules.items[0].SCHEDULE.NEXTLAUNCH_UTC, "2017-12-02T00:30:00");
+  assert.equal(schedules.items[1].ACTIVE, "");
+  assert.equal(schedules.items[1].TARGET, "Asset Tags Included");
+  assert.equal(schedules.items[1].ASSET_TAGS.TAG_SET_INCLUDE, "EC2_Targets");
+
+  const result = await assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listScheduledScans: async () => schedules.items }));
+  const coverage = findingById(result, "QUALYS-C01");
+  assert.equal(coverage.evidence.total_schedules, 2);
+  assert.equal(coverage.evidence.active_schedules, 1);
+  assert.equal(coverage.evidence.schedules_without_active_flag, 1, "an empty ACTIVE element is unknown, never active");
+  assert.deepEqual(coverage.evidence.next_launches, ["2017-12-02T00:30:00"]);
+  assert.notEqual(coverage.status, "fail", "a documented schedule list must not read as zero schedules");
+});
+
+test("docs fidelity 2: C14 matches only the documented ISCANNER_NAME literal External Scanner and never assumes a missing name is external", async () => {
+  const withSchedules = (schedules) => assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listScheduledScans: async () => schedules }));
+
+  const guideSample = await withSchedules((await routedClient(async () => xmlResponse(GUIDE_SCHEDULE_SCAN_LIST_SAMPLE)).listScheduledScans()).items);
+  const literal = findingById(guideSample, "QUALYS-C14");
+  assert.equal(literal.status, "pass");
+  assert.deepEqual(literal.evidence.external_schedules, ["My Daily Scan"], "the line-wrapped CDATA External Scanner in the guide sample is recognized");
+  assert.deepEqual(literal.evidence.scanners_in_use, ["External Scanner"]);
+  assert.match(literal.summary, /ISCANNER_NAME "External Scanner"/);
+
+  const bareWord = await withSchedules([documentedSchedule({ ID: "3", TITLE: "Bare word", ISCANNER_NAME: "External" })]);
+  assert.notEqual(findingById(bareWord, "QUALYS-C14").status, "pass", "External alone is an appliance name, not the documented literal");
+  assert.deepEqual(findingById(bareWord, "QUALYS-C14").evidence.external_schedules, []);
+
+  const missing = await withSchedules([documentedSchedule({ ID: "4", TITLE: "No scanner element", ISCANNER_NAME: undefined })]);
+  const unverified = findingById(missing, "QUALYS-C14");
+  assert.notEqual(unverified.status, "pass", "a missing ISCANNER_NAME is unverifiable and must never pass as external");
+  assert.deepEqual(unverified.evidence.external_schedules, []);
+  assert.deepEqual(unverified.evidence.schedules_without_scanner_name, ["No scanner element"]);
+  assert.equal(unverified.evidence.unknown_buckets.schedules_without_scanner_name, 1);
+  assert.match(unverified.summary, /no ISCANNER_NAME, so their scanner is unverifiable and was never assumed to be external/);
+});
+
+test("docs fidelity 3: schedule ASSET_TAGS/TAG_SET_INCLUDE is PCDATA, so tag-targeted schedules contribute their tags as targets", async () => {
+  const tagged = documentedSchedule({ ID: "5", TITLE: "Tagged", TARGET: "Asset Tags Included", ISCANNER_NAME: "External Scanner", USER_ENTERED_IPS: undefined, ASSET_TAGS: documentedAssetTags("Internal,DMZ") });
+  const result = await assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listScheduledScans: async () => [tagged] }));
+
+  const segmentation = findingById(result, "QUALYS-C20");
+  assert.deepEqual(segmentation.evidence.distinct_targets, ["Internal", "DMZ"], "tags are read from the PCDATA and the TARGET placeholder Asset Tags Included is not a target");
+
+  const coverage = findingById(result, "QUALYS-C01");
+  assert.deepEqual(coverage.evidence.asset_groups_without_schedule, [], "asset groups named by the tag set count as scheduled");
+  assert.equal(coverage.status, "pass");
+
+  const client = routedClient(async () => xmlResponse(GUIDE_SCHEDULE_SCAN_LIST_SAMPLE));
+  const fromGuide = await assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listScheduledScans: async () => (await client.listScheduledScans()).items }));
+  assert.ok(findingById(fromGuide, "QUALYS-C20").evidence.distinct_targets.includes("10.10.10.10-10.10.10.20"));
+  assert.ok(!findingById(fromGuide, "QUALYS-C20").evidence.distinct_targets.includes("Asset Tags Included"));
+});
+
+test("docs fidelity 4: option profiles are listed from /api/2.0/fo/subscription/option_profile/vm/ and parsed from the guide sample verbatim", async () => {
+  const urls = [];
+  const client = routedClient(async (url) => {
+    urls.push(url);
+    return xmlResponse(GUIDE_OPTION_PROFILE_LIST_SAMPLE);
+  });
+  const profiles = await client.listOptionProfiles();
+  assert.equal(urls.length, 1);
+  assert.ok(urls[0].startsWith("https://qualysapi.qualys.com/api/2.0/fo/subscription/option_profile/vm/?action=list"), `action=list is documented under /option_profile/vm/, got ${urls[0]}`);
+  assert.equal(profiles.items.length, 1);
+  assert.equal(profiles.items[0].BASIC_INFO.GROUP_NAME, "user op - 1");
+
+  const result = await assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listOptionProfiles: async () => profiles.items }));
+  const review = findingById(result, "QUALYS-C03");
+  assert.deepEqual(review.evidence.option_profiles, ["user op - 1"]);
+  assert.deepEqual(review.evidence.profiles_without_authentication, []);
+  assert.deepEqual(review.evidence.authentication_types, { "user op - 1": ["Windows", "Unix", "Oracle", "Oracle Listener", "SNMP", "VMware", "DB2", "HTTP", "MySQL", "Sybase"] });
+  assert.equal(findingById(result, "QUALYS-C16").evidence.option_profile_detection_exclusions, 0, "PASSWORD_BRUTE_FORCING custom lists are not detection exclusions");
+
+  const access = await checkQualysAccess(createFakeClient(healthyFixtures));
+  assert.equal(access.surfaces.find((surface) => surface.name === "option_profiles").endpoint, "/api/2.0/fo/subscription/option_profile/vm/");
+});
+
+test("docs fidelity 5: user status, role, and last login come from /msp/user_list.php (user_list_output.dtd); search/am/user carries no status", async () => {
+  const legacyUsers = [
+    legacyUser({ login: "acme_api", id: "1001", role: "Manager" }),
+    legacyUser({ login: "dormant_user", id: "1002", role: "Reader", lastLogin: daysAgo(120) }),
+    legacyUser({ login: "old_user", id: "1003", role: "Scanner", status: "Inactive", lastLogin: daysAgo(400) }),
+    legacyUser({ login: "new_user", id: "1004", role: "Reader", status: "Pending Activation", lastLogin: null }),
+  ];
+  const urls = [];
+  const client = routedClient(async (url, init) => {
+    urls.push(url);
+    if (url.includes("/msp/user_list.php")) return xmlResponse(userListXml(legacyUsers));
+    if (url.includes("/am/user")) return jsonResponse(qpsResponse("User", [adminUser(0, "acme_api", "MANAGER"), adminUser(2, "dormant_user", "Reader")]));
+    return emptyRouter(url, init);
+  });
+
+  const users = await client.listUsers();
+  assert.ok(urls.some((url) => url.startsWith("https://qualysapi.qualys.com/msp/user_list.php")));
+  assert.deepEqual(users.items.map((user) => user.USER_STATUS), ["Active", "Active", "Inactive", "Pending Activation"]);
+  assert.equal(users.items[0].CONTACT_INFO.EMAIL, "acme_api@example.com");
+
+  const result = await assessQualysAdministration(client);
+  const audit = findingById(result, "QUALYS-C13");
+  assert.equal(audit.evidence.user_list_users, 4);
+  assert.equal(audit.evidence.active_users, 2);
+  assert.equal(audit.evidence.inactive_status_users, 1);
+  assert.equal(audit.evidence.pending_activation_users, 1);
+  assert.deepEqual(audit.evidence.stale_login_users, ["dormant_user"]);
+  assert.deepEqual(audit.evidence.managers, ["acme_api"]);
+  assert.match(audit.evidence.status_source, /\/msp\/user_list\.php USER_STATUS, USER_ROLE, LAST_LOGIN_DATE/);
+  assert.match(audit.evidence.api_contract, /search\/am\/user returns Active users only/);
+  assert.match(audit.summary, /1 Active users whose LAST_LOGIN_DATE is older than 90 days/);
+  assert.equal(audit.status, "warn");
+
+  const erroring = routedClient(async () => xmlResponse('<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><ERROR number="999">Internal error. Please contact customer support.</ERROR></USER_LIST_OUTPUT>'));
+  await assert.rejects(() => erroring.listUsers(), /\/msp\/user_list\.php: error 999: Internal error/);
+
+  const undocumented = await assessQualysAdministration(createFakeClient({
+    ...healthyFixtures,
+    listUsers: failing("Qualys request failed (403) for /msp/user_list.php: error 999: not permitted"),
+    searchUsers: async () => [adminUser(0, "acme_api", "MANAGER", { userStatus: "INACTIVE", lastLoginDate: daysAgo(400) })],
+  }));
+  const fallback = findingById(undocumented, "QUALYS-C13");
+  assert.notEqual(fallback.status, "pass");
+  assert.equal(fallback.evidence.status_source, "not available");
+  assert.equal(fallback.evidence.inactive_status_users, 0, "userStatus and lastLoginDate are not documented on search/am/user and are never read");
+  assert.deepEqual(fallback.evidence.stale_login_users, []);
+  assert.match(fallback.summary, /documents no status or last-login field, so inactive-user detection is manual/);
+});
+
+test("docs fidelity 6: web app scan dates come from the WAS scan search launchedDate; a web app scanned before the window is stale, not never scanned", async () => {
+  const historyCalls = [];
+  const beforeWindow = await assessQualysAdministration(createFakeClient({
+    ...healthyFixtures,
+    searchWebApps: async () => [documentedWebApp({ lastScan: { id: 77, name: "Portal quarterly" } })],
+    searchWasScans: async () => [],
+    searchWasScanHistory: async (ids) => {
+      historyCalls.push(ids);
+      return [documentedWasScan({ id: 77, name: "Portal quarterly", launchedDate: daysAgo(60) })];
+    },
+  }));
+  const stale = findingById(beforeWindow, "QUALYS-C15");
+  assert.deepEqual(historyCalls, [["500"]], "unresolved web apps are looked up in the unbounded scan history by webApp.id");
+  assert.deepEqual(stale.evidence.stale_web_apps, ["Portal"]);
+  assert.deepEqual(stale.evidence.never_scanned_web_apps, []);
+  assert.equal(stale.evidence.scan_history_scans, 1);
+  assert.equal(stale.status, "fail");
+  assert.match(stale.evidence.last_scan_source, /launchedDate/);
+  assert.match(stale.summary, /1 were last scanned before the window per the unbounded scan history/);
+
+  const fresh = findingById(await assessQualysAdministration(createFakeClient(healthyFixtures)), "QUALYS-C15");
+  assert.equal(fresh.evidence.recently_scanned_web_apps, 1, "a FINISHED VULNERABILITY scan 4 days old is fresh against a 30 day lookback");
+  assert.deepEqual(fresh.evidence.stale_web_apps, []);
+  assert.equal(fresh.status, "pass");
+
+  const undocumentedDate = await assessQualysAdministration(createFakeClient({
+    ...healthyFixtures,
+    searchWebApps: async () => [{ ...documentedWebApp(), lastScan: { id: 1, name: "Portal weekly", date: daysAgo(1) }, lastScanDate: daysAgo(1) }],
+    searchWasScans: async () => [],
+    searchWasScanHistory: async () => [],
+  }));
+  assert.deepEqual(findingById(undocumentedDate, "QUALYS-C15").evidence.never_scanned_web_apps, ["Portal"], "lastScan.date is not on a WAS 3.0 webapp and is never read");
+
+  const discoveryOnly = await assessQualysAdministration(createFakeClient({
+    ...healthyFixtures,
+    searchWasScans: async () => [documentedWasScan({ type: "DISCOVERY" })],
+    searchWasScanHistory: async () => [],
+  }));
+  assert.deepEqual(findingById(discoveryOnly, "QUALYS-C15").evidence.never_scanned_web_apps, ["Portal"], "only FINISHED VULNERABILITY scans count");
+
+  const unreadableHistory = await assessQualysAdministration(createFakeClient({
+    ...healthyFixtures,
+    searchWasScans: async () => [],
+    searchWasScanHistory: failing("Qualys QPS request failed (500) for /qps/rest/3.0/search/was/wasscan: timeout"),
+  }));
+  const unresolved = findingById(unreadableHistory, "QUALYS-C15");
+  assert.deepEqual(unresolved.evidence.unresolved_web_apps, ["Portal"]);
+  assert.deepEqual(unresolved.evidence.never_scanned_web_apps, []);
+  assert.equal(unresolved.status, "manual");
+});
+
+test("docs fidelity: auth record wrappers follow auth_records.dtd (AUTH_<TECHNOLOGY>_IDS with ID_SET ID and ID_RANGE spans)", async () => {
+  const client = routedClient(async () => xmlResponse(AUTH_RECORDS_SAMPLE));
+  const summary = await client.listAuthRecordSummary();
+  assert.deepEqual(summary.items, [{ type: "unix", count: 253 }, { type: "windows", count: 2 }]);
+  assert.equal(summary.truncated, false);
+
+  const result = await assessQualysVulnerabilityManagement(createFakeClient({ ...healthyFixtures, listAuthRecordSummary: async () => summary.items }));
+  assert.deepEqual(findingById(result, "QUALYS-C08").evidence.missing_auth_types, []);
+  assert.equal(findingById(result, "QUALYS-C08").status, "pass");
+});
+
+test("docs fidelity: appliance versions compare ML_VERSION with ML_LATEST and VULNSIGS_VERSION with VULNSIGS_LATEST, never SOFTWARE_VERSION", async () => {
+  const outdated = await assessQualysAssetInventory(createFakeClient({
+    ...healthyFixtures,
+    listAppliances: async () => [documentedAppliance({ ML_VERSION: { "@updated": "no", "#text": "12.7.49-1" } })],
+  }));
+  assert.equal(findingById(outdated, "QUALYS-C06").status, "warn");
+  assert.equal(findingById(outdated, "QUALYS-C06").evidence.appliances[0].version_state, "outdated");
+
+  const offlineGuideShape = await assessQualysAssetInventory(createFakeClient({
+    ...healthyFixtures,
+    listAppliances: async () => [documentedAppliance({ ML_VERSION: { "@updated": "no", "#text": "" }, VULNSIGS_VERSION: { "@updated": "no", "#text": "" } })],
+  }));
+  assert.equal(findingById(offlineGuideShape, "QUALYS-C06").evidence.appliances[0].version_state, "outdated", "the guide shows <ML_VERSION updated=\"no\"></ML_VERSION>, so the attribute decides");
+
+  const noLatest = await assessQualysAssetInventory(createFakeClient({
+    ...healthyFixtures,
+    listAppliances: async () => [documentedAppliance({ ML_LATEST: undefined, ML_VERSION: "12.7.50-1", VULNSIGS_LATEST: undefined, VULNSIGS_VERSION: "2.6.212-3" })],
+  }));
+  assert.equal(findingById(noLatest, "QUALYS-C06").status, "warn");
+  assert.equal(findingById(noLatest, "QUALYS-C06").evidence.unknown_buckets.appliances_without_version_data, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// View scope and access check
+// ---------------------------------------------------------------------------------------------
+
+test("resolveViewScope verifies the API user role from the user search, then the User List API, then the activity log, and reports unverified", () => {
   const config = sampleConfig();
   const readable = (name, data) => ({ name, data, moduleUnavailable: false, truncated: false });
   const unreadable = (name) => ({ name, data: [], error: "Qualys request failed (403)", moduleUnavailable: true, truncated: false });
 
-  const manager = resolveViewScope(config, readable("users", [{ username: "ACME_API", roleList: { list: [{ RoleData: { name: "Manager" } }] } }]));
+  const manager = resolveViewScope(config, readable("users", [adminUser(0, "ACME_API", "Manager")]));
   assert.equal(manager.verified, true);
   assert.equal(manager.partial, false);
   assert.equal(manager.source, "user_search");
 
-  const reader = resolveViewScope(config, readable("users", [{ username: "acme_api", roleList: { list: [{ RoleData: { name: "Reader" } }] } }]));
+  const reader = resolveViewScope(config, readable("users", [adminUser(0, "acme_api", "Reader")]));
   assert.equal(reader.partial, true);
   assert.match(reader.note, /Reader/);
 
-  const scoped = resolveViewScope(config, readable("users", [{ username: "acme_api", roleList: { list: [{ RoleData: { name: "Manager" } }] }, scopeTags: { list: [{ TagData: { name: "BU-East" } }] } }]));
+  const scoped = resolveViewScope(config, readable("users", [adminUser(0, "acme_api", "Manager", { scopeTags: { list: [{ TagData: { name: "BU-East" } }] } })]));
   assert.equal(scoped.partial, true);
   assert.deepEqual(scoped.scopeTags, ["BU-East"]);
+
+  const fromUserList = resolveViewScope(config, readable("users", []), undefined, readable("user_list", [legacyUser({ login: "acme_api", role: "Unit Manager" })]));
+  assert.equal(fromUserList.verified, true);
+  assert.equal(fromUserList.partial, true);
+  assert.equal(fromUserList.source, "user_list");
+  assert.match(fromUserList.note, /User List API records API user acme_api with role Unit Manager/);
+
+  const managerFromUserList = resolveViewScope(config, readable("users", []), undefined, readable("user_list", [legacyUser({ login: "acme_api", role: "Manager" })]));
+  assert.equal(managerFromUserList.partial, false);
 
   const fromActivity = resolveViewScope(config, readable("users", []), readable("activity_log", [{ user_name: "acme_api", user_role: "Manager" }]));
   assert.equal(fromActivity.verified, true);
   assert.equal(fromActivity.partial, false);
   assert.equal(fromActivity.source, "activity_log");
 
-  const hidden = resolveViewScope(config, readable("users", [{ username: "someone_else" }]));
+  const hidden = resolveViewScope(config, readable("users", [adminUser(9, "someone_else", "Reader")]));
   assert.equal(hidden.verified, false);
   assert.equal(hidden.partial, false);
   assert.match(hidden.note, /hidden/);
@@ -598,12 +1598,15 @@ test("resolveViewScope verifies the API user role from the user search, falls ba
 test("checkQualysAccess reports healthy, degraded with a missing module or partial role, and limited states", async () => {
   const healthy = await checkQualysAccess(createFakeClient(healthyFixtures));
   assert.equal(healthy.status, "healthy");
-  assert.equal(healthy.surfaces.length, 14);
+  assert.equal(healthy.surfaces.length, 15);
   assert.ok(healthy.surfaces.every((surface) => surface.status === "readable"));
   assert.deepEqual(healthy.unavailableModules, []);
   assert.equal(healthy.viewScope.verified, true);
   assert.equal(healthy.viewScope.partial, false);
   assert.match(healthy.notes.join("\n"), /Manager role/);
+  const userList = healthy.surfaces.find((surface) => surface.name === "user_list");
+  assert.equal(userList.endpoint, "/msp/user_list.php");
+  assert.equal(userList.count, 3);
 
   const degraded = await checkQualysAccess(createFakeClient({
     ...healthyFixtures,
@@ -617,7 +1620,7 @@ test("checkQualysAccess reports healthy, degraded with a missing module or parti
 
   const reader = await checkQualysAccess(createFakeClient({
     ...healthyFixtures,
-    searchUsers: async () => [{ id: 0, username: "acme_api", roleList: { list: [{ RoleData: { name: "Reader" } }] } }],
+    searchUsers: async () => [adminUser(0, "acme_api", "Reader")],
   }));
   assert.equal(reader.status, "degraded");
   assert.equal(reader.viewScope.partial, true);
@@ -633,10 +1636,14 @@ test("checkQualysAccess reports healthy, degraded with a missing module or parti
 
   const truncatedProbe = await checkQualysAccess(createFakeClient({
     ...healthyFixtures,
-    listHosts: async () => truncated([{ ID: "1" }], "item cap 100 reached with more records available"),
+    listHosts: async () => truncated([documentedHost()], "item cap 100 reached with more records available"),
   }));
   assert.match(truncatedProbe.surfaces.find((surface) => surface.name === "hosts").truncation, /item cap 100/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Per-tool fixtures: passing, failing, unreadable, empty, partial
+// ---------------------------------------------------------------------------------------------
 
 test("assessQualysScanCoverage: passing fixture passes only the machine-verifiable controls", async () => {
   const healthy = await assessQualysScanCoverage(createFakeClient(healthyFixtures));
@@ -650,6 +1657,9 @@ test("assessQualysScanCoverage: passing fixture passes only the machine-verifiab
     "QUALYS-C20": "warn",
   });
   assert.equal(findingById(healthy, "QUALYS-C02").evidence.authenticated_percent, 100);
+  assert.deepEqual(findingById(healthy, "QUALYS-C01").evidence.asset_groups_without_schedule, []);
+  assert.deepEqual(findingById(healthy, "QUALYS-C14").evidence.external_schedules, ["Perimeter"]);
+  assert.deepEqual(findingById(healthy, "QUALYS-C20").evidence.distinct_targets, ["Internal", "10.0.0.1-10.0.0.254", "DMZ"]);
   assert.match(findingById(healthy, "QUALYS-C03").summary, /capped at warn/);
   assert.match(findingById(healthy, "QUALYS-C16").summary, /read completely, so emptiness is compliant/);
   assert.match(findingById(healthy, "QUALYS-C20").summary, /capped at warn/);
@@ -704,7 +1714,7 @@ test("assessQualysScanCoverage: empty fixture never passes and states the emptin
   });
   assert.match(findingById(empty, "QUALYS-C01").summary, /emptiness is a failure/i);
   assert.match(findingById(empty, "QUALYS-C02").summary, /treated as unknown, not compliant/);
-  assert.match(findingById(empty, "QUALYS-C16").summary, /QID exclusions could not be evaluated/);
+  assert.match(findingById(empty, "QUALYS-C16").summary, /detection exclusion search lists could not be evaluated/);
 
   const noHosts = await assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listHosts: async () => [] }));
   assert.equal(findingById(noHosts, "QUALYS-C01").status, "manual");
@@ -737,8 +1747,10 @@ test("assessQualysAssetInventory: passing fixture", async () => {
     "QUALYS-C18": "pass",
   });
   assert.match(findingById(healthy, "QUALYS-C04").summary, /CMDB/);
+  assert.equal(findingById(healthy, "QUALYS-C06").evidence.appliances[0].version_state, "current");
   assert.equal(findingById(healthy, "QUALYS-C07").evidence.agent_coverage_percent, 100);
   assert.equal(findingById(healthy, "QUALYS-C07").evidence.agents_without_activation_key, 0);
+  assert.equal(findingById(healthy, "QUALYS-C18").evidence.dynamic_tags, 1, "STATIC tags are not rule based");
   assert.ok(findingById(healthy, "QUALYS-C05").mappings.includes("FedRAMP CM-8(2)"));
 });
 
@@ -884,14 +1896,18 @@ test("assessQualysAdministration: passing fixture caps the partly manual control
   assert.deepEqual(healthy.findings.map((item) => item.control), [12, 13, 15, 19]);
   assert.deepEqual(statusMap(healthy), {
     "QUALYS-C12": "warn",
-    "QUALYS-C13": "manual",
+    "QUALYS-C13": "pass",
     "QUALYS-C15": "pass",
     "QUALYS-C19": "warn",
   });
   assert.match(findingById(healthy, "QUALYS-C12").summary, /Distribution recipients are not exposed/);
-  assert.match(findingById(healthy, "QUALYS-C13").summary, /hides other Manager and Super User accounts/);
+  const audit = findingById(healthy, "QUALYS-C13");
+  assert.match(audit.summary, /3 Active users \(USER_STATUS\) of 3 returned by the User List API/);
+  assert.match(audit.summary, /0 Active users without a LAST_LOGIN_DATE/);
+  assert.deepEqual(audit.evidence.managers, ["acme_api", "acme_mgr"]);
+  assert.equal(audit.evidence.users_with_last_login, 3);
   assert.match(findingById(healthy, "QUALYS-C19").summary, /capped at warn/);
-  assert.ok(findingById(healthy, "QUALYS-C13").mappings.includes("SOC 2 CC6.3"));
+  assert.ok(audit.mappings.includes("SOC 2 CC6.3"));
 });
 
 test("assessQualysAdministration: failing fixture", async () => {
@@ -903,6 +1919,7 @@ test("assessQualysAdministration: failing fixture", async () => {
     "QUALYS-C19": "warn",
   });
   assert.deepEqual(findingById(weak, "QUALYS-C13").evidence.shared_emails, ["ops@example.com"]);
+  assert.deepEqual(findingById(weak, "QUALYS-C13").evidence.generic_accounts, ["shared_admin", "svc_scan"]);
   assert.deepEqual(findingById(weak, "QUALYS-C15").evidence.never_scanned_web_apps, ["Legacy portal"]);
   assert.equal(findingById(weak, "QUALYS-C19").evidence.sensitive_actions.length, 1);
 });
@@ -916,6 +1933,10 @@ test("assessQualysAdministration: unreadable fixture is manual everywhere and ma
   assert.equal(findingById(noWas, "QUALYS-C15").status, "manual");
   assert.match(findingById(noWas, "QUALYS-C15").summary, /WAS module is not licensed or not enabled for this API user, so this control is not applicable/);
   assert.equal(findingById(noWas, "QUALYS-C12").status, "warn", "other controls are unaffected");
+
+  const noUserList = await assessQualysAdministration(createFakeClient({ ...healthyFixtures, listUsers: failing("Qualys request failed for /msp/user_list.php: error 999: not permitted") }));
+  assert.equal(findingById(noUserList, "QUALYS-C13").status, "manual", "the Administration API search alone cannot establish status or last login");
+  assert.match(findingById(noUserList, "QUALYS-C13").summary, /User List API \(\/msp\/user_list\.php, user_list_output\.dtd\), which was not readable/);
 });
 
 test("assessQualysAdministration: empty fixture never passes", async () => {
@@ -926,7 +1947,7 @@ test("assessQualysAdministration: empty fixture never passes", async () => {
     "QUALYS-C15": "manual",
     "QUALYS-C19": "manual",
   });
-  assert.match(findingById(empty, "QUALYS-C13").summary, /cannot see the user list/);
+  assert.match(findingById(empty, "QUALYS-C13").summary, /cannot see the user population/);
   assert.match(findingById(empty, "QUALYS-C15").summary, /not applicable if no web applications are in scope/);
   assert.match(findingById(empty, "QUALYS-C19").summary, /cannot read the log/);
 });
@@ -936,7 +1957,13 @@ test("assessQualysAdministration: partial fixture never passes", async () => {
   assert.ok(partial.findings.every((item) => item.status !== "pass"));
   assert.equal(findingById(partial, "QUALYS-C15").status, "warn");
   assert.match(findingById(partial, "QUALYS-C15").summary, /Partial view: was_webapps page cap 25/);
+  assert.equal(findingById(partial, "QUALYS-C13").status, "warn");
+  assert.match(findingById(partial, "QUALYS-C13").summary, /Partial view: user_list page cap 25/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Verdict safety rules through the real client and the fake client
+// ---------------------------------------------------------------------------------------------
 
 test("rule 1: a SIMPLE_RETURN or 403 response through the real client yields manual, never pass, and names the cause", async () => {
   const client = routedClient(forbiddenRouter);
@@ -950,6 +1977,7 @@ test("rule 1: a SIMPLE_RETURN or 403 response through the real client yields man
     assert.ok(item.evidence.collection.sources.some((source) => source.status === "unreadable"));
   }
   assert.ok(results.every((result) => result.errors.length > 0));
+  assert.match(findingById(results[3], "QUALYS-C13").summary, /\/msp\/user_list\.php: error 999: Forbidden/, "the documented USER_LIST_OUTPUT/ERROR element is surfaced with its number");
 });
 
 test("rule 2: empty inventories through the real client never pass and each summary states fail, unknown, or not applicable", async () => {
@@ -994,19 +2022,23 @@ test("rule 4: records without a date are bucketed, reported, and cap the verdict
     ...healthyFixtures,
     listHosts: async () => [
       ...(await healthyFixtures.listHosts()),
-      { ID: "102", IP: "10.0.0.7", OS: "Windows Server 2022", TRACKING_METHOD: "Cloud Agent", TAGS: { TAG: { NAME: "Prod" } } },
+      { ID: "102", IP: "10.0.0.7", TRACKING_METHOD: "Cloud Agent", OS: "Windows Server 2022", TAGS: { TAG: { TAG_ID: "2", NAME: "Prod" } } },
     ],
     searchCloudAgents: async () => [
       ...(await healthyFixtures.searchCloudAgents()),
-      { id: 102, agentInfo: { status: "STATUS_ACTIVE", activationKey: { title: "prod-key" } } },
+      documentedAgent({ id: 102, agentInfo: { status: "STATUS_ACTIVE", activationKey: { activationId: "0f1e2d3c", title: "prod-key" } } }),
     ],
-    searchConnectors: async () => [{ id: 1, name: "prod-aws", type: "AWS", connectorState: "FINISHED_SUCCESS" }],
+    searchConnectors: async () => [documentedConnector({ lastSync: undefined })],
     listDetections: async () => [
       ...(await healthyFixtures.listDetections()),
-      { host_id: "102", QID: "91000", TYPE: "Confirmed", SEVERITY: "5", STATUS: "Active", QDS: { "#text": "80" } },
+      { host_id: "102", ...documentedDetection({ FIRST_FOUND_DATETIME: undefined, LAST_FOUND_DATETIME: undefined, QDS: { "#text": "80" } }) },
     ],
-    searchWasAuthRecords: async () => [{ id: 1, name: "portal-login" }],
-    searchUsers: async () => [{ id: 0, username: "acme_api", emailAddress: "api@example.com", roleList: { list: [{ RoleData: { name: "Manager" } }] } }],
+    searchWasAuthRecords: async () => [documentedWasAuthRecord({ createdDate: undefined, updatedDate: undefined })],
+    listUsers: async () => [
+      ...(await healthyFixtures.listUsers()),
+      legacyUser({ login: "acme_new", id: "1004", role: "Reader", email: "new@example.com", lastLogin: null }),
+    ],
+    searchUsers: async () => [adminUser(0, "acme_api", "Manager", { emailAddress: "api@example.com" })],
   });
   const [scan, inventory, vuln, admin] = await runAllAssessments(undated);
 
@@ -1037,11 +2069,14 @@ test("rule 4: records without a date are bucketed, reported, and cap the verdict
   const was = findingById(admin, "QUALYS-C15");
   assert.equal(was.status, "warn");
   assert.equal(was.evidence.unknown_buckets.was_auth_records_without_date, 1);
-  assert.equal(findingById(admin, "QUALYS-C13").evidence.unknown_buckets.users_without_last_login, 1);
+  const users = findingById(admin, "QUALYS-C13");
+  assert.equal(users.status, "warn");
+  assert.equal(users.evidence.unknown_buckets.users_without_last_login, 1);
+  assert.deepEqual(users.evidence.stale_login_users, [], "a user without LAST_LOGIN_DATE is never counted as stale or as recently active");
 
   const onlyUndated = await assessQualysVulnerabilityManagement(createFakeClient({
     ...healthyFixtures,
-    listDetections: async () => [{ host_id: "100", QID: "91000", TYPE: "Confirmed", SEVERITY: "5", STATUS: "Active" }],
+    listDetections: async () => [{ host_id: "100", ...documentedDetection({ FIRST_FOUND_DATETIME: undefined, LAST_FOUND_DATETIME: undefined }) }],
   }));
   assert.equal(findingById(onlyUndated, "QUALYS-C10").status, "warn");
   assert.match(findingById(onlyUndated, "QUALYS-C10").summary, /none carries FIRST_FOUND_DATETIME/);
@@ -1056,17 +2091,16 @@ test("rule 5: sampling caps and a scoped API role flag a partial view instead of
       assert.match(item.summary, /Partial view: .*reaching the 2 record cap \(2 seen of cap 2\)/);
       assert.ok(item.evidence.collection.sources.some((source) => source.status === "truncated" && source.cap === 2));
     }
-    assert.notEqual(item.status, "pass" && cappedIds.includes(item.id) ? "pass" : "never");
   }
 
   const reader = createFakeClient({
     ...healthyFixtures,
-    searchUsers: async () => [{ id: 0, username: "acme_api", emailAddress: "api@example.com", roleList: { list: [{ RoleData: { name: "Reader" } }] } }],
+    searchUsers: async () => [adminUser(0, "acme_api", "Reader", { emailAddress: "api@example.com" })],
   });
   const readerFindings = allFindings(await runAllAssessments(reader));
   assert.ok(readerFindings.every((item) => item.status !== "pass"), "a Reader role can only see its own asset groups, so nothing may pass");
   const wouldPass = readerFindings.filter((item) => item.evidence.verdict_basis === "pass");
-  assert.ok(wouldPass.length >= 10);
+  assert.equal(wouldPass.length, COMPLIANT_PASS_IDS.length);
   for (const item of wouldPass) {
     assert.equal(item.status, "warn");
     assert.match(item.summary, /Partial view: API user acme_api holds role Reader/);
@@ -1075,7 +2109,7 @@ test("rule 5: sampling caps and a scoped API role flag a partial view instead of
 
   const scopedManager = await assessQualysScanCoverage(createFakeClient({
     ...healthyFixtures,
-    searchUsers: async () => [{ id: 0, username: "acme_api", roleList: { list: [{ RoleData: { name: "Manager" } }] }, scopeTags: { list: [{ TagData: { name: "BU-East" } }] } }],
+    searchUsers: async () => [adminUser(0, "acme_api", "Manager", { scopeTags: { list: [{ TagData: { name: "BU-East" } }] } })],
   }));
   assert.equal(findingById(scopedManager, "QUALYS-C01").status, "warn");
   assert.match(findingById(scopedManager, "QUALYS-C01").summary, /scoped to tags BU-East/);
@@ -1092,39 +2126,39 @@ test("rule 6: a value whose enabling flag is false or absent never supports pass
   const flagless = createFakeClient({
     ...healthyFixtures,
     listScheduledScans: async () => [
-      { ID: "1", TITLE: "No flag", TARGET: "10.0.0.0/24" },
-      { ID: "2", ACTIVE: "", TITLE: "Empty flag", TARGET: "203.0.113.0/28" },
+      documentedSchedule({ ID: "1", ACTIVE: undefined, TITLE: "No flag", TARGET: "10.0.0.0/24" }),
+      documentedSchedule({ ID: "2", ACTIVE: "", TITLE: "Empty flag", TARGET: "203.0.113.0/28" }),
     ],
     listCompliancePolicies: async () => [
-      { ID: "5", TITLE: "CIS Baseline", STATUS: "active", ASSET_GROUP_IDS: "10" },
-      { ID: "6", TITLE: "No status", ASSET_GROUP_IDS: "10" },
-      { ID: "7", TITLE: "Hidden groups", STATUS: "active", ASSET_GROUP_IDS: { "@has_hidden_data": "1", "#text": "" } },
+      documentedPolicy({ ASSET_GROUP_IDS: "10" }),
+      documentedPolicy({ ID: "6", TITLE: "No status", STATUS: undefined, ASSET_GROUP_IDS: "10" }),
+      documentedPolicy({ ID: "7", TITLE: "Hidden groups", ASSET_GROUP_IDS: { "@has_hidden_data": "1", "#text": "" } }),
     ],
     listDetections: async () => [
       ...(await healthyFixtures.listDetections()),
-      { host_id: "100", QID: "77000", TYPE: "Confirmed", SEVERITY: "5", STATUS: "Fixed", FIRST_FOUND_DATETIME: daysAgo(400) },
-      { host_id: "100", QID: "78000", TYPE: "Info", STATUS: "Active", FIRST_FOUND_DATETIME: daysAgo(400) },
-      { host_id: "100", QID: "79000", TYPE: "Confirmed", STATUS: "Active", FIRST_FOUND_DATETIME: daysAgo(2) },
+      { host_id: "100", ...documentedDetection({ QID: "77000", STATUS: "Fixed", FIRST_FOUND_DATETIME: daysAgo(400) }) },
+      { host_id: "100", ...documentedDetection({ QID: "78000", TYPE: "Info", SEVERITY: undefined, FIRST_FOUND_DATETIME: daysAgo(400) }) },
+      { host_id: "100", ...documentedDetection({ QID: "79000", SEVERITY: undefined, FIRST_FOUND_DATETIME: daysAgo(2) }) },
     ],
-    listKnowledgeBase: async () => [{ QID: "91000", PATCHABLE: "1" }, { QID: "38000", PATCHABLE: "0" }, { QID: "79000", PATCHABLE: "0" }],
+    listKnowledgeBase: async () => [...tenant.knowledgeBase, documentedVuln({ QID: "79000", PATCHABLE: "0" })],
     searchCloudAgents: async () => [
       ...(await healthyFixtures.searchCloudAgents()),
-      { id: 102, agentInfo: { lastCheckedIn: daysAgo(0), activationKey: { title: "prod-key" } } },
+      documentedAgent({ id: 102, agentInfo: { lastCheckedIn: { date: daysAgo(0) }, activationKey: { activationId: "0f1e2d3c", title: "prod-key" } } }),
     ],
     listHosts: async () => [
       ...(await healthyFixtures.listHosts()),
-      { ID: "102", IP: "10.0.0.7", OS: "Windows Server 2022", LAST_VULN_SCAN_DATETIME: daysAgo(1), LAST_VM_AUTH_SCANNED_DATE: daysAgo(1), TAGS: { TAG: { NAME: "Prod" } } },
+      documentedHost({ ID: "102", IP: "10.0.0.7", TRACKING_METHOD: undefined, LAST_VULN_SCAN_DATETIME: daysAgo(1), LAST_VM_SCANNED_DATE: daysAgo(1), LAST_VM_AUTH_SCANNED_DATE: daysAgo(1) }),
     ],
-    searchWasSchedules: async () => [{ id: 1 }],
-    searchUsers: async () => [
-      { id: 0, username: "acme_api", emailAddress: "api@example.com", roleList: { list: [{ RoleData: { name: "Manager" } }] } },
-      { id: 3, username: "no_role", emailAddress: "norole@example.com" },
+    searchWasSchedules: async () => [documentedWasSchedule({ active: undefined })],
+    listUsers: async () => [
+      ...(await healthyFixtures.listUsers()),
+      legacyUser({ login: "no_role", id: "1005", role: null, email: "norole@example.com" }),
     ],
   });
   const [scan, inventory, vuln, admin] = await runAllAssessments(flagless);
 
   const schedules = findingById(scan, "QUALYS-C01");
-  assert.equal(schedules.status, "fail", "schedules without an ACTIVE=1 flag are not active");
+  assert.equal(schedules.status, "fail", "schedules without an ACTIVE flag of 1, 2, or 3 are not active");
   assert.equal(schedules.evidence.active_schedules, 0);
   assert.equal(schedules.evidence.schedules_without_active_flag, 2);
   assert.equal(findingById(scan, "QUALYS-C14").status, "fail");
@@ -1155,7 +2189,7 @@ test("rule 6: a value whose enabling flag is false or absent never supports pass
 
   const noAuthProfile = await assessQualysScanCoverage(createFakeClient({
     ...healthyFixtures,
-    listOptionProfiles: async () => [{ BASIC_INFO: { ID: "7", GROUP_NAME: "Silent" }, SCAN: {} }],
+    listOptionProfiles: async () => [documentedOptionProfile({ BASIC_INFO: { ID: "7", GROUP_NAME: "Silent" }, SCAN: {} })],
   }));
   assert.deepEqual(findingById(noAuthProfile, "QUALYS-C03").evidence.profiles_without_authentication, ["Silent"]);
 
@@ -1165,6 +2199,13 @@ test("rule 6: a value whose enabling flag is false or absent never supports pass
   }));
   assert.equal(findingById(unknownAppliance, "QUALYS-C06").status, "warn");
   assert.equal(findingById(unknownAppliance, "QUALYS-C06").evidence.unknown_buckets.appliances_without_status, 1);
+
+  const inactiveReport = await assessQualysAdministration(createFakeClient({
+    ...healthyFixtures,
+    listScheduledReports: async () => [documentedScheduledReport({ ACTIVE: "0" }), documentedScheduledReport({ ID: "4", ACTIVE: undefined })],
+  }));
+  assert.equal(findingById(inactiveReport, "QUALYS-C12").status, "fail");
+  assert.equal(findingById(inactiveReport, "QUALYS-C12").evidence.scheduled_reports_without_active_flag, 1);
 });
 
 test("rule 7: a truncated collection through the real client downgrades the verdict", async () => {
@@ -1200,6 +2241,10 @@ test("rule 8: re-running an export never overwrites a prior bundle and the zip n
   assert.equal(statSync(first.zipPath).size, firstZipSize, "the prior archive is untouched");
 });
 
+// ---------------------------------------------------------------------------------------------
+// False-pass self-check fixtures (a) forbidden, (b) empty, (c) partial, (d) compliant
+// ---------------------------------------------------------------------------------------------
+
 test("false-pass self-check (a): every endpoint forbidden yields zero pass across all four tools", async () => {
   const findings = allFindings(await runAllAssessments(routedClient(forbiddenRouter)));
   assert.equal(findings.length, 20);
@@ -1211,13 +2256,12 @@ test("false-pass self-check (b): every list empty yields zero pass because no co
   const findings = allFindings(await runAllAssessments(routedClient(emptyRouter)));
   assert.equal(findings.length, 20);
   assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id), []);
-  const counts = findings.reduce((total, item) => ({ ...total, [item.status]: (total[item.status] ?? 0) + 1 }), {});
-  assert.deepEqual(counts, { fail: 7, manual: 13 });
-  const failing = findings.filter((item) => item.status === "fail").map((item) => item.id).sort();
-  assert.deepEqual(failing, ["QUALYS-C01", "QUALYS-C03", "QUALYS-C08", "QUALYS-C12", "QUALYS-C14", "QUALYS-C18", "QUALYS-C20"]);
+  assert.deepEqual(statusCounts(findings), { fail: 7, manual: 13 });
+  const failingIds = findings.filter((item) => item.status === "fail").map((item) => item.id).sort();
+  assert.deepEqual(failingIds, ["QUALYS-C01", "QUALYS-C03", "QUALYS-C08", "QUALYS-C12", "QUALYS-C14", "QUALYS-C18", "QUALYS-C20"]);
 });
 
-test("false-pass self-check (c): a partial inventory with caps, unfollowed continuations, and hasMoreRecords yields zero pass", async () => {
+test("false-pass self-check (c): a partial inventory with caps, unfollowed continuations, hasMoreRecords, and a Reader role yields zero pass", async () => {
   const findings = allFindings(await runAllAssessments(routedClient(partialRouter), { hostLimit: 3, detectionLimit: 3 }));
   assert.equal(findings.length, 20);
   assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id), []);
@@ -1228,8 +2272,42 @@ test("false-pass self-check (c): a partial inventory with caps, unfollowed conti
     assert.match(item.summary, /Partial view/);
   }
   for (const item of findings) {
-    assert.ok(item.evidence.collection.sources.some((source) => source.status === "truncated" || source.status === "unreadable"), `${item.id} should record a truncated source`);
+    const partialSource = item.evidence.collection.sources.some((source) => source.status === "truncated" || source.status === "unreadable");
+    // The User List API has no continuation, so C13 records the Reader view scope instead of a truncated source.
+    assert.ok(partialSource || (item.id === "QUALYS-C13" && item.evidence.collection.view_scope.partial), `${item.id} should record a truncated source or a partial view scope`);
   }
+});
+
+test("false-pass self-check (d): a fully compliant tenant built strictly from documented shapes passes every automatable control through the real client", async () => {
+  const results = await runAllAssessments(routedClient(compliantRouter));
+  const findings = allFindings(results);
+  assert.equal(findings.length, 20);
+  assert.ok(results.every((result) => result.errors.length === 0), results.flatMap((result) => result.errors).join("\n"));
+  assert.deepEqual(statusCounts(findings), { pass: 14, warn: 5, manual: 1 });
+  assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id).sort(), COMPLIANT_PASS_IDS);
+  assert.deepEqual(findings.filter((item) => item.status === "warn").map((item) => item.id).sort(), CAPPED_BY_DESIGN_IDS);
+  assert.deepEqual(findings.filter((item) => item.status === "manual").map((item) => item.id), ["QUALYS-C04"]);
+  for (const item of findings) {
+    assert.ok(item.evidence.collection.sources.every((source) => source.status === "readable"), `${item.id}: ${JSON.stringify(item.evidence.collection.sources)}`);
+    assert.equal(item.evidence.collection.view_scope.partial, false);
+    assert.equal(item.evidence.collection.view_scope.source, "user_search");
+  }
+  for (const item of findings.filter((entry) => entry.status === "pass")) {
+    assert.deepEqual(item.evidence.unknown_buckets, {}, `${item.id} passes with no unknown records`);
+    assert.equal(item.evidence.verdict_basis, "pass");
+  }
+  for (const item of findings.filter((entry) => entry.status === "warn")) {
+    assert.match(item.summary, /capped at warn/, `${item.id} warns only because the control is capped by design`);
+  }
+
+  const [scan, inventory, vuln, admin] = results;
+  assert.equal(findingById(scan, "QUALYS-C01").evidence.finished_scans_in_lookback, 1);
+  assert.deepEqual(findingById(scan, "QUALYS-C14").evidence.external_schedules, ["Perimeter"]);
+  assert.equal(findingById(inventory, "QUALYS-C07").evidence.agent_coverage_percent, 100);
+  assert.deepEqual(findingById(vuln, "QUALYS-C08").evidence.auth_record_types, [{ type: "unix", count: 253 }, { type: "windows", count: 2 }]);
+  assert.equal(findingById(vuln, "QUALYS-C10").evidence.sla_compliance_percent, 100);
+  assert.equal(findingById(admin, "QUALYS-C13").evidence.active_users, 3);
+  assert.equal(findingById(admin, "QUALYS-C15").evidence.recently_scanned_web_apps, 1);
 });
 
 test("all four assessments together cover every one of the 20 spec controls with framework mappings and collection evidence", async () => {
@@ -1244,14 +2322,11 @@ test("all four assessments together cover every one of the 20 spec controls with
     assert.ok(item.mappings.some((mapping) => mapping.startsWith("FedRAMP ")));
     assert.ok(item.mappings.some((mapping) => mapping.startsWith("ISMAP ")));
     assert.equal(typeof item.summary, "string");
-    assert.equal(typeof item.manual_evidence === "undefined" ? item.evidence.manual_evidence : item.manual_evidence, item.evidence.manual_evidence);
+    assert.equal(typeof item.evidence.manual_evidence, "string");
     assert.ok(Array.isArray(item.evidence.collection.sources) && item.evidence.collection.sources.length > 0);
     assert.ok(["pass", "warn", "fail", "manual"].includes(item.evidence.verdict_basis));
   }
-  assert.deepEqual(
-    findings.filter((item) => item.status === "pass").map((item) => item.id).sort(),
-    ["QUALYS-C01", "QUALYS-C02", "QUALYS-C05", "QUALYS-C06", "QUALYS-C07", "QUALYS-C08", "QUALYS-C09", "QUALYS-C10", "QUALYS-C11", "QUALYS-C14", "QUALYS-C15", "QUALYS-C16", "QUALYS-C18"],
-  );
+  assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id).sort(), COMPLIANT_PASS_IDS);
 });
 
 test("exportQualysAuditBundle writes the bundle layout, zip, and error log on partial failure", async () => {
@@ -1297,8 +2372,8 @@ test("exportQualysAuditBundle writes the bundle layout, zip, and error log on pa
   }
   assert.match(readFileSync(join(result.outputDir, "_errors.log"), "utf8"), /PC module not subscribed/);
   const executive = readFileSync(join(result.outputDir, "compliance/executive_summary.md"), "utf8");
-  assert.match(executive, /Manual controls: 3/);
-  assert.match(executive, /Passing controls: 12/);
+  assert.match(executive, /Manual controls: 2/);
+  assert.match(executive, /Passing controls: 13/);
   assert.match(readFileSync(join(result.outputDir, "compliance/fedramp/fedramp_compliance_report.md"), "utf8"), /RA-5\(3\)/);
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis/findings.json"), "utf8"));
   assert.equal(findings.find((item) => item.id === "QUALYS-C09").status, "manual");
