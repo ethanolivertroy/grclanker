@@ -294,6 +294,7 @@ function healthyFixture() {
       ip_access: [{ sys_id: "ip-1", type: "allow", direction: "inbound", active: "true", range_start: "10.0.0.0", range_end: "10.0.255.255", description: "Corporate VPN" }],
       sys_email_account: [{ sys_id: "email-1", name: "Outbound SMTP", type: "SMTP", active: "true", connection_security: "SSL/TLS", authentication: "Password", server: "smtp.example.com", port: "465" }],
       sys_encryption_context: [],
+      sys_kmf_crypto_module: [],
       sys_dictionary: [
         { sys_id: "dict-user", name: "sys_user", internal_type: "collection", audit: "true", attributes: "" },
         { sys_id: "dict-uhr", name: "sys_user_has_role", internal_type: "collection", audit: "true", attributes: "" },
@@ -613,7 +614,7 @@ test("checkServicenowAccess reports a healthy instance with the authenticated id
   assert.equal(result.status, "healthy");
   assert.equal(result.identity, "audit.reader");
   assert.equal(result.authMode, "basic");
-  assert.equal(result.surfaces.length, 26);
+  assert.equal(result.surfaces.length, 27);
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   const audit = result.surfaces.find((surface) => surface.table === "sys_audit");
   assert.equal(audit.total, 1200);
@@ -986,6 +987,49 @@ test("assessServicenowOperationsGovernance fails unaudited tables, unvalidated M
   assert.match(byId.get("SNOW-20").summary, /High Security Settings/);
 });
 
+test("SNOW-09 inventories KMF cryptographic modules and treats a missing legacy context table as absent, not as an error", async () => {
+  const withModules = healthyFixture();
+  withModules.tables.sys_kmf_crypto_module = [{ sys_id: "kmf-1", name: "global.pii_module", module_name: "pii_module", state: "Published" }];
+  delete withModules.tables.sys_encryption_context;
+  const { fetchImpl, calls } = fixtureFetch(withModules);
+  const result = await assessServicenowOperationsGovernance(createClient(fetchImpl));
+  const encryption = findingsById(result).get("SNOW-09");
+
+  assert.equal(encryption.status, "manual");
+  assert.match(encryption.summary, /1 KMF cryptographic modules, 0 legacy encryption contexts, and 0 encrypted dictionary fields/);
+  assert.deepEqual(encryption.evidence.crypto_modules, ["global.pii_module"]);
+  assert.equal(encryption.evidence.legacy_context_table_available, false);
+  assert.ok(calls.some((call) => call.url.pathname === "/api/now/table/sys_kmf_crypto_module"));
+  assert.equal(result.errors.some((issue) => /sys_encryption_context read failed/.test(issue)), false);
+
+  const none = findingsById(await assessServicenowOperationsGovernance(createClient(fixtureFetch(withModules, { forbiddenTables: ["sys_kmf_crypto_module"] }).fetchImpl))).get("SNOW-09");
+  assert.equal(none.status, "manual");
+  assert.match(none.summary, /sys_kmf_crypto_module read was forbidden \(403\)/);
+});
+
+test("SNOW-04 surfaces locked-out accounts and flags locked administrators", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_user = fixture.tables.sys_user.map((row) => (row.user_name === "bob.user" ? { ...row, locked_out: "true" } : row));
+  const review = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(fixture).fetchImpl))).get("SNOW-04");
+
+  assert.equal(review.status, "warn");
+  assert.match(review.summary, /1 active accounts are locked out \(0 admins; review or deactivate them\)/);
+  assert.deepEqual(review.evidence.locked_out_users, ["bob.user"]);
+  assert.equal(review.evidence.locked_out_user_count, 1);
+  assert.deepEqual(review.evidence.locked_out_admins, []);
+
+  const lockedAdmin = healthyFixture();
+  lockedAdmin.tables.sys_user = lockedAdmin.tables.sys_user.map((row) => (row.user_name === "alice.admin" ? { ...row, locked_out: "true" } : row));
+  const adminReview = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(lockedAdmin).fetchImpl))).get("SNOW-04");
+  assert.equal(adminReview.status, "warn");
+  assert.deepEqual(adminReview.evidence.locked_out_admins, ["alice.admin"]);
+
+  const clean = findingsById(await assessServicenowIdentityAccess(createClient(fixtureFetch(healthyFixture()).fetchImpl))).get("SNOW-04");
+  assert.equal(clean.status, "pass");
+  assert.match(clean.summary, /no active account is locked out/);
+  assert.equal(clean.evidence.locked_out_user_count, 0);
+});
+
 test("assessServicenowOperationsGovernance fails audited tables that produce zero audit rows (rule 2)", async () => {
   const fixture = healthyFixture();
   fixture.counts.sys_audit = 0;
@@ -1132,6 +1176,10 @@ test("exportServicenowAuditBundle writes core data, analysis, compliance reports
     "core_data/sys_security_acl.json",
     "core_data/sys_audit_count.json",
     "core_data/sys_plugins.json",
+    "core_data/ip_access.json",
+    "core_data/sys_plugins_ip_authenticator.json",
+    "core_data/multi_factor_criteria.json",
+    "core_data/sys_kmf_crypto_module.json",
     "analysis/findings.json",
     "analysis/summary.json",
     "analysis/identity_access.json",

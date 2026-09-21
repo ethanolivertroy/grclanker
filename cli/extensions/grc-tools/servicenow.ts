@@ -1298,6 +1298,8 @@ const ACL_FIELDS = ["sys_id", "name", "operation", "type", "active", "admin_over
 const ACL_ROLE_FIELDS = ["sys_id", "sys_security_acl", "sys_security_acl.name", "sys_user_role", "sys_user_role.name"];
 const PLUGIN_FIELDS = ["sys_id", "name", "source", "active", "version"];
 const MFA_CRITERIA_TABLE = "multi_factor_criteria";
+const CRYPTO_MODULE_TABLE = "sys_kmf_crypto_module";
+const LEGACY_ENCRYPTION_CONTEXT_TABLE = "sys_encryption_context";
 const IP_ACCESS_TABLE = "ip_access";
 const IP_AUTHENTICATOR_PLUGIN = "com.snc.ipauthenticator";
 const IP_ACCESS_FIELDS = ["sys_id", "type", "direction", "active", "range_start", "range_end", "description", "sys_updated_on"];
@@ -1487,6 +1489,8 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       }
     }
     const adminsWithoutLoginDate = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "") && !parseServicenowDate(user.last_login_time)).map(userLabel);
+    const lockedOut = users.filter((user) => rowBoolean(user, "locked_out") === true);
+    const lockedOutAdmins = lockedOut.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "")).map(userLabel);
     const evidence: JsonRecord = {
       active_users: users.length,
       admin_users: elevatedUserIds.size,
@@ -1499,25 +1503,28 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
       users_without_last_login_count: neverLoggedIn.length,
       admins_without_last_login: adminsWithoutLoginDate,
       inactive_admins: staleAdmins,
+      locked_out_users: truncateList(lockedOut.map(userLabel)),
+      locked_out_user_count: lockedOut.length,
+      locked_out_admins: lockedOutAdmins,
       multi_privileged_users: truncateList(multiPrivilegedUsers.map(([user, roles]) => ({ user, roles: [...roles] }))),
     };
     if (staleAdmins.length > 0 || elevatedUserIds.size > data.maxAdmins) {
       return {
         status: "fail",
-        summary: `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active.`,
+        summary: `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active; ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins).`,
         evidence,
       };
     }
-    if (stale.length > 0 || neverLoggedIn.length > 0 || adminsWithoutLoginDate.length > 0 || multiPrivilegedUsers.length > 0) {
+    if (stale.length > 0 || neverLoggedIn.length > 0 || adminsWithoutLoginDate.length > 0 || multiPrivilegedUsers.length > 0 || lockedOut.length > 0) {
       return {
         status: "warn",
-        summary: `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`,
+        summary: `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins; review or deactivate them), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`,
         evidence,
       };
     }
     return {
       status: "pass",
-      summary: `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, and no user stacks multiple privileged roles.`,
+      summary: `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, no active account is locked out, and no user stacks multiple privileged roles.`,
       evidence,
     };
   });
@@ -2291,6 +2298,7 @@ export async function assessServicenowAccessControl(
 
 export interface ServicenowOperationsData {
   encryptionContexts: TableSnapshot;
+  cryptoModules: TableSnapshot;
   encryptedFields: TableSnapshot;
   auditDictionary: TableSnapshot;
   recentAuditCount: CountResult;
@@ -2312,8 +2320,9 @@ export async function collectServicenowOperationsData(
     "update_set.state=in progress",
     ["sys_security_acl_", "sys_user_role_", "sys_user_role_contains_", "sys_script_", "sys_script_include_", "sys_properties_"].map((prefix) => `nameSTARTSWITH${prefix}`).join("^OR"),
   ].join("^");
-  const [encryptionContexts, encryptedFields, auditDictionary, recentAuditCount, recentTransactionCount, updateSetsInProgress, updateSetTotal, sensitiveUpdateXml, midServers, properties, plugins] = await Promise.all([
-    client.queryTable("sys_encryption_context", { fields: ["sys_id", "name", "type", "sys_updated_on"], limit: recordLimit }),
+  const [encryptionContexts, cryptoModules, encryptedFields, auditDictionary, recentAuditCount, recentTransactionCount, updateSetsInProgress, updateSetTotal, sensitiveUpdateXml, midServers, properties, plugins] = await Promise.all([
+    client.queryTable(LEGACY_ENCRYPTION_CONTEXT_TABLE, { fields: ["sys_id", "name", "type", "sys_updated_on"], limit: recordLimit }),
+    client.queryTable(CRYPTO_MODULE_TABLE, { fields: ["sys_id", "name", "module_name", "state", "sys_scope", "sys_updated_on"], limit: recordLimit }),
     client.queryTable("sys_dictionary", { query: "internal_type=glide_encrypted^ORinternal_type=password2", fields: ["sys_id", "name", "element", "internal_type"], limit: recordLimit }),
     client.queryTable("sys_dictionary", { query: `internal_type=collection^nameIN${AUDITED_CRITICAL_TABLES.join(",")}`, fields: ["sys_id", "name", "audit", "attributes"], limit: recordLimit }),
     client.countRecords("sys_audit", `sys_created_on>=javascript:gs.daysAgoStart(${AUDIT_LOOKBACK_DAYS})`),
@@ -2326,7 +2335,8 @@ export async function collectServicenowOperationsData(
     client.queryTable("sys_plugins", { fields: PLUGIN_FIELDS, limit: recordLimit }),
   ]);
   return {
-    encryptionContexts,
+    encryptionContexts: normalizeMissingTable(encryptionContexts, `${LEGACY_ENCRYPTION_CONTEXT_TABLE} (legacy Column Level Encryption contexts) does not exist on this instance`),
+    cryptoModules,
     encryptedFields,
     auditDictionary,
     recentAuditCount,
@@ -2353,6 +2363,7 @@ function pluginActive(row: JsonRecord): boolean | undefined {
 export function assessServicenowOperationsGovernanceData(data: ServicenowOperationsData): ServicenowAssessmentResult {
   const errors = [
     ...snapshotErrors("encryption contexts", data.encryptionContexts),
+    ...snapshotErrors("cryptographic modules", data.cryptoModules),
     ...snapshotErrors("encrypted fields", data.encryptedFields),
     ...snapshotErrors("audit dictionary", data.auditDictionary),
     ...countErrors("recent audit rows", data.recentAuditCount),
@@ -2365,25 +2376,29 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     ...snapshotErrors("plugins", data.plugins),
   ];
 
-  const encryption = gatedFinding(9, [data.encryptionContexts, data.encryptedFields], "Open System Security > Field Encryption > Encryption Contexts and System Definition > Dictionary filtered on Type = Encrypted Text; confirm every field holding regulated data is encrypted, and record whether Column Level Encryption Enterprise, Cloud Encryption, or Edge Encryption is licensed.", () => {
+  const encryption = gatedFinding(9, [data.encryptionContexts, data.cryptoModules, data.encryptedFields], `Open Key Management Framework > Cryptographic Modules (${CRYPTO_MODULE_TABLE}), System Security > Field Encryption > Encryption Contexts (legacy), and System Definition > Dictionary filtered on Type = Encrypted Text; confirm every field holding regulated data is encrypted, and record whether Column Level Encryption Enterprise, Cloud Encryption, or Edge Encryption is licensed.`, () => {
     const contexts = data.encryptionContexts.rows.map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "context");
+    const modules = data.cryptoModules.rows.map((row) => rowString(row, "name") ?? rowString(row, "module_name") ?? rowString(row, "sys_id") ?? "module");
     const fields = data.encryptedFields.rows.map((row) => `${rowString(row, "name") ?? "table"}.${rowString(row, "element") ?? "field"}`);
     const evidence: JsonRecord = {
-      encryption_contexts: truncateList(contexts),
-      encryption_context_count: contexts.length,
+      crypto_modules: truncateList(modules),
+      crypto_module_count: modules.length,
+      legacy_encryption_contexts: truncateList(contexts),
+      legacy_encryption_context_count: contexts.length,
+      legacy_context_table_available: !data.encryptionContexts.unavailable,
       encrypted_fields: truncateList(fields),
       encrypted_field_count: fields.length,
     };
-    if (contexts.length === 0 && fields.length === 0) {
+    if (contexts.length === 0 && modules.length === 0 && fields.length === 0) {
       return {
         status: "manual",
-        summary: "No encryption contexts or encrypted dictionary fields exist; column-level encryption is not in use. Confirm whether sensitive fields require encryption and whether an encryption module (CLE Enterprise, Cloud Encryption, Edge Encryption) is licensed and scoped for this instance.",
+        summary: `No KMF cryptographic modules, legacy encryption contexts${data.encryptionContexts.unavailable ? ` (${LEGACY_ENCRYPTION_CONTEXT_TABLE} is not present)` : ""}, or encrypted dictionary fields exist; column-level encryption is not in use. Confirm whether sensitive fields require encryption and whether an encryption module (CLE Enterprise, Cloud Encryption, Edge Encryption) is licensed and scoped for this instance.`,
         evidence,
       };
     }
     return {
       status: "manual",
-      summary: `${contexts.length} encryption contexts and ${fields.length} encrypted dictionary fields are configured; the API cannot determine whether every sensitive field is covered, so coverage must be confirmed against the data classification inventory.`,
+      summary: `${modules.length} KMF cryptographic modules, ${contexts.length} legacy encryption contexts, and ${fields.length} encrypted dictionary fields are configured; the API cannot determine whether every sensitive field is covered, so coverage must be confirmed against the data classification inventory.`,
       evidence,
     };
   });
@@ -2559,6 +2574,7 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     title: "ServiceNow operations governance",
     summary: {
       encryption_contexts: data.encryptionContexts.rows.length,
+      crypto_modules: data.cryptoModules.rows.length,
       encrypted_fields: data.encryptedFields.rows.length,
       audit_rows_last_7_days: data.recentAuditCount.count ?? null,
       update_sets_in_progress: data.updateSetsInProgress.rows.length,
@@ -2599,7 +2615,8 @@ const ACCESS_SURFACES: Array<{ name: string; table: string }> = [
   { name: "update_xml", table: "sys_update_xml" },
   { name: "user_sessions", table: "sys_user_session" },
   { name: "dictionary", table: "sys_dictionary" },
-  { name: "encryption_contexts", table: "sys_encryption_context" },
+  { name: "encryption_contexts", table: LEGACY_ENCRYPTION_CONTEXT_TABLE },
+  { name: "crypto_modules", table: CRYPTO_MODULE_TABLE },
   { name: "business_rules", table: "sys_script" },
   { name: "ip_access_rules", table: IP_ACCESS_TABLE },
   { name: "email_accounts", table: "sys_email_account" },
@@ -2914,6 +2931,7 @@ export async function exportServicenowAuditBundle(
     ["core_data/sys_security_acl_count.json", accessControlData.aclTotal],
     ["core_data/sys_public.json", accessControlData.publicPages],
     ["core_data/sys_encryption_context.json", operationsData.encryptionContexts],
+    ["core_data/sys_kmf_crypto_module.json", operationsData.cryptoModules],
     ["core_data/sys_dictionary_encrypted.json", operationsData.encryptedFields],
     ["core_data/sys_dictionary_audit.json", operationsData.auditDictionary],
     ["core_data/sys_audit_count.json", operationsData.recentAuditCount],
