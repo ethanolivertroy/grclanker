@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import * as v from "valibot";
 import { init, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
 import { start } from "@flue/runtime/node";
@@ -62,6 +63,13 @@ const { Grclanker, prepareGrclankerAgent } = await import("../dist/flue/agent.js
 const AGENT_IDENTITY_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$/;
 const DOMAIN_TOOL_COUNT = 107;
 
+/** The validating schema type at the end of a coercing pipe (`pipe(unknown, transform, strict)`). */
+function validatingType(schema) {
+  if (!Array.isArray(schema.pipe)) return schema.type;
+  const inner = schema.pipe.filter((item) => item.kind === "schema").at(-1);
+  return inner === schema ? schema.type : validatingType(inner);
+}
+
 function createRecordingHooks() {
   const calls = { models: [], tools: [], skills: [], subagents: [], sandboxes: [] };
   const hooks = {
@@ -105,19 +113,19 @@ function fakeRunContext(data, extra = {}) {
 }
 
 /**
- * Resolve the pi-ai copy `@flue/runtime` itself imports (nested or hoisted),
- * mirroring Node's own module walk, so the faux provider shares Flue's registry.
+ * Import a file from a package as `@flue/runtime` itself resolves it (nested
+ * or hoisted), mirroring Node's module walk, so test doubles share Flue's
+ * registries and the gate probes use Flue's own Pi copy.
  */
-async function importFluePiAi() {
+async function importFromFlueDependency(relativePath) {
   const flueDist = dirname(fileURLToPath(import.meta.resolve("@flue/runtime")));
-  const candidates = [
-    resolve(flueDist, "../node_modules/@earendil-works/pi-ai/dist/index.js"),
-    resolve(flueDist, "../../../@earendil-works/pi-ai/dist/index.js"),
-  ];
+  const candidates = [resolve(flueDist, "../node_modules", relativePath), resolve(flueDist, "../../..", relativePath)];
   const found = candidates.find((candidate) => existsSync(candidate));
-  assert.ok(found, "pi-ai used by @flue/runtime should be resolvable");
+  assert.ok(found, `${relativePath} used by @flue/runtime should be resolvable`);
   return import(pathToFileURL(found).href);
 }
+
+const importFluePiAi = () => importFromFlueDependency("@earendil-works/pi-ai/dist/index.js");
 
 test("schema conversion mirrors TypeBox tool parameters in Valibot", () => {
   const parameters = Type.Object({
@@ -140,9 +148,17 @@ test("schema conversion mirrors TypeBox tool parameters in Valibot", () => {
 
   assert.equal(v.safeParse(schema, {}).success, false, "required keys stay required");
   assert.equal(v.safeParse(schema, { query: "x", limit: 0 }).success, false, "minimum is enforced");
-  assert.equal(v.safeParse(schema, { query: "x", count: 1.5 }).success, false, "integer is enforced");
+  assert.equal(v.safeParse(schema, { query: "x", count: "x" }).success, false, "non-numeric integers are rejected");
   assert.equal(v.safeParse(schema, { query: "x", mode: "nope" }).success, false, "literal unions become picklists");
-  assert.equal(v.safeParse(schema, { query: "x", size: true }).success, false, "mixed unions stay unions");
+  assert.equal(v.safeParse(schema, { query: "x", refresh: "yes" }).success, false, "non-boolean strings are rejected");
+
+  // TypeBox `Value.Convert` coercions Pi applies before checking.
+  const coerced = v.safeParse(schema, { query: 4282, limit: "5", count: 1.5, ids: "CVE-2024-1", refresh: "true", size: true });
+  assert.ok(coerced.success);
+  assert.deepEqual(coerced.output, { query: "4282", limit: 5, count: 1, ids: ["CVE-2024-1"], refresh: true, size: "true" });
+  assert.deepEqual(v.safeParse(schema, { query: "x", size: 3 }).output.size, 3, "a value matching a later union member is kept as is");
+  assert.deepEqual(v.safeParse(schema, { query: "x", size: "3" }).output.size, "3", "a value matching the first union member is kept as is");
+  assert.deepEqual(v.safeParse(schema, { query: "x", count: "0x10" }).output.count, 16, "integer strings parse like TypeBox's radix-less parseInt");
 
   const defaults = v.safeParse(schema, { query: "x" });
   assert.ok(defaults.success);
@@ -170,18 +186,272 @@ test("schema conversion handles strict objects, enums, nullables, and unknown co
   assert.equal(v.safeParse(rest, { any: "no" }).success, false);
 
   const picklist = jsonSchemaToValibot({ type: "string", enum: ["json", "yaml"] });
-  assert.equal(picklist.type, "picklist");
+  assert.equal(validatingType(picklist), "picklist");
+  assert.equal(v.safeParse(picklist, "yaml").output, "yaml");
+  assert.equal(v.safeParse(picklist, "xml").success, false);
 
   const nullable = jsonSchemaToValibot({ type: ["string", "null"] });
+  assert.equal(validatingType(nullable), "union");
   assert.equal(v.safeParse(nullable, null).success, true);
   assert.equal(v.safeParse(nullable, "x").success, true);
-  assert.equal(v.safeParse(nullable, 1).success, false);
+  assert.equal(v.safeParse(nullable, 1).output, "1", "TypeBox converts a number to string for a string member");
+  assert.equal(v.safeParse(nullable, {}).success, false);
 
   assert.equal(jsonSchemaToValibot(undefined).type, "unknown");
   assert.equal(jsonSchemaToValibot({ type: "mystery" }).type, "unknown");
-  assert.equal(jsonSchemaToValibot({ const: "fixed" }).type, "literal");
+  assert.equal(validatingType(jsonSchemaToValibot({ const: "fixed" })), "literal");
+  assert.equal(v.safeParse(jsonSchemaToValibot({ const: 7 }), "7").output, 7, "literal targets coerce like TypeBox");
 
   assert.throws(() => jsonSchemaToToolInput(Type.String(), "bad"), /must be a JSON Schema object/);
+});
+
+test("tool input schemas run prepareArguments before validation and still render the declared schema", () => {
+  const { tool } = createFakePiTool();
+  const withShim = jsonSchemaToToolInput(tool.parameters, tool.name, tool.prepareArguments);
+  const withoutShim = jsonSchemaToToolInput(tool.parameters, tool.name);
+
+  assert.equal(withShim.type, "loose_object", "the pipe keeps Flue's top-level object type");
+  assert.ok(isToolInputObjectSchema(withShim));
+
+  const aliased = v.safeParse(withShim, { cve: "CVE-2024-3400", limit: "5" });
+  assert.ok(aliased.success);
+  assert.deepEqual(aliased.output, { query: "CVE-2024-3400", limit: 5 }, "the shim's own return value is what gets validated");
+  assert.equal(v.safeParse(withoutShim, { cve: "CVE-2024-3400" }).success, false, "without the shim the alias is not enough");
+
+  const failing = v.safeParse(withShim, { query: 5, limit: "abc" });
+  assert.equal(failing.success, false);
+  assert.deepEqual(
+    failing.issues.map((issue) => issue.path?.map((segment) => segment.key).join(".")),
+    ["limit"],
+    "issues point at the offending field after normalization",
+  );
+
+  const throwing = jsonSchemaToToolInput(tool.parameters, tool.name, () => {
+    throw new Error("shim exploded");
+  });
+  const thrown = v.safeParse(throwing, { query: "x" });
+  assert.equal(thrown.success, false);
+  assert.match(thrown.issues[0].message, /kevs_probe could not normalize its arguments: shim exploded/);
+});
+
+/** Pi's tool loop: `prepareArguments` (a throw becomes an error result), then TypeBox `Value.Convert` and `Value.Check`. */
+function piVerdict(tool, raw) {
+  let prepared;
+  try {
+    prepared = tool.prepareArguments ? tool.prepareArguments(structuredClone(raw)) : raw;
+  } catch {
+    return { ok: false, threw: true };
+  }
+  const args = structuredClone(prepared);
+  Value.Convert(tool.parameters, args);
+  if (Value.Check(tool.parameters, args)) return { ok: true, args: JSON.parse(JSON.stringify(args)) };
+  const errors = [...Value.Errors(tool.parameters, args)];
+  return { ok: false, undefinedKeyOnly: errors.length > 0 && errors.every((error) => error.value === undefined) };
+}
+
+// Flue mounts custom tools as Pi `AgentTool`s, so its Pi loop validates the raw
+// call against the rendered JSON Schema (its own JSON-schema coercion rules, no
+// prepareArguments) before Flue's Valibot parse runs. Reproduce that stack with
+// Flue's own Pi copy and its JSON Schema renderer.
+const { validateToolArguments: flueGateValidate } = await importFromFlueDependency(
+  "@earendil-works/pi-ai/dist/utils/validation.js",
+);
+const { toJsonSchema } = await importFromFlueDependency("@valibot/to-json-schema/dist/index.mjs");
+
+function renderedToolSchema(tool) {
+  const { $schema, ...rendered } = toJsonSchema(tool.input, { errorMode: "ignore" });
+  return rendered;
+}
+
+const GATE_REASONS = [
+  ["required", /must have required properties/],
+  ["enum", /must be equal to one of the allowed values/],
+  ["array", /must be array/],
+  ["integer", /must be integer/],
+  ["object", /must be object/],
+  ["type", /must be (string|number|boolean)/],
+  ["range", /must be (>=|<=)/],
+];
+
+/** Flue's gate: Pi 0.83 `validateToolArguments` against the rendered schema; returns coerced args or a reason. */
+function flueGate(tool, raw) {
+  try {
+    const args = flueGateValidate(
+      { name: tool.name, parameters: renderedToolSchema(tool) },
+      { id: "probe", name: tool.name, arguments: structuredClone(raw) },
+    );
+    return { ok: true, args };
+  } catch (error) {
+    const reason = GATE_REASONS.find(([, pattern]) => pattern.test(error.message))?.[0] ?? "other";
+    return { ok: false, reason, message: error.message };
+  }
+}
+
+/** The adapter's own stage: Flue's Valibot parse of whatever the gate handed over. */
+function adapterVerdict(tool, gatedArgs) {
+  const result = v.safeParse(tool.input, structuredClone(gatedArgs));
+  return result.success ? { ok: true, args: JSON.parse(JSON.stringify(result.output)) } : { ok: false };
+}
+
+/** The full Flue runtime path for one raw model payload. */
+function flueVerdict(tool, raw) {
+  const gate = flueGate(tool, raw);
+  if (!gate.ok) return { ok: false, stage: "gate", reason: gate.reason };
+  const adapter = adapterVerdict(tool, gate.args);
+  return adapter.ok ? { ok: true, args: adapter.args } : { ok: false, stage: "adapter" };
+}
+
+function canonical(value) {
+  return JSON.stringify(value, (_key, entry) =>
+    entry && typeof entry === "object" && !Array.isArray(entry)
+      ? Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]))
+      : entry,
+  );
+}
+
+function sampleValue(property) {
+  if (Array.isArray(property.anyOf)) {
+    const literal = property.anyOf.find((variant) => variant.const !== undefined);
+    return literal ? literal.const : "sample";
+  }
+  switch (property.type) {
+    case "number":
+      return property.minimum ?? 5;
+    case "integer":
+      return property.minimum ?? 3;
+    case "boolean":
+      return true;
+    case "array":
+      return ["a", "b"];
+    default:
+      return "sample";
+  }
+}
+
+const PROBE_VALUES = ["true", "false", "1", "0", 1, 0, null, true, {}, [], "bogus", 5, 1.5, "1e3", " 7 ", "", "null", -1, "0x10", "yes"];
+
+// These two normalizers emit `component_definitions: undefined`, which TypeBox
+// `Value.Convert` turns into `[undefined]`, so Pi rejects the call whenever the
+// optional field is omitted. Flue's `optional()` skips undefined instead.
+const PI_UNDEFINED_KEY_BUG_TOOLS = new Set(["oscal_generate_ssp_markdown", "oscal_assemble_ssp"]);
+
+test("the adapter stage normalizes exactly like Pi's prepareArguments plus TypeBox for every domain tool", () => {
+  const piTools = collectGrclankerDomainTools();
+  const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
+  const mismatches = [];
+  const gateReasons = new Map();
+  const piBugCases = new Set();
+  let compared = 0;
+  let gated = 0;
+
+  for (const piTool of piTools) {
+    const flueTool = flueTools.get(piTool.name);
+    const properties = piTool.parameters.properties ?? {};
+    const required = piTool.parameters.required ?? [];
+    const base = Object.fromEntries(required.map((key) => [key, sampleValue(properties[key])]));
+    const inputs = [{}, base, { ...base, extra_key: "x" }];
+    for (const [key, property] of Object.entries(properties)) {
+      const sample = sampleValue(property);
+      for (const value of [sample, String(sample), ...PROBE_VALUES]) inputs.push({ ...base, [key]: value });
+      if (property.type === "array") inputs.push({ ...base, [key]: "a" }, { ...base, [key]: 1 }, { ...base, [key]: [null] });
+    }
+    for (const key of required) {
+      const missing = { ...base };
+      delete missing[key];
+      inputs.push(missing);
+    }
+
+    for (const input of inputs) {
+      compared += 1;
+      // Without the gate, the adapter stage must equal Pi's own loop on the same payload.
+      const direct = adapterVerdict(flueTool, input);
+      const pi = piVerdict(piTool, input);
+      const piBug = !pi.ok && pi.undefinedKeyOnly && direct.ok && PI_UNDEFINED_KEY_BUG_TOOLS.has(piTool.name);
+      if (piBug) piBugCases.add(piTool.name);
+      else if (!(pi.ok === direct.ok && (!pi.ok || canonical(pi.args) === canonical(direct.args)))) {
+        mismatches.push({ stage: "adapter", tool: piTool.name, input, pi, flue: direct });
+      }
+
+      // Through the real stack, whatever Flue's gate hands over must be normalized like Pi would normalize it.
+      const gate = flueGate(flueTool, input);
+      if (!gate.ok) {
+        gated += 1;
+        if (pi.ok) gateReasons.set(gate.reason, (gateReasons.get(gate.reason) ?? 0) + 1);
+        continue;
+      }
+      const runtime = adapterVerdict(flueTool, gate.args);
+      const piOnGated = piVerdict(piTool, gate.args);
+      const gatedBug = !piOnGated.ok && piOnGated.undefinedKeyOnly && runtime.ok && PI_UNDEFINED_KEY_BUG_TOOLS.has(piTool.name);
+      if (!gatedBug && !(piOnGated.ok === runtime.ok && (!piOnGated.ok || canonical(piOnGated.args) === canonical(runtime.args)))) {
+        mismatches.push({ stage: "runtime", tool: piTool.name, input, gated: gate.args, pi: piOnGated, flue: runtime });
+      }
+    }
+  }
+
+  assert.ok(compared > 10000, `expected a broad probe matrix, compared ${compared}`);
+  assert.ok(gated > 0 && gated < compared / 2, `the gate should reject a minority of probes (rejected ${gated} of ${compared})`);
+  assert.deepEqual(mismatches.slice(0, 10), [], `${mismatches.length} verdicts differ between Pi and Flue`);
+  assert.deepEqual([...piBugCases].sort(), [...PI_UNDEFINED_KEY_BUG_TOOLS].sort());
+  assert.deepEqual(
+    [...gateReasons.keys()].sort(),
+    ["array", "enum", "integer", "range", "required", "type"],
+    "payloads Pi accepts are turned away by the gate only for the documented reasons",
+  );
+});
+
+test("reviewer probe cases: Flue's gate is the only place Pi-accepted payloads are turned away", () => {
+  const piTools = collectGrclankerDomainTools();
+  const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
+  // `pass` means accepted with Pi's exact arguments; `coerced` means accepted after the
+  // gate's own coercion changed a value before the normalizer saw it; the rest name the
+  // gate rejection reason (see the Flue runtime docs page, Limitations).
+  const cases = [
+    ["kevs_search", { query: "CVE-2024-3400", limit: "5" }, "pass"],
+    ["kevs_search", { cve: "CVE-2024-3400" }, "required"],
+    ["kevs_search", {}, "required"],
+    ["kevs_recent", { days: "7" }, "pass"],
+    ["kevs_recent", { days: null }, "coerced"],
+    ["kevs_get_epss", { cve_ids: "CVE-2024-3400" }, "array"],
+    ["kevs_get_epss", { cve_ids: [1] }, "coerced"],
+    ["kevs_get_epss", {}, "required"],
+    ["cmvp_get_module", { cert_number: 4282 }, "pass"],
+    ["cmvp_get_module", { certificate: "4282" }, "required"],
+    ["cmvp_get_module", {}, "required"],
+    ["fedramp_search_frmr", { query: "CDS", section: "bogus" }, "enum"],
+    ["fedramp_search_frmr", { query: "CDS", limit: "5" }, "pass"],
+    ["fedramp_search_frmr", { section: "any" }, "required"],
+    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp", name: "n", format: "xml" }, "enum"],
+    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp" }, "required"],
+    ["oscal_create_model", { workspace_dir: "w", model_type: "ssp", name: "n", include_optional_fields: "true" }, "pass"],
+    ["github_check_access", { installation_id: true }, "coerced"],
+    ["github_check_access", { lookback_days: "1" }, "pass"],
+    ["okta_check_access", { scopes: "okta.users.read" }, "array"],
+    ["okta_check_access", { scopes: [1] }, "coerced"],
+    ["gws_export_audit_bundle", { lookback_days: "1" }, "pass"],
+    ["gws_export_audit_bundle", { lookback_days: 1.5 }, "integer"],
+    ["aws_export_audit_bundle", { user_limit: "10" }, "pass"],
+  ];
+
+  for (const [name, input, expected] of cases) {
+    const label = `${name} ${JSON.stringify(input)}`;
+    const pi = piVerdict(piTools.find((tool) => tool.name === name), input);
+    const flue = flueVerdict(flueTools.get(name), input);
+    assert.ok(pi.ok, `${label} passes Pi's own loop`);
+    if (expected === "pass") {
+      assert.ok(flue.ok, `${label} should pass Flue`);
+      assert.equal(canonical(flue.args), canonical(pi.args), `${label} normalizes identically`);
+    } else if (expected === "coerced") {
+      assert.ok(flue.ok, `${label} should pass Flue after gate coercion`);
+    } else {
+      assert.deepEqual({ ok: flue.ok, stage: flue.stage, reason: flue.reason }, { ok: false, stage: "gate", reason: expected }, label);
+    }
+  }
+
+  const kevsSearch = flueTools.get("kevs_search");
+  assert.deepEqual(v.safeParse(kevsSearch.input, { cve: "CVE-2024-3400" }).output, { query: "CVE-2024-3400" }, "the adapter itself honors the alias");
+  const bare = flueGate(kevsSearch, "CVE-2024-3400");
+  assert.equal(bare.ok, false);
+  assert.equal(bare.reason, "object", "a bare non-object payload never reaches tool code under Flue");
 });
 
 test("every grclanker domain tool bridges into a Flue tool definition", () => {
@@ -215,17 +485,21 @@ test("every grclanker domain tool bridges into a Flue tool definition", () => {
   assert.deepEqual(parsed.output, { days: 7 });
 });
 
-test("bridged tools run prepareArguments then execute and return Flue envelopes", async () => {
+test("bridged tools validate through the shim, execute once, and return Flue envelopes", async () => {
   const { tool, executions } = createFakePiTool();
   const flueTool = toFlueTool(tool);
   const signal = new AbortController().signal;
 
-  const result = await flueTool.run(fakeRunContext({ cve: "CVE-2024-3400" }, { toolCallId: "call-42", signal }));
+  // Flue parses `input` (which runs prepareArguments and coercion) before calling `run`.
+  const data = v.parse(flueTool.input, { cve: "CVE-2024-3400", limit: "5" });
+  assert.deepEqual(data, { query: "CVE-2024-3400", limit: 5 });
+
+  const result = await flueTool.run(fakeRunContext(data, { toolCallId: "call-42", signal }));
   assert.deepEqual(result, { output: "probe saw CVE-2024-3400" });
   assert.equal(executions.length, 1);
   assert.equal(executions[0].toolCallId, "call-42");
   assert.equal(executions[0].signal, signal);
-  assert.deepEqual(executions[0].params, { query: "CVE-2024-3400", limit: undefined });
+  assert.equal(executions[0].params, data, "run hands the validated arguments to execute without re-normalizing");
 
   const terminating = toFlueTool(
     createFakePiTool({
@@ -668,9 +942,9 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
   faux.setResponses([
     (context) => {
       recordContext(context);
-      // Flue validates against the converted schema before `run`, so `query` is required;
-      // the extra alias key shows unknown keys still reach the Pi `prepareArguments` shim.
-      return fauxAssistantMessage([fauxToolCall("kevs_probe", { query: "CVE-2024-3400", cve: "alias" })], {
+      // The extra alias key and the numeric string prove the Pi `prepareArguments` shim
+      // (which rebuilds the object) and coercion run inside Flue's validation.
+      return fauxAssistantMessage([fauxToolCall("kevs_probe", { query: "CVE-2024-3400", cve: "alias", limit: "5" })], {
         stopReason: "toolUse",
       });
     },
@@ -698,7 +972,7 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
 
   assert.equal(faux.state.callCount, 3);
   assert.equal(probe.executions.length, 1);
-  assert.deepEqual(probe.executions[0].params, { query: "CVE-2024-3400", limit: undefined });
+  assert.deepEqual(probe.executions[0].params, { query: "CVE-2024-3400", limit: 5 });
   assert.equal(typeof probe.executions[0].toolCallId, "string");
 
   const first = modelContexts[0];

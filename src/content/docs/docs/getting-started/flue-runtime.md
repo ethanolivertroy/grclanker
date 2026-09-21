@@ -18,7 +18,7 @@ The adapter lives in `cli/flue/` and is additive. Nothing in the Pi CLI path cha
 | `.grclanker/agents/auditor.md` and `verifier.md` | Subagents reachable through Flue's `task` tool, each mounting only the tools its persona allows |
 | Pi compute backends (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) | Not mapped. Flue's own `local()` sandbox provides file and shell tools instead |
 
-Tool parameters are declared with TypeBox JSON Schema in the Pi extension. Flue requires Valibot object schemas, so the adapter converts each schema at the boundary and Flue renders the model-facing JSON Schema from the Valibot version. Property names, required lists, types, descriptions, defaults, and literal unions round-trip; unknown keys are kept so the tools' argument normalizers behave as they do under Pi.
+Tool parameters are declared with TypeBox JSON Schema in the Pi extension. Flue requires Valibot object schemas, so the adapter converts each schema at the boundary and Flue renders the model-facing JSON Schema from the Valibot version. Property names, required lists, types, descriptions, defaults, and literal unions round-trip. Inside the adapter, each tool's `prepareArguments` normalizer runs before validation and values are coerced with the same rules as TypeBox `Value.Convert`, so arguments reach a tool exactly as Pi's loop would hand them over (verified against every domain tool in `cli/tests/flue.test.mjs`).
 
 Pi tool results map onto Flue's result envelope: text content becomes the tool output, `terminate` is forwarded, and a Pi `errorResult()` becomes a Flue tool error the model can react to.
 
@@ -67,7 +67,8 @@ The CLI has to be installed next to the runtime it drives. `@flue/runtime` publi
 
 - Local-first models configured through `grclanker setup` (the Ollama path) are not available under Flue. The Flue runtime registers Pi's built-in providers only, and grclanker refuses to switch providers silently. Set `GRCLANKER_FLUE_MODEL` to a supported `provider/model` instead.
 - The Pi compute backends (`host`, `sandbox-runtime`, Docker, Parallels) do not apply. Use `GRCLANKER_FLUE_SANDBOX` to attach or skip Flue's local sandbox, or swap in another Flue sandbox adapter in your own agent module.
-- Flue validates tool arguments against the converted schema before a tool runs, so a call missing a required argument returns a validation error to the model rather than reaching the tool's normalizer.
+- Flue's runtime validates the raw model arguments against the rendered JSON Schema before the adapter (and therefore any normalizer) sees them. Payloads that a Pi normalizer would have repaired instead return a validation error naming the field, and the model retries: alias keys standing in for a missing required argument, invalid enum values, wrong-typed or out-of-range values a normalizer would drop or clamp, scalars sent for array fields, non-integer numbers for integer fields, and bare non-object payloads. Numeric strings, `"true"` and `"false"`, and numbers for string fields pass that check. One coercion differs in effect: `null` for an optional scalar becomes `0`, `false`, or an empty string at that check instead of being dropped.
+- Tool output reaches the model as a JSON string, because Flue JSON-serializes every tool `output`. Multi-line tables therefore arrive with escaped newlines and quotes rather than as raw text as under Pi.
 - Node.js 22.19 or newer is required by `@flue/runtime` and `@flue/cli`. On Node 22, Flue's SQLite persistence prints an experimental-feature warning from Node itself.
 
 ## Validate the adapter
