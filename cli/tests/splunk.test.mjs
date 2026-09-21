@@ -279,6 +279,34 @@ test("SplunkApiClient calls ACS with the ACS bearer token and retries 429 respon
 
   const denied = new SplunkApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ messages: [{ text: "call not properly authenticated" }] }, 401), retryDelayMs: 0 });
   await assert.rejects(denied.listUsers(), (error) => error.status === 401 && /401/.test(error.message));
+
+  let restAttempts = 0;
+  const flaky = new SplunkApiClient(sampleConfig(), {
+    retryDelayMs: 0,
+    fetchImpl: async () => {
+      restAttempts += 1;
+      if (restAttempts < 3) return jsonResponse({ messages: [{ text: "temporarily unavailable" }] }, 503);
+      return jsonResponse(entryList([entry("admin", { roles: ["admin"] })]));
+    },
+  });
+  const users = await flaky.listUsers();
+  assert.equal(users.entries.length, 1);
+  assert.equal(restAttempts, 3);
+});
+
+test("tokens without iat or exp claims are bucketed separately and cap the verdict at warn", async () => {
+  const fixture = {
+    ...HARDENED,
+    "/services/authorization/tokens": [
+      ...HARDENED["/services/authorization/tokens"],
+      entry("tok-undated", { claims: { sub: "admin" }, status: "enabled" }),
+    ],
+  };
+  const auth = await assessSplunkAuthentication(client(fixture).client);
+  const tokens = byId(auth, "SPLUNK-AUTH-06");
+  assert.equal(tokens.status, "warn");
+  assert.equal(tokens.evidence.missing_dates.length, 1);
+  assert.match(tokens.summary, /1 lack issue or expiry claims/);
 });
 
 test("TLS verification opt-out is scoped to the client and never sets NODE_TLS_REJECT_UNAUTHORIZED", () => {
