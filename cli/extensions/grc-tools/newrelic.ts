@@ -2433,13 +2433,14 @@ export function assessNewrelicAccessControlData(
   const control6 = (): Verdict => {
     if (!keysReadable) return unreadableVerdict("API keys (apiAccess.keySearch)", data.apiKeys, "key usage evidence from the API keys UI and NrAuditEvent queries for every key.");
     if (keys.length === 0) {
-      if (!accountsReadable || data.accountIds.length === 0 || unseenScopeAccounts.length > 0) {
-        return manualVerdict(`${zeroKeysNote}, but keySearch coverage of every account in scope cannot be confirmed (${!accountsReadable ? causeOf(data.accounts) : unseenScopeAccounts.length > 0 ? `accounts ${unseenScopeAccounts.join(", ")} are not visible to this key` : "no accounts are in scope"}), so the empty inventory is unknown rather than compliant. Collect ${keyEvidence}`);
-      }
-      if (!isComplete(data.apiKeys)) {
-        return verdict("warn", `${zeroKeysNote}, but the listing was incomplete (${keyCoverage.join("; ")}), so no key can be confirmed as absent. Collect ${keyEvidence}`);
-      }
-      return verdict("pass", `${zeroKeysNote}. Both conditions for accepting an empty inventory hold: keySearch was readable and complete for every account in scope, and every in-scope account (${data.accountIds.join(", ")}) is visible to this key in actor.accounts.`);
+      const coverageReason = !accountsReadable
+        ? ` Coverage of every account in scope also cannot be confirmed (${causeOf(data.accounts)}).`
+        : unseenScopeAccounts.length > 0
+          ? ` Accounts ${unseenScopeAccounts.join(", ")} are also not visible to this key.`
+          : !isComplete(data.apiKeys)
+            ? ` The listing was also incomplete (${keyCoverage.join("; ")}).`
+            : "";
+      return manualVerdict(`${zeroKeysNote}. The query includes INGEST keys and every account has at least its original license key, so a complete listing cannot be empty: the empty result means the key cannot see the keys and is unknown rather than compliant.${coverageReason} Collect ${keyEvidence}`);
     }
     const auditSummary = `${distinctActorKeys.size} distinct API keys performed configuration changes in the last ${data.auditWindowDays} days${auditReadable ? "" : ` (audit events unreadable: ${causeOf(data.apiKeyAuditEvents)})`}`;
     if (ownerIdsUnavailable) {

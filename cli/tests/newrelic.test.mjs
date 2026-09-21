@@ -1575,14 +1575,16 @@ test("verdict safety rule 2 and self-check (b): empty inventories never pass and
   assert.match(findings.find((item) => item.control === 8).summary, /zero accounts/);
 });
 
-test("verdict safety rule 2: control 6 passes on zero keys only when keySearch was complete and every in-scope account is visible", async () => {
+test("verdict safety rule 2: control 6 never passes on zero keys because a complete key listing cannot be empty", async () => {
   const clean = await assessNewrelicAccessControl(accessControlClient({ async listApiKeys() { return []; } }), { now: NOW });
   const unused = findingById(clean, "NR-06-UNUSED-API-KEYS");
-  assert.equal(unused.status, "pass");
-  assert.match(unused.summary, /Both conditions for accepting an empty inventory hold/);
-  assert.match(unused.summary, /keySearch was readable and complete for every account in scope/);
-  assert.match(unused.summary, /every in-scope account \(111, 222\) is visible to this key/);
+  assert.equal(unused.status, "manual");
+  assert.match(unused.summary, /returned zero keys for 2 accounts in scope \(111, 222\)/);
+  assert.match(unused.summary, /query includes INGEST keys and every account has at least its original license key, so a complete listing cannot be empty/);
+  assert.match(unused.summary, /the key cannot see the keys and is unknown rather than compliant/);
+  assert.doesNotMatch(unused.summary, /Both conditions/);
   assert.equal(findingStatus(clean, "NR-04-API-KEY-INVENTORY"), "manual");
+  assert.match(findingById(clean, "NR-04-API-KEY-INVENTORY").summary, /empty inventory means the key cannot see them/);
   assert.equal(findingStatus(clean, "NR-05-API-KEY-AGE"), "manual");
 
   const hiddenAccount = await assessNewrelicAccessControl(accessControlClient({
@@ -1590,7 +1592,7 @@ test("verdict safety rule 2: control 6 passes on zero keys only when keySearch w
     async listAccounts() { return [{ id: 111, name: "Payments Production" }]; },
   }), { now: NOW });
   assert.equal(findingStatus(hiddenAccount, "NR-06-UNUSED-API-KEYS"), "manual");
-  assert.match(findingById(hiddenAccount, "NR-06-UNUSED-API-KEYS").summary, /accounts 222 are not visible to this key/);
+  assert.match(findingById(hiddenAccount, "NR-06-UNUSED-API-KEYS").summary, /Accounts 222 are also not visible to this key/);
   assert.deepEqual(findingById(hiddenAccount, "NR-06-UNUSED-API-KEYS").evidence.accounts_in_scope_not_visible, [222]);
 
   const fallback = await assessNewrelicAccessControl(accessControlClient({
@@ -1598,8 +1600,8 @@ test("verdict safety rule 2: control 6 passes on zero keys only when keySearch w
       return { items: [], complete: false, totalCount: undefined, note: "keySearch rejected the cursor argument, so only the first page was read (0 keys)" };
     },
   }), { now: NOW });
-  assert.equal(findingStatus(fallback, "NR-06-UNUSED-API-KEYS"), "warn");
-  assert.match(findingById(fallback, "NR-06-UNUSED-API-KEYS").summary, /listing was incomplete/);
+  assert.equal(findingStatus(fallback, "NR-06-UNUSED-API-KEYS"), "manual");
+  assert.match(findingById(fallback, "NR-06-UNUSED-API-KEYS").summary, /listing was also incomplete/);
 
   const accountsUnreadable = await assessNewrelicAccessControl(accessControlClient({
     async listApiKeys() { return []; },
