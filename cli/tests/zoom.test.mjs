@@ -111,7 +111,6 @@ function compliantSettings(option) {
       return {
         schedule_meeting: {
           require_password_for_scheduling_new_meetings: true,
-          embed_password_in_join_link: false,
           use_pmi_for_scheduled_meetings: false,
           use_pmi_for_instant_meetings: false,
           personal_meeting: true,
@@ -600,7 +599,7 @@ test("schema fidelity: every verdict reads the exact documented key path", async
     "recording.local_recording": ["ZOOM-MTG-04", false],
     "meeting_security.end_to_end_encrypted_meetings": ["ZOOM-MTG-05", true],
     "meeting_security.encryption_type": ["ZOOM-MTG-05", "e2ee"],
-    "schedule_meeting.embed_password_in_join_link": ["ZOOM-MTG-06", false],
+    "meeting_security.embed_password_in_join_link": ["ZOOM-MTG-06", false],
     "schedule_meeting.use_pmi_for_scheduled_meetings": ["ZOOM-MTG-07", false],
     "schedule_meeting.use_pmi_for_instant_meetings": ["ZOOM-MTG-07", false],
     "meeting_authentication": ["ZOOM-MTG-08", true],
@@ -738,13 +737,13 @@ test("verdict safety: non-compliant documented values fail with the documented f
         return { security: { sign_in_with_two_factor_auth: "none", sign_again_period_for_inactivity_on_client: 0, sign_again_period_for_inactivity_on_web: 480 } };
       }
       if (option === "meeting_security") {
-        return { meeting_security: { waiting_room: false, end_to_end_encrypted_meetings: false, encryption_type: "enhanced_encryption" } };
+        return { meeting_security: { waiting_room: false, end_to_end_encrypted_meetings: false, encryption_type: "enhanced_encryption", embed_password_in_join_link: true } };
       }
       if (option === "meeting_authentication") {
         return { meeting_authentication: false };
       }
       return {
-        schedule_meeting: { require_password_for_scheduling_new_meetings: false, embed_password_in_join_link: true, use_pmi_for_scheduled_meetings: true, use_pmi_for_instant_meetings: false, personal_meeting: true },
+        schedule_meeting: { require_password_for_scheduling_new_meetings: false, use_pmi_for_scheduled_meetings: true, use_pmi_for_instant_meetings: false, personal_meeting: true },
         in_meeting: { screen_sharing: true, who_can_share_screen: "all", file_transfer: true, custom_data_center_regions: false },
         recording: { cloud_recording: true, local_recording: true, auto_delete_cmr: false, recording_disclaimer: false },
         chat: { allow_users_to_add_contacts: { enable: true, selected_option: 1 }, allow_users_to_chat_with_others: { enable: true, selected_option: 2 } },
@@ -1214,4 +1213,80 @@ test("rule 9: the audit bundle and its zip never contain credential-bearing valu
   assert.doesNotMatch(logs, /operation_detail/);
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /trusted_domains: .*\[REDACTED\]/);
+});
+
+test("review fix 1: ZOOM-MTG-06 reads meeting_security.embed_password_in_join_link from the meeting_security view, never the undocumented schedule_meeting path", async () => {
+  const legacyPathOnly = compliantClient({
+    async getAccountSettings(option) {
+      const settings = compliantSettings(option);
+      if (option === "meeting_security") delete settings.meeting_security.embed_password_in_join_link;
+      if (option === undefined) settings.schedule_meeting.embed_password_in_join_link = false;
+      return settings;
+    },
+  });
+  const absent = findingById(await assessZoomMeetingSecurity(legacyPathOnly, { now: NOW }), "ZOOM-MTG-06");
+  assert.equal(absent.status, "manual", absent.summary);
+  assert.match(absent.summary, /meeting_security\.embed_password_in_join_link was not present/);
+
+  const viewDenied = compliantClient({
+    async getAccountSettings(option) {
+      if (option === "meeting_security") throw new ZoomApiError("Forbidden", 403, { code: 124 });
+      return compliantSettings(option);
+    },
+  });
+  const denied = findingById(await assessZoomMeetingSecurity(viewDenied, { now: NOW }), "ZOOM-MTG-06");
+  assert.equal(denied.status, "manual", denied.summary);
+  assert.match(denied.summary, /option=meeting_security/);
+
+  const unlocked = compliantClient({
+    async getAccountLockSettings(option) {
+      const locks = compliantLocks(option);
+      if (option === "meeting_security") locks.meeting_security.embed_password_in_join_link = false;
+      return locks;
+    },
+  });
+  const warn = findingById(await assessZoomMeetingSecurity(unlocked, { now: NOW }), "ZOOM-MTG-06");
+  assert.equal(warn.status, "warn", warn.summary);
+  assert.match(warn.summary, /meeting_security\.embed_password_in_join_link is enabled but not locked/);
+});
+
+test("review fix 3: every documented login_types code is classified and unclassified codes never pass ZOOM-ID-05", async () => {
+  const withLoginTypes = (codes) => compliantClient({
+    async listUsers() {
+      return list([{ id: "u1", email: "u1@example.com", status: "active", type: 2, login_types: codes }]);
+    },
+  });
+
+  const alipay = await assessZoomIdentity(withLoginTypes([23]), { now: NOW });
+  assert.equal(findingById(alipay, "ZOOM-ID-05").status, "fail", findingById(alipay, "ZOOM-ID-05").summary);
+  assert.match(findingById(alipay, "ZOOM-ID-05").summary, /third-party OAuth sign-in \(codes 0, 1, 21, 23, 24, 27, 98\)/);
+  assert.equal(findingById(alipay, "ZOOM-ID-01").status, "fail");
+
+  const ringCentral = await assessZoomIdentity(withLoginTypes([98]), { now: NOW });
+  assert.equal(findingById(ringCentral, "ZOOM-ID-05").status, "fail");
+  assert.match(findingById(ringCentral, "ZOOM-ID-05").evidence.login_type_codes[98], /RingCentral OAuth \(described on GET \/users\/\{userId\}\) \[social\]/);
+  assert.match(findingById(ringCentral, "ZOOM-ID-05").evidence.login_type_codes[99], /API user \(described on both pages, absent from the GET \/users enum\) \[other\]/);
+
+  const phone = await assessZoomIdentity(withLoginTypes([11]), { now: NOW });
+  assert.equal(findingById(phone, "ZOOM-ID-05").status, "fail");
+  assert.match(findingById(phone, "ZOOM-ID-05").summary, /Zoom-held passwords \(codes 11, 100\)/);
+
+  for (const code of [97, 99]) {
+    const other = findingById(await assessZoomIdentity(withLoginTypes([code]), { now: NOW }), "ZOOM-ID-05");
+    assert.equal(other.status, "warn", other.summary);
+    assert.match(other.summary, /documented but neither SSO nor a personal or social provider \(97 Mobile device, 99 API user/);
+    assert.match(other.summary, /cannot count as blocked/);
+  }
+
+  const undocumented = await assessZoomIdentity(withLoginTypes([42]), { now: NOW });
+  const item = findingById(undocumented, "ZOOM-ID-05");
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /not documented on GET \/users or GET \/users\/\{userId\} \[42\]/);
+  assert.deepEqual(item.evidence.undocumented_login_codes, [42]);
+  assert.equal(findingById(undocumented, "ZOOM-ID-01").status, "fail");
+
+  const sso = await assessZoomIdentity(withLoginTypes([101]), { now: NOW });
+  assert.equal(findingById(sso, "ZOOM-ID-05").status, "pass");
+  assert.match(findingById(sso, "ZOOM-ID-05").summary, /complete active-user inventory/);
+  assert.match(findingById(sso, "ZOOM-ID-01").summary, /complete active-user inventory/);
 });

@@ -72,20 +72,43 @@ const ACCOUNT_SETTINGS_OPTIONS = ["meeting_authentication", "security", "meeting
 const LOCK_SETTINGS_OPTIONS = ["meeting_security"] as const;
 /** Documented `setting_types` values read from GET /phone/account_settings. */
 const PHONE_SETTING_TYPES = "auto_call_recording,ad_hoc_call_recording";
-/** Documented `login_types` codes for GET /users. */
-const LOGIN_TYPE_LABELS: Record<number, string> = {
-  0: "Facebook OAuth",
-  1: "Google OAuth",
-  24: "Apple OAuth",
-  27: "Microsoft OAuth",
-  97: "Mobile device",
-  98: "RingCentral OAuth",
-  99: "API user",
-  100: "Zoom Work email",
-  101: "SSO",
+type LoginTypeCategory = "sso" | "social" | "password" | "other";
+
+/**
+ * `login_types` codes. GET /users (ZOOM_DOCS.users) documents the enum
+ * [0, 1, 23, 24, 27, 97, 98, 100, 101] and describes 0, 1, 24, 27, 97, 99,
+ * 100, and 101; GET /users/{userId} (ZOOM_DOCS.user) additionally describes
+ * 98 (RingCentral OAuth), 99 (API user), and the China-only codes 11, 21,
+ * and 23. Code 99 is described on both pages but absent from the GET /users
+ * enum. social: third-party OAuth providers; password: Zoom-held credentials;
+ * other: documented but neither SSO nor a personal provider, so never pass.
+ */
+const LOGIN_TYPE_CATALOG: Record<number, { label: string; category: LoginTypeCategory }> = {
+  0: { label: "Facebook OAuth", category: "social" },
+  1: { label: "Google OAuth", category: "social" },
+  11: { label: "Phone number (China only, GET /users/{userId})", category: "password" },
+  21: { label: "WeChat (China only, GET /users/{userId})", category: "social" },
+  23: { label: "Alipay (China only, described on GET /users/{userId})", category: "social" },
+  24: { label: "Apple OAuth", category: "social" },
+  27: { label: "Microsoft OAuth", category: "social" },
+  97: { label: "Mobile device", category: "other" },
+  98: { label: "RingCentral OAuth (described on GET /users/{userId})", category: "social" },
+  99: { label: "API user (described on both pages, absent from the GET /users enum)", category: "other" },
+  100: { label: "Zoom Work email", category: "password" },
+  101: { label: "Single Sign-On (SSO)", category: "sso" },
 };
 const SSO_LOGIN_TYPE = 101;
-const SOCIAL_LOGIN_TYPES = new Set([0, 1, 24, 27]);
+
+function loginTypeCategory(code: number): LoginTypeCategory | "undocumented" {
+  return LOGIN_TYPE_CATALOG[code]?.category ?? "undocumented";
+}
+
+function loginCodesByCategory(category: LoginTypeCategory): number[] {
+  return Object.entries(LOGIN_TYPE_CATALOG)
+    .filter(([, entry]) => entry.category === category)
+    .map(([code]) => Number(code))
+    .sort((a, b) => a - b);
+}
 
 export type ZoomFramework = "FedRAMP" | "CMMC" | "SOC 2" | "CIS" | "PCI-DSS" | "STIG" | "IRAP" | "ISMAP";
 
@@ -1384,8 +1407,13 @@ export function assessZoomIdentityFromSnapshot(
   const ssoUsers = userRecords.filter((user) => loginTypeCodes(user)?.every((code) => code === SSO_LOGIN_TYPE));
   const nonSsoUsers = userRecords.filter((user) => loginTypeCodes(user)?.some((code) => code !== SSO_LOGIN_TYPE));
   const unknownLoginUsers = userRecords.filter((user) => loginTypeCodes(user) === undefined);
-  const socialUsers = userRecords.filter((user) => loginTypeCodes(user)?.some((code) => SOCIAL_LOGIN_TYPES.has(code)));
-  const workEmailUsers = userRecords.filter((user) => loginTypeCodes(user)?.includes(100));
+  const usersWithCategory = (category: LoginTypeCategory | "undocumented") =>
+    userRecords.filter((user) => loginTypeCodes(user)?.some((code) => loginTypeCategory(code) === category));
+  const socialUsers = usersWithCategory("social");
+  const passwordUsers = usersWithCategory("password");
+  const otherDocumentedUsers = usersWithCategory("other");
+  const undocumentedUsers = usersWithCategory("undocumented");
+  const undocumentedCodes = [...new Set(userRecords.flatMap((user) => loginTypeCodes(user) ?? []).filter((code) => loginTypeCategory(code) === "undocumented"))].sort((a, b) => a - b);
   const usersPartial = users.truncated || (users.total !== undefined && users.total > userRecords.length);
   const userEvidence = {
     seen_users: userRecords.length,
@@ -1394,7 +1422,8 @@ export function assessZoomIdentityFromSnapshot(
     sso_users: ssoUsers.length,
     non_sso_users: nonSsoUsers.slice(0, 25).map(userLabel),
     unknown_login_users: unknownLoginUsers.length,
-    login_type_codes: LOGIN_TYPE_LABELS,
+    undocumented_login_codes: undocumentedCodes,
+    login_type_codes: Object.fromEntries(Object.entries(LOGIN_TYPE_CATALOG).map(([code, entry]) => [code, `${entry.label} [${entry.category}]`])),
   };
 
   if (snapshot.users.status !== "ok") {
@@ -1422,28 +1451,46 @@ export function assessZoomIdentityFromSnapshot(
           ? `${partialNote(userRecords.length, users.total, users.truncated)} All seen users are SSO-only, but the unseen users were not judged.`
           : unknownLoginUsers.length > 0
             ? `${unknownLoginUsers.length}/${userRecords.length} users did not expose login_types; they are reported separately and cannot count as SSO-only.`
-            : `All ${userRecords.length} active users (complete inventory) expose login_types [101] (SSO) only.`,
+            : `All ${userRecords.length} active users (complete active-user inventory) expose login_types [101] (SSO) only.`,
       userEvidence,
     ));
-    const signInStatus: ZoomFindingStatus = socialUsers.length > 0 || workEmailUsers.length > 0
+    const unjudgedSignIns = otherDocumentedUsers.length > 0 || undocumentedUsers.length > 0;
+    const signInStatus: ZoomFindingStatus = socialUsers.length > 0 || passwordUsers.length > 0
       ? "fail"
-      : usersPartial || unknownLoginUsers.length > 0
+      : usersPartial || unknownLoginUsers.length > 0 || unjudgedSignIns
         ? "warn"
         : "pass";
+    const unjudgedNote = [
+      otherDocumentedUsers.length > 0
+        ? `${otherDocumentedUsers.length} users expose codes that are documented but neither SSO nor a personal or social provider (${loginCodesByCategory("other").map((code) => `${code} ${LOGIN_TYPE_CATALOG[code].label}`).join(", ")}).`
+        : "",
+      undocumentedUsers.length > 0
+        ? `${undocumentedUsers.length} users expose login_types codes not documented on GET /users or GET /users/{userId} [${undocumentedCodes.join(", ")}].`
+        : "",
+      unjudgedSignIns ? "They are reported separately and cannot count as blocked." : "",
+    ].filter(Boolean).join(" ");
     findings.push(finding(
       "ZOOM-ID-05",
       "Personal and social sign-in methods blocked",
       "high",
       [16],
       signInStatus,
-      socialUsers.length > 0 || workEmailUsers.length > 0
-        ? `${socialUsers.length} users use social OAuth (codes 0, 1, 24, 27) and ${workEmailUsers.length} use Zoom Work email passwords (code 100).`
+      socialUsers.length > 0 || passwordUsers.length > 0
+        ? `${socialUsers.length} users use third-party OAuth sign-in (codes ${loginCodesByCategory("social").join(", ")}) and ${passwordUsers.length} use Zoom-held passwords (codes ${loginCodesByCategory("password").join(", ")}).`
         : usersPartial
-          ? `${partialNote(userRecords.length, users.total, users.truncated)} No social or password sign-ins among seen users.`
-          : unknownLoginUsers.length > 0
-            ? `${unknownLoginUsers.length}/${userRecords.length} users did not expose login_types and are reported separately.`
-            : `No active user (complete inventory of ${userRecords.length}) uses social OAuth or Zoom Work email sign-in.`,
-      { ...userEvidence, social_login_users: socialUsers.slice(0, 25).map(userLabel), work_email_users: workEmailUsers.slice(0, 25).map(userLabel) },
+          ? `${partialNote(userRecords.length, users.total, users.truncated)} No social or password sign-ins among seen users. ${unjudgedNote}`.trim()
+          : unjudgedSignIns
+            ? unjudgedNote
+            : unknownLoginUsers.length > 0
+              ? `${unknownLoginUsers.length}/${userRecords.length} users did not expose login_types and are reported separately.`
+              : `No active user (complete active-user inventory of ${userRecords.length}) uses a third-party OAuth provider or a Zoom-held password; every login_types code is documented and classified.`,
+      {
+        ...userEvidence,
+        social_login_users: socialUsers.slice(0, 25).map(userLabel),
+        password_login_users: passwordUsers.slice(0, 25).map(userLabel),
+        other_documented_login_users: otherDocumentedUsers.slice(0, 25).map(userLabel),
+        undocumented_login_users: undocumentedUsers.slice(0, 25).map(userLabel),
+      },
     ));
   }
 
@@ -2238,12 +2285,14 @@ export function assessZoomMeetingSecurityFromSnapshot(
     "Embed password in join link disabled",
     "medium",
     [22],
-    "schedule_meeting.embed_password_in_join_link",
+    "meeting_security.embed_password_in_join_link",
     false,
     {
-      evidenceToCollect: "the Schedule Meeting > Embed passcode in invite link setting",
+      evidenceToCollect: "the Security > Embed passcode in invite link for one-click join setting",
       compliant: "join links do not carry the encrypted passcode.",
       nonCompliant: "join links carry the encrypted passcode for one-click join.",
+      surfaceName: "account_settings:meeting_security",
+      lockPath: "meeting_security.embed_password_in_join_link",
     },
   ));
 
@@ -2391,7 +2440,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
       meeting_authentication: readSetting(bundle, "meeting_authentication").value ?? null,
       who_can_share_screen: whoCanShare.value ?? null,
       local_recording: readSetting(bundle, "recording.local_recording").value ?? null,
-      embed_password_in_join_link: readSetting(bundle, "schedule_meeting.embed_password_in_join_link").value ?? null,
+      embed_password_in_join_link: readSetting(bundle, "meeting_security.embed_password_in_join_link").value ?? null,
       end_to_end_encrypted_meetings: e2ee.value ?? null,
       custom_data_center_regions: customRegions.value ?? null,
       groups_sampled: snapshot.groupPolicies.length,
