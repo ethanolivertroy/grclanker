@@ -104,7 +104,7 @@ test("agent sdk registry exposes every domain tool and excludes compute backend 
     .filter((tool) => tool.kind === "domain")
     .map((tool) => tool.name);
 
-  assert.equal(tools.length, 107);
+  assert.equal(tools.length, expected.length);
   assert.deepEqual(names, expected);
   assert.equal(new Set(names).size, names.length);
   for (const computeTool of COMPUTE_TOOL_NAMES) {
@@ -376,7 +376,7 @@ test("agent/tools has exactly one generated entry per registered domain tool", a
   const files = await listAgentSdkToolFiles(toolsDir);
   const names = [...listRegisteredGrcToolNames()].sort();
 
-  assert.equal(files.length, 107);
+  assert.equal(files.length, names.length);
   assert.deepEqual(files, names);
   for (const name of names) {
     const source = readFileSync(resolve(toolsDir, `${name}.ts`), "utf8");
@@ -418,8 +418,9 @@ test("agent entry files hand the adapter configs to the mocked Agent SDK define 
 
 test("every generated tool entry registers a server tool for its filename", async () => {
   const before = mockCalls().filter((call) => call.helper === "defineTool").length;
+  const toolNames = [...listRegisteredGrcToolNames()];
 
-  for (const name of listRegisteredGrcToolNames()) {
+  for (const name of toolNames) {
     const tool = (await importAgentEntry("tools", `${name}.js`)).default;
     const registered = getRegisteredGrcTool(name);
 
@@ -435,5 +436,5 @@ test("every generated tool entry registers a server tool for its filename", asyn
   }
 
   const after = mockCalls().filter((call) => call.helper === "defineTool").length;
-  assert.equal(after - before, 107);
+  assert.equal(after - before, toolNames.length);
 });
