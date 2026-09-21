@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -636,12 +636,16 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
+function auditZipPath(outputDir: string): string {
+  return resolveSecureOutputPath(dirname(outputDir), `${basename(outputDir)}.zip`);
+}
+
 async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
   ensurePrivateDir(root);
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(auditZipPath(candidate))) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -3154,7 +3158,7 @@ export async function exportLaunchdarklyAuditBundle(
     await writeSecureTextFile(outputDir, "_errors.log", `${uniqueErrors.join("\n")}\n`);
   }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${bundleName}.zip`);
+  const zipPath = auditZipPath(outputDir);
   await createZipArchive(outputDir, zipPath);
 
   return {

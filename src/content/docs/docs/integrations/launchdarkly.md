@@ -90,7 +90,7 @@ Control 16 evaluates custom role policies with a resource specifier parser that 
 <host>-<accountId>-audit-bundle.zip
 ```
 
-Output paths are resolved through `resolveSecureOutputPath`, which rejects directory traversal and symlinked parents, and files are written with owner-only permissions. SDK keys, mobile keys, Relay Proxy keys, webhook secrets, and integration credentials are masked before they reach `core_data/`.
+Repeated exports never overwrite earlier results: when `<host>-<accountId>-audit-bundle` (or its zip) already exists, the next run allocates `-2`, `-3`, and so on, and the zip always takes the name of the directory it was built from (`<host>-<accountId>-audit-bundle-2.zip`). Output paths are resolved through `resolveSecureOutputPath`, which rejects directory traversal and symlinked parents, and files are written with owner-only permissions. SDK keys, mobile keys, Relay Proxy keys, webhook secrets, and integration credentials are masked before they reach `core_data/`.
 
 ## Finding shape and status semantics
 

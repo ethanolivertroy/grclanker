@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -1232,13 +1233,27 @@ test("exportLaunchdarklyAuditBundle records partial collection failures in _erro
   assert.match(executive, /Partial Collection Warnings/);
 });
 
-test("exportLaunchdarklyAuditBundle allocates a suffixed directory when the bundle name already exists", async () => {
+test("exportLaunchdarklyAuditBundle keeps directory and zip paired across repeated exports", async () => {
   const base = createTempBase("grclanker-ld-export-dupe-");
   const first = await exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig(), base, { now: NOW });
+  const firstZipSize = statSync(first.zipPath).size;
   const second = await exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig(), base, { now: NOW });
 
   assert.notEqual(first.outputDir, second.outputDir);
   assert.match(second.outputDir, /-audit-bundle-2$/);
+  assert.notEqual(first.zipPath, second.zipPath);
+  assert.match(first.zipPath, /app\.launchdarkly\.com-acct-123-audit-bundle\.zip$/);
+  assert.match(second.zipPath, /app\.launchdarkly\.com-acct-123-audit-bundle-2\.zip$/);
+  assert.equal(second.zipPath, `${second.outputDir}.zip`);
+  assert.ok(existsSync(first.zipPath));
+  assert.ok(existsSync(second.zipPath));
+  assert.equal(statSync(first.zipPath).size, firstZipSize);
+
+  rmSync(second.outputDir, { recursive: true, force: true });
+  const third = await exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig(), base, { now: NOW });
+  assert.match(third.outputDir, /-audit-bundle-3$/);
+  assert.equal(third.zipPath, `${third.outputDir}.zip`);
+  assert.ok(existsSync(second.zipPath));
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
