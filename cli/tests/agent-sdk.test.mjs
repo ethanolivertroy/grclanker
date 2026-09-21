@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { register } from "node:module";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 
@@ -24,7 +25,8 @@ import {
   workflowSkillConfig,
 } from "../dist/agent-sdk/lib/skills.js";
 import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig } from "../dist/agent-sdk/lib/tools.js";
-import { clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
+import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
+import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { buildAgentSdkToolSource, listAgentSdkToolFiles } from "../scripts/generate-agent-sdk-tools.mjs";
 
@@ -236,7 +238,7 @@ test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and t
 
 test("executeGrcTool returns error envelopes for invalid arguments and thrown errors", async () => {
   const { tool, calls } = fakeTool();
-  const invalid = await executeGrcTool(tool, { limit: 2 }, "call_2");
+  const invalid = await executeGrcTool(tool, { limit: 2 }, { toolCallId: "call_2" });
 
   assert.equal(invalid.isError, true);
   assert.match(invalid.content[0].text, /Validation failed for tool "fake_search_things"/);
@@ -248,12 +250,85 @@ test("executeGrcTool returns error envelopes for invalid arguments and thrown er
       throw new Error("boom");
     },
   });
-  const thrown = await executeGrcTool(throwing, { query: "x" }, "call_3");
+  const thrown = await executeGrcTool(throwing, { query: "x" }, { toolCallId: "call_3" });
 
   assert.deepEqual(thrown, {
     content: [{ type: "text", text: "fake_search_things failed: boom" }],
     isError: true,
   });
+});
+
+test("executeGrcTool disables persistent caches only for dry-run sessions", async () => {
+  const observed = [];
+  const { tool } = fakeTool({
+    async execute(_toolCallId, args) {
+      observed.push(persistentCachesEnabled());
+      return { content: [{ type: "text", text: args.query }], details: {} };
+    },
+  });
+  const config = buildSdkToolConfig(tool);
+
+  await config.execute({ query: "live" }, { toolCallId: "call_live" });
+  await config.execute({ query: "dry" }, { toolCallId: "call_dry", session: { dryRun: true } });
+  await executeGrcTool(tool, { query: "explicit" }, { dryRun: true });
+  await executeGrcTool(tool, { query: "default" });
+
+  assert.deepEqual(observed, [true, false, false, true]);
+  assert.equal(persistentCachesEnabled(), true);
+});
+
+test("FedRAMP lookups leave the grclanker state directory untouched in a dry-run session", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalHome = process.env.GRCLANKER_HOME;
+  const homeBase = mkdtempSync(join(tmpdir(), "grclanker-agent-sdk-dryrun-"));
+  const grclankerHome = join(homeBase, ".grclanker");
+  process.env.GRCLANKER_HOME = homeBase;
+
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url === "https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json") {
+      return jsonResponse({
+        info: { title: "Fixture rules", version: "fixture-1", last_updated: "2026-01-01" },
+        FRD: { data: {} },
+      });
+    }
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+
+  clearFedrampCachesForTests();
+
+  try {
+    const dryRun = { toolCallId: "call_dry", session: { dryRun: true } };
+    const checkSources = await grclankerToolConfig("fedramp_check_sources").execute({ refresh: true }, dryRun);
+    assert.equal(checkSources.isError, undefined, checkSources.content[0]?.text);
+    assert.match(checkSources.content[0].text, /fixture-1/);
+
+    const search = await grclankerToolConfig("fedramp_search_frmr").execute({ query: "CDS" }, dryRun);
+    assert.equal(search.isError, undefined, search.content[0]?.text);
+
+    // The fixture catalog has no KSIs, so the lookup loads the catalog and
+    // then reports a miss; the cache path still ran.
+    const ksi = await grclankerToolConfig("fedramp_get_ksi").execute({ query: "KSI-CNA" }, dryRun);
+    assert.match(ksi.content[0].text, /No FedRAMP KSI matched "KSI-CNA"/);
+
+    assert.equal(existsSync(grclankerHome), false, "dry-run FedRAMP lookups must not create the state directory");
+    assert.deepEqual(readdirSync(homeBase), []);
+
+    clearFedrampCachesForTests();
+    const live = await grclankerToolConfig("fedramp_search_frmr").execute({ query: "CDS" }, { toolCallId: "call_live" });
+    assert.equal(live.isError, undefined, live.content[0]?.text);
+    assert.equal(existsSync(join(grclankerHome, ".state", "fedramp", "catalog.json")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalHome === undefined) {
+      delete process.env.GRCLANKER_HOME;
+    } else {
+      process.env.GRCLANKER_HOME = originalHome;
+    }
+    clearFedrampCachesForTests();
+    clearGrcSharedCachesForTests();
+    rmSync(homeBase, { recursive: true, force: true });
+  }
 });
 
 test("toSdkToolResult keeps text and image content, drops details, and carries isError", () => {
