@@ -283,6 +283,7 @@ function secretLadenClient() {
   client.listCloudGuardProblems = async () => {
     throw SECRET_ERROR;
   };
+  client.getResolvedConfig = () => sampleConfig({ configFile: "/home/FAKE_HOME_1/.oci/config" });
   return client;
 }
 
@@ -800,8 +801,11 @@ test("rule 9: bundle files, the zip, and tool outputs never carry credential-bea
   assert.match(errorsLog, /\[redacted key material\]/);
   assert.match(errorsLog, /token=\[redacted\]/);
   assert.match(errorsLog, /key_file=\[redacted\]/);
+  assert.match(errorsLog, /--config-file \[redacted\]/);
   const metadata = JSON.parse(readFileSync(join(result.outputDir, "metadata.json"), "utf8"));
   assert.equal(metadata.config_file, REDACTED_MARKER);
+  const access = JSON.parse(readFileSync(join(result.outputDir, "core_data", "access.json"), "utf8"));
+  assert.ok(access.notes.includes(`Using OCI config ${REDACTED_MARKER} profile prod-audit.`), access.notes.join("|"));
 
   const entries = readZipEntries(result.zipPath);
   const entryNames = entries.map((entry) => entry.name);

@@ -426,6 +426,7 @@ const SENSITIVE_TEXT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> =
   { pattern: /-----BEGIN[^-]*-----[\s\S]*/g, replacement: "[redacted key material]" },
   { pattern: /\/p\/[A-Za-z0-9_+/=-]+\/n\//g, replacement: "/p/[redacted]/n/" },
   { pattern: /\b(Signature|Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/g, replacement: "$1 [redacted]" },
+  { pattern: /--config-file\s+("[^"]*"|'[^']*'|\S+)/g, replacement: `--config-file ${REDACTED_MARKER}` },
   { pattern: /\b([A-Za-z_-]*(?:token|secret|password|passphrase|key_file|keyfile|access_uri|accessuri)[A-Za-z_-]*)\s*[=:]\s*("[^"]*"|'[^']*'|\S+)/gi, replacement: `$1=${REDACTED_MARKER}` },
 ];
 
@@ -2445,10 +2446,12 @@ function buildBundleReadme(): string {
     "- `compliance/<framework>/*.md`: one report per mapped framework",
     "- `analysis/findings.json` and `analysis/*.json`: normalized findings and assessment details",
     "- `core_data/*.json`: raw access inventory and compartment snapshot",
-    "- `metadata.json`: non-secret run metadata",
+    "- `metadata.json`: non-secret run metadata (the config file path is redacted; only the profile name is kept)",
     "- `_errors.log`: present only when collection partially failed",
     "",
-    "The OCI CLI is used for authenticated API transport, but credentials are not written to this bundle.",
+    "The OCI CLI is used for authenticated API transport, but credentials are not written to this bundle: signing keys, auth tokens,",
+    "customer secret keys, pre-authenticated request URIs, key material, and secret bundles are dropped or replaced with [redacted] at collection time,",
+    "and raw snapshots are projected to the documented fields the verdicts read.",
     "",
   ].join("\n");
 }
@@ -2488,8 +2491,12 @@ export async function exportOciAuditBundle(
 
   await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
   await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
+  const bundleAccess: OciAccessCheckResult = {
+    ...access,
+    notes: access.notes.map((note) => note.replace(/^Using OCI config .* profile /, `Using OCI config ${REDACTED_MARKER} profile `)),
+  };
   await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    config_file: config.configFile,
+    config_file: REDACTED_MARKER,
     profile: config.profile,
     region: config.region,
     tenancy_ocid: config.tenancyOcid,
@@ -2505,7 +2512,7 @@ export async function exportOciAuditBundle(
       lookback_days: options.lookback_days ?? DEFAULT_LOOKBACK_DAYS,
     },
   }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(redactSensitiveValues(bundleAccess)));
   await writeSecureTextFile(outputDir, "core_data/compartments.json", serializeJson(compartments.items.map(projectCompartmentSnapshot)));
   await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
   await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
