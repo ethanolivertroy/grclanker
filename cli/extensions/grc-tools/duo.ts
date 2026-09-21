@@ -1947,6 +1947,12 @@ export function projectCollectionStatus(
   );
 }
 
+/** The client prefixes every failure with the request path; drop it where the endpoint is already named. */
+function describeReadFailure(endpoint: string, error: string): string {
+  const prefix = `Duo API request failed for ${endpoint} `;
+  return `${endpoint} ${error.startsWith(prefix) ? error.slice(prefix.length) : `failed: ${error}`}`;
+}
+
 function unavailableEvidence(endpoint: string, permission: string, error: string | undefined, collect: string): string[] {
   return [
     `endpoint=${endpoint}`,
@@ -2365,8 +2371,10 @@ export function assessDuoAuthentication(
   // Retrieve Allowed Authentication Methods is a supporting read: the verdict rests on the global
   // policy, so a failed read is named as unread rather than shown as "no WebAuthn for administrators".
   const adminMethodsEvidence = adminMethodsUnreadable
-    ? `admin_allowed_auth_methods=unread (${DUO_ENDPOINTS.adminAllowedAuthMethods} ${
-        data.allowedAdminAuthMethods.error ? `failed: ${data.allowedAdminAuthMethods.error}` : "returned no usable payload"
+    ? `admin_allowed_auth_methods=unread (${
+        data.allowedAdminAuthMethods.error
+          ? describeReadFailure(DUO_ENDPOINTS.adminAllowedAuthMethods, data.allowedAdminAuthMethods.error)
+          : `${DUO_ENDPOINTS.adminAllowedAuthMethods} returned no usable payload`
       }; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`
     : `admin_allowed_auth_methods.webauthn_enabled=${getBooleanish(adminMethods, "webauthn_enabled") ?? false}`;
 
@@ -2703,12 +2711,9 @@ export function assessDuoAuthentication(
   const bypassReview = reviewBypassCodes(data.bypassCodes.data);
   // Retrieve Settings supplies the help desk issuance limits; when that read failed, the limits are
   // unread rather than "unknown", and the empty-inventory verdict cannot rise above Partial.
-  const settingsReadError = data.settings.error;
-  const helpdeskEvidence = settingsReadError
-    ? [
-        `helpdesk_bypass=unread (${DUO_ENDPOINTS.settings} failed: ${settingsReadError}; requires ${DUO_PERMISSIONS.settings})`,
-        "helpdesk_bypass_expiration=unread",
-      ]
+  const settingsReadFailure = data.settings.error ? describeReadFailure(DUO_ENDPOINTS.settings, data.settings.error) : undefined;
+  const helpdeskEvidence = settingsReadFailure
+    ? [`helpdesk_bypass=unread (${settingsReadFailure}; requires ${DUO_PERMISSIONS.settings})`, "helpdesk_bypass_expiration=unread"]
     : [`helpdesk_bypass=${helpdeskBypass ?? "unknown"}`, `helpdesk_bypass_expiration=${helpdeskBypassExpiration ?? "unset"}`];
   const bypassEvidence = [
     `active_bypass_codes=${bypassCount}`,
@@ -2747,12 +2752,12 @@ export function assessDuoAuthentication(
       withInventoryCap(
         buildFinding(
           "DUO-AUTH-006",
-          settingsReadError ? "Partial" : "Pass",
-          settingsReadError
-            ? `No active bypass codes were returned, but help desk issuance limits could not be read from ${DUO_ENDPOINTS.settings} (${settingsReadError}), so the zero-code inventory is capped at Partial.`
+          settingsReadFailure ? "Partial" : "Pass",
+          settingsReadFailure
+            ? `No active bypass codes were returned, but help desk issuance limits could not be read: ${settingsReadFailure}. The zero-code verdict is capped at Partial.`
             : "No active bypass codes were returned.",
           ["Global bypass code inventory is empty, which is compliant by intent: no outstanding break-glass codes.", ...helpdeskEvidence],
-          settingsReadError
+          settingsReadFailure
             ? `Grant the audit principal ${DUO_PERMISSIONS.settings} so helpdesk_bypass and helpdesk_bypass_expiration can be verified alongside the empty inventory.`
             : "Keep break-glass issuance exceptional and time-bounded.",
         ),
