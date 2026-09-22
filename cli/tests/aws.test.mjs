@@ -1,12 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
+import dns from "node:dns";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -14,27 +19,76 @@ import {
   AWS_CONTROL_CATALOG,
   AWS_FINDING_CONTROLS,
   AWS_FRAMEWORKS,
+  AWS_REQUIRED_OUTPUT_MEMBERS,
+  AwsApiError,
+  AwsCredentialProviderError,
   assessAwsDataProtection,
   assessAwsIdentity,
   assessAwsLoggingDetection,
   assessAwsNetworkSecurity,
   assessAwsOrgGuardrails,
+  awsFixedTexts,
   buildAwsMappings,
   checkAwsAccess,
   exportAwsAuditBundle,
   isAwsAccessDenied,
+  labelIdentifier,
+  maskAccessKeyId,
   normalizePolicyDocument,
+  paginateAwsList,
   permissiveNaclEntries,
+  redactErrorText,
   resolveAwsConfiguration,
   resolveRegionScope,
   resolveSecureOutputPath,
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
+import {
+  AWS_CANARIES,
+  CANARY_URL,
+  FIXTURE_ACCOUNT,
+  canaryHtmlBody,
+  contextLeakingDeniedError,
+  healthySdkRoutes,
+  proxyHtmlError,
+  realAwsClient,
+  realAwsConfig,
+  sdkAccessDenied,
+  sdkServiceUnavailable,
+  sdkThrottled,
+  sdkTimeout,
+  shortBodyParseError,
+  withSdkRoutes,
+} from "./helpers/aws-sdk-fixture.mjs";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  CANARY,
+  ENCODED_FORM_SECRET,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
+  assertCanaryFixture,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
+  assertNoShortBodyFragments,
+  assertRedactionCases,
+  assertScrubBoundary,
+  assertShortBodyRecordedAsNote,
+  jsonCanaryMessage,
+  parserMessageFor,
+  parserSnippetBody,
+} from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
+
+/** A raw access key id the fixtures return; only its masked form (first and last four characters) may reach an output. */
+const RAW_ACCESS_KEY_ID = "AKIA3HPK8LPDA53DZLCF";
+const MASKED_ACCESS_KEY_ID = `AKIA****${RAW_ACCESS_KEY_ID.slice(-4)}`;
 
 function accessDenied(code = "AccessDeniedException") {
   const error = new Error(`User is not authorized to perform this operation (${code})`);
@@ -45,6 +99,11 @@ function accessDenied(code = "AccessDeniedException") {
 
 function findingById(result, id) {
   return result.findings.find((item) => item.id === id);
+}
+
+/** Shape returned by every paginated client list: the items seen plus whether the walk stopped early. */
+function paged(items, truncated = false) {
+  return { items, truncated };
 }
 
 function statusMap(result) {
@@ -227,6 +286,33 @@ test("resolveAwsConfiguration prefers explicit args over environment defaults", 
   assert.ok(resolved.sourceChain.includes("arguments-profile"));
 });
 
+test("config resolution: the profile, region, and account set through the environment survive an argument overlay that carries every key as undefined and names only an unrelated argument, the source chain names the environment, and static environment credentials still sign the request through the real SDK", async () => {
+  // Every documented key present as undefined (the shape an argument overlay emits), one unrelated argument set.
+  const overlay = { region: undefined, profile: undefined, account_id: undefined, region_limit: 1 };
+
+  const profile = resolveAwsConfiguration(overlay, { AWS_PROFILE: "audit-env-profile", AWS_REGION: "eu-west-1", AWS_ACCOUNT_ID: "123456789012" });
+  assert.deepEqual({ region: profile.region, profile: profile.profile, accountId: profile.accountId }, { region: "eu-west-1", profile: "audit-env-profile", accountId: "123456789012" }, "the environment values resolve");
+  assert.deepEqual(profile.sourceChain, ["environment-region", "environment-profile", "environment-account"], "the source chain names the environment");
+
+  const defaultRegion = resolveAwsConfiguration(overlay, { AWS_DEFAULT_REGION: "ap-southeast-2" });
+  assert.equal(defaultRegion.region, "ap-southeast-2", "AWS_DEFAULT_REGION resolves when AWS_REGION is unset");
+  assert.deepEqual(defaultRegion.sourceChain, ["environment-region"]);
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveAwsConfiguration({ ...overlay, profile: "", region: "  " }, { AWS_PROFILE: "audit-env-profile", AWS_REGION: "eu-west-1" });
+  assert.deepEqual({ region: blank.region, profile: blank.profile }, { region: "eu-west-1", profile: "audit-env-profile" }, "blank arguments do not erase the environment values");
+
+  // The credential itself is the SDK's: with no profile resolved, the default chain reads the static environment key and signs with it.
+  await withLocalAwsEndpoint(() => STS_IDENTITY_RESPONSE, async ({ requests }) => {
+    const config = resolveAwsConfiguration(overlay, process.env);
+    assert.equal(config.profile, undefined, "no profile is resolved, so the default credential chain is used");
+    assert.deepEqual(config.sourceChain, ["environment-region"]);
+    const identity = await realAwsClient(config).getCallerIdentity();
+    assert.equal(identity.Account, FIXTURE_ACCOUNT, "the identity read completes with the environment credential");
+    assert.deepEqual(requests.map((entry) => [entry.label, entry.accessKeyId]), [["sts:GetCallerIdentity", process.env.AWS_ACCESS_KEY_ID]], "the request was signed with the environment access key id");
+  });
+});
+
 test("checkAwsAccess reports readable AWS audit surfaces", async () => {
   const client = {
     getResolvedConfig: () => sampleConfig(),
@@ -236,40 +322,61 @@ test("checkAwsAccess reports readable AWS audit surfaces", async () => {
     async getAccountSummary() {
       return { SummaryMap: { Users: 3 } };
     },
+    async listIamUsers(limit) {
+      return paged([{ UserName: "alice" }], limit === 1);
+    },
     async describeTrails() {
       return [{ Name: "org-trail" }];
     },
     async getEnabledSecurityHubStandards() {
-      return [{ StandardsArn: "arn:aws:securityhub:::standards/cis-aws-foundations-benchmark/v/1.4.0" }];
+      return paged([{ StandardsArn: "arn:aws:securityhub:::standards/cis-aws-foundations-benchmark/v/1.4.0" }]);
     },
     async describeConfigurationRecorders() {
       return [{ name: "default" }];
     },
     async listDetectors() {
-      return ["detector-1"];
+      return paged(["detector-1"]);
     },
     async listAnalyzers() {
-      return [{ arn: "arn:aws:access-analyzer:us-east-1:123456789012:analyzer/org", status: "ACTIVE" }];
+      return paged([{ arn: "arn:aws:access-analyzer:us-east-1:123456789012:analyzer/org", status: "ACTIVE" }]);
     },
     async describeOrganization() {
       return { Id: "o-example" };
     },
     async listIdentityCenterInstances() {
-      return [{ InstanceArn: "arn:aws:sso:::instance/ssoins-1" }];
+      return paged([{ InstanceArn: "arn:aws:sso:::instance/ssoins-1" }]);
     },
   };
 
   const result = await checkAwsAccess(client);
   assert.equal(result.status, "healthy");
-  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 8);
+  assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, 9);
+  const counts = Object.fromEntries(result.surfaces.map((surface) => [surface.name, surface.count]));
+  assert.equal(counts.security_hub, 1, "paged lists report the items seen as the surface count");
+  assert.equal(counts.guardduty, 1);
+  assert.equal(counts.access_analyzer, 1);
+  assert.equal(counts.identity_center, 1);
+  assert.equal(counts.organizations, 1);
+  assert.equal(counts.iam_users, 1, "IAM.ListUsers is probed so a denial of the user inventory is visible in the access check");
+  const users = result.surfaces.find((surface) => surface.name === "iam_users");
+  assert.deepEqual(
+    { command: users.command, region: users.region, truncated: users.truncated },
+    { command: "iam:ListUsers", region: "us-east-1", truncated: true },
+    "a probe capped at its page limit carries truncated: true beside the command and region it issued",
+  );
+  for (const surface of result.surfaces) {
+    assert.match(surface.command, /^[a-z0-9-]+:[A-Z][A-Za-z]+$/, `${surface.name} names the IAM action it issued`);
+    assert.equal(surface.region, "us-east-1");
+    assert.equal(typeof surface.count, "number", `${surface.name}: a completed probe carries a numeric count`);
+  }
   assert.match(result.recommendedNextStep, /aws_assess_identity/);
 });
 
 test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfaces and reports limited when any is denied", async () => {
   const healthy = await checkAwsAccess(compliantBundleClient());
   assert.equal(healthy.status, "healthy");
-  assert.equal(healthy.surfaces.length, 14);
-  for (const name of ["ec2_regions", "s3_buckets", "kms_keys", "rds_instances", "audit_manager", "account_contacts"]) {
+  assert.equal(healthy.surfaces.length, 15);
+  for (const name of ["ec2_regions", "s3_buckets", "kms_keys", "rds_instances", "audit_manager", "account_contacts", "iam_users"]) {
     const probe = healthy.surfaces.find((surface) => surface.name === name);
     assert.equal(probe?.status, "readable", `${name} should be readable`);
   }
@@ -285,11 +392,27 @@ test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfac
     },
   }));
   assert.equal(limited.status, "limited");
-  assert.equal(limited.surfaces.find((surface) => surface.name === "kms_keys")?.status, "not_readable");
+  const kms = limited.surfaces.find((surface) => surface.name === "kms_keys");
+  assert.equal(kms?.status, "not_readable");
+  assert.deepEqual(
+    { count: kms.count, truncated: kms.truncated, command: kms.command, region: kms.region, error_code: kms.error_code, http_status: kms.http_status },
+    { count: null, truncated: null, command: "kms:ListKeys", region: "us-east-1", error_code: "AccessDeniedException", http_status: 403 },
+    "a denied probe keeps count and truncated null and names the command, region, SDK error code, and HTTP status that failed",
+  );
+  assert.match(kms.error, /AccessDeniedException/);
   assert.equal(limited.surfaces.find((surface) => surface.name === "account_contacts")?.status, "readable", "a missing contact is readable evidence, not a denial");
   assert.equal(limited.surfaces.find((surface) => surface.name === "account_contacts")?.count, 0);
   assert.match(limited.recommendedNextStep, /kms/);
   assert.match(limited.recommendedNextStep, /never pass/);
+
+  const usersDenied = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw accessDenied();
+    },
+  }));
+  assert.equal(usersDenied.status, "limited", "a denied IAM.ListUsers is visible in the access check instead of leaving it healthy");
+  assert.equal(usersDenied.surfaces.find((surface) => surface.name === "iam_users")?.status, "not_readable");
+  assert.equal(usersDenied.surfaces.find((surface) => surface.name === "iam_users")?.count, null);
 });
 
 test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", async () => {
@@ -308,18 +431,18 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
       };
     },
     async listIamUsers() {
-      return [
+      return paged([
         { UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" },
         { UserName: "bob", PasswordLastUsed: "2025-12-01T00:00:00Z" },
         { UserName: "carol" },
-      ];
+      ]);
     },
     async listMfaDevices(userName) {
       return userName === "alice" ? [] : [{ SerialNumber: `mfa-${userName}` }];
     },
     async listAccessKeys(userName) {
       if (userName === "bob") {
-        return [{ AccessKeyId: "AKIABOB", CreateDate: "2025-01-01T00:00:00Z" }];
+        return [{ AccessKeyId: RAW_ACCESS_KEY_ID, CreateDate: "2025-01-01T00:00:00Z" }];
       }
       return [];
     },
@@ -327,12 +450,12 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
       return { LastUsedDate: "2025-01-02T00:00:00Z" };
     },
     async getAccountAuthorizationDetails() {
-      return [
+      return paged([
         {
           RoleName: "AdminRole",
           AttachedManagedPolicies: [{ PolicyName: "AdministratorAccess" }],
         },
-      ];
+      ]);
     },
   };
 
@@ -343,6 +466,34 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
   assert.equal(result.findings.find((item) => item.id === "AWS-IAM-04")?.status, "fail");
   assert.equal(result.findings.find((item) => item.id === "AWS-IAM-05")?.status, "warn");
   assert.equal(result.findings.find((item) => item.id === "AWS-IAM-06")?.status, "warn");
+  const staleKeys = findingById(result, "AWS-IAM-04").evidence.stale_access_keys;
+  assert.deepEqual(staleKeys.map((key) => key.accessKeyId), [MASKED_ACCESS_KEY_ID], "access key ids are masked in evidence");
+  assertNoCanaryWindows(assert, result, [RAW_ACCESS_KEY_ID], "the raw access key id never reaches the assessment output");
+});
+
+test("paginateAwsList stops at the limit, on a repeated token, and on the page budget, reporting each as truncated", async () => {
+  const pages = { undefined: { items: [1, 2], nextToken: "t1" }, t1: { items: [3, 4], nextToken: "t2" }, t2: { items: [5] } };
+  const complete = await paginateAwsList(10, async (token) => pages[String(token)]);
+  assert.deepEqual(complete, { items: [1, 2, 3, 4, 5], truncated: false });
+
+  const capped = await paginateAwsList(3, async (token) => pages[String(token)]);
+  assert.deepEqual(capped, { items: [1, 2, 3], truncated: true });
+
+  const stalled = await paginateAwsList(10, async (token) => (token ? { items: [2], nextToken: token } : { items: [1], nextToken: "same" }));
+  assert.deepEqual(stalled, { items: [1, 2], truncated: true }, "a token that never advances ends the walk as truncated instead of looping");
+
+  let calls = 0;
+  const endless = await paginateAwsList(10_000, async () => {
+    calls += 1;
+    return { items: [], nextToken: `t${calls}` };
+  });
+  assert.equal(endless.truncated, true, "a walk that exhausts the page budget is truncated");
+  assert.equal(calls, 1000);
+});
+
+test("maskAccessKeyId keeps only the prefix and suffix of a key id", () => {
+  assert.equal(maskAccessKeyId(RAW_ACCESS_KEY_ID), MASKED_ACCESS_KEY_ID);
+  assert.equal(maskAccessKeyId("short"), "****");
 });
 
 test("assessAwsLoggingDetection classifies trail, Security Hub, GuardDuty, and Config posture", async () => {
@@ -367,7 +518,7 @@ test("assessAwsLoggingDetection classifies trail, Security Hub, GuardDuty, and C
       return { HubArn: "arn:aws:securityhub:us-east-1:123456789012:hub/default" };
     },
     async getEnabledSecurityHubStandards() {
-      return [{ StandardsArn: "cis" }];
+      return paged([{ StandardsArn: "cis" }]);
     },
     async describeConfigurationRecorders() {
       return [{ name: "default", recordingGroup: { allSupported: true } }];
@@ -376,7 +527,7 @@ test("assessAwsLoggingDetection classifies trail, Security Hub, GuardDuty, and C
       return [{ name: "default", recording: true }];
     },
     async listDetectors() {
-      return ["detector-1"];
+      return paged(["detector-1"]);
     },
     async getDetector() {
       return { Status: "ENABLED" };
@@ -389,6 +540,212 @@ test("assessAwsLoggingDetection classifies trail, Security Hub, GuardDuty, and C
   assert.equal(result.findings.find((item) => item.id === "AWS-LOG-03")?.status, "pass");
   assert.equal(result.findings.find((item) => item.id === "AWS-LOG-04")?.status, "pass");
   assert.equal(result.findings.find((item) => item.id === "AWS-LOG-05")?.status, "pass");
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.summary.collection_errors, 0);
+});
+
+/** Fixture (d) for logging: two trails and two detectors so a single per-item denial leaves a healthy sibling. */
+function compliantLoggingClient(overrides = {}) {
+  return {
+    async describeTrails() {
+      return [
+        { Name: "org-trail", TrailARN: "arn:trail/org", IsMultiRegionTrail: true, LogFileValidationEnabled: true },
+        { Name: "regional-trail", TrailARN: "arn:trail/regional", IsMultiRegionTrail: false, LogFileValidationEnabled: true },
+      ];
+    },
+    async getTrailStatus() {
+      return { IsLogging: true };
+    },
+    async getEventSelectors() {
+      return { AdvancedEventSelectors: [{ Name: "data-events" }] };
+    },
+    async describeSecurityHub() {
+      return { HubArn: "arn:hub" };
+    },
+    async getEnabledSecurityHubStandards() {
+      return paged([{ StandardsArn: "cis" }]);
+    },
+    async describeConfigurationRecorders() {
+      return [{ name: "default" }];
+    },
+    async describeConfigurationRecorderStatus() {
+      return [{ name: "default", recording: true }];
+    },
+    async listDetectors() {
+      return paged(["detector-1", "detector-2"]);
+    },
+    async getDetector() {
+      return { Status: "ENABLED" };
+    },
+    ...overrides,
+  };
+}
+
+const LOGGING_IDS = ["AWS-LOG-01", "AWS-LOG-02", "AWS-LOG-03", "AWS-LOG-04", "AWS-LOG-05"];
+
+/** Asserts that exactly the listed findings left pass and every other finding in the assessment still passes. */
+function assertOnlyDemoted(result, expected, label) {
+  const statuses = statusMap(result);
+  for (const [id, status] of Object.entries(statuses)) {
+    if (id in expected) assert.equal(status, expected[id], `${label}: ${id} should be ${expected[id]}, saw ${status}`);
+    else assert.equal(status, "pass", `${label}: ${id} must stay pass while only ${Object.keys(expected).join(", ")} is affected, saw ${status}`);
+  }
+}
+
+test("rule 1 corollary: assessAwsLoggingDetection never passes a control whose per-item read was denied, one secondary at a time", async () => {
+  const healthy = await assessAwsLoggingDetection(compliantLoggingClient());
+  assertOnlyDemoted(healthy, {}, "healthy fixture");
+  assert.deepEqual(Object.keys(statusMap(healthy)).sort(), LOGGING_IDS);
+
+  const trailStatusOne = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getTrailStatus(nameOrArn) {
+      if (nameOrArn === "arn:trail/regional") throw accessDenied();
+      return { IsLogging: true };
+    },
+  }));
+  assertOnlyDemoted(trailStatusOne, { "AWS-LOG-01": "warn" }, "GetTrailStatus denied for one trail");
+  assert.match(findingById(trailStatusOne, "AWS-LOG-01").summary, /Downgraded to warn: GetTrailStatus unreadable for 1 trail\(s\) \(regional-trail\)/);
+  assert.equal(trailStatusOne.errors.length, 1);
+  assert.match(trailStatusOne.errors[0], /^cloudtrail:GetTrailStatus regional-trail: AccessDenied \(AccessDeniedException/);
+  assert.equal(findingById(trailStatusOne, "AWS-LOG-01").evidence.trails[1].status_error, trailStatusOne.errors[0]);
+
+  const trailStatusAll = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getTrailStatus() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(trailStatusAll, { "AWS-LOG-01": "manual" }, "GetTrailStatus denied for every trail");
+  assert.match(findingById(trailStatusAll, "AWS-LOG-01").summary, /logging state could not be read \(cloudtrail:GetTrailStatus org-trail: AccessDenied/);
+
+  const selectorsOne = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getEventSelectors(nameOrArn) {
+      if (nameOrArn === "arn:trail/regional") throw accessDenied();
+      return { AdvancedEventSelectors: [{ Name: "data-events" }] };
+    },
+  }));
+  assertOnlyDemoted(selectorsOne, { "AWS-LOG-02": "warn" }, "GetEventSelectors denied for one trail");
+  assert.match(findingById(selectorsOne, "AWS-LOG-02").summary, /Downgraded to warn: GetEventSelectors unreadable for 1 trail\(s\) \(regional-trail\)/);
+  assert.deepEqual(findingById(selectorsOne, "AWS-LOG-02").evidence.selectors_unreadable, ["regional-trail"]);
+
+  const selectorsAll = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getEventSelectors() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(selectorsAll, { "AWS-LOG-02": "manual" }, "GetEventSelectors denied for every trail");
+  assert.match(findingById(selectorsAll, "AWS-LOG-02").summary, /Event selectors could not be read for 2 of 2 trail\(s\) \(cloudtrail:GetEventSelectors org-trail: AccessDenied/);
+
+  const standards = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getEnabledSecurityHubStandards() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(standards, { "AWS-LOG-03": "warn" }, "GetEnabledStandards denied");
+  assert.match(findingById(standards, "AWS-LOG-03").summary, /Security Hub is enabled, but enabled standards could not be listed \(securityhub:GetEnabledStandards: AccessDenied/);
+  assert.equal(findingById(standards, "AWS-LOG-03").evidence.standards_readable, false);
+  assert.equal(findingById(standards, "AWS-LOG-03").evidence.hub_enabled, true);
+
+  const detectorOne = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getDetector(detectorId) {
+      if (detectorId === "detector-2") throw accessDenied();
+      return { Status: "ENABLED" };
+    },
+  }));
+  assertOnlyDemoted(detectorOne, { "AWS-LOG-04": "warn" }, "GetDetector denied for one detector");
+  assert.match(findingById(detectorOne, "AWS-LOG-04").summary, /Downgraded to warn: GetDetector unreadable for 1 detector\(s\)/);
+  assert.deepEqual(findingById(detectorOne, "AWS-LOG-04").evidence.detectors_unreadable, ["detector-2"]);
+
+  const detectorAll = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getDetector() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(detectorAll, { "AWS-LOG-04": "manual" }, "GetDetector denied for every detector");
+  assert.match(findingById(detectorAll, "AWS-LOG-04").summary, /GetDetector could not be read for 2 of them \(guardduty:GetDetector detector-1: AccessDenied/);
+
+  const recorderStatus = await assessAwsLoggingDetection(compliantLoggingClient({
+    async describeConfigurationRecorderStatus() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(recorderStatus, { "AWS-LOG-05": "manual" }, "DescribeConfigurationRecorderStatus denied");
+  assert.match(findingById(recorderStatus, "AWS-LOG-05").summary, /recording state could not be read \(config:DescribeConfigurationRecorderStatus: AccessDenied/);
+  assert.equal(findingById(recorderStatus, "AWS-LOG-05").evidence.recorder_status_readable, false);
+  assert.equal(recorderStatus.summary.collection_errors, 1);
+});
+
+test("assessAwsLoggingDetection goes manual when a primary list is denied and fail only on readable evidence", async () => {
+  const trails = await assessAwsLoggingDetection(compliantLoggingClient({
+    async describeTrails() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(trails, { "AWS-LOG-01": "manual", "AWS-LOG-02": "manual" }, "DescribeTrails denied");
+  assert.match(findingById(trails, "AWS-LOG-01").summary, /CloudTrail trails could not be listed \(cloudtrail:DescribeTrails: AccessDenied/);
+  assert.equal(findingById(trails, "AWS-LOG-01").evidence.trails_readable, false);
+
+  const hubDenied = await assessAwsLoggingDetection(compliantLoggingClient({
+    async describeSecurityHub() {
+      throw accessDenied();
+    },
+    async getEnabledSecurityHubStandards() {
+      throw new Error("standards must not be listed when the hub state is unknown");
+    },
+  }));
+  assertOnlyDemoted(hubDenied, { "AWS-LOG-03": "manual" }, "DescribeHub denied");
+  assert.match(findingById(hubDenied, "AWS-LOG-03").summary, /Security Hub could not be described \(securityhub:DescribeHub: AccessDenied/);
+  assert.equal(findingById(hubDenied, "AWS-LOG-03").evidence.standards_readable, null);
+  assert.equal(hubDenied.errors.length, 1);
+
+  const hubDisabled = await assessAwsLoggingDetection(compliantLoggingClient({
+    async describeSecurityHub() {
+      return null;
+    },
+  }));
+  assertOnlyDemoted(hubDisabled, { "AWS-LOG-03": "fail" }, "DescribeHub reports the hub as not subscribed");
+  assert.match(findingById(hubDisabled, "AWS-LOG-03").summary, /Security Hub is not enabled in the configured region/);
+  assert.deepEqual(hubDisabled.errors, []);
+
+  const detectors = await assessAwsLoggingDetection(compliantLoggingClient({
+    async listDetectors() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(detectors, { "AWS-LOG-04": "manual" }, "ListDetectors denied");
+  assert.match(findingById(detectors, "AWS-LOG-04").summary, /GuardDuty detectors could not be listed \(guardduty:ListDetectors: AccessDenied/);
+
+  const recorders = await assessAwsLoggingDetection(compliantLoggingClient({
+    async describeConfigurationRecorders() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(recorders, { "AWS-LOG-05": "manual" }, "DescribeConfigurationRecorders denied");
+  assert.match(findingById(recorders, "AWS-LOG-05").summary, /AWS Config recorders could not be listed \(config:DescribeConfigurationRecorders: AccessDenied/);
+  assert.doesNotMatch(findingById(recorders, "AWS-LOG-05").summary, /No AWS Config/);
+
+  const noRecorder = await assessAwsLoggingDetection(compliantLoggingClient({
+    async describeConfigurationRecorders() {
+      return [];
+    },
+  }));
+  assertOnlyDemoted(noRecorder, { "AWS-LOG-05": "fail" }, "no recorder exists");
+  assert.match(findingById(noRecorder, "AWS-LOG-05").summary, /No AWS Config configuration recorder exists/);
+});
+
+test("rule 10: assessAwsLoggingDetection caps truncated standards and detector lists at warn", async () => {
+  const result = await assessAwsLoggingDetection(compliantLoggingClient({
+    async getEnabledSecurityHubStandards() {
+      return paged([{ StandardsArn: "cis" }], true);
+    },
+    async listDetectors() {
+      return paged(["detector-1"], true);
+    },
+  }));
+  assertOnlyDemoted(result, { "AWS-LOG-03": "warn", "AWS-LOG-04": "warn" }, "truncated lists");
+  assert.match(findingById(result, "AWS-LOG-03").summary, /Downgraded to warn: standards list truncated at 100/);
+  assert.equal(findingById(result, "AWS-LOG-03").evidence.standards_truncated, true);
+  assert.match(findingById(result, "AWS-LOG-04").summary, /Downgraded to warn: detector list truncated at 50/);
+  assert.equal(findingById(result, "AWS-LOG-04").evidence.detector_list_truncated, true);
 });
 
 test("assessAwsOrgGuardrails flags external access and missing Identity Center", async () => {
@@ -397,22 +754,22 @@ test("assessAwsOrgGuardrails flags external access and missing Identity Center",
       return { Id: "o-example", FeatureSet: "ALL" };
     },
     async listAccounts() {
-      return [{ Id: "1111" }, { Id: "2222" }, { Id: "3333" }];
+      return paged([{ Id: "1111" }, { Id: "2222" }, { Id: "3333" }]);
     },
     async listScps() {
-      return [{ Id: "p-1", Name: "DenyRegions" }];
+      return paged([{ Id: "p-1", Name: "DenyRegions" }]);
     },
     async listPolicyTargets() {
-      return [{ TargetId: "ou-1", Name: "Prod", Type: "ORGANIZATIONAL_UNIT" }];
+      return paged([{ TargetId: "ou-1", Name: "Prod", Type: "ORGANIZATIONAL_UNIT" }]);
     },
     async listAnalyzers() {
-      return [{ arn: "arn:analyzer", status: "ACTIVE" }];
+      return paged([{ arn: "arn:analyzer", status: "ACTIVE" }]);
     },
     async listAccessAnalyzerFindings() {
-      return [{ id: "f-1", status: "ACTIVE", resource: "arn:aws:s3:::public-bucket" }];
+      return paged([{ id: "f-1", status: "ACTIVE", resource: "arn:aws:s3:::public-bucket" }]);
     },
     async listIdentityCenterInstances() {
-      return [];
+      return paged([]);
     },
   };
 
@@ -447,7 +804,7 @@ function compliantBundleClient(overrides = {}) {
       };
     },
     async listIamUsers() {
-      return [{ UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" }];
+      return paged([{ UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" }]);
     },
     async listMfaDevices() {
       return [{ SerialNumber: "mfa-alice" }];
@@ -459,7 +816,7 @@ function compliantBundleClient(overrides = {}) {
       return null;
     },
     async getAccountAuthorizationDetails() {
-      return [];
+      return paged([]);
     },
     async describeTrails() {
       return [{ Name: "org-trail", TrailARN: "arn:trail", IsMultiRegionTrail: true, LogFileValidationEnabled: true }];
@@ -474,7 +831,7 @@ function compliantBundleClient(overrides = {}) {
       return { HubArn: "arn:hub" };
     },
     async getEnabledSecurityHubStandards() {
-      return [{ StandardsArn: "cis" }];
+      return paged([{ StandardsArn: "cis" }]);
     },
     async describeConfigurationRecorders() {
       return [{ name: "default" }];
@@ -483,7 +840,7 @@ function compliantBundleClient(overrides = {}) {
       return [{ name: "default", recording: true }];
     },
     async listDetectors() {
-      return ["detector-1"];
+      return paged(["detector-1"]);
     },
     async getDetector() {
       return { Status: "ENABLED" };
@@ -492,22 +849,22 @@ function compliantBundleClient(overrides = {}) {
       return { Id: "o-example" };
     },
     async listAccounts() {
-      return [{ Id: "123456789012" }];
+      return paged([{ Id: "123456789012" }]);
     },
     async listScps() {
-      return [{ Id: "p-1", Name: "DenyRegions" }];
+      return paged([{ Id: "p-1", Name: "DenyRegions" }]);
     },
     async listPolicyTargets() {
-      return [{ TargetId: "r-root", Type: "ROOT" }];
+      return paged([{ TargetId: "r-root", Type: "ROOT" }]);
     },
     async listAnalyzers() {
-      return [{ arn: "arn:analyzer", status: "ACTIVE" }];
+      return paged([{ arn: "arn:analyzer", status: "ACTIVE" }]);
     },
     async listAccessAnalyzerFindings() {
-      return [];
+      return paged([]);
     },
     async listIdentityCenterInstances() {
-      return [{ InstanceArn: "arn:sso" }];
+      return paged([{ InstanceArn: "arn:sso" }]);
     },
     async lookupRootEvents() {
       return { items: [], truncated: false };
@@ -755,6 +1112,8 @@ test("assessAwsDataProtection fixture (d): compliant account passes every data p
   assert.equal(encryption.evidence.ebs_by_region.length, 2);
   assert.equal(encryption.evidence.ebs_by_region[0].EbsEncryptionByDefault, true);
   assert.equal(encryption.evidence.efs, "not assessed");
+  // Every region's RDS inventory was read: the sentence counts the instances against the regions that were read.
+  assert.match(encryption.summary, /all \d+ RDS instances in the 2 readable region\(s\) report StorageEncrypted=true/);
   assert.equal(findingById(result, "AWS-DATA-22").evidence.eligible_keys, 2);
 });
 
@@ -883,12 +1242,13 @@ test("assessAwsDataProtection caps partial reads and truncation at warn", async 
       if (bucket === "app-data") throw accessDenied("AccessDenied");
       return { ...FULL_BLOCK };
     },
+    // regionLimit: 1 keeps only us-east-1 in scope, so the denials must land there to exercise the caps.
     async describeDbInstances(region) {
-      if (region === "us-west-2") throw accessDenied();
+      if (region === "us-east-1") throw accessDenied();
       return { items: [{ DBInstanceIdentifier: "orders-db", StorageEncrypted: true }], truncated: false };
     },
-    async getKeyRotationStatus(region) {
-      if (region === "us-west-2") throw accessDenied();
+    async getKeyRotationStatus(region, keyId) {
+      if (region === "us-east-1" && keyId === "k-customer") throw accessDenied();
       return { KeyRotationEnabled: true };
     },
   });
@@ -899,14 +1259,39 @@ test("assessAwsDataProtection caps partial reads and truncation at warn", async 
     "AWS-DATA-13": "warn",
     "AWS-DATA-22": "warn",
   });
-  assert.match(findingById(result, "AWS-DATA-11").summary, /Downgraded to warn: 1 bucket\(s\) could not be read; bucket inventory truncated at 1000/);
+  assert.match(findingById(result, "AWS-DATA-11").summary, /Downgraded to warn: 1 bucket\(s\) could not be read \(s3:GetPublicAccessBlock or s3:GetBucketPolicyStatus\); bucket inventory truncated at 1000/);
+  assert.match(findingById(result, "AWS-DATA-12").summary, /rds:DescribeDBInstances unreadable in 1 region\(s\) \(us-east-1\)/);
   assert.match(findingById(result, "AWS-DATA-12").summary, /only 1 of 2 regions assessed/);
+  // The RDS inventory was unreadable in every assessed region: the summary says so and never claims "all 0 RDS instances".
+  assert.match(findingById(result, "AWS-DATA-12").summary, /RDS instances could not be listed in any of 1 region\(s\) \(rds:DescribeDBInstances us-east-1: AccessDenied/);
+  assert.doesNotMatch(findingById(result, "AWS-DATA-12").summary, /all 0 RDS instances|0 RDS instances report/);
+  assert.deepEqual({ instances: result.summary.rds_instances, unencrypted: result.summary.rds_unencrypted, evidence: findingById(result, "AWS-DATA-12").evidence.rds_instances }, { instances: null, unencrypted: null, evidence: null }, "the RDS counts are unread, matching the summary sentence");
   assert.match(findingById(result, "AWS-DATA-13").summary, /bucket inventory truncated/);
+  assert.match(findingById(result, "AWS-DATA-22").summary, /kms:GetKeyRotationStatus unreadable for 1 key\(s\)/);
   assert.match(findingById(result, "AWS-DATA-22").summary, /only 1 of 2 regions assessed/);
   assert.equal(result.summary.regions_seen, 1);
   assert.equal(result.summary.regions_total, 2);
   assert.ok(result.errors.some((line) => /Region scope truncated to 1 of 2/.test(line)));
   assert.ok(result.errors.some((line) => /s3:ListBuckets: inventory truncated/.test(line)));
+  assert.ok(result.errors.some((line) => /rds:DescribeDBInstances us-east-1: AccessDenied/.test(line)), "the RDS denial is recorded in errors");
+  assert.ok(result.errors.some((line) => /kms:GetKeyRotationStatus .*k-customer.*: AccessDenied/.test(line)), "the rotation denial is recorded in errors");
+});
+
+test("assessAwsDataProtection names the DescribeRegions failure when the scope falls back to the configured region", async () => {
+  const result = await assessAwsDataProtection(compliantDataProtectionClient({
+    async describeRegions() {
+      throw accessDenied("UnauthorizedOperation");
+    },
+  }));
+  assert.equal(result.summary.regions_seen, 1);
+  for (const id of ["AWS-DATA-12", "AWS-DATA-22"]) {
+    const item = findingById(result, id);
+    assert.equal(item.status, "warn", `${id} is capped while the region list is unreadable`);
+    assert.match(item.summary, /only us-east-1 was assessed because the enabled-region list could not be read \(ec2:DescribeRegions: AccessDenied/);
+    assert.equal(item.evidence.source, "configured-region-fallback");
+    assert.match(item.evidence.scope_error, /^ec2:DescribeRegions: AccessDenied/);
+  }
+  assert.ok(result.errors.some((line) => /^Region scope fell back to us-east-1 only: ec2:DescribeRegions: AccessDenied/.test(line)));
 });
 
 test("assessAwsDataProtection warns when customer keys exist but none can auto-rotate, and fails on public policies only with restrict", async () => {
@@ -1126,7 +1511,7 @@ function compliantIdentityClient(overrides = {}) {
       return { MinimumPasswordLength: 16, RequireSymbols: true, RequireNumbers: true, RequireUppercaseCharacters: true, RequireLowercaseCharacters: true };
     },
     async listIamUsers() {
-      return [{ UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" }];
+      return paged([{ UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" }]);
     },
     async listMfaDevices() {
       return [{ SerialNumber: "mfa-alice" }];
@@ -1138,7 +1523,7 @@ function compliantIdentityClient(overrides = {}) {
       return null;
     },
     async getAccountAuthorizationDetails() {
-      return [];
+      return paged([]);
     },
     async lookupRootEvents() {
       return { items: [], truncated: false };
@@ -1206,10 +1591,10 @@ test("assessAwsIdentity URL-decodes IAM documents and survives a literal % in in
   const fullAdmin = { Sid: "Allow100%Admin", Effect: "Allow", Action: "*", Resource: "*" };
   const result = await assessAwsIdentity(compliantIdentityClient({
     async getAccountAuthorizationDetails() {
-      return [
+      return paged([
         { RoleName: "EncodedInline", Arn: "arn:aws:iam::123456789012:role/EncodedInline", RolePolicyList: [{ PolicyName: "admin", PolicyDocument: encodeURIComponent(JSON.stringify({ Statement: [fullAdmin] })) }] },
         { RoleName: "RawInline", Arn: "arn:aws:iam::123456789012:role/RawInline", RolePolicyList: [{ PolicyName: "admin", PolicyDocument: JSON.stringify({ Statement: [fullAdmin] }) }] },
-      ];
+      ]);
     },
     async getPolicyVersionDocument(arn) {
       const document = JSON.stringify({ Statement: [arn.endsWith("/Deploy") ? fullAdmin : { Sid: "Read50%", Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::audit/q%202026/*" }] });
@@ -1346,22 +1731,22 @@ function compliantOrgClient(overrides = {}) {
       return { Id: "o-example", FeatureSet: "ALL" };
     },
     async listAccounts() {
-      return [{ Id: "123456789012" }];
+      return paged([{ Id: "123456789012" }]);
     },
     async listScps() {
-      return [{ Id: "p-1", Name: "DenyRegions" }];
+      return paged([{ Id: "p-1", Name: "DenyRegions" }]);
     },
     async listPolicyTargets() {
-      return [{ TargetId: "r-root", Type: "ROOT" }];
+      return paged([{ TargetId: "r-root", Type: "ROOT" }]);
     },
     async listAnalyzers() {
-      return [{ arn: "arn:analyzer", status: "ACTIVE" }];
+      return paged([{ arn: "arn:analyzer", name: "org-analyzer", status: "ACTIVE" }]);
     },
     async listAccessAnalyzerFindings() {
-      return [];
+      return paged([]);
     },
     async listIdentityCenterInstances() {
-      return [{ InstanceArn: "arn:sso" }];
+      return paged([{ InstanceArn: "arn:sso" }]);
     },
     async listActiveAuditManagerAssessments() {
       return { items: [{ id: "a-1", name: "FedRAMP Moderate", status: "ACTIVE", complianceType: "FedRAMP", lastUpdated: "2026-04-01T00:00:00Z" }], truncated: false };
@@ -1428,4 +1813,1654 @@ test("assessAwsOrgGuardrails goes manual on AccessDenied and warns on incomplete
   assert.match(findingById(partial, "AWS-ORG-06").summary, /without creation or update timestamps/);
   assert.equal(findingById(partial, "AWS-ORG-07").status, "warn");
   assert.match(findingById(partial, "AWS-ORG-07").summary, /missing a phone number/);
+});
+
+test("rule 1 corollary: assessAwsOrgGuardrails never passes a control whose secondary read was denied, one secondary at a time", async () => {
+  assertOnlyDemoted(await assessAwsOrgGuardrails(compliantOrgClient()), {}, "healthy fixture");
+
+  const accounts = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listAccounts() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(accounts, { "AWS-ORG-01": "warn" }, "ListAccounts denied");
+  assert.match(findingById(accounts, "AWS-ORG-01").summary, /is visible, but its member accounts could not be listed\. Downgraded to warn: member accounts unreadable \(organizations:ListAccounts: AccessDenied/);
+  assert.doesNotMatch(findingById(accounts, "AWS-ORG-01").summary, /0 account\(s\)/);
+  assert.equal(findingById(accounts, "AWS-ORG-01").evidence.accounts_readable, false);
+  assert.deepEqual(accounts.errors.map((line) => line.split(":").slice(0, 2).join(":")), ["organizations:ListAccounts"]);
+
+  const targetsAll = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listPolicyTargets() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(targetsAll, { "AWS-ORG-02": "manual" }, "ListTargetsForPolicy denied for every SCP");
+  assert.match(findingById(targetsAll, "AWS-ORG-02").summary, /1 SCP\(s\) exist, but targets could not be read for 1 of them \(organizations:ListTargetsForPolicy DenyRegions: AccessDenied/);
+  assert.doesNotMatch(findingById(targetsAll, "AWS-ORG-02").summary, /none is attached/);
+  assert.deepEqual(findingById(targetsAll, "AWS-ORG-02").evidence.scps_targets_unreadable, ["DenyRegions"]);
+
+  const targetsOne = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listScps() {
+      return paged([{ Id: "p-1", Name: "DenyRegions" }, { Id: "p-2", Name: "DenyLeaveOrg" }]);
+    },
+    async listPolicyTargets(policyId) {
+      if (policyId === "p-2") throw accessDenied();
+      return paged([{ TargetId: "r-root", Type: "ROOT" }]);
+    },
+  }));
+  assertOnlyDemoted(targetsOne, { "AWS-ORG-02": "warn" }, "ListTargetsForPolicy denied for one SCP");
+  assert.match(findingById(targetsOne, "AWS-ORG-02").summary, /^1\/2 SCPs are attached.*Downgraded to warn: ListTargetsForPolicy unreadable for 1 SCP\(s\) \(DenyLeaveOrg\)/);
+  assert.equal(findingById(targetsOne, "AWS-ORG-02").evidence.attached_scp_count, 1);
+
+  const findingsAll = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listAccessAnalyzerFindings() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(findingsAll, { "AWS-ORG-04": "manual" }, "ListFindings denied for the only analyzer");
+  assert.match(findingById(findingsAll, "AWS-ORG-04").summary, /Findings could not be read for any of the 1 active analyzer\(s\) \(access-analyzer:ListFindings org-analyzer: AccessDenied/);
+  assert.doesNotMatch(findingById(findingsAll, "AWS-ORG-04").summary, /No active Access Analyzer findings/);
+  assert.equal(findingById(findingsAll, "AWS-ORG-04").evidence.analyzers_sampled, null, "no analyzer was sampled, so the list is unread rather than empty");
+  assert.deepEqual(findingById(findingsAll, "AWS-ORG-04").evidence.analyzers_findings_unreadable, ["org-analyzer"]);
+  assert.equal(findingById(findingsAll, "AWS-ORG-03").status, "pass", "the analyzer list itself stays readable evidence");
+
+  const findingsOne = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listAnalyzers() {
+      return paged([
+        { arn: "arn:analyzer/org", name: "org-analyzer", status: "ACTIVE" },
+        { arn: "arn:analyzer/unused", name: "unused-access", status: "ACTIVE" },
+      ]);
+    },
+    async listAccessAnalyzerFindings(analyzerArn) {
+      if (analyzerArn === "arn:analyzer/unused") throw accessDenied();
+      return paged([]);
+    },
+  }));
+  assertOnlyDemoted(findingsOne, { "AWS-ORG-04": "warn" }, "ListFindings denied for one of two analyzers");
+  assert.match(findingById(findingsOne, "AWS-ORG-04").summary, /No active Access Analyzer findings were visible in the 1 sampled analyzer\(s\)\. Downgraded to warn: ListFindings unreadable for 1 analyzer\(s\) \(unused-access\)/);
+  assert.deepEqual(findingById(findingsOne, "AWS-ORG-04").evidence.analyzers_sampled, ["org-analyzer"]);
+
+  const identityCenter = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listIdentityCenterInstances() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(identityCenter, { "AWS-ORG-05": "manual" }, "sso:ListInstances denied");
+  assert.match(findingById(identityCenter, "AWS-ORG-05").summary, /could not be listed \(sso:ListInstances: AccessDenied/);
+  assert.equal(findingById(identityCenter, "AWS-ORG-05").evidence.instances_readable, false);
+});
+
+test("assessAwsOrgGuardrails renders manual when the analyzer list is denied or no analyzer is ACTIVE, and describes organization state honestly", async () => {
+  const analyzersDenied = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listAnalyzers() {
+      throw accessDenied();
+    },
+    async listAccessAnalyzerFindings() {
+      throw new Error("findings must not be sampled without an analyzer list");
+    },
+  }));
+  assertOnlyDemoted(analyzersDenied, { "AWS-ORG-03": "manual", "AWS-ORG-04": "manual" }, "ListAnalyzers denied");
+  assert.match(findingById(analyzersDenied, "AWS-ORG-04").summary, /analyzers could not be listed \(access-analyzer:ListAnalyzers: AccessDenied.*so external access findings could not be sampled/);
+  assert.equal(analyzersDenied.errors.length, 1);
+
+  const noneActive = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listAnalyzers() {
+      return paged([{ arn: "arn:analyzer/new", name: "creating", status: "CREATING" }]);
+    },
+  }));
+  assertOnlyDemoted(noneActive, { "AWS-ORG-03": "fail", "AWS-ORG-04": "manual" }, "no ACTIVE analyzer");
+  assert.match(findingById(noneActive, "AWS-ORG-04").summary, /No ACTIVE Access Analyzer instance was available to sample \(see AWS-ORG-03\)/);
+  assert.deepEqual(noneActive.errors, []);
+
+  const orgDenied = await assessAwsOrgGuardrails(compliantOrgClient({
+    async describeOrganization() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(orgDenied, { "AWS-ORG-01": "manual" }, "DescribeOrganization denied");
+  assert.match(findingById(orgDenied, "AWS-ORG-01").summary, /could not be described \(organizations:DescribeOrganization: AccessDenied/);
+  assert.equal(findingById(orgDenied, "AWS-ORG-01").evidence.organization_readable, false);
+  assert.equal(findingById(orgDenied, "AWS-ORG-02").status, "pass", "SCPs are governed by a separate IAM action and stay readable evidence");
+
+  const calls = [];
+  const standalone = await assessAwsOrgGuardrails(compliantOrgClient({
+    async describeOrganization() {
+      return null;
+    },
+    async listAccounts() {
+      calls.push("listAccounts");
+      return paged([]);
+    },
+    async listScps() {
+      calls.push("listScps");
+      return paged([]);
+    },
+  }));
+  assertOnlyDemoted(standalone, { "AWS-ORG-01": "warn", "AWS-ORG-02": "warn" }, "standalone account");
+  assert.match(findingById(standalone, "AWS-ORG-01").summary, /AWSOrganizationsNotInUseException.*standalone account/);
+  assert.match(findingById(standalone, "AWS-ORG-02").summary, /not part of an AWS Organization/);
+  assert.deepEqual(calls, [], "account and SCP lists are skipped for a standalone account");
+  assert.equal(findingById(standalone, "AWS-ORG-01").evidence.accounts_readable, null);
+  assert.deepEqual(standalone.errors, []);
+});
+
+test("rule 10: assessAwsOrgGuardrails caps truncated account, SCP, target, analyzer, and findings lists at warn", async () => {
+  const result = await assessAwsOrgGuardrails(compliantOrgClient({
+    async listAccounts() {
+      return paged([{ Id: "123456789012" }], true);
+    },
+    async listScps() {
+      return paged([{ Id: "p-1", Name: "DenyRegions" }], true);
+    },
+    async listPolicyTargets() {
+      return paged([{ TargetId: "r-root", Type: "ROOT" }], true);
+    },
+    async listAnalyzers() {
+      return paged([{ arn: "arn:analyzer", name: "org-analyzer", status: "ACTIVE" }], true);
+    },
+    async listAccessAnalyzerFindings() {
+      return paged([], true);
+    },
+  }), { maxFindings: 25 });
+  assertOnlyDemoted(result, { "AWS-ORG-01": "warn", "AWS-ORG-02": "warn", "AWS-ORG-03": "warn", "AWS-ORG-04": "warn" }, "truncated lists");
+  assert.match(findingById(result, "AWS-ORG-01").summary, /Downgraded to warn: account list truncated at 1000/);
+  assert.equal(findingById(result, "AWS-ORG-01").evidence.account_list_truncated, true);
+  assert.match(findingById(result, "AWS-ORG-02").summary, /Downgraded to warn: SCP list truncated at 1000; target list truncated for 1 SCP\(s\)/);
+  assert.match(findingById(result, "AWS-ORG-03").summary, /Downgraded to warn: analyzer list truncated at 100/);
+  assert.match(findingById(result, "AWS-ORG-04").summary, /Downgraded to warn: findings truncated at 25 for org-analyzer/);
+  assert.deepEqual(findingById(result, "AWS-ORG-04").evidence.analyzers_findings_truncated, ["org-analyzer"]);
+});
+
+test("rule 9: assessAwsOrgGuardrails keeps the security contact's name and title out of the evidence", async () => {
+  const result = await assessAwsOrgGuardrails(compliantOrgClient());
+  const contact = findingById(result, "AWS-ORG-07");
+  assert.equal(contact.status, "pass");
+  assert.equal(contact.evidence.has_name, true);
+  assert.equal(contact.evidence.has_title, true);
+  assert.equal(contact.evidence.has_phone, true);
+  const serialized = JSON.stringify(result);
+  for (const value of ["Security Team", "CISO", "security@example.com", "+1 555 0100"]) {
+    assert.ok(!serialized.includes(value), `${value} must not appear anywhere in the org guardrails result`);
+  }
+});
+
+test("rule 10: assessAwsIdentity caps user and role verdicts at warn when the inventories are truncated and records the cut in errors", async () => {
+  const result = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      return paged([{ UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" }], true);
+    },
+    async getAccountAuthorizationDetails() {
+      return paged([], true);
+    },
+  }), { userLimit: 1, roleLimit: 1 });
+  assertOnlyDemoted(result, { "AWS-IAM-02": "warn", "AWS-IAM-04": "warn", "AWS-IAM-05": "warn", "AWS-IAM-06": "warn" }, "truncated user and role inventories");
+  for (const id of ["AWS-IAM-02", "AWS-IAM-04", "AWS-IAM-06"]) {
+    assert.match(findingById(result, id).summary, /Downgraded to warn: user inventory truncated at 1/, id);
+    assert.equal(findingById(result, id).evidence.user_inventory_truncated, true, id);
+  }
+  assert.match(findingById(result, "AWS-IAM-05").summary, /Downgraded to warn: role inventory truncated at 1/);
+  assert.equal(findingById(result, "AWS-IAM-05").evidence.role_inventory_truncated, true);
+  assert.equal(result.summary.user_inventory_truncated, true);
+  assert.equal(result.summary.role_inventory_truncated, true);
+  assert.ok(result.errors.some((line) => /^iam:ListUsers: inventory truncated at user_limit 1/.test(line)));
+  assert.ok(result.errors.some((line) => /^iam:GetAccountAuthorizationDetails Filter=Role: inventory truncated at role_limit 1/.test(line)));
+});
+
+test("rule 1 corollary: assessAwsIdentity never passes a user control whose per-user read was denied, one secondary at a time", async () => {
+  const twoUsers = {
+    async listIamUsers() {
+      return paged([
+        { UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" },
+        { UserName: "bob", PasswordLastUsed: "2026-04-13T00:00:00Z" },
+      ]);
+    },
+  };
+  assertOnlyDemoted(await assessAwsIdentity(compliantIdentityClient(twoUsers)), {}, "two-user fixture");
+
+  const mfaOne = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listMfaDevices(userName) {
+      if (userName === "bob") throw accessDenied();
+      return [{ SerialNumber: "mfa-alice" }];
+    },
+  }));
+  assertOnlyDemoted(mfaOne, { "AWS-IAM-02": "warn" }, "ListMFADevices denied for one user");
+  assert.match(findingById(mfaOne, "AWS-IAM-02").summary, /All 1 sampled IAM users with readable device lists have MFA devices\. Downgraded to warn: ListMFADevices unreadable for 1 user\(s\) \(bob\)/);
+  assert.deepEqual(findingById(mfaOne, "AWS-IAM-02").evidence.users_mfa_unreadable, ["bob"]);
+  assert.deepEqual(findingById(mfaOne, "AWS-IAM-02").evidence.users_without_mfa, [], "an unreadable device list is not reported as a missing device");
+  assert.ok(mfaOne.errors.some((line) => /^iam:ListMFADevices bob: AccessDenied/.test(line)));
+
+  const mfaAll = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listMfaDevices() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(mfaAll, { "AWS-IAM-02": "manual" }, "ListMFADevices denied for every user");
+  assert.match(findingById(mfaAll, "AWS-IAM-02").summary, /MFA devices could not be listed for any of the 2 sampled IAM users \(iam:ListMFADevices alice: AccessDenied/);
+
+  const keysOne = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listAccessKeys(userName) {
+      if (userName === "bob") throw accessDenied();
+      return [];
+    },
+  }));
+  assertOnlyDemoted(keysOne, { "AWS-IAM-04": "warn", "AWS-IAM-06": "warn" }, "ListAccessKeys denied for one user");
+  assert.match(findingById(keysOne, "AWS-IAM-04").summary, /No sampled access key exceeded the 90-day staleness threshold\. Downgraded to warn: ListAccessKeys unreadable for 1 user\(s\) \(bob\)/);
+  assert.match(findingById(keysOne, "AWS-IAM-06").summary, /Downgraded to warn: ListAccessKeys unreadable for 1 user\(s\) \(bob\)/);
+  assert.deepEqual(findingById(keysOne, "AWS-IAM-04").evidence.users_keys_unreadable, ["bob"]);
+
+  const keysAll = await assessAwsIdentity(compliantIdentityClient({
+    ...twoUsers,
+    async listAccessKeys() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(keysAll, { "AWS-IAM-04": "manual", "AWS-IAM-06": "warn" }, "ListAccessKeys denied for every user");
+  assert.match(findingById(keysAll, "AWS-IAM-04").summary, /Access keys could not be listed for any of the 2 sampled IAM users \(iam:ListAccessKeys alice: AccessDenied/);
+
+  const noPasswordUser = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      return paged([{ UserName: "svc-deploy" }]);
+    },
+    async listAccessKeys() {
+      throw accessDenied();
+    },
+  }));
+  assert.equal(findingById(noPasswordUser, "AWS-IAM-06").status, "warn");
+  assert.deepEqual(findingById(noPasswordUser, "AWS-IAM-06").evidence.dormant_users, [], "a user without password activity is not called dormant while its key list is unreadable");
+  assert.match(findingById(noPasswordUser, "AWS-IAM-06").summary, /Downgraded to warn: ListAccessKeys unreadable for 1 user\(s\) \(svc-deploy\)/);
+
+  const lastUsed = await assessAwsIdentity(compliantIdentityClient({
+    async listAccessKeys() {
+      return [{ AccessKeyId: RAW_ACCESS_KEY_ID, CreateDate: "2026-04-01T00:00:00Z" }];
+    },
+    async getAccessKeyLastUsed() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(lastUsed, { "AWS-IAM-04": "manual" }, "GetAccessKeyLastUsed denied for the only sampled key");
+  assert.ok(
+    findingById(lastUsed, "AWS-IAM-04").summary.startsWith(`Last-used dates could not be read for any of the 1 sampled access key(s) (iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied`),
+    findingById(lastUsed, "AWS-IAM-04").summary,
+  );
+  assert.match(findingById(lastUsed, "AWS-IAM-04").summary, /no key was judged/);
+  assert.deepEqual(findingById(lastUsed, "AWS-IAM-04").evidence.keys_last_used_unreadable, [MASKED_ACCESS_KEY_ID]);
+  // No key was judged, so the stale list and the judged count are unread (null), not an empty list beside an unreadable key.
+  assert.deepEqual(
+    { stale: findingById(lastUsed, "AWS-IAM-04").evidence.stale_access_keys, judged: findingById(lastUsed, "AWS-IAM-04").evidence.keys_judged, summaryStale: lastUsed.summary.stale_access_keys, summaryJudged: lastUsed.summary.keys_judged },
+    { stale: null, judged: null, summaryStale: null, summaryJudged: null },
+    "an unjudged key is never listed as stale, and 0 never stands beside the unreadable key",
+  );
+  assert.equal(lastUsed.summary.keys_last_used_unreadable, 1);
+  assert.ok(lastUsed.errors.some((line) => line.startsWith(`iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied`)), "the error line carries the masked key id only");
+  assertNoCanaryWindows(assert, lastUsed, [RAW_ACCESS_KEY_ID], "last-used evidence");
+
+  // The review-round fixture: svc-deploy holds a key older than the threshold whose last use is denied. The creation
+  // date must not stand in for the denied last-used date, so the user is never failed on evidence the run did not see.
+  const oldKeyDenied = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      return paged([
+        { UserName: "alice", PasswordLastUsed: "2026-04-14T00:00:00Z" },
+        { UserName: "svc-deploy", PasswordLastUsed: "2026-04-13T00:00:00Z" },
+      ]);
+    },
+    async listAccessKeys(userName) {
+      if (userName === "svc-deploy") return [{ AccessKeyId: RAW_ACCESS_KEY_ID, CreateDate: "2024-01-01T00:00:00Z" }];
+      return [{ AccessKeyId: "AKIAALICEKEY00000001", CreateDate: "2026-04-01T00:00:00Z" }];
+    },
+    async getAccessKeyLastUsed(accessKeyId) {
+      if (accessKeyId === RAW_ACCESS_KEY_ID) throw accessDenied();
+      return { LastUsedDate: "2026-04-15T00:00:00Z" };
+    },
+  }));
+  assertOnlyDemoted(oldKeyDenied, { "AWS-IAM-04": "warn" }, "GetAccessKeyLastUsed denied for one of two sampled keys");
+  const oldKeyFinding = findingById(oldKeyDenied, "AWS-IAM-04");
+  assert.notEqual(oldKeyFinding.status, "fail", "a user is never failed on a key whose last use was unreadable");
+  assert.deepEqual(oldKeyFinding.evidence.stale_access_keys, [], "the 2024 key is not judged stale by its creation date");
+  assert.deepEqual(oldKeyFinding.evidence.keys_last_used_unreadable, [MASKED_ACCESS_KEY_ID]);
+  assert.ok(
+    oldKeyFinding.summary.includes(`No sampled access key exceeded the 90-day staleness threshold. Downgraded to warn: GetAccessKeyLastUsed unreadable for 1 key(s) (${MASKED_ACCESS_KEY_ID}); those keys were not judged and need a manual last-used review`),
+    oldKeyFinding.summary,
+  );
+  // One of two keys was judged: the stale count is 0 of the 1 judged key, stated beside the judged count and the unreadable key.
+  assert.deepEqual(
+    { stale: oldKeyFinding.evidence.stale_access_keys, judged: oldKeyFinding.evidence.keys_judged, sampled: oldKeyFinding.evidence.keys_sampled, summary: { stale: oldKeyDenied.summary.stale_access_keys, judged: oldKeyDenied.summary.keys_judged, unreadable: oldKeyDenied.summary.keys_last_used_unreadable } },
+    { stale: [], judged: 1, sampled: 2, summary: { stale: 0, judged: 1, unreadable: 1 } },
+    "a partially judged sample renders its stale count beside the number judged",
+  );
+  assertNoCanaryWindows(assert, oldKeyDenied, [RAW_ACCESS_KEY_ID], "denied last-used evidence");
+});
+
+test("assessAwsIdentity renders manual, never fail, when a primary IAM read is denied", async () => {
+  const summary = await assessAwsIdentity(compliantIdentityClient({
+    async getAccountSummary() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(summary, { "AWS-IAM-01": "manual" }, "GetAccountSummary denied");
+  assert.match(findingById(summary, "AWS-IAM-01").summary, /could not be read \(iam:GetAccountSummary: AccessDenied/);
+
+  const password = await assessAwsIdentity(compliantIdentityClient({
+    async getPasswordPolicy() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(password, { "AWS-IAM-03": "manual" }, "GetAccountPasswordPolicy denied");
+  assert.match(findingById(password, "AWS-IAM-03").summary, /could not be read \(iam:GetAccountPasswordPolicy: AccessDenied/);
+  assert.doesNotMatch(findingById(password, "AWS-IAM-03").summary, /No account password policy/);
+  assert.equal(findingById(password, "AWS-IAM-03").evidence.password_policy_readable, false);
+
+  const noPolicy = await assessAwsIdentity(compliantIdentityClient({
+    async getPasswordPolicy() {
+      return null;
+    },
+  }));
+  assertOnlyDemoted(noPolicy, { "AWS-IAM-03": "fail" }, "no password policy configured");
+  assert.match(findingById(noPolicy, "AWS-IAM-03").summary, /No account password policy is configured \(GetAccountPasswordPolicy returned NoSuchEntity\)/);
+
+  const users = await assessAwsIdentity(compliantIdentityClient({
+    async listIamUsers() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(users, { "AWS-IAM-02": "manual", "AWS-IAM-04": "manual", "AWS-IAM-06": "manual" }, "ListUsers denied");
+  assert.match(findingById(users, "AWS-IAM-02").summary, /IAM users could not be listed \(iam:ListUsers: AccessDenied/);
+  assert.equal(findingById(users, "AWS-IAM-02").evidence.users_readable, false);
+
+  const roles = await assessAwsIdentity(compliantIdentityClient({
+    async getAccountAuthorizationDetails() {
+      throw accessDenied();
+    },
+  }));
+  assertOnlyDemoted(roles, { "AWS-IAM-05": "manual" }, "GetAccountAuthorizationDetails denied");
+  assert.match(findingById(roles, "AWS-IAM-05").summary, /IAM roles could not be read \(iam:GetAccountAuthorizationDetails Filter=Role: AccessDenied/);
+  assert.equal(roles.errors.length, 1);
+});
+
+test("assessAwsNetworkSecurity names the DescribeRegions failure when the scope falls back to the configured region", async () => {
+  const result = await assessAwsNetworkSecurity(compliantNetworkClient({
+    async describeRegions() {
+      throw accessDenied("UnauthorizedOperation");
+    },
+  }));
+  for (const id of ["AWS-NET-14", "AWS-NET-20", "AWS-NET-21"]) {
+    const item = findingById(result, id);
+    assert.equal(item.status, "warn", `${id} is capped while the region list is unreadable`);
+    assert.match(item.summary, /only us-east-1 was assessed because the enabled-region list could not be read \(ec2:DescribeRegions: AccessDenied/);
+    assert.equal(item.evidence.source, "configured-region-fallback");
+  }
+  assert.ok(result.errors.some((line) => /^Region scope fell back to us-east-1 only: ec2:DescribeRegions: AccessDenied/.test(line)));
+});
+
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check). The contact email's canary is its
+ * local part and the phone's is its digits; the domain and the dialing prefix are legitimate text.
+ */
+const FAKE_AWS_SECRETS = {
+  accessKeyId: RAW_ACCESS_KEY_ID,
+  contactName: "UzJmyw4Cp8MNezmK",
+  contactTitle: "v2rpGAgG74uwFcGs",
+  contactEmail: "VyrQ3HB5ZSp2@example.test",
+  contactPhone: "+1 555 5835367",
+};
+const FAKE_AWS_CANARIES = Object.values(FAKE_AWS_SECRETS).map((value) => value.split("@")[0].replace(/^\+1 555 /, ""));
+
+test("verdict rule 9: exportAwsAuditBundle never writes access key ids or the security contact's identity into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-aws-secrets-");
+  const client = compliantBundleClient({
+    async listAccessKeys() {
+      return [{ AccessKeyId: FAKE_AWS_SECRETS.accessKeyId, CreateDate: "2025-01-01T00:00:00Z" }];
+    },
+    async getAccessKeyLastUsed() {
+      return { LastUsedDate: "2025-01-02T00:00:00Z" };
+    },
+    async getSecurityAlternateContact() {
+      return {
+        AlternateContactType: "SECURITY",
+        Name: FAKE_AWS_SECRETS.contactName,
+        Title: FAKE_AWS_SECRETS.contactTitle,
+        EmailAddress: FAKE_AWS_SECRETS.contactEmail,
+        PhoneNumber: FAKE_AWS_SECRETS.contactPhone,
+      };
+    },
+  });
+
+  const result = await exportAwsAuditBundle(client, sampleConfig(), base);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size > 10);
+  assert.equal(entries.size, files.size, "every written file is in the zip");
+  assertNoCanaryWindowsInFiles(assert, files, FAKE_AWS_CANARIES, "bundle files");
+  assertNoCanaryWindowsInFiles(assert, entries, FAKE_AWS_CANARIES, "zip entries");
+
+  const findings = JSON.parse(files.get("analysis/findings.json"));
+  const keyRotation = findings.find((item) => item.id === "AWS-IAM-04");
+  assert.equal(keyRotation.status, "fail", "the stale key is still reported");
+  assert.deepEqual(keyRotation.evidence.stale_access_keys.map((key) => key.accessKeyId), [MASKED_ACCESS_KEY_ID]);
+  const contact = findings.find((item) => item.id === "AWS-ORG-07");
+  assert.equal(contact.status, "pass");
+  assert.equal(contact.evidence.email_domain, "@example.test");
+  assert.match(contact.summary, /\*\*\*@example\.test/);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Real-client coverage: the tests below drive AwsAuditorClient itself through the shared SDK send() so request
+// shapes, SDK error decoration, and the error-string sink are exercised end to end (see helpers/aws-sdk-fixture).
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Probe names in core_data/access.json keyed by the IAM action each probe issues. */
+const ACCESS_PROBES = {
+  "iam:GetAccountSummary": "iam_summary",
+  "iam:ListUsers": "iam_users",
+  "cloudtrail:DescribeTrails": "cloudtrail",
+  "securityhub:GetEnabledStandards": "security_hub",
+  "config:DescribeConfigurationRecorders": "config",
+  "guardduty:ListDetectors": "guardduty",
+  "access-analyzer:ListAnalyzers": "access_analyzer",
+  "organizations:DescribeOrganization": "organizations",
+  "sso:ListInstances": "identity_center",
+  "ec2:DescribeRegions": "ec2_regions",
+  "s3:ListBuckets": "s3_buckets",
+  "kms:ListKeys": "kms_keys",
+  "rds:DescribeDBInstances": "rds_instances",
+  "auditmanager:ListAssessments": "audit_manager",
+  "account:GetAlternateContact": "account_contacts",
+};
+
+/**
+ * Summary leaves that depend on each command and must render null, never a defaulted count or flag, when that
+ * command fails. Keys are analysis files; values are the summary fields of that assessment.
+ */
+const DEPENDENT_SUMMARY_LEAVES = {
+  "iam:GetAccountSummary": {},
+  "iam:GetAccountPasswordPolicy": {},
+  "iam:ListUsers": { identity: ["users", "user_inventory_truncated", "users_without_mfa", "stale_access_keys", "keys_last_used_unreadable", "dormant_users"] },
+  "iam:ListMFADevices": {},
+  "iam:ListAccessKeys": {},
+  "iam:GetAccessKeyLastUsed": {},
+  "iam:GetAccountAuthorizationDetails": { identity: ["roles", "role_inventory_truncated", "privileged_roles", "roles_without_boundaries"] },
+  "iam:ListPolicies": { identity: ["customer_managed_policies", "full_admin_policies_attached"] },
+  "iam:GetPolicyVersion": {},
+  "cloudtrail:LookupEvents": { identity: ["root_console_logins"] },
+  "cloudtrail:DescribeTrails": { "logging-detection": ["trails", "compliant_trails"] },
+  "cloudtrail:GetTrailStatus": { "logging-detection": ["compliant_trails"] },
+  "cloudtrail:GetEventSelectors": {},
+  "securityhub:DescribeHub": { "logging-detection": ["security_hub_enabled", "security_hub_standards"] },
+  "securityhub:GetEnabledStandards": { "logging-detection": ["security_hub_standards"] },
+  "config:DescribeConfigurationRecorders": { "logging-detection": ["config_recorders", "recording_config_recorders"] },
+  "config:DescribeConfigurationRecorderStatus": { "logging-detection": ["recording_config_recorders"] },
+  "guardduty:ListDetectors": { "logging-detection": ["guardduty_detectors", "enabled_guardduty_detectors"] },
+  "guardduty:GetDetector": { "logging-detection": ["enabled_guardduty_detectors"] },
+  "organizations:DescribeOrganization": { "org-guardrails": ["organization_visible"] },
+  "organizations:ListAccounts": { "org-guardrails": ["accounts"] },
+  "organizations:ListPolicies": { "org-guardrails": ["scps", "attached_scps"] },
+  "organizations:ListTargetsForPolicy": { "org-guardrails": ["attached_scps"] },
+  "access-analyzer:ListAnalyzers": { "org-guardrails": ["analyzers", "active_analyzers", "active_external_findings"] },
+  "access-analyzer:ListFindings": { "org-guardrails": ["active_external_findings"] },
+  "sso:ListInstances": { "org-guardrails": ["identity_center_instances"] },
+  "auditmanager:ListAssessments": { "org-guardrails": ["audit_manager_active_assessments"] },
+  "account:GetAlternateContact": { "org-guardrails": ["security_contact_configured"] },
+  "ec2:DescribeRegions": { "data-protection": ["regions_total"], "network-security": ["regions_total"] },
+  "s3control:GetPublicAccessBlock": { "data-protection": ["buckets_without_full_block"] },
+  "s3:ListBuckets": { "data-protection": ["buckets", "buckets_without_full_block", "buckets_without_bucket_level_block", "buckets_with_public_policy", "buckets_without_default_encryption", "buckets_without_tls_deny"] },
+  "s3:GetPublicAccessBlock": {},
+  "s3:GetBucketPolicyStatus": {},
+  "s3:GetBucketEncryption": {},
+  "s3:GetBucketPolicy": {},
+  "ec2:GetEbsEncryptionByDefault": { "data-protection": ["ebs_regions_without_default_encryption"] },
+  "rds:DescribeDBInstances": { "data-protection": ["rds_instances", "rds_unencrypted"] },
+  "kms:ListKeys": { "data-protection": ["customer_managed_keys", "keys_not_rotating"] },
+  "kms:DescribeKey": { "data-protection": ["customer_managed_keys"] },
+  "kms:GetKeyRotationStatus": {},
+  "ec2:DescribeVpcs": { "network-security": ["vpcs", "vpcs_without_active_flow_logs"] },
+  "ec2:DescribeFlowLogs": { "network-security": ["vpcs_without_active_flow_logs"] },
+  "ec2:DescribeNetworkAcls": { "network-security": ["network_acls", "permissive_network_acls"] },
+  "ec2:DescribeSecurityGroups": { "network-security": ["security_groups", "unrestricted_security_groups"] },
+};
+
+/** Every action the healthy fixture serves other than the run's own identity, which is a primary that fails the tool outright. */
+const SECONDARY_ACTIONS = Object.keys(healthySdkRoutes()).filter((action) => action !== "sts:GetCallerIdentity");
+
+async function runAllAssessments(client) {
+  return {
+    access: await checkAwsAccess(client),
+    identity: await assessAwsIdentity(client),
+    "logging-detection": await assessAwsLoggingDetection(client),
+    "org-guardrails": await assessAwsOrgGuardrails(client),
+    "data-protection": await assessAwsDataProtection(client),
+    "network-security": await assessAwsNetworkSecurity(client),
+  };
+}
+
+/** Flattens an output tree into dotted leaf paths; empty arrays and objects are leaves so a collapse to [] or {} is visible. */
+function leafValues(value, path = "", out = new Map()) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) out.set(path, "[]");
+    for (const [index, item] of value.entries()) leafValues(item, `${path}[${index}]`, out);
+  } else if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value);
+    if (entries.length === 0) out.set(path, "{}");
+    for (const [key, item] of entries) leafValues(item, path ? `${path}.${key}` : key, out);
+  } else {
+    out.set(path, JSON.stringify(value));
+  }
+  return out;
+}
+
+/**
+ * Every leaf that a failed read changes must change to null, an error string, or an explicit marker, never to the
+ * value an empty-but-readable dataset would produce (0, false, [], {}, "none"); readability flags are the one
+ * boolean allowed to flip to false.
+ */
+function assertNoDefaultedLeaves(healthyOutputs, degradedOutputs, label) {
+  const before = leafValues(healthyOutputs);
+  const after = leafValues(degradedOutputs);
+  const changed = [...after].filter(([path, value]) => before.get(path) !== value);
+  assert.ok(changed.length > 0, `${label}: the failed read left every output leaf unchanged, so the failure is invisible`);
+  const defaulted = changed.filter(([path, value]) =>
+    ["0", "false", "[]", "{}", "\"none\""].includes(value)
+    && !/\.(status|summary)$/.test(path)
+    && !/_readable$/.test(path)
+    && !/\.collected$/.test(path));
+  assert.deepEqual(defaulted.map(([path, value]) => `${path} -> ${value}`), [], `${label}: leaves defaulted to an empty-dataset value instead of null`);
+}
+
+/** Planted credentials of the must-keep redaction text: a Basic password, a URL userinfo password, and a signature query value. */
+const AWS_MUST_KEEP_CANARIES = Object.freeze({ basicPassword: "MCuGTqGBG8dmEzse", userinfoPassword: "b4usg7S4JD6bbWTW", signature: "yMsNMGW3jpjWBk5MznMJ" });
+
+/** The secret planted on the malformed line of every shared-config fixture. */
+const SHARED_CONFIG_CANARY = "qf9apUYznyvTJPXKF2dreQwY";
+
+/** Every planted canary an AWS output is swept for, window by window. */
+const AWS_PLANTED_CANARIES = Object.freeze([
+  ...Object.values(AWS_CANARIES),
+  ...Object.values(CANARY),
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...FAKE_AWS_CANARIES,
+  ...Object.values(AWS_MUST_KEEP_CANARIES),
+  SHARED_CONFIG_CANARY,
+]);
+
+function assertNoCanaries(text, label) {
+  assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, label);
+}
+
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the resolved secret access key is a configured secret removed in every encoded form, and the fixed texts survive", async () => {
+  // The secret arrives the way a real run's does: resolved by the guarded fromIni provider from the shared credentials file.
+  await withSharedAwsFiles({ credentials: ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key = ${ENCODED_FORM_SECRET}`, ""].join("\n") }, async () => {
+    let resolved;
+    const routes = {
+      ...healthySdkRoutes(),
+      "sts:GetCallerIdentity": async (input, region, sdk) => {
+        resolved = await sdk.resolveCredentials();
+        return healthySdkRoutes()["sts:GetCallerIdentity"]();
+      },
+    };
+    await withSdkRoutes(routes, [], () => realAwsClient(realAwsConfig({ profile: "audit" })).getCallerIdentity());
+    assert.equal(resolved?.secretAccessKey, ENCODED_FORM_SECRET, "positive control: the provider resolved the planted secret verbatim");
+  });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      `iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied (AccessDeniedException (HTTP 403): User is not authorized to perform this operation (AccessDeniedException))`,
+      "credentials could not be resolved by fromIni (profile audit) (CredentialsProviderError ENOENT). The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in ~/.aws/credentials and ~/.aws/config.",
+      "SyntaxError (HTTP 502): non-JSON body (text/html, 5120 bytes)",
+      "SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
+      "arn:aws:cloudtrail:us-east-1:123456789012:trail/management-events-2026",
+      "only 1 of 17 regions assessed (ec2:DescribeRegions us-east-1: AccessDeniedException (HTTP 403))",
+      "bucket cloudtrail-logs-123456789012-us-east-1 has no bucket policy (s3:GetBucketPolicy NoSuchBucketPolicy (HTTP 404))",
+      ...awsFixedTexts(),
+    ],
+  });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through every AwsApiError, IncompleteResponse, and AwsCredentialProviderError rendering to the region-scope, not_readable, and downgrade wordings", () => {
+  const texts = awsFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 45 });
+  const denied = "AccessDeniedException (HTTP 403): User is not authorized to perform this operation";
+  for (const required of [
+    "response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
+    "SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
+    "SyntaxError (HTTP 502): non-JSON body (text/html, 89 bytes)",
+    "body: not observed",
+    "body: empty, 0 bytes",
+    "body: text/html, 512 bytes",
+    denied,
+    `NoSuchEntity (HTTP 404): The Access Key with id ${maskAccessKeyId("AKIAEXAMPLE000000001")} cannot be found.`,
+    "TimeoutError: Request did not complete within 10000 ms",
+    "HTTP 403",
+    "UnknownError (HTTP 403): rejected",
+    "UnknownError",
+    "IncompleteResponse (HTTP 200): ListUsers answered without its Users member (body: empty, 0 bytes)",
+    "IncompleteResponse (HTTP 200): GetCallerIdentity answered without its Account member (body: text/html, 512 bytes)",
+    "IncompleteResponse: GetAccountSummary answered without its SummaryMap member (body: not observed)",
+    `iam:ListUsers: AccessDenied (${denied})`,
+    `ec2:DescribeVpcs us-east-1: error (IncompleteResponse (HTTP 200): DescribeVpcs answered without its Vpcs member (body: text/xml, 240 bytes))`,
+    `guardduty:GetDetector 12ab****89f0: AccessDenied (${denied})`,
+    `guardduty:GetDetector detector-1: AccessDenied (${denied})`,
+    "Region scope truncated to 1 of 17 regions by region_limit.",
+    "only 1 of 17 regions assessed",
+    "Current AWS account could not be determined.",
+    "14/15 AWS audit surfaces are readable.",
+    "Grant read-only access for the audit principal to the surfaces marked not_readable (iam, ec2); unreadable surfaces render manual findings, never pass.",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => /^credentials could not be resolved by fromIni \(profile audit\) \(CredentialsProviderError ENOENT\)\. The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in .+ and .+\.$/.test(text)), "the credential-provider rendering is in the list");
+  assert.ok(texts.some((text) => /^credentials could not be resolved by fromNodeProviderChain \(default credential chain\) \(UnknownError\)\./.test(text)), "the default-chain rendering with a nameless cause is in the list");
+  assert.ok(texts.some((text) => /^Last-used dates could not be read for any of the 2 sampled access key\(s\) \(iam:GetAccessKeyLastUsed AKIA\*{4}[0-9A-Z]{4}: AccessDenied .*\); no key was judged\./.test(text)), "the no-key-judged wording is in the list");
+
+  // A nameless, message-less SDK error renders as its status alone, never as "[object Object]".
+  assert.equal(new AwsApiError({ $metadata: { httpStatusCode: 403 } }).message, "HTTP 403");
+  assert.ok(!texts.some((text) => text.includes("[object Object]")), "no fixed text stringifies an object");
+
+  // The read label keeps a server-assigned id whole when the scrub keeps it and masks it otherwise, so a
+  // 32-hex GuardDuty detector id (a hex digest to the scrub) still names the detector in the recorded line.
+  assert.equal(labelIdentifier("detector-1"), "detector-1");
+  assert.equal(labelIdentifier("12abc34d567e8fa901bc2d34e56789f0"), "12ab****89f0");
+  assert.equal(redactErrorText(`guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}: AccessDenied (${denied})`), `guardduty:GetDetector 12ab****89f0: AccessDenied (${denied})`);
+  assert.equal(redactErrorText("guardduty:GetDetector 12abc34d567e8fa901bc2d34e56789f0"), "guardduty:GetDetector [REDACTED]", "negative control: the bare 32-hex id is a hex digest to the scrub");
+
+  // The renderings the client throws, built by AwsApiError and AwsCredentialProviderError, survive too.
+  const thrown = [
+    new AwsApiError({ name: "AccessDeniedException", message: "User is not authorized to perform this operation", $metadata: { httpStatusCode: 403 } }),
+    new AwsApiError({ name: "SyntaxError", $metadata: { httpStatusCode: 502 }, $bodyNote: "non-JSON body (text/html, 5120 bytes)" }),
+    new AwsApiError(new SyntaxError("Unexpected token '<', \"<html>\" is not valid JSON")),
+    new AwsApiError({ name: "TimeoutError", message: "Request did not complete within 10000 ms" }),
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }),
+  ];
+  for (const error of thrown) {
+    assert.equal(redactErrorText(error.message), error.message, `the thrown rendering survives the scrub: ${error.message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every command with its region or identifier, name, principal, status text, finding id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const denied = "AccessDeniedException (HTTP 403): User is not authorized to perform this operation";
+  const groups = [
+    {
+      label: "commands",
+      values: [
+        "iam:ListUsers",
+        "iam:GetAccountSummary",
+        "iam:GetAccountPasswordPolicy",
+        `iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}`,
+        "iam:ListMFADevices svc-deploy",
+        "iam:ListAccessKeys alice",
+        "iam:GetPolicyVersion arn:aws:iam::123456789012:policy/ReadOnlyAudit",
+        "sts:GetCallerIdentity",
+        "ec2:DescribeVpcs us-east-1",
+        "ec2:DescribeRegions us-east-1",
+        "ec2:DescribeSecurityGroups us-west-2",
+        "ec2:DescribeFlowLogs us-east-1",
+        "rds:DescribeDBInstances us-east-1",
+        "kms:DescribeKey us-east-1/1234abcd-12ab-34cd-56ef-1234567890ab",
+        "kms:ListKeys us-east-1",
+        "s3:GetBucketPolicy cloudtrail-logs-123456789012-us-east-1",
+        "s3:GetBucketEncryption audit-logs",
+        "s3control:GetPublicAccessBlock",
+        "cloudtrail:GetTrailStatus arn:aws:cloudtrail:us-east-1:123456789012:trail/management-events-2026",
+        "cloudtrail:DescribeTrails",
+        "config:DescribeConfigurationRecorders",
+        "guardduty:GetDetector detector-1",
+        `guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}`,
+        "securityhub:DescribeHub",
+        "organizations:ListAccounts",
+        "organizations:ListTargetsForPolicy DenyRegions",
+        "access-analyzer:ListFindings arn:aws:access-analyzer:us-east-1:123456789012:analyzer/prod-analyzer",
+        "sso:ListInstances",
+      ],
+      sentence: (value) => `${value}: AccessDenied (${denied})`,
+    },
+    {
+      label: "names",
+      values: [
+        "us-east-1",
+        "us-west-2",
+        "prod-us-east-2026",
+        "management-events-2026",
+        "cloudtrail-logs-123456789012-us-east-1",
+        "audit-logs",
+        "orders-db",
+        "detector-1",
+        "DenyRegions",
+        "ReadOnlyAudit",
+        "region_limit",
+        "not_readable",
+        "SummaryMap",
+        "AccountMFAEnabled",
+        "arn:aws:securityhub:::standards/cis-aws-foundations-benchmark/v/1.4.0",
+        "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+      ],
+      sentence: (value) => `${value} could not be read (${denied}); its count is null, the surface is marked not_readable, and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: [
+        "svc-deploy",
+        "alice",
+        "arn:aws:iam::123456789012:user/svc-deploy",
+        "arn:aws:iam::123456789012:user/auditor",
+        "arn:aws:iam::123456789012:role/AuditRole",
+        "arn:aws:iam::aws:policy/AdministratorAccess",
+        "123456789012",
+        MASKED_ACCESS_KEY_ID,
+      ],
+      sentence: (value) => `Caller ${value} could not read iam:ListUsers (${denied}); the IAM user inventory is null and AWS-IAM-02 is manual.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "AccessDeniedException (HTTP 403)",
+        "NoSuchEntity (HTTP 404)",
+        "NoSuchBucketPolicy (HTTP 404)",
+        "IncompleteResponse (HTTP 200)",
+        "SyntaxError (HTTP 502)",
+        "TimeoutError",
+        "UnknownError",
+        "HTTP 403",
+        "CredentialsProviderError ENOENT",
+        "User is not authorized to perform this operation",
+        "body: empty, 0 bytes",
+        "non-JSON body (text/html, 89 bytes)",
+      ],
+      sentence: (value) => `iam:ListUsers: error (${value}), so the IAM user inventory is null and the dependent findings are manual.`,
+    },
+    {
+      label: "finding ids",
+      values: ["AWS-IAM-01", "AWS-IAM-04", "AWS-LOG-01", "AWS-ORG-04", "AWS-DATA-12", "AWS-NET-14"],
+      sentence: (value) => `${value} is manual because iam:ListUsers returned ${denied}.`,
+    },
+    {
+      label: "fixed texts",
+      values: awsFixedTexts(),
+      sentence: (value) => `AWS-IAM-04 ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+test("rule 9: redactErrorText scrubs authorization values, JWTs, AWS key ids and secrets, cookie and api key pairs, and URL userinfo and query strings anywhere in the text", () => {
+  assertRedactionCases(assert, redactErrorText);
+
+  // The AWS-specific shapes: an SDK message that echoes the signing identity, request context, and a
+  // proxy header block, with the cookie header on its own line as HTTP writes it.
+  const basic = Buffer.from(`auditor:${AWS_MUST_KEEP_CANARIES.basicPassword}`).toString("base64");
+  const text = [
+    `Authorization: Bearer ${AWS_CANARIES.bearer} was rejected; Basic ${basic} also failed. Token ${CANARY.jwt} expired.`,
+    `Signed with ${AWS_CANARIES.accessKeyId} and ${AWS_CANARIES.secretKey}; x-api-key: ${AWS_CANARIES.apiKey}; session_id=${AWS_CANARIES.session}.`,
+    `Retry at ${CANARY_URL} or https://auditor:${AWS_MUST_KEEP_CANARIES.userinfoPassword}@api.example.com/v1/y?sig=${AWS_MUST_KEEP_CANARIES.signature} later.`,
+    `Set-Cookie: AWSALB=${AWS_CANARIES.session}; Path=/`,
+  ].join("\n");
+
+  const scrubbed = redactErrorText(text);
+  assertNoCanaries(scrubbed, "redactErrorText");
+  assertNoCanaryWindows(assert, scrubbed, [basic], "redactErrorText Basic value");
+  assert.match(scrubbed, /Bearer \[REDACTED\] was rejected/);
+  assert.match(scrubbed, /Basic \[REDACTED\] also failed/);
+  assert.match(scrubbed, /Signed with \[REDACTED\] and \[REDACTED\]; x-api-key: \[REDACTED\]; session_id=\[REDACTED\]/, "AWS key ids, secrets, api key and session pairs are replaced in place");
+  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] or/, "the URL host and path survive while the query is replaced");
+  assert.match(scrubbed, /https:\/\/api\.example\.com\/v1\/y\?\[REDACTED\] later\./, "URL userinfo is dropped and the query replaced even mid-sentence");
+  assert.match(scrubbed, /Set-Cookie: \[REDACTED\]$/, "the cookie header keeps its name and loses its whole value");
+  assert.equal(redactErrorText("Basic authentication is required; Invalid token."), "Basic authentication is required; Invalid token.", "prose after a scheme word or credential noun is left alone");
+});
+
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [action, route] of Object.entries(healthySdkRoutes())) {
+    try {
+      legitimate.set(`route ${action}`, await route({}, "us-east-1"));
+    } catch {
+      // A route that needs a real input is exercised by the healthy run below.
+    }
+  }
+  const { outputs, exported } = await withSdkRoutes(healthySdkRoutes(), [], async () => {
+    const client = realAwsClient();
+    const results = await runAllAssessments(client);
+    return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-self-check-")) };
+  });
+  for (const [name, result] of Object.entries(outputs)) legitimate.set(name, result);
+  for (const [name, text] of readBundleFiles(exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("config", realAwsConfig());
+  legitimate.set("shared config fixture lines", ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", "credential_source = Environment"]);
+  // The contact phone's digits are the shortest canary (seven digits behind the dialing prefix).
+  assertCanaryFixture(assert, AWS_PLANTED_CANARIES, legitimate, "aws fixture", { minLength: 7 });
+});
+
+test("rule 9: a 502 HTML proxy body on any surface never carries credentials into the access check, assess results, bundle files, or zip entries, and the error string carries the status-and-length note", async () => {
+  const noteText = `non-JSON body (text/html, ${Buffer.byteLength(proxyHtmlError().$responseBodyText, "utf8")} bytes)`;
+  const errorLine = /SyntaxError \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/;
+
+  for (const action of SECONDARY_ACTIONS) {
+    const routes = { ...healthySdkRoutes(), [action]: () => { throw proxyHtmlError(); } };
+    const log = [];
+    const { outputs, exported } = await withSdkRoutes(routes, log, async () => {
+      const client = realAwsClient();
+      const results = await runAllAssessments(client);
+      return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-canary-")) };
+    });
+    assert.ok(log.some((entry) => entry.action === action && entry.status === 502), `${action}: the fixture served the 502 body`);
+
+    const files = readBundleFiles(exported.outputDir);
+    const entries = readZipEntries(exported.zipPath);
+    assertNoCanaries(JSON.stringify(outputs), `${action}: assess and check_access results`);
+    for (const [name, text] of files) assertNoCanaries(text, `${action}: bundle file ${name}`);
+    for (const [name, text] of entries) assertNoCanaries(text, `${action}: zip entry ${name}`);
+
+    const recorded = [
+      ...Object.values(outputs).flatMap((result) => result.errors ?? []),
+      ...(files.get("_errors.log") ?? "").split("\n"),
+      ...outputs.access.surfaces.map((surface) => surface.error ?? ""),
+    ].filter((line) => line.includes(action.split(":")[1]) && /502/.test(line));
+    assert.ok(recorded.length > 0, `${action}: the failure is recorded against the command that failed`);
+    for (const line of recorded) {
+      assert.match(line, errorLine, `${action}: the error string describes the body by type and length only: ${line}`);
+      assert.ok(line.includes(noteText), `${action}: the note carries the byte length of the body: ${line}`);
+      assert.ok(!/<html|DOCTYPE|Unexpected token/i.test(line), `${action}: no slice of the HTML body or parser message survives: ${line}`);
+    }
+  }
+});
+
+test("rule 9: an SDK error whose message echoes a URL with a token query and AWS key-shaped values is scrubbed on every surface, keeping the code, status, and host", async () => {
+  for (const action of SECONDARY_ACTIONS) {
+    const routes = { ...healthySdkRoutes(), [action]: () => { throw contextLeakingDeniedError(); } };
+    const { outputs, exported } = await withSdkRoutes(routes, [], async () => {
+      const client = realAwsClient();
+      const results = await runAllAssessments(client);
+      return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-canary-json-")) };
+    });
+
+    const files = readBundleFiles(exported.outputDir);
+    assertNoCanaries(JSON.stringify(outputs), `${action}: assess and check_access results`);
+    for (const [name, text] of files) assertNoCanaries(text, `${action}: bundle file ${name}`);
+    for (const [name, text] of readZipEntries(exported.zipPath)) assertNoCanaries(text, `${action}: zip entry ${name}`);
+
+    const lines = Object.values(outputs).flatMap((result) => result.errors ?? []).filter((line) => line.startsWith(action));
+    const probe = outputs.access.surfaces.find((surface) => surface.command === action);
+    if (probe) lines.push(probe.error);
+    assert.ok(lines.length > 0, `${action}: the denial is recorded against the command that failed`);
+    for (const line of lines) {
+      assert.match(line, /AccessDeniedException \(HTTP 403\)/, `${action}: the SDK code and HTTP status are kept: ${line}`);
+      assert.match(line, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${action}: the URL host survives with its query replaced: ${line}`);
+      assert.ok(!/AKIA[A-Z0-9]{16}/.test(line), `${action}: no access key id survives: ${line}`);
+    }
+  }
+});
+
+test("rule 9: the aws_check_access tool scrubs the failure of the run's own identity read, which is the one primary that fails the check outright", async () => {
+  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+  const registered = [];
+  registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "aws_check_access");
+  assert.ok(checkAccess, "aws_check_access is registered");
+
+  for (const [label, makeError] of [["502 HTML body", proxyHtmlError], ["context-echoing denial", contextLeakingDeniedError]]) {
+    const routes = { ...healthySdkRoutes(), "sts:GetCallerIdentity": () => { throw makeError(); } };
+    const result = await withSdkRoutes(routes, [], () => checkAccess.execute("call-1", { region: "us-east-1", account_id: FIXTURE_ACCOUNT }));
+    const text = JSON.stringify(result);
+    assertNoCanaries(text, `aws_check_access with ${label}`);
+    assert.match(text, /AWS access check failed: /);
+    if (makeError === proxyHtmlError) assert.match(text, /SyntaxError \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
+    else assert.match(text, /AccessDeniedException \(HTTP 403\)/);
+  }
+});
+
+/**
+ * Runs `run` with AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE pointed at fixtures, restoring the environment
+ * afterwards. `files.credentials` is either the file's text or a function that prepares the path itself (a
+ * directory, an unreadable file) and returns it.
+ */
+let sharedAwsFixtureSequence = 0;
+
+/**
+ * A fresh directory whose path is name-shaped (letters, hyphens, and one number per segment), so the scrub
+ * boundary's long-token rule leaves it in the provider error that names the two documented files; mkdtemp's
+ * random suffix is token-shaped often enough to be redacted, which is correct for a real path of that shape
+ * but would make the "names the files" assertion depend on the draw.
+ */
+function createNameShapedFixtureDir() {
+  sharedAwsFixtureSequence += 1;
+  const dir = join(tmpdir(), "grclanker-aws-creds-fixture", `${process.pid}-${sharedAwsFixtureSequence}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function withSharedAwsFiles(files, run) {
+  const dir = createNameShapedFixtureDir();
+  const configFile = join(dir, "config");
+  writeFileSync(configFile, files.config ?? "");
+  let credentialsFile = join(dir, "credentials");
+  if (typeof files.credentials === "function") credentialsFile = files.credentials(dir);
+  else writeFileSync(credentialsFile, files.credentials);
+  const previous = { AWS_SHARED_CREDENTIALS_FILE: process.env.AWS_SHARED_CREDENTIALS_FILE, AWS_CONFIG_FILE: process.env.AWS_CONFIG_FILE, AWS_PROFILE: process.env.AWS_PROFILE };
+  process.env.AWS_SHARED_CREDENTIALS_FILE = credentialsFile;
+  process.env.AWS_CONFIG_FILE = configFile;
+  delete process.env.AWS_PROFILE;
+  try {
+    return await run({ credentialsFile, configFile });
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+const SDK_ERROR_NAME_OR_FS_CODE = /^(?:[A-Za-z]+(?:Error|Exception)(?: E[A-Z]+)?|E[A-Z]+)$/;
+/** Node's fs wording ("EISDIR: illegal operation on a directory, read", "EACCES: permission denied, open '<path>'"). */
+const FS_WORDING = /illegal operation|permission denied|no such file|operation not permitted|, open '|, read$|, read /i;
+/** The SDK's own provider messages, which quote profile names and file values. */
+const SDK_PROVIDER_WORDING = /Could not resolve credentials|configuration\/credentials file|Unsupported credential source|invalid SSO credentials|Profile .* could not be found/;
+
+/** Every path-like token of a message; the only ones allowed are the two documented files. */
+function pathsNamedIn(text) {
+  return [...text.matchAll(/(?:~|\/)[\w.~/-]*[\w~/-]/g)].map((match) => match[0]);
+}
+
+function assertProviderErrorShape(error, { credentialsFile, configFile }, label) {
+  assert.ok(error instanceof AwsCredentialProviderError, `${label}: the provider failure is wrapped: ${error?.name}: ${error?.message}`);
+  assert.equal(error.name, "AwsCredentialProviderError", label);
+  assert.equal(error.provider, "fromIni (profile audit)", label);
+  assert.match(error.code, SDK_ERROR_NAME_OR_FS_CODE, `${label}: the code is an SDK error name or an fs code: ${error.code}`);
+  assertNoCanaryWindows(assert, error.message, [SHARED_CONFIG_CANARY], `${label}: the thrown message`);
+  assert.doesNotMatch(error.message, FS_WORDING, `${label}: fs wording reached the thrown message: ${error.message}`);
+  assert.doesNotMatch(error.message, SDK_PROVIDER_WORDING, `${label}: the provider's own message was interpolated: ${error.message}`);
+  assert.match(error.message, new RegExp(`^credentials could not be resolved by fromIni \\(profile audit\\) \\(${error.code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)\\. The provider's message is not recorded`), label);
+  assert.ok(error.message.includes(credentialsFile) && error.message.includes(configFile), `${label}: the message names the files to check: ${error.message}`);
+  for (const named of pathsNamedIn(error.message)) {
+    assert.ok(named === credentialsFile || named === configFile, `${label}: a path other than the two documented files is named: ${named}`);
+  }
+}
+
+/** The shared-config failure shapes; each names the fs positive control or whether the SDK's own message echoes file text. */
+const SHARED_CONFIG_CASES = [
+  {
+    name: "malformed lines carrying the canary",
+    credentials: ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key ${SHARED_CONFIG_CANARY}`, `[${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    config: ["[profile audit]", "region = us-east-1", `output ${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    sdkEchoesCanary: false,
+  },
+  {
+    // Positive control: the installed SDK quotes an unsupported credential_source value verbatim, so this is the
+    // shape that proves the wrapper, not the SDK, is what keeps the file's text out of the thrown error.
+    name: "unsupported credential_source value (the SDK echoes it)",
+    credentials: ["[audit]", "role_arn = arn:aws:iam::123456789012:role/audit", `credential_source = ${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    sdkEchoesCanary: true,
+  },
+  {
+    name: "source_profile naming a missing profile (the SDK echoes it)",
+    credentials: ["[audit]", "role_arn = arn:aws:iam::123456789012:role/audit", `source_profile = ${SHARED_CONFIG_CANARY}`, ""].join("\n"),
+    sdkEchoesCanary: true,
+  },
+  {
+    name: "incomplete SSO profile whose extra key carries the canary (the SDK echoes the keys)",
+    credentials: ["[audit]", "sso_start_url = https://example.awsapps.com/start", `${SHARED_CONFIG_CANARY}_key = 1`, ""].join("\n"),
+    sdkEchoesCanary: true,
+  },
+  {
+    name: "EISDIR: AWS_SHARED_CREDENTIALS_FILE is a directory",
+    credentials: (dir) => {
+      const target = join(dir, "credentials.d");
+      mkdirSync(target);
+      return target;
+    },
+    fsCode: "EISDIR",
+    sdkEchoesCanary: false,
+  },
+  {
+    name: "EACCES: AWS_SHARED_CREDENTIALS_FILE is a mode 000 file",
+    credentials: (dir) => {
+      const target = join(dir, "credentials");
+      writeFileSync(target, ["[audit]", "aws_access_key_id = AKIAEXAMPLE000000001", `aws_secret_access_key = ${SHARED_CONFIG_CANARY}`, ""].join("\n"));
+      chmodSync(target, 0o000);
+      return target;
+    },
+    fsCode: "EACCES",
+    skip: process.getuid?.() === 0 ? "root reads a mode 000 file" : undefined,
+    sdkEchoesCanary: false,
+  },
+];
+
+for (const shape of SHARED_CONFIG_CASES) {
+  test(`config loader errors: ${shape.name}: the thrown client error and the tool payloads name only the provider, an SDK error name or fs code, and the two documented files`, { skip: shape.skip }, async () => {
+    const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+    const { fromIni } = await import("@aws-sdk/credential-providers");
+
+    await withSharedAwsFiles(shape, async (files) => {
+      const { credentialsFile } = files;
+      // Positive controls: the fixture really is the failure it claims to be.
+      if (shape.fsCode) assert.throws(() => readFileSync(credentialsFile), { code: shape.fsCode }, `reading the fixture fails with ${shape.fsCode}`);
+      const sdkMessage = await fromIni({ profile: "audit", ignoreCache: true })().then(() => assert.fail("the SDK resolved credentials from the fixture"), (error) => `${error.name}: ${error.message}`);
+      assert.equal(sdkMessage.includes(SHARED_CONFIG_CANARY), shape.sdkEchoesCanary, `the SDK's own message ${shape.sdkEchoesCanary ? "carries" : "does not carry"} the canary: ${sdkMessage}`);
+
+      // The real send(): the provider chain fails while resolving credentials, before any request is signed or sent.
+      const client = realAwsClient(realAwsConfig({ profile: "audit" }));
+      await assert.rejects(() => client.getCallerIdentity(), (error) => {
+        assertProviderErrorShape(error, files, "thrown client error");
+        return true;
+      });
+
+      const registered = [];
+      registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+      for (const name of ["aws_check_access", "aws_assess_identity", "aws_export_audit_bundle"]) {
+        const tool = registered.find((candidate) => candidate.name === name);
+        const payload = await tool.execute("call-1", { region: "us-east-1", profile: "audit", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-creds-export-") });
+        const text = JSON.stringify(payload);
+        assertNoCanaryWindows(assert, text, [SHARED_CONFIG_CANARY], `${name}: the tool payload`);
+        assert.doesNotMatch(text, FS_WORDING, `${name}: fs wording reached the tool payload: ${text}`);
+        assert.doesNotMatch(text, SDK_PROVIDER_WORDING, `${name}: the provider's own message is interpolated: ${text}`);
+        assert.match(text, /AwsCredentialProviderError: credentials could not be resolved by fromIni \(profile audit\) \((?:[A-Za-z]+(?:Error|Exception)(?: E[A-Z]+)?|E[A-Z]+)\)\. The provider's message is not recorded/, `${name}: the payload names the provider and the SDK error name or fs code only: ${text}`);
+        // The error sentence names the two documented files and nothing else (the payload may name its own output_dir).
+        const sentence = text.match(/AwsCredentialProviderError: credentials could not be resolved[^"]*/)?.[0] ?? "";
+        assert.ok(sentence.includes(credentialsFile) && sentence.includes(files.configFile), `${name}: the payload names the files to check: ${sentence}`);
+        for (const named of pathsNamedIn(sentence)) {
+          assert.ok(named === credentialsFile || named === files.configFile, `${name}: a path other than the two documented files is named: ${named}`);
+        }
+      }
+    });
+  });
+}
+
+
+test("config loader errors: a SyntaxError the SDK raises without attaching the body is recorded by name only, never by the parser's message that quotes the text", async () => {
+  const snippet = parserSnippetBody();
+  const bareParseError = () => new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+  const registered = [];
+  registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "aws_check_access");
+
+  const identityResult = await withSdkRoutes({ ...healthySdkRoutes(), "sts:GetCallerIdentity": () => { throw bareParseError(); } }, [], () => checkAccess.execute("call-1", { region: "us-east-1" }));
+  const identityText = JSON.stringify(identityResult);
+  assertNoCanaryWindows(assert, identityText, [PARSER_SNIPPET_CANARY], "aws_check_access payload");
+  assert.doesNotMatch(identityText, PARSER_WORDING, `the parser's message reached the tool payload: ${identityText}`);
+  assert.match(identityText, /AWS access check failed: SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded/);
+
+  for (const action of ["iam:ListUsers", "cloudtrail:DescribeTrails", "s3:GetBucketPolicy"]) {
+    const routes = { ...healthySdkRoutes(), [action]: () => { throw bareParseError(); } };
+    const { outputs, exported } = await withSdkRoutes(routes, [], async () => {
+      const client = realAwsClient();
+      const results = await runAllAssessments(client);
+      return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-parse-error-")) };
+    });
+    const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values(), ...readZipEntries(exported.zipPath).values()].join("\n");
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], `${action}: outputs and bundle`);
+    assert.doesNotMatch(text, PARSER_WORDING, `${action}: a slice of the parser's message survived`);
+    const lines = [...Object.values(outputs).flatMap((result) => result.errors ?? []), ...outputs.access.surfaces.map((surface) => surface.error ?? "")].filter((line) => line.includes(action.split(":")[1]));
+    assert.ok(lines.length > 0, `${action}: the failure is recorded against the command`);
+    for (const line of lines) assert.match(line, /SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body/, `${action}: ${line}`);
+  }
+});
+
+test("denied-list markers: a failed probe or inventory keeps count and flags null and names the command, region, code, and status, and every dependent summary leaf renders null, per command and per failure mode", async () => {
+  const healthy = await withSdkRoutes(healthySdkRoutes(), [], () => runAllAssessments(realAwsClient()));
+  assert.equal(healthy.access.status, "healthy");
+  assert.equal(healthy.access.surfaces.length, 15);
+  for (const surface of healthy.access.surfaces) {
+    assert.equal(typeof surface.count, "number", `${surface.name}: a completed probe carries a numeric count`);
+    assert.equal(surface.region, "us-east-1");
+  }
+
+  const modes = [
+    ["denied", sdkAccessDenied, { code: "AccessDeniedException", status: 403 }],
+    ["throttled", sdkThrottled, { code: "ThrottlingException", status: 400 }],
+    ["unavailable", sdkServiceUnavailable, { code: "ServiceUnavailableException", status: 503 }],
+    ["timeout", sdkTimeout, { code: "TimeoutError", status: null }],
+  ];
+  for (const [mode, makeError, expected] of modes) {
+    for (const action of SECONDARY_ACTIONS) {
+      const label = `${action} ${mode}`;
+      const routes = { ...healthySdkRoutes(), [action]: () => { throw makeError(); } };
+      const degraded = await withSdkRoutes(routes, [], () => runAllAssessments(realAwsClient()));
+      assertNoDefaultedLeaves(healthy, degraded, label);
+
+      const probeName = ACCESS_PROBES[action];
+      if (probeName) {
+        const probe = degraded.access.surfaces.find((surface) => surface.name === probeName);
+        assert.equal(degraded.access.status, "limited", `${label}: a failed probe makes the check limited`);
+        assert.deepEqual(
+          { status: probe.status, count: probe.count, truncated: probe.truncated, command: probe.command, region: probe.region, error_code: probe.error_code, http_status: probe.http_status },
+          { status: "not_readable", count: null, truncated: null, command: action, region: "us-east-1", error_code: expected.code, http_status: expected.status },
+          `${label}: the probe row names what failed and what the service answered, with no count`,
+        );
+        assert.match(probe.error, new RegExp(expected.code), `${label}: the probe error carries the SDK code`);
+      } else {
+        assert.equal(degraded.access.status, "healthy", `${label}: a command the access check does not probe leaves the check healthy`);
+      }
+
+      for (const [file, fields] of Object.entries(DEPENDENT_SUMMARY_LEAVES[action] ?? {})) {
+        for (const field of fields) {
+          assert.equal(degraded[file].summary[field], null, `${label}: ${file} summary.${field} renders null, saw ${JSON.stringify(degraded[file].summary[field])}`);
+          assert.notEqual(healthy[file].summary[field], null, `${label}: ${file} summary.${field} is populated on the healthy fixture`);
+        }
+      }
+    }
+  }
+});
+
+test("denied-list markers: the exported bundle writes null probe counts with the observed code and status, records the command in _errors.log, and never writes a defaulted dependent leaf", async () => {
+  for (const [action, probeName] of Object.entries(ACCESS_PROBES)) {
+    const routes = { ...healthySdkRoutes(), [action]: () => { throw sdkAccessDenied(); } };
+    const exported = await withSdkRoutes(routes, [], async () => {
+      const client = realAwsClient();
+      return exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-markers-"));
+    });
+    const files = readBundleFiles(exported.outputDir);
+    const access = JSON.parse(files.get("core_data/access.json"));
+    const probe = access.surfaces.find((surface) => surface.name === probeName);
+    assert.deepEqual(
+      { status: probe.status, count: probe.count, truncated: probe.truncated, command: probe.command, region: probe.region, error_code: probe.error_code, http_status: probe.http_status },
+      { status: "not_readable", count: null, truncated: null, command: action, region: "us-east-1", error_code: "AccessDeniedException", http_status: 403 },
+      `${action}: core_data/access.json carries the marker shape`,
+    );
+    assert.equal(access.status, "limited");
+    assert.match(files.get("_errors.log") ?? "", new RegExp(`^${action.replace(/[-/]/g, "\\$&")}.*AccessDenied \\(AccessDeniedException \\(HTTP 403\\)`, "m"), `${action}: _errors.log names the command and the observed code and status`);
+
+    for (const [file, fields] of Object.entries(DEPENDENT_SUMMARY_LEAVES[action] ?? {})) {
+      const analysis = JSON.parse(files.get(`analysis/${file}.json`));
+      for (const field of fields) assert.equal(analysis.summary[field], null, `${action}: analysis/${file}.json summary.${field} renders null`);
+    }
+  }
+});
+
+test("rule 1 corollary: AWS-DATA-11 renders null, a marker, and no uncovered bucket when the account-level block read is denied, while a readable NoSuchPublicAccessBlockConfiguration still fails", async () => {
+  const denied = await withSdkRoutes({ ...healthySdkRoutes(), "s3control:GetPublicAccessBlock": () => { throw sdkAccessDenied(); } }, [], () => assessAwsDataProtection(realAwsClient()));
+  const finding = findingById(denied, "AWS-DATA-11");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, /Account-level S3 Block Public Access could not be read \(s3control:GetPublicAccessBlock: AccessDenied \(AccessDeniedException \(HTTP 403\)/);
+  assert.match(finding.summary, /whether the account block covers them is unknown/);
+  assert.equal(finding.evidence.account_block_readable, false);
+  assert.equal(finding.evidence.account_block_configured, null, "an unread account block is neither configured nor unconfigured");
+  assert.deepEqual(
+    { collected: finding.evidence.account_flags.collected, command: finding.evidence.account_flags.command, error_code: finding.evidence.account_flags.error_code, http_status: finding.evidence.account_flags.http_status },
+    { collected: false, command: "s3control:GetPublicAccessBlock", error_code: "AccessDeniedException", http_status: 403 },
+    "the flags render as a not-collected marker, not {}",
+  );
+  assert.equal(finding.evidence.buckets_without_full_block, null, "no bucket is listed as uncovered when the account read failed");
+  assert.deepEqual(finding.evidence.buckets_without_bucket_level_block, [], "the bucket-level facts that were read are still reported");
+  assert.equal(denied.summary.buckets_without_full_block, null);
+
+  const unset = await withSdkRoutes({ ...healthySdkRoutes(), "s3control:GetPublicAccessBlock": () => { throw sdkAccessDenied("NoSuchPublicAccessBlockConfiguration", 404); } }, [], () => assessAwsDataProtection(realAwsClient()));
+  const unsetFinding = findingById(unset, "AWS-DATA-11");
+  assert.equal(unsetFinding.status, "fail", "a readable NoSuchPublicAccessBlockConfiguration is a fact about the account block, so the control fails on evidence");
+  assert.match(unsetFinding.summary, /^Account-level S3 Block Public Access is not configured \(S3 Control returned NoSuchPublicAccessBlockConfiguration\); 0\/1 buckets lack a full bucket-level block/);
+  assert.equal(unsetFinding.evidence.account_block_readable, true, "a NoSuchPublicAccessBlockConfiguration answer is a completed read");
+  assert.equal(unsetFinding.evidence.account_block_configured, false);
+  assert.equal(unsetFinding.evidence.account_flags.collected, undefined, "a completed read is not a not-collected marker");
+  assert.ok(Object.values(unsetFinding.evidence.account_flags).every((flag) => flag === undefined), "no flag is set when the configuration is absent");
+  assert.deepEqual(unsetFinding.evidence.buckets_without_full_block, [], "the coverage list is a real empty list here: every bucket carries its own full block");
+  assert.equal(unset.summary.buckets_without_full_block, 0);
+});
+
+function recordedActions(log) {
+  return new Set(log.map((entry) => entry.action));
+}
+
+/** IAM actions named anywhere in the outputs; aws:* condition keys are policy vocabulary, not requests. */
+function namedActions(text) {
+  return new Set((text.match(/\b[a-z0-9-]+:[A-Z][A-Za-z]+\b/g) ?? []).filter((token) => !token.startsWith("aws:")));
+}
+
+function namedStatuses(text) {
+  const statuses = new Set();
+  for (const match of text.matchAll(/HTTP (\d{3})\b/g)) statuses.add(Number(match[1]));
+  for (const match of text.matchAll(/"http_status": ?(\d{3})\b/g)) statuses.add(Number(match[1]));
+  return statuses;
+}
+
+test("request matching: every IAM action and HTTP status named in any output corresponds to a request the run made and a response it observed", async () => {
+  const log = [];
+  const routes = {
+    ...healthySdkRoutes(),
+    "iam:ListAccessKeys": () => { throw sdkAccessDenied(); },
+    "kms:ListKeys": () => { throw proxyHtmlError(); },
+    "organizations:ListAccounts": () => { throw sdkServiceUnavailable(); },
+    "ec2:DescribeFlowLogs": () => { throw sdkTimeout(); },
+  };
+  const { outputs, exported } = await withSdkRoutes(routes, log, async () => {
+    const client = realAwsClient();
+    const results = await runAllAssessments(client);
+    return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-request-log-")) };
+  });
+
+  const observedStatuses = new Set(log.map((entry) => entry.status).filter((status) => status !== null));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(503), "the fixture served every failure status under test");
+  assert.ok(log.some((entry) => entry.action === "ec2:DescribeFlowLogs" && entry.status === null), "the timeout produced no status");
+
+  const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values()].join("\n");
+  const actions = namedActions(text);
+  const statuses = namedStatuses(text);
+  for (const action of [...Object.keys(ACCESS_PROBES), "iam:ListAccessKeys", "kms:ListKeys", "organizations:ListAccounts", "ec2:DescribeFlowLogs"]) {
+    assert.ok(actions.has(action), `the outputs name ${action}: every probe carries its command and every failed read names the command that failed`);
+  }
+  assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(503), "the outputs name the observed failure statuses");
+  assert.ok(!statuses.has(200), "successful responses are not described as failures");
+  const requested = recordedActions(log);
+  for (const action of actions) {
+    assert.ok(requested.has(action), `action ${action} is named in output but the run never issued it`);
+  }
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no response carried it`);
+  }
+  for (const entry of log) {
+    assert.equal(entry.region, "us-east-1", `${entry.action}: every request was sent to the configured region`);
+  }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter, and the SDK's error carries that message.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+  assert.ok(shortBodyParseError(SHORT_BODY_CANARY).message.includes(SHORT_BODY_CANARY), "the SDK's own error message carries the whole short body");
+
+  const action = "iam:ListUsers";
+  const log = [];
+  const routes = { ...healthySdkRoutes(), [action]: () => { throw shortBodyParseError(SHORT_BODY_CANARY, SHORT_BODY_CONTENT_TYPE); } };
+  const note = `SyntaxError (HTTP 200): non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`;
+
+  const { outputs, exported } = await withSdkRoutes(routes, log, async () => {
+    const client = realAwsClient();
+    // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+    await assert.rejects(() => client.listIamUsers(), (error) => {
+      assert.equal(error.name, "AwsApiError", `the client rethrows the SDK error as fixed text: ${error.name}: ${error.message}`);
+      assert.equal(error.code, "SyntaxError", "the SDK error name is kept as the code");
+      assert.equal(error.httpStatus, 200, "the observed status is kept");
+      assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+      assert.equal(error.message, note);
+      assert.equal(isAwsAccessDenied(error), false);
+      return true;
+    });
+    const results = await runAllAssessments(client);
+    return { outputs: results, exported: await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-short-body-")) };
+  });
+
+  assertShortBodyRecordedAsNote(assert, outputs.access, "check_access");
+  const probe = outputs.access.surfaces.find((surface) => surface.name === "iam_users");
+  assert.equal(probe.status, "not_readable");
+  assert.equal(probe.error, note, "the probe records the note and the observed status only");
+  assert.equal(probe.http_status, 200);
+  assert.equal(probe.error_code, "SyntaxError");
+  assertShortBodyRecordedAsNote(assert, outputs.identity, "identity assessment");
+  for (const [name, result] of Object.entries(outputs)) assertNoShortBodyFragments(assert, result, `${name} result`);
+
+  const files = readBundleFiles(exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(log.some((entry) => entry.action === action && entry.status === 200 && entry.code === "SyntaxError"), "the 200 answer named in the note was observed");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Real SDK parser path. A local HTTP server answers every request the AWS SDK makes, so each response travels through
+// the SDK's own deserializer (query XML for STS, IAM, and RDS; EC2 XML; restXml for S3; JSON 1.1 and restJson for the
+// rest) before it reaches the client, the guard, and the assessments.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** Services whose protocol is JSON (1.1 or restJson), by SigV4 signing name; the rest answer in XML. */
+const JSON_PROTOCOL_SERVICES = new Set(["cloudtrail", "securityhub", "organizations", "kms", "config", "guardduty", "access-analyzer", "sso", "auditmanager", "account"]);
+
+/** REST-protocol requests carry no Action field; the method and path name the operation. */
+const REST_ACTIONS = [
+  ["guardduty", /^GET \/detector$/, "ListDetectors"],
+  ["guardduty", /^GET \/detector\/[^/]+$/, "GetDetector"],
+  ["securityhub", /^GET \/accounts$/, "DescribeHub"],
+  ["securityhub", /^POST \/standards\/get$/, "GetEnabledStandards"],
+  ["access-analyzer", /^GET \/analyzer$/, "ListAnalyzers"],
+  ["access-analyzer", /^POST \/finding$/, "ListFindings"],
+  ["auditmanager", /^GET \/assessments$/, "ListAssessments"],
+  ["account", /^POST \/getAlternateContact$/, "GetAlternateContact"],
+  ["s3control", /^GET \/v20180820\/configuration\/publicAccessBlock$/, "GetPublicAccessBlock"],
+  ["s3", /^GET \/$/, "ListBuckets"],
+];
+
+/** The IAM-prefixed action label (iam:ListUsers) the integration records for one signed request. */
+function describeSdkRequest(req, body) {
+  const scope = /Credential=([^/]+)\/\d{8}\/[^/]+\/([^/]+)\/aws4_request/.exec(req.headers.authorization ?? "");
+  const accessKeyId = scope?.[1];
+  const signed = scope?.[2] ?? "unsigned";
+  // S3 Control signs as s3; its account-scoped requests carry the account id header and a versioned path.
+  const service = signed === "s3" && req.headers["x-amz-account-id"] ? "s3control" : signed;
+  const path = req.url.split("?")[0];
+  const queryAction = /(?:^|&)Action=([A-Za-z]+)/.exec(body)?.[1];
+  const target = req.headers["x-amz-target"] ? String(req.headers["x-amz-target"]).split(".").pop() : undefined;
+  const rest = REST_ACTIONS.find(([restService, pattern]) => restService === service && pattern.test(`${req.method} ${path}`))?.[2];
+  return { service, action: queryAction ?? target ?? rest ?? `${req.method} ${path}`, label: `${service}:${queryAction ?? target ?? rest ?? `${req.method} ${path}`}`, accessKeyId };
+}
+
+const escapeXml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/** A genuine STS answer for the run's own identity, so the access check and the assessments get past their one primary. */
+const STS_IDENTITY_RESPONSE = Object.freeze({
+  status: 200,
+  contentType: "text/xml",
+  body: `<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><GetCallerIdentityResult><Arn>arn:aws:iam::${FIXTURE_ACCOUNT}:user/auditor</Arn><UserId>AIDAAUDITOR</UserId><Account>${FIXTURE_ACCOUNT}</Account></GetCallerIdentityResult><ResponseMetadata><RequestId>req-sts-identity</RequestId></ResponseMetadata></GetCallerIdentityResponse>`,
+});
+
+/**
+ * Runs `run` with the real AWS SDK sending every request to a local server that answers with respond(request). The
+ * SDK reaches it through AWS_ENDPOINT_URL with static environment credentials and a single attempt per request;
+ * `localhost` and its subdomains resolve to the server for the run (S3 Control prefixes the account id to the
+ * endpoint host). Every request is logged as { service, action, label, status }.
+ */
+async function withLocalAwsEndpoint(respond, run) {
+  const requests = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const described = describeSdkRequest(req, Buffer.concat(chunks).toString("utf8"));
+      const response = respond(described);
+      requests.push({ ...described, status: response.status });
+      res.writeHead(response.status, { "content-type": response.contentType, "content-length": String(Buffer.byteLength(response.body)) });
+      res.end(response.body);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const env = {
+    AWS_ENDPOINT_URL: `http://localhost:${server.address().port}`,
+    AWS_MAX_ATTEMPTS: "1",
+    AWS_RETRY_MODE: "standard",
+    AWS_ACCESS_KEY_ID: "AKIALOCALENDPOINT001",
+    AWS_SECRET_ACCESS_KEY: "local-endpoint-fixture-secret-access-key-2026",
+    AWS_REGION: "us-east-1",
+    AWS_EC2_METADATA_DISABLED: "true",
+    AWS_SHARED_CREDENTIALS_FILE: "/nonexistent/credentials",
+    AWS_CONFIG_FILE: "/nonexistent/config",
+  };
+  const cleared = ["AWS_PROFILE", "AWS_SESSION_TOKEN"];
+  const previous = Object.fromEntries([...Object.keys(env), ...cleared].map((key) => [key, process.env[key]]));
+  for (const key of cleared) delete process.env[key];
+  Object.assign(process.env, env);
+  const originalLookup = dns.lookup;
+  dns.lookup = function lookupLocalEndpoint(hostname, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+      return options?.all ? callback(null, [{ address: "127.0.0.1", family: 4 }]) : callback(null, "127.0.0.1", 4);
+    }
+    return originalLookup.call(dns, hostname, options, callback);
+  };
+  try {
+    return await run({ requests });
+  } finally {
+    dns.lookup = originalLookup;
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+/** Every reader the client exposes that takes no inventory-derived argument, one per SDK client and protocol. */
+const LOCAL_AWS_METHODS = [
+  ["getCallerIdentity", "sts", (client) => client.getCallerIdentity()],
+  ["getAccountSummary", "iam", (client) => client.getAccountSummary()],
+  ["listIamUsers", "iam", (client) => client.listIamUsers()],
+  ["getPasswordPolicy", "iam", (client) => client.getPasswordPolicy()],
+  ["getAccountAuthorizationDetails", "iam", (client) => client.getAccountAuthorizationDetails()],
+  ["listCustomerManagedPolicies", "iam", (client) => client.listCustomerManagedPolicies()],
+  ["describeTrails", "cloudtrail", (client) => client.describeTrails()],
+  ["lookupRootEvents", "cloudtrail", (client) => client.lookupRootEvents("us-east-1", new Date("2026-01-01T00:00:00Z"), new Date("2026-04-01T00:00:00Z"))],
+  ["describeSecurityHub", "securityhub", (client) => client.describeSecurityHub()],
+  ["getEnabledSecurityHubStandards", "securityhub", (client) => client.getEnabledSecurityHubStandards()],
+  ["describeConfigurationRecorders", "config", (client) => client.describeConfigurationRecorders()],
+  ["describeConfigurationRecorderStatus", "config", (client) => client.describeConfigurationRecorderStatus()],
+  ["listDetectors", "guardduty", (client) => client.listDetectors()],
+  ["describeOrganization", "organizations", (client) => client.describeOrganization()],
+  ["listAccounts", "organizations", (client) => client.listAccounts()],
+  ["listScps", "organizations", (client) => client.listScps()],
+  ["listAnalyzers", "access-analyzer", (client) => client.listAnalyzers()],
+  ["listIdentityCenterInstances", "sso", (client) => client.listIdentityCenterInstances()],
+  ["listActiveAuditManagerAssessments", "auditmanager", (client) => client.listActiveAuditManagerAssessments()],
+  ["getSecurityAlternateContact", "account", (client) => client.getSecurityAlternateContact()],
+  ["describeRegions", "ec2", (client) => client.describeRegions()],
+  ["getEbsEncryptionByDefault", "ec2", (client) => client.getEbsEncryptionByDefault("us-east-1")],
+  ["describeVpcs", "ec2", (client) => client.describeVpcs("us-east-1")],
+  ["describeFlowLogs", "ec2", (client) => client.describeFlowLogs("us-east-1")],
+  ["describeNetworkAcls", "ec2", (client) => client.describeNetworkAcls("us-east-1")],
+  ["describeSecurityGroups", "ec2", (client) => client.describeSecurityGroups("us-east-1")],
+  ["listBuckets", "s3", (client) => client.listBuckets()],
+  ["getAccountPublicAccessBlock", "s3control", (client) => client.getAccountPublicAccessBlock(FIXTURE_ACCOUNT)],
+  ["describeDbInstances", "rds", (client) => client.describeDbInstances("us-east-1")],
+  ["listKmsKeys", "kms", (client) => client.listKmsKeys("us-east-1")],
+];
+
+/** Everything a caller that logs the thrown error would see: name, message, every own property (enumerable or not), and the stack. */
+function thrownErrorRecord(error) {
+  const own = Object.fromEntries(Object.getOwnPropertyNames(error).map((key) => [key, error[key] instanceof Object ? JSON.stringify(error[key]) : String(error[key])]));
+  return JSON.stringify({ name: error.name, message: error.message, cause: String(error.cause), ...own });
+}
+
+/** Codes the local fixtures never serve; any of them in an output would be a condition the run invented. */
+const UNSERVED_CONDITIONS = /\b(AccessDenied(?:Exception)?|NoSuchEntity(?:Exception)?|ResourceNotFoundException|InvalidAccessException|AWSOrganizationsNotInUseException|UnauthorizedOperation|AuthFailure|ThrottlingException|ServiceUnavailableException|NoSuchBucketPolicy|NoSuchPublicAccessBlockConfiguration)\b/;
+
+async function runAwsTool(name, args) {
+  const { registerAwsTools } = await import("../dist/extensions/grc-tools/aws.js");
+  const registered = [];
+  registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+  const tool = registered.find((item) => item.name === name);
+  assert.ok(tool, `${name} is registered`);
+  try {
+    return JSON.stringify(await tool.execute("call-1", args));
+  } catch (error) {
+    return `threw ${thrownErrorRecord(error)}`;
+  }
+}
+
+const SILENT_SUCCESS_SHAPES = {
+  "200 text/html": { status: 200, contentType: "text/html; charset=utf-8", body: canaryHtmlBody() },
+  "200 empty body": { status: 200, contentType: "text/xml", body: "" },
+};
+
+const INCOMPLETE_RESPONSE_NOTE = /^IncompleteResponse \(HTTP 200\): [A-Za-z]+ answered without its [A-Za-z/]+ member \(body: (?:text\/html, \d+ bytes|empty, 0 bytes)\)$/;
+const HTML_PARSE_NOTE = /^SyntaxError \(HTTP 200\): non-JSON body \(text\/html, \d+ bytes\)$/;
+
+for (const [shape, response] of Object.entries(SILENT_SUCCESS_SHAPES)) {
+  test(`silent success: a ${shape} answer through the real SDK parser path is an unreadable surface on every command, recorded with the status and the body note, never read as a default`, async () => {
+    const healthy = await withSdkRoutes(healthySdkRoutes(), [], () => runAllAssessments(realAwsClient()));
+    let serveIdentity = false;
+    await withLocalAwsEndpoint(
+      ({ action }) => (serveIdentity && action === "GetCallerIdentity" ? STS_IDENTITY_RESPONSE : response),
+      async ({ requests }) => {
+        const client = realAwsClient();
+        // Every reader, the run's own identity included, rejects with the fixed-text guard error.
+        for (const [name, service, call] of LOCAL_AWS_METHODS) {
+          await assert.rejects(() => call(client), (error) => {
+            const record = thrownErrorRecord(error);
+            assert.ok(error instanceof AwsApiError, `${name}: the client throws AwsApiError, not the SDK's error or a resolved default: ${record}`);
+            assert.equal(error.httpStatus, 200, `${name}: the observed status is kept`);
+            if (shape === "200 empty body" || !JSON_PROTOCOL_SERVICES.has(service)) {
+              assert.equal(error.code, "IncompleteResponse", `${name}: an output the deserializer emptied is IncompleteResponse: ${error.message}`);
+              assert.match(error.message, INCOMPLETE_RESPONSE_NOTE, name);
+            } else {
+              // A JSON-protocol deserializer rejects an HTML body outright; that path was already fixed text.
+              assert.equal(error.code, "SyntaxError", `${name}: ${error.message}`);
+              assert.match(error.message, HTML_PARSE_NOTE, name);
+            }
+            assert.deepEqual(
+              Object.getOwnPropertyNames(error).filter((key) => !["stack", "message", "name", "code", "httpStatus", "$metadata"].includes(key)),
+              [],
+              `${name}: nothing that can hold body text is retained on the thrown error`,
+            );
+            assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
+            assert.doesNotMatch(record, PARSER_WORDING, `${name}: no parser wording`);
+            return true;
+          });
+        }
+        assert.ok(requests.length >= LOCAL_AWS_METHODS.length && requests.every((request) => request.status === 200), "every request was answered by the local server with 200");
+
+        // With the run's own identity served, the access check, every assessment, and the export see the same 200 answers.
+        serveIdentity = true;
+        const outputs = await runAllAssessments(client);
+        const exported = await exportAwsAuditBundle(client, client.getResolvedConfig(), createTempBase("grclanker-aws-silent-success-"));
+
+        const access = outputs.access;
+        assert.equal(access.status, "limited");
+        assert.equal(access.accountId, FIXTURE_ACCOUNT, "the served identity is read");
+        for (const probe of access.surfaces) {
+          assert.equal(probe.status, "not_readable", `${probe.name}: a 200 that carries nothing is not a readable surface`);
+          assert.equal(probe.count, null, `${probe.name}: no count`);
+          assert.equal(probe.truncated, null, `${probe.name}: no truncation state`);
+          assert.equal(probe.http_status, 200, `${probe.name}: the observed status`);
+          assert.ok(["IncompleteResponse", "SyntaxError"].includes(probe.error_code), `${probe.name}: ${probe.error_code}`);
+          assert.ok(INCOMPLETE_RESPONSE_NOTE.test(probe.error) || HTML_PARSE_NOTE.test(probe.error), `${probe.name}: ${probe.error}`);
+        }
+        assert.ok(access.notes.includes(`0/${access.surfaces.length} AWS audit surfaces are readable.`), access.notes.join(" | "));
+
+        for (const [name, result] of Object.entries(outputs)) {
+          if (name === "access") continue;
+          for (const finding of result.findings) {
+            assert.equal(finding.status, "manual", `${name} ${finding.id}: a finding whose every read answered with nothing renders manual, never pass or fail: ${finding.summary}`);
+          }
+          assertNoDefaultedLeaves(healthy[name], result, `${name} under ${shape}`);
+        }
+        assertNoDefaultedLeaves(healthy.access, access, `access check under ${shape}`);
+
+        const files = readBundleFiles(exported.outputDir);
+        const text = [JSON.stringify(outputs), ...files.values()].join("\n");
+        for (const fragment of ['"users": 0', '"user_inventory_truncated": false', '"security_hub_enabled": true', '"collection_errors": 0', "Root MFA enabled=false", '"status": "pass"', '"status": "fail"']) {
+          assert.ok(!text.includes(fragment), `no output renders the default ${fragment}`);
+        }
+        assert.doesNotMatch(text, UNSERVED_CONDITIONS, "no output names a condition the fixture never served");
+        assert.deepEqual([...namedStatuses(text)], [200], "the only status named anywhere is the one every response carried");
+        const requested = new Set(requests.map((request) => request.label));
+        for (const action of namedActions(text)) {
+          assert.ok(requested.has(action), `action ${action} is named in output but the run never issued it (requested: ${[...requested].join(", ")})`);
+        }
+        assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, `outputs and bundle under ${shape}`);
+        assert.doesNotMatch(text, PARSER_WORDING);
+        for (const [name, entry] of readZipEntries(exported.zipPath)) assertNoCanaryWindows(assert, entry, AWS_PLANTED_CANARIES, `zip ${name}`);
+        assert.match(files.get("_errors.log"), /IncompleteResponse \(HTTP 200\): [A-Za-z]+ answered without its/, "_errors.log records the guard's note");
+        if (shape === "200 text/html") assert.match(files.get("_errors.log"), /SyntaxError \(HTTP 200\): non-JSON body \(text\/html, \d+ bytes\)/);
+      },
+    );
+  });
+}
+
+test("silent success: the shape guard also holds behind a patched send, so a route that answers without the command's member is IncompleteResponse rather than an empty inventory", async () => {
+  const log = [];
+  const routes = { ...healthySdkRoutes(), "iam:ListUsers": () => ({}) };
+  await withSdkRoutes(routes, log, async () => {
+    const client = realAwsClient();
+    await assert.rejects(() => client.listIamUsers(), (error) => {
+      assert.ok(error instanceof AwsApiError);
+      assert.equal(error.code, "IncompleteResponse");
+      assert.equal(error.httpStatus, undefined, "a patched send carries no HTTP response, so no status is invented");
+      assert.equal(error.message, "IncompleteResponse: ListUsers answered without its Users member (body: not observed)");
+      return true;
+    });
+    const access = await checkAwsAccess(client);
+    const probe = access.surfaces.find((surface) => surface.name === "iam_users");
+    assert.equal(probe.status, "not_readable");
+    assert.equal(probe.error_code, "IncompleteResponse");
+    assert.equal(probe.http_status, null);
+    assert.equal(probe.count, null);
+    const identity = await assessAwsIdentity(client);
+    assert.equal(identity.summary.users, null, "the user inventory renders null, not 0");
+    assert.equal(findingById(identity, "AWS-IAM-02").status, "manual");
+  });
+});
+
+test("silent success: the required-member table names every command the client sends and nothing else", () => {
+  const source = readFileSync(new URL("../extensions/grc-tools/aws.ts", import.meta.url), "utf8");
+  const aliases = new Map([...source.matchAll(/(\w+Command) as (\w+Command)/g)].map(([, original, alias]) => [alias, original]));
+  const sent = new Set([...source.matchAll(/new (\w+Command)\(/g)].map(([, name]) => (aliases.get(name) ?? name).replace(/Command$/, "")));
+  assert.deepEqual([...sent].filter((name) => !AWS_REQUIRED_OUTPUT_MEMBERS[name]), [], "every command the client sends has a required-member entry");
+  assert.deepEqual(Object.keys(AWS_REQUIRED_OUTPUT_MEMBERS).filter((name) => !sent.has(name)), [], "no entry names a command the client does not send");
+  for (const [name, members] of Object.entries(AWS_REQUIRED_OUTPUT_MEMBERS)) {
+    assert.ok(members.length > 0 && members.every((member) => /^[A-Za-z]+$/.test(member)), `${name}: member names are identifiers`);
+  }
+});
+
+/** A 403 whose error code slot carries a credential-shaped value, in each protocol's error shape. */
+function deniedWithCanaryCode({ service }) {
+  const message = jsonCanaryMessage();
+  if (JSON_PROTOCOL_SERVICES.has(service)) {
+    return { status: 403, contentType: "application/x-amz-json-1.1", body: JSON.stringify({ __type: CANARY.sessionCookie, message }) };
+  }
+  const code = `Bearer ${CANARY.bearer}`;
+  if (service === "s3" || service === "s3control") {
+    return { status: 403, contentType: "application/xml", body: `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message><RequestId>req-1</RequestId><HostId>host-1</HostId></Error>` };
+  }
+  if (service === "ec2") {
+    return { status: 403, contentType: "text/xml;charset=UTF-8", body: `<?xml version="1.0" encoding="UTF-8"?><Response><Errors><Error><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message></Error></Errors><RequestID>req-1</RequestID></Response>` };
+  }
+  return { status: 403, contentType: "text/xml", body: `<ErrorResponse xmlns="https://${service}.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message></Error><RequestId>req-1</RequestId></ErrorResponse>` };
+}
+
+test("rule 9: a server-controlled error code (<Code>Bearer …</Code>, a __type carrying a token) renders as UnknownError with the observed status; no 6-to-24-character window of it survives in the thrown client error, the access check, the tool payloads, or the bundle", async () => {
+  // Positive control: both planted codes are what the SDK would hand back, and both fail the code shape or the scrub.
+  assert.ok(redactErrorText(CANARY.sessionCookie) !== CANARY.sessionCookie, "the __type token is token-shaped, so the scrub changes it");
+  assert.ok(!/^[A-Za-z][A-Za-z0-9._:-]{0,63}$/.test(`Bearer ${CANARY.bearer}`), "the XML code carries a space");
+
+  let serveIdentity = false;
+  await withLocalAwsEndpoint(
+    (request) => (serveIdentity && request.action === "GetCallerIdentity" ? STS_IDENTITY_RESPONSE : deniedWithCanaryCode(request)),
+    async ({ requests }) => {
+      const client = realAwsClient();
+      for (const [name, , call] of LOCAL_AWS_METHODS) {
+        await assert.rejects(() => call(client), (error) => {
+          const record = thrownErrorRecord(error);
+          assert.ok(error instanceof AwsApiError, `${name}: ${record}`);
+          assert.equal(error.code, "UnknownError", `${name}: the server's code slot is not accepted`);
+          assert.equal(error.httpStatus, 403, name);
+          assert.ok(error.message.startsWith("UnknownError (HTTP 403)"), `${name}: ${error.message}`);
+          assert.equal(isAwsAccessDenied(error), true, `${name}: the observed 403 still classifies as a denial`);
+          assertNoCanaryWindows(assert, record, [...AWS_PLANTED_CANARIES, `Bearer ${CANARY.bearer}`], `${name} thrown error`);
+          return true;
+        });
+      }
+      assert.ok(requests.every((request) => request.status === 403), "every request observed the 403");
+
+      serveIdentity = true;
+      const outputs = await runAllAssessments(client);
+      for (const probe of outputs.access.surfaces) {
+        assert.equal(probe.status, "not_readable", probe.name);
+        assert.equal(probe.error_code, "UnknownError", probe.name);
+        assert.equal(probe.http_status, 403, probe.name);
+      }
+      const outputDir = createTempBase("grclanker-aws-canary-code-");
+      const exported = await exportAwsAuditBundle(client, client.getResolvedConfig(), outputDir);
+      const payloads = [];
+      for (const tool of ["aws_check_access", "aws_assess_identity", "aws_export_audit_bundle"]) {
+        payloads.push(await runAwsTool(tool, { region: "us-east-1", account_id: FIXTURE_ACCOUNT, output_dir: createTempBase("grclanker-aws-canary-code-tool-") }));
+      }
+      const text = [JSON.stringify(outputs), ...payloads, ...readBundleFiles(exported.outputDir).values(), ...[...readZipEntries(exported.zipPath)].map(([, entry]) => entry)].join("\n");
+      assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "outputs, tool payloads, and bundle");
+      assert.match(text, /UnknownError \(HTTP 403\)/);
+      assert.deepEqual([...namedStatuses(text)], [403], "the only status named is the one every failing response carried");
+      for (const result of Object.values(outputs)) {
+        for (const finding of result.findings ?? []) assert.ok(!["pass", "fail"].includes(finding.status), `${finding.id}: ${finding.status}`);
+      }
+    },
+  );
+});
+
+test("rule 9: a 502 HTML page through the real SDK parser path is recorded on every protocol as the non-JSON body note with the observed status, measured from the response rather than quoted from the SDK error", async () => {
+  const page = { status: 502, contentType: "text/html; charset=utf-8", body: canaryHtmlBody() };
+  await withLocalAwsEndpoint(() => page, async ({ requests }) => {
+    const client = realAwsClient();
+    for (const [name, , call] of LOCAL_AWS_METHODS) {
+      await assert.rejects(() => call(client), (error) => {
+        const record = thrownErrorRecord(error);
+        assert.ok(error instanceof AwsApiError, `${name}: ${record}`);
+        assert.equal(error.httpStatus, 502, name);
+        assert.match(error.message, new RegExp(`^(?:Unknown|SyntaxError) \\(HTTP 502\\): non-JSON body \\(text/html, ${Buffer.byteLength(page.body)} bytes\\)$`), `${name}: ${error.message}`);
+        assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
+        assert.doesNotMatch(record, PARSER_WORDING, name);
+        return true;
+      });
+    }
+    assert.ok(requests.length >= LOCAL_AWS_METHODS.length && requests.every((request) => request.status === 502));
+    const text = await runAwsTool("aws_check_access", { region: "us-east-1", account_id: FIXTURE_ACCOUNT });
+    assert.match(text, /AWS access check failed: Unknown \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
+    assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "aws_check_access payload");
+  });
 });

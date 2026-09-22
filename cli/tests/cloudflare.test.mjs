@@ -17,10 +17,36 @@ import {
   assessCloudflareTrafficControls,
   assessCloudflareZoneSecurity,
   checkCloudflareAccess,
+  cloudflareFixedTexts,
   exportCloudflareAuditBundle,
+  redactErrorText,
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/cloudflare.js";
+import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  CANARY_VALUES,
+  ENCODED_FORM_SECRET,
+  HTML_BODY_NOTE,
+  PARSER_SNIPPET_CANARY,
+  PARSER_WORDING,
+  REDACTED_CANARY_URL,
+  SHORT_BODY_CANARY,
+  SHORT_BODY_CONTENT_TYPE,
+  assertCanaryFixture,
+  assertNoCanaryWindows,
+  assertNoCanaryWindowsInFiles,
+  assertNoShortBodyFragments,
+  assertRedactionCases,
+  assertScrubBoundary,
+  assertShortBodyRecordedAsNote,
+  htmlCanaryBody,
+  jsonCanaryMessage,
+  parserMessageFor,
+  parserSnippetBody,
+  shortBodyResponse,
+} from "./helpers/error-canaries.mjs";
+import { assertFixedTextsSurvive, assertMustKeepRows, assertMustRedactRowsBesideMustKeep } from "./helpers/redaction-table.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -272,6 +298,30 @@ test("resolveCloudflareConfiguration prefers explicit arguments over environment
   assert.equal(resolved.timeoutMs, 10000);
   assert.equal(resolved.authMethod, "token");
   assert.ok(resolved.sourceChain.includes("arguments-api-token"));
+});
+
+test("config resolution: credentials set through the environment survive an argument overlay that carries every credential key as undefined and names only an unrelated argument, and the source chain names the environment", () => {
+  const env = { CLOUDFLARE_API_TOKEN: "vN8kQ3xT7mWp2Zr9Lc4Hd6Fs", CLOUDFLARE_ACCOUNT_ID: "acc-env-123", CLOUDFLARE_API_KEY: "Xr4Tq9Vw2Kp7Mz3Nb8Lc5Hd1", CLOUDFLARE_EMAIL: "auditor@example.com" };
+  // Every documented credential key present as undefined (the shape an argument overlay emits), one unrelated argument set.
+  const overlay = { api_token: undefined, token: undefined, api_key: undefined, email: undefined, account_id: undefined, base_url: undefined, timeout_seconds: 12 };
+
+  const token = resolveCloudflareConfiguration(overlay, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID });
+  assert.equal(token.apiToken, env.CLOUDFLARE_API_TOKEN, "the environment token resolves");
+  assert.equal(token.accountId, env.CLOUDFLARE_ACCOUNT_ID, "the environment account id resolves");
+  assert.equal(token.authMethod, "token");
+  assert.equal(token.timeoutMs, 12_000, "the unrelated argument is applied");
+  assert.deepEqual(token.sourceChain, ["environment-api-token", "environment-account-id", "default-base-url"], "the source chain names the environment");
+
+  const pair = resolveCloudflareConfiguration(overlay, { CLOUDFLARE_API_KEY: env.CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL: env.CLOUDFLARE_EMAIL });
+  assert.equal(pair.apiKey, env.CLOUDFLARE_API_KEY, "the environment global key resolves");
+  assert.equal(pair.email, env.CLOUDFLARE_EMAIL, "the environment email resolves");
+  assert.equal(pair.authMethod, "global_key");
+  assert.deepEqual(pair.sourceChain, ["environment-api-key", "environment-email", "default-base-url"], "the source chain names the environment for the pair");
+
+  // A blank string argument is "not provided" as well: it never shadows the environment value.
+  const blank = resolveCloudflareConfiguration({ ...overlay, api_token: "", token: "  " }, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN });
+  assert.equal(blank.apiToken, env.CLOUDFLARE_API_TOKEN, "a blank token argument does not erase the environment token");
+  assert.deepEqual(blank.sourceChain, ["environment-api-token", "default-base-url"]);
 });
 
 test("checkCloudflareAccess reports readable Cloudflare surfaces", async () => {
@@ -977,4 +1027,836 @@ test("self-check (d): a fully compliant account built from documented fields pas
     assert.deepEqual(result.errors, []);
   }
   assert.equal(results.identity.findings.length + results.zone.findings.length + results.traffic.findings.length, 27);
+});
+
+test("verdict rule 10: listCursorPaginated reports an empty page with a cursor, a repeated cursor, the page budget, and a mid-listing 404 as truncated", async () => {
+  const cursorClient = (handler) => new CloudflareApiClient(sampleConfig(), { fetchImpl: fakeFetch(handler).fetchImpl });
+
+  const emptyPageWithCursor = await cursorClient((url) => {
+    const cursor = url.searchParams.get("cursor");
+    return cursor
+      ? { payload: { success: true, result: [], result_info: { cursors: { after: "still-more" } } } }
+      : { payload: { success: true, result: [{ id: "rs-1" }], result_info: { cursors: { after: "c-1" } } } };
+  }).listZoneRulesets("zone-1");
+  assert.equal(emptyPageWithCursor.items.length, 1);
+  assert.equal(emptyPageWithCursor.truncated, true);
+  assert.equal(emptyPageWithCursor.totalCount, undefined);
+
+  const repeatedCursor = await cursorClient(() => ({ payload: { success: true, result: [{ id: "rs-x" }], result_info: { cursors: { after: "same" } } } })).listZoneRulesets("zone-1");
+  assert.equal(repeatedCursor.truncated, true, "a cursor that repeats the one just used is reported as truncated instead of following it forever");
+  assert.equal(repeatedCursor.items.length, 2);
+
+  let page = 0;
+  const budget = await cursorClient(() => {
+    page += 1;
+    return { payload: { success: true, result: [{ id: `rs-${page}` }], result_info: { cursors: { after: `c-${page}` } } } };
+  }).listZoneRulesets("zone-1");
+  assert.equal(page, 100, "the cursor loop stops at its page budget");
+  assert.equal(budget.items.length, 100);
+  assert.equal(budget.truncated, true);
+  assert.equal(budget.totalCount, undefined);
+
+  const cursorNotFound = await cursorClient((url) => (url.searchParams.get("cursor")
+    ? { status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } }
+    : { payload: { success: true, result: [{ id: "rs-1" }], result_info: { cursors: { after: "c-1" } } } })).listZoneRulesets("zone-1");
+  assert.equal(cursorNotFound.items.length, 1);
+  assert.equal(cursorNotFound.truncated, true, "a 404 after items were collected keeps them and reports the listing incomplete");
+
+  const pageNotFound = await cursorClient((url) => (Number(url.searchParams.get("page")) > 1
+    ? { status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } }
+    : { payload: { success: true, result: Array.from({ length: 50 }, (_, index) => ({ id: `ip-${index}` })), result_info: { page: 1, per_page: 50, total_pages: 3, total_count: 150 } } })).listIpAccessRules("acc-123");
+  assert.equal(pageNotFound.items.length, 50);
+  assert.equal(pageNotFound.truncated, true);
+  assert.equal(pageNotFound.totalCount, undefined);
+
+  const firstPageNotFound = await cursorClient(() => ({ status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } })).listIpAccessRules("acc-123");
+  assert.deepEqual(firstPageNotFound, { items: [], truncated: false, totalCount: 0 }, "a 404 on the first page still means the product is not provisioned");
+});
+
+test("verdict rule 10: CF-IAM-04 caps at warn when the reusable Access policy list is truncated and names seen versus total", async () => {
+  const client = fixtureClient("compliant", {
+    async listAccessPolicies() {
+      return { items: [{ id: "pol-2", name: "Staff", decision: "allow", reusable: true, include: [] }], truncated: true, totalCount: 1200 };
+    },
+  });
+  const identity = await assessCloudflareIdentity(client);
+  const access = byId(identity, "CF-IAM-04");
+  assert.equal(access.status, "warn");
+  assert.match(access.summary, /Partial reusable Access policy inventory: 1 seen of 1200 total/);
+  assert.equal(access.evidence.reusable_policies_truncated, true);
+  assert.equal(access.evidence.reusable_policies_total, 1200);
+  assert.equal(access.evidence.reusable_policies_readable, true);
+});
+
+test("rule 1 corollary: multi-inventory findings never pass when only a secondary read returns 403 and name the unreadable endpoint", async () => {
+  const policiesForbidden = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listAccessPolicies() {
+      throw forbidden("/accounts/acc-123/access/policies");
+    },
+  }));
+  const access = byId(policiesForbidden, "CF-IAM-04");
+  assert.equal(access.status, "manual", access.summary);
+  assert.match(access.summary, /reusable policy list could not be checked/);
+  assert.match(access.summary, /\/accounts\/acc-123\/access\/policies could not be read \(.*403/);
+  assert.match(access.summary, /Access: Apps and Policies: Read/);
+  assert.equal(access.evidence.reusable_policies_readable, false);
+  // The denied inventory renders null with the observed status, never the zero of an empty fallback.
+  assert.equal(access.evidence.reusable_policies, null);
+  assert.equal(access.evidence.reusable_policies_total, null);
+  assert.equal(access.evidence.reusable_policies_truncated, null);
+  assert.equal(access.evidence.reusable_policies_http_status, 403);
+  assert.equal(access.evidence.inline_policies, 1);
+  assert.ok(policiesForbidden.errors.some((error) => error.includes("/accounts/acc-123/access/policies")));
+  for (const item of policiesForbidden.findings) {
+    if (item.id !== "CF-IAM-04") assert.equal(item.status, "pass", `${item.id} should be unaffected by the policies read: ${item.summary}`);
+  }
+
+  const accountTokensForbidden = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listAccountTokens() {
+      throw forbidden("/accounts/acc-123/tokens");
+    },
+  }));
+  const tokenExpiry = byId(accountTokensForbidden, "CF-IAM-06");
+  assert.equal(tokenExpiry.status, "warn", tokenExpiry.summary);
+  assert.match(tokenExpiry.summary, /\/accounts\/acc-123\/tokens could not be read/);
+  assert.deepEqual(tokenExpiry.evidence.sources.map((source) => source.readable), [true, false]);
+  const deniedSource = tokenExpiry.evidence.sources[1];
+  assert.deepEqual(
+    { seen: deniedSource.seen, total: deniedSource.total, truncated: deniedSource.truncated, http_status: deniedSource.http_status, attempted: deniedSource.attempted },
+    { seen: null, total: null, truncated: null, http_status: 403, attempted: true },
+    "the denied token list carries no count or truncation flag, only the observed status",
+  );
+
+  const gatewayForbidden = await assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listGatewayRules() {
+      return { items: [], truncated: false, totalCount: 0 };
+    },
+    async getZeroTrustAccount() {
+      throw forbidden("/accounts/acc-123/gateway");
+    },
+  }));
+  const gateway = byId(gatewayForbidden, "CF-TRF-06");
+  assert.equal(gateway.status, "manual", gateway.summary);
+  assert.match(gateway.summary, /\/accounts\/\{account_id\}\/gateway could not be read \(.*403/);
+});
+
+/**
+ * Planted values that must never reach the bundle, alphanumeric and random-looking so no 6-character window of
+ * them occurs in the fixture's legitimate values (see the fixture self-check). A contact email's canary is its
+ * local part; the domain is legitimate text.
+ */
+const FAKE_CLOUDFLARE_SECRETS = {
+  tokenValue: "YYSQRQdqSqf9TtSkHKPxfKXQ",
+  abuseContactEmail: "d4gLMFRxxvB3@example.test",
+  zoneOwnerEmail: "d39crtHdJgRw@example.test",
+  memberEmail: "WPHygAMNBYa8@example.test",
+  accountFreeformSetting: "GhCYt6r7rzqWqPKCzb9k",
+};
+const FAKE_CLOUDFLARE_CANARIES = Object.values(FAKE_CLOUDFLARE_SECRETS).map((value) => value.split("@")[0]);
+
+/** Other planted credentials: the header echoed by a proxy page, a configured token, and the canary run's token. */
+const CLOUDFLARE_HEADER_ECHO_CANARY = "aJagv77Dvu2evcFMM4NP";
+const CLOUDFLARE_CONFIGURED_TOKEN_CANARY = "dcgqmL3afrWE64EJTmzpzEjb";
+const CLOUDFLARE_RUN_TOKEN_CANARY = "BhK5xQdrtGjV39mFJaKvKeRV";
+
+/** Every planted canary a Cloudflare output is swept for, window by window. */
+const CLOUDFLARE_PLANTED_CANARIES = Object.freeze([
+  ...CANARY_VALUES,
+  SHORT_BODY_CANARY,
+  PARSER_SNIPPET_CANARY,
+  ...FAKE_CLOUDFLARE_CANARIES,
+  CLOUDFLARE_HEADER_ECHO_CANARY,
+  CLOUDFLARE_CONFIGURED_TOKEN_CANARY,
+  CLOUDFLARE_RUN_TOKEN_CANARY,
+]);
+
+test("verdict rule 9: exportCloudflareAuditBundle never writes token values, contact emails, or unprojected account settings into the bundle or its zip", async () => {
+  const base = createTempBase("grclanker-cloudflare-secrets-");
+  const client = fixtureClient("compliant", {
+    async listAccounts() {
+      return {
+        items: [{
+          id: "acc-123",
+          name: "Example",
+          type: "standard",
+          settings: { enforce_twofactor: true, abuse_contact_email: FAKE_CLOUDFLARE_SECRETS.abuseContactEmail, default_nameservers: FAKE_CLOUDFLARE_SECRETS.accountFreeformSetting },
+          legacy_flags: { secret_hint: FAKE_CLOUDFLARE_SECRETS.accountFreeformSetting },
+        }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+    async listZones() {
+      return {
+        items: [{ id: "zone-1", name: "one.example", status: "active", plan: { id: "cf_pro", name: "Pro Website" }, owner: { id: "own-1", type: "user", email: FAKE_CLOUDFLARE_SECRETS.zoneOwnerEmail }, account: { id: "acc-123", name: "Example" } }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+    async listUserTokens() {
+      return {
+        items: [{ id: "tok-1", name: "audit", status: "active", expires_on: FUTURE, last_used_on: RECENT, issued_on: "2026-01-01T00:00:00Z", value: FAKE_CLOUDFLARE_SECRETS.tokenValue, policies: [] }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+    async listMembers() {
+      return {
+        items: [{ id: "m1", status: "accepted", user: { email: FAKE_CLOUDFLARE_SECRETS.memberEmail, two_factor_authentication_enabled: true }, roles: [{ id: "r1", name: "Super Administrator - All Privileges" }] }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  });
+
+  const result = await exportCloudflareAuditBundle(client, sampleConfig(), base);
+  const files = readBundleFiles(result.outputDir);
+  const entries = readZipEntries(result.zipPath);
+  assert.ok(files.size > 10);
+  assert.equal(entries.size, files.size, "every written file is in the zip");
+  assertNoCanaryWindowsInFiles(assert, files, FAKE_CLOUDFLARE_CANARIES, "bundle files");
+  assertNoCanaryWindowsInFiles(assert, entries, FAKE_CLOUDFLARE_CANARIES, "zip entries");
+
+  const accounts = JSON.parse(files.get("core_data/accounts.json"));
+  assert.deepEqual(Object.keys(accounts.items[0]).sort(), ["id", "name", "settings", "type"]);
+  assert.deepEqual(accounts.items[0].settings, { enforce_twofactor: true, abuse_contact_email_configured: true });
+  const zones = JSON.parse(files.get("core_data/zones.json"));
+  assert.deepEqual(zones.items[0].owner, { id: "own-1", type: "user" });
+  assert.deepEqual(zones.items[0].account, { id: "acc-123", name: "Example" });
+  assert.equal(zones.items[0].plan.name, "Pro Website");
+});
+
+test("verdict rule 9: non-JSON error bodies are described, never echoed, in CloudflareApiError messages", async () => {
+  const leaked = CLOUDFLARE_HEADER_ECHO_CANARY;
+  const fetchImpl = async () => ({
+    ok: false,
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { get: (name) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+    async text() {
+      return `<html><body>Proxy error: Authorization: Bearer ${leaked}</body></html>`;
+    },
+  });
+  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  await assert.rejects(client.listMembers("acc-123"), (error) => {
+    assert.equal(error.status, 502);
+    assert.equal(error.path, "/accounts/acc-123/members");
+    assertNoCanaryWindows(assert, error.message, [leaked], "CloudflareApiError message");
+    assert.match(error.message, /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+    return true;
+  });
+
+  // A 2xx answer that is not JSON (a proxy login page) is a failed read, not an empty inventory.
+  const okHtml = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: async () => new Response(`<html>Sign in with Bearer ${leaked}</html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }),
+  });
+  await assert.rejects(okHtml.listMembers("acc-123"), (error) => {
+    assert.equal(error.status, 200);
+    assertNoCanaryWindows(assert, error.message, [leaked], "CloudflareApiError message");
+    assert.match(error.message, /non-JSON payload for \/accounts\/acc-123\/members \(200 OK\): non-JSON body \(text\/html, \d+ bytes\)/);
+    return true;
+  });
+
+  // Transport failures carry the path and the failure class, never a status they did not observe.
+  const timedOut = new CloudflareApiClient(sampleConfig({ timeoutMs: 5 }), {
+    fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error(`aborted while holding Bearer ${leaked}`)));
+    }),
+  });
+  await assert.rejects(timedOut.verifyCurrentToken(), (error) => {
+    assert.equal(error.status, undefined);
+    assert.equal(error.path, "/user/tokens/verify");
+    assert.match(error.message, /timed out after 5 ms/);
+    assertNoCanaryWindows(assert, error.message, [leaked], "CloudflareApiError message");
+    return true;
+  });
+});
+
+test("rule 9: redactErrorText scrubs every credential shape anywhere in an error string and leaves prose alone", () => {
+  assertRedactionCases(assert, redactErrorText);
+  // The configured token is scrubbed wherever an upstream error echoes it.
+  new CloudflareApiClient(sampleConfig({ apiToken: CLOUDFLARE_CONFIGURED_TOKEN_CANARY }), { fetchImpl: async () => new Response("{}") });
+  assert.equal(redactErrorText(`proxy replayed ${CLOUDFLARE_CONFIGURED_TOKEN_CANARY} upstream`), "proxy replayed [REDACTED] upstream");
+});
+
+test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
+  new CloudflareApiClient(sampleConfig({ apiToken: ENCODED_FORM_SECRET }), { fetchImpl: async () => new Response("{}") });
+  assertScrubBoundary(assert, redactErrorText, {
+    configuredSecret: ENCODED_FORM_SECRET,
+    mustKeep: [
+      "GET /accounts/acc-123/access/policies (403 Forbidden): Authentication error (code 10000)",
+      "GET /zones/zone-1/settings/always_use_https (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+      "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+      "Cloudflare API token verification failed for tok-current: token status is expired",
+      "reusable policies not readable (GET /accounts/acc-123/access/policies: 403 Forbidden)",
+      ...cloudflareFixedTexts(),
+    ],
+  });
+});
+
+test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration emits survives redactErrorText unchanged, from the SyntaxError and non-JSON notes through the not attempted and Not attempted wordings to the manual-review, partial-inventory, and zone-plan prose", () => {
+  const texts = cloudflareFixedTexts();
+  assertFixedTextsSurvive(assert, redactErrorText, texts, { minimum: 25 });
+  for (const required of [
+    "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+    "not attempted: this client does not expose listAccessPolicies, so no request was made",
+    "Not attempted: /zones could not be read (Cloudflare request failed for /zones (403 Forbidden): Authentication error)",
+    "3 zone-scoped surfaces were not attempted because /zones could not be read (403).",
+    "Cloudflare request failed for /zones (timed out after 30000 ms)",
+    "Cloudflare request failed for /zones (network error: fetch failed)",
+    "Cloudflare API reported failure for /zones.",
+    "The active API token reported status expired instead of active.",
+    "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.",
+  ]) {
+    assert.ok(texts.includes(required), `the fixed-text list carries: ${required}`);
+  }
+  assert.ok(texts.some((text) => HTML_BODY_NOTE.test(text)), "the fixed-text list carries the non-JSON body note");
+  assert.ok(texts.some((text) => /^Manual review required: \/accounts\/acc-123\/access\/policies could not be read \(Cloudflare request failed for .* Grant Access: Apps and Policies: Read to the audit token/.test(text)), "the manual-review reason is in the list");
+  assert.ok(texts.some((text) => /^Partial Access application inventory: 1 seen of 40 total; unseen items were not assessed\.$/.test(text)), "the partial-inventory note is in the list");
+  assert.ok(texts.some((text) => text.startsWith("The zone plan could not be named because /zones/{zone_id}/subscription was not readable (")), "the zone-plan note is in the list");
+
+  // The renderings the client throws, built the way requestJson builds them, survive too.
+  const thrown = [
+    "Cloudflare request failed for /accounts/acc-123/access/policies (403 Forbidden): Authentication error",
+    "Cloudflare request failed for /zones/zone-1/settings/always_use_https (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+    "Cloudflare request returned a non-JSON payload for /zones (200 OK): non-JSON body (text/plain, 21 bytes)",
+    "Cloudflare request failed for /user/tokens/verify (timed out after 30000 ms)",
+  ];
+  for (const message of thrown) {
+    assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
+  }
+});
+
+test("rule 9 must-keep and must-redact table (addendum 7): every endpoint path, name, principal, status text, finding id, and fixed text the summaries, markers, probes, and evidence rely on survives redactErrorText alone and inside a realistic summary sentence, and every canary planted in every carrier beside one of them is removed while the row survives (extends the rule 9 scrub boundary fixed texts)", () => {
+  const groups = [
+    {
+      label: "endpoint paths",
+      values: [
+        "/zones",
+        "/zones/zone-1/dnssec",
+        "/zones/{zone_id}/dnssec",
+        "/zones/zone-1/settings/always_use_https",
+        "/zones/zone-1/settings/min_tls_version",
+        "/zones/zone-1/rulesets/phases/http_request_firewall_custom/entrypoint",
+        "/zones/zone-1/ssl/universal/settings",
+        "/zones/zone-1/origin_tls_client_auth/settings",
+        "/zones/zone-1/subscription",
+        "/zones/{zone_id}/firewall/rules",
+        "/accounts/acc-123/access/policies",
+        "/accounts/acc-123/access/apps",
+        "/accounts/acc-123/access/identity_providers",
+        "/accounts/acc-123/members",
+        "/accounts/acc-123/tokens",
+        "/accounts/acc-123/audit_logs",
+        "/accounts/acc-123/gateway/rules",
+        "/user/tokens/verify",
+        "/user/tokens/tok-current",
+        "GET /accounts/acc-123/access/policies",
+        "https://api.cloudflare.com/client/v4/zones/zone-1/dnssec",
+      ],
+      sentence: (value) => `Cloudflare request failed for ${value} (403 Forbidden): Authentication error`,
+    },
+    {
+      label: "names",
+      values: [
+        "zone-1",
+        "acc-123",
+        "one.example",
+        "prod-us-east-2026",
+        "tok-current",
+        "http_request_firewall_custom",
+        "always_use_https",
+        "min_tls_version",
+        "strict_transport_security",
+        "Zone Read",
+        "Access: Apps and Policies: Read",
+      ],
+      sentence: (value) => `${value} was not readable (403 Forbidden); its count is null, the surface is listed as not_readable, and the verdict is manual.`,
+    },
+    {
+      label: "principals",
+      values: ["tok-current", "svc-deploy", "auditor@example.com", "owner@example.com", "Super Administrator - All Privileges", "Administrator Read Only"],
+      sentence: (value) => `Account member ${value} could not be checked because /accounts/acc-123/members returned 403 Forbidden; the member count is null.`,
+    },
+    {
+      label: "status text",
+      values: [
+        "403 Forbidden",
+        "404 Not Found",
+        "502 Bad Gateway",
+        "200 OK",
+        "timed out after 30000 ms",
+        "network error: fetch failed",
+        "Authentication error",
+        "token status is expired",
+        "non-JSON body (text/html, 5120 bytes)",
+      ],
+      sentence: (value) => `GET /accounts/acc-123/access/policies returned ${value}, so the reusable Access policy list must be collected manually.`,
+    },
+    {
+      label: "finding ids",
+      values: ["CF-IAM-01", "CF-IAM-04", "CF-IAM-06", "CF-ZONE-07", "CF-ZONE-11", "CF-TRF-03", "CF-TRF-06"],
+      sentence: (value) => `${value} is manual because /zones/zone-1/dnssec was not readable (403 Forbidden).`,
+    },
+    {
+      label: "fixed texts",
+      values: cloudflareFixedTexts(),
+      sentence: (value) => `CF-IAM-04: ${value}`,
+    },
+  ];
+  assertMustKeepRows(assert, redactErrorText, groups);
+  assertMustRedactRowsBesideMustKeep(assert, redactErrorText, groups);
+});
+
+const CLOUDFLARE_JSON_HEADERS = { "content-type": "application/json" };
+
+function cloudflareOk(result) {
+  return () => new Response(JSON.stringify({ success: true, errors: [], messages: [], result }), { status: 200, statusText: "OK", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+function cloudflareForbidden() {
+  return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null }), { status: 403, statusText: "Forbidden", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+function cloudflareNotFound() {
+  return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "not found" }], messages: [], result: null }), { status: 404, statusText: "Not Found", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+function cloudflareCanaryHtml() {
+  return new Response(htmlCanaryBody(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+function cloudflareCanaryJson() {
+  return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: jsonCanaryMessage() }], messages: [], result: null }), { status: 403, statusText: "Forbidden", headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+const ZONE = "zone-1";
+const ACCOUNT = "acc-123";
+
+/**
+ * Every documented path the access check, the three assessments, and the export request for one
+ * account with one zone, each answering with the compliant fixture. Keys are request paths without
+ * the /client/v4 prefix; the fallback routes (/firewall/rules, /rate_limits, /subscription) are
+ * included so a run that reaches them is still served.
+ */
+function healthyCloudflareRoutes() {
+  const routes = {
+    "/user/tokens/verify": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, not_before: "2026-01-01T00:00:00Z" }),
+    "/user/tokens/tok-current": cloudflareOk({ id: "tok-current", status: "active", expires_on: FUTURE, policies: [{ id: "p1", effect: "allow", permission_groups: [{ id: "pg1", name: "Zone Read" }], resources: { "com.cloudflare.api.account.zone.zone-1": "*" } }] }),
+    "/user/tokens": cloudflareOk([
+      { id: "tok-1", name: "audit", status: "active", expires_on: FUTURE, last_used_on: RECENT, issued_on: "2026-01-01T00:00:00Z", policies: [] },
+      { id: "tok-2", name: "old", status: "expired", expires_on: "2025-01-01T00:00:00Z", policies: [] },
+    ]),
+    "/accounts": cloudflareOk([{ id: ACCOUNT, name: "Example", type: "standard", settings: { enforce_twofactor: true } }]),
+    "/zones": cloudflareOk([{ id: ZONE, name: "one.example", status: "active" }]),
+    [`/accounts/${ACCOUNT}/tokens`]: cloudflareOk([{ id: "atok-1", name: "ci", status: "active", expires_on: FUTURE, last_used_on: RECENT, policies: [] }]),
+    [`/accounts/${ACCOUNT}/members`]: cloudflareOk([
+      { id: "m1", status: "accepted", user: { email: "owner@example.com", two_factor_authentication_enabled: true }, roles: [{ id: "r1", name: "Super Administrator - All Privileges" }] },
+      { id: "m2", status: "accepted", user: { email: "auditor@example.com", two_factor_authentication_enabled: true }, roles: [{ id: "r2", name: "Administrator Read Only" }] },
+    ]),
+    [`/accounts/${ACCOUNT}/access/apps`]: cloudflareOk([{ id: "app-1", name: "Admin", type: "self_hosted", domain: "admin.one.example", policies: [{ id: "pol-1", decision: "allow", include: [{ email_domain: { domain: "example.com" } }] }] }]),
+    [`/accounts/${ACCOUNT}/access/policies`]: cloudflareOk([{ id: "pol-2", name: "Staff", decision: "allow", reusable: true, include: [] }]),
+    [`/accounts/${ACCOUNT}/access/identity_providers`]: cloudflareOk([{ id: "idp-1", name: "Okta", type: "okta" }]),
+    [`/accounts/${ACCOUNT}/audit_logs`]: cloudflareOk([{ id: "evt-1", when: RECENT, action: { type: "change_setting", result: true }, actor: { email: "admin@example.com" } }]),
+    [`/accounts/${ACCOUNT}/gateway/rules`]: cloudflareOk([{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }, { id: "gw-2", name: "Isolate", action: "isolate", enabled: true, filters: ["http"] }]),
+    [`/accounts/${ACCOUNT}/gateway`]: cloudflareOk({ id: ACCOUNT, gateway_tag: "gw-tag-1", provider_name: "Cloudflare" }),
+    [`/accounts/${ACCOUNT}/firewall/access_rules/rules`]: cloudflareOk([{ id: "ip-1", mode: "block", notes: "Known scanner", modified_on: RECENT, configuration: { target: "ip", value: "198.51.100.1" } }]),
+    [`/zones/${ZONE}/dnssec`]: cloudflareOk({ status: "active", algorithm: "13" }),
+    [`/zones/${ZONE}/rulesets`]: cloudflareOk([
+      { id: "rs-managed", kind: "zone", phase: CLOUDFLARE_RULESET_PHASES.firewallManaged, name: "zone", version: "1" },
+      { id: "rs-ddos", kind: "managed", phase: CLOUDFLARE_RULESET_PHASES.ddosL7, name: "DDoS L7 ruleset", version: "1" },
+    ]),
+    [`/zones/${ZONE}/ssl/universal/settings`]: cloudflareOk({ enabled: true }),
+    [`/zones/${ZONE}/origin_tls_client_auth/settings`]: cloudflareOk({ enabled: true }),
+    [`/zones/${ZONE}/origin_tls_client_auth/hostnames`]: cloudflareOk([{ cert_id: "cert-aop-1", created_at: "2026-01-01T00:00:00Z", enabled: true, hostname: "app.one.example", status: "active", updated_at: RECENT }]),
+    [`/zones/${ZONE}/ssl/certificate_packs`]: cloudflareOk([{ id: "pack-1", type: "universal", status: "active", hosts: ["one.example"], certificates: [{ id: "cert-1", status: "active", expires_on: FUTURE, hosts: ["one.example"] }] }]),
+    [`/zones/${ZONE}/dns_records`]: cloudflareOk([
+      { id: "rec-1", type: "A", name: "one.example", content: "203.0.113.10", proxied: true, proxiable: true, ttl: 1 },
+      { id: "rec-2", type: "TXT", name: "one.example", content: "v=spf1 -all", proxied: false, proxiable: false, ttl: 300 },
+    ]),
+    [`/zones/${ZONE}/pagerules`]: cloudflareOk([{ id: "pr-1", status: "active", priority: 1, targets: [{ target: "url", constraint: { operator: "matches", value: "one.example/static/*" } }], actions: [{ id: "browser_cache_ttl", value: 14400 }] }]),
+    [`/zones/${ZONE}/bot_management`]: cloudflareOk({ fight_mode: true }),
+    [`/zones/${ZONE}/subscription`]: cloudflareOk({ id: "sub-1", state: "Paid", rate_plan: { id: "cf_pro", public_name: "Pro Website", currency: "USD" } }),
+    [`/zones/${ZONE}/firewall/rules`]: cloudflareOk([]),
+    [`/zones/${ZONE}/rate_limits`]: cloudflareOk([]),
+  };
+  for (const setting of compliantSettings()) routes[`/zones/${ZONE}/settings/${setting.id}`] = cloudflareOk(setting);
+  for (const phase of [CLOUDFLARE_RULESET_PHASES.firewallManaged, CLOUDFLARE_RULESET_PHASES.firewallCustom, CLOUDFLARE_RULESET_PHASES.ddosL7, CLOUDFLARE_RULESET_PHASES.responseHeadersTransform, CLOUDFLARE_RULESET_PHASES.rateLimit]) {
+    routes[`/zones/${ZONE}/rulesets/phases/${phase}/entrypoint`] = cloudflareOk(compliantEntrypoint(phase));
+  }
+  return routes;
+}
+
+/** Fallback paths a compliant run never reaches; they are served so any run that does reach them is still healthy. */
+const CLOUDFLARE_FALLBACK_ROUTES = new Set([`/zones/${ZONE}/firewall/rules`, `/zones/${ZONE}/rate_limits`, `/zones/${ZONE}/subscription`]);
+
+/**
+ * Serves the route table over the real client and records every request (method, path, status).
+ * An unrouted path answers 500 with a distinctive message so the healthy baseline (errorCount 0)
+ * proves the table is complete.
+ */
+function cloudflareRoutedFetch(routes, log = []) {
+  return async (url, init) => {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace("/client/v4", "");
+    const route = routes[path];
+    const response = route
+      ? await route(parsed)
+      : new Response(JSON.stringify({ success: false, errors: [{ code: 1, message: `unrouted test path ${path}` }] }), { status: 500, statusText: "Internal Server Error", headers: CLOUDFLARE_JSON_HEADERS });
+    log.push({ method: init?.method ?? "GET", path, status: response.status });
+    return response;
+  };
+}
+
+async function runEveryCloudflareTool(client, outputRoot) {
+  const access = await checkCloudflareAccess(client);
+  const identity = await assessCloudflareIdentity(client);
+  const zone = await assessCloudflareZoneSecurity(client);
+  const traffic = await assessCloudflareTrafficControls(client);
+  const exported = await exportCloudflareAuditBundle(client, client.getResolvedConfig(), outputRoot);
+  return { access, assessments: [identity, zone, traffic], exported };
+}
+
+/** Every string an assessment records about a failed read: the errors array plus evidence error fields. */
+function recordedCloudflareErrors(assessments) {
+  const recorded = [];
+  for (const assessment of assessments) {
+    recorded.push(...assessment.errors);
+    for (const item of assessment.findings) {
+      for (const [key, value] of Object.entries(item.evidence ?? {})) {
+        if (typeof value === "string" && /(^|_)error$/.test(key)) recorded.push(value);
+      }
+      for (const source of item.evidence?.sources ?? []) {
+        if (typeof source.error === "string") recorded.push(source.error);
+      }
+    }
+  }
+  return recorded;
+}
+
+test("fixture self-check: every planted canary is alphanumeric and random-looking, and no 6-to-24-character window of any canary occurs in the healthy fixture's legitimate values, so a windowed leak assertion can fail only on a real echo", async () => {
+  const legitimate = new Map();
+  for (const [path, route] of Object.entries(healthyCloudflareRoutes())) {
+    legitimate.set(`route ${path}`, await route(new URL(`https://api.cloudflare.com/client/v4${path}`)).text());
+  }
+  const run = await runEveryCloudflareTool(
+    new CloudflareApiClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) }),
+    createTempBase("grclanker-cloudflare-self-check-"),
+  );
+  legitimate.set("check_access", run.access);
+  for (const assessment of run.assessments) legitimate.set(assessment.title, assessment);
+  for (const [name, text] of readBundleFiles(run.exported.outputDir)) legitimate.set(`bundle ${name}`, text);
+  for (const [name, text] of readZipEntries(run.exported.zipPath)) legitimate.set(`zip ${name}`, text);
+  legitimate.set("sample config", sampleConfig());
+  assertCanaryFixture(assert, CLOUDFLARE_PLANTED_CANARIES, legitimate, "cloudflare fixture");
+});
+
+test("rule 9: a 502 HTML page or a JSON error message carrying credentials on any surface never reaches a probe, finding, summary, or bundle file", async () => {
+  const config = sampleConfig({ apiToken: CLOUDFLARE_RUN_TOKEN_CANARY });
+  const outputRoot = createTempBase("grclanker-cloudflare-canary-");
+
+  // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
+  const healthyLog = [];
+  const healthy = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), healthyLog) });
+  const healthyRun = await runEveryCloudflareTool(healthy, outputRoot);
+  assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
+  for (const assessment of healthyRun.assessments) {
+    for (const item of assessment.findings) assert.equal(item.status, "pass", `${item.id}: ${item.summary}`);
+  }
+  const requested = new Set(healthyLog.map((entry) => entry.path));
+  const surfaces = Object.keys(healthyCloudflareRoutes()).filter((path) => !CLOUDFLARE_FALLBACK_ROUTES.has(path));
+  assert.deepEqual([...requested].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the assessments, or the export");
+  const accessLog = [];
+  await checkCloudflareAccess(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), accessLog) }));
+  const probed = new Set(accessLog.map((entry) => entry.path));
+
+  for (const surface of surfaces) {
+    for (const [variant, response, expectedNote] of [
+      ["html", cloudflareCanaryHtml, HTML_BODY_NOTE],
+      ["json", cloudflareCanaryJson, REDACTED_CANARY_URL],
+    ]) {
+      const label = `${surface} (${variant})`;
+      const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: response }) });
+      const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-canary-"));
+
+      assertNoCanaryWindows(assert, access, CLOUDFLARE_PLANTED_CANARIES, `${label} check_access`);
+      if (probed.has(surface)) {
+        const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
+        assert.ok(failed.length > 0, `${label}: the access check records the failing surface`);
+        for (const entry of failed) {
+          assert.match(entry.error, expectedNote, `${label}: probe ${entry.name} carries the expected note`);
+          assert.equal(entry.count, null, `${label}: probe ${entry.name} renders no count`);
+          assert.equal(entry.http_status, variant === "html" ? 502 : 403, `${label}: probe ${entry.name} records the observed status`);
+        }
+      }
+
+      const recorded = recordedCloudflareErrors(assessments);
+      for (const assessment of assessments) assertNoCanaryWindows(assert, assessment, CLOUDFLARE_PLANTED_CANARIES, `${label} ${assessment.title}`);
+      assert.ok(recorded.length > 0, `${label}: the failing surface is recorded by an assessment`);
+      if (variant === "html") {
+        for (const error of recorded) assert.match(error, HTML_BODY_NOTE, `${label}: "${error}" carries the status-and-length note`);
+        assert.ok(recorded.some((error) => /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/.test(error)), `${label}: the note names the observed status`);
+      } else {
+        for (const error of recorded) assert.match(error, REDACTED_CANARY_URL, `${label}: "${error}" keeps the URL host and path with its query redacted`);
+      }
+
+      const files = readBundleFiles(exported.outputDir);
+      assertNoCanaryWindowsInFiles(assert, files, CLOUDFLARE_PLANTED_CANARIES, `${label} bundle`);
+      assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), CLOUDFLARE_PLANTED_CANARIES, `${label} zip`);
+      assert.ok(exported.errorCount > 0, `${label}: the export logs the failed read`);
+      if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+    }
+  }
+});
+
+/**
+ * Single-surface denials with the evidence a consumer reads for the denied inventory. Every field
+ * listed must render null (or false for readable flags), never the zero or empty list of a fallback.
+ */
+const CLOUDFLARE_DENIAL_TABLE = [
+  { surface: "/accounts", finding: null, summaryFields: { identity: ["visible_accounts"] }, coreData: "core_data/accounts.json" },
+  { surface: "/zones", finding: null, summaryFields: { zone: ["sampled_zones", "zones_total", "zone_inventory_truncated"], traffic: ["sampled_zones", "zones_total", "zone_inventory_truncated"], identity: ["sampled_zones"] }, coreData: "core_data/zones.json" },
+  { surface: "/user/tokens", finding: "CF-IAM-06", nullFields: [], sourceIndex: 0 },
+  { surface: `/accounts/${ACCOUNT}/tokens`, finding: "CF-IAM-06", nullFields: [], sourceIndex: 1 },
+  { surface: `/accounts/${ACCOUNT}/members`, finding: "CF-IAM-03", nullFields: ["super_admins", "members_seen", "members_total", "members_truncated", "members_without_2fa"], statusField: "members_http_status", summaryFields: { identity: ["super_admins"] } },
+  { surface: `/accounts/${ACCOUNT}/access/apps`, finding: "CF-IAM-04", nullFields: ["access_apps", "access_apps_total", "access_apps_truncated", "inline_policies", "bypass_policies", "apps_without_policies"], statusField: "access_apps_http_status", summaryFields: { identity: ["access_apps", "access_policies"] } },
+  { surface: `/accounts/${ACCOUNT}/access/policies`, finding: "CF-IAM-04", nullFields: ["reusable_policies", "reusable_policies_total", "reusable_policies_truncated"], statusField: "reusable_policies_http_status", summaryFields: { identity: ["access_policies"] } },
+  { surface: `/accounts/${ACCOUNT}/access/identity_providers`, finding: "CF-IAM-05", nullFields: ["identity_providers", "identity_provider_types", "identity_providers_truncated"], statusField: "identity_providers_http_status", summaryFields: { identity: ["identity_providers"] } },
+  { surface: `/accounts/${ACCOUNT}/audit_logs`, finding: "CF-TRF-04", nullFields: ["audit_events"], statusField: "http_status", summaryFields: { traffic: ["audit_events"] } },
+  { surface: `/accounts/${ACCOUNT}/firewall/access_rules/rules`, finding: "CF-TRF-05", nullFields: ["ip_access_rules"], statusField: "http_status", summaryFields: { traffic: ["ip_access_rules"] } },
+  { surface: `/accounts/${ACCOUNT}/gateway/rules`, finding: "CF-TRF-06", nullFields: ["gateway_rules"], statusField: "http_status", summaryFields: { traffic: ["gateway_rules"] } },
+];
+
+const ASSESSMENT_KEYS = { identity: "Cloudflare identity posture", zone: "Cloudflare zone security posture", traffic: "Cloudflare traffic controls posture" };
+
+test("denied-list markers: a denied list writes a not-collected marker in core_data with the observed status and path, a readable-but-empty list stays [], and every count for the denied inventory renders null", async () => {
+  const config = sampleConfig();
+  const outputRoot = createTempBase("grclanker-cloudflare-denied-");
+
+  // Readable-but-empty lists keep an empty items array with real, observed flags.
+  const emptyRoutes = { ...healthyCloudflareRoutes(), "/zones": cloudflareOk([]) };
+  const emptyRun = await runEveryCloudflareTool(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(emptyRoutes) }), outputRoot);
+  const emptyZones = JSON.parse(readBundleFiles(emptyRun.exported.outputDir).get("core_data/zones.json"));
+  assert.deepEqual(emptyZones, { items: [], truncated: false, totalCount: 0 }, "a readable-but-empty zone list is written as an empty items array with observed flags");
+  assert.equal(emptyRun.access.surfaces.find((entry) => entry.name === "zones").count, 0, "a readable-but-empty probe reports the real zero");
+  for (const name of ["zone_settings", "dnssec", "rulesets"]) {
+    const probe = emptyRun.access.surfaces.find((entry) => entry.name === name);
+    assert.equal(probe.status, "not_configured", `${name}: a readable-but-empty zone list leaves the zone-scoped probe not_configured`);
+    assert.equal(probe.error, "No visible zones were available.");
+  }
+  assert.equal(emptyRun.access.status, "healthy", "a readable-but-empty zone list is not a failure");
+  for (const item of emptyRun.assessments[1].findings) {
+    assert.equal(item.status, "manual", `${item.id} with zero zones`);
+    assert.equal(item.evidence.zones_seen, 0, `${item.id}: a readable-but-empty zone list counts zero`);
+    assert.equal(item.evidence.zone_inventory_truncated, false);
+  }
+
+  for (const entry of CLOUDFLARE_DENIAL_TABLE) {
+    const log = [];
+    const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [entry.surface]: cloudflareForbidden }, log) });
+    const { access, assessments, exported } = await runEveryCloudflareTool(client, outputRoot);
+    const label = entry.surface;
+    const files = readBundleFiles(exported.outputDir);
+    const accessFile = JSON.parse(files.get("core_data/access.json"));
+    assert.ok(log.some((request) => request.path === entry.surface && request.status === 403), `${label}: the fixture served the 403`);
+
+    for (const probe of accessFile.surfaces.filter((candidate) => candidate.status === "not_readable")) {
+      assert.deepEqual(
+        { count: probe.count, http_status: probe.http_status, endpoint: probe.endpoint },
+        { count: null, http_status: 403, endpoint: entry.surface },
+        `${label}: the denied probe ${probe.name} keeps count null and records the observed status and path`,
+      );
+      assert.match(probe.error, /\(403 Forbidden\)/, `${label}: the probe error names the observed status`);
+    }
+    for (const probe of access.surfaces.filter((candidate) => candidate.status === "readable")) {
+      assert.equal(typeof probe.count, "number", `${label}: a readable probe still reports its count`);
+    }
+    const probeFailed = access.surfaces.some((candidate) => candidate.status === "not_readable" || candidate.status === "not_attempted");
+    assert.equal(access.status, probeFailed ? "limited" : "healthy", `${label}: a failed or unattempted probe never leaves the access check healthy`);
+    const readableTally = access.notes.find((line) => /Cloudflare audit surfaces are readable/.test(line));
+    assert.equal(readableTally, `${access.surfaces.filter((candidate) => candidate.status === "readable").length}/${access.surfaces.length} Cloudflare audit surfaces are readable.`, `${label}: the tally counts only readable probes`);
+
+    if (entry.surface === "/zones") {
+      // The zone-scoped probes were never sent: each names the parent read and its status, never the
+      // not_configured rendering a readable-but-empty zone list earns, and none counts as readable.
+      const dependent = ["zone_settings", "dnssec", "rulesets"].map((name) => access.surfaces.find((candidate) => candidate.name === name));
+      assert.equal(dependent.filter(Boolean).length, 3, `${label}: zone_settings, dnssec, and rulesets rows are all present`);
+      for (const probe of dependent) {
+        assert.deepEqual(
+          { status: probe.status, count: probe.count, http_status: probe.http_status },
+          { status: "not_attempted", count: null, http_status: 403 },
+          `${label}: ${probe.name} is not attempted with the /zones status`,
+        );
+        assert.match(probe.error, /^Not attempted: \/zones could not be read \(.*\(403 Forbidden\)/, `${label}: ${probe.name} names the parent read and its status`);
+        assert.doesNotMatch(probe.error, /No visible zones/, `${label}: ${probe.name} is not mistaken for an empty zone list`);
+      }
+      assert.equal(access.surfaces.filter((candidate) => candidate.status === "not_configured").length, 0, `${label}: no probe renders not_configured for a denied zone list`);
+      assert.ok(access.notes.some((line) => /3 zone-scoped surfaces were not attempted because \/zones could not be read \(403\)/.test(line)), `${label}: the notes name the parent read`);
+      assert.equal(access.surfaces.length, 9, `${label}: the denied zone list drops no row`);
+    }
+
+    if (entry.coreData) {
+      const marker = JSON.parse(files.get(entry.coreData));
+      assert.deepEqual(
+        { collected: marker.collected, status: marker.status, endpoint: marker.endpoint },
+        { collected: false, status: 403, endpoint: entry.surface },
+        `${label}: ${entry.coreData} is a not-collected marker, never an empty list`,
+      );
+      assert.match(marker.error, /403 Forbidden/, `${label}: the marker carries the scrubbed error`);
+      assert.ok(!("items" in marker), `${label}: the marker has no items array to mistake for an inventory`);
+    }
+
+    for (const [key, fields] of Object.entries(entry.summaryFields ?? {})) {
+      const assessment = assessments.find((candidate) => candidate.title === ASSESSMENT_KEYS[key]);
+      for (const field of fields) assert.equal(assessment.summary[field], null, `${label}: ${key} summary ${field} renders null for the denied inventory`);
+    }
+
+    if (entry.finding) {
+      const item = assessments.flatMap((assessment) => assessment.findings).find((candidate) => candidate.id === entry.finding);
+      assert.notEqual(item.status, "pass", `${label}: ${entry.finding} must not pass (${item.summary})`);
+      for (const field of entry.nullFields) assert.equal(item.evidence[field], null, `${label}: ${entry.finding} evidence ${field} renders null, not a fallback count`);
+      if (entry.statusField) assert.equal(item.evidence[entry.statusField], 403, `${label}: ${entry.finding} records the observed status`);
+      if (entry.sourceIndex !== undefined) {
+        const source = item.evidence.sources[entry.sourceIndex];
+        assert.deepEqual({ readable: source.readable, seen: source.seen, total: source.total, truncated: source.truncated, http_status: source.http_status, endpoint: source.endpoint }, { readable: false, seen: null, total: null, truncated: null, http_status: 403, endpoint: entry.surface }, `${label}: the denied token source carries no count`);
+      }
+      assert.match(item.summary, new RegExp(entry.surface.replace(/[/]/g, "\\/")), `${label}: ${entry.finding} names the denied endpoint`);
+    } else if (entry.surface === "/zones") {
+      // Every zone-scoped finding (the account-scoped CF-TRF-04..06 do not read the zone list).
+      const zoneScoped = [...assessments[1].findings, ...assessments[2].findings.filter((item) => /^CF-TRF-0[1-3]$/.test(item.id))];
+      assert.equal(zoneScoped.length, 18, `${label}: every zone-scoped finding is checked`);
+      {
+        for (const item of zoneScoped) {
+          assert.equal(item.status, "manual", `${label}: ${item.id} renders manual for the denied zone list`);
+          assert.deepEqual(
+            { zones_seen: item.evidence.zones_seen, zones_total: item.evidence.zones_total, zone_inventory_truncated: item.evidence.zone_inventory_truncated, zones_http_status: item.evidence.zones_http_status },
+            { zones_seen: null, zones_total: null, zone_inventory_truncated: null, zones_http_status: 403 },
+            `${label}: ${item.id} carries no zone count, total, or truncation flag`,
+          );
+          assert.ok(!("per_hostname_source" in item.evidence) && !("legacy_fallback" in item.evidence), `${label}: ${item.id} names no endpoint the run never requested`);
+        }
+      }
+    }
+  }
+});
+
+/** Endpoint mentions: absolute paths, `{zone_id}`-style templates, and per-zone suffix labels such as "/dnssec". */
+function namedCloudflareEndpoints(text) {
+  const mentions = new Set();
+  for (const match of text.matchAll(/(?<![\w.:/])(\/(?:user|accounts|zones|rulesets|dnssec|settings|ssl|origin_tls_client_auth|dns_records|pagerules|bot_management|rate_limits|firewall|subscription|access|gateway|audit_logs|members|tokens)(?:\/[A-Za-z0-9_{}.*-]+)*)/g)) {
+    mentions.add(match[1].replace(/[.,;:)]+$/, ""));
+  }
+  return mentions;
+}
+
+function namedCloudflareStatusCodes(text) {
+  const codes = new Set();
+  for (const match of text.matchAll(/\((\d{3}) (?:Forbidden|Unauthorized|Not Found|Bad Gateway|Bad Request|Internal Server Error|Service Unavailable|Too Many Requests|OK)\)/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/"[a-z_]*(?:http_)?status": ?(\d{3})\b/g)) codes.add(Number(match[1]));
+  return codes;
+}
+
+function cloudflareEndpointWasRequested(mention, log) {
+  const pattern = new RegExp(`${mention.replace(/[.*]/g, "\\$&").replace(/\{[^}]+\}/g, "[^/]+")}$`);
+  return log.some((request) => pattern.test(request.path));
+}
+
+test("request matching: every endpoint path and HTTP status named in any output corresponds to a request the run made and observed", async () => {
+  const config = sampleConfig();
+  const outputRoot = createTempBase("grclanker-cloudflare-request-log-");
+  const log = [];
+  const routes = {
+    ...healthyCloudflareRoutes(),
+    [`/accounts/${ACCOUNT}/access/policies`]: cloudflareForbidden,
+    [`/accounts/${ACCOUNT}/members`]: cloudflareCanaryHtml,
+    [`/zones/${ZONE}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.firewallManaged}/entrypoint`]: cloudflareForbidden,
+    [`/zones/${ZONE}/dnssec`]: cloudflareNotFound,
+    // Enterprise-shaped bot management renders manual, which is the only path that requests the zone subscription.
+    [`/zones/${ZONE}/bot_management`]: cloudflareOk({ auto_update_model: true, suppress_session_score: false }),
+    [`/zones/${ZONE}/subscription`]: cloudflareForbidden,
+    [`/accounts/${ACCOUNT}/gateway`]: cloudflareForbidden,
+  };
+  const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(routes, log) });
+  const { access, assessments, exported } = await runEveryCloudflareTool(client, outputRoot);
+
+  const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...readBundleFiles(exported.outputDir).values()];
+  const text = outputs.join("\n");
+  const observedStatuses = new Set(log.map((request) => request.status));
+  assert.ok(observedStatuses.has(403) && observedStatuses.has(502) && observedStatuses.has(404), "the fixture served every failure status under test");
+  assert.ok(log.some((request) => request.path === `/zones/${ZONE}/firewall/rules`), "the deprecated firewall rules fallback was requested because the managed ruleset read failed");
+  assert.ok(log.some((request) => request.path === `/zones/${ZONE}/subscription`), "the zone subscription was requested because the bot management verdict is manual");
+
+  const endpoints = namedCloudflareEndpoints(text);
+  assert.ok(endpoints.size >= 8, `the outputs name the failing endpoints (${[...endpoints].join(", ")})`);
+  for (const mention of endpoints) {
+    assert.ok(cloudflareEndpointWasRequested(mention, log), `endpoint "${mention}" is named in output but the run never requested it`);
+  }
+  const statuses = namedCloudflareStatusCodes(text);
+  assert.ok(statuses.has(403) && statuses.has(502), `the outputs name the observed failure statuses (${[...statuses].join(", ")})`);
+  for (const status of statuses) {
+    assert.ok(observedStatuses.has(status), `status ${status} is named in output but no request observed it`);
+  }
+  // The legacy fallback is documented only because the run requested it.
+  const managedWaf = assessments[1].findings.find((item) => item.id === "CF-ZONE-01");
+  assert.equal(managedWaf.evidence.legacy_firewall_rules_seen, 0);
+  assert.match(managedWaf.evidence.legacy_fallback, /was consulted for evidence only because the rulesets API was unreadable/);
+});
+
+test("config loader errors: a SyntaxError raised by the transport is recorded by name only, never by the parser's message that quotes the body", async () => {
+  const snippet = parserSnippetBody();
+  const fetchImpl = async () => {
+    throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
+  };
+  const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
+  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+
+  await assert.rejects(() => client.listAccounts(), (error) => {
+    assert.equal(error.name, "CloudflareApiError");
+    assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
+    assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
+    assert.equal(error.message, `Cloudflare request failed for /accounts (network error: ${note})`);
+    return true;
+  });
+
+  const outputs = [
+    await checkCloudflareAccess(client).then((result) => JSON.stringify(result), (error) => error.message),
+    JSON.stringify(await assessCloudflareIdentity(client)),
+  ];
+  for (const text of outputs) {
+    assertNoCanaryWindows(assert, text, [PARSER_SNIPPET_CANARY], "tool output");
+    assert.doesNotMatch(text, PARSER_WORDING, `a slice of the parser's message reached an output: ${text.slice(0, 400)}`);
+    assert.ok(text.includes(note), `the output records the parse failure by name: ${text.slice(0, 400)}`);
+  }
+});
+
+test("config loader errors: a 200 answer whose body is short non-JSON text is recorded as the non-JSON note only; no 6-to-24-character window of the body and no parser wording reaches the thrown client error, the access check, an assessment, or the bundle", async () => {
+  // Positive control for the class: V8 quotes the whole source when it is 21 characters or shorter.
+  assert.ok(SHORT_BODY_CANARY.length <= 21 && parserMessageFor(SHORT_BODY_CANARY).includes(SHORT_BODY_CANARY), "the parser's message carries the whole short body");
+
+  const surface = "/accounts";
+  const log = [];
+  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: () => shortBodyResponse() }, log) });
+
+  // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
+  await assert.rejects(() => client.listAccounts(), (error) => {
+    assert.equal(error.name, "CloudflareApiError");
+    assert.equal(error.status, 200);
+    assertShortBodyRecordedAsNote(assert, error.message, "thrown client error");
+    assert.equal(error.message, `Cloudflare request returned a non-JSON payload for ${surface} (200 OK): non-JSON body (${SHORT_BODY_CONTENT_TYPE}, 18 bytes)`);
+    return true;
+  });
+
+  const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-short-body-"));
+  assertShortBodyRecordedAsNote(assert, access, "check_access");
+  const probe = access.surfaces.find((entry) => entry.name === "accounts");
+  assert.ok(probe && probe.status === "not_readable", "the accounts probe is not readable");
+  assert.equal(probe.http_status, 200, "the probe records the observed status");
+  assertShortBodyRecordedAsNote(assert, assessments[0], `${assessments[0].title} assessment`);
+  for (const assessment of assessments) assertNoShortBodyFragments(assert, assessment, `${assessment.title} assessment`);
+
+  const files = readBundleFiles(exported.outputDir);
+  for (const [name, text] of files) assertNoShortBodyFragments(assert, text, `bundle ${name}`);
+  for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
+  assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
+  assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
 });
