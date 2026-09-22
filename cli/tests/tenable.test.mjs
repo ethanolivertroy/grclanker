@@ -1885,6 +1885,276 @@ test("addendum 5: refused or failed Tenable reads write not-collected markers na
   }
 });
 
+// The Security Center surfaces alongside the Vulnerability Management ones: both
+// platforms configured at once, so one sweep covers every request the integration makes.
+function healthyScRoutes() {
+  const scUser = { id: "1", username: "auditor", role: { id: "1", name: "Security Manager" }, lastLogin: String(Math.floor(NOW / 1000) - 3600) };
+  return {
+    "GET /rest/currentUser": { error_code: 0, response: scUser },
+    "GET /rest/scan": { error_code: 0, response: { usable: [{ id: "1", name: "Weekly", status: "completed", schedule: { type: "ical", repeatRule: "FREQ=WEEKLY" }, policy: { id: "1" }, credentials: [{ id: "1" }], modifiedTime: String(Math.floor(NOW / 1000) - 3600) }], manageable: [] } },
+    "GET /rest/scanResult": { error_code: 0, response: { usable: [{ id: "1", name: "Weekly", status: "Completed", startTime: String(Math.floor(NOW / 1000) - 7200), finishTime: String(Math.floor(NOW / 1000) - 3600), scannedIPs: "10", totalIPs: "10" }], manageable: [] } },
+    "GET /rest/scanner": { error_code: 0, response: { usable: [{ id: "1", name: "sc-scanner", status: "1", enabled: "true", version: "10.8.0", pluginSet: RECENT_PLUGIN_SET, loadedPluginSet: RECENT_PLUGIN_SET, lastCheckinTime: String(Math.floor(NOW / 1000) - 600) }], manageable: [] } },
+    "GET /rest/user": { error_code: 0, response: { usable: [{ ...scUser, status: "0", locked: "false", failedLogins: "0", authType: "tns" }], manageable: [] } },
+    "GET /rest/feed": { error_code: 0, response: { active: { updateTime: String(Math.floor(NOW / 1000) - 3600), stale: "false" } } },
+  };
+}
+
+const SC_FIXTURE = { sc_url: "https://sc.example.internal", sc_access_key: "fixture-sc-access-key-2026", sc_secret_key: "fixture-sc-secret-key-2026" };
+
+function bothPlatformClients(fetchImpl) {
+  // A short export deadline: a poll that never reaches a terminal state must not spin for seconds.
+  return createTenableClients(vmConfig(SC_FIXTURE), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 200, retryLimit: 1 });
+}
+
+function verdictMap(results) {
+  return new Map(allFindings(results).map((finding) => [finding.id, finding.status]));
+}
+
+function namedTenableStatusCodes(text) {
+  return [...text.matchAll(/HTTP (\d{3})\b/g)].map((match) => Number(match[1]));
+}
+
+// Where each surface lands in core_data, so the not-collected marker can be read back.
+const SILENT_SUCCESS_MARKERS = {
+  "GET /scans": ["scans.json"],
+  "GET /policies": ["policies.json"],
+  "GET /editor/scan/templates": ["scan_templates.json"],
+  "GET /exclusions": ["exclusions.json"],
+  "GET /target-groups": ["target_groups.json"],
+  "GET /server/properties": ["server_properties.json"],
+  "GET /scanners": ["scanners.json"],
+  "GET /scanners/null/agents": ["agents.json"],
+  "GET /scanners/null/agent-groups": ["agent_groups.json"],
+  "GET /networks": ["networks.json"],
+  "GET /tags/categories": ["tag_categories.json"],
+  "GET /tags/values": ["tag_values.json"],
+  "GET /users": ["users.json"],
+  "GET /groups": ["groups.json"],
+  "GET /access-control/v1/roles": ["roles.json"],
+  "GET /api/v3/access-control/permissions": ["permissions.json"],
+  "GET /v2/access-groups": ["access_groups.json"],
+  "GET /credentials": ["credentials.json"],
+  "GET /audit-log/v1/events": ["audit_log_events.json"],
+  "GET /vulns/export/status": ["export_jobs.json", "vulns"],
+  "GET /assets/export/status": ["export_jobs.json", "assets"],
+  "POST /assets/export": ["assets_export.json"],
+  "GET /assets/export/asset-export-1/status": ["assets_export.json"],
+  "GET /assets/export/asset-export-1/chunks/1": ["assets_export.json"],
+  "POST /vulns/export": ["vulns_export.json"],
+  "GET /vulns/export/vuln-export-1/status": ["vulns_export.json"],
+  "GET /vulns/export/vuln-export-1/chunks/1": ["vulns_export.json"],
+  "GET /rest/scan": ["security_center.json", "scans"],
+  "GET /rest/scanResult": ["security_center.json", "scan_results"],
+  "GET /rest/scanner": ["security_center.json", "scanners"],
+  "GET /rest/user": ["security_center.json", "users"],
+  "GET /rest/feed": ["security_center.json", "feed"],
+};
+
+// Text of the page or of JSON.parse's own message (which quotes a window of the body)
+// that must never reach any output.
+const NON_DOCUMENT_ECHO = /Captive portal canary page|Unexpected token|is not valid JSON|Unexpected end of JSON|prod-us-east-2026/;
+
+// Every body a proxy, captive portal, sign-in page, or misrouted request can serve with
+// a 2xx status in place of the documented document, driven through the real client
+// parser path. The page carries two carried canaries so an echo would show; the last
+// shape carries a content type that is not shaped like a media type, which is never
+// quoted. The foreign object carries no "status" member, so on an export status poll it
+// is a foreign document rather than an unknown export state.
+const SILENT_SUCCESS_SHAPES = [
+  {
+    name: "200-html",
+    make: () => new Response(
+      `<html><head><title>Captive portal canary page</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p><p>Cookie: sid=${CANARY_NAMED}</p></body></html>`,
+      { status: 200, statusText: "OK", headers: { "content-type": "text/html; charset=utf-8" } },
+    ),
+    note: /HTTP 200 OK with a non-JSON text\/html response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
+  },
+  {
+    name: "200-empty",
+    make: () => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /HTTP 200 OK with an empty response body where the documented JSON document was expected/,
+  },
+  {
+    name: "200-json-array",
+    make: () => new Response("[]", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /HTTP 200 OK with a JSON array response body \(2 bytes, not echoed\) where the documented JSON object was expected/,
+    // The documented answer of a role list or an export chunk is an array, so [] is a complete empty answer there.
+    documentedWhen: (healthy) => Array.isArray(healthy),
+  },
+  {
+    name: "200-foreign-object",
+    make: () => new Response(JSON.stringify({ ok: true, region: "prod-us-east-2026" }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /HTTP 200 OK with (?:a JSON response body without (?:the documented "[a-z_]+" (?:array|object|list|member)|any of the documented members (?:"[a-z_]+"(?:, )?)+) \(\d+ bytes, not echoed\)|a JSON object response body \(\d+ bytes, not echoed\) where the documented JSON array was expected)/,
+  },
+  {
+    name: "200-hostile-media-type",
+    make: () => new Response("<html>Captive portal canary page</html>", { status: 200, statusText: "OK", headers: { "content-type": `Bearer ${CANARY_BEARER}` } }),
+    note: /HTTP 200 OK with a non-JSON unknown response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
+  },
+];
+
+test("silent-success class: a 2xx answer without the documented JSON document on any Vulnerability Management or Security Center surface is an unreadable surface with the observed status, never an empty inventory, a readable probe, a healthy check, or a hard verdict", async () => {
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const surfaces = Object.keys(routes);
+  assert.ok(surfaces.length >= 34, `every surface of both platforms is enumerated (${surfaces.length})`);
+  const overriding = (surface, make) => {
+    const fallback = routerFetch(routes);
+    return async (url, init) => {
+      const key = `${(init?.method ?? "GET").toUpperCase()} ${new URL(url).pathname}`;
+      return key === surface ? make() : fallback(url, init);
+    };
+  };
+
+  // Baseline: both platforms healthy, every request answered 200, and no error recorded.
+  const baselineFetch = recordingTenableFetch(routerFetch(routes));
+  const baselineClients = bothPlatformClients(baselineFetch.fetchImpl);
+  const baselineAccess = await checkTenableAccess(baselineClients);
+  assert.equal(baselineAccess.status, "healthy", JSON.stringify(baselineAccess.notes));
+  const baselineResults = await runAll(baselineClients, { expectedAssetCount: 2 });
+  assert.deepEqual(baselineResults.flatMap((result) => result.errors), []);
+  assert.ok(baselineFetch.requests.every((request) => request.status === 200), `the healthy fixture answers every request: ${JSON.stringify(baselineFetch.requests.filter((request) => request.status !== 200))}`);
+  const baseline = verdictMap(baselineResults);
+
+  // Positive control: the parser's own message quotes the page, so only the fixed note keeps it out.
+  const htmlBody = await SILENT_SUCCESS_SHAPES[0].make().text();
+  assert.throws(() => JSON.parse(htmlBody), (error) => /Unexpected token|is not valid JSON/.test(error.message));
+  for (const shape of SILENT_SUCCESS_SHAPES) assert.equal(shape.make().status, 200, `${shape.name} is served as a success`);
+
+  for (const surface of surfaces) {
+    // A 2xx without the document demotes exactly the verdicts a refusal of the same surface demotes.
+    const refusedResults = await runAll(bothPlatformClients(overriding(surface, () => jsonResponse({ error: "forbidden" }, 403))), { expectedAssetCount: 2 });
+    const refused = verdictMap(refusedResults);
+    const dependents = [...baseline.keys()].filter((id) => refused.get(id) !== baseline.get(id));
+    // A surface only the access check reads (the Security Center caller) records no collection error.
+    const probeOnly = refusedResults.every((result) => result.errors.length === 0);
+    assert.equal(probeOnly, surface === "GET /rest/currentUser", `${surface}: ${probeOnly ? "no collector reads it" : "a collector reads it"}`);
+    const [markerFile, markerKey] = SILENT_SUCCESS_MARKERS[surface] ?? [];
+    assert.equal(markerFile !== undefined, !probeOnly && !surface.startsWith("GET /policies/"), `${surface}: a collected surface lands in core_data`);
+
+    for (const shape of SILENT_SUCCESS_SHAPES) {
+      const label = `${shape.name} on ${surface}`;
+      const { fetchImpl, requests } = recordingTenableFetch(overriding(surface, shape.make));
+      const clients = bothPlatformClients(fetchImpl);
+
+      if (shape.documentedWhen?.(routes[surface])) {
+        // The documented empty answer: a complete, empty inventory, never an error.
+        const results = await runAll(clients, { expectedAssetCount: 2 });
+        assert.deepEqual(results.flatMap((result) => result.errors), [], `${label}: the documented empty array is not an error`);
+        const probe = (await checkTenableAccess(clients)).surfaces.find((entry) => entry.endpoint === surface);
+        if (probe) assert.deepEqual({ status: probe.status, count: probe.count }, { status: "readable", count: 0 }, label);
+        continue;
+      }
+
+      const access = await checkTenableAccess(clients);
+      const accessText = JSON.stringify(access);
+      assertNoCanary(accessText, `${label} access check`);
+      assert.doesNotMatch(accessText, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached the access check`);
+      const probe = access.surfaces.find((entry) => entry.endpoint === surface);
+      if (probe) {
+        assert.equal(probe.status, "not_readable", `${label}: the probe does not count the surface as readable`);
+        assert.equal(probe.httpStatus, 200, `${label}: the probe carries the status the request observed`);
+        assert.equal(probe.count, null, `${label}: nothing was read, so nothing is counted`);
+        assert.match(probe.error, shape.note, `${label}: ${probe.error}`);
+        assert.equal(access.status, "limited", `${label}: a surface that produced no data is not a healthy check`);
+        assert.ok(access.notes.some((note) => note.startsWith(`${probe.name} could not be read: `)), `${label}: the notes name the surface: ${access.notes.join(" | ")}`);
+        assert.match(access.recommendedNextStep, /Investigate the failed surfaces/, `${label}: the next step names the surface, not the credential`);
+        assert.equal(access.surfaces.filter((entry) => entry.status !== "readable").length, 1, `${label}: only the failing surface is unreadable`);
+      } else {
+        assert.equal(access.status, "healthy", `${label}: the access check does not read this surface`);
+      }
+
+      const results = await runAll(clients, { expectedAssetCount: 2 });
+      const resultsText = JSON.stringify(results);
+      assertNoCanary(resultsText, `${label} assessments`);
+      assert.doesNotMatch(resultsText, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached an assessment`);
+      const errors = results.flatMap((result) => result.errors);
+      assert.equal(errors.length > 0, !probeOnly, `${label}: the surface is recorded as a collection error exactly when a collector reads it: ${JSON.stringify(errors)}`);
+      for (const error of errors) assert.match(error, shape.note, `${label}: ${error}`);
+      for (const [id, status] of verdictMap(results)) {
+        assert.equal(status, refused.get(id), `${label}: ${id} renders ${status} where a refused read of the same surface renders ${refused.get(id)}`);
+        if (dependents.includes(id)) assert.ok(["warn", "manual"].includes(status), `${label}: dependent ${id} rendered the hard verdict ${status}`);
+      }
+      for (const code of namedTenableStatusCodes(`${accessText}\n${resultsText}`)) {
+        assert.equal(code, 200, `${label}: status ${code} is named in output but the fixture served only 200`);
+      }
+
+      const exported = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-silent-success-")), { now: NOW });
+      const files = readBundleFiles(exported.outputDir);
+      for (const [name, content] of files) {
+        assertNoCanary(content, `${label} ${name}`);
+        assert.doesNotMatch(content, NON_DOCUMENT_ECHO, `${label}: the page or the parser message reached ${name}`);
+      }
+      if (probeOnly) {
+        assert.equal(files.has("_errors.log"), false, `${label}: no collector failed, so there is no _errors.log`);
+        const bundledProbe = JSON.parse(files.get(join("core_data", "access_check.json"))).surfaces.find((entry) => entry.endpoint === surface);
+        assert.match(bundledProbe.error, shape.note, `${label}: the bundled access check carries the note`);
+      } else {
+        assert.match(files.get("_errors.log"), shape.note, `${label}: _errors.log carries the note`);
+      }
+      if (markerFile) {
+        const document = JSON.parse(files.get(join("core_data", markerFile)));
+        const marker = markerKey ? document[markerKey] : document;
+        assert.deepEqual(
+          { collected: marker.collected, status: marker.status, dataset_status: marker.dataset_status },
+          { collected: false, status: 200, dataset_status: "error" },
+          `${label}: the dataset is a marker carrying the observed status, not an empty list: ${JSON.stringify(marker)}`,
+        );
+        assert.match(marker.error, shape.note, `${label}: the marker carries the note`);
+        assert.ok(tenableRequestObserved(requests, marker.endpoint, 200), `${label}: the marker names a request the run made: ${marker.endpoint}`);
+      }
+      assert.ok(requests.every((request) => request.status === 200), `${label}: every request in the run observed a 2xx`);
+    }
+  }
+});
+
+test("TenableApiClient fails a later page, a status poll, a chunk, or a Security Center envelope that lacks the documented member instead of returning a shorter complete inventory", async () => {
+  const scripted = (responses, config = vmConfig()) => {
+    let index = 0;
+    return createTenableClients(config, { fetchImpl: async () => responses[Math.min(index++, responses.length - 1)](), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 200 });
+  };
+  const ok = (body) => new Response(JSON.stringify(body), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+
+  await assert.rejects(
+    scripted([() => ok({ agents: [{ id: 1 }], pagination: { total: 3 } }), () => ok({ pagination: { total: 3 } })]).vm.listAgents(),
+    (error) => {
+      assert.ok(error instanceof TenableApiError);
+      assert.equal(error.status, 200);
+      assert.equal(error.endpoint, "GET /scanners/null/agents");
+      assert.match(error.message, /^Tenable request GET \/scanners\/null\/agents returned HTTP 200 OK with a JSON response body without the documented "agents" array \(\d+ bytes, not echoed\)$/);
+      return true;
+    },
+  );
+  // The documented empty collection (null or []) is still an empty, complete inventory.
+  assert.deepEqual(await scripted([() => ok({ scans: null })]).vm.listScans(), []);
+  assert.deepEqual(await scripted([() => ok({ users: [] })]).vm.listUsers(), []);
+  await assert.rejects(scripted([() => ok({ users: { id: 1 } })]).vm.listUsers(), /without the documented "users" array/);
+  await assert.rejects(scripted([() => ok({ ok: true })]).vm.getServerProperties(), /without any of the documented members "plugin_set", "loaded_plugin_set", "server_version", "nessus_type", "nessus_ui_version", "license" \(\d+ bytes, not echoed\)$/);
+  await assert.rejects(scripted([() => ok({ ok: true })]).vm.getPolicyDetails(7), /GET \/policies\/7 returned HTTP 200 OK with a JSON response body without any of the documented members "uuid", "settings", "plugins", "credentials"/);
+  await assert.rejects(scripted([() => ok({ roles: [] })]).vm.listRoles(), /returned HTTP 200 OK with a JSON object response body \(\d+ bytes, not echoed\) where the documented JSON array was expected$/);
+  // A 204 is not a documented answer to any read here and carries no document.
+  await assert.rejects(scripted([() => new Response(null, { status: 204, statusText: "No Content" })]).vm.listGroups(), /returned HTTP 204 No Content with an empty response body where the documented JSON document was expected$/);
+
+  // Export: a start without export_uuid, a poll without status, and a chunk that is not an array.
+  await assert.rejects(scripted([() => ok({ ok: true })]).vm.exportAssets(), /POST \/assets\/export returned HTTP 200 OK with a JSON response body without the documented "export_uuid" member/);
+  const pollFailed = await scripted([() => ok({ export_uuid: "x-1" }), () => ok({ ok: true })]).vm.exportAssets();
+  assert.equal(pollFailed.status, "STATUS_UNREADABLE");
+  assert.equal(pollFailed.httpStatus, 200);
+  assert.equal(pollFailed.endpoint, "GET /assets/export/x-1/status");
+  assert.match(pollFailed.reason, /GET \/assets\/export\/x-1\/status returned HTTP 200 OK with a JSON response body without the documented "status" member/);
+  const chunkFailed = await scripted([() => ok({ export_uuid: "x-2" }), () => ok({ status: "FINISHED", chunks_available: [1], chunks_failed: [], total_chunks: 1 }), () => ok({ assets: [] })]).vm.exportAssets();
+  assert.deepEqual({ status: chunkFailed.status, fetchedChunks: chunkFailed.fetchedChunks, downloadFailures: chunkFailed.downloadFailures, truncated: chunkFailed.truncated, httpStatus: chunkFailed.httpStatus, endpoint: chunkFailed.endpoint }, { status: "FINISHED", fetchedChunks: 0, downloadFailures: 1, truncated: true, httpStatus: 200, endpoint: "GET /assets/export/x-2/chunks/1" });
+  assert.match(chunkFailed.reason, /1 chunk downloads failed: Tenable request GET \/assets\/export\/x-2\/chunks\/1 returned HTTP 200 OK with a JSON object response body \(\d+ bytes, not echoed\) where the documented JSON array was expected/);
+
+  // Security Center: the envelope must carry response, and response must have the documented shape.
+  const sc = (responses) => scripted(responses, resolveTenableConfiguration({ url: "https://sc.example.internal", access_key: "sc-access-key", secret_key: "sc-secret-key", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV)).securityCenter;
+  await assert.rejects(sc([() => ok({ error_code: 0 })]).getCurrentUser(), /GET \/rest\/currentUser returned HTTP 200 OK with a JSON response body without the documented "response" member/);
+  await assert.rejects(sc([() => ok({ error_code: 0, response: [] })]).getCurrentUser(), /without the documented "response" object/);
+  await assert.rejects(sc([() => ok({ error_code: 0, response: { id: "1" } })]).listScans(), /GET \/rest\/scan returned HTTP 200 OK with a JSON response body without the documented "response" list/);
+  await assert.rejects(sc([() => ok({ error_code: 0, response: "ok" })]).listUsers(), /without the documented "response" list/);
+  assert.deepEqual(await sc([() => ok({ error_code: 0, response: { usable: [], manageable: [] } })]).listScanners(), []);
+  assert.deepEqual(await sc([() => ok({ error_code: 0, response: [{ id: "9" }] })]).listUsers(), [{ id: "9" }]);
+});
+
 test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
   const base = mkdtempSync(join(tmpdir(), "tenable-secure-"));
   assert.throws(() => resolveSecureOutputPath(base, "../escape"), /outside/);

@@ -781,28 +781,99 @@ function projectPolicyDetails(payload: JsonRecord): JsonRecord {
   return projected;
 }
 
+// The media type of a response is server-controlled text: it is quoted only when it has
+// the shape of a media type, otherwise it is described as unknown.
+const MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,31}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,39}$/;
+
+function mediaTypeOf(response: Response): string {
+  const value = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+  return MEDIA_TYPE_PATTERN.test(value) ? value : "unknown";
+}
+
+// JSON.parse's own message quotes a window of the source, so it is never kept: a body
+// that is not JSON parses to undefined and is described by media type and size only.
+function parseJsonBody(rawText: string): { parsed: unknown } | undefined {
+  try {
+    return { parsed: JSON.parse(rawText) };
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonValueKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function statusLine(response: Response): string {
+  return `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+}
+
 // Non-JSON bodies (HTML error pages, SSO interstitials, WAF blocks) are described by
 // status and length only; JSON bodies contribute Tenable's documented error fields
 // (error, error.message, message, error_msg), each scrubbed before it is shortened, with
 // the caller's scrub when it knows the configured secrets, so the cut never leaves a
 // fragment of a secret behind.
 export function describeErrorBody(response: Response, rawText: string, scrub: (text: string) => string = redactErrorText): string {
-  const base = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  const base = statusLine(response);
   if (rawText.length === 0) return base;
-  const contentType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    return `${base}; non-JSON ${contentType} response body (${rawText.length} bytes, not echoed)`;
-  }
-  const record = asObject(parsed);
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base}; non-JSON ${mediaTypeOf(response)} response body (${rawText.length} bytes, not echoed)`;
+  const record = asObject(body.parsed);
   const fields = record
     ? [asString(record.error), asString(asObject(record.error)?.message), asString(record.message), asString(record.error_msg)]
       .filter((item): item is string => Boolean(item))
     : [];
   if (fields.length === 0) return `${base}; JSON response body without documented error fields (${rawText.length} bytes, not echoed)`;
   return `${base}; ${fields.map((field) => scrub(field.replace(/\s+/g, " ")).slice(0, 200)).join("; ")}`;
+}
+
+// What a 2xx answer was expected to carry: the documented JSON document of any kind, a
+// JSON object, a JSON array, one documented member of a JSON object (an array, an
+// object, a Security Center list, or the member's mere presence), or any one of the
+// members that identify a documented object.
+type DocumentExpectation =
+  | { kind: "document" }
+  | { kind: "object" }
+  | { kind: "array" }
+  | { kind: "member"; key: string; type: "array" | "object" | "list" | "member" }
+  | { kind: "members"; keys: string[] };
+
+/**
+ * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
+ * page a proxy or captive portal serves in place of the API, a foreign JSON value, a
+ * JSON object without the documented member) is described like an error body, by
+ * status, media type, and size only, and is recorded as an unreadable surface: its
+ * missing members are never read as an empty inventory or a disabled setting.
+ */
+export function describeNonDocumentBody(response: Response, rawText: string, expected: DocumentExpectation = { kind: "document" }): string {
+  const base = statusLine(response);
+  const size = `${rawText.length} bytes, not echoed`;
+  let what: string;
+  switch (expected.kind) {
+    case "member":
+      return `${base} with a JSON response body without the documented "${expected.key}" ${expected.type} (${size})`;
+    case "members":
+      return `${base} with a JSON response body without any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
+    case "document":
+      what = "the documented JSON document";
+      break;
+    case "object":
+      what = "the documented JSON object";
+      break;
+    case "array":
+      what = "the documented JSON array";
+      break;
+    default: {
+      const exhaustive: never = expected;
+      throw new Error(`Unhandled document expectation: ${String(exhaustive)}`);
+    }
+  }
+  if (rawText.length === 0) return `${base} with an empty response body where ${what} was expected`;
+  const body = parseJsonBody(rawText);
+  if (body === undefined) return `${base} with a non-JSON ${mediaTypeOf(response)} response body (${size}) where ${what} was expected`;
+  return `${base} with a JSON ${jsonValueKind(body.parsed)} response body (${size}) where ${what} was expected`;
 }
 
 function parseTimestampMs(value: unknown): number | undefined {
@@ -1145,6 +1216,17 @@ abstract class TenableHttpClient {
   }
 
   protected async requestJson(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<unknown> {
+    return (await this.requestDocument(path, init, query)).value;
+  }
+
+  /**
+   * One request, with the shape guard every 2xx answer passes: a body that is empty
+   * or not JSON is not the documented document and is thrown as an unreadable surface
+   * carrying the status the request observed, never returned as an empty object. The
+   * JSON value is returned with the response so a caller can describe a missing
+   * documented member the same way.
+   */
+  protected async requestDocument(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<TenableDocument> {
     const url = this.buildUrl(path, query);
     const endpoint = endpointLabel(init.method, path);
     for (let attempt = 0; ; attempt += 1) {
@@ -1179,15 +1261,58 @@ abstract class TenableHttpClient {
       if (!response.ok) {
         throw this.fail(`Tenable request ${endpoint} failed (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
       }
-      if (rawText.length === 0) return {};
-      try {
-        return JSON.parse(rawText) as unknown;
-      } catch {
-        const contentType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "unknown";
-        throw this.fail(`Tenable request ${endpoint} returned HTTP ${response.status} with a non-JSON ${contentType} body (${rawText.length} bytes, not echoed).`, response.status, endpoint);
-      }
+      const body = rawText.length === 0 ? undefined : parseJsonBody(rawText);
+      if (body === undefined) throw this.nonDocument({ value: undefined, response, rawText, endpoint }, { kind: "document" });
+      return { value: body.parsed, response, rawText, endpoint };
     }
   }
+
+  protected nonDocument(document: TenableDocument, expected: DocumentExpectation): TenableApiError {
+    return this.fail(`Tenable request ${document.endpoint} returned ${describeNonDocumentBody(document.response, document.rawText, expected)}`, document.response.status, document.endpoint);
+  }
+
+  // The documented answer is a JSON object; any other JSON value is a foreign document.
+  protected async requestObject(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<TenableObjectDocument> {
+    const document = await this.requestDocument(path, init, query);
+    const payload = asObject(document.value);
+    if (payload === undefined) throw this.nonDocument(document, { kind: "object" });
+    return { ...document, payload };
+  }
+
+  // The documented collection member must be present on every page: an array of records,
+  // or null, which Tenable serves for an empty collection on some list endpoints. A 2xx
+  // object without the member is a foreign document, not an empty inventory.
+  protected documentedRecords(document: TenableObjectDocument, key: string): JsonRecord[] {
+    const value = document.payload[key];
+    if (!(key in document.payload) || (value !== null && !Array.isArray(value))) throw this.nonDocument(document, { kind: "member", key, type: "array" });
+    return asRecords(value);
+  }
+
+  // The documented answer is a JSON array of records (a role list, an export chunk).
+  protected documentedList(document: TenableDocument): JsonRecord[] {
+    if (!Array.isArray(document.value)) throw this.nonDocument(document, { kind: "array" });
+    return asRecords(document.value);
+  }
+
+  // A documented object is recognised by any one of the members that identify it; an
+  // object carrying none of them (a health page, a portal's JSON) is a foreign document.
+  protected documentedObject(document: TenableObjectDocument, keys: string[]): JsonRecord {
+    if (!keys.some((key) => key in document.payload)) throw this.nonDocument(document, { kind: "members", keys });
+    return document.payload;
+  }
+}
+
+// One 2xx answer that passed the shape guard, kept with what the request observed so a
+// missing documented member can be described by status, media type, and size.
+interface TenableDocument {
+  value: unknown;
+  response: Response;
+  rawText: string;
+  endpoint: string;
+}
+
+interface TenableObjectDocument extends TenableDocument {
+  payload: JsonRecord;
 }
 
 /**
@@ -1244,19 +1369,29 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async get(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord> {
-    return asObject(await this.requestJson(path, {}, query)) ?? {};
+    return (await this.requestObject(path, {}, query)).payload;
   }
 
   async getRaw(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<unknown> {
     return this.requestJson(path, {}, query);
   }
 
+  // A read whose documented answer is a JSON array of records.
+  private async getList(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord[]> {
+    return this.documentedList(await this.requestDocument(path, {}, query));
+  }
+
+  // A read whose documented answer is a JSON object carrying the named array member.
+  private async getRecords(path: string, key: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord[]> {
+    return this.documentedRecords(await this.requestObject(path, {}, query), key);
+  }
+
   async post(path: string, body: JsonRecord): Promise<JsonRecord> {
-    return asObject(await this.requestJson(path, {
+    return (await this.requestObject(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-    })) ?? {};
+    })).payload;
   }
 
   async listPaginated(
@@ -1277,8 +1412,9 @@ export class TenableApiClient extends TenableHttpClient {
     let reason: string | undefined;
     let previousPageKey: string | undefined;
     for (let page = 0; page < maxPages; page += 1) {
-      const payload = await this.get(path, { ...query, limit: pageLimit, offset });
-      const pageItems = asRecords(payload[collectionKey]);
+      const document = await this.requestObject(path, {}, { ...query, limit: pageLimit, offset });
+      const payload = document.payload;
+      const pageItems = this.documentedRecords(document, collectionKey);
       const first = pageItems[0];
       const pageKey = first ? asString(first.uuid) ?? asString(first.id) ?? JSON.stringify(first) : undefined;
       // A page that opens with the same record as the previous one means the endpoint
@@ -1302,31 +1438,31 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async getServerProperties(): Promise<JsonRecord> {
-    return this.get("/server/properties");
+    return this.documentedObject(await this.requestObject("/server/properties"), ["plugin_set", "loaded_plugin_set", "server_version", "nessus_type", "nessus_ui_version", "license"]);
   }
 
   async listScans(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/scans")).scans);
+    return this.getRecords("/scans", "scans");
   }
 
   async getScanDetails(scanId: string | number): Promise<JsonRecord> {
-    return this.get(`/scans/${encodeURIComponent(String(scanId))}`);
+    return this.documentedObject(await this.requestObject(`/scans/${encodeURIComponent(String(scanId))}`), ["info", "hosts", "history"]);
   }
 
   async listPolicies(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/policies")).policies);
+    return this.getRecords("/policies", "policies");
   }
 
   async getPolicyDetails(policyId: string | number): Promise<JsonRecord> {
-    return this.get(`/policies/${encodeURIComponent(String(policyId))}`);
+    return this.documentedObject(await this.requestObject(`/policies/${encodeURIComponent(String(policyId))}`), ["uuid", "settings", "plugins", "credentials"]);
   }
 
   async listScanTemplates(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/editor/scan/templates")).templates);
+    return this.getRecords("/editor/scan/templates", "templates");
   }
 
   async listScanners(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/scanners")).scanners).map(stripScannerCredentials);
+    return (await this.getRecords("/scanners", "scanners")).map(stripScannerCredentials);
   }
 
   async listAgents(): Promise<TenablePage> {
@@ -1334,7 +1470,7 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async listAgentGroups(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/scanners/null/agent-groups")).groups);
+    return this.getRecords("/scanners/null/agent-groups", "groups");
   }
 
   async listNetworks(): Promise<TenablePage> {
@@ -1350,19 +1486,19 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async listUsers(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/users", { withRoles: true })).users);
+    return this.getRecords("/users", "users", { withRoles: true });
   }
 
   async listGroups(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/groups")).groups);
+    return this.getRecords("/groups", "groups");
   }
 
   async listRoles(): Promise<JsonRecord[]> {
-    return asRecords(await this.getRaw("/access-control/v1/roles"));
+    return this.getList("/access-control/v1/roles");
   }
 
   async listPermissions(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/api/v3/access-control/permissions")).permissions);
+    return this.getRecords("/api/v3/access-control/permissions", "permissions");
   }
 
   async listAccessGroups(): Promise<TenablePage> {
@@ -1382,15 +1518,15 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async listTargetGroups(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/target-groups")).target_groups);
+    return this.getRecords("/target-groups", "target_groups");
   }
 
   async listVulnExportJobs(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/vulns/export/status")).exports);
+    return this.getRecords("/vulns/export/status", "exports");
   }
 
   async listAssetExportJobs(): Promise<JsonRecord[]> {
-    return asRecords((await this.get("/assets/export/status")).exports);
+    return this.getRecords("/assets/export/status", "exports");
   }
 
   /**
@@ -1401,10 +1537,13 @@ export class TenableApiClient extends TenableHttpClient {
    * every record that did arrive.
    */
   private async runExport(kind: "assets" | "vulns", body: JsonRecord, maxChunks: number): Promise<TenableExportResult> {
-    const startEndpoint = `POST /${kind}/export`;
-    const started = await this.post(`/${kind}/export`, body);
-    const exportUuid = asString(started.export_uuid);
-    if (!exportUuid) throw this.fail(`Tenable ${kind} export did not return export_uuid.`, 0, startEndpoint);
+    const started = await this.requestObject(`/${kind}/export`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const exportUuid = asString(started.payload.export_uuid);
+    if (!exportUuid) throw this.nonDocument(started, { kind: "member", key: "export_uuid", type: "member" });
 
     const statusPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/status`;
     const statusEndpoint = `GET ${statusPath}`;
@@ -1426,7 +1565,12 @@ export class TenableApiClient extends TenableHttpClient {
     let status: JsonRecord = {};
     for (;;) {
       try {
-        status = await this.get(statusPath);
+        // The documented status document always carries the status string; a 2xx object
+        // without it is a foreign document and is reported as an unreadable poll rather
+        // than polled until the deadline.
+        const document = await this.requestObject(statusPath);
+        if (typeof document.payload.status !== "string") throw this.nonDocument(document, { kind: "member", key: "status", type: "member" });
+        status = document.payload;
       } catch (error) {
         return notRun("STATUS_UNREADABLE", errorMessage(error), errorEndpoint(error) ?? statusEndpoint, errorStatus(error) ?? null);
       }
@@ -1451,8 +1595,9 @@ export class TenableApiClient extends TenableHttpClient {
     for (const chunkId of available.slice(0, maxChunks)) {
       const chunkPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/chunks/${chunkId}`;
       try {
-        const chunk = await this.getRaw(chunkPath);
-        records.push(...asRecords(chunk));
+        // A chunk is the documented JSON array of records; a 2xx answer of any other
+        // shape is a failed download, never an empty chunk.
+        records.push(...await this.getList(chunkPath));
         fetchedChunks += 1;
       } catch (error) {
         downloadErrors.push(errorMessage(error));
@@ -1511,23 +1656,38 @@ export class TenableSecurityCenterClient extends TenableHttpClient {
     return { "x-apikey": `accesskey=${this.config.accessKey}; secretkey=${this.config.secretKey};` };
   }
 
-  private async rest(resource: string, query: Record<string, string | number | undefined> = {}): Promise<unknown> {
-    const payload = asObject(await this.requestJson(`/rest/${resource}`, {}, query)) ?? {};
+  // Security Center wraps every answer in { type, response, error_code, error_msg, ... }:
+  // a non-zero error_code is Security Center's own refusal, and a 2xx object without the
+  // response member is a foreign document, not an empty answer.
+  private async rest(resource: string, query: Record<string, string | number | undefined> = {}): Promise<{ response: unknown; document: TenableObjectDocument }> {
+    const document = await this.requestObject(`/rest/${resource}`, {}, query);
+    const payload = document.payload;
     const errorCode = asNumber(payload.error_code);
     if (errorCode !== undefined && errorCode !== 0) {
       throw this.fail(`Tenable Security Center GET /rest/${resource} returned error_code ${errorCode}: ${asString(payload.error_msg) ?? "unknown"}`, 0, `GET /rest/${resource}`);
     }
-    return payload.response;
+    if (!("response" in payload)) throw this.nonDocument(document, { kind: "member", key: "response", type: "member" });
+    return { response: payload.response, document };
   }
 
-  private static usableList(response: unknown): JsonRecord[] {
+  private async restObject(resource: string, query: Record<string, string | number | undefined> = {}): Promise<JsonRecord> {
+    const { response, document } = await this.rest(resource, query);
+    const object = asObject(response);
+    if (object === undefined) throw this.nonDocument(document, { kind: "member", key: "response", type: "object" });
+    return object;
+  }
+
+  // A Security Center list arrives either as a bare array or as { usable, manageable }
+  // arrays deduplicated by id; a response of any other shape is a foreign document.
+  private async restList(resource: string, query: Record<string, string | number | undefined> = {}): Promise<JsonRecord[]> {
+    const { response, document } = await this.rest(resource, query);
     if (Array.isArray(response)) return asRecords(response);
     const object = asObject(response);
-    if (!object) return [];
-    const usable = asRecords(object.usable);
-    const manageable = asRecords(object.manageable);
+    if (!object || (!Array.isArray(object.usable) && !Array.isArray(object.manageable))) {
+      throw this.nonDocument(document, { kind: "member", key: "response", type: "list" });
+    }
     const seen = new Set<string>();
-    return [...usable, ...manageable].filter((item) => {
+    return [...asRecords(object.usable), ...asRecords(object.manageable)].filter((item) => {
       const id = asString(item.id) ?? JSON.stringify(item);
       if (seen.has(id)) return false;
       seen.add(id);
@@ -1536,27 +1696,27 @@ export class TenableSecurityCenterClient extends TenableHttpClient {
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
-    return asObject(await this.rest("currentUser", { fields: "id,username,role,lastLogin" })) ?? {};
+    return this.restObject("currentUser", { fields: "id,username,role,lastLogin" });
   }
 
   async listScans(): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("scan", { fields: "id,name,status,schedule,policy,repository,credentials,modifiedTime" }));
+    return this.restList("scan", { fields: "id,name,status,schedule,policy,repository,credentials,modifiedTime" });
   }
 
   async listScanResults(startTimeUnix: number): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("scanResult", { fields: "id,name,status,startTime,finishTime,scannedIPs,totalIPs", startTime: startTimeUnix }));
+    return this.restList("scanResult", { fields: "id,name,status,startTime,finishTime,scannedIPs,totalIPs", startTime: startTimeUnix });
   }
 
   async listScanners(): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("scanner", { fields: "id,name,status,statusMessage,enabled,version,pluginSet,loadedPluginSet,lastCheckinTime,agentCapable" }));
+    return this.restList("scanner", { fields: "id,name,status,statusMessage,enabled,version,pluginSet,loadedPluginSet,lastCheckinTime,agentCapable" });
   }
 
   async listUsers(): Promise<JsonRecord[]> {
-    return TenableSecurityCenterClient.usableList(await this.rest("user", { fields: "id,username,status,role,lastLogin,locked,failedLogins,authType" }));
+    return this.restList("user", { fields: "id,username,status,role,lastLogin,locked,failedLogins,authType" });
   }
 
   async getFeed(): Promise<JsonRecord> {
-    return asObject(await this.rest("feed")) ?? {};
+    return this.restObject("feed");
   }
 }
 
@@ -3558,7 +3718,9 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
     ],
     recommendedNextStep: status === "healthy"
       ? "Run tenable_assess_scan_program, tenable_assess_sensor_coverage, tenable_assess_access_control, tenable_assess_vulnerability_management, or tenable_export_audit_bundle."
-      : "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces.",
+      : forbidden.length > 0 || callerIsAdministrator === false
+        ? "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces."
+        : "Investigate the failed surfaces (the base URL, a proxy or portal answering in place of the API, or a transport fault) before relying on the assessments; findings that read them are demoted to warn or manual.",
   };
 }
 
