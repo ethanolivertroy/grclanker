@@ -404,6 +404,11 @@ test("a carrier after a two-character JSON escape is recognised through every en
     (value) => [`DB_PASSWORD: ${value}`, `DB_PASSWORD: ${REDACTED}`],
     (value) => [`/v1/items?token=${value}&limit=5`, `/v1/items?token=${REDACTED}&limit=5`],
     (value) => [`Bearer ${value} was replayed`, `Bearer ${REDACTED} was replayed`],
+    // A PascalCase code that names a credential is a pair key after the escape and keeps its name: the
+    // long-token rule reads `InvalidAuthenticationToken=`, not `nInvalidAuthenticationToken=` as a
+    // 28-character padded token.
+    (value) => [`InvalidAuthenticationToken=${value}`, `InvalidAuthenticationToken=${REDACTED}`],
+    (value) => [`InvalidAuthenticationToken=\\"${value}\\"`, `InvalidAuthenticationToken=\\"${REDACTED}\\"`],
   ];
   // The escapes as the scrub sees them (two characters, or `\u` and four hex digits), then the
   // controls every escape must equal: a space, a raw line break, an escaped quote, an escaped backslash.
@@ -482,6 +487,17 @@ test("a carrier after a two-character JSON escape is recognised through every en
     for (const [name, scrub] of entryPoints) {
       assert.equal(scrub(text), text, `${name} changed ${JSON.stringify(text)}`);
     }
+  }
+  // The escape's letter is left out of a long run: a bare token after it still goes (the run without
+  // the letter is judged), a PascalCase code after it stays whole, and a run that is long only with
+  // the letter counted is a name.
+  for (const escape of escapes) {
+    assert.equal(scrubErrorText(`request failed${escape}${ERROR_CANARY.bearer} see the log`), `request failed${escape}${REDACTED} see the log`, escape);
+    assert.equal(scrubErrorText(`request failed${escape}${ERROR_CANARY.awsAccessKeyId}=${ERROR_CANARY.bearer}`), `request failed${escape}${REDACTED}=${REDACTED}`, escape);
+    assert.equal(scrubErrorText(`request failed${escape}InvalidAuthenticationToken=${REDACTED} see the log`), `request failed${escape}InvalidAuthenticationToken=${REDACTED} see the log`, escape);
+    assert.equal(scrubErrorText(`request failed${escape}InvalidAuthenticationToken: Access token has expired.`), `request failed${escape}InvalidAuthenticationToken: Access token has expired.`, escape);
+    assert.equal(scrubErrorText(`request failed${escape}UnauthorizedAccessException see the log`), `request failed${escape}UnauthorizedAccessException see the log`, escape);
+    assert.equal(scrubErrorText(`request failed${escape}kq7zx2vw9lm4tp8 see the log`), `request failed${escape}kq7zx2vw9lm4tp8 see the log`, `${escape}: fifteen characters after the letter are not a long run`);
   }
 });
 

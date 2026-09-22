@@ -331,6 +331,10 @@ const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = [
 // are judged on their own; "=" joins a run only as trailing base64 padding. "-" and "_" stay in the
 // run and split it into name segments (see `isNameSegment`).
 const LONG_TOKEN_RUN_PATTERN = new RegExp(`[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&]))?`, "g");
+// The letter of a JSON escape in front of a run (`\n`, `\t`, `\uXXXX`, see `NAME_START`) belongs to
+// the escape, not to the run: over JSON-encoded text `\nInvalidAuthenticationToken=` is the code
+// after a line break, not a 28-character padded token.
+const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv]|u[0-9A-Fa-f]{4})/;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
 const DIGITS_ONLY_PATTERN = /^\d+$/;
 const DIGIT_GROUP_PATTERN = /\d+/g;
@@ -755,12 +759,12 @@ function readSettingValue(text: string, valueStart: number): ValueReplacement | 
   if (quoted !== null) {
     if (!opensValue(text, quoted)) return null;
     const content = text.slice(quoted.start, quoted.end);
-    const scrubbed = content.replace(LONG_TOKEN_RUN_PATTERN, scrubLongTokenRun);
+    const scrubbed = replaceLongTokenRuns(content);
     return scrubbed === content ? null : { end: quoted.after, replacement: `${quoted.open}${scrubbed}${quoted.close}` };
   }
   const value = readBareValue(text, valueStart, PAIR_BARE_VALUE_PATTERN);
   if (value === null) return null;
-  const scrubbed = value.replace(LONG_TOKEN_RUN_PATTERN, scrubLongTokenRun);
+  const scrubbed = replaceLongTokenRuns(value);
   return scrubbed === value ? null : { end: valueStart + value.length, replacement: scrubbed };
 }
 
@@ -926,7 +930,23 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));
   for (const pattern of VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, REDACTED);
   if (options.longTokens === false) return scrubbed;
-  return scrubbed.replace(LONG_TOKEN_RUN_PATTERN, scrubLongTokenRun);
+  return replaceLongTokenRuns(scrubbed);
+}
+
+/**
+ * The long-token rule over `text`: every run of `LONG_TOKEN_RUN_PATTERN` through `scrubLongTokenRun`.
+ * A run that starts with the letter of a JSON escape (`\nInvalidAuthenticationToken=`, see
+ * `ESCAPE_LETTER_PATTERN`) is judged without that letter, so the escape stays a boundary as it is
+ * for the carriers and the code after it is read as the code.
+ */
+function replaceLongTokenRuns(text: string): string {
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string, offset: number) => {
+    const escape = offset > 0 && text[offset - 1] === "\\" ? ESCAPE_LETTER_PATTERN.exec(run)?.[0] : undefined;
+    if (escape === undefined) return scrubLongTokenRun(run);
+    const rest = run.slice(escape.length);
+    const body = rest.replace(/=+$/, "");
+    return `${escape}${body.length >= LONG_TOKEN_MIN_LENGTH ? scrubLongTokenRun(rest) : rest}`;
+  });
 }
 
 /**
