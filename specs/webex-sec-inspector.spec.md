@@ -3,20 +3,24 @@ slug: "webex-sec-inspector"
 name: "Webex Security Inspector"
 vendor: "Cisco"
 category: "saas-collaboration"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/webex-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# Cisco Webex Security Inspector — Architecture Specification
+# Cisco Webex Security Inspector - Architecture Specification
 
 ## 1. Overview
 
 Cisco Webex Security Inspector is a hybrid CLI/TUI tool that audits the security posture of a Cisco Webex organization. It connects to the Webex REST API (webexapis.com/v1) to evaluate identity and access management, messaging policies, meeting security, recording governance, device management, hybrid infrastructure, and compliance controls. The tool produces structured findings mapped to enterprise compliance frameworks and outputs reports in JSON, CSV, and HTML formats.
 
 The inspector targets Webex organizations on Business and Enterprise plans (including Webex Control Hub-managed orgs) where advanced security, compliance, and hybrid deployment capabilities are available. It operates in read-only mode and requires no agent installation.
+
+### grclanker implementation
+
+The shipped implementation is the native TypeScript tool family in `cli/extensions/grc-tools/webex.ts`: `webex_check_access`, `webex_assess_identity`, `webex_assess_collaboration_governance`, `webex_assess_meeting_hybrid_security`, and `webex_export_audit_bundle`. It replaces the Go CLI/TUI layout in sections 7 to 9 with grclanker tools, keeps the 25 controls and the section 5 mapping table, and is documented in `src/content/docs/docs/integrations/webex.md`.
 
 ## 2. APIs & SDKs
 
@@ -85,19 +89,19 @@ The `webexpythonsdk` package provides native Python objects for all Webex API re
 - Can be granted admin-level scopes without a user login
 
 **Required scopes (minimum for full inspection):**
-- `spark-admin:people_read` — member enumeration
-- `spark-admin:organizations_read` — organization settings
-- `spark-admin:roles_read` — role assignments
-- `spark-admin:licenses_read` — license usage
-- `spark-admin:devices_read` — device inventory
-- `spark-admin:hybrid_clusters_read` — hybrid infrastructure
-- `spark-admin:resource_groups_read` — resource group config
-- `spark-compliance:events_read` — compliance events
-- `spark-compliance:meetings_read` — meeting compliance data
-- `spark-compliance:rooms_read` — room compliance data
-- `meeting:admin_schedule_read` — meeting settings
-- `meeting:admin_recordings_read` — recording inventory
-- `meeting:admin_preferences_read` — meeting preferences
+- `spark-admin:people_read` - member enumeration
+- `spark-admin:organizations_read` - organization settings
+- `spark-admin:roles_read` - role assignments
+- `spark-admin:licenses_read` - license usage
+- `spark-admin:devices_read` - device inventory
+- `spark-admin:hybrid_clusters_read` - hybrid infrastructure
+- `spark-admin:resource_groups_read` - resource group config
+- `spark-compliance:events_read` - compliance events
+- `spark-compliance:meetings_read` - meeting compliance data
+- `spark-compliance:rooms_read` - room compliance data
+- `meeting:admin_schedule_read` - meeting settings
+- `meeting:admin_recordings_read` - recording inventory
+- `meeting:admin_preferences_read` - meeting preferences
 
 **Configuration precedence:**
 1. `--token` CLI flag
@@ -163,7 +167,7 @@ The tool never stores tokens beyond the current session. Tokens and secrets are 
 | 20 Webhook HTTPS and signing | SC-8(1) | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000441 | ISM-0484 | CPS-11.6 |
 | 21 Messaging DLP | SC-7(8) | L2 3.13.1 | CC6.7 | 13.4 | 1.3.7 | SRG-APP-000516 | ISM-0947 | CPS-11.7 |
 | 22 SRTP calling encryption | SC-8 | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000439 | ISM-0484 | CPS-11.8 |
-| 23 Virtual background policy | AC-3 | L2 3.1.1 | CC6.1 | — | — | SRG-APP-000033 | — | — |
+| 23 Virtual background policy | AC-3 | L2 3.1.1 | CC6.1 | - | - | SRG-APP-000033 | - | - |
 | 24 License utilization | CM-8 | L2 3.4.1 | CC6.8 | 1.1 | 2.4 | SRG-APP-000383 | ISM-1409 | CPS-10.4 |
 | 25 Admin audit logging | AU-12 | L2 3.3.1 | CC7.2 | 8.5 | 10.2.2 | SRG-APP-000507 | ISM-0580 | CPS-12.6 |
 
@@ -171,13 +175,13 @@ The tool never stores tokens beyond the current session. Tokens and secrets are 
 
 | Tool | Type | Overlap | Gap Addressed |
 |------|------|---------|---------------|
-| Webex Control Hub | Native admin console | Full admin visibility — but manual, no automated compliance checks | No automated posture scoring or compliance framework mapping |
-| Webex Control Hub Alerts | Native | Alerts on specific events — not comprehensive posture analysis | No holistic security control evaluation |
-| Webex Pro Pack for Control Hub | Add-on | Enhanced compliance features — still requires manual review | No automated security benchmark or drift detection |
-| Cisco ThousandEyes (Webex integration) | Monitoring | Network/performance monitoring — no security posture | No IAM, policy, or compliance assessment |
-| webexpythonsdk / webexteamssdk | SDK | API wrapper — no security analysis logic | Building block only, no compliance controls |
-| Prowler | Cloud security | AWS/Azure/GCP focused — no SaaS collaboration platform coverage | No Webex-specific controls |
-| ScoutSuite | Cloud security | Multi-cloud auditor — no SaaS platform support | No Webex platform coverage |
+| Webex Control Hub | Native admin console | Full admin visibility - but manual, no automated compliance checks | No automated posture scoring or compliance framework mapping |
+| Webex Control Hub Alerts | Native | Alerts on specific events - not comprehensive posture analysis | No holistic security control evaluation |
+| Webex Pro Pack for Control Hub | Add-on | Enhanced compliance features - still requires manual review | No automated security benchmark or drift detection |
+| Cisco ThousandEyes (Webex integration) | Monitoring | Network/performance monitoring - no security posture | No IAM, policy, or compliance assessment |
+| webexpythonsdk / webexteamssdk | SDK | API wrapper - no security analysis logic | Building block only, no compliance controls |
+| Prowler | Cloud security | AWS/Azure/GCP focused - no SaaS collaboration platform coverage | No Webex-specific controls |
+| ScoutSuite | Cloud security | Multi-cloud auditor - no SaaS platform support | No Webex platform coverage |
 
 ## 7. Architecture
 
@@ -321,4 +325,36 @@ goreleaser release --clean
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (2026-09-21) as five read-only tools with 22 findings covering all 25 controls.
+
+### What shipped
+
+- Auth: bearer token, integration or Service App `refresh_token` grant against `POST /access_token`, config file discovery, bot token detection with admin-only controls rendered manual, and token redaction in every output.
+- Automatable controls (pass, warn, or fail from documented fields): 3 (Compliance Officer role), 9 (`securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings` from `GET /admin/meeting/config/commonSettings` per site), 10 (`securityOptions.requireStrongPassword` and `passwordCriteria.minLength`, same endpoint), 13 (`securityOptions.requireLoginBeforeAccess`, same endpoint, plus a guest inventory from People `type = appuser` and `GET /guests/count`), 14 (space classification via `classificationId`), 15 and 16 (hybrid connector `status`), 19 inventory (People `type = bot`), 20 (webhook `targetUrl` and `secret`), 24 (license `totalUnits` and `consumedUnits`), 25 (`/adminAudit/events`).
+- Manual controls with the citation proving the setting is absent from the public API and the Control Hub evidence to collect: 1, 2, 4, 5, 6, 7, 8, 11, 12, 17, 18, 19 approval, 21, 22, 23.
+- Verdict safety: denied or errored endpoints, empty inventories, partial views (truncated pages, bot tokens, sites that could not be read or listed), and undated items never pass; pagination follows `Link rel="next"` to completion and reports truncation; 429 honors `Retry-After`.
+- Rule 1 corollary: a finding that reads more than one inventory caps at `warn` when any of them is unreadable, even if its verdict comes from a complete primary inventory (WEBEX-ID-07 on `GET /guests/count`; WEBEX-MTG-02 and WEBEX-MTG-06 on `GET /meetings` and `GET /meetingPreferences`; WEBEX-COLLAB-04, WEBEX-COLLAB-05, WEBEX-MTG-02, WEBEX-MTG-03, and WEBEX-MTG-06 on the `GET /people/me` token-type probe). The summary names the endpoint and scope, counts and lists derived from the unreadable inventory render as `null` beside a `*_status` object, a denied `GET /meetingPreferences/sites` is named even when `GET /meetingPreferences` still lists the sites, and per-site `commonSettings` failures land in the assessment errors array and `_errors.log`. The null rule is uniform across every summary and evidence field, including manual findings: WEBEX-ID-02 takes the denied path (fields `null`, endpoint named, no count in prose) when either `GET /people` or `GET /roles` is unreadable, because the administrator list is derived from both.
+- Error-string hygiene: no response body is ever copied into an error string (JSON errors contribute only their documented message fields; a non-JSON body is described as `non-JSON error body (<content type>; <bytes> bytes)`), and every error string is scrubbed once where it is created (`scrubErrorText`, applied in the `WebexApiError` constructor and in the surface collectors) so that URL query strings anywhere in the text and credential-shaped fragments (`Bearer <value>`, `session=<value>`, `api_key: <value>`) never reach the errors array, `_errors.log`, `access.json`, status objects, summaries, or reports.
+- Bundle layout: `core_data/` (each surface projected to a per-surface field allowlist of what the findings read, with secret-named keys redacted and URL query strings such as recording `RCID`, meeting `MTID`, and webhook tokens stripped; nothing outside the allowlist is written), `analysis/`, `compliance/` with executive summary, unified matrix, and one report per framework in section 5, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, zip named after the allocated directory with `-2`, `-3` reruns.
+- Pagination follows `Link rel="next"` up to 1000 pages per listing; the item limit and the page ceiling both report `truncated: true`.
+- Live smoke: `npm --prefix cli run test:webex:live`.
+
+### Deviations from this spec
+
+- `/admin/organizations/{orgId}/settings` and `/admin/organizations/{orgId}/security` do not exist in the public API; the Organizations reference documents only `id`, `displayName`, and `created`, so controls that depended on them render manual.
+- Org-wide meeting lobby, password, and guest access defaults (controls 9, 10, 13) are read from `GET /admin/meeting/config/commonSettings` (site reference, scope `meeting:admin_config_read`), once per site returned by `GET /meetingPreferences/sites`, instead of the per-meeting or organization endpoints this spec named.
+- Control 2 (admin MFA) stays manual by coordinator ruling: `mfaEnabled` exists only in the PATCH request schema of `/identity/organizations/{orgId}/authenticationConfig` (update-organization-authentication-configuration-settings); no GET is documented, and a read-only inspector does not PATCH. `/people` has no MFA attribute either, so the admin list is attached as evidence only. WEBEX-ID-02 is the only finding tagged with control 2; the administrator concentration finding (WEBEX-ID-04) is tagged with control 25 so a bounded admin count never rolls up as a pass on MFA.
+- Recordings are read through `/admin/recordings` (the admin and compliance officer endpoint named in the compliance guide) and expose no storage or retention fields.
+- Admin audit evidence comes from `/adminAudit/events` (`audit:events_read`), not `/events`.
+- `orgId` is sent only where documented: `/people`, `/licenses`, `/devices`, `/workspaces`, `/hybrid/clusters`, `/hybrid/connectors`, `/adminAudit/events`. `max` is sent only where documented: `/people`, `/events`, `/adminAudit/events`, `/admin/recordings`, `/meetings`, `/devices`, `/workspaces`, `/rooms`, `/webhooks`.
+- Config file is `~/.config/webex-sec-inspector/config.json`, `.yaml`, or `.yml` instead of `config.toml`.
+- Control 22 (SRTP) stays folded into WEBEX-MTG-01 because no public API exposes a calling SRTP setting.
+- Per-resource GET endpoints are unused except `/organizations/{orgId}`; no control needs a field the list endpoints lack.
+- Guest inventory (control 13) uses the People `type` enum, whose `appuser` value is documented as a guest user, and `GET /guests/count` (scope `guest-issuer:read`), which answers with a bare number.
+- Reference verification: the canonical `https://developer.webex.com/docs/api/v1/<category>/<page>` URL answers 302 to a category-prefixed page (`/admin/docs`, `/meeting/docs`, `/calling/docs`, `/messaging/docs`) whose server-rendered HTML embeds the OpenAPI 3.0.3 schema for every endpoint in that category. `curl -L` fetches it without a browser, and every field read by the implementation was checked against that embedded schema.
+
+### Deferred
+
+- SARIF, CSV, and HTML reporters (section 1 output formats).
+- TUI and Go CLI surface (sections 7 to 9).
+- `GET /webhooks?ownedBy=org` for org-wide webhook inventory.
