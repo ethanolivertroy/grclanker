@@ -2158,6 +2158,130 @@ test("collection status: a denied statement is written to core_data and the asse
   assertOutputsNameOnlyExecutedStatements(snowflakeOutputs(access, results, exported), log, "healthy with an empty SHOW SHARES");
 });
 
+/** Every output of a run that sent no request, keyed by surface, with the tool payload text added by the caller. */
+function assertNoRequestClaims(outputs, label) {
+  for (const [name, text] of outputs) {
+    assert.ok(!text.includes("/api/v2/statements"), `${label}: ${name} names the statements endpoint although no request was made`);
+    assert.ok(!text.includes("Authenticated as"), `${label}: ${name} claims authentication although no request was made`);
+    assert.ok(!/SQL API request (failed|timed out)/.test(text), `${label}: ${name} reports a request failure although no request was made`);
+    assert.ok(!text.includes("lacks MANAGE GRANTS"), `${label}: ${name} judges the configured role's visibility although no statement ran under it`);
+  }
+}
+
+test("addendum 5.2: a private key that does not load sends no request, so no output names POST /api/v2/statements or a statement text, and the run reports itself as not authenticated with the key failure code", async () => {
+  const base = createTempBase("grclanker-snowflake-not-requested-");
+  const encryptedPem = testPrivateKey.export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: "the-right-passphrase-9f8e7d" });
+  const variants = [
+    { name: "malformed PEM body", overrides: { privateKeyPem: "-----BEGIN PRIVATE KEY-----\nbm90LWEta2V5LWp1c3QtYnl0ZXM=\n-----END PRIVATE KEY-----\n" } },
+    { name: "encrypted key with the wrong passphrase", overrides: { privateKeyPem: encryptedPem, privateKeyPassphrase: "not-the-passphrase" } },
+  ];
+  const registered = [];
+  registerSnowflakeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccessTool = registered.find((tool) => tool.name === "snowflake_check_access");
+
+  for (const variant of variants) {
+    const label = variant.name;
+    const config = sampleConfig(variant.overrides);
+    let fetchCalls = 0;
+    const client = new SnowflakeSqlClient(config, {
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error("the fixture must never be reached");
+      },
+    });
+
+    const access = await checkSnowflakeAccess(client);
+    assert.equal(fetchCalls, 0, `${label}: the access check sent no request`);
+    assert.equal(access.status, "limited");
+    assert.equal(access.authentication, "not_authenticated", label);
+    assert.equal(access.user, null, `${label}: no user is claimed`);
+    assert.equal(access.role, undefined, `${label}: the configured role is not reported as active`);
+    assert.equal(access.fullVisibility, false);
+    assert.match(access.authenticationNote, /^Not authenticated: the Snowflake private key could not be loaded \((ERR_[A-Z0-9_]+|INVALID_PRIVATE_KEY)\); no request was sent\.$/, label);
+    assert.ok(access.notes.includes(access.authenticationNote), `${label}: the notes carry the authentication statement`);
+    assert.ok(access.notes.every((note) => !note.startsWith("Authenticated as")), label);
+    assert.ok(access.surfaces.length > 10, label);
+    const code = access.authenticationNote.match(/\((ERR_[A-Z0-9_]+|INVALID_PRIVATE_KEY)\)/)[1];
+    for (const surface of access.surfaces) {
+      assert.equal(surface.status, "not_requested", `${label}: ${surface.name}`);
+      assert.equal(surface.statement, null, `${label}: ${surface.name} names no statement`);
+      assert.equal(surface.rowCount, null, label);
+      assert.equal(surface.error, `Not requested: the Snowflake private key could not be loaded (${code}); no statement was sent. Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.`, label);
+    }
+
+    const assessment = await assessSnowflakeNetworkAndAuthentication(client);
+    assert.equal(fetchCalls, 0, `${label}: the assessment sent no request`);
+    assert.equal(assessment.summary.role, null, `${label}: the configured role is not reported as active`);
+    assert.equal(assessment.summary.users_seen, null);
+    for (const finding of assessment.findings) {
+      assert.equal(finding.status, "manual", `${label}: ${finding.id}`);
+      assert.match(finding.summary, /^Unknown: .*Not requested: the Snowflake private key could not be loaded \(/, `${label}: ${finding.id}`);
+    }
+    for (const statement of assessment.statements) {
+      assert.equal(statement.status, "not_requested", `${label}: ${statement.key}`);
+      assert.equal(statement.statement, null, `${label}: ${statement.key} names no statement text`);
+      assert.equal(statement.code, code, `${label}: ${statement.key} carries the key failure code`);
+      assert.deepEqual(statement.rows, { collected: false, status: "not_requested", statement: null, error: statement.error }, `${label}: ${statement.key}`);
+      assert.equal(statement.columns, null);
+    }
+
+    const exported = await exportSnowflakeAuditBundle(client, config, join(base, label.replace(/\W+/g, "-")));
+    assert.equal(fetchCalls, 0, `${label}: the export sent no request`);
+    const files = readBundleFiles(exported.outputDir);
+    const outputs = new Map([
+      ["check_access", JSON.stringify(access)],
+      ["assess network-and-authentication", JSON.stringify(assessment)],
+      ...[...files].map(([name, content]) => [`bundle ${name}`, content]),
+      ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`zip ${name}`, content]),
+    ]);
+    assertNoRequestClaims(outputs, label);
+
+    const metadata = JSON.parse(files.get("metadata.json"));
+    assert.equal(metadata.user, null, label);
+    assert.equal(metadata.role, null, label);
+    assert.equal(metadata.authentication, "not_authenticated", label);
+    assert.equal(metadata.requested_statement_count, 0, `${label}: metadata counts the requests actually made`);
+    assert.equal(metadata.not_requested_statement_count, metadata.statement_count, label);
+    assert.equal(metadata.failed_statement_count, metadata.statement_count, label);
+    const errorLines = files.get("_errors.log").trimEnd().split("\n");
+    assert.equal(errorLines.length, metadata.statement_count, `${label}: one line per statement and no statement text lines`);
+    for (const line of errorLines) assert.match(line, /^\[not_requested\] [a-z_0-9]+: Not requested: the Snowflake private key could not be loaded \(/, label);
+    const accessFile = JSON.parse(files.get("core_data/access_check.json"));
+    assert.equal(accessFile.authentication, "not_authenticated", label);
+    assert.ok(accessFile.notes.includes(access.authenticationNote), label);
+    const summary = files.get("compliance/executive_summary.md");
+    assert.ok(summary.includes(`Authentication: ${access.authenticationNote}`), `${label}: the executive summary states the failure instead of an identity`);
+    assert.ok(!summary.includes("partial visibility"), label);
+    for (const [name, content] of files) {
+      if (!name.startsWith("core_data/") || name === "core_data/access_check.json") continue;
+      const snapshot = JSON.parse(content);
+      assert.equal(snapshot.statement, null, `${label}: ${name} names no statement`);
+      assert.equal(snapshot.rows.statement, null, `${label}: ${name} marker names no statement`);
+    }
+
+    // The tool boundary: the payload of snowflake_check_access built from the same key through the resolver.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      fetchCalls += 1;
+      throw new Error("the network must never be reached");
+    };
+    try {
+      const payload = await withSnowflakeHome(base, () => checkAccessTool.execute("call", checkAccessTool.prepareArguments({
+        account: "myorg-myaccount",
+        user: "auditor",
+        role: "AUDIT_ROLE",
+        private_key: config.privateKeyPem,
+        ...(config.privateKeyPassphrase ? { private_key_passphrase: config.privateKeyPassphrase } : {}),
+      })));
+      assert.equal(fetchCalls, 0, `${label}: the tool sent no request`);
+      assertNoRequestClaims(new Map([["snowflake_check_access payload", JSON.stringify(payload)]]), label);
+      assert.ok(JSON.stringify(payload).includes(`Not authenticated: the Snowflake private key could not be loaded (${code}); no request was sent.`), `${label}: the tool payload states the failure`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+});
+
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   const base = createTempBase("grclanker-snowflake-path-");
   const outside = createTempBase("grclanker-snowflake-outside-");

@@ -120,7 +120,13 @@ export interface SnowflakeResultSet {
   statementHandle?: string;
 }
 
-export type SnowflakeStatementStatus = "ok" | "denied" | "error" | "timeout";
+/**
+ * `not_requested` is the outcome of a statement that was never sent because
+ * the bearer token could not be built (a private key that does not load, a
+ * missing token): no endpoint was called, so no HTTP status, statement text,
+ * or server error is recorded for it.
+ */
+export type SnowflakeStatementStatus = "ok" | "denied" | "error" | "timeout" | "not_requested";
 
 export interface SnowflakeStatementOutcome {
   key: string;
@@ -135,13 +141,16 @@ export interface SnowflakeStatementOutcome {
   truncated: boolean | null;
   rowLimit?: number;
   error?: string;
+  /** The local failure code of a statement that was never sent (an OpenSSL code such as ERR_OSSL_UNSUPPORTED). */
+  code?: string;
 }
 
 /** What a bundle consumer reads in place of the rows of a statement that did not complete. */
 export interface SnowflakeNotCollectedMarker {
   collected: false;
   status: Exclude<SnowflakeStatementStatus, "ok">;
-  statement: string;
+  /** The statement that was actually executed; null when it was never sent. */
+  statement: string | null;
   error: string | null;
 }
 
@@ -150,11 +159,12 @@ export interface SnowflakeNotCollectedMarker {
  * statements echoed by the assess tools. A statement that did not complete
  * carries a not-collected marker in place of its rows and null columns, so a
  * denial can never be mistaken for an empty result set; a readable statement
- * with no rows keeps [].
+ * with no rows keeps []. A statement that was never sent has `statement: null`
+ * on both levels, so the bundle names only statements the run executed.
  */
 export interface SnowflakeStatementSnapshot {
   key: string;
-  statement: string;
+  statement: string | null;
   status: SnowflakeStatementStatus;
   columns: string[] | null;
   rows: SqlRow[] | SnowflakeNotCollectedMarker;
@@ -164,22 +174,36 @@ export interface SnowflakeStatementSnapshot {
   truncated: boolean | null;
   rowLimit?: number;
   error?: string;
+  code?: string;
 }
 
 export interface SnowflakeAccessSurface {
   name: string;
-  statement: string;
-  status: "readable" | "denied" | "error" | "timeout";
+  /** The statement that was executed; null when it was never sent. */
+  statement: string | null;
+  status: "readable" | "denied" | "error" | "timeout" | "not_requested";
   /** Rows seen on a readable surface; null when the statement did not complete. */
   rowCount: number | null;
   error?: string;
 }
 
+/**
+ * Whether the run observed its own identity: `confirmed` when the session
+ * context statement returned the user and role, `unconfirmed` when statements
+ * were sent but the session context did not complete (the user and role are
+ * the configured values), `not_authenticated` when no request was sent at all.
+ */
+export type SnowflakeAuthenticationStatus = "confirmed" | "unconfirmed" | "not_authenticated";
+
 export interface SnowflakeAccessCheckResult {
   status: "healthy" | "limited";
   account: string;
-  user: string;
+  /** The session user, the configured user when unconfirmed, null when not authenticated. */
+  user: string | null;
   role?: string;
+  authentication: SnowflakeAuthenticationStatus;
+  /** The one-sentence authentication statement also carried in notes. */
+  authenticationNote: string;
   fullVisibility: boolean;
   surfaces: SnowflakeAccessSurface[];
   notes: string[];
@@ -982,13 +1006,29 @@ export function computePublicKeyFingerprint(privateKey: KeyObject): string {
   return `SHA256:${createHash("sha256").update(publicKeyDer).digest("base64")}`;
 }
 
+/**
+ * A private key that cannot be turned into a bearer token. The message is
+ * fixed text plus a validated code (OpenSSL's ERR_OSSL_* code, or
+ * INVALID_PRIVATE_KEY when the library gave none); the key material, the
+ * passphrase, and the library's own wording never reach it.
+ */
+export class SnowflakePrivateKeyError extends Error {
+  readonly code: string;
+
+  constructor(code: string, detail: string = "Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.") {
+    super(`Unable to load the Snowflake private key (${code}). ${detail}`);
+    this.name = "SnowflakePrivateKeyError";
+    this.code = code;
+  }
+}
+
 export function buildSnowflakeKeyPairJwt(
   config: Pick<SnowflakeResolvedConfig, "account" | "user" | "privateKeyPem" | "privateKeyPassphrase">,
   now: Date = new Date(),
   lifetimeSeconds: number = JWT_LIFETIME_SECONDS,
 ): { token: string; expiresAt: number; issuer: string; subject: string } {
   if (!config.privateKeyPem) {
-    throw new Error("Snowflake key-pair authentication requires a private key.");
+    throw new SnowflakePrivateKeyError("MISSING_PRIVATE_KEY", "Snowflake key-pair authentication requires a private key.");
   }
   let privateKey: KeyObject;
   try {
@@ -998,9 +1038,7 @@ export function buildSnowflakeKeyPairJwt(
       passphrase: config.privateKeyPassphrase,
     });
   } catch (error) {
-    throw new Error(
-      `Unable to load the Snowflake private key (${thrownCode(error, CRYPTO_ERROR_CODE_PATTERN) ?? "INVALID_PRIVATE_KEY"}). Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.`,
-    );
+    throw new SnowflakePrivateKeyError(thrownCode(error, CRYPTO_ERROR_CODE_PATTERN) ?? "INVALID_PRIVATE_KEY");
   }
   const qualifiedUser = `${normalizeJwtAccountIdentifier(config.account)}.${config.user.trim().toUpperCase()}`;
   const issuer = `${qualifiedUser}.${computePublicKeyFingerprint(privateKey)}`;
@@ -1021,24 +1059,41 @@ interface SnowflakeApiResponse {
   nonJsonBody?: string;
 }
 
+export type SnowflakeStatementErrorKind = Exclude<SnowflakeStatementStatus, "ok">;
+
 export class SnowflakeStatementError extends Error {
   readonly statusCode?: number;
   readonly sqlCode?: string;
   readonly sqlState?: string;
-  readonly kind: "denied" | "error" | "timeout";
+  readonly kind: SnowflakeStatementErrorKind;
+  /** The local failure code when the statement was never sent. */
+  readonly code?: string;
 
   /**
    * The message and codes are scrubbed here as well as at the record point,
    * so an error built anywhere in the client never carries a credential even
    * if a caller stores error.message directly.
    */
-  constructor(message: string, options: { statusCode?: number; sqlCode?: string; sqlState?: string; kind?: "denied" | "error" | "timeout" } = {}) {
+  constructor(message: string, options: { statusCode?: number; sqlCode?: string; sqlState?: string; kind?: SnowflakeStatementErrorKind; code?: string } = {}) {
     super(redactSecrets(message));
     this.name = "SnowflakeStatementError";
     this.statusCode = options.statusCode;
     this.sqlCode = options.sqlCode === undefined ? undefined : redactSecrets(options.sqlCode);
     this.sqlState = options.sqlState === undefined ? undefined : redactSecrets(options.sqlState);
     this.kind = options.kind ?? classifyErrorMessage(this.message, options.statusCode);
+    this.code = options.code;
+  }
+
+  /**
+   * The error for a statement that is never sent because no bearer token can
+   * be built: the message names the local failure and its code, never an
+   * endpoint, and the request loop does not retry it.
+   */
+  static notRequested(reason: string, code: string, remediation?: string): SnowflakeStatementError {
+    return new SnowflakeStatementError(
+      `Not requested: ${reason} (${code}); no statement was sent.${remediation ? ` ${remediation}` : ""}`,
+      { kind: "not_requested", code },
+    );
   }
 
   /**
@@ -1095,17 +1150,32 @@ export class SnowflakeSqlClient {
     return this.config;
   }
 
+  /**
+   * The bearer token for the next request. When none can be built, the
+   * statement is reported as not requested with the local failure code; no
+   * endpoint is named because none was called.
+   */
   private getBearerToken(): string {
     if (this.config.tokenType === "KEYPAIR_JWT") {
       const nowMs = this.now().getTime();
       if (!this.jwt || this.jwt.expiresAt - JWT_REFRESH_SKEW_SECONDS * 1000 <= nowMs) {
-        const built = buildSnowflakeKeyPairJwt(this.config, this.now());
+        let built: ReturnType<typeof buildSnowflakeKeyPairJwt>;
+        try {
+          built = buildSnowflakeKeyPairJwt(this.config, this.now());
+        } catch (error) {
+          const code = error instanceof SnowflakePrivateKeyError ? error.code : "INVALID_PRIVATE_KEY";
+          throw SnowflakeStatementError.notRequested(
+            "the Snowflake private key could not be loaded",
+            code,
+            "Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
+          );
+        }
         this.jwt = { token: built.token, expiresAt: built.expiresAt };
       }
       return this.jwt.token;
     }
     if (!this.config.token) {
-      throw new Error("Snowflake bearer token is missing.");
+      throw SnowflakeStatementError.notRequested("no Snowflake bearer token is configured", "MISSING_TOKEN");
     }
     return this.config.token;
   }
@@ -1127,7 +1197,8 @@ export class SnowflakeSqlClient {
     let attempt = 0;
     for (;;) {
       // A credential that cannot be turned into a bearer token is a
-      // configuration error, not a transport failure, so it is never retried.
+      // configuration error, not a transport failure: the not-requested error
+      // propagates before any fetch and is never retried.
       const authorization = `Bearer ${this.getBearerToken()}`;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
@@ -1394,18 +1465,22 @@ export function rowsSeen(outcome: SnowflakeStatementOutcome): number | null {
  */
 export function snapshotStatement(outcome: SnowflakeStatementOutcome): SnowflakeStatementSnapshot {
   if (outcome.status === "ok") return { ...outcome };
+  // A statement that was never sent is not named: the key identifies what
+  // would have been collected, and the error names the local failure.
+  const statement = outcome.status === "not_requested" ? null : outcome.statement;
   return {
     key: outcome.key,
-    statement: outcome.statement,
+    statement,
     status: outcome.status,
     columns: null,
-    rows: { collected: false, status: outcome.status, statement: outcome.statement, error: outcome.error ?? null },
+    rows: { collected: false, status: outcome.status, statement, error: outcome.error ?? null },
     numRows: null,
     partitionCount: null,
     fetchedPartitions: null,
     truncated: null,
     rowLimit: outcome.rowLimit,
     error: outcome.error,
+    ...(outcome.code === undefined ? {} : { code: outcome.code }),
   };
 }
 
@@ -1441,10 +1516,12 @@ export async function collectStatement(
     // whichever constructor or throw site built the message.
     const message = redactSecrets(error instanceof Error ? error.message : String(error), configuredSecretsOf(client));
     const kind = error instanceof SnowflakeStatementError ? error.kind : classifyErrorMessage(message);
+    const code = error instanceof SnowflakeStatementError ? error.code : undefined;
     return {
       ...unreadOutcome(key, statement),
       status: kind,
       error: message,
+      ...(code === undefined ? {} : { code }),
     };
   }
 }
@@ -1506,7 +1583,13 @@ async function collectSessionContext(client: SnowflakeQueryClient): Promise<Sess
   };
 }
 
+/**
+ * The role the statements ran under: the session's when it was read, else the
+ * configured role that every request carried. When no request was sent there
+ * is no such role, so the configured name is not reported as active.
+ */
 function effectiveRole(config: SnowflakeResolvedConfig, session: SessionContext): string | undefined {
+  if (session.outcome.status === "not_requested") return undefined;
   return upper(session.role) || upper(config.role) || undefined;
 }
 
@@ -1524,6 +1607,8 @@ function describeOutcomeProblem(outcome: Pick<SnowflakeStatementOutcome, "key" |
       return `${outcome.key} timed out: ${outcome.error ?? "no detail"}`;
     case "error":
       return `${outcome.key} failed: ${outcome.error ?? "no detail"}`;
+    case "not_requested":
+      return `${outcome.key}: ${outcome.error ?? "Not requested: no detail"}`;
     default: {
       const exhaustive: never = outcome.status;
       return String(exhaustive);
@@ -1778,12 +1863,13 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
   const readable = surfaces.filter((surface) => surface.status === "readable").length;
   const accountUsageReadable = surfaces.filter((surface) => surface.name.startsWith("account_usage_") && surface.status === "readable").length;
   const status = session.outcome.status === "ok" && accountUsageReadable >= 10 && readable >= surfaces.length - 3 ? "healthy" : "limited";
+  const authentication = describeAuthentication(config, session, role);
   const notes = [
     `Using Snowflake account ${session.account ?? config.account} via ${config.baseUrl} (${config.tokenType}).`,
-    `Authenticated as ${session.user ?? config.user} with role ${role ?? "(default role)"}${session.warehouse ? ` and warehouse ${session.warehouse}` : ""}.`,
+    authentication.note,
     `${readable}/${surfaces.length} Snowflake audit surfaces are readable; ${accountUsageReadable} ACCOUNT_USAGE views responded.`,
   ];
-  if (!hasFullVisibility(role)) {
+  if (authentication.status !== "not_authenticated" && !hasFullVisibility(role)) {
     notes.push(partialVisibilityNote(role, "SHOW commands"));
   }
   if (config.sourceChain.length > 0) {
@@ -1793,8 +1879,10 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
   return {
     status,
     account: session.account ?? config.account,
-    user: session.user ?? config.user,
+    user: authentication.user,
     role,
+    authentication: authentication.status,
+    authenticationNote: authentication.note,
     fullVisibility: hasFullVisibility(role),
     surfaces,
     notes,
@@ -1803,6 +1891,47 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
         ? "Run snowflake_assess_network_and_authentication, snowflake_assess_access_control, snowflake_assess_monitoring_and_lifecycle, snowflake_assess_data_protection, or snowflake_export_audit_bundle."
         : "Grant the audit role IMPORTED PRIVILEGES on the SNOWFLAKE database plus MANAGE GRANTS (or use SECURITYADMIN/ACCOUNTADMIN) and a small warehouse, then re-run snowflake_check_access.",
   };
+}
+
+/**
+ * What the run can say about its own identity. Only a session context row is
+ * an observation; the configured user and role are reported as configured
+ * values when statements were sent without that row, and nothing is claimed
+ * when no request was sent.
+ */
+function describeAuthentication(
+  config: SnowflakeResolvedConfig,
+  session: SessionContext,
+  role: string | undefined,
+): { status: SnowflakeAuthenticationStatus; user: string | null; note: string } {
+  switch (session.outcome.status) {
+    case "ok": {
+      const user = session.user ?? config.user;
+      return {
+        status: "confirmed",
+        user,
+        note: `Authenticated as ${user} with role ${role ?? "(default role)"}${session.warehouse ? ` and warehouse ${session.warehouse}` : ""}.`,
+      };
+    }
+    case "not_requested":
+      return {
+        status: "not_authenticated",
+        user: null,
+        note: `Not authenticated: ${notRequestedReason(session.outcome)}; no request was sent.`,
+      };
+    default:
+      return {
+        status: "unconfirmed",
+        user: config.user,
+        note: `Authentication not confirmed: the session context statement ${session.outcome.status === "denied" ? "was denied" : session.outcome.status === "timeout" ? "timed out" : "failed"}, so the configured user ${config.user} and role ${role ?? "(default role)"} are reported as configured, not as observed.`,
+      };
+  }
+}
+
+/** The reason clause of a not-requested error ("<reason> (<code>)"), which SnowflakeStatementError.notRequested writes before the first semicolon. */
+function notRequestedReason(outcome: SnowflakeStatementOutcome): string {
+  const reason = (outcome.error ?? "").replace(/^Not requested: /, "").split(";")[0].trim();
+  return reason || `the bearer token could not be built (${outcome.code ?? "UNKNOWN"})`;
 }
 
 function toSurface(name: string, outcome: SnowflakeStatementOutcome): SnowflakeAccessSurface {
@@ -1815,6 +1944,8 @@ function toSurface(name: string, outcome: SnowflakeStatementOutcome): SnowflakeA
       return { name, statement: outcome.statement, status: "timeout", rowCount: null, error: outcome.error };
     case "error":
       return { name, statement: outcome.statement, status: "error", rowCount: null, error: outcome.error };
+    case "not_requested":
+      return { name, statement: null, status: "not_requested", rowCount: null, error: outcome.error };
     default: {
       const exhaustive: never = outcome.status;
       return exhaustive;
@@ -2704,9 +2835,11 @@ function buildExecutiveSummary(config: SnowflakeResolvedConfig, access: Snowflak
     "# Snowflake Security Inspector Executive Summary",
     "",
     `Account: ${access.account}`,
-    `Authenticated as: ${access.user} (role ${access.role ?? "default"}, ${config.tokenType})`,
+    access.authentication === "confirmed"
+      ? `Authenticated as: ${access.user} (role ${access.role ?? "default"}, ${config.tokenType})`
+      : `Authentication: ${access.authenticationNote}`,
     `Generated: ${new Date().toISOString()}`,
-    `Access check: ${access.status}${access.fullVisibility ? "" : " (partial visibility: role lacks MANAGE GRANTS)"}`,
+    `Access check: ${access.status}${access.fullVisibility || access.authentication === "not_authenticated" ? "" : " (partial visibility: role lacks MANAGE GRANTS)"}`,
     "",
     "## Result Counts",
     "",
@@ -2764,7 +2897,7 @@ function buildQuickReference(result: { outputDir: string }, assessments: Snowfla
     "- `compliance/<framework>.md`: framework-specific mapping reports",
     "- `core_data/access_check.json`: readable surface inventory",
     "- `metadata.json`: non-secret run metadata",
-    errorCount > 0 ? "- `_errors.log`: statements that were denied, failed, or timed out during collection" : "- `_errors.log`: not written because every statement completed",
+    errorCount > 0 ? "- `_errors.log`: statements that were denied, failed, timed out, or were never sent during collection" : "- `_errors.log`: not written because every statement completed",
     "",
     "## Assessments",
     "",
@@ -2790,6 +2923,7 @@ export async function exportSnowflakeAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const statements = assessments.flatMap((assessment) => assessment.statements);
   const failedStatements = statements.filter((statement) => statement.status !== "ok");
+  const notRequestedStatements = statements.filter((statement) => statement.status === "not_requested");
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(access.account || config.account)}-audit-bundle`);
@@ -2799,10 +2933,13 @@ export async function exportSnowflakeAuditBundle(
     account: access.account,
     user: access.user,
     role: access.role ?? null,
+    authentication: access.authentication,
     token_type: config.tokenType,
     base_url: config.baseUrl,
     source_chain: config.sourceChain,
     statement_count: statements.length,
+    requested_statement_count: statements.length - notRequestedStatements.length,
+    not_requested_statement_count: notRequestedStatements.length,
     failed_statement_count: failedStatements.length,
   }));
   await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
@@ -2826,7 +2963,8 @@ export async function exportSnowflakeAuditBundle(
   }
   await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDir }, assessments, failedStatements.length)}\n`);
   if (failedStatements.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${failedStatements.map((statement) => `[${statement.status}] ${statement.key}: ${statement.error ?? "no detail"}\n  ${statement.statement}`).join("\n")}\n`);
+    // A statement that was never sent has no statement line: the log names only statements the run executed.
+    await writeSecureTextFile(outputDir, "_errors.log", `${failedStatements.map((statement) => `[${statement.status}] ${statement.key}: ${statement.error ?? "no detail"}${statement.statement === null ? "" : `\n  ${statement.statement}`}`).join("\n")}\n`);
   }
 
   const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
