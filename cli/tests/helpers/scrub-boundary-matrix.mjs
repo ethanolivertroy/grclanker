@@ -89,6 +89,9 @@ export const MUST_KEEP = [
   "Unable to read config file /tmp/grclanker-loader-Ab3dEf/nested-mapping.yaml (EISDIR)",
   "Unable to parse config file: invalid JSON in /tmp/grclanker-loader-x9Q2zR/credentials.json at line 3",
   "Metadata read of SecurityHealthCheckRisks and TwoFactorMethodsInfo failed",
+  // Quoted non-credential headers, alone: the closing-quote rule takes only credential carriers.
+  'Content-Type: "text/html; charset=utf-8"',
+  'Date: "Mon, 22 Sep 2026 12:30:00 GMT"',
   // A credential word in a hyphenated name (access-token) or a lowercase scheme word before a lowercase word is prose, not a carrier.
   "Auth mode access-token against https://login.salesforce.com, instance https://acme.my.salesforce.com, API v64.0.",
   // camelCase identifiers may carry short acronyms and version suffixes.
@@ -246,6 +249,8 @@ export function quotedCarrierCases(canary) {
  */
 export function compoundHeaderLineCases(canary) {
   const json = '"application/json"';
+  const textHtml = '"text/html; charset=utf-8"';
+  const date = 'Date: "Mon, 22 Sep 2026 12:30:00 GMT"';
   return [
     { name: "Cookie followed by a quoted X-Api-Key", text: `Cookie: sid="ctl"; X-Api-Key: "${canary}"`, keeps: ["Cookie: ", '; X-Api-Key: "'], pinnedForShortToken: true },
     { name: "Cookie followed by X-Api-Key with a space before the colon", text: `Cookie: sid="ctl"; X-Api-Key : "${canary}"`, keeps: ["Cookie: ", '; X-Api-Key : "'] },
@@ -266,6 +271,16 @@ export function compoundHeaderLineCases(canary) {
     { name: "Cookie followed by a JSON fragment", text: `Cookie: sid=ctl; {"X-Api-Key": "${canary}"}`, keeps: ["Cookie: ", '; {"X-Api-Key": "'] },
     { name: "quoted Cookie followed by a JSON fragment after a space", text: `Cookie: sid="ctl" {"api_key": "${canary}"}`, keeps: ["Cookie: ", '{"api_key": "'] },
     { name: "header dump with every credential header and Content-Type", text: `Headers presented: Authorization: Bearer "ctl"; Cookie: sid="ctl"; X-Api-Key: "${canary}"; Cookie: sid=prod-us-east-2026; Content-Type: ${json}`, keeps: ["Headers presented: Authorization: ", "; Cookie: ", '; X-Api-Key: "', `; Content-Type: ${json}`] },
+    // Closing-quote refinement: a closed quoted value ends at its closing quote even with `; Name:` inside, so the
+    // header start inside the quotes is part of the value; a quote followed by a value character closed nothing,
+    // so that value is unterminated and the `Name:` cut applies to it, as it does to an unquoted value.
+    { name: "closed quoted Cookie with a header start inside, then the Content-Type control", text: `Cookie: sid="${canary}; X-Api-Key: ctl"; Content-Type: ${textHtml}`, keeps: ["Cookie: ", `; Content-Type: ${textHtml}`] },
+    { name: "closed quoted Bearer with a header start inside, then the Date control", text: `Authorization: Bearer "${canary}; X-Api-Key: ctl"; ${date}`, keeps: ["Authorization: ", `; ${date}`] },
+    { name: "unterminated quoted Cookie then a quoted X-Api-Key carrying the value", text: `Cookie: sid="ctl; X-Api-Key: "${canary}"`, keeps: ["Cookie: ", '; X-Api-Key: "'] },
+    { name: "unterminated quoted Cookie carrying the value, then a quoted X-Api-Key", text: `Cookie: sid="${canary}; X-Api-Key: "ctl"`, keeps: ["Cookie: ", '; X-Api-Key: "'] },
+    { name: "unterminated quoted Cookie at the end of the line", text: `Cookie: sid="${canary}`, keeps: ["Cookie: "] },
+    { name: "Cookie followed by the Content-Type control with a charset parameter", text: `Cookie: sid=${canary}; Content-Type: ${textHtml}`, keeps: ["Cookie: ", `; Content-Type: ${textHtml}`] },
+    { name: "quoted Cookie followed by the Date control", text: `Cookie: sid="${canary}"; ${date}`, keeps: ["Cookie: ", `; ${date}`] },
   ];
 }
 

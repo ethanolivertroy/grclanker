@@ -518,13 +518,20 @@ const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`
 // The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
 const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
 const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
-// A quoted value, in double quotes (possibly JSON-escaped) or single quotes, on one line. Quotes around a
-// credential belong to its carrier: `Bearer "x"`, `sid='x'`, `--token "x"` carry x whatever its shape.
-const QUOTED_VALUE = String.raw`\\?"[^"\\\r\n]+\\?"|'[^'\r\n]+'`;
+// A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value
+// character opens the next header's value instead, so the value it seemed to close was never terminated.
+const CLOSING_QUOTE_BOUNDARY = String.raw`(?![\w/+=-])`;
+// A quoted value, in double quotes (possibly JSON-escaped) or single quotes, on one line, ending at its closing
+// quote even with `; Name:` inside. Quotes around a credential belong to its carrier: `Bearer "x"`, `sid='x'`,
+// `--token "x"` carry x whatever its shape.
+const QUOTED_VALUE = String.raw`(?:\\?"[^"\\\r\n]+\\?"|'[^'\r\n]+')${CLOSING_QUOTE_BOUNDARY}`;
+// A value whose opening quote never closes: it runs to the next `;`, `,`, or space (where the header patterns
+// apply the `Name:` cut) or to the end of the line, stray quotes included.
+const UNTERMINATED_QUOTED_VALUE = String.raw`\\?["'][^\s<>,;\\]+`;
 // One credential token (bare or quoted), or a parameter list such as Digest's `username="u", response="r"`
 // (quotes possibly JSON-escaped or single) or PagerDuty's `token=k`.
-const CREDENTIAL_TOKEN = String.raw`(?:${QUOTED_VALUE}|[^\s"'<>,;\\]+)`;
-const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*'|[^\s"',;<>\\]+)`;
+const CREDENTIAL_TOKEN = String.raw`(?:${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'<>,;\\]+)`;
+const CREDENTIAL_PARAMETER_VALUE = String.raw`(?:(?:\\?"[^"\\\r\n]*\\?"|'[^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|\\?["']?[^\s"',;<>\\]+)`;
 const CREDENTIAL_PARAMETERS = String.raw`[\w-]+=${CREDENTIAL_PARAMETER_VALUE}(?:\s*[,;]\s*[\w-]+=${CREDENTIAL_PARAMETER_VALUE})*`;
 // The whole value of an Authorization header: a scheme and its credential, or up to two tokens for an unknown scheme.
 const AUTHORIZATION_HEADER_PATTERN = new RegExp(
@@ -532,10 +539,11 @@ const AUTHORIZATION_HEADER_PATTERN = new RegExp(
   "gi",
 );
 // Cookie and Set-Cookie headers: every pair of the header value is a session credential. A pair's value may be
-// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote; a quote anywhere else
-// closes the value, so the next header of a JSON headers object is not taken; an unquoted value runs to the
-// `;`, `,`, or space that begins the next header on the line, or to the end of the line.
-const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')`;
+// quoted (`sid="x"`, `sid = 'x'`, JSON-escaped `sid=\"x\"`) and ends at its closing quote even with `; Name:`
+// inside; a quote anywhere else closes the value, so the next header of a JSON headers object is not taken; an
+// unquoted value, or one whose opening quote never closes, runs to the `;`, `,`, or space that begins the next
+// header on the line, or to the end of the line.
+const COOKIE_PAIR_VALUE = String.raw`(?<==\s*)(?:(?:\\?"[^"\\\r\n,;\s][^"\\\r\n]*\\?"|'[^'\r\n,;\s][^'\r\n]*')${CLOSING_QUOTE_BOUNDARY}|${UNTERMINATED_QUOTED_VALUE})`;
 const COOKIE_HEADER_VALUE = String.raw`(?:[^\s"'<>\\;,]|[ \t;,](?!${NEXT_HEADER_NAME})|${COOKIE_PAIR_VALUE})+`;
 const COOKIE_HEADER_PATTERN = new RegExp(String.raw`\b(set-cookie|cookie)(${HEADER_SEPARATOR})(${COOKIE_HEADER_VALUE})`, "gi");
 // A scheme standing in prose (`Bearer x`, `Bearer "x"`, `Token token=x`, `ApiKey x`); a scheme word that is itself a
@@ -551,16 +559,16 @@ const PROSE_AFTER_CAPITALIZED_SCHEME_PATTERN = /^\(?[A-Z][a-z]+[).:!?]*$/;
 const CREDENTIAL_PARAMETER_PATTERN = new RegExp(String.raw`([\w-]+=)${CREDENTIAL_PARAMETER_VALUE}`, "g");
 // Credential-named assignments (`client_secret=x`, `client_secret = "x"`, `JSESSIONID=x`, `connect.sid='x'`, `--token=x`).
 const SECRET_ASSIGNMENT_PATTERN = new RegExp(
-  String.raw`(?<![\w.-])([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*\s*=\s*)(${QUOTED_VALUE}|[^\s"'&;,<>\\]+)`,
+  String.raw`(?<![\w.-])([\w.-]*(?:sess|sid|token|secret|passw|passphrase|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|assertion|signature|auth|cookie|otp)[\w.-]*\s*=\s*)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>\\]+)`,
   "gi",
 );
 // Credential-named fields and single-value credential headers (`x-api-key: x`, `"password": "x"`, `\"access_token\":\"x\"`).
-const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+)/gi;
+const SECRET_FIELD_PATTERN = /(?<![\w/.-])((?:[\w-]*(?:api[_-]?key|apikey|token|secret|passw|passphrase|credential|assertion|signature|private[_-]?key|access[_-]?key|authorization)[\w-]*|pwd|passcode|otp|sid|jsessionid|session|sessionid|session[_-]?id|cookie|set-cookie|x-auth|x-token|x-secret|auth)\\?["']?\s*:\s*\\?["']?)([^\s"'&;,<>\\]+(?:["'](?=[\w/+=-])[^\s"'&;,<>\\]*)*)/gi;
 // SOAP and XML credential elements (`<sessionId>x</sessionId>`, `<urn:password>x</urn:password>`).
 const CREDENTIAL_ELEMENT_PATTERN = /<((?:[\w.-]+:)?(?:session_?id|session|passw(?:or)?d|pwd|passcode|otp|token|access_?token|refresh_?token|id_?token|secret|client_?secret|api_?key|apikey|assertion|signature|credentials?|authorization|private_?key)[\w-]*)(\s[^>]*)?>([^<]*)<\/\1\s*>/gi;
 // Command-line credential flags (`--token x`, `-password x`); the flag starts a word, so `access-token against` is prose.
 const CLI_SECRET_FLAG_PATTERN = new RegExp(
-  String.raw`(?<![\w-])(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)(${QUOTED_VALUE}|[^\s"'&;,<>-][^\s"'&;,<>]*)`,
+  String.raw`(?<![\w-])(--?(?:token|password|passwd|pwd|passcode|secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|credential|auth|bearer|session|cookie|sid|otp)\s+)(${QUOTED_VALUE}|${UNTERMINATED_QUOTED_VALUE}|[^\s"'&;,<>-][^\s"'&;,<>]*)`,
   "gi",
 );
 // Real token shapes, removed bare.
