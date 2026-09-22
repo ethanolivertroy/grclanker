@@ -26,6 +26,7 @@ import {
   collectAcrossCompartments,
   createOciCommandRunner,
   exportOciAuditBundle,
+  isDocumentedOpcRequestId,
   isSensitiveFieldName,
   judgeKeyShape,
   ociCommandWords,
@@ -1137,6 +1138,96 @@ test("OciCommandError never echoes stderr or stdout and parseServiceError keeps 
     assert.equal(error.message, `oci iam user list exited 0 but printed ${Buffer.byteLength(GATEWAY_PAGE, "utf8")} bytes of non-JSON stdout (withheld)`);
     return true;
   });
+});
+
+/** Unlabeled secrets placed so that a 500-character cap applied before the scrub would leave a 15-character prefix, below the 16-character long-token floor. */
+const STRADDLING_SESSION_ID = "3f9c1d7a2b4e6f80a1b2c3d4e5f60718";
+const STRADDLING_API_KEY = "Qm9vdHNlY3JldEt".padEnd(40, "leUFCQ0RFRkdISUpLTE1OT1BRUlM");
+const STRADDLING_PREFIX = `${"Upstream rejected the request; ".repeat(15)}retry with debug id `;
+
+test("parseServiceError scrubs the message before it caps it, so a secret straddling the cap never leaves a sub-floor fragment", async () => {
+  assert.equal(STRADDLING_PREFIX.length, 485);
+  assert.equal(STRADDLING_SESSION_ID.length, 32);
+  assert.equal(STRADDLING_API_KEY.length, 40);
+  for (const secret of [STRADDLING_SESSION_ID, STRADDLING_API_KEY]) {
+    const fragment = secret.slice(0, 15);
+    const message = `${STRADDLING_PREFIX}${secret} then retry`;
+    assert.ok(message.length > 500, "the message exceeds the cap");
+    const parsed = parseServiceError(serviceErrorBlock(message));
+    assert.ok(parsed.message.length <= 500, "the cap still applies");
+    assert.doesNotMatch(parsed.message, new RegExp(fragment), `a ${fragment.length}-character fragment of the secret survived the cap: ${parsed.message.slice(-40)}`);
+    assert.match(parsed.message, /debug id \[redacted\]/);
+
+    const args = ["--config-file", "/tmp/oci/config", "--profile", "prod-audit", "--region", "us-ashburn-1", "--output", "json", "cloud-guard", "problem", "list"];
+    const error = OciCommandError.fromExecFailure(args, execFileSyncFailure(args, serviceErrorBlock(message)));
+    assert.doesNotMatch(error.message, new RegExp(fragment));
+    assert.doesNotMatch(error.serviceError.message, new RegExp(fragment));
+    assert.match(error.message, /message=Upstream rejected the request; .*debug id \[redacted\]/);
+  }
+
+  // End to end: the LOG-02 summary and every bundle file stay free of the fragment.
+  const message = `${STRADDLING_PREFIX}${STRADDLING_SESSION_ID} then retry`;
+  const fragment = STRADDLING_SESSION_ID.slice(0, 15);
+  const real = new OciAuditorClient(
+    sampleConfig(),
+    createOciCommandRunner((_file, args) => {
+      throw execFileSyncFailure(args, serviceErrorBlock(message));
+    }),
+    { now: () => NOW },
+  );
+  const client = compliantClient();
+  client.listCloudGuardProblems = () => real.listCloudGuardProblems();
+  const logging = await assessOciLoggingDetection(client);
+  assert.equal(byId(logging, "OCI-LOG-02").status, "manual");
+  assert.doesNotMatch(JSON.stringify(logging), new RegExp(fragment), "the in-memory assessment carries the fragment");
+  const base = createTempBase("grclanker-oci-straddle-");
+  const bundle = await exportOciAuditBundle(client, sampleConfig(), base);
+  for (const file of listFilesRecursively(bundle.outputDir)) {
+    assert.doesNotMatch(readFileSync(file, "utf8"), new RegExp(fragment), `${relative(bundle.outputDir, file)} carries the fragment`);
+  }
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("opc-request-id is kept only in its documented hex layout; token-shaped values are dropped from the disclosure", () => {
+  const withRequestId = (value) => `ServiceError:\n${JSON.stringify({ code: "NotAllowed", message: "Access denied", "opc-request-id": value, status: 403 })}\n`;
+  const documented = [
+    OPC_REQUEST_ID,
+    "6B5074A48E0B435699E3CF5EC923D475",
+    "6b5074a48e0b435699e3cf5ec923d475/9c18fc7943f75e13a905193fd7fec0a3",
+    "6B5074a48e0B435699E3cf5EC923d475/9C18FC7943F75E13A905193FD7FEC0A3/6c148159e67e634c115c8b7ffe780d0e",
+    "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "3FA85F64-5717-4562-B3FC-2C963F66AFA6",
+  ];
+  for (const value of documented) {
+    assert.equal(isDocumentedOpcRequestId(value), true, value);
+    assert.equal(parseServiceError(withRequestId(value)).opcRequestId, value);
+  }
+  const tokenShaped = [
+    CANARIES.session,
+    STRADDLING_API_KEY,
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "6B5074A48E0B435699E3CF5EC923D47",
+    "6B5074A48E0B435699E3CF5EC923D475G",
+    `${OPC_REQUEST_ID}/6C148159E67E634C115C8B7FFE780D0E`,
+    "request_id_with_underscores_1234",
+    "x y",
+  ];
+  for (const value of tokenShaped) {
+    assert.equal(isDocumentedOpcRequestId(value), false, value);
+    assert.equal(parseServiceError(withRequestId(value)).opcRequestId, undefined, `${value} must be dropped`);
+  }
+
+  const args = ["--config-file", "/tmp/oci/config", "--profile", "prod-audit", "--region", "us-ashburn-1", "--output", "json", "iam", "user", "list"];
+  const forged = OciCommandError.fromExecFailure(args, execFileSyncFailure(args, withRequestId(CANARIES.session)));
+  assert.equal(forged.message, "oci iam user list exited 1 with ServiceError status=403 code=NotAllowed message=Access denied");
+  assert.doesNotMatch(forged.message, /opc-request-id=|CANARY-/);
+  const genuine = OciCommandError.fromExecFailure(args, execFileSyncFailure(args, withRequestId(OPC_REQUEST_ID)));
+  assert.equal(genuine.message, `oci iam user list exited 1 with ServiceError status=403 code=NotAllowed opc-request-id=${OPC_REQUEST_ID} message=Access denied`);
+
+  // The label alone never exempts a value from the long-token rule inside free text.
+  assert.equal(scrubErrorText(`see opc-request-id=${CANARIES.session} for details`), "see opc-request-id=[redacted] for details");
+  assert.equal(scrubErrorText(`see opc-request-id=${STRADDLING_SESSION_ID} for details`), `see opc-request-id=${STRADDLING_SESSION_ID} for details`, "a documented 32-hex id behind its label stays readable");
+  assert.equal(scrubErrorText(`see opc-request-id=${OPC_REQUEST_ID} for details`), `see opc-request-id=${OPC_REQUEST_ID} for details`);
 });
 
 test("error-body walk: no CLI surface echoes a stderr or stdout canary into findings, summaries, errors, bundle files, the zip, or thrown errors", async () => {

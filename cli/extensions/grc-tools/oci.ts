@@ -509,8 +509,9 @@ const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
  * contains a digit or a base64 `+`. OCIDs, CLI flags, PascalCase error codes
  * such as NotAuthorizedOrNotFound,
  * embedded URLs (already reduced to host and path), and the documented
- * opc-request-id correlation id (validated to its charset by
- * parseServiceError) are kept because verdict summaries name them.
+ * opc-request-id correlation id (kept only behind its label and only in the
+ * documented hex layout, see isDocumentedOpcRequestId) are kept because
+ * verdict summaries name them.
  */
 const LONG_TOKEN_PATTERN = /\bocid1\.[A-Za-z0-9._-]+|(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}(?![A-Za-z0-9+/_-])/g;
 const OPC_REQUEST_ID_LABEL = "opc-request-id=";
@@ -541,7 +542,7 @@ function redactCredentialAssignment(match: string, key: string, value: string): 
 
 function redactLongToken(match: string, offset: number, text: string): string {
   if (match.startsWith("ocid1.") || match.startsWith("-") || !/[0-9+]/.test(match)) return match;
-  if (text.slice(0, offset).endsWith(OPC_REQUEST_ID_LABEL)) return match;
+  if (text.slice(0, offset).endsWith(OPC_REQUEST_ID_LABEL) && isDocumentedOpcRequestId(match)) return match;
   return REDACTED_MARKER;
 }
 
@@ -829,13 +830,35 @@ export interface OciServiceErrorFields {
 }
 
 const SERVICE_ERROR_CODE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-const OPC_REQUEST_ID_PATTERN = /^[A-Za-z0-9/_.-]{1,200}$/;
+/**
+ * The two documented shapes of the Oracle-assigned request id: the SDK form
+ * the CLI prints in its ServiceError block, one to three 32-hex segments
+ * joined by "/" (example block at
+ * https://docs.oracle.com/en-us/iaas/Content/ContEng/known-issues/conteng-known-issues.htm),
+ * and the UUID form shown for the opc-request-id response header at
+ * https://docs.oracle.com/en-us/iaas/Content/API/Concepts/usingapi.htm. Both
+ * are hex with a fixed layout, matched case-insensitively, so a token-shaped
+ * value (hyphenated word, 40-character base64 key, JWT) never passes as a
+ * request id; anything else is dropped from the disclosure rather than echoed.
+ */
+const OPC_REQUEST_ID_PATTERNS = [
+  /^[0-9A-Fa-f]{32}(?:\/[0-9A-Fa-f]{32}){0,2}$/,
+  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/,
+];
 const SERVICE_ERROR_MESSAGE_MAX_LENGTH = 500;
+
+export function isDocumentedOpcRequestId(value: string): boolean {
+  return OPC_REQUEST_ID_PATTERNS.some((pattern) => pattern.test(value));
+}
 
 /**
  * Extracts the documented fields from a `ServiceError:` block in CLI stderr.
  * Returns undefined for anything else (HTML gateway pages, tracebacks, plain
- * text), so the caller emits a descriptor instead of echoing the body.
+ * text), so the caller emits a descriptor instead of echoing the body. The
+ * message is scrubbed before it is capped: a cap applied first could cut an
+ * unlabeled secret so that the surviving prefix falls under the long-token
+ * floor and escapes the scrub. Every other cap in this module (errorMessage,
+ * the access-check note column) also slices text that was scrubbed first.
  */
 export function parseServiceError(stderr: string): OciServiceErrorFields | undefined {
   const start = stderr.indexOf("ServiceError:");
@@ -852,12 +875,13 @@ export function parseServiceError(stderr: string): OciServiceErrorFields | undef
   const record = asObject(parsed);
   if (!record) return undefined;
   const code = asString(record.code);
+  const message = asString(record.message);
   const requestId = asString(record["opc-request-id"]);
   return {
     status: asNumber(record.status),
     code: code && SERVICE_ERROR_CODE_PATTERN.test(code) ? code : undefined,
-    message: asString(record.message)?.slice(0, SERVICE_ERROR_MESSAGE_MAX_LENGTH),
-    opcRequestId: requestId && OPC_REQUEST_ID_PATTERN.test(requestId) ? requestId : undefined,
+    message: message === undefined ? undefined : scrubErrorText(message).slice(0, SERVICE_ERROR_MESSAGE_MAX_LENGTH),
+    opcRequestId: requestId && isDocumentedOpcRequestId(requestId) ? requestId : undefined,
   };
 }
 
