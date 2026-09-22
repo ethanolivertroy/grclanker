@@ -351,13 +351,26 @@ function readConfigFile(env: NodeJS.ProcessEnv): { values: JsonRecord; path?: st
     if (configured) throw new Error(`SLACK_CONFIG_FILE does not exist: ${configured}`);
     return { values: {} };
   }
+  let text: string;
   try {
-    const parsed = asObject(JSON.parse(readFileSync(candidate, "utf8")));
-    return { values: parsed ?? {}, path: candidate };
+    text = readFileSync(candidate, "utf8");
   } catch (error) {
-    const reason = error instanceof SyntaxError ? "the file is not valid JSON (parser detail withheld because it can quote the file)" : redactErrorText(error instanceof Error ? error.message : String(error));
-    throw new Error(`Unable to parse Slack config file ${candidate}: ${reason}`);
+    const code = systemErrorCode(error);
+    throw new Error(redactErrorText(`Unable to read Slack config file ${candidate}${code ? ` (${code})` : ""}`));
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`Unable to parse Slack config file ${candidate}: the file is not valid JSON (parser detail withheld because it can quote the file)`);
+  }
+  return { values: asObject(parsed) ?? {}, path: candidate };
+}
+
+/** A Node system error code such as EISDIR or EACCES; the error message and any other thrown value are never rendered. */
+function systemErrorCode(error: unknown): string | undefined {
+  const code = asObject(error)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code) ? code : undefined;
 }
 
 function pickSource(
