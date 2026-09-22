@@ -318,6 +318,60 @@ test("URL scrubbing is idempotent for query-only, fragment-only, and mixed URLs,
   }
 });
 
+test("scrubError reads every property under a guard, so a throwing getter, a hostile Proxy, or a revoked Proxy cannot replace the failure being recorded", () => {
+  const trap = () => {
+    throw new Error(`trap fired with ${CANARY.bearer}`);
+  };
+  const hostile = new Proxy({}, { get: trap, has: trap, ownKeys: trap, getOwnPropertyDescriptor: trap, getPrototypeOf: trap });
+  assert.deepEqual(scrubError(hostile), { name: "Error", message: "Error without a message" });
+  assert.equal(errorMessage(hostile), "Error without a message");
+
+  class ThrowingAccessors extends Error {
+    name = "ThrowingAccessors";
+    get code() {
+      return trap();
+    }
+    get status() {
+      return trap();
+    }
+    get cause() {
+      return trap();
+    }
+    get errors() {
+      return trap();
+    }
+    get response() {
+      return trap();
+    }
+    get request() {
+      return trap();
+    }
+    get endpoint() {
+      return trap();
+    }
+  }
+  const accessors = new ThrowingAccessors(`request failed: Authorization: Bearer ${CANARY.bearer}`);
+  assert.deepEqual(scrubError(accessors), { name: "ThrowingAccessors", message: `request failed: Authorization: Bearer ${REDACTED}` });
+
+  const throwingName = Object.create(Error.prototype, { name: { get: trap }, message: { value: "named badly", enumerable: true } });
+  assert.deepEqual(scrubError(throwingName), { name: "Error", message: "named badly" });
+
+  const membersProxy = new Proxy([new Error("member one")], { get: (target, key) => (key === "length" ? trap() : target[key]) });
+  assert.deepEqual(scrubError({ message: "aggregate", errors: membersProxy }), { name: "Error", message: "aggregate" });
+  const memberTrap = new Proxy([new Error("member one")], { get: (target, key) => (key === "0" ? trap() : target[key]) });
+  assert.deepEqual(scrubError({ message: "aggregate", errors: memberTrap }), { name: "Error", message: "aggregate" });
+
+  const { proxy: revoked, revoke } = Proxy.revocable({ message: "gone" }, {});
+  revoke();
+  assert.deepEqual(scrubError(revoked), { name: "Error", message: "Error without a message" });
+  assert.deepEqual(scrubError({ message: "outer", cause: revoked, $metadata: revoked, request: revoked, errors: revoked }), { name: "Error", message: "outer (cause: Error without a message)" });
+
+  const folded = new IntegrationError("collector failed", { cause: hostile, status: 502 });
+  assert.equal(folded.message, "collector failed");
+  assert.equal(errorMessage(folded), "collector failed (cause: Error without a message)");
+  for (const value of [hostile, accessors, throwingName, revoked]) assertNoCanaryValues(scrubError(value), "hostile thrown value");
+});
+
 test("URLs keep scheme, host, and path and lose userinfo, query, and fragment; bare query pairs keep their names", () => {
   assert.equal(
     scrubErrorText(`see https://alice:${CANARY.sessionCookie}@host.example/path/x?token=${CANARY.urlToken}#frag.`),

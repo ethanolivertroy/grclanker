@@ -781,7 +781,12 @@ function isPlainObject(value: unknown): value is JsonRecord {
 }
 
 function asRecord(value: unknown): JsonRecord | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : undefined;
+  try {
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : undefined;
+  } catch {
+    // Array.isArray throws on a revoked Proxy; such a value holds nothing readable.
+    return undefined;
+  }
 }
 
 function asText(value: unknown): string | undefined {
@@ -926,26 +931,57 @@ function validErrorCode(value: unknown): string | undefined {
   return typeof value === "string" && ERROR_CODE_PATTERN.test(value) ? value : undefined;
 }
 
+/**
+ * One property of a thrown value. A thrown value is foreign: a getter that throws, a Proxy trap that
+ * throws, or a revoked Proxy would otherwise raise from inside the error path and replace the failure
+ * being recorded with its own, so a property that cannot be read is treated as absent.
+ */
+function propertyOf(record: JsonRecord, key: string): unknown {
+  try {
+    return record[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/** The members of an `errors` array and its length, read under the same guard; anything unreadable is no member list. */
+function memberListOf(value: unknown): { members: unknown[]; count: number } {
+  try {
+    if (!Array.isArray(value)) return { members: [], count: 0 };
+    const count = value.length;
+    if (!Number.isSafeInteger(count) || count <= 0) return { members: [], count: 0 };
+    return { members: value.slice(0, MAX_AGGREGATE_MEMBERS), count };
+  } catch {
+    return { members: [], count: 0 };
+  }
+}
+
 function errorNameOf(record: JsonRecord): string {
-  return typeof record.name === "string" && ERROR_NAME_PATTERN.test(record.name) ? record.name : "Error";
+  const name = propertyOf(record, "name");
+  return typeof name === "string" && ERROR_NAME_PATTERN.test(name) ? name : "Error";
 }
 
 function statusOf(record: JsonRecord): number | undefined {
-  const metadata = asRecord(record.$metadata);
-  const response = asRecord(record.response) ?? asRecord(record.$response);
+  const metadata = asRecord(propertyOf(record, "$metadata"));
+  const response = asRecord(propertyOf(record, "response")) ?? asRecord(propertyOf(record, "$response"));
   return (
-    validHttpStatus(record.status) ??
-    validHttpStatus(record.statusCode) ??
-    validHttpStatus(record.httpStatusCode) ??
-    validHttpStatus(metadata?.httpStatusCode) ??
-    validHttpStatus(response?.status) ??
-    validHttpStatus(response?.statusCode)
+    validHttpStatus(propertyOf(record, "status")) ??
+    validHttpStatus(propertyOf(record, "statusCode")) ??
+    validHttpStatus(propertyOf(record, "httpStatusCode")) ??
+    validHttpStatus(metadata && propertyOf(metadata, "httpStatusCode")) ??
+    validHttpStatus(response && propertyOf(response, "status")) ??
+    validHttpStatus(response && propertyOf(response, "statusCode"))
   );
 }
 
 function endpointOf(record: JsonRecord, options: ScrubErrorTextOptions): string | undefined {
-  const request = asRecord(record.request);
-  const candidate = asText(record.endpoint) ?? asText(record.path) ?? asText(record.url) ?? asText(request?.url) ?? asText(request?.path);
+  const request = asRecord(propertyOf(record, "request"));
+  const candidate =
+    asText(propertyOf(record, "endpoint")) ??
+    asText(propertyOf(record, "path")) ??
+    asText(propertyOf(record, "url")) ??
+    asText(request && propertyOf(request, "url")) ??
+    asText(request && propertyOf(request, "path"));
   if (!candidate || candidate.length > MAX_ENDPOINT_LENGTH) return undefined;
   return scrubErrorText(candidate, options);
 }
@@ -960,29 +996,30 @@ function scrubErrorValue(value: unknown, options: ScrubErrorTextOptions, seen: S
   if (seen.has(value) || depth > MAX_CAUSE_DEPTH) return { name, message: "cause chain truncated" };
   seen.add(value);
 
-  const ownMessage = asText(record.message) ?? asText(record.error) ?? asText(record.error_description);
+  const ownMessage = asText(propertyOf(record, "message")) ?? asText(propertyOf(record, "error")) ?? asText(propertyOf(record, "error_description"));
   const parts = [ownMessage ? scrubErrorText(ownMessage, options) : `${name} without a message`];
-  let code = validErrorCode(record.code) ?? validErrorCode(record.Code);
+  let code = validErrorCode(propertyOf(record, "code")) ?? validErrorCode(propertyOf(record, "Code"));
   let status = statusOf(record);
   let endpoint = endpointOf(record, options);
 
-  const members = Array.isArray(record.errors) ? record.errors : [];
-  if (members.length > 0) {
-    const summaries = members.slice(0, MAX_AGGREGATE_MEMBERS).map((member) => scrubErrorValue(member, options, seen, depth + 1));
-    const rest = members.length > MAX_AGGREGATE_MEMBERS ? `; and ${members.length - MAX_AGGREGATE_MEMBERS} more` : "";
-    parts.push(`(${members.length} error${members.length === 1 ? "" : "s"}: ${summaries.map((summary) => summary.message).join("; ")}${rest})`);
+  const { members, count } = memberListOf(propertyOf(record, "errors"));
+  if (count > 0) {
+    const summaries = members.map((member) => scrubErrorValue(member, options, seen, depth + 1));
+    const rest = count > MAX_AGGREGATE_MEMBERS ? `; and ${count - MAX_AGGREGATE_MEMBERS} more` : "";
+    parts.push(`(${count} error${count === 1 ? "" : "s"}: ${summaries.map((summary) => summary.message).join("; ")}${rest})`);
     for (const summary of summaries) {
       code ??= summary.code;
       status ??= summary.status;
       endpoint ??= summary.endpoint;
     }
   }
-  if (record.cause !== undefined && record.cause !== null) {
-    const cause = scrubErrorValue(record.cause, options, seen, depth + 1);
-    parts.push(`(cause: ${cause.message})`);
-    code ??= cause.code;
-    status ??= cause.status;
-    endpoint ??= cause.endpoint;
+  const cause = propertyOf(record, "cause");
+  if (cause !== undefined && cause !== null) {
+    const scrubbedCause = scrubErrorValue(cause, options, seen, depth + 1);
+    parts.push(`(cause: ${scrubbedCause.message})`);
+    code ??= scrubbedCause.code;
+    status ??= scrubbedCause.status;
+    endpoint ??= scrubbedCause.endpoint;
   }
 
   const scrubbed: ScrubbedError = { name, message: truncate(parts.join(" "), MAX_ERROR_MESSAGE_LENGTH) };
@@ -998,10 +1035,17 @@ function scrubErrorValue(value: unknown, options: ScrubErrorTextOptions, seen: S
  * `$response`), plain objects, and strings. Only the `message`, `error`, and `error_description`
  * strings are read for text and each is scrubbed; a custom `toString`, a response body field such
  * as `$responseBodyText`, and every other property are never read, so a foreign object thrown by a
- * client library cannot smuggle a body or a credential into the recorded text.
+ * client library cannot smuggle a body or a credential into the recorded text. Every property is
+ * read under a guard: a getter or Proxy trap that throws counts as an absent property, and a value
+ * that cannot be reduced at all becomes the fixed message `thrown value could not be read`, so this
+ * function never throws and never lets a foreign value replace the failure being recorded.
  */
 export function scrubError(error: unknown, options: ScrubErrorTextOptions = {}): ScrubbedError {
-  return scrubErrorValue(error, options, new Set<object>(), 0);
+  try {
+    return scrubErrorValue(error, options, new Set<object>(), 0);
+  } catch {
+    return { name: "Error", message: "thrown value could not be read" };
+  }
 }
 
 /** The one-line form of `scrubError`: the scrubbed message with cause chain folded in and whitespace collapsed. */
