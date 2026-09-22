@@ -56,6 +56,7 @@ function createStubBackend(
       stageWorkspace: false,
       artifactSync: false,
       interactive: false,
+      oneShot: false,
     },
     async healthcheck() {
       fail();

@@ -35,6 +35,7 @@ function createLocalBackend(
       stageWorkspace: false,
       artifactSync: true,
       interactive: true,
+      oneShot: false,
     },
     async healthcheck() {
       return;

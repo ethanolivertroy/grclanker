@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { describePagination, readYamlConfig, type PaginationStop } from "./hardening/index.js";
+import { ConfigFileError, describePagination, readYamlConfig, type ConfigFileFailureKind, type ConfigFileResult, type PaginationStop } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -743,16 +743,55 @@ interface ConfigFileValues {
   auditWindowDays?: number;
 }
 
+const CONFIG_FILE_OPTIONS = { label: "New Relic" } as const;
+
+/**
+ * The sanitized form of a shared-loader failure, thrown by `resolveNewrelicConfiguration` in place of the loader's
+ * `ConfigFileError`. The loader's message is fixed text plus the path, the parser's position, and a validated code
+ * (`Unable to parse New Relic config file: invalid YAML in <path> at line N, column M (<CODE>)`, `Unable to read New
+ * Relic config file <path> (<CODE>)`); the path is the caller's own text and the one field that can carry a
+ * credential (a key embedded in a directory name), so the message and the `path` property both pass through
+ * `scrubErrorText`, with the configured key values as known secrets, before they leave this module. The validated
+ * fields (`kind`, `format`, `code`, `line`, `column`) are copied as they are for callers that branch on them.
+ */
+export class NewrelicConfigFileError extends Error {
+  readonly kind: ConfigFileFailureKind;
+  readonly path: string;
+  readonly format: string | undefined;
+  readonly code: string | undefined;
+  readonly line: number | undefined;
+  readonly column: number | undefined;
+
+  constructor(cause: ConfigFileError, secrets: string[]) {
+    super(scrubErrorText(cause.message, secrets));
+    this.name = "NewrelicConfigFileError";
+    this.kind = cause.kind;
+    this.path = scrubErrorText(cause.path, secrets);
+    this.format = cause.format;
+    this.code = cause.code;
+    this.line = cause.line;
+    this.column = cause.column;
+  }
+}
+
 /**
  * Reads the optional config file through the shared `readYamlConfig` guards. Neither the read error nor the parser
  * error is interpolated: the YAML parser quotes the offending source line in its message, which for a malformed
- * `api_key:` line is the key itself, so the thrown `ConfigFileError` is the fixed description with the path, the
+ * `api_key:` line is the key itself, so the loader's `ConfigFileError` is the fixed description with the path, the
  * line, column, and parser code when the parse failed, or the system error code when the read failed, and nothing
- * else. A missing file is no config, as before.
+ * else. That error is caught here and rethrown as `NewrelicConfigFileError`, whose message and path are scrubbed
+ * like every other error string this module creates; any other thrown value is not a loader failure and propagates.
+ * A missing file is no config, as before.
  */
-function readConfigFile(pathname: string): ConfigFileValues | undefined {
+function readConfigFile(pathname: string, secrets: string[]): ConfigFileValues | undefined {
   if (!existsSync(pathname)) return undefined;
-  const read = readYamlConfig(pathname, { label: "New Relic" });
+  let read: ConfigFileResult<unknown>;
+  try {
+    read = readYamlConfig(pathname, CONFIG_FILE_OPTIONS);
+  } catch (error) {
+    if (!(error instanceof ConfigFileError)) throw error;
+    throw new NewrelicConfigFileError(error, secrets);
+  }
   if (!read.ok) return undefined;
   const object = asObject(read.value) ?? {};
   return {
@@ -773,7 +812,9 @@ export function resolveNewrelicConfiguration(
   const configPath = asString(input.config_file)
     ?? asString(env.NEW_RELIC_SEC_INSPECTOR_CONFIG)
     ?? join(homeDir, ".newrelic-sec-inspector", "config.yaml");
-  const fileValues = readConfigFile(configPath);
+  // The key values already known before the file is read; a config-file error is scrubbed with them by exact match.
+  const knownSecrets = [asString(input.api_key), asString(env.NEW_RELIC_API_KEY)].filter((value): value is string => value !== undefined);
+  const fileValues = readConfigFile(configPath, knownSecrets);
 
   const apiKey = asString(input.api_key) ?? asString(env.NEW_RELIC_API_KEY) ?? fileValues?.apiKey;
   if (!apiKey) {
