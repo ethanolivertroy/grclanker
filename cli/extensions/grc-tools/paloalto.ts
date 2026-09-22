@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../flue/redact.js";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -501,27 +501,56 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const MIN_LETTERS_FOR_CASING = 6;
 // A segment this long that is not name-shaped makes the whole run a token on its own.
 const MIN_TOKEN_SEGMENT_LENGTH = 8;
-// A key whose last segment names a reference, threshold, count, mode, or file is never a
-// credential carrier (credentialID, keyId, tokenCount, session_timeout_minutes, auth_mode,
-// credentials_file, passwordPolicy, webhookUrl), nor is a max/min bound.
-const SAFE_LAST_KEY_SEGMENTS = new Set([
-  "id", "ids", "name", "names", "url", "urls", "uri", "host", "type", "types", "count", "limit", "days", "hours", "minutes", "seconds",
-  "path", "file", "dir", "mode", "method", "scheme", "status", "state", "source", "length", "age", "policy", "enabled", "required",
-  "expiry", "expires", "expiration", "version", "scope", "scopes", "label", "manager", "prefix", "suffix", "format", "hint", "ref",
+// A carrier is named by its last word: api_key, access_token, client_secret, X-PAN-KEY,
+// _upstream_session, oauth_signature, Set-Cookie, password1. A key whose last word names
+// something else (credentialID, keyId, tokenCount, auth_mode, credentials_file,
+// passwordPolicy, password_complexity_by_device, credential-enforcement) is not one, nor is
+// a max/min bound; a session id (session_id, PHPSESSID, JSESSIONID) is, whatever its tail.
+const CREDENTIAL_KEY_WORDS = new Set([
+  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passcode", "phash",
+  "apikey", "authorization", "credential", "credentials", "key", "keys", "cookie", "cookies", "sid", "sig", "signature",
+  "auth", "nonce", "sas", "community", "authpwd", "privpwd", "pin", "otp", "totp", "jwt", "assertion", "bearer", "hmac",
+  "session", "sessid", "kubeconfig", "dsn", "pem", "ikey", "skey",
 ]);
+// Concatenated spellings the segment split cannot see (authtoken, sharedsecret, privatekey).
+const CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:token|secret|passw(?:or)?d|passphrase|passcode|phash|authorization|credential|signature|nonce|community|assertion|session|sessid|authpwd|privpwd|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)keys?)$/;
+// A key whose last word names the form of a value (password_hash, token_value,
+// authorization_header, secret_plain) carries a credential when an earlier word names one.
+const CREDENTIAL_VALUE_FORM_WORDS = new Set(["value", "values", "plain", "plaintext", "data", "string", "text", "header", "raw", "encrypted", "hash", "digest", "blob", "content"]);
+const SESSION_ID_PATTERN = /sess(?:ion)?[_.-]?id$/i;
 const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
-// Bare and PAN-OS credential words the Flue heuristic does not cover.
-const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "session", "sessid", "auth", "nonce", "sas", "phash", "community", "authpwd", "privpwd"]);
 const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
+// "pass" names a credential in a query string or an = assignment (user=a&pass=b), while a
+// "pass" count or verdict in a key: value pair is this module's own vocabulary.
+const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
+// JSON structure and literals after a key are never a credential value.
+const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
+
+function credentialKeyWord(segment: string): boolean {
+  return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+// The words of a key with trailing digits removed from each (password1, key2).
+function keyWords(key: string): string[] {
+  return propertyNameSegments(key).map((segment) => segment.replace(/\d+$/, "")).filter((segment) => segment.length > 0);
+}
 
 /** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
 export function isCredentialKey(key: string): boolean {
-  const segments = propertyNameSegments(key);
-  const last = segments[segments.length - 1];
-  if (last === undefined || SAFE_LAST_KEY_SEGMENTS.has(last) || BOUND_KEY_SEGMENTS.has(segments[0])) return false;
-  if ((last === "key" || last === "keys") && segments.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(segments[segments.length - 2])) return false;
-  if (isSensitiveArgumentKey(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
-  return segments.some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+  if (SESSION_ID_PATTERN.test(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
+  if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
+  if (credentialKeyWord(last)) return true;
+  return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+/** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
+function isCredentialAssignmentKey(key: string): boolean {
+  if (isCredentialKey(key)) return true;
+  const words = keyWords(key);
+  return words.length > 0 && ASSIGNMENT_ONLY_CREDENTIAL_WORDS.has(words[words.length - 1]);
 }
 
 // Token-shaped casing: the case changes more often than once every three letters
@@ -606,11 +635,11 @@ function replaceCredentialAssignments(text: string): string {
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    if (!isCredentialKey(key)) continue;
+    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
     const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
     valuePattern.lastIndex = match.index + whole.length;
     const value = valuePattern.exec(text)?.[0];
-    if (value === undefined) continue;
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value)) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${REDACTION_MARKER}`;
     last = match.index + whole.length + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
@@ -623,7 +652,7 @@ function scrubCarriers(text: string, pemScope: PemScope): string {
   const scrubbed = scrubPem(text, pemScope)
     .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${REDACTION_MARKER}`)
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match))
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match))
     .replace(HEADER_LINE_PATTERN, `$1$2${REDACTION_MARKER}`)
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (PLAIN_WORD_PATTERN.test(value) ? match : `${scheme} ${REDACTION_MARKER}`))
     .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string) => (isCredentialKey(key) ? `"${key}":"${REDACTION_MARKER}"` : match))

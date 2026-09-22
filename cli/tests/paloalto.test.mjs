@@ -31,10 +31,12 @@ import {
   createPaloaltoClients,
   describePrismaErrorBody,
   exportPaloaltoAuditBundle,
+  isCredentialKey,
   isCredentialPropertyName,
   isCredentialXmlName,
   isPrimaryFinding,
   parseXml,
+  redactConfiguredSecrets,
   redactCredentialProperties,
   redactCredentialValueText,
   redactErrorText,
@@ -54,10 +56,21 @@ import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/
 const noSleep = async () => {};
 
 // The configured Prisma Cloud secret key of every fixture. It is a configured secret, so
-// the tool boundary and the bundle writer remove it wherever it appears (guard 2); a
-// realistic shape keeps it from colliding with a JSON property name such as "secret",
-// which a whole-token match on a short word would erase from the written files.
-const FIXTURE_SECRET_KEY = "fixture-secret-key-Q7wR2tY8uI3o";
+// the throw sites, the tool boundary, and the bundle writer remove it wherever it appears
+// (guard 2). It is deliberately name-shaped: bare in prose nothing but guard 2 removes it,
+// so its absence proves the configured-secret pass ran. Its words appear nowhere in the
+// module's own vocabulary (source_chain renders "environment-prisma-secret-key", so
+// "secret" and "key" are out), and it must not collide with a JSON property name such as
+// "secret", which a whole-token match on a short word would erase from the written files.
+const FIXTURE_SECRET_KEY = "fixture-ochre-lantern-2026";
+// The PAN-OS keygen password of the sweep fixtures: every character class an encoding
+// changes, so its JSON-escaped, URL-encoded, base64, and base64url forms all differ.
+const FIXTURE_PANOS_PASSWORD = 'p@ss"w/rd+2026';
+
+// The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
+function secretForms(value) {
+  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
+}
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1147,23 +1160,30 @@ const CANARY_BEARER = "CANARY-BEARER-9f8e7d6c5b4a3210";
 const CANARY_SESSION = "CANARY-SESSION-0a1b2c3d4e5f6789";
 const CANARY_API_KEY = "CANARY-APIKEY-1122334455667788";
 const CANARY_URL_TOKEN = "CANARY-URLTOKEN-99aa88bb77cc66dd";
-const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN];
+// Name-shaped (one digit group per segment), so bare in prose it would stay: only the
+// carrier it travels in (a session assignment) removes it.
+const CANARY_NAMED = "sess-canary-COOKIE-31415926535897";
+const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
-const CANARY_SENTENCE = `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; _upstream_session=${CANARY_SESSION} and api_key=${CANARY_API_KEY} were rejected`;
-const SCRUBBED_SENTENCE = "Upstream refused Bearer [REDACTED] when calling https://api.example.com/v1/x?token=[REDACTED] mid-sentence; _upstream_session=[REDACTED] and api_key=[REDACTED] were rejected";
+const CANARY_SENTENCE = `Upstream refused Bearer ${CANARY_BEARER} when calling ${CANARY_URL} mid-sentence; _upstream_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, and session=${CANARY_NAMED} were rejected`;
+const SCRUBBED_SENTENCE = "Upstream refused Bearer [REDACTED] when calling https://api.example.com/v1/x?token=[REDACTED] mid-sentence; _upstream_session=[REDACTED], api_key=[REDACTED], and session=[REDACTED] were rejected";
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function assertNoCanary(text, label) {
-  for (const canary of CANARIES) {
-    assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
-    for (let index = 0; index + 8 <= canary.length; index += 1) {
-      const fragment = canary.slice(index, index + 8);
-      assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
-    }
+// Neither the canary nor any window of `windowSize` characters of it may survive, so a
+// partial echo (a slice, a split token) is attributable to the canary it came from.
+function assertNoWindow(text, canary, windowSize, label) {
+  assert.ok(!text.includes(canary), `${label}: ${canary} leaked`);
+  for (let index = 0; index + windowSize <= canary.length; index += 1) {
+    const fragment = canary.slice(index, index + windowSize);
+    assert.ok(!text.includes(fragment), `${label}: fragment ${fragment} of ${canary} leaked`);
   }
+}
+
+function assertNoCanary(text, label, canaries = CANARIES) {
+  for (const canary of canaries) assertNoWindow(text, canary, 8, label);
 }
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.
@@ -1247,6 +1267,163 @@ test("redaction helpers scrub credential-shaped text, JSON pairs, URL credential
   for (const secret of Object.values(FAKE_PRISMA_SECRETS)) {
     assert.ok(!JSON.stringify(redacted).includes(secret), `${secret} leaked from integrations`);
     assert.ok(!JSON.stringify(compute).includes(secret), `${secret} leaked from the Compute snapshot`);
+  }
+});
+
+// The scrub boundary ruling: name-shaped values (words joined by hyphens or underscores
+// with at most one digit group per segment) stay bare in prose because they are
+// indistinguishable from resource names; the same values are removed from every carrier
+// whatever their shape, a configured secret is removed in every form whatever its shape,
+// and real token shapes are removed bare.
+const NAME_SHAPED_VALUES = ["prod-us-east-2026", "fw-dc1-01", "sess-canary-COOKIE-31415926535897"];
+
+// Every carrier of the ruling with the value in it, and the exact rendering after the scrub.
+function carriersOf(value) {
+  return [
+    [`Authorization: Bearer ${value}`, /^Authorization: (?:Bearer )?\[REDACTED\]$/],
+    [`Proxy-Authorization: Basic ${value}`, /^Proxy-Authorization: (?:Basic )?\[REDACTED\]$/],
+    [`Cookie: sid=${value}; theme=dark`, /^Cookie: \[REDACTED\]$/],
+    [`Set-Cookie: sid=${value}; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
+    [`X-Api-Key: ${value}`, /^X-Api-Key: \[REDACTED\]$/],
+    [`X-PAN-KEY: ${value}`, /^X-PAN-KEY: \[REDACTED\]$/],
+    [`x-redlock-auth: ${value}`, /^x-redlock-auth: \[REDACTED\]$/],
+    [`<p>X-Api-Key: ${value}</p><p>next</p>`, /^<p>X-Api-Key: \[REDACTED\]<\/p><p>next<\/p>$/],
+    [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
+    [`_upstream_session=${value} expired`, /^_upstream_session=\[REDACTED\] expired$/],
+    [`PHPSESSID=${value}; Path=/`, /^PHPSESSID=\[REDACTED\]; Path=\/$/],
+    [`https://svc:${value}@proxy.example.com/x`, /^https:\/\/\[REDACTED\]@proxy\.example\.com\/x$/],
+    [`https://fw/api/?type=op&key=${value}&cmd=x`, /^https:\/\/fw\/api\/\?type=op&key=\[REDACTED\]&cmd=x$/],
+    [`GET /api/?type=keygen&user=a&password=${value}`, /^GET \/api\/\?type=keygen&user=a&password=\[REDACTED\]$/],
+    [`/login?user=a&pass=${value}`, /^\/login\?user=a&pass=\[REDACTED\]$/],
+    [`https://x.example.com/cb#access_token=${value}&state=1`, /^https:\/\/x\.example\.com\/cb#access_token=\[REDACTED\]&state=1$/],
+    [`Bearer ${value}`, /^Bearer \[REDACTED\]$/],
+    [`Basic ${value}`, /^Basic \[REDACTED\]$/],
+    [`Token ${value}`, /^Token \[REDACTED\]$/],
+    [`ApiKey ${value}`, /^ApiKey \[REDACTED\]$/],
+    [`SSWS ${value}`, /^SSWS \[REDACTED\]$/],
+    [`password=${value}`, /^password=\[REDACTED\]$/],
+    [`password: ${value}`, /^password: \[REDACTED\]$/],
+    [`passphrase: ${value} and more words`, /^passphrase: \[REDACTED\]$/],
+    [`client_secret=${value}&grant_type=x`, /^client_secret=\[REDACTED\]&grant_type=x$/],
+    [`{"client_secret":"${value}","name":"svc"}`, /^\{"client_secret":"\[REDACTED\]","name":"svc"\}$/],
+    [`{"authToken": "${value}", "url": "https://x"}`, /^\{"authToken":"\[REDACTED\]", "url": "https:\/\/x"\}$/],
+    [`<entry name="fw1" key="${value}"/>`, /^<entry name="fw1" key="\[REDACTED\]"\/>$/],
+    [`<entry name='r1' secret='${value}'/>`, /^<entry name='r1' secret='\[REDACTED\]'\/>$/],
+    [`<server name="r1" community-string="${value}"/>`, /^<server name="r1" community-string="\[REDACTED\]"\/>$/],
+  ];
+}
+
+test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
+  for (const value of NAME_SHAPED_VALUES) {
+    for (const prose of [`device ${value} was not read`, `${value}`, `inventory ${value} read 12 of 40 resources`, `path /var/lib/${value}/state`]) {
+      assert.equal(redactErrorText(prose), prose, `${value} stays bare in error text`);
+      assert.equal(redactCredentialValueText(prose), prose, `${value} stays bare in a data value`);
+    }
+    for (const [text, expected] of carriersOf(value)) {
+      for (const scrub of [redactErrorText, redactCredentialValueText]) {
+        const out = scrub(text);
+        assert.match(out, expected, `${scrub.name}(${JSON.stringify(text)}) -> ${JSON.stringify(out)}`);
+        assertNoWindow(out, value, 6, `${scrub.name} ${text}`);
+        assert.equal(scrub(out), out, `${scrub.name} is idempotent on ${out}`);
+      }
+    }
+    // A configured secret goes bare and in every encoded form, however name-shaped it is.
+    for (const form of secretForms(value)) {
+      assert.equal(redactSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `configured ${value} as ${form}`);
+      assert.equal(redactConfiguredSecrets(`login rejected for ${form} by upstream`, [value]), "login rejected for [REDACTED] by upstream", `guard 2 alone on ${form}`);
+    }
+  }
+  // Every encoding of a secret with characters each encoding changes.
+  for (const form of secretForms(FIXTURE_PANOS_PASSWORD)) {
+    assert.ok(form.length >= 8, form);
+    assert.equal(redactConfiguredSecrets(`echo ${form} end`, [FIXTURE_PANOS_PASSWORD]), "echo [REDACTED] end", form);
+  }
+  assert.equal(secretForms(FIXTURE_PANOS_PASSWORD).length, 5, "the fixture password has five distinct forms");
+  assert.equal(redactConfiguredSecrets("a pin 4711 and pin 47110", ["4711"]), "a pin [REDACTED] and pin 47110", "a short secret is removed as a whole token only");
+  assert.equal(redactConfiguredSecrets("too short abc", ["abc"]), "too short abc", "below the minimum length nothing is scrubbed");
+
+  // Real token shapes go bare from error text, and stay in data values where they are identifiers.
+  for (const [text, expected] of [
+    ["bare Kq7Zx2Vw9Lm4Tp8R token", "bare [REDACTED] token"],
+    ["digest 0f9e8d7c6b5a4938 shown", "digest [REDACTED] shown"],
+    ["hash 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b shown", "hash [REDACTED] shown"],
+    ["key LUFRPT0123456789abcdefghijklmnop expired", "key [REDACTED] expired"],
+    ["jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijk expired", "jwt [REDACTED] expired"],
+    ["bare dXNlcjpwYXNzd29yZA== padded", "bare [REDACTED] padded"],
+    ["akid AKIAIOSFODNN7EXAMPLE shown", "akid [REDACTED] shown"],
+    ["-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----", "[REDACTED]"],
+    ["-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----", "[REDACTED]"],
+    ["truncated -----BEGIN PRIVATE KEY-----\nMIIEfake", "truncated [REDACTED]"],
+  ]) {
+    assert.equal(redactErrorText(text), expected);
+    assert.equal(redactErrorText(expected), expected, "idempotent");
+  }
+  assert.equal(redactCredentialValueText("bare Kq7Zx2Vw9Lm4Tp8R id"), "bare Kq7Zx2Vw9Lm4Tp8R id", "an opaque identifier in evidence is not a secret");
+  const certificate = "-----BEGIN CERTIFICATE-----\nMIIEfake\n-----END CERTIFICATE-----";
+  assert.equal(redactCredentialValueText(certificate), certificate, "a public certificate is evidence");
+  assert.equal(redactCredentialValueText("-----BEGIN PRIVATE KEY-----\nMIIEfake\n-----END PRIVATE KEY-----"), "[REDACTED]");
+  assert.equal(redactCredentialValueText("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA\n-----END OPENSSH PRIVATE KEY-----"), "[REDACTED]");
+  assert.equal(redactCredentialValueText(`${certificate}\n-----BEGIN EC PRIVATE KEY-----\nMHcC`), `${certificate}\n[REDACTED]`, "a truncated private block after a kept certificate");
+
+  // Names, prose, and this module's own vocabulary survive.
+  for (const text of [
+    "PAN-OS keygen failed (code 403, status 403): Invalid credentials",
+    "Prisma Cloud GET /v2/policy failed (400): non-JSON text/html response body (1234 bytes, not echoed)",
+    "GET /api/?type=config&action=show&xpath=/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']",
+    "arn:aws:iam::123456789012:role/AWSLambdaBasicExecutionRole",
+    "/tmp/grclanker-paloalto-loader-errors-Ab3xY9/nested.yaml",
+    "policy 550e8400-e29b-41d4-a716-446655440000 unified_compliance_matrix ENOENT PCI-DSS-4",
+    "Basic authentication is required; the Bearer token is missing; token expired, retry later",
+    "Unable to read Palo Alto config file /etc/paloalto.json (EACCES)",
+    '"pass": 12, "pass_rate": 95, "default_snmp_community": false, "credential_enforcement_disabled": [], "password_complexity_by_device": [',
+    '"credential-enforcement": {\n "client-auth": {\n "multi-factor-auth": {\n "password-complexity": {',
+    "session_timeout_minutes=30 auth_mode=saml credentials_file=/etc/x credentialID=reg-cred-1 access_key_id=AKIA client_id=abc",
+    "misconfiguration of the Authorization Code flow on misconfigured-firewall-cluster",
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+  }
+
+  for (const [key, expected] of [
+    ["key", true], ["token", true], ["pageToken", true], ["api_key", true], ["X-Api-Key", true], ["X-PAN-KEY", true], ["Set-Cookie", true],
+    ["_upstream_session", true], ["session_id", true], ["PHPSESSID", true], ["JSESSIONID", true], ["password1", true], ["authtoken", true],
+    ["sharedsecret", true], ["privatekey", true], ["password_hash", true], ["token_value", true], ["authorization_header", true],
+    ["default_snmp_community", true], ["X-Amz-Signature", true], ["oauth_verifier", true], ["sid", true], ["sig", true], ["phash", true],
+    ["credentialID", false], ["public_key", false], ["tokenCount", false], ["xpath", false], ["cmd", false], ["type", false], ["user", false],
+    ["login", false], ["max_keys", false], ["auth_mode", false], ["password_complexity_by_device", false], ["credential_enforcement_disabled", false],
+    ["pass_rate", false], ["pass", false], ["access_key_id", false], ["client_id", false], ["monkey", false], ["oauth", false], ["sessions", false],
+    ["session_timeout_minutes", false], ["credentials_file", false], ["passwordPolicy", false], ["webhookUrl", false],
+  ]) {
+    assert.equal(isCredentialKey(key), expected, key);
+  }
+});
+
+test("no window of a carried or configured canary survives, for every canary length from 6 to 24", () => {
+  // A deterministic generator so a failure reproduces; one digit is forced so the value
+  // never falls under the one-plain-word prose exception after a scheme.
+  let seed = 0x2545f491;
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) % 0x80000000;
+    return seed;
+  };
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  for (let length = 6; length <= 24; length += 1) {
+    const characters = Array.from({ length }, () => alphabet[next() % alphabet.length]);
+    characters[Math.floor(length / 2)] = String(next() % 10);
+    const canary = characters.join("");
+    const window = Math.min(6, length);
+    for (const input of [
+      `Authorization: Bearer ${canary}`, `Cookie: sid=${canary}`, `X-Api-Key: ${canary}`, `?token=${canary}`, `&key=${canary}&cmd=x`,
+      `password=${canary}`, `"api_key":"${canary}"`, `key="${canary}"`, `Basic ${canary}`, `https://u:${canary}@h.example.com/`,
+    ]) {
+      assert.ok(input.includes(canary), "fixture self-check");
+      for (const scrub of [redactErrorText, redactCredentialValueText]) {
+        assertNoWindow(scrub(input), canary, window, `${scrub.name} length ${length}: ${input}`);
+      }
+    }
+    const configured = `value ${canary} shown`;
+    assert.ok(configured.includes(canary), "fixture self-check");
+    assert.equal(redactSecrets(configured, [canary]), "value [REDACTED] shown", `configured length ${length}`);
+    for (const form of secretForms(canary)) assertNoWindow(redactConfiguredSecrets(`v ${form} w`, [canary]), form, window, `form ${form}`);
   }
 });
 
@@ -1396,7 +1573,7 @@ function sweepConfig() {
       PRISMA_SECRET_KEY: FIXTURE_SECRET_KEY,
       PANOS_HOST: PANOS_SWEEP_HOSTS.join(","),
       PANOS_USERNAME: "auditor",
-      PANOS_PASSWORD: "hunter2",
+      PANOS_PASSWORD: FIXTURE_PANOS_PASSWORD,
     }),
     retryAttempts: 0,
   };
@@ -1414,15 +1591,77 @@ const STRUCTURED_MARKERS = {
 };
 const ECHOED_BODY_TEXT = /<html|<!DOCTYPE|Set-Cookie|X-Api-Key:|did not answer/i;
 
-test("the two-device keygen sweep fixture is healthy before the canary sweep relies on it", async () => {
+test("the two-device keygen sweep fixture is healthy before the canary sweep relies on it, and every fixed text survives the scrubs", async () => {
   const clients = createPaloaltoClients(sweepConfig(), sweepFetch("none", () => htmlCanaryResponse()));
   const access = await checkPaloaltoAccess(clients);
   assert.equal(access.status, "healthy");
   assert.equal(access.surfaces.length, 8 + 9 + 2 * 7);
   const result = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-sweep-healthy-"));
   assert.equal(result.errorCount, 0);
-  const findings = JSON.parse(readBundleFiles(result.outputDir).get(join("analysis", "findings.json")));
+  const files = readBundleFiles(result.outputDir);
+  const findings = JSON.parse(files.get(join("analysis", "findings.json")));
   assert.deepEqual(findings.filter((item) => item.status !== "pass").map((item) => item.id), ["PA-25"]);
+
+  // Fixed-text survival: with nothing to redact, the configured-secret pass leaves every
+  // written file alone (the only markers are the three lines of QUICK_REFERENCE.md that
+  // describe the redaction), the access check carries none, and the general scrub is the
+  // identity on every file and on every rendered string, so no fixed text this module
+  // renders is ever mistaken for a credential.
+  assert.equal(JSON.stringify(access).includes(REDACTION_MARKER), false);
+  for (const [name, text] of files) {
+    const markers = (text.match(/\[REDACTED\]/g) ?? []).length;
+    assert.equal(markers, name === "QUICK_REFERENCE.md" ? 4 : 0, `${name} carries ${markers} markers`);
+    assert.equal(redactErrorText(text), text, `${name} is changed by the general scrub`);
+  }
+  assert.equal(redactErrorText(JSON.stringify(access)), JSON.stringify(access));
+  for (const item of findings) {
+    for (const field of ["summary", "detail", "remediation", "note", "title"]) {
+      if (typeof item[field] === "string") assert.equal(redactErrorText(item[field]), item[field], `${item.id} ${field}`);
+    }
+  }
+});
+
+// The failing surface echoes the configured secrets of its own product in every form a
+// server might reflect them: as is, JSON-escaped, URL-encoded, base64, and base64url. The
+// Prisma Cloud secret key is name-shaped, so nothing but the configured-secret pass can
+// remove its plain form; every form must be absent from every probe, finding, analysis
+// error, bundle file, and zip entry.
+const ECHOED_MARKER = /credentials(?: \[REDACTED\])+ rejected/;
+
+function echoedSecretsMessage(forms) {
+  return `credentials ${forms.join(" ")} rejected`;
+}
+
+test("configured secrets echoed by an error body in every encoded form never reach a probe, finding, analysis error, bundle file, or zip entry", async () => {
+  const prismaForms = secretForms(FIXTURE_SECRET_KEY);
+  const panosForms = secretForms(FIXTURE_PANOS_PASSWORD);
+  assert.equal(prismaForms.length, 3, "a name-shaped secret has three distinct forms (plain, base64, base64url)");
+  assert.equal(panosForms.length, 5);
+  const cases = [
+    ["prisma-cloud /login", prismaForms, () => jsonResponse({ message: echoedSecretsMessage(prismaForms) }, { status: 400 })],
+    ["prisma-cloud /v2/policy", prismaForms, () => jsonResponse({ message: echoedSecretsMessage(prismaForms) }, { status: 400 })],
+    ["prisma-compute /defenders", prismaForms, () => jsonResponse({ err: echoedSecretsMessage(prismaForms) }, { status: 400 })],
+    ["fw1.example.com keygen", panosForms, () => xmlResponse(`<response status="error" code="403"><result><msg>${echoedSecretsMessage(panosForms)}</msg></result></response>`, 403)],
+    ["fw2.example.com /config/shared", panosForms, () => xmlResponse(`<response status="error" code="403"><result><msg>${echoedSecretsMessage(panosForms)}</msg></result></response>`, 403)],
+  ];
+  for (const [surface, forms, make] of cases) {
+    const body = await make().text();
+    // Fixture self-check: the message the server sends carries every form verbatim.
+    const message = body.startsWith("{") ? Object.values(JSON.parse(body))[0] : body;
+    for (const form of forms) assert.ok(message.includes(form), `fixture self-check: ${surface} echoes ${form}`);
+    const clients = createPaloaltoClients(sweepConfig(), sweepFetch(surface, make));
+    const access = await checkPaloaltoAccess(clients);
+    const failed = access.surfaces.filter((probe) => probe.status !== "readable");
+    assert.ok(failed.length >= 1, surface);
+    for (const probe of failed) assert.match(probe.error, ECHOED_MARKER, `${surface}: ${probe.name}: ${probe.error}`);
+    assertNoCanary(JSON.stringify(access), `${surface} access`, forms);
+
+    const bundle = await exportPaloaltoAuditBundle(clients, createTempBase("grclanker-paloalto-echoed-secrets-"));
+    const files = readBundleFiles(bundle.outputDir);
+    for (const [name, text] of files) assertNoCanary(text, `${surface} bundle ${name}`, forms);
+    for (const [name, text] of readZipEntries(bundle.zipPath)) assertNoCanary(text, `${surface} zip ${name}`, forms);
+    for (const line of files.get("_errors.log").trim().split("\n")) assert.match(line, ECHOED_MARKER, `${surface}: ${line}`);
+  }
 });
 
 test("error-body canary sweep: every Palo Alto surface on every device failing with an HTML 502 or a JSON/XML error body leaks no credential into any probe, finding, summary, or bundle file", async () => {
@@ -1530,11 +1769,19 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
     return tool.execute("call-sweep", tool.prepareArguments({ ...baseArgs, ...extra }));
   };
   const anyMarker = (markers) => new RegExp([markers["prisma-cloud"], markers["pan-os"]].map((pattern) => pattern.source).join("|"));
+  // Every form of both products' configured secrets, echoed by every failing surface: a
+  // Prisma Cloud error carrying the PAN-OS key (or the reverse) is scrubbed by nothing but
+  // the tool boundary, which knows every configured secret.
+  const crossProductForms = [...secretForms(FIXTURE_SECRET_KEY), ...secretForms(baseArgs.panos_api_key)];
+  const echoedSecretsJson = () => jsonResponse({ message: echoedSecretsMessage(crossProductForms) }, { status: 400 });
+  const echoedSecretsXml = () => xmlResponse(`<response status="error" code="403"><result><msg>${echoedSecretsMessage(crossProductForms)}</msg></result></response>`, 403);
+  const echoedMarkers = { "prisma-cloud": ECHOED_MARKER, "prisma-compute": ECHOED_MARKER, "pan-os": ECHOED_MARKER };
 
   try {
     for (const shape of [
-      { name: "structured-error", prisma: jsonCanaryResponse, panos: xmlCanaryResponse, markers: STRUCTURED_MARKERS },
-      { name: "html-502", prisma: htmlCanaryResponse, panos: htmlCanaryResponse, markers: HTML_MARKERS },
+      { name: "structured-error", prisma: jsonCanaryResponse, panos: xmlCanaryResponse, markers: STRUCTURED_MARKERS, canaries: CANARIES },
+      { name: "html-502", prisma: htmlCanaryResponse, panos: htmlCanaryResponse, markers: HTML_MARKERS, canaries: CANARIES },
+      { name: "echoed-secrets", prisma: echoedSecretsJson, panos: echoedSecretsXml, markers: echoedMarkers, canaries: [...CANARIES, ...crossProductForms] },
     ]) {
       failing.clear();
       failing.set("prisma-cloud /v2/policy", shape.prisma);
@@ -1543,7 +1790,7 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
       const marker = anyMarker(shape.markers);
 
       const access = await run("paloalto_check_access");
-      assertNoCanary(JSON.stringify(access), `${shape.name} paloalto_check_access`);
+      assertNoCanary(JSON.stringify(access), `${shape.name} paloalto_check_access`, shape.canaries);
       assert.notEqual(access.isError, true, access.content[0].text);
       assert.equal(access.details.status, "degraded");
       const failedProbes = access.details.surfaces.filter((probe) => probe.status !== "readable");
@@ -1555,7 +1802,7 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
 
       for (const name of ["paloalto_assess_cloud_posture", "paloalto_assess_firewall_policy", "paloalto_assess_threat_prevention", "paloalto_assess_device_hardening"]) {
         const result = await run(name);
-        assertNoCanary(JSON.stringify(result), `${shape.name} ${name}`);
+        assertNoCanary(JSON.stringify(result), `${shape.name} ${name}`, shape.canaries);
         assert.notEqual(result.isError, true, result.content[0].text);
         assert.ok(result.details.errors.length >= 1, `${name}: the failing surfaces must be recorded`);
         for (const error of result.details.errors) {
@@ -1566,11 +1813,11 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
       }
 
       const exported = await run("paloalto_export_audit_bundle", { output_dir: createTempBase("grclanker-paloalto-tool-export-") });
-      assertNoCanary(JSON.stringify(exported), `${shape.name} paloalto_export_audit_bundle`);
+      assertNoCanary(JSON.stringify(exported), `${shape.name} paloalto_export_audit_bundle`, shape.canaries);
       assert.notEqual(exported.isError, true, exported.content[0].text);
       const files = readBundleFiles(exported.details.output_dir);
-      for (const [name, text] of files) assertNoCanary(text, `${shape.name} tool bundle ${name}`);
-      for (const [name, text] of readZipEntries(exported.details.zip_path)) assertNoCanary(text, `${shape.name} tool zip ${name}`);
+      for (const [name, text] of files) assertNoCanary(text, `${shape.name} tool bundle ${name}`, shape.canaries);
+      for (const [name, text] of readZipEntries(exported.details.zip_path)) assertNoCanary(text, `${shape.name} tool zip ${name}`, shape.canaries);
       for (const line of files.get("_errors.log").trim().split("\n")) assert.match(line, marker, line);
     }
   } finally {
